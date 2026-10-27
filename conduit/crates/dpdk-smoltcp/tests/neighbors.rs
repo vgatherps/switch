@@ -57,7 +57,7 @@ fn reconnect(eal: &Eal, p: usize, neighbor_capacity: usize) -> [(usize, Duration
                     port.rx_pool.cache_size,
                 ),
                 port.mtu,
-                std::iter::repeat(256).take(if side == Side::A { p } else { 0 }),
+                std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
             );
             port.tx_pool.count = 127;
         },

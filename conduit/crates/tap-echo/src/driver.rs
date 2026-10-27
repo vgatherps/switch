@@ -197,7 +197,7 @@ fn port_config(port_id: u16, max_sockets: usize, recv_capacity: usize) -> PortCo
             rx_pool_count(
                 rx_reserve(DESCRIPTORS, RX_STAGING, POOL_CACHE),
                 MTU,
-                std::iter::repeat(recv_capacity).take(max_sockets),
+                std::iter::repeat_n(recv_capacity, max_sockets),
             ),
         ),
         tx_pool: pool(TX_POOL, POOL_COUNT),
@@ -210,7 +210,7 @@ fn stack_config(max_sockets: usize, gateway: Option<Ipv4Addr>, random_seed: u64)
         max_udp_sockets: 0,
         ethernet: EthernetAddress(ZHIDA_MAC),
         ipv4: Ipv4Cidr::new(ZHIDA_IP, PREFIX_LEN),
-        gateway: gateway.map(Into::into),
+        gateway,
         paths: &[],
         random_seed,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,

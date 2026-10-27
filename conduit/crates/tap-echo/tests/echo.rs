@@ -93,7 +93,7 @@ impl<'h> Client<'h> {
 
     /// Sends one chunk; true if it moved bytes.
     fn write(&mut self, stack: &mut Stack) -> bool {
-        let socket = stack.tcp_mut(&self.handle);
+        let socket = stack.tcp_mut(self.handle);
         if !socket.may_send() || self.written == self.data.len() {
             return false;
         }
@@ -106,7 +106,7 @@ impl<'h> Client<'h> {
 
     /// Reads one chunk; true if it moved bytes.
     fn read(&mut self, stack: &mut Stack) -> bool {
-        let socket = stack.tcp_mut(&self.handle);
+        let socket = stack.tcp_mut(self.handle);
         if self.pending.is_none() && !socket.may_recv() {
             return false;
         }
@@ -187,31 +187,31 @@ fn close_all(
 ) -> Vec<Vec<State>> {
     let mut seen: Vec<Vec<State>> = vec![Vec::new(); server.handles().len()];
     for handle in clients {
-        pair.a.tcp_mut(&handle).close();
+        pair.a.tcp_mut(handle).close();
     }
     pair.drive(
         |_, _| {},
         |a, b| {
             for (states, handle) in seen.iter_mut().zip(server.handles()) {
-                let state = b.tcp(&handle).state();
+                let state = b.tcp(handle).state();
                 if states.last() != Some(&state) {
                     states.push(state);
                 }
             }
             let moved = server.step(b);
             for handle in clients {
-                let socket = a.tcp_mut(&handle);
+                let socket = a.tcp_mut(handle);
                 if socket.may_recv() {
                     assert!(socket.recv().unwrap().is_none());
                 }
             }
             let clients_done = clients
                 .iter()
-                .all(|handle| a.tcp(&handle).state() == State::TimeWait);
+                .all(|handle| a.tcp(handle).state() == State::TimeWait);
             let servers_listen = server
                 .handles()
                 .iter()
-                .all(|handle| b.tcp(&handle).state() == State::Listen);
+                .all(|handle| b.tcp(handle).state() == State::Listen);
             if clients_done && servers_listen {
                 App::Done
             } else {
@@ -405,7 +405,7 @@ fn echo_serves_concurrent_connections_up_to_listener_count() {
         let established = |stack: &mut Stack, handles: &[&TcpHandle]| {
             handles
                 .iter()
-                .all(|handle| stack.tcp(&handle).state() == State::Established)
+                .all(|handle| stack.tcp(handle).state() == State::Established)
         };
         let client_handles: Vec<&TcpHandle> = clients.iter().map(|c| c.handle).collect();
         let established_servers = |stack: &mut Stack, server: &EchoServer| {
@@ -570,7 +570,7 @@ fn handshake(
         },
         |a, b| {
             let moved = server.step(b);
-            if a.tcp(&client).state() == State::Established {
+            if a.tcp(client).state() == State::Established {
                 App::Done
             } else {
                 progress(moved)
@@ -886,7 +886,7 @@ impl Server {
                 port_config.rx_pool.cache_size,
             ),
             port_config.mtu,
-            std::iter::repeat(1024).take(listeners),
+            std::iter::repeat_n(1024, listeners),
         );
         let mut stack = match Stack::new(fixture.open_with(eal, port_config), stack_config, T0) {
             Ok(stack) => stack,
@@ -940,7 +940,7 @@ impl Server {
 
     fn state(&mut self, slot: usize) -> State {
         let handle = &self.echo.handles()[slot];
-        self.stack.tcp(&handle).state()
+        self.stack.tcp(handle).state()
     }
 
     /// SYN, SYN-ACK, ACK.
@@ -1107,7 +1107,7 @@ fn retransmitted_syn_after_lost_synack_completes_one_connection() {
             .iter()
             .enumerate()
             .filter_map(|(slot, handle)| {
-                let socket = server.stack.tcp(&handle);
+                let socket = server.stack.tcp(handle);
                 (socket.remote_endpoint() == Some(c.endpoint())).then(|| (slot, socket.state()))
             })
             .collect();

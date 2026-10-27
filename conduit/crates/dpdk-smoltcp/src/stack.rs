@@ -190,6 +190,8 @@ impl Stack {
     /// normalization relies on; the monotonic rule of `turn` and `receive`
     /// keeps every later time at or above this start. Times near `i64::MAX`
     /// microseconds overflow upstream timer arithmetic.
+    // Setup path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn new(port: Port, config: StackConfig<'_>, now: Instant) -> Result<Self, (Port, StackError)> {
         if let Err(reason) = validate(&config) {
             return Err((port, StackError::InvalidConfig(reason)));

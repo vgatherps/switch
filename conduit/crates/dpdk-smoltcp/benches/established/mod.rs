@@ -137,7 +137,7 @@ impl Established {
             },
             |round, a, b| {
                 let mut read = 0usize;
-                while let Some(frame) = b.tcp_mut(&server).recv().unwrap() {
+                while let Some(frame) = b.tcp_mut(server).recv().unwrap() {
                     let end = read.checked_add(frame.payload().len()).expect("read bytes");
                     sink[read..end].copy_from_slice(frame.payload());
                     read = end;
@@ -146,13 +146,13 @@ impl Established {
                     assert_eq!(byte, payload[(received + offset) % CHUNK]);
                 }
                 received += read;
-                let queued = a.tcp_mut(&client).send_queue();
+                let queued = a.tcp_mut(client).send_queue();
                 let steady = round.a_to_b == SEGMENTS
                     && round.b_to_a == 1
                     && read == CHUNK
                     && queued == CHUNK;
                 if steady || queued == 0 {
-                    assert_eq!(a.tcp_mut(&client).send_slice(payload), Ok(CHUNK));
+                    assert_eq!(a.tcp_mut(client).send_slice(payload), Ok(CHUNK));
                 }
                 match (steady, queued) {
                     (true, _) => App::Done,
@@ -184,9 +184,9 @@ impl Established {
         assert_eq!(turn_counts(black_box(&turn_a)), expected_turn(1, SEGMENTS));
         assert_eq!(turn_counts(black_box(&turn_b)), expected_turn(SEGMENTS, 1));
         assert_eq!((a_to_b, b_to_a), (SEGMENTS, 1));
-        assert_eq!(pair.a.tcp_mut(&client).send_slice(&self.payload), Ok(CHUNK));
+        assert_eq!(pair.a.tcp_mut(client).send_slice(&self.payload), Ok(CHUNK));
         let mut read = 0usize;
-        while let Some(frame) = pair.b.tcp_mut(&server).recv().unwrap() {
+        while let Some(frame) = pair.b.tcp_mut(server).recv().unwrap() {
             let end = read.checked_add(frame.payload().len()).expect("read bytes");
             self.sink[read..end].copy_from_slice(frame.payload());
             read = end;

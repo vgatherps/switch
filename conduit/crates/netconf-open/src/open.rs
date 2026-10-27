@@ -230,6 +230,8 @@ impl fmt::Display for OpenReport {
 /// Caller-owned attached rings must outlive device close and return queued
 /// packets before pool destruction. Vdevs are created by EAL from `config`
 /// and live as long as EAL.
+// Setup path; the error size does not matter.
+#[allow(clippy::result_large_err)]
 pub unsafe fn open(
     config: &Config,
     sizing: &Sizing,
@@ -365,6 +367,8 @@ pub unsafe fn open(
     })
 }
 
+// Setup path; the error size does not matter.
+#[allow(clippy::result_large_err)]
 fn check_mac(config: &Config, device: [u8; 6]) -> Result<(), OpenError> {
     if matches!(&config.device, Device::Pci(_)) {
         if let Some(expected) = config.mac {

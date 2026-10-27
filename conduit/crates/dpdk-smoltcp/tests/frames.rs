@@ -269,7 +269,7 @@ fn receive_acked(pair: &mut Pair, trace: &RefCell<Trace>, handles: &[TcpHandle; 
 
 fn transfer(pair: &mut Pair, trace: &RefCell<Trace>, handles: &[TcpHandle; 2], data: &[u8]) {
     assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(data), Ok(data.len()));
-    receive_acked(pair, trace, &handles, data);
+    receive_acked(pair, trace, handles, data);
 }
 
 fn finish(pair: Pair, trace: &RefCell<Trace>, drops: u64) -> Vec<String> {
@@ -429,7 +429,7 @@ fn bulk_small_writes() {
         for (seed, len) in [1, 2, 1447, 1448, 3000].into_iter().enumerate() {
             let data = pattern(len, u32::try_from(seed).unwrap());
             let start = trace.borrow().frames.len();
-            transfer(pair, trace, &handles, &data);
+            transfer(pair, trace, handles, &data);
             let recorded = trace.borrow();
             let sent: Vec<_> = tcp_frames(&recorded.frames[start..])
                 .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
@@ -452,7 +452,7 @@ fn bulk_small_writes() {
                 offset = end;
             }
             assert_eq!(offset, len);
-            next = next + len;
+            next += len;
             let (_, ack) = tcp_frames(&recorded.frames[start..])
                 .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
                 .last()
@@ -473,7 +473,7 @@ fn bulk_small_writes() {
         assert!(
             matches!(pair.b.poll_at(), Some(at) if at > sent_at && at <= ceil_ms(sent_at + ACK_DELAY))
         );
-        receive_acked(pair, trace, &handles, &data);
+        receive_acked(pair, trace, handles, &data);
         assert_eq!(pair.now(), ceil_ms(sent_at + ACK_DELAY));
         let recorded = trace.borrow();
         let acks: Vec<_> = tcp_frames(&recorded.frames[start..])
@@ -504,7 +504,7 @@ fn bulk_receive_window_reopening() {
             .last()
             .unwrap();
         let start = trace.borrow().frames.len();
-        read_b(pair, &handles, &data);
+        read_b(pair, handles, &data);
         let at = pair.now();
         assert_eq!(pair.b.poll_at(), Some(at));
         round(pair, trace, at);
@@ -699,7 +699,7 @@ fn bulk_tail_loss() {
             }
             attempts[0].1.seq_number + data.len()
         };
-        receive_acked(pair, trace, &handles, &data);
+        receive_acked(pair, trace, handles, &data);
         let recorded = trace.borrow();
         let (_, ack) = tcp_frames(&recorded.frames[start..])
             .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
@@ -730,7 +730,7 @@ fn bulk_fast_retransmit() {
                 .expect("MSS includes room for TCP options")
         };
         for seed in 8..24 {
-            transfer(pair, trace, &handles, &pattern(mss, seed));
+            transfer(pair, trace, handles, &pattern(mss, seed));
         }
         let data = pattern(4 * mss, 24);
         let start = trace.borrow().frames.len();
@@ -787,7 +787,7 @@ fn bulk_fast_retransmit() {
             seq
         };
         assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), 0);
-        receive_acked(pair, trace, &handles, &data);
+        receive_acked(pair, trace, handles, &data);
         assert_eq!(
             pair.now(),
             sent_at,

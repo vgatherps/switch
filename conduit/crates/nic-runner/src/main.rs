@@ -120,7 +120,7 @@ fn run(args: Args) -> i32 {
     };
     let feed_socket = target
         .as_ref()
-        .map(|target| nic::feed_socket(&config, (*target.addr.ip()).into()));
+        .map(|target| nic::feed_socket(&config, *target.addr.ip()));
     if let Err(e) = signals() {
         line("error", e);
         return 3;
@@ -128,7 +128,7 @@ fn run(args: Args) -> i32 {
     let clock = Clock::new(Instant::now());
     let sizing = nic::sizing(&config, &args.mode, feed_socket.as_ref());
     if let Some(target) = &target {
-        let cap = config.path_mtu((*target.addr.ip()).into())
+        let cap = config.path_mtu(*target.addr.ip())
             .checked_sub(40)
             .expect("path MTU exceeds TCP headers");
         line("feed_mss_cap", cap);

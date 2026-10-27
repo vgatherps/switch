@@ -192,8 +192,7 @@ fn new_pair(eal: &Eal, tag: &str, n: usize, active_buffer: usize) -> Pair {
                 ),
                 port.mtu,
                 std::iter::once(active_buffer).chain(
-                    std::iter::repeat(FILLER_BUFFER)
-                        .take(n.checked_sub(1).expect("at least one socket")),
+                    std::iter::repeat_n(FILLER_BUFFER, n.checked_sub(1).expect("at least one socket")),
                 ),
             );
         },
@@ -286,8 +285,8 @@ fn scaling_benches(c: &mut Criterion, eal: &Eal) {
 /// Send one byte on B, keeping its peer out of the turn so the RTO stays armed.
 /// Return the peer ACK that cancels this byte's timer.
 fn arm_deadline(pair: &mut Pair, server: &TcpHandle, rto: Duration) -> Vec<u8> {
-    pair.b.tcp_mut(&server).set_rto(rto);
-    assert_eq!(pair.b.tcp_mut(&server).send_slice(b"x"), Ok(1));
+    pair.b.tcp_mut(server).set_rto(rto);
+    assert_eq!(pair.b.tcp_mut(server).send_slice(b"x"), Ok(1));
     let now = pair.now();
     let turn = pair.b.turn(now, BUDGET).unwrap();
     assert_eq!(turn_counts(&turn), expected_turn(0, 1));
@@ -487,7 +486,7 @@ fn burst_pair(eal: &Eal, tag: &str, n: usize, burst: usize, buffer: usize) -> Pa
                     port.rx_pool.cache_size,
                 ),
                 port.mtu,
-                std::iter::repeat(buffer).take(n),
+                std::iter::repeat_n(buffer, n),
             );
             port.tx_pool.count = pool;
         },

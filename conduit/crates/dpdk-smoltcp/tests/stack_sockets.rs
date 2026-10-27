@@ -695,7 +695,7 @@ fn handshake(
             ..IDLE
         })
     );
-    assert_eq!(stack.tcp(&handle).state(), State::Established);
+    assert_eq!(stack.tcp(handle).state(), State::Established);
     let sent = fixture.take_tx();
     assert_eq!(sent.len(), 1);
     let ack = segment(&sent[0]);
@@ -1203,8 +1203,8 @@ fn listener_after_client_without_timestamps(
 
 /// `Stack::listen` again on REMOTE_PORT, then `next_client_gets_no_timestamps`.
 fn relisten_without_timestamps(fixture: &RingPort, stack: &mut Stack, handle: &TcpHandle) {
-    stack.listen(&handle, REMOTE_PORT).unwrap();
-    next_client_gets_no_timestamps(fixture, stack, &handle);
+    stack.listen(handle, REMOTE_PORT).unwrap();
+    next_client_gets_no_timestamps(fixture, stack, handle);
 }
 
 /// The next client's timestamped SYN gets a SYN-ACK without timestamps. Then abort,
@@ -1224,7 +1224,7 @@ fn next_client_gets_no_timestamps(fixture: &RingPort, stack: &mut Stack, handle:
             None
         )
     );
-    stack.tcp_mut(&handle).abort();
+    stack.tcp_mut(handle).abort();
     stack.turn(T0 + Duration::from_millis(6), 8).unwrap();
     assert_eq!(fixture.take_tx().len(), 1);
 }

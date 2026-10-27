@@ -78,7 +78,7 @@ fn setup(eal: &Eal, case: Case, n: usize) -> (Pair, [TcpHandle; 2], Vec<Conn>) {
     let (handles, _) = establish_sized(&mut pair, Side::A, buffer);
     for (stack, handle) in [(&mut pair.a, &handles[0]), (&mut pair.b, &handles[1])] {
         assert_eq!(handle.to_string(), "#0");
-        stack.tcp_mut(&handle).set_ack_delay(None);
+        stack.tcp_mut(handle).set_ack_delay(None);
     }
     let count = u16::try_from(n.checked_sub(1).expect("active connection"))
         .expect("filler connection count");
@@ -151,7 +151,7 @@ fn iteration(
     let [client, server] = handles;
     let now = pair.now();
     assert_eq!(
-        pair.a.tcp_mut(&client).send_slice(payload),
+        pair.a.tcp_mut(client).send_slice(payload),
         Ok(payload.len())
     );
     let (elapsed, ack) = match case {
@@ -216,7 +216,7 @@ fn iteration(
     }
     assert_eq!(pair.a_to_b.forward(), 0, "extra A→B frame after ACK");
     let mut read = 0usize;
-    while let Some(frame) = pair.b.tcp_mut(&server).recv().unwrap() {
+    while let Some(frame) = pair.b.tcp_mut(server).recv().unwrap() {
         let end = read.checked_add(frame.payload().len()).expect("read bytes");
         sink[read..end].copy_from_slice(frame.payload());
         read = end;
@@ -227,7 +227,7 @@ fn iteration(
         assert_eq!(pair.b.poll_at(), None, "B deadline after application read");
     }
     for (stack, handle) in [(&mut pair.a, client), (&mut pair.b, server)] {
-        let socket = stack.tcp(&handle);
+        let socket = stack.tcp(handle);
         assert_eq!((socket.send_queue(), socket.recv_queue()), (0, 0));
     }
     elapsed

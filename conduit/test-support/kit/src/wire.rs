@@ -195,6 +195,8 @@ pub enum Verdict {
     Hold,
 }
 
+type Impairment = Box<dyn FnMut(&[u8]) -> Verdict>;
+
 /// One direction of a lossy link: a sender's TX ring to a receiver's RX ring,
 /// each frame copied into the receiver's RX pool. The rings and pool must
 /// outlive the Link.
@@ -212,7 +214,7 @@ pub struct Link {
     pub held: u64,
     /// A paused Link leaves every frame on the sender's TX ring.
     pub paused: bool,
-    impairment: Option<Box<dyn FnMut(&[u8]) -> Verdict>>,
+    impairment: Option<Impairment>,
     /// The held copy, in the receiver's RX pool; this Link owns it.
     holding: Option<NonNull<rte_mbuf>>,
 }

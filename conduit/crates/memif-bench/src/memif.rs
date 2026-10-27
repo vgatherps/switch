@@ -94,6 +94,8 @@ impl MemifVdev {
     /// `wait_link_up` returned `Ok`; once the remote end may have closed, only
     /// `close_after_peer`, and `wait_link_up` must have returned `Ok` before
     /// the remote end closed.
+    // Setup path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub unsafe fn open<'a>(
         eal: &Eal,
         memif: &Memif<'_>,
@@ -157,6 +159,8 @@ impl MemifVdev {
         }
     }
 
+    // Setup/teardown path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     fn link_up(&self) -> Result<bool, MemifError> {
         let mut link: rte_eth_link = unsafe { std::mem::zeroed() };
         let code = unsafe { rte_eth_link_get_nowait(self.port_id, &mut link) };
@@ -174,6 +178,8 @@ impl MemifVdev {
     /// After `Err` the connect handling may still be running: the caller must
     /// neither close nor drop the Port (dropping closes it), but retries this
     /// or leaks the Port (`std::mem::forget`).
+    // Setup path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn wait_link_up(&self, timeout: Duration) -> Result<(), MemifError> {
         let deadline = Instant::now() + timeout;
         while !self.link_up()? {
@@ -189,6 +195,8 @@ impl MemifVdev {
     /// remove the vdev. Ports close one at a time; the remote end then uses
     /// `close_after_peer`. A refused close keeps the port's backing (Port's
     /// drop reports it).
+    // Teardown path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn close(self, port: Port) -> Result<(), MemifError> {
         port.try_close().map_err(|(_, error)| MemifError::Close(error))?;
         let code = unsafe { rte_vdev_uninit(self.vdev.as_ptr()) };
@@ -208,6 +216,8 @@ impl MemifVdev {
     /// it closes the port and may race the disconnect handling still running;
     /// the caller retries or leaks it (`std::mem::forget`). Otherwise the
     /// inner result is that of `close`.
+    // Teardown path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn close_after_peer(
         self,
         port: Port,
@@ -236,6 +246,8 @@ impl MemifVdev {
 /// it was set has returned. On failure the flag is leaked: a failed
 /// `rte_eal_alarm_set` may leave the alarm queued, and a timed-out one may
 /// still fire.
+// Setup/teardown path; the error size does not matter.
+#[allow(clippy::result_large_err)]
 fn interrupt_thread_barrier(deadline: Instant) -> Result<(), MemifError> {
     let fired = Box::into_raw(Box::new(AtomicBool::new(false)));
     let code = unsafe { rte_eal_alarm_set(1, Some(alarm_fired), fired.cast()) };

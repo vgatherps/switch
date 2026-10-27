@@ -320,7 +320,7 @@ impl Reconnect {
                     let side = if rng.below(2) == 0 { Side::A } else { Side::B };
                     let (stack, _) = side.pick(&mut pair.a, &mut pair.b);
                     let socket = stack.tcp_mut(&self.handles[side.index()]);
-                    if self.cycles.checked_add(1).unwrap() % 50 == 0 {
+                    if self.cycles.checked_add(1).unwrap().is_multiple_of(50) {
                         socket.abort();
                     } else {
                         socket.close();
@@ -378,6 +378,8 @@ impl Retransmits {
     }
 }
 
+// Test report helper.
+#[allow(clippy::too_many_arguments)]
 fn summary(
     label: &str,
     started: WallInstant,

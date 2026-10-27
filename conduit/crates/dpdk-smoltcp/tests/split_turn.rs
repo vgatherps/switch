@@ -78,13 +78,13 @@ fn payloads(frames: &[Vec<u8>], src: Side) -> Vec<Vec<u8>> {
 
 /// A writes `data` and turns at `now`: one segment on A's TX ring.
 fn a_sends(pair: &mut Pair, a: &TcpHandle, now: Instant, data: &[u8]) {
-    assert_eq!(pair.a.tcp_mut(&a).send_slice(data), Ok(data.len()));
+    assert_eq!(pair.a.tcp_mut(a).send_slice(data), Ok(data.len()));
     assert_eq!(pair.a.turn(now, BUDGET).unwrap().tx_accepted, 1);
 }
 
 /// Read exactly `request`, then write `reply`.
 fn answer(stack: &mut Stack, handle: &TcpHandle, request: &[u8], reply: &[u8]) {
-    let socket = stack.tcp_mut(&handle);
+    let socket = stack.tcp_mut(handle);
     let buffer = drain_bytes(socket).unwrap();
     let read = buffer.len();
     assert_eq!(&buffer[..read], request);
@@ -93,7 +93,7 @@ fn answer(stack: &mut Stack, handle: &TcpHandle, request: &[u8], reply: &[u8]) {
 
 /// Write back everything received.
 fn echo(stack: &mut Stack, handle: &TcpHandle) {
-    let socket = stack.tcp_mut(&handle);
+    let socket = stack.tcp_mut(handle);
     let buffer = drain_bytes(socket).unwrap();
     let read = buffer.len();
     assert_eq!(socket.send_slice(&buffer[..read]), Ok(read));

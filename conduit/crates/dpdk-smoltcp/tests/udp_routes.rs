@@ -85,7 +85,7 @@ fn reply(ip: Ipv4Address, mac: EthernetAddress) -> Vec<u8> {
 
 fn resolve_gateway(pair: &mut Pair, handle: &UdpHandle) {
     assert_eq!(
-        pair.a.udp_send_with(&handle, Some(endpoint(PEER)), 1, |_| {
+        pair.a.udp_send_with(handle, Some(endpoint(PEER)), 1, |_| {
             panic!("neighbor discovery must not fill")
         }),
         Err(UdpSendError::NeighborPending)

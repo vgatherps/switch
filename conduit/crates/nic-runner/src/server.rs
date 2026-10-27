@@ -166,6 +166,8 @@ impl TcpSlot {
     }
 }
 
+// Report helper.
+#[allow(clippy::too_many_arguments)]
 fn report(
     stack: &Stack,
     turns: &Turns,

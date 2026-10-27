@@ -154,7 +154,7 @@ pub fn port_config<'a>(port_id: u16, conns: usize, rx_pool: &'a CStr, tx_pool: &
             count: rx_pool_count(
                 rx_reserve(64, RX_STAGING, POOL_CACHE),
                 1500,
-                std::iter::repeat(SOCKET_BUFFER).take(conns),
+                std::iter::repeat_n(SOCKET_BUFFER, conns),
             ),
             cache_size: POOL_CACHE,
             data_room_size: headroom + BUFFER_SIZE,
@@ -165,6 +165,8 @@ pub fn port_config<'a>(port_id: u16, conns: usize, rx_pool: &'a CStr, tx_pool: &
     }
 }
 
+// Setup path; the error size does not matter.
+#[allow(clippy::result_large_err)]
 fn stack(
     port: Port,
     host: u8,
@@ -460,6 +462,8 @@ impl Client {
     /// Connect every connection of `shape` at `now`; the run fails unless all
     /// are established by `now + connect_timeout` and done by
     /// `now + run_timeout`. An invalid shape returns the Port unchanged.
+    // Setup path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn new(
         port: Port,
         shape: Shape,
@@ -616,7 +620,7 @@ impl Client {
         while self.udp_sent < total {
             let sequence = self.udp_sent;
             let start = &mut self.start;
-            match self.stack.udp_send_with(&handle, Some(remote), size, |buf| {
+            match self.stack.udp_send_with(handle, Some(remote), size, |buf| {
                 if sequence >= warmup {
                     start.get_or_insert_with(Instant::now);
                 }
@@ -858,6 +862,8 @@ pub struct Peer {
 
 impl Peer {
     /// Listen at `now`; the run fails unless done by `now + run_timeout`.
+    // Setup path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn new(
         port: Port,
         mode: PeerMode,
@@ -925,7 +931,7 @@ impl Peer {
         }
         if let PeerMode::UdpSink { size, warmup } = self.mode {
             let handle = self.udp.as_ref().expect("UDP sink has a socket");
-            while let Some(datagram) = self.stack.udp_mut(&handle).recv() {
+            while let Some(datagram) = self.stack.udp_mut(handle).recv() {
                 self.last_datagram = now;
                 let payload = datagram.payload();
                 if payload.len() != size {
@@ -1024,7 +1030,7 @@ impl Peer {
             rx_dropped_full: self
                 .udp
                 .as_ref()
-                .map_or(0, |handle| self.stack.udp(&handle).stats().rx_dropped_full),
+                .map_or(0, |handle| self.stack.udp(handle).stats().rx_dropped_full),
             udp_counters: self.stack.udp_counters(),
             counters: self.counters,
             failure: self.failure.clone(),

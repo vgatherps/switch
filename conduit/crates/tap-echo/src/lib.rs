@@ -111,15 +111,15 @@ impl EchoServer {
     pub fn step(&mut self, stack: &mut Stack) -> bool {
         let mut changed = false;
         for ((handle, echoed), pending) in self.handles.iter().zip(&mut self.echoed).zip(&mut self.pending) {
-            if stack.tcp(&handle).state() == State::Closed {
+            if stack.tcp(handle).state() == State::Closed {
                 stack
-                    .listen(&handle, self.port)
+                    .listen(handle, self.port)
                     .expect("listen on a closed socket with a nonzero port");
                 *pending = None;
                 *echoed = 0;
                 changed = true;
             }
-            let socket = stack.tcp_mut(&handle);
+            let socket = stack.tcp_mut(handle);
             // send_slice fails outside Established and CloseWait. In LastAck
             // smoltcp still enqueues payload from an in-window segment that
             // acks only part of our data (smoltcp tcp.rs 2040-2052,

@@ -118,7 +118,7 @@ mod tests {
             mss_cap: Some(536),
         };
         let reserve = 76 + tcp::rx_mbuf_budget(&capped, 1500);
-        let capacities = std::iter::once(0).chain(std::iter::repeat(65536).take(2));
+        let capacities = std::iter::once(0).chain(std::iter::repeat_n(65536, 2));
         assert_eq!(rx_pool_count(reserve, 1500, capacities), 76 + 123 + 6 + 45 + 45);
     }
 

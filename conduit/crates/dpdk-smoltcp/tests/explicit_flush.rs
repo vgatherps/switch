@@ -41,7 +41,7 @@ fn new_pair(eal: &Eal, names: [&str; 2], pending: usize) -> Pair {
                 port.rx_pool.cache_size,
             ),
             port.mtu,
-            std::iter::repeat(4096).take(configs[side.index()].max_sockets),
+            std::iter::repeat_n(4096, configs[side.index()].max_sockets),
         )
         .checked_add(1)
         .expect("UDP receive slot fits the RX pool");
@@ -117,7 +117,7 @@ fn assert_segments(frames: &[Vec<u8>], src: Side, data: &[u8], mss: usize) {
     for frame in frames {
         let tcp = segment(frame, src);
         assert_eq!(tcp.seq_number, next);
-        next = next + tcp.payload.len();
+        next += tcp.payload.len();
     }
 }
 
@@ -141,7 +141,7 @@ fn template_acks_keep_exact_tx_pool_counts() {
                             port.rx_pool.cache_size,
                         ),
                         port.mtu,
-                        std::iter::repeat(4096).take(configs[side.index()].max_sockets),
+                        std::iter::repeat_n(4096, configs[side.index()].max_sockets),
                     );
                 });
             let conns = many::open(&mut pair, 0..CONNECTIONS, 4096);

@@ -49,7 +49,7 @@ fn endpoint(side: Side) -> IpEndpoint {
 fn resolve(pair: &mut Pair, handle: &UdpHandle) {
     assert_eq!(
         pair.a
-            .udp_send_with(&handle, Some(endpoint(Side::B)), 1, |_| {
+            .udp_send_with(handle, Some(endpoint(Side::B)), 1, |_| {
                 panic!("ARP discovery must not fill the payload")
             }),
         Err(UdpSendError::NeighborPending)
@@ -59,7 +59,7 @@ fn resolve(pair: &mut Pair, handle: &UdpHandle) {
 }
 
 fn recv(stack: &mut Stack, handle: &UdpHandle, src: IpEndpoint, payload: &[u8]) {
-    let datagram = stack.udp_mut(&handle).recv().unwrap();
+    let datagram = stack.udp_mut(handle).recv().unwrap();
     assert_eq!(datagram.src(), src);
     assert_eq!(datagram.payload(), payload);
     drop(datagram);

@@ -115,7 +115,7 @@ mod tests {
                 framer
                     .push(&bytes[split..], |m| frames.push(m.to_vec()))
                     .unwrap();
-                assert_eq!(frames, [bytes.clone()], "split {split}");
+                assert_eq!(frames, std::slice::from_ref(&bytes), "split {split}");
             }
         }
     }

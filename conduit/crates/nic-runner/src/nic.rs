@@ -147,7 +147,7 @@ mod tests {
                 let socket = feed_socket(&config, "203.0.113.1".parse().unwrap());
                 let sizing = sizing(&config, &args.mode, Some(&socket));
                 let reserve = rx_reserve(config.descriptors, STAGING, 8) + udp * UDP_QUEUE;
-                let old = rx_pool_count(reserve, mtu, std::iter::repeat(bytes).take(tcp));
+                let old = rx_pool_count(reserve, mtu, std::iter::repeat_n(bytes, tcp));
                 let new = rx_reserve(config.descriptors, sizing.rx_staging, 8)
                     + sizing.udp_rx_datagrams
                     + sizing.tcp_rx_frames;

@@ -147,7 +147,7 @@ impl<'p> Net<'p> {
     }
 
     fn wait_state(&mut self, handle: &TcpHandle, state: State) {
-        self.until(|net| (net.a.tcp(&handle).state() == state).then_some(()));
+        self.until(|net| (net.a.tcp(handle).state() == state).then_some(()));
     }
 
     /// Drain the listener's request until its final blank line arrives.

@@ -1571,7 +1571,7 @@ mod tests {
         // Build a 6-segment chain
         for _ in 0..5 {
             let seg = pool.alloc_with_len(50).unwrap();
-            head.chain(seg).ok().expect("chain failed");
+            head.chain(seg).expect("chain failed");
         }
         assert_eq!(head.nb_segs(), 6);
 
@@ -1610,7 +1610,7 @@ mod tests {
         let pool = PoolManager::new(256);
         let mut head = pool.alloc_with_len(100).unwrap();
         let tail = pool.alloc_with_len(50).unwrap();
-        head.chain(tail).ok().expect("chain failed");
+        head.chain(tail).expect("chain failed");
 
         // Initially unique
         assert!(head.is_tail_unique(), "fresh chain should be tail-unique");
@@ -1646,7 +1646,7 @@ mod tests {
         let pool = PoolManager::new(256);
         let mut chain1 = pool.alloc_with_len(100).unwrap();
         let seg = pool.alloc_with_len(50).unwrap();
-        chain1.chain(seg).ok().expect("chain failed");
+        chain1.chain(seg).expect("chain failed");
 
         let chain2 = chain1.share_all(); // All refcounts = 2
 
@@ -1677,8 +1677,8 @@ mod tests {
         assert!(head2.is_tail_unique());
 
         // Both can chain to shared tails - no cycle!
-        head1.chain(shared_tail).ok().expect("chain1 should succeed");
-        head2.chain(shared_tail2).ok().expect("chain2 should succeed");
+        head1.chain(shared_tail).expect("chain1 should succeed");
+        head2.chain(shared_tail2).expect("chain2 should succeed");
 
         // Verify shared structure:
         // head1: [h1] -> [shared_tail]
@@ -1723,7 +1723,7 @@ mod tests {
             return pool.alloc_with_len(1).unwrap();
         }
         let mut head = one_byte_chain(pool, n - n / 2);
-        head.chain(one_byte_chain(pool, n / 2)).ok().expect("below the segment limit");
+        head.chain(one_byte_chain(pool, n / 2)).expect("below the segment limit");
         head
     }
 
@@ -1734,7 +1734,7 @@ mod tests {
         let pool = one_byte_segment_pool(limit + 1);
 
         let mut head = one_byte_chain(&pool, limit / 2 + 1);
-        head.chain(one_byte_chain(&pool, limit / 2)).ok().expect("exactly the segment limit");
+        head.chain(one_byte_chain(&pool, limit / 2)).expect("exactly the segment limit");
         assert_eq!((head.nb_segs(), head.pkt_len()), (u16::MAX, limit));
         let lastseg = head.lastseg();
 
@@ -2471,7 +2471,6 @@ mod tests {
         assert_eq!(segments.next(), Some(mbuf.as_ptr()));
         assert_eq!(segments.next(), None);
         assert_eq!(segments.next(), None);
-        drop(segments);
         drop(mbuf);
         assert_pool_returned_exactly_once(&pool, 256);
     }
@@ -2493,7 +2492,6 @@ mod tests {
         assert_eq!(lens, [100, 50, 30]);
         assert_eq!(segments.next(), None);
         assert_eq!(segments.next(), None);
-        drop(segments);
         drop(head);
         assert_pool_returned_exactly_once(&pool, 256);
     }
@@ -2506,6 +2504,8 @@ mod tests {
 
         let mut segments = head.iter_segs();
         assert_eq!(segments.next(), Some(head.as_ptr()));
+        // The drop states what the test checks: an early iterator drop leaves the owner usable.
+        #[allow(clippy::drop_non_drop)]
         drop(segments);
 
         head.chain(pool.alloc_with_len(30).unwrap()).unwrap();

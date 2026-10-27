@@ -93,5 +93,5 @@ fn test_refcount_through_tx_flow() {
     drop(mbuf);
     assert_eq!(retransmit.refcount(), 1);
 
-    assert!(retransmit.len() > 0);
+    assert!(!retransmit.is_empty());
 }

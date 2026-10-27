@@ -328,7 +328,7 @@ fn send_kernel(stack: &mut Stack, start: Instant, socket: &UdpSocket, payload: &
 fn recv_zhida(stack: &mut Stack, start: Instant, handle: &UdpHandle) -> UdpDatagram {
     loop {
         turn(stack, start);
-        if let Some(datagram) = stack.udp_mut(&handle).recv() {
+        if let Some(datagram) = stack.udp_mut(handle).recv() {
             return datagram;
         }
     }
@@ -343,7 +343,7 @@ fn send_zhida(
 ) {
     loop {
         turn(stack, start);
-        match stack.udp_send(&handle, to, payload) {
+        match stack.udp_send(handle, to, payload) {
             Ok(()) => return,
             Err(UdpSendError::NeighborPending | UdpSendError::WouldBlock) => {}
             Err(error) => panic!("Zhida udp_send: {error:?}"),

@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Include the path MSS cap when sizing the RX pool.
     let socket = tcp::Config {
         rx_capacity: BUFFER, tx_capacity: BUFFER,
-        mss_cap: Some(config.path_mtu((*server.ip()).into()) - 40),
+        mss_cap: Some(config.path_mtu(*server.ip()) - 40),
     };
     let sizing = Sizing {
         tcp_rx_frames: tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)),

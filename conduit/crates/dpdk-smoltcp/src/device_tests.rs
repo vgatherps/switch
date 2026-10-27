@@ -635,7 +635,7 @@ fn socket_template_frames(
         assert_eq!(tcp.seq_number, next_seq);
         assert_eq!(tcp.timestamp, None);
         assert_eq!(tcp.header_len(), 20);
-        next_seq = next_seq + data.len();
+        next_seq += data.len();
         frames.push(bytes);
     }
     // The socket still holds the unread "x" frame; dropping it returns that mbuf.
@@ -1661,7 +1661,7 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u
         reply.payload = payload;
         stage(&fixture, &mut device, &pair::tcp_frame(Side::B, &reply));
         packets.push(device.rx.pop_front().unwrap());
-        reply.seq_number = reply.seq_number + payload.len();
+        reply.seq_number += payload.len();
     }
     let arp = zhida_test_kit::ring_port::arp(
         ArpOperation::Reply,
@@ -1727,7 +1727,7 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u
         let turn = stack.turn(NOW, 8).unwrap();
         assert_eq!((turn.rx_received, turn.rx_processed), (1, 1));
         drop(peer_receive(&fixture, 16));
-        reply.seq_number = reply.seq_number + payload.len();
+        reply.seq_number += payload.len();
     }
     let mut stamps = Vec::new();
     let mut bytes = Vec::new();
@@ -1894,7 +1894,7 @@ fn tx_consume_queues_exactly_len_bytes() {
             buf.len()
         });
         assert_eq!(seen, 60);
-        assert_eq!(pending(&device), [bytes.clone()]);
+        assert_eq!(pending(&device), std::slice::from_ref(&bytes));
         assert_eq!(device.flush().unwrap(), 1);
         let sent = peer_receive(&fixture, 16);
         assert_eq!(sent.len(), 1);

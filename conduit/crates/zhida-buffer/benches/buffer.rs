@@ -449,8 +449,8 @@ fn bench_clone_isolated(c: &mut Criterion) {
     let mut seg_ptrs: [*mut zhida_dpdk_sys::rte_mbuf; 10] = [std::ptr::null_mut(); 10];
     unsafe {
         let mut seg = source;
-        for i in 0..10 {
-            seg_ptrs[i] = seg;
+        for slot in &mut seg_ptrs {
+            *slot = seg;
             seg = (*seg).next;
         }
     }

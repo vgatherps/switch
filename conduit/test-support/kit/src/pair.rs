@@ -127,7 +127,7 @@ impl Pair {
                     port.rx_pool.cache_size,
                 ),
                 port.mtu,
-                std::iter::repeat(SMALL).take(stack.max_sockets),
+                std::iter::repeat_n(SMALL, stack.max_sockets),
             );
         })
     }

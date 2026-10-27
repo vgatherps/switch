@@ -91,7 +91,7 @@ pub(super) fn setup(eal: &Eal, k: usize, buffer: usize) -> (Pair, [TcpHandle; 2]
     assert!(MSS <= send_mss, "payload chunk exceeds send MSS");
     for (stack, handle) in [(&mut pair.a, &handles[0]), (&mut pair.b, &handles[1])] {
         assert_eq!(handle.to_string(), "#0");
-        stack.tcp_mut(&handle).set_ack_delay(None);
+        stack.tcp_mut(handle).set_ack_delay(None);
     }
     grow_window(&mut pair, &handles, k, send_mss);
     assert_quiet(&mut pair, &[]);
@@ -184,8 +184,8 @@ fn grow_window(pair: &mut Pair, handles: &[TcpHandle; 2], k: usize, send_mss: us
         },
         |round, a, b| {
             let mut read = 0usize;
-            while b.tcp(&server).recv_queue() > 0 {
-                let frame = b.tcp_mut(&server).recv().unwrap().unwrap();
+            while b.tcp(server).recv_queue() > 0 {
+                let frame = b.tcp_mut(server).recv().unwrap().unwrap();
                 let len = frame.payload().len();
                 sink[..len].copy_from_slice(frame.payload());
                 assert!(len > 0, "warmup read made no progress");
@@ -195,7 +195,7 @@ fn grow_window(pair: &mut Pair, handles: &[TcpHandle; 2], k: usize, send_mss: us
                 }
                 read = read.checked_add(len).expect("warmup round bytes");
             }
-            let queued = a.tcp(&client).send_queue();
+            let queued = a.tcp(client).send_queue();
             let full = full_segments.replace(true);
             let steady = round.a_to_b == k && full && read == batch && queued == batch;
             if steady {
@@ -204,7 +204,7 @@ fn grow_window(pair: &mut Pair, handles: &[TcpHandle; 2], k: usize, send_mss: us
                 return App::Done;
             }
             if queued == 0 {
-                assert_eq!(a.tcp_mut(&client).send_slice(&payload), Ok(batch));
+                assert_eq!(a.tcp_mut(client).send_slice(&payload), Ok(batch));
                 App::Moved
             } else if read > 0 {
                 App::Moved
@@ -217,9 +217,11 @@ fn grow_window(pair: &mut Pair, handles: &[TcpHandle; 2], k: usize, send_mss: us
     assert_eq!(received % batch, 0);
     let now = pair.now();
     assert_turn(pair.a.turn(now, BUDGET).unwrap(), 1, 0);
-    assert_empty(pair, &handles);
+    assert_empty(pair, handles);
 }
 
+// Bench helper.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn iteration(
     pair: &mut Pair,
     handles: &[TcpHandle; 2],
@@ -238,13 +240,13 @@ pub(super) fn iteration(
     let now = pair.now();
     if seg == MSS {
         assert_eq!(
-            pair.a.tcp_mut(&client).send_slice(payload),
+            pair.a.tcp_mut(client).send_slice(payload),
             Ok(payload.len())
         );
         assert_turn(pair.a.turn(now, BUDGET).unwrap(), 0, k);
     } else {
         for bytes in payload.chunks_exact(seg) {
-            assert_eq!(pair.a.tcp_mut(&client).send_slice(bytes), Ok(seg));
+            assert_eq!(pair.a.tcp_mut(client).send_slice(bytes), Ok(seg));
             assert_turn(pair.a.turn(now, BUDGET).unwrap(), 0, 1);
         }
     }
@@ -289,7 +291,7 @@ pub(super) fn iteration(
     let mut valid = true;
     let start = Instant::now();
     let turn = pair.b.turn(now, BUDGET);
-    let socket = pair.b.tcp_mut(&server);
+    let socket = pair.b.tcp_mut(server);
     while let Some(frame) = socket.recv().unwrap() {
         let bytes = frame.payload();
         let len = bytes.len();
@@ -325,13 +327,13 @@ pub(super) fn iteration(
         assert_eq!(pair.a.poll_at(), None, "A deadline after ACK");
         assert_eq!(pair.b.poll_at(), None, "B deadline after application read");
     }
-    assert_empty(pair, &handles);
+    assert_empty(pair, handles);
     (elapsed, reads)
 }
 
 fn assert_empty(pair: &Pair, handles: &[TcpHandle; 2]) {
     for (stack, handle) in [(&pair.a, &handles[0]), (&pair.b, &handles[1])] {
-        let socket = stack.tcp(&handle);
+        let socket = stack.tcp(handle);
         assert_eq!((socket.send_queue(), socket.recv_queue()), (0, 0));
     }
 }

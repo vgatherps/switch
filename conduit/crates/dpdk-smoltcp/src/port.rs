@@ -447,6 +447,8 @@ impl Port {
     /// TX acceptance must report at most the offered count and take the front of the
     /// offered array.
     /// EAL and retained backing survive until all obligations are discharged.
+    // Setup path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub unsafe fn open(eal: &Eal, config: PortConfig<'_>) -> Result<Self, PortOpenError> {
         check_owner(eal.owner_lcore_id())?;
         if config.rx_descriptors == 0 || config.tx_descriptors == 0 {
@@ -498,7 +500,7 @@ impl Port {
         };
         let frame = u64::from(config.mtu) + 14;
         let headroom = u64::from(RTE_PKTMBUF_HEADROOM);
-        let required_rx_room = ((u64::from(config.mtu) + 26 + 1023) / 1024) * 1024;
+        let required_rx_room = (u64::from(config.mtu) + 26).div_ceil(1024) * 1024;
         if u64::from(config.rx_pool.data_room_size) < headroom + required_rx_room {
             return Err(PortError::InvalidSettings(
                 "RX usable room must be at least ceil1024(MTU + 26) for single-segment RX",
@@ -649,6 +651,8 @@ impl Port {
 
     /// Stop/close and release backing, or return the same owner for cleanup.
     /// A released-ID close failure permanently retains backing resources.
+    // Teardown path; the error size does not matter.
+    #[allow(clippy::result_large_err)]
     pub fn try_close(mut self) -> Result<(), (Self, PortError)> {
         self.cleanup_attempted = true;
         match self.cleanup() {

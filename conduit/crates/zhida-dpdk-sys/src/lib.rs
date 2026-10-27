@@ -3,7 +3,12 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+// bindgen-generated code.
+#[allow(clippy::missing_safety_doc, clippy::useless_transmute, clippy::unnecessary_cast, clippy::ptr_offset_with_cast)]
+mod bindings {
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+pub use bindings::*;
 
 mod affinity;
 pub use affinity::{only_allowed_cpu, AffinityError};
@@ -253,12 +258,18 @@ unsafe extern "C" {
 }
 
 /// Allocate an mbuf from a mempool.
+///
+/// # Safety
+/// `mp` must point to a live mempool; EAL must be initialized.
 #[inline]
 pub unsafe fn rte_pktmbuf_alloc(mp: *mut rte_mempool) -> *mut rte_mbuf {
     zhida_pktmbuf_alloc(mp)
 }
 
 /// Free an mbuf back to its pool.
+///
+/// # Safety
+/// `m` must be null or an mbuf the caller owns; it must not be used afterwards.
 #[inline]
 pub unsafe fn rte_pktmbuf_free(m: *mut rte_mbuf) {
     zhida_pktmbuf_free(m)
@@ -274,12 +285,18 @@ pub unsafe fn rte_pktmbuf_chain(head: *mut rte_mbuf, tail: *mut rte_mbuf) -> i32
 }
 
 /// Get last segment in chain.
+///
+/// # Safety
+/// `m` must point to a valid mbuf chain.
 #[inline]
 pub unsafe fn rte_pktmbuf_lastseg(m: *mut rte_mbuf) -> *mut rte_mbuf {
     zhida_pktmbuf_lastseg(m)
 }
 
 /// Update refcount by delta. Returns new refcount.
+///
+/// # Safety
+/// `m` must point to a valid mbuf; the caller must account for the refcount change.
 #[inline]
 pub unsafe fn rte_mbuf_refcnt_update(m: *mut rte_mbuf, delta: i16) -> u16 {
     zhida_mbuf_refcnt_update(m, delta)

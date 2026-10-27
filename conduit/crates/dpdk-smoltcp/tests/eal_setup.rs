@@ -37,6 +37,8 @@ fn explicit_argv_initializes_once_and_drop_retains_main_lcore() {
     assert_eq!(eal.owner_lcore_id(), 7);
     assert_eq!(unsafe { zhida_lcore_id() }, eal.owner_lcore_id());
 
+    // The drop states what the test checks: dropping Eal keeps the main lcore.
+    #[allow(clippy::drop_non_drop)]
     drop(eal);
     assert_eq!(unsafe { zhida_lcore_id() }, 7);
     assert!(matches!(

@@ -253,8 +253,8 @@ fn stack_segments_per_visit_controls_two_connection_order() {
                 },
                 |a, b| {
                     if handles.iter().all(|[client, server]| {
-                        a.tcp(&client).state() == State::Established
-                            && b.tcp(&server).state() == State::Established
+                        a.tcp(client).state() == State::Established
+                            && b.tcp(server).state() == State::Established
                     }) {
                         App::Done
                     } else {
@@ -271,7 +271,7 @@ fn stack_segments_per_visit_controls_two_connection_order() {
                 let len = mss + 300;
                 assert!(usize::from(window) >= len && len <= 2048);
                 let data = vec![index as u8 + 1; len];
-                assert_eq!(pair.a.tcp_mut(&client).send_slice(&data), Ok(data.len()));
+                assert_eq!(pair.a.tcp_mut(client).send_slice(&data), Ok(data.len()));
             }
             let now = pair.now();
             assert_eq!(pair.a.turn(now, pair::BUDGET).unwrap().tx_accepted, 4);
@@ -389,7 +389,7 @@ fn establish_small_segment_clients(pair: &mut Pair, count: u16) -> Vec<TcpHandle
         usize::from(count)
     );
     for handle in &handles {
-        assert_eq!(pair.a.tcp(&handle).state(), State::Established);
+        assert_eq!(pair.a.tcp(handle).state(), State::Established);
     }
     handles
 }
@@ -410,7 +410,7 @@ fn turn_sends_all_six_segments_in_connection_order() {
         for (index, handle) in handles.iter().enumerate() {
             assert_eq!(
                 pair.a
-                    .tcp_mut(&handle)
+                    .tcp_mut(handle)
                     .send_slice(&vec![index as u8 + 1; 3 * 512]),
                 Ok(3 * 512)
             );
@@ -442,7 +442,7 @@ fn lone_burst_keeps_poll_at_and_retransmits_at_deadline() {
         let handles = establish_small_segment_clients(&mut pair, 1);
         let handle = &handles[0];
         assert_eq!(
-            pair.a.tcp_mut(&handle).send_slice(&[1; 3 * 512]),
+            pair.a.tcp_mut(handle).send_slice(&[1; 3 * 512]),
             Ok(3 * 512)
         );
         let now = pair.now();

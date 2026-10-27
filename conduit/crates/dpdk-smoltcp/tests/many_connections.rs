@@ -117,8 +117,8 @@ fn packet_rx_full_window_64_connections() {
         assert_eq!(zero_window, [[true; 2]; 64]);
         for conn in &conns {
             for (stack, handle) in [(&pair.a, &conn.client), (&pair.b, &conn.server)] {
-                assert_eq!(stack.tcp(&handle).recv_room(), 0);
-                assert_eq!(stack.tcp(&handle).rx_refused_segments(), 0);
+                assert_eq!(stack.tcp(handle).recv_room(), 0);
+                assert_eq!(stack.tcp(handle).rx_refused_segments(), 0);
             }
         }
         for (conn, sent) in conns.iter().zip(&data).take(2) {
@@ -126,7 +126,7 @@ fn packet_rx_full_window_64_connections() {
                 (Side::A, &mut pair.a, &conn.client),
                 (Side::B, &mut pair.b, &conn.server),
             ] {
-                let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
+                let bytes = drain_bytes(stack.tcp_mut(handle)).unwrap();
                 assert_eq!(bytes.len(), CAPACITY);
                 assert_eq!(bytes, sent[side.other().index()]);
             }
@@ -147,7 +147,7 @@ fn packet_rx_full_window_64_connections() {
                         (Side::A, &mut *a, &conn.client),
                         (Side::B, &mut *b, &conn.server),
                     ] {
-                        let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
+                        let bytes = drain_bytes(stack.tcp_mut(handle)).unwrap();
                         let read = bytes.len();
                         if read > 0 {
                             assert!(round.a.rx_received + round.b.rx_received > 0);
@@ -185,7 +185,7 @@ fn packet_rx_full_window_64_connections() {
                     (Side::A, &mut pair.a, &conn.client),
                     (Side::B, &mut pair.b, &conn.server),
                 ] {
-                    let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
+                    let bytes = drain_bytes(stack.tcp_mut(handle)).unwrap();
                     assert_eq!(bytes.len(), CAPACITY);
                     assert_eq!(bytes, sent[side.other().index()]);
                 }
@@ -263,7 +263,7 @@ fn exchange(pair: &mut Pair, conns: &[&Conn]) {
             ] {
                 let message = message(conn.id, side);
                 assert_eq!(
-                    stack.tcp_mut(&handle).send_slice(&message),
+                    stack.tcp_mut(handle).send_slice(&message),
                     Ok(message.len())
                 );
             }
@@ -278,7 +278,7 @@ fn exchange(pair: &mut Pair, conns: &[&Conn]) {
                         (Side::A, &mut *a, &conn.client),
                         (Side::B, &mut *b, &conn.server),
                     ] {
-                        let socket = stack.tcp_mut(&handle);
+                        let socket = stack.tcp_mut(handle);
                         let buffer = drain_bytes(socket).unwrap();
                         let read = buffer.len();
                         got[side.index()].extend_from_slice(&buffer[..read]);

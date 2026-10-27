@@ -773,7 +773,7 @@ fn bulk(pair: &mut Pair, handles: &[TcpHandle; 2], data: &[Vec<u8>; 2]) -> ([Vec
                 sent[i] += wrote;
                 moved |= wrote > 0;
             }
-            moved |= read_all(a, b, &handles, &mut received);
+            moved |= read_all(a, b, handles, &mut received);
             if received[0].len() == data[1].len() && received[1].len() == data[0].len() {
                 App::Done
             } else if moved {
@@ -1777,7 +1777,7 @@ impl TimedLink {
         self.unsent.extend_from_slice(&queued);
         let remainder = self.unsent.len().checked_sub(allowance).expect("queue exceeds cwnd");
         assert!(remainder > 0);
-        self.step(pair, &handles, true);
+        self.step(pair, handles, true);
         assert_eq!(self.now, start);
         assert_eq!(self.ack_lens.len(), acks);
         assert_eq!(self.data_sent[sent..].iter().map(|(_, _, len)| len).sum::<usize>(), allowance,
@@ -1785,7 +1785,7 @@ impl TimedLink {
         assert_eq!(pair.a.tcp(&handles[0]).send_queue(), self.unsent.len());
         // Receive this flight's ACKs before asking the sender to dispatch the next round.
         for _ in 0..10000 {
-            self.step(pair, &handles, false);
+            self.step(pair, handles, false);
             if pair.a.tcp(&handles[0]).send_queue() == remainder {
                 break;
             }
@@ -1843,32 +1843,32 @@ fn cubic_growth_and_recovery_across_rtts() {
             let b = pair.b.add_tcp(pair::tcp_socket_sized(CAPACITY)).unwrap();
             let handles = [a, b];
             let [a, b] = &handles;
-            pair.a.tcp_mut(&a).set_initial_window(10 * MSS);
-            pair.a.tcp_mut(&a).set_rto(Duration::from_secs(10));
-            pair.b.tcp_mut(&b).set_rto(Duration::from_secs(10));
-            pair.b.tcp_mut(&b).set_ack_delay(None);
-            pair.b.listen(&b, pair::SERVER_PORT).unwrap();
-            pair.a.connect(&a, IpEndpoint::new(Side::B.ip().into(), pair::SERVER_PORT), pair::CLIENT_PORT).unwrap();
+            pair.a.tcp_mut(a).set_initial_window(10 * MSS);
+            pair.a.tcp_mut(a).set_rto(Duration::from_secs(10));
+            pair.b.tcp_mut(b).set_rto(Duration::from_secs(10));
+            pair.b.tcp_mut(b).set_ack_delay(None);
+            pair.b.listen(b, pair::SERVER_PORT).unwrap();
+            pair.a.connect(a, IpEndpoint::new(Side::B.ip().into(), pair::SERVER_PORT), pair::CLIENT_PORT).unwrap();
             let mut link = TimedLink::new(rtt);
             for _ in 0..100 {
                 link.step(&mut pair, &handles, true);
-                if pair.a.tcp(&a).state() == State::Established && pair.b.tcp(&b).state() == State::Established {
+                if pair.a.tcp(a).state() == State::Established && pair.b.tcp(b).state() == State::Established {
                     break;
                 }
             }
-            assert_eq!(pair.a.tcp(&a).state(), State::Established);
-            assert_eq!(pair.b.tcp(&b).state(), State::Established);
-            assert_eq!(pair.a.tcp(&a).congestion_window(), 10 * MSS);
+            assert_eq!(pair.a.tcp(a).state(), State::Established);
+            assert_eq!(pair.b.tcp(b).state(), State::Established);
+            assert_eq!(pair.a.tcp(a).congestion_window(), 10 * MSS);
             let mut total_sent = 0usize;
             let mut series = vec![(0, 10 * MSS)];
             for segments in [10, 20, 40, 80] {
                 let bytes = pattern(segments * MSS, segments as u32);
                 link.flight(&mut pair, &handles, &bytes);
                 total_sent = total_sent.checked_add(bytes.len()).expect("sent bytes fit usize");
-                assert_eq!(pair.a.tcp(&a).congestion_window(), 2 * segments * MSS);
-                series.push(((link.now - T0).total_micros(), pair.a.tcp(&a).congestion_window()));
+                assert_eq!(pair.a.tcp(a).congestion_window(), 2 * segments * MSS);
+                series.push(((link.now - T0).total_micros(), pair.a.tcp(a).congestion_window()));
             }
-            let prior = pair.a.tcp(&a).congestion_window();
+            let prior = pair.a.tcp(a).congestion_window();
             let threshold = ((0.7 * prior as f64).floor() as usize).max(2 * MSS);
             let una = link.highest.unwrap();
             link.drop_seq = Some(una);
@@ -1878,28 +1878,28 @@ fn cubic_growth_and_recovery_across_rtts() {
             assert!(remainder > 0);
             let sent = link.data_sent.len();
             let start = link.now;
-            assert_eq!(pair.a.tcp_mut(&a).send_slice(&bytes), Ok(bytes.len()));
+            assert_eq!(pair.a.tcp_mut(a).send_slice(&bytes), Ok(bytes.len()));
             let mut loss_at = None;
             link.step(&mut pair, &handles, true);
             assert_eq!(link.now, start);
             assert_eq!(link.data_sent[sent..].iter().map(|(_, _, len)| len).sum::<usize>(), prior,
                 "pre-ACK loss flight must fill cwnd and leave the excess unsent");
-            assert_eq!(pair.a.tcp(&a).send_queue(), link.unsent.len());
+            assert_eq!(pair.a.tcp(a).send_queue(), link.unsent.len());
             for _ in 0..10000 {
-                let send_a = pair.a.tcp(&a).retransmits() == 0;
+                let send_a = pair.a.tcp(a).retransmits() == 0;
                 link.step(&mut pair, &handles, send_a);
-                if loss_at.is_none() && pair.a.tcp(&a).loss_events() == 1 {
+                if loss_at.is_none() && pair.a.tcp(a).loss_events() == 1 {
                     loss_at = Some(link.now);
-                    assert_eq!(pair.a.tcp(&a).congestion_window(), threshold + 3 * MSS);
+                    assert_eq!(pair.a.tcp(a).congestion_window(), threshold + 3 * MSS);
                 }
-                if pair.a.tcp(&a).send_queue() == remainder {
+                if pair.a.tcp(a).send_queue() == remainder {
                     break;
                 }
                 assert!(link.now < start + rtt * 3, "fast repair must finish before RTO");
             }
             let loss_at = loss_at.expect("three duplicate ACKs enter fast recovery");
-            assert_eq!(pair.a.tcp(&a).send_queue(), remainder);
-            assert_eq!(pair.a.tcp(&a).congestion_window(), threshold);
+            assert_eq!(pair.a.tcp(a).send_queue(), remainder);
+            assert_eq!(pair.a.tcp(a).congestion_window(), threshold);
             assert_eq!(link.data_sent[sent..].iter().filter(|(at, _, _)| *at == start)
                 .map(|(_, _, len)| len).sum::<usize>(), prior);
             assert_eq!(link.highest, Some(una + prior));
@@ -1910,7 +1910,7 @@ fn cubic_growth_and_recovery_across_rtts() {
             link.unsent.drain(..prior);
             assert_eq!(link.total_received, total_sent);
             assert_eq!(link.dropped, 1);
-            assert_eq!((pair.a.tcp(&a).retransmits(), pair.a.tcp(&a).loss_events()), (1, 1));
+            assert_eq!((pair.a.tcp(a).retransmits(), pair.a.tcp(a).loss_events()), (1, 1));
             series.push(((link.now - T0).total_micros(), threshold));
 
             link.batch_b = 2;
@@ -1920,7 +1920,7 @@ fn cubic_growth_and_recovery_across_rtts() {
             let mut concave_samples = 0;
             let mut crossed = None;
             for round in 0..20000 {
-                let cwnd = pair.a.tcp(&a).congestion_window();
+                let cwnd = pair.a.tcp(a).congestion_window();
                 let bytes = pattern(cwnd, round as u32);
                 let ack_lens = link.flight(&mut pair, &handles, &bytes);
                 total_sent = total_sent.checked_add(bytes.len()).expect("sent bytes fit usize");
@@ -1938,7 +1938,7 @@ fn cubic_growth_and_recovery_across_rtts() {
                         expected += (target - expected).max(0.0) * len as f64 / expected;
                     }
                 }
-                let actual = pair.a.tcp(&a).congestion_window();
+                let actual = pair.a.tcp(a).congestion_window();
                 assert!(actual < CAPACITY, "the peer window never limits regrowth");
                 // Floating equations avoid the implementation's integer truncation
                 // (under 1 byte per ACK in the cubic branch, none accumulating in the
@@ -1951,7 +1951,7 @@ fn cubic_growth_and_recovery_across_rtts() {
                     concave_samples += 1;
                 }
                 series.push(((link.now - T0).total_micros(), actual));
-                assert_eq!((pair.a.tcp(&a).retransmits(), pair.a.tcp(&a).loss_events()), (1, 1));
+                assert_eq!((pair.a.tcp(a).retransmits(), pair.a.tcp(a).loss_events()), (1, 1));
                 if actual > prior + MSS {
                     crossed = Some((elapsed, cubic_branch));
                     break;
@@ -1967,10 +1967,10 @@ fn cubic_growth_and_recovery_across_rtts() {
             }
             assert_eq!(link.total_received, total_sent);
             assert!(link.received.is_empty());
-            assert_eq!(pair.a.tcp(&a).send_queue(), link.unsent.len());
+            assert_eq!(pair.a.tcp(a).send_queue(), link.unsent.len());
             for _ in 0..10000 {
                 link.step(&mut pair, &handles, true);
-                if pair.a.tcp(&a).send_queue() == 0 {
+                if pair.a.tcp(a).send_queue() == 0 {
                     break;
                 }
             }
@@ -1978,7 +1978,7 @@ fn cubic_growth_and_recovery_across_rtts() {
             total_sent = total_sent.checked_add(link.unsent.len()).expect("sent bytes fit usize");
             assert_eq!(link.total_received, total_sent);
             link.received.clear();
-            assert_eq!(pair.a.tcp(&a).send_queue(), 0);
+            assert_eq!(pair.a.tcp(a).send_queue(), 0);
             assert!(link.due.iter().all(|queue| queue.is_empty()));
             assert_eq!(pair.close(), 0);
         }

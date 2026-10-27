@@ -2370,7 +2370,7 @@ fn kernel_jumbo_echo() {
             .map(|s| s.len)
             .collect();
         assert!(lens.iter().all(|&len| len <= 8960), "{direction:?} segment over 8960: {lens:?}");
-        assert!(lens.iter().any(|&len| len == 8960), "{direction:?} no full segment: {lens:?}");
+        assert!(lens.contains(&8960), "{direction:?} no full segment: {lens:?}");
     }
 }
 
@@ -3054,7 +3054,7 @@ struct Tcp {
 impl Frame {
     /// Zhida wrote it through the PMD: the kernel received it rather than
     /// sent it.
-    fn from_zhida(&self) -> bool {
+    fn is_from_zhida(&self) -> bool {
         self.pkttype != libc::PACKET_OUTGOING
     }
 
@@ -3126,7 +3126,7 @@ fn kernel_fin_acked(frames: &[Frame]) -> bool {
     let tcp = |from_zhida: bool| {
         frames
             .iter()
-            .filter(move |f| f.from_zhida() == from_zhida)
+            .filter(move |f| f.is_from_zhida() == from_zhida)
             .filter_map(Frame::tcp)
     };
     let Some(fin) = tcp(false).find(|t| t.source == OFF_SUBNET_ADDR && t.flags & FIN != 0) else {
@@ -3331,7 +3331,7 @@ fn zhida_reaches_off_subnet_kernel_through_gateway() {
 
     let requests: Vec<Arp> = frames
         .iter()
-        .filter(|f| f.from_zhida())
+        .filter(|f| f.is_from_zhida())
         .filter_map(Frame::arp)
         .filter(|a| a.operation == ARP_REQUEST)
         .collect();
@@ -3342,7 +3342,7 @@ fn zhida_reaches_off_subnet_kernel_through_gateway() {
     );
     let gateway_macs: Vec<EthernetAddress> = frames
         .iter()
-        .filter(|f| !f.from_zhida())
+        .filter(|f| !f.is_from_zhida())
         .filter_map(Frame::arp)
         .filter(|a| a.operation == ARP_REPLY && a.sender == KERNEL_ADDR)
         .map(|a| a.sender_mac)
@@ -3353,7 +3353,7 @@ fn zhida_reaches_off_subnet_kernel_through_gateway() {
     assert!(gateway_macs.iter().all(|&mac| mac == gateway_mac));
 
     let mut from_zhida = Vec::new();
-    for frame in frames.iter().filter(|f| f.from_zhida()) {
+    for frame in frames.iter().filter(|f| f.is_from_zhida()) {
         if frame.arp().is_some() {
             continue;
         }
@@ -3366,7 +3366,7 @@ fn zhida_reaches_off_subnet_kernel_through_gateway() {
     }
     let from_kernel: Vec<Tcp> = frames
         .iter()
-        .filter(|f| !f.from_zhida())
+        .filter(|f| !f.is_from_zhida())
         .filter_map(Frame::tcp)
         .filter(|t| t.source == OFF_SUBNET_ADDR)
         .collect();
@@ -3403,7 +3403,7 @@ fn zhida_without_gateway_sends_nothing_off_subnet() {
             (turns, tx_accepted)
         });
     assert_eq!(tx_accepted, 0, "PMD accepted frames over {turns} turns");
-    let sent: Vec<&Frame> = frames.iter().filter(|f| f.from_zhida()).collect();
+    let sent: Vec<&Frame> = frames.iter().filter(|f| f.is_from_zhida()).collect();
     assert!(sent.is_empty(), "Zhida sent over {turns} turns: {sent:?}");
 }
 

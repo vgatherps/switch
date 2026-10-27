@@ -204,8 +204,8 @@ fn jumbo_pair_mss_cap_limits_both_directions() {
         pair.drive(
             |dir, frame| frames.push((dir, frame.to_vec())),
             |a, b| {
-                if a.tcp(&client).state() == State::Established
-                    && b.tcp(&server).state() == State::Established
+                if a.tcp(client).state() == State::Established
+                    && b.tcp(server).state() == State::Established
                 {
                     App::Done
                 } else {
@@ -220,8 +220,8 @@ fn jumbo_pair_mss_cap_limits_both_directions() {
         }
         assert_eq!(
             [
-                pair.a.tcp(&client).rx_refused_segments(),
-                pair.b.tcp(&server).rx_refused_segments(),
+                pair.a.tcp(client).rx_refused_segments(),
+                pair.b.tcp(server).rx_refused_segments(),
             ],
             [0, 0]
         );

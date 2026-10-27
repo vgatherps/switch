@@ -52,7 +52,7 @@ fn unique_chain(pool: &PoolManager, lens: &[u16], byte: u8) -> Mbuf {
     let mut head = filled(pool, lens[0], byte);
     for (i, &len) in lens.iter().enumerate().skip(1) {
         let seg = filled(pool, len, byte + i as u8);
-        head.chain(seg).ok().expect("building a unique chain");
+        head.chain(seg).expect("building a unique chain");
     }
     head
 }
@@ -91,7 +91,7 @@ fn unique_append_links_tail_and_frees_each_segment_once() {
     let tail = unique_chain(&pool, &[50, 30], 0xB1);
     let tail_ptr = tail.as_ptr();
 
-    head.chain(tail).ok().expect("unique append must succeed");
+    head.chain(tail).expect("unique append must succeed");
 
     let segs = snapshot(&head);
     assert_eq!(segs.len(), 3);
@@ -190,7 +190,7 @@ fn unique_indirect_head_appends_and_direct_with_attached_indirect_is_rejected() 
 
         // The indirect's own link and metadata have one owner: append allowed.
         let tail = filled(&pool, 50, 0x41);
-        indirect.chain(tail).ok().expect("unique indirect head appends");
+        indirect.chain(tail).expect("unique indirect head appends");
         assert_eq!((indirect.nb_segs(), indirect.pkt_len()), (2, 150));
 
         // The attached indirect raises the direct segment's refcount, which
@@ -224,8 +224,8 @@ fn shared_single_segment_tail_fans_in_and_stays_referenced() {
 
         let mut head1 = filled(&pool, 20, 0x51);
         let mut head2 = filled(&pool, 30, 0x52);
-        head1.chain(tail).ok().expect("fan-in onto shared single segment");
-        head2.chain(tail2).ok().expect("fan-in onto shared single segment");
+        head1.chain(tail).expect("fan-in onto shared single segment");
+        head2.chain(tail2).expect("fan-in onto shared single segment");
 
         assert_eq!((head1.nb_segs(), head1.pkt_len()), (2, 120));
         assert_eq!((head2.nb_segs(), head2.pkt_len()), (2, 130));
@@ -329,7 +329,7 @@ fn unique_chain_into_indirect_head_transfers_every_segment() {
     let head = unique_chain(&pool, &[100, 40], 0x72);
     let segs = snapshot(&head);
 
-    let converted = head.into_indirect_head(&pool).ok().expect("unique chain converts");
+    let converted = head.into_indirect_head(&pool).expect("unique chain converts");
     assert!(converted.is_head_indirect());
     let conv = snapshot(&converted);
     assert_eq!((converted.nb_segs(), converted.pkt_len()), (2, 140));
@@ -352,7 +352,7 @@ fn shared_single_segment_into_indirect_head_converts_without_changing_alias() {
         let alias = m.share();
         let before = snapshot(&alias);
 
-        let converted = m.into_indirect_head(&pool).ok().expect("single segment has no link to cut");
+        let converted = m.into_indirect_head(&pool).expect("single segment has no link to cut");
         assert!(converted.is_head_indirect());
         assert_eq!(converted.data(), &[0x73; 100][..]);
         assert_eq!(snapshot(&alias), before, "alias handle + attached indirect keep refcount 2");
@@ -414,7 +414,7 @@ fn shared_trimmed_multi_segment_tail_appends_and_alias_unchanged() {
         let tail2_before = snapshot(&tail2);
         let mut head = filled(&pool, 20, 0x91);
 
-        head.chain(tail).ok().expect("shared tail with pkt_len == data_len appends");
+        head.chain(tail).expect("shared tail with pkt_len == data_len appends");
         assert_eq!((head.nb_segs(), head.pkt_len()), (3, 80));
         assert_eq!(snapshot(&tail2), tail2_before, "other owner's segments changed");
 
@@ -452,7 +452,7 @@ fn into_indirect_head_on_exhausted_destination_returns_chain_unchanged() {
     assert_eq!((src.in_use_count(), dst.in_use_count()), (2, DST));
 
     drop(held.pop());
-    let converted = head.into_indirect_head(&dst).ok().expect("one destination mbuf free");
+    let converted = head.into_indirect_head(&dst).expect("one destination mbuf free");
     assert!(converted.is_head_indirect());
     assert_eq!((converted.nb_segs(), converted.pkt_len()), (2, 140));
     assert_eq!(converted.data(), &[0xA0; 100][..]);
@@ -508,11 +508,11 @@ fn into_indirect_head_with_fan_in_tail_keeps_tail_referenced() {
         let tail_addr = tail.as_ptr() as usize;
         let mut head1 = filled(&pool, 100, 0xC1);
         let mut head2 = filled(&pool, 30, 0xC2);
-        head1.chain(tail).ok().expect("fan-in");
-        head2.chain(tail2).ok().expect("fan-in");
+        head1.chain(tail).expect("fan-in");
+        head2.chain(tail2).expect("fan-in");
         let head2_before = snapshot(&head2);
 
-        let converted = head1.into_indirect_head(&pool).ok().expect("unique head converts");
+        let converted = head1.into_indirect_head(&pool).expect("unique head converts");
         let conv = snapshot(&converted);
         assert_eq!((converted.nb_segs(), converted.pkt_len()), (2, 140));
         assert_eq!((conv[1].addr, conv[1].refcnt), (tail_addr, 2));
@@ -784,7 +784,7 @@ fn header_segment_packet_safe_ops() {
     drop(head_clone);
     assert_segments_not_reallocated(&pool, &packet);
     assert_segments_not_reallocated(&pool, &alias);
-    let converted = packet.into_indirect_head(&pool).ok().expect("header segment is unique and direct");
+    let converted = packet.into_indirect_head(&pool).expect("header segment is unique and direct");
     assert_eq!((converted.nb_segs(), converted.pkt_len()), (2, 130));
     assert_eq!(snapshot(&alias), alias_before);
     drop(converted);
@@ -798,7 +798,7 @@ fn header_segment_packet_safe_ops() {
     // Exclusive old head without room for the header.
     let mut packet = filled(&pool, 100, 0xC0);
     packet.prepend(150).expect("header segment").fill(0xC1);
-    packet.chain(filled(&pool, 30, 0xC2)).ok().expect("old head is exclusive");
+    packet.chain(filled(&pool, 30, 0xC2)).expect("old head is exclusive");
     assert_eq!((packet.nb_segs(), packet.pkt_len()), (3, 280));
     drop(packet);
     assert_eq!(pool.in_use_count(), 0);
@@ -831,7 +831,7 @@ fn header_segment_chain_refused_while_old_head_shared_then_accepted() {
 
     drop(alias);
     assert_segments_not_reallocated(&pool, &packet);
-    packet.chain(tail).ok().expect("old head is exclusive after the alias drops");
+    packet.chain(tail).expect("old head is exclusive after the alias drops");
     let segs = snapshot(&packet);
     assert_eq!((packet.nb_segs(), packet.pkt_len()), (3, 150));
     assert_eq!(segs.iter().map(|s| s.data_len).collect::<Vec<_>>(), [20, 100, 30]);

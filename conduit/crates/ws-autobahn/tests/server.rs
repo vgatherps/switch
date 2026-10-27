@@ -62,8 +62,8 @@ fn close(pair: Pair) {
 }
 
 fn socket(rx: usize, tx: usize) -> tcp::Config {
-    let socket = tcp::Config { rx_capacity: rx, tx_capacity: tx, mss_cap: None };
-    socket
+    
+    tcp::Config { rx_capacity: rx, tx_capacity: tx, mss_cap: None }
 }
 
 fn would_block(error: &Error) -> bool {
@@ -167,11 +167,11 @@ impl<'p> Net<'p> {
     }
 
     fn state(&mut self, handle: &TcpHandle) -> State {
-        self.a.tcp(&handle).state()
+        self.a.tcp(handle).state()
     }
 
     fn wait_state(&mut self, handle: &TcpHandle, state: State) {
-        self.until(|net| (net.state(&handle) == state).then_some(()));
+        self.until(|net| (net.state(handle) == state).then_some(()));
     }
 
     /// Adds `socket` on A and connects it from `local_port`.
@@ -185,11 +185,11 @@ impl<'p> Net<'p> {
     /// Sends `request` and returns every byte received until the first
     /// blank line, which must end them.
     fn upgrade(&mut self, handle: &TcpHandle, request: &[u8]) -> String {
-        let sent = self.a.tcp_mut(&handle).send_slice(request);
+        let sent = self.a.tcp_mut(handle).send_slice(request);
         assert_eq!(sent, Ok(request.len()));
         let mut response = Vec::new();
         self.until(|net| {
-            let bytes = pair::drain_bytes(net.a.tcp_mut(&handle)).unwrap();
+            let bytes = pair::drain_bytes(net.a.tcp_mut(handle)).unwrap();
             response.extend_from_slice(&bytes);
             response.ends_with(b"\r\n\r\n").then_some(())
         });
