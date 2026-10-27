@@ -573,7 +573,7 @@ fn tcp_frame(
 #[test]
 fn tcp_unaffected() {
     let mut test = Test::new(1);
-    let mut socket = tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+    let mut socket = tcp::Socket::test_socket(64, 64);
     socket.set_ack_delay(None);
     socket.listen(PORT).unwrap();
     let handle = test.tcp.add(socket);

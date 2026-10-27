@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(unsafe_code))]
 
-use alloc::collections::VecDeque;
+use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::Cell;
 
 use crate::phy::{TxBuf, TxSource};
@@ -12,6 +12,17 @@ pub(crate) struct TxQueue {
     frame_cap: usize,
     hint: Cell<u32>,
     source: TxSource,
+}
+
+impl core::fmt::Debug for TxQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TxQueue")
+            .field("bytes", &self.len())
+            .field("frames", &self.frames())
+            .field("byte_cap", &self.byte_cap)
+            .field("frame_cap", &self.frame_cap)
+            .finish()
+    }
 }
 
 struct Entry {
@@ -127,6 +138,28 @@ impl TxQueue {
         count
     }
 
+    pub(crate) fn tail_room(&self, sent: usize, cap: usize) -> usize {
+        let first_never_sent = self
+            .acked
+            .checked_add(sent.try_into().expect("sent byte count exceeds u64"))
+            .expect("sent position overflow");
+        let Some(entry) = self.entries.back() else {
+            return 0;
+        };
+        let buf = entry.buf.as_ref().expect("TX queue tail is taken");
+        let start = entry
+            .end
+            .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
+            .expect("TX frame start underflow");
+        if first_never_sent > start || !buf.unique() {
+            return 0;
+        }
+        cap.checked_sub(buf.len())
+            .expect("TX tail length exceeds append cap")
+            .min(buf.capacity().checked_sub(buf.len()).expect("TX buffer length exceeds capacity"))
+            .min(self.byte_room())
+    }
+
     pub(crate) fn ack(&mut self, n: usize) {
         assert!(n <= self.len(), "ACK exceeds queued bytes");
         self.acked = self
@@ -189,6 +222,58 @@ impl TxQueue {
             .checked_add(size.min(buf.len() - within))
             .expect("TX segment end overflow");
         Seg::Cut(&buf.payload()[within..end])
+    }
+
+    pub(crate) fn segment_spans_frames(&self, offset: usize, size: usize) -> bool {
+        if size == 0 || offset >= self.len() {
+            return false;
+        }
+        let position = self
+            .acked
+            .checked_add(offset.try_into().expect("TX segment offset exceeds u64"))
+            .expect("TX segment position overflow");
+        let index = self.locate(position, || {});
+        let entry = self.entries.get(index).expect("TX segment entry missing");
+        position
+            .checked_add(size.try_into().expect("TX segment size exceeds u64"))
+            .expect("TX segment end overflow")
+            > entry.end
+    }
+
+    pub(crate) fn copy_segment(&self, offset: usize, size: usize, output: &mut Vec<u8>) {
+        assert!(offset <= self.len(), "TX segment offset exceeds queued bytes");
+        assert!(size <= self.len() - offset, "TX segment size exceeds queued bytes");
+        output.clear();
+        output.reserve(size);
+        if size == 0 {
+            return;
+        }
+
+        let position = self
+            .acked
+            .checked_add(offset.try_into().expect("TX segment offset exceeds u64"))
+            .expect("TX segment position overflow");
+        let mut index = self.locate(position, || {});
+        let mut copied = 0usize;
+        while copied < size {
+            let entry = self.entries.get(index).expect("TX segment entry missing");
+            let buf = entry.buf.as_ref().expect("TX segment frame is taken");
+            let start = entry
+                .end
+                .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
+                .expect("TX frame start underflow");
+            let within: usize = position
+                .checked_add(copied.try_into().expect("TX copied length exceeds u64"))
+                .expect("TX copy position overflow")
+                .checked_sub(start)
+                .expect("TX copy position precedes frame")
+                .try_into()
+                .expect("TX frame offset exceeds usize");
+            let count = (size - copied).min(buf.len() - within);
+            output.extend_from_slice(&buf.payload()[within..within + count]);
+            copied = copied.checked_add(count).expect("TX copied length overflow");
+            index = index.checked_add(1).expect("TX queue index overflow");
+        }
     }
 
     pub(crate) fn take(&mut self, index: u32) -> TxBuf {
@@ -431,6 +516,29 @@ mod tests {
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4]);
         assert_eq!(cut(queue.segment(1, 3)), &[2]);
+    }
+
+    #[test]
+    fn retransmit_copy_spans_consecutive_frames() {
+        let (mut queue, _) = queue(16, 3, 8);
+        queue.push_bytes(&[1, 2]);
+        queue.push_bytes(&[3, 4, 5]);
+        queue.push_bytes(&[6, 7]);
+        assert!(queue.segment_spans_frames(1, 5));
+        let mut bytes = Vec::new();
+        queue.copy_segment(1, 5, &mut bytes);
+        assert_eq!(bytes, &[2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn retransmit_copy_respects_partial_ack_position() {
+        let (mut queue, _) = queue(16, 2, 8);
+        queue.push_bytes(&[1, 2, 3]);
+        queue.push_bytes(&[4, 5, 6]);
+        queue.ack(2);
+        let mut bytes = Vec::new();
+        queue.copy_segment(0, 4, &mut bytes);
+        assert_eq!(bytes, &[3, 4, 5, 6]);
     }
 
     #[test]

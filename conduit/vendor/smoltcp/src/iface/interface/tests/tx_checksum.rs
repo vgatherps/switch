@@ -168,10 +168,7 @@ fn assert_tcp_frames(device: &RecordingDevice, offload: bool) {
 fn tcp_handshake_and_established_template_carry_checksum_metadata() {
     for offload in [true, false] {
         let (mut iface, mut sockets, mut device) = setup_recording(offload);
-        let mut socket = tcp::Socket::new(
-            tcp::RxBuffer::new(4096),
-            tcp::SocketBuffer::new(vec![0; 4096]),
-        );
+        let mut socket = tcp::Socket::test_socket(4096, 4096);
         socket.set_ack_delay(None);
         socket
             .connect(iface.context(), (REMOTE, 80), (LOCAL, 40000))

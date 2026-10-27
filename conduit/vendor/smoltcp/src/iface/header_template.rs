@@ -1,4 +1,4 @@
-use crate::phy::ChecksumCapabilities;
+use crate::phy::{ChecksumCapabilities, TxHeader};
 use crate::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
     checksum,
@@ -184,6 +184,58 @@ impl TcpTemplate {
                 tcp.window_len,
                 checksum::data(&packet.as_ref()[20..header_len]),
                 checksum::data(tcp.payload),
+            ]);
+            packet.set_checksum(sum);
+        }
+    }
+
+    pub(crate) fn emit_header(
+        &self,
+        header: &mut TxHeader,
+        ip: &Ipv4Repr,
+        tcp: &TcpRepr,
+        payload: &[u8],
+        checksum: &ChecksumCapabilities,
+    ) {
+        assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
+        assert!(tcp.header_len() == 20, "TCP frame header carries options");
+        let frame = header.bytes_mut();
+        self.prefix.emit(frame, ip, checksum);
+        let mut packet = TcpPacket::new_unchecked(&mut frame[34..]);
+        packet.set_src_port(tcp.src_port);
+        packet.set_dst_port(tcp.dst_port);
+        packet.set_seq_number(tcp.seq_number);
+        packet.set_ack_number(tcp.ack_number.expect("TCP template requires ACK"));
+        packet.set_header_len(20);
+        packet.clear_flags();
+        packet.set_ack(true);
+        match tcp.control {
+            TcpControl::None => (),
+            TcpControl::Psh => packet.set_psh(true),
+            TcpControl::Fin => packet.set_fin(true),
+            TcpControl::Rst => packet.set_rst(true),
+            _ => unreachable!("TCP control does not fit template"),
+        }
+        packet.set_window_len(tcp.window_len);
+        packet.set_checksum(0);
+        packet.set_urgent_at(0);
+        if checksum.tcp.tx() {
+            let tcp_len = ip.payload_len as u16;
+            let seq = tcp.seq_number.0 as u32;
+            let ack = tcp.ack_number.expect("TCP template requires ACK").0 as u32;
+            let sum = !checksum::combine(&[
+                self.prefix.pseudo_sum,
+                tcp_len,
+                tcp.src_port,
+                tcp.dst_port,
+                (seq >> 16) as u16,
+                seq as u16,
+                (ack >> 16) as u16,
+                ack as u16,
+                NetworkEndian::read_u16(&packet.as_ref()[12..14]),
+                tcp.window_len,
+                checksum::data(&packet.as_ref()[20..20]),
+                checksum::data(payload),
             ]);
             packet.set_checksum(sum);
         }

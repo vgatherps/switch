@@ -181,6 +181,7 @@ impl TxSource {
     pub fn origin(&self) -> NonNull<()> {
         self.0.origin()
     }
+
 }
 
 /// The app's frame. Clone is cheap; after a clone the payload is read-only.
@@ -217,6 +218,10 @@ impl TxFrame {
 
     pub fn origin(&self) -> NonNull<()> {
         self.0.origin()
+    }
+
+    pub(crate) fn unique(&self) -> bool {
+        self.0.unique()
     }
 
     pub(crate) fn into_buf(self) -> TxBuf {

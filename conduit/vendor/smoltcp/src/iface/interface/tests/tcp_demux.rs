@@ -11,7 +11,7 @@ const REMOTE_PORT: u16 = 65000;
 const REMOTE_SEQ: TcpSeqNumber = TcpSeqNumber(100);
 
 fn socket() -> tcp::Socket<'static> {
-    let mut socket = tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+    let mut socket = tcp::Socket::test_socket(64, 64);
     socket.set_ack_delay(None);
     socket
 }

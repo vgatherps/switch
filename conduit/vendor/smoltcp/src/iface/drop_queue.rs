@@ -84,7 +84,7 @@ mod tests {
     fn handles() -> ([SocketHandle; 3], [UdpHandle; 3]) {
         let mut tcp = TcpSet::new(Vec::new());
         let tcp = core::array::from_fn(|_| {
-            tcp.add(tcp::Socket::new(tcp::RxBuffer::new(0), tcp::SocketBuffer::new(Vec::new())))
+            tcp.add(tcp::Socket::test_socket(0, 0))
         });
         let mut udp = UdpSet::new(3);
         let udp = core::array::from_fn(|index| {

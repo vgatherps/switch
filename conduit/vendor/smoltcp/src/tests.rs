@@ -164,6 +164,10 @@ pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::TxBuf {
     buf
 }
 
+pub(crate) fn tx_test_source(room: usize) -> phy::TxSource {
+    phy::TxSource::new(phy::test_owner::CountingAlloc::new(room))
+}
+
 #[test]
 fn testing_device_frame_token_writes_before_publish() {
     use crate::phy::FrameToken as _;

@@ -95,6 +95,16 @@ impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
     }
 }
 
+enum EgressError {
+    Exhausted,
+    Dispatch,
+}
+
+enum HardwareLookup {
+    Found(HardwareAddress),
+    Arp(Ipv4Address),
+}
+
 /// Result returned by [`Interface::poll`].
 ///
 /// This contains information on whether socket states might have changed.
@@ -666,11 +676,6 @@ impl Interface {
         let visits = classify_dirty(&mut self.inner, sockets, timestamp, true);
         let _caps = device.capabilities();
 
-        enum EgressError {
-            Exhausted,
-            Dispatch,
-        }
-
         let mut result = PollResult::None;
         for _ in 0..visits {
             let index = {
@@ -703,18 +708,59 @@ impl Interface {
                 let template = &mut item.meta.tcp_template;
                 let mut neighbor_addr = None;
                 let mut emitted = false;
-                let mut respond =
-                    |inner: &mut InterfaceInner, meta: PacketMeta, ip: IpRepr, tcp: TcpRepr| {
-                        neighbor_addr = Some(ip.dst_addr());
-                        let t = device.transmit(inner.now).ok_or_else(|| {
-                            net_debug!("failed to transmit IP: device exhausted");
-                            EgressError::Exhausted
-                        })?;
+                let mut respond = |inner: &mut InterfaceInner,
+                                   meta: PacketMeta,
+                                   ip: IpRepr,
+                                   tcp: TcpRepr,
+                                   frame: Option<TxBuf>| {
+                    neighbor_addr = Some(ip.dst_addr());
+                    if let Some(frame) = frame {
+                        if inner.caps.medium == Medium::Ethernet {
+                            if !inner.tcp_frame_template_ready(&ip, &tcp, next_hop, template) {
+                                let now = inner.now;
+                                if let Err(error) = inner.prepare_tcp_frame(
+                                    &ip,
+                                    &tcp,
+                                    &mut *next_hop,
+                                    &mut *template,
+                                    || {
+                                        device.transmit(now).map(|t| TrackedTxToken {
+                                            inner: t,
+                                            consumed: &mut emitted,
+                                        })
+                                    },
+                                ) {
+                                    return (Err(error), Some(frame));
+                                }
+                            }
+                            let Some(t) = device.transmit_frame(inner.now) else {
+                                net_debug!("failed to transmit frame: device exhausted");
+                                return (Err(EgressError::Exhausted), Some(frame));
+                            };
+                            let t = TrackedFrameToken {
+                                inner: t,
+                                consumed: &mut emitted,
+                            };
+                            let frame = inner.dispatch_tcp_frame(
+                                t,
+                                ip,
+                                tcp,
+                                frame,
+                                template.as_ref().expect("TCP frame template is missing"),
+                            );
+                            result = PollResult::SocketStateChanged;
+                            return (Ok(()), Some(frame));
+                        }
 
+                        let Some(t) = device.transmit(inner.now) else {
+                            net_debug!("failed to transmit IP: device exhausted");
+                            return (Err(EgressError::Exhausted), Some(frame));
+                        };
                         let t = TrackedTxToken {
                             inner: t,
                             consumed: &mut emitted,
                         };
+                        let tcp = TcpRepr { payload: frame.payload(), ..tcp };
                         let dispatch = inner.dispatch_tcp(
                             t,
                             meta,
@@ -723,17 +769,38 @@ impl Interface {
                             &mut *next_hop,
                             &mut *template,
                         );
-                        dispatch.map_err(|_| EgressError::Dispatch)?;
+                        if dispatch.is_ok() {
+                            result = PollResult::SocketStateChanged;
+                        }
+                        return (dispatch.map_err(|_| EgressError::Dispatch), Some(frame));
+                    }
 
-                        result = PollResult::SocketStateChanged;
-
-                        Ok(())
+                    let Some(t) = device.transmit(inner.now) else {
+                        net_debug!("failed to transmit IP: device exhausted");
+                        return (Err(EgressError::Exhausted), None);
                     };
+                    let t = TrackedTxToken {
+                        inner: t,
+                        consumed: &mut emitted,
+                    };
+                    let dispatch = inner.dispatch_tcp(
+                        t,
+                        meta,
+                        ip,
+                        tcp,
+                        &mut *next_hop,
+                        &mut *template,
+                    );
+                    if dispatch.is_ok() {
+                        result = PollResult::SocketStateChanged;
+                    }
+                    (dispatch.map_err(|_| EgressError::Dispatch), None)
+                };
 
                 let dispatch_result = item
                     .socket
-                    .dispatch(&mut self.inner, |inner, meta, (ip, tcp)| {
-                        respond(inner, meta, ip, tcp)
+                    .dispatch(&mut self.inner, |inner, meta, (ip, tcp, frame)| {
+                        respond(inner, meta, ip, tcp, frame)
                     });
 
 
@@ -1118,22 +1185,16 @@ impl Interface {
 }
 
 impl InterfaceInner {
-    fn lookup_hardware_addr<Tx>(
+    fn find_hardware_addr(
         &mut self,
-        tx_token: Tx,
         dst_addr: &IpAddress,
-        mut next_hop: Option<
-            &mut Option<(u64, EthernetAddress)>,
-        >,
-    ) -> Result<(HardwareAddress, Tx), DispatchError>
-    where
-        Tx: TxToken,
-    {
+        mut next_hop: Option<&mut Option<(u64, EthernetAddress)>>,
+    ) -> Result<HardwareLookup, DispatchError> {
         if let Some(kept) = next_hop.as_deref_mut() {
             if let Some((changes, mac)) = *kept
                 && changes == self.neighbor_cache.changes()
             {
-                return Ok((HardwareAddress::Ethernet(mac), tx_token));
+                return Ok(HardwareLookup::Found(HardwareAddress::Ethernet(mac)));
             }
             *kept = None;
         }
@@ -1143,8 +1204,7 @@ impl InterfaceInner {
                 #[cfg(feature = "medium-ip")]
                 Medium::Ip => unreachable!(),
             };
-
-            return Ok((hardware_addr, tx_token));
+            return Ok(HardwareLookup::Found(hardware_addr));
         }
 
         if dst_addr.is_multicast() {
@@ -1165,12 +1225,10 @@ impl InterfaceInner {
                     Medium::Ip => unreachable!(),
                 },
             };
-
-            return Ok((hardware_addr, tx_token));
+            return Ok(HardwareLookup::Found(hardware_addr));
         }
 
         let dst_addr = self.route(dst_addr).ok_or(DispatchError::NoRoute)?;
-
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
             NeighborAnswer::Found(hardware_addr) => {
                 if let Some(kept) = next_hop {
@@ -1179,7 +1237,7 @@ impl InterfaceInner {
                         hardware_addr.ethernet_or_panic(),
                     ));
                 }
-                return Ok((hardware_addr, tx_token));
+                Ok(HardwareLookup::Found(hardware_addr))
             }
             NeighborAnswer::Stale {
                 hardware_addr,
@@ -1193,28 +1251,49 @@ impl InterfaceInner {
                         self.probe_owed = Some(addr);
                     }
                 }
-                return Ok((hardware_addr, tx_token));
+                Ok(HardwareLookup::Found(hardware_addr))
             }
-            NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
-            _ => (), // XXX
+            NeighborAnswer::RateLimited => Err(DispatchError::NeighborPending),
+            _ => match dst_addr {
+                IpAddress::Ipv4(dst_addr) if matches!(self.caps.medium, Medium::Ethernet) => {
+                    Ok(HardwareLookup::Arp(dst_addr))
+                }
+                #[allow(unreachable_patterns)]
+                _ => Err(DispatchError::NeighborPending),
+            },
         }
+    }
 
-        match dst_addr {
-            IpAddress::Ipv4(dst_addr) if matches!(self.caps.medium, Medium::Ethernet) => {
-                net_debug!(
-                    "address {} not in neighbor cache, sending ARP request",
-                    dst_addr
-                );
-                self.dispatch_arp_request(tx_token, dst_addr)?;
+    fn send_arp_request<Tx: TxToken>(
+        &mut self,
+        tx_token: Tx,
+        dst_addr: Ipv4Address,
+    ) -> Result<(), DispatchError> {
+        net_debug!(
+            "address {} not in neighbor cache, sending ARP request",
+            dst_addr
+        );
+        self.dispatch_arp_request(tx_token, dst_addr)?;
+        self.neighbor_cache.limit_rate(dst_addr.into(), self.now);
+        Ok(())
+    }
+
+    fn lookup_hardware_addr<Tx>(
+        &mut self,
+        tx_token: Tx,
+        dst_addr: &IpAddress,
+        next_hop: Option<&mut Option<(u64, EthernetAddress)>>,
+    ) -> Result<(HardwareAddress, Tx), DispatchError>
+    where
+        Tx: TxToken,
+    {
+        match self.find_hardware_addr(dst_addr, next_hop)? {
+            HardwareLookup::Found(hardware_addr) => Ok((hardware_addr, tx_token)),
+            HardwareLookup::Arp(dst_addr) => {
+                self.send_arp_request(tx_token, dst_addr)?;
+                Err(DispatchError::NeighborPending)
             }
-
-            #[allow(unreachable_patterns)]
-            _ => (),
         }
-
-        // The request got dispatched, limit the rate on the cache.
-        self.neighbor_cache.limit_rate(dst_addr, self.now);
-        Err(DispatchError::NeighborPending)
     }
 
     fn dispatch_arp_request<Tx: TxToken>(

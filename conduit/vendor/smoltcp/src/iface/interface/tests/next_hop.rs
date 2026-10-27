@@ -105,10 +105,7 @@ impl Peer {
             iface.set_ipv4_gateway(Some(gateway));
         }
         let mut sockets = TcpSet::new(vec![]);
-        let mut socket = tcp::Socket::new(
-            tcp::RxBuffer::new(4096),
-            tcp::SocketBuffer::new(vec![0; 4096]),
-        );
+        let mut socket = tcp::Socket::test_socket(4096, 4096);
         socket.set_ack_delay(None);
         configure(&mut iface, &mut socket);
         let handle = sockets.add(socket);
@@ -390,9 +387,7 @@ fn challenge_ack_uses_template_and_unknown_flow_reset_stays_generic() {
 fn ingress_reply_rebuilds_template_in_winning_slot() {
     let mut peer = Peer::new(2, PEER, None);
     let (socket, _) = peer.sockets.take(peer.handle);
-    let unrelated = peer.sockets.add(tcp::Socket::new(
-        tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]),
-    ));
+    let unrelated = peer.sockets.add(tcp::Socket::test_socket(64, 64));
     peer.sockets.get_mut(unrelated).listen(40001).unwrap();
     peer.handle = peer.sockets.add(socket);
     assert!(peer.sockets.item_at_mut(1).unwrap().meta.tcp_template.is_none());
@@ -897,10 +892,7 @@ mod invalidation {
     #[test]
     fn relisten_renegotiates_options() {
         let mut peer = Peer::configured(2, PEER, None, |_, socket| {
-            *socket = tcp::Socket::new(
-                tcp::RxBuffer::new(131072),
-                tcp::SocketBuffer::new(vec![0; 4096]),
-            );
+            *socket = tcp::Socket::test_socket(131072, 4096);
             socket.set_ack_delay(None);
         });
         peer.warm();
@@ -1296,10 +1288,7 @@ mod invalidation {
                 PEER,
                 None,
                 |_, socket| {
-                    *socket = tcp::Socket::new(
-                        tcp::RxBuffer::new(131072),
-                        tcp::SocketBuffer::new(vec![0; 4096]),
-                    );
+                    *socket = tcp::Socket::test_socket(131072, 4096);
                     socket.set_ack_delay(None);
                 },
                 |syn| syn.window_scale = Some(7),

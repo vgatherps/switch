@@ -1,8 +1,100 @@
 use super::*;
 
+use crate::iface::header_template::TcpTemplate;
 use crate::socket::tcp::Socket;
 
 impl InterfaceInner {
+    pub(super) fn tcp_frame_template_ready(
+        &self,
+        ip: &IpRepr,
+        tcp: &TcpRepr,
+        next_hop: &Option<(u64, EthernetAddress)>,
+        template: &Option<crate::iface::header_template::TcpTemplate>,
+    ) -> bool {
+        let IpRepr::Ipv4(ip4) = ip;
+        self.caps.medium == Medium::Ethernet
+            && TcpTemplate::is_eligible(tcp)
+            && next_hop.is_some_and(|(generation, _)| generation == self.neighbor_cache.changes())
+            && template.as_ref().is_some_and(|template| {
+                template.fits(
+                    self.neighbor_cache.changes(),
+                    self.hardware_addr.ethernet_or_panic(),
+                    ip4,
+                    tcp,
+                )
+            })
+    }
+
+    pub(super) fn prepare_tcp_frame<Tx: TxToken>(
+        &mut self,
+        ip: &IpRepr,
+        tcp: &TcpRepr,
+        next_hop: &mut Option<(u64, EthernetAddress)>,
+        template: &mut Option<crate::iface::header_template::TcpTemplate>,
+        reserve: impl FnOnce() -> Option<Tx>,
+    ) -> Result<(), EgressError> {
+        let IpRepr::Ipv4(ip4) = ip;
+        assert_eq!(self.caps.medium, Medium::Ethernet);
+        assert!(TcpTemplate::is_eligible(tcp));
+        let changes = self.neighbor_cache.changes();
+        let src_mac = self.hardware_addr.ethernet_or_panic();
+        let mac = match self
+            .find_hardware_addr(&ip.dst_addr(), Some(next_hop))
+            .map_err(|_| EgressError::Dispatch)?
+        {
+            HardwareLookup::Found(mac) => mac,
+            HardwareLookup::Arp(dst_addr) => {
+                let tx = reserve().ok_or(EgressError::Exhausted)?;
+                self.send_arp_request(tx, dst_addr)
+                    .map_err(|_| EgressError::Dispatch)?;
+                return Err(EgressError::Dispatch);
+            }
+        };
+        *template = Some(TcpTemplate::new(
+            src_mac,
+            mac.ethernet_or_panic(),
+            ip4,
+            tcp.src_port,
+            tcp.dst_port,
+            changes,
+        ));
+        Ok(())
+    }
+
+    pub(super) fn dispatch_tcp_frame<Frame: PhyFrameToken>(
+        &mut self,
+        frame_token: Frame,
+        ip: IpRepr,
+        mut tcp: TcpRepr,
+        frame: TxBuf,
+        template: &crate::iface::header_template::TcpTemplate,
+    ) -> TxBuf {
+        let IpRepr::Ipv4(ip4) = ip;
+        if let Some(max_burst_size) = self.caps.max_burst_size {
+            let max_segment_size = self.caps.max_transmission_unit - 20 - tcp.header_len();
+            let max_window_size = max_burst_size * max_segment_size;
+            if tcp.window_len as usize > max_window_size {
+                tcp.window_len = max_window_size as u16;
+            }
+        }
+        let header_len = 14usize
+            .checked_add(ip4.buffer_len())
+            .and_then(|len| len.checked_add(tcp.header_len()))
+            .expect("TCP frame header length exceeds usize");
+        let tx_checksum = self.tx_checksum(&ip, tcp.header_len());
+        let mut header = TxHeader::new(header_len, tx_checksum);
+        template.emit_header(&mut header, &ip4, &tcp, frame.payload(), &self.caps.checksum);
+        let frame = frame_token.consume_retain(header, frame);
+        #[cfg(test)]
+        {
+            self.template_frames = self
+                .template_frames
+                .checked_add(1)
+                .expect("TCP template frame count overflow");
+        }
+        frame
+    }
+
     pub(super) fn dispatch_tcp<Tx: TxToken>(
         &mut self,
         mut tx: Tx,
