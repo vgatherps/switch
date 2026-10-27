@@ -176,8 +176,12 @@ impl Net {
     ///
     /// A panic out of `Stack::turn` poisons the Net: every later call except
     /// drops and `into_stack` panics. A panic out of a waker's `wake`
-    /// propagates and discards this turn's result (the `Turn` or the error);
-    /// the ready tasks not yet woken are woken by the next turn.
+    /// propagates and discards this turn's result (the `Turn` or the error).
+    /// The ready tasks not yet woken are kept and woken first by later turns,
+    /// after their `Stack::turn`. A turn stops delivering at a panicking
+    /// wake, so under repeated panics the kept wakers go out over several
+    /// turns, at most one panicking wake per turn. Sockets that become ready
+    /// meanwhile are checked only once every kept waker has been delivered.
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut wake = Wake::Nothing;
