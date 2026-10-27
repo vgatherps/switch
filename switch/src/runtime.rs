@@ -2,15 +2,15 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::fmt;
-use std::future::Future;
 use std::rc::Rc;
 
-use crate::executor::wake_task;
+use crate::__private::Task;
 use crate::executor::{DEFAULT_CAPACITY, Executor, Lifecycle};
+use crate::task::SpawnToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
-    /// Ready-queue reservation; tasks still allocate individually.
+    /// Ready-queue reservation; task slots come from per-function slabs.
     pub tasks: usize,
     /// Timer-registration and expiry-index reservation.
     pub timers: usize,
@@ -53,13 +53,13 @@ pub struct PollReport {
     pub live_tasks: usize,
 }
 
-/// A rejected task submission and the original future.
-pub struct SpawnError<F> {
+/// A rejected task submission and the original token.
+pub struct SpawnError<T> {
     pub reason: RuntimeError,
-    pub future: F,
+    pub token: SpawnToken<T>,
 }
 
-impl<F> fmt::Debug for SpawnError<F> {
+impl<T> fmt::Debug for SpawnError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpawnError")
             .field("reason", &self.reason)
@@ -187,7 +187,7 @@ impl Runtime {
                     break;
                 };
                 timers_expired += 1;
-                wake_task(task);
+                Executor::wake_task(task);
             }
             let batch = Executor::poll_batch(&mut turn);
             let report = PollReport {
@@ -248,19 +248,17 @@ impl Spawner {
         Ok(crate::sleep::Sleep::new(deadline, self.control.clone()))
     }
 
-    /// Submit a unit-output future. Rejection returns the original future.
-    pub fn spawn<F>(&self, future: F) -> Result<(), SpawnError<F>>
-    where
-        F: Future<Output = ()> + 'static,
-    {
+    /// Submit a task function's token. Rejection returns the token before any
+    /// task storage is touched.
+    pub fn spawn<T: Task>(&self, token: SpawnToken<T>) -> Result<(), SpawnError<T>> {
         match self.control.open_core() {
             Ok(root) => {
-                unsafe { Executor::spawn(root, future) };
+                unsafe { Executor::spawn(root, token) };
                 Ok(())
             }
             Err(reason) => Err(SpawnError {
                 reason: reason.into(),
-                future,
+                token,
             }),
         }
     }

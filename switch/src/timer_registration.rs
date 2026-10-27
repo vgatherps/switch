@@ -1,7 +1,8 @@
 //! Versioned timer subscriptions with independent wheel and task membership.
 
 use crate::intrusive::{IntrusiveLinks, Linked, NIL, Timed};
-use crate::task::{TaskHeader, TaskState};
+use crate::task::TaskHeader;
+use crate::task::slab::TaskRef;
 use crate::timer_wheel::{InsertOutcome, TimeRegressed, TimerWheel, WheelEntry, WheelPosition};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,8 +30,8 @@ struct Entry {
     state: State,
     owner_prev: u32,
     owner_next: u32,
-    owner: *mut TaskHeader,
-    wake: Option<*mut TaskHeader>,
+    owner: *const TaskHeader,
+    wake: Option<TaskRef>,
 }
 
 impl Linked for Entry {
@@ -100,7 +101,8 @@ impl TimerStore {
     /// exclusively to this store; retire here before freeing the task.
     pub(crate) unsafe fn register(
         &mut self,
-        owner: *mut TaskHeader,
+        owner: *const TaskHeader,
+        wake: TaskRef,
         deadline: u64,
     ) -> Result<Token, RegistrationExhausted> {
         self.drained();
@@ -109,10 +111,7 @@ impl TimerStore {
             "registration deadline is due"
         );
         unsafe {
-            assert!(
-                (*owner).state != TaskState::Terminal,
-                "terminal timer owner"
-            );
+            assert!(TaskHeader::is_live(owner), "terminal timer owner");
         }
         let index = if self.free_head != NIL {
             let index = self.free_head;
@@ -134,7 +133,7 @@ impl TimerStore {
                 state: State::Free,
                 owner_prev: NIL,
                 owner_next: NIL,
-                owner: std::ptr::null_mut(),
+                owner: std::ptr::null(),
                 wake: None,
             });
             index
@@ -142,7 +141,7 @@ impl TimerStore {
         let entry = &mut self.entries[index as usize];
         entry.deadline = deadline;
         entry.state = State::Pending;
-        entry.wake = Some(owner);
+        entry.wake = Some(wake);
         unsafe {
             self.attach(index, owner);
         }
@@ -175,16 +174,18 @@ impl TimerStore {
     /// Token originated in this store (possibly stale). New owner is a stable
     /// live task on the owner thread; both task reg_heads belong exclusively
     /// to this store. All referenced tasks remain alive; handoff is drained.
-    pub(crate) unsafe fn refresh(&mut self, token: Token, owner: *mut TaskHeader) -> bool {
+    pub(crate) unsafe fn refresh(
+        &mut self,
+        token: Token,
+        owner: *const TaskHeader,
+        wake: TaskRef,
+    ) -> bool {
         self.drained();
         if !self.valid(token) {
             return false;
         }
         unsafe {
-            assert!(
-                (*owner).state != TaskState::Terminal,
-                "terminal timer owner"
-            );
+            assert!(TaskHeader::is_live(owner), "terminal timer owner");
             if self.entries[token.index as usize].owner != owner {
                 self.detach(token.index);
                 self.attach(token.index, owner);
@@ -192,7 +193,7 @@ impl TimerStore {
         }
         let entry = &mut self.entries[token.index as usize];
         if entry.state == State::Pending {
-            entry.wake = Some(owner);
+            entry.wake = Some(wake);
         }
         true
     }
@@ -201,11 +202,11 @@ impl TimerStore {
     /// # Safety
     /// Stable task on the owner thread, with reg_head owned exclusively by this
     /// store. Every referenced task remains alive and the handoff is drained.
-    pub(crate) unsafe fn retire(&mut self, owner: *mut TaskHeader) {
+    pub(crate) unsafe fn retire(&mut self, owner: *const TaskHeader) {
         self.drained();
         unsafe {
             loop {
-                let head = (*owner).reg_head;
+                let head = TaskHeader::reg_head(owner).get();
                 if head == NIL {
                     break;
                 }
@@ -222,16 +223,16 @@ impl TimerStore {
     }
 
     /// Normalize before returning a copied wake; no entry borrow escapes.
-    pub(crate) fn pop_expired(&mut self) -> Option<*mut TaskHeader> {
+    pub(crate) fn pop_expired(&mut self) -> Option<TaskRef> {
         let index = self.expired.pop()?;
         let entry = &mut self.entries[index as usize];
         entry.state = State::Expired;
         Some(entry.wake.take().expect("pending timer has no wake"))
     }
 
-    unsafe fn attach(&mut self, index: u32, owner: *mut TaskHeader) {
+    unsafe fn attach(&mut self, index: u32, owner: *const TaskHeader) {
         unsafe {
-            let next = (*owner).reg_head;
+            let next = TaskHeader::reg_head(owner).get();
             let entry = &mut self.entries[index as usize];
             entry.owner = owner;
             entry.owner_prev = NIL;
@@ -239,7 +240,7 @@ impl TimerStore {
             if next != NIL {
                 self.entries[next as usize].owner_prev = index;
             }
-            (*owner).reg_head = index;
+            TaskHeader::reg_head(owner).set(index);
         }
     }
 
@@ -248,7 +249,7 @@ impl TimerStore {
             let entry = &self.entries[index as usize];
             let (owner, prev, next) = (entry.owner, entry.owner_prev, entry.owner_next);
             if prev == NIL {
-                (*owner).reg_head = next;
+                TaskHeader::reg_head(owner).set(next);
             } else {
                 self.entries[prev as usize].owner_next = next;
             }
@@ -256,7 +257,7 @@ impl TimerStore {
                 self.entries[next as usize].owner_prev = prev;
             }
             let entry = &mut self.entries[index as usize];
-            entry.owner = std::ptr::null_mut();
+            entry.owner = std::ptr::null();
             entry.owner_prev = NIL;
             entry.owner_next = NIL;
         }

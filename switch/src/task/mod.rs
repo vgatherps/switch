@@ -1,13 +1,38 @@
-//! Task abstraction.
+//! Tasks: futures of marked task functions, stored in per-function slabs.
 //!
-//! A task is a heap-allocated structure containing:
-//! - An ownership header with executor pointer and function pointers
-//! - The future being executed
-//!
-//! The header layout enables wakers to wake tasks without thread-local access.
+//! A task is one call of a task function. Its future sits in a slot of a 64-slot
+//! slab and never moves. A `Waker`'s data is the task header pointer.
 
-mod header;
-mod storage;
+pub(crate) mod header;
+pub(crate) mod pool;
+pub mod private;
+pub(crate) mod slab;
 
-pub use header::{TaskHeader, TaskState};
-pub use storage::TaskBox;
+#[cfg(test)]
+mod tests;
+
+use std::marker::PhantomData;
+
+pub(crate) use header::TaskHeader;
+
+/// A task function's packaged call, ready for [`crate::Spawner::spawn`].
+///
+/// Dropping an unspawned token drops only the arguments. Not `Send`, `Sync` or `Clone`.
+#[must_use = "a task does nothing until spawned"]
+pub struct SpawnToken<T> {
+    payload: T,
+    _local: PhantomData<*const ()>,
+}
+
+impl<T> SpawnToken<T> {
+    pub(crate) fn new(payload: T) -> Self {
+        Self {
+            payload,
+            _local: PhantomData,
+        }
+    }
+
+    pub(crate) fn into_payload(self) -> T {
+        self.payload
+    }
+}

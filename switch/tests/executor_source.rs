@@ -4,9 +4,13 @@ use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use switch::{Runtime, StoredWaker, current_task};
+use switch::{Runtime, Spawner};
+
+#[macro_use]
+#[path = "support/task_macro.rs"]
+mod task_macro;
 
 struct YieldN(u32);
 
@@ -24,9 +28,8 @@ impl Future for YieldN {
 }
 
 /// Demonstrates how a runtime primitive would store a waker.
-/// Uses the unsafe StoredWaker API instead of Waker::clone().
 struct ManualWake {
-    waker_slot: Rc<Cell<Option<StoredWaker>>>,
+    waker_slot: Rc<Cell<Option<Waker>>>,
     done: bool,
 }
 
@@ -36,11 +39,62 @@ impl Future for ManualWake {
         if self.done {
             Poll::Ready(())
         } else {
-            // SAFETY: Task is alive for duration of this test.
-            self.waker_slot.set(Some(unsafe { StoredWaker::new(cx) }));
+            self.waker_slot.set(Some(cx.waker().clone()));
             self.done = true;
             Poll::Pending
         }
+    }
+}
+
+task! {
+    async fn set_true(flag: Rc<Cell<bool>>) {
+        flag.set(true);
+    }
+}
+
+task! {
+    async fn yield_then_set_one(count: Rc<Cell<u32>>) {
+        YieldN(3).await;
+        count.set(1);
+    }
+}
+
+task! {
+    async fn increment(count: Rc<Cell<u32>>) {
+        count.set(count.get() + 1);
+    }
+}
+
+task! {
+    async fn spawn_set_true(spawner: Spawner, flag: Rc<Cell<bool>>) {
+        spawner.spawn(set_true(flag)).unwrap();
+    }
+}
+
+task! {
+    async fn manual_wake_then_set(waker_slot: Rc<Cell<Option<Waker>>>, done: Rc<Cell<bool>>) {
+        ManualWake {
+            waker_slot,
+            done: false,
+        }
+        .await;
+        done.set(true);
+    }
+}
+
+task! {
+    async fn log_around_yield(
+        log: Rc<Cell<Vec<&'static str>>>,
+        start: &'static str,
+        end: &'static str,
+    ) {
+        let mut v = log.take();
+        v.push(start);
+        log.set(v);
+        YieldN(1).await;
+        let mut v = log.take();
+        v.push(end);
+        log.set(v);
     }
 }
 
@@ -49,13 +103,8 @@ fn test_spawn_and_poll() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let ran = Rc::new(Cell::new(false));
-    let ran_clone = ran.clone();
 
-    spawner
-        .spawn(async move {
-            ran_clone.set(true);
-        })
-        .unwrap();
+    spawner.spawn(set_true(ran.clone())).unwrap();
 
     let report = runtime.poll(0).unwrap();
     assert_eq!(
@@ -74,14 +123,8 @@ fn test_yield_and_resume() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let count = Rc::new(Cell::new(0));
-    let count_clone = count.clone();
 
-    spawner
-        .spawn(async move {
-            YieldN(3).await;
-            count_clone.set(1);
-        })
-        .unwrap();
+    spawner.spawn(yield_then_set_one(count.clone())).unwrap();
 
     let mut polls = 0;
     let mut report = runtime.poll(0).unwrap();
@@ -102,12 +145,7 @@ fn test_multiple_tasks() {
     let count = Rc::new(Cell::new(0));
 
     for _ in 0..10 {
-        let c = count.clone();
-        spawner
-            .spawn(async move {
-                c.set(c.get() + 1);
-            })
-            .unwrap();
+        spawner.spawn(increment(count.clone())).unwrap();
     }
 
     let report = runtime.poll(0).unwrap();
@@ -128,16 +166,9 @@ fn test_nested_spawn() {
     let spawner = runtime.spawner();
     let inner_spawner = spawner.clone();
     let inner_ran = Rc::new(Cell::new(false));
-    let inner_clone = inner_ran.clone();
 
     spawner
-        .spawn(async move {
-            inner_spawner
-                .spawn(async move {
-                    inner_clone.set(true);
-                })
-                .unwrap();
-        })
+        .spawn(spawn_set_true(inner_spawner, inner_ran.clone()))
         .unwrap();
 
     let first = runtime.poll(0).unwrap();
@@ -161,20 +192,11 @@ fn test_nested_spawn() {
 fn test_stored_waker_across_polls() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
-    let waker_slot: Rc<Cell<Option<StoredWaker>>> = Rc::new(Cell::new(None));
-    let slot_clone = waker_slot.clone();
+    let waker_slot: Rc<Cell<Option<Waker>>> = Rc::new(Cell::new(None));
     let done = Rc::new(Cell::new(false));
-    let done_clone = done.clone();
 
     spawner
-        .spawn(async move {
-            ManualWake {
-                waker_slot: slot_clone,
-                done: false,
-            }
-            .await;
-            done_clone.set(true);
-        })
+        .spawn(manual_wake_then_set(waker_slot.clone(), done.clone()))
         .unwrap();
 
     let first = runtime.poll(0).unwrap(); // First poll stores waker
@@ -203,30 +225,11 @@ fn test_interleaved_yields() {
     let spawner = runtime.spawner();
     let log = Rc::new(Cell::new(Vec::<&'static str>::new()));
 
-    let log_a = log.clone();
     spawner
-        .spawn(async move {
-            let mut v = log_a.take();
-            v.push("A start");
-            log_a.set(v);
-            YieldN(1).await;
-            let mut v = log_a.take();
-            v.push("A end");
-            log_a.set(v);
-        })
+        .spawn(log_around_yield(log.clone(), "A start", "A end"))
         .unwrap();
-
-    let log_b = log.clone();
     spawner
-        .spawn(async move {
-            let mut v = log_b.take();
-            v.push("B start");
-            log_b.set(v);
-            YieldN(1).await;
-            let mut v = log_b.take();
-            v.push("B end");
-            log_b.set(v);
-        })
+        .spawn(log_around_yield(log.clone(), "B start", "B end"))
         .unwrap();
 
     let mut report = runtime.poll(0).unwrap();
@@ -244,51 +247,5 @@ fn test_interleaved_yields() {
 #[test]
 fn test_empty_poll() {
     let mut runtime = Runtime::new(0);
-    assert_eq!(
-        runtime.poll(0).unwrap(),
-        switch::PollReport::default()
-    );
-}
-
-/// Future that uses ThinWaker instead of std Waker.
-struct ThinYieldN(u32);
-
-impl Future for ThinYieldN {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 == 0 {
-            Poll::Ready(())
-        } else {
-            self.0 -= 1;
-            // Wake directly via ThinWaker, no vtable indirection
-            current_task(cx).wake();
-            Poll::Pending
-        }
-    }
-}
-
-#[test]
-fn test_thin_waker() {
-    let mut runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let count = Rc::new(Cell::new(0));
-    let count_clone = count.clone();
-
-    spawner
-        .spawn(async move {
-            ThinYieldN(3).await;
-            count_clone.set(1);
-        })
-        .unwrap();
-
-    let mut polls = 0;
-    let mut report = runtime.poll(0).unwrap();
-    polls += report.tasks_polled;
-    while report.live_tasks != 0 {
-        report = runtime.poll(0).unwrap();
-        polls += report.tasks_polled;
-    }
-
-    assert_eq!(polls, 4);
-    assert_eq!(count.get(), 1);
+    assert_eq!(runtime.poll(0).unwrap(), switch::PollReport::default());
 }

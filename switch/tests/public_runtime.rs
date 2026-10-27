@@ -1,7 +1,25 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use switch::{Capacity, Runtime, SleepError};
+use switch::{Capacity, Runtime, SleepError, Spawner};
+
+#[macro_use]
+#[path = "support/task_macro.rs"]
+mod task_macro;
+
+task! {
+    async fn sleep_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
+        spawner.sleep(10).unwrap().await.unwrap();
+        completed.set(true);
+    }
+}
+
+task! {
+    async fn sleep_until_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
+        spawner.sleep_until(110).unwrap().await.unwrap();
+        completed.set(true);
+    }
+}
 
 struct Interface {
     calls: usize,
@@ -26,13 +44,9 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
     let spawner = runtime.spawner();
     let sleep_spawner = spawner.clone();
     let completed = Rc::new(Cell::new(false));
-    let task_completed = completed.clone();
 
     spawner
-        .spawn(async move {
-            sleep_spawner.sleep(10).unwrap().await.unwrap();
-            task_completed.set(true);
-        })
+        .spawn(sleep_then_set(sleep_spawner, completed.clone()))
         .unwrap();
 
     let mut interface = Interface { calls: 0 };
@@ -64,12 +78,8 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
 
     let due_spawner = spawner.clone();
     let due_completed = Rc::new(Cell::new(false));
-    let task_due_completed = due_completed.clone();
     spawner
-        .spawn(async move {
-            due_spawner.sleep_until(110).unwrap().await.unwrap();
-            task_due_completed.set(true);
-        })
+        .spawn(sleep_until_then_set(due_spawner, due_completed.clone()))
         .unwrap();
     let due = runtime.poll(110).unwrap();
     assert_eq!(

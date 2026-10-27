@@ -20,20 +20,40 @@
 //!
 //! ## Waking
 //!
-//! Use `wake_by_ref()` or `current_task(cx).wake()` for self-waking. Cloning an ordinary
-//! `Waker` panics, so futures that require `Waker::clone()` are unsupported. Runtime
-//! primitives that retain a wake may use [`StoredWaker`], whose construction is unsafe.
+//! A task's `Waker` points at its task header. Waking, cloning and dropping it do not
+//! allocate, but only on the runtime's thread: each of them panics on another thread.
 //!
 //! ## Example
 //!
 //! ```rust
 //! use switch::Runtime;
 //!
+//! // Hand-written expansion of `#[switch::task] async fn hello() { println!("Hello!"); }`.
+//! fn hello() -> switch::SpawnToken<impl switch::__private::Task> {
+//!     async fn __hello_task() {
+//!         println!("Hello!");
+//!     }
+//!     thread_local! {
+//!         static POOL: switch::__private::Pool = const { switch::__private::Pool::new() };
+//!     }
+//!     struct Key;
+//!     static WAKER: std::task::RawWakerVTable =
+//!         switch::__private::waker_vtable::<Key, _, _>(__hello_task);
+//!     unsafe impl switch::__private::PoolKey for Key {
+//!         fn pool() -> &'static std::thread::LocalKey<switch::__private::Pool> {
+//!             &POOL
+//!         }
+//!         fn waker() -> &'static std::task::RawWakerVTable {
+//!             &WAKER
+//!         }
+//!     }
+//!     // SAFETY: Key's pool is private to this function, which always produces one future type.
+//!     unsafe { switch::__private::token::<Key, _, _>(move || __hello_task()) }
+//! }
+//!
 //! let mut runtime = Runtime::new(100);
 //! let spawner = runtime.spawner();
-//! spawner.spawn(async {
-//!     println!("Hello!");
-//! }).unwrap();
+//! spawner.spawn(hello()).unwrap();
 //!
 //! while runtime.poll(100).unwrap().live_tasks != 0 {}
 //! ```
@@ -63,6 +83,14 @@
 //! require_sync::<switch::Sleep>();
 //! ```
 //! ```compile_fail
+//! fn require_send<T: Send>() {}
+//! require_send::<switch::SpawnToken<()>>();
+//! ```
+//! ```compile_fail
+//! fn require_sync<T: Sync>() {}
+//! require_sync::<switch::SpawnToken<()>>();
+//! ```
+//! ```compile_fail
 //! fn cannot_drive(spawner: &switch::Spawner) {
 //!     spawner.poll(0);
 //! }
@@ -72,6 +100,14 @@
 //!     spawner.shutdown();
 //! }
 //! ```
+
+#[cfg(test)]
+extern crate self as switch;
+
+#[cfg(test)]
+#[macro_use]
+#[path = "../tests/support/task_macro.rs"]
+mod task_macro;
 
 mod executor;
 pub(crate) mod intrusive;
@@ -84,7 +120,10 @@ mod waker;
 
 pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
-pub use waker::{StoredWaker, ThinWaker, current_task};
+pub use task::SpawnToken;
+
+#[doc(hidden)]
+pub use task::private as __private;
 
 #[cfg(test)]
 mod extraction_smoke;
