@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+libc = "0.2"
+ceph-rseq = { path = "crates/rseq" }
+ceph-ring = { path = "crates/ring" }
+ceph-proto = { path = "crates/proto" }
+ceph-control = { path = "crates/control" }

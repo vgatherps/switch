@@ -1,0 +1,8 @@
+/target
+plans
+/results
+__pycache__/
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
