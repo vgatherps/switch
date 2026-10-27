@@ -1,8 +1,10 @@
 //! switchnet receive side against a raw conduit Stack peer on net_ring.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
@@ -353,58 +355,83 @@ fn into_stack_refused_while_a_socket_or_handle_lives() {
     })
 }
 
-/// A waker whose clone and drop callbacks open and close a UDP socket through
-/// a NetHandle: switchnet must not run them while it holds the stack.
-struct Reenter {
-    handle: NetHandle,
+/// A raw waker that counts every clone, wake and drop call made on it, and
+/// runs `on_clone` in each clone and `on_other` in each wake and drop.
+struct Hooked {
     clones: Cell<usize>,
     wakes: Cell<usize>,
     drops: Cell<usize>,
+    on_clone: Box<dyn Fn()>,
+    on_other: Box<dyn Fn()>,
 }
 
-impl Reenter {
-    fn touch(&self) {
-        drop(self.handle.udp_bind(udp_config(9000)).unwrap());
+impl Hooked {
+    fn new(on_clone: impl Fn() + 'static, on_other: impl Fn() + 'static) -> Box<Self> {
+        Box::new(Self {
+            clones: Cell::new(0),
+            wakes: Cell::new(0),
+            drops: Cell::new(0),
+            on_clone: Box::new(on_clone),
+            on_other: Box::new(on_other),
+        })
+    }
+
+    /// `[clones, wakes, drops]` so far.
+    fn counts(&self) -> [usize; 3] {
+        [self.clones.get(), self.wakes.get(), self.drops.get()]
+    }
+
+    /// A waker on `self` that is never dropped, so it adds no count itself.
+    fn waker(&self) -> ManuallyDrop<Waker> {
+        ManuallyDrop::new(unsafe { Waker::from_raw(RawWaker::new(std::ptr::from_ref(self).cast(), &HOOKED_VTABLE)) })
+    }
+
+    fn at<'a>(data: *const ()) -> &'a Hooked {
+        unsafe { &*data.cast::<Hooked>() }
     }
 }
 
-static REENTER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+static HOOKED_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| {
-        let reenter = unsafe { &*data.cast::<Reenter>() };
-        reenter.clones.set(reenter.clones.get() + 1);
-        reenter.touch();
-        RawWaker::new(data, &REENTER_VTABLE)
+        let hooked = Hooked::at(data);
+        hooked.clones.set(hooked.clones.get() + 1);
+        (hooked.on_clone)();
+        RawWaker::new(data, &HOOKED_VTABLE)
     },
     |data| {
-        let reenter = unsafe { &*data.cast::<Reenter>() };
-        reenter.wakes.set(reenter.wakes.get() + 1);
-        reenter.touch();
+        let hooked = Hooked::at(data);
+        hooked.wakes.set(hooked.wakes.get() + 1);
+        (hooked.on_other)();
     },
     |data| {
-        let reenter = unsafe { &*data.cast::<Reenter>() };
-        reenter.wakes.set(reenter.wakes.get() + 1);
-        reenter.touch();
+        let hooked = Hooked::at(data);
+        hooked.wakes.set(hooked.wakes.get() + 1);
+        (hooked.on_other)();
     },
     |data| {
-        let reenter = unsafe { &*data.cast::<Reenter>() };
-        reenter.drops.set(reenter.drops.get() + 1);
-        reenter.touch();
+        let hooked = Hooked::at(data);
+        hooked.drops.set(hooked.drops.get() + 1);
+        (hooked.on_other)();
     },
 );
+
+/// Clone, wake and drop callbacks open and close a UDP socket through a
+/// NetHandle: switchnet must not run them while it holds the stack.
+fn reenter(handle: NetHandle) -> Box<Hooked> {
+    let touch = |handle: &NetHandle| drop(handle.udp_bind(udp_config(9000)).unwrap());
+    let other = handle.clone();
+    Hooked::new(move || touch(&handle), move || touch(&other))
+}
 
 #[zhida_test_support::pinned_test]
 fn waker_clone_and_drop_may_reenter_the_net() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["reea", "reeb"]);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
-        let new = || Box::new(Reenter { handle: mixed.handle(), clones: Cell::new(0), wakes: Cell::new(0), drops: Cell::new(0) });
         // Two distinct data pointers so the second poll replaces, not keeps, the parked waker.
-        let (reenter, other) = (new(), new());
-        let data = std::ptr::from_ref(&*reenter).cast();
-        let other_data = std::ptr::from_ref(&*other).cast();
+        let (reenter, other) = (reenter(mixed.handle()), reenter(mixed.handle()));
         {
-            let first = std::mem::ManuallyDrop::new(unsafe { Waker::from_raw(RawWaker::new(data, &REENTER_VTABLE)) });
-            let second = std::mem::ManuallyDrop::new(unsafe { Waker::from_raw(RawWaker::new(other_data, &REENTER_VTABLE)) });
+            let (first, second) = (reenter.waker(), other.waker());
             let mut recv = pin!(stream.recv());
             assert!(recv.as_mut().poll(&mut Context::from_waker(&first)).is_pending());
             assert_eq!(reenter.clones.get(), 1);
@@ -419,10 +446,45 @@ fn waker_clone_and_drop_may_reenter_the_net() {
             assert_eq!(frame.payload(), b"x");
         }
         // Every clone switchnet made was dropped or consumed by a wake.
-        assert_eq!([reenter.clones.get(), reenter.wakes.get(), reenter.drops.get()], [1, 0, 1]);
-        assert_eq!([other.clones.get(), other.wakes.get(), other.drops.get()], [1, 1, 0]);
+        assert_eq!(reenter.counts(), [1, 0, 1]);
+        assert_eq!(other.counts(), [1, 1, 0]);
         drop((stream, peer, reenter, other));
         mixed.close();
+    })
+}
+
+/// The clone callback turns the Net, which takes in data already waiting in
+/// its RX ring: the parked socket becomes ready between the poll's first
+/// check and its park. The same poll must return the data, not park.
+#[zhida_test_support::pinned_test]
+fn readiness_changing_during_the_waker_clone_is_seen_by_the_same_poll() {
+    with_eal(|eal| {
+        let mixed = Rc::new(RefCell::new(Mixed::new(eal, ["rdca", "rdcb"])));
+        let (mut stream, peer) = connect(&mut mixed.borrow_mut(), LOCAL_PORT);
+        {
+            let m = &mut *mixed.borrow_mut();
+            peer_send(m, &peer, b"during clone");
+            m.peer.turn(m.now, zhida_test_kit::pair::BUDGET).unwrap();
+            assert_eq!(m.to_net.forward(), 1, "the data segment did not reach the Net's ring");
+        }
+        let turner = mixed.clone();
+        let hooked = Hooked::new(
+            move || {
+                let m = &mut *turner.borrow_mut();
+                m.net.turn(m.now).unwrap();
+            },
+            || {},
+        );
+        let waker = hooked.waker();
+        let mut recv = Box::pin(stream.recv());
+        let Poll::Ready(Ok(frame)) = recv.as_mut().poll(&mut Context::from_waker(&waker)) else {
+            panic!("data that arrived during the waker clone was missed")
+        };
+        assert_eq!(frame.payload(), b"during clone");
+        assert_eq!(hooked.counts(), [1, 0, 1], "the clone was not taken, or not released");
+        drop(recv);
+        drop((hooked, frame, stream, peer));
+        Rc::try_unwrap(mixed).ok().expect("the hook released the Net").into_inner().close();
     })
 }
 
@@ -584,19 +646,22 @@ fn repeated_wake_panics_keep_socket_opening_working() {
     })
 }
 
+/// A re-poll with the waker already parked neither clones nor replaces it.
 #[zhida_test_support::pinned_test]
 fn repoll_with_the_same_waker_keeps_the_parked_clone() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["rpla", "rplb"]);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
-        let probe = Probe::new();
+        let counted = Hooked::new(|| {}, || {});
+        let waker = counted.waker();
+        let mut cx = Context::from_waker(&waker);
         let mut recv = Box::pin(stream.recv());
-        assert!(probe.poll(recv.as_mut()).is_pending());
-        assert_eq!(probe.clones(), 1);
-        assert!(probe.poll(recv.as_mut()).is_pending());
-        assert_eq!(probe.clones(), 1, "a re-poll with the parked waker cloned it again");
+        assert!(recv.as_mut().poll(&mut cx).is_pending());
+        assert!(recv.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(counted.counts(), [1, 0, 0], "a re-poll with the parked waker cloned or replaced it");
         drop(recv);
-        drop((stream, peer));
+        assert_eq!(counted.counts(), [1, 0, 1]);
+        drop((counted, stream, peer));
         mixed.close();
     })
 }
