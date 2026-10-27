@@ -22,10 +22,10 @@ impl Future for Holder {
         if self.stop.get() {
             return Poll::Ready(());
         }
-        if let Some(sleep) = self.sleep.borrow_mut().as_mut() {
-            if Pin::new(sleep).poll(cx).is_ready() {
-                return Poll::Ready(());
-            }
+        if let Some(sleep) = self.sleep.borrow_mut().as_mut()
+            && Pin::new(sleep).poll(cx).is_ready()
+        {
+            return Poll::Ready(());
         }
         cx.waker().wake_by_ref();
         Poll::Pending

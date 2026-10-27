@@ -1,6 +1,5 @@
-use super::benchmark_workloads::{Entry, entries};
+use super::benchmark_workloads::Entry;
 use super::*;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn check_structure(wheel: &TimerWheel, entries: &[Entry]) {
     let mut seen = vec![false; entries.len()];
@@ -47,16 +46,15 @@ fn check_structure(wheel: &TimerWheel, entries: &[Entry]) {
     }
 }
 
-fn state(
-    wheel: &TimerWheel,
-    entries: &[Entry],
-) -> (
+type WheelState = (
     Vec<(u32, u32)>,
     Vec<(WheelPosition, u32, u32)>,
     Vec<u32>,
     u64,
     usize,
-) {
+);
+
+fn state(wheel: &TimerWheel, entries: &[Entry]) -> WheelState {
     (
         wheel
             .levels
@@ -76,7 +74,7 @@ fn state(
 
 #[test]
 fn never_inserted_cancel_preserves_occupied_bucket() {
-    let mut entries = entries([0, 32]);
+    let mut entries = super::benchmark_workloads::entries([0, 32]);
     let mut wheel = TimerWheel::new(0);
     assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
     let before = state(&wheel, &entries);
@@ -91,7 +89,7 @@ fn never_inserted_cancel_preserves_occupied_bucket() {
 
 #[test]
 fn cancel_twice_preserves_shared_bucket_survivor() {
-    let mut entries = entries([5, 5]);
+    let mut entries = super::benchmark_workloads::entries([5, 5]);
     let mut wheel = TimerWheel::new(0);
     assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
     assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
@@ -108,7 +106,7 @@ fn cancel_twice_preserves_shared_bucket_survivor() {
 
 #[test]
 fn expired_cancel_preserves_another_timer_in_reused_bucket() {
-    let mut entries = entries([3, 35]);
+    let mut entries = super::benchmark_workloads::entries([3, 35]);
     let mut wheel = TimerWheel::new(0);
     assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
     let mut expired = Vec::new();
@@ -132,7 +130,7 @@ fn expired_cancel_preserves_another_timer_in_reused_bucket() {
 
 #[test]
 fn linked_singleton_has_nil_links_and_remains_removable() {
-    let mut entries = entries([5]);
+    let mut entries = super::benchmark_workloads::entries([5]);
     let mut wheel = TimerWheel::new(0);
     assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
     assert_eq!(entries[0].prev(), NIL);
@@ -150,12 +148,12 @@ fn linked_singleton_has_nil_links_and_remains_removable() {
 
 #[test]
 fn duplicate_insert_panics_before_any_mutation() {
-    let mut entries = entries([5, 5]);
+    let mut entries = super::benchmark_workloads::entries([5, 5]);
     let mut wheel = TimerWheel::new(0);
     assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
     assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
     let before = state(&wheel, &entries);
-    assert!(catch_unwind(AssertUnwindSafe(|| wheel.insert(&mut entries, 0))).is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wheel.insert(&mut entries, 0))).is_err());
     assert_eq!(state(&wheel, &entries), before);
     check_structure(&wheel, &entries);
     let mut expired = Vec::new();
@@ -166,7 +164,7 @@ fn duplicate_insert_panics_before_any_mutation() {
 
 #[test]
 fn formerly_overflowing_pair_expires_exactly_once() {
-    let mut entries = entries([2097152, 2097152]);
+    let mut entries = super::benchmark_workloads::entries([2097152, 2097152]);
     let mut wheel = TimerWheel::new(0);
     assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
     assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);

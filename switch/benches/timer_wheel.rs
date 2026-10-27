@@ -1,9 +1,12 @@
+// This bench uses part of the module.
+#[allow(dead_code)]
 #[path = "../src/intrusive/mod.rs"]
 mod intrusive;
+// This bench uses part of the module.
+#[allow(dead_code)]
 #[path = "../src/timer_wheel.rs"]
 mod timer_wheel;
-#[path = "../src/timer_wheel/benchmark_workloads.rs"]
-mod workloads;
+use timer_wheel::benchmark_workloads as workloads;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, black_box};
 use std::time::Duration;

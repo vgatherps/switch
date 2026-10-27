@@ -60,6 +60,8 @@ impl TimerWheel {
         self.current_tick
     }
 
+    // Used by unit tests and benches/timer_wheel.rs.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn has_pending(&self) -> bool {
         self.linked_count != 0
     }
@@ -214,7 +216,7 @@ impl TimerWheel {
 
 #[cfg(test)]
 #[path = "timer_wheel/benchmark_workloads.rs"]
-mod benchmark_workloads;
+pub mod benchmark_workloads;
 
 #[cfg(test)]
 #[path = "timer_wheel/membership_tests.rs"]

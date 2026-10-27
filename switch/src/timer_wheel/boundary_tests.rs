@@ -1,4 +1,4 @@
-use super::benchmark_workloads::{Entry, entries};
+use super::benchmark_workloads::Entry;
 use super::*;
 use crate::intrusive::{IntrusiveLinks, Linked};
 
@@ -29,7 +29,7 @@ fn check_future_positions(wheel: &TimerWheel, entries: &[Entry]) {
 
 #[test]
 fn former_late_boundaries_expire_exactly() {
-    let mut entries = entries([64, 65, 1024, 1025]);
+    let mut entries = super::benchmark_workloads::entries([64, 65, 1024, 1025]);
     let mut wheel = TimerWheel::new(0);
     for index in 0..4 {
         assert_eq!(wheel.insert(&mut entries, index), InsertOutcome::Linked);
@@ -44,7 +44,7 @@ fn former_late_boundaries_expire_exactly() {
 
 #[test]
 fn equal_and_backward_time_leave_everything_untouched() {
-    let mut entries = entries([101]);
+    let mut entries = super::benchmark_workloads::entries([101]);
     let mut wheel = TimerWheel::new(100);
     assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
     let mut expired = Vec::with_capacity(1);
@@ -89,7 +89,7 @@ fn due_insertions_complete_without_linking_at_nonzero_start_and_max() {
         } else {
             vec![start - 1, start, start + 1]
         };
-        let mut entries = entries(deadlines);
+        let mut entries = super::benchmark_workloads::entries(deadlines);
         let mut wheel = TimerWheel::new(start);
         let mut completed = Vec::new();
         for index in 0..entries.len() {
@@ -123,7 +123,7 @@ fn every_five_bit_transition_preserves_exact_expiry_and_future_positions() {
         let boundary = 1u64 << (5 * level);
         for start in [boundary - 1, boundary, boundary + 1] {
             let deadlines = [start + 1, start + 2];
-            let mut entries = entries(deadlines);
+            let mut entries = super::benchmark_workloads::entries(deadlines);
             let mut wheel = TimerWheel::new(start);
             for index in 0..2 {
                 assert_eq!(wheel.insert(&mut entries, index), InsertOutcome::Linked);
@@ -152,7 +152,7 @@ fn all_sixteen_top_digits_are_supported() {
         let boundary = digit << 60;
         let start = if digit == 0 { 0 } else { boundary - 1 };
         let deadline = if digit == 0 { 1 } else { boundary };
-        let mut entries = entries([deadline]);
+        let mut entries = super::benchmark_workloads::entries([deadline]);
         let mut wheel = TimerWheel::new(start);
         assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
         if digit != 0 {
@@ -185,7 +185,7 @@ fn arbitrary_starts_and_max_neighbor_use_absolute_deadlines() {
         (31, [32, 64]),
         (u64::MAX - 1, [u64::MAX, u64::MAX]),
     ] {
-        let mut entries = entries(deadlines);
+        let mut entries = super::benchmark_workloads::entries(deadlines);
         let mut wheel = TimerWheel::new(start);
         for index in 0..2 {
             assert_eq!(wheel.insert(&mut entries, index), InsertOutcome::Linked);

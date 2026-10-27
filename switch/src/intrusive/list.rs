@@ -80,6 +80,7 @@ impl ListHead {
     }
 
     /// Drain all entries, calling f for each.
+    #[cfg(test)]
     pub fn drain<T: ListLinked, F: FnMut(u32)>(&mut self, entries: &mut [T], mut f: F) {
         while let Some(idx) = self.pop_front(entries) {
             f(idx);
@@ -87,16 +88,19 @@ impl ListHead {
     }
 
     /// Iterate over all indices (non-mutating).
+    #[cfg(test)]
     pub fn iter<'a, T: ListLinked>(&self, entries: &'a [T]) -> ListIter<'a, T> {
         ListIter { entries, current: self.first }
     }
 }
 
+#[cfg(test)]
 pub struct ListIter<'a, T> {
     entries: &'a [T],
     current: u32,
 }
 
+#[cfg(test)]
 impl<T: ListLinked> Iterator for ListIter<'_, T> {
     type Item = u32;
 
@@ -112,7 +116,6 @@ impl<T: ListLinked> Iterator for ListIter<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::intrusive::links::{IntrusiveLinks, Linked};
 
     #[derive(Default)]
@@ -131,14 +134,14 @@ mod tests {
 
     #[test]
     fn test_empty_list() {
-        let list = ListHead::new();
+        let list = super::ListHead::new();
         assert!(list.is_empty());
     }
 
     #[test]
     fn test_push_back_single() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
 
@@ -150,7 +153,7 @@ mod tests {
     #[test]
     fn test_push_back_multiple() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 1);
@@ -160,20 +163,20 @@ mod tests {
         assert_eq!(list.last, 2);
 
         // Check forward links
-        assert_eq!(entries[0].next(), 1);
-        assert_eq!(entries[1].next(), 2);
-        assert_eq!(entries[2].next(), NIL);
+        assert_eq!(crate::intrusive::links::ListLinked::next(&entries[0]), 1);
+        assert_eq!(crate::intrusive::links::ListLinked::next(&entries[1]), 2);
+        assert_eq!(crate::intrusive::links::ListLinked::next(&entries[2]), crate::intrusive::links::NIL);
 
         // Check backward links
-        assert_eq!(entries[0].prev(), NIL);
-        assert_eq!(entries[1].prev(), 0);
-        assert_eq!(entries[2].prev(), 1);
+        assert_eq!(crate::intrusive::links::ListLinked::prev(&entries[0]), crate::intrusive::links::NIL);
+        assert_eq!(crate::intrusive::links::ListLinked::prev(&entries[1]), 0);
+        assert_eq!(crate::intrusive::links::ListLinked::prev(&entries[2]), 1);
     }
 
     #[test]
     fn test_pop_front() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 1);
@@ -181,7 +184,7 @@ mod tests {
 
         assert_eq!(list.pop_front(&mut entries), Some(0));
         assert_eq!(list.first, 1);
-        assert_eq!(entries[1].prev(), NIL);
+        assert_eq!(crate::intrusive::links::ListLinked::prev(&entries[1]), crate::intrusive::links::NIL);
 
         assert_eq!(list.pop_front(&mut entries), Some(1));
         assert_eq!(list.pop_front(&mut entries), Some(2));
@@ -192,7 +195,7 @@ mod tests {
     #[test]
     fn test_remove_middle() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 1);
@@ -202,14 +205,14 @@ mod tests {
 
         assert_eq!(list.first, 0);
         assert_eq!(list.last, 2);
-        assert_eq!(entries[0].next(), 2);
-        assert_eq!(entries[2].prev(), 0);
+        assert_eq!(crate::intrusive::links::ListLinked::next(&entries[0]), 2);
+        assert_eq!(crate::intrusive::links::ListLinked::prev(&entries[2]), 0);
     }
 
     #[test]
     fn test_remove_first() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 1);
@@ -218,13 +221,13 @@ mod tests {
         list.remove(&mut entries, 0);
 
         assert_eq!(list.first, 1);
-        assert_eq!(entries[1].prev(), NIL);
+        assert_eq!(crate::intrusive::links::ListLinked::prev(&entries[1]), crate::intrusive::links::NIL);
     }
 
     #[test]
     fn test_remove_last() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 1);
@@ -233,13 +236,13 @@ mod tests {
         list.remove(&mut entries, 2);
 
         assert_eq!(list.last, 1);
-        assert_eq!(entries[1].next(), NIL);
+        assert_eq!(crate::intrusive::links::ListLinked::next(&entries[1]), crate::intrusive::links::NIL);
     }
 
     #[test]
     fn test_iter() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 2);
@@ -252,7 +255,7 @@ mod tests {
     #[test]
     fn test_drain() {
         let mut entries = make_entries(5);
-        let mut list = ListHead::new();
+        let mut list = super::ListHead::new();
 
         list.push_back(&mut entries, 0);
         list.push_back(&mut entries, 1);

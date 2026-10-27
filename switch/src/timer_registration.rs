@@ -204,8 +204,12 @@ impl TimerStore {
     pub(crate) unsafe fn retire(&mut self, owner: *mut TaskHeader) {
         self.drained();
         unsafe {
-            while (*owner).reg_head != NIL {
-                self.release((*owner).reg_head);
+            loop {
+                let head = (*owner).reg_head;
+                if head == NIL {
+                    break;
+                }
+                self.release(head);
             }
         }
     }

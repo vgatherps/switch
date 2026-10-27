@@ -83,10 +83,10 @@ impl Future for Sleep {
             let Some(task) = task_from_active_frame(cx.waker(), (*root).active_frame) else {
                 return this.complete(Err(SleepError::WrongRuntime));
             };
-            if let Some(token) = this.token {
-                if (*root).timers.refresh(token, task.as_ptr()) {
-                    return Poll::Pending;
-                }
+            if let Some(token) = this.token
+                && (*root).timers.refresh(token, task.as_ptr())
+            {
+                return Poll::Pending;
             }
             match (*root).timers.register(task.as_ptr(), this.deadline) {
                 Ok(token) => {

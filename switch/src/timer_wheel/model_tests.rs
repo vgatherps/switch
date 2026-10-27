@@ -56,9 +56,9 @@ fn deadline(state: &mut u64, now: u64) -> u64 {
         _ => {
             let power = 1u64 << (random(state) % 64);
             if random(state) & 1 == 0 {
-                power.checked_sub(1).unwrap_or(0)
+                power.checked_sub(1).expect("power is positive")
             } else {
-                power.checked_add(1).unwrap_or(u64::MAX)
+                power.checked_add(1).expect("power plus one fits")
             }
         }
     }

@@ -1,3 +1,5 @@
+// This bench uses part of the module.
+#[allow(dead_code)]
 #[path = "../tests/support/runtime_workload.rs"]
 mod workload;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};

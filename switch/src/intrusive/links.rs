@@ -55,38 +55,4 @@ pub trait ListLinked: Linked {
     }
 }
 
-/// Heap-specific accessors.
-pub trait HeapLinked: Linked {
-    #[inline]
-    fn parent(&self) -> u32 {
-        self.links().a
-    }
-
-    #[inline]
-    fn left(&self) -> u32 {
-        self.links().b
-    }
-
-    #[inline]
-    fn right(&self) -> u32 {
-        self.links().c
-    }
-
-    #[inline]
-    fn set_parent(&mut self, v: u32) {
-        self.links_mut().a = v;
-    }
-
-    #[inline]
-    fn set_left(&mut self, v: u32) {
-        self.links_mut().b = v;
-    }
-
-    #[inline]
-    fn set_right(&mut self, v: u32) {
-        self.links_mut().c = v;
-    }
-}
-
 impl<T: Linked> ListLinked for T {}
-impl<T: Linked> HeapLinked for T {}

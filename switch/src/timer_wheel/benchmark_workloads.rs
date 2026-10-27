@@ -110,37 +110,35 @@ pub fn check_expiry(count: usize, deadline: u64, end: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn near_insert_remove_controls() {
         for count in [1, 32, 1024] {
-            check_insert_remove(count);
+            super::check_insert_remove(count);
         }
     }
 
     #[test]
     fn dense_l0_expiry_control() {
-        check_expiry(1024, 7, 7);
+        super::check_expiry(1024, 7, 7);
     }
 
     #[test]
     fn aligned_cascade_expiry_control() {
-        check_expiry(1024, 40, 40);
+        super::check_expiry(1024, 40, 40);
     }
 
     #[test]
     fn sparse_gap_expiry_controls() {
         for count in [1, 32] {
-            check_expiry(count, 100001, 1048576);
+            super::check_expiry(count, 100001, 1048576);
         }
     }
 
     #[test]
     fn cancelled_near_entries_leave_exact_survivors() {
-        let mut entries = near_entries(1024);
-        let mut wheel = TimerWheel::new(0);
-        insert_all(&mut wheel, &mut entries);
+        let mut entries = super::near_entries(1024);
+        let mut wheel = super::TimerWheel::new(0);
+        super::insert_all(&mut wheel, &mut entries);
         for index in (0..1024).step_by(2) {
             wheel.remove(&mut entries, index);
         }
@@ -149,6 +147,6 @@ mod tests {
         expired.sort_unstable();
         assert_eq!(expired, (1..1024).step_by(2).collect::<Vec<u32>>());
         assert!(!wheel.has_pending());
-        assert_detached(&entries);
+        super::assert_detached(&entries);
     }
 }
