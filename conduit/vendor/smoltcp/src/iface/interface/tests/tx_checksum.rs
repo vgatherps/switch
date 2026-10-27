@@ -36,28 +36,27 @@ impl crate::phy::FrameToken for RecordingFrame<'_> {
         self,
         header: crate::phy::TxHeader,
         frame: crate::phy::TxBuf,
-    ) -> Result<(), crate::phy::TxBuf> {
+    ) {
         let bytes = crate::phy::frame_bytes(header, &frame);
         let meta = PacketMeta {
             tx_checksum: header.tx_checksum(),
             ..PacketMeta::default()
         };
         self.frames.push((meta, bytes));
-        Ok(())
     }
 
     fn consume_retain(
         self,
         header: crate::phy::TxHeader,
         frame: crate::phy::TxBuf,
-    ) -> Result<crate::phy::TxBuf, crate::phy::TxBuf> {
+    ) -> crate::phy::TxBuf {
         let bytes = crate::phy::frame_bytes(header, &frame);
         let meta = PacketMeta {
             tx_checksum: header.tx_checksum(),
             ..PacketMeta::default()
         };
         self.frames.push((meta, bytes));
-        Ok(frame)
+        frame
     }
 }
 
@@ -125,9 +124,7 @@ fn recording_device_transmit_frame_keeps_metadata() {
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume_retain(header, frame)
-        .ok()
-        .unwrap();
+        .consume_retain(header, frame);
     assert_eq!(device.tx, vec![(meta, vec![1, 2, 3, 4])]);
 }
 

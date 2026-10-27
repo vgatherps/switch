@@ -4010,9 +4010,7 @@ mod test {
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_retain(header, frame)
-            .ok()
-            .unwrap();
+            .consume_retain(header, frame);
         assert_eq!(device.0.tx_queue.pop_front().unwrap(), &[1, 2]);
     }
 

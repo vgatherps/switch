@@ -54,20 +54,19 @@ impl crate::phy::FrameToken for ReplyFrameToken<'_> {
         self,
         header: crate::phy::TxHeader,
         frame: crate::phy::TxBuf,
-    ) -> Result<(), crate::phy::TxBuf> {
+    ) {
         let bytes = crate::phy::frame_bytes(header, &frame);
         self.0.push(bytes);
-        Ok(())
     }
 
     fn consume_retain(
         self,
         header: crate::phy::TxHeader,
         frame: crate::phy::TxBuf,
-    ) -> Result<crate::phy::TxBuf, crate::phy::TxBuf> {
+    ) -> crate::phy::TxBuf {
         let bytes = crate::phy::frame_bytes(header, &frame);
         self.0.push(bytes);
-        Ok(frame)
+        frame
     }
 }
 
@@ -131,9 +130,7 @@ fn udp_device_transmit_frame_uses_existing_limit() {
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume_retain(header, frame)
-        .ok()
-        .unwrap();
+        .consume_retain(header, frame);
     assert_eq!(device.tx, vec![vec![1, 2, 3, 4]]);
     assert!(device.transmit_frame(Instant::ZERO).is_none());
 }

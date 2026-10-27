@@ -80,24 +80,25 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
 struct StmPhyFrameToken<'a>(&'a mut [u8]);
 
 impl phy::FrameToken for StmPhyFrameToken<'_> {
-    fn consume(self, header: TxHeader, frame: TxBuf) -> Result<(), TxBuf> {
+    fn consume(self, header: TxHeader, frame: TxBuf) {
+        assert!(frame.unique(), "TX buffer is shared");
         let header_len = header.bytes().len();
         let len = header_len.checked_add(frame.len()).expect("TX frame length overflow");
         self.0[..header_len].copy_from_slice(header.bytes());
         self.0[header_len..len].copy_from_slice(frame.payload());
         println!("tx called {}", len);
         // TODO: send packet out
-        Ok(())
     }
 
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> Result<TxBuf, TxBuf> {
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf {
+        assert!(frame.unique(), "TX buffer is shared");
         let header_len = header.bytes().len();
         let len = header_len.checked_add(frame.len()).expect("TX frame length overflow");
         self.0[..header_len].copy_from_slice(header.bytes());
         self.0[header_len..len].copy_from_slice(frame.payload());
         println!("tx called {}", len);
         // TODO: send packet out
-        Ok(frame)
+        frame
     }
 }
 ```
@@ -378,13 +379,11 @@ pub trait TxToken {
 }
 
 /// Publishes one packet whose wire bytes are `header.bytes()` followed by `frame.payload()`.
-/// The device writes no byte or metadata that another holder of `frame` sees, except through a
-/// handle it holds exclusively. An error returns the frame unchanged and publishes nothing.
-/// Dropping the token unconsumed does nothing.
+/// Panics unless the frame is unique. Dropping the token unconsumed does nothing.
 pub trait FrameToken {
-    /// The caller keeps nothing.
-    fn consume(self, header: TxHeader, frame: TxBuf) -> Result<(), TxBuf>;
+    /// The frame's only reference moves to the device.
+    fn consume(self, header: TxHeader, frame: TxBuf);
 
     /// The caller's reference comes back.
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> Result<TxBuf, TxBuf>;
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf;
 }

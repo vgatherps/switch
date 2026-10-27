@@ -140,20 +140,19 @@ impl phy::FrameToken for FrameToken<'_> {
         self,
         header: phy::TxHeader,
         frame: phy::TxBuf,
-    ) -> core::result::Result<(), phy::TxBuf> {
+    ) {
         let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        Ok(())
     }
 
     fn consume_retain(
         self,
         header: phy::TxHeader,
         frame: phy::TxBuf,
-    ) -> core::result::Result<phy::TxBuf, phy::TxBuf> {
+    ) -> phy::TxBuf {
         let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        Ok(frame)
+        frame
     }
 }
 
@@ -176,7 +175,7 @@ fn testing_device_frame_token_writes_before_publish() {
     header.bytes_mut().copy_from_slice(&[1, 2]);
     assert!(device.tx_queue.is_empty());
     let token = device.transmit_frame(Instant::ZERO).unwrap();
-    let frame = token.consume_retain(header, frame).ok().unwrap();
+    let frame = token.consume_retain(header, frame);
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
     assert!(frame.unique());
 }
@@ -195,9 +194,7 @@ fn testing_device_owned_frame_releases_after_publish() {
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume(header, frame)
-        .ok()
-        .unwrap();
+        .consume(header, frame);
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
     assert_eq!(alloc.live(), 0);
 }

@@ -133,14 +133,21 @@ impl TxQueue {
             .acked
             .checked_add(n.try_into().expect("ACK count exceeds u64"))
             .expect("TX queue ACK position overflow");
+        let mut popped = 0u32;
         while self
             .entries
             .front()
             .is_some_and(|entry| entry.end <= self.acked)
         {
             self.entries.pop_front();
+            popped = popped.checked_add(1).expect("TX queue pop count exceeds u32");
         }
-        self.hint.set(0);
+        let hint = self.hint.get();
+        self.hint.set(if hint <= popped {
+            0
+        } else {
+            hint.checked_sub(popped).expect("TX queue hint underflow")
+        });
     }
 
     pub(crate) fn clear(&mut self) {
@@ -168,7 +175,7 @@ impl TxQueue {
             .end
             .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
             .expect("TX frame start underflow");
-        if position == start && position >= self.acked && size >= buf.len() {
+        if position == start && position >= self.acked && size >= buf.len() && buf.unique() {
             return Seg::Whole {
                 index: index.try_into().expect("TX queue index exceeds u32"),
             };
@@ -234,7 +241,7 @@ impl TxQueue {
             return 0;
         }
         let hint: usize = self.hint.get().try_into().expect("TX hint exceeds usize");
-        if hint < self.entries.len() && contains(hint, &mut compared) {
+        if hint != 0 && hint < self.entries.len() && contains(hint, &mut compared) {
             return hint;
         }
         let next = hint.checked_add(1).expect("TX hint index overflow");
@@ -373,6 +380,25 @@ mod tests {
     }
 
     #[test]
+    fn alternating_ack_and_segment_keeps_the_lookup_hint() {
+        let (mut queue, _) = queue(8, 8, 1);
+        for byte in 0..8 {
+            queue.push_bytes(&[byte]);
+        }
+        assert!(matches!(queue.segment(5, 1), Seg::Whole { index: 5 }));
+        for (acked, expected_index) in (1usize..=5).zip((0..5).rev()) {
+            queue.ack(1);
+            assert!(matches!(queue.segment(5 - acked, 1), Seg::Whole { index } if index == expected_index));
+            let comparisons = Cell::new(0usize);
+            let index = queue.locate(5, || {
+                comparisons.set(comparisons.get().checked_add(1).unwrap())
+            });
+            assert_eq!(index, usize::try_from(expected_index).unwrap());
+            assert_eq!(comparisons.get(), if expected_index == 0 { 1 } else { 2 });
+        }
+    }
+
+    #[test]
     fn segment_empty_for_zero_size() {
         let (mut queue, _) = queue(8, 1, 8);
         queue.push_bytes(&[1, 2]);
@@ -395,7 +421,7 @@ mod tests {
         assert!(matches!(queue.segment(0, 3), Seg::Whole { index: 0 }));
         assert_eq!(cut(queue.segment(0, 2)), &[1, 2]);
         let clone = queue.entries[0].buf.as_ref().unwrap().clone();
-        assert!(matches!(queue.segment(0, 3), Seg::Whole { index: 0 }));
+        assert_eq!(cut(queue.segment(0, 3)), &[1, 2, 3]);
         drop(clone);
     }
 
@@ -460,12 +486,10 @@ mod tests {
         unsafe fn unique(_: NonNull<()>) -> bool {
             true
         }
-        unsafe fn set_len(_: NonNull<()>, _: NonNull<u8>, _: usize) {}
         static OPS: TxBufOps = TxBufOps {
             release,
             share,
             unique,
-            set_len,
         };
         impl Drop for Alloc {
             fn drop(&mut self) {

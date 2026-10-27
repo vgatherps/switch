@@ -10,7 +10,6 @@ pub struct TxBufOps {
     pub release: unsafe fn(owner: NonNull<()>),
     pub share: unsafe fn(owner: NonNull<()>),
     pub unique: unsafe fn(owner: NonNull<()>) -> bool,
-    pub set_len: unsafe fn(owner: NonNull<()>, data: NonNull<u8>, len: usize),
 }
 
 /// One reference to a TX payload buffer. Payload is immutable while another reference exists.
@@ -82,9 +81,6 @@ impl TxBuf {
     pub fn set_len(&mut self, len: usize) {
         assert!(len <= self.capacity(), "TX payload length exceeds room");
         assert!(self.unique(), "TX buffer is shared");
-        // SAFETY: from_raw_parts requires ops to match owner. The uniqueness check above means
-        // the owner metadata is not visible through another TxBuf reference.
-        unsafe { (self.ops.set_len)(self.owner, self.data, len) };
         self.len = len.try_into().expect("TX payload length exceeds u32");
     }
 
@@ -149,6 +145,7 @@ impl TxHeader {
 }
 
 pub(crate) fn frame_bytes(header: TxHeader, frame: &TxBuf) -> Vec<u8> {
+    assert!(frame.unique(), "TX buffer is shared");
     let mut bytes = Vec::with_capacity(
         header
             .bytes()
@@ -239,7 +236,6 @@ pub(crate) mod test_owner {
         allocs: Cell<usize>,
         shares: Cell<usize>,
         releases: Cell<usize>,
-        set_lens: Cell<usize>,
         live: Cell<usize>,
     }
 
@@ -251,7 +247,6 @@ pub(crate) mod test_owner {
     struct Storage {
         bytes: Box<[u8]>,
         references: Cell<usize>,
-        payload_len: Cell<usize>,
         counts: Rc<Counts>,
     }
 
@@ -281,17 +276,7 @@ pub(crate) mod test_owner {
         unsafe { owner.cast::<Storage>().as_ref() }.references.get() == 1
     }
 
-    unsafe fn set_len(owner: NonNull<()>, data: NonNull<u8>, len: usize) {
-        // SAFETY: owner points to a live Storage while a TxBuf reference exists.
-        let storage = unsafe { owner.cast::<Storage>().as_ref() };
-        // SAFETY: Storage owns HEADROOM bytes before its payload pointer.
-        let expected = unsafe { storage.bytes.as_ptr().add(HEADROOM) };
-        assert_eq!(data.as_ptr().cast_const(), expected);
-        storage.payload_len.set(len);
-        storage.counts.set_lens.set(storage.counts.set_lens.get().checked_add(1).expect("set_len count overflow"));
-    }
-
-    static OPS: TxBufOps = TxBufOps { release, share, unique, set_len };
+    pub(super) static OPS: TxBufOps = TxBufOps { release, share, unique };
 
     impl CountingAlloc {
         pub(crate) fn new(room: usize) -> Rc<CountingAlloc> {
@@ -301,7 +286,6 @@ pub(crate) mod test_owner {
                     allocs: Cell::new(0),
                     shares: Cell::new(0),
                     releases: Cell::new(0),
-                    set_lens: Cell::new(0),
                     live: Cell::new(0),
                 }),
             })
@@ -310,12 +294,6 @@ pub(crate) mod test_owner {
         pub(crate) fn live(&self) -> usize { self.counts.live.get() }
         pub(crate) fn shares(&self) -> usize { self.counts.shares.get() }
         pub(crate) fn releases(&self) -> usize { self.counts.releases.get() }
-        pub(crate) fn set_lens(&self) -> usize { self.counts.set_lens.get() }
-
-        pub(crate) fn payload_len(&self, buf: &TxBuf) -> usize {
-            // SAFETY: buf holds a live reference to Storage from this allocator.
-            unsafe { buf.owner().cast::<Storage>().as_ref() }.payload_len.get()
-        }
     }
 
     impl TxAlloc for CountingAlloc {
@@ -324,7 +302,6 @@ pub(crate) mod test_owner {
             let mut storage = Box::new(Storage {
                 bytes: vec![0; total].into_boxed_slice(),
                 references: Cell::new(1),
-                payload_len: Cell::new(0),
                 counts: self.counts.clone(),
             });
             let data = NonNull::new(storage.bytes.as_mut_ptr()).expect("boxed slice pointer is null");
@@ -374,19 +351,53 @@ mod tests {
         }))
         .is_err());
         assert!(catch_unwind(AssertUnwindSafe(|| buf.set_len(1))).is_err());
-        assert_eq!(alloc.set_lens(), 0);
         drop(clone);
     }
 
     #[test]
-    fn set_len_updates_owner_extent_at_refcount_1() {
+    fn set_len_updates_this_buffer_at_refcount_1() {
         let alloc = CountingAlloc::new(8);
         let mut buf = alloc.alloc().unwrap();
         buf.room_mut()[..3].copy_from_slice(&[1, 2, 3]);
         buf.set_len(3);
         assert_eq!(buf.payload(), &[1, 2, 3]);
-        assert_eq!(alloc.payload_len(&buf), 3);
-        assert_eq!(alloc.set_lens(), 1);
+    }
+
+    #[test]
+    fn dropping_original_then_clone_releases_storage_once() {
+        let alloc = CountingAlloc::new(8);
+        let buf = alloc.alloc().unwrap();
+        let clone = buf.clone();
+        drop(buf);
+        assert_eq!(alloc.live(), 1);
+        drop(clone);
+        assert_eq!(alloc.live(), 0);
+        assert_eq!(alloc.releases(), 2);
+    }
+
+    #[test]
+    fn into_raw_keeps_its_reference() {
+        let alloc = CountingAlloc::new(8);
+        let buf = alloc.alloc().unwrap();
+        let owner = buf.into_raw();
+        assert_eq!(alloc.live(), 1);
+        // SAFETY: into_raw transfers this sole reference to the caller.
+        unsafe { (test_owner::OPS.release)(owner) };
+        assert_eq!(alloc.live(), 0);
+        assert_eq!(alloc.releases(), 1);
+    }
+
+    #[test]
+    fn tx_frame_new_rejects_shared_or_nonempty_buffers() {
+        let alloc = CountingAlloc::new(8);
+        let buf = alloc.alloc().unwrap();
+        let clone = buf.clone();
+        assert!(catch_unwind(AssertUnwindSafe(|| TxFrame::new(buf))).is_err());
+        drop(clone);
+
+        let mut buf = alloc.alloc().unwrap();
+        buf.set_len(1);
+        assert!(catch_unwind(AssertUnwindSafe(|| TxFrame::new(buf))).is_err());
     }
 
     #[test]

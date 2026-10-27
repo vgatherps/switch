@@ -83,20 +83,15 @@ struct TrackedFrameToken<'a, T> {
 }
 
 impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
-    fn consume(self, header: TxHeader, frame: TxBuf) -> Result<(), TxBuf> {
-        let result = self.inner.consume(header, frame);
-        if result.is_ok() {
-            *self.consumed = true;
-        }
-        result
+    fn consume(self, header: TxHeader, frame: TxBuf) {
+        self.inner.consume(header, frame);
+        *self.consumed = true;
     }
 
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> Result<TxBuf, TxBuf> {
-        let result = self.inner.consume_retain(header, frame);
-        if result.is_ok() {
-            *self.consumed = true;
-        }
-        result
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf {
+        let frame = self.inner.consume_retain(header, frame);
+        *self.consumed = true;
+        frame
     }
 }
 

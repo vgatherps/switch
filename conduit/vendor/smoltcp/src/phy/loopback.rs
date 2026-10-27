@@ -99,20 +99,19 @@ pub struct FrameToken<'a> {
 }
 
 impl phy::FrameToken for FrameToken<'_> {
-    fn consume(self, header: phy::TxHeader, frame: phy::TxBuf) -> Result<(), phy::TxBuf> {
+    fn consume(self, header: phy::TxHeader, frame: phy::TxBuf) {
         let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        Ok(())
     }
 
     fn consume_retain(
         self,
         header: phy::TxHeader,
         frame: phy::TxBuf,
-    ) -> Result<phy::TxBuf, phy::TxBuf> {
+    ) -> phy::TxBuf {
         let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        Ok(frame)
+        frame
     }
 }
 
@@ -130,10 +129,20 @@ mod tests {
         let frame = device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_retain(header, frame)
-            .ok()
-            .unwrap();
+            .consume_retain(header, frame);
         assert_eq!(device.queue.pop_front().unwrap(), &[1, 2, 3, 4]);
         assert!(frame.unique());
+    }
+
+    #[test]
+    #[should_panic(expected = "TX buffer is shared")]
+    fn transmit_frame_rejects_shared_frame() {
+        let mut device = Loopback::new(Medium::Ip);
+        let frame = crate::tests::tx_test_buf(&[3, 4]);
+        let _clone = frame.clone();
+        device
+            .transmit_frame(Instant::ZERO)
+            .unwrap()
+            .consume(phy::TxHeader::new(0, None), frame);
     }
 }

@@ -211,9 +211,7 @@ fn refusing_device_transmit_frame_uses_existing_limit() {
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume_retain(header, frame)
-        .ok()
-        .unwrap();
+        .consume_retain(header, frame);
     assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
     assert!(device.transmit_frame(Instant::ZERO).is_none());
 }

@@ -28,6 +28,56 @@ use crate::phy::ChecksumCapabilities;
 use crate::phy::Loopback;
 use crate::time::Instant;
 
+struct CountingFrameToken<'a>(&'a mut usize);
+
+impl crate::phy::FrameToken for CountingFrameToken<'_> {
+    fn consume(self, header: crate::phy::TxHeader, frame: crate::phy::TxBuf) {
+        let _ = crate::phy::frame_bytes(header, &frame);
+        *self.0 += 1;
+    }
+
+    fn consume_retain(
+        self,
+        header: crate::phy::TxHeader,
+        frame: crate::phy::TxBuf,
+    ) -> crate::phy::TxBuf {
+        let _ = crate::phy::frame_bytes(header, &frame);
+        *self.0 += 1;
+        frame
+    }
+}
+
+#[test]
+fn tracked_frame_token_marks_only_a_completed_publish() {
+    use crate::phy::FrameToken as _;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let mut publishes = 0;
+    let mut consumed = false;
+    let frame = crate::tests::tx_test_buf(&[1]);
+    TrackedFrameToken {
+        inner: CountingFrameToken(&mut publishes),
+        consumed: &mut consumed,
+    }
+    .consume(TxHeader::new(0, None), frame);
+    assert_eq!(publishes, 1);
+    assert!(consumed);
+
+    let mut consumed = false;
+    let frame = crate::tests::tx_test_buf(&[1]);
+    let _clone = frame.clone();
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        TrackedFrameToken {
+            inner: CountingFrameToken(&mut publishes),
+            consumed: &mut consumed,
+        }
+        .consume(TxHeader::new(0, None), frame);
+    }))
+    .is_err());
+    assert_eq!(publishes, 1);
+    assert!(!consumed);
+}
+
 #[allow(unused)]
 fn fill_slice(s: &mut [u8], val: u8) {
     for x in s.iter_mut() {

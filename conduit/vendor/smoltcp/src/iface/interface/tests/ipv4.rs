@@ -318,9 +318,7 @@ mod stale_neighbors {
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_retain(header, frame)
-            .ok()
-            .unwrap();
+            .consume_retain(header, frame);
         assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
         assert!(device.transmit_frame(Instant::ZERO).is_none());
     }
@@ -1339,9 +1337,7 @@ fn ingress_takes_each_frame_once_via_into_buf() {
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_retain(header, frame)
-            .ok()
-            .unwrap();
+            .consume_retain(header, frame);
         assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
     }
     let mut listener =
