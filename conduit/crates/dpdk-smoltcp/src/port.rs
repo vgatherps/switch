@@ -712,6 +712,15 @@ impl Port {
         self.tx_udp_checksum = true;
     }
 
+    /// Bench and test code uses this. It turns on the TX TCP checksum profile
+    /// without the PMD advertising it; on a PMD without the offload, frames
+    /// leave with TCP checksum 0.
+    #[cfg(any(test, feature = "bench-offload"))]
+    #[doc(hidden)]
+    pub fn force_tx_tcp_checksum(&mut self) {
+        self.tx_tcp_checksum = true;
+    }
+
     /// Largest Ethernet frame without FCS: IP MTU + 14. `open` validated that
     /// the TX data room holds it, so this always fits `alloc_tx`.
     pub(crate) fn frame_capacity(&self) -> u16 {

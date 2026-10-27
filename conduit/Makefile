@@ -235,7 +235,7 @@ bench: doctor
 # natively under e.g. `taskset -c 6`.
 bench-stack: doctor
 	$(if $(value BENCH_RUSTFLAGS),RUSTFLAGS="$$RUSTFLAGS "'$(value BENCH_RUSTFLAGS)') \
-		cargo bench --locked -p dpdk-smoltcp --features bench-offload --bench ring --bench stack --bench scaling --bench neighbor --bench emit --bench rx --bench udp \
+		cargo bench --locked -p dpdk-smoltcp --features bench-offload --bench ring --bench stack --bench scaling --bench neighbor --bench emit --bench rx --bench udp --bench tx_phases \
 		$(if $(value BENCH_FILTER),-- '$(value BENCH_FILTER)')
 
 soak:
