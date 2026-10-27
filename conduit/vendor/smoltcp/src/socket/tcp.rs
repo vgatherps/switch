@@ -57,7 +57,7 @@ pub fn rx_mbuf_budget(config: &Config, ip_mtu: usize) -> usize {
 /// Panics if `ip_mtu` is below IPv4's minimum of 68 bytes or `mss_cap` is `Some(0)`.
 pub fn tx_mbuf_budget(config: &Config, ip_mtu: usize) -> usize {
     assert!(config.mss_cap != Some(0), "MSS cap must not be zero");
-    rx_mbuf_budget_for_payload(config.tx_capacity, rx_frame_bytes(ip_mtu, config.mss_cap))
+    tx_frame_cap(config.tx_capacity, rx_frame_bytes(ip_mtu, config.mss_cap))
 }
 
 fn rx_frame_bytes(ip_mtu: usize, mss_cap: Option<u16>) -> usize {
@@ -72,6 +72,10 @@ fn rx_mbuf_budget_for_payload(recv_capacity: usize, payload: usize) -> usize {
         .checked_add(usize::from(recv_capacity % payload != 0))
         .expect("RX mbuf budget exceeds usize");
     rounded.max(6)
+}
+
+fn tx_frame_cap(tx_capacity: usize, segment_payload: usize) -> usize {
+    rx_mbuf_budget_for_payload(tx_capacity, segment_payload)
 }
 
 macro_rules! tcp_trace {
@@ -752,7 +756,7 @@ impl<'a> Socket<'a> {
         let mut socket = Socket::new(
             RxBuffer::new(config.rx_capacity),
             config.tx_capacity,
-            tx_mbuf_budget(config, ip_mtu),
+            tx_frame_cap(config.tx_capacity, tx_seg_bytes),
             source,
             tx_seg_bytes,
         );
@@ -765,7 +769,7 @@ impl<'a> Socket<'a> {
         Socket::new(
             RxBuffer::new(rx_capacity),
             tx_capacity,
-            tx_capacity.max(6),
+            tx_frame_cap(tx_capacity, 1460),
             crate::tests::tx_test_source(1460),
             1460,
         )
@@ -1437,12 +1441,15 @@ impl<'a> Socket<'a> {
         if !self.may_send() {
             return false;
         }
-        let Some(mss) = self.max_segment_payload() else {
+        if self.max_segment_payload().is_none() {
             return false;
-        };
+        }
         self.tx_queue.byte_room() != 0
             && (self.tx_queue.frame_room() != 0
-                || self.tx_queue.tail_room(self.sent_payload_bytes(), mss) != 0)
+                || self
+                    .tx_queue
+                    .tail_room(self.sent_payload_bytes(), self.tx_seg_bytes as usize)
+                    != 0)
     }
 
     /// Return the maximum number of bytes inside the recv buffer.
@@ -1566,14 +1573,15 @@ impl<'a> Socket<'a> {
         if !self.may_send() {
             return Err(SendError::InvalidState);
         }
-        let mss = self.max_segment_payload().expect("sendable TCP socket is not synchronized");
-        let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, mss);
+        self.max_segment_payload().expect("sendable TCP socket is not synchronized");
+        let frame_payload = self.tx_seg_bytes as usize;
+        let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 && self.tx_queue.frame_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc() else {
                 break;
             };
             let count = (data.len() - written)
-                .min(mss)
+                .min(frame_payload)
                 .min(self.tx_queue.byte_room());
             assert!(buf.capacity() >= count, "TX source buffer is smaller than its segment bound");
             buf.room_mut()[..count].copy_from_slice(&data[written..written + count]);
@@ -3381,11 +3389,11 @@ impl<'a> Socket<'a> {
                             let frame = self.tx_queue.take(index);
                             payload_len = frame.len();
                             whole_frame = Some((index, frame));
-                        } else if let Seg::Cut(bytes) =
-                            self.tx_queue.segment(offset, segment_size)
-                        {
-                            repr.payload = bytes;
-                            payload_len = bytes.len();
+                        } else if segment_size != 0 {
+                            self.tx_queue
+                                .copy_segment(offset, segment_size, &mut coalesced_payload);
+                            repr.payload = &coalesced_payload;
+                            payload_len = segment_size;
                         }
                     }
 
@@ -3791,6 +3799,12 @@ mod test {
         assert_eq!(s.mss_cap, core::num::NonZeroU16::new(100));
         assert_eq!(s.rx_mbuf_budget(1500), rx_mbuf_budget(&config, 1500));
         assert_eq!(s.rx_frame_cap(), 0);
+    }
+
+    #[test]
+    fn frame_cap_is_count_not_bytes() {
+        let s = Socket::test_socket(64, 2 * 1024 * 1024);
+        assert_eq!(s.tx_queue.frame_room(), 1437);
     }
 
     // =========================================================================================//
@@ -5956,10 +5970,16 @@ mod test {
 
     #[test]
     fn frame_send_frame_splits_with_copy() {
-        let source = crate::tests::tx_test_source(8);
+        let alloc = CountingAlloc::new(8);
+        let source = TxSource::new(alloc.clone());
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
         assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 2));
+        assert_eq!(alloc.live(), 2);
+        assert_eq!(alloc.releases(), 0);
+        let first = s.tx_queue.take(0);
+        assert_eq!(first.payload(), b"abcd");
+        s.tx_queue.put_back(0, first);
         assert_eq!(match s.tx_queue.segment(4, 4) { Seg::Whole { index } => s.tx_queue.take(index).payload().to_vec(), _ => panic!("missing split frame") }, b"ef");
     }
 
@@ -6031,6 +6051,7 @@ mod test {
         let clone = frame.clone();
         assert!(s.send_frame(clone).is_ok());
         assert_eq!(frame.payload(), b"abcdef");
+        assert!(frame.unique());
         assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 2));
     }
 
@@ -6139,7 +6160,7 @@ mod test {
     }
 
     #[test]
-    fn frame_cwnd_limited_cut_then_whole() {
+    fn frame_cut_remainder_merges_with_next_frame_like_ring() {
         let source = crate::tests::tx_test_source(8);
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
@@ -6148,11 +6169,9 @@ mod test {
         assert_eq!(emit_frame_segment(&mut s).2, b"a");
         ack_frame_bytes(&mut s, 1);
         s.remote_win_len = 8;
-        assert_eq!(emit_frame_segment(&mut s).2, b"b");
-        ack_frame_bytes(&mut s, 2);
-        let (_, _, payload, whole) = emit_frame_segment(&mut s);
-        assert_eq!(payload, b"cdef");
-        assert!(whole);
+        let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!((seq, payload), (LOCAL_SEQ + 2, b"bcde".to_vec()));
+        assert!(!whole);
     }
 
     #[test]
@@ -6193,17 +6212,68 @@ mod test {
     }
 
     #[test]
-    fn frame_two_writes_rto_resend_as_two_segments() {
+    fn frame_rto_coalesces_unacked_frames_like_ring() {
         let source = crate::tests::tx_test_source(8);
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
-        let _ = emit_frame_segment(&mut s);
+        assert!(emit_frame_segment(&mut s).3);
         assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
-        let _ = emit_frame_segment(&mut s);
+        assert!(emit_frame_segment(&mut s).3);
         s.cx.set_now(Instant::from_millis(300));
-        let (control, _, payload, whole) = emit_frame_segment(&mut s);
+        let (control, seq, payload, whole) = emit_frame_segment(&mut s);
         assert_eq!((control, payload), (TcpControl::Psh, b"abcd".to_vec()));
+        assert_eq!(seq, LOCAL_SEQ + 1);
+        assert_ne!(control, TcpControl::Fin);
         assert!(!whole);
+    }
+
+    #[test]
+    fn frame_peer_mss_below_local_payload_keeps_byte_capacity() {
+        let source = crate::tests::tx_test_source(1460);
+        let mut s = frame_socket(8192, tx_frame_cap(8192, 1460), 1460, source);
+        s.remote_mss = 536;
+        s.remote_win_len = 8192;
+        s.congestion_controller.set_initial_window(8192);
+        let bytes: Vec<u8> = (0..8192).map(|index| index as u8).collect();
+        assert_eq!(s.send_slice(&bytes), Ok(bytes.len()));
+        for offset in (0..bytes.len()).step_by(536) {
+            let (_, actual_seq, payload, whole) = emit_frame_segment(&mut s);
+            let end = offset.checked_add(536).unwrap().min(bytes.len());
+            assert_eq!(actual_seq, LOCAL_SEQ + 1 + offset);
+            assert_eq!(payload, bytes[offset..end]);
+            assert!(!whole);
+        }
+    }
+
+    #[test]
+    fn frame_peer_mss_cuts_across_local_send_slice_frames_like_ring() {
+        let source = crate::tests::tx_test_source(1460);
+        let mut s = frame_socket(4380, tx_frame_cap(4380, 1460), 1460, source);
+        s.remote_mss = 1024;
+        s.remote_win_len = 4380;
+        s.congestion_controller.set_initial_window(4380);
+        let bytes: Vec<u8> = (0..4380).map(|index| index as u8).collect();
+        assert_eq!(s.send_slice(&bytes), Ok(bytes.len()));
+        for (offset, len) in [(0, 1024), (1024, 1024), (2048, 1024), (3072, 1024), (4096, 284)] {
+            let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+            assert_eq!(seq, LOCAL_SEQ + 1 + offset);
+            assert_eq!(payload, bytes[offset..offset + len]);
+            assert!(!whole);
+        }
+    }
+
+    #[test]
+    fn frame_full_unique_frames_send_zero_copy_without_egress_between_writes() {
+        let source = crate::tests::tx_test_source(4);
+        let mut s = frame_socket(12, 3, 4, source.clone());
+        for bytes in [b"abcd", b"efgh", b"ijkl"] {
+            assert!(s.send_frame(owned_frame(&source, bytes)).is_ok());
+        }
+        for (offset, expected) in [(0, b"abcd"), (4, b"efgh"), (8, b"ijkl")] {
+            let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+            assert_eq!((seq, payload), (LOCAL_SEQ + 1 + offset, expected.to_vec()));
+            assert!(whole);
+        }
     }
 
     #[test]
