@@ -27,6 +27,8 @@ members = [
     "switch",
     # depot (vendored from ~/src/meminfra/depot)
     "depot",
+    # switchnet
+    "switchnet",
 ]
 exclude = ["conduit/vendor/smoltcp"]
 

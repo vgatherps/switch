@@ -1,0 +1,21 @@
+[package]
+name = "switchnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dpdk-smoltcp = { path = "../conduit/crates/dpdk-smoltcp" }
+
+[dev-dependencies]
+zhida-test-kit = { path = "../conduit/test-support/kit" }
+zhida-test-support = { path = "../conduit/test-support" }
+criterion = "0.5"
+
+[[bench]]
+name = "turn"
+harness = false
+
+[lints]
+workspace = true
