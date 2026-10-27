@@ -1,5 +1,5 @@
 LINUX = scripts/test-linux.sh
-# The root workspace also holds conduit and kioto; --workspace would pull them in.
+# The root workspace also holds conduit and switch; --workspace would pull them in.
 PKGS = -p ceph-rseq -p ceph-ring -p ceph-fifo -p ceph-proto -p ceph-control
 
 .PHONY: test test-release e2e bench clippy check-x86
