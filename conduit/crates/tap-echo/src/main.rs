@@ -32,7 +32,7 @@ bytes, then Zhida closes (FIN after them) and reads and discards whatever the pe
 sends; a peer FIN before that closes as without it.
 Zhida: MAC {zhida_mac}, IPv4 {ZHIDA_IP}/{PREFIX_LEN}. DPDK vdev {vdev} with
 devargs {devargs}: kernel netdev {IFACE}. Port: MTU {MTU}, {DESCRIPTORS}/{DESCRIPTORS}
-descriptors, bursts {BURST}/{BURST}, a TX pool of {POOL_COUNT} mbufs and an RX pool sized by
+descriptors, bursts {BURST}/{BURST}, TX and frame pools of {POOL_COUNT} mbufs each and an RX pool sized by
 dpdk_smoltcp::rx_pool_count for N sockets of BYTES receive bytes (cache {POOL_CACHE}, data room
 headroom + {FRAME_ROOM}). Stack: random_seed from /dev/urandom each run, max_sockets N, rx_staging
 {RX_STAGING}, tx_pending {TX_PENDING}.

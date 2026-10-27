@@ -37,6 +37,7 @@ struct Names {
     iface: &'static CStr,
     rx_pool: &'static CStr,
     tx_pool: &'static CStr,
+    frame_pool: &'static CStr,
 }
 
 fn with_stack(eal: &Eal, names: Names, test: impl FnOnce(&mut Stack, Instant)) {
@@ -77,6 +78,7 @@ fn with_stack_gateway(
         queue_socket: -1,
         rx_pool: pool(names.rx_pool, 255),
         tx_pool: pool(names.tx_pool, 127),
+        frame_pool: pool(names.frame_pool, 127),
         offloads,
     };
     // SAFETY: this thread owns the new tap and its Port. net_tap uses real
@@ -106,9 +108,10 @@ fn with_stack_gateway(
     let port = stack.into_port();
     assert_eq!(in_use(names.rx_pool), u32::from(port.descriptor_counts().0));
     assert_eq!(in_use(names.tx_pool), 0);
+    assert_eq!(in_use(names.frame_pool), 0);
     port.try_close().unwrap();
     tap.close();
-    for name in [names.rx_pool, names.tx_pool] {
+    for name in [names.rx_pool, names.tx_pool, names.frame_pool] {
         assert!(!pool_exists(name));
     }
 }
@@ -122,6 +125,7 @@ fn kernel_off_subnet_peer_through_gateway() {
             iface,
             rx_pool: c"udpk_gateway_rx",
             tx_pool: c"udpk_gateway_tx",
+            frame_pool: c"udpk_gateway_fr",
         };
         let [a, b, c, d] = KERNEL_ADDR.octets();
         with_stack_gateway(
@@ -400,6 +404,7 @@ fn kernel_to_zhida_datagrams() {
             iface: c"cdudp_rx",
             rx_pool: c"udpk_rx_rx",
             tx_pool: c"udpk_rx_tx",
+            frame_pool: c"udpk_rx_fr",
         };
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, true);
@@ -432,12 +437,14 @@ fn offload_kernel_to_zhida_and_back() {
                 iface: c"cdudp_off_on",
                 rx_pool: c"udpk_off_on_rx",
                 tx_pool: c"udpk_off_on_tx",
+                frame_pool: c"udpk_off_on_fr",
             }),
             (false, Names {
                 vdev: c"net_tap_udpk_off_no",
                 iface: c"cdudp_off_no",
                 rx_pool: c"udpk_off_no_rx",
                 tx_pool: c"udpk_off_no_tx",
+                frame_pool: c"udpk_off_no_fr",
             }),
         ] {
             let iface = names.iface;
@@ -482,6 +489,7 @@ fn zhida_to_kernel_datagrams() {
             iface: c"cdudp_tx",
             rx_pool: c"udpk_tx_rx",
             tx_pool: c"udpk_tx_tx",
+            frame_pool: c"udpk_tx_fr",
         };
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, true);
@@ -504,6 +512,7 @@ fn kernel_zero_checksum_accepted() {
             iface: c"cdudp_zrx",
             rx_pool: c"udpk_zrx_rx",
             tx_pool: c"udpk_zrx_tx",
+            frame_pool: c"udpk_zrx_fr",
         };
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, true);
@@ -541,6 +550,7 @@ fn offload_kernel_zero_checksum_accepted() {
             iface: c"cdudp_off_zrx",
             rx_pool: c"udpk_off_zrx_rx",
             tx_pool: c"udpk_off_zrx_tx",
+            frame_pool: c"udpk_off_zrx_fr",
         };
         let offloads = Offloads {
             rx_timestamp: false,
@@ -584,6 +594,7 @@ fn zhida_zero_checksum_accepted_by_kernel() {
             iface: c"cdudp_ztx",
             rx_pool: c"udpk_ztx_rx",
             tx_pool: c"udpk_ztx_tx",
+            frame_pool: c"udpk_ztx_fr",
         };
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, false);
@@ -610,6 +621,7 @@ fn connected_zhida_socket_echo() {
             iface: c"cdudp_echo",
             rx_pool: c"udpk_echo_rx",
             tx_pool: c"udpk_echo_tx",
+            frame_pool: c"udpk_echo_fr",
         };
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, true);
@@ -651,6 +663,7 @@ fn closed_port_no_icmp() {
             iface: c"cdudp_closed",
             rx_pool: c"udpk_closed_rx",
             tx_pool: c"udpk_closed_tx",
+            frame_pool: c"udpk_closed_fr",
         };
         with_stack(eal, names, |stack, start| {
             let kernel = kernel_socket();
@@ -696,6 +709,7 @@ fn oversize_refused() {
             iface: c"cdudp_large",
             rx_pool: c"udpk_large_rx",
             tx_pool: c"udpk_large_tx",
+            frame_pool: c"udpk_large_fr",
         };
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, true);

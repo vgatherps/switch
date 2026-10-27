@@ -37,7 +37,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
     UdpPacket,
 };
-use dpdk_smoltcp::{Eal, Sent, Turn, UdpConfig, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{tx_reserve, Eal, Sent, Turn, UdpConfig, UdpHandle, UdpSendError};
 
 use zhida_test_kit::pair::{self, Pair, Side, T0};
 use zhida_test_kit::with_eal;
@@ -110,11 +110,12 @@ fn setup(eal: &Eal, mode: Mode, paths: &[PathMtu]) -> (Pair, [UdpHandle; 2]) {
         configs,
         T0,
         128,
-        |_, port| {
+        |side, port| {
             port.rx_burst = u16::try_from(BURST).unwrap();
             port.tx_burst = u16::try_from(BURST).unwrap();
             port.rx_pool.count = 255;
-            port.tx_pool.count = 127;
+            port.tx_pool.count =
+                tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
         },
         |side, port| {
             if side == Side::A && mode == Mode::Offload {

@@ -8,7 +8,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpEndpoint,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
 use dpdk_smoltcp::{
     Eal, Port, PortConfig, Stack, StackConfig, TcpHandle, Turn, DEFAULT_NEIGHBOR_CAPACITY,
 };
@@ -150,7 +150,10 @@ impl Pair {
     }
 
     /// `new` with RX and TX rings of `ring` slots (holding `ring - 1`; a power
-    /// of two) and each side's `RingPort::config` changed by `adjust`.
+    /// of two) and each side's `RingPort::config` changed by `adjust`. Before
+    /// `adjust`, the TX and frame pools are raised to `tx_reserve` and
+    /// `frame_reserve` of the TX descriptors (the ring size) and the side's
+    /// `tx_pending` if the kit's pools are smaller.
     pub fn with_ports(
         eal: &Eal,
         names: [&str; 2],
@@ -177,6 +180,12 @@ impl Pair {
         let [a, b] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
             let mut config = fixture.config();
+            let tx_pending = configs[side.index()].tx_pending;
+            let floor = |reserve: usize| u32::try_from(reserve).expect("pool count fits u32");
+            config.tx_pool.count =
+                config.tx_pool.count.max(floor(tx_reserve(config.tx_descriptors, tx_pending)));
+            config.frame_pool.count =
+                config.frame_pool.count.max(floor(frame_reserve(config.tx_descriptors, tx_pending)));
             adjust(side, &mut config);
             let mut port = fixture.open_with(eal, config);
             opened(side, &mut port);

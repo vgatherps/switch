@@ -6,7 +6,7 @@ use smoltcp::iface::{
     SocketHandle, TcpCounters, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpCounters, UdpSendError, UdpSet,
     UdpSocket,
 };
-use smoltcp::phy::HeldFrames;
+use smoltcp::phy::{HeldFrames, TxAlloc as _, TxFrame};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -16,7 +16,7 @@ use smoltcp::wire::{
 use crate::device::Device;
 use crate::handle::{TcpHandle, UdpHandle};
 use crate::port::{Port, PortError};
-use crate::rx_pool::{rx_reserve, tx_reserve};
+use crate::rx_pool::{frame_reserve, rx_reserve, tx_reserve};
 
 /// Default number of on-link neighbors the ARP cache holds.
 pub const DEFAULT_NEIGHBOR_CAPACITY: usize = 256;
@@ -68,6 +68,8 @@ pub enum StackError {
     InvalidConfig(&'static str),
     IpMtuBelowIpv4Minimum { mtu: u16 },
     TxPoolTooSmall { count: usize, required: usize },
+    /// The frame pool holds fewer than `frame_reserve(TX descriptors, tx_pending)` mbufs.
+    TxFramePoolTooSmall { count: usize, required: usize },
     TimeWentBackwards { last: Instant, now: Instant },
     Port(PortError),
 }
@@ -182,9 +184,12 @@ impl Stack {
     /// Port unchanged with `InvalidConfig`.
     /// IP MTU below 68 returns the Port with `IpMtuBelowIpv4Minimum`.
     /// A TX pool below `tx_reserve` returns the Port with `TxPoolTooSmall`.
+    /// A frame pool below `frame_reserve` returns the Port with
+    /// `TxFramePoolTooSmall`: packets the PMD holds and pending packets can
+    /// then never take the last frame.
     /// The negotiated TX descriptor count bounds sent mbufs held by NIC PMDs.
-    /// Test PMDs such as net_ring ignore that count and queue sent mbufs into
-    /// an attached ring instead; their bound is the ring's capacity.
+    /// net_ring ignores that count and keeps sent mbufs on its attached ring
+    /// instead: open it with TX descriptors equal to the TX ring size.
     ///
     /// smoltcp encodes "poll now" as `Instant::ZERO`, which `poll_at`
     /// normalization relies on; the monotonic rule of `turn` and `receive`
@@ -214,6 +219,17 @@ impl Stack {
         let required = tx_reserve(port.descriptor_counts().1, config.tx_pending);
         if count < required {
             return Err((port, StackError::TxPoolTooSmall { count, required }));
+        }
+        let frame_count = port.frame_pool().count();
+        let frame_required = frame_reserve(port.descriptor_counts().1, config.tx_pending);
+        if frame_count < frame_required {
+            return Err((
+                port,
+                StackError::TxFramePoolTooSmall {
+                    count: frame_count,
+                    required: frame_required,
+                },
+            ));
         }
         let rx_pool_count = port.rx_pool_count();
         let rx_reserve = rx_reserve(
@@ -378,6 +394,13 @@ impl Stack {
     /// `Err(NoRoute)` when `StackConfig::gateway` is `None`.
     pub fn resolve_gateway(&mut self) -> Result<Option<EthernetAddress>, NoRoute> {
         self.iface.resolve_gateway(&mut self.device)
+    }
+
+    /// An empty TX frame from this Stack's frame pool: `capacity()` is the IP
+    /// MTU − 28, the largest UDP payload. `None` when the pool is empty.
+    /// Dropping the frame returns it to the pool.
+    pub fn tx_frame(&mut self) -> Option<TxFrame> {
+        self.device.frame_pool().alloc().map(TxFrame::new)
     }
 
     fn set_now(&mut self, now: Instant) -> Result<(), StackError> {

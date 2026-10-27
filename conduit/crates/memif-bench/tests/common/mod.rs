@@ -20,8 +20,10 @@ pub struct Names {
     pub client: CString,
     pub server_rx: CString,
     pub server_tx: CString,
+    pub server_frame: CString,
     pub client_rx: CString,
     pub client_tx: CString,
+    pub client_frame: CString,
 }
 
 /// Vdev and pool names unique to `tag`.
@@ -32,8 +34,10 @@ pub fn names(tag: &str) -> Names {
         client: CString::new(format!("net_memif_{tag}_c")).unwrap(),
         server_rx: name("srx"),
         server_tx: name("stx"),
+        server_frame: name("sfr"),
         client_rx: name("crx"),
         client_tx: name("ctx"),
+        client_frame: name("cfr"),
     }
 }
 
@@ -57,23 +61,32 @@ pub struct End {
 }
 
 /// Open the server, then the client, on a `fresh_socket` with
-/// `config(port_id, rx_pool, tx_pool)`, and wait until both links are up. If
+/// `config(port_id, rx_pool, tx_pool, frame_pool)`, and wait until both links are up. If
 /// a wait fails its connect handling may still run, so both Ports are
 /// leaked, never dropped.
 pub fn open_pair(
     names: &Names,
     log2_ring_size: u8,
-    config: impl for<'a> Fn(u16, &'a CStr, &'a CStr) -> PortConfig<'a>,
+    config: impl for<'a> Fn(u16, &'a CStr, &'a CStr, &'a CStr) -> PortConfig<'a>,
 ) -> (End, End) {
     let socket = fresh_socket();
     with_eal(|eal| {
-        let open = |vdev: &CStr, role, rx: &CStr, tx: &CStr| {
+        let open = |vdev: &CStr, role, [rx, tx, frame]: [&CString; 3]| {
             let memif = Memif { vdev, role, id: 0, socket: &socket, log2_ring_size };
-            let (vdev, port) = unsafe { MemifVdev::open(eal, &memif, |id| config(id, rx, tx)) }.unwrap();
+            let (vdev, port) =
+                unsafe { MemifVdev::open(eal, &memif, |id| config(id, rx, tx, frame)) }.unwrap();
             End { vdev, port: ManuallyDrop::new(port) }
         };
-        let server = open(&names.server, Role::Server, &names.server_rx, &names.server_tx);
-        let client = open(&names.client, Role::Client, &names.client_rx, &names.client_tx);
+        let server = open(
+            &names.server,
+            Role::Server,
+            [&names.server_rx, &names.server_tx, &names.server_frame],
+        );
+        let client = open(
+            &names.client,
+            Role::Client,
+            [&names.client_rx, &names.client_tx, &names.client_frame],
+        );
         let up = server.vdev.wait_link_up(DEADLINE).and_then(|()| client.vdev.wait_link_up(DEADLINE));
         if let Err(error) = up {
             std::mem::forget((server, client));
@@ -94,7 +107,14 @@ pub fn close_pair(first: End, second: End, names: &Names) {
             panic!("close barrier: {error}");
         }
     }
-    for name in [&names.server_rx, &names.server_tx, &names.client_rx, &names.client_tx] {
+    for name in [
+        &names.server_rx,
+        &names.server_tx,
+        &names.server_frame,
+        &names.client_rx,
+        &names.client_tx,
+        &names.client_frame,
+    ] {
         assert!(unsafe { rte_mempool_lookup(name.as_ptr()) }.is_null());
     }
 }

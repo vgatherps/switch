@@ -71,6 +71,7 @@ fn bench_config(defaults: PortConfig<'_>) -> PortConfig<'_> {
         tx_burst: BATCH as u16,
         rx_pool: pool(defaults.rx_pool.name),
         tx_pool: pool(defaults.tx_pool.name),
+        frame_pool: pool(defaults.frame_pool.name),
         ..defaults
     }
 }
@@ -104,7 +105,7 @@ fn ring_bench(c: &mut Criterion, eal: &Eal) {
         let mut pending = VecDeque::with_capacity(BATCH);
         b.iter(|| {
             for _ in 0..BATCH {
-                pending.push_back(port.alloc_tx(FRAME).unwrap());
+                pending.push_back(port.alloc_tx(FRAME).unwrap().into());
             }
             let accepted = port.tx_burst(&mut pending).unwrap();
             assert_eq!(black_box(accepted), BATCH);

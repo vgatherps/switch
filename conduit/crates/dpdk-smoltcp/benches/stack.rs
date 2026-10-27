@@ -108,7 +108,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     IPV4_HEADER_LEN,
 };
 use dpdk_smoltcp::{rx_pool_count, rx_reserve};
-use dpdk_smoltcp::{Eal, Packet, Port, PortConfig, RxBurst, Stack, StackConfig};
+use dpdk_smoltcp::{Eal, Packet, Port, PortConfig, RxBurst, Stack, StackConfig, TxPacket};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::*;
 
@@ -178,6 +178,7 @@ fn bench_config(defaults: PortConfig<'_>) -> PortConfig<'_> {
         tx_burst: BATCH as u16,
         rx_pool: pool(defaults.rx_pool.name),
         tx_pool: pool(defaults.tx_pool.name),
+        frame_pool: pool(defaults.frame_pool.name),
         ..defaults
     }
 }
@@ -308,11 +309,11 @@ fn tcp_bench(c: &mut Criterion, eal: &Eal) -> Templates {
 }
 
 /// Producer: `count` TX packets holding `frame`, burst whole.
-fn send_copies(port: &mut Port, pending: &mut VecDeque<Packet>, frame: &[u8], count: usize) {
+fn send_copies(port: &mut Port, pending: &mut VecDeque<TxPacket>, frame: &[u8], count: usize) {
     for _ in 0..count {
         let mut packet = port.alloc_tx(frame.len() as u16).unwrap();
         packet.data_mut().copy_from_slice(frame);
-        pending.push_back(packet);
+        pending.push_back(packet.into());
     }
     assert_eq!(port.tx_burst(pending).unwrap(), count);
 }

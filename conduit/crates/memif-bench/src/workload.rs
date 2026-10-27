@@ -129,9 +129,15 @@ fn send_poll(stack: &mut Stack, conns: usize) -> Result<Sent, StackError> {
 
 /// Port settings for a side with `conns` connections of 64 KiB receive buffers.
 /// The RX pool covers the driver reserve and socket budgets. The TX pool
-/// covers 64 descriptors and every pending slot, with cache slack;
-/// copy TX frees accepted mbufs.
-pub fn port_config<'a>(port_id: u16, conns: usize, rx_pool: &'a CStr, tx_pool: &'a CStr) -> PortConfig<'a> {
+/// covers 64 descriptors and every pending slot, and the frame pool one frame
+/// more (`frame_reserve`), each with cache slack; copy TX frees accepted mbufs.
+pub fn port_config<'a>(
+    port_id: u16,
+    conns: usize,
+    rx_pool: &'a CStr,
+    tx_pool: &'a CStr,
+    frame_pool: &'a CStr,
+) -> PortConfig<'a> {
     let headroom = RTE_PKTMBUF_HEADROOM as u16;
     let pool = |name, need: usize, data_room_size| PoolConfig {
         name,
@@ -161,6 +167,7 @@ pub fn port_config<'a>(port_id: u16, conns: usize, rx_pool: &'a CStr, tx_pool: &
             socket_id: -1,
         },
         tx_pool: pool(tx_pool, tx_pending(conns), headroom + FRAME),
+        frame_pool: pool(frame_pool, tx_pending(conns) + 1, headroom + FRAME),
         offloads: Offloads::default(),
     }
 }

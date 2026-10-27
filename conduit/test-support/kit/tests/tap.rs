@@ -20,7 +20,7 @@ fn message(payload: Box<dyn Any + Send>) -> String {
     }
 }
 
-fn config(port_id: u16, rx_pool: &'static CStr, tx_pool: &'static CStr) -> PortConfig<'static> {
+fn config(port_id: u16, [rx_pool, tx_pool, frame_pool]: [&'static CStr; 3]) -> PortConfig<'static> {
     let pool = |name| PoolConfig {
         name,
         count: 63,
@@ -38,6 +38,7 @@ fn config(port_id: u16, rx_pool: &'static CStr, tx_pool: &'static CStr) -> PortC
         queue_socket: -1,
         rx_pool: pool(rx_pool),
         tx_pool: pool(tx_pool),
+        frame_pool: pool(frame_pool),
         offloads: Offloads::default(),
     }
 }
@@ -45,11 +46,11 @@ fn config(port_id: u16, rx_pool: &'static CStr, tx_pool: &'static CStr) -> PortC
 #[zhida_test_support::pinned_test]
 fn tap_vdev_unwind_removes_netdev_and_vdev_name() {
     let (vdev, iface) = (c"net_tap_kit_unwind", c"cdtap_kunwind");
-    let (rx_pool, tx_pool) = (c"tap_kit_unwind_rx", c"tap_kit_unwind_tx");
+    let pools = [c"tap_kit_unwind_rx", c"tap_kit_unwind_tx", c"tap_kit_unwind_fr"];
     with_eal(|eal| {
         let payload = catch_unwind(AssertUnwindSafe(|| {
             let tap = TapVdev::new(vdev, iface);
-            let _port = unsafe { Port::open(eal, config(tap.port_id(), rx_pool, tx_pool)) }
+            let _port = unsafe { Port::open(eal, config(tap.port_id(), pools)) }
                 .unwrap();
             assert_ne!(ifindex(iface), 0);
             panic!("original tap panic");
@@ -58,7 +59,7 @@ fn tap_vdev_unwind_removes_netdev_and_vdev_name() {
         assert_eq!(message(payload), "original tap panic");
         // The Port dropped first and freed its pools; the vdev went after it.
         assert_eq!(ifindex(iface), 0);
-        assert!(!pool_exists(rx_pool) && !pool_exists(tx_pool));
+        assert!(!pools.into_iter().any(pool_exists));
 
         let tap = TapVdev::new(vdev, iface);
         assert_ne!(ifindex(iface), 0);

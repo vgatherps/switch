@@ -99,7 +99,7 @@ case $* in
     printf 'assertion `left == right` failed: recv_slice short of recv_queue\n  left: 0\n right: 1\n'
     exit 101
     ;;
-*"--seed leak"*) echo "tap-echo: buffers still in use at port close: rx 1, tx 0"; exit 2 ;;
+*"--seed leak"*) echo "tap-echo: buffers still in use at port close: rx 1, tx 0, frame 0"; exit 2 ;;
 *)
     echo 'usage: fuzz_tcp.py [-h] [--seed SEED] [--connections CONNECTIONS]'
     echo '                   [--only ONLY] [--known-bugs]'

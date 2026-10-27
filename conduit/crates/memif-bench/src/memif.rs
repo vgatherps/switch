@@ -47,6 +47,8 @@ pub struct Memif<'a> {
     pub log2_ring_size: u8,
 }
 
+// Setup path; the error size does not matter. `Open` carries the retained Port.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum MemifError {
     Settings(&'static str),
@@ -78,8 +80,8 @@ pub struct MemifVdev {
 
 impl MemifVdev {
     /// Create the vdev and open a Port on it with `config(port_id)`. The RX
-    /// data room after headroom must hold `BUFFER_SIZE` and the TX data room
-    /// after headroom must not exceed it. memif copy RX allocates 32 mbufs per
+    /// data room after headroom must hold `BUFFER_SIZE` and the TX and frame
+    /// pools' data rooms after headroom must not exceed it. memif copy RX allocates 32 mbufs per
     /// call with data waiting and returns nothing if it cannot, so the RX pool
     /// count must cover the caller's staging plus 32 plus cache slack.
     ///
@@ -144,6 +146,9 @@ impl MemifVdev {
         }
         if config.tx_pool.data_room_size > headroom + BUFFER_SIZE {
             return Err(uninit(MemifError::Settings("TX data room exceeds headroom + bsize")));
+        }
+        if config.frame_pool.data_room_size > headroom + BUFFER_SIZE {
+            return Err(uninit(MemifError::Settings("frame data room exceeds headroom + bsize")));
         }
         match Port::open(eal, config) {
             Ok(port) => Ok((

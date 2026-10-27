@@ -79,10 +79,10 @@ pub fn print_eth_stats(port_id: u16) -> Result<(), String> {
 pub fn close(port: Port, mut code: i32) -> i32 {
     match port.try_close() {
         Ok(()) => line("port_close", "ok"),
-        Err((port, PortError::OutstandingBuffers { rx, tx })) => {
+        Err((port, PortError::OutstandingBuffers { rx, tx, frame })) => {
             line(
                 "port_close",
-                format_args!("buffers still in use: rx={rx} tx={tx}"),
+                format_args!("buffers still in use: rx={rx} tx={tx} frame={frame}"),
             );
             code = 2;
             drop(port);

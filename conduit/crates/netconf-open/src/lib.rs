@@ -6,7 +6,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dpdk_smoltcp::{rx_reserve, tx_reserve, Offloads, PortConfig};
+use dpdk_smoltcp::{frame_reserve, rx_reserve, tx_reserve, Offloads, PortConfig};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::{
     rte_eth_dev_adjust_nb_rx_tx_desc, rte_eth_link, rte_eth_link_get_nowait, RTE_PKTMBUF_HEADROOM,
@@ -42,7 +42,7 @@ pub struct Sizing {
     /// Also counted in the RX pool.
     pub rx_staging: usize,
     /// `StackConfig::tx_pending`: frames built but not yet accepted by the
-    /// PMD. Also counted in the TX pool.
+    /// PMD. Also counted in the TX pool and the frame pool.
     pub tx_pending: usize,
     /// `StackConfig::segments_per_visit`: frames one TCP socket sends in a row
     /// while other sockets have frames ready.
@@ -81,9 +81,12 @@ fn port_config(
     )
     .map_err(|_| "RX pool count exceeds u32")?;
     // Stack::new refuses a TX pool below tx_reserve (a NIC PMD may hold a full
-    // TX ring of sent mbufs until it reclaims them).
+    // TX ring of sent mbufs until it reclaims them) and a frame pool below
+    // frame_reserve.
     let tx_count = u32::try_from(tx_reserve(tx_desc, sizing.tx_pending))
         .map_err(|_| "TX pool count exceeds u32")?;
+    let frame_count = u32::try_from(frame_reserve(tx_desc, sizing.tx_pending))
+        .map_err(|_| "frame pool count exceeds u32")?;
     let headroom = RTE_PKTMBUF_HEADROOM;
     let rx_room = headroom + (u32::from(mtu) + 26).div_ceil(1024) * 1024;
     let tx_room = headroom + u32::from(mtu) + 14;
@@ -106,6 +109,7 @@ fn port_config(
         queue_socket: -1,
         rx_pool: pool(c"nic_rx", rx_count, rx_room)?,
         tx_pool: pool(c"nic_tx", tx_count, tx_room)?,
+        frame_pool: pool(c"nic_frame", frame_count, tx_room)?,
         offloads,
     })
 }
@@ -194,6 +198,7 @@ mod tests {
             assert_eq!((config.rx_descriptors, config.tx_descriptors), adjusted);
             let held = u32::from(adjusted.1) + u32::try_from(sizing.tx_pending).unwrap();
             assert_eq!(config.tx_pool.count, held);
+            assert_eq!(config.frame_pool.count, held + 1);
         }
     }
 }

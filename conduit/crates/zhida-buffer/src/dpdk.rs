@@ -933,6 +933,22 @@ impl PoolManager {
     /// APIs do not enforce these restrictions; callers must preserve them through
     /// all Rust and DPDK operations.
     pub unsafe fn new_production(config: PoolConfig<'_>) -> Result<Self, PoolCreateError> {
+        Self::create(config)
+    }
+
+    /// Create a pool like `new_production` whose mbufs may be shared.
+    ///
+    /// # Safety
+    /// `new_production`'s contract applies with exactly one change: `share`
+    /// (refcount > 1) is allowed. Mbufs stay direct and single-segment: no
+    /// chains, indirect attachments or external backing. They are freed only by
+    /// the refcount-aware single-segment free (`zhida_pktmbuf_free_seg`) or a
+    /// PMD's standard free, never by `zhida_pktmbuf_free_minimal`.
+    pub unsafe fn new_shared(config: PoolConfig<'_>) -> Result<Self, PoolCreateError> {
+        Self::create(config)
+    }
+
+    unsafe fn create(config: PoolConfig<'_>) -> Result<Self, PoolCreateError> {
         if config.cache_size == 0 {
             return Err(PoolCreateError::CacheDisabled);
         }

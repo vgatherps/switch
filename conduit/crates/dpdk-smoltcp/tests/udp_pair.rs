@@ -8,13 +8,14 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol,
     Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
 };
-use dpdk_smoltcp::{Eal, Stack, UdpConfig, UdpCounters, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{tx_reserve, Eal, Stack, UdpConfig, UdpCounters, UdpHandle, UdpSendError};
 
 const PORT: u16 = 1234;
 const BURST: usize = 32;
 
 fn new_pair(eal: &Eal, names: [&str; 2]) -> (Pair, [UdpHandle; 2]) {
-    new_pair_with_tx_pool(eal, names, 127)
+    // net_ring's TX descriptors are its 128-slot TX ring.
+    new_pair_with_tx_pool(eal, names, tx_reserve(128, pair::config(Side::A).tx_pending) as u32)
 }
 
 fn new_pair_with_tx_pool(eal: &Eal, names: [&str; 2], tx_pool: u32) -> (Pair, [UdpHandle; 2]) {

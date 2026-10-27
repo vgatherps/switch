@@ -218,6 +218,7 @@ obligations below.
 | `queue_socket` | `i32` | NUMA socket passed to queue setup. |
 | `rx_pool` | `PoolConfig<'a>` | RX pool configuration. |
 | `tx_pool` | `PoolConfig<'a>` | TX pool configuration. |
+| `frame_pool` | `PoolConfig<'a>` | TX frame pool for `Stack::tx_frame`; data room like `tx_pool`'s. |
 | `offloads` | `Offloads` | Requested checksum and RX timestamp offloads. |
 
 `PoolConfig` has `name: &CStr`, `count: u32`, `cache_size: u32`, `data_room_size: u16`, and
@@ -326,8 +327,9 @@ both traffic directions. `Stack::new(port, config, now)` consumes the Port on su
 returns `(Port, StackError)`. Invalid configuration or negative start time gives `InvalidConfig`;
 IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` from the path table,
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
-`TxPoolTooSmall { count, required }`. Creation does not check the RX pool against sockets added
-afterwards.
+`TxPoolTooSmall { count, required }`, and a frame pool smaller than `frame_reserve(negotiated TX
+descriptors, tx_pending)` gives `TxFramePoolTooSmall { count, required }`. Creation does not check
+the RX pool against sockets added afterwards.
 
 ## Pool sizing
 
@@ -389,6 +391,15 @@ such as `net_ring` ignore the descriptor count and queue sent mbufs into an atta
 capacity bounds retention. Ingress needs a TX packet before processing each RX frame, even one that
 needs no reply, so an empty TX pool blocks receive too. Add room for PMD-specific allocations such
 as the `net_tap` checksum header copy.
+
+`Stack::tx_frame() -> Option<TxFrame>` takes an empty frame from the frame pool: its payload starts
+42 bytes after the mbuf headroom and holds up to IP MTU − 28 bytes. `None` means the pool is empty;
+dropping a frame returns it. Frame-pool mbufs may be shared (refcount above 1) but stay direct and
+single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame
+pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pending queue holds keeps
+at most one frame no socket or application counts, and the extra frame means those packets can never
+take the last one. Frames the application holds come on top. `net_ring` ports opened by the test kit
+use their TX ring size as the TX descriptor count.
 
 `Port::alloc_tx` retries an exhausted pool after one TX-done cleanup on queue 0. If the PMD does not
 support cleanup, it returns `None`. A cleanup error other than `-ENOTSUP` panics.
@@ -921,9 +932,9 @@ are:
 | --- | --- |
 | `OwnerMismatch { expected, actual }` | Open/cleanup sees a different lcore identity. |
 | `InvalidSettings(reason)` | Requested or read-back device settings are unacceptable. |
-| `Pool { direction, error }` | RX or TX production pool creation failed. |
+| `Pool { direction, error }` | RX, TX or frame pool creation failed. |
 | `Dpdk { operation, code }` | A checked DPDK setup/cleanup call returned nonzero. |
-| `OutstandingBuffers { rx, tx }` | Close cannot release pools with live buffers. |
+| `OutstandingBuffers { rx, tx, frame }` | Close cannot release pools with live buffers. |
 | `NotReady` | Bursts attempted after incomplete setup or cleanup began. |
 
 `InvalidSettings` includes zero descriptors/bursts, unavailable queues, MTU limits, insufficient
@@ -935,7 +946,8 @@ errno }`, or `OwnerCacheUnavailable { lcore_id }`. A valid lcore-local productio
 
 `StackError::InvalidConfig(reason)` covers configuration validation and negative start time.
 `IpMtuBelowIpv4Minimum { mtu }` rejects MTU below 68 during creation (68-87 is `InvalidConfig`). `TxPoolTooSmall { count,
-required }` rejects a TX pool below `tx_reserve` during creation. `TimeWentBackwards { last, now
+required }` rejects a TX pool below `tx_reserve` during creation, and `TxFramePoolTooSmall { count,
+required }` a frame pool below `frame_reserve`. `TimeWentBackwards { last, now
 }` rejects an earlier ingress-drive time before doing work. `Port(error)` propagates a Port
 burst/flush error. `Stack::new` returns its Port with the error; drive methods return the error
 directly. `AddTcpError::SocketsFull(config)` means all
@@ -1014,7 +1026,7 @@ The tap driver calls `stack.into_port().try_close()` and checks its result. `try
 Result<(), (Port, PortError)>` returns the owner for cleanup/retry.
 
 Cleanup marks the Port unready, stops/closes the ethdev, then checks pool in-use counts.
-`OutstandingBuffers { rx, tx }` refuses pool destruction. Return all application-owned buffers and
+`OutstandingBuffers { rx, tx, frame }` refuses pool destruction. Return all application-owned buffers and
 drain caller-owned rings, then retry `try_close` on the returned owner. Other cleanup failures
 return the owner too. If close released the device ID while returning an error, backing is
 retained for good and subsequent closes return that recorded error. Dropping after refused cleanup

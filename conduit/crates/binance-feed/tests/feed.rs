@@ -21,7 +21,8 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{
-    rx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack, StackConfig,
+    frame_reserve, rx_reserve, tx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack,
+    StackConfig,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -35,6 +36,7 @@ const VDEV: &CStr = c"net_tap_bnc";
 const IFACE: &CStr = c"cdtap_bnc";
 const RX_POOL: &CStr = c"bnc_rx";
 const TX_POOL: &CStr = c"bnc_tx";
+const FRAME_POOL: &CStr = c"bnc_frame";
 const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const SERVER_ADDR: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
@@ -74,6 +76,7 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
             ).unwrap(),
         ),
         tx_pool: pool(TX_POOL, 127),
+        frame_pool: pool(FRAME_POOL, 127),
         offloads: Offloads::default(),
     }
 }
@@ -158,6 +161,10 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
             port_config.rx_pool.count = u32::try_from(
                 reserve.checked_add(budget).expect("RX pool count fits usize"),
             ).unwrap();
+            // net_ring's TX descriptors are its 64-slot TX ring.
+            let (tx, pending) = (port_config.tx_descriptors, stack_config.tx_pending);
+            port_config.tx_pool.count = u32::try_from(tx_reserve(tx, pending)).unwrap();
+            port_config.frame_pool.count = u32::try_from(frame_reserve(tx, pending)).unwrap();
             let port = ring.open_with(eal, port_config);
             let mut stack = Stack::new(port, stack_config, StackInstant::ZERO)
                 .map_err(|(_, error)| error).unwrap();

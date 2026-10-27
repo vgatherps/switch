@@ -90,9 +90,9 @@ fn ring_port_unwind_frees_queued_frames_and_releases_rings_and_vdev() {
         assert_eq!(message(payload), "original ring port panic");
 
         // The Stack dropped first: Port::drop closed the device, found the
-        // three frames still on the RX ring and kept both pools. The fixture
+        // three frames still on the RX ring and kept every pool. The fixture
         // then freed those frames into the kept RX pool.
-        for name in [c"td_unwind_rxp", c"td_unwind_txp"] {
+        for name in [c"td_unwind_rxp", c"td_unwind_txp", c"td_unwind_frp"] {
             assert!(pool_exists(name));
         }
         assert_eq!(in_use(c"td_unwind_rxp"), 0);

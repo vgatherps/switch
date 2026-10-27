@@ -112,6 +112,21 @@ impl PoolResources {
         })
     }
 
+    /// The TX frame pool's backing (`PoolManager::new_shared`).
+    ///
+    /// # Safety
+    /// As `new`, except that `share` (refcount > 1) is allowed; mbufs stay
+    /// direct and single-segment and are freed only by the refcount-aware
+    /// single-segment free or the PMD's standard free, never the minimal free.
+    /// Header bytes in front of a published frame's payload and its mbuf
+    /// metadata may be written by the device and by the PMD's tx_prepare; the
+    /// payload region is written only while the mbuf has one reference.
+    pub(crate) unsafe fn new_frame(config: PoolConfig<'_>) -> Result<Self, PoolCreateError> {
+        PoolManager::new_shared(config).map(|pool| Self {
+            pool: ManuallyDrop::new(pool),
+        })
+    }
+
     pub(crate) fn pool(&self) -> &PoolManager {
         &self.pool
     }

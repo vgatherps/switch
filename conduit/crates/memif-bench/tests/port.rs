@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use common::{close_pair, fresh_socket, names, End, Names, DEADLINE};
 use zhida_test_kit::with_eal;
-use dpdk_smoltcp::{Offloads, Packet, Port, PortConfig, PortError};
+use dpdk_smoltcp::{Offloads, Packet, Port, PortConfig, PortError, TxPacket};
 use memif_bench::memif::{Memif, MemifError, MemifVdev, Role, BUFFER_SIZE, MAX_SOCKET_NAME};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::*;
@@ -65,8 +65,8 @@ fn tiny_segments_keep_memif_bulk_reserve() {
     let reserve = rx_reserve(64, usize::from(BURST), 8);
     let pool_count = rx_pool_count(reserve, 1500, [CAPACITY; 2]);
     let names = names("tinyreserve");
-    let (mut server, mut client) = common::open_pair(&names, RING, |id, rx, tx| {
-        let mut config = config(id, rx, tx);
+    let (mut server, mut client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
+        let mut config = config(id, rx, tx, frame);
         config.rx_pool.count = pool_count;
         config
     });
@@ -211,7 +211,7 @@ fn tiny_segments_keep_memif_bulk_reserve() {
 
 /// 255 mbufs cover RX staging (`BURST`) + memif's 32-mbuf bulk allocation +
 /// cache slack (1.5 x 8).
-fn config<'a>(port_id: u16, rx: &'a CStr, tx: &'a CStr) -> PortConfig<'a> {
+fn config<'a>(port_id: u16, rx: &'a CStr, tx: &'a CStr, frame: &'a CStr) -> PortConfig<'a> {
     let pool = |name| PoolConfig {
         name,
         count: 255,
@@ -229,6 +229,7 @@ fn config<'a>(port_id: u16, rx: &'a CStr, tx: &'a CStr) -> PortConfig<'a> {
         queue_socket: -1,
         rx_pool: pool(rx),
         tx_pool: pool(tx),
+        frame_pool: pool(frame),
         offloads: Offloads::default(),
     }
 }
@@ -266,13 +267,13 @@ fn frames(count: usize) -> Vec<Vec<u8>> {
     (0..count).map(|i| frame(60 + i * 97 % 1455, i as u8)).collect()
 }
 
-fn packets(port: &mut End, frames: &[Vec<u8>]) -> VecDeque<Packet> {
+fn packets(port: &mut End, frames: &[Vec<u8>]) -> VecDeque<TxPacket> {
     frames
         .iter()
         .map(|bytes| {
             let mut packet = port.port.alloc_tx(bytes.len() as u16).unwrap();
             packet.data_mut().copy_from_slice(bytes);
-            packet
+            packet.into()
         })
         .collect()
 }
@@ -360,7 +361,7 @@ fn memif_tx_accepts_front_prefix_when_ring_full() {
     let accepted = client.port.tx_burst(&mut pending).unwrap();
     assert_eq!(accepted, 16);
     assert!(accepted < sent.len());
-    let suffix: Vec<&[u8]> = pending.iter().map(Packet::data).collect();
+    let suffix: Vec<&[u8]> = pending.iter().map(TxPacket::data).collect();
     let expected: Vec<&[u8]> = sent[accepted..].iter().map(Vec::as_slice).collect();
     assert_eq!(suffix, expected);
     let mut received = receive(&mut server, accepted);
@@ -386,7 +387,7 @@ fn memif_tx_buffers_return_to_pool_on_accept() {
 }
 
 /// Copy mode keeps no mbuf between calls: with unread frames in both rings,
-/// both closes succeed and all four pools are freed. Says nothing about the
+/// both closes succeed and all six pools are freed. Says nothing about the
 /// shared memif regions themselves.
 #[zhida_test_support::pinned_test]
 fn memif_close_with_unread_frames_frees_pools() {
@@ -444,7 +445,11 @@ fn socket_names_memif_would_misread_are_rejected() {
     with_eal(|eal| {
         for (socket, expected) in cases {
             let memif = Memif { vdev: &names.server, role: Role::Server, id: 0, socket, log2_ring_size: RING };
-            let opened = unsafe { MemifVdev::open(eal, &memif, |id| config(id, &names.server_rx, &names.server_tx)) };
+            let opened = unsafe {
+                MemifVdev::open(eal, &memif, |id| {
+                    config(id, &names.server_rx, &names.server_tx, &names.server_frame)
+                })
+            };
             match opened {
                 Err(MemifError::Settings(reason)) => assert_eq!(reason, expected, "{socket}"),
                 Ok(opened) => {
@@ -481,9 +486,9 @@ fn memif_open_rejects_mtu_9000() {
         assert_eq!(unsafe { rte_eth_dev_info_get(port_id, &mut info) }, 0);
         assert_eq!((info.max_rx_pktlen, info.max_mtu), (1518, u16::MAX));
 
-        let mut config = config(port_id, &names.server_rx, &names.server_tx);
+        let mut config = config(port_id, &names.server_rx, &names.server_tx, &names.server_frame);
         config.mtu = 9000;
-        for pool in [&mut config.rx_pool, &mut config.tx_pool] {
+        for pool in [&mut config.rx_pool, &mut config.tx_pool, &mut config.frame_pool] {
             pool.data_room_size = RTE_PKTMBUF_HEADROOM as u16 + 9216;
         }
         let error = unsafe { Port::open(eal, config) }.unwrap_err();
@@ -491,7 +496,7 @@ fn memif_open_rejects_mtu_9000() {
             (error.cause, error.rollback_error, error.retained.is_none()),
             (PortError::Dpdk { operation: "rte_eth_dev_configure", code: -libc::EINVAL }, None, true)
         );
-        for name in [&names.server_rx, &names.server_tx] {
+        for name in [&names.server_rx, &names.server_tx, &names.server_frame] {
             assert!(unsafe { rte_mempool_lookup(name.as_ptr()) }.is_null());
         }
         assert_eq!(unsafe { rte_vdev_uninit(names.server.as_ptr()) }, 0);

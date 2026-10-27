@@ -3,12 +3,14 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr::{null_mut, NonNull};
+use std::rc::Rc;
 
 use smoltcp::phy::RxBuf;
 use zhida_buffer::{Mbuf, PoolConfig, PoolCreateError};
 use zhida_dpdk_sys::*;
 
 use crate::eal::{Eal, PoolResources};
+use crate::frame_pool::FramePool;
 
 /// Static properties and MAC address reported by a DPDK ethdev.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +98,11 @@ pub struct PortConfig<'a> {
     pub queue_socket: i32,
     pub rx_pool: PoolConfig<'a>,
     pub tx_pool: PoolConfig<'a>,
+    /// The Stack's TX frame pool (`Stack::tx_frame`). Its data room must hold
+    /// the frame like `tx_pool`'s; a frame's payload starts 42 bytes after the
+    /// mbuf headroom and holds up to IP MTU − 28 bytes. `Stack::new` refuses
+    /// fewer than `frame_reserve(TX descriptors, tx_pending)` mbufs.
+    pub frame_pool: PoolConfig<'a>,
     pub offloads: Offloads,
 }
 
@@ -209,6 +216,7 @@ pub enum PortError {
     OutstandingBuffers {
         rx: u32,
         tx: u32,
+        frame: u32,
     },
     /// Setup did not complete or cleanup has begun; no packet transfers.
     NotReady,
@@ -348,6 +356,58 @@ impl Drop for Packet {
     }
 }
 
+/// One single-segment TX mbuf the Device has queued for the PMD, from the TX
+/// pool or the frame pool. A frame-pool mbuf may also be held by a TCP send
+/// queue (refcount 2). Dropping it releases this one reference with the
+/// refcount-aware single-segment free; `tx_burst` hands accepted ones to the PMD.
+#[repr(transparent)]
+pub struct TxPacket(NonNull<rte_mbuf>);
+
+const _: () = {
+    assert!(std::mem::size_of::<TxPacket>() == std::mem::size_of::<*mut rte_mbuf>());
+    assert!(std::mem::align_of::<TxPacket>() == std::mem::align_of::<*mut rte_mbuf>());
+};
+
+impl TxPacket {
+    /// # Safety
+    /// The caller transfers one reference to `raw`, a live direct,
+    /// single-segment mbuf from a production or frame pool of this owner thread.
+    pub(crate) unsafe fn from_raw(raw: NonNull<rte_mbuf>) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut rte_mbuf {
+        self.0.as_ptr()
+    }
+
+    /// The first segment's bytes. Read-only: a frame-pool packet may be shared.
+    pub fn data(&self) -> &[u8] {
+        // SAFETY: this reference keeps the mbuf live; bytes are only read here.
+        unsafe {
+            let m = &*self.as_ptr();
+            std::slice::from_raw_parts(m.data_ptr(), usize::from(m.data_len()))
+        }
+    }
+}
+
+impl From<Packet> for TxPacket {
+    fn from(packet: Packet) -> Self {
+        let packet = ManuallyDrop::new(packet);
+        // SAFETY: a Packet always holds a live mbuf, so the pointer is non-null.
+        // The restricted invariant is a direct, single-segment mbuf with one
+        // reference, which Packet gives up here (its drop never runs).
+        unsafe { Self::from_raw(NonNull::new_unchecked(packet.as_ptr())) }
+    }
+}
+
+impl Drop for TxPacket {
+    fn drop(&mut self) {
+        // SAFETY: this value owns one reference to a direct, single-segment
+        // mbuf whose pool's cache slot is set; it returns with its last reference.
+        unsafe { zhida_pktmbuf_free_seg(self.as_ptr()) };
+    }
+}
+
 unsafe fn release_packet(owner: NonNull<()>) {
     let raw = owner.cast::<rte_mbuf>().as_ptr();
     debug_assert!({
@@ -402,6 +462,11 @@ pub struct Port {
     descriptors: (u16, u16),
     rx: ManuallyDrop<PoolResources>,
     tx: ManuallyDrop<PoolResources>,
+    /// This Port's clone of the frame pool; other clones may outlive the Port.
+    frame: ManuallyDrop<Rc<FramePool>>,
+    /// The frame pool's identity (`TxAlloc::origin`), kept here so the publish
+    /// check reads one field.
+    frame_origin: NonNull<()>,
     rx_scratch: Box<[*mut rte_mbuf]>,
     tx_scratch: Box<[*mut rte_mbuf]>,
     ready: bool,
@@ -439,7 +504,8 @@ impl Port {
     /// The ethdev must be newly created, never configured or started, and under
     /// exclusive control. EAL, packet operations and cleanup stay on its owner
     /// thread. Preserve the production pools' direct/unique/single-segment
-    /// contract. Caller-owned vdevs and attached rings must outlive device close;
+    /// contract and the frame pool's (`PoolManager::new_shared`).
+    /// Caller-owned vdevs and attached rings must outlive device close;
     /// their queued packets must return before pool destruction. The PMD must
     /// honor the requested packet profile and discharge its buffers/DMA on close.
     /// The PMD, and for net_ring whoever writes the attached RX ring, must supply
@@ -513,6 +579,9 @@ impl Port {
         {
             return Err(PortError::InvalidSettings("pool room cannot hold the frame").into());
         }
+        if u64::from(config.frame_pool.data_room_size) < headroom + frame {
+            return Err(PortError::InvalidSettings("frame pool room cannot hold the frame").into());
+        }
         let rx = PoolResources::new(config.rx_pool).map_err(|error| PortError::Pool {
             direction: "RX",
             error,
@@ -521,6 +590,11 @@ impl Port {
             direction: "TX",
             error,
         })?;
+        let frame_pool =
+            FramePool::new(config.frame_pool, config.mtu).map_err(|error| PortError::Pool {
+                direction: "frame",
+                error,
+            })?;
         let mut port = Self {
             port_id: config.port_id,
             owner_lcore: eal.owner_lcore_id(),
@@ -534,6 +608,8 @@ impl Port {
             descriptors: (config.rx_descriptors, config.tx_descriptors),
             rx: ManuallyDrop::new(rx),
             tx: ManuallyDrop::new(tx),
+            frame_origin: smoltcp::phy::TxAlloc::origin(&frame_pool),
+            frame: ManuallyDrop::new(Rc::new(frame_pool)),
             rx_scratch: vec![null_mut(); usize::from(config.rx_burst)].into_boxed_slice(),
             tx_scratch: vec![null_mut(); usize::from(config.tx_burst)].into_boxed_slice(),
             ready: false,
@@ -681,6 +757,15 @@ impl Port {
         // SAFETY: this Port owns the live TX pool; its object count is fixed.
         usize::try_from(unsafe { (*self.tx.pool().pool()).size })
             .expect("TX pool count exceeds usize")
+    }
+
+    pub(crate) fn frame_pool(&self) -> &FramePool {
+        &self.frame
+    }
+
+    /// The frame pool's `TxAlloc::origin`.
+    pub(crate) fn frame_origin(&self) -> NonNull<()> {
+        self.frame_origin
     }
 
     pub(crate) fn rx_checksum_enabled(&self) -> bool {
@@ -835,7 +920,7 @@ impl Port {
     /// `pending`; the unaccepted suffix stays in `pending` in its original order.
     /// An empty `pending` returns 0 without calling the PMD: memif's copy-mode
     /// TX in DPDK 25.11.3 reads the first packet pointer even for an empty burst.
-    pub fn tx_burst(&mut self, pending: &mut VecDeque<Packet>) -> Result<usize, PortError> {
+    pub fn tx_burst(&mut self, pending: &mut VecDeque<TxPacket>) -> Result<usize, PortError> {
         if !self.ready {
             return Err(PortError::NotReady);
         }
@@ -844,7 +929,7 @@ impl Port {
         }
         let count = pending.len().min(self.tx_scratch.len());
         for (slot, packet) in self.tx_scratch.iter_mut().zip(pending.iter()) {
-            *slot = packet.0.as_ptr();
+            *slot = packet.as_ptr();
         }
         // `count` fits: the scratch length came from a u16.
         let accepted =
@@ -884,14 +969,19 @@ impl Port {
                 return Err(error);
             }
         }
-        let (rx, tx) = (self.rx.pool().in_use_count(), self.tx.pool().in_use_count());
-        if rx != 0 || tx != 0 {
-            return Err(PortError::OutstandingBuffers { rx, tx });
+        let (rx, tx, frame) = (
+            self.rx.pool().in_use_count(),
+            self.tx.pool().in_use_count(),
+            self.frame.in_use_count(),
+        );
+        if rx != 0 || tx != 0 || frame != 0 {
+            return Err(PortError::OutstandingBuffers { rx, tx, frame });
         }
         self.released = true;
         unsafe {
             ManuallyDrop::drop(&mut self.rx);
             ManuallyDrop::drop(&mut self.tx);
+            ManuallyDrop::drop(&mut self.frame);
         }
         Ok(())
     }

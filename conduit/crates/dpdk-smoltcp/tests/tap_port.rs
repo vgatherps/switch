@@ -32,6 +32,7 @@ struct Names {
     iface: &'static CStr,
     rx_pool: &'static CStr,
     tx_pool: &'static CStr,
+    frame_pool: &'static CStr,
 }
 
 fn config(port_id: u16, names: &Names) -> PortConfig<'static> {
@@ -52,6 +53,7 @@ fn config(port_id: u16, names: &Names) -> PortConfig<'static> {
         queue_socket: -1,
         rx_pool: pool(names.rx_pool),
         tx_pool: pool(names.tx_pool),
+        frame_pool: pool(names.frame_pool),
         offloads: Offloads::default(),
     }
 }
@@ -63,6 +65,7 @@ fn device_info_reports_net_tap_driver_mac_and_mtu_limits() {
         iface: c"cdtap_info",
         rx_pool: c"tap_info_rx",
         tx_pool: c"tap_info_tx",
+        frame_pool: c"tap_info_fr",
     };
     with_eal(|eal| {
         let tap = TapVdev::new(names.vdev, names.iface);
@@ -97,6 +100,7 @@ fn port_by_name_finds_vdev_and_rejects_unknown() {
         iface: c"cdtap_by_name",
         rx_pool: c"tap_by_name_rx",
         tx_pool: c"tap_by_name_tx",
+        frame_pool: c"tap_by_name_fr",
     };
     with_eal(|eal| {
         let first = TapVdev::new(names.vdev, names.iface);
@@ -125,11 +129,11 @@ fn open(eal: &Eal, names: &Names) -> (TapVdev, Port) {
     (tap, port)
 }
 
-/// Close the Port, remove the vdev, and check the netdev and both pools are gone.
+/// Close the Port, remove the vdev, and check the netdev and every pool are gone.
 fn close(tap: TapVdev, port: Port, names: &Names) {
     port.try_close().unwrap();
     tap.close();
-    for name in [names.rx_pool, names.tx_pool] {
+    for name in [names.rx_pool, names.tx_pool, names.frame_pool] {
         assert!(!pool_exists(name));
     }
 }
@@ -220,7 +224,7 @@ fn send_from_port(port: &mut Port, frames: &[Vec<u8>]) {
     for bytes in frames {
         let mut packet = port.alloc_tx(bytes.len() as u16).unwrap();
         packet.data_mut().copy_from_slice(bytes);
-        pending.push_back(packet);
+        pending.push_back(packet.into());
     }
     assert_eq!(port.tx_burst(&mut pending), Ok(frames.len()));
 }
@@ -367,6 +371,7 @@ fn tap_port_exchanges_frames_with_kernel_netdev() {
         iface: c"cdtap_xchg",
         rx_pool: c"tap_xchg_rx",
         tx_pool: c"tap_xchg_tx",
+        frame_pool: c"tap_xchg_fr",
     };
     with_eal(|eal| {
         let (tap, mut port) = open(eal, &names);
@@ -444,6 +449,7 @@ fn tap_port_close_refuses_while_a_received_packet_is_held() {
         iface: c"cdtap_held",
         rx_pool: c"tap_held_rx",
         tx_pool: c"tap_held_tx",
+        frame_pool: c"tap_held_fr",
     };
     with_eal(|eal| {
         let (tap, mut port) = open(eal, &names);
@@ -457,7 +463,7 @@ fn tap_port_close_refuses_while_a_received_packet_is_held() {
         // Stopped and closed (tap_dev_close freed its RX buffers and the netdev is
         // gone); only the held packet keeps the pools alive.
         let (port, error) = port.try_close().unwrap_err();
-        assert_eq!(error, PortError::OutstandingBuffers { rx: 1, tx: 0 });
+        assert_eq!(error, PortError::OutstandingBuffers { rx: 1, tx: 0, frame: 0 });
         assert_eq!(ifindex(names.iface), 0);
 
         drop(held);
@@ -472,6 +478,7 @@ fn tap_port_recreates_the_same_vdev_after_uninit() {
         iface: c"cdtap_again",
         rx_pool: c"tap_again_rx",
         tx_pool: c"tap_again_tx",
+        frame_pool: c"tap_again_fr",
     };
     with_eal(|eal| {
         for round in 0..3u8 {
@@ -546,6 +553,7 @@ fn rx_checksum_profile_opens() {
         iface: c"cdtap_rxck",
         rx_pool: c"tap_rxck_rx",
         tx_pool: c"tap_rxck_tx",
+        frame_pool: c"tap_rxck_fr",
     };
     let offloads = Offloads {
         rx_timestamp: false,
@@ -611,6 +619,7 @@ fn tap_rx_checksum_stages_injected_bad_segment() {
         iface: c"cdtap_rx_bad",
         rx_pool: c"tap_rx_bad_rx",
         tx_pool: c"tap_rx_bad_tx",
+        frame_pool: c"tap_rx_bad_fr",
     };
     with_eal(|eal| {
         let tap = TapVdev::new(names.vdev, names.iface);
@@ -696,6 +705,7 @@ fn tx_checksum_profile_opens() {
         iface: c"cdtap_txck",
         rx_pool: c"tap_txck_rx",
         tx_pool: c"tap_txck_tx",
+        frame_pool: c"tap_txck_fr",
     };
     let offloads = Offloads {
         rx_timestamp: false,
@@ -713,6 +723,7 @@ fn tx_udp_checksum_profile_opens() {
         iface: c"cdtap_txudpck",
         rx_pool: c"tap_txudpck_rx",
         tx_pool: c"tap_txudpck_tx",
+        frame_pool: c"tap_txudpck_fr",
     };
     let offloads = Offloads {
         rx_timestamp: false,
@@ -765,6 +776,7 @@ fn tap_rx_checksum_udp_verdicts() {
         iface: c"cdtap_rx_udpck",
         rx_pool: c"tap_rx_udpck_rx",
         tx_pool: c"tap_rx_udpck_tx",
+        frame_pool: c"tap_rx_udpck_fr",
     };
     with_eal(|eal| {
         let tap = TapVdev::new(names.vdev, names.iface);

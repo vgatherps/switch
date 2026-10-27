@@ -352,7 +352,7 @@ fn open(eal: &Eal, role: Role, socket: &str, conns: usize) -> Result<(MemifVdev,
     // report; every other path leaks it.
     unsafe {
         MemifVdev::open(eal, &memif, |id| {
-            port_config(id, conns, c"memif_rx", c"memif_tx")
+            port_config(id, conns, c"memif_rx", c"memif_tx", c"memif_frame")
         })
     }
     .map_err(|error| format!("{name} memif open: {error}"))

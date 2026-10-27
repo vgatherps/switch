@@ -168,7 +168,7 @@ fn held_datagrams_make_try_close_refuse_then_succeed() {
         let port = stack.into_port();
         assert_eq!(fixture.in_use(), (1, 0));
         let (port, error) = port.try_close().unwrap_err();
-        assert_eq!(error, PortError::OutstandingBuffers { rx: 1, tx: 0 });
+        assert_eq!(error, PortError::OutstandingBuffers { rx: 1, tx: 0, frame: 0 });
         assert_eq!(datagram.payload(), b"held");
         drop(datagram);
         assert_eq!(fixture.in_use(), (0, 0));

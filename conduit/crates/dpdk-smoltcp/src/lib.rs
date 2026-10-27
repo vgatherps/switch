@@ -72,6 +72,7 @@
 
 mod device;
 mod eal;
+mod frame_pool;
 mod handle;
 mod port;
 mod rx_pool;
@@ -81,9 +82,9 @@ pub use eal::{Eal, EalError};
 pub use handle::{TcpHandle, UdpHandle};
 pub use port::{
     device_info, port_by_name, DeviceInfo, Offloads, Packet, Port, PortConfig, PortError,
-    PortOpenError, RxBurst,
+    PortOpenError, RxBurst, TxPacket,
 };
-pub use rx_pool::{rx_pool_count, rx_reserve, tx_reserve};
+pub use rx_pool::{frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
 pub use smoltcp;
 pub use smoltcp::phy::HeldFrames;
 pub use smoltcp::socket::tcp::TcpFrame;

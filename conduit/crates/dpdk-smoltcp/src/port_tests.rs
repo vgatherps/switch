@@ -311,6 +311,7 @@ impl Fixture {
             queue_socket: -1,
             rx_pool: pool(c"port_pool_rx", 2048),
             tx_pool: pool(c"port_pool_tx", 1514),
+            frame_pool: pool(c"port_pool_frame", 1514),
             offloads: Offloads::default(),
         }
     }
@@ -378,7 +379,7 @@ impl Drop for Fixture {
 }
 
 pub(crate) fn assert_no_pools() {
-    for name in [c"port_pool_rx", c"port_pool_tx"] {
+    for name in [c"port_pool_rx", c"port_pool_tx", c"port_pool_frame"] {
         assert!(unsafe { rte_mempool_lookup(name.as_ptr()) }.is_null());
     }
 }
@@ -424,7 +425,7 @@ fn preflight_failures_leave_the_caller_device_and_pool_names_untouched() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
         let baseline = fixture.config();
-        let mut configs = [baseline; 9];
+        let mut configs = [baseline; 10];
         configs[0].port_id = u16::MAX;
         configs[1].rx_descriptors = 0;
         configs[2].tx_descriptors = 0;
@@ -434,6 +435,7 @@ fn preflight_failures_leave_the_caller_device_and_pool_names_untouched() {
         configs[6].mtu = u16::MAX;
         configs[7].tx_burst = 0;
         configs[8].rx_burst = 0;
+        configs[9].frame_pool.data_room_size -= 1;
         for config in configs {
             let error = unsafe { Port::open(eal, config) }.unwrap_err();
             assert!(error.retained.is_none());
@@ -460,6 +462,7 @@ fn open_rejects_exact_fit_room_below_rule() {
             let mut config = fixture.config();
             config.mtu = mtu;
             config.tx_pool.data_room_size = RTE_PKTMBUF_HEADROOM as u16 + mtu + 14;
+            config.frame_pool.data_room_size = config.tx_pool.data_room_size;
             let (stops, closes) = (STOP_CALLS.get(), CLOSE_CALLS.get());
             assert_no_pools();
             for &room in short_rooms {
@@ -610,6 +613,106 @@ fn tx_pool_creation_failure_releases_rx_without_adopting_device() {
 }
 
 #[zhida_test_support::pinned_test]
+fn frame_pool_room_and_creation_failures_release_every_pool() {
+    with_test_eal(|eal| {
+        let fixture = Fixture::new();
+        let mut config = fixture.config();
+        config.frame_pool.data_room_size -= 1;
+        let error = unsafe { Port::open(eal, config) }.unwrap_err();
+        assert_eq!(
+            error.cause,
+            PortError::InvalidSettings("frame pool room cannot hold the frame")
+        );
+        assert!(error.retained.is_none());
+        assert_no_pools();
+
+        let mut config = fixture.config();
+        config.frame_pool.name = config.tx_pool.name;
+        let error = unsafe { Port::open(eal, config) }.unwrap_err();
+        assert!(matches!(
+            error.cause,
+            PortError::Pool {
+                direction: "frame",
+                ..
+            }
+        ));
+        assert!(error.retained.is_none());
+        assert_eq!(unsafe { rte_eth_dev_is_valid_port(fixture.port_id) }, 1);
+        assert_eq!(
+            unsafe { rte_eth_dev_start(fixture.port_id) },
+            -(EINVAL as i32)
+        );
+        assert_no_pools();
+        let port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
+        port.try_close().unwrap();
+        fixture.close().unwrap();
+        assert_no_pools();
+    });
+}
+
+/// A frame's payload starts 42 bytes after the mbuf headroom (room for UDP
+/// headers; TCP's 54 fit too) and holds IP MTU − 28 bytes. One share makes the
+/// refcount 2; each release drops one, and the last returns the mbuf once.
+#[zhida_test_support::pinned_test]
+fn frame_pool_layout_share_and_exhaustion() {
+    use smoltcp::phy::TxAlloc as _;
+    with_test_eal(|eal| {
+        let fixture = Fixture::new();
+        let port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
+        let pool = port.frame_pool();
+        assert_eq!(pool.count(), 63);
+        let mut frame = pool.alloc().unwrap();
+        assert_eq!(frame.origin().as_ptr().cast::<rte_mempool>(), pool.mempool());
+        assert_eq!((frame.len(), frame.capacity()), (0, 1500 - 28));
+        assert!(frame.unique());
+        let raw = frame.owner().cast::<rte_mbuf>().as_ptr();
+        unsafe {
+            assert_eq!((*raw).data_off(), RTE_PKTMBUF_HEADROOM as u16 + 42);
+            assert_eq!(((*raw).data_len(), (*raw).pkt_len()), (0, 0));
+            assert_eq!(frame.room_mut().as_ptr(), (*raw).data_ptr());
+            // The fixture's frame data room is exactly headroom + 1514, so the
+            // payload room ends at the buffer's end.
+            assert_eq!(
+                usize::from((*raw).data_off()) + frame.capacity(),
+                usize::from((*raw).buf_len())
+            );
+        }
+        frame.room_mut().fill(0xa5);
+        frame.set_len(frame.capacity());
+
+        let shared = frame.clone();
+        assert_eq!(unsafe { (*raw).refcnt() }, 2);
+        assert!(!frame.unique() && !shared.unique());
+        drop(frame);
+        assert_eq!(unsafe { (*raw).refcnt() }, 1);
+        assert!(shared.unique());
+        assert!(shared.payload().iter().all(|&byte| byte == 0xa5));
+        assert_eq!(pool.in_use_count(), 1);
+        drop(shared);
+        assert_eq!(pool.in_use_count(), 0);
+
+        let all: Vec<_> = std::iter::from_fn(|| pool.alloc()).collect();
+        assert_eq!(all.len(), 63);
+        assert_eq!(pool.in_use_count(), 63);
+        let mut owners: Vec<_> = all.iter().map(|frame| frame.owner()).collect();
+        owners.sort();
+        owners.dedup();
+        assert_eq!(owners.len(), 63);
+        drop(all);
+        assert_eq!(pool.in_use_count(), 0);
+        // Every object came back exactly once.
+        let again: Vec<_> = std::iter::from_fn(|| pool.alloc()).collect();
+        let mut again_owners: Vec<_> = again.iter().map(|frame| frame.owner()).collect();
+        again_owners.sort();
+        assert_eq!(again_owners, owners);
+        drop(again);
+        port.try_close().unwrap();
+        fixture.close().unwrap();
+        assert_no_pools();
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn actual_late_tx_queue_failure_rolls_back_and_start_error_stops_running_port() {
     with_test_eal(|eal| {
         for fault in [
@@ -715,12 +818,17 @@ fn released_id_close_error_latches_and_never_retries_device_or_frees_empty_pools
         // The seam actually closed net_ring successfully. Reclaim this test's
         // empty backing explicitly; production has no recovery for this error.
         assert_eq!(
-            (port.rx.pool().in_use_count(), port.tx.pool().in_use_count()),
-            (0, 0)
+            (
+                port.rx.pool().in_use_count(),
+                port.tx.pool().in_use_count(),
+                port.frame.in_use_count()
+            ),
+            (0, 0, 0)
         );
         unsafe {
             ManuallyDrop::drop(&mut port.rx);
             ManuallyDrop::drop(&mut port.tx);
+            ManuallyDrop::drop(&mut port.frame);
         }
         port.released = true;
         drop(port);
@@ -742,7 +850,7 @@ fn attached_ring_packet_survives_device_close_until_external_drain() {
             1
         );
         let (port, error) = port.try_close().unwrap_err();
-        assert_eq!(error, PortError::OutstandingBuffers { rx: 0, tx: 1 });
+        assert_eq!(error, PortError::OutstandingBuffers { rx: 0, tx: 1, frame: 0 });
         assert!(port.closed);
         let mut returned = [null_mut::<c_void>(); 1];
         assert_eq!(
@@ -1113,10 +1221,18 @@ fn failed_drop_retains_empty_pools_preserves_panic_and_never_repeats_explicit_cl
             } else {
                 unsafe { Port::open(eal, fixture.config()) }.unwrap()
             };
-            let pools = [port.rx.pool().pool(), port.tx.pool().pool()];
+            let pools = [
+                port.rx.pool().pool(),
+                port.tx.pool().pool(),
+                port.frame_pool().mempool(),
+            ];
             assert_eq!(
-                (port.rx.pool().in_use_count(), port.tx.pool().in_use_count()),
-                (0, 0)
+                (
+                    port.rx.pool().in_use_count(),
+                    port.tx.pool().in_use_count(),
+                    port.frame_pool().in_use_count()
+                ),
+                (0, 0, 0)
             );
             match case {
                 Case::RefusedClose => {
@@ -1148,7 +1264,10 @@ fn failed_drop_retains_empty_pools_preserves_panic_and_never_repeats_explicit_cl
                 (calls.0 + 1, calls.1)
             );
             assert_eq!(unsafe { rte_eth_dev_is_valid_port(fixture.port_id) }, 1);
-            for (name, pool) in [c"port_pool_rx", c"port_pool_tx"].into_iter().zip(pools) {
+            for (name, pool) in [c"port_pool_rx", c"port_pool_tx", c"port_pool_frame"]
+                .into_iter()
+                .zip(pools)
+            {
                 assert_eq!(unsafe { rte_mempool_lookup(name.as_ptr()) }, pool);
                 assert_eq!(unsafe { rte_mempool_in_use_count(pool) }, 0);
             }
@@ -1221,7 +1340,7 @@ fn readiness_requires_successful_setup_and_is_revoked_on_refused_close() {
         assert!(port.ready);
         let packet = port.tx.pool().alloc().unwrap();
         let (port, error) = port.try_close().unwrap_err();
-        assert_eq!(error, PortError::OutstandingBuffers { rx: 0, tx: 1 });
+        assert_eq!(error, PortError::OutstandingBuffers { rx: 0, tx: 1, frame: 0 });
         assert!(!port.ready);
         assert!(port.stopped);
         assert!(port.closed);
@@ -1241,8 +1360,15 @@ fn expected(identities: &[*mut rte_mbuf], base: u8) -> Frames {
         .collect()
 }
 
-fn pending_frames(pending: &VecDeque<Packet>) -> Frames {
+fn pending_frames(pending: &VecDeque<TxPacket>) -> Frames {
     pending
+        .iter()
+        .map(|packet| (packet.as_ptr(), packet.data().to_vec()))
+        .collect()
+}
+
+fn staged_frames(staged: &VecDeque<Packet>) -> Frames {
+    staged
         .iter()
         .map(|packet| (packet.0.as_ptr(), packet.data().to_vec()))
         .collect()
@@ -1255,7 +1381,7 @@ fn mbuf_frames(packets: &[Mbuf]) -> Frames {
         .collect()
 }
 
-fn stage(port: &Port, pending: &mut VecDeque<Packet>, base: u8, count: u8) -> Vec<*mut rte_mbuf> {
+fn stage(port: &Port, pending: &mut VecDeque<TxPacket>, base: u8, count: u8) -> Vec<*mut rte_mbuf> {
     let mut identities = Vec::with_capacity(usize::from(count));
     for value in base..base + count {
         let mut packet = port.alloc_tx(4).unwrap();
@@ -1263,7 +1389,7 @@ fn stage(port: &Port, pending: &mut VecDeque<Packet>, base: u8, count: u8) -> Ve
             .data_mut()
             .copy_from_slice(&[value, 0x55, 0xaa, value]);
         identities.push(packet.0.as_ptr());
-        pending.push_back(packet);
+        pending.push_back(packet.into());
     }
     identities
 }
@@ -1525,7 +1651,8 @@ fn alloc_tx_retries_once_after_cleanup_reclaims_sent_mbufs() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
         let mut port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
-        let mut pending: VecDeque<Packet> = exhaust_tx_pool(&port).into();
+        let mut pending: VecDeque<TxPacket> =
+            exhaust_tx_pool(&port).into_iter().map(TxPacket::from).collect();
         // The eight-slot ring takes seven: 4 + 3.
         assert_eq!(port.tx_burst(&mut pending), Ok(4));
         assert_eq!(port.tx_burst(&mut pending), Ok(3));
@@ -1801,9 +1928,9 @@ fn rx_burst_imports_own_pool_packets_in_order_within_burst_and_spare_capacity() 
         let ids: Vec<_> = (10..16).map(|value| rx_frame(&port, value)).collect();
         produce(&fixture, &ids);
         assert_eq!(port.rx_burst(&mut staged), rx(4, 0));
-        assert_eq!(pending_frames(&staged), expected(&ids[..4], 10));
+        assert_eq!(staged_frames(&staged), expected(&ids[..4], 10));
         assert_eq!(port.rx_burst(&mut staged), rx(2, 0));
-        assert_eq!(pending_frames(&staged), expected(&ids, 10));
+        assert_eq!(staged_frames(&staged), expected(&ids, 10));
 
         // One free slot: one import; the rest stay queued in the ring.
         while staged.len() < capacity - 1 {
@@ -1819,7 +1946,7 @@ fn rx_burst_imports_own_pool_packets_in_order_within_burst_and_spare_capacity() 
         staged.clear();
         assert_eq!(port.rx.pool().in_use_count(), 2);
         assert_eq!(port.rx_burst(&mut staged), rx(2, 0));
-        assert_eq!(pending_frames(&staged), expected(&ids[1..], 21));
+        assert_eq!(staged_frames(&staged), expected(&ids[1..], 21));
         staged.clear();
         assert_eq!(port.rx.pool().in_use_count(), 0);
         port.try_close().unwrap();
@@ -1926,7 +2053,7 @@ fn rx_burst_frees_valid_unsupported_packets_once_with_standard_free() {
             ],
         );
         assert_eq!(port.rx_burst(&mut staged), rx(3, 4));
-        assert_eq!(pending_frames(&staged), expected(&ids, 10));
+        assert_eq!(staged_frames(&staged), expected(&ids, 10));
         assert_eq!(unsafe { rte_mempool_in_use_count(foreign) }, 0);
         assert_eq!(shared_held.refcount(), 1);
         assert_eq!(direct_held.refcount(), 1);
@@ -1948,7 +2075,7 @@ fn rx_burst_frees_valid_unsupported_packets_once_with_standard_free() {
         let ids = [rx_frame(&port, 30), rx_frame(&port, 31)];
         produce(&fixture, &[ids[0], chained, ids[1]]);
         assert_eq!(port.rx_burst(&mut staged), rx(2, 1));
-        assert_eq!(pending_frames(&staged), expected(&ids, 30));
+        assert_eq!(staged_frames(&staged), expected(&ids, 30));
         assert_eq!(port.rx.pool().in_use_count(), 2);
         staged.clear();
         assert_eq!(port.rx.pool().in_use_count(), 0);
@@ -1988,7 +2115,7 @@ fn rx_burst_frees_valid_unsupported_packets_once_with_standard_free() {
             &[external, too_long, mismatched, peer_packet, id],
         );
         assert_eq!(port.rx_burst(&mut staged), rx(1, 4));
-        assert_eq!(pending_frames(&staged), expected(&[id], 13));
+        assert_eq!(staged_frames(&staged), expected(&[id], 13));
         assert_eq!(EXT_FREES.get(), ext_frees + 1);
         assert_eq!(peer.in_use_count(), 0);
         assert_eq!(port.rx.pool().in_use_count(), 1);
@@ -2144,17 +2271,17 @@ fn shutdown_refuses_until_staged_queued_and_ring_held_packets_each_return_once()
         assert_eq!(port.tx_burst(&mut pending), Err(PortError::NotReady));
         assert_eq!(port.rx_burst(&mut staged), Err(PortError::NotReady));
         assert_eq!(pending_frames(&pending), expected(&tx_ids[7..], 57));
-        assert_eq!(pending_frames(&staged), expected(&rx_ids[..4], 10));
+        assert_eq!(staged_frames(&staged), expected(&rx_ids[..4], 10));
 
         // Stopped and closed; every packet is still owned somewhere.
         let (port, error) = port.try_close().unwrap_err();
-        assert_eq!(error, PortError::OutstandingBuffers { rx: 5, tx: 9 });
+        assert_eq!(error, PortError::OutstandingBuffers { rx: 5, tx: 9, frame: 0 });
         assert_eq!(unsafe { rte_eth_dev_is_valid_port(fixture.port_id) }, 0);
 
         // Adapter-owned packets return first; the queued TX suffix is never sent.
         drop((staged, pending));
         let (port, error) = port.try_close().unwrap_err();
-        assert_eq!(error, PortError::OutstandingBuffers { rx: 1, tx: 7 });
+        assert_eq!(error, PortError::OutstandingBuffers { rx: 1, tx: 7, frame: 0 });
 
         // The ring owner drains transport-held packets.
         assert_eq!(
@@ -2216,11 +2343,11 @@ fn caller_unwind_returns_adapter_packets_and_never_frees_ring_held_ones() {
             Some(&"caller panic before queues drop")
         );
         assert_eq!(unsafe { rte_eth_dev_is_valid_port(fixture.port_id) }, 0);
-        let pools = [c"port_pool_rx", c"port_pool_tx"]
+        let pools = [c"port_pool_rx", c"port_pool_tx", c"port_pool_frame"]
             .map(|name| unsafe { rte_mempool_lookup(name.as_ptr()) });
         assert!(pools.iter().all(|pool| !pool.is_null()));
         let counts = pools.map(|pool| unsafe { rte_mempool_in_use_count(pool) });
-        assert_eq!(counts, [0, 4]);
+        assert_eq!(counts, [0, 4, 0]);
         assert_eq!(
             mbuf_frames(&ring_take(fixture.rings[1], 16)),
             expected(&tx_ids[..4], 20)

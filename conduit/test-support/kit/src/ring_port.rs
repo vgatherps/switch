@@ -26,8 +26,10 @@ pub struct RingPort {
     vdev: CString,
     pub(crate) rx_ring: *mut rte_ring,
     pub(crate) tx_ring: *mut rte_ring,
+    tx_ring_size: u16,
     rx_pool: CString,
     tx_pool: CString,
+    frame_pool: CString,
     opened: Cell<bool>,
     closed: bool,
 }
@@ -44,6 +46,7 @@ impl RingPort {
             assert!(!ring.is_null());
             ring
         };
+        let tx_ring_size = u16::try_from(tx_ring).expect("TX ring size fits u16");
         let (rx_ring, tx_ring) = (ring("rxr", rx_ring), ring("txr", tx_ring));
         let port_name = CString::new(name).unwrap();
         let id = unsafe { rte_eth_from_rings(port_name.as_ptr(), &rx_ring, 1, &tx_ring, 1, 0) };
@@ -53,8 +56,10 @@ impl RingPort {
             vdev: CString::new(format!("net_ring_{name}")).unwrap(),
             rx_ring,
             tx_ring,
+            tx_ring_size,
             rx_pool: CString::new(format!("{name}_rxp")).unwrap(),
             tx_pool: CString::new(format!("{name}_txp")).unwrap(),
+            frame_pool: CString::new(format!("{name}_frp")).unwrap(),
             opened: Cell::new(false),
             closed: false,
         }
@@ -76,9 +81,11 @@ impl RingPort {
         self.open_with(eal, self.config())
     }
 
-    /// IP MTU 1500, 16 descriptors and bursts of 8 each way, RX and TX pools
-    /// of 63 packets with per-lcore cache 8, each with 2048 usable bytes,
-    /// under this fixture's pool names.
+    /// IP MTU 1500, 16 RX descriptors, TX descriptors equal to the TX ring size
+    /// (net_ring keeps sent mbufs on that ring, so it bounds what the PMD
+    /// holds), bursts of 8 each way, RX, TX and frame pools of 63 packets with
+    /// per-lcore cache 8, each with 2048 usable bytes, under this fixture's
+    /// pool names.
     pub fn config(&self) -> PortConfig<'_> {
         fn pool(name: &CStr) -> PoolConfig<'_> {
             PoolConfig {
@@ -93,12 +100,13 @@ impl RingPort {
             port_id: self.port_id,
             mtu: 1500,
             rx_descriptors: 16,
-            tx_descriptors: 16,
+            tx_descriptors: self.tx_ring_size,
             rx_burst: 8,
             tx_burst: 8,
             queue_socket: -1,
             rx_pool: pool(&self.rx_pool),
             tx_pool: pool(&self.tx_pool),
+            frame_pool: pool(&self.frame_pool),
             offloads: Offloads::default(),
         }
     }
@@ -108,6 +116,7 @@ impl RingPort {
         assert_eq!(config.port_id, self.port_id);
         assert_eq!(config.rx_pool.name, self.rx_pool.as_c_str());
         assert_eq!(config.tx_pool.name, self.tx_pool.as_c_str());
+        assert_eq!(config.frame_pool.name, self.frame_pool.as_c_str());
         let port = unsafe { Port::open(eal, config) }.unwrap();
         self.opened.set(true);
         port
@@ -180,15 +189,23 @@ impl RingPort {
         (wire::in_use(&self.rx_pool), wire::in_use(&self.tx_pool))
     }
 
-    /// Audit both pools after every frame has been freed.
+    /// Frame pool packets in use, by pool name.
+    pub fn frame_in_use(&self) -> u32 {
+        wire::in_use(&self.frame_pool)
+    }
+
+    /// Audit every pool after every frame has been freed.
     pub fn assert_returned_exactly_once(&self) {
         wire::assert_returned_exactly_once(&self.rx_pool);
         wire::assert_returned_exactly_once(&self.tx_pool);
+        wire::assert_returned_exactly_once(&self.frame_pool);
     }
 
-    /// Whether either pool still exists: Port cleanup frees both.
+    /// Whether any pool still exists: Port cleanup frees them all.
     pub fn pools_exist(&self) -> bool {
-        wire::pool_exists(&self.rx_pool) || wire::pool_exists(&self.tx_pool)
+        wire::pool_exists(&self.rx_pool)
+            || wire::pool_exists(&self.tx_pool)
+            || wire::pool_exists(&self.frame_pool)
     }
 
     /// After the Port closed: both rings empty, vdev removed, rings freed.
@@ -237,11 +254,11 @@ impl Drop for RingPort {
     }
 }
 
-/// Set `config`'s IP MTU to `mtu` and both pools' data room to `room` bytes
+/// Set `config`'s IP MTU to `mtu` and every pool's data room to `room` bytes
 /// after headroom.
 pub fn resize(config: &mut PortConfig<'_>, mtu: u16, room: u16) {
     config.mtu = mtu;
-    for pool in [&mut config.rx_pool, &mut config.tx_pool] {
+    for pool in [&mut config.rx_pool, &mut config.tx_pool, &mut config.frame_pool] {
         pool.data_room_size = RTE_PKTMBUF_HEADROOM as u16 + room;
     }
 }
@@ -283,7 +300,7 @@ pub fn send(port: &mut Port, frames: &[Vec<u8>]) {
     for bytes in frames {
         let mut packet = port.alloc_tx(bytes.len() as u16).unwrap();
         packet.data_mut().copy_from_slice(bytes);
-        pending.push_back(packet);
+        pending.push_back(packet.into());
     }
     while !pending.is_empty() {
         assert!(port.tx_burst(&mut pending).unwrap() > 0);

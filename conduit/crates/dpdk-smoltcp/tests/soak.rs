@@ -11,7 +11,7 @@ use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol, Ipv4Packet,
 };
-use dpdk_smoltcp::{Stack, StackConfig, TcpHandle, UdpConfig, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{tx_reserve, Stack, StackConfig, TcpHandle, UdpConfig, UdpHandle, UdpSendError};
 
 const BULK_MIN: u64 = (1u64 << 32) + (1 << 20);
 const BUFFER: usize = 64 * 1024;
@@ -451,9 +451,10 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
         configs,
         pair::T0,
         1024,
-        |_, port| {
+        |side, port| {
             port.rx_pool.count = 8191;
-            port.tx_pool.count = 1023;
+            port.tx_pool.count =
+                tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
             port.rx_burst = 64;
             port.tx_burst = 32;
         },

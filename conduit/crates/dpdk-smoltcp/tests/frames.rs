@@ -19,7 +19,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     TCP_HEADER_LEN,
 };
 use dpdk_smoltcp::Stack;
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{rx_pool_count, rx_reserve, tx_reserve};
 
 use zhida_test_kit::pair::{
     ceil_ms, config, pattern, segment, tcp_frame, tcp_socket_sized, App, Dir, Pair, Round, Side, CLIENT_PORT,
@@ -314,7 +314,7 @@ fn bulk_scenario(mut scenario: impl FnMut(&mut Pair, &RefCell<Trace>, &[TcpHandl
             T0,
             512,
             rx_pool_count(rx_reserve(16, config(Side::A).rx_staging, 8), 1500, [BULK]),
-            511,
+            tx_reserve(512, config(Side::A).tx_pending) as u32,
         );
         let trace = record(&mut pair);
         let handles = open_sockets(&mut pair, &trace, BULK);
@@ -886,7 +886,7 @@ fn bulk_frames_match_committed() {
             T0,
             512,
             rx_pool_count(rx_reserve(16, config(Side::A).rx_staging, 8), 1500, [BULK]),
-            511,
+            tx_reserve(512, config(Side::A).tx_pending) as u32,
         );
         let trace = record(&mut pair);
         let handles = open(&mut pair, &trace, BULK);

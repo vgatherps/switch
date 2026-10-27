@@ -1832,7 +1832,7 @@ fn cubic_growth_and_recovery_across_rtts() {
             let mut pair = Pair::with_ports(eal, ["cubicrtta", "cubicrttb"], configs, T0, 512, |side, port| {
                 port.rx_burst = 256;
                 port.tx_burst = 256;
-                port.tx_pool.count = 511;
+                port.tx_pool.count = tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
                 port.rx_pool.count = rx_pool_count(
                     rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size),
                     port.mtu,

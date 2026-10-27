@@ -63,7 +63,8 @@ fn end(vdev: MemifVdev, port: Port) -> End {
 fn start(tag: &str, shape: Shape, mode: PeerMode) -> Run {
     let names = names(tag);
     let conns = shape.conns();
-    let (server, client) = common::open_pair(&names, RING, |id, rx, tx| port_config(id, conns, rx, tx));
+    let (server, client) =
+        common::open_pair(&names, RING, |id, rx, tx, frame| port_config(id, conns, rx, tx, frame));
     let now = Instant::now();
     let peer = built(Peer::new(
         ManuallyDrop::into_inner(server.port),
@@ -244,8 +245,8 @@ fn bulk_poll_sends_two_pending_queues() {
     assert!(bytes / mss > 2 * pending);
     let mut socket = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
     socket.mss_cap = Some(mss as u16);
-    let (server, client) = common::open_pair(&names, RING, |id, rx, tx| {
-        let mut config = port_config(id, 1, rx, tx);
+    let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
+        let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.server_rx.as_c_str() {
             config.rx_pool.count = u32::try_from(
                 rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size)
@@ -567,8 +568,8 @@ fn abort_makes_run_invalid() {
 #[zhida_test_support::pinned_test]
 fn peer_detects_corrupted_byte() {
     let names = names("corrupt");
-    let (server, client) = common::open_pair(&names, RING, |id, rx, tx| {
-        let mut config = port_config(id, 1, rx, tx);
+    let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
+        let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.client_rx.as_c_str() {
             config.rx_pool.count = rx_pool_count(
                 rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size),
@@ -623,8 +624,8 @@ fn client_detects_corrupted_echo() {
     let names = names("badecho");
     let rounds = 3;
     let shape = Shape::PingPong { conns: 1, message: 64, rounds, warmup: 0 };
-    let (server, client) = common::open_pair(&names, RING, |id, rx, tx| {
-        let mut config = port_config(id, 1, rx, tx);
+    let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
+        let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.server_rx.as_c_str() {
             config.rx_pool.count = rx_pool_count(
                 rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size),
@@ -680,8 +681,8 @@ fn client_detects_corrupted_echo() {
 #[zhida_test_support::pinned_test]
 fn peer_echo_leaves_in_the_poll_that_received_the_request() {
     let names = names("onepoll");
-    let (server, client) = common::open_pair(&names, RING, |id, rx, tx| {
-        let mut config = port_config(id, 1, rx, tx);
+    let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
+        let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.client_rx.as_c_str() {
             config.rx_pool.count = rx_pool_count(
                 rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size),

@@ -1,23 +1,27 @@
 use std::collections::VecDeque;
 
-use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium, TxChecksum};
+use smoltcp::phy::{
+    self, Checksum, DeviceCapabilities, Medium, TxBuf, TxChecksum, TxHeader,
+};
 use smoltcp::time::Instant;
 use zhida_dpdk_sys::{
-    zhida_errno, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
+    rte_mbuf, zhida_errno, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
     RTE_MBUF_F_RX_L4_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_MASK, RTE_MBUF_F_TX_IPV4,
     RTE_MBUF_F_TX_TCP_CKSUM, RTE_MBUF_F_TX_UDP_CKSUM,
 };
 
-use crate::port::{eth_tx_prepare, Packet, Port, PortError, RxBurst};
+use crate::frame_pool::{FramePool, FRAME_DATA_OFF};
+use crate::port::{eth_tx_prepare, Packet, Port, PortError, RxBurst, TxPacket};
 
 /// smoltcp device over one Port with bounded RX staging and TX pending queues.
 ///
 /// Tokens are issued only with a free pending slot and a full-frame TX packet
 /// in hand, so `TxToken::consume` never fails or allocates. Otherwise
-/// `receive` returns `None` and the RX packet stays staged.
+/// `receive` returns `None` and the RX packet stays staged. Frame tokens need
+/// only the free pending slot: the frame is the caller's.
 pub(crate) struct Device {
     rx: VecDeque<Packet>,
-    tx: VecDeque<Packet>,
+    tx: VecDeque<TxPacket>,
     /// Full-frame TX packet of a token dropped without `consume`, never
     /// written; the next token takes it instead of allocating.
     spare: Option<Packet>,
@@ -26,7 +30,7 @@ pub(crate) struct Device {
     /// are not prepared yet. Unused with both TX checksum profiles off.
     prepared: usize,
     /// Last: fields drop in order, so staged, pending and spare packets must
-    /// return to their pools before Port cleanup checks that both pools are idle.
+    /// return to their pools before Port cleanup checks that every pool is idle.
     port: Port,
 }
 
@@ -72,8 +76,15 @@ impl Device {
             for packets in part.chunks_mut(usize::from(u16::MAX)) {
                 let count = u16::try_from(packets.len())
                     .expect("TX prepare chunk is bounded by u16::MAX");
-                // SAFETY: Packet is transparent over one mbuf pointer. These
-                // packets are owned, direct and unshared on the Port's thread.
+                // SAFETY: TxPacket is transparent over one mbuf pointer; each
+                // is direct and single-segment on the Port's thread. Frame
+                // invariant: header bytes in front of the payload and mbuf
+                // metadata of a published frame may be written by the device
+                // and by the PMD's tx_prepare; the payload region is written
+                // only while the frame is unique, which TxBuf's safe API
+                // enforces (room_mut and set_len assert unique). A TCP send
+                // queue holding a retained frame reads only its payload, so
+                // this write to the L4 checksum races nothing.
                 let ready = unsafe { eth_tx_prepare(port_id, 0, packets.as_mut_ptr().cast(), count) };
                 if ready < count {
                     panic!(
@@ -125,13 +136,17 @@ impl Device {
         drop((rx, tx, spare));
         port
     }
+
+    pub(crate) fn frame_pool(&self) -> &FramePool {
+        self.port.frame_pool()
+    }
 }
 
 /// Reserve a free pending slot and a full-frame TX packet: the spare if one
 /// is held, else a new allocation.
 fn reserve<'a>(
     port: &'a Port,
-    pending: &'a mut VecDeque<Packet>,
+    pending: &'a mut VecDeque<TxPacket>,
     spare: &'a mut Option<Packet>,
 ) -> Option<Tx<'a>> {
     if pending.len() == pending.capacity() {
@@ -153,6 +168,7 @@ fn reserve<'a>(
 impl phy::Device for Device {
     type RxToken<'a> = Rx<'a>;
     type TxToken<'a> = Tx<'a>;
+    type FrameToken<'a> = FrameTx<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Rx<'_>, Tx<'_>)> {
         if self.rx.is_empty() {
@@ -165,6 +181,16 @@ impl phy::Device for Device {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Tx<'_>> {
         reserve(&self.port, &mut self.tx, &mut self.spare)
+    }
+
+    fn transmit_frame(&mut self, _timestamp: Instant) -> Option<FrameTx<'_>> {
+        if self.tx.len() == self.tx.capacity() {
+            return None;
+        }
+        Some(FrameTx {
+            pending: &mut self.tx,
+            port: &self.port,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -221,7 +247,7 @@ impl phy::RxToken for Rx<'_> {
 pub(crate) struct Tx<'a> {
     /// `None` only after `consume` took it.
     packet: Option<Packet>,
-    pending: &'a mut VecDeque<Packet>,
+    pending: &'a mut VecDeque<TxPacket>,
     spare: &'a mut Option<Packet>,
     port: &'a Port,
     tx_checksum: Option<TxChecksum>,
@@ -247,40 +273,139 @@ impl phy::TxToken for Tx<'_> {
         };
         packet.truncate(len);
         let result = f(packet.data_mut());
-        let port_id = self.port.port_id();
-        let (flags, l3, l4) = match self.tx_checksum {
-            Some(TxChecksum::Tcp {
-                ip_header_len,
-                tcp_header_len,
-            }) => {
-                assert!(
-                    self.port.tx_tcp_checksum(),
-                    "port {port_id}: TCP TX offload metadata without its profile"
-                );
-                (
-                    RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM,
-                    u16::from(ip_header_len),
-                    u16::from(tcp_header_len),
-                )
-            }
-            Some(TxChecksum::Udp { ip_header_len }) => {
-                assert!(
-                    self.port.tx_udp_checksum(),
-                    "port {port_id}: UDP TX offload metadata without its profile"
-                );
-                (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, u16::from(ip_header_len), 8)
-            }
-            None => (0, 0, 0),
-        };
+        let offload = tx_offload(self.port, self.tx_checksum);
         // SAFETY: the Packet owns its direct, unshared mbuf exclusively.
-        unsafe {
-            let raw = packet.as_ptr();
-            (*raw).set_ol_flags(flags);
-            (*raw).set_tx_offload_lengths(if flags == 0 { 0 } else { 14 }, l3, l4);
-        }
+        unsafe { offload.write(packet.as_ptr()) };
         // The slot checked at reservation is still free: this borrow was exclusive.
-        self.pending.push_back(packet);
+        self.pending.push_back(packet.into());
         result
+    }
+}
+
+/// TX offload flags and header lengths for one mbuf.
+#[derive(Clone, Copy)]
+struct TxOffload {
+    flags: u64,
+    l3: u16,
+    l4: u16,
+}
+
+impl TxOffload {
+    /// # Safety
+    /// The caller is the only holder of the live mbuf `raw`.
+    #[inline(always)]
+    unsafe fn write(self, raw: *mut rte_mbuf) {
+        let l2 = if self.flags == 0 { 0 } else { 14 };
+        // SAFETY: the caller is the mbuf's only holder.
+        unsafe {
+            (*raw).set_ol_flags(self.flags);
+            (*raw).set_tx_offload_lengths(l2, self.l3, self.l4);
+        }
+    }
+}
+
+/// The TX offload smoltcp's checksum metadata asks for. Panics if the
+/// metadata names an offload outside the port's profile.
+#[inline(always)]
+fn tx_offload(port: &Port, tx_checksum: Option<TxChecksum>) -> TxOffload {
+    let port_id = port.port_id();
+    let (flags, l3, l4) = match tx_checksum {
+        Some(TxChecksum::Tcp {
+            ip_header_len,
+            tcp_header_len,
+        }) => {
+            assert!(
+                port.tx_tcp_checksum(),
+                "port {port_id}: TCP TX offload metadata without its profile"
+            );
+            (
+                RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM,
+                u16::from(ip_header_len),
+                u16::from(tcp_header_len),
+            )
+        }
+        Some(TxChecksum::Udp { ip_header_len }) => {
+            assert!(
+                port.tx_udp_checksum(),
+                "port {port_id}: UDP TX offload metadata without its profile"
+            );
+            (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, u16::from(ip_header_len), 8)
+        }
+        None => (0, 0, 0),
+    };
+    TxOffload { flags, l3, l4 }
+}
+
+/// A free pending slot for one frame-pool TxBuf, held by the exclusive borrow.
+/// It takes no reference and allocates nothing; dropped without a consume, it
+/// does nothing.
+pub(crate) struct FrameTx<'a> {
+    pending: &'a mut VecDeque<TxPacket>,
+    port: &'a Port,
+}
+
+impl FrameTx<'_> {
+    /// Write `header` in front of the payload and set the mbuf's lengths and
+    /// offload metadata. Panics, before writing anything, unless the frame is
+    /// from this Stack's frame pool, unique, fits the frame capacity with its
+    /// headers, and asks only for offloads in the port's profile.
+    fn write(&self, header: &TxHeader, frame: &TxBuf) {
+        let port_id = self.port.port_id();
+        assert!(
+            frame.origin() == self.port.frame_origin(),
+            "port {port_id}: TX frame is not from this Stack's frame pool (TCP socket moved between Stacks)"
+        );
+        assert!(frame.unique(), "port {port_id}: published TX frame is shared");
+        let header_len = header.bytes().len();
+        let len = header_len + frame.len();
+        let capacity = usize::from(self.port.frame_capacity());
+        assert!(
+            len <= capacity,
+            "port {port_id}: TX frame of {len} bytes exceeds the frame capacity {capacity}"
+        );
+        let offload = tx_offload(self.port, header.tx_checksum());
+        let raw = frame.owner().cast::<rte_mbuf>().as_ptr();
+        // TxHeader holds at most 64 bytes; FRAME_DATA_OFF is above that.
+        let data_off = FRAME_DATA_OFF - header_len as u16;
+        // SAFETY: the origin check makes `raw` a live, direct, single-segment
+        // frame-pool mbuf whose payload starts FRAME_DATA_OFF bytes into its
+        // buffer (FramePool::alloc); the header range lies in its headroom and
+        // no Rust reference covers it. Frame invariant: header bytes in front
+        // of the payload and mbuf metadata may be written by the device and by
+        // the PMD's tx_prepare; the payload region only while the frame is
+        // unique (TxBuf's room_mut and set_len assert it). This write touches
+        // only headers and metadata; the frame is also unique here (asserted
+        // above). `len` fits u16: it is at most the frame capacity.
+        unsafe {
+            debug_assert_eq!(
+                (*raw).data_ptr().add(usize::from(FRAME_DATA_OFF - (*raw).data_off())),
+                frame.payload().as_ptr().cast_mut()
+            );
+            (*raw).set_data_off(data_off);
+            std::ptr::copy_nonoverlapping(header.bytes().as_ptr(), (*raw).data_ptr(), header_len);
+            (*raw).set_data_len(len as u16);
+            (*raw).set_pkt_len(len as u32);
+            offload.write(raw);
+        }
+    }
+}
+
+impl phy::FrameToken for FrameTx<'_> {
+    fn consume(self, header: TxHeader, frame: TxBuf) {
+        self.write(&header, &frame);
+        // SAFETY: into_raw gives up the frame's one reference to this packet.
+        // The slot checked at transmit_frame is still free: this borrow was exclusive.
+        self.pending
+            .push_back(unsafe { TxPacket::from_raw(frame.into_raw().cast()) });
+    }
+
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf {
+        self.write(&header, &frame);
+        let published = frame.clone();
+        // SAFETY: the clone's reference moves to this packet.
+        self.pending
+            .push_back(unsafe { TxPacket::from_raw(published.into_raw().cast()) });
+        frame
     }
 }
 

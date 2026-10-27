@@ -8,7 +8,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpEndpoint,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
 };
-use dpdk_smoltcp::{Eal, StackConfig, UdpConfig, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{tx_reserve, Eal, StackConfig, UdpConfig, UdpHandle, UdpSendError};
 
 const PORT: u16 = 1234;
 const PEER_PORT: u16 = 4321;
@@ -37,7 +37,7 @@ fn new_pair(eal: &Eal, gateway: Option<Ipv4Address>, capacity: usize) -> (Pair, 
             port.rx_burst = u16::try_from(BURST).unwrap();
             port.tx_burst = u16::try_from(BURST).unwrap();
             port.rx_pool.count = 255;
-            port.tx_pool.count = 127;
+            port.tx_pool.count = tx_reserve(port.tx_descriptors, pair::config(Side::A).tx_pending) as u32;
         },
     );
     let handle = pair

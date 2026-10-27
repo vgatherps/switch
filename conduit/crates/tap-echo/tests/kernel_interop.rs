@@ -39,6 +39,7 @@ const VDEV: &CStr = c"net_tap_kern";
 const IFACE: &CStr = c"cdtap_kern";
 const RX_POOL: &CStr = c"kern_rx";
 const TX_POOL: &CStr = c"kern_tx";
+const FRAME_POOL: &CStr = c"kern_frame";
 
 const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
@@ -167,6 +168,7 @@ fn port_config(
             rx_pool_count(rx_reserve(16, 32, 8), size.mtu, recv_capacities),
         ),
         tx_pool: pool(TX_POOL, 127),
+        frame_pool: pool(FRAME_POOL, 127),
         offloads: Offloads::default(),
     }
 }
@@ -210,7 +212,7 @@ fn sync_kernel_mtu(tap: &TapVdev, size: PortSize) {
 fn close(port: Port, tap: TapVdev) {
     port.try_close().unwrap();
     tap.close();
-    for name in [RX_POOL, TX_POOL] {
+    for name in [RX_POOL, TX_POOL, FRAME_POOL] {
         assert!(!pool_exists(name));
     }
 }

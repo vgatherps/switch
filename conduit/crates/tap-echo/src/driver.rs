@@ -24,6 +24,7 @@ pub const IFACE: &str = "cdtap_echo";
 pub const DEVARGS: &CStr = c"iface=cdtap_echo,mac=02:00:00:00:00:fe";
 const RX_POOL: &CStr = c"echo_rx";
 const TX_POOL: &CStr = c"echo_tx";
+const FRAME_POOL: &CStr = c"echo_frame";
 
 pub const ZHIDA_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
 pub const ZHIDA_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
@@ -201,6 +202,7 @@ fn port_config(port_id: u16, max_sockets: usize, recv_capacity: usize) -> PortCo
             ),
         ),
         tx_pool: pool(TX_POOL, POOL_COUNT),
+        frame_pool: pool(FRAME_POOL, POOL_COUNT),
         offloads: Offloads::default(),
     }
 }
@@ -333,10 +335,10 @@ fn serve(
                 None
             }
         }
-        Err((_, PortError::OutstandingBuffers { rx, tx })) => {
+        Err((_, PortError::OutstandingBuffers { rx, tx, frame })) => {
             report(
                 name,
-                format_args!("buffers still in use at port close: rx {rx}, tx {tx}"),
+                format_args!("buffers still in use at port close: rx {rx}, tx {tx}, frame {frame}"),
             );
             Some(EXIT_OUTSTANDING_BUFFERS)
         }

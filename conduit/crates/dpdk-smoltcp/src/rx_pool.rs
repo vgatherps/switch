@@ -35,6 +35,20 @@ pub fn tx_reserve(tx_descriptors: u16, tx_pending: usize) -> usize {
         .expect("TX reserve exceeds usize")
 }
 
+/// Frame-pool mbufs reserved for sent packets: tx_descriptors + tx_pending + 1.
+/// Each packet the PMD or the pending queue holds keeps at most one frame-pool
+/// mbuf that no socket or application counts (a frame the socket already
+/// released at ACK, or a sent UDP frame); the one extra frame means those
+/// packets can never take the last frame. Size the frame pool as this plus
+/// every TCP socket's frame limit plus the frames the application holds.
+///
+/// Panics if the reserve exceeds usize.
+pub fn frame_reserve(tx_descriptors: u16, tx_pending: usize) -> usize {
+    tx_reserve(tx_descriptors, tx_pending)
+        .checked_add(1)
+        .expect("frame reserve exceeds usize")
+}
+
 /// RX pool count is the reserve plus every uncapped TCP socket's RX mbuf budget.
 /// The reserve keeps the driver supplied while sockets hold received data.
 /// For capped sockets, add `tcp::rx_mbuf_budget(&config, usize::from(ip_mtu))`
@@ -62,6 +76,19 @@ pub fn rx_pool_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_reserve_covers_one_mbuf_per_held_packet_plus_one() {
+        assert_eq!(frame_reserve(16, 8), 16 + 8 + 1);
+        assert_eq!(frame_reserve(1024, 32), 1024 + 32 + 1);
+        assert_eq!(frame_reserve(0, 0), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame reserve exceeds usize")]
+    fn frame_reserve_refuses_overflow() {
+        frame_reserve(0, usize::MAX);
+    }
 
     #[test]
     fn tx_reserve_covers_descriptors_and_pending() {

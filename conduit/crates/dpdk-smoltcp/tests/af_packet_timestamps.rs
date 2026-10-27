@@ -227,6 +227,7 @@ fn af_packet_hardware_mode_opens_and_stamps() {
         let vdev = AfPacketVdev::new(pid, &pair.iface);
         let rx_pool = CString::new(format!("afp{pid}_rx")).unwrap();
         let tx_pool = CString::new(format!("afp{pid}_tx")).unwrap();
+        let frame_pool = CString::new(format!("afp{pid}_fr")).unwrap();
         let pool = |name| PoolConfig {
             name,
             count: 63,
@@ -244,6 +245,7 @@ fn af_packet_hardware_mode_opens_and_stamps() {
             queue_socket: -1,
             rx_pool: pool(rx_pool.as_c_str()),
             tx_pool: pool(tx_pool.as_c_str()),
+            frame_pool: pool(frame_pool.as_c_str()),
             offloads: Offloads {
                 rx_timestamp: true,
                 ..Offloads::default()
