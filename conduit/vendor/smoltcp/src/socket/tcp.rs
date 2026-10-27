@@ -18,6 +18,8 @@ mod congestion;
 mod rx_buffer;
 #[cfg_attr(not(test), allow(dead_code))]
 mod rx_store;
+#[cfg_attr(not(test), allow(dead_code))]
+mod tx_queue;
 
 use congestion::cubic::Cubic;
 pub(crate) use rx_buffer::RxBuffer;
@@ -3970,29 +3972,48 @@ mod test {
         }
     }
 
-    fn receive_window_socket(ip_mtu: usize, capacity: usize) -> TestSocket {
-        use crate::phy::{Device, DeviceCapabilities};
+    struct MtuDevice(crate::tests::TestingDevice, usize);
 
-        struct MtuDevice(crate::tests::TestingDevice, usize);
-        impl Device for MtuDevice {
-            type RxToken<'a> = crate::tests::RxToken;
-            type TxToken<'a> = crate::tests::TxToken<'a>;
+    impl crate::phy::Device for MtuDevice {
+        type RxToken<'a> = crate::tests::RxToken;
+        type TxToken<'a> = crate::tests::TxToken<'a>;
+        type FrameToken<'a> = crate::tests::FrameToken<'a>;
 
-            fn capabilities(&self) -> DeviceCapabilities {
-                DeviceCapabilities {
-                    max_transmission_unit: self.1,
-                    ..self.0.capabilities()
-                }
-            }
-
-            fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-                self.0.receive(now)
-            }
-
-            fn transmit(&mut self, now: Instant) -> Option<Self::TxToken<'_>> {
-                self.0.transmit(now)
+        fn capabilities(&self) -> crate::phy::DeviceCapabilities {
+            crate::phy::DeviceCapabilities {
+                max_transmission_unit: self.1,
+                ..self.0.capabilities()
             }
         }
+
+        fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            self.0.receive(now)
+        }
+
+        fn transmit(&mut self, now: Instant) -> Option<Self::TxToken<'_>> {
+            self.0.transmit(now)
+        }
+
+        fn transmit_frame(&mut self, now: Instant) -> Option<Self::FrameToken<'_>> {
+            self.0.transmit_frame(now)
+        }
+    }
+
+    #[test]
+    fn mtu_device_transmit_frame_delegates() {
+        use crate::phy::{Device as _, FrameToken as _};
+
+        let mut device = MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ip), 1280);
+        let frame = crate::tests::tx_test_buf(&[2]);
+        device
+            .transmit_frame(Instant::ZERO)
+            .unwrap()
+            .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+        assert_eq!(device.0.tx_queue.pop_front().unwrap(), &[1, 2]);
+    }
+
+    fn receive_window_socket(ip_mtu: usize, capacity: usize) -> TestSocket {
+        use crate::phy::Device;
 
         let mut device = MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ip), ip_mtu);
         let mut iface = crate::iface::Interface::new(

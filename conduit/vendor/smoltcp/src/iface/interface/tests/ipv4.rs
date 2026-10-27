@@ -273,6 +273,7 @@ mod stale_neighbors {
     impl Device for LimitedDevice {
         type RxToken<'a> = <TestingDevice as Device>::RxToken<'a>;
         type TxToken<'a> = <TestingDevice as Device>::TxToken<'a>;
+        type FrameToken<'a> = <TestingDevice as Device>::FrameToken<'a>;
 
         fn capabilities(&self) -> DeviceCapabilities {
             self.inner.capabilities()
@@ -291,6 +292,33 @@ mod stale_neighbors {
             }
             self.inner.transmit(now)
         }
+
+        fn transmit_frame(&mut self, now: Instant) -> Option<Self::FrameToken<'_>> {
+            if let Some(left) = &mut self.tx_left {
+                if *left == 0 {
+                    return None;
+                }
+                *left = left.checked_sub(1).expect("TX token count underflow");
+            }
+            self.inner.transmit_frame(now)
+        }
+    }
+
+    #[test]
+    fn limited_device_transmit_frame_uses_existing_limit() {
+        use crate::phy::FrameToken as _;
+
+        let mut device = LimitedDevice {
+            inner: TestingDevice::new(Medium::Ip),
+            tx_left: Some(1),
+        };
+        let frame = crate::tests::tx_test_buf(&[2]);
+        device
+            .transmit_frame(Instant::ZERO)
+            .unwrap()
+            .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+        assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
+        assert!(device.transmit_frame(Instant::ZERO).is_none());
     }
 
     struct Connection {
@@ -1198,6 +1226,7 @@ fn ingress_takes_each_frame_once_via_into_buf() {
     impl Device for CountingDevice {
         type RxToken<'a> = CountingRxToken;
         type TxToken<'a> = crate::tests::TxToken<'a>;
+        type FrameToken<'a> = crate::tests::FrameToken<'a>;
 
         fn capabilities(&self) -> DeviceCapabilities {
             self.inner.capabilities()
@@ -1214,6 +1243,10 @@ fn ingress_takes_each_frame_once_via_into_buf() {
 
         fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
             self.inner.transmit(timestamp)
+        }
+
+        fn transmit_frame(&mut self, timestamp: Instant) -> Option<Self::FrameToken<'_>> {
+            self.inner.transmit_frame(timestamp)
         }
     }
 
@@ -1293,6 +1326,16 @@ fn ingress_takes_each_frame_once_via_into_buf() {
         inner,
         queue: VecDeque::new(),
     };
+    {
+        use crate::phy::FrameToken as _;
+
+        let frame = crate::tests::tx_test_buf(&[2]);
+        device
+            .transmit_frame(Instant::ZERO)
+            .unwrap()
+            .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+        assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
+    }
     let mut listener =
         tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
     listener.listen(1234).unwrap();

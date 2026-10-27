@@ -47,6 +47,28 @@ impl TxToken for ReplyToken<'_> {
     }
 }
 
+struct ReplyFrameToken<'a>(&'a mut Vec<Vec<u8>>);
+
+impl crate::phy::FrameToken for ReplyFrameToken<'_> {
+    fn consume_shared<R, F>(self, frame: &crate::phy::TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R,
+    {
+        let (result, bytes) = crate::phy::copy_with_headers(frame, header_len, f);
+        self.0.push(bytes);
+        result
+    }
+
+    fn consume_owned<R, F>(self, frame: crate::phy::TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R,
+    {
+        let (result, bytes) = crate::phy::copy_with_headers(&frame, header_len, f);
+        self.0.push(bytes);
+        result
+    }
+}
+
 struct UdpDevice {
     rx: VecDeque<FrameToken>,
     tx: Vec<Vec<u8>>,
@@ -58,6 +80,7 @@ struct UdpDevice {
 impl Device for UdpDevice {
     type RxToken<'a> = FrameToken;
     type TxToken<'a> = ReplyToken<'a>;
+    type FrameToken<'a> = ReplyFrameToken<'a>;
 
     fn receive(&mut self, _: Instant) -> Option<(FrameToken, ReplyToken<'_>)> {
         let rx = self.rx.pop_front()?;
@@ -74,9 +97,39 @@ impl Device for UdpDevice {
         Some(ReplyToken(&mut self.tx))
     }
 
+    fn transmit_frame(&mut self, _: Instant) -> Option<ReplyFrameToken<'_>> {
+        if let Some(left) = &mut self.tx_left {
+            if *left == 0 {
+                return None;
+            }
+            *left = left.checked_sub(1).expect("TX token count underflow");
+        }
+        Some(ReplyFrameToken(&mut self.tx))
+    }
+
     fn capabilities(&self) -> DeviceCapabilities {
         self.caps.clone()
     }
+}
+
+#[test]
+fn udp_device_transmit_frame_uses_existing_limit() {
+    use crate::phy::FrameToken as _;
+
+    let mut device = UdpDevice {
+        rx: VecDeque::new(),
+        tx: Vec::new(),
+        releases: Rc::new(Cell::new(0)),
+        caps: DeviceCapabilities::default(),
+        tx_left: Some(1),
+    };
+    let frame = crate::tests::tx_test_buf(&[3, 4]);
+    device
+        .transmit_frame(Instant::ZERO)
+        .unwrap()
+        .consume_shared(&frame, 2, |headers, _| headers.copy_from_slice(&[1, 2]));
+    assert_eq!(device.tx, vec![vec![1, 2, 3, 4]]);
+    assert!(device.transmit_frame(Instant::ZERO).is_none());
 }
 
 struct Test {

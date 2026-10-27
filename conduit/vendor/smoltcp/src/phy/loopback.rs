@@ -29,6 +29,7 @@ impl Loopback {
 impl Device for Loopback {
     type RxToken<'a> = RxToken;
     type TxToken<'a> = TxToken<'a>;
+    type FrameToken<'a> = FrameToken<'a>;
 
     fn capabilities(&self) -> DeviceCapabilities {
         DeviceCapabilities {
@@ -51,6 +52,12 @@ impl Device for Loopback {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(TxToken {
+            queue: &mut self.queue,
+        })
+    }
+
+    fn transmit_frame(&mut self, _timestamp: Instant) -> Option<Self::FrameToken<'_>> {
+        Some(FrameToken {
             queue: &mut self.queue,
         })
     }
@@ -82,5 +89,49 @@ impl<'a> phy::TxToken for TxToken<'a> {
         let result = f(&mut buffer);
         self.queue.push_back(buffer);
         result
+    }
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrameToken<'a> {
+    queue: &'a mut VecDeque<Vec<u8>>,
+}
+
+impl phy::FrameToken for FrameToken<'_> {
+    fn consume_shared<R, F>(self, frame: &phy::TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R,
+    {
+        let (result, buffer) = phy::copy_with_headers(frame, header_len, f);
+        self.queue.push_back(buffer);
+        result
+    }
+
+    fn consume_owned<R, F>(self, frame: phy::TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R,
+    {
+        let (result, buffer) = phy::copy_with_headers(&frame, header_len, f);
+        self.queue.push_back(buffer);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::phy::FrameToken as _;
+
+    #[test]
+    fn transmit_frame_copies_headers_and_payload() {
+        let mut device = Loopback::new(Medium::Ip);
+        let frame = crate::tests::tx_test_buf(&[3, 4]);
+        device
+            .transmit_frame(Instant::ZERO)
+            .unwrap()
+            .consume_shared(&frame, 2, |headers, _| headers.copy_from_slice(&[1, 2]));
+        assert_eq!(device.queue.pop_front().unwrap(), &[1, 2, 3, 4]);
+        assert!(frame.unique());
     }
 }

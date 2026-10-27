@@ -26,7 +26,9 @@ use crate::config::{
     IFACE_MAX_ADDR_COUNT,
 };
 use crate::phy::{PacketMeta, TxChecksum};
-use crate::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use crate::phy::{
+    Device, DeviceCapabilities, FrameToken as PhyFrameToken, Medium, RxToken, TxBuf, TxToken,
+};
 use crate::rand::Rand;
 use crate::socket::*;
 use crate::time::{Duration, Instant};
@@ -68,6 +70,33 @@ impl<T: TxToken> TxToken for TrackedTxToken<'_, T> {
     {
         *self.consumed = true;
         self.inner.consume(len, f)
+    }
+
+    fn set_meta(&mut self, meta: PacketMeta) {
+        self.inner.set_meta(meta);
+    }
+}
+
+struct TrackedFrameToken<'a, T> {
+    inner: T,
+    consumed: &'a mut bool,
+}
+
+impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
+    fn consume_shared<R, F>(self, frame: &TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R,
+    {
+        *self.consumed = true;
+        self.inner.consume_shared(frame, header_len, f)
+    }
+
+    fn consume_owned<R, F>(self, frame: TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R,
+    {
+        *self.consumed = true;
+        self.inner.consume_owned(frame, header_len, f)
     }
 
     fn set_meta(&mut self, meta: PacketMeta) {

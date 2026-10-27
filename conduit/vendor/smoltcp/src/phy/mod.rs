@@ -11,7 +11,7 @@ An implementation of the [Device](trait.Device.html) trait for a simple hardware
 Ethernet controller could look as follows:
 
 ```rust
-use smoltcp::phy::{self, DeviceCapabilities, Device, Medium};
+use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, TxBuf};
 use smoltcp::time::Instant;
 
 struct StmPhy {
@@ -31,6 +31,7 @@ impl<'a> StmPhy {
 impl phy::Device for StmPhy {
     type RxToken<'a> = StmPhyRxToken where Self: 'a;
     type TxToken<'a> = StmPhyTxToken<'a> where Self: 'a;
+    type FrameToken<'a> = StmPhyFrameToken<'a> where Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let buffer = core::mem::replace(&mut self.rx_buffer, vec![0; 1536]);
@@ -40,6 +41,10 @@ impl phy::Device for StmPhy {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(StmPhyTxToken(&mut self.tx_buffer[..]))
+    }
+
+    fn transmit_frame(&mut self, _timestamp: Instant) -> Option<Self::FrameToken<'_>> {
+        Some(StmPhyFrameToken(&mut self.tx_buffer[..]))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -71,6 +76,38 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
         result
     }
 }
+
+struct StmPhyFrameToken<'a>(&'a mut [u8]);
+
+impl phy::FrameToken for StmPhyFrameToken<'_> {
+    fn consume_shared<R, F>(self, frame: &TxBuf, header_len: usize, f: F) -> R
+        where F: FnOnce(&mut [u8], &[u8]) -> R
+    {
+        // SAFETY: headers_and_payload checks uniqueness and headroom. This token holds no alias.
+        let (headers, payload) = unsafe { frame.headers_and_payload(header_len) };
+        let result = f(headers, payload);
+        let len = header_len.checked_add(payload.len()).expect("TX frame length overflow");
+        self.0[..header_len].copy_from_slice(headers);
+        self.0[header_len..len].copy_from_slice(payload);
+        println!("tx called {}", len);
+        // TODO: send packet out
+        result
+    }
+
+    fn consume_owned<R, F>(self, frame: TxBuf, header_len: usize, f: F) -> R
+        where F: FnOnce(&mut [u8], &[u8]) -> R
+    {
+        // SAFETY: headers_and_payload checks uniqueness and headroom. This token holds no alias.
+        let (headers, payload) = unsafe { frame.headers_and_payload(header_len) };
+        let result = f(headers, payload);
+        let len = header_len.checked_add(payload.len()).expect("TX frame length overflow");
+        self.0[..header_len].copy_from_slice(headers);
+        self.0[header_len..len].copy_from_slice(payload);
+        println!("tx called {}", len);
+        // TODO: send packet out
+        result
+    }
+}
 ```
 "##
 ]
@@ -79,10 +116,15 @@ use crate::time::Instant;
 
 mod loopback;
 mod rx_buf;
+mod tx_buf;
 mod held_frames;
 
 pub use self::loopback::Loopback;
 pub use self::rx_buf::RxBuf;
+pub use self::tx_buf::{TxAlloc, TxBuf, TxBufOps, TxFrame, TxSource};
+pub(crate) use self::tx_buf::copy_with_headers;
+#[cfg(test)]
+pub(crate) use self::tx_buf::test_owner;
 pub use self::held_frames::HeldFrames;
 pub(crate) use self::held_frames::RxShared;
 
@@ -285,6 +327,9 @@ pub trait Device {
     type TxToken<'a>: TxToken
     where
         Self: 'a;
+    type FrameToken<'a>: FrameToken
+    where
+        Self: 'a;
 
     /// Construct a token pair consisting of one receive token and one transmit token.
     ///
@@ -302,6 +347,9 @@ pub trait Device {
     /// The timestamp must be a number of milliseconds, monotonically increasing since an
     /// arbitrary moment in time, such as system startup.
     fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>>;
+
+    /// One free publish slot for an existing TxBuf; takes no reference and allocates nothing.
+    fn transmit_frame(&mut self, timestamp: Instant) -> Option<Self::FrameToken<'_>>;
 
     /// Get a description of device capabilities.
     fn capabilities(&self) -> DeviceCapabilities;
@@ -335,4 +383,26 @@ pub trait TxToken {
     /// The Packet ID to be associated with the frame to be transmitted by this [`TxToken`].
     #[allow(unused_variables)]
     fn set_meta(&mut self, meta: PacketMeta) {}
+}
+
+/// Publishes one frame with `header_len` header bytes written in front of its payload.
+/// Order, for both methods: (1) panic unless frame.unique() and header_len <= frame.headroom();
+/// (2) f(headers, payload) writes the headers; (3) the device writes its own length and offload
+/// metadata; (4) consume_shared only: add one reference; (5) publish.
+/// Nothing is written to the frame after (5). A panic in (1)-(3) publishes nothing and takes no
+/// reference; consume_owned's frame is then dropped (freed), consume_shared's stays with the caller.
+/// Dropping the token without consume does nothing.
+pub trait FrameToken {
+    #[allow(unused_variables)]
+    fn set_meta(&mut self, meta: PacketMeta) {}
+
+    /// TCP: the caller keeps its reference; the device takes a second one.
+    fn consume_shared<R, F>(self, frame: &TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R;
+
+    /// UDP: the caller's only reference moves into the device.
+    fn consume_owned<R, F>(self, frame: TxBuf, header_len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8], &[u8]) -> R;
 }

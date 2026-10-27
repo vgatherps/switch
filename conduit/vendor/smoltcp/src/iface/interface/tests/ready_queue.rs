@@ -170,6 +170,7 @@ struct RefusingDevice {
 impl Device for RefusingDevice {
     type RxToken<'a> = <TestingDevice as Device>::RxToken<'a>;
     type TxToken<'a> = <TestingDevice as Device>::TxToken<'a>;
+    type FrameToken<'a> = <TestingDevice as Device>::FrameToken<'a>;
 
     fn capabilities(&self) -> DeviceCapabilities {
         self.inner.capabilities()
@@ -186,6 +187,31 @@ impl Device for RefusingDevice {
         self.remaining -= 1;
         self.inner.transmit(timestamp)
     }
+
+    fn transmit_frame(&mut self, timestamp: Instant) -> Option<Self::FrameToken<'_>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        self.inner.transmit_frame(timestamp)
+    }
+}
+
+#[test]
+fn refusing_device_transmit_frame_uses_existing_limit() {
+    use crate::phy::FrameToken as _;
+
+    let mut device = RefusingDevice {
+        inner: TestingDevice::new(Medium::Ip),
+        remaining: 1,
+    };
+    let frame = crate::tests::tx_test_buf(&[2]);
+    device
+        .transmit_frame(Instant::ZERO)
+        .unwrap()
+        .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+    assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
+    assert!(device.transmit_frame(Instant::ZERO).is_none());
 }
 
 #[test]
