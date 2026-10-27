@@ -142,11 +142,18 @@ impl Mixed {
     /// Every socket and frame the test made must already be dropped. The Net
     /// gives its Stack back, both Ports close with every mbuf returned.
     pub fn close(self) {
+        self.close_after_stacks(|| {});
+    }
+
+    /// `close`, running `held` once both Stacks are torn down and before the
+    /// mbuf checks: it gets frames still held and must drop them.
+    pub fn close_after_stacks(self, held: impl FnOnce()) {
         let Self { mut to_peer, mut to_net, net, peer, fixtures, .. } = self;
         let stack = net.into_stack().ok().expect("a Net handle or socket is still alive");
         to_peer.free_held();
         to_net.free_held();
         let ports = [stack.into_port(), peer.into_port()];
+        held();
         for fixture in &fixtures {
             fixture.drain();
             assert_eq!(fixture.in_use(), (0, 0));

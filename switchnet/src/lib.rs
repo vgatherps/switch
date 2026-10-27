@@ -11,6 +11,7 @@
 //! conduit's frames they stay valid after their socket, the Net and the Stack
 //! are gone. Each held frame occupies its socket's receive budget until it drops.
 
+use std::mem;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -25,6 +26,8 @@ use dpdk_smoltcp::{TcpHandle, UdpHandle};
 use cell::StackCell;
 use wait::{Interest, Registry};
 
+#[cfg(test)]
+mod alloc_count;
 mod cell;
 mod wait;
 
@@ -45,14 +48,43 @@ struct Inner {
     stack: Stack,
     registry: Registry<Socket>,
     ingress_budget: usize,
-    /// Set while `Stack::turn` runs; left set if it unwinds.
+    /// Set if `Stack::turn` unwinds.
     poisoned: bool,
+    /// Makes the next `stack_turn` panic where `Stack::turn` would run.
+    #[cfg(test)]
+    fail_turn: bool,
 }
 
 impl Inner {
     #[inline]
     fn check(&self) {
         assert!(!self.poisoned, "Net poisoned: a Stack turn panicked");
+    }
+
+    /// `Stack::turn` with the configured budget; poisons only on unwind.
+    #[inline]
+    fn stack_turn(&mut self, now: Instant) -> Result<Turn, StackError> {
+        struct PoisonOnUnwind<'a>(&'a mut bool);
+        impl Drop for PoisonOnUnwind<'_> {
+            fn drop(&mut self) {
+                *self.0 = true;
+            }
+        }
+        self.check();
+        let poison = PoisonOnUnwind(&mut self.poisoned);
+        #[cfg(test)]
+        assert!(!self.fail_turn, "injected Stack::turn panic");
+        let turn = self.stack.turn(now, self.ingress_budget);
+        mem::forget(poison);
+        turn
+    }
+
+    /// Moves the wakers of parked tasks whose socket is ready into the
+    /// scratch; whether it holds any. Out of line so the idle turn inlines.
+    #[inline(never)]
+    fn scan(&mut self) -> bool {
+        let Inner { stack, registry, .. } = self;
+        registry.scan(|socket, interest| ready(stack, socket, interest))
     }
 
     fn tcp(&self, index: u32) -> &TcpHandle {
@@ -95,6 +127,8 @@ impl Net {
             registry: Registry::new(),
             ingress_budget: config.ingress_budget,
             poisoned: false,
+            #[cfg(test)]
+            fail_turn: false,
         };
         Net { shared: Rc::new(StackCell::new(inner)) }
     }
@@ -108,22 +142,44 @@ impl Net {
     /// sockets with a parked task. Wakers run after the stack is released.
     ///
     /// A panic out of `Stack::turn` poisons the Net: every later call except
-    /// drops and `into_stack` panics.
+    /// drops and `into_stack` panics. A panic out of a waker's `wake`
+    /// propagates; the other ready tasks not yet woken are woken by the next
+    /// turn.
+    #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
-        let (turn, mut wakes) = self.shared.with(|inner| {
-            inner.check();
-            inner.poisoned = true;
-            let turn = inner.stack.turn(now, inner.ingress_budget);
-            inner.poisoned = false;
-            let Inner { stack, registry, .. } = inner;
-            registry.scan(|socket, interest| ready(stack, socket, interest));
-            (turn, registry.take_wakes())
+        let mut woke = false;
+        let turn = self.shared.with(|inner| {
+            let turn = inner.stack_turn(now);
+            if inner.registry.pending() {
+                woke = inner.scan();
+            }
+            turn
         });
-        if !wakes.is_empty() {
-            wakes.drain(..).for_each(Waker::wake);
-            self.shared.with(|inner| inner.registry.restore_wakes(wakes));
+        if woke {
+            self.wake_ready();
         }
         turn
+    }
+
+    /// Wakes the wakers the scan collected, outside the borrow. If a wake
+    /// unwinds, the rest go back into the registry with the scratch.
+    #[inline(never)]
+    fn wake_ready(&self) {
+        struct Deliver<'a> {
+            shared: &'a Shared,
+            wakes: Vec<Waker>,
+        }
+        impl Drop for Deliver<'_> {
+            fn drop(&mut self) {
+                let wakes = mem::take(&mut self.wakes);
+                self.shared.with(|inner| inner.registry.restore_wakes(wakes));
+            }
+        }
+        let wakes = self.shared.with(|inner| inner.registry.take_wakes());
+        let mut deliver = Deliver { shared: &self.shared, wakes };
+        while let Some(waker) = deliver.wakes.pop() {
+            waker.wake();
+        }
     }
 
     /// `Stack::poll_at`.
@@ -295,8 +351,10 @@ struct TcpRx {
 
 impl TcpStream {
     /// `Future<Output = Result<TcpFrame, RecvError>>`: the next in-order frame.
-    /// After a FIN and the last frame, conduit's `RecvError::Finished`; after a
-    /// reset or in a state without receive, `RecvError::InvalidState`.
+    /// In-order data already received is delivered first, also after a reset.
+    /// Then: after an accepted FIN, conduit's `RecvError::Finished`, even if a
+    /// reset followed it; after a reset without one, or in a state without
+    /// receive, `RecvError::InvalidState`.
     pub fn recv(&mut self) -> Recv<'_> {
         Recv { rx: &mut self.rx, parked: false }
     }
@@ -435,5 +493,76 @@ impl Datagram {
     /// Raw NIC stamp; 0 = none.
     pub fn rx_timestamp(&self) -> u64 {
         self.0.rx_timestamp()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use dpdk_smoltcp::{StackConfig, rx_pool_count, rx_reserve};
+    use zhida_test_kit::pair::{self, BUDGET, Side, T0};
+    use zhida_test_kit::ring_port::RingPort;
+    use zhida_test_kit::with_eal;
+
+    use super::*;
+
+    fn message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => (*payload.downcast::<&str>().expect("panic message")).to_owned(),
+        }
+    }
+
+    fn panic_of<R>(body: impl FnOnce() -> R) -> String {
+        match catch_unwind(AssertUnwindSafe(body)) {
+            Ok(_) => panic!("did not panic"),
+            Err(payload) => message(payload),
+        }
+    }
+
+    /// The injected panic stands in for one unwinding out of `Stack::turn`
+    /// (conduit has no deterministic trigger); it runs where `Stack::turn`
+    /// would, under the same poison guard.
+    #[zhida_test_support::pinned_test]
+    fn stack_turn_panic_poisons_every_later_operation_but_drop_and_into_stack() {
+        with_eal(|eal| {
+            let fixture = RingPort::new("pois", 16, 16);
+            let stack_config = StackConfig { max_udp_sockets: 2, ..pair::config(Side::A) };
+            let mut config = fixture.config();
+            let reserve = rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
+            config.rx_pool.count = rx_pool_count(reserve, config.mtu, []) + 8;
+            let stack = match Stack::new(fixture.open_with(eal, config), stack_config, T0) {
+                Ok(stack) => stack,
+                Err((_, error)) => panic!("{error}"),
+            };
+            let mut net = Net::new(stack, NetConfig { ingress_budget: BUDGET });
+            let handle = net.handle();
+            let udp = |port| UdpConfig { port, rx_queue: 4, tx_checksum: true, broadcast: false };
+            let mut socket = handle.udp_bind(udp(7000)).unwrap();
+            let mut recv = Box::pin(socket.recv());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(recv.as_mut().poll(&mut cx).is_pending());
+            net.turn(T0).unwrap();
+
+            net.shared.with(|inner| inner.fail_turn = true);
+            assert_eq!(panic_of(|| net.turn(T0)), "injected Stack::turn panic");
+            let poisoned = "Net poisoned: a Stack turn panicked";
+            assert_eq!(panic_of(|| net.turn(T0)), poisoned);
+            assert_eq!(panic_of(|| net.poll_at()), poisoned);
+            assert_eq!(panic_of(|| handle.udp_bind(udp(7001))), poisoned);
+            assert_eq!(panic_of(|| recv.as_mut().poll(&mut cx)), poisoned);
+
+            drop(recv);
+            drop(socket);
+            drop(handle);
+            let stack = net.into_stack().ok().expect("every socket and handle dropped");
+            let port = stack.into_port();
+            fixture.drain();
+            assert_eq!(fixture.in_use(), (0, 0));
+            port.try_close().unwrap();
+            fixture.close();
+        })
     }
 }

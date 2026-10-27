@@ -9,6 +9,12 @@
 //!   `recv` future polled once so a task is parked on every socket; one
 //!   `Net::turn`. No socket becomes ready, so nothing is woken: the difference
 //!   is the cell borrow plus the readiness check of N parked sockets.
+//! - park_cancel/1: one socket bound through a `NetHandle`; per iteration a
+//!   fresh `recv` is polled once (parks the noop waker) and dropped (clears
+//!   it). The entry stays listed, so no turn: the cost of park plus cancel.
+//! - net_turn_canceled/1: park_cancel/1 then one `Net::turn`, whose scan meets
+//!   the cleared entry and unlists it. Minus park_cancel/1: a turn with one
+//!   canceled future.
 
 use std::hint::black_box;
 use std::pin::Pin;
@@ -78,6 +84,24 @@ fn net_turn(c: &mut Criterion) {
             let stack = net.into_stack().ok().expect("every socket dropped");
             close(fixture, stack.into_port());
         }
+
+        let fixture = RingPort::new("bc1", 16, 16);
+        let mut net = Net::new(open(eal, &fixture), NetConfig { ingress_budget: BUDGET });
+        let handle = net.handle();
+        let mut socket = handle.udp_bind(udp_config(0)).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        group.bench_function("park_cancel/1", |b| {
+            b.iter(|| black_box(Pin::new(&mut socket.recv()).poll(&mut cx).is_pending()))
+        });
+        group.bench_function("net_turn_canceled/1", |b| {
+            b.iter(|| {
+                black_box(Pin::new(&mut socket.recv()).poll(&mut cx).is_pending());
+                black_box(net.turn(black_box(T0)).unwrap())
+            })
+        });
+        drop((socket, handle));
+        let stack = net.into_stack().ok().expect("every socket dropped");
+        close(fixture, stack.into_port());
         group.finish();
     })
 }

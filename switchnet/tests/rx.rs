@@ -1,12 +1,16 @@
 //! switchnet receive side against a raw conduit Stack peer on net_ring.
 
 use std::cell::Cell;
-use std::pin::pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::{Pin, pin};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 
 use dpdk_smoltcp::TcpHandle;
+use dpdk_smoltcp::smoltcp::time::Duration;
 use switchnet::tcp::State;
-use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, RecvError, TcpStream, UdpConfig};
+use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, RecvError, StackError, TcpStream, UdpConfig};
 use zhida_test_kit::pair::pattern;
 use zhida_test_kit::with_eal;
 
@@ -416,6 +420,206 @@ fn waker_clone_and_drop_may_reenter_the_net() {
         assert_eq!([reenter.clones.get(), reenter.wakes.get(), reenter.drops.get()], [1, 0, 1]);
         assert_eq!([other.clones.get(), other.wakes.get(), other.drops.get()], [1, 1, 0]);
         drop((stream, peer, reenter, other));
+        mixed.close();
+    })
+}
+
+/// Peer sends `payload` to the Net's `port`, turning until the Net's MAC is resolved.
+fn peer_udp_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::UdpHandle, port: u16, payload: &[u8]) {
+    let to = Some(IpEndpoint::new(net_ip().into(), port));
+    mixed.until(|m| match m.peer.udp_send(peer, to, payload) {
+        Ok(()) => true,
+        Err(error) => {
+            assert_eq!(error, dpdk_smoltcp::UdpSendError::NeighborPending);
+            false
+        }
+    });
+}
+
+struct PanickingWake(AtomicUsize);
+
+impl Wake for PanickingWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        panic!("wake panicked");
+    }
+}
+
+#[zhida_test_support::pinned_test]
+fn panicking_wake_leaves_the_other_ready_task_for_the_next_turn() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["pwka", "pwkb"]);
+        let mut quiet = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut loud = mixed.handle().udp_bind(udp_config(7001)).unwrap();
+        let peer = mixed.peer.add_udp(udp_config(7002)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7000, b"warm");
+        let warm = drive(&mut mixed, &Probe::new(), pin!(quiet.recv()));
+        assert_eq!(warm.payload(), b"warm");
+        let probe = Probe::new();
+        let panicking = Arc::new(PanickingWake(AtomicUsize::new(0)));
+        let panicking_waker = Waker::from(panicking.clone());
+        // Parked in this order, the scan collects quiet then loud and the
+        // delivery wakes loud first.
+        let mut quiet_recv = Box::pin(quiet.recv());
+        let mut loud_recv = Box::pin(loud.recv());
+        assert!(probe.poll(quiet_recv.as_mut()).is_pending());
+        assert!(loud_recv.as_mut().poll(&mut Context::from_waker(&panicking_waker)).is_pending());
+        let to = |port| Some(IpEndpoint::new(net_ip().into(), port));
+        mixed.peer.udp_send(&peer, to(7000), b"quiet").unwrap();
+        mixed.peer.udp_send(&peer, to(7001), b"loud").unwrap();
+        mixed.peer.turn(mixed.now, zhida_test_kit::pair::BUDGET).unwrap();
+        assert_eq!(mixed.to_net.forward(), 2);
+        let now = mixed.now;
+        let unwound = catch_unwind(AssertUnwindSafe(|| mixed.net.turn(now)));
+        assert!(unwound.is_err());
+        assert_eq!(panicking.0.load(Ordering::Relaxed), 1);
+        assert_eq!(probe.wakes(), 0, "quiet woken before loud: the test lost its point");
+        mixed.net.turn(now).unwrap();
+        assert_eq!(probe.wakes(), 1, "the other ready task's wake was lost");
+        mixed.rounds(5);
+        assert_eq!([probe.wakes(), panicking.0.load(Ordering::Relaxed)], [1, 1]);
+        let Poll::Ready(datagram) = probe.poll(quiet_recv.as_mut()) else { panic!("woken without a datagram") };
+        assert_eq!(datagram.payload(), b"quiet");
+        let Poll::Ready(datagram_loud) = loud_recv.as_mut().poll(&mut Context::from_waker(&panicking_waker))
+        else {
+            panic!("loud datagram lost")
+        };
+        assert_eq!(datagram_loud.payload(), b"loud");
+        drop((quiet_recv, loud_recv, panicking_waker));
+        assert_eq!(probe.clones(), 0);
+        drop((warm, datagram, datagram_loud, quiet, loud, peer));
+        mixed.close();
+    })
+}
+
+#[zhida_test_support::pinned_test]
+fn canceled_connect_drops_the_socket_without_waking() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["ccna", "ccnb"]);
+        let peer = peer_listen(&mut mixed);
+        let probe = Probe::new();
+        {
+            let mut connecting =
+                pin!(mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap());
+            assert!(probe.poll(connecting.as_mut()).is_pending());
+            assert_eq!(probe.clones(), 1);
+        }
+        assert_eq!(probe.clones(), 0, "canceled Connecting left its waker parked");
+        mixed.rounds(10);
+        assert_eq!(probe.wakes(), 0);
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::Listen, "the dropped socket still connected");
+        drop(peer);
+        mixed.close();
+    })
+}
+
+#[zhida_test_support::pinned_test]
+fn canceled_udp_recv_clears_its_waker() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["cura", "curb"]);
+        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        let probe = Probe::new();
+        {
+            let mut recv = pin!(socket.recv());
+            assert!(probe.poll(recv.as_mut()).is_pending());
+            assert_eq!(probe.clones(), 1);
+        }
+        assert_eq!(probe.clones(), 0);
+        peer_udp_send(&mut mixed, &peer, 7000, b"after cancel");
+        mixed.rounds(10);
+        assert_eq!(probe.wakes(), 0, "canceled recv was woken");
+        let datagram = drive(&mut mixed, &probe, pin!(socket.recv()));
+        assert_eq!(datagram.payload(), b"after cancel");
+        drop((datagram, socket, peer));
+        mixed.close();
+    })
+}
+
+/// A leaked recv future never runs its drop: its waker stays parked until
+/// data wakes it once, or the stream drops it.
+#[zhida_test_support::pinned_test]
+fn forgotten_recv_future_is_woken_once_then_released() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["fgta", "fgtb"]);
+        let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let probe = Probe::new();
+        let mut recv = stream.recv();
+        assert!(probe.poll(Pin::new(&mut recv)).is_pending());
+        std::mem::forget(recv);
+        assert_eq!(probe.clones(), 1);
+        peer_send(&mut mixed, &peer, b"data");
+        mixed.until(|_| probe.wakes() > 0);
+        mixed.rounds(5);
+        assert_eq!([probe.wakes(), probe.clones()], [1, 0]);
+        let frame = drive(&mut mixed, &probe, pin!(stream.recv())).unwrap();
+        assert_eq!(frame.payload(), b"data");
+        let mut recv = stream.recv();
+        assert!(probe.poll(Pin::new(&mut recv)).is_pending());
+        std::mem::forget(recv);
+        assert_eq!(probe.clones(), 1);
+        drop(stream);
+        assert_eq!(probe.clones(), 0, "dropping the stream kept the forgotten future's waker");
+        drop((frame, peer));
+        mixed.close();
+    })
+}
+
+#[zhida_test_support::pinned_test]
+fn frames_outlive_the_stack() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["outa", "outb"]);
+        let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let mut udp = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let udp_peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        let probe = Probe::new();
+        peer_send(&mut mixed, &peer, b"tcp bytes");
+        let frame = drive(&mut mixed, &probe, pin!(stream.recv())).unwrap();
+        peer_udp_send(&mut mixed, &udp_peer, 7000, b"udp bytes");
+        let datagram = drive(&mut mixed, &probe, pin!(udp.recv()));
+        drop((stream, udp, peer, udp_peer));
+        mixed.close_after_stacks(move || {
+            let (mut frame, mut datagram) = (frame, datagram);
+            assert_eq!(frame.payload(), b"tcp bytes");
+            assert_eq!(datagram.payload(), b"udp bytes");
+            frame.payload_mut()[0] = b'T';
+            datagram.payload_mut()[0] = b'U';
+            assert_eq!(frame.payload(), b"Tcp bytes");
+            assert_eq!(datagram.payload(), b"Udp bytes");
+        });
+    })
+}
+
+/// A turn that returns an error (time went backwards: no work done) wakes
+/// nothing and keeps the parked task; the next turn processes the waiting
+/// datagram and wakes it.
+#[zhida_test_support::pinned_test]
+fn error_turn_keeps_the_parked_task_for_the_next_turn() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["erra", "errb"]);
+        let earlier = mixed.now;
+        mixed.now = earlier + Duration::from_millis(1);
+        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7000, b"warm");
+        let probe = Probe::new();
+        let warm = drive(&mut mixed, &probe, pin!(socket.recv()));
+        let mut recv = Box::pin(socket.recv());
+        assert!(probe.poll(recv.as_mut()).is_pending());
+        let woken = probe.wakes();
+        mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7000)), b"after error").unwrap();
+        mixed.peer.turn(mixed.now, zhida_test_kit::pair::BUDGET).unwrap();
+        assert_eq!(mixed.to_net.forward(), 1);
+        let Err(StackError::TimeWentBackwards { .. }) = mixed.net.turn(earlier) else {
+            panic!("turn at an earlier time did not fail")
+        };
+        assert_eq!([probe.wakes() - woken, probe.clones()], [0, 1]);
+        mixed.net.turn(mixed.now).unwrap();
+        assert_eq!([probe.wakes() - woken, probe.clones()], [1, 0]);
+        let Poll::Ready(datagram) = probe.poll(recv.as_mut()) else { panic!("woken without a datagram") };
+        assert_eq!(datagram.payload(), b"after error");
+        drop(recv);
+        drop((warm, datagram, socket, peer));
         mixed.close();
     })
 }
