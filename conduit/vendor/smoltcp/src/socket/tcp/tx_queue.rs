@@ -15,13 +15,13 @@ pub(crate) struct TxQueue {
 }
 
 struct Entry {
-    buf: TxBuf,
+    buf: Option<TxBuf>,
     end: u64,
 }
 
 pub(crate) enum Seg<'a> {
     Empty,
-    Whole(&'a TxBuf),
+    Whole { index: u32 },
     Cut(&'a [u8]),
 }
 
@@ -77,59 +77,54 @@ impl TxQueue {
         assert!(buf.len() != 0, "cannot queue an empty TX buffer");
         assert!(buf.len() <= self.byte_room(), "TX buffer exceeds byte room");
         assert!(self.frame_room() != 0, "TX queue has no frame room");
-        assert!(buf.unique(), "cannot queue a shared TX buffer");
         let start = self.entries.back().map_or(self.acked, |entry| entry.end);
         let end = start
             .checked_add(buf.len().try_into().expect("TX buffer length exceeds u64"))
             .expect("TX queue position overflow");
-        self.entries.push_back(Entry { buf, end });
+        self.entries.push_back(Entry {
+            buf: Some(buf),
+            end,
+        });
     }
 
-    pub(crate) fn tail_room(&mut self, sent: usize, cap: usize) -> Option<&mut [u8]> {
+    pub(crate) fn append_tail(&mut self, sent: usize, data: &[u8], cap: usize) -> usize {
         let first_never_sent = self
             .acked
             .checked_add(sent.try_into().expect("sent byte count exceeds u64"))
             .expect("sent position overflow");
         let byte_room = self.byte_room();
-        let entry = self.entries.back_mut()?;
+        let Some(entry) = self.entries.back_mut() else {
+            return 0;
+        };
+        let buf = entry.buf.as_mut().expect("TX queue tail is taken");
         let start = entry
             .end
-            .checked_sub(entry.buf.len().try_into().expect("TX buffer length exceeds u64"))
+            .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
             .expect("TX frame start underflow");
-        if first_never_sent > start || !entry.buf.unique() {
-            return None;
+        if first_never_sent > start || !buf.unique() {
+            return 0;
         }
-        let old_len = entry.buf.len();
-        let room = entry
-            .buf
+        let old_len = buf.len();
+        let cap_room = cap
+            .checked_sub(old_len)
+            .expect("TX tail length exceeds append cap");
+        let count = buf
             .capacity()
             .checked_sub(old_len)
             .expect("TX buffer length exceeds capacity")
             .min(byte_room)
-            .min(cap);
-        Some(&mut entry.buf.room_mut()[old_len..old_len + room])
-    }
-
-    pub(crate) fn commit_tail(&mut self, n: usize) {
-        let byte_room = self.byte_room();
-        let entry = self.entries.back_mut().expect("TX queue has no tail");
-        let room = entry
-            .buf
-            .capacity()
-            .checked_sub(entry.buf.len())
-            .expect("TX buffer length exceeds capacity")
-            .min(byte_room);
-        assert!(n <= room, "TX tail commit exceeds room");
-        let len = entry
-            .buf
-            .len()
-            .checked_add(n)
+            .min(cap_room)
+            .min(data.len());
+        let new_len = old_len
+            .checked_add(count)
             .expect("TX buffer length overflow");
-        entry.buf.set_len(len);
+        buf.room_mut()[old_len..new_len].copy_from_slice(&data[..count]);
+        buf.set_len(new_len);
         entry.end = entry
             .end
-            .checked_add(n.try_into().expect("TX tail commit exceeds u64"))
+            .checked_add(count.try_into().expect("TX tail append exceeds u64"))
             .expect("TX queue position overflow");
+        count
     }
 
     pub(crate) fn ack(&mut self, n: usize) {
@@ -168,16 +163,15 @@ impl TxQueue {
         self.hint
             .set(index.try_into().expect("TX queue index exceeds u32"));
         let entry = self.entries.get(index).expect("TX segment entry missing");
+        let buf = entry.buf.as_ref().expect("TX segment frame is taken");
         let start = entry
             .end
-            .checked_sub(entry.buf.len().try_into().expect("TX buffer length exceeds u64"))
+            .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
             .expect("TX frame start underflow");
-        if position == start
-            && position >= self.acked
-            && size >= entry.buf.len()
-            && entry.buf.unique()
-        {
-            return Seg::Whole(&entry.buf);
+        if position == start && position >= self.acked && size >= buf.len() {
+            return Seg::Whole {
+                index: index.try_into().expect("TX queue index exceeds u32"),
+            };
         }
         let within: usize = position
             .checked_sub(start)
@@ -185,17 +179,51 @@ impl TxQueue {
             .try_into()
             .expect("TX frame offset exceeds usize");
         let end = within
-            .checked_add(size.min(entry.buf.len() - within))
+            .checked_add(size.min(buf.len() - within))
             .expect("TX segment end overflow");
-        Seg::Cut(&entry.buf.payload()[within..end])
+        Seg::Cut(&buf.payload()[within..end])
+    }
+
+    pub(crate) fn take(&mut self, index: u32) -> TxBuf {
+        let index: usize = index.try_into().expect("TX queue index exceeds usize");
+        self.entries
+            .get_mut(index)
+            .expect("TX queue take index missing")
+            .buf
+            .take()
+            .expect("TX queue frame is already taken")
+    }
+
+    pub(crate) fn put_back(&mut self, index: u32, buf: TxBuf) {
+        let index: usize = index.try_into().expect("TX queue index exceeds usize");
+        let previous_end = if index == 0 {
+            self.acked
+        } else {
+            self.entries
+                .get(index - 1)
+                .expect("TX queue previous entry missing")
+                .end
+        };
+        let entry = self.entries.get_mut(index).expect("TX queue put index missing");
+        assert!(entry.buf.is_none(), "TX queue frame is not taken");
+        let expected_len: usize = entry
+            .end
+            .checked_sub(previous_end)
+            .expect("TX queue entry end precedes its start")
+            .try_into()
+            .expect("TX queue frame length exceeds usize");
+        assert_eq!(buf.origin(), self.source.origin(), "TX queue frame has wrong origin");
+        assert_eq!(buf.len(), expected_len, "TX queue frame has wrong length");
+        entry.buf = Some(buf);
     }
 
     fn locate(&self, position: u64, mut compared: impl FnMut()) -> usize {
         let contains = |index: usize, compared: &mut dyn FnMut()| {
             let entry = self.entries.get(index).expect("TX lookup index missing");
+            let buf = entry.buf.as_ref().expect("TX lookup frame is taken");
             let start = entry
                 .end
-                .checked_sub(entry.buf.len().try_into().expect("TX buffer length exceeds u64"))
+                .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
                 .expect("TX frame start underflow");
             compared();
             position >= start && position < entry.end
@@ -247,7 +275,7 @@ mod tests {
     use core::{cell::Cell, ptr::NonNull};
 
     fn queue(byte_cap: usize, frame_cap: usize, room: usize) -> (TxQueue, Rc<CountingAlloc>) {
-        let alloc = CountingAlloc::new(room, 64);
+        let alloc = CountingAlloc::new(room);
         let source = TxSource::new(alloc.clone());
         (TxQueue::new(byte_cap, frame_cap, source), alloc)
     }
@@ -256,14 +284,6 @@ mod tests {
         match seg {
             Seg::Cut(bytes) => bytes,
             _ => panic!("expected cut segment"),
-        }
-    }
-
-    fn bytes(seg: Seg<'_>) -> &[u8] {
-        match seg {
-            Seg::Whole(buf) => buf.payload(),
-            Seg::Cut(bytes) => bytes,
-            Seg::Empty => panic!("expected payload segment"),
         }
     }
 
@@ -303,25 +323,22 @@ mod tests {
     }
 
     #[test]
-    fn tail_room_appends_only_before_send() {
+    fn append_tail_caps_and_appends_only_before_send() {
         let (mut queue, _) = queue(8, 1, 6);
         queue.push_bytes(&[1, 2]);
-        assert_eq!(queue.tail_room(0, 2).unwrap().len(), 2);
-        queue.tail_room(0, 2).unwrap().copy_from_slice(&[3, 4]);
-        queue.commit_tail(2);
+        assert_eq!(queue.append_tail(0, &[3, 4, 5], 4), 2);
         assert_eq!(queue.len(), 4);
-        assert_eq!(bytes(queue.segment(0, 4)), &[1, 2, 3, 4]);
-        assert!(queue.tail_room(1, 2).is_none());
+        assert_eq!(queue.entries[0].buf.as_ref().unwrap().payload(), &[1, 2, 3, 4]);
+        assert_eq!(queue.append_tail(1, &[5], 1), 0);
     }
 
     #[test]
-    fn tail_room_refuses_shared_frame() {
+    fn append_tail_refuses_shared_frame() {
         let (mut queue, _) = queue(8, 1, 6);
         queue.push_bytes(&[1, 2]);
-        let owner = queue.entries[0].buf.share_raw();
-        assert!(queue.tail_room(0, 2).is_none());
-        // SAFETY: share_raw added one reference owned by this test.
-        unsafe { crate::phy::test_owner::release(owner) };
+        let clone = queue.entries[0].buf.as_ref().unwrap().clone();
+        assert_eq!(queue.append_tail(0, &[3], 1), 0);
+        drop(clone);
     }
 
     #[test]
@@ -330,12 +347,12 @@ mod tests {
         for byte in 0..24 {
             queue.push_bytes(&[byte]);
         }
-        assert_eq!(bytes(queue.segment(0, 1)), &[0]);
+        assert!(matches!(queue.segment(0, 1), Seg::Whole { index: 0 }));
         assert_eq!(queue.hint.get(), 0);
-        assert_eq!(bytes(queue.segment(20, 1)), &[20]);
+        assert!(matches!(queue.segment(20, 1), Seg::Whole { index: 20 }));
         assert_eq!(queue.hint.get(), 20);
-        assert_eq!(bytes(queue.segment(20, 1)), &[20]);
-        assert_eq!(bytes(queue.segment(21, 1)), &[21]);
+        assert!(matches!(queue.segment(20, 1), Seg::Whole { index: 20 }));
+        assert!(matches!(queue.segment(21, 1), Seg::Whole { index: 21 }));
     }
 
     #[test]
@@ -372,16 +389,14 @@ mod tests {
     }
 
     #[test]
-    fn segment_whole_only_when_unique_and_fits() {
+    fn segment_whole_when_frame_start_and_fits() {
         let (mut queue, _) = queue(8, 1, 8);
         queue.push_bytes(&[1, 2, 3]);
-        assert!(matches!(queue.segment(0, 3), Seg::Whole(_)));
+        assert!(matches!(queue.segment(0, 3), Seg::Whole { index: 0 }));
         assert_eq!(cut(queue.segment(0, 2)), &[1, 2]);
-        let owner = queue.entries[0].buf.share_raw();
-        assert_eq!(cut(queue.segment(0, 3)), &[1, 2, 3]);
-        // SAFETY: share_raw added one reference owned by this test.
-        unsafe { crate::phy::test_owner::release(owner) };
-        assert!(matches!(queue.segment(0, 3), Seg::Whole(_)));
+        let clone = queue.entries[0].buf.as_ref().unwrap().clone();
+        assert!(matches!(queue.segment(0, 3), Seg::Whole { index: 0 }));
+        drop(clone);
     }
 
     #[test]
@@ -390,6 +405,20 @@ mod tests {
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4]);
         assert_eq!(cut(queue.segment(1, 3)), &[2]);
+    }
+
+    #[test]
+    fn take_put_back_keeps_positions() {
+        let (mut queue, _) = queue(16, 2, 8);
+        queue.push_bytes(&[1, 2]);
+        queue.push_bytes(&[3, 4, 5]);
+        let frame = queue.take(1);
+        assert_eq!(frame.payload(), &[3, 4, 5]);
+        assert_eq!(queue.len(), 5);
+        queue.put_back(1, frame);
+        assert_eq!(cut(queue.segment(3, 1)), &[4]);
+        assert_eq!(queue.entries[0].end, 2);
+        assert_eq!(queue.entries[1].end, 5);
     }
 
     #[test]
@@ -431,7 +460,13 @@ mod tests {
         unsafe fn unique(_: NonNull<()>) -> bool {
             true
         }
-        static OPS: TxBufOps = TxBufOps { release, share, unique };
+        unsafe fn set_len(_: NonNull<()>, _: NonNull<u8>, _: usize) {}
+        static OPS: TxBufOps = TxBufOps {
+            release,
+            share,
+            unique,
+            set_len,
+        };
         impl Drop for Alloc {
             fn drop(&mut self) {
                 self.state.source_dropped.set(true);
@@ -448,7 +483,7 @@ mod tests {
                 let data = unsafe { data.add(64) };
                 let owner = NonNull::new(Box::into_raw(owner).cast::<()>()).unwrap();
                 // SAFETY: owner owns the allocation until OPS releases it.
-                Some(unsafe { TxBuf::from_raw_parts(owner, &OPS, self.origin(), data, 64, 64) })
+                Some(unsafe { TxBuf::from_raw_parts(owner, &OPS, self.origin(), data, 64) })
             }
 
             fn origin(&self) -> NonNull<()> {

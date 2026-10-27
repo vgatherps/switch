@@ -99,22 +99,20 @@ pub struct FrameToken<'a> {
 }
 
 impl phy::FrameToken for FrameToken<'_> {
-    fn consume_shared<R, F>(self, frame: &phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, buffer) = phy::copy_with_headers(frame, header_len, f);
+    fn consume(self, header: phy::TxHeader, frame: phy::TxBuf) -> Result<(), phy::TxBuf> {
+        let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        result
+        Ok(())
     }
 
-    fn consume_owned<R, F>(self, frame: phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, buffer) = phy::copy_with_headers(&frame, header_len, f);
+    fn consume_retain(
+        self,
+        header: phy::TxHeader,
+        frame: phy::TxBuf,
+    ) -> Result<phy::TxBuf, phy::TxBuf> {
+        let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        result
+        Ok(frame)
     }
 }
 
@@ -127,10 +125,14 @@ mod tests {
     fn transmit_frame_copies_headers_and_payload() {
         let mut device = Loopback::new(Medium::Ip);
         let frame = crate::tests::tx_test_buf(&[3, 4]);
-        device
+        let mut header = phy::TxHeader::new(2, None);
+        header.bytes_mut().copy_from_slice(&[1, 2]);
+        let frame = device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_shared(&frame, 2, |headers, _| headers.copy_from_slice(&[1, 2]));
+            .consume_retain(header, frame)
+            .ok()
+            .unwrap();
         assert_eq!(device.queue.pop_front().unwrap(), &[1, 2, 3, 4]);
         assert!(frame.unique());
     }

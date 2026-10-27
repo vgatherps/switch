@@ -4005,10 +4005,14 @@ mod test {
 
         let mut device = MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ip), 1280);
         let frame = crate::tests::tx_test_buf(&[2]);
+        let mut header = crate::phy::TxHeader::new(1, None);
+        header.bytes_mut()[0] = 1;
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+            .consume_retain(header, frame)
+            .ok()
+            .unwrap();
         assert_eq!(device.0.tx_queue.pop_front().unwrap(), &[1, 2]);
     }
 

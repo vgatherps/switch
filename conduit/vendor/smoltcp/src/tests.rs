@@ -10,7 +10,6 @@ pub(crate) fn setup<'a>(medium: Medium) -> (Interface, TcpSet<'a>, TestingDevice
     let iface = setup_with_device(medium, &mut device);
     (iface, TcpSet::new(vec![]), device)
 }
-
 fn setup_with_device(medium: Medium, device: &mut impl Device) -> Interface {
     let config = Config::new(match medium {
         Medium::Ethernet => {
@@ -137,27 +136,29 @@ pub struct FrameToken<'a> {
 }
 
 impl phy::FrameToken for FrameToken<'_> {
-    fn consume_shared<R, F>(self, frame: &phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, buffer) = phy::copy_with_headers(frame, header_len, f);
+    fn consume(
+        self,
+        header: phy::TxHeader,
+        frame: phy::TxBuf,
+    ) -> core::result::Result<(), phy::TxBuf> {
+        let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        result
+        Ok(())
     }
 
-    fn consume_owned<R, F>(self, frame: phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, buffer) = phy::copy_with_headers(&frame, header_len, f);
+    fn consume_retain(
+        self,
+        header: phy::TxHeader,
+        frame: phy::TxBuf,
+    ) -> core::result::Result<phy::TxBuf, phy::TxBuf> {
+        let buffer = phy::frame_bytes(header, &frame);
         self.queue.push_back(buffer);
-        result
+        Ok(frame)
     }
 }
 
 pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::TxBuf {
-    let alloc = phy::test_owner::CountingAlloc::new(bytes.len().max(1), 64);
+    let alloc = phy::test_owner::CountingAlloc::new(bytes.len().max(1));
     let mut buf = phy::TxAlloc::alloc(alloc.as_ref()).unwrap();
     buf.room_mut()[..bytes.len()].copy_from_slice(bytes);
     buf.set_len(bytes.len());
@@ -170,13 +171,12 @@ fn testing_device_frame_token_writes_before_publish() {
 
     let mut device = TestingDevice::new(Medium::Ip);
     let frame = tx_test_buf(&[3, 4]);
+    let mut header = phy::TxHeader::new(2, None);
+    assert!(device.tx_queue.is_empty());
+    header.bytes_mut().copy_from_slice(&[1, 2]);
+    assert!(device.tx_queue.is_empty());
     let token = device.transmit_frame(Instant::ZERO).unwrap();
-    let result = token.consume_shared(&frame, 2, |headers, payload| {
-        assert_eq!(payload, &[3, 4]);
-        headers.copy_from_slice(&[1, 2]);
-        7
-    });
-    assert_eq!(result, 7);
+    let frame = token.consume_retain(header, frame).ok().unwrap();
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
     assert!(frame.unique());
 }
@@ -185,60 +185,19 @@ fn testing_device_frame_token_writes_before_publish() {
 fn testing_device_owned_frame_releases_after_publish() {
     use crate::phy::FrameToken as _;
 
-    let alloc = phy::test_owner::CountingAlloc::new(2, 64);
+    let alloc = phy::test_owner::CountingAlloc::new(2);
     let mut frame = phy::TxAlloc::alloc(alloc.as_ref()).unwrap();
     frame.room_mut()[..2].copy_from_slice(&[3, 4]);
     frame.set_len(2);
     let mut device = TestingDevice::new(Medium::Ip);
+    let mut header = phy::TxHeader::new(2, None);
+    header.bytes_mut().copy_from_slice(&[1, 2]);
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume_owned(frame, 2, |headers, _| headers.copy_from_slice(&[1, 2]));
+        .consume(header, frame)
+        .ok()
+        .unwrap();
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-    assert_eq!(alloc.live(), 0);
-}
-
-#[test]
-fn testing_device_shared_panic_does_not_publish() {
-    use crate::phy::FrameToken as _;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    let mut device = TestingDevice::new(Medium::Ip);
-    let frame = tx_test_buf(&[3, 4]);
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_shared(&frame, 2, |headers, _| {
-                headers.copy_from_slice(&[1, 2]);
-                panic!("stop before publish");
-            });
-    }));
-    assert!(result.is_err());
-    assert!(device.tx_queue.is_empty());
-    assert!(frame.unique());
-}
-
-#[test]
-fn testing_device_owned_panic_releases_without_publish() {
-    use crate::phy::FrameToken as _;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    let alloc = phy::test_owner::CountingAlloc::new(2, 64);
-    let mut frame = phy::TxAlloc::alloc(alloc.as_ref()).unwrap();
-    frame.room_mut()[..2].copy_from_slice(&[3, 4]);
-    frame.set_len(2);
-    let mut device = TestingDevice::new(Medium::Ip);
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_owned(frame, 2, |headers, _| {
-                headers.copy_from_slice(&[1, 2]);
-                panic!("stop before publish");
-            });
-    }));
-    assert!(result.is_err());
-    assert!(device.tx_queue.is_empty());
     assert_eq!(alloc.live(), 0);
 }

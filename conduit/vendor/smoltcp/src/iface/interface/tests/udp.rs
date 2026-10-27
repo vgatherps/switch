@@ -50,22 +50,24 @@ impl TxToken for ReplyToken<'_> {
 struct ReplyFrameToken<'a>(&'a mut Vec<Vec<u8>>);
 
 impl crate::phy::FrameToken for ReplyFrameToken<'_> {
-    fn consume_shared<R, F>(self, frame: &crate::phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, bytes) = crate::phy::copy_with_headers(frame, header_len, f);
+    fn consume(
+        self,
+        header: crate::phy::TxHeader,
+        frame: crate::phy::TxBuf,
+    ) -> Result<(), crate::phy::TxBuf> {
+        let bytes = crate::phy::frame_bytes(header, &frame);
         self.0.push(bytes);
-        result
+        Ok(())
     }
 
-    fn consume_owned<R, F>(self, frame: crate::phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, bytes) = crate::phy::copy_with_headers(&frame, header_len, f);
+    fn consume_retain(
+        self,
+        header: crate::phy::TxHeader,
+        frame: crate::phy::TxBuf,
+    ) -> Result<crate::phy::TxBuf, crate::phy::TxBuf> {
+        let bytes = crate::phy::frame_bytes(header, &frame);
         self.0.push(bytes);
-        result
+        Ok(frame)
     }
 }
 
@@ -124,10 +126,14 @@ fn udp_device_transmit_frame_uses_existing_limit() {
         tx_left: Some(1),
     };
     let frame = crate::tests::tx_test_buf(&[3, 4]);
+    let mut header = crate::phy::TxHeader::new(2, None);
+    header.bytes_mut().copy_from_slice(&[1, 2]);
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume_shared(&frame, 2, |headers, _| headers.copy_from_slice(&[1, 2]));
+        .consume_retain(header, frame)
+        .ok()
+        .unwrap();
     assert_eq!(device.tx, vec![vec![1, 2, 3, 4]]);
     assert!(device.transmit_frame(Instant::ZERO).is_none());
 }

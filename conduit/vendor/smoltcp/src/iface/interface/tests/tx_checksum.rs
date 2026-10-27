@@ -29,30 +29,35 @@ struct RecordingTx<'a> {
 
 struct RecordingFrame<'a> {
     frames: &'a mut Vec<(PacketMeta, Vec<u8>)>,
-    meta: PacketMeta,
 }
 
 impl crate::phy::FrameToken for RecordingFrame<'_> {
-    fn set_meta(&mut self, meta: PacketMeta) {
-        self.meta = meta;
+    fn consume(
+        self,
+        header: crate::phy::TxHeader,
+        frame: crate::phy::TxBuf,
+    ) -> Result<(), crate::phy::TxBuf> {
+        let bytes = crate::phy::frame_bytes(header, &frame);
+        let meta = PacketMeta {
+            tx_checksum: header.tx_checksum(),
+            ..PacketMeta::default()
+        };
+        self.frames.push((meta, bytes));
+        Ok(())
     }
 
-    fn consume_shared<R, F>(self, frame: &crate::phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, bytes) = crate::phy::copy_with_headers(frame, header_len, f);
-        self.frames.push((self.meta, bytes));
-        result
-    }
-
-    fn consume_owned<R, F>(self, frame: crate::phy::TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        let (result, bytes) = crate::phy::copy_with_headers(&frame, header_len, f);
-        self.frames.push((self.meta, bytes));
-        result
+    fn consume_retain(
+        self,
+        header: crate::phy::TxHeader,
+        frame: crate::phy::TxBuf,
+    ) -> Result<crate::phy::TxBuf, crate::phy::TxBuf> {
+        let bytes = crate::phy::frame_bytes(header, &frame);
+        let meta = PacketMeta {
+            tx_checksum: header.tx_checksum(),
+            ..PacketMeta::default()
+        };
+        self.frames.push((meta, bytes));
+        Ok(frame)
     }
 }
 
@@ -95,7 +100,6 @@ impl Device for RecordingDevice {
     fn transmit_frame(&mut self, _: Instant) -> Option<RecordingFrame<'_>> {
         Some(RecordingFrame {
             frames: &mut self.tx,
-            meta: PacketMeta::default(),
         })
     }
 
@@ -114,11 +118,16 @@ fn recording_device_transmit_frame_keeps_metadata() {
         caps: DeviceCapabilities::default(),
     };
     let frame = crate::tests::tx_test_buf(&[3, 4]);
-    let mut token = device.transmit_frame(Instant::ZERO).unwrap();
     let mut meta = PacketMeta::default();
     meta.tx_checksum = Some(TxChecksum::Udp { ip_header_len: 20 });
-    token.set_meta(meta);
-    token.consume_shared(&frame, 2, |headers, _| headers.copy_from_slice(&[1, 2]));
+    let mut header = crate::phy::TxHeader::new(2, meta.tx_checksum);
+    header.bytes_mut().copy_from_slice(&[1, 2]);
+    device
+        .transmit_frame(Instant::ZERO)
+        .unwrap()
+        .consume_retain(header, frame)
+        .ok()
+        .unwrap();
     assert_eq!(device.tx, vec![(meta, vec![1, 2, 3, 4])]);
 }
 

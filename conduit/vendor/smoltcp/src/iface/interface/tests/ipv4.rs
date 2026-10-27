@@ -313,10 +313,14 @@ mod stale_neighbors {
             tx_left: Some(1),
         };
         let frame = crate::tests::tx_test_buf(&[2]);
+        let mut header = crate::phy::TxHeader::new(1, None);
+        header.bytes_mut()[0] = 1;
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+            .consume_retain(header, frame)
+            .ok()
+            .unwrap();
         assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
         assert!(device.transmit_frame(Instant::ZERO).is_none());
     }
@@ -1330,10 +1334,14 @@ fn ingress_takes_each_frame_once_via_into_buf() {
         use crate::phy::FrameToken as _;
 
         let frame = crate::tests::tx_test_buf(&[2]);
+        let mut header = crate::phy::TxHeader::new(1, None);
+        header.bytes_mut()[0] = 1;
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_shared(&frame, 1, |headers, _| headers[0] = 1);
+            .consume_retain(header, frame)
+            .ok()
+            .unwrap();
         assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
     }
     let mut listener =

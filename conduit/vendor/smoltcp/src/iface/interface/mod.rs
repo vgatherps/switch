@@ -25,7 +25,7 @@ use super::udp_set::UdpSet;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT,
 };
-use crate::phy::{PacketMeta, TxChecksum};
+use crate::phy::{PacketMeta, TxChecksum, TxHeader};
 use crate::phy::{
     Device, DeviceCapabilities, FrameToken as PhyFrameToken, Medium, RxToken, TxBuf, TxToken,
 };
@@ -83,24 +83,20 @@ struct TrackedFrameToken<'a, T> {
 }
 
 impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
-    fn consume_shared<R, F>(self, frame: &TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        *self.consumed = true;
-        self.inner.consume_shared(frame, header_len, f)
+    fn consume(self, header: TxHeader, frame: TxBuf) -> Result<(), TxBuf> {
+        let result = self.inner.consume(header, frame);
+        if result.is_ok() {
+            *self.consumed = true;
+        }
+        result
     }
 
-    fn consume_owned<R, F>(self, frame: TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R,
-    {
-        *self.consumed = true;
-        self.inner.consume_owned(frame, header_len, f)
-    }
-
-    fn set_meta(&mut self, meta: PacketMeta) {
-        self.inner.set_meta(meta);
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> Result<TxBuf, TxBuf> {
+        let result = self.inner.consume_retain(header, frame);
+        if result.is_ok() {
+            *self.consumed = true;
+        }
+        result
     }
 }
 

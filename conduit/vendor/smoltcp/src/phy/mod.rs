@@ -11,7 +11,7 @@ An implementation of the [Device](trait.Device.html) trait for a simple hardware
 Ethernet controller could look as follows:
 
 ```rust
-use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, TxBuf};
+use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, TxBuf, TxHeader};
 use smoltcp::time::Instant;
 
 struct StmPhy {
@@ -80,32 +80,24 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
 struct StmPhyFrameToken<'a>(&'a mut [u8]);
 
 impl phy::FrameToken for StmPhyFrameToken<'_> {
-    fn consume_shared<R, F>(self, frame: &TxBuf, header_len: usize, f: F) -> R
-        where F: FnOnce(&mut [u8], &[u8]) -> R
-    {
-        // SAFETY: headers_and_payload checks uniqueness and headroom. This token holds no alias.
-        let (headers, payload) = unsafe { frame.headers_and_payload(header_len) };
-        let result = f(headers, payload);
-        let len = header_len.checked_add(payload.len()).expect("TX frame length overflow");
-        self.0[..header_len].copy_from_slice(headers);
-        self.0[header_len..len].copy_from_slice(payload);
+    fn consume(self, header: TxHeader, frame: TxBuf) -> Result<(), TxBuf> {
+        let header_len = header.bytes().len();
+        let len = header_len.checked_add(frame.len()).expect("TX frame length overflow");
+        self.0[..header_len].copy_from_slice(header.bytes());
+        self.0[header_len..len].copy_from_slice(frame.payload());
         println!("tx called {}", len);
         // TODO: send packet out
-        result
+        Ok(())
     }
 
-    fn consume_owned<R, F>(self, frame: TxBuf, header_len: usize, f: F) -> R
-        where F: FnOnce(&mut [u8], &[u8]) -> R
-    {
-        // SAFETY: headers_and_payload checks uniqueness and headroom. This token holds no alias.
-        let (headers, payload) = unsafe { frame.headers_and_payload(header_len) };
-        let result = f(headers, payload);
-        let len = header_len.checked_add(payload.len()).expect("TX frame length overflow");
-        self.0[..header_len].copy_from_slice(headers);
-        self.0[header_len..len].copy_from_slice(payload);
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> Result<TxBuf, TxBuf> {
+        let header_len = header.bytes().len();
+        let len = header_len.checked_add(frame.len()).expect("TX frame length overflow");
+        self.0[..header_len].copy_from_slice(header.bytes());
+        self.0[header_len..len].copy_from_slice(frame.payload());
         println!("tx called {}", len);
         // TODO: send packet out
-        result
+        Ok(frame)
     }
 }
 ```
@@ -121,8 +113,8 @@ mod held_frames;
 
 pub use self::loopback::Loopback;
 pub use self::rx_buf::RxBuf;
-pub use self::tx_buf::{TxAlloc, TxBuf, TxBufOps, TxFrame, TxSource};
-pub(crate) use self::tx_buf::copy_with_headers;
+pub use self::tx_buf::{TxAlloc, TxBuf, TxBufOps, TxFrame, TxHeader, TxSource};
+pub(crate) use self::tx_buf::frame_bytes;
 #[cfg(test)]
 pub(crate) use self::tx_buf::test_owner;
 pub use self::held_frames::HeldFrames;
@@ -385,24 +377,14 @@ pub trait TxToken {
     fn set_meta(&mut self, meta: PacketMeta) {}
 }
 
-/// Publishes one frame with `header_len` header bytes written in front of its payload.
-/// Order, for both methods: (1) panic unless frame.unique() and header_len <= frame.headroom();
-/// (2) f(headers, payload) writes the headers; (3) the device writes its own length and offload
-/// metadata; (4) consume_shared only: add one reference; (5) publish.
-/// Nothing is written to the frame after (5). A panic in (1)-(3) publishes nothing and takes no
-/// reference; consume_owned's frame is then dropped (freed), consume_shared's stays with the caller.
-/// Dropping the token without consume does nothing.
+/// Publishes one packet whose wire bytes are `header.bytes()` followed by `frame.payload()`.
+/// The device writes no byte or metadata that another holder of `frame` sees, except through a
+/// handle it holds exclusively. An error returns the frame unchanged and publishes nothing.
+/// Dropping the token unconsumed does nothing.
 pub trait FrameToken {
-    #[allow(unused_variables)]
-    fn set_meta(&mut self, meta: PacketMeta) {}
+    /// The caller keeps nothing.
+    fn consume(self, header: TxHeader, frame: TxBuf) -> Result<(), TxBuf>;
 
-    /// TCP: the caller keeps its reference; the device takes a second one.
-    fn consume_shared<R, F>(self, frame: &TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R;
-
-    /// UDP: the caller's only reference moves into the device.
-    fn consume_owned<R, F>(self, frame: TxBuf, header_len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8], &[u8]) -> R;
+    /// The caller's reference comes back.
+    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> Result<TxBuf, TxBuf>;
 }
