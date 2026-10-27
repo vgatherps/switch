@@ -1,12 +1,14 @@
 LINUX = scripts/test-linux.sh
+# The root workspace also holds conduit and kioto; --workspace would pull them in.
+PKGS = -p ceph-rseq -p ceph-ring -p ceph-fifo -p ceph-proto -p ceph-control
 
 .PHONY: test test-release e2e bench clippy check-x86
 
 test:            ## Linux tests in Docker (debug)
-	$(LINUX) test --workspace
+	$(LINUX) test $(PKGS)
 
 test-release:    ## Linux tests in Docker (release)
-	$(LINUX) test --workspace --release
+	$(LINUX) test $(PKGS) --release
 
 e2e:             ## one sequencer process, four player processes
 	$(LINUX) test -p ceph-fifo --test e2e --release
@@ -15,7 +17,7 @@ bench:           ## push benchmark
 	$(LINUX) run --release -p ceph-ring --example push_bench
 
 clippy:          ## clippy for the Linux target, warnings are errors
-	cargo clippy --workspace --tests --examples --target aarch64-unknown-linux-gnu -- -D warnings
+	cargo clippy $(PKGS) --tests --examples --target aarch64-unknown-linux-gnu -- -D warnings
 
 check-x86:       ## compile the tests for x86_64 under the amd64 image
-	PLATFORM=linux/amd64 $(LINUX) test --no-run --release --workspace
+	PLATFORM=linux/amd64 $(LINUX) test --no-run --release $(PKGS)

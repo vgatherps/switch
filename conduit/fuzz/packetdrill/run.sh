@@ -42,7 +42,7 @@ export PACKETDRILL_CPU
 
 cd "$(dirname "$0")/../.."
 dir=fuzz/packetdrill
-tap_echo=target/debug/tap-echo
+tap_echo=../target/debug/tap-echo
 shim=target/fuzz/zhida_shim.so
 
 # packetdrill's lexer treats newlines as whitespace and its grammar allows adjacent events,

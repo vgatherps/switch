@@ -60,7 +60,7 @@ Per-PMD setup:
 ## 2. Discover, bind (root), unbind
 `zhida-netconf` (crate `zhida-netconf`) writes the config file that `zhida-nic` and `zhida_open::open`
 read, and moves the NIC between its kernel driver and vfio-pci. It does not need DPDK. Build it on the
-host with `cargo build --locked --release -p zhida-netconf`; the binary is `target/release/zhida-netconf`.
+host with `cargo build --locked --release -p zhida-netconf`; the binary is `../target/release/zhida-netconf`.
 The commands below assume it is on your `PATH`. `bind` and `unbind` run as root.
 ```
 zhida-netconf discover --interface <iface> --aws -o dut.json      # EC2; no root
@@ -109,7 +109,7 @@ Pick one core for Zhida on the NIC's NUMA node, ideally isolated (`isolcpus=`), 
 busy-polls that core at 100%.
 
 ## 3. Building and running
-Docker: build the image on the DUT, from the repository root (native architecture; x86_64 and arm64 use
+Docker: build the image on the DUT, from the `conduit/` directory (native architecture; x86_64 and arm64 use
 the same Dockerfile):
 ```
 make docker-image DOCKER_IMAGE=zhida-dpdk-test:local
@@ -119,7 +119,7 @@ Run (the cargo volumes keep the build between runs; the first run compiles for a
 nic() {
   docker run --rm -it --privileged --network host --cpuset-cpus="${ZHIDA_CPU:-2}" \
     -v /dev/hugepages:/dev/hugepages -v /dev/vfio:/dev/vfio -v /lib/firmware:/lib/firmware:ro \
-    -v "$PWD:/work" -w /work \
+    -v "$PWD/..:/work" -w /work/conduit \
     -v zhida-cargo-registry:/usr/local/cargo/registry -v zhida-nic-target:/work/target \
     zhida-dpdk-test:local cargo run --locked --release -p nic-runner -- "$@"
 }
@@ -127,7 +127,7 @@ nic() {
 Native: install DPDK 25.11.3 under /opt/dpdk with the meson options in docker/Dockerfile, Rust 1.93,
 clang and lld, then use the Dockerfile's `PKG_CONFIG_PATH`, `LD_LIBRARY_PATH` and `RUSTFLAGS`, and
 `cargo build --locked --release -p nic-runner`; run the binary as
-`taskset -c <core> target/release/zhida-nic ...`.
+`taskset -c <core> ../target/release/zhida-nic ...`.
 
 Arguments: `zhida-nic --config FILE <MODE> [MODE OPTIONS]`. The config contains the network, device,
 offload and EAL settings. `open` chooses EAL's main lcore from the one CPU allowed by `taskset` or Docker's

@@ -9,6 +9,15 @@ DEFAULT_RATES = (10_000, 20_000, 40_000, 80_000, 120_000, 160_000, 200_000)
 DEFAULT_VARIANTS = ("mio", "tokio")
 DEFAULT_MAX_PENDING_BYTES = 64 * 1024 * 1024
 KNOWN_VARIANTS = frozenset(DEFAULT_VARIANTS)
+# Kioto's packages inside the repository-wide cargo workspace (Cargo.toml at the parent of repo_root).
+CARGO_PACKAGES = (
+    "bench-core",
+    "bench-sender-mio",
+    "bench-sender-tokio",
+    "bench-victim-mio",
+    "bench-victim-tokio",
+)
+CARGO_PACKAGE_ARGS = tuple(arg for package in CARGO_PACKAGES for arg in ("-p", package))
 
 
 @dataclass(frozen=True)
@@ -46,11 +55,15 @@ class SweepConfig:
     def profile_dir(self) -> str:
         return "release" if self.release else "debug"
 
+    @property
+    def workspace_root(self) -> Path:
+        return self.repo_root.parent
+
     def victim_bin(self, variant: str) -> Path:
-        return self.repo_root / "target" / self.profile_dir / f"bench-victim-{variant}"
+        return self.workspace_root / "target" / self.profile_dir / f"bench-victim-{variant}"
 
     def sender_bin(self, variant: str) -> Path:
-        return self.repo_root / "target" / self.profile_dir / f"bench-sender-{variant}"
+        return self.workspace_root / "target" / self.profile_dir / f"bench-sender-{variant}"
 
 
 @dataclass(frozen=True)

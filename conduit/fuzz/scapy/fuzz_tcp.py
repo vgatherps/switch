@@ -212,7 +212,7 @@ class Runner:
         previous = self.previous.plan if self.previous is not None else None
         # A probe has no --only of its own: the plan before it is what broke Zhida.
         target = plan if plan.index.isdigit() else previous
-        replay = f"target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed {self.args.seed}"
+        replay = f"../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed {self.args.seed}"
         replay += f" --only {target.index}" if target is not None and target.index.isdigit() \
             else f" --connections {self.args.connections}"
         with open(f"{base}.json", "w") as f:

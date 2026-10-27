@@ -35,7 +35,7 @@ expect 2 "PACKETDRILL_TIMEOUT (0) must be a positive number" \
     env ZHIDA_CPU="$c" PACKETDRILL_CPU="$p" PACKETDRILL_TIMEOUT=0 fuzz/packetdrill/run.sh "$script"
 # packetdrill left on tap-echo's CPU: the shim must refuse to run the script.
 expect 1 "not only CPU $p" env PACKETDRILL_CPU="$p" timeout --kill-after=5 60 \
-    taskset -c "$c" target/debug/tap-echo -- packetdrill \
+    taskset -c "$c" ../target/debug/tap-echo -- packetdrill \
     --so_filename=target/fuzz/zhida_shim.so --ip_version=ipv4 \
     --local_ip=192.0.2.2 --remote_ip=192.0.2.1 --bind_port=8080 "$script"
 exit "$wrong"

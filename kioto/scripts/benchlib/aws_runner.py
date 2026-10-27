@@ -65,7 +65,7 @@ def run_aws_basic_sweep(config: AwsBasicConfig) -> list[PointResult]:
 
 
 def upload_source_bundle(config: AwsBasicConfig, outputs: TerraformOutputs, aws: AwsCli) -> None:
-    bundle = create_source_bundle(config.repo_root, config.run_id)
+    bundle = create_source_bundle(config.repo_root.parent, config.run_id)
     try:
         aws.run(["s3", "cp", str(bundle), s3_uri(outputs.bucket, config.s3_prefix, "source.tar.gz")])
     finally:

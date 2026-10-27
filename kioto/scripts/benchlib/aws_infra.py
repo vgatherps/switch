@@ -17,6 +17,7 @@ from .aws_commands import (
     wait_ssm_command,
 )
 from .aws_models import RUN_ROOT, AwsBasicConfig, TerraformOutputs
+from .models import CARGO_PACKAGE_ARGS
 
 
 def terraform_apply(config: AwsBasicConfig, deadline: float) -> None:
@@ -118,8 +119,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 . "$HOME/.cargo/env" 2>/dev/null || true
 rustup toolchain install {config.rust_toolchain} --profile minimal
 rustup default {config.rust_toolchain}
+# The source root pins its own toolchain in rust-toolchain.toml; the sweep builds with the requested one.
+export RUSTUP_TOOLCHAIN={config.rust_toolchain}
 cd {RUN_ROOT}/source
-cargo build --release --workspace
+cargo build --release {" ".join(CARGO_PACKAGE_ARGS)}
 (
   echo "role={role}"
   echo "instance_id={instance_id}"
@@ -134,14 +137,14 @@ aws s3 cp {RUN_ROOT}/results/{role}_host.txt {s3_uri(bucket, config.s3_prefix, f
     wait_ssm_command(aws, command_id, instance_id, deadline)
 
 
-def create_source_bundle(repo_root: Path, run_id: str) -> Path:
+def create_source_bundle(workspace_root: Path, run_id: str) -> Path:
     temp_dir = Path(tempfile.mkdtemp(prefix=f"kioto-{run_id}-"))
     bundle = temp_dir / "source.tar.gz"
     excluded_roots = {".git", "target", "results", "plans", "__pycache__"}
 
     with tarfile.open(bundle, "w:gz") as tar:
-        for path in repo_root.rglob("*"):
-            rel = path.relative_to(repo_root)
+        for path in workspace_root.rglob("*"):
+            rel = path.relative_to(workspace_root)
             if should_exclude(rel, excluded_roots):
                 continue
             tar.add(path, arcname=rel)
@@ -152,7 +155,7 @@ def should_exclude(path: Path, excluded_roots: set[str]) -> bool:
     parts = path.parts
     if not parts:
         return False
-    if parts[0] in excluded_roots:
+    if any(part in excluded_roots for part in parts):
         return True
     if any(part in {"__pycache__", ".terraform"} for part in parts):
         return True

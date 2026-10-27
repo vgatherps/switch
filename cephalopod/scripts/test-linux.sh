@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Runs cargo in a Linux container. Args go to cargo; default is `test --workspace`.
+# Runs cargo in a Linux container. Args go to cargo; default is `test` over the cephalopod crates.
+# The repository root is mounted so cargo sees the root Cargo.toml, Cargo.lock and rust-toolchain.toml.
 # PLATFORM=linux/amd64 selects the x86_64 image (emulated on Apple silicon).
 set -euo pipefail
 
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$(dirname "$0")/../.." && pwd)"
 platform="${PLATFORM:-linux/arm64}"
 tag="${platform//\//-}"
 
-if [ $# -eq 0 ]; then set -- test --workspace; fi
+if [ $# -eq 0 ]; then set -- test -p ceph-rseq -p ceph-ring -p ceph-fifo -p ceph-proto -p ceph-control; fi
 
 exec docker run --rm --privileged --platform "$platform" \
     --shm-size=1g \
@@ -15,7 +16,7 @@ exec docker run --rm --privileged --platform "$platform" \
     -v "cephalopod-cargo-$tag":/usr/local/cargo/registry \
     -v "cephalopod-target-$tag":/w/target \
     -e CARGO_TARGET_DIR=/w/target \
-    -w /w/repo \
+    -w /w/repo/cephalopod \
     rust:1.93.0-bookworm bash -c '
         # One 2 MiB page per possible CPU plus the metadata page, released afterwards.
         pages=$(( $(sed "s/.*[-,]//" /sys/devices/system/cpu/possible) + 3 ))

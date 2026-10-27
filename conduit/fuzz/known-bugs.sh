@@ -24,7 +24,7 @@
 # KNOWN_BUGS_PKT_TIMEOUT, seconds per packetdrill script (run.sh's PACKETDRILL_TIMEOUT);
 # ZHIDA_CPU and PACKETDRILL_CPU, passed to run.sh. For the self-test: KNOWN_BUGS_PKT_DIR
 # replaces fuzz/packetdrill/known-bugs; CARGO, PACKETDRILL_RUN, PACKETDRILL_LOCKED and TAP_ECHO replace cargo,
-# fuzz/packetdrill/run.sh and target/debug/tap-echo.
+# fuzz/packetdrill/run.sh and ../target/debug/tap-echo.
 set -u
 set -f
 
@@ -36,7 +36,7 @@ pkt_dir=${KNOWN_BUGS_PKT_DIR:-fuzz/packetdrill/known-bugs}
 cargo=${CARGO:-cargo}
 packetdrill_run=${PACKETDRILL_RUN:-fuzz/packetdrill/run.sh}
 packetdrill_lock=${PACKETDRILL_LOCKED:-fuzz/packetdrill/locked.sh}
-tap_echo=${TAP_ECHO:-target/debug/tap-echo}
+tap_echo=${TAP_ECHO:-../target/debug/tap-echo}
 
 if ! [ -f "$manifest" ]; then
     echo "known-bugs: INFRA: no manifest $manifest" >&2

@@ -53,9 +53,11 @@ prints versions.
 
 ## Containers and CPUs
 
-Containers mount the project at /work. Registry downloads and Linux artifacts persist in the
+Containers mount the repository root (the cargo workspace root, holding Cargo.toml, Cargo.lock and
+rust-toolchain.toml) at /work and run in /work/conduit. Registry downloads and Linux artifacts persist in the
 zhida-cargo-registry and zhida-linux-target named volumes; the target volume hides macOS
-artifacts. Concurrent runs from separate worktrees need distinct targets, e.g.
+artifacts (it is mounted at /work/target, cargo's target dir, and at /work/conduit/target, where the
+gates' cwd-relative `target/` output goes). Concurrent runs from separate worktrees need distinct targets, e.g.
 `make DOCKER_TARGET_VOLUME=zhida-target-rxtx docker-test`.
 
 Tests use the real EAL/pool setup with no PCI or huge pages. Containers are not privileged and
@@ -361,7 +363,7 @@ fuzz/scapy`). `make docker-fuzz` (`make fuzz` natively) runs only the Scapy fuzz
 `DOCKER_CPUSET` CPU. Native `make test-scapy` needs python3-scapy.
 
 The two deterministic scenarios in `fuzz/scapy/r9.py`, R9a and R9b in its output, run as
-`target/debug/tap-echo --listeners 2 -- python3 fuzz/scapy/r9.py` inside the Linux container
+`../target/debug/tap-echo --listeners 2 -- python3 fuzz/scapy/r9.py` inside the Linux container
 (bound it with `timeout --kill-after=10 30`). R9a requires the live connection's challenge ACK
 and continued echo. R9b loses a SYN-ACK, frees the lower listener, and requires the original
 identical SYN-ACK before its retransmission timer, then one connection echoing with no extra
@@ -436,7 +438,7 @@ the previous connection, both directions) and `.json` (both plans), prints a rep
 exits 1 (tap-echo then exits 1). A replay repeats the plan, not the timing. Replay one
 connection (then the end probe) inside a container started with the Makefile's `DOCKER_RUN`
 flags, after `make fuzz` (or `cargo build --locked -p tap-echo`) built `tap-echo`:
-`target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed 1 --only 17`, or a whole
+`../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed 1 --only 17`, or a whole
 seed: `make docker-fuzz FUZZ_SEED=7` (`FUZZ_ONLY=17` there runs only that connection).
 
 ### memif (`make test-memif`)
@@ -466,7 +468,7 @@ fail it too (needs Linux `/proc`, awk, python3).
 features plus `medium-ip`, which gates smoltcp's TCP socket tests. The fork supports only
 Zhida's configuration (IPv4 TCP and UDP over Ethernet, with std); its only features are
 `udp-set`, `auto-icmp-echo-reply` and `medium-ip`. The crate is outside the workspace: it builds
-into `target/smoltcp` against its own `vendor/smoltcp/Cargo.lock` (`--locked`). Its
+into `../target/smoltcp` against its own `vendor/smoltcp/Cargo.lock` (`--locked`). Its
 dev-dependencies are downloaded from crates.io into the `zhida-cargo-registry` volume on the
 first run, so that run needs network.
 
@@ -698,7 +700,7 @@ certificate outside the webpki-roots set rejected as UnknownIssuer.
 A Linux machine runs the same targets without Docker. It needs what docker/Dockerfile installs:
 
 - Rust 1.93.0. `rust-toolchain.toml` at the repository root pins it for cargo commands in this
-  tree (`cargo +nightly` overrides it). The Dockerfile's `rust:1.93.0-bookworm` base image must
+  repository (`cargo +nightly` overrides it). The Dockerfile's `rust:1.93.0-bookworm` base image must
   name the same version; bump both together.
 - clang 18 and lld 18, `clang` and `ld.lld` on `PATH`, plus pkg-config, meson, ninja,
   python3-pyelftools, libnuma-dev, libpcap-dev, iproute2 and ethtool (Ubuntu 24.04 package

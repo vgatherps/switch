@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = [
+    # conduit
+    "conduit/crates/zhida-buffer",
+    "conduit/crates/zhida-dpdk-sys",
+    "conduit/crates/dpdk-smoltcp",
+    "conduit/crates/tap-echo",
+    "conduit/crates/ws-autobahn",
+    "conduit/crates/stack-stream",
+    "conduit/crates/memif-bench",
+    "conduit/crates/binance-feed",
+    "conduit/crates/nic-runner",
+    "conduit/crates/netconf",
+    "conduit/crates/netconf-open",
+    "conduit/crates/sockperf-wire",
+    "conduit/test-support",
+    "conduit/test-support/kit",
+    "conduit/test-support/macros",
+    # cephalopod
+    "cephalopod/crates/rseq",
+    "cephalopod/crates/ring",
+    "cephalopod/crates/fifo",
+    "cephalopod/crates/proto",
+    "cephalopod/crates/control",
+    # kioto
+    "kioto/crates/bench-core",
+    "kioto/crates/bench-sender-mio",
+    "kioto/crates/bench-sender-tokio",
+    "kioto/crates/bench-victim-mio",
+    "kioto/crates/bench-victim-tokio",
+]
+exclude = ["conduit/vendor/smoltcp"]
+
+[workspace.package]
+license = "GPL-3.0-only"
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+# cephalopod
+libc = "0.2"
+ceph-rseq = { path = "cephalopod/crates/rseq" }
+ceph-ring = { path = "cephalopod/crates/ring" }
+ceph-proto = { path = "cephalopod/crates/proto" }
+ceph-control = { path = "cephalopod/crates/control" }
+# kioto
+bench-core = { path = "kioto/crates/bench-core" }
+ctrlc = "3.4"
+mio = { version = "1.0", features = ["net", "os-poll"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", default-features = false, features = ["io-util", "macros", "net", "rt", "signal", "time"] }
+
+[workspace.lints.clippy]
+doc_lazy_continuation = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -60,7 +60,7 @@ run_info() {
     info_log=$log_dir/$kind-info.log
     rc=0
     timeout --kill-after=10 "$TEST_TIMEOUT" taskset -c "$cpu" \
-        target/debug/zhida-nic --config "$config" info >"$info_log" 2>&1 || rc=$?
+        ../target/debug/zhida-nic --config "$config" info >"$info_log" 2>&1 || rc=$?
     cat "$info_log"
     [ "$rc" -eq 0 ] || fail "$kind info exited $rc"
     for prefix in 'zhida-nic: driver: ' 'zhida-nic: link_status: up' 'zhida-nic: port_close: ok'; do
@@ -183,7 +183,7 @@ test_device() {
         config=$log_dir/tap.json
         write_config "$config" nic-tap net_tap0,iface=cdnic0 false
         run_info "$kind" "$config"
-        taskset -c "$cpu" target/debug/zhida-nic --config "$config" sockperf-server \
+        taskset -c "$cpu" ../target/debug/zhida-nic --config "$config" sockperf-server \
             --udp-ports 11111 --tcp-port 11112 --tcp-connections 2 --seconds 0 \
             >"$server_log" 2>&1 &
         server_pid=$!
@@ -210,7 +210,7 @@ test_device() {
         config=$log_dir/af-packet.json
         write_config "$config" nic-af-packet "$afp" true
         run_info "$kind" "$config"
-        taskset -c "$cpu" target/debug/zhida-nic --config "$config" sockperf-server \
+        taskset -c "$cpu" ../target/debug/zhida-nic --config "$config" sockperf-server \
             --udp-ports 11111 --tcp-port 11112 --tcp-connections 2 --seconds 0 \
             >"$server_log" 2>&1 &
         server_pid=$!
@@ -256,7 +256,7 @@ test_device() {
     if [ "$kind" = tap ]; then check_final no; else check_final yes; fi
     if [ "$kind" = tap ]; then
         server_log=$log_dir/$kind-udp-only-server.log
-        taskset -c "$cpu" target/debug/zhida-nic --config "$config" sockperf-server \
+        taskset -c "$cpu" ../target/debug/zhida-nic --config "$config" sockperf-server \
             --udp-ports 11111 --seconds 0 >"$server_log" 2>&1 &
         server_pid=$!
         wait_interface cdnic0
@@ -286,7 +286,7 @@ PY
         # A reply that reaches NeighborPending stays on its UDP socket while ARP is unresolved.
         # Once ARP resolves, the same pending reply is sent exactly once.
         server_log=$log_dir/$kind-udp-arp-server.log
-        taskset -c "$cpu" target/debug/zhida-nic --config "$config" sockperf-server \
+        taskset -c "$cpu" ../target/debug/zhida-nic --config "$config" sockperf-server \
             --udp-ports 11111 --seconds 0 --report-seconds 1 >"$server_log" 2>&1 &
         server_pid=$!
         wait_interface cdnic0

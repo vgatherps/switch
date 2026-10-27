@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .models import KNOWN_VARIANTS, PointResult, ProcessOutcome, SenderArtifact, SweepConfig
+from .models import CARGO_PACKAGE_ARGS, KNOWN_VARIANTS, PointResult, ProcessOutcome, SenderArtifact, SweepConfig
 
 
 PROBE_CONNECTIONS_PER_POINT = 1
@@ -22,7 +22,7 @@ def build_binaries(config: SweepConfig) -> None:
     if not config.build:
         return
 
-    cmd = ["cargo", "build", "--workspace"]
+    cmd = ["cargo", "build", *CARGO_PACKAGE_ARGS]
     if config.release:
         cmd.append("--release")
     subprocess.run(cmd, cwd=config.repo_root, check=True)

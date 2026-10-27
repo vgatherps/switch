@@ -28,10 +28,14 @@ TEST_TIMEOUT ?= 600
 DOCKER_CPUSET ?= 0
 TIMEOUT = timeout --kill-after=10 $(TEST_TIMEOUT)
 # Container flags other than the cpuset.
+# The repository root (the cargo workspace root) is mounted at /work and the container runs in
+# /work/conduit. The target volume is cargo's target dir (/work/target) and also the cwd-relative
+# target/ that the gates write (conduit/target: target/fuzz, target/memif-bench, ...).
 DOCKER_ACCESS = --cap-add NET_ADMIN --device /dev/net/tun \
-	-v "$(CURDIR):/work" -w /work \
+	-v "$(abspath $(CURDIR)/..):/work" -w /work/conduit \
 	-v zhida-cargo-registry:/usr/local/cargo/registry \
-	-v $(DOCKER_TARGET_VOLUME):/work/target
+	-v $(DOCKER_TARGET_VOLUME):/work/target \
+	-v $(DOCKER_TARGET_VOLUME):/work/conduit/target
 DOCKER_DPDK = --cpuset-cpus=$(DOCKER_CPUSET) $(DOCKER_ACCESS)
 # --init: tini is PID 1 and forwards signals. make as PID 1, sent SIGTERM mid-step,
 # reaps the step, then the kernel drops the default-action TERM it re-raises on
@@ -204,7 +208,7 @@ test-autobahn-check:
 # test: it exercises production ISNs, while socket unit tests keep their fixed ISN.
 SMOLTCP_TEST_FEATURES = udp-set,medium-ip,auto-icmp-echo-reply
 test-smoltcp:
-	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir target/smoltcp \
+	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
 		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES)
 
 # The packetdrill lock's self-test, then under that lock the packetdrill suite,
@@ -240,7 +244,7 @@ soak:
 
 memif-bench: doctor
 	cargo build --locked --release -p memif-bench
-	target/release/memif-bench matrix --peer-cpu $(MEMIF_PEER_CPU) \
+	../target/release/memif-bench matrix --peer-cpu $(MEMIF_PEER_CPU) \
 		--client-cpu $(MEMIF_CLIENT_CPU) --control-cpu $(MEMIF_CONTROL_CPU)
 
 # tap-echo and the packetdrill shim, the inputs of fuzz/packetdrill/run.sh.
@@ -253,13 +257,13 @@ packetdrill-build: doctor
 # The Scapy mutation fuzzer only; its unit tests run in make test.
 fuzz: doctor
 	cargo build --locked -p tap-echo
-	timeout --kill-after=10 $(FUZZ_TIMEOUT) target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py \
+	timeout --kill-after=10 $(FUZZ_TIMEOUT) ../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py \
 		--seed $(FUZZ_SEED) --connections $(FUZZ_CONNECTIONS) $(if $(FUZZ_ONLY),--only $(FUZZ_ONLY))
 
 # Native live feed; needs internet and the tester's network permissions.
 binance: doctor
 	cargo build --locked -p binance-feed
-	timeout --kill-after=10 $$(( $(BINANCE_SECONDS) + 60 )) target/debug/binance-feed \
+	timeout --kill-after=10 $$(( $(BINANCE_SECONDS) + 60 )) ../target/debug/binance-feed \
 		--host '$(BINANCE_HOST)' --port $(BINANCE_PORT) --path '$(BINANCE_PATH)' \
 		--print $(BINANCE_PRINT) -- crates/binance-feed/tester.sh $(BINANCE_SECONDS)
 
@@ -491,7 +495,7 @@ docker-autobahn: docker-autobahn-image
 		c=zhida-autobahn-c-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$c $(DOCKER_DPDK) -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
 			$(DOCKER_IMAGE) timeout --kill-after=10 $(AUTOBAHN_TIMEOUT) \
-			target/release/ws-autobahn $$mode "$$@" \
+			../target/release/ws-autobahn $$mode "$$@" \
 			-- autobahn/zhida-tester.sh $$mode >/dev/null || { remove 1; return 1; }; \
 		a=zhida-autobahn-a-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$a --network container:$$c --cpuset-cpus=$(AUTOBAHN_CPUSET) \
