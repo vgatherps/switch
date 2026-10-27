@@ -9,7 +9,7 @@ const REMOTE: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 const START: Instant = Instant::from_millis_const(100);
 
 fn socket() -> tcp::Socket<'static> {
-    let mut socket = tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+    let mut socket = tcp::Socket::test_socket(64, 64);
     socket.set_ack_delay(None);
     socket
 }

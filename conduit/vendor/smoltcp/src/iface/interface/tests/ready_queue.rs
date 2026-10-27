@@ -10,10 +10,7 @@ const REMOTE_HARDWARE: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 1]);
 const START: Instant = Instant::from_millis_const(100);
 
 fn connect(iface: &mut Interface, sockets: &mut TcpSet<'static>, port: u16) -> SocketHandle {
-    let mut socket = tcp::Socket::new(
-        tcp::RxBuffer::new(4096),
-        tcp::SocketBuffer::new(vec![0; 4096]),
-    );
+    let mut socket = tcp::Socket::test_socket(4096, 4096);
     socket.set_ack_delay(None);
     socket
         .connect(iface.context(), (REMOTE, 65000), (LOCAL, port))
@@ -1848,10 +1845,7 @@ fn parked_socket_allows_lone_socket_to_burst() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
     iface.poll(START, &mut device, &mut sockets);
     device.tx_queue.clear();
-    let parked = tcp::Socket::new(
-        tcp::RxBuffer::new(4096),
-        tcp::SocketBuffer::new(vec![0; 4096]),
-    );
+    let parked = tcp::Socket::test_socket(4096, 4096);
     let parked = sockets.add(parked);
     iface.inner.neighbor_cache.fill(
         REMOTE.into(),

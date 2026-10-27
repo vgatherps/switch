@@ -228,7 +228,7 @@ pub fn tcp_listen_drops_unspecified_src() {
 
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
 
-    let tcp_socket = tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+    let tcp_socket = tcp::Socket::test_socket(64, 64);
     let handle = sockets.add(tcp_socket);
     sockets.get_mut(handle).listen(1234).unwrap();
 

@@ -372,9 +372,10 @@ impl<'a> TcpSet<'a> {
         &mut self,
         config: &tcp::Config,
         ip_mtu: usize,
+        tx_source: crate::phy::TxSource,
         wake: super::DropQueue,
     ) -> SocketHandle {
-        let mut socket = tcp::Socket::from_config(config);
+        let mut socket = tcp::Socket::from_config(config, ip_mtu, tx_source);
         socket.set_rx_mbuf_budget(ip_mtu);
         let budget = socket.rx_frame_cap();
         let handle = self.add(socket);
@@ -1106,7 +1107,7 @@ mod tests {
     use alloc::vec;
 
     fn socket() -> tcp::Socket<'static> {
-        tcp::Socket::new(tcp::RxBuffer::new(0), tcp::SocketBuffer::new(vec![]))
+        tcp::Socket::test_socket(0, 0)
     }
 
     fn at(index: usize, generation: u64) -> SocketHandle {
@@ -1189,7 +1190,7 @@ mod tests {
             addrs.clear();
             addrs.push(IpCidr::new(remote, 24)).unwrap();
         });
-        let buffered = || tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+        let buffered = || tcp::Socket::test_socket(64, 64);
         let ah = a_set.add(buffered());
         let bh = b_set.add(buffered());
         a_set.get_mut(ah).set_ack_delay(None);
@@ -1256,7 +1257,7 @@ mod tests {
                 addrs.clear();
                 addrs.push(IpCidr::new(remote, 24)).unwrap();
             });
-            let buffered = || tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+            let buffered = || tcp::Socket::test_socket(64, 64);
             let ah = a_set.add(buffered());
             let bh = b_set.add(buffered());
             b_set.get_mut(bh).listen(80).unwrap();
@@ -1328,7 +1329,7 @@ mod tests {
                 addrs.clear();
                 addrs.push(IpCidr::new(remote, 24)).unwrap();
             });
-            let buffered = || tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+            let buffered = || tcp::Socket::test_socket(64, 64);
             let ah = a_set.add(buffered());
             let bh = b_set.add(buffered());
             b_set.get_mut(bh).listen(80).unwrap();
@@ -1396,8 +1397,7 @@ mod tests {
             addrs.clear();
             addrs.push(IpCidr::new(remote, 24)).unwrap();
         });
-        let buffered =
-            || tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+        let buffered = || tcp::Socket::test_socket(64, 64);
         let a_handle = a_set.add(buffered());
         let b_handle = b_set.add(buffered());
         b_set.get_mut(b_handle).listen(80).unwrap();
@@ -1489,10 +1489,11 @@ mod tests {
             );
         }
 
-        assert_eq!(size_of::<TcpStorage<'static>>(), 576);
+        // TxQueue makes the socket larger than the former borrowed byte ring.
+        assert_eq!(size_of::<TcpStorage<'static>>(), 640);
         assert_eq!(align_of::<TcpStorage<'static>>(), 64);
         assert_eq!(size_of::<Meta>(), 112);
-        assert_eq!(size_of::<tcp::Socket<'static>>(), 408);
+        assert_eq!(size_of::<tcp::Socket<'static>>(), 456);
         assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
@@ -1522,21 +1523,22 @@ mod tests {
             ("max_snd_wnd", 92),
             ("rx_fin_seq", 100),
             ("rx_seg_bytes", 132),
-            ("tx_buffer", 136),
-            ("rtte", 176),
-            ("congestion_controller", 200),
-            ("rx_buffer", 272),
-            ("ack_delay_us", 336),
-            ("retransmits", 344),
-            ("loss_events", 352),
-            ("initial_window", 360),
-            ("listen_endpoint", 368),
-            ("bytes_acked", 376),
-            ("rcv_mss", 384),
-            ("challenge_ack_timer", 392),
-            ("rx_refused_segments", 400),
-            ("mss_cap", 404),
-            ("reset_by_peer", 407),
+            ("tx_queue", 136),
+            ("tx_seg_bytes", 216),
+            ("rtte", 224),
+            ("congestion_controller", 248),
+            ("rx_buffer", 320),
+            ("ack_delay_us", 384),
+            ("retransmits", 392),
+            ("loss_events", 400),
+            ("initial_window", 408),
+            ("listen_endpoint", 416),
+            ("bytes_acked", 424),
+            ("rcv_mss", 432),
+            ("challenge_ack_timer", 440),
+            ("rx_refused_segments", 448),
+            ("mss_cap", 452),
+            ("reset_by_peer", 455),
         ];
         for (name, expected) in expected_offsets {
             let &(_, actual) = socket_offsets
@@ -1583,17 +1585,18 @@ mod tests {
             ("rto_backoff", 3),
             ("rx_mbuf_cap", 3),
             ("rx_seg_bytes", 3),
-            ("tx_buffer", 4),
-            ("rtte", 4),
+            ("tx_queue", 4),
+            ("tx_seg_bytes", 5),
+            ("rtte", 5),
             ("congestion_controller", 5),
             ("rx_buffer", 6),
             ("ack_delay_us", 7),
-            ("retransmits", 7),
-            ("loss_events", 7),
-            ("initial_window", 7),
-            ("listen_endpoint", 7),
-            ("bytes_acked", 7),
-            ("rcv_mss", 7),
+            ("retransmits", 8),
+            ("loss_events", 8),
+            ("initial_window", 8),
+            ("listen_endpoint", 8),
+            ("bytes_acked", 8),
+            ("rcv_mss", 8),
             ("challenge_ack_timer", 8),
             ("rx_refused_segments", 8),
             ("mss_cap", 8),
@@ -1682,8 +1685,7 @@ mod tests {
             addrs.clear();
             addrs.push(crate::wire::IpCidr::new(remote, 24)).unwrap();
         });
-        let buffered =
-            || tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+        let buffered = || tcp::Socket::test_socket(64, 64);
         let a_handle = a_set.add(buffered());
         let b_handle = b_set.add(buffered());
         b_set.get_mut(b_handle).listen(80).unwrap();
@@ -1760,6 +1762,7 @@ mod tests {
         let handle = set.add_admitted(
             &config,
             1500,
+            crate::tests::tx_test_source(1460),
             super::super::DropQueue::with_capacity(1, #[cfg(feature = "udp-set")] 0),
         );
         // Raising the cap after admission must not change the admitted frame count.

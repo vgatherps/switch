@@ -1,10 +1,63 @@
 #![cfg(feature = "medium-ip")]
 
 use smoltcp::iface::{Config, DropQueue, Interface, SocketHandle, TcpSet};
-use smoltcp::phy::{Device, Loopback, Medium, RxToken, TxToken};
+use smoltcp::phy::{Device, Loopback, Medium, RxToken, TxAlloc, TxBuf, TxBufOps, TxSource, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet, TcpControl, TcpPacket};
+use std::cell::Cell;
+use std::ptr::NonNull;
+use std::rc::Rc;
+
+struct TestAlloc;
+
+struct TestOwner {
+    bytes: Box<[u8]>,
+    references: Cell<usize>,
+}
+
+unsafe fn release(owner: NonNull<()>) {
+    // SAFETY: TestAlloc::alloc creates owner with Box::into_raw and each TxBuf owns one count.
+    let storage = unsafe { owner.cast::<TestOwner>().as_ref() };
+    let remaining = storage.references.get().checked_sub(1).expect("TX reference underflow");
+    storage.references.set(remaining);
+    if remaining == 0 {
+        // SAFETY: this is the last reference to the Box created by TestAlloc::alloc.
+        unsafe { drop(Box::from_raw(owner.cast::<TestOwner>().as_ptr())) };
+    }
+}
+
+unsafe fn share(owner: NonNull<()>) {
+    // SAFETY: owner stays live while a TxBuf reference exists.
+    let storage = unsafe { owner.cast::<TestOwner>().as_ref() };
+    storage.references.set(storage.references.get().checked_add(1).expect("TX reference overflow"));
+}
+
+unsafe fn unique(owner: NonNull<()>) -> bool {
+    // SAFETY: owner stays live while a TxBuf reference exists.
+    unsafe { owner.cast::<TestOwner>().as_ref() }.references.get() == 1
+}
+
+static TX_OPS: TxBufOps = TxBufOps { release, share, unique };
+
+impl TxAlloc for TestAlloc {
+    fn alloc(&self) -> Option<TxBuf> {
+        let mut owner = Box::new(TestOwner {
+            bytes: vec![0; 64 + 1460].into_boxed_slice(),
+            references: Cell::new(1),
+        });
+        let data = NonNull::new(owner.bytes.as_mut_ptr()).expect("test allocation is null");
+        // SAFETY: the allocation has 64 bytes of headroom and 1460 bytes of payload room.
+        let data = unsafe { data.add(64) };
+        let owner = NonNull::new(Box::into_raw(owner).cast::<()>()).expect("Box pointer is null");
+        // SAFETY: TestOwner owns the payload until TX_OPS releases its last reference.
+        Some(unsafe { TxBuf::from_raw_parts(owner, &TX_OPS, self.origin(), data, 1460) })
+    }
+
+    fn origin(&self) -> NonNull<()> {
+        NonNull::from(self).cast()
+    }
+}
 
 const LOCAL: Ipv4Address = Ipv4Address::new(192, 0, 2, 1);
 const REMOTE: Ipv4Address = Ipv4Address::new(192, 0, 2, 2);
@@ -21,7 +74,7 @@ fn interface(seed: u64) -> (Interface, Loopback) {
 fn add_socket(sockets: &mut TcpSet<'static>) -> SocketHandle {
     let config = tcp::Config { rx_capacity: 64, tx_capacity: 64, mss_cap: None };
     let wake = DropQueue::with_capacity(1, #[cfg(feature = "udp-set")] 0);
-    sockets.add_admitted(&config, 1500, wake)
+    sockets.add_admitted(&config, 1500, TxSource::new(Rc::new(TestAlloc)), wake)
 }
 
 fn take_syn(device: &mut Loopback) -> u32 {

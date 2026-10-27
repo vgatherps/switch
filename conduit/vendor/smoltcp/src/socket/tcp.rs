@@ -5,9 +5,8 @@
 use core::fmt::Display;
 use core::fmt;
 
-use crate::phy::{HeldFrames, PacketMeta, RxBuf};
+use crate::phy::{HeldFrames, PacketMeta, RxBuf, TxBuf, TxFrame, TxSource};
 use crate::socket::{Context, PollAt};
-use crate::storage::RingBuffer;
 use crate::time::{Duration, Instant};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
@@ -25,6 +24,7 @@ use congestion::cubic::Cubic;
 pub(crate) use rx_buffer::RxBuffer;
 pub use rx_buffer::TcpFrame;
 use rx_store::Decision;
+use tx_queue::{Seg, TxQueue};
 
 /// What a TCP socket is built from. Sockets exist only inside a [`crate::iface::TcpSet`], which
 /// builds them with [`crate::iface::TcpSet::add_admitted`]. `rx_capacity` and `mss_cap` decide the
@@ -34,7 +34,7 @@ pub struct Config {
     /// Receive byte capacity, at most 1 GiB: the largest window advertised. Received payload
     /// stays in RX frames; no byte ring is allocated.
     pub rx_capacity: usize,
-    /// Bytes of the transmit ring, which keeps unacknowledged data.
+    /// Queued and unacknowledged transmit bytes.
     pub tx_capacity: usize,
     /// Cap on the advertised MSS and outgoing segment payloads, never `Some(0)`. It also sets
     /// the per-frame bytes of the RX frame budget.
@@ -50,6 +50,14 @@ pub struct Config {
 pub fn rx_mbuf_budget(config: &Config, ip_mtu: usize) -> usize {
     assert!(config.mss_cap != Some(0), "MSS cap must not be zero");
     rx_mbuf_budget_for_payload(config.rx_capacity, rx_frame_bytes(ip_mtu, config.mss_cap))
+}
+
+/// TX mbufs kept by a socket built from `config`.
+///
+/// Panics if `ip_mtu` is below IPv4's minimum of 68 bytes or `mss_cap` is `Some(0)`.
+pub fn tx_mbuf_budget(config: &Config, ip_mtu: usize) -> usize {
+    assert!(config.mss_cap != Some(0), "MSS cap must not be zero");
+    rx_mbuf_budget_for_payload(config.tx_capacity, rx_frame_bytes(ip_mtu, config.mss_cap))
 }
 
 fn rx_frame_bytes(ip_mtu: usize, mss_cap: Option<u16>) -> usize {
@@ -108,7 +116,7 @@ impl Display for ConnectError {
 
 impl core::error::Error for ConnectError {}
 
-/// Error returned by [`Socket::send`]
+/// Error returned by [`Socket::send_slice`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
     InvalidState,
@@ -123,6 +131,30 @@ impl Display for SendError {
 }
 
 impl core::error::Error for SendError {}
+
+/// Error returned by [`Socket::send_frame`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SendFrameError {
+    InvalidState,
+    Foreign,
+    Empty,
+    Full,
+    PoolEmpty,
+}
+
+impl Display for SendFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SendFrameError::InvalidState => write!(f, "invalid state"),
+            SendFrameError::Foreign => write!(f, "frame belongs to another source"),
+            SendFrameError::Empty => write!(f, "frame is empty"),
+            SendFrameError::Full => write!(f, "send queue is full"),
+            SendFrameError::PoolEmpty => write!(f, "frame pool is empty"),
+        }
+    }
+}
+
+impl core::error::Error for SendFrameError {}
 
 /// Error returned by [`Socket::recv`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -141,9 +173,6 @@ impl Display for RecvError {
 }
 
 impl core::error::Error for RecvError {}
-
-/// A TCP socket ring buffer.
-pub type SocketBuffer<'a> = RingBuffer<'a, u8>;
 
 /// The state of a TCP socket, according to [RFC 793].
 ///
@@ -482,7 +511,7 @@ pub struct Socket<'a> {
     remote_seq_no: TcpSeqNumber,
     /// The next sequence number to send from the transmit buffer: the end of the
     /// last segment sent, rewound to local_seq_no by a retransmission timeout.
-    /// I.e. in an idle socket, local_seq_no+tx_buffer.len().
+    /// I.e. in an idle socket, local_seq_no+tx_queue.len().
     remote_last_seq: TcpSeqNumber,
     /// The highest sequence number sent: the end of the furthest segment sent,
     /// zero window probe byte included. A retransmission timeout leaves it.
@@ -530,7 +559,9 @@ pub struct Socket<'a> {
     /// Segment bytes follow our advertised MSS and the peer MSS.
     rx_mbuf_cap: u32,
     rx_seg_bytes: u32,
-    tx_buffer: SocketBuffer<'a>,
+    tx_queue: TxQueue,
+    tx_seg_bytes: u32,
+    lifetime: core::marker::PhantomData<&'a mut [u8]>,
     rtte: SmoothedRtt,
     /// The congestion control algorithm.
     congestion_controller: Cubic,
@@ -601,7 +632,8 @@ pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
         ("rto_backoff", offset_of!(Socket<'static>, rto_backoff)),
         ("rx_mbuf_cap", offset_of!(Socket<'static>, rx_mbuf_cap)),
         ("rx_seg_bytes", offset_of!(Socket<'static>, rx_seg_bytes)),
-        ("tx_buffer", offset_of!(Socket<'static>, tx_buffer)),
+        ("tx_queue", offset_of!(Socket<'static>, tx_queue)),
+        ("tx_seg_bytes", offset_of!(Socket<'static>, tx_seg_bytes)),
         ("rtte", offset_of!(Socket<'static>, rtte)),
         ("congestion_controller", offset_of!(Socket<'static>, congestion_controller)),
         ("rx_buffer", offset_of!(Socket<'static>, rx_buffer)),
@@ -635,12 +667,15 @@ impl<'a> Socket<'a> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers. Outside this crate sockets come only from
     /// [`crate::iface::TcpSet::add_admitted`].
-    pub(crate) fn new<T>(rx_buffer: RxBuffer, tx_buffer: T) -> Socket<'a>
-    where
-        T: Into<SocketBuffer<'a>>,
-    {
-        let tx_buffer = tx_buffer.into();
+    pub(crate) fn new(
+        rx_buffer: RxBuffer,
+        tx_capacity: usize,
+        tx_frame_cap: usize,
+        tx_source: TxSource,
+        tx_seg_bytes: usize,
+    ) -> Socket<'a> {
         let rx_capacity = rx_buffer.capacity;
+        let tx_queue = TxQueue::new(tx_capacity, tx_frame_cap, tx_source);
 
         // From RFC 1323:
         // [...] the above constraints imply that 2 * the max window size must be less
@@ -657,7 +692,9 @@ impl<'a> Socket<'a> {
             rtte: SmoothedRtt::default(),
             rto_us: DEFAULT_RTO.total_micros() as u32,
             rto_backoff: 0,
-            tx_buffer,
+            tx_queue,
+            tx_seg_bytes: u32::try_from(tx_seg_bytes).expect("TX segment bytes exceed u32"),
+            lifetime: core::marker::PhantomData,
             rx_buffer,
             rx_mbuf_cap: 0,
             rx_seg_bytes: 0,
@@ -710,13 +747,28 @@ impl<'a> Socket<'a> {
 
     /// Build a socket from `config`. Panics if `rx_capacity` exceeds 1 GiB or `mss_cap` is
     /// `Some(0)`.
-    pub(crate) fn from_config(config: &Config) -> Socket<'a> {
+    pub(crate) fn from_config(config: &Config, ip_mtu: usize, source: TxSource) -> Socket<'a> {
+        let tx_seg_bytes = rx_frame_bytes(ip_mtu, config.mss_cap);
         let mut socket = Socket::new(
             RxBuffer::new(config.rx_capacity),
-            SocketBuffer::new(alloc::vec![0; config.tx_capacity]),
+            config.tx_capacity,
+            tx_mbuf_budget(config, ip_mtu),
+            source,
+            tx_seg_bytes,
         );
         socket.set_mss_cap(config.mss_cap);
         socket
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_socket(rx_capacity: usize, tx_capacity: usize) -> Socket<'static> {
+        Socket::new(
+            RxBuffer::new(rx_capacity),
+            tx_capacity,
+            tx_capacity.max(6),
+            crate::tests::tx_test_source(1460),
+            1460,
+        )
     }
 
     fn local_rx_last_seq(&self) -> Option<TcpSeqNumber> {
@@ -1063,7 +1115,7 @@ impl<'a> Socket<'a> {
         self.timer = Timer::new();
         self.rtte = SmoothedRtt::default();
         self.rto_backoff = 0;
-        self.tx_buffer.clear();
+        self.tx_queue.clear();
         self.rx_refused_segments = 0;
         self.rx_fin_seq = None;
         self.listen_endpoint = IpListenEndpoint::default();
@@ -1138,31 +1190,6 @@ impl<'a> Socket<'a> {
     ///
     /// The local port must be provided explicitly. Assuming `fn get_ephemeral_port() -> u16`
     /// allocates a port between 49152 and 65535, a connection may be established as follows:
-    ///
-    /// ```no_run
-    /// # {
-    /// # use smoltcp::socket::tcp::{RxBuffer, Socket, SocketBuffer};
-    /// # use smoltcp::iface::Interface;
-    /// # use smoltcp::wire::IpAddress;
-    /// #
-    /// # fn get_ephemeral_port() -> u16 {
-    /// #     49152
-    /// # }
-    /// #
-    /// # let mut socket = Socket::new(
-    /// #     RxBuffer::new(1200),
-    /// #     SocketBuffer::new(vec![0; 1200])
-    /// # );
-    /// #
-    /// # let mut iface: Interface = todo!();
-    /// #
-    /// socket.connect(
-    ///     iface.context(),
-    ///     (IpAddress::v4(10, 0, 0, 1), 80),
-    ///     get_ephemeral_port()
-    /// ).unwrap();
-    /// # }
-    /// ```
     ///
     /// The local address may optionally be provided.
     ///
@@ -1410,8 +1437,12 @@ impl<'a> Socket<'a> {
         if !self.may_send() {
             return false;
         }
-
-        !self.tx_buffer.is_full()
+        let Some(mss) = self.max_segment_payload() else {
+            return false;
+        };
+        self.tx_queue.byte_room() != 0
+            && (self.tx_queue.frame_room() != 0
+                || self.tx_queue.tail_room(self.sent_payload_bytes(), mss) != 0)
     }
 
     /// Return the maximum number of bytes inside the recv buffer.
@@ -1440,7 +1471,7 @@ impl<'a> Socket<'a> {
     /// Return the maximum number of bytes inside the transmit buffer.
     #[inline]
     pub fn send_capacity(&self) -> usize {
-        self.tx_buffer.capacity()
+        self.tx_queue.byte_capacity()
     }
 
     /// Check whether the receive buffer is not empty.
@@ -1449,38 +1480,81 @@ impl<'a> Socket<'a> {
         self.rx_buffer.store.in_order_len() > 0
     }
 
-    fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
-    where
-        F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
-    {
-        if !self.may_send() {
-            return Err(SendError::InvalidState);
+    /// Return the current effective MSS after the peer is synchronized.
+    pub fn max_segment_payload(&self) -> Option<usize> {
+        if !matches!(self.state, State::Established | State::FinWait1 | State::FinWait2
+                     | State::CloseWait | State::Closing | State::LastAck | State::TimeWait)
+        {
+            return None;
         }
-
-        #[cfg(test)]
-        let old_length = self.tx_buffer.len();
-        let (size, result) = f(&mut self.tx_buffer);
-        if size > 0 {
-            #[cfg(test)]
-            tcp_trace!(
-                "tx buffer: enqueueing {} octets (now {})",
-                size,
-                old_length + size
-            );
-        }
-        Ok(result)
+        Some(
+            (self.tx_seg_bytes as usize)
+                .min(self.connection_mss_cap.map(core::num::NonZeroU16::get)
+                    .map_or(usize::MAX, usize::from))
+                .min(usize::from(self.remote_mss)),
+        )
     }
 
-    /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
-    /// and enqueue the amount of elements returned by `f`.
-    ///
-    /// This function returns `Err(SendError::InvalidState)` if the transmit half of
-    /// the connection is not open; see [may_send](#method.may_send).
-    pub fn send<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
-    where
-        F: FnOnce(&'b mut [u8]) -> (usize, R),
-    {
-        self.send_impl(|tx_buffer| tx_buffer.enqueue_many_with(f))
+    /// Return the largest frame that `send_frame` accepts now.
+    pub fn frame_send_room(&self) -> usize {
+        if !self.may_send() {
+            return 0;
+        }
+        let Some(mss) = self.max_segment_payload() else {
+            return 0;
+        };
+        self.tx_queue.byte_room().min(
+            self.tx_queue
+                .frame_room()
+                .checked_mul(mss)
+                .expect("TX frame room exceeds usize"),
+        )
+    }
+
+    /// Enqueue one owned frame.
+    pub fn send_frame(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
+        if frame.origin() != self.tx_queue.source().origin() {
+            return Err((frame, SendFrameError::Foreign));
+        }
+        if !self.may_send() {
+            return Err((frame, SendFrameError::InvalidState));
+        }
+        if frame.len() == 0 {
+            return Err((frame, SendFrameError::Empty));
+        }
+        let mss = self.max_segment_payload().expect("sendable TCP socket is not synchronized");
+        let frames = frame.len().div_ceil(mss);
+        if frame.len() > self.tx_queue.byte_room() || frames > self.tx_queue.frame_room() {
+            return Err((frame, SendFrameError::Full));
+        }
+        if frame.len() <= mss {
+            self.tx_queue.push(frame.into_buf());
+            return Ok(());
+        }
+
+        let unique = frame.unique();
+        let mut copies = alloc::vec::Vec::with_capacity(frames);
+        let first_copy = usize::from(unique);
+        for index in first_copy..frames {
+            let start = index.checked_mul(mss).expect("TX split offset exceeds usize");
+            let end = start.checked_add(mss).expect("TX split end exceeds usize").min(frame.len());
+            let Some(mut buf) = self.tx_queue.source().alloc() else {
+                return Err((frame, SendFrameError::PoolEmpty));
+            };
+            assert!(buf.capacity() >= end - start, "TX source buffer is smaller than its segment bound");
+            buf.room_mut()[..end - start].copy_from_slice(&frame.payload()[start..end]);
+            buf.set_len(end - start);
+            copies.push(buf);
+        }
+        if unique {
+            let mut first = frame.into_buf();
+            first.set_len(mss);
+            self.tx_queue.push(first);
+        }
+        for buf in copies {
+            self.tx_queue.push(buf);
+        }
+        Ok(())
     }
 
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
@@ -1488,12 +1562,26 @@ impl<'a> Socket<'a> {
     /// This function returns the amount of octets actually enqueued, which is limited
     /// by the amount of free space in the transmit buffer; down to zero.
     ///
-    /// See also [send](#method.send).
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
-        self.send_impl(|tx_buffer| {
-            let size = tx_buffer.enqueue_slice(data);
-            (size, size)
-        })
+        if !self.may_send() {
+            return Err(SendError::InvalidState);
+        }
+        let mss = self.max_segment_payload().expect("sendable TCP socket is not synchronized");
+        let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, mss);
+        while written < data.len() && self.tx_queue.byte_room() != 0 && self.tx_queue.frame_room() != 0 {
+            let Some(mut buf) = self.tx_queue.source().alloc() else {
+                break;
+            };
+            let count = (data.len() - written)
+                .min(mss)
+                .min(self.tx_queue.byte_room());
+            assert!(buf.capacity() >= count, "TX source buffer is smaller than its segment bound");
+            buf.room_mut()[..count].copy_from_slice(&data[written..written + count]);
+            buf.set_len(count);
+            self.tx_queue.push(buf);
+            written = written.checked_add(count).expect("TX write count exceeds usize");
+        }
+        Ok(written)
     }
 
     fn recv_error_check(&mut self) -> Result<(), RecvError> {
@@ -1552,7 +1640,11 @@ impl<'a> Socket<'a> {
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn send_queue(&self) -> usize {
-        self.tx_buffer.len()
+        self.tx_queue.len()
+    }
+
+    fn sent_payload_bytes(&self) -> usize {
+        self.remote_max_seq - self.local_seq_no
     }
 
     /// Number of octets transmitted but not yet ACKed.
@@ -2319,7 +2411,7 @@ impl<'a> Socket<'a> {
 
                 // We could've sent data before the FIN, so only remove FIN from the sequence
                 // space if all of that data is acknowledged.
-                if sent_fin && self.tx_buffer.len() + 1 == ack_len {
+                if sent_fin && self.tx_queue.len() + 1 == ack_len {
                     ack_len -= 1;
                     tcp_trace!("received ACK of FIN");
                     ack_of_fin = true;
@@ -2601,13 +2693,13 @@ impl<'a> Socket<'a> {
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
-            debug_assert!(self.tx_buffer.len() >= ack_len);
+            debug_assert!(self.tx_queue.len() >= ack_len);
             tcp_trace!(
                 "tx buffer: dequeueing {} octets (now {})",
                 ack_len,
-                self.tx_buffer.len() - ack_len
+                self.tx_queue.len() - ack_len
             );
-            self.tx_buffer.dequeue_allocated(ack_len);
+            self.tx_queue.ack(ack_len);
         }
 
         if !old_ack && let Some(ack_number) = repr.ack_number {
@@ -2722,7 +2814,7 @@ impl<'a> Socket<'a> {
 
         // start/stop the Zero Window Probe timer.
         if self.remote_win_len == 0
-            && !self.tx_buffer.is_empty()
+            && !self.tx_queue.is_empty()
             && (self.timer.is_idle() || ack_len > 0)
         {
             let delay = self.retransmission_timeout();
@@ -2851,7 +2943,7 @@ impl<'a> Socket<'a> {
 
         // max sequence number we can send.
         let max_send_seq =
-            self.local_seq_no + core::cmp::min(self.remote_win_len as usize, self.tx_buffer.len());
+            self.local_seq_no + core::cmp::min(self.remote_win_len as usize, self.tx_queue.len());
 
         // Max amount of octets we can send.
         let capped_send_seq = if max_send_seq >= self.remote_last_seq {
@@ -2878,7 +2970,7 @@ impl<'a> Socket<'a> {
         // 1. We have unsent data that fits in the remote window.
         // 2. We have no unsent data.
         // This condition matches only if #2, because #1 is already covered by can_data and we're ORing them.
-        let can_fin = want_fin && self.remote_last_seq == self.local_seq_no + self.tx_buffer.len();
+        let can_fin = want_fin && self.remote_last_seq == self.local_seq_no + self.tx_queue.len();
 
         can_send || can_fin
     }
@@ -2977,7 +3069,11 @@ impl<'a> Socket<'a> {
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut Context, PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(
+            &mut Context,
+            PacketMeta,
+            (IpRepr, TcpRepr<'_>, Option<TxBuf>),
+        ) -> (Result<(), E>, Option<TxBuf>),
     {
         if self.tuple.is_none() {
             return Ok(());
@@ -3006,7 +3102,7 @@ impl<'a> Socket<'a> {
             return Ok(());
         }
 
-        if self.remote_win_len == 0 && !self.tx_buffer.is_empty() && self.timer.is_idle() {
+        if self.remote_win_len == 0 && !self.tx_queue.is_empty() && self.timer.is_idle() {
             let delay = self.retransmission_timeout();
             tcp_trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(cx.now(), delay);
@@ -3058,7 +3154,7 @@ impl<'a> Socket<'a> {
             // Clear the expired retransmit timer. With a closed window, keep
             // probing so a lost window update cannot stall queued data.
             if matches!(self.timer, Timer::Retransmit { .. })
-                && self.remote_win_len == 0 && !self.tx_buffer.is_empty()
+                && self.remote_win_len == 0 && !self.tx_queue.is_empty()
             {
                 self.timer = Timer::ZeroWindowProbe {
                     expires_at: cx.now(),
@@ -3132,6 +3228,9 @@ impl<'a> Socket<'a> {
 
         let mut is_zero_window_probe = false;
         let mut is_fast_retransmit = false;
+        let mut payload_len = 0usize;
+        let mut whole_frame = None;
+        let mut coalesced_payload = alloc::vec::Vec::new();
 
         let packet_meta = PacketMeta::default();
 
@@ -3193,9 +3292,26 @@ impl<'a> Socket<'a> {
                 let effective_mss = self.effective_mss(cx);
 
                 let offset = if self.pending_fast_retransmit {
-                    let size = effective_mss.min(self.tx_buffer.len());
+                    let size = effective_mss.min(self.tx_queue.len());
                     repr.seq_number = self.local_seq_no;
-                    repr.payload = self.tx_buffer.get_allocated(0, size);
+                    if self.tx_queue.segment_spans_frames(0, size) {
+                        self.tx_queue.copy_segment(0, size, &mut coalesced_payload);
+                        repr.payload = &coalesced_payload;
+                        payload_len = size;
+                    } else {
+                        let whole_index = match self.tx_queue.segment(0, size) {
+                            Seg::Whole { index } => Some(index),
+                            _ => None,
+                        };
+                        if let Some(index) = whole_index {
+                            let frame = self.tx_queue.take(index);
+                            payload_len = frame.len();
+                            whole_frame = Some((index, frame));
+                        } else if let Seg::Cut(bytes) = self.tx_queue.segment(0, size) {
+                            repr.payload = bytes;
+                            payload_len = bytes.len();
+                        }
+                    }
 
                     is_fast_retransmit = true;
 
@@ -3242,19 +3358,48 @@ impl<'a> Socket<'a> {
                     };
 
                     let offset = self.flight_size();
-                    repr.payload = self.tx_buffer.get_allocated(offset, size);
+                    let segment_size = size.min(
+                        self.tx_queue
+                            .len()
+                            .checked_sub(offset)
+                            .unwrap_or(0),
+                    );
+                    let retransmitting = self.remote_last_seq < self.remote_max_seq;
+                    if retransmitting
+                        && self.tx_queue.segment_spans_frames(offset, segment_size)
+                    {
+                        self.tx_queue
+                            .copy_segment(offset, segment_size, &mut coalesced_payload);
+                        repr.payload = &coalesced_payload;
+                        payload_len = segment_size;
+                    } else {
+                        let whole_index = match self.tx_queue.segment(offset, segment_size) {
+                            Seg::Whole { index } => Some(index),
+                            _ => None,
+                        };
+                        if let Some(index) = whole_index {
+                            let frame = self.tx_queue.take(index);
+                            payload_len = frame.len();
+                            whole_frame = Some((index, frame));
+                        } else if let Seg::Cut(bytes) =
+                            self.tx_queue.segment(offset, segment_size)
+                        {
+                            repr.payload = bytes;
+                            payload_len = bytes.len();
+                        }
+                    }
 
                     offset
                 };
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
-                if offset + repr.payload.len() == self.tx_buffer.len() {
+                if offset + payload_len == self.tx_queue.len() {
                     match self.state {
                         State::FinWait1 | State::LastAck | State::Closing => {
                             repr.control = TcpControl::Fin
                         }
-                        State::Established | State::CloseWait if !repr.payload.is_empty() => {
+                        State::Established | State::CloseWait if payload_len != 0 => {
                             repr.control = TcpControl::Psh
                         }
                         _ => (),
@@ -3266,7 +3411,15 @@ impl<'a> Socket<'a> {
             State::FinWait2 | State::TimeWait => {}
         }
 
-        if !is_zero_window_probe && repr.is_empty() {
+        let external_payload_len = payload_len
+            .checked_sub(repr.payload.len())
+            .expect("inline TCP payload exceeds segment payload");
+        let segment_len = repr
+            .segment_len()
+            .checked_add(external_payload_len)
+            .expect("TCP segment length exceeds usize");
+
+        if !is_zero_window_probe && repr.is_empty() && external_payload_len == 0 {
             // A pure ACK or window update. A zero window probe with no byte to carry
             // keeps the send cursor's sequence number: past the closed window, it
             // draws an ACK from the remote.
@@ -3274,14 +3427,14 @@ impl<'a> Socket<'a> {
         }
 
         // Trace a summary of what will be sent.
-        if !repr.payload.is_empty() {
+        if payload_len != 0 {
             tcp_trace!(
                 "tx buffer: sending {} octets at offset {}",
-                repr.payload.len(),
+                payload_len,
                 self.flight_size()
             );
         }
-        if repr.control != TcpControl::None || repr.payload.is_empty() {
+        if repr.control != TcpControl::None || payload_len == 0 {
             let flags = match (repr.control, repr.ack_number) {
                 (TcpControl::Syn, None) => "SYN",
                 (TcpControl::Syn, Some(_)) => "SYN|ACK",
@@ -3299,7 +3452,7 @@ impl<'a> Socket<'a> {
             repr.max_seg_size = Some(self.local_mss(cx) as u16);
         }
         // Only segments without payload: data is sized to the MSS with no room for options.
-        if repr.payload.is_empty() && matches!(repr.control, TcpControl::None | TcpControl::Fin) {
+        if payload_len == 0 && matches!(repr.control, TcpControl::None | TcpControl::Fin) {
             repr.sack_ranges = self.sack_blocks(None);
         }
 
@@ -3310,12 +3463,27 @@ impl<'a> Socket<'a> {
         // Bailing out if the packet isn't placed in the device buffer allows us
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
-        ip_repr.set_payload_len(repr.buffer_len());
-        let result = emit(cx, packet_meta, (ip_repr, repr));
+        ip_repr.set_payload_len(
+            repr.buffer_len()
+                .checked_add(external_payload_len)
+                .expect("TCP packet length exceeds usize"),
+        );
+        let sent_seq = repr.seq_number;
+        let sent_ack = repr.ack_number;
+        let sent_control = repr.control;
+        let sent_window = repr.window_len;
+        let whole_index = whole_frame.as_ref().map(|(index, _)| *index);
+        let frame = whole_frame.map(|(_, frame)| frame);
+        let (result, returned) = emit(cx, packet_meta, (ip_repr, repr, frame));
+        if let Some(index) = whole_index {
+            self.tx_queue.put_back(index, returned.expect("TCP frame was not returned"));
+        } else {
+            assert!(returned.is_none(), "emit returned a frame for a copied segment");
+        }
         if self.orphaned && self.state == State::Closed {
             self.tuple = None;
         }
-        if result.is_err() && self.orphaned && repr.segment_len() > 0 {
+        if result.is_err() && self.orphaned && segment_len > 0 {
             let delay = self.retransmission_timeout();
             if is_zero_window_probe {
                 self.timer.set_for_zero_window_probe(cx.now(), delay);
@@ -3324,7 +3492,7 @@ impl<'a> Socket<'a> {
             }
         }
         result?;
-        if repr.segment_len() > 0 && repr.seq_number < self.remote_max_seq {
+        if segment_len > 0 && sent_seq < self.remote_max_seq {
             self.retransmits = self.retransmits.checked_add(1).expect("retransmit count overflow");
         }
 
@@ -3338,7 +3506,7 @@ impl<'a> Socket<'a> {
                 tcp_trace!("stop delayed ack timer (was force-expired)")
             }
         }
-        // Field writes, not set_ack_delay_timer: repr.payload still borrows tx_buffer.
+        // Field writes, not set_ack_delay_timer: repr.payload can still borrow tx_queue.
         self.ack_kind = AckKind::Idle;
         self.ack_at = Instant::ZERO;
 
@@ -3352,41 +3520,41 @@ impl<'a> Socket<'a> {
         // A pure ACK never ends past the highest sequence number sent.
         self.remote_max_seq = self
             .remote_max_seq
-            .max(repr.seq_number + repr.segment_len());
+            .max(sent_seq + segment_len);
 
         // We've sent a packet successfully, so we can update the internal state now.
-        self.remote_last_ack = repr.ack_number;
+        self.remote_last_ack = sent_ack;
         self.remote_last_ack_is_marker = false;
-        self.remote_last_win_bytes = if repr.control == TcpControl::Syn {
-            u32::from(repr.window_len)
+        self.remote_last_win_bytes = if sent_control == TcpControl::Syn {
+            u32::from(sent_window)
         } else {
-            u32::from(repr.window_len) << self.remote_win_shift
+            u32::from(sent_window) << self.remote_win_shift
         };
 
         // Leave the rest of the state intact if sending a zero-window probe.
         if is_zero_window_probe {
-            self.rtte.on_send(cx.now(), repr.seq_number + repr.segment_len());
+            self.rtte.on_send(cx.now(), sent_seq + segment_len);
             self.rtte.on_retransmit();
             let delay = self.retransmission_timeout();
             self.timer.set_for_zero_window_probe(cx.now(), delay);
             return Ok(());
         }
 
-        if repr.segment_len() > 0 {
+        if segment_len > 0 {
             // Use max() so a fast-retransmit segment (whose seq_number is local_seq_no,
             // well behind the current frontier) doesn't rewind the send cursor. A pure
             // ACK must not move it either: it carries the highest sequence number
             // sent, which is ahead of the cursor after a retransmission timeout.
             self.remote_last_seq = self
                 .remote_last_seq
-                .max(repr.seq_number + repr.segment_len());
+                .max(sent_seq + segment_len);
             self.rtte
-                .on_send(cx.now(), repr.seq_number + repr.segment_len());
+                .on_send(cx.now(), sent_seq + segment_len);
             self.congestion_controller
-                .post_transmit(cx.now(), repr.segment_len());
+                .post_transmit(cx.now(), segment_len);
         }
 
-        if repr.segment_len() > 0 && !self.timer.is_retransmit() {
+        if segment_len > 0 && !self.timer.is_retransmit() {
             // RFC 6298 (5.1) Every time a packet containing data is sent (including a
             // retransmission), if the timer is not running, start it running
             // so that it will expire after RTO seconds.
@@ -3414,7 +3582,7 @@ impl<'a> Socket<'a> {
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
             (PollAt::Ingress, usize::MAX)
-        } else if self.remote_win_len == 0 && !self.tx_buffer.is_empty() && self.timer.is_idle() {
+        } else if self.remote_win_len == 0 && !self.tx_queue.is_empty() && self.timer.is_idle() {
             // Dispatch must arm the first probe from the caller's current time.
             (PollAt::Now, usize::MAX)
         } else if self.state == State::Closed {
@@ -3525,7 +3693,8 @@ fn rtt_sampling_round_trips() {
 #[cfg(test)]
 #[test]
 fn socket_size_matches_main() {
-    let main_size = 408;
+    // TxQueue holds frame entries and their TxSource instead of a borrowed byte ring.
+    let main_size = 456;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
 }
@@ -3537,8 +3706,12 @@ fn socket_size_matches_main() {
 mod test {
     use super::*;
     use crate::config::IFACE_MAX_ADDR_COUNT;
+    use crate::phy::TxAlloc;
+    use crate::phy::test_owner::CountingAlloc;
     use crate::wire::{IpCidr, IpRepr, TcpTimestampRepr};
+    use std::cell::Cell;
     use std::ops::{Deref, DerefMut};
+    use std::rc::Rc;
     use std::vec::Vec;
 
     #[test]
@@ -3612,7 +3785,7 @@ mod test {
     #[test]
     fn from_config_matches_config_and_its_budget() {
         let config = Config { rx_capacity: 65536, tx_capacity: 1000, mss_cap: Some(100) };
-        let s = Socket::from_config(&config);
+        let s = Socket::from_config(&config, 1500, crate::tests::tx_test_source(1460));
         assert_eq!(s.recv_capacity(), 65536);
         assert_eq!(s.send_capacity(), 1000);
         assert_eq!(s.mss_cap, core::num::NonZeroU16::new(100));
@@ -3780,6 +3953,13 @@ mod test {
         }
     }
 
+    fn frame_payload<'b>(repr: TcpRepr<'b>, frame: &'b Option<TxBuf>) -> TcpRepr<'b> {
+        TcpRepr {
+            payload: frame.as_ref().map_or(repr.payload, TxBuf::payload),
+            ..repr
+        }
+    }
+
     #[track_caller]
     fn send(
         socket: &mut TestSocket,
@@ -3841,7 +4021,8 @@ mod test {
         let mut sent = 0;
         let result = socket
             .socket
-            .dispatch(&mut socket.cx, |_, _, (ip_repr, tcp_repr)| {
+            .dispatch(&mut socket.cx, |_, _, (ip_repr, tcp_repr, frame)| {
+                let tcp_repr = frame_payload(tcp_repr, &frame);
                 assert_eq!(ip_repr.next_header(), IpProtocol::Tcp);
                 assert_eq!(ip_repr.src_addr(), LOCAL_ADDR.into());
                 assert_eq!(ip_repr.dst_addr(), REMOTE_ADDR.into());
@@ -3849,7 +4030,7 @@ mod test {
 
                 net_trace!("recv: {}", tcp_repr);
                 sent += 1;
-                Ok(f(Ok(tcp_repr)))
+                (Ok(f(Ok(tcp_repr))), frame)
             });
         match result {
             Ok(()) => assert_eq!(sent, 1, "Exactly one packet should be sent"),
@@ -3862,9 +4043,9 @@ mod test {
         socket.cx.set_now(timestamp);
 
         let mut fail = false;
-        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _, _| {
+        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _, (_, _, frame)| {
             fail = true;
-            Ok(())
+            (Ok(()), frame)
         });
         if fail {
             panic!("Should not send a packet")
@@ -3962,9 +4143,7 @@ mod test {
     fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
         let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
 
-        let rx_buffer = RxBuffer::new(rx_len);
-        let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
-        let mut socket = Socket::new(rx_buffer, tx_buffer);
+        let mut socket = Socket::test_socket(rx_len, tx_len);
         socket.set_ack_delay(None);
         TestSocket {
             socket,
@@ -4864,11 +5043,12 @@ mod test {
         for &len in lengths {
             let mut emitted = false;
             s.socket
-                .dispatch(&mut s.cx, |_, _, (_, segment)| {
+                .dispatch(&mut s.cx, |_, _, (_, segment, frame)| {
+                    let segment = frame_payload(segment, &frame);
                     emitted = true;
                     assert_eq!(segment.seq_number, LOCAL_SEQ + 1 + offset);
                     assert_eq!(segment.payload, &[0xa5; 1024][..len]);
-                    Ok::<_, ()>(())
+                    (Ok::<_, ()>(()), frame)
                 })
                 .unwrap();
             assert!(emitted);
@@ -4878,11 +5058,12 @@ mod test {
         s.cx.set_now(Instant::from_millis(300));
         let mut emitted = false;
         s.socket
-            .dispatch(&mut s.cx, |_, _, (_, segment)| {
+            .dispatch(&mut s.cx, |_, _, (_, segment, frame)| {
+                let segment = frame_payload(segment, &frame);
                 emitted = true;
                 assert_eq!(segment.seq_number, LOCAL_SEQ + 1);
                 assert_eq!(segment.payload, &[0xa5; 512]);
-                Ok::<_, ()>(())
+                (Ok::<_, ()>(()), frame)
             })
             .unwrap();
         assert!(emitted);
@@ -5169,6 +5350,7 @@ mod test {
         let handle = set.add_admitted(
             &Config { rx_capacity: 64, tx_capacity: 64, mss_cap: None },
             1500,
+            crate::tests::tx_test_source(1460),
             queue.clone(),
         );
         let shared = set.get(handle).rx_buffer.shared.clone();
@@ -5181,7 +5363,7 @@ mod test {
     #[cfg(feature = "udp-set")]
     fn remove_clears_frame_drop_wake() {
         let mut set = crate::iface::TcpSet::new(vec![]);
-        let placeholder = set.add(Socket::new(RxBuffer::new(64), SocketBuffer::new(vec![0; 64])));
+        let placeholder = set.add(Socket::test_socket(64, 64));
         let queue = crate::iface::DropQueue::with_capacity(2, 0);
         let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
         let handle = set.add(s.socket);
@@ -5196,7 +5378,7 @@ mod test {
     #[cfg(feature = "udp-set")]
     fn frame_drop_wakes_socket_only_when_window_update_becomes_due() {
         let mut set = crate::iface::TcpSet::new(vec![]);
-        let handle = set.add(Socket::new(RxBuffer::new(64), SocketBuffer::new(vec![0; 64])));
+        let handle = set.add(Socket::test_socket(64, 64));
         let queue = crate::iface::DropQueue::with_capacity(1, 0);
 
         let (mut s, mut frames, _) = zero_window_with_wake(&queue, handle);
@@ -5679,6 +5861,437 @@ mod test {
         socket_established_with_buffer_sizes(64, 64)
     }
 
+    struct LimitedTxAlloc {
+        inner: Rc<CountingAlloc>,
+        remaining: Cell<usize>,
+    }
+
+    impl TxAlloc for LimitedTxAlloc {
+        fn alloc(&self) -> Option<TxBuf> {
+            let remaining = self.remaining.get().checked_sub(1)?;
+            self.remaining.set(remaining);
+            self.inner.alloc()
+        }
+
+        fn origin(&self) -> core::ptr::NonNull<()> {
+            self.inner.origin()
+        }
+    }
+
+    fn limited_source(room: usize, allocations: usize) -> TxSource {
+        TxSource::new(Rc::new(LimitedTxAlloc {
+            inner: CountingAlloc::new(room),
+            remaining: Cell::new(allocations),
+        }))
+    }
+
+    fn frame_socket(
+        byte_cap: usize,
+        frame_cap: usize,
+        mss: usize,
+        source: TxSource,
+    ) -> TestSocket {
+        let mut s = socket_established();
+        s.tx_queue = TxQueue::new(byte_cap, frame_cap, source);
+        s.tx_seg_bytes = u32::try_from(mss).unwrap();
+        s.remote_mss = u16::try_from(mss).unwrap();
+        s
+    }
+
+    fn owned_frame(source: &TxSource, bytes: &[u8]) -> TxFrame {
+        let mut frame = TxFrame::new(source.alloc().expect("test TX source is empty"));
+        frame.room_mut()[..bytes.len()].copy_from_slice(bytes);
+        frame.set_len(bytes.len());
+        frame
+    }
+
+    #[test]
+    fn frame_send_frame_foreign() {
+        let source = crate::tests::tx_test_source(8);
+        let foreign = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source);
+        let frame = owned_frame(&foreign, b"a");
+        let (returned, error) = s.send_frame(frame).unwrap_err();
+        assert_eq!(error, SendFrameError::Foreign);
+        assert_eq!(returned.payload(), b"a");
+    }
+
+    #[test]
+    fn frame_send_frame_invalid_state_after_close() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        s.close();
+        let (returned, error) = s.send_frame(owned_frame(&source, b"a")).unwrap_err();
+        assert_eq!(error, SendFrameError::InvalidState);
+        assert_eq!(returned.payload(), b"a");
+    }
+
+    #[test]
+    fn frame_send_frame_empty() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        let (returned, error) = s.send_frame(owned_frame(&source, b"")).unwrap_err();
+        assert_eq!(error, SendFrameError::Empty);
+        assert_eq!(returned.len(), 0);
+    }
+
+    #[test]
+    fn frame_send_frame_full_bytes() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(3, 2, 4, source.clone());
+        let (returned, error) = s.send_frame(owned_frame(&source, b"abcd")).unwrap_err();
+        assert_eq!(error, SendFrameError::Full);
+        assert_eq!(returned.payload(), b"abcd");
+    }
+
+    #[test]
+    fn frame_send_frame_full_slots() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 1, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        let (returned, error) = s.send_frame(owned_frame(&source, b"b")).unwrap_err();
+        assert_eq!(error, SendFrameError::Full);
+        assert_eq!(returned.payload(), b"b");
+    }
+
+    #[test]
+    fn frame_send_frame_splits_with_copy() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 2));
+        assert_eq!(match s.tx_queue.segment(4, 4) { Seg::Whole { index } => s.tx_queue.take(index).payload().to_vec(), _ => panic!("missing split frame") }, b"ef");
+    }
+
+    #[test]
+    fn frame_split_pool_empty_returns_frame() {
+        let source = limited_source(8, 1);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        let frame = owned_frame(&source, b"abcdef");
+        let (returned, error) = s.send_frame(frame).unwrap_err();
+        assert_eq!(error, SendFrameError::PoolEmpty);
+        assert_eq!(returned.payload(), b"abcdef");
+        assert_eq!(s.send_queue(), 0);
+    }
+
+    #[test]
+    fn frame_send_slice_caps_at_bytes_and_slots() {
+        let source = crate::tests::tx_test_source(4);
+        let mut s = frame_socket(7, 2, 4, source);
+        assert_eq!(s.send_slice(b"abcdefghi"), Ok(7));
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (7, 2));
+    }
+
+    #[test]
+    fn frame_send_slice_appends_to_unsent_unique_tail_only() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source);
+        assert_eq!(s.send_slice(b"ab"), Ok(2));
+        assert_eq!(s.send_slice(b"cd"), Ok(2));
+        assert_eq!(s.tx_queue.frames(), 1);
+        assert_eq!(match s.tx_queue.segment(0, 4) { Seg::Whole { index } => s.tx_queue.take(index).payload().to_vec(), _ => panic!("missing tail frame") }, b"abcd");
+    }
+
+    #[test]
+    fn frame_send_slice_never_appends_to_shared_tail() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source);
+        assert_eq!(s.send_slice(b"ab"), Ok(2));
+        let frame = s.tx_queue.take(0);
+        let shared = frame.clone();
+        s.tx_queue.put_back(0, frame);
+        assert_eq!(s.send_slice(b"cd"), Ok(2));
+        assert_eq!(s.tx_queue.frames(), 2);
+        drop(shared);
+    }
+
+    #[test]
+    fn frame_can_send_false_when_slots_full() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 1, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        assert!(!s.can_send());
+        assert_eq!(s.frame_send_room(), 0);
+    }
+
+    #[test]
+    fn frame_tx_capacity_zero_sends_nothing() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(0, 6, 4, source.clone());
+        assert_eq!(s.send_capacity(), 0);
+        assert_eq!(s.send_slice(b"a"), Ok(0));
+        assert_eq!(s.send_frame(owned_frame(&source, b"a")).unwrap_err().1, SendFrameError::Full);
+    }
+
+    #[test]
+    fn frame_send_frame_shared_longer_than_mss_copies_whole_and_drops_clone() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        let frame = owned_frame(&source, b"abcdef");
+        let clone = frame.clone();
+        assert!(s.send_frame(clone).is_ok());
+        assert_eq!(frame.payload(), b"abcdef");
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 2));
+    }
+
+    fn emit_frame_segment(s: &mut TestSocket) -> (TcpControl, TcpSeqNumber, Vec<u8>, bool) {
+        let mut emitted = None;
+        s.socket
+            .dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let payload = frame.as_ref().map_or(repr.payload, TxBuf::payload).to_vec();
+                emitted = Some((repr.control, repr.seq_number, payload, frame.is_some()));
+                (Ok::<_, ()>(()), frame)
+            })
+            .unwrap();
+        emitted.expect("missing TCP segment")
+    }
+
+    fn ack_frame_bytes(mut s: &mut TestSocket, count: usize) {
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + count),
+            ..SEND_TEMPL
+        });
+    }
+
+    #[test]
+    fn frame_pure_ack_with_empty_queue() {
+        let mut s = socket_established();
+        s.remote_last_ack = Some(REMOTE_SEQ);
+        s.set_ack_delay_timer(AckDelayTimer::Immediate);
+        let (control, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(control, TcpControl::None);
+        assert!(payload.is_empty());
+        assert!(!whole);
+    }
+
+    #[test]
+    fn frame_lone_fin_after_all_data_sent() {
+        let mut s = socket_fin_wait_1();
+        let (control, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(control, TcpControl::Fin);
+        assert!(payload.is_empty());
+        assert!(!whole);
+    }
+
+    #[test]
+    fn frame_ack_after_fin_in_flight() {
+        let mut s = socket_fin_wait_1();
+        let _ = emit_frame_segment(&mut s);
+        s.remote_last_ack = Some(REMOTE_SEQ);
+        s.set_ack_delay_timer(AckDelayTimer::Immediate);
+        let (control, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(control, TcpControl::None);
+        assert!(payload.is_empty());
+        assert!(!whole);
+    }
+
+    #[test]
+    fn frame_fin_rides_last_whole_frame() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        s.close();
+        let (control, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!((control, payload, whole), (TcpControl::Fin, b"abcd".to_vec(), true));
+    }
+
+    #[test]
+    fn frame_zero_window_probe_cuts_one_byte() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        s.remote_win_len = 0;
+        s.timer = Timer::ZeroWindowProbe {
+            expires_at: Instant::ZERO,
+            backoff_applied: true,
+        };
+        let (_, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(payload, b"a");
+        assert!(!whole);
+    }
+
+    #[test]
+    fn frame_window_smaller_than_frame_cuts_then_rest() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        s.remote_win_len = 2;
+        assert_eq!(emit_frame_segment(&mut s).2, b"ab");
+        ack_frame_bytes(&mut s, 2);
+        s.remote_win_len = 4;
+        assert_eq!(emit_frame_segment(&mut s).2, b"cd");
+    }
+
+    #[test]
+    fn frame_window_reopens_across_frames() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
+        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
+        s.remote_win_len = 2;
+        assert_eq!(emit_frame_segment(&mut s).2, b"ab");
+        ack_frame_bytes(&mut s, 2);
+        s.remote_win_len = 4;
+        let (_, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(payload, b"cd");
+        assert!(whole);
+    }
+
+    #[test]
+    fn frame_cwnd_limited_cut_then_whole() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
+        assert!(s.send_frame(owned_frame(&source, b"cdef")).is_ok());
+        s.remote_win_len = 1;
+        assert_eq!(emit_frame_segment(&mut s).2, b"a");
+        ack_frame_bytes(&mut s, 1);
+        s.remote_win_len = 8;
+        assert_eq!(emit_frame_segment(&mut s).2, b"b");
+        ack_frame_bytes(&mut s, 2);
+        let (_, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(payload, b"cdef");
+        assert!(whole);
+    }
+
+    #[test]
+    fn frame_partly_acked_frame_retransmits_tail_copy() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        let _ = emit_frame_segment(&mut s);
+        ack_frame_bytes(&mut s, 2);
+        s.pending_fast_retransmit = true;
+        let (_, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(payload, b"cd");
+        assert!(!whole);
+    }
+
+    #[test]
+    fn frame_rto_resends_whole_frame() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        assert!(emit_frame_segment(&mut s).3);
+        s.cx.set_now(Instant::from_millis(300));
+        let (_, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!(payload, b"abcd");
+        assert!(whole);
+    }
+
+    #[test]
+    fn frame_fast_retransmit_head_frame() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        let _ = emit_frame_segment(&mut s);
+        s.pending_fast_retransmit = true;
+        let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!((seq, payload), (LOCAL_SEQ + 1, b"abcd".to_vec()));
+        assert!(whole);
+    }
+
+    #[test]
+    fn frame_two_writes_rto_resend_as_two_segments() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
+        let _ = emit_frame_segment(&mut s);
+        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
+        let _ = emit_frame_segment(&mut s);
+        s.cx.set_now(Instant::from_millis(300));
+        let (control, _, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!((control, payload), (TcpControl::Psh, b"abcd".to_vec()));
+        assert!(!whole);
+    }
+
+    #[test]
+    fn frame_emit_error_returns_frame_to_entry() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        assert_eq!(
+            s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame)),
+            Err(())
+        );
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (4, 1));
+        assert_eq!(emit_frame_segment(&mut s).2, b"abcd");
+    }
+
+    #[test]
+    fn frame_seq_wrap_across_frames() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 2, source.clone());
+        let start = TcpSeqNumber(i32::MAX - 1);
+        s.local_seq_no = start;
+        s.remote_last_seq = start;
+        s.remote_max_seq = start;
+        assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
+        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
+        assert_eq!(emit_frame_segment(&mut s).1, start);
+        assert_eq!(emit_frame_segment(&mut s).1, start + 2);
+    }
+
+    #[test]
+    fn frame_reset_releases_queue() {
+        let alloc = CountingAlloc::new(8);
+        let source = TxSource::new(alloc.clone());
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        assert_eq!(alloc.live(), 1);
+        s.reset();
+        assert_eq!((s.send_queue(), alloc.live()), (0, 0));
+    }
+
+    #[test]
+    fn frame_peer_rst_keeps_frames_until_reuse() {
+        let alloc = CountingAlloc::new(8);
+        let source = TxSource::new(alloc.clone());
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        send!(s, TcpRepr {
+            control: TcpControl::Rst,
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: None,
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!((s.send_queue(), alloc.live()), (4, 1));
+        s.reset();
+        assert_eq!((s.send_queue(), alloc.live()), (0, 0));
+    }
+
+    #[test]
+    fn frame_orphan_with_unread_data_keeps_frames() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(8, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: b"x",
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.recv_queue(), 1);
+        s.orphan(Instant::ZERO);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.send_queue(), 4);
+    }
+
+    #[test]
+    fn frame_orphan_syn_sent_releases() {
+        let alloc = CountingAlloc::new(8);
+        let source = TxSource::new(alloc.clone());
+        let mut s = socket_syn_sent();
+        s.tx_queue = TxQueue::new(8, 2, source);
+        s.tx_queue.push_bytes(b"abcd");
+        assert_eq!(alloc.live(), 1);
+        s.orphan(Instant::ZERO);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!((s.send_queue(), alloc.live()), (0, 0));
+    }
+
     fn socket_fin_wait_1() -> TestSocket {
         let mut s = socket_established();
         s.state = State::FinWait1;
@@ -5761,9 +6374,10 @@ mod test {
         let mut now = Instant::ZERO;
         for expiry in 0..=ORPHAN_RETRIES {
             s.cx.set_now(now);
-            let result = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            let result = s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let repr = frame_payload(repr, &frame);
                 assert!(repr.segment_len() > 0);
-                Err::<(), _>(())
+                (Err::<(), _>(()), frame)
             });
             if probe && expiry == 0 {
                 assert_eq!(result, Ok(()));
@@ -5785,7 +6399,7 @@ mod test {
             assert!(now > s.cx.now(), "failed emit did not re-arm the orphan timer");
         }
         s.cx.set_now(now);
-        let result = s.socket.dispatch(&mut s.cx, |_, _, _| Err::<(), _>(()));
+        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame));
         if orphaned {
             assert_eq!(result, Ok(()));
             assert_eq!(s.state(), State::Closed);
@@ -5820,9 +6434,9 @@ mod test {
         for expiry in 1..=ORPHAN_RETRIES {
             let Timer::Retransmit { expires_at } = s.timer else { panic!("expected RTO") };
             s.cx.set_now(expires_at);
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 assert_eq!(repr.control, TcpControl::Fin);
-                Err::<(), _>(())
+                (Err::<(), _>(()), frame)
             }), Err(()));
             assert_eq!(s.rto_backoff, expiry);
             assert_eq!(s.state(), State::FinWait1);
@@ -5858,9 +6472,10 @@ mod test {
         let Timer::ZeroWindowProbe { expires_at, .. } = s.timer else { panic!("expected probe timer") };
         for retry in 0..10 {
             s.cx.set_now(expires_at + Duration::from_secs(retry));
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.payload, b"a");
-                Err::<(), _>(())
+                (Err::<(), _>(()), frame)
             }), Err(()));
             assert_eq!(s.rto_backoff, 1);
             assert_eq!(s.timer, Timer::ZeroWindowProbe { expires_at, backoff_applied: true });
@@ -6046,10 +6661,10 @@ mod test {
                 s.abort();
             }
             let mut attempts = 0;
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 attempts += 1;
                 assert_eq!(repr.control, TcpControl::Rst);
-                Err(())
+                (Err(()), frame)
             }), Err(()));
             assert_eq!(attempts, 1);
             assert_eq!(s.state(), State::Closed);
@@ -6097,13 +6712,13 @@ mod test {
         drop(held);
         assert!(s.window_to_update());
         s.orphan(Instant::ZERO);
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Err::<(), _>(())), Err(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Err(()));
         assert!(s.window_to_update());
         s.cx.set_now(Instant::from_millis(60_001));
         let mut attempts = 0;
-        let result = s.socket.dispatch(&mut s.cx, |_, _, _| {
+        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| {
             attempts += 1;
-            Err(())
+            (Err(()), frame)
         });
         assert_eq!(attempts, 0, "expired close timer must not emit a window update");
         assert_eq!(result, Ok(()));
@@ -6457,7 +7072,7 @@ mod test {
                 match case {
                     "quiet" => {}
                     "data" | "window full" => {
-                        assert_eq!(s.tx_buffer.enqueue_slice(b"abcdef"), 6);
+                        s.tx_queue.push_bytes(b"abcdef");
                         s.remote_last_seq = s.local_seq_no;
                         s.remote_win_len = 64;
                         expected = PollAt::Now;
@@ -6476,7 +7091,7 @@ mod test {
                         expected = PollAt::Now;
                     }
                     "zero window, data queued, timer idle" => {
-                        assert_eq!(s.tx_buffer.enqueue_slice(b"abcdef"), 6);
+                        s.tx_queue.push_bytes(b"abcdef");
                         s.remote_win_len = 0;
                         s.timer = Timer::Idle;
                         expected = PollAt::Now;
@@ -6526,7 +7141,7 @@ mod test {
                 let mut s = make();
                 s.remote_last_ack = Some(s.remote_seq_no);
                 s.remote_last_win_bytes = 64;
-                assert_eq!(s.tx_buffer.enqueue_slice(b"abcdef"), 6);
+                s.tx_queue.push_bytes(b"abcdef");
                 s.remote_last_seq = s.local_seq_no + 3;
                 s.remote_win_len = 64;
                 s.congestion_controller.set_mss(3);
@@ -7051,9 +7666,9 @@ mod test {
         });
         assert!(!s.timer.is_retransmit());
         s.cx.set_now(Instant::from_millis(200));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
             assert_eq!(repr, syn_ack);
-            Err(())
+            (Err(()), frame)
         }), Err(()));
         assert!(!s.timer.is_retransmit());
         recv!(s, time 300, [syn_ack]);
@@ -7456,7 +8071,7 @@ mod test {
         assert_eq!(s.state, State::Established);
         assert_eq!(s.remote_win_len as usize, WINDOW);
         assert_eq!(s.max_snd_wnd as usize, WINDOW);
-        assert_eq!(s.send(|buffer| (buffer.len(), buffer.len())), Ok(WINDOW + 1));
+        assert_eq!(s.send_slice(&vec![0; WINDOW + 1]), Ok(WINDOW + 1));
         let mut sent = 0;
         while sent < WINDOW {
             recv(&mut s, Instant::ZERO, |result| {
@@ -7508,11 +8123,12 @@ mod test {
             loop {
                 let mut len = 0;
                 s.socket
-                    .dispatch(&mut s.cx, |_, _, (_, repr)| {
+                    .dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                        let repr = frame_payload(repr, &frame);
                         assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + sent);
                         len = repr.payload.len();
                         assert_eq!(len, (expected - sent).min(BASE_MSS as usize));
-                        Ok::<(), ()>(())
+                        (Ok::<(), ()>(()), frame)
                     })
                     .unwrap();
                 if len == 0 {
@@ -7664,9 +8280,10 @@ mod test {
         loop {
             let mut len = 0;
             s.socket
-                .dispatch(&mut s.cx, |_, _, (_, repr)| {
+                .dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                    let repr = frame_payload(repr, &frame);
                     len = repr.payload.len();
-                    Ok::<(), ()>(())
+                    (Ok::<(), ()>(()), frame)
                 })
                 .unwrap();
             if len == 0 {
@@ -10831,7 +11448,7 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.tx_buffer.len(), 6);
+        assert_eq!(s.send_queue(), 6);
         send!(
             s,
             TcpRepr {
@@ -10840,7 +11457,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.tx_buffer.len(), 0);
+        assert_eq!(s.send_queue(), 0);
         // Second roundtrip.
         s.send_slice(b"foobar").unwrap();
         recv!(
@@ -10860,7 +11477,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.tx_buffer.len(), 0);
+        assert_eq!(s.send_queue(), 0);
     }
 
     #[test]
@@ -10924,7 +11541,7 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.tx_buffer.len(), 6);
+        assert_eq!(s.send_queue(), 6);
 
         println!(
             "local_seq_no={} remote_win_len={} remote_last_seq={}",
@@ -10945,7 +11562,7 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.tx_buffer.len(), 6);
+        assert_eq!(s.send_queue(), 6);
 
         println!(
             "local_seq_no={} remote_win_len={} remote_last_seq={}",
@@ -13173,7 +13790,17 @@ mod test {
         assert_eq!(s.remote_win_len, 1);
         assert_eq!((s.recv_queue(), s.send_queue()), (2, 2));
         assert_eq!(s.recv().unwrap().unwrap().payload(), b"rx");
-        assert_eq!(s.tx_buffer.get_allocated(0, 2), b"tx");
+        let tx = match s.tx_queue.segment(0, 2) {
+            Seg::Cut(bytes) => bytes.to_vec(),
+            Seg::Whole { index } => {
+                let frame = s.tx_queue.take(index);
+                let bytes = frame.payload().to_vec();
+                s.tx_queue.put_back(index, frame);
+                bytes
+            }
+            Seg::Empty => panic!("missing TX segment"),
+        };
+        assert_eq!(tx, b"tx");
         assert_eq!((s.recv_queue(), s.send_queue()), (0, 2));
     }
 
@@ -14992,7 +15619,7 @@ mod test {
         // before the FIN.  We manually wire the state so we can send a partial ACK.
         let mut s = socket_last_ack();
         // Push one byte into the tx buffer to simulate data that preceded the FIN.
-        let _ = s.tx_buffer.enqueue_slice(b"x");
+        s.tx_queue.push_bytes(b"x");
         // Mark it as already sent (remote_last_seq is past the data byte and the FIN).
         s.remote_last_seq = LOCAL_SEQ + 1 + 1 + 1; // data(1) + FIN(1)
         s.remote_max_seq = LOCAL_SEQ + 1 + 1 + 1;
@@ -15742,10 +16369,11 @@ mod test {
         assert_eq!(s.remote_max_seq, LOCAL_SEQ + 13);
         assert_eq!(s.rtte.timestamp(), None);
         assert_eq!(s.rtte.max_seq_sent(), Some(LOCAL_SEQ + 13));
-        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+            let repr = frame_payload(repr, &frame);
             assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
             assert_eq!(repr.payload, b"aaa");
-            Err(())
+            (Err(()), frame)
         });
         assert_eq!(result, Err(()));
         assert!(s.pending_fast_retransmit);
@@ -16129,7 +16757,7 @@ mod test {
             ..RECV_TEMPL
         }));
         // Retransmit timer is on because all data was sent
-        assert_eq!(s.tx_buffer.len(), 3);
+        assert_eq!(s.send_queue(), 3);
         // ACK nothing new
         send!(
             s,
@@ -16427,7 +17055,10 @@ mod test {
         }
         // The device takes no packet.
         s.cx.set_now(Instant::from_millis(20));
-        let result: Result<(), ()> = s.socket.dispatch(&mut s.cx, |_, _, _| Err(()));
+        let result: Result<(), ()> = s.socket.dispatch(
+            &mut s.cx,
+            |_, _, (_, _, frame)| (Err(()), frame),
+        );
         assert_eq!(result, Err(()));
         s
     }
@@ -16521,21 +17152,22 @@ mod test {
     fn partial_ack_after_failed_data_repair_arms_fin_timer() {
         let mut s = socket_data_and_standalone_fin_lost();
         s.cx.set_now(Instant::from_millis(20));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+            let repr = frame_payload(repr, &frame);
             assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
             assert_eq!(repr.payload, b"aaa");
-            Err(())
+            (Err(()), frame)
         }), Err(()));
         // The reordered original segment fills the hole, leaving only FIN unacknowledged.
         partial_ack(&mut s, LOCAL_SEQ + 13);
         assert_eq!(s.send_queue(), 0);
         assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(330)));
         for _ in 0..2 {
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 assert_eq!(repr.control, TcpControl::Fin);
                 assert_eq!(repr.seq_number, LOCAL_SEQ + 13);
                 assert!(repr.payload.is_empty());
-                Err(())
+                (Err(()), frame)
             }), Err(()));
             assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(330)));
             assert_eq!((s.retransmits(), s.loss_events()), (0, 1));
@@ -16593,7 +17225,7 @@ mod test {
         for _ in 0..3 {
             partial_ack(&mut s, LOCAL_SEQ + 7);
         }
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Ok::<_, ()>(())), Ok(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Ok::<_, ()>(()), frame)), Ok(()));
         assert_eq!(s.congestion_controller.window(), window);
     }
 
@@ -16602,10 +17234,11 @@ mod test {
         let mut s = socket_fast_retransmit_emit_failed();
         partial_ack(&mut s, LOCAL_SEQ + 7);
         for _ in 0..2 {
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.seq_number, LOCAL_SEQ + 7);
                 assert_eq!(repr.payload, b"ccc");
-                Err(())
+                (Err(()), frame)
             }), Err(()));
         }
         recv!(s, time 30, [TcpRepr {
@@ -16693,9 +17326,9 @@ mod test {
             payload: b"aaa",
             ..RECV_TEMPL
         }));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Err::<(), _>(())), Ok(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Ok(()));
         s.cx.set_now(Instant::from_millis(320));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Err::<(), _>(())), Err(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Err(()));
         assert_eq!(s.recover(), None);
         assert!(!s.pending_fast_retransmit);
         partial_ack(&mut s, LOCAL_SEQ + 7);
@@ -16708,7 +17341,7 @@ mod test {
         assert_eq!(s.retransmits(), 0);
         assert_eq!(s.loss_events(), 1);
         for _ in 0..2 {
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Err::<(), _>(())), Err(()));
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Err(()));
             assert_eq!(s.retransmits(), 0);
             assert_eq!(s.loss_events(), 1);
         }
@@ -17330,7 +17963,7 @@ mod test {
         // this should exit retransmit mode.
         assert!(!s.timer.is_retransmit());
         // and consider all data ACKed.
-        assert!(s.tx_buffer.is_empty());
+        assert_eq!(s.send_queue(), 0);
         recv_nothing!(s, time 1500);
     }
 
@@ -17420,7 +18053,7 @@ mod test {
     #[test]
     fn test_maximum_segment_size() {
         let mut s = socket_listen();
-        s.tx_buffer = SocketBuffer::new(vec![0; 32767]);
+        s.tx_queue = TxQueue::new(32767, 23, s.tx_queue.source().clone());
         send!(
             s,
             TcpRepr {
@@ -18072,9 +18705,10 @@ mod test {
         let mut s = socket_zero_window(Duration::from_millis(700));
         for at in [700, 710] {
             s.cx.set_now(Instant::from_millis(at));
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.payload, b"a");
-                Err(())
+                (Err(()), frame)
             }), Err(()));
             assert_eq!(s.rto_backoff, 1);
             assert!(matches!(s.timer, Timer::ZeroWindowProbe { backoff_applied: true, .. }));
@@ -18107,7 +18741,7 @@ mod test {
         send!(s, time 100, ack);
         assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(400)));
         s.cx.set_now(Instant::from_millis(400));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, _| Err(())), Err(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame)), Err(()));
         for _ in 0..3 {
             send!(s, time 410, ack);
         }
@@ -18300,9 +18934,10 @@ mod test {
             if fail_emit {
                 for at in [700, 710] {
                     s.cx.set_now(Instant::from_millis(at));
-                    assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+                    assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                        let repr = frame_payload(repr, &frame);
                         assert_eq!(repr.payload, b"a");
-                        Err(())
+                        (Err(()), frame)
                     }), Err(()));
                     assert_eq!(s.rto_backoff, 1);
                     assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
@@ -18918,9 +19553,9 @@ mod test {
 
         s.set_hop_limit(Some(0x2a));
         assert_eq!(
-            s.socket.dispatch(&mut s.cx, |_, _, (ip_repr, _)| {
+            s.socket.dispatch(&mut s.cx, |_, _, (ip_repr, _, frame)| {
                 assert_eq!(ip_repr.hop_limit(), 0x2a);
-                Ok::<_, ()>(())
+                (Ok::<_, ()>(()), frame)
             }),
             Ok(())
         );
@@ -19066,110 +19701,6 @@ mod test {
         let data = drain_bytes(&mut s);
         assert_eq!(data.len(), 6);
         assert_eq!(data, &b"defghi"[..]);
-    }
-
-    #[test]
-    fn test_buffer_wraparound_tx() {
-        let mut s = socket_established();
-
-        s.tx_buffer = SocketBuffer::new(vec![b'.'; 9]);
-        assert_eq!(s.send_slice(b"xxxyyy"), Ok(6));
-        assert_eq!(s.tx_buffer.dequeue_many(3), &b"xxx"[..]);
-        assert_eq!(s.tx_buffer.len(), 3);
-
-        // "abcdef" not contiguous in tx buffer
-        assert_eq!(s.send_slice(b"abcdef"), Ok(6));
-        recv!(
-            s,
-            Ok(TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"yyyabc"[..],
-                ..RECV_TEMPL
-            })
-        );
-        recv!(
-            s,
-            Ok(TcpRepr {
-                seq_number: LOCAL_SEQ + 1 + 6,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"def"[..],
-                ..RECV_TEMPL
-            })
-        );
-    }
-
-    #[test]
-    fn test_wrapped_remainder_respects_window_and_cwnd() {
-        for limit_by_cwnd in [false, true] {
-            let mut s = socket_established_with_buffer_sizes(9, 64);
-
-            // Keep three bytes in flight so the next write wraps the tx buffer.
-            assert_eq!(s.send_slice(b"xxxxxx"), Ok(6));
-            recv!(
-                s,
-                Ok(TcpRepr {
-                    seq_number: LOCAL_SEQ + 1,
-                    ack_number: Some(REMOTE_SEQ + 1),
-                    payload: &b"xxxxxx"[..],
-                    ..RECV_TEMPL
-                })
-            );
-            send!(
-                s,
-                TcpRepr {
-                    seq_number: REMOTE_SEQ + 1,
-                    ack_number: Some(LOCAL_SEQ + 4),
-                    window_len: if limit_by_cwnd { 256 } else { 6 },
-                    ..SEND_TEMPL
-                }
-            );
-            if limit_by_cwnd {
-                s.congestion_controller.set_mss(6);
-                s.congestion_controller.on_rto(Instant::ZERO, 3);
-            }
-
-            assert_eq!(s.send_slice(b"abcdef"), Ok(6));
-            assert_eq!(s.tx_buffer.get_allocated(3, 6), b"abc");
-            assert_eq!(s.tx_buffer.get_allocated(6, 3), b"def");
-            recv!(
-                s,
-                Ok(TcpRepr {
-                    seq_number: LOCAL_SEQ + 7,
-                    ack_number: Some(REMOTE_SEQ + 1),
-                    payload: &b"abc"[..],
-                    ..RECV_TEMPL
-                })
-            );
-            assert_eq!(s.flight_size(), 6);
-            if limit_by_cwnd {
-                assert_eq!(s.cwnd_remaining(), 0);
-                assert!(s.remote_win_len as usize > s.flight_size());
-            } else {
-                assert_eq!(s.remote_win_len as usize, s.flight_size());
-                assert!(s.cwnd_remaining() > 0);
-            }
-            recv_nothing!(s);
-
-            send!(
-                s,
-                TcpRepr {
-                    seq_number: REMOTE_SEQ + 1,
-                    ack_number: Some(LOCAL_SEQ + 10),
-                    window_len: 1,
-                    ..SEND_TEMPL
-                }
-            );
-            recv!(
-                s,
-                [TcpRepr {
-                    seq_number: LOCAL_SEQ + 10,
-                    ack_number: Some(REMOTE_SEQ + 1),
-                    payload: &b"d"[..],
-                    ..RECV_TEMPL
-                }]
-            );
-        }
     }
 
     // =========================================================================================//
@@ -19880,10 +20411,11 @@ mod test {
         }));
         for time in [1000, 1100] {
             s.cx.set_now(Instant::from_millis(time));
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr)| {
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
                 assert_eq!(repr.payload, b"abcdef");
-                Err(())
+                (Err(()), frame)
             }), Err(()));
             assert!(!s.timer.is_retransmit());
             assert_eq!(s.rtte.timestamp(), None);

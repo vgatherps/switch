@@ -125,7 +125,7 @@ fn connect_unresolved_peer(
 ) {
     use crate::socket::tcp;
 
-    let mut socket = tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+    let mut socket = tcp::Socket::test_socket(64, 64);
     socket
         .connect(
             iface.context(),
@@ -351,8 +351,7 @@ mod stale_neighbors {
             mut sockets: TcpSet<'static>,
             device: TestingDevice,
         ) -> Self {
-            let mut socket =
-                tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+            let mut socket = tcp::Socket::test_socket(64, 64);
             // The timelines retransmit at 1 s after the first unacknowledged send.
             socket.set_rto(crate::time::Duration::from_millis(1_000));
             let handle = sockets.add(socket);
@@ -1340,8 +1339,7 @@ fn ingress_takes_each_frame_once_via_into_buf() {
             .consume_retain(header, frame);
         assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
     }
-    let mut listener =
-        tcp::Socket::new(tcp::RxBuffer::new(64), tcp::SocketBuffer::new(vec![0; 64]));
+    let mut listener = tcp::Socket::test_socket(64, 64);
     listener.listen(1234).unwrap();
     let handle = sockets.add(listener);
 
