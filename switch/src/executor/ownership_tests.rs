@@ -1,0 +1,846 @@
+use super::*;
+use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+use std::pin::Pin;
+use std::rc::Rc;
+
+#[path = "waker_tests.rs"]
+mod waker_tests;
+
+#[path = "registration_tests.rs"]
+mod registration_tests;
+
+struct Owner(*mut Executor);
+
+#[test]
+fn constructor_reserves_ready_storage_and_uses_initial_timer_tick() {
+    let ptr = Box::into_raw(Box::new(Executor::with_capacity(123, 17, 23)));
+    let owner = Owner(ptr);
+    unsafe {
+        assert!((*ptr).run_queue.capacity() >= 17);
+        assert!((*ptr).incoming.capacity() >= 17);
+        assert_eq!(
+            (*ptr).timers.advance_to(122),
+            Err(crate::timer_wheel::TimeRegressed {
+                current: 123,
+                supplied: 122
+            })
+        );
+        assert_eq!((*ptr).timers.advance_to(123), Ok(()));
+    }
+    owner.cleanup();
+}
+impl Owner {
+    fn new() -> Self {
+        Self(Box::into_raw(Box::new(Executor::new())))
+    }
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        unsafe { Executor::spawn(self.0, future) }
+    }
+    fn poll(&self) -> bool {
+        unsafe { Executor::poll(self.0) }
+    }
+    fn counts(&self) -> (usize, usize) {
+        unsafe { ((*self.0).task_count, (*self.0).allocated) }
+    }
+    fn cleanup(&self) {
+        unsafe { Executor::cleanup(self.0) }
+    }
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.cleanup();
+        unsafe {
+            drop(Box::from_raw(self.0));
+        }
+    }
+}
+
+struct Probe {
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+    wakes: usize,
+    pending: bool,
+    panic_poll: bool,
+    panic_drop: bool,
+    wake_drop: bool,
+    header: *mut TaskHeader,
+}
+impl Probe {
+    fn new() -> Self {
+        Self {
+            polls: Rc::new(Cell::new(0)),
+            drops: Rc::new(Cell::new(0)),
+            wakes: 0,
+            pending: false,
+            panic_poll: false,
+            panic_drop: false,
+            wake_drop: false,
+            header: std::ptr::null_mut(),
+        }
+    }
+}
+impl Future for Probe {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.polls.set(self.polls.get() + 1);
+        self.header = crate::waker::task_from_waker(cx.waker()).as_ptr();
+        for _ in 0..self.wakes {
+            cx.waker().wake_by_ref();
+        }
+        if self.panic_poll {
+            panic_any(1234usize);
+        }
+        if self.pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+        if self.wake_drop && !self.header.is_null() {
+            // Destructor-local wake while the allocation is deliberately still owned.
+            unsafe {
+                wake_task(self.header);
+            }
+        }
+        if self.panic_drop {
+            panic_any(5678usize);
+        }
+    }
+}
+
+#[test]
+fn self_wake_ready_retains_header_until_claim_drains() {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.wakes = 3;
+    let polls = task.polls.clone();
+    let drops = task.drops.clone();
+    owner.spawn(task);
+    assert!(owner.poll());
+    assert_eq!(owner.counts(), (0, 1));
+    assert_eq!((polls.get(), drops.get()), (1, 1));
+    assert!(owner.poll());
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!((polls.get(), drops.get()), (1, 1));
+    assert!(!owner.poll());
+}
+
+#[test]
+fn idle_future_remains_owned_until_cleanup() {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.pending = true;
+    let drops = task.drops.clone();
+    owner.spawn(task);
+    owner.poll();
+    assert_eq!(owner.counts(), (1, 1));
+    assert!(!owner.poll());
+    owner.cleanup();
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn duplicate_wakes_make_one_next_batch_claim() {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.wakes = 10;
+    task.pending = true;
+    let polls = task.polls.clone();
+    let drops = task.drops.clone();
+    owner.spawn(task);
+    owner.poll();
+    owner.poll();
+    assert_eq!(polls.get(), 2);
+    unsafe {
+        assert_eq!((*owner.0).incoming.len(), 1);
+    }
+    owner.cleanup();
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
+    let owner = Owner::new();
+    let ptr = owner.0;
+    let inner = Rc::new(Cell::new(0));
+    let inner_poll = inner.clone();
+    owner.spawn(async move {
+        for _ in 0..(DEFAULT_CAPACITY * 3) {
+            let count = inner_poll.clone();
+            unsafe {
+                Executor::spawn(ptr, async move {
+                    count.set(count.get() + 1);
+                });
+            }
+        }
+    });
+    owner.spawn(async {});
+    owner.poll();
+    assert_eq!(inner.get(), 0);
+    unsafe {
+        assert!((*owner.0).run_queue.capacity() >= (*owner.0).allocated);
+        assert!((*owner.0).incoming.capacity() >= (*owner.0).allocated);
+    }
+    owner.poll();
+    assert_eq!(inner.get(), DEFAULT_CAPACITY * 3);
+    assert_eq!(owner.counts(), (0, 0));
+}
+
+#[test]
+fn ready_destructor_wake_is_terminal_noop() {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.wake_drop = true;
+    let drops = task.drops.clone();
+    owner.spawn(task);
+    owner.poll();
+    assert_eq!(owner.counts(), (0, 0));
+    assert!(!owner.poll());
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn ready_self_wake_destructor_panic_keeps_incoming_header() {
+    ready_drop_panic(true);
+}
+#[test]
+fn ready_destructor_panic_without_claim_frees_header() {
+    ready_drop_panic(false);
+}
+fn ready_drop_panic(self_wake: bool) {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.wakes = usize::from(self_wake);
+    task.wake_drop = true;
+    task.panic_drop = true;
+    let drops = task.drops.clone();
+    owner.spawn(task);
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
+    assert_eq!(owner.counts(), (0, usize::from(self_wake)));
+    unsafe {
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
+        assert!(!(*owner.0).active);
+        assert_eq!((*owner.0).incoming.len(), usize::from(self_wake));
+        if self_wake {
+            assert!((*(*owner.0).all_head).drop_started);
+        }
+    }
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn failed_poll_preserves_payload_future_and_both_queues() {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.wakes = 1;
+    task.panic_poll = true;
+    let drops = task.drops.clone();
+    let remaining = Rc::new(Cell::new(0));
+    owner.spawn(task);
+    let count = remaining.clone();
+    owner.spawn(async move {
+        count.set(count.get() + 1);
+    });
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
+    assert_eq!(owner.counts(), (1, 2));
+    assert_eq!(drops.get(), 0);
+    unsafe {
+        assert_eq!((*owner.0).run_queue.len(), 2);
+        assert_eq!((*owner.0).incoming.len(), 1);
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.spawn(async {}))).is_err());
+    owner.cleanup();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(remaining.get(), 0);
+    assert_eq!(owner.counts(), (0, 0));
+}
+
+#[test]
+fn cleanup_resumes_after_one_destructor_panics() {
+    let owner = Owner::new();
+    let first = Probe::new();
+    let first_drops = first.drops.clone();
+    owner.spawn(first);
+    let mut failing = Probe::new();
+    failing.panic_drop = true;
+    let failing_drops = failing.drops.clone();
+    owner.spawn(failing);
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.cleanup())).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
+    assert_eq!(owner.counts(), (0, 1));
+    assert_eq!((first_drops.get(), failing_drops.get()), (0, 1));
+    owner.cleanup();
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!((first_drops.get(), failing_drops.get()), (1, 1));
+}
+
+#[test]
+fn over_aligned_future_has_exactly_one_drop() {
+    #[repr(align(256))]
+    struct Aligned(Rc<Cell<usize>>);
+    impl Future for Aligned {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            assert_eq!(std::ptr::from_ref(&*self).addr() % 256, 0);
+            Poll::Ready(())
+        }
+    }
+    impl Drop for Aligned {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    let owner = Owner::new();
+    let drops = Rc::new(Cell::new(0));
+    owner.spawn(Aligned(drops.clone()));
+    owner.poll();
+    owner.cleanup();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(owner.counts(), (0, 0));
+}
+
+#[test]
+fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
+    struct Recursive {
+        root: *mut Executor,
+        drops: Rc<Cell<usize>>,
+    }
+    impl Future for Recursive {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            unsafe { Executor::poll(self.root) };
+            Poll::Ready(())
+        }
+    }
+    impl Drop for Recursive {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+    let owner = Owner::new();
+    let drops = Rc::new(Cell::new(0));
+    let remaining_polls = Rc::new(Cell::new(0));
+    let remaining_drops = Rc::new(Cell::new(0));
+    let task = Probe::new();
+    let task = Probe {
+        polls: remaining_polls.clone(),
+        drops: remaining_drops.clone(),
+        ..task
+    };
+    owner.spawn(Recursive {
+        root: owner.0,
+        drops: drops.clone(),
+    });
+    owner.spawn(task);
+    let (data, incoming) = unsafe { ((*owner.0).run_queue.as_ptr(), (*owner.0).incoming.as_ptr()) };
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("executor reentrancy")
+    );
+    unsafe {
+        assert_eq!((*owner.0).run_queue.as_ptr(), incoming);
+        assert_eq!((*owner.0).incoming.as_ptr(), data);
+        assert_eq!((*owner.0).run_queue.len(), 2);
+        assert!((*owner.0).incoming.is_empty());
+        assert_eq!((*owner.0).task_count, 1);
+        assert_eq!((*owner.0).allocated, 2);
+        assert!(!(*owner.0).active);
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
+    }
+    assert_eq!(
+        (drops.get(), remaining_polls.get(), remaining_drops.get()),
+        (0, 0, 0)
+    );
+    owner.cleanup();
+    assert_eq!(
+        (drops.get(), remaining_polls.get(), remaining_drops.get()),
+        (1, 0, 1)
+    );
+}
+
+#[test]
+fn waking_another_current_batch_task_does_not_add_a_next_batch_claim() {
+    let owner = Owner::new();
+    let target = Rc::new(Cell::new(std::ptr::null_mut::<TaskHeader>()));
+    let wake_target = target.clone();
+    owner.spawn(async move {
+        unsafe {
+            wake_task(wake_target.get());
+        }
+    });
+    let mut task = Probe::new();
+    task.pending = true;
+    let polls = task.polls.clone();
+    let drops = task.drops.clone();
+    owner.spawn(task);
+    unsafe {
+        target.set((*owner.0).all_head);
+    }
+    owner.poll();
+    assert_eq!(polls.get(), 1);
+    assert_eq!(owner.counts(), (1, 1));
+    assert!(!owner.poll());
+    assert_eq!(polls.get(), 1);
+    unsafe {
+        assert!((*owner.0).incoming.is_empty());
+        assert!(!(*target.get()).queued);
+        assert_eq!((*target.get()).state, TaskState::Idle);
+    }
+    owner.cleanup();
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn ready_destructor_spawns_and_wakes_an_idle_task_during_reclamation() {
+    destructor_spawn_and_wake(true, false);
+    destructor_spawn_and_wake(true, true);
+}
+
+#[test]
+fn ready_destructor_spawns_and_wakes_a_current_batch_task_during_reclamation() {
+    destructor_spawn_and_wake(false, false);
+    destructor_spawn_and_wake(false, true);
+}
+
+fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
+    struct SpawnDuringDrop {
+        owner: *mut Executor,
+        target: Rc<Cell<*mut TaskHeader>>,
+        completed: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+        self_wake: bool,
+    }
+    impl Future for SpawnDuringDrop {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.self_wake {
+                cx.waker().wake_by_ref();
+            }
+            Poll::Ready(())
+        }
+    }
+    impl Drop for SpawnDuringDrop {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            for _ in 0..(DEFAULT_CAPACITY * 3) {
+                let completed = self.completed.clone();
+                unsafe {
+                    Executor::spawn(self.owner, async move {
+                        completed.set(completed.get() + 1);
+                    });
+                }
+            }
+            // Target allocation remains live whether idle or in this batch.
+            unsafe {
+                wake_task(self.target.get());
+            }
+        }
+    }
+    let owner = Owner::new();
+    let target = Rc::new(Cell::new(std::ptr::null_mut()));
+    let completed = Rc::new(Cell::new(0));
+    let drops = Rc::new(Cell::new(0));
+    let drop_spawner = SpawnDuringDrop {
+        owner: owner.0,
+        target: target.clone(),
+        completed: completed.clone(),
+        drops: drops.clone(),
+        self_wake,
+    };
+    let mut task = Probe::new();
+    task.pending = true;
+    let target_polls = task.polls.clone();
+    let target_drops = task.drops.clone();
+    if target_idle {
+        owner.spawn(task);
+        unsafe {
+            target.set((*owner.0).all_head);
+        }
+        owner.poll();
+        owner.spawn(drop_spawner);
+    } else {
+        owner.spawn(drop_spawner);
+        owner.spawn(task);
+        unsafe {
+            target.set((*owner.0).all_head);
+        }
+    }
+    owner.poll();
+    assert_eq!(drops.get(), 1);
+    assert_eq!(completed.get(), 0);
+    assert_eq!(target_polls.get(), 1);
+    assert_eq!(
+        owner.counts(),
+        (
+            DEFAULT_CAPACITY * 3 + 1,
+            DEFAULT_CAPACITY * 3 + 1 + usize::from(self_wake)
+        )
+    );
+    unsafe {
+        assert_eq!(
+            (*owner.0).incoming.len(),
+            DEFAULT_CAPACITY * 3 + usize::from(target_idle) + usize::from(self_wake)
+        );
+        assert!((*owner.0).run_queue.capacity() >= (*owner.0).allocated);
+        assert!((*owner.0).incoming.capacity() >= (*owner.0).allocated);
+    }
+    owner.poll();
+    assert_eq!(completed.get(), DEFAULT_CAPACITY * 3);
+    assert_eq!(target_polls.get(), 1 + usize::from(target_idle));
+    assert_eq!(owner.counts(), (1, 1));
+    owner.cleanup();
+    assert_eq!((drops.get(), target_drops.get()), (1, 1));
+}
+
+#[test]
+fn middle_batch_panic_allows_only_cleanup_with_exact_drops() {
+    for preceding_self_wake in [false, true] {
+        let owner = Owner::new();
+        let mut preceding = Probe::new();
+        preceding.wakes = usize::from(preceding_self_wake);
+        let preceding_polls = preceding.polls.clone();
+        let preceding_drops = preceding.drops.clone();
+        let mut interrupted = Probe::new();
+        interrupted.wakes = 1;
+        interrupted.panic_poll = true;
+        let interrupted_polls = interrupted.polls.clone();
+        let interrupted_drops = interrupted.drops.clone();
+        let unprocessed = [Probe::new(), Probe::new()];
+        let unprocessed_polls = unprocessed.each_ref().map(|task| task.polls.clone());
+        let unprocessed_drops = unprocessed.each_ref().map(|task| task.drops.clone());
+        owner.spawn(preceding);
+        owner.spawn(interrupted);
+        for task in unprocessed {
+            owner.spawn(task);
+        }
+        let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
+        assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
+        assert_eq!((preceding_polls.get(), preceding_drops.get()), (1, 1));
+        assert_eq!((interrupted_polls.get(), interrupted_drops.get()), (1, 0));
+        assert_eq!(
+            unprocessed_polls.each_ref().map(|count| count.get()),
+            [0, 0]
+        );
+        assert_eq!(
+            unprocessed_drops.each_ref().map(|count| count.get()),
+            [0, 0]
+        );
+        assert_eq!(owner.counts(), (2, 3 + usize::from(preceding_self_wake)));
+        unsafe {
+            assert_eq!((*owner.0).run_queue.len(), 4);
+            assert_eq!(
+                (*owner.0).incoming.len(),
+                1 + usize::from(preceding_self_wake)
+            );
+            assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
+            assert!(!(*owner.0).active);
+        }
+        assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| owner.spawn(async {}))).is_err());
+        owner.cleanup();
+        owner.cleanup();
+        assert_eq!(owner.counts(), (0, 0));
+        assert_eq!((preceding_polls.get(), preceding_drops.get()), (1, 1));
+        assert_eq!((interrupted_polls.get(), interrupted_drops.get()), (1, 1));
+        assert_eq!(
+            unprocessed_polls.each_ref().map(|count| count.get()),
+            [0, 0]
+        );
+        assert_eq!(
+            unprocessed_drops.each_ref().map(|count| count.get()),
+            [1, 1]
+        );
+    }
+}
+
+#[test]
+fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
+    struct Ordered {
+        id: usize,
+        targets: Rc<[Cell<*mut TaskHeader>; 3]>,
+        trace: Rc<std::cell::RefCell<Vec<usize>>>,
+        drops: Rc<[Cell<usize>; 3]>,
+        first_poll: bool,
+    }
+    impl Future for Ordered {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.trace.borrow_mut().push(self.id);
+            if !self.first_poll {
+                return Poll::Ready(());
+            }
+            self.first_poll = false;
+            if self.id == 0 || self.id == 2 {
+                for _ in 0..8 {
+                    cx.waker().wake_by_ref();
+                }
+            }
+            if self.id == 0 || self.id == 2 {
+                // A wakes queued B before its poll; C wakes idle B after its poll.
+                for _ in 0..8 {
+                    unsafe {
+                        wake_task(self.targets[1].get());
+                    }
+                }
+            }
+            if self.id == 2 {
+                for _ in 0..8 {
+                    unsafe {
+                        wake_task(self.targets[0].get());
+                    }
+                }
+            }
+            Poll::Pending
+        }
+    }
+    impl Drop for Ordered {
+        fn drop(&mut self) {
+            self.drops[self.id].set(self.drops[self.id].get() + 1);
+        }
+    }
+    let owner = Owner::new();
+    let targets = Rc::new(std::array::from_fn(|_| Cell::new(std::ptr::null_mut())));
+    let trace = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let drops = Rc::new(std::array::from_fn(|_| Cell::new(0)));
+    for id in 0..3 {
+        owner.spawn(Ordered {
+            id,
+            targets: targets.clone(),
+            trace: trace.clone(),
+            drops: drops.clone(),
+            first_poll: true,
+        });
+        unsafe {
+            targets[id].set((*owner.0).all_head);
+        }
+    }
+    owner.poll();
+    assert_eq!(*trace.borrow(), [0, 1, 2]);
+    assert_eq!(owner.counts(), (3, 3));
+    unsafe {
+        assert_eq!(
+            (*owner.0).incoming.as_slice(),
+            &[targets[0].get(), targets[2].get(), targets[1].get()]
+        );
+        for target in &*targets {
+            assert!((*target.get()).queued);
+            assert_eq!((*target.get()).state, TaskState::Scheduled);
+        }
+    }
+    owner.poll();
+    assert_eq!(*trace.borrow(), [0, 1, 2, 0, 2, 1]);
+    assert_eq!(owner.counts(), (0, 0));
+    assert!(!owner.poll());
+    assert_eq!(drops.each_ref().map(|count| count.get()), [1, 1, 1]);
+}
+
+#[test]
+fn multiple_selfwakes_then_panic_keep_one_claim_and_original_payload() {
+    let owner = Owner::new();
+    let mut task = Probe::new();
+    task.wakes = 8;
+    task.panic_poll = true;
+    let polls = task.polls.clone();
+    let drops = task.drops.clone();
+    let remainder = Probe::new();
+    let remainder_polls = remainder.polls.clone();
+    let remainder_drops = remainder.drops.clone();
+    owner.spawn(task);
+    owner.spawn(remainder);
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
+    assert_eq!(owner.counts(), (1, 2));
+    assert_eq!(
+        (
+            polls.get(),
+            drops.get(),
+            remainder_polls.get(),
+            remainder_drops.get()
+        ),
+        (1, 0, 0, 0)
+    );
+    unsafe {
+        assert_eq!((*owner.0).incoming.len(), 1);
+        assert_eq!((*(&(*owner.0).incoming)[0]).state, TaskState::Terminal);
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!(
+        (
+            polls.get(),
+            drops.get(),
+            remainder_polls.get(),
+            remainder_drops.get()
+        ),
+        (1, 1, 0, 1)
+    );
+}
+
+struct RejectedWakeOnDrop {
+    target: *mut TaskHeader,
+    drops: Rc<Cell<usize>>,
+}
+impl Future for RejectedWakeOnDrop {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
+    }
+}
+impl Drop for RejectedWakeOnDrop {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+        // Target remains allocated while rejected spawn destroys its argument.
+        unsafe {
+            wake_task(self.target);
+        }
+    }
+}
+
+#[test]
+fn panicked_lifecycle_rejects_work_and_destructor_wake_to_idle_target() {
+    let owner = Owner::new();
+    let mut idle = Probe::new();
+    idle.pending = true;
+    idle.wake_drop = true;
+    let idle_drops = idle.drops.clone();
+    owner.spawn(idle);
+    let target = unsafe { (*owner.0).all_head };
+    owner.poll();
+    let mut failing = Probe::new();
+    failing.panic_poll = true;
+    failing.wake_drop = true;
+    let failing_drops = failing.drops.clone();
+    owner.spawn(failing);
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
+    unsafe {
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    let rejected_drops = Rc::new(Cell::new(0));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| owner.spawn(RejectedWakeOnDrop {
+            target,
+            drops: rejected_drops.clone()
+        })))
+        .is_err()
+    );
+    assert_eq!(rejected_drops.get(), 1);
+    unsafe {
+        assert!((*owner.0).incoming.is_empty());
+        assert!(!(*target).queued);
+        assert_eq!((*target).state, TaskState::Idle);
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
+    }
+    assert_eq!(owner.counts(), (1, 2));
+    owner.cleanup();
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!((idle_drops.get(), failing_drops.get()), (1, 1));
+    unsafe {
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Closing);
+    }
+}
+
+#[test]
+fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
+    struct DuringCleanup {
+        owner: *mut Executor,
+        target: *mut TaskHeader,
+        drops: Rc<Cell<usize>>,
+        rejected_drops: Rc<Cell<usize>>,
+    }
+    impl Future for DuringCleanup {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+    impl Drop for DuringCleanup {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            unsafe {
+                assert_eq!((*self.owner).lifecycle, Lifecycle::Closing);
+                assert!(catch_unwind(AssertUnwindSafe(|| Executor::poll(self.owner))).is_err());
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| Executor::spawn(
+                        self.owner,
+                        RejectedWakeOnDrop {
+                            target: self.target,
+                            drops: self.rejected_drops.clone()
+                        }
+                    )))
+                    .is_err()
+                );
+                wake_task(self.target);
+                assert!((*self.owner).incoming.is_empty());
+            }
+            panic_any(5678usize);
+        }
+    }
+    let owner = Owner::new();
+    let mut target = Probe::new();
+    target.pending = true;
+    target.wake_drop = true;
+    let target_drops = target.drops.clone();
+    owner.spawn(target);
+    let target = unsafe { (*owner.0).all_head };
+    owner.poll();
+    let drops = Rc::new(Cell::new(0));
+    let rejected_drops = Rc::new(Cell::new(0));
+    owner.spawn(DuringCleanup {
+        owner: owner.0,
+        target,
+        drops: drops.clone(),
+        rejected_drops: rejected_drops.clone(),
+    });
+    let payload = catch_unwind(AssertUnwindSafe(|| owner.cleanup())).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
+    assert_eq!(owner.counts(), (0, 1));
+    assert_eq!(
+        (drops.get(), rejected_drops.get(), target_drops.get()),
+        (1, 1, 0)
+    );
+    unsafe {
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Closing);
+        assert!(!(*owner.0).active);
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| owner.spawn(RejectedWakeOnDrop {
+            target,
+            drops: rejected_drops.clone()
+        })))
+        .is_err()
+    );
+    unsafe {
+        assert!((*owner.0).incoming.is_empty());
+        assert!(!(*target).queued);
+    }
+    owner.cleanup();
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!(
+        (drops.get(), rejected_drops.get(), target_drops.get()),
+        (1, 2, 1)
+    );
+    unsafe {
+        assert_eq!((*owner.0).lifecycle, Lifecycle::Closing);
+    }
+}

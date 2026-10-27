@@ -1,0 +1,22 @@
+[package]
+name = "switch"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "executor"
+harness = false
+
+[[bench]]
+name = "timer_wheel"
+harness = false
+
+[[bench]]
+name = "runtime"
+harness = false

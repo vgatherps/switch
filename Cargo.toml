@@ -23,12 +23,8 @@ members = [
     "cephalopod/crates/fifo",
     "cephalopod/crates/proto",
     "cephalopod/crates/control",
-    # kioto
-    "kioto/crates/bench-core",
-    "kioto/crates/bench-sender-mio",
-    "kioto/crates/bench-sender-tokio",
-    "kioto/crates/bench-victim-mio",
-    "kioto/crates/bench-victim-tokio",
+    # switch
+    "switch",
 ]
 exclude = ["conduit/vendor/smoltcp"]
 
@@ -44,13 +40,6 @@ ceph-rseq = { path = "cephalopod/crates/rseq" }
 ceph-ring = { path = "cephalopod/crates/ring" }
 ceph-proto = { path = "cephalopod/crates/proto" }
 ceph-control = { path = "cephalopod/crates/control" }
-# kioto
-bench-core = { path = "kioto/crates/bench-core" }
-ctrlc = "3.4"
-mio = { version = "1.0", features = ["net", "os-poll"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", default-features = false, features = ["io-util", "macros", "net", "rt", "signal", "time"] }
 
 [workspace.lints.clippy]
 doc_lazy_continuation = "allow"
