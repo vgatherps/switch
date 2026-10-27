@@ -190,6 +190,7 @@ test-stream: doctor
 
 test-switchnet: doctor
 	$(TIMEOUT) cargo test --locked -p switchnet -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switchnet --benches --no-run
 
 test-ws: doctor
 	$(TIMEOUT) cargo test --locked -p ws-autobahn -- --test-threads=1

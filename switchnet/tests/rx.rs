@@ -4,14 +4,16 @@ use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
 
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use switchnet::tcp::State;
-use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, RecvError, StackError, TcpStream, UdpConfig};
-use zhida_test_kit::pair::pattern;
+use switchnet::{
+    IpEndpoint, IpListenEndpoint, NetHandle, RecvError, StackError, TcpStream, UdpConfig, UdpSocket,
+};
+use zhida_test_kit::pair::{T0, pattern};
 use zhida_test_kit::with_eal;
 
 mod support;
@@ -436,19 +438,46 @@ fn peer_udp_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::UdpHandle, port: u16, p
     });
 }
 
-struct PanickingWake(AtomicUsize);
+/// Counts wakes; while armed, each wake panics after counting.
+struct PanickingWake {
+    wakes: AtomicUsize,
+    armed: AtomicBool,
+}
 
-impl Wake for PanickingWake {
-    fn wake(self: Arc<Self>) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        panic!("wake panicked");
+impl PanickingWake {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { wakes: AtomicUsize::new(0), armed: AtomicBool::new(true) })
+    }
+
+    fn wakes(&self) -> usize {
+        self.wakes.load(Ordering::Relaxed)
     }
 }
 
-#[zhida_test_support::pinned_test]
-fn panicking_wake_leaves_the_other_ready_task_for_the_next_turn() {
+impl Wake for PanickingWake {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::Relaxed);
+        if self.armed.load(Ordering::Relaxed) {
+            panic!("wake panicked");
+        }
+    }
+}
+
+/// A `Net::turn` that must unwind out of a panicking wake.
+fn turn_panics_in_wake(mixed: &mut Mixed, now: switchnet::Instant) {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| mixed.net.turn(now))) else {
+        panic!("turn did not panic")
+    };
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"wake panicked"));
+}
+
+/// Two UDP sockets become ready in one turn; the panicking waker is delivered
+/// first, so the probe's wake is left undelivered. `recover` is the next
+/// turn, at a time the Stack accepts or not; it must deliver that wake.
+fn panicking_wake_then(names: [&str; 2], recover: impl FnOnce(&mut Mixed)) {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["pwka", "pwkb"]);
+        let mut mixed = Mixed::new(eal, names);
+        mixed.now += Duration::from_millis(1);
         let mut quiet = mixed.handle().udp_bind(udp_config(7000)).unwrap();
         let mut loud = mixed.handle().udp_bind(udp_config(7001)).unwrap();
         let peer = mixed.peer.add_udp(udp_config(7002)).unwrap();
@@ -456,7 +485,7 @@ fn panicking_wake_leaves_the_other_ready_task_for_the_next_turn() {
         let warm = drive(&mut mixed, &Probe::new(), pin!(quiet.recv()));
         assert_eq!(warm.payload(), b"warm");
         let probe = Probe::new();
-        let panicking = Arc::new(PanickingWake(AtomicUsize::new(0)));
+        let panicking = PanickingWake::new();
         let panicking_waker = Waker::from(panicking.clone());
         // Parked in this order, the scan collects quiet then loud and the
         // delivery wakes loud first.
@@ -470,14 +499,13 @@ fn panicking_wake_leaves_the_other_ready_task_for_the_next_turn() {
         mixed.peer.turn(mixed.now, zhida_test_kit::pair::BUDGET).unwrap();
         assert_eq!(mixed.to_net.forward(), 2);
         let now = mixed.now;
-        let unwound = catch_unwind(AssertUnwindSafe(|| mixed.net.turn(now)));
-        assert!(unwound.is_err());
-        assert_eq!(panicking.0.load(Ordering::Relaxed), 1);
+        turn_panics_in_wake(&mut mixed, now);
+        assert_eq!(panicking.wakes(), 1);
         assert_eq!(probe.wakes(), 0, "quiet woken before loud: the test lost its point");
-        mixed.net.turn(now).unwrap();
+        recover(&mut mixed);
         assert_eq!(probe.wakes(), 1, "the other ready task's wake was lost");
         mixed.rounds(5);
-        assert_eq!([probe.wakes(), panicking.0.load(Ordering::Relaxed)], [1, 1]);
+        assert_eq!([probe.wakes(), panicking.wakes()], [1, 1]);
         let Poll::Ready(datagram) = probe.poll(quiet_recv.as_mut()) else { panic!("woken without a datagram") };
         assert_eq!(datagram.payload(), b"quiet");
         let Poll::Ready(datagram_loud) = loud_recv.as_mut().poll(&mut Context::from_waker(&panicking_waker))
@@ -488,6 +516,216 @@ fn panicking_wake_leaves_the_other_ready_task_for_the_next_turn() {
         drop((quiet_recv, loud_recv, panicking_waker));
         assert_eq!(probe.clones(), 0);
         drop((warm, datagram, datagram_loud, quiet, loud, peer));
+        mixed.close();
+    })
+}
+
+#[zhida_test_support::pinned_test]
+fn panicking_wake_leaves_the_other_ready_task_for_the_next_turn() {
+    panicking_wake_then(["pwka", "pwkb"], |mixed| {
+        mixed.net.turn(mixed.now).unwrap();
+    });
+}
+
+/// A turn whose Stack turn fails still delivers wakes already queued.
+#[zhida_test_support::pinned_test]
+fn failing_turn_still_delivers_a_queued_wake() {
+    panicking_wake_then(["pwfa", "pwfb"], |mixed| {
+        let Err(StackError::TimeWentBackwards { .. }) = mixed.net.turn(T0) else {
+            panic!("turn at an earlier time did not fail")
+        };
+    });
+}
+
+/// Wakes panic in two turns, the tasks re-parking in between; the second
+/// scan must not pile onto the first turn's undelivered wakers. Opening a
+/// socket afterwards works, and every task made ready is woken.
+#[zhida_test_support::pinned_test]
+fn repeated_wake_panics_keep_socket_opening_working() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["rwpa", "rwpb"]);
+        let mut sockets: Vec<UdpSocket> =
+            (0..4).map(|i| mixed.handle().udp_bind(udp_config(7000 + i)).unwrap()).collect();
+        let peer = mixed.peer.add_udp(udp_config(7010)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7000, b"warm");
+        let warm = drive(&mut mixed, &Probe::new(), pin!(sockets[0].recv()));
+        let panicking: Vec<Arc<PanickingWake>> = (0..4).map(|_| PanickingWake::new()).collect();
+        let wakers: Vec<Waker> = panicking.iter().cloned().map(Waker::from).collect();
+        let mut held = Vec::new();
+        for round in 0..2u8 {
+            let mut recvs: Vec<_> = sockets.iter_mut().map(|socket| Box::pin(socket.recv())).collect();
+            for (recv, waker) in recvs.iter_mut().zip(&wakers) {
+                assert!(recv.as_mut().poll(&mut Context::from_waker(waker)).is_pending());
+            }
+            for port in 7000..7004 {
+                let to = Some(IpEndpoint::new(net_ip().into(), port));
+                mixed.peer.udp_send(&peer, to, &[round]).unwrap();
+            }
+            mixed.peer.turn(mixed.now, zhida_test_kit::pair::BUDGET).unwrap();
+            assert_eq!(mixed.to_net.forward(), 4);
+            let now = mixed.now;
+            turn_panics_in_wake(&mut mixed, now);
+            for (recv, waker) in recvs.iter_mut().zip(&wakers) {
+                let Poll::Ready(datagram) = recv.as_mut().poll(&mut Context::from_waker(waker)) else {
+                    panic!("datagram not queued")
+                };
+                assert_eq!(datagram.payload(), [round]);
+                held.push(datagram);
+            }
+        }
+        let peer_tcp = peer_listen(&mut mixed);
+        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap();
+        panicking.iter().for_each(|wake| wake.armed.store(false, Ordering::Relaxed));
+        let stream = drive(&mut mixed, &Probe::new(), pin!(connecting)).unwrap();
+        mixed.until(|m| m.peer.tcp(&peer_tcp).state() == State::Established);
+        assert!(panicking.iter().all(|wake| wake.wakes() >= 1), "a ready task was never woken");
+        drop((stream, peer_tcp, held, warm, wakers, sockets, peer));
+        mixed.close();
+    })
+}
+
+#[zhida_test_support::pinned_test]
+fn repoll_with_the_same_waker_keeps_the_parked_clone() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["rpla", "rplb"]);
+        let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let probe = Probe::new();
+        let mut recv = Box::pin(stream.recv());
+        assert!(probe.poll(recv.as_mut()).is_pending());
+        assert_eq!(probe.clones(), 1);
+        assert!(probe.poll(recv.as_mut()).is_pending());
+        assert_eq!(probe.clones(), 1, "a re-poll with the parked waker cloned it again");
+        drop(recv);
+        drop((stream, peer));
+        mixed.close();
+    })
+}
+
+/// The peer's queued segments all acknowledged, then a reset from the peer
+/// that reaches the Net and is turned.
+fn peer_resets_after(mixed: &mut Mixed, peer: &TcpHandle) {
+    mixed.until(|m| m.peer.tcp(peer).send_queue() == 0);
+    mixed.peer.tcp_mut(peer).abort();
+    mixed.peer.turn(mixed.now, zhida_test_kit::pair::BUDGET).unwrap();
+    assert!(mixed.to_net.forward() >= 1, "the reset did not leave the peer");
+    mixed.net.turn(mixed.now).unwrap();
+}
+
+/// One poll of a fresh `recv`, without turning anything.
+fn recv_now(stream: &mut TcpStream) -> Poll<Result<switchnet::TcpFrame, RecvError>> {
+    Probe::new().poll(pin!(stream.recv()))
+}
+
+#[zhida_test_support::pinned_test]
+fn queued_data_then_reset_gives_the_data_then_invalid_state() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["qrsa", "qrsb"]);
+        let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        peer_send(&mut mixed, &peer, b"before reset");
+        peer_resets_after(&mut mixed, &peer);
+        let Poll::Ready(Ok(frame)) = recv_now(&mut stream) else { panic!("queued data lost") };
+        assert_eq!(frame.payload(), b"before reset");
+        let Poll::Ready(error) = recv_now(&mut stream) else { panic!("reset not applied") };
+        assert_eq!(error.unwrap_err(), RecvError::InvalidState);
+        drop((frame, stream, peer));
+        mixed.close();
+    })
+}
+
+/// After the Net accepted the peer's FIN, a reset still ends in `Finished`.
+#[zhida_test_support::pinned_test]
+fn accepted_fin_then_reset_gives_finished() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["frsa", "frsb"]);
+        let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        peer_send(&mut mixed, &peer, b"last");
+        mixed.peer.tcp_mut(&peer).close();
+        mixed.until(|m| m.peer.tcp(&peer).state() == State::FinWait2);
+        peer_resets_after(&mut mixed, &peer);
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::Closed);
+        let Poll::Ready(Ok(frame)) = recv_now(&mut stream) else { panic!("queued data lost") };
+        assert_eq!(frame.payload(), b"last");
+        let Poll::Ready(error) = recv_now(&mut stream) else { panic!("FIN not applied") };
+        assert_eq!(error.unwrap_err(), RecvError::Finished);
+        drop((frame, stream, peer));
+        mixed.close();
+    })
+}
+
+/// Three sockets' tasks share a waker whose every wake panics; each turn they
+/// get a datagram and re-park, so each turn's delivery panics. The Stack must
+/// still turn every time, the wakers kept for later delivery must stay within
+/// the slot count, and once those tasks stop being re-woken, the fourth
+/// socket's task is woken.
+#[zhida_test_support::pinned_test]
+fn always_panicking_wake_does_not_stop_the_stack_or_grow_the_kept_wakers() {
+    const SLOTS: usize = support::MAX_TCP + support::MAX_UDP;
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["apwa", "apwb"]);
+        let mut sockets: Vec<UdpSocket> =
+            (0..4).map(|i| mixed.handle().udp_bind(udp_config(7000 + i)).unwrap()).collect();
+        let peer = mixed.peer.add_udp(udp_config(7010)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7003, b"warm");
+        let warm = drive(&mut mixed, &Probe::new(), pin!(sockets[3].recv()));
+        let panicking = PanickingWake::new();
+        let waker = Waker::from(panicking.clone());
+        let kept = |panicking: &Arc<PanickingWake>| Arc::strong_count(panicking) - 2;
+        let (loud, quiet) = sockets.split_at_mut(3);
+        let probe = Probe::new();
+        let mut quiet_recv = Box::pin(quiet[0].recv());
+        assert!(probe.poll(quiet_recv.as_mut()).is_pending());
+        let mut held = Vec::new();
+        let send = |mixed: &mut Mixed, port: u16, round: u8| {
+            let to = Some(IpEndpoint::new(net_ip().into(), port));
+            mixed.peer.udp_send(&peer, to, &[round]).unwrap();
+        };
+        let turn = |mixed: &mut Mixed| -> bool {
+            let now = mixed.now;
+            match catch_unwind(AssertUnwindSafe(|| mixed.net.turn(now))) {
+                Ok(turn) => {
+                    turn.unwrap();
+                    false
+                }
+                Err(payload) => {
+                    assert_eq!(payload.downcast_ref::<&str>(), Some(&"wake panicked"));
+                    true
+                }
+            }
+        };
+        for round in 0..6u8 {
+            let mut recvs: Vec<_> = loud.iter_mut().map(|socket| Box::pin(socket.recv())).collect();
+            for recv in &mut recvs {
+                assert!(recv.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            }
+            for port in 7000..7004 {
+                send(&mut mixed, port, round);
+            }
+            mixed.peer.turn(mixed.now, zhida_test_kit::pair::BUDGET).unwrap();
+            assert_eq!(mixed.to_net.forward(), 4);
+            assert!(turn(&mut mixed), "round {round}: no wake panicked");
+            assert!(kept(&panicking) <= SLOTS, "round {round}: {} wakers kept", kept(&panicking));
+            // The turn's ingress ran: each loud socket has this round's datagram.
+            for recv in &mut recvs {
+                let Poll::Ready(datagram) = recv.as_mut().poll(&mut Context::from_waker(&waker)) else {
+                    panic!("round {round}: the Stack did not receive")
+                };
+                assert_eq!(datagram.payload(), [round]);
+                held.push(datagram);
+            }
+        }
+        // The loud tasks are no longer re-woken: the kept wakers drain one
+        // panicking delivery per turn, then the quiet task's wake goes out.
+        for _ in 0..SLOTS + 2 {
+            if probe.wakes() > 0 {
+                break;
+            }
+            turn(&mut mixed);
+        }
+        assert_eq!(probe.wakes(), 1, "the quiet task was never woken");
+        let Poll::Ready(first) = probe.poll(quiet_recv.as_mut()) else { panic!("woken without a datagram") };
+        assert_eq!(first.payload(), [0]);
+        drop(quiet_recv);
+        drop((first, held, warm, waker, sockets, peer));
         mixed.close();
     })
 }

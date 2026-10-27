@@ -167,6 +167,7 @@ pub struct Stack {
     dropped_udp: Vec<smoltcp::iface::UdpHandle>,
     rx_wakes: Vec<SocketHandle>,
     max_sockets: usize,
+    max_udp_sockets: usize,
     rx_pool_count: usize,
     rx_reserve: usize,
     ip_mtu: u16,
@@ -243,6 +244,7 @@ impl Stack {
             dropped_udp: Vec::with_capacity(config.max_udp_sockets),
             rx_wakes: Vec::with_capacity(config.max_sockets),
             max_sockets: config.max_sockets,
+            max_udp_sockets: config.max_udp_sockets,
             rx_pool_count,
             rx_reserve,
             ip_mtu: mtu,
@@ -454,6 +456,16 @@ impl Stack {
             }
         }
         self.device.flush().map_err(StackError::Port)
+    }
+
+    /// `StackConfig::max_sockets`.
+    pub fn max_sockets(&self) -> usize {
+        self.max_sockets
+    }
+
+    /// `StackConfig::max_udp_sockets`.
+    pub fn max_udp_sockets(&self) -> usize {
+        self.max_udp_sockets
     }
 
     /// When sockets next want a turn, evaluated at the latest time given

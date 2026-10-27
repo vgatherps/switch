@@ -1,11 +1,10 @@
 //! Wait registry: one waker slot per socket entry, the list of entries with a
 //! parked task, and the scratch the post-turn scan moves ready wakers into.
 //! Pure data; waking and dropping wakers is the caller's job, outside any
-//! borrow of the shared cell. Storage grows only when `insert` adds an entry
-//! slot (opening a socket), so `remove`, `park`, `clear`, `scan` and
-//! `restore_wakes` never allocate. One exception: wakers a panicking wake
-//! left undelivered stay in the scratch, and if their tasks park again
-//! before the next scan, that scan can outgrow it.
+//! borrow of the shared cell. Every list is sized once, at `with_capacity`,
+//! for the most entries that can be live; nothing here allocates afterwards.
+//! A scan starts from an empty scratch, so it never holds more wakers than
+//! there are entries.
 
 use std::mem;
 use std::task::Waker;
@@ -34,27 +33,26 @@ pub(crate) struct Registry<T> {
 }
 
 impl<T> Registry<T> {
-    pub(crate) fn new() -> Self {
-        Self { entries: Vec::new(), free: Vec::new(), waiting: Vec::new(), wakes: Vec::new() }
+    /// Room for `slots` live entries.
+    pub(crate) fn with_capacity(slots: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(slots),
+            free: Vec::with_capacity(slots),
+            waiting: Vec::with_capacity(slots),
+            wakes: Vec::with_capacity(slots),
+        }
     }
 
-    /// Adds an entry with no parked task. A new slot reserves `free`,
-    /// `waiting` and the wake scratch for every slot; a reused slot is
-    /// already covered.
+    /// Adds an entry with no parked task.
     pub(crate) fn insert(&mut self, socket: T) -> u32 {
         let entry = Entry { socket, waker: None, interest: Interest::Connect, listed: false };
         if let Some(index) = self.free.pop() {
             self.entries[index as usize] = Some(entry);
             return index;
         }
+        debug_assert!(self.entries.len() < self.entries.capacity(), "more entries than slots");
         self.entries.push(Some(entry));
-        let slots = self.entries.len();
-        self.free.reserve(slots - self.free.len());
-        self.waiting.reserve(slots - self.waiting.len());
-        // While `take_wakes` has the scratch out this reserves the empty
-        // stand-in; `restore_wakes` keeps whichever covers every slot.
-        self.wakes.reserve(slots - self.wakes.len());
-        u32::try_from(slots - 1).expect("more than u32::MAX entries")
+        u32::try_from(self.entries.len() - 1).expect("more than u32::MAX entries")
     }
 
     /// Removes the entry; returns its socket and any parked waker.
@@ -97,7 +95,9 @@ impl<T> Registry<T> {
     /// For each waiting entry: a cleared one leaves `waiting`; one for which
     /// `ready` holds moves its waker into the scratch and leaves `waiting`.
     /// Visits only waiting entries. Returns whether the scratch holds wakers.
+    /// The scratch must be empty: undelivered wakers go out first.
     pub(crate) fn scan(&mut self, mut ready: impl FnMut(&T, Interest) -> bool) -> bool {
+        debug_assert!(self.wakes.is_empty(), "scan before the last wakers were delivered");
         let mut at = 0;
         while at < self.waiting.len() {
             let entry = self.entries[self.waiting[at] as usize].as_mut().expect("waiting entry is live");
@@ -118,11 +118,16 @@ impl<T> Registry<T> {
         !self.wakes.is_empty()
     }
 
-    /// Whether a scan has anything to do: a waiting entry, or wakers left
+    /// Whether a turn has anything to do: a waiting entry, or wakers left
     /// undelivered by a panicking wake.
     #[inline]
     pub(crate) fn pending(&self) -> bool {
-        !self.waiting.is_empty() || !self.wakes.is_empty()
+        !self.waiting.is_empty() || self.has_wakes()
+    }
+
+    /// Whether the scratch holds wakers not yet delivered.
+    pub(crate) fn has_wakes(&self) -> bool {
+        !self.wakes.is_empty()
     }
 
     /// The scratch with the collected wakers, to wake outside the borrow.
@@ -132,16 +137,15 @@ impl<T> Registry<T> {
     }
 
     /// Puts back the scratch from `take_wakes`, holding any wakers not yet
-    /// delivered. Keeps it if it covers every slot, else (slots were added
-    /// meanwhile) moves the wakers into the stand-in `insert` reserved.
-    pub(crate) fn restore_wakes(&mut self, mut wakes: Vec<Waker>) {
-        debug_assert!(self.wakes.is_empty(), "scanned while the scratch was out");
-        if wakes.capacity() >= self.entries.len() {
-            self.wakes = wakes;
-        } else {
-            debug_assert!(self.wakes.capacity() >= self.entries.len());
-            self.wakes.append(&mut wakes);
-        }
+    /// delivered.
+    pub(crate) fn restore_wakes(&mut self, wakes: Vec<Waker>) {
+        debug_assert!(self.wakes.is_empty() && self.wakes.capacity() == 0, "scratch restored twice");
+        self.wakes = wakes;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacities(&self) -> [usize; 4] {
+        [self.entries.capacity(), self.free.capacity(), self.waiting.capacity(), self.wakes.capacity()]
     }
 
     #[cfg(test)]
@@ -178,7 +182,7 @@ mod tests {
 
     #[test]
     fn scan_visits_only_parked_entries() {
-        let mut registry = Registry::new();
+        let mut registry = Registry::with_capacity(16);
         let ids: Vec<u32> = (0..16).map(|socket| registry.insert(socket)).collect();
         let mut visits = 0;
         registry.scan(|_, _| {
@@ -198,7 +202,7 @@ mod tests {
 
     #[test]
     fn ready_entry_moves_its_waker_and_leaves_waiting() {
-        let mut registry = Registry::new();
+        let mut registry = Registry::with_capacity(2);
         let [a, b] = [registry.insert('a'), registry.insert('b')];
         let (count_a, wa) = waker();
         let (count_b, wb) = waker();
@@ -218,7 +222,7 @@ mod tests {
 
     #[test]
     fn repark_replaces_waker_and_lists_once() {
-        let mut registry = Registry::new();
+        let mut registry = Registry::with_capacity(1);
         let id = registry.insert(());
         let (first, w1) = waker();
         let (_, w2) = waker();
@@ -230,7 +234,7 @@ mod tests {
 
     #[test]
     fn cleared_entry_is_dropped_from_waiting_without_wake() {
-        let mut registry = Registry::new();
+        let mut registry = Registry::with_capacity(1);
         let id = registry.insert(());
         let (count, w) = waker();
         registry.park(id, Interest::TcpRecv, w);
@@ -243,7 +247,7 @@ mod tests {
 
     #[test]
     fn remove_unlists_and_reuses_index() {
-        let mut registry = Registry::new();
+        let mut registry = Registry::with_capacity(1);
         let id = registry.insert(1);
         let (_, w) = waker();
         registry.park(id, Interest::TcpRecv, w);
@@ -256,7 +260,7 @@ mod tests {
 
     #[test]
     fn park_and_scan_do_not_grow_storage() {
-        let mut registry = Registry::new();
+        let mut registry = Registry::with_capacity(8);
         let ids: Vec<u32> = (0..8).map(|socket| registry.insert(socket)).collect();
         let caps = (registry.waiting.capacity(), registry.wakes.capacity());
         for &id in &ids {
@@ -276,13 +280,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_does_not_allocate() {
-        let mut registry = Registry::new();
-        let first = registry.insert(0);
+    fn insert_up_to_capacity_and_remove_do_not_allocate() {
+        let mut registry = Registry::with_capacity(10);
+        let (first, allocs) = allocations(|| registry.insert(0));
+        assert_eq!(allocs, 0, "inserting the first entry allocated");
         let ((_, parked), allocs) = allocations(|| registry.remove(first));
         assert!(parked.is_none());
         assert_eq!(allocs, 0, "removing the first entry allocated");
-        let ids: Vec<u32> = (0..9).map(|socket| registry.insert(socket)).collect();
+        let (ids, allocs) = allocations(|| (0..10).map(|socket| registry.insert(socket)).collect::<Vec<u32>>());
+        assert_eq!(allocs, 1, "only the test's own id Vec may allocate");
         let ((), allocs) = allocations(|| ids.iter().for_each(|&id| drop(registry.remove(id))));
         assert_eq!(allocs, 0);
         let (reused, allocs) = allocations(|| registry.insert(42));
@@ -290,38 +296,11 @@ mod tests {
         assert_eq!(allocs, 0, "reusing a slot allocated");
     }
 
-    /// A wake callback opens sockets while the scratch is out: insert grows
-    /// the stand-in, and the restore must keep that one, not regrow the old.
+    /// A wake panicked after one delivery: the rest go back with the scratch,
+    /// unchanged, for the caller to deliver before the next scan.
     #[test]
-    fn slots_added_while_scratch_is_out_do_not_allocate_restore_or_scan() {
-        let mut registry = Registry::new();
-        let ids: Vec<u32> = (0..2).map(|socket| registry.insert(socket)).collect();
-        for &id in &ids {
-            registry.park(id, Interest::UdpRecv, waker().1);
-        }
-        assert!(registry.scan(|_, _| true));
-        let mut wakes = registry.take_wakes();
-        let taken = wakes.capacity();
-        let added: Vec<u32> = (2..=taken as u32 + 4).map(|socket| registry.insert(socket)).collect();
-        assert!(registry.entries.len() > taken);
-        wakes.drain(..).for_each(Waker::wake);
-        let ((), allocs) = allocations(|| registry.restore_wakes(wakes));
-        assert_eq!(allocs, 0, "restore regrew the old scratch");
-        assert!(registry.wakes.capacity() >= registry.entries.len());
-        for &id in ids.iter().chain(&added) {
-            registry.park(id, Interest::UdpRecv, waker().1);
-        }
-        let (woke, allocs) = allocations(|| registry.scan(|_, _| true));
-        assert!(woke);
-        assert_eq!(allocs, 0, "scan of every slot outgrew the scratch");
-        assert_eq!(registry.take_wakes().len(), registry.entries.len());
-    }
-
-    /// A wake panicked after one delivery: the rest go back with the scratch
-    /// and the next scan reports them, with no waiting entry left.
-    #[test]
-    fn undelivered_wakers_survive_restore_for_the_next_scan() {
-        let mut registry = Registry::new();
+    fn undelivered_wakers_survive_restore() {
+        let mut registry = Registry::with_capacity(3);
         let counts: Vec<Arc<Count>> = (0..3)
             .map(|socket| {
                 let id = registry.insert(socket);
@@ -337,9 +316,19 @@ mod tests {
         registry.restore_wakes(wakes);
         assert_eq!((registry.wakes.as_ptr(), registry.wakes.capacity()), (ptr, cap), "scratch replaced");
         assert_eq!(registry.waiting(), 0);
-        assert!(registry.pending());
-        assert!(registry.scan(|_, _| panic!("no entry is waiting")));
+        assert!(registry.pending() && registry.has_wakes());
         registry.take_wakes().into_iter().for_each(Waker::wake);
         assert!(counts.iter().all(|count| count.0.load(Ordering::Relaxed) == 1));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "scan before the last wakers were delivered")]
+    fn scan_with_undelivered_wakers_is_refused() {
+        let mut registry = Registry::with_capacity(1);
+        let id = registry.insert(());
+        registry.park(id, Interest::UdpRecv, waker().1);
+        assert!(registry.scan(|_, _| true));
+        registry.scan(|_, _| true);
     }
 }

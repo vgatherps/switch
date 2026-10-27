@@ -5,6 +5,9 @@
 //! its executor. Tasks hold a [`NetHandle`], which opens sockets but cannot
 //! turn the stack, and await owned received frames. Waking uses the std
 //! `Waker`; one task may wait per socket at a time (`recv` takes `&mut`).
+//! Parking clones the context's waker, and switch's waker cannot be cloned
+//! yet, so a switch task that has to wait on a socket panics until switch's
+//! cloneable waker lands.
 //! Everything is single-threaded (`Rc`), so no type here is `Send`.
 //!
 //! Received frames ([`TcpFrame`], [`Datagram`]) do not hold the Net: like
@@ -79,9 +82,20 @@ impl Inner {
         turn
     }
 
-    /// Moves the wakers of parked tasks whose socket is ready into the
-    /// scratch; whether it holds any. Out of line so the idle turn inlines.
+    /// After the Stack turn: what is left for outside the borrow.
     #[inline(never)]
+    fn collect(&mut self) -> Wake {
+        if self.registry.has_wakes() {
+            Wake::Leftovers
+        } else if self.scan() {
+            Wake::Ready
+        } else {
+            Wake::Nothing
+        }
+    }
+
+    /// Moves the wakers of parked tasks whose socket is ready into the
+    /// (empty) scratch; whether it holds any.
     fn scan(&mut self) -> bool {
         let Inner { stack, registry, .. } = self;
         registry.scan(|socket, interest| ready(stack, socket, interest))
@@ -95,16 +109,29 @@ impl Inner {
     }
 }
 
+/// What a turn must deliver once the stack is released.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Nothing,
+    /// The scan collected wakers.
+    Ready,
+    /// A panicking wake left wakers undelivered: deliver them, then scan.
+    Leftovers,
+}
+
 fn ready(stack: &Stack, socket: &Socket, interest: Interest) -> bool {
     match (socket, interest) {
         (Socket::Tcp(handle), Interest::Connect) => !handshaking(stack.tcp(handle).state()),
-        (Socket::Tcp(handle), Interest::TcpRecv) => {
-            let socket = stack.tcp(handle);
-            socket.can_recv() || !socket.may_recv()
-        }
+        (Socket::Tcp(handle), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
         (Socket::Udp(handle), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
         _ => unreachable!("interest does not match socket kind"),
     }
+}
+
+/// Whether TCP `recv` returns something other than `Ok(None)`: a frame or an
+/// error. Takes `&Socket`, so checking marks nothing for egress.
+fn tcp_recv_ready(socket: &tcp::Socket<'_>) -> bool {
+    socket.can_recv() || !socket.may_recv()
 }
 
 /// SynSent, or SynReceived after a simultaneous open.
@@ -121,10 +148,12 @@ pub struct Net {
 }
 
 impl Net {
+    /// Sizes the wait registry once for every socket `stack` can hold.
     pub fn new(stack: Stack, config: NetConfig) -> Net {
+        let slots = stack.max_sockets() + stack.max_udp_sockets();
         let inner = Inner {
             stack,
-            registry: Registry::new(),
+            registry: Registry::with_capacity(slots),
             ingress_budget: config.ingress_budget,
             poisoned: false,
             #[cfg(test)]
@@ -141,30 +170,43 @@ impl Net {
     /// every task parked on a socket that became ready. The check visits only
     /// sockets with a parked task. Wakers run after the stack is released.
     ///
+    /// The check and the wakes run also when `Stack::turn` returns an error:
+    /// it can return `StackError::Port` from egress after ingress already
+    /// queued data or applied a FIN or reset, and those tasks must not sleep.
+    ///
     /// A panic out of `Stack::turn` poisons the Net: every later call except
     /// drops and `into_stack` panics. A panic out of a waker's `wake`
-    /// propagates; the other ready tasks not yet woken are woken by the next
-    /// turn.
+    /// propagates and discards this turn's result (the `Turn` or the error);
+    /// the ready tasks not yet woken are woken by the next turn.
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
-        let mut woke = false;
+        let mut wake = Wake::Nothing;
         let turn = self.shared.with(|inner| {
             let turn = inner.stack_turn(now);
             if inner.registry.pending() {
-                woke = inner.scan();
+                wake = inner.collect();
             }
             turn
         });
-        if woke {
-            self.wake_ready();
+        if wake != Wake::Nothing {
+            self.wake_ready(wake);
         }
         turn
     }
 
-    /// Wakes the wakers the scan collected, outside the borrow. If a wake
-    /// unwinds, the rest go back into the registry with the scratch.
+    /// Delivers what the turn collected; after leftovers, scans (from an
+    /// empty scratch) and delivers that too.
     #[inline(never)]
-    fn wake_ready(&self) {
+    fn wake_ready(&self, wake: Wake) {
+        self.deliver();
+        if wake == Wake::Leftovers && self.shared.with(Inner::scan) {
+            self.deliver();
+        }
+    }
+
+    /// Wakes the scratch's wakers outside the borrow. If a wake unwinds, the
+    /// rest go back into the registry with the scratch.
+    fn deliver(&self) {
         struct Deliver<'a> {
             shared: &'a Shared,
             wakes: Vec<Waker>,
@@ -192,6 +234,8 @@ impl Net {
 
     /// The Stack back, for teardown. `Err(self)` while any `NetHandle` or
     /// socket is alive. Frames may still be held: they outlive the Stack.
+    /// From a poisoned Net the Stack is one whose turn panicked: drop it or
+    /// call `into_port`, nothing else.
     pub fn into_stack(self) -> Result<Stack, Net> {
         match Rc::try_unwrap(self.shared) {
             Ok(cell) => Ok(cell.into_inner().stack),
@@ -383,6 +427,10 @@ impl Future for Recv<'_> {
                 Socket::Tcp(handle) => handle,
                 Socket::Udp(_) => unreachable!("TCP entry holds a UDP handle"),
             };
+            // `tcp_mut` marks the socket for egress; take it only to pop.
+            if !tcp_recv_ready(inner.stack.tcp(handle)) {
+                return None;
+            }
             match inner.stack.tcp_mut(handle).recv() {
                 Ok(None) => None,
                 Ok(Some(frame)) => Some(Ok(TcpFrame(frame))),
@@ -507,6 +555,7 @@ mod tests {
     use zhida_test_kit::with_eal;
 
     use super::*;
+    use crate::alloc_count::allocations;
 
     fn message(payload: Box<dyn Any + Send>) -> String {
         match payload.downcast::<String>() {
@@ -522,24 +571,50 @@ mod tests {
         }
     }
 
+    const RX_CAPACITY: usize = 6 * 1460;
+
+    /// A Net alone on a net_ring port: nothing ever arrives.
+    fn lone_net(eal: &dpdk_smoltcp::Eal, name: &str, max_tcp: usize, max_udp: usize) -> (RingPort, Net) {
+        let fixture = RingPort::new(name, 16, 16);
+        let stack_config =
+            StackConfig { max_sockets: max_tcp, max_udp_sockets: max_udp, ..pair::config(Side::A) };
+        let mut config = fixture.config();
+        let reserve = rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
+        config.rx_pool.count = rx_pool_count(reserve, config.mtu, std::iter::repeat_n(RX_CAPACITY, max_tcp))
+            + u32::try_from(4 * max_udp).unwrap();
+        let stack = match Stack::new(fixture.open_with(eal, config), stack_config, T0) {
+            Ok(stack) => stack,
+            Err((_, error)) => panic!("{error}"),
+        };
+        (fixture, Net::new(stack, NetConfig { ingress_budget: BUDGET }))
+    }
+
+    fn close(fixture: RingPort, net: Net) {
+        let port = net.into_stack().ok().expect("every socket and handle dropped").into_port();
+        fixture.drain();
+        assert_eq!(fixture.in_use(), (0, 0));
+        port.try_close().unwrap();
+        fixture.close();
+    }
+
+    fn udp(port: u16) -> UdpConfig {
+        UdpConfig { port, rx_queue: 4, tx_checksum: true, broadcast: false }
+    }
+
+    fn connect(handle: &NetHandle, port: u16) -> Connecting {
+        let config = tcp::Config { rx_capacity: RX_CAPACITY, tx_capacity: 4096, mss_cap: None };
+        let remote = IpEndpoint::new(Side::B.ip().into(), 80);
+        handle.tcp_connect(config, remote, IpListenEndpoint { addr: None, port }).unwrap()
+    }
+
     /// The injected panic stands in for one unwinding out of `Stack::turn`
     /// (conduit has no deterministic trigger); it runs where `Stack::turn`
     /// would, under the same poison guard.
     #[zhida_test_support::pinned_test]
     fn stack_turn_panic_poisons_every_later_operation_but_drop_and_into_stack() {
         with_eal(|eal| {
-            let fixture = RingPort::new("pois", 16, 16);
-            let stack_config = StackConfig { max_udp_sockets: 2, ..pair::config(Side::A) };
-            let mut config = fixture.config();
-            let reserve = rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
-            config.rx_pool.count = rx_pool_count(reserve, config.mtu, []) + 8;
-            let stack = match Stack::new(fixture.open_with(eal, config), stack_config, T0) {
-                Ok(stack) => stack,
-                Err((_, error)) => panic!("{error}"),
-            };
-            let mut net = Net::new(stack, NetConfig { ingress_budget: BUDGET });
+            let (fixture, mut net) = lone_net(eal, "pois", 1, 2);
             let handle = net.handle();
-            let udp = |port| UdpConfig { port, rx_queue: 4, tx_checksum: true, broadcast: false };
             let mut socket = handle.udp_bind(udp(7000)).unwrap();
             let mut recv = Box::pin(socket.recv());
             let mut cx = Context::from_waker(Waker::noop());
@@ -557,12 +632,62 @@ mod tests {
             drop(recv);
             drop(socket);
             drop(handle);
-            let stack = net.into_stack().ok().expect("every socket and handle dropped");
-            let port = stack.into_port();
-            fixture.drain();
-            assert_eq!(fixture.in_use(), (0, 0));
-            port.try_close().unwrap();
-            fixture.close();
+            close(fixture, net);
+        })
+    }
+
+    #[zhida_test_support::pinned_test]
+    fn registry_is_sized_once_for_every_stack_socket() {
+        with_eal(|eal| {
+            let (fixture, net) = lone_net(eal, "size", 3, 2);
+            assert_eq!(net.shared.with(|inner| inner.registry.capacities()), [5; 4]);
+            close(fixture, net);
+        })
+    }
+
+    /// Every UDP and TCP socket parked, one canceled: turns allocate nothing.
+    #[zhida_test_support::pinned_test]
+    fn turns_with_parked_and_canceled_sockets_do_not_allocate() {
+        with_eal(|eal| {
+            let (fixture, mut net) = lone_net(eal, "talc", 2, 16);
+            let handle = net.handle();
+            let mut sockets: Vec<UdpSocket> = (0..16).map(|i| handle.udp_bind(udp(7000 + i)).unwrap()).collect();
+            let mut connecting = [connect(&handle, 49152), connect(&handle, 49153)].map(Box::pin);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut recvs: Vec<_> = sockets.iter_mut().map(|socket| Box::pin(socket.recv())).collect();
+            for recv in &mut recvs {
+                assert!(recv.as_mut().poll(&mut cx).is_pending());
+            }
+            for connect in &mut connecting {
+                assert!(connect.as_mut().poll(&mut cx).is_pending());
+            }
+            net.turn(T0).unwrap();
+            let (turns, allocs) = allocations(|| (0..8).map(|_| net.turn(T0).is_ok()).filter(|&ok| ok).count());
+            assert_eq!((turns, allocs), (8, 0));
+            drop(recvs.pop());
+            let (turn, allocs) = allocations(|| net.turn(T0));
+            turn.unwrap();
+            assert_eq!(allocs, 0, "the turn that unlists a canceled future allocated");
+            drop(recvs);
+            drop((connecting, sockets, handle));
+            close(fixture, net);
+        })
+    }
+
+    #[zhida_test_support::pinned_test]
+    fn dropping_sockets_through_the_net_does_not_allocate() {
+        with_eal(|eal| {
+            let (fixture, net) = lone_net(eal, "dalc", 1, 1);
+            let handle = net.handle();
+            let udp_socket = handle.udp_bind(udp(7000)).unwrap();
+            let ((), allocs) = allocations(|| drop(udp_socket));
+            assert_eq!(allocs, 0, "dropping a UdpSocket allocated");
+            // `Connecting` owns the TcpStream; dropping it runs the stream's drop.
+            let connecting = connect(&handle, 49152);
+            let ((), allocs) = allocations(|| drop(connecting));
+            assert_eq!(allocs, 0, "dropping a TcpStream allocated");
+            drop(handle);
+            close(fixture, net);
         })
     }
 }
