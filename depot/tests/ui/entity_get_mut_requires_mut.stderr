@@ -1,0 +1,10 @@
+error[E0596]: cannot borrow `entity` as mutable, as it is not declared as mutable
+  --> tests/ui/entity_get_mut_requires_mut.rs:32:39
+   |
+32 |     let _value = pool.get_mut::<Meta>(&mut entity);
+   |                                       ^^^^^^^^^^^ cannot borrow as mutable
+   |
+help: consider changing this to be mutable
+   |
+31 |     let mut entity = pool.alloc().unwrap();
+   |         +++

@@ -1,0 +1,12 @@
+error[E0597]: `claim` does not live long enough
+  --> tests/ui/mainline_id_guard_cannot_escape_claim.rs:35:9
+   |
+33 |     let guard = {
+   |         ----- borrow later stored here
+34 |         let claim = ClaimEscapePool::claim().unwrap();
+   |             ----- binding `claim` declared here
+35 |         claim
+   |         ^^^^^ borrowed value does not live long enough
+...
+38 |     };
+   |     - `claim` dropped here while still borrowed

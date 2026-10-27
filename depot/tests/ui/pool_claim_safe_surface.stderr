@@ -1,0 +1,5 @@
+error[E0576]: cannot find method or associated constant `core` in trait `PoolClaim`
+ --> tests/ui/pool_claim_safe_surface.rs:4:44
+  |
+4 |     let _core = unsafe { <P as PoolClaim>::core(claim) };
+  |                                            ^^^^ not found in `PoolClaim`

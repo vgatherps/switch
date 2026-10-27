@@ -25,6 +25,8 @@ members = [
     "cephalopod/crates/control",
     # switch
     "switch",
+    # depot (vendored from ~/src/meminfra/depot)
+    "depot",
 ]
 exclude = ["conduit/vendor/smoltcp"]
 
