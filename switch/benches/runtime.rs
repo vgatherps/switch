@@ -15,14 +15,14 @@ fn runtime_benches(c: &mut Criterion) {
 
     let mut repeated = Runtime::new(0);
     c.bench_function("runtime_empty_repeated", |b| {
-        b.iter(|| black_box(repeated.poll(0, || {}).unwrap()))
+        b.iter(|| black_box(repeated.poll(0).unwrap()))
     });
     let mut advancing = Runtime::new(0);
     let mut tick = 0u64;
     c.bench_function("runtime_empty_advancing", |b| {
         b.iter(|| {
             tick = tick.checked_add(1).unwrap();
-            black_box(advancing.poll(black_box(tick), || {}).unwrap())
+            black_box(advancing.poll(black_box(tick)).unwrap())
         })
     });
     let mut pending = workload::PendingSleep::new();

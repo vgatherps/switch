@@ -44,14 +44,14 @@ fn ready_and_self_waking_pending_task_run_in_two_turns() {
         })
         .unwrap();
 
-    let first = runtime.poll(0, || {}).unwrap();
+    let first = runtime.poll(0).unwrap();
     assert_eq!(
         (first.tasks_polled, first.tasks_completed, first.live_tasks),
         (2, 1, 1)
     );
     assert_eq!(*trace.borrow(), ["ready", "pending first poll"]);
 
-    let second = runtime.poll(0, || {}).unwrap();
+    let second = runtime.poll(0).unwrap();
     assert_eq!(
         (
             second.tasks_polled,

@@ -10,16 +10,13 @@
 //! caller-defined, and absolute deadlines may use the full `u64` range. A relative sleep
 //! captures the latest accepted tick when it is created.
 //!
-//! A poll accepts an equal or later tick, advances timers, invokes the event callback once,
-//! then polls one ready-task snapshot. The runtime never waits, though callback or future
-//! code can block. A regressed tick returns
-//! [`RuntimeError::TimeRegressed`] without invoking the callback or changing runtime state.
-//! If the callback or a task panics, the original panic payload unwinds to the caller; the
+//! A poll accepts an equal or later tick, advances timers, then polls one ready-task snapshot.
+//! Work that wakes or spawns tasks must run before [`Runtime::poll`]; those tasks are polled by
+//! that call. The runtime never waits, though future code can block. A regressed tick returns
+//! [`RuntimeError::TimeRegressed`] without changing runtime state.
+//! If a task panics, the original panic payload unwinds to the caller; the
 //! runtime rejects new work and later turns, while [`Runtime::shutdown`] remains available
 //! for cleanup.
-//!
-//! The callback returns `()`. To call an event method with a non-unit return, discard its
-//! result explicitly with a semicolon: `|| { interface.poll_nonblocking(); }`.
 //!
 //! ## Waking
 //!
@@ -38,7 +35,7 @@
 //!     println!("Hello!");
 //! }).unwrap();
 //!
-//! while runtime.poll(100, || {}).unwrap().live_tasks != 0 {}
+//! while runtime.poll(100).unwrap().live_tasks != 0 {}
 //! ```
 //!
 //! ```compile_fail
@@ -67,7 +64,7 @@
 //! ```
 //! ```compile_fail
 //! fn cannot_drive(spawner: &switch::Spawner) {
-//!     spawner.poll(0, || {});
+//!     spawner.poll(0);
 //! }
 //! ```
 //! ```compile_fail

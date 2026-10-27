@@ -57,7 +57,7 @@ fn test_spawn_and_poll() {
         })
         .unwrap();
 
-    let report = runtime.poll(0, || {}).unwrap();
+    let report = runtime.poll(0).unwrap();
     assert_eq!(
         (
             report.tasks_polled,
@@ -84,10 +84,10 @@ fn test_yield_and_resume() {
         .unwrap();
 
     let mut polls = 0;
-    let mut report = runtime.poll(0, || {}).unwrap();
+    let mut report = runtime.poll(0).unwrap();
     polls += report.tasks_polled;
     while report.live_tasks != 0 {
-        report = runtime.poll(0, || {}).unwrap();
+        report = runtime.poll(0).unwrap();
         polls += report.tasks_polled;
     }
 
@@ -110,7 +110,7 @@ fn test_multiple_tasks() {
             .unwrap();
     }
 
-    let report = runtime.poll(0, || {}).unwrap();
+    let report = runtime.poll(0).unwrap();
     assert_eq!(
         (
             report.tasks_polled,
@@ -140,12 +140,12 @@ fn test_nested_spawn() {
         })
         .unwrap();
 
-    let first = runtime.poll(0, || {}).unwrap();
+    let first = runtime.poll(0).unwrap();
     assert_eq!(
         (first.tasks_polled, first.tasks_completed, first.live_tasks),
         (1, 1, 1)
     );
-    let second = runtime.poll(0, || {}).unwrap();
+    let second = runtime.poll(0).unwrap();
     assert_eq!(
         (
             second.tasks_polled,
@@ -177,7 +177,7 @@ fn test_stored_waker_across_polls() {
         })
         .unwrap();
 
-    let first = runtime.poll(0, || {}).unwrap(); // First poll stores waker
+    let first = runtime.poll(0).unwrap(); // First poll stores waker
     assert_eq!((first.tasks_polled, first.live_tasks), (1, 1));
     assert!(!done.get());
 
@@ -185,7 +185,7 @@ fn test_stored_waker_across_polls() {
     let stored = waker_slot.take().unwrap();
     stored.wake();
 
-    let second = runtime.poll(0, || {}).unwrap(); // Second poll completes
+    let second = runtime.poll(0).unwrap(); // Second poll completes
     assert_eq!(
         (
             second.tasks_polled,
@@ -229,9 +229,9 @@ fn test_interleaved_yields() {
         })
         .unwrap();
 
-    let mut report = runtime.poll(0, || {}).unwrap();
+    let mut report = runtime.poll(0).unwrap();
     while report.live_tasks != 0 {
-        report = runtime.poll(0, || {}).unwrap();
+        report = runtime.poll(0).unwrap();
     }
 
     let entries = log.take();
@@ -245,7 +245,7 @@ fn test_interleaved_yields() {
 fn test_empty_poll() {
     let mut runtime = Runtime::new(0);
     assert_eq!(
-        runtime.poll(0, || {}).unwrap(),
+        runtime.poll(0).unwrap(),
         switch::PollReport::default()
     );
 }
@@ -282,10 +282,10 @@ fn test_thin_waker() {
         .unwrap();
 
     let mut polls = 0;
-    let mut report = runtime.poll(0, || {}).unwrap();
+    let mut report = runtime.poll(0).unwrap();
     polls += report.tasks_polled;
     while report.live_tasks != 0 {
-        report = runtime.poll(0, || {}).unwrap();
+        report = runtime.poll(0).unwrap();
         polls += report.tasks_polled;
     }
 

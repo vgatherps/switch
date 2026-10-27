@@ -37,7 +37,7 @@ fn bench_spawn_ready(c: &mut Criterion) {
     c.bench_function("spawn_ready_1", |b| {
         b.iter(|| {
             spawner.spawn(Ready).unwrap();
-            runtime.poll(0, || {}).unwrap();
+            runtime.poll(0).unwrap();
         })
     });
 }
@@ -48,7 +48,7 @@ fn bench_spawn_yield(c: &mut Criterion) {
     c.bench_function("spawn_yield_10", |b| {
         b.iter(|| {
             spawner.spawn(YieldN(10)).unwrap();
-            while runtime.poll(0, || {}).unwrap().live_tasks != 0 {}
+            while runtime.poll(0).unwrap().live_tasks != 0 {}
         })
     });
 }
@@ -61,7 +61,7 @@ fn bench_many_tasks(c: &mut Criterion) {
             for _ in 0..64 {
                 spawner.spawn(Ready).unwrap();
             }
-            while runtime.poll(0, || {}).unwrap().live_tasks != 0 {}
+            while runtime.poll(0).unwrap().live_tasks != 0 {}
         })
     });
 }
@@ -72,8 +72,8 @@ fn bench_waker_overhead(c: &mut Criterion) {
     c.bench_function("waker_wake_overhead", |b| {
         b.iter(|| {
             spawner.spawn(YieldN(1)).unwrap();
-            runtime.poll(0, || {}).unwrap();
-            runtime.poll(0, || {}).unwrap();
+            runtime.poll(0).unwrap();
+            runtime.poll(0).unwrap();
         })
     });
 }
@@ -82,7 +82,7 @@ fn bench_poll_empty(c: &mut Criterion) {
     let mut runtime = Runtime::new(0);
     c.bench_function("poll_empty", |b| {
         b.iter(|| {
-            runtime.poll(0, || {}).unwrap();
+            runtime.poll(0).unwrap();
         })
     });
 }
@@ -93,7 +93,7 @@ fn bench_yield_chain(c: &mut Criterion) {
     c.bench_function("yield_chain_100", |b| {
         b.iter(|| {
             spawner.spawn(YieldN(100)).unwrap();
-            while runtime.poll(0, || {}).unwrap().live_tasks != 0 {}
+            while runtime.poll(0).unwrap().live_tasks != 0 {}
         })
     });
 }
@@ -130,13 +130,13 @@ fn bench_pure_yield(c: &mut Criterion) {
 
     c.bench_function("pure_yield", |b| {
         b.iter(|| {
-            runtime.poll(0, || {}).unwrap();
+            runtime.poll(0).unwrap();
         })
     });
 
     // Clean up
     stop.set(true);
-    runtime.poll(0, || {}).unwrap();
+    runtime.poll(0).unwrap();
 }
 
 /// Includes checked ThinWaker extraction followed by direct local waking.
@@ -163,11 +163,11 @@ fn bench_pure_direct_yield(c: &mut Criterion) {
     spawner.spawn(DirectYieldForever(stop.clone())).unwrap();
     c.bench_function("pure_direct_yield", |b| {
         b.iter(|| {
-            runtime.poll(0, || {}).unwrap();
+            runtime.poll(0).unwrap();
         })
     });
     stop.set(true);
-    runtime.poll(0, || {}).unwrap();
+    runtime.poll(0).unwrap();
 }
 
 criterion_group!(

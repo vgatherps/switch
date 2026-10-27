@@ -72,30 +72,27 @@ fn middle_batch_panic_preserves_payload_and_retires_pending_expired_and_unproces
             })
             .unwrap();
     }
-    assert_eq!(runtime.poll(0, || {}).unwrap().tasks_polled, 2);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 2);
     let polls: [Rc<Cell<usize>>; 3] = std::array::from_fn(|_| Rc::new(Cell::new(0)));
     let drops: [Rc<Cell<usize>>; 3] = std::array::from_fn(|_| Rc::new(Cell::new(0)));
     // AssertUnwindSafe wraps a reviewed shutdown-only runtime; no scheduling resumes.
-    let payload = catch_unwind(AssertUnwindSafe(|| {
-        runtime.poll(5, || {
-            for mode in 0..3 {
-                spawner
-                    .spawn(Counted {
-                        mode,
-                        polls: polls[mode as usize].clone(),
-                        drops: drops[mode as usize].clone(),
-                    })
-                    .unwrap();
-            }
-        })
-    }))
+    for mode in 0..3 {
+        spawner
+            .spawn(Counted {
+                mode,
+                polls: polls[mode as usize].clone(),
+                drops: drops[mode as usize].clone(),
+            })
+            .unwrap();
+    }
+    let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(5)))
     .unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&98765));
     assert_eq!(polls.each_ref().map(|p| p.get()), [1, 1, 0]);
     assert_eq!(drops.each_ref().map(|p| p.get()), [1, 0, 0]);
     assert_eq!(timer_drops.get(), 0);
     assert_eq!(
-        runtime.poll(5, || panic!("rejected callback")),
+        runtime.poll(5),
         Err(RuntimeError::Panicked)
     );
     assert_eq!(

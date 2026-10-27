@@ -96,22 +96,22 @@ fn reserved_real_sleep_phases_and_task_allocation_are_distinct() {
     let task = holder(&slot, &stop_a, &drops);
     let (_, spawn) = measure(|| spawner.spawn(task).unwrap());
     assert_eq!((spawn.allocations, spawn.reallocations), (1, 0));
-    let (r, register) = measure(|| runtime.poll(100, || {}).unwrap());
+    let (r, register) = measure(|| runtime.poll(100).unwrap());
     assert_eq!((r.tasks_polled, r.ready_tasks, r.live_tasks), (1, 1, 1));
     no_alloc(register);
-    let (_, refresh) = measure(|| runtime.poll(100, || {}).unwrap());
+    let (_, refresh) = measure(|| runtime.poll(100).unwrap());
     no_alloc(refresh);
     let task = holder(&slot, &stop_b, &drops);
     let (_, spawn_b) = measure(|| spawner.spawn(task).unwrap());
     assert_eq!((spawn_b.allocations, spawn_b.reallocations), (1, 0));
-    let (r, transfer) = measure(|| runtime.poll(100, || {}).unwrap());
+    let (r, transfer) = measure(|| runtime.poll(100).unwrap());
     assert_eq!(r.tasks_polled, 2);
     no_alloc(transfer);
     stop_a.set(true);
-    let (r, retire_a) = measure(|| runtime.poll(100, || {}).unwrap());
+    let (r, retire_a) = measure(|| runtime.poll(100).unwrap());
     assert_eq!((r.tasks_completed, r.live_tasks), (1, 1));
     no_alloc(retire_a);
-    let (r, expiry) = measure(|| runtime.poll(110, || {}).unwrap());
+    let (r, expiry) = measure(|| runtime.poll(110).unwrap());
     assert_eq!(
         (
             r.timers_expired,
@@ -130,11 +130,11 @@ fn reserved_real_sleep_phases_and_task_allocation_are_distinct() {
     let stop = Rc::new(Cell::new(false));
     let task = holder(&cancel_slot, &stop, &drops);
     spawner.spawn(task).unwrap();
-    let (_, register_reuse) = measure(|| runtime.poll(110, || {}).unwrap());
+    let (_, register_reuse) = measure(|| runtime.poll(110).unwrap());
     no_alloc(register_reuse);
     let (_, cancel) = measure(|| drop(cancel_slot.borrow_mut().take()));
     no_alloc(cancel);
-    assert_eq!(runtime.poll(120, || {}).unwrap().timers_expired, 0);
+    assert_eq!(runtime.poll(120).unwrap().timers_expired, 0);
     let (_, shutdown) = measure(|| runtime.shutdown());
     no_alloc(shutdown);
     assert_eq!(drops.get(), 3);
@@ -159,9 +159,9 @@ fn zero_reservation_growth_is_reported_separately() {
     let task = holder(&slot, &stop, &drops);
     let (_, spawn_growth) = measure(|| spawner.spawn(task).unwrap());
     assert!(spawn_growth.allocations + spawn_growth.reallocations >= 3);
-    let (_, timer_growth) = measure(|| runtime.poll(0, || {}).unwrap());
+    let (_, timer_growth) = measure(|| runtime.poll(0).unwrap());
     assert!(timer_growth.allocations + timer_growth.reallocations >= 2);
-    let (_, steady) = measure(|| runtime.poll(0, || {}).unwrap());
+    let (_, steady) = measure(|| runtime.poll(0).unwrap());
     no_alloc(steady);
     let (_, shutdown) = measure(|| runtime.shutdown());
     no_alloc(shutdown);

@@ -114,7 +114,7 @@ impl Mixed {
         }
     }
     pub fn step(&mut self, index: usize) -> PollReport {
-        // Offered events are queued by the outside driver before the callback.
+        // Offered events are queued by the outside driver before polling.
         match index {
             0 => self.events.push_back(1),
             2 => {
@@ -128,25 +128,22 @@ impl Mixed {
         let events = &mut self.events;
         let spawner = &self.spawner;
         let audit = &self.audit;
-        self.runtime
-            .poll(TICKS[index], || {
-                while let Some(value) = events.pop_front() {
-                    let sleeps = if value == 4 {
-                        vec![spawner.sleep_until(u64::MAX).unwrap()]
-                    } else {
-                        Vec::new()
-                    };
-                    spawner
-                        .spawn(Task {
-                            sleeps,
-                            yields: 0,
-                            value,
-                            audit: audit.clone(),
-                        })
-                        .unwrap();
-                }
-            })
-            .unwrap()
+        while let Some(value) = events.pop_front() {
+            let sleeps = if value == 4 {
+                vec![spawner.sleep_until(u64::MAX).unwrap()]
+            } else {
+                Vec::new()
+            };
+            spawner
+                .spawn(Task {
+                    sleeps,
+                    yields: 0,
+                    value,
+                    audit: audit.clone(),
+                })
+                .unwrap();
+        }
+        self.runtime.poll(TICKS[index]).unwrap()
     }
     pub fn run(&mut self) -> [PollReport; 6] {
         std::array::from_fn(|index| self.step(index))
@@ -154,7 +151,7 @@ impl Mixed {
     pub fn validate(&self, reports: [PollReport; 6]) {
         assert_eq!(reports.map(counts), EXPECTED);
         assert_eq!(self.audit.checksum.get(), 583);
-        assert_eq!(*self.audit.output.borrow(), [1, 40, 2, 3, 528, 4, 5]);
+        assert_eq!(*self.audit.output.borrow(), [1, 40, 2, 3, 528, 5, 4]);
         assert_eq!(self.audit.drops.get(), 7);
         assert!(self.events.is_empty());
     }
@@ -210,7 +207,7 @@ impl PendingSleep {
                 drops: drops.clone(),
             })
             .unwrap();
-        runtime.poll(0, || {}).unwrap();
+        runtime.poll(0).unwrap();
         Self {
             runtime,
             polls,
@@ -219,7 +216,7 @@ impl PendingSleep {
         }
     }
     pub fn step(&mut self) -> PollReport {
-        self.runtime.poll(0, || {}).unwrap()
+        self.runtime.poll(0).unwrap()
     }
     pub fn finish(&mut self) -> PollReport {
         self.stop.set(true);

@@ -33,18 +33,12 @@ mod tests {
         let mut events = EventQueue {
             pending: VecDeque::from(["one", "two"]),
         };
-        let first = runtime
-            .poll(0, || {
-                assert_eq!(events.poll_nonblocking(&spawner), 2);
-            })
-            .unwrap();
+        assert_eq!(events.poll_nonblocking(&spawner), 2);
+        let first = runtime.poll(0).unwrap();
         assert_eq!((first.tasks_polled, first.tasks_completed), (2, 2));
         assert_eq!(first.live_tasks, 0);
-        let second = runtime
-            .poll(0, || {
-                assert_eq!(events.poll_nonblocking(&spawner), 0);
-            })
-            .unwrap();
+        assert_eq!(events.poll_nonblocking(&spawner), 0);
+        let second = runtime.poll(0).unwrap();
         assert_eq!(second, switch::PollReport::default());
     }
 }
@@ -67,11 +61,8 @@ fn main() {
         if now == 110 {
             events.pending.push_back("event at deadline");
         }
-        let report = runtime
-            .poll(now, || {
-                events.poll_nonblocking(&spawner);
-            })
-            .unwrap();
+        events.poll_nonblocking(&spawner);
+        let report = runtime.poll(now).unwrap();
         println!("tick {now}: {report:?}");
     }
 }

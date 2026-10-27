@@ -44,7 +44,7 @@ impl Drop for ParkedSleep {
 }
 
 #[test]
-fn callback_duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_once() {
+fn duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_once() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let wake = Rc::new(RefCell::new(None));
@@ -63,25 +63,19 @@ fn callback_duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_onc
         live_tasks: 1,
         ..PollReport::default()
     };
-    assert_eq!(runtime.poll(0, || {}).unwrap(), polled_pending);
+    assert_eq!(runtime.poll(0).unwrap(), polled_pending);
     assert!(wake.borrow().is_some());
-    let callbacks = Cell::new(0);
+    assert_eq!((polls.get(), drops.get()), (1, 0));
+    let stored = wake.borrow().as_ref().copied().unwrap();
+    stored.wake();
+    stored.wake();
     assert_eq!(
-        runtime
-            .poll(0, || {
-                callbacks.set(callbacks.get() + 1);
-                assert_eq!((polls.get(), drops.get()), (1, 0));
-                // Copy ends before polling resumes; no handle survives completion.
-                let stored = wake.borrow().as_ref().copied().unwrap();
-                stored.wake();
-                stored.wake();
-            })
-            .unwrap(),
+        runtime.poll(0).unwrap(),
         polled_pending
     );
-    assert_eq!((callbacks.get(), polls.get(), drops.get()), (1, 2, 0));
+    assert_eq!((polls.get(), drops.get()), (2, 0));
     assert_eq!(
-        runtime.poll(0, || {}).unwrap(),
+        runtime.poll(0).unwrap(),
         PollReport {
             live_tasks: 1,
             ..PollReport::default()
@@ -89,7 +83,7 @@ fn callback_duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_onc
     );
     assert_eq!((polls.get(), drops.get()), (2, 0));
     assert_eq!(
-        runtime.poll(10, || {}).unwrap(),
+        runtime.poll(10).unwrap(),
         PollReport {
             tasks_polled: 1,
             tasks_completed: 1,

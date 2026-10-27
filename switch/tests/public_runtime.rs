@@ -15,7 +15,7 @@ impl Interface {
 }
 
 #[test]
-fn public_runtime_drives_sleep_with_caller_ticks_and_unit_event_callback() {
+fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
     let mut runtime = Runtime::with_capacity(
         100,
         Capacity {
@@ -36,29 +36,20 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_unit_event_callback() {
         .unwrap();
 
     let mut interface = Interface { calls: 0 };
-    let first = runtime
-        .poll(100, || {
-            interface.poll_nonblocking();
-        })
-        .unwrap();
+    interface.poll_nonblocking();
+    let first = runtime.poll(100).unwrap();
     assert_eq!(
         (first.tasks_polled, first.tasks_completed, first.live_tasks),
         (1, 0, 1)
     );
     assert!(!completed.get());
 
-    let repeated = runtime
-        .poll(100, || {
-            interface.poll_nonblocking();
-        })
-        .unwrap();
+    interface.poll_nonblocking();
+    let repeated = runtime.poll(100).unwrap();
     assert_eq!(repeated.tasks_polled, 0);
 
-    let expired = runtime
-        .poll(110, || {
-            interface.poll_nonblocking();
-        })
-        .unwrap();
+    interface.poll_nonblocking();
+    let expired = runtime.poll(110).unwrap();
     assert_eq!(
         (
             expired.timers_expired,
@@ -80,7 +71,7 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_unit_event_callback() {
             task_due_completed.set(true);
         })
         .unwrap();
-    let due = runtime.poll(110, || {}).unwrap();
+    let due = runtime.poll(110).unwrap();
     assert_eq!(
         (due.tasks_polled, due.tasks_completed, due.timers_expired),
         (1, 1, 0)

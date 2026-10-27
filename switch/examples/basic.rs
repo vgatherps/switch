@@ -39,7 +39,7 @@ fn main() {
         .unwrap();
 
     loop {
-        let report = runtime.poll(0, || {}).unwrap();
+        let report = runtime.poll(0).unwrap();
         println!(
             "Polled {} tasks; {} live",
             report.tasks_polled, report.live_tasks

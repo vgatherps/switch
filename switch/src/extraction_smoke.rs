@@ -124,7 +124,7 @@ fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
             polls: Rc::clone(&polls),
         })
         .unwrap();
-    let first = runtime.poll(0, || {}).unwrap();
+    let first = runtime.poll(0).unwrap();
     assert_eq!((first.tasks_polled, first.live_tasks), (1, 1));
     assert_eq!(polls.get(), 1);
 
@@ -132,7 +132,7 @@ fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
     wheel.advance_to(&mut entries, 3, &mut expired).unwrap();
     assert_eq!(expired, [0]);
     slot.take().expect("first poll stored a wake").wake();
-    let report = runtime.poll(0, || {}).unwrap();
+    let report = runtime.poll(0).unwrap();
     assert_eq!(
         (
             report.tasks_polled,

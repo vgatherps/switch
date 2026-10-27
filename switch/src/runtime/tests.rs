@@ -1,4 +1,5 @@
 use super::*;
+use crate::StoredWaker;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
@@ -72,7 +73,7 @@ fn moving_owner_with_live_task_keeps_root_stable() {
     let root = core(&runtime);
     let mut runtime = Box::new(runtime);
     assert_eq!(core(&runtime), root);
-    assert_eq!(runtime.poll(123, || {}).unwrap().tasks_polled, 1);
+    assert_eq!(runtime.poll(123).unwrap().tasks_polled, 1);
     assert_eq!((polls.get(), drops.get()), (1, 1));
     drop(runtime);
     assert_eq!(
@@ -93,11 +94,11 @@ fn two_owners_have_independent_tasks_and_teardown() {
     sa.spawn(task_a).unwrap();
     sb.spawn(task_b).unwrap();
     assert_ne!(core(&a), core(&b));
-    assert_eq!(a.poll(0, || {}).unwrap().tasks_polled, 1);
+    assert_eq!(a.poll(0).unwrap().tasks_polled, 1);
     assert_eq!((ran[0].get(), ran[1].get()), (1, 0));
     a.shutdown();
     assert_eq!(sa.spawn(async {}).unwrap_err().reason, RuntimeError::Closed);
-    assert_eq!(b.poll(u64::MAX, || {}).unwrap().tasks_polled, 1);
+    assert_eq!(b.poll(u64::MAX).unwrap().tasks_polled, 1);
     assert_eq!((ran[0].get(), ran[1].get()), (1, 1));
 }
 
@@ -156,7 +157,7 @@ fn panicked_core_rejects_submission_and_still_shuts_down() {
     let failing = Counted::new(Finish::Panic);
     let drops = failing.drops.clone();
     spawner.spawn(failing).unwrap();
-    let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(0, || {}))).unwrap_err();
+    let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(0))).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
     let rejected = Counted::new(Finish::Ready);
     let rejected_drops = rejected.drops.clone();
@@ -200,19 +201,67 @@ fn nested_spawner_grows_queues_without_repolling_current_batch() {
         .unwrap();
     spawner.spawn(async {}).unwrap();
     let root = core(&runtime);
-    assert_eq!(runtime.poll(9, || {}).unwrap().tasks_polled, 2);
+    assert_eq!(runtime.poll(9).unwrap().tasks_polled, 2);
     assert_eq!(count.get(), 0);
     unsafe {
         assert_eq!(Executor::task_count(root), DEFAULT_CAPACITY * 3);
     }
     assert_eq!(
-        runtime.poll(9, || {}).unwrap().tasks_polled,
+        runtime.poll(9).unwrap().tasks_polled,
         DEFAULT_CAPACITY * 3
     );
     assert_eq!(count.get(), DEFAULT_CAPACITY * 3);
     unsafe {
         assert_eq!(Executor::task_count(root), 0);
     }
+}
+
+#[test]
+fn woken_and_spawned_tasks_poll_in_the_same_turn() {
+    struct Parked {
+        wake: Rc<Cell<Option<StoredWaker>>>,
+        polls: Rc<Cell<usize>>,
+    }
+    impl Future for Parked {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.polls.set(self.polls.get() + 1);
+            if self.polls.get() == 1 {
+                self.wake.set(Some(unsafe { StoredWaker::new(cx) }));
+                Poll::Pending
+            } else {
+                self.wake.take();
+                Poll::Ready(())
+            }
+        }
+    }
+
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let wake = Rc::new(Cell::new(None));
+    let parked_polls = Rc::new(Cell::new(0));
+    spawner
+        .spawn(Parked {
+            wake: wake.clone(),
+            polls: parked_polls.clone(),
+        })
+        .unwrap();
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+    wake.take().unwrap().wake();
+    let woken = runtime.poll(0).unwrap();
+    assert_eq!((woken.tasks_polled, woken.tasks_completed), (1, 1));
+    assert_eq!(parked_polls.get(), 2);
+
+    let spawned_polls = Rc::new(Cell::new(0));
+    let task_polls = spawned_polls.clone();
+    spawner
+        .spawn(async move {
+            task_polls.set(task_polls.get() + 1);
+        })
+        .unwrap();
+    let spawned = runtime.poll(0).unwrap();
+    assert_eq!((spawned.tasks_polled, spawned.tasks_completed), (1, 1));
+    assert_eq!(spawned_polls.get(), 1);
 }
 
 #[test]
@@ -224,8 +273,8 @@ fn idle_tasks_remain_owned_and_task_held_control_cycle_is_broken() {
     let drops = idle.drops.clone();
     let polls = idle.polls.clone();
     runtime.spawner().spawn(idle).unwrap();
-    assert_eq!(runtime.poll(0, || {}).unwrap().tasks_polled, 1);
-    assert_eq!(runtime.poll(0, || {}).unwrap().tasks_polled, 0);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
     assert_eq!((polls.get(), drops.get()), (1, 0));
     runtime.shutdown();
     assert_eq!(drops.get(), 1);
@@ -288,7 +337,7 @@ fn owner_drop_during_existing_unwind_cleans_nonpanicking_futures() {
     task.held_spawner = Some(escaped.clone());
     let drops = task.drops.clone();
     escaped.spawn(task).unwrap();
-    assert_eq!(runtime.poll(0, || {}).unwrap().tasks_polled, 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     let payload = catch_unwind(AssertUnwindSafe(move || {
         let _owner = runtime;
         panic_any(999usize);

@@ -159,16 +159,12 @@ impl Runtime {
         }
     }
 
-    /// Advance to `now`, call `poll_events` once, and poll one ready snapshot.
+    /// Advance to `now` and poll one ready snapshot.
     ///
-    /// Equal ticks are accepted. A lower tick returns `TimeRegressed` before state changes
-    /// or callback invocation. This method never waits, though callback or future code can
-    /// block. The callback must return `()`.
-    pub fn poll(
-        &mut self,
-        now: u64,
-        poll_events: impl FnOnce(),
-    ) -> Result<PollReport, RuntimeError> {
+    /// Equal ticks are accepted. A lower tick returns `TimeRegressed` before state changes.
+    /// This method never waits, though future code can block. Tasks woken or spawned before
+    /// this call are polled in this ready-task snapshot.
+    pub fn poll(&mut self, now: u64) -> Result<PollReport, RuntimeError> {
         let root = self.control.open_core()?;
         unsafe {
             let current = (*root).timers.current_tick();
@@ -193,7 +189,6 @@ impl Runtime {
                 timers_expired += 1;
                 wake_task(task);
             }
-            poll_events();
             let batch = Executor::poll_batch(&mut turn);
             let report = PollReport {
                 tasks_polled: batch.polled,

@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 
 use crate::task::{TaskBox, TaskHeader, TaskState};
 use crate::timer_registration::TimerStore;
-use crate::waker::{WakeFrame, current_thread_id, waker_from_frame};
+use crate::waker::{WakeFrame, this_thread_tag, waker_from_frame};
 
 /// Maximum tasks (for pre-allocation, not a hard limit now).
 pub const DEFAULT_CAPACITY: usize = 64;
@@ -54,7 +54,7 @@ pub struct Executor {
     all_head: *mut TaskHeader,
     active: bool,
     lifecycle: Lifecycle,
-    owner: std::thread::ThreadId,
+    owner: u16,
     pub(crate) active_frame: *const WakeFrame,
     pub(crate) timers: TimerStore,
 }
@@ -73,7 +73,7 @@ impl Executor {
             all_head: std::ptr::null_mut(),
             active: false,
             lifecycle: Lifecycle::Open,
-            owner: current_thread_id(),
+            owner: this_thread_tag(),
             active_frame: std::ptr::null(),
             timers: TimerStore::new(initial_tick, timers),
         }
@@ -389,7 +389,7 @@ mod tests {
             })
             .unwrap();
 
-        let report = runtime.poll(0, || {}).unwrap();
+        let report = runtime.poll(0).unwrap();
         assert_eq!(report.tasks_polled, 1);
         assert_eq!(report.tasks_completed, 1);
         assert_eq!(report.live_tasks, 0);
@@ -411,10 +411,10 @@ mod tests {
             .unwrap();
 
         let mut polls = 0;
-        let mut report = runtime.poll(0, || {}).unwrap();
+        let mut report = runtime.poll(0).unwrap();
         polls += report.tasks_polled;
         while report.live_tasks != 0 {
-            report = runtime.poll(0, || {}).unwrap();
+            report = runtime.poll(0).unwrap();
             polls += report.tasks_polled;
         }
 
@@ -437,7 +437,7 @@ mod tests {
                 .unwrap();
         }
 
-        let report = runtime.poll(0, || {}).unwrap();
+        let report = runtime.poll(0).unwrap();
         assert_eq!(report.tasks_polled, 10);
         assert_eq!(report.tasks_completed, 10);
         assert_eq!(report.live_tasks, 0);

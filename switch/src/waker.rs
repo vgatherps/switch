@@ -17,24 +17,46 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
-use std::thread::ThreadId;
 
 use crate::executor::wake_task;
 use crate::task::TaskHeader;
 
 thread_local! {
-    static THREAD_ID: ThreadId = std::thread::current().id();
+    static THREAD_TAG: Cell<u16> = const { Cell::new(0) };
+}
+
+static NEXT_TAG: AtomicU32 = AtomicU32::new(1);
+
+#[inline]
+pub(crate) fn this_thread_tag() -> u16 {
+    THREAD_TAG.with(|tag| {
+        let current = tag.get();
+        if current != 0 {
+            return current;
+        }
+        let next = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+        let next = u16::try_from(next).expect("thread tag space exhausted");
+        tag.set(next);
+        next
+    })
 }
 
 #[inline]
-pub(crate) fn current_thread_id() -> ThreadId {
-    THREAD_ID.with(|id| *id)
+pub(crate) fn is_owner(owner: u16) -> bool {
+    THREAD_TAG.with(Cell::get) == owner
+}
+
+#[cold]
+#[inline(never)]
+fn foreign_thread() -> ! {
+    panic!("waker used on foreign thread")
 }
 
 /// Immutable for the entire borrowed Context use, including scoped-thread joins.
 pub(crate) struct WakeFrame {
-    pub(crate) owner: ThreadId,
+    pub(crate) owner: u16,
     pub(crate) task: *mut TaskHeader,
 }
 
@@ -43,10 +65,9 @@ pub(crate) struct WakeFrame {
 unsafe fn checked_task(data: *const ()) -> NonNull<TaskHeader> {
     unsafe {
         let frame = data.cast::<WakeFrame>();
-        assert!(
-            (*frame).owner == current_thread_id(),
-            "waker used on foreign thread"
-        );
+        if !is_owner((*frame).owner) {
+            foreign_thread();
+        }
         NonNull::new_unchecked((*frame).task)
     }
 }

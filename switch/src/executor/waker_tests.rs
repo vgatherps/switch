@@ -10,6 +10,7 @@ use std::task::Waker;
 fn foreign_borrowed_wake_and_helpers_reject_without_scheduling() {
     let owner = Owner::new();
     let ptr = owner.0;
+    let owner_tag = unsafe { (*ptr).owner };
     owner.spawn(std::future::poll_fn(move |cx| {
         let barrier = Barrier::new(3);
         let waker = cx.waker();
@@ -18,6 +19,9 @@ fn foreign_borrowed_wake_and_helpers_reject_without_scheduling() {
             for operation in 0..3 {
                 let barrier = &barrier;
                 joins.push(scope.spawn(move || {
+                    let foreign_owner = Owner::new();
+                    assert_ne!(unsafe { (*foreign_owner.0).owner }, 0);
+                    assert_ne!(unsafe { (*foreign_owner.0).owner }, owner_tag);
                     barrier.wait();
                     let rejected = catch_unwind(AssertUnwindSafe(|| {
                         let foreign = Context::from_waker(waker);
@@ -49,6 +53,23 @@ fn foreign_borrowed_wake_and_helpers_reject_without_scheduling() {
     }));
     owner.poll();
     assert_eq!(owner.counts(), (0, 0));
+}
+
+#[test]
+fn runtimes_on_one_thread_share_a_nonzero_tag_and_other_threads_differ() {
+    let first = Owner::new();
+    let second = Owner::new();
+    let first_tag = unsafe { (*first.0).owner };
+    assert_ne!(first_tag, 0);
+    assert_eq!(first_tag, unsafe { (*second.0).owner });
+    let other_tag = std::thread::spawn(|| {
+        let owner = Owner::new();
+        unsafe { (*owner.0).owner }
+    })
+    .join()
+    .unwrap();
+    assert_ne!(other_tag, 0);
+    assert_ne!(first_tag, other_tag);
 }
 
 #[test]
