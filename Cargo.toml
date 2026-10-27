@@ -25,6 +25,8 @@ members = [
     "cephalopod/crates/control",
     # switch
     "switch",
+    # switchnet
+    "switchnet",
 ]
 exclude = ["conduit/vendor/smoltcp"]
 
