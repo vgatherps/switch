@@ -26,7 +26,6 @@ use zhida_dpdk_sys::{rte_eal_init, zhida_errno, zhida_lcore_id};
 #[derive(Debug)]
 pub struct Eal {
     owner_lcore_id: u32,
-    consumed_args: usize,
     _thread_local: PhantomData<Rc<()>>,
 }
 
@@ -78,18 +77,12 @@ impl Eal {
 
         Ok(Self {
             owner_lcore_id: unsafe { zhida_lcore_id() },
-            consumed_args: return_code as usize,
             _thread_local: PhantomData,
         })
     }
 
     pub fn owner_lcore_id(&self) -> u32 {
         self.owner_lcore_id
-    }
-
-    /// Number of arguments consumed, as returned by `rte_eal_init`.
-    pub fn consumed_args(&self) -> usize {
-        self.consumed_args
     }
 }
 

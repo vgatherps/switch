@@ -166,7 +166,6 @@ pub struct Interface {
 /// exclusively). However, it is still possible to call methods on its `inner` field.
 pub struct InterfaceInner {
     caps: DeviceCapabilities,
-    ipv4_dropped: u64,
     now: Instant,
     pub(crate) tcp_isn_secret: [u64; 2],
     #[cfg(test)]
@@ -266,7 +265,6 @@ impl Interface {
             inner: InterfaceInner {
                 now,
                 caps,
-                ipv4_dropped: 0,
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
                 any_ip: false,
@@ -286,11 +284,6 @@ impl Interface {
     /// The context is needed for some socket methods.
     pub fn context(&mut self) -> &mut InterfaceInner {
         &mut self.inner
-    }
-
-    /// IPv4 packets rejected before transport processing.
-    pub fn ipv4_dropped(&self) -> u64 {
-        self.inner.ipv4_dropped
     }
 
     /// Get the HardwareAddress address of the interface.

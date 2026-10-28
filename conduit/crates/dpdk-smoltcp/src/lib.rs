@@ -88,8 +88,7 @@ pub use smoltcp;
 pub use smoltcp::phy::HeldFrames;
 pub use smoltcp::socket::tcp::TcpFrame;
 pub use smoltcp::iface::{
-    NoRoute, TcpCounters, UdpConfig, UdpConnectError, UdpCounters, UdpDatagram, UdpSendError,
-    UdpSocket, UdpSocketStats,
+    NoRoute, UdpConfig, UdpConnectError, UdpDatagram, UdpSendError, UdpSocket, UdpSocketStats,
 };
 pub use stack::{
     os_random_seed, AddTcpError, AddUdpError, Sent, Stack, StackConfig, StackError, Turn,

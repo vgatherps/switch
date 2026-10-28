@@ -340,7 +340,6 @@ fn udp_stream_reports_delivery_and_loss() {
         assert_eq!(peer.warmup_delivered, warmup);
         assert_eq!(peer.reordered, 0);
         assert_eq!(peer.rx_dropped_full, 0);
-        assert_eq!(peer.udp_counters, dpdk_smoltcp::UdpCounters::default());
         assert!(client.elapsed_ns > 0);
         let json = client.to_json();
         let pps: f64 = json

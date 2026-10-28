@@ -9,7 +9,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
 };
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, tx_reserve, Eal, Stack, UdpConfig, UdpCounters, UdpHandle,
+    frame_pool_count, frame_reserve, tx_reserve, Eal, Stack, UdpConfig, UdpHandle,
     UdpSendError,
 };
 
@@ -82,7 +82,7 @@ fn ip(frame: &[u8]) -> Ipv4Packet<&[u8]> {
 }
 
 #[zhida_test_support::pinned_test]
-fn ipv4_fragment_drop_counted() {
+fn ipv4_fragment_dropped() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpfraga", "udpfragb"]);
         resolve(&mut pair, &handles[0]);
@@ -100,9 +100,6 @@ fn ipv4_fragment_drop_counted() {
         ip.fill_checksum();
         pair.inject(Side::B, &frames);
         assert_eq!(pair.b.receive(pair::T0, BURST).unwrap().rx_processed, 1);
-        assert_eq!(pair.b.ipv4_dropped(), 1);
-        assert_eq!(pair.b.udp_counters(), UdpCounters::default());
-        assert_eq!(pair.b.udp(&handles[1]).stats().rx_delivered, 0);
         assert!(pair.b.udp_mut(&handles[1]).recv().is_none());
         assert_eq!(pair.close(), 0);
     });
@@ -183,17 +180,13 @@ fn stream_exact_bytes_order_counts() {
                         }
                         delivered[receiver_index] += BURST as u64;
                         let stats = receiver.udp(&handles[receiver_index]).stats();
-                        assert_eq!(stats.rx_delivered, delivered[receiver_index]);
                         assert_eq!(stats.rx_dropped_full, 0);
-                        assert_eq!(stats.rx_dropped_peer, 0);
                         assert!(receiver.udp_mut(&handles[receiver_index]).recv().is_none());
                         assert_eq!(pair.in_use(), idle);
                     }
                 }
             }
             assert_eq!(delivered, [385; 2]);
-            assert_eq!(pair.a.udp_counters(), UdpCounters::default());
-            assert_eq!(pair.b.udp_counters(), UdpCounters::default());
             pair::assert_lossless(&pair.a_to_b, "A to B");
             pair::assert_lossless(&pair.b_to_a, "B to A");
             assert_eq!(pair.close(), 0);
@@ -388,9 +381,6 @@ fn connected_send_default_peer_and_mismatch() {
             .unwrap();
         pair.round(|_, _| {});
         assert!(pair.b.udp_mut(&handles[1]).recv().is_none());
-        assert_eq!(pair.b.udp(&handles[1]).stats().rx_delivered, 1);
-        assert_eq!(pair.b.udp(&handles[1]).stats().rx_dropped_peer, 1);
-        assert_eq!(pair.b.udp_counters(), UdpCounters::default());
         assert_eq!(pair.close(), 0);
     });
 }
@@ -494,7 +484,6 @@ fn one_way_stream_across_neighbor_expiry() {
         );
         pair.b.receive(now, BURST).unwrap();
         recv(&mut pair.b, &handles[1], endpoint(Side::A), &[6]);
-        assert_eq!(pair.b.udp(&handles[1]).stats().rx_delivered, 7);
         assert_eq!(
             pair.drain_tx(Side::B, |_| panic!("B must send only ARP replies")),
             0
@@ -631,8 +620,6 @@ fn too_large_and_broadcast_opt_in() {
         assert_eq!(datagram.dst_addr(), Ipv4Address::BROADCAST);
         assert_eq!(datagram.payload(), b"broadcast");
         drop(datagram);
-        assert_eq!(pair.b.udp(&receiver).stats().rx_delivered, 1);
-        assert_eq!(pair.b.udp_counters(), UdpCounters::default());
         assert_eq!(pair.close(), 0);
     });
 }

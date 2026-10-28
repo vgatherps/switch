@@ -4,8 +4,6 @@ use alloc::rc::Rc;
 use core::{mem::ManuallyDrop, ptr::NonNull, slice};
 
 pub use owner::TxPool;
-#[cfg(not(feature = "dpdk"))]
-pub use owner::TxPoolCounts;
 
 /// Header bytes the stack may write in front of a TX buffer's payload.
 pub const TX_HEADROOM: usize = 64;
@@ -216,28 +214,26 @@ mod owner {
     use alloc::{boxed::Box, vec};
     use core::cell::Cell;
 
-    /// A pool's counters; they outlive the pool.
-    pub struct TxPoolCounts {
-        allocs: Cell<usize>,
+    /// A pool's reference counters, for leak checks; buffers keep them past the pool.
+    #[derive(Default)]
+    struct Counts {
         shares: Cell<usize>,
         releases: Cell<usize>,
         live: Cell<usize>,
-        pool_dropped: Cell<bool>,
-        released_after_pool: Cell<usize>,
     }
 
     /// Heap TX buffers with reference and lifetime counters, for smoltcp's own tests. Each buffer
     /// keeps `TX_HEADROOM` bytes in front of `room` payload bytes.
     pub struct TxPool {
         room: usize,
-        counts: Rc<TxPoolCounts>,
+        counts: Rc<Counts>,
     }
 
     pub(crate) struct Storage {
         bytes: Box<[u8]>,
         references: Cell<usize>,
         origin: NonNull<()>,
-        counts: Rc<TxPoolCounts>,
+        counts: Rc<Counts>,
     }
 
     /// A Box-allocated Storage, created by TxPool::alloc and freed by the last release.
@@ -263,9 +259,6 @@ mod owner {
         let storage = unsafe { owner.as_ref() };
         let counts = &storage.counts;
         counts.releases.set(counts.releases.get() + 1);
-        if counts.pool_dropped.get() {
-            counts.released_after_pool.set(counts.released_after_pool.get() + 1);
-        }
         let remaining = storage.references.get().checked_sub(1).expect("TX buffer reference count underflow");
         storage.references.set(remaining);
         if remaining == 0 {
@@ -292,14 +285,7 @@ mod owner {
         pub fn new(room: usize) -> Rc<TxPool> {
             Rc::new(TxPool {
                 room,
-                counts: Rc::new(TxPoolCounts {
-                    allocs: Cell::new(0),
-                    shares: Cell::new(0),
-                    releases: Cell::new(0),
-                    live: Cell::new(0),
-                    pool_dropped: Cell::new(false),
-                    released_after_pool: Cell::new(0),
-                }),
+                counts: Rc::default(),
             })
         }
 
@@ -315,7 +301,6 @@ mod owner {
             // SAFETY: TX_HEADROOM is within the allocation by construction.
             let data = unsafe { NonNull::new_unchecked(storage.bytes.as_mut_ptr().add(TX_HEADROOM)) };
             let owner = NonNull::new(Box::into_raw(storage)).expect("Box::into_raw returned null");
-            self.counts.allocs.set(self.counts.allocs.get() + 1);
             self.counts.live.set(self.counts.live.get() + 1);
             Some(TxBuf {
                 owner,
@@ -323,10 +308,6 @@ mod owner {
                 len: 0,
                 room: u32::try_from(self.room).expect("TX room exceeds u32"),
             })
-        }
-
-        pub fn counts(&self) -> Rc<TxPoolCounts> {
-            self.counts.clone()
         }
 
         /// Buffers whose storage is not yet freed.
@@ -340,31 +321,6 @@ mod owner {
 
         pub fn releases(&self) -> usize {
             self.counts.releases.get()
-        }
-    }
-
-    impl TxPoolCounts {
-        pub fn allocs(&self) -> usize {
-            self.allocs.get()
-        }
-
-        pub fn releases(&self) -> usize {
-            self.releases.get()
-        }
-
-        pub fn pool_dropped(&self) -> bool {
-            self.pool_dropped.get()
-        }
-
-        /// References released after the pool was dropped.
-        pub fn released_after_drop(&self) -> usize {
-            self.released_after_pool.get()
-        }
-    }
-
-    impl Drop for TxPool {
-        fn drop(&mut self) {
-            self.counts.pool_dropped.set(true);
         }
     }
 

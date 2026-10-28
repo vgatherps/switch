@@ -186,7 +186,7 @@ impl TxQueue {
             return Seg::Empty;
         }
         let position = self.acked + offset as u64;
-        let index = self.locate(position, || {});
+        let index = self.locate(position);
         self.hint.set(index as u32);
         let entry = &self.entries[index];
         let buf = entry.buf();
@@ -209,7 +209,7 @@ impl TxQueue {
             return None;
         }
         let position = self.acked + offset as u64;
-        let index = self.locate(position, || {});
+        let index = self.locate(position);
         self.hint.set(index as u32);
         let entry = &mut self.entries[index];
         if position != entry.start() || size < entry.buf().len() {
@@ -230,7 +230,7 @@ impl TxQueue {
             return false;
         }
         let position = self.acked + offset as u64;
-        let index = self.locate(position, || {});
+        let index = self.locate(position);
         position + size as u64 > self.entries[index].end
     }
 
@@ -245,7 +245,7 @@ impl TxQueue {
             return;
         }
         let position = self.acked + offset as u64;
-        let mut index = self.locate(position, || {});
+        let mut index = self.locate(position);
         let mut copied = 0usize;
         while copied < size {
             let entry = &self.entries[index];
@@ -281,28 +281,26 @@ impl TxQueue {
     }
 
     /// The entry holding stream position `position`: the head, the hint, the entry after it,
-    /// or a binary search. `compared` counts comparisons for tests.
+    /// or a binary search.
     #[inline(always)]
-    fn locate(&self, position: u64, mut compared: impl FnMut()) -> usize {
-        compared();
+    fn locate(&self, position: u64) -> usize {
         if position < self.entries.front().expect("TX lookup on empty queue").end {
             return 0;
         }
-        self.locate_after_head(position, compared)
+        self.locate_after_head(position)
     }
 
-    fn locate_after_head(&self, position: u64, mut compared: impl FnMut()) -> usize {
-        let contains = |index: usize, compared: &mut dyn FnMut()| {
+    fn locate_after_head(&self, position: u64) -> usize {
+        let contains = |index: usize| {
             let entry = &self.entries[index];
-            compared();
             position >= entry.start() && position < entry.end
         };
         let hint = self.hint.get() as usize;
-        if hint != 0 && hint < self.entries.len() && contains(hint, &mut compared) {
+        if hint != 0 && hint < self.entries.len() && contains(hint) {
             return hint;
         }
         let next = hint + 1;
-        if next < self.entries.len() && contains(next, &mut compared) {
+        if next < self.entries.len() && contains(next) {
             return next;
         }
 
@@ -310,7 +308,6 @@ impl TxQueue {
         let mut high = self.entries.len();
         while low < high {
             let mid = low + (high - low) / 2;
-            compared();
             if self.entries[mid].end <= position {
                 low = mid + 1;
             } else {
@@ -418,19 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn lookup_cost_bounded_for_46_frame_flight() {
+    fn binary_search_finds_every_entry_of_a_46_frame_flight() {
         let (mut queue, _) = queue(46, 46, 1);
         for byte in 0..46 {
             queue.push_bytes(&[byte]);
         }
         for position in (0..46u64).rev() {
             queue.hint.set(0);
-            let comparisons = Cell::new(0usize);
-            let index = queue.locate(position, || {
-                comparisons.set(comparisons.get().checked_add(1).unwrap())
-            });
-            assert_eq!(index, position as usize);
-            assert!(comparisons.get() <= 9, "{} comparisons", comparisons.get());
+            assert_eq!(queue.locate(position), position as usize);
         }
     }
 
@@ -444,12 +436,8 @@ mod tests {
         for (acked, expected_index) in (1usize..=5).zip((0..5).rev()) {
             queue.ack(1);
             assert!(matches!(queue.segment(5 - acked, 1), Seg::Whole { index } if index == expected_index));
-            let comparisons = Cell::new(0usize);
-            let index = queue.locate(5, || {
-                comparisons.set(comparisons.get().checked_add(1).unwrap())
-            });
-            assert_eq!(index, usize::try_from(expected_index).unwrap());
-            assert_eq!(comparisons.get(), if expected_index == 0 { 1 } else { 2 });
+            assert_eq!(queue.hint.get(), expected_index);
+            assert_eq!(queue.locate(5), usize::try_from(expected_index).unwrap());
         }
     }
 
@@ -562,18 +550,5 @@ mod tests {
         assert_eq!(queue.entries[1].end, u64::MAX - 3);
         queue.ack(3);
         assert_eq!(cut(queue.segment(0, 1)), &[4]);
-    }
-
-    /// The queue releases its frames before its source handle: the pool outlives the last
-    /// release.
-    #[test]
-    fn source_dropped_after_entries() {
-        let pool = TxPool::new(64);
-        let counts = pool.counts();
-        let mut queue = TxQueue::new(8, 1, TxSource::new(pool));
-        queue.push_bytes(&[1]);
-        drop(queue);
-        assert!(counts.pool_dropped());
-        assert_eq!((counts.releases(), counts.released_after_drop()), (1, 0));
     }
 }

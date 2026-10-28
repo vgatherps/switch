@@ -15,7 +15,7 @@ use dpdk_smoltcp::smoltcp::time::{Duration as NetDuration, Instant as NetInstant
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, IpEndpoint, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
     rx_pool_count, rx_reserve, Offloads, Port, PortConfig, Sent, Stack, StackConfig, StackError,
-    Turn, UdpConfig, UdpCounters, UdpHandle, UdpSendError,
+    Turn, UdpConfig, UdpHandle, UdpSendError,
     UdpSendFrameError, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_buffer::PoolConfig;
@@ -1054,7 +1054,6 @@ impl Peer {
                 .udp
                 .as_ref()
                 .map_or(0, |handle| self.stack.udp(handle).stats().rx_dropped_full),
-            udp_counters: self.stack.udp_counters(),
             counters: self.counters,
             failure: self.failure.clone(),
         }
@@ -1104,7 +1103,6 @@ pub struct PeerReport {
     pub warmup_delivered: u64,
     pub reordered: u64,
     pub rx_dropped_full: u64,
-    pub udp_counters: UdpCounters,
     /// Whole run, construction to done.
     pub counters: Counters,
     /// `None` when valid. A reset during the peer's close is invisible here
@@ -1119,10 +1117,8 @@ impl PeerReport {
             PeerMode::Sink => "sink",
             PeerMode::UdpSink { size, warmup } => {
                 return format!(
-                    "{{\"side\":\"peer\",\"mode\":\"udp-sink\",\"size\":{size},\"warmup\":{warmup},\"delivered\":{},\"warmup_delivered\":{},\"reordered\":{},\"rx_dropped_full\":{},\"rx_no_port\":{},\"rx_checksum_bad\":{},\"rx_malformed\":{},\"rx_not_unicast\":{},{},{}}}",
+                    "{{\"side\":\"peer\",\"mode\":\"udp-sink\",\"size\":{size},\"warmup\":{warmup},\"delivered\":{},\"warmup_delivered\":{},\"reordered\":{},\"rx_dropped_full\":{},{},{}}}",
                     self.delivered, self.warmup_delivered, self.reordered, self.rx_dropped_full,
-                    self.udp_counters.rx_no_port, self.udp_counters.rx_checksum_bad,
-                    self.udp_counters.rx_malformed, self.udp_counters.rx_not_unicast,
                     self.counters.json(), validity_json(&self.failure, NOTE)
                 );
             }

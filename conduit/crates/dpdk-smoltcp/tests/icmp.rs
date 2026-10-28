@@ -239,7 +239,6 @@ fn closed_udp_port_dropped_counted_no_reply() {
         assert_eq!(turn.rx_processed, 1);
         assert_eq!(turn.tx_accepted, 0);
         assert!(fixture.take_tx().is_empty());
-        assert_eq!(stack.udp_counters().rx_no_port, 1);
         let port = stack.into_port();
         assert_eq!(fixture.in_use(), (0, 0));
         port.try_close().unwrap();

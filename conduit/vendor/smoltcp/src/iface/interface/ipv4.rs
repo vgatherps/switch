@@ -1,13 +1,6 @@
 use super::*;
 
 impl InterfaceInner {
-    fn count_ipv4_drop(&mut self) {
-        self.ipv4_dropped = self
-            .ipv4_dropped
-            .checked_add(1)
-            .expect("IPv4 drop count overflow");
-    }
-
     /// Get an IPv4 source address based on a destination address.
     ///
     /// This function tries to find the first IPv4 address from the interface
@@ -79,14 +72,12 @@ impl InterfaceInner {
             Ok(repr) => repr,
             Err(err) => {
                 net_debug!("{:?}", err);
-                self.count_ipv4_drop();
                 return None;
             }
         };
         if !self.is_unicast_v4(ipv4_repr.src_addr) && !ipv4_repr.src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
             net_debug!("non-unicast or unspecified source address");
-            self.count_ipv4_drop();
             return None;
         }
 

@@ -2336,7 +2336,6 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         assert_eq!((turn.rx_received, turn.rx_rejected), (1, 0));
         assert_eq!(stack.tcp(&handle).recv_queue(), 0);
         assert!(peer_receive(&fixture, 16).is_empty());
-        assert_eq!(stack.tcp_counters().rx_checksum_bad, 1);
         inject(&data, RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_GOOD);
         stack.turn(NOW, 4).unwrap();
         assert_eq!(stack.tcp(&handle).recv_queue(), 3);
@@ -2345,7 +2344,6 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         let ip = Ipv4Packet::new_checked(&frames[0].data()[14..]).unwrap();
         assert_eq!(TcpPacket::new_checked(ip.payload()).unwrap().ack_number(), TcpSeqNumber(5));
         drop(frames);
-        assert_eq!(stack.tcp_counters().rx_checksum_bad, 1);
         let mut bytes = udp_frame();
         bytes[..12].copy_from_slice(&syn[..12]);
         let mut ip = Ipv4Packet::new_unchecked(&mut bytes[14..]);
@@ -2363,7 +2361,6 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         inject(&bytes, bad);
         stack.turn(NOW, 4).unwrap();
         assert!(stack.udp_mut(&udp).recv().is_none());
-        assert_eq!(stack.udp_counters().rx_checksum_bad, 1);
         stack.remove_tcp(handle);
         stack.remove_udp(udp);
         let port = stack.into_port();

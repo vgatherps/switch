@@ -239,9 +239,9 @@ port (`--udp-ports 11111,11112,...`) and at least as many TCP connections as cli
 (`-f`, lines `U:IP:PORT` or `T:IP:PORT`) cannot be combined with `-i`, `-p` or `--tcp`.
 
 The server report (every `--report-seconds` and at exit) has per protocol `received`, `replies`,
-`malformed`; TCP `accepted`/`closed`; per UDP socket its counters and `pending` (1 while a reply waits for
+`malformed`; TCP `accepted`/`closed`; per UDP socket its `rx_dropped_full` and `pending` (1 while a reply waits for
 the TX queue or for ARP); per TCP slot its state, `retransmits`, `loss_events`, `rx_refused_segments`;
-`udp_counters`; `stack_totals` including `tx_pending`; `eth_stats` (`ipackets`, `opackets`, `imissed`,
+`stack_totals` including `tx_pending`; `eth_stats` (`ipackets`, `opackets`, `imissed`,
 `ierrors`, `oerrors`, `rx_nombuf`); and with `rx_timestamps` enabled, the timestamp lines (section 4).
 TCP `accepted` and `closed` count slot state changes seen between visits, so a reset in SYN-RECEIVED
 followed by a new SYN within one poll turn counts once.

@@ -261,7 +261,7 @@ fn udp_packet(bytes: &mut [u8]) -> UdpPacket<&mut [u8]> {
 }
 
 #[test]
-fn ipv4_drops_before_udp_counted() {
+fn ipv4_drops_before_udp() {
     let mut test = Test::new(1);
     test.iface.inner.caps.checksum.ipv4 = Checksum::Rx;
     let good = datagram(b"payload!", LOCAL, PEER_PORT);
@@ -270,8 +270,6 @@ fn ipv4_drops_before_udp_counted() {
     ip.set_more_frags(true);
     ip.fill_checksum();
     test.receive(fragment, false);
-    assert_eq!(test.iface.ipv4_dropped(), 1);
-    assert_eq!(test.udp.counters(), crate::iface::UdpCounters::default());
     assert_eq!(test.udp.get(test.handle).stats(), Default::default());
     assert!(test.recv().is_none());
 
@@ -279,13 +277,10 @@ fn ipv4_drops_before_udp_counted() {
     let mut ip = Ipv4Packet::new_unchecked(&mut corrupt[ETH_LEN..]);
     ip.set_checksum(ip.checksum() ^ 1);
     test.receive(corrupt, false);
-    assert_eq!(test.iface.ipv4_dropped(), 2);
-    assert_eq!(test.udp.counters(), crate::iface::UdpCounters::default());
     assert_eq!(test.udp.get(test.handle).stats(), Default::default());
     assert!(test.recv().is_none());
 
     test.receive(good.clone(), false);
-    assert_eq!(test.iface.ipv4_dropped(), 2);
     assert_eq!(test.recv().unwrap().payload(), b"payload!");
 
     let mut offset = good.clone();
@@ -293,30 +288,19 @@ fn ipv4_drops_before_udp_counted() {
     ip.set_frag_offset(8);
     ip.fill_checksum();
     test.receive(offset, false);
-    assert_eq!(test.iface.ipv4_dropped(), 3);
+    assert!(test.recv().is_none());
 
     for length in [0, 1, 19] {
         test.receive(good[..ETH_LEN + length].to_vec(), false);
     }
-    assert_eq!(test.iface.ipv4_dropped(), 6);
+    assert!(test.recv().is_none());
 
     let mut malformed = good.clone();
     let mut ip = Ipv4Packet::new_unchecked(&mut malformed[ETH_LEN..]);
     ip.set_header_len(16);
     ip.fill_checksum();
     test.receive(malformed, false);
-    assert_eq!(test.iface.ipv4_dropped(), 7);
-
-    test.receive(
-        datagram(b"other", Ipv4Address::new(192, 168, 1, 3), PEER_PORT),
-        false,
-    );
-    assert_eq!(test.iface.ipv4_dropped(), 7);
-    let mut bad_udp = good;
-    udp_packet(&mut bad_udp).payload_mut()[0] ^= 1;
-    test.receive(bad_udp, false);
-    assert_eq!(test.iface.ipv4_dropped(), 7);
-    assert_eq!(test.udp.counters().rx_checksum_bad, 1);
+    assert!(test.recv().is_none());
 }
 
 #[test]
@@ -342,7 +326,6 @@ fn datagram_delivered_payload_src_dst() {
     );
     received.payload_mut()[0] = b'H';
     assert_eq!(received.payload(), b"Hello");
-    assert_eq!(test.udp.get(test.handle).stats().rx_delivered, 1);
     assert!(test.device.tx.is_empty());
 }
 
@@ -353,17 +336,15 @@ fn zero_checksum_accepted() {
     udp_packet(&mut bytes).set_checksum(0);
     test.receive(bytes, false);
     assert_eq!(test.recv().unwrap().payload(), b"zero");
-    assert_eq!(test.udp.counters().rx_checksum_bad, 0);
 }
 
 #[test]
-fn bad_checksum_counted() {
+fn bad_checksum_dropped() {
     let mut test = Test::new(1);
     let mut bytes = datagram(b"bad", LOCAL, PEER_PORT);
     udp_packet(&mut bytes).payload_mut()[0] ^= 1;
     test.receive(bytes, false);
     assert!(test.recv().is_none());
-    assert_eq!(test.udp.counters().rx_checksum_bad, 1);
     assert_eq!(test.device.releases.get(), 1);
     assert!(test.device.tx.is_empty());
 }
@@ -375,11 +356,10 @@ fn good_verdict_skips_verify() {
     udp_packet(&mut bytes).payload_mut()[0] ^= 1;
     test.receive(bytes, true);
     assert_eq!(test.recv().unwrap().payload(), b"cad");
-    assert_eq!(test.udp.counters().rx_checksum_bad, 0);
 }
 
 #[test]
-fn malformed_length_counted() {
+fn malformed_length_dropped() {
     let mut test = Test::new(1);
     for len in [7, 100] {
         let mut bytes = datagram(b"bad", LOCAL, PEER_PORT);
@@ -387,23 +367,20 @@ fn malformed_length_counted() {
         test.receive(bytes, true);
     }
     assert!(test.recv().is_none());
-    assert_eq!(test.udp.counters().rx_malformed, 2);
-    assert_eq!(test.udp.counters().rx_checksum_bad, 0);
     assert_eq!(test.device.releases.get(), 2);
 }
 
 #[test]
-fn closed_port_counted_no_reply() {
+fn closed_port_dropped_no_reply() {
     let mut test = Test::new(1);
     test.udp.remove(test.handle);
     test.receive(datagram(b"closed", LOCAL, PEER_PORT), false);
-    assert_eq!(test.udp.counters().rx_no_port, 1);
     assert!(test.device.tx.is_empty());
     assert_eq!(test.device.releases.get(), 1);
 }
 
 #[test]
-fn connected_drops_other_peer_counted() {
+fn connected_drops_other_peer() {
     let mut test = Test::new(1);
     test.udp
         .get_mut(test.handle)
@@ -411,7 +388,6 @@ fn connected_drops_other_peer_counted() {
         .unwrap();
     test.receive(datagram(b"other", LOCAL, PEER_PORT + 1), false);
     assert!(test.recv().is_none());
-    assert_eq!(test.udp.get(test.handle).stats().rx_dropped_peer, 1);
     assert_eq!(test.device.releases.get(), 1);
     test.receive(datagram(b"peer", LOCAL, PEER_PORT), false);
     assert_eq!(test.recv().unwrap().payload(), b"peer");
@@ -428,11 +404,10 @@ fn broadcast_delivered() {
         drop(received);
     }
     assert!(!test.udp.get(test.handle).config().broadcast);
-    assert_eq!(test.udp.get(test.handle).stats().rx_delivered, 2);
 }
 
 #[test]
-fn multicast_dst_counted() {
+fn multicast_dst_dropped() {
     let mut test = Test::new(1);
     for (dst, mac) in [
         (
@@ -449,21 +424,16 @@ fn multicast_dst_counted() {
         test.receive(bytes, false);
     }
     assert!(test.recv().is_none());
-    assert_eq!(test.udp.counters().rx_not_unicast, 2);
     assert_eq!(test.device.releases.get(), 2);
     assert!(test.device.tx.is_empty());
 }
 
-// IPv4 input drops TCP and ICMP to non-unicast destinations; UDP must still reach the set.
+// IPv4 input drops TCP and ICMP to non-unicast destinations; UDP broadcast must still reach the set.
 #[test]
 fn non_unicast_udp_passes_ip_filter() {
     let mut test = Test::new(1);
     test.receive(datagram(b"bcast", Ipv4Address::BROADCAST, PEER_PORT), false);
     assert_eq!(test.recv().unwrap().payload(), b"bcast");
-    let mut bytes = datagram(b"mcast", Ipv4Address::new(239, 1, 1, 1), PEER_PORT);
-    EthernetFrame::new_unchecked(&mut bytes[..]).set_dst_addr(EthernetAddress([1, 0, 0x5e, 1, 1, 1]));
-    test.receive(bytes, false);
-    assert_eq!(test.udp.counters().rx_not_unicast, 1);
 }
 
 #[test]
@@ -472,7 +442,6 @@ fn queue_full_drops_newest_counted() {
     test.receive(datagram(b"first", LOCAL, PEER_PORT), false);
     test.receive(datagram(b"second", LOCAL, PEER_PORT), false);
     assert_eq!(test.udp.get(test.handle).rx_queued(), 1);
-    assert_eq!(test.udp.get(test.handle).stats().rx_delivered, 1);
     assert_eq!(test.udp.get(test.handle).stats().rx_dropped_full, 1);
     assert_eq!(test.device.releases.get(), 1);
     assert_eq!(test.recv().unwrap().payload(), b"first");
@@ -492,7 +461,6 @@ fn held_datagram_keeps_credit() {
     assert_eq!(test.device.releases.get(), 2);
     test.receive(datagram(b"next", LOCAL, PEER_PORT), false);
     assert_eq!(test.recv().unwrap().payload(), b"next");
-    assert_eq!(test.udp.get(test.handle).stats().rx_delivered, 2);
 }
 
 #[test]
@@ -601,8 +569,6 @@ fn tcp_unaffected() {
     assert_eq!(payload.len(), 3);
     assert_eq!(&payload, b"tcp");
     assert_eq!(test.recv().unwrap().payload(), b"udp");
-    assert_eq!(test.udp.get(test.handle).stats().rx_delivered, 1);
-    assert_eq!(test.udp.counters(), crate::iface::UdpCounters::default());
 }
 
 fn send_frame(dst: Ipv4Address, mac: EthernetAddress, payload: &[u8], checksum: bool) -> Vec<u8> {
@@ -1460,7 +1426,6 @@ fn udp_over_path_mtu_is_too_large_before_fill() {
         mtu: 1500,
     }]);
     resolve(&mut test, REMOTE, REMOTE_MAC);
-    let counters = test.udp.counters();
     let stats = test.udp.get(test.handle).stats();
     test.device.tx_left = Some(1);
     assert_send_error(
@@ -1470,7 +1435,6 @@ fn udp_over_path_mtu_is_too_large_before_fill() {
         UdpSendError::TooLarge,
     );
     assert_eq!(test.device.tx_left, Some(1));
-    assert_eq!(test.udp.counters(), counters);
     assert_eq!(test.udp.get(test.handle).stats(), stats);
     assert_eq!(test.udp.template_frames, 0);
 }
@@ -1550,11 +1514,9 @@ fn udp_template_reuse_still_checked() {
         );
         test.device.tx.clear();
     }
-    let counters = test.udp.counters();
     let stats = test.udp.get(test.handle).stats();
     assert_send_error(&mut test, peer, 1473, UdpSendError::TooLarge);
     assert_eq!(test.udp.template_frames, 1);
-    assert_eq!(test.udp.counters(), counters);
     assert_eq!(test.udp.get(test.handle).stats(), stats);
 }
 

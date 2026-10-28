@@ -2045,7 +2045,7 @@ fn flow_index_matches_linear_scan_under_churn() {
 }
 
 #[test]
-fn tcp_bad_checksum_counted_without_delivery_or_ack_advance() {
+fn tcp_bad_checksum_dropped_without_delivery_or_ack_advance() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     let mut bytes = packet_bytes(TcpRepr {
@@ -2057,7 +2057,6 @@ fn tcp_bad_checksum_counted_without_delivery_or_ack_advance() {
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     assert_eq!(sockets.get(handle).recv_queue(), 0);
     assert!(device.tx_queue.is_empty());
-    assert_eq!(sockets.counters().rx_checksum_bad, 1);
 
     receive(
         &mut iface,
@@ -2072,11 +2071,10 @@ fn tcp_bad_checksum_counted_without_delivery_or_ack_advance() {
     assert_eq!(sockets.get(handle).recv_queue(), 3);
     let bytes = take_reply(&mut device);
     assert_eq!(reply(&bytes).ack_number, Some(REMOTE_SEQ + 4));
-    assert_eq!(sockets.counters().rx_checksum_bad, 1);
 }
 
 #[test]
-fn tcp_truncated_and_zero_ports_not_checksum_failures() {
+fn tcp_truncated_and_zero_ports_dropped() {
     let (mut iface, mut sockets, _) = setup(Medium::Ip);
     let bytes = packet_bytes(segment(TcpControl::Syn, REMOTE_SEQ, None));
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
@@ -2099,7 +2097,6 @@ fn tcp_truncated_and_zero_ports_not_checksum_failures() {
             &tcp,
         ).is_none());
     }
-    assert_eq!(sockets.counters().rx_checksum_bad, 0);
 }
 
 const NON_UNICAST_DSTS: [Ipv4Address; 4] = [

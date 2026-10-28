@@ -209,9 +209,6 @@ impl InterfaceInner {
         if !meta.l4_checksum_verified && self.caps.checksum.tcp.rx()
             && !tcp_packet.verify_checksum(&src_addr, &dst_addr)
         {
-            sockets.counters.rx_checksum_bad = sockets.counters.rx_checksum_bad
-                .checked_add(1)
-                .expect("TCP RX checksum failure count overflow");
             return None;
         }
         let mut checksum_caps = self.caps.checksum.clone();

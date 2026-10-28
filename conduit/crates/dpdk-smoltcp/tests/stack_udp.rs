@@ -203,7 +203,6 @@ fn over_limit_dropped_counted_tcp_progresses() {
         let round = pair.round(|_, _| {});
         assert_eq!(round.a.rx_processed, 1);
         assert_eq!(pair.a.udp(&udp).stats().rx_dropped_full, 1);
-        assert_eq!(pair.a.udp(&udp).stats().rx_delivered, 2);
         assert!(pair.a.udp_mut(&udp).recv().is_none());
         assert_eq!(pair.in_use()[0].0, before + 2);
 
@@ -478,8 +477,6 @@ fn connected_socket_drops_other_peer() {
             from_peer(PEER_PORT, b"peer"),
         ]);
         stack.turn(T0, 8).unwrap();
-        assert_eq!(stack.udp(&handle).stats().rx_dropped_peer, 1);
-        assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
         assert_eq!(fixture.in_use().0, 1);
         let datagram = stack.udp_mut(&handle).recv().unwrap();
         assert_eq!(datagram.src(), peer);

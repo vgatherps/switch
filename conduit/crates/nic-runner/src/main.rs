@@ -229,9 +229,6 @@ fn run(args: Args) -> i32 {
         line("error", e);
         code = 3;
     }
-    if !matches!(args.mode, Mode::Server(_)) {
-        line("udp_counters", format_args!("{:?}", stack.udp_counters()));
-    }
     if let Err(e) = nic::print_eth_stats(port_id) {
         line("error", e);
         code = 3;

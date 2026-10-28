@@ -20,7 +20,7 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{
     Eal, Offloads, Port, PortConfig, Stack, StackConfig, UdpConfig, UdpDatagram, UdpHandle,
-    UdpSendError, DEFAULT_NEIGHBOR_CAPACITY,
+    Turn, UdpSendError, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
@@ -164,9 +164,7 @@ fn kernel_off_subnet_peer_through_gateway() {
                 );
                 drop(datagram);
                 recv_kernel(stack, start, &kernel, b"from remote");
-                assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
                 assert_eq!(stack.udp(&handle).rx_queued(), 0);
-                assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
                 assert_kernel_quiet(stack, start, &kernel);
             },
         );
@@ -305,13 +303,14 @@ fn add_udp(stack: &mut Stack, tx_checksum: bool) -> UdpHandle {
         .unwrap()
 }
 
-fn turn(stack: &mut Stack, start: Instant) {
+fn turn(stack: &mut Stack, start: Instant) -> Turn {
     let elapsed = start.elapsed();
     assert!(elapsed < DEADLINE, "UDP exchange exceeded {DEADLINE:?}");
     let now = StackInstant::from_micros(i64::try_from(elapsed.as_micros()).unwrap());
     let result = stack.turn(now, BURST).unwrap();
     assert_eq!(result.rx_rejected, 0);
     std::thread::yield_now();
+    result
 }
 
 fn send_kernel(stack: &mut Stack, start: Instant, socket: &UdpSocket, payload: &[u8]) {
@@ -418,11 +417,8 @@ fn kernel_to_zhida_datagrams() {
                 drop(datagram);
             }
             let stats = stack.udp(&handle).stats();
-            assert_eq!(stats.rx_delivered, u64::try_from(payloads.len()).unwrap());
             assert_eq!(stats.rx_dropped_full, 0);
-            assert_eq!(stats.rx_dropped_peer, 0);
             assert_eq!(stack.udp(&handle).rx_queued(), 0);
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
         });
     });
 }
@@ -465,7 +461,6 @@ fn offload_kernel_to_zhida_and_back() {
                     assert_eq!(datagram.payload(), payload);
                     drop(datagram);
                 }
-                assert_eq!(stack.udp(&handle).stats().rx_delivered, payloads.len() as u64);
                 assert_eq!(stack.udp(&handle).rx_queued(), 0);
                 let capture = UdpCapture::bind(iface);
                 for payload in &payloads {
@@ -473,7 +468,6 @@ fn offload_kernel_to_zhida_and_back() {
                     recv_kernel(stack, start, &kernel, payload);
                     capture.verify_next(stack, start, peer, payload);
                 }
-                assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
                 assert_kernel_quiet(stack, start, &kernel);
             });
         }
@@ -529,14 +523,11 @@ fn kernel_zero_checksum_accepted() {
             };
             assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
             let payload = b"kernel checksum zero";
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
             send_kernel(stack, start, &kernel, payload);
             let datagram = recv_zhida(stack, start, &handle);
             assert_eq!(datagram.src(), endpoint(kernel.local_addr().unwrap()));
             assert_eq!(datagram.payload(), payload);
             drop(datagram);
-            assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
         });
     });
 }
@@ -573,14 +564,11 @@ fn offload_kernel_zero_checksum_accepted() {
             };
             assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
             let payload = b"kernel checksum zero";
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
             send_kernel(stack, start, &kernel, payload);
             let datagram = recv_zhida(stack, start, &handle);
             assert_eq!(datagram.src(), endpoint(kernel.local_addr().unwrap()));
             assert_eq!(datagram.payload(), payload);
             drop(datagram);
-            assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
         });
     });
 }
@@ -640,16 +628,11 @@ fn connected_zhida_socket_echo() {
             let other = kernel_socket();
             assert_ne!(other.local_addr().unwrap(), kernel.local_addr().unwrap());
             send_kernel(stack, start, &other, b"wrong peer");
-            while stack.udp(&handle).stats().rx_dropped_peer == 0 {
-                turn(stack, start);
-            }
-            let stats = stack.udp(&handle).stats();
-            assert_eq!(stats.rx_dropped_peer, 1);
-            assert_eq!(stats.rx_dropped_full, 0);
-            assert_eq!(stats.rx_delivered, u64::try_from(payloads.len()).unwrap());
-            assert!(stack.udp_mut(&handle).recv().is_none());
+            while turn(stack, start).rx_processed == 0 {}
             assert_kernel_quiet(stack, start, &other);
             assert_kernel_quiet(stack, start, &kernel);
+            assert!(stack.udp_mut(&handle).recv().is_none());
+            assert_eq!(stack.udp(&handle).stats().rx_dropped_full, 0);
         });
     });
 }
@@ -679,10 +662,7 @@ fn closed_port_no_icmp() {
                     Err(error) => panic!("connected kernel send: {error}"),
                 }
             }
-            while stack.udp_counters().rx_no_port == 0 {
-                turn(stack, start);
-            }
-            assert_eq!(stack.udp_counters().rx_no_port, 1);
+            while turn(stack, start).rx_processed == 0 {}
             assert_kernel_quiet(stack, start, &kernel);
             kernel.set_nonblocking(false).unwrap();
             kernel.set_read_timeout(Some(QUIET)).unwrap();

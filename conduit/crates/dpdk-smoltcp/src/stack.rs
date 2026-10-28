@@ -3,7 +3,7 @@ use std::io::Read;
 
 use smoltcp::iface::{
     Config, DropQueue, Interface, NoRoute, PathMtu, PathMtus, PollIngressSingleResult, PollResult,
-    SocketHandle, TcpCounters, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpCounters, UdpSendError, UdpSet,
+    SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
 use smoltcp::phy::{HeldFrames, TxFrame};
@@ -742,21 +742,6 @@ impl Stack {
         if held.count() != 0 {
             self.removed_held.push(held);
         }
-    }
-
-    /// TCP segments rejected by software checksum verification.
-    pub fn tcp_counters(&self) -> TcpCounters {
-        self.sockets.counters()
-    }
-
-    /// Receive counters for all UDP ports, including ports with no socket.
-    pub fn udp_counters(&self) -> UdpCounters {
-        self.udp.counters()
-    }
-
-    /// IPv4 packets rejected before transport processing.
-    pub fn ipv4_dropped(&self) -> u64 {
-        self.iface.ipv4_dropped()
     }
 
     /// Read-only access to a socket, including retransmits, loss_events and congestion_window. Marks nothing.
