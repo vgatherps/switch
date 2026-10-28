@@ -1,0 +1,16 @@
+[package]
+name = "sheath"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+
+[lints]
+workspace = true
