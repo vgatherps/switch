@@ -10,11 +10,11 @@
 use std::alloc::{self, Layout};
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::mem::{MaybeUninit, align_of, size_of};
+use std::mem::{ManuallyDrop, MaybeUninit, align_of, size_of};
 use std::pin::Pin;
 use std::ptr::{addr_of, addr_of_mut};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use super::header::TaskHeader;
 use super::pool::RuntimePool;
@@ -24,7 +24,7 @@ pub(crate) const BLOCK: usize = 64 * 1024;
 pub(crate) const MASK: usize = !(BLOCK - 1);
 const META: usize = 64;
 
-pub(crate) type PollFn = unsafe fn(*const TaskHeader, &mut Context<'_>) -> Poll<()>;
+pub(crate) type PollFn = unsafe fn(*const TaskHeader) -> Poll<()>;
 pub(crate) type DropFn = unsafe fn(*const TaskHeader);
 
 /// Block metadata, one cache line at the block base. Nothing forms `&Meta`:
@@ -93,11 +93,12 @@ impl<Fut: Future<Output = ()>> Shape<Fut> {
 ///
 /// # Safety
 /// `header` heads a slot of a block built for `Fut` holding a live future.
-unsafe fn poll_future<Fut: Future<Output = ()>>(
-    header: *const TaskHeader,
-    cx: &mut Context<'_>,
-) -> Poll<()> {
-    unsafe { Pin::new_unchecked(&mut *Shape::<Fut>::future(header)).poll(cx) }
+unsafe fn poll_future<Fut: Future<Output = ()>>(header: *const TaskHeader) -> Poll<()> {
+    // The waker is built here, in typed code, so its (constant) vtable is known
+    // to the future's poll and a self-wake inlines instead of calling through it.
+    let waker = ManuallyDrop::new(unsafe { Waker::from_raw(crate::waker::raw(header)) });
+    let mut cx = Context::from_waker(&waker);
+    unsafe { Pin::new_unchecked(&mut *Shape::<Fut>::future(header)).poll(&mut cx) }
 }
 
 /// `meta.drop` for `Fut`.
