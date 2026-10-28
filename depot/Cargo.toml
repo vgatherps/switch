@@ -1,7 +1,7 @@
 [package]
 name = "depot"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Cache-optimized pool allocator returning generation-checked handles"
 
 [features]
@@ -11,10 +11,10 @@ test-utils = []
 [dependencies]
 
 [dev-dependencies]
-depot = { path = ".", features = ["test-utils"] }
-quickcheck = "1"
-quickcheck_macros = "1"
-criterion = "0.5"
+depot = { workspace = true, features = ["test-utils"] }
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
+criterion.workspace = true
 rand = { version = "0.8", features = ["small_rng"] }
 trybuild = "1.0"
 

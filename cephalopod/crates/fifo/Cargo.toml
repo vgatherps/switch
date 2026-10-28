@@ -13,7 +13,7 @@ ceph-proto.workspace = true
 ceph-ring.workspace = true
 
 [dev-dependencies]
-ceph-fifo = { path = ".", features = ["test-util"] }
+ceph-fifo = { workspace = true, features = ["test-util"] }
 ceph-control.workspace = true
 ceph-ring = { workspace = true, features = ["test-util"] }
 libc.workspace = true

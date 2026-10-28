@@ -1,18 +1,18 @@
 [package]
 name = "zhida-open"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license.workspace = true
 
 [dependencies]
-zhida-netconf = { path = "../netconf" }
-dpdk-smoltcp = { path = "../dpdk-smoltcp" }
-zhida-buffer = { path = "../zhida-buffer" }
-zhida-dpdk-sys = { path = "../zhida-dpdk-sys" }
+zhida-netconf.workspace = true
+dpdk-smoltcp.workspace = true
+zhida-buffer.workspace = true
+zhida-dpdk-sys.workspace = true
 
 [dev-dependencies]
-zhida-test-support = { path = "../../test-support" }
-libc = "0.2"
+zhida-test-support.workspace = true
+libc.workspace = true
 
 [lints]
 workspace = true

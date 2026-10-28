@@ -1,13 +1,13 @@
 [package]
 name = "stack-stream"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license.workspace = true
 
 [dependencies]
-dpdk-smoltcp = { path = "../dpdk-smoltcp" }
+dpdk-smoltcp.workspace = true
 
 [dev-dependencies]
-zhida-test-kit = { path = "../../test-support/kit" }
-zhida-test-support = { path = "../../test-support" }
-tungstenite = "=0.30.0"
+zhida-test-kit.workspace = true
+zhida-test-support.workspace = true
+tungstenite.workspace = true
