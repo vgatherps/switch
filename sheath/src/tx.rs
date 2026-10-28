@@ -155,7 +155,9 @@ impl<L: FrameTx> TlsTx<L> {
             State::Received(e) => return Err(TxError::Received(e.clone())),
             State::Broken => return Err(TxError::Broken),
         }
-        self.collect();
+        // what rustls queued is already in `pending`: each later call into rustls (the receive
+        // step, `finish`, `take_pending`) ends with a collect, and rustls hands out queued
+        // records before WriteTraffic, so a connection past its handshake starts with none
         assert!(
             self.pending.is_empty(),
             "rustls queued a record while the connection is healthy; send it with take_pending first"
