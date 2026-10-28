@@ -108,18 +108,24 @@ mod tests {
     }
 
     #[test]
+    // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
+    #[cfg_attr(miri, ignore)]
     fn accept_key_is_rfc_6455_example() {
         // RFC 6455 §1.3.
         assert_eq!(accept_key(KEY), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
     }
 
     #[test]
+    // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
+    #[cfg_attr(miri, ignore)]
     fn valid_response_passes() {
         check(&response("", ""), KEY).unwrap();
         check(&response("Connection: keep-alive, Upgrade\r\n", "Connection"), KEY).unwrap();
     }
 
     #[test]
+    // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
+    #[cfg_attr(miri, ignore)]
     fn bad_responses_are_refused() {
         assert!(error(&response("Sec-WebSocket-Extensions: permessage-deflate\r\n", "")).contains("Extensions"));
         assert!(error(&response("Sec-WebSocket-Protocol: chat\r\n", "")).contains("Protocol"));
@@ -155,6 +161,8 @@ mod tests {
     /// The head is found across runs cut anywhere, even inside the blank line; the bytes after
     /// it are not taken.
     #[test]
+    // sha1 (in the response) uses aarch64 SHA intrinsics Miri does not run; a sweep anyway
+    #[cfg_attr(miri, ignore)]
     fn read_head_stops_at_the_blank_line_across_runs() {
         let mut stream = response("", "");
         let head_len = stream.len();

@@ -625,9 +625,22 @@ impl Message<'_> {
         self.bytes
     }
 
-    /// `Some` iff text.
+    /// `Some` iff text; no second pass over the bytes.
     pub fn text(&self) -> Option<&str> {
-        text(self.kind, self.bytes)
+        match self.kind {
+            Kind::Text => {
+                debug_assert!(core::str::from_utf8(self.bytes).is_ok(), "validated text changed");
+                // SAFETY: a Text message's bytes were validated as UTF-8 on receipt
+                // (`Core::step`: `from_utf8` over a direct payload, `Utf8::feed` and `finish`
+                // over scratch), and these are those bytes: scratch is written only by a later
+                // `recv`, which this message's borrow of the receive half rules out, and a
+                // direct payload is read through `PlainRx::current`, which returns exactly the
+                // bytes it handed out, unchanged, until the next `chunk` or `push` (the same
+                // borrow rules those out; `TlsRx::current` documents it for sheath).
+                Some(unsafe { core::str::from_utf8_unchecked(self.bytes) })
+            }
+            Kind::Binary => None,
+        }
     }
 
     /// Stamp of the frame holding the message's first byte.
@@ -636,14 +649,6 @@ impl Message<'_> {
     }
 }
 
-/// The payload was validated on receipt. Checking again keeps this safe code:
-/// direct bytes are re-read through the lower layer.
-pub(crate) fn text(kind: Kind, b: &[u8]) -> Option<&str> {
-    match kind {
-        Kind::Text => Some(core::str::from_utf8(b).expect("lower layer changed validated text")),
-        Kind::Binary => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -669,6 +674,28 @@ mod tests {
     fn frame(b0: u8, payload: &[u8]) -> Vec<u8> {
         assert!(payload.len() < 126);
         [&[b0, payload.len() as u8][..], payload].concat()
+    }
+
+    /// `text()` gives back the validated payload without checking it again: a direct message
+    /// (read through the lower layer) and one assembled in scratch, both with multibyte text.
+    /// Small enough for Miri, which checks the unchecked conversion.
+    #[test]
+    fn text_is_the_payload_validated_on_receipt() {
+        let t = "a€𝄞b";
+        let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client));
+        rx.push(F(frame(0x81, t.as_bytes())), &mut ()).unwrap();
+        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), Some(t));
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        let wire = frame(0x81, t.as_bytes());
+        rx.push(F(wire[..5].to_vec()), &mut ()).unwrap();
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        rx.push(F(wire[5..].to_vec()), &mut ()).unwrap();
+        let m = rx.recv(&mut ()).unwrap().unwrap();
+        assert_eq!(m.text(), Some(t));
+        assert!(!m.bytes().is_empty());
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        rx.push(F(frame(0x82, &[0xff])), &mut ()).unwrap();
+        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), None);
     }
 
     /// Doubling would pass `max_message`; capacity stops at it.
