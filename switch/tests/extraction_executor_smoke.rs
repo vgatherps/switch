@@ -6,6 +6,10 @@ use std::task::{Context, Poll};
 
 use switch::Runtime;
 
+#[macro_use]
+#[path = "support/task_macro.rs"]
+mod task_macro;
+
 struct WakeOnce(bool);
 
 impl Future for WakeOnce {
@@ -22,27 +26,28 @@ impl Future for WakeOnce {
     }
 }
 
+task! {
+    async fn push_ready(trace: Rc<RefCell<Vec<&'static str>>>) {
+        trace.borrow_mut().push("ready");
+    }
+}
+
+task! {
+    async fn push_around_wake(trace: Rc<RefCell<Vec<&'static str>>>) {
+        trace.borrow_mut().push("pending first poll");
+        WakeOnce(false).await;
+        trace.borrow_mut().push("pending second poll");
+    }
+}
+
 #[test]
 fn ready_and_self_waking_pending_task_run_in_two_turns() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let trace = Rc::new(RefCell::new(Vec::new()));
 
-    let ready_trace = Rc::clone(&trace);
-    spawner
-        .spawn(async move {
-            ready_trace.borrow_mut().push("ready");
-        })
-        .unwrap();
-
-    let pending_trace = Rc::clone(&trace);
-    spawner
-        .spawn(async move {
-            pending_trace.borrow_mut().push("pending first poll");
-            WakeOnce(false).await;
-            pending_trace.borrow_mut().push("pending second poll");
-        })
-        .unwrap();
+    spawner.spawn(push_ready(Rc::clone(&trace))).unwrap();
+    spawner.spawn(push_around_wake(Rc::clone(&trace))).unwrap();
 
     let first = runtime.poll(0).unwrap();
     assert_eq!(

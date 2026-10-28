@@ -2,15 +2,15 @@
 
 use std::cell::{Cell, UnsafeCell};
 use std::fmt;
-use std::future::Future;
 use std::rc::Rc;
 
-use crate::executor::wake_task;
+use crate::__private::Task;
 use crate::executor::{DEFAULT_CAPACITY, Executor, Lifecycle};
+use crate::task::SpawnToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
-    /// Ready-queue reservation; tasks still allocate individually.
+    /// Ready-queue reservation; task slots come from per-function task blocks.
     pub tasks: usize,
     /// Timer-registration and expiry-index reservation.
     pub timers: usize,
@@ -21,7 +21,12 @@ pub struct Capacity {
 pub enum RuntimeError {
     Closed,
     Panicked,
-    TimeRegressed { current: u64, supplied: u64 },
+    TimeRegressed {
+        current: u64,
+        supplied: u64,
+    },
+    /// Spawn only: the task function already has its capacity of live tasks here.
+    Exhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,13 +58,13 @@ pub struct PollReport {
     pub live_tasks: usize,
 }
 
-/// A rejected task submission and the original future.
-pub struct SpawnError<F> {
+/// A rejected task submission and the original token.
+pub struct SpawnError<T> {
     pub reason: RuntimeError,
-    pub future: F,
+    pub token: SpawnToken<T>,
 }
 
-impl<F> fmt::Debug for SpawnError<F> {
+impl<T> fmt::Debug for SpawnError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpawnError")
             .field("reason", &self.reason)
@@ -70,6 +75,8 @@ impl<F> fmt::Debug for SpawnError<F> {
 pub(crate) struct Control {
     core: UnsafeCell<Option<Box<Executor>>>,
     root: Cell<*mut Executor>,
+    /// Shutdown was requested while a task factory ran; the outermost spawn finishes it.
+    close_deferred: Cell<bool>,
 }
 
 impl Control {
@@ -81,6 +88,7 @@ impl Control {
                 capacity.timers,
             )))),
             root: Cell::new(std::ptr::null_mut()),
+            close_deferred: Cell::new(false),
         });
         // Derive once after final Control placement, before any task aliases exist.
         let root =
@@ -117,6 +125,14 @@ impl Control {
             return;
         }
         unsafe {
+            if Executor::spawning(root) > 0 {
+                // A task factory runs between slot reservation and commit, inside
+                // `Spawner::spawn`, which holds this Control. Close to new work now;
+                // that spawn completes the shutdown once its reservation resolves.
+                Executor::close(root);
+                self.close_deferred.set(true);
+                return;
+            }
             // Owning Box stays in place throughout arbitrary future destruction.
             Executor::cleanup(root);
             self.root.set(std::ptr::null_mut());
@@ -187,7 +203,7 @@ impl Runtime {
                     break;
                 };
                 timers_expired += 1;
-                wake_task(task);
+                Executor::wake(task);
             }
             let batch = Executor::poll_batch(&mut turn);
             let report = PollReport {
@@ -202,7 +218,7 @@ impl Runtime {
         }
     }
 
-    /// Close the runtime and drop its remaining tasks.
+    /// Close the runtime and drop its remaining tasks, in an unspecified order.
     pub fn shutdown(&mut self) {
         self.control.shutdown();
     }
@@ -216,6 +232,8 @@ impl Drop for CleanupContinuation {
     }
 }
 
+/// Dropping a `Runtime` shuts it down: its remaining tasks are dropped, in an
+/// unspecified order.
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _continuation = CleanupContinuation(self.control.clone());
@@ -248,20 +266,37 @@ impl Spawner {
         Ok(crate::sleep::Sleep::new(deadline, self.control.clone()))
     }
 
-    /// Submit a unit-output future. Rejection returns the original future.
-    pub fn spawn<F>(&self, future: F) -> Result<(), SpawnError<F>>
-    where
-        F: Future<Output = ()> + 'static,
-    {
+    /// Submit a task function's token. A closed or panicked runtime, or a task
+    /// function with no free slot here (`Exhausted`), returns the token.
+    ///
+    /// If the task's construction shuts down or drops the runtime, the runtime
+    /// closes at once and its tasks, this one included, are dropped when the
+    /// construction returns, before `spawn` returns `Ok`.
+    pub fn spawn<T: Task>(&self, token: SpawnToken<T>) -> Result<(), SpawnError<T>> {
         match self.control.open_core() {
             Ok(root) => {
-                unsafe { Executor::spawn(root, future) };
-                Ok(())
+                let _deferred = DeferredShutdown(&self.control);
+                unsafe { Executor::spawn(root, token) }.map_err(|token| SpawnError {
+                    reason: RuntimeError::Exhausted,
+                    token,
+                })
             }
             Err(reason) => Err(SpawnError {
                 reason: reason.into(),
-                future,
+                token,
             }),
+        }
+    }
+}
+
+/// Completes a shutdown that a task factory requested during this spawn, once
+/// no reservation is outstanding (also on unwind).
+struct DeferredShutdown<'a>(&'a Control);
+
+impl Drop for DeferredShutdown<'_> {
+    fn drop(&mut self) {
+        if self.0.close_deferred.get() {
+            self.0.shutdown();
         }
     }
 }

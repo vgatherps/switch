@@ -2,9 +2,8 @@ use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use crate::StoredWaker;
 use crate::intrusive::{IntrusiveLinks, Linked, ListHead, ListLinked, NIL, Timed};
 use crate::runtime::Runtime;
 use crate::timer_wheel::{InsertOutcome, TimerWheel, WheelEntry, WheelPosition};
@@ -86,7 +85,7 @@ fn intrusive_list_initializes_nil_and_pushes_then_pops() {
 }
 
 struct StoredWake {
-    slot: Rc<Cell<Option<StoredWaker>>>,
+    slot: Rc<Cell<Option<Waker>>>,
     polls: Rc<Cell<usize>>,
 }
 
@@ -98,9 +97,7 @@ impl Future for StoredWake {
         let count = this.polls.get();
         this.polls.set(count + 1);
         if count == 0 {
-            // SAFETY: this task remains alive until the second poll below, and
-            // the stored waker is used on this executor thread before then.
-            this.slot.set(Some(unsafe { StoredWaker::new(cx) }));
+            this.slot.set(Some(cx.waker().clone()));
             Poll::Pending
         } else {
             Poll::Ready(())
@@ -110,6 +107,11 @@ impl Future for StoredWake {
 
 #[test]
 fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
+    task! {
+        fn stored_wake(task: StoredWake) -> impl Future<Output = ()> {
+            task
+        }
+    }
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let mut entries = entries(&[3]);
@@ -119,10 +121,10 @@ fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
     let slot = Rc::new(Cell::new(None));
     let polls = Rc::new(Cell::new(0));
     spawner
-        .spawn(StoredWake {
+        .spawn(stored_wake(StoredWake {
             slot: Rc::clone(&slot),
             polls: Rc::clone(&polls),
-        })
+        }))
         .unwrap();
     let first = runtime.poll(0).unwrap();
     assert_eq!((first.tasks_polled, first.live_tasks), (1, 1));

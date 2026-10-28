@@ -1,0 +1,885 @@
+//! Block layout and growth, stale wakers, `will_wake`, `StoredWaker`, foreign threads,
+//! tokens, spawn unwinding and TLS teardown.
+
+use std::cell::{Cell, RefCell};
+use std::mem::ManuallyDrop;
+use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
+
+use super::TaskHeader;
+use super::block::{BLOCK, MASK, Meta, Shape};
+use super::pool::{FunctionPool, RuntimePool};
+use crate::StoredWaker;
+use crate::runtime::{Runtime, RuntimeError, Spawner};
+
+#[derive(Default)]
+pub(super) struct State {
+    pub(super) polls: Cell<usize>,
+    pub(super) drops: Cell<usize>,
+    pub(super) done: Cell<bool>,
+    pub(super) waker: RefCell<Option<Waker>>,
+    /// Future address at the latest poll.
+    pub(super) addr: Cell<usize>,
+}
+
+/// Records each poll and keeps a clone of its latest waker; ready once `done`.
+pub(super) struct Parked(pub(super) Rc<State>);
+
+impl Future for Parked {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let state = &self.0;
+        state.polls.set(state.polls.get() + 1);
+        state.addr.set(std::ptr::from_ref(&*self).addr());
+        *state.waker.borrow_mut() = Some(cx.waker().clone());
+        if state.done.get() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        self.0.drops.set(self.0.drops.get() + 1);
+    }
+}
+
+task! {
+    pub(super) fn parked(state: Rc<State>) -> impl Future<Output = ()> {
+        Parked(state)
+    }
+}
+
+task! {
+    fn parked_other(state: Rc<State>) -> impl Future<Output = ()> {
+        Parked(state)
+    }
+}
+
+pub(super) fn state() -> Rc<State> {
+    Rc::new(State::default())
+}
+
+pub(super) fn waker(state: &State) -> Waker {
+    state.waker.borrow().clone().expect("task was polled")
+}
+
+pub(super) fn header(waker: &Waker) -> *const TaskHeader {
+    waker.data().cast()
+}
+
+pub(super) fn meta(waker: &Waker) -> *mut Meta {
+    TaskHeader::meta(header(waker))
+}
+
+/// Holds 3 tasks per block, so a few tasks span several blocks.
+struct Big {
+    parked: Parked,
+    _bulk: [u8; 20_000],
+}
+
+impl Future for Big {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.parked).poll(cx)
+    }
+}
+
+task! {
+    capacity = 7;
+    fn big(state: Rc<State>) -> impl Future<Output = ()> {
+        Big { parked: Parked(state), _bulk: [0; 20_000] }
+    }
+}
+
+/// Spawn `n` tasks of `big` and poll them once.
+fn spawn_big(runtime: &mut Runtime, n: usize) -> Vec<Rc<State>> {
+    let spawner = runtime.spawner();
+    let states: Vec<_> = (0..n).map(|_| state()).collect();
+    for state in &states {
+        spawner.spawn(big(state.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    states
+}
+
+pub(super) fn function_pool(waker: &Waker) -> *mut FunctionPool {
+    unsafe { RuntimePool::function_pool(Meta::pool(meta(waker)).get()) }
+}
+
+/// Spawn `n` parked tasks and poll them once.
+pub(super) fn spawn_parked(runtime: &mut Runtime, n: usize) -> Vec<Rc<State>> {
+    let spawner = runtime.spawner();
+    let states: Vec<_> = (0..n).map(|_| state()).collect();
+    for state in &states {
+        spawner.spawn(parked(state.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    states
+}
+
+pub(super) fn finish(runtime: &mut Runtime, state: &State) {
+    state.done.set(true);
+    waker(state).wake_by_ref();
+    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+}
+
+// ---- Blocks ----
+
+#[test]
+fn every_live_header_masks_to_its_block_across_blocks() {
+    assert_eq!(Shape::<Big>::SLOTS, 3);
+    let mut runtime = Runtime::new(0);
+    let states = spawn_big(&mut runtime, 7);
+    let metas: Vec<_> = states.iter().map(|s| meta(&waker(s))).collect();
+    for (state, &meta) in states.iter().zip(&metas) {
+        let header = header(&waker(state));
+        assert_eq!(meta.addr() % BLOCK, 0);
+        assert_eq!(header.addr() & MASK, meta.addr());
+        let position = unsafe { Meta::position(meta, header) };
+        assert_eq!(unsafe { Meta::header(meta, position) }, header);
+    }
+    // Depot slot s is position (s - 1) % 3 of block (s - 1) / 3: slots 1..=7 fill
+    // two blocks and the first position of a third.
+    for (index, &meta) in metas.iter().enumerate() {
+        assert_eq!(unsafe { Meta::block(meta).get() }, (index / 3) as u32);
+    }
+    assert_eq!(
+        unsafe { RuntimePool::block_count(Meta::pool(metas[0]).get()) },
+        3
+    );
+}
+
+#[test]
+fn capacity_limits_live_tasks_and_frees_on_completion() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let states = spawn_big(&mut runtime, 7);
+    let rejected = state();
+    let error = spawner.spawn(big(rejected.clone())).unwrap_err();
+    assert_eq!(error.reason, RuntimeError::Exhausted);
+    drop(error);
+    assert_eq!(Rc::strong_count(&rejected), 1);
+    finish(&mut runtime, &states[4]);
+    let again = spawn_big(&mut runtime, 1).remove(0);
+    assert_eq!(header(&waker(&again)), header(&waker(&states[4])));
+}
+
+#[test]
+fn default_capacity_is_one_block() {
+    struct Wide(Parked, #[allow(dead_code)] [u8; 30_000]);
+    impl Future for Wide {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            Pin::new(&mut self.0).poll(cx)
+        }
+    }
+    task! {
+        fn wide(state: Rc<State>) -> impl Future<Output = ()> {
+            Wide(Parked(state), [0; 30_000])
+        }
+    }
+    assert_eq!(Shape::<Wide>::SLOTS, 2);
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let states: Vec<_> = (0..2).map(|_| state()).collect();
+    for state in &states {
+        spawner.spawn(wide(state.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    let block = meta(&waker(&states[0]));
+    assert_eq!(meta(&waker(&states[1])), block);
+    let error = spawner.spawn(wide(state())).unwrap_err();
+    assert_eq!(error.reason, RuntimeError::Exhausted);
+    assert_eq!(
+        unsafe { RuntimePool::block_count(Meta::pool(block).get()) },
+        1
+    );
+}
+
+#[repr(align(128))]
+struct Aligned128 {
+    state: Rc<State>,
+    _bulk: [u8; 40],
+}
+
+impl Future for Aligned128 {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        assert_eq!(std::ptr::from_ref(&*self).addr() % 128, 0);
+        let state = &self.state;
+        state.polls.set(state.polls.get() + 1);
+        *state.waker.borrow_mut() = Some(cx.waker().clone());
+        if state.done.get() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for Aligned128 {
+    fn drop(&mut self) {
+        assert_eq!(std::ptr::from_ref(self).addr() % 128, 0);
+        self.state.drops.set(self.state.drops.get() + 1);
+    }
+}
+
+task! {
+    fn aligned_128(state: Rc<State>) -> impl Future<Output = ()> {
+        Aligned128 { state, _bulk: [0; 40] }
+    }
+}
+
+#[test]
+fn over_aligned_future_polls_and_drops_aligned_through_slot_reuse() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let states: Vec<_> = (0..20).map(|_| state()).collect();
+    for state in &states {
+        spawner.spawn(aligned_128(state.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    for state in &states {
+        state.done.set(true);
+        waker(state).wake_by_ref();
+    }
+    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 20);
+    let again: Vec<_> = (0..20).map(|_| state()).collect();
+    for state in &again {
+        spawner.spawn(aligned_128(state.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    for state in &again {
+        state.done.set(true);
+        waker(state).wake_by_ref();
+    }
+    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 20);
+    assert!(
+        states
+            .iter()
+            .chain(&again)
+            .all(|s| s.drops.get() == 1 && s.polls.get() == 2)
+    );
+}
+
+// ---- Stale wakers ----
+
+#[test]
+fn stale_waker_of_free_slot_polls_nothing() {
+    let mut runtime = Runtime::new(0);
+    let states = spawn_parked(&mut runtime, 1);
+    let stale = waker(&states[0]);
+    finish(&mut runtime, &states[0]);
+    stale.wake_by_ref();
+    let by_value = stale.clone();
+    by_value.wake();
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
+    assert_eq!(states[0].polls.get(), 2);
+}
+
+#[test]
+fn stale_waker_of_reused_slot_polls_newer_task_once_per_drained_wake() {
+    let mut runtime = Runtime::new(0);
+    let old = spawn_parked(&mut runtime, 1).remove(0);
+    let stale = waker(&old);
+    finish(&mut runtime, &old);
+    let new = spawn_parked(&mut runtime, 1).remove(0);
+    assert_eq!(header(&waker(&new)), header(&stale));
+    assert_eq!(new.polls.get(), 1);
+    // Wakes coalesce while queued; each drain re-arms the stale waker.
+    for drain in 1..=3 {
+        stale.wake_by_ref();
+        stale.wake_by_ref();
+        assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+        assert_eq!(new.polls.get(), 1 + drain);
+    }
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
+    finish(&mut runtime, &new);
+    assert_eq!((new.polls.get(), new.drops.get()), (5, 1));
+}
+
+#[test]
+fn stale_waker_of_block_lent_to_later_runtime_polls_there_per_drained_wake() {
+    let mut first = Runtime::new(0);
+    let old = spawn_parked(&mut first, 1).remove(0);
+    let stale = waker(&old);
+    drop(first);
+    assert_eq!(old.drops.get(), 1);
+    let mut second = Runtime::new(0);
+    let new = spawn_parked(&mut second, 1).remove(0);
+    assert_eq!(header(&waker(&new)), header(&stale));
+    stale.wake_by_ref();
+    assert_eq!(second.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(new.polls.get(), 2);
+    stale.wake_by_ref();
+    assert_eq!(second.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(new.polls.get(), 3);
+}
+
+#[test]
+fn wake_after_shutdown_or_drop_has_no_effect() {
+    for drop_runtime in [false, true] {
+        let mut runtime = Runtime::new(0);
+        let states = spawn_parked(&mut runtime, 3);
+        let stale: Vec<_> = states.iter().map(|s| waker(s)).collect();
+        if drop_runtime {
+            drop(runtime);
+        } else {
+            runtime.shutdown();
+        }
+        for waker in &stale {
+            assert!(!unsafe { TaskHeader::is_live(header(waker)) });
+            assert!(unsafe { Meta::executor(meta(waker)).get() }.is_null());
+            waker.wake_by_ref();
+            let by_value = waker.clone();
+            by_value.wake();
+        }
+        assert!(
+            states
+                .iter()
+                .all(|s| s.drops.get() == 1 && s.polls.get() == 1)
+        );
+    }
+}
+
+#[test]
+fn stale_wake_into_a_reserved_slot_returns_before_any_executor_access() {
+    task! {
+        fn wake_while_reserved(state: Rc<State>, stale: Option<Waker>) -> impl Future<Output = ()> {
+            // Factory code runs with this call's slot reserved but not yet LIVE.
+            if let Some(stale) = stale {
+                assert_eq!(unsafe { TaskHeader::flags(header(&stale)).get() }, 0);
+                stale.wake_by_ref();
+            }
+            Parked(state)
+        }
+    }
+    let mut first = Runtime::new(0);
+    let spawner = first.spawner();
+    let old = state();
+    spawner
+        .spawn(wake_while_reserved(old.clone(), None))
+        .unwrap();
+    first.poll(0).unwrap();
+    let stale = waker(&old);
+    drop(first);
+    let mut second = Runtime::new(0);
+    let new = state();
+    second
+        .spawner()
+        .spawn(wake_while_reserved(new.clone(), Some(stale.clone())))
+        .unwrap();
+    let report = second.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.ready_tasks), (1, 0));
+    assert_eq!(header(&waker(&new)), header(&stale));
+    assert_eq!(new.polls.get(), 1);
+}
+
+// ---- will_wake ----
+
+#[test]
+fn will_wake_identifies_slots() {
+    let mut runtime = Runtime::new(0);
+    let states = spawn_parked(&mut runtime, 2);
+    let first = waker(&states[0]);
+    let clone = first.clone();
+    assert!(first.will_wake(&clone));
+    // Across polls of one task.
+    first.wake_by_ref();
+    runtime.poll(0).unwrap();
+    assert!(waker(&states[0]).will_wake(&first));
+    // Between tasks, of the same and of another function.
+    assert!(!first.will_wake(&waker(&states[1])));
+    let other = state();
+    runtime
+        .spawner()
+        .spawn(parked_other(other.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    assert!(!first.will_wake(&waker(&other)));
+    // Another executor's task.
+    let mut elsewhere = Runtime::new(0);
+    let foreign = spawn_parked(&mut elsewhere, 1).remove(0);
+    assert!(!first.will_wake(&waker(&foreign)));
+    // A stale clone against the newer task in its slot.
+    finish(&mut runtime, &states[0]);
+    let newer = spawn_parked(&mut runtime, 1).remove(0);
+    assert!(clone.will_wake(&waker(&newer)));
+    let mut target = waker(&states[1]);
+    target.clone_from(&first);
+    assert!(target.will_wake(&first));
+}
+
+// ---- Foreign thread after owner exit ----
+
+#[test]
+fn foreign_thread_ops_panic_after_owner_thread_exits() {
+    let wakers = std::thread::spawn(|| {
+        let mut runtime = Runtime::new(0);
+        let states = spawn_parked(&mut runtime, 1);
+        let waker = waker(&states[0]);
+        let wakers: Vec<Waker> = (0..4).map(|_| waker.clone()).collect();
+        drop(runtime);
+        assert_eq!(states[0].drops.get(), 1);
+        drop(states);
+        wakers
+    })
+    .join()
+    .unwrap();
+    for (operation, waker) in wakers.into_iter().enumerate() {
+        // Never dropped here unless dropping is the operation under test.
+        let waker = ManuallyDrop::new(waker);
+        let payload = catch_unwind(AssertUnwindSafe(move || match operation {
+            0 => waker.wake_by_ref(),
+            1 => drop(Waker::clone(&waker)),
+            2 => ManuallyDrop::into_inner(waker).wake(),
+            _ => drop(ManuallyDrop::into_inner(waker)),
+        }))
+        .unwrap_err();
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("waker used on foreign thread")
+        );
+    }
+}
+
+// ---- Pools ----
+
+#[test]
+fn runtimes_on_one_thread_use_disjoint_blocks() {
+    let mut a = Runtime::new(0);
+    let mut b = Runtime::new(0);
+    let in_a = spawn_big(&mut a, 2);
+    let a_block = meta(&waker(&in_a[0]));
+    for state in &in_a {
+        finish(&mut a, state);
+    }
+    // `a` has free slots, yet `b` never takes one.
+    let in_b = spawn_big(&mut b, 7);
+    assert!(in_b.iter().all(|s| meta(&waker(s)) != a_block));
+    let b_executor = unsafe { Meta::executor(meta(&waker(&in_b[0]))).get() };
+    assert_ne!(unsafe { Meta::executor(a_block).get() }, b_executor);
+}
+
+#[test]
+fn shutdown_lends_blocks_to_the_next_runtime() {
+    let mut first = Runtime::new(0);
+    let states = spawn_big(&mut first, 7);
+    let blocks: Vec<_> = states.iter().step_by(3).map(|s| meta(&waker(s))).collect();
+    let function = function_pool(&waker(&states[0]));
+    drop(first);
+    assert_eq!(unsafe { FunctionPool::spare_count(function) }, 3);
+    let mut second = Runtime::new(0);
+    let reused = spawn_big(&mut second, 1).remove(0);
+    assert!(blocks.contains(&meta(&waker(&reused))));
+    assert_eq!(unsafe { FunctionPool::spare_count(function) }, 2);
+}
+
+#[test]
+fn live_future_never_moves_when_blocks_grow() {
+    let mut runtime = Runtime::new(0);
+    let first = spawn_big(&mut runtime, 1).remove(0);
+    let addr = first.addr.get();
+    let _many = spawn_big(&mut runtime, 6);
+    waker(&first).wake_by_ref();
+    runtime.poll(0).unwrap();
+    assert_eq!(first.polls.get(), 2);
+    assert_eq!(first.addr.get(), addr);
+}
+
+#[test]
+fn one_function_on_two_threads_uses_disjoint_blocks() {
+    let spawn_on_thread = || {
+        std::thread::spawn(|| {
+            let mut runtime = Runtime::new(0);
+            let states = spawn_parked(&mut runtime, 1);
+            let waker = waker(&states[0]);
+            (meta(&waker).addr(), function_pool(&waker).addr())
+        })
+        .join()
+        .unwrap()
+    };
+    let (block_a, pool_a) = spawn_on_thread();
+    let (block_b, pool_b) = spawn_on_thread();
+    assert_ne!(block_a, block_b);
+    assert_ne!(pool_a, pool_b);
+}
+
+// ---- Token and spawn unwinding ----
+
+struct DropFlag(Rc<Cell<usize>>, bool);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+        if self.1 {
+            panic_any(55usize);
+        }
+    }
+}
+
+task! {
+    async fn holds(flag: DropFlag) {
+        let _flag = flag;
+    }
+}
+
+#[test]
+fn unspawned_token_drops_only_its_arguments() {
+    let drops = Rc::new(Cell::new(0));
+    let token = holds(DropFlag(drops.clone(), false));
+    assert_eq!(drops.get(), 0);
+    drop(token);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn token_destructor_panic_leaves_pool_usable() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let drops = Rc::new(Cell::new(0));
+    let token = holds(DropFlag(drops.clone(), true));
+    let payload = catch_unwind(AssertUnwindSafe(|| drop(token))).unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&55));
+    runtime.shutdown();
+    let error = spawner
+        .spawn(holds(DropFlag(drops.clone(), true)))
+        .unwrap_err();
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(error))).is_err());
+    assert_eq!(drops.get(), 2);
+    let mut runtime = Runtime::new(0);
+    runtime
+        .spawner()
+        .spawn(holds(DropFlag(drops.clone(), false)))
+        .unwrap();
+    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+    assert_eq!(drops.get(), 3);
+}
+
+#[test]
+fn factory_panic_releases_its_reserved_slot() {
+    task! {
+        capacity = 2;
+        fn factory(state: Rc<State>, panic: bool) -> impl Future<Output = ()> {
+            if panic {
+                panic_any(77usize);
+            }
+            Parked(state)
+        }
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let held = state();
+    spawner.spawn(factory(held.clone(), false)).unwrap();
+    runtime.poll(0).unwrap();
+    let failed = state();
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        spawner.spawn(factory(failed.clone(), true))
+    }))
+    .unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&77));
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (0, 1));
+    // Capacity 2: had the failed reservation leaked its slot, this would be Exhausted.
+    let next = state();
+    spawner.spawn(factory(next.clone(), false)).unwrap();
+    runtime.poll(0).unwrap();
+    assert_eq!(failed.polls.get(), 0);
+    drop(runtime);
+    assert_eq!(
+        (held.drops.get(), next.drops.get(), failed.drops.get()),
+        (1, 1, 0)
+    );
+}
+
+task! {
+    fn recursive_factory(spawner: Spawner, states: Rc<RefCell<Vec<Rc<State>>>>, depth: u8) -> impl Future<Output = ()> {
+        let state = state();
+        states.borrow_mut().push(state.clone());
+        if depth > 0 {
+            spawner
+                .spawn(recursive_factory(spawner.clone(), states.clone(), depth - 1))
+                .unwrap();
+        }
+        Parked(state)
+    }
+}
+
+#[test]
+fn factory_may_spawn_recursively() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let states = Rc::new(RefCell::new(Vec::new()));
+    spawner
+        .spawn(recursive_factory(spawner.clone(), states.clone(), 70))
+        .unwrap();
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (71, 71));
+    let mut headers: Vec<_> = states.borrow().iter().map(|s| header(&waker(s))).collect();
+    headers.sort_unstable();
+    headers.dedup();
+    assert_eq!(headers.len(), 71);
+    drop(runtime);
+    assert!(states.borrow().iter().all(|s| s.drops.get() == 1));
+}
+
+task! {
+    fn shutdown_in_factory(runtime: Rc<RefCell<Runtime>>, state: Rc<State>, panic: bool) -> impl Future<Output = ()> {
+        runtime.borrow_mut().shutdown();
+        assert_eq!(state.drops.get(), 0, "cleanup must wait for the reservation");
+        if panic {
+            panic_any(91usize);
+        }
+        Parked(state)
+    }
+}
+
+#[test]
+fn shutdown_from_a_factory_completes_when_the_spawn_returns() {
+    let runtime = Rc::new(RefCell::new(Runtime::new(0)));
+    let spawner = runtime.borrow().spawner();
+    let earlier = spawn_parked(&mut runtime.borrow_mut(), 1).remove(0);
+    let state = state();
+    spawner
+        .spawn(shutdown_in_factory(runtime.clone(), state.clone(), false))
+        .unwrap();
+    // The runtime closed inside the factory; its tasks, the new one included,
+    // were dropped as the spawn returned.
+    assert_eq!(
+        (earlier.drops.get(), state.drops.get(), state.polls.get()),
+        (1, 1, 0)
+    );
+    assert_eq!(runtime.borrow_mut().poll(0), Err(RuntimeError::Closed));
+    let rejected = spawner.spawn(parked(self::state())).unwrap_err();
+    assert_eq!(rejected.reason, RuntimeError::Closed);
+}
+
+#[test]
+fn shutdown_then_panic_in_a_factory_releases_the_slot_then_cleans_up() {
+    let runtime = Rc::new(RefCell::new(Runtime::new(0)));
+    let spawner = runtime.borrow().spawner();
+    let earlier = spawn_parked(&mut runtime.borrow_mut(), 1).remove(0);
+    let state = state();
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        spawner.spawn(shutdown_in_factory(runtime.clone(), state.clone(), true))
+    }))
+    .unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&91));
+    assert_eq!((earlier.drops.get(), state.drops.get()), (1, 0));
+    assert_eq!(runtime.borrow_mut().poll(0), Err(RuntimeError::Closed));
+}
+
+// ---- Cleanup ----
+
+#[test]
+fn cleanup_drops_every_task_of_every_block_and_function_once() {
+    struct Ordered(u32, Rc<RefCell<Vec<u32>>>, #[allow(dead_code)] [u8; 20_000]);
+    impl Future for Ordered {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+    impl Drop for Ordered {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+    task! {
+        capacity = 5;
+        fn first_fn(id: u32, log: Rc<RefCell<Vec<u32>>>) -> impl Future<Output = ()> {
+            Ordered(id, log, [0; 20_000])
+        }
+    }
+    task! {
+        fn second_fn(id: u32, log: Rc<RefCell<Vec<u32>>>) -> impl Future<Output = ()> {
+            Ordered(id, log, [0; 20_000])
+        }
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    for id in 0..5 {
+        spawner.spawn(first_fn(id, log.clone())).unwrap();
+    }
+    for id in 1000..1002 {
+        spawner.spawn(second_fn(id, log.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    runtime.shutdown();
+    // The drop order is unspecified; each future is dropped exactly once.
+    let mut dropped = log.borrow().clone();
+    dropped.sort_unstable();
+    let mut expected: Vec<u32> = (0..5).collect();
+    expected.extend(1000..1002);
+    assert_eq!(dropped, expected);
+}
+
+// ---- Timers ----
+
+#[test]
+fn sleep_expiry_wakes_a_task_in_a_later_block() {
+    task! {
+        capacity = 7;
+        async fn sleeper(spawner: Spawner, woke: Rc<Cell<bool>>) {
+            let bulk = [0u8; 20_000];
+            spawner.sleep_until(5).unwrap().await.unwrap();
+            std::hint::black_box(&bulk);
+            woke.set(true);
+        }
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let flags: Vec<_> = (0..7).map(|_| Rc::new(Cell::new(false))).collect();
+    for woke in &flags {
+        spawner
+            .spawn(sleeper(spawner.clone(), woke.clone()))
+            .unwrap();
+    }
+    assert_eq!(runtime.poll(0).unwrap().live_tasks, 7);
+    let report = runtime.poll(5).unwrap();
+    assert_eq!((report.timers_expired, report.tasks_completed), (7, 7));
+    assert!(flags.iter().all(|woke| woke.get()));
+}
+
+// ---- StoredWaker ----
+
+task! {
+    fn stores(state: Rc<State>, stored: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |cx| {
+            stored.set(Some(StoredWaker::new(cx)));
+            state.polls.set(state.polls.get() + 1);
+            if state.done.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+}
+
+#[test]
+fn stored_waker_wake_polls_the_task_once() {
+    let mut runtime = Runtime::new(0);
+    let state = state();
+    let stored = Rc::new(Cell::new(None));
+    runtime
+        .spawner()
+        .spawn(stores(state.clone(), stored.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    let handle = stored.get().unwrap();
+    handle.wake();
+    handle.wake();
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
+}
+
+#[test]
+fn stale_stored_waker_into_free_then_reused_slot() {
+    let mut runtime = Runtime::new(0);
+    let old = state();
+    let stored = Rc::new(Cell::new(None));
+    runtime
+        .spawner()
+        .spawn(stores(old.clone(), stored.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    let stale = stored.get().unwrap();
+    old.done.set(true);
+    stale.wake();
+    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+    // Free slot: nothing.
+    stale.wake();
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
+    // Reused slot: the newer task gets one more poll.
+    let new = state();
+    runtime
+        .spawner()
+        .spawn(stores(new.clone(), Rc::new(Cell::new(None))))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    assert_eq!(stored.get(), Some(stale));
+    stale.wake();
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(new.polls.get(), 2);
+}
+
+#[test]
+fn stored_waker_rejects_a_foreign_waker() {
+    let cx = Context::from_waker(Waker::noop());
+    assert!(catch_unwind(AssertUnwindSafe(|| StoredWaker::new(&cx))).is_err());
+}
+
+// ---- Thread-local destruction ----
+
+struct OnTlsDrop(Arc<AtomicUsize>);
+
+struct Counted(Arc<AtomicUsize>);
+
+impl Future for Counted {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+task! {
+    fn counted_in_tls(drops: Arc<AtomicUsize>) -> impl Future<Output = ()> {
+        Counted(drops)
+    }
+}
+
+task! {
+    fn first_used_in_tls_drop(drops: Arc<AtomicUsize>) -> impl Future<Output = ()> {
+        Counted(drops)
+    }
+}
+
+impl Drop for OnTlsDrop {
+    fn drop(&mut self) {
+        // First use of this function's pool on this thread, during TLS destruction.
+        let mut runtime = Runtime::new(0);
+        runtime
+            .spawner()
+            .spawn(first_used_in_tls_drop(self.0.clone()))
+            .unwrap();
+        assert_eq!(runtime.poll(0).unwrap().live_tasks, 1);
+    }
+}
+
+thread_local! {
+    static HELD_RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+    static SPAWN_ON_DROP: RefCell<Option<OnTlsDrop>> = const { RefCell::new(None) };
+}
+
+#[test]
+fn runtime_dropped_and_spawned_from_thread_local_destructors() {
+    let held = Arc::new(AtomicUsize::new(0));
+    let late = Arc::new(AtomicUsize::new(0));
+    let (held_in, late_in) = (held.clone(), late.clone());
+    std::thread::spawn(move || {
+        let mut runtime = Runtime::new(0);
+        runtime.spawner().spawn(counted_in_tls(held_in)).unwrap();
+        runtime.poll(0).unwrap();
+        HELD_RUNTIME.with(|slot| *slot.borrow_mut() = Some(runtime));
+        SPAWN_ON_DROP.with(|slot| *slot.borrow_mut() = Some(OnTlsDrop(late_in)));
+    })
+    .join()
+    .unwrap();
+    assert_eq!(held.load(Ordering::SeqCst), 1);
+    assert_eq!(late.load(Ordering::SeqCst), 1);
+}

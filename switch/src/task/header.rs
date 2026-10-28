@@ -1,51 +1,58 @@
-//! Task header and independently tracked allocation/future lifetime.
+//! Per-slot task header: 8 bytes in front of every future.
 
-use std::task::{Context, Poll};
+use std::cell::Cell;
+use std::ptr::addr_of;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TaskState {
-    Idle = 0,
-    Scheduled = 1,
-    Terminal = 3,
-}
+use super::block::{MASK, Meta};
 
+/// Task can be polled; cleared at completion, poll panic, or shutdown.
+pub(crate) const LIVE: u8 = 1;
+/// One run-queue entry refers to this slot.
+pub(crate) const QUEUED: u8 = 2;
+/// The future's destructor has started; it never runs twice.
+pub(crate) const DROP_STARTED: u8 = 4;
+/// The slot holds a future (live, or awaiting drop or reclaim); set at commit,
+/// cleared when the slot is freed.
+pub(crate) const TAKEN: u8 = 8;
+
+/// Written only on the owner thread. Every mutable field is a `Cell`, so shared
+/// access never conflicts with a wake or timer registration during a poll.
+/// A new block is zeroed: no flags. Flags are 0 exactly when the slot is free
+/// or reserved by a spawn in progress.
 #[repr(C)]
-pub struct TaskHeader {
-    pub(crate) executor: *mut (),
-    pub(super) poll_fn: unsafe fn(*mut TaskHeader, &mut Context<'_>) -> Poll<()>,
-    pub(super) drop_fn: unsafe fn(*mut TaskHeader),
-    pub(super) free_fn: unsafe fn(*mut TaskHeader),
-    pub(crate) prev: *mut TaskHeader,
-    pub(crate) next: *mut TaskHeader,
-    pub(crate) state: TaskState,
-    pub(crate) queued: bool,
-    pub(crate) drop_started: bool,
-    pub(crate) reg_head: u32,
+pub(crate) struct TaskHeader {
+    flags: Cell<u8>,
+    _pad: [u8; 3],
+    /// Timer registration list head (`timer_registration.rs`).
+    reg_head: Cell<u32>,
 }
 
 impl TaskHeader {
-    /// Caller owns a live initialized future, with no overlapping poll/drop.
-    #[inline]
-    pub(crate) unsafe fn poll(this: *mut Self, cx: &mut Context<'_>) -> Poll<()> {
-        unsafe { ((*this).poll_fn)(this, cx) }
+    /// The block metadata of the slot `this` heads; no load.
+    #[inline(always)]
+    pub(crate) fn meta(this: *const Self) -> *mut Meta {
+        this.cast_mut().map_addr(|addr| addr & MASK).cast()
     }
 
-    /// Mark before arbitrary user Drop; a panicking destructor must never repeat.
+    /// # Safety
+    /// `this` points to a header inside a block; only the owner thread calls.
     #[inline]
-    pub(crate) unsafe fn drop_future(this: *mut Self) {
-        unsafe {
-            if !(*this).drop_started {
-                (*this).drop_started = true;
-                ((*this).drop_fn)(this);
-            }
-        }
+    pub(crate) unsafe fn flags<'a>(this: *const Self) -> &'a Cell<u8> {
+        unsafe { &*addr_of!((*this).flags) }
     }
 
-    /// Caller has discharged all claims and finished (or unwound) future Drop.
+    /// # Safety
+    /// As for [`Self::flags`].
     #[inline]
-    pub(crate) unsafe fn free(this: *mut Self) {
-        unsafe { ((*this).free_fn)(this) }
+    pub(crate) unsafe fn reg_head<'a>(this: *const Self) -> &'a Cell<u32> {
+        unsafe { &*addr_of!((*this).reg_head) }
+    }
+
+    /// # Safety
+    /// As for [`Self::flags`].
+    #[inline]
+    pub(crate) unsafe fn is_live(this: *const Self) -> bool {
+        unsafe { Self::flags(this).get() & LIVE != 0 }
     }
 }
 
@@ -54,10 +61,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_layout_and_state() {
-        assert_eq!(std::mem::size_of::<TaskHeader>(), 56);
-        assert_eq!(std::mem::align_of::<TaskHeader>(), 8);
-        assert_eq!(std::mem::offset_of!(TaskHeader, reg_head), 52);
-        assert_eq!(TaskState::Terminal as u8, 3);
+    fn header_is_8_bytes_align_4_with_reg_head_at_4() {
+        assert_eq!(std::mem::size_of::<TaskHeader>(), 8);
+        assert_eq!(std::mem::align_of::<TaskHeader>(), 4);
+        assert_eq!(std::mem::offset_of!(TaskHeader, flags), 0);
+        assert_eq!(std::mem::offset_of!(TaskHeader, reg_head), 4);
     }
 }

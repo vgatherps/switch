@@ -8,6 +8,10 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use switch::{Capacity, Runtime, Sleep};
 
+#[macro_use]
+#[path = "support/task_macro.rs"]
+mod task_macro;
+
 #[global_allocator]
 static ALLOCATOR: CountingGlobalAlloc = CountingGlobalAlloc;
 
@@ -88,22 +92,30 @@ fn reserved_real_sleep_phases_and_task_allocation_are_distinct() {
         )
     });
     assert!(startup.allocations > 0);
+    // Local to this test so its pool starts empty on whatever thread runs it.
+    task! {
+        fn spawn_holder(holder: Holder) -> impl Future<Output = ()> {
+            holder
+        }
+    }
     let spawner = runtime.spawner();
     let drops = Rc::new(Cell::new(0));
     let stop_a = Rc::new(Cell::new(false));
     let stop_b = Rc::new(Cell::new(false));
     let slot = Rc::new(RefCell::new(Some(spawner.sleep_until(110).unwrap())));
-    let task = holder(&slot, &stop_a, &drops);
+    let task = spawn_holder(holder(&slot, &stop_a, &drops));
     let (_, spawn) = measure(|| spawner.spawn(task).unwrap());
-    assert_eq!((spawn.allocations, spawn.reallocations), (1, 0));
+    // First spawn of this function on this thread: function pool, runtime pool,
+    // executor pool list, depot (5 arrays), block, block list, spare capacity.
+    assert_eq!((spawn.allocations, spawn.reallocations), (11, 0));
     let (r, register) = measure(|| runtime.poll(100).unwrap());
     assert_eq!((r.tasks_polled, r.ready_tasks, r.live_tasks), (1, 1, 1));
     no_alloc(register);
     let (_, refresh) = measure(|| runtime.poll(100).unwrap());
     no_alloc(refresh);
-    let task = holder(&slot, &stop_b, &drops);
+    let task = spawn_holder(holder(&slot, &stop_b, &drops));
     let (_, spawn_b) = measure(|| spawner.spawn(task).unwrap());
-    assert_eq!((spawn_b.allocations, spawn_b.reallocations), (1, 0));
+    assert_eq!((spawn_b.allocations, spawn_b.reallocations), (0, 0));
     let (r, transfer) = measure(|| runtime.poll(100).unwrap());
     assert_eq!(r.tasks_polled, 2);
     no_alloc(transfer);
@@ -128,7 +140,7 @@ fn reserved_real_sleep_phases_and_task_allocation_are_distinct() {
 
     let cancel_slot = Rc::new(RefCell::new(Some(spawner.sleep_until(120).unwrap())));
     let stop = Rc::new(Cell::new(false));
-    let task = holder(&cancel_slot, &stop, &drops);
+    let task = spawn_holder(holder(&cancel_slot, &stop, &drops));
     spawner.spawn(task).unwrap();
     let (_, register_reuse) = measure(|| runtime.poll(110).unwrap());
     no_alloc(register_reuse);
@@ -152,11 +164,17 @@ fn zero_reservation_growth_is_reported_separately() {
             timers: 0,
         },
     );
+    // Local to this test so its pool starts empty on whatever thread runs it.
+    task! {
+        fn spawn_holder(holder: Holder) -> impl Future<Output = ()> {
+            holder
+        }
+    }
     let spawner = runtime.spawner();
     let slot = Rc::new(RefCell::new(Some(spawner.sleep_until(2).unwrap())));
     let stop = Rc::new(Cell::new(false));
     let drops = Rc::new(Cell::new(0));
-    let task = holder(&slot, &stop, &drops);
+    let task = spawn_holder(holder(&slot, &stop, &drops));
     let (_, spawn_growth) = measure(|| spawner.spawn(task).unwrap());
     assert!(spawn_growth.allocations + spawn_growth.reallocations >= 3);
     let (_, timer_growth) = measure(|| runtime.poll(0).unwrap());

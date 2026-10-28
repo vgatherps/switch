@@ -1,5 +1,7 @@
 use super::*;
 use crate::runtime::{Runtime, RuntimeError};
+use crate::task::TaskHeader;
+use crate::task::block::Meta;
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -12,14 +14,14 @@ struct Holder {
     sleep: Rc<RefCell<Option<Sleep>>>,
     complete: Rc<Cell<bool>>,
     forget: Option<Rc<RefCell<Option<ManuallyDrop<Sleep>>>>>,
-    wake: Option<Rc<Cell<Option<crate::StoredWaker>>>>,
+    wake: Option<Rc<Cell<Option<Waker>>>>,
 }
 impl Future for Holder {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = self.get_mut();
         if let Some(wake) = &this.wake {
-            wake.set(Some(unsafe { crate::StoredWaker::new(cx) }));
+            wake.set(Some(cx.waker().clone()));
         }
         if this.complete.get() {
             if let Some(target) = &this.forget {
@@ -39,12 +41,30 @@ impl Future for Holder {
         }
     }
 }
-fn holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> Holder {
+fn new_holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> Holder {
     Holder {
         sleep,
         complete,
         forget: None,
         wake: None,
+    }
+}
+
+task! {
+    fn holding(task: Holder) -> impl Future<Output = ()> {
+        task
+    }
+}
+
+task! {
+    fn holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> impl Future<Output = ()> {
+        new_holder(sleep, complete)
+    }
+}
+
+task! {
+    async fn panic_task(payload: &'static str) {
+        std::panic::panic_any(payload);
     }
 }
 
@@ -64,7 +84,7 @@ fn availability_precedes_overflow_and_escaped_sleep() {
     let mut runtime = Runtime::new(u64::MAX);
     let spawner = runtime.spawner();
     let mut sleep = spawner.sleep_until(u64::MAX).unwrap();
-    spawner.spawn(async { panic!("original") }).unwrap();
+    spawner.spawn(panic_task("original")).unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| runtime.poll(u64::MAX))).is_err());
     assert!(matches!(spawner.sleep(1), Err(SleepError::Panicked)));
     assert_eq!(
@@ -126,9 +146,9 @@ fn transfer_before_retirement_and_stale_after_retirement() {
         let slot = Rc::new(RefCell::new(Some(spawner.sleep_until(8).unwrap())));
         let done = Rc::new(Cell::new(false));
         let wake = Rc::new(Cell::new(None));
-        let mut original = holder(slot.clone(), done.clone());
+        let mut original = new_holder(slot.clone(), done.clone());
         original.wake = Some(wake.clone());
-        spawner.spawn(original).unwrap();
+        spawner.spawn(holding(original)).unwrap();
         runtime.poll(0).unwrap();
         let old = slot.borrow().as_ref().unwrap().token.unwrap();
         if transfer_first {
@@ -189,12 +209,12 @@ fn retirement_cleans_undropped_pending_and_expired_sleep() {
         let retained = Rc::new(RefCell::new(None));
         let wake = Rc::new(Cell::new(None));
         spawner
-            .spawn(Holder {
+            .spawn(holding(Holder {
                 sleep: slot.clone(),
                 complete: done.clone(),
                 forget: Some(retained.clone()),
                 wake: Some(wake.clone()),
-            })
+            }))
             .unwrap();
         runtime.poll(0).unwrap();
         done.set(true);
@@ -263,14 +283,7 @@ fn foreign_runtime_frame_rejected_while_original_frame_live() {
                 .spawner()
                 .spawn(holder(self.sleep.clone(), Rc::new(Cell::new(false))))
                 .unwrap();
-            assert_eq!(
-                self.other
-                    .borrow_mut()
-                    .poll(0)
-                    .unwrap()
-                    .tasks_completed,
-                1
-            );
+            assert_eq!(self.other.borrow_mut().poll(0).unwrap().tasks_completed, 1);
             assert_eq!(
                 self.sleep.borrow().as_ref().unwrap().result,
                 Some(Err(SleepError::WrongRuntime))
@@ -278,11 +291,16 @@ fn foreign_runtime_frame_rejected_while_original_frame_live() {
             Poll::Ready(())
         }
     }
+    task! {
+        fn nested(task: Nested) -> impl Future<Output = ()> {
+            task
+        }
+    }
     a.spawner()
-        .spawn(Nested {
+        .spawn(nested(Nested {
             sleep: slot,
             other: b.clone(),
-        })
+        }))
         .unwrap();
     assert_eq!(a.poll(0).unwrap().tasks_completed, 1);
     assert_eq!(a.poll(5).unwrap().timers_expired, 0);
@@ -290,7 +308,7 @@ fn foreign_runtime_frame_rejected_while_original_frame_live() {
 }
 
 #[test]
-fn active_frame_clears_pending_ready_and_unwind_before_destructor() {
+fn current_task_clears_pending_ready_and_unwind_before_destructor() {
     struct Inspect {
         root: Rc<Cell<*mut crate::executor::Executor>>,
         polls: u8,
@@ -300,17 +318,10 @@ fn active_frame_clears_pending_ready_and_unwind_before_destructor() {
     impl Future for Inspect {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            let task = crate::waker::task_from_waker(cx.waker());
-            let root = unsafe {
-                (*task.as_ptr())
-                    .executor
-                    .cast::<crate::executor::Executor>()
-            };
+            let meta = TaskHeader::meta(cx.waker().data().cast());
+            let root = unsafe { Meta::executor(meta).get() };
             self.root.set(root);
-            assert_eq!(
-                unsafe { (*root).active_frame.cast::<()>() },
-                cx.waker().data()
-            );
+            assert_eq!(unsafe { (*root).current.cast::<()>() }, cx.waker().data());
             if self.panic {
                 panic!("poll payload");
             }
@@ -325,8 +336,13 @@ fn active_frame_clears_pending_ready_and_unwind_before_destructor() {
     }
     impl Drop for Inspect {
         fn drop(&mut self) {
-            assert!(unsafe { (*self.root.get()).active_frame.is_null() });
+            assert!(unsafe { (*self.root.get()).current.is_null() });
             self.drops.set(self.drops.get() + 1);
+        }
+    }
+    task! {
+        fn inspect(task: Inspect) -> impl Future<Output = ()> {
+            task
         }
     }
     for panic in [false, true] {
@@ -335,24 +351,24 @@ fn active_frame_clears_pending_ready_and_unwind_before_destructor() {
         let drops = Rc::new(Cell::new(0));
         runtime
             .spawner()
-            .spawn(Inspect {
+            .spawn(inspect(Inspect {
                 root: root.clone(),
                 polls: 0,
                 panic,
                 drops: drops.clone(),
-            })
+            }))
             .unwrap();
         if panic {
             let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(0))).unwrap_err();
             assert_eq!(payload.downcast_ref::<&str>(), Some(&"poll payload"));
-            assert!(unsafe { (*root.get()).active_frame.is_null() });
+            assert!(unsafe { (*root.get()).current.is_null() });
             assert_eq!(drops.get(), 0);
             runtime.shutdown();
         } else {
             runtime.poll(0).unwrap();
-            assert!(unsafe { (*root.get()).active_frame.is_null() });
+            assert!(unsafe { (*root.get()).current.is_null() });
             runtime.poll(0).unwrap();
-            assert!(unsafe { (*root.get()).active_frame.is_null() });
+            assert!(unsafe { (*root.get()).current.is_null() });
         }
         assert_eq!(drops.get(), 1);
     }
@@ -371,7 +387,7 @@ fn unavailable_poll_cancels_other_live_task_subscription() {
     runtime.poll(0).unwrap();
     let token = slot.borrow().as_ref().unwrap().token.unwrap();
     let root = slot.borrow().as_ref().unwrap().control.open_core().unwrap();
-    spawner.spawn(async { panic!("task") }).unwrap();
+    spawner.spawn(panic_task("task")).unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| runtime.poll(0))).is_err());
     assert_eq!(
         poll_noop(slot.borrow_mut().as_mut().unwrap()),

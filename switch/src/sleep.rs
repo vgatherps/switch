@@ -7,7 +7,6 @@ use std::task::{Context, Poll};
 
 use crate::runtime::{Control, Unavailable};
 use crate::timer_registration::Token;
-use crate::waker::task_from_active_frame;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Failure to create, register, or poll a runtime-bound sleep.
@@ -80,15 +79,16 @@ impl Future for Sleep {
             if this.deadline <= (*root).timers.current_tick() {
                 return this.complete(Ok(()));
             }
-            let Some(task) = task_from_active_frame(cx.waker(), (*root).active_frame) else {
+            let task = (*root).current;
+            if task.is_null() || !crate::waker::is_task_waker(cx.waker(), task) {
                 return this.complete(Err(SleepError::WrongRuntime));
-            };
+            }
             if let Some(token) = this.token
-                && (*root).timers.refresh(token, task.as_ptr())
+                && (*root).timers.refresh(token, task)
             {
                 return Poll::Pending;
             }
-            match (*root).timers.register(task.as_ptr(), this.deadline) {
+            match (*root).timers.register(task, this.deadline) {
                 Ok(token) => {
                     this.token = Some(token);
                     Poll::Pending
