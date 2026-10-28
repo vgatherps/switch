@@ -31,8 +31,8 @@
 //! returning `()`, or a `fn` returning `impl Future<Output = ()>`, with arguments
 //! bound to plain identifiers. Calling it packages the arguments into a
 //! [`SpawnToken`]; `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
-//! The future must be `'static`. Each future type of a task function (one per
-//! instantiation of a generic one) has its own task blocks and capacity.
+//! The future must be `'static`. Each task function, and each instantiation of a
+//! generic one, has its own task blocks and capacity.
 //! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per
 //! runtime (default: one block's slots, `1 <= N < 2^25`).
 //!

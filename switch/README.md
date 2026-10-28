@@ -13,7 +13,7 @@ Depends on [`depot`](../depot/README.md) (`DynDepot` allocates task slots) and [
 
 ## Tasks
 
-A task future lives in a slot of a 64 KiB, 64 KiB-aligned block that holds slots of one task function's future type, and never moves. Each future type of a task function (one per instantiation of a generic one) has its own blocks and capacity. A future that does not fit a block is a compile-time error. Blocks are never freed and never change thread. Shutdown drops the remaining tasks in an unspecified order, and finishes even if a task's destructor panics. A task's `Waker` points at its header; waking, cloning and dropping it do not allocate, but panic on any thread other than the runtime's. This relies on native thread-locals (Linux glibc and macOS).
+A task future lives in a slot of a 64 KiB, 64 KiB-aligned block that holds slots of one task function, and never moves. Each instantiation of a generic task function has its own blocks and capacity. A future that does not fit a block is a compile-time error. Blocks are never freed and never change thread. Shutdown drops the remaining tasks in an unspecified order, and finishes even if a task's destructor panics. A task's `Waker` points at its header; waking, cloning and dropping it do not allocate, but panic on any thread other than the runtime's. This relies on native thread-locals (Linux glibc and macOS).
 
 Work that wakes or spawns tasks must run before `poll`, which polls them. The timer wheel has 13 levels of 32 slots by default.
 

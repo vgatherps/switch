@@ -2,8 +2,9 @@
 //!
 //! A [`FunctionPool`] exists per (task key, thread) and is never freed. It holds
 //! the `spare` blocks released by runtimes that shut down. A task key is the
-//! `TypeId` of (task function marker, future type), so a pool and its blocks
-//! only ever hold one future type. Each runtime that
+//! `TypeId` of (marker type, future type); `#[switch::task]` makes the marker
+//! unique per function and instantiation. A pool and its blocks only ever hold one
+//! future type. Each runtime that
 //! spawns the function owns one [`RuntimePool`], listed in its executor: a depot
 //! of slot numbers and the blocks those slots live in. Blocks are never freed and
 //! never change function or thread; a block serves one runtime at a time.

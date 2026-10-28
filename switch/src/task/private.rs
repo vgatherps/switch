@@ -88,8 +88,9 @@ where
 /// Package a task function's call as a token; allocates nothing.
 ///
 /// Spawns share a pool exactly when their `marker` type and future type are the
-/// same, so tasks of different functions (markers) never share slots, and one
-/// marker used with different future types gets one pool per future type.
+/// same, so tasks with different markers never share slots, and one marker used
+/// with different future types gets one pool per future type. `#[switch::task]`
+/// passes a closure, whose type is unique per function and instantiation.
 /// `capacity` is the pool's most occupied slots per runtime (default: one 64 KiB
 /// block's slots); the first spawn of a pool in a runtime sets it.
 #[inline]

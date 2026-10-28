@@ -13,7 +13,7 @@ use syn::{
 
 /// Marks a task function: `async fn` returning `()`, or `fn` returning
 /// `impl Future<Output = ()>`, with arguments bound to plain identifiers. Each
-/// future type of a task function has its own pool.
+/// instantiation of a generic task function has its own pool.
 ///
 /// `#[task(capacity = N)]` sets the most occupied slots of this function per
 /// runtime (default: one 64 KiB block's slots).
@@ -37,9 +37,9 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// The task function becomes a function, with the same generics, building a token
 /// from a closure that makes the future: the body moves into the closure (into an
-/// async block for an `async fn`), with every argument rebound inside it. The pool
-/// marker lives in a nested block of its own, so the signature and body cannot
-/// name it; `token` keys the pool by marker and future type.
+/// async block for an `async fn`), with every argument rebound inside it. `token`
+/// keys the pool by a marker closure's type and the future type. The expansion
+/// declares no name the signature or body can see.
 fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2> {
     let ItemFn {
         attrs,
@@ -128,12 +128,11 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
     // resolve to `()` is reported there.
     let token = quote_spanned!(name.span()=> ::switch::SpawnToken<impl ::switch::__private::Task>);
     let closure = quote_spanned!(name.span()=> let #build = move || #future;);
+    // The marker is a closure: its type is unique to this function and carries every
+    // generic parameter of it, `impl Trait` arguments included, so each instantiation
+    // has its own pool even when its future type does not depend on a parameter.
     let spawn = quote_spanned! {name.span()=>
-        {
-            #[derive(Clone, Copy)]
-            struct Marker;
-            ::switch::__private::token(Marker, #capacity_local, #build)
-        }
+        ::switch::__private::token(|| {}, #capacity_local, #build)
     };
     Ok(quote! {
         #(#attrs)*
