@@ -10,11 +10,15 @@ use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use rustls::client::UnbufferedClientConnection;
+use rustls::crypto::cipher::{MessageEncrypter, OutboundChunks, OutboundPlainMessage};
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use rustls::version::TLS13;
-use rustls::{AlertDescription, ClientConfig, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{
+    AlertDescription, ClientConfig, ConnectionTrafficSecrets, ContentType, ProtocolVersion,
+    RootCertStore, ServerConfig, ServerConnection, SupportedCipherSuite,
+};
 use sheath::{Error, RxFrame, TlsRx};
 
 const HOST: &str = "sheath.test";
@@ -58,6 +62,8 @@ fn configs(max_fragment_size: Option<usize>) -> (Arc<ClientConfig>, Arc<ServerCo
         .with_single_cert(vec![cert.clone()], PrivateKeyDer::Pkcs8(key.clone_key()))
         .unwrap();
     server.max_fragment_size = max_fragment_size;
+    // lets `Sealer` take over the server's sending side
+    server.enable_secret_extraction = true;
 
     let mut roots = RootCertStore::empty();
     roots.add(cert.clone()).unwrap();
@@ -567,22 +573,146 @@ fn new_needs_completed_handshake() {
     TlsRx::<VecFrame>::new(&client);
 }
 
-/// A header announcing more than 2^14 + 256 bytes fails as soon as the header is in, in a frame
-/// or split across frames, instead of waiting for (and gathering) its body.
+/// The length in a record header is checked against the TLS 1.3 bound of 2^14 + 256 bytes as
+/// soon as the header is complete: inside a frame, split across frames at every offset, and
+/// before any of the body has arrived.
 #[test]
-fn oversized_record_fails_at_its_header() {
-    for header_split in [false, true] {
-        let mut peer = connect(None);
-        let mut stream = Stream::default();
-        peer.send(&mut stream, b"hello");
+fn record_length_is_bounded_at_its_header() {
+    for (len, error) in [
+        (16640, rustls::Error::DecryptError),
+        (16641, rustls::Error::PeerSentOversizedRecord),
+        (0xffff, rustls::Error::PeerSentOversizedRecord),
+    ] {
+        for with_body in [true, false] {
+            for header_cut in 0..=5 {
+                let mut peer = connect(None);
+                let mut stream = Stream::default();
+                peer.send(&mut stream, b"hello");
+                let at = stream.bytes.len();
+                let [hi, lo] = u16::try_from(len).unwrap().to_be_bytes();
+                stream.bytes.extend_from_slice(&[0x17, 0x03, 0x03, hi, lo]);
+                if with_body {
+                    stream.bytes.resize(at + 5 + len, 0);
+                }
+                let cuts = if header_cut == 0 {
+                    vec![]
+                } else {
+                    vec![at + header_cut]
+                };
+
+                let received = receive(&mut peer.client, split(&stream.bytes, &cuts));
+                assert_received(&received.got, &stream.records, &cuts);
+                // a body of zeros fails authentication once it is all there
+                let expected = (len > 16640 || with_body).then(|| Error::Tls(error.clone()));
+                assert_eq!(received.error, expected, "len {len} cuts {cuts:?}");
+            }
+        }
+    }
+}
+
+/// Seals records with the server's traffic keys, for streams the rustls server API does not
+/// produce.
+struct Sealer {
+    encrypter: Box<dyn MessageEncrypter>,
+    seq: u64,
+}
+
+impl Sealer {
+    /// Takes over the server's sending side once its queued records are in `stream`.
+    fn new(mut peer: Peer, stream: &mut Stream) -> (UnbufferedClientConnection, Self) {
+        peer.flush(stream);
+        let Some(SupportedCipherSuite::Tls13(suite)) = peer.server.negotiated_cipher_suite() else {
+            panic!("TLS 1.3 suite negotiated");
+        };
+        let (seq, secrets) = peer.server.dangerous_extract_secrets().unwrap().tx;
+        let (key, iv) = match secrets {
+            ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+            | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+            | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => (key, iv),
+            _ => unreachable!("TLS 1.3 suites"),
+        };
+        let encrypter = suite.aead_alg.encrypter(key, iv);
+        (peer.client, Self { encrypter, seq })
+    }
+
+    fn seal(&mut self, typ: ContentType, payload: &[u8], stream: &mut Stream) -> Range<usize> {
+        let msg = OutboundPlainMessage {
+            typ,
+            version: ProtocolVersion::TLSv1_2,
+            payload: OutboundChunks::Single(payload),
+        };
         let at = stream.bytes.len();
         stream
             .bytes
-            .extend_from_slice(&[0x17, 0x03, 0x03, 0xff, 0xff, 0, 0, 0]);
-        let cuts = if header_split { vec![at + 2] } else { vec![] };
+            .extend(self.encrypter.encrypt(msg, self.seq).unwrap().encode());
+        self.seq += 1;
+        at..stream.bytes.len()
+    }
+}
 
-        let received = receive(&mut peer.client, split(&stream.bytes, &cuts));
-        assert_received(&received.got, &stream.records, &cuts);
+/// A NewSessionTicket message carrying a `len`-byte ticket.
+fn ticket(len: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend(3600u32.to_be_bytes()); // lifetime
+    body.extend(0u32.to_be_bytes()); // age_add
+    body.push(0); // empty nonce
+    body.extend(u16::try_from(len).unwrap().to_be_bytes());
+    body.resize(body.len() + len, 7);
+    body.extend(0u16.to_be_bytes()); // no extensions
+    let mut msg = vec![4];
+    msg.extend(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    msg.extend(body);
+    msg
+}
+
+/// `tickets` session tickets in 3000 B records, so every record ends inside a ticket and
+/// rustls must keep all of them until the last; then "hello" and close_notify. Returns the
+/// wire size of the ticket records, which rustls retains whole.
+fn chained_tickets(tickets: usize) -> (UnbufferedClientConnection, Stream, usize) {
+    let mut stream = Stream::default();
+    let (client, mut sealer) = Sealer::new(connect(None), &mut stream);
+    let chain: Vec<u8> = (0..tickets).flat_map(|_| ticket(4000)).collect();
+    let at = stream.bytes.len();
+    for record in chain.chunks(3000) {
+        sealer.seal(ContentType::Handshake, record, &mut stream);
+    }
+    let retained = stream.bytes.len() - at;
+    let wire = sealer.seal(ContentType::ApplicationData, b"hello", &mut stream);
+    stream.records.push(Sent {
+        wire,
+        plaintext: b"hello".to_vec(),
+    });
+    sealer.seal(ContentType::Alert, &[1, 0], &mut stream);
+    (client, stream, retained)
+}
+
+/// rustls keeps every record of a chain of handshake messages that never ends at a record
+/// boundary. Up to 0xffff retained bytes (the bound of rustls's buffered API) the chain is
+/// accepted; beyond, it is an error, whatever the framing.
+#[test]
+fn retained_handshake_records_are_bounded() {
+    for every_byte in [false, true] {
+        let cuts = |stream: &Stream| -> Vec<usize> {
+            if every_byte {
+                (1..stream.bytes.len()).collect()
+            } else {
+                vec![]
+            }
+        };
+
+        let (mut client, stream, retained) = chained_tickets(10);
+        assert!(retained < 0xffff);
+        let cuts_below = cuts(&stream);
+        let mut received = receive(&mut client, split(&stream.bytes, &cuts_below));
+        assert_eq!(received.error, None);
+        assert_received(&received.got, &stream.records, &cuts_below);
+        assert_eq!(received.rx.fin(), Ok(()));
+
+        let (mut client, stream, retained) = chained_tickets(20);
+        assert!(retained > 0xffff);
+        let cuts = cuts(&stream);
+        let received = receive(&mut client, split(&stream.bytes, &cuts));
+        assert!(received.got.is_empty());
         assert_eq!(
             received.error,
             Some(Error::Tls(rustls::Error::InvalidMessage(

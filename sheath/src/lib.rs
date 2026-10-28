@@ -14,9 +14,18 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 
 const HEADER_LEN: usize = 5;
 
-/// Largest TLS 1.3 record on the wire: header, 2^14 B of plaintext, 256 B of expansion
-/// (RFC 8446 §5.2). The scratch buffer is allocated once at this size.
-const MAX_RECORD_LEN: usize = HEADER_LEN + (1 << 14) + 256;
+/// Largest TLS 1.3 record body on the wire: 2^14 B of plaintext plus 256 B of expansion
+/// (RFC 8446 §5.2). rustls's own header check allows up to 18431 B.
+const MAX_CIPHERTEXT_LEN: usize = (1 << 14) + 256;
+
+/// Largest TLS 1.3 record on the wire. The scratch buffer is allocated once at this size.
+const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_CIPHERTEXT_LEN;
+
+/// Most bytes rustls may need kept: the records of a handshake message still being joined plus
+/// the next record. rustls's buffered API stops reading at the same bound while joining
+/// (`MAX_HANDSHAKE_SIZE` in msgs/deframer/buffers.rs); without it, a peer that always leaves a
+/// handshake message open grows the scratch buffer without limit.
+const MAX_RETAINED_LEN: usize = 0xffff;
 
 /// A received TCP segment's payload with its hardware RX timestamp.
 pub trait RxFrame {
@@ -149,7 +158,9 @@ impl<F: RxFrame> TlsRx<F> {
                 match self.gather() {
                     Gathered::NeedFrame => return Ok(None),
                     Gathered::Header => {
-                        if let Some(state) = check_header(conn, &mut self.scratch) {
+                        let state = check_bounds(&self.scratch, self.seen)
+                            .or_else(|| check_header(conn, &mut self.scratch));
+                        if let Some(state) = state {
                             self.end(state);
                         }
                     }
@@ -187,6 +198,12 @@ impl<F: RxFrame> TlsRx<F> {
             if available == 0 {
                 self.frame = None;
                 return Ok(None);
+            }
+            if available >= self.seen + HEADER_LEN
+                && let Some(state) = check_bounds(&frame.payload()[pos..], self.seen)
+            {
+                self.end(state);
+                continue;
             }
             let Some(end) = record_end(&frame.payload()[pos..], self.seen) else {
                 // the record straddles frames: let rustls check its header, if here, before
@@ -350,6 +367,20 @@ fn process(conn: &mut UnbufferedClientConnection, buf: &mut [u8]) -> Step {
         ),
         Err(e) => Step::End(State::Failed(Error::Tls(e))),
     }
+}
+
+/// Checks the length in the complete header of the record at `start` in `buf`, before its body
+/// is gathered or decrypted. Returns the end state on rejection.
+fn check_bounds(buf: &[u8], start: usize) -> Option<State> {
+    let end = body_end(buf, start);
+    let error = if end - start - HEADER_LEN > MAX_CIPHERTEXT_LEN {
+        rustls::Error::PeerSentOversizedRecord
+    } else if end > MAX_RETAINED_LEN {
+        rustls::Error::InvalidMessage(rustls::InvalidMessage::MessageTooLarge)
+    } else {
+        return None;
+    };
+    Some(State::Failed(Error::Tls(error)))
 }
 
 /// Gives rustls `buf`, which ends with the header of a record whose body has not arrived, so
