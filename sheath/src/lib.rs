@@ -17,7 +17,7 @@ mod rx;
 mod tx;
 
 pub use rx::TlsRx;
-pub use tx::TlsTx;
+pub use tx::{Sealed, TlsTx};
 
 /// A received TCP segment's payload with its hardware RX timestamp.
 pub trait RxFrame {
@@ -43,6 +43,9 @@ pub trait TxFrame {
 /// A sender of frames: raw TCP below [`TlsTx`], and [`TlsTx`] itself.
 pub trait PlainTx {
     type Frame: TxFrame;
+    /// A frame whose bytes are final. Only `seal` makes one and only `try_send` takes one, so
+    /// an unsealed frame cannot be sent.
+    type Sealed;
     type Error;
 
     /// A new, empty frame.
@@ -51,11 +54,11 @@ pub trait PlainTx {
     /// `room` plaintext bytes.
     fn plain(&self) -> (usize, usize);
     /// Turns the plaintext `room_mut()[head..head + len]` into the bytes to send (TLS: one
-    /// record; raw: sets the length). Under TLS this consumes a sequence number, so the frame
-    /// must then be sent, never dropped.
-    fn seal(&mut self, f: &mut Self::Frame, len: usize) -> Result<(), Self::Error>;
+    /// record; raw: sets the length). Under TLS this consumes a sequence number, so the sealed
+    /// frame must then be sent, never dropped.
+    fn seal(&mut self, f: Self::Frame, len: usize) -> Result<Self::Sealed, Self::Error>;
     /// Sends now, or hands the frame back unchanged when there is no room.
-    fn try_send(&mut self, f: Self::Frame) -> Result<(), Self::Frame>;
+    fn try_send(&mut self, f: Self::Sealed) -> Result<(), Self::Sealed>;
 }
 
 /// A receive error.
@@ -82,20 +85,24 @@ impl std::error::Error for Error {}
 /// A send error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TxError<E> {
-    /// The connection failed, on either side.
-    Tls(rustls::Error),
+    /// Receiving failed (a TLS error or truncation), which ends the connection.
+    Received(Error),
     /// We sent close_notify.
     Closed,
     /// The frame sender below failed.
     Lower(E),
+    /// A record was encrypted but the frame sender below failed to take it: its sequence
+    /// number is gone, so the peer cannot decrypt any later record.
+    Broken,
 }
 
 impl<E: fmt::Display> fmt::Display for TxError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Tls(e) => write!(f, "tls: {e}"),
+            Self::Received(e) => write!(f, "receiving failed: {e}"),
             Self::Closed => f.write_str("tls: close_notify already sent"),
             Self::Lower(e) => write!(f, "transport: {e}"),
+            Self::Broken => f.write_str("tls: an encrypted record was lost below"),
         }
     }
 }

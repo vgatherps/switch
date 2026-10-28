@@ -5,7 +5,6 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
-use std::convert::Infallible;
 use std::io::{ErrorKind, Read, Write};
 use std::ops::Range;
 use std::rc::Rc;
@@ -68,16 +67,22 @@ pub struct Wire {
     pub sent: Rc<RefCell<Vec<u8>>>,
     /// The next this many `try_send`s are refused.
     pub refuse: Rc<Cell<usize>>,
+    /// The next `seal` fails.
+    pub fail_seal: Rc<Cell<bool>>,
 }
 
 /// Raw TCP sender: frames go out as they are.
 pub struct TestTx(pub Wire);
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SealFailed;
+
 impl PlainTx for TestTx {
     type Frame = TestFrame;
-    type Error = Infallible;
+    type Sealed = TestFrame;
+    type Error = SealFailed;
 
-    fn alloc(&mut self) -> Result<TestFrame, Infallible> {
+    fn alloc(&mut self) -> Result<TestFrame, SealFailed> {
         Ok(TestFrame {
             room: vec![0; FRAME_ROOM],
             len: 0,
@@ -88,9 +93,12 @@ impl PlainTx for TestTx {
         (0, FRAME_ROOM)
     }
 
-    fn seal(&mut self, f: &mut TestFrame, len: usize) -> Result<(), Infallible> {
+    fn seal(&mut self, mut f: TestFrame, len: usize) -> Result<TestFrame, SealFailed> {
+        if self.0.fail_seal.take() {
+            return Err(SealFailed);
+        }
         f.len = len;
-        Ok(())
+        Ok(f)
     }
 
     fn try_send(&mut self, f: TestFrame) -> Result<(), TestFrame> {

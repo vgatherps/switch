@@ -200,13 +200,11 @@ impl<F: RxFrame> TlsRx<F> {
     }
 
     /// The transport ended (TCP FIN); call once `chunk` returns `Ok(None)`. `Ok` iff the peer
-    /// sent close_notify first; otherwise the stream was truncated.
-    pub fn fin(&mut self) -> Result<(), Error> {
+    /// sent close_notify first; otherwise the stream was truncated, which stops sending too.
+    pub fn fin<L: PlainTx>(&mut self, tx: &mut TlsTx<L>) -> Result<(), Error> {
         match &self.state {
             State::Open => {
-                self.state = State::Failed(Error::Truncated);
-                self.frame = None;
-                self.scratch.clear();
+                self.end(tx, State::Failed(Error::Truncated));
                 Err(Error::Truncated)
             }
             State::Closed => Ok(()),
@@ -252,9 +250,9 @@ impl<F: RxFrame> TlsRx<F> {
         }
     }
 
-    /// Latches `state`; a TLS error also stops the send half.
+    /// Latches `state`; an error also stops the send half.
     fn end<L: PlainTx>(&mut self, tx: &mut TlsTx<L>, state: State) {
-        if let State::Failed(Error::Tls(e)) = &state {
+        if let State::Failed(e) = &state {
             tx.fail(e.clone());
         }
         self.state = state;

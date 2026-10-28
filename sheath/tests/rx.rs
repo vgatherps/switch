@@ -44,7 +44,7 @@ fn check(
     assert_eq!(received.error, None, "cuts {cuts:?}");
     assert_received(&received.got, &stream.records, &cuts);
     assert!(received.rx.eof(), "cuts {cuts:?}");
-    assert_eq!(received.rx.fin(), Ok(()));
+    assert_eq!(received.rx.fin(&mut peer.tx), Ok(()));
 }
 
 fn stream_len(max_fragment_size: Option<usize>, build: fn(&mut Peer) -> Stream) -> usize {
@@ -186,7 +186,7 @@ fn bad_tag_is_rejected_without_releasing_plaintext() {
         let error = Some(Error::Tls(rustls::Error::DecryptError));
         assert_eq!(received.error, error);
         assert_eq!(received.rx.chunk(&mut peer.tx).err(), error);
-        assert_eq!(received.rx.fin().err(), error);
+        assert_eq!(received.rx.fin(&mut peer.tx).err(), error);
     }
 }
 
@@ -229,7 +229,7 @@ fn bytes_after_close_notify_are_ignored() {
         stamp: 9,
     });
     assert!(received.rx.chunk(&mut peer.tx).unwrap().is_none());
-    assert_eq!(received.rx.fin(), Ok(()));
+    assert_eq!(received.rx.fin(&mut peer.tx), Ok(()));
 }
 
 #[test]
@@ -249,7 +249,7 @@ fn fin_without_close_notify_is_truncation() {
         assert_eq!(received.error, None);
         assert_eq!(received.got.len(), 1);
         assert!(!received.rx.eof());
-        assert_eq!(received.rx.fin(), Err(Error::Truncated));
+        assert_eq!(received.rx.fin(&mut peer.tx), Err(Error::Truncated));
         assert_eq!(
             received.rx.chunk(&mut peer.tx).err(),
             Some(Error::Truncated)
@@ -408,7 +408,7 @@ fn retained_handshake_records_are_bounded() {
         let mut received = receive(&mut tx, split(&stream.bytes, &cuts_below));
         assert_eq!(received.error, None);
         assert_received(&received.got, &stream.records, &cuts_below);
-        assert_eq!(received.rx.fin(), Ok(()));
+        assert_eq!(received.rx.fin(&mut tx), Ok(()));
 
         let (mut tx, stream, retained) = chained_tickets(20);
         assert!(retained > 0xffff);

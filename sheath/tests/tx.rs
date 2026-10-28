@@ -14,22 +14,36 @@ use rustls::crypto::ring::{cipher_suite, default_provider};
 use rustls::crypto::{CipherSuiteCommon, CryptoProvider};
 use rustls::pki_types::ServerName;
 use rustls::{AlertDescription, SupportedCipherSuite, Tls13CipherSuite};
-use sheath::{Error, PlainTx, TlsTx, TxError, TxFrame};
+use sheath::{Error, PlainTx, Sealed, TlsRx, TlsTx, TxError, TxFrame};
 
 /// Record overhead: 5 B header, 1 B content type, 16 B tag.
 const RECORD: usize = 22;
 /// A KeyUpdate record.
 const KEY_UPDATE: usize = 27;
 
-/// Seals `payload` into one frame and sends it; returns the frame's length on the wire.
-fn seal_and_send(tx: &mut TlsTx<TestTx>, payload: &[u8]) -> usize {
+/// A frame with `payload` as its plaintext.
+fn frame(tx: &mut TlsTx<TestTx>, payload: &[u8]) -> TestFrame {
     let mut f = tx.alloc().unwrap();
     let (head, _) = tx.plain();
     f.room_mut()[head..head + payload.len()].copy_from_slice(payload);
-    tx.seal(&mut f, payload.len()).unwrap();
-    let len = f.bytes().len();
-    tx.try_send(f).unwrap();
-    len
+    f
+}
+
+fn seal(tx: &mut TlsTx<TestTx>, payload: &[u8]) -> Sealed<TestFrame> {
+    let f = frame(tx, payload);
+    tx.seal(f, payload.len()).unwrap()
+}
+
+/// Sends `sealed`; returns its length on the wire.
+fn send(peer: &mut Peer, sealed: Sealed<TestFrame>) -> usize {
+    let before = peer.wire.sent.borrow().len();
+    peer.tx.try_send(sealed).unwrap();
+    peer.wire.sent.borrow().len() - before
+}
+
+fn seal_and_send(peer: &mut Peer, payload: &[u8]) -> usize {
+    let sealed = seal(&mut peer.tx, payload);
+    send(peer, sealed)
 }
 
 /// Feeds the server's queued records to the client; they must carry no application data.
@@ -49,7 +63,7 @@ fn sealed_records_decrypt_on_the_server() {
     assert_eq!((head, room), (5, FRAME_ROOM - RECORD - 2 * KEY_UPDATE));
     for len in [1, 109, room] {
         let msg = message(len, len);
-        assert_eq!(seal_and_send(&mut peer.tx, &msg), RECORD + len);
+        assert_eq!(seal_and_send(&mut peer, &msg), RECORD + len);
         assert_eq!(peer.deliver().unwrap(), msg);
     }
 }
@@ -66,12 +80,9 @@ fn key_update_request_is_answered_in_front_of_the_next_record() {
     // a full frame of plaintext still fits: the room reserves space for the KeyUpdate
     let (_, room) = peer.tx.plain();
     let msg = message(1, room);
-    assert_eq!(
-        seal_and_send(&mut peer.tx, &msg),
-        KEY_UPDATE + RECORD + room
-    );
+    assert_eq!(seal_and_send(&mut peer, &msg), KEY_UPDATE + RECORD + room);
     assert_eq!(peer.deliver().unwrap(), msg);
-    assert_eq!(seal_and_send(&mut peer.tx, b"again"), RECORD + 5);
+    assert_eq!(seal_and_send(&mut peer, b"again"), RECORD + 5);
     assert_eq!(peer.deliver().unwrap(), b"again");
 
     // the server's new keys are in use on the receive side too
@@ -102,38 +113,68 @@ fn limited_provider() -> CryptoProvider {
     }
 }
 
+/// The send that carries rustls's own KeyUpdate under `limited_provider`.
+const OWN_UPDATE_AT: usize = 1025;
+
 /// At the confidentiality limit rustls updates our sending keys: its KeyUpdate goes out in
 /// front of the next data record, once, and the server follows it.
 #[test]
 fn own_key_update_goes_in_front_of_the_next_record() {
     let mut peer = connect_with(limited_provider(), None);
     deliver_to_client(&mut peer).unwrap();
-    let mut updates = 0;
     for i in 0..1100 {
         let msg = format!("{i:08}");
-        match seal_and_send(&mut peer.tx, msg.as_bytes()) {
-            n if n == RECORD + 8 => {}
-            n if n == KEY_UPDATE + RECORD + 8 => updates += 1,
-            n => panic!("frame {i} is {n} B"),
-        }
+        let expected = if i == OWN_UPDATE_AT {
+            KEY_UPDATE + RECORD + 8
+        } else {
+            RECORD + 8
+        };
+        assert_eq!(
+            seal_and_send(&mut peer, msg.as_bytes()),
+            expected,
+            "send {i}"
+        );
         assert_eq!(peer.deliver().unwrap(), msg.as_bytes());
     }
-    assert_eq!(updates, 1);
+}
+
+/// The server requests a key update just as rustls is due for its own: both KeyUpdates go in
+/// front of the same data record, and a full frame of plaintext still fits.
+#[test]
+fn both_key_updates_fit_in_front_of_one_full_record() {
+    let mut peer = connect_with(limited_provider(), None);
+    deliver_to_client(&mut peer).unwrap();
+    for i in 0..OWN_UPDATE_AT {
+        seal_and_send(&mut peer, format!("{i:08}").as_bytes());
+        peer.deliver().unwrap();
+    }
+    peer.server.refresh_traffic_keys().unwrap();
+    deliver_to_client(&mut peer).unwrap();
+
+    let (_, room) = peer.tx.plain();
+    let msg = message(2, room);
+    assert_eq!(
+        seal_and_send(&mut peer, &msg),
+        2 * KEY_UPDATE + RECORD + room
+    );
+    assert_eq!(2 * KEY_UPDATE + RECORD + room, FRAME_ROOM);
+    assert_eq!(peer.deliver().unwrap(), msg);
+    assert_eq!(seal_and_send(&mut peer, b"next"), RECORD + 4);
+    assert_eq!(peer.deliver().unwrap(), b"next");
 }
 
 #[test]
 fn close_notify_ends_sending_only() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap();
-    let mut f = peer.tx.alloc().unwrap();
-    peer.tx.close_notify(&mut f).unwrap();
-    assert_eq!(f.bytes().len(), RECORD + 2);
-    peer.tx.try_send(f).unwrap();
+    let f = peer.tx.alloc().unwrap();
+    let sealed = peer.tx.close_notify(f).unwrap();
+    assert_eq!(send(&mut peer, sealed), RECORD + 2);
     assert_eq!(peer.deliver().unwrap(), b"");
     assert!(peer.server.process_new_packets().unwrap().peer_has_closed());
 
-    let mut f = peer.tx.alloc().unwrap();
-    assert_eq!(peer.tx.seal(&mut f, 1), Err(TxError::Closed));
+    let f = frame(&mut peer.tx, b"x");
+    assert_eq!(peer.tx.seal(f, 1).err(), Some(TxError::Closed));
 
     let mut stream = Stream::default();
     peer.send(&mut stream, b"still");
@@ -148,10 +189,7 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap();
 
-    let mut sealed = peer.tx.alloc().unwrap();
-    let (head, _) = peer.tx.plain();
-    sealed.room_mut()[head..head + 6].copy_from_slice(b"before");
-    peer.tx.seal(&mut sealed, 6).unwrap();
+    let sealed = seal(&mut peer.tx, b"before");
     peer.wire.refuse.set(1);
     let sealed = peer.tx.try_send(sealed).unwrap_err();
 
@@ -160,17 +198,17 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
     let last = stream.bytes.len() - 1;
     stream.bytes[last] ^= 1;
     let received = receive(&mut peer.tx, vec![stream.bytes]);
-    let error = rustls::Error::DecryptError;
-    assert_eq!(received.error, Some(Error::Tls(error.clone())));
+    let error = Error::Tls(rustls::Error::DecryptError);
+    assert_eq!(received.error, Some(error.clone()));
 
-    peer.tx.try_send(sealed).unwrap();
-    let mut f = peer.tx.alloc().unwrap();
-    assert_eq!(peer.tx.seal(&mut f, 1), Err(TxError::Tls(error)));
-    assert_eq!(peer.tx.take_pending(&mut f), Ok(true));
-    assert_eq!(f.bytes().len(), RECORD + 2);
-    peer.tx.try_send(f).unwrap();
-    let mut f = peer.tx.alloc().unwrap();
-    assert_eq!(peer.tx.take_pending(&mut f), Ok(false));
+    assert_eq!(send(&mut peer, sealed), RECORD + 6);
+    let f = frame(&mut peer.tx, b"x");
+    assert_eq!(peer.tx.seal(f, 1).err(), Some(TxError::Received(error)));
+    let f = peer.tx.alloc().unwrap();
+    let alert = peer.tx.take_pending(f).unwrap().expect("the alert");
+    assert_eq!(send(&mut peer, alert), RECORD + 2);
+    let f = peer.tx.alloc().unwrap();
+    assert!(peer.tx.take_pending(f).unwrap().is_none());
 
     let sent = peer.wire.sent.take();
     peer.wire.sent.replace(sent[..RECORD + 6].to_vec());
@@ -182,34 +220,94 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
     );
 }
 
+/// TCP FIN without the server's close_notify is truncation, which stops sending.
+#[test]
+fn truncation_stops_sending() {
+    let mut peer = connect(None);
+    deliver_to_client(&mut peer).unwrap();
+    let mut rx = TlsRx::<VecFrame>::new();
+    assert_eq!(rx.fin(&mut peer.tx), Err(Error::Truncated));
+    let f = frame(&mut peer.tx, b"x");
+    assert_eq!(
+        peer.tx.seal(f, 1).err(),
+        Some(TxError::Received(Error::Truncated))
+    );
+    let f = peer.tx.alloc().unwrap();
+    assert_eq!(
+        peer.tx.close_notify(f).err(),
+        Some(TxError::Received(Error::Truncated))
+    );
+}
+
 /// A refused frame comes back unchanged and goes out later as it is.
 #[test]
 fn refused_frame_is_sent_later() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap();
-    let mut f = peer.tx.alloc().unwrap();
-    let (head, _) = peer.tx.plain();
-    f.room_mut()[head..head + 3].copy_from_slice(b"one");
-    peer.tx.seal(&mut f, 3).unwrap();
+    let sealed = seal(&mut peer.tx, b"one");
     peer.wire.refuse.set(2);
-    let f = peer.tx.try_send(f).unwrap_err();
-    let f = peer.tx.try_send(f).unwrap_err();
+    let sealed = peer.tx.try_send(sealed).unwrap_err();
+    let sealed = peer.tx.try_send(sealed).unwrap_err();
     assert!(peer.wire.sent.borrow().is_empty());
-    peer.tx.try_send(f).unwrap();
+    assert_eq!(send(&mut peer, sealed), RECORD + 3);
     assert_eq!(peer.deliver().unwrap(), b"one");
-    seal_and_send(&mut peer.tx, b"two");
+    seal_and_send(&mut peer, b"two");
     assert_eq!(peer.deliver().unwrap(), b"two");
 }
 
+/// The frame sender failing after rustls encrypted a record leaves a gap in the sequence
+/// numbers: no record may be encrypted after it.
 #[test]
-#[should_panic(expected = "was not sent")]
+fn lower_failure_after_encryption_breaks_the_connection() {
+    for close in [false, true] {
+        let mut peer = connect(None);
+        deliver_to_client(&mut peer).unwrap();
+        peer.wire.fail_seal.set(true);
+        let error = if close {
+            let f = peer.tx.alloc().unwrap();
+            peer.tx.close_notify(f).err()
+        } else {
+            let f = frame(&mut peer.tx, b"lost");
+            peer.tx.seal(f, 4).err()
+        };
+        assert_eq!(error, Some(TxError::Lower(SealFailed)));
+
+        let f = frame(&mut peer.tx, b"x");
+        assert_eq!(peer.tx.seal(f, 1).err(), Some(TxError::Broken));
+        let f = peer.tx.alloc().unwrap();
+        assert_eq!(peer.tx.close_notify(f).err(), Some(TxError::Broken));
+        let f = peer.tx.alloc().unwrap();
+        assert_eq!(peer.tx.take_pending(f).err(), Some(TxError::Broken));
+        assert!(peer.wire.sent.borrow().is_empty());
+    }
+}
+
+#[test]
+#[should_panic(expected = "sealing an empty record")]
+fn sealing_nothing_panics() {
+    let mut peer = connect(None);
+    let f = peer.tx.alloc().unwrap();
+    let _ = peer.tx.seal(f, 0);
+}
+
+/// The review's case: frame A is sealed, another frame goes out, A is dropped. Only a
+/// `Sealed` can be sent, and only one exists at a time, so A's loss is caught.
+#[test]
+#[should_panic(expected = "the last sealed frame was not sent")]
 fn sealing_after_dropping_a_sealed_frame_panics() {
     let mut peer = connect(None);
-    let mut f = peer.tx.alloc().unwrap();
-    peer.tx.seal(&mut f, 1).unwrap();
-    drop(f);
-    let mut f = peer.tx.alloc().unwrap();
-    let _ = peer.tx.seal(&mut f, 1);
+    let a = seal(&mut peer.tx, b"a");
+    drop(a);
+    let _ = seal(&mut peer.tx, b"b");
+}
+
+#[test]
+#[should_panic(expected = "the last sealed frame was not sent")]
+fn two_sealed_frames_cannot_exist() {
+    let mut peer = connect(None);
+    let _a = seal(&mut peer.tx, b"a");
+    let f = peer.tx.alloc().unwrap();
+    let _ = peer.tx.take_pending(f);
 }
 
 #[test]
