@@ -511,8 +511,8 @@ impl<R: PlainRx> WsRx<R> {
     }
 
     /// Hand the next frame to the lower layer. Call after `recv` returned `Ok(None)`.
-    pub fn push(&mut self, f: R::Frame, tx: &mut R::Tx) -> Result<(), R::Error> {
-        self.lower.push(f, tx)
+    pub fn push(&mut self, f: R::Frame) {
+        self.lower.push(f)
     }
 
     /// The next complete message, or `None` when a `push` is needed. Control
@@ -531,15 +531,6 @@ impl<R: PlainRx> WsRx<R> {
             bytes: if at.direct { &rx.lower.current()[..at.len] } else { &rx.core.scratch[..at.len] },
             rx_timestamp: at.stamp,
         }))
-    }
-
-    /// [`push`](Self::push) for a lower layer that receives through the send
-    /// half's connection (TLS).
-    pub fn push_via<L: PlainTx>(&mut self, f: R::Frame, tx: &mut WsTx<L>) -> Result<(), R::Error>
-    where
-        R: PlainRx<Tx = L>,
-    {
-        self.push(f, tx.lower_mut())
     }
 
     /// [`recv`](Self::recv) for a lower layer that receives through the send
@@ -678,23 +669,24 @@ mod tests {
 
     /// `text()` gives back the validated payload without checking it again: a direct message
     /// (read through the lower layer) and one assembled in scratch, both with multibyte text.
-    /// Small enough for Miri, which checks the unchecked conversion.
+    /// The check is `text()`'s debug_assert, which re-validates in every test build. relay is
+    /// not in `make miri`; by hand, `cargo +nightly miri test -p relay --lib` runs this too.
     #[test]
     fn text_is_the_payload_validated_on_receipt() {
         let t = "a€𝄞b";
         let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client));
-        rx.push(F(frame(0x81, t.as_bytes())), &mut ()).unwrap();
+        rx.push(F(frame(0x81, t.as_bytes())));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), Some(t));
         assert!(rx.recv(&mut ()).unwrap().is_none());
         let wire = frame(0x81, t.as_bytes());
-        rx.push(F(wire[..5].to_vec()), &mut ()).unwrap();
+        rx.push(F(wire[..5].to_vec()));
         assert!(rx.recv(&mut ()).unwrap().is_none());
-        rx.push(F(wire[5..].to_vec()), &mut ()).unwrap();
+        rx.push(F(wire[5..].to_vec()));
         let m = rx.recv(&mut ()).unwrap().unwrap();
         assert_eq!(m.text(), Some(t));
         assert!(!m.bytes().is_empty());
         assert!(rx.recv(&mut ()).unwrap().is_none());
-        rx.push(F(frame(0x82, &[0xff])), &mut ()).unwrap();
+        rx.push(F(frame(0x82, &[0xff])));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), None);
     }
 
@@ -710,7 +702,7 @@ mod tests {
                 9 => 0x80,
                 _ => 0,
             };
-            rx.push(F(frame(b0, &[i; 100])), &mut ()).unwrap();
+            rx.push(F(frame(b0, &[i; 100])));
             let got = rx.recv(&mut ()).unwrap().map(|m| m.bytes().len());
             assert_eq!(got, (i == 9).then_some(1000));
             assert!(rx.core.scratch.capacity() <= 1000, "{}", rx.core.scratch.capacity());
@@ -723,10 +715,10 @@ mod tests {
         let mut wire = vec![0x82, 126];
         wire.extend_from_slice(&1000u16.to_be_bytes());
         wire.extend_from_slice(&[7; 1000]);
-        rx.push(F(wire[..10].to_vec()), &mut ()).unwrap();
+        rx.push(F(wire[..10].to_vec()));
         assert!(rx.recv(&mut ()).unwrap().is_none());
         assert_eq!(rx.core.scratch.capacity(), 1000);
-        rx.push(F(wire[10..].to_vec()), &mut ()).unwrap();
+        rx.push(F(wire[10..].to_vec()));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes(), &[7; 1000][..]);
     }
 }

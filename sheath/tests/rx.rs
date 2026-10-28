@@ -473,3 +473,23 @@ fn consume_past_the_run_panics() {
     assert!(rx.chunk(&mut peer.tx).unwrap().is_some());
     rx.consume(3);
 }
+
+/// A record straddling frames is decrypted in the scratch buffer: `current()` is exactly that
+/// record's plaintext, and stays so until consumed (relay reads validated text back through it).
+#[test]
+fn current_of_a_straddling_record_is_its_plaintext() {
+    let mut peer = connect(None);
+    let mut stream = Stream::default();
+    peer.flush(&mut stream);
+    peer.send(&mut stream, "split €".as_bytes());
+    let cut = stream.records[0].wire.start + 3;
+    let mut rx = pushed(stream.bytes[..cut].to_vec(), 0);
+    assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
+    rx.push(VecFrame { data: stream.bytes[cut..].to_vec(), stamp: 1 });
+    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, "split €".as_bytes());
+    assert_eq!(rx.current(), "split €".as_bytes());
+    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().rx_timestamp, 0);
+    assert_eq!(rx.current(), "split €".as_bytes());
+    rx.consume(6);
+    assert_eq!(rx.current(), "€".as_bytes());
+}

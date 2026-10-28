@@ -16,7 +16,7 @@ pub(crate) trait PlainRx {
     type Error;
 
     /// Hand over the next frame. Called only after `chunk` returned `Ok(None)`.
-    fn push(&mut self, f: Self::Frame, tx: &mut Self::Tx) -> Result<(), Self::Error>;
+    fn push(&mut self, f: Self::Frame);
     /// The unconsumed rest of the current run; `None` when a `push` is needed, by which point
     /// every fully consumed frame has been dropped. Without an intervening `consume`, a second
     /// call returns the same bytes, including changes the caller made to them.
@@ -47,9 +47,8 @@ impl<F: RxFrame, L: FrameTx> PlainRx for TlsRx<F, L> {
     type Tx = TlsTx<L>;
     type Error = sheath::Error;
 
-    fn push(&mut self, f: F, _: &mut TlsTx<L>) -> Result<(), sheath::Error> {
-        TlsRx::push(self, f);
-        Ok(())
+    fn push(&mut self, f: F) {
+        TlsRx::push(self, f)
     }
 
     fn chunk(&mut self, tx: &mut TlsTx<L>) -> Result<Option<Chunk<'_>>, sheath::Error> {

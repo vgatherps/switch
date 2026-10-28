@@ -191,7 +191,7 @@ pub fn drive(rx: &mut Rx, chunks: &[&[u8]]) -> Run {
         let f = VecFrame { data: c.to_vec(), stamp: stamp(i) };
         let p = f.data.as_ptr() as usize;
         frames.push(p..p + f.data.len());
-        rx.push(f, &mut ()).unwrap();
+        rx.push(f);
         loop {
             match rx.recv(&mut ()) {
                 Ok(Some(m)) => {

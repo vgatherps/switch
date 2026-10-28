@@ -203,8 +203,9 @@ test-switchnet: doctor
 	$(TIMEOUT) cargo test --locked -p switchnet -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p switchnet --benches --no-run
 
-# relay (WebSocket) and sheath (TLS), then the wss client over switchnet against a kernel
-# wss server across net_tap (sheath's switchnet feature).
+# relay (WebSocket) and sheath (TLS), including their Docker tests over net_tap: relay's ws://
+# and wss:// clients (relay's switchnet feature) against kernel tungstenite servers, sheath's
+# TLS client (sheath's switchnet feature) against a kernel rustls server.
 test-wss: doctor
 	$(TIMEOUT) cargo test --locked -p relay --features switchnet -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p sheath --features switchnet -- --test-threads=1

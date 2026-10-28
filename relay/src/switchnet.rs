@@ -146,7 +146,7 @@ pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port:
                     break;
                 }
             }
-            None => rx.push(tcp.recv().await.map_err(Error::Recv)?, &mut tx)?,
+            None => rx.push(tcp.recv().await.map_err(Error::Recv)?),
         }
     }
     upgrade::check(&head, &key).map_err(Error::Upgrade)?;
@@ -236,10 +236,7 @@ where
                     Err(_) => unreachable!("has_message_via found a message"),
                 };
             }
-            let frame = self.tcp.recv().await.map_err(Error::Recv)?;
-            if let Err(e) = self.rx.push_via(frame, &mut self.tx) {
-                return Err(self.lower_failed(e).await);
-            }
+            self.rx.push(self.tcp.recv().await.map_err(Error::Recv)?);
         }
     }
 

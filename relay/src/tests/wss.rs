@@ -144,7 +144,7 @@ impl Wss {
         self.frame_starts.push(self.framed);
         self.framed += len;
         self.frame_bytes.push(data.as_ptr_range());
-        self.rx.push_via(VecFrame { data, stamp }, &mut self.tx).unwrap();
+        self.rx.push(VecFrame { data, stamp });
     }
 
     /// Pushes `to_client` in frames of `frame_len`, reading every message.
@@ -152,7 +152,14 @@ impl Wss {
         let mut got = Vec::new();
         loop {
             match self.rx.recv_via(&mut self.tx) {
-                Ok(Some(m)) => got.push(Got { kind: m.kind(), payload: m.bytes().to_vec(), stamp: m.rx_timestamp() }),
+                Ok(Some(m)) => {
+                    // runs text()'s debug_assert over TLS frame and scratch runs
+                    match m.kind() {
+                        Kind::Text => assert_eq!(m.text().map(str::as_bytes), Some(m.bytes())),
+                        Kind::Binary => assert_eq!(m.text(), None),
+                    }
+                    got.push(Got { kind: m.kind(), payload: m.bytes().to_vec(), stamp: m.rx_timestamp() })
+                }
                 Ok(None) if self.to_client.is_empty() => return got,
                 Ok(None) => self.push(frame_len),
                 Err(e) => panic!("relay: {e:?}"),

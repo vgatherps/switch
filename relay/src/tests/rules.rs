@@ -238,7 +238,7 @@ fn direct_message_borrows_the_frame() {
     let mut r = rx(Role::Client);
     let f = VecFrame { data: wire, stamp: 42 };
     let base = f.data.as_ptr();
-    r.push(f, &mut ()).unwrap();
+    r.push(f);
     let m = r.recv(&mut ()).unwrap().unwrap();
     assert_eq!(m.bytes().as_ptr(), base.wrapping_add(2));
     assert_eq!(m.text(), Some("first"));
@@ -290,11 +290,11 @@ fn pong_is_owed_once_per_ping() {
     let mut r = rx(Role::Client);
     assert_eq!(r.take_pong(), None);
     let ping = encode(fin(PING), None, b"hb");
-    r.push(VecFrame { data: ping.clone(), stamp: 0 }, &mut ()).unwrap();
+    r.push(VecFrame { data: ping.clone(), stamp: 0 });
     assert!(r.recv(&mut ()).unwrap().is_none());
     assert_eq!(r.take_pong(), Some(&b"hb"[..]));
     assert_eq!(r.take_pong(), None);
-    r.push(VecFrame { data: ping, stamp: 1 }, &mut ()).unwrap();
+    r.push(VecFrame { data: ping, stamp: 1 });
     assert!(r.recv(&mut ()).unwrap().is_none());
     assert_eq!(r.take_pong(), Some(&b"hb"[..]));
     assert_eq!(r.take_pong(), None);
@@ -332,7 +332,7 @@ fn consumed_frames_are_dropped_before_recv_asks_for_more() {
     let mut r = WsRx::new(Raw::new(), Config::new(Role::Client));
 
     // Direct: the message borrows the frame, so it lives until the message is gone.
-    r.push(frame(encode(fin(TEXT), None, b"direct")), &mut ()).unwrap();
+    r.push(frame(encode(fin(TEXT), None, b"direct")));
     let m = r.recv(&mut ()).unwrap().unwrap();
     assert_eq!(m.bytes(), b"direct");
     assert_eq!(drops.get(), 0);
@@ -341,10 +341,10 @@ fn consumed_frames_are_dropped_before_recv_asks_for_more() {
 
     // Scratch: the first frame is copied out and released before the rest arrives.
     let wire = encode(fin(BINARY), None, &[4; 20]);
-    r.push(frame(wire[..10].to_vec()), &mut ()).unwrap();
+    r.push(frame(wire[..10].to_vec()));
     assert!(r.recv(&mut ()).unwrap().is_none());
     assert_eq!(drops.get(), 2);
-    r.push(frame(wire[10..].to_vec()), &mut ()).unwrap();
+    r.push(frame(wire[10..].to_vec()));
     assert_eq!(r.recv(&mut ()).unwrap().unwrap().bytes(), [4; 20]);
     assert!(r.recv(&mut ()).unwrap().is_none());
     assert_eq!(drops.get(), 3);

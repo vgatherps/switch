@@ -32,11 +32,10 @@ impl<F: RxFrame, T> PlainRx for Raw<F, T> {
     type Tx = T;
     type Error = Infallible;
 
-    fn push(&mut self, f: F, _: &mut T) -> Result<(), Infallible> {
+    fn push(&mut self, f: F) {
         assert!(self.current().is_empty(), "push with unconsumed bytes");
         self.frame = Some(f);
         self.pos = 0;
-        Ok(())
     }
 
     fn chunk(&mut self, _: &mut T) -> Result<Option<Chunk<'_>>, Infallible> {

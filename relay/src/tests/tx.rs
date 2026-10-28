@@ -379,7 +379,7 @@ fn pong_goes_between_fragments() {
 fn ping_is_answered_with_its_payload() {
     let (mut t, log) = tx(Role::Client, 1430);
     let mut r = rx(Role::Client);
-    r.push(VecFrame { data: encode(fin(PING), None, b"hb"), stamp: 0 }, &mut ()).unwrap();
+    r.push(VecFrame { data: encode(fin(PING), None, b"hb"), stamp: 0 });
     assert!(r.recv(&mut ()).unwrap().is_none());
     if let Some(p) = r.take_pong() {
         t.pong(p);
@@ -394,7 +394,7 @@ fn close_is_echoed_and_ends_sending() {
     let (mut t, log) = tx(Role::Server, 1430);
     let mut r = rx(Role::Server);
     let close = [&1001u16.to_be_bytes()[..], b"bye"].concat();
-    r.push(VecFrame { data: encode(fin(CLOSE), Some([1, 2, 3, 4]), &close), stamp: 0 }, &mut ()).unwrap();
+    r.push(VecFrame { data: encode(fin(CLOSE), Some([1, 2, 3, 4]), &close), stamp: 0 });
     assert!(matches!(r.recv(&mut ()), Err(WsError::Closed)));
     t.pong(b"first");
     t.close(r.peer_close().unwrap());
