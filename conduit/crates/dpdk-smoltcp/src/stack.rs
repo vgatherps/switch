@@ -132,6 +132,14 @@ pub enum AddUdpError {
     RxPoolTooSmall { required: usize, pool: usize },
 }
 
+/// `Stack::udp_send_frame` refused the frame; it comes back with the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpSendFrameError {
+    Udp(UdpSendError),
+    /// The frame is not from this Stack's frame pool.
+    Foreign,
+}
+
 /// Outcome of one `Stack::turn` or `Stack::receive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turn {
@@ -693,6 +701,36 @@ impl Stack {
         self.udp_send_with(handle, to, payload.len(), |buffer| {
             buffer.copy_from_slice(payload)
         })
+    }
+
+    /// Send `frame` as one datagram; `to` may be omitted for a connected
+    /// socket. On success the frame is the Stack's. A unique frame goes out in
+    /// place: its headers are written in front of its payload and its mbuf
+    /// joins the shared pending FIFO in call order, freed after TX completion.
+    /// A shared frame (cloned by the app) is copied into a TX packet as
+    /// `udp_send` does, and this reference is dropped. A zero-length frame is
+    /// an empty datagram.
+    ///
+    /// Every error returns the frame untouched. `Foreign`: the frame is from
+    /// another Stack's pool. Then `udp_send`'s errors in its order;
+    /// `WouldBlock` means flush, then retry.
+    pub fn udp_send_frame(
+        &mut self,
+        handle: &UdpHandle,
+        to: Option<IpEndpoint>,
+        frame: TxFrame,
+    ) -> Result<(), (TxFrame, UdpSendFrameError)> {
+        if frame.origin() != self.device.frame_pool().origin() {
+            return Err((frame, UdpSendFrameError::Foreign));
+        }
+        let raw = self.udp_raw(handle);
+        let target = match self.iface.udp_target(&self.udp, raw, to, frame.len()) {
+            Ok(target) => target,
+            Err(error) => return Err((frame, UdpSendFrameError::Udp(error))),
+        };
+        self.iface
+            .udp_send_frame(&mut self.device, &mut self.udp, target, frame)
+            .map_err(|(frame, error)| (frame, UdpSendFrameError::Udp(error)))
     }
 
     /// Free queued datagrams and release the socket's RX budget.

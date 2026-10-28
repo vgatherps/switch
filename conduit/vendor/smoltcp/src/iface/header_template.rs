@@ -298,15 +298,49 @@ impl UdpTemplate {
         if checksum.udp.tx() {
             // The header words come from their values and the payload is summed from its own
             // start, so no load spans both the header stores and the app's payload stores.
-            let sum = !checksum::combine(&[
-                self.prefix.pseudo_sum,
-                udp_len,
-                self.src_port,
-                self.dst_port,
-                udp_len,
-                checksum::data(packet.payload_mut()),
-            ]);
-            packet.set_checksum(if sum == 0 { 0xffff } else { sum });
+            let sum = self.checksum(udp_len, packet.payload_mut());
+            packet.set_checksum(sum);
         }
+    }
+
+    /// `emit` for a payload that is not behind the headers: writes the 42 header bytes into
+    /// `header` (42 long) and sums `payload` where it lies. The caller checked that
+    /// `ip.payload_len` is the UDP length of `payload` (`Interface::udp_send_frame`).
+    #[inline]
+    pub(crate) fn emit_header(
+        &self,
+        header: &mut TxHeader,
+        ip: &Ipv4Repr,
+        payload: &[u8],
+        checksum: &ChecksumCapabilities,
+    ) {
+        let frame = header.bytes_mut();
+        debug_assert_eq!(ip.payload_len, 8 + payload.len());
+        self.prefix.emit(frame, ip, checksum);
+        let mut packet = UdpPacket::new_unchecked(&mut frame[34..]);
+        let udp_len = ip.payload_len as u16;
+        packet.set_src_port(self.src_port);
+        packet.set_dst_port(self.dst_port);
+        packet.set_len(udp_len);
+        packet.set_checksum(if checksum.udp.tx() {
+            self.checksum(udp_len, payload)
+        } else {
+            0
+        });
+    }
+
+    /// The UDP checksum field: header words from their values plus `payload`'s sum; a computed
+    /// 0 is sent as 0xffff.
+    #[inline]
+    fn checksum(&self, udp_len: u16, payload: &[u8]) -> u16 {
+        let sum = !checksum::combine(&[
+            self.prefix.pseudo_sum,
+            udp_len,
+            self.src_port,
+            self.dst_port,
+            udp_len,
+            checksum::data(payload),
+        ]);
+        if sum == 0 { 0xffff } else { sum }
     }
 }

@@ -3070,3 +3070,346 @@ fn retransmit_with_tx_checksum_offload() {
         finish(fixture, device);
     });
 }
+
+const UDP_OFFLOAD: (u64, u64, u64, u64) = (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, 14, 20, 8);
+
+/// An Interface for Side A at 10.0.0.1/24 on `device` that has learned Side
+/// B's MAC from an ARP reply.
+fn udp_iface(fixture: &Fixture, device: &mut Device) -> Interface {
+    use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr};
+
+    let mut config = Config::new(Side::A.mac().into());
+    config.random_seed = 1;
+    let mut iface = Interface::new(config, device, NOW);
+    iface.update_ip_addrs(|addrs| {
+        addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
+    });
+    let arp = ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Reply,
+        source_hardware_addr: Side::B.mac(),
+        source_protocol_addr: Side::B.ip(),
+        target_hardware_addr: Side::A.mac(),
+        target_protocol_addr: Side::A.ip(),
+    };
+    let mut bytes = vec![0; 14 + arp.buffer_len()];
+    let mut eth = EthernetFrame::new_unchecked(&mut bytes);
+    eth.set_src_addr(Side::B.mac());
+    eth.set_dst_addr(Side::A.mac());
+    eth.set_ethertype(EthernetProtocol::Arp);
+    arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
+    stage(fixture, device, &bytes);
+    iface.poll_ingress_single(NOW, device, &mut TcpSet::new(Vec::new()));
+    assert!(device.tx.is_empty());
+    iface
+}
+
+fn udp_socket(udp: &mut smoltcp::iface::UdpSet, port: u16, tx_checksum: bool) -> smoltcp::iface::UdpHandle {
+    udp.add(smoltcp::iface::UdpConfig {
+        port,
+        rx_queue: 1,
+        tx_checksum,
+        broadcast: false,
+    })
+    .unwrap()
+}
+
+/// A frame from `device`'s frame pool holding `payload`, and its mbuf.
+fn app_frame(device: &Device, payload: &[u8]) -> (smoltcp::phy::TxFrame, *mut zhida_dpdk_sys::rte_mbuf) {
+    let buf = device.frame_pool().alloc().unwrap();
+    let raw = buf.owner().cast::<zhida_dpdk_sys::rte_mbuf>().as_ptr();
+    let mut frame = smoltcp::phy::TxFrame::new(buf);
+    frame.room_mut()[..payload.len()].copy_from_slice(payload);
+    frame.set_len(payload.len());
+    (frame, raw)
+}
+
+/// What a send could write in an unpublished frame mbuf: layout, offload
+/// metadata and the 64 headroom bytes in front of the payload.
+#[derive(Debug, PartialEq)]
+struct FrameMbufState {
+    layout: (u16, u16, u32),
+    metadata: (u64, u64, u64, u64),
+    headroom: Vec<u8>,
+}
+
+fn frame_mbuf_state(raw: *mut zhida_dpdk_sys::rte_mbuf) -> FrameMbufState {
+    // SAFETY: the test holds a reference to this frame mbuf; only read here.
+    unsafe {
+        let m = &*raw;
+        FrameMbufState {
+            layout: (m.data_off(), m.data_len(), m.pkt_len()),
+            metadata: mbuf_tx_metadata(raw),
+            headroom: std::slice::from_raw_parts(m.data_ptr().sub(64), 64).to_vec(),
+        }
+    }
+}
+
+fn refcnt(raw: *mut zhida_dpdk_sys::rte_mbuf) -> u16 {
+    // SAFETY: the test holds a reference to this frame mbuf; only read here.
+    unsafe { (*raw).refcnt() }
+}
+
+fn send_udp_frame(
+    iface: &mut Interface,
+    device: &mut Device,
+    udp: &mut smoltcp::iface::UdpSet,
+    handle: smoltcp::iface::UdpHandle,
+    to: smoltcp::wire::IpEndpoint,
+    frame: smoltcp::phy::TxFrame,
+) -> Result<(), (smoltcp::phy::TxFrame, smoltcp::iface::UdpSendError)> {
+    let target = iface.udp_target(udp, handle, Some(to), frame.len()).unwrap();
+    iface.udp_send_frame(device, udp, target, frame)
+}
+
+/// A unique UDP frame goes out in place on the generic path (first send) and
+/// the template (second), for an empty, a small and a full payload in every
+/// checksum mode: the published mbuf is the frame's own (headers in its
+/// headroom, one segment, refcount 1, the copy path's offload metadata and
+/// wire bytes), no TX-pool mbuf is used, and the PMD's free returns it.
+#[zhida_test_support::pinned_test]
+fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
+    use smoltcp::iface::UdpSet;
+    use smoltcp::wire::IpEndpoint;
+
+    with_test_eal(|eal| {
+        for (offload, tx_checksum) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (fixture, mut device) = open(eal, 4, 4);
+            if offload {
+                enable_tx_udp_checksum(&mut device.port);
+            }
+            let mut iface = udp_iface(&fixture, &mut device);
+            let mut udp = UdpSet::new(1);
+            let to = IpEndpoint::new(Side::B.ip().into(), 80);
+            let room = device.frame_pool().alloc().unwrap().capacity();
+            assert_eq!(room, FRAME - 42);
+            let metadata = if offload { UDP_OFFLOAD } else { (0, 0, 0, 0) };
+            for len in [0, 8, room] {
+                let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ 0x5a).collect();
+                let handle = udp_socket(&mut udp, 49152, tx_checksum);
+                let mut sent = Vec::new();
+                for _ in 0..2 {
+                    let (frame, raw) = app_frame(&device, &payload);
+                    let tx_in_use = in_use(&device.port).1;
+                    assert!(send_udp_frame(&mut iface, &mut device, &mut udp, handle, to, frame).is_ok());
+                    assert_eq!(device.pending(), 1);
+                    assert_eq!(device.tx[0].as_ptr(), raw);
+                    let m = unsafe { &*raw };
+                    let wire_len = 42 + len;
+                    assert_eq!(
+                        (m.data_off(), m.data_len(), m.pkt_len(), m.nb_segs(), m.refcnt()),
+                        (FRAME_DATA_OFF - 42, wire_len as u16, wire_len as u32, 1, 1)
+                    );
+                    assert_eq!(m.pool, device.frame_pool().mempool());
+                    assert_eq!(tx_metadata(&device.tx[0]), metadata);
+                    assert_eq!((in_use(&device.port).1, frame_in_use(&device)), (tx_in_use, 1));
+                    sent.push(device.tx[0].data().to_vec());
+                    assert_eq!(device.flush(), Ok(1));
+                    assert_eq!(ring_bytes(&fixture), [sent.last().unwrap().clone()]);
+                    assert_eq!(frame_in_use(&device), 0);
+                }
+                let target = iface.udp_target(&udp, handle, Some(to), len).unwrap();
+                assert_eq!(
+                    iface.udp_send(&mut device, &mut udp, target, |out| out.copy_from_slice(&payload)),
+                    Ok(())
+                );
+                assert_eq!(tx_metadata(&device.tx[0]), metadata);
+                assert_eq!(sent, [device.tx[0].data(), device.tx[0].data()]);
+                assert_eq!(device.flush(), Ok(1));
+                drop(ring_bytes(&fixture));
+                drop(udp.remove(handle));
+            }
+            finish(fixture, device);
+        }
+    });
+}
+
+/// A shared frame (the app keeps a clone) is copied into one TX-pool packet
+/// with the unique path's bytes and metadata; its own mbuf is never written
+/// and drops back to refcount 1 when the send releases the sent reference.
+#[zhida_test_support::pinned_test]
+fn udp_shared_frame_copies_into_a_tx_packet() {
+    use smoltcp::iface::UdpSet;
+    use smoltcp::wire::IpEndpoint;
+
+    with_test_eal(|eal| {
+        for offload in [true, false] {
+            let (fixture, mut device) = open(eal, 4, 4);
+            if offload {
+                enable_tx_udp_checksum(&mut device.port);
+            }
+            let mut iface = udp_iface(&fixture, &mut device);
+            let mut udp = UdpSet::new(1);
+            let handle = udp_socket(&mut udp, 49152, true);
+            let to = IpEndpoint::new(Side::B.ip().into(), 80);
+            let payload = b"shared datagram";
+            let (unique, _) = app_frame(&device, payload);
+            assert!(send_udp_frame(&mut iface, &mut device, &mut udp, handle, to, unique).is_ok());
+            let unique_bytes = device.tx[0].data().to_vec();
+            let unique_metadata = tx_metadata(&device.tx[0]);
+            assert_eq!(device.flush(), Ok(1));
+            drop(ring_bytes(&fixture));
+
+            let (kept, raw) = app_frame(&device, payload);
+            let before = frame_mbuf_state(raw);
+            assert_eq!(refcnt(raw), 1);
+            assert!(send_udp_frame(&mut iface, &mut device, &mut udp, handle, to, kept.clone()).is_ok());
+            assert_eq!(frame_mbuf_state(raw), before);
+            assert_eq!(refcnt(raw), 1);
+            assert_eq!(device.pending(), 1);
+            let m = unsafe { &*device.tx[0].as_ptr() };
+            assert_ne!(device.tx[0].as_ptr(), raw);
+            assert_ne!(m.pool, device.frame_pool().mempool());
+            assert_eq!(m.nb_segs(), 1);
+            assert_eq!(device.tx[0].data(), unique_bytes);
+            assert_eq!(tx_metadata(&device.tx[0]), unique_metadata);
+            assert_eq!(frame_in_use(&device), 1);
+            assert_eq!(device.flush(), Ok(1));
+            assert_eq!(ring_bytes(&fixture), [unique_bytes]);
+            assert_eq!(kept.payload(), payload);
+            drop(kept);
+            assert_eq!(frame_in_use(&device), 0);
+            finish(fixture, device);
+        }
+    });
+}
+
+/// UDP broadcast of one payload: one frame cloned for 8 sockets, each clone
+/// sent on its own socket. Every NIC-bound packet is a single-segment TX-pool
+/// copy with that socket's headers and the same payload; the frame mbuf is
+/// never published and its refcount steps down by one per send. Draining the
+/// ring frees each copy once; the frame is freed once when the app drops it.
+#[zhida_test_support::pinned_test]
+fn udp_broadcast_clones_copy_once_per_socket() {
+    use smoltcp::iface::UdpSet;
+    use smoltcp::wire::IpEndpoint;
+
+    const N: usize = 8;
+    with_test_eal(|eal| {
+        let (fixture, mut device) = open(eal, 4, N);
+        enable_tx_udp_checksum(&mut device.port);
+        let mut iface = udp_iface(&fixture, &mut device);
+        let mut udp = UdpSet::new(N);
+        let handles: Vec<_> = (0..N).map(|i| udp_socket(&mut udp, 49152 + i as u16, true)).collect();
+        let to = IpEndpoint::new(Side::B.ip().into(), 80);
+        let payload = b"one payload for every socket";
+        let (frame, raw) = app_frame(&device, payload);
+        let before = frame_mbuf_state(raw);
+        let clones: Vec<_> = (0..N).map(|_| frame.clone()).collect();
+        assert_eq!(refcnt(raw), N as u16 + 1);
+        for (i, (clone, &handle)) in clones.into_iter().zip(&handles).enumerate() {
+            assert!(send_udp_frame(&mut iface, &mut device, &mut udp, handle, to, clone).is_ok());
+            assert_eq!(refcnt(raw), (N - i) as u16);
+            assert_eq!(frame_mbuf_state(raw), before);
+        }
+        assert_eq!(device.pending(), N);
+        assert_eq!(in_use(&device.port).1, N as u32);
+        assert!(device.spare.is_none());
+        for (i, packet) in device.tx.iter().enumerate() {
+            let m = unsafe { &*packet.as_ptr() };
+            assert_ne!(packet.as_ptr(), raw);
+            assert_ne!(m.pool, device.frame_pool().mempool());
+            assert_eq!(m.nb_segs(), 1);
+            assert_eq!(tx_metadata(packet), UDP_OFFLOAD);
+            let ip = Ipv4Packet::new_checked(&packet.data()[14..]).unwrap();
+            let datagram = UdpPacket::new_checked(ip.payload()).unwrap();
+            assert_eq!((datagram.src_port(), datagram.dst_port()), (49152 + i as u16, 80));
+            assert_eq!(datagram.payload(), payload);
+        }
+        assert_eq!(frame_in_use(&device), 1);
+        // The fixture's TX ring holds 7: the ring consumer frees each burst.
+        assert_eq!(device.flush(), Ok(N - 1));
+        assert_eq!(ring_bytes(&fixture).len(), N - 1);
+        assert_eq!(device.flush(), Ok(1));
+        assert_eq!(ring_bytes(&fixture).len(), 1);
+        assert_eq!(in_use(&device.port), (0, 0));
+        assert_eq!(frame_mbuf_state(raw), before);
+        drop(frame);
+        assert_eq!(frame_in_use(&device), 0);
+        finish(fixture, device);
+    });
+}
+
+/// Every refusal returns the frame with its mbuf untouched and queues no
+/// data: a full pending queue (unique frame, template and generic), an empty
+/// TX pool for a shared frame's copy, no route, and a pending neighbor. A
+/// unique frame's ARP request takes one pending slot; a rate-limited retry
+/// takes none.
+#[zhida_test_support::pinned_test]
+fn udp_frame_refusals_write_nothing() {
+    use smoltcp::iface::{UdpSendError, UdpSet};
+    use smoltcp::wire::IpEndpoint;
+
+    with_test_eal(|eal| {
+        let (fixture, mut device) = open(eal, 4, 1);
+        let mut iface = udp_iface(&fixture, &mut device);
+        let mut udp = UdpSet::new(2);
+        let templated = udp_socket(&mut udp, 49152, true);
+        let fresh = udp_socket(&mut udp, 49153, true);
+        let peer = IpEndpoint::new(Side::B.ip().into(), 80);
+        let (frame, _) = app_frame(&device, b"x");
+        assert!(send_udp_frame(&mut iface, &mut device, &mut udp, templated, peer, frame).is_ok());
+        assert_eq!(device.flush(), Ok(1));
+        drop(ring_bytes(&fixture));
+
+        #[allow(clippy::too_many_arguments)]
+        fn refused(
+            iface: &mut Interface,
+            device: &mut Device,
+            udp: &mut UdpSet,
+            handle: smoltcp::iface::UdpHandle,
+            to: IpEndpoint,
+            frame: smoltcp::phy::TxFrame,
+            raw: *mut zhida_dpdk_sys::rte_mbuf,
+            error: UdpSendError,
+        ) -> smoltcp::phy::TxFrame {
+            let before = frame_mbuf_state(raw);
+            let pending = device.pending();
+            match send_udp_frame(iface, device, udp, handle, to, frame) {
+                Ok(()) => panic!("send succeeded"),
+                Err((frame, got)) => {
+                    assert_eq!(got, error);
+                    assert_eq!(frame.payload(), b"kept");
+                    assert_eq!(frame_mbuf_state(raw), before);
+                    assert_eq!(device.pending(), pending);
+                    frame
+                }
+            }
+        }
+        // Pending full: one copy fills the single slot.
+        send(&mut device, &udp_frame());
+        let (frame, raw) = app_frame(&device, b"kept");
+        let frame = refused(&mut iface, &mut device, &mut udp, templated, peer, frame, raw, UdpSendError::WouldBlock);
+        let frame = refused(&mut iface, &mut device, &mut udp, fresh, peer, frame, raw, UdpSendError::WouldBlock);
+        assert_eq!(device.flush(), Ok(1));
+        drop(ring_bytes(&fixture));
+
+        // TX pool empty: a shared frame's copy cannot get a packet.
+        let mut held: Vec<_> = device.spare.take().into_iter().collect();
+        held.extend(std::iter::from_fn(|| device.port.alloc_tx(FRAME as u16)));
+        let clone = frame.clone();
+        let clone = refused(&mut iface, &mut device, &mut udp, templated, peer, clone, raw, UdpSendError::WouldBlock);
+        drop((clone, held));
+
+        let off_subnet = IpEndpoint::new(Ipv4Address::new(192, 0, 2, 1).into(), 80);
+        let frame = refused(&mut iface, &mut device, &mut udp, fresh, off_subnet, frame, raw, UdpSendError::NoRoute);
+        assert!(device.tx.is_empty());
+
+        let unresolved = IpEndpoint::new(Ipv4Address::new(10, 0, 0, 9).into(), 80);
+        let before = frame_mbuf_state(raw);
+        let Err((frame, error)) = send_udp_frame(&mut iface, &mut device, &mut udp, fresh, unresolved, frame) else {
+            panic!("send succeeded");
+        };
+        assert_eq!(error, UdpSendError::NeighborPending);
+        assert_eq!(frame_mbuf_state(raw), before);
+        assert_eq!(device.pending(), 1);
+        let arp = EthernetFrame::new_checked(device.tx[0].data()).unwrap();
+        assert_eq!(arp.ethertype(), EthernetProtocol::Arp);
+        assert_eq!(device.flush(), Ok(1));
+        drop(ring_bytes(&fixture));
+        let frame = refused(&mut iface, &mut device, &mut udp, fresh, unresolved, frame, raw, UdpSendError::NeighborPending);
+        assert!(device.tx.is_empty());
+        drop(frame);
+        assert_eq!(frame_in_use(&device), 0);
+        finish(fixture, device);
+    });
+}

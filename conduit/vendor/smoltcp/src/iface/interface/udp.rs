@@ -1,7 +1,8 @@
 use super::*;
 use crate::iface::header_template::UdpTemplate;
 use crate::iface::udp_set::PendingUdp;
-use crate::iface::{UdpHandle, UdpSendError, UdpTarget};
+use crate::iface::{UdpHandle, UdpSendError, UdpSocket, UdpTarget};
+use crate::phy::{ChecksumCapabilities, TxFrame};
 
 impl Interface {
     /// Check one UDP send of `len` payload bytes before any device work.
@@ -75,28 +76,7 @@ impl Interface {
         self.inner.neighbor_cache.expire(now);
         let mut token = device.transmit(now).ok_or(UdpSendError::WouldBlock)?;
         let src_mac = self.inner.hardware_addr.ethernet_or_panic();
-        let udp_repr = UdpRepr {
-            src_port: socket.config().port,
-            dst_port: to.port,
-        };
-        let ip_repr = self
-            .inner
-            .get_source_address_ipv4(&dst_addr)
-            .map(|src_addr| Ipv4Repr {
-                src_addr,
-                dst_addr,
-                next_header: IpProtocol::Udp,
-                payload_len: UDP_HEADER_LEN
-                    .checked_add(len)
-                    .expect("UDP length overflow"),
-                hop_limit: 64,
-            });
-        let mut checksum_caps = self.inner.caps.checksum.clone();
-        checksum_caps.udp = if socket.config().tx_checksum && self.inner.caps.checksum.udp.tx() {
-            crate::phy::Checksum::Both
-        } else {
-            crate::phy::Checksum::None
-        };
+        let (ip_repr, udp_repr, checksum_caps) = self.inner.udp_reprs(socket, to, dst_addr, len);
         if let Some(ip_repr) = &ip_repr
             && let Some(template) = &socket.template
             && template.fits(
@@ -129,10 +109,7 @@ impl Interface {
         let (hardware_addr, mut token) = self
             .inner
             .lookup_hardware_addr(token, &to.addr, Some(&mut next_hop))
-            .map_err(|err| match err {
-                DispatchError::NoRoute => UdpSendError::NoRoute,
-                DispatchError::NeighborPending => UdpSendError::NeighborPending,
-            })?;
+            .map_err(udp_dispatch_error)?;
         let ip_repr = ip_repr.ok_or(UdpSendError::NoRoute)?;
         let mut meta = PacketMeta::default();
         meta.tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(ip_repr), 0);
@@ -175,9 +152,157 @@ impl Interface {
         self.inner.dispatch_neighbor_probe(device);
         Ok(())
     }
+
+    /// Send `frame` as one UDP datagram to `target`, made for `frame.len()` payload bytes.
+    /// A unique frame is published in place: its headers go in front of its payload and its
+    /// only reference moves to the device. A shared frame's payload is copied through
+    /// `udp_send`; on success this reference is dropped.
+    /// Errors are `WouldBlock`, `NoRoute` and `NeighborPending`, each with the frame back.
+    /// For a unique frame the neighbor lookup runs first and takes a TX token only to send an
+    /// ARP request; the publish slot is taken after it. A shared frame keeps `udp_send`'s
+    /// order: its token comes first, so an exhausted device reports `WouldBlock` before any
+    /// lookup error.
+    ///
+    /// Panics if `frame.len()` is not the target's length, the UDP length exceeds 65535, the
+    /// interface medium is not Ethernet or the target's handle is stale.
+    pub fn udp_send_frame(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        udp: &mut UdpSet,
+        target: UdpTarget,
+        frame: TxFrame,
+    ) -> Result<(), (TxFrame, UdpSendError)> {
+        assert_eq!(frame.len(), target.len, "UDP frame length is not its target's");
+        assert!(
+            UDP_HEADER_LEN + frame.len() <= usize::from(u16::MAX),
+            "UDP frame length exceeds 65535"
+        );
+        if !frame.unique() {
+            return match self.udp_send(device, udp, target, |out| {
+                out.copy_from_slice(frame.payload())
+            }) {
+                Ok(()) => Ok(()),
+                Err(error) => Err((frame, error)),
+            };
+        }
+        let UdpTarget {
+            handle,
+            to,
+            dst_addr,
+            len,
+        } = target;
+        let socket = udp.get_mut(handle);
+        let now = self.inner.now;
+        self.inner.neighbor_cache.expire(now);
+        let src_mac = self.inner.hardware_addr.ethernet_or_panic();
+        let (ip_repr, udp_repr, checksum_caps) = self.inner.udp_reprs(socket, to, dst_addr, len);
+        if let Some(ip_repr) = &ip_repr
+            && let Some(template) = &socket.template
+            && template.fits(
+                self.inner.neighbor_cache.changes(),
+                src_mac,
+                ip_repr,
+                &udp_repr,
+            )
+        {
+            let Some(token) = device.transmit_frame(now) else {
+                return Err((frame, UdpSendError::WouldBlock));
+            };
+            let mut header =
+                TxHeader::new(UDP_FRAME_HEADER_LEN, self.inner.tx_checksum(&IpRepr::Ipv4(*ip_repr), 0));
+            template.emit_header(&mut header, ip_repr, frame.payload(), &checksum_caps);
+            token.consume(header, frame.into_buf());
+            #[cfg(test)]
+            {
+                udp.template_frames = udp
+                    .template_frames
+                    .checked_add(1)
+                    .expect("UDP template frame count overflow");
+            }
+            self.inner.dispatch_neighbor_probe(device);
+            return Ok(());
+        }
+        let mut next_hop = None;
+        let hardware_addr = match self.inner.find_hardware_addr(&to.addr, Some(&mut next_hop)) {
+            Ok(HardwareLookup::Found(hardware_addr)) => hardware_addr,
+            Ok(HardwareLookup::Arp(addr)) => {
+                let Some(token) = device.transmit(now) else {
+                    return Err((frame, UdpSendError::WouldBlock));
+                };
+                let error = match self.inner.send_arp_request(token, addr) {
+                    Ok(()) => UdpSendError::NeighborPending,
+                    Err(error) => udp_dispatch_error(error),
+                };
+                return Err((frame, error));
+            }
+            Err(error) => return Err((frame, udp_dispatch_error(error))),
+        };
+        let Some(ip_repr) = ip_repr else {
+            return Err((frame, UdpSendError::NoRoute));
+        };
+        let Some(token) = device.transmit_frame(now) else {
+            return Err((frame, UdpSendError::WouldBlock));
+        };
+        let mut header =
+            TxHeader::new(UDP_FRAME_HEADER_LEN, self.inner.tx_checksum(&IpRepr::Ipv4(ip_repr), 0));
+        emit_udp_header(
+            &mut header,
+            src_mac,
+            hardware_addr.ethernet_or_panic(),
+            &ip_repr,
+            &udp_repr,
+            frame.payload(),
+            &checksum_caps,
+        );
+        token.consume(header, frame.into_buf());
+        if let Some((changes, mac)) = next_hop {
+            socket.template = Some(UdpTemplate::new(
+                src_mac,
+                mac,
+                &ip_repr,
+                udp_repr.src_port,
+                udp_repr.dst_port,
+                changes,
+            ));
+        }
+        self.inner.dispatch_neighbor_probe(device);
+        Ok(())
+    }
 }
 
 impl InterfaceInner {
+    /// One send's IPv4 header (`None` without a source address for `dst_addr`), UDP ports and
+    /// checksum capabilities, the UDP checksum on only if the socket and device both ask for it.
+    #[inline]
+    fn udp_reprs(
+        &self,
+        socket: &UdpSocket,
+        to: IpEndpoint,
+        dst_addr: Ipv4Address,
+        len: usize,
+    ) -> (Option<Ipv4Repr>, UdpRepr, ChecksumCapabilities) {
+        let udp_repr = UdpRepr {
+            src_port: socket.config().port,
+            dst_port: to.port,
+        };
+        let ip_repr = self.get_source_address_ipv4(&dst_addr).map(|src_addr| Ipv4Repr {
+            src_addr,
+            dst_addr,
+            next_header: IpProtocol::Udp,
+            payload_len: UDP_HEADER_LEN
+                .checked_add(len)
+                .expect("UDP length overflow"),
+            hop_limit: 64,
+        });
+        let mut checksum_caps = self.caps.checksum.clone();
+        checksum_caps.udp = if socket.config().tx_checksum && self.caps.checksum.udp.tx() {
+            crate::phy::Checksum::Both
+        } else {
+            crate::phy::Checksum::None
+        };
+        (ip_repr, udp_repr, checksum_caps)
+    }
+
     pub(super) fn process_udp<'frame>(
         &mut self,
         udp: Option<&mut UdpSet>,
@@ -264,5 +389,56 @@ impl InterfaceInner {
             },
         ));
         None
+    }
+}
+
+/// Ethernet, IPv4 and UDP headers in front of a UDP frame's payload.
+const UDP_FRAME_HEADER_LEN: usize = 42;
+
+fn udp_dispatch_error(error: DispatchError) -> UdpSendError {
+    match error {
+        DispatchError::NoRoute => UdpSendError::NoRoute,
+        DispatchError::NeighborPending => UdpSendError::NeighborPending,
+    }
+}
+
+/// The generic emitters' header bytes for a datagram whose payload is not behind them: the
+/// UDP checksum covers the header words written here and `payload` where it lies. `header` is
+/// 42 long and `udp_send_frame` checked that `ip_repr.payload_len` is the UDP length of
+/// `payload` and fits u16.
+fn emit_udp_header(
+    header: &mut TxHeader,
+    src_mac: EthernetAddress,
+    dst_mac: EthernetAddress,
+    ip_repr: &Ipv4Repr,
+    udp_repr: &UdpRepr,
+    payload: &[u8],
+    checksum_caps: &ChecksumCapabilities,
+) {
+    let bytes = header.bytes_mut();
+    debug_assert_eq!(ip_repr.payload_len, UDP_HEADER_LEN + payload.len());
+    let udp_len = ip_repr.payload_len as u16;
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+    frame.set_src_addr(src_mac);
+    frame.set_dst_addr(dst_mac);
+    frame.set_ethertype(EthernetProtocol::Ipv4);
+    ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut bytes[14..34]), checksum_caps);
+    let mut packet = UdpPacket::new_unchecked(&mut bytes[34..]);
+    packet.set_src_port(udp_repr.src_port);
+    packet.set_dst_port(udp_repr.dst_port);
+    packet.set_len(udp_len);
+    packet.set_checksum(0);
+    if checksum_caps.udp.tx() {
+        let sum = !checksum::combine(&[
+            checksum::pseudo_header_v4(
+                &ip_repr.src_addr,
+                &ip_repr.dst_addr,
+                IpProtocol::Udp,
+                u32::from(udp_len),
+            ),
+            checksum::data(packet.as_ref()),
+            checksum::data(payload),
+        ]);
+        packet.set_checksum(if sum == 0 { 0xffff } else { sum });
     }
 }
