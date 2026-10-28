@@ -3,7 +3,7 @@
 //! CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 
 use std::ffi::CStr;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::fd::AsRawFd;
 use std::panic::resume_unwind;
@@ -25,9 +25,9 @@ use relay::Kind;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use sheath::switchnet::{Wss, connect};
+use sheath::switchnet::{Error as WssError, Tls, Wss, connect, tls_connect};
 use switch::Runtime;
-use switchnet::{IpEndpoint, IpListenEndpoint, Net, NetConfig, tcp};
+use switchnet::{IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Error as WsError, Message};
@@ -112,11 +112,8 @@ fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     (Arc::new(server), Arc::new(client))
 }
 
-/// Accepts one connection, runs the TLS handshake and the WebSocket upgrade, then `serve`.
-fn accept(listener: TcpListener, config: Arc<ServerConfig>) -> ServerWs {
-    let (stream, _) = listener.accept().expect("accept the client");
-    stream.set_read_timeout(Some(LIMIT)).unwrap();
-    stream.set_write_timeout(Some(LIMIT)).unwrap();
+/// Runs the server's TLS handshake and WebSocket upgrade on the accepted `stream`.
+fn accept(stream: std::net::TcpStream, config: Arc<ServerConfig>) -> ServerWs {
     let tls = StreamOwned::new(ServerConnection::new(config).unwrap(), stream);
     tungstenite::accept_hdr(tls, |request: &tungstenite::handshake::server::Request, response| {
         assert_eq!(request.uri().path(), PATH);
@@ -139,16 +136,16 @@ fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> 
     future
 }
 
-/// One run: a net_tap Stack under a switchnet Net; the kernel server on a thread runs `serve`
-/// on the accepted WebSocket (after `listener_setup` on its listener); `client` runs as a
-/// switch task on the connected `Wss` and hands it back. Turns the Net, calling `each_round`
-/// each time, until the client and the server are both done; the client's `Wss` is dropped
-/// only then, so what the server saw came from the client, not from its sockets closing.
-/// Returns what `serve` returned.
-fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
+/// One run: a net_tap Stack under a switchnet Net. The kernel server, on a thread, runs `serve`
+/// on the accepted TCP connection (after `listener_setup` on its listener); `client` runs as a
+/// switch task on the connected switchnet stream and hands back what it holds. Turns the Net,
+/// calling `each_round` each time, until the client and the server are both done; what the
+/// client holds is dropped only then, so what the server saw came from the client, not from its
+/// sockets closing. Returns what `serve` returned.
+fn run<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     listener_setup: impl FnOnce(&TcpListener),
-    serve: impl FnOnce(ServerWs) -> T + Send + 'static,
-    client: impl FnOnce(Wss) -> F + 'static,
+    serve: impl FnOnce(std::net::TcpStream, Arc<ServerConfig>) -> T + Send + 'static,
+    client: impl FnOnce(NetHandle, TcpStream, Arc<ClientConfig>) -> F + 'static,
     mut each_round: impl FnMut(),
 ) -> T {
     with_eal(|eal| {
@@ -162,7 +159,12 @@ fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
         let listener = TcpListener::bind(SocketAddrV4::new(KERNEL_ADDR, SERVER_PORT)).expect("bind the server");
         listener_setup(&listener);
         let (server_tls, client_tls) = tls_configs();
-        let server = thread::spawn(move || serve(accept(listener, server_tls)));
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the client");
+            stream.set_read_timeout(Some(LIMIT)).unwrap();
+            stream.set_write_timeout(Some(LIMIT)).unwrap();
+            serve(stream, server_tls)
+        });
 
         let config = StackConfig {
             max_udp_sockets: 0,
@@ -183,14 +185,13 @@ fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
         let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
         let mut rt = Runtime::new(0);
         let handle = net.handle();
-        let held: Rc<RefCell<Option<Wss>>> = Rc::default();
+        let held: Rc<RefCell<Option<H>>> = Rc::default();
         let task_held = held.clone();
         let task = async move {
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
             let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
             let stream = handle.tcp_connect(socket(), remote, local).expect("open TCP").await.expect("TCP connect");
-            let wss = connect(&handle, stream, client_tls, HOST, PATH).await.expect("wss connect");
-            *task_held.borrow_mut() = Some(client(wss).await);
+            *task_held.borrow_mut() = Some(client(handle, stream, client_tls).await);
         };
         rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
 
@@ -213,6 +214,25 @@ fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
         tap.close();
         saw
     })
+}
+
+/// `run` with a wss server, which runs `serve` on the upgraded WebSocket, and a wss client,
+/// which runs `client` on the connected `Wss` and hands it back.
+fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
+    listener_setup: impl FnOnce(&TcpListener),
+    serve: impl FnOnce(ServerWs) -> T + Send + 'static,
+    client: impl FnOnce(Wss) -> F + 'static,
+    each_round: impl FnMut(),
+) -> T {
+    run(
+        listener_setup,
+        |stream, config| serve(accept(stream, config)),
+        |handle, stream, config| async move {
+            let wss = connect(&handle, stream, config, HOST, PATH).await.expect("wss connect");
+            client(wss).await
+        },
+        each_round,
+    )
 }
 
 /// Text of `len` bytes, `seed`-dependent, with multibyte characters.
@@ -452,4 +472,117 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
     );
     assert!(stalled.get());
     assert_eq!(received, MESSAGES);
+}
+
+/// Everything the client sends until FIN, given to the server's `conn`; returns the error the
+/// server's rustls saw (the client's alert) and the bytes read.
+fn read_alert_then_fin(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) -> (rustls::Error, usize) {
+    let mut sent = Vec::new();
+    stream.read_to_end(&mut sent).expect("read the client's records until FIN");
+    let mut rest = &sent[..];
+    while !rest.is_empty() {
+        conn.read_tls(&mut rest).expect("buffer the client's records");
+    }
+    let error = conn.process_new_packets().expect_err("the client's alert");
+    (error, sent.len())
+}
+
+/// Runs the server handshake until it has its first flight to write; returns that flight.
+fn server_flight(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) -> Vec<u8> {
+    while !conn.wants_write() {
+        conn.read_tls(stream).expect("read the ClientHello");
+        conn.process_new_packets().expect("process the ClientHello");
+    }
+    let mut flight = Vec::new();
+    while conn.wants_write() {
+        conn.write_tls(&mut flight).unwrap();
+    }
+    flight
+}
+
+/// The server's handshake flight arrives with its last record (the one carrying Finished)
+/// corrupted: rustls rejects it, and `tls_connect` sends rustls's bad_record_mac alert, then
+/// FIN, before returning the error.
+#[zhida_test_support::pinned_test]
+fn rejected_handshake_sends_the_alert_then_fin() {
+    let (seen, read) = run(
+        |_| {},
+        |mut stream, config| {
+            let mut conn = ServerConnection::new(config).unwrap();
+            let mut flight = server_flight(&mut conn, &mut stream);
+            *flight.last_mut().unwrap() ^= 1;
+            stream.write_all(&flight).unwrap();
+            read_alert_then_fin(&mut conn, &mut stream)
+        },
+        |handle, stream, config| async move {
+            match tls_connect(&handle, stream, config, HOST).await {
+                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                Err(e) => panic!("unexpected error {e}"),
+                Ok(_) => panic!("the corrupted Finished record was accepted"),
+            }
+        },
+        || {},
+    );
+    assert!(read > 0);
+    assert_eq!(seen, rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
+}
+
+/// A corrupted application data record after the handshake: `Tls::ready` returns the error
+/// after sending rustls's alert and FIN (the client still holds the connection then).
+#[zhida_test_support::pinned_test]
+fn receive_error_after_the_handshake_sends_the_alert_then_fin() {
+    let seen = run(
+        |_| {},
+        |mut stream, config| {
+            let mut conn = ServerConnection::new(config).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut stream).expect("server handshake");
+            }
+            conn.writer().write_all(b"corrupted").unwrap();
+            let mut record = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut record).unwrap();
+            }
+            *record.last_mut().unwrap() ^= 1;
+            stream.write_all(&record).unwrap();
+            read_alert_then_fin(&mut conn, &mut stream).0
+        },
+        |handle, stream, config| async move {
+            let mut tls: Tls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
+            match tls.ready().await {
+                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            tls
+        },
+        || {},
+    );
+    assert_eq!(seen, rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
+}
+
+/// A record that fails authentication after the upgrade: `Wss::recv` returns the error after
+/// sending rustls's alert.
+#[zhida_test_support::pinned_test]
+fn wss_receive_error_sends_the_alert() {
+    let seen = wss_run(
+        |_| {},
+        |mut ws| {
+            let tls = ws.get_mut();
+            tls.sock.write_all(&[0x17, 0x03, 0x03, 0x00, 0x20]).unwrap();
+            tls.sock.write_all(&[0; 32]).unwrap();
+            let mut byte = [0; 1];
+            let error = tls.read(&mut byte).expect_err("the client's alert");
+            error.into_inner().and_then(|e| e.downcast::<rustls::Error>().ok()).map(|e| *e)
+        },
+        |mut wss| async move {
+            match wss.recv().await {
+                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                Err(e) => panic!("unexpected error {e}"),
+                Ok(_) => panic!("a message from a corrupted record"),
+            }
+            wss
+        },
+        || {},
+    );
+    assert_eq!(seen, Some(rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac)));
 }

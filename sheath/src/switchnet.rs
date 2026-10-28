@@ -159,7 +159,73 @@ pub struct Tls {
     pub tcp: TcpRx,
 }
 
-/// The TLS handshake for `host` on `stream`.
+impl Tls {
+    /// Waits until `rx` holds plaintext to read through `rx.current()`/`rx.consume` (`Ok(true)`),
+    /// or the server closed with close_notify (`Ok(false)`). A TLS error first sends the alert
+    /// rustls queued for it, then FIN; the TCP stream ending without close_notify is truncation.
+    pub async fn ready(&mut self) -> Result<bool, Error> {
+        use relay::PlainRx;
+
+        loop {
+            let failed = match self.rx.chunk(&mut self.tx).map(|run| run.is_some()) {
+                Ok(true) => return Ok(true),
+                Ok(false) if self.rx.eof() => return Ok(false),
+                Ok(false) => match self.tcp.recv().await {
+                    Ok(frame) => self.rx.push(Frame(frame), &mut self.tx).err(),
+                    Err(RecvError::Finished) => self.rx.fin(&mut self.tx).err(),
+                    Err(e) => return Err(Error::Recv(e)),
+                },
+                Err(e) => Some(e),
+            };
+            if let Some(e) = failed {
+                abort(&mut self.tx).await;
+                return Err(Error::Tls(e));
+            }
+        }
+    }
+
+    /// Sends close_notify, then FIN. Receiving goes on.
+    pub async fn close(&mut self) -> Result<(), Error> {
+        let f = self.tx.alloc().await.map_err(Error::Send)?;
+        let (_, room) = self.tx.plain();
+        self.tx.room(room).await.map_err(Error::Send)?;
+        if let Some(sealed) = self.tx.seal_close(f).map_err(Error::Send)? {
+            send_sealed(&mut self.tx, sealed, room).await.map_err(Error::Send)?;
+        }
+        self.tx.shutdown();
+        Ok(())
+    }
+}
+
+/// After a TLS error: sends the alert rustls queued for it, if any, then FIN. Best effort: the
+/// caller reports the TLS error, which matters more than a failed send.
+async fn abort(tx: &mut TlsTx<SwitchTx>) {
+    if tx.has_pending() {
+        let sent = async {
+            let f = tx.alloc().await?;
+            let (_, room) = tx.plain();
+            tx.room(room).await?;
+            if let Some(sealed) = tx.take_pending(f)? {
+                send_sealed(tx, sealed, room).await?;
+            }
+            Ok::<(), TxError<SendError>>(())
+        };
+        let _ = sent.await;
+    }
+    tx.shutdown();
+}
+
+/// Sends `sealed`, waiting for room of `len` bytes each time it is refused.
+async fn send_sealed<L: PlainTx>(lower: &mut L, mut sealed: L::Sealed, len: usize) -> Result<(), L::Error> {
+    while let Err(s) = lower.try_send(sealed) {
+        sealed = s;
+        lower.room(len).await?;
+    }
+    Ok(())
+}
+
+/// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert
+/// it queued goes out, then FIN, before the error returns.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -181,28 +247,44 @@ pub async fn tls_connect(
             Send,
             Read,
             Done,
+            Failed(rustls::Error),
         }
         let UnbufferedStatus { discard, state } = conn.process_tls_records(&mut received);
-        let next = match state.map_err(|e| Error::Tls(TlsError::Tls(e)))? {
-            ConnectionState::EncodeTlsData(mut data) => {
+        let next = match state {
+            Ok(ConnectionState::EncodeTlsData(mut data)) => {
                 encode_into(&mut out, &mut data);
                 Next::Again
             }
-            ConnectionState::TransmitTlsData(data) => {
+            Ok(ConnectionState::TransmitTlsData(data)) => {
                 data.done();
                 Next::Send
             }
-            ConnectionState::BlockedHandshake => Next::Read,
-            ConnectionState::WriteTraffic(_) => Next::Done,
-            state => return Err(Error::Upgrade(format!("TLS handshake ended in {state:?}"))),
+            Ok(ConnectionState::BlockedHandshake) => Next::Read,
+            Ok(ConnectionState::WriteTraffic(_)) => Next::Done,
+            Ok(state) => return Err(Error::Upgrade(format!("TLS handshake ended in {state:?}"))),
+            Err(e) => Next::Failed(e),
         };
         received.drain(..discard);
+        if let Next::Failed(e) = next {
+            // after what was already encoded, the alert rustls queued for the error (none if
+            // the server sent one). rustls hands queued records out before deframing; once
+            // they are gone it would deframe the rejected record again, so stop there.
+            while conn.wants_write() {
+                match conn.process_tls_records(&mut received).state {
+                    Ok(ConnectionState::EncodeTlsData(mut data)) => encode_into(&mut out, &mut data),
+                    other => unreachable!("rustls holds records to send but produced {other:?}"),
+                }
+            }
+            let _ = send_bytes(&mut raw, &out).await;
+            raw.shutdown();
+            return Err(Error::Tls(TlsError::Tls(e)));
+        }
         if !out.is_empty() && !matches!(next, Next::Again) {
             send_bytes(&mut raw, &out).await.map_err(|e| Error::Send(TxError::Lower(e)))?;
             out.clear();
         }
         match next {
-            Next::Again | Next::Send => {}
+            Next::Again | Next::Send | Next::Failed(_) => {}
             Next::Read => {
                 let frame = tcp_rx.recv().await.map_err(Error::Recv)?;
                 stamp = frame.rx_timestamp();
@@ -232,7 +314,7 @@ pub async fn connect(
         .secure_random
         .fill(&mut key)
         .map_err(|_| Error::Upgrade("no randomness for Sec-WebSocket-Key".into()))?;
-    let Tls { mut rx, tx: mut tls, tcp: mut tcp_rx } = tls_connect(handle, stream, config, host).await?;
+    let mut tls = tls_connect(handle, stream, config, host).await?;
 
     // WebSocket upgrade (RFC 6455 §4.1).
     let key = data_encoding::BASE64.encode(&key);
@@ -240,14 +322,14 @@ pub async fn connect(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
-    send_bytes(&mut tls, request.as_bytes()).await.map_err(Error::Send)?;
-    let response = read_response(&mut rx, &mut tls, &mut tcp_rx).await?;
+    send_bytes(&mut tls.tx, request.as_bytes()).await.map_err(Error::Send)?;
+    let response = read_response(&mut tls).await?;
     check_response(&response, &key)?;
 
     Ok(Wss {
-        rx: WsRx::new(rx, Config::new(Role::Client)),
-        tx: WsTx::new(tls, Role::Client),
-        tcp: tcp_rx,
+        rx: WsRx::new(tls.rx, Config::new(Role::Client)),
+        tx: WsTx::new(tls.tx, Role::Client),
+        tcp: tls.tcp,
     })
 }
 
@@ -258,45 +340,33 @@ pub async fn send_bytes<L: PlainTx>(lower: &mut L, bytes: &[u8]) -> Result<(), L
         let mut f = lower.alloc().await?;
         relay::TxFrame::room_mut(&mut f)[head..head + piece.len()].copy_from_slice(piece);
         lower.room(piece.len()).await?;
-        let mut sealed = lower.seal(f, piece.len())?;
-        while let Err(s) = lower.try_send(sealed) {
-            sealed = s;
-            lower.room(piece.len()).await?;
-        }
+        let sealed = lower.seal(f, piece.len())?;
+        send_sealed(lower, sealed, piece.len()).await?;
     }
     Ok(())
 }
 
 /// Reads the upgrade response's head, through the blank line; bytes after it stay unread for
 /// the WebSocket receive.
-async fn read_response(
-    rx: &mut TlsRx<Frame, SwitchTx>,
-    tls: &mut TlsTx<SwitchTx>,
-    tcp: &mut TcpRx,
-) -> Result<Vec<u8>, Error> {
+async fn read_response(tls: &mut Tls) -> Result<Vec<u8>, Error> {
     use relay::PlainRx;
 
     let mut head = Vec::new();
     loop {
-        match rx.chunk(tls).map_err(Error::Tls)? {
-            Some(chunk) => {
-                let before = head.len();
-                head.extend_from_slice(chunk.bytes);
-                let end = head.windows(4).position(|w| w == b"\r\n\r\n").map(|at| at + 4);
-                let taken = end.unwrap_or(head.len());
-                head.truncate(taken);
-                rx.consume(taken - before);
-                if end.is_some() {
-                    return Ok(head);
-                }
-                if head.len() > MAX_RESPONSE {
-                    return Err(Error::Upgrade(format!("response head over {MAX_RESPONSE} B")));
-                }
-            }
-            None => {
-                let frame = tcp.recv().await.map_err(Error::Recv)?;
-                rx.push(Frame(frame), tls).map_err(Error::Tls)?;
-            }
+        if !tls.ready().await? {
+            return Err(Error::Upgrade("server closed before the response".into()));
+        }
+        let before = head.len();
+        head.extend_from_slice(tls.rx.current());
+        let end = head.windows(4).position(|w| w == b"\r\n\r\n").map(|at| at + 4);
+        let taken = end.unwrap_or(head.len());
+        head.truncate(taken);
+        tls.rx.consume(taken - before);
+        if end.is_some() {
+            return Ok(head);
+        }
+        if head.len() > MAX_RESPONSE {
+            return Err(Error::Upgrade(format!("response head over {MAX_RESPONSE} B")));
         }
     }
 }
@@ -353,6 +423,7 @@ impl Wss {
                     self.tx.shutdown().await.map_err(Error::Send)?;
                     return Ok(None);
                 }
+                Err(WsError::Lower(e)) => return Err(self.tls_failed(e).await),
                 Err(e) => return Err(e.into()),
             };
             if let Some(p) = self.rx.take_pong() {
@@ -364,8 +435,17 @@ impl Wss {
                 return Ok(Some(m.expect("has_message_via found one")));
             }
             let frame = self.tcp.recv().await.map_err(Error::Recv)?;
-            self.rx.push_via(Frame(frame), &mut self.tx).map_err(Error::Tls)?;
+            if let Err(e) = self.rx.push_via(Frame(frame), &mut self.tx) {
+                return Err(self.tls_failed(e).await);
+            }
         }
+    }
+
+    /// A TLS receive error: sends the alert rustls queued for it (the lower layer's pending
+    /// record), best effort. FIN follows when the `Wss` is dropped.
+    async fn tls_failed(&mut self, e: TlsError) -> Error {
+        let _ = self.tx.flush().await;
+        Error::Tls(e)
     }
 
     /// Sends `payload` as one message, a TCP frame at a time.

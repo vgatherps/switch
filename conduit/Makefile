@@ -545,9 +545,9 @@ docker-autobahn: docker-autobahn-image
 # 192.0.2.1 on the tap netdev, writes tls-anvil/run/ready and starts one TLS connection per
 # trigger. Container A runs TLS-Anvil in C's network namespace, listening on port 8443; its
 # trigger script connects to the driver's trigger port 127.0.0.1:8090. Once A exits, `done`
-# stops the driver. Results in tls-anvil/run/results/, logs in tls-anvil/run/. Exit 0 iff
-# TLS-Anvil and the driver both exited 0 (TLS-Anvil's status says the run completed, not that
-# every test passed; see the report).
+# stops the driver. Results in tls-anvil/run/results/, logs in tls-anvil/run/. Then
+# tls-anvil/compare.py checks the report against tls-anvil/known-failures.txt. Exit 0 iff
+# TLS-Anvil and the driver both exited 0 and no test failed that is not a known failure.
 docker-tls-anvil:
 	@set -u; \
 	run=tls-anvil/run; c=zhida-tls-anvil-c-$$$$; a=zhida-tls-anvil-a-$$$$; \
@@ -583,4 +583,5 @@ docker-tls-anvil:
 	[ "$$($(DOCKER) inspect -f '{{.State.Running}}' $$c)" = true ] && driver="still running"; \
 	$(DOCKER) logs $$c > $$run/driver.log 2>&1; \
 	say "$$(( $$(date +%s) - start )) s, TLS-Anvil exit $$anvil, driver exit $$driver; results in $(CURDIR)/$$run/results"; \
-	[ "$$anvil" = 0 ] && [ "$$driver" = 0 ]
+	$(DOCKER_RUN) python3 tls-anvil/compare.py tls-anvil/known-failures.txt $$run/results; compare=$$?; \
+	[ "$$anvil" = 0 ] && [ "$$driver" = 0 ] && [ $$compare = 0 ]

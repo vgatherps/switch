@@ -640,6 +640,35 @@ Limits:
 - The host watchdog polls `docker inspect`; a Docker request that itself blocks (any
   `docker run`, `inspect`, `logs` or `rm`) is not bounded.
 
+## TLS-Anvil client tests (`make docker-tls-anvil`, not in `make test`)
+
+[TLS-Anvil](https://tls-anvil.com) (published image, pinned digest, amd64 so emulated on an arm64
+host) acts as TLS server and runs its client conformance tests against sheath: rustls (vendored,
+patched) through sheath's TLS layer over switchnet on net_tap. The driver,
+`sheath/examples/tls_anvil.rs`, opens one TLS 1.3 connection per trigger (handshake, a request,
+read until close_notify, close); TLS-Anvil shares its network namespace and triggers through
+127.0.0.1:8090.
+
+    make docker-tls-anvil DOCKER_TARGET_VOLUME=zhida-linux-target-tlsanvil
+
+About 17 min at `TLS_ANVIL_STRENGTH=1` (the default). `TLS_ANVIL_ARGS` passes more TLS-Anvil
+options, e.g. `-testPackage de.rub.nds.tlstest.suite.tests.client.tls13` for a subset.
+
+Reading the result:
+- The last lines come from `tls-anvil/compare.py`: `NEW FAILURE <id> <test>` for a failing test
+  missing from `tls-anvil/known-failures.txt` (the run fails), and `known failure no longer
+  fails` for a listed test that passed (the run does not fail; remove the line).
+- `tls-anvil/run/tls-anvil.log`: TLS-Anvil's summary (succeeded, failed, disabled per test).
+  TLS 1.2 and server tests show as disabled: the client offers TLS 1.3 only.
+- `tls-anvil/run/results/results/<id>/_testRun.json`: each test's cases, parameters and failure
+  reasons; a case's `DstPort` is the driver's local port 49152 + n.
+- `tls-anvil/run/driver.log`: one line per connection n, how it ended (the rustls error, if any).
+
+`known-failures.txt` lists tests that fail for reasons in rustls or ring, and, marked `OUR GAP`,
+one in sheath over switchnet: an alert lost when the socket is dropped with unread peer data
+(RST). It is kept per test, not per case: a test listed for some of its cases hides a new failure
+in its other cases. The RST cases are a race, so the set can vary between runs.
+
 ## Live Binance example (`make docker-binance`)
 
 `crates/binance-feed` subscribes to Binance's public `btcusdt@bookTicker` WebSocket stream over

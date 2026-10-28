@@ -8,8 +8,8 @@
 //! network namespace, opens a TCP connection there before each handshake. Then
 //! `<run-dir>/ready` is written. Each trigger starts one connection from 192.0.2.2 to
 //! 192.0.2.1:8443, after the previous one ended: the TLS handshake, a little application
-//! data, reading until close_notify, end of stream or an error, then sending a pending alert
-//! or close_notify, and FIN. Connection outcomes are printed, one line each; they do not fail
+//! data, reading until close_notify, then close_notify and FIN. On a TLS error sheath sends
+//! rustls's alert and FIN itself. Connection outcomes are printed, one line each; they do not fail
 //! the run, since TLS-Anvil expects rejections. Runs until `<run-dir>/done` exists, then
 //! prints a summary and exits 0; a setup or driver failure panics.
 
@@ -33,16 +33,15 @@ use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{
     DEFAULT_NEIGHBOR_CAPACITY, Offloads, Port, PortConfig, Stack, StackConfig, frame_reserve, rx_reserve,
 };
-use relay::{PlainRx, PlainTx};
+use relay::PlainRx;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use sheath::switchnet::{Frame, SwitchTx, Tls, send_bytes, tls_connect};
-use sheath::{TlsTx, TxError};
+use sheath::switchnet::{send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
-use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, Net, NetConfig, RecvError, SendError, tcp};
+use switchnet::{IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 use zhida_test_kit::{tap::TapVdev, with_eal};
@@ -63,8 +62,6 @@ const MAX_SOCKETS: usize = 512;
 const INGRESS_BUDGET: usize = 32;
 /// Runtime ticks are milliseconds since start; a connection is abandoned after this many.
 const CONNECTION_LIMIT_MS: u64 = 10_000;
-/// Room awaited for a record of our own (alert, close_notify: 24 B).
-const SMALL_RECORD: usize = 64;
 const ROUND_SLEEP: Duration = Duration::from_micros(50);
 /// How often the main loop looks for `<run-dir>/done`.
 const DONE_CHECK: Duration = Duration::from_millis(100);
@@ -159,41 +156,8 @@ fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> 
     future
 }
 
-/// Sends what `tx` holds from rustls (an alert after a receive error), then close_notify unless
-/// `alert_only`, then FIN.
-async fn finish(tx: &mut TlsTx<SwitchTx>, alert_only: bool) -> Result<(), TxError<SendError>> {
-    if tx.has_pending() {
-        tx.room(SMALL_RECORD).await?;
-        let f = tx.alloc().await?;
-        if let Some(sealed) = tx.take_pending(f)? {
-            send(tx, sealed).await?;
-        }
-    }
-    if !alert_only {
-        tx.room(SMALL_RECORD).await?;
-        let f = tx.alloc().await?;
-        if let Some(sealed) = tx.seal_close(f)? {
-            send(tx, sealed).await?;
-        }
-    }
-    tx.shutdown();
-    Ok(())
-}
-
-async fn send(tx: &mut TlsTx<SwitchTx>, mut sealed: <TlsTx<SwitchTx> as PlainTx>::Sealed) -> Result<(), TxError<SendError>> {
-    loop {
-        match tx.try_send(sealed) {
-            Ok(()) => return Ok(()),
-            Err(back) => {
-                sealed = back;
-                tx.room(SMALL_RECORD).await?;
-            }
-        }
-    }
-}
-
-/// One connection: handshake, request, read until the end, then the alert or close_notify, and
-/// FIN. Returns how it ended.
+/// One connection: handshake, request, read until close_notify, then close_notify and FIN.
+/// sheath sends the alert for a TLS error itself. Returns how the connection ended.
 async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfig>) -> String {
     let remote = IpEndpoint::new(ANVIL_ADDR.into(), ANVIL_PORT);
     let local = IpListenEndpoint { addr: None, port: local_port };
@@ -205,39 +169,26 @@ async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfi
         Ok(stream) => stream,
         Err(e) => return format!("TCP connect: {e:?}"),
     };
-    let Tls { mut rx, mut tx, mut tcp } = match tls_connect(handle, stream, config, HOST).await {
+    let mut tls = match tls_connect(handle, stream, config, HOST).await {
         Ok(tls) => tls,
         Err(e) => return format!("handshake: {e}"),
     };
-    if let Err(e) = send_bytes(&mut tx, REQUEST).await {
+    if let Err(e) = send_bytes(&mut tls.tx, REQUEST).await {
         return format!("send request: {e}");
     }
-    let end = loop {
-        let run = match rx.chunk(&mut tx) {
-            Ok(chunk) => chunk.map(|chunk| chunk.bytes.len()),
-            Err(e) => break Err(format!("receive: {e}")),
-        };
-        match run {
-            Some(n) => rx.consume(n),
-            None if rx.eof() => break Ok("close_notify"),
-            None => match tcp.recv().await {
-                Ok(frame) => {
-                    if let Err(e) = rx.push(Frame(frame), &mut tx) {
-                        break Err(format!("receive: {e}"));
-                    }
-                }
-                Err(RecvError::Finished) => break rx.fin(&mut tx).map(|()| "fin").map_err(|e| format!("end: {e}")),
-                Err(e) => break Err(format!("tcp receive: {e:?}")),
-            },
+    loop {
+        match tls.ready().await {
+            Ok(true) => {
+                let n = tls.rx.current().len();
+                tls.rx.consume(n);
+            }
+            Ok(false) => break,
+            Err(e) => return format!("receive: {e}"),
         }
-    };
-    // after an error only rustls's alert, if any, goes out; after close_notify ours too
-    let finished = finish(&mut tx, end.is_err()).await;
-    match (end, finished) {
-        (Ok(end), Ok(())) => format!("ended by {end}"),
-        (Ok(end), Err(e)) => format!("ended by {end}; closing: {e}"),
-        (Err(e), Ok(())) => e,
-        (Err(e), Err(closing)) => format!("{e}; closing: {closing}"),
+    }
+    match tls.close().await {
+        Ok(()) => "ended by close_notify".to_owned(),
+        Err(e) => format!("ended by close_notify; closing: {e}"),
     }
 }
 
