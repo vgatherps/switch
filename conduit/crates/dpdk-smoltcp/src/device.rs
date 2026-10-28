@@ -349,6 +349,7 @@ impl FrameTx<'_> {
     /// offload metadata. Panics, before writing anything, unless the frame is
     /// from this Stack's frame pool, unique, fits the frame capacity with its
     /// headers, and asks only for offloads in the port's profile.
+    #[inline(always)]
     fn write(&self, header: &TxHeader, frame: &TxBuf) {
         let port_id = self.port.port_id();
         assert!(

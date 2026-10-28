@@ -403,7 +403,9 @@ fn udp_dispatch_error(error: DispatchError) -> UdpSendError {
 }
 
 /// The generic emitters' header bytes for a datagram whose payload is not behind them: the
-/// UDP checksum covers the header words written here and `payload` where it lies.
+/// UDP checksum covers the header words written here and `payload` where it lies. `header` is
+/// 42 long and `udp_send_frame` checked that `ip_repr.payload_len` is the UDP length of
+/// `payload` and fits u16.
 fn emit_udp_header(
     header: &mut TxHeader,
     src_mac: EthernetAddress,
@@ -414,13 +416,8 @@ fn emit_udp_header(
     checksum_caps: &ChecksumCapabilities,
 ) {
     let bytes = header.bytes_mut();
-    assert_eq!(bytes.len(), UDP_FRAME_HEADER_LEN, "UDP frame header is not 42 bytes");
-    let udp_len = u16::try_from(ip_repr.payload_len).expect("UDP frame length exceeds 65535");
-    assert_eq!(
-        usize::from(udp_len),
-        UDP_HEADER_LEN + payload.len(),
-        "UDP frame header length does not match its payload"
-    );
+    debug_assert_eq!(ip_repr.payload_len, UDP_HEADER_LEN + payload.len());
+    let udp_len = ip_repr.payload_len as u16;
     let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
     frame.set_src_addr(src_mac);
     frame.set_dst_addr(dst_mac);

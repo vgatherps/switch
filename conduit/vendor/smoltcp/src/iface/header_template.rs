@@ -252,7 +252,9 @@ impl UdpTemplate {
     }
 
     /// `emit` for a payload that is not behind the headers: writes the 42 header bytes into
-    /// `header` and sums `payload` where it lies.
+    /// `header` (42 long) and sums `payload` where it lies. The caller checked that
+    /// `ip.payload_len` is the UDP length of `payload` (`Interface::udp_send_frame`).
+    #[inline]
     pub(crate) fn emit_header(
         &self,
         header: &mut TxHeader,
@@ -261,12 +263,7 @@ impl UdpTemplate {
         checksum: &ChecksumCapabilities,
     ) {
         let frame = header.bytes_mut();
-        assert_eq!(frame.len(), 42, "UDP frame header is not 42 bytes");
-        assert_eq!(
-            ip.payload_len,
-            8 + payload.len(),
-            "UDP frame header length does not match its payload"
-        );
+        debug_assert_eq!(ip.payload_len, 8 + payload.len());
         self.prefix.emit(frame, ip, checksum);
         let mut packet = UdpPacket::new_unchecked(&mut frame[34..]);
         let udp_len = ip.payload_len as u16;

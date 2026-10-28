@@ -1,10 +1,13 @@
 //! UDP datagram timings, Criterion group "udp", with one live Pair per case.
 //! A sends to B with software UDP checksums (csum) or zero UDP checksums
 //! (nocsum). Payloads are 64, 512 or 1472 bytes; bursts are 1, 8 or 32 frames.
-//! send times k udp_send_with calls, including payload writes, and one flush.
+//! send times k udp_send_with calls, including payload writes, and one flush:
+//! the app writes the payload straight into the TX packet.
+//! send_copy times the same payload writes into the app's own buffer, k
+//! `udp_send(&[u8])` calls that copy it into a TX packet, and one flush.
 //! send_frame times k `Stack::tx_frame` allocations, the same payload writes
 //! into each frame, k `udp_send_frame` calls (unique frames, published in
-//! place) and one flush; its receive side and checks are send's.
+//! place) and one flush. send_copy and send_frame share send's receive side and checks.
 //! recv times B's receive(now, k), k socket recv calls and each datagram's
 //! drop. Each read touches only the first payload byte and saves it for the
 //! untimed sequence check. Payloads have a one-byte sequence number, 0..k,
@@ -54,6 +57,7 @@ const PATTERN: u8 = 0xa5;
 #[derive(Clone, Copy)]
 enum Case {
     Send,
+    SendCopy,
     SendFrame,
     Recv,
 }
@@ -62,6 +66,7 @@ impl Case {
     fn name(self) -> &'static str {
         match self {
             Case::Send => "send",
+            Case::SendCopy => "send_copy",
             Case::SendFrame => "send_frame",
             Case::Recv => "recv",
         }
@@ -83,6 +88,32 @@ fn send_copies(
             payload.fill(PATTERN);
             payload[0] = sequence;
         });
+    }
+    let sent = pair.a.flush();
+    let send_elapsed = start.elapsed();
+    for result in &results[..sequences.len()] {
+        assert_eq!(*result, Ok(()));
+    }
+    (sent, send_elapsed)
+}
+
+/// k payload writes into the app's buffer, each copied by `udp_send`, then
+/// one flush, timed.
+fn send_slices(
+    pair: &mut Pair,
+    handle: &UdpHandle,
+    size: usize,
+    sequences: &[u8],
+) -> (Result<Sent, dpdk_smoltcp::StackError>, Duration) {
+    let to = Some(endpoint(Side::B));
+    let mut buffer = [0u8; 1472];
+    let mut results = [Ok(()); BURST];
+    let start = Instant::now();
+    for (result, &sequence) in results.iter_mut().zip(sequences) {
+        let payload = &mut buffer[..size];
+        payload.fill(PATTERN);
+        payload[0] = sequence;
+        *result = pair.a.udp_send(handle, to, black_box(&*payload));
     }
     let sent = pair.a.flush();
     let send_elapsed = start.elapsed();
@@ -273,12 +304,13 @@ fn iteration(
     let now = pair.now();
     let (sent, send_elapsed) = match case {
         Case::SendFrame => send_frames(pair, &handles[0], size, sequences),
+        Case::SendCopy => send_slices(pair, &handles[0], size, sequences),
         Case::Send | Case::Recv => send_copies(pair, &handles[0], size, sequences),
     };
     assert_sent(sent.unwrap(), k);
     forward(pair, size, mode, k);
     let elapsed = match case {
-        Case::Send | Case::SendFrame => {
+        Case::Send | Case::SendCopy | Case::SendFrame => {
             assert_turn(pair.b.receive(now, k).unwrap(), k, 0);
             for &sequence in sequences {
                 let datagram = pair.b.udp_mut(&handles[1]).recv().unwrap();
@@ -315,10 +347,12 @@ fn iteration(
 fn benches(c: &mut Criterion) {
     with_eal(|eal| {
         let mut group = c.benchmark_group("udp");
-        for case in [Case::Send, Case::SendFrame, Case::Recv] {
+        for case in [Case::Send, Case::SendCopy, Case::SendFrame, Case::Recv] {
             for size in [64, 512, 1472] {
                 let modes: &[Mode] = match case {
-                    Case::Send | Case::SendFrame => &[Mode::Csum, Mode::Nocsum, Mode::Offload],
+                    Case::Send | Case::SendCopy | Case::SendFrame => {
+                        &[Mode::Csum, Mode::Nocsum, Mode::Offload]
+                    }
                     Case::Recv => &[Mode::Csum, Mode::Nocsum],
                 };
                 for &mode in modes {
