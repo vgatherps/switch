@@ -5,21 +5,23 @@
 //! base (64 KiB aligned)    base + data_off
 //! | Meta (64 B) | pad |    slot 0 | slot 1 | ... | slot n-1 |    each slot: TaskHeader, future
 //! ```
-//! Every header masks to its block's `Meta` with one global constant. Blocks are
-//! never freed and never change function or thread.
+//! Every header masks to its block's `Meta` with one global constant. A block
+//! belongs to one runtime pool for good: its metadata is written once, when the
+//! pool allocates it. Blocks are never freed, so a waker always points at valid
+//! memory; a dropped runtime's blocks are leaked by design.
 
 use std::alloc::{self, Layout};
-use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, MaybeUninit, align_of, size_of};
 use std::pin::Pin;
 use std::ptr::{addr_of, addr_of_mut};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU16, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use super::header::TaskHeader;
 use super::pool::RuntimePool;
 use crate::executor::Executor;
+use crate::remote::Mailbox;
 
 pub(crate) const BLOCK: usize = 64 * 1024;
 pub(crate) const MASK: usize = !(BLOCK - 1);
@@ -28,25 +30,36 @@ const META: usize = 64;
 pub(crate) type PollFn = unsafe fn(*const TaskHeader) -> Poll<()>;
 pub(crate) type DropFn = unsafe fn(*const TaskHeader);
 
-/// Block metadata, one cache line at the block base. Nothing forms `&Meta`:
-/// fields are reached by raw projection, because a foreign thread may read
-/// `owner` while the owner thread writes the `Cell`s.
+/// Block metadata, one cache line at the block base, written once before the
+/// block is used. Nothing forms `&Meta`: fields are reached by raw projection.
 #[repr(C, align(64))]
 pub(crate) struct Meta {
-    /// Thread tag of the creating thread; the only field a foreign thread reads.
+    /// Thread tag of the creating thread. A foreign thread reads only this and
+    /// `mailbox`, both written before the block's first task existed.
     owner: AtomicU16,
     data_off: u16,
     stride: u32,
     /// Slots in this block.
     slots: u32,
     /// Ordinal of this block in its runtime pool.
-    block: Cell<u32>,
-    /// Runtime this block is assigned to; null while spare.
-    executor: Cell<*mut Executor>,
-    pool: Cell<*mut RuntimePool>,
+    block: u32,
+    /// The block's runtime and pool. They dangle once that runtime is dropped,
+    /// so they are read only where the runtime is alive: by the wake path after
+    /// its LIVE check, and by `RuntimePool::release` on a reserved slot of a live
+    /// executor. Shutdown clears every slot's flags before the executor is freed.
+    executor: *mut Executor,
+    pool: *mut RuntimePool,
     poll: PollFn,
     drop: DropFn,
+    /// The previously allocated block: every block stays reachable from
+    /// [`BLOCKS`] (for leak checkers), since none is ever freed.
+    next: *mut Meta,
+    /// The runtime's mailbox for `RemoteWaker`s; never freed.
+    mailbox: *const Mailbox,
 }
+
+/// The most recently allocated block, heading the list of all blocks.
+static BLOCKS: AtomicPtr<Meta> = AtomicPtr::new(std::ptr::null_mut());
 
 const _: () = assert!(size_of::<Meta>() == META);
 
@@ -120,9 +133,15 @@ pub(crate) struct BlockSpec {
 }
 
 impl BlockSpec {
-    /// Allocate a block owned by the calling thread, all slots free (zeroed
-    /// headers: no flags). Never freed.
-    pub(crate) fn allocate(&self) -> *mut Meta {
+    /// Allocate block number `block` of `pool` in `executor`, owned by the
+    /// calling thread, all slots free (zeroed headers: no flags). Never freed.
+    pub(crate) fn allocate(
+        &self,
+        executor: *mut Executor,
+        mailbox: *const Mailbox,
+        pool: *mut RuntimePool,
+        block: u32,
+    ) -> *mut Meta {
         // Before allocating: issuing the thread's first tag may panic.
         let owner = crate::waker::this_thread_tag();
         let layout = Layout::from_size_align(BLOCK, BLOCK).unwrap();
@@ -136,13 +155,23 @@ impl BlockSpec {
                 data_off: self.data_off,
                 stride: self.stride,
                 slots: self.slots,
-                block: Cell::new(0),
-                executor: Cell::new(std::ptr::null_mut()),
-                pool: Cell::new(std::ptr::null_mut()),
+                block,
+                executor,
+                pool,
                 poll: self.poll,
                 drop: self.drop,
+                next: std::ptr::null_mut(),
+                mailbox,
             });
-            meta
+            let mut head = BLOCKS.load(Ordering::Relaxed);
+            loop {
+                addr_of_mut!((*meta).next).write(head);
+                match BLOCKS.compare_exchange_weak(head, meta, Ordering::Release, Ordering::Relaxed)
+                {
+                    Ok(_) => return meta,
+                    Err(current) => head = current,
+                }
+            }
         }
     }
 }
@@ -193,22 +222,36 @@ impl Meta {
     /// # Safety
     /// Owner thread.
     #[inline(always)]
-    pub(crate) unsafe fn block<'a>(this: *mut Self) -> &'a Cell<u32> {
-        unsafe { &*addr_of!((*this).block) }
+    pub(crate) unsafe fn block(this: *mut Self) -> u32 {
+        unsafe { *addr_of!((*this).block) }
     }
 
+    /// Dangles once the block's runtime is dropped (see [`Meta`]).
+    ///
     /// # Safety
     /// Owner thread.
     #[inline(always)]
-    pub(crate) unsafe fn executor<'a>(this: *mut Self) -> &'a Cell<*mut Executor> {
-        unsafe { &*addr_of!((*this).executor) }
+    pub(crate) unsafe fn executor(this: *mut Self) -> *mut Executor {
+        unsafe { *addr_of!((*this).executor) }
     }
 
+    /// Dangles once the block's runtime is dropped (see [`Meta`]).
+    ///
     /// # Safety
     /// Owner thread.
     #[inline(always)]
-    pub(crate) unsafe fn pool<'a>(this: *mut Self) -> &'a Cell<*mut RuntimePool> {
-        unsafe { &*addr_of!((*this).pool) }
+    pub(crate) unsafe fn pool(this: *mut Self) -> *mut RuntimePool {
+        unsafe { *addr_of!((*this).pool) }
+    }
+
+    /// Never dangles: mailboxes are never freed. Safe from any thread that got
+    /// a header of this block after the block's first task existed.
+    ///
+    /// # Safety
+    /// `this` is a block base.
+    #[inline(always)]
+    pub(crate) unsafe fn mailbox(this: *mut Self) -> *const Mailbox {
+        unsafe { *addr_of!((*this).mailbox) }
     }
 
     /// # Safety
@@ -226,14 +269,16 @@ impl Meta {
     }
 }
 
-/// A standalone block for unit tests of type-erased code; freed on drop.
+/// A standalone block for unit tests of type-erased code, in no runtime.
 #[cfg(test)]
 pub(crate) struct TestBlock(*mut Meta);
 
 #[cfg(test)]
 impl TestBlock {
     pub(crate) fn new() -> Self {
-        Self(Shape::<std::future::Pending<()>>::SPEC.allocate())
+        let spec = &Shape::<std::future::Pending<()>>::SPEC;
+        use std::ptr::{null, null_mut};
+        Self(spec.allocate(null_mut(), null(), null_mut(), 0))
     }
 
     /// A LIVE task header at `position`.
@@ -244,14 +289,6 @@ impl TestBlock {
             TaskHeader::flags(header).set(super::header::LIVE);
             header
         }
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestBlock {
-    fn drop(&mut self) {
-        let layout = Layout::from_size_align(BLOCK, BLOCK).unwrap();
-        unsafe { alloc::dealloc(self.0.cast(), layout) }
     }
 }
 

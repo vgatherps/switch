@@ -6,6 +6,8 @@ use std::task::{Context, Poll, Waker};
 
 #[path = "clock_tests.rs"]
 mod clock_tests;
+#[path = "drain_tests.rs"]
+mod drain_tests;
 
 #[switch::task]
 async fn empty() {}
@@ -199,7 +201,7 @@ fn panicked_core_rejects_submission_and_still_shuts_down() {
 }
 
 #[test]
-fn nested_spawner_grows_queues_without_repolling_current_batch() {
+fn nested_spawner_grows_queues_and_spawned_tasks_run_in_the_next_round() {
     let mut runtime = Runtime::with_capacity(
         9,
         Capacity {
@@ -220,12 +222,11 @@ fn nested_spawner_grows_queues_without_repolling_current_batch() {
         .unwrap();
     spawner.spawn(empty()).unwrap();
     let root = core(&runtime);
-    assert_eq!(runtime.poll(9).unwrap().tasks_polled, 2);
-    assert_eq!(count.get(), 0);
-    unsafe {
-        assert_eq!(Executor::task_count(root), DEFAULT_CAPACITY * 3);
-    }
-    assert_eq!(runtime.poll(9).unwrap().tasks_polled, DEFAULT_CAPACITY * 3);
+    // Round one polls the two spawned tasks, round two the tasks spawned in it.
+    assert_eq!(
+        runtime.poll(9).unwrap().tasks_polled,
+        2 + DEFAULT_CAPACITY * 3
+    );
     assert_eq!(count.get(), DEFAULT_CAPACITY * 3);
     unsafe {
         assert_eq!(Executor::task_count(root), 0);

@@ -8,7 +8,7 @@
 8446-i9pq4Yt8pz RecordProtocol.acceptsOptionalPadding: RSA-1024 server key rejected by ring
 8446-jVohiUKi4u HappyFlow.happyFlow: RSA-1024 server key rejected by ring
 8701-91tcbyhyNk ServerInitiatedExtensionPoints.advertiseGreaseExtensionsInSessionTicket: RSA-1024 server key rejected by ring
-8446-oysw9PbeiT SupportedVersions.invalidLegacyVersion: RSA-1024 server key rejected by ring; and our alert arrives, then our RST (close with unread peer data) fails TLS-Anvil's own send (seen on the wire)
+8446-oysw9PbeiT SupportedVersions.invalidLegacyVersion: RSA-1024 server key rejected by ring; and our alert arrives, then our RST (we close with the server's data unread, as Linux close() does) fails TLS-Anvil's own send (seen on the wire)
 #
 # rustls sends its KeyUpdate reply only in front of the next application data record
 # (RFC 8446 4.6.3 allows that); TLS-Anvil expects it at once.
@@ -24,12 +24,3 @@ XSM-2iKDTUhXF5 StateMachine.sendHandshakeTrafficSecretEncryptedChangeCipherSpec:
 #
 # rustls accepts a zero-length handshake record (up to 32 consecutive empty fragments).
 8446-2R6GNvoUEs RecordLayer.zeroLengthRecord_Finished: zero-length handshake record before Finished accepted by rustls
-#
-# OUR GAP (sheath over switchnet, not upstream): rustls rejects the server's message mid-flight
-# and sheath queues the alert and FIN, then drops the socket. Frames leave at the Net's next
-# turn, but conduit acts on the drop first: with peer data unread it aborts (RST, as Linux
-# close() does) and the queued alert and FIN never leave (seen on the wire). A race.
-8446-X68SWFRBVS EncryptedExtensions.sendSupportedVersionsExtensionInEE: OUR GAP alert lost: socket dropped with unread peer data aborts (RST) before the queued alert/FIN leaves
-8446-guYpWN18yk Extensions.sendAdditionalExtension: OUR GAP alert lost: socket dropped with unread peer data aborts (RST) before the queued alert/FIN leaves
-8446-m6iEnsoJCw RecordLayer.sendEmptyZeroLengthRecords: OUR GAP alert lost: socket dropped with unread peer data aborts (RST) before the queued alert/FIN leaves
-8701-pVCWxJraM8 ServerInitiatedExtensionPoints.sendEncryptedExtensionsGreaseExtension: OUR GAP alert lost: socket dropped with unread peer data aborts (RST) before the queued alert/FIN leaves

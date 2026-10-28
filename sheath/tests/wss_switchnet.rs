@@ -25,7 +25,7 @@ use relay::Kind;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use sheath::switchnet::{Error as WssError, Tls, Wss, connect, tls_connect};
+use sheath::switchnet::{Error as WssError, Tls as ClientTls, Wss, connect, tls_connect};
 use switch::Runtime;
 use switchnet::{IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
@@ -112,11 +112,13 @@ fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     (Arc::new(server), Arc::new(client))
 }
 
-/// Runs the server's TLS handshake and WebSocket upgrade on the accepted `stream`.
-fn accept(stream: std::net::TcpStream, config: Arc<ServerConfig>) -> ServerWs {
-    let tls = StreamOwned::new(ServerConnection::new(config).unwrap(), stream);
+type Tls = StreamOwned<ServerConnection, std::net::TcpStream>;
+
+/// The WebSocket upgrade, server side; checks the client's path and Host.
+fn upgrade(tls: Tls) -> ServerWs {
     tungstenite::accept_hdr(tls, |request: &tungstenite::handshake::server::Request, response| {
         assert_eq!(request.uri().path(), PATH);
+        assert_eq!(request.headers()["Host"], format!("{HOST}:{SERVER_PORT}").as_str());
         Ok(response)
     })
     .expect("server WebSocket handshake")
@@ -216,19 +218,19 @@ fn run<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     })
 }
 
-/// `run` with a wss server, which runs `serve` on the upgraded WebSocket, and a wss client,
-/// which runs `client` on the connected `Wss` and hands it back.
+/// `run` with a TLS server, which runs `serve` on the accepted TLS stream (handshake on its first
+/// read), and a wss client, which runs `client` on the connected `Wss` and hands it back.
 fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
     listener_setup: impl FnOnce(&TcpListener),
-    serve: impl FnOnce(ServerWs) -> T + Send + 'static,
+    serve: impl FnOnce(Tls) -> T + Send + 'static,
     client: impl FnOnce(Wss) -> F + 'static,
     each_round: impl FnMut(),
 ) -> T {
     run(
         listener_setup,
-        |stream, config| serve(accept(stream, config)),
+        |stream, config| serve(StreamOwned::new(ServerConnection::new(config).unwrap(), stream)),
         |handle, stream, config| async move {
-            let wss = connect(&handle, stream, config, HOST, PATH).await.expect("wss connect");
+            let wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH).await.expect("wss connect");
             client(wss).await
         },
         each_round,
@@ -287,7 +289,7 @@ async fn close(wss: &mut Wss) {
 fn thousand_mixed_messages_echo_in_order() {
     let echoed = wss_run(
         |_| {},
-        echo,
+        |tls| echo(upgrade(tls)),
         |mut wss| async move {
             for i in 0..1000 {
                 let sent = text(i, message_len(i));
@@ -306,7 +308,7 @@ fn thousand_mixed_messages_echo_in_order() {
 fn message_larger_than_a_frame_echoes() {
     let echoed = wss_run(
         |_| {},
-        echo,
+        |tls| echo(upgrade(tls)),
         |mut wss| async move {
             let sent: Vec<u8> = (0..64 * 1024).map(|i| (i * 31 % 251) as u8).collect();
             wss.send(Kind::Binary, &sent).await.expect("send");
@@ -326,7 +328,8 @@ fn message_larger_than_a_frame_echoes() {
 fn server_ping_is_answered_inside_recv() {
     let pong = wss_run(
         |_| {},
-        |mut ws| {
+        |tls| {
+            let mut ws = upgrade(tls);
             ws.write(Message::Ping(b"hb".to_vec().into())).unwrap();
             ws.write(Message::Text("after the ping".into())).unwrap();
             ws.flush().unwrap();
@@ -357,7 +360,8 @@ fn server_ping_is_answered_inside_recv() {
 fn client_close_reaches_the_server_as_close_close_notify_fin() {
     let close_frame = wss_run(
         |_| {},
-        |mut ws| {
+        |tls| {
+            let mut ws = upgrade(tls);
             let frame = match ws.read() {
                 Ok(Message::Close(frame)) => frame,
                 other => panic!("expected the close: {other:?}"),
@@ -384,7 +388,8 @@ fn client_close_reaches_the_server_as_close_close_notify_fin() {
 fn server_close_ends_recv_cleanly() {
     let echo = wss_run(
         |_| {},
-        |mut ws| {
+        |tls| {
+            let mut ws = upgrade(tls);
             ws.close(Some(CloseFrame { code: CloseCode::Away, reason: "bye".into() })).unwrap();
             let echo = match ws.read() {
                 Ok(Message::Close(frame)) => frame,
@@ -433,7 +438,8 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
             };
             assert_eq!(rc, 0, "set SO_RCVBUF");
         },
-        move |mut ws| {
+        move |tls| {
+            let mut ws = upgrade(tls);
             go_rx.recv_timeout(LIMIT).expect("the go signal");
             let mut received = 0;
             while received < MESSAGES {
@@ -474,17 +480,29 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
     assert_eq!(received, MESSAGES);
 }
 
-/// Everything the client sends until FIN, given to the server's `conn`; returns the error the
-/// server's rustls saw (the client's alert) and the bytes read.
-fn read_alert_then_fin(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) -> (rustls::Error, usize) {
+/// Bytes the server sends after the record the client rejects: still unread when the client
+/// drops its socket, which then aborts with RST (as Linux `close()` does).
+const TRAILING: usize = 16 * 1024;
+
+/// Everything the client sends until its FIN or RST, given to the server's `conn`; returns the
+/// error the server's rustls saw (the client's alert, if it got out before an RST).
+fn read_alert(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) -> Result<(), rustls::Error> {
     let mut sent = Vec::new();
-    stream.read_to_end(&mut sent).expect("read the client's records until FIN");
+    let mut buf = [0; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => sent.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("read the client's records: {e}"),
+        }
+    }
     let mut rest = &sent[..];
     while !rest.is_empty() {
         conn.read_tls(&mut rest).expect("buffer the client's records");
     }
-    let error = conn.process_new_packets().expect_err("the client's alert");
-    (error, sent.len())
+    conn.process_new_packets().map(|_| ())
 }
 
 /// Runs the server handshake until it has its first flight to write; returns that flight.
@@ -500,19 +518,24 @@ fn server_flight(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) 
     flight
 }
 
+const BAD_RECORD_MAC: Result<(), rustls::Error> =
+    Err(rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
+
 /// The server's handshake flight arrives with its last record (the one carrying Finished)
-/// corrupted: rustls rejects it, and `tls_connect` sends rustls's bad_record_mac alert, then
-/// FIN, before returning the error.
+/// corrupted, and more data behind it. rustls rejects the record; `tls_connect` sends rustls's
+/// bad_record_mac alert and FIN, and they reach the server before the RST that dropping the
+/// socket with the trailing data unread causes.
 #[zhida_test_support::pinned_test]
-fn rejected_handshake_sends_the_alert_then_fin() {
-    let (seen, read) = run(
+fn rejected_handshake_sends_the_alert_before_the_rst() {
+    let seen = run(
         |_| {},
         |mut stream, config| {
             let mut conn = ServerConnection::new(config).unwrap();
             let mut flight = server_flight(&mut conn, &mut stream);
             *flight.last_mut().unwrap() ^= 1;
+            flight.resize(flight.len() + TRAILING, 0);
             stream.write_all(&flight).unwrap();
-            read_alert_then_fin(&mut conn, &mut stream)
+            read_alert(&mut conn, &mut stream)
         },
         |handle, stream, config| async move {
             match tls_connect(&handle, stream, config, HOST).await {
@@ -523,14 +546,14 @@ fn rejected_handshake_sends_the_alert_then_fin() {
         },
         || {},
     );
-    assert!(read > 0);
-    assert_eq!(seen, rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
+    assert_eq!(seen, BAD_RECORD_MAC);
 }
 
-/// A corrupted application data record after the handshake: `Tls::ready` returns the error
-/// after sending rustls's alert and FIN (the client still holds the connection then).
+/// A corrupted application data record after the handshake, with more data behind it:
+/// `Tls::ready` returns the error after the alert and FIN went out, so the client may drop the
+/// connection at once.
 #[zhida_test_support::pinned_test]
-fn receive_error_after_the_handshake_sends_the_alert_then_fin() {
+fn receive_error_after_the_handshake_sends_the_alert_before_the_rst() {
     let seen = run(
         |_| {},
         |mut stream, config| {
@@ -544,45 +567,87 @@ fn receive_error_after_the_handshake_sends_the_alert_then_fin() {
                 conn.write_tls(&mut record).unwrap();
             }
             *record.last_mut().unwrap() ^= 1;
+            record.resize(record.len() + TRAILING, 0);
             stream.write_all(&record).unwrap();
-            read_alert_then_fin(&mut conn, &mut stream).0
+            read_alert(&mut conn, &mut stream)
         },
         |handle, stream, config| async move {
-            let mut tls: Tls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
+            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
             match tls.ready().await {
                 Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 other => panic!("unexpected {other:?}"),
             }
-            tls
         },
         || {},
     );
-    assert_eq!(seen, rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
+    assert_eq!(seen, BAD_RECORD_MAC);
 }
 
-/// A record that fails authentication after the upgrade: `Wss::recv` returns the error after
-/// sending rustls's alert.
+/// A record that fails authentication after the upgrade, with more data behind it: `Wss::recv`
+/// returns the error after the alert went out, so the client may drop the `Wss` at once.
 #[zhida_test_support::pinned_test]
-fn wss_receive_error_sends_the_alert() {
-    let seen = wss_run(
+fn wss_receive_error_sends_the_alert_before_the_rst() {
+    let seen = run(
         |_| {},
-        |mut ws| {
+        |stream, config| {
+            let mut ws = upgrade(StreamOwned::new(ServerConnection::new(config).unwrap(), stream));
             let tls = ws.get_mut();
-            tls.sock.write_all(&[0x17, 0x03, 0x03, 0x00, 0x20]).unwrap();
-            tls.sock.write_all(&[0; 32]).unwrap();
-            let mut byte = [0; 1];
-            let error = tls.read(&mut byte).expect_err("the client's alert");
-            error.into_inner().and_then(|e| e.downcast::<rustls::Error>().ok()).map(|e| *e)
+            let mut junk = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+            junk.resize(junk.len() + 32 + TRAILING, 0);
+            tls.sock.write_all(&junk).unwrap();
+            read_alert(&mut tls.conn, &mut tls.sock)
         },
-        |mut wss| async move {
+        |handle, stream, config| async move {
+            let mut wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH).await.expect("wss connect");
             match wss.recv().await {
                 Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 Err(e) => panic!("unexpected error {e}"),
                 Ok(_) => panic!("a message from a corrupted record"),
             }
+        },
+        || {},
+    );
+    assert_eq!(seen, BAD_RECORD_MAC);
+}
+
+/// The server writes its 101 response and a first text frame in one write (one TLS record):
+/// the bytes after the response head reach the client as that message.
+#[zhida_test_support::pinned_test]
+fn message_in_the_same_record_as_the_upgrade_response() {
+    let echoed = wss_run(
+        |_| {},
+        |mut tls| {
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                assert_eq!(tls.read(&mut byte).expect("read the upgrade request"), 1);
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let key = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                .expect("the client sends a key");
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            let mut out = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .into_bytes();
+            out.extend_from_slice(&[0x81, 5]);
+            out.extend_from_slice(b"first");
+            tls.write_all(&out).unwrap();
+            tls.flush().unwrap();
+            echo(tungstenite::WebSocket::from_raw_socket(tls, tungstenite::protocol::Role::Server, None))
+        },
+        |mut wss| async move {
+            assert_eq!(recv_text(&mut wss).await, "first");
+            wss.send(Kind::Text, b"second").await.expect("send");
+            assert_eq!(recv_text(&mut wss).await, "second");
+            close(&mut wss).await;
             wss
         },
         || {},
     );
-    assert_eq!(seen, Some(rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac)));
+    assert_eq!(echoed, 1);
 }

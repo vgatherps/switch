@@ -12,6 +12,8 @@ use std::mem::ManuallyDrop;
 
 use crate::__private::Task;
 use crate::intrusive::NIL;
+use crate::oneshot::Sender;
+use crate::remote::Mailbox;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
@@ -29,18 +31,26 @@ pub(crate) enum Lifecycle {
     Closing,
 }
 
+/// Most task polls in one `Runtime::poll`, checked between rounds.
+pub(crate) const POLL_BUDGET: usize = 1024;
+
 /// Single-threaded executor.
 ///
-/// Two-vector swap model: wakes go to `incoming`, we iterate `run_queue`,
-/// then swap at end of poll. Simple iteration, no VecDeque overhead.
+/// Three queues: wakes go to `incoming`, deferred wakes to `deferred` (moved to
+/// the front of `incoming` when a `Runtime::poll` starts), and each round swaps
+/// `incoming` into `run_queue` and polls it. Simple iteration, no VecDeque.
 pub struct Executor {
     /// Tasks to poll this cycle, by header.
     run_queue: Vec<*const TaskHeader>,
     /// Incoming wakes (spawns and wakes during poll).
     incoming: Vec<*const TaskHeader>,
+    /// Tasks woken with `StoredWaker::wake_deferred`; moved into `incoming` at
+    /// the start of the next `Runtime::poll`.
+    deferred: Vec<*const TaskHeader>,
     /// Number of live tasks.
     task_count: usize,
-    /// Slots in use; both queues keep at least this capacity.
+    /// Slots in use; all three queues keep at least this capacity (every slot
+    /// has at most one queue entry), so queue pushes never reallocate.
     allocated: usize,
     /// One pool per task function this executor has spawned.
     pools: Vec<*mut RuntimePool>,
@@ -51,6 +61,8 @@ pub struct Executor {
     /// The task being polled, for `Sleep`; null between polls.
     pub(crate) current: *const TaskHeader,
     pub(crate) timers: TimerStore,
+    /// Wake requests from other threads; outlives this executor.
+    mailbox: *const Mailbox,
 }
 
 impl Executor {
@@ -62,6 +74,7 @@ impl Executor {
         Self {
             run_queue: Vec::with_capacity(tasks),
             incoming: Vec::with_capacity(tasks),
+            deferred: Vec::with_capacity(tasks),
             task_count: 0,
             allocated: 0,
             pools: Vec::new(),
@@ -70,7 +83,14 @@ impl Executor {
             lifecycle: Lifecycle::Open,
             current: std::ptr::null(),
             timers: TimerStore::new(initial_tick, timers),
+            mailbox: Mailbox::create(),
         }
+    }
+
+    /// Stable owner-thread pointer to a live executor.
+    #[inline(always)]
+    pub(crate) unsafe fn mailbox(this: *mut Self) -> *const Mailbox {
+        unsafe { (*this).mailbox }
     }
 
     /// Stable owner-thread pointer to a live executor.
@@ -83,9 +103,13 @@ impl Executor {
         unsafe { (*this).spawning }
     }
 
-    /// Reject new work and turns ahead of a deferred cleanup. Stable owner-thread pointer.
+    /// Reject new work, turns and remote wakes ahead of a deferred cleanup.
+    /// Stable owner-thread pointer.
     pub(crate) unsafe fn close(this: *mut Self) {
-        unsafe { (*this).lifecycle = Lifecycle::Closing }
+        unsafe {
+            (*this).lifecycle = Lifecycle::Closing;
+            Mailbox::close((*this).mailbox);
+        }
     }
 
     /// Spawn a task; gives the token back when its function's capacity is used up.
@@ -95,10 +119,14 @@ impl Executor {
     pub unsafe fn spawn<T: Task>(
         this: *mut Self,
         token: SpawnToken<T>,
+        join: Option<Sender<T::Output>>,
     ) -> Result<(), SpawnToken<T>> {
         unsafe {
             assert!((*this).lifecycle == Lifecycle::Open, "executor unavailable");
-            crate::task::private::spawn_in(token.into_payload(), this).map_err(SpawnToken::new)
+            token
+                .into_payload()
+                .spawn_in(this, join)
+                .map_err(SpawnToken::new)
         }
     }
 
@@ -119,7 +147,11 @@ impl Executor {
                 .allocated
                 .checked_add(1)
                 .expect("task count overflow");
-            for queue in [&mut (*this).run_queue, &mut (*this).incoming] {
+            for queue in [
+                &mut (*this).run_queue,
+                &mut (*this).incoming,
+                &mut (*this).deferred,
+            ] {
                 if queue.capacity() < needed {
                     queue.reserve(needed - queue.len());
                 }
@@ -159,9 +191,9 @@ impl Executor {
             if current & (LIVE | QUEUED) != LIVE {
                 return;
             }
-            // A LIVE slot's executor is alive: cleanup clears LIVE on every slot
-            // before the executor is freed.
-            let this = Meta::executor(TaskHeader::meta(header)).get();
+            // A LIVE slot's executor is alive: cleanup clears every slot's flags
+            // before the executor is freed, after which `Meta::executor` dangles.
+            let this = Meta::executor(TaskHeader::meta(header));
             if (*this).lifecycle != Lifecycle::Open {
                 return;
             }
@@ -170,6 +202,45 @@ impl Executor {
         }
     }
 
+    /// As [`Self::wake`], into `deferred`: the task runs in the next poll.
+    ///
+    /// # Safety
+    /// Owner thread; `header` heads a slot of a block.
+    #[inline]
+    pub(crate) unsafe fn wake_deferred(header: *const TaskHeader) {
+        unsafe {
+            let flags = TaskHeader::flags(header);
+            let current = flags.get();
+            if current & (LIVE | QUEUED) != LIVE {
+                return;
+            }
+            let this = Meta::executor(TaskHeader::meta(header));
+            if (*this).lifecycle != Lifecycle::Open {
+                return;
+            }
+            flags.set(current | QUEUED);
+            (*this).deferred.push(header);
+        }
+    }
+
+    /// Move deferred wakes into `incoming`, at the start of a poll.
+    ///
+    /// # Safety
+    /// Stable owner-thread pointer to a live executor.
+    #[inline]
+    pub(crate) unsafe fn undefer(this: *mut Self) {
+        unsafe {
+            if !(*this).deferred.is_empty() {
+                // Deferred wakes came first (during the last poll): they run first.
+                // Every slot has at most one queue entry: no reallocation.
+                (*this).deferred.append(&mut (*this).incoming);
+                std::mem::swap(&mut (*this).deferred, &mut (*this).incoming);
+            }
+        }
+    }
+
+    /// Poll one round (one snapshot of `incoming`), for tests of round order.
+    ///
     /// # Safety
     /// Stable owner-thread pointer; no active turn/cleanup; executor accepts work.
     #[cfg(test)]
@@ -179,10 +250,11 @@ impl Executor {
             if (*this).incoming.is_empty() {
                 return false;
             }
-            let mut turn = Self::enter_turn(this);
-            let report = Self::poll_batch(&mut turn);
+            let turn = Self::enter_turn(this);
+            let mut report = BatchReport::default();
+            Self::poll_round(this, &mut report);
             turn.finish();
-            report.queue_work
+            true
         }
     }
 
@@ -206,15 +278,28 @@ impl Executor {
         }
     }
 
+    /// Poll rounds: each round polls a snapshot of `incoming`, and another round
+    /// follows while `incoming` is not empty and fewer than [`POLL_BUDGET`] polls
+    /// were made (the budget never cuts a round short).
+    ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
     pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> BatchReport {
         unsafe {
             let this = turn.owner;
             let mut report = BatchReport::default();
-            if (*this).incoming.is_empty() {
-                return report;
+            while !(*this).incoming.is_empty() && report.polled < POLL_BUDGET {
+                Self::poll_round(this, &mut report);
             }
-            report.queue_work = true;
+            report
+        }
+    }
+
+    /// Poll one snapshot of `incoming`.
+    ///
+    /// # Safety
+    /// As for [`Self::poll_batch`].
+    unsafe fn poll_round(this: *mut Self, report: &mut BatchReport) {
+        unsafe {
             std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
             let batch_len = (*this).run_queue.len();
             let mut cursor = 0;
@@ -242,7 +327,6 @@ impl Executor {
                 }
             }
             (*this).run_queue.clear();
-            report
         }
     }
 
@@ -268,6 +352,7 @@ impl Executor {
             (*this)
                 .incoming
                 .iter()
+                .chain(&(*this).deferred)
                 .filter(|&&header| TaskHeader::is_live(header))
                 .count()
         }
@@ -306,8 +391,10 @@ impl Executor {
             );
             let turn = Self::enter_turn(this);
             (*this).lifecycle = Lifecycle::Closing;
+            Mailbox::close((*this).mailbox);
             (*this).run_queue.clear();
             (*this).incoming.clear();
+            (*this).deferred.clear();
             // No spawn succeeds while Closing, and no reservation is open.
             for header in Self::slots(this) {
                 if TaskHeader::flags(header).get() & TAKEN != 0 {
@@ -331,8 +418,10 @@ impl Executor {
                     Meta::drop_fn(TaskHeader::meta(header))(header);
                 }
             }
+            // Every slot's flags are now clear, so wakes of the leaked blocks
+            // stop at the flags check and never read the freed executor or pool.
             for pool in std::mem::take(&mut (*this).pools) {
-                RuntimePool::retire(pool);
+                RuntimePool::free(pool);
             }
             turn.finish();
         }
@@ -357,7 +446,6 @@ impl Executor {
 pub(crate) struct BatchReport {
     pub(crate) polled: usize,
     pub(crate) completed: usize,
-    pub(crate) queue_work: bool,
 }
 
 pub(crate) struct TurnGuard {
@@ -454,23 +542,7 @@ impl Default for Executor {
 mod tests {
     use crate::runtime::Runtime;
     use std::cell::Cell;
-    use std::pin::Pin;
     use std::rc::Rc;
-    use std::task::{Context, Poll};
-
-    struct YieldN(u32);
-    impl Future for YieldN {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 == 0 {
-                Poll::Ready(())
-            } else {
-                self.0 -= 1;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
 
     #[switch::task]
     async fn set_flag(flag: Rc<Cell<bool>>) {
@@ -479,7 +551,9 @@ mod tests {
 
     #[switch::task]
     async fn yield_then_count(count: Rc<Cell<usize>>) {
-        YieldN(3).await;
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
         count.set(count.get() + 1);
     }
 

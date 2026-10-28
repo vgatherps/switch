@@ -12,7 +12,7 @@ use std::task::{Context, Poll, Waker};
 
 use super::TaskHeader;
 use super::block::{BLOCK, MASK, Meta, Shape};
-use super::pool::{FunctionPool, RuntimePool};
+use super::pool::RuntimePool;
 use crate::StoredWaker;
 use crate::runtime::{Runtime, RuntimeError, Spawner};
 
@@ -108,8 +108,8 @@ fn spawn_big(runtime: &mut Runtime, n: usize) -> Vec<Rc<State>> {
     states
 }
 
-pub(super) fn function_pool(waker: &Waker) -> *mut FunctionPool {
-    unsafe { RuntimePool::function_pool(Meta::pool(meta(waker)).get()) }
+pub(super) fn runtime_pool(waker: &Waker) -> *mut RuntimePool {
+    unsafe { Meta::pool(meta(waker)) }
 }
 
 /// Spawn `n` parked tasks and poll them once.
@@ -147,12 +147,9 @@ fn every_live_header_masks_to_its_block_across_blocks() {
     // Depot slot s is position (s - 1) % 3 of block (s - 1) / 3: slots 1..=7 fill
     // two blocks and the first position of a third.
     for (index, &meta) in metas.iter().enumerate() {
-        assert_eq!(unsafe { Meta::block(meta).get() }, (index / 3) as u32);
+        assert_eq!(unsafe { Meta::block(meta) }, (index / 3) as u32);
     }
-    assert_eq!(
-        unsafe { RuntimePool::block_count(Meta::pool(metas[0]).get()) },
-        3
-    );
+    assert_eq!(unsafe { RuntimePool::block_count(Meta::pool(metas[0])) }, 3);
 }
 
 #[test]
@@ -195,10 +192,7 @@ fn default_capacity_is_one_block() {
     assert_eq!(meta(&waker(&states[1])), block);
     let error = spawner.spawn(wide(state())).unwrap_err();
     assert_eq!(error.reason, RuntimeError::Exhausted);
-    assert_eq!(
-        unsafe { RuntimePool::block_count(Meta::pool(block).get()) },
-        1
-    );
+    assert_eq!(unsafe { RuntimePool::block_count(Meta::pool(block)) }, 1);
 }
 
 #[repr(align(128))]
@@ -275,7 +269,8 @@ fn capacity_counts_a_completed_task_until_its_queued_wake_drains() {
     fn wake_then_finish(state: Rc<State>) -> impl Future<Output = ()> {
         std::future::poll_fn(move |cx| {
             state.polls.set(state.polls.get() + 1);
-            cx.waker().wake_by_ref();
+            // Deferred, so the wake is still queued when `poll` returns.
+            StoredWaker::new(cx).wake_deferred();
             Poll::Ready(())
         })
     }
@@ -336,24 +331,6 @@ fn stale_waker_of_reused_slot_polls_newer_task_once_per_drained_wake() {
 }
 
 #[test]
-fn stale_waker_of_block_lent_to_later_runtime_polls_there_per_drained_wake() {
-    let mut first = Runtime::new(0);
-    let old = spawn_parked(&mut first, 1).remove(0);
-    let stale = waker(&old);
-    drop(first);
-    assert_eq!(old.drops.get(), 1);
-    let mut second = Runtime::new(0);
-    let new = spawn_parked(&mut second, 1).remove(0);
-    assert_eq!(header(&waker(&new)), header(&stale));
-    stale.wake_by_ref();
-    assert_eq!(second.poll(0).unwrap().tasks_polled, 1);
-    assert_eq!(new.polls.get(), 2);
-    stale.wake_by_ref();
-    assert_eq!(second.poll(0).unwrap().tasks_polled, 1);
-    assert_eq!(new.polls.get(), 3);
-}
-
-#[test]
 fn wake_after_shutdown_or_drop_has_no_effect() {
     for drop_runtime in [false, true] {
         let mut runtime = Runtime::new(0);
@@ -364,9 +341,10 @@ fn wake_after_shutdown_or_drop_has_no_effect() {
         } else {
             runtime.shutdown();
         }
+        // The executor is freed (or closed); the flags check stops the wake
+        // before `Meta::executor` is read.
         for waker in &stale {
-            assert!(!unsafe { TaskHeader::is_live(header(waker)) });
-            assert!(unsafe { Meta::executor(meta(waker)).get() }.is_null());
+            assert_eq!(unsafe { TaskHeader::flags(header(waker)).get() }, 0);
             waker.wake_by_ref();
             let by_value = waker.clone();
             by_value.wake();
@@ -377,6 +355,36 @@ fn wake_after_shutdown_or_drop_has_no_effect() {
                 .all(|s| s.drops.get() == 1 && s.polls.get() == 1)
         );
     }
+}
+
+/// The freed executor's memory may be reused by a later runtime's: a stale wake
+/// must not reach it.
+#[test]
+fn wakers_of_a_dropped_runtime_never_reach_a_later_one() {
+    let mut first = Runtime::new(0);
+    let old = state();
+    let stored = Rc::new(Cell::new(None));
+    first
+        .spawner()
+        .spawn(stores(old.clone(), stored.clone()))
+        .unwrap();
+    first.poll(0).unwrap();
+    let (stale, stale_stored) = (waker(&old), stored.get().unwrap());
+    drop(first);
+    let mut second = Runtime::new(0);
+    let new = state();
+    second
+        .spawner()
+        .spawn(stores(new.clone(), Rc::new(Cell::new(None))))
+        .unwrap();
+    second.poll(0).unwrap();
+    assert_ne!(meta(&waker(&new)), meta(&stale));
+    stale.wake_by_ref();
+    let by_value = stale.clone();
+    by_value.wake();
+    stale_stored.wake();
+    assert_eq!(second.poll(0).unwrap().tasks_polled, 0);
+    assert_eq!((old.polls.get(), new.polls.get()), (1, 1));
 }
 
 #[test]
@@ -390,22 +398,20 @@ fn stale_wake_into_a_reserved_slot_returns_before_any_executor_access() {
         }
         Parked(state)
     }
-    let mut first = Runtime::new(0);
-    let spawner = first.spawner();
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
     let old = state();
     spawner
         .spawn(wake_while_reserved(old.clone(), None))
         .unwrap();
-    first.poll(0).unwrap();
+    runtime.poll(0).unwrap();
     let stale = waker(&old);
-    drop(first);
-    let mut second = Runtime::new(0);
+    finish(&mut runtime, &old);
     let new = state();
-    second
-        .spawner()
+    spawner
         .spawn(wake_while_reserved(new.clone(), Some(stale.clone())))
         .unwrap();
-    let report = second.poll(0).unwrap();
+    let report = runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.ready_tasks), (1, 0));
     assert_eq!(header(&waker(&new)), header(&stale));
     assert_eq!(new.polls.get(), 1);
@@ -493,22 +499,19 @@ fn runtimes_on_one_thread_use_disjoint_blocks() {
     // `a` has free slots, yet `b` never takes one.
     let in_b = spawn_big(&mut b, 7);
     assert!(in_b.iter().all(|s| meta(&waker(s)) != a_block));
-    let b_executor = unsafe { Meta::executor(meta(&waker(&in_b[0]))).get() };
-    assert_ne!(unsafe { Meta::executor(a_block).get() }, b_executor);
+    let b_executor = unsafe { Meta::executor(meta(&waker(&in_b[0]))) };
+    assert_ne!(unsafe { Meta::executor(a_block) }, b_executor);
 }
 
 #[test]
-fn shutdown_lends_blocks_to_the_next_runtime() {
+fn a_later_runtime_allocates_its_own_blocks() {
     let mut first = Runtime::new(0);
     let states = spawn_big(&mut first, 7);
     let blocks: Vec<_> = states.iter().step_by(3).map(|s| meta(&waker(s))).collect();
-    let function = function_pool(&waker(&states[0]));
     drop(first);
-    assert_eq!(unsafe { FunctionPool::spare_count(function) }, 3);
     let mut second = Runtime::new(0);
-    let reused = spawn_big(&mut second, 1).remove(0);
-    assert!(blocks.contains(&meta(&waker(&reused))));
-    assert_eq!(unsafe { FunctionPool::spare_count(function) }, 2);
+    let later = spawn_big(&mut second, 7);
+    assert!(later.iter().all(|s| !blocks.contains(&meta(&waker(s)))));
 }
 
 #[test]
@@ -529,16 +532,12 @@ fn one_function_on_two_threads_uses_disjoint_blocks() {
         std::thread::spawn(|| {
             let mut runtime = Runtime::new(0);
             let states = spawn_parked(&mut runtime, 1);
-            let waker = waker(&states[0]);
-            (meta(&waker).addr(), function_pool(&waker).addr())
+            meta(&waker(&states[0])).addr()
         })
         .join()
         .unwrap()
     };
-    let (block_a, pool_a) = spawn_on_thread();
-    let (block_b, pool_b) = spawn_on_thread();
-    assert_ne!(block_a, block_b);
-    assert_ne!(pool_a, pool_b);
+    assert_ne!(spawn_on_thread(), spawn_on_thread());
 }
 
 /// A `Parked` with another layout: a second future type of a different size.
@@ -598,7 +597,7 @@ fn type_macro_instantiations_use_distinct_pools() {
         .spawn(run_argument(Padded(Parked(states[2].clone()), [0; 4096])))
         .unwrap();
     runtime.poll(0).unwrap();
-    let pools: Vec<_> = states.iter().map(|s| function_pool(&waker(s))).collect();
+    let pools: Vec<_> = states.iter().map(|s| runtime_pool(&waker(s))).collect();
     assert_eq!(pools[0], pools[1]);
     assert_ne!(pools[0], pools[2]);
 }
@@ -624,7 +623,7 @@ fn token_with_shared_marker_splits_by_future_type() {
         .unwrap();
     runtime.poll(0).unwrap();
     assert!(states.iter().all(|state| state.polls.get() == 1));
-    let pools: Vec<_> = states.iter().map(|s| function_pool(&waker(s))).collect();
+    let pools: Vec<_> = states.iter().map(|s| runtime_pool(&waker(s))).collect();
     assert_eq!(pools[0], pools[1]);
     assert_ne!(pools[0], pools[2]);
 }
@@ -637,10 +636,7 @@ fn same_future_type_functions_keep_separate_pools() {
     spawner.spawn(parked(first.clone())).unwrap();
     spawner.spawn(parked_other(second.clone())).unwrap();
     runtime.poll(0).unwrap();
-    assert_ne!(
-        function_pool(&waker(&first)),
-        function_pool(&waker(&second))
-    );
+    assert_ne!(runtime_pool(&waker(&first)), runtime_pool(&waker(&second)));
 }
 
 #[switch::task(capacity = 1)]
@@ -662,7 +658,7 @@ fn generic_instantiations_have_their_own_pools_and_capacity() {
         .unwrap();
     runtime.poll(0).unwrap();
     assert_eq!((byte.polls.get(), text.polls.get()), (1, 1));
-    assert_ne!(function_pool(&waker(&byte)), function_pool(&waker(&text)));
+    assert_ne!(runtime_pool(&waker(&byte)), runtime_pool(&waker(&text)));
 }
 
 // ---- Token and spawn unwinding ----
@@ -876,8 +872,6 @@ fn deferred_shutdown_finishes_after_a_destructor_panic() {
         spawner.spawn(parked(state.clone())).unwrap();
     }
     owner.borrow_mut().as_mut().unwrap().poll(0).unwrap();
-    let parked_pool = function_pool(&waker(&others[0]));
-    let spare = unsafe { FunctionPool::spare_count(parked_pool) };
     let last = state();
     let payload = catch_unwind(AssertUnwindSafe(|| {
         spawner.spawn(drops_runtime(owner.clone(), last.clone()))
@@ -885,12 +879,10 @@ fn deferred_shutdown_finishes_after_a_destructor_panic() {
     .unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&13));
     assert!(owner.borrow().is_none());
-    // Every task was dropped once, the panicking one included, and the block
-    // went back to the spare list.
+    // Every task was dropped once, the panicking one included.
     assert_eq!(panicking.drops.get(), 1);
     assert!(others.iter().all(|state| state.drops.get() == 1));
     assert_eq!(last.drops.get(), 1);
-    assert_eq!(unsafe { FunctionPool::spare_count(parked_pool) }, spare + 1);
     assert_eq!(
         spawner.spawn(parked(state())).unwrap_err().reason,
         RuntimeError::Closed
@@ -1046,39 +1038,14 @@ fn stale_stored_waker_after_shutdown_or_drop_has_no_effect() {
         } else {
             runtime.shutdown();
         }
-        // The block is spare: only the flags check stands before a null executor.
-        assert!(unsafe { Meta::executor(block).get() }.is_null());
+        // Only the flags check stands before the freed (or closed) executor.
+        assert_eq!(
+            unsafe { TaskHeader::flags(Meta::header(block, 0)).get() },
+            0
+        );
         stale.wake();
         assert_eq!(state.polls.get(), 1);
     }
-}
-
-#[test]
-fn stale_stored_waker_of_block_lent_to_later_runtime_polls_there() {
-    let mut first = Runtime::new(0);
-    let old = state();
-    let stored = Rc::new(Cell::new(None));
-    first
-        .spawner()
-        .spawn(stores(old.clone(), stored.clone()))
-        .unwrap();
-    first.poll(0).unwrap();
-    let stale = stored.get().unwrap();
-    let old_header = header(&waker(&old));
-    drop(first);
-    assert!(unsafe { Meta::executor(TaskHeader::meta(old_header)).get() }.is_null());
-    stale.wake();
-    let mut second = Runtime::new(0);
-    let new = state();
-    second
-        .spawner()
-        .spawn(stores(new.clone(), Rc::new(Cell::new(None))))
-        .unwrap();
-    second.poll(0).unwrap();
-    assert_eq!(header(&waker(&new)), old_header);
-    stale.wake();
-    assert_eq!(second.poll(0).unwrap().tasks_polled, 1);
-    assert_eq!(new.polls.get(), 2);
 }
 
 #[test]

@@ -1,38 +1,18 @@
-error: async `#[switch::task]` functions must return `()`
- --> tests/ui/fail_lifetimes_and_output.rs:9:26
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = T>`
+ --> tests/ui/fail_lifetimes_and_output.rs:7:19
   |
-9 | async fn returns_value() -> u8 {
-  |                          ^^^^^
-
-error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
-  --> tests/ui/fail_lifetimes_and_output.rs:14:19
-   |
-14 | fn not_a_future() -> u8 {
-   |                   ^^^^^
-
-error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
-  --> tests/ui/fail_lifetimes_and_output.rs:19:19
-   |
-19 | fn wrong_output() -> impl Future<Output = u8> {
-   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-warning: unused import: `std::future::Future`
- --> tests/ui/fail_lifetimes_and_output.rs:1:5
-  |
-1 | use std::future::Future;
-  |     ^^^^^^^^^^^^^^^^^^^
-  |
-  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+7 | fn not_a_future() -> u8 {
+  |                   ^^^^^
 
 error: lifetime may not live long enough
- --> tests/ui/fail_lifetimes_and_output.rs:4:10
+ --> tests/ui/fail_lifetimes_and_output.rs:2:10
   |
-4 | async fn borrowed(value: &u8) {
+2 | async fn borrowed(value: &u8) {
   |          ^^^^^^^^        - let's call the lifetime of this reference `'1`
   |          |
   |          returning this value requires that `'1` must outlive `'static`
   |
-help: to declare that `impl Task` captures data from argument `value`, you can add an explicit `'_` lifetime bound
+help: to declare that `impl Task<Output = ()>` captures data from argument `value`, you can add an explicit `'_` lifetime bound
   |
-4 | async fn borrowed + '_(value: &u8) {
+2 | async fn borrowed + '_(value: &u8) {
   |                   ++++

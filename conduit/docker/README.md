@@ -664,10 +664,10 @@ Reading the result:
   reasons; a case's `DstPort` is the driver's local port 49152 + n.
 - `tls-anvil/run/driver.log`: one line per connection n, how it ended (the rustls error, if any).
 
-`known-failures.txt` lists tests that fail for reasons in rustls or ring, and, marked `OUR GAP`,
-one in sheath over switchnet: an alert lost when the socket is dropped with unread peer data
-(RST). It is kept per test, not per case: a test listed for some of its cases hides a new failure
-in its other cases. The RST cases are a race, so the set can vary between runs.
+`known-failures.txt` lists tests that fail for reasons in rustls or ring, and one where our alert
+arrives but the RST that follows it (we close with the server's data unread, as Linux `close()`
+does) fails TLS-Anvil's own send. It is kept per test, not per case: a test listed for some of
+its cases hides a new failure in its other cases.
 
 ## Live Binance example (`make docker-binance`)
 

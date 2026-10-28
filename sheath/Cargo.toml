@@ -7,12 +7,14 @@ publish = false
 
 [features]
 # wss client over switchnet TCP (module `switchnet`): TLS handshake, WebSocket upgrade, messages.
-switchnet = ["dep:switchnet", "dep:httparse", "dep:sha1", "dep:data-encoding"]
+switchnet = ["dep:switchnet", "dep:switch", "dep:httparse", "dep:sha1", "dep:data-encoding"]
 
 [dependencies]
 relay.workspace = true
 rustls = { version = "=0.23.43", default-features = false, features = ["std"] }
 switchnet = { workspace = true, optional = true }
+# yield_now: a failed connection lets the Net send its alert before the socket is dropped.
+switch = { workspace = true, optional = true }
 # The WebSocket upgrade (rare path): HTTP response parse, Sec-WebSocket-Accept check.
 httparse = { version = "1.10", optional = true }
 sha1 = { version = "0.11", optional = true }

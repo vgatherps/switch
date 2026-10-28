@@ -1,12 +1,13 @@
 //! Executor benchmarks.
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
-use switch::{Runtime, StoredWaker};
+use switch::{Capacity, Runtime, StoredWaker};
 
 struct Ready;
 impl Future for Ready {
@@ -17,29 +18,17 @@ impl Future for Ready {
     }
 }
 
-struct YieldN(u32);
-impl Future for YieldN {
-    type Output = ();
-    #[inline]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 == 0 {
-            Poll::Ready(())
-        } else {
-            self.0 -= 1;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
 #[switch::task]
 fn ready() -> impl Future<Output = ()> {
     Ready
 }
 
+/// Yields `n` times, one `Runtime::poll` per yield.
 #[switch::task]
-fn yield_n(n: u32) -> impl Future<Output = ()> {
-    YieldN(n)
+async fn yield_n(n: u32) {
+    for _ in 0..n {
+        switch::yield_now().await;
+    }
 }
 
 fn bench_spawn_ready(c: &mut Criterion) {
@@ -111,7 +100,8 @@ fn bench_yield_chain(c: &mut Criterion) {
 }
 
 /// Pure yield benchmark - no spawn/destroy in the hot path.
-/// Spawns once, then each iteration is just: poll -> wake -> pending.
+/// Spawns once, then each iteration is just: poll -> deferred wake -> pending.
+/// (A plain self-wake would be polled again in the same `poll`, up to its budget.)
 fn bench_pure_yield(c: &mut Criterion) {
     // Future that yields forever until we tell it to stop
     struct YieldForever {
@@ -125,7 +115,7 @@ fn bench_pure_yield(c: &mut Criterion) {
             if self.stop.get() {
                 Poll::Ready(())
             } else {
-                cx.waker().wake_by_ref();
+                StoredWaker::new(cx).wake_deferred();
                 Poll::Pending
             }
         }
@@ -272,22 +262,52 @@ fn wide_wakers(runtime: &mut Runtime, n: usize) -> Vec<Waker> {
         .collect()
 }
 
-/// The 3rd spawn into a runtime whose first block is full. Blocks are never
-/// freed, so after warm-up the new block comes from the function's spare list.
+/// Most blocks `spawn_new_block` allocates in a run (256 MiB), and per sample.
+const NEW_BLOCKS: u32 = 4096;
+const SAMPLE_BLOCKS: u64 = 16;
+
+/// Never polled; two fit a 64 KiB task block.
+#[switch::task(capacity = 8192)]
+fn wide_parked() -> impl Future<Output = ()> {
+    Wide(Publish(Rc::new(RefCell::new(None))), [0; 30_000])
+}
+
+/// A spawn that takes the first slot of a new block: a cold allocation of a
+/// fresh, zeroed 64 KiB block (blocks are never freed or reused). Every block
+/// stays allocated, so one long-lived runtime takes a bounded number of blocks:
+/// each sample measures at most `SAMPLE_BLOCKS` spawns and reports their mean
+/// for all its iterations (criterion's warm-up then needs only a few calls);
+/// after `NEW_BLOCKS` in total, a sample reports the mean of all earlier ones.
 fn bench_spawn_new_block(c: &mut Criterion) {
+    let runtime = Runtime::with_capacity(
+        0,
+        Capacity {
+            tasks: 2 * NEW_BLOCKS as usize,
+            timers: 0,
+        },
+    );
+    let spawner = runtime.spawner();
+    let (mut measured, mut total) = (0u32, Duration::ZERO);
     c.bench_function("spawn_new_block", |b| {
-        b.iter_batched_ref(
-            || {
-                let mut runtime = Runtime::new(0);
-                drop(wide_wakers(&mut runtime, 2));
-                let spawner = runtime.spawner();
-                let slot = Rc::new(RefCell::new(None));
-                (runtime, spawner, slot)
-            },
-            |(_, spawner, slot)| spawner.spawn(wide(slot.clone())).unwrap(),
-            BatchSize::SmallInput,
-        )
+        b.iter_custom(|iters| {
+            let n = iters
+                .min(SAMPLE_BLOCKS)
+                .min(u64::from(NEW_BLOCKS - measured)) as u32;
+            let mut sample = Duration::ZERO;
+            for _ in 0..n {
+                let start = Instant::now();
+                spawner.spawn(wide_parked()).unwrap();
+                sample += start.elapsed();
+                // Fill the block's second slot, so the next spawn needs a new one.
+                spawner.spawn(wide_parked()).unwrap();
+            }
+            measured += n;
+            total += sample;
+            let mean = if n > 0 { sample / n } else { total / measured };
+            mean.mul_f64(iters as f64)
+        })
     });
+    drop(runtime);
 }
 
 /// Wake and poll 64 tasks that sit in 64 different blocks.
