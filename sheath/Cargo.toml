@@ -37,5 +37,10 @@ zhida-test-support.workspace = true
 name = "wss_switchnet"
 required-features = ["switchnet"]
 
+# TLS-Anvil's client-test driver (`make docker-tls-anvil`): DPDK net_tap, Linux only.
+[[example]]
+name = "tls_anvil"
+required-features = ["switchnet"]
+
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
-.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
+.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -94,6 +94,17 @@ AUTOBAHN_IMAGE_TIMEOUT ?= 300
 # Autobahn 25.10.1 cases ("*"): fuzzingclient makes one connection each, the
 # client role runs each against fuzzingserver.
 AUTOBAHN_CASES = 517
+# TLS-Anvil (docker-tls-anvil): published image, amd64 only (emulated on an arm64 host).
+TLS_ANVIL_IMAGE ?= ghcr.io/tls-attacker/tlsanvil@sha256:29015a008c0def6e5ac495f9ac3d4d7f250dc8f7d0d393633f2f37c45245c4c2
+TLS_ANVIL_PLATFORM ?= linux/amd64
+# t-way strength of TLS-Anvil's combinatorial tests.
+TLS_ANVIL_STRENGTH ?= 1
+# Seconds for the whole TLS-Anvil run; expiry fails it.
+TLS_ANVIL_TIMEOUT ?= 7200
+# TLS-Anvil's CPUs; they must not include DOCKER_CPUSET.
+TLS_ANVIL_CPUSET ?= 1-3
+# More TLS-Anvil options, e.g. -testPackage de.rub.nds.tlstest.suite.tests.client.tls13 for a subset.
+TLS_ANVIL_ARGS ?=
 # memif-bench CPUs: EAL control threads, peer process, client process; the
 # Docker cpuset holds all three (off CPU 0, where other gates run).
 MEMIF_CONTROL_CPU ?= 3
@@ -137,7 +148,7 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 
 help:
 	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test-packetdrill test-scapy test-known-bugs test bench memif-bench fuzz binance known-bugs test-smoltcp bench-stack soak' \
-		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-bench-stack docker-soak' \
+		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
 
@@ -528,3 +539,48 @@ docker-autobahn: docker-autobahn-image
 	role server --expect-connections $(AUTOBAHN_CASES); server=$$?; \
 	role client --expect-cases $(AUTOBAHN_CASES); client=$$?; \
 	[ $$server = 0 ] && [ $$client = 0 ]
+
+# TLS-Anvil's client tests against sheath (TLS 1.3 over switchnet on net_tap), not part of make
+# test. Container C runs the driver (sheath example tls_anvil): it takes TLS-Anvil's address
+# 192.0.2.1 on the tap netdev, writes tls-anvil/run/ready and starts one TLS connection per
+# trigger. Container A runs TLS-Anvil in C's network namespace, listening on port 8443; its
+# trigger script connects to the driver's trigger port 127.0.0.1:8090. Once A exits, `done`
+# stops the driver. Results in tls-anvil/run/results/, logs in tls-anvil/run/. Exit 0 iff
+# TLS-Anvil and the driver both exited 0 (TLS-Anvil's status says the run completed, not that
+# every test passed; see the report).
+docker-tls-anvil:
+	@set -u; \
+	run=tls-anvil/run; c=zhida-tls-anvil-c-$$$$; a=zhida-tls-anvil-a-$$$$; \
+	say() { echo "docker-tls-anvil: $$*" >&2; }; \
+	cleanup() { rc=$$?; $(DOCKER) rm -f $$c $$a >/dev/null 2>&1; exit $$rc; }; \
+	trap cleanup EXIT; trap 'exit 130' INT TERM HUP; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p sheath --features switchnet --example tls_anvil || exit 1; \
+	rm -rf $$run && mkdir -p $$run || exit 1; \
+	$(DOCKER) run -d --name $$c $(DOCKER_DPDK) $(DOCKER_IMAGE) \
+		timeout --kill-after=10 $$(( $(TLS_ANVIL_TIMEOUT) + 120 )) ../target/release/examples/tls_anvil $$run >/dev/null || exit 1; \
+	deadline=$$(( $$(date +%s) + 120 )); \
+	until [ -f $$run/ready ]; do \
+		[ "$$($(DOCKER) inspect -f '{{.State.Running}}' $$c)" = true ] || { $(DOCKER) logs $$c; say "driver exited before ready"; exit 1; }; \
+		[ "$$(date +%s)" -lt $$deadline ] || { say "no ready within 120 s"; exit 1; }; \
+		sleep 1; \
+	done; \
+	start=$$(date +%s); \
+	$(DOCKER) run -d --name $$a --platform $(TLS_ANVIL_PLATFORM) --network container:$$c --cpuset-cpus=$(TLS_ANVIL_CPUSET) \
+		-v "$(CURDIR)/$$run:/output" $(TLS_ANVIL_IMAGE) \
+		-disableTcpDump -strength $(TLS_ANVIL_STRENGTH) -parallelHandshakes 1 -parallelTests 1 \
+		-identifier sheath -outputFolder /output/results -prettyPrintJSON $(TLS_ANVIL_ARGS) \
+		client -port 8443 -triggerScript bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090' >/dev/null || exit 1; \
+	while [ "$$($(DOCKER) inspect -f '{{.State.Running}}' $$a)" = true ]; do \
+		if [ $$(( $$(date +%s) - start )) -ge $(TLS_ANVIL_TIMEOUT) ]; then say "TLS-Anvil still running after $(TLS_ANVIL_TIMEOUT) s"; $(DOCKER) kill $$a >/dev/null; break; fi; \
+		sleep 5; \
+	done; \
+	anvil=$$($(DOCKER) inspect -f '{{.State.ExitCode}}' $$a); \
+	$(DOCKER) logs $$a > $$run/tls-anvil.log 2>&1; \
+	: > $$run/done; \
+	deadline=$$(( $$(date +%s) + 60 )); \
+	while [ "$$($(DOCKER) inspect -f '{{.State.Running}}' $$c)" = true ] && [ "$$(date +%s)" -lt $$deadline ]; do sleep 1; done; \
+	driver=$$($(DOCKER) inspect -f '{{.State.ExitCode}}' $$c); \
+	[ "$$($(DOCKER) inspect -f '{{.State.Running}}' $$c)" = true ] && driver="still running"; \
+	$(DOCKER) logs $$c > $$run/driver.log 2>&1; \
+	say "$$(( $$(date +%s) - start )) s, TLS-Anvil exit $$anvil, driver exit $$driver; results in $(CURDIR)/$$run/results"; \
+	[ "$$anvil" = 0 ] && [ "$$driver" = 0 ]

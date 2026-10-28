@@ -1,0 +1,361 @@
+//! TLS-only client for TLS-Anvil's client tests (`make docker-tls-anvil`): sheath's TLS 1.3
+//! client over switchnet TCP on net_tap, one connection per trigger.
+//!
+//! usage: tls_anvil <run-dir>
+//!
+//! Takes 192.0.2.1/24 (TLS-Anvil's address) on the tap netdev's kernel side and listens for
+//! triggers on 127.0.0.1:8090: TLS-Anvil's trigger script, in a container sharing this
+//! network namespace, opens a TCP connection there before each handshake. Then
+//! `<run-dir>/ready` is written. Each trigger starts one connection from 192.0.2.2 to
+//! 192.0.2.1:8443, after the previous one ended: the TLS handshake, a little application
+//! data, reading until close_notify, end of stream or an error, then sending a pending alert
+//! or close_notify, and FIN. Connection outcomes are printed, one line each; they do not fail
+//! the run, since TLS-Anvil expects rejections. Runs until `<run-dir>/done` exists, then
+//! prints a summary and exits 0; a setup or driver failure panics.
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::ffi::CStr;
+use std::future::poll_fn;
+use std::io::ErrorKind;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::path::{Path, PathBuf};
+use std::pin::{Pin, pin};
+use std::process::Command;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Poll;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
+use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
+use dpdk_smoltcp::{
+    DEFAULT_NEIGHBOR_CAPACITY, Offloads, Port, PortConfig, Stack, StackConfig, frame_reserve, rx_reserve,
+};
+use relay::{PlainRx, PlainTx};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::version::TLS13;
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use sheath::switchnet::{Frame, SwitchTx, Tls, send_bytes, tls_connect};
+use sheath::{TlsTx, TxError};
+use switch::{Runtime, Spawner};
+use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, Net, NetConfig, RecvError, SendError, tcp};
+use zhida_buffer::PoolConfig;
+use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
+use zhida_test_kit::{tap::TapVdev, with_eal};
+
+const VDEV: &CStr = c"net_tap_anvil";
+const IFACE: &CStr = c"cdtap_anvil";
+const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
+const ANVIL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+const ANVIL_PORT: u16 = 8443;
+const TRIGGER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8090);
+/// Server name sent; TLS-Anvil's certificate is accepted whatever its names (`AnyCert`).
+const HOST: &str = "tls-anvil";
+const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: tls-anvil\r\n\r\n";
+const MTU: u16 = 1500;
+/// An ended connection keeps its socket until the TCP close completes (TIME-WAIT, or never
+/// if TLS-Anvil leaves it half closed), and TLS-Anvil starts several a second.
+const MAX_SOCKETS: usize = 512;
+const INGRESS_BUDGET: usize = 32;
+/// Runtime ticks are milliseconds since start; a connection is abandoned after this many.
+const CONNECTION_LIMIT_MS: u64 = 10_000;
+/// Room awaited for a record of our own (alert, close_notify: 24 B).
+const SMALL_RECORD: usize = 64;
+const ROUND_SLEEP: Duration = Duration::from_micros(50);
+/// How often the main loop looks for `<run-dir>/done`.
+const DONE_CHECK: Duration = Duration::from_millis(100);
+
+fn socket() -> tcp::Config {
+    tcp::Config { rx_capacity: 16 * 1024, tx_capacity: 16 * 1024, mss_cap: None }
+}
+
+fn port_config(port_id: u16) -> PortConfig<'static> {
+    let pool = |name, count: usize| PoolConfig {
+        name,
+        count: u32::try_from(count).unwrap(),
+        cache_size: 8,
+        data_room_size: RTE_PKTMBUF_HEADROOM as u16 + 2048,
+        socket_id: -1,
+    };
+    let sockets = |budget: usize| budget * MAX_SOCKETS;
+    PortConfig {
+        port_id,
+        mtu: MTU,
+        rx_descriptors: 16,
+        tx_descriptors: 16,
+        rx_burst: 32,
+        tx_burst: 32,
+        queue_socket: -1,
+        rx_pool: pool(c"anvil_rx", rx_reserve(16, 32, 8) + sockets(tcp::rx_mbuf_budget(&socket(), MTU.into()))),
+        tx_pool: pool(c"anvil_tx", 127),
+        frame_pool: pool(
+            c"anvil_frame",
+            frame_reserve(16, 32) + sockets(tcp::tx_mbuf_budget(&socket(), MTU.into())),
+        ),
+        offloads: Offloads::default(),
+    }
+}
+
+/// Accepts TLS-Anvil's certificate, whatever it is, but checks the handshake signatures with it,
+/// so CertificateVerify still has to be right. Test-only: no chain or name validation.
+#[derive(Debug)]
+struct AnyCert(WebPkiSupportedAlgorithms);
+
+impl ServerCertVerifier for AnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_schemes()
+    }
+}
+
+/// A fresh config per connection: TLS-Anvil assumes every ClientHello is the same, and a shared
+/// config remembers the last server's key exchange group (and session tickets) and offers it next.
+fn client_config() -> Arc<ClientConfig> {
+    let provider: CryptoProvider = rustls::crypto::ring::default_provider();
+    let verifier = Arc::new(AnyCert(provider.signature_verification_algorithms));
+    let config = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&TLS13])
+        .expect("ring supports TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
+#[switch::task]
+fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
+    future
+}
+
+/// Sends what `tx` holds from rustls (an alert after a receive error), then close_notify unless
+/// `alert_only`, then FIN.
+async fn finish(tx: &mut TlsTx<SwitchTx>, alert_only: bool) -> Result<(), TxError<SendError>> {
+    if tx.has_pending() {
+        tx.room(SMALL_RECORD).await?;
+        let f = tx.alloc().await?;
+        if let Some(sealed) = tx.take_pending(f)? {
+            send(tx, sealed).await?;
+        }
+    }
+    if !alert_only {
+        tx.room(SMALL_RECORD).await?;
+        let f = tx.alloc().await?;
+        if let Some(sealed) = tx.seal_close(f)? {
+            send(tx, sealed).await?;
+        }
+    }
+    tx.shutdown();
+    Ok(())
+}
+
+async fn send(tx: &mut TlsTx<SwitchTx>, mut sealed: <TlsTx<SwitchTx> as PlainTx>::Sealed) -> Result<(), TxError<SendError>> {
+    loop {
+        match tx.try_send(sealed) {
+            Ok(()) => return Ok(()),
+            Err(back) => {
+                sealed = back;
+                tx.room(SMALL_RECORD).await?;
+            }
+        }
+    }
+}
+
+/// One connection: handshake, request, read until the end, then the alert or close_notify, and
+/// FIN. Returns how it ended.
+async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfig>) -> String {
+    let remote = IpEndpoint::new(ANVIL_ADDR.into(), ANVIL_PORT);
+    let local = IpListenEndpoint { addr: None, port: local_port };
+    let connecting = match handle.tcp_connect(socket(), remote, local) {
+        Ok(connecting) => connecting,
+        Err(e) => return format!("open TCP: {e:?}"),
+    };
+    let stream = match connecting.await {
+        Ok(stream) => stream,
+        Err(e) => return format!("TCP connect: {e:?}"),
+    };
+    let Tls { mut rx, mut tx, mut tcp } = match tls_connect(handle, stream, config, HOST).await {
+        Ok(tls) => tls,
+        Err(e) => return format!("handshake: {e}"),
+    };
+    if let Err(e) = send_bytes(&mut tx, REQUEST).await {
+        return format!("send request: {e}");
+    }
+    let end = loop {
+        let run = match rx.chunk(&mut tx) {
+            Ok(chunk) => chunk.map(|chunk| chunk.bytes.len()),
+            Err(e) => break Err(format!("receive: {e}")),
+        };
+        match run {
+            Some(n) => rx.consume(n),
+            None if rx.eof() => break Ok("close_notify"),
+            None => match tcp.recv().await {
+                Ok(frame) => {
+                    if let Err(e) = rx.push(Frame(frame), &mut tx) {
+                        break Err(format!("receive: {e}"));
+                    }
+                }
+                Err(RecvError::Finished) => break rx.fin(&mut tx).map(|()| "fin").map_err(|e| format!("end: {e}")),
+                Err(e) => break Err(format!("tcp receive: {e:?}")),
+            },
+        }
+    };
+    // after an error only rustls's alert, if any, goes out; after close_notify ours too
+    let finished = finish(&mut tx, end.is_err()).await;
+    match (end, finished) {
+        (Ok(end), Ok(())) => format!("ended by {end}"),
+        (Ok(end), Err(e)) => format!("ended by {end}; closing: {e}"),
+        (Err(e), Ok(())) => e,
+        (Err(e), Err(closing)) => format!("{e}; closing: {closing}"),
+    }
+}
+
+/// `connection`, abandoned after `CONNECTION_LIMIT_MS`.
+async fn bounded(spawner: &Spawner, handle: &NetHandle, local_port: u16, config: Arc<ClientConfig>) -> String {
+    let mut work = pin!(connection(handle, local_port, config));
+    let mut limit = pin!(spawner.sleep(CONNECTION_LIMIT_MS).expect("the runtime is open"));
+    poll_fn(|cx| {
+        if let Poll::Ready(ended) = work.as_mut().poll(cx) {
+            return Poll::Ready(ended);
+        }
+        if limit.as_mut().poll(cx).is_ready() {
+            return Poll::Ready("abandoned after the time limit".to_owned());
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+fn add_address(addr: Ipv4Addr, prefix: u8) {
+    let cidr = format!("{addr}/{prefix}");
+    let output = Command::new("ip")
+        .args(["address", "add", &cidr, "dev", IFACE.to_str().unwrap()])
+        .output()
+        .expect("run ip address add");
+    assert!(output.status.success(), "ip address add {cidr}: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+fn marker(dir: &Path, name: &str) {
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, "").and_then(|()| std::fs::rename(&tmp, dir.join(name))).expect("write marker");
+}
+
+fn main() {
+    let dir = PathBuf::from(std::env::args_os().nth(1).expect("usage: tls_anvil <run-dir>"));
+    let summary = with_eal(|eal| {
+        let tap = TapVdev::new(VDEV, IFACE);
+        // SAFETY: net_tap was just created and this EAL thread alone configures and uses its Port
+        // and packets. The offload-free net_tap profile returns single-segment RX buffers and
+        // frees TX buffers synchronously. The Port closes before the vdev is removed, and EAL
+        // outlives both.
+        let port = unsafe { Port::open(eal, port_config(tap.port_id())) }.expect("open net_tap Port");
+        add_address(ANVIL_ADDR, 24);
+        let triggers = TcpListener::bind(TRIGGER).expect("bind the trigger port");
+        triggers.set_nonblocking(true).expect("non-blocking trigger port");
+
+        let config = StackConfig {
+            max_udp_sockets: 0,
+            ethernet: EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
+            ipv4: Ipv4Cidr::new(ZHIDA_ADDR, 24),
+            gateway: None,
+            paths: &[],
+            random_seed: u64::from(std::process::id()),
+            neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
+            segments_per_visit: 1,
+            max_sockets: MAX_SOCKETS,
+            rx_staging: 32,
+            tx_pending: 32,
+        };
+        let start = Instant::now();
+        let now = || StackInstant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
+        let ticks = || u64::try_from(start.elapsed().as_millis()).unwrap();
+        let stack = Stack::new(port, config, now()).map_err(|(_, e)| e).expect("create Zhida Stack");
+        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+        let mut rt = Runtime::new(0);
+        let handle = net.handle();
+        marker(&dir, "ready");
+        println!("tls_anvil: ready; triggers on {TRIGGER}, connecting to {ANVIL_ADDR}:{ANVIL_PORT}");
+
+        let mut waiting = 0usize;
+        let mut started = 0usize;
+        // the outcome of the running connection, `Some` once it ended
+        let mut running: Option<Rc<RefCell<Option<String>>>> = None;
+        let mut outcomes: BTreeMap<String, usize> = BTreeMap::new();
+        let mut checked = Instant::now();
+        loop {
+            loop {
+                match triggers.accept() {
+                    Ok(_) => waiting += 1,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("trigger accept: {e}"),
+                }
+            }
+            if let Some(ended) = running.as_ref().and_then(|slot| slot.borrow_mut().take()) {
+                println!("tls_anvil: connection {started}: {ended}");
+                *outcomes.entry(ended).or_default() += 1;
+                running = None;
+            }
+            if running.is_none() && waiting > 0 {
+                waiting -= 1;
+                started += 1;
+                let slot: Rc<RefCell<Option<String>>> = Rc::default();
+                running = Some(slot.clone());
+                let (handle, spawner, config) = (handle.clone(), rt.spawner(), client_config());
+                // successive local ports, so no connection meets the previous one's TIME-WAIT
+                let local_port = 49152 + u16::try_from(started % 16384).unwrap();
+                let task = async move {
+                    let ended = bounded(&spawner, &handle, local_port, config).await;
+                    *slot.borrow_mut() = Some(ended);
+                };
+                rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn a connection");
+            }
+            net.turn(now()).expect("turn the Net");
+            rt.poll(ticks()).expect("poll the connections");
+            if checked.elapsed() >= DONE_CHECK {
+                checked = Instant::now();
+                if dir.join("done").exists() {
+                    break;
+                }
+            }
+            thread::sleep(ROUND_SLEEP);
+        }
+        rt.shutdown();
+        drop(handle);
+        let stack = net.into_stack().ok().expect("every connection's sockets are gone");
+        stack.into_port().try_close().expect("close the Port with every buffer returned");
+        tap.close();
+        format!("{started} connections, {waiting} triggers left waiting; outcomes {outcomes:#?}")
+    });
+    println!("tls_anvil: {summary}");
+}

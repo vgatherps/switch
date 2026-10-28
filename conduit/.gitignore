@@ -1,4 +1,5 @@
 /target/
 /crates/zhida-buffer/fuzz/target/
 /autobahn/run/
+/tls-anvil/run/
 __pycache__/

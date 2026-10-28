@@ -151,26 +151,27 @@ impl From<WsTxError<TxError<SendError>>> for Error {
     }
 }
 
-/// The TLS handshake for `host` on `stream`, then the WebSocket upgrade for `path`.
-pub async fn connect(
+/// A TLS 1.3 connection over switchnet TCP, after the handshake: the receive half, the send
+/// half, and the TCP receive half that feeds `rx`.
+pub struct Tls {
+    pub rx: TlsRx<Frame, SwitchTx>,
+    pub tx: TlsTx<SwitchTx>,
+    pub tcp: TcpRx,
+}
+
+/// The TLS handshake for `host` on `stream`.
+pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
     config: Arc<ClientConfig>,
     host: &str,
-    path: &str,
-) -> Result<Wss, Error> {
+) -> Result<Tls, Error> {
     let (mut tcp_rx, tcp) = stream.split();
     let mut raw = SwitchTx { handle: handle.clone(), tcp };
     let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Upgrade(format!("server name {host}: {e}")))?;
-    let mut key = [0; 16];
-    config
-        .crypto_provider()
-        .secure_random
-        .fill(&mut key)
-        .map_err(|_| Error::Upgrade("no randomness for Sec-WebSocket-Key".into()))?;
     let mut conn = UnbufferedClientConnection::new(config, name).map_err(|e| Error::Tls(TlsError::Tls(e)))?;
 
-    // TLS handshake: received bytes are joined in `received`, sent records gathered in `out`.
+    // Received bytes are joined in `received`, sent records gathered in `out`.
     let mut received = Vec::new();
     let mut stamp = 0;
     let mut out = Vec::new();
@@ -210,8 +211,28 @@ pub async fn connect(
             Next::Done => break,
         }
     }
-    let mut tls = TlsTx::new(conn, raw);
-    let mut rx = TlsRx::with_leftover(&received, stamp);
+    Ok(Tls {
+        tx: TlsTx::new(conn, raw),
+        rx: TlsRx::with_leftover(&received, stamp),
+        tcp: tcp_rx,
+    })
+}
+
+/// The TLS handshake for `host` on `stream`, then the WebSocket upgrade for `path`.
+pub async fn connect(
+    handle: &NetHandle,
+    stream: TcpStream,
+    config: Arc<ClientConfig>,
+    host: &str,
+    path: &str,
+) -> Result<Wss, Error> {
+    let mut key = [0; 16];
+    config
+        .crypto_provider()
+        .secure_random
+        .fill(&mut key)
+        .map_err(|_| Error::Upgrade("no randomness for Sec-WebSocket-Key".into()))?;
+    let Tls { mut rx, tx: mut tls, tcp: mut tcp_rx } = tls_connect(handle, stream, config, host).await?;
 
     // WebSocket upgrade (RFC 6455 §4.1).
     let key = data_encoding::BASE64.encode(&key);
@@ -231,7 +252,7 @@ pub async fn connect(
 }
 
 /// Sends `bytes` through `lower`, a frame at a time, each sent once there is room for it.
-async fn send_bytes<L: PlainTx>(lower: &mut L, bytes: &[u8]) -> Result<(), L::Error> {
+pub async fn send_bytes<L: PlainTx>(lower: &mut L, bytes: &[u8]) -> Result<(), L::Error> {
     let (head, room) = lower.plain();
     for piece in bytes.chunks(room) {
         let mut f = lower.alloc().await?;
