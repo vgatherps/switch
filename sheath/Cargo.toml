@@ -19,15 +19,18 @@ switch = { workspace = true, optional = true }
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
-# TLS-Anvil's client-test driver (`--features switchnet`): DPDK net_tap, Linux only.
+# The Docker end-to-end test and TLS-Anvil's driver (`--features switchnet`): DPDK net_tap,
+# Linux only.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-dpdk-smoltcp.workspace = true
 switch.workspace = true
-zhida-buffer.workspace = true
-zhida-dpdk-sys.workspace = true
-zhida-test-kit.workspace = true
+switchnet = { workspace = true, features = ["testkit"] }
+zhida-test-support.workspace = true
 
-# TLS-Anvil's client-test driver (`make docker-tls-anvil`): DPDK net_tap, Linux only.
+[[test]]
+name = "tls_switchnet"
+required-features = ["switchnet"]
+
+# TLS-Anvil's client-test driver (`make docker-tls-anvil`).
 [[example]]
 name = "tls_anvil"
 required-features = ["switchnet"]

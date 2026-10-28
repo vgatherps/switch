@@ -1192,7 +1192,6 @@ name = "relay"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
- "dpdk-smoltcp",
  "httparse",
  "libc",
  "rand 0.10.3",
@@ -1204,9 +1203,6 @@ dependencies = [
  "switchnet",
  "trybuild",
  "tungstenite",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
  "zhida-test-support",
 ]
 
@@ -1379,14 +1375,11 @@ dependencies = [
 name = "sheath"
 version = "0.1.0"
 dependencies = [
- "dpdk-smoltcp",
  "rcgen",
  "rustls",
  "switch",
  "switchnet",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
+ "zhida-test-support",
 ]
 
 [[package]]
@@ -1471,6 +1464,8 @@ dependencies = [
  "criterion",
  "dpdk-smoltcp",
  "switch",
+ "zhida-buffer",
+ "zhida-dpdk-sys",
  "zhida-test-kit",
  "zhida-test-support",
 ]

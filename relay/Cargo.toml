@@ -31,12 +31,8 @@ trybuild = "1.0"
 
 # The Docker end-to-end tests (`--features switchnet`): DPDK net_tap, Linux only.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-dpdk-smoltcp.workspace = true
 libc.workspace = true
-switch.workspace = true
-zhida-buffer.workspace = true
-zhida-dpdk-sys.workspace = true
-zhida-test-kit.workspace = true
+switchnet = { workspace = true, features = ["testkit"] }
 zhida-test-support.workspace = true
 
 [[test]]
