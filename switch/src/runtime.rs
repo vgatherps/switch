@@ -25,7 +25,10 @@ pub enum RuntimeError {
         current: u64,
         supplied: u64,
     },
-    /// Spawn only: the task function already has its capacity of live tasks here.
+    /// Spawn only: every slot of the task function's capacity here is occupied.
+    /// A slot stays occupied from spawn until its task completes and no wake of
+    /// it is still queued: a task that wakes itself and then completes holds its
+    /// slot until the next poll drains that wake.
     Exhausted,
 }
 
@@ -224,9 +227,10 @@ impl Runtime {
     }
 }
 
-struct CleanupContinuation(Rc<Control>);
+/// Finishes a shutdown that a task destructor's panic interrupted.
+struct CleanupContinuation<'a>(&'a Control);
 
-impl Drop for CleanupContinuation {
+impl Drop for CleanupContinuation<'_> {
     fn drop(&mut self) {
         self.0.shutdown();
     }
@@ -236,8 +240,8 @@ impl Drop for CleanupContinuation {
 /// unspecified order.
 impl Drop for Runtime {
     fn drop(&mut self) {
-        let _continuation = CleanupContinuation(self.control.clone());
-        self.shutdown();
+        let _continuation = CleanupContinuation(&self.control);
+        self.control.shutdown();
     }
 }
 
@@ -296,6 +300,7 @@ struct DeferredShutdown<'a>(&'a Control);
 impl Drop for DeferredShutdown<'_> {
     fn drop(&mut self) {
         if self.0.close_deferred.get() {
+            let _continuation = CleanupContinuation(self.0);
             self.0.shutdown();
         }
     }

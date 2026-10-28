@@ -56,7 +56,7 @@
 //! ```
 //!
 //! A task future that does not fit a 64 KiB task block is a compile-time error:
-//! ```compile_fail
+//! ```compile_fail,E0080
 //! fn too_big() -> switch::SpawnToken<impl switch::__private::Task> {
 //!     async fn __too_big() {
 //!         let bulk = [0u8; 70_000];

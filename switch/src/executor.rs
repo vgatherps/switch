@@ -201,7 +201,6 @@ impl Executor {
         }
         TurnGuard {
             owner: this,
-            current: std::ptr::null(),
             finished: false,
         }
     }
@@ -232,12 +231,10 @@ impl Executor {
                     continue;
                 }
                 report.polled += 1;
-                turn.current = header;
-                let result = {
-                    let _current = CurrentGuard::enter(this, header);
-                    Meta::poll_fn(TaskHeader::meta(header))(header)
-                };
-                turn.current = std::ptr::null();
+                // Published for `Sleep`; if the poll unwinds, `TurnGuard` ends the task.
+                (*this).current = header;
+                let result = Meta::poll_fn(TaskHeader::meta(header))(header);
+                (*this).current = std::ptr::null();
                 if result.is_ready() {
                     report.completed += 1;
                     Self::complete(this, header);
@@ -364,8 +361,6 @@ pub(crate) struct BatchReport {
 
 pub(crate) struct TurnGuard {
     owner: *mut Executor,
-    /// The task being polled; ended if its poll unwinds.
-    current: *const TaskHeader,
     finished: bool,
 }
 
@@ -382,8 +377,11 @@ impl Drop for TurnGuard {
                 if (*self.owner).lifecycle == Lifecycle::Open {
                     (*self.owner).lifecycle = Lifecycle::Panicked;
                 }
-                if !self.current.is_null() {
-                    Executor::terminal(self.owner, self.current);
+                // A poll unwound: end that task; it is never polled again.
+                let current = (*self.owner).current;
+                if !current.is_null() {
+                    Executor::terminal(self.owner, current);
+                    (*self.owner).current = std::ptr::null();
                 }
             }
             (*self.owner).active = false;
@@ -441,24 +439,6 @@ impl Drop for SlotGuard {
             if TaskHeader::flags(self.header).get() & QUEUED == 0 {
                 Executor::reclaim(self.owner, self.header);
             }
-        }
-    }
-}
-
-/// Publishes the polled task for `Sleep`; cleared on return and unwind.
-struct CurrentGuard(*mut Executor);
-
-impl CurrentGuard {
-    unsafe fn enter(this: *mut Executor, header: *const TaskHeader) -> Self {
-        unsafe { (*this).current = header };
-        Self(this)
-    }
-}
-
-impl Drop for CurrentGuard {
-    fn drop(&mut self) {
-        unsafe {
-            (*self.0).current = std::ptr::null();
         }
     }
 }

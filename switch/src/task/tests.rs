@@ -269,6 +269,38 @@ fn over_aligned_future_polls_and_drops_aligned_through_slot_reuse() {
     );
 }
 
+#[test]
+fn capacity_counts_a_completed_task_until_its_queued_wake_drains() {
+    task! {
+        capacity = 1;
+        fn wake_then_finish(state: Rc<State>) -> impl Future<Output = ()> {
+            std::future::poll_fn(move |cx| {
+                state.polls.set(state.polls.get() + 1);
+                cx.waker().wake_by_ref();
+                Poll::Ready(())
+            })
+        }
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    spawner.spawn(wake_then_finish(state())).unwrap();
+    let report = runtime.poll(0).unwrap();
+    assert_eq!(
+        (
+            report.tasks_completed,
+            report.ready_tasks,
+            report.live_tasks
+        ),
+        (1, 0, 0)
+    );
+    // The completed task's own wake is still queued, so its slot is occupied.
+    let error = spawner.spawn(wake_then_finish(state())).unwrap_err();
+    assert_eq!(error.reason, RuntimeError::Exhausted);
+    // The next poll drains that wake and frees the slot.
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
+    spawner.spawn(wake_then_finish(state())).unwrap();
+}
+
 // ---- Stale wakers ----
 
 #[test]
@@ -676,6 +708,62 @@ fn shutdown_then_panic_in_a_factory_releases_the_slot_then_cleans_up() {
     assert_eq!(runtime.borrow_mut().poll(0), Err(RuntimeError::Closed));
 }
 
+#[test]
+fn deferred_shutdown_finishes_after_a_destructor_panic() {
+    struct PanicOnDrop(Rc<State>);
+    impl Future for PanicOnDrop {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Pending
+        }
+    }
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            self.0.drops.set(self.0.drops.get() + 1);
+            panic_any(13usize);
+        }
+    }
+    task! {
+        fn panics_on_drop(state: Rc<State>) -> impl Future<Output = ()> {
+            PanicOnDrop(state)
+        }
+    }
+    task! {
+        fn drops_runtime(owner: Rc<RefCell<Option<Runtime>>>, state: Rc<State>) -> impl Future<Output = ()> {
+            drop(owner.borrow_mut().take());
+            Parked(state)
+        }
+    }
+    let owner = Rc::new(RefCell::new(Some(Runtime::new(0))));
+    let spawner = owner.borrow().as_ref().unwrap().spawner();
+    let panicking = state();
+    spawner.spawn(panics_on_drop(panicking.clone())).unwrap();
+    let others: Vec<_> = (0..3).map(|_| state()).collect();
+    for state in &others {
+        spawner.spawn(parked(state.clone())).unwrap();
+    }
+    owner.borrow_mut().as_mut().unwrap().poll(0).unwrap();
+    let parked_pool = function_pool(&waker(&others[0]));
+    let spare = unsafe { FunctionPool::spare_count(parked_pool) };
+    let last = state();
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        spawner.spawn(drops_runtime(owner.clone(), last.clone()))
+    }))
+    .unwrap_err();
+    assert_eq!(payload.downcast_ref::<usize>(), Some(&13));
+    assert!(owner.borrow().is_none());
+    // Every task was dropped once, the panicking one included, and the block
+    // went back to the spare list.
+    assert_eq!(panicking.drops.get(), 1);
+    assert!(others.iter().all(|state| state.drops.get() == 1));
+    assert_eq!(last.drops.get(), 1);
+    assert_eq!(unsafe { FunctionPool::spare_count(parked_pool) }, spare + 1);
+    assert_eq!(
+        spawner.spawn(parked(state())).unwrap_err().reason,
+        RuntimeError::Closed
+    );
+}
+
 // ---- Cleanup ----
 
 #[test]
@@ -755,6 +843,7 @@ task! {
     fn stores(state: Rc<State>, stored: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
         std::future::poll_fn(move |cx| {
             stored.set(Some(StoredWaker::new(cx)));
+            *state.waker.borrow_mut() = Some(cx.waker().clone());
             state.polls.set(state.polls.get() + 1);
             if state.done.get() {
                 Poll::Ready(())
@@ -813,9 +902,83 @@ fn stale_stored_waker_into_free_then_reused_slot() {
 }
 
 #[test]
+fn stale_stored_waker_after_shutdown_or_drop_has_no_effect() {
+    for drop_runtime in [false, true] {
+        let mut runtime = Runtime::new(0);
+        let state = state();
+        let stored = Rc::new(Cell::new(None));
+        runtime
+            .spawner()
+            .spawn(stores(state.clone(), stored.clone()))
+            .unwrap();
+        runtime.poll(0).unwrap();
+        let stale = stored.get().unwrap();
+        let block = meta(&waker(&state));
+        if drop_runtime {
+            drop(runtime);
+        } else {
+            runtime.shutdown();
+        }
+        // The block is spare: only the flags check stands before a null executor.
+        assert!(unsafe { Meta::executor(block).get() }.is_null());
+        stale.wake();
+        assert_eq!(state.polls.get(), 1);
+    }
+}
+
+#[test]
+fn stale_stored_waker_of_block_lent_to_later_runtime_polls_there() {
+    let mut first = Runtime::new(0);
+    let old = state();
+    let stored = Rc::new(Cell::new(None));
+    first
+        .spawner()
+        .spawn(stores(old.clone(), stored.clone()))
+        .unwrap();
+    first.poll(0).unwrap();
+    let stale = stored.get().unwrap();
+    let old_header = header(&waker(&old));
+    drop(first);
+    assert!(unsafe { Meta::executor(TaskHeader::meta(old_header)).get() }.is_null());
+    stale.wake();
+    let mut second = Runtime::new(0);
+    let new = state();
+    second
+        .spawner()
+        .spawn(stores(new.clone(), Rc::new(Cell::new(None))))
+        .unwrap();
+    second.poll(0).unwrap();
+    assert_eq!(header(&waker(&new)), old_header);
+    stale.wake();
+    assert_eq!(second.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(new.polls.get(), 2);
+}
+
+#[test]
 fn stored_waker_rejects_a_foreign_waker() {
     let cx = Context::from_waker(Waker::noop());
-    assert!(catch_unwind(AssertUnwindSafe(|| StoredWaker::new(&cx))).is_err());
+    let payload = catch_unwind(AssertUnwindSafe(|| StoredWaker::new(&cx))).unwrap_err();
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("StoredWaker needs a switch task waker")
+    );
+}
+
+#[test]
+fn stored_waker_new_rejects_a_foreign_thread() {
+    let mut runtime = Runtime::new(0);
+    let state = spawn_parked(&mut runtime, 1).remove(0);
+    let waker = waker(&state);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let cx = Context::from_waker(&waker);
+            let payload = catch_unwind(AssertUnwindSafe(|| StoredWaker::new(&cx))).unwrap_err();
+            assert_eq!(
+                payload.downcast_ref::<&str>().copied(),
+                Some("waker used on foreign thread")
+            );
+        });
+    });
 }
 
 // ---- Thread-local destruction ----

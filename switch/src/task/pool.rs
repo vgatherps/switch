@@ -41,6 +41,9 @@ impl Pool {
         if !pool.is_null() {
             return pool;
         }
+        // Issue the thread tag (it may panic once tags are exhausted) before any
+        // pool or reservation state exists; block allocation reuses it.
+        crate::waker::this_thread_tag();
         let pool = FunctionPool::register(Box::new(FunctionPool {
             spare: Vec::new(),
             registry_next: ptr::null_mut(),

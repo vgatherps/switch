@@ -1,6 +1,6 @@
+use crate::MAX_SLOTS;
 use crate::algorithm::depot_algorithm;
 use crate::index_ring::IndexRing;
-use crate::{DepotHandle, MAX_SLOTS};
 
 /// Runtime-capacity slab allocator using the same allocation algorithm as [`crate::FixedDepot`].
 pub struct DynDepot {
@@ -73,38 +73,6 @@ impl DynDepot {
     }
 
     depot_algorithm!();
-}
-
-impl crate::DepotAlloc for DynDepot {
-    #[inline(always)]
-    fn alloc(&mut self) -> Option<DepotHandle> {
-        DynDepot::alloc(self)
-    }
-
-    #[inline(always)]
-    fn get_or_sentinel(&self, handle: Option<DepotHandle>) -> Option<u32> {
-        DynDepot::get_or_sentinel(self, handle)
-    }
-
-    #[inline(always)]
-    fn validate(&self, handle: DepotHandle) -> Result<u32, crate::AccessError> {
-        DynDepot::validate(self, handle)
-    }
-
-    #[inline(always)]
-    fn validate_live(&self, handle: DepotHandle) -> Option<u32> {
-        DynDepot::validate_live(self, handle)
-    }
-
-    #[inline(always)]
-    unsafe fn free_unchecked(&mut self, handle: DepotHandle) {
-        unsafe { DynDepot::free_unchecked(self, handle) }
-    }
-
-    #[inline(always)]
-    unsafe fn poison_unchecked(&mut self, handle: DepotHandle) {
-        unsafe { DynDepot::poison_unchecked(self, handle) }
-    }
 }
 
 #[cfg(test)]

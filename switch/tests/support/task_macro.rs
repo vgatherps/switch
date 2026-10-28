@@ -1,6 +1,6 @@
 // Hand-written stand-in for `#[switch::task]`, expanding to the items the attribute
 // will generate. Accepts `async fn` and `fn -> impl Future<Output = ()>`, with an
-// optional leading `capacity = N;` (most live tasks of the function per runtime).
+// optional leading `capacity = N;` (most occupied slots of the function per runtime).
 // Shared by unit tests (via `extern crate self as switch`), integration tests,
 // benches and examples.
 

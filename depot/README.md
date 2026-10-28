@@ -64,7 +64,7 @@ again.
 | `free_unchecked` / `poison_unchecked` | unsafe; poison sets the byte to 0, so the slot is never handed out again |
 | `check_invariants()` | full consistency check of bitmaps, caches, ring and generation bytes |
 
-`DepotAlloc` is the trait the pool layer uses. `FixedDepot` has compile-time capacity; `DynDepot::new(slots)`
+`DepotAlloc` is the trait the pool layer uses; only `FixedDepot` implements it. `FixedDepot` has compile-time capacity; `DynDepot::new(slots)`
 has runtime capacity (rounded up to a multiple of 64, at most 2^25, slot 0 reserved) and the same allocation
 algorithm, which `src/algorithm.rs` shares between the two.
 

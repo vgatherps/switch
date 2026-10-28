@@ -11,10 +11,14 @@ pub use super::pool::Pool;
 /// Identifies one task function: its thread-local pool and its capacity.
 ///
 /// # Safety
-/// `pool()` is private to one task function that always produces one future type.
+/// `pool()` is private to one task function that always produces one future
+/// type, and is side-effect free: it returns a `const`-initialized
+/// thread-local and runs no other code. Spawn calls it with the runtime
+/// borrowed, so it must not be able to shut down or drop that runtime.
 pub unsafe trait PoolKey: 'static {
     fn pool() -> &'static std::thread::LocalKey<Pool>;
-    /// Most live tasks of this function per runtime; `None` is one block's slots.
+    /// Most occupied slots of this function per runtime; `None` is one block's
+    /// slots. Checked at compile time: `1 <= N < 2^25`.
     const CAPACITY: Option<u32> = None;
 }
 
@@ -87,6 +91,14 @@ pub unsafe fn token<K: PoolKey, C: FnOnce() -> Fut, Fut: Future<Output = ()> + '
     c: C,
 ) -> SpawnToken<impl Task> {
     let () = Shape::<Fut>::FITS;
+    const {
+        if let Some(capacity) = K::CAPACITY {
+            assert!(
+                capacity >= 1 && capacity < 1 << 25,
+                "task capacity must be at least 1 and below 2^25"
+            );
+        }
+    }
     SpawnToken::new(Payload::<K, C, Fut> {
         build: c,
         _key: PhantomData,
