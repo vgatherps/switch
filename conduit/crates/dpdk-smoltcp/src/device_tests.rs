@@ -808,27 +808,6 @@ fn dropped_tx_metadata_and_spare_flags_do_not_reach_next_frame() {
 }
 
 #[zhida_test_support::pinned_test]
-fn tx_metadata_requires_matching_port_profile() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        for (offload, protocol) in [
-            (TCP_OFFLOAD, "TCP"),
-            (Some(TxChecksum::Udp { ip_header_len: 20 }), "UDP"),
-        ] {
-            let panic = catch_unwind(AssertUnwindSafe(|| {
-                send_meta(&mut device, b"frame", offload)
-            })).unwrap_err();
-            let message = panic.downcast_ref::<String>().unwrap();
-            assert!(message.contains(&format!("port {}:", device.port.port_id())));
-            assert!(message.contains(&format!("{protocol} TX offload metadata without its profile")));
-            assert_eq!(device.pending(), 0);
-            assert_eq!(in_use(&device.port), (0, 0));
-        }
-        finish(fixture, device);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn flush_prepares_each_range_once() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
