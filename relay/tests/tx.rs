@@ -17,6 +17,8 @@ const HEAD: usize = 5;
 const TAIL: usize = 17;
 const FILL: u8 = 0xee;
 
+const CLOSE_RECORD: &[u8] = b"close_notify";
+
 #[derive(Default)]
 struct Log {
     /// Plaintext of each frame sent, in order.
@@ -97,6 +99,12 @@ impl PlainTx for MockTx {
         };
         f.buf[HEAD..HEAD + record.len()].copy_from_slice(&record);
         Ok(Some(self.sealed(f, record.len())))
+    }
+
+    /// A TLS-like close record.
+    fn seal_close(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Infallible> {
+        f.buf[HEAD..HEAD + CLOSE_RECORD.len()].copy_from_slice(CLOSE_RECORD);
+        Ok(Some(self.sealed(f, CLOSE_RECORD.len())))
     }
 
     fn try_send(&mut self, s: MockSealed) -> Result<(), MockSealed> {
@@ -441,4 +449,39 @@ fn no_pending_no_extra_frames() {
     assert_eq!(t.flush(), Ok(true));
     assert_eq!(log.borrow().allocs, 5);
     assert_eq!(log.borrow().take_pending_calls, 0);
+}
+
+/// After the close frame, the lower layer's close record goes out once, last,
+/// through the unsent slot when refused.
+#[test]
+fn shutdown_sends_the_lower_close_after_the_close_frame() {
+    let close = [&[0x88, 2][..], &1000u16.to_be_bytes()].concat();
+
+    // The close frame is refused: the close record may not overtake it.
+    let (mut t, log) = tx(Role::Server, 1430);
+    t.close(&1000u16.to_be_bytes());
+    log.borrow_mut().refuse = 1;
+    assert_eq!(t.shutdown(), Ok(false));
+    assert!(sent(&log).is_empty());
+    assert_eq!(t.shutdown(), Ok(true));
+    assert_eq!(sent(&log), [close.clone(), CLOSE_RECORD.to_vec()]);
+
+    // The close record is refused: it waits in the slot, goes out once.
+    let (mut t, log) = tx(Role::Server, 1430);
+    t.close(&1000u16.to_be_bytes());
+    assert_eq!(t.flush(), Ok(true));
+    log.borrow_mut().refuse = 1;
+    assert_eq!(t.shutdown(), Ok(false));
+    assert_eq!(sent(&log), std::slice::from_ref(&close));
+    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(t.shutdown(), Ok(true));
+    assert_eq!(sent(&log), [close, CLOSE_RECORD.to_vec()]);
+    assert_eq!(log.borrow().seals, 2);
+}
+
+#[test]
+#[should_panic(expected = "shutdown before close")]
+fn shutdown_before_close_panics() {
+    let (mut t, _) = tx(Role::Server, 1430);
+    let _ = t.shutdown();
 }

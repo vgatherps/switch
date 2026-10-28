@@ -89,6 +89,8 @@ pub struct WsTx<L: PlainTx> {
     open: Option<Kind>,
     pong: Option<Control>,
     close: Close,
+    /// The lower layer's end-of-stream record was handed over.
+    shut: bool,
 }
 
 impl<L: PlainTx> WsTx<L> {
@@ -102,7 +104,34 @@ impl<L: PlainTx> WsTx<L> {
             open: None,
             pong: None,
             close: Close::None,
+            shut: false,
         }
+    }
+
+    /// For [`WsRx::recv_via`](crate::WsRx::recv_via): receiving under TLS goes
+    /// through the connection this layer owns. Not public, so nothing can send
+    /// around the unsent slot.
+    pub(crate) fn lower_mut(&mut self) -> &mut L {
+        &mut self.lower
+    }
+
+    /// After the close frame: flush, then send the lower layer's end-of-stream
+    /// record (TLS close_notify) once, through the unsent slot. `Ok(false)`:
+    /// refused; call [`flush`](Self::flush) or this again once there is room.
+    /// Panics if no close was queued.
+    pub fn shutdown(&mut self) -> Result<bool, L::Error> {
+        assert!(!matches!(self.close, Close::None), "shutdown before close");
+        if !self.flush()? {
+            return Ok(false);
+        }
+        if !self.shut {
+            self.shut = true;
+            let f = self.lower.alloc()?;
+            if let Some(s) = self.lower.seal_close(f)? {
+                self.send_sealed(s);
+            }
+        }
+        Ok(self.unsent.is_none())
     }
 
     /// Queue a pong; a newer one replaces one not yet sent (RFC 6455 §5.5.3).

@@ -110,6 +110,10 @@ impl PlainTx for TestTx {
         Ok(None)
     }
 
+    fn seal_close(&mut self, _: TestFrame) -> Result<Option<TestFrame>, SealFailed> {
+        Ok(None)
+    }
+
     fn try_send(&mut self, f: TestFrame) -> Result<(), TestFrame> {
         if self.0.refuse.get() > 0 {
             self.0.refuse.set(self.0.refuse.get() - 1);

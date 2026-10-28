@@ -231,6 +231,11 @@ impl<L: PlainTx> PlainTx for TlsTx<L> {
         !self.pending.is_empty()
     }
 
+    /// close_notify, through [`TlsTx::close_notify`].
+    fn seal_close(&mut self, f: L::Frame) -> Result<Option<Self::Sealed>, Self::Error> {
+        self.close_notify(f).map(Some)
+    }
+
     fn take_pending(&mut self, mut f: L::Frame) -> Result<Option<Self::Sealed>, Self::Error> {
         self.check_sent();
         if matches!(self.state, State::Broken) {

@@ -1,7 +1,8 @@
 //! Receive core: parses WebSocket frames (RFC 6455) out of the lower layer's
 //! runs and hands out messages that borrow the received bytes in place.
 
-use crate::lower::{PlainRx, RxFrame};
+use crate::lower::{PlainRx, PlainTx, RxFrame};
+use crate::tx::WsTx;
 use crate::utf8::Utf8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -519,6 +520,24 @@ impl<R: PlainRx> WsRx<R> {
     pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_, R>>, WsError<R::Error>> {
         let at = self.next(tx)?;
         Ok(at.map(|at| Message { rx: self, at }))
+    }
+
+    /// [`push`](Self::push) for a lower layer that receives through the send
+    /// half's connection (TLS).
+    pub fn push_via<L: PlainTx>(&mut self, f: R::Frame, tx: &mut WsTx<L>) -> Result<(), R::Error>
+    where
+        R: PlainRx<Tx = L>,
+    {
+        self.push(f, tx.lower_mut())
+    }
+
+    /// [`recv`](Self::recv) for a lower layer that receives through the send
+    /// half's connection (TLS).
+    pub fn recv_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<Option<Message<'_, R>>, WsError<R::Error>>
+    where
+        R: PlainRx<Tx = L>,
+    {
+        self.recv(tx.lower_mut())
     }
 
     /// The pong owed for the newest ping, once: a later call returns `None`

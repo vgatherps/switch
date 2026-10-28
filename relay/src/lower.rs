@@ -73,6 +73,10 @@ pub trait PlainTx {
     /// Write those records into `f`; `None`, dropping `f`, when there are none.
     /// Called only when `has_pending()`.
     fn take_pending(&mut self, f: Self::Frame) -> Result<Option<Self::Sealed>, Self::Error>;
+    /// Seal the lower layer's own end-of-stream record into `f` (TLS:
+    /// close_notify); `None`, dropping `f`, when it has none (raw TCP ends
+    /// with FIN, which is not a frame).
+    fn seal_close(&mut self, f: Self::Frame) -> Result<Option<Self::Sealed>, Self::Error>;
     /// Send now, or hand the sealed frame back unchanged when there is no room.
     fn try_send(&mut self, s: Self::Sealed) -> Result<(), Self::Sealed>;
 }
