@@ -54,6 +54,9 @@ pub trait TxFrame {
 /// synchronous send that may refuse.
 pub trait PlainTx {
     type Frame: TxFrame;
+    /// A frame whose bytes are final. Only `seal` and `take_pending` make one
+    /// and only `try_send` takes one, so an unsealed frame cannot be sent.
+    type Sealed;
     type Error;
 
     /// A new, empty frame.
@@ -63,8 +66,13 @@ pub trait PlainTx {
     fn plain(&self) -> (usize, usize);
     /// Turn the plaintext `room_mut()[head..head + len]` into the bytes to send
     /// (TLS: one record; raw: set the length). Under TLS this consumes a
-    /// sequence number, so the frame must then be sent, never dropped.
-    fn seal(&mut self, f: &mut Self::Frame, len: usize) -> Result<(), Self::Error>;
-    /// Send now, or hand the frame back unchanged when there is no room.
-    fn try_send(&mut self, f: Self::Frame) -> Result<(), Self::Frame>;
+    /// sequence number, so the sealed frame must then be sent, never dropped.
+    fn seal(&mut self, f: Self::Frame, len: usize) -> Result<Self::Sealed, Self::Error>;
+    /// The lower layer has records to send on its own (TLS: an alert).
+    fn has_pending(&self) -> bool;
+    /// Write those records into `f`; `None`, dropping `f`, when there are none.
+    /// Called only when `has_pending()`.
+    fn take_pending(&mut self, f: Self::Frame) -> Result<Option<Self::Sealed>, Self::Error>;
+    /// Send now, or hand the sealed frame back unchanged when there is no room.
+    fn try_send(&mut self, s: Self::Sealed) -> Result<(), Self::Sealed>;
 }

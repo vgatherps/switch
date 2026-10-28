@@ -26,6 +26,9 @@ struct Log {
     refused: usize,
     allocs: usize,
     seals: u64,
+    /// Records the lower layer must send on its own, oldest first.
+    pending: Vec<Vec<u8>>,
+    take_pending_calls: usize,
 }
 
 /// A TLS-shaped lower layer: plaintext at `HEAD`, `TAIL` bytes after it.
@@ -38,50 +41,74 @@ struct MockTx {
 
 struct MockFrame {
     buf: Vec<u8>,
-    len: usize,
-    seq: Option<u64>,
 }
 
 impl TxFrame for MockFrame {
     fn room_mut(&mut self) -> &mut [u8] {
-        assert!(self.seq.is_none(), "frame written after seal");
         &mut self.buf
+    }
+}
+
+struct MockSealed {
+    buf: Vec<u8>,
+    len: usize,
+    seq: u64,
+}
+
+impl MockTx {
+    fn sealed(&mut self, f: MockFrame, len: usize) -> MockSealed {
+        assert!(len <= self.room);
+        let mut log = self.log.borrow_mut();
+        log.seals += 1;
+        MockSealed { buf: f.buf, len, seq: log.seals - 1 }
     }
 }
 
 impl PlainTx for MockTx {
     type Frame = MockFrame;
+    type Sealed = MockSealed;
     type Error = Infallible;
 
     fn alloc(&mut self) -> Result<MockFrame, Infallible> {
         self.log.borrow_mut().allocs += 1;
-        Ok(MockFrame { buf: vec![FILL; HEAD + self.room + TAIL], len: 0, seq: None })
+        Ok(MockFrame { buf: vec![FILL; HEAD + self.room + TAIL] })
     }
 
     fn plain(&self) -> (usize, usize) {
         (HEAD, self.room)
     }
 
-    fn seal(&mut self, f: &mut MockFrame, len: usize) -> Result<(), Infallible> {
-        assert!(f.seq.is_none(), "sealed twice");
-        assert!(len <= self.room);
-        let mut log = self.log.borrow_mut();
-        f.seq = Some(log.seals);
-        f.len = len;
-        log.seals += 1;
-        Ok(())
+    fn seal(&mut self, f: MockFrame, len: usize) -> Result<MockSealed, Infallible> {
+        Ok(self.sealed(f, len))
     }
 
-    fn try_send(&mut self, f: MockFrame) -> Result<(), MockFrame> {
+    fn has_pending(&self) -> bool {
+        !self.log.borrow().pending.is_empty()
+    }
+
+    fn take_pending(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Infallible> {
+        let record = {
+            let mut log = self.log.borrow_mut();
+            log.take_pending_calls += 1;
+            if log.pending.is_empty() {
+                return Ok(None);
+            }
+            log.pending.remove(0)
+        };
+        f.buf[HEAD..HEAD + record.len()].copy_from_slice(&record);
+        Ok(Some(self.sealed(f, record.len())))
+    }
+
+    fn try_send(&mut self, s: MockSealed) -> Result<(), MockSealed> {
         let mut log = self.log.borrow_mut();
         if log.refuse > 0 {
             log.refuse -= 1;
             log.refused += 1;
-            return Err(f);
+            return Err(s);
         }
-        assert_eq!(f.seq, Some(log.sent.len() as u64), "sent out of seal order or a frame was dropped");
-        assert!(f.buf[..HEAD].iter().all(|&b| b == FILL), "wrote before the plaintext head");
-        log.sent.push(f.buf[HEAD..HEAD + f.len].to_vec());
+        assert_eq!(s.seq, log.sent.len() as u64, "sent out of seal order or a frame was dropped");
+        assert!(s.buf[..HEAD].iter().all(|&b| b == FILL), "wrote before the plaintext head");
+        log.sent.push(s.buf[HEAD..HEAD + s.len].to_vec());
         Ok(())
     }
 }
@@ -360,4 +387,58 @@ fn other_kind_while_a_message_is_open_panics() {
     let (mut t, _) = tx(Role::Server, 1430);
     t.frame(Kind::Text).unwrap().unwrap().commit(0, false).unwrap();
     let _ = t.frame(Kind::Binary);
+}
+
+/// Flush order: the refused frame, then the lower layer's own records, then
+/// the pong, then the close; a refusal stops it and the rest waits in order.
+#[test]
+fn flush_order_unsent_pending_pong_close() {
+    let (mut t, log) = tx(Role::Server, 1430);
+    log.borrow_mut().refuse = 1;
+    send_all(&mut t, Kind::Binary, b"data");
+    log.borrow_mut().pending = vec![b"alert1".to_vec(), b"alert2".to_vec()];
+    t.pong(b"p");
+    t.close(&1000u16.to_be_bytes());
+    // The pending records come after the refused frame and are not lost when it is refused again.
+    log.borrow_mut().refuse = 1;
+    assert_eq!(t.flush(), Ok(false));
+    assert!(sent(&log).is_empty());
+    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(
+        sent(&log),
+        [
+            [&[0x82, 4][..], b"data"].concat(),
+            b"alert1".to_vec(),
+            b"alert2".to_vec(),
+            [&[0x8a, 1][..], b"p"].concat(),
+            [&[0x88, 2][..], &1000u16.to_be_bytes()].concat(),
+        ]
+    );
+    assert_eq!(log.borrow().take_pending_calls, 2);
+}
+
+/// A refused pending record is kept, sent first, and stops the pong behind it.
+#[test]
+fn refused_pending_record_is_kept() {
+    let (mut t, log) = tx(Role::Server, 1430);
+    log.borrow_mut().pending = vec![b"alert".to_vec()];
+    t.pong(b"p");
+    log.borrow_mut().refuse = 1;
+    assert_eq!(t.flush(), Ok(false));
+    assert!(sent(&log).is_empty());
+    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(sent(&log), [b"alert".to_vec(), [&[0x8a, 1][..], b"p"].concat()]);
+}
+
+/// Without pending records, sending allocates exactly one frame per WebSocket
+/// frame and never asks for pending records.
+#[test]
+fn no_pending_no_extra_frames() {
+    let (mut t, log) = tx(Role::Client, 1430);
+    for _ in 0..5 {
+        send_all(&mut t, Kind::Text, b"hi");
+    }
+    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(log.borrow().allocs, 5);
+    assert_eq!(log.borrow().take_pending_calls, 0);
 }

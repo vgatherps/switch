@@ -84,7 +84,7 @@ pub struct WsTx<L: PlainTx> {
     lower: L,
     /// Mask source; `Some` iff client role.
     rng: Option<StdRng>,
-    unsent: Option<L::Frame>,
+    unsent: Option<L::Sealed>,
     /// Kind of the fragmented message being sent.
     open: Option<Kind>,
     pong: Option<Control>,
@@ -122,29 +122,40 @@ impl<L: PlainTx> WsTx<L> {
         }
     }
 
-    /// Send what waits: the refused frame, then a queued pong, then a queued
-    /// close. `Ok(false)`: the lower layer refused; call again once it has room.
+    /// Send what waits: the refused frame, then the lower layer's own records,
+    /// then a queued pong, then a queued close. `Ok(false)`: the lower layer
+    /// refused; call again once it has room.
     pub fn flush(&mut self) -> Result<bool, L::Error> {
-        if let Some(f) = self.unsent.take()
-            && let Err(f) = self.lower.try_send(f)
-        {
-            self.unsent = Some(f);
-            return Ok(false);
+        if let Some(s) = self.unsent.take() {
+            self.send_sealed(s);
         }
-        if let Some(p) = self.pong.take() {
-            self.control(PONG, p)?;
-            if self.unsent.is_some() {
-                return Ok(false);
+        while self.unsent.is_none() && self.lower.has_pending() {
+            let f = self.lower.alloc()?;
+            match self.lower.take_pending(f)? {
+                Some(s) => self.send_sealed(s),
+                None => break,
             }
         }
-        if let Close::Queued(c) = self.close {
+        if self.unsent.is_none()
+            && let Some(p) = self.pong.take()
+        {
+            self.control(PONG, p)?;
+        }
+        if self.unsent.is_none()
+            && let Close::Queued(c) = self.close
+        {
             self.close = Close::Sent;
             self.control(CLOSE, c)?;
-            if self.unsent.is_some() {
-                return Ok(false);
-            }
         }
-        Ok(true)
+        Ok(self.unsent.is_none())
+    }
+
+    /// Send `s`, or keep it to be sent first by the next call.
+    fn send_sealed(&mut self, s: L::Sealed) {
+        debug_assert!(self.unsent.is_none());
+        if let Err(s) = self.lower.try_send(s) {
+            self.unsent = Some(s);
+        }
     }
 
     /// One frame to write a payload into, after [`flush`](Self::flush);
@@ -213,10 +224,8 @@ impl<L: PlainTx> WsTx<L> {
                 *b ^= k[i & 3];
             }
         }
-        self.lower.seal(&mut f, h + len)?;
-        if let Err(f) = self.lower.try_send(f) {
-            self.unsent = Some(f);
-        }
+        let s = self.lower.seal(f, h + len)?;
+        self.send_sealed(s);
         Ok(())
     }
 }
