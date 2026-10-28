@@ -182,6 +182,18 @@ pub struct Sent {
 ///
 /// Socket handles own their sockets and queue cleanup when dropped.
 /// Handles may outlive the Stack; dropping them afterwards is harmless.
+///
+/// # Panics
+///
+/// `turn`, `receive` and `send` panic if `Port::alloc_tx` does: its TX done
+/// cleanup failing with an error other than `-ENOTSUP`. With
+/// `Offloads::tx_tcp_checksum` or `Offloads::tx_udp_checksum` on, these and
+/// `flush` also panic when a queued frame fails TX checksum preparation (see
+/// [`Offloads::tx_tcp_checksum`](crate::Offloads::tx_tcp_checksum) and
+/// [`Offloads::tx_udp_checksum`](crate::Offloads::tx_udp_checksum)).
+///
+/// A panic unwinding out of any of them leaves the Stack unusable: drop it or
+/// call `into_port`, nothing else.
 pub struct Stack {
     iface: Interface,
     /// Exactly `max_sockets` slots, never grown.
@@ -320,15 +332,7 @@ impl Stack {
     /// through in the same loop iteration: `tx_accepted` and `tx_pending`
     /// differ, and so can a later call's `rx_staged`.
     ///
-    /// Panics if `Port::alloc_tx` does: its TX done cleanup failing with an
-    /// error other than `-ENOTSUP`. With `Offloads::tx_tcp_checksum` or
-    /// `Offloads::tx_udp_checksum` on, also panics when a queued frame fails
-    /// TX checksum preparation
-    /// (see [`Offloads::tx_tcp_checksum`](crate::Offloads::tx_tcp_checksum) and
-    /// [`Offloads::tx_udp_checksum`](crate::Offloads::tx_udp_checksum)).
-    ///
-    /// A panic unwinding out of `turn` leaves the Stack unusable: drop it or
-    /// call `into_port`, nothing else.
+    /// Panics as described in [Panics](Stack#panics).
     pub fn turn(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         let mut turn = self.ingress(now, ingress_budget)?;
         turn.tx_accepted += self.egress()?;
@@ -352,15 +356,7 @@ impl Stack {
     /// with different `tx_accepted` and `tx_pending`, and so a different
     /// `rx_staged` in a later call.
     ///
-    /// Panics if `Port::alloc_tx` does: its TX done cleanup failing with an
-    /// error other than `-ENOTSUP`. With `Offloads::tx_tcp_checksum` or
-    /// `Offloads::tx_udp_checksum` on, also panics when a queued frame fails
-    /// TX checksum preparation
-    /// (see [`Offloads::tx_tcp_checksum`](crate::Offloads::tx_tcp_checksum) and
-    /// [`Offloads::tx_udp_checksum`](crate::Offloads::tx_udp_checksum)).
-    ///
-    /// A panic unwinding out of `receive` leaves the Stack unusable: drop it
-    /// or call `into_port`, nothing else.
+    /// Panics as described in [Panics](Stack#panics).
     pub fn receive(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         let mut turn = self.ingress(now, ingress_budget)?;
         if turn.tx_pending != 0 {
@@ -381,15 +377,7 @@ impl Stack {
     /// Needs no preceding `receive` and may repeat; with nothing to send it
     /// sends nothing.
     ///
-    /// Panics if `Port::alloc_tx` does: its TX done cleanup failing with an
-    /// error other than `-ENOTSUP`. With `Offloads::tx_tcp_checksum` or
-    /// `Offloads::tx_udp_checksum` on, also panics when a queued frame fails
-    /// TX checksum preparation
-    /// (see [`Offloads::tx_tcp_checksum`](crate::Offloads::tx_tcp_checksum) and
-    /// [`Offloads::tx_udp_checksum`](crate::Offloads::tx_udp_checksum)).
-    ///
-    /// A panic unwinding out of `send` leaves the Stack unusable: drop it or
-    /// call `into_port`, nothing else.
+    /// Panics as described in [Panics](Stack#panics).
     pub fn send(&mut self) -> Result<Sent, StackError> {
         self.tidy();
         let tx_accepted = self.egress()?;
@@ -405,15 +393,8 @@ impl Stack {
     /// Retry on the caller's bounded cadence when frames remain pending.
     /// Builds no frames and does not change time; time rules are in [`Self::turn`].
     ///
-    /// TX checksum preparation happens here. With `Offloads::tx_tcp_checksum`
-    /// or `Offloads::tx_udp_checksum` on, panics when a queued frame fails preparation
-    /// (see [`Offloads::tx_tcp_checksum`](crate::Offloads::tx_tcp_checksum) and
-    /// [`Offloads::tx_udp_checksum`](crate::Offloads::tx_udp_checksum)).
-    /// Unlike receive and send calls, this call does not use `Port::alloc_tx`
-    /// or its TX done cleanup, so it cannot panic from that cleanup.
-    ///
-    /// A panic unwinding out of `flush` leaves the Stack unusable: drop it or
-    /// call `into_port`, nothing else.
+    /// TX checksum preparation happens here; panics as described in
+    /// [Panics](Stack#panics), except that `flush` does not use `Port::alloc_tx`.
     pub fn flush(&mut self) -> Result<Sent, StackError> {
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         Ok(Sent {
