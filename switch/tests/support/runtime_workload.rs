@@ -57,7 +57,8 @@ impl Future for Task {
         }
         if self.yields != 0 {
             self.yields -= 1;
-            cx.waker().wake_by_ref();
+            // Deferred: the yield takes the task to the next turn.
+            switch::StoredWaker::new(cx).wake_deferred();
             return Poll::Pending;
         }
         self.audit.complete(self.value);
@@ -176,7 +177,8 @@ impl Future for Repeated {
             return Poll::Ready(());
         }
         assert!(Pin::new(&mut self.sleep).poll(cx).is_pending());
-        cx.waker().wake_by_ref();
+        // Deferred: one poll per turn.
+        switch::StoredWaker::new(cx).wake_deferred();
         Poll::Pending
     }
 }

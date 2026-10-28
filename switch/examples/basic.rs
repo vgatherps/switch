@@ -1,24 +1,5 @@
 //! Basic example.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-struct YieldOnce(bool);
-
-impl Future for YieldOnce {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
 #[switch::task]
 async fn immediate() {
     println!("Task 1: immediate");
@@ -27,7 +8,7 @@ async fn immediate() {
 #[switch::task]
 async fn yield_once() {
     println!("Task 2: start");
-    YieldOnce(false).await;
+    switch::yield_now().await;
     println!("Task 2: after yield");
 }
 

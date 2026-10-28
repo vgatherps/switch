@@ -113,7 +113,7 @@ fn regressed_time_preserves_clock_timer_and_task_state() {
 }
 
 #[test]
-fn spawned_task_enters_current_snapshot_and_future_spawn_selfwake_enter_next() {
+fn spawned_task_and_selfwake_run_in_the_next_round_of_the_same_poll() {
     struct Parent {
         spawner: Spawner,
         step: usize,
@@ -146,10 +146,10 @@ fn spawned_task_enters_current_snapshot_and_future_spawn_selfwake_enter_next() {
         task
     }
     spawner.spawn(parent_task(parent)).unwrap();
-    assert_eq!(runtime.poll(7).unwrap(), report(1, 0, 0, 2, 2));
-    assert_eq!(ran.get(), 0);
-    assert_eq!(runtime.poll(7).unwrap(), report(2, 2, 0, 0, 0));
+    // Round one polls the parent; round two the child and the parent's one claim.
+    assert_eq!(runtime.poll(7).unwrap(), report(3, 2, 0, 0, 0));
     assert_eq!(ran.get(), 1);
+    assert_eq!(runtime.poll(7).unwrap(), report(0, 0, 0, 0, 0));
 }
 
 #[test]

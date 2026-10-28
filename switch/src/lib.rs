@@ -10,7 +10,11 @@
 //! caller-defined, and absolute deadlines may use the full `u64` range. A relative sleep
 //! captures the latest accepted tick when it is created.
 //!
-//! A poll accepts an equal or later tick, advances timers, then polls one ready-task snapshot.
+//! A poll accepts an equal or later tick, advances timers, then polls ready tasks in rounds:
+//! each round polls a snapshot of the woken tasks, and tasks woken or spawned during a
+//! round run in the next one, until none are left or 1024 tasks were polled (checked
+//! between rounds). [`StoredWaker::wake_deferred`] and [`yield_now`] instead move a task
+//! to the next poll.
 //! Work that wakes or spawns tasks must run before [`Runtime::poll`]; those tasks are polled by
 //! that call. The runtime never waits, though future code can block. A regressed tick returns
 //! [`RuntimeError::TimeRegressed`] without changing runtime state.
@@ -160,7 +164,7 @@ pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;
 pub use task::SpawnToken;
 pub use task::join::JoinHandle;
-pub use waker::StoredWaker;
+pub use waker::{StoredWaker, YieldNow, yield_now};
 
 #[doc(hidden)]
 pub use task::private as __private;

@@ -269,7 +269,8 @@ fn capacity_counts_a_completed_task_until_its_queued_wake_drains() {
     fn wake_then_finish(state: Rc<State>) -> impl Future<Output = ()> {
         std::future::poll_fn(move |cx| {
             state.polls.set(state.polls.get() + 1);
-            cx.waker().wake_by_ref();
+            // Deferred, so the wake is still queued when `poll` returns.
+            StoredWaker::new(cx).wake_deferred();
             Poll::Ready(())
         })
     }

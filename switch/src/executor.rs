@@ -31,6 +31,9 @@ pub(crate) enum Lifecycle {
     Closing,
 }
 
+/// Most task polls in one `Runtime::poll`, checked between rounds.
+pub(crate) const POLL_BUDGET: usize = 1024;
+
 /// Single-threaded executor.
 ///
 /// Two-vector swap model: wakes go to `incoming`, we iterate `run_queue`,
@@ -40,6 +43,9 @@ pub struct Executor {
     run_queue: Vec<*const TaskHeader>,
     /// Incoming wakes (spawns and wakes during poll).
     incoming: Vec<*const TaskHeader>,
+    /// Tasks woken with `StoredWaker::wake_deferred`; moved into `incoming` at
+    /// the start of the next `Runtime::poll`.
+    deferred: Vec<*const TaskHeader>,
     /// Number of live tasks.
     task_count: usize,
     /// Slots in use; both queues keep at least this capacity.
@@ -66,6 +72,7 @@ impl Executor {
         Self {
             run_queue: Vec::with_capacity(tasks),
             incoming: Vec::with_capacity(tasks),
+            deferred: Vec::with_capacity(tasks),
             task_count: 0,
             allocated: 0,
             pools: Vec::new(),
@@ -134,7 +141,11 @@ impl Executor {
                 .allocated
                 .checked_add(1)
                 .expect("task count overflow");
-            for queue in [&mut (*this).run_queue, &mut (*this).incoming] {
+            for queue in [
+                &mut (*this).run_queue,
+                &mut (*this).incoming,
+                &mut (*this).deferred,
+            ] {
                 if queue.capacity() < needed {
                     queue.reserve(needed - queue.len());
                 }
@@ -185,6 +196,45 @@ impl Executor {
         }
     }
 
+    /// As [`Self::wake`], into `deferred`: the task runs in the next poll.
+    ///
+    /// # Safety
+    /// Owner thread; `header` heads a slot of a block.
+    #[inline]
+    pub(crate) unsafe fn wake_deferred(header: *const TaskHeader) {
+        unsafe {
+            let flags = TaskHeader::flags(header);
+            let current = flags.get();
+            if current & (LIVE | QUEUED) != LIVE {
+                return;
+            }
+            let this = Meta::executor(TaskHeader::meta(header));
+            if (*this).lifecycle != Lifecycle::Open {
+                return;
+            }
+            flags.set(current | QUEUED);
+            (*this).deferred.push(header);
+        }
+    }
+
+    /// Move deferred wakes into `incoming`, at the start of a poll.
+    ///
+    /// # Safety
+    /// Stable owner-thread pointer to a live executor.
+    #[inline]
+    pub(crate) unsafe fn undefer(this: *mut Self) {
+        unsafe {
+            if !(*this).deferred.is_empty() {
+                // Deferred wakes came first (during the last poll): they run first.
+                // Every slot has at most one queue entry: no reallocation.
+                (*this).deferred.append(&mut (*this).incoming);
+                std::mem::swap(&mut (*this).deferred, &mut (*this).incoming);
+            }
+        }
+    }
+
+    /// Poll one round (one snapshot of `incoming`), for tests of round order.
+    ///
     /// # Safety
     /// Stable owner-thread pointer; no active turn/cleanup; executor accepts work.
     #[cfg(test)]
@@ -194,8 +244,9 @@ impl Executor {
             if (*this).incoming.is_empty() {
                 return false;
             }
-            let mut turn = Self::enter_turn(this);
-            let report = Self::poll_batch(&mut turn);
+            let turn = Self::enter_turn(this);
+            let mut report = BatchReport::default();
+            Self::poll_round(this, &mut report);
             turn.finish();
             report.queue_work
         }
@@ -221,14 +272,28 @@ impl Executor {
         }
     }
 
+    /// Poll rounds: each round polls a snapshot of `incoming`, and another round
+    /// follows while `incoming` is not empty and fewer than [`POLL_BUDGET`] polls
+    /// were made (the budget never cuts a round short).
+    ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
     pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> BatchReport {
         unsafe {
             let this = turn.owner;
             let mut report = BatchReport::default();
-            if (*this).incoming.is_empty() {
-                return report;
+            while !(*this).incoming.is_empty() && report.polled < POLL_BUDGET {
+                Self::poll_round(this, &mut report);
             }
+            report
+        }
+    }
+
+    /// Poll one snapshot of `incoming`.
+    ///
+    /// # Safety
+    /// As for [`Self::poll_batch`].
+    unsafe fn poll_round(this: *mut Self, report: &mut BatchReport) {
+        unsafe {
             report.queue_work = true;
             std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
             let batch_len = (*this).run_queue.len();
@@ -257,7 +322,6 @@ impl Executor {
                 }
             }
             (*this).run_queue.clear();
-            report
         }
     }
 
@@ -283,6 +347,7 @@ impl Executor {
             (*this)
                 .incoming
                 .iter()
+                .chain(&(*this).deferred)
                 .filter(|&&header| TaskHeader::is_live(header))
                 .count()
         }
@@ -324,6 +389,7 @@ impl Executor {
             Mailbox::close((*this).mailbox);
             (*this).run_queue.clear();
             (*this).incoming.clear();
+            (*this).deferred.clear();
             // No spawn succeeds while Closing, and no reservation is open.
             for header in Self::slots(this) {
                 if TaskHeader::flags(header).get() & TAKEN != 0 {
@@ -472,23 +538,7 @@ impl Default for Executor {
 mod tests {
     use crate::runtime::Runtime;
     use std::cell::Cell;
-    use std::pin::Pin;
     use std::rc::Rc;
-    use std::task::{Context, Poll};
-
-    struct YieldN(u32);
-    impl Future for YieldN {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.0 == 0 {
-                Poll::Ready(())
-            } else {
-                self.0 -= 1;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
 
     #[switch::task]
     async fn set_flag(flag: Rc<Cell<bool>>) {
@@ -497,7 +547,9 @@ mod tests {
 
     #[switch::task]
     async fn yield_then_count(count: Rc<Cell<usize>>) {
-        YieldN(3).await;
+        for _ in 0..3 {
+            crate::yield_now().await;
+        }
         count.set(count.get() + 1);
     }
 

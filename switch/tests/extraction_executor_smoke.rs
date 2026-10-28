@@ -16,7 +16,8 @@ impl Future for WakeOnce {
             Poll::Ready(())
         } else {
             self.0 = true;
-            cx.waker().wake_by_ref();
+            // Deferred: a plain self-wake would run again in this same poll.
+            switch::StoredWaker::new(cx).wake_deferred();
             Poll::Pending
         }
     }

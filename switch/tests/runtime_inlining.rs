@@ -20,7 +20,8 @@ impl Future for YieldingSleep {
         match Pin::new(&mut self.sleep).poll(cx) {
             Poll::Pending => {
                 self.trace.borrow_mut().push("pending");
-                cx.waker().wake_by_ref();
+                // Deferred: one poll per turn.
+                switch::StoredWaker::new(cx).wake_deferred();
                 Poll::Pending
             }
             Poll::Ready(result) => {

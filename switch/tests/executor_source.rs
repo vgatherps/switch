@@ -8,21 +8,6 @@ use std::task::{Context, Poll, Waker};
 
 use switch::{Runtime, Spawner};
 
-struct YieldN(u32);
-
-impl Future for YieldN {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 == 0 {
-            Poll::Ready(())
-        } else {
-            self.0 -= 1;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
 /// Demonstrates how a runtime primitive would store a waker.
 struct ManualWake {
     waker_slot: Rc<Cell<Option<Waker>>>,
@@ -49,7 +34,9 @@ async fn set_true(flag: Rc<Cell<bool>>) {
 
 #[switch::task]
 async fn yield_then_set_one(count: Rc<Cell<u32>>) {
-    YieldN(3).await;
+    for _ in 0..3 {
+        switch::yield_now().await;
+    }
     count.set(1);
 }
 
@@ -82,7 +69,7 @@ async fn log_around_yield(
     let mut v = log.take();
     v.push(start);
     log.set(v);
-    YieldN(1).await;
+    switch::yield_now().await;
     let mut v = log.take();
     v.push(end);
     log.set(v);
@@ -161,19 +148,11 @@ fn test_nested_spawn() {
         .spawn(spawn_set_true(inner_spawner, inner_ran.clone()))
         .unwrap();
 
+    // The spawned task runs in the same poll's next round.
     let first = runtime.poll(0).unwrap();
     assert_eq!(
         (first.tasks_polled, first.tasks_completed, first.live_tasks),
-        (1, 1, 1)
-    );
-    let second = runtime.poll(0).unwrap();
-    assert_eq!(
-        (
-            second.tasks_polled,
-            second.tasks_completed,
-            second.live_tasks
-        ),
-        (1, 1, 0)
+        (2, 2, 0)
     );
     assert!(inner_ran.get());
 }

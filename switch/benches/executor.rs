@@ -18,29 +18,17 @@ impl Future for Ready {
     }
 }
 
-struct YieldN(u32);
-impl Future for YieldN {
-    type Output = ();
-    #[inline]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 == 0 {
-            Poll::Ready(())
-        } else {
-            self.0 -= 1;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
 #[switch::task]
 fn ready() -> impl Future<Output = ()> {
     Ready
 }
 
+/// Yields `n` times, one `Runtime::poll` per yield.
 #[switch::task]
-fn yield_n(n: u32) -> impl Future<Output = ()> {
-    YieldN(n)
+async fn yield_n(n: u32) {
+    for _ in 0..n {
+        switch::yield_now().await;
+    }
 }
 
 fn bench_spawn_ready(c: &mut Criterion) {
@@ -112,7 +100,8 @@ fn bench_yield_chain(c: &mut Criterion) {
 }
 
 /// Pure yield benchmark - no spawn/destroy in the hot path.
-/// Spawns once, then each iteration is just: poll -> wake -> pending.
+/// Spawns once, then each iteration is just: poll -> deferred wake -> pending.
+/// (A plain self-wake would be polled again in the same `poll`, up to its budget.)
 fn bench_pure_yield(c: &mut Criterion) {
     // Future that yields forever until we tell it to stop
     struct YieldForever {
@@ -126,7 +115,7 @@ fn bench_pure_yield(c: &mut Criterion) {
             if self.stop.get() {
                 Poll::Ready(())
             } else {
-                cx.waker().wake_by_ref();
+                StoredWaker::new(cx).wake_deferred();
                 Poll::Pending
             }
         }

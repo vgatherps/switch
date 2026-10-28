@@ -154,6 +154,44 @@ impl StoredWaker {
     pub fn wake(self) {
         unsafe { Executor::wake(self.header.as_ptr()) }
     }
+
+    /// Wake the task for the next [`crate::Runtime::poll`], not this one: unlike
+    /// [`Self::wake`], it is not polled again in the current poll's later rounds.
+    #[inline]
+    pub fn wake_deferred(&self) {
+        unsafe { Executor::wake_deferred(self.header.as_ptr()) }
+    }
+}
+
+/// Lets the runtime's other tasks run: the first poll wakes the task for the
+/// next [`crate::Runtime::poll`] ([`StoredWaker::wake_deferred`]) and returns
+/// `Pending`, the second returns `Ready`.
+///
+/// # Panics
+/// When polled outside a switch task, like [`StoredWaker::new`].
+pub fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
+}
+
+/// The future of [`yield_now`].
+#[must_use = "futures do nothing unless awaited"]
+#[derive(Debug)]
+pub struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    #[inline]
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> std::task::Poll<()> {
+        if self.yielded {
+            return std::task::Poll::Ready(());
+        }
+        self.yielded = true;
+        StoredWaker::new(cx).wake_deferred();
+        std::task::Poll::Pending
+    }
 }
 
 /// Whether `waker` is the waker of the task headed by `header`.

@@ -181,11 +181,13 @@ impl Runtime {
         }
     }
 
-    /// Advance to `now` and poll one ready snapshot.
+    /// Advance to `now` and poll ready tasks in rounds.
     ///
     /// Equal ticks are accepted. A lower tick returns `TimeRegressed` before state changes.
-    /// This method never waits, though future code can block. Tasks woken or spawned before
-    /// this call are polled in this ready-task snapshot.
+    /// This method never waits, though future code can block. The first round polls the
+    /// tasks woken or spawned before this call (deferred wakes first); tasks woken or
+    /// spawned in a round run in the next. Rounds continue until no task is woken or
+    /// 1024 tasks were polled; the limit is checked between rounds.
     pub fn poll(&mut self, now: u64) -> Result<PollReport, RuntimeError> {
         let root = self.control.open_core()?;
         unsafe {
@@ -202,6 +204,7 @@ impl Runtime {
             if Mailbox::pending(mailbox) {
                 Mailbox::deliver(mailbox);
             }
+            Executor::undefer(root);
             (*root)
                 .timers
                 .advance_to(now)
