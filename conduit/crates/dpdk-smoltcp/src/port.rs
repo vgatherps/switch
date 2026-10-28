@@ -5,12 +5,11 @@ use std::mem::ManuallyDrop;
 use std::ptr::{null_mut, NonNull};
 use std::rc::Rc;
 
-use smoltcp::phy::{RxBuf, TxAlloc, TxSource};
-use zhida_buffer::{Mbuf, PoolConfig, PoolCreateError};
+use smoltcp::phy::{RxBuf, TxSource};
+use zhida_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
 use zhida_dpdk_sys::*;
 
 use crate::eal::{Eal, PoolResources};
-use crate::frame_pool::FramePool;
 
 /// Static properties and MAC address reported by a DPDK ethdev.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,7 +463,7 @@ pub struct Port {
     tx: ManuallyDrop<PoolResources>,
     /// This Port's clone of the frame pool; other clones may outlive the Port.
     frame: ManuallyDrop<Rc<FramePool>>,
-    /// The frame pool's identity (`TxAlloc::origin`), kept here so the publish
+    /// The frame pool's mempool (every frame's `TxBuf::origin`), kept here so the publish
     /// check reads one field.
     frame_origin: NonNull<()>,
     rx_scratch: Box<[*mut rte_mbuf]>,
@@ -590,8 +589,10 @@ impl Port {
             direction: "TX",
             error,
         })?;
+        // The largest UDP payload; `data_room_size` >= headroom + frame was checked above.
+        let frame_room = (config.mtu + 14).saturating_sub(42);
         let frame_pool =
-            FramePool::new(config.frame_pool, config.mtu).map_err(|error| PortError::Pool {
+            FramePool::new(config.frame_pool, frame_room).map_err(|error| PortError::Pool {
                 direction: "frame",
                 error,
             })?;
@@ -608,7 +609,7 @@ impl Port {
             descriptors: (config.rx_descriptors, config.tx_descriptors),
             rx: ManuallyDrop::new(rx),
             tx: ManuallyDrop::new(tx),
-            frame_origin: smoltcp::phy::TxAlloc::origin(&frame_pool),
+            frame_origin: NonNull::new(frame_pool.mempool()).expect("a frame pool has a mempool").cast(),
             frame: ManuallyDrop::new(Rc::new(frame_pool)),
             rx_scratch: vec![null_mut(); usize::from(config.rx_burst)].into_boxed_slice(),
             tx_scratch: vec![null_mut(); usize::from(config.tx_burst)].into_boxed_slice(),
@@ -763,7 +764,7 @@ impl Port {
         &self.frame
     }
 
-    /// The frame pool's `TxAlloc::origin`.
+    /// The frame pool's mempool: every frame's `TxBuf::origin`.
     pub(crate) fn frame_origin(&self) -> NonNull<()> {
         self.frame_origin
     }
@@ -772,8 +773,7 @@ impl Port {
     /// keeps the pool's backing alive, so a socket outliving this Port still
     /// releases its frames into a live pool.
     pub(crate) fn frame_source(&self) -> TxSource {
-        let pool: Rc<dyn TxAlloc> = Rc::<FramePool>::clone(&self.frame);
-        TxSource::new(pool)
+        TxSource::new(Rc::clone(&self.frame))
     }
 
     pub(crate) fn rx_checksum_enabled(&self) -> bool {

@@ -6,7 +6,7 @@ use smoltcp::iface::{
     SocketHandle, TcpCounters, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpCounters, UdpSendError, UdpSet,
     UdpSocket,
 };
-use smoltcp::phy::{HeldFrames, TxAlloc as _, TxFrame};
+use smoltcp::phy::{HeldFrames, TxFrame};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -429,7 +429,7 @@ impl Stack {
     /// MTU − 28, the largest UDP payload. `None` when the pool is empty.
     /// Dropping the frame returns it to the pool.
     pub fn tx_frame(&mut self) -> Option<TxFrame> {
-        self.device.frame_pool().alloc().map(TxFrame::new)
+        TxFrame::alloc(self.device.frame_pool())
     }
 
     fn set_now(&mut self, now: Instant) -> Result<(), StackError> {
@@ -664,9 +664,10 @@ impl Stack {
         self.udp.get_mut(raw)
     }
 
-    /// Write one datagram in place at this Stack's current time.
-    /// `to` may be omitted for a connected socket. Errors return before `fill` runs.
-    /// The frame joins TCP frames in the shared pending FIFO in call order and
+    /// Copy one datagram into the shared pending FIFO at this Stack's current
+    /// time, in call order with TCP frames; for payloads the caller already
+    /// holds. To write a payload in place, fill a `tx_frame` and use
+    /// `udp_send_frame`. `to` may be omitted for a connected socket. The packet
     /// leaves on `flush`, or the flush inside `turn`, `receive` or `send`.
     ///
     /// `WouldBlock` means the pending queue or TX pool is full: flush, then retry.
@@ -674,33 +675,16 @@ impl Stack {
     /// also blocks ingress (`Turn::rx_blocked`) if the PMD refuses its frames;
     /// `receive` and `turn` flush first but can remain blocked if TX cannot progress.
     /// A send loop must call `receive` or `turn` to take ARP replies and advance time.
-    pub fn udp_send_with(
-        &mut self,
-        handle: &UdpHandle,
-        to: Option<IpEndpoint>,
-        len: usize,
-        fill: impl FnOnce(&mut [u8]),
-    ) -> Result<(), UdpSendError> {
-        let raw = self.udp_raw(handle);
-        let target = self.iface.udp_target(&self.udp, raw, to, len)?;
-        self.iface
-            .udp_send(&mut self.device, &mut self.udp, target, fill)
-    }
-
-    /// Copy one datagram into the shared pending FIFO, in call order with TCP frames.
-    /// `WouldBlock` means flush, then retry; flush at least every
-    /// `StackConfig::tx_pending` sends because a full queue also blocks ingress
-    /// (`Turn::rx_blocked`). `receive` and `turn` flush before ingress.
-    /// A send loop must call `receive` or `turn` to take ARP replies and advance time.
     pub fn udp_send(
         &mut self,
         handle: &UdpHandle,
         to: Option<IpEndpoint>,
         payload: &[u8],
     ) -> Result<(), UdpSendError> {
-        self.udp_send_with(handle, to, payload.len(), |buffer| {
-            buffer.copy_from_slice(payload)
-        })
+        let raw = self.udp_raw(handle);
+        let target = self.iface.udp_target(&self.udp, raw, to, payload.len())?;
+        self.iface
+            .udp_send(&mut self.device, &mut self.udp, target, payload)
     }
 
     /// Send `frame` as one datagram; `to` may be omitted for a connected
@@ -720,7 +704,7 @@ impl Stack {
         to: Option<IpEndpoint>,
         frame: TxFrame,
     ) -> Result<(), (TxFrame, UdpSendFrameError)> {
-        if frame.origin() != self.device.frame_pool().origin() {
+        if frame.origin().as_ptr() != self.device.frame_pool().mempool().cast() {
             return Err((frame, UdpSendFrameError::Foreign));
         }
         let raw = self.udp_raw(handle);

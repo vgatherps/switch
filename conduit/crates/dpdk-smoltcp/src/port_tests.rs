@@ -655,17 +655,17 @@ fn frame_pool_room_and_creation_failures_release_every_pool() {
 /// refcount 2; each release drops one, and the last returns the mbuf once.
 #[zhida_test_support::pinned_test]
 fn frame_pool_layout_share_and_exhaustion() {
-    use smoltcp::phy::TxAlloc as _;
     with_test_eal(|eal| {
         let fixture = Fixture::new();
         let port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
         let pool = port.frame_pool();
+        let source = port.frame_source();
         assert_eq!(pool.count(), 63);
-        let mut frame = pool.alloc().unwrap();
+        let mut frame = source.alloc().unwrap();
         assert_eq!(frame.origin().as_ptr().cast::<rte_mempool>(), pool.mempool());
         assert_eq!((frame.len(), frame.capacity()), (0, 1500 - 28));
         assert!(frame.unique());
-        let raw = frame.owner().cast::<rte_mbuf>().as_ptr();
+        let raw = frame.mbuf().as_ptr();
         unsafe {
             assert_eq!((*raw).data_off(), RTE_PKTMBUF_HEADROOM as u16 + 42);
             assert_eq!(((*raw).data_len(), (*raw).pkt_len()), (0, 0));
@@ -691,21 +691,21 @@ fn frame_pool_layout_share_and_exhaustion() {
         drop(shared);
         assert_eq!(pool.in_use_count(), 0);
 
-        let all: Vec<_> = std::iter::from_fn(|| pool.alloc()).collect();
+        let all: Vec<_> = std::iter::from_fn(|| source.alloc()).collect();
         assert_eq!(all.len(), 63);
         assert_eq!(pool.in_use_count(), 63);
-        let mut owners: Vec<_> = all.iter().map(|frame| frame.owner()).collect();
+        let mut owners: Vec<_> = all.iter().map(|frame| frame.mbuf()).collect();
         owners.sort();
         owners.dedup();
         assert_eq!(owners.len(), 63);
         drop(all);
         assert_eq!(pool.in_use_count(), 0);
         // Every object came back exactly once.
-        let again: Vec<_> = std::iter::from_fn(|| pool.alloc()).collect();
-        let mut again_owners: Vec<_> = again.iter().map(|frame| frame.owner()).collect();
+        let again: Vec<_> = std::iter::from_fn(|| source.alloc()).collect();
+        let mut again_owners: Vec<_> = again.iter().map(|frame| frame.mbuf()).collect();
         again_owners.sort();
         assert_eq!(again_owners, owners);
-        drop(again);
+        drop((again, source));
         port.try_close().unwrap();
         fixture.close().unwrap();
         assert_no_pools();

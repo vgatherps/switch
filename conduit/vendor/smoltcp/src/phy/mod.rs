@@ -11,7 +11,7 @@ An implementation of the [Device](trait.Device.html) trait for a simple hardware
 Ethernet controller could look as follows:
 
 ```rust
-use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, TxBuf, TxHeader};
+use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, TxBuf, TxChecksum};
 use smoltcp::time::Instant;
 
 struct StmPhy {
@@ -80,23 +80,17 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
 struct StmPhyFrameToken<'a>(&'a mut [u8]);
 
 impl phy::FrameToken for StmPhyFrameToken<'_> {
-    fn consume(self, header: TxHeader, frame: TxBuf) {
-        assert!(frame.unique(), "TX buffer is shared");
-        let header_len = header.bytes().len();
-        let len = header_len.checked_add(frame.len()).expect("TX frame length overflow");
-        self.0[..header_len].copy_from_slice(header.bytes());
-        self.0[header_len..len].copy_from_slice(frame.payload());
-        println!("tx called {}", len);
+    fn consume(self, frame: TxBuf, header_len: usize, _: Option<TxChecksum>) {
+        let packet = frame.packet(header_len);
+        self.0[..packet.len()].copy_from_slice(packet);
+        println!("tx called {}", packet.len());
         // TODO: send packet out
     }
 
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf {
-        assert!(frame.unique(), "TX buffer is shared");
-        let header_len = header.bytes().len();
-        let len = header_len.checked_add(frame.len()).expect("TX frame length overflow");
-        self.0[..header_len].copy_from_slice(header.bytes());
-        self.0[header_len..len].copy_from_slice(frame.payload());
-        println!("tx called {}", len);
+    fn consume_retain(self, frame: TxBuf, header_len: usize, _: Option<TxChecksum>) -> TxBuf {
+        let packet = frame.packet(header_len);
+        self.0[..packet.len()].copy_from_slice(packet);
+        println!("tx called {}", packet.len());
         // TODO: send packet out
         frame
     }
@@ -114,10 +108,10 @@ mod held_frames;
 
 pub use self::loopback::Loopback;
 pub use self::rx_buf::RxBuf;
-pub use self::tx_buf::{TxAlloc, TxBuf, TxBufOps, TxFrame, TxHeader, TxSource};
-pub(crate) use self::tx_buf::frame_bytes;
-#[cfg(test)]
-pub(crate) use self::tx_buf::test_owner;
+pub use self::tx_buf::{TxBuf, TxFrame, TxPool, TxSource, TX_HEADROOM};
+pub(crate) use self::tx_buf::UniqueTxBuf;
+#[cfg(not(feature = "dpdk"))]
+pub use self::tx_buf::TxPoolCounts;
 pub use self::held_frames::HeldFrames;
 pub(crate) use self::held_frames::RxShared;
 
@@ -378,12 +372,14 @@ pub trait TxToken {
     fn set_meta(&mut self, meta: PacketMeta) {}
 }
 
-/// Publishes one packet whose wire bytes are `header.bytes()` followed by `frame.payload()`.
-/// Panics unless the frame is unique. Dropping the token unconsumed does nothing.
+/// Publishes one packet, `frame.packet(header_len)`: the stack wrote `header_len` header bytes
+/// in front of the payload while the frame was unique. `tx_checksum` is the checksum the device
+/// completes. Dropping the token unconsumed does nothing.
 pub trait FrameToken {
-    /// The frame's only reference moves to the device.
-    fn consume(self, header: TxHeader, frame: TxBuf);
+    /// The frame's reference moves to the device.
+    fn consume(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>);
 
-    /// The caller's reference comes back.
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf;
+    /// The device takes another reference; the caller's comes back.
+    fn consume_retain(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>)
+    -> TxBuf;
 }

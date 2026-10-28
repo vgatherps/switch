@@ -8,7 +8,9 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpEndpoint,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
 };
-use dpdk_smoltcp::{tx_reserve, Eal, StackConfig, UdpConfig, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{
+    tx_reserve, Eal, StackConfig, UdpConfig, UdpHandle, UdpSendError, UdpSendFrameError,
+};
 
 const PORT: u16 = 1234;
 const PEER_PORT: u16 = 4321;
@@ -85,9 +87,7 @@ fn reply(ip: Ipv4Address, mac: EthernetAddress) -> Vec<u8> {
 
 fn resolve_gateway(pair: &mut Pair, handle: &UdpHandle) {
     assert_eq!(
-        pair.a.udp_send_with(handle, Some(endpoint(PEER)), 1, |_| {
-            panic!("neighbor discovery must not fill")
-        }),
+        pair.a.udp_send(handle, Some(endpoint(PEER)), &[0]),
         Err(UdpSendError::NeighborPending)
     );
     assert_eq!(pair.a.flush().unwrap().tx_accepted, 1);
@@ -209,13 +209,13 @@ fn off_subnet_receive_from_gateway_mac() {
 fn off_subnet_without_gateway_no_route() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, None, PEERS);
-        let mut filled = false;
-        assert_eq!(
-            pair.a
-                .udp_send_with(&handle, Some(endpoint(PEER)), 1, |_| filled = true),
-            Err(UdpSendError::NoRoute)
-        );
-        assert!(!filled);
+        let mut frame = pair.a.tx_frame().unwrap();
+        frame.room_mut()[..6].copy_from_slice(b"remote");
+        frame.set_len(6);
+        let (frame, error) = pair.a.udp_send_frame(&handle, Some(endpoint(PEER)), frame).unwrap_err();
+        assert_eq!(error, UdpSendFrameError::Udp(UdpSendError::NoRoute));
+        assert_eq!(frame.payload(), b"remote");
+        drop(frame);
         assert_eq!(
             pair.a.udp_send(&handle, Some(endpoint(PEER)), b"remote"),
             Err(UdpSendError::NoRoute)

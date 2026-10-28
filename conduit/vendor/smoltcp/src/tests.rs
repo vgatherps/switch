@@ -136,36 +136,30 @@ pub struct FrameToken<'a> {
 }
 
 impl phy::FrameToken for FrameToken<'_> {
-    fn consume(
-        self,
-        header: phy::TxHeader,
-        frame: phy::TxBuf,
-    ) {
-        let buffer = phy::frame_bytes(header, &frame);
-        self.queue.push_back(buffer);
+    fn consume(self, frame: phy::TxBuf, header_len: usize, _: Option<phy::TxChecksum>) {
+        self.queue.push_back(frame.packet(header_len).to_vec());
     }
 
     fn consume_retain(
         self,
-        header: phy::TxHeader,
         frame: phy::TxBuf,
+        header_len: usize,
+        _: Option<phy::TxChecksum>,
     ) -> phy::TxBuf {
-        let buffer = phy::frame_bytes(header, &frame);
-        self.queue.push_back(buffer);
+        self.queue.push_back(frame.packet(header_len).to_vec());
         frame
     }
 }
 
 pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::TxBuf {
-    let alloc = phy::test_owner::CountingAlloc::new(bytes.len().max(1));
-    let mut buf = phy::TxAlloc::alloc(alloc.as_ref()).unwrap();
+    let mut buf = phy::TxPool::new(bytes.len().max(1)).alloc().unwrap();
     buf.room_mut()[..bytes.len()].copy_from_slice(bytes);
     buf.set_len(bytes.len());
     buf
 }
 
 pub(crate) fn tx_test_source(room: usize) -> phy::TxSource {
-    phy::TxSource::new(phy::test_owner::CountingAlloc::new(room))
+    phy::TxSource::new(phy::TxPool::new(room))
 }
 
 #[test]
@@ -173,13 +167,11 @@ fn testing_device_frame_token_writes_before_publish() {
     use crate::phy::FrameToken as _;
 
     let mut device = TestingDevice::new(Medium::Ip);
-    let frame = tx_test_buf(&[3, 4]);
-    let mut header = phy::TxHeader::new(2, None);
-    assert!(device.tx_queue.is_empty());
-    header.bytes_mut().copy_from_slice(&[1, 2]);
+    let mut frame = tx_test_buf(&[3, 4]);
+    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
     assert!(device.tx_queue.is_empty());
     let token = device.transmit_frame(Instant::ZERO).unwrap();
-    let frame = token.consume_retain(header, frame);
+    let frame = token.consume_retain(frame, 2, None);
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
     assert!(frame.unique());
 }
@@ -188,17 +180,16 @@ fn testing_device_frame_token_writes_before_publish() {
 fn testing_device_owned_frame_releases_after_publish() {
     use crate::phy::FrameToken as _;
 
-    let alloc = phy::test_owner::CountingAlloc::new(2);
-    let mut frame = phy::TxAlloc::alloc(alloc.as_ref()).unwrap();
+    let alloc = phy::TxPool::new(2);
+    let mut frame = alloc.alloc().unwrap();
     frame.room_mut()[..2].copy_from_slice(&[3, 4]);
     frame.set_len(2);
+    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
     let mut device = TestingDevice::new(Medium::Ip);
-    let mut header = phy::TxHeader::new(2, None);
-    header.bytes_mut().copy_from_slice(&[1, 2]);
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume(header, frame);
+        .consume(frame, 2, None);
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
     assert_eq!(alloc.live(), 0);
 }

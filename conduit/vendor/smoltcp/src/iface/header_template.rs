@@ -1,4 +1,4 @@
-use crate::phy::{ChecksumCapabilities, TxHeader};
+use crate::phy::ChecksumCapabilities;
 use crate::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr,
     checksum,
@@ -189,9 +189,12 @@ impl TcpTemplate {
         }
     }
 
+    /// `emit` for a payload that is not behind the headers: writes the 54 header bytes into
+    /// `frame` (54 long) and sums `payload` where it lies.
+    #[inline]
     pub(crate) fn emit_header(
         &self,
-        header: &mut TxHeader,
+        frame: &mut [u8],
         ip: &Ipv4Repr,
         tcp: &TcpRepr,
         payload: &[u8],
@@ -199,7 +202,6 @@ impl TcpTemplate {
     ) {
         assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
         assert!(tcp.header_len() == 20, "TCP frame header carries options");
-        let frame = header.bytes_mut();
         self.prefix.emit(frame, ip, checksum);
         let mut packet = TcpPacket::new_unchecked(&mut frame[34..]);
         packet.set_src_port(tcp.src_port);
@@ -279,11 +281,12 @@ impl UdpTemplate {
             && self.dst_port == udp.dst_port
     }
 
+    #[inline]
     pub(crate) fn emit(
         &self,
         frame: &mut [u8],
         ip: &Ipv4Repr,
-        fill: impl FnOnce(&mut [u8]),
+        payload: &[u8],
         checksum: &ChecksumCapabilities,
     ) {
         self.prefix.emit(frame, ip, checksum);
@@ -294,27 +297,24 @@ impl UdpTemplate {
         packet.set_dst_port(self.dst_port);
         packet.set_len(udp_len);
         packet.set_checksum(0);
-        fill(packet.payload_mut());
+        packet.payload_mut().copy_from_slice(payload);
         if checksum.udp.tx() {
-            // The header words come from their values and the payload is summed from its own
-            // start, so no load spans both the header stores and the app's payload stores.
-            let sum = self.checksum(udp_len, packet.payload_mut());
-            packet.set_checksum(sum);
+            // Summed from the source, so no load reads back the copied bytes.
+            packet.set_checksum(self.checksum(udp_len, payload));
         }
     }
 
     /// `emit` for a payload that is not behind the headers: writes the 42 header bytes into
-    /// `header` (42 long) and sums `payload` where it lies. The caller checked that
+    /// `frame` (42 long) and sums `payload` where it lies. The caller checked that
     /// `ip.payload_len` is the UDP length of `payload` (`Interface::udp_send_frame`).
     #[inline]
     pub(crate) fn emit_header(
         &self,
-        header: &mut TxHeader,
+        frame: &mut [u8],
         ip: &Ipv4Repr,
         payload: &[u8],
         checksum: &ChecksumCapabilities,
     ) {
-        let frame = header.bytes_mut();
         debug_assert_eq!(ip.payload_len, 8 + payload.len());
         self.prefix.emit(frame, ip, checksum);
         let mut packet = UdpPacket::new_unchecked(&mut frame[34..]);

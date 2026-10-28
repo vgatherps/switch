@@ -10,8 +10,8 @@ use zhida_test_kit::pair::{self, Side};
 use zhida_test_kit::pcap::{write_pcap, PcapVdev};
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, TcpSet};
 use smoltcp::phy::{
-    Checksum, ChecksumCapabilities, Device as _, FrameToken as _, PacketMeta, RxToken as _,
-    TxAlloc as _, TxChecksum, TxToken as _,
+    Checksum, ChecksumCapabilities, Device as _, PacketMeta, RxToken as _,
+    TxChecksum, TxToken as _,
 };
 use zhida_buffer::PoolConfig;
 use smoltcp::wire::{
@@ -45,15 +45,17 @@ fn finish(fixture: Fixture, device: Device) {
     let port = device.into_port();
     drop(peer_receive(&fixture, 16));
     assert_eq!(in_use(&port), (0, 0));
-    assert_frames_returned_exactly_once(port.frame_pool());
+    assert_frames_returned_exactly_once(&port);
     port.try_close().unwrap();
     fixture.close().unwrap();
 }
 
-fn assert_frames_returned_exactly_once(pool: &FramePool) {
+fn assert_frames_returned_exactly_once(port: &Port) {
+    let pool = port.frame_pool();
     assert_eq!(pool.in_use_count(), 0);
-    let all: Vec<_> = std::iter::from_fn(|| pool.alloc()).collect();
-    let mut owners: Vec<_> = all.iter().map(TxBuf::owner).collect();
+    let source = port.frame_source();
+    let all: Vec<_> = std::iter::from_fn(|| source.alloc()).collect();
+    let mut owners: Vec<_> = all.iter().map(TxBuf::mbuf).collect();
     owners.sort();
     owners.dedup();
     assert_eq!((all.len(), owners.len()), (pool.count(), pool.count()));
@@ -1163,7 +1165,7 @@ fn complete_frames_without_metadata_ignore_header_shape() {
 }
 
 #[zhida_test_support::pinned_test]
-fn udp_send_with_offload_writes_zero_and_flags_frame() {
+fn udp_send_offload_writes_zero_and_flags_frame() {
     use smoltcp::iface::{UdpConfig, UdpSet};
     use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, IpEndpoint};
 
@@ -1215,8 +1217,7 @@ fn udp_send_with_offload_writes_zero_and_flags_frame() {
                 )
                 .unwrap();
             assert_eq!(
-                iface.udp_send(&mut device, &mut udp, target, |out| out
-                    .copy_from_slice(payload)),
+                iface.udp_send(&mut device, &mut udp, target, payload),
                 Ok(())
             );
             let expected = if offload {
@@ -1325,8 +1326,7 @@ fn udp_template_frames_match_generic_and_flags() {
                     )
                     .unwrap();
                 assert_eq!(
-                    iface.udp_send(&mut device, &mut udp, target, |out| out
-                        .copy_from_slice(payload)),
+                    iface.udp_send(&mut device, &mut udp, target, payload),
                     Ok(())
                 );
             }
@@ -2383,28 +2383,65 @@ fn frame_in_use(device: &Device) -> u32 {
 
 /// A frame from `device`'s frame pool holding `payload`.
 fn tx_frame(device: &Device, payload: &[u8]) -> TxBuf {
-    let mut frame = device.frame_pool().alloc().unwrap();
+    let mut frame = device.frame_source().alloc().unwrap();
     frame.room_mut()[..payload.len()].copy_from_slice(payload);
     frame.set_len(payload.len());
     frame
 }
 
+/// Header bytes and checksum metadata a stack would write for one publish.
+#[derive(Clone, Copy)]
+struct Header {
+    bytes: [u8; 64],
+    len: usize,
+    tx_checksum: Option<TxChecksum>,
+}
+
+impl Header {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.len]
+    }
+}
+
 /// `len` header bytes counting up from `first`.
-fn tx_header(len: usize, first: u8, tx_checksum: Option<TxChecksum>) -> TxHeader {
-    let mut header = TxHeader::new(len, tx_checksum);
+fn tx_header(len: usize, first: u8, tx_checksum: Option<TxChecksum>) -> Header {
+    let mut header = Header { bytes: [0; 64], len, tx_checksum };
     for (index, byte) in header.bytes_mut().iter_mut().enumerate() {
         *byte = first.wrapping_add(index as u8);
     }
     header
 }
 
-fn wire(header: &TxHeader, payload: &[u8]) -> Vec<u8> {
+/// A stack's publish: the header written in front of the payload while the
+/// frame is unique, then the token consumed.
+trait Publish {
+    fn publish(self, header: Header, frame: TxBuf);
+    fn publish_retain(self, header: Header, frame: TxBuf) -> TxBuf;
+}
+
+impl<T: phy::FrameToken> Publish for T {
+    fn publish(self, header: Header, mut frame: TxBuf) {
+        frame.headroom_mut(header.len).0.copy_from_slice(header.bytes());
+        self.consume(frame, header.len, header.tx_checksum);
+    }
+
+    fn publish_retain(self, header: Header, mut frame: TxBuf) -> TxBuf {
+        frame.headroom_mut(header.len).0.copy_from_slice(header.bytes());
+        self.consume_retain(frame, header.len, header.tx_checksum)
+    }
+}
+
+fn wire(header: &Header, payload: &[u8]) -> Vec<u8> {
     [header.bytes(), payload].concat()
 }
 
 fn mbuf(frame: &TxBuf) -> &zhida_dpdk_sys::rte_mbuf {
     // SAFETY: the frame's reference keeps its mbuf live; only read here.
-    unsafe { &*frame.owner().cast::<zhida_dpdk_sys::rte_mbuf>().as_ptr() }
+    unsafe { &*frame.mbuf().as_ptr() }
 }
 
 /// (data_off, data_len, pkt_len, nb_segs, refcnt) of the frame's mbuf.
@@ -2426,11 +2463,11 @@ fn send_unique_in_place() {
         let (fixture, mut device) = open(eal, 4, 4);
         let payload = b"unique payload";
         let frame = tx_frame(&device, payload);
-        let owner = frame.owner();
+        let owner = frame.mbuf();
         let header = tx_header(42, 0x10, None);
-        device.transmit_frame(NOW).unwrap().consume(header, frame);
+        device.transmit_frame(NOW).unwrap().publish(header, frame);
         assert_eq!(device.pending(), 1);
-        assert_eq!(device.tx[0].as_ptr(), owner.cast::<zhida_dpdk_sys::rte_mbuf>().as_ptr());
+        assert_eq!(device.tx[0].as_ptr(), owner.as_ptr());
         let m = unsafe { &*device.tx[0].as_ptr() };
         let len = 42 + payload.len();
         assert_eq!(
@@ -2457,11 +2494,11 @@ fn consume_retain_shares_and_sets_offload_metadata() {
         enable_tx_tcp_checksum(&mut device.port);
         let payload = b"tcp payload";
         let frame = tx_frame(&device, payload);
-        let owner = frame.owner();
+        let owner = frame.mbuf();
         let checksum = Some(TxChecksum::Tcp { ip_header_len: 20, tcp_header_len: 20 });
         let header = tx_header(54, 0x20, checksum);
-        let frame = device.transmit_frame(NOW).unwrap().consume_retain(header, frame);
-        assert_eq!(frame.owner(), owner);
+        let frame = device.transmit_frame(NOW).unwrap().publish_retain(header, frame);
+        assert_eq!(frame.mbuf(), owner);
         assert_eq!(frame.payload(), payload);
         let len = 54 + payload.len();
         assert_eq!(layout(&frame), (FRAME_DATA_OFF - 54, len as u16, len as u32, 1, 2));
@@ -2497,7 +2534,7 @@ fn retained_frame_freed_once_in_both_orders() {
 
         // ACK before TX completion.
         let frame = tx_frame(&device, payload);
-        let frame = device.transmit_frame(NOW).unwrap().consume_retain(first, frame);
+        let frame = device.transmit_frame(NOW).unwrap().publish_retain(first, frame);
         assert_eq!(device.flush(), Ok(1));
         assert_eq!(layout(&frame).4, 2);
         drop(frame);
@@ -2507,13 +2544,13 @@ fn retained_frame_freed_once_in_both_orders() {
 
         // TX completion before ACK, then an in-place retransmit.
         let frame = tx_frame(&device, payload);
-        let frame = device.transmit_frame(NOW).unwrap().consume_retain(first, frame);
+        let frame = device.transmit_frame(NOW).unwrap().publish_retain(first, frame);
         assert_eq!(device.flush(), Ok(1));
         assert_eq!(ring_bytes(&fixture), [wire(&first, payload)]);
         assert_eq!(frame_in_use(&device), 1);
         assert!(frame.unique());
         let again = tx_header(54, 0x80, None);
-        let frame = device.transmit_frame(NOW).unwrap().consume_retain(again, frame);
+        let frame = device.transmit_frame(NOW).unwrap().publish_retain(again, frame);
         assert_eq!(layout(&frame).4, 2);
         assert_eq!(pending(&device), [wire(&again, payload)]);
         assert_eq!(device.flush(), Ok(1));
@@ -2542,7 +2579,7 @@ fn transmit_frame_token_drop_takes_no_reference() {
         let mut held = Vec::new();
         while device.pending() < device.tx.capacity() {
             let frame = tx_frame(&device, b"x");
-            held.push(device.transmit_frame(NOW).unwrap().consume_retain(tx_header(42, 0, None), frame));
+            held.push(device.transmit_frame(NOW).unwrap().publish_retain(tx_header(42, 0, None), frame));
         }
         assert!(device.transmit_frame(NOW).is_none());
         assert_eq!(frame_in_use(&device), 1 + held.len() as u32);
@@ -2554,68 +2591,38 @@ fn transmit_frame_token_drop_takes_no_reference() {
     });
 }
 
-/// Both consumes refuse a shared frame before writing anything: the mbuf's
-/// layout is unchanged, nothing is queued, and unwinding drops only the
-/// passed reference.
-#[zhida_test_support::pinned_test]
-fn consume_panics_on_shared_frame() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        let frame = tx_frame(&device, b"shared");
-        let before = layout(&frame);
-        for retain in [false, true] {
-            let clone = frame.clone();
-            let panic = catch_unwind(AssertUnwindSafe(|| {
-                let token = device.transmit_frame(NOW).unwrap();
-                let header = tx_header(42, 0, None);
-                if retain {
-                    drop(token.consume_retain(header, clone));
-                } else {
-                    token.consume(header, clone);
-                }
-            }))
-            .unwrap_err();
-            let message = panic.downcast_ref::<String>().unwrap();
-            assert!(message.contains("published TX frame is shared"), "{message}");
-            assert_eq!(device.pending(), 0);
-            assert_eq!(layout(&frame), before);
-            assert_eq!(frame.payload(), b"shared");
-        }
-        drop(frame);
-        assert_eq!(frame_in_use(&device), 0);
-        finish(fixture, device);
-    });
-}
-
 /// A frame from another Stack's frame pool panics with the origin message;
 /// unwinding returns it to its own pool and nothing is queued.
 #[zhida_test_support::pinned_test]
 fn foreign_pool_frame_panics() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
-        let foreign = unsafe {
-            FramePool::new(
-                PoolConfig {
-                    name: c"device_foreign_frame",
-                    count: 7,
-                    cache_size: 2,
-                    data_room_size: zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM as u16 + 1514,
-                    socket_id: -1,
-                },
-                1500,
-            )
-        }
-        .unwrap();
+        let foreign = std::rc::Rc::new(
+            unsafe {
+                FramePool::new(
+                    PoolConfig {
+                        name: c"device_foreign_frame",
+                        count: 7,
+                        cache_size: 2,
+                        data_room_size: zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM as u16 + 1514,
+                        socket_id: -1,
+                    },
+                    1472,
+                )
+            }
+            .unwrap(),
+        );
+        let source = TxSource::new(foreign.clone());
         for retain in [false, true] {
-            let mut frame = foreign.alloc().unwrap();
+            let mut frame = source.alloc().unwrap();
             frame.set_len(4);
             let panic = catch_unwind(AssertUnwindSafe(|| {
                 let token = device.transmit_frame(NOW).unwrap();
                 let header = tx_header(42, 0, None);
                 if retain {
-                    drop(token.consume_retain(header, frame));
+                    drop(token.publish_retain(header, frame));
                 } else {
-                    token.consume(header, frame);
+                    token.publish(header, frame);
                 }
             }))
             .unwrap_err();
@@ -2624,7 +2631,7 @@ fn foreign_pool_frame_panics() {
             assert_eq!(device.pending(), 0);
             assert_eq!(foreign.in_use_count(), 0);
         }
-        drop(foreign);
+        drop((source, foreign));
         assert_eq!(frame_in_use(&device), 0);
         finish(fixture, device);
     });
@@ -2638,10 +2645,10 @@ fn pending_teardown_frees_shared_frames() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
         let moved = tx_frame(&device, b"moved");
-        device.transmit_frame(NOW).unwrap().consume(tx_header(42, 0, None), moved);
+        device.transmit_frame(NOW).unwrap().publish(tx_header(42, 0, None), moved);
         let retained = [b"one", b"two"].map(|payload| {
             let frame = tx_frame(&device, payload);
-            device.transmit_frame(NOW).unwrap().consume_retain(tx_header(54, 0, None), frame)
+            device.transmit_frame(NOW).unwrap().publish_retain(tx_header(54, 0, None), frame)
         });
         assert_eq!(device.pending(), 3);
         assert_eq!(frame_in_use(&device), 3);
@@ -2652,7 +2659,7 @@ fn pending_teardown_frees_shared_frames() {
         }
         assert_eq!(retained[1].payload(), b"two");
         drop(retained);
-        assert_frames_returned_exactly_once(port.frame_pool());
+        assert_frames_returned_exactly_once(&port);
         assert!(peer_receive(&fixture, 16).is_empty());
         port.try_close().unwrap();
         fixture.close().unwrap();
@@ -2671,10 +2678,7 @@ fn tx_prepare_writes_header_only() {
         let full = tcp_frame();
         // tcp_frame has IP and TCP options: 14 + 24 + 32 = 70 header bytes.
         let (headers, payload) = full.split_at(70);
-        let mut header = TxHeader::new(
-            54,
-            Some(TxChecksum::Tcp { ip_header_len: 20, tcp_header_len: 20 }),
-        );
+        let mut header = tx_header(54, 0, Some(TxChecksum::Tcp { ip_header_len: 20, tcp_header_len: 20 }));
         // Same frame without options: Ethernet, 20-byte IP, 20-byte TCP.
         header.bytes_mut()[..14].copy_from_slice(&headers[..14]);
         header.bytes_mut()[14..34].copy_from_slice(&headers[14..34]);
@@ -2685,7 +2689,7 @@ fn tx_prepare_writes_header_only() {
         header.bytes_mut()[46] = 0x50;
         Ipv4Packet::new_unchecked(&mut header.bytes_mut()[14..]).fill_checksum();
         let frame = tx_frame(&device, payload);
-        let frame = device.transmit_frame(NOW).unwrap().consume_retain(header, frame);
+        let frame = device.transmit_frame(NOW).unwrap().publish_retain(header, frame);
         let mut faults = Faults::default();
         faults.tx_accept_limit = Some(0);
         let guard = FaultGuard::new(faults);
@@ -2728,7 +2732,7 @@ fn published_frames_fill_ring_and_pending_within_reserve() {
         let header = tx_header(54, 0x40, None);
         let publish = |device: &mut Device, index: u8| {
             let frame = tx_frame(device, &[index; 16]);
-            device.transmit_frame(NOW).unwrap().consume_retain(header, frame)
+            device.transmit_frame(NOW).unwrap().publish_retain(header, frame)
         };
 
         // Five sent (four, then one), then four more of which the ring takes two.
@@ -2751,7 +2755,8 @@ fn published_frames_fill_ring_and_pending_within_reserve() {
         drop(held);
         assert_eq!(frame_in_use(&device), 11);
         assert!(late.iter().all(|frame| layout(frame).4 == 2));
-        let free: Vec<_> = std::iter::from_fn(|| device.frame_pool().alloc()).collect();
+        let source = device.frame_source();
+        let free: Vec<_> = std::iter::from_fn(|| source.alloc()).collect();
         assert_eq!(free.len(), reserve - 11);
         assert_eq!(free.len(), 2);
         drop(free);
@@ -2778,7 +2783,7 @@ fn published_frames_fill_ring_and_pending_within_reserve() {
 /// layout and offload metadata.
 fn check_published(
     device: &Device,
-    header: &TxHeader,
+    header: &Header,
     payload: &[u8],
     offload: (u64, u64, u64, u64),
 ) {
@@ -2796,7 +2801,7 @@ fn check_published(
 /// Edges of the in-place publish: a payload that fills the frame capacity
 /// exactly with UDP headers (ending at the buffer's end) and with TCP
 /// headers, an empty payload, a 62-byte header (TCP with 8 option bytes) and
-/// the 64-byte TxHeader maximum. Each reaches the wire as header ++ payload,
+/// the 64-byte header maximum. Each reaches the wire as header ++ payload,
 /// and every frame returns to the pool.
 #[zhida_test_support::pinned_test]
 fn frame_publish_edges_reach_the_wire_exactly() {
@@ -2815,9 +2820,9 @@ fn frame_publish_edges_reach_the_wire_exactly() {
             let frame = tx_frame(&device, payload);
             let token = device.transmit_frame(NOW).unwrap();
             let kept = if retain {
-                Some(token.consume_retain(*header, frame))
+                Some(token.publish_retain(*header, frame))
             } else {
-                token.consume(*header, frame);
+                token.publish(*header, frame);
                 None
             };
             check_published(&device, header, payload, (0, 0, 0, 0));
@@ -2839,62 +2844,6 @@ fn frame_publish_edges_reach_the_wire_exactly() {
     });
 }
 
-/// Every refusal comes before any write: a payload one byte over the frame
-/// capacity, a payload filling the whole frame room behind TCP headers, and
-/// TCP offload metadata on a port without that profile. Each panics for
-/// both consumes with nothing queued, the frame mbuf's metadata and headroom
-/// unchanged, and the unwound frame back in the pool; the next publish works.
-#[zhida_test_support::pinned_test]
-fn frame_refusals_write_nothing_and_pool_recovers() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        let capacity = usize::from(device.port.frame_capacity());
-        let room = device.frame_pool().alloc().unwrap().capacity();
-        assert_eq!(room, capacity - 42);
-        let tcp_offload = Some(TxChecksum::Tcp { ip_header_len: 20, tcp_header_len: 20 });
-        let cases = [
-            (capacity - 54 + 1, None, format!("TX frame of {} bytes exceeds the frame capacity {capacity}", capacity + 1)),
-            (room, None, format!("TX frame of {} bytes exceeds the frame capacity {capacity}", room + 54)),
-            (4, tcp_offload, "TCP TX offload metadata without its profile".to_string()),
-        ];
-        for (len, tx_checksum, expected) in &cases {
-            for retain in [false, true] {
-                let frame = tx_frame(&device, &vec![0x33; *len]);
-                let raw = frame.owner().cast::<zhida_dpdk_sys::rte_mbuf>().as_ptr();
-                let state = || unsafe {
-                    let m = &*raw;
-                    let headroom = std::slice::from_raw_parts(m.data_ptr().sub(64), 64).to_vec();
-                    (m.data_off(), m.data_len(), m.pkt_len(), m.ol_flags(), headroom)
-                };
-                let before = state();
-                let panic = catch_unwind(AssertUnwindSafe(|| {
-                    let token = device.transmit_frame(NOW).unwrap();
-                    let header = tx_header(54, 0x50, *tx_checksum);
-                    if retain {
-                        drop(token.consume_retain(header, frame));
-                    } else {
-                        token.consume(header, frame);
-                    }
-                }))
-                .unwrap_err();
-                let message = panic.downcast_ref::<String>().unwrap();
-                assert!(message.contains(expected.as_str()), "{message}");
-                assert_eq!(device.pending(), 0);
-                assert_eq!(frame_in_use(&device), 0);
-                // The freed object still holds what the refusal left in it.
-                assert_eq!(state(), before);
-            }
-        }
-        let header = tx_header(54, 0x60, None);
-        let frame = tx_frame(&device, b"after");
-        device.transmit_frame(NOW).unwrap().consume(header, frame);
-        assert_eq!(device.flush(), Ok(1));
-        assert_eq!(ring_bytes(&fixture), [wire(&header, b"after")]);
-        assert_eq!(frame_in_use(&device), 0);
-        finish(fixture, device);
-    });
-}
-
 /// Checksum offload metadata reaches the published frame mbuf: UDP through
 /// `consume`, TCP with options through `consume_retain`; the wire bytes are
 /// header ++ payload and both pools end at zero.
@@ -2906,7 +2855,7 @@ fn frame_publish_sets_udp_and_tcp_offload_metadata() {
         enable_tx_tcp_checksum(&mut device.port);
         let udp = tx_header(42, 0x70, Some(TxChecksum::Udp { ip_header_len: 20 }));
         let frame = tx_frame(&device, b"udp datagram");
-        device.transmit_frame(NOW).unwrap().consume(udp, frame);
+        device.transmit_frame(NOW).unwrap().publish(udp, frame);
         check_published(
             &device,
             &udp,
@@ -2919,7 +2868,7 @@ fn frame_publish_sets_udp_and_tcp_offload_metadata() {
             Some(TxChecksum::Tcp { ip_header_len: 20, tcp_header_len: 28 }),
         );
         let frame = tx_frame(&device, b"tcp segment");
-        let frame = device.transmit_frame(NOW).unwrap().consume_retain(tcp, frame);
+        let frame = device.transmit_frame(NOW).unwrap().publish_retain(tcp, frame);
         check_published(
             &device,
             &tcp,
@@ -2938,7 +2887,7 @@ fn frame_publish_sets_udp_and_tcp_offload_metadata() {
         assert_eq!(frame_in_use(&device), 0);
         assert_eq!(in_use(&device.port), (0, 0));
         let port = device.into_port();
-        assert_frames_returned_exactly_once(port.frame_pool());
+        assert_frames_returned_exactly_once(&port);
         port.try_close().unwrap();
         fixture.close().unwrap();
         assert_no_pools();
@@ -3115,9 +3064,8 @@ fn udp_socket(udp: &mut smoltcp::iface::UdpSet, port: u16, tx_checksum: bool) ->
 
 /// A frame from `device`'s frame pool holding `payload`, and its mbuf.
 fn app_frame(device: &Device, payload: &[u8]) -> (smoltcp::phy::TxFrame, *mut zhida_dpdk_sys::rte_mbuf) {
-    let buf = device.frame_pool().alloc().unwrap();
-    let raw = buf.owner().cast::<zhida_dpdk_sys::rte_mbuf>().as_ptr();
-    let mut frame = smoltcp::phy::TxFrame::new(buf);
+    let mut frame = smoltcp::phy::TxFrame::alloc(device.frame_pool()).unwrap();
+    let raw = frame.mbuf().as_ptr();
     frame.room_mut()[..payload.len()].copy_from_slice(payload);
     frame.set_len(payload.len());
     (frame, raw)
@@ -3180,7 +3128,7 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
             let mut iface = udp_iface(&fixture, &mut device);
             let mut udp = UdpSet::new(1);
             let to = IpEndpoint::new(Side::B.ip().into(), 80);
-            let room = device.frame_pool().alloc().unwrap().capacity();
+            let room = usize::from(device.frame_pool().room());
             assert_eq!(room, FRAME - 42);
             let metadata = if offload { UDP_OFFLOAD } else { (0, 0, 0, 0) };
             for len in [0, 8, room] {
@@ -3209,7 +3157,7 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
                 }
                 let target = iface.udp_target(&udp, handle, Some(to), len).unwrap();
                 assert_eq!(
-                    iface.udp_send(&mut device, &mut udp, target, |out| out.copy_from_slice(&payload)),
+                    iface.udp_send(&mut device, &mut udp, target, &payload),
                     Ok(())
                 );
                 assert_eq!(tx_metadata(&device.tx[0]), metadata);

@@ -597,7 +597,7 @@ call `stack.connect` or `stack.listen`. Admission alone leaves the socket closed
 
 `TcpHandle` and `UdpHandle` own their socket's place in the Stack. They are not `Copy`, `Clone`,
 `Default`, or `Send`. Every accessor borrows the handle: `tcp(&h)`, `tcp_mut(&h)`, `connect(&h, ..)`,
-`listen(&h, ..)`, `udp(&h)`, `udp_mut(&h)`, `udp_send(&h, ..)`, `udp_send_with(&h, ..)`.
+`listen(&h, ..)`, `udp(&h)`, `udp_mut(&h)`, `udp_send(&h, ..)`, `udp_send_frame(&h, ..)`.
 `remove_tcp(h)` and `remove_udp(h)` consume the handle, so use after removal does not compile. Using
 a handle with a Stack that did not create it panics. Handles may outlive the Stack; dropping them
 afterwards does nothing.
@@ -783,14 +783,16 @@ purged. `peer()` reads the optional peer, and `config()` reads the socket config
 
 ### Send datagrams
 
-`udp_send(&handle, to: Option<IpEndpoint>, payload: &[u8])` copies one payload into a frame.
-`udp_send_with(&handle, to, len: usize, fill)` supplies the payload slice in the TX mbuf for in-place
-filling. It runs at the interface's stored time, without reading a clock.
+`udp_send_frame(&handle, to: Option<IpEndpoint>, frame: TxFrame)` sends a frame from
+`Stack::tx_frame` whose payload the application wrote in place. `udp_send(&handle, to, payload: &[u8])`
+copies a payload the application already holds into a frame. Both run at the interface's stored time,
+without reading a clock.
 
 ```rust
-stack.udp_send_with(&handle, Some(peer), 5, |buffer| {
-    buffer.copy_from_slice(b"hello");
-})?;
+let mut frame = stack.tx_frame().ok_or(Error::NoFrame)?;
+frame.room_mut()[..5].copy_from_slice(b"hello");
+frame.set_len(5);
+stack.udp_send_frame(&handle, Some(peer), frame).map_err(|(_frame, error)| error)?;
 let sent = stack.flush()?;
 ```
 
@@ -798,7 +800,8 @@ Use `to: None` with a connected socket, or supply a destination for an unconnect
 explicit destination on a connected socket must equal its peer. UDP has no socket TX byte ring: a
 successful call queues the whole datagram frame in the shared pending FIFO. Zero-length payloads are
 allowed. Payload length must be at most path MTU minus 28 (1472 at MTU 1500); there is no
-fragmentation. Every error is returned before `fill` runs. `NeighborPending` can queue an ARP
+fragmentation. `udp_send_frame` returns the frame untouched with every error, and `Foreign` for a
+frame from another Stack. `NeighborPending` can queue an ARP
 request but drops the datagram; flush, receive ARP replies, and retry. `WouldBlock` means no TX
 packet or pending slot is available; flush and retry. Flush at least every `StackConfig::tx_pending`
 sends. The pending FIFO is shared with TCP and ingress replies and keeps frame-building order:
@@ -1016,7 +1019,6 @@ counters, not per-read errors.
 These panic:
 
 - using a handle with a Stack that did not create it
-- a TCP `send` callback reporting more enqueued bytes than exposed
 - TCP admission with receive capacity above 1 GiB; admission or budget sizing with `mss_cap: Some(0)`
 - `set_initial_window(0)`, `set_rto(Duration::ZERO)` or RTO above 60 seconds, `set_ack_delay` above
   60 seconds, `set_hop_limit(Some(0))`
@@ -1026,7 +1028,6 @@ These panic:
 - a TX-done cleanup failure other than `-ENOTSUP` when a drive operation allocates a TX packet
 - with TX checksum offload, the PMD's checksum preparation refusing a frame during flush (Zhida does
   not validate frame headers there)
-- a panicking UDP fill callback, including ordinary slice bounds
 
 A panic unwinding out of `turn`, `receive`, `send`, or `flush` leaves the Stack unusable: after
 catching it, only drop the Stack or call `into_port`.

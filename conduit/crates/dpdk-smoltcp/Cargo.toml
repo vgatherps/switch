@@ -8,7 +8,7 @@ license.workspace = true
 bench-offload = []
 
 [dependencies]
-smoltcp = { version = "=0.14.0", path = "../../vendor/smoltcp", default-features = false, features = ["udp-set", "auto-icmp-echo-reply"] }
+smoltcp = { version = "=0.14.0", path = "../../vendor/smoltcp", default-features = false, features = ["udp-set", "auto-icmp-echo-reply", "dpdk"] }
 zhida-buffer = { path = "../zhida-buffer" }
 zhida-dpdk-sys = { path = "../zhida-dpdk-sys" }
 

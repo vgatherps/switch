@@ -82,9 +82,13 @@ impl InterfaceInner {
             .and_then(|len| len.checked_add(tcp.header_len()))
             .expect("TCP frame header length exceeds usize");
         let tx_checksum = self.tx_checksum(&ip, tcp.header_len());
-        let mut header = TxHeader::new(header_len, tx_checksum);
-        template.emit_header(&mut header, &ip4, &tcp, frame.payload(), &self.caps.checksum);
-        let frame = frame_token.consume_retain(header, frame);
+        // dispatch passes only a `Seg::Whole` frame, which `TxQueue::segment` found unique.
+        let Ok(mut frame) = frame.into_unique() else {
+            panic!("whole TCP frame is shared");
+        };
+        let (headers, payload) = frame.headroom_mut(header_len);
+        template.emit_header(headers, &ip4, &tcp, payload, &self.caps.checksum);
+        let frame = frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum);
         #[cfg(test)]
         {
             self.template_frames = self

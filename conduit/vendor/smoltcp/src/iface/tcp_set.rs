@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(size_of::<TcpStorage<'static>>(), 640);
         assert_eq!(align_of::<TcpStorage<'static>>(), 64);
         assert_eq!(size_of::<Meta>(), 112);
-        assert_eq!(size_of::<tcp::Socket<'static>>(), 456);
+        assert_eq!(size_of::<tcp::Socket<'static>>(), 448);
         assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
@@ -1533,21 +1533,21 @@ mod tests {
             ("rx_fin_seq", 100),
             ("rx_seg_bytes", 132),
             ("tx_queue", 136),
-            ("tx_seg_bytes", 216),
-            ("rtte", 224),
-            ("congestion_controller", 248),
-            ("rx_buffer", 320),
-            ("ack_delay_us", 384),
-            ("retransmits", 392),
-            ("loss_events", 400),
-            ("initial_window", 408),
-            ("listen_endpoint", 416),
-            ("bytes_acked", 424),
-            ("rcv_mss", 432),
-            ("challenge_ack_timer", 440),
-            ("rx_refused_segments", 448),
-            ("mss_cap", 452),
-            ("reset_by_peer", 455),
+            ("tx_seg_bytes", 208),
+            ("rtte", 216),
+            ("congestion_controller", 240),
+            ("rx_buffer", 312),
+            ("ack_delay_us", 376),
+            ("retransmits", 384),
+            ("loss_events", 392),
+            ("initial_window", 400),
+            ("listen_endpoint", 408),
+            ("bytes_acked", 416),
+            ("rcv_mss", 424),
+            ("challenge_ack_timer", 432),
+            ("rx_refused_segments", 440),
+            ("mss_cap", 444),
+            ("reset_by_peer", 447),
         ];
         for (name, expected) in expected_offsets {
             let &(_, actual) = socket_offsets
@@ -1600,7 +1600,7 @@ mod tests {
             ("congestion_controller", 5),
             ("rx_buffer", 6),
             ("ack_delay_us", 7),
-            ("retransmits", 8),
+            ("retransmits", 7),
             ("loss_events", 8),
             ("initial_window", 8),
             ("listen_endpoint", 8),

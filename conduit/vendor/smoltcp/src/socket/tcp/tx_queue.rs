@@ -365,13 +365,11 @@ impl TxQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phy::test_owner::CountingAlloc;
-    use crate::phy::{TxAlloc, TxBufOps};
-    use alloc::{boxed::Box, rc::Rc};
-    use core::{cell::Cell, ptr::NonNull};
+    use crate::phy::TxPool;
+    use alloc::rc::Rc;
 
-    fn queue(byte_cap: usize, frame_cap: usize, room: usize) -> (TxQueue, Rc<CountingAlloc>) {
-        let alloc = CountingAlloc::new(room);
+    fn queue(byte_cap: usize, frame_cap: usize, room: usize) -> (TxQueue, Rc<TxPool>) {
+        let alloc = TxPool::new(room);
         let source = TxSource::new(alloc.clone());
         (TxQueue::new(byte_cap, frame_cap, source), alloc)
     }
@@ -571,71 +569,16 @@ mod tests {
         assert_eq!(cut(queue.segment(0, 1)), &[4]);
     }
 
+    /// The queue releases its frames before its source handle: the pool outlives the last
+    /// release.
     #[test]
     fn source_dropped_after_entries() {
-        struct DropState {
-            source_dropped: Cell<bool>,
-            buffer_released_first: Cell<bool>,
-        }
-        struct Alloc {
-            state: Rc<DropState>,
-        }
-        struct Owner {
-            state: Rc<DropState>,
-            bytes: Box<[u8]>,
-        }
-        unsafe fn release(owner: NonNull<()>) {
-            // SAFETY: Alloc::alloc creates this pointer with Box::into_raw once.
-            let owner = unsafe { Box::from_raw(owner.cast::<Owner>().as_ptr()) };
-            owner
-                .state
-                .buffer_released_first
-                .set(!owner.state.source_dropped.get());
-        }
-        unsafe fn share(_: NonNull<()>) {
-            panic!("test owner is never shared");
-        }
-        unsafe fn unique(_: NonNull<()>) -> bool {
-            true
-        }
-        static OPS: TxBufOps = TxBufOps {
-            release,
-            share,
-            unique,
-        };
-        impl Drop for Alloc {
-            fn drop(&mut self) {
-                self.state.source_dropped.set(true);
-            }
-        }
-        impl TxAlloc for Alloc {
-            fn alloc(&self) -> Option<TxBuf> {
-                let mut owner = Box::new(Owner {
-                    state: self.state.clone(),
-                    bytes: alloc::vec![0; 128].into_boxed_slice(),
-                });
-                let data = NonNull::new(owner.bytes.as_mut_ptr()).unwrap();
-                // SAFETY: 64 bytes are headroom and the other 64 bytes are payload room.
-                let data = unsafe { data.add(64) };
-                let owner = NonNull::new(Box::into_raw(owner).cast::<()>()).unwrap();
-                // SAFETY: owner owns the allocation until OPS releases it.
-                Some(unsafe { TxBuf::from_raw_parts(owner, &OPS, self.origin(), data, 64) })
-            }
-
-            fn origin(&self) -> NonNull<()> {
-                NonNull::from(self).cast()
-            }
-        }
-
-        let state = Rc::new(DropState {
-            source_dropped: Cell::new(false),
-            buffer_released_first: Cell::new(false),
-        });
-        let source = TxSource::new(Rc::new(Alloc { state: state.clone() }));
-        let mut queue = TxQueue::new(8, 1, source);
+        let pool = TxPool::new(64);
+        let counts = pool.counts();
+        let mut queue = TxQueue::new(8, 1, TxSource::new(pool));
         queue.push_bytes(&[1]);
         drop(queue);
-        assert!(state.buffer_released_first.get());
-        assert!(state.source_dropped.get());
+        assert!(counts.pool_dropped());
+        assert_eq!((counts.releases(), counts.released_after_drop()), (1, 0));
     }
 }

@@ -59,9 +59,7 @@ fn endpoint(side: Side) -> IpEndpoint {
 fn resolve(pair: &mut Pair, handle: &UdpHandle) {
     assert_eq!(
         pair.a
-            .udp_send_with(handle, Some(endpoint(Side::B)), 1, |_| {
-                panic!("ARP discovery must not fill the payload")
-            }),
+            .udp_send(handle, Some(endpoint(Side::B)), &[0]),
         Err(UdpSendError::NeighborPending)
     );
     pair.round(|_, _| {});
@@ -141,11 +139,7 @@ fn stream_exact_bytes_order_counts() {
                             let payload = vec![u8::try_from(sequence).unwrap(); size];
                             let (sender, _) = side.pick(&mut pair.a, &mut pair.b);
                             sender
-                                .udp_send_with(&handles[side.index()],
-                                    Some(endpoint(side.other())),
-                                    size,
-                                    |buffer| buffer.copy_from_slice(&payload),
-                                )
+                                .udp_send(&handles[side.index()], Some(endpoint(side.other())), &payload)
                                 .unwrap();
                         }
                         let mut frames = 0;
@@ -211,13 +205,10 @@ fn stream_exact_bytes_order_counts() {
 fn first_send_arps_then_succeeds() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpfa", "udpfb"]);
-        let mut filled = false;
         assert_eq!(
-            pair.a
-                .udp_send_with(&handles[0], Some(endpoint(Side::B)), 5, |_| filled = true),
+            pair.a.udp_send(&handles[0], Some(endpoint(Side::B)), b"hello"),
             Err(UdpSendError::NeighborPending)
         );
-        assert!(!filled);
         assert_eq!(pair.a.flush().unwrap().tx_accepted, 1);
         assert_eq!(
             pair.a_to_b.forward_with(|frame| {
@@ -249,13 +240,10 @@ fn first_send_arps_then_succeeds() {
             1
         );
         pair.a.receive(pair::T0, BURST).unwrap();
-        pair.a
-            .udp_send_with(&handles[0], Some(endpoint(Side::B)), 5, |buffer| {
-                filled = true;
-                buffer.copy_from_slice(b"hello");
-            })
-            .unwrap();
-        assert!(filled);
+        let mut frame = pair.a.tx_frame().unwrap();
+        frame.room_mut()[..5].copy_from_slice(b"hello");
+        frame.set_len(5);
+        assert!(pair.a.udp_send_frame(&handles[0], Some(endpoint(Side::B)), frame).is_ok());
         pair.round(|_, _| {});
         recv(&mut pair.b, &handles[1], endpoint(Side::A), b"hello");
         assert_eq!(pair.close(), 0);
@@ -280,9 +268,7 @@ fn pending_full_would_block_and_blocks_rx_until_flush() {
         }
         assert_eq!(
             pair.a
-                .udp_send_with(&handles[0], Some(endpoint(Side::B)), 1, |_| {
-                    panic!("full queue must not fill")
-                }),
+                .udp_send(&handles[0], Some(endpoint(Side::B)), b"full"),
             Err(UdpSendError::WouldBlock)
         );
         pair.b
@@ -388,11 +374,7 @@ fn connected_send_default_peer_and_mismatch() {
         pair.round(|_, _| {});
         recv(&mut pair.b, &handles[1], endpoint(Side::A), b"connected");
         assert_eq!(
-            pair.a.udp_send_with(&handles[0],
-                Some(IpEndpoint::new(Side::B.ip().into(), PORT + 1)),
-                1,
-                |_| panic!("peer mismatch must not fill")
-            ),
+            pair.a.udp_send(&handles[0], Some(IpEndpoint::new(Side::B.ip().into(), PORT + 1)), &[0]),
             Err(UdpSendError::PeerMismatch)
         );
         assert_eq!(pair.a.flush().unwrap().tx_accepted, 0);
@@ -540,11 +522,7 @@ fn parallel_peers_each_get_arp_udp() {
         ];
         for (_, address) in peers {
             assert_eq!(
-                pair.a.udp_send_with(&handles[0],
-                    Some(IpEndpoint::new(address.into(), PORT)),
-                    1,
-                    |_| panic!("unresolved peers must not fill")
-                ),
+                pair.a.udp_send(&handles[0], Some(IpEndpoint::new(address.into(), PORT)), &[0]),
                 Err(UdpSendError::NeighborPending)
             );
         }
@@ -622,18 +600,13 @@ fn too_large_and_broadcast_opt_in() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpbra", "udpbrb"]);
         assert_eq!(
-            pair.a
-                .udp_send_with(&handles[0], Some(endpoint(Side::B)), 1473, |_| {
-                    panic!("oversized datagrams must not fill")
-                }),
+            pair.a.udp_send(&handles[0], Some(endpoint(Side::B)), &[0; 1473]),
             Err(UdpSendError::TooLarge)
         );
         assert_eq!(pair.a.flush().unwrap().tx_accepted, 0);
         let broadcast = IpEndpoint::new(Ipv4Address::BROADCAST.into(), PORT);
         assert_eq!(
-            pair.a.udp_send_with(&handles[0], Some(broadcast), 1, |_| {
-                panic!("broadcast without opt-in must not fill")
-            }),
+            pair.a.udp_send(&handles[0], Some(broadcast), &[0]),
             Err(UdpSendError::Unaddressable)
         );
         assert_eq!(pair.a.flush().unwrap().tx_accepted, 0);

@@ -25,7 +25,7 @@ use super::udp_set::UdpSet;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT,
 };
-use crate::phy::{PacketMeta, TxChecksum, TxHeader};
+use crate::phy::{PacketMeta, TxChecksum};
 use crate::phy::{
     Device, DeviceCapabilities, FrameToken as PhyFrameToken, Medium, RxToken, TxBuf, TxToken,
 };
@@ -83,13 +83,18 @@ struct TrackedFrameToken<'a, T> {
 }
 
 impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
-    fn consume(self, header: TxHeader, frame: TxBuf) {
-        self.inner.consume(header, frame);
+    fn consume(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
+        self.inner.consume(frame, header_len, tx_checksum);
         *self.consumed = true;
     }
 
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf {
-        let frame = self.inner.consume_retain(header, frame);
+    fn consume_retain(
+        self,
+        frame: TxBuf,
+        header_len: usize,
+        tx_checksum: Option<TxChecksum>,
+    ) -> TxBuf {
+        let frame = self.inner.consume_retain(frame, header_len, tx_checksum);
         *self.consumed = true;
         frame
     }

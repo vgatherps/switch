@@ -28,6 +28,8 @@ repository = "https://github.com/smoltcp-rs/smoltcp.git"
 
 [features]
 auto-icmp-echo-reply = []
+# TX buffers are frame-pool mbufs (conduit). Without it they are heap buffers (smoltcp's tests).
+dpdk = ["dep:zhida-buffer", "dep:zhida-dpdk-sys"]
 medium-ip = []
 udp-set = []
 
@@ -47,6 +49,14 @@ path = "tests/rx_buf_from_vec.rs"
 [dependencies.byteorder]
 version = "1.0"
 default-features = false
+
+[dependencies.zhida-buffer]
+path = "../../crates/zhida-buffer"
+optional = true
+
+[dependencies.zhida-dpdk-sys]
+path = "../../crates/zhida-dpdk-sys"
+optional = true
 
 [dependencies.heapless]
 version = "0.9"

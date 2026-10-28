@@ -1,187 +1,433 @@
 #![allow(unsafe_code)]
 
-use alloc::{rc::Rc, vec, vec::Vec};
+use alloc::rc::Rc;
 use core::{mem::ManuallyDrop, ptr::NonNull, slice};
 
-use super::TxChecksum;
+pub use owner::TxPool;
+#[cfg(not(feature = "dpdk"))]
+pub use owner::TxPoolCounts;
 
-/// Reference operations on a TxBuf's owner. One TxBuf value is one reference.
-pub struct TxBufOps {
-    pub release: unsafe fn(owner: NonNull<()>),
-    pub share: unsafe fn(owner: NonNull<()>),
-    pub unique: unsafe fn(owner: NonNull<()>) -> bool,
-}
+/// Header bytes the stack may write in front of a TX buffer's payload.
+pub const TX_HEADROOM: usize = 64;
 
-/// One reference to a TX payload buffer. Payload is immutable while another reference exists.
+/// One reference to a TX payload buffer. Payload and headers are written only while this is the
+/// only reference.
+///
+/// With feature `dpdk` (conduit) the owner is a frame-pool mbuf (`zhida_buffer::FramePool`) and
+/// reference operations are direct refcount accesses. Without it the owner is a heap buffer from
+/// `TxPool`, which smoltcp's own tests use.
 pub struct TxBuf {
+    owner: owner::Owner,
     data: NonNull<u8>,
     len: u32,
     room: u32,
-    owner: NonNull<()>,
-    origin: NonNull<()>,
-    ops: &'static TxBufOps,
 }
 
 impl TxBuf {
-    /// # Safety
-    /// `data .. data + room` is valid for reads and writes, lies in one allocation, and is
-    /// reachable only through `owner`'s references. The caller transfers one reference of
-    /// `owner`; `ops` matches it. The payload length starts at zero.
-    pub unsafe fn from_raw_parts(
-        owner: NonNull<()>,
-        ops: &'static TxBufOps,
-        origin: NonNull<()>,
-        data: NonNull<u8>,
-        room: usize,
-    ) -> TxBuf {
-        TxBuf {
-            data,
-            len: 0,
-            room: room.try_into().expect("TX payload room exceeds u32"),
-            owner,
-            origin,
-            ops,
-        }
-    }
-
+    #[inline]
     pub fn len(&self) -> usize {
         self.len as usize
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.room as usize
     }
 
+    /// The allocator identity: the pool this buffer came from.
+    #[inline]
     pub fn origin(&self) -> NonNull<()> {
-        self.origin
+        owner::origin(self.owner)
     }
 
-    pub fn owner(&self) -> NonNull<()> {
-        self.owner
-    }
-
+    /// Whether this is the only reference.
+    #[inline]
     pub fn unique(&self) -> bool {
-        // SAFETY: from_raw_parts requires ops to match owner and owner remains live.
-        unsafe { (self.ops.unique)(self.owner) }
+        owner::unique(self.owner)
     }
 
+    #[inline]
     pub fn payload(&self) -> &[u8] {
-        // SAFETY: from_raw_parts requires data..data + room to stay valid. len never exceeds room.
+        // SAFETY: data..data + room stays valid while this reference lives; len <= room.
         unsafe { slice::from_raw_parts(self.data.as_ptr(), self.len()) }
     }
 
-    /// Return the whole payload room. Panics unless this is the only reference.
+    /// The whole payload room. Panics unless this is the only reference.
     pub fn room_mut(&mut self) -> &mut [u8] {
         assert!(self.unique(), "TX buffer is shared");
-        // SAFETY: uniqueness gives exclusive access and the mutable borrow prevents another view.
+        // SAFETY: the only reference, and the mutable borrow prevents another view.
         unsafe { slice::from_raw_parts_mut(self.data.as_ptr(), self.capacity()) }
     }
 
-    /// Set the payload length. Panics if the length exceeds the room or the buffer is shared.
+    /// Set the payload length. Panics if it exceeds the room or the buffer is shared.
     pub fn set_len(&mut self, len: usize) {
         assert!(len <= self.capacity(), "TX payload length exceeds room");
         assert!(self.unique(), "TX buffer is shared");
-        self.len = len.try_into().expect("TX payload length exceeds u32");
+        self.len = len as u32;
     }
 
-    /// Give up this value's owner reference without releasing it.
-    pub fn into_raw(self) -> NonNull<()> {
-        ManuallyDrop::new(self).owner
+    /// The `header_len` bytes in front of the payload, to write headers into, and the payload.
+    /// Panics unless this is the only reference and `header_len <= TX_HEADROOM`.
+    pub fn headroom_mut(&mut self, header_len: usize) -> (&mut [u8], &[u8]) {
+        assert!(self.unique(), "TX buffer is shared");
+        // SAFETY: checked unique just now.
+        unsafe { self.headroom_unchecked(header_len) }
+    }
+
+    /// This buffer as a `UniqueTxBuf` if it holds the only reference: one refcount read.
+    #[inline]
+    pub(crate) fn into_unique(self) -> Result<UniqueTxBuf, TxBuf> {
+        if self.unique() { Ok(UniqueTxBuf(self)) } else { Err(self) }
+    }
+
+    /// # Safety
+    /// This is the only reference.
+    #[inline]
+    unsafe fn headroom_unchecked(&mut self, header_len: usize) -> (&mut [u8], &[u8]) {
+        assert!(header_len <= TX_HEADROOM, "TX header exceeds the headroom");
+        debug_assert!(self.unique());
+        // SAFETY: every owner keeps TX_HEADROOM bytes in front of data in the same allocation;
+        // the only reference may write them, and the two slices do not overlap.
+        unsafe {
+            let start = self.data.as_ptr().sub(header_len);
+            (
+                slice::from_raw_parts_mut(start, header_len),
+                slice::from_raw_parts(self.data.as_ptr(), self.len()),
+            )
+        }
+    }
+
+    /// The `header_len` bytes in front of the payload followed by the payload: the packet a
+    /// device publishes. Panics if `header_len > TX_HEADROOM`.
+    pub fn packet(&self, header_len: usize) -> &[u8] {
+        assert!(header_len <= TX_HEADROOM, "TX header exceeds the headroom");
+        // SAFETY: the headroom and payload are one valid range of the owner's allocation.
+        unsafe {
+            slice::from_raw_parts(
+                self.data.as_ptr().sub(header_len),
+                header_len + self.len(),
+            )
+        }
     }
 }
 
 impl Clone for TxBuf {
+    #[inline]
     fn clone(&self) -> TxBuf {
-        // SAFETY: from_raw_parts requires ops to match the live owner.
-        unsafe { (self.ops.share)(self.owner) };
+        owner::share(self.owner);
         TxBuf {
+            owner: self.owner,
             data: self.data,
             len: self.len,
             room: self.room,
-            owner: self.owner,
-            origin: self.origin,
-            ops: self.ops,
         }
     }
 }
 
 impl Drop for TxBuf {
+    #[inline]
     fn drop(&mut self) {
-        // SAFETY: from_raw_parts transfers one owner reference to this value.
-        unsafe { (self.ops.release)(self.owner) };
+        // SAFETY: this value holds one reference, given up exactly once here.
+        unsafe { owner::release(self.owner) };
     }
 }
 
-/// Header bytes for one send, built by the stack and moved to the device.
-#[derive(Clone, Copy)]
-pub struct TxHeader {
-    bytes: [u8; 64],
-    len: u8,
-    tx_checksum: Option<TxChecksum>,
-}
+#[cfg(feature = "dpdk")]
+mod owner {
+    use super::*;
+    use zhida_dpdk_sys::{rte_mbuf, zhida_pktmbuf_free_seg};
 
-impl TxHeader {
-    pub fn new(len: usize, tx_checksum: Option<TxChecksum>) -> TxHeader {
-        assert!(len <= 64, "TX header exceeds 64 bytes");
-        TxHeader {
-            bytes: [0; 64],
-            len: len.try_into().expect("TX header length exceeds u8"),
-            tx_checksum,
+    pub use zhida_buffer::FramePool as TxPool;
+
+    /// A frame-pool mbuf; one TxBuf or published packet is one refcount.
+    pub(super) type Owner = NonNull<rte_mbuf>;
+
+    #[inline(always)]
+    pub(super) fn unique(owner: Owner) -> bool {
+        // SAFETY: a reference keeps the mbuf live; refcounts are non-atomic, one owner thread.
+        unsafe { (*owner.as_ptr()).refcnt() == 1 }
+    }
+
+    #[inline(always)]
+    pub(super) fn share(owner: Owner) {
+        // SAFETY: as `unique`.
+        unsafe { (*owner.as_ptr()).refcnt_inc() }
+    }
+
+    /// # Safety
+    /// The caller gives up one reference.
+    #[inline(always)]
+    pub(super) unsafe fn release(owner: Owner) {
+        // SAFETY: a direct, single-segment frame-pool mbuf; the last reference returns it.
+        unsafe { zhida_pktmbuf_free_seg(owner.as_ptr()) }
+    }
+
+    #[inline(always)]
+    pub(super) fn origin(owner: Owner) -> NonNull<()> {
+        // SAFETY: as `unique`; a pool mbuf's `pool` is never null.
+        unsafe { NonNull::new_unchecked((*owner.as_ptr()).pool).cast() }
+    }
+
+    #[inline(always)]
+    pub(super) fn pool_origin(pool: &TxPool) -> NonNull<()> {
+        NonNull::new(pool.mempool()).expect("a frame pool has a mempool").cast()
+    }
+
+    #[inline]
+    pub(super) fn alloc(pool: &TxPool) -> Option<TxBuf> {
+        let mbuf = pool.alloc()?;
+        // SAFETY: FramePool::alloc returns a live mbuf with this reference only, its payload at
+        // FRAME_DATA_OFF (>= TX_HEADROOM) followed by `room` bytes of its buffer.
+        let data = unsafe { NonNull::new_unchecked((*mbuf.as_ptr()).data_ptr()) };
+        Some(TxBuf {
+            owner: mbuf,
+            data,
+            len: 0,
+            room: u32::from(pool.room()),
+        })
+    }
+
+    impl TxBuf {
+        /// The frame's mbuf; it stays this value's reference.
+        #[inline]
+        pub fn mbuf(&self) -> NonNull<rte_mbuf> {
+            self.owner
+        }
+
+        /// Give this value's reference to the caller as its mbuf.
+        #[inline]
+        pub fn into_mbuf(self) -> NonNull<rte_mbuf> {
+            ManuallyDrop::new(self).owner
         }
     }
 
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
-    }
-
-    pub fn bytes_mut(&mut self) -> &mut [u8] {
-        let len = usize::from(self.len);
-        &mut self.bytes[..len]
-    }
-
-    pub fn tx_checksum(&self) -> Option<TxChecksum> {
-        self.tx_checksum
+    impl TxFrame {
+        /// The frame's mbuf; it stays this frame's reference.
+        #[inline]
+        pub fn mbuf(&self) -> NonNull<rte_mbuf> {
+            self.0.owner
+        }
     }
 }
 
-pub(crate) fn frame_bytes(header: TxHeader, frame: &TxBuf) -> Vec<u8> {
-    assert!(frame.unique(), "TX buffer is shared");
-    let mut bytes = Vec::with_capacity(
-        header
-            .bytes()
-            .len()
-            .checked_add(frame.len())
-            .expect("TX frame length overflow"),
-    );
-    bytes.extend_from_slice(header.bytes());
-    bytes.extend_from_slice(frame.payload());
-    bytes
+#[cfg(not(feature = "dpdk"))]
+mod owner {
+    use super::*;
+    use alloc::{boxed::Box, vec};
+    use core::cell::Cell;
+
+    /// A pool's counters; they outlive the pool.
+    pub struct TxPoolCounts {
+        allocs: Cell<usize>,
+        shares: Cell<usize>,
+        releases: Cell<usize>,
+        live: Cell<usize>,
+        pool_dropped: Cell<bool>,
+        released_after_pool: Cell<usize>,
+    }
+
+    /// Heap TX buffers with reference and lifetime counters, for smoltcp's own tests. Each buffer
+    /// keeps `TX_HEADROOM` bytes in front of `room` payload bytes.
+    pub struct TxPool {
+        room: usize,
+        counts: Rc<TxPoolCounts>,
+    }
+
+    pub(crate) struct Storage {
+        bytes: Box<[u8]>,
+        references: Cell<usize>,
+        origin: NonNull<()>,
+        counts: Rc<TxPoolCounts>,
+    }
+
+    /// A Box-allocated Storage, created by TxPool::alloc and freed by the last release.
+    pub(super) type Owner = NonNull<Storage>;
+
+    #[inline]
+    pub(super) fn unique(owner: Owner) -> bool {
+        // SAFETY: a reference keeps the Storage live.
+        unsafe { owner.as_ref() }.references.get() == 1
+    }
+
+    pub(super) fn share(owner: Owner) {
+        // SAFETY: as `unique`.
+        let storage = unsafe { owner.as_ref() };
+        storage.references.set(storage.references.get().checked_add(1).expect("TX buffer reference count overflow"));
+        storage.counts.shares.set(storage.counts.shares.get() + 1);
+    }
+
+    /// # Safety
+    /// The caller gives up one reference.
+    pub(super) unsafe fn release(owner: Owner) {
+        // SAFETY: a reference keeps the Storage live.
+        let storage = unsafe { owner.as_ref() };
+        let counts = &storage.counts;
+        counts.releases.set(counts.releases.get() + 1);
+        if counts.pool_dropped.get() {
+            counts.released_after_pool.set(counts.released_after_pool.get() + 1);
+        }
+        let remaining = storage.references.get().checked_sub(1).expect("TX buffer reference count underflow");
+        storage.references.set(remaining);
+        if remaining == 0 {
+            counts.live.set(counts.live.get() - 1);
+            // SAFETY: the last reference to the Box created by TxPool::alloc.
+            unsafe { drop(Box::from_raw(owner.as_ptr())) };
+        }
+    }
+
+    pub(super) fn origin(owner: Owner) -> NonNull<()> {
+        // SAFETY: as `unique`.
+        unsafe { owner.as_ref() }.origin
+    }
+
+    pub(super) fn pool_origin(pool: &TxPool) -> NonNull<()> {
+        NonNull::from(pool).cast()
+    }
+
+    pub(super) fn alloc(pool: &TxPool) -> Option<TxBuf> {
+        pool.alloc()
+    }
+
+    impl TxPool {
+        pub fn new(room: usize) -> Rc<TxPool> {
+            Rc::new(TxPool {
+                room,
+                counts: Rc::new(TxPoolCounts {
+                    allocs: Cell::new(0),
+                    shares: Cell::new(0),
+                    releases: Cell::new(0),
+                    live: Cell::new(0),
+                    pool_dropped: Cell::new(false),
+                    released_after_pool: Cell::new(0),
+                }),
+            })
+        }
+
+        /// An empty buffer with one reference.
+        pub fn alloc(&self) -> Option<TxBuf> {
+            let total = TX_HEADROOM.checked_add(self.room).expect("TX storage size overflow");
+            let mut storage = Box::new(Storage {
+                bytes: vec![0; total].into_boxed_slice(),
+                references: Cell::new(1),
+                origin: pool_origin(self),
+                counts: self.counts.clone(),
+            });
+            // SAFETY: TX_HEADROOM is within the allocation by construction.
+            let data = unsafe { NonNull::new_unchecked(storage.bytes.as_mut_ptr().add(TX_HEADROOM)) };
+            let owner = NonNull::new(Box::into_raw(storage)).expect("Box::into_raw returned null");
+            self.counts.allocs.set(self.counts.allocs.get() + 1);
+            self.counts.live.set(self.counts.live.get() + 1);
+            Some(TxBuf {
+                owner,
+                data,
+                len: 0,
+                room: u32::try_from(self.room).expect("TX room exceeds u32"),
+            })
+        }
+
+        pub fn counts(&self) -> Rc<TxPoolCounts> {
+            self.counts.clone()
+        }
+
+        /// Buffers whose storage is not yet freed.
+        pub fn live(&self) -> usize {
+            self.counts.live.get()
+        }
+
+        pub fn shares(&self) -> usize {
+            self.counts.shares.get()
+        }
+
+        pub fn releases(&self) -> usize {
+            self.counts.releases.get()
+        }
+    }
+
+    impl TxPoolCounts {
+        pub fn allocs(&self) -> usize {
+            self.allocs.get()
+        }
+
+        pub fn releases(&self) -> usize {
+            self.releases.get()
+        }
+
+        pub fn pool_dropped(&self) -> bool {
+            self.pool_dropped.get()
+        }
+
+        /// References released after the pool was dropped.
+        pub fn released_after_drop(&self) -> usize {
+            self.released_after_pool.get()
+        }
+    }
+
+    impl Drop for TxPool {
+        fn drop(&mut self) {
+            self.counts.pool_dropped.set(true);
+        }
+    }
+
+    impl TxBuf {
+        /// Give this value's reference up without releasing it (tests that model a device
+        /// holding it). `release_raw` gives it back.
+        #[cfg(test)]
+        pub(crate) fn into_raw(self) -> NonNull<Storage> {
+            ManuallyDrop::new(self).owner
+        }
+
+        /// # Safety
+        /// `owner` came from `into_raw` and its reference is given up here.
+        #[cfg(test)]
+        pub(crate) unsafe fn release_raw(owner: NonNull<Storage>) {
+            unsafe { release(owner) }
+        }
+    }
 }
 
-/// Allocator behind a TxSource. Every TxBuf it returns has length zero, is unique,
-/// has the same origin as this allocator, and has at least 64 bytes of owner headroom.
-pub trait TxAlloc {
-    fn alloc(&self) -> Option<TxBuf>;
-    fn origin(&self) -> NonNull<()>;
+/// A TxBuf holding the only reference. It cannot be cloned, so it stays the only reference and
+/// its headers may be written without another refcount read.
+pub(crate) struct UniqueTxBuf(TxBuf);
+
+impl UniqueTxBuf {
+    /// The `header_len` bytes in front of the payload, and the payload. Panics if
+    /// `header_len > TX_HEADROOM`.
+    #[inline]
+    pub(crate) fn headroom_mut(&mut self, header_len: usize) -> (&mut [u8], &[u8]) {
+        // SAFETY: a UniqueTxBuf is the only reference (`into_unique`) and cannot be cloned.
+        unsafe { self.0.headroom_unchecked(header_len) }
+    }
+
+    #[inline]
+    pub(crate) fn into_buf(self) -> TxBuf {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) fn into_frame(self) -> TxFrame {
+        TxFrame(self.0)
+    }
 }
 
-/// Cloneable allocator handle that keeps its backing alive.
+/// Cloneable handle to a TX pool; each clone keeps the pool alive.
 #[derive(Clone)]
-pub struct TxSource(Rc<dyn TxAlloc>);
+pub struct TxSource(Rc<TxPool>);
 
 impl TxSource {
-    pub fn new(alloc: Rc<dyn TxAlloc>) -> TxSource {
-        TxSource(alloc)
+    pub fn new(pool: Rc<TxPool>) -> TxSource {
+        TxSource(pool)
     }
 
+    /// An empty, unique buffer from the pool; `None` when it is empty.
+    #[inline]
     pub fn alloc(&self) -> Option<TxBuf> {
-        self.0.alloc()
+        owner::alloc(&self.0)
     }
 
+    #[inline]
     pub fn origin(&self) -> NonNull<()> {
-        self.0.origin()
+        owner::pool_origin(&self.0)
     }
-
 }
 
 /// The app's frame. Clone is cheap; after a clone the payload is read-only.
@@ -189,180 +435,108 @@ impl TxSource {
 pub struct TxFrame(TxBuf);
 
 impl TxFrame {
-    /// Wrap an empty, unique TX buffer.
-    pub fn new(buf: TxBuf) -> TxFrame {
-        assert!(buf.unique(), "TX frame buffer is shared");
-        assert_eq!(buf.len(), 0, "TX frame buffer is not empty");
-        TxFrame(buf)
+    /// An empty frame from `pool`; `None` when the pool is empty.
+    #[inline]
+    pub fn alloc(pool: &TxPool) -> Option<TxFrame> {
+        owner::alloc(pool).map(TxFrame)
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.0.capacity()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// The whole payload room. Panics if the frame is shared.
+    #[inline]
     pub fn room_mut(&mut self) -> &mut [u8] {
         self.0.room_mut()
     }
 
+    /// Panics if the frame is shared or `len` exceeds the capacity.
+    #[inline]
     pub fn set_len(&mut self, len: usize) {
         self.0.set_len(len);
     }
 
+    #[inline]
     pub fn payload(&self) -> &[u8] {
         self.0.payload()
     }
 
+    #[inline]
     pub fn origin(&self) -> NonNull<()> {
         self.0.origin()
     }
 
+    #[inline]
     pub(crate) fn unique(&self) -> bool {
         self.0.unique()
     }
 
+    /// This frame as a `UniqueTxBuf` if it holds the only reference: one refcount read.
+    #[inline]
+    pub(crate) fn into_unique(self) -> Result<UniqueTxBuf, TxFrame> {
+        self.0.into_unique().map_err(TxFrame)
+    }
+
+    #[inline]
     pub(crate) fn into_buf(self) -> TxBuf {
         self.0
     }
-}
 
-#[cfg(test)]
-pub(crate) mod test_owner {
-    use super::*;
-    use alloc::boxed::Box;
-    use core::cell::Cell;
-
-    const HEADROOM: usize = 64;
-
-    struct Counts {
-        allocs: Cell<usize>,
-        shares: Cell<usize>,
-        releases: Cell<usize>,
-        live: Cell<usize>,
-    }
-
-    pub(crate) struct CountingAlloc {
-        room: usize,
-        counts: Rc<Counts>,
-    }
-
-    struct Storage {
-        bytes: Box<[u8]>,
-        references: Cell<usize>,
-        counts: Rc<Counts>,
-    }
-
-    unsafe fn release(owner: NonNull<()>) {
-        // SAFETY: CountingAlloc::alloc creates owner with Box::into_raw and keeps it live
-        // until the reference count reaches zero.
-        let storage = unsafe { owner.cast::<Storage>().as_ref() };
-        storage.counts.releases.set(storage.counts.releases.get().checked_add(1).expect("release count overflow"));
-        let remaining = storage.references.get().checked_sub(1).expect("TX buffer reference count underflow");
-        storage.references.set(remaining);
-        if remaining == 0 {
-            storage.counts.live.set(storage.counts.live.get().checked_sub(1).expect("live allocation count underflow"));
-            // SAFETY: this is the last reference to the Box created by CountingAlloc::alloc.
-            unsafe { drop(Box::from_raw(owner.cast::<Storage>().as_ptr())) };
-        }
-    }
-
-    unsafe fn share(owner: NonNull<()>) {
-        // SAFETY: owner points to a live Storage while a TxBuf reference exists.
-        let storage = unsafe { owner.cast::<Storage>().as_ref() };
-        storage.references.set(storage.references.get().checked_add(1).expect("TX buffer reference count overflow"));
-        storage.counts.shares.set(storage.counts.shares.get().checked_add(1).expect("share count overflow"));
-    }
-
-    unsafe fn unique(owner: NonNull<()>) -> bool {
-        // SAFETY: owner points to a live Storage while a TxBuf reference exists.
-        unsafe { owner.cast::<Storage>().as_ref() }.references.get() == 1
-    }
-
-    pub(super) static OPS: TxBufOps = TxBufOps { release, share, unique };
-
-    impl CountingAlloc {
-        pub(crate) fn new(room: usize) -> Rc<CountingAlloc> {
-            Rc::new(CountingAlloc {
-                room,
-                counts: Rc::new(Counts {
-                    allocs: Cell::new(0),
-                    shares: Cell::new(0),
-                    releases: Cell::new(0),
-                    live: Cell::new(0),
-                }),
-            })
-        }
-
-        pub(crate) fn live(&self) -> usize { self.counts.live.get() }
-        pub(crate) fn shares(&self) -> usize { self.counts.shares.get() }
-        pub(crate) fn releases(&self) -> usize { self.counts.releases.get() }
-    }
-
-    impl TxAlloc for CountingAlloc {
-        fn alloc(&self) -> Option<TxBuf> {
-            let total = HEADROOM.checked_add(self.room).expect("test TX storage size overflow");
-            let mut storage = Box::new(Storage {
-                bytes: vec![0; total].into_boxed_slice(),
-                references: Cell::new(1),
-                counts: self.counts.clone(),
-            });
-            let data = NonNull::new(storage.bytes.as_mut_ptr()).expect("boxed slice pointer is null");
-            // SAFETY: HEADROOM is within the allocation by construction.
-            let data = unsafe { data.add(HEADROOM) };
-            let owner = NonNull::new(Box::into_raw(storage).cast::<()>()).expect("Box::into_raw returned null");
-            self.counts.allocs.set(self.counts.allocs.get().checked_add(1).expect("allocation count overflow"));
-            self.counts.live.set(self.counts.live.get().checked_add(1).expect("live allocation count overflow"));
-            // SAFETY: Storage owns room bytes from data until OPS releases its last reference.
-            Some(unsafe { TxBuf::from_raw_parts(owner, &OPS, self.origin(), data, self.room) })
-        }
-
-        fn origin(&self) -> NonNull<()> {
-            NonNull::from(self).cast()
-        }
+    /// Wrap a buffer from a test pool.
+    #[cfg(test)]
+    pub(crate) fn from_buf(buf: TxBuf) -> TxFrame {
+        TxFrame(buf)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_owner::CountingAlloc;
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
     fn clone_shares_and_drop_releases_once() {
-        let alloc = CountingAlloc::new(8);
-        let buf = alloc.alloc().unwrap();
+        let pool = TxPool::new(8);
+        let buf = pool.alloc().unwrap();
         let clone = buf.clone();
-        assert_eq!(alloc.shares(), 1);
+        assert_eq!(pool.shares(), 1);
         assert!(!buf.unique());
         drop(clone);
-        assert_eq!(alloc.releases(), 1);
+        assert_eq!(pool.releases(), 1);
         assert!(buf.unique());
         drop(buf);
-        assert_eq!(alloc.releases(), 2);
-        assert_eq!(alloc.live(), 0);
+        assert_eq!(pool.releases(), 2);
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]
-    fn room_mut_and_set_len_panic_when_shared() {
-        let alloc = CountingAlloc::new(8);
-        let mut buf = alloc.alloc().unwrap();
+    fn room_mut_set_len_and_headroom_mut_panic_when_shared() {
+        let pool = TxPool::new(8);
+        let mut buf = pool.alloc().unwrap();
         let clone = buf.clone();
         assert!(catch_unwind(AssertUnwindSafe(|| {
             let _ = buf.room_mut();
         }))
         .is_err());
         assert!(catch_unwind(AssertUnwindSafe(|| buf.set_len(1))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _ = buf.headroom_mut(1);
+        }))
+        .is_err());
         drop(clone);
     }
 
     #[test]
     fn set_len_updates_this_buffer_at_refcount_1() {
-        let alloc = CountingAlloc::new(8);
-        let mut buf = alloc.alloc().unwrap();
+        let pool = TxPool::new(8);
+        let mut buf = pool.alloc().unwrap();
         buf.room_mut()[..3].copy_from_slice(&[1, 2, 3]);
         buf.set_len(3);
         assert_eq!(buf.payload(), &[1, 2, 3]);
@@ -370,47 +544,61 @@ mod tests {
 
     #[test]
     fn dropping_original_then_clone_releases_storage_once() {
-        let alloc = CountingAlloc::new(8);
-        let buf = alloc.alloc().unwrap();
+        let pool = TxPool::new(8);
+        let buf = pool.alloc().unwrap();
         let clone = buf.clone();
         drop(buf);
-        assert_eq!(alloc.live(), 1);
+        assert_eq!(pool.live(), 1);
         drop(clone);
-        assert_eq!(alloc.live(), 0);
-        assert_eq!(alloc.releases(), 2);
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.releases(), 2);
     }
 
     #[test]
     fn into_raw_keeps_its_reference() {
-        let alloc = CountingAlloc::new(8);
-        let buf = alloc.alloc().unwrap();
+        let pool = TxPool::new(8);
+        let buf = pool.alloc().unwrap();
         let owner = buf.into_raw();
-        assert_eq!(alloc.live(), 1);
-        // SAFETY: into_raw transfers this sole reference to the caller.
-        unsafe { (test_owner::OPS.release)(owner) };
-        assert_eq!(alloc.live(), 0);
-        assert_eq!(alloc.releases(), 1);
+        assert_eq!(pool.live(), 1);
+        // SAFETY: into_raw gave up this sole reference.
+        unsafe { TxBuf::release_raw(owner) };
+        assert_eq!(pool.live(), 0);
+        assert_eq!(pool.releases(), 1);
+    }
+
+    /// Headers written into the headroom form one packet with the payload; the headroom holds
+    /// exactly TX_HEADROOM bytes.
+    #[test]
+    fn headroom_and_payload_form_the_packet() {
+        let pool = TxPool::new(8);
+        let mut buf = pool.alloc().unwrap();
+        buf.room_mut()[..2].copy_from_slice(&[8, 9]);
+        buf.set_len(2);
+        let (headers, payload) = buf.headroom_mut(TX_HEADROOM);
+        assert_eq!(payload, &[8, 9]);
+        headers.fill(7);
+        headers[TX_HEADROOM - 1] = 1;
+        assert_eq!(buf.packet(1), &[1, 8, 9]);
+        assert_eq!(buf.packet(TX_HEADROOM).len(), TX_HEADROOM + 2);
+        assert_eq!(buf.packet(0), &[8, 9]);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _ = buf.headroom_mut(TX_HEADROOM + 1);
+        }))
+        .is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _ = buf.packet(TX_HEADROOM + 1);
+        }))
+        .is_err());
     }
 
     #[test]
-    fn tx_frame_new_rejects_shared_or_nonempty_buffers() {
-        let alloc = CountingAlloc::new(8);
-        let buf = alloc.alloc().unwrap();
-        let clone = buf.clone();
-        assert!(catch_unwind(AssertUnwindSafe(|| TxFrame::new(buf))).is_err());
-        drop(clone);
-
-        let mut buf = alloc.alloc().unwrap();
-        buf.set_len(1);
-        assert!(catch_unwind(AssertUnwindSafe(|| TxFrame::new(buf))).is_err());
-    }
-
-    #[test]
-    fn tx_header_len_bounds() {
-        let mut header = TxHeader::new(64, None);
-        header.bytes_mut()[63] = 7;
-        assert_eq!(header.bytes().len(), 64);
-        assert_eq!(header.bytes()[63], 7);
-        assert!(catch_unwind(|| TxHeader::new(65, None)).is_err());
+    fn frames_are_empty_unique_and_of_their_pool() {
+        let pool = TxPool::new(8);
+        let source = TxSource::new(pool.clone());
+        let frame = TxFrame::alloc(&pool).unwrap();
+        assert_eq!((frame.len(), frame.capacity()), (0, 8));
+        assert!(frame.unique());
+        assert_eq!(frame.origin(), source.origin());
+        assert_ne!(TxPool::new(8).alloc().unwrap().origin(), source.origin());
     }
 }

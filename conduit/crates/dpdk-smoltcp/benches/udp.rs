@@ -1,16 +1,14 @@
 //! UDP datagram timings, Criterion group "udp", with one live Pair per case.
 //! A sends to B with software UDP checksums (csum) or zero UDP checksums
 //! (nocsum). Payloads are 64, 512 or 1472 bytes; bursts are 1, 8 or 32 frames.
-//! send times k udp_send_with calls, including payload writes, and one flush:
-//! the app writes the payload straight into the TX packet.
-//! send_copy times the same payload writes into the app's own buffer, k
+//! send_copy times payload writes into the app's own buffer, k
 //! `udp_send(&[u8])` calls that copy it into a TX packet, and one flush.
 //! send_frame times k `Stack::tx_frame` allocations, the same payload writes
 //! into each frame, k `udp_send_frame` calls (unique frames, published in
-//! place) and one flush. send_copy and send_frame share send's receive side and checks.
-//! recv times B's receive(now, k), k socket recv calls and each datagram's
-//! drop. Each read touches only the first payload byte and saves it for the
-//! untimed sequence check. Payloads have a one-byte sequence number, 0..k,
+//! place) and one flush. Both share the receive side and checks.
+//! recv sends with send_frame's path, untimed, then times B's receive(now,
+//! k), k socket recv calls and each datagram's drop. Each read touches only
+//! the first payload byte and saves it for the untimed sequence check. Payloads have a one-byte sequence number, 0..k,
 //! followed by a fixed pattern. Sequence numbers restart with each burst.
 //! Setup and ARP resolution are untimed, and caller time stays fixed.
 //! Forwarding and every frame's size, payload and checksum checks are untimed.
@@ -23,7 +21,7 @@
 //! One throughput element is a datagram. Timings include the timer read;
 //! clock times an empty region with the same two Instant reads as emit.rs.
 //! The timer tick may be coarse in a VM; Criterion averages these samples.
-//! send/<size>/nocsum/paths4 is the nocsum send with four `StackConfig::paths`
+//! send_frame/<size>/nocsum/paths4 is the nocsum frame send with four `StackConfig::paths`
 //! rules on both Stacks (`PATHS4`), so each send's size check scans four entries.
 //!
 //! Offload turns on the TX UDP checksum profile on A's net_ring Port with
@@ -56,7 +54,6 @@ const PATTERN: u8 = 0xa5;
 
 #[derive(Clone, Copy)]
 enum Case {
-    Send,
     SendCopy,
     SendFrame,
     Recv,
@@ -65,36 +62,11 @@ enum Case {
 impl Case {
     fn name(self) -> &'static str {
         match self {
-            Case::Send => "send",
             Case::SendCopy => "send_copy",
             Case::SendFrame => "send_frame",
             Case::Recv => "recv",
         }
     }
-}
-
-/// k copying sends and one flush, timed.
-fn send_copies(
-    pair: &mut Pair,
-    handle: &UdpHandle,
-    size: usize,
-    sequences: &[u8],
-) -> (Result<Sent, dpdk_smoltcp::StackError>, Duration) {
-    let to = Some(endpoint(Side::B));
-    let mut results = [Ok(()); BURST];
-    let start = Instant::now();
-    for (result, &sequence) in results.iter_mut().zip(sequences) {
-        *result = pair.a.udp_send_with(handle, to, size, |payload| {
-            payload.fill(PATTERN);
-            payload[0] = sequence;
-        });
-    }
-    let sent = pair.a.flush();
-    let send_elapsed = start.elapsed();
-    for result in &results[..sequences.len()] {
-        assert_eq!(*result, Ok(()));
-    }
-    (sent, send_elapsed)
 }
 
 /// k payload writes into the app's buffer, each copied by `udp_send`, then
@@ -218,10 +190,7 @@ fn setup(eal: &Eal, mode: Mode, paths: &[PathMtu]) -> (Pair, [UdpHandle; 2]) {
             .unwrap()
     });
     assert_eq!(
-        pair.a
-            .udp_send_with(&handles[0], Some(endpoint(Side::B)), 1, |_| {
-                panic!("ARP discovery must not fill the payload")
-            }),
+        pair.a.udp_send(&handles[0], Some(endpoint(Side::B)), &[0]),
         Err(UdpSendError::NeighborPending)
     );
     assert_sent(pair.a.flush().unwrap(), 1);
@@ -303,14 +272,13 @@ fn iteration(
     let k = sequences.len();
     let now = pair.now();
     let (sent, send_elapsed) = match case {
-        Case::SendFrame => send_frames(pair, &handles[0], size, sequences),
+        Case::SendFrame | Case::Recv => send_frames(pair, &handles[0], size, sequences),
         Case::SendCopy => send_slices(pair, &handles[0], size, sequences),
-        Case::Send | Case::Recv => send_copies(pair, &handles[0], size, sequences),
     };
     assert_sent(sent.unwrap(), k);
     forward(pair, size, mode, k);
     let elapsed = match case {
-        Case::Send | Case::SendCopy | Case::SendFrame => {
+        Case::SendCopy | Case::SendFrame => {
             assert_turn(pair.b.receive(now, k).unwrap(), k, 0);
             for &sequence in sequences {
                 let datagram = pair.b.udp_mut(&handles[1]).recv().unwrap();
@@ -347,17 +315,15 @@ fn iteration(
 fn benches(c: &mut Criterion) {
     with_eal(|eal| {
         let mut group = c.benchmark_group("udp");
-        for case in [Case::Send, Case::SendCopy, Case::SendFrame, Case::Recv] {
+        for case in [Case::SendCopy, Case::SendFrame, Case::Recv] {
             for size in [64, 512, 1472] {
                 let modes: &[Mode] = match case {
-                    Case::Send | Case::SendCopy | Case::SendFrame => {
-                        &[Mode::Csum, Mode::Nocsum, Mode::Offload]
-                    }
+                    Case::SendCopy | Case::SendFrame => &[Mode::Csum, Mode::Nocsum, Mode::Offload],
                     Case::Recv => &[Mode::Csum, Mode::Nocsum],
                 };
                 for &mode in modes {
                     let tables: &[(&str, &[PathMtu])] =
-                        if matches!(case, Case::Send) && mode == Mode::Nocsum {
+                        if matches!(case, Case::SendFrame) && mode == Mode::Nocsum {
                             &[("", &[]), ("/paths4", &PATHS4)]
                         } else {
                             &[("", &[])]

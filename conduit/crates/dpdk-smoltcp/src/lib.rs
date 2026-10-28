@@ -72,7 +72,6 @@
 
 mod device;
 mod eal;
-mod frame_pool;
 mod handle;
 mod port;
 mod rx_pool;

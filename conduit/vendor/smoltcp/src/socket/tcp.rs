@@ -3677,8 +3677,9 @@ fn rtt_sampling_round_trips() {
 #[cfg(test)]
 #[test]
 fn socket_size_matches_main() {
-    // TxQueue holds frame entries and their TxSource instead of a borrowed byte ring.
-    let main_size = 456;
+    // TxQueue holds frame entries and their TxSource instead of a borrowed byte ring; the
+    // TxSource is a thin Rc to the concrete pool.
+    let main_size = 448;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
 }
@@ -3690,8 +3691,7 @@ fn socket_size_matches_main() {
 mod test {
     use super::*;
     use crate::config::IFACE_MAX_ADDR_COUNT;
-    use crate::phy::TxAlloc;
-    use crate::phy::test_owner::CountingAlloc;
+    use crate::phy::TxPool;
     use crate::wire::{IpCidr, IpRepr, TcpTimestampRepr};
     use std::cell::Cell;
     use std::ops::{Deref, DerefMut};
@@ -4173,13 +4173,12 @@ mod test {
         use crate::phy::{Device as _, FrameToken as _};
 
         let mut device = MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ip), 1280);
-        let frame = crate::tests::tx_test_buf(&[2]);
-        let mut header = crate::phy::TxHeader::new(1, None);
-        header.bytes_mut()[0] = 1;
+        let mut frame = crate::tests::tx_test_buf(&[2]);
+        frame.headroom_mut(1).0[0] = 1;
         device
             .transmit_frame(Instant::ZERO)
             .unwrap()
-            .consume_retain(header, frame);
+            .consume_retain(frame, 1, None);
         assert_eq!(device.0.tx_queue.pop_front().unwrap(), &[1, 2]);
     }
 
@@ -5865,7 +5864,7 @@ mod test {
     }
 
     fn owned_frame(source: &TxSource, bytes: &[u8]) -> TxFrame {
-        let mut frame = TxFrame::new(source.alloc().expect("test TX source is empty"));
+        let mut frame = TxFrame::from_buf(source.alloc().expect("test TX source is empty"));
         frame.room_mut()[..bytes.len()].copy_from_slice(bytes);
         frame.set_len(bytes.len());
         frame
@@ -5922,7 +5921,7 @@ mod test {
 
     #[test]
     fn frame_longer_than_mss_is_one_entry_sent_by_copy() {
-        let alloc = CountingAlloc::new(8);
+        let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
@@ -6266,7 +6265,7 @@ mod test {
 
     #[test]
     fn frame_reset_releases_queue() {
-        let alloc = CountingAlloc::new(8);
+        let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
@@ -6277,7 +6276,7 @@ mod test {
 
     #[test]
     fn frame_peer_rst_keeps_frames_until_reuse() {
-        let alloc = CountingAlloc::new(8);
+        let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
@@ -6312,7 +6311,7 @@ mod test {
 
     #[test]
     fn frame_orphan_syn_sent_releases() {
-        let alloc = CountingAlloc::new(8);
+        let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
         let mut s = socket_syn_sent();
         s.tx_queue = TxQueue::new(8, 2, source);

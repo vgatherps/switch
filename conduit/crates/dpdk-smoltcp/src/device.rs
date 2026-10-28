@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 
-use smoltcp::phy::{
-    self, Checksum, DeviceCapabilities, Medium, TxBuf, TxChecksum, TxHeader, TxSource,
-};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium, TxBuf, TxChecksum, TxSource};
 use smoltcp::time::Instant;
 use zhida_dpdk_sys::{
     rte_mbuf, zhida_errno, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
@@ -10,7 +8,7 @@ use zhida_dpdk_sys::{
     RTE_MBUF_F_TX_TCP_CKSUM, RTE_MBUF_F_TX_UDP_CKSUM,
 };
 
-use crate::frame_pool::{FramePool, FRAME_DATA_OFF};
+use zhida_buffer::{FramePool, FRAME_DATA_OFF};
 use crate::port::{eth_tx_prepare, Packet, Port, PortError, RxBurst, TxPacket};
 
 /// smoltcp device over one Port with bounded RX staging and TX pending queues.
@@ -313,26 +311,35 @@ impl TxOffload {
 #[inline(always)]
 fn tx_offload(port: &Port, tx_checksum: Option<TxChecksum>) -> TxOffload {
     let port_id = port.port_id();
+    match tx_checksum {
+        Some(TxChecksum::Tcp { .. }) => assert!(
+            port.tx_tcp_checksum(),
+            "port {port_id}: TCP TX offload metadata without its profile"
+        ),
+        Some(TxChecksum::Udp { .. }) => assert!(
+            port.tx_udp_checksum(),
+            "port {port_id}: UDP TX offload metadata without its profile"
+        ),
+        None => (),
+    }
+    tx_offload_unchecked(tx_checksum)
+}
+
+/// `tx_offload` without the profile check. The Stack builds smoltcp's
+/// checksum capabilities from the port's profile, so its metadata asks only
+/// for offloads the profile has.
+#[inline(always)]
+fn tx_offload_unchecked(tx_checksum: Option<TxChecksum>) -> TxOffload {
     let (flags, l3, l4) = match tx_checksum {
         Some(TxChecksum::Tcp {
             ip_header_len,
             tcp_header_len,
-        }) => {
-            assert!(
-                port.tx_tcp_checksum(),
-                "port {port_id}: TCP TX offload metadata without its profile"
-            );
-            (
-                RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM,
-                u16::from(ip_header_len),
-                u16::from(tcp_header_len),
-            )
-        }
+        }) => (
+            RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM,
+            u16::from(ip_header_len),
+            u16::from(tcp_header_len),
+        ),
         Some(TxChecksum::Udp { ip_header_len }) => {
-            assert!(
-                port.tx_udp_checksum(),
-                "port {port_id}: UDP TX offload metadata without its profile"
-            );
             (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, u16::from(ip_header_len), 8)
         }
         None => (0, 0, 0),
@@ -349,45 +356,28 @@ pub(crate) struct FrameTx<'a> {
 }
 
 impl FrameTx<'_> {
-    /// Write `header` in front of the payload and set the mbuf's lengths and
-    /// offload metadata. Panics, before writing anything, unless the frame is
-    /// from this Stack's frame pool, unique, fits the frame capacity with its
-    /// headers, and asks only for offloads in the port's profile.
+    /// Set the mbuf's data offset, lengths and offload metadata so the packet
+    /// starts at the `header_len` header bytes the stack wrote in front of the
+    /// payload. Panics, before writing, unless the frame is from this Stack's
+    /// frame pool.
     #[inline(always)]
-    fn write(&self, header: &TxHeader, frame: &TxBuf) {
-        let port_id = self.port.port_id();
+    fn write(&self, frame: &TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
+        let raw = frame.mbuf().as_ptr();
         assert!(
             frame.origin() == self.port.frame_origin(),
-            "port {port_id}: TX frame is not from this Stack's frame pool (TCP socket moved between Stacks)"
+            "port {}: TX frame is not from this Stack's frame pool (TCP socket moved between Stacks)",
+            self.port.port_id()
         );
-        assert!(frame.unique(), "port {port_id}: published TX frame is shared");
-        let header_len = header.bytes().len();
-        let len = header_len + frame.len();
-        let capacity = usize::from(self.port.frame_capacity());
-        assert!(
-            len <= capacity,
-            "port {port_id}: TX frame of {len} bytes exceeds the frame capacity {capacity}"
-        );
-        let offload = tx_offload(self.port, header.tx_checksum());
-        let raw = frame.owner().cast::<rte_mbuf>().as_ptr();
-        // TxHeader holds at most 64 bytes; FRAME_DATA_OFF is above that.
-        let data_off = FRAME_DATA_OFF - header_len as u16;
+        let offload = tx_offload_unchecked(tx_checksum);
         // SAFETY: the origin check makes `raw` a live, direct, single-segment
-        // frame-pool mbuf whose payload starts FRAME_DATA_OFF bytes into its
-        // buffer (FramePool::alloc); the header range lies in its headroom and
-        // no Rust reference covers it. Frame invariant: header bytes in front
-        // of the payload and mbuf metadata may be written by the device and by
-        // the PMD's tx_prepare; the payload region only while the frame is
-        // unique (TxBuf's room_mut and set_len assert it). This write touches
-        // only headers and metadata; the frame is also unique here (asserted
-        // above). `len` fits u16: it is at most the frame capacity.
+        // mbuf of this Stack's frame pool, its payload FRAME_DATA_OFF bytes into
+        // its buffer and at most TX_HEADROOM (64) header bytes in front of it
+        // (TxBuf::headroom_mut). Metadata of a frame may be written by the
+        // device at publish; no Rust reference covers it. The packet length
+        // fits u16: the payload fits the frame room, sized from a u16 MTU.
         unsafe {
-            debug_assert_eq!(
-                (*raw).data_ptr().add(usize::from(FRAME_DATA_OFF - (*raw).data_off())),
-                frame.payload().as_ptr().cast_mut()
-            );
-            (*raw).set_data_off(data_off);
-            std::ptr::copy_nonoverlapping(header.bytes().as_ptr(), (*raw).data_ptr(), header_len);
+            (*raw).set_data_off(FRAME_DATA_OFF - header_len as u16);
+            let len = header_len + frame.len();
             (*raw).set_data_len(len as u16);
             (*raw).set_pkt_len(len as u32);
             offload.write(raw);
@@ -396,20 +386,26 @@ impl FrameTx<'_> {
 }
 
 impl phy::FrameToken for FrameTx<'_> {
-    fn consume(self, header: TxHeader, frame: TxBuf) {
-        self.write(&header, &frame);
-        // SAFETY: into_raw gives up the frame's one reference to this packet.
-        // The slot checked at transmit_frame is still free: this borrow was exclusive.
+    #[inline]
+    fn consume(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
+        self.write(&frame, header_len, tx_checksum);
+        // SAFETY: into_mbuf gives the frame's reference to this packet. The
+        // slot checked at transmit_frame is still free: this borrow was exclusive.
         self.pending
-            .push_back(unsafe { TxPacket::from_raw(frame.into_raw().cast()) });
+            .push_back(unsafe { TxPacket::from_raw(frame.into_mbuf()) });
     }
 
-    fn consume_retain(self, header: TxHeader, frame: TxBuf) -> TxBuf {
-        self.write(&header, &frame);
-        let published = frame.clone();
+    #[inline]
+    fn consume_retain(
+        self,
+        frame: TxBuf,
+        header_len: usize,
+        tx_checksum: Option<TxChecksum>,
+    ) -> TxBuf {
+        self.write(&frame, header_len, tx_checksum);
         // SAFETY: the clone's reference moves to this packet.
         self.pending
-            .push_back(unsafe { TxPacket::from_raw(published.into_raw().cast()) });
+            .push_back(unsafe { TxPacket::from_raw(frame.clone().into_mbuf()) });
         frame
     }
 }

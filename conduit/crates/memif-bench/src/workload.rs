@@ -15,7 +15,8 @@ use dpdk_smoltcp::smoltcp::time::{Duration as NetDuration, Instant as NetInstant
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, IpEndpoint, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
     rx_pool_count, rx_reserve, Offloads, Port, PortConfig, Sent, Stack, StackConfig, StackError,
-    Turn, UdpConfig, UdpCounters, UdpHandle, UdpSendError, DEFAULT_NEIGHBOR_CAPACITY,
+    Turn, UdpConfig, UdpCounters, UdpHandle, UdpSendError,
+    UdpSendFrameError, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
@@ -637,17 +638,22 @@ impl Client {
         let remote = IpEndpoint::new(Ipv4Address::new(10, 0, 0, PEER_HOST).into(), PEER_PORT);
         while self.udp_sent < total {
             let sequence = self.udp_sent;
-            let start = &mut self.start;
-            match self.stack.udp_send_with(handle, Some(remote), size, |buf| {
-                if sequence >= warmup {
-                    start.get_or_insert_with(Instant::now);
+            // The first measured datagram's write starts the clock, counted only if it is sent.
+            let written = (sequence >= warmup && self.start.is_none()).then(Instant::now);
+            let Some(mut frame) = self.stack.tx_frame() else { break };
+            let buf = &mut frame.room_mut()[..size];
+            buf[..8].copy_from_slice(&sequence.to_le_bytes());
+            fill_pattern(&mut buf[8..], 0, 8);
+            frame.set_len(size);
+            match self.stack.udp_send_frame(handle, Some(remote), frame) {
+                Ok(()) => {
+                    if let Some(written) = written {
+                        self.start = Some(written);
+                    }
+                    self.udp_sent = self.udp_sent.checked_add(1).expect("UDP sent count");
                 }
-                buf[..8].copy_from_slice(&sequence.to_le_bytes());
-                fill_pattern(&mut buf[8..], 0, 8);
-            }) {
-                Ok(()) => self.udp_sent = self.udp_sent.checked_add(1).expect("UDP sent count"),
-                Err(UdpSendError::WouldBlock | UdpSendError::NeighborPending) => break,
-                Err(error) => {
+                Err((_, UdpSendFrameError::Udp(UdpSendError::WouldBlock | UdpSendError::NeighborPending))) => break,
+                Err((_, error)) => {
                     self.stop(format!("UDP send: {error:?}"));
                     break;
                 }

@@ -13,7 +13,7 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{
     frame_pool_count, frame_reserve, tx_reserve, Stack, StackConfig, TcpHandle, UdpConfig,
-    UdpHandle, UdpSendError,
+    UdpHandle, UdpSendError, UdpSendFrameError,
 };
 
 const BULK_MIN: u64 = (1u64 << 32) + (1 << 20);
@@ -205,18 +205,17 @@ impl Datagrams {
         for _ in 0..count {
             let sequence = self.sent[index];
             let seed = self.seeds[index];
-            match stack.udp_send_with(
-                &self.handles[index],
-                Some(IpEndpoint::new(side.other().ip().into(), UDP_PORT)),
-                udp_length(sequence, seed),
-                |bytes| {
-                    bytes[..8].copy_from_slice(&sequence.to_le_bytes());
-                    fill(&mut bytes[8..], 0, mix(sequence ^ seed));
-                },
-            ) {
+            let Some(mut frame) = stack.tx_frame() else { break };
+            let len = udp_length(sequence, seed);
+            let bytes = &mut frame.room_mut()[..len];
+            bytes[..8].copy_from_slice(&sequence.to_le_bytes());
+            fill(&mut bytes[8..], 0, mix(sequence ^ seed));
+            frame.set_len(len);
+            let to = Some(IpEndpoint::new(side.other().ip().into(), UDP_PORT));
+            match stack.udp_send_frame(&self.handles[index], to, frame) {
                 Ok(()) => self.sent[index] = sequence.checked_add(1).unwrap(),
-                Err(UdpSendError::NeighborPending | UdpSendError::WouldBlock) => break,
-                Err(error) => panic!("UDP send: {error:?}"),
+                Err((_, UdpSendFrameError::Udp(UdpSendError::NeighborPending | UdpSendError::WouldBlock))) => break,
+                Err((_, error)) => panic!("UDP send: {error:?}"),
             }
         }
     }
