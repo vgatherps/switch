@@ -1420,6 +1420,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "dpdk-smoltcp",
+ "switch",
  "zhida-test-kit",
  "zhida-test-support",
 ]

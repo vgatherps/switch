@@ -1,16 +1,17 @@
 //! One `Net` (side A, 10.0.0.1) facing a raw conduit `Stack` peer (side B,
-//! 10.0.0.2) over two lossless net_ring links, and a probe executor that polls
-//! futures by hand with a counting std `Waker`.
+//! 10.0.0.2) over two lossless net_ring links, with a switch `Runtime` whose
+//! tasks run the switchnet futures.
 
 #![allow(dead_code)]
 
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use dpdk_smoltcp::{rx_pool_count, rx_reserve, Eal, StackConfig};
+use switch::Runtime;
 use switchnet::{tcp, Instant, IpEndpoint, Net, NetConfig, NetHandle, Stack};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
@@ -45,6 +46,7 @@ pub fn peer_endpoint(port: u16) -> IpEndpoint {
 
 /// Fields drop in order on a failed test; `close` is the clean teardown.
 pub struct Mixed {
+    pub rt: Runtime,
     pub to_peer: Link,
     pub to_net: Link,
     pub net: Net,
@@ -74,6 +76,7 @@ impl Mixed {
         });
         let [a, b] = &fixtures;
         Self {
+            rt: Runtime::new(0),
             to_peer: a.link_to(b),
             to_net: b.link_to(a),
             net: Net::new(net_stack, NetConfig { ingress_budget: BUDGET }),
@@ -87,10 +90,24 @@ impl Mixed {
         self.net.handle()
     }
 
-    /// Net turn, Net→peer, peer turn, peer→Net, at `now`. Returns whether a
-    /// link moved a frame.
+    /// Runs `future` as a switch task; its output lands in the returned slot.
+    pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Slot<T> {
+        let slot = Slot::default();
+        let out = slot.clone();
+        self.rt.spawner().spawn(async move { *out.0.borrow_mut() = Some(future.await) }).ok().unwrap();
+        slot
+    }
+
+    /// Rounds until `slot` is filled; takes its value.
+    pub fn wait<T>(&mut self, slot: &Slot<T>) -> T {
+        self.until(|_| slot.is_full());
+        slot.take()
+    }
+
+    /// Net turn, task poll, Net→peer, peer turn, peer→Net, at `now`.
+    /// Returns whether a link moved a frame.
     pub fn round(&mut self) -> bool {
-        self.net.turn(self.now).unwrap();
+        self.turn();
         let out = self.to_peer.forward();
         assert_lossless(&self.to_peer, "Net→peer");
         self.peer.turn(self.now, BUDGET).unwrap();
@@ -122,6 +139,12 @@ impl Mixed {
         }
     }
 
+    /// Net turn, then one poll of the woken tasks.
+    pub fn turn(&mut self) {
+        self.net.turn(self.now).unwrap();
+        self.rt.poll(0).unwrap();
+    }
+
     fn advance(&mut self) {
         let deadline = [self.net.poll_at(), self.peer.poll_at()].into_iter().flatten().min();
         if let Some(at) = deadline {
@@ -131,12 +154,12 @@ impl Mixed {
 
     /// Asserts `Net::into_stack` refuses, and keeps the Net it hands back.
     pub fn into_stack_refused(self) -> Self {
-        let Self { to_peer, to_net, net, peer, now, fixtures } = self;
+        let Self { rt, to_peer, to_net, net, peer, now, fixtures } = self;
         let net = match net.into_stack() {
             Ok(_) => panic!("into_stack succeeded while a handle or socket lives"),
             Err(net) => net,
         };
-        Self { to_peer, to_net, net, peer, now, fixtures }
+        Self { rt, to_peer, to_net, net, peer, now, fixtures }
     }
 
     /// Every socket and frame the test made must already be dropped. The Net
@@ -148,7 +171,8 @@ impl Mixed {
     /// `close`, running `held` once both Stacks are torn down and before the
     /// mbuf checks: it gets frames still held and must drop them.
     pub fn close_after_stacks(self, held: impl FnOnce()) {
-        let Self { mut to_peer, mut to_net, net, peer, fixtures, .. } = self;
+        let Self { mut rt, mut to_peer, mut to_net, net, peer, fixtures, .. } = self;
+        rt.shutdown();
         let stack = net.into_stack().ok().expect("a Net handle or socket is still alive");
         to_peer.free_held();
         to_net.free_held();
@@ -175,47 +199,58 @@ pub fn peer_listen(mixed: &mut Mixed) -> dpdk_smoltcp::TcpHandle {
     handle
 }
 
-pub struct Count(AtomicUsize);
+/// A spawned task's output.
+pub struct Slot<T>(Rc<RefCell<Option<T>>>);
 
-impl Wake for Count {
-    fn wake(self: Arc<Self>) {
-        self.0.fetch_add(1, Ordering::Relaxed);
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self(Rc::new(RefCell::new(None)))
     }
 }
 
-/// One task's waker; counts wakes.
-pub struct Probe {
-    count: Arc<Count>,
-    waker: Waker,
-}
-
-impl Probe {
-    pub fn new() -> Self {
-        let count = Arc::new(Count(AtomicUsize::new(0)));
-        Self { waker: Waker::from(count.clone()), count }
-    }
-
-    pub fn wakes(&self) -> usize {
-        self.count.0.load(Ordering::Relaxed)
-    }
-
-    pub fn poll<F: Future + ?Sized>(&self, future: Pin<&mut F>) -> Poll<F::Output> {
-        future.poll(&mut Context::from_waker(&self.waker))
-    }
-
-    /// Wakers this probe handed out that are still alive, beside its own.
-    pub fn clones(&self) -> usize {
-        Arc::strong_count(&self.count) - 2
+impl<T> Clone for Slot<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
-/// Polls `future` with `probe`; while pending, waits for a wake with rounds.
-pub fn drive<F: Future + ?Sized>(mixed: &mut Mixed, probe: &Probe, mut future: Pin<&mut F>) -> F::Output {
-    loop {
-        if let Poll::Ready(out) = probe.poll(future.as_mut()) {
-            return out;
-        }
-        let woken = probe.wakes();
-        mixed.until(|_| probe.wakes() > woken);
+impl<T> Slot<T> {
+    pub fn is_full(&self) -> bool {
+        self.0.borrow().is_some()
     }
+
+    pub fn take(&self) -> T {
+        self.0.borrow_mut().take().expect("task has not finished")
+    }
+}
+
+/// Counts every poll of `future` into `polls`.
+pub struct Counted<F> {
+    pub future: Pin<Box<F>>,
+    pub polls: Rc<Cell<usize>>,
+}
+
+impl<F: Future> Future for Counted<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        self.polls.set(self.polls.get() + 1);
+        self.future.as_mut().poll(cx)
+    }
+}
+
+/// `future` and a counter of its polls.
+pub fn counted<F: Future>(future: F) -> (Counted<F>, Rc<Cell<usize>>) {
+    let polls = Rc::new(Cell::new(0));
+    (Counted { future: Box::pin(future), polls: polls.clone() }, polls)
+}
+
+/// Polls `future` once, which must be pending, then drops it.
+pub async fn cancel_after_one_poll<F: Future>(future: F) {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending(), "future ready on its first poll");
+        Poll::Ready(())
+    })
+    .await;
 }
