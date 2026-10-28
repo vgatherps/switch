@@ -94,5 +94,5 @@ pub use smoltcp::iface::{
 };
 pub use stack::{
     os_random_seed, AddTcpError, AddUdpError, Sent, Stack, StackConfig, StackError, Turn,
-    DEFAULT_NEIGHBOR_CAPACITY,
+    UdpSendFrameError, DEFAULT_NEIGHBOR_CAPACITY,
 };

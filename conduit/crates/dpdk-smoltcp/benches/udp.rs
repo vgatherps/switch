@@ -2,6 +2,9 @@
 //! A sends to B with software UDP checksums (csum) or zero UDP checksums
 //! (nocsum). Payloads are 64, 512 or 1472 bytes; bursts are 1, 8 or 32 frames.
 //! send times k udp_send_with calls, including payload writes, and one flush.
+//! send_frame times k `Stack::tx_frame` allocations, the same payload writes
+//! into each frame, k `udp_send_frame` calls (unique frames, published in
+//! place) and one flush; its receive side and checks are send's.
 //! recv times B's receive(now, k), k socket recv calls and each datagram's
 //! drop. Each read touches only the first payload byte and saves it for the
 //! untimed sequence check. Payloads have a one-byte sequence number, 0..k,
@@ -51,6 +54,7 @@ const PATTERN: u8 = 0xa5;
 #[derive(Clone, Copy)]
 enum Case {
     Send,
+    SendFrame,
     Recv,
 }
 
@@ -58,9 +62,58 @@ impl Case {
     fn name(self) -> &'static str {
         match self {
             Case::Send => "send",
+            Case::SendFrame => "send_frame",
             Case::Recv => "recv",
         }
     }
+}
+
+/// k copying sends and one flush, timed.
+fn send_copies(
+    pair: &mut Pair,
+    handle: &UdpHandle,
+    size: usize,
+    sequences: &[u8],
+) -> (Result<Sent, dpdk_smoltcp::StackError>, Duration) {
+    let to = Some(endpoint(Side::B));
+    let mut results = [Ok(()); BURST];
+    let start = Instant::now();
+    for (result, &sequence) in results.iter_mut().zip(sequences) {
+        *result = pair.a.udp_send_with(handle, to, size, |payload| {
+            payload.fill(PATTERN);
+            payload[0] = sequence;
+        });
+    }
+    let sent = pair.a.flush();
+    let send_elapsed = start.elapsed();
+    for result in &results[..sequences.len()] {
+        assert_eq!(*result, Ok(()));
+    }
+    (sent, send_elapsed)
+}
+
+/// k frame allocations, payload writes and frame sends, then one flush, timed.
+fn send_frames(
+    pair: &mut Pair,
+    handle: &UdpHandle,
+    size: usize,
+    sequences: &[u8],
+) -> (Result<Sent, dpdk_smoltcp::StackError>, Duration) {
+    let to = Some(endpoint(Side::B));
+    let mut sent_ok = [false; BURST];
+    let start = Instant::now();
+    for (ok, &sequence) in sent_ok.iter_mut().zip(sequences) {
+        let mut frame = pair.a.tx_frame().expect("frame pool empty");
+        let payload = &mut frame.room_mut()[..size];
+        payload.fill(PATTERN);
+        payload[0] = sequence;
+        frame.set_len(size);
+        *ok = pair.a.udp_send_frame(handle, to, frame).is_ok();
+    }
+    let sent = pair.a.flush();
+    let send_elapsed = start.elapsed();
+    assert!(sent_ok[..sequences.len()].iter().all(|&ok| ok), "udp_send_frame refused");
+    (sent, send_elapsed)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -218,24 +271,14 @@ fn iteration(
 ) -> Duration {
     let k = sequences.len();
     let now = pair.now();
-    let to = Some(endpoint(Side::B));
-    let mut results = [Ok(()); BURST];
-    let start = Instant::now();
-    for (result, &sequence) in results.iter_mut().zip(sequences) {
-        *result = pair.a.udp_send_with(&handles[0], to, size, |payload| {
-            payload.fill(PATTERN);
-            payload[0] = sequence;
-        });
-    }
-    let sent = pair.a.flush();
-    let send_elapsed = start.elapsed();
-    for result in &results[..k] {
-        assert_eq!(*result, Ok(()));
-    }
+    let (sent, send_elapsed) = match case {
+        Case::SendFrame => send_frames(pair, &handles[0], size, sequences),
+        Case::Send | Case::Recv => send_copies(pair, &handles[0], size, sequences),
+    };
     assert_sent(sent.unwrap(), k);
     forward(pair, size, mode, k);
     let elapsed = match case {
-        Case::Send => {
+        Case::Send | Case::SendFrame => {
             assert_turn(pair.b.receive(now, k).unwrap(), k, 0);
             for &sequence in sequences {
                 let datagram = pair.b.udp_mut(&handles[1]).recv().unwrap();
@@ -272,10 +315,10 @@ fn iteration(
 fn benches(c: &mut Criterion) {
     with_eal(|eal| {
         let mut group = c.benchmark_group("udp");
-        for case in [Case::Send, Case::Recv] {
+        for case in [Case::Send, Case::SendFrame, Case::Recv] {
             for size in [64, 512, 1472] {
                 let modes: &[Mode] = match case {
-                    Case::Send => &[Mode::Csum, Mode::Nocsum, Mode::Offload],
+                    Case::Send | Case::SendFrame => &[Mode::Csum, Mode::Nocsum, Mode::Offload],
                     Case::Recv => &[Mode::Csum, Mode::Nocsum],
                 };
                 for &mode in modes {

@@ -95,6 +95,11 @@ impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
     }
 }
 
+enum HardwareLookup {
+    Found(HardwareAddress),
+    Arp(Ipv4Address),
+}
+
 /// Result returned by [`Interface::poll`].
 ///
 /// This contains information on whether socket states might have changed.
@@ -1118,22 +1123,16 @@ impl Interface {
 }
 
 impl InterfaceInner {
-    fn lookup_hardware_addr<Tx>(
+    fn find_hardware_addr(
         &mut self,
-        tx_token: Tx,
         dst_addr: &IpAddress,
-        mut next_hop: Option<
-            &mut Option<(u64, EthernetAddress)>,
-        >,
-    ) -> Result<(HardwareAddress, Tx), DispatchError>
-    where
-        Tx: TxToken,
-    {
+        mut next_hop: Option<&mut Option<(u64, EthernetAddress)>>,
+    ) -> Result<HardwareLookup, DispatchError> {
         if let Some(kept) = next_hop.as_deref_mut() {
             if let Some((changes, mac)) = *kept
                 && changes == self.neighbor_cache.changes()
             {
-                return Ok((HardwareAddress::Ethernet(mac), tx_token));
+                return Ok(HardwareLookup::Found(HardwareAddress::Ethernet(mac)));
             }
             *kept = None;
         }
@@ -1143,8 +1142,7 @@ impl InterfaceInner {
                 #[cfg(feature = "medium-ip")]
                 Medium::Ip => unreachable!(),
             };
-
-            return Ok((hardware_addr, tx_token));
+            return Ok(HardwareLookup::Found(hardware_addr));
         }
 
         if dst_addr.is_multicast() {
@@ -1165,12 +1163,10 @@ impl InterfaceInner {
                     Medium::Ip => unreachable!(),
                 },
             };
-
-            return Ok((hardware_addr, tx_token));
+            return Ok(HardwareLookup::Found(hardware_addr));
         }
 
         let dst_addr = self.route(dst_addr).ok_or(DispatchError::NoRoute)?;
-
         match self.neighbor_cache.lookup(&dst_addr, self.now) {
             NeighborAnswer::Found(hardware_addr) => {
                 if let Some(kept) = next_hop {
@@ -1179,7 +1175,7 @@ impl InterfaceInner {
                         hardware_addr.ethernet_or_panic(),
                     ));
                 }
-                return Ok((hardware_addr, tx_token));
+                Ok(HardwareLookup::Found(hardware_addr))
             }
             NeighborAnswer::Stale {
                 hardware_addr,
@@ -1193,28 +1189,49 @@ impl InterfaceInner {
                         self.probe_owed = Some(addr);
                     }
                 }
-                return Ok((hardware_addr, tx_token));
+                Ok(HardwareLookup::Found(hardware_addr))
             }
-            NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
-            _ => (), // XXX
+            NeighborAnswer::RateLimited => Err(DispatchError::NeighborPending),
+            _ => match dst_addr {
+                IpAddress::Ipv4(dst_addr) if matches!(self.caps.medium, Medium::Ethernet) => {
+                    Ok(HardwareLookup::Arp(dst_addr))
+                }
+                #[allow(unreachable_patterns)]
+                _ => Err(DispatchError::NeighborPending),
+            },
         }
+    }
 
-        match dst_addr {
-            IpAddress::Ipv4(dst_addr) if matches!(self.caps.medium, Medium::Ethernet) => {
-                net_debug!(
-                    "address {} not in neighbor cache, sending ARP request",
-                    dst_addr
-                );
-                self.dispatch_arp_request(tx_token, dst_addr)?;
+    fn send_arp_request<Tx: TxToken>(
+        &mut self,
+        tx_token: Tx,
+        dst_addr: Ipv4Address,
+    ) -> Result<(), DispatchError> {
+        net_debug!(
+            "address {} not in neighbor cache, sending ARP request",
+            dst_addr
+        );
+        self.dispatch_arp_request(tx_token, dst_addr)?;
+        self.neighbor_cache.limit_rate(dst_addr.into(), self.now);
+        Ok(())
+    }
+
+    fn lookup_hardware_addr<Tx>(
+        &mut self,
+        tx_token: Tx,
+        dst_addr: &IpAddress,
+        next_hop: Option<&mut Option<(u64, EthernetAddress)>>,
+    ) -> Result<(HardwareAddress, Tx), DispatchError>
+    where
+        Tx: TxToken,
+    {
+        match self.find_hardware_addr(dst_addr, next_hop)? {
+            HardwareLookup::Found(hardware_addr) => Ok((hardware_addr, tx_token)),
+            HardwareLookup::Arp(dst_addr) => {
+                self.send_arp_request(tx_token, dst_addr)?;
+                Err(DispatchError::NeighborPending)
             }
-
-            #[allow(unreachable_patterns)]
-            _ => (),
         }
-
-        // The request got dispatched, limit the rate on the cache.
-        self.neighbor_cache.limit_rate(dst_addr, self.now);
-        Err(DispatchError::NeighborPending)
     }
 
     fn dispatch_arp_request<Tx: TxToken>(

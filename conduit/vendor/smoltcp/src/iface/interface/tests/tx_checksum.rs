@@ -284,6 +284,60 @@ fn udp_direct_and_template_carry_checksum_metadata() {
     }
 }
 
+/// A unique UDP frame's header carries the same checksum metadata and wire bytes as the copy
+/// path's, on the generic (first) and template (second) send.
+#[test]
+fn udp_frame_carries_copy_path_checksum_metadata() {
+    let alloc = crate::phy::test_owner::CountingAlloc::new(4);
+    for offload in [true, false] {
+        for tx_checksum in [true, false] {
+            let (mut iface, _, mut device) = setup_recording(offload);
+            let mut udp = UdpSet::new(1);
+            let handle = udp
+                .add(UdpConfig {
+                    port: 40000,
+                    rx_queue: 1,
+                    tx_checksum,
+                    broadcast: false,
+                })
+                .unwrap();
+            let to = Some(IpEndpoint::new(REMOTE.into(), 80));
+            for _ in 0..2 {
+                let target = iface.udp_target(&udp, handle, to, 4).unwrap();
+                assert_eq!(
+                    iface.udp_send(&mut device, &mut udp, target, |out| out
+                        .copy_from_slice(b"data")),
+                    Ok(())
+                );
+            }
+            let copies = core::mem::take(&mut device.tx);
+            udp.remove(handle);
+            let handle = udp
+                .add(UdpConfig {
+                    port: 40000,
+                    rx_queue: 1,
+                    tx_checksum,
+                    broadcast: false,
+                })
+                .unwrap();
+            for templates in [1, 2] {
+                let mut frame = crate::phy::TxFrame::new(crate::phy::TxAlloc::alloc(alloc.as_ref()).unwrap());
+                frame.room_mut().copy_from_slice(b"data");
+                frame.set_len(4);
+                let target = iface.udp_target(&udp, handle, to, 4).unwrap();
+                assert!(iface.udp_send_frame(&mut device, &mut udp, target, frame).is_ok());
+                assert_eq!(udp.template_frames, templates);
+            }
+            assert_eq!(device.tx, copies);
+            assert_eq!(
+                device.tx[0].0.tx_checksum,
+                offload.then_some(TxChecksum::Udp { ip_header_len: 20 })
+            );
+            assert_eq!(alloc.live(), 0);
+        }
+    }
+}
+
 #[test]
 fn generic_icmp_and_arp_frames_carry_no_checksum_offload() {
     let (mut iface, _, mut device) = setup_recording(true);

@@ -219,6 +219,10 @@ impl TxFrame {
         self.0.origin()
     }
 
+    pub(crate) fn unique(&self) -> bool {
+        self.0.unique()
+    }
+
     pub(crate) fn into_buf(self) -> TxBuf {
         self.0
     }
