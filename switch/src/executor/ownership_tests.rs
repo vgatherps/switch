@@ -21,6 +21,7 @@ fn constructor_reserves_ready_storage_and_uses_initial_timer_tick() {
     unsafe {
         assert!((*ptr).run_queue.capacity() >= 17);
         assert!((*ptr).incoming.capacity() >= 17);
+        assert!((*ptr).deferred.capacity() >= 17);
         assert_eq!(
             (*ptr).timers.advance_to(122),
             Err(crate::timer_wheel::TimeRegressed {
@@ -214,6 +215,7 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
     unsafe {
         assert!((*owner.0).run_queue.capacity() >= (*owner.0).allocated);
         assert!((*owner.0).incoming.capacity() >= (*owner.0).allocated);
+        assert!((*owner.0).deferred.capacity() >= (*owner.0).allocated);
     }
     owner.poll();
     assert_eq!(inner.get(), DEFAULT_CAPACITY * 3);
@@ -523,6 +525,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
         );
         assert!((*owner.0).run_queue.capacity() >= (*owner.0).allocated);
         assert!((*owner.0).incoming.capacity() >= (*owner.0).allocated);
+        assert!((*owner.0).deferred.capacity() >= (*owner.0).allocated);
     }
     owner.poll();
     assert_eq!(completed.get(), DEFAULT_CAPACITY * 3);

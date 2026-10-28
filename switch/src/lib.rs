@@ -14,7 +14,7 @@
 //! each round polls a snapshot of the woken tasks, and tasks woken or spawned during a
 //! round run in the next one, until none are left or 1024 tasks were polled (checked
 //! between rounds). [`StoredWaker::wake_deferred`] and [`yield_now`] instead move a task
-//! to the next poll.
+//! to the next poll, unless an ordinary wake already queued it.
 //! Work that wakes or spawns tasks must run before [`Runtime::poll`]; those tasks are polled by
 //! that call. The runtime never waits, though future code can block. A regressed tick returns
 //! [`RuntimeError::TimeRegressed`] without changing runtime state.

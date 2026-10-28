@@ -156,7 +156,9 @@ impl StoredWaker {
     }
 
     /// Wake the task for the next [`crate::Runtime::poll`], not this one: unlike
-    /// [`Self::wake`], it is not polled again in the current poll's later rounds.
+    /// [`Self::wake`], it is not polled again in the current poll's later rounds,
+    /// unless an ordinary wake already queued it (then this does nothing). An
+    /// ordinary wake of a deferred task leaves it deferred.
     #[inline]
     pub fn wake_deferred(&self) {
         unsafe { Executor::wake_deferred(self.header.as_ptr()) }

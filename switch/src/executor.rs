@@ -36,8 +36,9 @@ pub(crate) const POLL_BUDGET: usize = 1024;
 
 /// Single-threaded executor.
 ///
-/// Two-vector swap model: wakes go to `incoming`, we iterate `run_queue`,
-/// then swap at end of poll. Simple iteration, no VecDeque overhead.
+/// Three queues: wakes go to `incoming`, deferred wakes to `deferred` (moved to
+/// the front of `incoming` when a `Runtime::poll` starts), and each round swaps
+/// `incoming` into `run_queue` and polls it. Simple iteration, no VecDeque.
 pub struct Executor {
     /// Tasks to poll this cycle, by header.
     run_queue: Vec<*const TaskHeader>,
@@ -48,7 +49,8 @@ pub struct Executor {
     deferred: Vec<*const TaskHeader>,
     /// Number of live tasks.
     task_count: usize,
-    /// Slots in use; both queues keep at least this capacity.
+    /// Slots in use; all three queues keep at least this capacity (every slot
+    /// has at most one queue entry), so queue pushes never reallocate.
     allocated: usize,
     /// One pool per task function this executor has spawned.
     pools: Vec<*mut RuntimePool>,
@@ -252,7 +254,7 @@ impl Executor {
             let mut report = BatchReport::default();
             Self::poll_round(this, &mut report);
             turn.finish();
-            report.queue_work
+            true
         }
     }
 
@@ -298,7 +300,6 @@ impl Executor {
     /// As for [`Self::poll_batch`].
     unsafe fn poll_round(this: *mut Self, report: &mut BatchReport) {
         unsafe {
-            report.queue_work = true;
             std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
             let batch_len = (*this).run_queue.len();
             let mut cursor = 0;
@@ -445,7 +446,6 @@ impl Executor {
 pub(crate) struct BatchReport {
     pub(crate) polled: usize,
     pub(crate) completed: usize,
-    pub(crate) queue_work: bool,
 }
 
 pub(crate) struct TurnGuard {

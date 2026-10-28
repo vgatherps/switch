@@ -148,3 +148,52 @@ fn deferred_tasks_run_before_work_queued_after_them() {
     runtime.poll(0).unwrap();
     assert_eq!(*order.borrow(), ["deferred", "spawned"]);
 }
+
+#[test]
+fn the_budget_is_checked_between_rounds() {
+    let mut runtime = Runtime::new(0);
+    let polls = Rc::new(Cell::new(0));
+    for _ in 0..3 {
+        runtime.spawner().spawn(spins(polls.clone())).unwrap();
+    }
+    // 342 rounds of three reach 1026: the round that crosses 1024 completes.
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.ready_tasks), (1026, 3));
+}
+
+#[test]
+fn an_ordinary_wake_of_a_deferred_task_leaves_it_deferred() {
+    #[switch::task]
+    async fn yields_once(polls: Rc<Cell<usize>>, waker: Rc<RefCell<Option<Waker>>>) {
+        std::future::poll_fn(|cx| {
+            *waker.borrow_mut() = Some(cx.waker().clone());
+            Poll::Ready(())
+        })
+        .await;
+        polls.set(polls.get() + 1);
+        yield_now().await;
+        polls.set(polls.get() + 1);
+    }
+    #[switch::task]
+    async fn wakes(waker: Rc<RefCell<Option<Waker>>>) {
+        waker.borrow().as_ref().unwrap().wake_by_ref();
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let (polls, waker) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(None)));
+    spawner
+        .spawn(yields_once(polls.clone(), waker.clone()))
+        .unwrap();
+    spawner.spawn(wakes(waker.clone())).unwrap();
+    // A yields (deferred); B, later in the same round, wakes A ordinarily.
+    let first = runtime.poll(0).unwrap();
+    assert_eq!(
+        (first.tasks_polled, polls.get(), first.ready_tasks),
+        (2, 1, 1)
+    );
+    let second = runtime.poll(0).unwrap();
+    assert_eq!(
+        (second.tasks_polled, second.tasks_completed, polls.get()),
+        (1, 1, 2)
+    );
+}

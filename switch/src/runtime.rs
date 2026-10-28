@@ -31,7 +31,9 @@ pub enum RuntimeError {
     /// Spawn only: every slot of the task function's capacity here is occupied.
     /// A slot stays occupied from spawn until its task completes and no wake of
     /// it is still queued: a task that wakes itself and then completes holds its
-    /// slot until the next poll drains that wake.
+    /// slot until that wake drains, later in the same poll for an ordinary wake,
+    /// or in the next poll for `wake_deferred` or when the 1024-poll limit
+    /// stopped the poll.
     Exhausted,
 }
 
