@@ -1,13 +1,11 @@
 //! Validation rules, fail-fast UTF-8, control frames, `take`, and where
 //! message bytes live.
 
-mod common;
-
 use std::cell::Cell;
 use std::rc::Rc;
 
-use common::*;
-use relay::{Config, Kind, ProtocolError as P, Raw, Role, WsError, WsRx};
+use super::*;
+use crate::rx::ProtocolError as P;
 
 const KEY: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
 
@@ -367,7 +365,7 @@ impl Drop for CountedFrame {
     }
 }
 
-impl relay::RxFrame for CountedFrame {
+impl RxFrame for CountedFrame {
     fn payload(&self) -> &[u8] {
         &self.data
     }

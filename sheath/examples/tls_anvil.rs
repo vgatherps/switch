@@ -33,7 +33,6 @@ use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{
     DEFAULT_NEIGHBOR_CAPACITY, Offloads, Port, PortConfig, Stack, StackConfig, frame_reserve, rx_reserve,
 };
-use relay::PlainRx;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};

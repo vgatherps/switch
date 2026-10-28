@@ -5,12 +5,10 @@
 //! message's expected stamp is the index of the frame holding the first byte of the record its
 //! first WebSocket header byte is in.
 
-mod common;
-
 use std::io::{self, Read, Write};
 
-use common::*;
-use relay::{Config, Kind, Role, WsError, WsRx, WsTx};
+use super::peer::*;
+use super::*;
 use rustls::ServerConnection;
 use sheath::{TlsRx, TlsTx};
 use tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
@@ -62,7 +60,7 @@ struct Wss {
 impl Wss {
     /// Handshake done, the session tickets delivered.
     fn new() -> Wss {
-        let Peer { tx, wire, mut server } = connect(None);
+        let Peer { tx, wire, mut server } = connect();
         // tungstenite writes whole messages; rustls would stop taking plaintext at 64 KiB.
         server.set_buffer_limit(None);
         let mut w = Wss {

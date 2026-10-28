@@ -206,7 +206,7 @@ test-switchnet: doctor
 # relay (WebSocket) and sheath (TLS), then the wss client over switchnet against a kernel
 # wss server across net_tap (sheath's switchnet feature).
 test-wss: doctor
-	$(TIMEOUT) cargo test --locked -p relay -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p relay --features switchnet -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p sheath --features switchnet -- --test-threads=1
 
 test-ws: doctor

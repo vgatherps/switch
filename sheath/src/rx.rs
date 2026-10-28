@@ -1,10 +1,9 @@
 use core::marker::PhantomData;
 use core::ops::Range;
 
-use relay::{Chunk, PlainRx, PlainTx, RxFrame};
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 
-use crate::{Error, TlsTx, encode_into};
+use crate::{Chunk, Error, FrameTx, RxFrame, TlsTx, encode_into};
 
 const HEADER_LEN: usize = 5;
 
@@ -53,8 +52,8 @@ impl Run {
     };
 }
 
-/// Receive half of a TLS 1.3 client connection, fed with frames in stream order: relay's
-/// [`PlainRx`] whose runs are records' plaintext.
+/// Receive half of a TLS 1.3 client connection, fed with frames in stream order; each run it
+/// hands out is one record's plaintext.
 ///
 /// The rustls connection lives in [`TlsTx`], which each call borrows. Records rustls wants
 /// sent while receiving go to the send half's `take_pending`, and a receive error stops the
@@ -84,13 +83,13 @@ pub struct TlsRx<F, L> {
     _tx: PhantomData<fn(&mut TlsTx<L>)>,
 }
 
-impl<F: RxFrame, L: PlainTx> Default for TlsRx<F, L> {
+impl<F: RxFrame, L: FrameTx> Default for TlsRx<F, L> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<F: RxFrame, L: PlainTx> TlsRx<F, L> {
+impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
     pub fn new() -> Self {
         Self {
             frame: None,
@@ -314,13 +313,10 @@ impl<F: RxFrame, L: PlainTx> TlsRx<F, L> {
     }
 }
 
-impl<F: RxFrame, L: PlainTx> PlainRx for TlsRx<F, L> {
-    type Frame = F;
-    type Tx = TlsTx<L>;
-    type Error = Error;
-
-    /// Frames pushed after close_notify or an error are dropped.
-    fn push(&mut self, frame: F, _: &mut TlsTx<L>) -> Result<(), Error> {
+impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
+    /// Hands over the next frame. Allowed only after `chunk` returned `Ok(None)`. Frames
+    /// pushed after close_notify or an error are dropped.
+    pub fn push(&mut self, frame: F) {
         assert!(
             self.frame.is_none(),
             "push before chunk returned None: the current frame still holds unprocessed bytes"
@@ -329,7 +325,6 @@ impl<F: RxFrame, L: PlainTx> PlainRx for TlsRx<F, L> {
             self.frame = Some(frame);
             self.pos = 0;
         }
-        Ok(())
     }
 
     /// The unconsumed plaintext of the current record, else the next record's, decrypted now;
@@ -337,14 +332,14 @@ impl<F: RxFrame, L: PlainTx> PlainRx for TlsRx<F, L> {
     /// borrows `self`, so the next `chunk` cannot run while it is held:
     ///
     /// ```compile_fail,E0499
-    /// # use relay::{PlainRx, PlainTx, RxFrame};
-    /// # fn f<F: RxFrame, L: PlainTx>(rx: &mut sheath::TlsRx<F, L>, tx: &mut sheath::TlsTx<L>) {
+    /// # use sheath::{FrameTx, RxFrame};
+    /// # fn f<F: RxFrame, L: FrameTx>(rx: &mut sheath::TlsRx<F, L>, tx: &mut sheath::TlsTx<L>) {
     /// let first = rx.chunk(tx).unwrap().unwrap();
     /// let second = rx.chunk(tx);
     /// first.bytes[0] = 0;
     /// # }
     /// ```
-    fn chunk(&mut self, tx: &mut TlsTx<L>) -> Result<Option<Chunk<'_>>, Error> {
+    pub fn chunk(&mut self, tx: &mut TlsTx<L>) -> Result<Option<Chunk<'_>>, Error> {
         if self.run.at.is_empty() {
             self.drop_run();
             let found = self.next_run(tx);
@@ -358,7 +353,10 @@ impl<F: RxFrame, L: PlainTx> PlainRx for TlsRx<F, L> {
         Ok(Some(self.run_chunk()))
     }
 
-    fn current(&self) -> &[u8] {
+    /// The unconsumed plaintext of the run the last `chunk` returned (empty if none): exactly
+    /// those bytes, unchanged, until the next `chunk`, `push` or `take_frame`. relay relies on
+    /// this to read text it validated at receipt without validating again.
+    pub fn current(&self) -> &[u8] {
         let at = self.run.at.clone();
         match self.run.src {
             Src::Frame => &self.frame.as_ref().expect("the run's frame").payload()[at],
@@ -367,7 +365,8 @@ impl<F: RxFrame, L: PlainTx> PlainRx for TlsRx<F, L> {
         }
     }
 
-    fn consume(&mut self, n: usize) {
+    /// Marks the first `n` bytes of `current()` consumed.
+    pub fn consume(&mut self, n: usize) {
         assert!(n <= self.run.at.len(), "consume past the current run");
         self.run.at.start += n;
     }
@@ -375,7 +374,7 @@ impl<F: RxFrame, L: PlainTx> PlainRx for TlsRx<F, L> {
     /// Moves out the frame holding the current record: its plaintext's first `len` bytes are
     /// consumed, the rest of the record's plaintext is copied to a carry buffer and the bytes
     /// after the record to `scratch`, so later chunks are unaffected.
-    fn take_frame(&mut self, len: usize) -> Option<(F, usize)> {
+    pub fn take_frame(&mut self, len: usize) -> Option<(F, usize)> {
         if self.run.src != Src::Frame || self.run.at.is_empty() {
             return None;
         }
@@ -441,7 +440,7 @@ enum Step {
 /// Runs rustls over `buf`, which starts with the `held` bytes rustls holds, until it returns a
 /// record, needs more bytes, or ends the stream. Records rustls wants sent on the way go to the
 /// send half.
-fn process<L: PlainTx>(tx: &mut TlsTx<L>, buf: &mut [u8], held: usize) -> Step {
+fn process<L: FrameTx>(tx: &mut TlsTx<L>, buf: &mut [u8], held: usize) -> Step {
     let base = buf.as_ptr() as usize;
     let mut done = 0;
     loop {
@@ -493,7 +492,7 @@ fn check_bounds(buf: &[u8], start: usize) -> Option<State> {
 
 /// Gives rustls `buf`, which ends with the header of a record whose body has not arrived, so
 /// it rejects a bad header before the body is gathered. Returns the end state on rejection.
-fn check_header<L: PlainTx>(tx: &mut TlsTx<L>, buf: &mut [u8], held: usize) -> Option<State> {
+fn check_header<L: FrameTx>(tx: &mut TlsTx<L>, buf: &mut [u8], held: usize) -> Option<State> {
     match process(tx, buf, held) {
         Step::NeedMore { consumed } => {
             assert_eq!(consumed, 0, "rustls consumed part of an incomplete record");

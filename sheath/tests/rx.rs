@@ -10,7 +10,6 @@ mod common;
 use std::ops::Range;
 
 use common::*;
-use relay::PlainRx;
 use rustls::crypto::cipher::{MessageEncrypter, OutboundChunks, OutboundPlainMessage};
 use rustls::{
     AlertDescription, ConnectionTrafficSecrets, ContentType, ProtocolVersion, SupportedCipherSuite,
@@ -229,7 +228,7 @@ fn bytes_after_close_notify_are_ignored() {
         data: b"ignored".to_vec(),
         stamp: 9,
     };
-    received.rx.push(ignored, &mut peer.tx).unwrap();
+    received.rx.push(ignored);
     assert!(received.rx.chunk(&mut peer.tx).unwrap().is_none());
     assert_eq!(received.rx.fin(&mut peer.tx), Ok(()));
 }
@@ -270,13 +269,13 @@ fn push_before_chunk_drained_panics() {
         data: stream.bytes,
         stamp: 0,
     };
-    rx.push(first, &mut peer.tx).unwrap();
+    rx.push(first);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_some());
     let second = VecFrame {
         data: vec![],
         stamp: 1,
     };
-    let _ = rx.push(second, &mut peer.tx);
+    rx.push(second);
 }
 
 /// The length in a record header is checked against the TLS 1.3 bound of 2^14 + 256 bytes as
@@ -429,13 +428,13 @@ fn retained_handshake_records_are_bounded() {
 }
 
 /// A fresh receive half with frame `stamp` holding `data`.
-fn pushed(peer: &mut Peer, data: Vec<u8>, stamp: u64) -> TlsRx<VecFrame, TestTx> {
+fn pushed(data: Vec<u8>, stamp: u64) -> TlsRx<VecFrame, TestTx> {
     let mut rx = TlsRx::new();
-    rx.push(VecFrame { data, stamp }, &mut peer.tx).unwrap();
+    rx.push(VecFrame { data, stamp });
     rx
 }
 
-/// relay's run contract: `chunk` again returns the same unconsumed bytes, with the caller's
+/// The run contract: `chunk` again returns the same unconsumed bytes, with the caller's
 /// changes; `consume` advances within the record; the next record comes only once the run is
 /// used up.
 #[test]
@@ -445,7 +444,7 @@ fn a_run_is_returned_again_until_consumed() {
     peer.flush(&mut stream);
     peer.send(&mut stream, b"hello");
     peer.send(&mut stream, b"world");
-    let mut rx = pushed(&mut peer, stream.bytes, 0);
+    let mut rx = pushed(stream.bytes, 0);
 
     let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
     assert_eq!(chunk.bytes, b"hello");
@@ -470,7 +469,7 @@ fn consume_past_the_run_panics() {
     let mut stream = Stream::default();
     peer.flush(&mut stream);
     peer.send(&mut stream, b"hi");
-    let mut rx = pushed(&mut peer, stream.bytes, 0);
+    let mut rx = pushed(stream.bytes, 0);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_some());
     rx.consume(3);
 }
@@ -488,7 +487,7 @@ fn take_frame_keeps_what_follows_readable() {
     peer.send(&mut stream, b"third");
     let first = &stream.records[0];
     let cut = stream.records[2].wire.start + 7;
-    let mut rx = pushed(&mut peer, stream.bytes[..cut].to_vec(), 0);
+    let mut rx = pushed(stream.bytes[..cut].to_vec(), 0);
 
     assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"hello");
     let (frame, offset) = rx.take_frame(2).expect("the record is inside the frame");
@@ -509,10 +508,7 @@ fn take_frame_keeps_what_follows_readable() {
         VecFrame {
             data: stream.bytes[cut..].to_vec(),
             stamp: 1,
-        },
-        &mut peer.tx,
-    )
-    .unwrap();
+        });
     let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
     assert_eq!((&*chunk.bytes, chunk.rx_timestamp), (&b"third"[..], 0));
 }
@@ -524,7 +520,7 @@ fn take_frame_of_a_last_record() {
     let mut stream = Stream::default();
     peer.flush(&mut stream);
     peer.send(&mut stream, b"only");
-    let mut rx = pushed(&mut peer, stream.bytes.clone(), 3);
+    let mut rx = pushed(stream.bytes.clone(), 3);
     assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"only");
     let (frame, offset) = rx.take_frame(4).unwrap();
     assert_eq!(&frame.data[offset..offset + 4], b"only");
@@ -537,10 +533,7 @@ fn take_frame_of_a_last_record() {
         VecFrame {
             data: stream.bytes[at..].to_vec(),
             stamp: 4,
-        },
-        &mut peer.tx,
-    )
-    .unwrap();
+        });
     let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
     assert_eq!((&*chunk.bytes, chunk.rx_timestamp), (&b"next"[..], 4));
 }
@@ -554,16 +547,13 @@ fn take_frame_of_a_straddling_record_is_none() {
     peer.flush(&mut stream);
     peer.send(&mut stream, b"split");
     let cut = stream.records[0].wire.start + 3;
-    let mut rx = pushed(&mut peer, stream.bytes[..cut].to_vec(), 0);
+    let mut rx = pushed(stream.bytes[..cut].to_vec(), 0);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
     rx.push(
         VecFrame {
             data: stream.bytes[cut..].to_vec(),
             stamp: 1,
-        },
-        &mut peer.tx,
-    )
-    .unwrap();
+        });
     assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"split");
     assert!(rx.take_frame(2).is_none());
     assert_eq!(rx.current(), b"split");

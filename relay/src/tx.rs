@@ -5,7 +5,9 @@
 use rand::Rng;
 use rand::rngs::StdRng;
 
-use crate::lower::{PlainTx, TxFrame};
+use sheath::TxFrame;
+
+use crate::lower::PlainTx;
 use crate::rx::{Control, Kind, Role};
 
 const CONT: u8 = 0;

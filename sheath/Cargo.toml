@@ -6,38 +6,26 @@ license.workspace = true
 publish = false
 
 [features]
-# wss client over switchnet TCP (module `switchnet`): TLS handshake, WebSocket upgrade, messages.
-switchnet = ["dep:switchnet", "dep:switch", "dep:httparse", "dep:sha1", "dep:data-encoding"]
+# TLS over switchnet TCP (module `switchnet`): the handshake, then the two halves.
+switchnet = ["dep:switchnet", "dep:switch"]
 
 [dependencies]
-relay.workspace = true
 rustls = { version = "=0.23.43", default-features = false, features = ["std"] }
 switchnet = { workspace = true, optional = true }
 # yield_now: a failed connection lets the Net send its alert before the socket is dropped.
 switch = { workspace = true, optional = true }
-# The WebSocket upgrade (rare path): HTTP response parse, Sec-WebSocket-Accept check.
-httparse = { version = "1.10", optional = true }
-sha1 = { version = "0.11", optional = true }
-data-encoding = { version = "2.11", optional = true }
 
 [dev-dependencies]
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
-tungstenite.workspace = true
 
-# The Docker end-to-end test (`--features switchnet`): DPDK net_tap, Linux only.
+# TLS-Anvil's client-test driver (`--features switchnet`): DPDK net_tap, Linux only.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 dpdk-smoltcp.workspace = true
-libc.workspace = true
 switch.workspace = true
 zhida-buffer.workspace = true
 zhida-dpdk-sys.workspace = true
 zhida-test-kit.workspace = true
-zhida-test-support.workspace = true
-
-[[test]]
-name = "wss_switchnet"
-required-features = ["switchnet"]
 
 # TLS-Anvil's client-test driver (`make docker-tls-anvil`): DPDK net_tap, Linux only.
 [[example]]

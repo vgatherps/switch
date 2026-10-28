@@ -1,9 +1,9 @@
-error[E0499]: cannot borrow `rx` as mutable more than once at a time
-  --> tests/ui/second_recv_while_message_held.rs:20:13
-   |
-19 |     let m = rx.recv(&mut ()).unwrap().unwrap();
-   |             -- first mutable borrow occurs here
-20 |     let _ = rx.recv(&mut ());
-   |             ^^ second mutable borrow occurs here
-21 |     drop(m);
-   |          - first borrow later used here
+error[E0499]: cannot borrow `*wss` as mutable more than once at a time
+ --> tests/ui/second_recv_while_message_held.rs:3:13
+  |
+2 |     let m = wss.recv().await.unwrap().unwrap();
+  |             --- first mutable borrow occurs here
+3 |     let _ = wss.recv().await;
+  |             ^^^ second mutable borrow occurs here
+4 |     let _ = m.bytes();
+  |             - first borrow later used here

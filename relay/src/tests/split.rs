@@ -1,10 +1,7 @@
 //! Every stream yields the same messages however it is cut into frames, and
 //! each message's direct/scratch placement and stamp follow from the cut.
 
-mod common;
-
-use common::*;
-use relay::{Kind, Role};
+use super::*;
 
 fn corpus(role: Role) -> Vec<Stream> {
     let mut out = Vec::new();

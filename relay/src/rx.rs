@@ -1,7 +1,9 @@
 //! Receive core: parses WebSocket frames (RFC 6455) out of the lower layer's
 //! runs and hands out messages that borrow the received bytes in place.
 
-use crate::lower::{PlainRx, PlainTx, RxFrame};
+use sheath::RxFrame;
+
+use crate::lower::{PlainRx, PlainTx};
 use crate::tx::WsTx;
 use crate::utf8::Utf8;
 
@@ -633,6 +635,14 @@ impl<'r, R: PlainRx> Message<'r, R> {
         self.at.stamp
     }
 
+    /// The kind, the bytes for as long as the receive half stays borrowed, and the stamp.
+    pub fn into_parts(self) -> (Kind, &'r [u8], u64) {
+        let Message { rx, at } = self;
+        let rx: &'r WsRx<R> = rx;
+        let bytes = if at.direct { &rx.lower.current()[..at.len] } else { &rx.core.scratch[..at.len] };
+        (at.kind, bytes, at.stamp)
+    }
+
     /// Move the frame holding the message out. Gives the message back when it
     /// does not lie inside one frame.
     pub fn take(self) -> Result<Taken<R::Frame>, Message<'r, R>> {
@@ -679,7 +689,7 @@ impl<F: RxFrame> Taken<F> {
 
 /// The payload was validated on receipt. Checking again keeps this safe code:
 /// direct bytes are re-read through the lower layer.
-fn text(kind: Kind, b: &[u8]) -> Option<&str> {
+pub(crate) fn text(kind: Kind, b: &[u8]) -> Option<&str> {
     match kind {
         Kind::Text => Some(core::str::from_utf8(b).expect("lower layer changed validated text")),
         Kind::Binary => None,
@@ -689,7 +699,7 @@ fn text(kind: Kind, b: &[u8]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Raw;
+    use crate::raw::Raw;
 
     struct F(Vec<u8>);
 

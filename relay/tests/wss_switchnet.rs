@@ -1,4 +1,4 @@
-//! The wss client (sheath + relay over switchnet TCP, as switch tasks) against a kernel wss
+//! The WebSocket clients (relay over switchnet TCP, wss:// through sheath, as switch tasks) against a kernel wss
 //! echo server (blocking tungstenite + rustls on a std thread) across net_tap. Needs
 //! CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 
@@ -25,7 +25,8 @@ use relay::Kind;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use sheath::switchnet::{Error as WssError, Tls as ClientTls, Wss, connect, tls_connect};
+use relay::switchnet::{Error as WssError, Wss, connect, connect_ws};
+use sheath::switchnet::{Error as TlsError, Tls as ClientTls, tls_connect};
 use switch::Runtime;
 use switchnet::{IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
@@ -258,7 +259,7 @@ fn message_len(i: usize) -> usize {
 }
 
 /// Echoes every data message until the client's close; returns how many.
-fn echo(mut ws: ServerWs) -> usize {
+fn echo<S: Read + Write>(mut ws: tungstenite::WebSocket<S>) -> usize {
     let mut echoed = 0;
     loop {
         match ws.read() {
@@ -269,6 +270,9 @@ fn echo(mut ws: ServerWs) -> usize {
             Ok(Message::Close(_)) => {}
             Ok(other) => panic!("unexpected {other:?}"),
             Err(WsError::ConnectionClosed) => return echoed,
+            // a plain socket's blocking read returns EINTR when a signal arrives; tungstenite
+            // keeps its partial frame, so reading again continues it (rustls retries itself)
+            Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => panic!("server read: {e}"),
         }
     }
@@ -539,7 +543,7 @@ fn rejected_handshake_sends_the_alert_before_the_rst() {
         },
         |handle, stream, config| async move {
             match tls_connect(&handle, stream, config, HOST).await {
-                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                Err(TlsError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 Err(e) => panic!("unexpected error {e}"),
                 Ok(_) => panic!("the corrupted Finished record was accepted"),
             }
@@ -574,7 +578,7 @@ fn receive_error_after_the_handshake_sends_the_alert_before_the_rst() {
         |handle, stream, config| async move {
             let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
             match tls.ready().await {
-                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                Err(TlsError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 other => panic!("unexpected {other:?}"),
             }
         },
@@ -650,4 +654,40 @@ fn message_in_the_same_record_as_the_upgrade_response() {
         || {},
     );
     assert_eq!(echoed, 1);
+}
+
+/// ws:// over plain switchnet TCP: the upgrade (with `Host: host:port`), then text and binary
+/// messages echo byte-exact, and the client's close ends with the server's echo and FIN.
+#[zhida_test_support::pinned_test]
+fn plain_ws_echoes_and_closes() {
+    let echoed = run(
+        |_| {},
+        |stream, _| {
+            let ws = tungstenite::accept_hdr(stream, |request: &tungstenite::handshake::server::Request, response| {
+                assert_eq!(request.uri().path(), PATH);
+                assert_eq!(request.headers()["Host"], format!("{HOST}:{SERVER_PORT}").as_str());
+                Ok(response)
+            })
+            .expect("server WebSocket handshake");
+            echo(ws)
+        },
+        |handle, stream, _| async move {
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            for i in 0..100 {
+                let sent = text(i, message_len(i));
+                ws.send(Kind::Text, sent.as_bytes()).await.expect("send");
+                let m = ws.recv().await.expect("recv").expect("the echo");
+                assert_eq!(m.text(), Some(sent.as_str()), "message {i}");
+            }
+            let big: Vec<u8> = (0..64 * 1024).map(|i| (i * 31 % 251) as u8).collect();
+            ws.send(Kind::Binary, &big).await.expect("send");
+            let m = ws.recv().await.expect("recv").expect("the echo");
+            assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &big[..]));
+            ws.close(1000, "done").await.expect("send close");
+            assert!(ws.recv().await.expect("recv after close").is_none(), "data after close");
+            ws
+        },
+        || {},
+    );
+    assert_eq!(echoed, 101);
 }

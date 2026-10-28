@@ -1,22 +1,27 @@
 //! ws:// lower layer: frames pass through untouched.
 
 use core::convert::Infallible;
+use core::marker::PhantomData;
 
-use crate::lower::{Chunk, PlainRx, RxFrame};
+use sheath::{Chunk, RxFrame};
+
+use crate::lower::PlainRx;
 
 /// Holds at most one frame. After `take_frame` the frame's unconsumed bytes
-/// move to `carry`, which is served before the next frame.
-pub struct Raw<F> {
+/// move to `carry`, which is served before the next frame. `T` is the send half
+/// it is paired with, which receiving does not use.
+pub struct Raw<F, T = ()> {
     frame: Option<F>,
     pos: usize,
     carry: Vec<u8>,
     carry_pos: usize,
     carry_stamp: u64,
+    _tx: PhantomData<fn(&mut T)>,
 }
 
-impl<F> Raw<F> {
+impl<F, T> Raw<F, T> {
     pub fn new() -> Self {
-        Raw { frame: None, pos: 0, carry: Vec::new(), carry_pos: 0, carry_stamp: 0 }
+        Raw { frame: None, pos: 0, carry: Vec::new(), carry_pos: 0, carry_stamp: 0, _tx: PhantomData }
     }
 
     fn in_carry(&self) -> bool {
@@ -24,25 +29,25 @@ impl<F> Raw<F> {
     }
 }
 
-impl<F> Default for Raw<F> {
+impl<F, T> Default for Raw<F, T> {
     fn default() -> Self {
         Raw::new()
     }
 }
 
-impl<F: RxFrame> PlainRx for Raw<F> {
+impl<F: RxFrame, T> PlainRx for Raw<F, T> {
     type Frame = F;
-    type Tx = ();
+    type Tx = T;
     type Error = Infallible;
 
-    fn push(&mut self, f: F, _: &mut ()) -> Result<(), Infallible> {
+    fn push(&mut self, f: F, _: &mut T) -> Result<(), Infallible> {
         assert!(self.current().is_empty(), "push with unconsumed bytes");
         self.frame = Some(f);
         self.pos = 0;
         Ok(())
     }
 
-    fn chunk(&mut self, _: &mut ()) -> Result<Option<Chunk<'_>>, Infallible> {
+    fn chunk(&mut self, _: &mut T) -> Result<Option<Chunk<'_>>, Infallible> {
         if self.in_carry() {
             let stamp = self.carry_stamp;
             return Ok(Some(Chunk { bytes: &mut self.carry[self.carry_pos..], rx_timestamp: stamp }));
