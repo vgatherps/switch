@@ -7,10 +7,6 @@
 //! builds copy through the stack), so the check runs under `cargo test --release`.
 #![cfg_attr(debug_assertions, allow(dead_code, unused_imports, unused_macros))]
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -30,20 +26,21 @@ impl Future for Huge {
     }
 }
 
-task! {
-    fn huge_struct(tag: u8) -> impl Future<Output = ()> {
-        Huge { tag, bulk: [0; SIZE] }
+#[switch::task]
+fn huge_struct(tag: u8) -> impl Future<Output = ()> {
+    Huge {
+        tag,
+        bulk: [0; SIZE],
     }
 }
 
-task! {
-    async fn huge_async(tag: u8) {
-        let mut bulk = [0u8; SIZE];
-        bulk[0] = tag;
-        std::future::ready(()).await;
-        std::hint::black_box(&mut bulk);
-        assert_eq!(bulk[0], 7);
-    }
+#[switch::task]
+async fn huge_async(tag: u8) {
+    let mut bulk = [0u8; SIZE];
+    bulk[0] = tag;
+    std::future::ready(()).await;
+    std::hint::black_box(&mut bulk);
+    assert_eq!(bulk[0], 7);
 }
 
 #[cfg(not(debug_assertions))]

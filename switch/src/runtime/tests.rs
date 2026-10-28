@@ -7,20 +7,17 @@ use std::task::{Context, Poll, Waker};
 #[path = "clock_tests.rs"]
 mod clock_tests;
 
-task! {
-    async fn empty() {}
+#[switch::task]
+async fn empty() {}
+
+#[switch::task]
+fn counted(task: Counted) -> impl Future<Output = ()> {
+    task
 }
 
-task! {
-    fn counted(task: Counted) -> impl Future<Output = ()> {
-        task
-    }
-}
-
-task! {
-    async fn count_task(count: Rc<Cell<usize>>) {
-        count.set(count.get() + 1);
-    }
+#[switch::task]
+async fn count_task(count: Rc<Cell<usize>>) {
+    count.set(count.get() + 1);
 }
 
 enum Finish {
@@ -157,10 +154,9 @@ fn rejected_future_is_returned_without_hidden_drop() {
     runtime.shutdown();
     let identity = Rc::new(());
     let drops = Rc::new(Cell::new(0));
-    task! {
-        fn identified(task: Identified) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn identified(task: Identified) -> impl Future<Output = ()> {
+        task
     }
     let error = spawner
         .spawn(identified(Identified {
@@ -212,11 +208,10 @@ fn nested_spawner_grows_queues_without_repolling_current_batch() {
         },
     );
     let spawner = runtime.spawner();
-    task! {
-        async fn spawn_many(spawner: Spawner, count: Rc<Cell<usize>>) {
-            for _ in 0..(DEFAULT_CAPACITY * 3) {
-                spawner.spawn(count_task(count.clone())).unwrap();
-            }
+    #[switch::task]
+    async fn spawn_many(spawner: Spawner, count: Rc<Cell<usize>>) {
+        for _ in 0..(DEFAULT_CAPACITY * 3) {
+            spawner.spawn(count_task(count.clone())).unwrap();
         }
     }
     let count = Rc::new(Cell::new(0));
@@ -261,10 +256,9 @@ fn woken_and_spawned_tasks_poll_in_the_same_turn() {
     let spawner = runtime.spawner();
     let wake = Rc::new(Cell::new(None));
     let parked_polls = Rc::new(Cell::new(0));
-    task! {
-        fn parked(task: Parked) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn parked(task: Parked) -> impl Future<Output = ()> {
+        task
     }
     spawner
         .spawn(parked(Parked {

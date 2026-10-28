@@ -10,10 +10,9 @@ enum Finish {
     Panic,
 }
 
-task! {
-    fn registered(task: Registered) -> impl Future<Output = ()> {
-        task
-    }
+#[switch::task]
+fn registered(task: Registered) -> impl Future<Output = ()> {
+    task
 }
 
 struct Registered {

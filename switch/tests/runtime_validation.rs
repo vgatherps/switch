@@ -1,6 +1,3 @@
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
 #[path = "support/runtime_workload.rs"]
 mod workload;
 use std::cell::Cell;
@@ -40,13 +37,12 @@ impl Drop for Retain {
         self.drops.set(self.drops.get() + 1);
     }
 }
-task! {
-    fn retain(sleep: Sleep, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-        Retain {
-            sleep,
-            registered: false,
-            drops,
-        }
+#[switch::task]
+fn retain(sleep: Sleep, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+    Retain {
+        sleep,
+        registered: false,
+        drops,
     }
 }
 struct Counted {
@@ -70,14 +66,12 @@ impl Drop for Counted {
         self.drops.set(self.drops.get() + 1);
     }
 }
-task! {
-    fn counted(mode: u8, polls: Rc<Cell<usize>>, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-        Counted { mode, polls, drops }
-    }
+#[switch::task]
+fn counted(mode: u8, polls: Rc<Cell<usize>>, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+    Counted { mode, polls, drops }
 }
-task! {
-    async fn noop() {}
-}
+#[switch::task]
+async fn noop() {}
 #[test]
 fn middle_batch_panic_preserves_payload_and_retires_pending_expired_and_unprocessed_tasks() {
     let mut runtime = Runtime::new(0);
@@ -172,10 +166,9 @@ fn double_panic_child() {
             panic!("future-destructor-marker");
         }
     }
-    task! {
-        fn panic_drop() -> impl Future<Output = ()> {
-            PanicDrop
-        }
+    #[switch::task]
+    fn panic_drop() -> impl Future<Output = ()> {
+        PanicDrop
     }
     let runtime = Runtime::new(0);
     runtime.spawner().spawn(panic_drop()).unwrap();

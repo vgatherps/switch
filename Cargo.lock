@@ -1413,6 +1413,18 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "depot",
+ "switch-macros",
+]
+
+[[package]]
+name = "switch-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "switch",
+ "syn 2.0.119",
+ "trybuild",
 ]
 
 [[package]]

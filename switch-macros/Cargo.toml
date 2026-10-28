@@ -1,0 +1,18 @@
+[package]
+name = "switch-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The #[switch::task] attribute; use it through switch::task"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+
+[dev-dependencies]
+switch.workspace = true
+trybuild = "1.0"

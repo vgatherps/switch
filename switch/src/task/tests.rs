@@ -50,16 +50,14 @@ impl Drop for Parked {
     }
 }
 
-task! {
-    pub(super) fn parked(state: Rc<State>) -> impl Future<Output = ()> {
-        Parked(state)
-    }
+#[switch::task]
+pub(super) fn parked(state: Rc<State>) -> impl Future<Output = ()> {
+    Parked(state)
 }
 
-task! {
-    fn parked_other(state: Rc<State>) -> impl Future<Output = ()> {
-        Parked(state)
-    }
+#[switch::task]
+fn parked_other(state: Rc<State>) -> impl Future<Output = ()> {
+    Parked(state)
 }
 
 pub(super) fn state() -> Rc<State> {
@@ -91,10 +89,11 @@ impl Future for Big {
     }
 }
 
-task! {
-    capacity = 7;
-    fn big(state: Rc<State>) -> impl Future<Output = ()> {
-        Big { parked: Parked(state), _bulk: [0; 20_000] }
+#[switch::task(capacity = 7)]
+fn big(state: Rc<State>) -> impl Future<Output = ()> {
+    Big {
+        parked: Parked(state),
+        _bulk: [0; 20_000],
     }
 }
 
@@ -180,10 +179,9 @@ fn default_capacity_is_one_block() {
             Pin::new(&mut self.0).poll(cx)
         }
     }
-    task! {
-        fn wide(state: Rc<State>) -> impl Future<Output = ()> {
-            Wide(Parked(state), [0; 30_000])
-        }
+    #[switch::task]
+    fn wide(state: Rc<State>) -> impl Future<Output = ()> {
+        Wide(Parked(state), [0; 30_000])
     }
     assert_eq!(Shape::<Wide>::SLOTS, 2);
     let mut runtime = Runtime::new(0);
@@ -231,9 +229,11 @@ impl Drop for Aligned128 {
     }
 }
 
-task! {
-    fn aligned_128(state: Rc<State>) -> impl Future<Output = ()> {
-        Aligned128 { state, _bulk: [0; 40] }
+#[switch::task]
+fn aligned_128(state: Rc<State>) -> impl Future<Output = ()> {
+    Aligned128 {
+        state,
+        _bulk: [0; 40],
     }
 }
 
@@ -271,15 +271,13 @@ fn over_aligned_future_polls_and_drops_aligned_through_slot_reuse() {
 
 #[test]
 fn capacity_counts_a_completed_task_until_its_queued_wake_drains() {
-    task! {
-        capacity = 1;
-        fn wake_then_finish(state: Rc<State>) -> impl Future<Output = ()> {
-            std::future::poll_fn(move |cx| {
-                state.polls.set(state.polls.get() + 1);
-                cx.waker().wake_by_ref();
-                Poll::Ready(())
-            })
-        }
+    #[switch::task(capacity = 1)]
+    fn wake_then_finish(state: Rc<State>) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |cx| {
+            state.polls.set(state.polls.get() + 1);
+            cx.waker().wake_by_ref();
+            Poll::Ready(())
+        })
     }
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
@@ -383,15 +381,14 @@ fn wake_after_shutdown_or_drop_has_no_effect() {
 
 #[test]
 fn stale_wake_into_a_reserved_slot_returns_before_any_executor_access() {
-    task! {
-        fn wake_while_reserved(state: Rc<State>, stale: Option<Waker>) -> impl Future<Output = ()> {
-            // Factory code runs with this call's slot reserved but not yet LIVE.
-            if let Some(stale) = stale {
-                assert_eq!(unsafe { TaskHeader::flags(header(&stale)).get() }, 0);
-                stale.wake_by_ref();
-            }
-            Parked(state)
+    #[switch::task]
+    fn wake_while_reserved(state: Rc<State>, stale: Option<Waker>) -> impl Future<Output = ()> {
+        // Factory code runs with this call's slot reserved but not yet LIVE.
+        if let Some(stale) = stale {
+            assert_eq!(unsafe { TaskHeader::flags(header(&stale)).get() }, 0);
+            stale.wake_by_ref();
         }
+        Parked(state)
     }
     let mut first = Runtime::new(0);
     let spawner = first.spawner();
@@ -557,10 +554,9 @@ impl Drop for DropFlag {
     }
 }
 
-task! {
-    async fn holds(flag: DropFlag) {
-        let _flag = flag;
-    }
+#[switch::task]
+async fn holds(flag: DropFlag) {
+    let _flag = flag;
 }
 
 #[test]
@@ -597,14 +593,12 @@ fn token_destructor_panic_leaves_pool_usable() {
 
 #[test]
 fn factory_panic_releases_its_reserved_slot() {
-    task! {
-        capacity = 2;
-        fn factory(state: Rc<State>, panic: bool) -> impl Future<Output = ()> {
-            if panic {
-                panic_any(77usize);
-            }
-            Parked(state)
+    #[switch::task(capacity = 2)]
+    fn factory(state: Rc<State>, panic: bool) -> impl Future<Output = ()> {
+        if panic {
+            panic_any(77usize);
         }
+        Parked(state)
     }
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
@@ -631,17 +625,24 @@ fn factory_panic_releases_its_reserved_slot() {
     );
 }
 
-task! {
-    fn recursive_factory(spawner: Spawner, states: Rc<RefCell<Vec<Rc<State>>>>, depth: u8) -> impl Future<Output = ()> {
-        let state = state();
-        states.borrow_mut().push(state.clone());
-        if depth > 0 {
-            spawner
-                .spawn(recursive_factory(spawner.clone(), states.clone(), depth - 1))
-                .unwrap();
-        }
-        Parked(state)
+#[switch::task]
+fn recursive_factory(
+    spawner: Spawner,
+    states: Rc<RefCell<Vec<Rc<State>>>>,
+    depth: u8,
+) -> impl Future<Output = ()> {
+    let state = state();
+    states.borrow_mut().push(state.clone());
+    if depth > 0 {
+        spawner
+            .spawn(recursive_factory(
+                spawner.clone(),
+                states.clone(),
+                depth - 1,
+            ))
+            .unwrap();
     }
+    Parked(state)
 }
 
 #[test]
@@ -662,15 +663,22 @@ fn factory_may_spawn_recursively() {
     assert!(states.borrow().iter().all(|s| s.drops.get() == 1));
 }
 
-task! {
-    fn shutdown_in_factory(runtime: Rc<RefCell<Runtime>>, state: Rc<State>, panic: bool) -> impl Future<Output = ()> {
-        runtime.borrow_mut().shutdown();
-        assert_eq!(state.drops.get(), 0, "cleanup must wait for the reservation");
-        if panic {
-            panic_any(91usize);
-        }
-        Parked(state)
+#[switch::task]
+fn shutdown_in_factory(
+    runtime: Rc<RefCell<Runtime>>,
+    state: Rc<State>,
+    panic: bool,
+) -> impl Future<Output = ()> {
+    runtime.borrow_mut().shutdown();
+    assert_eq!(
+        state.drops.get(),
+        0,
+        "cleanup must wait for the reservation"
+    );
+    if panic {
+        panic_any(91usize);
     }
+    Parked(state)
 }
 
 #[test]
@@ -723,16 +731,17 @@ fn deferred_shutdown_finishes_after_a_destructor_panic() {
             panic_any(13usize);
         }
     }
-    task! {
-        fn panics_on_drop(state: Rc<State>) -> impl Future<Output = ()> {
-            PanicOnDrop(state)
-        }
+    #[switch::task]
+    fn panics_on_drop(state: Rc<State>) -> impl Future<Output = ()> {
+        PanicOnDrop(state)
     }
-    task! {
-        fn drops_runtime(owner: Rc<RefCell<Option<Runtime>>>, state: Rc<State>) -> impl Future<Output = ()> {
-            drop(owner.borrow_mut().take());
-            Parked(state)
-        }
+    #[switch::task]
+    fn drops_runtime(
+        owner: Rc<RefCell<Option<Runtime>>>,
+        state: Rc<State>,
+    ) -> impl Future<Output = ()> {
+        drop(owner.borrow_mut().take());
+        Parked(state)
     }
     let owner = Rc::new(RefCell::new(Some(Runtime::new(0))));
     let spawner = owner.borrow().as_ref().unwrap().spawner();
@@ -780,16 +789,13 @@ fn cleanup_drops_every_task_of_every_block_and_function_once() {
             self.1.borrow_mut().push(self.0);
         }
     }
-    task! {
-        capacity = 5;
-        fn first_fn(id: u32, log: Rc<RefCell<Vec<u32>>>) -> impl Future<Output = ()> {
-            Ordered(id, log, [0; 20_000])
-        }
+    #[switch::task(capacity = 5)]
+    fn first_fn(id: u32, log: Rc<RefCell<Vec<u32>>>) -> impl Future<Output = ()> {
+        Ordered(id, log, [0; 20_000])
     }
-    task! {
-        fn second_fn(id: u32, log: Rc<RefCell<Vec<u32>>>) -> impl Future<Output = ()> {
-            Ordered(id, log, [0; 20_000])
-        }
+    #[switch::task]
+    fn second_fn(id: u32, log: Rc<RefCell<Vec<u32>>>) -> impl Future<Output = ()> {
+        Ordered(id, log, [0; 20_000])
     }
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
@@ -814,14 +820,12 @@ fn cleanup_drops_every_task_of_every_block_and_function_once() {
 
 #[test]
 fn sleep_expiry_wakes_a_task_in_a_later_block() {
-    task! {
-        capacity = 7;
-        async fn sleeper(spawner: Spawner, woke: Rc<Cell<bool>>) {
-            let bulk = [0u8; 20_000];
-            spawner.sleep_until(5).unwrap().await.unwrap();
-            std::hint::black_box(&bulk);
-            woke.set(true);
-        }
+    #[switch::task(capacity = 7)]
+    async fn sleeper(spawner: Spawner, woke: Rc<Cell<bool>>) {
+        let bulk = [0u8; 20_000];
+        spawner.sleep_until(5).unwrap().await.unwrap();
+        std::hint::black_box(&bulk);
+        woke.set(true);
     }
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
@@ -839,19 +843,18 @@ fn sleep_expiry_wakes_a_task_in_a_later_block() {
 
 // ---- StoredWaker ----
 
-task! {
-    fn stores(state: Rc<State>, stored: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
-        std::future::poll_fn(move |cx| {
-            stored.set(Some(StoredWaker::new(cx)));
-            *state.waker.borrow_mut() = Some(cx.waker().clone());
-            state.polls.set(state.polls.get() + 1);
-            if state.done.get() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-    }
+#[switch::task]
+fn stores(state: Rc<State>, stored: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
+    std::future::poll_fn(move |cx| {
+        stored.set(Some(StoredWaker::new(cx)));
+        *state.waker.borrow_mut() = Some(cx.waker().clone());
+        state.polls.set(state.polls.get() + 1);
+        if state.done.get() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
 }
 
 #[test]
@@ -1000,16 +1003,14 @@ impl Drop for Counted {
     }
 }
 
-task! {
-    fn counted_in_tls(drops: Arc<AtomicUsize>) -> impl Future<Output = ()> {
-        Counted(drops)
-    }
+#[switch::task]
+fn counted_in_tls(drops: Arc<AtomicUsize>) -> impl Future<Output = ()> {
+    Counted(drops)
 }
 
-task! {
-    fn first_used_in_tls_drop(drops: Arc<AtomicUsize>) -> impl Future<Output = ()> {
-        Counted(drops)
-    }
+#[switch::task]
+fn first_used_in_tls_drop(drops: Arc<AtomicUsize>) -> impl Future<Output = ()> {
+    Counted(drops)
 }
 
 impl Drop for OnTlsDrop {

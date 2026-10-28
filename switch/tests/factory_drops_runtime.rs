@@ -3,10 +3,6 @@
 //! This used to abort the process (cleanup refused during the reservation, and the
 //! drop's cleanup retry panicked again while unwinding), so it runs in a child.
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
 use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -28,17 +24,18 @@ impl Drop for Counted {
     }
 }
 
-task! {
-    fn drops_its_runtime(owner: Rc<RefCell<Option<Runtime>>>, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-        drop(owner.borrow_mut().take());
-        Counted(drops)
-    }
+#[switch::task]
+fn drops_its_runtime(
+    owner: Rc<RefCell<Option<Runtime>>>,
+    drops: Rc<Cell<usize>>,
+) -> impl Future<Output = ()> {
+    drop(owner.borrow_mut().take());
+    Counted(drops)
 }
 
-task! {
-    fn parked(drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-        Counted(drops)
-    }
+#[switch::task]
+fn parked(drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+    Counted(drops)
 }
 
 #[cfg(not(miri))]

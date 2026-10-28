@@ -2,13 +2,13 @@
 
 A caller-driven, single-threaded async runtime. Nothing blocks or reads a clock: the caller supplies a `u64` tick on every poll, in units it chooses.
 
-Depends on [`depot`](../depot/README.md) (`DynDepot` allocates task slots). `switchnet` depends on it. It needs no DPDK or Docker.
+Depends on [`depot`](../depot/README.md) (`DynDepot` allocates task slots) and [`switch-macros`](../switch-macros/README.md) (the `#[switch::task]` attribute). `switchnet` depends on it. It needs no DPDK or Docker.
 
 ## API
 
 - `Runtime`: owns tasks and timers, `!Send + !Sync`. `Runtime::new(tick)` or `with_capacity(tick, Capacity { tasks, timers })`. `poll(tick)` accepts an equal or later tick, advances timers, polls one snapshot of ready tasks and returns a `PollReport` (`tasks_polled`, `tasks_completed`, `timers_expired`, `ready_tasks`, `live_tasks`). A regressed tick returns `RuntimeError::TimeRegressed` and changes nothing. After a task panics the payload unwinds to the caller, the runtime rejects new work, and `shutdown()` stays available.
 - `Spawner` (from `runtime.spawner()`): `spawn(SpawnToken<T>)`, `sleep(ticks)`, `sleep_until(...)`, returning `Sleep` futures. `SpawnError` carries the reason and gives the token back; `RuntimeError::Exhausted` means the task function's capacity of occupied slots in this runtime is used (one block's slots unless the function sets `capacity = N`). A completed task that woke itself keeps its slot until its queued wake drains on the next poll.
-- `SpawnToken`: one call of a task function, packaged by the `#[switch::task]` expansion, whose support items are in the hidden `__private` module. The proc macro is not in the workspace yet; the crate doc and `tests/support/task_macro.rs` show the expansion by hand.
+- `#[switch::task]` (from [`switch-macros`](../switch-macros/README.md)) marks a task function; calling it returns a `SpawnToken`, one call's arguments packaged for `spawn`. `#[switch::task(capacity = N)]` sets the function's capacity.
 - `StoredWaker::new(cx)`: copyable handle that wakes its task directly; `wake(self)`.
 
 ## Tasks

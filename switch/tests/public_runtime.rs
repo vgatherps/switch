@@ -3,22 +3,16 @@ use std::rc::Rc;
 
 use switch::{Capacity, Runtime, SleepError, Spawner};
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
-task! {
-    async fn sleep_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
-        spawner.sleep(10).unwrap().await.unwrap();
-        completed.set(true);
-    }
+#[switch::task]
+async fn sleep_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
+    spawner.sleep(10).unwrap().await.unwrap();
+    completed.set(true);
 }
 
-task! {
-    async fn sleep_until_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
-        spawner.sleep_until(110).unwrap().await.unwrap();
-        completed.set(true);
-    }
+#[switch::task]
+async fn sleep_until_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
+    spawner.sleep_until(110).unwrap().await.unwrap();
+    completed.set(true);
 }
 
 struct Interface {

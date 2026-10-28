@@ -4,10 +4,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-#[macro_use]
-#[path = "../tests/support/task_macro.rs"]
-mod task_macro;
-
 struct YieldOnce(bool);
 
 impl Future for YieldOnce {
@@ -23,18 +19,16 @@ impl Future for YieldOnce {
     }
 }
 
-task! {
-    async fn immediate() {
-        println!("Task 1: immediate");
-    }
+#[switch::task]
+async fn immediate() {
+    println!("Task 1: immediate");
 }
 
-task! {
-    async fn yield_once() {
-        println!("Task 2: start");
-        YieldOnce(false).await;
-        println!("Task 2: after yield");
-    }
+#[switch::task]
+async fn yield_once() {
+    println!("Task 2: start");
+    YieldOnce(false).await;
+    println!("Task 2: after yield");
 }
 
 fn main() {

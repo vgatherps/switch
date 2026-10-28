@@ -107,10 +107,9 @@ impl Future for StoredWake {
 
 #[test]
 fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
-    task! {
-        fn stored_wake(task: StoredWake) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn stored_wake(task: StoredWake) -> impl Future<Output = ()> {
+        task
     }
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();

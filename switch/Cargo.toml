@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 depot.workspace = true
+switch-macros.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

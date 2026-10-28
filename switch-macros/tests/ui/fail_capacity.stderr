@@ -1,0 +1,25 @@
+error[E0080]: evaluation panicked: task capacity must be at least 1 and below 2^25
+ --> $WORKSPACE/switch/src/task/private.rs
+  |
+  | /             assert!(
+  | |                 capacity >= 1 && capacity < 1 << 25,
+  | |                 "task capacity must be at least 1 and below 2^25"
+  | |             );
+  | |_____________^ evaluation of `switch::__private::token::<zero::Key, {closure@$DIR/tests/ui/fail_capacity.rs:2:10: 2:14}, {async fn body of zero::__task()}>::{constant#0}` failed here
+
+note: erroneous constant encountered
+ --> $WORKSPACE/switch/src/task/private.rs
+  |
+  | /     const {
+  | |         if let Some(capacity) = K::CAPACITY {
+  | |             assert!(
+  | |                 capacity >= 1 && capacity < 1 << 25,
+... |
+  | |     }
+  | |_____^
+
+note: the above error was encountered while instantiating `fn token::<Key, {closure@$DIR/tests/ui/fail_capacity.rs:2:10: 2:14}, {async fn body of zero::__task()}>`
+ --> tests/ui/fail_capacity.rs:2:10
+  |
+2 | async fn zero() {}
+  |          ^^^^

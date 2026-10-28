@@ -25,54 +25,37 @@
 //! Runtime primitives that park tasks can keep a [`StoredWaker`] instead: a copyable
 //! handle that wakes its task directly, without a call through the waker vtable.
 //!
-//! ## Example
+//! ## Tasks
+//!
+//! A task is one call of a function marked `#[switch::task]`: an `async fn`, or a
+//! `fn` returning `impl Future<Output = ()>`, with `'static` arguments bound to plain
+//! identifiers and no generics. Calling it packages the arguments into a
+//! [`SpawnToken`]; `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
+//! `#[switch::task(capacity = N)]` sets the most occupied slots of that function per
+//! runtime (default: one block's slots, `1 <= N < 2^25`).
 //!
 //! ```rust
 //! use switch::Runtime;
 //!
-//! // Hand-written expansion of `#[switch::task] async fn hello() { println!("Hello!"); }`.
-//! fn hello() -> switch::SpawnToken<impl switch::__private::Task> {
-//!     async fn __hello_task() {
-//!         println!("Hello!");
-//!     }
-//!     thread_local! {
-//!         static POOL: switch::__private::Pool = const { switch::__private::Pool::new() };
-//!     }
-//!     struct Key;
-//!     unsafe impl switch::__private::PoolKey for Key {
-//!         fn pool() -> &'static std::thread::LocalKey<switch::__private::Pool> {
-//!             &POOL
-//!         }
-//!     }
-//!     // SAFETY: Key's pool is private to this function, which always produces one future type.
-//!     unsafe { switch::__private::token::<Key, _, _>(move || __hello_task()) }
+//! #[switch::task]
+//! async fn hello(name: &'static str) {
+//!     println!("Hello, {name}!");
 //! }
 //!
 //! let mut runtime = Runtime::new(100);
 //! let spawner = runtime.spawner();
-//! spawner.spawn(hello()).unwrap();
+//! spawner.spawn(hello("switch")).unwrap();
 //!
 //! while runtime.poll(100).unwrap().live_tasks != 0 {}
 //! ```
 //!
 //! A task future that does not fit a 64 KiB task block is a compile-time error:
 //! ```compile_fail,E0080
-//! fn too_big() -> switch::SpawnToken<impl switch::__private::Task> {
-//!     async fn __too_big() {
-//!         let bulk = [0u8; 70_000];
-//!         std::future::ready(()).await;
-//!         std::hint::black_box(&bulk);
-//!     }
-//!     thread_local! {
-//!         static POOL: switch::__private::Pool = const { switch::__private::Pool::new() };
-//!     }
-//!     struct Key;
-//!     unsafe impl switch::__private::PoolKey for Key {
-//!         fn pool() -> &'static std::thread::LocalKey<switch::__private::Pool> {
-//!             &POOL
-//!         }
-//!     }
-//!     unsafe { switch::__private::token::<Key, _, _>(move || __too_big()) }
+//! #[switch::task]
+//! async fn too_big() {
+//!     let bulk = [0u8; 70_000];
+//!     std::future::ready(()).await;
+//!     std::hint::black_box(&bulk);
 //! }
 //! drop(too_big());
 //! ```
@@ -123,11 +106,6 @@
 #[cfg(test)]
 extern crate self as switch;
 
-#[cfg(test)]
-#[macro_use]
-#[path = "../tests/support/task_macro.rs"]
-mod task_macro;
-
 mod executor;
 pub(crate) mod intrusive;
 mod runtime;
@@ -139,6 +117,7 @@ mod waker;
 
 pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
+pub use switch_macros::task;
 pub use task::SpawnToken;
 pub use waker::StoredWaker;
 

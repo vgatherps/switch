@@ -1,6 +1,3 @@
-#[macro_use]
-#[path = "../tests/support/task_macro.rs"]
-mod task_macro;
 // This bench uses part of the module.
 #[allow(dead_code)]
 #[path = "../tests/support/runtime_workload.rs"]

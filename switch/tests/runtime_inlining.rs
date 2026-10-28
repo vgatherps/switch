@@ -6,10 +6,6 @@ use std::task::{Context, Poll};
 
 use switch::{PollReport, Runtime, RuntimeError, Sleep};
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
 struct YieldingSleep {
     sleep: Sleep,
     polls: Rc<Cell<usize>>,
@@ -43,26 +39,24 @@ impl Drop for YieldingSleep {
     }
 }
 
-task! {
-    fn yielding_sleep(
-        sleep: Sleep,
-        polls: Rc<Cell<usize>>,
-        drops: Rc<Cell<usize>>,
-        trace: Rc<RefCell<Vec<&'static str>>>,
-    ) -> impl Future<Output = ()> {
-        YieldingSleep {
-            sleep,
-            polls,
-            drops,
-            trace,
-        }
+#[switch::task]
+fn yielding_sleep(
+    sleep: Sleep,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+    trace: Rc<RefCell<Vec<&'static str>>>,
+) -> impl Future<Output = ()> {
+    YieldingSleep {
+        sleep,
+        polls,
+        drops,
+        trace,
     }
 }
 
-task! {
-    async fn push_spawned_ready(trace: Rc<RefCell<Vec<&'static str>>>) {
-        trace.borrow_mut().push("spawned ready");
-    }
+#[switch::task]
+async fn push_spawned_ready(trace: Rc<RefCell<Vec<&'static str>>>) {
+    trace.borrow_mut().push("spawned ready");
 }
 
 #[test]

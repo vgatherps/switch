@@ -50,22 +50,19 @@ fn new_holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> Ho
     }
 }
 
-task! {
-    fn holding(task: Holder) -> impl Future<Output = ()> {
-        task
-    }
+#[switch::task]
+fn holding(task: Holder) -> impl Future<Output = ()> {
+    task
 }
 
-task! {
-    fn holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> impl Future<Output = ()> {
-        new_holder(sleep, complete)
-    }
+#[switch::task]
+fn holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> impl Future<Output = ()> {
+    new_holder(sleep, complete)
 }
 
-task! {
-    async fn panic_task(payload: &'static str) {
-        std::panic::panic_any(payload);
-    }
+#[switch::task]
+async fn panic_task(payload: &'static str) {
+    std::panic::panic_any(payload);
 }
 
 #[test]
@@ -291,10 +288,9 @@ fn foreign_runtime_frame_rejected_while_original_frame_live() {
             Poll::Ready(())
         }
     }
-    task! {
-        fn nested(task: Nested) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn nested(task: Nested) -> impl Future<Output = ()> {
+        task
     }
     a.spawner()
         .spawn(nested(Nested {
@@ -340,10 +336,9 @@ fn current_task_clears_pending_ready_and_unwind_before_destructor() {
             self.drops.set(self.drops.get() + 1);
         }
     }
-    task! {
-        fn inspect(task: Inspect) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn inspect(task: Inspect) -> impl Future<Output = ()> {
+        task
     }
     for panic in [false, true] {
         let mut runtime = Runtime::new(0);

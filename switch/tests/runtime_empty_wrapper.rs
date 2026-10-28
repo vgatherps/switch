@@ -6,10 +6,6 @@ use std::task::{Context, Poll, Waker};
 
 use switch::{PollReport, Runtime, Sleep};
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
 struct ParkedSleep {
     sleep: Sleep,
     wake: Rc<RefCell<Option<Waker>>>,
@@ -45,19 +41,18 @@ impl Drop for ParkedSleep {
     }
 }
 
-task! {
-    fn parked_sleep(
-        sleep: Sleep,
-        wake: Rc<RefCell<Option<Waker>>>,
-        polls: Rc<Cell<usize>>,
-        drops: Rc<Cell<usize>>,
-    ) -> impl Future<Output = ()> {
-        ParkedSleep {
-            sleep,
-            wake,
-            polls,
-            drops,
-        }
+#[switch::task]
+fn parked_sleep(
+    sleep: Sleep,
+    wake: Rc<RefCell<Option<Waker>>>,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+) -> impl Future<Output = ()> {
+    ParkedSleep {
+        sleep,
+        wake,
+        polls,
+        drops,
     }
 }
 

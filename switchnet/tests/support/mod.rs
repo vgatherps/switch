@@ -17,15 +17,10 @@ use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
 
-#[macro_use]
-#[path = "../../../switch/tests/support/task_macro.rs"]
-mod task_macro;
-
-task! {
-    /// Any test future, boxed so one task function serves every test.
-    fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-        future
-    }
+/// Any test future, boxed so one task function serves every test.
+#[switch::task]
+fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
+    future
 }
 
 pub const MAX_TCP: usize = 4;

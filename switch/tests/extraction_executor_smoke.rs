@@ -6,10 +6,6 @@ use std::task::{Context, Poll};
 
 use switch::Runtime;
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
 struct WakeOnce(bool);
 
 impl Future for WakeOnce {
@@ -26,18 +22,16 @@ impl Future for WakeOnce {
     }
 }
 
-task! {
-    async fn push_ready(trace: Rc<RefCell<Vec<&'static str>>>) {
-        trace.borrow_mut().push("ready");
-    }
+#[switch::task]
+async fn push_ready(trace: Rc<RefCell<Vec<&'static str>>>) {
+    trace.borrow_mut().push("ready");
 }
 
-task! {
-    async fn push_around_wake(trace: Rc<RefCell<Vec<&'static str>>>) {
-        trace.borrow_mut().push("pending first poll");
-        WakeOnce(false).await;
-        trace.borrow_mut().push("pending second poll");
-    }
+#[switch::task]
+async fn push_around_wake(trace: Rc<RefCell<Vec<&'static str>>>) {
+    trace.borrow_mut().push("pending first poll");
+    WakeOnce(false).await;
+    trace.borrow_mut().push("pending second poll");
 }
 
 #[test]

@@ -8,10 +8,6 @@ use std::task::{Context, Poll, Waker};
 
 use switch::{Runtime, Spawner};
 
-#[macro_use]
-#[path = "support/task_macro.rs"]
-mod task_macro;
-
 struct YieldN(u32);
 
 impl Future for YieldN {
@@ -46,56 +42,50 @@ impl Future for ManualWake {
     }
 }
 
-task! {
-    async fn set_true(flag: Rc<Cell<bool>>) {
-        flag.set(true);
-    }
+#[switch::task]
+async fn set_true(flag: Rc<Cell<bool>>) {
+    flag.set(true);
 }
 
-task! {
-    async fn yield_then_set_one(count: Rc<Cell<u32>>) {
-        YieldN(3).await;
-        count.set(1);
-    }
+#[switch::task]
+async fn yield_then_set_one(count: Rc<Cell<u32>>) {
+    YieldN(3).await;
+    count.set(1);
 }
 
-task! {
-    async fn increment(count: Rc<Cell<u32>>) {
-        count.set(count.get() + 1);
-    }
+#[switch::task]
+async fn increment(count: Rc<Cell<u32>>) {
+    count.set(count.get() + 1);
 }
 
-task! {
-    async fn spawn_set_true(spawner: Spawner, flag: Rc<Cell<bool>>) {
-        spawner.spawn(set_true(flag)).unwrap();
-    }
+#[switch::task]
+async fn spawn_set_true(spawner: Spawner, flag: Rc<Cell<bool>>) {
+    spawner.spawn(set_true(flag)).unwrap();
 }
 
-task! {
-    async fn manual_wake_then_set(waker_slot: Rc<Cell<Option<Waker>>>, done: Rc<Cell<bool>>) {
-        ManualWake {
-            waker_slot,
-            done: false,
-        }
-        .await;
-        done.set(true);
+#[switch::task]
+async fn manual_wake_then_set(waker_slot: Rc<Cell<Option<Waker>>>, done: Rc<Cell<bool>>) {
+    ManualWake {
+        waker_slot,
+        done: false,
     }
+    .await;
+    done.set(true);
 }
 
-task! {
-    async fn log_around_yield(
-        log: Rc<Cell<Vec<&'static str>>>,
-        start: &'static str,
-        end: &'static str,
-    ) {
-        let mut v = log.take();
-        v.push(start);
-        log.set(v);
-        YieldN(1).await;
-        let mut v = log.take();
-        v.push(end);
-        log.set(v);
-    }
+#[switch::task]
+async fn log_around_yield(
+    log: Rc<Cell<Vec<&'static str>>>,
+    start: &'static str,
+    end: &'static str,
+) {
+    let mut v = log.take();
+    v.push(start);
+    log.set(v);
+    YieldN(1).await;
+    let mut v = log.take();
+    v.push(end);
+    log.set(v);
 }
 
 #[test]

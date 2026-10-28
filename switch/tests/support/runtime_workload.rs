@@ -6,8 +6,6 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use switch::{Capacity, PollReport, Runtime, Sleep, Spawner};
 
-// `task!` comes from the including crate root, which declares `task_macro` before this module.
-
 pub const TICKS: [u64; 6] = [100, 100, 101, 102, 1 << 60, u64::MAX];
 pub const EXPECTED: [(usize, usize, usize, usize, usize); 6] = [
     (3, 1, 0, 1, 2),
@@ -71,19 +69,18 @@ impl Drop for Task {
         self.audit.drops.set(self.audit.drops.get() + 1);
     }
 }
-task! {
-    fn mixed_task(
-        sleeps: Vec<Sleep>,
-        yields: usize,
-        value: u64,
-        audit: Rc<Audit>,
-    ) -> impl Future<Output = ()> {
-        Task {
-            sleeps,
-            yields,
-            value,
-            audit,
-        }
+#[switch::task]
+fn mixed_task(
+    sleeps: Vec<Sleep>,
+    yields: usize,
+    value: u64,
+    audit: Rc<Audit>,
+) -> impl Future<Output = ()> {
+    Task {
+        sleeps,
+        yields,
+        value,
+        audit,
     }
 }
 pub struct Mixed {
@@ -188,19 +185,18 @@ impl Drop for Repeated {
         self.drops.set(self.drops.get() + 1);
     }
 }
-task! {
-    fn repeated(
-        sleep: Sleep,
-        stop: Rc<Cell<bool>>,
-        polls: Rc<Cell<usize>>,
-        drops: Rc<Cell<usize>>,
-    ) -> impl Future<Output = ()> {
-        Repeated {
-            sleep,
-            stop,
-            polls,
-            drops,
-        }
+#[switch::task]
+fn repeated(
+    sleep: Sleep,
+    stop: Rc<Cell<bool>>,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+) -> impl Future<Output = ()> {
+    Repeated {
+        sleep,
+        stop,
+        polls,
+        drops,
     }
 }
 impl PendingSleep {

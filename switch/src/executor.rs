@@ -471,23 +471,20 @@ mod tests {
         }
     }
 
-    task! {
-        async fn set_flag(flag: Rc<Cell<bool>>) {
-            flag.set(true);
-        }
+    #[switch::task]
+    async fn set_flag(flag: Rc<Cell<bool>>) {
+        flag.set(true);
     }
 
-    task! {
-        async fn yield_then_count(count: Rc<Cell<usize>>) {
-            YieldN(3).await;
-            count.set(count.get() + 1);
-        }
+    #[switch::task]
+    async fn yield_then_count(count: Rc<Cell<usize>>) {
+        YieldN(3).await;
+        count.set(count.get() + 1);
     }
 
-    task! {
-        async fn count_once(count: Rc<Cell<usize>>) {
-            count.set(count.get() + 1);
-        }
+    #[switch::task]
+    async fn count_once(count: Rc<Cell<usize>>) {
+        count.set(count.get() + 1);
     }
 
     #[test]

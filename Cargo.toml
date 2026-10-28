@@ -25,6 +25,7 @@ members = [
     "cephalopod/crates/control",
     # switch
     "switch",
+    "switch-macros",
     # depot (vendored from ~/src/meminfra/depot)
     "depot",
     # switchnet
@@ -61,6 +62,7 @@ smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-featur
 sockperf-wire = { path = "conduit/crates/sockperf-wire" }
 stack-stream = { path = "conduit/crates/stack-stream" }
 switch = { path = "switch" }
+switch-macros = { path = "switch-macros" }
 tap-echo = { path = "conduit/crates/tap-echo" }
 zhida-buffer = { path = "conduit/crates/zhida-buffer" }
 zhida-dpdk-sys = { path = "conduit/crates/zhida-dpdk-sys" }

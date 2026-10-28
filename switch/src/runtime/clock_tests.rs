@@ -90,10 +90,9 @@ fn regressed_time_preserves_clock_timer_and_task_state() {
     let task = TimedTask::new(&runtime, 110, 2);
     let polls = task.polls.clone();
     let drops = task.drops.clone();
-    task! {
-        fn timed(task: TimedTask) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn timed(task: TimedTask) -> impl Future<Output = ()> {
+        task
     }
     runtime.spawner().spawn(timed(task)).unwrap();
     assert_eq!(runtime.poll(100).unwrap(), report(1, 0, 0, 0, 1));
@@ -142,10 +141,9 @@ fn spawned_task_enters_current_snapshot_and_future_spawn_selfwake_enter_next() {
         step: 0,
         ran: ran.clone(),
     };
-    task! {
-        fn parent_task(task: Parent) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn parent_task(task: Parent) -> impl Future<Output = ()> {
+        task
     }
     spawner.spawn(parent_task(parent)).unwrap();
     assert_eq!(runtime.poll(7).unwrap(), report(1, 0, 0, 2, 2));
@@ -167,10 +165,9 @@ fn terminal_selfwake_claim_is_not_ready_and_drains_with_zero_future_polls() {
     }
     let mut runtime = Runtime::new(0);
     let polls = Rc::new(Cell::new(0));
-    task! {
-        fn ready_wake(polls: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-            ReadyWake(polls)
-        }
+    #[switch::task]
+    fn ready_wake(polls: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+        ReadyWake(polls)
     }
     runtime.spawner().spawn(ready_wake(polls.clone())).unwrap();
     assert_eq!(runtime.poll(0).unwrap(), report(1, 1, 0, 0, 0));

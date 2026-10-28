@@ -20,15 +20,10 @@ use zhida_test_kit::pair::{self, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::with_eal;
 
-#[macro_use]
-#[path = "../../switch/tests/support/task_macro.rs"]
-mod task_macro;
-
-task! {
-    async fn park_in_recv(socket: UdpSocket) {
-        let mut socket = socket;
-        drop(socket.recv().await);
-    }
+#[switch::task]
+async fn park_in_recv(socket: UdpSocket) {
+    let mut socket = socket;
+    drop(socket.recv().await);
 }
 
 const MAX_UDP: usize = 16;

@@ -72,20 +72,17 @@ fn wake(task: *const TaskHeader) {
     unsafe { Executor::wake(task) }
 }
 
-task! {
-    async fn empty() {}
+#[switch::task]
+async fn empty() {}
+
+#[switch::task]
+async fn count_task(count: Rc<Cell<usize>>) {
+    count.set(count.get() + 1);
 }
 
-task! {
-    async fn count_task(count: Rc<Cell<usize>>) {
-        count.set(count.get() + 1);
-    }
-}
-
-task! {
-    fn probe(task: Probe) -> impl Future<Output = ()> {
-        task
-    }
+#[switch::task]
+fn probe(task: Probe) -> impl Future<Output = ()> {
+    task
 }
 
 struct Probe {
@@ -202,12 +199,11 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
     let owner = Owner::new();
     let ptr = owner.0;
     let inner = Rc::new(Cell::new(0));
-    task! {
-        async fn spawn_many(ptr: *mut Executor, inner: Rc<Cell<usize>>) {
-            for _ in 0..(DEFAULT_CAPACITY * 3) {
-                unsafe {
-                    assert!(Executor::spawn(ptr, count_task(inner.clone())).is_ok());
-                }
+    #[switch::task]
+    async fn spawn_many(ptr: *mut Executor, inner: Rc<Cell<usize>>) {
+        for _ in 0..(DEFAULT_CAPACITY * 3) {
+            unsafe {
+                assert!(Executor::spawn(ptr, count_task(inner.clone())).is_ok());
             }
         }
     }
@@ -334,10 +330,9 @@ fn over_aligned_future_has_exactly_one_drop() {
             self.0.set(self.0.get() + 1);
         }
     }
-    task! {
-        fn aligned(drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-            Aligned(drops)
-        }
+    #[switch::task]
+    fn aligned(drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+        Aligned(drops)
     }
     let owner = Owner::new();
     let drops = Rc::new(Cell::new(0));
@@ -373,10 +368,9 @@ fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
     let mut task = Probe::new();
     task.polls = remaining_polls.clone();
     task.drops = remaining_drops.clone();
-    task! {
-        fn recursive(task: Recursive) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn recursive(task: Recursive) -> impl Future<Output = ()> {
+        task
     }
     owner.spawn(recursive(Recursive {
         root: owner.0,
@@ -413,10 +407,9 @@ fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
 #[test]
 fn waking_another_current_batch_task_does_not_add_a_next_batch_claim() {
     let owner = Owner::new();
-    task! {
-        async fn wake_target(target: Rc<Cell<Option<*const TaskHeader>>>) {
-            wake(target.get().unwrap());
-        }
+    #[switch::task]
+    async fn wake_target(target: Rc<Cell<Option<*const TaskHeader>>>) {
+        wake(target.get().unwrap());
     }
     let target = Rc::new(Cell::new(None));
     owner.spawn(wake_target(target.clone()));
@@ -482,10 +475,9 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
             wake(self.target.get().unwrap());
         }
     }
-    task! {
-        fn spawn_during_drop(task: SpawnDuringDrop) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn spawn_during_drop(task: SpawnDuringDrop) -> impl Future<Output = ()> {
+        task
     }
     let owner = Owner::new();
     let target = Rc::new(Cell::new(None));
@@ -641,10 +633,9 @@ fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
             self.drops[self.id].set(self.drops[self.id].get() + 1);
         }
     }
-    task! {
-        fn ordered(task: Ordered) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn ordered(task: Ordered) -> impl Future<Output = ()> {
+        task
     }
     let owner = Owner::new();
     let targets = Rc::new(std::array::from_fn(|_| Cell::new(None)));
@@ -723,10 +714,9 @@ fn multiple_selfwakes_then_panic_keep_one_claim_and_original_payload() {
     );
 }
 
-task! {
-    fn rejected(task: RejectedWakeOnDrop) -> impl Future<Output = ()> {
-        task
-    }
+#[switch::task]
+fn rejected(task: RejectedWakeOnDrop) -> impl Future<Output = ()> {
+    task
 }
 
 struct RejectedWakeOnDrop {
@@ -840,10 +830,9 @@ fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
     owner.poll();
     let drops = Rc::new(Cell::new(0));
     let rejected_drops = Rc::new(Cell::new(0));
-    task! {
-        fn during_cleanup(task: DuringCleanup) -> impl Future<Output = ()> {
-            task
-        }
+    #[switch::task]
+    fn during_cleanup(task: DuringCleanup) -> impl Future<Output = ()> {
+        task
     }
     owner.spawn(during_cleanup(DuringCleanup {
         owner: owner.0,

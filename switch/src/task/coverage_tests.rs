@@ -154,9 +154,16 @@ impl Drop for Probe {
     }
 }
 
-task! {
-    fn probe(polls: Arc<AtomicUsize>, drops: Arc<AtomicUsize>, ready: bool) -> impl Future<Output = ()> {
-        Probe { polls, drops, ready }
+#[switch::task]
+fn probe(
+    polls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+    ready: bool,
+) -> impl Future<Output = ()> {
+    Probe {
+        polls,
+        drops,
+        ready,
     }
 }
 
@@ -246,18 +253,17 @@ fn foreign_ops_panic_after_owner_exit_with_forgotten_runtime_and_live_slot() {
     }
 }
 
-task! {
-    fn polls_in_factory(
-        runtime: Rc<RefCell<Runtime>>,
-        inner: Option<Rc<Cell<Option<PollReport>>>>,
-        state: Rc<State>,
-    ) -> impl Future<Output = ()> {
-        // This call's slot is reserved, not yet committed.
-        if let Some(inner) = inner {
-            inner.set(Some(runtime.borrow_mut().poll(0).unwrap()));
-        }
-        Parked(state)
+#[switch::task]
+fn polls_in_factory(
+    runtime: Rc<RefCell<Runtime>>,
+    inner: Option<Rc<Cell<Option<PollReport>>>>,
+    state: Rc<State>,
+) -> impl Future<Output = ()> {
+    // This call's slot is reserved, not yet committed.
+    if let Some(inner) = inner {
+        inner.set(Some(runtime.borrow_mut().poll(0).unwrap()));
     }
+    Parked(state)
 }
 
 #[test]
@@ -292,10 +298,9 @@ fn factory_polls_the_runtime_between_reserve_and_commit() {
     assert_eq!((earlier.drops.get(), new.drops.get()), (1, 1));
 }
 
-task! {
-    async fn panics_when_polled() {
-        panic_any(88usize)
-    }
+#[switch::task]
+async fn panics_when_polled() {
+    panic_any(88usize)
 }
 
 #[test]

@@ -8,10 +8,6 @@ use std::task::{Context, Poll, Waker};
 
 use switch::{Runtime, StoredWaker};
 
-#[macro_use]
-#[path = "../tests/support/task_macro.rs"]
-mod task_macro;
-
 struct Ready;
 impl Future for Ready {
     type Output = ();
@@ -36,16 +32,14 @@ impl Future for YieldN {
     }
 }
 
-task! {
-    fn ready() -> impl Future<Output = ()> {
-        Ready
-    }
+#[switch::task]
+fn ready() -> impl Future<Output = ()> {
+    Ready
 }
 
-task! {
-    fn yield_n(n: u32) -> impl Future<Output = ()> {
-        YieldN(n)
-    }
+#[switch::task]
+fn yield_n(n: u32) -> impl Future<Output = ()> {
+    YieldN(n)
 }
 
 fn bench_spawn_ready(c: &mut Criterion) {
@@ -137,10 +131,9 @@ fn bench_pure_yield(c: &mut Criterion) {
         }
     }
 
-    task! {
-        fn yield_forever(stop: Rc<Cell<bool>>) -> impl Future<Output = ()> {
-            YieldForever { stop }
-        }
+    #[switch::task]
+    fn yield_forever(stop: Rc<Cell<bool>>) -> impl Future<Output = ()> {
+        YieldForever { stop }
     }
 
     let stop = Rc::new(Cell::new(false));
@@ -174,10 +167,9 @@ impl Future for Publish {
     }
 }
 
-task! {
-    fn publish(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
-        Publish(slot)
-    }
+#[switch::task]
+fn publish(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
+    Publish(slot)
 }
 
 /// Spawn `n` parked tasks, poll them once, and return their wakers in spawn order.
@@ -207,10 +199,9 @@ impl Future for PublishStored {
     }
 }
 
-task! {
-    fn publish_stored(slot: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
-        PublishStored(slot)
-    }
+#[switch::task]
+fn publish_stored(slot: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
+    PublishStored(slot)
 }
 
 /// Wake an already-parked task, then poll it: through its std `Waker`, and
@@ -262,11 +253,9 @@ impl Future for Wide {
     }
 }
 
-task! {
-    capacity = 128;
-    fn wide(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
-        Wide(Publish(slot), [0; 30_000])
-    }
+#[switch::task(capacity = 128)]
+fn wide(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
+    Wide(Publish(slot), [0; 30_000])
 }
 
 /// Spawn `n` parked `wide` tasks, poll them once, and return their wakers.

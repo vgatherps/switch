@@ -3,21 +3,15 @@
 use std::collections::VecDeque;
 use switch::{Runtime, Spawner};
 
-#[macro_use]
-#[path = "../tests/support/task_macro.rs"]
-mod task_macro;
-
-task! {
-    async fn print_event(event: &'static str) {
-        println!("{event}");
-    }
+#[switch::task]
+async fn print_event(event: &'static str) {
+    println!("{event}");
 }
 
-task! {
-    async fn print_after_sleep(spawner: Spawner) {
-        spawner.sleep(10).unwrap().await.unwrap();
-        println!("deadline reached");
-    }
+#[switch::task]
+async fn print_after_sleep(spawner: Spawner) {
+    spawner.sleep(10).unwrap().await.unwrap();
+    println!("deadline reached");
 }
 
 struct EventQueue {
