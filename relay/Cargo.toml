@@ -1,0 +1,17 @@
+[package]
+name = "relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Client-role frame masks (RFC 6455 §5.3): per-connection CSPRNG.
+rand = "0.10"
+
+[dev-dependencies]
+tungstenite.workspace = true
+trybuild = "1.0"
+
+[lints]
+workspace = true
