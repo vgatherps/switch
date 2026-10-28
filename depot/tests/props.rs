@@ -1,12 +1,37 @@
 //! Property-based tests using QuickCheck.
 
-use depot::{DepotHandle, fixed_depot_type};
+use depot::{DepotHandle, DynDepot, FreeError, fixed_depot_type};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 
 type TestDepot = fixed_depot_type!(4096);
 type OrderDepot = fixed_depot_type!(128);
+
+trait OrderModelDepot {
+    fn alloc(&mut self) -> Option<DepotHandle>;
+    fn free(&mut self, handle: DepotHandle) -> Result<(), FreeError>;
+}
+
+impl OrderModelDepot for OrderDepot {
+    fn alloc(&mut self) -> Option<DepotHandle> {
+        OrderDepot::alloc(self)
+    }
+
+    fn free(&mut self, handle: DepotHandle) -> Result<(), FreeError> {
+        OrderDepot::free(self, handle)
+    }
+}
+
+impl OrderModelDepot for DynDepot {
+    fn alloc(&mut self) -> Option<DepotHandle> {
+        DynDepot::alloc(self)
+    }
+
+    fn free(&mut self, handle: DepotHandle) -> Result<(), FreeError> {
+        DynDepot::free(self, handle)
+    }
+}
 
 /// Operations that can be performed on the allocator.
 #[derive(Debug, Clone)]
@@ -43,14 +68,15 @@ impl Arbitrary for AllocationPhases {
 }
 
 /// Allocation order is the ring, then the lowest recycled slot, then the next fresh slot.
-#[quickcheck]
-fn alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
-    let mut alloc = OrderDepot::new();
+fn alloc_order_matches_reference_model_for(
+    mut alloc: impl OrderModelDepot,
+    capacity: u32,
+    phases: AllocationPhases,
+) -> bool {
     let mut live = Vec::new();
     let mut ring = VecDeque::with_capacity(16);
     let mut recycled = BTreeSet::new();
     let mut max_ever = 0u32;
-    let capacity = <OrderDepot as depot::HasSlots>::SLOTS as u32 - 1;
 
     for (is_alloc, count) in phases.0 {
         for _ in 0..count {
@@ -89,6 +115,36 @@ fn alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
     true
 }
 
+#[quickcheck]
+fn alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
+    alloc_order_matches_reference_model_for(
+        OrderDepot::new(),
+        <OrderDepot as depot::HasSlots>::SLOTS as u32 - 1,
+        phases,
+    )
+}
+
+#[quickcheck]
+fn dyn_64_alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
+    alloc_order_matches_reference_model_for(DynDepot::new(64), 63, phases)
+}
+
+#[quickcheck]
+fn dyn_65_alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
+    alloc_order_matches_reference_model_for(DynDepot::new(65), 127, phases)
+}
+
+#[quickcheck]
+fn dyn_4096_alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
+    alloc_order_matches_reference_model_for(DynDepot::new(4096), 4095, phases)
+}
+
+#[quickcheck]
+fn dyn_large_alloc_order_matches_reference_model(phases: AllocationPhases) -> bool {
+    const SLOTS: u32 = 1 << 20;
+    alloc_order_matches_reference_model_for(DynDepot::new(SLOTS as usize), SLOTS - 1, phases)
+}
+
 /// No index is ever returned twice without being freed in between.
 #[quickcheck]
 fn no_double_alloc(ops: Vec<Op>) -> bool {
@@ -99,9 +155,10 @@ fn no_double_alloc(ops: Vec<Op>) -> bool {
         match op {
             Op::Alloc => {
                 if let Some(idx) = alloc.alloc()
-                    && !live.insert(idx) {
-                        return false; // Double allocation!
-                    }
+                    && !live.insert(idx)
+                {
+                    return false; // Double allocation!
+                }
             }
             Op::Free(i) => {
                 if !live.is_empty() {
@@ -121,9 +178,10 @@ fn handle_encoding_valid(count: u8) -> bool {
     let mut alloc = TestDepot::new();
     for _ in 0..count {
         if let Some(handle) = alloc.alloc()
-            && handle.slot() >= (1 << 25) {
-                return false;
-            }
+            && handle.slot() >= (1 << 25)
+        {
+            return false;
+        }
     }
     true
 }

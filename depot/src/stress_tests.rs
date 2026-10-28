@@ -43,6 +43,7 @@ fn stress_heap(numbers: &[u32], check_freq: usize) {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn stress_1k() {
     let mut rng = SmallRng::seed_from_u64(42);
     let numbers: Vec<u32> = (0..1000).map(|_| rng.r#gen_range(0..500)).collect();
@@ -50,6 +51,7 @@ fn stress_1k() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn stress_10k() {
     let mut rng = SmallRng::seed_from_u64(42);
     let numbers: Vec<u32> = (0..10_000).map(|_| rng.r#gen_range(0..5000)).collect();
@@ -57,6 +59,7 @@ fn stress_10k() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn stress_64k() {
     let mut rng = SmallRng::seed_from_u64(42);
     let numbers: Vec<u32> = (0..65_536).map(|_| rng.r#gen_range(0..30000)).collect();
@@ -65,6 +68,7 @@ fn stress_64k() {
 
 #[test]
 #[cfg(debug_assertions)]
+#[cfg_attr(miri, ignore)]
 fn stress_64k_paranoid() {
     let mut rng = SmallRng::seed_from_u64(42);
     let numbers: Vec<u32> = (0..65_536).map(|_| rng.r#gen_range(0..30000)).collect();
