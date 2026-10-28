@@ -5,202 +5,16 @@
 // ring's assembly cannot run under Miri, and sheath itself has no unsafe code.
 #![cfg(not(miri))]
 
-use std::io::Write;
+mod common;
+
 use std::ops::Range;
-use std::sync::{Arc, LazyLock};
 
-use rustls::client::UnbufferedClientConnection;
+use common::*;
 use rustls::crypto::cipher::{MessageEncrypter, OutboundChunks, OutboundPlainMessage};
-use rustls::crypto::ring::default_provider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
-use rustls::version::TLS13;
 use rustls::{
-    AlertDescription, ClientConfig, ConnectionTrafficSecrets, ContentType, ProtocolVersion,
-    RootCertStore, ServerConfig, ServerConnection, SupportedCipherSuite,
+    AlertDescription, ConnectionTrafficSecrets, ContentType, ProtocolVersion, SupportedCipherSuite,
 };
-use sheath::{Error, RxFrame, TlsRx};
-
-const HOST: &str = "sheath.test";
-
-struct VecFrame {
-    data: Vec<u8>,
-    stamp: u64,
-}
-
-impl RxFrame for VecFrame {
-    fn payload(&self) -> &[u8] {
-        &self.data
-    }
-
-    fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
-    fn rx_timestamp(&self) -> u64 {
-        self.stamp
-    }
-}
-
-fn configs(max_fragment_size: Option<usize>) -> (Arc<ClientConfig>, Arc<ServerConfig>) {
-    static CERT: LazyLock<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> =
-        LazyLock::new(|| {
-            let rcgen::CertifiedKey { cert, signing_key } =
-                rcgen::generate_simple_self_signed(vec![HOST.to_owned()]).unwrap();
-            (
-                cert.der().clone(),
-                PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
-            )
-        });
-    let (cert, key) = &*CERT;
-
-    let provider = Arc::new(default_provider());
-    let mut server = ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.clone()], PrivateKeyDer::Pkcs8(key.clone_key()))
-        .unwrap();
-    server.max_fragment_size = max_fragment_size;
-    // lets `Sealer` take over the server's sending side
-    server.enable_secret_extraction = true;
-
-    let mut roots = RootCertStore::empty();
-    roots.add(cert.clone()).unwrap();
-    let client = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    (Arc::new(client), Arc::new(server))
-}
-
-struct Peer {
-    client: UnbufferedClientConnection,
-    server: ServerConnection,
-}
-
-/// Completes the handshake. The server's records sent after it (session tickets) stay queued
-/// for the stream under test.
-fn connect(max_fragment_size: Option<usize>) -> Peer {
-    enum Next {
-        Continue,
-        Blocked,
-        Done,
-    }
-
-    let (client_config, server_config) = configs(max_fragment_size);
-    let mut client =
-        UnbufferedClientConnection::new(client_config, ServerName::try_from(HOST).unwrap())
-            .unwrap();
-    let mut server = ServerConnection::new(server_config).unwrap();
-    let mut to_client = Vec::new();
-    loop {
-        let UnbufferedStatus { discard, state } = client.process_tls_records(&mut to_client);
-        let next = match state.unwrap() {
-            ConnectionState::EncodeTlsData(mut data) => {
-                let mut buf = vec![0; 1 << 15];
-                let len = data.encode(&mut buf).unwrap();
-                let mut tls = &buf[..len];
-                while !tls.is_empty() {
-                    server.read_tls(&mut tls).unwrap();
-                }
-                Next::Continue
-            }
-            ConnectionState::TransmitTlsData(data) => {
-                data.done();
-                server.process_new_packets().unwrap();
-                Next::Continue
-            }
-            ConnectionState::BlockedHandshake => Next::Blocked,
-            ConnectionState::WriteTraffic(_) => Next::Done,
-            state => panic!("unexpected client state {state:?}"),
-        };
-        to_client.drain(..discard);
-        match next {
-            Next::Continue => {}
-            Next::Blocked => {
-                assert!(server.wants_write(), "handshake stalled");
-                while server.wants_write() {
-                    server.write_tls(&mut to_client).unwrap();
-                }
-            }
-            Next::Done => break,
-        }
-    }
-    assert!(to_client.is_empty());
-    assert!(!server.is_handshaking());
-    Peer { client, server }
-}
-
-/// Server-to-client bytes and the application data records among them.
-#[derive(Default)]
-struct Stream {
-    bytes: Vec<u8>,
-    records: Vec<Sent>,
-}
-
-struct Sent {
-    wire: Range<usize>,
-    plaintext: Vec<u8>,
-}
-
-impl Peer {
-    /// Moves the server's queued records (tickets, key updates, alerts) to the stream.
-    fn flush(&mut self, stream: &mut Stream) {
-        while self.server.wants_write() {
-            self.server.write_tls(&mut stream.bytes).unwrap();
-        }
-    }
-
-    fn send(&mut self, stream: &mut Stream, msg: &[u8]) {
-        self.flush(stream);
-        let at = stream.bytes.len();
-        self.server.writer().write_all(msg).unwrap();
-        self.flush(stream);
-
-        // TLS 1.3 records carry 1 B of content type and 16 B of tag; rustls adds no padding
-        let mut sent = 0;
-        for wire in records(&stream.bytes[at..]) {
-            let len = wire.len() - 5 - 17;
-            stream.records.push(Sent {
-                wire: at + wire.start..at + wire.end,
-                plaintext: msg[sent..sent + len].to_vec(),
-            });
-            sent += len;
-        }
-        assert_eq!(sent, msg.len());
-    }
-
-    fn close_notify(&mut self, stream: &mut Stream) {
-        self.server.send_close_notify();
-        self.flush(stream);
-    }
-
-    /// Makes the server send a fatal decode_error alert.
-    fn fatal_alert(&mut self, stream: &mut Stream) {
-        self.server.read_tls(&mut &[0xff; 5][..]).unwrap();
-        assert!(self.server.process_new_packets().is_err());
-        self.flush(stream);
-    }
-}
-
-/// Wire ranges of the records in `bytes`, which holds whole records.
-fn records(bytes: &[u8]) -> Vec<Range<usize>> {
-    let mut at = 0;
-    let mut out = Vec::new();
-    while at < bytes.len() {
-        let end = at + 5 + usize::from(u16::from_be_bytes([bytes[at + 3], bytes[at + 4]]));
-        out.push(at..end);
-        at = end;
-    }
-    assert_eq!(at, bytes.len());
-    out
-}
-
-fn message(seed: usize, len: usize) -> Vec<u8> {
-    (0..len).map(|i| (seed * 31 + i * 7) as u8).collect()
-}
+use sheath::{Error, TlsRx, TlsTx};
 
 /// Tickets, application data of several sizes, a key update, more data, close_notify.
 fn standard(peer: &mut Peer) -> Stream {
@@ -216,108 +30,6 @@ fn standard(peer: &mut Peer) -> Stream {
     stream
 }
 
-#[derive(Debug, PartialEq)]
-struct Got {
-    plaintext: Vec<u8>,
-    stamp: u64,
-    place: Place,
-}
-
-/// Where a record's plaintext was found.
-#[derive(Debug, PartialEq)]
-enum Place {
-    /// Inside frame `index` at `offset`.
-    Frame { index: usize, offset: usize },
-    /// Outside every frame (the scratch buffer).
-    Elsewhere(usize),
-}
-
-struct Received {
-    got: Vec<Got>,
-    error: Option<Error>,
-    rx: TlsRx<VecFrame>,
-}
-
-/// Pushes `frames` (frame `i` stamped `i`) and collects every chunk until the first error.
-fn receive(client: &mut UnbufferedClientConnection, frames: Vec<Vec<u8>>) -> Received {
-    let ranges: Vec<Range<usize>> = frames
-        .iter()
-        .map(|f| {
-            let r = f.as_ptr_range();
-            r.start as usize..r.end as usize
-        })
-        .collect();
-    let mut rx = TlsRx::new(client);
-    let mut got = Vec::new();
-    for (index, data) in frames.into_iter().enumerate() {
-        rx.push(VecFrame {
-            data,
-            stamp: index as u64,
-        });
-        loop {
-            match rx.chunk(client) {
-                Ok(Some(chunk)) => {
-                    let ptr = chunk.bytes.as_ptr() as usize;
-                    let place = match ranges.iter().position(|r| r.contains(&ptr)) {
-                        Some(index) => Place::Frame {
-                            index,
-                            offset: ptr - ranges[index].start,
-                        },
-                        None => Place::Elsewhere(ptr),
-                    };
-                    got.push(Got {
-                        plaintext: chunk.bytes.to_vec(),
-                        stamp: chunk.rx_timestamp,
-                        place,
-                    });
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    return Received {
-                        got,
-                        error: Some(error),
-                        rx,
-                    };
-                }
-            }
-        }
-    }
-    Received {
-        got,
-        error: None,
-        rx,
-    }
-}
-
-fn split(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
-    let mut bounds = vec![0];
-    bounds.extend_from_slice(cuts);
-    bounds.push(bytes.len());
-    bounds
-        .windows(2)
-        .map(|w| bytes[w[0]..w[1]].to_vec())
-        .collect()
-}
-
-/// `got` must be `records` in order, each stamped with the index of the frame holding its first
-/// byte, and found in that frame right after its header unless it straddles frames.
-fn assert_received(got: &[Got], records: &[Sent], cuts: &[usize]) {
-    assert_eq!(got.len(), records.len(), "cuts {cuts:?}");
-    for (got, sent) in got.iter().zip(records) {
-        let index = cuts.iter().filter(|&&c| c <= sent.wire.start).count();
-        let start = if index == 0 { 0 } else { cuts[index - 1] };
-        let end = cuts.get(index).copied().unwrap_or(usize::MAX);
-        assert_eq!(got.plaintext, sent.plaintext, "cuts {cuts:?}");
-        assert_eq!(got.stamp, index as u64, "cuts {cuts:?}");
-        if sent.wire.end <= end {
-            let offset = sent.wire.start - start + 5;
-            assert_eq!(got.place, Place::Frame { index, offset }, "cuts {cuts:?}");
-        } else {
-            assert!(matches!(got.place, Place::Elsewhere(_)), "cuts {cuts:?}");
-        }
-    }
-}
-
 /// Builds a stream with `build` on a fresh connection, cuts it at `cuts(stream)`, and checks
 /// every record and the clean close.
 fn check(
@@ -328,7 +40,7 @@ fn check(
     let mut peer = connect(max_fragment_size);
     let stream = build(&mut peer);
     let cuts = cuts(&stream);
-    let mut received = receive(&mut peer.client, split(&stream.bytes, &cuts));
+    let mut received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
     assert_eq!(received.error, None, "cuts {cuts:?}");
     assert_received(&received.got, &stream.records, &cuts);
     assert!(received.rx.eof(), "cuts {cuts:?}");
@@ -447,7 +159,7 @@ fn scratch_buffer_is_reused() {
     let mut peer = connect(None);
     let stream = max_size(&mut peer);
     let cuts: Vec<usize> = stream.records.iter().map(|r| r.wire.start + 100).collect();
-    let received = receive(&mut peer.client, split(&stream.bytes, &cuts));
+    let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
     assert_received(&received.got, &stream.records, &cuts);
     let [first, second] = &received.got[..] else {
         panic!("two records");
@@ -469,11 +181,11 @@ fn bad_tag_is_rejected_without_releasing_plaintext() {
             vec![]
         };
 
-        let mut received = receive(&mut peer.client, split(&stream.bytes, &cuts));
+        let mut received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
         assert_received(&received.got, &stream.records[..2], &cuts);
         let error = Some(Error::Tls(rustls::Error::DecryptError));
         assert_eq!(received.error, error);
-        assert_eq!(received.rx.chunk(&mut peer.client).err(), error);
+        assert_eq!(received.rx.chunk(&mut peer.tx).err(), error);
         assert_eq!(received.rx.fin().err(), error);
     }
 }
@@ -485,7 +197,7 @@ fn fatal_alert_is_an_error() {
     peer.send(&mut stream, b"hello");
     peer.fatal_alert(&mut stream);
 
-    let received = receive(&mut peer.client, vec![stream.bytes]);
+    let received = receive(&mut peer.tx, vec![stream.bytes]);
     assert_eq!(received.got.len(), 1);
     assert_eq!(received.got[0].plaintext, b"hello");
     assert_eq!(
@@ -507,7 +219,7 @@ fn bytes_after_close_notify_are_ignored() {
         .bytes
         .extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x10]);
 
-    let mut received = receive(&mut peer.client, split(&stream.bytes, &[after + 2]));
+    let mut received = receive(&mut peer.tx, split(&stream.bytes, &[after + 2]));
     assert_eq!(received.error, None);
     assert_eq!(received.got.len(), 1);
     assert!(received.rx.eof());
@@ -516,7 +228,7 @@ fn bytes_after_close_notify_are_ignored() {
         data: b"ignored".to_vec(),
         stamp: 9,
     });
-    assert!(received.rx.chunk(&mut peer.client).unwrap().is_none());
+    assert!(received.rx.chunk(&mut peer.tx).unwrap().is_none());
     assert_eq!(received.rx.fin(), Ok(()));
 }
 
@@ -533,13 +245,13 @@ fn fin_without_close_notify_is_truncation() {
             stream.records[0].wire.end
         };
 
-        let mut received = receive(&mut peer.client, vec![stream.bytes[..end].to_vec()]);
+        let mut received = receive(&mut peer.tx, vec![stream.bytes[..end].to_vec()]);
         assert_eq!(received.error, None);
         assert_eq!(received.got.len(), 1);
         assert!(!received.rx.eof());
         assert_eq!(received.rx.fin(), Err(Error::Truncated));
         assert_eq!(
-            received.rx.chunk(&mut peer.client).err(),
+            received.rx.chunk(&mut peer.tx).err(),
             Some(Error::Truncated)
         );
     }
@@ -551,26 +263,16 @@ fn push_before_chunk_drained_panics() {
     let mut peer = connect(None);
     let mut stream = Stream::default();
     peer.send(&mut stream, b"hello");
-    let mut rx = TlsRx::new(&peer.client);
+    let mut rx = TlsRx::new();
     rx.push(VecFrame {
         data: stream.bytes,
         stamp: 0,
     });
-    assert!(rx.chunk(&mut peer.client).unwrap().is_some());
+    assert!(rx.chunk(&mut peer.tx).unwrap().is_some());
     rx.push(VecFrame {
         data: vec![],
         stamp: 1,
     });
-}
-
-#[test]
-#[should_panic(expected = "handshake is complete")]
-fn new_needs_completed_handshake() {
-    let (client_config, _) = configs(None);
-    let client =
-        UnbufferedClientConnection::new(client_config, ServerName::try_from(HOST).unwrap())
-            .unwrap();
-    TlsRx::<VecFrame>::new(&client);
 }
 
 /// The length in a record header is checked against the TLS 1.3 bound of 2^14 + 256 bytes as
@@ -600,7 +302,7 @@ fn record_length_is_bounded_at_its_header() {
                     vec![at + header_cut]
                 };
 
-                let received = receive(&mut peer.client, split(&stream.bytes, &cuts));
+                let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
                 assert_received(&received.got, &stream.records, &cuts);
                 // a body of zeros fails authentication once it is all there
                 let expected = (len > 16640 || with_body).then(|| Error::Tls(error.clone()));
@@ -619,7 +321,7 @@ struct Sealer {
 
 impl Sealer {
     /// Takes over the server's sending side once its queued records are in `stream`.
-    fn new(mut peer: Peer, stream: &mut Stream) -> (UnbufferedClientConnection, Self) {
+    fn new(mut peer: Peer, stream: &mut Stream) -> (TlsTx<TestTx>, Self) {
         peer.flush(stream);
         let Some(SupportedCipherSuite::Tls13(suite)) = peer.server.negotiated_cipher_suite() else {
             panic!("TLS 1.3 suite negotiated");
@@ -632,7 +334,7 @@ impl Sealer {
             _ => unreachable!("TLS 1.3 suites"),
         };
         let encrypter = suite.aead_alg.encrypter(key, iv);
-        (peer.client, Self { encrypter, seq })
+        (peer.tx, Self { encrypter, seq })
     }
 
     fn seal(&mut self, typ: ContentType, payload: &[u8], stream: &mut Stream) -> Range<usize> {
@@ -668,9 +370,9 @@ fn ticket(len: usize) -> Vec<u8> {
 /// `tickets` session tickets in 3000 B records, so every record ends inside a ticket and
 /// rustls must keep all of them until the last; then "hello" and close_notify. Returns the
 /// wire size of the ticket records, which rustls retains whole.
-fn chained_tickets(tickets: usize) -> (UnbufferedClientConnection, Stream, usize) {
+fn chained_tickets(tickets: usize) -> (TlsTx<TestTx>, Stream, usize) {
     let mut stream = Stream::default();
-    let (client, mut sealer) = Sealer::new(connect(None), &mut stream);
+    let (tx, mut sealer) = Sealer::new(connect(None), &mut stream);
     let chain: Vec<u8> = (0..tickets).flat_map(|_| ticket(4000)).collect();
     let at = stream.bytes.len();
     for record in chain.chunks(3000) {
@@ -683,7 +385,7 @@ fn chained_tickets(tickets: usize) -> (UnbufferedClientConnection, Stream, usize
         plaintext: b"hello".to_vec(),
     });
     sealer.seal(ContentType::Alert, &[1, 0], &mut stream);
-    (client, stream, retained)
+    (tx, stream, retained)
 }
 
 /// rustls keeps every record of a chain of handshake messages that never ends at a record
@@ -700,18 +402,18 @@ fn retained_handshake_records_are_bounded() {
             }
         };
 
-        let (mut client, stream, retained) = chained_tickets(10);
+        let (mut tx, stream, retained) = chained_tickets(10);
         assert!(retained < 0xffff);
         let cuts_below = cuts(&stream);
-        let mut received = receive(&mut client, split(&stream.bytes, &cuts_below));
+        let mut received = receive(&mut tx, split(&stream.bytes, &cuts_below));
         assert_eq!(received.error, None);
         assert_received(&received.got, &stream.records, &cuts_below);
         assert_eq!(received.rx.fin(), Ok(()));
 
-        let (mut client, stream, retained) = chained_tickets(20);
+        let (mut tx, stream, retained) = chained_tickets(20);
         assert!(retained > 0xffff);
         let cuts = cuts(&stream);
-        let received = receive(&mut client, split(&stream.bytes, &cuts));
+        let received = receive(&mut tx, split(&stream.bytes, &cuts));
         assert!(received.got.is_empty());
         assert_eq!(
             received.error,
