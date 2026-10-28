@@ -1,12 +1,16 @@
-//! Async sockets over one conduit `Stack`, receive side, for the `switch` runtime.
+//! Async sockets over one conduit `Stack`, for the `switch` runtime.
 //!
 //! The loop owner holds the [`Net`] and calls `net.turn(now)` (a `Stack::turn`,
 //! then a wake of every task parked on a socket that became ready), then polls
-//! the switch runtime. Tasks hold a [`NetHandle`], which opens sockets but
-//! cannot turn the stack, and await owned received frames. One task may wait
-//! per socket at a time (`recv` takes `&mut`). Futures here must be polled by
-//! switch tasks: parking stores a `switch::StoredWaker`.
+//! the switch runtime. Tasks hold a [`NetHandle`], which opens sockets and
+//! hands out TX frames but cannot turn the stack. Futures here must be polled
+//! by switch tasks: parking stores a `switch::StoredWaker`.
 //! Everything is single-threaded (`Rc`), so no type here is `Send`.
+//!
+//! Each socket splits into a receive half and a send half; each half has at
+//! most one waiting task (its futures take `&mut`). Sending never hands a
+//! frame to a future: [`TcpTx::room`] waits until a frame of a given length
+//! fits, then [`TcpTx::try_send`] queues it synchronously or returns it.
 //!
 //! Received frames ([`TcpFrame`], [`Datagram`]) do not hold the Net: like
 //! conduit's frames they stay valid after their socket, the Net and the Stack
@@ -17,11 +21,14 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+pub use dpdk_smoltcp::smoltcp::phy::TxFrame;
 pub use dpdk_smoltcp::smoltcp::socket::tcp;
-pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError};
+pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendError, SendFrameError};
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
-pub use dpdk_smoltcp::{AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig};
+pub use dpdk_smoltcp::{
+    AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
+};
 use dpdk_smoltcp::{TcpHandle, UdpHandle};
 use switch::StoredWaker;
 
@@ -38,43 +45,71 @@ enum Socket {
     Udp(UdpHandle),
 }
 
+/// Index of an entry's receive-side (recv, connect, accept) and send-side
+/// (room) parked task.
+const RX: usize = 0;
+const TX: usize = 1;
+
 #[derive(Clone, Copy)]
 enum Interest {
     Connect,
     Accept,
     TcpRecv,
     UdpRecv,
+    /// Room for one frame of this many bytes.
+    TcpRoom(u32),
+}
+
+impl Interest {
+    fn side(self) -> usize {
+        match self {
+            Interest::TcpRoom(_) => TX,
+            _ => RX,
+        }
+    }
 }
 
 struct Entry {
     socket: Option<Socket>,
-    parked: Option<(StoredWaker, Interest)>,
-    /// In `Inner::listed`.
-    listed: bool,
+    parked: [Option<(StoredWaker, Interest)>; 2],
+    /// Live halves; the socket drops with the last.
+    halves: u8,
+    /// Each side is in `Inner::listed`.
+    listed: [bool; 2],
 }
 
 struct Inner {
     stack: Stack,
     entries: Vec<Entry>,
     free: Vec<u32>,
-    /// Entries parked since the last turn; may hold entries since unparked.
-    listed: Vec<u32>,
+    /// Per side, entries parked since the last turn; may hold entries since
+    /// unparked.
+    listed: [Vec<u32>; 2],
+    /// Tasks waiting for a TX frame; each listed once.
+    frame_waiters: Vec<StoredWaker>,
     ingress_budget: usize,
 }
 
 impl Inner {
     fn insert(&mut self, socket: Socket) -> u32 {
         let index = self.free.pop().expect("more sockets than the Stack holds");
-        self.entries[index as usize].socket = Some(socket);
+        let entry = &mut self.entries[index as usize];
+        entry.socket = Some(socket);
+        entry.halves = 2;
         index
     }
 
-    /// Clears the parked handle, removes the entry and returns its socket.
-    /// The index is free at once: if it is still listed, the next scan
-    /// unlists it, or checks the socket that reused it.
-    fn remove(&mut self, index: u32) -> Option<Socket> {
+    /// Drops one half: clears its parked handle; with the last half, removes
+    /// the entry and returns its socket. The index is free at once: if it is
+    /// still listed, the next scan unlists it, or checks the socket that
+    /// reused it.
+    fn release(&mut self, index: u32, side: usize) -> Option<Socket> {
         let entry = &mut self.entries[index as usize];
-        entry.parked = None;
+        entry.parked[side] = None;
+        entry.halves -= 1;
+        if entry.halves != 0 {
+            return None;
+        }
         self.free.push(index);
         entry.socket.take()
     }
@@ -99,46 +134,63 @@ impl Inner {
         // A stale handle is harmless: switch never frees task blocks, and a
         // wake of a finished task does nothing.
         let waker = StoredWaker::new(cx);
+        let side = interest.side();
         let entry = &mut self.entries[index as usize];
-        entry.parked = Some((waker, interest));
-        if !entry.listed {
-            entry.listed = true;
-            self.listed.push(index);
+        entry.parked[side] = Some((waker, interest));
+        if !entry.listed[side] {
+            entry.listed[side] = true;
+            self.listed[side].push(index);
         }
     }
 
-    fn unpark(&mut self, index: u32) {
-        self.entries[index as usize].parked = None;
+    fn unpark(&mut self, index: u32, side: usize) {
+        self.entries[index as usize].parked[side] = None;
     }
 }
 
-/// Wakes every listed task whose socket is ready; unlists woken, unparked and
-/// removed entries. Takes the fields, not `&mut Inner`, so the loop keeps
-/// `entries` and `listed` in registers across the out-of-line
-/// `Stack::udp`/`Stack::tcp` calls.
+/// Wakes every task parked on `SIDE` whose socket is ready; unlists woken,
+/// unparked and removed entries. Takes the fields, not `&mut Inner`, so the
+/// loop keeps `entries` and `listed` in registers across the out-of-line
+/// `Stack::udp`/`Stack::tcp` calls. One list per side keeps the receive loop
+/// as cheap as with one slot per entry.
 #[inline(never)]
-fn wake_ready(stack: &Stack, entries: &mut [Entry], listed: &mut Vec<u32>) {
+fn wake_ready<const SIDE: usize>(stack: &Stack, entries: &mut [Entry], listed: &mut Vec<u32>) {
     let mut at = 0;
     while at < listed.len() {
         let entry = &mut entries[listed[at] as usize];
-        if let (Some(socket), Some((waker, interest))) = (&entry.socket, entry.parked) {
+        if let (Some(socket), Some((waker, interest))) = (&entry.socket, entry.parked[SIDE]) {
             if !ready(stack, socket, interest) {
                 at += 1;
                 continue;
             }
-            entry.parked = None;
+            entry.parked[SIDE] = None;
             waker.wake();
         }
-        entry.listed = false;
+        entry.listed[SIDE] = false;
         listed.swap_remove(at);
     }
 }
 
+/// Wakes every task waiting for a TX frame if the pool has one. The probe
+/// frame goes straight back to the pool.
+#[inline(never)]
+fn wake_frame_waiters(stack: &mut Stack, waiters: &mut Vec<StoredWaker>) {
+    if stack.tx_frame().is_some() {
+        for waker in waiters.drain(..) {
+            waker.wake();
+        }
+    }
+}
+
+/// Inlined into both `wake_ready` instances: out of line it costs a call per
+/// parked socket per turn.
+#[inline(always)]
 fn ready(stack: &Stack, socket: &Socket, interest: Interest) -> bool {
     match (socket, interest) {
         (Socket::Tcp(handle), Interest::Connect) => !connecting(stack.tcp(handle).state()),
         (Socket::Tcp(handle), Interest::Accept) => !accepting(stack.tcp(handle).state()),
         (Socket::Tcp(handle), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
+        (Socket::Tcp(handle), Interest::TcpRoom(len)) => tcp_room_ready(stack.tcp(handle), len as usize),
         (Socket::Udp(handle), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
         _ => unreachable!("interest does not match socket kind"),
     }
@@ -147,6 +199,14 @@ fn ready(stack: &Stack, socket: &Socket, interest: Interest) -> bool {
 /// Whether TCP `recv` returns something other than `Ok(None)`.
 fn tcp_recv_ready(socket: &tcp::Socket<'_>) -> bool {
     socket.can_recv() || !socket.may_recv()
+}
+
+/// Whether `room(len)` resolves: the socket can no longer send, or a frame of
+/// `len` bytes fits (`send_frame` refuses with `Full` when it exceeds the free
+/// bytes or no frame slot is free; `frame_send_room` is 0 without a slot).
+fn tcp_room_ready(socket: &tcp::Socket<'_>, len: usize) -> bool {
+    !socket.may_send()
+        || (socket.send_capacity() - socket.send_queue() >= len && socket.frame_send_room() != 0)
 }
 
 /// SynSent, or SynReceived after a simultaneous open.
@@ -171,12 +231,14 @@ impl Net {
     /// Sizes the registry once for every socket `stack` can hold.
     pub fn new(stack: Stack, config: NetConfig) -> Net {
         let slots = stack.max_sockets() + stack.max_udp_sockets();
-        let entries = (0..slots).map(|_| Entry { socket: None, parked: None, listed: false }).collect();
+        let entries =
+            (0..slots).map(|_| Entry { socket: None, parked: [None; 2], halves: 0, listed: [false; 2] }).collect();
         let inner = Inner {
             stack,
             entries,
             free: (0..slots as u32).rev().collect(),
-            listed: Vec::with_capacity(slots),
+            listed: [Vec::with_capacity(slots), Vec::with_capacity(slots)],
+            frame_waiters: Vec::new(),
             ingress_budget: config.ingress_budget,
         };
         Net { shared: Rc::new(RefCell::new(inner)) }
@@ -187,15 +249,22 @@ impl Net {
     }
 
     /// `Stack::turn` at `now`, then wakes every task parked on a socket that
-    /// became ready, also when the turn returns an error (egress can fail
-    /// after ingress queued data). After a panic out of `turn`, drop the Net.
+    /// became ready, and every task waiting for a TX frame if the pool has
+    /// one, also when the turn returns an error (egress can fail after
+    /// ingress queued data). After a panic out of `turn`, drop the Net.
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut inner = self.shared.borrow_mut();
-        let Inner { stack, entries, listed, ingress_budget, .. } = &mut *inner;
+        let Inner { stack, entries, listed: [rx, tx], frame_waiters, ingress_budget, .. } = &mut *inner;
         let turn = stack.turn(now, *ingress_budget);
-        if !listed.is_empty() {
-            wake_ready(stack, entries, listed);
+        if !rx.is_empty() {
+            wake_ready::<RX>(stack, entries, rx);
+        }
+        if !tx.is_empty() {
+            wake_ready::<TX>(stack, entries, tx);
+        }
+        if !frame_waiters.is_empty() {
+            wake_frame_waiters(stack, frame_waiters);
         }
         turn
     }
@@ -206,7 +275,7 @@ impl Net {
     }
 
     /// The Stack back, for teardown. `Err(self)` while any `NetHandle` or
-    /// socket is alive. Frames may still be held: they outlive the Stack.
+    /// socket half is alive. Frames may still be held: they outlive the Stack.
     pub fn into_stack(self) -> Result<Stack, Net> {
         match Rc::try_unwrap(self.shared) {
             Ok(cell) => Ok(cell.into_inner().stack),
@@ -215,7 +284,7 @@ impl Net {
     }
 }
 
-/// Opens sockets on the Net's Stack; cannot turn it.
+/// Opens sockets on the Net's Stack and hands out TX frames; cannot turn it.
 #[derive(Clone)]
 pub struct NetHandle {
     shared: Shared,
@@ -264,14 +333,50 @@ impl NetHandle {
             return Err(error);
         }
         let index = inner.insert(Socket::Tcp(handle));
-        Ok(TcpStream { shared: self.shared.clone(), index })
+        Ok(TcpStream {
+            rx: TcpRx(Half { shared: self.shared.clone(), index, side: RX }),
+            tx: TcpTx(Half { shared: self.shared.clone(), index, side: TX }),
+        })
     }
 
     pub fn udp_bind(&self, config: UdpConfig) -> Result<UdpSocket, AddUdpError> {
         let mut inner = self.shared.borrow_mut();
         let handle = inner.stack.add_udp(config)?;
         let index = inner.insert(Socket::Udp(handle));
-        Ok(UdpSocket { shared: self.shared.clone(), index })
+        Ok(UdpSocket {
+            rx: UdpRx(Half { shared: self.shared.clone(), index, side: RX }),
+            tx: UdpTx(Half { shared: self.shared.clone(), index, side: TX }),
+        })
+    }
+
+    /// `Future<Output = TxFrame>`: an empty frame from the Stack's frame pool
+    /// (`capacity()` is the IP MTU − 28). While the pool is empty the task
+    /// waits; it is woken by the first `Net::turn` that finds a free frame,
+    /// and may wait again if another task took it first.
+    pub fn tx_frame(&self) -> TxFrameWait<'_> {
+        TxFrameWait { handle: self }
+    }
+}
+
+pub struct TxFrameWait<'a> {
+    handle: &'a NetHandle,
+}
+
+impl Future for TxFrameWait<'_> {
+    type Output = TxFrame;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TxFrame> {
+        let mut inner = self.handle.shared.borrow_mut();
+        if let Some(frame) = inner.stack.tx_frame() {
+            return Poll::Ready(frame);
+        }
+        // Stale handle harmless as in `Inner::park`; a dropped future's
+        // handle stays until the next free frame wakes it.
+        let waker = StoredWaker::new(cx);
+        if !inner.frame_waiters.contains(&waker) {
+            inner.frame_waiters.push(waker);
+        }
+        Poll::Pending
     }
 }
 
@@ -286,13 +391,28 @@ fn poll_op<R>(
     let mut inner = shared.borrow_mut();
     match op(&mut inner) {
         Some(out) => {
-            inner.unpark(index);
+            inner.unpark(index, interest.side());
             Poll::Ready(out)
         }
         None => {
             inner.park(index, interest, cx);
             Poll::Pending
         }
+    }
+}
+
+/// One half of a socket's entry. Dropping it clears the half's parked task;
+/// dropping the last half drops the conduit socket.
+struct Half {
+    shared: Shared,
+    index: u32,
+    side: usize,
+}
+
+impl Drop for Half {
+    fn drop(&mut self) {
+        let socket = self.shared.borrow_mut().release(self.index, self.side);
+        drop(socket);
     }
 }
 
@@ -313,9 +433,9 @@ impl Future for Connecting {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let stream = this.stream.as_ref().expect("Connecting polled after completion");
-        let index = stream.index;
-        let state = poll_op(&stream.shared, index, Interest::Connect, cx, |inner| {
+        let half = &this.stream.as_ref().expect("Connecting polled after completion").rx.0;
+        let index = half.index;
+        let state = poll_op(&half.shared, index, Interest::Connect, cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
             match socket.state() {
@@ -344,9 +464,9 @@ impl Future for Accepting {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TcpStream> {
         let this = self.get_mut();
-        let stream = this.stream.as_ref().expect("Accepting polled after completion");
-        let index = stream.index;
-        let state = poll_op(&stream.shared, index, Interest::Accept, cx, |inner| {
+        let half = &this.stream.as_ref().expect("Accepting polled after completion").rx.0;
+        let index = half.index;
+        let state = poll_op(&half.shared, index, Interest::Accept, cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             (!accepting(stack.tcp(handle).state())).then_some(())
         });
@@ -354,42 +474,50 @@ impl Future for Accepting {
     }
 }
 
-/// A connected TCP stream. Dropping it drops the conduit socket: Linux
-/// `close()` semantics.
+/// A connected TCP stream: a receive and a send half. Dropping both drops the
+/// conduit socket: Linux `close()` semantics.
 pub struct TcpStream {
-    shared: Shared,
-    index: u32,
+    rx: TcpRx,
+    tx: TcpTx,
 }
 
 impl TcpStream {
+    /// The halves; sending needs the `TcpTx` half.
+    pub fn split(self) -> (TcpRx, TcpTx) {
+        (self.rx, self.tx)
+    }
+
+    /// [`TcpRx::recv`].
+    pub fn recv(&mut self) -> Recv<'_> {
+        self.rx.recv()
+    }
+}
+
+/// The receive half of a TCP stream.
+pub struct TcpRx(Half);
+
+impl TcpRx {
     /// `Future<Output = Result<TcpFrame, RecvError>>`: the next in-order frame.
     /// In-order data already received is delivered first, also after a reset.
     /// Then: after an accepted FIN, conduit's `RecvError::Finished`, even if a
     /// reset followed it; after a reset without one, or in a state without
     /// receive, `RecvError::InvalidState`.
     pub fn recv(&mut self) -> Recv<'_> {
-        Recv { stream: self }
-    }
-}
-
-impl Drop for TcpStream {
-    fn drop(&mut self) {
-        let socket = self.shared.borrow_mut().remove(self.index);
-        drop(socket);
+        Recv { rx: self }
     }
 }
 
 pub struct Recv<'a> {
-    stream: &'a mut TcpStream,
+    rx: &'a mut TcpRx,
 }
 
 impl Future for Recv<'_> {
     type Output = Result<TcpFrame, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let stream = &*self.stream;
-        let index = stream.index;
-        poll_op(&stream.shared, index, Interest::TcpRecv, cx, |inner| {
+        let half = &self.rx.0;
+        let index = half.index;
+        poll_op(&half.shared, index, Interest::TcpRecv, cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             // `tcp_mut` marks the socket for egress; take it only to pop.
             if !tcp_recv_ready(stack.tcp(handle)) {
@@ -406,7 +534,68 @@ impl Future for Recv<'_> {
 
 impl Drop for Recv<'_> {
     fn drop(&mut self) {
-        self.stream.shared.borrow_mut().unpark(self.stream.index);
+        self.rx.0.shared.borrow_mut().unpark(self.rx.0.index, RX);
+    }
+}
+
+/// The send half of a TCP stream.
+pub struct TcpTx(Half);
+
+impl TcpTx {
+    /// `Future<Output = Result<(), SendError>>`: `Ok` once a frame of `len`
+    /// bytes fits (free bytes and a free frame slot), so `try_send` of such a
+    /// frame succeeds until the next turn; `Err(InvalidState)` once the
+    /// socket can no longer send (reset, closed, or after `shutdown`).
+    /// Panics if `len` exceeds the socket's send capacity: it would never fit.
+    pub fn room(&mut self, len: usize) -> Room<'_> {
+        Room { tx: self, len }
+    }
+
+    /// Queues `frame` (conduit `send_frame`); it leaves in a later turn. Every
+    /// error returns the same frame: `Full` when it does not fit now,
+    /// `InvalidState` when the socket cannot send, `Empty`, `Foreign`.
+    pub fn try_send(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
+        let mut inner = self.0.shared.borrow_mut();
+        let (stack, handle) = inner.tcp(self.0.index);
+        stack.tcp_send_frame(handle, frame)
+    }
+
+    /// Half-close: a FIN after the queued data. Receiving continues.
+    pub fn shutdown(&mut self) {
+        let mut inner = self.0.shared.borrow_mut();
+        let (stack, handle) = inner.tcp(self.0.index);
+        stack.tcp_mut(handle).close();
+    }
+}
+
+pub struct Room<'a> {
+    tx: &'a mut TcpTx,
+    len: usize,
+}
+
+impl Future for Room<'_> {
+    type Output = Result<(), SendError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (half, len) = (&self.tx.0, self.len);
+        let index = half.index;
+        let interest = Interest::TcpRoom(u32::try_from(len).expect("room length exceeds u32"));
+        poll_op(&half.shared, index, interest, cx, |inner| {
+            let (stack, handle) = inner.tcp(index);
+            let socket = stack.tcp(handle);
+            assert!(len <= socket.send_capacity(), "room({len}) exceeds the send capacity");
+            if !socket.may_send() {
+                Some(Err(SendError::InvalidState))
+            } else {
+                tcp_room_ready(socket, len).then_some(Ok(()))
+            }
+        })
+    }
+}
+
+impl Drop for Room<'_> {
+    fn drop(&mut self) {
+        self.tx.0.shared.borrow_mut().unpark(self.tx.0.index, TX);
     }
 }
 
@@ -429,37 +618,60 @@ impl TcpFrame {
     }
 }
 
-/// A bound UDP socket. Dropping it unbinds the port.
+/// A bound UDP socket: a receive and a send half. Dropping both unbinds the
+/// port.
 pub struct UdpSocket {
-    shared: Shared,
-    index: u32,
+    rx: UdpRx,
+    tx: UdpTx,
 }
 
 impl UdpSocket {
-    /// `Future<Output = Datagram>`: the next queued datagram.
+    /// The halves; sending needs the `UdpTx` half.
+    pub fn split(self) -> (UdpRx, UdpTx) {
+        (self.rx, self.tx)
+    }
+
+    /// [`UdpRx::recv`].
     pub fn recv(&mut self) -> UdpRecv<'_> {
-        UdpRecv { socket: self }
+        self.rx.recv()
     }
 }
 
-impl Drop for UdpSocket {
-    fn drop(&mut self) {
-        let socket = self.shared.borrow_mut().remove(self.index);
-        drop(socket);
+/// The receive half of a UDP socket.
+pub struct UdpRx(Half);
+
+impl UdpRx {
+    /// `Future<Output = Datagram>`: the next queued datagram.
+    pub fn recv(&mut self) -> UdpRecv<'_> {
+        UdpRecv { rx: self }
+    }
+}
+
+/// The send half of a UDP socket.
+pub struct UdpTx(Half);
+
+impl UdpTx {
+    /// Sends `frame` as one datagram (conduit `udp_send_frame`); `to` may be
+    /// `None` for a connected socket. Every error returns the same frame;
+    /// `WouldBlock` (TX queue full) clears after a turn.
+    pub fn send(&mut self, to: Option<IpEndpoint>, frame: TxFrame) -> Result<(), (TxFrame, UdpSendFrameError)> {
+        let mut inner = self.0.shared.borrow_mut();
+        let (stack, handle) = inner.udp(self.0.index);
+        stack.udp_send_frame(handle, to, frame)
     }
 }
 
 pub struct UdpRecv<'a> {
-    socket: &'a mut UdpSocket,
+    rx: &'a mut UdpRx,
 }
 
 impl Future for UdpRecv<'_> {
     type Output = Datagram;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Datagram> {
-        let socket = &*self.socket;
-        let index = socket.index;
-        poll_op(&socket.shared, index, Interest::UdpRecv, cx, |inner| {
+        let half = &self.rx.0;
+        let index = half.index;
+        poll_op(&half.shared, index, Interest::UdpRecv, cx, |inner| {
             let (stack, handle) = inner.udp(index);
             stack.udp_mut(handle).recv().map(Datagram)
         })
@@ -468,7 +680,7 @@ impl Future for UdpRecv<'_> {
 
 impl Drop for UdpRecv<'_> {
     fn drop(&mut self) {
-        self.socket.shared.borrow_mut().unpark(self.socket.index);
+        self.rx.0.shared.borrow_mut().unpark(self.rx.0.index, RX);
     }
 }
 

@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, StackConfig};
 use switch::Runtime;
-use switchnet::{tcp, Instant, IpEndpoint, Net, NetConfig, NetHandle, Stack};
+use switchnet::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
@@ -29,6 +29,7 @@ pub const UDP_QUEUE: usize = 8;
 /// Six full-MSS frames: the smallest TCP receive budget conduit admits.
 pub const RX_CAPACITY: usize = 6 * 1460;
 pub const PEER_PORT: u16 = 80;
+pub const LOCAL_PORT: u16 = 49152;
 
 pub fn tcp_config() -> tcp::Config {
     tcp::Config { rx_capacity: RX_CAPACITY, tx_capacity: 64 * 1024, mss_cap: None }
@@ -209,6 +210,53 @@ pub fn peer_listen(mixed: &mut Mixed) -> dpdk_smoltcp::TcpHandle {
     let handle = mixed.peer.add_tcp(tcp_config()).unwrap();
     mixed.peer.listen(&handle, PEER_PORT).unwrap();
     handle
+}
+
+pub fn local(port: u16) -> IpListenEndpoint {
+    IpListenEndpoint { addr: None, port }
+}
+
+pub fn udp_config(port: u16) -> UdpConfig {
+    UdpConfig { port, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
+}
+
+/// Net connects from `port` to the peer's listener in a task; drives until
+/// both ends are established.
+pub fn connect(mixed: &mut Mixed, port: u16) -> (TcpStream, dpdk_smoltcp::TcpHandle) {
+    connect_with(mixed, port, tcp_config())
+}
+
+/// `connect` with the Net socket's `config`.
+pub fn connect_with(mixed: &mut Mixed, port: u16, config: tcp::Config) -> (TcpStream, dpdk_smoltcp::TcpHandle) {
+    let peer = peer_listen(mixed);
+    let connecting = mixed.handle().tcp_connect(config, peer_endpoint(PEER_PORT), local(port)).unwrap();
+    let slot = mixed.spawn(connecting);
+    let stream = mixed.wait(&slot).unwrap();
+    mixed.until(|m| m.peer.tcp(&peer).state() == tcp::State::Established);
+    (stream, peer)
+}
+
+pub fn peer_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, data: &[u8]) {
+    assert_eq!(mixed.peer.tcp_mut(peer).send_slice(data), Ok(data.len()));
+}
+
+/// Peer sends `payload` to the Net's `port`, turning until the Net's MAC is resolved.
+pub fn peer_udp_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::UdpHandle, port: u16, payload: &[u8]) {
+    let to = Some(IpEndpoint::new(net_ip().into(), port));
+    mixed.until(|m| match m.peer.udp_send(peer, to, payload) {
+        Ok(()) => true,
+        Err(error) => {
+            assert_eq!(error, dpdk_smoltcp::UdpSendError::NeighborPending);
+            false
+        }
+    });
+}
+
+/// Every in-order byte the peer has received so far.
+pub fn peer_drain(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, into: &mut Vec<u8>) {
+    while let Ok(Some(frame)) = mixed.peer.tcp_mut(peer).recv() {
+        into.extend_from_slice(frame.payload());
+    }
 }
 
 /// A spawned task's output.

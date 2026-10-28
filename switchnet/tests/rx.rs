@@ -8,51 +8,15 @@ use std::rc::Rc;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use switchnet::tcp::State;
-use switchnet::{IpEndpoint, IpListenEndpoint, RecvError, StackError, TcpStream, UdpConfig};
+use switchnet::{IpEndpoint, RecvError, StackError, TcpStream};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
 mod support;
 use support::{
-    cancel_after_one_poll, counted, net_ip, peer_endpoint, peer_listen, tcp_config, Mixed, PEER_PORT, UDP_QUEUE,
+    cancel_after_one_poll, connect, counted, local, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send,
+    tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT,
 };
-
-const LOCAL_PORT: u16 = 49152;
-
-fn local(port: u16) -> IpListenEndpoint {
-    IpListenEndpoint { addr: None, port }
-}
-
-fn udp_config(port: u16) -> UdpConfig {
-    UdpConfig { port, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
-}
-
-/// Net connects from `port` to the peer's listener in a task; drives until
-/// both ends are established.
-fn connect(mixed: &mut Mixed, port: u16) -> (TcpStream, TcpHandle) {
-    let peer = peer_listen(mixed);
-    let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(port)).unwrap();
-    let slot = mixed.spawn(connecting);
-    let stream = mixed.wait(&slot).unwrap();
-    mixed.until(|m| m.peer.tcp(&peer).state() == State::Established);
-    (stream, peer)
-}
-
-fn peer_send(mixed: &mut Mixed, peer: &TcpHandle, data: &[u8]) {
-    assert_eq!(mixed.peer.tcp_mut(peer).send_slice(data), Ok(data.len()));
-}
-
-/// Peer sends `payload` to the Net's `port`, turning until the Net's MAC is resolved.
-fn peer_udp_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::UdpHandle, port: u16, payload: &[u8]) {
-    let to = Some(IpEndpoint::new(net_ip().into(), port));
-    mixed.until(|m| match m.peer.udp_send(peer, to, payload) {
-        Ok(()) => true,
-        Err(error) => {
-            assert_eq!(error, dpdk_smoltcp::UdpSendError::NeighborPending);
-            false
-        }
-    });
-}
 
 /// The peer's queued segments all acknowledged, then a reset from the peer
 /// that reaches the Net and is turned.
