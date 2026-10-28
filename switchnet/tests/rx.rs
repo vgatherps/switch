@@ -1,11 +1,14 @@
 //! switchnet against a raw conduit Stack peer on net_ring; every future runs
 //! as a switch task.
 
+use std::cell::RefCell;
 use std::future::pending;
+use std::rc::Rc;
 
 use dpdk_smoltcp::TcpHandle;
+use dpdk_smoltcp::smoltcp::time::Duration;
 use switchnet::tcp::State;
-use switchnet::{IpEndpoint, IpListenEndpoint, RecvError, TcpStream, UdpConfig};
+use switchnet::{IpEndpoint, IpListenEndpoint, RecvError, StackError, TcpStream, UdpConfig};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
@@ -425,5 +428,131 @@ fn frames_outlive_the_stack() {
             assert_eq!(frame.payload(), b"Tcp bytes");
             assert_eq!(datagram.payload(), b"Udp bytes");
         });
+    })
+}
+
+/// The app holds every frame it receives: the window shuts and the peer
+/// stalls. Releasing a middle and the last frame, the head still held,
+/// reopens it and data resumes in order; releasing all lets the rest in.
+#[zhida_test_support::pinned_test]
+fn held_frames_shut_the_window_and_releasing_them_reopens_it() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["wina", "winb"]);
+        let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let data = pattern(64 * 1024, 3);
+        let len = data.len();
+        peer_send(&mut mixed, &peer, &data);
+        let held = Rc::new(RefCell::new(Vec::new()));
+        let got = Rc::new(RefCell::new(Vec::new()));
+        let slot = mixed.spawn({
+            let (held, got) = (held.clone(), got.clone());
+            async move {
+                while got.borrow().len() < len {
+                    let frame = stream.recv().await.unwrap();
+                    got.borrow_mut().extend_from_slice(frame.payload());
+                    held.borrow_mut().push(frame);
+                }
+                stream
+            }
+        });
+        let mut received = 0;
+        loop {
+            mixed.rounds(50);
+            let now = got.borrow().len();
+            if now == received {
+                break;
+            }
+            received = now;
+        }
+        assert!(held.borrow().len() >= 3, "only {} frames held", held.borrow().len());
+        assert!(received < len, "the window never shut");
+        assert!(mixed.peer.tcp(&peer).send_queue() > 0, "the peer is not stalled");
+        assert_eq!(got.borrow()[..], data[..received]);
+        let head = held.borrow_mut().remove(0);
+        {
+            let mut held = held.borrow_mut();
+            let middle = held.len() / 2;
+            held.remove(middle);
+            held.pop();
+        }
+        mixed.until(|_| got.borrow().len() > received);
+        assert_eq!(got.borrow()[..], data[..got.borrow().len()], "data after the reopened window is out of order");
+        drop(head);
+        mixed.until(|_| {
+            held.borrow_mut().clear();
+            slot.is_full()
+        });
+        let stream = slot.take();
+        assert_eq!(*got.borrow(), data);
+        drop((stream, peer));
+        mixed.close();
+    })
+}
+
+/// Both ends send a SYN. The Net's turn that takes the peer's SYN moves it
+/// to SynReceived, which must not wake the connecting task.
+#[zhida_test_support::pinned_test]
+fn simultaneous_open_waits_through_syn_received() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["sima", "simb"]);
+        resolve_neighbors(&mut mixed);
+        let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
+        mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
+        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap();
+        let (connecting, polls) = counted(connecting);
+        let slot = mixed.spawn(connecting);
+        mixed.rt.poll(0).unwrap();
+        assert_eq!(polls.get(), 1);
+        // The peer's SYN reaches the Net while the Net is in SynSent and has sent nothing.
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::SynSent);
+        assert_eq!(mixed.to_net.forward(), 1);
+        mixed.turn();
+        assert_eq!(polls.get(), 1, "woken in SynReceived");
+        assert_eq!(mixed.to_peer.forward(), 1);
+        let stream = mixed.wait(&slot).unwrap();
+        assert_eq!(polls.get(), 2);
+        mixed.until(|m| m.peer.tcp(&peer).state() == State::Established);
+        drop((stream, peer));
+        mixed.close();
+    })
+}
+
+/// A turn that fails before ingress (time went backwards) wakes nothing and
+/// keeps the parked task; the next turn takes in the datagram and wakes it.
+#[zhida_test_support::pinned_test]
+fn error_turn_keeps_the_parked_task_for_the_next_turn() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["erra", "errb"]);
+        let earlier = mixed.now;
+        mixed.now = earlier + Duration::from_millis(1);
+        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7000, b"warm");
+        let (task, polls) = counted(async move {
+            let warm = socket.recv().await;
+            assert_eq!(warm.payload(), b"warm");
+            let datagram = socket.recv().await;
+            (socket, warm, datagram)
+        });
+        let slot = mixed.spawn(task);
+        mixed.until(|_| polls.get() >= 2);
+        mixed.rounds(5);
+        let parked = polls.get();
+        assert!(!slot.is_full());
+        mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7000)), b"after error").unwrap();
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        assert_eq!(mixed.to_net.forward(), 1);
+        let Err(StackError::TimeWentBackwards { .. }) = mixed.net.turn(earlier) else {
+            panic!("turn at an earlier time did not fail")
+        };
+        mixed.rt.poll(0).unwrap();
+        assert_eq!(polls.get(), parked, "the failed turn woke the task");
+        mixed.turn();
+        assert_eq!(polls.get(), parked + 1);
+        let (socket, warm, datagram) = slot.take();
+        assert_eq!(datagram.payload(), b"after error");
+        drop((socket, warm, datagram, peer));
+        mixed.close();
     })
 }

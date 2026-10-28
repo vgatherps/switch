@@ -17,6 +17,17 @@ use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
 
+#[macro_use]
+#[path = "../../../switch/tests/support/task_macro.rs"]
+mod task_macro;
+
+task! {
+    /// Any test future, boxed so one task function serves every test.
+    fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
+        future
+    }
+}
+
 pub const MAX_TCP: usize = 4;
 pub const MAX_UDP: usize = 4;
 pub const UDP_QUEUE: usize = 8;
@@ -94,7 +105,8 @@ impl Mixed {
     pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Slot<T> {
         let slot = Slot::default();
         let out = slot.clone();
-        self.rt.spawner().spawn(async move { *out.0.borrow_mut() = Some(future.await) }).ok().unwrap();
+        let token = boxed(Box::pin(async move { *out.0.borrow_mut() = Some(future.await) }));
+        self.rt.spawner().spawn(token).expect("spawn");
         slot
     }
 

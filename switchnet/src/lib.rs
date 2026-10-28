@@ -97,12 +97,9 @@ impl Inner {
     }
 
     fn park(&mut self, index: u32, interest: Interest, cx: &Context<'_>) {
-        // SAFETY: `Net` is `!Send`, so the handle is stored and woken on the
-        // executor thread. switch never frees task slabs, so a stale handle
-        // is harmless; it is cleared anyway on every path that ends the
-        // parked future: completion (`unpark`), drop (`unpark`) and socket
-        // drop (`remove`).
-        let waker = unsafe { StoredWaker::new(cx) };
+        // A stale handle is harmless: switch never frees task blocks, and a
+        // wake of a finished task does nothing.
+        let waker = StoredWaker::new(cx);
         let entry = &mut self.entries[index as usize];
         entry.parked = Some((waker, interest));
         if !entry.listed {

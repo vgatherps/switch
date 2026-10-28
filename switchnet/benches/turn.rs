@@ -15,10 +15,21 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion};
 use dpdk_smoltcp::{rx_pool_count, rx_reserve, Eal, Port, Stack, StackConfig};
 use switch::Runtime;
-use switchnet::{Net, NetConfig, UdpConfig};
+use switchnet::{Net, NetConfig, UdpConfig, UdpSocket};
 use zhida_test_kit::pair::{self, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::with_eal;
+
+#[macro_use]
+#[path = "../../switch/tests/support/task_macro.rs"]
+mod task_macro;
+
+task! {
+    async fn park_in_recv(socket: UdpSocket) {
+        let mut socket = socket;
+        drop(socket.recv().await);
+    }
+}
 
 const MAX_UDP: usize = 16;
 const UDP_QUEUE: usize = 4;
@@ -64,8 +75,8 @@ fn net_turn(c: &mut Criterion) {
             let handle = net.handle();
             let mut rt = Runtime::new(0);
             for i in 0..parked {
-                let mut socket = handle.udp_bind(udp_config(i)).unwrap();
-                rt.spawner().spawn(async move { drop(socket.recv().await) }).unwrap();
+                let socket = handle.udp_bind(udp_config(i)).unwrap();
+                rt.spawner().spawn(park_in_recv(socket)).expect("spawn");
             }
             assert_eq!(rt.poll(0).unwrap().tasks_polled, parked);
             group.bench_function(format!("net_turn/{parked}"), |b| {
