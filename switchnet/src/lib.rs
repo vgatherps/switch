@@ -85,7 +85,8 @@ struct Inner {
     /// Per side, entries parked since the last turn; may hold entries since
     /// unparked.
     listed: [Vec<u32>; 2],
-    /// Tasks waiting for a TX frame; each listed once.
+    /// Tasks waiting for a TX frame; each listed once. Sized for one per
+    /// socket slot; more simultaneous waiters than that grow it.
     frame_waiters: Vec<StoredWaker>,
     ingress_budget: usize,
 }
@@ -238,7 +239,7 @@ impl Net {
             entries,
             free: (0..slots as u32).rev().collect(),
             listed: [Vec::with_capacity(slots), Vec::with_capacity(slots)],
-            frame_waiters: Vec::new(),
+            frame_waiters: Vec::with_capacity(slots),
             ingress_budget: config.ingress_budget,
         };
         Net { shared: Rc::new(RefCell::new(inner)) }
