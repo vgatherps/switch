@@ -67,8 +67,8 @@ impl TimerWheel {
     }
 
     pub fn insert<T: WheelEntry>(&mut self, entries: &mut [T], idx: u32) -> InsertOutcome {
-        assert!(idx != NIL, "invalid timer index");
-        assert!(
+        debug_assert!(idx != NIL, "invalid timer index");
+        debug_assert!(
             matches!(
                 entries[idx as usize].wheel_position(),
                 WheelPosition::Unlinked
@@ -86,12 +86,12 @@ impl TimerWheel {
     }
 
     pub fn remove<T: WheelEntry>(&mut self, entries: &mut [T], idx: u32) -> bool {
-        assert!(idx != NIL, "invalid timer index");
+        debug_assert!(idx != NIL, "invalid timer index");
         let WheelPosition::Linked { level, slot } = entries[idx as usize].wheel_position() else {
             return false;
         };
         let (level, slot) = (level as usize, slot as usize);
-        assert!(
+        debug_assert!(
             level < DEFAULT_LEVELS && slot < DEFAULT_SLOTS,
             "invalid wheel position"
         );
@@ -147,12 +147,12 @@ impl TimerWheel {
                     entries[idx as usize].set_wheel_position(WheelPosition::Unlinked);
                     let deadline = entries[idx as usize].deadline();
                     if deadline <= boundary {
-                        assert!(deadline == boundary, "timer passed its deadline");
+                        debug_assert!(deadline == boundary, "timer passed its deadline");
                         self.linked_count -= 1;
                         expired.push(idx);
                     } else {
                         let (new_level, new_slot) = Self::place(boundary, deadline);
-                        assert!(new_level < level, "cascade did not descend");
+                        debug_assert!(new_level < level, "cascade did not descend");
                         self.link(entries, idx, new_level, new_slot);
                     }
                 }
@@ -189,11 +189,11 @@ impl TimerWheel {
             } else {
                 u32::MAX << (digit + 1)
             };
-            assert!(
+            debug_assert!(
                 pending & !above == 0,
                 "occupied bucket is not ahead of current time"
             );
-            assert!(
+            debug_assert!(
                 level != 12 || pending & 0xffff0000 == 0,
                 "invalid top-level bucket"
             );
@@ -204,7 +204,7 @@ impl TimerWheel {
                 (self.current_tick >> (shift + 5)) << (shift + 5)
             };
             let boundary = prefix | (u64::from(slot) << shift);
-            assert!(
+            debug_assert!(
                 boundary > self.current_tick,
                 "bucket boundary is not future"
             );

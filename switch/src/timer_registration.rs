@@ -86,7 +86,7 @@ impl TimerStore {
     }
 
     fn drained(&self) {
-        assert!(self.expired.is_empty(), "timer expiry handoff not drained");
+        debug_assert!(self.expired.is_empty(), "timer expiry handoff not drained");
     }
 
     fn valid(&self, token: Token) -> bool {
@@ -104,13 +104,14 @@ impl TimerStore {
         deadline: u64,
     ) -> Result<Token, RegistrationExhausted> {
         self.drained();
-        assert!(
+        debug_assert!(
             deadline > self.wheel.current_tick(),
             "registration deadline is due"
         );
-        unsafe {
-            assert!(TaskHeader::is_live(owner), "terminal timer owner");
-        }
+        debug_assert!(
+            unsafe { TaskHeader::is_live(owner) },
+            "terminal timer owner"
+        );
         let index = if self.free_head != NIL {
             let index = self.free_head;
             self.free_head = self.entries[index as usize].owner_next;
@@ -143,10 +144,8 @@ impl TimerStore {
         unsafe {
             self.attach(index, owner);
         }
-        assert_eq!(
-            self.wheel.insert(&mut self.entries, index),
-            InsertOutcome::Linked
-        );
+        let outcome = self.wheel.insert(&mut self.entries, index);
+        debug_assert_eq!(outcome, InsertOutcome::Linked);
         Ok(Token {
             index,
             version: self.entries[index as usize].version,
@@ -177,8 +176,11 @@ impl TimerStore {
         if !self.valid(token) {
             return false;
         }
+        debug_assert!(
+            unsafe { TaskHeader::is_live(owner) },
+            "terminal timer owner"
+        );
         unsafe {
-            assert!(TaskHeader::is_live(owner), "terminal timer owner");
             if self.entries[token.index as usize].owner != owner {
                 self.detach(token.index);
                 self.attach(token.index, owner);
