@@ -78,7 +78,8 @@ impl RuntimePool {
             let block = (*this).blocks.len() as u32;
             // Room first: once allocated, the block is always recorded here.
             (*this).blocks.reserve(1);
-            let meta = spec.allocate((*this).executor, this, block);
+            let executor = (*this).executor;
+            let meta = spec.allocate(executor, Executor::mailbox(executor), this, block);
             (*this).blocks.push(meta);
         }
     }

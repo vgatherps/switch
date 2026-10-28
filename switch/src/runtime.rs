@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::__private::Task;
 use crate::executor::{DEFAULT_CAPACITY, Executor, Lifecycle};
 use crate::oneshot::{self, Sender};
+use crate::remote::Mailbox;
 use crate::task::SpawnToken;
 use crate::task::join::JoinHandle;
 
@@ -197,6 +198,10 @@ impl Runtime {
             }
             Executor::check_turn(root);
             let mut turn = Executor::enter_turn(root);
+            let mailbox = Executor::mailbox(root);
+            if Mailbox::pending(mailbox) {
+                Mailbox::deliver(mailbox);
+            }
             (*root)
                 .timers
                 .advance_to(now)

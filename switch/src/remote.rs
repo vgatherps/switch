@@ -1,0 +1,175 @@
+//! `RemoteWaker` and the per-runtime mailbox of wake requests from other threads.
+//!
+//! Each runtime owns one [`Mailbox`], allocated with it and never freed: its
+//! blocks' metadata points at it, and a foreign thread may wake a task long after
+//! the runtime is gone. A foreign wake pushes the task header under the lock; the
+//! owner takes the requests at the start of its next turn and wakes each task
+//! locally, where the slot's flags make a stale or finished task's wake a no-op.
+
+use std::cell::Cell;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::task::Context;
+
+use crate::executor::Executor;
+use crate::task::TaskHeader;
+use crate::task::block::Meta;
+use crate::waker::{THREAD_TAG, VTABLE, check_owner};
+
+/// A task header queued by a foreign thread.
+struct Request(*const TaskHeader);
+
+// SAFETY: only the header address travels; the owner thread dereferences it.
+unsafe impl Send for Request {}
+
+pub(crate) struct Mailbox {
+    /// Requests are queued: a hint for the owner, set and cleared under the lock.
+    pending: AtomicBool,
+    /// The runtime shut down: requests are discarded. Set under the lock.
+    closed: AtomicBool,
+    queue: Mutex<Vec<Request>>,
+    /// The previously created mailbox: every mailbox stays reachable from
+    /// [`MAILBOXES`] (for leak checkers), since none is ever freed.
+    next: *mut Mailbox,
+}
+
+/// The most recently created mailbox, heading the list of all mailboxes.
+static MAILBOXES: AtomicPtr<Mailbox> = AtomicPtr::new(ptr::null_mut());
+
+impl Mailbox {
+    /// A new open mailbox, never freed.
+    pub(crate) fn create() -> *const Self {
+        let mailbox = Box::into_raw(Box::new(Self {
+            pending: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            queue: Mutex::new(Vec::new()),
+            next: ptr::null_mut(),
+        }));
+        let mut head = MAILBOXES.load(Ordering::Relaxed);
+        loop {
+            unsafe { (*mailbox).next = head };
+            match MAILBOXES.compare_exchange_weak(
+                head,
+                mailbox,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return mailbox,
+                Err(current) => head = current,
+            }
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Request>> {
+        // Nothing runs user code under the lock, so a poisoned queue is intact.
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Queue a wake of `header`, or drop it once the runtime has shut down.
+    fn push(&self, header: *const TaskHeader) {
+        let mut queue = self.lock();
+        if !self.closed.load(Ordering::Relaxed) {
+            queue.push(Request(header));
+            self.pending.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether wake requests may be queued; one load at the start of a turn.
+    ///
+    /// # Safety
+    /// `this` came from [`Mailbox::create`].
+    #[inline(always)]
+    pub(crate) unsafe fn pending(this: *const Self) -> bool {
+        unsafe { (*this).pending.load(Ordering::Relaxed) }
+    }
+
+    /// Wake every queued task locally.
+    ///
+    /// # Safety
+    /// Owner thread of the runtime that created `this`; its executor is open.
+    #[cold]
+    #[inline(never)]
+    pub(crate) unsafe fn deliver(this: *const Self) {
+        let requests = unsafe {
+            let mut queue = (*this).lock();
+            (*this).pending.store(false, Ordering::Relaxed);
+            std::mem::take(&mut *queue)
+        };
+        for Request(header) in requests {
+            // A header of one of this runtime's blocks: the flags check makes
+            // a free, finished or newer task's wake harmless.
+            unsafe { Executor::wake(header) };
+        }
+    }
+
+    /// Discard queued and future requests.
+    ///
+    /// # Safety
+    /// `this` came from [`Mailbox::create`].
+    pub(crate) unsafe fn close(this: *const Self) {
+        let requests = unsafe {
+            let mut queue = (*this).lock();
+            (*this).closed.store(true, Ordering::Relaxed);
+            (*this).pending.store(false, Ordering::Relaxed);
+            std::mem::take(&mut *queue)
+        };
+        drop(requests);
+    }
+}
+
+/// A wake handle that may be used from any thread.
+///
+/// On the task's own thread `wake` is the normal wake; on any other thread it
+/// queues the task in its runtime's mailbox, and the runtime wakes it at the
+/// start of its next [`crate::Runtime::poll`]. Like a stale `Waker`, a stale
+/// `RemoteWaker` is harmless: when its slot is free its wake does nothing, when
+/// the slot holds a newer task that task gets one more poll, and after its runtime
+/// shut down the wake is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteWaker {
+    header: NonNull<TaskHeader>,
+}
+
+// SAFETY: a foreign thread only reads the block's owner tag and mailbox, both
+// written once before the block's first task (and so before this handle) existed,
+// and pushes the header address; the header is dereferenced on the owner thread.
+unsafe impl Send for RemoteWaker {}
+unsafe impl Sync for RemoteWaker {}
+
+impl RemoteWaker {
+    /// The task whose waker `cx` carries.
+    ///
+    /// # Panics
+    /// If `cx`'s waker is not a switch task waker, or on a foreign thread.
+    pub fn new(cx: &Context<'_>) -> Self {
+        let waker = cx.waker();
+        assert!(
+            ptr::eq(waker.vtable(), &VTABLE),
+            "RemoteWaker needs a switch task waker"
+        );
+        let header = waker.data().cast::<TaskHeader>();
+        unsafe { check_owner(header) };
+        Self {
+            header: NonNull::new(header.cast_mut()).expect("switch waker data is a header"),
+        }
+    }
+
+    /// Wake the task: at once on its own thread, at the start of its runtime's
+    /// next turn from any other thread.
+    pub fn wake(&self) {
+        let header = self.header.as_ptr().cast_const();
+        // SAFETY: blocks are never freed, so the metadata stays readable.
+        unsafe {
+            let meta = TaskHeader::meta(header);
+            if Meta::owner(meta) == THREAD_TAG.with(Cell::get) {
+                Executor::wake(header);
+            } else {
+                (*Meta::mailbox(meta)).push(header);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

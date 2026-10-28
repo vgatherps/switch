@@ -24,6 +24,10 @@
 //! allocate, but only on the runtime's thread: each of them panics on another thread.
 //! Runtime primitives that park tasks can keep a [`StoredWaker`] instead: a copyable
 //! handle that wakes its task directly, without a call through the waker vtable.
+//! Another thread wakes a task through a [`RemoteWaker`]: `Send + Sync` and
+//! copyable, it queues the task in its runtime's mailbox, which the runtime
+//! empties at the start of its next `poll` (on the task's own thread it wakes at
+//! once). A wake after the runtime shut down is dropped.
 //!
 //! ## Tasks
 //!
@@ -142,6 +146,7 @@ extern crate self as switch;
 mod executor;
 pub(crate) mod intrusive;
 pub mod oneshot;
+mod remote;
 mod runtime;
 mod sleep;
 pub(crate) mod task;
@@ -149,6 +154,7 @@ mod timer_registration;
 mod timer_wheel;
 mod waker;
 
+pub use remote::RemoteWaker;
 pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;

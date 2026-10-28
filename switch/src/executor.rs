@@ -13,6 +13,7 @@ use std::mem::ManuallyDrop;
 use crate::__private::Task;
 use crate::intrusive::NIL;
 use crate::oneshot::Sender;
+use crate::remote::Mailbox;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
@@ -52,6 +53,8 @@ pub struct Executor {
     /// The task being polled, for `Sleep`; null between polls.
     pub(crate) current: *const TaskHeader,
     pub(crate) timers: TimerStore,
+    /// Wake requests from other threads; outlives this executor.
+    mailbox: *const Mailbox,
 }
 
 impl Executor {
@@ -71,7 +74,14 @@ impl Executor {
             lifecycle: Lifecycle::Open,
             current: std::ptr::null(),
             timers: TimerStore::new(initial_tick, timers),
+            mailbox: Mailbox::create(),
         }
+    }
+
+    /// Stable owner-thread pointer to a live executor.
+    #[inline(always)]
+    pub(crate) unsafe fn mailbox(this: *mut Self) -> *const Mailbox {
+        unsafe { (*this).mailbox }
     }
 
     /// Stable owner-thread pointer to a live executor.
@@ -311,6 +321,7 @@ impl Executor {
             );
             let turn = Self::enter_turn(this);
             (*this).lifecycle = Lifecycle::Closing;
+            Mailbox::close((*this).mailbox);
             (*this).run_queue.clear();
             (*this).incoming.clear();
             // No spawn succeeds while Closing, and no reservation is open.

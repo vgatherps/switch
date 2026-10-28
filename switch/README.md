@@ -12,6 +12,7 @@ Depends on [`depot`](../depot/README.md) (`DynDepot` allocates task slots) and [
 - `JoinHandle<T>`: a future of `Result<T, oneshot::Canceled>`. It resolves to the task's value, or to `Canceled` when the task ends without a value (its runtime shut down or was dropped, or its poll panicked; a panic cancels the handle at once). Dropping it detaches the task. Detached and joined spawns of one task function share its pool and capacity.
 - `oneshot::channel()`: single-thread channel for one value, one allocation. `Sender::send(self, value)` gives the value back if the receiver is gone; `Receiver` is a future of `Result<T, Canceled>`, `Canceled` once the sender is dropped without sending. Accepts any waker.
 - `StoredWaker::new(cx)`: copyable handle that wakes its task directly; `wake(self)`.
+- `RemoteWaker::new(cx)`: `Copy + Send + Sync` handle for waking from other threads. `wake(&self)` on the task's thread is the normal wake; on another thread it queues the task in its runtime's mailbox (a mutex-guarded list, never freed), and the runtime wakes it at the start of its next `poll`. After the runtime shut down the wake is dropped. A stale handle at most gives the task now in its slot one extra poll.
 
 ## Tasks
 

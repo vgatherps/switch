@@ -22,7 +22,7 @@ use crate::task::TaskHeader;
 use crate::task::block::Meta;
 
 thread_local! {
-    static THREAD_TAG: Cell<u16> = const { Cell::new(0) };
+    pub(crate) static THREAD_TAG: Cell<u16> = const { Cell::new(0) };
 }
 
 static NEXT_TAG: AtomicU32 = AtomicU32::new(1);
@@ -65,7 +65,7 @@ fn foreign_thread() -> ! {
 /// # Safety
 /// `header` heads a slot of a block (blocks are never freed).
 #[inline(always)]
-unsafe fn check_owner(header: *const TaskHeader) {
+pub(crate) unsafe fn check_owner(header: *const TaskHeader) {
     if unsafe { Meta::owner(TaskHeader::meta(header)) } != THREAD_TAG.with(Cell::get) {
         foreign_thread();
     }

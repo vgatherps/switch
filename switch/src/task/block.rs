@@ -21,6 +21,7 @@ use std::task::{Context, Poll, Waker};
 use super::header::TaskHeader;
 use super::pool::RuntimePool;
 use crate::executor::Executor;
+use crate::remote::Mailbox;
 
 pub(crate) const BLOCK: usize = 64 * 1024;
 pub(crate) const MASK: usize = !(BLOCK - 1);
@@ -33,7 +34,8 @@ pub(crate) type DropFn = unsafe fn(*const TaskHeader);
 /// block is used. Nothing forms `&Meta`: fields are reached by raw projection.
 #[repr(C, align(64))]
 pub(crate) struct Meta {
-    /// Thread tag of the creating thread; the only field a foreign thread reads.
+    /// Thread tag of the creating thread. A foreign thread reads only this and
+    /// `mailbox`, both written before the block's first task existed.
     owner: AtomicU16,
     data_off: u16,
     stride: u32,
@@ -51,6 +53,8 @@ pub(crate) struct Meta {
     /// The previously allocated block: every block stays reachable from
     /// [`BLOCKS`] (for leak checkers), since none is ever freed.
     next: *mut Meta,
+    /// The runtime's mailbox for `RemoteWaker`s; never freed.
+    mailbox: *const Mailbox,
 }
 
 /// The most recently allocated block, heading the list of all blocks.
@@ -133,6 +137,7 @@ impl BlockSpec {
     pub(crate) fn allocate(
         &self,
         executor: *mut Executor,
+        mailbox: *const Mailbox,
         pool: *mut RuntimePool,
         block: u32,
     ) -> *mut Meta {
@@ -155,6 +160,7 @@ impl BlockSpec {
                 poll: self.poll,
                 drop: self.drop,
                 next: std::ptr::null_mut(),
+                mailbox,
             });
             let mut head = BLOCKS.load(Ordering::Relaxed);
             loop {
@@ -237,6 +243,16 @@ impl Meta {
         unsafe { *addr_of!((*this).pool) }
     }
 
+    /// Never dangles: mailboxes are never freed. Safe from any thread that got
+    /// a header of this block after the block's first task existed.
+    ///
+    /// # Safety
+    /// `this` is a block base.
+    #[inline(always)]
+    pub(crate) unsafe fn mailbox(this: *mut Self) -> *const Mailbox {
+        unsafe { *addr_of!((*this).mailbox) }
+    }
+
     /// # Safety
     /// Owner thread.
     #[inline(always)]
@@ -260,7 +276,8 @@ pub(crate) struct TestBlock(*mut Meta);
 impl TestBlock {
     pub(crate) fn new() -> Self {
         let spec = &Shape::<std::future::Pending<()>>::SPEC;
-        Self(spec.allocate(std::ptr::null_mut(), std::ptr::null_mut(), 0))
+        use std::ptr::{null, null_mut};
+        Self(spec.allocate(null_mut(), null(), null_mut(), 0))
     }
 
     /// A LIVE task header at `position`.
