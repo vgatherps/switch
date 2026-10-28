@@ -163,6 +163,19 @@ impl RemoteWaker {
         }
     }
 
+    /// The handle of the task headed by `header`, from any thread. Waking a
+    /// stale header is harmless (see the type docs).
+    ///
+    /// # Safety
+    /// `header` came from [`Self::header`].
+    pub(crate) unsafe fn from_header(header: NonNull<TaskHeader>) -> Self {
+        Self { header }
+    }
+
+    pub(crate) fn header(self) -> NonNull<TaskHeader> {
+        self.header
+    }
+
     /// Wake the task: at once on its own thread, at the start of its runtime's
     /// next turn from any other thread.
     pub fn wake(&self) {

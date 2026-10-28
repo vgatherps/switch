@@ -97,6 +97,151 @@ fn send_to_a_dropped_receiver_returns_the_value() {
     assert_eq!(sender.send(5u8), Err(5));
 }
 
+// ---- oneshot across threads ----
+
+/// Polls until `out` is set or `turns` polls ran.
+fn run_until<T>(runtime: &mut Runtime, out: &Slot<T>, turns: usize) {
+    for _ in 0..turns {
+        if out.borrow().is_some() {
+            return;
+        }
+        runtime.poll(0).unwrap();
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn a_send_from_another_thread_delivers_the_value() {
+    let mut runtime = Runtime::new(0);
+    let (sender, receiver) = oneshot::channel();
+    let out = slot();
+    runtime
+        .spawner()
+        .spawn(store(receiver, out.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    std::thread::spawn(move || sender.send(String::from("across")).unwrap())
+        .join()
+        .unwrap();
+    // The wake went through the mailbox: one poll delivers it.
+    runtime.poll(0).unwrap();
+    assert_eq!(*out.borrow(), Some(Ok(String::from("across"))));
+}
+
+#[test]
+fn a_sender_dropped_on_another_thread_cancels() {
+    let mut runtime = Runtime::new(0);
+    let (sender, receiver) = oneshot::channel::<u32>();
+    let out = slot();
+    runtime
+        .spawner()
+        .spawn(store(receiver, out.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    std::thread::spawn(move || drop(sender)).join().unwrap();
+    runtime.poll(0).unwrap();
+    assert_eq!(*out.borrow(), Some(Err(Canceled)));
+}
+
+#[test]
+fn a_send_from_another_thread_to_a_dropped_receiver_returns_the_value() {
+    let (sender, receiver) = oneshot::channel::<Vec<u8>>();
+    drop(receiver);
+    let back = std::thread::spawn(move || sender.send(vec![1, 2]))
+        .join()
+        .unwrap();
+    assert_eq!(back, Err(vec![1, 2]));
+}
+
+#[test]
+fn a_send_racing_the_first_poll_is_never_lost() {
+    for _ in 0..8 {
+        let mut runtime = Runtime::new(0);
+        let (sender, receiver) = oneshot::channel();
+        let out = slot();
+        runtime
+            .spawner()
+            .spawn(store(receiver, out.clone()))
+            .unwrap();
+        let sending = std::thread::spawn(move || sender.send(5u32).unwrap());
+        // Each poll either sees the value or registered before the send's wake.
+        run_until(&mut runtime, &out, 1000);
+        sending.join().unwrap();
+        run_until(&mut runtime, &out, 2);
+        assert_eq!(*out.borrow(), Some(Ok(5)));
+    }
+}
+
+#[test]
+fn a_sender_drop_racing_the_receiver_drop_frees_once() {
+    for _ in 0..8 {
+        let (sender, receiver) = oneshot::channel::<Vec<u8>>();
+        let dropping = std::thread::spawn(move || {
+            let _ = sender.send(vec![7]);
+        });
+        drop(receiver);
+        dropping.join().unwrap();
+    }
+}
+
+#[test]
+fn the_waiter_moves_with_the_receiver_to_another_task() {
+    /// Polls the receiver once, then hands it over.
+    #[switch::task]
+    fn polls_once(
+        receiver: Receiver<u32>,
+        handoff: Slot<Receiver<u32>>,
+        polls: Rc<Cell<u32>>,
+    ) -> impl Future<Output = ()> {
+        let mut receiver = Some(receiver);
+        std::future::poll_fn(move |cx| {
+            polls.set(polls.get() + 1);
+            let mut held = receiver.take().unwrap();
+            assert!(std::pin::Pin::new(&mut held).poll(cx).is_pending());
+            *handoff.borrow_mut() = Some(held);
+            std::task::Poll::Ready(())
+        })
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let (sender, receiver) = oneshot::channel();
+    let (handoff, polls, out) = (slot(), Rc::new(Cell::new(0)), slot());
+    spawner
+        .spawn(polls_once(receiver, handoff.clone(), polls.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    let receiver = handoff.borrow_mut().take().unwrap();
+    spawner.spawn(store(receiver, out.clone())).unwrap();
+    runtime.poll(0).unwrap();
+    std::thread::spawn(move || sender.send(9).unwrap())
+        .join()
+        .unwrap();
+    runtime.poll(0).unwrap();
+    assert_eq!(*out.borrow(), Some(Ok(9)));
+    assert_eq!(polls.get(), 1);
+}
+
+#[test]
+fn a_receiver_polled_outside_a_switch_task_panics() {
+    let (_sender, mut receiver) = oneshot::channel::<u32>();
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = std::pin::Pin::new(&mut receiver).poll(&mut cx);
+    }))
+    .unwrap_err();
+    assert_eq!(
+        payload.downcast_ref::<&str>(),
+        Some(&"RemoteWaker needs a switch task waker")
+    );
+}
+
+fn assert_send<T: Send>() {}
+
+#[test]
+fn the_sender_is_send() {
+    assert_send::<oneshot::Sender<Vec<u8>>>();
+}
+
 // ---- JoinHandle ----
 
 #[test]
