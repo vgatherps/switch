@@ -44,8 +44,9 @@ pub(crate) struct Meta {
     /// Ordinal of this block in its runtime pool.
     block: u32,
     /// The block's runtime and pool. They dangle once that runtime is dropped,
-    /// so they are read only for a TAKEN slot, whose runtime is alive: shutdown
-    /// clears every slot's flags before the executor is freed.
+    /// so they are read only where the runtime is alive: by the wake path after
+    /// its LIVE check, and by `RuntimePool::release` on a reserved slot of a live
+    /// executor. Shutdown clears every slot's flags before the executor is freed.
     executor: *mut Executor,
     pool: *mut RuntimePool,
     poll: PollFn,

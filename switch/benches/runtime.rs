@@ -3,7 +3,20 @@
 #[path = "../tests/support/runtime_workload.rs"]
 mod workload;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use switch::{Capacity, Runtime};
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::rc::Rc;
+use switch::{Capacity, Runtime, Sleep};
+
+#[switch::task]
+fn sleeps_then(sleeps: Vec<Sleep>, audit: Rc<workload::Audit>) -> impl Future<Output = ()> {
+    workload::Task {
+        sleeps,
+        yields: 0,
+        value: 528,
+        audit,
+    }
+}
 
 fn runtime_benches(c: &mut Criterion) {
     // Controls use the exact production fixture outside timing.
@@ -37,58 +50,39 @@ fn runtime_benches(c: &mut Criterion) {
     assert_eq!(pending.drops.get(), 1);
     black_box(polls);
 
+    // 32 sleeps expire in one turn and complete their task. One long-lived
+    // runtime; each iteration's untimed setup spawns the task and polls it once.
+    let expiry = RefCell::new(Runtime::with_capacity(
+        0,
+        Capacity {
+            tasks: 2,
+            timers: 32,
+        },
+    ));
+    let audit = Rc::new(workload::Audit::default());
+    let tick = Cell::new(0u64);
     c.bench_function("runtime_expiry_32", |b| {
-        b.iter_batched_ref(
+        b.iter_batched(
             || {
-                let mut fixture = workload::Mixed::new();
-                fixture.step(0);
-                fixture.step(1);
-                fixture
+                // `complete` records each value; keep the record from growing.
+                audit.output.borrow_mut().clear();
+                let mut runtime = expiry.borrow_mut();
+                let spawner = runtime.spawner();
+                let deadline = tick.get() + 2;
+                let sleeps = (0..32)
+                    .map(|_| spawner.sleep_until(deadline).unwrap())
+                    .collect();
+                spawner.spawn(sleeps_then(sleeps, audit.clone())).unwrap();
+                runtime.poll(deadline - 1).unwrap();
+                tick.set(deadline);
             },
-            |fixture| {
-                let report = fixture.step(3);
-                black_box((
-                    report,
-                    fixture.audit.checksum.get(),
-                    fixture.audit.drops.get(),
-                ))
+            |()| {
+                let report = expiry.borrow_mut().poll(tick.get()).unwrap();
+                black_box((report, audit.checksum.get(), audit.drops.get()))
             },
-            BatchSize::LargeInput,
+            BatchSize::PerIteration,
         )
     });
-    c.bench_function("runtime_mixed_six_turns", |b| {
-        b.iter_batched_ref(
-            workload::Mixed::new,
-            |fixture| {
-                black_box((
-                    fixture.run(),
-                    fixture.audit.checksum.get(),
-                    fixture.audit.drops.get(),
-                ))
-            },
-            BatchSize::LargeInput,
-        )
-    });
-    // Fixed batch sizes: one live fixture (one runtime) and 64 live fixtures
-    // (64 runtimes on this thread) per timed batch.
-    for (name, fixtures) in [
-        ("runtime_mixed_six_turns_1rt", 1),
-        ("runtime_mixed_six_turns_64rt", 64),
-    ] {
-        c.bench_function(name, |b| {
-            b.iter_batched_ref(
-                workload::Mixed::new,
-                |fixture| {
-                    black_box((
-                        fixture.run(),
-                        fixture.audit.checksum.get(),
-                        fixture.audit.drops.get(),
-                    ))
-                },
-                BatchSize::NumIterations(fixtures),
-            )
-        });
-    }
     c.bench_function("runtime_cold_create_drop", |b| {
         b.iter(|| {
             let runtime = Runtime::with_capacity(
