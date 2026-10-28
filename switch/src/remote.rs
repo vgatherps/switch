@@ -6,7 +6,7 @@
 //! owner takes the requests at the start of its next turn and wakes each task
 //! locally, where the slot's flags make a stale or finished task's wake a no-op.
 
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -29,6 +29,9 @@ pub(crate) struct Mailbox {
     /// The runtime shut down: requests are discarded. Set under the lock.
     closed: AtomicBool,
     queue: Mutex<Vec<Request>>,
+    /// Owner thread only: the queue's previous buffer, swapped in at each
+    /// delivery so a steady rate of remote wakes does not allocate per turn.
+    spare: UnsafeCell<Vec<Request>>,
     /// The previously created mailbox: every mailbox stays reachable from
     /// [`MAILBOXES`] (for leak checkers), since none is ever freed.
     next: *mut Mailbox,
@@ -44,6 +47,7 @@ impl Mailbox {
             pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             queue: Mutex::new(Vec::new()),
+            spare: UnsafeCell::new(Vec::new()),
             next: ptr::null_mut(),
         }));
         let mut head = MAILBOXES.load(Ordering::Relaxed);
@@ -91,22 +95,25 @@ impl Mailbox {
     #[cold]
     #[inline(never)]
     pub(crate) unsafe fn deliver(this: *const Self) {
-        let requests = unsafe {
-            let mut queue = (*this).lock();
-            (*this).pending.store(false, Ordering::Relaxed);
-            std::mem::take(&mut *queue)
-        };
-        for Request(header) in requests {
-            // A header of one of this runtime's blocks: the flags check makes
-            // a free, finished or newer task's wake harmless.
-            unsafe { Executor::wake(header) };
+        unsafe {
+            let requests = &mut *(*this).spare.get();
+            {
+                let mut queue = (*this).lock();
+                (*this).pending.store(false, Ordering::Relaxed);
+                std::mem::swap(&mut *queue, requests);
+            }
+            for Request(header) in requests.drain(..) {
+                // A header of one of this runtime's blocks: the flags check makes
+                // a free, finished or newer task's wake harmless.
+                Executor::wake(header);
+            }
         }
     }
 
-    /// Discard queued and future requests.
+    /// Discard queued and future requests, and free the buffers.
     ///
     /// # Safety
-    /// `this` came from [`Mailbox::create`].
+    /// Owner thread of the runtime that created `this`.
     pub(crate) unsafe fn close(this: *const Self) {
         let requests = unsafe {
             let mut queue = (*this).lock();
@@ -115,6 +122,7 @@ impl Mailbox {
             std::mem::take(&mut *queue)
         };
         drop(requests);
+        unsafe { drop(std::mem::take(&mut *(*this).spare.get())) };
     }
 }
 

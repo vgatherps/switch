@@ -101,9 +101,13 @@ impl Executor {
         unsafe { (*this).spawning }
     }
 
-    /// Reject new work and turns ahead of a deferred cleanup. Stable owner-thread pointer.
+    /// Reject new work, turns and remote wakes ahead of a deferred cleanup.
+    /// Stable owner-thread pointer.
     pub(crate) unsafe fn close(this: *mut Self) {
-        unsafe { (*this).lifecycle = Lifecycle::Closing }
+        unsafe {
+            (*this).lifecycle = Lifecycle::Closing;
+            Mailbox::close((*this).mailbox);
+        }
     }
 
     /// Spawn a task; gives the token back when its function's capacity is used up.
