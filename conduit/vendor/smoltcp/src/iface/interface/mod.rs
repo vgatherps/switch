@@ -28,6 +28,7 @@ use crate::config::{
 use crate::phy::{PacketMeta, TxChecksum};
 use crate::phy::{
     Device, DeviceCapabilities, FrameToken as PhyFrameToken, Medium, RxToken, TxBuf, TxToken,
+    UniqueTxBuf,
 };
 use crate::rand::Rand;
 use crate::socket::*;
@@ -717,7 +718,7 @@ impl Interface {
                                    meta: PacketMeta,
                                    ip: IpRepr,
                                    tcp: TcpRepr,
-                                   frame: Option<TxBuf>| {
+                                   frame: Option<UniqueTxBuf>| {
                     neighbor_addr = Some(ip.dst_addr());
                     if let Some(frame) = frame {
                         if inner.caps.medium == Medium::Ethernet {
@@ -735,12 +736,12 @@ impl Interface {
                                         })
                                     },
                                 ) {
-                                    return (Err(error), Some(frame));
+                                    return (Err(error), Some(frame.into_buf()));
                                 }
                             }
                             let Some(t) = device.transmit_frame(inner.now) else {
                                 net_debug!("failed to transmit frame: device exhausted");
-                                return (Err(EgressError::Exhausted), Some(frame));
+                                return (Err(EgressError::Exhausted), Some(frame.into_buf()));
                             };
                             let t = TrackedFrameToken {
                                 inner: t,
@@ -759,7 +760,7 @@ impl Interface {
 
                         let Some(t) = device.transmit(inner.now) else {
                             net_debug!("failed to transmit IP: device exhausted");
-                            return (Err(EgressError::Exhausted), Some(frame));
+                            return (Err(EgressError::Exhausted), Some(frame.into_buf()));
                         };
                         let t = TrackedTxToken {
                             inner: t,
@@ -777,7 +778,7 @@ impl Interface {
                         if dispatch.is_ok() {
                             result = PollResult::SocketStateChanged;
                         }
-                        return (dispatch.map_err(|_| EgressError::Dispatch), Some(frame));
+                        return (dispatch.map_err(|_| EgressError::Dispatch), Some(frame.into_buf()));
                     }
 
                     let Some(t) = device.transmit(inner.now) else {

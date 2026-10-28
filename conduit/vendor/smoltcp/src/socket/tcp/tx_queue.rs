@@ -3,11 +3,14 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::Cell;
 
-use crate::phy::{TxBuf, TxSource};
+use crate::phy::{TxBuf, TxSource, UniqueTxBuf};
 
 pub(crate) struct TxQueue {
     entries: VecDeque<Entry>,
+    /// Stream position of the first unACKed byte.
     acked: u64,
+    /// Stream position after the last queued byte: the last entry's `end`, or `acked` when empty.
+    end: u64,
     byte_cap: usize,
     frame_cap: usize,
     hint: Cell<u32>,
@@ -30,17 +33,33 @@ struct Entry {
     end: u64,
 }
 
+impl Entry {
+    /// Stream position of the frame's first byte.
+    #[inline]
+    fn start(&self) -> u64 {
+        self.end - self.buf().len() as u64
+    }
+
+    #[inline]
+    fn buf(&self) -> &TxBuf {
+        self.buf.as_ref().expect("TX queue frame is taken")
+    }
+}
+
 pub(crate) enum Seg<'a> {
     Empty,
     Whole { index: u32 },
     Cut(&'a [u8]),
 }
 
+// Positions are u64 byte counts that never wrap; lengths stay below `byte_cap`, a usize, and the
+// queue lives on a 64-bit target, so the conversions between them below are lossless.
 impl TxQueue {
     pub(crate) fn new(byte_cap: usize, frame_cap: usize, source: TxSource) -> TxQueue {
         TxQueue {
             entries: VecDeque::with_capacity(frame_cap),
             acked: 0,
+            end: 0,
             byte_cap,
             frame_cap,
             hint: Cell::new(0),
@@ -52,18 +71,17 @@ impl TxQueue {
         &self.source
     }
 
+    #[inline]
     pub(crate) fn len(&self) -> usize {
-        let end = self.entries.back().map_or(self.acked, |entry| entry.end);
-        end.checked_sub(self.acked)
-            .expect("TX queue end precedes ACK position")
-            .try_into()
-            .expect("TX queue length exceeds usize")
+        (self.end - self.acked) as usize
     }
 
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.end == self.acked
     }
 
+    #[inline]
     pub(crate) fn frames(&self) -> usize {
         self.entries.len()
     }
@@ -76,100 +94,74 @@ impl TxQueue {
         self.frame_cap
     }
 
+    #[inline]
     pub(crate) fn byte_room(&self) -> usize {
-        self.byte_cap
-            .checked_sub(self.len())
-            .expect("TX queue exceeds byte capacity")
+        self.byte_cap - self.len()
     }
 
+    #[inline]
     pub(crate) fn frame_room(&self) -> usize {
-        self.frame_cap
-            .checked_sub(self.frames())
-            .expect("TX queue exceeds frame capacity")
+        self.frame_cap - self.frames()
     }
 
+    /// Append a frame. The caller checked it is not empty and fits the byte and frame room.
+    #[inline]
     pub(crate) fn push(&mut self, buf: TxBuf) {
-        assert!(buf.len() != 0, "cannot queue an empty TX buffer");
-        assert!(buf.len() <= self.byte_room(), "TX buffer exceeds byte room");
-        assert!(self.frame_room() != 0, "TX queue has no frame room");
-        let start = self.entries.back().map_or(self.acked, |entry| entry.end);
-        let end = start
-            .checked_add(buf.len().try_into().expect("TX buffer length exceeds u64"))
-            .expect("TX queue position overflow");
+        debug_assert!(buf.len() != 0, "cannot queue an empty TX buffer");
+        debug_assert!(buf.len() <= self.byte_room(), "TX buffer exceeds byte room");
+        debug_assert!(self.frame_room() != 0, "TX queue has no frame room");
+        self.end += buf.len() as u64;
         self.entries.push_back(Entry {
             buf: Some(buf),
-            end,
+            end: self.end,
         });
     }
 
     pub(crate) fn append_tail(&mut self, sent: usize, data: &[u8], cap: usize) -> usize {
-        let first_never_sent = self
-            .acked
-            .checked_add(sent.try_into().expect("sent byte count exceeds u64"))
-            .expect("sent position overflow");
+        let first_never_sent = self.acked + sent as u64;
         let byte_room = self.byte_room();
         let Some(entry) = self.entries.back_mut() else {
             return 0;
         };
+        if first_never_sent > entry.start() {
+            return 0;
+        }
         let buf = entry.buf.as_mut().expect("TX queue tail is taken");
-        let start = entry
-            .end
-            .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
-            .expect("TX frame start underflow");
-        if first_never_sent > start || !buf.unique() {
+        if !buf.unique() {
             return 0;
         }
         let old_len = buf.len();
-        let cap_room = cap
-            .checked_sub(old_len)
-            .expect("TX tail length exceeds append cap");
-        let count = buf
-            .capacity()
-            .checked_sub(old_len)
-            .expect("TX buffer length exceeds capacity")
+        let count = (buf.capacity() - old_len)
             .min(byte_room)
-            .min(cap_room)
+            .min(cap - old_len)
             .min(data.len());
-        let new_len = old_len
-            .checked_add(count)
-            .expect("TX buffer length overflow");
+        let new_len = old_len + count;
         buf.room_mut()[old_len..new_len].copy_from_slice(&data[..count]);
         buf.set_len(new_len);
-        entry.end = entry
-            .end
-            .checked_add(count.try_into().expect("TX tail append exceeds u64"))
-            .expect("TX queue position overflow");
+        entry.end += count as u64;
+        self.end = entry.end;
         count
     }
 
     pub(crate) fn tail_room(&self, sent: usize, cap: usize) -> usize {
-        let first_never_sent = self
-            .acked
-            .checked_add(sent.try_into().expect("sent byte count exceeds u64"))
-            .expect("sent position overflow");
+        let first_never_sent = self.acked + sent as u64;
         let Some(entry) = self.entries.back() else {
             return 0;
         };
-        let buf = entry.buf.as_ref().expect("TX queue tail is taken");
-        let start = entry
-            .end
-            .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
-            .expect("TX frame start underflow");
-        if first_never_sent > start || !buf.unique() {
+        let buf = entry.buf();
+        if first_never_sent > entry.start() || !buf.unique() {
             return 0;
         }
-        cap.checked_sub(buf.len())
-            .expect("TX tail length exceeds append cap")
-            .min(buf.capacity().checked_sub(buf.len()).expect("TX buffer length exceeds capacity"))
+        (cap - buf.len())
+            .min(buf.capacity() - buf.len())
             .min(self.byte_room())
     }
 
+    /// ACK `n` bytes, at most `len()`: release every frame they complete.
+    #[inline]
     pub(crate) fn ack(&mut self, n: usize) {
-        assert!(n <= self.len(), "ACK exceeds queued bytes");
-        self.acked = self
-            .acked
-            .checked_add(n.try_into().expect("ACK count exceeds u64"))
-            .expect("TX queue ACK position overflow");
+        debug_assert!(n <= self.len(), "ACK exceeds queued bytes");
+        self.acked += n as u64;
         let mut popped = 0u32;
         while self
             .entries
@@ -177,20 +169,13 @@ impl TxQueue {
             .is_some_and(|entry| entry.end <= self.acked)
         {
             self.entries.pop_front();
-            popped = popped.checked_add(1).expect("TX queue pop count exceeds u32");
+            popped += 1;
         }
-        let hint = self.hint.get();
-        self.hint.set(if hint <= popped {
-            0
-        } else {
-            hint.checked_sub(popped).expect("TX queue hint underflow")
-        });
+        self.hint.set(self.hint.get().saturating_sub(popped));
     }
 
     pub(crate) fn clear(&mut self) {
-        if let Some(entry) = self.entries.back() {
-            self.acked = entry.end;
-        }
+        self.acked = self.end;
         self.entries.clear();
         self.hint.set(0);
     }
@@ -199,141 +184,123 @@ impl TxQueue {
         if size == 0 || offset >= self.len() {
             return Seg::Empty;
         }
-        let position = self
-            .acked
-            .checked_add(offset.try_into().expect("TX segment offset exceeds u64"))
-            .expect("TX segment position overflow");
+        let position = self.acked + offset as u64;
         let index = self.locate(position, || {});
-        self.hint
-            .set(index.try_into().expect("TX queue index exceeds u32"));
-        let entry = self.entries.get(index).expect("TX segment entry missing");
-        let buf = entry.buf.as_ref().expect("TX segment frame is taken");
-        let start = entry
-            .end
-            .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
-            .expect("TX frame start underflow");
-        if position == start && position >= self.acked && size >= buf.len() && buf.unique() {
+        self.hint.set(index as u32);
+        let entry = &self.entries[index];
+        let buf = entry.buf();
+        let start = entry.start();
+        if position == start && size >= buf.len() && buf.unique() {
             return Seg::Whole {
-                index: index.try_into().expect("TX queue index exceeds u32"),
+                index: index as u32,
             };
         }
-        let within: usize = position
-            .checked_sub(start)
-            .expect("TX segment precedes frame")
-            .try_into()
-            .expect("TX frame offset exceeds usize");
-        let end = within
-            .checked_add(size.min(buf.len() - within))
-            .expect("TX segment end overflow");
+        let within = (position - start) as usize;
+        let end = within + size.min(buf.len() - within);
         Seg::Cut(&buf.payload()[within..end])
+    }
+
+    /// Take the frame `segment(offset, size)` would send whole: one that starts at `offset`,
+    /// fits `size` and holds its only reference, read once. `None` leaves the queue unchanged.
+    #[inline(always)]
+    pub(crate) fn take_whole(&mut self, offset: usize, size: usize) -> Option<(u32, UniqueTxBuf)> {
+        if size == 0 || offset >= self.len() {
+            return None;
+        }
+        let position = self.acked + offset as u64;
+        let index = self.locate(position, || {});
+        self.hint.set(index as u32);
+        let entry = &mut self.entries[index];
+        if position != entry.start() || size < entry.buf().len() {
+            return None;
+        }
+        let buf = entry.buf.take().expect("TX queue frame is taken");
+        match buf.into_unique() {
+            Ok(frame) => Some((index as u32, frame)),
+            Err(shared) => {
+                entry.buf = Some(shared);
+                None
+            }
+        }
     }
 
     pub(crate) fn segment_spans_frames(&self, offset: usize, size: usize) -> bool {
         if size == 0 || offset >= self.len() {
             return false;
         }
-        let position = self
-            .acked
-            .checked_add(offset.try_into().expect("TX segment offset exceeds u64"))
-            .expect("TX segment position overflow");
+        let position = self.acked + offset as u64;
         let index = self.locate(position, || {});
-        let entry = self.entries.get(index).expect("TX segment entry missing");
-        position
-            .checked_add(size.try_into().expect("TX segment size exceeds u64"))
-            .expect("TX segment end overflow")
-            > entry.end
+        position + size as u64 > self.entries[index].end
     }
 
+    /// Copy `size` bytes from `offset` across consecutive frames into `output`. The range lies
+    /// in the queued bytes.
     pub(crate) fn copy_segment(&self, offset: usize, size: usize, output: &mut Vec<u8>) {
-        assert!(offset <= self.len(), "TX segment offset exceeds queued bytes");
-        assert!(size <= self.len() - offset, "TX segment size exceeds queued bytes");
+        debug_assert!(offset <= self.len(), "TX segment offset exceeds queued bytes");
+        debug_assert!(size <= self.len() - offset, "TX segment size exceeds queued bytes");
         output.clear();
         output.reserve(size);
         if size == 0 {
             return;
         }
-
-        let position = self
-            .acked
-            .checked_add(offset.try_into().expect("TX segment offset exceeds u64"))
-            .expect("TX segment position overflow");
+        let position = self.acked + offset as u64;
         let mut index = self.locate(position, || {});
         let mut copied = 0usize;
         while copied < size {
-            let entry = self.entries.get(index).expect("TX segment entry missing");
-            let buf = entry.buf.as_ref().expect("TX segment frame is taken");
-            let start = entry
-                .end
-                .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
-                .expect("TX frame start underflow");
-            let within: usize = position
-                .checked_add(copied.try_into().expect("TX copied length exceeds u64"))
-                .expect("TX copy position overflow")
-                .checked_sub(start)
-                .expect("TX copy position precedes frame")
-                .try_into()
-                .expect("TX frame offset exceeds usize");
+            let entry = &self.entries[index];
+            let buf = entry.buf();
+            let within = (position + copied as u64 - entry.start()) as usize;
             let count = (size - copied).min(buf.len() - within);
             output.extend_from_slice(&buf.payload()[within..within + count]);
-            copied = copied.checked_add(count).expect("TX copied length overflow");
-            index = index.checked_add(1).expect("TX queue index overflow");
+            copied += count;
+            index += 1;
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&mut self, index: u32) -> TxBuf {
-        let index: usize = index.try_into().expect("TX queue index exceeds usize");
-        self.entries
-            .get_mut(index)
-            .expect("TX queue take index missing")
+        self.entries[index as usize]
             .buf
             .take()
             .expect("TX queue frame is already taken")
     }
 
+    /// Return the frame `take_whole` took from `index`.
+    #[inline]
     pub(crate) fn put_back(&mut self, index: u32, buf: TxBuf) {
-        let index: usize = index.try_into().expect("TX queue index exceeds usize");
-        let previous_end = if index == 0 {
-            self.acked
-        } else {
-            self.entries
-                .get(index - 1)
-                .expect("TX queue previous entry missing")
-                .end
-        };
-        let entry = self.entries.get_mut(index).expect("TX queue put index missing");
-        assert!(entry.buf.is_none(), "TX queue frame is not taken");
-        let expected_len: usize = entry
-            .end
-            .checked_sub(previous_end)
-            .expect("TX queue entry end precedes its start")
-            .try_into()
-            .expect("TX queue frame length exceeds usize");
-        assert_eq!(buf.origin(), self.source.origin(), "TX queue frame has wrong origin");
-        assert_eq!(buf.len(), expected_len, "TX queue frame has wrong length");
+        let index = index as usize;
+        debug_assert_eq!(buf.origin(), self.source.origin(), "TX queue frame has wrong origin");
+        debug_assert!(
+            index == 0 || self.entries[index - 1].end == self.entries[index].end - buf.len() as u64,
+            "TX queue frame has wrong length"
+        );
+        let entry = &mut self.entries[index];
+        debug_assert!(entry.buf.is_none(), "TX queue frame is not taken");
         entry.buf = Some(buf);
     }
 
+    /// The entry holding stream position `position`: the head, the hint, the entry after it,
+    /// or a binary search. `compared` counts comparisons for tests.
+    #[inline(always)]
     fn locate(&self, position: u64, mut compared: impl FnMut()) -> usize {
-        let contains = |index: usize, compared: &mut dyn FnMut()| {
-            let entry = self.entries.get(index).expect("TX lookup index missing");
-            let buf = entry.buf.as_ref().expect("TX lookup frame is taken");
-            let start = entry
-                .end
-                .checked_sub(buf.len().try_into().expect("TX buffer length exceeds u64"))
-                .expect("TX frame start underflow");
-            compared();
-            position >= start && position < entry.end
-        };
-
         compared();
         if position < self.entries.front().expect("TX lookup on empty queue").end {
             return 0;
         }
-        let hint: usize = self.hint.get().try_into().expect("TX hint exceeds usize");
+        self.locate_after_head(position, compared)
+    }
+
+    fn locate_after_head(&self, position: u64, mut compared: impl FnMut()) -> usize {
+        let contains = |index: usize, compared: &mut dyn FnMut()| {
+            let entry = &self.entries[index];
+            compared();
+            position >= entry.start() && position < entry.end
+        };
+        let hint = self.hint.get() as usize;
         if hint != 0 && hint < self.entries.len() && contains(hint, &mut compared) {
             return hint;
         }
-        let next = hint.checked_add(1).expect("TX hint index overflow");
+        let next = hint + 1;
         if next < self.entries.len() && contains(next, &mut compared) {
             return next;
         }
@@ -343,8 +310,8 @@ impl TxQueue {
         while low < high {
             let mid = low + (high - low) / 2;
             compared();
-            if self.entries.get(mid).expect("TX binary lookup entry missing").end <= position {
-                low = mid.checked_add(1).expect("TX binary lookup index overflow");
+            if self.entries[mid].end <= position {
+                low = mid + 1;
             } else {
                 high = mid;
             }
@@ -543,6 +510,32 @@ mod tests {
         assert_eq!(bytes, &[3, 4, 5, 6]);
     }
 
+    /// `take_whole` takes only a frame that starts at the offset, fits the size and is unique;
+    /// every refusal leaves the queue as it was, and `put_back` restores a taken frame.
+    #[test]
+    fn take_whole_takes_only_a_fitting_unique_frame() {
+        let (mut queue, _) = queue(16, 2, 8);
+        queue.push_bytes(&[1, 2]);
+        queue.push_bytes(&[3, 4, 5]);
+        assert!(queue.take_whole(0, 0).is_none());
+        assert!(queue.take_whole(5, 3).is_none());
+        assert!(queue.take_whole(1, 4).is_none());
+        assert!(queue.take_whole(2, 2).is_none());
+        let clone = queue.entries[1].buf.as_ref().unwrap().clone();
+        assert!(queue.take_whole(2, 3).is_none());
+        assert!(queue.entries[1].buf.is_some());
+        drop(clone);
+        let (index, frame) = queue.take_whole(2, 8).unwrap();
+        assert_eq!((index, frame.payload()), (1, &[3, 4, 5][..]));
+        assert!(queue.entries[1].buf.is_none());
+        assert_eq!(queue.len(), 5);
+        queue.put_back(index, frame.into_buf());
+        assert_eq!(cut(queue.segment(3, 2)), &[4, 5]);
+        let (index, frame) = queue.take_whole(0, 2).unwrap();
+        assert_eq!((index, frame.payload()), (0, &[1, 2][..]));
+        queue.put_back(index, frame.into_buf());
+    }
+
     #[test]
     fn take_put_back_keeps_positions() {
         let (mut queue, _) = queue(16, 2, 8);
@@ -561,6 +554,7 @@ mod tests {
     fn end_positions_survive_u64_far_from_zero() {
         let (mut queue, _) = queue(16, 2, 8);
         queue.acked = u64::MAX - 8;
+        queue.end = queue.acked;
         queue.push_bytes(&[1, 2, 3]);
         queue.push_bytes(&[4, 5]);
         assert_eq!(queue.entries[0].end, u64::MAX - 5);

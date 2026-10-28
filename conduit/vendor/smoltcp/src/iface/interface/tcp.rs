@@ -66,26 +66,21 @@ impl InterfaceInner {
         frame_token: Frame,
         ip: IpRepr,
         mut tcp: TcpRepr,
-        frame: TxBuf,
+        mut frame: UniqueTxBuf,
         template: &crate::iface::header_template::TcpTemplate,
     ) -> TxBuf {
         let IpRepr::Ipv4(ip4) = ip;
+        // dispatch puts options only on segments without payload, and sends no timestamps.
+        debug_assert_eq!(tcp.header_len(), TCP_HEADER_LEN, "TCP frame header carries options");
         if let Some(max_burst_size) = self.caps.max_burst_size {
-            let max_segment_size = self.caps.max_transmission_unit - 20 - tcp.header_len();
+            let max_segment_size = self.caps.max_transmission_unit - 20 - TCP_HEADER_LEN;
             let max_window_size = max_burst_size * max_segment_size;
             if tcp.window_len as usize > max_window_size {
                 tcp.window_len = max_window_size as u16;
             }
         }
-        let header_len = 14usize
-            .checked_add(ip4.buffer_len())
-            .and_then(|len| len.checked_add(tcp.header_len()))
-            .expect("TCP frame header length exceeds usize");
-        let tx_checksum = self.tx_checksum(&ip, tcp.header_len());
-        // dispatch passes only a `Seg::Whole` frame, which `TxQueue::segment` found unique.
-        let Ok(mut frame) = frame.into_unique() else {
-            panic!("whole TCP frame is shared");
-        };
+        let header_len = 14 + ip4.buffer_len() + TCP_HEADER_LEN;
+        let tx_checksum = self.tx_checksum(&ip, TCP_HEADER_LEN);
         let (headers, payload) = frame.headroom_mut(header_len);
         template.emit_header(headers, &ip4, &tcp, payload, &self.caps.checksum);
         let frame = frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum);

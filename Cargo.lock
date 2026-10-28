@@ -1379,6 +1379,8 @@ dependencies = [
  "byteorder",
  "heapless",
  "managed",
+ "zhida-buffer",
+ "zhida-dpdk-sys",
 ]
 
 [[package]]

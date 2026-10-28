@@ -5,7 +5,7 @@
 use core::fmt::Display;
 use core::fmt;
 
-use crate::phy::{HeldFrames, PacketMeta, RxBuf, TxBuf, TxFrame, TxSource};
+use crate::phy::{HeldFrames, PacketMeta, RxBuf, TxBuf, TxFrame, TxSource, UniqueTxBuf};
 use crate::socket::{Context, PollAt};
 use crate::time::{Duration, Instant};
 use crate::wire::{
@@ -1532,7 +1532,7 @@ impl<'a> Socket<'a> {
         if frame.len() == 0 {
             return Err((frame, SendFrameError::Empty));
         }
-        self.max_segment_payload().expect("sendable TCP socket is not synchronized");
+        debug_assert!(self.max_segment_payload().is_some(), "sendable TCP socket is not synchronized");
         if frame.len() > self.tx_queue.byte_room() || self.tx_queue.frame_room() == 0 {
             return Err((frame, SendFrameError::Full));
         }
@@ -1549,21 +1549,20 @@ impl<'a> Socket<'a> {
         if !self.may_send() {
             return Err(SendError::InvalidState);
         }
-        self.max_segment_payload().expect("sendable TCP socket is not synchronized");
+        debug_assert!(self.max_segment_payload().is_some(), "sendable TCP socket is not synchronized");
         let frame_payload = self.tx_seg_bytes as usize;
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 && self.tx_queue.frame_room() != 0 {
-            let Some(mut buf) = self.tx_queue.source().alloc() else {
+            let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
                 break;
             };
             let count = (data.len() - written)
                 .min(frame_payload)
                 .min(self.tx_queue.byte_room());
-            assert!(buf.capacity() >= count, "TX source buffer is smaller than its segment bound");
             buf.room_mut()[..count].copy_from_slice(&data[written..written + count]);
             buf.set_len(count);
-            self.tx_queue.push(buf);
-            written = written.checked_add(count).expect("TX write count exceeds usize");
+            self.tx_queue.push(buf.into_buf());
+            written += count;
         }
         Ok(written)
     }
@@ -3056,7 +3055,7 @@ impl<'a> Socket<'a> {
         F: FnOnce(
             &mut Context,
             PacketMeta,
-            (IpRepr, TcpRepr<'_>, Option<TxBuf>),
+            (IpRepr, TcpRepr<'_>, Option<UniqueTxBuf>),
         ) -> (Result<(), E>, Option<TxBuf>),
     {
         if self.tuple.is_none() {
@@ -3282,19 +3281,12 @@ impl<'a> Socket<'a> {
                         self.tx_queue.copy_segment(0, size, &mut coalesced_payload);
                         repr.payload = &coalesced_payload;
                         payload_len = size;
-                    } else {
-                        let whole_index = match self.tx_queue.segment(0, size) {
-                            Seg::Whole { index } => Some(index),
-                            _ => None,
-                        };
-                        if let Some(index) = whole_index {
-                            let frame = self.tx_queue.take(index);
-                            payload_len = frame.len();
-                            whole_frame = Some((index, frame));
-                        } else if let Seg::Cut(bytes) = self.tx_queue.segment(0, size) {
-                            repr.payload = bytes;
-                            payload_len = bytes.len();
-                        }
+                    } else if let Some((index, frame)) = self.tx_queue.take_whole(0, size) {
+                        payload_len = frame.len();
+                        whole_frame = Some((index, frame));
+                    } else if let Seg::Cut(bytes) = self.tx_queue.segment(0, size) {
+                        repr.payload = bytes;
+                        payload_len = bytes.len();
                     }
 
                     is_fast_retransmit = true;
@@ -3356,21 +3348,16 @@ impl<'a> Socket<'a> {
                             .copy_segment(offset, segment_size, &mut coalesced_payload);
                         repr.payload = &coalesced_payload;
                         payload_len = segment_size;
-                    } else {
-                        let whole_index = match self.tx_queue.segment(offset, segment_size) {
-                            Seg::Whole { index } => Some(index),
-                            _ => None,
-                        };
-                        if let Some(index) = whole_index {
-                            let frame = self.tx_queue.take(index);
-                            payload_len = frame.len();
-                            whole_frame = Some((index, frame));
-                        } else if segment_size != 0 {
-                            self.tx_queue
-                                .copy_segment(offset, segment_size, &mut coalesced_payload);
-                            repr.payload = &coalesced_payload;
-                            payload_len = segment_size;
-                        }
+                    } else if let Some((index, frame)) =
+                        self.tx_queue.take_whole(offset, segment_size)
+                    {
+                        payload_len = frame.len();
+                        whole_frame = Some((index, frame));
+                    } else if segment_size != 0 {
+                        self.tx_queue
+                            .copy_segment(offset, segment_size, &mut coalesced_payload);
+                        repr.payload = &coalesced_payload;
+                        payload_len = segment_size;
                     }
 
                     offset
@@ -3677,9 +3664,9 @@ fn rtt_sampling_round_trips() {
 #[cfg(test)]
 #[test]
 fn socket_size_matches_main() {
-    // TxQueue holds frame entries and their TxSource instead of a borrowed byte ring; the
-    // TxSource is a thin Rc to the concrete pool.
-    let main_size = 448;
+    // TxQueue holds frame entries, their end position and their TxSource instead of a borrowed
+    // byte ring; the TxSource is a thin Rc to the concrete pool.
+    let main_size = 456;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
 }
@@ -3943,9 +3930,9 @@ mod test {
         }
     }
 
-    fn frame_payload<'b>(repr: TcpRepr<'b>, frame: &'b Option<TxBuf>) -> TcpRepr<'b> {
+    fn frame_payload<'b>(repr: TcpRepr<'b>, frame: &'b Option<UniqueTxBuf>) -> TcpRepr<'b> {
         TcpRepr {
-            payload: frame.as_ref().map_or(repr.payload, TxBuf::payload),
+            payload: frame.as_ref().map_or(repr.payload, UniqueTxBuf::payload),
             ..repr
         }
     }
@@ -4020,7 +4007,7 @@ mod test {
 
                 net_trace!("recv: {}", tcp_repr);
                 sent += 1;
-                (Ok(f(Ok(tcp_repr))), frame)
+                (Ok(f(Ok(tcp_repr))), frame.map(UniqueTxBuf::into_buf))
             });
         match result {
             Ok(()) => assert_eq!(sent, 1, "Exactly one packet should be sent"),
@@ -4035,7 +4022,7 @@ mod test {
         let mut fail = false;
         let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _, (_, _, frame)| {
             fail = true;
-            (Ok(()), frame)
+            (Ok(()), frame.map(UniqueTxBuf::into_buf))
         });
         if fail {
             panic!("Should not send a packet")
@@ -5037,7 +5024,7 @@ mod test {
                     emitted = true;
                     assert_eq!(segment.seq_number, LOCAL_SEQ + 1 + offset);
                     assert_eq!(segment.payload, &[0xa5; 1024][..len]);
-                    (Ok::<_, ()>(()), frame)
+                    (Ok::<_, ()>(()), frame.map(UniqueTxBuf::into_buf))
                 })
                 .unwrap();
             assert!(emitted);
@@ -5052,7 +5039,7 @@ mod test {
                 emitted = true;
                 assert_eq!(segment.seq_number, LOCAL_SEQ + 1);
                 assert_eq!(segment.payload, &[0xa5; 512]);
-                (Ok::<_, ()>(()), frame)
+                (Ok::<_, ()>(()), frame.map(UniqueTxBuf::into_buf))
             })
             .unwrap();
         assert!(emitted);
@@ -5999,9 +5986,9 @@ mod test {
         let mut emitted = None;
         s.socket
             .dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
-                let payload = frame.as_ref().map_or(repr.payload, TxBuf::payload).to_vec();
+                let payload = frame.as_ref().map_or(repr.payload, UniqueTxBuf::payload).to_vec();
                 emitted = Some((repr.control, repr.seq_number, payload, frame.is_some()));
-                (Ok::<_, ()>(()), frame)
+                (Ok::<_, ()>(()), frame.map(UniqueTxBuf::into_buf))
             })
             .unwrap();
         emitted.expect("missing TCP segment")
@@ -6242,7 +6229,7 @@ mod test {
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         assert_eq!(
-            s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame)),
+            s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame.map(UniqueTxBuf::into_buf))),
             Err(())
         );
         assert_eq!((s.send_queue(), s.tx_queue.frames()), (4, 1));
@@ -6407,7 +6394,7 @@ mod test {
             let result = s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 let repr = frame_payload(repr, &frame);
                 assert!(repr.segment_len() > 0);
-                (Err::<(), _>(()), frame)
+                (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))
             });
             if probe && expiry == 0 {
                 assert_eq!(result, Ok(()));
@@ -6429,7 +6416,7 @@ mod test {
             assert!(now > s.cx.now(), "failed emit did not re-arm the orphan timer");
         }
         s.cx.set_now(now);
-        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame));
+        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf)));
         if orphaned {
             assert_eq!(result, Ok(()));
             assert_eq!(s.state(), State::Closed);
@@ -6466,7 +6453,7 @@ mod test {
             s.cx.set_now(expires_at);
             assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 assert_eq!(repr.control, TcpControl::Fin);
-                (Err::<(), _>(()), frame)
+                (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
             assert_eq!(s.rto_backoff, expiry);
             assert_eq!(s.state(), State::FinWait1);
@@ -6505,7 +6492,7 @@ mod test {
             assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.payload, b"a");
-                (Err::<(), _>(()), frame)
+                (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
             assert_eq!(s.rto_backoff, 1);
             assert_eq!(s.timer, Timer::ZeroWindowProbe { expires_at, backoff_applied: true });
@@ -6694,7 +6681,7 @@ mod test {
             assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 attempts += 1;
                 assert_eq!(repr.control, TcpControl::Rst);
-                (Err(()), frame)
+                (Err(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
             assert_eq!(attempts, 1);
             assert_eq!(s.state(), State::Closed);
@@ -6742,13 +6729,13 @@ mod test {
         drop(held);
         assert!(s.window_to_update());
         s.orphan(Instant::ZERO);
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Err(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))), Err(()));
         assert!(s.window_to_update());
         s.cx.set_now(Instant::from_millis(60_001));
         let mut attempts = 0;
         let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| {
             attempts += 1;
-            (Err(()), frame)
+            (Err(()), frame.map(UniqueTxBuf::into_buf))
         });
         assert_eq!(attempts, 0, "expired close timer must not emit a window update");
         assert_eq!(result, Ok(()));
@@ -7698,7 +7685,7 @@ mod test {
         s.cx.set_now(Instant::from_millis(200));
         assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
             assert_eq!(repr, syn_ack);
-            (Err(()), frame)
+            (Err(()), frame.map(UniqueTxBuf::into_buf))
         }), Err(()));
         assert!(!s.timer.is_retransmit());
         recv!(s, time 300, [syn_ack]);
@@ -8158,7 +8145,7 @@ mod test {
                         assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + sent);
                         len = repr.payload.len();
                         assert_eq!(len, (expected - sent).min(BASE_MSS as usize));
-                        (Ok::<(), ()>(()), frame)
+                        (Ok::<(), ()>(()), frame.map(UniqueTxBuf::into_buf))
                     })
                     .unwrap();
                 if len == 0 {
@@ -8313,7 +8300,7 @@ mod test {
                 .dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                     let repr = frame_payload(repr, &frame);
                     len = repr.payload.len();
-                    (Ok::<(), ()>(()), frame)
+                    (Ok::<(), ()>(()), frame.map(UniqueTxBuf::into_buf))
                 })
                 .unwrap();
             if len == 0 {
@@ -16403,7 +16390,7 @@ mod test {
             let repr = frame_payload(repr, &frame);
             assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
             assert_eq!(repr.payload, b"aaa");
-            (Err(()), frame)
+            (Err(()), frame.map(UniqueTxBuf::into_buf))
         });
         assert_eq!(result, Err(()));
         assert!(s.pending_fast_retransmit);
@@ -17087,7 +17074,7 @@ mod test {
         s.cx.set_now(Instant::from_millis(20));
         let result: Result<(), ()> = s.socket.dispatch(
             &mut s.cx,
-            |_, _, (_, _, frame)| (Err(()), frame),
+            |_, _, (_, _, frame)| (Err(()), frame.map(UniqueTxBuf::into_buf)),
         );
         assert_eq!(result, Err(()));
         s
@@ -17186,7 +17173,7 @@ mod test {
             let repr = frame_payload(repr, &frame);
             assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
             assert_eq!(repr.payload, b"aaa");
-            (Err(()), frame)
+            (Err(()), frame.map(UniqueTxBuf::into_buf))
         }), Err(()));
         // The reordered original segment fills the hole, leaving only FIN unacknowledged.
         partial_ack(&mut s, LOCAL_SEQ + 13);
@@ -17197,7 +17184,7 @@ mod test {
                 assert_eq!(repr.control, TcpControl::Fin);
                 assert_eq!(repr.seq_number, LOCAL_SEQ + 13);
                 assert!(repr.payload.is_empty());
-                (Err(()), frame)
+                (Err(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
             assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(330)));
             assert_eq!((s.retransmits(), s.loss_events()), (0, 1));
@@ -17255,7 +17242,7 @@ mod test {
         for _ in 0..3 {
             partial_ack(&mut s, LOCAL_SEQ + 7);
         }
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Ok::<_, ()>(()), frame)), Ok(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Ok::<_, ()>(()), frame.map(UniqueTxBuf::into_buf))), Ok(()));
         assert_eq!(s.congestion_controller.window(), window);
     }
 
@@ -17268,7 +17255,7 @@ mod test {
                 let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.seq_number, LOCAL_SEQ + 7);
                 assert_eq!(repr.payload, b"ccc");
-                (Err(()), frame)
+                (Err(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
         }
         recv!(s, time 30, [TcpRepr {
@@ -17356,9 +17343,9 @@ mod test {
             payload: b"aaa",
             ..RECV_TEMPL
         }));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Ok(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))), Ok(()));
         s.cx.set_now(Instant::from_millis(320));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Err(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))), Err(()));
         assert_eq!(s.recover(), None);
         assert!(!s.pending_fast_retransmit);
         partial_ack(&mut s, LOCAL_SEQ + 7);
@@ -17371,7 +17358,7 @@ mod test {
         assert_eq!(s.retransmits(), 0);
         assert_eq!(s.loss_events(), 1);
         for _ in 0..2 {
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame)), Err(()));
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))), Err(()));
             assert_eq!(s.retransmits(), 0);
             assert_eq!(s.loss_events(), 1);
         }
@@ -18738,7 +18725,7 @@ mod test {
             assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.payload, b"a");
-                (Err(()), frame)
+                (Err(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
             assert_eq!(s.rto_backoff, 1);
             assert!(matches!(s.timer, Timer::ZeroWindowProbe { backoff_applied: true, .. }));
@@ -18771,7 +18758,7 @@ mod test {
         send!(s, time 100, ack);
         assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(400)));
         s.cx.set_now(Instant::from_millis(400));
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame)), Err(()));
+        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame.map(UniqueTxBuf::into_buf))), Err(()));
         for _ in 0..3 {
             send!(s, time 410, ack);
         }
@@ -18967,7 +18954,7 @@ mod test {
                     assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                         let repr = frame_payload(repr, &frame);
                         assert_eq!(repr.payload, b"a");
-                        (Err(()), frame)
+                        (Err(()), frame.map(UniqueTxBuf::into_buf))
                     }), Err(()));
                     assert_eq!(s.rto_backoff, 1);
                     assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
@@ -19585,7 +19572,7 @@ mod test {
         assert_eq!(
             s.socket.dispatch(&mut s.cx, |_, _, (ip_repr, _, frame)| {
                 assert_eq!(ip_repr.hop_limit(), 0x2a);
-                (Ok::<_, ()>(()), frame)
+                (Ok::<_, ()>(()), frame.map(UniqueTxBuf::into_buf))
             }),
             Ok(())
         );
@@ -20445,7 +20432,7 @@ mod test {
                 let repr = frame_payload(repr, &frame);
                 assert_eq!(repr.seq_number, LOCAL_SEQ + 1);
                 assert_eq!(repr.payload, b"abcdef");
-                (Err(()), frame)
+                (Err(()), frame.map(UniqueTxBuf::into_buf))
             }), Err(()));
             assert!(!s.timer.is_retransmit());
             assert_eq!(s.rtte.timestamp(), None);

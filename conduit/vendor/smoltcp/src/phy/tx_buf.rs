@@ -390,12 +390,37 @@ mod owner {
 pub(crate) struct UniqueTxBuf(TxBuf);
 
 impl UniqueTxBuf {
+    /// `TxBuf::room_mut` without the refcount read.
+    #[inline]
+    pub(crate) fn room_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the only reference (`into_unique`, `alloc_unique`), and the mutable borrow
+        // prevents another view.
+        unsafe { slice::from_raw_parts_mut(self.0.data.as_ptr(), self.0.capacity()) }
+    }
+
+    /// `TxBuf::set_len` without the refcount read. Panics if `len` exceeds the room.
+    #[inline]
+    pub(crate) fn set_len(&mut self, len: usize) {
+        assert!(len <= self.0.capacity(), "TX payload length exceeds room");
+        self.0.len = len as u32;
+    }
+
     /// The `header_len` bytes in front of the payload, and the payload. Panics if
     /// `header_len > TX_HEADROOM`.
     #[inline]
     pub(crate) fn headroom_mut(&mut self, header_len: usize) -> (&mut [u8], &[u8]) {
         // SAFETY: a UniqueTxBuf is the only reference (`into_unique`) and cannot be cloned.
         unsafe { self.0.headroom_unchecked(header_len) }
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub(crate) fn payload(&self) -> &[u8] {
+        self.0.payload()
     }
 
     #[inline]
@@ -422,6 +447,12 @@ impl TxSource {
     #[inline]
     pub fn alloc(&self) -> Option<TxBuf> {
         owner::alloc(&self.0)
+    }
+
+    /// `alloc` as a `UniqueTxBuf`: a fresh buffer holds the only reference.
+    #[inline]
+    pub(crate) fn alloc_unique(&self) -> Option<UniqueTxBuf> {
+        owner::alloc(&self.0).map(UniqueTxBuf)
     }
 
     #[inline]
@@ -589,6 +620,24 @@ mod tests {
             let _ = buf.packet(TX_HEADROOM + 1);
         }))
         .is_err());
+    }
+
+    /// A buffer from `alloc_unique` is written and sized without refcount reads, keeps the
+    /// room limit, and becomes an ordinary buffer with the written payload.
+    #[test]
+    fn alloc_unique_writes_payload_within_room() {
+        let pool = TxPool::new(4);
+        let source = TxSource::new(pool.clone());
+        let mut buf = source.alloc_unique().unwrap();
+        buf.room_mut()[..3].copy_from_slice(&[7, 8, 9]);
+        buf.set_len(3);
+        assert_eq!((buf.len(), buf.payload()), (3, &[7, 8, 9][..]));
+        assert!(catch_unwind(AssertUnwindSafe(|| buf.set_len(5))).is_err());
+        let buf = buf.into_buf();
+        assert!(buf.unique());
+        assert_eq!(buf.payload(), &[7, 8, 9]);
+        drop(buf);
+        assert_eq!(pool.live(), 0);
     }
 
     #[test]

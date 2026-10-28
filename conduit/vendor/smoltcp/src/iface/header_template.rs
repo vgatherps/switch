@@ -200,8 +200,8 @@ impl TcpTemplate {
         payload: &[u8],
         checksum: &ChecksumCapabilities,
     ) {
-        assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
-        assert!(tcp.header_len() == 20, "TCP frame header carries options");
+        debug_assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
+        debug_assert_eq!(tcp.header_len(), 20, "TCP frame header carries options");
         self.prefix.emit(frame, ip, checksum);
         let mut packet = TcpPacket::new_unchecked(&mut frame[34..]);
         packet.set_src_port(tcp.src_port);
