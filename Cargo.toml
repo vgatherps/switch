@@ -38,12 +38,37 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-# cephalopod
+# external
+criterion = "0.5"
 libc = "0.2"
+proptest = "1.5"
+quickcheck = "1"
+quickcheck_macros = "1"
+serde = "1"
+serde_json = "1"
+tungstenite = "=0.30.0"
+
+# internal
+binance-feed = { path = "conduit/crates/binance-feed" }
 ceph-rseq = { path = "cephalopod/crates/rseq" }
 ceph-ring = { path = "cephalopod/crates/ring" }
+ceph-fifo = { path = "cephalopod/crates/fifo" }
 ceph-proto = { path = "cephalopod/crates/proto" }
 ceph-control = { path = "cephalopod/crates/control" }
+depot = { path = "depot" }
+dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
+smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-features = false }
+sockperf-wire = { path = "conduit/crates/sockperf-wire" }
+stack-stream = { path = "conduit/crates/stack-stream" }
+switch = { path = "switch" }
+tap-echo = { path = "conduit/crates/tap-echo" }
+zhida-buffer = { path = "conduit/crates/zhida-buffer" }
+zhida-dpdk-sys = { path = "conduit/crates/zhida-dpdk-sys" }
+zhida-netconf = { path = "conduit/crates/netconf" }
+zhida-open = { path = "conduit/crates/netconf-open" }
+zhida-test-kit = { path = "conduit/test-support/kit" }
+zhida-test-support = { path = "conduit/test-support" }
+zhida-test-support-macros = { path = "conduit/test-support/macros" }
 
 [workspace.lints.clippy]
 doc_lazy_continuation = "allow"

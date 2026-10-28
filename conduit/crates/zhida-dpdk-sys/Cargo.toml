@@ -1,6 +1,6 @@
 [package]
 name = "zhida-dpdk-sys"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 build = "build.rs"
 license.workspace = true
@@ -11,7 +11,7 @@ pkg-config = "0.3"
 cc = "1.0"
 
 [dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-zhida-test-support = { path = "../../test-support" }
+zhida-test-support.workspace = true
