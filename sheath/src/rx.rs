@@ -33,7 +33,6 @@ enum State {
 enum Src {
     Frame,
     Scratch,
-    Carry,
 }
 
 /// The unconsumed plaintext of the record the last `chunk` returned.
@@ -46,7 +45,7 @@ struct Run {
 
 impl Run {
     const NONE: Run = Run {
-        src: Src::Carry,
+        src: Src::Scratch,
         at: 0..0,
         stamp: 0,
     };
@@ -67,7 +66,7 @@ pub struct TlsRx<F, L> {
     frame: Option<F>,
     /// Bytes at the front of `frame` that rustls has consumed.
     pos: usize,
-    /// Records straddling frames or left by `take_frame`, after the `seen` bytes.
+    /// A record straddling frames, after the `seen` bytes.
     scratch: Vec<u8>,
     /// Stamp of the frame holding the first byte of the record after the `seen` bytes in
     /// `scratch`.
@@ -77,8 +76,6 @@ pub struct TlsRx<F, L> {
     /// Bytes at the front of the source taken by the run's record; dropped once the run is
     /// used up.
     returned: usize,
-    /// Plaintext of a record whose frame `take_frame` moved out.
-    carry: Vec<u8>,
     state: State,
     _tx: PhantomData<fn(&mut TlsTx<L>)>,
 }
@@ -99,7 +96,6 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
             seen: 0,
             run: Run::NONE,
             returned: 0,
-            carry: Vec::new(),
             state: State::Open,
             _tx: PhantomData,
         }
@@ -241,7 +237,7 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         self.run = Run { src, at, stamp: 0 };
     }
 
-    /// Drops the used-up run: its record's bytes in the source, or the carry.
+    /// Drops the used-up run: its record's bytes in the source.
     fn drop_run(&mut self) {
         let returned = core::mem::take(&mut self.returned);
         match self.run.src {
@@ -249,7 +245,6 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
             Src::Scratch => {
                 self.scratch.drain(..returned);
             }
-            Src::Carry => self.carry.clear(),
         }
         self.run = Run::NONE;
     }
@@ -259,7 +254,6 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         let bytes = match self.run.src {
             Src::Frame => &mut self.frame.as_mut().expect("the run's frame").payload_mut()[at],
             Src::Scratch => &mut self.scratch[at],
-            Src::Carry => &mut self.carry[at],
         };
         Chunk {
             bytes,
@@ -307,7 +301,6 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         self.frame = None;
         self.scratch.clear();
         self.seen = 0;
-        self.carry.clear();
         self.run = Run::NONE;
         self.returned = 0;
     }
@@ -354,14 +347,13 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
     }
 
     /// The unconsumed plaintext of the run the last `chunk` returned (empty if none): exactly
-    /// those bytes, unchanged, until the next `chunk`, `push` or `take_frame`. relay relies on
+    /// those bytes, unchanged, until the next `chunk` or `push`. relay relies on
     /// this to read text it validated at receipt without validating again.
     pub fn current(&self) -> &[u8] {
         let at = self.run.at.clone();
         match self.run.src {
             Src::Frame => &self.frame.as_ref().expect("the run's frame").payload()[at],
             Src::Scratch => &self.scratch[at],
-            Src::Carry => &self.carry[at],
         }
     }
 
@@ -369,34 +361,6 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
     pub fn consume(&mut self, n: usize) {
         assert!(n <= self.run.at.len(), "consume past the current run");
         self.run.at.start += n;
-    }
-
-    /// Moves out the frame holding the current record: its plaintext's first `len` bytes are
-    /// consumed, the rest of the record's plaintext is copied to a carry buffer and the bytes
-    /// after the record to `scratch`, so later chunks are unaffected.
-    pub fn take_frame(&mut self, len: usize) -> Option<(F, usize)> {
-        if self.run.src != Src::Frame || self.run.at.is_empty() {
-            return None;
-        }
-        assert!(len <= self.run.at.len(), "take_frame past the current run");
-        let frame = self.frame.take().expect("the run's frame");
-        let start = self.run.at.start;
-        let payload = frame.payload();
-        self.carry.clear();
-        self.carry
-            .extend_from_slice(&payload[start + len..self.run.at.end]);
-        debug_assert!(self.scratch.is_empty() && self.seen == 0);
-        self.scratch
-            .extend_from_slice(&payload[self.pos + self.returned..]);
-        self.scratch_stamp = frame.rx_timestamp();
-        self.pos = 0;
-        self.returned = 0;
-        self.run = Run {
-            src: Src::Carry,
-            at: 0..self.carry.len(),
-            stamp: self.run.stamp,
-        };
-        Some((frame, start))
     }
 }
 

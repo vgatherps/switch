@@ -1,4 +1,4 @@
-//! Validation rules, fail-fast UTF-8, control frames, `take`, and where
+//! Validation rules, fail-fast UTF-8, control frames, and where
 //! message bytes live.
 
 use std::cell::Cell;
@@ -258,60 +258,6 @@ fn spanning_message_is_copied_and_stamped_by_its_first_byte() {
     let run = drive(&mut rx(Role::Client), &split(&wire, &[1, 2]));
     assert!(run.msgs[0].direct);
     assert_eq!(run.msgs[0].stamp, stamp(0));
-}
-
-#[test]
-fn take_moves_the_frame_out() {
-    let wire = [encode(fin(TEXT), None, b"one"), encode(fin(TEXT), None, b"two")].concat();
-    let mut r = rx(Role::Client);
-    r.push(VecFrame { data: wire, stamp: 7 }, &mut ()).unwrap();
-    let t = match r.recv(&mut ()).unwrap().unwrap().take() {
-        Ok(t) => t,
-        Err(_) => panic!("direct message not taken"),
-    };
-    assert_eq!(t.bytes(), b"one");
-    assert_eq!(t.text(), Some("one"));
-    assert_eq!(t.rx_timestamp(), 7);
-    // The rest of the frame was kept: the second message still arrives, now from
-    // the lower layer's carry, so it cannot be taken.
-    let m = r.recv(&mut ()).unwrap().unwrap();
-    assert_eq!(m.text(), Some("two"));
-    assert_eq!(m.rx_timestamp(), 7);
-    let m = match m.take() {
-        Ok(_) => panic!("carry message taken"),
-        Err(m) => m,
-    };
-    assert_eq!(m.bytes(), b"two");
-    assert!(r.recv(&mut ()).unwrap().is_none());
-    let f = t.into_frame();
-    assert_eq!(&f.data[2..5], b"one");
-}
-
-#[test]
-fn take_of_scratch_message_gives_it_back() {
-    let wire = encode(fin(BINARY), None, b"spans");
-    let mut r = rx(Role::Client);
-    r.push(VecFrame { data: wire[..4].to_vec(), stamp: 1 }, &mut ()).unwrap();
-    assert!(r.recv(&mut ()).unwrap().is_none());
-    r.push(VecFrame { data: wire[4..].to_vec(), stamp: 2 }, &mut ()).unwrap();
-    let m = r.recv(&mut ()).unwrap().unwrap();
-    let m = match m.take() {
-        Ok(_) => panic!("scratch message taken"),
-        Err(m) => m,
-    };
-    assert_eq!(m.bytes(), b"spans");
-    assert_eq!(m.rx_timestamp(), 1);
-}
-
-#[test]
-fn taken_frame_with_nothing_left_needs_a_push() {
-    let mut r = rx(Role::Client);
-    r.push(VecFrame { data: encode(fin(BINARY), None, b"x"), stamp: 3 }, &mut ()).unwrap();
-    let Ok(t) = r.recv(&mut ()).unwrap().unwrap().take() else { panic!() };
-    assert_eq!(t.bytes(), b"x");
-    assert!(r.recv(&mut ()).unwrap().is_none());
-    r.push(VecFrame { data: encode(fin(TEXT), None, b"y"), stamp: 4 }, &mut ()).unwrap();
-    assert_eq!(r.recv(&mut ()).unwrap().unwrap().rx_timestamp(), 4);
 }
 
 #[test]

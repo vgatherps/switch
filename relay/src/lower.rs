@@ -22,15 +22,11 @@ pub(crate) trait PlainRx {
     /// call returns the same bytes, including changes the caller made to them.
     fn chunk(&mut self, tx: &mut Self::Tx) -> Result<Option<Chunk<'_>>, Self::Error>;
     /// The unconsumed bytes of the run the last `chunk` returned; empty if none. Exactly those
-    /// bytes, unchanged, until the next `chunk`, `push` or `take_frame`: text validated at
-    /// receipt is read back through this without validating again.
+    /// bytes, unchanged, until the next `chunk` or `push`: text validated at receipt is read
+    /// back through this without validating again.
     fn current(&self) -> &[u8];
     /// Mark the first `n` bytes of `current()` consumed. Frees nothing.
     fn consume(&mut self, n: usize);
-    /// If the current run lies inside a frame: consume its first `len` bytes and move the
-    /// frame out, with the offset of those bytes in `payload()`. Bytes after them stay readable
-    /// through later chunks. `None`, with nothing consumed, when the run is not inside a frame.
-    fn take_frame(&mut self, len: usize) -> Option<(Self::Frame, usize)>;
 }
 
 /// The send half below WebSocket: sheath's frame sender, plus the records the lower layer
@@ -66,10 +62,6 @@ impl<F: RxFrame, L: FrameTx> PlainRx for TlsRx<F, L> {
 
     fn consume(&mut self, n: usize) {
         TlsRx::consume(self, n)
-    }
-
-    fn take_frame(&mut self, len: usize) -> Option<(F, usize)> {
-        TlsRx::take_frame(self, len)
     }
 }
 

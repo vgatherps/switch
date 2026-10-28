@@ -55,6 +55,8 @@ struct Wss {
     framed: usize,
     /// Stream offset where each pushed frame starts; frame `i` is stamped `i`.
     frame_starts: Vec<usize>,
+    /// Where each pushed frame's bytes are in memory.
+    frame_bytes: Vec<std::ops::Range<*const u8>>,
 }
 
 impl Wss {
@@ -72,6 +74,7 @@ impl Wss {
             to_client: Vec::new(),
             framed: 0,
             frame_starts: Vec::new(),
+            frame_bytes: Vec::new(),
         };
         w.server_flush();
         assert!(w.client_read(FRAME_ROOM).is_empty());
@@ -140,6 +143,7 @@ impl Wss {
         let stamp = self.frame_starts.len() as u64;
         self.frame_starts.push(self.framed);
         self.framed += len;
+        self.frame_bytes.push(data.as_ptr_range());
         self.rx.push_via(VecFrame { data, stamp }, &mut self.tx).unwrap();
     }
 
@@ -294,7 +298,7 @@ fn close_started_by_the_server() {
 }
 
 /// One record cut at every offset across two frames: the message comes out of sheath's scratch
-/// copy, stamped with the frame holding the record's first byte, and cannot be taken.
+/// copy, stamped with the frame holding the record's first byte.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn record_split_across_frames() {
@@ -316,72 +320,65 @@ fn record_split_across_frames() {
         assert_eq!(want, w.frame_starts.len() as u64 - 2);
         let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
         assert_eq!(m.rx_timestamp(), want, "cut {cut}");
-        let Err(m) = m.take() else { panic!("message from a straddling record taken, cut {cut}") };
         assert_eq!(m.bytes(), payload);
         assert!(w.rx.recv_via(&mut w.tx).unwrap().is_none());
     }
     assert_eq!(record, Some(5 + 2 + 109 + 17));
 }
 
-/// A message inside one record inside one frame is taken with its frame: the payload is read
-/// in place, where rustls decrypted it.
+/// A message inside one record inside one frame is read in place, where rustls decrypted it in
+/// the frame; two records in one frame both come out of it.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn take_message_inside_one_record() {
+fn message_inside_one_record_is_read_in_the_frame() {
     let mut w = Wss::new();
     let payload = message(5, 109);
     let at = w.server_send(vec![TMessage::Binary(payload.clone().into())]);
     w.push(FRAME_ROOM);
     let want = w.stamp_of(at);
+    let frame = w.frame_bytes.last().unwrap().clone();
     let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
     assert_eq!(m.rx_timestamp(), want);
-    let Ok(t) = m.take() else { panic!("direct message not taken") };
-    assert_eq!(t.bytes(), payload);
-    assert_eq!(t.rx_timestamp(), want);
-    let p = t.bytes().as_ptr();
-    let frame = t.into_frame();
-    assert!(frame.data.as_ptr_range().contains(&p), "payload not inside the frame");
+    assert_eq!(m.bytes(), payload);
     // Record header (5) + WebSocket header (2): the payload sits right behind them.
-    assert_eq!(p, frame.data[7..].as_ptr());
+    assert_eq!(m.bytes().as_ptr(), frame.start.wrapping_add(7));
     assert!(w.rx.recv_via(&mut w.tx).unwrap().is_none());
 
-    // Two records in one frame: taking the first keeps the second readable.
     let first = w.server_send(vec![TMessage::Binary(b"one".to_vec().into())]);
     w.server_send(vec![TMessage::Binary(b"two".to_vec().into())]);
     w.push(FRAME_ROOM);
     let want = w.stamp_of(first);
-    let Ok(t) = w.rx.recv_via(&mut w.tx).unwrap().unwrap().take() else { panic!() };
-    assert_eq!(t.bytes(), b"one");
-    assert_eq!(t.rx_timestamp(), want);
-    let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
-    assert_eq!(m.bytes(), b"two");
-    assert_eq!(m.rx_timestamp(), want);
+    let frame = w.frame_bytes.last().unwrap().clone();
+    for expected in [&b"one"[..], b"two"] {
+        let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
+        assert_eq!((m.bytes(), m.rx_timestamp()), (expected, want));
+        assert!(frame.contains(&m.bytes().as_ptr()), "{expected:?} not read in the frame");
+    }
 }
 
 /// A message spanning records (rustls cuts plaintext at 16 KiB) is assembled in relay's
-/// scratch and given back by `take`.
+/// scratch, stamped with the frame holding its first byte.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn take_message_spanning_records_gives_it_back() {
+fn message_spanning_records_is_assembled() {
     let mut w = Wss::new();
     let payload = message(9, 40_000);
     let at = w.server_send(vec![TMessage::Binary(payload.clone().into())]);
     assert!(records(&w.to_client).len() >= 3);
-    let mut taken_back = false;
+    let mut received = false;
     loop {
         let want = w.stamp_of(at);
         match w.rx.recv_via(&mut w.tx).unwrap() {
             Some(m) => {
                 assert_eq!(m.rx_timestamp(), want);
-                let Err(m) = m.take() else { panic!("spanning message taken") };
                 assert_eq!(m.bytes(), payload);
-                taken_back = true;
+                received = true;
             }
             None if w.to_client.is_empty() => break,
             None => w.push(FRAME_ROOM),
         }
     }
-    assert!(taken_back);
+    assert!(received);
 }
 
 /// The server updates its keys and asks the client to (KeyUpdate with update_requested)

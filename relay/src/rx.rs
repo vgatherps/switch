@@ -1,8 +1,6 @@
 //! Receive core: parses WebSocket frames (RFC 6455) out of the lower layer's
 //! runs and hands out messages that borrow the received bytes in place.
 
-use sheath::RxFrame;
-
 use crate::lower::{PlainRx, PlainTx};
 use crate::tx::WsTx;
 use crate::utf8::Utf8;
@@ -522,12 +520,17 @@ impl<R: PlainRx> WsRx<R> {
     /// a valid close ends the connection with [`WsError::Closed`].
     ///
     /// The message borrows `self`, so no further `recv` runs while it is held.
-    pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_, R>>, WsError<R::Error>> {
+    pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_>>, WsError<R::Error>> {
         let at = match self.ready.take() {
             Some(at) => Some(at),
             None => self.next(tx)?,
         };
-        Ok(at.map(|at| Message { rx: self, at }))
+        let rx: &WsRx<R> = self;
+        Ok(at.map(|at| Message {
+            kind: at.kind,
+            bytes: if at.direct { &rx.lower.current()[..at.len] } else { &rx.core.scratch[..at.len] },
+            rx_timestamp: at.stamp,
+        }))
     }
 
     /// [`push`](Self::push) for a lower layer that receives through the send
@@ -541,7 +544,7 @@ impl<R: PlainRx> WsRx<R> {
 
     /// [`recv`](Self::recv) for a lower layer that receives through the send
     /// half's connection (TLS).
-    pub fn recv_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<Option<Message<'_, R>>, WsError<R::Error>>
+    pub fn recv_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<Option<Message<'_>>, WsError<R::Error>>
     where
         R: PlainRx<Tx = L>,
     {
@@ -605,85 +608,31 @@ impl<R: PlainRx> WsRx<R> {
     }
 }
 
-/// A received message, borrowing either the lower layer's run (direct) or
-/// the receive scratch.
-pub struct Message<'r, R: PlainRx> {
-    rx: &'r mut WsRx<R>,
-    at: Located,
+/// A received message, borrowing either the lower layer's run (direct) or the receive scratch.
+/// It borrows the receive half, so no further `recv` runs while it is held.
+pub struct Message<'r> {
+    kind: Kind,
+    bytes: &'r [u8],
+    rx_timestamp: u64,
 }
 
-impl<'r, R: PlainRx> Message<'r, R> {
+impl Message<'_> {
     pub fn kind(&self) -> Kind {
-        self.at.kind
+        self.kind
     }
 
     pub fn bytes(&self) -> &[u8] {
-        if self.at.direct {
-            &self.rx.lower.current()[..self.at.len]
-        } else {
-            &self.rx.core.scratch[..self.at.len]
-        }
+        self.bytes
     }
 
     /// `Some` iff text.
     pub fn text(&self) -> Option<&str> {
-        text(self.at.kind, self.bytes())
+        text(self.kind, self.bytes)
     }
 
     /// Stamp of the frame holding the message's first byte.
     pub fn rx_timestamp(&self) -> u64 {
-        self.at.stamp
-    }
-
-    /// The kind, the bytes for as long as the receive half stays borrowed, and the stamp.
-    pub fn into_parts(self) -> (Kind, &'r [u8], u64) {
-        let Message { rx, at } = self;
-        let rx: &'r WsRx<R> = rx;
-        let bytes = if at.direct { &rx.lower.current()[..at.len] } else { &rx.core.scratch[..at.len] };
-        (at.kind, bytes, at.stamp)
-    }
-
-    /// Move the frame holding the message out. Gives the message back when it
-    /// does not lie inside one frame.
-    pub fn take(self) -> Result<Taken<R::Frame>, Message<'r, R>> {
-        if !self.at.direct {
-            return Err(self);
-        }
-        match self.rx.lower.take_frame(self.at.len) {
-            Some((frame, start)) => {
-                self.rx.pending = 0;
-                Ok(Taken { frame, start, len: self.at.len, kind: self.at.kind, stamp: self.at.stamp })
-            }
-            None => Err(self),
-        }
-    }
-}
-
-/// A message together with the frame that holds it.
-#[derive(Debug)]
-pub struct Taken<F> {
-    frame: F,
-    start: usize,
-    len: usize,
-    kind: Kind,
-    stamp: u64,
-}
-
-impl<F: RxFrame> Taken<F> {
-    pub fn bytes(&self) -> &[u8] {
-        &self.frame.payload()[self.start..self.start + self.len]
-    }
-
-    pub fn text(&self) -> Option<&str> {
-        text(self.kind, self.bytes())
-    }
-
-    pub fn rx_timestamp(&self) -> u64 {
-        self.stamp
-    }
-
-    pub fn into_frame(self) -> F {
-        self.frame
+        self.rx_timestamp
     }
 }
 
@@ -698,6 +647,8 @@ pub(crate) fn text(kind: Kind, b: &[u8]) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use sheath::RxFrame;
+
     use super::*;
     use crate::raw::Raw;
 

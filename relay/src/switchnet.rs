@@ -13,7 +13,7 @@ use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
-use crate::rx::{Config, Kind, ProtocolError, Role, WsError, WsRx};
+use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx};
 use crate::tx::{TxError, WsTx};
 use crate::upgrade;
 
@@ -98,33 +98,6 @@ impl From<SendError> for Error {
 impl From<Infallible> for Error {
     fn from(e: Infallible) -> Self {
         match e {}
-    }
-}
-
-/// A received message. It borrows the connection, so no further `recv` runs while it is held.
-pub struct Message<'a> {
-    kind: Kind,
-    bytes: &'a [u8],
-    rx_timestamp: u64,
-}
-
-impl Message<'_> {
-    pub fn kind(&self) -> Kind {
-        self.kind
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        self.bytes
-    }
-
-    /// `Some` iff text.
-    pub fn text(&self) -> Option<&str> {
-        crate::rx::text(self.kind, self.bytes)
-    }
-
-    /// Stamp of the frame holding the message's first byte.
-    pub fn rx_timestamp(&self) -> u64 {
-        self.rx_timestamp
     }
 }
 
@@ -258,12 +231,10 @@ where
             }
             self.tx.flush().await?;
             if ready {
-                let m = match self.rx.recv_via(&mut self.tx) {
-                    Ok(m) => m.expect("has_message_via found one"),
+                return match self.rx.recv_via(&mut self.tx) {
+                    Ok(m) => Ok(Some(m.expect("has_message_via found one"))),
                     Err(_) => unreachable!("has_message_via found a message"),
                 };
-                let (kind, bytes, rx_timestamp) = m.into_parts();
-                return Ok(Some(Message { kind, bytes, rx_timestamp }));
             }
             let frame = self.tcp.recv().await.map_err(Error::Recv)?;
             if let Err(e) = self.rx.push_via(frame, &mut self.tx) {
