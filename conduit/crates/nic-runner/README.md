@@ -18,6 +18,13 @@ Applications use the same host setup (sections 1, 2, 3 and 3a) and build on `zhi
 from [crates/netconf-open/examples/tcp_client.rs](../netconf-open/examples/tcp_client.rs) and
 [docs/USAGE.md](../../docs/USAGE.md).
 
+The package is `nic-runner` and the binary is `zhida-nic`. It depends on `zhida-open`, `zhida-netconf`,
+`dpdk-smoltcp`, `zhida-dpdk-sys`, `binance-feed` and `sockperf-wire`; nothing depends on it. The modes live
+in `src/server.rs` (sockperf-server), `src/feed.rs` and `src/nic.rs` (info), with argument parsing in
+`src/args.rs`. `make test-nic-runner` runs `tests/run.sh` in the Docker image: the `zhida-nic` and
+sockperf-wire unit tests, `sockperf_merge.py --self-test`, then `zhida-nic` against kernel `sockperf`
+clients over a veth pair.
+
 ## 1. Which PMD, and what it offers
 The image builds net/ena, net/intel/{ixgbe,i40e,ice} and net/af_packet. `lspci -nn -s <BDF>` tells which:
 Intel 82599/X520/X540/X550 = ixgbe, X710/XL710/XXV710 = i40e, E810 = ice, Amazon ENA = ena.

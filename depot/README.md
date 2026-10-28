@@ -3,6 +3,10 @@
 Fixed-capacity slot allocator with generation-checked 32-bit handles, plus a pool layer of
 thread-owned static pools, RAII entities and claim-carrying ids.
 
+The crate has no dependencies. It is vendored into this workspace from `~/src/meminfra/depot`, and `switch`
+uses `DynDepot` to hand out task slots. It builds with the workspace's edition 2024 toolchain and needs no
+DPDK or Docker: `cargo test -p depot`.
+
 ## Allocator
 
 ### Sizing
@@ -60,7 +64,9 @@ again.
 | `free_unchecked` / `poison_unchecked` | unsafe; poison sets the byte to 0, so the slot is never handed out again |
 | `check_invariants()` | full consistency check of bitmaps, caches, ring and generation bytes |
 
-`DepotAlloc` is the trait the pool layer uses; `FixedDepot` is its only production implementation.
+`DepotAlloc` is the trait the pool layer uses. `FixedDepot` has compile-time capacity; `DynDepot::new(slots)`
+has runtime capacity (rounded up to a multiple of 64, at most 2^25, slot 0 reserved) and the same allocation
+algorithm, which `src/algorithm.rs` shares between the two.
 
 ## Pools
 
@@ -128,7 +134,9 @@ panic).
 | File | Contains |
 |------|----------|
 | `src/lib.rs` | `DepotHandle`, `DepotAlloc`, error types, `define_static_ecs!` |
-| `src/fixed.rs` | `FixedDepot`, bitmap hierarchy, `fixed_depot_type!` |
+| `src/fixed.rs` | `FixedDepot`, `fixed_depot_type!` |
+| `src/dyn_depot.rs` | `DynDepot`, the runtime-capacity depot |
+| `src/algorithm.rs` | `depot_algorithm!`: the bitmap hierarchy and allocation order both depots use |
 | `src/index_ring.rs` | 16-entry ring of freed handles |
 | `src/pool.rs` | claims, entities, ids, components, `GlobalPool`, `LocalPool` |
 | `src/test_heap.rs` | `SlabHeap<T>`: a pointer-linked max-heap on a depot, used as an allocator oracle |
