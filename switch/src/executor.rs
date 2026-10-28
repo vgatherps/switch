@@ -8,7 +8,6 @@
 //! `&mut self` borrows would invalidate those stored pointers.
 
 use std::mem::ManuallyDrop;
-use std::task::{Context, Waker};
 
 use crate::__private::Task;
 use crate::intrusive::NIL;
@@ -236,9 +235,7 @@ impl Executor {
                 turn.current = header;
                 let result = {
                     let _current = CurrentGuard::enter(this, header);
-                    let waker = ManuallyDrop::new(Waker::from_raw(crate::waker::raw(header)));
-                    let mut cx = Context::from_waker(&waker);
-                    Meta::poll_fn(TaskHeader::meta(header))(header, &mut cx)
+                    Meta::poll_fn(TaskHeader::meta(header))(header)
                 };
                 turn.current = std::ptr::null();
                 if result.is_ready() {
@@ -343,16 +340,11 @@ impl Executor {
         }
     }
 
-    /// Every slot header of every block this executor holds. Runs no user code.
+    /// Every slot header ever handed out by this executor's pools. Runs no user code.
     unsafe fn slots(this: *mut Self) -> impl Iterator<Item = *const TaskHeader> {
         unsafe {
-            (0..(*this).pools.len()).flat_map(move |pool| {
-                let pool = (&(*this).pools)[pool];
-                (0..RuntimePool::block_count(pool)).flat_map(move |block| {
-                    let meta = RuntimePool::block(pool, block);
-                    (0..Meta::slots(meta)).map(move |position| Meta::header(meta, position))
-                })
-            })
+            (0..(*this).pools.len())
+                .flat_map(move |pool| RuntimePool::headers((&(*this).pools)[pool]))
         }
     }
 
@@ -479,12 +471,11 @@ impl Default for Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::runtime::Runtime;
     use std::cell::Cell;
     use std::pin::Pin;
     use std::rc::Rc;
-    use std::task::Poll;
+    use std::task::{Context, Poll};
 
     struct YieldN(u32);
     impl Future for YieldN {

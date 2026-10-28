@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 
 #[path = "waker_tests.rs"]
 mod waker_tests;

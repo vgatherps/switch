@@ -87,6 +87,8 @@ pub(crate) struct RuntimePool {
     executor: *mut Executor,
     depot: DynDepot,
     capacity: u32,
+    /// Highest depot slot handed out so far; higher slots were never used.
+    high: u32,
     /// Block ordinal -> block base.
     blocks: Vec<*mut Meta>,
 }
@@ -102,6 +104,7 @@ impl RuntimePool {
             executor,
             depot: DynDepot::new(capacity as usize + 1),
             capacity,
+            high: 0,
             blocks: Vec::new(),
         }))
     }
@@ -119,6 +122,7 @@ impl RuntimePool {
                 (*this).depot.free_slot_unchecked(slot);
                 return None;
             }
+            (*this).high = (*this).high.max(slot);
             let block = ((slot - 1) / spec.slots) as usize;
             if block == (*this).blocks.len() {
                 Self::grow(this, spec);
@@ -168,16 +172,24 @@ impl RuntimePool {
         }
     }
 
-    /// # Safety
-    /// Owner thread.
+    #[cfg(test)]
     pub(crate) unsafe fn block_count(this: *mut Self) -> usize {
         unsafe { (*this).blocks.len() }
     }
 
+    /// The header of every slot ever handed out here (so shutdown scans the
+    /// peak in use, not the capacity).
+    ///
     /// # Safety
-    /// Owner thread; `block < block_count`.
-    pub(crate) unsafe fn block(this: *mut Self, block: usize) -> *mut Meta {
-        unsafe { (&(*this).blocks)[block] }
+    /// Owner thread; `this` stays live while iterating.
+    pub(crate) unsafe fn headers(this: *mut Self) -> impl Iterator<Item = *const TaskHeader> {
+        unsafe {
+            (0..(*this).high).map(move |index| {
+                let slots = Meta::slots((&(*this).blocks)[0]);
+                let block = (&(*this).blocks)[(index / slots) as usize];
+                Meta::header(block, index % slots)
+            })
+        }
     }
 
     /// # Safety
