@@ -12,6 +12,7 @@ use std::mem::ManuallyDrop;
 
 use crate::__private::Task;
 use crate::intrusive::NIL;
+use crate::oneshot::Sender;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
@@ -95,10 +96,14 @@ impl Executor {
     pub unsafe fn spawn<T: Task>(
         this: *mut Self,
         token: SpawnToken<T>,
+        join: Option<Sender<T::Output>>,
     ) -> Result<(), SpawnToken<T>> {
         unsafe {
             assert!((*this).lifecycle == Lifecycle::Open, "executor unavailable");
-            crate::task::private::spawn_in(token.into_payload(), this).map_err(SpawnToken::new)
+            token
+                .into_payload()
+                .spawn_in(this, join)
+                .map_err(SpawnToken::new)
         }
     }
 

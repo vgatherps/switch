@@ -5,6 +5,7 @@
 
 pub(crate) mod block;
 pub(crate) mod header;
+pub(crate) mod join;
 pub(crate) mod pool;
 pub mod private;
 

@@ -6,7 +6,9 @@ use std::rc::Rc;
 
 use crate::__private::Task;
 use crate::executor::{DEFAULT_CAPACITY, Executor, Lifecycle};
+use crate::oneshot::{self, Sender};
 use crate::task::SpawnToken;
+use crate::task::join::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
@@ -270,17 +272,39 @@ impl Spawner {
         Ok(crate::sleep::Sleep::new(deadline, self.control.clone()))
     }
 
-    /// Submit a task function's token. A closed or panicked runtime, or a task
-    /// function with no free slot here (`Exhausted`), returns the token.
+    /// Submit a task function's token, detached: its return value is dropped
+    /// when it completes. A closed or panicked runtime, or a task function with
+    /// no free slot here (`Exhausted`), returns the token.
     ///
     /// If the task's construction shuts down or drops the runtime, the runtime
     /// closes at once and its tasks, this one included, are dropped when the
     /// construction returns, before `spawn` returns `Ok`.
+    #[inline]
     pub fn spawn<T: Task>(&self, token: SpawnToken<T>) -> Result<(), SpawnError<T>> {
+        self.submit(token, None)
+    }
+
+    /// As [`Self::spawn`], and returns a [`JoinHandle`] that resolves to the
+    /// task's return value. Allocates one oneshot channel.
+    pub fn spawn_join<T: Task>(
+        &self,
+        token: SpawnToken<T>,
+    ) -> Result<JoinHandle<T::Output>, SpawnError<T>> {
+        let (sender, receiver) = oneshot::channel();
+        self.submit(token, Some(sender))?;
+        Ok(JoinHandle::new(receiver))
+    }
+
+    #[inline]
+    fn submit<T: Task>(
+        &self,
+        token: SpawnToken<T>,
+        join: Option<Sender<T::Output>>,
+    ) -> Result<(), SpawnError<T>> {
         match self.control.open_core() {
             Ok(root) => {
                 let _deferred = DeferredShutdown(&self.control);
-                unsafe { Executor::spawn(root, token) }.map_err(|token| SpawnError {
+                unsafe { Executor::spawn(root, token, join) }.map_err(|token| SpawnError {
                     reason: RuntimeError::Exhausted,
                     token,
                 })

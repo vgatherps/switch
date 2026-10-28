@@ -11,8 +11,8 @@ use syn::{
     TypeImplTrait, TypeParamBound, parse_macro_input,
 };
 
-/// Marks a task function: `async fn` returning `()`, or `fn` returning
-/// `impl Future<Output = ()>`, with arguments bound to plain identifiers. Each
+/// Marks a task function: `async fn`, or `fn` returning `impl Future<Output = T>`,
+/// with arguments bound to plain identifiers and a `'static` return value. Each
 /// instantiation of a generic task function has its own pool.
 ///
 /// `#[task(capacity = N)]` sets the most occupied slots of this function per
@@ -88,28 +88,31 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
         bindings.push(quote!(#(#cfgs)* let #mutability #ident = #ident;));
     }
 
-    let (future, declared) = if sig.asyncness.is_some() {
-        if !returns_unit(&sig.output) {
-            return Err(Error::new_spanned(
-                &sig.output,
-                "async `#[switch::task]` functions must return `()`",
-            ));
-        }
+    let (future, declared, output) = if sig.asyncness.is_some() {
+        let output = match &sig.output {
+            ReturnType::Default => quote!(()),
+            ReturnType::Type(_, ty) => quote!(#ty),
+        };
         (
             quote_spanned!(sig.ident.span()=> async move { #(#bindings)* #block }),
             None,
+            output,
         )
     } else {
-        let Some(bounds) = unit_future_bounds(&sig.output) else {
+        let Some((bounds, output)) = future_bounds(&sig.output) else {
             return Err(Error::new_spanned(
                 &sig.output,
-                "`#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`",
+                "`#[switch::task]` functions must be `async fn` or return `impl Future<Output = T>`",
             ));
         };
         // The closure cannot name its return type, so `token` checks the future.
         // The declared bounds still resolve here, as the user wrote them.
         let declared = quote!(let _: ::std::marker::PhantomData<dyn #bounds>;);
-        (quote!({ #(#bindings)* #block }), Some(declared))
+        (
+            quote!({ #(#bindings)* #block }),
+            Some(declared),
+            quote!(#output),
+        )
     };
 
     let name = &sig.ident;
@@ -125,8 +128,8 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
         None => quote!(::std::option::Option::None),
     };
     // Spanned at the function name, so a future that is not `'static` or does not
-    // resolve to `()` is reported there.
-    let token = quote_spanned!(name.span()=> ::switch::SpawnToken<impl ::switch::__private::Task>);
+    // resolve to the declared output is reported there.
+    let token = quote_spanned!(name.span()=> ::switch::SpawnToken<impl ::switch::__private::Task<Output = #output>>);
     let closure = quote_spanned!(name.span()=> let #build = move || #future;);
     // The marker is a closure: its type is unique to this function and carries every
     // generic parameter of it, `impl Trait` arguments included, so each instantiation
@@ -145,48 +148,44 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
     })
 }
 
-/// `()` or nothing.
-fn returns_unit(output: &ReturnType) -> bool {
-    match output {
-        ReturnType::Default => true,
-        ReturnType::Type(_, ty) => is_unit(ty),
-    }
-}
-
-/// The bounds of `impl Future<Output = ()>`, optionally `+ 'static`.
-fn unit_future_bounds(output: &ReturnType) -> Option<&Punctuated<TypeParamBound, Token![+]>> {
+/// The bounds of `impl Future<Output = T>`, optionally `+ 'static`, and `T`.
+fn future_bounds(output: &ReturnType) -> Option<(&Punctuated<TypeParamBound, Token![+]>, &Type)> {
     let ReturnType::Type(_, ty) = output else {
         return None;
     };
     let Type::ImplTrait(TypeImplTrait { bounds, .. }) = ty.as_ref() else {
         return None;
     };
-    let mut future = 0;
+    let mut future = None;
     for bound in bounds {
         match bound {
             TypeParamBound::Lifetime(lifetime) if lifetime.ident == "static" => {}
-            TypeParamBound::Trait(bound) if is_unit_future(&bound.path) => future += 1,
+            TypeParamBound::Trait(bound) if future.is_none() => {
+                future = Some(future_output(&bound.path)?);
+            }
             _ => return None,
         }
     }
-    (future == 1).then_some(bounds)
+    Some((bounds, future?))
 }
 
-fn is_unit_future(path: &syn::Path) -> bool {
-    let Some(segment) = path.segments.last() else {
-        return false;
-    };
+/// `T` of a `Future<Output = T>` path.
+fn future_output(path: &syn::Path) -> Option<&Type> {
+    let segment = path.segments.last()?;
     let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return false;
+        return None;
     };
-    segment.ident == "Future"
-        && arguments.args.len() == 1
-        && matches!(&arguments.args[0], GenericArgument::AssocType(output)
-            if output.ident == "Output" && output.generics.is_none() && is_unit(&output.ty))
-}
-
-fn is_unit(ty: &Type) -> bool {
-    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+    if segment.ident != "Future" || arguments.args.len() != 1 {
+        return None;
+    }
+    match &arguments.args[0] {
+        GenericArgument::AssocType(output)
+            if output.ident == "Output" && output.generics.is_none() =>
+        {
+            Some(&output.ty)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

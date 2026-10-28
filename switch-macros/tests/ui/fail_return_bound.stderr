@@ -1,10 +1,10 @@
-error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = T>`
  --> tests/ui/fail_return_bound.rs:4:15
   |
 4 | fn sendable() -> impl Future<Output = ()> + Send {
   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = T>`
  --> tests/ui/fail_return_bound.rs:9:12
   |
 9 | fn boxed() -> std::pin::Pin<Box<dyn Future<Output = ()>>> {

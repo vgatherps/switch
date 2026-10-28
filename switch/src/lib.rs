@@ -27,11 +27,16 @@
 //!
 //! ## Tasks
 //!
-//! A task is one call of a function marked `#[switch::task]`: an `async fn`
-//! returning `()`, or a `fn` returning `impl Future<Output = ()>`, with arguments
-//! bound to plain identifiers. Calling it packages the arguments into a
-//! [`SpawnToken`]; `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
-//! The future must be `'static`. Each task function, and each instantiation of a
+//! A task is one call of a function marked `#[switch::task]`: an `async fn`, or a
+//! `fn` returning `impl Future<Output = T>`, with arguments bound to plain
+//! identifiers. Calling it packages the arguments into a [`SpawnToken`];
+//! `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
+//! The future and its value must be `'static`. `spawn` detaches the task: its
+//! value is dropped when it completes. `Spawner::spawn_join` also returns a
+//! [`JoinHandle`] that resolves to the value, or to [`oneshot::Canceled`] if the
+//! task is dropped before it finishes (shutdown, or a panic unwinding through it);
+//! it allocates one [`oneshot`] channel. Both kinds of spawn share the function's
+//! pool and capacity. Each task function, and each instantiation of a
 //! generic one, has its own task blocks and capacity.
 //! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per
 //! runtime (default: one block's slots, `1 <= N < 2^25`).
@@ -49,6 +54,26 @@
 //! spawner.spawn(hello("switch")).unwrap();
 //!
 //! while runtime.poll(100).unwrap().live_tasks != 0 {}
+//! ```
+//!
+//! Joining a task's value:
+//!
+//! ```rust
+//! #[switch::task]
+//! async fn double(value: u32) -> u32 {
+//!     value * 2
+//! }
+//!
+//! #[switch::task]
+//! async fn report(handle: switch::JoinHandle<u32>) {
+//!     assert_eq!(handle.await, Ok(42));
+//! }
+//!
+//! let mut runtime = switch::Runtime::new(0);
+//! let spawner = runtime.spawner();
+//! let handle = spawner.spawn_join(double(21)).unwrap();
+//! spawner.spawn(report(handle)).unwrap();
+//! while runtime.poll(0).unwrap().live_tasks != 0 {}
 //! ```
 //!
 //! A task future that does not fit a 64 KiB task block is a compile-time error:
@@ -110,6 +135,7 @@ extern crate self as switch;
 
 mod executor;
 pub(crate) mod intrusive;
+pub mod oneshot;
 mod runtime;
 mod sleep;
 pub(crate) mod task;
@@ -121,6 +147,7 @@ pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawn
 pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;
 pub use task::SpawnToken;
+pub use task::join::JoinHandle;
 pub use waker::StoredWaker;
 
 #[doc(hidden)]
