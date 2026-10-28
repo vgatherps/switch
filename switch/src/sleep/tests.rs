@@ -315,7 +315,7 @@ fn current_task_clears_pending_ready_and_unwind_before_destructor() {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             let meta = TaskHeader::meta(cx.waker().data().cast());
-            let root = unsafe { Meta::executor(meta).get() };
+            let root = unsafe { Meta::executor(meta) };
             self.root.set(root);
             assert_eq!(unsafe { (*root).current.cast::<()>() }, cx.waker().data());
             if self.panic {

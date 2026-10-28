@@ -14,9 +14,7 @@ use std::thread;
 
 use super::TaskHeader;
 use super::header::{LIVE, QUEUED};
-use super::tests::{
-    Parked, State, finish, function_pool, header, meta, parked, spawn_parked, state, waker,
-};
+use super::tests::{Parked, State, finish, header, meta, runtime_pool, spawn_parked, state, waker};
 use crate::runtime::{PollReport, Runtime, RuntimeError};
 
 fn expect_foreign_panic(op: impl FnOnce()) {
@@ -36,7 +34,7 @@ fn foreign_round(borrowed: &Waker, woken: Waker, dropped: Waker) {
 }
 
 #[test]
-fn foreign_ops_overlap_completion_reuse_shutdown_and_spare_reuse() {
+fn foreign_ops_overlap_completion_reuse_shutdown_and_a_later_runtime() {
     const FOREIGN: usize = 2;
     const PHASES: usize = 4;
     const ROUNDS: usize = 5;
@@ -91,43 +89,14 @@ fn foreign_ops_overlap_completion_reuse_shutdown_and_spare_reuse() {
 
         barrier.wait();
         let mut later = Runtime::new(0);
-        let lent = spawn_parked(&mut later, 1).remove(0);
-        assert_eq!(meta(&waker(&lent)), block);
+        let fresh = spawn_parked(&mut later, 1).remove(0);
+        assert_ne!(meta(&waker(&fresh)), block);
         assert_eq!(later.poll(0).unwrap().tasks_polled, 0);
         drop(later);
-        assert_eq!((lent.polls.get(), lent.drops.get()), (1, 1));
+        assert_eq!((fresh.polls.get(), fresh.drops.get()), (1, 1));
         barrier.wait();
     });
     assert_eq!((first.polls.get(), first.drops.get()), (2, 1));
-}
-
-#[test]
-fn concurrent_first_pool_registrations_are_distinct() {
-    const THREADS: usize = 8;
-    let barrier = Barrier::new(THREADS);
-    let mut pools: Vec<usize> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut runtime = Runtime::new(0);
-                    let spawner = runtime.spawner();
-                    let state = state();
-                    state.done.set(true);
-                    barrier.wait();
-                    spawner.spawn(parked(state.clone())).unwrap();
-                    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
-                    let pool = function_pool(&waker(&state)).addr();
-                    drop(runtime);
-                    assert_eq!((state.polls.get(), state.drops.get()), (1, 1));
-                    pool
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    pools.sort_unstable();
-    pools.dedup();
-    assert_eq!(pools.len(), THREADS);
 }
 
 struct Probe {
@@ -292,7 +261,7 @@ fn factory_polls_the_runtime_between_reserve_and_commit() {
     assert_eq!((report.tasks_polled, report.live_tasks), (1, 2));
     assert_eq!((earlier.polls.get(), new.polls.get()), (2, 1));
     // Same function, same pool: the reserved slot is not the one polled inside.
-    assert_eq!(function_pool(&waker(&new)), function_pool(&waker(&earlier)));
+    assert_eq!(runtime_pool(&waker(&new)), runtime_pool(&waker(&earlier)));
     assert_ne!(header(&waker(&earlier)), header(&waker(&new)));
     drop(runtime);
     assert_eq!((earlier.drops.get(), new.drops.get()), (1, 1));
