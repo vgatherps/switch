@@ -12,17 +12,19 @@ fn wrapped(value: u8) -> impl Future<Output = ()> { async move { /* ... */ } }
 spawner.spawn(session(net.clone(), 7))?;
 ```
 
-The marked function keeps its name, visibility and attributes, but now returns a `switch::SpawnToken` that holds the arguments. Spawning it builds the future in a task slot. The original body moves into a nested function, and a per-function thread-local pool is declared next to it. Inside a generic `impl`, the nested function cannot use the impl's parameters, so the task still has one future type. The expansion is built on switch's hidden `__private` items.
+The marked function keeps its name, visibility, generics and attributes, but returns a `switch::SpawnToken` that holds the arguments. Spawning it builds the future in a task slot. The expansion turns the body into a closure that makes the future: for an `async fn` the closure returns an async block, and every argument is rebound inside the future, so unused arguments drop with the future, as in an `async fn`. For a plain `fn`, arguments the returned future does not keep drop when the closure returns, at spawn. `#[cfg]` and `#[cfg_attr]` on arguments apply to both. The expansion contains no `unsafe` and declares no item or local that the signature or body can see, so user names keep their meaning. It is built on switch's hidden `__private` items and names the crate as `::switch`: a renamed `switch` dependency is not supported.
 
-`capacity = N` is the most occupied slots of this function per runtime. Without it the capacity is one 64 KiB block's worth of slots. N must be a constant from 1 to 2^25 − 1; any other value fails to compile.
+Tasks are pooled by future type: each future type of a task function has its own task blocks and its own capacity. A generic task function, an `impl Trait` argument (including one produced by a type macro) and a task in a generic `impl` get one pool per instantiation whose future type differs.
 
-The function can be an `async fn` returning `()`, or a `fn` returning `impl Future<Output = ()>`. Rejected with a compile error:
+`capacity = N` is the most occupied slots per runtime of one future type of this function. Without it the capacity is one 64 KiB block's worth of slots. N is a constant expression evaluated in the function's scope, so `Self::N` and generic parameters (`T::N`) work. It must be from 1 to 2^25 − 1. Otherwise compilation fails, when the function is compiled to code (`cargo build`, not `cargo check`); for a generic function, when an instantiation is.
 
-- generic parameters (type, lifetime or const), a `where` clause, or `impl Trait` in an argument type. The pool is a static, and statics are shared by every instantiation of a generic function, so one pool would hold futures of different layouts. The error is "switch tasks cannot be generic: write a concrete wrapper task";
+The function can be an `async fn` returning `()`, or a `fn` returning `impl Future<Output = ()>`, optionally `+ 'static`. The future must be `'static`. Rejected with a compile error:
+
 - a `self` receiver;
+- `const`, `unsafe` or `extern` functions;
 - argument patterns other than a plain identifier;
-- arguments that are not `'static` (the compiler reports these);
-- any other output type (the compiler reports these).
+- any other return type, including other bounds such as `+ Send`;
+- futures that are not `'static`, such as arguments borrowing for a shorter lifetime (the compiler reports these).
 
 ## Tests
 
@@ -30,4 +32,4 @@ The function can be an `async fn` returning `()`, or a `fn` returning `impl Futu
 cargo test -p switch-macros
 ```
 
-`tests/ui` holds trybuild cases: one file that must compile and run, and one file per group of rejected forms with its expected compiler output. After an intended change to the messages, regenerate the expected output with `TRYBUILD=overwrite cargo test -p switch-macros` and review the diff.
+`tests/ui` holds trybuild cases: `pass_*.rs` files that must compile and run, and one `fail_*.rs` file per group of rejected forms with its expected compiler output. After an intended change to the messages, regenerate the expected output with `TRYBUILD=overwrite cargo test -p switch-macros` and review the diff.

@@ -7,6 +7,7 @@
 //! Borrows violations: block metadata stores the executor pointer, and
 //! `&mut self` borrows would invalidate those stored pointers.
 
+use std::any::TypeId;
 use std::mem::ManuallyDrop;
 
 use crate::__private::Task;
@@ -15,7 +16,7 @@ use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
 use crate::task::header::{DROP_STARTED, LIVE, QUEUED, TAKEN};
-use crate::task::pool::{FunctionPool, RuntimePool};
+use crate::task::pool::RuntimePool;
 use crate::timer_registration::TimerStore;
 
 /// Initial ready-queue reservation.
@@ -106,10 +107,10 @@ impl Executor {
     /// `None` when the function already has `capacity` slots in use here.
     ///
     /// # Safety
-    /// Owner thread; open executor; `spec` describes `function`.
+    /// Owner thread; open executor; `spec` is the shape of `key`'s future type.
     pub(crate) unsafe fn reserve(
         this: *mut Self,
-        function: *mut FunctionPool,
+        key: TypeId,
         spec: &BlockSpec,
         capacity: u32,
     ) -> Option<Reservation> {
@@ -127,11 +128,11 @@ impl Executor {
                 .pools
                 .iter()
                 .copied()
-                .find(|&pool| RuntimePool::function_pool(pool) == function)
+                .find(|&pool| RuntimePool::key(pool) == key)
             {
                 Some(pool) => pool,
                 None => {
-                    let pool = RuntimePool::new(this, function, capacity);
+                    let pool = RuntimePool::new(this, key, capacity);
                     (*this).pools.push(pool);
                     pool
                 }

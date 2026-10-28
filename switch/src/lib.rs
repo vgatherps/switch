@@ -27,11 +27,13 @@
 //!
 //! ## Tasks
 //!
-//! A task is one call of a function marked `#[switch::task]`: an `async fn`, or a
-//! `fn` returning `impl Future<Output = ()>`, with `'static` arguments bound to plain
-//! identifiers and no generics. Calling it packages the arguments into a
+//! A task is one call of a function marked `#[switch::task]`: an `async fn`
+//! returning `()`, or a `fn` returning `impl Future<Output = ()>`, with arguments
+//! bound to plain identifiers. Calling it packages the arguments into a
 //! [`SpawnToken`]; `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
-//! `#[switch::task(capacity = N)]` sets the most occupied slots of that function per
+//! The future must be `'static`. Each future type of a task function (one per
+//! instantiation of a generic one) has its own task blocks and capacity.
+//! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per
 //! runtime (default: one block's slots, `1 <= N < 2^25`).
 //!
 //! ```rust

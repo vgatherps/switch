@@ -541,6 +541,130 @@ fn one_function_on_two_threads_uses_disjoint_blocks() {
     assert_ne!(pool_a, pool_b);
 }
 
+/// A `Parked` with another layout: a second future type of a different size.
+struct Padded(Parked, #[allow(dead_code)] [u8; 4096]);
+
+impl Future for Padded {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
+macro_rules! argument {
+    () => { impl Future<Output = ()> + 'static };
+}
+
+/// The type macro makes the task generic over its argument's future type.
+#[switch::task]
+fn run_argument(future: argument!()) -> impl Future<Output = ()> {
+    future
+}
+
+#[test]
+fn type_macro_argument_runs_each_future() {
+    let count = Rc::new(Cell::new(0));
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let small = count.clone();
+    spawner
+        .spawn(run_argument(async move { small.set(small.get() + 1) }))
+        .unwrap();
+    let large = count.clone();
+    spawner
+        .spawn(run_argument(async move {
+            let bulk = [0u8; 4096];
+            std::future::ready(()).await;
+            std::hint::black_box(&bulk);
+            large.set(large.get() + 10);
+        }))
+        .unwrap();
+    while runtime.poll(0).unwrap().live_tasks != 0 {}
+    assert_eq!(count.get(), 11);
+}
+
+#[test]
+fn type_macro_instantiations_use_distinct_pools() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let states: Vec<_> = (0..3).map(|_| state()).collect();
+    spawner
+        .spawn(run_argument(Parked(states[0].clone())))
+        .unwrap();
+    spawner
+        .spawn(run_argument(Parked(states[1].clone())))
+        .unwrap();
+    spawner
+        .spawn(run_argument(Padded(Parked(states[2].clone()), [0; 4096])))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    let pools: Vec<_> = states.iter().map(|s| function_pool(&waker(s))).collect();
+    assert_eq!(pools[0], pools[1]);
+    assert_ne!(pools[0], pools[2]);
+}
+
+#[test]
+fn token_with_shared_marker_splits_by_future_type() {
+    #[derive(Clone, Copy)]
+    struct Shared;
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let states: Vec<_> = (0..3).map(|_| state()).collect();
+    for state in &states[..2] {
+        let state = state.clone();
+        spawner
+            .spawn(crate::__private::token(Shared, None, move || Parked(state)))
+            .unwrap();
+    }
+    let padded = states[2].clone();
+    spawner
+        .spawn(crate::__private::token(Shared, None, move || {
+            Padded(Parked(padded), [0; 4096])
+        }))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    assert!(states.iter().all(|state| state.polls.get() == 1));
+    let pools: Vec<_> = states.iter().map(|s| function_pool(&waker(s))).collect();
+    assert_eq!(pools[0], pools[1]);
+    assert_ne!(pools[0], pools[2]);
+}
+
+#[test]
+fn same_future_type_functions_keep_separate_pools() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let (first, second) = (state(), state());
+    spawner.spawn(parked(first.clone())).unwrap();
+    spawner.spawn(parked_other(second.clone())).unwrap();
+    runtime.poll(0).unwrap();
+    assert_ne!(
+        function_pool(&waker(&first)),
+        function_pool(&waker(&second))
+    );
+}
+
+#[switch::task(capacity = 1)]
+async fn one_per_type<T: 'static>(value: T, state: Rc<State>) {
+    Parked(state).await;
+    drop(value);
+}
+
+#[test]
+fn generic_instantiations_have_their_own_pools_and_capacity() {
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let (byte, text) = (state(), state());
+    spawner.spawn(one_per_type(1u8, byte.clone())).unwrap();
+    let full = spawner.spawn(one_per_type(2u8, state())).unwrap_err();
+    assert_eq!(full.reason, RuntimeError::Exhausted);
+    spawner
+        .spawn(one_per_type(String::new(), text.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    assert_eq!((byte.polls.get(), text.polls.get()), (1, 1));
+    assert_ne!(function_pool(&waker(&byte)), function_pool(&waker(&text)));
+}
+
 // ---- Token and spawn unwinding ----
 
 struct DropFlag(Rc<Cell<usize>>, bool);

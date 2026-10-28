@@ -21,8 +21,8 @@ fn local(count: Rc<Cell<u32>>) -> impl Future<Output = ()> {
 
 struct Holder<T>(PhantomData<T>);
 
-/// In a generic impl that the task does not use: every `Holder<T>` shares one
-/// pool, and every call produces the same future type.
+/// In a generic impl whose parameter the task does not use. The future type
+/// still differs per `Holder<T>`, so each instantiation has its own pool.
 impl<T> Holder<T> {
     #[switch::task]
     async fn bump(count: Rc<Cell<u32>>) {

@@ -1,3 +1,29 @@
+error: async `#[switch::task]` functions must return `()`
+ --> tests/ui/fail_lifetimes_and_output.rs:9:26
+  |
+9 | async fn returns_value() -> u8 {
+  |                          ^^^^^
+
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
+  --> tests/ui/fail_lifetimes_and_output.rs:14:19
+   |
+14 | fn not_a_future() -> u8 {
+   |                   ^^^^^
+
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
+  --> tests/ui/fail_lifetimes_and_output.rs:19:19
+   |
+19 | fn wrong_output() -> impl Future<Output = u8> {
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::future::Future`
+ --> tests/ui/fail_lifetimes_and_output.rs:1:5
+  |
+1 | use std::future::Future;
+  |     ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
 error: lifetime may not live long enough
  --> tests/ui/fail_lifetimes_and_output.rs:4:10
   |
@@ -10,40 +36,3 @@ help: to declare that `impl Task` captures data from argument `value`, you can a
   |
 4 | async fn borrowed + '_(value: &u8) {
   |                   ++++
-
-error[E0271]: expected `impl Future<Output = u8>` to be a future that resolves to `()`, but it resolves to `u8`
- --> tests/ui/fail_lifetimes_and_output.rs:9:10
-  |
-9 | async fn returns_value() -> u8 {
-  |          ^^^^^^^^^^^^^ expected `()`, found `u8`
-  |
-note: required by a bound in `token`
- --> $WORKSPACE/switch/src/task/private.rs
-  |
-  | pub unsafe fn token<K: PoolKey, C: FnOnce() -> Fut, Fut: Future<Output = ()> + 'static>(
-  |                                                                 ^^^^^^^^^^^ required by this bound in `token`
-
-error[E0277]: `u8` is not a future
-  --> tests/ui/fail_lifetimes_and_output.rs:14:4
-   |
-14 | fn not_a_future() -> u8 {
-   |    ^^^^^^^^^^^^ `u8` is not a future
-   |
-   = help: the trait `Future` is not implemented for `u8`
-note: required by a bound in `token`
-  --> $WORKSPACE/switch/src/task/private.rs
-   |
-   | pub unsafe fn token<K: PoolKey, C: FnOnce() -> Fut, Fut: Future<Output = ()> + 'static>(
-   |                                                          ^^^^^^^^^^^^^^^^^^^ required by this bound in `token`
-
-error[E0271]: expected `impl Future<Output = u8>` to be a future that resolves to `()`, but it resolves to `u8`
-  --> tests/ui/fail_lifetimes_and_output.rs:19:4
-   |
-19 | fn wrong_output() -> impl Future<Output = u8> {
-   |    ^^^^^^^^^^^^ expected `()`, found `u8`
-   |
-note: required by a bound in `token`
-  --> $WORKSPACE/switch/src/task/private.rs
-   |
-   | pub unsafe fn token<K: PoolKey, C: FnOnce() -> Fut, Fut: Future<Output = ()> + 'static>(
-   |                                                                 ^^^^^^^^^^^ required by this bound in `token`

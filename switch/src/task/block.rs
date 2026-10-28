@@ -1,4 +1,4 @@
-//! Task blocks: 64 KiB, aligned to 64 KiB, holding slots of one task function.
+//! Task blocks: 64 KiB, aligned to 64 KiB, holding slots of one task future type.
 //!
 //! ```text
 //! base (64 KiB aligned)    base + data_off

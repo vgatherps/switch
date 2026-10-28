@@ -1,7 +1,9 @@
 //! Per-function block pools.
 //!
-//! A [`FunctionPool`] exists per (task function, thread) and is never freed. It
-//! holds the `spare` blocks released by runtimes that shut down. Each runtime that
+//! A [`FunctionPool`] exists per (task key, thread) and is never freed. It holds
+//! the `spare` blocks released by runtimes that shut down. A task key is the
+//! `TypeId` of (task function marker, future type), so a pool and its blocks
+//! only ever hold one future type. Each runtime that
 //! spawns the function owns one [`RuntimePool`], listed in its executor: a depot
 //! of slot numbers and the blocks those slots live in. Blocks are never freed and
 //! never change function or thread; a block serves one runtime at a time.
@@ -9,6 +11,7 @@
 //! All access is on the owning thread, through raw pointers, with no reference
 //! held across user code (a task factory may spawn recursively).
 
+use std::any::TypeId;
 use std::cell::Cell;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -19,60 +22,88 @@ use super::block::{BlockSpec, Meta};
 use super::header::TaskHeader;
 use crate::executor::Executor;
 
-/// Thread-local root of one task function's pool.
-///
-/// Declared by each task function as a `const`-initialized `thread_local!`
-/// without `Drop`. Such a thread-local stays accessible while other
-/// thread-locals are destroyed, so tasks can be spawned and runtimes dropped from
-/// thread-local destructors. That relies on native TLS; supported targets are
-/// Linux (glibc) and macOS. Nothing reached after thread exit (wakers, blocks)
-/// goes through this storage: blocks are reached from their own metadata.
-pub struct Pool(Cell<*mut FunctionPool>);
+thread_local! {
+    /// This thread's function pools. `const` and without `Drop`, so it stays
+    /// accessible while other thread-locals are destroyed: tasks can be spawned and
+    /// runtimes dropped from thread-local destructors. That relies on native TLS;
+    /// supported targets are Linux (glibc) and macOS. Nothing reached after thread
+    /// exit (wakers, blocks) goes through it: blocks are reached from their own
+    /// metadata.
+    static REGISTRY: Cell<*mut Registry> = const { Cell::new(ptr::null_mut()) };
+}
 
-impl Pool {
-    #[allow(clippy::new_without_default)]
-    pub const fn new() -> Self {
-        Self(Cell::new(ptr::null_mut()))
-    }
+/// One thread's function pools, sorted by key. Never freed.
+struct Registry {
+    pools: Vec<(TypeId, *mut FunctionPool)>,
+    next: *mut Registry,
+}
 
-    /// This thread's function pool, created on first use.
-    pub(crate) fn get(&self) -> *mut FunctionPool {
-        let pool = self.0.get();
-        if !pool.is_null() {
-            return pool;
-        }
-        // Issue the thread tag (it may panic once tags are exhausted) before any
-        // pool or reservation state exists; block allocation reuses it.
-        crate::waker::this_thread_tag();
-        let pool = FunctionPool::register(Box::new(FunctionPool {
-            spare: Vec::new(),
-            registry_next: ptr::null_mut(),
-            blocks: 0,
+/// Every registry ever created, so their pools stay reachable after thread exit.
+static REGISTRIES: AtomicPtr<Registry> = AtomicPtr::new(ptr::null_mut());
+
+impl Registry {
+    fn register() -> *mut Self {
+        let registry = Box::into_raw(Box::new(Self {
+            pools: Vec::new(),
+            next: ptr::null_mut(),
         }));
-        self.0.set(pool);
-        pool
+        let mut head = REGISTRIES.load(Ordering::Relaxed);
+        loop {
+            unsafe { (*registry).next = head };
+            match REGISTRIES.compare_exchange_weak(
+                head,
+                registry,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => head = current,
+            }
+        }
+        REGISTRY.with(|cell| cell.set(registry));
+        registry
     }
 }
 
-/// Every function pool ever created, so their memory stays reachable.
-static POOLS: AtomicPtr<FunctionPool> = AtomicPtr::new(ptr::null_mut());
-
 pub(crate) struct FunctionPool {
     spare: Vec<*mut Meta>,
-    registry_next: *mut FunctionPool,
     /// Blocks ever allocated for this function on this thread.
     blocks: usize,
 }
 
 impl FunctionPool {
-    fn register(pool: Box<Self>) -> *mut Self {
-        let pool = Box::into_raw(pool);
-        let mut head = POOLS.load(Ordering::Relaxed);
-        loop {
-            unsafe { (*pool).registry_next = head };
-            match POOLS.compare_exchange_weak(head, pool, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => return pool,
-                Err(current) => head = current,
+    /// This thread's pool for `key`, created on first use. Only reached when a
+    /// runtime spawns `key` for the first time.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn for_key(key: TypeId) -> *mut FunctionPool {
+        let registry = REGISTRY.with(Cell::get);
+        let found = if registry.is_null() {
+            Err(0)
+        } else {
+            unsafe {
+                (*registry)
+                    .pools
+                    .binary_search_by_key(&key, |&(key, _)| key)
+            }
+        };
+        match found {
+            Ok(index) => unsafe { (&(*registry).pools)[index].1 },
+            Err(index) => {
+                // Issue the thread tag (it may panic once tags are exhausted) before
+                // any pool state exists; block allocation reuses it.
+                crate::waker::this_thread_tag();
+                let registry = if registry.is_null() {
+                    Registry::register()
+                } else {
+                    registry
+                };
+                let pool = Box::into_raw(Box::new(FunctionPool {
+                    spare: Vec::new(),
+                    blocks: 0,
+                }));
+                unsafe { (*registry).pools.insert(index, (key, pool)) };
+                pool
             }
         }
     }
@@ -86,6 +117,7 @@ impl FunctionPool {
 /// One task function's slots in one runtime. Depot slot `s` (1..=capacity; 0 is
 /// the depot's sentinel) is position `(s - 1) % slots` of block `(s - 1) / slots`.
 pub(crate) struct RuntimePool {
+    key: TypeId,
     function: *mut FunctionPool,
     executor: *mut Executor,
     depot: DynDepot,
@@ -97,13 +129,10 @@ pub(crate) struct RuntimePool {
 }
 
 impl RuntimePool {
-    pub(crate) fn new(
-        executor: *mut Executor,
-        function: *mut FunctionPool,
-        capacity: u32,
-    ) -> *mut Self {
+    pub(crate) fn new(executor: *mut Executor, key: TypeId, capacity: u32) -> *mut Self {
         Box::into_raw(Box::new(Self {
-            function,
+            key,
+            function: FunctionPool::for_key(key),
             executor,
             depot: DynDepot::new(capacity as usize + 1),
             capacity,
@@ -197,6 +226,14 @@ impl RuntimePool {
 
     /// # Safety
     /// `this` is live.
+    #[inline]
+    pub(crate) unsafe fn key(this: *mut Self) -> TypeId {
+        unsafe { (*this).key }
+    }
+
+    /// # Safety
+    /// `this` is live.
+    #[cfg(test)]
     pub(crate) unsafe fn function_pool(this: *mut Self) -> *mut FunctionPool {
         unsafe { (*this).function }
     }

@@ -1,0 +1,19 @@
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
+ --> tests/ui/fail_return_bound.rs:4:15
+  |
+4 | fn sendable() -> impl Future<Output = ()> + Send {
+  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`
+ --> tests/ui/fail_return_bound.rs:9:12
+  |
+9 | fn boxed() -> std::pin::Pin<Box<dyn Future<Output = ()>>> {
+  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::future::Future`
+ --> tests/ui/fail_return_bound.rs:1:5
+  |
+1 | use std::future::Future;
+  |     ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

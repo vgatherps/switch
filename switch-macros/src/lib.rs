@@ -2,13 +2,18 @@
 //! `switch::SpawnToken`. Use it through `switch::task`.
 
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, quote_spanned};
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::{quote, quote_spanned};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::visit::Visit;
-use syn::{Error, Expr, FnArg, ItemFn, Pat, TypeImplTrait, parse_macro_input};
+use syn::{
+    Error, Expr, FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Token, Type,
+    TypeImplTrait, TypeParamBound, parse_macro_input,
+};
 
-/// Marks a task function: `async fn` or `fn -> impl Future<Output = ()>`, with
-/// `'static` arguments bound to plain identifiers and no generics.
+/// Marks a task function: `async fn` returning `()`, or `fn` returning
+/// `impl Future<Output = ()>`, with arguments bound to plain identifiers. Each
+/// future type of a task function has its own pool.
 ///
 /// `#[task(capacity = N)]` sets the most occupied slots of this function per
 /// runtime (default: one 64 KiB block's slots).
@@ -30,32 +35,38 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
-// One thread-local pool serves every call, and statics are not per instantiation,
-// so a generic task would share one pool across future types of different layouts.
-const GENERIC: &str = "switch tasks cannot be generic: write a concrete wrapper task";
-
-fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+/// The task function becomes a function, with the same generics, building a token
+/// from a closure that makes the future: the body moves into the closure (into an
+/// async block for an `async fn`), with every argument rebound inside it. The pool
+/// marker lives in a nested block of its own, so the signature and body cannot
+/// name it; `token` keys the pool by marker and future type.
+fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2> {
     let ItemFn {
         attrs,
         vis,
         mut sig,
         block,
     } = function;
-    if let Some(where_clause) = &sig.generics.where_clause {
-        return Err(Error::new(where_clause.span(), GENERIC));
+    if let Some(span) = sig
+        .constness
+        .map(|token| token.span)
+        .or(sig.unsafety.map(|token| token.span))
+        .or(sig.abi.as_ref().map(Spanned::span))
+    {
+        return Err(Error::new(
+            span,
+            "`#[switch::task]` functions cannot be const, unsafe or extern",
+        ));
     }
-    if !sig.generics.params.is_empty() {
-        return Err(Error::new(sig.generics.span(), GENERIC));
-    }
-    let mut arguments = Vec::new();
-    for input in &sig.inputs {
+    let mut bindings = Vec::new();
+    for input in &mut sig.inputs {
         let FnArg::Typed(input) = input else {
             return Err(Error::new(
                 input.span(),
                 "`#[switch::task]` functions cannot take `self`",
             ));
         };
-        let Pat::Ident(pattern) = input.pat.as_ref() else {
+        let Pat::Ident(pattern) = input.pat.as_mut() else {
             return Err(Error::new(
                 input.pat.span(),
                 "`#[switch::task]` arguments must be plain identifiers",
@@ -67,53 +78,149 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<proc_macro2::
                 "`#[switch::task]` arguments must be plain identifiers",
             ));
         }
-        let mut impl_trait = ImplTrait(None);
-        impl_trait.visit_type(&input.ty);
-        if let Some(span) = impl_trait.0 {
-            return Err(Error::new(span, GENERIC));
-        }
-        arguments.push(pattern.ident.clone());
+        let cfgs = input
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"));
+        let ident = &pattern.ident;
+        // `mut` moves to the rebinding, where the body uses the argument.
+        let mutability = pattern.mutability.take();
+        bindings.push(quote!(#(#cfgs)* let #mutability #ident = #ident;));
     }
 
-    let name = sig.ident.clone();
-    let inputs = sig.inputs.clone();
-    sig.ident = format_ident!("__task");
-    let capacity = capacity.map(|capacity| quote!(const CAPACITY: ::std::option::Option<u32> = ::std::option::Option::Some(#capacity);));
-    // Spanned at the function name, so wrong output types and non-'static
-    // arguments are reported there rather than at the attribute.
+    let (future, declared) = if sig.asyncness.is_some() {
+        if !returns_unit(&sig.output) {
+            return Err(Error::new_spanned(
+                &sig.output,
+                "async `#[switch::task]` functions must return `()`",
+            ));
+        }
+        (
+            quote_spanned!(sig.ident.span()=> async move { #(#bindings)* #block }),
+            None,
+        )
+    } else {
+        let Some(bounds) = unit_future_bounds(&sig.output) else {
+            return Err(Error::new_spanned(
+                &sig.output,
+                "`#[switch::task]` functions must be `async fn` or return `impl Future<Output = ()>`",
+            ));
+        };
+        // The closure cannot name its return type, so `token` checks the future.
+        // The declared bounds still resolve here, as the user wrote them.
+        let declared = quote!(let _: ::std::marker::PhantomData<dyn #bounds>;);
+        (quote!({ #(#bindings)* #block }), Some(declared))
+    };
+
+    let name = &sig.ident;
+    let generics = &sig.generics;
+    let where_clause = &sig.generics.where_clause;
+    let inputs = &sig.inputs;
+    let build = quote::format_ident!("build", span = Span::mixed_site());
+    let capacity_local = quote::format_ident!("capacity", span = Span::mixed_site());
+    let capacity = match capacity {
+        Some(capacity) => quote_spanned! {capacity.span()=>
+            ::std::option::Option::Some(const { ::switch::__private::Capacity::new(#capacity) })
+        },
+        None => quote!(::std::option::Option::None),
+    };
+    // Spanned at the function name, so a future that is not `'static` or does not
+    // resolve to `()` is reported there.
     let token = quote_spanned!(name.span()=> ::switch::SpawnToken<impl ::switch::__private::Task>);
+    let closure = quote_spanned!(name.span()=> let #build = move || #future;);
     let spawn = quote_spanned! {name.span()=>
-        // Built outside the unsafe block, so the task's own calls stay checked.
-        let build = move || __task(#(#arguments),*);
-        // SAFETY: Key's pool is private to this function. Its future is `__task`'s, a
-        // nested non-generic fn that cannot use an enclosing impl's generics, so every
-        // call produces one future type. `pool` only returns a const thread-local.
-        unsafe { ::switch::__private::token::<Key, _, _>(build) }
+        {
+            #[derive(Clone, Copy)]
+            struct Marker;
+            ::switch::__private::token(Marker, #capacity_local, #build)
+        }
     };
     Ok(quote! {
         #(#attrs)*
-        #vis fn #name(#inputs) -> #token {
-            #sig #block
-            ::std::thread_local! {
-                static POOL: ::switch::__private::Pool = const { ::switch::__private::Pool::new() };
-            }
-            struct Key;
-            unsafe impl ::switch::__private::PoolKey for Key {
-                fn pool() -> &'static ::std::thread::LocalKey<::switch::__private::Pool> {
-                    &POOL
-                }
-                #capacity
-            }
+        #vis fn #name #generics (#inputs) -> #token #where_clause {
+            #declared
+            #closure
+            let #capacity_local = #capacity;
             #spawn
         }
     })
 }
 
-/// Finds an `impl Trait` (an anonymous generic) in an argument type.
-struct ImplTrait(Option<proc_macro2::Span>);
+/// `()` or nothing.
+fn returns_unit(output: &ReturnType) -> bool {
+    match output {
+        ReturnType::Default => true,
+        ReturnType::Type(_, ty) => is_unit(ty),
+    }
+}
 
-impl<'ast> Visit<'ast> for ImplTrait {
-    fn visit_type_impl_trait(&mut self, node: &'ast TypeImplTrait) {
-        self.0.get_or_insert(node.impl_token.span);
+/// The bounds of `impl Future<Output = ()>`, optionally `+ 'static`.
+fn unit_future_bounds(output: &ReturnType) -> Option<&Punctuated<TypeParamBound, Token![+]>> {
+    let ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let Type::ImplTrait(TypeImplTrait { bounds, .. }) = ty.as_ref() else {
+        return None;
+    };
+    let mut future = 0;
+    for bound in bounds {
+        match bound {
+            TypeParamBound::Lifetime(lifetime) if lifetime.ident == "static" => {}
+            TypeParamBound::Trait(bound) if is_unit_future(&bound.path) => future += 1,
+            _ => return None,
+        }
+    }
+    (future == 1).then_some(bounds)
+}
+
+fn is_unit_future(path: &syn::Path) -> bool {
+    let Some(segment) = path.segments.last() else {
+        return false;
+    };
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    segment.ident == "Future"
+        && arguments.args.len() == 1
+        && matches!(&arguments.args[0], GenericArgument::AssocType(output)
+            if output.ident == "Output" && output.generics.is_none() && is_unit(&output.ty))
+}
+
+fn is_unit(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use proc_macro2::{TokenStream, TokenTree};
+    use syn::parse_quote;
+
+    fn has_unsafe(tokens: TokenStream) -> bool {
+        tokens.into_iter().any(|token| match token {
+            TokenTree::Ident(ident) => ident == "unsafe",
+            TokenTree::Group(group) => has_unsafe(group.stream()),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn expansion_contains_no_unsafe() {
+        for function in [
+            parse_quote!(
+                async fn run(a: u8, mut b: Vec<u8>) {
+                    b.push(a);
+                }
+            ),
+            parse_quote!(
+                fn run(a: u8) -> impl Future<Output = ()> + 'static {
+                    async move {
+                        let _ = a;
+                    }
+                }
+            ),
+        ] {
+            let expanded = super::expand(Some(parse_quote!(4)), function).unwrap();
+            assert!(!has_unsafe(expanded));
+        }
     }
 }

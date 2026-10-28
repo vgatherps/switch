@@ -1,25 +1,26 @@
 //! Items used by `#[switch::task]` expansions. Not a stable API.
 
+use std::any::TypeId;
 use std::marker::PhantomData;
+use std::num::NonZeroU32;
 
 use super::block::Shape;
 use crate::executor::Executor;
 use crate::task::SpawnToken;
 
-pub use super::pool::Pool;
+/// Most occupied slots of one task function per runtime.
+#[derive(Clone, Copy)]
+pub struct Capacity(NonZeroU32);
 
-/// Identifies one task function: its thread-local pool and its capacity.
-///
-/// # Safety
-/// `pool()` is private to one task function that always produces one future
-/// type, and is side-effect free: it returns a `const`-initialized
-/// thread-local and runs no other code. Spawn calls it with the runtime
-/// borrowed, so it must not be able to shut down or drop that runtime.
-pub unsafe trait PoolKey: 'static {
-    fn pool() -> &'static std::thread::LocalKey<Pool>;
-    /// Most occupied slots of this function per runtime; `None` is one block's
-    /// slots. Checked at compile time: `1 <= N < 2^25`.
-    const CAPACITY: Option<u32> = None;
+impl Capacity {
+    /// Panics unless `1 <= n < 2^25`; in a `const` block that is a compile error.
+    pub const fn new(n: u32) -> Self {
+        assert!(
+            n >= 1 && n < 1 << 25,
+            "task capacity must be at least 1 and below 2^25"
+        );
+        Self(NonZeroU32::new(n).unwrap())
+    }
 }
 
 mod sealed {
@@ -45,25 +46,27 @@ pub(crate) unsafe fn spawn_in<T: Task>(payload: T, executor: *mut Executor) -> R
 
 struct Payload<K, C, Fut> {
     build: C,
+    capacity: Option<Capacity>,
     _key: PhantomData<fn() -> (K, Fut)>,
 }
 
 impl<K, C, Fut> sealed::Sealed for Payload<K, C, Fut>
 where
-    K: PoolKey,
+    K: 'static,
     C: FnOnce() -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
     #[inline]
     unsafe fn spawn_in(self, executor: *mut Executor) -> Result<(), Self> {
-        let capacity = match K::CAPACITY {
-            Some(capacity) => capacity,
+        let capacity = match self.capacity {
+            Some(capacity) => capacity.0.get(),
             None => Shape::<Fut>::SLOTS as u32,
         };
+        // The pool's key names `Fut`, and `Shape::<Fut>` is written into its blocks
+        // here, in the same instantiation: a pool only ever holds one future type.
+        let key = TypeId::of::<(K, Fut)>();
         unsafe {
-            let pool = K::pool().with(Pool::get);
-            let Some(reservation) =
-                Executor::reserve(executor, pool, &Shape::<Fut>::SPEC, capacity)
+            let Some(reservation) = Executor::reserve(executor, key, &Shape::<Fut>::SPEC, capacity)
             else {
                 return Err(self);
             };
@@ -76,7 +79,7 @@ where
 
 impl<K, C, Fut> Task for Payload<K, C, Fut>
 where
-    K: PoolKey,
+    K: 'static,
     C: FnOnce() -> Fut,
     Fut: Future<Output = ()> + 'static,
 {
@@ -84,23 +87,21 @@ where
 
 /// Package a task function's call as a token; allocates nothing.
 ///
-/// # Safety
-/// `K` belongs to the task function producing `Fut` (see [`PoolKey`]).
+/// Spawns share a pool exactly when their `marker` type and future type are the
+/// same, so tasks of different functions (markers) never share slots, and one
+/// marker used with different future types gets one pool per future type.
+/// `capacity` is the pool's most occupied slots per runtime (default: one 64 KiB
+/// block's slots); the first spawn of a pool in a runtime sets it.
 #[inline]
-pub unsafe fn token<K: PoolKey, C: FnOnce() -> Fut, Fut: Future<Output = ()> + 'static>(
-    c: C,
+pub fn token<K: Copy + 'static, C: FnOnce() -> Fut, Fut: Future<Output = ()> + 'static>(
+    _marker: K,
+    capacity: Option<Capacity>,
+    build: C,
 ) -> SpawnToken<impl Task> {
     let () = Shape::<Fut>::FITS;
-    const {
-        if let Some(capacity) = K::CAPACITY {
-            assert!(
-                capacity >= 1 && capacity < 1 << 25,
-                "task capacity must be at least 1 and below 2^25"
-            );
-        }
-    }
     SpawnToken::new(Payload::<K, C, Fut> {
-        build: c,
+        build,
+        capacity,
         _key: PhantomData,
     })
 }
