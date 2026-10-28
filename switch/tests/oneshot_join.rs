@@ -173,15 +173,103 @@ fn a_send_racing_the_first_poll_is_never_lost() {
 }
 
 #[test]
-fn a_sender_drop_racing_the_receiver_drop_frees_once() {
+fn a_send_racing_the_receiver_drop_frees_once() {
     for _ in 0..8 {
         let (sender, receiver) = oneshot::channel::<Vec<u8>>();
-        let dropping = std::thread::spawn(move || {
+        let sending = std::thread::spawn(move || {
             let _ = sender.send(vec![7]);
         });
         drop(receiver);
+        sending.join().unwrap();
+    }
+}
+
+#[test]
+fn a_sender_drop_racing_the_receiver_drop_frees_once() {
+    for _ in 0..8 {
+        let (sender, receiver) = oneshot::channel::<Vec<u8>>();
+        let dropping = std::thread::spawn(move || drop(sender));
+        drop(receiver);
         dropping.join().unwrap();
     }
+}
+
+#[test]
+fn a_sender_drop_racing_the_first_poll_cancels() {
+    for _ in 0..8 {
+        let mut runtime = Runtime::new(0);
+        let (sender, receiver) = oneshot::channel::<u32>();
+        let out = slot();
+        runtime
+            .spawner()
+            .spawn(store(receiver, out.clone()))
+            .unwrap();
+        let dropping = std::thread::spawn(move || drop(sender));
+        run_until(&mut runtime, &out, 1000);
+        dropping.join().unwrap();
+        run_until(&mut runtime, &out, 2);
+        assert_eq!(*out.borrow(), Some(Err(Canceled)));
+    }
+}
+
+#[test]
+fn a_sender_dropped_after_its_receiver_does_not_wake_the_slot() {
+    /// Polls its receiver until `done`, then drops it and completes. Keeps its
+    /// waker in `waker`.
+    #[switch::task(capacity = 1)]
+    fn waits(
+        receiver: Receiver<u32>,
+        done: Rc<Cell<bool>>,
+        polls: Rc<Cell<u32>>,
+        waker: Slot<std::task::Waker>,
+    ) -> impl Future<Output = ()> {
+        let mut receiver = Some(receiver);
+        std::future::poll_fn(move |cx| {
+            polls.set(polls.get() + 1);
+            *waker.borrow_mut() = Some(cx.waker().clone());
+            if done.get() {
+                drop(receiver.take());
+                return std::task::Poll::Ready(());
+            }
+            let held = receiver.as_mut().unwrap();
+            assert!(std::pin::Pin::new(held).poll(cx).is_pending());
+            std::task::Poll::Pending
+        })
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let (old_sender, old_receiver) = oneshot::channel();
+    let (done, old_polls, waker) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0)), slot());
+    spawner
+        .spawn(waits(
+            old_receiver,
+            done.clone(),
+            old_polls.clone(),
+            waker.clone(),
+        ))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    // The receiver registered its task; the task then drops it and completes.
+    done.set(true);
+    waker.borrow_mut().take().unwrap().wake();
+    runtime.poll(0).unwrap();
+    assert_eq!(old_polls.get(), 2);
+    // Capacity 1: a newer task takes the old one's slot.
+    let (_new_sender, new_receiver) = oneshot::channel();
+    let new_polls = Rc::new(Cell::new(0));
+    spawner
+        .spawn(waits(
+            new_receiver,
+            Rc::new(Cell::new(false)),
+            new_polls.clone(),
+            slot(),
+        ))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    assert_eq!(new_polls.get(), 1);
+    drop(old_sender);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
+    assert_eq!(new_polls.get(), 1);
 }
 
 #[test]

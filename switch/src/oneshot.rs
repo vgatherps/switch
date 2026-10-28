@@ -148,11 +148,15 @@ impl<T> fmt::Debug for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         unsafe {
-            self.shared
+            let previous = self
+                .shared
                 .as_ref()
                 .state
                 .fetch_or(CLOSED, Ordering::SeqCst);
-            wake(self.shared);
+            // A dropped receiver's task may be gone and its slot reused.
+            if previous & RECEIVER != 0 {
+                wake(self.shared);
+            }
             release(self.shared, SENDER);
         }
     }
@@ -162,7 +166,9 @@ impl<T> Drop for Sender<T> {
 /// without sending. Dropping it makes a later send give the value back.
 ///
 /// # Panics
-/// When polled outside a switch task (it keeps a [`RemoteWaker`]).
+/// When polled outside a switch task (it keeps a [`RemoteWaker`]) while the
+/// channel is not done; once a value was sent or the sender dropped, any
+/// poller gets `Ready`.
 pub struct Receiver<T> {
     shared: NonNull<Shared<T>>,
     _local: PhantomData<*const ()>,
