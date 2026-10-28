@@ -29,6 +29,8 @@ members = [
     "depot",
     # switchnet
     "switchnet",
+    # relay (WebSocket over conduit frames)
+    "relay",
 ]
 exclude = ["conduit/vendor/smoltcp"]
 

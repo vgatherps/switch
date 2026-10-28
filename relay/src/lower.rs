@@ -1,0 +1,45 @@
+//! The interface relay consumes from the layer below it: raw TCP frames
+//! ([`Raw`](crate::Raw)) or a TLS layer handing out plaintext.
+
+/// A received TCP frame: one segment's payload plus its hardware RX stamp.
+pub trait RxFrame {
+    fn payload(&self) -> &[u8];
+    fn payload_mut(&mut self) -> &mut [u8];
+    fn rx_timestamp(&self) -> u64;
+}
+
+/// One contiguous run of received bytes, in stream order.
+pub struct Chunk<'a> {
+    /// Never empty. Mutable so the server role can unmask in place.
+    pub bytes: &'a mut [u8],
+    /// Stamp of the frame holding the run's first byte (TLS: the record's first byte).
+    pub rx_timestamp: u64,
+}
+
+/// A byte stream delivered as frames.
+///
+/// Bytes are handed out as runs: raw TCP gives the unconsumed rest of the
+/// current frame, TLS one record's plaintext.
+pub trait PlainRx {
+    type Frame: RxFrame;
+    /// The send half the receive path needs per call (the TLS connection lives there).
+    type Tx;
+    type Error;
+
+    /// Hand over the next frame. Called only after `chunk` returned `Ok(None)`.
+    fn push(&mut self, f: Self::Frame, tx: &mut Self::Tx) -> Result<(), Self::Error>;
+    /// The unconsumed rest of the current run; `None` when a `push` is needed,
+    /// by which point every fully consumed frame has been dropped.
+    /// Without an intervening `consume`, a second call returns the same bytes,
+    /// including changes the caller made to them.
+    fn chunk(&mut self, tx: &mut Self::Tx) -> Result<Option<Chunk<'_>>, Self::Error>;
+    /// The unconsumed bytes of the run the last `chunk` returned; empty if none.
+    fn current(&self) -> &[u8];
+    /// Mark the first `n` bytes of `current()` consumed. Frees nothing.
+    fn consume(&mut self, n: usize);
+    /// If the current run lies inside a frame: consume its first `len` bytes and
+    /// move the frame out, with the offset of those bytes in `payload()`. Bytes
+    /// after them stay readable through later chunks. `None`, with nothing
+    /// consumed, when the run is not inside a frame.
+    fn take_frame(&mut self, len: usize) -> Option<(Self::Frame, usize)>;
+}
