@@ -109,6 +109,10 @@ pub enum FeedError {
         required: usize,
         pool: usize,
     },
+    TxFramePoolTooSmall {
+        required: usize,
+        pool: usize,
+    },
     Connect(tcp::ConnectError),
     Refused {
         addr: SocketAddrV4,
@@ -153,6 +157,12 @@ impl fmt::Display for FeedError {
                 write!(
                     f,
                     "RX pool has {pool} mbufs; adding this socket requires {required}"
+                )
+            }
+            Self::TxFramePoolTooSmall { required, pool } => {
+                write!(
+                    f,
+                    "frame pool has {pool} mbufs; adding this socket requires {required}"
                 )
             }
             Self::Connect(error) => write!(f, "TCP connect: {error:?}"),
@@ -257,6 +267,9 @@ pub fn connect<'s>(
         AddTcpError::SocketsFull(_) => FeedError::SocketsFull,
         AddTcpError::RxPoolTooSmall { required, pool, .. } => {
             FeedError::RxPoolTooSmall { required, pool }
+        }
+        AddTcpError::TxFramePoolTooSmall { required, pool, .. } => {
+            FeedError::TxFramePoolTooSmall { required, pool }
         }
     })?;
     let endpoint = IpEndpoint::new((*target.addr.ip()).into(), target.addr.port());

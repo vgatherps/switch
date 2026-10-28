@@ -11,7 +11,9 @@ use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::{EthernetFrame, EthernetProtocol, IpEndpoint, TcpControl};
-use dpdk_smoltcp::{AddTcpError, Stack, StackConfig};
+use dpdk_smoltcp::{
+    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, AddTcpError, Stack, StackConfig,
+};
 use tungstenite::error::ProtocolError;
 use tungstenite::protocol::{Role, WebSocketContext};
 use tungstenite::{Error, Message};
@@ -45,14 +47,45 @@ fn request(key: Option<&str>) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A with `client_sockets` slots, B with `server_sockets`.
-fn new_pair(eal: &dpdk_smoltcp::Eal, names: [&str; 2], sockets: [usize; 2]) -> Pair {
-    let configs = [Side::A, Side::B].map(|side| StackConfig {
+fn configs(sockets: [usize; 2]) -> [StackConfig<'static>; 2] {
+    [Side::A, Side::B].map(|side| StackConfig {
         max_udp_sockets: 0,
         max_sockets: sockets[side.index()],
         ..config(side)
-    });
-    Pair::new(eal, names, configs, T0)
+    })
+}
+
+/// A with `client_sockets` slots, B with `server_sockets`.
+fn new_pair(eal: &dpdk_smoltcp::Eal, names: [&str; 2], sockets: [usize; 2]) -> Pair {
+    Pair::new(eal, names, configs(sockets), T0)
+}
+
+/// `new_pair` with sockets of `BUFFER` bytes, except that A's frame pool
+/// backs one client socket sending `send` bytes.
+fn new_pair_with_client_send(
+    eal: &dpdk_smoltcp::Eal,
+    names: [&str; 2],
+    sockets: [usize; 2],
+    send: usize,
+) -> Pair {
+    let configs = configs(sockets);
+    Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
+        let stack = configs[side.index()];
+        port.rx_pool.count = rx_pool_count(
+            rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
+            port.mtu,
+            std::iter::repeat_n(BUFFER, stack.max_sockets),
+        );
+        let sends = match side {
+            Side::A => vec![send],
+            Side::B => vec![BUFFER; stack.max_sockets],
+        };
+        port.frame_pool.count = frame_pool_count(
+            frame_reserve(port.tx_descriptors, stack.tx_pending),
+            port.mtu,
+            sends,
+        );
+    })
 }
 
 fn close(pair: Pair) {
@@ -349,7 +382,7 @@ fn server_closes_tcp_first_after_close_handshake() {
 #[zhida_test_support::pinned_test]
 fn close_reply_sent_before_fin_under_backpressure() {
     with_eal(|eal| {
-        let mut pair = new_pair(eal, ["crba", "crbb"], [1, 2]);
+        let mut pair = new_pair_with_client_send(eal, ["crba", "crbb"], [1, 2], 256 * 1024);
         let mut net = Net::new(&mut pair, 4096);
         let mut client = net.open_with(socket(4096, 256 * 1024), CLIENT_PORT);
         let message = Message::binary(pattern(64 * 1024, 2));

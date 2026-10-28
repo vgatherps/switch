@@ -35,6 +35,8 @@ const POOL_CACHE: u32 = 8;
 /// Mbufs one lcore's mempool cache can hold.
 const CACHE_SLACK: u32 = POOL_CACHE * 3 / 2;
 const FRAME: u16 = 1514;
+/// Local TCP segment payload at MTU 1500: the size a frame goes out in place at.
+const SEGMENT_PAYLOAD: usize = 1500 - 40;
 const NOTE: &str = "frames include memif's copy of every frame on both sides";
 /// The peer delays the ACK of the last segment when at most one MSS is
 /// unacknowledged (smoltcp 0.14.0 tcp.rs:2258-2262, 2401-2403).
@@ -127,10 +129,11 @@ fn send_poll(stack: &mut Stack, conns: usize) -> Result<Sent, StackError> {
     })
 }
 
-/// Port settings for a side with `conns` connections of 64 KiB receive buffers.
+/// Port settings for a side with `conns` connections of 64 KiB buffers.
 /// The RX pool covers the driver reserve and socket budgets. The TX pool
 /// covers 64 descriptors and every pending slot, and the frame pool one frame
-/// more (`frame_reserve`), each with cache slack; copy TX frees accepted mbufs.
+/// more (`frame_reserve`) plus every socket's TX frame limit, each with cache
+/// slack; copy TX frees accepted mbufs.
 pub fn port_config<'a>(
     port_id: u16,
     conns: usize,
@@ -167,7 +170,11 @@ pub fn port_config<'a>(
             socket_id: -1,
         },
         tx_pool: pool(tx_pool, tx_pending(conns), headroom + FRAME),
-        frame_pool: pool(frame_pool, tx_pending(conns) + 1, headroom + FRAME),
+        frame_pool: pool(
+            frame_pool,
+            tx_pending(conns) + 1 + conns * tcp::tx_mbuf_budget(&socket(), 1500),
+            headroom + FRAME,
+        ),
         offloads: Offloads::default(),
     }
 }
@@ -267,19 +274,23 @@ fn message_key(conn: usize, round: usize) -> u64 {
     (conn as u64) << 48 | (round as u64) << 16
 }
 
-/// Enqueue pattern bytes `from..to` of stream `key`; returns how many fit.
-fn send_pattern(socket: &mut tcp::Socket<'static>, key: u64, from: usize, to: usize) -> usize {
+/// Enqueue pattern bytes `from..to` of stream `key` in frames filled in place,
+/// one per local segment payload, while the socket has frame room; returns how
+/// many fit. Admission backs every frame slot, so the pool has a frame whenever
+/// the socket has room.
+fn send_pattern(stack: &mut Stack, handle: &TcpHandle, key: u64, from: usize, to: usize) -> usize {
     let mut at = from;
     while at < to {
-        let n = socket
-            .send(|buf| {
-                let n = buf.len().min(to - at);
-                fill_pattern(&mut buf[..n], key, at as u64);
-                (n, n)
-            })
-            .expect("sending socket is Established");
-        if n == 0 {
+        let room = stack.tcp(handle).frame_send_room();
+        if room == 0 {
             break;
+        }
+        let mut frame = stack.tx_frame().expect("admission backs the socket's frame slots");
+        let n = (to - at).min(SEGMENT_PAYLOAD).min(room).min(frame.capacity());
+        fill_pattern(&mut frame.room_mut()[..n], key, at as u64);
+        frame.set_len(n);
+        if let Err((_, error)) = stack.tcp_send_frame(handle, frame) {
+            panic!("frame of {n} bytes within frame_send_room refused: {error}");
         }
         at += n;
     }
@@ -649,14 +660,14 @@ impl Client {
         let target = if measured { warmup + rounds } else { warmup };
         let mut last_echo = None;
         for (c, conn) in self.conns.iter_mut().enumerate() {
-            let socket = self.stack.tcp_mut(&conn.handle);
             while conn.round < target {
                 let key = message_key(c, conn.round);
                 if measured && conn.round == warmup && conn.written == 0 {
                     conn.started = Instant::now();
                     self.start.get_or_insert(conn.started);
                 }
-                conn.written += send_pattern(socket, key, conn.written, message);
+                conn.written += send_pattern(&mut self.stack, &conn.handle, key, conn.written, message);
+                let socket = self.stack.tcp_mut(&conn.handle);
                 let (read, equal) = recv_pattern(socket, &mut conn.pending, key, conn.echoed, conn.written);
                 conn.echoed += read;
                 if !equal {
@@ -685,10 +696,9 @@ impl Client {
 
     fn bulk(&mut self, bytes: usize, warmup: usize) {
         let conn = &mut self.conns[0];
-        let socket = self.stack.tcp_mut(&conn.handle);
         if self.phase == Phase::Warmup {
-            conn.written += send_pattern(socket, 0, conn.written, warmup);
-            self.acked = conn.written - socket.send_queue();
+            conn.written += send_pattern(&mut self.stack, &conn.handle, 0, conn.written, warmup);
+            self.acked = conn.written - self.stack.tcp(&conn.handle).send_queue();
             if self.acked < warmup {
                 return;
             }
@@ -696,8 +706,8 @@ impl Client {
             self.start = Some(Instant::now());
         }
         let total = warmup + bytes;
-        conn.written += send_pattern(socket, 0, conn.written, total);
-        self.acked = conn.written - socket.send_queue();
+        conn.written += send_pattern(&mut self.stack, &conn.handle, 0, conn.written, total);
+        self.acked = conn.written - self.stack.tcp(&conn.handle).send_queue();
         if self.acked == total {
             self.finish(Instant::now());
         }

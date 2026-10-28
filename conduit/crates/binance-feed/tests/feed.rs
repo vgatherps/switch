@@ -76,7 +76,14 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
             ).unwrap(),
         ),
         tx_pool: pool(TX_POOL, 127),
-        frame_pool: pool(FRAME_POOL, 127),
+        frame_pool: pool(
+            FRAME_POOL,
+            u32::try_from(
+                frame_reserve(16, 32)
+                    .checked_add(tcp::tx_mbuf_budget(&socket(mss_cap), 1500))
+                    .expect("frame pool count fits usize"),
+            ).unwrap(),
+        ),
         offloads: Offloads::default(),
     }
 }
@@ -164,7 +171,11 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
             // net_ring's TX descriptors are its 64-slot TX ring.
             let (tx, pending) = (port_config.tx_descriptors, stack_config.tx_pending);
             port_config.tx_pool.count = u32::try_from(tx_reserve(tx, pending)).unwrap();
-            port_config.frame_pool.count = u32::try_from(frame_reserve(tx, pending)).unwrap();
+            port_config.frame_pool.count = u32::try_from(
+                frame_reserve(tx, pending)
+                    .checked_add(tcp::tx_mbuf_budget(&tcp_config, 9000))
+                    .expect("frame pool count fits usize"),
+            ).unwrap();
             let port = ring.open_with(eal, port_config);
             let mut stack = Stack::new(port, stack_config, StackInstant::ZERO)
                 .map_err(|(_, error)| error).unwrap();

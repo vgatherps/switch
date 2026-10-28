@@ -381,6 +381,7 @@ fn backpressure(eal: &Eal, names: [&str; 2], queued: usize, mode: Mode) -> (Turn
         4,
         rx_pool_count(rx_reserve(16, configs[0].rx_staging, 8), 1500, [4096]),
         63,
+        63,
     );
     let ([a, b], _) = establish(&mut pair, Side::A);
     let now = pair.now();

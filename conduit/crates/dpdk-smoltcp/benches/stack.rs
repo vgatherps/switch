@@ -51,8 +51,8 @@
 //! of warmup (no timer is needed in steady state; the timed round never
 //! calls `poll_at`): A turn, Link A->B, B turn, Link B->A, then A writes
 //! `CHUNK` bytes and B reads `CHUNK` bytes into a buffer passed through
-//! `black_box` (the app I/O, timed inside the round and measured alone by
-//! established_app_io). Every iteration asserts A received one ACK and sent
+//! `black_box` (the app I/O, timed inside the round). Every iteration
+//! asserts A received one ACK and sent
 //! `SEGMENTS` data frames and B received those and sent one ACK:
 //! `SEGMENTS + 1` = 9 frames forwarded (the throughput element) and `CHUNK`
 //! payload bytes per iteration. This per-frame figure is an average over 8
@@ -69,32 +69,13 @@
 //! allocates, copies and bursts one template ACK; Link B->A; A's RX burst and
 //! free. Same 9 elements.
 //!
-//! established_app_io, reference for the round's app I/O: the same calls on
-//! two bare `tcp::SocketBuffer`s of `TCP_BUFFER` bytes, no Stack, no ports.
-//! Untimed, A's buffer holds one unacknowledged `CHUNK` and every
-//! `CHUNK`-aligned offset of B's holds `payload`, as in a steady round. One
-//! iteration, all timed: `enqueue_slice(CHUNK)` into A's buffer, the bytes
-//! just written passed through `black_box` (`get_allocated(len - CHUNK,
-//! CHUNK)`), and `dequeue_allocated(CHUNK)` out of it (the ACK's release,
-//! which the stack does in the round); `enqueue_unallocated(CHUNK)` into B's
-//! (the stack's receive, bytes already in place) and `dequeue_slice(CHUNK)`
-//! out of it into a `black_box`ed buffer; offsets advance by `CHUNK` per
-//! round as in the round. Untimed settle rounds check both the written and
-//! the read bytes equal `payload`. Elements = 9, the round's frames, only so
-//! the units line up with established_tcp_turn; it moves no frames. It runs
-//! cache-hot in isolation (only its two buffers and `payload` are touched),
-//! so it likely undercounts the app I/O inside the round slightly.
-//!
-//! Approximate: stack cost per round ~ established_tcp_turn -
-//! established_link_only - established_app_io. In it: smoltcp ingress and
-//! egress processing, header emit, per-turn fixed cost (two flushes,
-//! maintenance, egress passes) twice per round. Residuals: the link-only
-//! producer's 9 whole-frame copies (8 full data templates and one ACK) are
-//! subtracted,
-//! while the stack fills each frame by header emit plus a payload copy from
-//! the socket buffer, so the difference leaves out roughly one frame copy
-//! per sent frame; the app reference's two O(1) bookkeeping calls stand in
-//! for work the stack does inside its turns.
+//! Approximate: stack cost plus app I/O per round ~ established_tcp_turn -
+//! established_link_only. In it: smoltcp ingress and egress processing,
+//! header emit, per-turn fixed cost (two flushes, maintenance, egress
+//! passes) twice per round, and the app's write and read. Residual: the
+//! link-only producer's 9 whole-frame copies (8 full data templates and one
+//! ACK) are subtracted, while the stack sends data frames in place after the
+//! app's write.
 
 use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
@@ -102,21 +83,18 @@ use std::hint::black_box;
 use std::ptr::null_mut;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use dpdk_smoltcp::smoltcp::socket::tcp::SocketBuffer;
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, Ipv4Address, Ipv4Cidr, ETHERNET_HEADER_LEN,
     IPV4_HEADER_LEN,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
 use dpdk_smoltcp::{Eal, Packet, Port, PortConfig, RxBurst, Stack, StackConfig, TxPacket};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::*;
 
 use zhida_test_kit::{pair, ring_port, wire, with_eal};
-use established::{
-    expected_turn, turn_counts, Established, CHUNK, SEGMENTS, SETTLE_ROUNDS, TCP_BUFFER,
-};
-use pair::{config, pattern, segment, Dir, Pair, Side, T0};
+use established::{expected_turn, turn_counts, Established, SEGMENTS, TCP_BUFFER};
+use pair::{config, segment, Dir, Pair, Side, T0};
 use ring_port::RingPort;
 
 mod established;
@@ -274,6 +252,11 @@ fn tcp_bench(c: &mut Criterion, eal: &Eal) -> Templates {
             port.mtu,
             [TCP_BUFFER],
         );
+        port.frame_pool.count = frame_pool_count(
+            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
+            port.mtu,
+            [TCP_BUFFER],
+        );
     });
     let (mut data, mut ack) = (Vec::new(), Vec::new());
     let mut established = Established::connect(&mut pair);
@@ -369,49 +352,12 @@ fn link_only_bench(c: &mut Criterion, eal: &Eal, templates: &Templates) {
     }
 }
 
-/// `CHUNK` written into `tx` and released as acknowledged; `CHUNK` received
-/// into `rx` in place and read out into `sink`.
-fn app_io_round(tx: &mut SocketBuffer, rx: &mut SocketBuffer, payload: &[u8], sink: &mut [u8]) {
-    assert_eq!(tx.enqueue_slice(payload), CHUNK);
-    black_box(tx.get_allocated(tx.len() - CHUNK, CHUNK));
-    tx.dequeue_allocated(CHUNK);
-    rx.enqueue_unallocated(CHUNK);
-    assert_eq!(rx.dequeue_slice(sink), CHUNK);
-    black_box(&*sink);
-}
-
-fn app_io_bench(c: &mut Criterion) {
-    let payload = pattern(CHUNK, 7);
-    let mut tx = SocketBuffer::new(vec![0; TCP_BUFFER]);
-    let mut rx = SocketBuffer::new(vec![0; TCP_BUFFER]);
-    assert_eq!(tx.enqueue_slice(&payload), CHUNK);
-    for _ in 0..TCP_BUFFER / CHUNK {
-        assert_eq!(rx.enqueue_slice(&payload), CHUNK);
-    }
-    rx.dequeue_allocated(TCP_BUFFER);
-    let mut sink = vec![0; CHUNK];
-    for _ in 0..SETTLE_ROUNDS {
-        app_io_round(&mut tx, &mut rx, &payload, &mut sink);
-        assert_eq!(sink, payload);
-        assert_eq!(tx.get_allocated(0, CHUNK), payload);
-        assert_eq!((tx.len(), rx.len()), (CHUNK, 0));
-    }
-
-    let mut group = c.benchmark_group("stack");
-    group.throughput(Throughput::Elements(SEGMENTS as u64 + 1));
-    group.bench_function("established_app_io", |b| {
-        b.iter(|| app_io_round(&mut tx, &mut rx, &payload, &mut sink));
-    });
-    group.finish();
-}
-
 fn stack_benches(c: &mut Criterion) {
     with_eal(|eal| {
         arp_benches(c, eal);
         let templates = tcp_bench(c, eal);
         link_only_bench(c, eal, &templates);
     });
-    app_io_bench(c);
 }
 
 criterion_group!(benches, stack_benches);

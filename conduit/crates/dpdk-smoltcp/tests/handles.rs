@@ -12,7 +12,8 @@ use dpdk_smoltcp::smoltcp::wire::{
     UdpPacket,
 };
 use dpdk_smoltcp::{
-    rx_pool_count, rx_reserve, AddTcpError, AddUdpError, Eal, Stack, TcpHandle, UdpConfig,
+    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, AddTcpError, AddUdpError, Eal,
+    Stack, TcpHandle, UdpConfig,
 };
 
 type Frames = Vec<(Dir, Vec<u8>)>;
@@ -97,6 +98,11 @@ fn connect_pair(eal: &Eal, names: [&str; 2]) -> Pair {
             port.rx_pool.cache_size,
         );
         port.rx_pool.count = rx_pool_count(reserve, port.mtu, [4096; 3]);
+        port.frame_pool.count = frame_pool_count(
+            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
+            port.mtu,
+            [4096; 3],
+        );
     })
 }
 

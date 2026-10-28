@@ -5,7 +5,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, EthernetAddress, EthernetFrame, EthernetProtocol, TcpControl,
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, TCP_HEADER_LEN,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
 use dpdk_smoltcp::{Eal, Sent, StackConfig, Turn, UdpConfig};
 
 use zhida_test_kit::{many, pair, wire, with_eal};
@@ -45,6 +45,11 @@ fn new_pair(eal: &Eal, names: [&str; 2], pending: usize) -> Pair {
         )
         .checked_add(1)
         .expect("UDP receive slot fits the RX pool");
+        port.frame_pool.count = frame_pool_count(
+            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
+            port.mtu,
+            std::iter::repeat_n(4096, configs[side.index()].max_sockets),
+        );
     })
 }
 
@@ -140,6 +145,11 @@ fn template_acks_keep_exact_tx_pool_counts() {
                             configs[side.index()].rx_staging,
                             port.rx_pool.cache_size,
                         ),
+                        port.mtu,
+                        std::iter::repeat_n(4096, configs[side.index()].max_sockets),
+                    );
+                    port.frame_pool.count = frame_pool_count(
+                        frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                         port.mtu,
                         std::iter::repeat_n(4096, configs[side.index()].max_sockets),
                     );
@@ -301,16 +311,18 @@ fn send_backpressure_resumes_same_socket() {
         let now = pair.now();
         assert_eq!(pair.a.poll_at(), Some(now));
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 15);
-        assert_eq!(pair.in_use()[0].1, 2);
+        // Data leaves in frame-pool frames: the TX pool holds none of it, and
+        // the socket holds all five frames until B acknowledges them.
+        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (0, 5));
         assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 2, tx_pending: 0 }));
         assert_eq!(pair.a.poll_at(), Some(now));
         assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 2, tx_pending: 0 }));
         assert_eq!(pair.a.poll_at(), Some(now));
         assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 1, tx_pending: 0 }));
-        assert_eq!(pair.in_use()[0].1, 5);
+        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (0, 5));
         let frames = forward(&mut pair.a_to_b);
         assert_segments(&frames, Side::A, &data, mss);
-        assert_eq!(pair.in_use()[0].1, 0);
+        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (0, 5));
         assert_eq!(pair.b.receive(now, BUDGET).unwrap().rx_processed, 5);
         let received = drain_bytes(pair.b.tcp_mut(&b)).unwrap();
         assert_eq!(received.len(), data.len());
@@ -371,9 +383,11 @@ fn into_port_returns_unflushed_frames() {
         fill_tx_ring(&mut pair);
         assert_eq!(pair.a.tcp_mut(&a).send_slice(&data), Ok(data.len()));
         assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 0, tx_pending: 3 }));
-        assert_eq!(pair.in_use()[0].1, 18);
+        // The UDP datagrams are TX-pool copies; the three data segments are
+        // frame-pool frames, pending and held by the socket.
+        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (15, 3));
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 15);
-        assert_eq!(pair.in_use()[0].1, 3);
+        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (0, 3));
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 0);
         // close calls into_port before it checks both pools on each side are 0.
         assert_eq!(pair.close(), 0);

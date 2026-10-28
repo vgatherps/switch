@@ -551,6 +551,11 @@ fn read_fills_buffer_across_frames_keeping_partial_frame() {
                 port.mtu,
                 [65536],
             );
+            port.frame_pool.count = dpdk_smoltcp::frame_pool_count(
+                dpdk_smoltcp::frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
+                port.mtu,
+                [65536],
+            );
         });
         let (handles, _) = establish_sized(&mut pair, Side::A, 65536);
         let mut handles = handles.map(Some);

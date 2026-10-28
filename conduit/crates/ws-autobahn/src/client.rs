@@ -35,6 +35,10 @@ pub enum ClientError {
         required: usize,
         pool: usize,
     },
+    TxFramePoolTooSmall {
+        required: usize,
+        pool: usize,
+    },
     Connect(tcp::ConnectError),
     /// Connection `connection`'s socket was Closed while the client waited
     /// for Established: refused (RST) or timed out.
@@ -79,6 +83,12 @@ impl fmt::Display for ClientError {
                 write!(
                     f,
                     "RX pool has {pool} mbufs; adding this socket requires {required}"
+                )
+            }
+            Self::TxFramePoolTooSmall { required, pool } => {
+                write!(
+                    f,
+                    "frame pool has {pool} mbufs; adding this socket requires {required}"
                 )
             }
             _ => write!(f, "{self:?}"),
@@ -369,6 +379,9 @@ impl<'s> Client<'s> {
                 AddTcpError::SocketsFull(_) => ClientError::SocketsFull,
                 AddTcpError::RxPoolTooSmall { required, pool, .. } => {
                     ClientError::RxPoolTooSmall { required, pool }
+                }
+                AddTcpError::TxFramePoolTooSmall { required, pool, .. } => {
+                    ClientError::TxFramePoolTooSmall { required, pool }
                 }
             })?;
         stack

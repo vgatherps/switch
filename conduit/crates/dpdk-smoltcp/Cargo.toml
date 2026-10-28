@@ -46,3 +46,8 @@ harness = false
 name = "udp"
 harness = false
 required-features = ["bench-offload"]
+
+[[bench]]
+name = "tx_phases"
+harness = false
+required-features = ["bench-offload"]

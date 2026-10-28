@@ -8,7 +8,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpEndpoint,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr,
 };
-use dpdk_smoltcp::{frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
 use dpdk_smoltcp::{
     Eal, Port, PortConfig, Stack, StackConfig, TcpHandle, Turn, DEFAULT_NEIGHBOR_CAPACITY,
 };
@@ -114,8 +114,10 @@ impl Drop for DrainFirst {
 impl Pair {
     /// `names` are short and unique among live fixtures; rings hold 15 and TX pools 63.
     /// Each RX pool covers its Stack's reserve and `max_sockets` sockets with
-    /// receive buffers up to 8688 bytes (6 * (1500 - 52)). Larger buffers need
-    /// counts from `rx_pool_count` passed through `with_pools` or `with_ports`.
+    /// receive buffers up to 8688 bytes (6 * (1500 - 52)), and each frame pool
+    /// its `frame_reserve` and `max_sockets` sockets with send buffers of that
+    /// size. Larger buffers need counts from `rx_pool_count` and
+    /// `frame_pool_count` passed through `with_pools` or `with_ports`.
     pub fn new(eal: &Eal, names: [&str; 2], configs: [StackConfig<'_>; 2], now: Instant) -> Self {
         const SMALL: usize = 6 * (1500 - 52);
         Self::with_ports(eal, names, configs, now, 16, |side, port| {
@@ -129,11 +131,18 @@ impl Pair {
                 port.mtu,
                 std::iter::repeat_n(SMALL, stack.max_sockets),
             );
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, stack.tx_pending),
+                port.mtu,
+                std::iter::repeat_n(SMALL, stack.max_sockets),
+            );
         })
     }
 
     /// `new` with RX and TX rings of `ring` slots (holding `ring - 1`; a power
-    /// of two) and RX and TX pools of `rx_pool` and `tx_pool` packets per side.
+    /// of two) and RX, TX and frame pools of `rx_pool`, `tx_pool` and
+    /// `frame_pool` packets per side.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_pools(
         eal: &Eal,
         names: [&str; 2],
@@ -142,10 +151,12 @@ impl Pair {
         ring: u32,
         rx_pool: u32,
         tx_pool: u32,
+        frame_pool: u32,
     ) -> Self {
         Self::with_ports(eal, names, configs, now, ring, |_, config| {
             config.rx_pool.count = rx_pool;
             config.tx_pool.count = tx_pool;
+            config.frame_pool.count = frame_pool;
         })
     }
 
@@ -228,6 +239,11 @@ impl Pair {
     /// (RX, TX) pool packets in use, A then B.
     pub fn in_use(&self) -> [(u32, u32); 2] {
         self.fixtures.each_ref().map(RingPort::in_use)
+    }
+
+    /// Frame pool packets in use, A then B.
+    pub fn frame_in_use(&self) -> [u32; 2] {
+        self.fixtures.each_ref().map(RingPort::frame_in_use)
     }
 
     /// A turn, A→B, B turn, B→A, all at `now()`. `observe` sees every
@@ -437,19 +453,28 @@ pub fn establish(pair: &mut Pair, client: Side) -> ([TcpHandle; 2], Vec<(Dir, Ve
     establish_sized(pair, client, 4096)
 }
 
-/// `client` connects to a listener on the other side, both with `size`-byte
-/// buffers; drives until both sockets are Established. Returns the handles by
-/// side and every delivered frame in order.
+/// `establish_with` with `size`-byte buffers.
 pub fn establish_sized(
     pair: &mut Pair,
     client: Side,
     size: usize,
 ) -> ([TcpHandle; 2], Vec<(Dir, Vec<u8>)>) {
+    establish_with(pair, client, tcp_socket_sized(size))
+}
+
+/// `client` connects to a listener on the other side, both sockets with
+/// `socket`; drives until both are Established. Returns the handles by side
+/// and every delivered frame in order.
+pub fn establish_with(
+    pair: &mut Pair,
+    client: Side,
+    socket: tcp::Config,
+) -> ([TcpHandle; 2], Vec<(Dir, Vec<u8>)>) {
     let server = client.other();
     let (client_stack, server_stack) = client.pick(&mut pair.a, &mut pair.b);
-    let server_handle = server_stack.add_tcp(tcp_socket_sized(size)).unwrap();
+    let server_handle = server_stack.add_tcp(socket).unwrap();
     server_stack.listen(&server_handle, SERVER_PORT).unwrap();
-    let client_handle = client_stack.add_tcp(tcp_socket_sized(size)).unwrap();
+    let client_handle = client_stack.add_tcp(socket).unwrap();
     client_stack
         .connect(&client_handle, IpEndpoint::new(server.ip().into(), SERVER_PORT), CLIENT_PORT)
         .unwrap();

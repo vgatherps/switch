@@ -10,7 +10,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Cidr,
     Ipv4Address, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
 use dpdk_smoltcp::{Eal, NoRoute, Stack, StackConfig, StackError, DEFAULT_NEIGHBOR_CAPACITY};
 
 fn request(ip: Ipv4Address) -> Vec<u8> {
@@ -56,6 +56,11 @@ fn reconnect(eal: &Eal, p: usize, neighbor_capacity: usize) -> [(usize, Duration
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 ),
+                port.mtu,
+                std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
+            );
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                 port.mtu,
                 std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
             );

@@ -28,7 +28,8 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    rx_pool_count, rx_reserve, Eal, Offloads, Port, PortConfig, Stack, StackConfig,
+    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, Offloads, Port, PortConfig,
+    Stack, StackConfig,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use tap_echo::{serve, EchoServer};
@@ -143,11 +144,14 @@ const JUMBO: PortSize = PortSize {
     room: 9216,
 };
 
+/// The frame pool backs the same capacities as send buffers (every socket
+/// here uses equal receive and send capacities).
 fn port_config(
     port_id: u16,
     size: PortSize,
     recv_capacities: impl IntoIterator<Item = usize>,
 ) -> PortConfig<'static> {
+    let capacities: Vec<usize> = recv_capacities.into_iter().collect();
     let pool = |name, count| PoolConfig {
         name,
         count,
@@ -165,10 +169,13 @@ fn port_config(
         queue_socket: -1,
         rx_pool: pool(
             RX_POOL,
-            rx_pool_count(rx_reserve(16, 32, 8), size.mtu, recv_capacities),
+            rx_pool_count(rx_reserve(16, 32, 8), size.mtu, capacities.iter().copied()),
         ),
         tx_pool: pool(TX_POOL, 127),
-        frame_pool: pool(FRAME_POOL, 127),
+        frame_pool: pool(
+            FRAME_POOL,
+            frame_pool_count(frame_reserve(16, 32), size.mtu, capacities).max(127),
+        ),
         offloads: Offloads::default(),
     }
 }

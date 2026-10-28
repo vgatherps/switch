@@ -335,7 +335,7 @@ fn held_tcp_frame_after_removal(reap: bool) {
         let reserve = rx_reserve(16, configs[0].rx_staging, 8);
         let pool = rx_pool_count(reserve, 1500, [4096]);
         let names = if reap { ["rxreapa", "rxreapb"] } else { ["rxhelda", "rxheldb"] };
-        let mut pair = Pair::with_pools(eal, names, configs, pair::T0, 16, pool, 63);
+        let mut pair = Pair::with_pools(eal, names, configs, pair::T0, 16, pool, 63, 63);
         let ([client, server], _) = pair::establish(&mut pair, Side::A);
         pair.a.tcp_mut(&client).set_ack_delay(None);
         pair.b.tcp_mut(&server).set_ack_delay(None);
@@ -398,7 +398,7 @@ fn remove_tcp_discards_unread_rx_and_returns_budget() {
         });
         let reserve = rx_reserve(16, configs[0].rx_staging, 8);
         let pool = rx_pool_count(reserve, 1500, [4096]);
-        let mut pair = Pair::with_pools(eal, ["rxrma", "rxrmb"], configs, pair::T0, 16, pool, 63);
+        let mut pair = Pair::with_pools(eal, ["rxrma", "rxrmb"], configs, pair::T0, 16, pool, 63, 63);
         let (handles, _) = pair::establish(&mut pair, Side::A);
         assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"unread"), Ok(6));
         pair.drive(
@@ -442,7 +442,7 @@ fn remove_tcp_frees_one_slot_full_rx_budget_and_unread_mbufs_without_sending() {
         });
         let reserve = rx_reserve(16, configs[0].rx_staging, 8);
         let pool = rx_pool_count(reserve, 1500, [4096]);
-        let mut pair = Pair::with_pools(eal, ["rxrm1a", "rxrm1b"], configs, pair::T0, 16, pool, 63);
+        let mut pair = Pair::with_pools(eal, ["rxrm1a", "rxrm1b"], configs, pair::T0, 16, pool, 63, 63);
         let ([client, server], _) = pair::establish(&mut pair, Side::A);
         let idle = pair.in_use()[1].0;
         pair.b.tcp_mut(&server).set_ack_delay(None);

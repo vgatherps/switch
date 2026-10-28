@@ -3,17 +3,17 @@
 
 use zhida_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
-use dpdk_smoltcp::smoltcp::socket::tcp::{RecvError, SendError, State};
+use dpdk_smoltcp::smoltcp::socket::tcp::{self, RecvError, SendError, State};
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::{TcpControl, TcpSeqNumber};
-use dpdk_smoltcp::{rx_pool_count, rx_reserve, tx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
 use dpdk_smoltcp::{Stack, StackConfig, StackError, Turn};
 
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::{pair, wire, with_eal};
 use pair::{
-    assert_lossless, ceil_ms, config, establish, establish_sized, new_pair, pattern, segment, App, Dir,
-    Pair, Round, Side, T0,
+    assert_lossless, ceil_ms, config, establish_sized, establish_with, new_pair, pattern,
+    segment, tcp_socket_sized, App, Dir, Pair, Round, Side, T0,
 };
 use wire::{Link, Verdict};
 
@@ -194,13 +194,44 @@ fn segs(frames: &[(Dir, Vec<u8>)]) -> Vec<Seg> {
         .collect()
 }
 
-/// A connects to B; returns the handles and the next sequence numbers of A
-/// and B, read off A's final handshake ACK.
+/// A connects to B with 4 KiB buffers; returns the handles and the next
+/// sequence numbers of A and B, read off A's final handshake ACK.
 fn connect(pair: &mut Pair) -> ([TcpHandle; 2], TcpSeqNumber, TcpSeqNumber) {
-    let (handles, frames) = establish(pair, Side::A);
+    connect_with(pair, tcp_socket_sized(4096))
+}
+
+/// `connect` with `socket` on both sides.
+fn connect_with(pair: &mut Pair, socket: tcp::Config) -> ([TcpHandle; 2], TcpSeqNumber, TcpSeqNumber) {
+    let (handles, frames) = establish_with(pair, Side::A, socket);
     let ack = segs(&frames[frames.len() - 1..])[0];
     assert_eq!((ack.dir, ack.control, ack.len), (Dir::AToB, TcpControl::None, 0));
     (handles, ack.seq, ack.ack.unwrap())
+}
+
+/// A 4 KiB receive window, and a send buffer whose frame limit covers
+/// `MESSAGES` unacknowledged one-segment writes: each write sent alone
+/// occupies one frame (`tcp::tx_mbuf_budget`), and the message tests keep a
+/// full TX ring and pending queue (15 + 32) or more unacknowledged.
+const MESSAGE_SOCKET: tcp::Config =
+    tcp::Config { rx_capacity: 4096, tx_capacity: MESSAGES * 1460, mss_cap: None };
+
+/// A Pair with default Stack configs whose pools admit one `MESSAGE_SOCKET`
+/// per side.
+fn message_pair(eal: &dpdk_smoltcp::Eal, names: [&str; 2]) -> Pair {
+    let configs = [config(Side::A), config(Side::B)];
+    Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
+        let stack = configs[side.index()];
+        port.rx_pool.count = rx_pool_count(
+            rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
+            port.mtu,
+            [MESSAGE_SOCKET.rx_capacity],
+        );
+        port.frame_pool.count = frame_pool_count(
+            frame_reserve(port.tx_descriptors, stack.tx_pending),
+            port.mtu,
+            [MESSAGE_SOCKET.tx_capacity],
+        );
+    })
 }
 
 /// Drive until `done`, writing `data` from A once in the first app step;
@@ -545,9 +576,13 @@ fn close_frees_held_and_ring_frames() {
         assert_eq!(pair.a_to_b.forward(), 1);
         assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"c"), Ok(1));
         assert_eq!(pair.a.turn(pair.now(), 32).unwrap().tx_accepted, 1);
-        // A: B's held segment in its RX pool, its own on its TX ring. B: A's
-        // first segment on its RX ring.
-        assert_eq!(pair.in_use(), [(1, 1), (1, 0)]);
+        // A: B's held segment in its RX pool. B: A's first segment on its RX
+        // ring, and the spare TX packet its handshake turn left (no reply was
+        // needed). Data leaves in frame-pool frames, so no data segment uses
+        // a TX packet: A holds "a" (unacknowledged) and "c" (also on its TX
+        // ring), B holds "b".
+        assert_eq!(pair.in_use(), [(1, 0), (1, 1)]);
+        assert_eq!(pair.frame_in_use(), [2, 1]);
         // The held copy and one frame on each of two rings.
         assert_eq!(pair.close(), 3);
     });
@@ -813,6 +848,7 @@ fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
             16,
             rx_pool_count(rx_reserve(16, S, 8), 1500, [BULK]),
             tx_reserve(16, Q) as u32,
+            frame_pool_count(frame_reserve(16, Q), 1500, [BULK]),
         );
         // 64 KiB buffers each way allow flights larger than one ring.
         let (handles, _) = establish_sized(&mut pair, Side::A, BULK);
@@ -873,6 +909,7 @@ fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
             8,
             rx_pool_count(rx_reserve(16, S, 8), 1500, [BULK]),
             tx_reserve(16, Q) as u32,
+            frame_pool_count(frame_reserve(8, Q), 1500, [BULK]),
         );
         let (handles, _) = establish_sized(&mut pair, Side::A, BULK);
         let data = [pattern(4 * BULK, 7), pattern(4 * BULK, 8)];
@@ -1017,13 +1054,22 @@ fn admission_full_tx_ring_still_answers() {
             |side, port| {
                 assert_eq!(port.tx_descriptors, 16);
                 assert_eq!(port.tx_pool.cache_size, 8);
-                port.rx_pool.count =
-                    rx_pool_count(rx_reserve(16, q1(side).rx_staging, 8), 1500, [4096]);
+                port.rx_pool.count = rx_pool_count(
+                    rx_reserve(16, q1(side).rx_staging, 8),
+                    1500,
+                    [MESSAGE_SOCKET.rx_capacity],
+                );
                 port.tx_pool.count = count;
+                port.frame_pool.count = frame_pool_count(
+                    frame_reserve(16, q1(side).tx_pending),
+                    1500,
+                    [MESSAGE_SOCKET.tx_capacity],
+                );
             },
             |_, port| assert_eq!(port.descriptor_counts().1, 16),
         );
-        let (handles, _, b_seq) = connect(&mut pair);
+        // 15 unacknowledged one-byte writes need 15 frame slots.
+        let (handles, _, b_seq) = connect_with(&mut pair, MESSAGE_SOCKET);
         let idle = Turn {
             rx_received: 0,
             rx_rejected: 0,
@@ -1042,7 +1088,8 @@ fn admission_full_tx_ring_still_answers() {
             let sent = Turn { tx_accepted: 1, ..idle };
             assert_eq!((round.a, round.b), (sent, idle), "segment {k}");
         }
-        assert_eq!(pair.in_use()[0], (0, 15));
+        // The 15 one-byte segments are frame-pool frames on A's TX ring.
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 15));
         assert_eq!(pair.b.tcp_mut(&handles[1]).send_slice(b"b"), Ok(1));
         let round = pair.round(|_, _| {});
         assert_eq!((round.a, round.b.tx_accepted, round.b_to_a), (idle, 1, 1));
@@ -1056,7 +1103,8 @@ fn admission_full_tx_ring_still_answers() {
                 ..idle
             }
         );
-        assert_eq!(pair.in_use()[0], (1, 16));
+        // A's queued ACK for "b" is a TX packet; its data stays in frames.
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((1, 1), 15));
         assert_eq!(pair.a.tcp(&handles[0]).recv_queue(), 1);
         assert_eq!(pair.b.tcp(&handles[1]).send_queue(), 1);
 
@@ -1162,8 +1210,8 @@ fn paused_turn(k: usize) -> Turn {
 #[zhida_test_support::pinned_test]
 fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
     with_eal(|eal| {
-        let mut pair = new_pair(eal, ["pwa", "pwb"]);
-        let (handles, _, _) = connect(&mut pair);
+        let mut pair = message_pair(eal, ["pwa", "pwb"]);
+        let (handles, _, _) = connect_with(&mut pair, MESSAGE_SOCKET);
         // A 4 KiB window carries about three full segments, too few to fill a
         // 15-entry TX ring. Each 16-byte write is one segment.
         let mut messages = Messages {
@@ -1205,8 +1253,10 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             assert_eq!(round, expected, "paused round {k}");
             messages.step(&mut pair.a, &mut pair.b, MESSAGES);
         }
-        // Each side: 15 frames on its TX ring and 32 pending.
-        assert_eq!(pair.in_use(), [(0, 47); 2]);
+        // Each side: 15 frames on its TX ring, 32 pending and one unsent; the
+        // TX pool still holds only B's spare.
+        assert_eq!(pair.in_use(), [(0, 0), (0, 1)]);
+        assert_eq!(pair.frame_in_use(), [48; 2]);
 
         pair.a_to_b.paused = false;
         pair.b_to_a.paused = false;
@@ -1235,7 +1285,8 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             b_to_a: 15,
         };
         assert_eq!(round, expected);
-        assert_eq!(pair.in_use(), [(15, 32); 2]);
+        assert_eq!(pair.in_use(), [(15, 0), (15, 1)]);
+        assert_eq!(pair.frame_in_use(), [48; 2]);
 
         pair.drive(
             |_, _| {},
@@ -1265,8 +1316,8 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
 #[zhida_test_support::pinned_test]
 fn rto_while_wire_paused_then_resume() {
     with_eal(|eal| {
-        let mut pair = new_pair(eal, ["rpa", "rpb"]);
-        let (handles, a_seq, _) = connect(&mut pair);
+        let mut pair = message_pair(eal, ["rpa", "rpb"]);
+        let (handles, a_seq, _) = connect_with(&mut pair, MESSAGE_SOCKET);
         // Each 16-byte write is its own segment, enough of them to fill A's
         // TX ring and pending queue within a 4 KiB window.
         let total = 8 + 47;
@@ -1312,7 +1363,9 @@ fn rto_while_wire_paused_then_resume() {
             assert!(write(&mut pair.a, total));
             pair.round(|_, _| panic!("paused link delivered a frame"));
         }
-        assert_eq!(pair.in_use()[0], (0, 47));
+        // The 47 segments are frame-pool frames; A's TX pool holds the spare
+        // its last ACK-only turn left.
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 1), 47));
         assert!(matches!(pair.a.poll_at(), Some(p) if p > t && p <= ceil_ms(t + RTO)));
 
         let full = Turn {
@@ -1335,7 +1388,7 @@ fn rto_while_wire_paused_then_resume() {
         let expired = pair.round_at(ceil_ms(t + RTO), |_, _| panic!("paused link delivered a frame"));
         assert_eq!(expired.a, full);
         assert_eq!(pair.a.poll_at(), Some(pair.now()));
-        assert_eq!(pair.in_use()[0], (0, 47));
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 1), 47));
 
         pair.a_to_b.paused = false;
         let mut frames = Vec::new();
@@ -1450,6 +1503,11 @@ fn cubic_send_allowance_trace_with_sequence_pinned_losses() {
                         configs[side.index()].rx_staging,
                         port.rx_pool.cache_size,
                     ),
+                    port.mtu,
+                    [65536],
+                );
+                port.frame_pool.count = frame_pool_count(
+                    frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                     port.mtu,
                     [65536],
                 );
@@ -1594,6 +1652,11 @@ fn burst_loss_partial_acks_repair_all_holes_before_rto() {
         let mut pair = Pair::with_ports(eal, ["nrbursta", "nrburstb"], configs, T0, 64, |side, port| {
             port.rx_pool.count = rx_pool_count(
                 rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size),
+                port.mtu,
+                [CAPACITY],
+            );
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                 port.mtu,
                 [CAPACITY],
             );
@@ -1835,6 +1898,11 @@ fn cubic_growth_and_recovery_across_rtts() {
                 port.tx_pool.count = tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
                 port.rx_pool.count = rx_pool_count(
                     rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size),
+                    port.mtu,
+                    [CAPACITY],
+                );
+                port.frame_pool.count = frame_pool_count(
+                    frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                     port.mtu,
                     [CAPACITY],
                 );

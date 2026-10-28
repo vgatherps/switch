@@ -71,6 +71,7 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
     };
     let sizing = zhida_open::Sizing {
         tcp_rx_frames: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
+        tcp_tx_frames: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         udp_rx_datagrams: 0,
         max_sockets: 1,
         max_udp_sockets: 0,
@@ -95,17 +96,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Build the TCP config before calling `open`: `open` sizes the RX pool, and the pool must hold every
-socket's receive budget. Use the same config, including its MSS cap, for sizing and admission.
-`Sizing` has no defaults; fill all eight fields:
+Build the TCP config before calling `open`: `open` sizes the RX and frame pools, and they must hold
+every socket's receive budget and TX frame limit. Use the same config, including its MSS cap, for
+sizing and admission. `Sizing` has no defaults; fill all nine fields:
 
 | field | what to put there |
 |---|---|
 | `tcp_rx_frames` | sum of `tcp::rx_mbuf_budget(&config, mtu)` over every TCP config you will add (see "Pool sizing" below) |
+| `tcp_tx_frames` | sum of `tcp::tx_mbuf_budget(&config, mtu)` over every TCP config you will add, plus the frames the application holds at once from `Stack::tx_frame` |
 | `udp_rx_datagrams` | sum of `UdpConfig::rx_queue` over every UDP socket you will add |
 | `max_sockets`, `max_udp_sockets`, `rx_staging`, `tx_pending`, `segments_per_visit`, `neighbor_capacity` | passed to the `StackConfig` fields of the same name ("Configure the Stack" below) |
 
-A socket that does not fit gets `AddTcpError::RxPoolTooSmall` from `add_tcp`.
+A socket that does not fit gets `AddTcpError::RxPoolTooSmall` or `AddTcpError::TxFramePoolTooSmall`
+from `add_tcp`.
 
 `open` checks the process is pinned to one CPU, initializes EAL (`--lcores=0@cpu`, the config's file
 prefix, the PCI address or vdev, then `eal.extra`), checks the PCI MAC against the config, resolves
@@ -376,7 +379,8 @@ leave room for that.
 
 ### TX pool
 
-TX socket buffers are ordinary byte rings; TX mbufs hold frames built from them.
+TCP send queues hold frames from the frame pool (below); the TX pool holds ACKs, ARP, RSTs and
+copied segments (cuts, merged small frames, retransmissions of more than one frame, shared frames).
 `tx_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum TX pool count:
 
 ```text
@@ -398,8 +402,19 @@ dropping a frame returns it. Frame-pool mbufs may be shared (refcount above 1) b
 single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame
 pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pending queue holds keeps
 at most one frame no socket or application counts, and the extra frame means those packets can never
-take the last one. Frames the application holds come on top. `net_ring` ports opened by the test kit
-use their TX ring size as the TX descriptor count.
+take the last one. `Stack::add_tcp` also charges each TCP socket's frame limit,
+`tcp::tx_mbuf_budget(&config, ip_mtu)` (one frame per segment payload of `tx_capacity`, at least
+six), and refuses a socket whose limit does not fit beside `frame_reserve` and the sockets already
+added with `AddTcpError::TxFramePoolTooSmall { config, required, pool }`; removing a socket releases
+its share. Frames the application holds come on top. `net_ring` ports opened by the test kit use
+their TX ring size as the TX descriptor count.
+
+To send TCP data without a copy, fill a frame and pass it by value:
+`stack.tcp_send_frame(&handle, frame)` queues it, and `Err((frame, error))` returns it untouched
+(`Foreign` from another Stack, `InvalidState`, `Empty`, `Full` beyond `frame_send_room()`). Each
+frame takes one frame slot; one longer than the segment payload is copied at send. A unique frame that starts the unsent
+data and fits one segment goes out in place; the socket holds it until the peer ACKs it. Clones of a
+frame (one per socket, for broadcast) are copied at send. `send_slice` copies into frames.
 
 `Port::alloc_tx` retries an exhausted pool after one TX-done cleanup on queue 0. If the PMD does not
 support cleanup, it returns `None`. A cleanup error other than `-ENOTSUP` panics.
@@ -559,7 +574,9 @@ stack.listen(&handle, 7000)?;
 `rx_capacity` sets a byte capacity without allocating a payload byte ring. Received payload stays in
 owned RX mbufs until the application drains and drops it. The byte capacity sets the advertised
 window and window scale; the admitted frame count also limits how much the socket can hold. After
-admission the Stack allocates a TX byte ring of `tx_capacity` bytes for unacknowledged stream data.
+admission the socket queues sent data as frames from the frame pool: `tx_capacity` bytes and
+`tcp::tx_mbuf_budget(&config, ip_mtu)` frames at most, unacknowledged data included. Many tiny
+writes can reach the frame limit before the byte limit.
 
 Each received segment uses its own buffer unless it is a small in-order one appended to the last
 frame, so a peer sending many tiny segments can fill a socket's buffers before its byte window;

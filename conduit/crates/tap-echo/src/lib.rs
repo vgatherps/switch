@@ -20,6 +20,7 @@ const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
 pub enum EchoError {
     SocketsFull,
     RxPoolTooSmall { required: usize, pool: usize },
+    TxFramePoolTooSmall { required: usize, pool: usize },
     Listen(tcp::ListenError),
 }
 
@@ -31,6 +32,12 @@ impl fmt::Display for EchoError {
                 write!(
                     f,
                     "RX pool has {pool} mbufs; adding this socket requires {required}"
+                )
+            }
+            EchoError::TxFramePoolTooSmall { required, pool } => {
+                write!(
+                    f,
+                    "frame pool has {pool} mbufs; adding this socket requires {required}"
                 )
             }
             EchoError::Listen(error) => write!(f, "listen failed: {error}"),
@@ -68,6 +75,9 @@ impl EchoServer {
                     AddTcpError::SocketsFull(_) => EchoError::SocketsFull,
                     AddTcpError::RxPoolTooSmall { required, pool, .. } => {
                         EchoError::RxPoolTooSmall { required, pool }
+                    }
+                    AddTcpError::TxFramePoolTooSmall { required, pool, .. } => {
+                        EchoError::TxFramePoolTooSmall { required, pool }
                     }
                 })
                 .and_then(|handle| {
@@ -144,10 +154,13 @@ impl EchoServer {
                 }
                 let (frame, offset) = pending.as_mut().unwrap();
                 let n = room.min(frame.payload().len() - *offset);
+                // Short when the socket's TX frame limit fills before its bytes do.
                 let sent = socket.send_slice(&frame.payload()[*offset..*offset + n]).unwrap();
-                assert_eq!(sent, n, "send_slice short of free send space");
-                *offset = offset.checked_add(n).expect("echo frame offset exceeds usize");
-                *echoed = echoed.checked_add(n).expect("echo count exceeds usize");
+                if sent == 0 {
+                    break;
+                }
+                *offset = offset.checked_add(sent).expect("echo frame offset exceeds usize");
+                *echoed = echoed.checked_add(sent).expect("echo count exceeds usize");
                 if *offset == frame.payload().len() {
                     *pending = None;
                 }

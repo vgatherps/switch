@@ -34,16 +34,17 @@ pub fn sizing(
         ),
         Mode::Feed(_) => (1, 0, binance_feed::SOCKET_BUFFER),
     };
+    let socket = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
+    let mtu = usize::from(config.mtu);
+    let budget = |per_socket: fn(&tcp::Config, usize) -> usize| match mode {
+        Mode::Feed(_) => per_socket(feed.expect("feed mode has a config"), mtu),
+        _ => tcp
+            .checked_mul(per_socket(&socket, mtu))
+            .expect("TCP frame budget overflow"),
+    };
     Sizing {
-        tcp_rx_frames: match mode {
-            Mode::Feed(_) => tcp::rx_mbuf_budget(
-                feed.expect("feed mode has a config"), usize::from(config.mtu)),
-            _ => tcp
-                .checked_mul(tcp::rx_mbuf_budget(&tcp::Config {
-                    rx_capacity: bytes, tx_capacity: bytes, mss_cap: None,
-                }, usize::from(config.mtu)))
-                .expect("TCP RX frame budget overflow"),
-        },
+        tcp_rx_frames: budget(tcp::rx_mbuf_budget),
+        tcp_tx_frames: budget(tcp::tx_mbuf_budget),
         udp_rx_datagrams: udp.checked_mul(UDP_QUEUE).expect("UDP RX budget overflow"),
         max_sockets: tcp.max(1),
         max_udp_sockets: udp,
@@ -172,11 +173,17 @@ mod tests {
         );
         assert_eq!(capped, 180);
         assert_eq!(uncapped, 30);
-        assert_eq!(sizing(&config, &args.mode, Some(&socket)).tcp_rx_frames, capped);
+        let feed_sizing = sizing(&config, &args.mode, Some(&socket));
+        assert_eq!(feed_sizing.tcp_rx_frames, capped);
+        // The send side's frame limit follows the same 1460-byte cap: 256 KiB / 1460.
+        assert_eq!(feed_sizing.tcp_tx_frames, 180);
         assert!(capped > uncapped);
 
         let socket = feed_socket(&config, "203.0.114.1".parse().unwrap());
-        assert_eq!(sizing(&config, &args.mode, Some(&socket)).tcp_rx_frames, uncapped);
+        let feed_sizing = sizing(&config, &args.mode, Some(&socket));
+        assert_eq!(feed_sizing.tcp_rx_frames, uncapped);
+        // Uncapped at MTU 9000: 256 KiB / 8960.
+        assert_eq!(feed_sizing.tcp_tx_frames, 30);
     }
 
     fn test_config(mtu: u16, paths: &str) -> zhida_netconf::Config {

@@ -712,6 +712,14 @@ fn two_stack_mixed_sizes_follow_mbuf_window() {
                     port.mtu,
                     [CAPACITY],
                 );
+                port.frame_pool.count = dpdk_smoltcp::frame_pool_count(
+                    dpdk_smoltcp::frame_reserve(
+                        port.tx_descriptors,
+                        pair::config(Side::A).tx_pending,
+                    ),
+                    port.mtu,
+                    [CAPACITY],
+                );
             },
         );
         let (handles, handshake) = establish_sized(&mut pair, Side::A, CAPACITY);

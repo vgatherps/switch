@@ -5,7 +5,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::{null_mut, NonNull};
 use std::rc::Rc;
 
-use smoltcp::phy::RxBuf;
+use smoltcp::phy::{RxBuf, TxAlloc, TxSource};
 use zhida_buffer::{Mbuf, PoolConfig, PoolCreateError};
 use zhida_dpdk_sys::*;
 
@@ -768,6 +768,14 @@ impl Port {
         self.frame_origin
     }
 
+    /// An allocator handle over the frame pool for one TCP socket. Each handle
+    /// keeps the pool's backing alive, so a socket outliving this Port still
+    /// releases its frames into a live pool.
+    pub(crate) fn frame_source(&self) -> TxSource {
+        let pool: Rc<dyn TxAlloc> = Rc::<FramePool>::clone(&self.frame);
+        TxSource::new(pool)
+    }
+
     pub(crate) fn rx_checksum_enabled(&self) -> bool {
         self.rx_checksum
     }
@@ -795,6 +803,15 @@ impl Port {
     #[doc(hidden)]
     pub fn force_tx_udp_checksum(&mut self) {
         self.tx_udp_checksum = true;
+    }
+
+    /// Bench and test code uses this. It turns on the TX TCP checksum profile
+    /// without the PMD advertising it; on a PMD without the offload, frames
+    /// leave with TCP checksum 0.
+    #[cfg(any(test, feature = "bench-offload"))]
+    #[doc(hidden)]
+    pub fn force_tx_tcp_checksum(&mut self) {
+        self.tx_tcp_checksum = true;
     }
 
     /// Largest Ethernet frame without FCS: IP MTU + 14. `open` validated that

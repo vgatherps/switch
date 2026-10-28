@@ -15,6 +15,7 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
     };
     let sizing = zhida_open::Sizing {
         tcp_rx_frames: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
+        tcp_tx_frames: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         udp_rx_datagrams: 0,
         max_sockets: 1,
         max_udp_sockets: 0,

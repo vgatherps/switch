@@ -73,6 +73,31 @@ pub fn rx_pool_count(
     count
 }
 
+/// Frame pool count is the reserve (`frame_reserve`) plus every uncapped TCP
+/// socket's TX frame limit. For capped sockets, add
+/// `tcp::tx_mbuf_budget(&config, usize::from(ip_mtu))` to the reserve instead.
+/// Frames the application holds at once from `Stack::tx_frame` come on top.
+/// Use the same config for sizing and admission.
+///
+/// Panics if `ip_mtu` is below 68 or the pool count exceeds u32.
+pub fn frame_pool_count(
+    reserve: usize,
+    ip_mtu: u16,
+    send_capacities: impl IntoIterator<Item = usize>,
+) -> u32 {
+    assert!(ip_mtu >= 68, "IP MTU must be at least 68 bytes");
+    let mut count = u32::try_from(reserve).expect("frame pool count exceeds u32");
+    for tx_capacity in send_capacities {
+        let config = tcp::Config { rx_capacity: 0, tx_capacity, mss_cap: None };
+        let budget = u32::try_from(tcp::tx_mbuf_budget(&config, usize::from(ip_mtu)))
+            .expect("TX frame limit exceeds u32");
+        count = count
+            .checked_add(budget)
+            .expect("frame pool count exceeds u32");
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +178,24 @@ mod tests {
     #[should_panic(expected = "RX pool count exceeds u32")]
     fn rx_pool_count_refuses_overflow() {
         rx_pool_count(u32::MAX as usize, 1500, [4096]);
+    }
+
+    #[test]
+    fn frame_pool_count_covers_reserve_and_frame_limits() {
+        let nic = frame_reserve(1024, 32);
+        assert_eq!(nic, 1057);
+        // max(ceil(B / 1460), 6) at MTU 1500; P = 8960 at 9000.
+        assert_eq!(frame_pool_count(nic, 1500, [4096, 65536, 262144]), 1057 + 6 + 45 + 180);
+        assert_eq!(frame_pool_count(nic, 9000, [4096, 65536, 262144]), 1057 + 6 + 8 + 30);
+        assert_eq!(frame_pool_count(nic, 1500, []), 1057);
+        let capped = tcp::Config { rx_capacity: 4096, tx_capacity: 20_000, mss_cap: Some(100) };
+        let reserve = nic + tcp::tx_mbuf_budget(&capped, 1500);
+        assert_eq!(frame_pool_count(reserve, 1500, [4096]), 1057 + 200 + 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame pool count exceeds u32")]
+    fn frame_pool_count_refuses_overflow() {
+        frame_pool_count(u32::MAX as usize, 1500, [4096]);
     }
 }

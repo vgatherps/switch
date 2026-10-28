@@ -22,7 +22,7 @@ use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::wire::{
     TcpControl, TcpSeqNumber, ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, TCP_HEADER_LEN,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
 use dpdk_smoltcp::{Eal, Turn};
 
 use zhida_test_kit::many::{self, assert_quiet};
@@ -67,6 +67,11 @@ pub(super) fn setup(eal: &Eal, k: usize, buffer: usize) -> (Pair, [TcpHandle; 2]
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 ),
+                port.mtu,
+                [buffer],
+            );
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                 port.mtu,
                 [buffer],
             );

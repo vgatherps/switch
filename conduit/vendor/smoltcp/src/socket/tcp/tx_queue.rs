@@ -72,6 +72,10 @@ impl TxQueue {
         self.byte_cap
     }
 
+    pub(crate) fn frame_capacity(&self) -> usize {
+        self.frame_cap
+    }
+
     pub(crate) fn byte_room(&self) -> usize {
         self.byte_cap
             .checked_sub(self.len())

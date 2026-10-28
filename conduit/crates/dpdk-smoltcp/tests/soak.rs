@@ -11,7 +11,10 @@ use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol, Ipv4Packet,
 };
-use dpdk_smoltcp::{tx_reserve, Stack, StackConfig, TcpHandle, UdpConfig, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{
+    frame_pool_count, frame_reserve, tx_reserve, Stack, StackConfig, TcpHandle, UdpConfig,
+    UdpHandle, UdpSendError,
+};
 
 const BULK_MIN: u64 = (1u64 << 32) + (1 << 20);
 const BUFFER: usize = 64 * 1024;
@@ -146,21 +149,30 @@ impl Stream {
         }
     }
 
+    /// Queue stream bytes up to `end` in frames filled in place, one per MSS,
+    /// while the socket has frame room. Admission backs every frame slot, so
+    /// the pool has a frame whenever the socket has room.
     fn send(&mut self, stack: &mut Stack, handle: &TcpHandle, end: u64) {
-        if self.accepted == end || !stack.tcp(handle).can_send() {
-            return;
+        while self.accepted != end {
+            let socket = stack.tcp(handle);
+            let (Some(mss), room) = (socket.max_segment_payload(), socket.frame_send_room()) else {
+                return;
+            };
+            if room == 0 {
+                return;
+            }
+            let mut frame = stack.tx_frame().expect("admission backs the socket's frame slots");
+            let count = mss
+                .min(room)
+                .min(frame.capacity())
+                .min(usize::try_from(end.checked_sub(self.accepted).unwrap()).unwrap());
+            fill(&mut frame.room_mut()[..count], self.accepted, self.seed);
+            frame.set_len(count);
+            if let Err((_, error)) = stack.tcp_send_frame(handle, frame) {
+                panic!("frame of {count} bytes within frame_send_room refused: {error}");
+            }
+            self.accepted = self.accepted.checked_add(count as u64).unwrap();
         }
-        let count = stack
-            .tcp_mut(handle)
-            .send(|bytes| {
-                let count = bytes
-                    .len()
-                    .min(usize::try_from(end.checked_sub(self.accepted).unwrap()).unwrap());
-                fill(&mut bytes[..count], self.accepted, self.seed);
-                (count, count)
-            })
-            .unwrap();
-        self.accepted = self.accepted.checked_add(count as u64).unwrap();
     }
 
     fn receive(&mut self, stack: &mut Stack, handle: &TcpHandle) {
@@ -453,8 +465,12 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
         1024,
         |side, port| {
             port.rx_pool.count = 8191;
-            port.tx_pool.count =
-                tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
+            let tx_pending = configs[side.index()].tx_pending;
+            port.tx_pool.count = tx_reserve(port.tx_descriptors, tx_pending) as u32;
+            // Exactly the admission bound for the two TCP sockets: Stream::send
+            // expects a frame whenever its socket has frame room.
+            port.frame_pool.count =
+                frame_pool_count(frame_reserve(port.tx_descriptors, tx_pending), port.mtu, [BUFFER; 2]);
             port.rx_burst = 64;
             port.tx_burst = 32;
         },

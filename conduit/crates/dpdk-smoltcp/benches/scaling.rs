@@ -117,7 +117,7 @@ use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, TcpControl, TcpRepr, TcpSeqNumber,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
 use dpdk_smoltcp::{Eal, StackConfig};
 
 use zhida_test_kit::many::{self, assert_quiet, Conn};
@@ -190,6 +190,13 @@ fn new_pair(eal: &Eal, tag: &str, n: usize, active_buffer: usize) -> Pair {
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 ),
+                port.mtu,
+                std::iter::once(active_buffer).chain(
+                    std::iter::repeat_n(FILLER_BUFFER, n.checked_sub(1).expect("at least one socket")),
+                ),
+            );
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                 port.mtu,
                 std::iter::once(active_buffer).chain(
                     std::iter::repeat_n(FILLER_BUFFER, n.checked_sub(1).expect("at least one socket")),
@@ -485,6 +492,11 @@ fn burst_pair(eal: &Eal, tag: &str, n: usize, burst: usize, buffer: usize) -> Pa
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 ),
+                port.mtu,
+                std::iter::repeat_n(buffer, n),
+            );
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
                 port.mtu,
                 std::iter::repeat_n(buffer, n),
             );

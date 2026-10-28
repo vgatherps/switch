@@ -9,7 +9,9 @@ use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
 };
-use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, Stack, TcpHandle, UdpConfig, UdpSendError};
+use dpdk_smoltcp::{
+    frame_pool_count, frame_reserve, rx_reserve, Eal, Stack, TcpHandle, UdpConfig, UdpSendError,
+};
 
 const A: usize = 0;
 const B: usize = 1;
@@ -66,8 +68,11 @@ impl Network {
                 .expect("RX pool count overflow");
             port.rx_pool.count = u32::try_from(count).unwrap();
             port.tx_pool.count = 127;
-            port.frame_pool.count =
-                u32::try_from(frame_reserve(port.tx_descriptors, stack.tx_pending)).unwrap();
+            port.frame_pool.count = frame_pool_count(
+                frame_reserve(port.tx_descriptors, stack.tx_pending),
+                9000,
+                std::iter::repeat_n(BUFFER, stack.max_sockets),
+            );
             match Stack::new(rings[node].open_with(eal, port), stack, T0) {
                 Ok(stack) => stack,
                 Err((_, error)) => panic!("{error}"),

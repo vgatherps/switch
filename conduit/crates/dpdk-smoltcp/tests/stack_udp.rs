@@ -184,7 +184,7 @@ fn over_limit_dropped_counted_tcp_progresses() {
             max_udp_sockets: 1,
             ..pair::config(side)
         });
-        let mut pair = Pair::with_pools(eal, ["udptcpa", "udptcpb"], configs, T0, 16, 127, 63);
+        let mut pair = Pair::with_pools(eal, ["udptcpa", "udptcpb"], configs, T0, 16, 127, 63, 63);
         let (handles, _) = pair::establish(&mut pair, Side::A);
         let udp = pair.a.add_udp(udp_config(PORT, 2)).unwrap();
         let before = pair.in_use()[0].0;
@@ -377,6 +377,7 @@ fn removed_tcp_and_udp_frames_share_admission_count() {
             T0,
             16,
             u32::try_from(pool).unwrap(),
+            63,
             63,
         );
         let ([client, server], _) = pair::establish(&mut pair, Side::A);

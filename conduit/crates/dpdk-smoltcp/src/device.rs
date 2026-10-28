@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use smoltcp::phy::{
-    self, Checksum, DeviceCapabilities, Medium, TxBuf, TxChecksum, TxHeader,
+    self, Checksum, DeviceCapabilities, Medium, TxBuf, TxChecksum, TxHeader, TxSource,
 };
 use smoltcp::time::Instant;
 use zhida_dpdk_sys::{
@@ -139,6 +139,10 @@ impl Device {
 
     pub(crate) fn frame_pool(&self) -> &FramePool {
         self.port.frame_pool()
+    }
+
+    pub(crate) fn frame_source(&self) -> TxSource {
+        self.port.frame_source()
     }
 }
 

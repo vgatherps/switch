@@ -53,8 +53,14 @@ fn packet_rx_full_window_64_connections() {
             1500,
             [CAPACITY; 64],
         );
+        let frame_count = dpdk_smoltcp::frame_pool_count(
+            dpdk_smoltcp::frame_reserve(16, configs[0].tx_pending),
+            1500,
+            [CAPACITY; 64],
+        );
         let mut pair = Pair::with_ports(eal, ["full64a", "full64b"], configs, T0, 16, |_, port| {
             port.rx_pool.count = pool_count;
+            port.frame_pool.count = frame_count;
         });
         let conns = many::open(&mut pair, 0..COUNT, CAPACITY);
         assert_quiet(&mut pair, &conns);

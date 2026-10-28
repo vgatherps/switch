@@ -93,6 +93,13 @@ pub enum AddTcpError {
         required: usize,
         pool: usize,
     },
+    /// The frame pool cannot back this socket's TX frame limit beside the frame
+    /// reserve and the TCP sockets already added.
+    TxFramePoolTooSmall {
+        config: tcp::Config,
+        required: usize,
+        pool: usize,
+    },
 }
 
 impl fmt::Display for AddTcpError {
@@ -103,6 +110,12 @@ impl fmt::Display for AddTcpError {
                 write!(
                     f,
                     "RX pool has {pool} mbufs; adding this socket requires {required}"
+                )
+            }
+            Self::TxFramePoolTooSmall { required, pool, .. } => {
+                write!(
+                    f,
+                    "frame pool has {pool} mbufs; adding this socket requires {required}"
                 )
             }
         }
@@ -171,6 +184,11 @@ pub struct Stack {
     max_sockets: usize,
     rx_pool_count: usize,
     rx_reserve: usize,
+    frame_pool_count: usize,
+    /// `frame_reserve(TX descriptors, tx_pending)`.
+    frame_reserve: usize,
+    /// Sum of the TX frame limits of the TCP sockets in `sockets`.
+    tx_frames_held: usize,
     ip_mtu: u16,
     rx_budget_held: usize,
     /// Holds every staged and pending packet; its Port drops after them.
@@ -263,6 +281,9 @@ impl Stack {
             max_sockets: config.max_sockets,
             rx_pool_count,
             rx_reserve,
+            frame_pool_count: frame_count,
+            frame_reserve: frame_required,
+            tx_frames_held: 0,
             ip_mtu: mtu,
             rx_budget_held: 0,
             device,
@@ -515,9 +536,13 @@ impl Stack {
     }
 
     /// Build a TCP socket from `config` and admit it. Returns the config when all
-    /// `max_sockets` slots are occupied or the RX pool cannot back the socket's
+    /// `max_sockets` slots are occupied, when the RX pool cannot back the socket's
     /// receive budget, `tcp::rx_mbuf_budget(&config, ip_mtu)`, beside the RX reserve
-    /// and every socket already added.
+    /// and every socket already added, or when the frame pool cannot back the
+    /// socket's TX frame limit, `tcp::tx_mbuf_budget(&config, ip_mtu)`, beside
+    /// `frame_reserve` and every TCP socket already added (checked in that order).
+    /// Frames the application holds are not counted: they get what the pool has
+    /// beyond that sum.
     /// Held TCP frames and UDP datagrams from removed sockets count until dropped.
     /// Connections never use TCP timestamps.
     /// A dropped connection holds its slot until it closes; `SocketsFull` is
@@ -545,12 +570,30 @@ impl Stack {
                 pool: self.rx_pool_count,
             });
         }
+        let tx_frames = tcp::tx_mbuf_budget(&config, usize::from(self.ip_mtu));
+        let frames_held = self
+            .tx_frames_held
+            .checked_add(tx_frames)
+            .expect("TX socket frame limits exceed usize");
+        let frames_required = self
+            .frame_reserve
+            .checked_add(frames_held)
+            .expect("frame pool requirement exceeds usize");
+        if frames_required > self.frame_pool_count {
+            return Err(AddTcpError::TxFramePoolTooSmall {
+                config,
+                required: frames_required,
+                pool: self.frame_pool_count,
+            });
+        }
         let handle = self.sockets.add_admitted(
             &config,
             usize::from(self.ip_mtu),
+            self.device.frame_source(),
             self.dropped.clone(),
         );
         self.rx_budget_held = held;
+        self.tx_frames_held = frames_held;
         Ok(TcpHandle {
             raw: handle,
             queue: self.dropped.clone(),
@@ -700,6 +743,22 @@ impl Stack {
         self.sockets.get_mut(raw)
     }
 
+    /// Queue `frame` on the socket by value (`tcp::Socket::send_frame`); it
+    /// leaves in a later egress (`send` or `turn`). On success the socket holds
+    /// the frame until the peer ACKs its last byte. Errors return the frame
+    /// untouched: `Foreign` when it came from another Stack's `tx_frame`,
+    /// `InvalidState` unless the socket may send, `Empty` for a zero-length
+    /// frame, and `Full` when it exceeds the socket's free bytes or it has no
+    /// free frame slot (`frame_send_room`). Each frame takes one slot; one longer
+    /// than the segment payload is copied at send.
+    pub fn tcp_send_frame(
+        &mut self,
+        handle: &TcpHandle,
+        frame: TxFrame,
+    ) -> Result<(), (TxFrame, tcp::SendFrameError)> {
+        self.tcp_mut(handle).send_frame(frame)
+    }
+
     /// `tcp::Socket::connect` with this interface's context; refuses a live exact tuple.
     /// A failed connect leaves the socket unchanged.
     pub fn connect<T: Into<IpEndpoint>, U: Into<IpListenEndpoint>>(
@@ -739,7 +798,9 @@ impl Stack {
         Ok(())
     }
 
-    /// Remove the socket immediately, freeing its slot and RX budget.
+    /// Remove the socket immediately, freeing its slot, RX budget and TX frame
+    /// limit, and releasing its queued TX frames (the PMD and pending queue
+    /// keep their own references to frames already sent).
     /// Discards unread received bytes and sends nothing on the wire.
     /// Frames the application still holds count against admission until dropped.
     pub fn remove_tcp(&mut self, handle: TcpHandle) {
@@ -749,7 +810,7 @@ impl Stack {
     }
 
     fn remove_tcp_raw(&mut self, handle: SocketHandle) {
-        let (held, budget) = self.sockets.remove(handle);
+        let (held, budget, tx_frames) = self.sockets.remove(handle);
         if held.count() != 0 {
             self.removed_held.push(held);
         }
@@ -757,6 +818,10 @@ impl Stack {
             .rx_budget_held
             .checked_sub(budget)
             .expect("removed socket's RX budget was held");
+        self.tx_frames_held = self
+            .tx_frames_held
+            .checked_sub(tx_frames)
+            .expect("removed socket's TX frame limit was held");
     }
 
     fn tcp_raw(&self, handle: &TcpHandle) -> SocketHandle {

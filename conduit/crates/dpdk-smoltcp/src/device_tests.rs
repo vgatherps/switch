@@ -555,6 +555,7 @@ fn socket_template_frames(
     let handle = sockets.add_admitted(
         &pair::tcp_socket_sized(4096),
         1500,
+        device.frame_source(),
         smoltcp::iface::DropQueue::with_capacity(1, 0),
     );
     sockets.get_mut(handle).set_ack_delay(None);
@@ -645,7 +646,10 @@ fn socket_template_frames(
             Vec::new()
         };
         iface.poll_egress(NOW, &mut device, &mut sockets);
-        let bytes = capture_socket_frame(&fixture, &mut device, offload, &poisoned);
+        // Data leaves in place from its frame-pool frame; only segments without
+        // payload are built in a (poisoned) TX-pool mbuf.
+        let poisoned = if data.is_empty() { poisoned.as_slice() } else { &[] };
+        let bytes = capture_socket_frame(&fixture, &mut device, offload, poisoned);
         assert_eq!(bytes.len(), 54 + data.len());
         let tcp = pair::segment(&bytes, Side::A);
         assert_eq!((tcp.control, tcp.payload), (control, data));
@@ -2938,5 +2942,131 @@ fn frame_publish_sets_udp_and_tcp_offload_metadata() {
         port.try_close().unwrap();
         fixture.close().unwrap();
         assert_no_pools();
+    });
+}
+
+/// With the TX TCP checksum profile on, a socket's data frame is published in
+/// place at refcount 2 with the offload metadata and prepared at flush. After
+/// the peer frees its reference, the RTO retransmission republishes the same
+/// mbuf in place with the same metadata and is prepared again; payload and
+/// sequence number are unchanged and smoltcp leaves the checksum to the NIC.
+#[zhida_test_support::pinned_test]
+fn retransmit_with_tx_checksum_offload() {
+    use smoltcp::socket::tcp::State;
+    use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr};
+
+    with_test_eal(|eal| {
+        let (fixture, mut device) = open(eal, 4, 4);
+        enable_tx_tcp_checksum(&mut device.port);
+        let mut config = Config::new(Side::A.mac().into());
+        config.random_seed = 1;
+        let mut iface = Interface::new(config, &mut device, NOW);
+        iface.update_ip_addrs(|addrs| {
+            addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
+        });
+        let mut sockets = TcpSet::new(Vec::new());
+        let handle = sockets.add_admitted(
+            &pair::tcp_socket_sized(4096),
+            1500,
+            device.frame_source(),
+            smoltcp::iface::DropQueue::with_capacity(1, 0),
+        );
+        sockets.get_mut(handle).set_ack_delay(None);
+        let arp = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Reply,
+            source_hardware_addr: Side::B.mac(),
+            source_protocol_addr: Side::B.ip(),
+            target_hardware_addr: Side::A.mac(),
+            target_protocol_addr: Side::A.ip(),
+        };
+        let mut bytes = vec![0; 14 + arp.buffer_len()];
+        let mut eth = EthernetFrame::new_unchecked(&mut bytes);
+        eth.set_src_addr(Side::B.mac());
+        eth.set_dst_addr(Side::A.mac());
+        eth.set_ethertype(EthernetProtocol::Arp);
+        arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
+        stage(&fixture, &mut device, &bytes);
+        iface.poll_ingress_single(NOW, &mut device, &mut sockets);
+        sockets
+            .get_mut(handle)
+            .connect(iface.context(), (Side::B.ip(), 80), (Side::A.ip(), 49152))
+            .unwrap();
+        iface.poll_egress(NOW, &mut device, &mut sockets);
+        assert_eq!(device.flush(), Ok(1));
+        let syn = peer_receive(&fixture, 16);
+        let mut syn_bytes = syn[0].data().to_vec();
+        TcpPacket::new_unchecked(&mut syn_bytes[34..])
+            .fill_checksum(&Side::A.ip().into(), &Side::B.ip().into());
+        let local_seq = pair::segment(&syn_bytes, Side::A).seq_number + 1;
+        drop(syn);
+        let reply = TcpRepr {
+            src_port: 80,
+            dst_port: 49152,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(100),
+            ack_number: Some(local_seq),
+            window_len: 4096,
+            window_scale: None,
+            max_seg_size: Some(1460),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        stage(&fixture, &mut device, &pair::tcp_frame(Side::B, &reply));
+        iface.poll_ingress_single(NOW, &mut device, &mut sockets);
+        assert_eq!(sockets.get(handle).state(), State::Established);
+        iface.poll_egress(NOW, &mut device, &mut sockets);
+        assert_eq!(device.flush(), Ok(1));
+        drop(peer_receive(&fixture, 16));
+
+        let payload = b"offloaded payload";
+        assert_eq!(sockets.get_mut(handle).send_slice(payload), Ok(payload.len()));
+        let offload = (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM, 14, 20, 20);
+        let mut published = None;
+        for attempt in 0..2 {
+            if attempt == 0 {
+                iface.poll_egress(NOW, &mut device, &mut sockets);
+            } else {
+                // poll_at is advisory and may be early: poll at each deadline
+                // until the RTO fires.
+                let mut at = NOW;
+                for _ in 0..8 {
+                    if !device.tx.is_empty() {
+                        break;
+                    }
+                    at = iface.poll_at(at, &mut sockets).expect("RTO deadline");
+                    iface.poll_egress(at, &mut device, &mut sockets);
+                }
+            }
+            assert_eq!(device.tx.len(), 1, "attempt {attempt}");
+            let raw = device.tx[0].as_ptr();
+            assert_eq!(*published.get_or_insert(raw), raw, "republished in place");
+            // SAFETY: the pending packet keeps this frame-pool mbuf alive.
+            let m = unsafe { &*raw };
+            assert_eq!(m.pool, device.frame_pool().mempool());
+            assert_eq!((m.data_off(), m.refcnt(), m.nb_segs()), (FRAME_DATA_OFF - 54, 2, 1));
+            assert_eq!(tx_metadata(&device.tx[0]), offload);
+            let calls = prepare_calls();
+            assert_eq!(device.flush(), Ok(1));
+            assert_eq!(prepare_calls(), calls + 1);
+            let received = peer_receive(&fixture, 16);
+            assert_eq!(received.len(), 1);
+            let ip = Ipv4Packet::new_checked(&received[0].data()[14..]).unwrap();
+            assert!(ip.verify_checksum());
+            assert_eq!(TcpPacket::new_checked(ip.payload()).unwrap().checksum(), 0);
+            // The NIC would fill the checksum; fill it to parse the segment.
+            let mut filled = received[0].data().to_vec();
+            TcpPacket::new_unchecked(&mut filled[34..])
+                .fill_checksum(&Side::A.ip().into(), &Side::B.ip().into());
+            let tcp = pair::segment(&filled, Side::A);
+            assert_eq!((tcp.seq_number, tcp.payload), (local_seq, payload.as_slice()));
+            drop(received);
+            assert_eq!(m.refcnt(), 1);
+        }
+        assert_eq!(sockets.get(handle).retransmits(), 1);
+        drop(sockets);
+        assert_eq!(frame_in_use(&device), 0);
+        finish(fixture, device);
     });
 }

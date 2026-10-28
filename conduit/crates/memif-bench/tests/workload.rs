@@ -22,7 +22,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as NetInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, IpEndpoint, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    rx_pool_count, rx_reserve, Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
+    frame_reserve, rx_pool_count, rx_reserve, Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use memif_bench::memif::MemifVdev;
 use memif_bench::workload::{
@@ -253,6 +253,11 @@ fn bulk_poll_sends_two_pending_queues() {
                     .checked_add(tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)))
                     .expect("peer RX pool count fits usize"),
             ).expect("peer RX pool count fits u32");
+            config.frame_pool.count = u32::try_from(
+                frame_reserve(config.tx_descriptors, 32)
+                    .checked_add(tcp::tx_mbuf_budget(&socket, usize::from(config.mtu)))
+                    .expect("peer frame pool count fits usize"),
+            ).expect("peer frame pool count fits u32");
         }
         config
     });

@@ -8,7 +8,10 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol,
     Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
 };
-use dpdk_smoltcp::{tx_reserve, Eal, Stack, UdpConfig, UdpCounters, UdpHandle, UdpSendError};
+use dpdk_smoltcp::{
+    frame_pool_count, frame_reserve, tx_reserve, Eal, Stack, UdpConfig, UdpCounters, UdpHandle,
+    UdpSendError,
+};
 
 const PORT: u16 = 1234;
 const BURST: usize = 32;
@@ -23,11 +26,17 @@ fn new_pair_with_tx_pool(eal: &Eal, names: [&str; 2], tx_pool: u32) -> (Pair, [U
         max_udp_sockets: 2,
         ..pair::config(side)
     });
-    let mut pair = Pair::with_ports(eal, names, configs, pair::T0, 128, |_, port| {
+    let mut pair = Pair::with_ports(eal, names, configs, pair::T0, 128, |side, port| {
         port.rx_burst = u16::try_from(BURST).unwrap();
         port.tx_burst = u16::try_from(BURST).unwrap();
         port.rx_pool.count = 255;
         port.tx_pool.count = tx_pool;
+        // One 4 KiB TCP socket for `udp_tcp_share_pending_in_call_order`.
+        port.frame_pool.count = frame_pool_count(
+            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
+            port.mtu,
+            [4096],
+        );
     });
     let handles =
         [&mut pair.a, &mut pair.b].map(|stack| stack.add_udp(udp_config(true, false)).unwrap());

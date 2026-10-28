@@ -12,9 +12,10 @@ use std::time::Instant;
 
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
+use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::{
-    os_random_seed, port_by_name, rx_pool_count, rx_reserve, Eal, Offloads, Port, PortConfig,
-    PortError, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
+    frame_reserve, os_random_seed, port_by_name, rx_pool_count, rx_reserve, Eal, Offloads, Port,
+    PortConfig, PortError, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::{only_allowed_cpu, rte_vdev_init, rte_vdev_uninit, RTE_PKTMBUF_HEADROOM};
@@ -120,9 +121,9 @@ impl Drop for Tester {
 }
 
 /// Spawns `tester` (non-empty) with `tester_env`, then runs `app` on a Stack
-/// with `max_sockets` slots, `recv_capacity` receive bytes per socket and
-/// optional IPv4 `gateway` until it returns,
-/// and composes the exit status.
+/// with `max_sockets` slots, pools for that many uncapped sockets of
+/// `recv_capacity` receive and send bytes each, and optional IPv4 `gateway`
+/// until it returns, and composes the exit status.
 ///
 /// `app` gets the Stack, created at `Instant::ZERO` = the wall-clock `start`,
 /// and `stop`, which polls whether the tester exited. It must return `Ok` only
@@ -177,6 +178,8 @@ pub fn run(
     )
 }
 
+/// The frame pool covers `frame_reserve` plus `max_sockets` TX frame limits of
+/// `recv_capacity`-byte send buffers.
 fn port_config(port_id: u16, max_sockets: usize, recv_capacity: usize) -> PortConfig<'static> {
     let pool = |name, count| PoolConfig {
         name,
@@ -202,9 +205,18 @@ fn port_config(port_id: u16, max_sockets: usize, recv_capacity: usize) -> PortCo
             ),
         ),
         tx_pool: pool(TX_POOL, POOL_COUNT),
-        frame_pool: pool(FRAME_POOL, POOL_COUNT),
+        frame_pool: pool(FRAME_POOL, frame_pool_count(max_sockets, recv_capacity)),
         offloads: Offloads::default(),
     }
+}
+
+fn frame_pool_count(max_sockets: usize, send_capacity: usize) -> u32 {
+    let socket = tcp::Config { rx_capacity: send_capacity, tx_capacity: send_capacity, mss_cap: None };
+    tcp::tx_mbuf_budget(&socket, usize::from(MTU))
+        .checked_mul(max_sockets)
+        .and_then(|frames| frames.checked_add(frame_reserve(DESCRIPTORS, TX_PENDING)))
+        .and_then(|count| u32::try_from(count).ok())
+        .expect("frame pool count fits u32")
 }
 
 fn stack_config(max_sockets: usize, gateway: Option<Ipv4Addr>, random_seed: u64) -> StackConfig<'static> {
@@ -237,6 +249,7 @@ fn serve(
     let mut config = port_config(u16::MAX, max_sockets, recv_capacity);
     let pool_memory_bytes = u64::from(config.rx_pool.count)
         .checked_add(u64::from(config.tx_pool.count))
+        .and_then(|count| count.checked_add(u64::from(config.frame_pool.count)))
         .and_then(|count| count.checked_mul(MBUF_MEMORY_BYTES))
         .expect("pool memory size exceeds u64");
     let pool_memory_mb = (pool_memory_bytes / BYTES_PER_MIB)

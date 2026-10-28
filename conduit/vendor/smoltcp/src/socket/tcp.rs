@@ -143,7 +143,6 @@ pub enum SendFrameError {
     Foreign,
     Empty,
     Full,
-    PoolEmpty,
 }
 
 impl Display for SendFrameError {
@@ -153,7 +152,6 @@ impl Display for SendFrameError {
             SendFrameError::Foreign => write!(f, "frame belongs to another source"),
             SendFrameError::Empty => write!(f, "frame is empty"),
             SendFrameError::Full => write!(f, "send queue is full"),
-            SendFrameError::PoolEmpty => write!(f, "frame pool is empty"),
         }
     }
 }
@@ -987,6 +985,11 @@ impl<'a> Socket<'a> {
         self.rx_mbuf_cap as usize
     }
 
+    /// Return the socket's TX frame limit: how many frames its send queue holds at most.
+    pub fn tx_frame_cap(&self) -> usize {
+        self.tx_queue.frame_capacity()
+    }
+
     /// Fix the socket's RX frame count and per-frame bytes using its configured cap.
     /// The count survives reset and reconnect; per-frame bytes follow each connection.
     /// Panics if the app still holds received frames, `ip_mtu` is below 68,
@@ -1502,23 +1505,23 @@ impl<'a> Socket<'a> {
         )
     }
 
-    /// Return the largest frame that `send_frame` accepts now.
+    /// Return how many bytes `send_frame` takes now in frames of the local segment
+    /// payload: free bytes, capped by free frame slots × that payload. The peer MSS
+    /// does not limit it; egress cuts frames larger than a segment.
     pub fn frame_send_room(&self) -> usize {
-        if !self.may_send() {
+        if !self.may_send() || self.max_segment_payload().is_none() {
             return 0;
         }
-        let Some(mss) = self.max_segment_payload() else {
-            return 0;
-        };
         self.tx_queue.byte_room().min(
             self.tx_queue
                 .frame_room()
-                .checked_mul(mss)
+                .checked_mul(self.tx_seg_bytes as usize)
                 .expect("TX frame room exceeds usize"),
         )
     }
 
-    /// Enqueue one owned frame.
+    /// Enqueue one owned frame as one send-queue entry. A frame longer than the
+    /// current segment payload is sent by copying, like `send_slice` data.
     pub fn send_frame(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
         if frame.origin() != self.tx_queue.source().origin() {
             return Err((frame, SendFrameError::Foreign));
@@ -1529,38 +1532,11 @@ impl<'a> Socket<'a> {
         if frame.len() == 0 {
             return Err((frame, SendFrameError::Empty));
         }
-        let mss = self.max_segment_payload().expect("sendable TCP socket is not synchronized");
-        let frames = frame.len().div_ceil(mss);
-        if frame.len() > self.tx_queue.byte_room() || frames > self.tx_queue.frame_room() {
+        self.max_segment_payload().expect("sendable TCP socket is not synchronized");
+        if frame.len() > self.tx_queue.byte_room() || self.tx_queue.frame_room() == 0 {
             return Err((frame, SendFrameError::Full));
         }
-        if frame.len() <= mss {
-            self.tx_queue.push(frame.into_buf());
-            return Ok(());
-        }
-
-        let unique = frame.unique();
-        let mut copies = alloc::vec::Vec::with_capacity(frames);
-        let first_copy = usize::from(unique);
-        for index in first_copy..frames {
-            let start = index.checked_mul(mss).expect("TX split offset exceeds usize");
-            let end = start.checked_add(mss).expect("TX split end exceeds usize").min(frame.len());
-            let Some(mut buf) = self.tx_queue.source().alloc() else {
-                return Err((frame, SendFrameError::PoolEmpty));
-            };
-            assert!(buf.capacity() >= end - start, "TX source buffer is smaller than its segment bound");
-            buf.room_mut()[..end - start].copy_from_slice(&frame.payload()[start..end]);
-            buf.set_len(end - start);
-            copies.push(buf);
-        }
-        if unique {
-            let mut first = frame.into_buf();
-            first.set_len(mss);
-            self.tx_queue.push(first);
-        }
-        for buf in copies {
-            self.tx_queue.push(buf);
-        }
+        self.tx_queue.push(frame.into_buf());
         Ok(())
     }
 
@@ -5382,7 +5358,7 @@ mod test {
         let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
         let handle = set.add(s.socket);
         set.get_mut(handle).set_rx_wake(queue.clone(), handle);
-        let (held, _) = set.remove(handle);
+        let (held, _, _) = set.remove(handle);
         frames.pop();
         assert!(drain_wakes(&queue).is_empty(), "removed socket must not queue a wake");
         assert_eq!(held.count(), frames.len());
@@ -5875,30 +5851,6 @@ mod test {
         socket_established_with_buffer_sizes(64, 64)
     }
 
-    struct LimitedTxAlloc {
-        inner: Rc<CountingAlloc>,
-        remaining: Cell<usize>,
-    }
-
-    impl TxAlloc for LimitedTxAlloc {
-        fn alloc(&self) -> Option<TxBuf> {
-            let remaining = self.remaining.get().checked_sub(1)?;
-            self.remaining.set(remaining);
-            self.inner.alloc()
-        }
-
-        fn origin(&self) -> core::ptr::NonNull<()> {
-            self.inner.origin()
-        }
-    }
-
-    fn limited_source(room: usize, allocations: usize) -> TxSource {
-        TxSource::new(Rc::new(LimitedTxAlloc {
-            inner: CountingAlloc::new(room),
-            remaining: Cell::new(allocations),
-        }))
-    }
-
     fn frame_socket(
         byte_cap: usize,
         frame_cap: usize,
@@ -5969,29 +5921,19 @@ mod test {
     }
 
     #[test]
-    fn frame_send_frame_splits_with_copy() {
+    fn frame_longer_than_mss_is_one_entry_sent_by_copy() {
         let alloc = CountingAlloc::new(8);
         let source = TxSource::new(alloc.clone());
         let mut s = frame_socket(8, 2, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
-        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 2));
-        assert_eq!(alloc.live(), 2);
-        assert_eq!(alloc.releases(), 0);
-        let first = s.tx_queue.take(0);
-        assert_eq!(first.payload(), b"abcd");
-        s.tx_queue.put_back(0, first);
-        assert_eq!(match s.tx_queue.segment(4, 4) { Seg::Whole { index } => s.tx_queue.take(index).payload().to_vec(), _ => panic!("missing split frame") }, b"ef");
-    }
-
-    #[test]
-    fn frame_split_pool_empty_returns_frame() {
-        let source = limited_source(8, 1);
-        let mut s = frame_socket(8, 2, 4, source.clone());
-        let frame = owned_frame(&source, b"abcdef");
-        let (returned, error) = s.send_frame(frame).unwrap_err();
-        assert_eq!(error, SendFrameError::PoolEmpty);
-        assert_eq!(returned.payload(), b"abcdef");
-        assert_eq!(s.send_queue(), 0);
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 1));
+        assert_eq!(alloc.live(), 1);
+        for (offset, expected) in [(0, &b"abcd"[..]), (4, &b"ef"[..])] {
+            let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+            assert_eq!((seq, payload), (LOCAL_SEQ + 1 + offset, expected.to_vec()));
+            assert!(!whole);
+        }
+        assert_eq!(alloc.live(), 1);
     }
 
     #[test]
@@ -6044,15 +5986,14 @@ mod test {
     }
 
     #[test]
-    fn frame_send_frame_shared_longer_than_mss_copies_whole_and_drops_clone() {
+    fn frame_send_frame_shared_longer_than_mss_is_one_entry() {
         let source = crate::tests::tx_test_source(8);
         let mut s = frame_socket(8, 2, 4, source.clone());
         let frame = owned_frame(&source, b"abcdef");
-        let clone = frame.clone();
-        assert!(s.send_frame(clone).is_ok());
+        assert!(s.send_frame(frame.clone()).is_ok());
         assert_eq!(frame.payload(), b"abcdef");
-        assert!(frame.unique());
-        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 2));
+        assert!(!frame.unique());
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 1));
     }
 
     fn emit_frame_segment(s: &mut TestSocket) -> (TcpControl, TcpSeqNumber, Vec<u8>, bool) {
@@ -6225,6 +6166,26 @@ mod test {
         assert_eq!(seq, LOCAL_SEQ + 1);
         assert_ne!(control, TcpControl::Fin);
         assert!(!whole);
+    }
+
+    #[test]
+    fn frame_send_room_with_small_peer_mss_reaches_tx_capacity() {
+        let source = crate::tests::tx_test_source(1460);
+        let mut s = frame_socket(65536, tx_frame_cap(65536, 1460), 1460, source.clone());
+        s.remote_mss = 512;
+        assert_eq!(s.frame_send_room(), 65536);
+        let mut sent = 0;
+        loop {
+            let room = s.frame_send_room();
+            if room == 0 {
+                break;
+            }
+            let frame = owned_frame(&source, &vec![b'x'; room.min(1460)]);
+            assert!(s.send_frame(frame).is_ok(), "frame within frame_send_room refused");
+            sent += room.min(1460);
+        }
+        assert_eq!((sent, s.send_queue()), (65536, 65536));
+        assert_eq!(s.tx_queue.frames(), 65536usize.div_ceil(1460));
     }
 
     #[test]

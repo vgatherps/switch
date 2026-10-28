@@ -202,7 +202,7 @@ pub(crate) fn prepare_packets() -> Vec<Vec<usize>> {
 }
 
 pub(crate) fn enable_tx_tcp_checksum(port: &mut Port) {
-    port.tx_tcp_checksum = true;
+    port.force_tx_tcp_checksum();
 }
 
 pub(crate) fn enable_tx_udp_checksum(port: &mut Port) {

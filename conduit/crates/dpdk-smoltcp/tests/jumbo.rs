@@ -11,7 +11,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     Ipv4Packet, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, ETHERNET_HEADER_LEN, IPV4_HEADER_LEN,
     TCP_HEADER_LEN,
 };
-use dpdk_smoltcp::rx_reserve;
+use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Port, PortError};
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
@@ -75,6 +75,10 @@ fn sized_pair_with_paths(
         );
         let count = reserve.checked_add(tcp::rx_mbuf_budget(&socket, usize::from(port.mtu))).unwrap();
         port.rx_pool.count = u32::try_from(count).unwrap();
+        let frames = frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending)
+            .checked_add(tcp::tx_mbuf_budget(&socket, usize::from(port.mtu)))
+            .unwrap();
+        port.frame_pool.count = u32::try_from(frames).unwrap();
         port.tx_pool.count = POOL;
     })
 }
@@ -247,18 +251,18 @@ fn mismatched_mss_respects_smaller_limit() {
                 short_from_b = sizes.iter().filter(|&&(payload, _)| payload < mss).count();
             }
         }
-        // A's window is 6 frames x 1460 B and assumes full-sized segments. B's short segments
-        // (its TX ring wrap, window-cut heads and tails) each hold a whole frame, and
-        // never-shrink keeps edges promised at 0 held frames, so some in-window segments are
-        // refused and retransmitted; the transfer still completes byte-exact (U54: short
-        // segments holding whole frames accepted). The bound is not a receive-window
-        // invariant: a full-sized segment refused again before A drains would count twice,
-        // and `sizes` includes B's retransmissions. It is a tripwire for this deterministic
-        // run, where every refusal traced to a short segment eating a frame. The count moves
-        // with how Cubic paces B (5 before the Cubic window changes, 6 after; the extra one is
-        // a 473 B tail after a 987 B head in a 6 x 1460 B flight), so it is not pinned.
+        // A's window is 6 frames x 1460 B and assumes full-sized segments. A short segment
+        // from B holds a whole frame, and never-shrink keeps edges promised at 0 held frames,
+        // so an in-window short segment can be refused and retransmitted; the transfer still
+        // completes byte-exact (U54: short segments holding whole frames accepted). B now
+        // sends from TX frames, so its byte ring's wrap-point splits are gone and only
+        // window-cut heads and tails stay short (this run: one short segment, no refusal).
+        // The bound is not a receive-window invariant: a full-sized segment refused again
+        // before A drains would count twice, and `sizes` includes B's retransmissions. It
+        // is a tripwire for this deterministic run, where every refusal traces to a short
+        // segment eating a frame.
         let refused = pair.a.tcp(&handles[0]).rx_refused_segments();
-        assert!(refused > 0 && usize::try_from(refused).unwrap() <= short_from_b,
+        assert!(usize::try_from(refused).unwrap() <= short_from_b,
             "A refused {refused} segments; B sent {short_from_b} short segments");
         assert_eq!(pair.b.tcp(&handles[1]).rx_refused_segments(), 0);
         assert_no_drops(&pair);

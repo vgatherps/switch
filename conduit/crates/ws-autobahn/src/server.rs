@@ -28,6 +28,10 @@ pub enum ServerError {
         required: usize,
         pool: usize,
     },
+    TxFramePoolTooSmall {
+        required: usize,
+        pool: usize,
+    },
     Listen(tcp::ListenError),
     /// A connection was accepted while another accepted one still waits for
     /// the running session to end.
@@ -52,6 +56,12 @@ impl fmt::Display for ServerError {
                 write!(
                     f,
                     "RX pool has {pool} mbufs; adding this socket requires {required}"
+                )
+            }
+            Self::TxFramePoolTooSmall { required, pool } => {
+                write!(
+                    f,
+                    "frame pool has {pool} mbufs; adding this socket requires {required}"
                 )
             }
             _ => write!(f, "{self:?}"),
@@ -280,6 +290,9 @@ fn add_listener(stack: &mut Stack, port: u16, buffer: usize) -> Result<TcpHandle
         AddTcpError::SocketsFull(_) => ServerError::SocketsFull,
         AddTcpError::RxPoolTooSmall { required, pool, .. } => {
             ServerError::RxPoolTooSmall { required, pool }
+        }
+        AddTcpError::TxFramePoolTooSmall { required, pool, .. } => {
+            ServerError::TxFramePoolTooSmall { required, pool }
         }
     })?;
     if let Err(error) = stack.listen(&handle, port) {
