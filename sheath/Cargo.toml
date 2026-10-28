@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+relay = { path = "../relay" }
 rustls = { version = "=0.23.43", default-features = false, features = ["std"] }
 
 [dev-dependencies]

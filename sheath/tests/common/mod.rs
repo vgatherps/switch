@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
+use relay::{PlainRx, PlainTx, RxFrame, TxFrame};
 use rustls::client::UnbufferedClientConnection;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::ring::default_provider;
@@ -17,7 +18,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
-use sheath::{Error, PlainTx, RxFrame, TlsRx, TlsTx, TxFrame};
+use sheath::{Error, TlsRx, TlsTx};
 
 pub const HOST: &str = "sheath.test";
 
@@ -99,6 +100,14 @@ impl PlainTx for TestTx {
         }
         f.len = len;
         Ok(f)
+    }
+
+    fn has_pending(&self) -> bool {
+        false
+    }
+
+    fn take_pending(&mut self, _: TestFrame) -> Result<Option<TestFrame>, SealFailed> {
+        Ok(None)
     }
 
     fn try_send(&mut self, f: TestFrame) -> Result<(), TestFrame> {
@@ -320,10 +329,11 @@ pub enum Place {
 pub struct Received {
     pub got: Vec<Got>,
     pub error: Option<Error>,
-    pub rx: TlsRx<VecFrame>,
+    pub rx: TlsRx<VecFrame, TestTx>,
 }
 
-/// Pushes `frames` (frame `i` stamped `i`) and collects every chunk until the first error.
+/// Pushes `frames` (frame `i` stamped `i`) and collects every run, consuming it whole, until
+/// the first error.
 pub fn receive(tx: &mut TlsTx<TestTx>, frames: Vec<Vec<u8>>) -> Received {
     let ranges: Vec<Range<usize>> = frames
         .iter()
@@ -335,10 +345,14 @@ pub fn receive(tx: &mut TlsTx<TestTx>, frames: Vec<Vec<u8>>) -> Received {
     let mut rx = TlsRx::new();
     let mut got = Vec::new();
     for (index, data) in frames.into_iter().enumerate() {
-        rx.push(VecFrame {
-            data,
-            stamp: index as u64,
-        });
+        rx.push(
+            VecFrame {
+                data,
+                stamp: index as u64,
+            },
+            tx,
+        )
+        .unwrap();
         loop {
             match rx.chunk(tx) {
                 Ok(Some(chunk)) => {
@@ -350,11 +364,13 @@ pub fn receive(tx: &mut TlsTx<TestTx>, frames: Vec<Vec<u8>>) -> Received {
                         },
                         None => Place::Elsewhere(ptr),
                     };
+                    let n = chunk.bytes.len();
                     got.push(Got {
                         plaintext: chunk.bytes.to_vec(),
                         stamp: chunk.rx_timestamp,
                         place,
                     });
+                    rx.consume(n);
                 }
                 Ok(None) => break,
                 Err(error) => {

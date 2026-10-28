@@ -9,12 +9,13 @@ mod common;
 use std::sync::LazyLock;
 
 use common::*;
+use relay::{PlainRx, PlainTx, TxFrame};
 use rustls::client::UnbufferedClientConnection;
 use rustls::crypto::ring::{cipher_suite, default_provider};
 use rustls::crypto::{CipherSuiteCommon, CryptoProvider};
 use rustls::pki_types::ServerName;
 use rustls::{AlertDescription, SupportedCipherSuite, Tls13CipherSuite};
-use sheath::{Error, PlainTx, Sealed, TlsRx, TlsTx, TxError, TxFrame};
+use sheath::{Error, Sealed, TlsRx, TlsTx, TxError};
 
 /// Record overhead: 5 B header, 1 B content type, 16 B tag.
 const RECORD: usize = 22;
@@ -225,7 +226,7 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
 fn truncation_stops_sending() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap();
-    let mut rx = TlsRx::<VecFrame>::new();
+    let mut rx = TlsRx::<VecFrame, TestTx>::new();
     assert_eq!(rx.fin(&mut peer.tx), Err(Error::Truncated));
     let f = frame(&mut peer.tx, b"x");
     assert_eq!(
@@ -318,4 +319,65 @@ fn new_needs_completed_handshake() {
         UnbufferedClientConnection::new(client_config, ServerName::try_from(HOST).unwrap())
             .unwrap();
     TlsTx::new(client, TestTx(Wire::default()));
+}
+
+/// The alert rustls queues on a receive error is visible to `has_pending` as soon as the
+/// receive step returns, before anything else asks rustls.
+#[test]
+fn has_pending_sees_the_alert_of_a_receive_error() {
+    let mut peer = connect(None);
+    deliver_to_client(&mut peer).unwrap();
+    assert!(!peer.tx.has_pending());
+    let mut stream = Stream::default();
+    peer.send(&mut stream, b"hello");
+    let last = stream.bytes.len() - 1;
+    stream.bytes[last] ^= 1;
+    let received = receive(&mut peer.tx, vec![stream.bytes]);
+    assert_eq!(
+        received.error,
+        Some(Error::Tls(rustls::Error::DecryptError))
+    );
+    assert!(peer.tx.has_pending());
+    let f = peer.tx.alloc().unwrap();
+    let alert = peer.tx.take_pending(f).unwrap().unwrap();
+    assert_eq!(send(&mut peer, alert), RECORD + 2);
+    assert!(!peer.tx.has_pending());
+}
+
+/// Sending while the server's session ticket is split across records, half received: rustls
+/// holds the first half, and every call to it must start with those bytes.
+#[test]
+fn sealing_while_a_handshake_message_is_half_received() {
+    let mut peer = connect(Some(64));
+    let mut stream = Stream::default();
+    peer.flush(&mut stream);
+    peer.send(&mut stream, b"after the ticket");
+    let tickets = records(&stream.bytes);
+    assert!(tickets.len() > 2, "the ticket spans records");
+    let cut = tickets[0].end;
+
+    let mut rx = TlsRx::<VecFrame, TestTx>::new();
+    let first = VecFrame {
+        data: stream.bytes[..cut].to_vec(),
+        stamp: 0,
+    };
+    rx.push(first, &mut peer.tx).unwrap();
+    assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
+
+    assert_eq!(seal_and_send(&mut peer, b"mid"), RECORD + 3);
+    assert_eq!(peer.deliver().unwrap(), b"mid");
+    assert!(!peer.tx.has_pending());
+
+    let rest = VecFrame {
+        data: stream.bytes[cut..].to_vec(),
+        stamp: 1,
+    };
+    rx.push(rest, &mut peer.tx).unwrap();
+    let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
+    assert_eq!(chunk.bytes, b"after the ticket");
+    let n = chunk.bytes.len();
+    rx.consume(n);
+    assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
+    assert_eq!(seal_and_send(&mut peer, b"end"), RECORD + 3);
+    assert_eq!(peer.deliver().unwrap(), b"end");
 }
