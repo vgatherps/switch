@@ -106,6 +106,16 @@ impl<F: RxFrame, L: PlainTx> TlsRx<F, L> {
         }
     }
 
+    /// Starts with `leftover`, bytes after the handshake that rustls has not processed (the
+    /// start of a record), from a frame stamped `stamp`.
+    #[cfg(feature = "switchnet")]
+    pub(crate) fn with_leftover(leftover: &[u8], stamp: u64) -> Self {
+        let mut rx = Self::new();
+        rx.scratch.extend_from_slice(leftover);
+        rx.scratch_stamp = stamp;
+        rx
+    }
+
     /// The peer closed the stream with close_notify.
     pub fn eof(&self) -> bool {
         matches!(self.state, State::Closed)

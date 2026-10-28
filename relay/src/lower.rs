@@ -50,8 +50,8 @@ pub trait TxFrame {
     fn room_mut(&mut self) -> &mut [u8];
 }
 
-/// The send half below WebSocket: frames, record sealing (TLS), and a
-/// synchronous send that may refuse.
+/// The send half below WebSocket: frames, record sealing (TLS), a wait for
+/// room, and a synchronous send.
 pub trait PlainTx {
     type Frame: TxFrame;
     /// A frame whose bytes are final. Only `seal` and `take_pending` make one
@@ -59,8 +59,12 @@ pub trait PlainTx {
     type Sealed;
     type Error;
 
-    /// A new, empty frame.
-    fn alloc(&mut self) -> Result<Self::Frame, Self::Error>;
+    /// A new, empty frame, once one is free.
+    fn alloc(&mut self) -> impl Future<Output = Result<Self::Frame, Self::Error>>;
+    /// Resolves once a sealed frame carrying `len` plaintext bytes can be
+    /// sent: `try_send` of it then succeeds until the transport runs again.
+    /// `Err` once the transport can no longer send.
+    fn room(&mut self, len: usize) -> impl Future<Output = Result<(), Self::Error>>;
     /// `(head, room)`: plaintext starts at `room_mut()[head]`, and one frame
     /// carries at most `room` plaintext bytes.
     fn plain(&self) -> (usize, usize);
@@ -79,4 +83,6 @@ pub trait PlainTx {
     fn seal_close(&mut self, f: Self::Frame) -> Result<Option<Self::Sealed>, Self::Error>;
     /// Send now, or hand the sealed frame back unchanged when there is no room.
     fn try_send(&mut self, s: Self::Sealed) -> Result<(), Self::Sealed>;
+    /// End the transport after the frames sent (TCP FIN). Receiving goes on.
+    fn shutdown(&mut self);
 }

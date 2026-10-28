@@ -1,12 +1,16 @@
 //! Send core: frames read back by relay's receive core and by tungstenite,
-//! exact header bytes, masking, the unsent slot, and control frames.
+//! exact header bytes, masking, the wait for room, the unsent slot, and
+//! control frames. Futures are polled with a no-op waker; the mock lower
+//! layer is ready at once unless a test withholds its room.
 
 mod common;
 
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::io::Cursor;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use common::*;
 use relay::{Kind, PlainTx, Role, TxError, TxFrame, WsError, WsTx};
@@ -23,7 +27,12 @@ const CLOSE_RECORD: &[u8] = b"close_notify";
 struct Log {
     /// Plaintext of each frame sent, in order.
     sent: Vec<Vec<u8>>,
-    /// Number of upcoming `try_send` calls to refuse.
+    /// Bytes of room left; `None`: unlimited.
+    room: Option<usize>,
+    /// The length the last resolved `room` granted, cleared by the next seal.
+    granted: Option<usize>,
+    /// Number of upcoming `try_send` calls to refuse; a refusal also takes
+    /// all room away, as a full socket would.
     refuse: usize,
     refused: usize,
     allocs: usize,
@@ -31,11 +40,13 @@ struct Log {
     /// Records the lower layer must send on its own, oldest first.
     pending: Vec<Vec<u8>>,
     take_pending_calls: usize,
+    shutdowns: usize,
 }
 
 /// A TLS-shaped lower layer: plaintext at `HEAD`, `TAIL` bytes after it.
-/// Sealing numbers the frame; sending checks the numbers arrive in order with
-/// none missing, which is what a TLS peer requires.
+/// Sealing numbers the frame and requires room granted for it first; sending
+/// checks the numbers arrive in order with none missing, which is what a TLS
+/// peer requires.
 struct MockTx {
     room: usize,
     log: Rc<RefCell<Log>>,
@@ -61,6 +72,8 @@ impl MockTx {
     fn sealed(&mut self, f: MockFrame, len: usize) -> MockSealed {
         assert!(len <= self.room);
         let mut log = self.log.borrow_mut();
+        let granted = log.granted.take().expect("sealed before room was granted");
+        assert!(len <= granted, "sealed {len} B with room for {granted} B");
         log.seals += 1;
         MockSealed { buf: f.buf, len, seq: log.seals - 1 }
     }
@@ -71,9 +84,21 @@ impl PlainTx for MockTx {
     type Sealed = MockSealed;
     type Error = Infallible;
 
-    fn alloc(&mut self) -> Result<MockFrame, Infallible> {
+    async fn alloc(&mut self) -> Result<MockFrame, Infallible> {
         self.log.borrow_mut().allocs += 1;
         Ok(MockFrame { buf: vec![FILL; HEAD + self.room + TAIL] })
+    }
+
+    async fn room(&mut self, len: usize) -> Result<(), Infallible> {
+        std::future::poll_fn(|_| {
+            let mut log = self.log.borrow_mut();
+            if log.room.is_some_and(|room| room < len) {
+                return Poll::Pending;
+            }
+            log.granted = Some(len);
+            Poll::Ready(Ok(()))
+        })
+        .await
     }
 
     fn plain(&self) -> (usize, usize) {
@@ -112,18 +137,42 @@ impl PlainTx for MockTx {
         if log.refuse > 0 {
             log.refuse -= 1;
             log.refused += 1;
+            if log.room.is_some() {
+                log.room = Some(0);
+            }
             return Err(s);
         }
+        assert_eq!(log.shutdowns, 0, "sent after shutdown");
         assert_eq!(s.seq, log.sent.len() as u64, "sent out of seal order or a frame was dropped");
         assert!(s.buf[..HEAD].iter().all(|&b| b == FILL), "wrote before the plaintext head");
+        if let Some(room) = &mut log.room {
+            *room -= s.len;
+        }
         log.sent.push(s.buf[HEAD..HEAD + s.len].to_vec());
         Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        self.log.borrow_mut().shutdowns += 1;
     }
 }
 
 fn tx(role: Role, room: usize) -> (WsTx<MockTx>, Rc<RefCell<Log>>) {
     let log = Rc::new(RefCell::new(Log::default()));
     (WsTx::new(MockTx { room, log: log.clone() }, role), log)
+}
+
+/// Polls `f` once.
+fn poll<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    f.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// `f`'s output; panics if it is not ready on the first poll.
+fn ready<F: Future>(f: F) -> F::Output {
+    match poll(pin!(f)) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("future pending though the mock has room"),
+    }
 }
 
 fn peer(role: Role) -> Role {
@@ -161,9 +210,18 @@ fn tungstenite_reads(sender: Role, frames: &[Vec<u8>]) -> Vec<TMessage> {
 }
 
 fn send_all(t: &mut WsTx<MockTx>, kind: Kind, payload: &[u8]) {
-    let mut rest = payload;
-    assert_eq!(t.send(kind, &mut rest), Ok(true));
-    assert!(rest.is_empty());
+    assert_eq!(ready(t.send(kind, payload)), Ok(()));
+}
+
+/// One frame of `payload` through `frame` + `commit`.
+fn commit(t: &mut WsTx<MockTx>, kind: Kind, payload: &[u8], fin: bool) {
+    let mut f = ready(t.frame(kind)).unwrap();
+    f.room()[..payload.len()].copy_from_slice(payload);
+    ready(f.commit(payload.len(), fin)).unwrap();
+}
+
+fn payloads(sender: Role, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    relay_reads(sender, frames).msgs.into_iter().map(|m| m.payload).collect()
 }
 
 #[test]
@@ -211,9 +269,7 @@ fn header_bytes_and_length_classes() {
     // Room reserves the 4-byte class; a short payload moves down behind a 2-byte header.
     for (room, len, header) in [(1430, 10, &[0x82u8, 10][..]), (300, 200, &[0x82, 126, 0, 200]), (300, 125, &[0x82, 125])] {
         let (mut t, log) = tx(Role::Server, room);
-        let mut f = t.frame(Kind::Binary).unwrap().unwrap();
-        f.room()[..len].fill(3);
-        f.commit(len, true).unwrap();
+        commit(&mut t, Kind::Binary, &vec![3; len], true);
         assert_eq!(sent(&log), [[header, &vec![3; len][..]].concat()], "room {room} len {len}");
     }
 }
@@ -222,7 +278,7 @@ fn header_bytes_and_length_classes() {
 fn room_is_the_frame_room_minus_the_header() {
     for (role, room, cap) in [(Role::Server, 1430, 1426), (Role::Client, 1430, 1422), (Role::Server, 127, 125), (Role::Server, 128, 124)] {
         let (mut t, _) = tx(role, room);
-        assert_eq!(t.frame(Kind::Text).unwrap().unwrap().room().len(), cap, "{role:?} {room}");
+        assert_eq!(ready(t.frame(Kind::Text)).unwrap().room().len(), cap, "{role:?} {room}");
     }
 }
 
@@ -255,80 +311,70 @@ fn client_masks_every_frame_with_a_fresh_key() {
     assert_eq!(sent(&log), [[&[0x82, 40][..], &payload].concat()]);
 }
 
+/// With no room the send waits before sealing (no sequence number used) and
+/// resumes once room is granted; a message larger than the room goes out
+/// frame by frame as room comes.
 #[test]
-fn refused_frame_is_kept_and_sent_first() {
-    for role in [Role::Client, Role::Server] {
-        let (mut t, log) = tx(role, 1430);
-        log.borrow_mut().refuse = 1;
-        let mut f = t.frame(Kind::Text).unwrap().unwrap();
-        f.room()[..1].copy_from_slice(b"a");
-        f.commit(1, true).unwrap();
-        assert!(sent(&log).is_empty());
-        assert_eq!(log.borrow().refused, 1);
-
-        // The next frame goes out only after the kept one.
-        send_all(&mut t, Kind::Text, b"b");
-        assert_eq!(t.flush(), Ok(true));
-        let frames = sent(&log);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(log.borrow().seals, 2);
-        let got: Vec<_> = relay_reads(role, &frames).msgs.into_iter().map(|m| m.payload).collect();
-        assert_eq!(got, [b"a".to_vec(), b"b".to_vec()]);
-    }
-}
-
-#[test]
-fn no_new_frame_while_the_kept_one_is_refused() {
-    let (mut t, log) = tx(Role::Server, 1430);
-    log.borrow_mut().refuse = 4;
-    send_all(&mut t, Kind::Binary, b"a");
-    assert!(t.frame(Kind::Binary).unwrap().is_none());
-    assert_eq!(t.flush(), Ok(false));
-    assert_eq!(log.borrow().allocs, 1, "allocated while a frame waited");
-    let mut rest: &[u8] = b"b";
-    assert_eq!(t.send(Kind::Binary, &mut rest), Ok(false));
-    assert_eq!(rest, b"b");
-    assert_eq!(t.send(Kind::Binary, &mut rest), Ok(true));
-    let got: Vec<_> = relay_reads(Role::Server, &sent(&log)).msgs.into_iter().map(|m| m.payload).collect();
-    assert_eq!(got, [b"a".to_vec(), b"b".to_vec()]);
-}
-
-/// A refusal mid-message leaves it open; the next call continues it.
-#[test]
-fn send_resumes_after_a_refusal() {
+fn send_waits_for_room_before_sealing() {
     for role in [Role::Client, Role::Server] {
         let (mut t, log) = tx(role, 100);
-        let payload: Vec<u8> = (0..1000).map(|i| i as u8).collect();
-        let mut rest = &payload[..];
-        log.borrow_mut().refuse = 2;
-        assert_eq!(t.send(Kind::Binary, &mut rest), Ok(false));
-        let left = rest.len();
-        assert!(0 < left && left < payload.len());
-        assert_eq!(t.send(Kind::Binary, &mut rest), Ok(true));
+        log.borrow_mut().room = Some(0);
+        let payload: Vec<u8> = (0..250).map(|i| i as u8).collect();
+        let mut f = pin!(t.send(Kind::Binary, &payload));
+        assert!(poll(f.as_mut()).is_pending());
+        assert_eq!((log.borrow().allocs, log.borrow().seals), (1, 0));
+        // Room for one frame only: one goes out, the next waits.
+        log.borrow_mut().room = Some(100);
+        assert!(poll(f.as_mut()).is_pending());
+        assert_eq!(log.borrow().sent.len(), 1);
+        log.borrow_mut().room = None;
+        assert_eq!(poll(f.as_mut()), Poll::Ready(Ok(())));
         let frames = sent(&log);
-        assert!(frames.len() > 10);
-        assert_eq!(frames[0][0], 0x02, "first fragment: binary, not fin");
-        assert!(frames[1..frames.len() - 1].iter().all(|f| f[0] == 0x00), "middle fragments: continuation");
-        assert_eq!(frames[frames.len() - 1][0], 0x80, "last fragment: fin continuation");
-        let run = relay_reads(role, &frames);
-        assert_eq!(run.msgs.len(), 1);
-        assert_eq!(run.msgs[0].payload, payload);
-        assert_eq!(tungstenite_reads(role, &frames), [TMessage::Binary(payload.into())]);
+        assert!(frames.len() >= 3);
+        assert_eq!(payloads(role, &frames), std::slice::from_ref(&payload));
     }
+}
+
+/// A refused sealed frame waits in the slot for room and goes out before
+/// anything else, also when the future that sealed it is dropped meanwhile.
+#[test]
+fn refused_frame_is_kept_through_a_dropped_future() {
+    for role in [Role::Client, Role::Server] {
+        let (mut t, log) = tx(role, 1430);
+        log.borrow_mut().room = Some(10_000);
+        log.borrow_mut().refuse = 1;
+        {
+            let mut f = pin!(t.send(Kind::Text, b"a"));
+            assert!(poll(f.as_mut()).is_pending(), "refusal took the room; the slot waits");
+        }
+        assert_eq!((log.borrow().seals, log.borrow().refused), (1, 1));
+        assert!(sent(&log).is_empty());
+        log.borrow_mut().room = None;
+        send_all(&mut t, Kind::Text, b"b");
+        assert_eq!(log.borrow().seals, 2);
+        assert_eq!(payloads(role, &sent(&log)), [b"a".to_vec(), b"b".to_vec()]);
+    }
+}
+
+/// A refusal with room left is retried at once; nothing is lost or reordered.
+#[test]
+fn refusal_is_retried() {
+    let (mut t, log) = tx(Role::Server, 1430);
+    log.borrow_mut().refuse = 2;
+    send_all(&mut t, Kind::Binary, b"a");
+    send_all(&mut t, Kind::Binary, b"b");
+    assert_eq!((log.borrow().seals, log.borrow().refused), (2, 2));
+    assert_eq!(payloads(Role::Server, &sent(&log)), [b"a".to_vec(), b"b".to_vec()]);
 }
 
 #[test]
 fn pong_goes_between_fragments() {
     for role in [Role::Client, Role::Server] {
         let (mut t, log) = tx(role, 1430);
-        let mut f = t.frame(Kind::Text).unwrap().unwrap();
-        f.room()[..3].copy_from_slice(b"abc");
-        f.commit(3, false).unwrap();
+        commit(&mut t, Kind::Text, b"abc", false);
         t.pong(b"old");
         t.pong(b"p");
-        let mut f = t.frame(Kind::Text).unwrap().unwrap();
-        f.room()[..3].copy_from_slice(b"def");
-        f.commit(3, true).unwrap();
+        commit(&mut t, Kind::Text, b"def", true);
         let frames = sent(&log);
         assert_eq!(frames.iter().map(|f| f[0]).collect::<Vec<_>>(), [0x01, 0x8a, 0x80]);
         let run = relay_reads(role, &frames);
@@ -342,16 +388,6 @@ fn pong_goes_between_fragments() {
     }
 }
 
-#[test]
-fn refused_pong_is_kept() {
-    let (mut t, log) = tx(Role::Server, 1430);
-    t.pong(b"p");
-    log.borrow_mut().refuse = 1;
-    assert_eq!(t.flush(), Ok(false));
-    assert!(t.frame(Kind::Binary).unwrap().is_some());
-    assert_eq!(tungstenite_reads(Role::Server, &sent(&log)), [TMessage::Pong(b"p".to_vec().into())]);
-}
-
 /// The receive half's ping becomes the send half's pong.
 #[test]
 fn ping_is_answered_with_its_payload() {
@@ -362,7 +398,7 @@ fn ping_is_answered_with_its_payload() {
     if let Some(p) = r.take_pong() {
         t.pong(p);
     }
-    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(ready(t.flush()), Ok(()));
     assert_eq!(tungstenite_reads(Role::Client, &sent(&log)), [TMessage::Pong(b"hb".to_vec().into())]);
 }
 
@@ -378,14 +414,14 @@ fn close_is_echoed_and_ends_sending() {
     t.close(r.peer_close().unwrap());
     t.close(b"ignored");
     t.pong(b"after");
-    assert!(matches!(t.frame(Kind::Binary), Err(TxError::Closed)));
-    assert_eq!(t.flush(), Ok(true));
+    assert!(matches!(ready(t.frame(Kind::Binary)), Err(TxError::Closed)));
+    assert_eq!(ready(t.flush()), Ok(()));
     let frames = sent(&log);
     assert_eq!(frames, [[&[0x8a, 5][..], b"first"].concat(), [&[0x88, 5][..], &close].concat()]);
     let msgs = tungstenite_reads(Role::Server, &frames);
     assert_eq!(msgs.len(), 2);
     assert!(matches!(&msgs[1], TMessage::Close(Some(c)) if u16::from(c.code) == 1001 && c.reason == "bye"));
-    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(ready(t.flush()), Ok(()));
     assert_eq!(sent(&log).len(), 2);
 }
 
@@ -393,25 +429,26 @@ fn close_is_echoed_and_ends_sending() {
 #[should_panic(expected = "message is still open")]
 fn other_kind_while_a_message_is_open_panics() {
     let (mut t, _) = tx(Role::Server, 1430);
-    t.frame(Kind::Text).unwrap().unwrap().commit(0, false).unwrap();
-    let _ = t.frame(Kind::Binary);
+    commit(&mut t, Kind::Text, b"", false);
+    let _ = ready(t.frame(Kind::Binary));
 }
 
 /// Flush order: the refused frame, then the lower layer's own records, then
-/// the pong, then the close; a refusal stops it and the rest waits in order.
+/// the pong, then the close.
 #[test]
 fn flush_order_unsent_pending_pong_close() {
     let (mut t, log) = tx(Role::Server, 1430);
+    log.borrow_mut().room = Some(10_000);
     log.borrow_mut().refuse = 1;
-    send_all(&mut t, Kind::Binary, b"data");
+    {
+        let mut f = pin!(t.send(Kind::Binary, b"data"));
+        assert!(poll(f.as_mut()).is_pending());
+    }
     log.borrow_mut().pending = vec![b"alert1".to_vec(), b"alert2".to_vec()];
     t.pong(b"p");
     t.close(&1000u16.to_be_bytes());
-    // The pending records come after the refused frame and are not lost when it is refused again.
-    log.borrow_mut().refuse = 1;
-    assert_eq!(t.flush(), Ok(false));
-    assert!(sent(&log).is_empty());
-    assert_eq!(t.flush(), Ok(true));
+    log.borrow_mut().room = None;
+    assert_eq!(ready(t.flush()), Ok(()));
     assert_eq!(
         sent(&log),
         [
@@ -425,19 +462,6 @@ fn flush_order_unsent_pending_pong_close() {
     assert_eq!(log.borrow().take_pending_calls, 2);
 }
 
-/// A refused pending record is kept, sent first, and stops the pong behind it.
-#[test]
-fn refused_pending_record_is_kept() {
-    let (mut t, log) = tx(Role::Server, 1430);
-    log.borrow_mut().pending = vec![b"alert".to_vec()];
-    t.pong(b"p");
-    log.borrow_mut().refuse = 1;
-    assert_eq!(t.flush(), Ok(false));
-    assert!(sent(&log).is_empty());
-    assert_eq!(t.flush(), Ok(true));
-    assert_eq!(sent(&log), [b"alert".to_vec(), [&[0x8a, 1][..], b"p"].concat()]);
-}
-
 /// Without pending records, sending allocates exactly one frame per WebSocket
 /// frame and never asks for pending records.
 #[test]
@@ -446,42 +470,26 @@ fn no_pending_no_extra_frames() {
     for _ in 0..5 {
         send_all(&mut t, Kind::Text, b"hi");
     }
-    assert_eq!(t.flush(), Ok(true));
+    assert_eq!(ready(t.flush()), Ok(()));
     assert_eq!(log.borrow().allocs, 5);
     assert_eq!(log.borrow().take_pending_calls, 0);
 }
 
-/// After the close frame, the lower layer's close record goes out once, last,
-/// through the unsent slot when refused.
+/// After the close frame: the lower layer's close record once, then the
+/// transport ends once.
 #[test]
 fn shutdown_sends_the_lower_close_after_the_close_frame() {
-    let close = [&[0x88, 2][..], &1000u16.to_be_bytes()].concat();
-
-    // The close frame is refused: the close record may not overtake it.
     let (mut t, log) = tx(Role::Server, 1430);
     t.close(&1000u16.to_be_bytes());
-    log.borrow_mut().refuse = 1;
-    assert_eq!(t.shutdown(), Ok(false));
-    assert!(sent(&log).is_empty());
-    assert_eq!(t.shutdown(), Ok(true));
-    assert_eq!(sent(&log), [close.clone(), CLOSE_RECORD.to_vec()]);
-
-    // The close record is refused: it waits in the slot, goes out once.
-    let (mut t, log) = tx(Role::Server, 1430);
-    t.close(&1000u16.to_be_bytes());
-    assert_eq!(t.flush(), Ok(true));
-    log.borrow_mut().refuse = 1;
-    assert_eq!(t.shutdown(), Ok(false));
-    assert_eq!(sent(&log), std::slice::from_ref(&close));
-    assert_eq!(t.flush(), Ok(true));
-    assert_eq!(t.shutdown(), Ok(true));
-    assert_eq!(sent(&log), [close, CLOSE_RECORD.to_vec()]);
-    assert_eq!(log.borrow().seals, 2);
+    assert_eq!(ready(t.shutdown()), Ok(()));
+    assert_eq!(ready(t.shutdown()), Ok(()));
+    assert_eq!(sent(&log), [[&[0x88, 2][..], &1000u16.to_be_bytes()].concat(), CLOSE_RECORD.to_vec()]);
+    assert_eq!((log.borrow().seals, log.borrow().shutdowns), (2, 1));
 }
 
 #[test]
 #[should_panic(expected = "shutdown before close")]
 fn shutdown_before_close_panics() {
     let (mut t, _) = tx(Role::Server, 1430);
-    let _ = t.shutdown();
+    let _ = ready(t.shutdown());
 }

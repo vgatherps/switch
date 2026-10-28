@@ -24,7 +24,7 @@ const KEY_UPDATE: usize = 27;
 
 /// A frame with `payload` as its plaintext.
 fn frame(tx: &mut TlsTx<TestTx>, payload: &[u8]) -> TestFrame {
-    let mut f = tx.alloc().unwrap();
+    let mut f = ready(tx.alloc()).unwrap();
     let (head, _) = tx.plain();
     f.room_mut()[head..head + payload.len()].copy_from_slice(payload);
     f
@@ -168,7 +168,7 @@ fn both_key_updates_fit_in_front_of_one_full_record() {
 fn close_notify_ends_sending_only() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap();
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     let sealed = peer.tx.close_notify(f).unwrap();
     assert_eq!(send(&mut peer, sealed), RECORD + 2);
     assert_eq!(peer.deliver().unwrap(), b"");
@@ -205,10 +205,10 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
     assert_eq!(send(&mut peer, sealed), RECORD + 6);
     let f = frame(&mut peer.tx, b"x");
     assert_eq!(peer.tx.seal(f, 1).err(), Some(TxError::Received(error)));
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     let alert = peer.tx.take_pending(f).unwrap().expect("the alert");
     assert_eq!(send(&mut peer, alert), RECORD + 2);
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     assert!(peer.tx.take_pending(f).unwrap().is_none());
 
     let sent = peer.wire.sent.take();
@@ -233,7 +233,7 @@ fn truncation_stops_sending() {
         peer.tx.seal(f, 1).err(),
         Some(TxError::Received(Error::Truncated))
     );
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     assert_eq!(
         peer.tx.close_notify(f).err(),
         Some(TxError::Received(Error::Truncated))
@@ -265,7 +265,7 @@ fn lower_failure_after_encryption_breaks_the_connection() {
         deliver_to_client(&mut peer).unwrap();
         peer.wire.fail_seal.set(true);
         let error = if close {
-            let f = peer.tx.alloc().unwrap();
+            let f = ready(peer.tx.alloc()).unwrap();
             peer.tx.close_notify(f).err()
         } else {
             let f = frame(&mut peer.tx, b"lost");
@@ -275,9 +275,9 @@ fn lower_failure_after_encryption_breaks_the_connection() {
 
         let f = frame(&mut peer.tx, b"x");
         assert_eq!(peer.tx.seal(f, 1).err(), Some(TxError::Broken));
-        let f = peer.tx.alloc().unwrap();
+        let f = ready(peer.tx.alloc()).unwrap();
         assert_eq!(peer.tx.close_notify(f).err(), Some(TxError::Broken));
-        let f = peer.tx.alloc().unwrap();
+        let f = ready(peer.tx.alloc()).unwrap();
         assert_eq!(peer.tx.take_pending(f).err(), Some(TxError::Broken));
         assert!(peer.wire.sent.borrow().is_empty());
     }
@@ -287,7 +287,7 @@ fn lower_failure_after_encryption_breaks_the_connection() {
 #[should_panic(expected = "sealing an empty record")]
 fn sealing_nothing_panics() {
     let mut peer = connect(None);
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     let _ = peer.tx.seal(f, 0);
 }
 
@@ -307,7 +307,7 @@ fn sealing_after_dropping_a_sealed_frame_panics() {
 fn two_sealed_frames_cannot_exist() {
     let mut peer = connect(None);
     let _a = seal(&mut peer.tx, b"a");
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     let _ = peer.tx.take_pending(f);
 }
 
@@ -338,7 +338,7 @@ fn has_pending_sees_the_alert_of_a_receive_error() {
         Some(Error::Tls(rustls::Error::DecryptError))
     );
     assert!(peer.tx.has_pending());
-    let f = peer.tx.alloc().unwrap();
+    let f = ready(peer.tx.alloc()).unwrap();
     let alert = peer.tx.take_pending(f).unwrap().unwrap();
     assert_eq!(send(&mut peer, alert), RECORD + 2);
     assert!(!peer.tx.has_pending());

@@ -191,8 +191,13 @@ impl<L: PlainTx> PlainTx for TlsTx<L> {
     type Sealed = Sealed<L::Sealed>;
     type Error = TxError<L::Error>;
 
-    fn alloc(&mut self) -> Result<L::Frame, Self::Error> {
-        self.lower.alloc().map_err(TxError::Lower)
+    async fn alloc(&mut self) -> Result<L::Frame, Self::Error> {
+        self.lower.alloc().await.map_err(TxError::Lower)
+    }
+
+    /// Room below for the record carrying `len` B and the KeyUpdates that may precede it.
+    async fn room(&mut self, len: usize) -> Result<(), Self::Error> {
+        self.lower.room(len + OVERHEAD).await.map_err(TxError::Lower)
     }
 
     fn plain(&self) -> (usize, usize) {
@@ -256,5 +261,10 @@ impl<L: PlainTx> PlainTx for TlsTx<L> {
         self.lower.try_send(f.0).map_err(Sealed)?;
         self.in_flight = false;
         Ok(())
+    }
+
+    /// Ends the transport below, after close_notify (`seal_close`).
+    fn shutdown(&mut self) {
+        self.lower.shutdown();
     }
 }

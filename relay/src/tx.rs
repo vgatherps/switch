@@ -77,14 +77,16 @@ enum Close {
 
 /// Send half of a connection over lower layer `L`.
 ///
-/// At most one frame waits unsent: one the lower layer refused. Every call
-/// that sends sends it first, and a new frame is handed out only once it is
-/// gone, so no sealed frame is ever dropped.
+/// Each frame goes out in this order: header, mask, wait for room, seal,
+/// synchronous send. A sealed frame the lower layer refuses waits in a
+/// one-frame slot that every later call sends first, also when the future
+/// that sealed it was dropped, so no sealed frame is ever dropped.
 pub struct WsTx<L: PlainTx> {
     lower: L,
     /// Mask source; `Some` iff client role.
     rng: Option<StdRng>,
-    unsent: Option<L::Sealed>,
+    /// A sealed frame not yet accepted, and the plaintext length it carries.
+    unsent: Option<(L::Sealed, usize)>,
     /// Kind of the fragmented message being sent.
     open: Option<Kind>,
     pong: Option<Control>,
@@ -116,22 +118,22 @@ impl<L: PlainTx> WsTx<L> {
     }
 
     /// After the close frame: flush, then send the lower layer's end-of-stream
-    /// record (TLS close_notify) once, through the unsent slot. `Ok(false)`:
-    /// refused; call [`flush`](Self::flush) or this again once there is room.
-    /// Panics if no close was queued.
-    pub fn shutdown(&mut self) -> Result<bool, L::Error> {
+    /// record (TLS close_notify) once, then end the transport
+    /// ([`PlainTx::shutdown`]: TCP FIN). Panics if no close was queued.
+    pub async fn shutdown(&mut self) -> Result<(), L::Error> {
         assert!(!matches!(self.close, Close::None), "shutdown before close");
-        if !self.flush()? {
-            return Ok(false);
-        }
+        self.flush().await?;
         if !self.shut {
+            let f = self.lower.alloc().await?;
+            let (_, room) = self.lower.plain();
+            self.lower.room(room).await?;
             self.shut = true;
-            let f = self.lower.alloc()?;
             if let Some(s) = self.lower.seal_close(f)? {
-                self.send_sealed(s);
+                self.send_sealed(s, room).await?;
             }
+            self.lower.shutdown();
         }
-        Ok(self.unsent.is_none())
+        Ok(())
     }
 
     /// Queue a pong; a newer one replaces one not yet sent (RFC 6455 §5.5.3).
@@ -152,94 +154,99 @@ impl<L: PlainTx> WsTx<L> {
     }
 
     /// Send what waits: the refused frame, then the lower layer's own records,
-    /// then a queued pong, then a queued close. `Ok(false)`: the lower layer
-    /// refused; call again once it has room.
-    pub fn flush(&mut self) -> Result<bool, L::Error> {
-        if let Some(s) = self.unsent.take() {
-            self.send_sealed(s);
-        }
-        while self.unsent.is_none() && self.lower.has_pending() {
-            let f = self.lower.alloc()?;
-            match self.lower.take_pending(f)? {
-                Some(s) => self.send_sealed(s),
-                None => break,
+    /// then a queued pong, then a queued close.
+    pub async fn flush(&mut self) -> Result<(), L::Error> {
+        self.drain_unsent().await?;
+        while self.lower.has_pending() {
+            let f = self.lower.alloc().await?;
+            let (_, room) = self.lower.plain();
+            self.lower.room(room).await?;
+            if let Some(s) = self.lower.take_pending(f)? {
+                self.send_sealed(s, room).await?;
             }
         }
-        if self.unsent.is_none()
-            && let Some(p) = self.pong.take()
-        {
-            self.control(PONG, p)?;
+        if self.pong.is_some() {
+            let f = self.lower.alloc().await?;
+            if let Some(p) = self.pong.take() {
+                self.control(f, PONG, p).await?;
+            }
         }
-        if self.unsent.is_none()
-            && let Close::Queued(c) = self.close
-        {
-            self.close = Close::Sent;
-            self.control(CLOSE, c)?;
+        if matches!(self.close, Close::Queued(_)) {
+            let f = self.lower.alloc().await?;
+            if let Close::Queued(c) = core::mem::replace(&mut self.close, Close::Sent) {
+                self.control(f, CLOSE, c).await?;
+            }
         }
-        Ok(self.unsent.is_none())
+        Ok(())
     }
 
-    /// Send `s`, or keep it to be sent first by the next call.
-    fn send_sealed(&mut self, s: L::Sealed) {
-        debug_assert!(self.unsent.is_none());
-        if let Err(s) = self.lower.try_send(s) {
-            self.unsent = Some(s);
-        }
-    }
-
-    /// One frame to write a payload into, after [`flush`](Self::flush);
-    /// `None` when that could not finish. Panics if a message of another
-    /// kind is still open.
-    pub fn frame(&mut self, kind: Kind) -> Result<Option<OutFrame<'_, L>>, TxError<L::Error>> {
+    /// One frame to write a payload into, after [`flush`](Self::flush).
+    /// Panics if a message of another kind is still open.
+    pub async fn frame(&mut self, kind: Kind) -> Result<OutFrame<'_, L>, TxError<L::Error>> {
         if !matches!(self.close, Close::None) {
             return Err(TxError::Closed);
         }
         if let Some(open) = self.open {
             assert_eq!(open, kind, "a {open:?} message is still open");
         }
-        if !self.flush().map_err(TxError::Lower)? {
-            return Ok(None);
-        }
-        let frame = self.lower.alloc().map_err(TxError::Lower)?;
+        self.flush().await.map_err(TxError::Lower)?;
+        let frame = self.lower.alloc().await.map_err(TxError::Lower)?;
         let (head, room) = self.lower.plain();
         let (reserved, cap) = layout(room, self.rng.is_some());
-        Ok(Some(OutFrame { tx: self, frame, kind, head, reserved, cap }))
+        Ok(OutFrame { tx: self, frame, kind, head, reserved, cap })
     }
 
-    /// Copy `rest` out as the (rest of the) message, one frame per lower-layer
-    /// frame. `Ok(true)`: all of it is committed and the message ended.
-    /// `Ok(false)`: the lower layer refused; `rest` holds what is left, and the
-    /// frames sent so far form an open fragmented message. Call again with the
-    /// same kind once the lower layer has room.
-    pub fn send(&mut self, kind: Kind, rest: &mut &[u8]) -> Result<bool, TxError<L::Error>> {
+    /// Copy `payload` out as one message, one WebSocket frame per lower-layer
+    /// frame.
+    pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), TxError<L::Error>> {
+        let mut rest = payload;
         loop {
-            let Some(mut f) = self.frame(kind)? else {
-                return Ok(false);
-            };
+            let mut f = self.frame(kind).await?;
             let room = f.room();
             let n = rest.len().min(room.len());
             room[..n].copy_from_slice(&rest[..n]);
             let fin = n == rest.len();
-            f.commit(n, fin)?;
-            *rest = &rest[n..];
+            f.commit(n, fin).await?;
+            rest = &rest[n..];
             if fin {
-                return Ok(true);
+                return Ok(());
             }
         }
     }
 
-    fn control(&mut self, op: u8, c: Control) -> Result<(), L::Error> {
-        let mut f = self.lower.alloc()?;
+    async fn control(&mut self, mut f: L::Frame, op: u8, c: Control) -> Result<(), L::Error> {
         let (head, _) = self.lower.plain();
         let p = c.bytes();
         let h = header_len(p.len(), self.rng.is_some());
         f.room_mut()[head + h..head + h + p.len()].copy_from_slice(p);
-        self.finish(f, FIN | op, head, h, p.len())
+        self.finish(f, FIN | op, head, h, p.len()).await
+    }
+
+    /// Keep `s` in the slot, then send it.
+    async fn send_sealed(&mut self, s: L::Sealed, len: usize) -> Result<(), L::Error> {
+        debug_assert!(self.unsent.is_none());
+        self.unsent = Some((s, len));
+        self.drain_unsent().await
+    }
+
+    /// Send the slot's frame once the lower layer has room for it. A refusal
+    /// after room was granted means the transport died, which the next room
+    /// wait reports.
+    async fn drain_unsent(&mut self) -> Result<(), L::Error> {
+        while let Some(&(_, len)) = self.unsent.as_ref() {
+            self.lower.room(len).await?;
+            let (s, len) = self.unsent.take().expect("checked above");
+            if let Err(s) = self.lower.try_send(s) {
+                self.unsent = Some((s, len));
+            }
+        }
+        Ok(())
     }
 
     /// The payload is at `head + reserved`. Moves it down if its header is
-    /// shorter than reserved, writes the header at `head`, masks, seals, sends.
-    fn finish(&mut self, mut f: L::Frame, b0: u8, head: usize, reserved: usize, len: usize) -> Result<(), L::Error> {
+    /// shorter than reserved, writes the header at `head`, masks, waits for
+    /// room, seals, sends.
+    async fn finish(&mut self, mut f: L::Frame, b0: u8, head: usize, reserved: usize, len: usize) -> Result<(), L::Error> {
         debug_assert!(self.unsent.is_none());
         let mask = self.rng.as_mut().map(|r| r.next_u32().to_ne_bytes());
         let h = header_len(len, mask.is_some());
@@ -253,9 +260,9 @@ impl<L: PlainTx> WsTx<L> {
                 *b ^= k[i & 3];
             }
         }
+        self.lower.room(h + len).await?;
         let s = self.lower.seal(f, h + len)?;
-        self.send_sealed(s);
-        Ok(())
+        self.send_sealed(s, h + len).await
     }
 }
 
@@ -277,9 +284,8 @@ impl<L: PlainTx> OutFrame<'_, L> {
     }
 
     /// Send the first `len` bytes of `room()` as one WebSocket frame; `fin`
-    /// ends the message, otherwise later frames continue it. If the lower
-    /// layer refuses the frame it is kept and sent first by the next call.
-    pub fn commit(self, len: usize, fin: bool) -> Result<(), TxError<L::Error>> {
+    /// ends the message, otherwise later frames continue it.
+    pub async fn commit(self, len: usize, fin: bool) -> Result<(), TxError<L::Error>> {
         assert!(len <= self.cap, "commit past the frame room");
         let op = match (self.tx.open, self.kind) {
             (Some(_), _) => CONT,
@@ -288,6 +294,6 @@ impl<L: PlainTx> OutFrame<'_, L> {
         };
         self.tx.open = (!fin).then_some(self.kind);
         let b0 = if fin { FIN | op } else { op };
-        self.tx.finish(self.frame, b0, self.head, self.reserved, len).map_err(TxError::Lower)
+        self.tx.finish(self.frame, b0, self.head, self.reserved, len).await.map_err(TxError::Lower)
     }
 }

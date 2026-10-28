@@ -480,6 +480,8 @@ pub struct WsRx<R: PlainRx> {
     core: Core,
     /// Payload of the last direct message, consumed at the next `recv`.
     pending: usize,
+    /// A complete message found by `has_message_via`, returned by the next `recv`.
+    ready: Option<Located>,
 }
 
 impl<R: PlainRx> WsRx<R> {
@@ -504,6 +506,7 @@ impl<R: PlainRx> WsRx<R> {
                 close: None,
             },
             pending: 0,
+            ready: None,
         }
     }
 
@@ -518,7 +521,10 @@ impl<R: PlainRx> WsRx<R> {
     ///
     /// The message borrows `self`, so no further `recv` runs while it is held.
     pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_, R>>, WsError<R::Error>> {
-        let at = self.next(tx)?;
+        let at = match self.ready.take() {
+            Some(at) => Some(at),
+            None => self.next(tx)?,
+        };
         Ok(at.map(|at| Message { rx: self, at }))
     }
 
@@ -538,6 +544,20 @@ impl<R: PlainRx> WsRx<R> {
         R: PlainRx<Tx = L>,
     {
         self.recv(tx.lower_mut())
+    }
+
+    /// Parse until a message is complete: `Ok(true)` and the next `recv_via`
+    /// returns it without parsing, or `Ok(false)` when a frame must be pushed.
+    /// An async receive loop awaits frames on `false`; it cannot keep the
+    /// message `recv_via` returns across such a loop.
+    pub fn has_message_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<bool, WsError<R::Error>>
+    where
+        R: PlainRx<Tx = L>,
+    {
+        if self.ready.is_none() {
+            self.ready = self.next(tx.lower_mut())?;
+        }
+        Ok(self.ready.is_some())
     }
 
     /// The pong owed for the newest ping, once: a later call returns `None`

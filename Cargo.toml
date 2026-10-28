@@ -69,6 +69,7 @@ sockperf-wire = { path = "conduit/crates/sockperf-wire" }
 stack-stream = { path = "conduit/crates/stack-stream" }
 switch = { path = "switch" }
 switch-macros = { path = "switch-macros" }
+switchnet = { path = "switchnet" }
 tap-echo = { path = "conduit/crates/tap-echo" }
 zhida-buffer = { path = "conduit/crates/zhida-buffer" }
 zhida-dpdk-sys = { path = "conduit/crates/zhida-dpdk-sys" }

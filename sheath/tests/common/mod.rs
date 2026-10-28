@@ -70,6 +70,8 @@ pub struct Wire {
     pub refuse: Rc<Cell<usize>>,
     /// The next `seal` fails.
     pub fail_seal: Rc<Cell<bool>>,
+    /// `shutdown` was called (TCP FIN).
+    pub shut: Rc<Cell<bool>>,
 }
 
 /// Raw TCP sender: frames go out as they are.
@@ -83,11 +85,15 @@ impl PlainTx for TestTx {
     type Sealed = TestFrame;
     type Error = SealFailed;
 
-    fn alloc(&mut self) -> Result<TestFrame, SealFailed> {
+    async fn alloc(&mut self) -> Result<TestFrame, SealFailed> {
         Ok(TestFrame {
             room: vec![0; FRAME_ROOM],
             len: 0,
         })
+    }
+
+    async fn room(&mut self, _: usize) -> Result<(), SealFailed> {
+        Ok(())
     }
 
     fn plain(&self) -> (usize, usize) {
@@ -121,6 +127,10 @@ impl PlainTx for TestTx {
         }
         self.0.sent.borrow_mut().extend_from_slice(f.bytes());
         Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        self.0.shut.set(true);
     }
 }
 
@@ -420,5 +430,13 @@ pub fn assert_received(got: &[Got], records: &[Sent], cuts: &[usize]) {
         } else {
             assert!(matches!(got.place, Place::Elsewhere(_)), "cuts {cuts:?}");
         }
+    }
+}
+
+/// `f`'s output; panics unless it is ready on its first poll (the test lower layer never waits).
+pub fn ready<F: Future>(f: F) -> F::Output {
+    match std::pin::pin!(f).poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(out) => out,
+        std::task::Poll::Pending => panic!("future pending though the test lower layer never waits"),
     }
 }

@@ -1365,10 +1365,21 @@ dependencies = [
 name = "sheath"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
+ "dpdk-smoltcp",
+ "httparse",
+ "libc",
  "rcgen",
  "relay",
  "rustls",
+ "sha1",
+ "switch",
+ "switchnet",
  "tungstenite",
+ "zhida-buffer",
+ "zhida-dpdk-sys",
+ "zhida-test-kit",
+ "zhida-test-support",
 ]
 
 [[package]]

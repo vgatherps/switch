@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
-.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-ws test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
+.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -136,7 +136,7 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 	FUZZ_TIMEOUT=$(FUZZ_TIMEOUT)
 
 help:
-	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-ws test-binance test-memif test-autobahn-check test-packetdrill test-scapy test-known-bugs test bench memif-bench fuzz binance known-bugs test-smoltcp bench-stack soak' \
+	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test-packetdrill test-scapy test-known-bugs test bench memif-bench fuzz binance known-bugs test-smoltcp bench-stack soak' \
 		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-bench-stack docker-soak' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
@@ -192,6 +192,12 @@ test-switchnet: doctor
 	$(TIMEOUT) cargo test --locked -p switchnet -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p switchnet --benches --no-run
 
+# relay (WebSocket) and sheath (TLS), then the wss client over switchnet against a kernel
+# wss server across net_tap (sheath's switchnet feature).
+test-wss: doctor
+	$(TIMEOUT) cargo test --locked -p relay -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p sheath --features switchnet -- --test-threads=1
+
 test-ws: doctor
 	$(TIMEOUT) cargo test --locked -p ws-autobahn -- --test-threads=1
 
@@ -230,7 +236,7 @@ test-scapy:
 test-known-bugs:
 	$(TIMEOUT) sh fuzz/known-bugs-self-test.sh
 
-test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-stream test-switchnet test-ws test-binance test-memif test-autobahn-check test-scapy test-known-bugs test-smoltcp
+test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test-scapy test-known-bugs test-smoltcp
 
 bench: doctor
 	cargo bench --locked -p zhida-buffer --bench buffer

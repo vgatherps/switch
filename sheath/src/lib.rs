@@ -7,6 +7,9 @@
 //!
 //! [`TlsTx`] ([`relay::PlainTx`]) owns the rustls connection and seals each frame's plaintext
 //! into one record in that frame, on top of a lower `PlainTx` that sends frames as they are.
+//!
+//! Feature `switchnet`: module `switchnet`, a wss client (TLS handshake, WebSocket upgrade,
+//! relay messages) over switchnet TCP.
 
 use std::fmt;
 
@@ -14,6 +17,9 @@ use rustls::unbuffered::{EncodeError, EncodeTlsData};
 
 mod rx;
 mod tx;
+
+#[cfg(feature = "switchnet")]
+pub mod switchnet;
 
 pub use rx::TlsRx;
 pub use tx::{Sealed, TlsTx};

@@ -164,8 +164,7 @@ impl Wss {
     }
 
     fn client_send(&mut self, kind: Kind, payload: &[u8]) {
-        let mut rest = payload;
-        assert_eq!(self.tx.send(kind, &mut rest), Ok(true));
+        assert_eq!(ready(self.tx.send(kind, payload)), Ok(()));
     }
 
     /// Answers a ping the client received.
@@ -173,7 +172,7 @@ impl Wss {
         if let Some(p) = self.rx.take_pong() {
             self.tx.pong(p);
         }
-        assert_eq!(self.tx.flush(), Ok(true));
+        assert_eq!(ready(self.tx.flush()), Ok(()));
     }
 }
 
@@ -233,12 +232,11 @@ fn fragments_and_ping() {
     assert_eq!(got, [Got { kind: Kind::Text, payload: want, stamp: w.stamp_of(at) }]);
 
     // The client opens a fragmented message, answers the ping inside it, then finishes it.
-    let mut f = w.tx.frame(Kind::Binary).unwrap().unwrap();
+    let mut f = ready(w.tx.frame(Kind::Binary)).unwrap();
     f.room()[..3].copy_from_slice(b"abc");
-    f.commit(3, false).unwrap();
+    ready(f.commit(3, false)).unwrap();
     w.client_pong();
-    let mut rest: &[u8] = &[7; 3000];
-    assert_eq!(w.tx.send(Kind::Binary, &mut rest), Ok(true));
+    assert_eq!(ready(w.tx.send(Kind::Binary, &[7; 3000])), Ok(()));
     let mut want = b"abc".to_vec();
     want.extend_from_slice(&[7; 3000]);
     assert_eq!(w.server_read(), [TMessage::Pong(b"hb".to_vec().into()), TMessage::Binary(want.into())]);
@@ -262,7 +260,7 @@ fn server_ping_is_answered() {
 fn close_started_by_the_client() {
     let mut w = Wss::new();
     w.tx.close(&[&1000u16.to_be_bytes()[..], b"done"].concat());
-    assert_eq!(w.tx.flush(), Ok(true));
+    assert_eq!(ready(w.tx.flush()), Ok(()));
     let msgs = w.server_read();
     assert!(matches!(&msgs[..], [TMessage::Close(Some(c))] if c.code == CloseCode::Normal && c.reason == "done"));
     // tungstenite wrote its echo while reading; it reaches the client.
@@ -271,7 +269,8 @@ fn close_started_by_the_client() {
     assert!(matches!(w.rx.recv_via(&mut w.tx), Err(WsError::Closed)));
     assert_eq!(w.rx.peer_close(), Some(&[&1000u16.to_be_bytes()[..], b"done"].concat()[..]));
     // Then the client ends the TLS stream.
-    assert_eq!(w.tx.shutdown(), Ok(true));
+    assert_eq!(ready(w.tx.shutdown()), Ok(()));
+    assert!(w.wire.shut.get(), "no FIN after close_notify");
     let (msgs, closed) = w.server_deliver();
     assert!(msgs.is_empty() && closed, "no close_notify");
 }
@@ -289,7 +288,7 @@ fn close_started_by_the_server() {
     assert_eq!(echo, [&1001u16.to_be_bytes()[..], b"bye"].concat());
     // Echo the close, then end the TLS stream with close_notify behind it.
     w.tx.close(&echo);
-    assert_eq!(w.tx.shutdown(), Ok(true));
+    assert_eq!(ready(w.tx.shutdown()), Ok(()));
     let (msgs, closed) = w.server_deliver();
     assert!(closed, "no close_notify");
     assert!(matches!(&msgs[..], [TMessage::Close(Some(c))] if c.code == CloseCode::Away && c.reason == "bye"));
