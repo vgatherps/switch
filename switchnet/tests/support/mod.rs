@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use dpdk_smoltcp::{rx_pool_count, rx_reserve, Eal, StackConfig};
+use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, StackConfig};
 use switch::Runtime;
 use switchnet::{tcp, Instant, IpEndpoint, Net, NetConfig, NetHandle, Stack};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
@@ -74,6 +74,11 @@ impl Mixed {
                 rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
             config.rx_pool.count = rx_pool_count(reserve, config.mtu, tcp)
                 + u32::try_from(MAX_UDP * UDP_QUEUE).unwrap();
+            config.frame_pool.count = frame_pool_count(
+                frame_reserve(config.tx_descriptors, stack_config.tx_pending),
+                config.mtu,
+                std::iter::repeat_n(tcp_config().tx_capacity, MAX_TCP),
+            );
             let port = fixture.open_with(eal, config);
             match Stack::new(port, stack_config, T0) {
                 Ok(stack) => stack,
