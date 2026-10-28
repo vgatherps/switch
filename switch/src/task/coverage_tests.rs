@@ -178,14 +178,7 @@ fn first_switch_use_inside_a_tls_destructor() {
         .get()
         .expect("destructor ran")
         .expect("poll succeeded");
-    assert_eq!(
-        (
-            report.tasks_polled,
-            report.tasks_completed,
-            report.live_tasks
-        ),
-        (2, 1, 1)
-    );
+    assert_eq!((report.tasks_polled, report.live_tasks), (2, 1));
     assert_eq!(polls.load(Ordering::SeqCst), 2);
     assert_eq!(drops.load(Ordering::SeqCst), 2);
 }

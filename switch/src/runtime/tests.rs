@@ -270,13 +270,13 @@ fn woken_and_spawned_tasks_poll_in_the_same_turn() {
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     wake.take().unwrap().wake();
     let woken = runtime.poll(0).unwrap();
-    assert_eq!((woken.tasks_polled, woken.tasks_completed), (1, 1));
+    assert_eq!((woken.tasks_polled, woken.live_tasks), (1, 0));
     assert_eq!(parked_polls.get(), 2);
 
     let spawned_polls = Rc::new(Cell::new(0));
     spawner.spawn(count_task(spawned_polls.clone())).unwrap();
     let spawned = runtime.poll(0).unwrap();
-    assert_eq!((spawned.tasks_polled, spawned.tasks_completed), (1, 1));
+    assert_eq!((spawned.tasks_polled, spawned.live_tasks), (1, 0));
     assert_eq!(spawned_polls.get(), 1);
 }
 

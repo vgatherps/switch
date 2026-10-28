@@ -251,8 +251,7 @@ impl Executor {
                 return false;
             }
             let turn = Self::enter_turn(this);
-            let mut report = BatchReport::default();
-            Self::poll_round(this, &mut report);
+            Self::poll_round(this);
             turn.finish();
             true
         }
@@ -283,23 +282,24 @@ impl Executor {
     /// were made (the budget never cuts a round short).
     ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
-    pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> BatchReport {
+    pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> usize {
         unsafe {
             let this = turn.owner;
-            let mut report = BatchReport::default();
-            while !(*this).incoming.is_empty() && report.polled < POLL_BUDGET {
-                Self::poll_round(this, &mut report);
+            let mut polled = 0;
+            while !(*this).incoming.is_empty() && polled < POLL_BUDGET {
+                polled += Self::poll_round(this);
             }
-            report
+            polled
         }
     }
 
-    /// Poll one snapshot of `incoming`.
+    /// Poll one snapshot of `incoming`; returns the futures polled.
     ///
     /// # Safety
     /// As for [`Self::poll_batch`].
-    unsafe fn poll_round(this: *mut Self, report: &mut BatchReport) {
+    unsafe fn poll_round(this: *mut Self) -> usize {
         unsafe {
+            let mut polled = 0;
             std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
             let batch_len = (*this).run_queue.len();
             let mut cursor = 0;
@@ -316,17 +316,17 @@ impl Executor {
                     Self::reclaim(this, header);
                     continue;
                 }
-                report.polled += 1;
+                polled += 1;
                 // Published for `Sleep`; if the poll unwinds, `TurnGuard` ends the task.
                 (*this).current = header;
                 let result = Meta::poll_fn(TaskHeader::meta(header))(header);
                 (*this).current = std::ptr::null();
                 if result.is_ready() {
-                    report.completed += 1;
                     Self::complete(this, header);
                 }
             }
             (*this).run_queue.clear();
+            polled
         }
     }
 
@@ -343,18 +343,6 @@ impl Executor {
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() | DROP_STARTED);
             Meta::drop_fn(TaskHeader::meta(header))(header);
-        }
-    }
-
-    /// Stable owner-thread pointer; no user code runs while scanning claims.
-    pub(crate) unsafe fn ready_count(this: *mut Self) -> usize {
-        unsafe {
-            (*this)
-                .incoming
-                .iter()
-                .chain(&(*this).deferred)
-                .filter(|&&header| TaskHeader::is_live(header))
-                .count()
         }
     }
 
@@ -440,12 +428,6 @@ impl Executor {
     pub unsafe fn task_count(this: *mut Self) -> usize {
         unsafe { (*this).task_count }
     }
-}
-
-#[derive(Default)]
-pub(crate) struct BatchReport {
-    pub(crate) polled: usize,
-    pub(crate) completed: usize,
 }
 
 pub(crate) struct TurnGuard {
@@ -572,7 +554,6 @@ mod tests {
 
         let report = runtime.poll(0).unwrap();
         assert_eq!(report.tasks_polled, 1);
-        assert_eq!(report.tasks_completed, 1);
         assert_eq!(report.live_tasks, 0);
         assert!(ran.get());
     }
@@ -609,7 +590,6 @@ mod tests {
 
         let report = runtime.poll(0).unwrap();
         assert_eq!(report.tasks_polled, 10);
-        assert_eq!(report.tasks_completed, 10);
         assert_eq!(report.live_tasks, 0);
         assert_eq!(count.get(), 10);
     }

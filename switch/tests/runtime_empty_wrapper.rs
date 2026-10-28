@@ -74,7 +74,6 @@ fn duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_once() {
     let polled_pending = PollReport {
         tasks_polled: 1,
         live_tasks: 1,
-        ..PollReport::default()
     };
     assert_eq!(runtime.poll(0).unwrap(), polled_pending);
     assert!(wake.borrow().is_some());
@@ -87,8 +86,8 @@ fn duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_once() {
     assert_eq!(
         runtime.poll(0).unwrap(),
         PollReport {
+            tasks_polled: 0,
             live_tasks: 1,
-            ..PollReport::default()
         }
     );
     assert_eq!((polls.get(), drops.get()), (2, 0));
@@ -96,9 +95,7 @@ fn duplicate_wakes_poll_parked_sleep_in_same_turn_then_expiry_drops_once() {
         runtime.poll(10).unwrap(),
         PollReport {
             tasks_polled: 1,
-            tasks_completed: 1,
-            timers_expired: 1,
-            ..PollReport::default()
+            live_tasks: 0,
         }
     );
     assert!(wake.borrow().is_none());

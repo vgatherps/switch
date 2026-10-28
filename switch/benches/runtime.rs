@@ -140,8 +140,8 @@ fn runtime_benches(c: &mut Criterion) {
     }
     assert_eq!(rolling.audit.drops.get(), 14);
     let mut pending_control = workload::PendingSleep::new();
-    assert_eq!(workload::counts(pending_control.step()), (1, 0, 0, 1, 1));
-    assert_eq!(pending_control.finish().tasks_completed, 1);
+    assert_eq!(workload::counts(pending_control.step()), (1, 1));
+    assert_eq!(workload::counts(pending_control.finish()), (1, 0));
     assert_eq!(pending_control.drops.get(), 1);
 
     let mut repeated = Runtime::new(0);
@@ -162,7 +162,7 @@ fn runtime_benches(c: &mut Criterion) {
     });
     let polls = pending.polls.get();
     assert!(polls > 1);
-    assert_eq!(pending.finish().tasks_completed, 1);
+    assert_eq!(workload::counts(pending.finish()), (1, 0));
     assert_eq!(pending.drops.get(), 1);
     black_box(polls);
 

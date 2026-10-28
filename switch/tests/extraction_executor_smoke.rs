@@ -45,21 +45,11 @@ fn ready_and_self_waking_pending_task_run_in_two_turns() {
     spawner.spawn(push_around_wake(Rc::clone(&trace))).unwrap();
 
     let first = runtime.poll(0).unwrap();
-    assert_eq!(
-        (first.tasks_polled, first.tasks_completed, first.live_tasks),
-        (2, 1, 1)
-    );
+    assert_eq!((first.tasks_polled, first.live_tasks), (2, 1));
     assert_eq!(*trace.borrow(), ["ready", "pending first poll"]);
 
     let second = runtime.poll(0).unwrap();
-    assert_eq!(
-        (
-            second.tasks_polled,
-            second.tasks_completed,
-            second.live_tasks
-        ),
-        (1, 1, 0)
-    );
+    assert_eq!((second.tasks_polled, second.live_tasks), (1, 0));
     assert_eq!(
         *trace.borrow(),
         ["ready", "pending first poll", "pending second poll"]

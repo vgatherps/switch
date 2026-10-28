@@ -7,22 +7,9 @@ use std::task::{Context, Poll};
 use switch::{Capacity, PollReport, Runtime, Sleep, Spawner};
 
 pub const TICKS: [u64; 6] = [100, 100, 101, 102, 1 << 60, u64::MAX];
-pub const EXPECTED: [(usize, usize, usize, usize, usize); 6] = [
-    (3, 1, 0, 1, 2),
-    (1, 1, 0, 0, 1),
-    (2, 2, 0, 0, 1),
-    (1, 1, 32, 0, 0),
-    (1, 0, 0, 0, 1),
-    (2, 2, 1, 0, 0),
-];
-pub fn counts(r: PollReport) -> (usize, usize, usize, usize, usize) {
-    (
-        r.tasks_polled,
-        r.tasks_completed,
-        r.timers_expired,
-        r.ready_tasks,
-        r.live_tasks,
-    )
+pub const EXPECTED: [(usize, usize); 6] = [(3, 2), (1, 1), (2, 1), (1, 0), (1, 1), (2, 0)];
+pub fn counts(r: PollReport) -> (usize, usize) {
+    (r.tasks_polled, r.live_tasks)
 }
 #[derive(Default)]
 pub struct Audit {

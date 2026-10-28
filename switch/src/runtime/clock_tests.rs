@@ -4,18 +4,9 @@ use crate::task::TaskHeader;
 use crate::timer_registration::Token;
 use std::cell::RefCell;
 
-fn report(
-    polled: usize,
-    completed: usize,
-    expired: usize,
-    ready: usize,
-    live: usize,
-) -> PollReport {
+fn report(polled: usize, live: usize) -> PollReport {
     PollReport {
         tasks_polled: polled,
-        tasks_completed: completed,
-        timers_expired: expired,
-        ready_tasks: ready,
         live_tasks: live,
     }
 }
@@ -95,7 +86,7 @@ fn regressed_time_preserves_clock_timer_and_task_state() {
         task
     }
     runtime.spawner().spawn(timed(task)).unwrap();
-    assert_eq!(runtime.poll(100).unwrap(), report(1, 0, 0, 0, 1));
+    assert_eq!(runtime.poll(100).unwrap(), report(1, 1));
     for now in [99, 0] {
         assert_eq!(
             runtime.poll(now),
@@ -107,8 +98,8 @@ fn regressed_time_preserves_clock_timer_and_task_state() {
         assert_eq!(unsafe { (*core(&runtime)).timers.current_tick() }, 100);
         assert_eq!((polls.get(), drops.get()), (1, 0));
     }
-    assert_eq!(runtime.poll(100).unwrap(), report(0, 0, 0, 0, 1));
-    assert_eq!(runtime.poll(110).unwrap(), report(1, 1, 2, 0, 0));
+    assert_eq!(runtime.poll(100).unwrap(), report(0, 1));
+    assert_eq!(runtime.poll(110).unwrap(), report(1, 0));
     assert_eq!((polls.get(), drops.get()), (2, 1));
 }
 
@@ -147,9 +138,9 @@ fn spawned_task_and_selfwake_run_in_the_next_round_of_the_same_poll() {
     }
     spawner.spawn(parent_task(parent)).unwrap();
     // Round one polls the parent; round two the child and the parent's one claim.
-    assert_eq!(runtime.poll(7).unwrap(), report(3, 2, 0, 0, 0));
+    assert_eq!(runtime.poll(7).unwrap(), report(3, 0));
     assert_eq!(ran.get(), 1);
-    assert_eq!(runtime.poll(7).unwrap(), report(0, 0, 0, 0, 0));
+    assert_eq!(runtime.poll(7).unwrap(), report(0, 0));
 }
 
 #[test]
@@ -170,7 +161,7 @@ fn terminal_selfwake_claim_is_not_ready_and_drains_with_zero_future_polls() {
         ReadyWake(polls)
     }
     runtime.spawner().spawn(ready_wake(polls.clone())).unwrap();
-    assert_eq!(runtime.poll(0).unwrap(), report(1, 1, 0, 0, 0));
+    assert_eq!(runtime.poll(0).unwrap(), report(1, 0));
     assert_eq!(runtime.poll(0).unwrap(), PollReport::default());
     assert_eq!(polls.get(), 1);
     assert_eq!(runtime.poll(0).unwrap(), PollReport::default());

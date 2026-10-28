@@ -42,8 +42,7 @@ mod tests {
         };
         assert_eq!(events.poll_nonblocking(&spawner), 2);
         let first = runtime.poll(0).unwrap();
-        assert_eq!((first.tasks_polled, first.tasks_completed), (2, 2));
-        assert_eq!(first.live_tasks, 0);
+        assert_eq!((first.tasks_polled, first.live_tasks), (2, 0));
         assert_eq!(events.poll_nonblocking(&spawner), 0);
         let second = runtime.poll(0).unwrap();
         assert_eq!(second, switch::PollReport::default());

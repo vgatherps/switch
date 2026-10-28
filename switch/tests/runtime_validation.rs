@@ -179,15 +179,15 @@ fn double_panic_child() {
 fn actual_benchmark_pending_and_burst_controls_finish_exact_work() {
     let mut pending = workload::PendingSleep::new();
     for _ in 0..3 {
-        assert_eq!(workload::counts(pending.step()), (1, 0, 0, 1, 1));
+        assert_eq!(workload::counts(pending.step()), (1, 1));
     }
     assert_eq!(pending.polls.get(), 4);
-    assert_eq!(workload::counts(pending.finish()), (1, 1, 0, 0, 0));
+    assert_eq!(workload::counts(pending.finish()), (1, 0));
     assert_eq!(pending.drops.get(), 1);
     let mut burst = workload::Mixed::new();
     assert_eq!(workload::counts(burst.step(0)), workload::EXPECTED[0]);
     assert_eq!(workload::counts(burst.step(1)), workload::EXPECTED[1]);
-    assert_eq!(workload::counts(burst.step(3)), (1, 1, 32, 0, 0));
+    assert_eq!(workload::counts(burst.step(3)), (1, 0));
     assert_eq!(burst.audit.checksum.get(), 569);
     assert_eq!(burst.audit.drops.get(), 3);
     burst.runtime.shutdown();

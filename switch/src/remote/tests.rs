@@ -100,7 +100,7 @@ fn foreign_wake_polls_the_task_at_the_next_turn() {
     wake_from_thread(&task, 42);
     assert!(mailbox_pending(&task));
     let report = runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.tasks_completed), (1, 1));
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
     assert_eq!((task.polls.get(), task.seen.get()), (2, 42));
     assert!(!mailbox_pending(&task));
 }
@@ -112,7 +112,8 @@ fn owner_thread_wake_is_local() {
     task.value.store(7, Ordering::Relaxed);
     remote(&task).wake();
     assert!(!mailbox_pending(&task));
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
     assert_eq!(task.seen.get(), 7);
 }
 

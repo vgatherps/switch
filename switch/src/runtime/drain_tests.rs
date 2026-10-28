@@ -54,7 +54,7 @@ fn a_ping_pong_within_the_budget_finishes_in_one_poll() {
     }
     let report = runtime.poll(0).unwrap();
     assert_eq!(baton.hops.get(), HOPS);
-    assert_eq!((report.tasks_completed, report.live_tasks), (2, 0));
+    assert_eq!(report.live_tasks, 0);
     assert!(report.tasks_polled < POLL_BUDGET);
 }
 
@@ -74,7 +74,7 @@ fn a_plain_self_wake_runs_again_in_this_poll_up_to_the_budget() {
     runtime.spawner().spawn(spins(polls.clone())).unwrap();
     for turn in 1..=2 {
         let report = runtime.poll(0).unwrap();
-        assert_eq!((report.tasks_polled, report.ready_tasks), (POLL_BUDGET, 1));
+        assert_eq!(report.tasks_polled, POLL_BUDGET);
         assert_eq!(polls.get(), turn * POLL_BUDGET);
     }
 }
@@ -97,12 +97,9 @@ fn a_deferred_wake_runs_on_the_next_poll_not_this_one() {
     let polls = Rc::new(Cell::new(0));
     runtime.spawner().spawn(defers_once(polls.clone())).unwrap();
     let first = runtime.poll(0).unwrap();
-    assert_eq!(
-        (first.tasks_polled, first.ready_tasks, polls.get()),
-        (1, 1, 1)
-    );
+    assert_eq!((first.tasks_polled, polls.get()), (1, 1));
     let second = runtime.poll(0).unwrap();
-    assert_eq!((second.tasks_polled, second.tasks_completed), (1, 1));
+    assert_eq!((second.tasks_polled, second.live_tasks), (1, 0));
 }
 
 #[switch::task]
@@ -158,7 +155,8 @@ fn the_budget_is_checked_between_rounds() {
     }
     // 342 rounds of three reach 1026: the round that crosses 1024 completes.
     let report = runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.ready_tasks), (1026, 3));
+    assert_eq!(report.tasks_polled, 1026);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1026);
 }
 
 #[test]
@@ -187,13 +185,10 @@ fn an_ordinary_wake_of_a_deferred_task_leaves_it_deferred() {
     spawner.spawn(wakes(waker.clone())).unwrap();
     // A yields (deferred); B, later in the same round, wakes A ordinarily.
     let first = runtime.poll(0).unwrap();
-    assert_eq!(
-        (first.tasks_polled, polls.get(), first.ready_tasks),
-        (2, 1, 1)
-    );
+    assert_eq!((first.tasks_polled, polls.get()), (2, 1));
     let second = runtime.poll(0).unwrap();
     assert_eq!(
-        (second.tasks_polled, second.tasks_completed, polls.get()),
-        (1, 1, 2)
+        (second.tasks_polled, second.live_tasks, polls.get()),
+        (1, 0, 2)
     );
 }

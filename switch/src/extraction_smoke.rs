@@ -134,13 +134,6 @@ fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
     assert_eq!(expired, [0]);
     slot.take().expect("first poll stored a wake").wake();
     let report = runtime.poll(0).unwrap();
-    assert_eq!(
-        (
-            report.tasks_polled,
-            report.tasks_completed,
-            report.live_tasks
-        ),
-        (1, 1, 0)
-    );
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
     assert_eq!(polls.get(), 2);
 }

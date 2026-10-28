@@ -80,9 +80,6 @@ fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
             runtime.poll(10).unwrap(),
             PollReport {
                 tasks_polled: 1,
-                tasks_completed: 0,
-                timers_expired: 0,
-                ready_tasks: 1,
                 live_tasks: 1,
             }
         );
@@ -94,9 +91,6 @@ fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
         expired,
         PollReport {
             tasks_polled: 2,
-            tasks_completed: 2,
-            timers_expired: 1,
-            ready_tasks: 0,
             live_tasks: 0,
         }
     );
