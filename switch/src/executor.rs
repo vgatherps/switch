@@ -164,9 +164,9 @@ impl Executor {
             if current & (LIVE | QUEUED) != LIVE {
                 return;
             }
-            // A LIVE slot's executor is alive: cleanup clears LIVE on every slot
-            // before the executor is freed.
-            let this = Meta::executor(TaskHeader::meta(header)).get();
+            // A LIVE slot's executor is alive: cleanup clears every slot's flags
+            // before the executor is freed, after which `Meta::executor` dangles.
+            let this = Meta::executor(TaskHeader::meta(header));
             if (*this).lifecycle != Lifecycle::Open {
                 return;
             }
@@ -336,8 +336,10 @@ impl Executor {
                     Meta::drop_fn(TaskHeader::meta(header))(header);
                 }
             }
+            // Every slot's flags are now clear, so wakes of the leaked blocks
+            // stop at the flags check and never read the freed executor or pool.
             for pool in std::mem::take(&mut (*this).pools) {
-                RuntimePool::retire(pool);
+                RuntimePool::free(pool);
             }
             turn.finish();
         }

@@ -1,21 +1,16 @@
-//! Per-function block pools.
+//! Per-runtime block pools.
 //!
-//! A [`FunctionPool`] exists per (task key, thread) and is never freed. It holds
-//! the `spare` blocks released by runtimes that shut down. A task key is the
-//! `TypeId` of (marker type, future type); `#[switch::task]` makes the marker
-//! unique per function and instantiation. A pool and its blocks only ever hold one
-//! future type. Each runtime that
-//! spawns the function owns one [`RuntimePool`], listed in its executor: a depot
-//! of slot numbers and the blocks those slots live in. Blocks are never freed and
-//! never change function or thread; a block serves one runtime at a time.
+//! Each runtime that spawns a task key owns one [`RuntimePool`], listed in its
+//! executor: a depot of slot numbers and the blocks those slots live in. A task
+//! key is the `TypeId` of (marker type, future type); `#[switch::task]` makes the
+//! marker unique per function and instantiation, so a pool and its blocks only
+//! ever hold one future type. A pool allocates its own blocks, which stay its
+//! own: shutdown frees the pool and leaks its blocks (they are never freed).
 //!
 //! All access is on the owning thread, through raw pointers, with no reference
 //! held across user code (a task factory may spawn recursively).
 
 use std::any::TypeId;
-use std::cell::Cell;
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
 use depot::DynDepot;
 
@@ -23,103 +18,10 @@ use super::block::{BlockSpec, Meta};
 use super::header::TaskHeader;
 use crate::executor::Executor;
 
-thread_local! {
-    /// This thread's function pools. `const` and without `Drop`, so it stays
-    /// accessible while other thread-locals are destroyed: tasks can be spawned and
-    /// runtimes dropped from thread-local destructors. That relies on native TLS;
-    /// supported targets are Linux (glibc) and macOS. Nothing reached after thread
-    /// exit (wakers, blocks) goes through it: blocks are reached from their own
-    /// metadata.
-    static REGISTRY: Cell<*mut Registry> = const { Cell::new(ptr::null_mut()) };
-}
-
-/// One thread's function pools, sorted by key. Never freed.
-struct Registry {
-    pools: Vec<(TypeId, *mut FunctionPool)>,
-    next: *mut Registry,
-}
-
-/// Every registry ever created, so their pools stay reachable after thread exit.
-static REGISTRIES: AtomicPtr<Registry> = AtomicPtr::new(ptr::null_mut());
-
-impl Registry {
-    fn register() -> *mut Self {
-        let registry = Box::into_raw(Box::new(Self {
-            pools: Vec::new(),
-            next: ptr::null_mut(),
-        }));
-        let mut head = REGISTRIES.load(Ordering::Relaxed);
-        loop {
-            unsafe { (*registry).next = head };
-            match REGISTRIES.compare_exchange_weak(
-                head,
-                registry,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => head = current,
-            }
-        }
-        REGISTRY.with(|cell| cell.set(registry));
-        registry
-    }
-}
-
-pub(crate) struct FunctionPool {
-    spare: Vec<*mut Meta>,
-    /// Blocks ever allocated for this function on this thread.
-    blocks: usize,
-}
-
-impl FunctionPool {
-    /// This thread's pool for `key`, created on first use. Only reached when a
-    /// runtime spawns `key` for the first time.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn for_key(key: TypeId) -> *mut FunctionPool {
-        let registry = REGISTRY.with(Cell::get);
-        let found = if registry.is_null() {
-            Err(0)
-        } else {
-            unsafe {
-                (*registry)
-                    .pools
-                    .binary_search_by_key(&key, |&(key, _)| key)
-            }
-        };
-        match found {
-            Ok(index) => unsafe { (&(*registry).pools)[index].1 },
-            Err(index) => {
-                // Issue the thread tag (it may panic once tags are exhausted) before
-                // any pool state exists; block allocation reuses it.
-                crate::waker::this_thread_tag();
-                let registry = if registry.is_null() {
-                    Registry::register()
-                } else {
-                    registry
-                };
-                let pool = Box::into_raw(Box::new(FunctionPool {
-                    spare: Vec::new(),
-                    blocks: 0,
-                }));
-                unsafe { (*registry).pools.insert(index, (key, pool)) };
-                pool
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) unsafe fn spare_count(this: *mut Self) -> usize {
-        unsafe { (*this).spare.len() }
-    }
-}
-
 /// One task function's slots in one runtime. Depot slot `s` (1..=capacity; 0 is
 /// the depot's sentinel) is position `(s - 1) % slots` of block `(s - 1) / slots`.
 pub(crate) struct RuntimePool {
     key: TypeId,
-    function: *mut FunctionPool,
     executor: *mut Executor,
     depot: DynDepot,
     capacity: u32,
@@ -130,10 +32,14 @@ pub(crate) struct RuntimePool {
 }
 
 impl RuntimePool {
+    #[cold]
+    #[inline(never)]
     pub(crate) fn new(executor: *mut Executor, key: TypeId, capacity: u32) -> *mut Self {
+        // Issue the thread tag (it may panic once tags are exhausted) before any
+        // pool or reservation state exists; block allocation reuses it.
+        crate::waker::this_thread_tag();
         Box::into_raw(Box::new(Self {
             key,
-            function: FunctionPool::for_key(key),
             executor,
             depot: DynDepot::new(capacity as usize + 1),
             capacity,
@@ -169,22 +75,10 @@ impl RuntimePool {
 
     unsafe fn grow(this: *mut Self, spec: &BlockSpec) {
         unsafe {
-            let function = (*this).function;
-            let meta = match (*function).spare.pop() {
-                Some(meta) => meta,
-                None => {
-                    let meta = spec.allocate();
-                    // Capacity for every block ever made: shutdown moves them to
-                    // `spare` without allocating.
-                    (*function).blocks += 1;
-                    let spare = &mut (*function).spare;
-                    spare.reserve((*function).blocks - spare.len());
-                    meta
-                }
-            };
-            Meta::block(meta).set((*this).blocks.len() as u32);
-            Meta::executor(meta).set((*this).executor);
-            Meta::pool(meta).set(this);
+            let block = (*this).blocks.len() as u32;
+            // Room first: once allocated, the block is always recorded here.
+            (*this).blocks.reserve(1);
+            let meta = spec.allocate((*this).executor, this, block);
             (*this).blocks.push(meta);
         }
     }
@@ -199,9 +93,8 @@ impl RuntimePool {
             let meta = TaskHeader::meta(header);
             debug_assert_eq!(TaskHeader::reg_head(header).get(), crate::intrusive::NIL);
             TaskHeader::flags(header).set(0);
-            let slot =
-                Meta::block(meta).get() * Meta::slots(meta) + Meta::position(meta, header) + 1;
-            (*Meta::pool(meta).get()).depot.free_slot_unchecked(slot);
+            let slot = Meta::block(meta) * Meta::slots(meta) + Meta::position(meta, header) + 1;
+            (*Meta::pool(meta)).depot.free_slot_unchecked(slot);
         }
     }
 
@@ -232,26 +125,12 @@ impl RuntimePool {
         unsafe { (*this).key }
     }
 
-    /// # Safety
-    /// `this` is live.
-    #[cfg(test)]
-    pub(crate) unsafe fn function_pool(this: *mut Self) -> *mut FunctionPool {
-        unsafe { (*this).function }
-    }
-
-    /// Move every block to the function's `spare` list and free this pool.
+    /// Free this pool; its blocks are leaked, with every slot's flags clear, so
+    /// a stale waker of them does nothing.
     ///
     /// # Safety
     /// Owner thread; every slot is free; nothing refers to `this` afterwards.
-    pub(crate) unsafe fn retire(this: *mut Self) {
-        unsafe {
-            let function = (*this).function;
-            for &meta in &(*this).blocks {
-                Meta::executor(meta).set(ptr::null_mut());
-                Meta::pool(meta).set(ptr::null_mut());
-                (*function).spare.push(meta);
-            }
-            drop(Box::from_raw(this));
-        }
+    pub(crate) unsafe fn free(this: *mut Self) {
+        unsafe { drop(Box::from_raw(this)) }
     }
 }

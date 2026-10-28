@@ -41,6 +41,12 @@
 //! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per
 //! runtime (default: one block's slots, `1 <= N < 2^25`).
 //!
+//! A runtime allocates its own task blocks and keeps them for its whole life;
+//! blocks are never shared between runtimes. Shutdown drops the tasks, and a
+//! dropped runtime's blocks are leaked by design, so a stale waker still points
+//! at valid memory and waking it does nothing. Runtimes are meant to live as long
+//! as the process.
+//!
 //! ```rust
 //! use switch::Runtime;
 //!
