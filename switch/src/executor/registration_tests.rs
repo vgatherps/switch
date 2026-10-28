@@ -43,15 +43,15 @@ impl Registered {
 impl Future for Registered {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let current = unsafe { (*self.owner).current.expect("polled by its executor") };
-        assert_eq!(cx.waker().data(), current.header.cast());
-        self.header = current.header;
+        let current = unsafe { (*self.owner).current };
+        assert_eq!(cx.waker().data(), current.cast());
+        self.header = current;
         if self.tokens.borrow().is_empty() {
             for i in 0..self.registrations {
                 let token = unsafe {
                     (*self.owner)
                         .timers
-                        .register(current.header, current.task, 10 + i as u64)
+                        .register(current, 10 + i as u64)
                         .unwrap()
                 };
                 self.tokens.borrow_mut().push(token);
@@ -145,7 +145,7 @@ fn shutdown_retires_pending_and_expired_before_any_drop_and_survives_drop_panic(
                         let Some(task) = task else {
                             break;
                         };
-                        Executor::wake_task(task);
+                        Executor::wake(task);
                     }
                 }
             }

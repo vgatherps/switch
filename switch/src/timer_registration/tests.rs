@@ -1,35 +1,33 @@
 use super::*;
-use crate::task::slab::TestSlab;
+use crate::task::block::TestBlock;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 struct Fixture {
     store: TimerStore,
-    tasks: Vec<(TaskRef, *const TaskHeader)>,
-    _slab: TestSlab,
+    tasks: Vec<*const TaskHeader>,
+    _block: TestBlock,
 }
 impl Fixture {
     fn new() -> Self {
-        let slab = TestSlab::new();
-        let tasks = (0..3).map(|slot| slab.task(slot)).collect();
+        let block = TestBlock::new();
+        let tasks = (0..3).map(|position| block.task(position)).collect();
         Self {
             store: TimerStore::new(0, 0),
             tasks,
-            _slab: slab,
+            _block: block,
         }
     }
-    fn task(&self, task: usize) -> TaskRef {
-        self.tasks[task].0
+    fn task(&self, task: usize) -> *const TaskHeader {
+        self.tasks[task]
     }
     fn header(&self, task: usize) -> *const TaskHeader {
-        self.tasks[task].1
+        self.tasks[task]
     }
     fn register(&mut self, task: usize, tick: u64) -> Token {
-        let (wake, owner) = self.tasks[task];
-        unsafe { self.store.register(owner, wake, tick).unwrap() }
+        unsafe { self.store.register(self.tasks[task], tick).unwrap() }
     }
     fn refresh(&mut self, token: Token, task: usize) -> bool {
-        let (wake, owner) = self.tasks[task];
-        unsafe { self.store.refresh(token, owner, wake) }
+        unsafe { self.store.refresh(token, self.tasks[task]) }
     }
     fn cancel(&mut self, token: Token) -> bool {
         unsafe { self.store.cancel(token) }

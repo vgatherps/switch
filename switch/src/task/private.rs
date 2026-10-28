@@ -1,78 +1,31 @@
 //! Items used by `#[switch::task]` expansions. Not a stable API.
 
 use std::marker::PhantomData;
-use std::task::RawWakerVTable;
 
-use super::slab::Shape;
-use crate::executor::{self, Executor};
+use super::block::Shape;
+use crate::executor::Executor;
 use crate::task::SpawnToken;
 
 pub use super::pool::Pool;
 
-/// Names the future type of a task function from its function item.
-pub trait TaskFn<Args>: Copy {
-    type Fut: Future<Output = ()> + 'static;
-}
-
-macro_rules! task_fn_impl {
-    ($($arg:ident),*) => {
-        impl<F, Fut, $($arg,)*> TaskFn<($($arg,)*)> for F
-        where
-            F: Copy + FnOnce($($arg,)*) -> Fut,
-            Fut: Future<Output = ()> + 'static,
-        {
-            type Fut = Fut;
-        }
-    };
-}
-
-task_fn_impl!();
-task_fn_impl!(A0);
-task_fn_impl!(A0, A1);
-task_fn_impl!(A0, A1, A2);
-task_fn_impl!(A0, A1, A2, A3);
-task_fn_impl!(A0, A1, A2, A3, A4);
-task_fn_impl!(A0, A1, A2, A3, A4, A5);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7, A8);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
-task_fn_impl!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
-task_fn_impl!(
-    A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14
-);
-task_fn_impl!(
-    A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
-);
-
-/// Identifies one task function: its thread-local pool and its waker vtable.
+/// Identifies one task function: its thread-local pool and its capacity.
 ///
 /// # Safety
-/// `pool()` is private to one task function that always produces one future
-/// type, and `waker()` is that function's [`waker_vtable`].
+/// `pool()` is private to one task function that always produces one future type.
 pub unsafe trait PoolKey: 'static {
     fn pool() -> &'static std::thread::LocalKey<Pool>;
-    fn waker() -> &'static RawWakerVTable;
-}
-
-/// The waker vtable of task function `f` (data = task header pointer).
-pub const fn waker_vtable<K: PoolKey, F: TaskFn<Args>, Args>(_f: F) -> RawWakerVTable {
-    RawWakerVTable::new(
-        crate::waker::clone::<K, F::Fut>,
-        crate::waker::wake::<F::Fut>,
-        crate::waker::wake_by_ref::<F::Fut>,
-        crate::waker::drop::<F::Fut>,
-    )
+    /// Most live tasks of this function per runtime; `None` is one block's slots.
+    const CAPACITY: Option<u32> = None;
 }
 
 mod sealed {
-    pub trait Sealed {
+    pub trait Sealed: Sized {
+        /// Spawn into `executor`; gives the payload back when the function's
+        /// capacity is used up.
+        ///
         /// # Safety
         /// Owner thread; `executor` is live and open.
-        unsafe fn spawn_in(self, executor: *mut crate::executor::Executor);
+        unsafe fn spawn_in(self, executor: *mut crate::executor::Executor) -> Result<(), Self>;
     }
 }
 
@@ -82,7 +35,7 @@ pub trait Task: sealed::Sealed {}
 /// # Safety
 /// Owner thread; `executor` is live and open.
 #[inline]
-pub(crate) unsafe fn spawn_in<T: Task>(payload: T, executor: *mut Executor) {
+pub(crate) unsafe fn spawn_in<T: Task>(payload: T, executor: *mut Executor) -> Result<(), T> {
     unsafe { sealed::Sealed::spawn_in(payload, executor) }
 }
 
@@ -98,14 +51,21 @@ where
     Fut: Future<Output = ()> + 'static,
 {
     #[inline]
-    unsafe fn spawn_in(self, executor: *mut Executor) {
+    unsafe fn spawn_in(self, executor: *mut Executor) -> Result<(), Self> {
+        let capacity = match K::CAPACITY {
+            Some(capacity) => capacity,
+            None => Shape::<Fut>::SLOTS as u32,
+        };
         unsafe {
             let pool = K::pool().with(Pool::get);
-            let spec = Shape::<Fut>::spec(executor::run::<K, Fut>, executor::drop_future::<Fut>);
-            let reservation = Executor::reserve(executor, pool, &spec);
-            let slot = Shape::<Fut>::slot(reservation.meta(), reservation.slot());
-            Shape::<Fut>::future(slot).write((self.build)());
+            let Some(reservation) =
+                Executor::reserve(executor, pool, &Shape::<Fut>::SPEC, capacity)
+            else {
+                return Err(self);
+            };
+            Shape::<Fut>::future(reservation.header()).write((self.build)());
             reservation.commit();
+            Ok(())
         }
     }
 }
@@ -126,6 +86,7 @@ where
 pub unsafe fn token<K: PoolKey, C: FnOnce() -> Fut, Fut: Future<Output = ()> + 'static>(
     c: C,
 ) -> SpawnToken<impl Task> {
+    let () = Shape::<Fut>::FITS;
     SpawnToken::new(Payload::<K, C, Fut> {
         build: c,
         _key: PhantomData,

@@ -10,7 +10,7 @@ use crate::task::SpawnToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capacity {
-    /// Ready-queue reservation; task slots come from per-function slabs.
+    /// Ready-queue reservation; task slots come from per-function task blocks.
     pub tasks: usize,
     /// Timer-registration and expiry-index reservation.
     pub timers: usize,
@@ -21,7 +21,12 @@ pub struct Capacity {
 pub enum RuntimeError {
     Closed,
     Panicked,
-    TimeRegressed { current: u64, supplied: u64 },
+    TimeRegressed {
+        current: u64,
+        supplied: u64,
+    },
+    /// Spawn only: the task function already has its capacity of live tasks here.
+    Exhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,7 +203,7 @@ impl Runtime {
                     break;
                 };
                 timers_expired += 1;
-                Executor::wake_task(task);
+                Executor::wake(task);
             }
             let batch = Executor::poll_batch(&mut turn);
             let report = PollReport {
@@ -261,8 +266,8 @@ impl Spawner {
         Ok(crate::sleep::Sleep::new(deadline, self.control.clone()))
     }
 
-    /// Submit a task function's token. Rejection returns the token before any
-    /// task storage is touched.
+    /// Submit a task function's token. A closed or panicked runtime, or a task
+    /// function with no free slot here (`Exhausted`), returns the token.
     ///
     /// If the task's construction shuts down or drops the runtime, the runtime
     /// closes at once and its tasks, this one included, are dropped when the
@@ -271,8 +276,10 @@ impl Spawner {
         match self.control.open_core() {
             Ok(root) => {
                 let _deferred = DeferredShutdown(&self.control);
-                unsafe { Executor::spawn(root, token) };
-                Ok(())
+                unsafe { Executor::spawn(root, token) }.map_err(|token| SpawnError {
+                    reason: RuntimeError::Exhausted,
+                    token,
+                })
             }
             Err(reason) => Err(SpawnError {
                 reason: reason.into(),

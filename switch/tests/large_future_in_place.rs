@@ -1,7 +1,8 @@
-//! Spawn builds a task's future directly in its slab slot.
+//! Spawn builds a task's future directly in its block slot.
 //!
-//! Size-sensitive measurement: 1 MiB futures are spawned on a thread with a
-//! 128 KiB stack, so any stack copy of a future overflows and aborts. Rust does
+//! Size-sensitive measurement: 60 KiB futures (near the 64 KiB block limit) are
+//! spawned on a thread with a 32 KiB stack, so any stack copy of a future
+//! overflows and aborts. Rust does
 //! not guarantee placement; this holds for optimized builds only (unoptimized
 //! builds copy through the stack), so the check runs under `cargo test --release`.
 #![cfg_attr(debug_assertions, allow(dead_code, unused_imports, unused_macros))]
@@ -13,7 +14,7 @@ mod task_macro;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-const SIZE: usize = 1 << 20;
+const SIZE: usize = 60 * 1024;
 
 struct Huge {
     tag: u8,
@@ -47,9 +48,9 @@ task! {
 
 #[cfg(not(debug_assertions))]
 #[test]
-fn one_mebibyte_futures_spawn_on_a_128_kib_stack() {
+fn sixty_kib_futures_spawn_on_a_32_kib_stack() {
     std::thread::Builder::new()
-        .stack_size(128 * 1024)
+        .stack_size(32 * 1024)
         .spawn(|| {
             let mut runtime = switch::Runtime::new(0);
             let spawner = runtime.spawner();

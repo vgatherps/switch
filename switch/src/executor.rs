@@ -4,21 +4,19 @@
 //! All access is single-threaded, enforced by design.
 //!
 //! All Executor methods take `*mut Self` (not `&mut self`) to avoid Stacked
-//! Borrows violations: slab metadata stores the executor pointer, and
+//! Borrows violations: block metadata stores the executor pointer, and
 //! `&mut self` borrows would invalidate those stored pointers.
 
 use std::mem::ManuallyDrop;
-use std::pin::Pin;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Waker};
 
-use crate::__private::PoolKey;
 use crate::__private::Task;
 use crate::intrusive::NIL;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
-use crate::task::header::{DROP_STARTED, LIVE, QUEUED};
+use crate::task::block::{BlockSpec, Meta};
+use crate::task::header::{DROP_STARTED, LIVE, QUEUED, TAKEN};
 use crate::task::pool::{FunctionPool, RuntimePool};
-use crate::task::slab::{Meta, Shape, SlabSpec, TaskRef};
 use crate::timer_registration::TimerStore;
 
 /// Initial ready-queue reservation.
@@ -31,23 +29,15 @@ pub(crate) enum Lifecycle {
     Closing,
 }
 
-/// The task being polled, for `Sleep` identity checks.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct CurrentTask {
-    pub(crate) header: *const TaskHeader,
-    pub(crate) task: TaskRef,
-    pub(crate) vtable: *const RawWakerVTable,
-}
-
 /// Single-threaded executor.
 ///
 /// Two-vector swap model: wakes go to `incoming`, we iterate `run_queue`,
 /// then swap at end of poll. Simple iteration, no VecDeque overhead.
 pub struct Executor {
-    /// Tasks to poll this cycle.
-    run_queue: Vec<TaskRef>,
+    /// Tasks to poll this cycle, by header.
+    run_queue: Vec<*const TaskHeader>,
     /// Incoming wakes (spawns and wakes during poll).
-    incoming: Vec<TaskRef>,
+    incoming: Vec<*const TaskHeader>,
     /// Number of live tasks.
     task_count: usize,
     /// Slots in use; both queues keep at least this capacity.
@@ -58,7 +48,8 @@ pub struct Executor {
     spawning: usize,
     active: bool,
     lifecycle: Lifecycle,
-    pub(crate) current: Option<CurrentTask>,
+    /// The task being polled, for `Sleep`; null between polls.
+    pub(crate) current: *const TaskHeader,
     pub(crate) timers: TimerStore,
 }
 
@@ -77,7 +68,7 @@ impl Executor {
             spawning: 0,
             active: false,
             lifecycle: Lifecycle::Open,
-            current: None,
+            current: std::ptr::null(),
             timers: TimerStore::new(initial_tick, timers),
         }
     }
@@ -97,43 +88,32 @@ impl Executor {
         unsafe { (*this).lifecycle = Lifecycle::Closing }
     }
 
+    /// Spawn a task; gives the token back when its function's capacity is used up.
+    ///
     /// # Safety
     /// Stable owner-thread pointer; owner remains alive through all task uses.
-    pub unsafe fn spawn<T: Task>(this: *mut Self, token: SpawnToken<T>) {
+    pub unsafe fn spawn<T: Task>(
+        this: *mut Self,
+        token: SpawnToken<T>,
+    ) -> Result<(), SpawnToken<T>> {
         unsafe {
             assert!((*this).lifecycle == Lifecycle::Open, "executor unavailable");
-            crate::task::private::spawn_in(token.into_payload(), this);
-        }
-    }
-
-    /// This executor's pool for `function`, created on its first spawn of it.
-    /// Scans one entry per function this executor has spawned.
-    unsafe fn runtime_pool(this: *mut Self, function: *mut FunctionPool) -> *mut RuntimePool {
-        unsafe {
-            if let Some(pool) = (*this)
-                .pools
-                .iter()
-                .copied()
-                .find(|&pool| RuntimePool::function_pool(pool) == function)
-            {
-                return pool;
-            }
-            let pool = RuntimePool::new(this, function);
-            (*this).pools.push(pool);
-            pool
+            crate::task::private::spawn_in(token.into_payload(), this).map_err(SpawnToken::new)
         }
     }
 
     /// Reserve queue capacity and a slot for one spawn. The slot stays free of
     /// LIVE until [`Reservation::commit`], so stale wakes of it do nothing.
+    /// `None` when the function already has `capacity` slots in use here.
     ///
     /// # Safety
-    /// Owner thread; open executor; `spec` describes `pool`'s function.
+    /// Owner thread; open executor; `spec` describes `function`.
     pub(crate) unsafe fn reserve(
         this: *mut Self,
-        pool: *mut FunctionPool,
-        spec: &SlabSpec,
-    ) -> Reservation {
+        function: *mut FunctionPool,
+        spec: &BlockSpec,
+        capacity: u32,
+    ) -> Option<Reservation> {
         unsafe {
             let needed = (*this)
                 .allocated
@@ -144,24 +124,35 @@ impl Executor {
                     queue.reserve(needed - queue.len());
                 }
             }
-            let pool = Self::runtime_pool(this, pool);
-            let (meta, slot) = RuntimePool::reserve(pool, spec);
+            let pool = match (*this)
+                .pools
+                .iter()
+                .copied()
+                .find(|&pool| RuntimePool::function_pool(pool) == function)
+            {
+                Some(pool) => pool,
+                None => {
+                    let pool = RuntimePool::new(this, function, capacity);
+                    (*this).pools.push(pool);
+                    pool
+                }
+            };
+            let header = RuntimePool::reserve(pool, spec)?;
             (*this).allocated = needed;
             (*this).spawning += 1;
-            Reservation {
+            Some(Reservation {
                 executor: this,
-                meta,
-                slot,
-            }
+                header,
+            })
         }
     }
 
     /// Wake after the owner check: task flags first, then the executor.
     ///
     /// # Safety
-    /// Owner thread; `header` lies in slab `meta`.
+    /// Owner thread; `header` heads a slot of a block.
     #[inline]
-    pub(crate) unsafe fn wake(meta: *mut Meta, header: *const TaskHeader) {
+    pub(crate) unsafe fn wake(header: *const TaskHeader) {
         unsafe {
             let flags = TaskHeader::flags(header);
             let current = flags.get();
@@ -170,24 +161,13 @@ impl Executor {
             }
             // A LIVE slot's executor is alive: cleanup clears LIVE on every slot
             // before the executor is freed.
-            let this = Meta::executor(meta).get();
+            let this = Meta::executor(TaskHeader::meta(header)).get();
             if (*this).lifecycle != Lifecycle::Open {
                 return;
             }
             flags.set(current | QUEUED);
-            (*this)
-                .incoming
-                .push(TaskRef::new(meta, u32::from(TaskHeader::slot(header))));
+            (*this).incoming.push(header);
         }
-    }
-
-    /// Owner-thread wake from type-erased code (timer expiry).
-    ///
-    /// # Safety
-    /// `task`'s slab is assigned to a live executor or the slot is not LIVE.
-    #[inline]
-    pub(crate) unsafe fn wake_task(task: TaskRef) {
-        unsafe { Self::wake(task.meta(), task.header()) }
     }
 
     /// # Safety
@@ -244,17 +224,26 @@ impl Executor {
                 cursor += 1;
                 // Spawn may reserve this Vec, but cannot change this batch's length.
                 // Reload its buffer each iteration; no buffer pointer spans user code.
-                let task = *(*this).run_queue.as_ptr().add(index);
-                let meta = task.meta();
-                let slot = task.slot();
-                match Meta::run_fn(meta)(this, meta, slot, turn) {
-                    Step::Reclaimed => {}
-                    Step::Pending => report.polled += 1,
-                    Step::Completed => {
-                        report.polled += 1;
-                        report.completed += 1;
-                        Self::complete(this, meta, slot);
-                    }
+                let header = *(*this).run_queue.as_ptr().add(index);
+                let flags = TaskHeader::flags(header);
+                let current = flags.get() & !QUEUED;
+                flags.set(current);
+                if current & LIVE == 0 {
+                    Self::reclaim(this, header);
+                    continue;
+                }
+                report.polled += 1;
+                turn.current = header;
+                let result = {
+                    let _current = CurrentGuard::enter(this, header);
+                    let waker = ManuallyDrop::new(Waker::from_raw(crate::waker::raw(header)));
+                    let mut cx = Context::from_waker(&waker);
+                    Meta::poll_fn(TaskHeader::meta(header))(header, &mut cx)
+                };
+                turn.current = std::ptr::null();
+                if result.is_ready() {
+                    report.completed += 1;
+                    Self::complete(this, header);
                 }
             }
             (*this).run_queue.clear();
@@ -262,46 +251,19 @@ impl Executor {
         }
     }
 
-    /// The task returned `Ready`: end it and drop its future (the cold path,
-    /// kept out of the per-function `run`).
+    /// The task returned `Ready`: end it and drop its future (the cold path).
     #[inline(never)]
-    unsafe fn complete(this: *mut Self, meta: *mut Meta, slot: u32) {
+    unsafe fn complete(this: *mut Self, header: *const TaskHeader) {
         unsafe {
-            let header = Meta::header(meta, slot);
             Self::terminal(this, header);
             // A self-wake during the final poll keeps the slot until its entry drains.
             let _slot = SlotGuard {
                 owner: this,
-                meta,
-                slot,
                 header,
             };
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() | DROP_STARTED);
-            Meta::drop_fn(meta)(meta, slot);
-        }
-    }
-
-    /// Claim a queue entry: clear QUEUED, then reclaim a finished slot or mark
-    /// it current. Returns whether to poll.
-    #[inline]
-    unsafe fn begin_poll(
-        this: *mut Self,
-        meta: *mut Meta,
-        slot: u32,
-        header: *const TaskHeader,
-        turn: &mut TurnGuard,
-    ) -> bool {
-        unsafe {
-            let flags = TaskHeader::flags(header);
-            let current = flags.get() & !QUEUED;
-            flags.set(current);
-            if current & LIVE == 0 {
-                Self::reclaim(this, meta, slot);
-                return false;
-            }
-            turn.current = header;
-            true
+            Meta::drop_fn(TaskHeader::meta(header))(header);
         }
     }
 
@@ -311,7 +273,7 @@ impl Executor {
             (*this)
                 .incoming
                 .iter()
-                .filter(|&&task| TaskHeader::is_live(task.header()))
+                .filter(|&&header| TaskHeader::is_live(header))
                 .count()
         }
     }
@@ -331,10 +293,10 @@ impl Executor {
         }
     }
 
-    unsafe fn reclaim(this: *mut Self, meta: *mut Meta, slot: u32) {
+    unsafe fn reclaim(this: *mut Self, header: *const TaskHeader) {
         unsafe {
             (*this).allocated -= 1;
-            RuntimePool::release(meta, slot);
+            RuntimePool::release(header);
         }
     }
 
@@ -351,46 +313,27 @@ impl Executor {
             (*this).lifecycle = Lifecycle::Closing;
             (*this).run_queue.clear();
             (*this).incoming.clear();
-            // No spawn succeeds while Closing, so pools, slabs and alloc bits only shrink.
-            for pool in (0..(*this).pools.len()).rev() {
-                let pool = (&(*this).pools)[pool];
-                for slab in (0..RuntimePool::slab_count(pool)).rev() {
-                    let meta = RuntimePool::slab(pool, slab);
-                    let mut bits = Meta::alloc(meta).get();
-                    while bits != 0 {
-                        let slot = 63 - bits.leading_zeros();
-                        bits &= !(1 << slot);
-                        let header = Meta::header(meta, slot);
-                        Self::terminal(this, header);
-                        let flags = TaskHeader::flags(header);
-                        flags.set(flags.get() & !QUEUED);
-                    }
+            // No spawn succeeds while Closing, and no reservation is open.
+            for header in Self::slots(this) {
+                if TaskHeader::flags(header).get() & TAKEN != 0 {
+                    Self::terminal(this, header);
+                    let flags = TaskHeader::flags(header);
+                    flags.set(flags.get() & !QUEUED);
                 }
             }
-            for pool in (0..(*this).pools.len()).rev() {
-                let pool = (&(*this).pools)[pool];
-                for slab in (0..RuntimePool::slab_count(pool)).rev() {
-                    let meta = RuntimePool::slab(pool, slab);
-                    loop {
-                        let bits = Meta::alloc(meta).get();
-                        if bits == 0 {
-                            break;
-                        }
-                        let slot = 63 - bits.leading_zeros();
-                        let header = Meta::header(meta, slot);
-                        let _slot = SlotGuard {
-                            owner: this,
-                            meta,
-                            slot,
-                            header,
-                        };
-                        let flags = TaskHeader::flags(header);
-                        let current = flags.get();
-                        if current & DROP_STARTED == 0 {
-                            flags.set(current | DROP_STARTED);
-                            Meta::drop_fn(meta)(meta, slot);
-                        }
-                    }
+            for header in Self::slots(this) {
+                let flags = TaskHeader::flags(header);
+                let current = flags.get();
+                if current & TAKEN == 0 {
+                    continue;
+                }
+                let _slot = SlotGuard {
+                    owner: this,
+                    header,
+                };
+                if current & DROP_STARTED == 0 {
+                    flags.set(current | DROP_STARTED);
+                    Meta::drop_fn(TaskHeader::meta(header))(header);
                 }
             }
             for pool in std::mem::take(&mut (*this).pools) {
@@ -400,64 +343,24 @@ impl Executor {
         }
     }
 
+    /// Every slot header of every block this executor holds. Runs no user code.
+    unsafe fn slots(this: *mut Self) -> impl Iterator<Item = *const TaskHeader> {
+        unsafe {
+            (0..(*this).pools.len()).flat_map(move |pool| {
+                let pool = (&(*this).pools)[pool];
+                (0..RuntimePool::block_count(pool)).flat_map(move |block| {
+                    let meta = RuntimePool::block(pool, block);
+                    (0..Meta::slots(meta)).map(move |position| Meta::header(meta, position))
+                })
+            })
+        }
+    }
+
     /// Returns count of active tasks.
     #[inline]
     pub unsafe fn task_count(this: *mut Self) -> usize {
         unsafe { (*this).task_count }
     }
-}
-
-/// Per-function poll of one queue entry: `meta.run` for task function `K`.
-///
-/// # Safety
-/// Called only from `poll_batch` with a queue entry of a slab built for `Fut`.
-pub(crate) unsafe fn run<K: PoolKey, Fut: Future<Output = ()>>(
-    this: *mut Executor,
-    meta: *mut Meta,
-    slot: u32,
-    turn: &mut TurnGuard,
-) -> Step {
-    unsafe {
-        let task_slot = Shape::<Fut>::slot(meta, slot);
-        let header = task_slot.cast::<TaskHeader>().cast_const();
-        if !Executor::begin_poll(this, meta, slot, header, turn) {
-            return Step::Reclaimed;
-        }
-        let vtable = K::waker();
-        let result = {
-            let _current = CurrentGuard::enter(
-                this,
-                CurrentTask {
-                    header,
-                    task: TaskRef::new(meta, slot),
-                    vtable,
-                },
-            );
-            let waker = ManuallyDrop::new(Waker::from_raw(RawWaker::new(header.cast(), vtable)));
-            let mut cx = Context::from_waker(&waker);
-            Pin::new_unchecked(&mut *Shape::<Fut>::future(task_slot)).poll(&mut cx)
-        };
-        turn.current = std::ptr::null();
-        match result {
-            Poll::Pending => Step::Pending,
-            Poll::Ready(()) => Step::Completed,
-        }
-    }
-}
-
-/// `meta.drop` for `Fut`: drop the slot's future in place.
-///
-/// # Safety
-/// The slot holds an initialized future whose drop has been marked started.
-pub(crate) unsafe fn drop_future<Fut>(meta: *mut Meta, slot: u32) {
-    unsafe { std::ptr::drop_in_place(Shape::<Fut>::future(Shape::<Fut>::slot(meta, slot))) }
-}
-
-pub(crate) enum Step {
-    /// A finished slot's queue entry drained; no poll.
-    Reclaimed,
-    Pending,
-    Completed,
 }
 
 #[derive(Default)]
@@ -469,6 +372,7 @@ pub(crate) struct BatchReport {
 
 pub(crate) struct TurnGuard {
     owner: *mut Executor,
+    /// The task being polled; ended if its poll unwinds.
     current: *const TaskHeader,
     finished: bool,
 }
@@ -499,17 +403,12 @@ impl Drop for TurnGuard {
 /// panicking factory), it returns the slot without touching the future.
 pub(crate) struct Reservation {
     executor: *mut Executor,
-    meta: *mut Meta,
-    slot: u32,
+    header: *const TaskHeader,
 }
 
 impl Reservation {
-    pub(crate) fn meta(&self) -> *mut Meta {
-        self.meta
-    }
-
-    pub(crate) fn slot(&self) -> u32 {
-        self.slot
+    pub(crate) fn header(&self) -> *const TaskHeader {
+        self.header
     }
 
     /// The future is written: make the task LIVE and queue it.
@@ -519,14 +418,11 @@ impl Reservation {
     pub(crate) unsafe fn commit(self) {
         let this = ManuallyDrop::new(self);
         unsafe {
-            let header = Meta::header(this.meta, this.slot);
-            TaskHeader::flags(header).set(LIVE | QUEUED);
+            TaskHeader::flags(this.header).set(TAKEN | LIVE | QUEUED);
             let executor = this.executor;
             (*executor).spawning -= 1;
             (*executor).task_count += 1;
-            (*executor)
-                .incoming
-                .push(TaskRef::new(this.meta, this.slot));
+            (*executor).incoming.push(this.header);
         }
     }
 }
@@ -535,7 +431,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         unsafe {
             (*self.executor).spawning -= 1;
-            Executor::reclaim(self.executor, self.meta, self.slot);
+            Executor::reclaim(self.executor, self.header);
         }
     }
 }
@@ -544,8 +440,6 @@ impl Drop for Reservation {
 /// refers to it; that entry reclaims it when drained.
 struct SlotGuard {
     owner: *mut Executor,
-    meta: *mut Meta,
-    slot: u32,
     header: *const TaskHeader,
 }
 
@@ -553,7 +447,7 @@ impl Drop for SlotGuard {
     fn drop(&mut self) {
         unsafe {
             if TaskHeader::flags(self.header).get() & QUEUED == 0 {
-                Executor::reclaim(self.owner, self.meta, self.slot);
+                Executor::reclaim(self.owner, self.header);
             }
         }
     }
@@ -563,8 +457,8 @@ impl Drop for SlotGuard {
 struct CurrentGuard(*mut Executor);
 
 impl CurrentGuard {
-    unsafe fn enter(this: *mut Executor, task: CurrentTask) -> Self {
-        unsafe { (*this).current = Some(task) };
+    unsafe fn enter(this: *mut Executor, header: *const TaskHeader) -> Self {
+        unsafe { (*this).current = header };
         Self(this)
     }
 }
@@ -572,7 +466,7 @@ impl CurrentGuard {
 impl Drop for CurrentGuard {
     fn drop(&mut self) {
         unsafe {
-            (*self.0).current = None;
+            (*self.0).current = std::ptr::null();
         }
     }
 }
@@ -588,7 +482,9 @@ mod tests {
     use super::*;
     use crate::runtime::Runtime;
     use std::cell::Cell;
+    use std::pin::Pin;
     use std::rc::Rc;
+    use std::task::Poll;
 
     struct YieldN(u32);
     impl Future for YieldN {

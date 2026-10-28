@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime::{Runtime, RuntimeError};
-use crate::task::slab::{Meta, Shape};
+use crate::task::TaskHeader;
+use crate::task::block::Meta;
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -317,14 +318,10 @@ fn current_task_clears_pending_ready_and_unwind_before_destructor() {
     impl Future for Inspect {
         type Output = ();
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            // The task function returns `Inspect` itself, so its slab has `Slot<Inspect>` layout.
-            let meta = Shape::<Inspect>::meta_of(cx.waker().data().cast());
+            let meta = TaskHeader::meta(cx.waker().data().cast());
             let root = unsafe { Meta::executor(meta).get() };
             self.root.set(root);
-            assert_eq!(
-                unsafe { (*root).current.unwrap().header.cast::<()>() },
-                cx.waker().data()
-            );
+            assert_eq!(unsafe { (*root).current.cast::<()>() }, cx.waker().data());
             if self.panic {
                 panic!("poll payload");
             }
@@ -339,7 +336,7 @@ fn current_task_clears_pending_ready_and_unwind_before_destructor() {
     }
     impl Drop for Inspect {
         fn drop(&mut self) {
-            assert!(unsafe { (*self.root.get()).current.is_none() });
+            assert!(unsafe { (*self.root.get()).current.is_null() });
             self.drops.set(self.drops.get() + 1);
         }
     }
@@ -364,14 +361,14 @@ fn current_task_clears_pending_ready_and_unwind_before_destructor() {
         if panic {
             let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(0))).unwrap_err();
             assert_eq!(payload.downcast_ref::<&str>(), Some(&"poll payload"));
-            assert!(unsafe { (*root.get()).current.is_none() });
+            assert!(unsafe { (*root.get()).current.is_null() });
             assert_eq!(drops.get(), 0);
             runtime.shutdown();
         } else {
             runtime.poll(0).unwrap();
-            assert!(unsafe { (*root.get()).current.is_none() });
+            assert!(unsafe { (*root.get()).current.is_null() });
             runtime.poll(0).unwrap();
-            assert!(unsafe { (*root.get()).current.is_none() });
+            assert!(unsafe { (*root.get()).current.is_null() });
         }
         assert_eq!(drops.get(), 1);
     }

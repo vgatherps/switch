@@ -1,12 +1,12 @@
-//! Tasks: futures of marked task functions, stored in per-function slabs.
+//! Tasks: futures of marked task functions, stored in 64 KiB task blocks.
 //!
-//! A task is one call of a task function. Its future sits in a slot of a 64-slot
-//! slab and never moves. A `Waker`'s data is the task header pointer.
+//! A task is one call of a task function. Its future sits in a slot of a block
+//! and never moves. A `Waker`'s data is the task header pointer.
 
+pub(crate) mod block;
 pub(crate) mod header;
 pub(crate) mod pool;
 pub mod private;
-pub(crate) mod slab;
 
 #[cfg(test)]
 mod coverage_tests;

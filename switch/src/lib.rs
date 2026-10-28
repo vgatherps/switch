@@ -22,6 +22,8 @@
 //!
 //! A task's `Waker` points at its task header. Waking, cloning and dropping it do not
 //! allocate, but only on the runtime's thread: each of them panics on another thread.
+//! Runtime primitives that park tasks can keep a [`StoredWaker`] instead: a copyable
+//! handle that wakes its task directly, without a call through the waker vtable.
 //!
 //! ## Example
 //!
@@ -37,14 +39,9 @@
 //!         static POOL: switch::__private::Pool = const { switch::__private::Pool::new() };
 //!     }
 //!     struct Key;
-//!     static WAKER: std::task::RawWakerVTable =
-//!         switch::__private::waker_vtable::<Key, _, _>(__hello_task);
 //!     unsafe impl switch::__private::PoolKey for Key {
 //!         fn pool() -> &'static std::thread::LocalKey<switch::__private::Pool> {
 //!             &POOL
-//!         }
-//!         fn waker() -> &'static std::task::RawWakerVTable {
-//!             &WAKER
 //!         }
 //!     }
 //!     // SAFETY: Key's pool is private to this function, which always produces one future type.
@@ -56,6 +53,28 @@
 //! spawner.spawn(hello()).unwrap();
 //!
 //! while runtime.poll(100).unwrap().live_tasks != 0 {}
+//! ```
+//!
+//! A task future that does not fit a 64 KiB task block is a compile-time error:
+//! ```compile_fail
+//! fn too_big() -> switch::SpawnToken<impl switch::__private::Task> {
+//!     async fn __too_big() {
+//!         let bulk = [0u8; 70_000];
+//!         std::future::ready(()).await;
+//!         std::hint::black_box(&bulk);
+//!     }
+//!     thread_local! {
+//!         static POOL: switch::__private::Pool = const { switch::__private::Pool::new() };
+//!     }
+//!     struct Key;
+//!     unsafe impl switch::__private::PoolKey for Key {
+//!         fn pool() -> &'static std::thread::LocalKey<switch::__private::Pool> {
+//!             &POOL
+//!         }
+//!     }
+//!     unsafe { switch::__private::token::<Key, _, _>(move || __too_big()) }
+//! }
+//! drop(too_big());
 //! ```
 //!
 //! ```compile_fail
@@ -121,6 +140,7 @@ mod waker;
 pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
 pub use task::SpawnToken;
+pub use waker::StoredWaker;
 
 #[doc(hidden)]
 pub use task::private as __private;

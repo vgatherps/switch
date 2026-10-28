@@ -1,8 +1,10 @@
 use super::*;
-use crate::task::header::{DROP_STARTED, LIVE, QUEUED};
+use crate::task::header::{DROP_STARTED, LIVE, QUEUED, TAKEN};
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 #[path = "waker_tests.rs"]
 mod waker_tests;
@@ -35,10 +37,10 @@ impl Owner {
         Self(Box::into_raw(Box::new(Executor::new())))
     }
     fn spawn<T: Task>(&self, token: SpawnToken<T>) {
-        unsafe { Executor::spawn(self.0, token) }
+        assert!(unsafe { Executor::spawn(self.0, token) }.is_ok());
     }
     /// The most recently spawned task (spawn pushes onto `incoming`).
-    fn last(&self) -> TaskRef {
+    fn last(&self) -> *const TaskHeader {
         unsafe { *(*self.0).incoming.last().expect("no queued task") }
     }
     fn poll(&self) -> bool {
@@ -60,13 +62,14 @@ impl Drop for Owner {
     }
 }
 
-fn flags(task: TaskRef) -> u8 {
-    unsafe { TaskHeader::flags(task.header()).get() }
+/// Task state flags, without the slot-in-use bit.
+fn flags(task: *const TaskHeader) -> u8 {
+    unsafe { TaskHeader::flags(task).get() & !TAKEN }
 }
 
 /// Owner-thread wake of a task by reference (as timer expiry does).
-fn wake(task: TaskRef) {
-    unsafe { Executor::wake_task(task) }
+fn wake(task: *const TaskHeader) {
+    unsafe { Executor::wake(task) }
 }
 
 task! {
@@ -203,7 +206,7 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
         async fn spawn_many(ptr: *mut Executor, inner: Rc<Cell<usize>>) {
             for _ in 0..(DEFAULT_CAPACITY * 3) {
                 unsafe {
-                    Executor::spawn(ptr, count_task(inner.clone()));
+                    assert!(Executor::spawn(ptr, count_task(inner.clone())).is_ok());
                 }
             }
         }
@@ -305,8 +308,10 @@ fn cleanup_resumes_after_one_destructor_panics() {
     owner.spawn(probe(failing));
     let payload = catch_unwind(AssertUnwindSafe(|| owner.cleanup())).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
-    assert_eq!(owner.counts(), (0, 1));
-    assert_eq!((first_drops.get(), failing_drops.get()), (0, 1));
+    // Drop order is unspecified: the other task is either dropped and freed, or
+    // still allocated for the retry.
+    assert_eq!(failing_drops.get(), 1);
+    assert_eq!(owner.counts(), (0, 1 - first_drops.get()));
     owner.cleanup();
     owner.cleanup();
     assert_eq!(owner.counts(), (0, 0));
@@ -409,7 +414,7 @@ fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
 fn waking_another_current_batch_task_does_not_add_a_next_batch_claim() {
     let owner = Owner::new();
     task! {
-        async fn wake_target(target: Rc<Cell<Option<TaskRef>>>) {
+        async fn wake_target(target: Rc<Cell<Option<*const TaskHeader>>>) {
             wake(target.get().unwrap());
         }
     }
@@ -449,7 +454,7 @@ fn ready_destructor_spawns_and_wakes_a_current_batch_task_during_reclamation() {
 fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
     struct SpawnDuringDrop {
         owner: *mut Executor,
-        target: Rc<Cell<Option<TaskRef>>>,
+        target: Rc<Cell<Option<*const TaskHeader>>>,
         completed: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
         self_wake: bool,
@@ -468,7 +473,9 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
             self.drops.set(self.drops.get() + 1);
             for _ in 0..(DEFAULT_CAPACITY * 3) {
                 unsafe {
-                    Executor::spawn(self.owner, count_task(self.completed.clone()));
+                    assert!(
+                        Executor::spawn(self.owner, count_task(self.completed.clone())).is_ok()
+                    );
                 }
             }
             // Target slot remains live whether idle or in this batch.
@@ -597,7 +604,7 @@ fn middle_batch_panic_allows_only_cleanup_with_exact_drops() {
 fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
     struct Ordered {
         id: usize,
-        targets: Rc<[Cell<Option<TaskRef>>; 3]>,
+        targets: Rc<[Cell<Option<*const TaskHeader>>; 3]>,
         trace: Rc<std::cell::RefCell<Vec<usize>>>,
         drops: Rc<[Cell<usize>; 3]>,
         first_poll: bool,
@@ -723,7 +730,7 @@ task! {
 }
 
 struct RejectedWakeOnDrop {
-    target: TaskRef,
+    target: *const TaskHeader,
     drops: Rc<Cell<usize>>,
 }
 impl Future for RejectedWakeOnDrop {
@@ -791,7 +798,7 @@ fn panicked_lifecycle_rejects_work_and_destructor_wake_to_idle_target() {
 fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
     struct DuringCleanup {
         owner: *mut Executor,
-        target: TaskRef,
+        target: *const TaskHeader,
         drops: Rc<Cell<usize>>,
         rejected_drops: Rc<Cell<usize>>,
     }
@@ -846,11 +853,10 @@ fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
     }));
     let payload = catch_unwind(AssertUnwindSafe(|| owner.cleanup())).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
-    assert_eq!(owner.counts(), (0, 1));
-    assert_eq!(
-        (drops.get(), rejected_drops.get(), target_drops.get()),
-        (1, 1, 0)
-    );
+    // Drop order is unspecified: the target is either dropped and freed, or
+    // still allocated for the retry.
+    assert_eq!((drops.get(), rejected_drops.get()), (1, 1));
+    assert_eq!(owner.counts(), (0, 1 - target_drops.get()));
     unsafe {
         assert_eq!((*owner.0).lifecycle, Lifecycle::Closing);
         assert!(!(*owner.0).active);

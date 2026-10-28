@@ -45,9 +45,8 @@ impl Future for TimedTask {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.polls.set(self.polls.get() + 1);
-        let current = unsafe { (*self.root).current.expect("polled by its executor") };
-        assert_eq!(cx.waker().data(), current.header.cast());
-        let header = current.header;
+        let header = unsafe { (*self.root).current };
+        assert_eq!(cx.waker().data(), header.cast());
         self.header.set(header);
         unsafe {
             if (*self.root).timers.current_tick() >= self.deadline {
@@ -55,10 +54,7 @@ impl Future for TimedTask {
             }
             if self.tokens.borrow().is_empty() {
                 for _ in 0..self.registrations {
-                    let token = (*self.root)
-                        .timers
-                        .register(header, current.task, self.deadline)
-                        .unwrap();
+                    let token = (*self.root).timers.register(header, self.deadline).unwrap();
                     self.tokens.borrow_mut().push(token);
                 }
             }

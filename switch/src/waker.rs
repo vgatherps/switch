@@ -1,9 +1,9 @@
-//! Thread tags and per-function task wakers.
+//! Thread tags, the task waker, and `StoredWaker`.
 //!
-//! A task `Waker`'s data is its task header pointer and its vtable is the task
-//! function's `WAKER` static, so all wakers of one slot compare equal under
-//! `will_wake`. Every operation first checks the slab's owner thread tag and
-//! panics on a foreign thread; only then does it touch the task or runtime.
+//! Every task `Waker` shares one vtable; its data is the task header pointer, so
+//! all wakers of one slot compare equal under `will_wake`. Every operation first
+//! checks the block's owner thread tag and panics on a foreign thread; only then
+//! does it touch the task or runtime.
 //!
 //! Ordinary Wakers remain shareable; local handles have stricter trait bounds.
 //! ```
@@ -12,13 +12,14 @@
 //! ```
 
 use std::cell::Cell;
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::RawWaker;
+use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
-use crate::__private::PoolKey;
 use crate::executor::Executor;
 use crate::task::TaskHeader;
-use crate::task::slab::{Meta, Shape};
+use crate::task::block::Meta;
 
 thread_local! {
     static THREAD_TAG: Cell<u16> = const { Cell::new(0) };
@@ -59,34 +60,106 @@ fn foreign_thread() -> ! {
     panic!("waker used on foreign thread")
 }
 
-/// Mask `header` to its slab and reject a foreign thread before any other access.
+/// Reject a foreign thread before any other access to the task.
+///
+/// # Safety
+/// `header` heads a slot of a block (blocks are never freed).
 #[inline(always)]
-unsafe fn checked_meta<Fut>(header: *const ()) -> *mut Meta {
-    let meta = Shape::<Fut>::meta_of(header.cast());
-    if unsafe { Meta::owner(meta) } != THREAD_TAG.with(Cell::get) {
+unsafe fn check_owner(header: *const TaskHeader) {
+    if unsafe { Meta::owner(TaskHeader::meta(header)) } != THREAD_TAG.with(Cell::get) {
         foreign_thread();
     }
-    meta
 }
 
-pub(crate) unsafe fn clone<K: PoolKey, Fut>(header: *const ()) -> RawWaker {
-    unsafe { checked_meta::<Fut>(header) };
-    RawWaker::new(header, K::waker())
+pub(crate) static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+/// The raw waker of the task headed by `header`.
+#[inline(always)]
+pub(crate) fn raw(header: *const TaskHeader) -> RawWaker {
+    RawWaker::new(header.cast(), &VTABLE)
 }
 
-pub(crate) unsafe fn wake<Fut>(header: *const ()) {
-    unsafe { wake_by_ref::<Fut>(header) }
+unsafe fn clone(header: *const ()) -> RawWaker {
+    unsafe { check_owner(header.cast()) };
+    raw(header.cast())
 }
 
-pub(crate) unsafe fn wake_by_ref<Fut>(header: *const ()) {
+unsafe fn wake(header: *const ()) {
+    unsafe { wake_by_ref(header) }
+}
+
+unsafe fn wake_by_ref(header: *const ()) {
     unsafe {
-        let meta = checked_meta::<Fut>(header);
-        Executor::wake(meta, header.cast::<TaskHeader>());
+        check_owner(header.cast());
+        Executor::wake(header.cast());
     }
 }
 
-pub(crate) unsafe fn drop<Fut>(header: *const ()) {
-    unsafe { checked_meta::<Fut>(header) };
+unsafe fn drop(header: *const ()) {
+    unsafe { check_owner(header.cast()) };
+}
+
+/// A copyable wake handle for runtime primitives that park tasks. `wake`
+/// enqueues the task directly, with no call through a waker vtable.
+///
+/// Like a stale `Waker`, a stale `StoredWaker` is harmless: when its slot is free
+/// its wake does nothing, and when the slot holds a newer task that task gets one
+/// more poll.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<switch::StoredWaker>();
+/// ```
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<switch::StoredWaker>();
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredWaker {
+    header: NonNull<TaskHeader>,
+    _local: PhantomData<*const ()>,
+}
+
+impl StoredWaker {
+    /// The task whose waker `cx` carries.
+    ///
+    /// Safe because: a waker with switch's vtable was made by switch (a forged
+    /// one needs `Waker::from_raw`, whose contract the forger breaks), so its
+    /// data heads a slot of a task block. Blocks are never freed, so the header
+    /// and its block metadata stay readable for the life of the process, whatever
+    /// happens to the task or runtime. The owner check pins the handle to the
+    /// block's thread, and being `!Send`/`!Sync` it never leaves; so every later
+    /// `wake` runs on the only thread that writes the slot's flags and runtime.
+    /// `wake` reads the runtime only when the slot is LIVE, and a LIVE slot's
+    /// runtime is alive.
+    ///
+    /// # Panics
+    /// If `cx`'s waker is not a switch task waker, or on a foreign thread.
+    pub fn new(cx: &Context<'_>) -> Self {
+        let waker = cx.waker();
+        assert!(
+            std::ptr::eq(waker.vtable(), &VTABLE),
+            "StoredWaker needs a switch task waker"
+        );
+        let header = waker.data().cast::<TaskHeader>();
+        unsafe { check_owner(header) };
+        Self {
+            header: NonNull::new(header.cast_mut()).expect("switch waker data is a header"),
+            _local: PhantomData,
+        }
+    }
+
+    /// Wake the task.
+    #[inline]
+    pub fn wake(self) {
+        unsafe { Executor::wake(self.header.as_ptr()) }
+    }
+}
+
+/// Whether `waker` is the waker of the task headed by `header`.
+#[inline]
+pub(crate) fn is_task_waker(waker: &Waker, header: *const TaskHeader) -> bool {
+    std::ptr::eq(waker.vtable(), &VTABLE) && waker.data() == header.cast()
 }
 
 #[cfg(test)]

@@ -208,32 +208,63 @@ fn bench_waker_clone(c: &mut Criterion) {
     });
 }
 
-/// The 65th spawn into a runtime whose first slab is full. Slabs are never
-/// freed, so after warm-up the new slab comes from the function's spare list.
-fn bench_spawn_new_slab(c: &mut Criterion) {
-    c.bench_function("spawn_new_slab", |b| {
+/// Parks forever like `Publish`; two fit a 64 KiB task block.
+struct Wide(Publish, #[allow(dead_code)] [u8; 30_000]);
+impl Future for Wide {
+    type Output = ();
+    #[inline]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+task! {
+    capacity = 128;
+    fn wide(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
+        Wide(Publish(slot), [0; 30_000])
+    }
+}
+
+/// Spawn `n` parked `wide` tasks, poll them once, and return their wakers.
+fn wide_wakers(runtime: &mut Runtime, n: usize) -> Vec<Waker> {
+    let spawner = runtime.spawner();
+    let slots: Vec<_> = (0..n).map(|_| Rc::new(RefCell::new(None))).collect();
+    for slot in &slots {
+        spawner.spawn(wide(slot.clone())).unwrap();
+    }
+    runtime.poll(0).unwrap();
+    slots
+        .iter()
+        .map(|slot| slot.borrow().clone().unwrap())
+        .collect()
+}
+
+/// The 3rd spawn into a runtime whose first block is full. Blocks are never
+/// freed, so after warm-up the new block comes from the function's spare list.
+fn bench_spawn_new_block(c: &mut Criterion) {
+    c.bench_function("spawn_new_block", |b| {
         b.iter_batched_ref(
             || {
                 let mut runtime = Runtime::new(0);
-                drop(parked_wakers(&mut runtime, 64));
+                drop(wide_wakers(&mut runtime, 2));
                 let spawner = runtime.spawner();
                 let slot = Rc::new(RefCell::new(None));
                 (runtime, spawner, slot)
             },
-            |(_, spawner, slot)| spawner.spawn(publish(slot.clone())).unwrap(),
+            |(_, spawner, slot)| spawner.spawn(wide(slot.clone())).unwrap(),
             BatchSize::SmallInput,
         )
     });
 }
 
-/// Wake and poll 64 tasks that sit in 64 different slabs.
+/// Wake and poll 64 tasks that sit in 64 different blocks.
 fn bench_wake_spread(c: &mut Criterion) {
     let mut runtime = Runtime::new(0);
-    let wakers: Vec<_> = parked_wakers(&mut runtime, 64 * 64)
+    let wakers: Vec<_> = wide_wakers(&mut runtime, 128)
         .into_iter()
-        .step_by(64)
+        .step_by(2)
         .collect();
-    c.bench_function("wake_spread_64_slabs", |b| {
+    c.bench_function("wake_spread_64_blocks", |b| {
         b.iter(|| {
             for waker in &wakers {
                 waker.wake_by_ref();
@@ -253,7 +284,7 @@ criterion_group!(
     bench_yield_chain,
     bench_pure_yield,
     bench_waker_clone,
-    bench_spawn_new_slab,
+    bench_spawn_new_block,
     bench_wake_spread,
 );
 

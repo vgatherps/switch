@@ -18,9 +18,9 @@ use switch::{Capacity, Runtime};
 #[global_allocator]
 static ALLOCATOR: CountingGlobalAlloc = CountingGlobalAlloc;
 
-const BULK: usize = 1024;
-/// Lower bound of one slab of `Bulky` tasks: 64 slots of more than `BULK` bytes.
-const SLAB_BYTES: usize = 64 * BULK;
+/// Big enough that a 64 KiB task block holds 3 `Bulky` tasks.
+const BULK: usize = 20_000;
+const BLOCK_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 struct State {
@@ -53,6 +53,7 @@ impl Future for Bulky {
 }
 
 task! {
+    capacity = 4;
     fn bulky(state: Rc<State>) -> impl Future<Output = ()> {
         Bulky { state, _bulk: [0; BULK] }
     }
@@ -72,8 +73,8 @@ fn runtime() -> Runtime {
 fn steady_state_task_operations_do_not_allocate() {
     let mut runtime = runtime();
     let spawner = runtime.spawner();
-    // Warm-up: reach a peak of 64 live tasks, then finish them all.
-    let warm: Vec<_> = (0..64).map(|_| Rc::new(State::default())).collect();
+    // Warm-up: reach the capacity of 4 live tasks, then finish them all.
+    let warm: Vec<_> = (0..4).map(|_| Rc::new(State::default())).collect();
     for state in &warm {
         spawner.spawn(bulky(state.clone())).unwrap();
     }
@@ -82,7 +83,7 @@ fn steady_state_task_operations_do_not_allocate() {
         state.done.set(true);
         state.waker.borrow().as_ref().unwrap().wake_by_ref();
     }
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 64);
+    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 4);
 
     let state = Rc::new(State::default());
     let (token, make) = measure(|| bulky(state.clone()));
@@ -119,28 +120,28 @@ fn steady_state_task_operations_do_not_allocate() {
 }
 
 #[test]
-fn growth_allocates_only_slabs_vectors_and_runtime_pools() {
+fn growth_allocates_only_blocks_vectors_and_runtime_pools() {
     let mut first = runtime();
     let spawner = first.spawner();
-    let states: Vec<_> = (0..65).map(|_| Rc::new(State::default())).collect();
-    // First spawn on this thread: function pool, runtime pool, one slab.
+    let states: Vec<_> = (0..4).map(|_| Rc::new(State::default())).collect();
+    // First spawn on this thread: function pool, runtime pool, depot, one block.
     let (_, initial) = measure(|| spawner.spawn(bulky(states[0].clone())).unwrap());
-    assert!(initial.allocated_bytes >= SLAB_BYTES, "{initial:?}");
-    // The rest of the slab allocates nothing.
-    for state in &states[1..64] {
+    assert!(initial.allocated_bytes >= BLOCK_BYTES, "{initial:?}");
+    // The rest of the block allocates nothing.
+    for state in &states[1..3] {
         let (_, fill) = measure(|| spawner.spawn(bulky(state.clone())).unwrap());
         no_alloc(fill);
     }
-    // The 65th task needs a new slab: the slab plus bookkeeping Vec growth.
-    let (_, grow) = measure(|| spawner.spawn(bulky(states[64].clone())).unwrap());
-    assert!(grow.allocated_bytes >= SLAB_BYTES, "{grow:?}");
-    assert!(grow.allocated_bytes < 2 * SLAB_BYTES, "{grow:?}");
+    // The 4th task needs a new block: the block plus bookkeeping Vec growth.
+    let (_, grow) = measure(|| spawner.spawn(bulky(states[3].clone())).unwrap());
+    assert!(grow.allocated_bytes >= BLOCK_BYTES, "{grow:?}");
+    assert!(grow.allocated_bytes < 2 * BLOCK_BYTES, "{grow:?}");
     first.poll(0).unwrap();
     let (_, shutdown) = measure(|| first.shutdown());
     no_alloc(shutdown);
 
-    // A later runtime reuses the spare slabs; its first spawn allocates only its
-    // runtime pool and vectors, never a slab.
+    // A later runtime reuses the spare blocks; its first spawn allocates only its
+    // runtime pool, depot and vectors, never a block.
     let mut second = runtime();
     let spawner = second.spawner();
     let state = Rc::new(State::default());

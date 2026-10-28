@@ -1,4 +1,4 @@
-//! Cross-thread waker ops, pool growth and ring order, pool registration,
+//! Cross-thread waker ops, pool registration,
 //! TLS-destructor first use, factory reentry and panicked-runtime wakes.
 
 use std::cell::{Cell, RefCell};
@@ -12,38 +12,12 @@ use std::sync::{Arc, Barrier, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use super::SpawnToken;
 use super::TaskHeader;
 use super::header::{LIVE, QUEUED};
-use super::pool::FunctionPool;
-use super::private::Task;
-use super::slab::{Meta, SLOTS};
 use super::tests::{
-    Parked, State, finish, function_pool, header, index, meta, parked, spawn_parked, state, waker,
+    Parked, State, finish, function_pool, header, meta, parked, spawn_parked, state, waker,
 };
 use crate::runtime::{PollReport, Runtime, RuntimeError};
-
-// Own pool, so its slab counts start from zero on the test thread.
-task! {
-    fn parked_wide(state: Rc<State>) -> impl Future<Output = ()> {
-        Parked(state)
-    }
-}
-
-/// Spawn `n` tasks of `make` and poll them once.
-fn spawn_with<T: Task>(
-    runtime: &mut Runtime,
-    n: usize,
-    make: impl Fn(Rc<State>) -> SpawnToken<T>,
-) -> Vec<Rc<State>> {
-    let spawner = runtime.spawner();
-    let states: Vec<_> = (0..n).map(|_| state()).collect();
-    for state in &states {
-        spawner.spawn(make(state.clone())).unwrap();
-    }
-    runtime.poll(0).unwrap();
-    states
-}
 
 fn expect_foreign_panic(op: impl FnOnce()) {
     let payload = catch_unwind(AssertUnwindSafe(op)).unwrap_err();
@@ -69,7 +43,7 @@ fn foreign_ops_overlap_completion_reuse_shutdown_and_spare_reuse() {
     let mut runtime = Runtime::new(0);
     let first = spawn_parked(&mut runtime, 1).remove(0);
     let target = waker(&first);
-    let slab = meta(&target);
+    let block = meta(&target);
     // Cloned here on the owner thread; a foreign thread drops only the clones
     // whose drop is the operation under test.
     let kits: Vec<(ManuallyDrop<Waker>, Vec<ManuallyDrop<Waker>>)> = (0..FOREIGN)
@@ -118,63 +92,13 @@ fn foreign_ops_overlap_completion_reuse_shutdown_and_spare_reuse() {
         barrier.wait();
         let mut later = Runtime::new(0);
         let lent = spawn_parked(&mut later, 1).remove(0);
-        assert_eq!(meta(&waker(&lent)), slab);
+        assert_eq!(meta(&waker(&lent)), block);
         assert_eq!(later.poll(0).unwrap().tasks_polled, 0);
         drop(later);
         assert_eq!((lent.polls.get(), lent.drops.get()), (1, 1));
         barrier.wait();
     });
     assert_eq!((first.polls.get(), first.drops.get()), (2, 1));
-}
-
-#[test]
-#[cfg_attr(miri, ignore = "large-capacity test")]
-fn growth_past_first_has_free_word_then_ring_then_lowest_across_words() {
-    let tasks = 64 * SLOTS + 1;
-    let mut runtime = Runtime::new(0);
-    let states = spawn_with(&mut runtime, tasks, parked_wide);
-    let fp = function_pool(&waker(&states[0]));
-    for (i, state) in states.iter().enumerate() {
-        assert_eq!(index(&waker(state)), i as u32);
-    }
-    let slab_no = |i: usize| unsafe { Meta::slab_no(meta(&waker(&states[i]))).get() };
-    assert_eq!((slab_no(4095), slab_no(4096)), (63, 64));
-    assert_eq!(unsafe { FunctionPool::spare_count(fp) }, 0);
-    // The first five frees are evicted from the 16-entry ring by the next 16.
-    let evicted = [4096, 4095, 4000, 130, 7];
-    let ringed = [
-        3, 64, 65, 127, 128, 1000, 2047, 2048, 3000, 3071, 3072, 4031, 4032, 4094, 1, 2,
-    ];
-    for &i in evicted.iter().chain(&ringed) {
-        states[i].done.set(true);
-        waker(&states[i]).wake_by_ref();
-    }
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 21);
-    let refill = spawn_with(&mut runtime, 22, parked_wide);
-    let got: Vec<u32> = refill.iter().map(|s| index(&waker(s))).collect();
-    let mut expected: Vec<u32> = ringed.iter().rev().map(|&i| i as u32).collect();
-    // Lowest free: slab 63 (has_free word 0), then slab 64 (word 1) slots 0 and 1.
-    expected.extend([7, 130, 4000, 4095, 4096, 4097]);
-    assert_eq!(got, expected);
-    drop(runtime);
-    assert!(states.iter().chain(&refill).all(|s| s.drops.get() == 1));
-    assert_eq!(unsafe { FunctionPool::spare_count(fp) }, 65);
-}
-
-#[test]
-fn ring_hands_out_newest_16_frees_then_lowest_indices() {
-    let mut runtime = Runtime::new(0);
-    let states = spawn_parked(&mut runtime, 3 * SLOTS);
-    for state in &states[..3 * SLOTS - 1] {
-        state.done.set(true);
-        waker(state).wake_by_ref();
-    }
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 3 * SLOTS - 1);
-    let refill = spawn_parked(&mut runtime, SLOTS);
-    let got: Vec<u32> = refill.iter().map(|s| index(&waker(s))).collect();
-    let mut expected: Vec<u32> = (175..=190).rev().collect();
-    expected.extend(0..48);
-    assert_eq!(got, expected);
 }
 
 #[test]
@@ -363,7 +287,7 @@ fn factory_polls_the_runtime_between_reserve_and_commit() {
     assert_eq!((earlier.polls.get(), new.polls.get()), (2, 1));
     // Same function, same pool: the reserved slot is not the one polled inside.
     assert_eq!(function_pool(&waker(&new)), function_pool(&waker(&earlier)));
-    assert_eq!((index(&waker(&earlier)), index(&waker(&new))), (0, 1));
+    assert_ne!(header(&waker(&earlier)), header(&waker(&new)));
     drop(runtime);
     assert_eq!((earlier.drops.get(), new.drops.get()), (1, 1));
 }

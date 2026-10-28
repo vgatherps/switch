@@ -79,22 +79,16 @@ impl Future for Sleep {
             if this.deadline <= (*root).timers.current_tick() {
                 return this.complete(Ok(()));
             }
-            let waker = cx.waker();
-            let Some(task) = (*root).current.filter(|current| {
-                waker.data() == current.header.cast()
-                    && std::ptr::eq(waker.vtable(), current.vtable)
-            }) else {
+            let task = (*root).current;
+            if task.is_null() || !crate::waker::is_task_waker(cx.waker(), task) {
                 return this.complete(Err(SleepError::WrongRuntime));
-            };
+            }
             if let Some(token) = this.token
-                && (*root).timers.refresh(token, task.header, task.task)
+                && (*root).timers.refresh(token, task)
             {
                 return Poll::Pending;
             }
-            match (*root)
-                .timers
-                .register(task.header, task.task, this.deadline)
-            {
+            match (*root).timers.register(task, this.deadline) {
                 Ok(token) => {
                     this.token = Some(token);
                     Poll::Pending

@@ -5,8 +5,8 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-fn slab_owner(task: TaskRef) -> u16 {
-    unsafe { Meta::owner(task.meta()) }
+fn block_owner(task: *const TaskHeader) -> u16 {
+    unsafe { Meta::owner(TaskHeader::meta(task)) }
 }
 
 task! {
@@ -45,8 +45,7 @@ task! {
             unsafe {
                 assert!((*ptr).incoming.is_empty());
                 assert_eq!(((*ptr).task_count, (*ptr).allocated), (1, 1));
-                let task = (*ptr).current.unwrap().task;
-                assert_eq!(TaskHeader::flags(task.header()).get(), LIVE);
+                assert_eq!(TaskHeader::flags((*ptr).current).get() & !TAKEN, LIVE);
             }
             Poll::Ready(())
         })
@@ -72,14 +71,17 @@ fn runtimes_on_one_thread_share_a_nonzero_tag_and_other_threads_differ() {
     let second = Owner::new();
     first.spawn(idle());
     second.spawn(idle());
-    let first_tag = slab_owner(first.last());
+    let first_tag = block_owner(first.last());
     assert_ne!(first_tag, 0);
-    assert_eq!(first_tag, slab_owner(second.last()));
-    assert_ne!(first.last().meta(), second.last().meta());
+    assert_eq!(first_tag, block_owner(second.last()));
+    assert_ne!(
+        TaskHeader::meta(first.last()),
+        TaskHeader::meta(second.last())
+    );
     let other_tag = std::thread::spawn(|| {
         let owner = Owner::new();
         owner.spawn(idle());
-        slab_owner(owner.last())
+        block_owner(owner.last())
     })
     .join()
     .unwrap();

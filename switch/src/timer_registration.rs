@@ -2,7 +2,6 @@
 
 use crate::intrusive::{IntrusiveLinks, Linked, NIL, Timed};
 use crate::task::TaskHeader;
-use crate::task::slab::TaskRef;
 use crate::timer_wheel::{InsertOutcome, TimeRegressed, TimerWheel, WheelEntry, WheelPosition};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,7 +30,7 @@ struct Entry {
     owner_prev: u32,
     owner_next: u32,
     owner: *const TaskHeader,
-    wake: Option<TaskRef>,
+    wake: Option<*const TaskHeader>,
 }
 
 impl Linked for Entry {
@@ -102,7 +101,6 @@ impl TimerStore {
     pub(crate) unsafe fn register(
         &mut self,
         owner: *const TaskHeader,
-        wake: TaskRef,
         deadline: u64,
     ) -> Result<Token, RegistrationExhausted> {
         self.drained();
@@ -141,7 +139,7 @@ impl TimerStore {
         let entry = &mut self.entries[index as usize];
         entry.deadline = deadline;
         entry.state = State::Pending;
-        entry.wake = Some(wake);
+        entry.wake = Some(owner);
         unsafe {
             self.attach(index, owner);
         }
@@ -174,12 +172,7 @@ impl TimerStore {
     /// Token originated in this store (possibly stale). New owner is a stable
     /// live task on the owner thread; both task reg_heads belong exclusively
     /// to this store. All referenced tasks remain alive; handoff is drained.
-    pub(crate) unsafe fn refresh(
-        &mut self,
-        token: Token,
-        owner: *const TaskHeader,
-        wake: TaskRef,
-    ) -> bool {
+    pub(crate) unsafe fn refresh(&mut self, token: Token, owner: *const TaskHeader) -> bool {
         self.drained();
         if !self.valid(token) {
             return false;
@@ -193,7 +186,7 @@ impl TimerStore {
         }
         let entry = &mut self.entries[token.index as usize];
         if entry.state == State::Pending {
-            entry.wake = Some(wake);
+            entry.wake = Some(owner);
         }
         true
     }
@@ -223,7 +216,7 @@ impl TimerStore {
     }
 
     /// Normalize before returning a copied wake; no entry borrow escapes.
-    pub(crate) fn pop_expired(&mut self) -> Option<TaskRef> {
+    pub(crate) fn pop_expired(&mut self) -> Option<*const TaskHeader> {
         let index = self.expired.pop()?;
         let entry = &mut self.entries[index as usize];
         entry.state = State::Expired;
