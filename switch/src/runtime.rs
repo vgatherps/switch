@@ -201,10 +201,7 @@ impl Runtime {
                 Mailbox::deliver(mailbox);
             }
             Executor::undefer(root);
-            (*root)
-                .timers
-                .advance_to(now)
-                .expect("validated timer tick regressed");
+            (*root).timers.advance_to(now);
             while let Some(task) = (*root).timers.pop_expired() {
                 Executor::wake(task);
             }

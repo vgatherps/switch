@@ -514,12 +514,6 @@ impl Drop for SlotGuard {
     }
 }
 
-impl Default for Executor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::runtime::Runtime;

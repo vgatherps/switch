@@ -2,7 +2,7 @@
 
 use crate::intrusive::{IntrusiveLinks, Linked, NIL, Timed};
 use crate::task::TaskHeader;
-use crate::timer_wheel::{InsertOutcome, TimeRegressed, TimerWheel, WheelEntry, WheelPosition};
+use crate::timer_wheel::{TimerWheel, WheelEntry, WheelPosition};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Token {
@@ -18,7 +18,6 @@ enum State {
     Pending,
     Expired,
     Free,
-    Retired,
 }
 
 struct Entry {
@@ -30,7 +29,6 @@ struct Entry {
     owner_prev: u32,
     owner_next: u32,
     owner: *const TaskHeader,
-    wake: Option<*const TaskHeader>,
 }
 
 impl Linked for Entry {
@@ -133,19 +131,16 @@ impl TimerStore {
                 owner_prev: NIL,
                 owner_next: NIL,
                 owner: std::ptr::null(),
-                wake: None,
             });
             index
         };
         let entry = &mut self.entries[index as usize];
         entry.deadline = deadline;
         entry.state = State::Pending;
-        entry.wake = Some(owner);
         unsafe {
             self.attach(index, owner);
         }
-        let outcome = self.wheel.insert(&mut self.entries, index);
-        debug_assert_eq!(outcome, InsertOutcome::Linked);
+        self.wheel.insert(&mut self.entries, index);
         Ok(Token {
             index,
             version: self.entries[index as usize].version,
@@ -186,10 +181,6 @@ impl TimerStore {
                 self.attach(token.index, owner);
             }
         }
-        let entry = &mut self.entries[token.index as usize];
-        if entry.state == State::Pending {
-            entry.wake = Some(owner);
-        }
         true
     }
 
@@ -211,18 +202,19 @@ impl TimerStore {
     }
 
     /// Stage without callbacks. Drain completely before mutation or user code.
-    pub(crate) fn advance_to(&mut self, tick: u64) -> Result<(), TimeRegressed> {
+    pub(crate) fn advance_to(&mut self, tick: u64) {
         self.drained();
         self.wheel
-            .advance_to(&mut self.entries, tick, &mut self.expired)
+            .advance_to(&mut self.entries, tick, &mut self.expired);
     }
 
-    /// Normalize before returning a copied wake; no entry borrow escapes.
+    /// Normalize before returning the owner to wake; no entry borrow escapes.
     pub(crate) fn pop_expired(&mut self) -> Option<*const TaskHeader> {
         let index = self.expired.pop()?;
         let entry = &mut self.entries[index as usize];
+        debug_assert_eq!(entry.state, State::Pending);
         entry.state = State::Expired;
-        Some(entry.wake.take().expect("pending timer has no wake"))
+        Some(entry.owner)
     }
 
     unsafe fn attach(&mut self, index: u32, owner: *const TaskHeader) {
@@ -264,14 +256,9 @@ impl TimerStore {
             self.detach(index);
         }
         let entry = &mut self.entries[index as usize];
-        entry.wake = None;
-        if entry.version == u64::MAX {
-            entry.state = State::Retired;
-        } else {
-            entry.state = State::Free;
-            entry.owner_next = self.free_head;
-            self.free_head = index;
-        }
+        entry.state = State::Free;
+        entry.owner_next = self.free_head;
+        self.free_head = index;
     }
 }
 

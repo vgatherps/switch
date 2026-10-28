@@ -138,7 +138,7 @@ fn shutdown_retires_pending_and_expired_before_any_drop_and_survives_drop_panic(
             owner.poll();
             if expired {
                 unsafe {
-                    (*owner.0).timers.advance_to(11).unwrap();
+                    (*owner.0).timers.advance_to(11);
                     loop {
                         let task = (*owner.0).timers.pop_expired();
                         let Some(task) = task else {

@@ -6,7 +6,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::intrusive::{IntrusiveLinks, Linked, ListHead, ListLinked, NIL, Timed};
 use crate::runtime::Runtime;
-use crate::timer_wheel::{InsertOutcome, TimerWheel, WheelEntry, WheelPosition};
+use crate::timer_wheel::{TimerWheel, WheelEntry, WheelPosition};
 
 #[derive(Default)]
 struct Entry {
@@ -55,12 +55,12 @@ fn entries(deadlines: &[u64]) -> Vec<Entry> {
 fn wheel_deadline_three_expires_after_deadline_five_is_cancelled() {
     let mut entries = entries(&[3, 5]);
     let mut wheel: TimerWheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
-    assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
+    wheel.insert(&mut entries, 1);
 
     wheel.remove(&mut entries, 1);
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 3, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 3, &mut expired);
 
     assert_eq!(expired, [0]);
     assert!(!wheel.has_pending());
@@ -115,7 +115,7 @@ fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
     let spawner = runtime.spawner();
     let mut entries = entries(&[3]);
     let mut wheel: TimerWheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
 
     let slot = Rc::new(Cell::new(None));
     let polls = Rc::new(Cell::new(0));
@@ -130,7 +130,7 @@ fn wheel_expiry_can_drive_an_existing_stored_executor_waker() {
     assert_eq!(polls.get(), 1);
 
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 3, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 3, &mut expired);
     assert_eq!(expired, [0]);
     slot.take().expect("first poll stored a wake").wake();
     let report = runtime.poll(0).unwrap();

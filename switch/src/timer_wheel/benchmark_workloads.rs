@@ -1,5 +1,5 @@
 use crate::intrusive::{IntrusiveLinks, Linked, ListLinked, NIL, Timed};
-use crate::timer_wheel::{InsertOutcome, TimerWheel, WheelEntry, WheelPosition};
+use crate::timer_wheel::{TimerWheel, WheelEntry, WheelPosition};
 
 pub struct Entry {
     links: IntrusiveLinks,
@@ -48,10 +48,7 @@ pub fn near_entries(count: usize) -> Vec<Entry> {
 
 pub fn insert_all(wheel: &mut TimerWheel, entries: &mut [Entry]) {
     for index in 0..entries.len() {
-        match wheel.insert(entries, index as u32) {
-            InsertOutcome::Linked => {}
-            InsertOutcome::Due => panic!("benchmark requires a future timer"),
-        }
+        wheel.insert(entries, index as u32);
     }
 }
 
@@ -70,7 +67,7 @@ pub fn prepared(count: usize, deadline: u64) -> (TimerWheel, Vec<Entry>, Vec<u32
 
 pub fn advance(state: &mut (TimerWheel, Vec<Entry>, Vec<u32>), now: u64) {
     let (wheel, entries, expired) = state;
-    wheel.advance_to(entries, now, expired).unwrap();
+    wheel.advance_to(entries, now, expired);
 }
 
 fn assert_detached(entries: &[Entry]) {
@@ -87,7 +84,7 @@ pub fn check_insert_remove(count: usize) {
     insert_all(&mut wheel, &mut entries);
     remove_all(&mut wheel, &mut entries);
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 31, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 31, &mut expired);
     assert!(expired.is_empty());
     assert!(!wheel.has_pending());
     assert_detached(&entries);
@@ -143,7 +140,7 @@ mod tests {
             wheel.remove(&mut entries, index);
         }
         let mut expired = Vec::new();
-        wheel.advance_to(&mut entries, 31, &mut expired).unwrap();
+        wheel.advance_to(&mut entries, 31, &mut expired);
         expired.sort_unstable();
         assert_eq!(expired, (1..1024).step_by(2).collect::<Vec<u32>>());
         assert!(!wheel.has_pending());

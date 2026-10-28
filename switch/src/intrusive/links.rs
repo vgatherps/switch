@@ -3,21 +3,17 @@
 /// Sentinel value for "no link".
 pub const NIL: u32 = u32::MAX;
 
-/// Intrusive links for both list and heap structures.
-///
-/// For doubly-linked list: uses a (prev), b (next)
-/// For binary heap: uses a (parent), b (left), c (right)
+/// Intrusive doubly-linked list links: a (prev), b (next).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct IntrusiveLinks {
     pub a: u32,
     pub b: u32,
-    pub c: u32,
 }
 
 impl IntrusiveLinks {
     pub const fn new() -> Self {
-        Self { a: NIL, b: NIL, c: NIL }
+        Self { a: NIL, b: NIL }
     }
 }
 

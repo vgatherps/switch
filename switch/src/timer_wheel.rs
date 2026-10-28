@@ -21,29 +21,10 @@ pub trait WheelEntry: Timed + ListLinked {
     fn set_wheel_position(&mut self, position: WheelPosition);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InsertOutcome {
-    Due,
-    Linked,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TimeRegressed {
-    pub current: u64,
-    pub supplied: u64,
-}
-
 pub struct TimerWheel {
     levels: [[ListHead; DEFAULT_SLOTS]; DEFAULT_LEVELS],
     pending: [u32; DEFAULT_LEVELS],
     current_tick: u64,
-    linked_count: usize,
-}
-
-impl Default for TimerWheel {
-    fn default() -> Self {
-        Self::new(0)
-    }
 }
 
 impl TimerWheel {
@@ -52,7 +33,6 @@ impl TimerWheel {
             levels: [[ListHead::new(); DEFAULT_SLOTS]; DEFAULT_LEVELS],
             pending: [0; DEFAULT_LEVELS],
             current_tick: initial_tick,
-            linked_count: 0,
         }
     }
 
@@ -60,13 +40,13 @@ impl TimerWheel {
         self.current_tick
     }
 
-    // Used by unit tests and benches/timer_wheel.rs.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn has_pending(&self) -> bool {
-        self.linked_count != 0
+        self.pending.iter().any(|&bits| bits != 0)
     }
 
-    pub fn insert<T: WheelEntry>(&mut self, entries: &mut [T], idx: u32) -> InsertOutcome {
+    /// The entry's deadline must be after the current tick.
+    pub fn insert<T: WheelEntry>(&mut self, entries: &mut [T], idx: u32) {
         debug_assert!(idx != NIL, "invalid timer index");
         debug_assert!(
             matches!(
@@ -76,13 +56,9 @@ impl TimerWheel {
             "timer is already linked"
         );
         let deadline = entries[idx as usize].deadline();
-        if deadline <= self.current_tick {
-            return InsertOutcome::Due;
-        }
+        debug_assert!(deadline > self.current_tick, "timer is due");
         let (level, slot) = Self::place(self.current_tick, deadline);
         self.link(entries, idx, level, slot);
-        self.linked_count += 1;
-        InsertOutcome::Linked
     }
 
     pub fn remove<T: WheelEntry>(&mut self, entries: &mut [T], idx: u32) -> bool {
@@ -97,37 +73,31 @@ impl TimerWheel {
         );
         self.levels[level][slot].remove(entries, idx);
         entries[idx as usize].set_wheel_position(WheelPosition::Unlinked);
-        self.linked_count -= 1;
         if self.levels[level][slot].is_empty() {
             self.pending[level] &= !(1 << slot);
         }
         true
     }
 
+    /// `now_tick` must not be before the current tick.
     pub fn advance_to<T: WheelEntry>(
         &mut self,
         entries: &mut [T],
         now_tick: u64,
         expired: &mut Vec<u32>,
-    ) -> Result<(), TimeRegressed> {
-        if now_tick < self.current_tick {
-            return Err(TimeRegressed {
-                current: self.current_tick,
-                supplied: now_tick,
-            });
-        }
+    ) {
+        debug_assert!(now_tick >= self.current_tick, "timer tick regressed");
         if now_tick == self.current_tick {
-            return Ok(());
+            return;
         }
-        expired.reserve(self.linked_count);
         loop {
             let Some(boundary) = self.next_boundary() else {
                 self.current_tick = now_tick;
-                return Ok(());
+                return;
             };
             if boundary > now_tick {
                 self.current_tick = now_tick;
-                return Ok(());
+                return;
             }
             self.current_tick = boundary;
             for level in (0..DEFAULT_LEVELS).rev() {
@@ -148,7 +118,6 @@ impl TimerWheel {
                     let deadline = entries[idx as usize].deadline();
                     if deadline <= boundary {
                         debug_assert!(deadline == boundary, "timer passed its deadline");
-                        self.linked_count -= 1;
                         expired.push(idx);
                     } else {
                         let (new_level, new_slot) = Self::place(boundary, deadline);
@@ -291,7 +260,7 @@ mod tests {
         let mut timers = make_timers(&[5]);
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
+        wheel.insert(&mut timers, 0);
 
         assert!(wheel.has_pending());
     }
@@ -301,10 +270,10 @@ mod tests {
         let mut timers = make_timers(&[3]);
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
+        wheel.insert(&mut timers, 0);
 
         let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 5, &mut expired).unwrap();
+        wheel.advance_to(&mut timers, 5, &mut expired);
 
         assert_eq!(expired, vec![0]);
         assert!(!wheel.has_pending());
@@ -316,11 +285,11 @@ mod tests {
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
         for i in 0..5 {
-            assert_eq!(wheel.insert(&mut timers, i), InsertOutcome::Linked);
+            wheel.insert(&mut timers, i);
         }
 
         let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 25, &mut expired).unwrap();
+        wheel.advance_to(&mut timers, 25, &mut expired);
 
         // Should expire in deadline order: 3, 5, 10, 15, 20
         let deadlines: Vec<_> = expired
@@ -335,14 +304,14 @@ mod tests {
         let mut timers = make_timers(&[10, 20]);
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
-        assert_eq!(wheel.insert(&mut timers, 1), InsertOutcome::Linked);
+        wheel.insert(&mut timers, 0);
+        wheel.insert(&mut timers, 1);
 
         // Remove the first one
         wheel.remove(&mut timers, 0);
 
         let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 25, &mut expired).unwrap();
+        wheel.advance_to(&mut timers, 25, &mut expired);
 
         assert_eq!(expired, vec![1]);
     }
@@ -353,11 +322,11 @@ mod tests {
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
         for i in 0..3 {
-            assert_eq!(wheel.insert(&mut timers, i), InsertOutcome::Linked);
+            wheel.insert(&mut timers, i);
         }
 
         let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 10, &mut expired).unwrap();
+        wheel.advance_to(&mut timers, 10, &mut expired);
 
         assert_eq!(expired.len(), 3);
     }
@@ -367,7 +336,7 @@ mod tests {
         let mut timers = make_timers(&[40]); // Will go to L1 (> 32 ticks away)
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
+        wheel.insert(&mut timers, 0);
 
         // Should be in L1
         assert_eq!(
@@ -376,7 +345,7 @@ mod tests {
         );
 
         let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 45, &mut expired).unwrap();
+        wheel.advance_to(&mut timers, 45, &mut expired);
 
         assert_eq!(expired, vec![0]);
     }
@@ -387,32 +356,20 @@ mod tests {
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
         for i in 0..3 {
-            assert_eq!(wheel.insert(&mut timers, i), InsertOutcome::Linked);
+            wheel.insert(&mut timers, i);
         }
 
         let mut expired1 = Vec::new();
-        wheel.advance_to(&mut timers, 10, &mut expired1).unwrap();
+        wheel.advance_to(&mut timers, 10, &mut expired1);
         assert_eq!(expired1, vec![0]);
 
         let mut expired2 = Vec::new();
-        wheel.advance_to(&mut timers, 20, &mut expired2).unwrap();
+        wheel.advance_to(&mut timers, 20, &mut expired2);
         assert_eq!(expired2, vec![1]);
 
         let mut expired3 = Vec::new();
-        wheel.advance_to(&mut timers, 30, &mut expired3).unwrap();
+        wheel.advance_to(&mut timers, 30, &mut expired3);
         assert_eq!(expired3, vec![2]);
-    }
-
-    #[test]
-    fn test_insert_past_deadline() {
-        let mut timers = make_timers(&[5]);
-        let mut wheel = TimerWheel::new(10);
-        let mut expired = Vec::new();
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Due);
-        assert_eq!(timers[0].position, WheelPosition::Unlinked);
-        assert!(!wheel.has_pending());
-        wheel.advance_to(&mut timers, 11, &mut expired).unwrap();
-        assert!(expired.is_empty());
     }
 
     #[test]
@@ -420,7 +377,7 @@ mod tests {
         let mut timers = make_timers(&[100000]);
         let mut wheel: TimerWheel = TimerWheel::new(0);
 
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
+        wheel.insert(&mut timers, 0);
 
         // Should be in highest level
         assert!(matches!(
