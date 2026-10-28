@@ -68,7 +68,7 @@ impl TxBuf {
 
     /// The `header_len` bytes in front of the payload, to write headers into, and the payload.
     /// Panics unless this is the only reference and `header_len <= TX_HEADROOM`.
-    pub(crate) fn headroom_mut(&mut self, header_len: usize) -> (&mut [u8], &[u8]) {
+    pub fn headroom_mut(&mut self, header_len: usize) -> (&mut [u8], &[u8]) {
         assert!(self.unique(), "TX buffer is shared");
         // SAFETY: checked unique just now.
         unsafe { self.headroom_unchecked(header_len) }

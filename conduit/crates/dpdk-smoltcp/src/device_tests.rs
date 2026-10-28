@@ -2424,31 +2424,14 @@ trait Publish {
 }
 
 impl<T: phy::FrameToken> Publish for T {
-    fn publish(self, header: Header, frame: TxBuf) {
-        write_header(&frame, &header);
+    fn publish(self, header: Header, mut frame: TxBuf) {
+        frame.headroom_mut(header.len).0.copy_from_slice(header.bytes());
         self.consume(frame, header.len, header.tx_checksum);
     }
 
-    fn publish_retain(self, header: Header, frame: TxBuf) -> TxBuf {
-        write_header(&frame, &header);
+    fn publish_retain(self, header: Header, mut frame: TxBuf) -> TxBuf {
+        frame.headroom_mut(header.len).0.copy_from_slice(header.bytes());
         self.consume_retain(frame, header.len, header.tx_checksum)
-    }
-}
-
-/// Write `header` into the headroom in front of the unique frame's payload, through its mbuf.
-fn write_header(frame: &TxBuf, header: &Header) {
-    assert!(frame.unique(), "test publishes a shared frame");
-    assert!(header.len <= smoltcp::phy::TX_HEADROOM);
-    let buf_addr = mbuf(frame).buf_addr.cast::<u8>();
-    // SAFETY: the frame is unique and its payload lies in its mbuf's buffer with TX_HEADROOM
-    // bytes in front; no Rust reference covers those header bytes.
-    unsafe {
-        let payload = frame.payload().as_ptr().offset_from(buf_addr.cast_const()) as usize;
-        std::ptr::copy_nonoverlapping(
-            header.bytes().as_ptr(),
-            buf_addr.add(payload - header.len),
-            header.len,
-        );
     }
 }
 
