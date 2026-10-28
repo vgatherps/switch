@@ -105,7 +105,9 @@ fn reserved_real_sleep_phases_and_task_allocation_are_distinct() {
     let slot = Rc::new(RefCell::new(Some(spawner.sleep_until(110).unwrap())));
     let task = spawn_holder(holder(&slot, &stop_a, &drops));
     let (_, spawn) = measure(|| spawner.spawn(task).unwrap());
-    assert_eq!((spawn.allocations, spawn.reallocations), (8, 0));
+    // First spawn of this function on this thread: function pool, runtime pool,
+    // executor pool list, slab, slab list, has_free bits, spare capacity.
+    assert_eq!((spawn.allocations, spawn.reallocations), (7, 0));
     let (r, register) = measure(|| runtime.poll(100).unwrap());
     assert_eq!((r.tasks_polled, r.ready_tasks, r.live_tasks), (1, 1, 1));
     no_alloc(register);

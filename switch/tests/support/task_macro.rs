@@ -1,5 +1,5 @@
-// Hand-written stand-in for `#[switch::task]`, expanding to the shape in
-// TASKS_DESIGN.md §2. Accepts `async fn` and `fn -> impl Future<Output = ()>`.
+// Hand-written stand-in for `#[switch::task]`, expanding to the items the attribute
+// will generate. Accepts `async fn` and `fn -> impl Future<Output = ()>`.
 // Shared by unit tests (via `extern crate self as switch`), integration tests,
 // benches and examples.
 

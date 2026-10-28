@@ -87,6 +87,16 @@ impl Executor {
         unsafe { (*this).lifecycle }
     }
 
+    /// Spawns between slot reservation and commit. Stable owner-thread pointer.
+    pub(crate) unsafe fn spawning(this: *mut Self) -> usize {
+        unsafe { (*this).spawning }
+    }
+
+    /// Reject new work and turns ahead of a deferred cleanup. Stable owner-thread pointer.
+    pub(crate) unsafe fn close(this: *mut Self) {
+        unsafe { (*this).lifecycle = Lifecycle::Closing }
+    }
+
     /// # Safety
     /// Stable owner-thread pointer; owner remains alive through all task uses.
     pub unsafe fn spawn<T: Task>(this: *mut Self, token: SpawnToken<T>) {
@@ -96,8 +106,22 @@ impl Executor {
         }
     }
 
-    pub(crate) unsafe fn add_pool(this: *mut Self, pool: *mut RuntimePool) {
-        unsafe { (*this).pools.push(pool) }
+    /// This executor's pool for `function`, created on its first spawn of it.
+    /// Scans one entry per function this executor has spawned.
+    unsafe fn runtime_pool(this: *mut Self, function: *mut FunctionPool) -> *mut RuntimePool {
+        unsafe {
+            if let Some(pool) = (*this)
+                .pools
+                .iter()
+                .copied()
+                .find(|&pool| RuntimePool::function_pool(pool) == function)
+            {
+                return pool;
+            }
+            let pool = RuntimePool::new(this, function);
+            (*this).pools.push(pool);
+            pool
+        }
     }
 
     /// Reserve queue capacity and a slot for one spawn. The slot stays free of
@@ -120,7 +144,7 @@ impl Executor {
                     queue.reserve(needed - queue.len());
                 }
             }
-            let pool = FunctionPool::runtime_pool(pool, this);
+            let pool = Self::runtime_pool(this, pool);
             let (meta, slot) = RuntimePool::reserve(pool, spec);
             (*this).allocated = needed;
             (*this).spawning += 1;
@@ -132,7 +156,7 @@ impl Executor {
         }
     }
 
-    /// Wake after the owner check (§4.2 order): task flags, then the executor.
+    /// Wake after the owner check: task flags first, then the executor.
     ///
     /// # Safety
     /// Owner thread; `header` lies in slab `meta`.
@@ -144,7 +168,8 @@ impl Executor {
             if current & (LIVE | QUEUED) != LIVE {
                 return;
             }
-            // A LIVE slot's runtime is alive: shutdown clears LIVE before reassigning.
+            // A LIVE slot's executor is alive: cleanup clears LIVE on every slot
+            // before the executor is freed.
             let this = Meta::executor(meta).get();
             if (*this).lifecycle != Lifecycle::Open {
                 return;
@@ -221,17 +246,39 @@ impl Executor {
                 // Reload its buffer each iteration; no buffer pointer spans user code.
                 let task = *(*this).run_queue.as_ptr().add(index);
                 let meta = task.meta();
-                match Meta::run_fn(meta)(this, meta, task.slot(), turn) {
+                let slot = task.slot();
+                match Meta::run_fn(meta)(this, meta, slot, turn) {
                     Step::Reclaimed => {}
                     Step::Pending => report.polled += 1,
                     Step::Completed => {
                         report.polled += 1;
                         report.completed += 1;
+                        Self::complete(this, meta, slot);
                     }
                 }
             }
             (*this).run_queue.clear();
             report
+        }
+    }
+
+    /// The task returned `Ready`: end it and drop its future (the cold path,
+    /// kept out of the per-function `run`).
+    #[inline(never)]
+    unsafe fn complete(this: *mut Self, meta: *mut Meta, slot: u32) {
+        unsafe {
+            let header = Meta::header(meta, slot);
+            Self::terminal(this, header);
+            // A self-wake during the final poll keeps the slot until its entry drains.
+            let _slot = SlotGuard {
+                owner: this,
+                meta,
+                slot,
+                header,
+            };
+            let flags = TaskHeader::flags(header);
+            flags.set(flags.get() | DROP_STARTED);
+            Meta::drop_fn(meta)(meta, slot);
         }
     }
 
@@ -293,7 +340,7 @@ impl Executor {
 
     /// Owner-only cleanup. Stable raw pointer, no active poll/drop or escaped task uses.
     /// Scheduling closes before user Drop. A caught destructor panic permits retry.
-    /// Futures drop from the last registered function's highest slot down.
+    /// Futures drop in an unspecified order.
     pub(crate) unsafe fn cleanup(this: *mut Self) {
         unsafe {
             assert!(
@@ -393,20 +440,7 @@ pub(crate) unsafe fn run<K: PoolKey, Fut: Future<Output = ()>>(
         turn.current = std::ptr::null();
         match result {
             Poll::Pending => Step::Pending,
-            Poll::Ready(()) => {
-                Executor::terminal(this, header);
-                // A self-wake during the final poll keeps the slot until its entry drains.
-                let _slot = SlotGuard {
-                    owner: this,
-                    meta,
-                    slot,
-                    header,
-                };
-                let flags = TaskHeader::flags(header);
-                flags.set(flags.get() | DROP_STARTED);
-                std::ptr::drop_in_place(Shape::<Fut>::future(task_slot));
-                Step::Completed
-            }
+            Poll::Ready(()) => Step::Completed,
         }
     }
 }

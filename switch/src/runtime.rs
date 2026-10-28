@@ -70,6 +70,8 @@ impl<T> fmt::Debug for SpawnError<T> {
 pub(crate) struct Control {
     core: UnsafeCell<Option<Box<Executor>>>,
     root: Cell<*mut Executor>,
+    /// Shutdown was requested while a task factory ran; the outermost spawn finishes it.
+    close_deferred: Cell<bool>,
 }
 
 impl Control {
@@ -81,6 +83,7 @@ impl Control {
                 capacity.timers,
             )))),
             root: Cell::new(std::ptr::null_mut()),
+            close_deferred: Cell::new(false),
         });
         // Derive once after final Control placement, before any task aliases exist.
         let root =
@@ -117,6 +120,14 @@ impl Control {
             return;
         }
         unsafe {
+            if Executor::spawning(root) > 0 {
+                // A task factory runs between slot reservation and commit, inside
+                // `Spawner::spawn`, which holds this Control. Close to new work now;
+                // that spawn completes the shutdown once its reservation resolves.
+                Executor::close(root);
+                self.close_deferred.set(true);
+                return;
+            }
             // Owning Box stays in place throughout arbitrary future destruction.
             Executor::cleanup(root);
             self.root.set(std::ptr::null_mut());
@@ -202,7 +213,7 @@ impl Runtime {
         }
     }
 
-    /// Close the runtime and drop its remaining tasks.
+    /// Close the runtime and drop its remaining tasks, in an unspecified order.
     pub fn shutdown(&mut self) {
         self.control.shutdown();
     }
@@ -216,6 +227,8 @@ impl Drop for CleanupContinuation {
     }
 }
 
+/// Dropping a `Runtime` shuts it down: its remaining tasks are dropped, in an
+/// unspecified order.
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _continuation = CleanupContinuation(self.control.clone());
@@ -250,9 +263,14 @@ impl Spawner {
 
     /// Submit a task function's token. Rejection returns the token before any
     /// task storage is touched.
+    ///
+    /// If the task's construction shuts down or drops the runtime, the runtime
+    /// closes at once and its tasks, this one included, are dropped when the
+    /// construction returns, before `spawn` returns `Ok`.
     pub fn spawn<T: Task>(&self, token: SpawnToken<T>) -> Result<(), SpawnError<T>> {
         match self.control.open_core() {
             Ok(root) => {
+                let _deferred = DeferredShutdown(&self.control);
                 unsafe { Executor::spawn(root, token) };
                 Ok(())
             }
@@ -260,6 +278,18 @@ impl Spawner {
                 reason: reason.into(),
                 token,
             }),
+        }
+    }
+}
+
+/// Completes a shutdown that a task factory requested during this spawn, once
+/// no reservation is outstanding (also on unwind).
+struct DeferredShutdown<'a>(&'a Control);
+
+impl Drop for DeferredShutdown<'_> {
+    fn drop(&mut self) {
+        if self.0.close_deferred.get() {
+            self.0.shutdown();
         }
     }
 }

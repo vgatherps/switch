@@ -214,23 +214,25 @@ impl TimerWheel {
     }
 }
 
-#[cfg(test)]
+// The wheel has no unsafe code, so its tests (including the 1024-entry
+// workload controls and the seeded model test) do not run under Miri.
+#[cfg(all(test, not(miri)))]
 #[path = "timer_wheel/benchmark_workloads.rs"]
 pub mod benchmark_workloads;
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 #[path = "timer_wheel/membership_tests.rs"]
 mod membership_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 #[path = "timer_wheel/boundary_tests.rs"]
 mod boundary_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 #[path = "timer_wheel/model_tests.rs"]
 mod model_tests;
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use crate::intrusive::{IntrusiveLinks, Linked};

@@ -136,6 +136,8 @@ pub(crate) struct SlabSpec {
 impl SlabSpec {
     /// Allocate and initialize a slab owned by the calling thread. Never freed.
     pub(crate) fn allocate(&self) -> *mut Meta {
+        // Before allocating: issuing the thread's first tag may panic.
+        let owner = crate::waker::this_thread_tag();
         unsafe {
             let base = alloc::alloc(self.layout);
             if base.is_null() {
@@ -143,7 +145,7 @@ impl SlabSpec {
             }
             let meta = base.cast::<Meta>();
             meta.write(Meta {
-                owner: AtomicU16::new(crate::waker::this_thread_tag()),
+                owner: AtomicU16::new(owner),
                 data_off: self.data_off,
                 stride: self.stride,
                 alloc: Cell::new(0),
@@ -321,5 +323,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Slot<u64>, future), 8);
         assert_eq!(std::mem::offset_of!(Slot<[u64; 10]>, future), 8);
         assert_eq!(std::mem::offset_of!(Slot<u128>, future), 16);
+    }
+
+    #[test]
+    fn stride_rounding_adds_at_most_12_bytes() {
+        // Nine bytes at alignment 1: a 20-byte slot (alignment 4) rounds to 32.
+        assert_eq!(size_of::<Slot<[u8; 9]>>(), 20);
+        assert_eq!(Shape::<[u8; 9]>::STRIDE, 32);
+        assert_eq!(Shape::<[u8; 8]>::STRIDE, 16);
+        assert_eq!(Shape::<u64>::STRIDE, 16);
+        assert_eq!(Shape::<[u64; 2]>::STRIDE, 32);
     }
 }

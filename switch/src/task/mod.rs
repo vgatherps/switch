@@ -9,6 +9,8 @@ pub mod private;
 pub(crate) mod slab;
 
 #[cfg(test)]
+mod coverage_tests;
+#[cfg(test)]
 mod tests;
 
 use std::marker::PhantomData;

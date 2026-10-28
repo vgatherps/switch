@@ -1,9 +1,11 @@
 //! Per-function slab pools.
 //!
 //! A [`FunctionPool`] exists per (task function, thread) and is never freed. It
-//! holds one [`RuntimePool`] per runtime that has spawned the function, plus
-//! `spare` slabs released by runtimes that shut down. Slabs are never freed and
-//! never change function or thread; a slab serves one runtime at a time.
+//! holds the `spare` slabs released by runtimes that shut down. Each runtime that
+//! spawns the function owns one [`RuntimePool`], listed in its executor (so the
+//! lookup cost does not grow with the number of runtimes on the thread). Slabs
+//! are never freed and never change function or thread; a slab serves one
+//! runtime at a time.
 //!
 //! All access is on the owning thread, through raw pointers, with no reference
 //! held across user code (a task factory may spawn recursively).
@@ -41,7 +43,6 @@ impl Pool {
             return pool;
         }
         let pool = FunctionPool::register(Box::new(FunctionPool {
-            runtimes: Vec::new(),
             spare: Vec::new(),
             registry_next: ptr::null_mut(),
             slabs: 0,
@@ -55,7 +56,6 @@ impl Pool {
 static POOLS: AtomicPtr<FunctionPool> = AtomicPtr::new(ptr::null_mut());
 
 pub(crate) struct FunctionPool {
-    runtimes: Vec<*mut RuntimePool>,
     spare: Vec<*mut Meta>,
     registry_next: *mut FunctionPool,
     /// Slabs ever allocated for this function on this thread.
@@ -75,41 +75,9 @@ impl FunctionPool {
         }
     }
 
-    /// This runtime's pool for the function, created (and registered with the
-    /// executor) on the runtime's first spawn of it.
-    ///
-    /// # Safety
-    /// Owner thread; `executor` is live and open.
-    pub(crate) unsafe fn runtime_pool(
-        this: *mut Self,
-        executor: *mut Executor,
-    ) -> *mut RuntimePool {
-        unsafe {
-            if let Some(&pool) = (*this)
-                .runtimes
-                .iter()
-                .find(|&&pool| (*pool).executor == executor)
-            {
-                return pool;
-            }
-            let pool = Box::into_raw(Box::new(RuntimePool {
-                executor,
-                owner: this,
-                slabs: Vec::new(),
-                has_free: Vec::new(),
-                ring: [0; RING],
-                head: 0,
-                len: 0,
-            }));
-            (*this).runtimes.push(pool);
-            Executor::add_pool(executor, pool);
-            pool
-        }
-    }
-
     #[cfg(test)]
-    pub(crate) unsafe fn counts(this: *mut Self) -> (usize, usize) {
-        unsafe { ((*this).runtimes.len(), (*this).spare.len()) }
+    pub(crate) unsafe fn spare_count(this: *mut Self) -> usize {
+        unsafe { (*this).spare.len() }
     }
 }
 
@@ -125,8 +93,20 @@ pub(crate) struct RuntimePool {
     head: u8,
     len: u8,
 }
-
 impl RuntimePool {
+    /// A new, empty pool for `owner`'s function in `executor`.
+    pub(crate) fn new(executor: *mut Executor, owner: *mut FunctionPool) -> *mut Self {
+        Box::into_raw(Box::new(Self {
+            executor,
+            owner,
+            slabs: Vec::new(),
+            has_free: Vec::new(),
+            ring: [0; RING],
+            head: 0,
+            len: 0,
+        }))
+    }
+
     /// Reserve a slot: newest recently freed index, else the lowest free index,
     /// else a spare or new slab. Sets the slot's `alloc` bit.
     ///
@@ -186,20 +166,24 @@ impl RuntimePool {
     /// Take a spare slab of this function, or allocate one; returns its first index.
     unsafe fn grow(this: *mut Self, spec: &SlabSpec) -> u32 {
         unsafe {
+            let slab = (*this).slabs.len();
+            // Checked before a slab is taken, so a failure loses none.
+            let index = u32::try_from(slab * SLOTS + SLOTS - 1)
+                .map(|last| last - (SLOTS as u32 - 1))
+                .expect("task index space exhausted");
             let owner = (*this).owner;
             let meta = match (*owner).spare.pop() {
                 Some(meta) => meta,
                 None => {
+                    let meta = spec.allocate();
                     // Capacity for every slab ever made: shutdown moves them to
                     // `spare` without allocating.
                     (*owner).slabs += 1;
                     let spare = &mut (*owner).spare;
                     spare.reserve((*owner).slabs - spare.len());
-                    spec.allocate()
+                    meta
                 }
             };
-            let slab = (*this).slabs.len();
-            let index = u32::try_from(slab * SLOTS).expect("task index space exhausted");
             (*this).slabs.push(meta);
             if (*this).has_free.len() * 64 <= slab {
                 (*this).has_free.push(0);
@@ -261,12 +245,6 @@ impl RuntimePool {
                 Meta::slab_no(meta).set(0);
                 (*owner).spare.push(meta);
             }
-            let runtimes = &mut (*owner).runtimes;
-            let position = runtimes
-                .iter()
-                .position(|&pool| pool == this)
-                .expect("runtime pool not registered");
-            runtimes.swap_remove(position);
             drop(Box::from_raw(this));
         }
     }
@@ -276,7 +254,8 @@ impl RuntimePool {
         unsafe { Meta::slab_no(meta).get() * SLOTS as u32 + u32::from(TaskHeader::slot(header)) }
     }
 
-    #[cfg(test)]
+    /// # Safety
+    /// `this` is live.
     pub(crate) unsafe fn function_pool(this: *mut Self) -> *mut FunctionPool {
         unsafe { (*this).owner }
     }

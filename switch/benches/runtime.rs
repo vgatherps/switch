@@ -72,6 +72,26 @@ fn runtime_benches(c: &mut Criterion) {
             BatchSize::LargeInput,
         )
     });
+    // Fixed batch sizes: one live fixture (one runtime) and 64 live fixtures
+    // (64 runtimes on this thread) per timed batch.
+    for (name, fixtures) in [
+        ("runtime_mixed_six_turns_1rt", 1),
+        ("runtime_mixed_six_turns_64rt", 64),
+    ] {
+        c.bench_function(name, |b| {
+            b.iter_batched_ref(
+                workload::Mixed::new,
+                |fixture| {
+                    black_box((
+                        fixture.run(),
+                        fixture.audit.checksum.get(),
+                        fixture.audit.drops.get(),
+                    ))
+                },
+                BatchSize::NumIterations(fixtures),
+            )
+        });
+    }
     c.bench_function("runtime_cold_create_drop", |b| {
         b.iter(|| {
             let runtime = Runtime::with_capacity(
