@@ -29,6 +29,8 @@ members = [
     "depot",
     # switchnet
     "switchnet",
+    # TLS 1.3 client over conduit frames
+    "sheath",
 ]
 exclude = ["conduit/vendor/smoltcp", "vendor/rustls"]
 
