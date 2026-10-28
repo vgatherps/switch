@@ -70,14 +70,13 @@ impl Inner {
     }
 
     /// Clears the parked handle, removes the entry and returns its socket.
+    /// The index is free at once: if it is still listed, the next scan
+    /// unlists it, or checks the socket that reused it.
     fn remove(&mut self, index: u32) -> Option<Socket> {
         let entry = &mut self.entries[index as usize];
         entry.parked = None;
-        let socket = entry.socket.take();
-        if !entry.listed {
-            self.free.push(index);
-        }
-        socket
+        self.free.push(index);
+        entry.socket.take()
     }
 
     /// The stack and the TCP handle of entry `index`.
@@ -111,29 +110,27 @@ impl Inner {
     fn unpark(&mut self, index: u32) {
         self.entries[index as usize].parked = None;
     }
+}
 
-    /// Wakes every listed task whose socket is ready; unlists woken,
-    /// unparked and removed entries.
-    #[inline(never)]
-    fn wake_ready(&mut self) {
-        let mut at = 0;
-        while at < self.listed.len() {
-            let index = self.listed[at];
-            let entry = &mut self.entries[index as usize];
-            if let (Some(socket), Some((waker, interest))) = (&entry.socket, entry.parked) {
-                if !ready(&self.stack, socket, interest) {
-                    at += 1;
-                    continue;
-                }
-                entry.parked = None;
-                waker.wake();
+/// Wakes every listed task whose socket is ready; unlists woken, unparked and
+/// removed entries. Takes the fields, not `&mut Inner`, so the loop keeps
+/// `entries` and `listed` in registers across the out-of-line
+/// `Stack::udp`/`Stack::tcp` calls.
+#[inline(never)]
+fn wake_ready(stack: &Stack, entries: &mut [Entry], listed: &mut Vec<u32>) {
+    let mut at = 0;
+    while at < listed.len() {
+        let entry = &mut entries[listed[at] as usize];
+        if let (Some(socket), Some((waker, interest))) = (&entry.socket, entry.parked) {
+            if !ready(stack, socket, interest) {
+                at += 1;
+                continue;
             }
-            entry.listed = false;
-            if entry.socket.is_none() {
-                self.free.push(index);
-            }
-            self.listed.swap_remove(at);
+            entry.parked = None;
+            waker.wake();
         }
+        entry.listed = false;
+        listed.swap_remove(at);
     }
 }
 
@@ -195,10 +192,10 @@ impl Net {
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut inner = self.shared.borrow_mut();
-        let inner = &mut *inner;
-        let turn = inner.stack.turn(now, inner.ingress_budget);
-        if !inner.listed.is_empty() {
-            inner.wake_ready();
+        let Inner { stack, entries, listed, ingress_budget, .. } = &mut *inner;
+        let turn = stack.turn(now, *ingress_budget);
+        if !listed.is_empty() {
+            wake_ready(stack, entries, listed);
         }
         turn
     }

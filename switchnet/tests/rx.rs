@@ -556,3 +556,30 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
         mixed.close();
     })
 }
+
+/// A socket dropped while its index is still listed (no turn in between)
+/// frees the index at once; a new socket that reuses it and parks is woken
+/// by its own data.
+#[zhida_test_support::pinned_test]
+fn socket_reusing_a_still_listed_index_is_woken() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["reua", "reub"]);
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
+        let mut first = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let slot = mixed.spawn(async move { cancel_after_one_poll(first.recv()).await });
+        mixed.rt.poll(0).unwrap();
+        mixed.wait(&slot);
+        let mut second = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let slot = mixed.spawn(async move {
+            let datagram = second.recv().await;
+            (second, datagram)
+        });
+        mixed.rt.poll(0).unwrap();
+        mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7000)), b"second").unwrap();
+        let (second, datagram) = mixed.wait(&slot);
+        assert_eq!(datagram.payload(), b"second");
+        drop((second, datagram, peer));
+        mixed.close();
+    })
+}
