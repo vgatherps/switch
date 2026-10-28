@@ -43,3 +43,28 @@ pub trait PlainRx {
     /// consumed, when the run is not inside a frame.
     fn take_frame(&mut self, len: usize) -> Option<(Self::Frame, usize)>;
 }
+
+/// A frame buffer to fill and send.
+pub trait TxFrame {
+    /// The whole writable room of the frame.
+    fn room_mut(&mut self) -> &mut [u8];
+}
+
+/// The send half below WebSocket: frames, record sealing (TLS), and a
+/// synchronous send that may refuse.
+pub trait PlainTx {
+    type Frame: TxFrame;
+    type Error;
+
+    /// A new, empty frame.
+    fn alloc(&mut self) -> Result<Self::Frame, Self::Error>;
+    /// `(head, room)`: plaintext starts at `room_mut()[head]`, and one frame
+    /// carries at most `room` plaintext bytes.
+    fn plain(&self) -> (usize, usize);
+    /// Turn the plaintext `room_mut()[head..head + len]` into the bytes to send
+    /// (TLS: one record; raw: set the length). Under TLS this consumes a
+    /// sequence number, so the frame must then be sent, never dropped.
+    fn seal(&mut self, f: &mut Self::Frame, len: usize) -> Result<(), Self::Error>;
+    /// Send now, or hand the frame back unchanged when there is no room.
+    fn try_send(&mut self, f: Self::Frame) -> Result<(), Self::Frame>;
+}

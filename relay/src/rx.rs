@@ -148,14 +148,25 @@ struct Located {
     stamp: u64,
 }
 
+/// A control frame payload (at most 125 B, RFC 6455 §5.5).
 #[derive(Clone, Copy)]
-struct Control {
+pub(crate) struct Control {
     buf: [u8; 125],
     len: usize,
 }
 
 impl Control {
-    fn bytes(&self) -> &[u8] {
+    pub(crate) const EMPTY: Control = Control { buf: [0; 125], len: 0 };
+
+    /// Panics above 125 B.
+    pub(crate) fn new(p: &[u8]) -> Control {
+        let mut c = Control::EMPTY;
+        c.buf[..p.len()].copy_from_slice(p);
+        c.len = p.len();
+        c
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 }
@@ -472,7 +483,6 @@ pub struct WsRx<R: PlainRx> {
 
 impl<R: PlainRx> WsRx<R> {
     pub fn new(lower: R, config: Config) -> WsRx<R> {
-        let empty = Control { buf: [0; 125], len: 0 };
         WsRx {
             lower,
             core: Core {
@@ -484,11 +494,11 @@ impl<R: PlainRx> WsRx<R> {
                 hdr_len: 0,
                 hdr_stamp: 0,
                 frame: None,
-                ctrl: empty,
+                ctrl: Control::EMPTY,
                 msg: None,
                 utf8: Utf8::default(),
                 scratch: Vec::with_capacity(config.scratch.min(config.max_message)),
-                pong: empty,
+                pong: Control::EMPTY,
                 pong_due: false,
                 close: None,
             },

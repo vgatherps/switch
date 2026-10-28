@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::io::{self, Cursor, Read, Write};
+use std::io::Cursor;
 
 use common::*;
 use relay::{Config, Kind, ProtocolError, Raw, Role, WsError, WsRx};
@@ -28,23 +28,6 @@ struct Outcome {
     msgs: Vec<(Kind, Vec<u8>)>,
     ping: Option<Vec<u8>>,
     end: End,
-}
-
-struct Duplex(Cursor<Vec<u8>>);
-
-impl Read for Duplex {
-    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
-        self.0.read(b)
-    }
-}
-
-impl Write for Duplex {
-    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn tungstenite(role: Role, wire: &[u8]) -> Outcome {

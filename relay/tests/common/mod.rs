@@ -249,3 +249,21 @@ pub fn random_cuts(rng: &mut Rng, len: usize, max: usize) -> Vec<usize> {
         cuts.push(at);
     }
 }
+
+/// A byte stream for tungstenite: reads `wire`, discards writes.
+pub struct Duplex(pub std::io::Cursor<Vec<u8>>);
+
+impl std::io::Read for Duplex {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(b)
+    }
+}
+
+impl std::io::Write for Duplex {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
