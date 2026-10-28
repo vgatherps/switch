@@ -34,8 +34,8 @@
 //! The future and its value must be `'static`. `spawn` detaches the task: its
 //! value is dropped when it completes. `Spawner::spawn_join` also returns a
 //! [`JoinHandle`] that resolves to the value, or to [`oneshot::Canceled`] if the
-//! task is dropped before it finishes (shutdown, or a panic unwinding through it);
-//! it allocates one [`oneshot`] channel. Both kinds of spawn share the function's
+//! task ends without one (its runtime shut down or dropped, or its poll
+//! panicked); it allocates one [`oneshot`] channel. Both kinds of spawn share the function's
 //! pool and capacity. Each task function, and each instantiation of a
 //! generic one, has its own task blocks and capacity.
 //! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per

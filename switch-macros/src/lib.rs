@@ -3,7 +3,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{quote, quote_spanned};
+use quote::{ToTokens, quote, quote_spanned};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
@@ -89,12 +89,28 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
     }
 
     let (future, declared, output) = if sig.asyncness.is_some() {
-        let output = match &sig.output {
-            ReturnType::Default => quote!(()),
-            ReturnType::Type(_, ty) => quote!(#ty),
+        let (output, body) = match &sig.output {
+            ReturnType::Default => (quote!(()), quote!(#block)),
+            // A `let` of the declared type gives the body's value a coercion
+            // context, as a function's return type does (`&[1, 2]` to `&[u8]`). A
+            // `return` returns from the async block, so it gets none. `impl Trait`
+            // cannot annotate a `let`; that output is inferred. The `_` name and
+            // the `allow`s keep a diverging body (`panic!()`) free of lints that a
+            // plain `async fn` would not have.
+            ReturnType::Type(_, ty) if !has_impl(ty.to_token_stream()) => {
+                let value = quote::format_ident!("_output", span = Span::mixed_site());
+                let body = quote_spanned! {Span::mixed_site()=>
+                    #[allow(clippy::diverging_sub_expression)]
+                    let #value: #ty = #block;
+                    #[allow(unreachable_code)]
+                    return #value;
+                };
+                (quote!(#ty), body)
+            }
+            ReturnType::Type(_, ty) => (quote!(#ty), quote!(#block)),
         };
         (
-            quote_spanned!(sig.ident.span()=> async move { #(#bindings)* #block }),
+            quote_spanned!(sig.ident.span()=> async move { #(#bindings)* #body }),
             None,
             output,
         )
@@ -186,6 +202,15 @@ fn future_output(path: &syn::Path) -> Option<&Type> {
         }
         _ => None,
     }
+}
+
+/// Whether a type mentions `impl Trait`.
+fn has_impl(tokens: TokenStream2) -> bool {
+    tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(ident) => ident == "impl",
+        proc_macro2::TokenTree::Group(group) => has_impl(group.stream()),
+        _ => false,
+    })
 }
 
 #[cfg(test)]

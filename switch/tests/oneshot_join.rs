@@ -244,6 +244,38 @@ fn handle_polled_after_shutdown_is_canceled() {
     assert_eq!(*out.borrow(), Some(Err(Canceled)));
 }
 
+/// Panics on its first poll.
+#[switch::task]
+async fn panics(_argument: Counted) -> u32 {
+    panic!("joined task panics");
+}
+
+#[test]
+fn panic_cancels_the_handle_at_once() {
+    let mut a = Runtime::new(0);
+    let mut b = Runtime::new(0);
+    let drops = Rc::new(Cell::new(0));
+    let handle = a
+        .spawner()
+        .spawn_join(panics(Counted(drops.clone())))
+        .unwrap();
+    let out = slot();
+    b.spawner().spawn(store(handle, out.clone())).unwrap();
+    run(&mut b);
+    assert_eq!(*out.borrow(), None);
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.poll(0))).unwrap_err();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"joined task panics"));
+    b.poll(0).unwrap();
+    assert_eq!(*out.borrow(), Some(Err(Canceled)));
+    // The unwind dropped the async block's locals, the argument among them; the
+    // poisoned future stays in its slot until shutdown.
+    assert_eq!(drops.get(), 1);
+    a.shutdown();
+    assert_eq!(drops.get(), 1);
+    drop(a);
+    assert_eq!(drops.get(), 1);
+}
+
 #[derive(Debug, PartialEq)]
 struct Odd(u32);
 

@@ -54,13 +54,39 @@ impl<Fut: Future> Future for Joinable<Fut> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // SAFETY: `future` is structurally pinned: it is never moved out.
         let this = unsafe { self.get_unchecked_mut() };
-        let Poll::Ready(value) = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx) else {
-            return Poll::Pending;
-        };
         if this.join.is_some() {
-            send(&mut this.join, value);
+            return poll_joined(this, cx);
         }
-        Poll::Ready(())
+        // Detached: the value is dropped here.
+        match unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Drops the sender if the task's poll unwinds, so the handle is canceled at
+/// once rather than when the panicked runtime shuts down.
+struct CancelOnUnwind<'a, T>(&'a mut Option<Sender<T>>);
+
+impl<T> Drop for CancelOnUnwind<'_, T> {
+    fn drop(&mut self) {
+        cancel(self.0);
+    }
+}
+
+#[inline(never)]
+fn poll_joined<Fut: Future>(this: &mut Joinable<Fut>, cx: &mut Context<'_>) -> Poll<()> {
+    let guard = CancelOnUnwind(&mut this.join);
+    // SAFETY: as in `poll`.
+    let poll = unsafe { Pin::new_unchecked(&mut this.future) }.poll(cx);
+    std::mem::forget(guard);
+    match poll {
+        Poll::Ready(value) => {
+            send(&mut this.join, value);
+            Poll::Ready(())
+        }
+        Poll::Pending => Poll::Pending,
     }
 }
 
@@ -76,13 +102,18 @@ impl<Fut: Future> Drop for Joinable<Fut> {
 /// The result of a task spawned with [`crate::Spawner::spawn_join`].
 ///
 /// Resolves to the task's return value, at once if the task already finished,
-/// or to `Err(Canceled)` if the task was dropped before it finished (its
-/// runtime shut down, or a panic unwound through it). Dropping the handle
+/// or to `Err(Canceled)` if the task ends without a value: its runtime shut
+/// down or was dropped first, or its poll panicked. Dropping the handle
 /// detaches the task: its value is dropped when it completes, or now if it
 /// already did. Accepts any waker. Not `Send` or `Sync`.
 #[must_use = "dropping a JoinHandle detaches its task"]
-#[derive(Debug)]
 pub struct JoinHandle<T>(Receiver<T>);
+
+impl<T> std::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinHandle").finish_non_exhaustive()
+    }
+}
 
 impl<T> JoinHandle<T> {
     pub(crate) fn new(receiver: Receiver<T>) -> Self {
