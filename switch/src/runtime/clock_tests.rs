@@ -24,7 +24,7 @@ struct TimedTask {
     deadline: u64,
     registrations: usize,
     tokens: Rc<RefCell<Vec<Token>>>,
-    header: Rc<Cell<*mut TaskHeader>>,
+    header: Rc<Cell<*const TaskHeader>>,
     polls: Rc<Cell<usize>>,
     drops: Rc<Cell<usize>>,
 }
@@ -35,7 +35,7 @@ impl TimedTask {
             deadline,
             registrations,
             tokens: Rc::new(RefCell::new(Vec::new())),
-            header: Rc::new(Cell::new(std::ptr::null_mut())),
+            header: Rc::new(Cell::new(std::ptr::null())),
             polls: Rc::new(Cell::new(0)),
             drops: Rc::new(Cell::new(0)),
         }
@@ -45,7 +45,8 @@ impl Future for TimedTask {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.polls.set(self.polls.get() + 1);
-        let header = crate::waker::task_from_waker(cx.waker()).as_ptr();
+        let header = unsafe { (*self.root).current };
+        assert_eq!(cx.waker().data(), header.cast());
         self.header.set(header);
         unsafe {
             if (*self.root).timers.current_tick() >= self.deadline {
@@ -66,7 +67,7 @@ impl Drop for TimedTask {
         self.drops.set(self.drops.get() + 1);
         if !self.header.get().is_null() {
             unsafe {
-                assert_eq!((*self.header.get()).reg_head, NIL);
+                assert_eq!(TaskHeader::reg_head(self.header.get()).get(), NIL);
             }
         }
     }
@@ -89,7 +90,11 @@ fn regressed_time_preserves_clock_timer_and_task_state() {
     let task = TimedTask::new(&runtime, 110, 2);
     let polls = task.polls.clone();
     let drops = task.drops.clone();
-    runtime.spawner().spawn(task).unwrap();
+    #[switch::task]
+    fn timed(task: TimedTask) -> impl Future<Output = ()> {
+        task
+    }
+    runtime.spawner().spawn(timed(task)).unwrap();
     assert_eq!(runtime.poll(100).unwrap(), report(1, 0, 0, 0, 1));
     for now in [99, 0] {
         assert_eq!(
@@ -119,12 +124,7 @@ fn spawned_task_enters_current_snapshot_and_future_spawn_selfwake_enter_next() {
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             if self.step == 0 {
                 self.step = 1;
-                let ran = self.ran.clone();
-                self.spawner
-                    .spawn(async move {
-                        ran.set(ran.get() + 1);
-                    })
-                    .unwrap();
+                self.spawner.spawn(count_task(self.ran.clone())).unwrap();
                 cx.waker().wake_by_ref();
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -141,7 +141,11 @@ fn spawned_task_enters_current_snapshot_and_future_spawn_selfwake_enter_next() {
         step: 0,
         ran: ran.clone(),
     };
-    spawner.spawn(parent).unwrap();
+    #[switch::task]
+    fn parent_task(task: Parent) -> impl Future<Output = ()> {
+        task
+    }
+    spawner.spawn(parent_task(parent)).unwrap();
     assert_eq!(runtime.poll(7).unwrap(), report(1, 0, 0, 2, 2));
     assert_eq!(ran.get(), 0);
     assert_eq!(runtime.poll(7).unwrap(), report(2, 2, 0, 0, 0));
@@ -161,7 +165,11 @@ fn terminal_selfwake_claim_is_not_ready_and_drains_with_zero_future_polls() {
     }
     let mut runtime = Runtime::new(0);
     let polls = Rc::new(Cell::new(0));
-    runtime.spawner().spawn(ReadyWake(polls.clone())).unwrap();
+    #[switch::task]
+    fn ready_wake(polls: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+        ReadyWake(polls)
+    }
+    runtime.spawner().spawn(ready_wake(polls.clone())).unwrap();
     assert_eq!(runtime.poll(0).unwrap(), report(1, 1, 0, 0, 0));
     assert_eq!(runtime.poll(0).unwrap(), PollReport::default());
     assert_eq!(polls.get(), 1);

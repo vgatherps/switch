@@ -39,6 +39,26 @@ impl Drop for YieldingSleep {
     }
 }
 
+#[switch::task]
+fn yielding_sleep(
+    sleep: Sleep,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+    trace: Rc<RefCell<Vec<&'static str>>>,
+) -> impl Future<Output = ()> {
+    YieldingSleep {
+        sleep,
+        polls,
+        drops,
+        trace,
+    }
+}
+
+#[switch::task]
+async fn push_spawned_ready(trace: Rc<RefCell<Vec<&'static str>>>) {
+    trace.borrow_mut().push("spawned ready");
+}
+
 #[test]
 fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
     let mut runtime = Runtime::new(10);
@@ -47,12 +67,12 @@ fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
     let drops = Rc::new(Cell::new(0));
     let trace = Rc::new(RefCell::new(Vec::new()));
     spawner
-        .spawn(YieldingSleep {
-            sleep: spawner.sleep_until(20).unwrap(),
-            polls: polls.clone(),
-            drops: drops.clone(),
-            trace: trace.clone(),
-        })
+        .spawn(yielding_sleep(
+            spawner.sleep_until(20).unwrap(),
+            polls.clone(),
+            drops.clone(),
+            trace.clone(),
+        ))
         .unwrap();
     for _ in 0..2 {
         assert_eq!(
@@ -67,12 +87,7 @@ fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
         );
     }
     assert_eq!((polls.get(), drops.get()), (2, 0));
-    let spawned_trace = trace.clone();
-    spawner
-        .spawn(async move {
-            spawned_trace.borrow_mut().push("spawned ready");
-        })
-        .unwrap();
+    spawner.spawn(push_spawned_ready(trace.clone())).unwrap();
     let expired = runtime.poll(20).unwrap();
     assert_eq!(
         expired,
@@ -87,13 +102,7 @@ fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
     assert_eq!((polls.get(), drops.get()), (3, 1));
     assert_eq!(
         *trace.borrow(),
-        [
-            "pending",
-            "pending",
-            "sleep ready",
-            "drop",
-            "spawned ready"
-        ]
+        ["pending", "pending", "sleep ready", "drop", "spawned ready"]
     );
     assert_eq!(
         runtime.poll(19),
@@ -112,7 +121,10 @@ fn empty_long_jump_accepts_max_and_keeps_clock_on_regression() {
     let spawner = runtime.spawner();
     let report = runtime.poll(u64::MAX).unwrap();
     assert_eq!(report, PollReport::default());
-    assert_eq!(spawner.sleep(1).err(), Some(switch::SleepError::DeadlineOverflow));
+    assert_eq!(
+        spawner.sleep(1).err(),
+        Some(switch::SleepError::DeadlineOverflow)
+    );
     assert_eq!(
         runtime.poll(u64::MAX - 1),
         Err(RuntimeError::TimeRegressed {

@@ -1,12 +1,24 @@
 use super::*;
-use crate::StoredWaker;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 #[path = "clock_tests.rs"]
 mod clock_tests;
+
+#[switch::task]
+async fn empty() {}
+
+#[switch::task]
+fn counted(task: Counted) -> impl Future<Output = ()> {
+    task
+}
+
+#[switch::task]
+async fn count_task(count: Rc<Cell<usize>>) {
+    count.set(count.get() + 1);
+}
 
 enum Finish {
     Ready,
@@ -48,7 +60,7 @@ impl Drop for Counted {
         self.drops.set(self.drops.get() + 1);
         if let Some(spawner) = &self.held_spawner {
             assert_eq!(
-                spawner.spawn(async {}).unwrap_err().reason,
+                spawner.spawn(empty()).unwrap_err().reason,
                 RuntimeError::Closed
             );
         }
@@ -69,7 +81,7 @@ fn moving_owner_with_live_task_keeps_root_stable() {
     let task = Counted::new(Finish::Ready);
     let polls = task.polls.clone();
     let drops = task.drops.clone();
-    spawner.spawn(task).unwrap();
+    spawner.spawn(counted(task)).unwrap();
     let root = core(&runtime);
     let mut runtime = Box::new(runtime);
     assert_eq!(core(&runtime), root);
@@ -77,7 +89,7 @@ fn moving_owner_with_live_task_keeps_root_stable() {
     assert_eq!((polls.get(), drops.get()), (1, 1));
     drop(runtime);
     assert_eq!(
-        spawner.spawn(async {}).unwrap_err().reason,
+        spawner.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
 }
@@ -91,13 +103,13 @@ fn two_owners_have_independent_tasks_and_teardown() {
     let task_a = Counted::new(Finish::Ready);
     let task_b = Counted::new(Finish::Ready);
     let ran = [task_a.polls.clone(), task_b.polls.clone()];
-    sa.spawn(task_a).unwrap();
-    sb.spawn(task_b).unwrap();
+    sa.spawn(counted(task_a)).unwrap();
+    sb.spawn(counted(task_b)).unwrap();
     assert_ne!(core(&a), core(&b));
     assert_eq!(a.poll(0).unwrap().tasks_polled, 1);
     assert_eq!((ran[0].get(), ran[1].get()), (1, 0));
     a.shutdown();
-    assert_eq!(sa.spawn(async {}).unwrap_err().reason, RuntimeError::Closed);
+    assert_eq!(sa.spawn(empty()).unwrap_err().reason, RuntimeError::Closed);
     assert_eq!(b.poll(u64::MAX).unwrap().tasks_polled, 1);
     assert_eq!((ran[0].get(), ran[1].get()), (1, 1));
 }
@@ -106,23 +118,26 @@ fn two_owners_have_independent_tasks_and_teardown() {
 fn explicit_shutdown_is_idempotent_and_escaped_spawner_stays_closed() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
-    spawner.spawn(async {}).unwrap(); // async blocks need no Debug implementation.
+    spawner.spawn(empty()).unwrap(); // async blocks need no Debug implementation.
     runtime.shutdown();
     runtime.shutdown();
     assert_eq!(
-        spawner.spawn(async {}).unwrap_err().reason,
+        spawner.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
     drop(runtime);
     assert_eq!(
-        spawner.spawn(async {}).unwrap_err().reason,
+        spawner.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
 }
 
 #[test]
 fn rejected_future_is_returned_without_hidden_drop() {
-    struct Identified(Rc<()>, Rc<Cell<usize>>);
+    struct Identified {
+        _identity: Rc<()>,
+        drops: Rc<Cell<usize>>,
+    }
     impl Future for Identified {
         type Output = ();
         fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
@@ -131,7 +146,7 @@ fn rejected_future_is_returned_without_hidden_drop() {
     }
     impl Drop for Identified {
         fn drop(&mut self) {
-            self.1.set(self.1.get() + 1);
+            self.drops.set(self.drops.get() + 1);
         }
     }
     let mut runtime = Runtime::new(0);
@@ -139,15 +154,24 @@ fn rejected_future_is_returned_without_hidden_drop() {
     runtime.shutdown();
     let identity = Rc::new(());
     let drops = Rc::new(Cell::new(0));
+    #[switch::task]
+    fn identified(task: Identified) -> impl Future<Output = ()> {
+        task
+    }
     let error = spawner
-        .spawn(Identified(identity.clone(), drops.clone()))
+        .spawn(identified(Identified {
+            _identity: identity.clone(),
+            drops: drops.clone(),
+        }))
         .unwrap_err();
     assert_eq!(error.reason, RuntimeError::Closed);
-    assert!(Rc::ptr_eq(&identity, &error.future.0));
+    // The returned token still holds the original argument.
+    assert_eq!(Rc::strong_count(&identity), 2);
     assert_eq!(drops.get(), 0);
     assert!(format!("{error:?}").contains("Closed"));
-    drop(error.future);
+    drop(error.token);
     assert_eq!(drops.get(), 1);
+    assert_eq!(Rc::strong_count(&identity), 1);
 }
 
 #[test]
@@ -156,20 +180,20 @@ fn panicked_core_rejects_submission_and_still_shuts_down() {
     let spawner = runtime.spawner();
     let failing = Counted::new(Finish::Panic);
     let drops = failing.drops.clone();
-    spawner.spawn(failing).unwrap();
+    spawner.spawn(counted(failing)).unwrap();
     let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(0))).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
     let rejected = Counted::new(Finish::Ready);
     let rejected_drops = rejected.drops.clone();
-    let error = spawner.spawn(rejected).unwrap_err();
+    let error = spawner.spawn(counted(rejected)).unwrap_err();
     assert_eq!(error.reason, RuntimeError::Panicked);
     assert_eq!(rejected_drops.get(), 0);
-    drop(error.future);
+    drop(error.token);
     assert_eq!(rejected_drops.get(), 1);
     runtime.shutdown();
     assert_eq!(drops.get(), 1);
     assert_eq!(
-        spawner.spawn(async {}).unwrap_err().reason,
+        spawner.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
 }
@@ -184,32 +208,24 @@ fn nested_spawner_grows_queues_without_repolling_current_batch() {
         },
     );
     let spawner = runtime.spawner();
-    let inner_spawner = spawner.clone();
+    #[switch::task]
+    async fn spawn_many(spawner: Spawner, count: Rc<Cell<usize>>) {
+        for _ in 0..(DEFAULT_CAPACITY * 3) {
+            spawner.spawn(count_task(count.clone())).unwrap();
+        }
+    }
     let count = Rc::new(Cell::new(0));
-    let inner_count = count.clone();
     spawner
-        .spawn(async move {
-            for _ in 0..(DEFAULT_CAPACITY * 3) {
-                let count = inner_count.clone();
-                inner_spawner
-                    .spawn(async move {
-                        count.set(count.get() + 1);
-                    })
-                    .unwrap();
-            }
-        })
+        .spawn(spawn_many(spawner.clone(), count.clone()))
         .unwrap();
-    spawner.spawn(async {}).unwrap();
+    spawner.spawn(empty()).unwrap();
     let root = core(&runtime);
     assert_eq!(runtime.poll(9).unwrap().tasks_polled, 2);
     assert_eq!(count.get(), 0);
     unsafe {
         assert_eq!(Executor::task_count(root), DEFAULT_CAPACITY * 3);
     }
-    assert_eq!(
-        runtime.poll(9).unwrap().tasks_polled,
-        DEFAULT_CAPACITY * 3
-    );
+    assert_eq!(runtime.poll(9).unwrap().tasks_polled, DEFAULT_CAPACITY * 3);
     assert_eq!(count.get(), DEFAULT_CAPACITY * 3);
     unsafe {
         assert_eq!(Executor::task_count(root), 0);
@@ -219,7 +235,7 @@ fn nested_spawner_grows_queues_without_repolling_current_batch() {
 #[test]
 fn woken_and_spawned_tasks_poll_in_the_same_turn() {
     struct Parked {
-        wake: Rc<Cell<Option<StoredWaker>>>,
+        wake: Rc<Cell<Option<Waker>>>,
         polls: Rc<Cell<usize>>,
     }
     impl Future for Parked {
@@ -227,7 +243,7 @@ fn woken_and_spawned_tasks_poll_in_the_same_turn() {
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             self.polls.set(self.polls.get() + 1);
             if self.polls.get() == 1 {
-                self.wake.set(Some(unsafe { StoredWaker::new(cx) }));
+                self.wake.set(Some(cx.waker().clone()));
                 Poll::Pending
             } else {
                 self.wake.take();
@@ -240,11 +256,15 @@ fn woken_and_spawned_tasks_poll_in_the_same_turn() {
     let spawner = runtime.spawner();
     let wake = Rc::new(Cell::new(None));
     let parked_polls = Rc::new(Cell::new(0));
+    #[switch::task]
+    fn parked(task: Parked) -> impl Future<Output = ()> {
+        task
+    }
     spawner
-        .spawn(Parked {
+        .spawn(parked(Parked {
             wake: wake.clone(),
             polls: parked_polls.clone(),
-        })
+        }))
         .unwrap();
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     wake.take().unwrap().wake();
@@ -253,12 +273,7 @@ fn woken_and_spawned_tasks_poll_in_the_same_turn() {
     assert_eq!(parked_polls.get(), 2);
 
     let spawned_polls = Rc::new(Cell::new(0));
-    let task_polls = spawned_polls.clone();
-    spawner
-        .spawn(async move {
-            task_polls.set(task_polls.get() + 1);
-        })
-        .unwrap();
+    spawner.spawn(count_task(spawned_polls.clone())).unwrap();
     let spawned = runtime.poll(0).unwrap();
     assert_eq!((spawned.tasks_polled, spawned.tasks_completed), (1, 1));
     assert_eq!(spawned_polls.get(), 1);
@@ -272,7 +287,7 @@ fn idle_tasks_remain_owned_and_task_held_control_cycle_is_broken() {
     idle.held_spawner = Some(runtime.spawner());
     let drops = idle.drops.clone();
     let polls = idle.polls.clone();
-    runtime.spawner().spawn(idle).unwrap();
+    runtime.spawner().spawn(counted(idle)).unwrap();
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
     assert_eq!((polls.get(), drops.get()), (1, 0));
@@ -291,15 +306,16 @@ fn explicit_shutdown_resumes_after_original_destructor_panic() {
     failing.panic_drop = true;
     let drops = [survivor.drops.clone(), failing.drops.clone()];
     let spawner = runtime.spawner();
-    spawner.spawn(survivor).unwrap();
-    spawner.spawn(failing).unwrap();
+    spawner.spawn(counted(survivor)).unwrap();
+    spawner.spawn(counted(failing)).unwrap();
     let root = core(&runtime);
     let payload = catch_unwind(AssertUnwindSafe(|| runtime.shutdown())).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
-    assert_eq!((drops[0].get(), drops[1].get()), (0, 1));
+    // Drop order is unspecified; the survivor may or may not be dropped yet.
+    assert_eq!(drops[1].get(), 1);
     assert_eq!(runtime.control.root.get(), root);
     assert_eq!(
-        spawner.spawn(async {}).unwrap_err().reason,
+        spawner.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
     runtime.shutdown();
@@ -317,14 +333,14 @@ fn owner_drop_continues_cleanup_and_preserves_original_payload() {
     let mut failing = Counted::new(Finish::Pending);
     failing.panic_drop = true;
     let drops = [survivor.drops.clone(), failing.drops.clone()];
-    escaped.spawn(survivor).unwrap();
-    escaped.spawn(failing).unwrap();
+    escaped.spawn(counted(survivor)).unwrap();
+    escaped.spawn(counted(failing)).unwrap();
     let payload = catch_unwind(AssertUnwindSafe(|| drop(runtime))).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
     assert_eq!((drops[0].get(), drops[1].get()), (1, 1));
     assert!(escaped.control.root.get().is_null());
     assert_eq!(
-        escaped.spawn(async {}).unwrap_err().reason,
+        escaped.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
 }
@@ -336,7 +352,7 @@ fn owner_drop_during_existing_unwind_cleans_nonpanicking_futures() {
     let mut task = Counted::new(Finish::Pending);
     task.held_spawner = Some(escaped.clone());
     let drops = task.drops.clone();
-    escaped.spawn(task).unwrap();
+    escaped.spawn(counted(task)).unwrap();
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     let payload = catch_unwind(AssertUnwindSafe(move || {
         let _owner = runtime;
@@ -347,7 +363,7 @@ fn owner_drop_during_existing_unwind_cleans_nonpanicking_futures() {
     assert_eq!(drops.get(), 1);
     assert!(escaped.control.root.get().is_null());
     assert_eq!(
-        escaped.spawn(async {}).unwrap_err().reason,
+        escaped.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
 }

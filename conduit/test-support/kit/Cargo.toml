@@ -5,10 +5,10 @@ edition = "2021"
 publish = false
 
 [dependencies]
-dpdk-smoltcp = { path = "../../crates/dpdk-smoltcp" }
-libc = "0.2"
-zhida-buffer = { path = "../../crates/zhida-buffer" }
-zhida-dpdk-sys = { path = "../../crates/zhida-dpdk-sys" }
+dpdk-smoltcp.workspace = true
+libc.workspace = true
+zhida-buffer.workspace = true
+zhida-dpdk-sys.workspace = true
 
 [dev-dependencies]
-zhida-test-support = { path = ".." }
+zhida-test-support.workspace = true

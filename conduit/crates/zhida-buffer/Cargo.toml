@@ -1,6 +1,6 @@
 [package]
 name = "zhida-buffer"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Zero-copy, refcounted buffer abstraction for TCP packet processing"
 license.workspace = true
@@ -14,17 +14,17 @@ testing = []
 arbitrary = ["dep:arbitrary", "testing"]
 
 [dependencies]
-zhida-dpdk-sys = { path = "../zhida-dpdk-sys" }
-proptest = { version = "1.5", optional = true }
+zhida-dpdk-sys.workspace = true
+proptest = { workspace = true, optional = true }
 arbitrary = { version = "1.4", features = ["derive"], optional = true }
 
 [dev-dependencies]
-zhida-test-support = { path = "../../test-support" }
-criterion = "0.5"
-quickcheck = "1.0"
-quickcheck_macros = "1.0"
+zhida-test-support.workspace = true
+criterion.workspace = true
+quickcheck.workspace = true
+quickcheck_macros.workspace = true
 # Tests, benches and doctests get the test-only EAL/pool helpers without --features.
-zhida-buffer = { path = ".", features = ["testing"] }
+zhida-buffer = { workspace = true, features = ["testing"] }
 
 [[test]]
 name = "props"

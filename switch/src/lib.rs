@@ -20,22 +20,46 @@
 //!
 //! ## Waking
 //!
-//! Use `wake_by_ref()` or `current_task(cx).wake()` for self-waking. Cloning an ordinary
-//! `Waker` panics, so futures that require `Waker::clone()` are unsupported. Runtime
-//! primitives that retain a wake may use [`StoredWaker`], whose construction is unsafe.
+//! A task's `Waker` points at its task header. Waking, cloning and dropping it do not
+//! allocate, but only on the runtime's thread: each of them panics on another thread.
+//! Runtime primitives that park tasks can keep a [`StoredWaker`] instead: a copyable
+//! handle that wakes its task directly, without a call through the waker vtable.
 //!
-//! ## Example
+//! ## Tasks
+//!
+//! A task is one call of a function marked `#[switch::task]`: an `async fn`
+//! returning `()`, or a `fn` returning `impl Future<Output = ()>`, with arguments
+//! bound to plain identifiers. Calling it packages the arguments into a
+//! [`SpawnToken`]; `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
+//! The future must be `'static`. Each task function, and each instantiation of a
+//! generic one, has its own task blocks and capacity.
+//! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per
+//! runtime (default: one block's slots, `1 <= N < 2^25`).
 //!
 //! ```rust
 //! use switch::Runtime;
 //!
+//! #[switch::task]
+//! async fn hello(name: &'static str) {
+//!     println!("Hello, {name}!");
+//! }
+//!
 //! let mut runtime = Runtime::new(100);
 //! let spawner = runtime.spawner();
-//! spawner.spawn(async {
-//!     println!("Hello!");
-//! }).unwrap();
+//! spawner.spawn(hello("switch")).unwrap();
 //!
 //! while runtime.poll(100).unwrap().live_tasks != 0 {}
+//! ```
+//!
+//! A task future that does not fit a 64 KiB task block is a compile-time error:
+//! ```compile_fail,E0080
+//! #[switch::task]
+//! async fn too_big() {
+//!     let bulk = [0u8; 70_000];
+//!     std::future::ready(()).await;
+//!     std::hint::black_box(&bulk);
+//! }
+//! drop(too_big());
 //! ```
 //!
 //! ```compile_fail
@@ -63,6 +87,14 @@
 //! require_sync::<switch::Sleep>();
 //! ```
 //! ```compile_fail
+//! fn require_send<T: Send>() {}
+//! require_send::<switch::SpawnToken<()>>();
+//! ```
+//! ```compile_fail
+//! fn require_sync<T: Sync>() {}
+//! require_sync::<switch::SpawnToken<()>>();
+//! ```
+//! ```compile_fail
 //! fn cannot_drive(spawner: &switch::Spawner) {
 //!     spawner.poll(0);
 //! }
@@ -72,6 +104,9 @@
 //!     spawner.shutdown();
 //! }
 //! ```
+
+#[cfg(test)]
+extern crate self as switch;
 
 mod executor;
 pub(crate) mod intrusive;
@@ -84,7 +119,12 @@ mod waker;
 
 pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
-pub use waker::{StoredWaker, ThinWaker, current_task};
+pub use switch_macros::task;
+pub use task::SpawnToken;
+pub use waker::StoredWaker;
+
+#[doc(hidden)]
+pub use task::private as __private;
 
 #[cfg(test)]
 mod extraction_smoke;

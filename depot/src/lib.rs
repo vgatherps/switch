@@ -6,6 +6,8 @@
 use std::cell::UnsafeCell;
 use std::num::NonZeroU32;
 
+mod algorithm;
+mod dyn_depot;
 pub mod fixed;
 mod index_ring;
 pub mod pool;
@@ -15,6 +17,7 @@ mod stress_tests;
 #[cfg(any(test, feature = "test-utils"))]
 mod test_heap;
 
+pub use dyn_depot::DynDepot;
 pub use fixed::FixedDepot;
 #[doc(hidden)]
 pub use pool::{

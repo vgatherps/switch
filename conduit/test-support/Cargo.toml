@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
-zhida-test-support-macros = { path = "macros" }
-libc = "0.2"
+zhida-test-support-macros.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
-proptest = "1.5"
+proptest.workspace = true

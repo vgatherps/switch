@@ -1414,6 +1414,30 @@ name = "switch"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "depot",
+ "switch-macros",
+]
+
+[[package]]
+name = "switch-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "switch",
+ "syn 2.0.119",
+ "trybuild",
+]
+
+[[package]]
+name = "switchnet"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "dpdk-smoltcp",
+ "switch",
+ "zhida-test-kit",
+ "zhida-test-support",
 ]
 
 [[package]]

@@ -1,0 +1,22 @@
+[package]
+name = "switchnet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+dpdk-smoltcp.workspace = true
+switch.workspace = true
+
+[dev-dependencies]
+zhida-test-kit.workspace = true
+zhida-test-support.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "turn"
+harness = false
+
+[lints]
+workspace = true

@@ -1,13 +1,15 @@
 [package]
 name = "switch"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-3.0-only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+depot.workspace = true
+switch-macros.workspace = true
 
 [dev-dependencies]
-criterion = "0.5"
+criterion.workspace = true
 
 [[bench]]
 name = "executor"

@@ -69,6 +69,20 @@ impl Drop for Task {
         self.audit.drops.set(self.audit.drops.get() + 1);
     }
 }
+#[switch::task]
+fn mixed_task(
+    sleeps: Vec<Sleep>,
+    yields: usize,
+    value: u64,
+    audit: Rc<Audit>,
+) -> impl Future<Output = ()> {
+    Task {
+        sleeps,
+        yields,
+        value,
+        audit,
+    }
+}
 pub struct Mixed {
     pub runtime: Runtime,
     pub audit: Rc<Audit>,
@@ -91,20 +105,10 @@ impl Mixed {
         });
         let sleeps = (0..32).map(|_| spawner.sleep_until(102).unwrap()).collect();
         spawner
-            .spawn(Task {
-                sleeps,
-                yields: 0,
-                value: 528,
-                audit: audit.clone(),
-            })
+            .spawn(mixed_task(sleeps, 0, 528, audit.clone()))
             .unwrap();
         spawner
-            .spawn(Task {
-                sleeps: Vec::new(),
-                yields: 1,
-                value: 40,
-                audit: audit.clone(),
-            })
+            .spawn(mixed_task(Vec::new(), 1, 40, audit.clone()))
             .unwrap();
         Self {
             runtime,
@@ -135,12 +139,7 @@ impl Mixed {
                 Vec::new()
             };
             spawner
-                .spawn(Task {
-                    sleeps,
-                    yields: 0,
-                    value,
-                    audit: audit.clone(),
-                })
+                .spawn(mixed_task(sleeps, 0, value, audit.clone()))
                 .unwrap();
         }
         self.runtime.poll(TICKS[index]).unwrap()
@@ -186,6 +185,20 @@ impl Drop for Repeated {
         self.drops.set(self.drops.get() + 1);
     }
 }
+#[switch::task]
+fn repeated(
+    sleep: Sleep,
+    stop: Rc<Cell<bool>>,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+) -> impl Future<Output = ()> {
+    Repeated {
+        sleep,
+        stop,
+        polls,
+        drops,
+    }
+}
 impl PendingSleep {
     pub fn new() -> Self {
         let mut runtime = Runtime::with_capacity(
@@ -200,12 +213,12 @@ impl PendingSleep {
         let drops = Rc::new(Cell::new(0));
         let stop = Rc::new(Cell::new(false));
         spawner
-            .spawn(Repeated {
-                sleep: spawner.sleep_until(u64::MAX).unwrap(),
-                stop: stop.clone(),
-                polls: polls.clone(),
-                drops: drops.clone(),
-            })
+            .spawn(repeated(
+                spawner.sleep_until(u64::MAX).unwrap(),
+                stop.clone(),
+                polls.clone(),
+                drops.clone(),
+            ))
             .unwrap();
         runtime.poll(0).unwrap();
         Self {

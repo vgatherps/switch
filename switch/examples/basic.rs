@@ -19,24 +19,25 @@ impl Future for YieldOnce {
     }
 }
 
+#[switch::task]
+async fn immediate() {
+    println!("Task 1: immediate");
+}
+
+#[switch::task]
+async fn yield_once() {
+    println!("Task 2: start");
+    YieldOnce(false).await;
+    println!("Task 2: after yield");
+}
+
 fn main() {
     println!("=== switch runtime example ===\n");
     let mut runtime = switch::Runtime::new(0);
     let spawner = runtime.spawner();
 
-    spawner
-        .spawn(async {
-            println!("Task 1: immediate");
-        })
-        .unwrap();
-
-    spawner
-        .spawn(async {
-            println!("Task 2: start");
-            YieldOnce(false).await;
-            println!("Task 2: after yield");
-        })
-        .unwrap();
+    spawner.spawn(immediate()).unwrap();
+    spawner.spawn(yield_once()).unwrap();
 
     loop {
         let report = runtime.poll(0).unwrap();

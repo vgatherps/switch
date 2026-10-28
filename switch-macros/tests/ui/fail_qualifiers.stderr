@@ -1,0 +1,17 @@
+error: `#[switch::task]` functions cannot be const, unsafe or extern
+ --> tests/ui/fail_qualifiers.rs:2:1
+  |
+2 | const fn constant() -> impl std::future::Future<Output = ()> {
+  | ^^^^^
+
+error: `#[switch::task]` functions cannot be const, unsafe or extern
+ --> tests/ui/fail_qualifiers.rs:7:7
+  |
+7 | async unsafe fn not_safe() {}
+  |       ^^^^^^
+
+error: `#[switch::task]` functions cannot be const, unsafe or extern
+  --> tests/ui/fail_qualifiers.rs:10:1
+   |
+10 | extern "C" fn foreign() -> impl std::future::Future<Output = ()> {
+   | ^^^^^^

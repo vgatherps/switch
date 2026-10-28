@@ -1,0 +1,20 @@
+error[E0080]: evaluation panicked: task capacity must be at least 1 and below 2^25
+ --> tests/ui/fail_capacity.rs:1:27
+  |
+1 | #[switch::task(capacity = 0)]
+  |                           ^ evaluation of `zero::{constant#0}` failed inside this call
+  |
+note: inside `switch::__private::Capacity::new`
+ --> $WORKSPACE/switch/src/task/private.rs
+  |
+  | /         assert!(
+  | |             n >= 1 && n < 1 << 25,
+  | |             "task capacity must be at least 1 and below 2^25"
+  | |         );
+  | |_________^ the failure occurred here
+
+note: erroneous constant encountered
+ --> tests/ui/fail_capacity.rs:1:27
+  |
+1 | #[switch::task(capacity = 0)]
+  |                           ^

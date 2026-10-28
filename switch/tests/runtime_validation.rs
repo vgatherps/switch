@@ -37,6 +37,14 @@ impl Drop for Retain {
         self.drops.set(self.drops.get() + 1);
     }
 }
+#[switch::task]
+fn retain(sleep: Sleep, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+    Retain {
+        sleep,
+        registered: false,
+        drops,
+    }
+}
 struct Counted {
     mode: u8,
     polls: Rc<Cell<usize>>,
@@ -58,6 +66,12 @@ impl Drop for Counted {
         self.drops.set(self.drops.get() + 1);
     }
 }
+#[switch::task]
+fn counted(mode: u8, polls: Rc<Cell<usize>>, drops: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+    Counted { mode, polls, drops }
+}
+#[switch::task]
+async fn noop() {}
 #[test]
 fn middle_batch_panic_preserves_payload_and_retires_pending_expired_and_unprocessed_tasks() {
     let mut runtime = Runtime::new(0);
@@ -65,11 +79,10 @@ fn middle_batch_panic_preserves_payload_and_retires_pending_expired_and_unproces
     let timer_drops = Rc::new(Cell::new(0));
     for deadline in [5, 10] {
         spawner
-            .spawn(Retain {
-                sleep: spawner.sleep_until(deadline).unwrap(),
-                registered: false,
-                drops: timer_drops.clone(),
-            })
+            .spawn(retain(
+                spawner.sleep_until(deadline).unwrap(),
+                timer_drops.clone(),
+            ))
             .unwrap();
     }
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 2);
@@ -78,25 +91,21 @@ fn middle_batch_panic_preserves_payload_and_retires_pending_expired_and_unproces
     // AssertUnwindSafe wraps a reviewed shutdown-only runtime; no scheduling resumes.
     for mode in 0..3 {
         spawner
-            .spawn(Counted {
+            .spawn(counted(
                 mode,
-                polls: polls[mode as usize].clone(),
-                drops: drops[mode as usize].clone(),
-            })
+                polls[mode as usize].clone(),
+                drops[mode as usize].clone(),
+            ))
             .unwrap();
     }
-    let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(5)))
-    .unwrap_err();
+    let payload = catch_unwind(AssertUnwindSafe(|| runtime.poll(5))).unwrap_err();
     assert_eq!(payload.downcast_ref::<usize>(), Some(&98765));
     assert_eq!(polls.each_ref().map(|p| p.get()), [1, 1, 0]);
     assert_eq!(drops.each_ref().map(|p| p.get()), [1, 0, 0]);
     assert_eq!(timer_drops.get(), 0);
+    assert_eq!(runtime.poll(5), Err(RuntimeError::Panicked));
     assert_eq!(
-        runtime.poll(5),
-        Err(RuntimeError::Panicked)
-    );
-    assert_eq!(
-        spawner.spawn(async {}).unwrap_err().reason,
+        spawner.spawn(noop()).unwrap_err().reason,
         RuntimeError::Panicked
     );
     runtime.shutdown();
@@ -157,8 +166,12 @@ fn double_panic_child() {
             panic!("future-destructor-marker");
         }
     }
+    #[switch::task]
+    fn panic_drop() -> impl Future<Output = ()> {
+        PanicDrop
+    }
     let runtime = Runtime::new(0);
-    runtime.spawner().spawn(PanicDrop).unwrap();
+    runtime.spawner().spawn(panic_drop()).unwrap();
     panic!("original-unwind-marker");
 }
 
