@@ -131,9 +131,10 @@ impl TxQueue {
             return 0;
         }
         let old_len = buf.len();
+        // A frame the app filled past `cap` (up to its capacity) takes no more bytes.
         let count = (buf.capacity() - old_len)
             .min(byte_room)
-            .min(cap - old_len)
+            .min(cap.saturating_sub(old_len))
             .min(data.len());
         let new_len = old_len + count;
         buf.room_mut()[old_len..new_len].copy_from_slice(&data[..count]);
@@ -152,7 +153,7 @@ impl TxQueue {
         if first_never_sent > entry.start() || !buf.unique() {
             return 0;
         }
-        (cap - buf.len())
+        cap.saturating_sub(buf.len())
             .min(buf.capacity() - buf.len())
             .min(self.byte_room())
     }

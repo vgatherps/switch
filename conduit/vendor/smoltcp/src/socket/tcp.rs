@@ -5922,6 +5922,26 @@ mod test {
         assert_eq!(alloc.live(), 1);
     }
 
+    /// An unsent frame the app filled past the segment payload P takes no appended bytes: with
+    /// no free slot `can_send` is false and `send_slice` writes nothing; with a free slot the
+    /// bytes go to a new frame.
+    #[test]
+    fn frame_longer_than_mss_takes_no_appended_bytes() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(16, 1, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
+        assert!(!s.can_send());
+        assert_eq!(s.frame_send_room(), 0);
+        assert_eq!(s.send_slice(b"x"), Ok(0));
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 1));
+
+        let mut s = frame_socket(16, 2, 4, source.clone());
+        assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
+        assert!(s.can_send());
+        assert_eq!(s.send_slice(b"x"), Ok(1));
+        assert_eq!((s.send_queue(), s.tx_queue.frames()), (7, 2));
+    }
+
     #[test]
     fn frame_send_slice_caps_at_bytes_and_slots() {
         let source = crate::tests::tx_test_source(4);
