@@ -1,8 +1,8 @@
 //! switchnet send side against a raw conduit Stack peer on net_ring; every
 //! future runs as a switch task.
 
-use std::cell::RefCell;
-use std::future::{Future, poll_fn};
+use std::cell::{Cell, RefCell};
+use std::future::{Future, pending, poll_fn};
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
@@ -14,8 +14,8 @@ use zhida_test_kit::with_eal;
 
 mod support;
 use support::{
-    connect, connect_with, counted, net_ip, peer_drain, peer_ip, peer_udp_send, tcp_config, udp_config, Mixed,
-    LOCAL_PORT,
+    cancel_after_one_poll, connect, connect_with, counted, net_ip, peer_drain, peer_ip, peer_send, peer_udp_send,
+    tcp_config, udp_config, Mixed, LOCAL_PORT,
 };
 
 /// Bytes per frame: below the 1460-byte segment payload, so frames go out whole.
@@ -331,6 +331,133 @@ fn udp_halves_receive_and_send_a_frame() {
         assert_eq!(pong.payload(), b"pong");
         assert_eq!(pong.src(), IpEndpoint::new(net_ip().into(), 7000));
         drop((ping, pong, rx, tx, peer));
+        mixed.close();
+    })
+}
+
+/// Free bytes, not frame slots, limit `room`. With `tx_capacity` 1500 the
+/// socket has 6 frame slots; one 1000-byte frame queued leaves 5 slots but
+/// 500 bytes, so `room(400)` resolves and `room(1000)` parks. The peer's ACK
+/// frees the bytes, and `try_send` of a 1000-byte frame then succeeds at once.
+#[zhida_test_support::pinned_test]
+fn room_waits_for_bytes_while_frame_slots_remain() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["rbya", "rbyb"]);
+        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
+        let (_rx, mut tx) = stream.split();
+        let data = pattern(2 * CHUNK, 17);
+        let handle = mixed.handle();
+        let sent = data.clone();
+        let (task, polls) = counted(async move {
+            let first = filled(&handle, &sent[..CHUNK]).await;
+            tx.try_send(first).map_err(|(_, error)| error).unwrap();
+            assert_eq!(poll_once(tx.room(400)).await, Some(Ok(())), "a free slot and 500 free bytes");
+            let second = filled(&handle, &sent[CHUNK..]).await;
+            tx.room(CHUNK).await.unwrap();
+            tx.try_send(second).map_err(|(_, error)| error).unwrap();
+            tx
+        });
+        let slot = mixed.spawn(task);
+        mixed.turn();
+        assert_eq!(polls.get(), 1);
+        assert!(!slot.is_full(), "room(1000) resolved with 500 free bytes");
+        let got = peer_receive(&mut mixed, &peer, data.len());
+        assert_eq!(got, data);
+        assert_eq!(polls.get(), 2, "woken more than once by the ACK");
+        drop((slot.take(), _rx, peer));
+        mixed.close();
+    })
+}
+
+/// Dropping the send half sends no FIN: the receive half keeps receiving
+/// and the peer stays Established.
+#[zhida_test_support::pinned_test]
+fn dropping_the_send_half_keeps_receiving() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["dtxa", "dtxb"]);
+        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let (mut rx, tx) = stream.split();
+        let reader = mixed.spawn(async move { (rx.recv().await.unwrap().payload().to_vec(), rx) });
+        mixed.turn();
+        assert!(!reader.is_full());
+        drop(tx);
+        peer_send(&mut mixed, &peer, b"still open");
+        let (bytes, rx) = mixed.wait(&reader);
+        assert_eq!(bytes, b"still open");
+        mixed.rounds(10);
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::Established);
+        drop((rx, peer));
+        mixed.close();
+    })
+}
+
+/// Dropping the receive half leaves a writer parked in `room` working: once
+/// the peer reads, everything arrives.
+#[zhida_test_support::pinned_test]
+fn dropping_the_receive_half_keeps_a_parked_writer() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["drxa", "drxb"]);
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
+        let (rx, mut tx) = stream.split();
+        let data = pattern(128 * 1024, 19);
+        let handle = mixed.handle();
+        let sent = data.clone();
+        let (task, polls) = counted(async move {
+            send_all(&handle, &mut tx, &sent).await;
+            tx
+        });
+        let slot = mixed.spawn(task);
+        mixed.rounds(50);
+        let parked = polls.get();
+        mixed.rounds(20);
+        assert_eq!(polls.get(), parked, "the writer is not parked");
+        drop(rx);
+        let got = peer_receive(&mut mixed, &peer, data.len());
+        assert_eq!(got, data);
+        mixed.until(|_| slot.is_full());
+        drop((slot.take(), peer));
+        mixed.close();
+    })
+}
+
+/// A `room` polled once with the send buffer full and then dropped leaves no
+/// parked task: the ACKs that free room do not poll it.
+#[zhida_test_support::pinned_test]
+fn canceled_room_clears_its_parked_handle() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["crma", "crmb"]);
+        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let (_rx, mut tx) = stream.split();
+        let handle = mixed.handle();
+        let queued = Rc::new(Cell::new(0));
+        let (task, polls) = counted({
+            let queued = queued.clone();
+            async move {
+                loop {
+                    let frame = filled(&handle, &[3; CHUNK]).await;
+                    match tx.try_send(frame) {
+                        Ok(()) => queued.set(queued.get() + CHUNK),
+                        Err((frame, error)) => {
+                            assert_eq!(error, SendFrameError::Full);
+                            cancel_after_one_poll(tx.room(frame.len())).await;
+                            break;
+                        }
+                    }
+                }
+                pending::<()>().await;
+                drop(tx);
+            }
+        });
+        mixed.spawn(task);
+        mixed.turn();
+        assert_eq!(polls.get(), 1);
+        let got = peer_receive(&mut mixed, &peer, queued.get());
+        assert_eq!(got.len(), queued.get());
+        mixed.rounds(10);
+        assert_eq!(polls.get(), 1, "canceled room was woken");
+        mixed.rt.shutdown();
+        drop((_rx, peer));
         mixed.close();
     })
 }
