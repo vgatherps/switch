@@ -18,10 +18,8 @@ const MTU: u16 = 256;
 const IDLE: Turn = Turn {
     rx_received: 0,
     rx_rejected: 0,
-    rx_ipv4_checksum_bad: 0,
     rx_processed: 0,
     rx_staged: 0,
-    rx_blocked: false,
     tx_accepted: 0,
     tx_pending: 0,
 };
@@ -350,7 +348,6 @@ fn receive_blocks_on_full_pending_queue() {
             Ok(Turn {
                 rx_received: 1,
                 rx_staged: 1,
-                rx_blocked: true,
                 tx_pending: 2,
                 ..IDLE
             })

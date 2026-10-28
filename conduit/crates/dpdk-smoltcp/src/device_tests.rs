@@ -71,7 +71,6 @@ fn stage(fixture: &Fixture, device: &mut Device, bytes: &[u8]) {
         RxBurst {
             accepted: 1,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0
         }
     );
     assert_eq!(device.rx.len(), staged + 1);
@@ -155,7 +154,6 @@ fn stage_checksum(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags: u
         RxBurst {
             accepted: 1,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0
         }
     );
 }
@@ -1447,7 +1445,6 @@ fn check_pcap_rx_timestamp(eal: &crate::Eal, enabled: bool) {
         RxBurst {
             accepted: 2,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0,
         }
     );
     assert_eq!(in_use(&device.port).0, 2);
@@ -2336,7 +2333,7 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         let bad = RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_BAD;
         inject(&data, bad);
         let turn = stack.turn(NOW, 4).unwrap();
-        assert_eq!((turn.rx_received, turn.rx_ipv4_checksum_bad), (1, 0));
+        assert_eq!((turn.rx_received, turn.rx_rejected), (1, 0));
         assert_eq!(stack.tcp(&handle).recv_queue(), 0);
         assert!(peer_receive(&fixture, 16).is_empty());
         assert_eq!(stack.tcp_counters().rx_checksum_bad, 1);

@@ -45,16 +45,11 @@ fn assert_arp_reply(frame: &[u8]) {
     );
 }
 
-/// (received, processed, accepted), with nothing staged, blocked or pending.
+/// (received, processed, accepted), with nothing staged or pending.
 fn counts(turn: &Turn) -> (usize, usize, usize) {
     assert_eq!(
-        (
-            turn.rx_rejected,
-            turn.rx_staged,
-            turn.rx_blocked,
-            turn.tx_pending
-        ),
-        (0, 0, false, 0),
+        (turn.rx_rejected, turn.rx_staged, turn.tx_pending),
+        (0, 0, 0),
         "{turn:?}"
     );
     (turn.rx_received, turn.rx_processed, turn.tx_accepted)

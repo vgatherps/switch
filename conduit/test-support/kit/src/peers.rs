@@ -214,13 +214,8 @@ pub fn connect_all(
             (pending_replies, pending_replies)
         );
         assert_eq!(
-            (
-                turn.rx_rejected,
-                turn.rx_staged,
-                turn.rx_blocked,
-                turn.tx_pending
-            ),
-            (0, 0, false, 0)
+            (turn.rx_rejected, turn.rx_staged, turn.tx_pending),
+            (0, 0, 0)
         );
         let (new_arps, new_syns) = respond(pair, &mut answered);
         pending_replies = new_arps + new_syns;

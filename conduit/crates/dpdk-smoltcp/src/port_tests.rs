@@ -1826,8 +1826,7 @@ fn bad_checksum_dropped_and_counted(flags: u64) {
             port.rx_burst(&mut staged).unwrap(),
             RxBurst {
                 accepted: 0,
-                rejected: 0,
-                rx_ipv4_checksum_bad: 1
+                rejected: 1,
             }
         );
         assert!(staged.is_empty());
@@ -1874,7 +1873,6 @@ fn rx(accepted: usize, rejected: usize) -> Result<RxBurst, PortError> {
     Ok(RxBurst {
         accepted,
         rejected,
-        rx_ipv4_checksum_bad: 0,
     })
 }
 

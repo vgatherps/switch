@@ -283,7 +283,6 @@ fn pending_full_would_block_and_blocks_rx_until_flush() {
         );
         assert_eq!(turn.tx_accepted, 0);
         assert_eq!(turn.tx_pending, BURST);
-        assert!(turn.rx_blocked);
         assert_eq!(pair.a.flush().unwrap().tx_accepted, 0);
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 127);
         assert_eq!(pair.a.flush().unwrap().tx_accepted, BURST);
@@ -293,7 +292,6 @@ fn pending_full_would_block_and_blocks_rx_until_flush() {
             .unwrap();
         let turn = pair.a.receive(pair::T0, BURST).unwrap();
         assert_eq!(turn.rx_processed, 1);
-        assert!(!turn.rx_blocked);
         assert_eq!(turn.tx_accepted, 1);
         assert_eq!(turn.tx_pending, 0);
         recv(&mut pair.a, &handles[0], endpoint(Side::B), b"incoming");

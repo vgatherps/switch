@@ -761,14 +761,12 @@ const BULK: usize = 64 * 1024;
 /// Turn reports over the rounds of a bulk transfer, per side.
 #[derive(Debug, Default)]
 struct Pressure {
-    rx_blocked: [usize; 2],
     max_tx_pending: [usize; 2],
 }
 
 impl Pressure {
     fn record(&mut self, round: &Round) {
         for (i, turn) in [round.a, round.b].iter().enumerate() {
-            self.rx_blocked[i] += usize::from(turn.rx_blocked);
             self.max_tx_pending[i] = self.max_tx_pending[i].max(turn.tx_pending);
         }
     }
@@ -872,7 +870,6 @@ fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
         // packets the previous turn left pending and leaves <= 1; each of
         // <= S = 8 staged frames reserves one more, so pending <= 9 < Q and TX
         // in use <= 15 + 9 < P_tx.
-        assert_eq!(pressure.rx_blocked, [0, 0]);
         // The bulk stops as soon as every byte arrived; the receivers' last ACKs can
         // still be on the wire then. Let them land before checking nothing is left.
         pair.drive_rounds(|_, _| {}, |last, _, _| if last.moved() { App::Moved } else { App::Done });
@@ -925,7 +922,6 @@ fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
         // pending; at most one ring of 7 frames arrives per round, each
         // reserving one slot, so pending <= 16 = Q and TX in use <= 7 + 16 =
         // 23 < P_tx = 32.
-        assert_eq!(pressure.rx_blocked, [0, 0]);
         // The bulk stops as soon as every byte arrived; the receivers' last ACKs can
         // still be on the wire then (measured: B's ACK of A's last 7760 bytes
         // on A's RX ring). Let them land before checking nothing is left.
@@ -1073,10 +1069,8 @@ fn admission_full_tx_ring_still_answers() {
         let idle = Turn {
             rx_received: 0,
             rx_rejected: 0,
-            rx_ipv4_checksum_bad: 0,
             rx_processed: 0,
             rx_staged: 0,
-            rx_blocked: false,
             tx_accepted: 0,
             tx_pending: 0,
         };
@@ -1198,10 +1192,8 @@ fn paused_turn(k: usize) -> Turn {
     Turn {
         rx_received: 0,
         rx_rejected: 0,
-        rx_ipv4_checksum_bad: 0,
         rx_processed: 0,
         rx_staged: 0,
-        rx_blocked: false,
         tx_accepted,
         tx_pending,
     }
@@ -1264,10 +1256,8 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
         let blocked = Turn {
             rx_received: 0,
             rx_rejected: 0,
-            rx_ipv4_checksum_bad: 0,
             rx_processed: 0,
             rx_staged: 0,
-            rx_blocked: false,
             tx_accepted: 0,
             tx_pending: 32,
         };
@@ -1278,7 +1268,6 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             b: Turn {
                 rx_received: 8,
                 rx_staged: 8,
-                rx_blocked: true,
                 ..blocked
             },
             a_to_b: 15,
@@ -1371,10 +1360,8 @@ fn rto_while_wire_paused_then_resume() {
         let full = Turn {
             rx_received: 0,
             rx_rejected: 0,
-            rx_ipv4_checksum_bad: 0,
             rx_processed: 0,
             rx_staged: 0,
-            rx_blocked: false,
             tx_accepted: 0,
             tx_pending: 32,
         };
@@ -1772,7 +1759,6 @@ impl TimedLink {
             let before = stack.tcp(&handles[side.index()]).send_queue();
             let turn = stack.receive(self.now, budget).unwrap();
             assert_eq!(turn.rx_staged, 0);
-            assert!(!turn.rx_blocked);
             let after = stack.tcp(&handles[side.index()]).send_queue();
             if side == Side::A && after < before {
                 self.ack_lens.push(before - after);

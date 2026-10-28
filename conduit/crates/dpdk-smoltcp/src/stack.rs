@@ -145,24 +145,27 @@ pub enum UdpSendFrameError {
 pub struct Turn {
     /// Packets this turn's RX burst staged.
     pub rx_received: usize,
-    /// Unsupported packets this turn's RX burst released.
+    /// Packets this turn's RX burst released: unsupported, or a bad IPv4
+    /// header checksum reported by the NIC (see `RxBurst::rejected`).
     pub rx_rejected: usize,
-    /// Frames released because the NIC reported a bad IPv4 header checksum
-    /// with the RX checksum profile on (see `RxBurst::rx_ipv4_checksum_bad`).
-    pub rx_ipv4_checksum_bad: usize,
     /// Staged packets handed to smoltcp this turn.
     pub rx_processed: usize,
-    /// Packets still staged after ingress.
+    /// Packets still staged after ingress: the budget ran out, or no reply
+    /// capacity (pending slot and TX packet) was available. An empty TX pool
+    /// also blocks receive, because Device::receive takes a TX reservation first.
     pub rx_staged: usize,
-    /// Ingress stopped with packets staged because no reply capacity (pending
-    /// slot and TX packet) was available; not set when the budget ran out.
-    /// An empty TX pool also blocks receive, because Device::receive takes
-    /// a TX reservation first.
-    pub rx_blocked: bool,
     /// Packets the PMD accepted across this call's flushes.
     pub tx_accepted: usize,
     /// Packets still pending after this call.
     pub tx_pending: usize,
+}
+
+impl Turn {
+    /// Whether this turn received, processed or transmitted anything; a turn that did not and
+    /// left nothing staged or pending is idle.
+    pub fn moved(&self) -> bool {
+        self.rx_received + self.rx_rejected + self.rx_processed + self.tx_accepted != 0
+    }
 }
 
 /// Outcome of one `Stack::send` or `Stack::flush`.
@@ -315,7 +318,7 @@ impl Stack {
     /// put the same frames on the wire with the same combined counters. When
     /// the pending queue or the TX ring is full, that flush can let more frames
     /// through in the same loop iteration: `tx_accepted` and `tx_pending`
-    /// differ, and so can a later call's `rx_blocked`.
+    /// differ, and so can a later call's `rx_staged`.
     ///
     /// Panics if `Port::alloc_tx` does: its TX done cleanup failing with an
     /// error other than `-ENOTSUP`. With `Offloads::tx_tcp_checksum` or
@@ -347,7 +350,7 @@ impl Stack {
     /// under TX backpressure (pending queue or TX ring full) `receive` then
     /// `send` can let more frames through in this loop iteration than `turn`,
     /// with different `tx_accepted` and `tx_pending`, and so a different
-    /// `rx_blocked` in a later call.
+    /// `rx_staged` in a later call.
     ///
     /// Panics if `Port::alloc_tx` does: its TX done cleanup failing with an
     /// error other than `-ENOTSUP`. With `Offloads::tx_tcp_checksum` or
@@ -454,7 +457,6 @@ impl Stack {
         self.iface.poll_maintenance(now);
 
         let mut rx_processed = 0;
-        let mut rx_blocked = false;
         while rx_processed < ingress_budget {
             match self.iface.poll_ingress_single_udp(
                 now,
@@ -462,10 +464,7 @@ impl Stack {
                 &mut self.sockets,
                 &mut self.udp,
             ) {
-                PollIngressSingleResult::None => {
-                    rx_blocked = self.device.staged() != 0;
-                    break;
-                }
+                PollIngressSingleResult::None => break,
                 PollIngressSingleResult::PacketProcessed
                 | PollIngressSingleResult::SocketStateChanged => {}
             }
@@ -475,10 +474,8 @@ impl Stack {
         Ok(Turn {
             rx_received: burst.accepted,
             rx_rejected: burst.rejected,
-            rx_ipv4_checksum_bad: burst.rx_ipv4_checksum_bad,
             rx_processed,
             rx_staged: self.device.staged(),
-            rx_blocked,
             tx_accepted,
             tx_pending: self.device.pending(),
         })
@@ -533,12 +530,11 @@ impl Stack {
     /// A non-empty DropQueue, or a dropped socket that reached CLOSED, reports
     /// the current time so the next turn processes or frees it.
     /// It does not cover frames staged or pending in the Stack. When the last
-    /// `turn` or `receive` reported `rx_staged > 0` without
-    /// `rx_blocked`, the ingress budget ran out: call it again promptly. When
-    /// an ingress call reported `rx_blocked`, or a call reported `tx_pending > 0`,
-    /// the next call progresses only once the PMD accepts frames or frees TX
-    /// packets: retry on the caller's own bounded cadence, independent of this
-    /// deadline. Pending frames leave through `flush`, or the flush inside
+    /// `turn` or `receive` reported `rx_staged > 0`, call it again promptly:
+    /// either the ingress budget ran out, or no reply capacity was free. In the
+    /// latter case, as when a call reported `tx_pending > 0`, the next call
+    /// progresses only once the PMD accepts frames or frees TX packets: retry
+    /// on the caller's own bounded cadence, independent of this deadline. Pending frames leave through `flush`, or the flush inside
     /// `turn`, `receive` or `send`. When a call reported `tx_pending > 0`, call
     /// `flush` until nothing is pending, then `send`: `send` runs egress before
     /// its flush, so a full pending queue lets it only flush. An ordinary TCP
@@ -684,7 +680,7 @@ impl Stack {
     ///
     /// `WouldBlock` means the pending queue or TX pool is full: flush, then retry.
     /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue
-    /// also blocks ingress (`Turn::rx_blocked`) if the PMD refuses its frames;
+    /// also blocks ingress (packets stay in `Turn::rx_staged`) if the PMD refuses its frames;
     /// `receive` and `turn` flush first but can remain blocked if TX cannot progress.
     /// A send loop must call `receive` or `turn` to take ARP replies and advance time.
     pub fn udp_send(

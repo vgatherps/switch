@@ -942,8 +942,8 @@ fn kernel_echo_with_held_rx() {
             );
             let turn = stack.turn(now, 32).unwrap();
             assert_eq!(
-                (turn.rx_rejected, turn.rx_ipv4_checksum_bad, turn.rx_staged),
-                (0, 0, 0)
+                (turn.rx_rejected, turn.rx_staged),
+                (0, 0)
             );
             let held = in_use(RX_POOL)
                 .checked_sub(descriptors)

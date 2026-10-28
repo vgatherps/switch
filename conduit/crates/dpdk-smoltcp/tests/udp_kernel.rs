@@ -311,7 +311,6 @@ fn turn(stack: &mut Stack, start: Instant) {
     let now = StackInstant::from_micros(i64::try_from(elapsed.as_micros()).unwrap());
     let result = stack.turn(now, BURST).unwrap();
     assert_eq!(result.rx_rejected, 0);
-    assert_eq!(result.rx_ipv4_checksum_bad, 0);
     std::thread::yield_now();
 }
 
