@@ -1,12 +1,12 @@
 //! Executor benchmarks.
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use switch::Runtime;
+use switch::{Runtime, StoredWaker};
 
 #[macro_use]
 #[path = "../tests/support/task_macro.rs"]
@@ -83,10 +83,11 @@ fn bench_many_tasks(c: &mut Criterion) {
     });
 }
 
-fn bench_waker_overhead(c: &mut Criterion) {
+/// Spawn, a first poll that self-wakes, a second poll that completes.
+fn bench_spawn_wake_complete(c: &mut Criterion) {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
-    c.bench_function("waker_wake_overhead", |b| {
+    c.bench_function("spawn_wake_complete", |b| {
         b.iter(|| {
             spawner.spawn(yield_n(1)).unwrap();
             runtime.poll(0).unwrap();
@@ -118,9 +119,6 @@ fn bench_yield_chain(c: &mut Criterion) {
 /// Pure yield benchmark - no spawn/destroy in the hot path.
 /// Spawns once, then each iteration is just: poll -> wake -> pending.
 fn bench_pure_yield(c: &mut Criterion) {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
     // Future that yields forever until we tell it to stop
     struct YieldForever {
         stop: Rc<Cell<bool>>,
@@ -194,6 +192,52 @@ fn parked_wakers(runtime: &mut Runtime, n: usize) -> Vec<Waker> {
         .iter()
         .map(|slot| slot.borrow().clone().unwrap())
         .collect()
+}
+
+/// Parks forever; publishes a `StoredWaker` taken on its first poll.
+struct PublishStored(Rc<Cell<Option<StoredWaker>>>);
+impl Future for PublishStored {
+    type Output = ();
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0.get().is_none() {
+            self.0.set(Some(StoredWaker::new(cx)));
+        }
+        Poll::Pending
+    }
+}
+
+task! {
+    fn publish_stored(slot: Rc<Cell<Option<StoredWaker>>>) -> impl Future<Output = ()> {
+        PublishStored(slot)
+    }
+}
+
+/// Wake an already-parked task, then poll it: through its std `Waker`, and
+/// through a `StoredWaker` (direct, no vtable call).
+fn bench_wake_parked(c: &mut Criterion) {
+    let mut runtime = Runtime::new(0);
+    let waker = parked_wakers(&mut runtime, 1).remove(0);
+    c.bench_function("wake_parked_waker", |b| {
+        b.iter(|| {
+            black_box(&waker).wake_by_ref();
+            black_box(runtime.poll(0).unwrap())
+        })
+    });
+    let mut runtime = Runtime::new(0);
+    let slot = Rc::new(Cell::new(None));
+    runtime
+        .spawner()
+        .spawn(publish_stored(slot.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    let stored = slot.get().unwrap();
+    c.bench_function("wake_parked_stored", |b| {
+        b.iter(|| {
+            black_box(stored).wake();
+            black_box(runtime.poll(0).unwrap())
+        })
+    });
 }
 
 fn bench_waker_clone(c: &mut Criterion) {
@@ -279,10 +323,11 @@ criterion_group!(
     bench_spawn_ready,
     bench_spawn_yield,
     bench_many_tasks,
-    bench_waker_overhead,
+    bench_spawn_wake_complete,
     bench_poll_empty,
     bench_yield_chain,
     bench_pure_yield,
+    bench_wake_parked,
     bench_waker_clone,
     bench_spawn_new_block,
     bench_wake_spread,
