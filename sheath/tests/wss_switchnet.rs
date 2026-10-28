@@ -3,7 +3,7 @@
 //! CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 
 use std::ffi::CStr;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::fd::AsRawFd;
 use std::panic::resume_unwind;
@@ -112,14 +112,21 @@ fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     (Arc::new(server), Arc::new(client))
 }
 
-/// Accepts one connection, runs the TLS handshake and the WebSocket upgrade, then `serve`.
-fn accept(listener: TcpListener, config: Arc<ServerConfig>) -> ServerWs {
+type Tls = StreamOwned<ServerConnection, std::net::TcpStream>;
+
+/// Accepts one connection; the TLS handshake runs on its first read.
+fn accept(listener: TcpListener, config: Arc<ServerConfig>) -> Tls {
     let (stream, _) = listener.accept().expect("accept the client");
     stream.set_read_timeout(Some(LIMIT)).unwrap();
     stream.set_write_timeout(Some(LIMIT)).unwrap();
-    let tls = StreamOwned::new(ServerConnection::new(config).unwrap(), stream);
+    StreamOwned::new(ServerConnection::new(config).unwrap(), stream)
+}
+
+/// The WebSocket upgrade, server side; checks the client's path and Host.
+fn upgrade(tls: Tls) -> ServerWs {
     tungstenite::accept_hdr(tls, |request: &tungstenite::handshake::server::Request, response| {
         assert_eq!(request.uri().path(), PATH);
+        assert_eq!(request.headers()["Host"], format!("{HOST}:{SERVER_PORT}").as_str());
         Ok(response)
     })
     .expect("server WebSocket handshake")
@@ -140,14 +147,14 @@ fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> 
 }
 
 /// One run: a net_tap Stack under a switchnet Net; the kernel server on a thread runs `serve`
-/// on the accepted WebSocket (after `listener_setup` on its listener); `client` runs as a
+/// on the accepted TLS stream (after `listener_setup` on its listener); `client` runs as a
 /// switch task on the connected `Wss` and hands it back. Turns the Net, calling `each_round`
 /// each time, until the client and the server are both done; the client's `Wss` is dropped
 /// only then, so what the server saw came from the client, not from its sockets closing.
 /// Returns what `serve` returned.
 fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
     listener_setup: impl FnOnce(&TcpListener),
-    serve: impl FnOnce(ServerWs) -> T + Send + 'static,
+    serve: impl FnOnce(Tls) -> T + Send + 'static,
     client: impl FnOnce(Wss) -> F + 'static,
     mut each_round: impl FnMut(),
 ) -> T {
@@ -189,7 +196,7 @@ fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
             let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
             let stream = handle.tcp_connect(socket(), remote, local).expect("open TCP").await.expect("TCP connect");
-            let wss = connect(&handle, stream, client_tls, HOST, PATH).await.expect("wss connect");
+            let wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
             *task_held.borrow_mut() = Some(client(wss).await);
         };
         rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
@@ -267,7 +274,7 @@ async fn close(wss: &mut Wss) {
 fn thousand_mixed_messages_echo_in_order() {
     let echoed = wss_run(
         |_| {},
-        echo,
+        |tls| echo(upgrade(tls)),
         |mut wss| async move {
             for i in 0..1000 {
                 let sent = text(i, message_len(i));
@@ -286,7 +293,7 @@ fn thousand_mixed_messages_echo_in_order() {
 fn message_larger_than_a_frame_echoes() {
     let echoed = wss_run(
         |_| {},
-        echo,
+        |tls| echo(upgrade(tls)),
         |mut wss| async move {
             let sent: Vec<u8> = (0..64 * 1024).map(|i| (i * 31 % 251) as u8).collect();
             wss.send(Kind::Binary, &sent).await.expect("send");
@@ -306,7 +313,8 @@ fn message_larger_than_a_frame_echoes() {
 fn server_ping_is_answered_inside_recv() {
     let pong = wss_run(
         |_| {},
-        |mut ws| {
+        |tls| {
+            let mut ws = upgrade(tls);
             ws.write(Message::Ping(b"hb".to_vec().into())).unwrap();
             ws.write(Message::Text("after the ping".into())).unwrap();
             ws.flush().unwrap();
@@ -337,7 +345,8 @@ fn server_ping_is_answered_inside_recv() {
 fn client_close_reaches_the_server_as_close_close_notify_fin() {
     let close_frame = wss_run(
         |_| {},
-        |mut ws| {
+        |tls| {
+            let mut ws = upgrade(tls);
             let frame = match ws.read() {
                 Ok(Message::Close(frame)) => frame,
                 other => panic!("expected the close: {other:?}"),
@@ -364,7 +373,8 @@ fn client_close_reaches_the_server_as_close_close_notify_fin() {
 fn server_close_ends_recv_cleanly() {
     let echo = wss_run(
         |_| {},
-        |mut ws| {
+        |tls| {
+            let mut ws = upgrade(tls);
             ws.close(Some(CloseFrame { code: CloseCode::Away, reason: "bye".into() })).unwrap();
             let echo = match ws.read() {
                 Ok(Message::Close(frame)) => frame,
@@ -413,7 +423,8 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
             };
             assert_eq!(rc, 0, "set SO_RCVBUF");
         },
-        move |mut ws| {
+        move |tls| {
+            let mut ws = upgrade(tls);
             go_rx.recv_timeout(LIMIT).expect("the go signal");
             let mut received = 0;
             while received < MESSAGES {
@@ -452,4 +463,46 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
     );
     assert!(stalled.get());
     assert_eq!(received, MESSAGES);
+}
+
+/// The server writes its 101 response and a first text frame in one write (one TLS record):
+/// the bytes after the response head reach the client as that message.
+#[zhida_test_support::pinned_test]
+fn message_in_the_same_record_as_the_upgrade_response() {
+    let echoed = wss_run(
+        |_| {},
+        |mut tls| {
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                assert_eq!(tls.read(&mut byte).expect("read the upgrade request"), 1);
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let key = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+                .expect("the client sends a key");
+            let accept = tungstenite::handshake::derive_accept_key(key.as_bytes());
+            let mut out = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .into_bytes();
+            out.extend_from_slice(&[0x81, 5]);
+            out.extend_from_slice(b"first");
+            tls.write_all(&out).unwrap();
+            tls.flush().unwrap();
+            echo(tungstenite::WebSocket::from_raw_socket(tls, tungstenite::protocol::Role::Server, None))
+        },
+        |mut wss| async move {
+            assert_eq!(recv_text(&mut wss).await, "first");
+            wss.send(Kind::Text, b"second").await.expect("send");
+            assert_eq!(recv_text(&mut wss).await, "second");
+            close(&mut wss).await;
+            wss
+        },
+        || {},
+    );
+    assert_eq!(echoed, 1);
 }

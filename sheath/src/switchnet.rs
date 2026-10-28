@@ -15,9 +15,14 @@ use switchnet::{NetHandle, RecvError, SendError, TcpRx, TcpStream, TcpTx};
 
 use crate::{Error as TlsError, TlsRx, TlsTx, TxError, encode_into};
 
-/// TCP payload per sent frame: the Ethernet MSS. A lower effective MSS makes conduit cut and
-/// copy each frame, which stays correct.
+/// Most TCP payload per sent frame: the Ethernet MSS. A lower effective MSS makes conduit cut
+/// and copy each frame, which stays correct.
 const FRAME_PAYLOAD: usize = 1460;
+
+/// The plaintext room advertised below TLS for frames of `capacity` bytes.
+fn frame_room(capacity: usize) -> usize {
+    capacity.min(FRAME_PAYLOAD)
+}
 
 /// Most bytes of the server's upgrade response accepted.
 const MAX_RESPONSE: usize = 16 * 1024;
@@ -53,6 +58,8 @@ impl relay::TxFrame for SendFrame {
 pub struct SwitchTx {
     handle: NetHandle,
     tcp: TcpTx,
+    /// `frame_room` of the Stack's frames.
+    room: usize,
 }
 
 impl PlainTx for SwitchTx {
@@ -69,7 +76,7 @@ impl PlainTx for SwitchTx {
     }
 
     fn plain(&self) -> (usize, usize) {
-        (0, FRAME_PAYLOAD)
+        (0, self.room)
     }
 
     fn seal(&mut self, mut f: SendFrame, len: usize) -> Result<SendFrame, SendError> {
@@ -151,16 +158,19 @@ impl From<WsTxError<TxError<SendError>>> for Error {
     }
 }
 
-/// The TLS handshake for `host` on `stream`, then the WebSocket upgrade for `path`.
+/// The TLS handshake for `host` on `stream`, connected to the server's `port`, then the
+/// WebSocket upgrade for `path`.
 pub async fn connect(
     handle: &NetHandle,
     stream: TcpStream,
     config: Arc<ClientConfig>,
     host: &str,
+    port: u16,
     path: &str,
 ) -> Result<Wss, Error> {
     let (mut tcp_rx, tcp) = stream.split();
-    let mut raw = SwitchTx { handle: handle.clone(), tcp };
+    let room = frame_room(handle.tx_frame().await.capacity());
+    let mut raw = SwitchTx { handle: handle.clone(), tcp, room };
     let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Upgrade(format!("server name {host}: {e}")))?;
     let mut key = [0; 16];
     config
@@ -217,7 +227,8 @@ pub async fn connect(
     let key = data_encoding::BASE64.encode(&key);
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        host = host_header(host, port),
     );
     send_bytes(&mut tls, request.as_bytes()).await.map_err(Error::Send)?;
     let response = read_response(&mut rx, &mut tls, &mut tcp_rx).await?;
@@ -280,14 +291,14 @@ async fn read_response(
     }
 }
 
-/// RFC 6455 §4.2.2: status 101, `Upgrade: websocket`, `Connection: upgrade`, and the accept key
-/// derived from `key`.
+/// RFC 6455 §4.2.2: status 101, `Upgrade: websocket`, `Connection: upgrade`, the accept key
+/// derived from `key`, and no extension or subprotocol (we offer neither).
 fn check_response(response: &[u8], key: &str) -> Result<(), Error> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut parsed = httparse::Response::new(&mut headers);
     match parsed.parse(response) {
         Ok(httparse::Status::Complete(_)) => {}
-        Ok(httparse::Status::Partial) => unreachable!("the head ends with a blank line"),
+        Ok(httparse::Status::Partial) => return Err(Error::Upgrade("incomplete response head".into())),
         Err(e) => return Err(Error::Upgrade(format!("response: {e}"))),
     }
     if parsed.code != Some(101) {
@@ -303,14 +314,29 @@ fn check_response(response: &[u8], key: &str) -> Result<(), Error> {
     if !connection.split(|&b| b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade")) {
         return Err(Error::Upgrade("no Connection: upgrade".into()));
     }
+    if header("sec-websocket-accept") != Some(accept_key(key).as_bytes()) {
+        return Err(Error::Upgrade("wrong Sec-WebSocket-Accept".into()));
+    }
+    // RFC 6455 §4.1: the server may select only what the client offered.
+    for unrequested in ["Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol"] {
+        if header(unrequested).is_some() {
+            return Err(Error::Upgrade(format!("unrequested {unrequested}")));
+        }
+    }
+    Ok(())
+}
+
+/// Sec-WebSocket-Accept for `key` (RFC 6455 §4.2.2).
+fn accept_key(key: &str) -> String {
     let mut sha1 = Sha1::new();
     sha1.update(key.as_bytes());
     sha1.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let accept = data_encoding::BASE64.encode(&sha1.finalize());
-    if header("sec-websocket-accept") != Some(accept.as_bytes()) {
-        return Err(Error::Upgrade("wrong Sec-WebSocket-Accept".into()));
-    }
-    Ok(())
+    data_encoding::BASE64.encode(&sha1.finalize())
+}
+
+/// RFC 7230 §5.4: the port only when it is not the scheme's default (wss: 443).
+fn host_header(host: &str, port: u16) -> String {
+    if port == 443 { host.to_owned() } else { format!("{host}:{port}") }
 }
 
 /// An open wss connection. A server ping is answered within `recv`; the server's close is
@@ -359,5 +385,78 @@ impl Wss {
         payload.extend_from_slice(reason.as_bytes());
         self.tx.close(&payload);
         self.tx.shutdown().await.map_err(Error::Send)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+
+    /// A valid 101 for `KEY` with `extra` header lines, minus any line naming `drop`.
+    fn response(extra: &str, drop: &str) -> Vec<u8> {
+        let lines = [
+            "HTTP/1.1 101 Switching Protocols".to_owned(),
+            "Upgrade: websocket".to_owned(),
+            "Connection: Upgrade".to_owned(),
+            format!("Sec-WebSocket-Accept: {}", accept_key(KEY)),
+        ];
+        let mut head = String::new();
+        for line in lines.iter().filter(|l| drop.is_empty() || !l.starts_with(drop)) {
+            head.push_str(line);
+            head.push_str("\r\n");
+        }
+        head.push_str(extra);
+        head.push_str("\r\n");
+        head.into_bytes()
+    }
+
+    fn upgrade_error(response: &[u8]) -> String {
+        match check_response(response, KEY) {
+            Err(Error::Upgrade(e)) => e,
+            other => panic!("expected an upgrade error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accept_key_is_rfc_6455_example() {
+        // RFC 6455 §1.3.
+        assert_eq!(accept_key(KEY), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn valid_response_passes() {
+        check_response(&response("", ""), KEY).unwrap();
+        check_response(&response("Connection: keep-alive, Upgrade\r\n", "Connection"), KEY).unwrap();
+    }
+
+    #[test]
+    fn bad_responses_are_refused() {
+        assert!(upgrade_error(&response("Sec-WebSocket-Extensions: permessage-deflate\r\n", "")).contains("Extensions"));
+        assert!(upgrade_error(&response("Sec-WebSocket-Protocol: chat\r\n", "")).contains("Protocol"));
+        assert_eq!(upgrade_error(&response("", "Sec-WebSocket-Accept")), "wrong Sec-WebSocket-Accept");
+        let wrong = format!("Sec-WebSocket-Accept: {}\r\n", accept_key("other"));
+        assert_eq!(upgrade_error(&response(&wrong, "Sec-WebSocket-Accept")), "wrong Sec-WebSocket-Accept");
+        let forbidden = String::from_utf8(response("", "")).unwrap().replace("101 Switching Protocols", "403 Forbidden");
+        assert!(upgrade_error(forbidden.as_bytes()).starts_with("status Some(403)"));
+        assert_eq!(upgrade_error(&response("", "Upgrade")), "no Upgrade: websocket");
+        assert_eq!(upgrade_error(&response("", "Connection")), "no Connection: upgrade");
+        assert_eq!(upgrade_error(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: web"), "incomplete response head");
+    }
+
+    #[test]
+    fn host_header_names_the_port_unless_443() {
+        assert_eq!(host_header("stream.example", 443), "stream.example");
+        assert_eq!(host_header("stream.example", 9443), "stream.example:9443");
+    }
+
+    /// Frames below the Ethernet MSS (an IP MTU of 1280 gives 1252 B) are advertised as they
+    /// are, so TLS never seals past the frame.
+    #[test]
+    fn frame_room_is_the_capacity_up_to_the_mss() {
+        assert_eq!(frame_room(1472), 1460);
+        assert_eq!(frame_room(1460), 1460);
+        assert_eq!(frame_room(1252), 1252);
     }
 }

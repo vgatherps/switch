@@ -75,6 +75,14 @@ enum Close {
     Sent,
 }
 
+/// State a sealed frame completes, applied as it enters the unsent slot.
+enum Done {
+    /// A data frame: the message still open after it.
+    Open(Option<Kind>),
+    Pong,
+    Close,
+}
+
 /// Send half of a connection over lower layer `L`.
 ///
 /// Each frame goes out in this order: header, mask, wait for room, seal,
@@ -119,7 +127,8 @@ impl<L: PlainTx> WsTx<L> {
 
     /// After the close frame: flush, then send the lower layer's end-of-stream
     /// record (TLS close_notify) once, then end the transport
-    /// ([`PlainTx::shutdown`]: TCP FIN). Panics if no close was queued.
+    /// ([`PlainTx::shutdown`]: TCP FIN, again on every call). Panics if no
+    /// close was queued.
     pub async fn shutdown(&mut self) -> Result<(), L::Error> {
         assert!(!matches!(self.close, Close::None), "shutdown before close");
         self.flush().await?;
@@ -127,12 +136,14 @@ impl<L: PlainTx> WsTx<L> {
             let f = self.lower.alloc().await?;
             let (_, room) = self.lower.plain();
             self.lower.room(room).await?;
+            let sealed = self.lower.seal_close(f)?;
             self.shut = true;
-            if let Some(s) = self.lower.seal_close(f)? {
-                self.send_sealed(s, room).await?;
+            if let Some(s) = sealed {
+                self.unsent = Some((s, room));
             }
-            self.lower.shutdown();
+            self.drain_unsent().await?;
         }
+        self.lower.shutdown();
         Ok(())
     }
 
@@ -154,7 +165,8 @@ impl<L: PlainTx> WsTx<L> {
     }
 
     /// Send what waits: the refused frame, then the lower layer's own records,
-    /// then a queued pong, then a queued close.
+    /// then a queued pong, then a queued close. A pong or close stays queued
+    /// until its frame is sealed, so dropping this future loses neither.
     pub async fn flush(&mut self) -> Result<(), L::Error> {
         self.drain_unsent().await?;
         while self.lower.has_pending() {
@@ -162,20 +174,15 @@ impl<L: PlainTx> WsTx<L> {
             let (_, room) = self.lower.plain();
             self.lower.room(room).await?;
             if let Some(s) = self.lower.take_pending(f)? {
-                self.send_sealed(s, room).await?;
+                self.unsent = Some((s, room));
+                self.drain_unsent().await?;
             }
         }
-        if self.pong.is_some() {
-            let f = self.lower.alloc().await?;
-            if let Some(p) = self.pong.take() {
-                self.control(f, PONG, p).await?;
-            }
+        if let Some(p) = self.pong {
+            self.control(PONG, p, Done::Pong).await?;
         }
-        if matches!(self.close, Close::Queued(_)) {
-            let f = self.lower.alloc().await?;
-            if let Close::Queued(c) = core::mem::replace(&mut self.close, Close::Sent) {
-                self.control(f, CLOSE, c).await?;
-            }
+        if let Close::Queued(c) = self.close {
+            self.control(CLOSE, c, Done::Close).await?;
         }
         Ok(())
     }
@@ -197,7 +204,8 @@ impl<L: PlainTx> WsTx<L> {
     }
 
     /// Copy `payload` out as one message, one WebSocket frame per lower-layer
-    /// frame.
+    /// frame. Dropping the future after a fragment was sealed leaves the
+    /// message open: the next `send` or `frame` of the same kind continues it.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), TxError<L::Error>> {
         let mut rest = payload;
         loop {
@@ -214,19 +222,21 @@ impl<L: PlainTx> WsTx<L> {
         }
     }
 
-    async fn control(&mut self, mut f: L::Frame, op: u8, c: Control) -> Result<(), L::Error> {
+    async fn control(&mut self, op: u8, c: Control, done: Done) -> Result<(), L::Error> {
+        let mut f = self.lower.alloc().await?;
         let (head, _) = self.lower.plain();
         let p = c.bytes();
         let h = header_len(p.len(), self.rng.is_some());
         f.room_mut()[head + h..head + h + p.len()].copy_from_slice(p);
-        self.finish(f, FIN | op, head, h, p.len()).await
+        self.finish(f, FIN | op, head, h, p.len(), done).await
     }
 
-    /// Keep `s` in the slot, then send it.
-    async fn send_sealed(&mut self, s: L::Sealed, len: usize) -> Result<(), L::Error> {
-        debug_assert!(self.unsent.is_none());
-        self.unsent = Some((s, len));
-        self.drain_unsent().await
+    fn apply(&mut self, done: Done) {
+        match done {
+            Done::Open(open) => self.open = open,
+            Done::Pong => self.pong = None,
+            Done::Close => self.close = Close::Sent,
+        }
     }
 
     /// Send the slot's frame once the lower layer has room for it. A refusal
@@ -245,8 +255,18 @@ impl<L: PlainTx> WsTx<L> {
 
     /// The payload is at `head + reserved`. Moves it down if its header is
     /// shorter than reserved, writes the header at `head`, masks, waits for
-    /// room, seals, sends.
-    async fn finish(&mut self, mut f: L::Frame, b0: u8, head: usize, reserved: usize, len: usize) -> Result<(), L::Error> {
+    /// room, seals. Only then, with no wait in between, `done` takes effect and
+    /// the sealed frame enters the unsent slot; a future dropped before that
+    /// changed nothing.
+    async fn finish(
+        &mut self,
+        mut f: L::Frame,
+        b0: u8,
+        head: usize,
+        reserved: usize,
+        len: usize,
+        done: Done,
+    ) -> Result<(), L::Error> {
         debug_assert!(self.unsent.is_none());
         let mask = self.rng.as_mut().map(|r| r.next_u32().to_ne_bytes());
         let h = header_len(len, mask.is_some());
@@ -262,7 +282,9 @@ impl<L: PlainTx> WsTx<L> {
         }
         self.lower.room(h + len).await?;
         let s = self.lower.seal(f, h + len)?;
-        self.send_sealed(s, h + len).await
+        self.apply(done);
+        self.unsent = Some((s, h + len));
+        self.drain_unsent().await
     }
 }
 
@@ -292,8 +314,8 @@ impl<L: PlainTx> OutFrame<'_, L> {
             (None, Kind::Text) => TEXT,
             (None, Kind::Binary) => BINARY,
         };
-        self.tx.open = (!fin).then_some(self.kind);
         let b0 = if fin { FIN | op } else { op };
-        self.tx.finish(self.frame, b0, self.head, self.reserved, len).await.map_err(TxError::Lower)
+        let done = Done::Open((!fin).then_some(self.kind));
+        self.tx.finish(self.frame, b0, self.head, self.reserved, len, done).await.map_err(TxError::Lower)
     }
 }

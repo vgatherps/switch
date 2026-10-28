@@ -475,16 +475,114 @@ fn no_pending_no_extra_frames() {
     assert_eq!(log.borrow().take_pending_calls, 0);
 }
 
-/// After the close frame: the lower layer's close record once, then the
-/// transport ends once.
+/// After the close frame: the lower layer's close record once; the transport
+/// end (idempotent) on every call.
 #[test]
 fn shutdown_sends_the_lower_close_after_the_close_frame() {
     let (mut t, log) = tx(Role::Server, 1430);
     t.close(&1000u16.to_be_bytes());
     assert_eq!(ready(t.shutdown()), Ok(()));
     assert_eq!(ready(t.shutdown()), Ok(()));
-    assert_eq!(sent(&log), [[&[0x88, 2][..], &1000u16.to_be_bytes()].concat(), CLOSE_RECORD.to_vec()]);
-    assert_eq!((log.borrow().seals, log.borrow().shutdowns), (2, 1));
+    assert_eq!(sent(&log), [close_frame(), CLOSE_RECORD.to_vec()]);
+    assert_eq!((log.borrow().seals, log.borrow().shutdowns), (2, 2));
+}
+
+fn close_frame() -> Vec<u8> {
+    [&[0x88, 2][..], &1000u16.to_be_bytes()].concat()
+}
+
+/// Polls `f` once, which must be pending (the mock withholds room), then drops it.
+fn cancel<F: Future>(f: F) {
+    assert!(poll(pin!(f)).is_pending(), "ready though the mock withholds room");
+}
+
+/// A data frame cancelled in its room wait leaves no message open: the first
+/// fragment and a final continuation alike.
+#[test]
+fn cancelled_data_frame_changes_nothing() {
+    for role in [Role::Client, Role::Server] {
+        // Before the first fragment: the retry starts a fresh message.
+        let (mut t, log) = tx(role, 1430);
+        log.borrow_mut().room = Some(0);
+        {
+            let mut f = ready(t.frame(Kind::Binary)).unwrap();
+            f.room()[0] = b'y';
+            cancel(f.commit(1, false));
+        }
+        log.borrow_mut().room = None;
+        send_all(&mut t, Kind::Text, b"x");
+        let frames = sent(&log);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0][0], 0x81, "{role:?}: a fin text frame, not a continuation");
+        assert_eq!(payloads(role, &frames), [b"x".to_vec()]);
+
+        // Before the final continuation: the message stays open for the retry.
+        let (mut t, log) = tx(role, 1430);
+        commit(&mut t, Kind::Binary, b"a", false);
+        log.borrow_mut().room = Some(0);
+        {
+            let mut f = ready(t.frame(Kind::Binary)).unwrap();
+            f.room()[0] = b'b';
+            cancel(f.commit(1, true));
+        }
+        log.borrow_mut().room = None;
+        commit(&mut t, Kind::Binary, b"c", true);
+        let frames = sent(&log);
+        assert_eq!(frames.iter().map(|f| f[0]).collect::<Vec<_>>(), [0x02, 0x80]);
+        assert_eq!(payloads(role, &frames), [b"ac".to_vec()]);
+    }
+}
+
+/// A pong whose flush is cancelled in the room wait stays queued.
+#[test]
+fn cancelled_pong_stays_queued() {
+    let (mut t, log) = tx(Role::Server, 1430);
+    t.pong(b"hb");
+    log.borrow_mut().room = Some(0);
+    cancel(t.flush());
+    log.borrow_mut().room = None;
+    assert_eq!(ready(t.flush()), Ok(()));
+    assert_eq!(sent(&log), [[&[0x8a, 2][..], b"hb"].concat()]);
+}
+
+/// A close whose frame is cancelled in the room wait stays queued: the retry
+/// sends WebSocket close, close_notify, FIN in that order.
+#[test]
+fn cancelled_close_stays_queued() {
+    let (mut t, log) = tx(Role::Server, 1430);
+    t.close(&1000u16.to_be_bytes());
+    log.borrow_mut().room = Some(0);
+    cancel(t.shutdown());
+    assert_eq!(log.borrow().shutdowns, 0);
+    log.borrow_mut().room = None;
+    assert_eq!(ready(t.shutdown()), Ok(()));
+    assert_eq!(sent(&log), [close_frame(), CLOSE_RECORD.to_vec()]);
+    assert_eq!(log.borrow().shutdowns, 1);
+}
+
+/// Shutdown cancelled while close_notify waits for room, or after it was
+/// sealed but refused: the retry sends it once and still ends the transport.
+#[test]
+fn cancelled_shutdown_still_ends_the_transport() {
+    for refused in [false, true] {
+        let (mut t, log) = tx(Role::Server, 1430);
+        t.close(&1000u16.to_be_bytes());
+        assert_eq!(ready(t.flush()), Ok(()));
+        if refused {
+            // Room for the record, then a refusal takes it all away.
+            log.borrow_mut().room = Some(10_000);
+            log.borrow_mut().refuse = 1;
+        } else {
+            log.borrow_mut().room = Some(0);
+        }
+        cancel(t.shutdown());
+        assert_eq!(log.borrow().seals, 1 + usize::from(refused) as u64, "refused {refused}");
+        assert_eq!(log.borrow().shutdowns, 0);
+        log.borrow_mut().room = None;
+        assert_eq!(ready(t.shutdown()), Ok(()));
+        assert_eq!(sent(&log), [close_frame(), CLOSE_RECORD.to_vec()], "refused {refused}");
+        assert_eq!((log.borrow().seals, log.borrow().shutdowns), (2, 1), "refused {refused}");
+    }
 }
 
 #[test]
