@@ -131,7 +131,9 @@ pub struct Tls {
 impl Tls {
     /// Waits until `rx` holds plaintext to read through `rx.current()`/`rx.consume` (`Ok(true)`),
     /// or the server closed with close_notify (`Ok(false)`). A TLS error first sends the alert
-    /// rustls queued for it, then FIN; the TCP stream ending without close_notify is truncation.
+    /// rustls queued for it, then FIN, and returns once the server acked them (or the connection
+    /// ended): until then an erroring call stays pending, so the caller bounds it. The TCP stream
+    /// ending without close_notify is truncation.
     pub async fn ready(&mut self) -> Result<bool, Error> {
         loop {
             let failed = match self.rx.chunk(&mut self.tx).map(|run| run.is_some()) {
@@ -154,7 +156,9 @@ impl Tls {
         }
     }
 
-    /// Sends close_notify, then FIN. Receiving goes on.
+    /// Sends close_notify, then FIN, and returns once the server acked them (or the connection
+    /// ended), so the connection may be dropped then; until then it stays pending, so the caller
+    /// bounds it. Receiving goes on.
     pub async fn close(&mut self) -> Result<(), Error> {
         let f = self.tx.alloc().await.map_err(Error::Send)?;
         let (_, room) = self.tx.plain();
@@ -162,14 +166,15 @@ impl Tls {
         let sealed = self.tx.close_notify(f).map_err(Error::Send)?;
         send_sealed(&mut self.tx, sealed, room).await.map_err(Error::Send)?;
         self.tx.shutdown();
+        self.tx.delivered().await;
         Ok(())
     }
 }
 
-/// After a TLS error: sends the alert rustls queued for it, if any, then FIN, and yields once so
-/// the Net's next turn sends them before the caller can drop the socket (a drop with server data
-/// unread aborts with RST and discards them). Best effort: the caller reports the TLS error,
-/// which matters more than a failed send.
+/// After a TLS error: sends the alert rustls queued for it, if any, then FIN, and waits until the
+/// server acked them or the connection ended. A drop before that would lose them: the Stack sends
+/// them only on later turns, and a drop with server data unread aborts with RST at once. Best
+/// effort: the caller reports the TLS error, which matters more than a failed send.
 async fn abort(tx: &mut TlsTx<SwitchTx>) {
     if tx.has_pending() {
         let sent = async {
@@ -184,7 +189,7 @@ async fn abort(tx: &mut TlsTx<SwitchTx>) {
         let _ = sent.await;
     }
     tx.shutdown();
-    switch::yield_now().await;
+    tx.delivered().await;
 }
 
 /// Sends `sealed`, waiting for room of `len` bytes each time it is refused.
@@ -197,7 +202,8 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
 }
 
 /// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert
-/// it queued goes out, then FIN, before the error returns.
+/// it queued goes out, then FIN, and the error returns once the server acked them (or the
+/// connection ended): until then a failing handshake stays pending, so the caller bounds it.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -249,9 +255,8 @@ pub async fn tls_connect(
             }
             let _ = send_bytes(&mut raw, &out).await;
             raw.shutdown();
-            // the alert and FIN leave at the Net's next turn; dropping the socket before that,
-            // with server data unread, would abort it with RST and discard them
-            switch::yield_now().await;
+            // dropping the socket before the server has them would lose them (see `abort`)
+            raw.delivered().await;
             return Err(Error::Tls(TlsError::Tls(e)));
         }
         if !out.is_empty() && !matches!(next, Next::Again) {

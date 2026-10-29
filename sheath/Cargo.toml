@@ -7,7 +7,7 @@ publish = false
 
 [features]
 # TLS over switchnet TCP (module `switchnet`): the handshake, then the two halves.
-switchnet = ["dep:switchnet", "dep:switch"]
+switchnet = ["dep:switchnet"]
 # Test-only: the Docker end-to-end test and TLS-Anvil's driver (DPDK net_tap, Linux), on
 # switchnet's testkit.
 e2e = ["switchnet", "switchnet/testkit", "dep:zhida-test-support"]
@@ -15,13 +15,13 @@ e2e = ["switchnet", "switchnet/testkit", "dep:zhida-test-support"]
 [dependencies]
 rustls = { version = "=0.23.43", default-features = false, features = ["std"] }
 switchnet = { workspace = true, optional = true }
-# yield_now: a failed connection lets the Net send its alert before the socket is dropped.
-switch = { workspace = true, optional = true }
 zhida-test-support = { workspace = true, optional = true }
 
 [dev-dependencies]
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+switch.workspace = true
+libc.workspace = true
 
 [[test]]
 name = "tls_switchnet"
