@@ -24,7 +24,7 @@ pub use self::interface::{
     Config, Interface, InterfaceInner as Context, NoRoute, PollIngressSingleResult, PollResult,
 };
 
-pub use self::tcp_set::{SocketHandle, TcpSet, TcpStorage};
+pub use self::tcp_set::{ReadySide, SocketHandle, TcpSet, TcpStorage};
 pub use self::drop_queue::DropQueue;
 #[cfg(feature = "udp-set")]
 pub use self::udp_set::{

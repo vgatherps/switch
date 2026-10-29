@@ -3,7 +3,7 @@ use std::io::Read;
 
 use smoltcp::iface::{
     Config, DropQueue, Interface, NoRoute, OwnedIpv4, PathMtu, PathMtus, PollIngressSingleResult,
-    PollResult,
+    PollResult, ReadySide,
     SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
@@ -833,6 +833,47 @@ impl Stack {
             .tx_frames_held
             .checked_sub(tx_frames)
             .expect("removed socket's TX frame limit was held");
+    }
+
+    /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
+    /// that can make the socket readable, writable or change its state fires it: a received
+    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), a receive wake
+    /// from a dropped frame, or a state change in egress (close timers, TIME-WAIT end). A fired
+    /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
+    /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
+    /// processes a dropped handle; `disarm_tcp` stops a token at once.
+    pub fn arm_tcp(&mut self, handle: &TcpHandle, side: ReadySide, token: u32) {
+        let raw = self.tcp_raw(handle);
+        self.sockets.arm(raw, side, token);
+    }
+
+    /// Disarm `side` of the socket. `true` when a token was armed; `false` when none was, or
+    /// it fired and `pop_fired` has not returned it yet.
+    pub fn disarm_tcp(&mut self, handle: &TcpHandle, side: ReadySide) -> bool {
+        let raw = self.tcp_raw(handle);
+        self.sockets.disarm(raw, side)
+    }
+
+    /// Arm `token` for the UDP socket's receive queue, replacing a token armed there; the next
+    /// queued datagram fires it as in [`Self::arm_tcp`]. `remove_udp`, or the Stack processing
+    /// a dropped handle, disarms it.
+    pub fn arm_udp(&mut self, handle: &UdpHandle, token: u32) {
+        let raw = self.udp_raw(handle);
+        self.udp.arm_rx(raw, token);
+    }
+
+    /// [`Self::disarm_tcp`] for the UDP socket's receive queue.
+    pub fn disarm_udp(&mut self, handle: &UdpHandle) -> bool {
+        let raw = self.udp_raw(handle);
+        self.udp.disarm_rx(raw)
+    }
+
+    /// One fired token, in no particular order; `None` once every fired token was returned.
+    /// The lists are sized at `new` for every token armed once: re-arming a token before it
+    /// was returned can grow them.
+    #[inline]
+    pub fn pop_fired(&mut self) -> Option<u32> {
+        self.sockets.pop_fired().or_else(|| self.udp.pop_fired())
     }
 
     fn tcp_raw(&self, handle: &TcpHandle) -> SocketHandle {

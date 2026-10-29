@@ -131,15 +131,26 @@ pub struct TcpStorage<'a> {
     inner: Option<Item<'a>>,
     admitted_rx_budget: usize,
     admitted_tx_budget: usize,
+    /// Readiness tokens armed for the receive and send halves ([`ReadySide`]). In the last
+    /// line's padding, so the slot keeps its size and line map.
+    tokens: [Option<u32>; 2],
 }
 
 impl<'a> TcpStorage<'a> {
     pub const EMPTY: Self = Self {
         inner: None,
         generation: 0,
+        tokens: [None; 2],
         admitted_rx_budget: 0,
         admitted_tx_budget: 0,
     };
+}
+
+/// The half of a TCP socket a readiness token watches; an index into its two tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadySide {
+    Rx = 0,
+    Tx = 1,
 }
 
 /// An item of a socket set.
@@ -179,6 +190,13 @@ impl fmt::Display for SocketHandle {
 /// port for Listen, and the 4-tuple otherwise. The flow index is resynced on state
 /// changes. App changes go through `get_mut` or `iter_mut`, which mark slots dirty.
 ///
+/// Readiness tokens: [`arm`](Self::arm) stores a caller's `u32` for one half of a socket.
+/// Every change that marks the socket dirty (ingress, `get_mut`, a receive wake, timer and
+/// neighbor rescans) and every state change in egress fires each armed token of the socket:
+/// it moves to a list that [`pop_fired`](Self::pop_fired) drains, and is disarmed. A token
+/// fires at most once per arm; the list holds two per slot without growing while no token is
+/// re-armed before it was popped.
+///
 /// If a socket method unwinds out of `Interface::poll`, the set must not be polled again.
 #[derive(Debug)]
 pub struct TcpSet<'a> {
@@ -203,6 +221,7 @@ pub struct TcpSet<'a> {
     pub(crate) neighbor_changes: u64,
     ready: VecDeque<usize>,
     reapable: Vec<SocketHandle>,
+    fired: Vec<u32>,
     #[cfg(test)]
     pub(crate) dispatches: Vec<usize>,
     #[cfg(test)]
@@ -249,6 +268,7 @@ impl<'a> TcpSet<'a> {
             neighbor_changes: 0,
             ready: VecDeque::with_capacity(slot_count),
             reapable: Vec::with_capacity(slot_count),
+            fired: Vec::with_capacity(2 * slot_count),
             #[cfg(test)]
             dispatches: Vec::new(),
             #[cfg(test)]
@@ -340,6 +360,9 @@ impl<'a> TcpSet<'a> {
                         self.dirty_list
                             .reserve_exact(sockets.len() - self.dirty_list.len());
                     }
+                    if self.fired.capacity() < 2 * sockets.len() {
+                        self.fired.reserve_exact(2 * sockets.len() - self.fired.len());
+                    }
                     index
                 }
             },
@@ -401,6 +424,42 @@ impl<'a> TcpSet<'a> {
         &mut self.item_mut(handle).socket
     }
 
+    /// Arm `token` for `side` of the socket, replacing a token armed there. Removing the
+    /// socket or orphaning it (its handle dropped) disarms both halves.
+    ///
+    /// # Panics
+    /// As `get`.
+    pub fn arm(&mut self, handle: SocketHandle, side: ReadySide, token: u32) {
+        self.item(handle);
+        self.sockets[handle.index].tokens[side as usize] = Some(token);
+    }
+
+    /// Disarm `side` of the socket. Returns whether a token was armed there; `false` when none
+    /// was, or it fired and waits in the fired list until popped.
+    ///
+    /// # Panics
+    /// As `get`.
+    pub fn disarm(&mut self, handle: SocketHandle, side: ReadySide) -> bool {
+        self.item(handle);
+        self.sockets[handle.index].tokens[side as usize].take().is_some()
+    }
+
+    /// One fired token, in no particular order; `None` once the list is empty.
+    #[inline]
+    pub fn pop_fired(&mut self) -> Option<u32> {
+        self.fired.pop()
+    }
+
+    /// Move every token armed on slot `index` to the fired list.
+    #[inline]
+    pub(crate) fn fire(&mut self, index: usize) {
+        for token in &mut self.sockets[index].tokens {
+            if let Some(token) = token.take() {
+                self.fired.push(token);
+            }
+        }
+    }
+
     /// Complete a queued receive wake and schedule the socket's readiness check.
     pub fn rx_woken(&mut self, handle: SocketHandle) {
         let socket = &mut self.sockets.get_mut(handle.index)
@@ -413,6 +472,8 @@ impl<'a> TcpSet<'a> {
 
     /// Close the socket after its application handle is dropped, keeping it in the set.
     pub fn orphan(&mut self, handle: SocketHandle, now: Instant) {
+        self.item(handle);
+        self.sockets[handle.index].tokens = [None; 2];
         self.get_mut(handle).orphan(now);
         self.flow_slots[handle.index].orphaned = true;
         self.check_reapable(handle.index);
@@ -466,6 +527,7 @@ impl<'a> TcpSet<'a> {
             .generation
             .checked_add(1)
             .expect("socket slot generation overflow");
+        slot.tokens = [None; 2];
         if self.flow_slots[handle.index].reap_queued {
             self.reapable.retain(|&queued| queued != handle);
         }
@@ -706,6 +768,7 @@ impl TcpSet<'_> {
     }
 
     pub(crate) fn mark_dirty(&mut self, index: usize) {
+        self.fire(index);
         if !self.flow_slots[index].dirty {
             self.remove_deadline(index);
             self.flow_slots[index].dirty = true;
@@ -1438,6 +1501,108 @@ mod tests {
         assert_reapable(&mut b_set, &[]);
     }
 
+    #[cfg(feature = "medium-ip")]
+    #[test]
+    fn readiness_tokens_fire_on_ingress_app_changes_and_egress_state_changes() {
+        use crate::phy::Medium;
+        use crate::wire::{IpAddress, IpCidr};
+        use ReadySide::{Rx, Tx};
+
+        fn fired(set: &mut TcpSet) -> alloc::vec::Vec<u32> {
+            let mut fired: alloc::vec::Vec<u32> = core::iter::from_fn(|| set.pop_fired()).collect();
+            fired.sort_unstable();
+            fired
+        }
+
+        let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
+        let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+        let remote = IpAddress::v4(192, 168, 1, 2);
+        b.update_ip_addrs(|addrs| {
+            addrs.clear();
+            addrs.push(IpCidr::new(remote, 24)).unwrap();
+        });
+        let buffered = || tcp::Socket::test_socket(64, 64);
+        macro_rules! exchange {
+            () => {
+                for _ in 0..8 {
+                    a.poll(Instant::ZERO, &mut a_device, &mut a_set);
+                    b_device.rx_queue.append(&mut a_device.tx_queue);
+                    b.poll(Instant::ZERO, &mut b_device, &mut b_set);
+                    a_device.rx_queue.append(&mut b_device.tx_queue);
+                }
+            };
+        }
+        let ah = a_set.add(buffered());
+        let bh = b_set.add(buffered());
+        b_set.get_mut(bh).listen(80).unwrap();
+        a_set.get_mut(ah).connect(a.context(), (remote, 80), 1234).unwrap();
+        exchange!();
+        assert_eq!(a_set.get(ah).state(), tcp::State::Established);
+        assert_eq!(a.poll_at(Instant::ZERO, &mut a_set), None);
+        assert_eq!(fired(&mut a_set), [], "nothing was armed");
+
+        // An idle poll and a read-only access fire nothing.
+        a_set.arm(ah, Rx, 10);
+        a_set.arm(ah, Tx, 11);
+        a.poll(Instant::ZERO, &mut a_device, &mut a_set);
+        a_set.get(ah);
+        assert_eq!(fired(&mut a_set), []);
+
+        // A received segment fires both halves, once.
+        b_set.get_mut(bh).send_slice(b"data").unwrap();
+        b.poll(Instant::ZERO, &mut b_device, &mut b_set);
+        a_device.rx_queue.append(&mut b_device.tx_queue);
+        a.poll(Instant::ZERO, &mut a_device, &mut a_set);
+        assert!(a_set.get(ah).can_recv());
+        assert_eq!(fired(&mut a_set), [10, 11]);
+        a_set.get_mut(ah);
+        assert_eq!(fired(&mut a_set), [], "a fired token is disarmed");
+
+        // App changes and receive wakes fire; a re-arm replaces the token.
+        a_set.arm(ah, Rx, 12);
+        a_set.arm(ah, Rx, 13);
+        a_set.get_mut(ah);
+        assert_eq!(fired(&mut a_set), [13]);
+        a_set.arm(ah, Tx, 14);
+        a_set.rx_woken(ah);
+        assert_eq!(fired(&mut a_set), [14]);
+
+        // disarm reports whether the token was still armed.
+        a_set.arm(ah, Rx, 15);
+        assert!(a_set.disarm(ah, Rx));
+        assert!(!a_set.disarm(ah, Rx));
+        a_set.arm(ah, Rx, 16);
+        a_set.get_mut(ah);
+        assert!(!a_set.disarm(ah, Rx), "fired, not yet popped");
+        assert_eq!(fired(&mut a_set), [16]);
+
+        // TIME-WAIT ends on a timer in egress: no segment, no app call.
+        a_set.get_mut(ah).close();
+        exchange!();
+        b_set.get_mut(bh).close();
+        exchange!();
+        assert_eq!(a_set.get(ah).state(), tcp::State::TimeWait);
+        assert_eq!(fired(&mut a_set), []);
+        a_set.arm(ah, Rx, 17);
+        a_set.arm(ah, Tx, 18);
+        a.poll_egress(Instant::from_secs(10), &mut a_device, &mut a_set);
+        assert_eq!(a_set.get(ah).state(), tcp::State::Closed);
+        assert_eq!(fired(&mut a_set), [17, 18]);
+
+        // Orphaning (handle dropped) and removing disarm; the next socket in a slot starts
+        // unarmed.
+        a_set.arm(ah, Rx, 19);
+        a_set.orphan(ah, Instant::from_secs(10));
+        assert_eq!(fired(&mut a_set), []);
+        let ch = a_set.add(buffered());
+        a_set.arm(ch, Tx, 20);
+        a_set.remove(ch);
+        let dh = a_set.add(buffered());
+        assert_eq!(dh.index, ch.index);
+        a_set.get_mut(dh);
+        assert_eq!(fired(&mut a_set), []);
+    }
+
     #[test]
     fn tcp_storage_line_map() {
         use core::mem::{align_of, offset_of, size_of};
@@ -1446,6 +1611,7 @@ mod tests {
             generation: 0,
             admitted_rx_budget: 0,
             admitted_tx_budget: 0,
+            tokens: [None; 2],
             inner: Some(Item {
                 meta: Meta::default(),
                 socket: socket(),
@@ -1495,6 +1661,7 @@ mod tests {
         assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
+        assert_eq!(offset_of!(TcpStorage<'static>, tokens), 592);
         assert_eq!(item_offset, 8);
         assert_eq!(offset_of!(Item<'static>, meta), 0);
         assert_eq!(offset_of!(Item<'static>, socket), 112);
