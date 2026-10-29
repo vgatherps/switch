@@ -496,6 +496,7 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
             stack
                 .add_udp(UdpConfig {
                     port: UDP_PORT,
+                    local_addr: None,
                     rx_queue: 128,
                     tx_checksum: true,
                     broadcast: false,

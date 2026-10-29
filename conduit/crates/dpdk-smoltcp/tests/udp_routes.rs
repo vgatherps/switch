@@ -46,6 +46,7 @@ fn new_pair(eal: &Eal, gateway: Option<Ipv4Address>, capacity: usize) -> (Pair, 
         .a
         .add_udp(UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: BURST,
             tx_checksum: true,
             broadcast: false,

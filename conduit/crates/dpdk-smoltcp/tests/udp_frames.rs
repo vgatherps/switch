@@ -58,6 +58,7 @@ fn add_udp(stack: &mut Stack, port: u16) -> UdpHandle {
     stack
         .add_udp(UdpConfig {
             port,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: true,
             broadcast: false,

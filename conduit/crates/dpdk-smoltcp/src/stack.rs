@@ -135,6 +135,8 @@ pub enum AddUdpError {
     Full,
     PortInUse,
     InvalidConfig(&'static str),
+    /// `UdpConfig::local_addr` is not an address this Stack owns.
+    Unaddressable,
     RxPoolTooSmall { required: usize, pool: usize },
 }
 
@@ -623,9 +625,12 @@ impl Stack {
             .expect("RX pool requirement exceeds usize")
     }
 
-    /// Bind one local UDP port exclusively. The RX pool must back `rx_queue`
-    /// datagrams beside the RX reserve and every TCP and UDP socket's budget.
-    /// Held TCP frames and UDP datagrams from removed sockets count until dropped.
+    /// Bind a local UDP port on one owned address (`local_addr`) or on all of them (`None`);
+    /// each (address or all-IP, port) at most once. A datagram goes to the socket bound to its
+    /// destination, else to the port's all-IP socket; broadcasts only to the all-IP one. The
+    /// RX pool must back `rx_queue` datagrams beside the RX reserve and every TCP and UDP
+    /// socket's budget. Held TCP frames and UDP datagrams from removed sockets count until
+    /// dropped. A refused socket changes nothing.
     pub fn add_udp(&mut self, config: UdpConfig) -> Result<UdpHandle, AddUdpError> {
         self.tidy();
         let required = self.required_rx_pool(config.rx_queue);
@@ -635,10 +640,11 @@ impl Stack {
                 pool: self.rx_pool_count,
             });
         }
-        let handle = self.udp.add(config).map_err(|error| match error {
+        let handle = self.udp.add(&self.iface, config).map_err(|error| match error {
             UdpAddError::Full => AddUdpError::Full,
             UdpAddError::PortInUse => AddUdpError::PortInUse,
             UdpAddError::InvalidConfig(reason) => AddUdpError::InvalidConfig(reason),
+            UdpAddError::Unaddressable => AddUdpError::Unaddressable,
         })?;
         self.rx_budget_held = self
             .rx_budget_held

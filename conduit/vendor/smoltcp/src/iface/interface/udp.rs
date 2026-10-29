@@ -234,6 +234,8 @@ fn udp_copy(udp: &UdpSet, len: usize, payload: &[u8]) -> Result<UniqueTxBuf, Udp
 impl InterfaceInner {
     /// One send's IPv4 header (`None` without a source address for `dst_addr`), UDP ports and
     /// checksum capabilities, the UDP checksum on only if the socket and device both ask for it.
+    /// The source is the socket's bound address, or for an all-IP socket the interface's
+    /// address for `dst_addr`.
     #[inline]
     fn udp_reprs(
         &self,
@@ -246,7 +248,11 @@ impl InterfaceInner {
             src_port: socket.config().port,
             dst_port: to.port,
         };
-        let ip_repr = self.get_source_address_ipv4(&dst_addr).map(|src_addr| Ipv4Repr {
+        let src_addr = match socket.config().local_addr {
+            Some(addr) => Some(addr),
+            None => self.get_source_address_ipv4(&dst_addr),
+        };
+        let ip_repr = src_addr.map(|src_addr| Ipv4Repr {
             src_addr,
             dst_addr,
             next_header: IpProtocol::Udp,
@@ -283,12 +289,13 @@ impl InterfaceInner {
         {
             return None;
         }
-        if !self.is_broadcast_v4(ipv4_repr.dst_addr)
+        let broadcast = self.is_broadcast_v4(ipv4_repr.dst_addr);
+        if !broadcast
             && (!self.has_ip_addr(ipv4_repr.dst_addr) || !ipv4_repr.dst_addr.x_is_unicast())
         {
             return None;
         }
-        let slot = udp.lookup(packet.dst_port())?;
+        let slot = udp.lookup(ipv4_repr.dst_addr, packet.dst_port(), broadcast)?;
         let src = IpEndpoint::new(ipv4_repr.src_addr.into(), packet.src_port());
         let socket = udp.socket_at_mut(slot);
         if socket.peer().is_some_and(|peer| src != peer) {
