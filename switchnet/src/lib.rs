@@ -367,7 +367,10 @@ impl NetHandle {
 
     /// Adds a TCP socket listening on `local`; it becomes the one accepted
     /// connection (conduit has no accept queue). Several may listen on one
-    /// port; the lowest slot takes the next SYN.
+    /// port. A SYN goes to a listener bound to its destination address if one
+    /// exists, whatever the slots; otherwise to an all-IP listener (`addr:
+    /// None`) on the port. Among several listeners in the chosen group, the
+    /// lowest slot takes it.
     pub fn tcp_accept(&self, config: tcp::Config, local: IpListenEndpoint) -> Result<Accepting, OpenError> {
         let stream = self.open_tcp(config, |stack, handle| stack.listen(handle, local).map_err(OpenError::Listen))?;
         Ok(Accepting { stream: Some(stream) })
