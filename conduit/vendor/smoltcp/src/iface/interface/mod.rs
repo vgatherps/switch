@@ -13,7 +13,7 @@ mod tcp;
 mod udp;
 
 use super::packet::*;
-use super::PathMtus;
+use super::{OwnedIpv4, PathMtus};
 
 use core::result::Result;
 use heapless::Vec;
@@ -177,6 +177,7 @@ pub struct InterfaceInner {
     any_ip: bool,
     ipv4_gateway: Option<Ipv4Address>,
     path_mtus: Option<PathMtus>,
+    owned_ipv4: OwnedIpv4,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -257,6 +258,7 @@ impl Interface {
                 any_ip: false,
                 ipv4_gateway: None,
                 path_mtus: None,
+                owned_ipv4: OwnedIpv4::default(),
                 neighbor_cache: NeighborCache::new(config.neighbor_capacity),
                 probe_owed: None,
                 tcp_isn_secret,
@@ -334,6 +336,13 @@ impl Interface {
     /// Path MTUs do not change next hops, so the neighbor cache stays valid.
     pub fn set_path_mtus(&mut self, paths: PathMtus) {
         self.inner.path_mtus = Some(paths);
+    }
+
+    /// Addresses the interface owns besides its own: it answers ARP, ICMP echo, UDP and TCP for
+    /// them. The caller fixes the set for the Stack lifetime. It does not route traffic: replies
+    /// leave toward the peer as for the interface address.
+    pub fn set_owned_ipv4(&mut self, owned: OwnedIpv4) {
+        self.inner.owned_ipv4 = owned;
     }
 
     /// Enable or disable the AnyIP capability.
@@ -1009,17 +1018,32 @@ impl InterfaceInner {
         }
     }
 
-    /// Check whether the interface has the given IP address assigned.
+    /// Check whether the interface has the given IP address assigned: its own address, then the
+    /// owned set.
     ///
     /// Always returns true if [`InterfaceInner::any_ip`].
     pub(crate) fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
-        // If any IP is set to true, we don't bother about checking the IP.
-        if self.any_ip {
+        let addr = addr.into();
+        if self.has_interface_addr(addr) {
             return true;
         }
+        match addr {
+            IpAddress::Ipv4(addr) => self.owned_ipv4.contains(addr),
+        }
+    }
 
-        let addr = addr.into();
-        self.ip_addrs.iter().any(|probe| probe.address() == addr)
+    /// `has_ip_addr` without the owned set: the interface's own address, or any address with
+    /// [`InterfaceInner::any_ip`].
+    #[inline]
+    pub(crate) fn has_interface_addr(&self, addr: IpAddress) -> bool {
+        // If any IP is set to true, we don't bother about checking the IP.
+        self.any_ip || self.ip_addrs.iter().any(|probe| probe.address() == addr)
+    }
+
+    /// Whether `addr` is in the owned set (not the interface's own address).
+    #[inline]
+    pub(crate) fn owns_ipv4(&self, addr: Ipv4Address) -> bool {
+        self.owned_ipv4.contains(addr)
     }
 
     #[cfg(feature = "medium-ip")]

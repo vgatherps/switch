@@ -21,6 +21,7 @@ fn config(tx_pending: usize) -> StackConfig<'static> {
         ipv4: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 1,

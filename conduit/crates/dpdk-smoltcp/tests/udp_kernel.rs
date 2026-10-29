@@ -93,6 +93,7 @@ fn with_stack_gateway(
         ipv4: Ipv4Cidr::new(Ipv4Address::new(a, b, c, d), 24),
         gateway,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 1,

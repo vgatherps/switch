@@ -289,6 +289,7 @@ fn create_stack(port: Port) -> Result<Stack, Box<dyn std::error::Error>> {
         ipv4: Ipv4Cidr::new(Ipv4Address::new(192, 0, 2, 2), 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: os_random_seed()?,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 8,
@@ -309,6 +310,15 @@ reached directly; any other destination goes to the gateway's MAC. There is no r
 and a TCP connect to them sends nothing. A gateway must be unicast, inside the configured subnet, and
 different from our own address and the subnet's network and broadcast addresses. A /31 has neither of
 the latter.
+
+`owned_ipv4: &[Ipv4Cidr]` lists further addresses the Stack owns: single addresses (/32) and
+prefixes, inside or outside the subnet. The Stack answers ARP for each, from that address, and
+accepts IPv4 traffic to each; an ICMP echo reply comes from the address it was sent to. Routing, the
+subnet broadcast and the default source address stay with `ipv4`. Duplicates and overlaps are
+merged; lookup is a binary search over the merged ranges, done only for a destination that is not
+`ipv4`'s address. Every address must be unicast, and none may be the gateway or the subnet's
+broadcast address; a prefix with host bits set is refused. The set is fixed at `Stack::new`, and the
+Stack sends no gratuitous ARP for it.
 
 `random_seed: u64` seeds the interface PRNG, including the TCP initial-sequence-number secret.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
@@ -979,8 +989,8 @@ whole-datagram send failures:
 | `NeighborPending` | Next-hop address resolution has not completed. |
 | `WouldBlock` | No frame-pool frame for a copy, or no pending slot. |
 
-UDP invalid destinations include unspecified or multicast addresses, our own interface address, port
-zero, and broadcast without `broadcast: true`. The order is: the destination and size checks, an
+UDP invalid destinations include unspecified or multicast addresses, our own interface address, an
+address in `owned_ipv4`, port zero, and broadcast without `broadcast: true`. The order is: the destination and size checks, an
 empty frame pool for a copy (`WouldBlock`), the neighbor lookup (`NoRoute`, `NeighborPending`), then
 a full pending queue (`WouldBlock`). One exception: the first ARP request for a neighbor needs a TX
 packet, so with the pending queue full that send is `WouldBlock`, not `NeighborPending`; the ARP

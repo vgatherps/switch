@@ -172,6 +172,7 @@ fn arp_benches(c: &mut Criterion, eal: &Eal) {
         ipv4: Ipv4Cidr::new(STACK_IP, 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 1,

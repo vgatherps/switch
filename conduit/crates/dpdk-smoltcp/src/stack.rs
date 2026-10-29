@@ -2,7 +2,8 @@ use std::fmt;
 use std::io::Read;
 
 use smoltcp::iface::{
-    Config, DropQueue, Interface, NoRoute, PathMtu, PathMtus, PollIngressSingleResult, PollResult,
+    Config, DropQueue, Interface, NoRoute, OwnedIpv4, PathMtu, PathMtus, PollIngressSingleResult,
+    PollResult,
     SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
@@ -44,6 +45,14 @@ pub struct StackConfig<'a> {
     /// Empty paths give every destination the Port IP MTU.
     /// TCP connects cap MSS at path MTU minus 40. Copied at `Stack::new`.
     pub paths: &'a [PathMtu],
+    /// Addresses the Stack owns besides `ipv4`'s address: single addresses
+    /// (/32) and prefixes, inside or outside the subnet. It answers ARP for
+    /// each and accepts IPv4 traffic to each; routing, the subnet broadcast
+    /// and the default source stay with `ipv4`. Duplicates and overlaps are
+    /// merged. Every address must be unicast, and none may be the gateway or
+    /// the subnet's broadcast address; a prefix must not have host bits set.
+    /// Copied at `Stack::new`.
+    pub owned_ipv4: &'a [Ipv4Cidr],
     /// Interface PRNG seed, including the TCP ISN secret. Production callers
     /// use [`os_random_seed`]; tests and library benchmarks may fix it.
     pub random_seed: u64,
@@ -254,6 +263,10 @@ impl Stack {
             Ok(paths) => paths,
             Err(reason) => return Err((port, StackError::InvalidConfig(reason))),
         };
+        let owned = match OwnedIpv4::new(config.owned_ipv4, config.ipv4, config.gateway) {
+            Ok(owned) => owned,
+            Err(reason) => return Err((port, StackError::InvalidConfig(reason))),
+        };
         let count = port.tx_pool_count();
         let required = tx_reserve(port.descriptor_counts().1, config.tx_pending);
         if count < required {
@@ -287,6 +300,7 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
+        iface.set_owned_ipv4(owned);
         let mut storage = Vec::with_capacity(config.max_sockets);
         storage.resize_with(config.max_sockets, || TcpStorage::EMPTY);
         Ok(Self {

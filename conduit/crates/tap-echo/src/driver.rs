@@ -227,6 +227,7 @@ fn stack_config(max_sockets: usize, gateway: Option<Ipv4Addr>, random_seed: u64)
         ipv4: Ipv4Cidr::new(ZHIDA_IP, PREFIX_LEN),
         gateway,
         paths: &[],
+        owned_ipv4: &[],
         random_seed,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets,
