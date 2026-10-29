@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::table_hash::{C1, finish, mix};
-use crate::wire::{IpAddress, IpEndpoint};
+use crate::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 pub(crate) trait FlowTableKey: Copy + Eq {
     fn hash(&self) -> u64;
@@ -10,6 +10,21 @@ pub(crate) trait FlowTableKey: Copy + Eq {
 impl FlowTableKey for u16 {
     fn hash(&self) -> u64 {
         finish(mix(C1, *self as u64))
+    }
+}
+
+/// A bind: a local port on one local address (`Some`), or on every address the interface owns
+/// (`None`, all-IP). UDP sockets are keyed by it; a lookup probes the exact key, then the all-IP
+/// one.
+pub(crate) type BindKey = (Option<Ipv4Address>, u16);
+
+/// An all-IP key hashes as its port alone (`u16`'s hash): `None` and `Some(0.0.0.0)` share a
+/// hash, and 0.0.0.0 is never bound.
+impl FlowTableKey for BindKey {
+    #[inline]
+    fn hash(&self) -> u64 {
+        let addr = self.0.map_or(0, |addr| u32::from_be_bytes(addr.octets()));
+        finish(mix(C1, (addr as u64) << 16 | self.1 as u64))
     }
 }
 
@@ -53,6 +68,7 @@ impl<K: FlowTableKey> FlowTable<K> {
         (key.hash() >> self.hash_shift) as usize
     }
 
+    #[inline(always)]
     fn find(&self, key: &K) -> Result<usize, usize> {
         let mut index = self.home(key);
         while let Some((stored_key, _)) = &self.storage[index] {
@@ -64,7 +80,9 @@ impl<K: FlowTableKey> FlowTable<K> {
         Err(index)
     }
 
-    #[inline]
+    /// Forced inline (with `find`): keyed by `BindKey`, the UDP receive path's two lookups
+    /// were left as calls, +83 instructions per datagram.
+    #[inline(always)]
     pub(crate) fn get(&self, key: &K) -> Option<usize> {
         self.find(key)
             .ok()
@@ -313,6 +331,28 @@ mod tests {
             }),
             11,
         );
+    }
+
+    /// Binds on one port, one per address: sequential addresses and every other address (the
+    /// cg owned set), and the all-IP keys of sequential ports.
+    #[test]
+    fn sequential_bind_addresses_spread() {
+        let addr = |index: u32| Some(Ipv4Address::from((0x6440_0000 + index).to_be_bytes()));
+        assert_spread("bind addresses", 1024, (0..1024).map(|i| (addr(i), 443u16)), 12);
+        assert_spread("bind addresses stride 2", 1024, (0..1024).map(|i| (addr(2 * i), 443u16)), 12);
+        assert_spread("all-IP bind ports", 1024, (40000..41024u16).map(|port| (None, port)), 15);
+    }
+
+    /// An all-IP bind key lands where the port alone does; its exact twins elsewhere.
+    #[test]
+    fn all_ip_bind_key_hashes_as_its_port() {
+        for port in [1, 443, 1234, u16::MAX] {
+            assert_eq!(FlowTableKey::hash(&(None::<Ipv4Address>, port)), FlowTableKey::hash(&port));
+            assert_ne!(
+                FlowTableKey::hash(&(Some(Ipv4Address::new(10, 0, 0, 1)), port)),
+                FlowTableKey::hash(&port)
+            );
+        }
     }
 
     #[test]

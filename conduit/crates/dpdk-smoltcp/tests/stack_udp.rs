@@ -7,7 +7,7 @@ use zhida_test_kit::{wire, with_eal};
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
-    EthernetFrame, EthernetProtocol, EthernetRepr, IpEndpoint, IpProtocol, Ipv4Cidr, Ipv4Packet,
+    EthernetFrame, EthernetProtocol, EthernetRepr, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
     Ipv4Repr, UdpPacket, UdpRepr,
 };
 use dpdk_smoltcp::{
@@ -46,6 +46,7 @@ fn new_stack(port: Port, max_udp_sockets: usize) -> Stack {
 fn udp_config(port: u16, rx_queue: usize) -> UdpConfig {
     UdpConfig {
         port,
+        local_addr: None,
         rx_queue,
         tx_checksum: true,
         broadcast: false,
@@ -427,6 +428,41 @@ fn removed_tcp_and_udp_frames_share_admission_count() {
         let tcp = pair.a.add_tcp(pair::tcp_socket_sized(7 * (1500 - 40))).unwrap();
         pair.a.remove_tcp(tcp);
         assert_eq!(pair.close(), 0);
+    });
+}
+
+/// A local address the Stack does not own is refused with nothing changed: no slot and no RX
+/// budget taken, so a socket needing the whole remaining pool and the only slot then fits on an
+/// owned address (also outside the subnet). The pool check still comes first.
+#[zhida_test_support::pinned_test]
+fn unowned_local_address_refused_without_change() {
+    const OWNED: Ipv4Address = Ipv4Address::new(10, 9, 0, 1);
+    with_eal(|eal| {
+        let fixture = RingPort::new("udpunown", 16, 16);
+        let port_config = fixture.config();
+        let reserve = rx_reserve(port_config.rx_descriptors, 8, port_config.rx_pool.cache_size);
+        let pool = usize::try_from(port_config.rx_pool.count).unwrap();
+        let owned = [Ipv4Cidr::new(OWNED, 32)];
+        let config = StackConfig { owned_ipv4: &owned, ..config(1) };
+        let mut stack = match Stack::new(fixture.open_with(eal, port_config), config, T0) {
+            Ok(stack) => stack,
+            Err((_, error)) => panic!("{error}"),
+        };
+        let whole = pool - reserve;
+        let at = |local_addr| UdpConfig { local_addr: Some(local_addr), ..udp_config(PORT, whole) };
+        for unowned in [Ipv4Address::new(10, 0, 0, 9), Ipv4Address::new(10, 9, 0, 2), Ipv4Address::BROADCAST] {
+            assert_eq!(stack.add_udp(at(unowned)).unwrap_err(), AddUdpError::Unaddressable);
+            assert_eq!(
+                stack.add_udp(UdpConfig { rx_queue: whole + 1, ..at(unowned) }).unwrap_err(),
+                AddUdpError::RxPoolTooSmall { required: pool + 1, pool }
+            );
+        }
+        let handle = stack.add_udp(at(OWNED)).unwrap();
+        assert_eq!(stack.udp(&handle).config().local_addr, Some(OWNED));
+        stack.remove_udp(handle);
+        let handle = stack.add_udp(at(Side::A.ip())).unwrap();
+        stack.remove_udp(handle);
+        finish(fixture, stack);
     });
 }
 

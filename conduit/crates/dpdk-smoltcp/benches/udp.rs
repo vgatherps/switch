@@ -183,6 +183,7 @@ fn setup(eal: &Eal, mode: Mode, paths: &[PathMtu]) -> (Pair, [UdpHandle; 2]) {
         stack
             .add_udp(UdpConfig {
                 port: PORT,
+                local_addr: None,
                 rx_queue: BURST,
                 tx_checksum: mode.tx_checksum(),
                 broadcast: false,

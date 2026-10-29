@@ -208,6 +208,7 @@ fn stack(
 fn udp_config(port: u16) -> UdpConfig {
     UdpConfig {
         port,
+        local_addr: None,
         rx_queue: usize::try_from(rx_pool_count(0, 1500, [SOCKET_BUFFER]))
             .expect("one socket RX budget fits usize"),
         tx_checksum: true,

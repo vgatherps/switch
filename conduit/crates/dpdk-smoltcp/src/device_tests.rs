@@ -1177,8 +1177,9 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
             assert!(device.tx.is_empty());
             let mut udp = UdpSet::new(1, device.frame_source());
             let handle = udp
-                .add(UdpConfig {
+                .add(&iface, UdpConfig {
                     port: 49152,
+                    local_addr: None,
                     rx_queue: 1,
                     tx_checksum,
                     broadcast: false,
@@ -1285,8 +1286,9 @@ fn udp_template_frames_match_generic_and_flags() {
             assert!(device.tx.is_empty());
             let mut udp = UdpSet::new(1, device.frame_source());
             let handle = udp
-                .add(UdpConfig {
+                .add(&iface, UdpConfig {
                     port: 49152,
+                    local_addr: None,
                     rx_queue: 1,
                     tx_checksum,
                     broadcast: false,
@@ -1589,6 +1591,7 @@ fn udp_datagram_reports_hardware_stamp() {
         let handle = stack
             .add_udp(UdpConfig {
                 port: 80,
+                local_addr: None,
                 rx_queue: 2,
                 tx_checksum: true,
                 broadcast: false,
@@ -2261,6 +2264,7 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         stack.listen(&handle, 80).unwrap();
         let udp = stack.add_udp(smoltcp::iface::UdpConfig {
             port: 80,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: true,
             broadcast: false,
@@ -3025,9 +3029,15 @@ fn udp_iface(fixture: &Fixture, device: &mut Device) -> Interface {
     iface
 }
 
-fn udp_socket(udp: &mut smoltcp::iface::UdpSet, port: u16, tx_checksum: bool) -> smoltcp::iface::UdpHandle {
-    udp.add(smoltcp::iface::UdpConfig {
+fn udp_socket(
+    iface: &Interface,
+    udp: &mut smoltcp::iface::UdpSet,
+    port: u16,
+    tx_checksum: bool,
+) -> smoltcp::iface::UdpHandle {
+    udp.add(iface, smoltcp::iface::UdpConfig {
         port,
+        local_addr: None,
         rx_queue: 1,
         tx_checksum,
         broadcast: false,
@@ -3106,7 +3116,7 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
             let metadata = if offload { UDP_OFFLOAD } else { (0, 0, 0, 0) };
             for len in [0, 8, room] {
                 let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8 ^ 0x5a).collect();
-                let handle = udp_socket(&mut udp, 49152, tx_checksum);
+                let handle = udp_socket(&iface, &mut udp, 49152, tx_checksum);
                 let mut sent = Vec::new();
                 for _ in 0..2 {
                     let (frame, raw) = app_frame(&device, &payload);
@@ -3161,7 +3171,7 @@ fn udp_shared_frame_copies_into_a_new_frame() {
             }
             let mut iface = udp_iface(&fixture, &mut device);
             let mut udp = UdpSet::new(1, device.frame_source());
-            let handle = udp_socket(&mut udp, 49152, true);
+            let handle = udp_socket(&iface, &mut udp, 49152, true);
             let to = IpEndpoint::new(Side::B.ip().into(), 80);
             let payload = b"shared datagram";
             let (unique, _) = app_frame(&device, payload);
@@ -3213,7 +3223,7 @@ fn udp_broadcast_clones_copy_once_per_socket() {
         enable_tx_udp_checksum(&mut device.port);
         let mut iface = udp_iface(&fixture, &mut device);
         let mut udp = UdpSet::new(N, device.frame_source());
-        let handles: Vec<_> = (0..N).map(|i| udp_socket(&mut udp, 49152 + i as u16, true)).collect();
+        let handles: Vec<_> = (0..N).map(|i| udp_socket(&iface, &mut udp, 49152 + i as u16, true)).collect();
         let to = IpEndpoint::new(Side::B.ip().into(), 80);
         let payload = b"one payload for every socket";
         let (frame, raw) = app_frame(&device, payload);
@@ -3268,8 +3278,8 @@ fn udp_frame_refusals_write_nothing() {
         let (fixture, mut device) = open(eal, 4, 1);
         let mut iface = udp_iface(&fixture, &mut device);
         let mut udp = UdpSet::new(2, device.frame_source());
-        let templated = udp_socket(&mut udp, 49152, true);
-        let fresh = udp_socket(&mut udp, 49153, true);
+        let templated = udp_socket(&iface, &mut udp, 49152, true);
+        let fresh = udp_socket(&iface, &mut udp, 49153, true);
         let peer = IpEndpoint::new(Side::B.ip().into(), 80);
         let (frame, _) = app_frame(&device, b"x");
         assert!(send_udp_frame(&mut iface, &mut device, &mut udp, templated, peer, frame).is_ok());

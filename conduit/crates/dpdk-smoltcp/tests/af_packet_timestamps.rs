@@ -273,6 +273,7 @@ fn af_packet_hardware_mode_opens_and_stamps() {
         let handle = stack
             .add_udp(UdpConfig {
                 port: PORT,
+                local_addr: None,
                 rx_queue: 5,
                 tx_checksum: true,
                 broadcast: false,

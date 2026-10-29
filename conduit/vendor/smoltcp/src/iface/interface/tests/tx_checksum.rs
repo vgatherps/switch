@@ -242,8 +242,9 @@ fn udp_direct_and_template_carry_checksum_metadata() {
             let (mut iface, _, mut device) = setup_recording(offload);
             let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
             let handle = udp
-                .add(UdpConfig {
+                .add(&iface, UdpConfig {
                     port: 40000,
+                    local_addr: None,
                     rx_queue: 1,
                     tx_checksum,
                     broadcast: false,
@@ -286,8 +287,9 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
             let (mut iface, _, mut device) = setup_recording(offload);
             let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
             let handle = udp
-                .add(UdpConfig {
+                .add(&iface, UdpConfig {
                     port: 40000,
+                    local_addr: None,
                     rx_queue: 1,
                     tx_checksum,
                     broadcast: false,
@@ -304,8 +306,9 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
             let copies = core::mem::take(&mut device.tx);
             udp.remove(handle);
             let handle = udp
-                .add(UdpConfig {
+                .add(&iface, UdpConfig {
                     port: 40000,
+                    local_addr: None,
                     rx_queue: 1,
                     tx_checksum,
                     broadcast: false,

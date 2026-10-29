@@ -755,13 +755,19 @@ changes. Do not swap the socket behind `tcp_mut` with one from another `TcpSet` 
 
 ### Bind and optionally connect
 
-`add_udp(UdpConfig) -> Result<UdpHandle, AddUdpError>` binds one local port exclusively. TCP and UDP
-have separate socket sets; UDP exclusivity is between UDP sockets. There is no UDP local-address
-field. Reception uses the Stack's IPv4 address and recognized broadcasts.
+`add_udp(UdpConfig) -> Result<UdpHandle, AddUdpError>` binds a local port on one address or on all
+of them. `local_addr: Some(addr)` binds `addr`, which must be the Stack's IPv4 address or one of
+`StackConfig::owned_ipv4`; `None` binds every address the Stack owns (all-IP). One port carries at
+most one all-IP socket and one socket per address; TCP and UDP have separate socket sets. A
+datagram goes to the socket bound to its destination address, else to the port's all-IP socket
+(exact first, then all-IP; creation order does not matter). Broadcasts (the limited broadcast and
+the subnet's) go only to the all-IP socket. A bound socket sends from its address; an all-IP socket
+sends from the Stack's IPv4 address.
 
 ```rust
 let handle = stack.add_udp(UdpConfig {
     port: 1234,
+    local_addr: None,
     rx_queue: 32,
     tx_checksum: true,
     broadcast: false,
@@ -959,10 +965,11 @@ directly. `AddTcpError::SocketsFull(config)` means all
 TCP slots are occupied. `RxPoolTooSmall { config, required, pool }` means admission would exceed the
 RX pool count. Both return the unchanged config.
 `AddUdpError::Full` means all UDP slots are occupied, including when UDP is disabled. `PortInUse`
-means that local UDP port is already bound. `InvalidConfig(reason)` rejects port zero or receive
-queue zero. `RxPoolTooSmall { required, pool }` rejects the shared RX requirement. The pool check
-runs before UDP config/slot/port checks, so a request with multiple problems can report pool
-insufficiency first.
+means a socket is already bound to that local address (or all-IP) and port. `InvalidConfig(reason)`
+rejects port zero or receive queue zero. `Unaddressable` rejects a `local_addr` the Stack does not
+own. `RxPoolTooSmall { required, pool }` rejects the shared RX requirement. The order is
+`RxPoolTooSmall`, `InvalidConfig`, `Unaddressable`, `PortInUse`, `Full`, so a request with
+multiple problems can report pool insufficiency first. A refused socket changes nothing.
 
 ### Socket errors
 

@@ -1,9 +1,10 @@
 use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use core::ops::Range;
 
-use super::flow_table::FlowTable;
+use super::Interface;
+use super::flow_table::{BindKey, FlowTable};
 use crate::phy::{HeldFrames, RxBuf, RxShared, TxSource};
-use crate::wire::{IpAddress, IpEndpoint, Ipv4Address};
+use crate::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv4AddressExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UdpHandle {
@@ -14,6 +15,10 @@ pub struct UdpHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpConfig {
     pub port: u16,
+    /// The one local address the socket receives on and sends from, which the interface must
+    /// own; `None` binds every owned address (all-IP): it receives what no socket bound to the
+    /// datagram's destination takes, and broadcasts, and sends from the interface's address.
+    pub local_addr: Option<Ipv4Address>,
     pub rx_queue: usize,
     /// Compute the UDP checksum in software when true, or write 0 when false.
     /// With a device whose `checksum.udp` capability has no TX, smoltcp always
@@ -25,8 +30,11 @@ pub struct UdpConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpAddError {
     Full,
+    /// A socket is already bound to this local address (or all-IP) and port.
     PortInUse,
     InvalidConfig(&'static str),
+    /// `local_addr` is not a unicast address the interface owns.
+    Unaddressable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +165,9 @@ pub(crate) struct PendingUdp {
 #[derive(Debug)]
 pub struct UdpSet {
     slots: Vec<Slot>,
-    ports: FlowTable<u16>,
+    binds: FlowTable<BindKey>,
+    /// Sockets bound to one address. While none is, `lookup` probes only the all-IP key.
+    bound: usize,
     pub(crate) pending_rx_attach: Option<(usize, PendingUdp)>,
     /// Frames `Interface::udp_send` copies payloads into.
     pub(crate) source: TxSource,
@@ -175,7 +185,8 @@ impl UdpSet {
                     generation: 0,
                 })
                 .collect(),
-            ports: FlowTable::new(max_sockets),
+            binds: FlowTable::new(max_sockets),
+            bound: 0,
             pending_rx_attach: None,
             source,
             #[cfg(test)]
@@ -183,14 +194,24 @@ impl UdpSet {
         }
     }
 
-    pub fn add(&mut self, config: UdpConfig) -> Result<UdpHandle, UdpAddError> {
+    /// Add a socket bound to `config`'s local address and port on `iface`. Errors, in this
+    /// order, change nothing: `InvalidConfig` (port or receive queue zero), `Unaddressable` (a
+    /// local address `iface` does not own), `PortInUse` (the same address, or all-IP, and port
+    /// already bound; one port can carry one all-IP socket and one per address), `Full`.
+    pub fn add(&mut self, iface: &Interface, config: UdpConfig) -> Result<UdpHandle, UdpAddError> {
         if config.port == 0 {
             return Err(UdpAddError::InvalidConfig("UDP port is zero"));
         }
         if config.rx_queue == 0 {
             return Err(UdpAddError::InvalidConfig("UDP receive queue is zero"));
         }
-        if self.ports.get(&config.port).is_some() {
+        if let Some(addr) = config.local_addr
+            && (!addr.x_is_unicast() || !iface.inner.has_ip_addr(addr))
+        {
+            return Err(UdpAddError::Unaddressable);
+        }
+        let key = (config.local_addr, config.port);
+        if self.binds.get(&key).is_some() {
             return Err(UdpAddError::PortInUse);
         }
         let slot = self
@@ -206,7 +227,8 @@ impl UdpSet {
             stats: UdpSocketStats::default(),
             template: None,
         });
-        self.ports.set(config.port, slot);
+        self.binds.set(key, slot);
+        self.bound += usize::from(config.local_addr.is_some());
         Ok(UdpHandle {
             slot,
             generation: self.slots[slot].generation,
@@ -227,7 +249,7 @@ impl UdpSet {
 
     pub fn remove(&mut self, handle: UdpHandle) -> HeldFrames {
         let socket = self.get(handle);
-        let port = socket.config.port;
+        let key = (socket.config.local_addr, socket.config.port);
         let held = HeldFrames::new(socket.shared.clone());
         let slot = &mut self.slots[handle.slot];
         slot.generation = slot
@@ -235,12 +257,23 @@ impl UdpSet {
             .checked_add(1)
             .expect("UDP generation overflow");
         slot.socket = None;
-        self.ports.remove(&port);
+        self.binds.remove(&key);
+        self.bound -= usize::from(key.0.is_some());
         held
     }
 
-    pub(crate) fn lookup(&self, port: u16) -> Option<usize> {
-        self.ports.get(&port)
+    /// The socket a datagram to `dst_addr:port` belongs to: one bound to `dst_addr`, else the
+    /// all-IP one. A broadcast belongs only to the all-IP socket. Without address-bound sockets
+    /// the exact probe, which could only miss, is skipped.
+    #[inline]
+    pub(crate) fn lookup(&self, dst_addr: Ipv4Address, port: u16, broadcast: bool) -> Option<usize> {
+        if !broadcast
+            && self.bound != 0
+            && let Some(slot) = self.binds.get(&(Some(dst_addr), port))
+        {
+            return Some(slot);
+        }
+        self.binds.get(&(None, port))
     }
 
     pub(crate) fn socket_at_mut(&mut self, slot: usize) -> &mut UdpSocket {
@@ -271,9 +304,17 @@ mod tests {
     use crate::wire::IpAddress;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    /// The interface's own address (crate::tests::setup).
+    const LOCAL: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
+
+    fn iface() -> Interface {
+        crate::tests::setup(crate::phy::Medium::Ethernet).0
+    }
+
     fn config(port: u16) -> UdpConfig {
         UdpConfig {
             port,
+            local_addr: None,
             rx_queue: 2,
             tx_checksum: true,
             broadcast: false,
@@ -283,20 +324,20 @@ mod tests {
     #[test]
     fn duplicate_port_refused_without_change() {
         let mut set = UdpSet::new(2, crate::tests::tx_test_source(1472));
-        let handle = set.add(config(1234)).unwrap();
+        let handle = set.add(&iface(), config(1234)).unwrap();
         let peer = IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321);
         set.get_mut(handle).connect(peer).unwrap();
-        assert_eq!(set.add(config(1234)), Err(UdpAddError::PortInUse));
+        assert_eq!(set.add(&iface(), config(1234)), Err(UdpAddError::PortInUse));
         assert_eq!(set.get(handle).config(), &config(1234));
         assert_eq!(set.get(handle).peer(), Some(peer));
-        assert_eq!(set.lookup(1234), Some(handle.slot));
-        assert!(set.add(config(1235)).is_ok());
+        assert_eq!(set.lookup(LOCAL, 1234, false), Some(handle.slot));
+        assert!(set.add(&iface(), config(1235)).is_ok());
     }
 
     #[test]
     fn stale_handle_panics() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
-        let old = set.add(config(1234)).unwrap();
+        let old = set.add(&iface(), config(1234)).unwrap();
         set.remove(old);
         assert!(catch_unwind(AssertUnwindSafe(|| set.get(old))).is_err());
         assert!(
@@ -306,7 +347,7 @@ mod tests {
             .is_err()
         );
         assert!(catch_unwind(AssertUnwindSafe(|| set.remove(old))).is_err());
-        let new = set.add(config(1234)).unwrap();
+        let new = set.add(&iface(), config(1234)).unwrap();
         assert_ne!(old, new);
         assert!(catch_unwind(AssertUnwindSafe(|| set.get(old))).is_err());
         assert!(
@@ -323,7 +364,7 @@ mod tests {
     fn receive_queue_wraps_without_growing() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set
-            .add(UdpConfig {
+            .add(&iface(), UdpConfig {
                 rx_queue: 3,
                 ..config(1234)
             })
@@ -379,7 +420,7 @@ mod tests {
     #[test]
     fn remove_frees_queued_held_stays_valid() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
-        let handle = set.add(config(1234)).unwrap();
+        let handle = set.add(&iface(), config(1234)).unwrap();
         let releases = Rc::new(Cell::new(0));
         for byte in [1, 2] {
             set.commit_rx(
@@ -394,12 +435,12 @@ mod tests {
         }
         let mut held = set.get_mut(handle).recv().unwrap();
         set.remove(handle);
-        assert_eq!(set.lookup(1234), None);
+        assert_eq!(set.lookup(LOCAL, 1234, false), None);
         assert_eq!(releases.get(), 1);
         assert_eq!(held.payload(), &[1]);
         held.payload_mut()[0] = 3;
         assert_eq!(held.payload(), &[3]);
-        let replacement = set.add(config(1234)).unwrap();
+        let replacement = set.add(&iface(), config(1234)).unwrap();
         assert_eq!(set.get(replacement).shared.held.get(), 0);
         drop(held);
         assert_eq!(releases.get(), 2);
@@ -410,7 +451,7 @@ mod tests {
     fn remove_returns_held_count() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set
-            .add(UdpConfig {
+            .add(&iface(), UdpConfig {
                 rx_queue: 3,
                 ..config(1234)
             })
@@ -443,7 +484,7 @@ mod tests {
     #[test]
     fn removed_datagram_drop_clears_count_without_wake() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
-        let handle = set.add(config(1234)).unwrap();
+        let handle = set.add(&iface(), config(1234)).unwrap();
         let shared = set.get(handle).shared.clone();
         let releases = Rc::new(Cell::new(0));
         for byte in [1, 2] {
@@ -478,7 +519,7 @@ mod tests {
     #[test]
     fn at_limit_counts_drained_datagrams_until_drop() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
-        let handle = set.add(config(1234)).unwrap();
+        let handle = set.add(&iface(), config(1234)).unwrap();
         let releases = Rc::new(Cell::new(0));
         assert!(!set.get(handle).at_limit());
         let mut datagrams = Vec::new();
@@ -510,17 +551,17 @@ mod tests {
     fn invalid_config_refused() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         assert!(matches!(
-            set.add(config(0)),
+            set.add(&iface(), config(0)),
             Err(UdpAddError::InvalidConfig(_))
         ));
         assert!(matches!(
-            set.add(UdpConfig {
+            set.add(&iface(), UdpConfig {
                 rx_queue: 0,
                 ..config(1234)
             }),
             Err(UdpAddError::InvalidConfig(_))
         ));
-        let handle = set.add(config(1234)).unwrap();
+        let handle = set.add(&iface(), config(1234)).unwrap();
         let peer = IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321);
         set.get_mut(handle).connect(peer).unwrap();
         for invalid in [
@@ -539,14 +580,96 @@ mod tests {
 
     #[test]
     fn full_set() {
-        assert_eq!(UdpSet::new(0, crate::tests::tx_test_source(1472)).add(config(1234)), Err(UdpAddError::Full));
+        assert_eq!(UdpSet::new(0, crate::tests::tx_test_source(1472)).add(&iface(), config(1234)), Err(UdpAddError::Full));
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
-        let handle = set.add(config(1234)).unwrap();
-        assert_eq!(set.add(config(1235)), Err(UdpAddError::Full));
-        assert_eq!(set.lookup(1235), None);
+        let handle = set.add(&iface(), config(1234)).unwrap();
+        assert_eq!(set.add(&iface(), config(1235)), Err(UdpAddError::Full));
+        assert_eq!(set.lookup(LOCAL, 1235, false), None);
         assert_eq!(set.get(handle).config(), &config(1234));
         set.remove(handle);
-        assert!(set.add(config(1235)).is_ok());
+        assert!(set.add(&iface(), config(1235)).is_ok());
         assert_eq!(set.slots.len(), 1);
     }
+
+    fn bound(port: u16, addr: Ipv4Address) -> UdpConfig {
+        UdpConfig {
+            local_addr: Some(addr),
+            ..config(port)
+        }
+    }
+
+    /// The bound socket's key is probed first, whichever was added first; a broadcast and an
+    /// address without a bound socket take the all-IP socket; a port without one takes nothing.
+    #[test]
+    fn lookup_prefers_the_bound_socket_in_either_order() {
+        for bound_first in [true, false] {
+            let mut set = UdpSet::new(2, crate::tests::tx_test_source(1472));
+            let (bound_handle, all) = if bound_first {
+                let b = set.add(&iface(), bound(1234, LOCAL)).unwrap();
+                (b, set.add(&iface(), config(1234)).unwrap())
+            } else {
+                let a = set.add(&iface(), config(1234)).unwrap();
+                (set.add(&iface(), bound(1234, LOCAL)).unwrap(), a)
+            };
+            assert_eq!(set.lookup(LOCAL, 1234, false), Some(bound_handle.slot));
+            assert_eq!(set.lookup(LOCAL, 1234, true), Some(all.slot));
+            assert_eq!(set.lookup(Ipv4Address::new(127, 0, 0, 1), 1234, false), Some(all.slot));
+            assert_eq!(set.lookup(LOCAL, 1235, false), None);
+            set.remove(all);
+            assert_eq!(set.lookup(LOCAL, 1234, true), None);
+            assert_eq!(set.lookup(Ipv4Address::new(127, 0, 0, 1), 1234, false), None);
+        }
+    }
+
+    /// A local address the interface does not own, or one that is not unicast, is refused
+    /// before the bind check and before taking a slot, and changes nothing: the next socket takes
+    /// the same slot and generation. A bad port or queue comes first.
+    #[test]
+    fn unowned_local_address_refused_without_change() {
+        let iface = iface();
+        let mut set = UdpSet::new(2, crate::tests::tx_test_source(1472));
+        let held = set.add(&iface, config(1234)).unwrap();
+        for addr in [
+            Ipv4Address::new(192, 168, 1, 9),
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::BROADCAST,
+            Ipv4Address::new(192, 168, 1, 255),
+            Ipv4Address::new(224, 0, 0, 1),
+        ] {
+            assert_eq!(set.add(&iface, bound(1234, addr)), Err(UdpAddError::Unaddressable), "{addr}");
+            assert_eq!(set.add(&iface, bound(1235, addr)), Err(UdpAddError::Unaddressable), "{addr}");
+            assert!(matches!(set.add(&iface, bound(0, addr)), Err(UdpAddError::InvalidConfig(_))));
+            assert_eq!(set.lookup(addr, 1234, false), Some(held.slot));
+        }
+        assert_eq!(set.slots[1].generation, 0);
+        let next = set.add(&iface, bound(1234, LOCAL)).unwrap();
+        assert_eq!((next.slot, next.generation), (1, 0));
+        // an owned address from the owned set is accepted
+        let mut iface = iface;
+        let second = Ipv4Address::new(10, 9, 0, 1);
+        iface.set_owned_ipv4(
+            crate::iface::OwnedIpv4::new(
+                &[crate::wire::Ipv4Cidr::new(second, 32)],
+                crate::wire::Ipv4Cidr::new(LOCAL, 24),
+                None,
+            )
+            .unwrap(),
+        );
+        set.remove(next);
+        assert!(set.add(&iface, bound(1234, second)).is_ok());
+    }
+
+    /// One port carries one all-IP socket and one per address; an identical bind is refused.
+    #[test]
+    fn identical_bind_refused_others_on_the_port_allowed() {
+        let iface = iface();
+        let mut set = UdpSet::new(4, crate::tests::tx_test_source(1472));
+        set.add(&iface, config(1234)).unwrap();
+        set.add(&iface, bound(1234, LOCAL)).unwrap();
+        set.add(&iface, bound(1234, Ipv4Address::new(127, 0, 0, 1))).unwrap();
+        assert_eq!(set.add(&iface, config(1234)), Err(UdpAddError::PortInUse));
+        assert_eq!(set.add(&iface, bound(1234, LOCAL)), Err(UdpAddError::PortInUse));
+        assert!(set.add(&iface, bound(1235, LOCAL)).is_ok());
+    }
 }
+
