@@ -83,9 +83,10 @@ struct Entry {
     parked: [Option<(StoredWaker, Interest)>; 2],
     /// Live halves; the socket drops with the last.
     halves: u8,
-    /// Per side: its token is armed in the Stack, or fired and not yet popped. A token that
-    /// fired before the last half dropped keeps this set for the entry's next socket until
-    /// `wake_fired` pops it, so a side never has two tokens out.
+    /// Per side: a token for this entry and side is armed in the Stack or waits in its fired
+    /// list. It may belong to the entry's previous socket, of either kind: a token that fired
+    /// before the last half dropped stays out until `wake_fired` pops it, and the side does
+    /// not arm until then, so a side never has two tokens out.
     token_out: [bool; 2],
 }
 
@@ -177,14 +178,13 @@ fn arm(stack: &mut Stack, socket: &Socket, side: usize, token: u32) {
     }
 }
 
-/// Whether the side's token was still armed (it had not fired).
+/// Disarms the side's token on the entry's current socket; whether it was armed there. A
+/// UDP socket arms only its receive side, so its send side has nothing to disarm: a send
+/// token still out on its entry is the previous socket's and waits for `wake_fired`.
 fn disarm(stack: &mut Stack, socket: &Socket, side: usize) -> bool {
     match socket {
         Socket::Tcp(_, key) => stack.disarm_tcp(*key, ready_side(side)),
-        Socket::Udp(_, key) => {
-            debug_assert_eq!(side, RX, "nothing parks on UDP send");
-            stack.disarm_udp(*key)
-        }
+        Socket::Udp(_, key) => side == RX && stack.disarm_udp(*key),
     }
 }
 

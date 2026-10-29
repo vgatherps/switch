@@ -8,12 +8,15 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use switchnet::tcp;
-use switchnet::{first, IpEndpoint};
+use switchnet::{first, IpEndpoint, TcpStream};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
 mod support;
-use support::{connect, connect_with, counted, net_ip, peer_drain, peer_send, peer_udp_send, tcp_config, udp_config, Mixed, LOCAL_PORT};
+use support::{
+    cancel_after_one_poll, connect, connect_with, counted, local, net_ip, peer_drain, peer_endpoint, peer_listen,
+    peer_send, peer_udp_send, tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT,
+};
 
 /// Opened by the test; a task awaiting it is woken then.
 #[derive(Clone, Default)]
@@ -312,6 +315,80 @@ fn token_fired_by_the_other_half_rearms_without_a_wake() {
         assert_eq!(polls.get(), 2);
         assert_eq!(frame.payload(), b"in");
         drop((rx, frame, tx, peer));
+        mixed.close();
+    })
+}
+
+/// Parks `delivered` on the stream's send side and cancels it, then changes the
+/// socket (`shutdown` again), which fires the still armed send token; drops the
+/// stream. No Net turn runs, so the fired token waits to be popped while the
+/// entry is already free.
+fn fire_send_token_and_drop(mixed: &mut Mixed, stream: TcpStream) {
+    let (rx, mut tx) = stream.split();
+    let slot = mixed.spawn(async move {
+        tx.shutdown();
+        cancel_after_one_poll(tx.delivered()).await;
+        tx.shutdown();
+        tx
+    });
+    mixed.rt.poll(0).unwrap();
+    drop((rx, slot.take()));
+}
+
+/// A UDP socket takes the entry while the previous TCP socket's fired send
+/// token is still out. Dropping the UDP send half, which never arms a token,
+/// must leave the UDP receive token alone: the parked receiver is woken by
+/// its datagram.
+#[zhida_test_support::pinned_test]
+fn udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["xkua", "xkub"]);
+        let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
+        fire_send_token_and_drop(&mut mixed, stream);
+        let (mut rx, tx) = mixed.handle().udp_bind(udp_config(7000)).unwrap().split();
+        let (task, polls) = counted(async move {
+            let datagram = rx.recv().await;
+            (rx, datagram)
+        });
+        let slot = mixed.spawn(task);
+        mixed.rt.poll(0).unwrap();
+        assert_eq!(polls.get(), 1);
+        drop(tx);
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        peer_udp_send(&mut mixed, &peer, 7000, b"after reuse");
+        let (rx, datagram) = mixed.wait(&slot);
+        assert_eq!(datagram.payload(), b"after reuse");
+        assert_eq!(polls.get(), 2);
+        drop((rx, datagram, peer, tcp_peer));
+        mixed.close();
+    })
+}
+
+/// A TCP socket takes the entry while the previous TCP socket's fired send
+/// token is still out; it connects and, after `shutdown`, waits in
+/// `delivered` until the peer acks the FIN.
+#[zhida_test_support::pinned_test]
+fn tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["xkta", "xktb"]);
+        let (stream, old_peer) = connect(&mut mixed, LOCAL_PORT);
+        fire_send_token_and_drop(&mut mixed, stream);
+        let peer = peer_listen(&mut mixed);
+        let connecting =
+            mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT + 1)).unwrap();
+        let (task, polls) = counted(async move {
+            let (rx, mut tx) = connecting.await.expect("connect").split();
+            drop(rx);
+            tx.shutdown();
+            tx.delivered().await;
+            tx
+        });
+        let slot = mixed.spawn(task);
+        mixed.rt.poll(0).unwrap();
+        let tx = mixed.wait(&slot);
+        assert_eq!(polls.get(), 3, "parked in connect, then in delivered, each woken once");
+        assert_eq!(mixed.peer.tcp(&peer).state(), tcp::State::CloseWait);
+        drop((tx, peer, old_peer));
         mixed.close();
     })
 }
