@@ -270,11 +270,14 @@ impl InterfaceInner {
         (ip_repr, udp_repr, checksum_caps)
     }
 
+    /// `dst_ours` is `process_ipv4`'s `has_ip_addr` answer for the destination, so an owned
+    /// address is searched once per datagram.
     pub(super) fn process_udp<'frame>(
         &mut self,
         udp: Option<&mut UdpSet>,
         meta: PacketMeta,
         ipv4_repr: Ipv4Repr,
+        dst_ours: bool,
         ip_payload: &'frame [u8],
         payload_offset: usize,
     ) -> Option<Packet<'frame>> {
@@ -291,7 +294,7 @@ impl InterfaceInner {
         }
         let broadcast = self.is_broadcast_v4(ipv4_repr.dst_addr);
         if !broadcast
-            && (!self.has_ip_addr(ipv4_repr.dst_addr) || !ipv4_repr.dst_addr.x_is_unicast())
+            && (!dst_ours || !ipv4_repr.dst_addr.x_is_unicast())
         {
             return None;
         }

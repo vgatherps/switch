@@ -91,7 +91,8 @@ impl InterfaceInner {
             return self.process_tcp(sockets, meta, source_hardware_addr, ip_repr, ip_payload);
         }
 
-        if !self.has_ip_addr(ipv4_repr.dst_addr) {
+        let dst_ours = self.has_ip_addr(ipv4_repr.dst_addr);
+        if !dst_ours {
             // Only UDP may arrive on a broadcast or multicast destination. Like Linux, TCP and
             // ICMP sent there get no RST and no echo reply.
             #[cfg(feature = "udp-set")]
@@ -120,7 +121,7 @@ impl InterfaceInner {
                 let payload_offset = link_header_len
                     .checked_add(ipv4_packet.header_len() as usize)
                     .expect("UDP payload offset overflow");
-                self.process_udp(udp, meta, ipv4_repr, ip_payload, payload_offset)
+                self.process_udp(udp, meta, ipv4_repr, dst_ours, ip_payload, payload_offset)
             }
 
             _ => None,
