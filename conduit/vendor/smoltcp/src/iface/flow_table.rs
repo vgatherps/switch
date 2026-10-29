@@ -7,19 +7,13 @@ pub(crate) trait FlowTableKey: Copy + Eq {
     fn hash(&self) -> u64;
 }
 
-impl FlowTableKey for u16 {
-    fn hash(&self) -> u64 {
-        finish(mix(C1, *self as u64))
-    }
-}
-
 /// A bind: a local port on one local address (`Some`), or on every address the interface owns
 /// (`None`, all-IP). UDP sockets are keyed by it; a lookup probes the exact key, then the all-IP
 /// one.
 pub(crate) type BindKey = (Option<Ipv4Address>, u16);
 
-/// An all-IP key hashes as its port alone (`u16`'s hash): `None` and `Some(0.0.0.0)` share a
-/// hash, and 0.0.0.0 is never bound.
+/// An all-IP key hashes as its port alone: `None` and `Some(0.0.0.0)` share a hash, and 0.0.0.0
+/// is never bound.
 impl FlowTableKey for BindKey {
     #[inline]
     fn hash(&self) -> u64 {
@@ -220,11 +214,6 @@ mod tests {
     }
 
     #[test]
-    fn sequential_listener_ports_spread() {
-        assert_spread("listener ports", 1024, 40000..41024u16, 15);
-    }
-
-    #[test]
     fn sequential_reviewer_remote_ports_spread() {
         assert_spread(
             "reviewer remote ports",
@@ -343,22 +332,24 @@ mod tests {
         assert_spread("all-IP bind ports", 1024, (40000..41024u16).map(|port| (None, port)), 15);
     }
 
-    /// An all-IP bind key lands where the port alone does; its exact twins elsewhere.
+    /// An all-IP bind key hashes as its port alone; its exact twins elsewhere.
     #[test]
     fn all_ip_bind_key_hashes_as_its_port() {
         for port in [1, 443, 1234, u16::MAX] {
-            assert_eq!(FlowTableKey::hash(&(None::<Ipv4Address>, port)), FlowTableKey::hash(&port));
+            let port_hash = finish(mix(C1, port as u64));
+            assert_eq!(FlowTableKey::hash(&(None::<Ipv4Address>, port)), port_hash);
             assert_ne!(
                 FlowTableKey::hash(&(Some(Ipv4Address::new(10, 0, 0, 1)), port)),
-                FlowTableKey::hash(&port)
+                port_hash
             );
         }
     }
 
     #[test]
     fn flow_table_backward_shift() {
-        let table = FlowTable::<u16>::new(4);
+        let table = FlowTable::<BindKey>::new(4);
         let keys: Vec<_> = (0..u16::MAX)
+            .map(|port| (None, port))
             .filter(|key| table.home(key) == table.storage.len() - 1)
             .take(4)
             .collect();

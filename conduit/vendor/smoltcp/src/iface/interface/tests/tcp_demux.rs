@@ -1127,6 +1127,8 @@ fn index_follows_socket_lifecycle() {
     }
 }
 
+/// A listener bound to the SYN's destination address beats an all-IP listener on the port,
+/// in either slot order; then an exact tuple beats any listener.
 #[test]
 fn precedence_across_match_classes() {
     for bound_first in [false, true] {
@@ -1135,13 +1137,14 @@ fn precedence_across_match_classes() {
         wildcard.listen(LOCAL_PORT).unwrap();
         let mut bound = socket();
         bound.listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
-        let (first, second) = if bound_first {
+        let (bound, wildcard) = if bound_first {
             (sockets.add(bound), sockets.add(wildcard))
         } else {
-            (sockets.add(wildcard), sockets.add(bound))
+            let wildcard = sockets.add(wildcard);
+            (sockets.add(bound), wildcard)
         };
-        assert_listener_receives_syn(&mut iface, &mut sockets, &mut device, first, LOCAL_PORT);
-        assert_eq!(sockets.get(second).state(), tcp::State::Listen);
+        assert_listener_receives_syn(&mut iface, &mut sockets, &mut device, bound, LOCAL_PORT);
+        assert_eq!(sockets.get(wildcard).state(), tcp::State::Listen);
     }
 
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
@@ -2370,4 +2373,97 @@ fn owned_address_connections_survive_interface_address_removal() {
         .collect();
     sent.sort();
     assert_eq!(sent, [(owned, false, b"data".to_vec()), (source, true, Vec::new())]);
+}
+
+/// `count` owned single addresses 10.10.x.y, every other one skipped.
+fn own_singles(iface: &mut Interface, count: u32) -> Vec<Ipv4Address> {
+    let base = u32::from(Ipv4Address::new(10, 10, 0, 0));
+    let owned: Vec<_> = (0..count).map(|index| Ipv4Address::from(base + 2 * index)).collect();
+    let cidrs: Vec<_> = owned.iter().map(|&addr| Ipv4Cidr::new(addr, 32)).collect();
+    iface.set_owned_ipv4(
+        crate::iface::OwnedIpv4::new(&cidrs, Ipv4Cidr::new(LOCAL_ADDR, 24), None).unwrap(),
+    );
+    owned
+}
+
+/// One exact listener per owned address on one port, 1000 of them, plus an all-IP listener
+/// created first in the lowest slot: a SYN to each owned address goes to that address's
+/// listener, answered from that address; a SYN to the interface address goes to the all-IP one.
+#[test]
+fn thousand_exact_listeners_on_one_port_each_get_their_syn() {
+    const PORT: u16 = 443;
+    let (mut iface, _, mut device) = setup(Medium::Ip);
+    let owned = own_singles(&mut iface, 1000);
+    let mut sockets = TcpSet::new(Vec::new());
+    let mut all = socket();
+    all.listen(PORT).unwrap();
+    let all = sockets.add(all);
+    let exact: Vec<_> = owned
+        .iter()
+        .map(|&addr| {
+            let mut listener = socket();
+            listener.listen((addr, PORT)).unwrap();
+            sockets.add(listener)
+        })
+        .collect();
+    for (index, (&addr, &handle)) in owned.iter().zip(&exact).enumerate().rev() {
+        let syn = TcpRepr {
+            dst_port: PORT,
+            src_port: 10000 + index as u16,
+            ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+        };
+        device.rx_queue.push_back(packet_bytes_to(syn, addr));
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        let bytes = take_reply(&mut device);
+        let (src, synack) = reply_from(&bytes);
+        assert_eq!((src, synack.control, synack.src_port), (addr, TcpControl::Syn, PORT));
+        assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived, "{addr}");
+    }
+    assert_eq!(sockets.get(all).state(), tcp::State::Listen);
+    let syn = TcpRepr { dst_port: PORT, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
+    device.rx_queue.push_back(packet_bytes_to(syn, LOCAL_ADDR));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    assert_eq!(reply_from(&bytes).0, LOCAL_ADDR);
+    assert_eq!(sockets.get(all).state(), tcp::State::SynReceived);
+    sockets.check_flow_index();
+}
+
+/// Two identical exact listeners serve two connections, lowest slot first; once both are
+/// taken (and after the exact listeners are removed) a further SYN to that address falls back
+/// to the all-IP listener.
+#[test]
+fn identical_exact_listeners_then_all_ip_fallback() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let owned = own_singles(&mut iface, 1)[0];
+    let mut all = socket();
+    all.listen(LOCAL_PORT).unwrap();
+    let all = sockets.add(all);
+    let [first, second] = [(); 2].map(|_| {
+        let mut listener = socket();
+        listener.listen((owned, LOCAL_PORT)).unwrap();
+        sockets.add(listener)
+    });
+    let syn_from = |port: u16| TcpRepr { src_port: port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
+    for (src_port, handle) in [(50001, first), (50002, second)] {
+        device.rx_queue.push_back(packet_bytes_to(syn_from(src_port), owned));
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        let bytes = take_reply(&mut device);
+        assert_eq!(reply_from(&bytes).0, owned);
+        assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+        assert_eq!(
+            sockets.get(handle).remote_endpoint(),
+            Some(IpEndpoint::new(REMOTE_ADDR.into(), src_port))
+        );
+    }
+    assert_eq!(sockets.get(all).state(), tcp::State::Listen);
+    sockets.remove(first);
+    sockets.remove(second);
+    device.rx_queue.push_back(packet_bytes_to(syn_from(50003), owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    assert_eq!(reply_from(&bytes).0, owned);
+    assert_eq!(sockets.get(all).state(), tcp::State::SynReceived);
+    assert_eq!(sockets.get(all).local_endpoint(), Some(IpEndpoint::new(owned.into(), LOCAL_PORT)));
+    sockets.check_flow_index();
 }

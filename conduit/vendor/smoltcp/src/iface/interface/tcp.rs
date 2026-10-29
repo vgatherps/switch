@@ -249,12 +249,17 @@ impl InterfaceInner {
 
         #[cfg(debug_assertions)]
         let linear = {
-            let listener = (0..sockets.slot_count()).find(|&index| {
-                sockets.item_at_mut(index).is_some_and(|item| {
-                    item.socket.is_listening()
-                        && item.socket.accepts(self, &ip_repr, &tcp_repr)
-                })
-            });
+            // The lowest listener bound to the destination address, else the lowest all-IP one.
+            let mut listeners = [None, None];
+            for index in (0..sockets.slot_count()).rev() {
+                if let Some(item) = sockets.item_at_mut(index)
+                    && item.socket.is_listening()
+                    && item.socket.accepts(self, &ip_repr, &tcp_repr)
+                {
+                    listeners[usize::from(item.socket.listen_endpoint().addr.is_none())] = Some(index);
+                }
+            }
+            let listener = listeners[0].or(listeners[1]);
             (0..sockets.slot_count())
                 .find(|&index| {
                     sockets.item_at_mut(index).is_some_and(|item| {

@@ -663,8 +663,10 @@ succeeds without resetting it; listening on an otherwise open socket errors.
 Multiple TCP sockets can listen on the same local port; there is no TCP `PortInUse` error. For a
 new SYN, an exact connection tuple wins before listener lookup. A SYN without ACK whose sequence
 number is beyond a matching TimeWait socket's receive-next position resets that socket and goes to
-an available matching listener. Listener lookup selects the lowest socket slot whose listen port
-and optional address match.
+an available matching listener. Listener lookup, as on Linux, prefers a listener bound to the SYN's
+destination address over an all-address one on the same port, whatever their creation order; among
+identical listeners the lowest socket slot wins, so several identical listeners pre-arm several
+accepts. Removing the last bound listener for an address falls back to the all-address one.
 
 An accepted SYN changes that listening socket itself to `SynReceived` and installs the local/remote
 tuple. The final handshake ACK changes it to `Established`. There is no separate accepted socket,
