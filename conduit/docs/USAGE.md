@@ -1046,6 +1046,5 @@ Keep EAL and its owner identity alive until every buffer has returned.
   by hand through tap-echo's driver, not through `open`.
 - `crates/tap-echo`: EAL/vdev/Port setup by hand, bounded echo I/O, drive loop, and explicit teardown.
 - `crates/stack-stream`: nonblocking `Read`/`Write` adapter over a drained TCP socket.
-- `crates/ws-autobahn`: `StackStream` with tungstenite client/server integration.
 - `crates/memif-bench`: pool sizing, queued drive calls, stream workloads, and in-place UDP sending.
 - [docker/README.md](../docker/README.md): Linux DPDK test setup and commands.

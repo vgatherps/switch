@@ -58,7 +58,6 @@ pub enum ProtocolError {
     NonMinimalLength,
     /// A close payload of 1 byte.
     InvalidCloseLength,
-    InvalidCloseCode(u16),
     InvalidUtf8,
     FrameTooBig,
     MessageTooBig,
@@ -366,7 +365,9 @@ impl Core {
                 if p.len() >= 2 {
                     let code = u16::from_be_bytes([p[0], p[1]]);
                     if !close_code_allowed(code) {
-                        return Err(ProtocolError::InvalidCloseCode(code).into());
+                        // RFC 6455 §7.4.1: the close handshake still completes, with 1002
+                        self.close = Some(Control::new(&1002u16.to_be_bytes()));
+                        return Err(Stop::Closed);
                     }
                     if core::str::from_utf8(&p[2..]).is_err() {
                         return Err(ProtocolError::InvalidUtf8.into());
@@ -563,7 +564,8 @@ impl<R: PlainRx> WsRx<R> {
         due.then(|| self.core.pong.bytes())
     }
 
-    /// The peer's validated close payload, to echo, once `recv` returned `Closed`.
+    /// The close payload to echo once `recv` returned `Closed`: the peer's, validated, or
+    /// 1002 (protocol error) when its status code is not one a peer may send.
     pub fn peer_close(&self) -> Option<&[u8]> {
         self.core.close.as_ref().map(Control::bytes)
     }

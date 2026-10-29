@@ -20,7 +20,6 @@ Ethernet.
 | `crates/tap-echo` | `tap-echo` | TCP echo server over a tap device, the target for packetdrill and the fuzzers |
 | `crates/binance-feed` | `binance-feed` | Binance bookTicker client over TCP, TLS and WebSocket |
 | `crates/stack-stream` | `stack-stream` | `Read`/`Write` adapter over a TCP socket |
-| `crates/ws-autobahn` | `ws-autobahn` | tungstenite over `stack-stream`, checked with the Autobahn suite |
 | `crates/memif-bench` | `memif-bench` | Benchmarks over DPDK memif |
 | `crates/sockperf-wire` | `sockperf-wire` | sockperf's message format, used by `zhida-nic` |
 | `vendor/smoltcp` | `smoltcp` | smoltcp 0.14.0, cut down to IPv4 TCP and UDP over Ethernet, with mbuf-native receive |
@@ -75,8 +74,8 @@ Imported files keep their own licenses:
 - packetdrill scripts from freebsd-net/tcp-testsuite: BSD-2-Clause, notice in each file.
 - packetdrill scripts from google/packetdrill, and `docker/packetdrill-relearn-isn.patch`:
   GPL-2.0-or-later.
-- `autobahn/expected-results.json`: from tungstenite, MIT OR Apache-2.0
-  (`autobahn/LICENSE-MIT-tungstenite`).
+- `autobahn/expected-results-relay.json`: derived from tungstenite's expected results, MIT OR
+  Apache-2.0 (`autobahn/LICENSE-MIT-tungstenite`).
 
 Sources and commits: [fuzz/packetdrill/README.md](fuzz/packetdrill/README.md#upstream-suites),
 [autobahn/README.md](autobahn/README.md).

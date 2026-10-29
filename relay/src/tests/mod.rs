@@ -7,7 +7,7 @@ pub(crate) use sheath::{FrameTx, RxFrame, TxFrame};
 
 pub(crate) use crate::lower::PlainTx;
 pub(crate) use crate::raw::Raw;
-pub(crate) use crate::rx::{Config, Kind, ProtocolError, Role, WsError, WsRx};
+pub(crate) use crate::rx::{Config, Kind, Role, WsError, WsRx};
 pub(crate) use crate::tx::{TxError, WsTx};
 
 mod differential;

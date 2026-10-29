@@ -99,13 +99,13 @@ in-container `make test` runs under `timeout --kill-after=10 $(MAKE_TEST_TIMEOUT
 
 ## Stack configuration in the drivers
 
-The shared driver for tap-echo, ws-autobahn and binance-feed sizes DPDK memory from its RX and TX
+The shared driver for tap-echo, relay-autobahn and binance-feed sizes DPDK memory from its RX and TX
 pool counts: `-m` requests `64 + ceil((rx_count + tx_count) * 4096 / 1048576)` MB. The RX pool
-grows with sockets × receive buffer through `rx_pool_count`. ws-autobahn keeps every case's
-socket, so memory grows with the Autobahn case count: 91 RX mbufs per case at 128 KiB, about
+grows with sockets × receive buffer through `rx_pool_count`. relay-autobahn sizes for a socket
+per case (a socket closed first holds its slot through TIME-WAIT), so memory grows with the Autobahn case count: 91 RX mbufs per case at 128 KiB, about
 250 MB for 517 cases (249 MB server, 250 MB client).
 
-tap-echo, ws-autobahn, binance-feed and memif-bench read `StackConfig.random_seed` from
+tap-echo, relay-autobahn, binance-feed and memif-bench read `StackConfig.random_seed` from
 `/dev/urandom` on each run. Tests and library benches use fixed seeds. memif-bench has no seed
 override, so its traffic choices vary between runs.
 
@@ -562,12 +562,15 @@ make DOCKER_TARGET_VOLUME=zhida-target-websocket docker-autobahn [AUTOBAHN_TIMEO
 ```
 
 Two roles, all 517 cases each, checked against the same pinned expected file. Server role:
-`wstest -m fuzzingclient` (`autobahn/fuzzingclient.json`) against `ws-autobahn server`, a
-tungstenite 0.30.0 echo server on Zhida at ws://192.0.2.2:8080. Client role: `ws-autobahn
-client`, a tungstenite 0.30.0 client on Zhida (192.0.2.2, local ports 49152..49670), drives
+`wstest -m fuzzingclient` (`autobahn/fuzzingclient.json`, agent `relay`) against
+`relay-autobahn server`, relay's echo server on Zhida at ws://192.0.2.2:8080 (`relay::switchnet::accept_ws`,
+no extensions). Client role: `relay-autobahn client`, relay's client on Zhida (192.0.2.2, local
+ports 49152..49670, `connect_ws`), drives
 `wstest -m fuzzingserver` (`autobahn/fuzzingserver.json`, kernel TCP at ws://192.0.2.1:9001,
 `--webport 0`) through getCaseCount, runCase 1..517 and updateReports. Every byte crosses kernel
-TCP -> net_tap -> Port -> Stack -> `StackStream` -> tungstenite. `make docker-test` runs it
+TCP -> net_tap -> Port -> Stack -> switchnet -> relay, as switch tasks. The binary is
+`relay-autobahn` (relay/src/bin, feature `e2e`); its tests (`make test-wss`) run both roles
+against kernel peers. `make docker-test` runs it
 after `make test`; `make docker-autobahn` runs the gate alone.
 
 Each role needs two containers (Zhida on `DOCKER_CPUSET`, Autobahn on `AUTOBAHN_CPUSET`) and the
@@ -673,7 +676,7 @@ its cases hides a new failure in its other cases.
 
 `crates/binance-feed` subscribes to Binance's public `btcusdt@bookTicker` WebSocket stream over
 TLS with TCP running on Zhida: a DPDK net_tap port and a `Stack` inside the Docker container,
-not kernel sockets. rustls (ring provider, webpki-roots) runs over ws-autobahn's `StackStream`,
+not kernel sockets. rustls (ring provider, webpki-roots) runs over stack-stream's `StackStream`,
 tungstenite over rustls. It needs internet:
 
 ```sh

@@ -9,7 +9,7 @@ publish = false
 # The clients over switchnet TCP (module `switchnet`): ws:// and wss:// through sheath.
 switchnet = ["dep:switchnet", "dep:switch", "dep:rustls", "sheath/switchnet"]
 # Test-only: the Docker end-to-end tests (DPDK net_tap, Linux), on switchnet's testkit.
-e2e = ["switchnet", "switchnet/testkit", "dep:zhida-test-support"]
+e2e = ["switchnet", "switchnet/testkit", "dep:zhida-test-support", "dep:tap-echo"]
 
 [dependencies]
 # Client-role frame masks (RFC 6455 §5.3) and Sec-WebSocket-Key: per-connection CSPRNG.
@@ -25,6 +25,8 @@ switchnet = { workspace = true, optional = true }
 # yield_now: a failed connection lets the Net send its alert before the socket is dropped.
 switch = { workspace = true, optional = true }
 zhida-test-support = { workspace = true, optional = true }
+# The Autobahn driver (bin relay-autobahn): tester process, EAL and net_tap Port.
+tap-echo = { workspace = true, optional = true }
 
 [dev-dependencies]
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
@@ -33,6 +35,10 @@ tungstenite.workspace = true
 trybuild = "1.0"
 # setsockopt in the Docker end-to-end tests.
 libc.workspace = true
+
+[[bin]]
+name = "relay-autobahn"
+required-features = ["e2e"]
 
 [[test]]
 name = "wss_switchnet"

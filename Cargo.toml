@@ -6,7 +6,6 @@ members = [
     "conduit/crates/zhida-dpdk-sys",
     "conduit/crates/dpdk-smoltcp",
     "conduit/crates/tap-echo",
-    "conduit/crates/ws-autobahn",
     "conduit/crates/stack-stream",
     "conduit/crates/memif-bench",
     "conduit/crates/binance-feed",

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Tester of `ws-autobahn server|client` (make docker-autobahn), run by the driver
+# Tester of `relay-autobahn server|client` (make docker-autobahn), run by the driver
 # in the Zhida container with its env (ZHIDA_IFACE, TESTER_IP=192.0.2.1, ...).
 # Takes 192.0.2.1/24 on the tap netdev, signals `ready` to peer.sh; client role:
 # then waits until wstest's fuzzingserver listens on port 9001 and signals

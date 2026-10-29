@@ -66,6 +66,41 @@ pub(crate) fn check(head: &[u8], key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The server's answer to a client's upgrade request head (RFC 6455 §4.2.1, §4.2.2): a GET
+/// with `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Version: 13` and a
+/// `Sec-WebSocket-Key` gets the 101 response. No extension or subprotocol is selected, so
+/// offers of them are ignored.
+pub(crate) fn accept(head: &[u8]) -> Result<String, String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut parsed = httparse::Request::new(&mut headers);
+    match parsed.parse(head) {
+        Ok(httparse::Status::Complete(_)) => {}
+        Ok(httparse::Status::Partial) => return Err("incomplete request head".into()),
+        Err(e) => return Err(format!("request: {e}")),
+    }
+    if parsed.method != Some("GET") {
+        return Err(format!("method {:?}", parsed.method));
+    }
+    let header = |name: &str| parsed.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.value);
+    if !header("upgrade").is_some_and(|v| v.eq_ignore_ascii_case(b"websocket")) {
+        return Err("no Upgrade: websocket".into());
+    }
+    let connection = header("connection").unwrap_or_default();
+    if !connection.split(|&b| b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade")) {
+        return Err("no Connection: upgrade".into());
+    }
+    if header("sec-websocket-version") != Some(b"13") {
+        return Err("no Sec-WebSocket-Version: 13".into());
+    }
+    let key = header("sec-websocket-key").ok_or("no Sec-WebSocket-Key")?;
+    let key = core::str::from_utf8(key).map_err(|_| "Sec-WebSocket-Key not ASCII")?;
+    Ok(format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        accept_key(key.trim())
+    ))
+}
+
 /// Sec-WebSocket-Accept for `key` (RFC 6455 §4.2.2).
 fn accept_key(key: &str) -> String {
     let mut sha1 = Sha1::new();
@@ -182,5 +217,38 @@ mod tests {
         }
         let mut head = Vec::new();
         assert!(read_head(&mut head, &[b'x'; MAX_HEAD + 1]).is_err());
+    }
+
+    /// Our own request is accepted, and the 101 answers its key (RFC 6455 §1.3 example).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn accept_answers_a_valid_request() {
+        let req = "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\n\
+                   Connection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+        let response = accept(req.as_bytes()).unwrap();
+        assert_eq!(
+            response,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+        );
+        // and it passes the client's own check, without an extension selected
+        check(response.as_bytes(), KEY).unwrap();
+        let (ours, key) = request("h", 80, 80, "/", [7; 16]);
+        check(accept(ours.as_bytes()).unwrap().as_bytes(), &key).unwrap();
+    }
+
+    #[test]
+    fn accept_refuses_bad_requests() {
+        let good = "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                    Sec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let without = |line: &str| good.replace(&format!("{line}\r\n"), "");
+        assert_eq!(accept(without("Upgrade: websocket").as_bytes()).unwrap_err(), "no Upgrade: websocket");
+        assert_eq!(accept(without("Connection: Upgrade").as_bytes()).unwrap_err(), "no Connection: upgrade");
+        assert_eq!(accept(without("Sec-WebSocket-Key: k").as_bytes()).unwrap_err(), "no Sec-WebSocket-Key");
+        let v8 = good.replace("Version: 13", "Version: 8");
+        assert_eq!(accept(v8.as_bytes()).unwrap_err(), "no Sec-WebSocket-Version: 13");
+        assert!(accept(good.replace("GET", "POST").as_bytes()).unwrap_err().starts_with("method"));
+        assert_eq!(accept(b"GET / HTTP/1.1\r\nUpgr").unwrap_err(), "incomplete request head");
     }
 }

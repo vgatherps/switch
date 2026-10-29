@@ -4,7 +4,7 @@ The zhida stack: the vendored smoltcp (`vendor/smoltcp`) running on one DPDK por
 
 Most applications open it through `zhida-open` rather than calling `Eal::init` and `Port::open` directly. The API guide is [docs/USAGE.md](../../docs/USAGE.md).
 
-Depended on by `zhida-open`, `tap-echo`, `stack-stream`, `ws-autobahn`, `binance-feed`, `memif-bench`, `nic-runner`, `switchnet` and `zhida-test-kit`. It builds on [`zhida-buffer`](../zhida-buffer/README.md) and [`zhida-dpdk-sys`](../zhida-dpdk-sys/README.md).
+Depended on by `zhida-open`, `tap-echo`, `stack-stream`, `binance-feed`, `memif-bench`, `nic-runner`, `switchnet` and `zhida-test-kit`. It builds on [`zhida-buffer`](../zhida-buffer/README.md) and [`zhida-dpdk-sys`](../zhida-dpdk-sys/README.md).
 
 ## Main types
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare an Autobahn fuzzingclient index.json to tungstenite's expected results.
+"""Compare an Autobahn report index.json to relay's expected results.
 
 Exit 0: exact per-case match. Exit 1: mismatch. Exit 2: malformed input.
 """
@@ -12,9 +12,9 @@ import subprocess
 import sys
 import tempfile
 
-AGENT = "Tungstenite"
+AGENT = "relay"
 COMPARED = ("behavior", "behaviorClose", "remoteCloseCode")
-DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expected-results.json")
+DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expected-results-relay.json")
 
 
 class Malformed(Exception):
@@ -132,7 +132,7 @@ def self_test(expected_path):
         d[AGENT]["99.9.9"] = copy.deepcopy(cases[any_case])
 
     def rename_agent(d):
-        d["NotTungstenite"] = d.pop(AGENT)
+        d["Not" + AGENT] = d.pop(AGENT)
 
     def add_agent(d):
         d["Other"] = copy.deepcopy(d[AGENT])

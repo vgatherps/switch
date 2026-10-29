@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
-.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
+.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -147,7 +147,7 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 	FUZZ_TIMEOUT=$(FUZZ_TIMEOUT)
 
 help:
-	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test-packetdrill test-scapy test-known-bugs test bench memif-bench fuzz binance known-bugs test-smoltcp bench-stack soak' \
+	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-stream test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test-known-bugs test bench memif-bench fuzz binance known-bugs test-smoltcp bench-stack soak' \
 		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
@@ -211,9 +211,6 @@ test-wss: doctor
 	$(TIMEOUT) cargo test --locked -p relay --features e2e -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p sheath --features e2e -- --test-threads=1
 
-test-ws: doctor
-	$(TIMEOUT) cargo test --locked -p ws-autobahn -- --test-threads=1
-
 test-binance: doctor
 	$(TIMEOUT) cargo test --locked -p binance-feed -- --test-threads=1
 
@@ -249,7 +246,7 @@ test-scapy:
 test-known-bugs:
 	$(TIMEOUT) sh fuzz/known-bugs-self-test.sh
 
-test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-stream test-switchnet test-wss test-ws test-binance test-memif test-autobahn-check test-scapy test-known-bugs test-smoltcp
+test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-stream test-switchnet test-wss test-binance test-memif test-autobahn-check test-scapy test-known-bugs test-smoltcp
 
 bench: doctor
 	cargo bench --locked -p zhida-buffer --bench buffer
@@ -457,8 +454,8 @@ docker-autobahn-image:
 	done; \
 	wait $$pid
 
-# Once per role, server (wstest fuzzingclient against `ws-autobahn server`) then
-# client (`ws-autobahn client` against wstest fuzzingserver), each in a fresh
+# Once per role, server (wstest fuzzingclient against `relay-autobahn server`) then
+# client (`relay-autobahn client` against wstest fuzzingserver), each in a fresh
 # autobahn/run/<role>/: Zhida container C (driver + tester) and Autobahn
 # container A (wstest, in C's netns), both detached; see docker/README.md. A role
 # passes only if C exited 0 within AUTOBAHN_TIMEOUT + 60 s, A ended within 30 s
@@ -518,7 +515,7 @@ docker-autobahn: docker-autobahn-image
 		c=zhida-autobahn-c-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$c $(DOCKER_DPDK) -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
 			$(DOCKER_IMAGE) timeout --kill-after=10 $(AUTOBAHN_TIMEOUT) \
-			../target/release/ws-autobahn $$mode "$$@" \
+			../target/release/relay-autobahn $$mode "$$@" \
 			-- autobahn/zhida-tester.sh $$mode >/dev/null || { remove 1; return 1; }; \
 		a=zhida-autobahn-a-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$a --network container:$$c --cpuset-cpus=$(AUTOBAHN_CPUSET) \
@@ -537,7 +534,7 @@ docker-autobahn: docker-autobahn-image
 		echo "docker-autobahn: $$mode $$result: $$(( $$(date +%s) - start )) s, driver exit $$driver, wstest $$peer, failures:$${failed:- none} (logs in $$run/)"; \
 		return $$verdict; \
 	}; \
-	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p ws-autobahn || exit 1; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p relay --features e2e --bin relay-autobahn || exit 1; \
 	role server --expect-connections $(AUTOBAHN_CASES); server=$$?; \
 	role client --expect-cases $(AUTOBAHN_CASES); client=$$?; \
 	[ $$server = 0 ] && [ $$client = 0 ]

@@ -2,7 +2,7 @@
 
 DPDK fixtures shared by the workspace's integration tests and benches. Not published.
 
-Depends on `dpdk-smoltcp`, `zhida-buffer` and `zhida-dpdk-sys`. Dev-dependency of `dpdk-smoltcp`, `stack-stream`, `tap-echo`, `ws-autobahn`, `binance-feed`, `memif-bench` and `switchnet`. Its own tests use `zhida-test-support`.
+Depends on `dpdk-smoltcp`, `zhida-buffer` and `zhida-dpdk-sys`. Dev-dependency of `dpdk-smoltcp`, `stack-stream`, `tap-echo`, `binance-feed`, `memif-bench` and `switchnet`. Its own tests use `zhida-test-support`.
 
 ## Modules
 

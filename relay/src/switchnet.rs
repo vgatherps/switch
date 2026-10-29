@@ -1,6 +1,7 @@
-//! WebSocket clients over switchnet TCP: [`connect`] for wss:// (TLS 1.3 through sheath) and
-//! [`connect_ws`] for plain ws://. Each runs the WebSocket upgrade (a rare path, which
-//! allocates), then [`Wss`]/[`Ws`] receive and send messages. Their futures run as switch tasks.
+//! WebSocket over switchnet TCP: [`connect`] for a wss:// client (TLS 1.3 through sheath),
+//! [`connect_ws`] for a plain ws:// client and [`accept_ws`] for a plain ws:// server. Each runs
+//! the WebSocket upgrade (a rare path, which allocates), then [`Wss`]/[`Ws`] receive and send
+//! messages. Their futures run as switch tasks.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -8,7 +9,7 @@ use std::sync::Arc;
 
 use rustls::ClientConfig;
 use sheath::switchnet::{SwitchTx, send_bytes, tls_connect};
-use sheath::{TlsRx, TlsTx, TxError as TlsTxError};
+use sheath::{FrameTx, TlsRx, TlsTx, TxError as TlsTxError};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
@@ -126,7 +127,7 @@ pub async fn connect(
         }
     }
     upgrade::check(&head, &key).map_err(Error::Upgrade)?;
-    Ok(Wss(Session::new(tls.rx, tls.tx, tls.tcp)))
+    Ok(Wss(Session::new(tls.rx, tls.tx, tls.tcp, Role::Client)))
 }
 
 /// The ws:// upgrade for `path` on `stream`, connected to `host`'s `port`.
@@ -136,29 +137,47 @@ pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port:
     let (request, key) = upgrade::request(host, port, 80, path, rand::random());
     send_bytes(&mut tx, request.as_bytes()).await?;
     let mut rx = Raw::new();
+    let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
+    upgrade::check(&head, &key).map_err(Error::Upgrade)?;
+    Ok(Ws(Session::new(rx, tx, tcp, Role::Client)))
+}
+
+/// The server side of the ws:// upgrade on an accepted `stream`: the client's request is
+/// answered with 101, selecting no extension or subprotocol. A request that is not a
+/// WebSocket upgrade is `Error::Upgrade`, with nothing sent.
+pub async fn accept_ws(handle: &NetHandle, stream: TcpStream) -> Result<Ws, Error> {
+    let (mut tcp, tcp_tx) = stream.split();
+    let mut tx = SwitchTx::new(handle, tcp_tx).await;
+    let mut rx = Raw::new();
+    let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
+    let response = upgrade::accept(&head).map_err(Error::Upgrade)?;
+    send_bytes(&mut tx, response.as_bytes()).await?;
+    Ok(Ws(Session::new(rx, tx, tcp, Role::Server)))
+}
+
+/// Reads an HTTP head off plain TCP, through its blank line; what follows stays in `rx`.
+async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mut TcpRx) -> Result<Vec<u8>, Error> {
     let mut head = Vec::new();
     loop {
-        match rx.chunk(&mut tx)? {
+        match rx.chunk(tx)? {
             Some(run) => {
                 let (taken, done) = upgrade::read_head(&mut head, run.bytes).map_err(Error::Upgrade)?;
                 rx.consume(taken);
                 if done {
-                    break;
+                    return Ok(head);
                 }
             }
             None => rx.push(tcp.recv().await.map_err(Error::Recv)?),
         }
     }
-    upgrade::check(&head, &key).map_err(Error::Upgrade)?;
-    Ok(Ws(Session::new(rx, tx, tcp)))
 }
 
 /// An open wss:// connection. A server ping is answered within `recv`; the server's close is
 /// echoed there, followed by close_notify and FIN.
 pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>>);
 
-/// An open ws:// connection. A server ping is answered within `recv`; the server's close is
-/// echoed there, followed by FIN.
+/// An open ws:// connection, client or server. A ping is answered within `recv`; the peer's
+/// close is echoed there, followed by FIN.
 pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx>);
 
 impl Wss {
@@ -191,9 +210,23 @@ impl Ws {
     }
 
     /// Sends a close frame (`code`, `reason`), then FIN. Receiving goes on until
-    /// `recv` returns `None`, after the server's echo.
+    /// `recv` returns `None`, after the peer's echo.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
         self.0.close(code, reason).await
+    }
+
+    /// After `recv` failed the connection (a protocol error): FIN, then receives and drops what
+    /// the peer still sends until it ends the stream too, so dropping the `Ws` afterwards sends
+    /// no RST (a socket dropped with data unread aborts). Waits for the peer: bound it.
+    pub async fn linger(&mut self) -> Result<(), Error> {
+        self.0.tx.lower_mut().shutdown();
+        loop {
+            match self.0.tcp.recv().await {
+                Ok(_) => {}
+                Err(RecvError::Finished) => return Ok(()),
+                Err(e) => return Err(Error::Recv(e)),
+            }
+        }
     }
 }
 
@@ -210,8 +243,8 @@ where
     T: PlainTx,
     Error: From<R::Error> + From<T::Error>,
 {
-    fn new(rx: R, tx: T, tcp: TcpRx) -> Self {
-        Session { rx: WsRx::new(rx, Config::new(Role::Client)), tx: WsTx::new(tx, Role::Client), tcp }
+    fn new(rx: R, tx: T, tcp: TcpRx, role: Role) -> Self {
+        Session { rx: WsRx::new(rx, Config::new(role)), tx: WsTx::new(tx, role), tcp }
     }
 
     async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {

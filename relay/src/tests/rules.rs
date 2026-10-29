@@ -93,7 +93,6 @@ fn close_codes() {
     assert_eq!(P::FrameTooBig.close_code(), 1009);
     assert_eq!(P::MessageTooBig.close_code(), 1009);
     assert_eq!(P::ReservedBits.close_code(), 1002);
-    assert_eq!(P::InvalidCloseCode(5).close_code(), 1002);
 }
 
 fn close(code: u16, reason: &[u8]) -> Vec<u8> {
@@ -116,8 +115,12 @@ fn close_frames() {
     assert_eq!(feed(&mut r, &[encode(fin(CLOSE), None, b"")]).end, Some(WsError::Closed));
     assert_eq!(r.peer_close(), Some(&[][..]));
 
+    // a status code a peer may not send still closes, answered with 1002, whatever the reason
     for code in [0, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000, 65535] {
-        fails(Role::Client, &[close(code, b"")], P::InvalidCloseCode(code));
+        let mut r = rx(Role::Client);
+        let run = feed(&mut r, &[close(code, &[b'w', 0xff])]);
+        assert_eq!(run.end, Some(WsError::Closed), "{code}");
+        assert_eq!(r.peer_close(), Some(&1002u16.to_be_bytes()[..]), "{code}");
     }
     fails(Role::Client, &[encode(fin(CLOSE), None, &[3])], P::InvalidCloseLength);
     fails(Role::Client, &[close(1000, &[b'o', 0xff])], P::InvalidUtf8);

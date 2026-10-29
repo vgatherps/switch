@@ -1,8 +1,8 @@
 # tap-echo
 
-TCP echo server on a `Stack` over a net_tap netdev, plus the driver that `ws-autobahn` and `binance-feed` reuse. It is the zhida target for the packetdrill scripts and the Scapy fuzzer.
+TCP echo server on a `Stack` over a net_tap netdev, plus the driver that relay's `relay-autobahn` and `binance-feed` reuse. It is the zhida target for the packetdrill scripts and the Scapy fuzzer.
 
-Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `zhida-buffer` and `zhida-dpdk-sys`. `ws-autobahn` and `binance-feed` depend on it for `driver`.
+Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `zhida-buffer` and `zhida-dpdk-sys`. relay (feature `e2e`) and `binance-feed` depend on it for `driver`.
 
 ## Contents
 

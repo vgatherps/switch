@@ -4,7 +4,7 @@ Test harness that runs DPDK tests on one long-lived thread. Not published (`publ
 
 EAL is claimed by the thread that initializes it, and libtest runs each test on a fresh thread. `zhida-test-support` runs every `#[pinned_test]` body on a single worker thread, so all tests in a binary share one EAL owner.
 
-Dev-dependency of `zhida-dpdk-sys`, `zhida-buffer`, `dpdk-smoltcp`, `zhida-open`, `tap-echo`, `stack-stream`, `ws-autobahn`, `binance-feed`, `memif-bench`, `zhida-test-kit` and `switchnet`.
+Dev-dependency of `zhida-dpdk-sys`, `zhida-buffer`, `dpdk-smoltcp`, `zhida-open`, `tap-echo`, `stack-stream`, `binance-feed`, `memif-bench`, `zhida-test-kit` and `switchnet`.
 
 ## API
 

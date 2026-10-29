@@ -71,8 +71,6 @@ fn relay(role: Role, wire: &[u8], cuts: &[usize]) -> Outcome {
             let p = rx.peer_close().unwrap();
             End::Close((p.len() >= 2).then(|| u16::from_be_bytes([p[0], p[1]])))
         }
-        // tungstenite reports a disallowed close code as a close with 1002.
-        Some(WsError::Protocol(ProtocolError::InvalidCloseCode(_))) => End::Close(Some(1002)),
         Some(WsError::Protocol(e)) => End::Fail(e.close_code()),
         Some(WsError::Lower(e)) => match e {},
     };
