@@ -29,4 +29,4 @@ make test-switchnet    # from conduit/: cargo test -p switchnet, then --benches 
 cargo bench -p switchnet --bench turn
 ```
 
-Needs DPDK 25.11.3 and a one-CPU process (Docker image on macOS; `make docker-test` includes it). Tests are in `tests/rx.rs` (receive, connect, accept), `tests/tx.rs` (send) and `tests/ready.rs` (which parked tasks a turn wakes).
+Needs DPDK 25.11.3 and a one-CPU process (Docker image on macOS; `make docker-test` includes it). Tests are in `tests/rx.rs` (receive, connect, accept), `tests/tx.rs` (send), `tests/ready.rs` (which parked tasks a turn wakes) and `tests/multi_ip.rs` (secondary addresses, per-address binds, bound-over-all-IP precedence).
