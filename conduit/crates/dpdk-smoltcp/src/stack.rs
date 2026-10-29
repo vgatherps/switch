@@ -146,6 +146,14 @@ pub enum UdpSendFrameError {
     Foreign,
 }
 
+/// A TCP socket's readiness key from [`Stack::tcp_ready_key`], checked once against its handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpReadyKey(SocketHandle);
+
+/// A UDP socket's readiness key from [`Stack::udp_ready_key`], checked once against its handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpReadyKey(smoltcp::iface::UdpHandle);
+
 /// Outcome of one `Stack::turn` or `Stack::receive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turn {
@@ -835,6 +843,16 @@ impl Stack {
             .expect("removed socket's TX frame limit was held");
     }
 
+    /// The socket's readiness key, checked against `handle` as `tcp` does: it belongs to this
+    /// Stack and names a live socket. Arming then runs on every park without repeating that
+    /// check. The key is valid for this Stack until the socket is removed; take it once per
+    /// socket and keep it beside the handle.
+    pub fn tcp_ready_key(&self, handle: &TcpHandle) -> TcpReadyKey {
+        let raw = self.tcp_raw(handle);
+        self.sockets.get(raw);
+        TcpReadyKey(raw)
+    }
+
     /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
     /// that can make the socket readable, writable or change its state fires it: a received
     /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), a receive wake
@@ -842,30 +860,37 @@ impl Stack {
     /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
     /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
     /// processes a dropped handle; `disarm_tcp` stops a token at once.
-    pub fn arm_tcp(&mut self, handle: &TcpHandle, side: ReadySide, token: u32) {
-        let raw = self.tcp_raw(handle);
-        self.sockets.arm(raw, side, token);
+    ///
+    /// Only debug builds check that `key` still names a live socket; a key used after its
+    /// socket was removed, or on another Stack, misdirects the token to whatever socket holds
+    /// that slot, where it fires spuriously, and panics if the slot does not exist.
+    pub fn arm_tcp(&mut self, key: TcpReadyKey, side: ReadySide, token: u32) {
+        self.sockets.arm(key.0, side, token);
     }
 
     /// Disarm `side` of the socket. `true` when a token was armed; `false` when none was, or
-    /// it fired and `pop_fired` has not returned it yet.
-    pub fn disarm_tcp(&mut self, handle: &TcpHandle, side: ReadySide) -> bool {
-        let raw = self.tcp_raw(handle);
-        self.sockets.disarm(raw, side)
+    /// it fired and `pop_fired` has not returned it yet. Key checks as in [`Self::arm_tcp`].
+    pub fn disarm_tcp(&mut self, key: TcpReadyKey, side: ReadySide) -> bool {
+        self.sockets.disarm(key.0, side)
+    }
+
+    /// [`Self::tcp_ready_key`] for a UDP socket.
+    pub fn udp_ready_key(&self, handle: &UdpHandle) -> UdpReadyKey {
+        let raw = self.udp_raw(handle);
+        self.udp.get(raw);
+        UdpReadyKey(raw)
     }
 
     /// Arm `token` for the UDP socket's receive queue, replacing a token armed there; the next
     /// queued datagram fires it as in [`Self::arm_tcp`]. `remove_udp`, or the Stack processing
-    /// a dropped handle, disarms it.
-    pub fn arm_udp(&mut self, handle: &UdpHandle, token: u32) {
-        let raw = self.udp_raw(handle);
-        self.udp.arm_rx(raw, token);
+    /// a dropped handle, disarms it. Key checks as in [`Self::arm_tcp`].
+    pub fn arm_udp(&mut self, key: UdpReadyKey, token: u32) {
+        self.udp.arm_rx(key.0, token);
     }
 
     /// [`Self::disarm_tcp`] for the UDP socket's receive queue.
-    pub fn disarm_udp(&mut self, handle: &UdpHandle) -> bool {
-        let raw = self.udp_raw(handle);
-        self.udp.disarm_rx(raw)
+    pub fn disarm_udp(&mut self, key: UdpReadyKey) -> bool {
+        self.udp.disarm_rx(key.0)
     }
 
     /// One fired token, in no particular order; `None` once every fired token was returned.

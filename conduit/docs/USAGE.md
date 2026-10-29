@@ -508,8 +508,12 @@ replies.
 ### Learn which sockets changed
 
 An application waiting on many sockets arms a `u32` token per socket half instead of checking
-every socket after each turn: `arm_tcp(&handle, ReadySide::Rx | ReadySide::Tx, token)` and
-`arm_udp(&handle, token)` (receive queue only). A change that can alter the socket's readiness
+every socket after each turn. `tcp_ready_key(&handle)` and `udp_ready_key(&handle)` check the
+handle once, as `tcp` and `udp` do, and return a key to keep beside it. Then
+`arm_tcp(key, ReadySide::Rx | ReadySide::Tx, token)` and `arm_udp(key, token)` (receive queue
+only) arm a token without repeating that check; only debug builds check that the key's socket
+is still live, and a key used after its socket is removed misdirects tokens to whatever socket
+takes the slot. A change that can alter the socket's readiness
 fires every token armed on it: for TCP a received segment, `tcp_mut` (also through
 `tcp_send_frame`, `connect`, `listen`), a receive wake from a dropped frame, or a state change in
 egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and

@@ -35,7 +35,7 @@ pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address}
 pub use dpdk_smoltcp::{
     AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
 };
-use dpdk_smoltcp::{ReadySide, TcpHandle, UdpHandle};
+use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
 use switch::StoredWaker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +46,10 @@ pub struct NetConfig {
 
 type Shared = Rc<RefCell<Inner>>;
 
+/// A handle and the readiness key taken from it at open, which arming uses.
 enum Socket {
-    Tcp(TcpHandle),
-    Udp(UdpHandle),
+    Tcp(TcpHandle, TcpReadyKey),
+    Udp(UdpHandle, UdpReadyKey),
 }
 
 /// Index of an entry's receive-side (recv, connect, accept) and send-side
@@ -129,7 +130,7 @@ impl Inner {
     /// The stack and the TCP handle of entry `index`.
     fn tcp(&mut self, index: u32) -> (&mut Stack, &TcpHandle) {
         match &self.entries[index as usize].socket {
-            Some(Socket::Tcp(handle)) => (&mut self.stack, handle),
+            Some(Socket::Tcp(handle, _)) => (&mut self.stack, handle),
             _ => unreachable!("entry holds no TCP handle"),
         }
     }
@@ -137,7 +138,7 @@ impl Inner {
     /// The stack and the UDP handle of entry `index`.
     fn udp(&mut self, index: u32) -> (&mut Stack, &UdpHandle) {
         match &self.entries[index as usize].socket {
-            Some(Socket::Udp(handle)) => (&mut self.stack, handle),
+            Some(Socket::Udp(handle, _)) => (&mut self.stack, handle),
             _ => unreachable!("entry holds no UDP handle"),
         }
     }
@@ -168,10 +169,10 @@ fn token(index: u32, side: usize) -> u32 {
 
 fn arm(stack: &mut Stack, socket: &Socket, side: usize, token: u32) {
     match socket {
-        Socket::Tcp(handle) => stack.arm_tcp(handle, ready_side(side), token),
-        Socket::Udp(handle) => {
+        Socket::Tcp(_, key) => stack.arm_tcp(*key, ready_side(side), token),
+        Socket::Udp(_, key) => {
             debug_assert_eq!(side, RX, "nothing parks on UDP send");
-            stack.arm_udp(handle, token);
+            stack.arm_udp(*key, token);
         }
     }
 }
@@ -179,10 +180,10 @@ fn arm(stack: &mut Stack, socket: &Socket, side: usize, token: u32) {
 /// Whether the side's token was still armed (it had not fired).
 fn disarm(stack: &mut Stack, socket: &Socket, side: usize) -> bool {
     match socket {
-        Socket::Tcp(handle) => stack.disarm_tcp(handle, ready_side(side)),
-        Socket::Udp(handle) => {
+        Socket::Tcp(_, key) => stack.disarm_tcp(*key, ready_side(side)),
+        Socket::Udp(_, key) => {
             debug_assert_eq!(side, RX, "nothing parks on UDP send");
-            stack.disarm_udp(handle)
+            stack.disarm_udp(*key)
         }
     }
 }
@@ -233,12 +234,12 @@ fn wake_frame_waiters(stack: &mut Stack, waiters: &mut Vec<StoredWaker>) {
 #[inline(always)]
 fn ready(stack: &Stack, socket: &Socket, interest: Interest) -> bool {
     match (socket, interest) {
-        (Socket::Tcp(handle), Interest::Connect) => !connecting(stack.tcp(handle).state()),
-        (Socket::Tcp(handle), Interest::Accept) => !accepting(stack.tcp(handle).state()),
-        (Socket::Tcp(handle), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
-        (Socket::Tcp(handle), Interest::TcpRoom(len)) => tcp_room_ready(stack.tcp(handle), len as usize),
-        (Socket::Tcp(handle), Interest::TcpDelivered) => delivered(stack.tcp(handle).state()),
-        (Socket::Udp(handle), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
+        (Socket::Tcp(handle, _), Interest::Connect) => !connecting(stack.tcp(handle).state()),
+        (Socket::Tcp(handle, _), Interest::Accept) => !accepting(stack.tcp(handle).state()),
+        (Socket::Tcp(handle, _), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
+        (Socket::Tcp(handle, _), Interest::TcpRoom(len)) => tcp_room_ready(stack.tcp(handle), len as usize),
+        (Socket::Tcp(handle, _), Interest::TcpDelivered) => delivered(stack.tcp(handle).state()),
+        (Socket::Udp(handle, _), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
         _ => unreachable!("interest does not match socket kind"),
     }
 }
@@ -383,7 +384,8 @@ impl NetHandle {
             inner.stack.remove_tcp(handle);
             return Err(error);
         }
-        let index = inner.insert(Socket::Tcp(handle));
+        let key = inner.stack.tcp_ready_key(&handle);
+        let index = inner.insert(Socket::Tcp(handle, key));
         Ok(TcpStream {
             rx: TcpRx(Half { shared: self.shared.clone(), index, side: RX }),
             tx: TcpTx(Half { shared: self.shared.clone(), index, side: TX }),
@@ -393,7 +395,8 @@ impl NetHandle {
     pub fn udp_bind(&self, config: UdpConfig) -> Result<UdpSocket, AddUdpError> {
         let mut inner = self.shared.borrow_mut();
         let handle = inner.stack.add_udp(config)?;
-        let index = inner.insert(Socket::Udp(handle));
+        let key = inner.stack.udp_ready_key(&handle);
+        let index = inner.insert(Socket::Udp(handle, key));
         Ok(UdpSocket {
             rx: UdpRx(Half { shared: self.shared.clone(), index, side: RX }),
             tx: UdpTx(Half { shared: self.shared.clone(), index, side: TX }),

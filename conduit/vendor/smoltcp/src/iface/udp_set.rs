@@ -236,16 +236,23 @@ impl UdpSet {
 
     /// Arm `token` for the socket's receive queue, replacing a token armed there. Removing
     /// the socket disarms it.
+    ///
+    /// Arming runs on every park: the caller checks `handle` once (as `get` does) and keeps it
+    /// while the socket lives; only debug builds check it here. A stale handle misdirects the
+    /// token to whatever socket the slot holds or holds next, where it fires spuriously.
+    /// Panics if the handle's slot index is out of range.
     pub fn arm_rx(&mut self, handle: UdpHandle, token: u32) {
-        self.get(handle);
-        self.slots[handle.slot].rx_token = Some(token);
+        let slot = &mut self.slots[handle.slot];
+        debug_assert!(slot.generation == handle.generation && slot.socket.is_some(), "stale UDP handle");
+        slot.rx_token = Some(token);
     }
 
     /// Disarm the socket's receive queue. Returns whether a token was armed; `false` when none
-    /// was, or it fired and waits in the fired list until popped.
+    /// was, or it fired and waits in the fired list until popped. Handle checks as in `arm_rx`.
     pub fn disarm_rx(&mut self, handle: UdpHandle) -> bool {
-        self.get(handle);
-        self.slots[handle.slot].rx_token.take().is_some()
+        let slot = &mut self.slots[handle.slot];
+        debug_assert!(slot.generation == handle.generation && slot.socket.is_some(), "stale UDP handle");
+        slot.rx_token.take().is_some()
     }
 
     /// One fired token, in no particular order; `None` once the list is empty.

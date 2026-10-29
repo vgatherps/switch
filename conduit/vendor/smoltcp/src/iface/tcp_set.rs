@@ -430,25 +430,35 @@ impl<'a> TcpSet<'a> {
     /// Arm `token` for `side` of the socket, replacing a token armed there. Removing the
     /// socket or orphaning it (its handle dropped) disarms both halves.
     ///
+    /// Arming runs on every park: the caller checks `handle` once (as `get` does) and keeps it
+    /// while the socket lives; only debug builds check it here. A stale handle misdirects the
+    /// token to whatever socket the slot holds or holds next, where it fires spuriously.
+    ///
     /// # Panics
-    /// As `get`.
+    /// If the handle's slot index is out of range; in debug builds, as `get`.
     pub fn arm(&mut self, handle: SocketHandle, side: ReadySide, token: u32) {
-        self.item(handle);
+        self.debug_assert_live(handle);
         self.sockets[handle.index].tokens[side as usize] = Some(token);
         self.flow_slots[handle.index].armed = true;
     }
 
     /// Disarm `side` of the socket. Returns whether a token was armed there; `false` when none
-    /// was, or it fired and waits in the fired list until popped.
-    ///
-    /// # Panics
-    /// As `get`.
+    /// was, or it fired and waits in the fired list until popped. Handle checks as in `arm`.
     pub fn disarm(&mut self, handle: SocketHandle, side: ReadySide) -> bool {
-        self.item(handle);
+        self.debug_assert_live(handle);
         let tokens = &mut self.sockets[handle.index].tokens;
         let armed = tokens[side as usize].take().is_some();
         self.flow_slots[handle.index].armed = tokens.iter().any(Option::is_some);
         armed
+    }
+
+    fn debug_assert_live(&self, handle: SocketHandle) {
+        debug_assert!(
+            self.sockets.get(handle.index).is_some_and(|slot| {
+                slot.inner.is_some() && slot.generation == handle.generation
+            }),
+            "handle does not refer to a valid socket"
+        );
     }
 
     /// One fired token, in no particular order; `None` once the list is empty.

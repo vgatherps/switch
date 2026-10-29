@@ -92,6 +92,6 @@ pub use smoltcp::iface::{
     UdpSocketStats,
 };
 pub use stack::{
-    os_random_seed, AddTcpError, AddUdpError, Sent, Stack, StackConfig, StackError, Turn,
-    UdpSendFrameError, DEFAULT_NEIGHBOR_CAPACITY,
+    os_random_seed, AddTcpError, AddUdpError, Sent, Stack, StackConfig, StackError, TcpReadyKey,
+    Turn, UdpReadyKey, UdpSendFrameError, DEFAULT_NEIGHBOR_CAPACITY,
 };

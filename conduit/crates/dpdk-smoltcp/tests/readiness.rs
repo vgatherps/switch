@@ -35,12 +35,13 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
     with_eal(|eal| {
         let mut pair = pair::new_pair(eal, ["rdya", "rdyb"]);
         let (h, _) = establish_sized(&mut pair, Side::A, SMALL);
+        let key = pair.a.tcp_ready_key(&h[0]);
         settle(&mut pair);
         assert_eq!(popped(&mut pair.a), [], "nothing was armed");
 
         // Idle turns fire nothing.
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 1);
-        pair.a.arm_tcp(&h[0], ReadySide::Tx, 2);
+        pair.a.arm_tcp(key, ReadySide::Rx, 1);
+        pair.a.arm_tcp(key, ReadySide::Tx, 2);
         for _ in 0..3 {
             let round = pair.round_at(pair.now() + Duration::from_millis(1), |_, _| {});
             assert!(!round.moved());
@@ -55,12 +56,12 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         assert_eq!(popped(&mut pair.a), [1, 2]);
 
         // tcp_mut and tcp_send_frame fire at once, between turns.
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 3);
+        pair.a.arm_tcp(key, ReadySide::Rx, 3);
         let frame = pair.a.tcp_mut(&h[0]).recv().unwrap().unwrap();
         assert_eq!(frame.payload(), b"data");
         assert_eq!(popped(&mut pair.a), [3]);
         drop(frame);
-        pair.a.arm_tcp(&h[0], ReadySide::Tx, 4);
+        pair.a.arm_tcp(key, ReadySide::Tx, 4);
         let mut out = pair.a.tx_frame().unwrap();
         out.room_mut()[..1000].fill(7);
         out.set_len(1000);
@@ -68,7 +69,7 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         assert_eq!(popped(&mut pair.a), [4]);
 
         // Sending the data fires nothing; the peer's ACK that frees the room does.
-        pair.a.arm_tcp(&h[0], ReadySide::Tx, 5);
+        pair.a.arm_tcp(key, ReadySide::Tx, 5);
         pair.round(|_, _| {});
         assert_eq!(pair.a.tcp(&h[0]).send_queue(), 1000);
         assert_eq!(popped(&mut pair.a), []);
@@ -85,8 +86,8 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         assert_eq!(pair.a.tcp(&h[0]).state(), State::TimeWait);
         assert_eq!(pair.a.turn(pair.now(), BUDGET).unwrap().rx_received, 0);
         popped(&mut pair.a);
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 6);
-        pair.a.arm_tcp(&h[0], ReadySide::Tx, 7);
+        pair.a.arm_tcp(key, ReadySide::Rx, 6);
+        pair.a.arm_tcp(key, ReadySide::Tx, 7);
         let mut now = pair.now();
         for _ in 0..MAX_ROUNDS {
             if pair.a.tcp(&h[0]).state() == State::Closed {
@@ -100,17 +101,17 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         assert_eq!(popped(&mut pair.a), [6, 7]);
 
         // disarm reports whether the token was still armed.
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 8);
-        assert!(pair.a.disarm_tcp(&h[0], ReadySide::Rx));
-        assert!(!pair.a.disarm_tcp(&h[0], ReadySide::Rx));
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 9);
+        pair.a.arm_tcp(key, ReadySide::Rx, 8);
+        assert!(pair.a.disarm_tcp(key, ReadySide::Rx));
+        assert!(!pair.a.disarm_tcp(key, ReadySide::Rx));
+        pair.a.arm_tcp(key, ReadySide::Rx, 9);
         pair.a.tcp_mut(&h[0]);
-        assert!(!pair.a.disarm_tcp(&h[0], ReadySide::Rx), "fired, not yet popped");
+        assert!(!pair.a.disarm_tcp(key, ReadySide::Rx), "fired, not yet popped");
         assert_eq!(popped(&mut pair.a), [9]);
 
         // A dropped handle's tokens never fire: the Stack disarms them when it
         // orphans the socket, which changes it.
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 10);
+        pair.a.arm_tcp(key, ReadySide::Rx, 10);
         let [ah, bh] = h;
         drop(ah);
         pair.a.turn(now, BUDGET).unwrap();
@@ -145,7 +146,8 @@ fn tcp_token_fires_when_released_frames_reopen_the_window() {
         assert_eq!(pair.a.tcp(&h[0]).recv_room(), 0, "the window did not shut");
         pair.a.turn(pair.now(), BUDGET).unwrap();
         popped(&mut pair.a);
-        pair.a.arm_tcp(&h[0], ReadySide::Rx, 1);
+        let key = pair.a.tcp_ready_key(&h[0]);
+        pair.a.arm_tcp(key, ReadySide::Rx, 1);
         held.clear();
         assert_eq!(popped(&mut pair.a), [], "a dropped frame fires nothing by itself");
         let turn = pair.a.turn(pair.now(), BUDGET).unwrap();
@@ -179,6 +181,7 @@ fn udp_token_fires_on_a_queued_datagram_only() {
     with_eal(|eal| {
         let mut pair = udp_pair(eal);
         let ua = pair.a.add_udp(udp_config(PORT)).unwrap();
+        let key = pair.a.udp_ready_key(&ua);
         let ub = pair.b.add_udp(udp_config(PORT)).unwrap();
         let to_a = Some(IpEndpoint::new(Side::A.ip().into(), PORT));
         assert_eq!(pair.b.udp_send(&ub, to_a, b"x"), Err(UdpSendError::NeighborPending));
@@ -186,7 +189,7 @@ fn udp_token_fires_on_a_queued_datagram_only() {
             pair.round(|_, _| {});
         }
 
-        pair.a.arm_udp(&ua, 1);
+        pair.a.arm_udp(key, 1);
         for _ in 0..3 {
             pair.round_at(pair.now() + Duration::from_millis(1), |_, _| {});
         }
@@ -199,18 +202,18 @@ fn udp_token_fires_on_a_queued_datagram_only() {
         drop(pair.a.udp_mut(&ua).recv());
         assert_eq!(popped(&mut pair.a), [], "receiving and releasing fire nothing");
 
-        pair.a.arm_udp(&ua, 2);
-        assert!(pair.a.disarm_udp(&ua));
-        pair.a.arm_udp(&ua, 3);
+        pair.a.arm_udp(key, 2);
+        assert!(pair.a.disarm_udp(key));
+        pair.a.arm_udp(key, 3);
         pair.b.udp_send(&ub, to_a, b"two").unwrap();
         pair.round(|_, _| {});
         pair.round(|_, _| {});
-        assert!(!pair.a.disarm_udp(&ua), "fired, not yet popped");
+        assert!(!pair.a.disarm_udp(key), "fired, not yet popped");
         assert_eq!(popped(&mut pair.a), [3]);
         drop(pair.a.udp_mut(&ua).recv());
 
         // A dropped handle's token never fires, also for a socket that reuses its slot.
-        pair.a.arm_udp(&ua, 4);
+        pair.a.arm_udp(key, 4);
         drop(ua);
         pair.b.udp_send(&ub, to_a, b"gone").unwrap();
         pair.round(|_, _| {});
