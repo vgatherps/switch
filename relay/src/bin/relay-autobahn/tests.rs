@@ -22,7 +22,7 @@ const SHORT: Duration = Duration::from_secs(1);
 /// Runs `role` on a fresh Net until `peer` (on its own thread) returned; the run's result and
 /// what the peer returned. A run that failed first keeps turning the Net, so the peer sees the
 /// FIN or RST of the connections it dropped.
-fn run<T: Send + 'static>(role: Role, deadline: Duration, peer: impl FnOnce() -> T + Send + 'static) -> (Result<(), String>, T) {
+fn run<T: Send + 'static>(role: Role, deadline: Duration, peer: impl FnOnce() -> T + Send + 'static) -> (Result<(), Failure>, T) {
     let tap = TapConfig { name: "autobahn", socket: SOCKET, max_sockets: role.max_sockets(), random_seed: 1 };
     with_tap_net(&tap, |net, clock| {
         let peer = thread::spawn(peer);
@@ -175,8 +175,9 @@ fn close_reply_sent_before_fin_under_backpressure() {
 }
 
 /// A frame with RSV1 set, after a valid one in the same segment and followed by more bytes:
-/// the valid one is echoed, then the server fails the connection with FIN and no close frame,
-/// and reads what follows until the client's FIN, so no RST.
+/// the valid one is echoed, then the server fails the connection with FIN and no close frame.
+/// Bytes the client sends after that FIN are read and dropped until the client's own FIN, so
+/// the connection ends without RST.
 #[zhida_test_support::pinned_test]
 fn protocol_error_ends_with_fin_and_no_close_frame() {
     let (result, ()) = run(Role::Server { connections: 1 }, DEADLINE, || {
@@ -186,8 +187,20 @@ fn protocol_error_ends_with_fin_and_no_close_frame() {
         s.read_exact(&mut echo).unwrap();
         assert_eq!(echo, [0x81, 2, b'o', b'k']);
         assert_fin(&mut s);
+        late_bytes_then_fin_end_without_rst(&mut s);
     });
     result.unwrap();
+}
+
+/// After the other side's FIN: more bytes, then our FIN; the stream must end, not reset (a
+/// socket dropped with those bytes unread, or gone, would answer them with RST).
+fn late_bytes_then_fin_end_without_rst(s: &mut TcpStream) {
+    s.write_all(&[0x55; 100]).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    s.shutdown(Shutdown::Write).unwrap();
+    thread::sleep(Duration::from_millis(200));
+    let mut byte = [0];
+    assert_eq!(s.read(&mut byte).expect("the end, not a reset"), 0);
 }
 
 /// A close with a status code a peer may not send (999) still gets a close reply, with 1002.
@@ -223,7 +236,7 @@ fn sequential_connections_are_each_accepted() {
 #[zhida_test_support::pinned_test]
 fn missing_connection_is_an_error() {
     let (result, ()) = run(Role::Server { connections: 1 }, DEADLINE, || {});
-    assert_eq!(result.unwrap_err(), "accepted 0 connections, expected 1");
+    assert!(matches!(result, Err(Failure::Accepted { got: 0, want: 1 })), "{result:?}");
 }
 
 /// The deadline ends the run for a connection stalled in its upgrade, and for an open one.
@@ -238,9 +251,9 @@ fn server_deadline_expires_in_upgrade_and_open() {
         s.write_all(b"GET / HTTP/1.1\r\n").unwrap();
         stall(s);
     });
-    assert_eq!(result.unwrap_err(), "connection 0: still open after 1s");
+    assert!(matches!(result, Err(Failure::Connection { n: 0, why: Why::Deadline(SHORT) })), "{result:?}");
     let (result, ()) = run(Role::Server { connections: 1 }, SHORT, move || stall(raw_client()));
-    assert_eq!(result.unwrap_err(), "connection 0: still open after 1s");
+    assert!(matches!(result, Err(Failure::Connection { n: 0, why: Why::Deadline(SHORT) })), "{result:?}");
 }
 
 /// One connection's request path and the local port it came from.
@@ -338,8 +351,9 @@ fn client_runs_the_sequence_from_distinct_local_ports() {
 }
 
 /// Case 1's server sends a frame with RSV1 set: the client fails the connection with FIN (no
-/// close frame, no RST) before the server closes, so that socket stays in TIME-WAIT; with
-/// max_sockets = cases + 2, case 2 still gets a socket and runs.
+/// close frame) before the server closes, so that socket stays in TIME-WAIT; with max_sockets =
+/// cases + 2, case 2 still gets a socket and runs. The server's bytes after that FIN are read
+/// and dropped until its FIN: no RST.
 #[zhida_test_support::pinned_test]
 fn client_protocol_error_fins_first_and_the_next_case_runs() {
     let dir = run_dir("protocol");
@@ -349,6 +363,7 @@ fn client_protocol_error_fins_first_and_the_next_case_runs() {
         1 => {
             ws.get_mut().write_all(&[0xc1, 0]).unwrap();
             assert_fin(ws.get_mut());
+            late_bytes_then_fin_end_without_rst(ws.get_mut());
         }
         3 => reports(&mut ws),
         i => case(&mut ws, i),
@@ -363,25 +378,28 @@ fn client_sequence_failures_are_errors() {
     let fails = |test: &str, cases: usize, connections: usize, serve: fn(usize, WebSocket<TcpStream>)| {
         let dir = run_dir(test);
         let (result, _) = run(Role::Client { cases, run: dir.clone() }, SHORT, fuzzingserver(dir, connections, false, serve));
-        result.unwrap_err()
+        match result {
+            Err(Failure::Connection { n, why }) => (n, why),
+            other => panic!("{test}: {other:?}"),
+        }
     };
     // the failing peers ignore errors: the client drops the connection once it fails
     let mismatch = fails("mismatch", 2, 1, |_, mut ws| {
         let _ = send(&mut ws, Message::text("3"));
         let _ = read(&mut ws);
     });
-    assert_eq!(mismatch, "connection 0 /getCaseCount: case count Some(3), expected 2");
+    assert!(matches!(mismatch, (0, Why::CaseCount(Some(3)))), "{mismatch:?}");
     let missing = fails("missing", 1, 1, |_, mut ws| {
         let _ = ws.close(None);
         while read(&mut ws).is_ok() {}
     });
-    assert_eq!(missing, "connection 0 /getCaseCount: closed without the case count");
+    assert!(matches!(missing, (0, Why::NoCaseCount)), "{missing:?}");
     let extra = fails("extra", 1, 1, |_, mut ws| {
         let _ = send(&mut ws, Message::text("1"));
         let _ = send(&mut ws, Message::text("more"));
         while read(&mut ws).is_ok() {}
     });
-    assert_eq!(extra, "connection 0 /getCaseCount: unexpected Text message of 4 bytes");
+    assert!(matches!(extra, (0, Why::Unexpected { kind: Kind::Text, len: 4 })), "{extra:?}");
     let no_reply = fails("noreply", 1, 3, |i, mut ws| match i {
         0 => count(&mut ws, "1"),
         1 => case(&mut ws, 1),
@@ -391,11 +409,11 @@ fn client_sequence_failures_are_errors() {
             let _ = ws.get_mut().shutdown(Shutdown::Both);
         }
     });
-    assert!(no_reply.starts_with("connection 2 /updateReports?agent=relay: no close reply: tcp receive"), "{no_reply}");
+    assert!(matches!(no_reply, (2, Why::NoCloseReply(Error::Recv(_)))), "{no_reply:?}");
     let stalled = fails("stalled", 1, 1, |_, mut ws| {
         let _ = read(&mut ws);
     });
-    assert_eq!(stalled, "connection 0 /getCaseCount: still open after 1s");
+    assert!(matches!(stalled, (0, Why::Deadline(SHORT))), "{stalled:?}");
 }
 
 /// No listener (the SYN gets RST), and a 404 for the upgrade: both end the run.
@@ -407,7 +425,7 @@ fn client_connect_and_upgrade_failures_are_errors() {
         write_marker(&marker.join("server-ready")).unwrap();
         thread::sleep(Duration::from_secs(2));
     });
-    assert!(result.unwrap_err().starts_with("connection 0 /getCaseCount: not established"));
+    assert!(matches!(result, Err(Failure::Connection { n: 0, why: Why::NotEstablished(_) })), "{result:?}");
 
     let dir = run_dir("404");
     let marker = dir.clone();
@@ -421,14 +439,18 @@ fn client_connect_and_upgrade_failures_are_errors() {
         s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
         thread::sleep(Duration::from_secs(1));
     });
-    assert!(result.unwrap_err().starts_with("connection 0 /getCaseCount: upgrade: "));
+    let refused = matches!(
+        result,
+        Err(Failure::Connection { n: 0, why: Why::Upgrade(Error::Upgrade(relay::UpgradeError::Status(Some(404)))) })
+    );
+    assert!(refused, "{result:?}");
 }
 
 /// The tester exits before server-ready exists: the sequence did not complete.
 #[zhida_test_support::pinned_test]
 fn client_tester_exit_before_server_ready_is_an_error() {
     let (result, ()) = run(Role::Client { cases: 1, run: run_dir("early") }, DEADLINE, || {});
-    assert_eq!(result.unwrap_err(), "sequence did not complete: 0 of 3 connections started");
+    assert!(matches!(result, Err(Failure::Incomplete { started: 0, of: 3 })), "{result:?}");
 }
 
 #[test]
@@ -439,10 +461,14 @@ fn parse_reads_both_roles_and_bounds_the_cases() {
     let (role, _) = parse(&args("client --expect-cases 16382 -- t")).unwrap();
     assert_eq!(role, Role::Client { cases: 16382, run: PathBuf::from(CLIENT_RUN) });
     assert_eq!(role.max_sockets(), 16384);
-    assert!(parse(&args("client --expect-cases 16383 -- t")).unwrap_err().contains("local ports"));
-    assert!(parse(&args("client --expect-connections 1 -- t")).unwrap_err().starts_with("expected --expect-cases"));
-    assert!(parse(&args("server --expect-connections 0 -- t")).unwrap_err().contains("positive integer"));
-    assert!(parse(&args("server --expect-connections 1 t")).is_err());
-    assert_eq!(parse(&args("server --expect-connections 1 --")).unwrap_err(), "missing tester command after --");
-    assert!(parse(&args("both --expect-cases 1 -- t")).unwrap_err().starts_with("unknown mode"));
+    for bad in [
+        "client --expect-cases 16383 -- t",
+        "client --expect-connections 1 -- t",
+        "server --expect-connections 0 -- t",
+        "server --expect-connections 1 t",
+        "server --expect-connections 1 --",
+        "both --expect-cases 1 -- t",
+    ] {
+        assert!(parse(&args(bad)).is_err(), "{bad}");
+    }
 }

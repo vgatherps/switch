@@ -4,12 +4,10 @@
 
 use std::cell::RefCell;
 use std::fmt;
-use std::future::{poll_fn, Future};
+use std::future::Future;
 use std::net::SocketAddrV4;
-use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::{Duration, Instant as WallInstant};
 
 use relay::switchnet::{Error as WsError, Wss};
@@ -17,14 +15,13 @@ use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
 use switch::{oneshot, Runtime, RuntimeError, Spawner};
 use switchnet::{
-    tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetHandle, OpenError, StackError,
+    first, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetHandle, OpenError, RoundError,
+    StackError,
 };
 
 pub const INGRESS_BUDGET: usize = 32;
 /// RX and TX buffer bytes of the feed's socket.
 pub const SOCKET_BUFFER: usize = 256 * 1024;
-/// Longest idle sleep in [`round`].
-const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 /// Wall clock since `start`: Stack time in microseconds (panics past i64 microseconds) and
 /// Runtime ticks in milliseconds.
@@ -194,7 +191,7 @@ pub fn run<T: 'static, F: Future<Output = T> + 'static>(
     let done = Rc::new(RefCell::new(None));
     let slot = done.clone();
     let future = client(net.handle(), rt.spawner(), stop_rx);
-    let task = boxed(Box::pin(
+    let task = switchnet::boxed(Box::pin(
         async move { *slot.borrow_mut() = Some(future.await) },
     ));
     rt.spawner()
@@ -205,8 +202,11 @@ pub fn run<T: 'static, F: Future<Output = T> + 'static>(
         if let Some(out) = done.borrow_mut().take() {
             break Ok(out);
         }
-        if let Err(error) = round(net, &mut rt, clock) {
-            break Err(error);
+        if let Err(error) = switchnet::round(net, &mut rt, clock.now(), clock.ms()) {
+            break Err(match error {
+                RoundError::Stack(error) => FeedError::Stack(error),
+                RoundError::Runtime(error) => FeedError::Runtime(error),
+            });
         }
         if stop_tx.is_some() && should_stop() {
             let _ = stop_tx.take().expect("checked above").send(());
@@ -216,39 +216,6 @@ pub fn run<T: 'static, F: Future<Output = T> + 'static>(
     result
 }
 
-#[switch::task]
-fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-    future
-}
-
-/// One Net turn and one Runtime poll. When neither moved anything, sleeps until the Stack's
-/// next timer, at most 1 ms.
-fn round(net: &mut Net, rt: &mut Runtime, clock: &Clock) -> Result<(), FeedError> {
-    let now = clock.now();
-    let turn = net.turn(now).map_err(FeedError::Stack)?;
-    let polled = rt.poll(clock.ms()).map_err(FeedError::Runtime)?;
-    if !turn.moved() && turn.tx_pending == 0 && turn.rx_staged == 0 && polled.tasks_polled == 0 {
-        let sleep = match net.poll_at() {
-            None => MAX_IDLE_SLEEP,
-            Some(at) if at <= now => return Ok(()),
-            Some(at) => Duration::from_micros((at - now).total_micros()).min(MAX_IDLE_SLEEP),
-        };
-        std::thread::sleep(sleep);
-    }
-    Ok(())
-}
-
-/// `a`'s output, or `None` if `b` finishes first; `a` is polled first. Callers race a step
-/// (`connect`) against the stop, as `Feed::next` does; dropping `a` drops what it holds.
-pub async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
-    let (mut a, mut b) = (pin!(a), pin!(b));
-    poll_fn(|cx| match a.as_mut().poll(cx) {
-        Poll::Ready(out) => Poll::Ready(Some(out)),
-        Poll::Pending => b.as_mut().poll(cx).map(|_| None),
-    })
-    .await
-}
-
 /// `work`, or `Timeout { step, limit }` once `limit` passed; dropping `work` drops what it holds.
 async fn within<T>(
     spawner: &Spawner,
@@ -256,12 +223,7 @@ async fn within<T>(
     limit: Duration,
     work: impl Future<Output = Result<T, FeedError>>,
 ) -> Result<T, FeedError> {
-    let ticks = u64::try_from(limit.as_millis()).expect("limit fits u64 milliseconds");
-    let sleep = spawner
-        .sleep(ticks)
-        .expect("the Runtime polling this task is open");
-    let expired = async { sleep.await.expect("a sleep in the task's own open Runtime") };
-    first(work, expired)
+    switchnet::within(spawner, limit, work)
         .await
         .unwrap_or(Err(FeedError::Timeout { step, limit }))
 }

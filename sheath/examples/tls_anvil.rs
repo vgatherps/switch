@@ -33,7 +33,8 @@ use rustls::version::TLS13;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use sheath::switchnet::{send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
-use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, boxed, with_tap_net};
+use switchnet::boxed;
+use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};
 
 /// TLS-Anvil's address: the kernel side of the tap netdev.

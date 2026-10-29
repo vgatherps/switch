@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    client_config, connect, first, run, socket, webpki_client_config, BookTicker, Clock, FeedError,
+    client_config, connect, run, socket, webpki_client_config, BookTicker, Clock, FeedError,
     Target, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
@@ -31,7 +31,7 @@ use relay::switchnet::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use switch::Spawner;
-use switchnet::{Net, NetConfig, NetHandle, OpenError};
+use switchnet::{first, Net, NetConfig, NetHandle, OpenError};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -713,7 +713,7 @@ fn server_close_reports_its_status_and_reason() {
 /// before `CONNECT_LIMIT`, and drops its socket: the server reads the end of the stream (the
 /// run stops once the server returned).
 #[zhida_test_support::pinned_test]
-fn stop_during_connect_ends_it_and_frees_the_slot() {
+fn stop_during_connect_ends_it_and_drops_the_socket() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Silent));

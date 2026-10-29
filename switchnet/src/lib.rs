@@ -16,8 +16,11 @@
 //! conduit's frames they stay valid after their socket, the Net and the Stack
 //! are gone. Each held frame occupies its socket's receive budget until it drops.
 
+mod drive;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+pub use drive::{RoundError, boxed, first, round, within};
 
 use std::cell::RefCell;
 use std::pin::Pin;

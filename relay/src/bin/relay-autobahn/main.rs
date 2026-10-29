@@ -5,19 +5,21 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
-use std::future::{Future, poll_fn};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
 use std::process;
 use std::rc::Rc;
-use std::task::Poll;
 use std::time::Duration;
 
+use relay::Kind;
 use relay::switchnet::{Error, Ws, accept_ws, connect_ws};
 use switch::{Runtime, Spawner};
-use switchnet::testkit::boxed;
-use switchnet::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp};
+use switchnet::{
+    Closed, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, OpenError, RoundError, boxed, round,
+    tcp, within,
+};
 use tap_echo::driver::{self, ECHO_PORT, EXIT_ERROR, IFACE, TESTER_IP, ZHIDA_IP};
 
 #[cfg(test)]
@@ -29,7 +31,6 @@ const AGENT: &str = "relay";
 const BUFFER: usize = 128 * 1024;
 const SOCKET: tcp::Config = tcp::Config { rx_capacity: BUFFER, tx_capacity: BUFFER, mss_cap: None };
 const INGRESS_BUDGET: usize = 32;
-const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// Autobahn fuzzingserver's port on the tester address.
 const FUZZINGSERVER_PORT: u16 = 9001;
 /// Local port of the client's connection 0; connection i uses `FIRST_LOCAL_PORT + i`.
@@ -137,7 +138,7 @@ fn main() {
     };
     let code = driver::run(NAME, &tester, role.max_sockets(), BUFFER, None, |stack, start, stop| {
         let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-        let result = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE);
+        let result = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE).map_err(|e| e.to_string());
         let stack = net.into_stack().ok().expect("drive dropped every handle and socket");
         (stack, result)
     });
@@ -151,6 +152,78 @@ struct Tally {
     endings: BTreeMap<&'static str, usize>,
 }
 
+/// Why a run failed.
+#[derive(Debug)]
+enum Failure {
+    Spawn,
+    Round(RoundError),
+    /// The server role's next listener.
+    Listen(OpenError),
+    /// The tester's server-ready marker did not appear within `SERVER_READY_LIMIT`.
+    NoServerReady,
+    /// Writing the client-done marker.
+    Marker(std::io::Error),
+    /// Connection `n` (0-based) failed.
+    Connection { n: usize, why: Why },
+    /// The server role accepted `got` connections, not `want`.
+    Accepted { got: usize, want: usize },
+    /// The client role's sequence did not complete: `started` of `of` connections.
+    Incomplete { started: usize, of: usize },
+}
+
+/// Why one connection failed.
+#[derive(Debug)]
+enum Why {
+    Open(OpenError),
+    NotEstablished(Closed),
+    Upgrade(Error),
+    /// Still open after this per-connection deadline.
+    Deadline(Duration),
+    /// getCaseCount's message, parsed, was not the expected count.
+    CaseCount(Option<usize>),
+    /// getCaseCount's connection ended without a message.
+    NoCaseCount,
+    /// Receiving getCaseCount's message failed.
+    CaseCountRecv(Error),
+    Close(Error),
+    /// A control connection got a message after its own close.
+    Unexpected { kind: Kind, len: usize },
+    /// A control connection's close got no reply.
+    NoCloseReply(Error),
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn => f.write_str("spawn the role task"),
+            Self::Round(e) => write!(f, "turn or poll: {e:?}"),
+            Self::Listen(e) => write!(f, "listen: {e:?}"),
+            Self::NoServerReady => write!(f, "no {CLIENT_RUN}/server-ready within {SERVER_READY_LIMIT:?}"),
+            Self::Marker(e) => write!(f, "writing {CLIENT_RUN}/client-done: {e}"),
+            Self::Connection { n, why } => write!(f, "connection {n}: {why}"),
+            Self::Accepted { got, want } => write!(f, "accepted {got} connections, expected {want}"),
+            Self::Incomplete { started, of } => write!(f, "sequence did not complete: {started} of {of} connections started"),
+        }
+    }
+}
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(e) => write!(f, "open: {e:?}"),
+            Self::NotEstablished(e) => write!(f, "not established: {e:?}"),
+            Self::Upgrade(e) => write!(f, "upgrade: {e}"),
+            Self::Deadline(limit) => write!(f, "still open after {limit:?}"),
+            Self::CaseCount(n) => write!(f, "case count {n:?}"),
+            Self::NoCaseCount => f.write_str("closed without the case count"),
+            Self::CaseCountRecv(e) => write!(f, "case count: {e}"),
+            Self::Close(e) => write!(f, "close: {e}"),
+            Self::Unexpected { kind, len } => write!(f, "unexpected {kind:?} message of {len} bytes after the close"),
+            Self::NoCloseReply(e) => write!(f, "no close reply: {e}"),
+        }
+    }
+}
+
 /// Runs `role` as a switch task on `net`, turning it on `elapsed` (the time since the Stack's
 /// zero) until `stop`. The server role must have accepted its connections by then; the client
 /// role must have completed its sequence. A task error ends the run at once.
@@ -160,10 +233,10 @@ fn drive(
     stop: &mut dyn FnMut() -> bool,
     role: &Role,
     deadline: Duration,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let mut rt = Runtime::new(0);
     let tally: Rc<RefCell<Tally>> = Rc::default();
-    let outcome: Rc<RefCell<Option<Result<(), String>>>> = Rc::default();
+    let outcome: Rc<RefCell<Option<Result<(), Failure>>>> = Rc::default();
     let (handle, spawner) = (net.handle(), rt.spawner());
     let task = {
         let (tally, outcome, role) = (tally.clone(), outcome.clone(), role.clone());
@@ -175,77 +248,38 @@ fn drive(
             *outcome.borrow_mut() = Some(result);
         }
     };
-    rt.spawner().spawn(boxed(Box::pin(task))).map_err(|_| "spawn the role task".to_owned())?;
-    let result = turn_until(net, &mut rt, elapsed, stop, &outcome);
-    rt.shutdown();
-    let tally = tally.borrow();
-    println!("{NAME}: {} connections; endings {:?}", tally.connections, tally.endings);
-    result?;
-    match (role, outcome.borrow_mut().take()) {
-        (Role::Server { connections }, _) if tally.connections != *connections => {
-            Err(format!("accepted {} connections, expected {connections}", tally.connections))
-        }
-        (Role::Server { .. }, _) | (Role::Client { .. }, Some(Ok(()))) => Ok(()),
-        (Role::Client { cases, .. }, _) => {
-            Err(format!("sequence did not complete: {} of {} connections started", tally.connections, cases + 2))
-        }
-    }
-}
-
-/// Turns the Net and polls the runtime until `stop`, or until the task failed. Sleeps (at most
-/// `MAX_IDLE_SLEEP`, never past the Stack's next timer) only after a round that moved nothing.
-fn turn_until(
-    net: &mut Net,
-    rt: &mut Runtime,
-    elapsed: &dyn Fn() -> Duration,
-    stop: &mut dyn FnMut() -> bool,
-    outcome: &RefCell<Option<Result<(), String>>>,
-) -> Result<(), String> {
-    loop {
+    rt.spawner().spawn(boxed(Box::pin(task))).map_err(|_| Failure::Spawn)?;
+    let turned = loop {
         let since = elapsed();
         let now = Instant::from_micros(i64::try_from(since.as_micros()).expect("elapsed fits i64 microseconds"));
-        let turn = net.turn(now).map_err(|e| format!("turn: {e:?}"))?;
-        let polled = rt.poll(u64::try_from(since.as_millis()).expect("elapsed fits u64 ms"));
-        let polled = polled.map_err(|e| format!("runtime: {e:?}"))?;
-        if let Some(Err(e)) = &*outcome.borrow() {
-            return Err(e.clone());
+        let tick = u64::try_from(since.as_millis()).expect("elapsed fits u64 ms");
+        if let Err(e) = round(net, &mut rt, now, tick) {
+            break Err(Failure::Round(e));
         }
-        if stop() {
-            return Ok(());
+        if outcome.borrow().as_ref().is_some_and(Result::is_err) || stop() {
+            break Ok(());
         }
-        if turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0 {
-            continue;
+    };
+    rt.shutdown();
+    let tally = tally.borrow();
+    let _ = writeln!(std::io::stdout(), "{NAME}: {} connections; endings {:?}", tally.connections, tally.endings);
+    turned?;
+    match (role, outcome.borrow_mut().take()) {
+        (_, Some(Err(e))) => Err(e),
+        (&Role::Server { connections }, _) if tally.connections != connections => {
+            Err(Failure::Accepted { got: tally.connections, want: connections })
         }
-        let sleep = match net.poll_at() {
-            None => MAX_IDLE_SLEEP,
-            Some(at) if at <= now => continue,
-            Some(at) => Duration::from_micros((at - now).total_micros()).min(MAX_IDLE_SLEEP),
-        };
-        std::thread::sleep(sleep);
+        (Role::Server { .. }, _) | (Role::Client { .. }, Some(Ok(()))) => Ok(()),
+        (Role::Client { cases, .. }, None) => Err(Failure::Incomplete { started: tally.connections, of: cases + 2 }),
     }
-}
-
-/// `f`, or an error once `limit` passed first (dropping `f`, and the connection with it).
-async fn within<T>(spawner: &Spawner, limit: Duration, f: impl Future<Output = T>) -> Result<T, String> {
-    let ms = u64::try_from(limit.as_millis()).expect("limit fits u64 ms");
-    let sleep = spawner.sleep(ms).map_err(|e| format!("sleep: {e:?}"))?;
-    let (mut f, mut sleep) = (pin!(f), pin!(sleep));
-    poll_fn(|cx| match f.as_mut().poll(cx) {
-        Poll::Ready(v) => Poll::Ready(Ok(v)),
-        Poll::Pending => sleep.as_mut().poll(cx).map(|slept| match slept {
-            Ok(()) => Err(format!("still open after {limit:?}")),
-            Err(e) => Err(format!("sleep: {e:?}")),
-        }),
-    })
-    .await
 }
 
 /// The echo server on `ECHO_PORT`, one connection at a time, forever. The next connection's
 /// listener opens as soon as one is accepted, so a client's next SYN finds it even while the
 /// previous connection still closes.
-async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally: &RefCell<Tally>) -> Result<(), String> {
+async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally: &RefCell<Tally>) -> Result<(), Failure> {
     let local = IpListenEndpoint { addr: None, port: ECHO_PORT };
-    let listen = || handle.tcp_accept(SOCKET, local).map_err(|e| format!("listen: {e:?}"));
+    let listen = || handle.tcp_accept(SOCKET, local).map_err(Failure::Listen);
     let mut next = listen()?;
     let mut buf = Vec::new();
     loop {
@@ -254,10 +288,11 @@ async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally
         let n = tally.borrow().connections;
         tally.borrow_mut().connections += 1;
         let session = async {
-            let mut ws = accept_ws(handle, stream).await.map_err(|e| format!("upgrade: {e}"))?;
-            Ok::<_, String>(echo(&mut ws, &mut buf).await)
+            let mut ws = accept_ws(handle, stream).await.map_err(Why::Upgrade)?;
+            Ok(echo(&mut ws, &mut buf).await)
         };
-        let ending = within(spawner, deadline, session).await.and_then(|r| r).map_err(|e| format!("connection {n}: {e}"))?;
+        let ending = within(spawner, deadline, session).await.unwrap_or(Err(Why::Deadline(deadline)));
+        let ending = ending.map_err(|why| Failure::Connection { n, why })?;
         *tally.borrow_mut().endings.entry(ending).or_default() += 1;
     }
 }
@@ -271,60 +306,60 @@ async fn client(
     run: &Path,
     deadline: Duration,
     tally: &RefCell<Tally>,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     let ready = run.join("server-ready");
-    let mut waited = Duration::ZERO;
+    let waiting = std::time::Instant::now();
     while !ready.exists() {
-        if waited >= SERVER_READY_LIMIT {
-            return Err(format!("no {} within {SERVER_READY_LIMIT:?}", ready.display()));
+        if waiting.elapsed() >= SERVER_READY_LIMIT {
+            return Err(Failure::NoServerReady);
         }
-        spawner.sleep(SERVER_READY_POLL_MS).map_err(|e| format!("sleep: {e:?}"))?.await.map_err(|e| format!("sleep: {e:?}"))?;
-        waited += Duration::from_millis(SERVER_READY_POLL_MS);
+        let poll = spawner.sleep(SERVER_READY_POLL_MS).expect("the Runtime polling this task is open");
+        poll.await.expect("a sleep in the task's own open Runtime");
     }
     let mut buf = Vec::new();
-    for i in 0..=cases + 1 {
-        let path = match i {
+    for n in 0..=cases + 1 {
+        let path = match n {
             0 => "/getCaseCount".to_owned(),
-            i if i <= cases => format!("/runCase?case={i}&agent={AGENT}"),
+            n if n <= cases => format!("/runCase?case={n}&agent={AGENT}"),
             _ => format!("/updateReports?agent={AGENT}"),
         };
         tally.borrow_mut().connections += 1;
-        let session = connection(handle, i, &path, cases, &mut buf);
-        let ending = within(spawner, deadline, session).await.and_then(|r| r).map_err(|e| format!("connection {i} {path}: {e}"))?;
+        let session = connection(handle, n, &path, cases, &mut buf);
+        let ending = within(spawner, deadline, session).await.unwrap_or(Err(Why::Deadline(deadline)));
+        let ending = ending.map_err(|why| Failure::Connection { n, why })?;
         *tally.borrow_mut().endings.entry(ending).or_default() += 1;
     }
-    write_marker(&run.join("client-done"))
+    write_marker(&run.join("client-done")).map_err(Failure::Marker)
 }
 
-/// Client connection `i` to `path`. A runCase echoes until it ends, however it ends; a
+/// Client connection `n` to `path`. A runCase echoes until it ends, however it ends; a
 /// control connection (getCaseCount, updateReports) closes, and must end with the close
 /// handshake and no message besides getCaseCount's count.
-async fn connection(handle: &NetHandle, i: usize, path: &str, cases: usize, buf: &mut Vec<u8>) -> Result<&'static str, String> {
+async fn connection(handle: &NetHandle, n: usize, path: &str, cases: usize, buf: &mut Vec<u8>) -> Result<&'static str, Why> {
     let remote = IpEndpoint::new(TESTER_IP.into(), FUZZINGSERVER_PORT);
-    let port = FIRST_LOCAL_PORT + u16::try_from(i).expect("parse bounded the cases");
+    let port = FIRST_LOCAL_PORT + u16::try_from(n).expect("parse bounded the cases");
     let local = IpListenEndpoint { addr: None, port };
-    let connecting = handle.tcp_connect(SOCKET, remote, local).map_err(|e| format!("connect: {e:?}"))?;
-    let stream = connecting.await.map_err(|e| format!("not established: {e:?}"))?;
-    let mut ws =
-        connect_ws(handle, stream, &TESTER_IP.to_string(), FUZZINGSERVER_PORT, path).await.map_err(|e| format!("upgrade: {e}"))?;
-    if (1..=cases).contains(&i) {
+    let connecting = handle.tcp_connect(SOCKET, remote, local).map_err(Why::Open)?;
+    let stream = connecting.await.map_err(Why::NotEstablished)?;
+    let mut ws = connect_ws(handle, stream, &TESTER_IP.to_string(), FUZZINGSERVER_PORT, path).await.map_err(Why::Upgrade)?;
+    if (1..=cases).contains(&n) {
         return Ok(echo(&mut ws, buf).await);
     }
-    if i == 0 {
+    if n == 0 {
         let count = match ws.recv().await {
             Ok(Some(m)) => m.text().and_then(|t| t.parse::<usize>().ok()),
-            Ok(None) => return Err("closed without the case count".to_owned()),
-            Err(e) => return Err(format!("case count: {e}")),
+            Ok(None) => return Err(Why::NoCaseCount),
+            Err(e) => return Err(Why::CaseCountRecv(e)),
         };
         if count != Some(cases) {
-            return Err(format!("case count {count:?}, expected {cases}"));
+            return Err(Why::CaseCount(count));
         }
     }
-    ws.close(1000, "").await.map_err(|e| format!("close: {e}"))?;
+    ws.close(1000, "").await.map_err(Why::Close)?;
     match ws.recv().await {
         Ok(None) => Ok("close handshake"),
-        Ok(Some(m)) => Err(format!("unexpected {:?} message of {} bytes", m.kind(), m.bytes().len())),
-        Err(e) => Err(format!("no close reply: {e}")),
+        Ok(Some(m)) => Err(Why::Unexpected { kind: m.kind(), len: m.bytes().len() }),
+        Err(e) => Err(Why::NoCloseReply(e)),
     }
 }
 
@@ -357,7 +392,7 @@ async fn echo(ws: &mut Ws, buf: &mut Vec<u8>) -> &'static str {
 }
 
 /// Creates the empty file `path` atomically (write, then rename).
-fn write_marker(path: &Path) -> Result<(), String> {
+fn write_marker(path: &Path) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, "").and_then(|()| fs::rename(&tmp, path)).map_err(|e| format!("writing {}: {e}", path.display()))
+    fs::write(&tmp, "").and_then(|()| fs::rename(&tmp, path))
 }

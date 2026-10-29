@@ -2,16 +2,17 @@
 
 Async sockets over one zhida `Stack` for the `switch` runtime. Tasks await owned received frames and send TX frames; one loop owner turns the stack and then polls the runtime. Not published.
 
-Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md) and [`switch`](../switch/README.md). Dev-dependencies are `zhida-test-kit`, `zhida-test-support` and criterion. Nothing depends on it.
+Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md) and [`switch`](../switch/README.md). Dev-dependencies are `zhida-test-kit`, `zhida-test-support` and criterion. Used by relay, sheath, binance-feed and nic-runner.
 
 ## API
 
 - `Net::new(stack, NetConfig { ingress_budget })`: the loop owner. `turn(now)` runs `Stack::turn` and wakes every task parked on a socket that became ready; `poll_at()`; `into_stack()`; `handle()`.
 - `NetHandle`: held by tasks. It opens sockets (`tcp_connect`, `tcp_accept`, `udp_bind`) and hands out TX frames (`tx_frame().await`: waits while the frame pool is empty; a turn that finds a free frame wakes the waiters). It cannot turn the stack.
 - `TcpStream`: `recv()` yields a `TcpFrame` (`payload`, `payload_mut`, `rx_timestamp`); `split()` gives `TcpRx` (`recv`) and `TcpTx`.
-- `TcpTx`: `room(len).await` resolves `Ok` once a frame of `len` bytes fits (free bytes and a free frame slot), `Err(InvalidState)` once the socket cannot send. `try_send(frame)` queues it synchronously; every error returns the same frame (`Full`, `InvalidState`, `Empty`, `Foreign`). No future ever owns a frame, so a filled (e.g. sealed) frame is never lost to a dropped future. `shutdown()` sends FIN after the queued data; receiving continues.
+- `TcpTx`: `room(len).await` resolves `Ok` once a frame of `len` bytes fits (free bytes and a free frame slot), `Err(InvalidState)` once the socket cannot send. `try_send(frame)` queues it synchronously; every error returns the same frame (`Full`, `InvalidState`, `Empty`, `Foreign`). No future ever owns a frame, so a filled (e.g. sealed) frame is never lost to a dropped future. `shutdown()` sends FIN after the queued data; receiving continues. `delivered().await`, after `shutdown`, resolves once the peer acked every byte and the FIN (FinWait2, TimeWait) or the connection is gone (Closed): until then the bytes exist only in the socket, and dropping the Stack loses them.
 - `UdpSocket`: `recv()` yields a `Datagram` (`payload`, `src`, `dst_addr`, `rx_timestamp`); `split()` gives `UdpRx` (`recv`) and `UdpTx` (`send(to, frame)`, synchronous; errors return the frame; `WouldBlock` clears after a turn).
 - `Connecting`, `Accepting` and `Closed` are the connection-setup futures and error.
+- Running tasks: `round(net, rt, now, tick)` is the loop owner's step (turn, poll, then an idle sleep until the Stack's next timer, at most 1 ms, when nothing moved); `boxed(future)` makes any future a switch task; `first(a, b)` races two futures; `within(spawner, limit, f)` bounds one by a Runtime sleep (ticks are milliseconds). Used by binance-feed, nic-runner and relay-autobahn.
 - Re-exports from `dpdk-smoltcp`: `Stack`, `Turn`, `StackError`, `UdpConfig`, `TxFrame`, `UdpSendError`, `UdpSendFrameError`, `Instant`, the `tcp` module (with `SendError`, `SendFrameError`) and address types.
 
 ## Constraints

@@ -10,9 +10,9 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, first, run, Clock, FeedError, Target, INGRESS_BUDGET, SOCKET_BUFFER};
+use binance_feed::{connect, run, Clock, FeedError, Target, INGRESS_BUDGET, SOCKET_BUFFER};
 use rustls::ClientConfig;
-use switchnet::{Net, NetConfig};
+use switchnet::{first, Net, NetConfig};
 use tap_echo::driver::{self, ZHIDA_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP};
 
 const NAME: &str = "binance-feed";

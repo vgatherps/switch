@@ -4,8 +4,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, first, webpki_client_config, Clock, FeedError, Target};
-use switchnet::{tcp, Net};
+use binance_feed::{connect, webpki_client_config, Clock, FeedError, Target};
+use switchnet::{first, tcp, Net};
 
 use crate::args::Feed;
 use crate::{line, stopped};

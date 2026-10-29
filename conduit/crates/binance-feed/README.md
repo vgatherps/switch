@@ -6,7 +6,6 @@ Depends on `relay` (feature `switchnet`), `switchnet`, `switch`, [`tap-echo`](..
 
 ## API
 
-- `first(a, b)`: `a`'s output, or `None` if `b` finishes first; the binaries race `connect` against the stop with it.
 - `run(net, clock, should_stop, client)`: runs `client(handle, spawner, stop)` as a switch task on a new Runtime, turning the Net until it finishes; `stop` finishes once `should_stop()` returns true. Runtime ticks are milliseconds (`Clock::ms`).
 - `connect(handle, spawner, target, socket, tls, local_port, limit)`: opens TCP, TLS and WebSocket within one time limit. Returns a `Feed`; on an error or timeout the socket is dropped.
 - `Feed::next(stop)`: the next `BookTicker`, or `None` once `stop` finishes (updates already received come first). Server pings are answered inside. `Feed::close(spawner, limit)` sends the WebSocket close and reads until the server's close echo; then close_notify and FIN go out, and it returns once the server acked them.

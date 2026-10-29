@@ -7,7 +7,6 @@ use std::ffi::CString;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::panic::resume_unwind;
-use std::pin::Pin;
 use std::process::Command;
 use std::rc::Rc;
 use std::thread;
@@ -20,7 +19,7 @@ use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 use zhida_test_kit::{tap::TapVdev, with_eal};
 
-use crate::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, tcp};
+use crate::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, boxed, tcp};
 
 pub const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 pub const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -131,12 +130,6 @@ fn add_address(iface: &CString, addr: Ipv4Addr, prefix: u8) {
         .output()
         .expect("run ip address add");
     assert!(output.status.success(), "ip address add {cidr}: {}", String::from_utf8_lossy(&output.stderr));
-}
-
-/// Any future as a switch task.
-#[switch::task]
-pub fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-    future
 }
 
 /// One client against one kernel peer: the peer, on a thread, runs `serve` on the connection
