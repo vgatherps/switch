@@ -590,6 +590,12 @@ pub struct Socket<'a> {
     orphaned: bool,
     /// An acceptable peer RST closed this connection; cleared by reset().
     reset_by_peer: bool,
+    /// The tuple's local address is in the interface's owned set, recorded when the tuple is
+    /// set (connect, accepted SYN). The set is fixed for the interface's life, so the egress
+    /// liveness check needs no search: a tuple only exists for one of our addresses (connect
+    /// refuses another, and a SYN reaches a listener only when addressed to us), and of those
+    /// only the interface addresses can go away.
+    local_owned: bool,
 }
 
 #[cfg(test)]
@@ -650,6 +656,7 @@ pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
         ("rx_refused_segments", offset_of!(Socket<'static>, rx_refused_segments)),
         ("mss_cap", offset_of!(Socket<'static>, mss_cap)),
         ("reset_by_peer", offset_of!(Socket<'static>, reset_by_peer)),
+        ("local_owned", offset_of!(Socket<'static>, local_owned)),
     ]
 }
 
@@ -707,6 +714,7 @@ impl<'a> Socket<'a> {
             mss_cap: None,
             orphaned: false,
             reset_by_peer: false,
+            local_owned: false,
             connection_mss_cap: None,
             initial_window: 1_048_576,
             listen_endpoint: IpListenEndpoint::default(),
@@ -1224,6 +1232,7 @@ impl<'a> Socket<'a> {
             remote: remote_endpoint,
         };
         self.tuple = Some(tuple);
+        self.local_owned = cx.owns(local_endpoint.addr);
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
         self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
@@ -2505,6 +2514,7 @@ impl<'a> Socket<'a> {
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 };
                 self.tuple = Some(tuple);
+                self.local_owned = cx.owns(tuple.local.addr);
                 self.local_seq_no = Self::random_seq_no(cx, tuple);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_win_seq = repr.seq_number;
@@ -3070,8 +3080,8 @@ impl<'a> Socket<'a> {
         // Check if the interface still has our source IP address.
         // If not (e.g. the interface's IP changed), reset the socket.
         // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP.
-        if !cx.has_ip_addr(tuple.local.addr) {
+        // an RST packet with the now-invalid source IP. An owned address never goes away.
+        if !cx.has_interface_addr(tuple.local.addr) && !self.local_owned {
             net_debug!("source IP address no longer available, closing socket");
             self.reset();
             return Ok(());
@@ -3667,8 +3677,9 @@ fn rtt_sampling_round_trips() {
 #[test]
 fn socket_size_matches_main() {
     // TxQueue holds frame entries, their end position and their TxSource instead of a borrowed
-    // byte ring; the TxSource is a thin Rc to the concrete pool.
-    let main_size = 456;
+    // byte ring; the TxSource is a thin Rc to the concrete pool. local_owned adds a byte at the
+    // tail (8 with padding); every other field keeps its offset.
+    let main_size = 464;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
 }

@@ -293,6 +293,7 @@ impl Stack {
         let mut iface_config = Config::new(config.ethernet.into());
         iface_config.random_seed = config.random_seed;
         iface_config.neighbor_capacity = config.neighbor_capacity;
+        iface_config.owned_ipv4 = owned;
         let mut iface = Interface::new(iface_config, &mut device, now);
         iface.update_ip_addrs(|addrs| {
             // The address list starts empty and holds at least one entry.
@@ -300,7 +301,6 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
-        iface.set_owned_ipv4(owned);
         let mut storage = Vec::with_capacity(config.max_sockets);
         storage.resize_with(config.max_sockets, || TcpStorage::EMPTY);
         Ok(Self {

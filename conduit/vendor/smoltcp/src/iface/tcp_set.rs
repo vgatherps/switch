@@ -1501,7 +1501,7 @@ mod tests {
         assert_eq!(size_of::<TcpStorage<'static>>(), 640);
         assert_eq!(align_of::<TcpStorage<'static>>(), 64);
         assert_eq!(size_of::<Meta>(), 112);
-        assert_eq!(size_of::<tcp::Socket<'static>>(), 456);
+        assert_eq!(size_of::<tcp::Socket<'static>>(), 464);
         assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
@@ -1547,6 +1547,7 @@ mod tests {
             ("rx_refused_segments", 448),
             ("mss_cap", 452),
             ("reset_by_peer", 455),
+            ("local_owned", 456),
         ];
         for (name, expected) in expected_offsets {
             let &(_, actual) = socket_offsets
@@ -1609,6 +1610,8 @@ mod tests {
             ("rx_refused_segments", 8),
             ("mss_cap", 8),
             ("reset_by_peer", 8),
+            // Read once per egress dispatch with the tuple; the slot's last, cold line.
+            ("local_owned", 9),
         ];
         assert_eq!(socket_offsets.len(), expected_lines.len());
         for (&(name, offset), (expected_name, expected_line)) in

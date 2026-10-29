@@ -195,6 +195,12 @@ pub struct Config {
     /// How many neighbors the cache holds. Defaults to 256.
     pub neighbor_capacity: usize,
 
+    /// Addresses the interface owns besides its own: it answers ARP, ICMP echo, UDP and TCP for
+    /// them. Fixed for the interface's life (sockets record at admission whether their local
+    /// address is in it). It does not route traffic: replies leave toward the peer as for the
+    /// interface address. Defaults to empty.
+    pub owned_ipv4: OwnedIpv4,
+
     /// Set the Hardware address the interface will use.
     ///
     /// # Panics
@@ -207,6 +213,7 @@ impl Config {
         Config {
             random_seed: 0,
             neighbor_capacity: 256,
+            owned_ipv4: OwnedIpv4::default(),
             hardware_addr,
         }
     }
@@ -258,7 +265,7 @@ impl Interface {
                 any_ip: false,
                 ipv4_gateway: None,
                 path_mtus: None,
-                owned_ipv4: OwnedIpv4::default(),
+                owned_ipv4: config.owned_ipv4,
                 neighbor_cache: NeighborCache::new(config.neighbor_capacity),
                 probe_owed: None,
                 tcp_isn_secret,
@@ -343,10 +350,10 @@ impl Interface {
         self.inner.path_mtus = Some(paths);
     }
 
-    /// Addresses the interface owns besides its own: it answers ARP, ICMP echo, UDP and TCP for
-    /// them. The caller fixes the set for the Stack lifetime. It does not route traffic: replies
-    /// leave toward the peer as for the interface address.
-    pub fn set_owned_ipv4(&mut self, owned: OwnedIpv4) {
+    /// Replace the owned set of an interface that has no sockets yet: tests only; the set is
+    /// otherwise fixed by `Config::owned_ipv4`.
+    #[cfg(test)]
+    pub(crate) fn set_owned_ipv4(&mut self, owned: OwnedIpv4) {
         self.inner.owned_ipv4 = owned;
     }
 
@@ -1049,6 +1056,14 @@ impl InterfaceInner {
     #[inline]
     pub(crate) fn owns_ipv4(&self, addr: Ipv4Address) -> bool {
         self.owned_ipv4.contains(addr)
+    }
+
+    /// `owns_ipv4` for an IP address.
+    #[inline]
+    pub(crate) fn owns(&self, addr: IpAddress) -> bool {
+        match addr {
+            IpAddress::Ipv4(addr) => self.owns_ipv4(addr),
+        }
     }
 
     #[cfg(feature = "medium-ip")]
