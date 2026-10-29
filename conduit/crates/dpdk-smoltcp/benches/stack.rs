@@ -174,7 +174,6 @@ fn arp_benches(c: &mut Criterion, eal: &Eal) {
         paths: &[],
         random_seed: 1,
         neighbor_capacity: dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 1,
         rx_staging: BATCH,
         tx_pending: BATCH,

@@ -77,7 +77,6 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
         max_udp_sockets: 0,
         rx_staging: 32,
         tx_pending: 32,
-        segments_per_visit: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     };
     let start = std::time::Instant::now();
@@ -105,7 +104,7 @@ sizing and admission. `Sizing` has no defaults; fill all nine fields:
 | `tcp_rx_frames` | sum of `tcp::rx_mbuf_budget(&config, mtu)` over every TCP config you will add (see "Pool sizing" below) |
 | `tcp_tx_frames` | sum of `tcp::tx_mbuf_budget(&config, mtu)` over every TCP config you will add, plus the frames the application holds at once from `Stack::tx_frame` |
 | `udp_rx_datagrams` | sum of `UdpConfig::rx_queue` over every UDP socket you will add |
-| `max_sockets`, `max_udp_sockets`, `rx_staging`, `tx_pending`, `segments_per_visit`, `neighbor_capacity` | passed to the `StackConfig` fields of the same name ("Configure the Stack" below) |
+| `max_sockets`, `max_udp_sockets`, `rx_staging`, `tx_pending`, `neighbor_capacity` | passed to the `StackConfig` fields of the same name ("Configure the Stack" below) |
 
 A socket that does not fit gets `AddTcpError::RxPoolTooSmall` or `AddTcpError::TxFramePoolTooSmall`
 from `add_tcp`.
@@ -292,7 +291,6 @@ fn create_stack(port: Port) -> Result<Stack, Box<dyn std::error::Error>> {
         paths: &[],
         random_seed: os_random_seed()?,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 8,
         max_udp_sockets: 2,
         rx_staging: 32,
@@ -315,13 +313,12 @@ the latter.
 `random_seed: u64` seeds the interface PRNG, including the TCP initial-sequence-number secret.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
 only in tests and benchmarks. `neighbor_capacity: usize` controls the ARP cache. `DEFAULT_NEIGHBOR_CAPACITY` is 256. A
-new neighbor in a full cache evicts the neighbor that expires first. `segments_per_visit: usize`
-limits consecutive frames from one TCP socket while other sockets have frames ready. A socket alone
-can continue sending; 1 gives one-segment interleaving.
+new neighbor in a full cache evicts the neighbor that expires first. Egress sends one segment per
+TCP socket visit while other sockets have frames ready; a socket alone keeps sending while it is due.
 
 `max_sockets: usize` is the TCP slot limit and must be positive, even for a UDP-only application.
 `max_udp_sockets: usize` is a separate UDP slot limit; zero disables UDP sockets.
-`neighbor_capacity`, `segments_per_visit`, `rx_staging`, and `tx_pending` must be positive.
+`neighbor_capacity`, `rx_staging`, and `tx_pending` must be positive.
 `rx_staging: usize` and `tx_pending: usize` set fixed-capacity device queues (`VecDeque::with_capacity`,
 so actual capacity can exceed the request). RX bursts fill available staging space. TCP-built
 frames and UDP sends share the pending TX FIFO. A full pending queue blocks ingress, so size it for

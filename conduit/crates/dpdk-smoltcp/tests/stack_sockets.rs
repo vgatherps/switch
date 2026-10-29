@@ -41,7 +41,6 @@ fn stack(port: Port, max_sockets: usize, tx_pending: usize) -> Stack {
         paths: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets,
         rx_staging: 8,
         tx_pending,

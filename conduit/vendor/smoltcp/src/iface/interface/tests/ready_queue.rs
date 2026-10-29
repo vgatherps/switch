@@ -258,7 +258,6 @@ fn egress_idle_means_next_pass_does_nothing() {
             "burst" => assert_eq!(device.inner.tx_queue.len(), 3),
             "refused" => assert_eq!(sockets.ready_len(), 1),
             "bounded" => {
-                assert_eq!(iface.segments_per_visit, 1);
                 assert_eq!(device.inner.tx_queue.len(), 2);
                 assert_eq!(sockets.dirty_list, vec![0, 1]);
             }
@@ -1624,15 +1623,16 @@ fn visit_end_with_peer_window_full_stores_deadline() {
     assert!(sockets.dirty_list.is_empty());
 }
 
+/// A visit that ends after its one segment, with the peer window then full, stores the socket's
+/// deadline.
 #[test]
 fn segment_cap_end_reclassifies() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    iface.segments_per_visit = 2;
     let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let (b, b_seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
     for (handle, port, seq, byte) in [(a, 1234, a_seq, 1), (b, 1235, b_seq, 2)] {
         let mut window = segment(port, TcpControl::None, 101, seq);
-        window.window_len = 1024;
+        window.window_len = 512;
         receive(&mut iface, &mut sockets, &mut device, window);
         assert_eq!(
             sockets.get_mut(handle).send_slice(&[byte; 4 * 512]),
@@ -1644,15 +1644,13 @@ fn segment_cap_end_reclassifies() {
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
     );
-    assert_eq!(device.tx_queue.len(), 4);
-    assert_eq!(sockets.dispatches, vec![0, 0, 1, 1]);
+    assert_eq!(device.tx_queue.len(), 2);
+    assert_eq!(sockets.dispatches, vec![0, 1]);
     for (index, handle, port, seq, byte) in [(0, a, 1234, a_seq, 1), (1, b, 1235, b_seq, 2)] {
-        for frame in 0..2 {
-            let (sent_port, control, sent_seq, payload) = take_tcp(&mut device);
-            assert_eq!((sent_port, control), (port, TcpControl::None));
-            assert_eq!(sent_seq, seq + frame * 512);
-            assert_eq!(payload, [byte; 512]);
-        }
+        let (sent_port, control, sent_seq, payload) = take_tcp(&mut device);
+        assert_eq!((sent_port, control), (port, TcpControl::None));
+        assert_eq!(sent_seq, seq);
+        assert_eq!(payload, [byte; 512]);
         assert_eq!(sockets.get(handle).send_queue(), 4 * 512);
         let deadline = sockets.get(handle).poll_at(&mut iface.inner);
         assert!(matches!(deadline, PollAt::Time(time) if time > START));
@@ -1710,11 +1708,12 @@ fn address_removal_resets_socket_only_when_retransmit_timer_fires() {
     assert_eq!(iface.poll_at(now, &mut sockets), None);
 }
 
+/// While another socket is ready a visit sends one segment; once the other has nothing left,
+/// the remaining socket is alone and bursts within the same pass.
 #[test]
-fn segments_per_visit_bounds_burst_while_others_wait() {
+fn one_segment_per_visit_while_others_wait_then_lone_burst() {
     for a_segments in [4, 1] {
         let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-        iface.segments_per_visit = 2;
         let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
         let (b, b_seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
         assert_eq!(
@@ -1724,7 +1723,7 @@ fn segments_per_visit_bounds_burst_while_others_wait() {
         assert_eq!(sockets.get_mut(b).send_slice(&[2; 4 * 512]), Ok(4 * 512));
         sockets.dispatches.clear();
         let expected: &[&[usize]] = if a_segments == 4 {
-            &[&[0, 0, 1, 1], &[0, 0, 1, 1]]
+            &[&[0, 1], &[0, 1], &[0, 1], &[0, 1], &[]]
         } else {
             &[&[0, 1, 1, 1, 1], &[]]
         };
@@ -1747,7 +1746,7 @@ fn segments_per_visit_bounds_burst_while_others_wait() {
             assert_eq!(sockets.dispatches, dispatches);
             assert_eq!(
                 sockets.dirty_list.contains(&0),
-                a_segments == 4 && pass_number == 0
+                a_segments == 4 && pass_number < 3
             );
             assert_eq!(device.tx_queue.len(), pass.len());
             for &index in *pass {
@@ -1774,7 +1773,7 @@ fn segments_per_visit_bounds_burst_while_others_wait() {
         assert_eq!(
             sockets.dispatches,
             if a_segments == 4 {
-                vec![0, 0, 1, 1, 0, 0, 1, 1]
+                vec![0, 1, 0, 1, 0, 1, 0, 1]
             } else {
                 vec![0, 1, 1, 1, 1]
             }

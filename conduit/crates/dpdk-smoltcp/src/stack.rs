@@ -51,9 +51,6 @@ pub struct StackConfig<'a> {
     /// [`DEFAULT_NEIGHBOR_CAPACITY`] is 256. When the cache is full, a new
     /// neighbor evicts the one that expires first.
     pub neighbor_capacity: usize,
-    /// How many frames a socket may send in a row while other sockets have frames to send.
-    /// A socket alone sends while it has segments ready. 1 keeps strict one-segment interleave.
-    pub segments_per_visit: usize,
     pub max_sockets: usize,
     /// How many UDP sockets may be added. Zero disables UDP sockets.
     pub max_udp_sockets: usize,
@@ -283,7 +280,6 @@ impl Stack {
         let mut iface_config = Config::new(config.ethernet.into());
         iface_config.random_seed = config.random_seed;
         iface_config.neighbor_capacity = config.neighbor_capacity;
-        iface_config.segments_per_visit = config.segments_per_visit;
         let mut iface = Interface::new(iface_config, &mut device, now);
         iface.update_ip_addrs(|addrs| {
             // The address list starts empty and holds at least one entry.
@@ -912,9 +908,6 @@ fn validate(config: &StackConfig<'_>) -> Result<(), &'static str> {
     }
     if config.neighbor_capacity == 0 {
         return Err("neighbor_capacity must be > 0");
-    }
-    if config.segments_per_visit == 0 {
-        return Err("segments_per_visit must be positive");
     }
     if config.rx_staging == 0 {
         return Err("rx_staging must be positive");

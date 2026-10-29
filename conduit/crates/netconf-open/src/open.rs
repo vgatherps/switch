@@ -316,7 +316,6 @@ pub unsafe fn open(
         paths: &paths,
         random_seed: seed,
         neighbor_capacity: sizing.neighbor_capacity,
-        segments_per_visit: sizing.segments_per_visit,
         max_sockets: sizing.max_sockets,
         max_udp_sockets: sizing.max_udp_sockets,
         rx_staging: sizing.rx_staging,
