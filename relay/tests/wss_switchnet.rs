@@ -72,8 +72,7 @@ fn upgrade(tls: Tls) -> ServerWs {
 
 /// After the close handshake: the client's close_notify (rustls reads a clean end) and then its
 /// FIN (the socket reads end of stream).
-fn assert_close_notify_then_fin(ws: ServerWs) {
-    let mut tls = ws.into_inner();
+fn assert_close_notify_then_fin(mut tls: Tls) {
     let mut byte = [0; 1];
     assert_eq!(tls.read(&mut byte).expect("clean TLS end: close_notify, not truncation"), 0);
     assert_eq!(tls.sock.read(&mut byte).expect("TCP end of stream"), 0);
@@ -237,21 +236,25 @@ fn server_ping_is_answered_inside_recv() {
     assert_eq!(pong.as_deref(), Some(&b"hb"[..]));
 }
 
-/// The client closes: the server sees the close frame, then close_notify, then FIN; the
-/// client's recv ends cleanly after the server's echo.
+/// The client closes: the server sees the close frame alone, and close_notify and FIN only
+/// after its echo; the client's recv ends cleanly with that echo.
 #[zhida_test_support::pinned_test]
-fn client_close_reaches_the_server_as_close_close_notify_fin() {
+fn client_close_sends_close_notify_and_fin_after_the_echo() {
     let close_frame = wss_run(
         |_| {},
         |tls| {
-            let mut ws = upgrade(tls);
-            let frame = match ws.read() {
-                Ok(Message::Close(frame)) => frame,
-                other => panic!("expected the close: {other:?}"),
-            };
-            // tungstenite sends its echo, then reports the finished handshake.
-            assert!(matches!(ws.read(), Err(WsError::ConnectionClosed)));
-            assert_close_notify_then_fin(ws);
+            let mut tls = upgrade(tls).into_inner();
+            let mut frame = [0; 11];
+            tls.read_exact(&mut frame).expect("the client's close");
+            // nothing follows the close until the echo: no close_notify, no FIN
+            tls.sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut byte = [0; 1];
+            let quiet = tls.read(&mut byte).expect_err("close_notify or FIN before the echo");
+            assert!(matches!(quiet.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{quiet}");
+            tls.sock.set_read_timeout(Some(LIMIT)).unwrap();
+            tls.write_all(&[0x88, 5, 0x03, 0xe8, b'b', b'y', b'e']).unwrap();
+            tls.flush().unwrap();
+            assert_close_notify_then_fin(tls);
             frame
         },
         |mut wss| async move {
@@ -261,8 +264,11 @@ fn client_close_reaches_the_server_as_close_close_notify_fin() {
         },
         || {},
     );
-    let frame = close_frame.expect("a close payload");
-    assert_eq!((frame.code, frame.reason.as_str()), (CloseCode::Normal, "bye"));
+    // masked: FIN + close, 0x80 | 5, the key, then 1000 "bye" under it
+    assert_eq!(close_frame[..2], [0x88, 0x85]);
+    let key = &close_frame[2..6];
+    let payload: Vec<u8> = close_frame[6..].iter().zip(key.iter().cycle()).map(|(b, k)| b ^ k).collect();
+    assert_eq!(payload, [0x03, 0xe8, b'b', b'y', b'e']);
 }
 
 /// The server closes: the client's recv returns the end, after echoing the close and ending
@@ -279,7 +285,7 @@ fn server_close_ends_recv_cleanly() {
                 other => panic!("expected the echoed close: {other:?}"),
             };
             assert!(matches!(ws.read(), Err(WsError::ConnectionClosed)));
-            assert_close_notify_then_fin(ws);
+            assert_close_notify_then_fin(ws.into_inner());
             echo
         },
         |mut wss| async move {

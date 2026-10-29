@@ -172,12 +172,14 @@ async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mu
     }
 }
 
-/// An open wss:// connection. A server ping is answered within `recv`; the server's close is
-/// echoed there, followed by close_notify and FIN.
+/// An open wss:// connection. A server ping is answered within `recv`. The close handshake
+/// ends there too, either way: the server's close is echoed, or the echo of ours arrives; then
+/// close_notify and FIN go out.
 pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>>);
 
-/// An open ws:// connection, client or server. A ping is answered within `recv`; the peer's
-/// close is echoed there, followed by FIN.
+/// An open ws:// connection, client or server. A ping is answered within `recv`. The close
+/// handshake ends there too, either way: the peer's close is echoed, or the echo of ours
+/// arrives; then FIN goes out.
 pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx>);
 
 impl Wss {
@@ -191,8 +193,9 @@ impl Wss {
         self.0.send(kind, payload).await
     }
 
-    /// Sends a close frame (`code`, `reason`), then close_notify and FIN. Receiving goes on until
-    /// `recv` returns `None`, after the server's echo.
+    /// Sends a close frame (`code`, `reason`) and nothing more (RFC 6455 §7.1.1: TCP closes after
+    /// the handshake). Receiving goes on until the server's echo, when `recv` sends close_notify
+    /// and FIN and returns `None`; a server that never echoes keeps `recv` waiting: bound it.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
         self.0.close(code, reason).await
     }
@@ -209,8 +212,9 @@ impl Ws {
         self.0.send(kind, payload).await
     }
 
-    /// Sends a close frame (`code`, `reason`), then FIN. Receiving goes on until
-    /// `recv` returns `None`, after the peer's echo.
+    /// Sends a close frame (`code`, `reason`) and nothing more (RFC 6455 §7.1.1: TCP closes after
+    /// the handshake). Receiving goes on until the peer's echo, when `recv` sends FIN and returns
+    /// `None`; a peer that never echoes keeps `recv` waiting: bound it.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
         self.0.close(code, reason).await
     }
@@ -294,6 +298,6 @@ where
         let mut payload = code.to_be_bytes().to_vec();
         payload.extend_from_slice(reason.as_bytes());
         self.tx.close(&payload);
-        Ok(self.tx.shutdown().await?)
+        Ok(self.tx.flush().await?)
     }
 }
