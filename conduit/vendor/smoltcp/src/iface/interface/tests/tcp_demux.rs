@@ -2488,3 +2488,30 @@ fn foreign_context_connect_from_an_address_the_dispatcher_does_not_own_is_reset(
     assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
     assert_eq!(sockets.get(handle).local_endpoint(), None);
 }
+
+/// A raw connect through another interface's context, from an address only that interface owns,
+/// registers no flow on this one: a SYN-ACK for the tuple, arriving before any egress, is not
+/// delivered (no RST from the SYN-SENT socket, nothing sent at all) and the socket is reset by
+/// the check that runs before the segment is demuxed.
+#[test]
+fn foreign_context_connect_gets_no_flow_for_an_inbound_segment() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut other, _, _) = setup(Medium::Ip);
+    own_prefix(&mut other);
+    let source = Ipv4Address::new(10, 9, 0, 1);
+    let handle = sockets.add(socket());
+    sockets
+        .get_mut(handle)
+        .connect(other.context(), (REMOTE_ADDR, REMOTE_PORT), (source, LOCAL_PORT))
+        .unwrap();
+    assert_eq!(sockets.get(handle).state(), tcp::State::SynSent);
+    device.rx_queue.push_back(packet_bytes_to(
+        segment(TcpControl::Syn, REMOTE_SEQ, Some(TcpSeqNumber(1))),
+        source,
+    ));
+    iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+    assert!(device.rx_queue.is_empty());
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
+    assert_eq!(sockets.get(handle).local_endpoint(), None);
+}

@@ -299,7 +299,7 @@ impl InterfaceInner {
                     .expect("TCP flow index contains an empty slot")
                     .socket
                     .finish_time_wait();
-                sockets.sync_identity(index);
+                sockets.resync_identity(index);
                 sockets.check_reapable(index);
                 sockets.mark_dirty_synced(index);
                 winner = sockets.tcp_lookup(dst, src, syn_like);
@@ -328,7 +328,7 @@ impl InterfaceInner {
             let (reply, pending) = socket.process(self, &ip_repr, &tcp_repr);
             // Inside process, a flow key change requires a state change.
             if socket.state() != before {
-                sockets.sync_identity(index);
+                sockets.resync_identity(index);
                 sockets.check_reapable(index);
             } else {
                 #[cfg(debug_assertions)]

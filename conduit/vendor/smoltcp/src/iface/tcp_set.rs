@@ -5,6 +5,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::socket_meta::Meta;
+use super::interface::InterfaceInner;
 use crate::socket::tcp;
 
 use super::flow_table::{BindKey, FlowTable};
@@ -285,8 +286,8 @@ impl<'a> TcpSet<'a> {
             #[cfg(test)]
             slot_visits: 0,
         };
+        // Occupied slots register their flows at the driving interface's first sync.
         for index in 0..slot_count {
-            set.sync_identity(index);
             if set.sockets[index].inner.is_some() {
                 set.mark_dirty(index);
             }
@@ -378,7 +379,6 @@ impl<'a> TcpSet<'a> {
         };
         self.set_occupied(index, true);
         let handle = put(index, &mut self.sockets[index], socket);
-        self.sync_identity(index);
         self.mark_dirty(index);
         handle
     }
@@ -739,14 +739,43 @@ impl TcpSet<'_> {
         self.flow_slots[index].next = usize::MAX;
     }
 
-    pub(crate) fn sync_identity(&mut self, index: usize) {
-        let key = self.sockets[index]
-            .inner
-            .as_ref()
-            .map_or(FlowKey::None, |item| flow_key(&item.socket));
+    /// Registers the slot's flow key after an application change, with `cx` the interface
+    /// driving the set. A new exact tuple whose local address `cx` neither has nor owns resets
+    /// the socket and registers nothing, so demux and egress only ever see tuples on our
+    /// addresses.
+    pub(crate) fn sync_identity(&mut self, cx: &InterfaceInner, index: usize) {
+        let mut key = self.slot_flow_key(index);
         if key == self.flow_slots[index].registered {
             return;
         }
+        if let FlowKey::Exact { .. } = key
+            && let Some(item) = &mut self.sockets[index].inner
+            && !item.socket.admit_local(cx)
+        {
+            key = FlowKey::None;
+        }
+        self.register_identity(index, key);
+    }
+
+    /// Registers the slot's flow key after the driving interface changed the socket's state
+    /// itself: a segment it accepted for one of its addresses, or its egress. Such a change
+    /// sets no tuple on another address, so nothing is checked.
+    pub(crate) fn resync_identity(&mut self, index: usize) {
+        let key = self.slot_flow_key(index);
+        if key == self.flow_slots[index].registered {
+            return;
+        }
+        self.register_identity(index, key);
+    }
+
+    fn slot_flow_key(&self, index: usize) -> FlowKey {
+        self.sockets[index]
+            .inner
+            .as_ref()
+            .map_or(FlowKey::None, |item| flow_key(&item.socket))
+    }
+
+    fn register_identity(&mut self, index: usize, key: FlowKey) {
         self.set_deadline(index, PollAt::Ingress, false);
         if let Some(item) = &mut self.sockets[index].inner {
             item.meta = Meta::default();
@@ -843,13 +872,13 @@ impl TcpSet<'_> {
         self.identity_synced = 0;
     }
 
-    pub(crate) fn sync_dirty_identities(&mut self) {
+    pub(crate) fn sync_dirty_identities(&mut self, cx: &InterfaceInner) {
         for position in self.identity_synced..self.dirty_list.len() {
             #[cfg(test)]
             {
                 self.slot_visits += 1;
             }
-            self.sync_identity(self.dirty_list[position]);
+            self.sync_identity(cx, self.dirty_list[position]);
         }
         self.identity_synced = self.dirty_list.len();
     }
@@ -2276,6 +2305,7 @@ mod tests {
             assert_eq!(set.tcp_lookup(local, remote, true), Some(first.index));
             assert_eq!(set.tcp_lookup(local, remote, false), None);
             let second = set.add(listener(local.port));
+            iface.classify_dirty(&mut set, Instant::ZERO);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, true), Some(first.index));
             assert_eq!(set.tcp_lookup(local, remote, false), None);
@@ -2316,6 +2346,7 @@ mod tests {
             assert_eq!(set.tcp_lookup(local, remote, false), Some(1));
             let reused = set.add(connected(local, remote));
             assert_eq!(reused.index, 0);
+            iface.classify_dirty(&mut set, Instant::ZERO);
             set.remove(handles[1]);
             set.check_flow_index();
             assert_eq!(set.flow_slots[0].next, 2);
@@ -2337,6 +2368,7 @@ mod tests {
             };
             let mut set = TcpSet::new(vec![]);
             let handle = set.add(connected(local, remote));
+            iface.classify_dirty(&mut set, Instant::ZERO);
             *set.get_mut(handle) = connected(other_local, remote);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, false), Some(handle.index));
@@ -2359,6 +2391,7 @@ mod tests {
                 let port = local.port + index as u16;
                 let handle = set.add(listener(port));
                 assert_eq!(handle.index, index);
+                iface.classify_dirty(&mut set, Instant::ZERO);
                 set.check_flow_index();
                 assert_eq!(set.tcp_lookup(local, remote, false), Some(first.index));
                 for expected in 1..=index {
@@ -2394,6 +2427,7 @@ mod tests {
 
         #[test]
         fn flow_index_filters_bound_listeners_and_keeps_lowest_match() {
+            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
             let (local, remote) = endpoints();
             for exact_first in [false, true] {
                 let mut set = TcpSet::new(vec![]);
@@ -2411,6 +2445,7 @@ mod tests {
                         set.add(connected(local, remote)),
                     )
                 };
+                iface.classify_dirty(&mut set, Instant::ZERO);
                 set.check_flow_index();
                 let exact = if exact_first { first } else { second };
                 assert_eq!(set.tcp_lookup(local, remote, true), Some(exact.index));
@@ -2458,12 +2493,16 @@ mod tests {
         }
 
         #[test]
-        fn flow_index_constructor_registers_occupied_storage() {
+        fn flow_index_constructor_registers_occupied_storage_at_first_sync() {
+            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
             let (local, remote) = endpoints();
             let mut set = TcpSet::new(vec![]);
             set.add(listener(local.port));
             set.add(connected(local, remote));
             let mut set = TcpSet::new(set.sockets);
+            set.check_flow_index();
+            assert_eq!(set.tcp_lookup(local, remote, true), None);
+            iface.classify_dirty(&mut set, Instant::ZERO);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, true), Some(1));
             assert_eq!(set.tcp_lookup(local, remote, false), Some(1));

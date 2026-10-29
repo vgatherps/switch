@@ -501,12 +501,10 @@ pub struct Socket<'a> {
     in_rto_loss_episode: bool,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
     remote_has_sack: bool,
-    /// The dispatching interface's owned set holds the tuple's local address: false when the
-    /// tuple is set, resolved by the first egress dispatch whose interface-address compare
-    /// misses. The owned set is fixed for the interface's life, so later dispatches need no
-    /// search. Resolved against the interface that dispatches, not the context given at
-    /// connect or accept, which could be another interface's. Sits in the slot line egress
-    /// already reads for hop_limit and the next hop.
+    /// The tuple's local address is in the owned set of the interface that registered its flow
+    /// (`admit_local`), not of the context given at connect, which could be another interface's.
+    /// The owned set is fixed for the interface's life, so egress needs no search. Sits in the
+    /// slot line egress already reads for hop_limit and the next hop.
     local_owned: bool,
     timer: Timer,
     /// Delayed ack timer. If set, packets containing exclusively
@@ -1109,6 +1107,24 @@ impl<'a> Socket<'a> {
         self.reset_by_peer
     }
 
+    /// Checks a new tuple's local address against the interface registering its flow, once per
+    /// tuple: the interface's own address clears `local_owned`, an owned one sets it, and any
+    /// other resets the socket without an RST (the address is not ours to send from). Returns
+    /// whether the tuple stands.
+    pub(crate) fn admit_local(&mut self, cx: &Context) -> bool {
+        let local = self.tuple.expect("admit_local needs a tuple").local.addr;
+        if cx.has_interface_addr(local) {
+            self.local_owned = false;
+        } else if cx.owns(local) {
+            self.local_owned = true;
+        } else {
+            net_debug!("local address {} is not ours, closing socket", local);
+            self.reset();
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn reset(&mut self) {
         self.rx_buffer.store.clear();
         self.rx_fin_received = false;
@@ -1233,7 +1249,6 @@ impl<'a> Socket<'a> {
             remote: remote_endpoint,
         };
         self.tuple = Some(tuple);
-        self.local_owned = false;
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
         self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
@@ -2515,7 +2530,8 @@ impl<'a> Socket<'a> {
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 };
                 self.tuple = Some(tuple);
-                self.local_owned = false;
+                // The SYN reached a listener only because its destination is ours.
+                self.local_owned = !cx.has_interface_addr(tuple.local.addr);
                 self.local_seq_no = Self::random_seq_no(cx, tuple);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_win_seq = repr.seq_number;
@@ -3081,15 +3097,11 @@ impl<'a> Socket<'a> {
         // Check if the interface still has our source IP address.
         // If not (e.g. the interface's IP changed), reset the socket.
         // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP. An owned address never goes away: its
-        // one search per connection is cached in local_owned.
+        // an RST packet with the now-invalid source IP. An owned address never goes away.
         if !cx.has_interface_addr(tuple.local.addr) && !self.local_owned {
-            if !cx.owns(tuple.local.addr) {
-                net_debug!("source IP address no longer available, closing socket");
-                self.reset();
-                return Ok(());
-            }
-            self.local_owned = true;
+            net_debug!("source IP address no longer available, closing socket");
+            self.reset();
+            return Ok(());
         }
 
         if self.timer.should_close(cx.now()) {

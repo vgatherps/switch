@@ -196,9 +196,9 @@ pub struct Config {
     pub neighbor_capacity: usize,
 
     /// Addresses the interface owns besides its own: it answers ARP, ICMP echo, UDP and TCP for
-    /// them. Fixed for the interface's life (a connection caches, at its first egress dispatch,
-    /// whether its local address is in it). It does not route traffic: replies leave toward the peer as for the
-    /// interface address. Defaults to empty.
+    /// them. Fixed for the interface's life (a connection records whether its local address is
+    /// in it when its flow is registered). It does not route traffic: replies leave toward the
+    /// peer as for the interface address. Defaults to empty.
     pub owned_ipv4: OwnedIpv4,
 
     /// Set the Hardware address the interface will use.
@@ -397,7 +397,7 @@ impl Interface {
 
         self.poll_maintenance(timestamp);
 
-        sockets.sync_dirty_identities();
+        sockets.sync_dirty_identities(&self.inner);
 
         // Process ingress while there's packets available.
         loop {
@@ -465,7 +465,7 @@ impl Interface {
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
-        sockets.sync_dirty_identities();
+        sockets.sync_dirty_identities(&self.inner);
 
         self.socket_ingress(
             device,
@@ -486,7 +486,7 @@ impl Interface {
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
-        tcp.sync_dirty_identities();
+        tcp.sync_dirty_identities(&self.inner);
 
         self.socket_ingress(device, tcp, Some(udp))
     }
@@ -835,7 +835,7 @@ impl Interface {
                 // Inside dispatch, a flow key change requires a state change. Timers (close,
                 // TIME_WAIT end, RTO abort) change readiness only through the state.
                 if state_changed {
-                    sockets.sync_identity(index);
+                    sockets.resync_identity(index);
                     sockets.check_reapable(index);
                     sockets.fire(index);
                 } else {
@@ -967,7 +967,7 @@ fn classify_dirty(
             sockets.slot_visits += 1;
         }
         let index = sockets.dirty_list[position];
-        sockets.sync_identity(index);
+        sockets.sync_identity(inner, index);
         classify(inner, sockets, index, timestamp);
     }
     if admit {
