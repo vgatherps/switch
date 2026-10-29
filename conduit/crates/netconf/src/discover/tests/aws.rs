@@ -656,13 +656,15 @@ fn aws_prefix_holding_the_gateway_is_rejected() {
     assert!(error.starts_with("owned_ipv4[2]:"), "{error}");
 }
 
-/// An AWS rediscovery replaces the owned addresses with the current ones and reports the change.
+/// An AWS rediscovery replaces the owned addresses with the current ones and reports every entry
+/// it drops, including a hand-added one IMDS does not list, and every entry it adds.
 #[test]
 fn aws_rediscover_replaces_and_reports_owned_ipv4() {
     let tree = Tree::new();
-    let previous = aws(&tree, &with_prefixes((404, "")), &addresses())
+    let mut previous = aws(&tree, &with_prefixes((404, "")), &addresses())
         .unwrap()
         .config;
+    previous.owned_ipv4.extend(cidrs(&["172.16.0.9/32"]));
     let discovered = aws(&tree, &with_prefixes((200, "10.0.1.48/28\n")), &addresses()).unwrap();
     let path = tree.dir.join("config.json");
     fs::write(&path, previous.to_json()).unwrap();
@@ -673,7 +675,10 @@ fn aws_rediscover_replaces_and_reports_owned_ipv4() {
         Config::load(&path).unwrap().owned_ipv4,
         discovered.config.owned_ipv4
     );
-    assert_eq!(String::from_utf8(output).unwrap(), "changed: owned_ipv4\n");
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "changed: owned_ipv4\nowned_ipv4 removed: 172.16.0.9/32\nowned_ipv4 added: 10.0.1.48/28\n"
+    );
 }
 
 /// Kernel discovery does not list owned addresses: a rediscovery keeps the configured ones, like

@@ -92,8 +92,20 @@ pub fn write(
         .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
     file.write_all(config.to_json().as_bytes())
         .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
+    let report = |changes: &mut dyn Write, line: std::fmt::Arguments| {
+        writeln!(changes, "{line}").map_err(|e| ConfigError(e.to_string()))
+    };
     for key in changed {
-        writeln!(changes, "changed: {key}").map_err(|e| ConfigError(e.to_string()))?;
+        report(changes, format_args!("changed: {key}"))?;
+        if key == "owned_ipv4" {
+            let old = &previous.expect("a changed key has a previous config").owned_ipv4;
+            for cidr in old.iter().filter(|cidr| !config.owned_ipv4.contains(cidr)) {
+                report(changes, format_args!("owned_ipv4 removed: {cidr}"))?;
+            }
+            for cidr in config.owned_ipv4.iter().filter(|cidr| !old.contains(cidr)) {
+                report(changes, format_args!("owned_ipv4 added: {cidr}"))?;
+            }
+        }
     }
     Ok(())
 }
