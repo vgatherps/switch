@@ -993,10 +993,10 @@ whole-datagram send failures:
 
 UDP invalid destinations include unspecified or multicast addresses, our own interface address, port
 zero, and broadcast without `broadcast: true`. The order is: the destination and size checks, an
-empty frame pool for a copy (`WouldBlock`), the neighbor lookup (`NoRoute`, `NeighborPending`; an
-ARP request needs a TX packet), then a full pending queue (`WouldBlock`). A full pending queue
-therefore cannot hide an unresolved route or neighbor. UDP receive reports drops through
-counters, not per-read errors.
+empty frame pool for a copy (`WouldBlock`), the neighbor lookup (`NoRoute`, `NeighborPending`), then
+a full pending queue (`WouldBlock`). One exception: the first ARP request for a neighbor needs a TX
+packet, so with the pending queue full that send is `WouldBlock`, not `NeighborPending`; the ARP
+request goes out on a later send. UDP receive reports drops through counters, not per-read errors.
 
 ### Panics and recovery
 
