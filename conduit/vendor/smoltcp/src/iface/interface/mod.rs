@@ -303,6 +303,11 @@ impl Interface {
         self.inner.ip_addrs.as_ref()
     }
 
+    /// Whether `addr` is one of the interface's addresses or in its owned set.
+    pub fn has_ip_addr(&self, addr: IpAddress) -> bool {
+        self.inner.has_ip_addr(addr)
+    }
+
     /// Get the first IPv4 address if present.
     #[cfg(test)]
     pub(crate) fn ipv4_addr(&self) -> Option<Ipv4Address> {

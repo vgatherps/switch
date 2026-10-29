@@ -229,3 +229,58 @@ fn stack_new_validates_owned_addresses() {
         finish(fixture, stack);
     });
 }
+
+/// `Stack::listen` refuses an explicit local address we do not own with `Unaddressable` and
+/// changes nothing: a closed socket stays closed with its endpoint, capacities and receive
+/// room; a listening socket keeps listening on its owned address. A peer then connects to that
+/// owned address and the connection's local endpoint is it.
+#[zhida_test_support::pinned_test]
+fn listen_refuses_unowned_address_and_accepts_on_owned() {
+    use dpdk_smoltcp::smoltcp::socket::tcp::{ListenError, State};
+    use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint};
+    use zhida_test_kit::pair::{self, tcp_socket_sized, App, Pair, Side};
+
+    with_eal(|eal| {
+        let owned_ip = Ipv4Address::new(10, 0, 0, 77);
+        let owned = [Ipv4Cidr::new(owned_ip, 32)];
+        let configs = [pair::config(Side::A), StackConfig { owned_ipv4: &owned, ..pair::config(Side::B) }];
+        let mut pair = Pair::new(eal, ["ownla", "ownlb"], configs, pair::T0);
+        let server = pair.b.add_tcp(tcp_socket_sized(4096)).unwrap();
+        let snapshot = |stack: &Stack| {
+            let socket = stack.tcp(&server);
+            (
+                socket.state(),
+                socket.listen_endpoint(),
+                socket.local_endpoint(),
+                socket.recv_capacity(),
+                socket.send_capacity(),
+                socket.recv_room(),
+            )
+        };
+        let before = snapshot(&pair.b);
+        for foreign in [Side::A.ip(), Ipv4Address::new(10, 0, 0, 78), Ipv4Address::new(192, 0, 2, 1)] {
+            assert_eq!(pair.b.listen(&server, (foreign, 80)), Err(ListenError::Unaddressable));
+            assert_eq!(snapshot(&pair.b), before, "{foreign}");
+        }
+        pair.b.listen(&server, (owned_ip, 80)).unwrap();
+        let listening = snapshot(&pair.b);
+        assert_eq!((listening.0, listening.1), (State::Listen, IpListenEndpoint::from((owned_ip, 80))));
+        assert_eq!(pair.b.listen(&server, (Side::A.ip(), 80)), Err(ListenError::Unaddressable));
+        assert_eq!(snapshot(&pair.b), listening);
+        pair.b.listen(&server, (Side::B.ip(), 81)).unwrap_err();
+        assert_eq!(snapshot(&pair.b), listening);
+
+        let client = pair.a.add_tcp(tcp_socket_sized(4096)).unwrap();
+        pair.a.connect(&client, IpEndpoint::new(owned_ip.into(), 80), 49152).unwrap();
+        pair.drive(|_, _| {}, |a, b| {
+            if a.tcp(&client).state() == State::Established && b.tcp(&server).state() == State::Established {
+                App::Done
+            } else {
+                App::Idle
+            }
+        });
+        assert_eq!(pair.b.tcp(&server).local_endpoint(), Some(IpEndpoint::new(owned_ip.into(), 80)));
+        assert_eq!(pair.a.tcp(&client).remote_endpoint(), Some(IpEndpoint::new(owned_ip.into(), 80)));
+        pair.close();
+    });
+}

@@ -797,13 +797,23 @@ impl Stack {
         Ok(())
     }
 
-    /// `tcp::Socket::listen`. A failed listen leaves the socket unchanged.
+    /// `tcp::Socket::listen`, refusing an explicit local address that is
+    /// neither `StackConfig::ipv4`'s address nor in `StackConfig::owned_ipv4`
+    /// (`Unaddressable`). A failed listen leaves the socket unchanged.
+    ///
+    /// `tcp_mut(handle).listen(..)` does not check the address; such a
+    /// listener never receives a SYN, because a segment to an address we do
+    /// not own is dropped before any listener is consulted.
     pub fn listen<T: Into<IpListenEndpoint>>(
         &mut self,
         handle: &TcpHandle,
         local: T,
     ) -> Result<(), tcp::ListenError> {
         let raw = self.tcp_raw(handle);
+        let local = local.into();
+        if local.addr.is_some_and(|addr| !self.iface.has_ip_addr(addr)) {
+            return Err(tcp::ListenError::Unaddressable);
+        }
         let socket = self.sockets.get_mut(raw);
         socket.listen(local)?;
         Ok(())

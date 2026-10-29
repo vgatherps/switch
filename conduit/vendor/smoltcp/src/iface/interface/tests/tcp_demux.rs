@@ -2289,3 +2289,33 @@ fn flows_only_exist_for_owned_addresses() {
         assert!(iface.inner.has_ip_addr(local.addr), "flow on {local}");
     }
 }
+
+/// A listener bound through the raw `Socket::listen` to an address we do not own never gets a
+/// SYN: no SYN-ACK, no RST, no flow, the socket stays in Listen. A SYN to an owned address on
+/// the same port goes to the matching listener.
+#[test]
+fn raw_listener_on_unowned_address_never_gets_a_syn() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let foreign = Ipv4Address::new(192, 168, 1, 3);
+    let owned = Ipv4Address::new(10, 9, 0, 2);
+    let mut unowned = socket();
+    unowned.listen((foreign, LOCAL_PORT)).unwrap();
+    let unowned = sockets.add(unowned);
+    let mut on_owned = socket();
+    on_owned.listen((owned, LOCAL_PORT)).unwrap();
+    let on_owned = sockets.add(on_owned);
+    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), foreign));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(unowned).state(), tcp::State::Listen);
+    assert_eq!(sockets.get(unowned).local_endpoint(), None);
+    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (src, synack) = reply_from(&bytes);
+    assert_eq!(src, owned);
+    assert_control(&synack, LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 1));
+    assert_eq!(sockets.get(unowned).state(), tcp::State::Listen);
+    assert_eq!(sockets.get(on_owned).state(), tcp::State::SynReceived);
+}
