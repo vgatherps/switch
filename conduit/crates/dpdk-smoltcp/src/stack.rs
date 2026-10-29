@@ -296,7 +296,7 @@ impl Stack {
         Ok(Self {
             iface,
             sockets: TcpSet::new(storage),
-            udp: UdpSet::new(config.max_udp_sockets),
+            udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
             removed_held: Vec::new(),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
             dropped_tcp: Vec::with_capacity(config.max_sockets),
@@ -659,7 +659,11 @@ impl Stack {
     /// `udp_send_frame`. `to` may be omitted for a connected socket. The packet
     /// leaves on `flush`, or the flush inside `turn`, `receive` or `send`.
     ///
-    /// `WouldBlock` means the pending queue or TX pool is full: flush, then retry.
+    /// The payload is copied into a frame from this Stack's frame pool, then sent as
+    /// `udp_send_frame` sends a unique frame. Errors come in this order: the destination
+    /// and size checks (`NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`),
+    /// `WouldBlock` for an empty frame pool, the neighbor lookup (`NoRoute`,
+    /// `NeighborPending`), then `WouldBlock` for a full pending queue: flush, then retry.
     /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue
     /// also blocks ingress (packets stay in `Turn::rx_staged`) if the PMD refuses its frames;
     /// `receive` and `turn` flush first but can remain blocked if TX cannot progress.
@@ -680,13 +684,14 @@ impl Stack {
     /// socket. On success the frame is the Stack's. A unique frame goes out in
     /// place: its headers are written in front of its payload and its mbuf
     /// joins the shared pending FIFO in call order, freed after TX completion.
-    /// A shared frame (cloned by the app) is copied into a TX packet as
+    /// A shared frame (cloned by the app) is copied into a new frame-pool frame as
     /// `udp_send` does, and this reference is dropped. A zero-length frame is
     /// an empty datagram.
     ///
     /// Every error returns the frame untouched. `Foreign`: the frame is from
-    /// another Stack's pool. Then `udp_send`'s errors in its order;
-    /// `WouldBlock` means flush, then retry.
+    /// another Stack's pool. Then `udp_send`'s errors in its order, except that
+    /// a unique frame needs no frame-pool copy and so cannot report the empty
+    /// pool; `WouldBlock` means flush, then retry.
     pub fn udp_send_frame(
         &mut self,
         handle: &UdpHandle,

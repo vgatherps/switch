@@ -1175,7 +1175,7 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
             let mut tcp = TcpSet::new(Vec::new());
             iface.poll_ingress_single(NOW, &mut device, &mut tcp);
             assert!(device.tx.is_empty());
-            let mut udp = UdpSet::new(1);
+            let mut udp = UdpSet::new(1, device.frame_source());
             let handle = udp
                 .add(UdpConfig {
                     port: 49152,
@@ -1283,7 +1283,7 @@ fn udp_template_frames_match_generic_and_flags() {
             let mut tcp = TcpSet::new(Vec::new());
             iface.poll_ingress_single(NOW, &mut device, &mut tcp);
             assert!(device.tx.is_empty());
-            let mut udp = UdpSet::new(1);
+            let mut udp = UdpSet::new(1, device.frame_source());
             let handle = udp
                 .add(UdpConfig {
                     port: 49152,
@@ -3099,7 +3099,7 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
                 enable_tx_udp_checksum(&mut device.port);
             }
             let mut iface = udp_iface(&fixture, &mut device);
-            let mut udp = UdpSet::new(1);
+            let mut udp = UdpSet::new(1, device.frame_source());
             let to = IpEndpoint::new(Side::B.ip().into(), 80);
             let room = usize::from(device.frame_pool().room());
             assert_eq!(room, FRAME - 42);
@@ -3144,11 +3144,12 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
     });
 }
 
-/// A shared frame (the app keeps a clone) is copied into one TX-pool packet
-/// with the unique path's bytes and metadata; its own mbuf is never written
-/// and drops back to refcount 1 when the send releases the sent reference.
+/// A shared frame (the app keeps a clone) is copied into one new frame-pool
+/// frame with the unique path's bytes and metadata; its own mbuf is never
+/// written and drops back to refcount 1 when the send releases the sent
+/// reference. The TX pool is not used.
 #[zhida_test_support::pinned_test]
-fn udp_shared_frame_copies_into_a_tx_packet() {
+fn udp_shared_frame_copies_into_a_new_frame() {
     use smoltcp::iface::UdpSet;
     use smoltcp::wire::IpEndpoint;
 
@@ -3159,7 +3160,7 @@ fn udp_shared_frame_copies_into_a_tx_packet() {
                 enable_tx_udp_checksum(&mut device.port);
             }
             let mut iface = udp_iface(&fixture, &mut device);
-            let mut udp = UdpSet::new(1);
+            let mut udp = UdpSet::new(1, device.frame_source());
             let handle = udp_socket(&mut udp, 49152, true);
             let to = IpEndpoint::new(Side::B.ip().into(), 80);
             let payload = b"shared datagram";
@@ -3172,6 +3173,7 @@ fn udp_shared_frame_copies_into_a_tx_packet() {
 
             let (kept, raw) = app_frame(&device, payload);
             let before = frame_mbuf_state(raw);
+            let tx_in_use = in_use(&device.port).1;
             assert_eq!(refcnt(raw), 1);
             assert!(send_udp_frame(&mut iface, &mut device, &mut udp, handle, to, kept.clone()).is_ok());
             assert_eq!(frame_mbuf_state(raw), before);
@@ -3179,11 +3181,12 @@ fn udp_shared_frame_copies_into_a_tx_packet() {
             assert_eq!(device.pending(), 1);
             let m = unsafe { &*device.tx[0].as_ptr() };
             assert_ne!(device.tx[0].as_ptr(), raw);
-            assert_ne!(m.pool, device.frame_pool().mempool());
+            assert_eq!(m.pool, device.frame_pool().mempool());
             assert_eq!(m.nb_segs(), 1);
             assert_eq!(device.tx[0].data(), unique_bytes);
             assert_eq!(tx_metadata(&device.tx[0]), unique_metadata);
-            assert_eq!(frame_in_use(&device), 1);
+            assert_eq!(frame_in_use(&device), 2);
+            assert_eq!(in_use(&device.port).1, tx_in_use);
             assert_eq!(device.flush(), Ok(1));
             assert_eq!(ring_bytes(&fixture), [unique_bytes]);
             assert_eq!(kept.payload(), payload);
@@ -3195,7 +3198,7 @@ fn udp_shared_frame_copies_into_a_tx_packet() {
 }
 
 /// UDP broadcast of one payload: one frame cloned for 8 sockets, each clone
-/// sent on its own socket. Every NIC-bound packet is a single-segment TX-pool
+/// sent on its own socket. Every NIC-bound packet is a single-segment frame-pool
 /// copy with that socket's headers and the same payload; the frame mbuf is
 /// never published and its refcount steps down by one per send. Draining the
 /// ring frees each copy once; the frame is freed once when the app drops it.
@@ -3209,13 +3212,14 @@ fn udp_broadcast_clones_copy_once_per_socket() {
         let (fixture, mut device) = open(eal, 4, N);
         enable_tx_udp_checksum(&mut device.port);
         let mut iface = udp_iface(&fixture, &mut device);
-        let mut udp = UdpSet::new(N);
+        let mut udp = UdpSet::new(N, device.frame_source());
         let handles: Vec<_> = (0..N).map(|i| udp_socket(&mut udp, 49152 + i as u16, true)).collect();
         let to = IpEndpoint::new(Side::B.ip().into(), 80);
         let payload = b"one payload for every socket";
         let (frame, raw) = app_frame(&device, payload);
         let before = frame_mbuf_state(raw);
         let clones: Vec<_> = (0..N).map(|_| frame.clone()).collect();
+        let tx_in_use = in_use(&device.port).1;
         assert_eq!(refcnt(raw), N as u16 + 1);
         for (i, (clone, &handle)) in clones.into_iter().zip(&handles).enumerate() {
             assert!(send_udp_frame(&mut iface, &mut device, &mut udp, handle, to, clone).is_ok());
@@ -3223,12 +3227,11 @@ fn udp_broadcast_clones_copy_once_per_socket() {
             assert_eq!(frame_mbuf_state(raw), before);
         }
         assert_eq!(device.pending(), N);
-        assert_eq!(in_use(&device.port).1, N as u32);
-        assert!(device.spare.is_none());
+        assert_eq!(in_use(&device.port).1, tx_in_use);
         for (i, packet) in device.tx.iter().enumerate() {
             let m = unsafe { &*packet.as_ptr() };
             assert_ne!(packet.as_ptr(), raw);
-            assert_ne!(m.pool, device.frame_pool().mempool());
+            assert_eq!(m.pool, device.frame_pool().mempool());
             assert_eq!(m.nb_segs(), 1);
             assert_eq!(tx_metadata(packet), UDP_OFFLOAD);
             let ip = Ipv4Packet::new_checked(&packet.data()[14..]).unwrap();
@@ -3236,13 +3239,14 @@ fn udp_broadcast_clones_copy_once_per_socket() {
             assert_eq!((datagram.src_port(), datagram.dst_port()), (49152 + i as u16, 80));
             assert_eq!(datagram.payload(), payload);
         }
-        assert_eq!(frame_in_use(&device), 1);
+        assert_eq!(frame_in_use(&device), 1 + N as u32);
         // The fixture's TX ring holds 7: the ring consumer frees each burst.
         assert_eq!(device.flush(), Ok(N - 1));
         assert_eq!(ring_bytes(&fixture).len(), N - 1);
         assert_eq!(device.flush(), Ok(1));
         assert_eq!(ring_bytes(&fixture).len(), 1);
-        assert_eq!(in_use(&device.port), (0, 0));
+        assert_eq!(frame_in_use(&device), 1);
+        assert_eq!(in_use(&device.port), (0, tx_in_use));
         assert_eq!(frame_mbuf_state(raw), before);
         drop(frame);
         assert_eq!(frame_in_use(&device), 0);
@@ -3252,7 +3256,7 @@ fn udp_broadcast_clones_copy_once_per_socket() {
 
 /// Every refusal returns the frame with its mbuf untouched and queues no
 /// data: a full pending queue (unique frame, template and generic), an empty
-/// TX pool for a shared frame's copy, no route, and a pending neighbor. A
+/// frame pool for a shared frame's copy, no route, and a pending neighbor. A
 /// unique frame's ARP request takes one pending slot; a rate-limited retry
 /// takes none.
 #[zhida_test_support::pinned_test]
@@ -3263,7 +3267,7 @@ fn udp_frame_refusals_write_nothing() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 1);
         let mut iface = udp_iface(&fixture, &mut device);
-        let mut udp = UdpSet::new(2);
+        let mut udp = UdpSet::new(2, device.frame_source());
         let templated = udp_socket(&mut udp, 49152, true);
         let fresh = udp_socket(&mut udp, 49153, true);
         let peer = IpEndpoint::new(Side::B.ip().into(), 80);
@@ -3304,9 +3308,8 @@ fn udp_frame_refusals_write_nothing() {
         assert_eq!(device.flush(), Ok(1));
         drop(ring_bytes(&fixture));
 
-        // TX pool empty: a shared frame's copy cannot get a packet.
-        let mut held: Vec<_> = device.spare.take().into_iter().collect();
-        held.extend(std::iter::from_fn(|| device.port.alloc_tx(FRAME as u16)));
+        // Frame pool empty: a shared frame's copy cannot get a frame.
+        let held: Vec<_> = std::iter::from_fn(|| device.frame_source().alloc()).collect();
         let clone = frame.clone();
         let clone = refused(&mut iface, &mut device, &mut udp, templated, peer, clone, raw, UdpSendError::WouldBlock);
         drop((clone, held));

@@ -2,7 +2,7 @@ use super::*;
 use crate::iface::header_template::UdpTemplate;
 use crate::iface::udp_set::PendingUdp;
 use crate::iface::{UdpHandle, UdpSendError, UdpSocket, UdpTarget};
-use crate::phy::{ChecksumCapabilities, TxFrame};
+use crate::phy::{ChecksumCapabilities, TxFrame, UniqueTxBuf};
 
 impl Interface {
     /// Check one UDP send of `len` payload bytes before any device work.
@@ -54,8 +54,10 @@ impl Interface {
         })
     }
 
-    /// Copy `payload` into one TX frame as a UDP datagram to `target`, which `udp_target` made
-    /// for `payload.len()` bytes. Errors are `WouldBlock`, `NoRoute` and `NeighborPending`.
+    /// Copy `payload` into a frame from the UDP set's frame source and send it as one datagram
+    /// to `target`, which `udp_target` made for `payload.len()` bytes. Errors are `WouldBlock`,
+    /// `NoRoute` and `NeighborPending`, in `udp_send_frame`'s order; an empty frame source is
+    /// `WouldBlock` before the neighbor lookup.
     ///
     /// Panics if `payload` is not the target's length, the interface medium is not Ethernet
     /// or the target's handle is stale.
@@ -66,103 +68,19 @@ impl Interface {
         target: UdpTarget,
         payload: &[u8],
     ) -> Result<(), UdpSendError> {
-        let UdpTarget {
-            handle,
-            to,
-            dst_addr,
-            len,
-        } = target;
-        let socket = udp.get_mut(handle);
-        let now = self.inner.now;
-        self.inner.neighbor_cache.expire(now);
-        let mut token = device.transmit(now).ok_or(UdpSendError::WouldBlock)?;
-        let src_mac = self.inner.hardware_addr.ethernet_or_panic();
-        let (ip_repr, udp_repr, checksum_caps) = self.inner.udp_reprs(socket, to, dst_addr, len);
-        if let Some(ip_repr) = &ip_repr
-            && let Some(template) = &socket.template
-            && template.fits(
-                self.inner.neighbor_cache.changes(),
-                src_mac,
-                ip_repr,
-                &udp_repr,
-            )
-        {
-            let mut meta = PacketMeta::default();
-            meta.tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(*ip_repr), 0);
-            token.set_meta(meta);
-            token.consume(
-                34usize
-                    .checked_add(ip_repr.payload_len)
-                    .expect("UDP frame length overflow"),
-                |frame| template.emit(frame, ip_repr, payload, &checksum_caps),
-            );
-            #[cfg(test)]
-            {
-                udp.template_frames = udp
-                    .template_frames
-                    .checked_add(1)
-                    .expect("UDP template frame count overflow");
-            }
-            self.inner.dispatch_neighbor_probe(device);
-            return Ok(());
-        }
-        let mut next_hop = None;
-        let (hardware_addr, mut token) = self
-            .inner
-            .lookup_hardware_addr(token, &to.addr, Some(&mut next_hop))
-            .map_err(udp_dispatch_error)?;
-        let ip_repr = ip_repr.ok_or(UdpSendError::NoRoute)?;
-        let mut meta = PacketMeta::default();
-        meta.tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(ip_repr), 0);
-        token.set_meta(meta);
-        self.inner.dispatch_ethernet(
-            token,
-            ip_repr
-                .buffer_len()
-                .checked_add(ip_repr.payload_len)
-                .expect("IPv4 length overflow"),
-            |mut frame| {
-                frame.set_dst_addr(hardware_addr.ethernet_or_panic());
-                frame.set_ethertype(EthernetProtocol::Ipv4);
-                ip_repr.emit(
-                    &mut Ipv4Packet::new_unchecked(frame.payload_mut()),
-                    &checksum_caps,
-                );
-                udp_repr.emit(
-                    &mut UdpPacket::new_unchecked(
-                        &mut frame.payload_mut()[ip_repr.buffer_len()..],
-                    ),
-                    &ip_repr.src_addr.into(),
-                    &to.addr,
-                    len,
-                    |out| out.copy_from_slice(payload),
-                    &checksum_caps,
-                );
-            },
-        );
-        if let Some((changes, mac)) = next_hop {
-            socket.template = Some(UdpTemplate::new(
-                src_mac,
-                mac,
-                &ip_repr,
-                udp_repr.src_port,
-                udp_repr.dst_port,
-                changes,
-            ));
-        }
-        self.inner.dispatch_neighbor_probe(device);
-        Ok(())
+        let frame = udp_copy(udp, target.len, payload)?;
+        self.udp_send_unique(device, udp, target, frame)
+            .map_err(|(_, error)| error)
     }
 
     /// Send `frame` as one UDP datagram to `target`, made for `frame.len()` payload bytes.
     /// A unique frame is published in place: its headers go in front of its payload and its
-    /// only reference moves to the device. A shared frame's payload is copied through
-    /// `udp_send`; on success this reference is dropped.
-    /// Errors are `WouldBlock`, `NoRoute` and `NeighborPending`, each with the frame back.
-    /// For a unique frame the neighbor lookup runs first and takes a TX token only to send an
-    /// ARP request; the publish slot is taken after it. A shared frame keeps `udp_send`'s
-    /// order: its token comes first, so an exhausted device reports `WouldBlock` before any
-    /// lookup error.
+    /// only reference moves to the device. A shared frame's payload is copied into a frame from
+    /// the UDP set's frame source, as `udp_send` does; on success this reference is dropped.
+    /// Errors are `WouldBlock`, `NoRoute` and `NeighborPending`, each with the frame back. The
+    /// neighbor lookup runs first and takes a TX token only to send an ARP request; the publish
+    /// slot is taken after it, so a full device reports `WouldBlock` only for a resolved
+    /// neighbor. A shared frame with an empty frame source is `WouldBlock` before the lookup.
     ///
     /// `target` must be `udp_target`'s for `frame.len()` bytes, at most 65527.
     ///
@@ -176,15 +94,42 @@ impl Interface {
     ) -> Result<(), (TxFrame, UdpSendError)> {
         debug_assert_eq!(frame.len(), target.len, "UDP frame length is not its target's");
         debug_assert!(UDP_HEADER_LEN + frame.len() <= usize::from(u16::MAX));
-        let mut frame = match frame.into_unique() {
-            Ok(frame) => frame,
-            Err(shared) => {
-                return match self.udp_send(device, udp, target, shared.payload()) {
-                    Ok(()) => Ok(()),
-                    Err(error) => Err((shared, error)),
-                };
-            }
+        match frame.into_unique() {
+            Ok(unique) => self
+                .udp_send_unique(device, udp, target, unique)
+                .map_err(|(unique, error)| (unique.into_frame(), error)),
+            Err(shared) => self.udp_send_shared(device, udp, target, shared),
+        }
+    }
+
+    /// `udp_send_frame` for a shared frame: send a copy; errors give the shared frame back.
+    /// Out of line so the unique path stays small.
+    #[cold]
+    #[inline(never)]
+    fn udp_send_shared(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        udp: &mut UdpSet,
+        target: UdpTarget,
+        shared: TxFrame,
+    ) -> Result<(), (TxFrame, UdpSendError)> {
+        let copy = match udp_copy(udp, target.len, shared.payload()) {
+            Ok(copy) => copy,
+            Err(error) => return Err((shared, error)),
         };
+        self.udp_send_unique(device, udp, target, copy)
+            .map_err(|(_, error)| (shared, error))
+    }
+
+    /// Publish the unique `frame` as one UDP datagram to `target`; errors give it back.
+    #[inline(always)]
+    fn udp_send_unique(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        udp: &mut UdpSet,
+        target: UdpTarget,
+        mut frame: UniqueTxBuf,
+    ) -> Result<(), (UniqueTxBuf, UdpSendError)> {
         let UdpTarget {
             handle,
             to,
@@ -206,7 +151,7 @@ impl Interface {
             )
         {
             let Some(token) = device.transmit_frame(now) else {
-                return Err((frame.into_frame(), UdpSendError::WouldBlock));
+                return Err((frame, UdpSendError::WouldBlock));
             };
             let tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(*ip_repr), 0);
             let (headers, payload) = frame.headroom_mut(UDP_FRAME_HEADER_LEN);
@@ -227,21 +172,21 @@ impl Interface {
             Ok(HardwareLookup::Found(hardware_addr)) => hardware_addr,
             Ok(HardwareLookup::Arp(addr)) => {
                 let Some(token) = device.transmit(now) else {
-                    return Err((frame.into_frame(), UdpSendError::WouldBlock));
+                    return Err((frame, UdpSendError::WouldBlock));
                 };
                 let error = match self.inner.send_arp_request(token, addr) {
                     Ok(()) => UdpSendError::NeighborPending,
                     Err(error) => udp_dispatch_error(error),
                 };
-                return Err((frame.into_frame(), error));
+                return Err((frame, error));
             }
-            Err(error) => return Err((frame.into_frame(), udp_dispatch_error(error))),
+            Err(error) => return Err((frame, udp_dispatch_error(error))),
         };
         let Some(ip_repr) = ip_repr else {
-            return Err((frame.into_frame(), UdpSendError::NoRoute));
+            return Err((frame, UdpSendError::NoRoute));
         };
         let Some(token) = device.transmit_frame(now) else {
-            return Err((frame.into_frame(), UdpSendError::WouldBlock));
+            return Err((frame, UdpSendError::WouldBlock));
         };
         let tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(ip_repr), 0);
         let (headers, payload) = frame.headroom_mut(UDP_FRAME_HEADER_LEN);
@@ -269,6 +214,17 @@ impl Interface {
         Ok(())
     }
 }
+
+/// A unique frame from `udp`'s frame source holding `payload`, which must be `len` bytes.
+/// `WouldBlock` when the source is empty.
+#[inline]
+fn udp_copy(udp: &UdpSet, len: usize, payload: &[u8]) -> Result<UniqueTxBuf, UdpSendError> {
+    let mut frame = udp.source.alloc_unique().ok_or(UdpSendError::WouldBlock)?;
+    frame.room_mut()[..len].copy_from_slice(payload);
+    frame.set_len(len);
+    Ok(frame)
+}
+
 
 impl InterfaceInner {
     /// One send's IPv4 header (`None` without a source address for `dst_addr`), UDP ports and

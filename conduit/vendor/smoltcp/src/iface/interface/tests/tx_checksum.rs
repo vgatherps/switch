@@ -240,7 +240,7 @@ fn udp_direct_and_template_carry_checksum_metadata() {
     for offload in [true, false] {
         for tx_checksum in [true, false] {
             let (mut iface, _, mut device) = setup_recording(offload);
-            let mut udp = UdpSet::new(1);
+            let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
             let handle = udp
                 .add(UdpConfig {
                     port: 40000,
@@ -284,7 +284,7 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
     for offload in [true, false] {
         for tx_checksum in [true, false] {
             let (mut iface, _, mut device) = setup_recording(offload);
-            let mut udp = UdpSet::new(1);
+            let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
             let handle = udp
                 .add(UdpConfig {
                     port: 40000,

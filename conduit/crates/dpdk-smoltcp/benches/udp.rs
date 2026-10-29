@@ -2,7 +2,7 @@
 //! A sends to B with software UDP checksums (csum) or zero UDP checksums
 //! (nocsum). Payloads are 64, 512 or 1472 bytes; bursts are 1, 8 or 32 frames.
 //! send_copy times payload writes into the app's own buffer, k
-//! `udp_send(&[u8])` calls that copy it into a TX packet, and one flush.
+//! `udp_send(&[u8])` calls that copy it into a frame-pool frame, and one flush.
 //! send_frame times k `Stack::tx_frame` allocations, the same payload writes
 //! into each frame, k `udp_send_frame` calls (unique frames, published in
 //! place) and one flush. Both share the receive side and checks.

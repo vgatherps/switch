@@ -379,7 +379,8 @@ leave room for that.
 ### TX pool
 
 TCP send queues hold frames from the frame pool (below); the TX pool holds ACKs, ARP, RSTs and
-copied segments (cuts, merged small frames, retransmissions of more than one frame, shared frames).
+copied TCP segments (cuts, merged small frames, retransmissions of more than one frame, shared
+frames). UDP copies (`udp_send`, shared frames in `udp_send_frame`) take frame-pool frames.
 `tx_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum TX pool count:
 
 ```text
@@ -801,8 +802,8 @@ successful call queues the whole datagram frame in the shared pending FIFO. Zero
 allowed. Payload length must be at most path MTU minus 28 (1472 at MTU 1500); there is no
 fragmentation. `udp_send_frame` returns the frame untouched with every error, and `Foreign` for a
 frame from another Stack. `NeighborPending` can queue an ARP
-request but drops the datagram; flush, receive ARP replies, and retry. `WouldBlock` means no TX
-packet or pending slot is available; flush and retry. Flush at least every `StackConfig::tx_pending`
+request but drops the datagram; flush, receive ARP replies, and retry. `WouldBlock` means the frame
+pool has no frame for a copy, or no pending slot is available; flush and retry. Flush at least every `StackConfig::tx_pending`
 sends. The pending FIFO is shared with TCP and ingress replies and keeps frame-building order:
 TCP bytes written before a UDP call do not go first unless TCP egress runs. Keep calling `receive`
 or `turn` in a send loop to accept ARP replies and advance time.
@@ -991,11 +992,13 @@ whole-datagram send failures:
 | `TooLarge` | Payload exceeds the path IP MTU toward the destination minus 28 (the Port IP MTU minus 28 without a smaller `StackConfig::paths` rule). |
 | `NoRoute` | Destination outside the subnet and no gateway configured. |
 | `NeighborPending` | Next-hop address resolution has not completed. |
-| `WouldBlock` | Pending capacity or a TX packet is unavailable. |
+| `WouldBlock` | No frame-pool frame for a copy, or no pending slot. |
 
 UDP invalid destinations include unspecified or multicast addresses, our own interface address, port
-zero, and broadcast without `broadcast: true`. `WouldBlock` is checked before neighbor lookup, so it
-can hide an unresolved route or neighbor until capacity returns. UDP receive reports drops through
+zero, and broadcast without `broadcast: true`. The order is: the destination and size checks, an
+empty frame pool for a copy (`WouldBlock`), the neighbor lookup (`NoRoute`, `NeighborPending`; an
+ARP request needs a TX packet), then a full pending queue (`WouldBlock`). A full pending queue
+therefore cannot hide an unresolved route or neighbor. UDP receive reports drops through
 counters, not per-read errors.
 
 ### Panics and recovery

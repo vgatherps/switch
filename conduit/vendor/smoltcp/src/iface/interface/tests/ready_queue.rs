@@ -443,7 +443,7 @@ fn ingress_does_not_resync_processed_sockets() {
     sockets.slot_visits = 0;
     sockets.classify_calls = 0;
     sockets.dispatches.clear();
-    let mut udp = crate::iface::UdpSet::new(0);
+    let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
     for _ in 0..connections.len() {
         assert_eq!(
             iface.poll_ingress_single_udp(START, &mut device, &mut sockets, &mut udp),
@@ -468,7 +468,7 @@ fn ingress_does_not_resync_processed_sockets() {
 fn ingress_syncs_app_relisten_of_already_dirty_socket(#[case] use_iterator: bool) {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    let mut udp = crate::iface::UdpSet::new(0);
+    let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
     queue_segment(&iface, &mut device, segment(1234, TcpControl::None, 101, seq));
     assert_eq!(
         iface.poll_ingress_single_udp(START, &mut device, &mut sockets, &mut udp),
