@@ -590,11 +590,11 @@ pub struct Socket<'a> {
     orphaned: bool,
     /// An acceptable peer RST closed this connection; cleared by reset().
     reset_by_peer: bool,
-    /// The tuple's local address is in the interface's owned set, recorded when the tuple is
-    /// set (connect, accepted SYN). The set is fixed for the interface's life, so the egress
-    /// liveness check needs no search: a tuple only exists for one of our addresses (connect
-    /// refuses another, and a SYN reaches a listener only when addressed to us), and of those
-    /// only the interface addresses can go away.
+    /// The dispatching interface's owned set holds the tuple's local address: false when the
+    /// tuple is set, resolved by the first egress dispatch whose interface-address compare
+    /// misses. The owned set is fixed for the interface's life, so later dispatches need no
+    /// search. Resolved against the interface that dispatches, not the context given at
+    /// connect or accept, which could be another interface's.
     local_owned: bool,
 }
 
@@ -1232,7 +1232,7 @@ impl<'a> Socket<'a> {
             remote: remote_endpoint,
         };
         self.tuple = Some(tuple);
-        self.local_owned = cx.owns(local_endpoint.addr);
+        self.local_owned = false;
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
         self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
@@ -2514,7 +2514,7 @@ impl<'a> Socket<'a> {
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 };
                 self.tuple = Some(tuple);
-                self.local_owned = cx.owns(tuple.local.addr);
+                self.local_owned = false;
                 self.local_seq_no = Self::random_seq_no(cx, tuple);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_win_seq = repr.seq_number;
@@ -3080,11 +3080,15 @@ impl<'a> Socket<'a> {
         // Check if the interface still has our source IP address.
         // If not (e.g. the interface's IP changed), reset the socket.
         // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP. An owned address never goes away.
+        // an RST packet with the now-invalid source IP. An owned address never goes away: its
+        // one search per connection is cached in local_owned.
         if !cx.has_interface_addr(tuple.local.addr) && !self.local_owned {
-            net_debug!("source IP address no longer available, closing socket");
-            self.reset();
-            return Ok(());
+            if !cx.owns(tuple.local.addr) {
+                net_debug!("source IP address no longer available, closing socket");
+                self.reset();
+                return Ok(());
+            }
+            self.local_owned = true;
         }
 
         if self.timer.should_close(cx.now()) {
