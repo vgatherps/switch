@@ -36,6 +36,20 @@ pub(crate) enum Lifecycle {
 #[inline]
 fn unlikely() {}
 
+/// Append to a wake queue without a capacity check.
+///
+/// # Safety
+/// `queue.len() < queue.capacity()`.
+#[inline]
+unsafe fn append_reserved(queue: &mut Vec<*const TaskHeader>, header: *const TaskHeader) {
+    let len = queue.len();
+    debug_assert!(len < queue.capacity());
+    unsafe {
+        queue.as_mut_ptr().add(len).write(header);
+        queue.set_len(len + 1);
+    }
+}
+
 /// Most task polls in one `Runtime::poll`, checked between rounds.
 pub(crate) const POLL_BUDGET: usize = 1024;
 
@@ -54,8 +68,12 @@ pub struct Executor {
     deferred: Vec<*const TaskHeader>,
     /// Number of live tasks.
     task_count: usize,
-    /// Slots in use; all three queues keep at least this capacity (every slot
-    /// has at most one queue entry), so queue pushes never reallocate.
+    /// Slots in use, including a finished task's slot until its queue entry
+    /// drains. `reserve` grows all three queues to at least this capacity before
+    /// counting a slot; capacities never shrink (rounds and `undefer` only trade
+    /// buffers between the queues). Each entry in `incoming` and `deferred`
+    /// belongs to a distinct QUEUED slot, and a QUEUED slot is not reclaimed
+    /// until its entry drains, so `incoming.len() + deferred.len() <= allocated`.
     allocated: usize,
     /// One pool per task function this executor has spawned.
     pools: Vec<*mut RuntimePool>,
@@ -203,12 +221,14 @@ impl Executor {
             }
             // A LIVE slot's executor is alive: cleanup clears every slot's flags
             // before the executor is freed, after which `Meta::executor` dangles.
+            // A Panicked or Closing executor still takes the wake: its queues are
+            // never polled again and are freed with it.
             let this = Meta::executor(TaskHeader::meta(header));
-            if (*this).lifecycle != Lifecycle::Open {
-                return;
-            }
             flags.set(current | QUEUED);
-            (*this).incoming.push(header);
+            // SAFETY: the slot is LIVE without QUEUED, so it is counted in
+            // `allocated` and has no entry: `incoming.len() < allocated <=
+            // incoming.capacity()` (see `allocated`).
+            append_reserved(&mut (*this).incoming, header);
         }
     }
 
@@ -223,10 +243,8 @@ impl Executor {
     #[inline(never)]
     unsafe fn upgrade(header: *const TaskHeader) {
         unsafe {
+            // Alive, and any lifecycle takes the move, as in `wake`.
             let this = Meta::executor(TaskHeader::meta(header));
-            if (*this).lifecycle != Lifecycle::Open {
-                return;
-            }
             let deferred = &mut (*this).deferred;
             let Some(position) = deferred.iter().position(|&entry| entry == header) else {
                 return;
@@ -252,12 +270,11 @@ impl Executor {
             if current & (LIVE | QUEUED) != LIVE {
                 return;
             }
+            // Alive, and any lifecycle takes the wake, as in `wake`.
             let this = Meta::executor(TaskHeader::meta(header));
-            if (*this).lifecycle != Lifecycle::Open {
-                return;
-            }
             flags.set(current | QUEUED | DEFERRED);
-            (*this).deferred.push(header);
+            // SAFETY: as in `wake`, `deferred.len() < allocated <= deferred.capacity()`.
+            append_reserved(&mut (*this).deferred, header);
         }
     }
 
