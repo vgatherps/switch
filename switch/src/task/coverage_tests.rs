@@ -266,7 +266,7 @@ async fn panics_when_polled() {
 }
 
 #[test]
-fn wake_of_live_slot_in_panicked_runtime_does_nothing() {
+fn wake_of_live_slot_in_panicked_runtime_queues_but_never_polls() {
     let mut runtime = Runtime::new(0);
     let parked = spawn_parked(&mut runtime, 1).remove(0);
     let stored = waker(&parked);
@@ -276,7 +276,7 @@ fn wake_of_live_slot_in_panicked_runtime_does_nothing() {
     let flags = unsafe { TaskHeader::flags(header(&stored)) };
     assert_eq!(flags.get() & (LIVE | QUEUED), LIVE);
     stored.wake_by_ref();
-    assert_eq!(flags.get() & (LIVE | QUEUED), LIVE);
+    assert_eq!(flags.get() & (LIVE | QUEUED), LIVE | QUEUED);
     assert_eq!(runtime.poll(0), Err(RuntimeError::Panicked));
     assert_eq!((parked.polls.get(), parked.drops.get()), (1, 0));
     runtime.shutdown();

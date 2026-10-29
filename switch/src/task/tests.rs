@@ -1038,8 +1038,40 @@ fn stale_stored_waker_after_shutdown_or_drop_has_no_effect() {
             0
         );
         stale.wake();
+        stale.wake_deferred();
         assert_eq!(state.polls.get(), 1);
     }
+}
+
+#[test]
+fn stale_stored_waker_after_dropping_a_panicked_runtime_with_queued_wakes() {
+    use super::header::{LIVE, QUEUED, TAKEN};
+    #[switch::task]
+    async fn panics() {
+        panic_any(7usize)
+    }
+    let mut runtime = Runtime::new(0);
+    let state = state();
+    let stored = Rc::new(Cell::new(None));
+    runtime
+        .spawner()
+        .spawn(stores(state.clone(), stored.clone()))
+        .unwrap();
+    runtime.poll(0).unwrap();
+    let stale = stored.get().unwrap();
+    let flags = unsafe { TaskHeader::flags(header(&waker(&state))) };
+    runtime.spawner().spawn(panics()).unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| runtime.poll(0))).is_err());
+    // The panicked executor queues the wakes: deferred, then upgraded.
+    stale.wake_deferred();
+    stale.wake();
+    assert_eq!(flags.get() & !TAKEN, LIVE | QUEUED);
+    drop(runtime);
+    // Cleanup cleared every flag before freeing the executor and its queues.
+    assert_eq!(flags.get(), 0);
+    stale.wake();
+    stale.wake_deferred();
+    assert_eq!((state.polls.get(), flags.get()), (1, 0));
 }
 
 #[test]

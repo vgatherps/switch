@@ -1,5 +1,6 @@
 use super::*;
-use crate::task::header::{DROP_STARTED, LIVE, QUEUED, TAKEN};
+use crate::StoredWaker;
+use crate::task::header::{DEFERRED, DROP_STARTED, LIVE, QUEUED, TAKEN};
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
@@ -735,12 +736,13 @@ impl Drop for RejectedWakeOnDrop {
 }
 
 #[test]
-fn panicked_lifecycle_rejects_work_and_destructor_wake_to_idle_target() {
+fn panicked_lifecycle_rejects_work_and_queues_destructor_wake_to_idle_target() {
     let owner = Owner::new();
     let mut idle = Probe::new();
     idle.pending = true;
     idle.wake_drop = true;
     let idle_drops = idle.drops.clone();
+    let idle_polls = idle.polls.clone();
     owner.spawn(probe(idle));
     let target = owner.last();
     owner.poll();
@@ -766,11 +768,14 @@ fn panicked_lifecycle_rejects_work_and_destructor_wake_to_idle_target() {
         .is_err()
     );
     assert_eq!(rejected_drops.get(), 1);
+    // The executor takes the wake, but never polls again.
     unsafe {
-        assert!((*owner.0).incoming.is_empty());
+        assert_eq!(*(*owner.0).incoming, [target]);
         assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
     }
-    assert_eq!(flags(target), LIVE);
+    assert_eq!(flags(target), LIVE | QUEUED);
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(idle_polls.get(), 1);
     assert_eq!(owner.counts(), (1, 2));
     owner.cleanup();
     owner.cleanup();
@@ -872,4 +877,141 @@ fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
     unsafe {
         assert_eq!((*owner.0).lifecycle, Lifecycle::Closing);
     }
+}
+
+/// Parks forever after publishing its `StoredWaker`.
+struct StoredPark {
+    stored: Rc<Cell<Option<StoredWaker>>>,
+    polls: Rc<Cell<usize>>,
+    drops: Rc<Cell<usize>>,
+}
+impl StoredPark {
+    fn new() -> Self {
+        Self {
+            stored: Rc::default(),
+            polls: Rc::default(),
+            drops: Rc::default(),
+        }
+    }
+}
+impl Future for StoredPark {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.polls.set(self.polls.get() + 1);
+        self.stored.set(Some(StoredWaker::new(cx)));
+        Poll::Pending
+    }
+}
+impl Drop for StoredPark {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+#[switch::task]
+fn stored_park(task: StoredPark) -> impl Future<Output = ()> {
+    task
+}
+
+#[test]
+fn stored_wakes_in_a_panicked_executor_queue_and_never_poll() {
+    stored_wakes_after_open(Lifecycle::Panicked);
+}
+
+#[test]
+fn stored_wakes_in_a_closing_executor_queue_and_never_poll() {
+    stored_wakes_after_open(Lifecycle::Closing);
+}
+
+/// `wake`, `wake_deferred` and an upgrade still queue a LIVE task once the
+/// executor left Open; it is never polled again, and cleanup drops it once.
+fn stored_wakes_after_open(lifecycle: Lifecycle) {
+    let owner = Owner::new();
+    let (eager, deferred) = (StoredPark::new(), StoredPark::new());
+    let stored = [eager.stored.clone(), deferred.stored.clone()];
+    let polls = [eager.polls.clone(), deferred.polls.clone()];
+    let drops = [eager.drops.clone(), deferred.drops.clone()];
+    owner.spawn(stored_park(eager));
+    let eager_header = owner.last();
+    owner.spawn(stored_park(deferred));
+    let deferred_header = owner.last();
+    owner.poll();
+    match lifecycle {
+        Lifecycle::Panicked => {
+            let mut failing = Probe::new();
+            failing.panic_poll = true;
+            owner.spawn(probe(failing));
+            assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+        }
+        Lifecycle::Closing => unsafe { Executor::close(owner.0) },
+        Lifecycle::Open => unreachable!(),
+    }
+    unsafe {
+        assert_eq!((*owner.0).lifecycle, lifecycle);
+    }
+    let [eager_waker, deferred_waker] = stored.map(|stored| stored.get().unwrap());
+    eager_waker.wake();
+    deferred_waker.wake_deferred();
+    assert_eq!(flags(eager_header), LIVE | QUEUED);
+    assert_eq!(flags(deferred_header), LIVE | QUEUED | DEFERRED);
+    unsafe {
+        assert_eq!(*(*owner.0).incoming, [eager_header]);
+        assert_eq!(*(*owner.0).deferred, [deferred_header]);
+    }
+    deferred_waker.wake();
+    assert_eq!(flags(deferred_header), LIVE | QUEUED);
+    unsafe {
+        assert_eq!(*(*owner.0).incoming, [eager_header, deferred_header]);
+        assert!((*owner.0).deferred.is_empty());
+    }
+    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(polls.each_ref().map(|polls| polls.get()), [1, 1]);
+    owner.cleanup();
+    assert_eq!(owner.counts(), (0, 0));
+    assert_eq!(drops.each_ref().map(|drops| drops.get()), [1, 1]);
+    unsafe {
+        assert!((*owner.0).incoming.is_empty() && (*owner.0).deferred.is_empty());
+    }
+}
+
+/// The longest the wake queues get: every slot in use has an entry, one of them
+/// the self-wake of a finished task, whose slot stays in use until it drains.
+#[test]
+fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
+    let owner = Owner(Box::into_raw(Box::new(Executor::with_capacity(0, 0, 0))));
+    let mut finishing = Probe::new();
+    finishing.wakes = 1;
+    owner.spawn(probe(finishing));
+    let stale = owner.last();
+    let parked: Vec<StoredPark> = (0..4).map(|_| StoredPark::new()).collect();
+    let stored: Vec<_> = parked.iter().map(|task| task.stored.clone()).collect();
+    for task in parked {
+        owner.spawn(stored_park(task));
+    }
+    owner.poll();
+    assert_eq!(flags(stale) & (LIVE | QUEUED), QUEUED);
+    unsafe {
+        assert_eq!(*(*owner.0).incoming, [stale]);
+    }
+    owner.spawn(probe(Probe::new()));
+    assert_ne!(owner.last(), stale);
+    assert_eq!(owner.counts(), (5, 6));
+    for (index, stored) in stored.iter().enumerate() {
+        let waker = stored.get().unwrap();
+        if index % 2 == 0 {
+            waker.wake();
+        } else {
+            waker.wake_deferred();
+        }
+    }
+    unsafe {
+        let (incoming, deferred) = ((*owner.0).incoming.len(), (*owner.0).deferred.len());
+        assert_eq!((incoming, deferred), (4, 2));
+        assert_eq!(incoming + deferred, (*owner.0).allocated);
+        assert!(incoming <= (*owner.0).incoming.capacity());
+        assert!(deferred <= (*owner.0).deferred.capacity());
+    }
+    // The stale entry drains and frees its slot; the new task completes.
+    owner.poll();
+    assert_eq!(owner.counts(), (4, 4));
 }
