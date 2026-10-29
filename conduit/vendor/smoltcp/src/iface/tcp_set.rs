@@ -63,6 +63,8 @@ struct FlowSlot {
     due: bool,
     orphaned: bool,
     reap_queued: bool,
+    /// `TcpStorage::tokens` holds an armed token: the one check `mark_dirty` makes.
+    armed: bool,
 }
 
 impl FlowSlot {
@@ -78,6 +80,7 @@ impl FlowSlot {
         due: false,
         orphaned: false,
         reap_queued: false,
+        armed: false,
     };
 }
 
@@ -432,6 +435,7 @@ impl<'a> TcpSet<'a> {
     pub fn arm(&mut self, handle: SocketHandle, side: ReadySide, token: u32) {
         self.item(handle);
         self.sockets[handle.index].tokens[side as usize] = Some(token);
+        self.flow_slots[handle.index].armed = true;
     }
 
     /// Disarm `side` of the socket. Returns whether a token was armed there; `false` when none
@@ -441,7 +445,10 @@ impl<'a> TcpSet<'a> {
     /// As `get`.
     pub fn disarm(&mut self, handle: SocketHandle, side: ReadySide) -> bool {
         self.item(handle);
-        self.sockets[handle.index].tokens[side as usize].take().is_some()
+        let tokens = &mut self.sockets[handle.index].tokens;
+        let armed = tokens[side as usize].take().is_some();
+        self.flow_slots[handle.index].armed = tokens.iter().any(Option::is_some);
+        armed
     }
 
     /// One fired token, in no particular order; `None` once the list is empty.
@@ -453,6 +460,15 @@ impl<'a> TcpSet<'a> {
     /// Move every token armed on slot `index` to the fired list.
     #[inline]
     pub(crate) fn fire(&mut self, index: usize) {
+        if self.flow_slots[index].armed {
+            self.fire_armed(index);
+        }
+    }
+
+    /// Out of line, so `mark_dirty` stays small enough to inline.
+    #[inline(never)]
+    fn fire_armed(&mut self, index: usize) {
+        self.flow_slots[index].armed = false;
         for token in &mut self.sockets[index].tokens {
             if let Some(token) = token.take() {
                 self.fired.push(token);
@@ -474,6 +490,7 @@ impl<'a> TcpSet<'a> {
     pub fn orphan(&mut self, handle: SocketHandle, now: Instant) {
         self.item(handle);
         self.sockets[handle.index].tokens = [None; 2];
+        self.flow_slots[handle.index].armed = false;
         self.get_mut(handle).orphan(now);
         self.flow_slots[handle.index].orphaned = true;
         self.check_reapable(handle.index);
@@ -528,6 +545,7 @@ impl<'a> TcpSet<'a> {
             .checked_add(1)
             .expect("socket slot generation overflow");
         slot.tokens = [None; 2];
+        self.flow_slots[handle.index].armed = false;
         if self.flow_slots[handle.index].reap_queued {
             self.reapable.retain(|&queued| queued != handle);
         }
@@ -767,9 +785,16 @@ impl TcpSet<'_> {
         }
     }
 
+    /// Also fires the slot's tokens; the armed check shares the dirty check's slot load.
+    /// Always inlined: the out-of-line `fire_armed` call otherwise moves it out of `get_mut`.
+    #[inline(always)]
     pub(crate) fn mark_dirty(&mut self, index: usize) {
-        self.fire(index);
-        if !self.flow_slots[index].dirty {
+        let slot = &self.flow_slots[index];
+        let (armed, dirty) = (slot.armed, slot.dirty);
+        if armed {
+            self.fire_armed(index);
+        }
+        if !dirty {
             self.remove_deadline(index);
             self.flow_slots[index].dirty = true;
             self.dirty_list.push(index);

@@ -281,10 +281,12 @@ impl UdpSet {
     }
 
     pub(crate) fn commit_rx(&mut self, slot: usize, mut frame: RxBuf, pending: PendingUdp) {
-        if let Some(token) = self.slots[slot].rx_token.take() {
-            self.fired.push(token);
+        let entry = &mut self.slots[slot];
+        if let Some(token) = entry.rx_token {
+            entry.rx_token = None;
+            fire(&mut self.fired, token);
         }
-        let socket = self.socket_at_mut(slot);
+        let socket = entry.socket.as_mut().expect("UDP socket is missing");
         assert!(!socket.at_limit(), "UDP receive credit is exhausted");
         frame.narrow(pending.payload);
         socket.shared.hold();
@@ -295,6 +297,12 @@ impl UdpSet {
             shared: socket.shared.clone(),
         });
     }
+}
+
+/// Out of line, so a datagram for an unarmed socket pays one load and branch.
+#[inline(never)]
+fn fire(fired: &mut Vec<u32>, token: u32) {
+    fired.push(token);
 }
 
 #[cfg(test)]
