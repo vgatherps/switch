@@ -105,7 +105,7 @@ impl<Fut: Future> Drop for Joinable<Fut> {
 /// or to `Err(Canceled)` if the task ends without a value: its runtime shut
 /// down or was dropped first, or its poll panicked. Dropping the handle
 /// detaches the task: its value is dropped when it completes, or now if it
-/// already did. Must be awaited by a switch task (it keeps a `RemoteWaker`).
+/// already did. Must be awaited by a switch task (it keeps a `StoredWaker`).
 /// Not `Send` or `Sync`.
 #[must_use = "dropping a JoinHandle detaches its task"]
 pub struct JoinHandle<T>(Receiver<T>);
