@@ -173,7 +173,7 @@ fn udp_pair(eal: &dpdk_smoltcp::Eal) -> Pair {
 }
 
 fn udp_config(port: u16) -> UdpConfig {
-    UdpConfig { port, rx_queue: 8, tx_checksum: true, broadcast: false }
+    UdpConfig { port, local_addr: None, rx_queue: 8, tx_checksum: true, broadcast: false }
 }
 
 #[zhida_test_support::pinned_test]
