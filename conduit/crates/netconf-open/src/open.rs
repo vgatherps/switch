@@ -314,7 +314,7 @@ pub unsafe fn open(
         ipv4: config.ipv4,
         gateway: config.gateway,
         paths: &paths,
-        owned_ipv4: &[],
+        owned_ipv4: &config.owned_ipv4,
         random_seed: seed,
         neighbor_capacity: sizing.neighbor_capacity,
         max_sockets: sizing.max_sockets,

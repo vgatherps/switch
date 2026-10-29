@@ -156,7 +156,7 @@ fn main() -> ExitCode {
                 let path = Path::new(&path);
                 if let Err(e) = rediscover::write(
                     path,
-                    discovered.config,
+                    &discovered,
                     previous.as_ref(),
                     &mut std::io::stderr().lock(),
                 ) {

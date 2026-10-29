@@ -1,6 +1,6 @@
 use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use smoltcp::iface::{PathMtu, PathMtus, MIN_IP_MTU};
+use smoltcp::iface::{OwnedIpv4, PathMtu, PathMtus, MIN_IP_MTU};
 use smoltcp::wire::{EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr};
 use std::{fmt, fs, path::Path, str::FromStr};
 
@@ -14,6 +14,10 @@ pub struct Config {
     pub mac: Option<EthernetAddress>,
     pub ipv4: Ipv4Cidr,
     pub gateway: Option<Ipv4Address>,
+    /// IPv4 addresses the Stack owns besides `ipv4`: single addresses (/32) and prefixes. Sorted,
+    /// none inside another (duplicates and contained entries are dropped on load). Ownership
+    /// only: `ipv4` keeps routing, the subnet broadcast and the default source.
+    pub owned_ipv4: Vec<Ipv4Cidr>,
     pub mtu: u16,
     pub paths: Vec<PathRule>,
     pub offloads: Offloads,
@@ -148,6 +152,8 @@ struct JsonConfig {
     ipv4: String,
     #[serde(deserialize_with = "required_option")]
     gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    owned_ipv4: Vec<String>,
     mtu: u16,
     paths: Vec<PathRule>,
     offloads: Offloads,
@@ -187,7 +193,7 @@ impl TryFrom<JsonConfig> for Config {
         if json.version != 1 {
             return Err(error("version", "must be 1"));
         }
-        let config = Self {
+        let mut config = Self {
             device: json.device,
             mac: json
                 .mac
@@ -200,6 +206,12 @@ impl TryFrom<JsonConfig> for Config {
                 .as_deref()
                 .map(|v| parse(v, "gateway", "IPv4 address"))
                 .transpose()?,
+            owned_ipv4: json
+                .owned_ipv4
+                .iter()
+                .enumerate()
+                .map(|(index, v)| parse(v, &format!("owned_ipv4[{index}]"), "IPv4 CIDR"))
+                .collect::<Result<_, _>>()?,
             mtu: json.mtu,
             paths: json.paths,
             offloads: json.offloads,
@@ -208,6 +220,7 @@ impl TryFrom<JsonConfig> for Config {
             eal: json.eal,
         };
         validate(&config)?;
+        config.owned_ipv4 = merge_owned(config.owned_ipv4);
         Ok(config)
     }
 }
@@ -220,6 +233,7 @@ impl From<Config> for JsonConfig {
             mac: config.mac.map(mac_string),
             ipv4: config.ipv4.to_string(),
             gateway: config.gateway.map(|g| g.to_string()),
+            owned_ipv4: config.owned_ipv4.iter().map(ToString::to_string).collect(),
             mtu: config.mtu,
             paths: config.paths,
             offloads: config.offloads,
@@ -299,6 +313,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             }
         }
     }
+    validate_owned(config)?;
     if config.mtu < MIN_IP_MTU {
         return Err(error("mtu", MTU_TOO_SMALL));
     }
@@ -333,6 +348,44 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
         return Err(error("eal.file_prefix", "must not be empty"));
     }
     Ok(())
+}
+
+/// First and last address of `cidr`'s whole range.
+fn interval(cidr: Ipv4Cidr) -> (u32, u32) {
+    let start = u32::from(cidr.network().address());
+    (
+        start,
+        start
+            | u32::MAX
+                .checked_shr(u32::from(cidr.prefix_len()))
+                .unwrap_or(0),
+    )
+}
+
+/// Each entry against the rules `Stack::new` applies (`OwnedIpv4::new`), one at a time so the
+/// error names the entry.
+fn validate_owned(config: &Config) -> Result<(), ConfigError> {
+    for (index, cidr) in config.owned_ipv4.iter().enumerate() {
+        OwnedIpv4::new(&[*cidr], config.ipv4, config.gateway)
+            .map_err(|message| error(&format!("owned_ipv4[{index}]"), message))?;
+    }
+    Ok(())
+}
+
+/// Sorted by first address, with duplicates and entries inside another dropped: two prefixes are
+/// either disjoint or one holds the other.
+fn merge_owned(mut owned: Vec<Ipv4Cidr>) -> Vec<Ipv4Cidr> {
+    owned.sort_by_key(|cidr| (interval(*cidr).0, cidr.prefix_len()));
+    let mut merged: Vec<Ipv4Cidr> = Vec::with_capacity(owned.len());
+    for cidr in owned {
+        if merged
+            .last()
+            .is_none_or(|last| interval(*last).1 < interval(cidr).0)
+        {
+            merged.push(cidr);
+        }
+    }
+    merged
 }
 
 /// Colon-separated lowercase hex, as sysfs prints it (smoltcp's Display uses dashes).
@@ -395,6 +448,19 @@ impl fmt::Display for Config {
             "gateway: {}",
             self.gateway
                 .map_or_else(|| "null".into(), |g| g.to_string())
+        )?;
+        writeln!(
+            f,
+            "owned_ipv4: {}",
+            if self.owned_ipv4.is_empty() {
+                "none".to_owned()
+            } else {
+                self.owned_ipv4
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
         )?;
         writeln!(f, "mtu: {}", self.mtu)?;
         writeln!(f, "paths:")?;
@@ -627,5 +693,101 @@ mod tests {
             *value.pointer_mut(pointer).unwrap() = json!(88);
             Config::from_json(&value.to_string()).unwrap();
         }
+    }
+
+    fn cidrs(texts: &[&str]) -> Vec<Ipv4Cidr> {
+        texts.iter().map(|t| t.parse().unwrap()).collect()
+    }
+
+    /// A config without `owned_ipv4`, or with an empty list, owns nothing besides `ipv4` and
+    /// writes the same JSON as before the field existed; `null` is not a list.
+    #[test]
+    fn owned_ipv4_absent_or_empty_keeps_the_single_address_json() {
+        let config = Config::from_json(EXPECTED).unwrap();
+        assert!(config.owned_ipv4.is_empty());
+        assert_eq!(config.to_json(), EXPECTED);
+        assert!(config.to_string().contains("owned_ipv4: none\n"));
+        let mut value = example();
+        value["owned_ipv4"] = json!([]);
+        assert_eq!(
+            Config::from_json(&value.to_string()).unwrap().to_json(),
+            EXPECTED
+        );
+        value["owned_ipv4"] = Value::Null;
+        assert!(Config::from_json(&value.to_string()).is_err());
+    }
+
+    /// Entries load sorted, with duplicates and entries inside another dropped; adjacent and
+    /// off-subnet entries stay. The result round-trips and is shown.
+    #[test]
+    fn owned_ipv4_round_trips_sorted_and_merged() {
+        let mut value = example();
+        value["owned_ipv4"] = json!([
+            "10.0.2.5/32",
+            "10.0.2.0/29",
+            "10.0.2.5/32",
+            "10.0.2.8/29",
+            "10.0.3.128/25",
+            "10.0.3.0/24",
+            "10.0.1.24/32",
+            "172.16.0.0/16",
+        ]);
+        let config = Config::from_json(&value.to_string()).unwrap();
+        let merged = cidrs(&[
+            "10.0.1.24/32",
+            "10.0.2.0/29",
+            "10.0.2.8/29",
+            "10.0.3.0/24",
+            "172.16.0.0/16",
+        ]);
+        assert_eq!(config.owned_ipv4, merged);
+        let json = config.to_json();
+        assert!(json.contains(
+            "  \"gateway\": \"10.0.1.1\",\n  \"owned_ipv4\": [\n    \"10.0.1.24/32\",\n    \"10.0.2.0/29\","
+        ), "{json}");
+        assert_eq!(Config::from_json(&json).unwrap(), config);
+        assert!(config.to_string().contains(
+            "owned_ipv4: 10.0.1.24/32, 10.0.2.0/29, 10.0.2.8/29, 10.0.3.0/24, 172.16.0.0/16\n"
+        ));
+    }
+
+    /// Every address an entry covers must be unicast, not the gateway and not the subnet's
+    /// broadcast address; the error names the entry as written.
+    #[test]
+    fn owned_ipv4_rejects_bad_entries_anywhere_in_their_range() {
+        for entry in [
+            "10.0.1.5/24",
+            "10.0.1.5",
+            "0.0.0.0/32",
+            "0.0.0.0/8",
+            "224.0.0.1/32",
+            "239.255.255.255/32",
+            "192.0.0.0/2",
+            "255.255.255.255/32",
+            "10.0.1.1/32",
+            "10.0.1.0/28",
+            "10.0.1.255/32",
+            "10.0.1.240/28",
+        ] {
+            let mut value = example();
+            value["owned_ipv4"] = json!(["10.0.1.30/32", entry]);
+            reject(&value, "owned_ipv4[1]:");
+        }
+        let mut value = example();
+        value["owned_ipv4"] = json!([1]);
+        assert!(Config::from_json(&value.to_string()).is_err());
+        // next to the forbidden addresses is fine
+        value["owned_ipv4"] = json!([
+            "10.0.1.2/32",
+            "10.0.1.254/32",
+            "223.255.255.255/32",
+            "240.0.0.0/32"
+        ]);
+        Config::from_json(&value.to_string()).unwrap();
+        // with no gateway, its address is ownable; a /32 subnet has no broadcast
+        value["gateway"] = Value::Null;
+        value["ipv4"] = json!("10.0.1.23/32");
+        value["owned_ipv4"] = json!(["10.0.1.1/32", "10.0.1.255/32"]);
+        Config::from_json(&value.to_string()).unwrap();
     }
 }
