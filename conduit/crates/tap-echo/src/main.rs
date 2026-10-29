@@ -125,11 +125,14 @@ fn main() {
         listeners,
         buffer,
         None,
-        |stack, start, stop| {
-            let mut echo = EchoServer::new(stack, ECHO_PORT, listeners, buffer)
-                .map_err(|error| format!("EchoServer::new: {error}"))?
-                .with_close_after(close_after);
-            serve(stack, &mut echo, start, |_, _| stop()).map_err(|error| format!("serve: {error}"))
+        |mut stack, start, stop| {
+            let served = (|| {
+                let mut echo = EchoServer::new(&mut stack, ECHO_PORT, listeners, buffer)
+                    .map_err(|error| format!("EchoServer::new: {error}"))?
+                    .with_close_after(close_after);
+                serve(&mut stack, &mut echo, start, |_, _| stop()).map_err(|error| format!("serve: {error}"))
+            })();
+            (stack, served)
         },
     );
     process::exit(code);

@@ -1,36 +1,41 @@
-//! The binance_feed client uses Zhida TCP, rustls and tungstenite against a
-//! kernel TCP TLS WebSocket server across net_tap through Zhida's IPv4 gateway,
-//! as in the live run. These tests need CAP_NET_ADMIN and /dev/net/tun, and no internet.
+//! The binance_feed client (relay's wss client over sheath, as a switch task on a switchnet Net)
+//! against a kernel TCP TLS WebSocket server (rustls + tungstenite) across net_tap through
+//! Zhida's IPv4 gateway, as in the live run. These tests need CAP_NET_ADMIN and /dev/net/tun,
+//! and no internet.
 
+use std::cell::Cell;
 use std::ffi::CStr;
-use std::io::{ErrorKind, Write as _};
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::panic::resume_unwind;
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    client_config, connect, socket, webpki_client_config, BookTicker, Clock, FeedError, Target,
-    INGRESS_BUDGET, SOCKET_BUFFER,
+    client_config, connect, run, socket, webpki_client_config, BookTicker, Clock, FeedError,
+    Target, INGRESS_BUDGET, SOCKET_BUFFER,
 };
-use zhida_test_kit::{tap::TapVdev, with_eal};
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
-use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
+use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{
     frame_reserve, rx_reserve, tx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack,
-    StackConfig,
-    DEFAULT_NEIGHBOR_CAPACITY,
+    StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
+use relay::switchnet::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+use switch::Spawner;
+use switchnet::{Net, NetConfig, NetHandle, OpenError};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::{Error, Message};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
+use zhida_test_kit::{tap::TapVdev, with_eal};
 
 const VDEV: &CStr = c"net_tap_bnc";
 const IFACE: &CStr = c"cdtap_bnc";
@@ -46,10 +51,9 @@ const PATH: &str = "/ws/btcusdt@bookTicker";
 const LOCAL_PORT: u16 = 49152;
 const CONNECT_LIMIT: Duration = Duration::from_secs(20);
 const CLOSE_LIMIT: Duration = Duration::from_secs(10);
-const READ_LIMIT: Duration = Duration::from_secs(60);
+/// Every test's client, and the server's accept and socket reads and writes.
+const LIMIT: Duration = Duration::from_secs(60);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
-/// The TLS-only server's read timeout (see `ServerPlan::TlsOnly`).
-const TLS_ONLY_READ_LIMIT: Duration = Duration::from_secs(2);
 
 fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
     let pool = |name, count| PoolConfig {
@@ -73,7 +77,8 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
                 rx_reserve(16, 32, 8)
                     .checked_add(tcp::rx_mbuf_budget(&socket(mss_cap), 1500))
                     .expect("RX pool count fits usize"),
-            ).unwrap(),
+            )
+            .unwrap(),
         ),
         tx_pool: pool(TX_POOL, 127),
         frame_pool: pool(
@@ -82,7 +87,8 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
                 frame_reserve(16, 32)
                     .checked_add(tcp::tx_mbuf_budget(&socket(mss_cap), 1500))
                     .expect("frame pool count fits usize"),
-            ).unwrap(),
+            )
+            .unwrap(),
         ),
         offloads: Offloads::default(),
     }
@@ -91,7 +97,13 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
 fn add_address(addr: Ipv4Addr, prefix: u8) {
     let cidr = format!("{addr}/{prefix}");
     let output = Command::new("ip")
-        .args(["address", "add", &cidr, "dev", IFACE.to_str().expect("IFACE is ASCII")])
+        .args([
+            "address",
+            "add",
+            &cidr,
+            "dev",
+            IFACE.to_str().expect("IFACE is ASCII"),
+        ])
         .output()
         .expect("run ip address add");
     assert!(
@@ -101,11 +113,12 @@ fn add_address(addr: Ipv4Addr, prefix: u8) {
     );
 }
 
-fn with_stack<T>(
-    max_sockets: usize,
+/// A Net with one socket slot on a fresh net_tap Port, Zhida's gateway the kernel side, and a
+/// kernel listener on the off-subnet SERVER_ADDR:SERVER_PORT.
+fn with_net<T>(
     paths: &[PathMtu],
     mss_cap: Option<u16>,
-    body: impl FnOnce(&mut Stack, &Clock, TcpListener) -> T,
+    body: impl FnOnce(&mut Net, &Clock, TcpListener) -> T,
 ) -> T {
     with_eal(|eal| {
         let tap = TapVdev::new(VDEV, IFACE);
@@ -128,16 +141,29 @@ fn with_stack<T>(
             random_seed: 1,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
             segments_per_visit: 1,
-            max_sockets,
+            max_sockets: 1,
             rx_staging: 32,
             tx_pending: 32,
         };
         let clock = Clock::new(Instant::now());
-        let mut stack = Stack::new(port, config, StackInstant::ZERO)
+        let stack = Stack::new(port, config, StackInstant::ZERO)
             .map_err(|(_, error)| error)
             .expect("create Zhida Stack");
-        let result = body(&mut stack, &clock, listener);
-        stack.into_port().try_close().expect("close Port with all buffers returned");
+        let mut net = Net::new(
+            stack,
+            NetConfig {
+                ingress_budget: INGRESS_BUDGET,
+            },
+        );
+        let result = body(&mut net, &clock, listener);
+        let stack = net
+            .into_stack()
+            .ok()
+            .expect("the test dropped every handle and socket");
+        stack
+            .into_port()
+            .try_close()
+            .expect("close Port with all buffers returned");
         tap.close();
         result
     })
@@ -149,7 +175,10 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
     use zhida_test_kit::ring_port::{resize, RingPort};
 
     with_eal(|eal| {
-        let paths = [PathMtu { prefix: Ipv4Cidr::new(Side::B.ip(), 32), mtu: 1500 }];
+        let paths = [PathMtu {
+            prefix: Ipv4Cidr::new(Side::B.ip(), 32),
+            mtu: 1500,
+        }];
         for (name, tcp_config, admits) in [
             ("bnc_cap", socket(Some(1460)), true),
             ("bnc_small", socket(None), false),
@@ -166,8 +195,11 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
                 port_config.rx_pool.cache_size,
             );
             port_config.rx_pool.count = u32::try_from(
-                reserve.checked_add(budget).expect("RX pool count fits usize"),
-            ).unwrap();
+                reserve
+                    .checked_add(budget)
+                    .expect("RX pool count fits usize"),
+            )
+            .unwrap();
             // net_ring's TX descriptors are its 64-slot TX ring.
             let (tx, pending) = (port_config.tx_descriptors, stack_config.tx_pending);
             port_config.tx_pool.count = u32::try_from(tx_reserve(tx, pending)).unwrap();
@@ -175,10 +207,12 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
                 frame_reserve(tx, pending)
                     .checked_add(tcp::tx_mbuf_budget(&tcp_config, 9000))
                     .expect("frame pool count fits usize"),
-            ).unwrap();
+            )
+            .unwrap();
             let port = ring.open_with(eal, port_config);
             let mut stack = Stack::new(port, stack_config, StackInstant::ZERO)
-                .map_err(|(_, error)| error).unwrap();
+                .map_err(|(_, error)| error)
+                .unwrap();
             let result = stack.add_tcp(socket(Some(1460)));
             if admits {
                 let handle = result.expect("capped budget admits the feed socket");
@@ -187,12 +221,19 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
                 drop(handle);
             } else {
                 match result {
-                    Err(AddTcpError::RxPoolTooSmall { config, required, pool }) => {
+                    Err(AddTcpError::RxPoolTooSmall {
+                        config,
+                        required,
+                        pool,
+                    }) => {
                         assert_eq!(config, socket(Some(1460)));
                         assert_eq!(pool, reserve.checked_add(budget).unwrap());
-                        assert_eq!(required, reserve.checked_add(
-                            tcp::rx_mbuf_budget(&socket(Some(1460)), 9000),
-                        ).unwrap());
+                        assert_eq!(
+                            required,
+                            reserve
+                                .checked_add(tcp::rx_mbuf_budget(&socket(Some(1460)), 9000))
+                                .unwrap(),
+                        );
                     }
                     other => panic!("uncapped pool must reject capped socket: {other:?}"),
                 }
@@ -205,28 +246,27 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
 
 fn server_config() -> (Arc<ServerConfig>, RootCertStore) {
     let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec![HOST.to_owned()]).expect("generate test certificate");
+        rcgen::generate_simple_self_signed(vec![HOST.to_owned()])
+            .expect("generate test certificate");
     let mut roots = RootCertStore::empty();
-    roots.add(cert.der().clone()).expect("add test certificate to roots");
+    roots
+        .add(cert.der().clone())
+        .expect("add test certificate to roots");
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
-    let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("ring supports rustls's safe default protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone()], key)
-        .expect("the generated certificate and key match");
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("ring supports rustls's safe default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .expect("the generated certificate and key match");
     (Arc::new(config), roots)
 }
 
 enum ServerPlan {
     Tickers(Vec<String>),
     Refuse451,
-    /// The client rejects the certificate. Its UnknownCA alert never reaches
-    /// this server: rustls writes the alert after a failed handshake with one
-    /// `write_tls`, which hands its queued records to `write_vectored`, and
-    /// StackStream has only the default `write_vectored`, which writes the
-    /// first record (the ChangeCipherSpec) alone. The server's handshake read
-    /// ends at `TLS_ONLY_READ_LIMIT` instead.
+    /// The client rejects the certificate; the server's handshake ends at its alert.
     TlsOnly,
 }
 
@@ -242,10 +282,10 @@ struct ServerSaw {
 fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> ServerSaw {
     listener.set_nonblocking(true).expect("nonblocking accept");
     let deadline = Instant::now()
-        .checked_add(CONNECT_LIMIT)
+        .checked_add(LIMIT)
         .expect("accept deadline fits wall time");
     let stream = loop {
-        assert!(Instant::now() < deadline, "no client within {CONNECT_LIMIT:?}");
+        assert!(Instant::now() < deadline, "no client within {LIMIT:?}");
         match listener.accept() {
             Ok((stream, _)) => break stream,
             Err(error) if error.kind() == ErrorKind::WouldBlock => thread::sleep(IDLE_SLEEP),
@@ -254,12 +294,12 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
         }
     };
     stream.set_nonblocking(false).expect("blocking TLS socket");
-    let read_limit = match plan {
-        ServerPlan::TlsOnly => TLS_ONLY_READ_LIMIT,
-        _ => CONNECT_LIMIT,
-    };
-    stream.set_read_timeout(Some(read_limit)).expect("TLS read timeout");
-    stream.set_write_timeout(Some(CONNECT_LIMIT)).expect("TLS write timeout");
+    stream
+        .set_read_timeout(Some(LIMIT))
+        .expect("TLS read timeout");
+    stream
+        .set_write_timeout(Some(LIMIT))
+        .expect("TLS write timeout");
     let conn = ServerConnection::new(config).expect("create TLS server connection");
     let tls = StreamOwned::new(conn, stream);
     let mut saw = ServerSaw::default();
@@ -275,7 +315,9 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
         if matches!(plan, ServerPlan::Refuse451) {
             let response: ErrorResponse = Response::builder()
                 .status(451)
-                .body(Some("Service unavailable from a restricted location".to_owned()))
+                .body(Some(
+                    "Service unavailable from a restricted location".to_owned(),
+                ))
                 .expect("valid HTTP refusal");
             Err(response)
         } else {
@@ -297,9 +339,11 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
     };
     for (index, text) in texts.into_iter().enumerate() {
         if index == 3 {
-            ws.write(Message::Ping(b"keepalive".to_vec().into())).expect("send Ping");
+            ws.write(Message::Ping(b"keepalive".to_vec().into()))
+                .expect("send Ping");
         }
-        ws.write(Message::Text(text.into())).expect("send bookTicker");
+        ws.write(Message::Text(text.into()))
+            .expect("send bookTicker");
     }
     ws.flush().expect("flush bookTickers and Ping");
     loop {
@@ -310,28 +354,15 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
             // Only the client's TLS close_notify gets here: rustls reports a
             // TCP EOF without it as UnexpectedEof, which panics below.
             Err(Error::ConnectionClosed) => break,
+            Err(Error::Io(error)) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => panic!("server WebSocket read: {error}"),
         }
     }
     let mut tls = ws.into_inner();
     tls.conn.send_close_notify();
-    tls.flush().expect("send server TLS close_notify");
-    drop(tls);
+    // The client may have dropped its socket after reading our close echo.
+    let _ = tls.conn.complete_io(&mut tls.sock);
     saw
-}
-
-/// After a failed connect: keeps turning the Stack (ARP and ACK answers, and
-/// anything the client wrote before failing) until the server thread ended.
-fn turn_until_finished(stack: &mut Stack, clock: &Clock, server: &JoinHandle<ServerSaw>) {
-    let started = Instant::now();
-    while !server.is_finished() {
-        assert!(
-            started.elapsed() < CONNECT_LIMIT,
-            "server still running {CONNECT_LIMIT:?} after the client failed",
-        );
-        stack.turn(clock.now(), INGRESS_BUDGET).expect("turn the Stack");
-        thread::sleep(IDLE_SLEEP);
-    }
 }
 
 fn join(server: JoinHandle<ServerSaw>) -> ServerSaw {
@@ -357,85 +388,118 @@ fn closed_target() -> Target {
     }
 }
 
-fn retry_failed_connect(stack: &mut Stack, clock: &Clock, initially_full: bool) {
+/// Asked each round by `run`: panics once the test ran `LIMIT`.
+fn guard(clock: &Clock) {
+    assert!(
+        clock.ms() < LIMIT.as_millis() as u64,
+        "test not done within {LIMIT:?}"
+    );
+}
+
+/// A connect to a closed port on the Net's only slot: it must be refused (the slot is free).
+/// With `at_once` the first attempt must get the slot; otherwise attempts retry every
+/// millisecond while the slot is still taken.
+async fn connect_refused(handle: &NetHandle, spawner: &Spawner, at_once: bool) {
     let target = closed_target();
-    let tls = webpki_client_config();
-    let started = Instant::now();
-    let limit = Duration::from_secs(30);
-    let attempt = |stack: &mut Stack, remaining| {
-        match connect(stack, clock, &target, socket(None), tls.clone(), LOCAL_PORT + 1, remaining) {
+    loop {
+        let error = match connect(
+            handle,
+            spawner,
+            &target,
+            socket(None),
+            webpki_client_config(),
+            LOCAL_PORT + 1,
+            CONNECT_LIMIT,
+        )
+        .await
+        {
             Ok(_) => panic!("a closed port opened a feed"),
             Err(error) => error,
-        }
-    };
-    let first = attempt(stack, CONNECT_LIMIT);
-    eprintln!("first retry before pumping: {first:?}");
-    assert_eq!(matches!(first, FeedError::SocketsFull), initially_full, "{first:?}");
-    let mut error = first;
-    loop {
+        };
         match error {
-            FeedError::Refused { addr } => {
-                assert!(started.elapsed() < limit, "retry exceeded 30 s");
-                assert_eq!(addr, target.addr);
-                return;
+            FeedError::Closed {
+                addr,
+                reset_by_peer: true,
+            } if addr == target.addr => return,
+            FeedError::Open(OpenError::Add(AddTcpError::SocketsFull(_))) if !at_once => {
+                spawner
+                    .sleep(1)
+                    .expect("open Runtime")
+                    .await
+                    .expect("sleep");
             }
-            FeedError::SocketsFull => {}
-            other => panic!("retry to a closed port: {other:?}"),
+            other => panic!("connect to a closed port: {other:?}"),
         }
-        let remaining = limit.checked_sub(started.elapsed()).expect("slot not freed within 30 s");
-        assert!(!remaining.is_zero(), "slot not freed within 30 s");
-        stack.turn(clock.now(), INGRESS_BUDGET).expect("pump the Stack between retries");
-        thread::sleep(IDLE_SLEEP);
-        let remaining = limit.checked_sub(started.elapsed()).expect("slot not freed within 30 s");
-        error = attempt(stack, remaining.min(CONNECT_LIMIT));
     }
 }
 
 #[zhida_test_support::pinned_test]
 fn refused_connect_releases_the_only_slot() {
-    with_stack(1, &[], None, |stack, clock, _listener| {
-        let target = closed_target();
-        let error = match connect(
-            stack, clock, &target, socket(None), webpki_client_config(), LOCAL_PORT, CONNECT_LIMIT,
-        ) {
-            Ok(_) => panic!("a closed port opened a feed"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(error, FeedError::Refused { addr } if addr == target.addr),
-            "{error:?}",
-        );
-        retry_failed_connect(stack, clock, false);
+    with_net(&[], None, |net, clock, _listener| {
+        run(
+            net,
+            clock,
+            || {
+                guard(clock);
+                false
+            },
+            |handle, spawner, _stop| async move {
+                connect_refused(&handle, &spawner, true).await;
+                connect_refused(&handle, &spawner, true).await;
+            },
+        )
+        .expect("run the client");
     });
 }
 
 #[zhida_test_support::pinned_test]
 fn timed_out_connect_releases_the_only_slot() {
-    with_stack(1, &[], None, |stack, clock, _listener| {
-        // 192.0.2.3 is unassigned in this TAP fixture; connect waits for ARP.
-        let target = Target {
-            addr: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 3), SERVER_PORT),
-            host: HOST.to_owned(),
-            path: PATH.to_owned(),
-        };
-        let limit = Duration::from_millis(100);
-        let error = match connect(
-            stack, clock, &target, socket(None), webpki_client_config(), LOCAL_PORT, limit,
-        ) {
-            Ok(_) => panic!("an unanswered ARP opened a feed"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(
-                error,
-                FeedError::ConnectTimeout { addr, state: State::SynSent, limit: actual }
-                    if addr == target.addr && actual == limit
-            ),
-            "{error:?}",
-        );
-        // A dropped SYN-SENT socket closes without sending anything (Linux
-        // tcp_close), so the very next connect gets the slot.
-        retry_failed_connect(stack, clock, false);
+    with_net(&[], None, |net, clock, _listener| {
+        run(
+            net,
+            clock,
+            || {
+                guard(clock);
+                false
+            },
+            |handle, spawner, _stop| async move {
+                // 192.0.2.3 is unassigned in this TAP fixture; connect waits for ARP.
+                let target = Target {
+                    addr: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 3), SERVER_PORT),
+                    host: HOST.to_owned(),
+                    path: PATH.to_owned(),
+                };
+                let limit = Duration::from_millis(100);
+                let started = Instant::now();
+                let error = match connect(
+                    &handle,
+                    &spawner,
+                    &target,
+                    socket(None),
+                    webpki_client_config(),
+                    LOCAL_PORT,
+                    limit,
+                )
+                .await
+                {
+                    Ok(_) => panic!("an unanswered ARP opened a feed"),
+                    Err(error) => error,
+                };
+                assert!(
+                    matches!(error, FeedError::Timeout { limit: actual, .. } if actual == limit),
+                    "{error:?}",
+                );
+                assert!(
+                    started.elapsed() >= limit,
+                    "timed out after {:?}",
+                    started.elapsed()
+                );
+                // A dropped SYN-SENT socket closes without sending anything (Linux
+                // tcp_close), so the very next connect gets the slot.
+                connect_refused(&handle, &spawner, true).await;
+            },
+        )
+        .expect("run the client");
     });
 }
 
@@ -464,29 +528,55 @@ fn tickers() -> (Vec<String>, Vec<BookTicker>) {
     (texts, expected)
 }
 
+/// 12 updates with a Ping after the third, through a 1400-byte path MTU and a capped MSS. Once
+/// all were read, `run`'s stop ends `next`; then close.
 #[zhida_test_support::pinned_test]
 fn feed_reads_tickers_answers_ping_and_closes() {
-    let paths = [PathMtu { prefix: Ipv4Cidr::new(SERVER_ADDR, 32), mtu: 1400 }];
-    with_stack(1, &paths, Some(1360), |stack, clock, listener| {
+    let paths = [PathMtu {
+        prefix: Ipv4Cidr::new(SERVER_ADDR, 32),
+        mtu: 1400,
+    }];
+    with_net(&paths, Some(1360), |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let (texts, expected) = tickers();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Tickers(texts)));
-        let target = target();
-        let mut feed = connect(
-            stack, clock, &target, socket(Some(1360)), client_config(roots), LOCAL_PORT, CONNECT_LIMIT,
-        )
-        .expect("connect Zhida TLS WebSocket client");
-        let started = Instant::now();
-        let mut stop = || {
-            assert!(started.elapsed() < READ_LIMIT, "tickers not received within {READ_LIMIT:?}");
-            false
+        let read_all = Rc::new(Cell::new(false));
+        let client_read_all = read_all.clone();
+        let should_stop = || {
+            guard(clock);
+            read_all.get()
         };
-        for ticker in expected {
-            let received = feed.next(clock, &mut stop).expect("read bookTicker");
-            assert_eq!(received, Some(ticker));
-        }
-        let state = feed.close(clock, CLOSE_LIMIT).expect("close Zhida feed");
-        assert!(matches!(state, State::Closed | State::TimeWait), "TCP state {state}");
+        run(
+            net,
+            clock,
+            should_stop,
+            |handle, spawner, mut stop| async move {
+                let tls = client_config(roots);
+                let mut feed = connect(
+                    &handle,
+                    &spawner,
+                    &target(),
+                    socket(Some(1360)),
+                    tls,
+                    LOCAL_PORT,
+                    CONNECT_LIMIT,
+                )
+                .await
+                .expect("connect Zhida TLS WebSocket client");
+                for ticker in expected {
+                    assert_eq!(
+                        feed.next(&mut stop).await.expect("read bookTicker"),
+                        Some(ticker)
+                    );
+                }
+                client_read_all.set(true);
+                assert_eq!(feed.next(&mut stop).await.expect("stop"), None);
+                feed.close(&spawner, CLOSE_LIMIT)
+                    .await
+                    .expect("close Zhida feed");
+            },
+        )
+        .expect("run the client");
         let saw = join(server);
         assert_eq!(saw.path, PATH);
         assert_eq!(saw.host, "binance.test:9443");
@@ -496,70 +586,163 @@ fn feed_reads_tickers_answers_ping_and_closes() {
     });
 }
 
+/// A finished stop does not hide an update already received: `next` returns it first.
 #[zhida_test_support::pinned_test]
-fn upgrade_refused_with_http_451_reports_status_and_body() {
-    with_stack(1, &[], None, |stack, clock, listener| {
+fn received_update_comes_before_a_finished_stop() {
+    with_net(&[], None, |net, clock, listener| {
+        let (server_tls, roots) = server_config();
+        let (texts, expected) = tickers();
+        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Tickers(texts)));
+        run(
+            net,
+            clock,
+            || {
+                guard(clock);
+                false
+            },
+            |handle, spawner, _stop| async move {
+                let tls = client_config(roots);
+                let mut feed = connect(
+                    &handle,
+                    &spawner,
+                    &target(),
+                    socket(None),
+                    tls,
+                    LOCAL_PORT,
+                    CONNECT_LIMIT,
+                )
+                .await
+                .expect("connect Zhida TLS WebSocket client");
+                let first = feed
+                    .next(std::future::pending::<()>())
+                    .await
+                    .expect("read bookTicker");
+                assert_eq!(first.as_ref(), Some(&expected[0]));
+                // The server wrote all 12 in one flush; wait until the last is surely here.
+                spawner
+                    .sleep(200)
+                    .expect("open Runtime")
+                    .await
+                    .expect("sleep");
+                for ticker in &expected[1..] {
+                    let next = feed
+                        .next(std::future::ready(()))
+                        .await
+                        .expect("read bookTicker");
+                    assert_eq!(next.as_ref(), Some(ticker));
+                }
+                assert_eq!(feed.next(std::future::ready(())).await.expect("stop"), None);
+                feed.close(&spawner, CLOSE_LIMIT)
+                    .await
+                    .expect("close Zhida feed");
+            },
+        )
+        .expect("run the client");
+        let saw = join(server);
+        assert!(
+            saw.close && saw.error.is_none(),
+            "server close {} error {:?}",
+            saw.close,
+            saw.error
+        );
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn upgrade_refused_with_http_451_reports_the_status() {
+    with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Refuse451));
-        let target = target();
-        let error = match connect(
-            stack,
-            clock,
-            &target,
-            socket(None),
-            client_config(roots),
-            LOCAL_PORT,
-            CONNECT_LIMIT,
-        ) {
-            Ok(_) => panic!("HTTP 451 opened a WebSocket"),
-            Err(error) => error,
+        let should_stop = || {
+            guard(clock);
+            server.is_finished()
         };
-        assert!(error.to_string().contains("HTTP 451"), "{error}");
-        match error {
-            FeedError::Upgrade { status, body, .. } => {
-                assert_eq!(status, 451);
-                assert!(body.contains("restricted location"), "HTTP 451 body: {body:?}");
-            }
-            other => panic!("expected HTTP 451, got {other:?}"),
-        }
-        retry_failed_connect(stack, clock, true);
-        turn_until_finished(stack, clock, &server);
+        run(
+            net,
+            clock,
+            should_stop,
+            |handle, spawner, stop| async move {
+                let error = match connect(
+                    &handle,
+                    &spawner,
+                    &target(),
+                    socket(None),
+                    client_config(roots),
+                    LOCAL_PORT,
+                    CONNECT_LIMIT,
+                )
+                .await
+                {
+                    Ok(_) => panic!("HTTP 451 opened a WebSocket"),
+                    Err(error) => error,
+                };
+                match &error {
+                    FeedError::Ws(WsError::Upgrade(reason)) => {
+                        assert!(reason.contains("451"), "{reason}")
+                    }
+                    other => panic!("expected the HTTP 451 refusal, got {other:?}"),
+                }
+                assert!(error.to_string().contains("451"), "{error}");
+                connect_refused(&handle, &spawner, false).await;
+                let _ = stop.await;
+            },
+        )
+        .expect("run the client");
         let saw = join(server);
         assert!(saw.error.is_some(), "server accepted the upgrade");
     });
 }
 
 #[zhida_test_support::pinned_test]
-fn unknown_certificate_fails_tls() {
-    with_stack(1, &[], None, |stack, clock, listener| {
+fn unknown_certificate_fails_tls_and_alerts_the_server() {
+    with_net(&[], None, |net, clock, listener| {
         let (server_tls, _) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::TlsOnly));
-        let target = target();
-        let error = match connect(
-            stack,
-            clock,
-            &target,
-            socket(None),
-            webpki_client_config(),
-            LOCAL_PORT,
-            CONNECT_LIMIT,
-        ) {
-            Ok(_) => panic!("Mozilla roots trusted the self-signed certificate"),
-            Err(error) => error,
+        let should_stop = || {
+            guard(clock);
+            server.is_finished()
         };
-        assert!(
-            matches!(
-                error,
-                FeedError::Tls(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::UnknownIssuer
-                ))
-            ),
-            "expected UnknownIssuer, got {error:?}",
-        );
-        retry_failed_connect(stack, clock, true);
-        turn_until_finished(stack, clock, &server);
+        run(
+            net,
+            clock,
+            should_stop,
+            |handle, spawner, stop| async move {
+                let error = match connect(
+                    &handle,
+                    &spawner,
+                    &target(),
+                    socket(None),
+                    webpki_client_config(),
+                    LOCAL_PORT,
+                    CONNECT_LIMIT,
+                )
+                .await
+                {
+                    Ok(_) => panic!("Mozilla roots trusted the self-signed certificate"),
+                    Err(error) => error,
+                };
+                assert!(
+                    matches!(
+                        error,
+                        FeedError::Ws(WsError::Tls(sheath::Error::Tls(
+                            rustls::Error::InvalidCertificate(
+                                rustls::CertificateError::UnknownIssuer
+                            )
+                        )))
+                    ),
+                    "expected UnknownIssuer, got {error:?}",
+                );
+                connect_refused(&handle, &spawner, false).await;
+                let _ = stop.await;
+            },
+        )
+        .expect("run the client");
         let saw = join(server);
-        assert!(saw.error.is_some(), "server TLS handshake did not fail");
+        let error = saw.error.expect("server TLS handshake did not fail");
+        assert!(
+            error.contains("UnknownCA"),
+            "server did not receive the client's alert: {error}"
+        );
     });
 }
 

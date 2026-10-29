@@ -1,5 +1,5 @@
-//! Binance bookTicker over TLS and WebSocket on Zhida's net_tap TCP socket.
-//! See `usage`.
+//! Binance bookTicker over TLS 1.3 and WebSocket on Zhida's net_tap TCP socket, as a switch
+//! task on a switchnet Net. See `usage`.
 
 use std::ffi::OsString;
 use std::fs;
@@ -10,9 +10,9 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, Clock, Target, INGRESS_BUDGET, SOCKET_BUFFER};
-use dpdk_smoltcp::Stack;
+use binance_feed::{connect, run, Clock, FeedError, Target, INGRESS_BUDGET, SOCKET_BUFFER};
 use rustls::ClientConfig;
+use switchnet::{Net, NetConfig};
 use tap_echo::driver::{self, ZHIDA_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP};
 
 const NAME: &str = "binance-feed";
@@ -22,7 +22,7 @@ const READY_LIMIT: Duration = Duration::from_secs(60);
 const FIRST_LOCAL_PORT: u16 = 49152;
 const CONNECT_LIMIT: Duration = Duration::from_secs(20);
 const CLOSE_LIMIT: Duration = Duration::from_secs(10);
-const DEFAULT_HOST: &str = "data-stream.binance.vision";
+const DEFAULT_HOST: &str = "stream.binance.com";
 const DEFAULT_PORT: u16 = 9443;
 const DEFAULT_PATH: &str = "/ws/btcusdt@bookTicker";
 const DEFAULT_PRINT: usize = 10;
@@ -36,15 +36,16 @@ Resolves HOST with the kernel resolver before DPDK starts and uses its first IPv
 address. Defaults: HOST {DEFAULT_HOST}, PORT {DEFAULT_PORT}, PATH {DEFAULT_PATH},
 N {DEFAULT_PRINT}. N may be 0. Each option may appear once, in any order before --.
 TCP runs on Zhida at {ZHIDA_IP}/{PREFIX_LEN}, with IPv4 gateway {TESTER_IP} on
-netdev {IFACE}, connecting from a random local port in {FIRST_LOCAL_PORT}-65535. TLS uses
-the Mozilla roots from webpki-roots. stream.binance.com answers HTTP 451 from restricted
-locations, so the default host is data-stream.binance.vision.
+netdev {IFACE}, connecting from a random local port in {FIRST_LOCAL_PORT}-65535. TLS 1.3
+only (sheath) uses the Mozilla roots from webpki-roots. data-stream.binance.vision speaks
+TLS 1.2 only, so it is unreachable here; stream.binance.com may answer HTTP 451 from
+restricted locations.
 
 The tester starts before DPDK. It must wait for {IFACE} to be up, give the kernel
 side {TESTER_IP} on {IFACE}, NAT Zhida's traffic out of the container, then create
 {READY}. The client prints the first N bookTicker messages and keeps reading until
-the tester exits. It then prints the count and update id range, closes the
-WebSocket, sends TLS close_notify and closes TCP with FIN.
+the tester exits. It then prints the count and update id range, sends the WebSocket
+close, TLS close_notify and FIN, and reads until the server's close echo.
 Only the tester process itself is killed: run it directly or have it exec its
 final command. It must exit on SIGTERM. Bound the run with timeout --kill-after=N
 without --foreground so expiry signals the tester too.
@@ -181,7 +182,12 @@ fn main() {
         1,
         SOCKET_BUFFER,
         Some(TESTER_IP),
-        |stack, start, stop| feed(stack, start, stop, &target, tls, local_port, args.print),
+        |stack, start, stop| {
+            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+            let result = feed(&mut net, start, stop, &target, tls, local_port, args.print);
+            let stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
+            (stack, result)
+        },
     );
     process::exit(code);
 }
@@ -197,8 +203,10 @@ fn random_local_port() -> io::Result<u16> {
     Ok(FIRST_LOCAL_PORT + u16::from_ne_bytes(bytes) % span)
 }
 
+/// Turns `net` until the tester created READY, then runs the feed as a switch task: connect,
+/// print the first `print` updates, read until the tester exits, print the count, close.
 fn feed(
-    stack: &mut Stack,
+    net: &mut Net,
     start: Instant,
     stop: &mut dyn FnMut() -> bool,
     target: &Target,
@@ -208,9 +216,7 @@ fn feed(
 ) -> Result<(), String> {
     let clock = Clock::new(start);
     loop {
-        stack
-            .turn(clock.now(), INGRESS_BUDGET)
-            .map_err(|error| format!("turn: {error}"))?;
+        net.turn(clock.now()).map_err(|error| format!("turn: {error}"))?;
         if stop() {
             return Err(format!("tester exited before {READY} existed"));
         }
@@ -222,46 +228,45 @@ fn feed(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    let mut feed = connect(
-        stack, &clock, target, binance_feed::socket(None), tls, local_port, CONNECT_LIMIT,
-    )
-    .map_err(|error| error.to_string())?;
-    let _ = writeln!(
-        io::stdout(),
-        "{NAME}: connected to {} ({}) from {ZHIDA_IP}:{local_port} over Zhida, \
-         {}, WebSocket open",
-        target.url(),
-        target.addr,
-        feed.tls_summary(),
-    );
-    let mut count = 0usize;
-    let mut first = None;
-    let mut last = None;
-    while let Some(ticker) = feed.next(&clock, stop).map_err(|error| error.to_string())? {
-        count = count.checked_add(1).expect("bookTicker count fits usize");
-        if first.is_none() {
-            first = Some(ticker.update_id);
-        }
-        last = Some(ticker.update_id);
-        if count <= print {
-            let _ = writeln!(io::stdout(), "#{count} {ticker}");
-        }
-    }
-    let secs = start.elapsed().as_secs_f64();
-    if let (Some(first), Some(last)) = (first, last) {
+    let target = target.clone();
+    let count = run(net, &clock, stop, move |handle, spawner, mut stop| async move {
+        let socket = binance_feed::socket(None);
+        let mut feed = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT).await?;
         let _ = writeln!(
             io::stdout(),
-            "{NAME}: {count} bookTicker messages in {secs:.1} s since start, \
-             update ids {first}..{last}",
+            "{NAME}: connected to {} ({}) from {ZHIDA_IP}:{local_port} over Zhida, TLS 1.3, WebSocket open",
+            target.url(),
+            target.addr,
         );
-    } else {
-        let _ = writeln!(io::stdout(), "{NAME}: 0 bookTicker messages in {secs:.1} s since start");
-    }
-    let state = feed.close(&clock, CLOSE_LIMIT).map_err(|error| error.to_string())?;
-    let _ = writeln!(
-        io::stdout(),
-        "{NAME}: closed (WebSocket close handshake, TLS close_notify, TCP {state})",
-    );
+        let mut count = 0usize;
+        let mut first = None;
+        let mut last = None;
+        while let Some(ticker) = feed.next(&mut stop).await? {
+            count = count.checked_add(1).expect("bookTicker count fits usize");
+            if first.is_none() {
+                first = Some(ticker.update_id);
+            }
+            last = Some(ticker.update_id);
+            if count <= print {
+                let _ = writeln!(io::stdout(), "#{count} {ticker}");
+            }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        if let (Some(first), Some(last)) = (first, last) {
+            let _ = writeln!(
+                io::stdout(),
+                "{NAME}: {count} bookTicker messages in {secs:.1} s since start, \
+                 update ids {first}..{last}",
+            );
+        } else {
+            let _ = writeln!(io::stdout(), "{NAME}: 0 bookTicker messages in {secs:.1} s since start");
+        }
+        feed.close(&spawner, CLOSE_LIMIT).await?;
+        let _ = writeln!(io::stdout(), "{NAME}: closed (WebSocket close handshake, TLS close_notify, FIN)");
+        Ok::<_, FeedError>(count)
+    })
+    .and_then(|count| count)
+    .map_err(|error| error.to_string())?;
     if count == 0 {
         return Err("no bookTicker message received".to_owned());
     }

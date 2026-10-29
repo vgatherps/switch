@@ -13,7 +13,9 @@ MODES:
     Socket buffers support messages through 65507 bytes. UDP above MTU - 28
     (1472 at MTU 1500) requires IP fragment reassembly; Zhida does not do it.
   feed [--host H] [--port P] [--path P] [--print N] [--seconds S]
-    Defaults: data-stream.binance.vision, 9443, /ws/btcusdt@bookTicker, N=10, S=30.
+    Defaults: stream.binance.com, 9443, /ws/btcusdt@bookTicker, N=10, S=30. TLS 1.3 only:
+    data-stream.binance.vision (TLS 1.2 only) is unreachable; stream.binance.com may answer
+    HTTP 451 from restricted locations. S counts from the WebSocket open.
 Exit codes: 0 success; 2 buffers in use at close; 3 args/setup/run error; 101 panic.";
 
 pub struct Args {

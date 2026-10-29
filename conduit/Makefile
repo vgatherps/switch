@@ -13,8 +13,8 @@ DOCKER_TARGET_VOLUME ?= zhida-linux-target$(if $(DOCKER_PLATFORM),-$(DOCKER_PLAT
 BINANCE_IMAGE ?= zhida-dpdk-test:binance
 # Seconds the tester keeps the live feed open.
 BINANCE_SECONDS ?= 10
-# TLS server name and HTTP Host of the feed.
-BINANCE_HOST ?= data-stream.binance.vision
+# TLS server name and HTTP Host of the feed (TLS 1.3 only: data-stream.binance.vision is TLS 1.2).
+BINANCE_HOST ?= stream.binance.com
 # TLS WebSocket server port.
 BINANCE_PORT ?= 9443
 # WebSocket request path.

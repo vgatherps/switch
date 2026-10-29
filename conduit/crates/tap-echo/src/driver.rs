@@ -126,16 +126,17 @@ impl Drop for Tester {
 /// until it returns, and composes the exit status.
 ///
 /// `app` gets the Stack, created at `Instant::ZERO` = the wall-clock `start`,
-/// and `stop`, which polls whether the tester exited. It must return `Ok` only
-/// after `stop` returned true. `Err` is printed, the tester killed, exit
-/// `EXIT_ERROR`. Diagnostics are prefixed `name: `.
+/// and `stop`, which polls whether the tester exited, and hands the Stack back
+/// with its result. It must return `Ok` only after `stop` returned true. `Err`
+/// is printed, the tester killed, exit `EXIT_ERROR`. Diagnostics are prefixed
+/// `name: `.
 pub fn run(
     name: &'static str,
     tester: &[OsString],
     max_sockets: usize,
     recv_capacity: usize,
     gateway: Option<Ipv4Addr>,
-    app: impl FnOnce(&mut Stack, Instant, &mut dyn FnMut() -> bool) -> Result<(), String>,
+    app: impl FnOnce(Stack, Instant, &mut dyn FnMut() -> bool) -> (Stack, Result<(), String>),
 ) -> i32 {
     let random_seed = match os_random_seed() {
         Ok(seed) => seed,
@@ -244,7 +245,7 @@ fn serve(
     recv_capacity: usize,
     gateway: Option<Ipv4Addr>,
     random_seed: u64,
-    app: impl FnOnce(&mut Stack, Instant, &mut dyn FnMut() -> bool) -> Result<(), String>,
+    app: impl FnOnce(Stack, Instant, &mut dyn FnMut() -> bool) -> (Stack, Result<(), String>),
 ) -> i32 {
     let mut config = port_config(u16::MAX, max_sockets, recv_capacity);
     let pool_memory_bytes = u64::from(config.rx_pool.count)
@@ -313,7 +314,7 @@ fn serve(
         Err(error) => return tester.fail(error),
     };
     let start = Instant::now();
-    let mut stack = match Stack::new(
+    let stack = match Stack::new(
         port,
         stack_config(max_sockets, gateway, random_seed),
         StackInstant::ZERO,
@@ -323,7 +324,7 @@ fn serve(
     };
 
     let mut waited: io::Result<Option<ExitStatus>> = Ok(None);
-    let served = app(&mut stack, start, &mut || {
+    let (stack, served) = app(stack, start, &mut || {
         waited = tester.child.try_wait();
         !matches!(waited, Ok(None))
     });

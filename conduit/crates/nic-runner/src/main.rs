@@ -8,7 +8,8 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use binance_feed::Clock;
+use binance_feed::{Clock, INGRESS_BUDGET};
+use switchnet::{Net, NetConfig};
 use zhida_netconf::Config;
 use zhida_open::{open, OpenError, Opened};
 use dpdk_smoltcp::Stack;
@@ -216,13 +217,18 @@ fn run(args: Args) -> i32 {
             &clock,
             workload_start,
         ),
-        Mode::Feed(f) => feed::run(
-            &mut stack,
-            f,
-            target.as_ref().unwrap(),
-            feed_socket.expect("feed mode has a socket"),
-            &clock,
-        ),
+        Mode::Feed(f) => {
+            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+            let result = feed::run(
+                &mut net,
+                f,
+                target.as_ref().unwrap(),
+                feed_socket.expect("feed mode has a socket"),
+                &clock,
+            );
+            stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
+            result
+        }
     };
     let mut code = 0;
     if let Err(e) = result {

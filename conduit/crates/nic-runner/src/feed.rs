@@ -1,9 +1,11 @@
+use std::cell::Cell;
 use std::io::Read;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, webpki_client_config, Clock, Target};
-use dpdk_smoltcp::{smoltcp::socket::tcp, Stack};
+use binance_feed::{connect, webpki_client_config, Clock, FeedError, Target};
+use switchnet::{tcp, Net};
 
 use crate::args::Feed;
 use crate::{line, stopped};
@@ -26,8 +28,9 @@ pub fn resolve(args: &Feed) -> Result<Target, String> {
     })
 }
 
+/// Connects, reads for `args.seconds` after the connect (or until a stop signal), closes.
 pub fn run(
-    stack: &mut Stack,
+    net: &mut Net,
     args: &Feed,
     target: &Target,
     socket: tcp::Config,
@@ -38,60 +41,70 @@ pub fn run(
         .and_then(|mut f| f.read_exact(&mut bytes))
         .map_err(|e| format!("local port entropy: {e}"))?;
     let local_port = 49152 + u16::from_ne_bytes(bytes) % (u16::MAX - 49152 + 1);
-    let mut feed = connect(
-        stack,
+    let seconds = Duration::from_secs(args.seconds);
+    let connected: Rc<Cell<Option<Instant>>> = Rc::default();
+    let task_connected = connected.clone();
+    let stop = || stopped() || connected.get().is_some_and(|at| at.elapsed() >= seconds);
+    let (target, print) = (target.clone(), args.print);
+    let count = binance_feed::run(
+        net,
         clock,
-        target,
-        socket,
-        webpki_client_config(),
-        local_port,
-        Duration::from_secs(20),
+        stop,
+        move |handle, spawner, mut stop| async move {
+            let tls = webpki_client_config();
+            let limit = Duration::from_secs(20);
+            let mut feed =
+                connect(&handle, &spawner, &target, socket, tls, local_port, limit).await?;
+            line(
+                "feed_connected",
+                format_args!("{} local_port={local_port} TLS 1.3", target.url()),
+            );
+            task_connected.set(Some(Instant::now()));
+            let mut count = 0u64;
+            let mut first = None;
+            let mut last = None;
+            let read = loop {
+                match feed.next(&mut stop).await {
+                    Ok(Some(ticker)) => {
+                        count += 1;
+                        if first.is_none() {
+                            first = Some(ticker.update_id);
+                        }
+                        last = Some(ticker.update_id);
+                        if count <= print as u64 {
+                            line("feed_message", format_args!("#{count} {ticker}"));
+                        }
+                    }
+                    Ok(None) => break Ok(()),
+                    Err(e) => break Err(e),
+                }
+            };
+            line("feed_count", count);
+            match (first, last) {
+                (Some(first), Some(last)) => {
+                    line("feed_update_ids", format_args!("{first}..{last}"))
+                }
+                _ => line("feed_update_ids", "none"),
+            }
+            let closed = feed.close(&spawner, Duration::from_secs(10)).await;
+            if closed.is_ok() {
+                line(
+                    "feed_close",
+                    "WebSocket close handshake, TLS close_notify, FIN",
+                );
+            }
+            if read.is_err() {
+                if let Err(e) = &closed {
+                    line("feed_close_error", e);
+                }
+            }
+            read?;
+            closed?;
+            Ok::<_, FeedError>(count)
+        },
     )
+    .and_then(|count| count)
     .map_err(|e| e.to_string())?;
-    line(
-        "feed_connected",
-        format_args!(
-            "{} local_port={local_port} {}",
-            target.url(),
-            feed.tls_summary()
-        ),
-    );
-    let run_start = Instant::now();
-    let mut stop = || stopped() || run_start.elapsed() >= Duration::from_secs(args.seconds);
-    let mut count = 0u64;
-    let mut first = None;
-    let mut last = None;
-    let read: Result<(), String> = (|| {
-        while let Some(ticker) = feed.next(clock, &mut stop).map_err(|e| e.to_string())? {
-            count += 1;
-            if first.is_none() {
-                first = Some(ticker.update_id);
-            }
-            last = Some(ticker.update_id);
-            if count <= args.print as u64 {
-                line("feed_message", format_args!("#{count} {ticker}"));
-            }
-        }
-        Ok(())
-    })();
-    line("feed_count", count);
-    match (first, last) {
-        (Some(first), Some(last)) => line("feed_update_ids", format_args!("{first}..{last}")),
-        _ => line("feed_update_ids", "none"),
-    }
-    let closed = feed
-        .close(clock, Duration::from_secs(10))
-        .map_err(|e| e.to_string());
-    if let Ok(state) = &closed {
-        line("feed_close", state);
-    }
-    if read.is_err() {
-        if let Err(e) = &closed {
-            line("feed_close_error", e);
-        }
-    }
-    read?;
-    closed?;
     if count == 0 {
         return Err("no bookTicker message received".into());
     }

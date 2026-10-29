@@ -106,7 +106,10 @@ fn main() {
             expected + 1,
             BUFFER,
             None,
-            |stack, start, stop| serve(stack, start, stop, expected),
+            |mut stack, start, stop| {
+                let served = serve(&mut stack, start, stop, expected);
+                (stack, served)
+            },
         ),
         Mode::Client => driver::run(
             NAME,
@@ -114,7 +117,10 @@ fn main() {
             expected + 2,
             BUFFER,
             None,
-            |stack, start, stop| client(stack, start, stop, expected),
+            |mut stack, start, stop| {
+                let served = client(&mut stack, start, stop, expected);
+                (stack, served)
+            },
         ),
     };
     process::exit(code);
