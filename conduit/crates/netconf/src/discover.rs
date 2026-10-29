@@ -35,6 +35,9 @@ pub struct Discovered {
     pub config: Config,
     pub operstate: String,
     pub warnings: Vec<String>,
+    /// The source lists every address the interface has (AWS IMDS), so `config.owned_ipv4` is
+    /// complete and replaces a previous list on rediscovery; otherwise the previous list is kept.
+    pub enumerates_owned_ipv4: bool,
 }
 
 struct Link {
@@ -290,6 +293,7 @@ fn build(
     Ok(Discovered {
         config: Config::from_json(&config.to_json()).map_err(|e| DiscoverError(e.to_string()))?,
         operstate: kernel.operstate,
+        enumerates_owned_ipv4: aws.is_some(),
         warnings: aws.map(|a| a.warnings).unwrap_or_default(),
     })
 }

@@ -102,7 +102,8 @@ pub(crate) fn derive(
         Vec::new()
     };
     let mut owned_ipv4: Vec<Ipv4Cidr> = addresses.iter().map(|a| Ipv4Cidr::new(*a, 32)).collect();
-    // 404: the ENI has no delegated prefixes
+    // key as amazon-ec2-net-utils lib/lib.sh reads it (get_iface_imds $mac ipv4-prefix); 404: the
+    // ENI has no delegated prefixes
     if let Some(prefixes) = get("ipv4-prefix")? {
         for s in items(&prefixes) {
             owned_ipv4.push(parse_block(s, "ipv4-prefix")?);

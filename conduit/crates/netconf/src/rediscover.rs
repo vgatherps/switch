@@ -1,7 +1,17 @@
-use crate::{Config, ConfigError, Device};
+use crate::{discover::Discovered, Config, ConfigError, Device};
 use std::{fs, io::Write, path::Path};
 
-pub(crate) fn merge(mut discovered: Config, previous: &Config) -> Result<Config, ConfigError> {
+/// Discovered facts replace the previous ones; what the source cannot discover is kept as
+/// configured: devargs, offloads, rx_timestamps, descriptors, eal, path rules other than `vpc`
+/// and `default`, and `owned_ipv4` unless the source enumerates the interface's addresses.
+pub(crate) fn merge(
+    mut discovered: Config,
+    enumerates_owned_ipv4: bool,
+    previous: &Config,
+) -> Result<Config, ConfigError> {
+    if !enumerates_owned_ipv4 {
+        discovered.owned_ipv4.clone_from(&previous.owned_ipv4);
+    }
     if let (Device::Pci(new), Device::Pci(old)) = (&mut discovered.device, &previous.device) {
         new.devargs.clone_from(&old.devargs);
     }
@@ -35,13 +45,17 @@ pub fn load_existing(path: &Path) -> Result<Option<Config>, ConfigError> {
 
 pub fn write(
     path: &Path,
-    discovered: Config,
+    discovered: &Discovered,
     previous: Option<&Config>,
     changes: &mut impl Write,
 ) -> Result<(), ConfigError> {
     let config = match previous {
-        Some(old) => merge(discovered, old)?,
-        None => discovered,
+        Some(old) => merge(
+            discovered.config.clone(),
+            discovered.enumerates_owned_ipv4,
+            old,
+        )?,
+        None => discovered.config.clone(),
     };
     let mut changed = Vec::new();
     if let Some(old) = previous {

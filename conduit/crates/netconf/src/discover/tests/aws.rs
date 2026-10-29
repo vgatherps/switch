@@ -380,8 +380,8 @@ fn operator_rules_survive_rediscover() {
         "10.0.0.0/16\n172.16.0.0/16\n",
         (200, "1.2.3.4"),
     );
-    let discovered = aws(&tree, &server, &addresses()).unwrap().config;
-    let mut previous = discovered.clone();
+    let discovered = aws(&tree, &server, &addresses()).unwrap();
+    let mut previous = discovered.config.clone();
     previous.paths.insert(
         0,
         PathRule {
@@ -409,7 +409,7 @@ fn operator_rules_survive_rediscover() {
     fs::write(&path, previous.to_json()).unwrap();
     let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
     let mut output = Vec::new();
-    crate::rediscover::write(&path, discovered, Some(&loaded), &mut output).unwrap();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
     let merged = Config::load(&path).unwrap();
     assert_eq!(merged.paths[..2], previous.paths[..2]);
     assert_eq!(
@@ -656,24 +656,40 @@ fn aws_prefix_holding_the_gateway_is_rejected() {
     assert!(error.starts_with("owned_ipv4[2]:"), "{error}");
 }
 
-/// Rediscovery replaces the owned addresses with the current ones and reports the change.
+/// An AWS rediscovery replaces the owned addresses with the current ones and reports the change.
 #[test]
-fn rediscover_replaces_and_reports_owned_ipv4() {
+fn aws_rediscover_replaces_and_reports_owned_ipv4() {
     let tree = Tree::new();
     let previous = aws(&tree, &with_prefixes((404, "")), &addresses())
         .unwrap()
         .config;
-    let discovered = aws(&tree, &with_prefixes((200, "10.0.1.48/28\n")), &addresses())
-        .unwrap()
-        .config;
+    let discovered = aws(&tree, &with_prefixes((200, "10.0.1.48/28\n")), &addresses()).unwrap();
     let path = tree.dir.join("config.json");
     fs::write(&path, previous.to_json()).unwrap();
     let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
     let mut output = Vec::new();
-    crate::rediscover::write(&path, discovered.clone(), Some(&loaded), &mut output).unwrap();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
     assert_eq!(
         Config::load(&path).unwrap().owned_ipv4,
-        discovered.owned_ipv4
+        discovered.config.owned_ipv4
     );
     assert_eq!(String::from_utf8(output).unwrap(), "changed: owned_ipv4\n");
+}
+
+/// Kernel discovery does not list owned addresses: a rediscovery keeps the configured ones, like
+/// the other fields it cannot discover, and reports no change.
+#[test]
+fn kernel_rediscover_keeps_configured_owned_ipv4() {
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    assert!(discovered.config.owned_ipv4.is_empty());
+    let mut previous = discovered.config.clone();
+    previous.owned_ipv4 = cidrs(&["10.0.1.48/28", "172.16.0.9/32"]);
+    let path = tree.dir.join("config.json");
+    fs::write(&path, previous.to_json()).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    assert_eq!(Config::load(&path).unwrap().owned_ipv4, previous.owned_ipv4);
+    assert_eq!(String::from_utf8(output).unwrap(), "");
 }
