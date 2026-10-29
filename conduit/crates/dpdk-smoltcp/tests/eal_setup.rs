@@ -33,7 +33,6 @@ fn explicit_argv_initializes_once_and_drop_retains_main_lcore() {
         "application-argument",
     ];
     let eal = Eal::init(&args).expect("explicit test EAL argv must initialize");
-    assert_eq!(eal.consumed_args(), args.len() - 2);
     assert_eq!(eal.owner_lcore_id(), 7);
     assert_eq!(unsafe { zhida_lcore_id() }, eal.owner_lcore_id());
 

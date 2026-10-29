@@ -71,7 +71,6 @@ fn stage(fixture: &Fixture, device: &mut Device, bytes: &[u8]) {
         RxBurst {
             accepted: 1,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0
         }
     );
     assert_eq!(device.rx.len(), staged + 1);
@@ -155,7 +154,6 @@ fn stage_checksum(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags: u
         RxBurst {
             accepted: 1,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0
         }
     );
 }
@@ -810,27 +808,6 @@ fn dropped_tx_metadata_and_spare_flags_do_not_reach_next_frame() {
 }
 
 #[zhida_test_support::pinned_test]
-fn tx_metadata_requires_matching_port_profile() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        for (offload, protocol) in [
-            (TCP_OFFLOAD, "TCP"),
-            (Some(TxChecksum::Udp { ip_header_len: 20 }), "UDP"),
-        ] {
-            let panic = catch_unwind(AssertUnwindSafe(|| {
-                send_meta(&mut device, b"frame", offload)
-            })).unwrap_err();
-            let message = panic.downcast_ref::<String>().unwrap();
-            assert!(message.contains(&format!("port {}:", device.port.port_id())));
-            assert!(message.contains(&format!("{protocol} TX offload metadata without its profile")));
-            assert_eq!(device.pending(), 0);
-            assert_eq!(in_use(&device.port), (0, 0));
-        }
-        finish(fixture, device);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn flush_prepares_each_range_once() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1447,7 +1424,6 @@ fn check_pcap_rx_timestamp(eal: &crate::Eal, enabled: bool) {
         RxBurst {
             accepted: 2,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0,
         }
     );
     assert_eq!(in_use(&device.port).0, 2);
@@ -2336,10 +2312,9 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         let bad = RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_BAD;
         inject(&data, bad);
         let turn = stack.turn(NOW, 4).unwrap();
-        assert_eq!((turn.rx_received, turn.rx_ipv4_checksum_bad), (1, 0));
+        assert_eq!((turn.rx_received, turn.rx_rejected), (1, 0));
         assert_eq!(stack.tcp(&handle).recv_queue(), 0);
         assert!(peer_receive(&fixture, 16).is_empty());
-        assert_eq!(stack.tcp_counters().rx_checksum_bad, 1);
         inject(&data, RTE_MBUF_F_RX_IP_CKSUM_GOOD | RTE_MBUF_F_RX_L4_CKSUM_GOOD);
         stack.turn(NOW, 4).unwrap();
         assert_eq!(stack.tcp(&handle).recv_queue(), 3);
@@ -2348,7 +2323,6 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         let ip = Ipv4Packet::new_checked(&frames[0].data()[14..]).unwrap();
         assert_eq!(TcpPacket::new_checked(ip.payload()).unwrap().ack_number(), TcpSeqNumber(5));
         drop(frames);
-        assert_eq!(stack.tcp_counters().rx_checksum_bad, 1);
         let mut bytes = udp_frame();
         bytes[..12].copy_from_slice(&syn[..12]);
         let mut ip = Ipv4Packet::new_unchecked(&mut bytes[14..]);
@@ -2366,7 +2340,6 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         inject(&bytes, bad);
         stack.turn(NOW, 4).unwrap();
         assert!(stack.udp_mut(&udp).recv().is_none());
-        assert_eq!(stack.udp_counters().rx_checksum_bad, 1);
         stack.remove_tcp(handle);
         stack.remove_udp(udp);
         let port = stack.into_port();

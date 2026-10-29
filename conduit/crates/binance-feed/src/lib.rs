@@ -207,12 +207,7 @@ impl std::error::Error for FeedError {}
 fn pump(stack: &mut Stack, clock: &Clock) -> Result<(), FeedError> {
     let now = clock.now();
     let turn = stack.turn(now, INGRESS_BUDGET).map_err(FeedError::Stack)?;
-    let moved = turn.rx_received
-        + turn.rx_rejected
-        + turn.rx_ipv4_checksum_bad
-        + turn.rx_processed
-        + turn.tx_accepted;
-    if moved == 0 && turn.tx_pending == 0 && turn.rx_staged == 0 {
+    if !turn.moved() && turn.tx_pending == 0 && turn.rx_staged == 0 {
         let sleep = match stack.poll_at() {
             None => MAX_IDLE_SLEEP,
             Some(at) if at <= now => return Ok(()),

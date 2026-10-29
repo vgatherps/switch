@@ -313,57 +313,24 @@ impl InterfaceInner {
     ) -> Option<Packet<'frame>> {
         let udp = udp?;
         assert!(udp.pending_rx_attach.is_none());
-        let packet = match UdpPacket::new_checked(ip_payload) {
-            Ok(packet) => packet,
-            Err(_) => {
-                udp.counters.rx_malformed = udp
-                    .counters
-                    .rx_malformed
-                    .checked_add(1)
-                    .expect("UDP malformed count overflow");
-                return None;
-            }
+        let Ok(packet) = UdpPacket::new_checked(ip_payload) else {
+            return None;
         };
         if !meta.l4_checksum_verified
             && packet.checksum() != 0
             && !packet.verify_checksum(&ipv4_repr.src_addr.into(), &ipv4_repr.dst_addr.into())
         {
-            udp.counters.rx_checksum_bad = udp
-                .counters
-                .rx_checksum_bad
-                .checked_add(1)
-                .expect("UDP checksum count overflow");
             return None;
         }
         if !self.is_broadcast_v4(ipv4_repr.dst_addr)
             && (!self.has_ip_addr(ipv4_repr.dst_addr) || !ipv4_repr.dst_addr.x_is_unicast())
         {
-            udp.counters.rx_not_unicast = udp
-                .counters
-                .rx_not_unicast
-                .checked_add(1)
-                .expect("UDP destination count overflow");
             return None;
         }
-        let slot = match udp.lookup(packet.dst_port()) {
-            Some(slot) => slot,
-            None => {
-                udp.counters.rx_no_port = udp
-                    .counters
-                    .rx_no_port
-                    .checked_add(1)
-                    .expect("UDP closed port count overflow");
-                return None;
-            }
-        };
+        let slot = udp.lookup(packet.dst_port())?;
         let src = IpEndpoint::new(ipv4_repr.src_addr.into(), packet.src_port());
         let socket = udp.socket_at_mut(slot);
         if socket.peer().is_some_and(|peer| src != peer) {
-            socket.stats.rx_dropped_peer = socket
-                .stats
-                .rx_dropped_peer
-                .checked_add(1)
-                .expect("UDP peer drop count overflow");
             return None;
         }
         if socket.at_limit() {

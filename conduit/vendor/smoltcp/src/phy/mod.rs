@@ -110,8 +110,6 @@ pub use self::loopback::Loopback;
 pub use self::rx_buf::RxBuf;
 pub use self::tx_buf::{TxBuf, TxFrame, TxPool, TxSource, TX_HEADROOM};
 pub(crate) use self::tx_buf::UniqueTxBuf;
-#[cfg(not(feature = "dpdk"))]
-pub use self::tx_buf::TxPoolCounts;
 pub use self::held_frames::HeldFrames;
 pub(crate) use self::held_frames::RxShared;
 

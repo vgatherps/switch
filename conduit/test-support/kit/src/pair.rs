@@ -80,7 +80,7 @@ pub struct Round {
 impl Round {
     /// Whether a turn received, processed or sent a frame, or a link moved one.
     pub fn moved(&self) -> bool {
-        moved(&self.a) || moved(&self.b) || self.a_to_b + self.b_to_a > 0
+        self.a.moved() || self.b.moved() || self.a_to_b + self.b_to_a > 0
     }
 }
 
@@ -366,15 +366,6 @@ impl Pair {
     }
 }
 
-fn moved(turn: &Turn) -> bool {
-    turn.rx_received
-        + turn.rx_rejected
-        + turn.rx_ipv4_checksum_bad
-        + turn.rx_processed
-        + turn.tx_accepted
-        > 0
-}
-
 pub const T0: Instant = Instant::from_millis_const(5_000);
 pub const SERVER_PORT: u16 = 80;
 pub const CLIENT_PORT: u16 = 49152;
@@ -604,7 +595,7 @@ impl Rounds {
         b_to_a: &mut Link,
     ) -> bool {
         self.round_with(a, a_to_b, b_to_a, |now| {
-            moved(&b.turn(now, BUDGET).unwrap())
+            b.turn(now, BUDGET).unwrap().moved()
         })
     }
 
@@ -630,7 +621,7 @@ impl Rounds {
         let moved_b = turn_b(self.now);
         let forward_b = b_to_a.forward();
         assert_lossless(b_to_a, "B→A");
-        moved(&turn_a) || moved_b || forward_a + forward_b > 0
+        turn_a.moved() || moved_b || forward_a + forward_b > 0
     }
 
     /// Ends a round: when neither the round nor the caller made progress,

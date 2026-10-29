@@ -23,11 +23,11 @@ pub use self::interface::{
     Config, Interface, InterfaceInner as Context, NoRoute, PollIngressSingleResult, PollResult,
 };
 
-pub use self::tcp_set::{SocketHandle, TcpCounters, TcpSet, TcpStorage};
+pub use self::tcp_set::{SocketHandle, TcpSet, TcpStorage};
 pub use self::drop_queue::DropQueue;
 #[cfg(feature = "udp-set")]
 pub use self::udp_set::{
-    UdpAddError, UdpConfig, UdpConnectError, UdpCounters, UdpDatagram, UdpHandle,
+    UdpAddError, UdpConfig, UdpConnectError, UdpDatagram, UdpHandle,
     UdpSendError, UdpSet, UdpSocket, UdpSocketStats, UdpTarget,
 };
 

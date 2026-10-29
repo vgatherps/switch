@@ -139,7 +139,6 @@ fn ring_bench(c: &mut Criterion, eal: &Eal) {
                 RxBurst {
                     accepted: BATCH,
                     rejected: 0,
-                    rx_ipv4_checksum_bad: 0,
                 }
             );
             staged.clear();

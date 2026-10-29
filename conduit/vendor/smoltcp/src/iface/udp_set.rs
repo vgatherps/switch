@@ -57,18 +57,8 @@ pub struct UdpTarget {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct UdpCounters {
-    pub rx_no_port: u64,
-    pub rx_checksum_bad: u64,
-    pub rx_malformed: u64,
-    pub rx_not_unicast: u64,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UdpSocketStats {
-    pub rx_delivered: u64,
     pub rx_dropped_full: u64,
-    pub rx_dropped_peer: u64,
 }
 
 #[derive(Debug)]
@@ -168,7 +158,6 @@ pub(crate) struct PendingUdp {
 pub struct UdpSet {
     slots: Vec<Slot>,
     ports: FlowTable<u16>,
-    pub(crate) counters: UdpCounters,
     pub(crate) pending_rx_attach: Option<(usize, PendingUdp)>,
     #[cfg(test)]
     pub(crate) template_frames: usize,
@@ -184,7 +173,6 @@ impl UdpSet {
                 })
                 .collect(),
             ports: FlowTable::new(max_sockets),
-            counters: UdpCounters::default(),
             pending_rx_attach: None,
             #[cfg(test)]
             template_frames: 0,
@@ -247,10 +235,6 @@ impl UdpSet {
         held
     }
 
-    pub fn counters(&self) -> UdpCounters {
-        self.counters
-    }
-
     pub(crate) fn lookup(&self, port: u16) -> Option<usize> {
         self.ports.get(&port)
     }
@@ -273,11 +257,6 @@ impl UdpSet {
             dst_addr: pending.dst_addr,
             shared: socket.shared.clone(),
         });
-        socket.stats.rx_delivered = socket
-            .stats
-            .rx_delivered
-            .checked_add(1)
-            .expect("UDP delivered count overflow");
     }
 }
 
@@ -390,9 +369,7 @@ mod tests {
             assert_eq!(set.get(handle).shared.held.get(), 0);
         }
         assert_eq!(releases.get(), 20);
-        assert_eq!(set.get(handle).stats().rx_delivered, 20);
         assert_eq!(set.get(handle).stats().rx_dropped_full, 0);
-        assert_eq!(set.get(handle).stats().rx_dropped_peer, 0);
     }
 
     #[test]

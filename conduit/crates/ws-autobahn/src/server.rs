@@ -140,12 +140,7 @@ impl<'s> Server<'s> {
             .turn(now, INGRESS_BUDGET)
             .map_err(ServerError::Stack)?;
         self.turn = Some(turn);
-        let mut moved = turn.rx_received
-            + turn.rx_rejected
-            + turn.rx_ipv4_checksum_bad
-            + turn.rx_processed
-            + turn.tx_accepted
-            > 0;
+        let mut moved = turn.moved();
         moved |= self.maintain_listener(now)?;
         moved |= self.advance(now)?;
         Ok(moved)

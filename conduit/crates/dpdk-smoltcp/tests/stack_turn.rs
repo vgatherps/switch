@@ -15,10 +15,8 @@ const T: Instant = Instant::from_millis_const(10);
 const IDLE: Turn = Turn {
     rx_received: 0,
     rx_rejected: 0,
-    rx_ipv4_checksum_bad: 0,
     rx_processed: 0,
     rx_staged: 0,
-    rx_blocked: false,
     tx_accepted: 0,
     tx_pending: 0,
 };
@@ -251,16 +249,12 @@ fn rx_flood_each_turn_finite() {
 }
 
 #[zhida_test_support::pinned_test]
-fn undrained_tx_ring_blocks_ingress_reports_rx_blocked_then_recovers() {
+fn undrained_tx_ring_blocks_ingress_keeps_rx_staged_then_recovers() {
     with_eal(|eal| {
         // TX ring holds 3, pending holds 2: replies back up into staging.
         let fixture = RingPort::new("blocked", 16, 4);
         let mut stack = stack(fixture.open(eal), config(8, 2));
         fixture.inject(&requests(0..8));
-        let blocked = Turn {
-            rx_blocked: true,
-            ..IDLE
-        };
         assert_eq!(
             stack.turn(T, 8),
             Ok(Turn {
@@ -268,7 +262,7 @@ fn undrained_tx_ring_blocks_ingress_reports_rx_blocked_then_recovers() {
                 rx_processed: 2,
                 rx_staged: 6,
                 tx_accepted: 2,
-                ..blocked
+                ..IDLE
             })
         );
         assert_eq!(
@@ -278,7 +272,7 @@ fn undrained_tx_ring_blocks_ingress_reports_rx_blocked_then_recovers() {
                 rx_staged: 4,
                 tx_accepted: 1,
                 tx_pending: 1,
-                ..blocked
+                ..IDLE
             })
         );
         assert_eq!(
@@ -287,7 +281,7 @@ fn undrained_tx_ring_blocks_ingress_reports_rx_blocked_then_recovers() {
                 rx_processed: 1,
                 rx_staged: 3,
                 tx_pending: 2,
-                ..blocked
+                ..IDLE
             })
         );
         // The peer is not draining: every further turn is finite and idle.
@@ -297,7 +291,7 @@ fn undrained_tx_ring_blocks_ingress_reports_rx_blocked_then_recovers() {
                 Ok(Turn {
                     rx_staged: 3,
                     tx_pending: 2,
-                    ..blocked
+                    ..IDLE
                 })
             );
         }
@@ -311,7 +305,7 @@ fn undrained_tx_ring_blocks_ingress_reports_rx_blocked_then_recovers() {
                 rx_staged: 1,
                 tx_accepted: 3,
                 tx_pending: 1,
-                ..blocked
+                ..IDLE
             })
         );
         assert_eq!(fixture.take_tx(), replies(3..6));
@@ -599,7 +593,6 @@ fn stack_drop_releases_queues_before_port_close() {
                 rx_staged: 2,
                 tx_accepted: 3,
                 tx_pending: 1,
-                ..IDLE
             })
         );
         assert_eq!(fixture.take_tx(), vec![reply(0), reply(1), reply(2)]);

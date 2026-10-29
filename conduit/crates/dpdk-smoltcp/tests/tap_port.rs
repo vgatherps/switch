@@ -655,13 +655,11 @@ fn tap_rx_checksum_stages_injected_bad_segment() {
         kernel.send(&bad);
         let mut staged = VecDeque::with_capacity(16);
         let mut received = Vec::new();
-        let mut checksum_bad = 0;
         let deadline = Instant::now() + DEADLINE;
         let mut quiet_until = None;
         loop {
             let burst = port.rx_burst(&mut staged).unwrap();
             assert_eq!(burst.rejected, 0);
-            checksum_bad += burst.rx_ipv4_checksum_bad;
             for packet in staged.drain(..) {
                 if packet.data().get(..14) == good.get(..14) {
                     assert_eq!(
@@ -673,12 +671,11 @@ fn tap_rx_checksum_stages_injected_bad_segment() {
                 }
             }
             assert!(received.len() <= 2);
-            assert_eq!(checksum_bad, 0);
-            if received.len() == 2 && checksum_bad == 0 && quiet_until.is_none() {
+            if received.len() == 2 && quiet_until.is_none() {
                 quiet_until = Some(Instant::now() + QUIET);
             }
             if let Some(until) = quiet_until {
-                if Instant::now() >= until && burst.accepted + burst.rx_ipv4_checksum_bad == 0 {
+                if Instant::now() >= until && burst.accepted == 0 {
                     break;
                 }
             }
@@ -689,7 +686,6 @@ fn tap_rx_checksum_stages_injected_bad_segment() {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(received.len(), 2);
-        assert_eq!(checksum_bad, 0);
         assert_eq!(in_use(names.rx_pool), rx_held + 2);
         drop(received);
         assert_eq!(in_use(names.rx_pool), rx_held);
@@ -813,13 +809,11 @@ fn tap_rx_checksum_udp_verdicts() {
         kernel.send(&zero);
         let mut staged = VecDeque::with_capacity(16);
         let mut received = Vec::new();
-        let mut checksum_bad = 0;
         let deadline = Instant::now() + DEADLINE;
         let mut quiet_until = None;
         loop {
             let burst = port.rx_burst(&mut staged).unwrap();
             assert_eq!(burst.rejected, 0);
-            checksum_bad += burst.rx_ipv4_checksum_bad;
             for packet in staged.drain(..) {
                 if packet.data().get(..14) == good.get(..14) {
                     let expected = [&good, &bad, &zero][received.len()];
@@ -828,12 +822,11 @@ fn tap_rx_checksum_udp_verdicts() {
                 }
             }
             assert!(received.len() <= 3);
-            assert_eq!(checksum_bad, 0);
-            if received.len() == 3 && checksum_bad == 0 && quiet_until.is_none() {
+            if received.len() == 3 && quiet_until.is_none() {
                 quiet_until = Some(Instant::now() + QUIET);
             }
             if let Some(until) = quiet_until {
-                if Instant::now() >= until && burst.accepted + burst.rx_ipv4_checksum_bad == 0 {
+                if Instant::now() >= until && burst.accepted == 0 {
                     break;
                 }
             }
@@ -841,7 +834,6 @@ fn tap_rx_checksum_udp_verdicts() {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(received.len(), 3);
-        assert_eq!(checksum_bad, 0);
         assert_eq!(in_use(names.rx_pool), rx_held + 3);
         drop(received);
         assert_eq!(in_use(names.rx_pool), rx_held);

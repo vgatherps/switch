@@ -147,7 +147,7 @@ impl Device {
 /// Reserve a free pending slot and a full-frame TX packet: the spare if one
 /// is held, else a new allocation.
 fn reserve<'a>(
-    port: &'a Port,
+    port: &Port,
     pending: &'a mut VecDeque<TxPacket>,
     spare: &'a mut Option<Packet>,
 ) -> Option<Tx<'a>> {
@@ -162,7 +162,6 @@ fn reserve<'a>(
         packet: Some(packet),
         pending,
         spare,
-        port,
         tx_checksum: None,
     })
 }
@@ -251,7 +250,6 @@ pub(crate) struct Tx<'a> {
     packet: Option<Packet>,
     pending: &'a mut VecDeque<TxPacket>,
     spare: &'a mut Option<Packet>,
-    port: &'a Port,
     tx_checksum: Option<TxChecksum>,
 }
 
@@ -275,7 +273,7 @@ impl phy::TxToken for Tx<'_> {
         };
         packet.truncate(len);
         let result = f(packet.data_mut());
-        let offload = tx_offload(self.port, self.tx_checksum);
+        let offload = tx_offload(self.tx_checksum);
         // SAFETY: the Packet owns its direct, unshared mbuf exclusively.
         unsafe { offload.write(packet.as_ptr()) };
         // The slot checked at reservation is still free: this borrow was exclusive.
@@ -306,30 +304,11 @@ impl TxOffload {
     }
 }
 
-/// The TX offload smoltcp's checksum metadata asks for. Panics if the
-/// metadata names an offload outside the port's profile.
+/// The TX offload smoltcp's checksum metadata asks for. The Stack builds
+/// smoltcp's checksum capabilities from the port's profile, so the metadata
+/// asks only for offloads the profile has.
 #[inline(always)]
-fn tx_offload(port: &Port, tx_checksum: Option<TxChecksum>) -> TxOffload {
-    let port_id = port.port_id();
-    match tx_checksum {
-        Some(TxChecksum::Tcp { .. }) => assert!(
-            port.tx_tcp_checksum(),
-            "port {port_id}: TCP TX offload metadata without its profile"
-        ),
-        Some(TxChecksum::Udp { .. }) => assert!(
-            port.tx_udp_checksum(),
-            "port {port_id}: UDP TX offload metadata without its profile"
-        ),
-        None => (),
-    }
-    tx_offload_unchecked(tx_checksum)
-}
-
-/// `tx_offload` without the profile check. The Stack builds smoltcp's
-/// checksum capabilities from the port's profile, so its metadata asks only
-/// for offloads the profile has.
-#[inline(always)]
-fn tx_offload_unchecked(tx_checksum: Option<TxChecksum>) -> TxOffload {
+fn tx_offload(tx_checksum: Option<TxChecksum>) -> TxOffload {
     let (flags, l3, l4) = match tx_checksum {
         Some(TxChecksum::Tcp {
             ip_header_len,
@@ -368,7 +347,7 @@ impl FrameTx<'_> {
             "port {}: TX frame is not from this Stack's frame pool (TCP socket moved between Stacks)",
             self.port.port_id()
         );
-        let offload = tx_offload_unchecked(tx_checksum);
+        let offload = tx_offload(tx_checksum);
         // SAFETY: the origin check makes `raw` a live, direct, single-segment
         // mbuf of this Stack's frame pool, its payload FRAME_DATA_OFF bytes into
         // its buffer and at most TX_HEADROOM (64) header bytes in front of it

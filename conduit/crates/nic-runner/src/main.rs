@@ -46,12 +46,10 @@ fn signals() -> Result<(), String> {
 pub struct Turns {
     received: u64,
     rejected: u64,
-    ipv4_checksum_bad: u64,
     processed: u64,
     transmitted: u64,
     staged: usize,
     pending: usize,
-    blocked_turns: u64,
 }
 
 impl Turns {
@@ -61,12 +59,10 @@ impl Turns {
             .map_err(|e| format!("Stack::turn: {e}"))?;
         self.received += t.rx_received as u64;
         self.rejected += t.rx_rejected as u64;
-        self.ipv4_checksum_bad += t.rx_ipv4_checksum_bad as u64;
         self.processed += t.rx_processed as u64;
         self.transmitted += t.tx_accepted as u64;
         self.staged = t.rx_staged;
         self.pending = t.tx_pending;
-        self.blocked_turns += u64::from(t.rx_blocked);
         Ok(())
     }
 
@@ -88,9 +84,8 @@ impl Turns {
         line(
             "stack_totals",
             format_args!(
-                "rx_received={} rx_rejected={} rx_ipv4_checksum_bad={} rx_processed={} tx_accepted={} rx_staged={} tx_pending={} rx_blocked_turns={}",
-                self.received, self.rejected, self.ipv4_checksum_bad, self.processed, self.transmitted,
-                self.staged, self.pending, self.blocked_turns
+                "rx_received={} rx_rejected={} rx_processed={} tx_accepted={} rx_staged={} tx_pending={}",
+                self.received, self.rejected, self.processed, self.transmitted, self.staged, self.pending
             ),
         );
     }
@@ -233,9 +228,6 @@ fn run(args: Args) -> i32 {
     if let Err(e) = result {
         line("error", e);
         code = 3;
-    }
-    if !matches!(args.mode, Mode::Server(_)) {
-        line("udp_counters", format_args!("{:?}", stack.udp_counters()));
     }
     if let Err(e) = nic::print_eth_stats(port_id) {
         line("error", e);

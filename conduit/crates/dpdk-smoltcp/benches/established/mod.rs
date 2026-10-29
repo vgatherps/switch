@@ -35,9 +35,9 @@ pub fn expected_turn(
 }
 
 /// (received, rejected, processed, still staged, accepted), with nothing
-/// left pending and ingress not blocked.
+/// left pending.
 pub fn turn_counts(turn: &Turn) -> (usize, usize, usize, usize, usize) {
-    assert_eq!((turn.rx_blocked, turn.tx_pending), (false, 0), "{turn:?}");
+    assert_eq!(turn.tx_pending, 0, "{turn:?}");
     (
         turn.rx_received,
         turn.rx_rejected,

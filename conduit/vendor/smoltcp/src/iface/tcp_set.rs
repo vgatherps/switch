@@ -166,11 +166,6 @@ impl fmt::Display for SocketHandle {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct TcpCounters {
-    pub rx_checksum_bad: u64,
-}
-
 /// An extensible set of TCP sockets.
 ///
 /// The lifetime `'a` is used when storing a `tcp::Socket<'a>`.  If you're using
@@ -188,7 +183,6 @@ pub struct TcpCounters {
 #[derive(Debug)]
 pub struct TcpSet<'a> {
     sockets: ManagedSlice<'a, TcpStorage<'a>>,
-    pub(crate) counters: TcpCounters,
     pub(crate) pending_rx_attach: Option<(usize, tcp::PendingRxCommit)>,
     pub(crate) pending_tcp_reply: Option<usize>,
     /// Number of occupied slots.
@@ -218,10 +212,6 @@ pub struct TcpSet<'a> {
 }
 
 impl<'a> TcpSet<'a> {
-    pub fn counters(&self) -> TcpCounters {
-        self.counters
-    }
-
     /// Create a socket set using the provided storage.
     pub fn new<SocketsT>(sockets: SocketsT) -> TcpSet<'a>
     where
@@ -242,7 +232,6 @@ impl<'a> TcpSet<'a> {
         let mut set = TcpSet {
             sockets,
             pending_rx_attach: None,
-            counters: TcpCounters::default(),
             pending_tcp_reply: None,
             len,
             occupied,

@@ -263,11 +263,9 @@ impl std::error::Error for PortOpenError {}
 pub struct RxBurst {
     /// Packets appended to the caller's queue, in arrival order.
     pub accepted: usize,
-    /// Valid but unsupported packets released by standard DPDK free.
+    /// Packets released by standard DPDK free: unsupported, or (with the RX
+    /// checksum profile on) a bad IPv4 header checksum reported by the NIC.
     pub rejected: usize,
-    /// Frames released because the NIC reported a bad IPv4 header checksum
-    /// with the RX checksum profile on.
-    pub rx_ipv4_checksum_bad: usize,
 }
 
 /// Restricted packet owner: one direct, single-segment mbuf with `refcnt == 1`,
@@ -892,25 +890,20 @@ impl Port {
         }
         let count = (staged.capacity() - staged.len()).min(self.rx_scratch.len());
         if count == 0 {
-            return Ok(RxBurst {
-                accepted: 0,
-                rejected: 0,
-                rx_ipv4_checksum_bad: 0,
-            });
+            return Ok(RxBurst { accepted: 0, rejected: 0 });
         }
         // `count` fits: the scratch length came from a u16.
         let received =
             unsafe { eth_rx_burst(self.port_id, 0, self.rx_scratch.as_mut_ptr(), count as u16) };
         let pool = self.rx.pool().pool();
         let mut rejected = 0;
-        let mut rx_ipv4_checksum_bad = 0;
         for &raw in &self.rx_scratch[..usize::from(received)] {
             if self.rx_checksum {
                 let flags = unsafe { (*raw).ol_flags };
                 let ip_bad = flags & RTE_MBUF_F_RX_IP_CKSUM_MASK == RTE_MBUF_F_RX_IP_CKSUM_BAD;
                 if ip_bad {
                     unsafe { dpdk_raw_pktmbuf_free(raw) };
-                    rx_ipv4_checksum_bad += 1;
+                    rejected += 1;
                     continue;
                 }
             }
@@ -925,9 +918,8 @@ impl Port {
             }
         }
         Ok(RxBurst {
-            accepted: usize::from(received) - rejected - rx_ipv4_checksum_bad,
+            accepted: usize::from(received) - rejected,
             rejected,
-            rx_ipv4_checksum_bad,
         })
     }
 

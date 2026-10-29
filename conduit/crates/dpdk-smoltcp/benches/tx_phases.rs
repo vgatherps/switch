@@ -429,10 +429,8 @@ fn assert_receive(turn: Turn, received: usize, case: Case, step: &str) {
         Turn {
             rx_received: received,
             rx_rejected: 0,
-            rx_ipv4_checksum_bad: 0,
             rx_processed: received,
             rx_staged: 0,
-            rx_blocked: false,
             tx_accepted: 0,
             tx_pending: 0,
         },

@@ -296,7 +296,6 @@ fn bulk_poll_sends_two_pending_queues() {
         let turn = stack.receive(net_time(origin, now), 32).unwrap();
         assert_eq!(turn.rx_received, pending);
         assert_eq!(turn.rx_rejected, 0);
-        assert!(!turn.rx_blocked);
         received += drain_bytes(stack.tcp_mut(&handle)).unwrap().len();
     }
     assert_eq!(received, 2 * pending * mss);
@@ -341,7 +340,6 @@ fn udp_stream_reports_delivery_and_loss() {
         assert_eq!(peer.warmup_delivered, warmup);
         assert_eq!(peer.reordered, 0);
         assert_eq!(peer.rx_dropped_full, 0);
-        assert_eq!(peer.udp_counters, dpdk_smoltcp::UdpCounters::default());
         assert!(client.elapsed_ns > 0);
         let json = client.to_json();
         let pps: f64 = json

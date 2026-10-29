@@ -313,7 +313,6 @@ fn af_packet_hardware_mode_opens_and_stamps() {
             let now = StackInstant::from_micros(i64::try_from(elapsed.as_micros()).unwrap());
             let turn = stack.turn(now, BURST).unwrap();
             assert_eq!(turn.rx_rejected, 0);
-            assert_eq!(turn.rx_ipv4_checksum_bad, 0);
             while let Some(datagram) = stack.udp_mut(&handle).recv() {
                 assert_eq!(datagram.src(), peer);
                 assert_eq!(datagram.payload(), [stamps.len() as u8]);

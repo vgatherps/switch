@@ -164,9 +164,7 @@ fn kernel_off_subnet_peer_through_gateway() {
                 );
                 drop(datagram);
                 recv_kernel(stack, start, &kernel, b"from remote");
-                assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
                 assert_eq!(stack.udp(&handle).rx_queued(), 0);
-                assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
                 assert_kernel_quiet(stack, start, &kernel);
             },
         );
@@ -311,7 +309,6 @@ fn turn(stack: &mut Stack, start: Instant) {
     let now = StackInstant::from_micros(i64::try_from(elapsed.as_micros()).unwrap());
     let result = stack.turn(now, BURST).unwrap();
     assert_eq!(result.rx_rejected, 0);
-    assert_eq!(result.rx_ipv4_checksum_bad, 0);
     std::thread::yield_now();
 }
 
@@ -419,11 +416,8 @@ fn kernel_to_zhida_datagrams() {
                 drop(datagram);
             }
             let stats = stack.udp(&handle).stats();
-            assert_eq!(stats.rx_delivered, u64::try_from(payloads.len()).unwrap());
             assert_eq!(stats.rx_dropped_full, 0);
-            assert_eq!(stats.rx_dropped_peer, 0);
             assert_eq!(stack.udp(&handle).rx_queued(), 0);
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
         });
     });
 }
@@ -466,7 +460,6 @@ fn offload_kernel_to_zhida_and_back() {
                     assert_eq!(datagram.payload(), payload);
                     drop(datagram);
                 }
-                assert_eq!(stack.udp(&handle).stats().rx_delivered, payloads.len() as u64);
                 assert_eq!(stack.udp(&handle).rx_queued(), 0);
                 let capture = UdpCapture::bind(iface);
                 for payload in &payloads {
@@ -474,7 +467,6 @@ fn offload_kernel_to_zhida_and_back() {
                     recv_kernel(stack, start, &kernel, payload);
                     capture.verify_next(stack, start, peer, payload);
                 }
-                assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
                 assert_kernel_quiet(stack, start, &kernel);
             });
         }
@@ -530,14 +522,11 @@ fn kernel_zero_checksum_accepted() {
             };
             assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
             let payload = b"kernel checksum zero";
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
             send_kernel(stack, start, &kernel, payload);
             let datagram = recv_zhida(stack, start, &handle);
             assert_eq!(datagram.src(), endpoint(kernel.local_addr().unwrap()));
             assert_eq!(datagram.payload(), payload);
             drop(datagram);
-            assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
         });
     });
 }
@@ -574,14 +563,11 @@ fn offload_kernel_zero_checksum_accepted() {
             };
             assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
             let payload = b"kernel checksum zero";
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
             send_kernel(stack, start, &kernel, payload);
             let datagram = recv_zhida(stack, start, &handle);
             assert_eq!(datagram.src(), endpoint(kernel.local_addr().unwrap()));
             assert_eq!(datagram.payload(), payload);
             drop(datagram);
-            assert_eq!(stack.udp(&handle).stats().rx_delivered, 1);
-            assert_eq!(stack.udp_counters().rx_checksum_bad, 0);
         });
     });
 }
@@ -641,16 +627,16 @@ fn connected_zhida_socket_echo() {
             let other = kernel_socket();
             assert_ne!(other.local_addr().unwrap(), kernel.local_addr().unwrap());
             send_kernel(stack, start, &other, b"wrong peer");
-            while stack.udp(&handle).stats().rx_dropped_peer == 0 {
-                turn(stack, start);
-            }
-            let stats = stack.udp(&handle).stats();
-            assert_eq!(stats.rx_dropped_peer, 1);
-            assert_eq!(stats.rx_dropped_full, 0);
-            assert_eq!(stats.rx_delivered, u64::try_from(payloads.len()).unwrap());
+            // The tap and the Stack keep arrival order: the peer's later datagram
+            // arriving alone shows the wrong peer's was processed and dropped.
+            send_kernel(stack, start, &kernel, b"marker");
+            let datagram = recv_zhida(stack, start, &handle);
+            assert_eq!((datagram.src(), datagram.payload()), (peer, &b"marker"[..]));
+            drop(datagram);
             assert!(stack.udp_mut(&handle).recv().is_none());
             assert_kernel_quiet(stack, start, &other);
             assert_kernel_quiet(stack, start, &kernel);
+            assert_eq!(stack.udp(&handle).stats().rx_dropped_full, 0);
         });
     });
 }
@@ -666,8 +652,9 @@ fn closed_port_no_icmp() {
             frame_pool: c"udpk_closed_fr",
         };
         with_stack(eal, names, |stack, start| {
+            let handle = add_udp(stack, false);
             let kernel = kernel_socket();
-            kernel.connect(zhida_address()).unwrap();
+            kernel.connect((ZHIDA_ADDR, PORT + 1)).unwrap();
             let payload = b"closed port";
             loop {
                 turn(stack, start);
@@ -680,10 +667,13 @@ fn closed_port_no_icmp() {
                     Err(error) => panic!("connected kernel send: {error}"),
                 }
             }
-            while stack.udp_counters().rx_no_port == 0 {
-                turn(stack, start);
-            }
-            assert_eq!(stack.udp_counters().rx_no_port, 1);
+            // The tap and the Stack keep arrival order, and the kernel queues both
+            // datagrams behind the same ARP resolution: the bound port receiving the
+            // later one shows the closed-port datagram was processed first.
+            send_kernel(stack, start, &kernel_socket(), b"marker");
+            let datagram = recv_zhida(stack, start, &handle);
+            assert_eq!(datagram.payload(), b"marker");
+            drop(datagram);
             assert_kernel_quiet(stack, start, &kernel);
             kernel.set_nonblocking(false).unwrap();
             kernel.set_read_timeout(Some(QUIET)).unwrap();

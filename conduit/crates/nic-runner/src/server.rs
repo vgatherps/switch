@@ -231,7 +231,6 @@ fn report(
             ),
         );
     }
-    line("udp_counters", format_args!("{:?}", stack.udp_counters()));
     turns.print();
     nic::print_eth_stats(port)
 }

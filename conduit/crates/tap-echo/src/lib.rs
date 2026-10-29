@@ -216,9 +216,7 @@ pub fn serve(
         if stop(stack, echo) {
             return Ok(());
         }
-        let idle =
-            turn.rx_received == 0 && turn.rx_processed == 0 && turn.tx_accepted == 0 && !changed;
-        if !idle {
+        if turn.moved() || changed {
             continue;
         }
         let sleep = match stack.poll_at() {

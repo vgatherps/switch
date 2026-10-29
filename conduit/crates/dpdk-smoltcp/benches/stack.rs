@@ -309,7 +309,6 @@ fn receive_and_free(port: &mut Port, staged: &mut VecDeque<Packet>, count: usize
         RxBurst {
             accepted: count,
             rejected: 0,
-            rx_ipv4_checksum_bad: 0
         }
     );
     staged.clear();

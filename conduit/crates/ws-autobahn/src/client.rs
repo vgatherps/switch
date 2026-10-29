@@ -184,13 +184,7 @@ impl<'s> Client<'s> {
             .turn(now, INGRESS_BUDGET)
             .map_err(ClientError::Stack)?;
         self.turn = Some(turn);
-        let moved = turn.rx_received
-            + turn.rx_rejected
-            + turn.rx_ipv4_checksum_bad
-            + turn.rx_processed
-            + turn.tx_accepted
-            > 0;
-        Ok(self.advance(now)? || moved)
+        Ok(self.advance(now)? || turn.moved())
     }
 
     /// The Stack, through whichever state holds it.

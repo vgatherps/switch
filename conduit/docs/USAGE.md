@@ -189,8 +189,7 @@ let eal = Eal::init(&eal_args)?;
 ```
 
 The tap's device/memory options are example-specific; `--no-pci` disables PCI probing. Use options
-for your device and keep the one-CPU mapping. `owner_lcore_id()` reports the initialized lcore;
-`consumed_args()` reports DPDK's consumed count.
+for your device and keep the one-CPU mapping. `owner_lcore_id()` reports the initialized lcore.
 
 EAL creates writable argument strings and a pointer array for initialization. Only the strings
 remain allocated until process exit, because DPDK retains pointers to parsed options. A failed
@@ -246,9 +245,9 @@ reception.
 
 `Offloads::default()` requests none. `rx_checksum: true` requests IPv4, TCP, and UDP RX verification
 together. GOOD verdicts let smoltcp skip the corresponding software check. An IPv4-header BAD verdict
-drops the packet in the Port and increments `rx_ipv4_checksum_bad`. Any other verdict, including L4
-BAD, leaves the packet to smoltcp's software verification; TCP and UDP software failures appear in
-`Stack::tcp_counters()` and `Stack::udp_counters()`. `rx_timestamp: true` requests hardware RX
+drops the packet in the Port and counts it in `rx_rejected`. Any other verdict, including L4
+BAD, leaves the packet to smoltcp's software verification, which drops TCP and UDP failures.
+`rx_timestamp: true` requests hardware RX
 timestamps; see Hardware RX timestamps. `tx_tcp_checksum: true` and `tx_udp_checksum: true` request
 the respective TX checksums. IPv4 header checksums run in software. The Stack prepares offload
 metadata before flushing frames; direct `Port::tx_burst` does not. With UDP TX offload enabled,
@@ -462,7 +461,7 @@ short. `send` needs no preceding receive and may repeat. It uses the last suppli
 
 Without TX backpressure, `receive` then `send` with no application changes emits the same frames as
 `turn`, with the same combined counts. Under backpressure, the extra flush between ingress and
-egress can let more frames through, so accepted/pending counts and the next call's `rx_blocked` can
+egress can let more frames through, so accepted/pending counts and the next call's `rx_staged` can
 differ.
 
 ### Push pending frames
@@ -487,9 +486,9 @@ timer wheel can report a boundary before the actual socket deadline. `poll_at` d
 staged RX frames, pending TX frames, or packet arrivals, so never wait on it indefinitely. The feed
 caps its idle wait at 1 ms; a busy-poll application calls again immediately.
 
-If `rx_staged > 0` and `rx_blocked == false`, the ingress budget ran out: call ingress again
-promptly. If `rx_blocked` is true, processing needs a pending slot and a TX packet; flush and retry
-as the PMD accepts frames or returns TX buffers. Budget exhaustion alone does not set `rx_blocked`.
+If `rx_staged > 0`, call ingress again promptly: either the ingress budget ran out, or processing
+needs a pending slot and a TX packet, in which case flush and retry as the PMD accepts frames or
+returns TX buffers.
 If a call reported `tx_pending > 0`, call `flush` until nothing is pending, then `send`,
 independently of `poll_at`. `send` runs egress before its flush, so with the pending queue full it
 only flushes. A TCP sender refused by the full queue stays due and is served first on retry; a
@@ -829,8 +828,7 @@ drop(datagram);
 `rx_timestamp()` returns the raw hardware stamp, 0 for none. `payload()` gives `&[u8]`, and
 `payload_mut()` gives `&mut [u8]`. A held datagram consumes receive credit even when
 `rx_queued() == 0`. Datagrams arriving at the credit limit are dropped and counted; UDP does not
-backpressure the sender. `udp_counters()` reads Stack-wide receive counts; `udp(&handle).stats()`
-reads socket counts. `remove_udp(handle)` consumes the handle, frees queued datagrams, unbinds the
+backpressure the sender. `udp(&handle).stats()` reads the socket's `rx_dropped_full` count. `remove_udp(handle)` consumes the handle, frees queued datagrams, unbinds the
 port, and releases the budget immediately; dropping the handle does the same at the next cleanup
 call (see Handles). Held datagrams remain charged until dropped. Do not replace a socket through
 `udp_mut`.
@@ -866,25 +864,25 @@ reports stamps when `rx_timestamps` is enabled in the config.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `rx_received` | `usize` | Packets accepted into staging by this call's RX burst. |
-| `rx_rejected` | `usize` | Unsupported RX mbufs released by the Port. |
-| `rx_ipv4_checksum_bad` | `usize` | RX packets dropped for a BAD IPv4-header checksum verdict. |
+| `rx_rejected` | `usize` | RX mbufs released by the Port: unsupported, or a BAD IPv4-header checksum verdict. |
 | `rx_processed` | `usize` | Staged packets handed to smoltcp in this call. |
-| `rx_staged` | `usize` | Packets left staged after ingress. |
-| `rx_blocked` | `bool` | Ingress lacked reply capacity while packets remained staged. |
+| `rx_staged` | `usize` | Packets left staged after ingress: budget ran out or no reply capacity. |
 | `tx_accepted` | `usize` | Frames accepted by the PMD across this call's flushes. |
 | `tx_pending` | `usize` | Frames pending after this call. |
 
 `rx_processed` can exceed `rx_received` when old staging is drained. It includes packets smoltcp
 drops; it is not an application delivery count. `receive` includes its initial and post-ingress
-flushes; `turn` includes its initial and final flushes.
+flushes; `turn` includes its initial and final flushes. `Turn::moved()` is true when the call
+received, rejected, processed or accepted anything; a call that did not, with nothing staged or
+pending, is idle.
 
 `Sent` has `tx_accepted: usize` and `tx_pending: usize`. For `send`, acceptance is from its final
 flush; for `flush`, it is from that flush. To account for a split iteration, add
 `received.tx_accepted + sent.tx_accepted` and use `sent.tx_pending` as the final pending count.
 
-`RxBurst` reports `accepted`, `rejected`, and `rx_ipv4_checksum_bad`. The Port imports only its own
-RX pool's direct, unique, single-segment mbufs with valid lengths and no external buffer, and frees
-and counts other mbufs separately from checksum drops. There is no cumulative Port rejection getter;
+`RxBurst` reports `accepted` and `rejected`. The Port imports only its own RX pool's direct, unique,
+single-segment mbufs with valid lengths and no external buffer, and frees and counts other mbufs and
+BAD IPv4-header checksum drops as `rejected`. There is no cumulative Port rejection getter;
 accumulate the per-call counts.
 
 ### TCP and UDP counters
@@ -908,31 +906,17 @@ Both counters survive abort and other closes until socket reset runs, such as co
 TimeWait expiry, or a peer reset that re-arms Listen. `congestion_window() -> usize` reports Cubic's
 current window in bytes. It is separate from the peer window and TX ring space. Also inspect
 `state`, endpoints, `send_queue`, `recv_queue`, `recv_room`, capacities, and `rx_refused_segments`.
-The latter is a `u32` count that saturates at its maximum. `Stack::tcp_counters() -> TcpCounters`
-has one cumulative `u64` field, `rx_checksum_bad`: TCP segments rejected by software checksum
-verification.
+The latter is a `u32` count that saturates at its maximum.
 
-`Stack::ipv4_dropped()` counts malformed IPv4 packets, software IPv4 checksum failures, and rejected fragments before transport processing.
-
-`UdpCounters` fields are cumulative `u64` receive counts for the UDP set:
-
-| Field | Meaning |
-| --- | --- |
-| `rx_no_port` | Validated UDP packets for an unbound destination port. |
-| `rx_checksum_bad` | Bad nonzero UDP checksums found in software. |
-| `rx_malformed` | UDP packet/header length validation failures. |
-| `rx_not_unicast` | Destinations rejected by UDP destination validation. |
-
-These counters count packets reaching the UDP handler, not every frame rejected earlier by Ethernet,
-IPv4, or the Port. RX-offload IPv4-header BAD drops appear in `Turn::rx_ipv4_checksum_bad`; an
-offload L4 BAD verdict leaves the packet to software verification, which counts here if it fails.
-UDP checksum zero is accepted. Recognized broadcast destinations are
-accepted; multicast is rejected. An unbound port is dropped without an ICMP port-unreachable
-response. `UdpSocketStats` has cumulative `u64` fields `rx_delivered`, `rx_dropped_full`, and
-`rx_dropped_peer`. Delivery means queued successfully, not read by the application. The full count
-includes credit exhaustion from held datagrams; the peer count records connected-socket source
-mismatches. `rx_queued()` reports only datagrams in the queue. Removing and re-adding a UDP
-socket starts new socket stats; Stack-wide counters remain.
+Malformed IPv4 packets, software IPv4 checksum failures, rejected fragments, malformed UDP, bad
+nonzero UDP checksums, non-unicast UDP destinations, unbound UDP ports and, on a connected socket,
+datagrams from another source are dropped without a count. RX-offload IPv4-header BAD drops appear
+in `Turn::rx_rejected`; an offload L4 BAD verdict leaves the packet to software verification. UDP
+checksum zero is accepted. Recognized broadcast destinations are accepted; multicast is rejected. An
+unbound port is dropped without an ICMP port-unreachable response. `UdpSocketStats` has one
+cumulative `u64` field, `rx_dropped_full`: datagrams dropped at the credit limit, including credit
+held by unread datagrams. `rx_queued()` reports only datagrams in the queue. Removing and re-adding
+a UDP socket starts new socket stats.
 
 ## Errors and panics
 
