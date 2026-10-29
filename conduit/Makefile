@@ -205,10 +205,11 @@ test-switchnet: doctor
 
 # relay (WebSocket) and sheath (TLS), including their Docker tests over net_tap: relay's ws://
 # and wss:// clients (relay's switchnet feature) against kernel tungstenite servers, sheath's
-# TLS client (sheath's switchnet feature) against a kernel rustls server.
+# TLS client (sheath's switchnet feature) against a kernel rustls server. `e2e` is each crate's
+# test-only feature for those tests (switchnet's testkit).
 test-wss: doctor
-	$(TIMEOUT) cargo test --locked -p relay --features switchnet -- --test-threads=1
-	$(TIMEOUT) cargo test --locked -p sheath --features switchnet -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p relay --features e2e -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p sheath --features e2e -- --test-threads=1
 
 test-ws: doctor
 	$(TIMEOUT) cargo test --locked -p ws-autobahn -- --test-threads=1
@@ -555,7 +556,7 @@ docker-tls-anvil:
 	say() { echo "docker-tls-anvil: $$*" >&2; }; \
 	cleanup() { rc=$$?; $(DOCKER) rm -f $$c $$a >/dev/null 2>&1; exit $$rc; }; \
 	trap cleanup EXIT; trap 'exit 130' INT TERM HUP; \
-	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p sheath --features switchnet --example tls_anvil || exit 1; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p sheath --features e2e --example tls_anvil || exit 1; \
 	rm -rf $$run && mkdir -p $$run || exit 1; \
 	$(DOCKER) run -d --name $$c $(DOCKER_DPDK) $(DOCKER_IMAGE) \
 		timeout --kill-after=10 $$(( $(TLS_ANVIL_TIMEOUT) + 120 )) ../target/release/examples/tls_anvil $$run >/dev/null || exit 1; \
