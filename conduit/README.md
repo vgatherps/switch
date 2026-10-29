@@ -18,7 +18,7 @@ Ethernet.
 | `crates/zhida-dpdk-sys` | `zhida-dpdk-sys` | Bindings to DPDK 25.11.3 |
 | `crates/nic-runner` | `nic-runner` | `zhida-nic`: runs a Stack on a real NIC (link info, sockperf server, feed client) |
 | `crates/tap-echo` | `tap-echo` | TCP echo server over a tap device, the target for packetdrill and the fuzzers |
-| `crates/binance-feed` | `binance-feed` | Binance bookTicker client over TCP, TLS and WebSocket |
+| `crates/binance-feed` | `binance-feed` | Binance bookTicker client: relay's wss client (TLS 1.3 through sheath) on switchnet |
 | `crates/stack-stream` | `stack-stream` | `Read`/`Write` adapter over a TCP socket |
 | `crates/memif-bench` | `memif-bench` | Benchmarks over DPDK memif |
 | `crates/sockperf-wire` | `sockperf-wire` | sockperf's message format, used by `zhida-nic` |

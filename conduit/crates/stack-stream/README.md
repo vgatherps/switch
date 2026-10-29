@@ -2,7 +2,7 @@
 
 `StackStream`: nonblocking `std::io::Read` and `Write` over one TCP socket of a borrowed `dpdk_smoltcp::Stack`. It lets code written against `Read + Write`, such as tungstenite and rustls, run on a zhida socket.
 
-Used by `binance-feed`. Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md).
+Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md).
 
 ## API
 

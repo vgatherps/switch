@@ -675,9 +675,9 @@ its cases hides a new failure in its other cases.
 ## Live Binance example (`make docker-binance`)
 
 `crates/binance-feed` subscribes to Binance's public `btcusdt@bookTicker` WebSocket stream over
-TLS with TCP running on Zhida: a DPDK net_tap port and a `Stack` inside the Docker container,
-not kernel sockets. rustls (ring provider, webpki-roots) runs over stack-stream's `StackStream`,
-tungstenite over rustls. It needs internet:
+TLS 1.3 with TCP running on Zhida: a DPDK net_tap port and a switchnet `Net` inside the Docker
+container, not kernel sockets. The client is relay's wss client over sheath (rustls with the ring
+provider and webpki-roots), run as a switch task. It needs internet:
 
 ```sh
 make docker-binance BINANCE_SECONDS=30
@@ -686,7 +686,7 @@ make docker-binance BINANCE_SECONDS=30
 | Variable | Default |
 | --- | --- |
 | `BINANCE_SECONDS` | 10 |
-| `BINANCE_HOST` | `data-stream.binance.vision` (`stream.binance.com` answers HTTP 451 from restricted locations) |
+| `BINANCE_HOST` | `stream.binance.com` (may answer HTTP 451 from restricted locations; `data-stream.binance.vision` speaks TLS 1.2 only, which sheath does not) |
 | `BINANCE_PORT` | 9443 |
 | `BINANCE_PATH` | `/ws/btcusdt@bookTicker` |
 | `BINANCE_PRINT` | 10 (messages printed) |
@@ -699,7 +699,7 @@ resolves the host with the container's kernel resolver before DPDK starts.
 192.0.2.2 with gateway 192.0.2.1), NATs Zhida's traffic out of eth0 and recomputes the TCP
 checksum of segments arriving on eth0: under Docker Desktop they arrive with an unfilled
 checksum, which the kernel's own TCP accepts but Zhida rejects. After `BINANCE_SECONDS` the
-client closes the WebSocket, sends TLS close_notify and closes TCP.
+client sends the WebSocket close, TLS close_notify and FIN, and reads until the server's close echo.
 
 Example output:
 
@@ -723,9 +723,10 @@ binance-feed: closed (WebSocket close handshake, TLS close_notify, TCP TIME-WAIT
 
 `make test-binance` (part of `make test`) runs the same client offline: a kernel TCP rustls +
 tungstenite server with a self-signed certificate on 198.51.100.10, reached through Zhida's
-gateway across a net_tap netdev. It checks 12 bookTicker messages, a Ping answered with Pong and
-the close sequence, an HTTP 451 upgrade refusal reported with its status and body, and a
-certificate outside the webpki-roots set rejected as UnknownIssuer.
+gateway across a net_tap netdev. It checks 12 bookTicker messages through a 1400-byte path MTU, a
+Ping answered with Pong, the stop signal and the close sequence, an HTTP 451 upgrade refusal
+reported with its status, a certificate outside the webpki-roots set rejected as UnknownIssuer with
+the alert reaching the server, and that refused, timed-out and failed connects free the only socket.
 
 ## Linux VM
 

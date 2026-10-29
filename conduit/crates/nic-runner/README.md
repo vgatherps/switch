@@ -19,7 +19,7 @@ from [crates/netconf-open/examples/tcp_client.rs](../netconf-open/examples/tcp_c
 [docs/USAGE.md](../../docs/USAGE.md).
 
 The package is `nic-runner` and the binary is `zhida-nic`. It depends on `zhida-open`, `zhida-netconf`,
-`dpdk-smoltcp`, `zhida-dpdk-sys`, `binance-feed` and `sockperf-wire`; nothing depends on it. The modes live
+`dpdk-smoltcp`, `zhida-dpdk-sys`, `switchnet`, `binance-feed` and `sockperf-wire`; nothing depends on it. The modes live
 in `src/server.rs` (sockperf-server), `src/feed.rs` and `src/nic.rs` (info), with argument parsing in
 `src/args.rs`. `make test-nic-runner` runs `tests/run.sh` in the Docker image: the `zhida-nic` and
 sockperf-wire unit tests, `sockperf_merge.py --self-test`, then `zhida-nic` against kernel `sockperf`
@@ -205,10 +205,13 @@ it prints the requested bit and the reason. A refused offload fails Port open wi
 ```
 nic --config dut.json feed --seconds 30 --print 10 2>&1 | tee feed.log
 ```
-Options: `--host H` (default data-stream.binance.vision), `--port P` (9443), `--path P`
-(/ws/btcusdt@bookTicker), `--print N` (10), `--seconds S` (30). The kernel resolves the host name before
-the NIC is taken. Output is the TLS summary, up to N bookTicker messages, a message count and the
-update-id range. Success requires at least one message and successful read/close.
+Options: `--host H` (default stream.binance.com), `--port P` (9443), `--path P`
+(/ws/btcusdt@bookTicker), `--print N` (10), `--seconds S` (30, counted from the WebSocket open). The
+kernel resolves the host name before the NIC is taken. The client is binance-feed's: relay's wss
+client over sheath (TLS 1.3 only), as a switch task on a switchnet Net. data-stream.binance.vision
+speaks TLS 1.2 only and is unreachable; stream.binance.com may answer HTTP 451 from restricted
+locations. Output is up to N bookTicker messages, a message count and the update-id range. Success
+requires at least one message and successful read/close.
 
 ### 3c. sockperf-server
 ```

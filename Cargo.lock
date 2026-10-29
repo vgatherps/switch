@@ -89,10 +89,13 @@ version = "0.1.0"
 dependencies = [
  "dpdk-smoltcp",
  "rcgen",
+ "relay",
  "rustls",
  "serde",
  "serde_json",
- "stack-stream",
+ "sheath",
+ "switch",
+ "switchnet",
  "tap-echo",
  "tungstenite",
  "webpki-roots",
@@ -817,6 +820,7 @@ dependencies = [
  "dpdk-smoltcp",
  "libc",
  "sockperf-wire",
+ "switchnet",
  "zhida-dpdk-sys",
  "zhida-netconf",
  "zhida-open",
@@ -1253,7 +1257,6 @@ dependencies = [
 name = "rustls"
 version = "0.23.43"
 dependencies = [
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

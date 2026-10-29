@@ -8,7 +8,7 @@ Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `zhida-buffer` and `zhid
 
 - Binary `tap-echo`: `tap-echo [--listeners N] [--buffer BYTES] [--close-after BYTES] -- <tester> [args...]`. It spawns the tester before DPDK starts, serves echo on port 8080 until the tester exits, and returns an exit status (0 tester exited 0, 1 tester failed, 2 packet buffers still in use at port close, 3 bad arguments or a setup, serve or teardown error). `tap-echo` with no valid arguments prints the full usage, including the fixed addressing: Zhida 192.0.2.2/24, tester 192.0.2.1, netdev `cdtap_echo`.
 - `EchoServer`, `EchoError`, `serve(stack, echo, start, stop)` in `lib.rs`: the echo application and its drive loop. `with_close_after` makes it close after echoing a set number of bytes.
-- `driver` module: `run(...)` (spawn tester, build the Port and Stack on the tap vdev, run an app until the tester exits, tear down, compose the exit status), `tester_env()`, `report()`, and the constants for addresses, pool sizes and exit codes.
+- `driver` module: `run(...)` (spawn tester, build the Port and Stack on the tap vdev, run an app until the tester exits, tear down, compose the exit status; the app takes the Stack by value and hands it back with its result, so it can own it in a switchnet `Net`), `tester_env()`, `report()`, and the constants for addresses, pool sizes and exit codes.
 
 ## Build and test
 
