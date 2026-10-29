@@ -214,7 +214,8 @@ impl Executor {
 
     /// An ordinary wake of a deferred task: its entry moves from `deferred` to
     /// `incoming`, so it runs in this poll's next round. The other deferred
-    /// tasks keep their order.
+    /// tasks keep their order. A task whose entry already left `deferred` at the
+    /// start of this poll is in the current round: nothing to do.
     ///
     /// # Safety
     /// As for [`Self::wake`]; the task is LIVE, QUEUED and DEFERRED.
@@ -227,10 +228,9 @@ impl Executor {
                 return;
             }
             let deferred = &mut (*this).deferred;
-            let position = deferred
-                .iter()
-                .position(|&entry| entry == header)
-                .expect("a DEFERRED task has an entry in `deferred`");
+            let Some(position) = deferred.iter().position(|&entry| entry == header) else {
+                return;
+            };
             deferred.remove(position);
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() & !DEFERRED);
@@ -269,10 +269,7 @@ impl Executor {
     pub(crate) unsafe fn undefer(this: *mut Self) {
         unsafe {
             if !(*this).deferred.is_empty() {
-                for &header in &(*this).deferred {
-                    let flags = TaskHeader::flags(header);
-                    flags.set(flags.get() & !DEFERRED);
-                }
+                // DEFERRED stays set until the task's round clears it with QUEUED.
                 // Deferred wakes came first (during the last poll): they run first.
                 // Every slot has at most one queue entry: no reallocation.
                 (*this).deferred.append(&mut (*this).incoming);
@@ -352,7 +349,7 @@ impl Executor {
                 // Reload its buffer each iteration; no buffer pointer spans user code.
                 let header = *(*this).run_queue.as_ptr().add(index);
                 let flags = TaskHeader::flags(header);
-                let current = flags.get() & !QUEUED;
+                let current = flags.get() & !(QUEUED | DEFERRED);
                 flags.set(current);
                 if current & LIVE == 0 {
                     Self::reclaim(this, header);

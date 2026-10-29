@@ -395,3 +395,38 @@ fn a_task_upgraded_then_deferred_again_has_one_entry() {
     assert_eq!(*log.borrow(), ["upgraded", "done"]);
     assert_eq!(queues.get(), (0, 0));
 }
+
+#[test]
+fn a_wake_after_the_deferred_entry_moved_polls_the_task_once_this_poll() {
+    /// Yields once (deferred); on resume wakes `wakers[0]` and records the queues.
+    #[switch::task]
+    async fn defers_then_wakes(wakers: Wakers, root: *mut Executor, queues: Queues, log: Log) {
+        yield_now().await;
+        wakers.borrow()[0].wake();
+        queues.set(unsafe { Executor::queue_lengths(root) });
+        log.borrow_mut().push("b");
+    }
+    let (mut runtime, wakers, log, queues) = setup();
+    let root = super::core(&runtime);
+    let spawner = runtime.spawner();
+    spawner
+        .spawn(defers_then_wakes(
+            wakers.clone(),
+            root,
+            queues.clone(),
+            log.clone(),
+        ))
+        .unwrap();
+    spawner
+        .spawn(defers("a", wakers.clone(), log.clone()))
+        .unwrap();
+    // Both defer: `deferred` is [b, a].
+    runtime.poll(0).unwrap();
+    assert_eq!(unsafe { Executor::queue_lengths(root) }, (0, 2));
+    // Both entries move to this poll's first round; b, earlier in it, wakes a,
+    // which is polled once, in its turn.
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (2, 0));
+    assert_eq!(*log.borrow(), ["b", "a"]);
+    assert_eq!(queues.get(), (0, 0));
+}
