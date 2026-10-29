@@ -150,7 +150,7 @@ separate Make invocations sequentially too. Each `cargo test` step runs under
 container), so a hung test fails the step with 124 (137 if it ignores TERM). Cargo commands use
 --locked. The property invocation runs only the `props` test target, the one target its
 `proptest` feature adds. Two documentation examples are marked ignored. `docker-test` runs
-`test-stack-release` after `test-stack`, testing dpdk-smoltcp and stack-stream in release.
+`test-stack-release` after `test-stack`, testing dpdk-smoltcp in release.
 
 ### Pinned tests
 

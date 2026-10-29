@@ -19,7 +19,6 @@ Ethernet.
 | `crates/nic-runner` | `nic-runner` | `zhida-nic`: runs a Stack on a real NIC (link info, sockperf server, feed client) |
 | `crates/tap-echo` | `tap-echo` | TCP echo server over a tap device, the target for packetdrill and the fuzzers |
 | `crates/binance-feed` | `binance-feed` | Binance bookTicker client: relay's wss client (TLS 1.3 through sheath) on switchnet |
-| `crates/stack-stream` | `stack-stream` | `Read`/`Write` adapter over a TCP socket |
 | `crates/memif-bench` | `memif-bench` | Benchmarks over DPDK memif |
 | `crates/sockperf-wire` | `sockperf-wire` | sockperf's message format, used by `zhida-nic` |
 | `vendor/smoltcp` | `smoltcp` | smoltcp 0.14.0, cut down to IPv4 TCP and UDP over Ethernet, with mbuf-native receive |

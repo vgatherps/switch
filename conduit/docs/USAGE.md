@@ -698,18 +698,6 @@ half is unavailable without a clean EOF (for example reset, or before the connec
 established), and received data may be truncated. Queued frames remain drainable after a state
 change.
 
-`crates/stack-stream`'s `StackStream::new(&mut stack, handle)` wraps one Established or CloseWait
-socket as nonblocking `std::io::Read`/`Write` for byte-stream protocols (rustls, tungstenite). Read
-copies drained frames into the caller's buffer, keeping a partly copied frame for the next read; no
-data gives `WouldBlock`, clean EOF gives `Ok(0)` (also when a peer RST follows the peer FIN), and a peer reset without a
-prior FIN gives `ConnectionReset` once buffered bytes are drained. Write maps
-a full send buffer to `WouldBlock`, a peer reset to `ConnectionReset`, and our own close or abort
-(FinWait1 through TimeWait, and Closed without a peer reset) to `BrokenPipe`. Both use
-`tcp::Socket::reset_by_peer()`, true when an acceptable peer RST closed the connection (not one
-arriving in TimeWait, where our close came first) and cleared by `connect`/`listen`. The
-stream owns the handle; `stack()` or `parts()` reach the Stack to drive it, and `into_parts()`
-returns the handle, discarding any partly read frame.
-
 ### Send stream bytes
 
 `send` exposes the largest contiguous free region of the TX byte ring. Its closure returns
@@ -1045,6 +1033,5 @@ Keep EAL and its owner identity alive until every buffer has returned.
 - `crates/binance-feed`: bookTicker over TCP, TLS and WebSocket, with application deadlines. It sets up
   by hand through tap-echo's driver, not through `open`.
 - `crates/tap-echo`: EAL/vdev/Port setup by hand, bounded echo I/O, drive loop, and explicit teardown.
-- `crates/stack-stream`: nonblocking `Read`/`Write` adapter over a drained TCP socket.
 - `crates/memif-bench`: pool sizing, queued drive calls, stream workloads, and in-place UDP sending.
 - [docker/README.md](../docker/README.md): Linux DPDK test setup and commands.

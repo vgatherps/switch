@@ -6,7 +6,6 @@ members = [
     "conduit/crates/zhida-dpdk-sys",
     "conduit/crates/dpdk-smoltcp",
     "conduit/crates/tap-echo",
-    "conduit/crates/stack-stream",
     "conduit/crates/memif-bench",
     "conduit/crates/binance-feed",
     "conduit/crates/nic-runner",
@@ -65,7 +64,6 @@ relay = { path = "relay" }
 sheath = { path = "sheath" }
 smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-features = false }
 sockperf-wire = { path = "conduit/crates/sockperf-wire" }
-stack-stream = { path = "conduit/crates/stack-stream" }
 switch = { path = "switch" }
 switch-macros = { path = "switch-macros" }
 switchnet = { path = "switchnet" }

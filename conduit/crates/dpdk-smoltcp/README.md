@@ -4,7 +4,7 @@ The zhida stack: the vendored smoltcp (`vendor/smoltcp`) running on one DPDK por
 
 Most applications open it through `zhida-open` rather than calling `Eal::init` and `Port::open` directly. The API guide is [docs/USAGE.md](../../docs/USAGE.md).
 
-Depended on by `zhida-open`, `tap-echo`, `stack-stream`, `binance-feed`, `memif-bench`, `nic-runner`, `switchnet` and `zhida-test-kit`. It builds on [`zhida-buffer`](../zhida-buffer/README.md) and [`zhida-dpdk-sys`](../zhida-dpdk-sys/README.md).
+Depended on by `zhida-open`, `tap-echo`, `binance-feed`, `memif-bench`, `nic-runner`, `switchnet` and `zhida-test-kit`. It builds on [`zhida-buffer`](../zhida-buffer/README.md) and [`zhida-dpdk-sys`](../zhida-dpdk-sys/README.md).
 
 ## Main types
 
@@ -26,7 +26,7 @@ Needs DPDK 25.11.3 on Linux (`make doctor`); on macOS use the Docker image.
 
 ```sh
 make test-stack            # dpdk-smoltcp and zhida-test-kit, one test thread
-make test-stack-release    # dpdk-smoltcp and stack-stream, --release
+make test-stack-release    # dpdk-smoltcp, --release
 make bench-stack           # Criterion benches (ring, stack, scaling, neighbor, emit, rx, udp)
 make soak                  # ignored two-stack soak (SOAK_SECONDS, SOAK_SEED)
 ```
