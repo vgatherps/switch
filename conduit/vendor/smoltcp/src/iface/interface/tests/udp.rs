@@ -2125,6 +2125,24 @@ fn removal_falls_back_to_all_ip_and_rebind_takes_the_address_back() {
     assert_eq!(test.deliver(&[elsewhere, bound, all], ELSEWHERE, b"d"), [vec![b"d".to_vec()], vec![], vec![]]);
 }
 
+/// Strict bound delivery: a datagram to a bound address goes to its bound socket or nowhere. The
+/// bound socket is connected to one peer, so a datagram to the same address and port from another
+/// peer is dropped, not handed to the port's all-IP socket.
+#[test]
+fn connected_bound_socket_drops_other_peer_without_all_ip_fallback() {
+    let (mut test, handles) = Test::bound(&[SECOND], &[udp_config(Some(SECOND)), udp_config(None)], 0);
+    let (bound, all) = (handles[0], handles[1]);
+    test.udp.get_mut(bound).connect(IpEndpoint::new(REMOTE.into(), PEER_PORT)).unwrap();
+    test.receive(datagram(b"other", SECOND, PEER_PORT + 1), false);
+    assert!(test.udp.get_mut(bound).recv().is_none());
+    assert!(test.udp.get_mut(all).recv().is_none());
+    assert_eq!(test.device.releases.get(), 1);
+    assert_eq!(test.deliver(&[bound, all], SECOND, b"peer"), [vec![b"peer".to_vec()], vec![]]);
+    test.receive(datagram(b"local", LOCAL, PEER_PORT + 1), false);
+    assert!(test.udp.get_mut(bound).recv().is_none());
+    assert_eq!(test.udp.get_mut(all).recv().unwrap().payload(), b"local");
+}
+
 /// A broadcast goes only to the port's all-IP socket: sockets bound to the interface's own
 /// address or another owned one never see it, and with no all-IP socket it is dropped.
 #[test]

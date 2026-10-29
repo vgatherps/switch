@@ -2324,9 +2324,9 @@ fn raw_listener_on_unowned_address_never_gets_a_syn() {
 }
 
 /// Connections whose local address is owned keep sending after the interface addresses are
-/// removed (the owned set is fixed, recorded per connection at admission): one accepted on an
-/// owned address and one connected from one. A connection on the removed interface address is
-/// reset on its next egress visit and sends nothing.
+/// removed (the owned set is fixed; each connection checks its address against it at its first
+/// egress dispatch): one accepted on an owned address and one connected from one. A connection
+/// on the removed interface address is reset on its next egress visit and sends nothing.
 #[test]
 fn owned_address_connections_survive_interface_address_removal() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);

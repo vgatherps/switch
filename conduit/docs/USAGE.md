@@ -518,7 +518,10 @@ fires every token armed on it: for TCP a received segment, `tcp_mut` (also throu
 `tcp_send_frame`, `connect`, `listen`), a receive wake from a dropped frame, or a state change in
 egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and
 returned once by `pop_fired()`; drain it after each drive call and check those sockets. Changes
-that leave readiness as it was may fire tokens too. An idle turn fires none. `disarm_tcp` and
+that leave readiness as it was may fire tokens too, also in a turn with no received segment and
+no call: egress fires a TCP socket's tokens when its timer comes due while it waits for a
+neighbor, when a neighbor cache change rescans the sockets waiting on one, when its visit could
+not send (next hop unresolved, TX full), and when it is still due after its visit. `disarm_tcp` and
 `disarm_udp` return whether the token was still armed (`false`: it fired and `pop_fired` has not
 returned it yet). `remove_tcp`, `remove_udp` and the Stack processing a dropped handle disarm the
 socket's tokens; a token that fired before is still returned. The fired lists are sized at `new`
