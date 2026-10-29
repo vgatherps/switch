@@ -153,6 +153,8 @@ impl UdpSocket {
 struct Slot {
     socket: Option<UdpSocket>,
     generation: u64,
+    /// Readiness token armed for the receive queue.
+    rx_token: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -162,6 +164,10 @@ pub(crate) struct PendingUdp {
     pub(crate) payload: Range<usize>,
 }
 
+/// Readiness tokens: [`arm_rx`](Self::arm_rx) stores a caller's `u32` for a socket's receive
+/// queue. A queued datagram fires it: the token moves to a list that
+/// [`pop_fired`](Self::pop_fired) drains, and is disarmed. The list holds one per slot without
+/// growing while no token is re-armed before it was popped.
 #[derive(Debug)]
 pub struct UdpSet {
     slots: Vec<Slot>,
@@ -171,6 +177,7 @@ pub struct UdpSet {
     pub(crate) pending_rx_attach: Option<(usize, PendingUdp)>,
     /// Frames `Interface::udp_send` copies payloads into.
     pub(crate) source: TxSource,
+    fired: Vec<u32>,
     #[cfg(test)]
     pub(crate) template_frames: usize,
 }
@@ -183,12 +190,14 @@ impl UdpSet {
                 .map(|_| Slot {
                     socket: None,
                     generation: 0,
+                    rx_token: None,
                 })
                 .collect(),
             binds: FlowTable::new(max_sockets),
             bound: 0,
             pending_rx_attach: None,
             source,
+            fired: Vec::with_capacity(max_sockets),
             #[cfg(test)]
             template_frames: 0,
         }
@@ -247,6 +256,33 @@ impl UdpSet {
         slot.socket.as_mut().expect("removed UDP handle")
     }
 
+    /// Arm `token` for the socket's receive queue, replacing a token armed there. Removing
+    /// the socket disarms it.
+    ///
+    /// Arming runs on every park: the caller checks `handle` once (as `get` does) and keeps it
+    /// while the socket lives; only debug builds check it here. A stale handle misdirects the
+    /// token to whatever socket the slot holds or holds next, where it fires spuriously.
+    /// Panics if the handle's slot index is out of range.
+    pub fn arm_rx(&mut self, handle: UdpHandle, token: u32) {
+        let slot = &mut self.slots[handle.slot];
+        debug_assert!(slot.generation == handle.generation && slot.socket.is_some(), "stale UDP handle");
+        slot.rx_token = Some(token);
+    }
+
+    /// Disarm the socket's receive queue. Returns whether a token was armed; `false` when none
+    /// was, or it fired and waits in the fired list until popped. Handle checks as in `arm_rx`.
+    pub fn disarm_rx(&mut self, handle: UdpHandle) -> bool {
+        let slot = &mut self.slots[handle.slot];
+        debug_assert!(slot.generation == handle.generation && slot.socket.is_some(), "stale UDP handle");
+        slot.rx_token.take().is_some()
+    }
+
+    /// One fired token, in no particular order; `None` once the list is empty.
+    #[inline]
+    pub fn pop_fired(&mut self) -> Option<u32> {
+        self.fired.pop()
+    }
+
     pub fn remove(&mut self, handle: UdpHandle) -> HeldFrames {
         let socket = self.get(handle);
         let key = (socket.config.local_addr, socket.config.port);
@@ -257,6 +293,7 @@ impl UdpSet {
             .checked_add(1)
             .expect("UDP generation overflow");
         slot.socket = None;
+        slot.rx_token = None;
         self.binds.remove(&key);
         self.bound -= usize::from(key.0.is_some());
         held
@@ -284,7 +321,12 @@ impl UdpSet {
     }
 
     pub(crate) fn commit_rx(&mut self, slot: usize, mut frame: RxBuf, pending: PendingUdp) {
-        let socket = self.socket_at_mut(slot);
+        let entry = &mut self.slots[slot];
+        if let Some(token) = entry.rx_token {
+            entry.rx_token = None;
+            fire(&mut self.fired, token);
+        }
+        let socket = entry.socket.as_mut().expect("UDP socket is missing");
         assert!(!socket.at_limit(), "UDP receive credit is exhausted");
         frame.narrow(pending.payload);
         socket.shared.hold();
@@ -295,6 +337,12 @@ impl UdpSet {
             shared: socket.shared.clone(),
         });
     }
+}
+
+/// Out of line, so a datagram for an unarmed socket pays one load and branch.
+#[inline(never)]
+fn fire(fired: &mut Vec<u32>, token: u32) {
+    fired.push(token);
 }
 
 #[cfg(test)]
@@ -358,6 +406,48 @@ mod tests {
         );
         assert!(catch_unwind(AssertUnwindSafe(|| set.remove(old))).is_err());
         assert_eq!(set.get(new).config().port, 1234);
+    }
+
+    #[test]
+    fn rx_token_fires_once_on_a_queued_datagram_and_remove_disarms() {
+        let mut set = UdpSet::new(2, crate::tests::tx_test_source(1472));
+        let handle = set.add(&iface(), config(1234)).unwrap();
+        let other = set.add(&iface(), config(1235)).unwrap();
+        let releases = Rc::new(Cell::new(0));
+        let enqueue = |set: &mut UdpSet, slot| {
+            set.commit_rx(
+                slot,
+                RxBuf::counted_frame(alloc::vec![0, 1, 0], 0, releases.clone()),
+                PendingUdp {
+                    src: IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321),
+                    dst_addr: Ipv4Address::new(192, 168, 1, 1),
+                    payload: 1..2,
+                },
+            );
+        };
+        assert_eq!(set.fired.capacity(), 2);
+        set.arm_rx(handle, 7);
+        set.arm_rx(other, 8);
+        enqueue(&mut set, handle.slot);
+        assert_eq!(set.pop_fired(), Some(7));
+        assert_eq!(set.pop_fired(), None);
+        enqueue(&mut set, handle.slot);
+        assert_eq!(set.pop_fired(), None, "a fired token is disarmed");
+        assert!(!set.disarm_rx(handle));
+        drop(set.get_mut(handle).recv());
+        drop(set.get_mut(handle).recv());
+        assert_eq!(set.pop_fired(), None, "receiving and releasing datagrams fire nothing");
+        set.arm_rx(handle, 9);
+        assert!(set.disarm_rx(handle));
+        enqueue(&mut set, handle.slot);
+        assert_eq!(set.pop_fired(), None);
+        drop(set.get_mut(handle).recv());
+        set.remove(other);
+        let reused = set.add(&iface(), config(1236)).unwrap();
+        assert_eq!(reused.slot, other.slot);
+        enqueue(&mut set, reused.slot);
+        assert_eq!(set.pop_fired(), None, "remove disarmed the old socket's token");
+        drop(set.get_mut(reused).recv());
     }
 
     #[test]

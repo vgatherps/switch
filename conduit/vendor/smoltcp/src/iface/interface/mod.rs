@@ -832,10 +832,12 @@ impl Interface {
                     }
                     sockets.check_reapable(index);
                 }
-                // Inside dispatch, a flow key change requires a state change.
+                // Inside dispatch, a flow key change requires a state change. Timers (close,
+                // TIME_WAIT end, RTO abort) change readiness only through the state.
                 if state_changed {
                     sockets.sync_identity(index);
                     sockets.check_reapable(index);
+                    sockets.fire(index);
                 } else {
                     #[cfg(debug_assertions)]
                     sockets.debug_assert_synced(index);

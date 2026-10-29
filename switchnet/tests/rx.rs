@@ -521,11 +521,11 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
     })
 }
 
-/// A socket dropped while its index is still listed (no turn in between)
-/// frees the index at once; a new socket that reuses it and parks is woken
-/// by its own data.
+/// A socket dropped while its receive token is still armed (no turn in
+/// between) frees the index at once; a new socket that reuses it and parks is
+/// woken by its own data.
 #[zhida_test_support::pinned_test]
-fn socket_reusing_a_still_listed_index_is_woken() {
+fn socket_reusing_a_just_freed_index_is_woken() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["reua", "reub"]);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();

@@ -35,7 +35,7 @@ pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address}
 pub use dpdk_smoltcp::{
     AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
 };
-use dpdk_smoltcp::{TcpHandle, UdpHandle};
+use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
 use switch::StoredWaker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +46,10 @@ pub struct NetConfig {
 
 type Shared = Rc<RefCell<Inner>>;
 
+/// A handle and the readiness key taken from it at open, which arming uses.
 enum Socket {
-    Tcp(TcpHandle),
-    Udp(UdpHandle),
+    Tcp(TcpHandle, TcpReadyKey),
+    Udp(UdpHandle, UdpReadyKey),
 }
 
 /// Index of an entry's receive-side (recv, connect, accept) and send-side
@@ -82,17 +83,16 @@ struct Entry {
     parked: [Option<(StoredWaker, Interest)>; 2],
     /// Live halves; the socket drops with the last.
     halves: u8,
-    /// Each side is in `Inner::listed`.
-    listed: [bool; 2],
+    /// Per side: its token is armed in the Stack, or fired and not yet popped. A token that
+    /// fired before the last half dropped keeps this set for the entry's next socket until
+    /// `wake_fired` pops it, so a side never has two tokens out.
+    token_out: [bool; 2],
 }
 
 struct Inner {
     stack: Stack,
     entries: Vec<Entry>,
     free: Vec<u32>,
-    /// Per side, entries parked since the last turn; may hold entries since
-    /// unparked.
-    listed: [Vec<u32>; 2],
     /// Tasks waiting for a TX frame; each listed once. Sized for one per
     /// socket slot; more simultaneous waiters than that grow it.
     frame_waiters: Vec<StoredWaker>,
@@ -108,13 +108,17 @@ impl Inner {
         index
     }
 
-    /// Drops one half: clears its parked handle; with the last half, removes
-    /// the entry and returns its socket. The index is free at once: if it is
-    /// still listed, the next scan unlists it, or checks the socket that
-    /// reused it.
+    /// Drops one half: clears its parked handle and disarms its token; with the last half,
+    /// removes the entry and returns its socket. The index is free at once; a token of the
+    /// half that already fired is popped by the next turn, which checks whatever socket then
+    /// holds the entry.
     fn release(&mut self, index: u32, side: usize) -> Option<Socket> {
         let entry = &mut self.entries[index as usize];
         entry.parked[side] = None;
+        if entry.token_out[side] {
+            let socket = entry.socket.as_ref().expect("a live half has a socket");
+            entry.token_out[side] = !disarm(&mut self.stack, socket, side);
+        }
         entry.halves -= 1;
         if entry.halves != 0 {
             return None;
@@ -126,7 +130,7 @@ impl Inner {
     /// The stack and the TCP handle of entry `index`.
     fn tcp(&mut self, index: u32) -> (&mut Stack, &TcpHandle) {
         match &self.entries[index as usize].socket {
-            Some(Socket::Tcp(handle)) => (&mut self.stack, handle),
+            Some(Socket::Tcp(handle, _)) => (&mut self.stack, handle),
             _ => unreachable!("entry holds no TCP handle"),
         }
     }
@@ -134,7 +138,7 @@ impl Inner {
     /// The stack and the UDP handle of entry `index`.
     fn udp(&mut self, index: u32) -> (&mut Stack, &UdpHandle) {
         match &self.entries[index as usize].socket {
-            Some(Socket::Udp(handle)) => (&mut self.stack, handle),
+            Some(Socket::Udp(handle, _)) => (&mut self.stack, handle),
             _ => unreachable!("entry holds no UDP handle"),
         }
     }
@@ -146,9 +150,10 @@ impl Inner {
         let side = interest.side();
         let entry = &mut self.entries[index as usize];
         entry.parked[side] = Some((waker, interest));
-        if !entry.listed[side] {
-            entry.listed[side] = true;
-            self.listed[side].push(index);
+        if !entry.token_out[side] {
+            entry.token_out[side] = true;
+            let socket = entry.socket.as_ref().expect("a parked entry has a socket");
+            arm(&mut self.stack, socket, side, token(index, side));
         }
     }
 
@@ -157,26 +162,60 @@ impl Inner {
     }
 }
 
-/// Wakes every task parked on `SIDE` whose socket is ready; unlists woken,
-/// unparked and removed entries. Takes the fields, not `&mut Inner`, so the
-/// loop keeps `entries` and `listed` in registers across the out-of-line
-/// `Stack::udp`/`Stack::tcp` calls. One list per side keeps the receive loop
-/// as cheap as with one slot per entry.
-#[inline(never)]
-fn wake_ready<const SIDE: usize>(stack: &Stack, entries: &mut [Entry], listed: &mut Vec<u32>) {
-    let mut at = 0;
-    while at < listed.len() {
-        let entry = &mut entries[listed[at] as usize];
-        if let (Some(socket), Some((waker, interest))) = (&entry.socket, entry.parked[SIDE]) {
-            if !ready(stack, socket, interest) {
-                at += 1;
-                continue;
-            }
-            entry.parked[SIDE] = None;
-            waker.wake();
+/// A side's readiness token: entry index and side.
+fn token(index: u32, side: usize) -> u32 {
+    (index << 1) | side as u32
+}
+
+fn arm(stack: &mut Stack, socket: &Socket, side: usize, token: u32) {
+    match socket {
+        Socket::Tcp(_, key) => stack.arm_tcp(*key, ready_side(side), token),
+        Socket::Udp(_, key) => {
+            debug_assert_eq!(side, RX, "nothing parks on UDP send");
+            stack.arm_udp(*key, token);
         }
-        entry.listed[SIDE] = false;
-        listed.swap_remove(at);
+    }
+}
+
+/// Whether the side's token was still armed (it had not fired).
+fn disarm(stack: &mut Stack, socket: &Socket, side: usize) -> bool {
+    match socket {
+        Socket::Tcp(_, key) => stack.disarm_tcp(*key, ready_side(side)),
+        Socket::Udp(_, key) => {
+            debug_assert_eq!(side, RX, "nothing parks on UDP send");
+            stack.disarm_udp(*key)
+        }
+    }
+}
+
+fn ready_side(side: usize) -> ReadySide {
+    if side == RX { ReadySide::Rx } else { ReadySide::Tx }
+}
+
+/// For `token` and every other fired token the Stack returns: wakes the side's parked task
+/// if its socket is ready, else re-arms the token. A side with no parked task (canceled, its
+/// half dropped, or the entry reused by a socket whose task has not parked) takes no action; the
+/// token is only marked popped. A reused entry's task is woken only by its own socket's
+/// readiness, since the check reads the socket the entry holds now.
+#[inline(never)]
+fn wake_fired(stack: &mut Stack, entries: &mut [Entry], mut token: u32) {
+    loop {
+        let side = (token & 1) as usize;
+        let entry = &mut entries[(token >> 1) as usize];
+        entry.token_out[side] = false;
+        if let (Some(socket), Some((waker, interest))) = (&entry.socket, entry.parked[side]) {
+            if ready(stack, socket, interest) {
+                entry.parked[side] = None;
+                waker.wake();
+            } else {
+                entry.token_out[side] = true;
+                arm(stack, socket, side, token);
+            }
+        }
+        match stack.pop_fired() {
+            Some(next) => token = next,
+            None => return,
+        }
     }
 }
 
@@ -191,17 +230,16 @@ fn wake_frame_waiters(stack: &mut Stack, waiters: &mut Vec<StoredWaker>) {
     }
 }
 
-/// Inlined into both `wake_ready` instances: out of line it costs a call per
-/// parked socket per turn.
+/// Inlined into `wake_fired`.
 #[inline(always)]
 fn ready(stack: &Stack, socket: &Socket, interest: Interest) -> bool {
     match (socket, interest) {
-        (Socket::Tcp(handle), Interest::Connect) => !connecting(stack.tcp(handle).state()),
-        (Socket::Tcp(handle), Interest::Accept) => !accepting(stack.tcp(handle).state()),
-        (Socket::Tcp(handle), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
-        (Socket::Tcp(handle), Interest::TcpRoom(len)) => tcp_room_ready(stack.tcp(handle), len as usize),
-        (Socket::Tcp(handle), Interest::TcpDelivered) => delivered(stack.tcp(handle).state()),
-        (Socket::Udp(handle), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
+        (Socket::Tcp(handle, _), Interest::Connect) => !connecting(stack.tcp(handle).state()),
+        (Socket::Tcp(handle, _), Interest::Accept) => !accepting(stack.tcp(handle).state()),
+        (Socket::Tcp(handle, _), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
+        (Socket::Tcp(handle, _), Interest::TcpRoom(len)) => tcp_room_ready(stack.tcp(handle), len as usize),
+        (Socket::Tcp(handle, _), Interest::TcpDelivered) => delivered(stack.tcp(handle).state()),
+        (Socket::Udp(handle, _), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
         _ => unreachable!("interest does not match socket kind"),
     }
 }
@@ -246,13 +284,13 @@ impl Net {
     /// Sizes the registry once for every socket `stack` can hold.
     pub fn new(stack: Stack, config: NetConfig) -> Net {
         let slots = stack.max_sockets() + stack.max_udp_sockets();
+        assert!(u32::try_from(2 * slots).is_ok(), "socket slots exceed the readiness tokens");
         let entries =
-            (0..slots).map(|_| Entry { socket: None, parked: [None; 2], halves: 0, listed: [false; 2] }).collect();
+            (0..slots).map(|_| Entry { socket: None, parked: [None; 2], halves: 0, token_out: [false; 2] }).collect();
         let inner = Inner {
             stack,
             entries,
             free: (0..slots as u32).rev().collect(),
-            listed: [Vec::with_capacity(slots), Vec::with_capacity(slots)],
             frame_waiters: Vec::with_capacity(slots),
             ingress_budget: config.ingress_budget,
         };
@@ -266,17 +304,16 @@ impl Net {
     /// `Stack::turn` at `now`, then wakes every task parked on a socket that
     /// became ready, and every task waiting for a TX frame if the pool has
     /// one, also when the turn returns an error (egress can fail after
-    /// ingress queued data). After a panic out of `turn`, drop the Net.
+    /// ingress queued data). Only sockets whose readiness tokens fired since
+    /// the last turn are checked, never every parked one. After a panic out of
+    /// `turn`, drop the Net.
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut inner = self.shared.borrow_mut();
-        let Inner { stack, entries, listed: [rx, tx], frame_waiters, ingress_budget, .. } = &mut *inner;
+        let Inner { stack, entries, frame_waiters, ingress_budget, .. } = &mut *inner;
         let turn = stack.turn(now, *ingress_budget);
-        if !rx.is_empty() {
-            wake_ready::<RX>(stack, entries, rx);
-        }
-        if !tx.is_empty() {
-            wake_ready::<TX>(stack, entries, tx);
+        if let Some(token) = stack.pop_fired() {
+            wake_fired(stack, entries, token);
         }
         if !frame_waiters.is_empty() {
             wake_frame_waiters(stack, frame_waiters);
@@ -347,7 +384,8 @@ impl NetHandle {
             inner.stack.remove_tcp(handle);
             return Err(error);
         }
-        let index = inner.insert(Socket::Tcp(handle));
+        let key = inner.stack.tcp_ready_key(&handle);
+        let index = inner.insert(Socket::Tcp(handle, key));
         Ok(TcpStream {
             rx: TcpRx(Half { shared: self.shared.clone(), index, side: RX }),
             tx: TcpTx(Half { shared: self.shared.clone(), index, side: TX }),
@@ -357,7 +395,8 @@ impl NetHandle {
     pub fn udp_bind(&self, config: UdpConfig) -> Result<UdpSocket, AddUdpError> {
         let mut inner = self.shared.borrow_mut();
         let handle = inner.stack.add_udp(config)?;
-        let index = inner.insert(Socket::Udp(handle));
+        let key = inner.stack.udp_ready_key(&handle);
+        let index = inner.insert(Socket::Udp(handle, key));
         Ok(UdpSocket {
             rx: UdpRx(Half { shared: self.shared.clone(), index, side: RX }),
             tx: UdpTx(Half { shared: self.shared.clone(), index, side: TX }),

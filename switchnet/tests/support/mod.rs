@@ -17,8 +17,9 @@ use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
 
-/// Any test future, boxed so one task function serves every test.
-#[switch::task]
+/// Any test future, boxed so one task function serves every test; room for a
+/// task per socket of the largest fixture.
+#[switch::task(capacity = 2048)]
 fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
     future
 }
@@ -35,8 +36,8 @@ pub fn tcp_config() -> tcp::Config {
     tcp::Config { rx_capacity: RX_CAPACITY, tx_capacity: 64 * 1024, mss_cap: None }
 }
 
-fn stack_config(side: Side) -> StackConfig<'static> {
-    StackConfig { max_sockets: MAX_TCP, max_udp_sockets: MAX_UDP, ..pair::config(side) }
+fn stack_config(side: Side, tcp: usize, udp: usize) -> StackConfig<'static> {
+    StackConfig { max_sockets: tcp, max_udp_sockets: udp, ..pair::config(side) }
 }
 
 pub fn net_ip() -> switchnet::Ipv4Address {
@@ -65,20 +66,24 @@ pub struct Mixed {
 impl Mixed {
     /// `names` are short and unique among live fixtures.
     pub fn new(eal: &Eal, names: [&str; 2]) -> Self {
+        Self::with_sockets(eal, names, MAX_TCP, MAX_UDP)
+    }
+
+    /// `new` with `tcp` TCP and `udp` UDP socket slots on each side.
+    pub fn with_sockets(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [net_stack, peer] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
-            let stack_config = stack_config(side);
+            let stack_config = stack_config(side, tcp, udp);
             let mut config = fixture.config();
-            let tcp = std::iter::repeat_n(RX_CAPACITY, MAX_TCP);
             let reserve =
                 rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
-            config.rx_pool.count = rx_pool_count(reserve, config.mtu, tcp)
-                + u32::try_from(MAX_UDP * UDP_QUEUE).unwrap();
+            config.rx_pool.count = rx_pool_count(reserve, config.mtu, std::iter::repeat_n(RX_CAPACITY, tcp))
+                + u32::try_from(udp * UDP_QUEUE).unwrap();
             config.frame_pool.count = frame_pool_count(
                 frame_reserve(config.tx_descriptors, stack_config.tx_pending),
                 config.mtu,
-                std::iter::repeat_n(tcp_config().tx_capacity, MAX_TCP),
+                std::iter::repeat_n(tcp_config().tx_capacity, tcp),
             );
             let port = fixture.open_with(eal, config);
             match Stack::new(port, stack_config, T0) {

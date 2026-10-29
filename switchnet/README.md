@@ -6,7 +6,7 @@ Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md) and [`swit
 
 ## API
 
-- `Net::new(stack, NetConfig { ingress_budget })`: the loop owner. `turn(now)` runs `Stack::turn` and wakes every task parked on a socket that became ready; `poll_at()`; `into_stack()`; `handle()`.
+- `Net::new(stack, NetConfig { ingress_budget })`: the loop owner. `turn(now)` runs `Stack::turn` and wakes every task parked on a socket that became ready; it checks only the sockets whose readiness tokens (`Stack::arm_tcp`/`arm_udp` with the key taken when the socket opens, armed when a task parks) fired, so an idle turn costs the same with any number of parked tasks. `poll_at()`; `into_stack()`; `handle()`.
 - `NetHandle`: held by tasks. It opens sockets (`tcp_connect`, `tcp_accept`, `udp_bind`) and hands out TX frames (`tx_frame().await`: waits while the frame pool is empty; a turn that finds a free frame wakes the waiters). It cannot turn the stack.
 - `TcpStream`: `recv()` yields a `TcpFrame` (`payload`, `payload_mut`, `rx_timestamp`); `split()` gives `TcpRx` (`recv`) and `TcpTx`.
 - `TcpTx`: `room(len).await` resolves `Ok` once a frame of `len` bytes fits (free bytes and a free frame slot), `Err(InvalidState)` once the socket cannot send. `try_send(frame)` queues it synchronously; every error returns the same frame (`Full`, `InvalidState`, `Empty`, `Foreign`). No future ever owns a frame, so a filled (e.g. sealed) frame is never lost to a dropped future. `shutdown()` sends FIN after the queued data; receiving continues. `delivered().await`, after `shutdown`, resolves once the peer acked every byte and the FIN (FinWait2, TimeWait) or the connection is gone (Closed): until then the bytes exist only in the socket, and dropping the Stack loses them.
@@ -29,4 +29,4 @@ make test-switchnet    # from conduit/: cargo test -p switchnet, then --benches 
 cargo bench -p switchnet --bench turn
 ```
 
-Needs DPDK 25.11.3 and a one-CPU process (Docker image on macOS; `make docker-test` includes it). Tests are in `tests/rx.rs` (receive, connect, accept) and `tests/tx.rs` (send).
+Needs DPDK 25.11.3 and a one-CPU process (Docker image on macOS; `make docker-test` includes it). Tests are in `tests/rx.rs` (receive, connect, accept), `tests/tx.rs` (send) and `tests/ready.rs` (which parked tasks a turn wakes).

@@ -505,6 +505,25 @@ not covered by `poll_at`; after freeing capacity, `send` or `turn` retries it in
 time with `turn` or `receive`; repeating `send` or `flush` does not advance timers or receive ARP
 replies.
 
+### Learn which sockets changed
+
+An application waiting on many sockets arms a `u32` token per socket half instead of checking
+every socket after each turn. `tcp_ready_key(&handle)` and `udp_ready_key(&handle)` check the
+handle once, as `tcp` and `udp` do, and return a key to keep beside it. Then
+`arm_tcp(key, ReadySide::Rx | ReadySide::Tx, token)` and `arm_udp(key, token)` (receive queue
+only) arm a token without repeating that check; only debug builds check that the key's socket
+is still live, and a key used after its socket is removed misdirects tokens to whatever socket
+takes the slot. A change that can alter the socket's readiness
+fires every token armed on it: for TCP a received segment, `tcp_mut` (also through
+`tcp_send_frame`, `connect`, `listen`), a receive wake from a dropped frame, or a state change in
+egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and
+returned once by `pop_fired()`; drain it after each drive call and check those sockets. Changes
+that leave readiness as it was may fire tokens too. An idle turn fires none. `disarm_tcp` and
+`disarm_udp` return whether the token was still armed (`false`: it fired and `pop_fired` has not
+returned it yet). `remove_tcp`, `remove_udp` and the Stack processing a dropped handle disarm the
+socket's tokens; a token that fired before is still returned. The fired lists are sized at `new`
+for every token armed once; re-arming a token before `pop_fired` returned it can grow them.
+
 ## Time rules
 
 Supply `dpdk_smoltcp::smoltcp::time::Instant`, not `std::time::Instant`, to Stack calls. Choose a
