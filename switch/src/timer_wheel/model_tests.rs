@@ -67,7 +67,6 @@ fn deadline(state: &mut u64, now: u64) -> u64 {
 fn check(wheel: &TimerWheel, entries: &[Entry], live: &[Option<u64>], now: u64) {
     assert_eq!(wheel.current_tick(), now);
     let count = live.iter().filter(|deadline| deadline.is_some()).count();
-    assert_eq!(wheel.linked_count, count);
     assert_eq!(wheel.has_pending(), count != 0);
 
     let mut seen = vec![false; entries.len()];
@@ -119,11 +118,9 @@ fn insert(
     assert!(live[index].is_none());
     assert_eq!(entries[index].wheel_position(), WheelPosition::Unlinked);
     let deadline = entries[index].deadline;
-    let result = wheel.insert(entries, index as u32);
-    if deadline <= now {
-        assert_eq!(result, InsertOutcome::Due);
-    } else {
-        assert_eq!(result, InsertOutcome::Linked);
+    // A due deadline violates insert's precondition; the store never inserts one.
+    if deadline > now {
+        wheel.insert(entries, index as u32);
         live[index] = Some(deadline);
     }
     check(wheel, entries, live, now);
@@ -136,20 +133,8 @@ fn advance(
     now: &mut u64,
     supplied: u64,
 ) -> Vec<u32> {
+    // A regressed tick violates advance_to's precondition; Runtime::poll rejects it first.
     if supplied < *now {
-        let before = live.to_vec();
-        let mut output = vec![u32::MAX - 1];
-        let before_output = output.clone();
-        assert_eq!(
-            wheel.advance_to(entries, supplied, &mut output),
-            Err(TimeRegressed {
-                current: *now,
-                supplied,
-            })
-        );
-        assert_eq!(output, before_output);
-        assert_eq!(live, before.as_slice());
-        check(wheel, entries, live, *now);
         return Vec::new();
     }
 
@@ -163,7 +148,7 @@ fn advance(
         })
         .collect();
     let mut actual = Vec::new();
-    assert_eq!(wheel.advance_to(entries, supplied, &mut actual), Ok(()));
+    wheel.advance_to(entries, supplied, &mut actual);
     expected.sort_unstable();
     actual.sort_unstable();
     assert_eq!(actual, expected);

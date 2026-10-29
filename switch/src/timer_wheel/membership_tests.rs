@@ -30,10 +30,7 @@ fn check_structure(wheel: &TimerWheel, entries: &[Entry]) {
         }
         assert_eq!(wheel.pending[level], pending);
     }
-    assert_eq!(
-        seen.iter().filter(|&&linked| linked).count(),
-        wheel.linked_count
-    );
+    assert_eq!(seen.contains(&true), wheel.has_pending());
     for (index, entry) in entries.iter().enumerate() {
         assert_eq!(
             seen[index],
@@ -51,7 +48,6 @@ type WheelState = (
     Vec<(WheelPosition, u32, u32)>,
     Vec<u32>,
     u64,
-    usize,
 );
 
 fn state(wheel: &TimerWheel, entries: &[Entry]) -> WheelState {
@@ -68,7 +64,6 @@ fn state(wheel: &TimerWheel, entries: &[Entry]) -> WheelState {
             .collect(),
         wheel.pending.to_vec(),
         wheel.current_tick(),
-        wheel.linked_count,
     )
 }
 
@@ -76,13 +71,13 @@ fn state(wheel: &TimerWheel, entries: &[Entry]) -> WheelState {
 fn never_inserted_cancel_preserves_occupied_bucket() {
     let mut entries = super::benchmark_workloads::entries([0, 32]);
     let mut wheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 1);
     let before = state(&wheel, &entries);
     assert!(!wheel.remove(&mut entries, 0));
     assert_eq!(state(&wheel, &entries), before);
     check_structure(&wheel, &entries);
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 32, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 32, &mut expired);
     assert_eq!(expired, [1]);
     check_structure(&wheel, &entries);
 }
@@ -91,15 +86,15 @@ fn never_inserted_cancel_preserves_occupied_bucket() {
 fn cancel_twice_preserves_shared_bucket_survivor() {
     let mut entries = super::benchmark_workloads::entries([5, 5]);
     let mut wheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
-    assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
+    wheel.insert(&mut entries, 1);
     assert!(wheel.remove(&mut entries, 0));
     let before = state(&wheel, &entries);
     assert!(!wheel.remove(&mut entries, 0));
     assert_eq!(state(&wheel, &entries), before);
     check_structure(&wheel, &entries);
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 5, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 5, &mut expired);
     assert_eq!(expired, [1]);
     check_structure(&wheel, &entries);
 }
@@ -108,13 +103,13 @@ fn cancel_twice_preserves_shared_bucket_survivor() {
 fn expired_cancel_preserves_another_timer_in_reused_bucket() {
     let mut entries = super::benchmark_workloads::entries([3, 35]);
     let mut wheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 3, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 3, &mut expired);
     assert_eq!(expired, [0]);
     assert_eq!(entries[0].wheel_position(), WheelPosition::Unlinked);
-    wheel.advance_to(&mut entries, 32, &mut expired).unwrap();
-    assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
+    wheel.advance_to(&mut entries, 32, &mut expired);
+    wheel.insert(&mut entries, 1);
     assert_eq!(
         entries[1].wheel_position(),
         WheelPosition::Linked { level: 0, slot: 3 }
@@ -123,7 +118,7 @@ fn expired_cancel_preserves_another_timer_in_reused_bucket() {
     assert!(!wheel.remove(&mut entries, 0));
     assert_eq!(state(&wheel, &entries), before);
     check_structure(&wheel, &entries);
-    wheel.advance_to(&mut entries, 35, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 35, &mut expired);
     assert_eq!(expired, [0, 1]);
     check_structure(&wheel, &entries);
 }
@@ -132,7 +127,7 @@ fn expired_cancel_preserves_another_timer_in_reused_bucket() {
 fn linked_singleton_has_nil_links_and_remains_removable() {
     let mut entries = super::benchmark_workloads::entries([5]);
     let mut wheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
     assert_eq!(entries[0].prev(), NIL);
     assert_eq!(entries[0].next(), NIL);
     assert_eq!(
@@ -147,17 +142,18 @@ fn linked_singleton_has_nil_links_and_remains_removable() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn duplicate_insert_panics_before_any_mutation() {
     let mut entries = super::benchmark_workloads::entries([5, 5]);
     let mut wheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
-    assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
+    wheel.insert(&mut entries, 1);
     let before = state(&wheel, &entries);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wheel.insert(&mut entries, 0))).is_err());
     assert_eq!(state(&wheel, &entries), before);
     check_structure(&wheel, &entries);
     let mut expired = Vec::new();
-    wheel.advance_to(&mut entries, 5, &mut expired).unwrap();
+    wheel.advance_to(&mut entries, 5, &mut expired);
     assert_eq!(expired, [0, 1]);
     check_structure(&wheel, &entries);
 }
@@ -166,23 +162,17 @@ fn duplicate_insert_panics_before_any_mutation() {
 fn formerly_overflowing_pair_expires_exactly_once() {
     let mut entries = super::benchmark_workloads::entries([2097152, 2097152]);
     let mut wheel = TimerWheel::new(0);
-    assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
-    assert_eq!(wheel.insert(&mut entries, 1), InsertOutcome::Linked);
+    wheel.insert(&mut entries, 0);
+    wheel.insert(&mut entries, 1);
     let mut expired = Vec::new();
-    wheel
-        .advance_to(&mut entries, 2097151, &mut expired)
-        .unwrap();
+    wheel.advance_to(&mut entries, 2097151, &mut expired);
     assert!(expired.is_empty());
     check_structure(&wheel, &entries);
-    wheel
-        .advance_to(&mut entries, 2097152, &mut expired)
-        .unwrap();
+    wheel.advance_to(&mut entries, 2097152, &mut expired);
     assert_eq!(expired, [0, 1]);
     assert!(!wheel.remove(&mut entries, 0));
     assert!(!wheel.remove(&mut entries, 1));
-    wheel
-        .advance_to(&mut entries, 2097153, &mut expired)
-        .unwrap();
+    wheel.advance_to(&mut entries, 2097153, &mut expired);
     assert_eq!(expired, [0, 1]);
     assert!(!wheel.has_pending());
     check_structure(&wheel, &entries);

@@ -22,14 +22,7 @@ fn constructor_reserves_ready_storage_and_uses_initial_timer_tick() {
         assert!((*ptr).run_queue.capacity() >= 17);
         assert!((*ptr).incoming.capacity() >= 17);
         assert!((*ptr).deferred.capacity() >= 17);
-        assert_eq!(
-            (*ptr).timers.advance_to(122),
-            Err(crate::timer_wheel::TimeRegressed {
-                current: 123,
-                supplied: 122
-            })
-        );
-        assert_eq!((*ptr).timers.advance_to(123), Ok(()));
+        assert_eq!((*ptr).timers.current_tick(), 123);
     }
     owner.cleanup();
 }

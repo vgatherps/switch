@@ -65,13 +65,13 @@ fn two_memberships_cancel_independently_and_retire_forgotten_pending() {
     assert!(!f.cancel(a));
     assert!(!f.cancel(b));
     assert!(f.store.valid(c));
-    f.store.advance_to(20).unwrap();
+    f.store.advance_to(20);
     assert_eq!(f.store.pop_expired(), Some(f.task(1)));
     assert_eq!(f.store.pop_expired(), None);
 }
 
 #[test]
-fn reuse_invalidates_old_cancel_and_never_wraps_max_version() {
+fn reuse_invalidates_old_cancel() {
     let mut f = Fixture::new();
     let old = f.register(0, 10);
     assert!(f.cancel(old));
@@ -81,15 +81,6 @@ fn reuse_invalidates_old_cancel_and_never_wraps_max_version() {
     assert!(!f.cancel(old));
     assert!(f.store.valid(replacement));
     assert!(f.cancel(replacement));
-    f.store.entries[old.index as usize].version = u64::MAX - 1;
-    let last = f.register(0, 30);
-    assert_eq!(last.version, u64::MAX);
-    assert!(f.cancel(last));
-    assert_eq!(f.store.entries[last.index as usize].state, State::Retired);
-    let next = f.register(0, 40);
-    assert_ne!(last.index, next.index);
-    assert_eq!(f.store.entries[last.index as usize].version, u64::MAX);
-    assert!(!f.cancel(last));
 }
 
 #[test]
@@ -119,27 +110,26 @@ fn refresh_moves_owner_before_retirement_and_stale_token_reregisters_after() {
     assert!(!f.refresh(token, 2));
     let new = f.register(2, 10);
     assert_ne!(token, new);
-    f.store.advance_to(10).unwrap();
+    f.store.advance_to(10);
     assert_eq!(f.store.pop_expired(), Some(f.task(2)));
     assert_eq!(f.store.pop_expired(), None);
 }
 
 #[test]
-fn expired_keeps_owner_without_wake_until_cancel_transfer_or_retire() {
+fn expired_keeps_owner_until_cancel_transfer_or_retire() {
     let mut f = Fixture::new();
     let a = f.register(0, 10);
     let b = f.register(0, 10);
-    f.store.advance_to(10).unwrap();
+    f.store.advance_to(10);
     assert_eq!(f.store.pop_expired(), Some(f.task(0)));
     assert_eq!(f.store.pop_expired(), Some(f.task(0)));
     assert_eq!(f.store.pop_expired(), None);
     assert_eq!(f.head(0), b.index);
     for t in [a, b] {
         assert_eq!(f.store.entries[t.index as usize].state, State::Expired);
-        assert!(f.store.entries[t.index as usize].wake.is_none());
     }
     assert!(f.refresh(a, 1));
-    assert!(f.store.entries[a.index as usize].wake.is_none());
+    assert_eq!(f.store.entries[a.index as usize].state, State::Expired);
     f.retire(0);
     assert!(f.store.valid(a));
     assert!(!f.store.valid(b));
@@ -148,10 +138,11 @@ fn expired_keeps_owner_without_wake_until_cancel_transfer_or_retire() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn staged_handoff_blocks_reuse_before_any_mutation() {
     let mut f = Fixture::new();
     let token = f.register(0, 10);
-    f.store.advance_to(10).unwrap();
+    f.store.advance_to(10);
     let entry_len = f.store.entries.len();
     assert!(catch_unwind(AssertUnwindSafe(|| f.cancel(token))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| f.register(1, 20))).is_err());
@@ -164,34 +155,26 @@ fn staged_handoff_blocks_reuse_before_any_mutation() {
 }
 
 #[test]
-fn full_range_equal_and_regressed_time_preserve_identity_and_membership() {
+fn full_range_and_equal_time_preserve_identity_and_membership() {
     let mut f = Fixture::new();
     let first = f.register(0, 1);
     let last = f.register(1, u64::MAX);
-    f.store.advance_to(0).unwrap();
+    f.store.advance_to(0);
     assert!(f.store.expired.is_empty());
-    f.store.advance_to(1).unwrap();
+    f.store.advance_to(1);
     assert_eq!(f.store.pop_expired(), Some(f.task(0)));
-    let old_position = f.store.entries[last.index as usize].position;
-    assert_eq!(
-        f.store.advance_to(0),
-        Err(TimeRegressed {
-            current: 1,
-            supplied: 0
-        })
-    );
-    assert_eq!(f.store.entries[last.index as usize].position, old_position);
     assert!(f.store.valid(first));
     assert!(f.store.valid(last));
     assert_eq!(f.head(1), last.index);
-    f.store.advance_to(u64::MAX).unwrap();
+    f.store.advance_to(u64::MAX);
     assert_eq!(f.store.pop_expired(), Some(f.task(1)));
     assert_eq!(f.store.pop_expired(), None);
-    f.store.advance_to(u64::MAX).unwrap();
+    f.store.advance_to(u64::MAX);
     assert!(f.store.expired.is_empty());
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn due_or_terminal_registration_rejects_before_publication() {
     let mut f = Fixture::new();
     assert!(catch_unwind(AssertUnwindSafe(|| f.register(0, 0))).is_err());
@@ -220,7 +203,7 @@ fn moving_store_and_growing_entries_preserves_stable_task_aliases() {
         f.store
             .entries
             .iter()
-            .all(|e| e.state == State::Free && e.wake.is_none() && e.owner.is_null())
+            .all(|e| e.state == State::Free && e.owner.is_null())
     );
     let mut free = f.store.free_head;
     let mut seen = vec![false; f.store.entries.len()];

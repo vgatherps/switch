@@ -53,7 +53,8 @@ fn sixty_kib_futures_spawn_on_a_32_kib_stack() {
             let spawner = runtime.spawner();
             spawner.spawn(huge_struct(7)).unwrap();
             spawner.spawn(huge_async(7)).unwrap();
-            assert_eq!(runtime.poll(0).unwrap().tasks_completed, 2);
+            let report = runtime.poll(0).unwrap();
+            assert_eq!((report.tasks_polled, report.live_tasks), (2, 0));
         })
         .unwrap()
         .join()

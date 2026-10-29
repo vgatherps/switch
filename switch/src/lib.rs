@@ -168,6 +168,3 @@ pub use waker::{StoredWaker, YieldNow, yield_now};
 
 #[doc(hidden)]
 pub use task::private as __private;
-
-#[cfg(test)]
-mod extraction_smoke;

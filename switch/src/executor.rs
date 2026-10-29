@@ -251,8 +251,7 @@ impl Executor {
                 return false;
             }
             let turn = Self::enter_turn(this);
-            let mut report = BatchReport::default();
-            Self::poll_round(this, &mut report);
+            Self::poll_round(this);
             turn.finish();
             true
         }
@@ -283,23 +282,24 @@ impl Executor {
     /// were made (the budget never cuts a round short).
     ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
-    pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> BatchReport {
+    pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> usize {
         unsafe {
             let this = turn.owner;
-            let mut report = BatchReport::default();
-            while !(*this).incoming.is_empty() && report.polled < POLL_BUDGET {
-                Self::poll_round(this, &mut report);
+            let mut polled = 0;
+            while !(*this).incoming.is_empty() && polled < POLL_BUDGET {
+                polled += Self::poll_round(this);
             }
-            report
+            polled
         }
     }
 
-    /// Poll one snapshot of `incoming`.
+    /// Poll one snapshot of `incoming`; returns the futures polled.
     ///
     /// # Safety
     /// As for [`Self::poll_batch`].
-    unsafe fn poll_round(this: *mut Self, report: &mut BatchReport) {
+    unsafe fn poll_round(this: *mut Self) -> usize {
         unsafe {
+            let mut polled = 0;
             std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
             let batch_len = (*this).run_queue.len();
             let mut cursor = 0;
@@ -316,17 +316,17 @@ impl Executor {
                     Self::reclaim(this, header);
                     continue;
                 }
-                report.polled += 1;
+                polled += 1;
                 // Published for `Sleep`; if the poll unwinds, `TurnGuard` ends the task.
                 (*this).current = header;
                 let result = Meta::poll_fn(TaskHeader::meta(header))(header);
                 (*this).current = std::ptr::null();
                 if result.is_ready() {
-                    report.completed += 1;
                     Self::complete(this, header);
                 }
             }
             (*this).run_queue.clear();
+            polled
         }
     }
 
@@ -343,18 +343,6 @@ impl Executor {
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() | DROP_STARTED);
             Meta::drop_fn(TaskHeader::meta(header))(header);
-        }
-    }
-
-    /// Stable owner-thread pointer; no user code runs while scanning claims.
-    pub(crate) unsafe fn ready_count(this: *mut Self) -> usize {
-        unsafe {
-            (*this)
-                .incoming
-                .iter()
-                .chain(&(*this).deferred)
-                .filter(|&&header| TaskHeader::is_live(header))
-                .count()
         }
     }
 
@@ -442,12 +430,6 @@ impl Executor {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct BatchReport {
-    pub(crate) polled: usize,
-    pub(crate) completed: usize,
-}
-
 pub(crate) struct TurnGuard {
     owner: *mut Executor,
     finished: bool,
@@ -529,89 +511,6 @@ impl Drop for SlotGuard {
                 Executor::reclaim(self.owner, self.header);
             }
         }
-    }
-}
-
-impl Default for Executor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::runtime::Runtime;
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    #[switch::task]
-    async fn set_flag(flag: Rc<Cell<bool>>) {
-        flag.set(true);
-    }
-
-    #[switch::task]
-    async fn yield_then_count(count: Rc<Cell<usize>>) {
-        for _ in 0..3 {
-            crate::yield_now().await;
-        }
-        count.set(count.get() + 1);
-    }
-
-    #[switch::task]
-    async fn count_once(count: Rc<Cell<usize>>) {
-        count.set(count.get() + 1);
-    }
-
-    #[test]
-    fn test_spawn_and_poll() {
-        let mut runtime = Runtime::new(0);
-        let spawner = runtime.spawner();
-        let ran = Rc::new(Cell::new(false));
-
-        spawner.spawn(set_flag(ran.clone())).unwrap();
-
-        let report = runtime.poll(0).unwrap();
-        assert_eq!(report.tasks_polled, 1);
-        assert_eq!(report.tasks_completed, 1);
-        assert_eq!(report.live_tasks, 0);
-        assert!(ran.get());
-    }
-
-    #[test]
-    fn test_yield_and_resume() {
-        let mut runtime = Runtime::new(0);
-        let spawner = runtime.spawner();
-        let count = Rc::new(Cell::new(0));
-
-        spawner.spawn(yield_then_count(count.clone())).unwrap();
-
-        let mut polls = 0;
-        let mut report = runtime.poll(0).unwrap();
-        polls += report.tasks_polled;
-        while report.live_tasks != 0 {
-            report = runtime.poll(0).unwrap();
-            polls += report.tasks_polled;
-        }
-
-        assert_eq!(polls, 4); // 3 yields + 1 completion
-        assert_eq!(count.get(), 1);
-    }
-
-    #[test]
-    fn test_multiple_tasks() {
-        let mut runtime = Runtime::new(0);
-        let spawner = runtime.spawner();
-        let count = Rc::new(Cell::new(0));
-
-        for _ in 0..10 {
-            spawner.spawn(count_once(count.clone())).unwrap();
-        }
-
-        let report = runtime.poll(0).unwrap();
-        assert_eq!(report.tasks_polled, 10);
-        assert_eq!(report.tasks_completed, 10);
-        assert_eq!(report.live_tasks, 0);
-        assert_eq!(count.get(), 10);
     }
 }
 

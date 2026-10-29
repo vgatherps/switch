@@ -126,7 +126,7 @@ pub(super) fn spawn_parked(runtime: &mut Runtime, n: usize) -> Vec<Rc<State>> {
 pub(super) fn finish(runtime: &mut Runtime, state: &State) {
     state.done.set(true);
     waker(state).wake_by_ref();
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
 }
 
 // ---- Blocks ----
@@ -244,7 +244,7 @@ fn over_aligned_future_polls_and_drops_aligned_through_slot_reuse() {
         state.done.set(true);
         waker(state).wake_by_ref();
     }
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 20);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 20);
     let again: Vec<_> = (0..20).map(|_| state()).collect();
     for state in &again {
         spawner.spawn(aligned_128(state.clone())).unwrap();
@@ -254,7 +254,7 @@ fn over_aligned_future_polls_and_drops_aligned_through_slot_reuse() {
         state.done.set(true);
         waker(state).wake_by_ref();
     }
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 20);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 20);
     assert!(
         states
             .iter()
@@ -278,14 +278,7 @@ fn capacity_counts_a_completed_task_until_its_queued_wake_drains() {
     let spawner = runtime.spawner();
     spawner.spawn(wake_then_finish(state())).unwrap();
     let report = runtime.poll(0).unwrap();
-    assert_eq!(
-        (
-            report.tasks_completed,
-            report.ready_tasks,
-            report.live_tasks
-        ),
-        (1, 0, 0)
-    );
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
     // The completed task's own wake is still queued, so its slot is occupied.
     let error = spawner.spawn(wake_then_finish(state())).unwrap_err();
     assert_eq!(error.reason, RuntimeError::Exhausted);
@@ -412,9 +405,10 @@ fn stale_wake_into_a_reserved_slot_returns_before_any_executor_access() {
         .spawn(wake_while_reserved(new.clone(), Some(stale.clone())))
         .unwrap();
     let report = runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.ready_tasks), (1, 0));
+    assert_eq!(report.tasks_polled, 1);
     assert_eq!(header(&waker(&new)), header(&stale));
     assert_eq!(new.polls.get(), 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
 }
 
 // ---- will_wake ----
@@ -707,7 +701,7 @@ fn token_destructor_panic_leaves_pool_usable() {
         .spawner()
         .spawn(holds(DropFlag(drops.clone(), false)))
         .unwrap();
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     assert_eq!(drops.get(), 3);
 }
 
@@ -953,7 +947,7 @@ fn sleep_expiry_wakes_a_task_in_a_later_block() {
     }
     assert_eq!(runtime.poll(0).unwrap().live_tasks, 7);
     let report = runtime.poll(5).unwrap();
-    assert_eq!((report.timers_expired, report.tasks_completed), (7, 7));
+    assert_eq!((report.tasks_polled, report.live_tasks), (7, 0));
     assert!(flags.iter().all(|woke| woke.get()));
 }
 
@@ -1003,7 +997,7 @@ fn stale_stored_waker_into_free_then_reused_slot() {
     let stale = stored.get().unwrap();
     old.done.set(true);
     stale.wake();
-    assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     // Free slot: nothing.
     stale.wake();
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);

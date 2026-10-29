@@ -107,7 +107,7 @@ fn wrong_context_cancels_original_subscription_and_is_terminal() {
         Poll::Ready(Err(SleepError::WrongRuntime))
     );
     assert!(slot.borrow().as_ref().unwrap().token.is_none());
-    assert_eq!(runtime.poll(10).unwrap().timers_expired, 0);
+    assert_eq!(runtime.poll(10).unwrap().tasks_polled, 0);
     assert_eq!(
         poll_noop(slot.borrow_mut().as_mut().unwrap()),
         Poll::Ready(Err(SleepError::WrongRuntime))
@@ -126,13 +126,13 @@ fn other_runtime_context_rejects_without_migration() {
     b.spawner()
         .spawn(holder(slot.clone(), Rc::new(Cell::new(false))))
         .unwrap();
-    assert_eq!(b.poll(0).unwrap().tasks_completed, 1);
+    assert_eq!(b.poll(0).unwrap().tasks_polled, 1);
     assert_eq!(
         slot.borrow().as_ref().unwrap().result,
         Some(Err(SleepError::WrongRuntime))
     );
-    assert_eq!(a.poll(5).unwrap().timers_expired, 0);
-    assert_eq!(b.poll(5).unwrap().timers_expired, 0);
+    assert_eq!(a.poll(5).unwrap().tasks_polled, 0);
+    assert_eq!(b.poll(5).unwrap().tasks_polled, 0);
 }
 
 #[test]
@@ -157,7 +157,7 @@ fn transfer_before_retirement_and_stale_after_retirement() {
         }
         done.set(true);
         wake.take().unwrap().wake();
-        assert_eq!(runtime.poll(0).unwrap().tasks_completed, 1);
+        assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
         if !transfer_first {
             spawner
                 .spawn(holder(slot.clone(), Rc::new(Cell::new(false))))
@@ -166,7 +166,7 @@ fn transfer_before_retirement_and_stale_after_retirement() {
             assert_ne!(slot.borrow().as_ref().unwrap().token, Some(old));
         }
         let report = runtime.poll(8).unwrap();
-        assert_eq!((report.timers_expired, report.tasks_completed), (1, 1));
+        assert_eq!(report.tasks_polled, 1);
     }
 }
 
@@ -192,8 +192,8 @@ fn drop_cancels_and_reused_slot_does_not_accept_old_token() {
             .timers
             .cancel(old)
     });
-    assert_eq!(runtime.poll(5).unwrap().timers_expired, 0);
-    assert_eq!(runtime.poll(6).unwrap().timers_expired, 1);
+    assert_eq!(runtime.poll(5).unwrap().tasks_polled, 0);
+    assert_eq!(runtime.poll(6).unwrap().tasks_polled, 1);
 }
 
 #[test]
@@ -218,13 +218,8 @@ fn retirement_cleans_undropped_pending_and_expired_sleep() {
         if !expired {
             wake.take().unwrap().wake();
         }
-        assert_eq!(
-            runtime
-                .poll(if expired { 5 } else { 0 })
-                .unwrap()
-                .tasks_completed,
-            1
-        );
+        let report = runtime.poll(if expired { 5 } else { 0 }).unwrap();
+        assert_eq!(report.tasks_polled, 1);
         let held = ManuallyDrop::into_inner(retained.borrow_mut().take().unwrap());
         let token = held.token.unwrap();
         let root = held.control.open_core().unwrap();
@@ -236,7 +231,7 @@ fn retirement_cleans_undropped_pending_and_expired_sleep() {
         runtime.poll(if expired { 5 } else { 0 }).unwrap();
         assert_ne!(replacement.borrow().as_ref().unwrap().token, Some(token));
         drop(held); // Stale cancellation must not cancel the replacement.
-        assert_eq!(runtime.poll(9).unwrap().timers_expired, 1);
+        assert_eq!(runtime.poll(9).unwrap().tasks_polled, 1);
     }
 }
 
@@ -254,8 +249,8 @@ fn maximum_equal_and_regressed_ticks() {
         Err(RuntimeError::TimeRegressed { .. })
     ));
     let report = runtime.poll(u64::MAX).unwrap();
-    assert_eq!((report.timers_expired, report.tasks_completed), (1, 1));
-    assert_eq!(runtime.poll(u64::MAX).unwrap().timers_expired, 0);
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
+    assert_eq!(runtime.poll(u64::MAX).unwrap().tasks_polled, 0);
 }
 
 #[test]
@@ -280,7 +275,7 @@ fn foreign_runtime_frame_rejected_while_original_frame_live() {
                 .spawner()
                 .spawn(holder(self.sleep.clone(), Rc::new(Cell::new(false))))
                 .unwrap();
-            assert_eq!(self.other.borrow_mut().poll(0).unwrap().tasks_completed, 1);
+            assert_eq!(self.other.borrow_mut().poll(0).unwrap().tasks_polled, 1);
             assert_eq!(
                 self.sleep.borrow().as_ref().unwrap().result,
                 Some(Err(SleepError::WrongRuntime))
@@ -298,9 +293,9 @@ fn foreign_runtime_frame_rejected_while_original_frame_live() {
             other: b.clone(),
         }))
         .unwrap();
-    assert_eq!(a.poll(0).unwrap().tasks_completed, 1);
-    assert_eq!(a.poll(5).unwrap().timers_expired, 0);
-    assert_eq!(b.borrow_mut().poll(5).unwrap().timers_expired, 0);
+    assert_eq!(a.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(a.poll(5).unwrap().tasks_polled, 0);
+    assert_eq!(b.borrow_mut().poll(5).unwrap().tasks_polled, 0);
 }
 
 #[test]

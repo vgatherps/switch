@@ -56,12 +56,6 @@ impl From<Unavailable> for RuntimeError {
 pub struct PollReport {
     /// Calls made to task futures during this turn.
     pub tasks_polled: usize,
-    /// Tasks that returned `Ready` during this turn.
-    pub tasks_completed: usize,
-    /// Timer registrations normalized as expired during this turn.
-    pub timers_expired: usize,
-    /// Nonterminal ready tasks left after this turn.
-    pub ready_tasks: usize,
     /// All live tasks, including tasks waiting on timers or other wakes.
     pub live_tasks: usize,
 }
@@ -207,25 +201,12 @@ impl Runtime {
                 Mailbox::deliver(mailbox);
             }
             Executor::undefer(root);
-            (*root)
-                .timers
-                .advance_to(now)
-                .expect("validated timer tick regressed");
-            let mut timers_expired = 0;
-            loop {
-                let task = (*root).timers.pop_expired();
-                let Some(task) = task else {
-                    break;
-                };
-                timers_expired += 1;
+            (*root).timers.advance_to(now);
+            while let Some(task) = (*root).timers.pop_expired() {
                 Executor::wake(task);
             }
-            let batch = Executor::poll_batch(&mut turn);
             let report = PollReport {
-                tasks_polled: batch.polled,
-                tasks_completed: batch.completed,
-                timers_expired,
-                ready_tasks: Executor::ready_count(root),
+                tasks_polled: Executor::poll_batch(&mut turn),
                 live_tasks: Executor::task_count(root),
             };
             turn.finish();

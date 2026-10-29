@@ -46,10 +46,7 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
     let mut interface = Interface { calls: 0 };
     interface.poll_nonblocking();
     let first = runtime.poll(100).unwrap();
-    assert_eq!(
-        (first.tasks_polled, first.tasks_completed, first.live_tasks),
-        (1, 0, 1)
-    );
+    assert_eq!((first.tasks_polled, first.live_tasks), (1, 1));
     assert!(!completed.get());
 
     interface.poll_nonblocking();
@@ -58,15 +55,7 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
 
     interface.poll_nonblocking();
     let expired = runtime.poll(110).unwrap();
-    assert_eq!(
-        (
-            expired.timers_expired,
-            expired.tasks_polled,
-            expired.tasks_completed
-        ),
-        (1, 1, 1)
-    );
-    assert_eq!(expired.live_tasks, 0);
+    assert_eq!((expired.tasks_polled, expired.live_tasks), (1, 0));
     assert_eq!(interface.calls, 3);
     assert!(completed.get());
 
@@ -76,10 +65,7 @@ fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
         .spawn(sleep_until_then_set(due_spawner, due_completed.clone()))
         .unwrap();
     let due = runtime.poll(110).unwrap();
-    assert_eq!(
-        (due.tasks_polled, due.tasks_completed, due.timers_expired),
-        (1, 1, 0)
-    );
+    assert_eq!((due.tasks_polled, due.live_tasks), (1, 0));
     assert!(due_completed.get());
     assert_eq!(
         spawner.sleep(u64::MAX).err(),

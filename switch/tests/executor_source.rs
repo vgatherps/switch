@@ -84,14 +84,7 @@ fn test_spawn_and_poll() {
     spawner.spawn(set_true(ran.clone())).unwrap();
 
     let report = runtime.poll(0).unwrap();
-    assert_eq!(
-        (
-            report.tasks_polled,
-            report.tasks_completed,
-            report.live_tasks
-        ),
-        (1, 1, 0)
-    );
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
     assert!(ran.get());
 }
 
@@ -126,14 +119,7 @@ fn test_multiple_tasks() {
     }
 
     let report = runtime.poll(0).unwrap();
-    assert_eq!(
-        (
-            report.tasks_polled,
-            report.tasks_completed,
-            report.live_tasks
-        ),
-        (10, 10, 0)
-    );
+    assert_eq!((report.tasks_polled, report.live_tasks), (10, 0));
     assert_eq!(count.get(), 10);
 }
 
@@ -150,10 +136,7 @@ fn test_nested_spawn() {
 
     // The spawned task runs in the same poll's next round.
     let first = runtime.poll(0).unwrap();
-    assert_eq!(
-        (first.tasks_polled, first.tasks_completed, first.live_tasks),
-        (2, 2, 0)
-    );
+    assert_eq!((first.tasks_polled, first.live_tasks), (2, 0));
     assert!(inner_ran.get());
 }
 
@@ -177,14 +160,7 @@ fn test_stored_waker_across_polls() {
     stored.wake();
 
     let second = runtime.poll(0).unwrap(); // Second poll completes
-    assert_eq!(
-        (
-            second.tasks_polled,
-            second.tasks_completed,
-            second.live_tasks
-        ),
-        (1, 1, 0)
-    );
+    assert_eq!((second.tasks_polled, second.live_tasks), (1, 0));
     assert!(done.get());
 }
 
