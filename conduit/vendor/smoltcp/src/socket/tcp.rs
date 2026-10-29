@@ -501,6 +501,13 @@ pub struct Socket<'a> {
     in_rto_loss_episode: bool,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
     remote_has_sack: bool,
+    /// The dispatching interface's owned set holds the tuple's local address: false when the
+    /// tuple is set, resolved by the first egress dispatch whose interface-address compare
+    /// misses. The owned set is fixed for the interface's life, so later dispatches need no
+    /// search. Resolved against the interface that dispatches, not the context given at
+    /// connect or accept, which could be another interface's. Sits in the slot line egress
+    /// already reads for hop_limit and the next hop.
+    local_owned: bool,
     timer: Timer,
     /// Delayed ack timer. If set, packets containing exclusively
     /// ACK or window updates (ie, no data) won't be sent until expiry.
@@ -590,12 +597,6 @@ pub struct Socket<'a> {
     orphaned: bool,
     /// An acceptable peer RST closed this connection; cleared by reset().
     reset_by_peer: bool,
-    /// The dispatching interface's owned set holds the tuple's local address: false when the
-    /// tuple is set, resolved by the first egress dispatch whose interface-address compare
-    /// misses. The owned set is fixed for the interface's life, so later dispatches need no
-    /// search. Resolved against the interface that dispatches, not the context given at
-    /// connect or accept, which could be another interface's.
-    local_owned: bool,
 }
 
 #[cfg(test)]
@@ -609,6 +610,7 @@ pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
         ("rx_fin_received", offset_of!(Socket<'static>, rx_fin_received)),
         ("in_rto_loss_episode", offset_of!(Socket<'static>, in_rto_loss_episode)),
         ("remote_has_sack", offset_of!(Socket<'static>, remote_has_sack)),
+        ("local_owned", offset_of!(Socket<'static>, local_owned)),
         ("timer", offset_of!(Socket<'static>, timer)),
         ("ack_at", offset_of!(Socket<'static>, ack_at)),
         ("local_seq_no", offset_of!(Socket<'static>, local_seq_no)),
@@ -656,7 +658,6 @@ pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
         ("rx_refused_segments", offset_of!(Socket<'static>, rx_refused_segments)),
         ("mss_cap", offset_of!(Socket<'static>, mss_cap)),
         ("reset_by_peer", offset_of!(Socket<'static>, reset_by_peer)),
-        ("local_owned", offset_of!(Socket<'static>, local_owned)),
     ]
 }
 
@@ -3681,9 +3682,9 @@ fn rtt_sampling_round_trips() {
 #[test]
 fn socket_size_matches_main() {
     // TxQueue holds frame entries, their end position and their TxSource instead of a borrowed
-    // byte ring; the TxSource is a thin Rc to the concrete pool. local_owned adds a byte at the
-    // tail (8 with padding); every other field keeps its offset.
-    let main_size = 464;
+    // byte ring; the TxSource is a thin Rc to the concrete pool. local_owned takes a padding
+    // byte before timer.
+    let main_size = 456;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
 }
