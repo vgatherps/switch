@@ -26,6 +26,7 @@ fn config(max_udp_sockets: usize) -> StackConfig<'static> {
         ipv4: Ipv4Cidr::new(Side::A.ip(), 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 2,

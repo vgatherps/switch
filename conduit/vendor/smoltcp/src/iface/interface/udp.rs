@@ -7,6 +7,9 @@ use crate::phy::{ChecksumCapabilities, TxFrame, UniqueTxBuf};
 impl Interface {
     /// Check one UDP send of `len` payload bytes before any device work.
     /// Errors come in this order: `NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`.
+    /// `Unaddressable` includes our own addresses, the owned set too. The set is not searched for
+    /// the destination of the socket's header template: a template exists only for a destination
+    /// that passed here, and the set is fixed.
     ///
     /// Panics if the interface medium is not Ethernet or `handle` is stale.
     pub fn udp_target(
@@ -31,7 +34,9 @@ impl Interface {
         };
         if dst_addr.is_unspecified()
             || dst_addr.is_multicast()
-            || self.inner.has_ip_addr(dst_addr)
+            || self.inner.has_interface_addr(to.addr)
+            || (socket.template.as_ref().is_none_or(|template| template.dst() != dst_addr)
+                && self.inner.owns_ipv4(dst_addr))
             || to.port == 0
             || (self.inner.is_broadcast(&to.addr) && !socket.config().broadcast)
         {

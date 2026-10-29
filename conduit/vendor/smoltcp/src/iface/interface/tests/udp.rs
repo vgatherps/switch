@@ -1233,6 +1233,42 @@ fn udp_target_error_order() {
     assert_eq!(test.device.tx, vec![arp_request(REMOTE)]);
 }
 
+/// An owned address is `Unaddressable` in `udp_target`'s order (before `TooLarge`), in and
+/// outside the subnet, also once the socket has a header template for a peer; the peer's
+/// sends, which skip the owned-set search, still go out.
+#[test]
+fn udp_target_refuses_owned_addresses_in_order() {
+    let owned = Ipv4Address::new(192, 168, 1, 9);
+    let elsewhere = Ipv4Address::new(10, 9, 0, 1);
+    let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
+    let mut test = Test::new(1);
+    test.iface.set_owned_ipv4(
+        crate::iface::OwnedIpv4::new(
+            &[Ipv4Cidr::new(owned, 32), Ipv4Cidr::new(elsewhere, 32)],
+            Ipv4Cidr::new(LOCAL, 24),
+            None,
+        )
+        .unwrap(),
+    );
+    resolve(&mut test, REMOTE, REMOTE_MAC);
+    for sent in 0..3 {
+        for addr in [LOCAL, owned, elsewhere] {
+            for len in [1, usize::MAX] {
+                assert_send_error(
+                    &mut test,
+                    Some(IpEndpoint::new(addr.into(), PEER_PORT)),
+                    len,
+                    UdpSendError::Unaddressable,
+                );
+            }
+        }
+        assert_eq!(test.udp.get(test.handle).template.is_some(), sent > 0);
+        assert_eq!(test.send(peer, b"peer"), Ok(()));
+        assert_eq!(test.device.tx, vec![send_frame(REMOTE, REMOTE_MAC, b"peer", true)]);
+        test.device.tx.clear();
+    }
+}
+
 #[test]
 fn arp_on_miss_payload_untouched() {
     let mut test = Test::new(1);

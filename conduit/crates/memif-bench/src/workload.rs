@@ -200,6 +200,7 @@ fn stack(
         tx_pending: tx_pending(conns),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
     };
     Stack::new(port, config, NetInstant::ZERO)
 }

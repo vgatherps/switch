@@ -82,6 +82,7 @@ pub fn with_tap_net<T>(config: &TapConfig, body: impl FnOnce(&mut Net, &Clock) -
             ipv4: Ipv4Cidr::new(ZHIDA_ADDR, 24),
             gateway: None,
             paths: &[],
+            owned_ipv4: &[],
             random_seed: config.random_seed,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
             max_sockets: config.max_sockets,

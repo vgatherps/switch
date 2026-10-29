@@ -141,6 +141,7 @@ fn with_net<T>(
             ipv4: Ipv4Cidr::new(ZHIDA_ADDR, 24),
             gateway: Some(KERNEL_ADDR),
             paths,
+            owned_ipv4: &[],
             random_seed: 1,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
             max_sockets: 1,

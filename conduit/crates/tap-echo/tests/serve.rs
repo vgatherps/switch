@@ -18,6 +18,7 @@ fn serve_returns_time_went_backwards_when_the_stack_starts_ahead_of_the_clock() 
             ipv4: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, 1), 24),
             gateway: None,
             paths: &[],
+            owned_ipv4: &[],
             random_seed: 1,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
             max_sockets: 1,
