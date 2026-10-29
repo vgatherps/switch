@@ -10,10 +10,15 @@ pub(crate) const LIVE: u8 = 1;
 /// One run-queue entry refers to this slot.
 pub(crate) const QUEUED: u8 = 2;
 /// The future's destructor has started; it never runs twice.
-pub(crate) const DROP_STARTED: u8 = 4;
+pub(crate) const DROP_STARTED: u8 = 16;
 /// The slot holds a future (live, or awaiting drop or reclaim); set at commit,
 /// cleared when the slot is freed.
 pub(crate) const TAKEN: u8 = 8;
+/// With QUEUED: the queue entry is in `deferred` (`StoredWaker::wake_deferred`).
+/// Cleared when the entry moves to `incoming`. Bit 2, next to LIVE and QUEUED:
+/// the wake check's mask `LIVE | QUEUED | DEFERRED` (0b111) is then one AArch64
+/// logical immediate.
+pub(crate) const DEFERRED: u8 = 4;
 
 /// Written only on the owner thread. Every mutable field is a `Cell`, so shared
 /// access never conflicts with a wake or timer registration during a poll.

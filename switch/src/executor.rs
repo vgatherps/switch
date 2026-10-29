@@ -17,7 +17,7 @@ use crate::remote::Mailbox;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
-use crate::task::header::{DROP_STARTED, LIVE, QUEUED, TAKEN};
+use crate::task::header::{DEFERRED, DROP_STARTED, LIVE, QUEUED, TAKEN};
 use crate::task::pool::RuntimePool;
 use crate::timer_registration::TimerStore;
 
@@ -30,6 +30,11 @@ pub(crate) enum Lifecycle {
     Panicked,
     Closing,
 }
+
+/// Calling it marks a branch unlikely (`std::hint::cold_path` is unstable).
+#[cold]
+#[inline]
+fn unlikely() {}
 
 /// Most task polls in one `Runtime::poll`, checked between rounds.
 pub(crate) const POLL_BUDGET: usize = 1024;
@@ -188,7 +193,12 @@ impl Executor {
         unsafe {
             let flags = TaskHeader::flags(header);
             let current = flags.get();
-            if current & (LIVE | QUEUED) != LIVE {
+            if current & (LIVE | QUEUED | DEFERRED) != LIVE {
+                // Laid out off the fresh-wake path.
+                unlikely();
+                if current & (LIVE | QUEUED | DEFERRED) == LIVE | QUEUED | DEFERRED {
+                    Self::upgrade(header);
+                }
                 return;
             }
             // A LIVE slot's executor is alive: cleanup clears every slot's flags
@@ -202,7 +212,35 @@ impl Executor {
         }
     }
 
-    /// As [`Self::wake`], into `deferred`: the task runs in the next poll.
+    /// An ordinary wake of a deferred task: its entry moves from `deferred` to
+    /// `incoming`, so it runs in this poll's next round. The other deferred
+    /// tasks keep their order.
+    ///
+    /// # Safety
+    /// As for [`Self::wake`]; the task is LIVE, QUEUED and DEFERRED.
+    #[cold]
+    #[inline(never)]
+    unsafe fn upgrade(header: *const TaskHeader) {
+        unsafe {
+            let this = Meta::executor(TaskHeader::meta(header));
+            if (*this).lifecycle != Lifecycle::Open {
+                return;
+            }
+            let deferred = &mut (*this).deferred;
+            let position = deferred
+                .iter()
+                .position(|&entry| entry == header)
+                .expect("a DEFERRED task has an entry in `deferred`");
+            deferred.remove(position);
+            let flags = TaskHeader::flags(header);
+            flags.set(flags.get() & !DEFERRED);
+            // The entry moved: queue lengths sum to at most `allocated`.
+            (*this).incoming.push(header);
+        }
+    }
+
+    /// As [`Self::wake`], into `deferred`: the task runs in the next poll. A
+    /// task already queued (eagerly or deferred) stays as it is.
     ///
     /// # Safety
     /// Owner thread; `header` heads a slot of a block.
@@ -218,7 +256,7 @@ impl Executor {
             if (*this).lifecycle != Lifecycle::Open {
                 return;
             }
-            flags.set(current | QUEUED);
+            flags.set(current | QUEUED | DEFERRED);
             (*this).deferred.push(header);
         }
     }
@@ -231,6 +269,10 @@ impl Executor {
     pub(crate) unsafe fn undefer(this: *mut Self) {
         unsafe {
             if !(*this).deferred.is_empty() {
+                for &header in &(*this).deferred {
+                    let flags = TaskHeader::flags(header);
+                    flags.set(flags.get() & !DEFERRED);
+                }
                 // Deferred wakes came first (during the last poll): they run first.
                 // Every slot has at most one queue entry: no reallocation.
                 (*this).deferred.append(&mut (*this).incoming);
@@ -388,7 +430,7 @@ impl Executor {
                 if TaskHeader::flags(header).get() & TAKEN != 0 {
                     Self::terminal(this, header);
                     let flags = TaskHeader::flags(header);
-                    flags.set(flags.get() & !QUEUED);
+                    flags.set(flags.get() & !(QUEUED | DEFERRED));
                 }
             }
             for header in Self::slots(this) {
@@ -427,6 +469,12 @@ impl Executor {
     #[inline]
     pub unsafe fn task_count(this: *mut Self) -> usize {
         unsafe { (*this).task_count }
+    }
+
+    /// Entries in `incoming` and `deferred`.
+    #[cfg(test)]
+    pub(crate) unsafe fn queue_lengths(this: *mut Self) -> (usize, usize) {
+        unsafe { ((*this).incoming.len(), (*this).deferred.len()) }
     }
 }
 
