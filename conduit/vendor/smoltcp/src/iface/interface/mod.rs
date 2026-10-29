@@ -177,7 +177,7 @@ pub struct InterfaceInner {
     any_ip: bool,
     ipv4_gateway: Option<Ipv4Address>,
     path_mtus: Option<PathMtus>,
-    owned_ipv4: OwnedIpv4,
+    pub(crate) owned_ipv4: OwnedIpv4,
 }
 
 /// Configuration structure used for creating a network interface.

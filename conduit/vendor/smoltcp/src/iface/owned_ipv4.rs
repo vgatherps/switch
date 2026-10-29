@@ -130,6 +130,7 @@ mod tests {
     /// Single addresses with every other address skipped: each is a member, each skipped one is
     /// not, at every set size the plan names.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn single_addresses_at_every_size() {
         for count in [1u32, 50, 500, 1000, 4096] {
             let base = u32::from(addr("100.64.0.0"));

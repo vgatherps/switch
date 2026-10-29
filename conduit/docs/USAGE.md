@@ -646,12 +646,15 @@ stack.connect(&handle, endpoint, local_port)?;
 `Stack::connect(&handle, remote, local)` supplies the interface context. `remote` converts to
 `IpEndpoint`; `local` converts to `IpListenEndpoint`. The local port must be nonzero; there is no
 ephemeral-port allocator. Omitting the local address lets the interface choose its IPv4 source
-address. Success enters `State::SynSent`; drive the Stack until `state()` is `Established` or the
+address; an explicit local address must be the interface address or one in `owned_ipv4`. Success enters `State::SynSent`; drive the Stack until `state()` is `Established` or the
 application gives up. A returned connect error leaves the socket unchanged.
 
 For passive open, call `stack.listen(&handle, local_port)` or supply an `IpListenEndpoint`. An
-unspecified listen address matches the interface address; an explicit address filters incoming SYNs.
-TCP and ICMP sent to a broadcast or multicast address are dropped without a reply, as on Linux.
+unspecified listen address matches the interface address and every `owned_ipv4` address; an explicit
+address filters incoming SYNs. TCP and ICMP sent to a broadcast or multicast address are dropped
+without a reply, as on Linux. A TCP segment that matches a connection (its 4-tuple) goes to it
+without any address check; a connection's local address is always one of ours. Any other segment
+to an address that is not ours is dropped without a reply: no SYN-ACK and no RST.
 Success enters `State::Listen`. Listening again on the same endpoint while already in Listen
 succeeds without resetting it; listening on an otherwise open socket errors.
 
@@ -962,8 +965,9 @@ insufficiency first.
 ### Socket errors
 
 `tcp::ConnectError::InvalidState` means the socket is already open. `Unaddressable` covers zero
-local/remote port, unspecified remote or explicit local address, unavailable source address
-selection, or mismatched address versions. `Stack::connect` returns `AddressInUse` when a
+local/remote port, unspecified remote or explicit local address, an explicit local address that is
+neither the interface address nor in `owned_ipv4`, unavailable source address selection, or
+mismatched address versions. `Stack::connect` returns `AddressInUse` when a
 socket holds the same local and remote endpoints, including while closing or in TIME-WAIT.
 Closed sockets and listeners do not reserve an exact tuple. Different remote endpoints may share a
 local port. Success does not promise reachability.

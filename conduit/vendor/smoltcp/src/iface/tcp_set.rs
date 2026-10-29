@@ -998,6 +998,23 @@ impl TcpSet<'_> {
         src: IpEndpoint,
         syn_like: bool,
     ) -> Option<usize> {
+        let exact = self.tcp_exact_lookup(dst, src, syn_like);
+        if exact.is_none() && syn_like {
+            self.tcp_listener_lookup(dst)
+        } else {
+            exact
+        }
+    }
+
+    /// The exact (4-tuple) flow for a segment from `src` to `dst`, without the listener
+    /// fallback. A non-SYN segment's hit is cached for the next lookup.
+    #[inline]
+    pub(crate) fn tcp_exact_lookup(
+        &mut self,
+        dst: IpEndpoint,
+        src: IpEndpoint,
+        syn_like: bool,
+    ) -> Option<usize> {
         if !syn_like
             && let Some((index, epoch)) = self.last_exact
             && epoch == self.flow_epoch
@@ -1013,14 +1030,7 @@ impl TcpSet<'_> {
         if !syn_like && let Some(index) = e {
             self.last_exact = Some((index, self.flow_epoch));
         }
-        if e.is_some() {
-            return e;
-        }
-        if syn_like {
-            self.tcp_listener_lookup(dst)
-        } else {
-            None
-        }
+        e
     }
 
     pub(crate) fn tcp_listener_lookup(&self, dst: IpEndpoint) -> Option<usize> {

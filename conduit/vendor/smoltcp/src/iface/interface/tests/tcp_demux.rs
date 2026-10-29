@@ -246,6 +246,7 @@ fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
         let response = iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
+            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             packet.payload(),
         );
@@ -2083,6 +2084,7 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
+            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &packet.payload()[..length],
         ).is_none());
@@ -2093,6 +2095,7 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
+            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &tcp,
         ).is_none());
@@ -2139,4 +2142,150 @@ fn broadcast_syn_without_socket_gets_no_rst() {
         segment(TcpControl::Syn, REMOTE_SEQ, None));
     let bytes = take_reply(&mut device);
     assert_control(&reply(&bytes), LOCAL_PORT, TcpControl::Rst, Some(REMOTE_SEQ + 1));
+}
+
+/// Owned 10.9.0.0/30 next to the interface address.
+fn own_prefix(iface: &mut Interface) {
+    iface.set_owned_ipv4(
+        crate::iface::OwnedIpv4::new(
+            &["10.9.0.0/30".parse().unwrap()],
+            Ipv4Cidr::new(LOCAL_ADDR, 24),
+            None,
+        )
+        .unwrap(),
+    );
+}
+
+/// The reply's source address and TCP header, for a reply from any of our addresses.
+fn reply_from(bytes: &[u8]) -> (Ipv4Address, TcpRepr<'_>) {
+    let ip = Ipv4Packet::new_checked(bytes).unwrap();
+    assert!(ip.verify_checksum());
+    assert_eq!(ip.dst_addr(), REMOTE_ADDR);
+    let tcp = TcpRepr::parse(
+        &TcpPacket::new_checked(ip.payload()).unwrap(),
+        &ip.src_addr().into(),
+        &REMOTE_ADDR.into(),
+        &ChecksumCapabilities::default(),
+    )
+    .unwrap();
+    (ip.src_addr(), tcp)
+}
+
+/// With an all-address listener, a SYN or an unknown segment to an address that is not ours
+/// (a neighbour, just past the owned prefix, the subnet broadcast) gets nothing back: no
+/// SYN-ACK, no RST, the listener untouched. To an owned address the SYN-ACK and the RST come
+/// from that address.
+#[test]
+fn segments_to_unowned_addresses_get_no_reply() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT).unwrap();
+    let handle = sockets.add(listener);
+    let unknown = segment(TcpControl::None, REMOTE_SEQ, Some(TcpSeqNumber(7)));
+    for dst in [
+        Ipv4Address::new(192, 168, 1, 3),
+        Ipv4Address::new(10, 9, 0, 4),
+        Ipv4Address::new(192, 168, 1, 255),
+    ] {
+        for tcp in [segment(TcpControl::Syn, REMOTE_SEQ, None), unknown] {
+            device.rx_queue.push_back(packet_bytes_to(tcp, dst));
+            iface.poll(Instant::ZERO, &mut device, &mut sockets);
+            assert!(device.tx_queue.is_empty(), "{dst} {:?}", tcp.control);
+            assert_eq!(sockets.get(handle).state(), tcp::State::Listen);
+        }
+    }
+    let owned = Ipv4Address::new(10, 9, 0, 3);
+    device.rx_queue.push_back(packet_bytes_to(unknown, owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (src, rst) = reply_from(&bytes);
+    assert_eq!((src, rst.control), (owned, TcpControl::Rst));
+    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (src, synack) = reply_from(&bytes);
+    assert_eq!(src, owned);
+    assert_control(&synack, LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 1));
+    assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+    assert_eq!(
+        sockets.get(handle).local_endpoint(),
+        Some(IpEndpoint::new(owned.into(), LOCAL_PORT))
+    );
+}
+
+/// A segment matching an established flow is delivered without checking its destination:
+/// with the interface address removed, data to the flow still arrives, while a SYN to that
+/// address now gets nothing.
+#[test]
+fn established_flow_takes_segments_without_an_address_check() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
+    iface.update_ip_addrs(|addrs| addrs.clear());
+    device.rx_queue.push_back(packet_bytes(TcpRepr {
+        payload: b"abc",
+        ..segment(TcpControl::None, REMOTE_SEQ + 1, Some(local_seq))
+    }));
+    assert_eq!(
+        iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets),
+        PollIngressSingleResult::SocketStateChanged
+    );
+    assert_eq!(sockets.get(handle).recv_queue(), 3);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT + 1).unwrap();
+    let listener = sockets.add(listener);
+    device.rx_queue.push_back(packet_bytes(TcpRepr {
+        dst_port: LOCAL_PORT + 1,
+        ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+    }));
+    iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(sockets.get(listener).state(), tcp::State::Listen);
+    assert!(device.tx_queue.is_empty());
+}
+
+/// Every flow's local address is one of ours: accepted on the interface address and on an
+/// owned one, connected with the default source and with an owned source. A connect from a
+/// foreign address and a SYN to one create no flow.
+#[test]
+fn flows_only_exist_for_owned_addresses() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT).unwrap();
+    sockets.add(listener);
+    for (dst, src_port) in [
+        (LOCAL_ADDR, 50001),
+        (Ipv4Address::new(10, 9, 0, 1), 50002),
+        (Ipv4Address::new(192, 168, 1, 3), 50003),
+    ] {
+        let mut listener = socket();
+        listener.listen(LOCAL_PORT).unwrap();
+        sockets.add(listener);
+        device.rx_queue.push_back(packet_bytes_to(
+            TcpRepr { src_port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) },
+            dst,
+        ));
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        device.tx_queue.clear();
+    }
+    let remote = IpEndpoint::new(REMOTE_ADDR.into(), 80);
+    for (local, expected) in [
+        (IpListenEndpoint { addr: None, port: 40001 }, Ok(())),
+        (IpListenEndpoint::from((Ipv4Address::new(10, 9, 0, 2), 40002)), Ok(())),
+        (
+            IpListenEndpoint::from((Ipv4Address::new(192, 168, 1, 3), 40003)),
+            Err(tcp::ConnectError::Unaddressable),
+        ),
+    ] {
+        let handle = sockets.add(socket());
+        assert_eq!(sockets.get_mut(handle).connect(iface.context(), remote, local), expected);
+    }
+    let locals: Vec<_> = sockets
+        .iter()
+        .filter_map(|(_, socket)| socket.remote_endpoint().and(socket.local_endpoint()))
+        .collect();
+    assert_eq!(locals.len(), 4);
+    for local in locals {
+        assert!(iface.inner.has_ip_addr(local.addr), "flow on {local}");
+    }
 }

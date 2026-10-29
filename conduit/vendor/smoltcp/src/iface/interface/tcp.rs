@@ -183,25 +183,20 @@ impl InterfaceInner {
         Ok(())
     }
 
-    pub(crate) fn process_tcp<'frame>(
-        &mut self,
-        sockets: &mut TcpSet,
+    /// The TCP segment in `ip_payload`, or `None` for one this stack drops before demux: an
+    /// unspecified address (RFC 1122 §3.2.1.3; a socket with an unspecified peer would panic on
+    /// egress), a malformed header, a zero port or a bad checksum.
+    #[inline]
+    fn tcp_segment<'frame>(
+        &self,
         meta: PacketMeta,
-        ip_repr: IpRepr,
+        src_addr: IpAddress,
+        dst_addr: IpAddress,
         ip_payload: &'frame [u8],
-    ) -> Option<Packet<'frame>> {
-        assert!(sockets.pending_rx_attach.is_none());
-        assert!(sockets.pending_tcp_reply.is_none());
-
-        let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
-
-        // Per RFC 1122 §3.2.1.3, the unspecified address must never appear as a source
-        // or destination in any IP datagram. Drop such TCP segments early to avoid
-        // creating sockets with unspecified peers (which would later panic on egress).
+    ) -> Option<TcpRepr<'frame>> {
         if src_addr.is_unspecified() || dst_addr.is_unspecified() {
             return None;
         }
-
         let tcp_packet = check!(TcpPacket::new_checked(ip_payload));
         if tcp_packet.src_port() == 0 || tcp_packet.dst_port() == 0 {
             return None;
@@ -213,12 +208,39 @@ impl InterfaceInner {
         }
         let mut checksum_caps = self.caps.checksum.clone();
         checksum_caps.tcp = crate::phy::Checksum::None;
-        let tcp_repr = check!(TcpRepr::parse(
+        Some(check!(TcpRepr::parse(
             &tcp_packet,
             &src_addr,
             &dst_addr,
             &checksum_caps
-        ));
+        )))
+    }
+
+    /// Demultiplex one TCP segment flow-first: an exact (4-tuple) flow takes it without
+    /// checking the destination, since a flow's local address is ours by construction
+    /// (`Socket::connect` refuses another, and a listener only accepts SYNs to our addresses).
+    /// On a miss the destination must be ours, else the segment is dropped without a reply;
+    /// only then do listeners and the RST reply apply. `source_hardware_addr` refreshes the
+    /// sender's neighbor entry for a segment to one of our unicast addresses, malformed or not.
+    pub(crate) fn process_tcp<'frame>(
+        &mut self,
+        sockets: &mut TcpSet,
+        meta: PacketMeta,
+        source_hardware_addr: HardwareAddress,
+        ip_repr: IpRepr,
+        ip_payload: &'frame [u8],
+    ) -> Option<Packet<'frame>> {
+        assert!(sockets.pending_rx_attach.is_none());
+        assert!(sockets.pending_tcp_reply.is_none());
+
+        let IpRepr::Ipv4(ipv4_repr) = ip_repr;
+        let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
+        let Some(tcp_repr) = self.tcp_segment(meta, src_addr, dst_addr, ip_payload) else {
+            if self.has_ip_addr(dst_addr) {
+                self.refresh_sender(ipv4_repr, source_hardware_addr);
+            }
+            return None;
+        };
 
         let syn_like = tcp_repr.ack_number.is_none() && tcp_repr.control != TcpControl::Rst;
         let dst = IpEndpoint::new(dst_addr, tcp_repr.dst_port);
@@ -244,7 +266,17 @@ impl InterfaceInner {
                 .or(listener)
         };
 
-        let mut winner = sockets.tcp_lookup(dst, src, syn_like);
+        let mut winner = sockets.tcp_exact_lookup(dst, src, syn_like);
+        if winner.is_none() {
+            if !self.has_ip_addr(dst_addr) {
+                net_trace!("Rejecting TCP segment to {}", dst_addr);
+                return None;
+            }
+            if syn_like {
+                winner = sockets.tcp_listener_lookup(dst);
+            }
+        }
+        self.refresh_sender(ipv4_repr, source_hardware_addr);
         if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none() {
             while let Some(index) = winner {
                 let socket = &mut sockets

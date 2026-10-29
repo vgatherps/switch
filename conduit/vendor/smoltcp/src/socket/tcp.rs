@@ -1201,8 +1201,8 @@ impl<'a> Socket<'a> {
     /// The local address may optionally be provided.
     ///
     /// This function returns an error if the socket was open; see [is_open](#method.is_open).
-    /// It also returns an error if the local or remote port is zero, or if the remote address
-    /// is unspecified.
+    /// It also returns an error if the local or remote port is zero, if the remote address
+    /// is unspecified, or if an explicit local address is not one of the interface's.
     pub fn connect<T, U>(
         &mut self,
         cx: &mut Context,
@@ -1256,7 +1256,9 @@ impl<'a> Socket<'a> {
         let local_endpoint = IpEndpoint {
             addr: match local_endpoint.addr {
                 Some(addr) => {
-                    if addr.is_unspecified() {
+                    // A flow's local address must be ours: inbound segments that match a flow
+                    // are delivered without checking their destination.
+                    if addr.is_unspecified() || !cx.has_ip_addr(addr) {
                         return Err(ConnectError::Unaddressable);
                     }
                     addr
@@ -9578,13 +9580,36 @@ mod test {
         assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
     }
 
+    /// An explicit local address must be ours (the interface address or an owned one): a
+    /// foreign one is `Unaddressable` and leaves the socket closed with no tuple, so no flow is
+    /// ever registered for an address we do not own.
     #[test]
     fn test_connect_specified_local() {
         let mut s = socket();
+        for foreign in [REMOTE_ADDR, IpvXAddress::new(192, 168, 1, 3)] {
+            assert_eq!(
+                s.socket.connect(&mut s.cx, REMOTE_END, (foreign, 80)),
+                Err(ConnectError::Unaddressable)
+            );
+            assert_eq!(s.socket.state(), State::Closed);
+            assert_eq!(s.socket.local_endpoint(), None);
+        }
         assert_eq!(
-            s.socket.connect(&mut s.cx, REMOTE_END, (REMOTE_ADDR, 80)),
+            s.socket.connect(&mut s.cx, REMOTE_END, (LOCAL_ADDR, 80)),
             Ok(())
         );
+        assert_eq!(s.socket.local_endpoint(), Some(IpEndpoint::new(LOCAL_ADDR.into(), 80)));
+
+        let mut s = socket();
+        let owned = IpvXAddress::new(10, 9, 0, 1);
+        s.cx.owned_ipv4 = crate::iface::OwnedIpv4::new(
+            &[crate::wire::Ipv4Cidr::new(owned, 32)],
+            crate::wire::Ipv4Cidr::new(LOCAL_ADDR, 24),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, (owned, 80)), Ok(()));
+        assert_eq!(s.socket.local_endpoint(), Some(IpEndpoint::new(owned.into(), 80)));
     }
 
     #[test]
