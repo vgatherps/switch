@@ -1,6 +1,6 @@
 use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use smoltcp::iface::{PathMtu, PathMtus, MIN_IP_MTU};
+use smoltcp::iface::{OwnedIpv4, PathMtu, PathMtus, MIN_IP_MTU};
 use smoltcp::wire::{EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr};
 use std::{fmt, fs, path::Path, str::FromStr};
 
@@ -362,40 +362,12 @@ fn interval(cidr: Ipv4Cidr) -> (u32, u32) {
     )
 }
 
-/// The rules `Stack::new` applies to its owned ranges, checked over every address an entry
-/// covers: no host bits, unicast (no 0.0.0.0, multicast or 255.255.255.255), not the gateway,
-/// not the subnet's broadcast address.
+/// Each entry against the rules `Stack::new` applies (`OwnedIpv4::new`), one at a time so the
+/// error names the entry.
 fn validate_owned(config: &Config) -> Result<(), ConfigError> {
-    const MULTICAST: (u32, u32) = (0xe000_0000, 0xefff_ffff);
     for (index, cidr) in config.owned_ipv4.iter().enumerate() {
-        let field = format!("owned_ipv4[{index}]");
-        if *cidr != cidr.network() {
-            return Err(error(&field, "prefix must not have host bits set"));
-        }
-        let (start, end) = interval(*cidr);
-        let holds = |addr: u32| start <= addr && addr <= end;
-        if holds(0) || holds(u32::MAX) || (start <= MULTICAST.1 && MULTICAST.0 <= end) {
-            return Err(error(&field, "owned IPv4 addresses must be unicast"));
-        }
-        if config
-            .gateway
-            .is_some_and(|gateway| holds(u32::from(gateway)))
-        {
-            return Err(error(
-                &field,
-                "owned IPv4 addresses must not include the gateway",
-            ));
-        }
-        if config
-            .ipv4
-            .broadcast()
-            .is_some_and(|broadcast| holds(u32::from(broadcast)))
-        {
-            return Err(error(
-                &field,
-                "owned IPv4 addresses must not include the subnet's broadcast address",
-            ));
-        }
+        OwnedIpv4::new(&[*cidr], config.ipv4, config.gateway)
+            .map_err(|message| error(&format!("owned_ipv4[{index}]"), message))?;
     }
     Ok(())
 }
