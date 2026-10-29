@@ -2,7 +2,8 @@ use std::fmt;
 use std::io::Read;
 
 use smoltcp::iface::{
-    Config, DropQueue, Interface, NoRoute, PathMtu, PathMtus, PollIngressSingleResult, PollResult,
+    Config, DropQueue, Interface, NoRoute, OwnedIpv4, PathMtu, PathMtus, PollIngressSingleResult,
+    PollResult,
     SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
@@ -44,6 +45,14 @@ pub struct StackConfig<'a> {
     /// Empty paths give every destination the Port IP MTU.
     /// TCP connects cap MSS at path MTU minus 40. Copied at `Stack::new`.
     pub paths: &'a [PathMtu],
+    /// Addresses the Stack owns besides `ipv4`'s address: single addresses
+    /// (/32) and prefixes, inside or outside the subnet. It answers ARP for
+    /// each and accepts IPv4 traffic to each; routing, the subnet broadcast
+    /// and the default source stay with `ipv4`. Duplicates and overlaps are
+    /// merged. Every address must be unicast, and none may be the gateway or
+    /// the subnet's broadcast address; a prefix must not have host bits set.
+    /// Copied at `Stack::new`.
+    pub owned_ipv4: &'a [Ipv4Cidr],
     /// Interface PRNG seed, including the TCP ISN secret. Production callers
     /// use [`os_random_seed`]; tests and library benchmarks may fix it.
     pub random_seed: u64,
@@ -126,6 +135,8 @@ pub enum AddUdpError {
     Full,
     PortInUse,
     InvalidConfig(&'static str),
+    /// `UdpConfig::local_addr` is not an address this Stack owns.
+    Unaddressable,
     RxPoolTooSmall { required: usize, pool: usize },
 }
 
@@ -254,6 +265,10 @@ impl Stack {
             Ok(paths) => paths,
             Err(reason) => return Err((port, StackError::InvalidConfig(reason))),
         };
+        let owned = match OwnedIpv4::new(config.owned_ipv4, config.ipv4, config.gateway) {
+            Ok(owned) => owned,
+            Err(reason) => return Err((port, StackError::InvalidConfig(reason))),
+        };
         let count = port.tx_pool_count();
         let required = tx_reserve(port.descriptor_counts().1, config.tx_pending);
         if count < required {
@@ -280,6 +295,7 @@ impl Stack {
         let mut iface_config = Config::new(config.ethernet.into());
         iface_config.random_seed = config.random_seed;
         iface_config.neighbor_capacity = config.neighbor_capacity;
+        iface_config.owned_ipv4 = owned;
         let mut iface = Interface::new(iface_config, &mut device, now);
         iface.update_ip_addrs(|addrs| {
             // The address list starts empty and holds at least one entry.
@@ -609,9 +625,12 @@ impl Stack {
             .expect("RX pool requirement exceeds usize")
     }
 
-    /// Bind one local UDP port exclusively. The RX pool must back `rx_queue`
-    /// datagrams beside the RX reserve and every TCP and UDP socket's budget.
-    /// Held TCP frames and UDP datagrams from removed sockets count until dropped.
+    /// Bind a local UDP port on one owned address (`local_addr`) or on all of them (`None`);
+    /// each (address or all-IP, port) at most once. A datagram goes to the socket bound to its
+    /// destination, else to the port's all-IP socket; broadcasts only to the all-IP one. The
+    /// RX pool must back `rx_queue` datagrams beside the RX reserve and every TCP and UDP
+    /// socket's budget. Held TCP frames and UDP datagrams from removed sockets count until
+    /// dropped. A refused socket changes nothing.
     pub fn add_udp(&mut self, config: UdpConfig) -> Result<UdpHandle, AddUdpError> {
         self.tidy();
         let required = self.required_rx_pool(config.rx_queue);
@@ -621,10 +640,11 @@ impl Stack {
                 pool: self.rx_pool_count,
             });
         }
-        let handle = self.udp.add(config).map_err(|error| match error {
+        let handle = self.udp.add(&self.iface, config).map_err(|error| match error {
             UdpAddError::Full => AddUdpError::Full,
             UdpAddError::PortInUse => AddUdpError::PortInUse,
             UdpAddError::InvalidConfig(reason) => AddUdpError::InvalidConfig(reason),
+            UdpAddError::Unaddressable => AddUdpError::Unaddressable,
         })?;
         self.rx_budget_held = self
             .rx_budget_held
@@ -783,13 +803,23 @@ impl Stack {
         Ok(())
     }
 
-    /// `tcp::Socket::listen`. A failed listen leaves the socket unchanged.
+    /// `tcp::Socket::listen`, refusing an explicit local address that is
+    /// neither `StackConfig::ipv4`'s address nor in `StackConfig::owned_ipv4`
+    /// (`Unaddressable`). A failed listen leaves the socket unchanged.
+    ///
+    /// `tcp_mut(handle).listen(..)` does not check the address; such a
+    /// listener never receives a SYN, because a segment to an address we do
+    /// not own is dropped before any listener is consulted.
     pub fn listen<T: Into<IpListenEndpoint>>(
         &mut self,
         handle: &TcpHandle,
         local: T,
     ) -> Result<(), tcp::ListenError> {
         let raw = self.tcp_raw(handle);
+        let local = local.into();
+        if local.addr.is_some_and(|addr| !self.iface.has_ip_addr(addr)) {
+            return Err(tcp::ListenError::Unaddressable);
+        }
         let socket = self.sockets.get_mut(raw);
         socket.listen(local)?;
         Ok(())

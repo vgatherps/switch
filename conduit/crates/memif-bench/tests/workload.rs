@@ -160,6 +160,7 @@ fn bare_stack(port: Port, host: u8) -> ManuallyDrop<Stack> {
         tx_pending: 32,
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
     };
     built(Stack::new(port, config, NetInstant::ZERO))
 }

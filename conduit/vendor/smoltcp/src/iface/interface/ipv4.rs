@@ -85,6 +85,12 @@ impl InterfaceInner {
 
         let ip_repr = IpRepr::Ipv4(ipv4_repr);
 
+        // TCP checks its destination in process_tcp, only when no flow matches: established
+        // traffic never searches our addresses.
+        if ipv4_repr.next_header == IpProtocol::Tcp {
+            return self.process_tcp(sockets, meta, source_hardware_addr, ip_repr, ip_payload);
+        }
+
         if !self.has_ip_addr(ipv4_repr.dst_addr) {
             // Only UDP may arrive on a broadcast or multicast destination. Like Linux, TCP and
             // ICMP sent there get no RST and no echo reply.
@@ -99,13 +105,7 @@ impl InterfaceInner {
             }
         }
 
-        if self.is_unicast_v4(ipv4_repr.dst_addr) {
-            self.neighbor_cache.reset_expiry_if_existing(
-                IpAddress::Ipv4(ipv4_repr.src_addr),
-                source_hardware_addr,
-                self.now,
-            );
-        }
+        self.refresh_sender(ipv4_repr, source_hardware_addr);
 
         match ipv4_repr.next_header {
             IpProtocol::Icmp => self.process_icmpv4(ipv4_repr, ip_payload),
@@ -123,11 +123,25 @@ impl InterfaceInner {
                 self.process_udp(udp, meta, ipv4_repr, ip_payload, payload_offset)
             }
 
-            IpProtocol::Tcp => {
-                self.process_tcp(sockets, meta, ip_repr, ip_payload)
-            }
-
             _ => None,
+        }
+    }
+
+    /// Keep the sender's neighbor entry alive for a packet to one of our unicast addresses; the
+    /// caller decided the destination is ours. Inlined with the cache refresh at both callers
+    /// (TCP and the other protocols), as when it was written once in `process_ipv4`.
+    #[inline(always)]
+    pub(super) fn refresh_sender(
+        &mut self,
+        ipv4_repr: Ipv4Repr,
+        source_hardware_addr: HardwareAddress,
+    ) {
+        if self.is_unicast_v4(ipv4_repr.dst_addr) {
+            self.neighbor_cache.reset_expiry_if_existing(
+                IpAddress::Ipv4(ipv4_repr.src_addr),
+                source_hardware_addr,
+                self.now,
+            );
         }
     }
 

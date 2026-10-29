@@ -259,6 +259,7 @@ fn af_packet_hardware_mode_opens_and_stamps() {
             ipv4: Ipv4Cidr::new(zhida_ip, 30),
             gateway: None,
             paths: &[],
+            owned_ipv4: &[],
             random_seed: 1,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
             max_sockets: 1,
@@ -272,6 +273,7 @@ fn af_packet_hardware_mode_opens_and_stamps() {
         let handle = stack
             .add_udp(UdpConfig {
                 port: PORT,
+                local_addr: None,
                 rx_queue: 5,
                 tx_checksum: true,
                 broadcast: false,

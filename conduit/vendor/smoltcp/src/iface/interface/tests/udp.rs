@@ -146,6 +146,7 @@ impl Test {
     fn new(capacity: usize) -> Self {
         Self::with_config(UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: capacity,
             tx_checksum: true,
             broadcast: false,
@@ -153,11 +154,22 @@ impl Test {
     }
 
     fn with_config(config: UdpConfig) -> Self {
-        let (iface, tcp, device) = setup(Medium::Ethernet);
+        Self::bound(&[], &[config], 0).0
+    }
+
+    /// An interface that also owns `owned` (/32 each), with `configs`' sockets added in order and
+    /// room for `spare` more; `handle` is the first.
+    fn bound(owned: &[Ipv4Address], configs: &[UdpConfig], spare: usize) -> (Self, Vec<UdpHandle>) {
+        let (mut iface, tcp, device) = setup(Medium::Ethernet);
+        let owned: Vec<_> = owned.iter().map(|&addr| Ipv4Cidr::new(addr, 32)).collect();
+        iface.set_owned_ipv4(
+            crate::iface::OwnedIpv4::new(&owned, Ipv4Cidr::new(LOCAL, 24), None).unwrap(),
+        );
         // Room for the largest datagram `with_path_mtus` allows: 9000 - 28.
-        let mut udp = UdpSet::new(1, crate::tests::tx_test_source(8972));
-        let handle = udp.add(config).unwrap();
-        Self {
+        let mut udp = UdpSet::new(configs.len() + spare, crate::tests::tx_test_source(8972));
+        let handles: Vec<_> = configs.iter().map(|&config| udp.add(&iface, config).unwrap()).collect();
+        let handle = handles[0];
+        let test = Self {
             iface,
             tcp,
             udp,
@@ -169,7 +181,8 @@ impl Test {
                 caps: device.capabilities(),
                 tx_left: None,
             },
-        }
+        };
+        (test, handles)
     }
 
     fn with_path_mtus(rules: &[PathMtu]) -> Self {
@@ -596,12 +609,24 @@ fn send_frame_caps_port(
     payload: &[u8],
     caps: &ChecksumCapabilities,
 ) -> Vec<u8> {
+    send_frame_from(LOCAL, dst, mac, dst_port, payload, caps)
+}
+
+/// The generic emitters' frame for a datagram from `src:PORT`.
+fn send_frame_from(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    mac: EthernetAddress,
+    dst_port: u16,
+    payload: &[u8],
+    caps: &ChecksumCapabilities,
+) -> Vec<u8> {
     let udp = UdpRepr {
         src_port: PORT,
         dst_port,
     };
     let ip = Ipv4Repr {
-        src_addr: LOCAL,
+        src_addr: src,
         dst_addr: dst,
         next_header: IpProtocol::Udp,
         payload_len: udp.header_len() + payload.len(),
@@ -618,7 +643,7 @@ fn send_frame_caps_port(
     ip.emit(&mut Ipv4Packet::new_unchecked(eth.payload_mut()), caps);
     udp.emit(
         &mut UdpPacket::new_unchecked(&mut eth.payload_mut()[ip.buffer_len()..]),
-        &LOCAL.into(),
+        &src.into(),
         &dst.into(),
         payload.len(),
         |out| out.copy_from_slice(payload),
@@ -642,6 +667,7 @@ fn udp_template_matches_wire_emitter() {
                 for len in [0, 1, 2, 3, 63, 64, 65, 1471, 1472] {
                     let mut test = Test::with_config(UdpConfig {
                         port: PORT,
+                        local_addr: None,
                         rx_queue: 1,
                         tx_checksum,
                         broadcast: false,
@@ -922,7 +948,7 @@ fn template_follows_connect_and_destination_change() {
     }
     let config = *test.udp.get(test.handle).config();
     test.udp.remove(test.handle);
-    test.handle = test.udp.add(config).unwrap();
+    test.handle = test.udp.add(&test.iface, config).unwrap();
     assert!(test.udp.get(test.handle).template.is_none());
     assert_eq!(test.udp.get(test.handle).peer(), None);
     for expected_count in [4, 5] {
@@ -943,6 +969,7 @@ fn template_follows_connect_and_destination_change() {
 fn template_not_built_for_broadcast() {
     let mut test = Test::with_config(UdpConfig {
         port: PORT,
+        local_addr: None,
         rx_queue: 1,
         tx_checksum: true,
         broadcast: true,
@@ -969,6 +996,7 @@ fn send_frame_bytes_match_wire_emitters() {
     for checksum in [true, false] {
         let mut test = Test::with_config(UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: checksum,
             broadcast: false,
@@ -1008,6 +1036,7 @@ fn send_device_tx_offload_writes_zero() {
     for tx_checksum in [true, false] {
         let mut test = Test::with_config(UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum,
             broadcast: false,
@@ -1233,6 +1262,42 @@ fn udp_target_error_order() {
     assert_eq!(test.device.tx, vec![arp_request(REMOTE)]);
 }
 
+/// An owned address is `Unaddressable` in `udp_target`'s order (before `TooLarge`), in and
+/// outside the subnet, also once the socket has a header template for a peer; the peer's
+/// sends, which skip the owned-set search, still go out.
+#[test]
+fn udp_target_refuses_owned_addresses_in_order() {
+    let owned = Ipv4Address::new(192, 168, 1, 9);
+    let elsewhere = Ipv4Address::new(10, 9, 0, 1);
+    let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
+    let mut test = Test::new(1);
+    test.iface.set_owned_ipv4(
+        crate::iface::OwnedIpv4::new(
+            &[Ipv4Cidr::new(owned, 32), Ipv4Cidr::new(elsewhere, 32)],
+            Ipv4Cidr::new(LOCAL, 24),
+            None,
+        )
+        .unwrap(),
+    );
+    resolve(&mut test, REMOTE, REMOTE_MAC);
+    for sent in 0..3 {
+        for addr in [LOCAL, owned, elsewhere] {
+            for len in [1, usize::MAX] {
+                assert_send_error(
+                    &mut test,
+                    Some(IpEndpoint::new(addr.into(), PEER_PORT)),
+                    len,
+                    UdpSendError::Unaddressable,
+                );
+            }
+        }
+        assert_eq!(test.udp.get(test.handle).template.is_some(), sent > 0);
+        assert_eq!(test.send(peer, b"peer"), Ok(()));
+        assert_eq!(test.device.tx, vec![send_frame(REMOTE, REMOTE_MAC, b"peer", true)]);
+        test.device.tx.clear();
+    }
+}
+
 #[test]
 fn arp_on_miss_payload_untouched() {
     let mut test = Test::new(1);
@@ -1385,6 +1450,7 @@ fn broadcast_requires_opt_in() {
         assert_send_error(&mut Test::new(1), to, 3, UdpSendError::Unaddressable);
         let mut test = Test::with_config(UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: true,
             broadcast: true,
@@ -1591,8 +1657,9 @@ fn send_panics_on_ip_medium() {
     let (mut iface, _, mut device) = setup(Medium::Ip);
     let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
     let handle = udp
-        .add(UdpConfig {
+        .add(&iface, UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: true,
             broadcast: true,
@@ -1739,6 +1806,7 @@ fn udp_frame_template_and_generic_match_wire_emitter() {
                 for len in [0, 1, 2, 3, 63, 64, 65, 1471, 1472] {
                     let mut test = Test::with_config(UdpConfig {
                         port: PORT,
+                        local_addr: None,
                         rx_queue: 1,
                         tx_checksum,
                         broadcast: false,
@@ -1834,6 +1902,7 @@ fn udp_frame_broadcast_uses_generic_header() {
     let alloc = crate::phy::TxPool::new(64);
     let mut test = Test::with_config(UdpConfig {
         port: PORT,
+        local_addr: None,
         rx_queue: 1,
         tx_checksum: true,
         broadcast: true,
@@ -1983,3 +2052,171 @@ fn udp_frame_length_must_match_target() {
     assert!(test.device.tx.is_empty());
     assert_eq!(alloc.live(), 0);
 }
+
+/// A secondary owned address inside the subnet and one outside it.
+const SECOND: Ipv4Address = Ipv4Address::new(192, 168, 1, 9);
+const ELSEWHERE: Ipv4Address = Ipv4Address::new(10, 9, 0, 1);
+
+fn udp_config(local_addr: Option<Ipv4Address>) -> UdpConfig {
+    UdpConfig {
+        port: PORT,
+        local_addr,
+        rx_queue: 4,
+        tx_checksum: true,
+        broadcast: false,
+    }
+}
+
+impl Test {
+    /// Receives `datagram(payload, dst)` and returns the payloads now queued on each of
+    /// `handles`, draining them.
+    fn deliver(&mut self, handles: &[UdpHandle], dst: Ipv4Address, payload: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        self.device.rx.push_back(FrameToken {
+            frame: RxBuf::counted_frame(datagram(payload, dst, PEER_PORT), 0, self.device.releases.clone()),
+            meta: PacketMeta::default(),
+        });
+        self.iface.poll_ingress_single_udp(Instant::ZERO, &mut self.device, &mut self.tcp, &mut self.udp);
+        handles
+            .iter()
+            .map(|&handle| {
+                core::iter::from_fn(|| self.udp.get_mut(handle).recv())
+                    .map(|datagram| datagram.payload().to_vec())
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// A datagram to an address goes to the socket bound to it, whichever socket was added first;
+/// one to an address without a bound socket (the interface's own, or another owned one) goes to
+/// the port's all-IP socket.
+#[test]
+fn bound_socket_beats_all_ip_in_either_creation_order() {
+    let got = |payload: &[u8]| vec![payload.to_vec()];
+    for bound_first in [true, false] {
+        let configs = if bound_first {
+            [udp_config(Some(SECOND)), udp_config(None)]
+        } else {
+            [udp_config(None), udp_config(Some(SECOND))]
+        };
+        let (mut test, handles) = Test::bound(&[SECOND, ELSEWHERE], &configs, 0);
+        let [bound, all] = if bound_first { [handles[0], handles[1]] } else { [handles[1], handles[0]] };
+        assert_eq!(test.deliver(&[bound, all], SECOND, b"second"), [got(b"second"), vec![]]);
+        assert_eq!(test.deliver(&[bound, all], LOCAL, b"local"), [vec![], got(b"local")]);
+        assert_eq!(test.deliver(&[bound, all], ELSEWHERE, b"other"), [vec![], got(b"other")]);
+    }
+}
+
+/// Removing the bound socket hands its address back to the all-IP socket; binding it again takes
+/// it back. An identical bind is refused, the same port on another address is not.
+#[test]
+fn removal_falls_back_to_all_ip_and_rebind_takes_the_address_back() {
+    let (mut test, handles) = Test::bound(&[SECOND, ELSEWHERE], &[udp_config(None), udp_config(Some(SECOND))], 1);
+    let (all, bound) = (handles[0], handles[1]);
+    assert_eq!(test.deliver(&[bound, all], SECOND, b"a"), [vec![b"a".to_vec()], vec![]]);
+    test.udp.remove(bound);
+    assert_eq!(test.deliver(&[all], SECOND, b"b"), [vec![b"b".to_vec()]]);
+    let bound = test.udp.add(&test.iface, udp_config(Some(SECOND))).unwrap();
+    assert_eq!(test.deliver(&[bound, all], SECOND, b"c"), [vec![b"c".to_vec()], vec![]]);
+    for identical in [Some(SECOND), None] {
+        assert_eq!(test.udp.add(&test.iface, udp_config(identical)), Err(crate::iface::UdpAddError::PortInUse));
+    }
+    let elsewhere = test.udp.add(&test.iface, udp_config(Some(ELSEWHERE))).unwrap();
+    assert_eq!(test.deliver(&[elsewhere, bound, all], ELSEWHERE, b"d"), [vec![b"d".to_vec()], vec![], vec![]]);
+}
+
+/// A broadcast goes only to the port's all-IP socket: sockets bound to the interface's own
+/// address or another owned one never see it, and with no all-IP socket it is dropped.
+#[test]
+fn broadcast_reaches_only_the_all_ip_socket() {
+    let (mut test, handles) = Test::bound(&[SECOND], &[udp_config(Some(LOCAL)), udp_config(Some(SECOND)), udp_config(None)], 0);
+    let (local, second, all) = (handles[0], handles[1], handles[2]);
+    for dst in [Ipv4Address::new(192, 168, 1, 255), Ipv4Address::BROADCAST] {
+        assert_eq!(test.deliver(&[local, second, all], dst, b"b"), [vec![], vec![], vec![b"b".to_vec()]]);
+    }
+    test.udp.remove(all);
+    for dst in [Ipv4Address::new(192, 168, 1, 255), Ipv4Address::BROADCAST] {
+        assert_eq!(test.deliver(&[local, second], dst, b"b"), [Vec::<Vec<u8>>::new(), vec![]]);
+    }
+    assert_eq!(test.deliver(&[local, second], LOCAL, b"u"), [vec![b"u".to_vec()], vec![]]);
+}
+
+/// A bound socket sends from its address, in and outside the subnet, on every send path:
+/// copied (`udp_send`), unique frame, shared frame; each the first time (generic header) and
+/// again (header template). An all-IP socket on the same port sends from the interface's
+/// address.
+#[test]
+fn bound_socket_sends_from_its_address_on_every_path() {
+    let alloc = crate::phy::TxPool::new(64);
+    let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
+    for src in [SECOND, ELSEWHERE, LOCAL] {
+        let local_addr = (src != LOCAL).then_some(src);
+        let (mut test, _) = Test::bound(&[SECOND, ELSEWHERE], &[udp_config(local_addr)], 0);
+        resolve(&mut test, REMOTE, REMOTE_MAC);
+        let expected = send_frame_from(src, REMOTE, REMOTE_MAC, PEER_PORT, b"from", &ChecksumCapabilities::default());
+        for templates in [0, 1] {
+            assert_eq!(test.send(peer, b"from"), Ok(()));
+            assert_eq!(test.udp.template_frames, templates, "{src}");
+        }
+        let kept = tx_frame(&alloc, b"from");
+        assert_frame_sent(send_tx_frame(&mut test, peer, tx_frame(&alloc, b"from")));
+        assert_frame_sent(send_tx_frame(&mut test, peer, kept.clone()));
+        assert_eq!(test.udp.template_frames, 3, "{src}");
+        assert_eq!(test.device.tx, vec![expected; 4], "{src}");
+        let udp = UdpPacket::new_checked(&test.device.tx[0][ETH_LEN + IP_LEN..]).unwrap();
+        assert!(udp.verify_checksum(&src.into(), &REMOTE.into()));
+        // a template from another source is not reused: cold header again
+        test.device.tx.clear();
+        test.udp.remove(test.handle);
+        drop(kept);
+    }
+    assert_eq!(alloc.live(), 0);
+}
+
+/// 500 sockets on one port, one per owned address, and one all-IP: each address's datagram
+/// reaches only its socket, the interface's address the all-IP one, and each socket's send
+/// leaves from its address.
+#[test]
+fn five_hundred_sockets_on_one_port_one_per_address() {
+    let addrs: Vec<_> = (0..500u32).map(|i| Ipv4Address::from(u32::from(ELSEWHERE) + i)).collect();
+    let mut configs: Vec<_> = addrs.iter().map(|&addr| udp_config(Some(addr))).collect();
+    configs.push(udp_config(None));
+    let (mut test, handles) = Test::bound(&addrs, &configs, 0);
+    resolve(&mut test, REMOTE, REMOTE_MAC);
+    for (i, &addr) in addrs.iter().enumerate() {
+        let payload = i.to_be_bytes();
+        let queued = test.deliver(&handles, addr, &payload);
+        for (j, datagrams) in queued.iter().enumerate() {
+            assert_eq!(*datagrams, if i == j { vec![payload.to_vec()] } else { vec![] }, "datagram to {addr}, socket {j}");
+        }
+        test.handle = handles[i];
+        assert_eq!(test.send(Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), &payload), Ok(()));
+        let sent = test.device.tx.pop().unwrap();
+        assert_eq!(sent, send_frame_from(addr, REMOTE, REMOTE_MAC, PEER_PORT, &payload, &ChecksumCapabilities::default()));
+    }
+    let queued = test.deliver(&handles, LOCAL, b"local");
+    assert_eq!(queued.iter().map(Vec::len).sum::<usize>(), 1);
+    assert_eq!(queued[500], [b"local".to_vec()]);
+}
+
+/// With no address-bound socket the all-IP socket takes every owned address; the first bound
+/// socket takes its address at once, and removing the last one hands it back.
+#[test]
+fn precedence_holds_as_bound_sockets_come_and_go() {
+    let (mut test, handles) = Test::bound(&[SECOND, ELSEWHERE], &[udp_config(None)], 2);
+    let all = handles[0];
+    let only_all = |test: &mut Test, dst| assert_eq!(test.deliver(&[all], dst, b"x"), [vec![b"x".to_vec()]], "{dst}");
+    only_all(&mut test, SECOND);
+    only_all(&mut test, LOCAL);
+    let bound = test.udp.add(&test.iface, udp_config(Some(SECOND))).unwrap();
+    assert_eq!(test.deliver(&[bound, all], SECOND, b"b"), [vec![b"b".to_vec()], vec![]]);
+    let other = test.udp.add(&test.iface, udp_config(Some(ELSEWHERE))).unwrap();
+    test.udp.remove(bound);
+    only_all(&mut test, SECOND);
+    assert_eq!(test.deliver(&[other, all], ELSEWHERE, b"e"), [vec![b"e".to_vec()], vec![]]);
+    test.udp.remove(other);
+    for dst in [SECOND, ELSEWHERE, LOCAL] {
+        only_all(&mut test, dst);
+    }
+}
+

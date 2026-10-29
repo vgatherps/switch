@@ -590,6 +590,12 @@ pub struct Socket<'a> {
     orphaned: bool,
     /// An acceptable peer RST closed this connection; cleared by reset().
     reset_by_peer: bool,
+    /// The tuple's local address is in the interface's owned set, recorded when the tuple is
+    /// set (connect, accepted SYN). The set is fixed for the interface's life, so the egress
+    /// liveness check needs no search: a tuple only exists for one of our addresses (connect
+    /// refuses another, and a SYN reaches a listener only when addressed to us), and of those
+    /// only the interface addresses can go away.
+    local_owned: bool,
 }
 
 #[cfg(test)]
@@ -650,6 +656,7 @@ pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
         ("rx_refused_segments", offset_of!(Socket<'static>, rx_refused_segments)),
         ("mss_cap", offset_of!(Socket<'static>, mss_cap)),
         ("reset_by_peer", offset_of!(Socket<'static>, reset_by_peer)),
+        ("local_owned", offset_of!(Socket<'static>, local_owned)),
     ]
 }
 
@@ -707,6 +714,7 @@ impl<'a> Socket<'a> {
             mss_cap: None,
             orphaned: false,
             reset_by_peer: false,
+            local_owned: false,
             connection_mss_cap: None,
             initial_window: 1_048_576,
             listen_endpoint: IpListenEndpoint::default(),
@@ -1201,8 +1209,8 @@ impl<'a> Socket<'a> {
     /// The local address may optionally be provided.
     ///
     /// This function returns an error if the socket was open; see [is_open](#method.is_open).
-    /// It also returns an error if the local or remote port is zero, or if the remote address
-    /// is unspecified.
+    /// It also returns an error if the local or remote port is zero, if the remote address
+    /// is unspecified, or if an explicit local address is not one of the interface's.
     pub fn connect<T, U>(
         &mut self,
         cx: &mut Context,
@@ -1224,6 +1232,7 @@ impl<'a> Socket<'a> {
             remote: remote_endpoint,
         };
         self.tuple = Some(tuple);
+        self.local_owned = cx.owns(local_endpoint.addr);
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
         self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
@@ -1256,7 +1265,9 @@ impl<'a> Socket<'a> {
         let local_endpoint = IpEndpoint {
             addr: match local_endpoint.addr {
                 Some(addr) => {
-                    if addr.is_unspecified() {
+                    // A flow's local address must be ours: inbound segments that match a flow
+                    // are delivered without checking their destination.
+                    if addr.is_unspecified() || !cx.has_ip_addr(addr) {
                         return Err(ConnectError::Unaddressable);
                     }
                     addr
@@ -2503,6 +2514,7 @@ impl<'a> Socket<'a> {
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 };
                 self.tuple = Some(tuple);
+                self.local_owned = cx.owns(tuple.local.addr);
                 self.local_seq_no = Self::random_seq_no(cx, tuple);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_win_seq = repr.seq_number;
@@ -3068,8 +3080,8 @@ impl<'a> Socket<'a> {
         // Check if the interface still has our source IP address.
         // If not (e.g. the interface's IP changed), reset the socket.
         // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP.
-        if !cx.has_ip_addr(tuple.local.addr) {
+        // an RST packet with the now-invalid source IP. An owned address never goes away.
+        if !cx.has_interface_addr(tuple.local.addr) && !self.local_owned {
             net_debug!("source IP address no longer available, closing socket");
             self.reset();
             return Ok(());
@@ -3665,8 +3677,9 @@ fn rtt_sampling_round_trips() {
 #[test]
 fn socket_size_matches_main() {
     // TxQueue holds frame entries, their end position and their TxSource instead of a borrowed
-    // byte ring; the TxSource is a thin Rc to the concrete pool.
-    let main_size = 456;
+    // byte ring; the TxSource is a thin Rc to the concrete pool. local_owned adds a byte at the
+    // tail (8 with padding); every other field keeps its offset.
+    let main_size = 464;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
 }
@@ -9578,13 +9591,36 @@ mod test {
         assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
     }
 
+    /// An explicit local address must be ours (the interface address or an owned one): a
+    /// foreign one is `Unaddressable` and leaves the socket closed with no tuple, so no flow is
+    /// ever registered for an address we do not own.
     #[test]
     fn test_connect_specified_local() {
         let mut s = socket();
+        for foreign in [REMOTE_ADDR, IpvXAddress::new(192, 168, 1, 3)] {
+            assert_eq!(
+                s.socket.connect(&mut s.cx, REMOTE_END, (foreign, 80)),
+                Err(ConnectError::Unaddressable)
+            );
+            assert_eq!(s.socket.state(), State::Closed);
+            assert_eq!(s.socket.local_endpoint(), None);
+        }
         assert_eq!(
-            s.socket.connect(&mut s.cx, REMOTE_END, (REMOTE_ADDR, 80)),
+            s.socket.connect(&mut s.cx, REMOTE_END, (LOCAL_ADDR, 80)),
             Ok(())
         );
+        assert_eq!(s.socket.local_endpoint(), Some(IpEndpoint::new(LOCAL_ADDR.into(), 80)));
+
+        let mut s = socket();
+        let owned = IpvXAddress::new(10, 9, 0, 1);
+        s.cx.owned_ipv4 = crate::iface::OwnedIpv4::new(
+            &[crate::wire::Ipv4Cidr::new(owned, 32)],
+            crate::wire::Ipv4Cidr::new(LOCAL_ADDR, 24),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, (owned, 80)), Ok(()));
+        assert_eq!(s.socket.local_endpoint(), Some(IpEndpoint::new(owned.into(), 80)));
     }
 
     #[test]

@@ -86,10 +86,12 @@ mod tests {
         let tcp = core::array::from_fn(|_| {
             tcp.add(tcp::Socket::test_socket(0, 0))
         });
+        let iface = crate::tests::setup(crate::phy::Medium::Ethernet).0;
         let mut udp = UdpSet::new(3, crate::tests::tx_test_source(1472));
         let udp = core::array::from_fn(|index| {
-            udp.add(UdpConfig {
+            udp.add(&iface, UdpConfig {
                 port: u16::try_from(1000 + index).unwrap(),
+                local_addr: None,
                 rx_queue: 1,
                 tx_checksum: true,
                 broadcast: false,

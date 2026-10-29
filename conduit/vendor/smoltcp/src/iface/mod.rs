@@ -8,6 +8,7 @@ mod flow_table;
 mod header_template;
 mod interface;
 mod path_mtu;
+mod owned_ipv4;
 mod neighbor;
 mod socket_meta;
 mod tcp_set;
@@ -31,4 +32,5 @@ pub use self::udp_set::{
     UdpSendError, UdpSet, UdpSocket, UdpSocketStats, UdpTarget,
 };
 
+pub use self::owned_ipv4::OwnedIpv4;
 pub use self::path_mtu::{PathMtu, PathMtus, MIN_IP_MTU};

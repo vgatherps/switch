@@ -246,6 +246,7 @@ fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
         let response = iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
+            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             packet.payload(),
         );
@@ -1126,6 +1127,8 @@ fn index_follows_socket_lifecycle() {
     }
 }
 
+/// A listener bound to the SYN's destination address beats an all-IP listener on the port,
+/// in either slot order; then an exact tuple beats any listener.
 #[test]
 fn precedence_across_match_classes() {
     for bound_first in [false, true] {
@@ -1134,13 +1137,14 @@ fn precedence_across_match_classes() {
         wildcard.listen(LOCAL_PORT).unwrap();
         let mut bound = socket();
         bound.listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
-        let (first, second) = if bound_first {
+        let (bound, wildcard) = if bound_first {
             (sockets.add(bound), sockets.add(wildcard))
         } else {
-            (sockets.add(wildcard), sockets.add(bound))
+            let wildcard = sockets.add(wildcard);
+            (sockets.add(bound), wildcard)
         };
-        assert_listener_receives_syn(&mut iface, &mut sockets, &mut device, first, LOCAL_PORT);
-        assert_eq!(sockets.get(second).state(), tcp::State::Listen);
+        assert_listener_receives_syn(&mut iface, &mut sockets, &mut device, bound, LOCAL_PORT);
+        assert_eq!(sockets.get(wildcard).state(), tcp::State::Listen);
     }
 
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
@@ -2083,6 +2087,7 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
+            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &packet.payload()[..length],
         ).is_none());
@@ -2093,6 +2098,7 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
+            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &tcp,
         ).is_none());
@@ -2139,4 +2145,325 @@ fn broadcast_syn_without_socket_gets_no_rst() {
         segment(TcpControl::Syn, REMOTE_SEQ, None));
     let bytes = take_reply(&mut device);
     assert_control(&reply(&bytes), LOCAL_PORT, TcpControl::Rst, Some(REMOTE_SEQ + 1));
+}
+
+/// Owned 10.9.0.0/30 next to the interface address.
+fn own_prefix(iface: &mut Interface) {
+    iface.set_owned_ipv4(
+        crate::iface::OwnedIpv4::new(
+            &["10.9.0.0/30".parse().unwrap()],
+            Ipv4Cidr::new(LOCAL_ADDR, 24),
+            None,
+        )
+        .unwrap(),
+    );
+}
+
+/// The reply's source address and TCP header, for a reply from any of our addresses.
+fn reply_from(bytes: &[u8]) -> (Ipv4Address, TcpRepr<'_>) {
+    let ip = Ipv4Packet::new_checked(bytes).unwrap();
+    assert!(ip.verify_checksum());
+    assert_eq!(ip.dst_addr(), REMOTE_ADDR);
+    let tcp = TcpRepr::parse(
+        &TcpPacket::new_checked(ip.payload()).unwrap(),
+        &ip.src_addr().into(),
+        &REMOTE_ADDR.into(),
+        &ChecksumCapabilities::default(),
+    )
+    .unwrap();
+    (ip.src_addr(), tcp)
+}
+
+/// With an all-address listener, a SYN or an unknown segment to an address that is not ours
+/// (a neighbour, just past the owned prefix, the subnet broadcast) gets nothing back: no
+/// SYN-ACK, no RST, the listener untouched. To an owned address the SYN-ACK and the RST come
+/// from that address.
+#[test]
+fn segments_to_unowned_addresses_get_no_reply() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT).unwrap();
+    let handle = sockets.add(listener);
+    let unknown = segment(TcpControl::None, REMOTE_SEQ, Some(TcpSeqNumber(7)));
+    for dst in [
+        Ipv4Address::new(192, 168, 1, 3),
+        Ipv4Address::new(10, 9, 0, 4),
+        Ipv4Address::new(192, 168, 1, 255),
+    ] {
+        for tcp in [segment(TcpControl::Syn, REMOTE_SEQ, None), unknown] {
+            device.rx_queue.push_back(packet_bytes_to(tcp, dst));
+            iface.poll(Instant::ZERO, &mut device, &mut sockets);
+            assert!(device.tx_queue.is_empty(), "{dst} {:?}", tcp.control);
+            assert_eq!(sockets.get(handle).state(), tcp::State::Listen);
+        }
+    }
+    let owned = Ipv4Address::new(10, 9, 0, 3);
+    device.rx_queue.push_back(packet_bytes_to(unknown, owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (src, rst) = reply_from(&bytes);
+    assert_eq!((src, rst.control), (owned, TcpControl::Rst));
+    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (src, synack) = reply_from(&bytes);
+    assert_eq!(src, owned);
+    assert_control(&synack, LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 1));
+    assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+    assert_eq!(
+        sockets.get(handle).local_endpoint(),
+        Some(IpEndpoint::new(owned.into(), LOCAL_PORT))
+    );
+}
+
+/// A segment matching an established flow is delivered without checking its destination:
+/// with the interface address removed, data to the flow still arrives, while a SYN to that
+/// address now gets nothing.
+#[test]
+fn established_flow_takes_segments_without_an_address_check() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
+    iface.update_ip_addrs(|addrs| addrs.clear());
+    device.rx_queue.push_back(packet_bytes(TcpRepr {
+        payload: b"abc",
+        ..segment(TcpControl::None, REMOTE_SEQ + 1, Some(local_seq))
+    }));
+    assert_eq!(
+        iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets),
+        PollIngressSingleResult::SocketStateChanged
+    );
+    assert_eq!(sockets.get(handle).recv_queue(), 3);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT + 1).unwrap();
+    let listener = sockets.add(listener);
+    device.rx_queue.push_back(packet_bytes(TcpRepr {
+        dst_port: LOCAL_PORT + 1,
+        ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+    }));
+    iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(sockets.get(listener).state(), tcp::State::Listen);
+    assert!(device.tx_queue.is_empty());
+}
+
+/// Every flow's local address is one of ours: accepted on the interface address and on an
+/// owned one, connected with the default source and with an owned source. A connect from a
+/// foreign address and a SYN to one create no flow.
+#[test]
+fn flows_only_exist_for_owned_addresses() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT).unwrap();
+    sockets.add(listener);
+    for (dst, src_port) in [
+        (LOCAL_ADDR, 50001),
+        (Ipv4Address::new(10, 9, 0, 1), 50002),
+        (Ipv4Address::new(192, 168, 1, 3), 50003),
+    ] {
+        let mut listener = socket();
+        listener.listen(LOCAL_PORT).unwrap();
+        sockets.add(listener);
+        device.rx_queue.push_back(packet_bytes_to(
+            TcpRepr { src_port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) },
+            dst,
+        ));
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        device.tx_queue.clear();
+    }
+    let remote = IpEndpoint::new(REMOTE_ADDR.into(), 80);
+    for (local, expected) in [
+        (IpListenEndpoint { addr: None, port: 40001 }, Ok(())),
+        (IpListenEndpoint::from((Ipv4Address::new(10, 9, 0, 2), 40002)), Ok(())),
+        (
+            IpListenEndpoint::from((Ipv4Address::new(192, 168, 1, 3), 40003)),
+            Err(tcp::ConnectError::Unaddressable),
+        ),
+    ] {
+        let handle = sockets.add(socket());
+        assert_eq!(sockets.get_mut(handle).connect(iface.context(), remote, local), expected);
+    }
+    let locals: Vec<_> = sockets
+        .iter()
+        .filter_map(|(_, socket)| socket.remote_endpoint().and(socket.local_endpoint()))
+        .collect();
+    assert_eq!(locals.len(), 4);
+    for local in locals {
+        assert!(iface.inner.has_ip_addr(local.addr), "flow on {local}");
+    }
+}
+
+/// A listener bound through the raw `Socket::listen` to an address we do not own never gets a
+/// SYN: no SYN-ACK, no RST, no flow, the socket stays in Listen. A SYN to an owned address on
+/// the same port goes to the matching listener.
+#[test]
+fn raw_listener_on_unowned_address_never_gets_a_syn() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let foreign = Ipv4Address::new(192, 168, 1, 3);
+    let owned = Ipv4Address::new(10, 9, 0, 2);
+    let mut unowned = socket();
+    unowned.listen((foreign, LOCAL_PORT)).unwrap();
+    let unowned = sockets.add(unowned);
+    let mut on_owned = socket();
+    on_owned.listen((owned, LOCAL_PORT)).unwrap();
+    let on_owned = sockets.add(on_owned);
+    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), foreign));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(unowned).state(), tcp::State::Listen);
+    assert_eq!(sockets.get(unowned).local_endpoint(), None);
+    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (src, synack) = reply_from(&bytes);
+    assert_eq!(src, owned);
+    assert_control(&synack, LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 1));
+    assert_eq!(sockets.get(unowned).state(), tcp::State::Listen);
+    assert_eq!(sockets.get(on_owned).state(), tcp::State::SynReceived);
+}
+
+/// Connections whose local address is owned keep sending after the interface addresses are
+/// removed (the owned set is fixed, recorded per connection at admission): one accepted on an
+/// owned address and one connected from one. A connection on the removed interface address is
+/// reset on its next egress visit and sends nothing.
+#[test]
+fn owned_address_connections_survive_interface_address_removal() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    own_prefix(&mut iface);
+    let owned = Ipv4Address::new(10, 9, 0, 1);
+    let source = Ipv4Address::new(10, 9, 0, 2);
+    let (on_primary, _) = establish(&mut iface, &mut sockets, &mut device);
+    let mut listener = socket();
+    listener.listen((owned, LOCAL_PORT + 1)).unwrap();
+    let accepted = sockets.add(listener);
+    let syn = TcpRepr { dst_port: LOCAL_PORT + 1, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
+    device.rx_queue.push_back(packet_bytes_to(syn, owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    let (_, synack) = reply_from(&bytes);
+    let ack = TcpRepr {
+        dst_port: LOCAL_PORT + 1,
+        ..segment(TcpControl::None, REMOTE_SEQ + 1, Some(synack.seq_number + 1))
+    };
+    device.rx_queue.push_back(packet_bytes_to(ack, owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(sockets.get(accepted).state(), tcp::State::Established);
+    let connected = sockets.add(socket());
+    sockets
+        .get_mut(connected)
+        .connect(iface.context(), IpEndpoint::new(REMOTE_ADDR.into(), 80), (source, 40000))
+        .unwrap();
+    for handle in [on_primary, accepted] {
+        assert_eq!(sockets.get_mut(handle).send_slice(b"data"), Ok(4));
+    }
+    iface.update_ip_addrs(|addrs| addrs.clear());
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(sockets.get(on_primary).state(), tcp::State::Closed);
+    assert_eq!(sockets.get(accepted).state(), tcp::State::Established);
+    assert_eq!(sockets.get(connected).state(), tcp::State::SynSent);
+    let mut sent: Vec<_> = device
+        .tx_queue
+        .drain(..)
+        .map(|bytes| {
+            let ip = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            (ip.src_addr(), tcp.syn(), tcp.payload().to_vec())
+        })
+        .collect();
+    sent.sort();
+    assert_eq!(sent, [(owned, false, b"data".to_vec()), (source, true, Vec::new())]);
+}
+
+/// `count` owned single addresses 10.10.x.y, every other one skipped.
+fn own_singles(iface: &mut Interface, count: u32) -> Vec<Ipv4Address> {
+    let base = u32::from(Ipv4Address::new(10, 10, 0, 0));
+    let owned: Vec<_> = (0..count).map(|index| Ipv4Address::from(base + 2 * index)).collect();
+    let cidrs: Vec<_> = owned.iter().map(|&addr| Ipv4Cidr::new(addr, 32)).collect();
+    iface.set_owned_ipv4(
+        crate::iface::OwnedIpv4::new(&cidrs, Ipv4Cidr::new(LOCAL_ADDR, 24), None).unwrap(),
+    );
+    owned
+}
+
+/// One exact listener per owned address on one port, 1000 of them, plus an all-IP listener
+/// created first in the lowest slot: a SYN to each owned address goes to that address's
+/// listener, answered from that address; a SYN to the interface address goes to the all-IP one.
+#[test]
+fn thousand_exact_listeners_on_one_port_each_get_their_syn() {
+    const PORT: u16 = 443;
+    let (mut iface, _, mut device) = setup(Medium::Ip);
+    let owned = own_singles(&mut iface, 1000);
+    let mut sockets = TcpSet::new(Vec::new());
+    let mut all = socket();
+    all.listen(PORT).unwrap();
+    let all = sockets.add(all);
+    let exact: Vec<_> = owned
+        .iter()
+        .map(|&addr| {
+            let mut listener = socket();
+            listener.listen((addr, PORT)).unwrap();
+            sockets.add(listener)
+        })
+        .collect();
+    for (index, (&addr, &handle)) in owned.iter().zip(&exact).enumerate().rev() {
+        let syn = TcpRepr {
+            dst_port: PORT,
+            src_port: 10000 + index as u16,
+            ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+        };
+        device.rx_queue.push_back(packet_bytes_to(syn, addr));
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        let bytes = take_reply(&mut device);
+        let (src, synack) = reply_from(&bytes);
+        assert_eq!((src, synack.control, synack.src_port), (addr, TcpControl::Syn, PORT));
+        assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived, "{addr}");
+    }
+    assert_eq!(sockets.get(all).state(), tcp::State::Listen);
+    let syn = TcpRepr { dst_port: PORT, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
+    device.rx_queue.push_back(packet_bytes_to(syn, LOCAL_ADDR));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    assert_eq!(reply_from(&bytes).0, LOCAL_ADDR);
+    assert_eq!(sockets.get(all).state(), tcp::State::SynReceived);
+    sockets.check_flow_index();
+}
+
+/// Two identical exact listeners serve two connections, lowest slot first; once both are
+/// taken (and after the exact listeners are removed) a further SYN to that address falls back
+/// to the all-IP listener.
+#[test]
+fn identical_exact_listeners_then_all_ip_fallback() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let owned = own_singles(&mut iface, 1)[0];
+    let mut all = socket();
+    all.listen(LOCAL_PORT).unwrap();
+    let all = sockets.add(all);
+    let [first, second] = [(); 2].map(|_| {
+        let mut listener = socket();
+        listener.listen((owned, LOCAL_PORT)).unwrap();
+        sockets.add(listener)
+    });
+    let syn_from = |port: u16| TcpRepr { src_port: port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
+    for (src_port, handle) in [(50001, first), (50002, second)] {
+        device.rx_queue.push_back(packet_bytes_to(syn_from(src_port), owned));
+        iface.poll(Instant::ZERO, &mut device, &mut sockets);
+        let bytes = take_reply(&mut device);
+        assert_eq!(reply_from(&bytes).0, owned);
+        assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+        assert_eq!(
+            sockets.get(handle).remote_endpoint(),
+            Some(IpEndpoint::new(REMOTE_ADDR.into(), src_port))
+        );
+    }
+    assert_eq!(sockets.get(all).state(), tcp::State::Listen);
+    sockets.remove(first);
+    sockets.remove(second);
+    device.rx_queue.push_back(packet_bytes_to(syn_from(50003), owned));
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    let bytes = take_reply(&mut device);
+    assert_eq!(reply_from(&bytes).0, owned);
+    assert_eq!(sockets.get(all).state(), tcp::State::SynReceived);
+    assert_eq!(sockets.get(all).local_endpoint(), Some(IpEndpoint::new(owned.into(), LOCAL_PORT)));
+    sockets.check_flow_index();
 }

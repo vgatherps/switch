@@ -304,6 +304,7 @@ pub fn run(
             let handle = stack
                 .add_udp(UdpConfig {
                     port,
+                    local_addr: None,
                     rx_queue: nic::UDP_QUEUE,
                     tx_checksum: true,
                     broadcast: false,

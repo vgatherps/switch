@@ -30,7 +30,7 @@ const MAX_UDP: usize = 16;
 const UDP_QUEUE: usize = 4;
 
 fn udp_config(index: usize) -> UdpConfig {
-    UdpConfig { port: 7000 + index as u16, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
+    UdpConfig { port: 7000 + index as u16, local_addr: None, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
 }
 
 fn open(eal: &Eal, fixture: &RingPort) -> Stack {

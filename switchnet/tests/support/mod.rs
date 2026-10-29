@@ -217,7 +217,7 @@ pub fn local(port: u16) -> IpListenEndpoint {
 }
 
 pub fn udp_config(port: u16) -> UdpConfig {
-    UdpConfig { port, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
+    UdpConfig { port, local_addr: None, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
 }
 
 /// Net connects from `port` to the peer's listener in a task; drives until

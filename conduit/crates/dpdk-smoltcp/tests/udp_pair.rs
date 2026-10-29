@@ -6,7 +6,7 @@ use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol,
-    Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, UdpPacket,
 };
 use dpdk_smoltcp::{
     frame_pool_count, frame_reserve, tx_reserve, Eal, Stack, UdpConfig, UdpHandle,
@@ -22,8 +22,19 @@ fn new_pair(eal: &Eal, names: [&str; 2]) -> (Pair, [UdpHandle; 2]) {
 }
 
 fn new_pair_with_tx_pool(eal: &Eal, names: [&str; 2], tx_pool: u32) -> (Pair, [UdpHandle; 2]) {
+    new_pair_owning(eal, names, tx_pool, &[])
+}
+
+/// `new_pair_with_tx_pool` with B also owning `b_owned`.
+fn new_pair_owning(
+    eal: &Eal,
+    names: [&str; 2],
+    tx_pool: u32,
+    b_owned: &[Ipv4Cidr],
+) -> (Pair, [UdpHandle; 2]) {
     let configs = [Side::A, Side::B].map(|side| dpdk_smoltcp::StackConfig {
         max_udp_sockets: 2,
+        owned_ipv4: if side == Side::B { b_owned } else { &[] },
         ..pair::config(side)
     });
     let mut pair = Pair::with_ports(eal, names, configs, pair::T0, 128, |side, port| {
@@ -46,6 +57,7 @@ fn new_pair_with_tx_pool(eal: &Eal, names: [&str; 2], tx_pool: u32) -> (Pair, [U
 fn udp_config(tx_checksum: bool, broadcast: bool) -> UdpConfig {
     UdpConfig {
         port: PORT,
+        local_addr: None,
         rx_queue: BURST,
         tx_checksum,
         broadcast,
@@ -623,3 +635,48 @@ fn too_large_and_broadcast_opt_in() {
         assert_eq!(pair.close(), 0);
     });
 }
+
+/// B owns 10.0.0.9 beside its own address and binds a socket to it next to its all-IP socket on
+/// the same port: A's datagram to 10.0.0.9 reaches only the bound socket, one to B's address only
+/// the all-IP socket. Each of B's sockets sends from its address on the wire, and A sees that
+/// source.
+#[zhida_test_support::pinned_test]
+fn bound_socket_receives_and_sends_on_its_address() {
+    const SECOND: Ipv4Address = Ipv4Address::new(10, 0, 0, 9);
+    with_eal(|eal| {
+        let tx_pool = tx_reserve(128, pair::config(Side::A).tx_pending) as u32;
+        let (mut pair, [a, all]) = new_pair_owning(eal, ["udpbnda", "udpbndb"], tx_pool, &[Ipv4Cidr::new(SECOND, 32)]);
+        let bound = pair
+            .b
+            .add_udp(UdpConfig { local_addr: Some(SECOND), ..udp_config(true, false) })
+            .unwrap();
+        let second = IpEndpoint::new(SECOND.into(), PORT);
+        assert_eq!(pair.a.udp_send(&a, Some(second), &[0]), Err(UdpSendError::NeighborPending));
+        pair.round(|_, _| {});
+        pair.round(|_, _| {});
+        resolve(&mut pair, &a);
+        for (to, payload) in [(second, &b"to second"[..]), (endpoint(Side::B), b"to b")] {
+            pair.a.udp_send(&a, Some(to), payload).unwrap();
+            pair.round(|_, _| {});
+        }
+        let datagram = pair.b.udp_mut(&bound).recv().unwrap();
+        assert_eq!((datagram.payload(), datagram.dst_addr()), (&b"to second"[..], SECOND));
+        drop(datagram);
+        assert!(pair.b.udp_mut(&bound).recv().is_none());
+        let datagram = pair.b.udp_mut(&all).recv().unwrap();
+        assert_eq!((datagram.payload(), datagram.dst_addr()), (&b"to b"[..], Side::B.ip()));
+        drop(datagram);
+        assert!(pair.b.udp_mut(&all).recv().is_none());
+        for (handle, src) in [(&bound, SECOND), (&all, Side::B.ip())] {
+            pair.b.udp_send(handle, Some(endpoint(Side::A)), b"reply").unwrap();
+            let mut sources = Vec::new();
+            pair.round(|_, frame| sources.push(ip(frame).src_addr()));
+            assert_eq!(sources, [src]);
+            // A takes it in on its next turn
+            pair.round(|_, _| {});
+            recv(&mut pair.a, &a, IpEndpoint::new(src.into(), PORT), b"reply");
+        }
+        assert_eq!(pair.close(), 0);
+    });
+}
+

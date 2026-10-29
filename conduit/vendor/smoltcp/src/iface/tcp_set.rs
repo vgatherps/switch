@@ -7,18 +7,19 @@ use alloc::vec::Vec;
 use super::socket_meta::Meta;
 use crate::socket::tcp;
 
-use super::flow_table::FlowTable;
+use super::flow_table::{BindKey, FlowTable};
 use super::timer_wheel::{
     InsertOutcome, IntrusiveLinks, Linked, ListHead, Timed, TimerWheel, WheelEntry, WheelPosition,
 };
 use crate::socket::PollAt;
 use crate::time::Instant;
-use crate::wire::IpEndpoint;
+use crate::wire::{IpAddress, IpEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlowKey {
     None,
-    Listener(u16),
+    /// A listener's (local address or all-IP, port).
+    Listener(BindKey),
     Exact {
         local: IpEndpoint,
         remote: IpEndpoint,
@@ -31,7 +32,11 @@ pub(crate) fn flow_key(socket: &tcp::Socket) -> FlowKey {
         tcp::State::Listen => {
             debug_assert!(socket.local_endpoint().is_none());
             debug_assert!(socket.remote_endpoint().is_none());
-            return FlowKey::Listener(socket.listen_endpoint().port);
+            let endpoint = socket.listen_endpoint();
+            let addr = endpoint.addr.map(|addr| match addr {
+                IpAddress::Ipv4(addr) => addr,
+            });
+            return FlowKey::Listener((addr, endpoint.port));
         }
         tcp::State::SynSent => "TCP SynSent requires local and remote endpoints",
         tcp::State::SynReceived => "TCP SynReceived requires local and remote endpoints",
@@ -191,7 +196,8 @@ pub struct TcpSet<'a> {
     occupied: Vec<u64>,
     flow_slots: Vec<FlowSlot>,
     exact: FlowTable<(IpEndpoint, IpEndpoint)>,
-    listeners: FlowTable<u16>,
+    /// Listener chains by (local address or all-IP, port), each ascending by slot.
+    listeners: FlowTable<BindKey>,
     flow_epoch: u64,
     last_exact: Option<(usize, u64)>,
     pub(crate) dirty_list: Vec<usize>,
@@ -586,7 +592,7 @@ impl TcpSet<'_> {
     fn flow_head(&self, key: FlowKey) -> Option<usize> {
         match key {
             FlowKey::None => None,
-            FlowKey::Listener(port) => self.listeners.get(&port),
+            FlowKey::Listener(bind) => self.listeners.get(&bind),
             FlowKey::Exact { local, remote } => self.exact.get(&(local, remote)),
         }
     }
@@ -595,11 +601,11 @@ impl TcpSet<'_> {
         self.flow_epoch = self.flow_epoch.wrapping_add(1);
         match key {
             FlowKey::None => unreachable!(),
-            FlowKey::Listener(port) => {
+            FlowKey::Listener(bind) => {
                 if head == usize::MAX {
-                    self.listeners.remove(&port);
+                    self.listeners.remove(&bind);
                 } else {
-                    self.listeners.set(port, head);
+                    self.listeners.set(bind, head);
                 }
             }
             FlowKey::Exact { local, remote } => {
@@ -998,6 +1004,23 @@ impl TcpSet<'_> {
         src: IpEndpoint,
         syn_like: bool,
     ) -> Option<usize> {
+        let exact = self.tcp_exact_lookup(dst, src, syn_like);
+        if exact.is_none() && syn_like {
+            self.tcp_listener_lookup(dst)
+        } else {
+            exact
+        }
+    }
+
+    /// The exact (4-tuple) flow for a segment from `src` to `dst`, without the listener
+    /// fallback. A non-SYN segment's hit is cached for the next lookup.
+    #[inline]
+    pub(crate) fn tcp_exact_lookup(
+        &mut self,
+        dst: IpEndpoint,
+        src: IpEndpoint,
+        syn_like: bool,
+    ) -> Option<usize> {
         if !syn_like
             && let Some((index, epoch)) = self.last_exact
             && epoch == self.flow_epoch
@@ -1013,34 +1036,17 @@ impl TcpSet<'_> {
         if !syn_like && let Some(index) = e {
             self.last_exact = Some((index, self.flow_epoch));
         }
-        if e.is_some() {
-            return e;
-        }
-        if syn_like {
-            self.tcp_listener_lookup(dst)
-        } else {
-            None
-        }
+        e
     }
 
+    /// The listener a SYN to `dst` goes to: the lowest slot listening on `dst`'s address and
+    /// port, else the lowest slot listening on the port on every address (Linux's rule: an exact
+    /// bind beats all-IP, whatever the creation order).
     pub(crate) fn tcp_listener_lookup(&self, dst: IpEndpoint) -> Option<usize> {
-        let mut index = self.listeners.get(&dst.port).unwrap_or(usize::MAX);
-        while index != usize::MAX {
-            let socket = &self.sockets[index]
-                .inner
-                .as_ref()
-                .expect("TCP listener chain contains an empty slot")
-                .socket;
-            if socket
-                .listen_endpoint()
-                .addr
-                .is_none_or(|addr| addr == dst.addr)
-            {
-                return Some(index);
-            }
-            index = self.flow_slots[index].next;
-        }
-        None
+        let IpAddress::Ipv4(addr) = dst.addr;
+        self.listeners
+            .get(&(Some(addr), dst.port))
+            .or_else(|| self.listeners.get(&(None, dst.port)))
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1050,7 +1056,7 @@ impl TcpSet<'_> {
         let entries = self
             .listeners
             .entries()
-            .map(|(port, head)| (FlowKey::Listener(port), head))
+            .map(|(bind, head)| (FlowKey::Listener(bind), head))
             .chain(
                 self.exact
                     .entries()
@@ -1491,7 +1497,7 @@ mod tests {
         assert_eq!(size_of::<TcpStorage<'static>>(), 640);
         assert_eq!(align_of::<TcpStorage<'static>>(), 64);
         assert_eq!(size_of::<Meta>(), 112);
-        assert_eq!(size_of::<tcp::Socket<'static>>(), 456);
+        assert_eq!(size_of::<tcp::Socket<'static>>(), 464);
         assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
@@ -1537,6 +1543,7 @@ mod tests {
             ("rx_refused_segments", 448),
             ("mss_cap", 452),
             ("reset_by_peer", 455),
+            ("local_owned", 456),
         ];
         for (name, expected) in expected_offsets {
             let &(_, actual) = socket_offsets
@@ -1599,6 +1606,8 @@ mod tests {
             ("rx_refused_segments", 8),
             ("mss_cap", 8),
             ("reset_by_peer", 8),
+            // Read once per egress dispatch with the tuple; the slot's last, cold line.
+            ("local_owned", 9),
         ];
         assert_eq!(socket_offsets.len(), expected_lines.len());
         for (&(name, offset), (expected_name, expected_line)) in

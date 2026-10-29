@@ -290,6 +290,7 @@ impl TxQueue {
         self.locate_after_head(position)
     }
 
+    #[inline(always)]
     fn locate_after_head(&self, position: u64) -> usize {
         let contains = |index: usize| {
             let entry = &self.entries[index];

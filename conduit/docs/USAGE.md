@@ -289,6 +289,7 @@ fn create_stack(port: Port) -> Result<Stack, Box<dyn std::error::Error>> {
         ipv4: Ipv4Cidr::new(Ipv4Address::new(192, 0, 2, 2), 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: os_random_seed()?,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 8,
@@ -309,6 +310,15 @@ reached directly; any other destination goes to the gateway's MAC. There is no r
 and a TCP connect to them sends nothing. A gateway must be unicast, inside the configured subnet, and
 different from our own address and the subnet's network and broadcast addresses. A /31 has neither of
 the latter.
+
+`owned_ipv4: &[Ipv4Cidr]` lists further addresses the Stack owns: single addresses (/32) and
+prefixes, inside or outside the subnet. The Stack answers ARP for each, from that address, and
+accepts IPv4 traffic to each; an ICMP echo reply comes from the address it was sent to. Routing, the
+subnet broadcast and the default source address stay with `ipv4`. Duplicates and overlaps are
+merged; lookup is a binary search over the merged ranges, done only for a destination that is not
+`ipv4`'s address. Every address must be unicast, and none may be the gateway or the subnet's
+broadcast address; a prefix with host bits set is refused. The set is fixed at `Stack::new`, and the
+Stack sends no gratuitous ARP for it.
 
 `random_seed: u64` seeds the interface PRNG, including the TCP initial-sequence-number secret.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
@@ -636,20 +646,27 @@ stack.connect(&handle, endpoint, local_port)?;
 `Stack::connect(&handle, remote, local)` supplies the interface context. `remote` converts to
 `IpEndpoint`; `local` converts to `IpListenEndpoint`. The local port must be nonzero; there is no
 ephemeral-port allocator. Omitting the local address lets the interface choose its IPv4 source
-address. Success enters `State::SynSent`; drive the Stack until `state()` is `Established` or the
+address; an explicit local address must be the interface address or one in `owned_ipv4`. Success enters `State::SynSent`; drive the Stack until `state()` is `Established` or the
 application gives up. A returned connect error leaves the socket unchanged.
 
 For passive open, call `stack.listen(&handle, local_port)` or supply an `IpListenEndpoint`. An
-unspecified listen address matches the interface address; an explicit address filters incoming SYNs.
-TCP and ICMP sent to a broadcast or multicast address are dropped without a reply, as on Linux.
+unspecified listen address matches the interface address and every `owned_ipv4` address; an explicit
+address filters incoming SYNs and must be the interface address or an `owned_ipv4` address
+(`Stack::listen` refuses another with `Unaddressable`; a raw `tcp_mut(&h).listen(..)` is not
+checked, and such a listener never receives a SYN). TCP and ICMP sent to a broadcast or multicast address are dropped
+without a reply, as on Linux. A TCP segment that matches a connection (its 4-tuple) goes to it
+without any address check; a connection's local address is always one of ours. Any other segment
+to an address that is not ours is dropped without a reply: no SYN-ACK and no RST.
 Success enters `State::Listen`. Listening again on the same endpoint while already in Listen
 succeeds without resetting it; listening on an otherwise open socket errors.
 
 Multiple TCP sockets can listen on the same local port; there is no TCP `PortInUse` error. For a
 new SYN, an exact connection tuple wins before listener lookup. A SYN without ACK whose sequence
 number is beyond a matching TimeWait socket's receive-next position resets that socket and goes to
-an available matching listener. Listener lookup selects the lowest socket slot whose listen port
-and optional address match.
+an available matching listener. Listener lookup, as on Linux, prefers a listener bound to the SYN's
+destination address over an all-address one on the same port, whatever their creation order; among
+identical listeners the lowest socket slot wins, so several identical listeners pre-arm several
+accepts. Removing the last bound listener for an address falls back to the all-address one.
 
 An accepted SYN changes that listening socket itself to `SynReceived` and installs the local/remote
 tuple. The final handshake ACK changes it to `Established`. There is no separate accepted socket,
@@ -740,13 +757,19 @@ changes. Do not swap the socket behind `tcp_mut` with one from another `TcpSet` 
 
 ### Bind and optionally connect
 
-`add_udp(UdpConfig) -> Result<UdpHandle, AddUdpError>` binds one local port exclusively. TCP and UDP
-have separate socket sets; UDP exclusivity is between UDP sockets. There is no UDP local-address
-field. Reception uses the Stack's IPv4 address and recognized broadcasts.
+`add_udp(UdpConfig) -> Result<UdpHandle, AddUdpError>` binds a local port on one address or on all
+of them. `local_addr: Some(addr)` binds `addr`, which must be the Stack's IPv4 address or one of
+`StackConfig::owned_ipv4`; `None` binds every address the Stack owns (all-IP). One port carries at
+most one all-IP socket and one socket per address; TCP and UDP have separate socket sets. A
+datagram goes to the socket bound to its destination address, else to the port's all-IP socket
+(exact first, then all-IP; creation order does not matter). Broadcasts (the limited broadcast and
+the subnet's) go only to the all-IP socket. A bound socket sends from its address; an all-IP socket
+sends from the Stack's IPv4 address.
 
 ```rust
 let handle = stack.add_udp(UdpConfig {
     port: 1234,
+    local_addr: None,
     rx_queue: 32,
     tx_checksum: true,
     broadcast: false,
@@ -944,21 +967,24 @@ directly. `AddTcpError::SocketsFull(config)` means all
 TCP slots are occupied. `RxPoolTooSmall { config, required, pool }` means admission would exceed the
 RX pool count. Both return the unchanged config.
 `AddUdpError::Full` means all UDP slots are occupied, including when UDP is disabled. `PortInUse`
-means that local UDP port is already bound. `InvalidConfig(reason)` rejects port zero or receive
-queue zero. `RxPoolTooSmall { required, pool }` rejects the shared RX requirement. The pool check
-runs before UDP config/slot/port checks, so a request with multiple problems can report pool
-insufficiency first.
+means a socket is already bound to that local address (or all-IP) and port. `InvalidConfig(reason)`
+rejects port zero or receive queue zero. `Unaddressable` rejects a `local_addr` the Stack does not
+own. `RxPoolTooSmall { required, pool }` rejects the shared RX requirement. The order is
+`RxPoolTooSmall`, `InvalidConfig`, `Unaddressable`, `PortInUse`, `Full`, so a request with
+multiple problems can report pool insufficiency first. A refused socket changes nothing.
 
 ### Socket errors
 
 `tcp::ConnectError::InvalidState` means the socket is already open. `Unaddressable` covers zero
-local/remote port, unspecified remote or explicit local address, unavailable source address
-selection, or mismatched address versions. `Stack::connect` returns `AddressInUse` when a
+local/remote port, unspecified remote or explicit local address, an explicit local address that is
+neither the interface address nor in `owned_ipv4`, unavailable source address selection, or
+mismatched address versions. `Stack::connect` returns `AddressInUse` when a
 socket holds the same local and remote endpoints, including while closing or in TIME-WAIT.
 Closed sockets and listeners do not reserve an exact tuple. Different remote endpoints may share a
 local port. Success does not promise reachability.
 
-`tcp::ListenError::Unaddressable` means port zero. `InvalidState` means an open socket that is not
+`tcp::ListenError::Unaddressable` means port zero, or (from `Stack::listen`) an explicit local address
+that is neither the interface address nor in `owned_ipv4`. `InvalidState` means an open socket that is not
 already listening on that same endpoint. Duplicate local TCP listen ports do not produce an error.
 
 `tcp::SendError::InvalidState` means the transmit half is not open. A full byte ring returns success
@@ -979,8 +1005,8 @@ whole-datagram send failures:
 | `NeighborPending` | Next-hop address resolution has not completed. |
 | `WouldBlock` | No frame-pool frame for a copy, or no pending slot. |
 
-UDP invalid destinations include unspecified or multicast addresses, our own interface address, port
-zero, and broadcast without `broadcast: true`. The order is: the destination and size checks, an
+UDP invalid destinations include unspecified or multicast addresses, our own interface address, an
+address in `owned_ipv4`, port zero, and broadcast without `broadcast: true`. The order is: the destination and size checks, an
 empty frame pool for a copy (`WouldBlock`), the neighbor lookup (`NoRoute`, `NeighborPending`), then
 a full pending queue (`WouldBlock`). One exception: the first ARP request for a neighbor needs a TX
 packet, so with the pending queue full that send is `WouldBlock`, not `NeighborPending`; the ARP

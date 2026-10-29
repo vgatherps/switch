@@ -200,6 +200,7 @@ fn stack(
         tx_pending: tx_pending(conns),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
     };
     Stack::new(port, config, NetInstant::ZERO)
 }
@@ -207,6 +208,7 @@ fn stack(
 fn udp_config(port: u16) -> UdpConfig {
     UdpConfig {
         port,
+        local_addr: None,
         rx_queue: usize::try_from(rx_pool_count(0, 1500, [SOCKET_BUFFER]))
             .expect("one socket RX budget fits usize"),
         tx_checksum: true,
