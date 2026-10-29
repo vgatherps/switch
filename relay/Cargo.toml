@@ -8,22 +8,22 @@ publish = false
 [features]
 # WebSocket over switchnet TCP (module `switchnet`): ws:// and wss:// (through sheath) clients,
 # a ws:// server.
-switchnet = ["dep:switchnet", "dep:switch", "dep:rustls", "sheath/switchnet"]
+switchnet = ["dep:switchnet", "dep:rustls", "sheath/switchnet"]
 # Test-only: the Docker end-to-end tests (DPDK net_tap, Linux), on switchnet's testkit.
-e2e = ["switchnet", "switchnet/testkit", "dep:zhida-test-support", "dep:tap-echo"]
+e2e = ["switchnet", "switchnet/testkit", "dep:switch", "dep:zhida-test-support", "dep:tap-echo"]
 
 [dependencies]
 # Client-role frame masks (RFC 6455 §5.3) and Sec-WebSocket-Key: per-connection CSPRNG.
 rand = "0.10"
 # The TLS lower layer (TlsRx/TlsTx) and the frame traits.
 sheath.workspace = true
-# The WebSocket upgrade (rare path): HTTP response parse, Sec-WebSocket-Accept check.
+# The WebSocket upgrade (rare path): HTTP request and response parse, Sec-WebSocket-Accept.
 httparse = "1.10"
 sha1 = "0.11"
 data-encoding = "2.11"
 rustls = { version = "=0.23.43", default-features = false, features = ["std"], optional = true }
 switchnet = { workspace = true, optional = true }
-# yield_now: a failed connection lets the Net send its alert before the socket is dropped.
+# The Runtime of the Autobahn driver and the e2e tests.
 switch = { workspace = true, optional = true }
 zhida-test-support = { workspace = true, optional = true }
 # The Autobahn driver (bin relay-autobahn): tester process, EAL and net_tap Port.

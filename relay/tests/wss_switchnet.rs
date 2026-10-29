@@ -688,28 +688,31 @@ const BAD_RECORD_MAC: Result<(), rustls::Error> =
     Err(rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
 
 /// A record that fails authentication after the upgrade, with more data behind it: `Wss::recv`
-/// returns the error after the alert went out, so the client may drop the `Wss` at once.
+/// returns the error once the alert and FIN reached the server, so the client may drop the
+/// `Wss` (and the Net) at once: the server reads the alert, then the end, with the Net no longer
+/// turned once the client finished.
 #[zhida_test_support::pinned_test]
-fn wss_receive_error_sends_the_alert_before_the_rst() {
-    let seen = run(
+fn wss_receive_error_sends_the_alert_and_fin() {
+    let (server_tls, client_tls) = tls_configs();
+    let seen = until_client(
         |_| {},
-        |stream, config| {
-            let mut ws = upgrade(StreamOwned::new(ServerConnection::new(config).unwrap(), stream));
+        move |stream| {
+            let mut ws = upgrade(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), stream));
             let tls = ws.get_mut();
             let mut junk = vec![0x17, 0x03, 0x03, 0x00, 0x20];
             junk.resize(junk.len() + 32 + TRAILING, 0);
             tls.sock.write_all(&junk).unwrap();
             read_alert(&mut tls.conn, &mut tls.sock)
         },
-        |handle, stream, config| async move {
-            let mut wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+        |handle, stream| async move {
+            let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
             match wss.recv().await {
                 Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 Err(e) => panic!("unexpected error {e}"),
                 Ok(_) => panic!("a message from a corrupted record"),
             }
+            wss
         },
-        || {},
     );
     assert_eq!(seen, BAD_RECORD_MAC);
 }

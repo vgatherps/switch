@@ -299,12 +299,15 @@ where
     }
 
     /// A receive error below WebSocket (TLS): sends the alert the lower layer queued for it,
-    /// best effort, and yields once so the Net's next turn sends it before the caller can drop
-    /// the connection (a drop with server data unread aborts with RST and discards it). FIN
-    /// follows when the connection is dropped.
+    /// best effort, then FIN, and waits until the peer acked them (`delivered`), so the caller
+    /// may drop the connection, and the Net, at once (a drop with server data unread then
+    /// aborts with RST, after the alert and FIN). A peer that never acks keeps this waiting:
+    /// the caller bounds `recv`.
     async fn lower_failed(&mut self, e: R::Error) -> Error {
         let _ = self.tx.flush().await;
-        switch::yield_now().await;
+        let lower = self.tx.lower_mut();
+        lower.shutdown();
+        lower.delivered().await;
         e.into()
     }
 
