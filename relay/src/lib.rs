@@ -1,5 +1,5 @@
-//! WebSocket (RFC 6455) clients over switchnet TCP, plain (ws://) or through sheath's TLS 1.3
-//! (wss://): feature `switchnet`, module [`switchnet`]. Received messages borrow the frame
+//! WebSocket (RFC 6455) over switchnet TCP: clients, plain (ws://) or through sheath's TLS 1.3
+//! (wss://), and a plain ws:// server: feature `switchnet`, module [`switchnet`]. Received messages borrow the frame
 //! bytes in place; only messages spanning frames or fragments are copied, into one reusable
 //! scratch buffer. Sent payloads are written straight into the frame buffer, behind the header.
 //!
@@ -21,3 +21,4 @@ pub mod switchnet;
 mod tests;
 
 pub use rx::{Kind, Message, ProtocolError};
+pub use upgrade::UpgradeError;

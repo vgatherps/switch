@@ -70,6 +70,10 @@ pub trait FrameTx {
     fn try_send(&mut self, s: Self::Sealed) -> Result<(), Self::Sealed>;
     /// Ends the transport after the frames sent (TCP FIN). Receiving goes on.
     fn shutdown(&mut self);
+    /// After `shutdown`: resolves once the peer has everything sent, the end included (TCP:
+    /// the FIN acked), or the transport can deliver nothing more (reset). What was sent may
+    /// otherwise still sit in the transport, lost if it is torn down now.
+    fn delivered(&mut self) -> impl Future<Output = ()>;
 }
 
 /// A receive error.

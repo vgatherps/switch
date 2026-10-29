@@ -16,7 +16,7 @@ use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
 use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx};
 use crate::tx::{TxError, WsTx};
-use crate::upgrade;
+use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
 impl PlainTx for SwitchTx {
@@ -46,7 +46,7 @@ pub enum Error {
     /// The server broke the WebSocket protocol.
     Protocol(ProtocolError),
     /// The server refused or botched the WebSocket upgrade.
-    Upgrade(String),
+    Upgrade(UpgradeError),
     /// A send after close.
     Closed,
 }
@@ -118,7 +118,7 @@ pub async fn connect(
     let mut head = Vec::new();
     loop {
         if !tls.ready().await? {
-            return Err(Error::Upgrade("server closed before the response".into()));
+            return Err(Error::Upgrade(UpgradeError::Closed));
         }
         let (taken, done) = upgrade::read_head(&mut head, tls.rx.current()).map_err(Error::Upgrade)?;
         tls.rx.consume(taken);
@@ -174,16 +174,21 @@ async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mu
 
 /// An open wss:// connection. A server ping is answered within `recv`. The close handshake
 /// ends there too, either way: the server's close is echoed, or the echo of ours arrives; then
-/// close_notify and FIN go out.
+/// close_notify and FIN go out, and `recv` returns `None` once the server acked them, so the
+/// connection (and the Net) may be dropped at once. A server that never acks keeps `recv`
+/// waiting: bound it.
 pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>>);
 
 /// An open ws:// connection, client or server. A ping is answered within `recv`. The close
 /// handshake ends there too, either way: the peer's close is echoed, or the echo of ours
-/// arrives; then FIN goes out.
+/// arrives; then FIN goes out, and `recv` returns `None` once the peer acked it, so the
+/// connection (and the Net) may be dropped at once. A peer that never acks keeps `recv`
+/// waiting: bound it.
 pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx>);
 
 impl Wss {
-    /// The next message; `None` once the close handshake is done (ours or the server's).
+    /// The next message; `None` once the close handshake is done (ours or the server's) and the
+    /// transport's end delivered.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         self.0.recv().await
     }
@@ -191,6 +196,21 @@ impl Wss {
     /// Sends `payload` as one message, a TCP frame at a time.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
         self.0.send(kind, payload).await
+    }
+
+    /// The server's close status and reason once `recv` returned `None`: 1005 (none) for a close
+    /// without a status, 1002 (protocol error, what we echoed) for one with a status code a
+    /// server may not send.
+    pub fn peer_close(&self) -> Option<(u16, &str)> {
+        let p = self.0.rx.peer_close()?;
+        Some(match p {
+            [] => (1005, ""),
+            [a, b, reason @ ..] => {
+                let reason = core::str::from_utf8(reason).expect("the receive core validated the reason");
+                (u16::from_be_bytes([*a, *b]), reason)
+            }
+            [_] => unreachable!("the receive core refuses a 1-byte close"),
+        })
     }
 
     /// Sends a close frame (`code`, `reason`) and nothing more (RFC 6455 §7.1.1: TCP closes after
@@ -202,7 +222,8 @@ impl Wss {
 }
 
 impl Ws {
-    /// The next message; `None` once the close handshake is done (ours or the server's).
+    /// The next message; `None` once the close handshake is done (ours or the peer's) and the
+    /// FIN delivered.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         self.0.recv().await
     }

@@ -120,6 +120,8 @@ impl FrameTx for TestTx {
     fn shutdown(&mut self) {
         self.0.shut.set(true);
     }
+
+    async fn delivered(&mut self) {}
 }
 
 pub fn configs(

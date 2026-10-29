@@ -6,9 +6,10 @@ Depends on `relay` (feature `switchnet`), `switchnet`, `switch`, [`tap-echo`](..
 
 ## API
 
+- `first(a, b)`: `a`'s output, or `None` if `b` finishes first; the binaries race `connect` against the stop with it.
 - `run(net, clock, should_stop, client)`: runs `client(handle, spawner, stop)` as a switch task on a new Runtime, turning the Net until it finishes; `stop` finishes once `should_stop()` returns true. Runtime ticks are milliseconds (`Clock::ms`).
 - `connect(handle, spawner, target, socket, tls, local_port, limit)`: opens TCP, TLS and WebSocket within one time limit. Returns a `Feed`; on an error or timeout the socket is dropped.
-- `Feed::next(stop)`: the next `BookTicker`, or `None` once `stop` finishes (updates already received come first). Server pings are answered inside. `Feed::close(spawner, limit)` sends the WebSocket close, close_notify and FIN, and reads until the server's close echo.
+- `Feed::next(stop)`: the next `BookTicker`, or `None` once `stop` finishes (updates already received come first). Server pings are answered inside. `Feed::close(spawner, limit)` sends the WebSocket close and reads until the server's close echo; then close_notify and FIN go out, and it returns once the server acked them.
 - `Target { addr, host, path }`, `BookTicker` (`update_id`, `symbol`, bid and ask price and quantity as Binance's decimal strings), `Clock`, `FeedError`.
 - `socket(mss_cap)`: the `tcp::Config` (256 KiB RX and TX buffers). `client_config(roots)` (TLS 1.3 only) and `webpki_client_config()` build the rustls config.
 

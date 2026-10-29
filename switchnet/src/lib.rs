@@ -61,12 +61,14 @@ enum Interest {
     UdpRecv,
     /// Room for one frame of this many bytes.
     TcpRoom(u32),
+    /// Everything sent, FIN included, acked.
+    TcpDelivered,
 }
 
 impl Interest {
     fn side(self) -> usize {
         match self {
-            Interest::TcpRoom(_) => TX,
+            Interest::TcpRoom(_) | Interest::TcpDelivered => TX,
             _ => RX,
         }
     }
@@ -195,6 +197,7 @@ fn ready(stack: &Stack, socket: &Socket, interest: Interest) -> bool {
         (Socket::Tcp(handle), Interest::Accept) => !accepting(stack.tcp(handle).state()),
         (Socket::Tcp(handle), Interest::TcpRecv) => tcp_recv_ready(stack.tcp(handle)),
         (Socket::Tcp(handle), Interest::TcpRoom(len)) => tcp_room_ready(stack.tcp(handle), len as usize),
+        (Socket::Tcp(handle), Interest::TcpDelivered) => delivered(stack.tcp(handle).state()),
         (Socket::Udp(handle), Interest::UdpRecv) => stack.udp(handle).rx_queued() > 0,
         _ => unreachable!("interest does not match socket kind"),
     }
@@ -211,6 +214,11 @@ fn tcp_recv_ready(socket: &tcp::Socket<'_>) -> bool {
 fn tcp_room_ready(socket: &tcp::Socket<'_>, len: usize) -> bool {
     !socket.may_send()
         || (socket.send_capacity() - socket.send_queue() >= len && socket.frame_send_room() != 0)
+}
+
+/// Our FIN acked (FinWait2, TimeWait), or nothing more can be delivered (Closed).
+fn delivered(state: tcp::State) -> bool {
+    matches!(state, tcp::State::FinWait2 | tcp::State::TimeWait | tcp::State::Closed)
 }
 
 /// SynSent, or SynReceived after a simultaneous open.
@@ -569,6 +577,36 @@ impl TcpTx {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.tcp(self.0.index);
         stack.tcp_mut(handle).close();
+    }
+
+    /// `Future<Output = ()>`, after `shutdown`: resolves once the peer acked every byte and the
+    /// FIN, or the connection closed (a reset: nothing more can be delivered). Until then the
+    /// queued bytes exist only in this socket, and a Stack dropped now never sends them.
+    pub fn delivered(&mut self) -> Delivered<'_> {
+        Delivered { tx: self }
+    }
+}
+
+pub struct Delivered<'a> {
+    tx: &'a mut TcpTx,
+}
+
+impl Future for Delivered<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let half = &self.tx.0;
+        let index = half.index;
+        poll_op(&half.shared, index, Interest::TcpDelivered, cx, |inner| {
+            let (stack, handle) = inner.tcp(index);
+            delivered(stack.tcp(handle).state()).then_some(())
+        })
+    }
+}
+
+impl Drop for Delivered<'_> {
+    fn drop(&mut self) {
+        self.tx.0.shared.borrow_mut().unpark(self.tx.0.index, TX);
     }
 }
 

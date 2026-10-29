@@ -263,6 +263,40 @@ fn parked_room_resolves_with_an_error_on_reset() {
     })
 }
 
+/// `delivered` after `shutdown` parks, unpolled, while the peer does not read: its window
+/// shut, the bytes and the FIN stay unacked. Once the peer reads them all, it resolves.
+#[zhida_test_support::pinned_test]
+fn delivered_waits_until_the_peer_acks_the_fin() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["dlva", "dlvb"]);
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
+        let (_rx, mut tx) = stream.split();
+        let data = pattern(20 * CHUNK, 21);
+        let handle = mixed.handle();
+        let sent = data.clone();
+        let (task, polls) = counted(async move {
+            send_all(&handle, &mut tx, &sent).await;
+            tx.shutdown();
+            tx.delivered().await;
+            tx
+        });
+        let slot = mixed.spawn(task);
+        mixed.rounds(50);
+        let parked = polls.get();
+        mixed.rounds(20);
+        assert_eq!(polls.get(), parked, "the waiter is not parked");
+        assert!(!slot.is_full(), "delivered before the peer acked");
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::Established, "the FIN reached the peer");
+        let got = peer_receive(&mut mixed, &peer, data.len());
+        assert_eq!(got, data);
+        mixed.until(|_| slot.is_full());
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::CloseWait);
+        assert_eq!(mixed.peer.tcp_mut(&peer).recv().map(|f| f.is_some()), Err(RecvError::Finished));
+        drop((slot.take(), _rx, peer));
+        mixed.close();
+    })
+}
+
 /// After `shutdown` the peer reads every byte, then end of stream; the Net
 /// side can still receive.
 #[zhida_test_support::pinned_test]

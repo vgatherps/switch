@@ -6,7 +6,8 @@ license.workspace = true
 publish = false
 
 [features]
-# The clients over switchnet TCP (module `switchnet`): ws:// and wss:// through sheath.
+# WebSocket over switchnet TCP (module `switchnet`): ws:// and wss:// (through sheath) clients,
+# a ws:// server.
 switchnet = ["dep:switchnet", "dep:switch", "dep:rustls", "sheath/switchnet"]
 # Test-only: the Docker end-to-end tests (DPDK net_tap, Linux), on switchnet's testkit.
 e2e = ["switchnet", "switchnet/testkit", "dep:zhida-test-support", "dep:tap-echo"]

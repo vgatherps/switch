@@ -129,8 +129,9 @@ impl<L: PlainTx> WsTx<L> {
 
     /// After the close frame: flush, then send the lower layer's end-of-stream
     /// record (TLS close_notify) once, then end the transport
-    /// ([`PlainTx::shutdown`]: TCP FIN, again on every call). Panics if no
-    /// close was queued.
+    /// ([`PlainTx::shutdown`]: TCP FIN, again on every call), then wait until
+    /// the peer has it all (`delivered`: the FIN acked), so a caller may tear
+    /// the transport down once this returns. Panics if no close was queued.
     pub async fn shutdown(&mut self) -> Result<(), L::Error> {
         assert!(!matches!(self.close, Close::None), "shutdown before close");
         self.flush().await?;
@@ -146,6 +147,7 @@ impl<L: PlainTx> WsTx<L> {
             self.drain_unsent().await?;
         }
         self.lower.shutdown();
+        self.lower.delivered().await;
         Ok(())
     }
 

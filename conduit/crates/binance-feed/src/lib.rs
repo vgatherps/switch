@@ -141,8 +141,8 @@ pub enum FeedError {
     },
     /// A binary message; bookTicker updates are text.
     Binary,
-    /// The server closed the WebSocket (its close was echoed).
-    ServerClosed,
+    /// The server closed the WebSocket with this status and reason (its close was echoed).
+    ServerClosed { code: u16, reason: String },
     Stack(StackError),
     Runtime(RuntimeError),
 }
@@ -170,7 +170,7 @@ impl fmt::Display for FeedError {
             Self::Timeout { step, limit } => write!(f, "{step} not finished within {limit:?}"),
             Self::Parse { text, error } => write!(f, "not a bookTicker message ({error}): {text}"),
             Self::Binary => write!(f, "unexpected WebSocket binary message"),
-            Self::ServerClosed => write!(f, "server closed the WebSocket"),
+            Self::ServerClosed { code, reason } => write!(f, "server closed the WebSocket: {code} {reason}"),
             Self::Stack(error) => write!(f, "Zhida stack: {error}"),
             Self::Runtime(error) => write!(f, "switch runtime: {error:?}"),
         }
@@ -238,8 +238,9 @@ fn round(net: &mut Net, rt: &mut Runtime, clock: &Clock) -> Result<(), FeedError
     Ok(())
 }
 
-/// `a`'s output, or `None` if `b` finishes first; `a` is polled first.
-async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
+/// `a`'s output, or `None` if `b` finishes first; `a` is polled first. Callers race a step
+/// (`connect`) against the stop, as `Feed::next` does; dropping `a` drops what it holds.
+pub async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
     let (mut a, mut b) = (pin!(a), pin!(b));
     poll_fn(|cx| match a.as_mut().poll(cx) {
         Poll::Ready(out) => Poll::Ready(Some(out)),
@@ -315,12 +316,10 @@ impl Feed {
     }
 
     async fn recv(&mut self) -> Result<BookTicker, FeedError> {
-        let message = self
-            .0
-            .recv()
-            .await
-            .map_err(FeedError::Ws)?
-            .ok_or(FeedError::ServerClosed)?;
+        let Some(message) = self.0.recv().await.map_err(FeedError::Ws)? else {
+            let (code, reason) = self.0.peer_close().expect("recv returned None after the server's close");
+            return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
+        };
         let text = message.text().ok_or(FeedError::Binary)?;
         serde_json::from_str(text).map_err(|error| FeedError::Parse {
             text: text.to_owned(),
@@ -328,8 +327,9 @@ impl Feed {
         })
     }
 
-    /// Sends the WebSocket close (1000), TLS close_notify and FIN, then reads until the server's
-    /// close echo, dropping the updates before it, within `limit`.
+    /// Sends the WebSocket close (1000) and reads until the server's close echo, dropping the
+    /// updates before it; relay then sends close_notify and FIN and returns once the server acked
+    /// them, so the Net may be dropped right after. All within `limit`.
     pub async fn close(mut self, spawner: &Spawner, limit: Duration) -> Result<(), FeedError> {
         let close = async {
             self.0.close(1000, "").await.map_err(FeedError::Ws)?;

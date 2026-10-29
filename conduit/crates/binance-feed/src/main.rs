@@ -10,7 +10,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, run, Clock, FeedError, Target, INGRESS_BUDGET, SOCKET_BUFFER};
+use binance_feed::{connect, first, run, Clock, FeedError, Target, INGRESS_BUDGET, SOCKET_BUFFER};
 use rustls::ClientConfig;
 use switchnet::{Net, NetConfig};
 use tap_echo::driver::{self, ZHIDA_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP};
@@ -44,8 +44,9 @@ restricted locations.
 The tester starts before DPDK. It must wait for {IFACE} to be up, give the kernel
 side {TESTER_IP} on {IFACE}, NAT Zhida's traffic out of the container, then create
 {READY}. The client prints the first N bookTicker messages and keeps reading until
-the tester exits. It then prints the count and update id range, sends the WebSocket
-close, TLS close_notify and FIN, and reads until the server's close echo.
+the tester exits (also during the connect). It then prints the count and update id range,
+sends the WebSocket close, reads until the server's close echo, then sends TLS close_notify
+and FIN and waits for the server's ack of them.
 Only the tester process itself is killed: run it directly or have it exec its
 final command. It must exit on SIGTERM. Bound the run with timeout --kill-after=N
 without --foreground so expiry signals the tester too.
@@ -231,7 +232,11 @@ fn feed(
     let target = target.clone();
     let count = run(net, &clock, stop, move |handle, spawner, mut stop| async move {
         let socket = binance_feed::socket(None);
-        let mut feed = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT).await?;
+        let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT);
+        let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {
+            let _ = writeln!(io::stdout(), "{NAME}: the tester exited before the feed connected");
+            return Ok(0);
+        };
         let _ = writeln!(
             io::stdout(),
             "{NAME}: connected to {} ({}) from {ZHIDA_IP}:{local_port} over Zhida, TLS 1.3, WebSocket open",

@@ -12,11 +12,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use relay::Kind;
-use relay::switchnet::{Error as WssError, Wss, connect, connect_ws};
+use relay::switchnet::{Error as WssError, Ws, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use switchnet::testkit::{TapConfig, client_server};
+use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, boxed, client_server, with_tap_net};
+use switchnet::{IpEndpoint, IpListenEndpoint};
 use switchnet::{NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -114,6 +115,163 @@ fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
         },
         each_round,
     )
+}
+
+/// One client against one kernel peer, like `client_server`, except that the Net is turned only
+/// until the client task finishes: what the peer reads afterwards was on the wire by then, not
+/// sent by later turns. What the client returns is dropped only after the peer is done.
+fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
+    listener_setup: impl FnOnce(&TcpListener),
+    serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
+    client: impl FnOnce(NetHandle, TcpStream) -> F + 'static,
+) -> T {
+    with_tap_net(&TAP, |net, clock| {
+        let listener = TcpListener::bind((KERNEL_ADDR, SERVER_PORT)).expect("bind the peer");
+        listener_setup(&listener);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept the client");
+            stream.set_read_timeout(Some(LIMIT)).unwrap();
+            stream.set_write_timeout(Some(LIMIT)).unwrap();
+            serve(stream)
+        });
+        let mut rt = switch::Runtime::new(0);
+        let handle = net.handle();
+        let held: Rc<RefCell<Option<H>>> = Rc::default();
+        let task_held = held.clone();
+        let task = async move {
+            let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
+            let local = IpListenEndpoint { addr: None, port: 49152 };
+            let stream = handle.tcp_connect(TAP.socket, remote, local).expect("open TCP").await.expect("TCP connect");
+            *task_held.borrow_mut() = Some(client(handle, stream).await);
+        };
+        rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
+        while held.borrow().is_none() {
+            assert!(clock.elapsed() < LIMIT, "client not done");
+            net.turn(clock.now()).expect("turn the Net");
+            rt.poll(clock.ms()).expect("poll the client");
+            std::thread::sleep(ROUND_SLEEP);
+        }
+        let saw = match server.join() {
+            Ok(saw) => saw,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        drop(held.borrow_mut().take());
+        rt.shutdown();
+        saw
+    })
+}
+
+/// `until_client` with a TLS server running `serve` on the upgraded stream's raw bytes (the
+/// tungstenite upgrade done, nothing read past it) and a wss client running `client`.
+fn wss_until_client<T: Send + 'static, F: Future<Output = Wss> + 'static>(
+    serve: impl FnOnce(Tls) -> T + Send + 'static,
+    client: impl FnOnce(Wss) -> F + 'static,
+) -> T {
+    let (server_tls, client_tls) = tls_configs();
+    until_client(
+        |_| {},
+        move |stream| serve(upgrade(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), stream)).into_inner()),
+        move |handle, stream| async move {
+            let wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            client(wss).await
+        },
+    )
+}
+
+/// `until_client` with a plain server running `serve` on the upgraded stream and a ws client
+/// running `client`.
+fn ws_until_client<T: Send + 'static, F: Future<Output = Ws> + 'static>(
+    listener_setup: impl FnOnce(&TcpListener),
+    serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
+    client: impl FnOnce(Ws) -> F + 'static,
+) -> T {
+    until_client(
+        listener_setup,
+        move |stream| serve(tungstenite::accept(stream).expect("server WebSocket handshake").into_inner()),
+        move |handle, stream| async move {
+            let ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            client(ws).await
+        },
+    )
+}
+
+/// SO_RCVBUF of `size` bytes on `listener`; accepted sockets inherit it.
+fn set_rcvbuf(listener: &TcpListener, size: libc::c_int) {
+    // SAFETY: a valid socket and an int option of the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "set SO_RCVBUF");
+}
+
+/// One masked client frame off `r`: the first byte (FIN and opcode) and the unmasked payload.
+fn read_frame(r: &mut impl Read) -> (u8, Vec<u8>) {
+    let mut head = [0; 2];
+    r.read_exact(&mut head).expect("a frame head");
+    assert_eq!(head[1] & 0x80, 0x80, "client frames are masked");
+    let len = match head[1] & 0x7f {
+        126 => {
+            let mut ext = [0; 2];
+            r.read_exact(&mut ext).unwrap();
+            usize::from(u16::from_be_bytes(ext))
+        }
+        127 => panic!("no test frame is that long"),
+        n => usize::from(n),
+    };
+    let mut key = [0; 4];
+    r.read_exact(&mut key).unwrap();
+    let mut payload = vec![0; len];
+    r.read_exact(&mut payload).unwrap();
+    payload.iter_mut().zip(key.iter().cycle()).for_each(|(b, k)| *b ^= k);
+    (head[0], payload)
+}
+
+/// An unmasked server frame, FIN set, under 126 bytes.
+fn server_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    [&[0x80 | opcode, payload.len() as u8][..], payload].concat()
+}
+
+const TEXT: u8 = 0x1;
+const CLOSE: u8 = 0x8;
+const PING: u8 = 0x9;
+
+/// A close payload: the status code, big-endian, then the reason.
+fn close_payload(code: u16, reason: &str) -> Vec<u8> {
+    [&code.to_be_bytes()[..], reason.as_bytes()].concat()
+}
+
+/// Reads nothing for 300 ms: no byte, and not the end of the stream.
+fn assert_quiet(sock: &std::net::TcpStream, r: &mut impl Read) {
+    sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let quiet = r.read(&mut [0; 1]).expect_err("a byte or the end before the echo");
+    assert!(matches!(quiet.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{quiet}");
+    sock.set_read_timeout(Some(LIMIT)).unwrap();
+}
+
+/// The end of the stream, with no byte before it.
+fn assert_fin(sock: &mut std::net::TcpStream) {
+    let mut rest = Vec::new();
+    sock.read_to_end(&mut rest).expect("FIN, not RST");
+    assert_eq!(rest, b"", "bytes before FIN");
+}
+
+/// `f`'s output if it finishes within `rounds` of the client's runtime, else `None` (`f`
+/// dropped).
+async fn within_rounds<F: Future>(rounds: usize, f: F) -> Option<F::Output> {
+    let mut f = std::pin::pin!(f);
+    for _ in 0..rounds {
+        if let std::task::Poll::Ready(out) = std::future::poll_fn(|cx| std::task::Poll::Ready(f.as_mut().poll(cx))).await {
+            return Some(out);
+        }
+        switch::yield_now().await;
+    }
+    None
 }
 
 /// Text of `len` bytes, `seed`-dependent, with multibyte characters.
@@ -237,39 +395,184 @@ fn server_ping_is_answered_inside_recv() {
 }
 
 /// The client closes: the server sees the close frame alone, and close_notify and FIN only
-/// after its echo; the client's recv ends cleanly with that echo.
+/// after its echo; the client's recv ends cleanly with that echo, and by then (the Net not
+/// turned again) close_notify and FIN are on the wire.
 #[zhida_test_support::pinned_test]
 fn client_close_sends_close_notify_and_fin_after_the_echo() {
-    let close_frame = wss_run(
-        |_| {},
-        |tls| {
-            let mut tls = upgrade(tls).into_inner();
-            let mut frame = [0; 11];
-            tls.read_exact(&mut frame).expect("the client's close");
-            // nothing follows the close until the echo: no close_notify, no FIN
-            tls.sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-            let mut byte = [0; 1];
-            let quiet = tls.read(&mut byte).expect_err("close_notify or FIN before the echo");
-            assert!(matches!(quiet.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{quiet}");
-            tls.sock.set_read_timeout(Some(LIMIT)).unwrap();
-            tls.write_all(&[0x88, 5, 0x03, 0xe8, b'b', b'y', b'e']).unwrap();
+    let close = wss_until_client(
+        |mut tls| {
+            let close = read_frame(&mut tls);
+            assert_quiet(&tls.sock.try_clone().unwrap(), &mut tls);
+            tls.write_all(&server_frame(CLOSE, &close_payload(1000, "bye"))).unwrap();
             tls.flush().unwrap();
             assert_close_notify_then_fin(tls);
-            frame
+            close
         },
         |mut wss| async move {
             wss.close(1000, "bye").await.expect("send close");
             assert!(wss.recv().await.expect("recv after close").is_none());
             wss
         },
-        || {},
     );
-    // masked: FIN + close, 0x80 | 5, the key, then 1000 "bye" under it
-    assert_eq!(close_frame[..2], [0x88, 0x85]);
-    let key = &close_frame[2..6];
-    let payload: Vec<u8> = close_frame[6..].iter().zip(key.iter().cycle()).map(|(b, k)| b ^ k).collect();
-    assert_eq!(payload, [0x03, 0xe8, b'b', b'y', b'e']);
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "bye")));
 }
+
+/// The same for ws://: the server sees the close frame alone, FIN only after its echo, and the
+/// FIN is on the wire once the client's recv ended.
+#[zhida_test_support::pinned_test]
+fn ws_client_close_sends_fin_after_the_echo() {
+    let close = ws_until_client(
+        |_| {},
+        |mut sock| {
+            let close = read_frame(&mut sock);
+            assert_quiet(&sock.try_clone().unwrap(), &mut sock);
+            sock.write_all(&server_frame(CLOSE, &close_payload(1000, "bye"))).unwrap();
+            assert_fin(&mut sock);
+            close
+        },
+        |mut ws| async move {
+            ws.close(1000, "bye").await.expect("send close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "bye")));
+}
+
+/// After our close the server still sends a Text and a Ping before its echo: recv returns the
+/// Text, answers no Ping (a close is queued), then ends; the server reads nothing after our close
+/// but close_notify and FIN (Wss) or FIN (Ws): no Pong, no second close.
+#[zhida_test_support::pinned_test]
+fn data_and_ping_after_our_close_then_the_echo() {
+    let late = |w: &mut dyn Write| {
+        let frames = [server_frame(TEXT, b"late"), server_frame(PING, b"p"), server_frame(CLOSE, &close_payload(1000, ""))];
+        w.write_all(&frames.concat()).unwrap();
+        w.flush().unwrap();
+    };
+    let close = wss_until_client(
+        move |mut tls| {
+            let close = read_frame(&mut tls);
+            late(&mut tls);
+            assert_close_notify_then_fin(tls);
+            close
+        },
+        |mut wss| async move {
+            wss.close(1000, "").await.expect("send close");
+            assert_eq!(recv_text(&mut wss).await, "late");
+            assert!(wss.recv().await.expect("recv after close").is_none());
+            wss
+        },
+    );
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "")));
+    let close = ws_until_client(
+        |_| {},
+        move |mut sock| {
+            let close = read_frame(&mut sock);
+            late(&mut sock);
+            assert_fin(&mut sock);
+            close
+        },
+        |mut ws| async move {
+            ws.close(1000, "").await.expect("send close");
+            let m = ws.recv().await.expect("recv").expect("the late Text");
+            assert_eq!(m.text(), Some("late"));
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "")));
+}
+
+/// Crossing closes: the server sends its close right after the upgrade and the client closes
+/// without having read it. The server reads one close (ours, 1000, not an echo of its 1001), then
+/// FIN.
+#[zhida_test_support::pinned_test]
+fn crossing_closes_send_one_close_and_fin() {
+    let close = ws_until_client(
+        |_| {},
+        |mut sock| {
+            sock.write_all(&server_frame(CLOSE, &close_payload(1001, "away"))).unwrap();
+            let close = read_frame(&mut sock);
+            assert_fin(&mut sock);
+            close
+        },
+        |mut ws| async move {
+            ws.close(1000, "mine").await.expect("send close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "mine")));
+}
+
+/// A server that never echoes: the client's recv after its close stays pending (a caller bounds
+/// it), and nothing but the close was sent: no FIN.
+#[zhida_test_support::pinned_test]
+fn recv_after_close_waits_for_the_echo() {
+    let (tx, rx) = mpsc::channel::<()>();
+    let close = ws_until_client(
+        |_| {},
+        move |mut sock| {
+            let close = read_frame(&mut sock);
+            rx.recv_timeout(LIMIT).expect("the client gave up");
+            // no FIN without the echo (the client still holds the connection)
+            assert_quiet(&sock.try_clone().unwrap(), &mut sock);
+            close
+        },
+        |mut ws| async move {
+            ws.close(1000, "").await.expect("send close");
+            assert!(within_rounds(2000, ws.recv()).await.is_none(), "recv ended without the echo");
+            tx.send(()).unwrap();
+            ws
+        },
+    );
+    assert_eq!(close.0, 0x80 | CLOSE);
+}
+
+/// A server that stops reading: the client's one-byte messages fill its window and then the
+/// send buffer or frame slots, so `close` waits for room; that wait is dropped. The next recv
+/// still sends the queued close, after every message sent before it (the one dropped in its
+/// wait is not sent); the server echoes it and sees FIN.
+#[zhida_test_support::pinned_test]
+fn close_dropped_while_waiting_for_room_is_sent_by_recv() {
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let sent = Rc::new(Cell::new(0usize));
+    let client_sent = sent.clone();
+    let (frames, close) = ws_until_client(
+        |listener| set_rcvbuf(listener, 4096),
+        move |mut sock| {
+            go_rx.recv_timeout(LIMIT).expect("the client's go");
+            let mut frames = 0usize;
+            let close = loop {
+                match read_frame(&mut sock) {
+                    (0x82, payload) => {
+                        assert_eq!(payload, [frames as u8], "message {frames}");
+                        frames += 1;
+                    }
+                    close => break close,
+                }
+            };
+            sock.write_all(&server_frame(CLOSE, &close.1)).unwrap();
+            assert_fin(&mut sock);
+            (frames, close)
+        },
+        |mut ws| async move {
+            let mut n = 0usize;
+            while within_rounds(2000, ws.send(Kind::Binary, &[n as u8])).await.is_some() {
+                n += 1;
+            }
+            client_sent.set(n);
+            assert!(within_rounds(2000, ws.close(1000, "full")).await.is_none(), "close found room");
+            go_tx.send(()).unwrap();
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert!(sent.get() > 0);
+    assert_eq!(frames, sent.get(), "the server read a message count other than the sends that finished");
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "full")));
+}
+
 
 /// The server closes: the client's recv returns the end, after echoing the close and ending
 /// TLS and TCP.
@@ -290,6 +593,7 @@ fn server_close_ends_recv_cleanly() {
         },
         |mut wss| async move {
             assert!(wss.recv().await.expect("recv").is_none(), "a message instead of the end");
+            assert_eq!(wss.peer_close(), Some((1001, "bye")));
             wss
         },
         || {},
@@ -312,21 +616,7 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
     let seen = RefCell::new((Instant::now(), 0));
     let stalled = Cell::new(false);
     let received = wss_run(
-        |listener| {
-            let size: libc::c_int = 4096;
-            // SAFETY: a valid socket and an int option of the right size; accepted sockets
-            // inherit the buffer size.
-            let rc = unsafe {
-                libc::setsockopt(
-                    listener.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    (&size as *const libc::c_int).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            };
-            assert_eq!(rc, 0, "set SO_RCVBUF");
-        },
+        |listener| set_rcvbuf(listener, 4096),
         move |tls| {
             let mut ws = upgrade(tls);
             go_rx.recv_timeout(LIMIT).expect("the go signal");

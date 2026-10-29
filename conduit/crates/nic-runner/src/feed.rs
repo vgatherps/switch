@@ -4,7 +4,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, webpki_client_config, Clock, FeedError, Target};
+use binance_feed::{connect, first, webpki_client_config, Clock, FeedError, Target};
 use switchnet::{tcp, Net};
 
 use crate::args::Feed;
@@ -53,8 +53,11 @@ pub fn run(
         move |handle, spawner, mut stop| async move {
             let tls = webpki_client_config();
             let limit = Duration::from_secs(20);
-            let mut feed =
-                connect(&handle, &spawner, &target, socket, tls, local_port, limit).await?;
+            let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, limit);
+            let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {
+                line("feed_stopped", "before the feed connected");
+                return Ok(0);
+            };
             line(
                 "feed_connected",
                 format_args!("{} local_port={local_port} TLS 1.3", target.url()),

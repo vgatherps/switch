@@ -268,4 +268,8 @@ impl<L: FrameTx> FrameTx for TlsTx<L> {
     fn shutdown(&mut self) {
         self.lower.shutdown();
     }
+
+    async fn delivered(&mut self) {
+        self.lower.delivered().await
+    }
 }

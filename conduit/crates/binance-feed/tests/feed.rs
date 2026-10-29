@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 use std::ffi::CStr;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::panic::resume_unwind;
 use std::process::Command;
@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    client_config, connect, run, socket, webpki_client_config, BookTicker, Clock, FeedError,
+    client_config, connect, first, run, socket, webpki_client_config, BookTicker, Clock, FeedError,
     Target, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
@@ -26,12 +26,15 @@ use dpdk_smoltcp::{
     frame_reserve, rx_reserve, tx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack,
     StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
+use relay::UpgradeError;
 use relay::switchnet::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use switch::Spawner;
 use switchnet::{Net, NetConfig, NetHandle, OpenError};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tungstenite::protocol::CloseFrame;
+use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Error, Message};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
@@ -267,6 +270,10 @@ enum ServerPlan {
     Refuse451,
     /// The client rejects the certificate; the server's handshake ends at its alert.
     TlsOnly,
+    /// After the upgrade the server closes: 1001 "maintenance".
+    CloseAway,
+    /// Accepts TCP and never answers; ends once the client's socket is gone.
+    Silent,
 }
 
 #[derive(Default)]
@@ -293,6 +300,14 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
         }
     };
     stream.set_nonblocking(false).expect("blocking TLS socket");
+    if matches!(plan, ServerPlan::Silent) {
+        let mut stream = stream;
+        stream.set_read_timeout(Some(LIMIT)).expect("read timeout");
+        let mut rest = Vec::new();
+        // the ClientHello, then the end (FIN or RST) once the client dropped its socket
+        let _ = stream.read_to_end(&mut rest);
+        return ServerSaw::default();
+    }
     stream
         .set_read_timeout(Some(LIMIT))
         .expect("TLS read timeout");
@@ -333,6 +348,12 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
     };
     let texts = match plan {
         ServerPlan::Tickers(texts) => texts,
+        ServerPlan::CloseAway => {
+            let frame = CloseFrame { code: CloseCode::Away, reason: "maintenance".into() };
+            ws.close(Some(frame)).expect("send the server's Close");
+            Vec::new()
+        }
+        ServerPlan::Silent => unreachable!("answered above"),
         ServerPlan::Refuse451 => panic!("HTTP 451 was accepted"),
         ServerPlan::TlsOnly => panic!("the client trusted an unknown certificate"),
     };
@@ -350,18 +371,30 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
             Ok(Message::Pong(payload)) if payload.as_ref() == b"keepalive" => saw.pong = true,
             Ok(Message::Close(_)) => saw.close = true,
             Ok(_) => {}
-            // Only the client's TLS close_notify gets here: rustls reports a
-            // TCP EOF without it as UnexpectedEof, which panics below.
+            // tungstenite returns this once it sent its reply to the client's Close, without
+            // reading further; the client's close_notify and FIN are read below.
             Err(Error::ConnectionClosed) => break,
             Err(Error::Io(error)) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => panic!("server WebSocket read: {error}"),
         }
     }
+    // The client's close_notify (a clean TLS end, not truncation) and then its FIN, both sent
+    // before its close returned: the Net is not turned once `run` returned.
     let mut tls = ws.into_inner();
-    tls.conn.send_close_notify();
-    // The client may have dropped its socket after reading our close echo.
-    let _ = tls.conn.complete_io(&mut tls.sock);
+    assert_eq!(read_retrying(&mut tls).expect("clean TLS end: close_notify"), 0);
+    assert_eq!(read_retrying(&mut tls.sock).expect("TCP end of stream"), 0);
     saw
+}
+
+/// One byte's read, again after EINTR (a blocking read returns it when a signal arrives).
+fn read_retrying(from: &mut impl Read) -> std::io::Result<usize> {
+    let mut byte = [0; 1];
+    loop {
+        match from.read(&mut byte) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            read => return read,
+        }
+    }
 }
 
 fn join(server: JoinHandle<ServerSaw>) -> ServerSaw {
@@ -488,8 +521,10 @@ fn timed_out_connect_releases_the_only_slot() {
                     matches!(error, FeedError::Timeout { limit: actual, .. } if actual == limit),
                     "{error:?}",
                 );
+                // Runtime ticks are whole milliseconds of `clock`, and `started` is read within
+                // the tick the sleep counts from: up to 1 ms of the limit may precede it.
                 assert!(
-                    started.elapsed() >= limit,
+                    started.elapsed() + Duration::from_millis(1) >= limit,
                     "timed out after {:?}",
                     started.elapsed()
                 );
@@ -647,6 +682,59 @@ fn received_update_comes_before_a_finished_stop() {
     });
 }
 
+/// The server closes: `next` reports its status and reason, after relay echoed the close and
+/// sent close_notify and FIN (checked by `serve`, the Net not turned once `run` returned).
+#[zhida_test_support::pinned_test]
+fn server_close_reports_its_status_and_reason() {
+    with_net(&[], None, |net, clock, listener| {
+        let (server_tls, roots) = server_config();
+        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::CloseAway));
+        let should_stop = || {
+            guard(clock);
+            false
+        };
+        run(net, clock, should_stop, |handle, spawner, mut stop| async move {
+            let target = target();
+            let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
+            let mut feed = connecting.await.expect("connect Zhida TLS WebSocket client");
+            match feed.next(&mut stop).await {
+                Err(FeedError::ServerClosed { code: 1001, reason }) => assert_eq!(reason, "maintenance"),
+                other => panic!("expected the server's close, got {other:?}"),
+            }
+        })
+        .expect("run the client");
+        let saw = join(server);
+        assert!(saw.close, "server did not receive the echo");
+        assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
+    });
+}
+
+/// A stop while `connect` waits (the server never answers the ClientHello) ends it at once,
+/// before `CONNECT_LIMIT`, and drops its socket: the server reads the end of the stream (the
+/// run stops once the server returned).
+#[zhida_test_support::pinned_test]
+fn stop_during_connect_ends_it_and_frees_the_slot() {
+    with_net(&[], None, |net, clock, listener| {
+        let (server_tls, roots) = server_config();
+        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Silent));
+        let should_stop = || {
+            guard(clock);
+            server.is_finished()
+        };
+        run(net, clock, should_stop, |handle, spawner, stop| async move {
+            let target = target();
+            let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
+            let early = spawner.sleep(200).expect("open Runtime");
+            let started = Instant::now();
+            assert!(first(connecting, early).await.is_none(), "connect finished against a silent server");
+            assert!(started.elapsed() < CONNECT_LIMIT / 2, "connect outlived the stop");
+            let _ = stop.await;
+        })
+        .expect("run the client");
+        join(server);
+    });
+}
+
 #[zhida_test_support::pinned_test]
 fn upgrade_refused_with_http_451_reports_the_status() {
     with_net(&[], None, |net, clock, listener| {
@@ -676,9 +764,7 @@ fn upgrade_refused_with_http_451_reports_the_status() {
                     Err(error) => error,
                 };
                 match &error {
-                    FeedError::Ws(WsError::Upgrade(reason)) => {
-                        assert!(reason.contains("451"), "{reason}")
-                    }
+                    FeedError::Ws(WsError::Upgrade(UpgradeError::Status(Some(451)))) => {}
                     other => panic!("expected the HTTP 451 refusal, got {other:?}"),
                 }
                 assert!(error.to_string().contains("451"), "{error}");

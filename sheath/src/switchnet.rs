@@ -88,6 +88,10 @@ impl FrameTx for SwitchTx {
     fn shutdown(&mut self) {
         self.tcp.shutdown();
     }
+
+    async fn delivered(&mut self) {
+        self.tcp.delivered().await
+    }
 }
 
 #[derive(Debug)]

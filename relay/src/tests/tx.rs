@@ -38,6 +38,8 @@ struct Log {
     pending: Vec<Vec<u8>>,
     take_pending_calls: usize,
     shutdowns: usize,
+    /// `delivered` resolves (`tx` sets it); it stays pending while false.
+    delivered: bool,
 }
 
 /// A TLS-shaped lower layer: plaintext at `HEAD`, `TAIL` bytes after it.
@@ -129,6 +131,10 @@ impl FrameTx for MockTx {
     fn shutdown(&mut self) {
         self.log.borrow_mut().shutdowns += 1;
     }
+
+    async fn delivered(&mut self) {
+        std::future::poll_fn(|_| if self.log.borrow().delivered { Poll::Ready(()) } else { Poll::Pending }).await
+    }
 }
 
 impl PlainTx for MockTx {
@@ -157,7 +163,7 @@ impl PlainTx for MockTx {
 }
 
 fn tx(role: Role, room: usize) -> (WsTx<MockTx>, Rc<RefCell<Log>>) {
-    let log = Rc::new(RefCell::new(Log::default()));
+    let log = Rc::new(RefCell::new(Log { delivered: true, ..Log::default() }));
     (WsTx::new(MockTx { room, log: log.clone() }, role), log)
 }
 
@@ -471,6 +477,22 @@ fn shutdown_sends_the_lower_close_after_the_close_frame() {
     assert_eq!(ready(t.shutdown()), Ok(()));
     assert_eq!(sent(&log), [close_frame(), CLOSE_RECORD.to_vec()]);
     assert_eq!((log.borrow().seals, log.borrow().shutdowns), (2, 2));
+}
+
+/// `shutdown` returns only once the lower layer reports everything delivered, after its FIN.
+#[test]
+fn shutdown_waits_until_the_lower_layer_delivered() {
+    let (mut t, log) = tx(Role::Server, 1430);
+    log.borrow_mut().delivered = false;
+    t.close(&1000u16.to_be_bytes());
+    {
+        let mut shut = pin!(t.shutdown());
+        assert!(poll(shut.as_mut()).is_pending(), "returned before delivery");
+        assert_eq!(log.borrow().shutdowns, 1, "waits after the FIN, not before it");
+        log.borrow_mut().delivered = true;
+        assert_eq!(poll(shut.as_mut()), Poll::Ready(Ok(())));
+    }
+    assert_eq!(sent(&log), [close_frame(), CLOSE_RECORD.to_vec()]);
 }
 
 fn close_frame() -> Vec<u8> {
