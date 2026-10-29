@@ -13,7 +13,7 @@ use zhida_open::open;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Address};
 
-fn configure_kernel_side(iface: &'static str) -> thread::JoinHandle<EthernetAddress> {
+fn configure_kernel_side(iface: &'static str) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let name = CString::new(iface).unwrap();
         let deadline = WallInstant::now() + WallDuration::from_secs(2);
@@ -35,9 +35,14 @@ fn configure_kernel_side(iface: &'static str) -> thread::JoinHandle<EthernetAddr
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let address = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).unwrap();
-        EthernetAddress::from_str(address.trim()).unwrap()
     })
+}
+
+/// The kernel tap's MAC, read once `open` has returned: the tap PMD sets it to the `mac=`
+/// devarg after the interface appears, so a read during setup can see the earlier random one.
+fn kernel_mac(iface: &str) -> EthernetAddress {
+    let address = std::fs::read_to_string(format!("/sys/class/net/{iface}/address")).unwrap();
+    EthernetAddress::from_str(address.trim()).unwrap()
 }
 
 #[zhida_test_support::pinned_test]
@@ -56,7 +61,8 @@ fn open_resolves_tap_kernel_gateway() {
         Instant::from_micros(i64::try_from(started.elapsed().as_micros()).unwrap())
     };
     let opened = unsafe { open(&config, &common::sizing(), &mut clock) }.unwrap();
-    let kernel_mac = setup.join().unwrap();
+    setup.join().unwrap();
+    let kernel_mac = kernel_mac(iface);
     let Some((gateway, mac, waited)) = opened.report.gateway else {
         panic!("gateway was not reported")
     };

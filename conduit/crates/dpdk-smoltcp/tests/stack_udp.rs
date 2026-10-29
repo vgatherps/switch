@@ -28,7 +28,6 @@ fn config(max_udp_sockets: usize) -> StackConfig<'static> {
         paths: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 2,
         max_udp_sockets,
         rx_staging: 8,

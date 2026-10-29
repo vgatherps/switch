@@ -40,7 +40,6 @@ fn config(max_udp_sockets: usize) -> StackConfig<'static> {
         paths: &PATHS,
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 1,
         rx_staging: 8,
         tx_pending: 8,
@@ -216,6 +215,37 @@ fn udp_send_frame_refusals_return_frame_and_send_nothing() {
     });
 }
 
+/// `udp_send` copies into a frame-pool frame, as does `udp_send_frame` for a shared frame:
+/// with every frame held by the app both report `WouldBlock` and send nothing, even toward an
+/// unroutable destination, because the empty pool is checked before the neighbor lookup.
+/// One frame released lets the copy go out.
+#[zhida_test_support::pinned_test]
+fn udp_copy_with_frame_pool_empty_would_block() {
+    with_eal(|eal| {
+        let fixture = RingPort::new("udpfr_empty", 16, 16);
+        let mut stack = stack(fixture.open(eal), 1);
+        let handle = add_udp(&mut stack, PORT);
+        resolve_peer(&fixture, &mut stack);
+        let mut held: Vec<_> = std::iter::from_fn(|| stack.tx_frame()).collect();
+        assert!(!held.is_empty());
+        assert_eq!(fixture.frame_in_use(), held.len() as u32);
+        let off_subnet = Some(IpEndpoint::new(Ipv4Address::new(192, 0, 2, 1).into(), PEER_PORT));
+        for to in [peer(PEER_PORT), off_subnet] {
+            assert_eq!(stack.udp_send(&handle, to, b"copy"), Err(UdpSendError::WouldBlock));
+            let shared = held[0].clone();
+            drop(refused(&mut stack, &handle, to, shared, UdpSendFrameError::Udp(UdpSendError::WouldBlock)));
+        }
+        assert_eq!(sent(&mut stack), 0);
+        assert!(fixture.take_tx().is_empty());
+        drop(held.pop());
+        stack.udp_send(&handle, peer(PEER_PORT), b"copy").unwrap();
+        assert_eq!(sent(&mut stack), 1);
+        assert_datagram(&fixture.take_tx()[0], PORT, b"copy");
+        drop(held);
+        finish(fixture, stack);
+    });
+}
+
 fn stack_other(port: Port) -> Stack {
     let config = StackConfig {
         ethernet: EthernetAddress([0x02, 0, 0, 0, 0, 0x09]),
@@ -230,9 +260,10 @@ fn stack_other(port: Port) -> Stack {
 
 /// Broadcast of one payload: the app clones one frame for 8 sockets and
 /// sends one clone on each. Each socket's datagram reaches the wire with its
-/// own source port and the same payload, each from its own TX-pool copy
-/// (TX pool in use rises by 8, the frame pool stays at the app's 1); the
-/// ring consumer frees every copy, and the frame returns when the app drops it.
+/// own source port and the same payload, each from its own frame-pool copy
+/// (frame pool in use rises from the app's 1 by 8, the TX pool is untouched);
+/// the ring consumer frees every copy, and the frame returns when the app
+/// drops it.
 #[zhida_test_support::pinned_test]
 fn udp_broadcast_one_frame_to_eight_sockets() {
     const N: usize = 8;
@@ -247,18 +278,16 @@ fn udp_broadcast_one_frame_to_eight_sockets() {
         for handle in &handles {
             assert!(stack.udp_send_frame(handle, peer(PEER_PORT), frame.clone()).is_ok());
         }
-        assert_eq!(fixture.frame_in_use(), 1);
+        assert_eq!(fixture.frame_in_use(), 1 + N as u32);
         assert_eq!(sent(&mut stack), N);
-        // Ingress left one spare TX packet; it serves the first copy, so the
-        // ring holds 8 TX-pool copies.
-        assert_eq!(tx_before, 1);
-        assert_eq!(fixture.in_use().1, N as u32);
+        assert_eq!(fixture.in_use().1, tx_before);
         let wire = fixture.take_tx();
         assert_eq!(wire.len(), N);
         for (i, bytes) in wire.iter().enumerate() {
             assert_datagram(bytes, PORT + i as u16, payload);
         }
-        assert_eq!(fixture.in_use(), (0, 0));
+        assert_eq!(fixture.frame_in_use(), 1);
+        assert_eq!(fixture.in_use(), (0, tx_before));
         assert_eq!(frame.payload(), payload);
         drop(frame);
         finish(fixture, stack);

@@ -2,7 +2,7 @@ use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use core::ops::Range;
 
 use super::flow_table::FlowTable;
-use crate::phy::{HeldFrames, RxBuf, RxShared};
+use crate::phy::{HeldFrames, RxBuf, RxShared, TxSource};
 use crate::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -159,12 +159,15 @@ pub struct UdpSet {
     slots: Vec<Slot>,
     ports: FlowTable<u16>,
     pub(crate) pending_rx_attach: Option<(usize, PendingUdp)>,
+    /// Frames `Interface::udp_send` copies payloads into.
+    pub(crate) source: TxSource,
     #[cfg(test)]
     pub(crate) template_frames: usize,
 }
 
 impl UdpSet {
-    pub fn new(max_sockets: usize) -> Self {
+    /// A set of up to `max_sockets` sockets whose copied sends take frames from `source`.
+    pub fn new(max_sockets: usize, source: TxSource) -> Self {
         Self {
             slots: (0..max_sockets)
                 .map(|_| Slot {
@@ -174,6 +177,7 @@ impl UdpSet {
                 .collect(),
             ports: FlowTable::new(max_sockets),
             pending_rx_attach: None,
+            source,
             #[cfg(test)]
             template_frames: 0,
         }
@@ -278,7 +282,7 @@ mod tests {
 
     #[test]
     fn duplicate_port_refused_without_change() {
-        let mut set = UdpSet::new(2);
+        let mut set = UdpSet::new(2, crate::tests::tx_test_source(1472));
         let handle = set.add(config(1234)).unwrap();
         let peer = IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321);
         set.get_mut(handle).connect(peer).unwrap();
@@ -291,7 +295,7 @@ mod tests {
 
     #[test]
     fn stale_handle_panics() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let old = set.add(config(1234)).unwrap();
         set.remove(old);
         assert!(catch_unwind(AssertUnwindSafe(|| set.get(old))).is_err());
@@ -317,7 +321,7 @@ mod tests {
 
     #[test]
     fn receive_queue_wraps_without_growing() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set
             .add(UdpConfig {
                 rx_queue: 3,
@@ -374,7 +378,7 @@ mod tests {
 
     #[test]
     fn remove_frees_queued_held_stays_valid() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set.add(config(1234)).unwrap();
         let releases = Rc::new(Cell::new(0));
         for byte in [1, 2] {
@@ -404,7 +408,7 @@ mod tests {
 
     #[test]
     fn remove_returns_held_count() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set
             .add(UdpConfig {
                 rx_queue: 3,
@@ -438,7 +442,7 @@ mod tests {
 
     #[test]
     fn removed_datagram_drop_clears_count_without_wake() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set.add(config(1234)).unwrap();
         let shared = set.get(handle).shared.clone();
         let releases = Rc::new(Cell::new(0));
@@ -473,7 +477,7 @@ mod tests {
 
     #[test]
     fn at_limit_counts_drained_datagrams_until_drop() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set.add(config(1234)).unwrap();
         let releases = Rc::new(Cell::new(0));
         assert!(!set.get(handle).at_limit());
@@ -504,7 +508,7 @@ mod tests {
 
     #[test]
     fn invalid_config_refused() {
-        let mut set = UdpSet::new(1);
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         assert!(matches!(
             set.add(config(0)),
             Err(UdpAddError::InvalidConfig(_))
@@ -535,8 +539,8 @@ mod tests {
 
     #[test]
     fn full_set() {
-        assert_eq!(UdpSet::new(0).add(config(1234)), Err(UdpAddError::Full));
-        let mut set = UdpSet::new(1);
+        assert_eq!(UdpSet::new(0, crate::tests::tx_test_source(1472)).add(config(1234)), Err(UdpAddError::Full));
+        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set.add(config(1234)).unwrap();
         assert_eq!(set.add(config(1235)), Err(UdpAddError::Full));
         assert_eq!(set.lookup(1235), None);

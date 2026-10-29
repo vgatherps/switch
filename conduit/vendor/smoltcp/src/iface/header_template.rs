@@ -281,33 +281,11 @@ impl UdpTemplate {
             && self.dst_port == udp.dst_port
     }
 
-    #[inline]
-    pub(crate) fn emit(
-        &self,
-        frame: &mut [u8],
-        ip: &Ipv4Repr,
-        payload: &[u8],
-        checksum: &ChecksumCapabilities,
-    ) {
-        self.prefix.emit(frame, ip, checksum);
-
-        let mut packet = UdpPacket::new_unchecked(&mut frame[34..]);
-        let udp_len = ip.payload_len as u16;
-        packet.set_src_port(self.src_port);
-        packet.set_dst_port(self.dst_port);
-        packet.set_len(udp_len);
-        packet.set_checksum(0);
-        packet.payload_mut().copy_from_slice(payload);
-        if checksum.udp.tx() {
-            // Summed from the source, so no load reads back the copied bytes.
-            packet.set_checksum(self.checksum(udp_len, payload));
-        }
-    }
-
-    /// `emit` for a payload that is not behind the headers: writes the 42 header bytes into
-    /// `frame` (42 long) and sums `payload` where it lies. The caller checked that
-    /// `ip.payload_len` is the UDP length of `payload` (`Interface::udp_send_frame`).
-    #[inline]
+    /// Write the 42 header bytes into `frame` (42 long) and sum `payload`, which lies behind
+    /// them. The caller checked that `ip.payload_len` is the UDP length of `payload`
+    /// (`Interface::udp_send_frame`). Inlined into the one publish path: as a call it costs
+    /// the UDP send about 40 instructions.
+    #[inline(always)]
     pub(crate) fn emit_header(
         &self,
         frame: &mut [u8],

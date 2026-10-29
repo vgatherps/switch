@@ -50,7 +50,6 @@ pub fn sizing(
         max_udp_sockets: udp,
         rx_staging: STAGING,
         tx_pending: STAGING.max(tcp),
-        segments_per_visit: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     }
 }
