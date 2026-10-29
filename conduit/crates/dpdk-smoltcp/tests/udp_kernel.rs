@@ -20,7 +20,7 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{
     Eal, Offloads, Port, PortConfig, Stack, StackConfig, UdpConfig, UdpDatagram, UdpHandle,
-    Turn, UdpSendError, DEFAULT_NEIGHBOR_CAPACITY,
+    UdpSendError, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
@@ -303,14 +303,13 @@ fn add_udp(stack: &mut Stack, tx_checksum: bool) -> UdpHandle {
         .unwrap()
 }
 
-fn turn(stack: &mut Stack, start: Instant) -> Turn {
+fn turn(stack: &mut Stack, start: Instant) {
     let elapsed = start.elapsed();
     assert!(elapsed < DEADLINE, "UDP exchange exceeded {DEADLINE:?}");
     let now = StackInstant::from_micros(i64::try_from(elapsed.as_micros()).unwrap());
     let result = stack.turn(now, BURST).unwrap();
     assert_eq!(result.rx_rejected, 0);
     std::thread::yield_now();
-    result
 }
 
 fn send_kernel(stack: &mut Stack, start: Instant, socket: &UdpSocket, payload: &[u8]) {
@@ -628,10 +627,15 @@ fn connected_zhida_socket_echo() {
             let other = kernel_socket();
             assert_ne!(other.local_addr().unwrap(), kernel.local_addr().unwrap());
             send_kernel(stack, start, &other, b"wrong peer");
-            while turn(stack, start).rx_processed == 0 {}
+            // The tap and the Stack keep arrival order: the peer's later datagram
+            // arriving alone shows the wrong peer's was processed and dropped.
+            send_kernel(stack, start, &kernel, b"marker");
+            let datagram = recv_zhida(stack, start, &handle);
+            assert_eq!((datagram.src(), datagram.payload()), (peer, &b"marker"[..]));
+            drop(datagram);
+            assert!(stack.udp_mut(&handle).recv().is_none());
             assert_kernel_quiet(stack, start, &other);
             assert_kernel_quiet(stack, start, &kernel);
-            assert!(stack.udp_mut(&handle).recv().is_none());
             assert_eq!(stack.udp(&handle).stats().rx_dropped_full, 0);
         });
     });
@@ -648,8 +652,9 @@ fn closed_port_no_icmp() {
             frame_pool: c"udpk_closed_fr",
         };
         with_stack(eal, names, |stack, start| {
+            let handle = add_udp(stack, false);
             let kernel = kernel_socket();
-            kernel.connect(zhida_address()).unwrap();
+            kernel.connect((ZHIDA_ADDR, PORT + 1)).unwrap();
             let payload = b"closed port";
             loop {
                 turn(stack, start);
@@ -662,7 +667,13 @@ fn closed_port_no_icmp() {
                     Err(error) => panic!("connected kernel send: {error}"),
                 }
             }
-            while turn(stack, start).rx_processed == 0 {}
+            // The tap and the Stack keep arrival order, and the kernel queues both
+            // datagrams behind the same ARP resolution: the bound port receiving the
+            // later one shows the closed-port datagram was processed first.
+            send_kernel(stack, start, &kernel_socket(), b"marker");
+            let datagram = recv_zhida(stack, start, &handle);
+            assert_eq!(datagram.payload(), b"marker");
+            drop(datagram);
             assert_kernel_quiet(stack, start, &kernel);
             kernel.set_nonblocking(false).unwrap();
             kernel.set_read_timeout(Some(QUIET)).unwrap();
