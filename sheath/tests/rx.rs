@@ -10,7 +10,6 @@ mod common;
 use std::ops::Range;
 
 use common::*;
-use relay::PlainRx;
 use rustls::crypto::cipher::{MessageEncrypter, OutboundChunks, OutboundPlainMessage};
 use rustls::{
     AlertDescription, ConnectionTrafficSecrets, ContentType, ProtocolVersion, SupportedCipherSuite,
@@ -229,7 +228,7 @@ fn bytes_after_close_notify_are_ignored() {
         data: b"ignored".to_vec(),
         stamp: 9,
     };
-    received.rx.push(ignored, &mut peer.tx).unwrap();
+    received.rx.push(ignored);
     assert!(received.rx.chunk(&mut peer.tx).unwrap().is_none());
     assert_eq!(received.rx.fin(&mut peer.tx), Ok(()));
 }
@@ -270,13 +269,13 @@ fn push_before_chunk_drained_panics() {
         data: stream.bytes,
         stamp: 0,
     };
-    rx.push(first, &mut peer.tx).unwrap();
+    rx.push(first);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_some());
     let second = VecFrame {
         data: vec![],
         stamp: 1,
     };
-    let _ = rx.push(second, &mut peer.tx);
+    rx.push(second);
 }
 
 /// The length in a record header is checked against the TLS 1.3 bound of 2^14 + 256 bytes as
@@ -429,13 +428,13 @@ fn retained_handshake_records_are_bounded() {
 }
 
 /// A fresh receive half with frame `stamp` holding `data`.
-fn pushed(peer: &mut Peer, data: Vec<u8>, stamp: u64) -> TlsRx<VecFrame, TestTx> {
+fn pushed(data: Vec<u8>, stamp: u64) -> TlsRx<VecFrame, TestTx> {
     let mut rx = TlsRx::new();
-    rx.push(VecFrame { data, stamp }, &mut peer.tx).unwrap();
+    rx.push(VecFrame { data, stamp });
     rx
 }
 
-/// relay's run contract: `chunk` again returns the same unconsumed bytes, with the caller's
+/// The run contract: `chunk` again returns the same unconsumed bytes, with the caller's
 /// changes; `consume` advances within the record; the next record comes only once the run is
 /// used up.
 #[test]
@@ -445,7 +444,7 @@ fn a_run_is_returned_again_until_consumed() {
     peer.flush(&mut stream);
     peer.send(&mut stream, b"hello");
     peer.send(&mut stream, b"world");
-    let mut rx = pushed(&mut peer, stream.bytes, 0);
+    let mut rx = pushed(stream.bytes, 0);
 
     let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
     assert_eq!(chunk.bytes, b"hello");
@@ -470,101 +469,27 @@ fn consume_past_the_run_panics() {
     let mut stream = Stream::default();
     peer.flush(&mut stream);
     peer.send(&mut stream, b"hi");
-    let mut rx = pushed(&mut peer, stream.bytes, 0);
+    let mut rx = pushed(stream.bytes, 0);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_some());
     rx.consume(3);
 }
 
-/// `take_frame` moves out the frame holding the current record, at the record's plaintext.
-/// What followed in the frame stays readable: the rest of the record's plaintext, the records
-/// after it, and a record completed by the next frame, stamped with the taken frame.
+/// A record straddling frames is decrypted in the scratch buffer: `current()` is exactly that
+/// record's plaintext, and stays so until consumed (relay reads validated text back through it).
 #[test]
-fn take_frame_keeps_what_follows_readable() {
+fn current_of_a_straddling_record_is_its_plaintext() {
     let mut peer = connect(None);
     let mut stream = Stream::default();
     peer.flush(&mut stream);
-    peer.send(&mut stream, b"hello");
-    peer.send(&mut stream, b"world");
-    peer.send(&mut stream, b"third");
-    let first = &stream.records[0];
-    let cut = stream.records[2].wire.start + 7;
-    let mut rx = pushed(&mut peer, stream.bytes[..cut].to_vec(), 0);
-
-    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"hello");
-    let (frame, offset) = rx.take_frame(2).expect("the record is inside the frame");
-    assert_eq!(offset, first.wire.start + 5);
-    assert_eq!(&frame.data[offset..offset + 5], b"hello");
-    assert_eq!(frame.stamp, 0);
-
-    assert_eq!(rx.current(), b"llo");
-    let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
-    assert_eq!((&*chunk.bytes, chunk.rx_timestamp), (&b"llo"[..], 0));
-    rx.consume(3);
-    let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
-    assert_eq!((&*chunk.bytes, chunk.rx_timestamp), (&b"world"[..], 0));
-    rx.consume(5);
-    assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
-
-    rx.push(
-        VecFrame {
-            data: stream.bytes[cut..].to_vec(),
-            stamp: 1,
-        },
-        &mut peer.tx,
-    )
-    .unwrap();
-    let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
-    assert_eq!((&*chunk.bytes, chunk.rx_timestamp), (&b"third"[..], 0));
-}
-
-/// A whole record taken with nothing after it in the frame: nothing is copied.
-#[test]
-fn take_frame_of_a_last_record() {
-    let mut peer = connect(None);
-    let mut stream = Stream::default();
-    peer.flush(&mut stream);
-    peer.send(&mut stream, b"only");
-    let mut rx = pushed(&mut peer, stream.bytes.clone(), 3);
-    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"only");
-    let (frame, offset) = rx.take_frame(4).unwrap();
-    assert_eq!(&frame.data[offset..offset + 4], b"only");
-    assert_eq!(rx.current(), b"");
-    assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
-
-    peer.send(&mut stream, b"next");
-    let at = stream.records[1].wire.start;
-    rx.push(
-        VecFrame {
-            data: stream.bytes[at..].to_vec(),
-            stamp: 4,
-        },
-        &mut peer.tx,
-    )
-    .unwrap();
-    let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
-    assert_eq!((&*chunk.bytes, chunk.rx_timestamp), (&b"next"[..], 4));
-}
-
-/// A record decrypted in the scratch buffer is not inside a frame: `take_frame` gives nothing
-/// and consumes nothing.
-#[test]
-fn take_frame_of_a_straddling_record_is_none() {
-    let mut peer = connect(None);
-    let mut stream = Stream::default();
-    peer.flush(&mut stream);
-    peer.send(&mut stream, b"split");
+    peer.send(&mut stream, "split €".as_bytes());
     let cut = stream.records[0].wire.start + 3;
-    let mut rx = pushed(&mut peer, stream.bytes[..cut].to_vec(), 0);
+    let mut rx = pushed(stream.bytes[..cut].to_vec(), 0);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
-    rx.push(
-        VecFrame {
-            data: stream.bytes[cut..].to_vec(),
-            stamp: 1,
-        },
-        &mut peer.tx,
-    )
-    .unwrap();
-    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"split");
-    assert!(rx.take_frame(2).is_none());
-    assert_eq!(rx.current(), b"split");
+    rx.push(VecFrame { data: stream.bytes[cut..].to_vec(), stamp: 1 });
+    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, "split €".as_bytes());
+    assert_eq!(rx.current(), "split €".as_bytes());
+    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().rx_timestamp, 0);
+    assert_eq!(rx.current(), "split €".as_bytes());
+    rx.consume(6);
+    assert_eq!(rx.current(), "€".as_bytes());
 }

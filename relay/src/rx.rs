@@ -1,7 +1,7 @@
 //! Receive core: parses WebSocket frames (RFC 6455) out of the lower layer's
 //! runs and hands out messages that borrow the received bytes in place.
 
-use crate::lower::{PlainRx, PlainTx, RxFrame};
+use crate::lower::{PlainRx, PlainTx};
 use crate::tx::WsTx;
 use crate::utf8::Utf8;
 
@@ -511,8 +511,8 @@ impl<R: PlainRx> WsRx<R> {
     }
 
     /// Hand the next frame to the lower layer. Call after `recv` returned `Ok(None)`.
-    pub fn push(&mut self, f: R::Frame, tx: &mut R::Tx) -> Result<(), R::Error> {
-        self.lower.push(f, tx)
+    pub fn push(&mut self, f: R::Frame) {
+        self.lower.push(f)
     }
 
     /// The next complete message, or `None` when a `push` is needed. Control
@@ -520,26 +520,22 @@ impl<R: PlainRx> WsRx<R> {
     /// a valid close ends the connection with [`WsError::Closed`].
     ///
     /// The message borrows `self`, so no further `recv` runs while it is held.
-    pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_, R>>, WsError<R::Error>> {
+    pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_>>, WsError<R::Error>> {
         let at = match self.ready.take() {
             Some(at) => Some(at),
             None => self.next(tx)?,
         };
-        Ok(at.map(|at| Message { rx: self, at }))
-    }
-
-    /// [`push`](Self::push) for a lower layer that receives through the send
-    /// half's connection (TLS).
-    pub fn push_via<L: PlainTx>(&mut self, f: R::Frame, tx: &mut WsTx<L>) -> Result<(), R::Error>
-    where
-        R: PlainRx<Tx = L>,
-    {
-        self.push(f, tx.lower_mut())
+        let rx: &WsRx<R> = self;
+        Ok(at.map(|at| Message {
+            kind: at.kind,
+            bytes: if at.direct { &rx.lower.current()[..at.len] } else { &rx.core.scratch[..at.len] },
+            rx_timestamp: at.stamp,
+        }))
     }
 
     /// [`recv`](Self::recv) for a lower layer that receives through the send
     /// half's connection (TLS).
-    pub fn recv_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<Option<Message<'_, R>>, WsError<R::Error>>
+    pub fn recv_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<Option<Message<'_>>, WsError<R::Error>>
     where
         R: PlainRx<Tx = L>,
     {
@@ -603,93 +599,54 @@ impl<R: PlainRx> WsRx<R> {
     }
 }
 
-/// A received message, borrowing either the lower layer's run (direct) or
-/// the receive scratch.
-pub struct Message<'r, R: PlainRx> {
-    rx: &'r mut WsRx<R>,
-    at: Located,
+/// A received message, borrowing either the lower layer's run (direct) or the receive scratch.
+/// It borrows the receive half, so no further `recv` runs while it is held.
+pub struct Message<'r> {
+    kind: Kind,
+    bytes: &'r [u8],
+    rx_timestamp: u64,
 }
 
-impl<'r, R: PlainRx> Message<'r, R> {
+impl Message<'_> {
     pub fn kind(&self) -> Kind {
-        self.at.kind
+        self.kind
     }
 
     pub fn bytes(&self) -> &[u8] {
-        if self.at.direct {
-            &self.rx.lower.current()[..self.at.len]
-        } else {
-            &self.rx.core.scratch[..self.at.len]
-        }
+        self.bytes
     }
 
-    /// `Some` iff text.
+    /// `Some` iff text; no second pass over the bytes.
     pub fn text(&self) -> Option<&str> {
-        text(self.at.kind, self.bytes())
+        match self.kind {
+            Kind::Text => {
+                debug_assert!(core::str::from_utf8(self.bytes).is_ok(), "validated text changed");
+                // SAFETY: a Text message's bytes were validated as UTF-8 on receipt
+                // (`Core::step`: `from_utf8` over a direct payload, `Utf8::feed` and `finish`
+                // over scratch), and these are those bytes: scratch is written only by a later
+                // `recv`, which this message's borrow of the receive half rules out, and a
+                // direct payload is read through `PlainRx::current`, which returns exactly the
+                // bytes it handed out, unchanged, until the next `chunk` or `push` (the same
+                // borrow rules those out; `TlsRx::current` documents it for sheath).
+                Some(unsafe { core::str::from_utf8_unchecked(self.bytes) })
+            }
+            Kind::Binary => None,
+        }
     }
 
     /// Stamp of the frame holding the message's first byte.
     pub fn rx_timestamp(&self) -> u64 {
-        self.at.stamp
-    }
-
-    /// Move the frame holding the message out. Gives the message back when it
-    /// does not lie inside one frame.
-    pub fn take(self) -> Result<Taken<R::Frame>, Message<'r, R>> {
-        if !self.at.direct {
-            return Err(self);
-        }
-        match self.rx.lower.take_frame(self.at.len) {
-            Some((frame, start)) => {
-                self.rx.pending = 0;
-                Ok(Taken { frame, start, len: self.at.len, kind: self.at.kind, stamp: self.at.stamp })
-            }
-            None => Err(self),
-        }
+        self.rx_timestamp
     }
 }
 
-/// A message together with the frame that holds it.
-#[derive(Debug)]
-pub struct Taken<F> {
-    frame: F,
-    start: usize,
-    len: usize,
-    kind: Kind,
-    stamp: u64,
-}
-
-impl<F: RxFrame> Taken<F> {
-    pub fn bytes(&self) -> &[u8] {
-        &self.frame.payload()[self.start..self.start + self.len]
-    }
-
-    pub fn text(&self) -> Option<&str> {
-        text(self.kind, self.bytes())
-    }
-
-    pub fn rx_timestamp(&self) -> u64 {
-        self.stamp
-    }
-
-    pub fn into_frame(self) -> F {
-        self.frame
-    }
-}
-
-/// The payload was validated on receipt. Checking again keeps this safe code:
-/// direct bytes are re-read through the lower layer.
-fn text(kind: Kind, b: &[u8]) -> Option<&str> {
-    match kind {
-        Kind::Text => Some(core::str::from_utf8(b).expect("lower layer changed validated text")),
-        Kind::Binary => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
+    use sheath::RxFrame;
+
     use super::*;
-    use crate::Raw;
+    use crate::raw::Raw;
 
     struct F(Vec<u8>);
 
@@ -710,6 +667,29 @@ mod tests {
         [&[b0, payload.len() as u8][..], payload].concat()
     }
 
+    /// `text()` gives back the validated payload without checking it again: a direct message
+    /// (read through the lower layer) and one assembled in scratch, both with multibyte text.
+    /// The check is `text()`'s debug_assert, which re-validates in every test build. relay is
+    /// not in `make miri`; by hand, `cargo +nightly miri test -p relay --lib` runs this too.
+    #[test]
+    fn text_is_the_payload_validated_on_receipt() {
+        let t = "a€𝄞b";
+        let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client));
+        rx.push(F(frame(0x81, t.as_bytes())));
+        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), Some(t));
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        let wire = frame(0x81, t.as_bytes());
+        rx.push(F(wire[..5].to_vec()));
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        rx.push(F(wire[5..].to_vec()));
+        let m = rx.recv(&mut ()).unwrap().unwrap();
+        assert_eq!(m.text(), Some(t));
+        assert!(!m.bytes().is_empty());
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        rx.push(F(frame(0x82, &[0xff])));
+        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), None);
+    }
+
     /// Doubling would pass `max_message`; capacity stops at it.
     #[test]
     fn scratch_capacity_never_exceeds_max_message() {
@@ -722,7 +702,7 @@ mod tests {
                 9 => 0x80,
                 _ => 0,
             };
-            rx.push(F(frame(b0, &[i; 100])), &mut ()).unwrap();
+            rx.push(F(frame(b0, &[i; 100])));
             let got = rx.recv(&mut ()).unwrap().map(|m| m.bytes().len());
             assert_eq!(got, (i == 9).then_some(1000));
             assert!(rx.core.scratch.capacity() <= 1000, "{}", rx.core.scratch.capacity());
@@ -735,10 +715,10 @@ mod tests {
         let mut wire = vec![0x82, 126];
         wire.extend_from_slice(&1000u16.to_be_bytes());
         wire.extend_from_slice(&[7; 1000]);
-        rx.push(F(wire[..10].to_vec()), &mut ()).unwrap();
+        rx.push(F(wire[..10].to_vec()));
         assert!(rx.recv(&mut ()).unwrap().is_none());
         assert_eq!(rx.core.scratch.capacity(), 1000);
-        rx.push(F(wire[10..].to_vec()), &mut ()).unwrap();
+        rx.push(F(wire[10..].to_vec()));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes(), &[7; 1000][..]);
     }
 }

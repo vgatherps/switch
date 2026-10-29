@@ -5,9 +5,16 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Module `testkit`: a Net on a net_tap Port for Docker tests and drivers against kernel peers.
+testkit = ["dep:zhida-test-kit", "dep:zhida-buffer", "dep:zhida-dpdk-sys"]
+
 [dependencies]
 dpdk-smoltcp.workspace = true
 switch.workspace = true
+zhida-test-kit = { workspace = true, optional = true }
+zhida-buffer = { workspace = true, optional = true }
+zhida-dpdk-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 zhida-test-kit.workspace = true

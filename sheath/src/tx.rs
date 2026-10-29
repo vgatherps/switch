@@ -1,9 +1,8 @@
-use relay::{PlainTx, TxFrame};
 use rustls::ProtocolVersion;
 use rustls::client::{ClientConnectionData, UnbufferedClientConnection};
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus, WriteTraffic};
 
-use crate::{Error, TxError, encode_into};
+use crate::{Error, FrameTx, TxError, TxFrame, encode_into};
 
 /// A TLS 1.3 record's header, in front of the plaintext.
 const RECORD_HEAD: usize = 5;
@@ -18,13 +17,13 @@ const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
 
 /// A frame holding records that used sequence numbers. Only [`TlsTx`] makes one, and only
-/// [`TlsTx::try_send`](PlainTx::try_send) takes one, so a frame that was not sealed cannot be
+/// [`TlsTx::try_send`](FrameTx::try_send) takes one, so a frame that was not sealed cannot be
 /// sent in place of the sealed one:
 ///
 /// ```compile_fail,E0308
-/// # use relay::PlainTx;
-/// fn send_unsealed<L: PlainTx>(tx: &mut sheath::TlsTx<L>) {
-///     let f = tx.alloc().ok().unwrap();
+/// # use sheath::FrameTx;
+/// async fn send_unsealed<L: FrameTx>(tx: &mut sheath::TlsTx<L>) {
+///     let f = tx.alloc().await.ok().unwrap();
 ///     let _ = tx.try_send(f);
 /// }
 /// ```
@@ -39,7 +38,8 @@ enum State {
     Broken,
 }
 
-/// Send half of a TLS 1.3 client connection, relay's [`PlainTx`]; owns the rustls connection.
+/// Send half of a TLS 1.3 client connection, a [`FrameTx`] over the frame sender `L`; owns the
+/// rustls connection.
 ///
 /// One [`Sealed`] frame at a time: the one from `seal`, `take_pending` or
 /// [`TlsTx::close_notify`] must be accepted by `try_send` (offered again while it is handed
@@ -61,7 +61,7 @@ pub struct TlsTx<L> {
     in_flight: bool,
 }
 
-impl<L: PlainTx> TlsTx<L> {
+impl<L: FrameTx> TlsTx<L> {
     /// `conn` must have completed a TLS 1.3 handshake. Panics if `lower`'s frames cannot carry
     /// a record with one byte of plaintext.
     pub fn new(conn: UnbufferedClientConnection, lower: L) -> Self {
@@ -155,7 +155,9 @@ impl<L: PlainTx> TlsTx<L> {
             State::Received(e) => return Err(TxError::Received(e.clone())),
             State::Broken => return Err(TxError::Broken),
         }
-        self.collect();
+        // what rustls queued is already in `pending`: each later call into rustls (the receive
+        // step, `finish`, `take_pending`) ends with a collect, and rustls hands out queued
+        // records before WriteTraffic, so a connection past its handshake starts with none
         assert!(
             self.pending.is_empty(),
             "rustls queued a record while the connection is healthy; send it with take_pending first"
@@ -184,9 +186,36 @@ impl<L: PlainTx> TlsTx<L> {
             }
         }
     }
+
+    /// Records rustls queued itself, the alert after a receive error. Gathered at the end of
+    /// every receive step and every seal, so this never misses one.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Writes the records rustls queued itself into `f`; `Ok(None)`, dropping `f`, if there
+    /// are none.
+    pub fn take_pending(
+        &mut self,
+        mut f: L::Frame,
+    ) -> Result<Option<Sealed<L::Sealed>>, TxError<L::Error>> {
+        self.check_sent();
+        if matches!(self.state, State::Broken) {
+            return Err(TxError::Broken);
+        }
+        self.collect();
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let (head, room) = self.lower.plain();
+        let n = self.pending.len().min(room);
+        f.room_mut()[head..head + n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        self.finish(f, n).map(Some)
+    }
 }
 
-impl<L: PlainTx> PlainTx for TlsTx<L> {
+impl<L: FrameTx> FrameTx for TlsTx<L> {
     type Frame = L::Frame;
     type Sealed = Sealed<L::Sealed>;
     type Error = TxError<L::Error>;
@@ -230,40 +259,12 @@ impl<L: PlainTx> PlainTx for TlsTx<L> {
         self.finish(f, encrypted?)
     }
 
-    /// Records rustls queued itself, the alert after a receive error. Gathered at the end of
-    /// every receive step and every seal, so this never misses one.
-    fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
-    }
-
-    /// close_notify, through [`TlsTx::close_notify`].
-    fn seal_close(&mut self, f: L::Frame) -> Result<Option<Self::Sealed>, Self::Error> {
-        self.close_notify(f).map(Some)
-    }
-
-    fn take_pending(&mut self, mut f: L::Frame) -> Result<Option<Self::Sealed>, Self::Error> {
-        self.check_sent();
-        if matches!(self.state, State::Broken) {
-            return Err(TxError::Broken);
-        }
-        self.collect();
-        if self.pending.is_empty() {
-            return Ok(None);
-        }
-        let (head, room) = self.lower.plain();
-        let n = self.pending.len().min(room);
-        f.room_mut()[head..head + n].copy_from_slice(&self.pending[..n]);
-        self.pending.drain(..n);
-        self.finish(f, n).map(Some)
-    }
-
     fn try_send(&mut self, f: Self::Sealed) -> Result<(), Self::Sealed> {
         self.lower.try_send(f.0).map_err(Sealed)?;
         self.in_flight = false;
         Ok(())
     }
 
-    /// Ends the transport below, after close_notify (`seal_close`).
     fn shutdown(&mut self) {
         self.lower.shutdown();
     }

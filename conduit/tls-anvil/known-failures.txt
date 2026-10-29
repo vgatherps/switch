@@ -1,0 +1,26 @@
+# TLS-Anvil client tests that fail against sheath for reasons outside sheath (make docker-tls-anvil).
+# <test id> <test>: <reason>. tls-anvil/compare.py fails the run on any failing test not listed here.
+# Baseline: TLS-Anvil 1.5.3 image (pinned in the Makefile), strength 1, rustls 0.23.43 + ring.
+#
+# ring verifies RSA keys of 2048-8192 bits only: the cases with a 1024-bit RSA server key fail.
+8446-BSsVDoM82Z RecordProtocol.sendZeroLengthApplicationRecord: RSA-1024 server key rejected by ring
+8446-b7XLVJA8Pn NewSessionTicket.ignoresUnknownNewSessionTicketExtension: RSA-1024 server key rejected by ring
+8446-i9pq4Yt8pz RecordProtocol.acceptsOptionalPadding: RSA-1024 server key rejected by ring
+8446-jVohiUKi4u HappyFlow.happyFlow: RSA-1024 server key rejected by ring
+8701-91tcbyhyNk ServerInitiatedExtensionPoints.advertiseGreaseExtensionsInSessionTicket: RSA-1024 server key rejected by ring
+8446-oysw9PbeiT SupportedVersions.invalidLegacyVersion: RSA-1024 server key rejected by ring; and our alert arrives, then our RST (we close with the server's data unread, as Linux close() does) fails TLS-Anvil's own send (seen on the wire)
+#
+# rustls sends its KeyUpdate reply only in front of the next application data record
+# (RFC 8446 4.6.3 allows that); TLS-Anvil expects it at once.
+8446-J6tVdjJCzF KeyUpdate.respondsWithValidKeyUpdate: KeyUpdate reply deferred by rustls to the next app data
+8446-fFh7mHrXow KeyUpdate.appDataUnderNewKeysSucceeds: KeyUpdate reply deferred by rustls to the next app data
+#
+# rustls deviations from RFC 8446 MUSTs (upstream).
+8446-zgsrCx4EDP ServerHello.testSessionId: rustls does not check ServerHello legacy_session_id_echo in TLS 1.3 (4.1.3)
+8446-t4AtKzmU9J PreSharedKeyExchangeModes.sendPSKModeExtension: rustls accepts psk_key_exchange_modes in ServerHello (4.2)
+XSM-2iKDTUhXF5 StateMachine.sendHandshakeTrafficSecretEncryptedChangeCipherSpec: rustls drops an encrypted CCS instead of aborting (5)
+8446-cM4fvnBMce Certificate.emptyCertificateList: rustls rejects an empty server Certificate without an alert (4.4.2.4 decode_error)
+8446-EmE5eWBxE7 RecordProtocol.sendEncryptedHandshakeRecordWithNoNonZeroOctet: rustls rejects all-zero inner plaintext without an alert (5.4)
+#
+# rustls accepts a zero-length handshake record (up to 32 consecutive empty fragments).
+8446-2R6GNvoUEs RecordLayer.zeroLengthRecord_Finished: zero-length handshake record before Finished accepted by rustls

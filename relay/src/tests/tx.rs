@@ -3,17 +3,14 @@
 //! control frames. Futures are polled with a no-op waker; the mock lower
 //! layer is ready at once unless a test withholds its room.
 
-mod common;
-
 use std::cell::RefCell;
 use std::convert::Infallible;
 use std::io::Cursor;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::task::Poll;
 
-use common::*;
-use relay::{Kind, PlainTx, Role, TxError, TxFrame, WsError, WsTx};
+use super::*;
 use tungstenite::Message as TMessage;
 use tungstenite::protocol::{Role as TRole, WebSocket};
 
@@ -79,7 +76,7 @@ impl MockTx {
     }
 }
 
-impl PlainTx for MockTx {
+impl FrameTx for MockTx {
     type Frame = MockFrame;
     type Sealed = MockSealed;
     type Error = Infallible;
@@ -109,29 +106,6 @@ impl PlainTx for MockTx {
         Ok(self.sealed(f, len))
     }
 
-    fn has_pending(&self) -> bool {
-        !self.log.borrow().pending.is_empty()
-    }
-
-    fn take_pending(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Infallible> {
-        let record = {
-            let mut log = self.log.borrow_mut();
-            log.take_pending_calls += 1;
-            if log.pending.is_empty() {
-                return Ok(None);
-            }
-            log.pending.remove(0)
-        };
-        f.buf[HEAD..HEAD + record.len()].copy_from_slice(&record);
-        Ok(Some(self.sealed(f, record.len())))
-    }
-
-    /// A TLS-like close record.
-    fn seal_close(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Infallible> {
-        f.buf[HEAD..HEAD + CLOSE_RECORD.len()].copy_from_slice(CLOSE_RECORD);
-        Ok(Some(self.sealed(f, CLOSE_RECORD.len())))
-    }
-
     fn try_send(&mut self, s: MockSealed) -> Result<(), MockSealed> {
         let mut log = self.log.borrow_mut();
         if log.refuse > 0 {
@@ -157,22 +131,34 @@ impl PlainTx for MockTx {
     }
 }
 
+impl PlainTx for MockTx {
+    fn has_pending(&self) -> bool {
+        !self.log.borrow().pending.is_empty()
+    }
+
+    fn take_pending(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Infallible> {
+        let record = {
+            let mut log = self.log.borrow_mut();
+            log.take_pending_calls += 1;
+            if log.pending.is_empty() {
+                return Ok(None);
+            }
+            log.pending.remove(0)
+        };
+        f.buf[HEAD..HEAD + record.len()].copy_from_slice(&record);
+        Ok(Some(self.sealed(f, record.len())))
+    }
+
+    /// A TLS-like close record.
+    fn seal_close(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Infallible> {
+        f.buf[HEAD..HEAD + CLOSE_RECORD.len()].copy_from_slice(CLOSE_RECORD);
+        Ok(Some(self.sealed(f, CLOSE_RECORD.len())))
+    }
+}
+
 fn tx(role: Role, room: usize) -> (WsTx<MockTx>, Rc<RefCell<Log>>) {
     let log = Rc::new(RefCell::new(Log::default()));
     (WsTx::new(MockTx { room, log: log.clone() }, role), log)
-}
-
-/// Polls `f` once.
-fn poll<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
-    f.poll(&mut Context::from_waker(Waker::noop()))
-}
-
-/// `f`'s output; panics if it is not ready on the first poll.
-fn ready<F: Future>(f: F) -> F::Output {
-    match poll(pin!(f)) {
-        Poll::Ready(out) => out,
-        Poll::Pending => panic!("future pending though the mock has room"),
-    }
 }
 
 fn peer(role: Role) -> Role {
@@ -393,7 +379,7 @@ fn pong_goes_between_fragments() {
 fn ping_is_answered_with_its_payload() {
     let (mut t, log) = tx(Role::Client, 1430);
     let mut r = rx(Role::Client);
-    r.push(VecFrame { data: encode(fin(PING), None, b"hb"), stamp: 0 }, &mut ()).unwrap();
+    r.push(VecFrame { data: encode(fin(PING), None, b"hb"), stamp: 0 });
     assert!(r.recv(&mut ()).unwrap().is_none());
     if let Some(p) = r.take_pong() {
         t.pong(p);
@@ -408,7 +394,7 @@ fn close_is_echoed_and_ends_sending() {
     let (mut t, log) = tx(Role::Server, 1430);
     let mut r = rx(Role::Server);
     let close = [&1001u16.to_be_bytes()[..], b"bye"].concat();
-    r.push(VecFrame { data: encode(fin(CLOSE), Some([1, 2, 3, 4]), &close), stamp: 0 }, &mut ()).unwrap();
+    r.push(VecFrame { data: encode(fin(CLOSE), Some([1, 2, 3, 4]), &close), stamp: 0 });
     assert!(matches!(r.recv(&mut ()), Err(WsError::Closed)));
     t.pong(b"first");
     t.close(r.peer_close().unwrap());

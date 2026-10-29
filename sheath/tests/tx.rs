@@ -9,7 +9,7 @@ mod common;
 use std::sync::LazyLock;
 
 use common::*;
-use relay::{PlainRx, PlainTx, TxFrame};
+use sheath::{FrameTx, TxFrame};
 use rustls::client::UnbufferedClientConnection;
 use rustls::crypto::ring::{cipher_suite, default_provider};
 use rustls::crypto::{CipherSuiteCommon, CryptoProvider};
@@ -361,7 +361,7 @@ fn sealing_while_a_handshake_message_is_half_received() {
         data: stream.bytes[..cut].to_vec(),
         stamp: 0,
     };
-    rx.push(first, &mut peer.tx).unwrap();
+    rx.push(first);
     assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
 
     assert_eq!(seal_and_send(&mut peer, b"mid"), RECORD + 3);
@@ -372,7 +372,7 @@ fn sealing_while_a_handshake_message_is_half_received() {
         data: stream.bytes[cut..].to_vec(),
         stamp: 1,
     };
-    rx.push(rest, &mut peer.tx).unwrap();
+    rx.push(rest);
     let chunk = rx.chunk(&mut peer.tx).unwrap().unwrap();
     assert_eq!(chunk.bytes, b"after the ticket");
     let n = chunk.bytes.len();

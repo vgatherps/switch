@@ -1,15 +1,16 @@
-//! TLS 1.3 client over TCP frames, on rustls's unbuffered client, as relay's lower layer.
+//! TLS 1.3 client over TCP frames, on rustls's unbuffered client.
 //!
-//! [`TlsRx`] ([`relay::PlainRx`]) hands each received frame's bytes to rustls, which decrypts
-//! records in place: a record lying wholly inside one frame is returned as a slice of that
-//! frame. Only a record straddling frames is copied, into one reusable scratch buffer, and
-//! decrypted there. Decryption is lazy: one record per run.
+//! [`TlsRx`] hands each received frame's bytes to rustls, which decrypts records in place: a
+//! record lying wholly inside one frame is returned as a slice of that frame. Only a record
+//! straddling frames is copied, into one reusable scratch buffer, and decrypted there.
+//! Decryption is lazy: one record per run.
 //!
-//! [`TlsTx`] ([`relay::PlainTx`]) owns the rustls connection and seals each frame's plaintext
-//! into one record in that frame, on top of a lower `PlainTx` that sends frames as they are.
+//! [`TlsTx`] owns the rustls connection and seals each frame's plaintext into one record in
+//! that frame, on top of a lower [`FrameTx`] that sends frames as they are; it is a
+//! [`FrameTx`] itself.
 //!
-//! Feature `switchnet`: module `switchnet`, a wss client (TLS handshake, WebSocket upgrade,
-//! relay messages) over switchnet TCP.
+//! Feature `switchnet`: module `switchnet`, TLS over switchnet TCP (handshake, then the two
+//! halves), with switchnet's frames as [`RxFrame`]/[`TxFrame`].
 
 use std::fmt;
 
@@ -23,6 +24,53 @@ pub mod switchnet;
 
 pub use rx::TlsRx;
 pub use tx::{Sealed, TlsTx};
+
+/// A received TCP segment's payload with its hardware RX timestamp.
+pub trait RxFrame {
+    fn payload(&self) -> &[u8];
+    fn payload_mut(&mut self) -> &mut [u8];
+    fn rx_timestamp(&self) -> u64;
+}
+
+/// One run of received plaintext: a record's, from where the last run was consumed.
+pub struct Chunk<'a> {
+    /// Never empty.
+    pub bytes: &'a mut [u8],
+    /// Stamp of the frame holding the record's first byte.
+    pub rx_timestamp: u64,
+}
+
+/// A frame buffer to fill and send.
+pub trait TxFrame {
+    /// The whole writable room of the frame.
+    fn room_mut(&mut self) -> &mut [u8];
+}
+
+/// A sender of frames: raw TCP below [`TlsTx`], and [`TlsTx`] itself.
+pub trait FrameTx {
+    type Frame: TxFrame;
+    /// A frame whose bytes are final. Only `seal` makes one and only `try_send` takes one, so
+    /// an unsealed frame cannot be sent.
+    type Sealed;
+    type Error;
+
+    /// A new, empty frame, once one is free.
+    fn alloc(&mut self) -> impl Future<Output = Result<Self::Frame, Self::Error>>;
+    /// Resolves once a sealed frame carrying `len` plaintext bytes can be sent: `try_send` of
+    /// it then succeeds until the transport runs again. `Err` once it can no longer send.
+    fn room(&mut self, len: usize) -> impl Future<Output = Result<(), Self::Error>>;
+    /// `(head, room)`: plaintext starts at `room_mut()[head]`, and one frame carries at most
+    /// `room` plaintext bytes.
+    fn plain(&self) -> (usize, usize);
+    /// Turns the plaintext `room_mut()[head..head + len]` into the bytes to send (TLS: one
+    /// record; raw: sets the length). Under TLS this consumes a sequence number, so the sealed
+    /// frame must then be sent, never dropped.
+    fn seal(&mut self, f: Self::Frame, len: usize) -> Result<Self::Sealed, Self::Error>;
+    /// Sends now, or hands the sealed frame back unchanged when there is no room.
+    fn try_send(&mut self, s: Self::Sealed) -> Result<(), Self::Sealed>;
+    /// Ends the transport after the frames sent (TCP FIN). Receiving goes on.
+    fn shutdown(&mut self);
+}
 
 /// A receive error.
 #[derive(Clone, Debug, PartialEq)]

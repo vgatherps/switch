@@ -5,13 +5,43 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# The clients over switchnet TCP (module `switchnet`): ws:// and wss:// through sheath.
+switchnet = ["dep:switchnet", "dep:switch", "dep:rustls", "sheath/switchnet"]
+
 [dependencies]
-# Client-role frame masks (RFC 6455 §5.3): per-connection CSPRNG.
+# Client-role frame masks (RFC 6455 §5.3) and Sec-WebSocket-Key: per-connection CSPRNG.
 rand = "0.10"
+# The TLS lower layer (TlsRx/TlsTx) and the frame traits.
+sheath.workspace = true
+# The WebSocket upgrade (rare path): HTTP response parse, Sec-WebSocket-Accept check.
+httparse = "1.10"
+sha1 = "0.11"
+data-encoding = "2.11"
+rustls = { version = "=0.23.43", default-features = false, features = ["std"], optional = true }
+switchnet = { workspace = true, optional = true }
+# yield_now: a failed connection lets the Net send its alert before the socket is dropped.
+switch = { workspace = true, optional = true }
 
 [dev-dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 tungstenite.workspace = true
 trybuild = "1.0"
+
+# The Docker end-to-end tests (`--features switchnet`): DPDK net_tap, Linux only.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
+switchnet = { workspace = true, features = ["testkit"] }
+zhida-test-support.workspace = true
+
+[[test]]
+name = "wss_switchnet"
+required-features = ["switchnet"]
+
+[[test]]
+name = "compile_fail"
+required-features = ["switchnet"]
 
 [lints]
 workspace = true

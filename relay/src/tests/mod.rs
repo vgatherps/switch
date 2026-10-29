@@ -1,9 +1,21 @@
-#![allow(dead_code)]
-
 use std::convert::Infallible;
 use std::ops::Range;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
-use relay::{Config, Kind, Raw, Role, RxFrame, WsError, WsRx};
+pub(crate) use sheath::{FrameTx, RxFrame, TxFrame};
+
+pub(crate) use crate::lower::PlainTx;
+pub(crate) use crate::raw::Raw;
+pub(crate) use crate::rx::{Config, Kind, ProtocolError, Role, WsError, WsRx};
+pub(crate) use crate::tx::{TxError, WsTx};
+
+mod differential;
+mod peer;
+mod rules;
+mod split;
+mod tx;
+mod wss;
 
 pub struct VecFrame {
     pub data: Vec<u8>,
@@ -179,7 +191,7 @@ pub fn drive(rx: &mut Rx, chunks: &[&[u8]]) -> Run {
         let f = VecFrame { data: c.to_vec(), stamp: stamp(i) };
         let p = f.data.as_ptr() as usize;
         frames.push(p..p + f.data.len());
-        rx.push(f, &mut ()).unwrap();
+        rx.push(f);
         loop {
             match rx.recv(&mut ()) {
                 Ok(Some(m)) => {
@@ -265,5 +277,18 @@ impl std::io::Write for Duplex {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Polls `f` once.
+pub fn poll<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    f.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// `f`'s output; panics if it is not ready on the first poll (the lower layer did not wait).
+pub fn ready<F: Future>(f: F) -> F::Output {
+    match poll(pin!(f)) {
+        Poll::Ready(out) => out,
+        Poll::Pending => panic!("future pending though the lower layer has room"),
     }
 }

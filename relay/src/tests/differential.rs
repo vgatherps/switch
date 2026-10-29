@@ -2,12 +2,9 @@
 //! Cursor: same data messages, same newest ping, same ending (clean end,
 //! close code, or failure class).
 
-mod common;
-
 use std::io::Cursor;
 
-use common::*;
-use relay::{Config, Kind, ProtocolError, Raw, Role, WsError, WsRx};
+use super::*;
 use tungstenite::protocol::{Role as TRole, WebSocket, WebSocketConfig};
 use tungstenite::{Error as TError, Message as TMessage};
 

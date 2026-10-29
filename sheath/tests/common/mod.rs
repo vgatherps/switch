@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
-use relay::{PlainRx, PlainTx, RxFrame, TxFrame};
+use sheath::{FrameTx, RxFrame, TxFrame};
 use rustls::client::UnbufferedClientConnection;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::ring::default_provider;
@@ -80,7 +80,7 @@ pub struct TestTx(pub Wire);
 #[derive(Clone, Debug, PartialEq)]
 pub struct SealFailed;
 
-impl PlainTx for TestTx {
+impl FrameTx for TestTx {
     type Frame = TestFrame;
     type Sealed = TestFrame;
     type Error = SealFailed;
@@ -106,18 +106,6 @@ impl PlainTx for TestTx {
         }
         f.len = len;
         Ok(f)
-    }
-
-    fn has_pending(&self) -> bool {
-        false
-    }
-
-    fn take_pending(&mut self, _: TestFrame) -> Result<Option<TestFrame>, SealFailed> {
-        Ok(None)
-    }
-
-    fn seal_close(&mut self, _: TestFrame) -> Result<Option<TestFrame>, SealFailed> {
-        Ok(None)
     }
 
     fn try_send(&mut self, f: TestFrame) -> Result<(), TestFrame> {
@@ -363,10 +351,7 @@ pub fn receive(tx: &mut TlsTx<TestTx>, frames: Vec<Vec<u8>>) -> Received {
             VecFrame {
                 data,
                 stamp: index as u64,
-            },
-            tx,
-        )
-        .unwrap();
+            });
         loop {
             match rx.chunk(tx) {
                 Ok(Some(chunk)) => {

@@ -16,6 +16,9 @@
 //! conduit's frames they stay valid after their socket, the Net and the Stack
 //! are gone. Each held frame occupies its socket's receive budget until it drops.
 
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;

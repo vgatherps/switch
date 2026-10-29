@@ -1,95 +1,41 @@
-//! The wss client (sheath + relay over switchnet TCP, as switch tasks) against a kernel wss
-//! echo server (blocking tungstenite + rustls on a std thread) across net_tap. Needs
+//! The WebSocket clients (relay over switchnet TCP, wss:// through sheath, as switch tasks)
+//! against kernel servers (blocking tungstenite, with rustls for wss) across net_tap. Needs
 //! CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 
-use std::ffi::CStr;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
-use std::os::fd::AsRawFd;
-use std::panic::resume_unwind;
-use std::pin::Pin;
-use std::process::Command;
-use std::rc::Rc;
 use std::cell::{Cell, RefCell};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::fd::AsRawFd;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
-use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
-use dpdk_smoltcp::{
-    DEFAULT_NEIGHBOR_CAPACITY, Offloads, Port, PortConfig, Stack, StackConfig, frame_reserve, rx_reserve,
-};
 use relay::Kind;
+use relay::switchnet::{Error as WssError, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use sheath::switchnet::{Wss, connect};
-use switch::Runtime;
-use switchnet::{IpEndpoint, IpListenEndpoint, Net, NetConfig, tcp};
+use switchnet::testkit::{TapConfig, client_server};
+use switchnet::{NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Error as WsError, Message};
-use zhida_buffer::PoolConfig;
-use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
-use zhida_test_kit::{tap::TapVdev, with_eal};
 
-const VDEV: &CStr = c"net_tap_wss";
-const IFACE: &CStr = c"cdtap_wss";
-const RX_POOL: &CStr = c"wss_rx";
-const TX_POOL: &CStr = c"wss_tx";
-const FRAME_POOL: &CStr = c"wss_frame";
-const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
-const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const SERVER_PORT: u16 = 9443;
-const LOCAL_PORT: u16 = 49152;
 const HOST: &str = "wss.test";
 const PATH: &str = "/echo";
-const MTU: u16 = 1500;
-const INGRESS_BUDGET: usize = 32;
-/// The whole client run, and every server socket read and write.
+/// Every peer socket read and write.
 const LIMIT: Duration = Duration::from_secs(60);
-/// The main loop sleeps this long each round so the server thread, on the same CPU, runs.
-const ROUND_SLEEP: Duration = Duration::from_micros(50);
+
+const TAP: TapConfig = TapConfig {
+    name: "wss",
+    socket: tcp::Config { rx_capacity: 64 * 1024, tx_capacity: 64 * 1024, mss_cap: None },
+    max_sockets: 1,
+    random_seed: 1,
+};
 
 type ServerWs = tungstenite::WebSocket<StreamOwned<ServerConnection, std::net::TcpStream>>;
-
-fn socket() -> tcp::Config {
-    tcp::Config { rx_capacity: 64 * 1024, tx_capacity: 64 * 1024, mss_cap: None }
-}
-
-fn port_config(port_id: u16) -> PortConfig<'static> {
-    let pool = |name, count: usize| PoolConfig {
-        name,
-        count: u32::try_from(count).unwrap(),
-        cache_size: 8,
-        data_room_size: RTE_PKTMBUF_HEADROOM as u16 + 2048,
-        socket_id: -1,
-    };
-    PortConfig {
-        port_id,
-        mtu: MTU,
-        rx_descriptors: 16,
-        tx_descriptors: 16,
-        rx_burst: 32,
-        tx_burst: 32,
-        queue_socket: -1,
-        rx_pool: pool(RX_POOL, rx_reserve(16, 32, 8) + tcp::rx_mbuf_budget(&socket(), MTU.into())),
-        tx_pool: pool(TX_POOL, 127),
-        frame_pool: pool(FRAME_POOL, frame_reserve(16, 32) + tcp::tx_mbuf_budget(&socket(), MTU.into())),
-        offloads: Offloads::default(),
-    }
-}
-
-fn add_address(addr: Ipv4Addr, prefix: u8) {
-    let cidr = format!("{addr}/{prefix}");
-    let output = Command::new("ip")
-        .args(["address", "add", &cidr, "dev", IFACE.to_str().unwrap()])
-        .output()
-        .expect("run ip address add");
-    assert!(output.status.success(), "ip address add {cidr}: {}", String::from_utf8_lossy(&output.stderr));
-}
 
 fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let rcgen::CertifiedKey { cert, signing_key } =
@@ -114,14 +60,6 @@ fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
 
 type Tls = StreamOwned<ServerConnection, std::net::TcpStream>;
 
-/// Accepts one connection; the TLS handshake runs on its first read.
-fn accept(listener: TcpListener, config: Arc<ServerConfig>) -> Tls {
-    let (stream, _) = listener.accept().expect("accept the client");
-    stream.set_read_timeout(Some(LIMIT)).unwrap();
-    stream.set_write_timeout(Some(LIMIT)).unwrap();
-    StreamOwned::new(ServerConnection::new(config).unwrap(), stream)
-}
-
 /// The WebSocket upgrade, server side; checks the client's path and Host.
 fn upgrade(tls: Tls) -> ServerWs {
     tungstenite::accept_hdr(tls, |request: &tungstenite::handshake::server::Request, response| {
@@ -141,85 +79,42 @@ fn assert_close_notify_then_fin(ws: ServerWs) {
     assert_eq!(tls.sock.read(&mut byte).expect("TCP end of stream"), 0);
 }
 
-#[switch::task]
-fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-    future
+/// One client against one kernel peer (see `client_server`), with the TLS configs the peer
+/// and the client use.
+fn run<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
+    listener_setup: impl FnOnce(&TcpListener),
+    serve: impl FnOnce(std::net::TcpStream, Arc<ServerConfig>) -> T + Send + 'static,
+    client: impl FnOnce(NetHandle, TcpStream, Arc<ClientConfig>) -> F + 'static,
+    each_round: impl FnMut(),
+) -> T {
+    let (server_tls, client_tls) = tls_configs();
+    client_server(
+        &TAP,
+        SERVER_PORT,
+        listener_setup,
+        move |stream| serve(stream, server_tls),
+        move |handle, stream| client(handle, stream, client_tls),
+        each_round,
+    )
 }
 
-/// One run: a net_tap Stack under a switchnet Net; the kernel server on a thread runs `serve`
-/// on the accepted TLS stream (after `listener_setup` on its listener); `client` runs as a
-/// switch task on the connected `Wss` and hands it back. Turns the Net, calling `each_round`
-/// each time, until the client and the server are both done; the client's `Wss` is dropped
-/// only then, so what the server saw came from the client, not from its sockets closing.
-/// Returns what `serve` returned.
+/// `run` with a TLS server, which runs `serve` on the accepted TLS stream (handshake on its first
+/// read), and a wss client, which runs `client` on the connected `Wss` and hands it back.
 fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
     listener_setup: impl FnOnce(&TcpListener),
     serve: impl FnOnce(Tls) -> T + Send + 'static,
     client: impl FnOnce(Wss) -> F + 'static,
-    mut each_round: impl FnMut(),
+    each_round: impl FnMut(),
 ) -> T {
-    with_eal(|eal| {
-        let tap = TapVdev::new(VDEV, IFACE);
-        // SAFETY: net_tap was just created and this EAL thread alone configures and uses its
-        // Port and packets. The offload-free net_tap profile returns single-segment RX buffers
-        // and frees TX buffers synchronously. The Port closes before the vdev is removed, and
-        // EAL outlives both.
-        let port = unsafe { Port::open(eal, port_config(tap.port_id())) }.expect("open net_tap Port");
-        add_address(KERNEL_ADDR, 24);
-        let listener = TcpListener::bind(SocketAddrV4::new(KERNEL_ADDR, SERVER_PORT)).expect("bind the server");
-        listener_setup(&listener);
-        let (server_tls, client_tls) = tls_configs();
-        let server = thread::spawn(move || serve(accept(listener, server_tls)));
-
-        let config = StackConfig {
-            max_udp_sockets: 0,
-            ethernet: EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
-            ipv4: Ipv4Cidr::new(ZHIDA_ADDR, 24),
-            gateway: None,
-            paths: &[],
-            random_seed: 1,
-            neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-            segments_per_visit: 1,
-            max_sockets: 1,
-            rx_staging: 32,
-            tx_pending: 32,
-        };
-        let start = Instant::now();
-        let now = || StackInstant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
-        let stack = Stack::new(port, config, now()).map_err(|(_, e)| e).expect("create Zhida Stack");
-        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-        let mut rt = Runtime::new(0);
-        let handle = net.handle();
-        let held: Rc<RefCell<Option<Wss>>> = Rc::default();
-        let task_held = held.clone();
-        let task = async move {
-            let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
-            let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
-            let stream = handle.tcp_connect(socket(), remote, local).expect("open TCP").await.expect("TCP connect");
-            let wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
-            *task_held.borrow_mut() = Some(client(wss).await);
-        };
-        rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
-
-        let client_done = || held.borrow().is_some();
-        while !(client_done() && server.is_finished()) {
-            assert!(start.elapsed() < LIMIT, "client done {}, server done {}", client_done(), server.is_finished());
-            net.turn(now()).expect("turn the Net");
-            rt.poll(0).expect("poll the client");
-            each_round();
-            thread::sleep(ROUND_SLEEP);
-        }
-        let saw = match server.join() {
-            Ok(saw) => saw,
-            Err(panic) => resume_unwind(panic),
-        };
-        drop(held.borrow_mut().take());
-        rt.shutdown();
-        let stack = net.into_stack().ok().expect("the client's sockets are gone");
-        stack.into_port().try_close().expect("close the Port with every buffer returned");
-        tap.close();
-        saw
-    })
+    run(
+        listener_setup,
+        |stream, config| serve(StreamOwned::new(ServerConnection::new(config).unwrap(), stream)),
+        |handle, stream, config| async move {
+            let wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            client(wss).await
+        },
+        each_round,
+    )
 }
 
 /// Text of `len` bytes, `seed`-dependent, with multibyte characters.
@@ -243,7 +138,7 @@ fn message_len(i: usize) -> usize {
 }
 
 /// Echoes every data message until the client's close; returns how many.
-fn echo(mut ws: ServerWs) -> usize {
+fn echo<S: Read + Write>(mut ws: tungstenite::WebSocket<S>) -> usize {
     let mut echoed = 0;
     loop {
         match ws.read() {
@@ -254,6 +149,9 @@ fn echo(mut ws: ServerWs) -> usize {
             Ok(Message::Close(_)) => {}
             Ok(other) => panic!("unexpected {other:?}"),
             Err(WsError::ConnectionClosed) => return echoed,
+            // a plain socket's blocking read returns EINTR when a signal arrives; tungstenite
+            // keeps its partial frame, so reading again continues it (rustls retries itself)
+            Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => panic!("server read: {e}"),
         }
     }
@@ -465,6 +363,61 @@ fn sends_wait_for_room_while_the_server_stops_reading() {
     assert_eq!(received, MESSAGES);
 }
 
+/// Bytes the server sends after the record the client rejects: still unread when the client
+/// drops its socket, which then aborts with RST (as Linux `close()` does).
+const TRAILING: usize = 16 * 1024;
+
+/// Everything the client sends until its FIN or RST, given to the server's `conn`; returns the
+/// error the server's rustls saw (the client's alert, if it got out before an RST).
+fn read_alert(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) -> Result<(), rustls::Error> {
+    let mut sent = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => sent.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => panic!("read the client's records: {e}"),
+        }
+    }
+    let mut rest = &sent[..];
+    while !rest.is_empty() {
+        conn.read_tls(&mut rest).expect("buffer the client's records");
+    }
+    conn.process_new_packets().map(|_| ())
+}
+
+const BAD_RECORD_MAC: Result<(), rustls::Error> =
+    Err(rustls::Error::AlertReceived(rustls::AlertDescription::BadRecordMac));
+
+/// A record that fails authentication after the upgrade, with more data behind it: `Wss::recv`
+/// returns the error after the alert went out, so the client may drop the `Wss` at once.
+#[zhida_test_support::pinned_test]
+fn wss_receive_error_sends_the_alert_before_the_rst() {
+    let seen = run(
+        |_| {},
+        |stream, config| {
+            let mut ws = upgrade(StreamOwned::new(ServerConnection::new(config).unwrap(), stream));
+            let tls = ws.get_mut();
+            let mut junk = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+            junk.resize(junk.len() + 32 + TRAILING, 0);
+            tls.sock.write_all(&junk).unwrap();
+            read_alert(&mut tls.conn, &mut tls.sock)
+        },
+        |handle, stream, config| async move {
+            let mut wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            match wss.recv().await {
+                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                Err(e) => panic!("unexpected error {e}"),
+                Ok(_) => panic!("a message from a corrupted record"),
+            }
+        },
+        || {},
+    );
+    assert_eq!(seen, BAD_RECORD_MAC);
+}
+
 /// The server writes its 101 response and a first text frame in one write (one TLS record):
 /// the bytes after the response head reach the client as that message.
 #[zhida_test_support::pinned_test]
@@ -505,4 +458,40 @@ fn message_in_the_same_record_as_the_upgrade_response() {
         || {},
     );
     assert_eq!(echoed, 1);
+}
+
+/// ws:// over plain switchnet TCP: the upgrade (with `Host: host:port`), then text and binary
+/// messages echo byte-exact, and the client's close ends with the server's echo and FIN.
+#[zhida_test_support::pinned_test]
+fn plain_ws_echoes_and_closes() {
+    let echoed = run(
+        |_| {},
+        |stream, _| {
+            let ws = tungstenite::accept_hdr(stream, |request: &tungstenite::handshake::server::Request, response| {
+                assert_eq!(request.uri().path(), PATH);
+                assert_eq!(request.headers()["Host"], format!("{HOST}:{SERVER_PORT}").as_str());
+                Ok(response)
+            })
+            .expect("server WebSocket handshake");
+            echo(ws)
+        },
+        |handle, stream, _| async move {
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            for i in 0..100 {
+                let sent = text(i, message_len(i));
+                ws.send(Kind::Text, sent.as_bytes()).await.expect("send");
+                let m = ws.recv().await.expect("recv").expect("the echo");
+                assert_eq!(m.text(), Some(sent.as_str()), "message {i}");
+            }
+            let big: Vec<u8> = (0..64 * 1024).map(|i| (i * 31 % 251) as u8).collect();
+            ws.send(Kind::Binary, &big).await.expect("send");
+            let m = ws.recv().await.expect("recv").expect("the echo");
+            assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &big[..]));
+            ws.close(1000, "done").await.expect("send close");
+            assert!(ws.recv().await.expect("recv after close").is_none(), "data after close");
+            ws
+        },
+        || {},
+    );
+    assert_eq!(echoed, 101);
 }
