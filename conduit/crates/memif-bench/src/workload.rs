@@ -195,7 +195,6 @@ fn stack(
         ipv4: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, host), 24),
         random_seed,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: conns,
         rx_staging: RX_STAGING,
         tx_pending: tx_pending(conns),

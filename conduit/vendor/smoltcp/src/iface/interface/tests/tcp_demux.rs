@@ -198,7 +198,7 @@ fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
                 } else {
                     #[cfg(feature = "udp-set")]
                     {
-                        let mut udp = crate::iface::UdpSet::new(0);
+                        let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
                         iface.poll_ingress_single_udp(
                             Instant::ZERO, &mut device, &mut sockets, &mut udp,
                         )

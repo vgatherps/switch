@@ -380,9 +380,9 @@ fn into_port_returns_unflushed_frames() {
         fill_tx_ring(&mut pair);
         assert_eq!(pair.a.tcp_mut(&a).send_slice(&data), Ok(data.len()));
         assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 0, tx_pending: 3 }));
-        // The UDP datagrams are TX-pool copies; the three data segments are
-        // frame-pool frames, pending and held by the socket.
-        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (15, 3));
+        // The UDP datagrams are frame-pool copies, as are the three data
+        // segments, pending and held by the socket.
+        assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (0, 18));
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 15);
         assert_eq!((pair.in_use()[0].1, pair.frame_in_use()[0]), (0, 3));
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 0);

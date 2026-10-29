@@ -155,7 +155,6 @@ fn bare_stack(port: Port, host: u8) -> ManuallyDrop<Stack> {
         ipv4: Ipv4Cidr::new(Ipv4Address::new(10, 0, 0, host), 24),
         random_seed: u64::from(host),
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 1,
         rx_staging: 32,
         tx_pending: 32,

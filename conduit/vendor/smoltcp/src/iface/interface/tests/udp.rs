@@ -154,7 +154,8 @@ impl Test {
 
     fn with_config(config: UdpConfig) -> Self {
         let (iface, tcp, device) = setup(Medium::Ethernet);
-        let mut udp = UdpSet::new(1);
+        // Room for the largest datagram `with_path_mtus` allows: 9000 - 28.
+        let mut udp = UdpSet::new(1, crate::tests::tx_test_source(8972));
         let handle = udp.add(config).unwrap();
         Self {
             iface,
@@ -1174,9 +1175,13 @@ fn send_errors_put_nothing_on_the_device() {
         1,
         UdpSendError::NeighborPending,
     );
+    // The neighbor lookup comes before the publish slot: an unroutable destination is
+    // `NoRoute` even with the device full, and only a resolved one reports `WouldBlock`.
     let mut test = Test::new(1);
     test.device.tx_left = Some(0);
-    assert_send_error(&mut test, Some(off_subnet), 1, UdpSendError::WouldBlock);
+    assert_send_error(&mut test, Some(off_subnet), 1, UdpSendError::NoRoute);
+    resolve(&mut test, REMOTE, REMOTE_MAC);
+    assert_send_error(&mut test, Some(peer), 1, UdpSendError::WouldBlock);
 }
 
 #[test]
@@ -1584,7 +1589,7 @@ fn send_ipv4_checksum_follows_device_caps() {
 #[should_panic(expected = "UDP send needs an Ethernet interface")]
 fn send_panics_on_ip_medium() {
     let (mut iface, _, mut device) = setup(Medium::Ip);
-    let mut udp = UdpSet::new(1);
+    let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
     let handle = udp
         .add(UdpConfig {
             port: PORT,
@@ -1918,11 +1923,12 @@ fn udp_frame_refusals_return_frame_and_reserve_only_for_arp() {
     assert_eq!(alloc.live(), 0);
 }
 
-/// A shared frame goes through today's `udp_send` unchanged: the token comes first, so with
-/// the device exhausted an unroutable or rate-limited destination reports `WouldBlock`, where
-/// a unique frame reports `NoRoute` or `NeighborPending`. With a token, an ARP request uses it.
+/// A shared frame is copied and then sent like a unique one: the neighbor lookup comes before
+/// the publish slot, so with the device exhausted an unroutable destination reports `NoRoute`
+/// and a rate-limited one `NeighborPending`, and only a resolved one `WouldBlock`. With a token,
+/// an ARP request uses it. Every refusal returns the shared frame intact.
 #[test]
-fn udp_shared_frame_takes_token_before_lookup() {
+fn udp_shared_frame_looks_up_neighbor_before_token() {
     let alloc = crate::phy::TxPool::new(64);
     let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
     let off_subnet = Some(IpEndpoint::new(IpAddress::v4(10, 0, 0, 1), PEER_PORT));
@@ -1934,17 +1940,25 @@ fn udp_shared_frame_takes_token_before_lookup() {
     assert_eq!(test.device.tx, vec![arp_request(REMOTE)]);
     assert_eq!(test.device.tx_left, Some(0));
     drop(frame);
-    for to in [peer, off_subnet] {
+    for (to, expected) in [
+        (peer, UdpSendError::NeighborPending),
+        (off_subnet, UdpSendError::NoRoute),
+    ] {
         let (frame, error) = frame_refused(send_tx_frame(&mut test, to, kept.clone()));
-        assert_eq!(error, UdpSendError::WouldBlock);
+        assert_eq!(error, expected);
         assert_eq!(frame.payload(), b"kept");
     }
-    let unique = tx_frame(&alloc, b"uniq");
-    let (unique, error) = frame_refused(send_tx_frame(&mut test, peer, unique));
-    assert_eq!(error, UdpSendError::NeighborPending);
-    let (_, error) = frame_refused(send_tx_frame(&mut test, off_subnet, unique));
-    assert_eq!(error, UdpSendError::NoRoute);
+    resolve(&mut test, REMOTE, REMOTE_MAC);
+    let (frame, error) = frame_refused(send_tx_frame(&mut test, peer, kept.clone()));
+    assert_eq!((error, frame.payload()), (UdpSendError::WouldBlock, &b"kept"[..]));
+    drop(frame);
     assert_eq!(test.device.tx, vec![arp_request(REMOTE)]);
+    test.device.tx_left = Some(1);
+    assert_frame_sent(send_tx_frame(&mut test, peer, kept.clone()));
+    assert_eq!(
+        test.device.tx[1..],
+        [send_frame(REMOTE, REMOTE_MAC, b"kept", true)]
+    );
     assert!(kept.unique());
     drop(kept);
     assert_eq!(alloc.live(), 0);

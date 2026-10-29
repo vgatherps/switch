@@ -85,7 +85,6 @@ pub fn with_tap_net<T>(config: &TapConfig, body: impl FnOnce(&mut Net, &Clock) -
             paths: &[],
             random_seed: config.random_seed,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-            segments_per_visit: 1,
             max_sockets: config.max_sockets,
             rx_staging: 32,
             tx_pending: 32,

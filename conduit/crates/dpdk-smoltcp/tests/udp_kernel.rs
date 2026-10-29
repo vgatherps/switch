@@ -95,7 +95,6 @@ fn with_stack_gateway(
         paths: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 1,
         max_udp_sockets: 1,
         rx_staging: BURST,

@@ -127,7 +127,6 @@ fn with_stack<T>(
             paths,
             random_seed: 1,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-            segments_per_visit: 1,
             max_sockets,
             rx_staging: 32,
             tx_pending: 32,

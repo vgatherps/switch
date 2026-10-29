@@ -44,7 +44,6 @@ pub fn sizing() -> Sizing {
         max_udp_sockets: 0,
         rx_staging: 32,
         tx_pending: 32,
-        segments_per_visit: 1,
         neighbor_capacity: 256,
     }
 }
