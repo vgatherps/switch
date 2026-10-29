@@ -6,9 +6,10 @@ Used by `zhida-open` (which turns a `Config` into a running `Stack`) and `nic-ru
 
 ## API
 
-- `Config` and its parts `Device` (`Pci(PciDevice)` or `Vdev`), `PathRule`, `Offloads` (`Auto` or explicit checksum flags), `EalConfig`. `Config::load(path)` rejects unknown fields; `ConfigError` carries the reason. Fields: device, mac, ipv4, gateway, mtu, paths, offloads, rx_timestamps, descriptors, eal.
-- `discover::{discover, discover_aws, ipv4_addresses}`: read the interface's IPv4, MAC, MTU, PCI address and id, kernel driver and NUMA node from the kernel. `discover_aws` also reads ENI facts from IMDSv2 (`imds`).
-- `rediscover::write`: writes a discovered config over an existing file, keeping hand-added path rules.
+- `Config` and its parts `Device` (`Pci(PciDevice)` or `Vdev`), `PathRule`, `Offloads` (`Auto` or explicit checksum flags), `EalConfig`. `Config::load(path)` rejects unknown fields; `ConfigError` carries the reason. Fields: device, mac, ipv4, gateway, owned_ipv4, mtu, paths, offloads, rx_timestamps, descriptors, eal.
+- `owned_ipv4` (optional, default empty, omitted from the JSON when empty): CIDRs the Stack owns besides `ipv4`, single addresses as /32. Each entry must have no host bits set, and no address it covers may be 0.0.0.0, multicast, 255.255.255.255, the gateway or the `ipv4` subnet's broadcast address. On load the list is sorted and duplicates and entries inside another are dropped. Ownership only: `ipv4` keeps routing, the subnet broadcast and the default source. Not yet passed to the Stack by `zhida-open`.
+- `discover::{discover, discover_aws, ipv4_addresses}`: read the interface's IPv4, MAC, MTU, PCI address and id, kernel driver and NUMA node from the kernel. `discover_aws` also reads ENI facts from IMDSv2 (`imds`); `owned_ipv4` is every `local-ipv4s` address as a /32 plus every `ipv4-prefix` block (404: none). The primary `ipv4` is chosen as before.
+- `rediscover::write`: writes a discovered config over an existing file, keeping hand-added path rules. `owned_ipv4` is replaced by the discovered list.
 - `devbind::{bind, unbind}`: move the device between its kernel driver and vfio-pci, with refusals before any write.
 
 ## Binary

@@ -100,6 +100,18 @@ fn metadata_for_mac(
     blocks: &str,
     public: (u16, &str),
 ) -> Server {
+    metadata_with_prefixes(mac, device, local, subnet, blocks, public, (404, ""))
+}
+/// The metadata items `derive` reads, in its order; `prefixes` answers `ipv4-prefix`.
+fn metadata_with_prefixes(
+    mac: &str,
+    device: &str,
+    local: &str,
+    subnet: &str,
+    blocks: &str,
+    public: (u16, &str),
+    prefixes: (u16, &str),
+) -> Server {
     let mut responses = vec![token_response(response(200, "secret"))];
     for (item, status, body) in [
         ("device-number", 200, device),
@@ -107,6 +119,7 @@ fn metadata_for_mac(
         ("subnet-ipv4-cidr-block", 200, subnet),
         ("vpc-ipv4-cidr-blocks", 200, blocks),
         ("public-ipv4s", public.0, public.1),
+        ("ipv4-prefix", prefixes.0, prefixes.1),
     ] {
         responses.push(get_response(
             &format!("network/interfaces/macs/{mac}/{item}"),
@@ -166,7 +179,7 @@ fn imds_put_token_then_get_with_header() {
     let discovered = aws(&tree, &server, &addresses()).unwrap();
     assert_eq!(discovered.config.mac, Some(mac.parse().unwrap()));
     let requests = server.requests.lock().unwrap();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 7);
     assert_eq!(
         requests[0].lines().next(),
         Some("PUT /latest/api/token HTTP/1.1")
@@ -177,6 +190,7 @@ fn imds_put_token_then_get_with_header() {
         "subnet-ipv4-cidr-block",
         "vpc-ipv4-cidr-blocks",
         "public-ipv4s",
+        "ipv4-prefix",
     ]) {
         assert_eq!(
             request.lines().next().unwrap(),
@@ -549,4 +563,124 @@ fn aws_required_items_and_address_selection() {
         aws(&tree, &server, &addresses[..1]).unwrap().config.mtu,
         1400
     );
+}
+
+const MAC: &str = "0a:12:34:56:78:9a";
+fn with_prefixes(prefixes: (u16, &str)) -> Server {
+    metadata_with_prefixes(
+        MAC,
+        "1",
+        "10.0.1.23\n10.0.1.24\n",
+        "10.0.1.0/24",
+        "10.0.0.0/16",
+        (200, "1.2.3.4"),
+        prefixes,
+    )
+}
+fn cidrs(texts: &[&str]) -> Vec<Ipv4Cidr> {
+    texts.iter().map(|t| t.parse().unwrap()).collect()
+}
+
+/// Every local-ipv4s address is owned as a /32 and every delegated prefix as itself, the
+/// selected primary among them; the primary (`ipv4`) is chosen as before.
+#[test]
+fn aws_owns_every_local_ipv4_and_prefix() {
+    let tree = Tree::new();
+    let server = with_prefixes((200, "10.0.1.64/28\n10.0.1.48/28\n"));
+    let config = aws(&tree, &server, &addresses()).unwrap().config;
+    assert_eq!(config.ipv4, addresses()[0]);
+    assert_eq!(
+        config.owned_ipv4,
+        cidrs(&[
+            "10.0.1.23/32",
+            "10.0.1.24/32",
+            "10.0.1.48/28",
+            "10.0.1.64/28"
+        ])
+    );
+    let selected: Vec<Ipv4Cidr> = cidrs(&["10.0.1.23/24", "10.0.1.24/24"]);
+    let server = with_prefixes((200, "10.0.1.48/28\n"));
+    let config = discover_aws(
+        &tree.roots,
+        "eth1",
+        &selected,
+        Some(selected[1].address()),
+        &server.imds,
+    )
+    .unwrap()
+    .config;
+    assert_eq!(config.ipv4, selected[1]);
+    assert_eq!(
+        config.owned_ipv4,
+        cidrs(&["10.0.1.23/32", "10.0.1.24/32", "10.0.1.48/28"])
+    );
+    // local addresses inside a delegated prefix (here both) are owned once, by the prefix
+    let server = with_prefixes((200, "10.0.1.16/28\n"));
+    let config = aws(&tree, &server, &addresses()).unwrap().config;
+    assert_eq!(config.owned_ipv4, cidrs(&["10.0.1.16/28"]));
+}
+
+/// `ipv4-prefix` answering 404, or 200 with no lines, means no prefixes; any other status, an
+/// invalid CIDR or one with host bits set fails discovery.
+#[test]
+fn aws_ipv4_prefix_404_is_none_other_errors_fail() {
+    let tree = Tree::new();
+    for prefixes in [(404, ""), (200, "\n  \n")] {
+        let server = with_prefixes(prefixes);
+        let config = aws(&tree, &server, &addresses()).unwrap().config;
+        assert_eq!(
+            config.owned_ipv4,
+            cidrs(&["10.0.1.23/32", "10.0.1.24/32"]),
+            "{prefixes:?}"
+        );
+    }
+    for (prefixes, message) in [
+        (
+            (500, "error"),
+            format!("IMDS answered 500 for /latest/meta-data/network/interfaces/macs/{MAC}/ipv4-prefix"),
+        ),
+        (
+            (401, ""),
+            format!("IMDS rejected the session token (401) for /latest/meta-data/network/interfaces/macs/{MAC}/ipv4-prefix"),
+        ),
+        ((200, "10.0.1.48"), "IMDS ipv4-prefix has invalid CIDR 10.0.1.48".to_owned()),
+        ((200, "10.0.1.49/28"), "IMDS ipv4-prefix 10.0.1.49/28 has host bits set".to_owned()),
+    ] {
+        let server = with_prefixes(prefixes);
+        assert_eq!(aws(&tree, &server, &addresses()).err().unwrap().to_string(), message);
+    }
+}
+
+/// A delegated prefix holding the subnet's gateway (base + 1) fails the config's ownership rules.
+#[test]
+fn aws_prefix_holding_the_gateway_is_rejected() {
+    let tree = Tree::new();
+    let server = with_prefixes((200, "10.0.1.0/28\n"));
+    let error = aws(&tree, &server, &addresses()).err().unwrap().to_string();
+    assert!(
+        error.contains("owned IPv4 addresses must not include the gateway"),
+        "{error}"
+    );
+}
+
+/// Rediscovery replaces the owned addresses with the current ones and reports the change.
+#[test]
+fn rediscover_replaces_and_reports_owned_ipv4() {
+    let tree = Tree::new();
+    let previous = aws(&tree, &with_prefixes((404, "")), &addresses())
+        .unwrap()
+        .config;
+    let discovered = aws(&tree, &with_prefixes((200, "10.0.1.48/28\n")), &addresses())
+        .unwrap()
+        .config;
+    let path = tree.dir.join("config.json");
+    fs::write(&path, previous.to_json()).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, discovered.clone(), Some(&loaded), &mut output).unwrap();
+    assert_eq!(
+        Config::load(&path).unwrap().owned_ipv4,
+        discovered.owned_ipv4
+    );
+    assert_eq!(String::from_utf8(output).unwrap(), "changed: owned_ipv4\n");
 }

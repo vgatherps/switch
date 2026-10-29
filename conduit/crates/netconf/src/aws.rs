@@ -8,6 +8,8 @@ pub(crate) struct Aws {
     pub(crate) ipv4: Ipv4Cidr,
     pub(crate) gateway: Ipv4Address,
     pub(crate) vpc_blocks: Vec<Ipv4Cidr>,
+    /// Every IMDS `local-ipv4s` address as a /32, then every `ipv4-prefix` block.
+    pub(crate) owned_ipv4: Vec<Ipv4Cidr>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -99,10 +101,18 @@ pub(crate) fn derive(
     } else {
         Vec::new()
     };
+    let mut owned_ipv4: Vec<Ipv4Cidr> = addresses.iter().map(|a| Ipv4Cidr::new(*a, 32)).collect();
+    // 404: the ENI has no delegated prefixes
+    if let Some(prefixes) = get("ipv4-prefix")? {
+        for s in items(&prefixes) {
+            owned_ipv4.push(parse_block(s, "ipv4-prefix")?);
+        }
+    }
     Ok(Aws {
         ipv4,
         gateway,
         vpc_blocks,
+        owned_ipv4,
         warnings,
     })
 }

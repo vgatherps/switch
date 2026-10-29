@@ -53,6 +53,7 @@ pub fn write(
             "mac",
             "ipv4",
             "gateway",
+            "owned_ipv4",
             "mtu",
             "paths",
             "offloads",

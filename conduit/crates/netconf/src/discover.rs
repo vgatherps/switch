@@ -276,6 +276,7 @@ fn build(
         mac: Some(kernel.mac),
         ipv4,
         gateway: aws.as_ref().map(|a| a.gateway).or(kernel.gateway),
+        owned_ipv4: aws.as_ref().map(|a| a.owned_ipv4.clone()).unwrap_or_default(),
         mtu: kernel.mtu,
         paths,
         offloads: Offloads::Auto,
@@ -467,6 +468,7 @@ mod tests {
                 mac: Some("0a:12:34:56:78:9a".parse().unwrap()),
                 ipv4: addresses()[0],
                 gateway: Some("10.0.1.1".parse().unwrap()),
+                owned_ipv4: Vec::new(),
                 mtu: 9001,
                 paths: vec![PathRule {
                     prefix: "0.0.0.0/0".parse().unwrap(),
