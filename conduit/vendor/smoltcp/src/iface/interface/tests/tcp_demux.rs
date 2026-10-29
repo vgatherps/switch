@@ -2467,3 +2467,24 @@ fn identical_exact_listeners_then_all_ip_fallback() {
     assert_eq!(sockets.get(all).local_endpoint(), Some(IpEndpoint::new(owned.into(), LOCAL_PORT)));
     sockets.check_flow_index();
 }
+
+/// A connect given another interface's context, one that owns the source address, still has
+/// its source checked by the interface that dispatches it: A does not own 10.9.0.1, so A's
+/// egress sends nothing from it and resets the socket, as for a removed interface address.
+#[test]
+fn foreign_context_connect_from_an_address_the_dispatcher_does_not_own_is_reset() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut other, _, _) = setup(Medium::Ip);
+    own_prefix(&mut other);
+    let source = Ipv4Address::new(10, 9, 0, 1);
+    let handle = sockets.add(socket());
+    sockets
+        .get_mut(handle)
+        .connect(other.context(), IpEndpoint::new(REMOTE_ADDR.into(), 80), (source, 40000))
+        .unwrap();
+    assert_eq!(sockets.get(handle).state(), tcp::State::SynSent);
+    iface.poll(Instant::ZERO, &mut device, &mut sockets);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
+    assert_eq!(sockets.get(handle).local_endpoint(), None);
+}

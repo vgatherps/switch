@@ -196,8 +196,8 @@ pub struct Config {
     pub neighbor_capacity: usize,
 
     /// Addresses the interface owns besides its own: it answers ARP, ICMP echo, UDP and TCP for
-    /// them. Fixed for the interface's life (sockets record at admission whether their local
-    /// address is in it). It does not route traffic: replies leave toward the peer as for the
+    /// them. Fixed for the interface's life (a connection caches, at its first egress dispatch,
+    /// whether its local address is in it). It does not route traffic: replies leave toward the peer as for the
     /// interface address. Defaults to empty.
     pub owned_ipv4: OwnedIpv4,
 
