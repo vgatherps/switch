@@ -211,12 +211,11 @@ fn arp_and_handshake_a_connects_b_listens() {
 }
 
 #[zhida_test_support::pinned_test]
-fn stack_segments_per_visit_controls_two_connection_order() {
+fn two_connections_interleave_one_segment_per_visit() {
     with_eal(|eal| {
-        for segments_per_visit in [2, 1] {
+        {
             let mut a_config = pair::config(Side::A);
             a_config.max_sockets = 2;
-            a_config.segments_per_visit = segments_per_visit;
             let mut b_config = pair::config(Side::B);
             b_config.max_sockets = 2;
             let mut pair = Pair::new(eal, ["bursta", "burstb"], [a_config, b_config], pair::T0);
@@ -291,12 +290,7 @@ fn stack_segments_per_visit_controls_two_connection_order() {
             }
             let c1 = CLIENT_PORT;
             let c2 = CLIENT_PORT + 1;
-            let expected = if segments_per_visit == 2 {
-                [c1, c1, c2, c2]
-            } else {
-                [c1, c2, c1, c2]
-            };
-            assert_eq!(ports, expected);
+            assert_eq!(ports, [c1, c2, c1, c2]);
             assert_no_drops(&pair);
             assert_eq!(pair.close(), 4);
         }
@@ -399,7 +393,6 @@ fn turn_sends_all_six_segments_in_connection_order() {
     with_eal(|eal| {
         let mut config = pair::config(Side::A);
         config.max_sockets = 2;
-        config.segments_per_visit = 1;
         let mut pair = Pair::new(
             eal,
             ["idle6a", "idle6b"],

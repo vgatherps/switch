@@ -86,7 +86,7 @@ mod tests {
         let tcp = core::array::from_fn(|_| {
             tcp.add(tcp::Socket::test_socket(0, 0))
         });
-        let mut udp = UdpSet::new(3);
+        let mut udp = UdpSet::new(3, crate::tests::tx_test_source(1472));
         let udp = core::array::from_fn(|index| {
             udp.add(UdpConfig {
                 port: u16::try_from(1000 + index).unwrap(),

@@ -154,7 +154,6 @@ pub enum PollIngressSingleResult {
 /// a `&mut [T]`, or `Vec<T>` if a heap is available.
 pub struct Interface {
     pub(crate) inner: InterfaceInner,
-    segments_per_visit: usize,
 }
 
 /// The device independent part of an Ethernet network interface.
@@ -195,10 +194,6 @@ pub struct Config {
     /// How many neighbors the cache holds. Defaults to 256.
     pub neighbor_capacity: usize,
 
-    /// How many segments one egress visit may send to a socket while other sockets are waiting.
-    /// A socket that is alone keeps sending while it is due. Defaults to 1.
-    pub segments_per_visit: usize,
-
     /// Set the Hardware address the interface will use.
     ///
     /// # Panics
@@ -211,7 +206,6 @@ impl Config {
         Config {
             random_seed: 0,
             neighbor_capacity: 256,
-            segments_per_visit: 1,
             hardware_addr,
         }
     }
@@ -223,17 +217,11 @@ impl Interface {
     /// # Panics
     /// This function panics if the configured `hardware_addr` does not match
     /// the medium of the device.
-    /// It also panics if [`Config::neighbor_capacity`] or
-    /// [`Config::segments_per_visit`] is zero.
+    /// It also panics if [`Config::neighbor_capacity`] is zero.
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
         assert!(
             config.neighbor_capacity != 0,
             "Neighbor capacity must be nonzero."
-        );
-
-        assert!(
-            config.segments_per_visit != 0,
-            "Segments per visit must be nonzero."
         );
 
         let caps = device.capabilities();
@@ -261,7 +249,6 @@ impl Interface {
         ];
 
         Interface {
-            segments_per_visit: config.segments_per_visit,
             inner: InterfaceInner {
                 now,
                 caps,
@@ -696,7 +683,6 @@ impl Interface {
                 continue;
             }
 
-            let mut sent = 0usize;
             let mut end_poll_at = None;
             let result = loop {
                 #[cfg(test)]
@@ -836,13 +822,9 @@ impl Interface {
                 if dispatch_result.is_err() || !emitted {
                     break dispatch_result;
                 }
-                sent = sent
-                    .checked_add(1)
-                    .expect("TCP visit segment count overflow");
-                // A lone socket keeps sending; other ready or dirty sockets bound its burst.
-                if !(sockets.ready_len() == 0 && sockets.dirty_list.is_empty())
-                    && sent >= self.segments_per_visit
-                {
+                // A lone socket keeps sending; with other ready or dirty sockets a visit sends
+                // one segment.
+                if sockets.ready_len() != 0 || !sockets.dirty_list.is_empty() {
                     break dispatch_result;
                 }
                 let item = sockets.item_at_mut(index).expect("ready TCP slot is empty");

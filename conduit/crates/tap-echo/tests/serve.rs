@@ -20,7 +20,6 @@ fn serve_returns_time_went_backwards_when_the_stack_starts_ahead_of_the_clock() 
             paths: &[],
             random_seed: 1,
             neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-            segments_per_visit: 1,
             max_sockets: 1,
             rx_staging: 8,
             tx_pending: 8,

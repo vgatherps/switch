@@ -423,7 +423,6 @@ pub fn config(side: Side) -> StackConfig<'static> {
         paths: &[],
         random_seed: 1 + side as u64,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets: 1,
         rx_staging: 32,
         tx_pending: 32,

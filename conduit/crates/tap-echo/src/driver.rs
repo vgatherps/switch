@@ -229,7 +229,6 @@ fn stack_config(max_sockets: usize, gateway: Option<Ipv4Addr>, random_seed: u64)
         paths: &[],
         random_seed,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-        segments_per_visit: 1,
         max_sockets,
         rx_staging: RX_STAGING,
         tx_pending: TX_PENDING,

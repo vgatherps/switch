@@ -51,9 +51,6 @@ pub struct Sizing {
     /// `StackConfig::tx_pending`: frames built but not yet accepted by the
     /// PMD. Also counted in the TX pool and the frame pool.
     pub tx_pending: usize,
-    /// `StackConfig::segments_per_visit`: frames one TCP socket sends in a row
-    /// while other sockets have frames ready.
-    pub segments_per_visit: usize,
     /// `StackConfig::neighbor_capacity`: ARP cache entries.
     /// `dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY` is 256.
     pub neighbor_capacity: usize,
@@ -175,7 +172,6 @@ mod tests {
                     max_udp_sockets: 0,
                     rx_staging: 32,
                     tx_pending: 32,
-                    segments_per_visit: 1,
                     neighbor_capacity: 256,
                 },
             ),
@@ -189,7 +185,6 @@ mod tests {
                     max_udp_sockets: 0,
                     rx_staging: 32,
                     tx_pending: 32,
-                    segments_per_visit: 1,
                     neighbor_capacity: 256,
                 },
             ),
@@ -203,7 +198,6 @@ mod tests {
                     max_udp_sockets: 1,
                     rx_staging: 32,
                     tx_pending: 64,
-                    segments_per_visit: 1,
                     neighbor_capacity: 256,
                 },
             ),

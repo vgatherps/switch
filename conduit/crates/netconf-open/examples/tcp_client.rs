@@ -65,7 +65,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         max_udp_sockets: 0,
         rx_staging: 32,
         tx_pending: 32,
-        segments_per_visit: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     };
 

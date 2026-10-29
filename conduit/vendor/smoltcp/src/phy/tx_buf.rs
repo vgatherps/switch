@@ -417,6 +417,12 @@ impl TxSource {
     }
 }
 
+impl core::fmt::Debug for TxSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("TxSource").field(&self.origin()).finish()
+    }
+}
+
 /// The app's frame. Clone is cheap; after a clone the payload is read-only.
 #[derive(Clone)]
 pub struct TxFrame(TxBuf);
