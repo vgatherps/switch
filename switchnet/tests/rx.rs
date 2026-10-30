@@ -156,7 +156,7 @@ fn accepted_fin_gives_finished() {
         let mut mixed = Mixed::new(eal, ["fina", "finb"]);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"last");
-        mixed.peer.tcp_mut(&peer).close();
+        mixed.peer.close(&peer);
         mixed.until(|m| m.peer.tcp(&peer).state() == State::FinWait2);
         let (frame, error) = recv_twice(&mut mixed, stream);
         assert_eq!(frame.unwrap().payload(), b"last");
