@@ -286,26 +286,21 @@ impl InterfaceInner {
         self.refresh_sender(ipv4_repr, source_hardware_addr);
         // Only a plain SYN retires an acceptable TIME-WAIT tuple for a listener; a SYN+FIN goes
         // to the TIME-WAIT socket, which ACKs it, listener or not.
-        if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none() {
-            while let Some(index) = winner {
-                let socket = &mut sockets
-                    .item_at_mut(index)
-                    .expect("TCP flow index contains an empty slot")
-                    .socket;
-                if !socket.time_wait_accepts_syn(&tcp_repr)
-                    || sockets.tcp_listener_lookup(dst).is_none()
-                {
-                    break;
-                }
-                sockets
-                    .item_at_mut(index)
-                    .expect("TCP flow index contains an empty slot")
-                    .socket
-                    .finish_time_wait();
+        if tcp_repr.control == TcpControl::Syn
+            && tcp_repr.ack_number.is_none()
+            && let Some(index) = winner
+            && let Some(listener) = sockets.tcp_listener_lookup(dst)
+        {
+            let socket = &mut sockets
+                .item_at_mut(index)
+                .expect("TCP flow index contains an empty slot")
+                .socket;
+            if socket.time_wait_accepts_syn(&tcp_repr) {
+                socket.finish_time_wait();
                 sockets.update_identity(index);
                 sockets.check_reapable(index);
                 sockets.mark_dirty(index);
-                winner = sockets.tcp_lookup(dst, src, syn_like);
+                winner = Some(listener);
             }
         }
 

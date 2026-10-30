@@ -127,3 +127,36 @@ fn closed_listener_takes_no_syn() {
         pair.close();
     });
 }
+
+/// Abort a connection, then connect another socket on the same tuple, before any poll. The
+/// aborted socket gives up the tuple at once and keeps only its owed RST, so the connect is
+/// allowed: the next round sends the RST and then the new socket's SYN. The peer, its
+/// connection reset and no listener on the port, answers the SYN with an RST, which closes the
+/// new socket.
+#[zhida_test_support::pinned_test]
+fn abort_then_connect_another_socket_on_the_tuple() {
+    with_eal(|eal| {
+        let mut pair = pair(eal, ["idi", "idj"]);
+        let ([first, _server], _) = establish(&mut pair, Side::A);
+        let second = pair.a.add_tcp(tcp_socket_sized(4096)).unwrap();
+        pair.a.abort(&first);
+        pair.a.connect(&second, server(), CLIENT_PORT).unwrap();
+        assert_eq!(pair.a.tcp(&first).state(), State::Closed);
+        assert_eq!(pair.a.tcp(&second).state(), State::SynSent);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.extend(round(&mut pair));
+        }
+        assert_eq!(
+            seen,
+            [
+                (Dir::AToB, TcpControl::Rst, CLIENT_PORT, SERVER_PORT),
+                (Dir::AToB, TcpControl::Syn, CLIENT_PORT, SERVER_PORT),
+                (Dir::BToA, TcpControl::Rst, SERVER_PORT, CLIENT_PORT),
+            ]
+        );
+        assert_eq!(pair.a.tcp(&first).remote_endpoint(), None);
+        assert_eq!(pair.a.tcp(&second).state(), State::Closed);
+        pair.close();
+    });
+}

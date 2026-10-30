@@ -58,6 +58,7 @@ pub(crate) fn flow_key(socket: &tcp::Socket) -> FlowKey {
 #[repr(align(64))]
 struct FlowSlot {
     registered: FlowKey,
+    /// The next slot in a listener chain (ascending), or `usize::MAX`.
     next: usize,
     dirty: bool,
     deadline: PollAt,
@@ -212,8 +213,8 @@ pub struct TcpSet<'a> {
     exact: FlowTable<(IpEndpoint, IpEndpoint)>,
     /// Listener chains by (local address or all-IP, port), each ascending by slot.
     listeners: FlowTable<BindKey>,
-    flow_epoch: u64,
-    last_exact: Option<(usize, u64)>,
+    /// The slot the last non-SYN exact lookup found.
+    last_exact: Option<usize>,
     pub(crate) dirty_list: Vec<usize>,
     wheel: TimerWheel,
     due: ListHead,
@@ -245,7 +246,6 @@ impl<'a> TcpSet<'a> {
             flow_slots: alloc::vec![FlowSlot::EMPTY; slot_count],
             exact: FlowTable::new(slot_count),
             listeners: FlowTable::new(slot_count),
-            flow_epoch: 0,
             last_exact: None,
             dirty_list: Vec::with_capacity(slot_count),
             wheel: TimerWheel::default(),
@@ -684,61 +684,41 @@ impl<'a> TcpSet<'a> {
 }
 
 impl TcpSet<'_> {
-    fn flow_head(&self, key: FlowKey) -> Option<usize> {
-        match key {
-            FlowKey::None => None,
-            FlowKey::Listener(bind) => self.listeners.get(&bind),
-            FlowKey::Exact { local, remote } => self.exact.get(&(local, remote)),
-        }
-    }
-
-    fn set_flow_head(&mut self, key: FlowKey, head: usize) {
-        self.flow_epoch = self.flow_epoch.wrapping_add(1);
-        match key {
-            FlowKey::None => unreachable!(),
-            FlowKey::Listener(bind) => {
-                if head == usize::MAX {
-                    self.listeners.remove(&bind);
-                } else {
-                    self.listeners.set(bind, head);
-                }
-            }
-            FlowKey::Exact { local, remote } => {
-                if head == usize::MAX {
-                    self.exact.remove(&(local, remote));
-                } else {
-                    self.exact.set((local, remote), head);
-                }
-            }
-        }
-    }
-
     fn unlink_identity(&mut self, index: usize) {
         let slot = self.flow_slots[index];
-        if slot.registered == FlowKey::None {
-            return;
-        }
-        let head = self
-            .flow_head(slot.registered)
-            .expect("registered TCP flow has no chain head");
-        if head == index {
-            self.set_flow_head(slot.registered, slot.next);
-        } else {
-            let mut previous = head;
-            while self.flow_slots[previous].next != index {
-                #[cfg(test)]
-                {
-                    self.slot_visits += 1;
-                }
-                previous = self.flow_slots[previous].next;
-                assert_ne!(
-                    previous,
-                    usize::MAX,
-                    "registered TCP slot is not in its chain"
-                );
+        match slot.registered {
+            FlowKey::None => return,
+            FlowKey::Exact { local, remote } => {
+                self.exact.remove(&(local, remote));
             }
-            self.flow_slots[previous].next = slot.next;
-            self.flow_epoch = self.flow_epoch.wrapping_add(1);
+            FlowKey::Listener(bind) => {
+                let head = self
+                    .listeners
+                    .get(&bind)
+                    .expect("registered TCP listener has no chain head");
+                if head == index {
+                    if slot.next == usize::MAX {
+                        self.listeners.remove(&bind);
+                    } else {
+                        self.listeners.set(bind, slot.next);
+                    }
+                } else {
+                    let mut previous = head;
+                    while self.flow_slots[previous].next != index {
+                        #[cfg(test)]
+                        {
+                            self.slot_visits += 1;
+                        }
+                        previous = self.flow_slots[previous].next;
+                        assert_ne!(
+                            previous,
+                            usize::MAX,
+                            "registered TCP listener is not in its chain"
+                        );
+                    }
+                    self.flow_slots[previous].next = slot.next;
+                }
+            }
         }
         self.flow_slots[index].registered = FlowKey::None;
         self.flow_slots[index].next = usize::MAX;
@@ -782,26 +762,35 @@ impl TcpSet<'_> {
             item.meta = Meta::default();
         }
         self.unlink_identity(index);
-        if key == FlowKey::None {
-            return;
-        }
-        let head = self.flow_head(key).unwrap_or(usize::MAX);
         self.flow_slots[index].registered = key;
-        if index < head {
-            self.flow_slots[index].next = head;
-            self.set_flow_head(key, index);
-        } else {
-            let mut previous = head;
-            while self.flow_slots[previous].next < index {
-                #[cfg(test)]
-                {
-                    self.slot_visits += 1;
-                }
-                previous = self.flow_slots[previous].next;
+        match key {
+            FlowKey::None => {}
+            FlowKey::Exact { local, remote } => {
+                assert!(
+                    self.exact.get(&(local, remote)).is_none(),
+                    "TCP tuple {local} -> {remote} is already registered"
+                );
+                self.exact.set((local, remote), index);
             }
-            self.flow_slots[index].next = self.flow_slots[previous].next;
-            self.flow_slots[previous].next = index;
-            self.flow_epoch = self.flow_epoch.wrapping_add(1);
+            FlowKey::Listener(bind) => {
+                // Lowest slot first: the accept pool hands a SYN to the lowest listener.
+                let head = self.listeners.get(&bind).unwrap_or(usize::MAX);
+                if index < head {
+                    self.flow_slots[index].next = head;
+                    self.listeners.set(bind, index);
+                } else {
+                    let mut previous = head;
+                    while self.flow_slots[previous].next < index {
+                        #[cfg(test)]
+                        {
+                            self.slot_visits += 1;
+                        }
+                        previous = self.flow_slots[previous].next;
+                    }
+                    self.flow_slots[index].next = self.flow_slots[previous].next;
+                    self.flow_slots[previous].next = index;
+                }
+            }
         }
     }
 
@@ -1089,8 +1078,7 @@ impl TcpSet<'_> {
         }
     }
 
-    /// The cached slot was the exact group's head at this epoch, so it is the lowest
-    /// accepting slot when no listener is eligible. SYN-like segments need the full lookup.
+    /// The exact flow for the segment, else for a SYN-like segment the listener.
     pub(crate) fn tcp_lookup(
         &mut self,
         dst: IpEndpoint,
@@ -1115,8 +1103,7 @@ impl TcpSet<'_> {
         syn_like: bool,
     ) -> Option<usize> {
         if !syn_like
-            && let Some((index, epoch)) = self.last_exact
-            && epoch == self.flow_epoch
+            && let Some(index) = self.last_exact
             && self.flow_slots[index].registered
                 == (FlowKey::Exact {
                     local: dst,
@@ -1127,7 +1114,7 @@ impl TcpSet<'_> {
         }
         let e = self.exact.get(&(dst, src));
         if !syn_like && let Some(index) = e {
-            self.last_exact = Some((index, self.flow_epoch));
+            self.last_exact = Some(index);
         }
         e
     }
@@ -1146,21 +1133,18 @@ impl TcpSet<'_> {
     pub(crate) fn check_flow_index(&self) {
         assert_eq!(self.flow_slots.len(), self.sockets.len());
         let mut seen = alloc::vec![false; self.sockets.len()];
-        let entries = self
-            .listeners
-            .entries()
-            .map(|(bind, head)| (FlowKey::Listener(bind), head))
-            .chain(
-                self.exact
-                    .entries()
-                    .map(|((local, remote), head)| (FlowKey::Exact { local, remote }, head)),
-            );
-        for (key, head) in entries {
-            assert_eq!(self.flow_head(key), Some(head));
+        for ((local, remote), index) in self.exact.entries() {
+            assert!(!seen[index], "TCP slot holds two flows");
+            seen[index] = true;
+            assert!(self.sockets[index].inner.is_some());
+            assert_eq!(self.flow_slots[index].registered, FlowKey::Exact { local, remote });
+            assert_eq!(self.flow_slots[index].next, usize::MAX);
+        }
+        for (bind, head) in self.listeners.entries() {
             assert_eq!(
                 self.flow_slots
                     .iter()
-                    .position(|slot| slot.registered == key),
+                    .position(|slot| slot.registered == FlowKey::Listener(bind)),
                 Some(head)
             );
             let mut index = head;
@@ -1169,8 +1153,8 @@ impl TcpSet<'_> {
                 seen[index] = true;
                 assert!(self.sockets[index].inner.is_some());
                 let slot = &self.flow_slots[index];
-                assert_eq!(slot.registered, key);
-                assert!(slot.next > index, "TCP flow chain is not ascending");
+                assert_eq!(slot.registered, FlowKey::Listener(bind));
+                assert!(slot.next > index, "TCP listener chain is not ascending");
                 index = slot.next;
             }
         }
@@ -2304,40 +2288,6 @@ mod tests {
             set.remove(second);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, true), None);
-        }
-
-        #[test]
-        fn flow_index_exact_groups_are_ascending() {
-            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
-            let (local, remote) = endpoints();
-            let mut set = TcpSet::new(64);
-            let mut handles: Vec<_> = (0..3).map(|_| set.add(socket())).collect();
-            for index in [2, 0, 1] {
-                set.remove(handles[index]);
-                handles[index] = set.add(connected(local, remote));
-                assert_eq!(handles[index].index, index);
-                set.check_flow_index();
-            }
-            assert_eq!(set.flow_slots[0].next, 1);
-            assert_eq!(set.flow_slots[1].next, 2);
-            assert_eq!(set.flow_slots[2].next, usize::MAX);
-            assert_eq!(set.tcp_lookup(local, remote, true), Some(0));
-            assert_eq!(set.tcp_lookup(local, remote, false), Some(0));
-            set.remove(handles[0]);
-            set.check_flow_index();
-            assert_eq!(set.tcp_lookup(local, remote, false), Some(1));
-            let reused = set.add(connected(local, remote));
-            assert_eq!(reused.index, 0);
-            iface.classify_dirty(&mut set, Instant::ZERO);
-            set.remove(handles[1]);
-            set.check_flow_index();
-            assert_eq!(set.flow_slots[0].next, 2);
-            set.remove(handles[2]);
-            set.check_flow_index();
-            assert_eq!(set.flow_slots[0].next, usize::MAX);
-            set.remove(reused);
-            set.check_flow_index();
-            assert_eq!(set.tcp_lookup(local, remote, false), None);
         }
 
         #[test]
