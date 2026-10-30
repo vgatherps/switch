@@ -7,32 +7,22 @@ use quote::{ToTokens, quote, quote_spanned};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Error, Expr, FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Token, Type,
+    Error, FnArg, GenericArgument, ItemFn, Pat, PathArguments, ReturnType, Token, Type,
     TypeImplTrait, TypeParamBound, parse_macro_input,
 };
 
 /// Marks a task function: `async fn`, or `fn` returning `impl Future<Output = T>`,
 /// with arguments bound to plain identifiers and a `'static` return value. Each
-/// instantiation of a generic task function has its own pool.
-///
-/// `#[task(capacity = N)]` sets the most occupied slots of this function per
-/// runtime (default: one 64 KiB block's slots).
+/// instantiation of a generic task function has its own pool. Takes no arguments.
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut capacity = None;
-    let parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("capacity") && capacity.is_none() {
-            capacity = Some(meta.value()?.parse::<Expr>()?);
-            Ok(())
-        } else {
-            Err(meta.error("expected `capacity = N`"))
-        }
-    });
-    parse_macro_input!(attr with parser);
+    if !attr.is_empty() {
+        return Error::new_spanned(TokenStream2::from(attr), "`#[switch::task]` takes no arguments")
+            .into_compile_error()
+            .into();
+    }
     let function = parse_macro_input!(item as ItemFn);
-    expand(capacity, function)
-        .unwrap_or_else(Error::into_compile_error)
-        .into()
+    expand(function).unwrap_or_else(Error::into_compile_error).into()
 }
 
 /// The task function becomes a function, with the same generics, building a token
@@ -40,7 +30,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async block for an `async fn`), with every argument rebound inside it. `token`
 /// keys the pool by a marker closure's type and the future type. The expansion
 /// declares no name the signature or body can see.
-fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2> {
+fn expand(function: ItemFn) -> syn::Result<TokenStream2> {
     let ItemFn {
         attrs,
         vis,
@@ -136,13 +126,6 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
     let where_clause = &sig.generics.where_clause;
     let inputs = &sig.inputs;
     let build = quote::format_ident!("build", span = Span::mixed_site());
-    let capacity_local = quote::format_ident!("capacity", span = Span::mixed_site());
-    let capacity = match capacity {
-        Some(capacity) => quote_spanned! {capacity.span()=>
-            ::std::option::Option::Some(const { ::switch::__private::Capacity::new(#capacity) })
-        },
-        None => quote!(::std::option::Option::None),
-    };
     // Spanned at the function name, so a future that is not `'static` or does not
     // resolve to the declared output is reported there.
     let token = quote_spanned!(name.span()=> ::switch::SpawnToken<impl ::switch::__private::Task<Output = #output>>);
@@ -151,14 +134,13 @@ fn expand(capacity: Option<Expr>, function: ItemFn) -> syn::Result<TokenStream2>
     // generic parameter of it, `impl Trait` arguments included, so each instantiation
     // has its own pool even when its future type does not depend on a parameter.
     let spawn = quote_spanned! {name.span()=>
-        ::switch::__private::token(|| {}, #capacity_local, #build)
+        ::switch::__private::token(|| {}, #build)
     };
     Ok(quote! {
         #(#attrs)*
         #vis fn #name #generics (#inputs) -> #token #where_clause {
             #declared
             #closure
-            let #capacity_local = #capacity;
             #spawn
         }
     })
@@ -242,7 +224,7 @@ mod tests {
                 }
             ),
         ] {
-            let expanded = super::expand(Some(parse_quote!(4)), function).unwrap();
+            let expanded = super::expand(function).unwrap();
             assert!(!has_unsafe(expanded));
         }
     }

@@ -3,10 +3,8 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-const LIMIT: u32 = 4;
-
 /// Documented, public, async, with a `'static` reference argument.
-#[switch::task(capacity = LIMIT * 2)]
+#[switch::task]
 pub async fn countdown(spawner: switch::Spawner, left: u32, label: &'static str) {
     if left > 0 {
         spawner.spawn(countdown(spawner.clone(), left - 1, label)).unwrap();

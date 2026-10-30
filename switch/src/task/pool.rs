@@ -18,14 +18,14 @@ use super::block::{BlockSpec, Meta};
 use super::header::TaskHeader;
 use crate::executor::Executor;
 
-/// One task function's slots in one runtime. Depot slot `s` (1..=capacity; 0 is
-/// the depot's sentinel) is position `(s - 1) % slots` of block `(s - 1) / slots`.
+/// One task function's slots in one runtime. Slot `s` is position `s % slots` of
+/// block `s / slots`. Slots are handed out lowest first, so a block is added only
+/// once every slot of the blocks before it is in use.
 pub(crate) struct RuntimePool {
     key: TypeId,
     executor: *mut Executor,
     depot: DynDepot,
-    capacity: u32,
-    /// Highest depot slot handed out so far; higher slots were never used.
+    /// One past the highest slot handed out so far; higher slots were never used.
     high: u32,
     /// Block ordinal -> block base.
     blocks: Vec<*mut Meta>,
@@ -34,42 +34,36 @@ pub(crate) struct RuntimePool {
 impl RuntimePool {
     #[cold]
     #[inline(never)]
-    pub(crate) fn new(executor: *mut Executor, key: TypeId, capacity: u32) -> *mut Self {
+    pub(crate) fn new(executor: *mut Executor, key: TypeId) -> *mut Self {
         // Issue the thread tag (it may panic once tags are exhausted) before any
         // pool or reservation state exists; block allocation reuses it.
         crate::waker::this_thread_tag();
         Box::into_raw(Box::new(Self {
             key,
             executor,
-            depot: DynDepot::new(capacity as usize + 1),
-            capacity,
+            depot: DynDepot::new(),
             high: 0,
             blocks: Vec::new(),
         }))
     }
 
-    /// Reserve a free slot, adding a block when the depot hands out the first
-    /// slot past the current blocks. `None` when the function's capacity is used.
+    /// Reserve the lowest free slot, adding a block when it is the first slot
+    /// past the current blocks.
     ///
     /// # Safety
     /// Owner thread; `spec` describes this pool's function.
-    pub(crate) unsafe fn reserve(this: *mut Self, spec: &BlockSpec) -> Option<*const TaskHeader> {
+    pub(crate) unsafe fn reserve(this: *mut Self, spec: &BlockSpec) -> *const TaskHeader {
         unsafe {
-            let slot = (*this).depot.alloc()?.slot();
-            if slot > (*this).capacity {
-                // The depot rounds its size up to 64 slots.
-                (*this).depot.free_slot_unchecked(slot);
-                return None;
-            }
-            (*this).high = (*this).high.max(slot);
-            let block = ((slot - 1) / spec.slots) as usize;
+            let slot = (*this).depot.alloc();
+            (*this).high = (*this).high.max(slot + 1);
+            let block = (slot / spec.slots) as usize;
             if block == (*this).blocks.len() {
                 Self::grow(this, spec);
             }
-            let header = Meta::header((&(*this).blocks)[block], (slot - 1) % spec.slots);
+            let header = Meta::header((&(*this).blocks)[block], slot % spec.slots);
             // A zeroed block's headers have no timer list yet; a freed slot keeps NIL.
             TaskHeader::reg_head(header).set(crate::intrusive::NIL);
-            Some(header)
+            header
         }
     }
 
@@ -84,7 +78,7 @@ impl RuntimePool {
         }
     }
 
-    /// Return a slot whose future is gone (or was never written) to its depot.
+    /// Return a slot whose future is gone (or was never written) to its pool.
     ///
     /// # Safety
     /// Owner thread; the slot is reserved, no queue entry or timer registration
@@ -94,8 +88,8 @@ impl RuntimePool {
             let meta = TaskHeader::meta(header);
             debug_assert_eq!(TaskHeader::reg_head(header).get(), crate::intrusive::NIL);
             TaskHeader::flags(header).set(0);
-            let slot = Meta::block(meta) * Meta::slots(meta) + Meta::position(meta, header) + 1;
-            (*Meta::pool(meta)).depot.free_slot_unchecked(slot);
+            let slot = Meta::block(meta) * Meta::slots(meta) + Meta::position(meta, header);
+            (*Meta::pool(meta)).depot.free(slot);
         }
     }
 

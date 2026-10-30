@@ -1,12 +1,10 @@
-//! Generic task functions: each instantiation has its own pool and capacity, also
-//! when its future type does not depend on the parameter.
+//! Generic task functions in every form compile and run: type and const parameters, `where`
+//! clauses, `impl Trait` arguments, parameters the future type does not depend on.
 
 use std::cell::RefCell;
 use std::fmt::Display;
 use std::future::Future;
 use std::rc::Rc;
-
-use switch::RuntimeError;
 
 type Log = Rc<RefCell<Vec<String>>>;
 
@@ -30,68 +28,47 @@ async fn constant<const N: usize>(log: Log) {
     log.borrow_mut().push(N.to_string());
 }
 
-trait Limit {
-    const N: u32;
-}
+trait Tag {}
 
 struct Two;
-impl Limit for Two {
-    const N: u32 = 2;
-}
+impl Tag for Two {}
 
 struct Three;
-impl Limit for Three {
-    const N: u32 = 3;
-}
+impl Tag for Three {}
 
-#[switch::task(capacity = L::N)]
-async fn limited<L>()
+#[switch::task]
+async fn bounded<L>()
 where
-    L: Limit + 'static,
+    L: Tag + 'static,
 {
 }
 
 /// The future type is the same for every `L`.
-#[switch::task(capacity = L::N)]
-fn plain_limited<L: Limit + 'static>(_unused: L) -> impl Future<Output = ()> {
+#[switch::task]
+fn plain<L: Tag + 'static>(_unused: L) -> impl Future<Output = ()> {
     std::future::ready(())
 }
 
-#[switch::task(capacity = L::N)]
-async fn async_limited<L: Limit + 'static>(_unused: L) {}
+#[switch::task]
+async fn async_plain<L: Tag + 'static>(_unused: L) {}
 
 /// `T` need not be `'static` when the future does not hold it.
-#[switch::task(capacity = T::N)]
-fn borrowed_limited<T: Limit>(_unused: T) -> impl Future<Output = ()> {
+#[switch::task]
+fn borrowed<T: Tag>(_unused: T) -> impl Future<Output = ()> {
     std::future::ready(())
 }
 
-impl Limit for &Two {
-    const N: u32 = 2;
-}
+impl Tag for &Two {}
 
 /// The future type is the same for every `N`.
-#[switch::task(capacity = N)]
-fn const_limited<const N: u32>() -> impl Future<Output = ()> {
+#[switch::task]
+fn const_plain<const N: u32>() -> impl Future<Output = ()> {
     std::future::ready(())
 }
 
-/// One pool per `impl Trait` argument type, though the future type is the same.
-#[switch::task(capacity = 1)]
-fn anonymous_limited(_unused: impl Limit + 'static) -> impl Future<Output = ()> {
+#[switch::task]
+fn anonymous_plain(_unused: impl Tag + 'static) -> impl Future<Output = ()> {
     std::future::ready(())
-}
-
-/// Spawns `make()` until the pool is full; the number spawned.
-fn fill<T: switch::__private::Task>(
-    spawner: &switch::Spawner,
-    make: impl Fn() -> switch::SpawnToken<T>,
-) -> u32 {
-    let mut spawned = 0;
-    while spawner.spawn(make()).is_ok() {
-        spawned += 1;
-    }
-    spawned
 }
 
 fn main() {
@@ -106,28 +83,21 @@ fn main() {
     spawner.spawn(anonymous("four", log.clone())).unwrap();
     spawner.spawn(nested(Some(5i64), log.clone())).unwrap();
     spawner.spawn(constant::<6>(log.clone())).unwrap();
-    for _ in 0..2 {
-        spawner.spawn(limited::<Two>()).unwrap();
-    }
-    let reason = spawner.spawn(limited::<Two>()).unwrap_err().reason;
-    assert_eq!(reason, RuntimeError::Exhausted);
-    for _ in 0..3 {
-        spawner.spawn(limited::<Three>()).unwrap();
-    }
-    let reason = spawner.spawn(limited::<Three>()).unwrap_err().reason;
-    assert_eq!(reason, RuntimeError::Exhausted);
-    assert_eq!(fill(&spawner, || plain_limited(Two)), 2);
-    assert_eq!(fill(&spawner, || plain_limited(Three)), 3);
-    assert_eq!(fill(&spawner, || async_limited(Two)), 2);
-    assert_eq!(fill(&spawner, || async_limited(Three)), 3);
+    spawner.spawn(bounded::<Two>()).unwrap();
+    spawner.spawn(bounded::<Three>()).unwrap();
+    spawner.spawn(plain(Two)).unwrap();
+    spawner.spawn(plain(Three)).unwrap();
+    spawner.spawn(async_plain(Two)).unwrap();
+    spawner.spawn(async_plain(Three)).unwrap();
     let two = Two;
-    assert_eq!(fill(&spawner, || borrowed_limited(&two)), 2);
-    assert_eq!(fill(&spawner, || borrowed_limited(Three)), 3);
-    assert_eq!(fill(&spawner, const_limited::<2>), 2);
-    assert_eq!(fill(&spawner, const_limited::<3>), 3);
-    assert_eq!(fill(&spawner, || anonymous_limited(Two)), 1);
-    assert_eq!(fill(&spawner, || anonymous_limited(Three)), 1);
-    while runtime.poll(0).unwrap().live_tasks != 0 {}
+    spawner.spawn(borrowed(&two)).unwrap();
+    spawner.spawn(borrowed(Three)).unwrap();
+    spawner.spawn(const_plain::<2>()).unwrap();
+    spawner.spawn(const_plain::<3>()).unwrap();
+    spawner.spawn(anonymous_plain(Two)).unwrap();
+    spawner.spawn(anonymous_plain(Three)).unwrap();
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (18, 0));
     let mut log = log.take();
     log.sort();
     assert_eq!(log, ["1", "3", "5", "6", "four", "two"]);

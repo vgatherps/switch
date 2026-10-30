@@ -28,13 +28,6 @@ pub enum RuntimeError {
         current: u64,
         supplied: u64,
     },
-    /// Spawn only: every slot of the task function's capacity here is occupied.
-    /// A slot stays occupied from spawn until its task completes and no wake of
-    /// it is still queued: a task that wakes itself and then completes holds its
-    /// slot until that wake drains, later in the same poll for an ordinary wake,
-    /// or in the next poll for `wake_deferred` or when the 1024-poll limit
-    /// stopped the poll.
-    Exhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,8 +259,7 @@ impl Spawner {
     }
 
     /// Submit a task function's token, detached: its return value is dropped
-    /// when it completes. A closed or panicked runtime, or a task function with
-    /// no free slot here (`Exhausted`), returns the token.
+    /// when it completes. A closed or panicked runtime returns the token.
     ///
     /// If the task's construction shuts down or drops the runtime, the runtime
     /// closes at once and its tasks, this one included, are dropped when the
@@ -297,10 +289,8 @@ impl Spawner {
         match self.control.open_core() {
             Ok(root) => {
                 let _deferred = DeferredShutdown(&self.control);
-                unsafe { Executor::spawn(root, token, join) }.map_err(|token| SpawnError {
-                    reason: RuntimeError::Exhausted,
-                    token,
-                })
+                unsafe { Executor::spawn(root, token, join) };
+                Ok(())
             }
             Err(reason) => Err(SpawnError {
                 reason: reason.into(),

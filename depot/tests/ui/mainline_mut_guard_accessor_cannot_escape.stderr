@@ -1,9 +1,0 @@
-error[E0597]: `guard` does not live long enough
-  --> tests/ui/mainline_mut_guard_accessor_cannot_escape.rs:36:9
-   |
-35 |         let mut guard = claim.get_mut::<MutGuardEscapeMeta>(&mut entity);
-   |             --------- binding `guard` declared here
-36 |         guard.view_mut()
-   |         ^^^^^ borrowed value does not live long enough
-37 |     };
-   |     - `guard` dropped here while still borrowed

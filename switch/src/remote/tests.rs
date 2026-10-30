@@ -20,7 +20,7 @@ type Shared = Arc<OnceLock<RemoteWaker>>;
 
 /// Parks, publishing a `RemoteWaker`, until `value` is nonzero; then stores it
 /// in `seen`. Counts its polls.
-#[switch::task(capacity = 1)]
+#[switch::task]
 fn waits(
     value: Arc<AtomicU32>,
     shared: Shared,
@@ -205,7 +205,7 @@ fn new_on_a_foreign_thread_panics() {
 
 /// Parks, publishing a `RemoteWaker`, until `value` reaches `last`; records the
 /// value it saw.
-#[switch::task(capacity = 8)]
+#[switch::task]
 fn until(
     value: Arc<AtomicU32>,
     last: u32,

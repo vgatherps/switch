@@ -24,7 +24,7 @@ members = [
     # switch
     "switch",
     "switch-macros",
-    # depot (vendored from ~/src/meminfra/depot)
+    # depot (task slot numbers for switch)
     "depot",
     # switchnet
     "switchnet",

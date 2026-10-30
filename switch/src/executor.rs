@@ -142,36 +142,23 @@ impl Executor {
         }
     }
 
-    /// Spawn a task; gives the token back when its function's capacity is used up.
+    /// Spawn a task.
     ///
     /// # Safety
     /// Stable owner-thread pointer; owner remains alive through all task uses.
-    pub unsafe fn spawn<T: Task>(
-        this: *mut Self,
-        token: SpawnToken<T>,
-        join: Option<Sender<T::Output>>,
-    ) -> Result<(), SpawnToken<T>> {
+    pub unsafe fn spawn<T: Task>(this: *mut Self, token: SpawnToken<T>, join: Option<Sender<T::Output>>) {
         unsafe {
             assert!((*this).lifecycle == Lifecycle::Open, "executor unavailable");
-            token
-                .into_payload()
-                .spawn_in(this, join)
-                .map_err(SpawnToken::new)
+            token.into_payload().spawn_in(this, join);
         }
     }
 
     /// Reserve queue capacity and a slot for one spawn. The slot stays free of
     /// LIVE until [`Reservation::commit`], so stale wakes of it do nothing.
-    /// `None` when the function already has `capacity` slots in use here.
     ///
     /// # Safety
     /// Owner thread; open executor; `spec` is the shape of `key`'s future type.
-    pub(crate) unsafe fn reserve(
-        this: *mut Self,
-        key: TypeId,
-        spec: &BlockSpec,
-        capacity: u32,
-    ) -> Option<Reservation> {
+    pub(crate) unsafe fn reserve(this: *mut Self, key: TypeId, spec: &BlockSpec) -> Reservation {
         unsafe {
             let needed = (*this)
                 .allocated
@@ -194,18 +181,18 @@ impl Executor {
             {
                 Some(pool) => pool,
                 None => {
-                    let pool = RuntimePool::new(this, key, capacity);
+                    let pool = RuntimePool::new(this, key);
                     (*this).pools.push(pool);
                     pool
                 }
             };
-            let header = RuntimePool::reserve(pool, spec)?;
+            let header = RuntimePool::reserve(pool, spec);
             (*this).allocated = needed;
             (*this).spawning += 1;
-            Some(Reservation {
+            Reservation {
                 executor: this,
                 header,
-            })
+            }
         }
     }
 
