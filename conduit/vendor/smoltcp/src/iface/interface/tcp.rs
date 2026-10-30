@@ -266,6 +266,7 @@ impl InterfaceInner {
                         !item.socket.is_listening()
                             && item.socket.accepts(self, &ip_repr, &tcp_repr)
                             && !(listener.is_some()
+                                && tcp_repr.control == TcpControl::Syn
                                 && item.socket.time_wait_accepts_syn(&tcp_repr))
                     })
                 })
@@ -283,6 +284,8 @@ impl InterfaceInner {
             }
         }
         self.refresh_sender(ipv4_repr, source_hardware_addr);
+        // Only a plain SYN retires an acceptable TIME-WAIT tuple for a listener; a SYN+FIN goes
+        // to the TIME-WAIT socket, which ACKs it, listener or not.
         if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none() {
             while let Some(index) = winner {
                 let socket = &mut sockets
