@@ -19,16 +19,14 @@ pub struct Config {
     pub max_frame: usize,
     /// Largest message accepted.
     pub max_message: usize,
-    /// Scratch capacity reserved at construction.
-    pub scratch: usize,
     /// Largest message sent.
     pub max_send: usize,
 }
 
 impl Config {
-    /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way); 64 KiB scratch.
+    /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way).
     pub fn new(role: Role) -> Config {
-        Config { role, max_frame: 16 << 20, max_message: 64 << 20, scratch: 64 << 10, max_send: 64 << 20 }
+        Config { role, max_frame: 16 << 20, max_message: 64 << 20, max_send: 64 << 20 }
     }
 }
 
@@ -508,7 +506,8 @@ impl<R: PlainRx> WsRx<R> {
                 ctrl: Control::EMPTY,
                 msg: None,
                 utf8: Utf8::default(),
-                scratch: Vec::with_capacity(config.scratch.min(config.max_message)),
+                // allocated on the first message spanning runs, then kept
+                scratch: Vec::new(),
                 pong: Control::EMPTY,
                 pong_due: false,
                 close: None,
@@ -709,12 +708,34 @@ mod tests {
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), None);
     }
 
+    /// The scratch starts empty: a connection that never receives a message spanning runs never
+    /// allocates it. The first such message grows it, and the capacity is kept for the next.
+    #[test]
+    fn scratch_is_allocated_on_first_use_and_kept() {
+        let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client));
+        assert_eq!(rx.core.scratch.capacity(), 0);
+        rx.push(F(frame(0x82, b"direct")));
+        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes(), b"direct");
+        assert!(rx.recv(&mut ()).unwrap().is_none());
+        assert_eq!(rx.core.scratch.capacity(), 0, "a direct message used the scratch");
+        let mut kept = None;
+        for _ in 0..2 {
+            rx.push(F(frame(0x02, &[1; 100])));
+            assert!(rx.recv(&mut ()).unwrap().is_none());
+            rx.push(F(frame(0x80, &[2; 100])));
+            assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes().len(), 200);
+            let at = (rx.core.scratch.as_ptr(), rx.core.scratch.capacity());
+            assert!(at.1 >= 200);
+            assert_eq!(*kept.get_or_insert(at), at, "the second message reallocated the scratch");
+        }
+    }
+
     /// Doubling would pass `max_message`; capacity stops at it.
     #[test]
     fn scratch_capacity_never_exceeds_max_message() {
-        let cfg = Config { max_frame: 100, max_message: 1000, scratch: 16, ..Config::new(Role::Client) };
+        let cfg = Config { max_frame: 100, max_message: 1000, ..Config::new(Role::Client) };
         let mut rx = WsRx::new(Raw::new(), cfg);
-        // 10 fragments of 100 B: capacity 16 -> 100 -> 200 -> 400 -> 800 -> 1000 (doubling alone: 1600).
+        // 10 fragments of 100 B: capacity 0 -> 100 -> 200 -> 400 -> 800 -> 1000 (doubling alone: 1600).
         for i in 0..10 {
             let b0 = match i {
                 0 => 2,
@@ -729,7 +750,7 @@ mod tests {
         assert_eq!(rx.core.scratch.capacity(), 1000);
 
         // One frame spanning two pushes: the reservation is clamped too.
-        let cfg = Config { max_frame: 1000, max_message: 1000, scratch: 600, ..Config::new(Role::Client) };
+        let cfg = Config { max_frame: 1000, max_message: 1000, ..Config::new(Role::Client) };
         let mut rx = WsRx::new(Raw::new(), cfg);
         let mut wire = vec![0x82, 126];
         wire.extend_from_slice(&1000u16.to_be_bytes());
