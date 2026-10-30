@@ -318,7 +318,7 @@ fn new_needs_completed_handshake() {
     let client =
         UnbufferedClientConnection::new(client_config, ServerName::try_from(HOST).unwrap())
             .unwrap();
-    TlsTx::new(client, TestTx(Wire::default()));
+    TlsTx::new(client, TestTx(Wire::default()), None);
 }
 
 /// The alert rustls queues on a receive error is visible to `has_pending` as soon as the

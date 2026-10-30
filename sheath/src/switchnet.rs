@@ -14,7 +14,7 @@ use rustls::pki_types::ServerName;
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
 
-use crate::tx::OVERHEAD;
+use crate::tx::{OVERHEAD, plain_room};
 use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
 
 /// Most TCP payload per sent frame: the Ethernet MSS. A lower effective MSS makes conduit cut
@@ -255,7 +255,8 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
 /// it queued goes out, then FIN, and the error returns once the server acked them (or the
 /// connection ended): until then a failing handshake stays pending, so the caller bounds it.
 /// `min_plain` is the largest plaintext record the caller will send (0 counts as 1); a frame
-/// that cannot carry it as a record is `Setup(RoomTooSmall)` before the ClientHello.
+/// that cannot carry it as one record (its room, or the client's `max_fragment_size`) is
+/// `Setup(RoomTooSmall)` before the ClientHello.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -269,7 +270,13 @@ pub async fn tls_connect(
     let need = min_plain.max(1).saturating_add(OVERHEAD);
     let mut raw = SwitchTx::new(handle, tcp, need).await.map_err(Error::Setup)?;
     let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Handshake(format!("server name {host}: {e}")))?;
+    let max_fragment_size = config.max_fragment_size;
     let mut conn = UnbufferedClientConnection::new(config, name).map_err(|e| Error::Tls(TlsError::Tls(e)))?;
+    // rustls has checked the fragment limit; it caps what one frame carries as one record
+    let plain = plain_room(raw.room, max_fragment_size);
+    if plain < min_plain.max(1) {
+        return Err(Error::Setup(SetupError::RoomTooSmall { room: plain + OVERHEAD, need }));
+    }
 
     // Received bytes are joined in `received`, sent records gathered in `out`.
     let mut received = Vec::new();
@@ -330,7 +337,7 @@ pub async fn tls_connect(
         }
     }
     Ok(Tls {
-        tx: TlsTx::new(conn, raw),
+        tx: TlsTx::new(conn, raw, max_fragment_size),
         rx: TlsRx::with_leftover(&received, stamp),
         tcp: tcp_rx,
     })

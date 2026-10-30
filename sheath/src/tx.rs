@@ -16,6 +16,14 @@ const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
 
+/// Plaintext one frame of `room` bytes carries as one record: the room less the record
+/// overhead, and at most one record's plaintext under the client's `max_fragment_size`
+/// (rustls's limit counts the record header and is at least 32 B).
+pub(crate) fn plain_room(room: usize, max_fragment_size: Option<usize>) -> usize {
+    let plain = room - OVERHEAD;
+    max_fragment_size.map_or(plain, |max| plain.min(max - RECORD_HEAD))
+}
+
 /// A frame holding records that used sequence numbers. Only [`TlsTx`] makes one, and only
 /// [`TlsTx::try_send`](FrameTx::try_send) takes one, so a frame that was not sealed cannot be
 /// sent in place of the sealed one:
@@ -59,12 +67,16 @@ pub struct TlsTx<L> {
     state: State,
     /// A `Sealed` frame exists that the lower layer has not accepted.
     in_flight: bool,
+    /// Plaintext per frame ([`plain_room`]): rustls would split a larger seal into several
+    /// records, past the frame.
+    room: usize,
 }
 
 impl<L: FrameTx> TlsTx<L> {
-    /// `conn` must have completed a TLS 1.3 handshake. Panics if `lower`'s frames cannot carry
-    /// a record with one byte of plaintext.
-    pub fn new(conn: UnbufferedClientConnection, lower: L) -> Self {
+    /// `conn` must have completed a TLS 1.3 handshake; `max_fragment_size` is the
+    /// `ClientConfig::max_fragment_size` it was made with. Panics if `lower`'s frames cannot
+    /// carry a record with one byte of plaintext.
+    pub fn new(conn: UnbufferedClientConnection, lower: L, max_fragment_size: Option<usize>) -> Self {
         assert!(
             !conn.is_handshaking(),
             "TlsTx needs a connection whose handshake is complete"
@@ -76,14 +88,16 @@ impl<L: FrameTx> TlsTx<L> {
         );
         let (_, room) = lower.plain();
         assert!(room > OVERHEAD, "frame room {room} B below one TLS record");
+        let room = plain_room(room, max_fragment_size);
         Self {
             conn,
             lower,
             held: Vec::new(),
-            plaintext: Vec::with_capacity(room - OVERHEAD),
+            plaintext: Vec::with_capacity(room),
             pending: Vec::new(),
             state: State::Open,
             in_flight: false,
+            room,
         }
     }
 
@@ -230,8 +244,7 @@ impl<L: FrameTx> FrameTx for TlsTx<L> {
     }
 
     fn plain(&self) -> (usize, usize) {
-        let (head, room) = self.lower.plain();
-        (head + RECORD_HEAD, room - OVERHEAD)
+        (self.lower.plain().0 + RECORD_HEAD, self.room)
     }
 
     /// Encrypts the plaintext into one record in place of it, behind any KeyUpdate records
@@ -242,7 +255,7 @@ impl<L: FrameTx> FrameTx for TlsTx<L> {
         let (head, room) = self.lower.plain();
         assert!(len > 0, "sealing an empty record");
         assert!(
-            len <= room - OVERHEAD,
+            len <= self.room,
             "{len} B of plaintext exceed the frame room"
         );
         let start = head + RECORD_HEAD;

@@ -222,7 +222,7 @@ pub fn connect_with(provider: CryptoProvider, max_fragment_size: Option<usize>) 
     assert!(!server.is_handshaking());
     let wire = Wire::default();
     Peer {
-        tx: TlsTx::new(client, TestTx(wire.clone())),
+        tx: TlsTx::new(client, TestTx(wire.clone()), None),
         wire,
         server,
     }

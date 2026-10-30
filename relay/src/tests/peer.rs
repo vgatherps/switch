@@ -82,7 +82,7 @@ pub struct Peer {
     pub server: ServerConnection,
 }
 
-fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>) {
+fn configs(max_fragment_size: Option<usize>) -> (Arc<ClientConfig>, Arc<ServerConfig>) {
     let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![HOST.to_owned()]).unwrap();
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -94,24 +94,30 @@ fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>) {
         .unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
-    let client = ClientConfig::builder_with_provider(provider)
+    let mut client = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&TLS13])
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    client.max_fragment_size = max_fragment_size;
     (Arc::new(client), Arc::new(server))
 }
 
 /// Completes the handshake. The server's records sent after it (session tickets) stay queued
 /// for the stream under test.
 pub fn connect() -> Peer {
+    connect_with(None)
+}
+
+/// `connect` with the client's `max_fragment_size`.
+pub fn connect_with(max_fragment_size: Option<usize>) -> Peer {
     enum Next {
         Continue,
         Blocked,
         Done,
     }
 
-    let (client_config, server_config) = configs();
+    let (client_config, server_config) = configs(max_fragment_size);
     let mut client = UnbufferedClientConnection::new(client_config, ServerName::try_from(HOST).unwrap()).unwrap();
     let mut server = ServerConnection::new(server_config).unwrap();
     let mut to_client = Vec::new();
@@ -151,7 +157,7 @@ pub fn connect() -> Peer {
     assert!(to_client.is_empty());
     assert!(!server.is_handshaking());
     let wire = Wire::default();
-    Peer { tx: TlsTx::new(client, TestTx(wire.clone())), wire, server }
+    Peer { tx: TlsTx::new(client, TestTx(wire.clone()), max_fragment_size), wire, server }
 }
 
 /// Wire ranges of the records in `bytes`, which holds whole records.
