@@ -422,18 +422,19 @@ impl Stack {
     }
 
     /// Time check, tidying (which wakes sockets waiting for a free frame if one is free), flush,
-    /// one RX burst, maintenance, then ingress. A burst that staged frames also tells the
+    /// one RX burst, maintenance, then ingress. A burst that returned packets also tells the
     /// Interface whether the RX pool is low (fewer free mbufs than one refill of the RX ring
     /// plus one RX burst, see `Port`); while it is, each TCP socket that processes a segment
     /// keeps no out-of-order data (`Interface::set_rx_pool_low`). An empty burst keeps the last
-    /// answer: the frames still staged were taken before it, and only a burst takes mbufs.
+    /// answer: the frames still staged were taken before it.
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
         self.tidy();
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
-        if burst.accepted != 0 {
-            self.iface.set_rx_pool_low(self.device.rx_pool_low());
+        let received = burst.accepted + burst.rejected;
+        if received != 0 {
+            self.iface.set_rx_pool_low(self.device.rx_pool_low(received));
         }
         self.iface.poll_maintenance(now);
 

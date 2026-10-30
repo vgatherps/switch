@@ -382,14 +382,19 @@ negotiated RX descriptor count, which the PMD may raise; leave room for that.
 Out-of-order segments are freed only when the gap before them fills, so sockets holding them
 could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. As Linux
 prunes the receiving socket's out-of-order queue under memory pressure, each `turn` and `receive`
-whose RX burst staged frames checks whether fewer RX mbufs are free than one refill of the RX
+whose RX burst returned packets checks whether fewer RX mbufs are free than one refill of the RX
 ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
 refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
 receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
 at once; while that fails ENA still returns completed packets, but stops receiving once the
 buffers already posted run out. So the check must fire while a refill can still succeed.
 Out-of-order data is kept only while at least that
-many mbufs are free, so size the RX share for it on top of what sockets hold.
+many mbufs are free, so size the RX share for it on top of what sockets hold. The free count is
+read only when the last reading no longer rules out "low": only the driver takes RX mbufs, at
+most max(negotiated RX descriptors, 32) posted plus one per packet it returns, so a reading of
+`free` covers the next `free - mark - max(RX descriptors, 32)` received packets. A test driver
+that allocates RX mbufs outside the PMD (the kit's `Link`, with an RX ring larger than 32)
+breaks that bound.
 While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
 out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
 ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
