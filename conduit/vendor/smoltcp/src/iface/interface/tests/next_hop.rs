@@ -104,7 +104,7 @@ impl Peer {
         if let Some(gateway) = gateway {
             iface.set_ipv4_gateway(Some(gateway));
         }
-        let mut sockets = TcpSet::new(vec![]);
+        let mut sockets = TcpSet::new(64);
         let mut socket = tcp::Socket::test_socket(4096, 4096);
         socket.set_ack_delay(None);
         configure(&mut iface, &mut socket);
@@ -216,9 +216,7 @@ impl Peer {
     }
 
     fn connect_with_syn(&mut self, millis: i64, configure_syn: impl FnOnce(&mut TcpRepr<'static>)) {
-        self.sockets
-            .get_mut(self.handle)
-            .connect(
+        self.sockets.connect(self.handle, 
                 self.iface.context(),
                 (self.remote, self.remote_port),
                 (self.local, self.local_port),
@@ -329,10 +327,10 @@ fn established_frames_use_template() {
 #[test]
 fn passive_handshake_seeds_template_for_first_data() {
     let mut peer = Peer::new(2, PEER, None);
-    peer.sockets.get_mut(peer.handle).abort();
+    peer.sockets.abort(peer.handle);
     peer.egress(1);
     peer.take_generic_tcp(TcpControl::Rst, &[]);
-    peer.sockets.get_mut(peer.handle).listen((LOCAL, 40000)).unwrap();
+    peer.sockets.listen(peer.handle, (LOCAL, 40000)).unwrap();
     peer.sockets.item_at_mut(0).unwrap().meta.tcp_template = None;
     let mut syn = peer.reply(TcpControl::Syn, TcpSeqNumber(0));
     syn.ack_number = None;
@@ -388,7 +386,7 @@ fn ingress_reply_rebuilds_template_in_winning_slot() {
     let mut peer = Peer::new(2, PEER, None);
     let (socket, _) = peer.sockets.take(peer.handle);
     let unrelated = peer.sockets.add(tcp::Socket::test_socket(64, 64));
-    peer.sockets.get_mut(unrelated).listen(40001).unwrap();
+    peer.sockets.listen(unrelated, 40001).unwrap();
     peer.handle = peer.sockets.add(socket);
     assert!(peer.sockets.item_at_mut(1).unwrap().meta.tcp_template.is_none());
     let before = peer.iface.inner.template_frames;
@@ -558,7 +556,7 @@ fn reconnect_same_slot_uses_new_peer() {
     peer.arp(1, remote2, NEW_MAC);
     peer.send(1);
     peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    peer.sockets.get_mut(peer.handle).abort();
+    peer.sockets.abort(peer.handle);
     peer.remote = remote2;
     peer.mac = NEW_MAC;
     peer.connect(2);
@@ -569,7 +567,7 @@ fn aborted_reconnect_uses_cached_peer_mac() {
     let mut peer = Peer::new(2, PEER, None);
     let remote2 = Ipv4Address::new(192, 168, 1, 3);
     peer.arp(1, remote2, NEW_MAC);
-    peer.sockets.get_mut(peer.handle).abort();
+    peer.sockets.abort(peer.handle);
     peer.egress(1);
     peer.take_tcp(TcpControl::Rst, &[]);
     assert!(peer.device.tx_queue.is_empty());
@@ -578,11 +576,9 @@ fn aborted_reconnect_uses_cached_peer_mac() {
 
     peer.remote = remote2;
     peer.mac = NEW_MAC;
-    peer.sockets
-        .get_mut(peer.handle)
-        .connect(peer.iface.context(), (remote2, 80), (LOCAL, 40000))
+    peer.sockets.connect(peer.handle, peer.iface.context(), (remote2, 80), (LOCAL, 40000))
         .unwrap();
-    peer.sockets.get_mut(peer.handle).abort();
+    peer.sockets.abort(peer.handle);
     peer.egress(2);
     peer.take_tcp(TcpControl::Rst, &[]);
     assert!(peer.device.tx_queue.is_empty());
@@ -592,18 +588,16 @@ fn aborted_reconnect_uses_cached_peer_mac() {
 fn aborted_reconnect_discovers_unknown_peer() {
     let mut peer = Peer::new(2, PEER, None);
     let remote2 = Ipv4Address::new(192, 168, 1, 3);
-    peer.sockets.get_mut(peer.handle).abort();
+    peer.sockets.abort(peer.handle);
     peer.egress(1);
     peer.take_tcp(TcpControl::Rst, &[]);
     assert!(peer.device.tx_queue.is_empty());
     assert_eq!(peer.sockets.get(peer.handle).state(), tcp::State::Closed);
     assert!(peer.sockets.get(peer.handle).remote_endpoint().is_none());
 
-    peer.sockets
-        .get_mut(peer.handle)
-        .connect(peer.iface.context(), (remote2, 80), (LOCAL, 40000))
+    peer.sockets.connect(peer.handle, peer.iface.context(), (remote2, 80), (LOCAL, 40000))
         .unwrap();
-    peer.sockets.get_mut(peer.handle).abort();
+    peer.sockets.abort(peer.handle);
     peer.egress(2);
     peer.take_arp_request(remote2);
 }
@@ -833,7 +827,7 @@ mod invalidation {
             peer.data(0, true);
             peer.warm();
             let before = peer.iface.inner.template_frames;
-            peer.sockets.get_mut(peer.handle).abort();
+            peer.sockets.abort(peer.handle);
             peer.remote = remote;
             peer.remote_port = port;
             peer.connect(2);
@@ -852,7 +846,7 @@ mod invalidation {
         });
         peer.warm();
         let before = peer.iface.inner.template_frames;
-        peer.sockets.get_mut(peer.handle).abort();
+        peer.sockets.abort(peer.handle);
         peer.local = local;
         peer.connect(2);
         assert_eq!(peer.iface.inner.template_frames, before + 1);
@@ -864,7 +858,7 @@ mod invalidation {
         let mut peer = Peer::new(2, PEER, None);
         peer.warm();
         let before = peer.iface.inner.template_frames;
-        peer.sockets.get_mut(peer.handle).abort();
+        peer.sockets.abort(peer.handle);
         peer.local_port = 40001;
         peer.connect(2);
         assert_eq!(peer.iface.inner.template_frames, before + 1);
@@ -876,12 +870,12 @@ mod invalidation {
         let mut peer = Peer::new(2, PEER, None);
         peer.warm();
         let before = peer.iface.inner.template_frames;
-        peer.sockets.get_mut(peer.handle).abort();
+        peer.sockets.abort(peer.handle);
         peer.connect(2);
         assert_eq!(peer.iface.inner.template_frames, before + 1);
         peer.data(3, true);
         let before = peer.iface.inner.template_frames;
-        peer.sockets.get_mut(peer.handle).abort();
+        peer.sockets.abort(peer.handle);
         peer.egress(4);
         peer.take_generic_tcp(TcpControl::Rst, &[]);
         assert!(peer.device.tx_queue.is_empty());
@@ -898,13 +892,11 @@ mod invalidation {
         peer.warm();
         peer.assert_layout(64, 20);
         let before = peer.iface.inner.template_frames;
-        peer.sockets.get_mut(peer.handle).abort();
+        peer.sockets.abort(peer.handle);
         peer.egress(2);
         peer.take_generic_tcp(TcpControl::Rst, &[]);
         assert_eq!(peer.iface.inner.template_frames, before + 1);
-        peer.sockets
-            .get_mut(peer.handle)
-            .listen((LOCAL, 40000))
+        peer.sockets.listen(peer.handle, (LOCAL, 40000))
             .unwrap();
         let mut syn = reply(TcpControl::Syn, TcpSeqNumber(0));
         syn.ack_number = None;
@@ -1250,7 +1242,7 @@ mod invalidation {
             peer.warm();
             let seq = peer.ack;
             let before = peer.iface.inner.template_frames;
-            peer.sockets.get_mut(peer.handle).close();
+            peer.sockets.close(peer.handle);
             peer.egress(2);
             peer.expect_frame(TcpControl::Fin, seq, TcpSeqNumber(101), &[]);
             peer.expect_template_frames(before, 1);
@@ -1272,7 +1264,7 @@ mod invalidation {
             peer.warm();
             let seq = peer.ack;
             let before = peer.iface.inner.template_frames;
-            peer.sockets.get_mut(peer.handle).abort();
+            peer.sockets.abort(peer.handle);
             assert_eq!(peer.sockets.get(peer.handle).state(), tcp::State::Closed);
             peer.egress(2);
             peer.expect_frame(TcpControl::Rst, seq, TcpSeqNumber(101), &[]);

@@ -5363,7 +5363,7 @@ mod test {
     #[test]
     #[cfg(feature = "udp-set")]
     fn add_admitted_registers_frame_drop_wake() {
-        let mut set = crate::iface::TcpSet::new(vec![]);
+        let mut set = crate::iface::TcpSet::new(64);
         let queue = crate::iface::DropQueue::with_capacity(1, 0);
         let handle = set.add_admitted(
             &Config { rx_capacity: 64, tx_capacity: 64, mss_cap: None },
@@ -5380,7 +5380,7 @@ mod test {
     #[test]
     #[cfg(feature = "udp-set")]
     fn remove_clears_frame_drop_wake() {
-        let mut set = crate::iface::TcpSet::new(vec![]);
+        let mut set = crate::iface::TcpSet::new(64);
         let placeholder = set.add(Socket::test_socket(64, 64));
         let queue = crate::iface::DropQueue::with_capacity(2, 0);
         let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
@@ -5395,7 +5395,7 @@ mod test {
     #[test]
     #[cfg(feature = "udp-set")]
     fn frame_drop_wakes_socket_only_when_window_update_becomes_due() {
-        let mut set = crate::iface::TcpSet::new(vec![]);
+        let mut set = crate::iface::TcpSet::new(64);
         let handle = set.add(Socket::test_socket(64, 64));
         let queue = crate::iface::DropQueue::with_capacity(1, 0);
 
@@ -5867,7 +5867,7 @@ mod test {
         let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
         let socket = socket().socket;
         let shared = socket.rx_buffer.shared.clone();
-        let mut sockets = crate::iface::TcpSet::new(vec![]);
+        let mut sockets = crate::iface::TcpSet::new(64);
         sockets.add(socket);
         iface.classify_dirty(&mut sockets, Instant::ZERO);
         shared.wake_at_held.set(17);

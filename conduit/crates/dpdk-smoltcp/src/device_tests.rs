@@ -184,7 +184,7 @@ fn checksum_ingress(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags:
             .push(IpCidr::new(Ipv4Address::new(10, 0, 0, 1).into(), 24))
             .unwrap();
     });
-    let mut sockets = TcpSet::new(Vec::new());
+    let mut sockets = TcpSet::new(64);
     let mut arp = Vec::new();
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 2]);
@@ -551,7 +551,7 @@ fn socket_template_frames(
     iface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
     });
-    let mut sockets = TcpSet::new(Vec::new());
+    let mut sockets = TcpSet::new(64);
     let handle = sockets.add_admitted(
         &pair::tcp_socket_sized(4096),
         1500,
@@ -1170,7 +1170,7 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
             eth.set_ethertype(EthernetProtocol::Arp);
             arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
             stage(&fixture, &mut device, &bytes);
-            let mut tcp = TcpSet::new(Vec::new());
+            let mut tcp = TcpSet::new(64);
             iface.poll_ingress_single(NOW, &mut device, &mut tcp);
             assert!(device.tx.is_empty());
             let mut udp = UdpSet::new(1, device.frame_source());
@@ -1279,7 +1279,7 @@ fn udp_template_frames_match_generic_and_flags() {
             eth.set_ethertype(EthernetProtocol::Arp);
             arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
             stage(&fixture, &mut device, &bytes);
-            let mut tcp = TcpSet::new(Vec::new());
+            let mut tcp = TcpSet::new(64);
             iface.poll_ingress_single(NOW, &mut device, &mut tcp);
             assert!(device.tx.is_empty());
             let mut udp = UdpSet::new(1, device.frame_source());
@@ -2273,7 +2273,7 @@ fn interface_answers_arp_request_through_paired_token_exact_bytes() {
                 .push(IpCidr::new(Ipv4Address::new(10, 0, 0, 1).into(), 24))
                 .unwrap();
         });
-        let mut sockets = TcpSet::new(Vec::new());
+        let mut sockets = TcpSet::new(64);
 
         let header = |dst: [u8; 6], src: [u8; 6], op: u8| {
             let mut frame = Vec::with_capacity(14);
@@ -2973,7 +2973,7 @@ fn retransmit_with_tx_checksum_offload() {
         iface.update_ip_addrs(|addrs| {
             addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
         });
-        let mut sockets = TcpSet::new(Vec::new());
+        let mut sockets = TcpSet::new(64);
         let handle = sockets.add_admitted(
             &pair::tcp_socket_sized(4096),
             1500,
@@ -3105,7 +3105,7 @@ fn udp_iface(fixture: &Fixture, device: &mut Device) -> Interface {
     eth.set_ethertype(EthernetProtocol::Arp);
     arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
     stage(fixture, device, &bytes);
-    iface.poll_ingress_single(NOW, device, &mut TcpSet::new(Vec::new()));
+    iface.poll_ingress_single(NOW, device, &mut TcpSet::new(64));
     assert!(device.tx.is_empty());
     iface
 }

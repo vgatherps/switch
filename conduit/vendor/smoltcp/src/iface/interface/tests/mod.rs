@@ -235,7 +235,7 @@ pub fn tcp_listen_drops_unspecified_src() {
 
     let tcp_socket = tcp::Socket::test_socket(64, 64);
     let handle = sockets.add(tcp_socket);
-    sockets.get_mut(handle).listen(1234).unwrap();
+    sockets.listen(handle, 1234).unwrap();
 
     let tcp = TcpRepr {
         src_port: 65000,

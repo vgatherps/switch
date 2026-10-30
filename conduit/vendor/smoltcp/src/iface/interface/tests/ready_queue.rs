@@ -405,26 +405,6 @@ fn ingress_sync_keeps_deadline_dirty() {
 }
 
 #[test]
-fn ingress_sync_visits_each_dirty_slot_once() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.get_mut(handle);
-    sockets.slot_visits = 0;
-    sockets.classify_calls = 0;
-    receive(
-        &mut iface,
-        &mut sockets,
-        &mut device,
-        segment(1234, TcpControl::None, 101, seq),
-    );
-    assert_eq!(sockets.slot_visits, 1);
-    assert_eq!(sockets.classify_calls, 0);
-    assert_eq!(sockets.dirty_list, vec![0]);
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    assert!(device.tx_queue.is_empty());
-}
-
-#[test]
 #[cfg(feature = "udp-set")]
 fn ingress_does_not_resync_processed_sockets() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
@@ -460,11 +440,9 @@ fn ingress_does_not_resync_processed_sockets() {
     assert_eq!(sockets.slot_visits, 0);
 }
 
-#[rstest]
-#[case::get_mut(false)]
-#[case::iter_mut(true)]
+#[test]
 #[cfg(feature = "udp-set")]
-fn ingress_syncs_app_relisten_of_already_dirty_socket(#[case] use_iterator: bool) {
+fn ingress_finds_app_relisten_of_already_dirty_socket() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
@@ -474,15 +452,8 @@ fn ingress_syncs_app_relisten_of_already_dirty_socket(#[case] use_iterator: bool
         PollIngressSingleResult::SocketStateChanged
     );
     assert_eq!(sockets.dirty_list, vec![0]);
-    if use_iterator {
-        let (returned_handle, socket) = sockets.iter_mut().next().unwrap();
-        assert_eq!(returned_handle, handle);
-        socket.abort();
-        socket.listen(1235).unwrap();
-    } else {
-        sockets.get_mut(handle).abort();
-        sockets.get_mut(handle).listen(1235).unwrap();
-    }
+    sockets.abort(handle);
+    sockets.listen(handle, 1235).unwrap();
     assert_eq!(sockets.dirty_list, vec![0]);
     sockets.classify_calls = 0;
     sockets.dispatches.clear();
@@ -886,10 +857,9 @@ fn reconnect_to_cached_neighbor_sends_syn_without_old_neighbor_silence() {
         HardwareAddress::Ethernet(peer_b_hardware),
         START,
     );
-    let socket = sockets.get_mut(handle);
-    socket.abort();
-    socket
-        .connect(iface.context(), (peer_b, 65000), (LOCAL, 1234))
+    sockets.abort(handle);
+    sockets
+        .connect(handle, iface.context(), (peer_b, 65000), (LOCAL, 1234))
         .unwrap();
     iface.poll_egress(START, &mut device, &mut sockets);
 
@@ -1023,7 +993,7 @@ fn now_is_due_at_negative_time() {
 fn check_close_timer_after_idle_wheel(now: Instant, fresh: bool, poll_at_first: bool) {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.get_mut(handle).close();
+    sockets.close(handle);
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).1, TcpControl::Fin);
     receive(
@@ -1036,7 +1006,7 @@ fn check_close_timer_after_idle_wheel(now: Instant, fresh: bool, poll_at_first: 
     assert_eq!(take_tcp(&mut device).1, TcpControl::None);
     assert_eq!(sockets.get(handle).state(), tcp::State::TimeWait);
     let (socket, _) = sockets.take(handle);
-    let mut sockets = TcpSet::new(Vec::new());
+    let mut sockets = TcpSet::new(64);
     if !fresh {
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
     }
@@ -1155,7 +1125,7 @@ fn timers_fire_among_idle_sockets() {
                 Duration::from_millis(300)
             }
             "TIME-WAIT" => {
-                sockets.get_mut(handle).close();
+                sockets.close(handle);
                 iface.poll_egress(START, &mut device, &mut sockets);
                 assert_eq!(take_tcp(&mut device).1, TcpControl::Fin);
                 receive(
@@ -1573,7 +1543,7 @@ fn visit_end_after_fin_stores_retransmit_deadline() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     assert_eq!(sockets.get(handle).send_queue(), 0);
-    sockets.get_mut(handle).close();
+    sockets.close(handle);
     sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
@@ -1851,9 +1821,7 @@ fn parked_socket_allows_lone_socket_to_burst() {
         START,
     );
     let (active, seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
-    sockets
-        .get_mut(parked)
-        .connect(
+    sockets.connect(parked, 
             iface.context(),
             (Ipv4Address::new(192, 168, 1, 3), 65000),
             (LOCAL, 1234),
@@ -1998,11 +1966,7 @@ fn one_busy_socket_costs_no_slot_walk() {
     let mut visits = Vec::new();
     for slot_count in [64, 10240] {
         let (mut iface, _, mut device) = setup(Medium::Ip);
-        let mut sockets = TcpSet::new(
-            (0..slot_count)
-                .map(|_| crate::iface::TcpStorage::EMPTY)
-                .collect::<Vec<_>>(),
-        );
+        let mut sockets = TcpSet::new(slot_count);
         let (handle, mut seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
         assert_eq!(sockets.slot_count(), slot_count);
         sockets.slot_visits = 0;
@@ -2100,8 +2064,8 @@ fn unqueued_future_deadline_stays_on_wheel_after_device_refusal() {
     };
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(sockets.ready_len(), 1);
-    sockets.get_mut(a).abort();
-    sockets.get_mut(a).listen(1234).unwrap();
+    sockets.abort(a);
+    sockets.listen(a, 1234).unwrap();
     assert_eq!(
         iface.poll_at(START, &mut sockets),
         Some(Instant::from_millis(384))
@@ -2131,8 +2095,8 @@ fn queued_future_deadline_stays_exact_after_device_refusal() {
     };
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(sockets.ready_len(), 2);
-    sockets.get_mut(a).abort();
-    sockets.get_mut(a).listen(1234).unwrap();
+    sockets.abort(a);
+    sockets.listen(a, 1234).unwrap();
     receive(&mut iface, &mut sockets, &mut device.inner, TcpRepr {
         window_len: 0,
         ..segment(1235, TcpControl::None, 101, seq)

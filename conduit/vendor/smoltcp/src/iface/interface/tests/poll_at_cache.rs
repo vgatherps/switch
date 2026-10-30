@@ -170,7 +170,7 @@ fn remove_and_reuse_resets_deadline() {
     listener.listen(1234).unwrap();
     let reused = sockets.add(listener);
     assert_ne!(reused, handle);
-    assert_eq!(sockets.slot_count(), 1);
+    assert_eq!(reused.to_string(), handle.to_string());
     assert_eq!(iface.poll_at(START, &mut sockets), None);
     sockets.remove(reused);
     connect(&mut iface, &mut sockets, 1234);
@@ -239,7 +239,7 @@ fn cached_poll_at_matches_full_scan_under_churn() {
         let port = 1234 + index as u16;
         let handle = if index < 8 {
             let handle = sockets.add(socket());
-            sockets.get_mut(handle).listen(port).unwrap();
+            sockets.listen(handle, port).unwrap();
             handle
         } else {
             connect(&mut iface, &mut sockets, port)
@@ -353,9 +353,9 @@ fn cached_poll_at_matches_full_scan_under_churn() {
     for (index, &handle) in handles.iter().enumerate() {
         if index < 8 {
             sockets.get_mut(handle).set_rto(Duration::from_millis(25));
-            sockets.get_mut(handle).close();
+            sockets.close(handle);
         } else {
-            sockets.get_mut(handle).abort();
+            sockets.abort(handle);
         }
         assert_eq!(iface.poll_at(now, &mut sockets), Some(Instant::ZERO));
         iface.poll_egress(now, &mut device, &mut sockets);
@@ -381,7 +381,7 @@ fn cached_poll_at_matches_full_scan_under_churn() {
     }
     for &handle in &handles[..8] {
         assert_eq!(sockets.get(handle).state(), tcp::State::FinWait1);
-        sockets.get_mut(handle).abort();
+        sockets.abort(handle);
     }
     iface.poll_egress(expired, &mut device, &mut sockets);
     for _ in 0..8 {
@@ -389,9 +389,9 @@ fn cached_poll_at_matches_full_scan_under_churn() {
     }
     assert_eq!(iface.poll_at(expired, &mut sockets), None);
     for &handle in &handles {
-        sockets.get_mut(handle).listen(4321).unwrap();
+        sockets.listen(handle, 4321).unwrap();
         assert_eq!(iface.poll_at(expired, &mut sockets), None);
-        sockets.get_mut(handle).close();
+        sockets.close(handle);
         assert_eq!(iface.poll_at(expired, &mut sockets), None);
     }
     for &handle in handles.iter().step_by(2) {
@@ -456,7 +456,7 @@ fn poll_at_matches_full_scan_with_wheel() {
     assert_eq!(sockets.get(handles[0]).state(), tcp::State::Established);
     sockets.remove(handles[0]);
     let replacement = sockets.add(socket());
-    sockets.get_mut(replacement).listen(1234).unwrap();
+    sockets.listen(replacement, 1234).unwrap();
     assert_eq!(iface.poll_at(start, &mut sockets), Some(Instant::from_millis(6)));
     let churn_delays = [Duration::from_millis(1500), Duration::from_secs(33),
                         Duration::from_secs(45), Duration::from_secs(60)];

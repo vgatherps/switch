@@ -36,7 +36,7 @@ fn take_syn(device: &mut Loopback) -> u32 {
 fn different_interface_seeds_change_active_syn_isn() {
     let syn = |seed| {
         let (mut iface, mut device) = interface(seed);
-        let mut sockets = TcpSet::new(vec![]);
+        let mut sockets = TcpSet::new(64);
         let handle = add_socket(&mut sockets);
         sockets.connect(handle, iface.context(), (REMOTE, 80), 49152)
             .unwrap();
@@ -49,7 +49,7 @@ fn different_interface_seeds_change_active_syn_isn() {
 #[test]
 fn reconnect_same_tuple_advances_syn_isn_with_interface_time() {
     let (mut iface, mut device) = interface(1);
-    let mut sockets = TcpSet::new(vec![]);
+    let mut sockets = TcpSet::new(64);
     let handle = add_socket(&mut sockets);
     sockets.connect(handle, iface.context(), (REMOTE, 80), 49152)
         .unwrap();
@@ -71,7 +71,7 @@ fn passive_syn_isn_uses_interface_seed_and_time() {
 
     let syn = |seed, now| {
         let (mut iface, mut device) = interface(seed);
-        let mut sockets = TcpSet::new(vec![]);
+        let mut sockets = TcpSet::new(64);
         let handle = add_socket(&mut sockets);
         sockets.listen(handle, 80).unwrap();
         let tcp = TcpRepr {

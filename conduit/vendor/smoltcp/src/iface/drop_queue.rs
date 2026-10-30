@@ -82,7 +82,7 @@ mod tests {
     use crate::socket::tcp;
 
     fn handles() -> ([SocketHandle; 3], [UdpHandle; 3]) {
-        let mut tcp = TcpSet::new(Vec::new());
+        let mut tcp = TcpSet::new(64);
         let tcp = core::array::from_fn(|_| {
             tcp.add(tcp::Socket::test_socket(0, 0))
         });

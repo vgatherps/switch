@@ -4,7 +4,7 @@ use std::io::Read;
 use smoltcp::iface::{
     Config, DropQueue, Interface, NoRoute, OwnedIpv4, PathMtu, PathMtus, PollIngressSingleResult,
     PollResult, ReadySide,
-    SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
+    SocketHandle, TcpSet, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
 use smoltcp::phy::{HeldFrames, TxFrame};
@@ -311,11 +311,9 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
-        let mut storage = Vec::with_capacity(config.max_sockets);
-        storage.resize_with(config.max_sockets, || TcpStorage::EMPTY);
         Ok(Self {
             iface,
-            sockets: TcpSet::new(storage),
+            sockets: TcpSet::new(config.max_sockets),
             udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
             removed_held: Vec::new(),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
@@ -794,19 +792,6 @@ impl Stack {
         local: U,
     ) -> Result<(), tcp::ConnectError> {
         let raw = self.tcp_raw(handle);
-        let remote = remote.into();
-        let local = self.sockets.get(raw).connect_local_endpoint(
-            self.iface.context(),
-            remote,
-            local.into(),
-        )?;
-        if self.sockets.iter().any(|(_, socket)| {
-            !matches!(socket.state(), tcp::State::Closed | tcp::State::Listen)
-                && socket.local_endpoint() == Some(local)
-                && socket.remote_endpoint() == Some(remote)
-        }) {
-            return Err(tcp::ConnectError::AddressInUse);
-        }
         self.sockets.connect(raw, self.iface.context(), remote, local)
     }
 

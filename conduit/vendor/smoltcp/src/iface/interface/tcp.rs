@@ -302,9 +302,9 @@ impl InterfaceInner {
                     .expect("TCP flow index contains an empty slot")
                     .socket
                     .finish_time_wait();
-                sockets.resync_identity(index);
+                sockets.update_identity(index);
                 sockets.check_reapable(index);
-                sockets.mark_dirty_synced(index);
+                sockets.mark_dirty(index);
                 winner = sockets.tcp_lookup(dst, src, syn_like);
             }
         }
@@ -329,15 +329,12 @@ impl InterfaceInner {
             );
             let before = socket.state();
             let (reply, pending) = socket.process(self, &ip_repr, &tcp_repr);
-            // Inside process, a flow key change requires a state change.
-            if socket.state() != before {
-                sockets.resync_identity(index);
+            let state_changed = socket.state() != before;
+            sockets.update_identity(index);
+            if state_changed {
                 sockets.check_reapable(index);
-            } else {
-                #[cfg(debug_assertions)]
-                sockets.debug_assert_synced(index);
             }
-            sockets.mark_dirty_synced(index);
+            sockets.mark_dirty(index);
             if let Some(pending) = pending {
                 sockets.pending_rx_attach = Some((index, pending));
             }

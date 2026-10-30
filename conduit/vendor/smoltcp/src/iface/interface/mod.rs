@@ -397,8 +397,6 @@ impl Interface {
 
         self.poll_maintenance(timestamp);
 
-        sockets.sync_dirty_identities(&self.inner);
-
         // Process ingress while there's packets available.
         loop {
             match self.socket_ingress(
@@ -465,8 +463,6 @@ impl Interface {
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
-        sockets.sync_dirty_identities(&self.inner);
-
         self.socket_ingress(
             device,
             sockets,
@@ -485,8 +481,6 @@ impl Interface {
         udp: &mut UdpSet,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
-
-        tcp.sync_dirty_identities(&self.inner);
 
         self.socket_ingress(device, tcp, Some(udp))
     }
@@ -832,15 +826,12 @@ impl Interface {
                     }
                     sockets.check_reapable(index);
                 }
-                // Inside dispatch, a flow key change requires a state change. Timers (close,
-                // TIME_WAIT end, RTO abort) change readiness only through the state.
+                sockets.update_identity(index);
+                // Timers (close, TIME_WAIT end, RTO abort) change readiness only through the
+                // state.
                 if state_changed {
-                    sockets.resync_identity(index);
                     sockets.check_reapable(index);
                     sockets.fire(index);
-                } else {
-                    #[cfg(debug_assertions)]
-                    sockets.debug_assert_synced(index);
                 }
                 if dispatch_result.is_err() || !emitted {
                     break dispatch_result;
@@ -967,7 +958,6 @@ fn classify_dirty(
             sockets.slot_visits += 1;
         }
         let index = sockets.dirty_list[position];
-        sockets.sync_identity(inner, index);
         classify(inner, sockets, index, timestamp);
     }
     if admit {
