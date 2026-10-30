@@ -382,9 +382,11 @@ could keep the pool empty while every resent gap segment is dropped for lack of 
 prunes the receiving socket's out-of-order queue under memory pressure, each `turn` and `receive`
 whose RX burst staged frames checks whether fewer RX mbufs are free than one refill of the RX
 ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
-refill in chunks up to that size and receive nothing while a chunk cannot be had (ENA allocates
-every free descriptor at once, ixgbe vector RX 64, memif copy mode 32 per receive), so the check
-must fire while a refill can still succeed. Out-of-order data is kept only while at least that
+refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
+receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
+at once; while that fails ENA still returns completed packets, but stops receiving once the
+buffers already posted run out. So the check must fire while a refill can still succeed.
+Out-of-order data is kept only while at least that
 many mbufs are free, so size the RX share for it on top of what sockets hold.
 While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
 out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an

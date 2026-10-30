@@ -1052,10 +1052,11 @@ fn check_configuration(mtu: u16, offloads: Offloads, conf: &rte_eth_conf) -> Res
 }
 
 /// One refill of the whole RX ring plus one RX burst: max(RX descriptors, 32) + `rx_burst`.
-/// DPDK 25.11.3 PMDs refill in chunks up to that size and receive nothing while a chunk cannot
-/// be had: ENA bulk-allocates every free descriptor at once, ixgbe's vector RX rearms 64, memif
-/// copy mode allocates 32 per receive whatever the burst; net_tap takes one per packet and
-/// net_ring none. The 32 floor is `rx_reserve`'s.
+/// DPDK 25.11.3 PMDs refill in chunks up to that size, all or nothing: memif copy mode
+/// allocates 32 per receive whatever the burst and receives nothing without them; ixgbe's
+/// vector RX rearms 64; ENA bulk-allocates every free descriptor at once, and while that fails
+/// still returns completed packets until the buffers already posted run out, then receives
+/// nothing. net_tap takes one per packet and net_ring none. The 32 floor is `rx_reserve`'s.
 fn rx_low_mark(rx_descriptors: u16, rx_burst: u16) -> usize {
     usize::from(rx_descriptors.max(32)) + usize::from(rx_burst)
 }
