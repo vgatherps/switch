@@ -29,7 +29,7 @@ use std::task::{Context, Poll};
 
 pub use dpdk_smoltcp::smoltcp::phy::TxFrame;
 pub use dpdk_smoltcp::smoltcp::socket::tcp;
-pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendError, SendFrameError};
+pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendFrameError};
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
 pub use dpdk_smoltcp::{
@@ -605,8 +605,9 @@ impl TcpTx {
     /// `Future<Output = Result<(), SendError>>`: `Ok` once a frame of `len`
     /// bytes fits (free bytes and a free frame slot), so `try_send` of such a
     /// frame succeeds until the next turn; `Err(InvalidState)` once the
-    /// socket can no longer send (reset, closed, or after `shutdown`).
-    /// Panics if `len` exceeds the socket's send capacity: it would never fit.
+    /// socket can no longer send (reset, closed, or after `shutdown`);
+    /// `Err(TooLarge)` on the first poll if `len` exceeds the socket's send capacity
+    /// (or u32): it would never fit.
     pub fn room(&mut self, len: usize) -> Room<'_> {
         Room { tx: self, len }
     }
@@ -675,18 +676,43 @@ pub struct Room<'a> {
     len: usize,
 }
 
+/// Why a [`TcpTx::room`] failed.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SendError {
+    /// The socket can no longer send: reset, closed, or after `shutdown`.
+    InvalidState,
+    /// `len` exceeds the socket's send buffer, `capacity` bytes (or u32): it would never fit.
+    TooLarge { len: usize, capacity: usize },
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::InvalidState => f.write_str("invalid state"),
+            Self::TooLarge { len, capacity } => write!(f, "{len} B exceeds the {capacity} B send buffer"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
 impl Future for Room<'_> {
     type Output = Result<(), SendError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (half, len) = (&self.tx.0, self.len);
         let index = half.index;
-        let interest = Interest::TcpRoom(u32::try_from(len).expect("room length exceeds u32"));
-        poll_op(&half.shared, index, interest, cx, |inner| {
+        let Ok(interest) = u32::try_from(len) else {
+            let capacity = self.tx.send_capacity();
+            return Poll::Ready(Err(SendError::TooLarge { len, capacity }));
+        };
+        poll_op(&half.shared, index, Interest::TcpRoom(interest), cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
-            assert!(len <= socket.send_capacity(), "room({len}) exceeds the send capacity");
-            if !socket.may_send() {
+            let capacity = socket.send_capacity();
+            if len > capacity {
+                Some(Err(SendError::TooLarge { len, capacity }))
+            } else if !socket.may_send() {
                 Some(Err(SendError::InvalidState))
             } else {
                 tcp_room_ready(socket, len).then_some(Ok(()))
