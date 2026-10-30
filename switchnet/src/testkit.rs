@@ -5,11 +5,13 @@
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::future::Future;
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::panic::resume_unwind;
 use std::process::Command;
 use std::rc::Rc;
-use std::thread;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
@@ -25,8 +27,6 @@ pub const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 pub const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const MTU: u16 = 1500;
 const INGRESS_BUDGET: usize = 32;
-/// The client's local port in [`client_server`].
-const LOCAL_PORT: u16 = 49152;
 /// A [`client_server`] run, and every peer socket read and write.
 const LIMIT: Duration = Duration::from_secs(60);
 /// The loops sleep this long each round so a peer thread on the same CPU runs.
@@ -133,9 +133,77 @@ fn add_address(iface: &CString, addr: Ipv4Addr, prefix: u8) {
     assert!(output.status.success(), "ip address add {cidr}: {}", String::from_utf8_lossy(&output.stderr));
 }
 
+/// A local port no earlier connection of this process used. The kernel keeps a test's socket
+/// after the test (in FIN-WAIT-1 or LAST-ACK when the Net stopped turning before the close
+/// finished); a new connection on the same address pair would collide with it and never
+/// connect.
+pub fn next_local_port() -> u16 {
+    static NEXT: AtomicU16 = AtomicU16::new(49152);
+    let port = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(port >= 49152, "local ports used up");
+    port
+}
+
+/// The kernel side of one test connection: listens on 192.0.2.1:`port` and accepts in the
+/// test's own loop, so a test that fails before its client connects drops the listener as it
+/// unwinds, instead of leaving a thread blocked in `accept` that holds the port for the
+/// tests after it.
+pub struct KernelPeer<T> {
+    listener: Option<TcpListener>,
+    serve: Option<Box<dyn FnOnce(std::net::TcpStream) -> T + Send>>,
+    server: Option<JoinHandle<T>>,
+}
+
+impl<T: Send + 'static> KernelPeer<T> {
+    /// `serve` runs on its own thread on the accepted connection (reads and writes time out
+    /// after a minute).
+    pub fn listen(
+        port: u16,
+        listener_setup: impl FnOnce(&TcpListener),
+        serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind(SocketAddrV4::new(KERNEL_ADDR, port)).expect("bind the peer");
+        listener_setup(&listener);
+        listener.set_nonblocking(true).expect("non-blocking listener");
+        KernelPeer { listener: Some(listener), serve: Some(Box::new(serve)), server: None }
+    }
+
+    /// Accepts the client if it connected: starts `serve` and closes the listener.
+    pub fn accept(&mut self) {
+        let Some(listener) = &self.listener else { return };
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+            Err(e) => panic!("accept the client: {e}"),
+        };
+        self.listener = None;
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(LIMIT)).unwrap();
+        stream.set_write_timeout(Some(LIMIT)).unwrap();
+        let serve = self.serve.take().expect("serve runs once");
+        self.server = Some(thread::spawn(move || serve(stream)));
+    }
+
+    /// `serve` ran to the end.
+    pub fn is_finished(&self) -> bool {
+        self.server.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
+    /// What `serve` returned, once it returns; its panic resumes here. Panics if the client
+    /// never connected.
+    pub fn join(mut self) -> T {
+        self.accept();
+        match self.server.take().expect("the client never connected").join() {
+            Ok(out) => out,
+            Err(panic) => resume_unwind(panic),
+        }
+    }
+}
+
 /// One client against one kernel peer: the peer, on a thread, runs `serve` on the connection
 /// it accepts on 192.0.2.1:`port` (after `listener_setup` on its listener); `client` runs as
-/// a switch task on the Net's handle and the connected stream, and hands back what it holds.
+/// a switch task on the Net's handle and the connected stream (from a fresh local port), and
+/// hands back what it holds.
 /// Turns the Net, calling `each_round` each time, until both are done; what the client holds
 /// is dropped only then, so what the peer saw came from the client, not from its sockets
 /// closing. Returns what `serve` returned.
@@ -148,14 +216,7 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
     mut each_round: impl FnMut(),
 ) -> T {
     with_tap_net(tap, |net, clock| {
-        let listener = TcpListener::bind(SocketAddrV4::new(KERNEL_ADDR, port)).expect("bind the peer");
-        listener_setup(&listener);
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept the client");
-            stream.set_read_timeout(Some(LIMIT)).unwrap();
-            stream.set_write_timeout(Some(LIMIT)).unwrap();
-            serve(stream)
-        });
+        let mut peer = KernelPeer::listen(port, listener_setup, serve);
         let mut rt = Runtime::new(0);
         let handle = net.handle();
         let held: Rc<RefCell<Option<H>>> = Rc::default();
@@ -163,23 +224,21 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
         let socket = tap.socket;
         let task = async move {
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), port);
-            let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
+            let local = IpListenEndpoint { addr: None, port: next_local_port() };
             let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
             *task_held.borrow_mut() = Some(client(handle, stream).await);
         };
         rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
         let client_done = || held.borrow().is_some();
-        while !(client_done() && server.is_finished()) {
-            assert!(clock.elapsed() < LIMIT, "client done {}, peer done {}", client_done(), server.is_finished());
+        while !(client_done() && peer.is_finished()) {
+            assert!(clock.elapsed() < LIMIT, "client done {}, peer done {}", client_done(), peer.is_finished());
+            peer.accept();
             net.turn(clock.now()).expect("turn the Net");
             rt.poll(clock.ms()).expect("poll the client");
             each_round();
             thread::sleep(ROUND_SLEEP);
         }
-        let saw = match server.join() {
-            Ok(saw) => saw,
-            Err(panic) => resume_unwind(panic),
-        };
+        let saw = peer.join();
         drop(held.borrow_mut().take());
         rt.shutdown();
         saw

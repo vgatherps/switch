@@ -16,7 +16,7 @@ use relay::switchnet::{Error as WssError, Ws, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, client_server, with_tap_net};
+use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint, boxed};
 use switchnet::{NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
@@ -137,35 +137,26 @@ fn until_client_on<T: Send + 'static, H: 'static, F: Future<Output = H> + 'stati
 ) -> T {
     let socket = tap.socket;
     with_tap_net(tap, |net, clock| {
-        let listener = TcpListener::bind((KERNEL_ADDR, SERVER_PORT)).expect("bind the peer");
-        listener_setup(&listener);
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept the client");
-            stream.set_read_timeout(Some(LIMIT)).unwrap();
-            stream.set_write_timeout(Some(LIMIT)).unwrap();
-            serve(stream)
-        });
+        let mut peer = KernelPeer::listen(SERVER_PORT, listener_setup, serve);
         let mut rt = switch::Runtime::new(0);
         let handle = net.handle();
         let held: Rc<RefCell<Option<H>>> = Rc::default();
         let task_held = held.clone();
         let task = async move {
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
-            let local = IpListenEndpoint { addr: None, port: 49152 };
+            let local = IpListenEndpoint { addr: None, port: next_local_port() };
             let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
             *task_held.borrow_mut() = Some(client(handle, stream).await);
         };
         rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
+            peer.accept();
             net.turn(clock.now()).expect("turn the Net");
             rt.poll(clock.ms()).expect("poll the client");
             std::thread::sleep(ROUND_SLEEP);
         }
-        let saw = match server.join() {
-            Ok(saw) => saw,
-            Err(panic) => std::panic::resume_unwind(panic),
-        };
+        let saw = peer.join();
         drop(held.borrow_mut().take());
         rt.shutdown();
         saw
