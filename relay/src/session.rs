@@ -153,9 +153,8 @@ where
     }
 
     /// One input result: a frame is pushed while reading, dropped unread after; the peer's
-    /// FIN while reading fails the connection (PeerEof, or the TLS truncation) unless the
-    /// socket is known dead; a reset is the socket's death. The outcome of a death is
-    /// `settle`d.
+    /// FIN while reading fails the connection (PeerEof, or the TLS truncation); a reset (the
+    /// input reports one after a FIN too) is the socket's death, whose outcome is `settle`d.
     fn take_input(&mut self, input: Result<R::Frame, InputEnd>) {
         match input {
             Ok(frame) => match self.rx_in {
@@ -163,15 +162,13 @@ where
                 RxIn::Stopped | RxIn::Eof => {}
             },
             Err(end) => {
-                let dead = self.tx.end() == End::Dead;
                 match (end, self.rx_in) {
-                    (InputEnd::Fin, RxIn::Reading) if !dead => match self.rx.fin(self.tx.lower_mut()) {
+                    (InputEnd::Fin, RxIn::Reading) => match self.rx.fin(self.tx.lower_mut()) {
                         Ok(()) => self.tx.fail(Failure::PeerEof),
                         Err(e) => self.tx.fail(e.into()),
                     },
-                    // receiving was over (the peer's close came first, or a failure did), or
-                    // a send wait saw the death: `settle` decides
-                    (InputEnd::Fin, _) => {}
+                    // receiving was over: the peer's close came first, or a failure did
+                    (InputEnd::Fin, RxIn::Stopped | RxIn::Eof) => {}
                     (InputEnd::Reset, _) => self.tx.stop(),
                 }
                 self.rx.discard();

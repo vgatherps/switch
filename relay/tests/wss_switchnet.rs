@@ -1279,3 +1279,68 @@ fn wss_with_a_fragment_limit_below_a_control_frame_is_refused() {
         assert!(matches!(got, Err(WssError::Config(e)) if e == want), "{got:?}");
     });
 }
+
+/// Turns the client's runtime (and so the Net) until `done` has a message.
+async fn until_told(done: &mpsc::Receiver<()>) {
+    while done.try_recv().is_err() {
+        assert!(within_rounds(1, std::future::pending::<()>()).await.is_none());
+    }
+}
+
+/// The server sends a message and its FIN (then, if `reset`, a reset at once, with no
+/// WebSocket close), and the client reads only after that: by `recv` (the message, then the
+/// outcome) or by `linger`.
+fn fin_then(reset: bool, lingering: bool) -> Result<(), WssError> {
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let outcome = Rc::new(RefCell::new(None));
+    let seen = outcome.clone();
+    ws_until_client(
+        |_| {},
+        move |mut sock| {
+            sock.write_all(&server_frame(TEXT, b"last")).unwrap();
+            sock.shutdown(std::net::Shutdown::Write).unwrap();
+            if reset {
+                let (go_tx, go_rx) = mpsc::channel();
+                go_tx.send(()).unwrap();
+                reset_when_told(go_rx)(sock);
+                done_tx.send(()).unwrap();
+            }
+        },
+        move |mut ws| async move {
+            if reset {
+                until_told(&done_rx).await;
+                // the FIN and the reset are on the tap now; let the Net take both
+                assert!(within_rounds(50, std::future::pending::<()>()).await.is_none());
+            }
+            let got = if lingering {
+                ws.linger().await
+            } else {
+                let m = ws.recv().await.expect("the message").expect("a message, not the end");
+                assert_eq!(m.text(), Some("last"));
+                ws.recv().await.map(|m| assert!(m.is_none(), "a second message"))
+            };
+            *seen.borrow_mut() = Some(got);
+            ws
+        },
+    );
+    outcome.take().expect("the client ran")
+}
+
+/// The server's FIN alone, no close: recv gives the message, then `PeerEof`; linger ends
+/// clean. (Unchanged.)
+#[zhida_test_support::pinned_test]
+fn peer_fin_without_a_close() {
+    assert!(matches!(fin_then(false, false), Err(WssError::Failed(relay::switchnet::Failure::PeerEof))));
+    assert!(matches!(fin_then(false, true), Ok(())));
+}
+
+/// The server's FIN then a reset, no close: recv gives the message, then `Failed(Dead)`, and
+/// linger is `Failed(Dead)`: a reset before the peer's close. (Before, switchnet reported the
+/// accepted FIN and hid the reset: PeerEof and Ok.)
+#[zhida_test_support::pinned_test]
+fn peer_fin_then_reset_without_a_close_is_dead() {
+    for lingering in [false, true] {
+        let got = fin_then(true, lingering);
+        assert!(matches!(got, Err(WssError::Failed(relay::switchnet::Failure::Dead))), "lingering {lingering}: {got:?}");
+    }
+}

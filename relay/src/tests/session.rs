@@ -413,20 +413,35 @@ fn close_then_reset_in_one_poll_with_a_send_pending_is_a_clean_end() {
     }
 }
 
-/// The peer sends FIN and then resets, with no Close: the app's send sees the death first
-/// (`Failed(Dead)` for that call), then the input reports the FIN (switchnet reports an
-/// accepted FIN, not the reset after it). The peer's Close never came, so the connection's
-/// outcome is `Failed(Dead)`, for recv and for linger. (Before, recv gave PeerEof and linger
-/// Ok.)
+/// The peer sends FIN and then resets, with no Close (switchnet's input reports the reset
+/// after the data, not the FIN): data first, then `Failed(Dead)` for recv, and for linger;
+/// also when the app's send saw the death first. The FIN alone is `PeerEof` for recv and a
+/// clean end for linger.
 #[test]
-fn a_death_seen_by_a_send_then_the_peer_fin_is_dead() {
-    for lingering in [false, true] {
+fn the_peer_fin_then_reset_is_dead_and_a_fin_alone_is_not() {
+    for (reset, lingering, sending) in [(true, false, false), (true, false, true), (true, true, false), (false, false, false), (false, true, false)] {
+        let case = format!("reset {reset} lingering {lingering} sending {sending}");
         let (mut s, log, input) = raw();
-        log.borrow_mut().dead = true;
-        assert_eq!(ready(s.send(Kind::Text, b"ping")), Err(TxError::Failed(Failure::Dead)));
-        end(&input, InputEnd::Fin);
-        let got = if lingering { poll_n(s.linger(), 2) } else { recv_n(&mut s, 2).map(|r| r.map(drop)) };
-        assert_eq!(got, Some(Err(TxError::Failed(Failure::Dead))), "lingering {lingering}");
+        feed(&input, &client_frame(TEXT, b"last"), false);
+        end(&input, if reset { InputEnd::Reset } else { InputEnd::Fin });
+        if reset {
+            log.borrow_mut().dead = true;
+        }
+        if sending {
+            assert_eq!(ready(s.send(Kind::Text, b"ping")), Err(TxError::Failed(Failure::Dead)), "{case}");
+        }
+        let got = if lingering {
+            poll_n(s.linger(), 2)
+        } else {
+            assert_eq!(recv_n(&mut s, 1), Some(msg(Kind::Text, b"last")), "{case}");
+            recv_n(&mut s, 2).map(|r| r.map(drop))
+        };
+        let want = match (reset, lingering) {
+            (true, _) => Err(TxError::Failed(Failure::Dead)),
+            (false, true) => Ok(()),
+            (false, false) => Err(TxError::Failed(Failure::PeerEof)),
+        };
+        assert_eq!(got, Some(want), "{case}");
     }
 }
 
