@@ -6,7 +6,6 @@ mod poll_at_cache;
 mod ready_queue;
 #[cfg(feature = "medium-ip")]
 mod tcp_demux;
-mod tcp_walk;
 mod template;
 
 #[cfg(feature = "udp-set")]
