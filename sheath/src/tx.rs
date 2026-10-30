@@ -51,8 +51,9 @@ enum State {
 ///
 /// One [`Sealed`] frame at a time: the one from `seal`, `take_pending` or
 /// [`TlsTx::close_notify`] must be accepted by `try_send` (offered again while it is handed
-/// back) before the next is made. Its records used sequence numbers, so dropping it would
-/// break every later record; the next of those three calls panics if it was dropped.
+/// back) before the next is made. Its records used sequence numbers, so dropping it breaks
+/// every later record: the next of those three calls (and every one after) fails with
+/// [`TxError::Broken`].
 pub struct TlsTx<L> {
     pub(crate) conn: UnbufferedClientConnection,
     lower: L,
@@ -106,7 +107,7 @@ impl<L: FrameTx> TlsTx<L> {
         &mut self,
         mut f: L::Frame,
     ) -> Result<Sealed<L::Sealed>, TxError<L::Error>> {
-        self.check_sent();
+        self.check_sent()?;
         let (head, room) = self.lower.plain();
         let mut traffic = self.write_traffic()?;
         let n = traffic
@@ -153,11 +154,14 @@ impl<L: FrameTx> TlsTx<L> {
         }
     }
 
-    fn check_sent(&self) {
-        assert!(
-            !self.in_flight,
-            "the last sealed frame was not sent: it is still held or was dropped"
-        );
+    /// The last sealed frame was taken by the lower layer. If not (dropped, or still held and
+    /// never sent), its sequence numbers are lost to every later record: the sender is broken.
+    fn check_sent(&mut self) -> Result<(), TxError<L::Error>> {
+        if self.in_flight {
+            self.state = State::Broken;
+            return Err(TxError::Broken);
+        }
+        Ok(())
     }
 
     fn write_traffic(
@@ -213,7 +217,7 @@ impl<L: FrameTx> TlsTx<L> {
         &mut self,
         mut f: L::Frame,
     ) -> Result<Option<Sealed<L::Sealed>>, TxError<L::Error>> {
-        self.check_sent();
+        self.check_sent()?;
         if matches!(self.state, State::Broken) {
             return Err(TxError::Broken);
         }
@@ -251,7 +255,7 @@ impl<L: FrameTx> FrameTx for TlsTx<L> {
     /// rustls has to send first. Panics if `len` is 0 (rustls makes no record of nothing) or
     /// exceeds the room.
     fn seal(&mut self, mut f: L::Frame, len: usize) -> Result<Self::Sealed, Self::Error> {
-        self.check_sent();
+        self.check_sent()?;
         let (head, room) = self.lower.plain();
         assert!(len > 0, "sealing an empty record");
         assert!(

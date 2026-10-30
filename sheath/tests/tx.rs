@@ -291,24 +291,32 @@ fn sealing_nothing_panics() {
     let _ = peer.tx.seal(f, 0);
 }
 
-/// The review's case: frame A is sealed, another frame goes out, A is dropped. Only a
-/// `Sealed` can be sent, and only one exists at a time, so A's loss is caught.
+/// Frame A is sealed and dropped unsent: its sequence number is lost, so the sender is broken.
+/// The next seal fails with `Broken` instead of panicking, and so does every later call that
+/// would make a record. (Before, the next seal panicked.)
 #[test]
-#[should_panic(expected = "the last sealed frame was not sent")]
-fn sealing_after_dropping_a_sealed_frame_panics() {
+fn sealing_after_dropping_a_sealed_frame_is_broken() {
     let mut peer = connect(None);
-    let a = seal(&mut peer.tx, b"a");
-    drop(a);
-    let _ = seal(&mut peer.tx, b"b");
+    drop(seal(&mut peer.tx, b"a"));
+    let f = frame(&mut peer.tx, b"b");
+    assert!(matches!(peer.tx.seal(f, 1), Err(TxError::Broken)));
+    let f = ready(peer.tx.alloc()).unwrap();
+    assert!(matches!(peer.tx.take_pending(f), Err(TxError::Broken)));
+    let f = ready(peer.tx.alloc()).unwrap();
+    assert!(matches!(peer.tx.close_notify(f), Err(TxError::Broken)));
+    assert!(peer.wire.sent.borrow().is_empty());
 }
 
+/// A second record while the first sealed frame is still held unsent: the sender is broken
+/// (the held one's records can no longer be followed), with `Broken`, not a panic.
 #[test]
-#[should_panic(expected = "the last sealed frame was not sent")]
 fn two_sealed_frames_cannot_exist() {
     let mut peer = connect(None);
     let _a = seal(&mut peer.tx, b"a");
     let f = ready(peer.tx.alloc()).unwrap();
-    let _ = peer.tx.take_pending(f);
+    assert!(matches!(peer.tx.take_pending(f), Err(TxError::Broken)));
+    let f = frame(&mut peer.tx, b"b");
+    assert!(matches!(peer.tx.seal(f, 1), Err(TxError::Broken)));
 }
 
 #[test]
