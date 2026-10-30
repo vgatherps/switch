@@ -4,12 +4,12 @@
 //! call those.
 //!
 //! The input's end: the peer's FIN while reading fails the connection (`PeerEof`, or the TLS
-//! truncation) and is the normal end after its close. A reset is the socket's death. A send
-//! wait that sees it only stops sending (the call that saw it fails with `Failed(Dead)`); the
-//! connection's outcome is decided once the input reports it, after the frames received before
-//! it are read: before the peer's close it is the connection's failure (`Failed(Dead)`), after
-//! it a clean end: reading had stopped there anyway, and what we still owed the peer (our
-//! echo, close_notify) is moot.
+//! truncation) and is the normal end after its close. A reset is the socket's death; a send
+//! wait that sees it only stops sending (the call that saw it fails with `Failed(Dead)`). Once
+//! the death is known and the input ended (by FIN or reset, after the frames received before
+//! it are read), `settle` decides the outcome: before the peer's close it is the connection's
+//! failure (`Failed(Dead)`), after it a clean end: reading had stopped there anyway, and what
+//! we still owed the peer (our echo, close_notify) is moot. A failure stored before stays.
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
@@ -79,6 +79,7 @@ where
         // Parsing stops only where it needs input, so it runs again only once input came.
         let mut parse = true;
         loop {
+            self.settle();
             if parse && self.rx_in == RxIn::Reading && self.rx_step() {
                 self.tx.service().await;
                 return Ok(self.rx.take_message());
@@ -117,6 +118,7 @@ where
         while !(self.rx_in == RxIn::Eof && matches!(self.tx.end(), End::Fin | End::Delivered | End::Dead)) {
             self.wait().await;
         }
+        self.settle();
         match (self.tx.end(), self.tx.failed()) {
             (End::Dead, Some(_)) => Err(TxError::Failed(Failure::Dead)),
             (End::Dead, None) | (End::Open | End::Notify | End::Fin | End::Delivered, _) => Ok(()),
@@ -151,8 +153,9 @@ where
     }
 
     /// One input result: a frame is pushed while reading, dropped unread after; the peer's
-    /// FIN while reading fails the connection (PeerEof, or the TLS truncation); a reset is
-    /// the socket's death (see the module docs).
+    /// FIN while reading fails the connection (PeerEof, or the TLS truncation) unless the
+    /// socket is known dead; a reset is the socket's death. The outcome of a death is
+    /// `settle`d.
     fn take_input(&mut self, input: Result<R::Frame, InputEnd>) {
         match input {
             Ok(frame) => match self.rx_in {
@@ -160,18 +163,29 @@ where
                 RxIn::Stopped | RxIn::Eof => {}
             },
             Err(end) => {
+                let dead = self.tx.end() == End::Dead;
                 match (end, self.rx_in) {
-                    (InputEnd::Fin, RxIn::Reading) => match self.rx.fin(self.tx.lower_mut()) {
+                    (InputEnd::Fin, RxIn::Reading) if !dead => match self.rx.fin(self.tx.lower_mut()) {
                         Ok(()) => self.tx.fail(Failure::PeerEof),
                         Err(e) => self.tx.fail(e.into()),
                     },
-                    // receiving was over: the peer's close came first, or a failure did
-                    (InputEnd::Fin, RxIn::Stopped | RxIn::Eof) => {}
-                    (InputEnd::Reset, _) => self.tx.reset(),
+                    // receiving was over (the peer's close came first, or a failure did), or
+                    // a send wait saw the death: `settle` decides
+                    (InputEnd::Fin, _) => {}
+                    (InputEnd::Reset, _) => self.tx.stop(),
                 }
                 self.rx.discard();
                 self.rx_in = RxIn::Eof;
+                self.settle();
             }
+        }
+    }
+
+    /// Once the socket's death is known and the input ended (every frame before it read): the
+    /// death is the connection's failure unless the peer's close came first or a failure did.
+    fn settle(&mut self) {
+        if self.tx.end() == End::Dead && self.rx_in == RxIn::Eof {
+            self.tx.reset();
         }
     }
 
@@ -188,6 +202,7 @@ where
         if let Some(input) = input {
             self.take_input(input);
         }
+        self.settle();
         took
     }
 }

@@ -413,6 +413,37 @@ fn close_then_reset_in_one_poll_with_a_send_pending_is_a_clean_end() {
     }
 }
 
+/// The peer sends FIN and then resets, with no Close: the app's send sees the death first
+/// (`Failed(Dead)` for that call), then the input reports the FIN (switchnet reports an
+/// accepted FIN, not the reset after it). The peer's Close never came, so the connection's
+/// outcome is `Failed(Dead)`, for recv and for linger. (Before, recv gave PeerEof and linger
+/// Ok.)
+#[test]
+fn a_death_seen_by_a_send_then_the_peer_fin_is_dead() {
+    for lingering in [false, true] {
+        let (mut s, log, input) = raw();
+        log.borrow_mut().dead = true;
+        assert_eq!(ready(s.send(Kind::Text, b"ping")), Err(TxError::Failed(Failure::Dead)));
+        end(&input, InputEnd::Fin);
+        let got = if lingering { poll_n(s.linger(), 2) } else { recv_n(&mut s, 2).map(|r| r.map(drop)) };
+        assert_eq!(got, Some(Err(TxError::Failed(Failure::Dead))), "lingering {lingering}");
+    }
+}
+
+/// `linger` reads the peer's FIN first, then its close_notify finds the socket dead: the
+/// death came before any peer Close, so `Failed(Dead)`. (Before, Ok.)
+#[test]
+fn linger_seeing_the_peer_fin_then_a_death_is_dead() {
+    let (mut s, log, input) = shaped::<true>();
+    log.borrow_mut().room = Some(0);
+    end(&input, InputEnd::Fin);
+    assert_eq!(poll_n(s.linger(), 2), None);
+    assert_eq!(log.borrow().waited.last().copied(), Some("room"));
+    log.borrow_mut().dead = true;
+    assert_eq!(poll_n(s.linger(), 2), Some(Err(TxError::Failed(Failure::Dead))));
+    assert_eq!(sent(&log).len(), 0);
+}
+
 /// Our close sent, then `linger` with the peer's close not in: our FIN goes out and is
 /// delivered, then the peer resets. Its close never came, so the reset is the socket's death,
 /// though nothing of ours was lost.

@@ -472,7 +472,7 @@ impl<L: PlainTx> TxCore<L> {
         self.end = End::Dead;
     }
 
-    /// The input reported the reset, after every frame before it: the socket's death is the
+    /// The socket is dead and the input ended, after every frame before it: the death is the
     /// connection's failure unless the peer's close came first (receiving was over, and what
     /// we still owed it is moot: a clean end). A failure stored before stays.
     pub(crate) fn reset(&mut self) {
