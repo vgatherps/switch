@@ -1152,6 +1152,9 @@ impl<'a> Socket<'a> {
         self.rx_fin_seq = None;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
+        // Set again only when a new tuple is admitted, so a tuple set by connect and closed by
+        // abort before admission never inherits the previous tuple's ownership.
+        self.local_owned = false;
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
