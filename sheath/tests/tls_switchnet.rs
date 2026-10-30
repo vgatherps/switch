@@ -20,7 +20,7 @@ use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use sheath::switchnet::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
-use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, client_server, with_tap_net};
+use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
 use switchnet::{AddTcpError, Closed, IpEndpoint, IpListenEndpoint, NetHandle, OpenError, TcpStream, boxed, tcp};
 
 const SERVER_PORT: u16 = 8443;
@@ -172,8 +172,6 @@ fn receive_error_after_the_handshake_sends_the_alert_before_the_rst() {
 
 /// Every test's client and every peer socket read and write.
 const LIMIT: Duration = Duration::from_secs(60);
-/// The client's local port.
-const LOCAL_PORT: u16 = 49152;
 /// The server's SO_RCVBUF in the backlog tests: its window takes a few KiB of `BULK`, the rest
 /// waits in the client's socket (64 KiB of send buffer).
 const SMALL_RCVBUF: libc::c_int = 4096;
@@ -195,14 +193,7 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
 ) -> T {
     let (server_tls, client_tls) = tls_configs();
     with_tap_net(&TAP, |net, clock| {
-        let listener = TcpListener::bind((KERNEL_ADDR, SERVER_PORT)).expect("bind the peer");
-        listener_setup(&listener);
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept the client");
-            stream.set_read_timeout(Some(LIMIT)).unwrap();
-            stream.set_write_timeout(Some(LIMIT)).unwrap();
-            serve(stream, server_tls)
-        });
+        let mut peer = KernelPeer::listen(SERVER_PORT, listener_setup, move |stream| serve(stream, server_tls));
         let mut rt = Runtime::new(0);
         let handle = net.handle();
         let spawner = rt.spawner();
@@ -210,21 +201,19 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
         let task_held = held.clone();
         let task = async move {
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
-            let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
+            let local = IpListenEndpoint { addr: None, port: next_local_port() };
             let stream = handle.tcp_connect(TAP.socket, remote, local).expect("open TCP").await.expect("TCP connect");
             *task_held.borrow_mut() = Some(client(handle, spawner, stream, client_tls).await);
         };
         rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
+            peer.accept();
             net.turn(clock.now()).expect("turn the Net");
             rt.poll(clock.ms()).expect("poll the client");
             thread::sleep(ROUND_SLEEP);
         }
-        let saw = match server.join() {
-            Ok(saw) => saw,
-            Err(panic) => std::panic::resume_unwind(panic),
-        };
+        let saw = peer.join();
         drop(held.borrow_mut().take());
         rt.shutdown();
         saw
@@ -413,7 +402,7 @@ fn receive_error_waits_for_a_server_that_never_reads_until_the_caller_gives_up()
             }
             drop(tls);
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT + 1);
-            let local = IpListenEndpoint { addr: None, port: LOCAL_PORT + 1 };
+            let local = IpListenEndpoint { addr: None, port: next_local_port() };
             let started = Instant::now();
             let connecting = loop {
                 match handle.tcp_connect(TAP.socket, remote, local) {
