@@ -342,7 +342,7 @@ mod stale_neighbors {
             config.neighbor_capacity = capacity;
             let mut iface = Interface::new(config, &mut device, Instant::ZERO);
             iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(LOCAL.into(), 24)).unwrap());
-            Self::establish(iface, TcpSet::new(vec![]), device)
+            Self::establish(iface, TcpSet::new(64), device)
         }
 
         fn establish(
@@ -365,9 +365,7 @@ mod stale_neighbors {
                 seq: TcpSeqNumber(0),
             };
             conn.arp_reply(0);
-            conn.sockets
-                .get_mut(handle)
-                .connect(conn.iface.context(), (PEER, 65000), (LOCAL, 1234))
+            conn.sockets.connect(handle, conn.iface.context(), (PEER, 65000), (LOCAL, 1234))
                 .unwrap();
             conn.egress(0);
             let bytes = conn.device.inner.tx_queue.pop_front().unwrap();
@@ -607,7 +605,7 @@ mod stale_neighbors {
         config.neighbor_capacity = 1;
         let mut iface = Interface::new(config, &mut device, Instant::ZERO);
         iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(LOCAL.into(), 24)).unwrap());
-        let mut sockets = TcpSet::new(vec![]);
+        let mut sockets = TcpSet::new(64);
         let other = Ipv4Address::new(192, 168, 1, 3);
         for millis in [0, 1, 2, 3, 998, 999, 1_000, 1_001, 1_002, 1_999, 2_000] {
             let peer = if millis % 2 == 0 { PEER } else { other };

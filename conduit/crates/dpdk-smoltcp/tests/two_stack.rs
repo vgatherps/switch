@@ -632,7 +632,7 @@ fn close_both(pair: &mut Pair, handles: &[TcpHandle; 2]) {
         |a, b| {
             let mut moved = false;
             if !a_closed {
-                a.tcp_mut(&handles[0]).close();
+                a.close(&handles[0]);
                 a_closed = true;
                 moved = true;
             }
@@ -646,7 +646,7 @@ fn close_both(pair: &mut Pair, handles: &[TcpHandle; 2]) {
                     Err(RecvError::Finished) => {
                         finished[side.index()] = true;
                         if side == Side::B {
-                            socket.close();
+                            stack.close(&handles[side.index()]);
                         }
                         moved = true;
                     }

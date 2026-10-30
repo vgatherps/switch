@@ -672,7 +672,7 @@ impl TcpTx {
     pub fn shutdown(&mut self) {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.tcp(self.0.index);
-        stack.tcp_mut(handle).close();
+        stack.close(handle);
     }
 
     /// `Future<Output = ()>`, after `shutdown`: resolves once the peer acked every byte and the

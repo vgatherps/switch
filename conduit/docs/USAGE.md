@@ -319,7 +319,9 @@ Stack sends no gratuitous ARP for it.
 `random_seed: u64` seeds the interface PRNG, including the TCP initial-sequence-number secret.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
 only in tests and benchmarks. `neighbor_capacity: usize` controls the ARP cache. `DEFAULT_NEIGHBOR_CAPACITY` is 256. A
-new neighbor in a full cache evicts the neighbor that expires first. Egress sends one segment per
+new neighbor in a full cache evicts the neighbor that expires first. A lookup scans the cached
+neighbors, so it is sized for the gateway and a few on-link peers; hundreds of on-link peers make
+each lookup proportionally slower. Egress sends one segment per
 TCP socket visit while other sockets have frames ready; a socket alone keeps sending while it is due.
 
 `max_sockets: usize` is the TCP slot limit and must be positive, even for a UDP-only application.
@@ -691,8 +693,7 @@ application gives up. A returned connect error leaves the socket unchanged.
 For passive open, call `stack.listen(&handle, local_port)` or supply an `IpListenEndpoint`. An
 unspecified listen address matches the interface address and every `owned_ipv4` address; an explicit
 address filters incoming SYNs and must be the interface address or an `owned_ipv4` address
-(`Stack::listen` refuses another with `Unaddressable`; a raw `tcp_mut(&h).listen(..)` is not
-checked, and such a listener never receives a SYN). TCP and ICMP sent to a broadcast or multicast address are dropped
+(`Stack::listen` refuses another with `Unaddressable`). TCP and ICMP sent to a broadcast or multicast address are dropped
 without a reply, as on Linux. A TCP segment that matches a connection (its 4-tuple) goes to it
 without any address check; a connection's local address is always one of ours. Any other segment
 to an address that is not ours is dropped without a reply: no SYN-ACK and no RST.
@@ -769,20 +770,20 @@ byte-ring capacity.
 
 ### Close, abort, remove, and access
 
-`close()` closes the transmit half. In Established it enters FinWait1; in CloseWait it enters
+`Stack::close(&h)` closes the transmit half. In Established it enters FinWait1; in CloseWait it enters
 LastAck. Queued stream bytes precede FIN. Receive can continue until the peer closes its half. In
 SynReceived it aborts, sending one RST, because the peer is not synchronized for a FIN. In Listen it
 stops listening; in SynSent it enters Closed. In closing states it does nothing. Keep driving to
 send FIN and process replies, and run egress at the TimeWait close deadline (see Time rules).
 
-`abort()` enters Closed immediately. If a connection tuple is present, the next egress attempts to
+`Stack::abort(&h)` enters Closed immediately. If a connection tuple is present, the next egress attempts to
 emit one RST, subject to TX capacity, and forgets the tuple after successful emission. A fresh closed
 socket or unconnected listener has no remote endpoint to reset. To send the RST, drive egress before removing or reconnecting the
 socket. `abort` itself does not transmit or discard queued receive frames.
 
 `remove_tcp(handle)` removes the socket immediately, freeing the slot, and returns
 nothing. It discards queued receive data and sends neither FIN nor RST. Frames already drained stay
-valid and keep their RX mbufs until dropped. To close gracefully instead, `close()` and keep
+valid and keep their RX mbufs until dropped. To close gracefully instead, `close` and keep
 driving, or drop the handle.
 
 Neither `abort`, `remove_tcp`, nor a handle drop cancels TCP frames already in the shared pending
@@ -790,9 +791,9 @@ FIFO. They remain eligible for later flushes, subject to PMD acceptance.
 
 `Stack::tcp(&handle)` reads state, queues, endpoints, and counters and marks nothing.
 `tcp_mut(&handle)` schedules a readiness check before `poll_at` or egress; use it for drains and
-changes. Do not swap the socket behind `tcp_mut` with one from another `TcpSet` or Stack. The
-Stack's address guarantees assume its own interface: passing another `Interface`'s `context()` to a
-raw socket method such as `tcp_mut(&h).connect(..)` is unsupported.
+settings. Connect, listen, close and abort go through the Stack methods of those names, which
+update the Stack's connection index in the call. Do not swap the socket behind `tcp_mut` with one
+from another `TcpSet` or Stack.
 
 ## UDP
 

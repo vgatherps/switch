@@ -90,8 +90,6 @@ pub mod config {
     pub const IFACE_MAX_ADDR_COUNT: usize = 2;
 }
 
-mod table_hash;
-
 pub mod iface;
 
 pub mod phy;

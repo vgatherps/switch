@@ -117,7 +117,7 @@ impl TcpSlot {
         }
         if malformed {
             counts.malformed += 1;
-            stack.tcp_mut(&self.handle).abort();
+            stack.abort(&self.handle);
             self.output.clear();
             self.sent = 0;
         }
@@ -160,7 +160,7 @@ impl TcpSlot {
             && self.output.is_empty()
             && !stack.tcp(&self.handle).can_recv()
         {
-            stack.tcp_mut(&self.handle).close();
+            stack.close(&self.handle);
         }
         Ok(())
     }
@@ -374,7 +374,7 @@ pub fn run(
                 }
                 slot.flush(stack)?;
                 if slot.output.is_empty() {
-                    stack.tcp_mut(&slot.handle).close();
+                    stack.close(&slot.handle);
                 }
                 waiting = waiting.checked_add(1).expect("TCP slot count overflow");
             }

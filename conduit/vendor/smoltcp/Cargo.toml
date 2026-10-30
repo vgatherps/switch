@@ -57,6 +57,9 @@ optional = true
 [dependencies.heapless]
 version = "0.9"
 
+[dependencies.rustc-hash]
+version = "2"
+
 [dependencies.managed]
 version = "0.8"
 features = ["std"]

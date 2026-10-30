@@ -113,10 +113,10 @@ fn connect_rejects_time_wait_tuple_until_expiry() {
             let mut pair = connect_pair(eal, ["h_tupa", "h_tupb"]);
             let ([a, b], _) = establish(&mut pair, Side::A);
             pair.b.tcp_mut(&b).set_ack_delay(None);
-            pair.a.tcp_mut(&a).close();
+            pair.a.close(&a);
             let mut frames = Vec::new();
             until_control(&mut pair, &mut frames, Side::A, TcpControl::Fin);
-            pair.b.tcp_mut(&b).close();
+            pair.b.close(&b);
             pair.drive(
                 |_, _| {},
                 |a_stack, b_stack| {
@@ -200,10 +200,10 @@ fn connect_rejects_dirty_syn_sent_tuple_but_allows_closed_and_listener() {
         assert_eq!(error.to_string(), "address in use");
         assert_eq!(pair.a.tcp(&replacement).state(), State::Closed);
         assert_eq!(pair.a.tcp(&replacement).remote_endpoint(), None);
-        pair.a.tcp_mut(&a).abort();
+        pair.a.abort(&a);
         assert_eq!(pair.a.tcp(&a).remote_endpoint(), Some(remote));
         pair.a.connect(&replacement, remote, CLIENT_PORT).unwrap();
-        pair.a.tcp_mut(&replacement).abort();
+        pair.a.abort(&replacement);
         pair.a.listen(&a, CLIENT_PORT).unwrap();
         pair.a.connect(&replacement, remote, CLIENT_PORT).unwrap();
         pair.a.remove_tcp(a);
@@ -226,7 +226,7 @@ fn drop_established_sends_fin_and_frees_slot_after_close() {
         assert_eq!(count(&frames, Side::A, TcpControl::Rst), 0);
         assert_eq!(pair.b.tcp(&b).state(), State::CloseWait);
         assert_full(&mut pair.a);
-        pair.b.tcp_mut(&b).close();
+        pair.b.close(&b);
         until_control(&mut pair, &mut frames, Side::B, TcpControl::Fin);
         assert_eq!(pair.b.tcp(&b).state(), State::LastAck);
         assert_full(&mut pair.a);
@@ -270,7 +270,7 @@ fn drop_close_wait_frees_slot_after_fin_ack() {
         pair.a.tcp_mut(&a).set_ack_delay(None);
         pair.b.tcp_mut(&b).set_ack_delay(None);
         let mut frames = Vec::new();
-        pair.a.tcp_mut(&a).close();
+        pair.a.close(&a);
         until_control(&mut pair, &mut frames, Side::A, TcpControl::Fin);
         assert_eq!(pair.b.tcp(&b).state(), State::CloseWait);
         drop(b);
@@ -769,7 +769,7 @@ fn reconnect_loop_one_slot() {
             assert_full(&mut pair.a);
             until_control(&mut pair, &mut frames, Side::A, TcpControl::Fin);
             assert_eq!(pair.b.tcp(&b).state(), State::CloseWait);
-            pair.b.tcp_mut(&b).close();
+            pair.b.close(&b);
             pair.drive(
                 |dir, bytes| frames.push((dir, bytes.to_vec())),
                 |_, b_stack| {

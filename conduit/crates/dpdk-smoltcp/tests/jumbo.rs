@@ -395,7 +395,7 @@ fn reconnect_reclassifies() {
                 offers.push(repr.max_seg_size);
             });
             assert_eq!(offers, [Some(expected)]);
-            pair.a.tcp_mut(&client).abort();
+            pair.a.abort(&client);
             assert_eq!(pair.a.tcp(&client).state(), State::Closed);
             let now = pair.now();
             pair.a.turn(now, BUDGET).unwrap();
@@ -568,7 +568,7 @@ fn listener_reuse_reclassifies() {
             assert_eq!(pair.b.tcp(&server).state(), State::Listen);
             assert_eq!(listener_reply(&mut pair, src, None), (TcpControl::Syn, Some(expected)));
             assert_eq!(pair.b.tcp(&server).state(), State::SynReceived);
-            pair.b.tcp_mut(&server).abort();
+            pair.b.abort(&server);
             assert_eq!(pair.b.tcp(&server).state(), State::Closed);
             let now = pair.now();
             pair.b.turn(now, BUDGET).unwrap();
@@ -599,7 +599,7 @@ fn invalid_syn_leaves_listener_unchanged() {
         assert_eq!(pair.b.tcp(&server).remote_endpoint(), None);
         assert_eq!(listener_reply(&mut pair, Side::A.ip(), None), (TcpControl::Syn, Some(8960)));
         assert_eq!(pair.b.tcp(&server).state(), State::SynReceived);
-        pair.b.tcp_mut(&server).abort();
+        pair.b.abort(&server);
         let now = pair.now();
         pair.b.turn(now, BUDGET).unwrap();
         assert_eq!(pair.drain_tx(Side::B, |_| {}), 1);

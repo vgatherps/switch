@@ -723,7 +723,7 @@ impl Client {
         self.end = Some(end);
         self.phase = Phase::Closing;
         for conn in &self.conns {
-            self.stack.tcp_mut(&conn.handle).close();
+            self.stack.close(&conn.handle);
         }
     }
 
@@ -742,6 +742,11 @@ impl Client {
     /// Panics if `conn` is not a connection index.
     pub fn socket(&mut self, conn: usize) -> &mut tcp::Socket<'static> {
         self.stack.tcp_mut(&self.conns[conn].handle)
+    }
+
+    /// Abort connection `conn` (one RST). Panics if `conn` is not a connection index.
+    pub fn abort(&mut self, conn: usize) {
+        self.stack.abort(&self.conns[conn].handle);
     }
 
     pub fn report(&self) -> ClientReport {
@@ -1017,8 +1022,8 @@ impl Peer {
             // FIN leaves in this poll's send, so the client's ACK can close the
             // socket before the next poll: record the state close() moved to.
             if conn.seen == State::CloseWait && socket.recv_queue() == 0 && conn.pending.is_none() {
-                socket.close();
-                advance(&PEER_PATH, &mut conn.seen, socket.state())
+                self.stack.close(&conn.handle);
+                advance(&PEER_PATH, &mut conn.seen, self.stack.tcp(&conn.handle).state())
                     .expect("close in CloseWait moves to LastAck");
             }
         }

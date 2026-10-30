@@ -251,7 +251,7 @@ fn parked_room_resolves_with_an_error_on_reset() {
         mixed.rounds(20);
         assert_eq!(polls.get(), parked, "the writer is not parked");
         assert!(!slot.is_full());
-        mixed.peer.tcp_mut(&peer).abort();
+        mixed.peer.abort(&peer);
         mixed.peer.turn(mixed.now, BUDGET).unwrap();
         assert!(mixed.to_net.forward() >= 1, "the reset did not leave the peer");
         mixed.turn();

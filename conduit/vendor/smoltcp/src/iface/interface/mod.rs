@@ -333,7 +333,9 @@ impl Interface {
         self.inner.get_source_address(dst_addr)
     }
 
-    /// Update the IP addresses of the interface.
+    /// Update the IP addresses of the interface. Call it before any TCP socket holds a
+    /// connection or listens: a connection on a removed address is not reset and keeps sending
+    /// from it, and a listener bound to one keeps it.
     ///
     /// # Panics
     /// This function panics if any of the addresses are not unicast.
@@ -409,8 +411,6 @@ impl Interface {
 
         self.poll_maintenance(timestamp);
 
-        sockets.sync_dirty_identities(&self.inner);
-
         // Process ingress while there's packets available.
         loop {
             match self.socket_ingress(
@@ -477,8 +477,6 @@ impl Interface {
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
 
-        sockets.sync_dirty_identities(&self.inner);
-
         self.socket_ingress(
             device,
             sockets,
@@ -497,8 +495,6 @@ impl Interface {
         udp: &mut UdpSet,
     ) -> PollIngressSingleResult {
         self.inner.now = timestamp;
-
-        tcp.sync_dirty_identities(&self.inner);
 
         self.socket_ingress(device, tcp, Some(udp))
     }
@@ -844,15 +840,12 @@ impl Interface {
                     }
                     sockets.check_reapable(index);
                 }
-                // Inside dispatch, a flow key change requires a state change. Timers (close,
-                // TIME_WAIT end, RTO abort) change readiness only through the state.
+                sockets.update_identity(index);
+                // Timers (close, TIME_WAIT end, RTO abort) change readiness only through the
+                // state.
                 if state_changed {
-                    sockets.resync_identity(index);
                     sockets.check_reapable(index);
                     sockets.fire(index);
-                } else {
-                    #[cfg(debug_assertions)]
-                    sockets.debug_assert_synced(index);
                 }
                 if dispatch_result.is_err() || !emitted {
                     break dispatch_result;
@@ -979,7 +972,6 @@ fn classify_dirty(
             sockets.slot_visits += 1;
         }
         let index = sockets.dirty_list[position];
-        sockets.sync_identity(inner, index);
         classify(inner, sockets, index, timestamp);
     }
     if admit {
@@ -1070,14 +1062,6 @@ impl InterfaceInner {
     #[inline]
     pub(crate) fn owns_ipv4(&self, addr: Ipv4Address) -> bool {
         self.owned_ipv4.contains(addr)
-    }
-
-    /// `owns_ipv4` for an IP address.
-    #[inline]
-    pub(crate) fn owns(&self, addr: IpAddress) -> bool {
-        match addr {
-            IpAddress::Ipv4(addr) => self.owns_ipv4(addr),
-        }
     }
 
     #[cfg(feature = "medium-ip")]

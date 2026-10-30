@@ -4,7 +4,7 @@ use std::io::Read;
 use smoltcp::iface::{
     Config, DropQueue, Interface, NoRoute, OwnedIpv4, PathMtu, PathMtus, PollIngressSingleResult,
     PollResult, ReadySide,
-    SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
+    SocketHandle, TcpSet, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
 use smoltcp::phy::TxFrame;
@@ -291,11 +291,9 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
-        let mut storage = Vec::with_capacity(config.max_sockets);
-        storage.resize_with(config.max_sockets, || TcpStorage::EMPTY);
         Ok(Self {
             iface,
-            sockets: TcpSet::new(storage),
+            sockets: TcpSet::new(config.max_sockets),
             udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
             dropped_tcp: Vec::with_capacity(config.max_sockets),
@@ -691,12 +689,11 @@ impl Stack {
         self.sockets.get(self.tcp_raw(handle))
     }
 
-    /// Change a socket and schedule a readiness check before the next
-    /// `poll_at` call or egress pass. No public API hands out an owned socket, so
+    /// Change a socket's data or settings and schedule a readiness check before the
+    /// next `poll_at` call or egress pass. Connect, listen, close and abort go through
+    /// the Stack methods of those names. No public API hands out an owned socket, so
     /// this reference cannot be overwritten with a new one; swapping it with a
-    /// socket held by another `TcpSet` or Stack is unsupported. The Stack's address
-    /// guarantees assume its own interface: passing another `Interface`'s `context()`
-    /// to a raw socket method such as `connect` is unsupported.
+    /// socket held by another `TcpSet` or Stack is unsupported.
     pub fn tcp_mut(&mut self, handle: &TcpHandle) -> &mut tcp::Socket<'static> {
         let raw = self.tcp_raw(handle);
         self.sockets.get_mut(raw)
@@ -727,31 +724,12 @@ impl Stack {
         local: U,
     ) -> Result<(), tcp::ConnectError> {
         let raw = self.tcp_raw(handle);
-        let remote = remote.into();
-        let local = self.sockets.get(raw).connect_local_endpoint(
-            self.iface.context(),
-            remote,
-            local.into(),
-        )?;
-        if self.sockets.iter().any(|(_, socket)| {
-            !matches!(socket.state(), tcp::State::Closed | tcp::State::Listen)
-                && socket.local_endpoint() == Some(local)
-                && socket.remote_endpoint() == Some(remote)
-        }) {
-            return Err(tcp::ConnectError::AddressInUse);
-        }
-        let socket = self.sockets.get_mut(raw);
-        socket.connect(self.iface.context(), remote, local)?;
-        Ok(())
+        self.sockets.connect(raw, self.iface.context(), remote, local)
     }
 
     /// `tcp::Socket::listen`, refusing an explicit local address that is
     /// neither `StackConfig::ipv4`'s address nor in `StackConfig::owned_ipv4`
     /// (`Unaddressable`). A failed listen leaves the socket unchanged.
-    ///
-    /// `tcp_mut(handle).listen(..)` does not check the address; such a
-    /// listener never receives a SYN, because a segment to an address we do
-    /// not own is dropped before any listener is consulted.
     pub fn listen<T: Into<IpListenEndpoint>>(
         &mut self,
         handle: &TcpHandle,
@@ -762,9 +740,20 @@ impl Stack {
         if local.addr.is_some_and(|addr| !self.iface.has_ip_addr(addr)) {
             return Err(tcp::ListenError::Unaddressable);
         }
-        let socket = self.sockets.get_mut(raw);
-        socket.listen(local)?;
-        Ok(())
+        self.sockets.listen(raw, local)
+    }
+
+    /// `tcp::Socket::close`: send FIN after the queued data, or, in LISTEN and
+    /// SYN-SENT, close at once; in SYN-RECEIVED, reset.
+    pub fn close(&mut self, handle: &TcpHandle) {
+        let raw = self.tcp_raw(handle);
+        self.sockets.close(raw);
+    }
+
+    /// `tcp::Socket::abort`: close at once; an open connection sends one RST.
+    pub fn abort(&mut self, handle: &TcpHandle) {
+        let raw = self.tcp_raw(handle);
+        self.sockets.abort(raw);
     }
 
     /// Remove the socket immediately, freeing its slot and releasing its queued

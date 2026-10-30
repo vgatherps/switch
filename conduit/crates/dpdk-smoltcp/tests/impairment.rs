@@ -593,7 +593,7 @@ fn rst_on_abort_closes_peer() {
             |dir, frame| frames.push((dir, frame.to_vec())),
             |a, b| {
                 if !aborted {
-                    a.tcp_mut(&handles[0]).abort();
+                    a.abort(&handles[0]);
                     assert_eq!(a.tcp(&handles[0]).state(), State::Closed);
                     aborted = true;
                     App::Moved
@@ -630,9 +630,9 @@ fn data_then_close_drains_before_finished() {
             |_, _| {},
             |a, b| {
                 if !closed {
-                    let socket = a.tcp_mut(&handles[0]);
-                    assert_eq!(socket.send_slice(&data), Ok(data.len()));
-                    socket.close();
+                    assert_eq!(a.tcp_mut(&handles[0]).send_slice(&data), Ok(data.len()));
+                    a.close(&handles[0]);
+                    let socket = a.tcp(&handles[0]);
                     assert_eq!(
                         (socket.state(), socket.send_queue()),
                         (State::FinWait1, data.len())
@@ -692,16 +692,15 @@ fn time_wait_expires_from_supplied_time() {
         pair.drive(
             |dir, frame| frames.push((dir, frame.to_vec())),
             |a, b| {
-                let (a, b) = (a.tcp_mut(&handles[0]), b.tcp_mut(&handles[1]));
                 if !closed[0] {
-                    a.close();
+                    a.close(&handles[0]);
                     closed[0] = true;
                     App::Moved
-                } else if !closed[1] && b.state() == State::CloseWait {
-                    b.close();
+                } else if !closed[1] && b.tcp(&handles[1]).state() == State::CloseWait {
+                    b.close(&handles[1]);
                     closed[1] = true;
                     App::Moved
-                } else if a.state() == State::TimeWait {
+                } else if a.tcp(&handles[0]).state() == State::TimeWait {
                     App::Done
                 } else {
                     App::Idle

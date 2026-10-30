@@ -36,11 +36,9 @@ fn take_syn(device: &mut Loopback) -> u32 {
 fn different_interface_seeds_change_active_syn_isn() {
     let syn = |seed| {
         let (mut iface, mut device) = interface(seed);
-        let mut sockets = TcpSet::new(vec![]);
+        let mut sockets = TcpSet::new(64);
         let handle = add_socket(&mut sockets);
-        sockets
-            .get_mut(handle)
-            .connect(iface.context(), (REMOTE, 80), 49152)
+        sockets.connect(handle, iface.context(), (REMOTE, 80), 49152)
             .unwrap();
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
         take_syn(&mut device)
@@ -51,19 +49,15 @@ fn different_interface_seeds_change_active_syn_isn() {
 #[test]
 fn reconnect_same_tuple_advances_syn_isn_with_interface_time() {
     let (mut iface, mut device) = interface(1);
-    let mut sockets = TcpSet::new(vec![]);
+    let mut sockets = TcpSet::new(64);
     let handle = add_socket(&mut sockets);
-    sockets
-        .get_mut(handle)
-        .connect(iface.context(), (REMOTE, 80), 49152)
+    sockets.connect(handle, iface.context(), (REMOTE, 80), 49152)
         .unwrap();
     iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
     let first = take_syn(&mut device);
-    sockets.get_mut(handle).abort();
+    sockets.abort(handle);
     iface.poll_maintenance(Instant::from_millis(1));
-    sockets
-        .get_mut(handle)
-        .connect(iface.context(), (REMOTE, 80), 49152)
+    sockets.connect(handle, iface.context(), (REMOTE, 80), 49152)
         .unwrap();
     iface.poll_egress(Instant::from_millis(1), &mut device, &mut sockets);
     let second = take_syn(&mut device);
@@ -77,9 +71,9 @@ fn passive_syn_isn_uses_interface_seed_and_time() {
 
     let syn = |seed, now| {
         let (mut iface, mut device) = interface(seed);
-        let mut sockets = TcpSet::new(vec![]);
+        let mut sockets = TcpSet::new(64);
         let handle = add_socket(&mut sockets);
-        sockets.get_mut(handle).listen(80).unwrap();
+        sockets.listen(handle, 80).unwrap();
         let tcp = TcpRepr {
             src_port: 49152,
             dst_port: 80,

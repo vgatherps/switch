@@ -470,6 +470,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rstest",
+ "rustc-hash",
  "zhida-buffer",
  "zhida-dpdk-sys",
 ]

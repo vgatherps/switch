@@ -22,7 +22,7 @@ use support::{
 /// that reaches the Net and is turned.
 fn peer_resets_after(mixed: &mut Mixed, peer: &TcpHandle) {
     mixed.until(|m| m.peer.tcp(peer).send_queue() == 0);
-    mixed.peer.tcp_mut(peer).abort();
+    mixed.peer.abort(peer);
     mixed.peer.turn(mixed.now, BUDGET).unwrap();
     assert!(mixed.to_net.forward() >= 1, "the reset did not leave the peer");
     mixed.turn();
@@ -156,7 +156,7 @@ fn accepted_fin_then_reset_gives_finished() {
         let mut mixed = Mixed::new(eal, ["frsa", "frsb"]);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"last");
-        mixed.peer.tcp_mut(&peer).close();
+        mixed.peer.close(&peer);
         mixed.until(|m| m.peer.tcp(&peer).state() == State::FinWait2);
         peer_resets_after(&mut mixed, &peer);
         assert_eq!(mixed.peer.tcp(&peer).state(), State::Closed);

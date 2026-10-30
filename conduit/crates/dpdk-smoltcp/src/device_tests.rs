@@ -184,7 +184,7 @@ fn checksum_ingress(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags:
             .push(IpCidr::new(Ipv4Address::new(10, 0, 0, 1).into(), 24))
             .unwrap();
     });
-    let mut sockets = TcpSet::new(Vec::new());
+    let mut sockets = TcpSet::new(64);
     let mut arp = Vec::new();
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
     arp.extend_from_slice(&[0x02, 0, 0, 0, 0, 2]);
@@ -551,7 +551,7 @@ fn socket_template_frames(
     iface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
     });
-    let mut sockets = TcpSet::new(Vec::new());
+    let mut sockets = TcpSet::new(64);
     let handle = sockets.add_admitted(
         &pair::tcp_socket_sized(4096),
         1500,
@@ -575,9 +575,7 @@ fn socket_template_frames(
     stage(&fixture, &mut device, &bytes);
     iface.poll_ingress_single(NOW, &mut device, &mut sockets);
     assert!(device.tx.is_empty());
-    sockets
-        .get_mut(handle)
-        .connect(iface.context(), (Side::B.ip(), 80), (Side::A.ip(), 49152))
+    sockets.connect(handle, iface.context(), (Side::B.ip(), 80), (Side::A.ip(), 49152))
         .unwrap();
     iface.poll_egress(NOW, &mut device, &mut sockets);
     let syn = capture_socket_frame(&fixture, &mut device, offload, &[]);
@@ -636,8 +634,8 @@ fn socket_template_frames(
             TcpControl::Psh => {
                 assert_eq!(sockets.get_mut(handle).send_slice(data), Ok(data.len()));
             }
-            TcpControl::Fin => sockets.get_mut(handle).close(),
-            TcpControl::Rst => sockets.get_mut(handle).abort(),
+            TcpControl::Fin => sockets.close(handle),
+            TcpControl::Rst => sockets.abort(handle),
             _ => unreachable!(),
         }
         let poisoned = if poison {
@@ -1172,7 +1170,7 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
             eth.set_ethertype(EthernetProtocol::Arp);
             arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
             stage(&fixture, &mut device, &bytes);
-            let mut tcp = TcpSet::new(Vec::new());
+            let mut tcp = TcpSet::new(64);
             iface.poll_ingress_single(NOW, &mut device, &mut tcp);
             assert!(device.tx.is_empty());
             let mut udp = UdpSet::new(1, device.frame_source());
@@ -1281,7 +1279,7 @@ fn udp_template_frames_match_generic_and_flags() {
             eth.set_ethertype(EthernetProtocol::Arp);
             arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
             stage(&fixture, &mut device, &bytes);
-            let mut tcp = TcpSet::new(Vec::new());
+            let mut tcp = TcpSet::new(64);
             iface.poll_ingress_single(NOW, &mut device, &mut tcp);
             assert!(device.tx.is_empty());
             let mut udp = UdpSet::new(1, device.frame_source());
@@ -1750,26 +1748,15 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u
     assert_no_pools();
 }
 
-/// Owned by the foreign interface in the tests below, never by the Stack.
-const FOREIGN: Ipv4Address = Ipv4Address::new(10, 0, 0, 78);
-
-/// A Stack on Side A owning `stack_owned` with the peer's MAC resolved and one TCP socket, plus
-/// a separately built Interface that owns `FOREIGN`; its context is what a raw socket method
-/// could be handed instead of the Stack's own.
-fn foreign_context_stack(
+/// A Stack on Side A owning `stack_owned`, with the peer's MAC resolved and one TCP socket.
+fn owned_address_stack(
     eal: &crate::Eal,
     stack_owned: &[smoltcp::wire::Ipv4Cidr],
-) -> (Fixture, crate::Stack, Interface, crate::TcpHandle) {
+) -> (Fixture, crate::Stack, crate::TcpHandle) {
     use crate::{Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY};
-    use smoltcp::iface::OwnedIpv4;
     use smoltcp::wire::{ArpOperation, Ipv4Cidr};
 
-    let subnet = Ipv4Cidr::new(Side::A.ip(), 24);
-    assert!(subnet.contains_addr(&FOREIGN));
-    let (fixture, mut device) = open(eal, 4, 4);
-    let mut config = Config::new(Side::A.mac().into());
-    config.owned_ipv4 = OwnedIpv4::new(&[Ipv4Cidr::new(FOREIGN, 32)], subnet, None).unwrap();
-    let other = Interface::new(config, &mut device, NOW);
+    let (fixture, device) = open(eal, 4, 4);
     let arp = zhida_test_kit::ring_port::arp(
         ArpOperation::Reply,
         Side::A.mac(),
@@ -1779,7 +1766,7 @@ fn foreign_context_stack(
     produce(&fixture, &[rx_frame_bytes(&device.port, &arp)]);
     let config = StackConfig {
         ethernet: Side::A.mac(),
-        ipv4: subnet,
+        ipv4: Ipv4Cidr::new(Side::A.ip(), 24),
         gateway: None,
         paths: &[],
         owned_ipv4: stack_owned,
@@ -1797,10 +1784,10 @@ fn foreign_context_stack(
     let handle = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap();
     stack.turn(NOW, 8).unwrap();
     assert!(peer_receive(&fixture, 16).is_empty());
-    (fixture, stack, other, handle)
+    (fixture, stack, handle)
 }
 
-fn close_foreign_context_stack(fixture: Fixture, stack: crate::Stack) {
+fn close_owned_address_stack(fixture: Fixture, stack: crate::Stack) {
     let port = stack.into_port();
     assert_eq!(in_use(&port), (0, 0));
     port.try_close().unwrap();
@@ -1820,87 +1807,9 @@ fn sent_tcp(fixture: &Fixture) -> Vec<(Ipv4Address, bool, bool)> {
         .collect()
 }
 
-/// A raw connect given another interface's context, one that owns the source address, then
-/// `Stack::send` with no receive: the Stack's egress checks the tuple against its own addresses
-/// before the first dispatch, so no SYN leaves from an address this Stack does not own and the
-/// socket is reset.
-#[zhida_test_support::pinned_test]
-fn foreign_context_connect_then_send_emits_nothing() {
-    use smoltcp::socket::tcp::State;
-
-    with_test_eal(|eal| {
-        let (fixture, mut stack, mut other, handle) = foreign_context_stack(eal, &[]);
-        stack
-            .tcp_mut(&handle)
-            .connect(other.context(), (Side::B.ip(), 80), (FOREIGN, 49152))
-            .unwrap();
-        assert_eq!(stack.tcp(&handle).state(), State::SynSent);
-        stack.send().unwrap();
-        assert!(sent_tcp(&fixture).is_empty());
-        assert_eq!(stack.tcp(&handle).state(), State::Closed);
-        assert_eq!(stack.tcp(&handle).local_endpoint(), None);
-        close_foreign_context_stack(fixture, stack);
-    });
-}
-
-/// A socket admitted on an owned address X keeps no ownership for its next tuple: abort, a raw
-/// connect from the foreign address and abort again, all before the Stack runs, close the socket
-/// with the foreign tuple and no flow to admit. `Stack::send` sends no RST from the foreign
-/// address and resets the socket.
-#[zhida_test_support::pinned_test]
-fn aborted_foreign_connect_does_not_inherit_ownership() {
-    use smoltcp::socket::tcp::State;
-    use smoltcp::wire::Ipv4Cidr;
-
-    with_test_eal(|eal| {
-        let owned = Ipv4Address::new(10, 0, 0, 77);
-        let (fixture, mut stack, mut other, handle) =
-            foreign_context_stack(eal, &[Ipv4Cidr::new(owned, 32)]);
-        stack.connect(&handle, (Side::B.ip(), 80), (owned, 49152)).unwrap();
-        stack.send().unwrap();
-        assert_eq!(sent_tcp(&fixture), [(owned, true, false)]);
-        let socket = stack.tcp_mut(&handle);
-        socket.abort();
-        socket
-            .connect(other.context(), (Side::B.ip(), 80), (FOREIGN, 49153))
-            .unwrap();
-        socket.abort();
-        stack.send().unwrap();
-        assert_eq!(sent_tcp(&fixture), []);
-        assert_eq!(stack.tcp(&handle).state(), State::Closed);
-        assert_eq!(stack.tcp(&handle).local_endpoint(), None);
-        close_foreign_context_stack(fixture, stack);
-    });
-}
-
-/// Refusing a foreign tuple changes the socket's state, so it fires a token armed after the
-/// connect: the waiter learns the socket closed instead of sleeping with no deadline.
-#[zhida_test_support::pinned_test]
-fn refused_foreign_connect_fires_armed_token() {
-    use smoltcp::iface::ReadySide;
-    use smoltcp::socket::tcp::State;
-
-    with_test_eal(|eal| {
-        let (fixture, mut stack, mut other, handle) = foreign_context_stack(eal, &[]);
-        stack
-            .tcp_mut(&handle)
-            .connect(other.context(), (Side::B.ip(), 80), (FOREIGN, 49152))
-            .unwrap();
-        let key = stack.tcp_ready_key(&handle);
-        stack.arm_tcp(key, ReadySide::Rx, 7);
-        assert_eq!(stack.pop_fired(), None);
-        stack.send().unwrap();
-        assert_eq!(stack.pop_fired(), Some(7));
-        assert_eq!(stack.pop_fired(), None);
-        assert_eq!(stack.tcp(&handle).state(), State::Closed);
-        assert!(sent_tcp(&fixture).is_empty());
-        close_foreign_context_stack(fixture, stack);
-    });
-}
-
-/// Reconnecting an aborted socket with the same tuple on an owned (not interface) address before
-/// the Stack runs keeps the connection: the reconnect is admitted again even though its flow key
-/// is unchanged, so the next send emits its SYN from the owned address instead of resetting it.
+/// Abort, then reconnect on the same tuple from an owned (not interface) address before the
+/// Stack runs: the reconnect replaces the RST the abort owed, so the next send emits only the
+/// new SYN, from the owned address.
 #[zhida_test_support::pinned_test]
 fn same_tuple_reconnect_on_owned_address_sends_syn() {
     use smoltcp::socket::tcp::State;
@@ -1908,20 +1817,19 @@ fn same_tuple_reconnect_on_owned_address_sends_syn() {
 
     with_test_eal(|eal| {
         let owned = Ipv4Address::new(10, 0, 0, 77);
-        let (fixture, mut stack, _other, handle) =
-            foreign_context_stack(eal, &[Ipv4Cidr::new(owned, 32)]);
+        let (fixture, mut stack, handle) = owned_address_stack(eal, &[Ipv4Cidr::new(owned, 32)]);
         stack.connect(&handle, (Side::B.ip(), 80), (owned, 49152)).unwrap();
         stack.send().unwrap();
         assert_eq!(sent_tcp(&fixture), [(owned, true, false)]);
-        stack.tcp_mut(&handle).abort();
+        stack.abort(&handle);
         stack.connect(&handle, (Side::B.ip(), 80), (owned, 49152)).unwrap();
         stack.send().unwrap();
         assert_eq!(sent_tcp(&fixture), [(owned, true, false)]);
         assert_eq!(stack.tcp(&handle).state(), State::SynSent);
-        stack.tcp_mut(&handle).abort();
+        stack.abort(&handle);
         stack.send().unwrap();
         assert_eq!(sent_tcp(&fixture), [(owned, false, true)]);
-        close_foreign_context_stack(fixture, stack);
+        close_owned_address_stack(fixture, stack);
     });
 }
 
@@ -2365,7 +2273,7 @@ fn interface_answers_arp_request_through_paired_token_exact_bytes() {
                 .push(IpCidr::new(Ipv4Address::new(10, 0, 0, 1).into(), 24))
                 .unwrap();
         });
-        let mut sockets = TcpSet::new(Vec::new());
+        let mut sockets = TcpSet::new(64);
 
         let header = |dst: [u8; 6], src: [u8; 6], op: u8| {
             let mut frame = Vec::with_capacity(14);
@@ -3065,7 +2973,7 @@ fn retransmit_with_tx_checksum_offload() {
         iface.update_ip_addrs(|addrs| {
             addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
         });
-        let mut sockets = TcpSet::new(Vec::new());
+        let mut sockets = TcpSet::new(64);
         let handle = sockets.add_admitted(
             &pair::tcp_socket_sized(4096),
             1500,
@@ -3088,9 +2996,7 @@ fn retransmit_with_tx_checksum_offload() {
         arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
         stage(&fixture, &mut device, &bytes);
         iface.poll_ingress_single(NOW, &mut device, &mut sockets);
-        sockets
-            .get_mut(handle)
-            .connect(iface.context(), (Side::B.ip(), 80), (Side::A.ip(), 49152))
+        sockets.connect(handle, iface.context(), (Side::B.ip(), 80), (Side::A.ip(), 49152))
             .unwrap();
         iface.poll_egress(NOW, &mut device, &mut sockets);
         assert_eq!(device.flush(), Ok(1));
@@ -3199,7 +3105,7 @@ fn udp_iface(fixture: &Fixture, device: &mut Device) -> Interface {
     eth.set_ethertype(EthernetProtocol::Arp);
     arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
     stage(fixture, device, &bytes);
-    iface.poll_ingress_single(NOW, device, &mut TcpSet::new(Vec::new()));
+    iface.poll_ingress_single(NOW, device, &mut TcpSet::new(64));
     assert!(device.tx.is_empty());
     iface
 }

@@ -288,26 +288,21 @@ impl InterfaceInner {
         self.refresh_sender(ipv4_repr, source_hardware_addr);
         // Only a plain SYN retires an acceptable TIME-WAIT tuple for a listener; a SYN+FIN goes
         // to the TIME-WAIT socket, which ACKs it, listener or not.
-        if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none() {
-            while let Some(index) = winner {
-                let socket = &mut sockets
-                    .item_at_mut(index)
-                    .expect("TCP flow index contains an empty slot")
-                    .socket;
-                if !socket.time_wait_accepts_syn(&tcp_repr)
-                    || sockets.tcp_listener_lookup(dst).is_none()
-                {
-                    break;
-                }
-                sockets
-                    .item_at_mut(index)
-                    .expect("TCP flow index contains an empty slot")
-                    .socket
-                    .finish_time_wait();
-                sockets.resync_identity(index);
+        if tcp_repr.control == TcpControl::Syn
+            && tcp_repr.ack_number.is_none()
+            && let Some(index) = winner
+            && let Some(listener) = sockets.tcp_listener_lookup(dst)
+        {
+            let socket = &mut sockets
+                .item_at_mut(index)
+                .expect("TCP flow index contains an empty slot")
+                .socket;
+            if socket.time_wait_accepts_syn(&tcp_repr) {
+                socket.finish_time_wait();
+                sockets.update_identity(index);
                 sockets.check_reapable(index);
-                sockets.mark_dirty_synced(index);
-                winner = sockets.tcp_lookup(dst, src, syn_like);
+                sockets.mark_dirty(index);
+                winner = Some(listener);
             }
         }
 
@@ -331,15 +326,12 @@ impl InterfaceInner {
             );
             let before = socket.state();
             let (reply, pending) = socket.process(self, &ip_repr, &tcp_repr);
-            // Inside process, a flow key change requires a state change.
-            if socket.state() != before {
-                sockets.resync_identity(index);
+            let state_changed = socket.state() != before;
+            sockets.update_identity(index);
+            if state_changed {
                 sockets.check_reapable(index);
-            } else {
-                #[cfg(debug_assertions)]
-                sockets.debug_assert_synced(index);
             }
-            sockets.mark_dirty_synced(index);
+            sockets.mark_dirty(index);
             if let Some(pending) = pending {
                 sockets.pending_rx_attach = Some((index, pending));
             }

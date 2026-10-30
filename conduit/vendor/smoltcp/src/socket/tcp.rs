@@ -501,11 +501,6 @@ pub struct Socket<'a> {
     in_rto_loss_episode: bool,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
     remote_has_sack: bool,
-    /// The tuple's local address is in the owned set of the interface that registered its flow
-    /// (`admit_local`), not of the context given at connect, which could be another interface's.
-    /// The owned set is fixed for the interface's life, so egress needs no search. Sits in the
-    /// slot line egress already reads for hop_limit and the next hop.
-    local_owned: bool,
     timer: Timer,
     /// Delayed ack timer. If set, packets containing exclusively
     /// ACK or window updates (ie, no data) won't be sent until expiry.
@@ -608,7 +603,6 @@ pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
         ("rx_fin_received", offset_of!(Socket<'static>, rx_fin_received)),
         ("in_rto_loss_episode", offset_of!(Socket<'static>, in_rto_loss_episode)),
         ("remote_has_sack", offset_of!(Socket<'static>, remote_has_sack)),
-        ("local_owned", offset_of!(Socket<'static>, local_owned)),
         ("timer", offset_of!(Socket<'static>, timer)),
         ("ack_at", offset_of!(Socket<'static>, ack_at)),
         ("local_seq_no", offset_of!(Socket<'static>, local_seq_no)),
@@ -713,7 +707,6 @@ impl<'a> Socket<'a> {
             mss_cap: None,
             orphaned: false,
             reset_by_peer: false,
-            local_owned: false,
             connection_mss_cap: None,
             initial_window: 1_048_576,
             listen_endpoint: IpListenEndpoint::default(),
@@ -1106,24 +1099,6 @@ impl<'a> Socket<'a> {
         self.reset_by_peer
     }
 
-    /// Checks a new tuple's local address against the interface registering its flow, once per
-    /// tuple: the interface's own address clears `local_owned`, an owned one sets it, and any
-    /// other resets the socket without an RST (the address is not ours to send from). Returns
-    /// whether the tuple stands.
-    pub(crate) fn admit_local(&mut self, cx: &Context) -> bool {
-        let local = self.tuple.expect("admit_local needs a tuple").local.addr;
-        if cx.has_interface_addr(local) {
-            self.local_owned = false;
-        } else if cx.owns(local) {
-            self.local_owned = true;
-        } else {
-            net_debug!("local address {} is not ours, closing socket", local);
-            self.reset();
-            return false;
-        }
-        true
-    }
-
     pub(crate) fn reset(&mut self) {
         self.rx_buffer.store.clear();
         self.rx_fin_received = false;
@@ -1151,10 +1126,6 @@ impl<'a> Socket<'a> {
         self.rx_fin_seq = None;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
-        // Set again only when a new tuple is admitted (or connect sets the same tuple), so a
-        // tuple set by connect and closed by abort before admission never inherits the previous
-        // tuple's ownership.
-        self.local_owned = false;
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
@@ -1188,8 +1159,9 @@ impl<'a> Socket<'a> {
     ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open
     /// (see [is_open](#method.is_open)), and `Err(Error::Unaddressable)`
-    /// if the port in the given endpoint is zero.
-    pub fn listen<T>(&mut self, local_endpoint: T) -> Result<(), ListenError>
+    /// if the port in the given endpoint is zero. Applications listen through
+    /// [`TcpSet::listen`](crate::iface::TcpSet::listen), which registers the listener at once.
+    pub(crate) fn listen<T>(&mut self, local_endpoint: T) -> Result<(), ListenError>
     where
         T: Into<IpListenEndpoint>,
     {
@@ -1231,7 +1203,8 @@ impl<'a> Socket<'a> {
     /// This function returns an error if the socket was open; see [is_open](#method.is_open).
     /// It also returns an error if the local or remote port is zero, if the remote address
     /// is unspecified, or if an explicit local address is not one of the interface's.
-    pub fn connect<T, U>(
+    /// Applications connect through [`TcpSet::connect`](crate::iface::TcpSet::connect).
+    pub(crate) fn connect<T, U>(
         &mut self,
         cx: &mut Context,
         remote_endpoint: T,
@@ -1250,12 +1223,8 @@ impl<'a> Socket<'a> {
             local: local_endpoint,
             remote: remote_endpoint,
         };
-        // The same tuple keeps its admission: its flow key is unchanged, so it is not admitted
-        // again, and the owned set never changes. Any other tuple waits for admission.
-        let local_owned = self.local_owned && self.tuple == Some(tuple);
         self.reset();
         self.tuple = Some(tuple);
-        self.local_owned = local_owned;
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
         self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
@@ -1268,7 +1237,7 @@ impl<'a> Socket<'a> {
     }
 
     /// Validate a connect and resolve its local endpoint without changing the socket.
-    pub fn connect_local_endpoint(
+    pub(crate) fn connect_local_endpoint(
         &self,
         cx: &Context,
         remote_endpoint: IpEndpoint,
@@ -1325,7 +1294,8 @@ impl<'a> Socket<'a> {
     /// Note that there is no corresponding function for the receive half of the full-duplex
     /// connection; only the remote end can close it. If you no longer wish to receive any
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
-    pub fn close(&mut self) {
+    /// Applications close through [`TcpSet::close`](crate::iface::TcpSet::close).
+    pub(crate) fn close(&mut self) {
         match self.state {
             // In the LISTEN state there is no established connection.
             State::Listen => self.set_state(State::Closed),
@@ -1375,8 +1345,9 @@ impl<'a> Socket<'a> {
     /// endpoint.
     ///
     /// In terms of the TCP state machine, the socket may be in any state and is moved to
-    /// the `CLOSED` state.
-    pub fn abort(&mut self) {
+    /// the `CLOSED` state. Applications abort through
+    /// [`TcpSet::abort`](crate::iface::TcpSet::abort).
+    pub(crate) fn abort(&mut self) {
         self.set_state(State::Closed);
     }
 
@@ -2571,8 +2542,6 @@ impl<'a> Socket<'a> {
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 };
                 self.tuple = Some(tuple);
-                // The SYN reached a listener only because its destination is ours.
-                self.local_owned = !cx.has_interface_addr(tuple.local.addr);
                 self.local_seq_no = Self::random_seq_no(cx, tuple);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_win_seq = repr.seq_number;
@@ -3134,16 +3103,6 @@ impl<'a> Socket<'a> {
 
         // NOTE(unwrap): we check tuple is not None above.
         let tuple = self.tuple.unwrap();
-
-        // Check if the interface still has our source IP address.
-        // If not (e.g. the interface's IP changed), reset the socket.
-        // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP. An owned address never goes away.
-        if !cx.has_interface_addr(tuple.local.addr) && !self.local_owned {
-            net_debug!("source IP address no longer available, closing socket");
-            self.reset();
-            return Ok(());
-        }
 
         if self.timer.should_close(cx.now()) {
             tcp_trace!("close timer expired");
@@ -3735,8 +3694,7 @@ fn rtt_sampling_round_trips() {
 #[test]
 fn socket_size_matches_main() {
     // TxQueue holds frame entries, their end position and their TxSource instead of a borrowed
-    // byte ring; the TxSource is a thin Rc to the concrete pool. local_owned takes a padding
-    // byte before timer.
+    // byte ring; the TxSource is a thin Rc to the concrete pool.
     let main_size = 456;
     let size = core::mem::size_of::<Socket<'static>>();
     assert_eq!(size, main_size);
@@ -5392,7 +5350,7 @@ mod test {
     #[test]
     #[cfg(feature = "udp-set")]
     fn add_admitted_registers_frame_drop_wake() {
-        let mut set = crate::iface::TcpSet::new(vec![]);
+        let mut set = crate::iface::TcpSet::new(64);
         let queue = crate::iface::DropQueue::with_capacity(1, 0);
         let handle = set.add_admitted(
             &Config { rx_capacity: 64, tx_capacity: 64, mss_cap: None },
@@ -5409,7 +5367,7 @@ mod test {
     #[test]
     #[cfg(feature = "udp-set")]
     fn remove_clears_frame_drop_wake() {
-        let mut set = crate::iface::TcpSet::new(vec![]);
+        let mut set = crate::iface::TcpSet::new(64);
         let placeholder = set.add(Socket::test_socket(64, 64));
         let queue = crate::iface::DropQueue::with_capacity(2, 0);
         let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
@@ -5424,7 +5382,7 @@ mod test {
     #[test]
     #[cfg(feature = "udp-set")]
     fn frame_drop_wakes_socket_only_when_window_update_becomes_due() {
-        let mut set = crate::iface::TcpSet::new(vec![]);
+        let mut set = crate::iface::TcpSet::new(64);
         let handle = set.add(Socket::test_socket(64, 64));
         let queue = crate::iface::DropQueue::with_capacity(1, 0);
 
@@ -5968,7 +5926,7 @@ mod test {
         let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
         let socket = socket().socket;
         let shared = socket.rx_buffer.shared.clone();
-        let mut sockets = crate::iface::TcpSet::new(vec![]);
+        let mut sockets = crate::iface::TcpSet::new(64);
         sockets.add(socket);
         iface.classify_dirty(&mut sockets, Instant::ZERO);
         shared.wake_at_held.set(17);
@@ -21091,36 +21049,6 @@ mod test {
     // =========================================================================================//
     // Tests for source IP address change.
     // =========================================================================================//
-
-    #[test]
-    fn test_established_close_on_src_ip_change() {
-        let mut s = socket_established();
-
-        // Verify socket is working normally
-        s.send_slice(b"abc").unwrap();
-        recv!(
-            s,
-            [TcpRepr {
-                seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"abc"[..],
-                ..RECV_TEMPL
-            }]
-        );
-
-        // Simulate interface IP change - remove the socket's source IP
-        // and add a different one.
-        let mut new_addrs = heapless::Vec::<IpCidr, IFACE_MAX_ADDR_COUNT>::new();
-        new_addrs.push(IpCidr::new(OTHER_ADDR.into(), 24)).unwrap();
-        s.cx.set_ip_addrs(new_addrs);
-
-        // The socket's source IP is no longer on the interface.
-        // When dispatch() runs, it should detect this and reset the socket
-        // silently (no RST sent, since that would use the invalid source IP).
-        s.send_slice(b"def").unwrap();
-        recv_nothing!(s);
-        assert_eq!(s.state, State::Closed);
-    }
 
     #[test]
     fn send_into_zero_window_arms_probe_from_current_dispatch_time() {

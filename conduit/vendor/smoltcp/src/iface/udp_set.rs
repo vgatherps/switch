@@ -2,7 +2,7 @@ use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use core::ops::Range;
 
 use super::Interface;
-use super::flow_table::{BindKey, FlowTable};
+use super::{bind_word, slot_map, SlotMap};
 use crate::phy::{HeldFrames, RxBuf, RxShared, TxSource};
 use crate::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv4AddressExt};
 
@@ -171,7 +171,7 @@ pub(crate) struct PendingUdp {
 #[derive(Debug)]
 pub struct UdpSet {
     slots: Vec<Slot>,
-    binds: FlowTable<BindKey>,
+    binds: SlotMap<u64>,
     /// Sockets bound to one address. While none is, `lookup` probes only the all-IP key.
     bound: usize,
     pub(crate) pending_rx_attach: Option<(usize, PendingUdp)>,
@@ -193,7 +193,7 @@ impl UdpSet {
                     rx_token: None,
                 })
                 .collect(),
-            binds: FlowTable::new(max_sockets),
+            binds: slot_map(max_sockets),
             bound: 0,
             pending_rx_attach: None,
             source,
@@ -220,7 +220,7 @@ impl UdpSet {
             return Err(UdpAddError::Unaddressable);
         }
         let key = (config.local_addr, config.port);
-        if self.binds.get(&key).is_some() {
+        if self.binds.contains_key(&bind_word(key)) {
             return Err(UdpAddError::PortInUse);
         }
         let slot = self
@@ -236,7 +236,7 @@ impl UdpSet {
             stats: UdpSocketStats::default(),
             template: None,
         });
-        self.binds.set(key, slot);
+        self.binds.insert(bind_word(key), slot as u32);
         self.bound += usize::from(config.local_addr.is_some());
         Ok(UdpHandle {
             slot,
@@ -294,7 +294,7 @@ impl UdpSet {
             .expect("UDP generation overflow");
         slot.socket = None;
         slot.rx_token = None;
-        self.binds.remove(&key);
+        self.binds.remove(&bind_word(key));
         self.bound -= usize::from(key.0.is_some());
         held
     }
@@ -306,11 +306,11 @@ impl UdpSet {
     pub(crate) fn lookup(&self, dst_addr: Ipv4Address, port: u16, broadcast: bool) -> Option<usize> {
         if !broadcast
             && self.bound != 0
-            && let Some(slot) = self.binds.get(&(Some(dst_addr), port))
+            && let Some(&slot) = self.binds.get(&bind_word((Some(dst_addr), port)))
         {
-            return Some(slot);
+            return Some(slot as usize);
         }
-        self.binds.get(&(None, port))
+        self.binds.get(&bind_word((None, port))).map(|&slot| slot as usize)
     }
 
     pub(crate) fn socket_at_mut(&mut self, slot: usize) -> &mut UdpSocket {

@@ -187,7 +187,7 @@ fn close_all(
 ) -> Vec<Vec<State>> {
     let mut seen: Vec<Vec<State>> = vec![Vec::new(); server.handles().len()];
     for handle in clients {
-        pair.a.tcp_mut(handle).close();
+        pair.a.close(handle);
     }
     pair.drive(
         |_, _| {},
@@ -331,9 +331,8 @@ fn echo_drains_before_closing_after_peer_fin() {
                 }
             },
         );
-        let socket = pair.a.tcp_mut(&handle);
-        assert_eq!(socket.send_slice(&data).unwrap(), data.len());
-        socket.close();
+        assert_eq!(pair.a.tcp_mut(&handle).send_slice(&data).unwrap(), data.len());
+        pair.a.close(&handle);
 
         // The client reads 64 bytes a round, so the server's send buffer stays
         // full and the FIN arrives with echo bytes still in its receive buffer.
@@ -498,7 +497,7 @@ fn echo_relistens_after_peer_reset_mid_stream() {
             },
         );
         assert_eq!(pair.b.tcp(&server.handles()[0]).state(), State::Established);
-        pair.a.tcp_mut(&first).abort();
+        pair.a.abort(&first);
 
         // One sample per round, before `step`; every segment each side sends.
         let mut states = Vec::new();
@@ -661,7 +660,7 @@ fn echo_until_server_fin(pair: &mut Pair, server: &mut EchoServer, local: u16, d
     assert_eq!(pair.a.tcp(&handle).state(), State::CloseWait);
     assert_eq!(pair.b.tcp(&server.handles()[0]).state(), State::FinWait2);
 
-    pair.a.tcp_mut(&handle).close();
+    pair.a.close(&handle);
     let mut states = Vec::new();
     pair.drive(
         |_, _| {},
@@ -1167,7 +1166,7 @@ fn echo_retains_frame_when_free_send_space_is_smaller_than_payload() {
             if limit.is_some() {
                 // The server closed first after the limit: it passes TIME-WAIT, the
                 // client ends Closed from LAST-ACK.
-                pair.a.tcp_mut(&client).close();
+                pair.a.close(&client);
                 pair.drive(|_, _| {}, |a, b| {
                     let moved = server.step(b);
                     let listening = b.tcp(&server.handles()[0]).state() == State::Listen;
