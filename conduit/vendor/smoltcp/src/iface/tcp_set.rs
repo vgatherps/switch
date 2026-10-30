@@ -62,13 +62,16 @@ struct FlowSlot {
     next: usize,
     dirty: bool,
     deadline: PollAt,
-    waiting: bool,
+    /// Position in `TcpSet::waiting`, or `UNLISTED`.
+    waiting_at: u32,
     queued: bool,
     timer_links: IntrusiveLinks,
     timer_position: WheelPosition,
     due: bool,
     orphaned: bool,
-    reap_queued: bool,
+    /// Position in `TcpSet::reapable`; `REPORTED` once `take_reapable` returned the slot,
+    /// until it is removed; `UNLISTED` otherwise.
+    reap_at: u32,
     /// `TcpStorage::tokens` holds an armed token: the one check `mark_dirty` makes.
     armed: bool,
 }
@@ -79,16 +82,25 @@ impl FlowSlot {
         next: usize::MAX,
         dirty: false,
         deadline: PollAt::Ingress,
-        waiting: false,
+        waiting_at: UNLISTED,
         queued: false,
         timer_links: IntrusiveLinks::new(),
         timer_position: WheelPosition::Unlinked,
         due: false,
         orphaned: false,
-        reap_queued: false,
+        reap_at: UNLISTED,
         armed: false,
     };
+
+    fn is_waiting(&self) -> bool {
+        self.waiting_at != UNLISTED
+    }
 }
+
+/// A list position meaning "not in the list".
+const UNLISTED: u32 = u32::MAX;
+/// `FlowSlot::reap_at` for a slot `take_reapable` returned.
+const REPORTED: u32 = u32::MAX - 1;
 
 fn deadline_tick(instant: Instant) -> u64 {
     let micros = instant.total_micros();
@@ -520,15 +532,15 @@ impl<'a> TcpSet<'a> {
 
     pub(crate) fn check_reapable(&mut self, index: usize) {
         let flow = &mut self.flow_slots[index];
-        if !flow.orphaned || flow.reap_queued {
+        if !flow.orphaned || flow.reap_at != UNLISTED {
             return;
         }
         let storage = &self.sockets[index];
         let socket = &storage.inner.as_ref().expect("orphan slot is empty").socket;
         if socket.state() == tcp::State::Closed && socket.remote_endpoint().is_none() {
             debug_assert!(self.reapable.len() < self.reapable.capacity());
+            flow.reap_at = self.reapable.len() as u32;
             self.reapable.push(SocketHandle { index, generation: storage.generation });
-            flow.reap_queued = true;
         }
     }
 
@@ -538,8 +550,11 @@ impl<'a> TcpSet<'a> {
     }
 
     /// Drain reapable orphan handles, retaining the list's allocation.
-    pub fn take_reapable(&mut self, f: impl FnMut(SocketHandle)) {
-        self.reapable.drain(..).for_each(f);
+    pub fn take_reapable(&mut self, mut f: impl FnMut(SocketHandle)) {
+        for handle in self.reapable.drain(..) {
+            self.flow_slots[handle.index].reap_at = REPORTED;
+            f(handle);
+        }
     }
 
     /// Removes a socket from the set without changing its state, discarding unread received
@@ -568,11 +583,15 @@ impl<'a> TcpSet<'a> {
             .expect("socket slot generation overflow");
         slot.tokens = [None; 2];
         self.flow_slots[handle.index].armed = false;
-        if self.flow_slots[handle.index].reap_queued {
-            self.reapable.retain(|&queued| queued != handle);
+        let reap_at = self.flow_slots[handle.index].reap_at;
+        if reap_at < REPORTED {
+            self.reapable.swap_remove(reap_at as usize);
+            if let Some(moved) = self.reapable.get(reap_at as usize) {
+                self.flow_slots[moved.index].reap_at = reap_at;
+            }
         }
         self.flow_slots[handle.index].orphaned = false;
-        self.flow_slots[handle.index].reap_queued = false;
+        self.flow_slots[handle.index].reap_at = UNLISTED;
         self.unlink_identity(handle.index);
         self.set_deadline(handle.index, PollAt::Ingress, false);
         if self.flow_slots[handle.index].queued {
@@ -850,26 +869,26 @@ impl TcpSet<'_> {
         self.set_waiting(index, waiting);
     }
 
+    #[inline]
     pub(crate) fn set_waiting(&mut self, index: usize, waiting: bool) {
+        if waiting != self.flow_slots[index].is_waiting() {
+            self.move_waiting(index, waiting);
+        }
+    }
+
+    #[inline(never)]
+    fn move_waiting(&mut self, index: usize, waiting: bool) {
         let slot = &mut self.flow_slots[index];
-        if waiting != slot.waiting {
-            if waiting {
-                self.waiting.push(index);
-            } else {
-                let position = self
-                    .waiting
-                    .iter()
-                    .position(|&i| {
-                        #[cfg(test)]
-                        {
-                            self.slot_visits += 1;
-                        }
-                        i == index
-                    })
-                    .expect("waiting TCP slot is not in the waiting list");
-                self.waiting.swap_remove(position);
+        if waiting {
+            slot.waiting_at = self.waiting.len() as u32;
+            self.waiting.push(index);
+        } else {
+            let position = slot.waiting_at as usize;
+            slot.waiting_at = UNLISTED;
+            self.waiting.swap_remove(position);
+            if let Some(&moved) = self.waiting.get(position) {
+                self.flow_slots[moved].waiting_at = position as u32;
             }
-            slot.waiting = waiting;
         }
     }
 
@@ -941,7 +960,7 @@ impl TcpSet<'_> {
                 self.slot_visits += 1;
             }
             let index = self.admission[position];
-            if self.flow_slots[index as usize].waiting {
+            if self.flow_slots[index as usize].is_waiting() {
                 self.mark_dirty(index as usize);
                 continue;
             }
@@ -1130,6 +1149,22 @@ impl TcpSet<'_> {
             .map(|&index| index as usize)
     }
 
+    /// Every slot in `waiting` and `reapable` stores its position there, and no other slot
+    /// claims one.
+    #[cfg(test)]
+    pub(crate) fn check_list_positions(&self) {
+        for (index, slot) in self.flow_slots.iter().enumerate() {
+            match self.waiting.iter().position(|&listed| listed == index) {
+                Some(position) => assert_eq!(slot.waiting_at, position as u32, "slot {index}"),
+                None => assert_eq!(slot.waiting_at, UNLISTED, "slot {index}"),
+            }
+            match self.reapable.iter().position(|listed| listed.index == index) {
+                Some(position) => assert_eq!(slot.reap_at, position as u32, "slot {index}"),
+                None => assert!(slot.reap_at >= REPORTED, "slot {index}"),
+            }
+        }
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn check_flow_index(&self) {
         assert_eq!(self.flow_slots.len(), self.sockets.len());
@@ -1210,6 +1245,32 @@ mod tests {
         assert_eq!(found, expected);
         assert!(!set.has_reapable());
         set.take_reapable(|_| panic!("orphan reported twice"));
+    }
+
+    /// Removing a queued orphan before it is reported keeps the other queued orphans' stored
+    /// positions right; each is reported once, and a reported orphan is not queued again.
+    #[test]
+    fn removing_a_queued_orphan_keeps_the_others_reported_once() {
+        let mut set = TcpSet::new(4);
+        let handles: Vec<_> = (0..4)
+            .map(|port| {
+                let handle = set.add(socket());
+                set.listen(handle, 80 + port).unwrap();
+                set.orphan(handle, Instant::ZERO);
+                handle
+            })
+            .collect();
+        set.check_list_positions();
+        set.remove(handles[1]);
+        set.check_list_positions();
+        let mut found = Vec::new();
+        set.take_reapable(|handle| found.push(handle));
+        found.sort();
+        assert_eq!(found, [handles[0], handles[2], handles[3]]);
+        set.orphan(handles[0], Instant::ZERO);
+        assert!(!set.has_reapable());
+        set.remove(handles[0]);
+        set.check_list_positions();
     }
 
     #[cfg(feature = "medium-ip")]

@@ -2078,3 +2078,44 @@ fn rto_deadline_cancellation_removes_idle_socket() {
     assert_eq!(iface.poll_at(Instant::from_millis(200), &mut sockets), None);
     assert_eq!(sockets.get(handle).state(), tcp::State::Established);
 }
+
+/// 4096 sockets wait for one neighbor; removing every third keeps each waiter's stored list
+/// position right, and learning the neighbor releases every remaining socket, each sending its
+/// SYN, and empties the list.
+#[test]
+fn waiting_positions_follow_removal_and_release() {
+    const COUNT: u16 = 4096;
+    let (mut iface, _, mut device) = setup(Medium::Ethernet);
+    let mut sockets = TcpSet::new(usize::from(COUNT));
+    let handles: Vec<_> = (0..COUNT).map(|i| connect(&mut iface, &mut sockets, 1024 + i)).collect();
+    iface.poll_egress(START, &mut device, &mut sockets);
+    assert_eq!(sockets.waiting.len(), usize::from(COUNT));
+    sockets.check_list_positions();
+    for handle in handles.iter().step_by(3) {
+        sockets.remove(*handle);
+    }
+    sockets.check_list_positions();
+    let remaining = handles.len() - handles.len().div_ceil(3);
+    assert_eq!(sockets.waiting.len(), remaining);
+    device.tx_queue.clear();
+    iface.inner.neighbor_cache.fill(
+        REMOTE.into(),
+        HardwareAddress::Ethernet(REMOTE_HARDWARE),
+        START,
+    );
+    let mut syns = 0;
+    for _ in 0..remaining {
+        iface.poll_egress(START, &mut device, &mut sockets);
+        if device.tx_queue.is_empty() {
+            break;
+        }
+        while !device.tx_queue.is_empty() {
+            let (_, control, _, _) = take_tcp(&mut device);
+            assert_eq!(control, TcpControl::Syn);
+            syns += 1;
+        }
+    }
+    assert_eq!(syns, remaining);
+    assert!(sockets.waiting.is_empty());
+    sockets.check_list_positions();
+}
