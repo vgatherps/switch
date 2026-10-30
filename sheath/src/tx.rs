@@ -94,7 +94,8 @@ impl<L: FrameTx> TlsTx<L> {
             conn,
             lower,
             held: Vec::new(),
-            plaintext: Vec::with_capacity(room),
+            // allocated at the first seal, then kept
+            plaintext: Vec::new(),
             pending: Vec::new(),
             state: State::Open,
             in_flight: false,
@@ -264,6 +265,7 @@ impl<L: FrameTx> FrameTx for TlsTx<L> {
         );
         let start = head + RECORD_HEAD;
         self.plaintext.clear();
+        self.plaintext.reserve_exact(self.room);
         self.plaintext
             .extend_from_slice(&f.room_mut()[start..start + len]);
         let plaintext = core::mem::take(&mut self.plaintext);

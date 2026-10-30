@@ -11,8 +11,17 @@ const HEADER_LEN: usize = 5;
 /// (RFC 8446 §5.2). rustls's own header check allows up to 18431 B.
 const MAX_CIPHERTEXT_LEN: usize = (1 << 14) + 256;
 
-/// Largest TLS 1.3 record on the wire. The scratch buffer is allocated once at this size.
+/// Largest TLS 1.3 record on the wire. The scratch buffer is allocated at this size when first
+/// used (a record straddling frames), then kept.
 const MAX_RECORD_LEN: usize = HEADER_LEN + MAX_CIPHERTEXT_LEN;
+
+/// Room for one whole record in `scratch`, reserved on its first use and kept (a handshake
+/// message being joined may grow it further, up to `MAX_RETAINED_LEN`).
+fn reserve_record(scratch: &mut Vec<u8>) {
+    if scratch.capacity() < MAX_RECORD_LEN {
+        scratch.reserve_exact(MAX_RECORD_LEN - scratch.len());
+    }
+}
 
 /// Most bytes rustls may need kept: the records of a handshake message still being joined plus
 /// the next record. rustls's buffered API stops reading at the same bound while joining
@@ -91,7 +100,7 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         Self {
             frame: None,
             pos: 0,
-            scratch: Vec::with_capacity(MAX_RECORD_LEN),
+            scratch: Vec::new(),
             scratch_stamp: 0,
             seen: 0,
             run: Run::NONE,
@@ -106,6 +115,9 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
     #[cfg(feature = "switchnet")]
     pub(crate) fn with_leftover(leftover: &[u8], stamp: u64) -> Self {
         let mut rx = Self::new();
+        if !leftover.is_empty() {
+            reserve_record(&mut rx.scratch);
+        }
         rx.scratch.extend_from_slice(leftover);
         rx.scratch_stamp = stamp;
         rx
@@ -202,6 +214,7 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
                         continue;
                     }
                 }
+                reserve_record(&mut self.scratch);
                 self.scratch.extend_from_slice(&frame.payload()[pos..]);
                 self.scratch_stamp = frame.rx_timestamp();
                 self.frame = None;
@@ -280,6 +293,7 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
             if self.scratch.len() == self.seen && n > 0 {
                 self.scratch_stamp = frame.rx_timestamp();
             }
+            reserve_record(&mut self.scratch);
             self.scratch.extend_from_slice(&available[..n]);
             self.pos += n;
             if self.pos == frame.payload().len() {
