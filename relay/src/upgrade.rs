@@ -75,14 +75,15 @@ pub(crate) fn request(host: &str, port: u16, default_port: u16, path: &str, key:
 }
 
 /// Moves the bytes of `run` that belong to the head into `head`: how many it took,
-/// and whether the head (through its blank line) is now complete.
+/// and whether the head (through its blank line) is now complete. A head over `MAX_HEAD`
+/// bytes is refused, complete or not.
 pub(crate) fn read_head(head: &mut Vec<u8>, run: &[u8]) -> Result<(usize, bool), UpgradeError> {
     let before = head.len();
     head.extend_from_slice(run);
     let end = head.windows(4).position(|w| w == b"\r\n\r\n").map(|at| at + 4);
     let taken = end.unwrap_or(head.len());
     head.truncate(taken);
-    if end.is_none() && head.len() > MAX_HEAD {
+    if head.len() > MAX_HEAD {
         return Err(UpgradeError::HeadTooBig);
     }
     Ok((taken - before, end.is_some()))
@@ -292,6 +293,32 @@ mod tests {
         }
         let mut head = Vec::new();
         assert!(read_head(&mut head, &[b'x'; MAX_HEAD + 1]).is_err());
+    }
+
+    /// A complete head is held to `MAX_HEAD` too, in one run or across two: exactly
+    /// `MAX_HEAD` bytes pass, one more is refused. (Before the fix only an unterminated head
+    /// was checked, so the over-limit cases passed.)
+    #[test]
+    fn complete_head_over_the_limit_is_refused() {
+        let head_of = |len: usize| {
+            let mut h = b"GET / HTTP/1.1\r\nX: ".to_vec();
+            h.resize(len - 4, b'a');
+            h.extend_from_slice(b"\r\n\r\n");
+            h
+        };
+        for (len, ok) in [(MAX_HEAD, true), (MAX_HEAD + 1, false)] {
+            let stream = [head_of(len), b"\x81\x02hi".to_vec()].concat();
+            let mut head = Vec::new();
+            match read_head(&mut head, &stream) {
+                Ok((taken, done)) => assert!(ok && done && taken == len, "{len}"),
+                Err(e) => assert!(!ok && e == UpgradeError::HeadTooBig, "{len}: {e:?}"),
+            }
+            let mut head = Vec::new();
+            let cut = len - 10;
+            assert_eq!(read_head(&mut head, &stream[..cut]), Ok((cut, false)));
+            let second = read_head(&mut head, &stream[cut..]);
+            assert_eq!(second.is_ok(), ok, "{len} across runs: {second:?}");
+        }
     }
 
     /// Our own request is accepted, and the 101 answers its key (RFC 6455 §1.3 example).
