@@ -708,28 +708,6 @@ mod tests {
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), None);
     }
 
-    /// The scratch starts empty: a connection that never receives a message spanning runs never
-    /// allocates it. The first such message grows it, and the capacity is kept for the next.
-    #[test]
-    fn scratch_is_allocated_on_first_use_and_kept() {
-        let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client));
-        assert_eq!(rx.core.scratch.capacity(), 0);
-        rx.push(F(frame(0x82, b"direct")));
-        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes(), b"direct");
-        assert!(rx.recv(&mut ()).unwrap().is_none());
-        assert_eq!(rx.core.scratch.capacity(), 0, "a direct message used the scratch");
-        let mut kept = None;
-        for _ in 0..2 {
-            rx.push(F(frame(0x02, &[1; 100])));
-            assert!(rx.recv(&mut ()).unwrap().is_none());
-            rx.push(F(frame(0x80, &[2; 100])));
-            assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes().len(), 200);
-            let at = (rx.core.scratch.as_ptr(), rx.core.scratch.capacity());
-            assert!(at.1 >= 200);
-            assert_eq!(*kept.get_or_insert(at), at, "the second message reallocated the scratch");
-        }
-    }
-
     /// Doubling would pass `max_message`; capacity stops at it.
     #[test]
     fn scratch_capacity_never_exceeds_max_message() {

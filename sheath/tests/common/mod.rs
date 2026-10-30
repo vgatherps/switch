@@ -173,20 +173,6 @@ pub fn connect(max_fragment_size: Option<usize>) -> Peer {
 /// Completes the handshake. The server's records sent after it (session tickets) stay queued
 /// for the stream under test.
 pub fn connect_with(provider: CryptoProvider, max_fragment_size: Option<usize>) -> Peer {
-    let (client, server) = handshake(provider, max_fragment_size);
-    let wire = Wire::default();
-    Peer {
-        tx: TlsTx::new(client, TestTx(wire.clone()), None),
-        wire,
-        server,
-    }
-}
-
-/// The client and server connections after the handshake.
-pub fn handshake(
-    provider: CryptoProvider,
-    max_fragment_size: Option<usize>,
-) -> (UnbufferedClientConnection, ServerConnection) {
     enum Next {
         Continue,
         Blocked,
@@ -234,7 +220,12 @@ pub fn handshake(
     }
     assert!(to_client.is_empty());
     assert!(!server.is_handshaking());
-    (client, server)
+    let wire = Wire::default();
+    Peer {
+        tx: TlsTx::new(client, TestTx(wire.clone()), None),
+        wire,
+        server,
+    }
 }
 
 /// Server-to-client bytes and the application data records among them.

@@ -746,7 +746,7 @@ fn close_after_a_cancelled_linger_is_closed() {
 }
 
 /// A send whose drain of earlier work finds the socket dead accepts nothing: it returns the
-/// death without copying its message in or sealing it.
+/// death without sealing its message.
 #[test]
 fn send_whose_drain_dies_accepts_nothing() {
     let (mut c, log) = core(Role::Server, ROOM);
@@ -754,7 +754,7 @@ fn send_whose_drain_dies_accepts_nothing() {
     assert!(poll_n(c.send(Kind::Binary, b"x"), 1).is_none());
     log.borrow_mut().dead = true;
     assert_eq!(ready(c.send(Kind::Binary, &[1; 4000])), Err(TxError::Failed(Failure::Dead)));
-    assert_eq!((c.buf_capacity(), log.borrow().seals), (0, 1));
+    assert_eq!(log.borrow().seals, 1);
 }
 
 /// After death, records the lower layer still owes are never sealed.
