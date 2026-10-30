@@ -490,6 +490,11 @@ impl Executor {
     pub(crate) unsafe fn queue_lengths(this: *mut Self) -> (usize, usize) {
         unsafe { ((*this).incoming.len(), (*this).deferred.len()) }
     }
+
+    #[cfg(test)]
+    pub(crate) unsafe fn active(this: *mut Self) -> bool {
+        unsafe { (*this).active }
+    }
 }
 
 pub(crate) struct TurnGuard {
@@ -579,3 +584,7 @@ impl Drop for SlotGuard {
 #[cfg(test)]
 #[path = "executor/ownership_tests.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+#[path = "executor/state_walk_tests.rs"]
+mod state_walk_tests;

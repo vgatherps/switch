@@ -41,6 +41,11 @@ pub(crate) struct Mailbox {
 static MAILBOXES: AtomicPtr<Mailbox> = AtomicPtr::new(ptr::null_mut());
 
 impl Mailbox {
+    #[cfg(test)]
+    pub(crate) unsafe fn is_closed(this: *const Self) -> bool {
+        unsafe { (*this).closed.load(Ordering::Relaxed) }
+    }
+
     /// A new open mailbox, never freed.
     pub(crate) fn create() -> *const Self {
         let mailbox = Box::into_raw(Box::new(Self {

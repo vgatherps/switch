@@ -324,3 +324,7 @@ impl Drop for DeferredShutdown<'_> {
 #[cfg(test)]
 #[path = "runtime/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runtime/state_walk_tests.rs"]
+mod state_walk_tests;
