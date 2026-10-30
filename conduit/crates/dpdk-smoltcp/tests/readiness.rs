@@ -78,9 +78,9 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         assert_eq!(popped(&mut pair.a), [5]);
 
         // TIME-WAIT ends on a timer: turns of A alone fire nothing until it does.
-        pair.a.tcp_mut(&h[0]).close();
+        pair.a.close(&h[0]);
         settle(&mut pair);
-        pair.b.tcp_mut(&h[1]).close();
+        pair.b.close(&h[1]);
         pair.round(|_, _| {});
         pair.round(|_, _| {});
         assert_eq!(pair.a.tcp(&h[0]).state(), State::TimeWait);

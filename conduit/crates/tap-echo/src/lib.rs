@@ -168,17 +168,19 @@ impl EchoServer {
             }
             if self.close_after == Some(*echoed) {
                 if socket.may_send() {
-                    socket.close();
+                    stack.close(handle);
                     changed = true;
                 }
                 changed |= pending.take().is_some();
+                let socket = stack.tcp_mut(handle);
                 while socket.recv_queue() > 0 {
                     drop(socket.recv().unwrap().unwrap());
                     changed = true;
                 }
             }
+            let socket = stack.tcp(handle);
             if socket.state() == State::CloseWait && socket.recv_queue() == 0 && pending.is_none() {
-                socket.close();
+                stack.close(handle);
                 changed = true;
             }
         }

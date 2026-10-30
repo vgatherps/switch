@@ -332,11 +332,10 @@ fn thousand_connections_keep_streams_apart() {
 fn end(pair: &mut Pair, group: &[Conn], abort: bool) {
     assert!(group.len() <= WAVE);
     for conn in group {
-        let client = pair.a.tcp_mut(&conn.client);
         if abort {
-            client.abort();
+            pair.a.abort(&conn.client);
         } else {
-            client.close();
+            pair.a.close(&conn.client);
         }
     }
     pair.drive(
@@ -347,7 +346,7 @@ fn end(pair: &mut Pair, group: &[Conn], abort: bool) {
                 let server = b.tcp_mut(&conn.server);
                 if server.state() == State::CloseWait {
                     assert!(matches!(server.recv(), Err(RecvError::Finished)));
-                    server.close();
+                    b.close(&conn.server);
                     moved = true;
                 }
             }

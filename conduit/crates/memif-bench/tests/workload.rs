@@ -553,7 +553,7 @@ fn abort_makes_run_invalid() {
         }
         run.peer.poll(now).unwrap();
     }
-    run.client.socket(0).abort();
+    run.client.abort(0);
     let now = Instant::now();
     assert!(run.client.poll(now).unwrap());
     let client = run.client.report();
@@ -607,7 +607,7 @@ fn peer_detects_corrupted_byte() {
         let socket = stack.tcp_mut(&handle);
         if !written && socket.state() == State::Established {
             assert_eq!(socket.send_slice(&stream).unwrap(), stream.len());
-            socket.close();
+            stack.close(&handle);
             written = true;
         }
         peer_done = peer.poll(now).unwrap();
@@ -667,7 +667,7 @@ fn client_detects_corrupted_echo() {
             assert_eq!(socket.send_slice(&scratch[..read]).unwrap(), read);
         }
         if socket.state() == State::CloseWait {
-            socket.close();
+            stack.close(&handle);
         }
         client_done = client_side.poll(now).unwrap();
     }
@@ -732,7 +732,7 @@ fn peer_echo_leaves_in_the_poll_that_received_the_request() {
     assert_eq!(echoed.len(), request.len());
     assert_eq!(&echoed[..request.len()], request);
 
-    stack.tcp_mut(&handle).close();
+    stack.close(&handle);
     let mut peer_done = false;
     while !peer_done {
         let now = Instant::now();

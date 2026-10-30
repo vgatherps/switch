@@ -485,7 +485,7 @@ fn drain_after_release(host: &mut Host) -> Vec<Vec<u8>> {
 fn reset_with_frames_pending_and_in_ring() {
     with_eal(|eal| {
         let (mut host, conn) = frames_in_ring_and_pending(eal, "rstpend");
-        host.stack.tcp_mut(&conn.handle).abort();
+        host.stack.abort(&conn.handle);
         host.stack.listen(&conn.handle, 1234).unwrap();
         assert_eq!(host.stack.tcp(&conn.handle).send_queue(), 0);
         assert_eq!(host.frame_in_use(), 3);

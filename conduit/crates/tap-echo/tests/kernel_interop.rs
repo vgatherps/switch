@@ -1565,7 +1565,7 @@ fn data_loss_transfer(direction: Direction) -> DataLoss {
                             sent = sent.checked_add(queued).expect("sent bytes fit usize");
                         }
                         if sent == data.len() && socket.may_send() {
-                            socket.close();
+                            stack.close(&handle);
                         }
                     }
                     Direction::ToZhida => {
@@ -1574,7 +1574,7 @@ fn data_loss_transfer(direction: Direction) -> DataLoss {
                             received.extend_from_slice(frame.payload());
                         }
                         if socket.state() == State::CloseWait {
-                            socket.close();
+                            stack.close(&handle);
                         }
                     }
                 }
@@ -3309,10 +3309,11 @@ fn zhida_reaches_off_subnet_kernel_through_gateway() {
                         moved |= n != 0;
                     }
                     if sent == data.len() && !closed {
-                        socket.close();
+                        stack.close(&handle);
                         closed = true;
                         moved = true;
                     }
+                    let socket = stack.tcp_mut(&handle);
                     while socket.can_recv() {
                         let frame = socket.recv().unwrap().unwrap();
                         echoed.extend_from_slice(frame.payload());

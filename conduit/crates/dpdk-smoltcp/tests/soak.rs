@@ -314,11 +314,11 @@ impl Reconnect {
                 {
                     let side = if rng.below(2) == 0 { Side::A } else { Side::B };
                     let (stack, _) = side.pick(&mut pair.a, &mut pair.b);
-                    let socket = stack.tcp_mut(&self.handles[side.index()]);
+                    let handle = &self.handles[side.index()];
                     if self.cycles.checked_add(1).unwrap().is_multiple_of(50) {
-                        socket.abort();
+                        stack.abort(handle);
                     } else {
-                        socket.close();
+                        stack.close(handle);
                     }
                     self.phase = Phase::Closing {
                         peer: side.other(),
@@ -330,7 +330,7 @@ impl Reconnect {
                 // Close the other half even if impairment lost the first FIN or RST.
                 if !*peer_closed {
                     let (stack, _) = peer.pick(&mut pair.a, &mut pair.b);
-                    stack.tcp_mut(&self.handles[peer.index()]).close();
+                    stack.close(&self.handles[peer.index()]);
                     *peer_closed = true;
                 }
                 let closed = [&pair.a, &pair.b]
@@ -640,8 +640,8 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
     assert!(gaps > 0);
 
     enabled.set(false);
-    pair.a.tcp_mut(&bulk_handles[0]).close();
-    pair.b.tcp_mut(&bulk_handles[1]).close();
+    pair.a.close(&bulk_handles[0]);
+    pair.b.close(&bulk_handles[1]);
     loop {
         let at = pair.now() + Duration::from_millis(10);
         round(&mut pair, at, &mut arp);

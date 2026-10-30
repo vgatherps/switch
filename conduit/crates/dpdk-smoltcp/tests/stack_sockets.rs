@@ -349,7 +349,7 @@ fn held_tcp_frame_after_removal(reap: bool) {
         assert_eq!(frame.payload(), b"held");
         assert_eq!(pair.b.tcp(&server).held_frames().count(), 1);
         if reap {
-            pair.a.tcp_mut(&client).close();
+            pair.a.close(&client);
             pair.drive(|_, _| {}, |_, b| {
                 if b.tcp(&server).state() == State::CloseWait { App::Done } else { App::Idle }
             });
@@ -1222,7 +1222,7 @@ fn next_client_gets_no_timestamps(fixture: &RingPort, stack: &mut Stack, handle:
             None
         )
     );
-    stack.tcp_mut(handle).abort();
+    stack.abort(handle);
     stack.turn(T0 + Duration::from_millis(6), 8).unwrap();
     assert_eq!(fixture.take_tx().len(), 1);
 }
@@ -1235,7 +1235,7 @@ fn relisten_after_client_without_timestamps_stays_without_them() {
         let mut stack = stack(fixture.open(eal), 1, 4);
         let handle = listener_after_client_without_timestamps(&fixture, &mut stack);
 
-        stack.tcp_mut(&handle).abort();
+        stack.abort(&handle);
         stack.turn(T0 + Duration::from_millis(1), 8).unwrap();
         let sent = fixture.take_tx();
         assert_eq!(sent.len(), 1);
@@ -1286,7 +1286,7 @@ fn reconnect_offers_no_timestamps() {
         stack.connect(&handle, remote(), LOCAL_PORT).unwrap();
         handshake(&fixture, &mut stack, &handle);
 
-        stack.tcp_mut(&handle).abort();
+        stack.abort(&handle);
         stack.turn(T0 + Duration::from_millis(1), 8).unwrap();
         let sent = fixture.take_tx();
         assert_eq!(sent.len(), 1);

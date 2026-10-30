@@ -246,8 +246,8 @@ fn template_acks_keep_exact_tx_pool_counts() {
             assert_eq!(acks, expected);
             assert_eq!(pair.b.send(), Ok(Sent { tx_accepted: 0, tx_pending: 0 }));
             for conn in &conns {
-                pair.a.tcp_mut(&conn.client).abort();
-                pair.b.tcp_mut(&conn.server).abort();
+                pair.a.abort(&conn.client);
+                pair.b.abort(&conn.server);
             }
             let expected_rsts: Vec<_> = conns
                 .iter()

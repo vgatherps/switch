@@ -821,12 +821,12 @@ fn bulk_fast_retransmit() {
 fn bulk_fin() {
     bulk_scenario(|pair, trace, handles| {
         let start = trace.borrow().frames.len();
-        pair.a.tcp_mut(&handles[0]).close();
+        pair.a.close(&handles[0]);
         drive(pair, trace, |a, b| {
             let server = b.tcp_mut(&handles[1]);
             if server.state() == State::CloseWait {
                 assert!(matches!(server.recv(), Err(RecvError::Finished)));
-                server.close();
+                b.close(&handles[1]);
                 App::Moved
             } else if a.tcp(&handles[0]).state() == State::TimeWait
                 && server.state() == State::Closed
@@ -1067,12 +1067,12 @@ fn bulk_frames_match_committed() {
         }
 
         let start = trace.borrow().frames.len();
-        pair.a.tcp_mut(&handles[0]).close();
+        pair.a.close(&handles[0]);
         drive(&mut pair, &trace, |a, b| {
             let server = b.tcp_mut(&handles[1]);
             if server.state() == State::CloseWait {
                 assert!(matches!(server.recv(), Err(RecvError::Finished)));
-                server.close();
+                b.close(&handles[1]);
                 App::Moved
             } else if a.tcp(&handles[0]).state() == State::TimeWait
                 && server.state() == State::Closed
@@ -1271,7 +1271,7 @@ fn plain_frames_match_committed() {
         assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
 
         let start = trace.borrow().frames.len();
-        pair.a.tcp_mut(&handles[0]).abort();
+        pair.a.abort(&handles[0]);
         drive(&mut pair, &trace, |a, b| {
             if a.tcp(&handles[0]).state() == State::Closed
                 && b.tcp(&handles[1]).state() == State::Closed

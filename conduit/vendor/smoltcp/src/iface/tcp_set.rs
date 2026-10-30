@@ -14,7 +14,7 @@ use super::timer_wheel::{
 };
 use crate::socket::PollAt;
 use crate::time::Instant;
-use crate::wire::{IpAddress, IpEndpoint};
+use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlowKey {
@@ -431,6 +431,61 @@ impl<'a> TcpSet<'a> {
         self.identity_synced = 0;
         self.mark_dirty(handle.index);
         &mut self.item_mut(handle).socket
+    }
+
+    /// [`tcp::Socket::connect`] through the set, with `cx` the context of the interface that
+    /// drives it: the new flow is registered, and the socket scheduled, in this call. A failed
+    /// connect changes nothing.
+    pub fn connect<T, U>(
+        &mut self,
+        handle: SocketHandle,
+        cx: &mut InterfaceInner,
+        remote_endpoint: T,
+        local_endpoint: U,
+    ) -> Result<(), tcp::ConnectError>
+    where
+        T: Into<IpEndpoint>,
+        U: Into<IpListenEndpoint>,
+    {
+        self.item_mut(handle).socket.connect(cx, remote_endpoint, local_endpoint)?;
+        self.sync_identity(cx, handle.index);
+        self.identity_changed(handle.index);
+        Ok(())
+    }
+
+    /// [`tcp::Socket::listen`] through the set: the listener is registered, and the socket
+    /// scheduled, in this call. A failed listen changes nothing.
+    pub fn listen<T>(&mut self, handle: SocketHandle, local_endpoint: T) -> Result<(), tcp::ListenError>
+    where
+        T: Into<IpListenEndpoint>,
+    {
+        self.item_mut(handle).socket.listen(local_endpoint)?;
+        self.resync_identity(handle.index);
+        self.identity_changed(handle.index);
+        Ok(())
+    }
+
+    /// [`tcp::Socket::close`] through the set: a listener, or a connection still in SYN-SENT or
+    /// SYN-RECEIVED, leaves the flow index in this call.
+    pub fn close(&mut self, handle: SocketHandle) {
+        self.item_mut(handle).socket.close();
+        self.resync_identity(handle.index);
+        self.identity_changed(handle.index);
+    }
+
+    /// [`tcp::Socket::abort`] through the set: the socket leaves the flow index in this call
+    /// and is scheduled to send its reset.
+    pub fn abort(&mut self, handle: SocketHandle) {
+        self.item_mut(handle).socket.abort();
+        self.resync_identity(handle.index);
+        self.identity_changed(handle.index);
+    }
+
+    /// After an identity operation registered the slot's flow: queue an orphan that closed for
+    /// reaping and schedule the socket's readiness check.
+    fn identity_changed(&mut self, index: usize) {
+        self.check_reapable(index);
+        self.mark_dirty_synced(index);
     }
 
     /// Arm `token` for `side` of the socket, replacing a token armed there. Removing the

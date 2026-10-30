@@ -103,9 +103,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if socket.state() == State::CloseWait {
             server_closed = true;
-            socket.close();
+            stack.close(&handle);
         }
-        if socket.state() == State::Closed {
+        if stack.tcp(&handle).state() == State::Closed {
             break;
         }
         stack.send()?;

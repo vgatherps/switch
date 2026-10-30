@@ -1189,8 +1189,9 @@ impl<'a> Socket<'a> {
     ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open
     /// (see [is_open](#method.is_open)), and `Err(Error::Unaddressable)`
-    /// if the port in the given endpoint is zero.
-    pub fn listen<T>(&mut self, local_endpoint: T) -> Result<(), ListenError>
+    /// if the port in the given endpoint is zero. Applications listen through
+    /// [`TcpSet::listen`](crate::iface::TcpSet::listen), which registers the listener at once.
+    pub(crate) fn listen<T>(&mut self, local_endpoint: T) -> Result<(), ListenError>
     where
         T: Into<IpListenEndpoint>,
     {
@@ -1232,7 +1233,8 @@ impl<'a> Socket<'a> {
     /// This function returns an error if the socket was open; see [is_open](#method.is_open).
     /// It also returns an error if the local or remote port is zero, if the remote address
     /// is unspecified, or if an explicit local address is not one of the interface's.
-    pub fn connect<T, U>(
+    /// Applications connect through [`TcpSet::connect`](crate::iface::TcpSet::connect).
+    pub(crate) fn connect<T, U>(
         &mut self,
         cx: &mut Context,
         remote_endpoint: T,
@@ -1326,7 +1328,8 @@ impl<'a> Socket<'a> {
     /// Note that there is no corresponding function for the receive half of the full-duplex
     /// connection; only the remote end can close it. If you no longer wish to receive any
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
-    pub fn close(&mut self) {
+    /// Applications close through [`TcpSet::close`](crate::iface::TcpSet::close).
+    pub(crate) fn close(&mut self) {
         match self.state {
             // In the LISTEN state there is no established connection.
             State::Listen => self.set_state(State::Closed),
@@ -1376,8 +1379,9 @@ impl<'a> Socket<'a> {
     /// endpoint.
     ///
     /// In terms of the TCP state machine, the socket may be in any state and is moved to
-    /// the `CLOSED` state.
-    pub fn abort(&mut self) {
+    /// the `CLOSED` state. Applications abort through
+    /// [`TcpSet::abort`](crate::iface::TcpSet::abort).
+    pub(crate) fn abort(&mut self) {
         self.set_state(State::Closed);
     }
 

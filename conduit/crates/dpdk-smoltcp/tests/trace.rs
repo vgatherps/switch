@@ -234,7 +234,7 @@ fn exchange(pair: &mut Pair, trace: &RefCell<Trace>, group: &[Conn]) {
 /// both ends are Closed, the clients after TIME-WAIT.
 fn close(pair: &mut Pair, trace: &RefCell<Trace>, group: &[Conn]) {
     for conn in group {
-        pair.a.tcp_mut(&conn.client).close();
+        pair.a.close(&conn.client);
     }
     drive(pair, trace, |a, b| {
         let mut moved = false;
@@ -242,7 +242,7 @@ fn close(pair: &mut Pair, trace: &RefCell<Trace>, group: &[Conn]) {
             let server = b.tcp_mut(&conn.server);
             if server.state() == State::CloseWait {
                 assert!(matches!(server.recv(), Err(RecvError::Finished)));
-                server.close();
+                b.close(&conn.server);
                 moved = true;
             }
         }
