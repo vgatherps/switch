@@ -1412,6 +1412,7 @@ dependencies = [
  "byteorder",
  "heapless",
  "managed",
+ "rustc-hash",
  "zhida-buffer",
  "zhida-dpdk-sys",
 ]

@@ -7,7 +7,7 @@ use super::socket_meta::Meta;
 use super::interface::InterfaceInner;
 use crate::socket::tcp;
 
-use super::flow_table::{BindKey, FlowTable};
+use super::{bind_word, slot_map, tuple_word, BindKey, SlotMap};
 use super::timer_wheel::{
     InsertOutcome, IntrusiveLinks, Linked, ListHead, Timed, TimerWheel, WheelEntry, WheelPosition,
 };
@@ -210,9 +210,9 @@ pub struct TcpSet<'a> {
     /// Bit `i` is set when slot `i` holds a socket.
     occupied: Vec<u64>,
     flow_slots: Vec<FlowSlot>,
-    exact: FlowTable<(IpEndpoint, IpEndpoint)>,
+    exact: SlotMap<u128>,
     /// Listener chains by (local address or all-IP, port), each ascending by slot.
-    listeners: FlowTable<BindKey>,
+    listeners: SlotMap<u64>,
     /// The slot the last non-SYN exact lookup found.
     last_exact: Option<usize>,
     pub(crate) dirty_list: Vec<usize>,
@@ -244,8 +244,8 @@ impl<'a> TcpSet<'a> {
             len: 0,
             occupied: alloc::vec![0u64; slot_count.div_ceil(64)],
             flow_slots: alloc::vec![FlowSlot::EMPTY; slot_count],
-            exact: FlowTable::new(slot_count),
-            listeners: FlowTable::new(slot_count),
+            exact: slot_map(slot_count),
+            listeners: slot_map(slot_count),
             last_exact: None,
             dirty_list: Vec::with_capacity(slot_count),
             wheel: TimerWheel::default(),
@@ -394,7 +394,7 @@ impl<'a> TcpSet<'a> {
             remote_endpoint,
             local_endpoint.into(),
         )?;
-        if self.exact.get(&(local_endpoint, remote_endpoint)).is_some() {
+        if self.exact.contains_key(&tuple_word(local_endpoint, remote_endpoint)) {
             return Err(tcp::ConnectError::AddressInUse);
         }
         self.item_mut(handle).socket.connect(cx, remote_endpoint, local_endpoint)?;
@@ -689,18 +689,18 @@ impl TcpSet<'_> {
         match slot.registered {
             FlowKey::None => return,
             FlowKey::Exact { local, remote } => {
-                self.exact.remove(&(local, remote));
+                self.exact.remove(&tuple_word(local, remote));
             }
             FlowKey::Listener(bind) => {
-                let head = self
+                let head = *self
                     .listeners
-                    .get(&bind)
-                    .expect("registered TCP listener has no chain head");
+                    .get(&bind_word(bind))
+                    .expect("registered TCP listener has no chain head") as usize;
                 if head == index {
                     if slot.next == usize::MAX {
-                        self.listeners.remove(&bind);
+                        self.listeners.remove(&bind_word(bind));
                     } else {
-                        self.listeners.set(bind, slot.next);
+                        self.listeners.insert(bind_word(bind), slot.next as u32);
                     }
                 } else {
                     let mut previous = head;
@@ -766,18 +766,18 @@ impl TcpSet<'_> {
         match key {
             FlowKey::None => {}
             FlowKey::Exact { local, remote } => {
-                assert!(
-                    self.exact.get(&(local, remote)).is_none(),
-                    "TCP tuple {local} -> {remote} is already registered"
-                );
-                self.exact.set((local, remote), index);
+                let previous = self.exact.insert(tuple_word(local, remote), index as u32);
+                assert!(previous.is_none(), "TCP tuple {local} -> {remote} is already registered");
             }
             FlowKey::Listener(bind) => {
                 // Lowest slot first: the accept pool hands a SYN to the lowest listener.
-                let head = self.listeners.get(&bind).unwrap_or(usize::MAX);
+                let head = self
+                    .listeners
+                    .get(&bind_word(bind))
+                    .map_or(usize::MAX, |&head| head as usize);
                 if index < head {
                     self.flow_slots[index].next = head;
-                    self.listeners.set(bind, index);
+                    self.listeners.insert(bind_word(bind), index as u32);
                 } else {
                     let mut previous = head;
                     while self.flow_slots[previous].next < index {
@@ -1112,7 +1112,7 @@ impl TcpSet<'_> {
         {
             return Some(index);
         }
-        let e = self.exact.get(&(dst, src));
+        let e = self.exact.get(&tuple_word(dst, src)).map(|&index| index as usize);
         if !syn_like && let Some(index) = e {
             self.last_exact = Some(index);
         }
@@ -1125,22 +1125,32 @@ impl TcpSet<'_> {
     pub(crate) fn tcp_listener_lookup(&self, dst: IpEndpoint) -> Option<usize> {
         let IpAddress::Ipv4(addr) = dst.addr;
         self.listeners
-            .get(&(Some(addr), dst.port))
-            .or_else(|| self.listeners.get(&(None, dst.port)))
+            .get(&bind_word((Some(addr), dst.port)))
+            .or_else(|| self.listeners.get(&bind_word((None, dst.port))))
+            .map(|&index| index as usize)
     }
 
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn check_flow_index(&self) {
         assert_eq!(self.flow_slots.len(), self.sockets.len());
         let mut seen = alloc::vec![false; self.sockets.len()];
-        for ((local, remote), index) in self.exact.entries() {
+        for (&word, &index) in &self.exact {
+            let index = index as usize;
             assert!(!seen[index], "TCP slot holds two flows");
             seen[index] = true;
             assert!(self.sockets[index].inner.is_some());
-            assert_eq!(self.flow_slots[index].registered, FlowKey::Exact { local, remote });
+            let FlowKey::Exact { local, remote } = self.flow_slots[index].registered else {
+                panic!("TCP slot {index} is in the exact table without a tuple");
+            };
+            assert_eq!(tuple_word(local, remote), word);
             assert_eq!(self.flow_slots[index].next, usize::MAX);
         }
-        for (bind, head) in self.listeners.entries() {
+        for (&word, &head) in &self.listeners {
+            let head = head as usize;
+            let FlowKey::Listener(bind) = self.flow_slots[head].registered else {
+                panic!("TCP slot {head} heads a listener chain without a bind");
+            };
+            assert_eq!(bind_word(bind), word);
             assert_eq!(
                 self.flow_slots
                     .iter()
@@ -2179,6 +2189,31 @@ mod tests {
             let mut socket = socket();
             socket.listen(port).unwrap();
             socket
+        }
+
+        /// 4096 connect and abort cycles over a full set, each on a new tuple, with listeners
+        /// relistening on new ports: the flow maps keep the capacity they were built with.
+        #[test]
+        fn flow_maps_do_not_grow_under_churn() {
+            const SLOTS: usize = 64;
+            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
+            let (local, remote) = endpoints();
+            let mut set = TcpSet::new(SLOTS);
+            let handles: Vec<_> = (0..SLOTS).map(|_| set.add(socket())).collect();
+            let capacity = (set.exact.capacity(), set.listeners.capacity());
+            for cycle in 0..4096u16 {
+                let handle = handles[usize::from(cycle) % SLOTS];
+                set.abort(handle);
+                if cycle % 2 == 0 {
+                    let remote = IpEndpoint { port: 1 + cycle, ..remote };
+                    set.connect(handle, iface.context(), remote, local).unwrap();
+                } else {
+                    set.listen(handle, 1 + cycle).unwrap();
+                }
+            }
+            set.check_flow_index();
+            assert_eq!(set.exact.len() + set.listeners.len(), SLOTS);
+            assert_eq!((set.exact.capacity(), set.listeners.capacity()), capacity);
         }
 
         /// Each identity operation updates the flow index in its call, before any poll: a
