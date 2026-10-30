@@ -15,9 +15,10 @@ use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
-use crate::rx::{Config, Kind, Message, Role, WsError, WsRx};
+use crate::rx::{Config, Kind, Message, Role, WsRx};
+use crate::session::{Input, InputEnd, Session};
 pub use crate::tx::Failure;
-use crate::tx::{End, TxCore, TxError, max_control_frame};
+use crate::tx::{TxCore, TxError, max_control_frame};
 use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
@@ -162,7 +163,7 @@ pub async fn connect(
         }
     }
     upgrade::check(&head, &key).map_err(Error::Upgrade)?;
-    Ok(Wss(Session::new(tls.rx, tls.tx, tls.tcp, Role::Client)))
+    Ok(Wss(session(tls.rx, tls.tx, tls.tcp, Role::Client)))
 }
 
 /// The ws:// upgrade for `path` on `stream`, connected to `host`'s `port`.
@@ -174,7 +175,7 @@ pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port:
     let mut rx = Raw::new();
     let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
     upgrade::check(&head, &key).map_err(Error::Upgrade)?;
-    Ok(Ws(Session::new(rx, tx, tcp, Role::Client)))
+    Ok(Ws(session(rx, tx, tcp, Role::Client)))
 }
 
 /// The server side of the ws:// upgrade on an accepted `stream`: the client's request is
@@ -187,7 +188,7 @@ pub async fn accept_ws(handle: &NetHandle, stream: TcpStream) -> Result<Ws, Erro
     let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
     let response = upgrade::accept(&head).map_err(Error::Upgrade)?;
     send_bytes(&mut tx, response.as_bytes()).await?;
-    Ok(Ws(Session::new(rx, tx, tcp, Role::Server)))
+    Ok(Ws(session(rx, tx, tcp, Role::Server)))
 }
 
 /// Reads an HTTP head off plain TCP, through its blank line; what follows stays in `rx`.
@@ -207,25 +208,33 @@ async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mu
     }
 }
 
-/// An open wss:// connection. A server ping is answered within `recv`. The close handshake
-/// ends there too, either way: the server's close is echoed, or the echo of ours arrives; then
-/// close_notify and FIN go out, and `recv` returns `None` once the server acked them, so the
-/// connection (and the Net) may be dropped at once. A server that never acks keeps `recv`
-/// waiting: bound it.
-pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>>);
+/// An open wss:// connection, used from one task. A server ping is answered within `recv`.
+/// The close handshake ends there too, either way: the server's close is echoed, or the echo
+/// of ours arrives; then close_notify and FIN go out, and `recv` returns `None` once the server
+/// acked them, so the connection (and the Net) may be dropped at once. A server that never
+/// acks keeps `recv` waiting: bound it.
+///
+/// Progress needs a call: there is no background task. Output queued by one call (the rest of
+/// a message, a pong, a close echo) goes out during the next `send`, `close`, `recv` or
+/// `linger`. `send` and `recv` cannot run at once: if both peers send past each other's
+/// windows before reading, both wait; keep sends within the window or alternate them with
+/// reads.
+pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>, TcpRx>);
 
-/// An open ws:// connection, client or server. A ping is answered within `recv`. The close
-/// handshake ends there too, either way: the peer's close is echoed, or the echo of ours
-/// arrives; then FIN goes out, and `recv` returns `None` once the peer acked it, so the
-/// connection (and the Net) may be dropped at once. A peer that never acks keeps `recv`
-/// waiting: bound it.
-pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx>);
+/// An open ws:// connection, client or server, used from one task. A ping is answered within
+/// `recv`. The close handshake ends there too, either way: the peer's close is echoed, or the
+/// echo of ours arrives; then FIN goes out, and `recv` returns `None` once the peer acked it,
+/// so the connection (and the Net) may be dropped at once. A peer that never acks keeps
+/// `recv` waiting: bound it. Progress and concurrency as on [`Wss`].
+pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx, TcpRx>);
 
 impl Wss {
     /// The next message; `None` once the close handshake is done (ours or the server's) and the
-    /// transport's end delivered.
+    /// transport's end delivered. After a failure, the first failure, once what is owed (the
+    /// TLS alert, close_notify, FIN) went out. Bytes the server sends after its close are read
+    /// and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
-        self.0.recv().await
+        Ok(self.0.recv().await?)
     }
 
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
@@ -234,37 +243,38 @@ impl Wss {
     /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, `Failed`,
     /// `InvalidText`, `TooBig`.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
-        self.0.send(kind, payload).await
+        Ok(self.0.send(kind, payload).await?)
     }
 
     /// The server's close status and reason once `recv` returned `None`: 1005 (none) for a close
     /// without a status, 1002 (protocol error, what we echoed) for one with a status code a
     /// server may not send.
     pub fn peer_close(&self) -> Option<(u16, &str)> {
-        let p = self.0.rx.peer_close()?;
-        Some(match p {
-            [] => (1005, ""),
-            [a, b, reason @ ..] => {
-                let reason = core::str::from_utf8(reason).expect("the receive core validated the reason");
-                (u16::from_be_bytes([*a, *b]), reason)
-            }
-            [_] => unreachable!("the receive core refuses a 1-byte close"),
-        })
+        peer_close(self.0.rx.peer_close()?)
     }
 
     /// Sends a close frame (`code`, `reason`) and nothing more (RFC 6455 §7.1.1: TCP closes after
     /// the handshake). Receiving goes on until the server's echo, when `recv` sends close_notify
     /// and FIN and returns `None`; a server that never echoes keeps `recv` waiting: bound it.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
-        self.0.close(code, reason).await
+        Ok(self.0.close(code, reason).await?)
+    }
+
+    /// Ends without a close frame (one already sent still goes out): close_notify (unless a TLS
+    /// failure) and FIN, then reads and drops what the server still sends until its FIN, so
+    /// dropping the `Wss` afterwards sends no RST (a socket dropped with data unread aborts).
+    /// `Err(Failed(Dead))` if the socket reset. Waits for the server: bound it.
+    pub async fn linger(&mut self) -> Result<(), Error> {
+        Ok(self.0.linger().await?)
     }
 }
 
 impl Ws {
     /// The next message; `None` once the close handshake is done (ours or the peer's) and the
-    /// FIN delivered.
+    /// FIN delivered. After a failure, the first failure, once FIN went out. Bytes the peer
+    /// sends after its close are read and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
-        self.0.recv().await
+        Ok(self.0.recv().await?)
     }
 
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
@@ -273,122 +283,60 @@ impl Ws {
     /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, `Failed`,
     /// `InvalidText`, `TooBig`.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
-        self.0.send(kind, payload).await
+        Ok(self.0.send(kind, payload).await?)
+    }
+
+    /// The peer's close status and reason once `recv` returned `None`, as on [`Wss`].
+    pub fn peer_close(&self) -> Option<(u16, &str)> {
+        peer_close(self.0.rx.peer_close()?)
     }
 
     /// Sends a close frame (`code`, `reason`) and nothing more (RFC 6455 §7.1.1: TCP closes after
     /// the handshake). Receiving goes on until the peer's echo, when `recv` sends FIN and returns
     /// `None`; a peer that never echoes keeps `recv` waiting: bound it.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
-        self.0.close(code, reason).await
+        Ok(self.0.close(code, reason).await?)
     }
 
-    /// After `recv` failed the connection (a protocol error): FIN, then receives and drops what
-    /// the peer still sends until it ends the stream too, so dropping the `Ws` afterwards sends
-    /// no RST (a socket dropped with data unread aborts). Waits for the peer: bound it.
+    /// Ends without a close frame (one already sent still goes out), as after `recv` failed
+    /// the connection: FIN, then reads and drops what the peer still sends until its FIN, so
+    /// dropping the `Ws` afterwards sends no RST (a socket dropped with data unread aborts).
+    /// `Err(Failed(Dead))` if the socket reset. Waits for the peer: bound it.
     pub async fn linger(&mut self) -> Result<(), Error> {
-        self.0.tx.abandon();
-        self.0.tx.finish().await;
-        loop {
-            match self.0.tcp.recv().await {
-                Ok(_) => {}
-                Err(RecvError::Finished) => return Ok(()),
-                Err(e) => return Err(Error::Recv(e)),
-            }
-        }
+        Ok(self.0.linger().await?)
     }
 }
 
-/// The receive half, the send core, and the TCP receive half that feeds them.
-struct Session<R: PlainRx, T: PlainTx> {
-    rx: WsRx<R>,
-    tx: TxCore<T>,
-    tcp: TcpRx,
+/// A received close payload as status and reason (the receive core validated it).
+fn peer_close(p: &[u8]) -> Option<(u16, &str)> {
+    Some(match p {
+        [] => (1005, ""),
+        [a, b, reason @ ..] => {
+            let reason = core::str::from_utf8(reason).expect("the receive core validated the reason");
+            (u16::from_be_bytes([*a, *b]), reason)
+        }
+        [_] => unreachable!("the receive core refuses a 1-byte close"),
+    })
 }
 
-impl<R, T> Session<R, T>
+/// A connection's halves and TCP input, under `role`'s limits.
+fn session<R, T>(rx: R, tx: T, tcp: TcpRx, role: Role) -> Session<R, T, TcpRx>
 where
     R: PlainRx<Frame = TcpFrame, Tx = T>,
     T: PlainTx,
     Failure: From<R::Error>,
 {
-    fn new(rx: R, tx: T, tcp: TcpRx, role: Role) -> Self {
-        let config = Config::new(role);
-        Session { rx: WsRx::new(rx, config), tx: TxCore::new(tx, &config), tcp }
-    }
-
-    /// The next message. Before returning one, what cannot wait goes out (refused frame,
-    /// lower records, pong, our close); before waiting for input, everything that does not
-    /// need the peer (an accepted message's rest and a close behind it too). A peer close, a failure or the socket's death runs the
-    /// rest of the connection's sending through the transport's end, then returns `None` (a
-    /// clean close) or the first failure; so the caller may drop the connection at once.
-    async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
-        loop {
-            if self.tx.failed().is_some() || matches!(self.tx.end(), End::Delivered | End::Dead) {
-                return self.end().await;
-            }
-            let ready = match self.rx.has_message(self.tx.lower_mut()) {
-                Ok(ready) => ready,
-                Err(WsError::Closed) => {
-                    self.tx.peer_close(self.rx.peer_close().expect("a close was received"));
-                    return self.end().await;
-                }
-                Err(WsError::Protocol(e)) => {
-                    self.tx.fail(Failure::Protocol(e));
-                    return self.end().await;
-                }
-                Err(WsError::Lower(e)) => {
-                    self.tx.fail(e.into());
-                    return self.end().await;
-                }
-            };
-            if let Some(p) = self.rx.take_pong() {
-                self.tx.ping(p);
-            }
-            if ready {
-                self.tx.flush().await;
-            } else {
-                self.tx.drain().await;
-            }
-            if self.tx.failed().is_some() {
-                return self.end().await;
-            }
-            if ready {
-                return Ok(self.rx.take_message());
-            }
-            match self.tcp.recv().await {
-                Ok(frame) => self.rx.push(frame),
-                Err(RecvError::Finished) => self.tx.fail(Failure::PeerEof),
-                Err(_) => self.tx.die(),
-            }
-        }
-    }
-
-    /// Sends everything left through the transport's end; `None` after a clean close, else the
-    /// first failure.
-    async fn end(&mut self) -> Result<Option<Message<'_>>, Error> {
-        self.tx.finish().await;
-        self.tx.result()?;
-        Ok(None)
-    }
-
-    async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
-        Ok(self.tx.send(kind, payload).await?)
-    }
-
-    async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
-        Ok(self.tx.close(code, reason).await?)
-    }
+    let config = Config::new(role);
+    Session::new(WsRx::new(rx, config), TxCore::new(tx, &config), tcp)
 }
 
-impl From<Infallible> for Failure {
-    fn from(e: Infallible) -> Self {
-        match e {}
-    }
-}
+impl Input for TcpRx {
+    type Frame = TcpFrame;
 
-impl From<sheath::Error> for Failure {
-    fn from(e: sheath::Error) -> Self {
-        Failure::Tls(e)
+    async fn recv(&mut self) -> Result<TcpFrame, InputEnd> {
+        TcpRx::recv(self).await.map_err(|e| match e {
+            RecvError::Finished => InputEnd::Fin,
+            _ => InputEnd::Reset,
+        })
     }
 }

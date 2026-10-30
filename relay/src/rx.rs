@@ -569,6 +569,24 @@ impl<R: PlainRx> WsRx<R> {
         self.core.close.as_ref().map(Control::bytes)
     }
 
+    /// Stops receiving: drops what the lower layer holds and any found message. Nothing is
+    /// pushed or parsed after.
+    pub(crate) fn discard(&mut self) {
+        self.lower.discard();
+        self.pending = 0;
+        self.ready = None;
+    }
+
+    /// The lower layer ended its stream (TLS close_notify) and `has_message` found no message.
+    pub(crate) fn eof(&self) -> bool {
+        self.lower.eof()
+    }
+
+    /// TCP FIN while reading; see [`PlainRx::fin`].
+    pub(crate) fn fin(&mut self, tx: &mut R::Tx) -> Result<(), R::Error> {
+        self.lower.fin(tx)
+    }
+
     fn next(&mut self, tx: &mut R::Tx) -> Result<Option<Located>, WsError<R::Error>> {
         if let Some(s) = self.core.stop {
             return Err(s.into());

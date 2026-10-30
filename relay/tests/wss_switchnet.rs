@@ -1123,3 +1123,65 @@ fn invalid_text_and_close_are_refused_before_anything_is_sent() {
     assert_eq!(frames.1, (0x80 | CLOSE, close_payload(1000, "")));
 }
 
+
+/// The server ends TLS with close_notify, sends no WebSocket close and keeps TCP open: `recv`
+/// fails with `PeerEof` once our close_notify and FIN are out, instead of waiting for a FIN
+/// that does not come (before the fix it waited, bounded only by the test).
+#[zhida_test_support::pinned_test]
+fn close_notify_without_a_close_is_peer_eof() {
+    wss_until_client(
+        |mut tls| {
+            tls.conn.send_close_notify();
+            while tls.conn.wants_write() {
+                tls.conn.write_tls(&mut tls.sock).unwrap();
+            }
+            assert_close_notify_then_fin(tls);
+        },
+        |mut wss| async move {
+            let got = within_rounds(20_000, wss.recv()).await.expect("recv waited for a FIN");
+            let got = got.map(|m| m.is_some());
+            assert!(matches!(got, Err(WssError::Failed(relay::switchnet::Failure::PeerEof))), "{got:?}");
+            wss
+        },
+    );
+}
+
+/// Every frame of the Net held by the test: a message of many frames waits for frames, then
+/// goes out whole once they come back, and once the connection closed every frame is back
+/// for anyone to take.
+#[zhida_test_support::pinned_test]
+fn a_large_send_waits_for_frames_then_completes() {
+    const LEN: usize = 100_000;
+    let read = until_client(
+        |_| {},
+        |sock| {
+            let mut ws = tungstenite::accept(sock).expect("server WebSocket handshake");
+            let mut read = Vec::new();
+            loop {
+                match ws.read() {
+                    Ok(Message::Close(_)) => {}
+                    Ok(m) => read.push(m),
+                    Err(WsError::ConnectionClosed) => return read,
+                    Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("server read: {e}"),
+                }
+            }
+        },
+        |handle, stream| async move {
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let held = take_every_frame(&handle).await;
+            let total = held.len();
+            {
+                let mut sending = std::pin::pin!(ws.send(Kind::Binary, &[5; LEN]));
+                assert!(within_rounds(50, sending.as_mut()).await.is_none(), "sent without a frame");
+                drop(held);
+                within_rounds(20_000, sending).await.expect("send stuck after the frames came back").expect("send");
+            }
+            ws.close(1000, "").await.expect("close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            assert_eq!(take_every_frame(&handle).await.len(), total, "frames not returned");
+            ws
+        },
+    );
+    assert_eq!(read, [Message::Binary(vec![5; LEN].into())]);
+}

@@ -181,7 +181,7 @@ impl Wss {
         if let Some(p) = self.rx.take_pong() {
             self.tx.ping(p);
         }
-        ready(self.tx.flush());
+        ready(self.tx.finish());
     }
 }
 

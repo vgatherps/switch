@@ -27,6 +27,14 @@ pub(crate) trait PlainRx {
     fn current(&self) -> &[u8];
     /// Mark the first `n` bytes of `current()` consumed. Frees nothing.
     fn consume(&mut self, n: usize);
+    /// Drop everything held (frame, run, buffered bytes); nothing is read or pushed after.
+    fn discard(&mut self);
+    /// The stream ended inside the lower layer (TLS close_notify); `chunk` returns `None` for
+    /// good. Raw TCP ends only with FIN, which `fin` reports.
+    fn eof(&self) -> bool;
+    /// TCP FIN arrived while reading, after `chunk` returned `None`: `Ok` if the lower layer
+    /// had ended its stream first (raw TCP has nothing to end), else why not (TLS truncation).
+    fn fin(&mut self, tx: &mut Self::Tx) -> Result<(), Self::Error>;
 }
 
 /// The send half below WebSocket: sheath's frame sender, plus the records the lower layer
@@ -64,6 +72,18 @@ impl<F: RxFrame, L: FrameTx> PlainRx for TlsRx<F, L> {
 
     fn consume(&mut self, n: usize) {
         TlsRx::consume(self, n)
+    }
+
+    fn discard(&mut self) {
+        TlsRx::discard(self)
+    }
+
+    fn eof(&self) -> bool {
+        TlsRx::eof(self)
+    }
+
+    fn fin(&mut self, tx: &mut TlsTx<L>) -> Result<(), sheath::Error> {
+        TlsRx::fin(self, tx)
     }
 }
 

@@ -15,6 +15,10 @@
 // A new variant must be decided at every match.
 #![warn(clippy::wildcard_enum_match_arm)]
 
+use core::future::{Future, poll_fn};
+use core::pin::pin;
+use core::task::Poll;
+
 use rand::Rng;
 use rand::rngs::StdRng;
 
@@ -43,8 +47,20 @@ pub enum Failure {
     Dead,
 }
 
+impl From<core::convert::Infallible> for Failure {
+    fn from(e: core::convert::Infallible) -> Self {
+        match e {}
+    }
+}
+
+impl From<sheath::Error> for Failure {
+    fn from(e: sheath::Error) -> Self {
+        Failure::Tls(e)
+    }
+}
+
 /// Why `send` or `close` refused; nothing changed.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TxError {
     /// A close is queued or sent (RFC 6455 §5.5.1).
     Closed,
@@ -233,6 +249,7 @@ impl<L: PlainTx> TxCore<L> {
         &mut self.lower
     }
 
+    #[cfg(test)]
     pub(crate) fn failed(&self) -> Option<&Failure> {
         self.failed.as_ref()
     }
@@ -532,26 +549,6 @@ impl<L: PlainTx> TxCore<L> {
         self.local == Local::Sent && self.unsent.is_none()
     }
 
-    /// Jobs that go out before `recv` returns a message it has: the refused frame, lower
-    /// records, a pong, our close. (The rest of a large message goes out before `recv` waits
-    /// for input, see `backlog`.)
-    pub(crate) fn urgent(&self) -> bool {
-        match self.next_job() {
-            Job::Resend(_) | Job::Frame(_, Work::Pending | Work::Pong | Work::Close) => true,
-            Job::Idle | Job::Frame(_, Work::Fragment | Work::Notify) | Job::Fin | Job::Delivered => false,
-        }
-    }
-
-    /// Work that goes out before `recv` waits for input: every job but waiting for our FIN's
-    /// delivery (which needs the peer). Without it an accepted message's rest, and a Close
-    /// queued behind it, would wait for input the peer sends only after them.
-    pub(crate) fn backlog(&self) -> bool {
-        match self.next_job() {
-            Job::Resend(_) | Job::Frame(..) | Job::Fin => true,
-            Job::Idle | Job::Delivered => false,
-        }
-    }
-
     /// The first failure, if any.
     pub(crate) fn result(&self) -> Result<(), TxError> {
         match &self.failed {
@@ -681,17 +678,25 @@ impl<L: PlainTx> TxCore<L> {
         self.result()
     }
 
-    /// Sends the jobs that cannot wait (see `urgent`).
-    pub(crate) async fn flush(&mut self) {
-        self.drive(Self::urgent).await;
-    }
-
-    /// Sends everything that does not need the peer (see `backlog`).
-    pub(crate) async fn drain(&mut self) {
-        self.drive(Self::backlog).await;
+    /// The service `recv` gives the jobs once it has a message: each job in order is polled
+    /// once, stopping at the first that is not ready or after one fragment of a large
+    /// message. Never waits.
+    pub(crate) async fn service(&mut self) {
+        loop {
+            let job = self.next_job();
+            if job == Job::Idle {
+                return;
+            }
+            let mut step = pin!(self.step());
+            let done = poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx).is_ready())).await;
+            if !done || matches!(job, Job::Frame(_, Work::Fragment)) {
+                return;
+            }
+        }
     }
 
     /// Everything left, through the transport's end, as far as it goes without the peer.
+    #[cfg(test)]
     pub(crate) async fn finish(&mut self) {
         self.drive(|_| true).await;
     }

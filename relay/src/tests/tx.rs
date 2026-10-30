@@ -37,7 +37,7 @@ pub(super) struct Log {
     /// Each wait that pended, in order.
     pub(super) waited: Vec<&'static str>,
     /// The wakers of pending waits; [`set`] wakes them.
-    wakers: Vec<Waker>,
+    wakers: Wakers,
     /// Upcoming `try_send` calls to refuse; a refusal also takes all room away, as a full
     /// socket would.
     pub(super) refuse: usize,
@@ -75,7 +75,7 @@ pub(super) fn set(log: &Rc<RefCell<Log>>, change: impl FnOnce(&mut Log)) {
     let wakers = {
         let mut l = log.borrow_mut();
         change(&mut l);
-        std::mem::take(&mut l.wakers)
+        l.wakers.take()
     };
     wakers.into_iter().for_each(Waker::wake);
 }
@@ -123,6 +123,8 @@ impl<const TLS: bool> MockTx<TLS> {
     /// A gated wait: pends once if stalling (recording `name`), then while `blocked`.
     async fn wait(&self, name: &'static str, blocked: impl Fn(&Log) -> bool) -> Result<(), Dead> {
         let mut first = true;
+        let id = self.log.borrow_mut().wakers.id();
+        let _unregister = OnDrop(|| self.log.borrow_mut().wakers.remove(id));
         std::future::poll_fn(|cx| {
             let mut log = self.log.borrow_mut();
             if log.dead {
@@ -131,7 +133,7 @@ impl<const TLS: bool> MockTx<TLS> {
             if (first && log.stall) || blocked(&log) {
                 first = false;
                 log.waited.push(name);
-                log.wakers.push(cx.waker().clone());
+                log.wakers.register(id, cx.waker());
                 return Poll::Pending;
             }
             Poll::Ready(Ok(()))
@@ -246,7 +248,7 @@ pub(super) fn relay_reads(sender: Role, frames: &[Vec<u8>]) -> Run {
 }
 
 /// The frames as tungstenite in the peer's role reads them; the close it saw, if any.
-fn tungstenite_reads(sender: Role, frames: &[Vec<u8>]) -> Vec<TMessage> {
+pub(super) fn tungstenite_reads(sender: Role, frames: &[Vec<u8>]) -> Vec<TMessage> {
     let role = if sender == Role::Client { TRole::Server } else { TRole::Client };
     let mut ws = WebSocket::from_raw_socket(Duplex(Cursor::new(frames.concat())), role, None);
     let mut out = Vec::new();
@@ -263,7 +265,7 @@ fn tungstenite_reads(sender: Role, frames: &[Vec<u8>]) -> Vec<TMessage> {
 }
 
 /// The data and control frames as tungstenite reads them, without the close record.
-fn messages(sender: Role, log: &Rc<RefCell<Log>>) -> Vec<TMessage> {
+pub(super) fn messages(sender: Role, log: &Rc<RefCell<Log>>) -> Vec<TMessage> {
     let frames: Vec<_> = sent(log).into_iter().filter(|f| f != CLOSE_RECORD).collect();
     tungstenite_reads(sender, &frames)
 }
@@ -272,7 +274,7 @@ fn send_all(c: &mut Core, kind: Kind, payload: &[u8]) {
     assert_eq!(ready(c.send(kind, payload)), Ok(()));
 }
 
-fn tmsg(kind: Kind, payload: &[u8]) -> TMessage {
+pub(super) fn tmsg(kind: Kind, payload: &[u8]) -> TMessage {
     match kind {
         Kind::Text => TMessage::Text(String::from_utf8(payload.to_vec()).unwrap().into()),
         Kind::Binary => TMessage::Binary(payload.to_vec().into()),
@@ -280,7 +282,7 @@ fn tmsg(kind: Kind, payload: &[u8]) -> TMessage {
 }
 
 /// Polls `f` at most `n` times; its output if it finished.
-fn poll_n<F: Future>(f: F, n: usize) -> Option<F::Output> {
+pub(super) fn poll_n<F: Future>(f: F, n: usize) -> Option<F::Output> {
     let mut f = pin!(f);
     for _ in 0..n {
         if let Poll::Ready(out) = poll(f.as_mut()) {
@@ -527,28 +529,30 @@ fn next_job_order() {
     );
 }
 
-/// What `recv` sends before it waits for input (`drain`): a dropped large send's rest and a
-/// close queued behind it, everything short of waiting for the peer; what it sends before
-/// returning a message it has (`flush`): the pong, not the rest of the message.
+/// The service `recv` gives once it has a message: each job polled once in order, stopping
+/// after one fragment of a large message or at the first job that waits; it never waits.
 #[test]
-fn drain_sends_an_accepted_messages_rest_and_the_close_behind_it() {
+fn service_stops_after_one_fragment_or_at_the_first_wait() {
     let (mut c, log) = core(Role::Server, ROOM);
-    log.borrow_mut().room = Some(ROOM);
+    log.borrow_mut().room = Some(0);
     assert!(poll_n(c.send(Kind::Binary, &[4; 3000]), 1).is_none());
     c.ping(b"p");
-    assert!(poll_n(c.close(1000, "x"), 1).is_none());
     log.borrow_mut().room = None;
-    ready(c.flush());
-    assert_eq!(c.next_job(), Job::Frame(1430, Work::Fragment));
-    c.peer_close(&[0x03, 0xe8]);
-    log.borrow_mut().delivered = false;
-    ready(c.drain());
-    assert_eq!((c.next_job(), log.borrow().shutdowns), (Job::Delivered, 1));
-    let frames = sent(&log);
-    assert_eq!(frames.last().unwrap(), CLOSE_RECORD);
-    let msgs = tungstenite_reads(Role::Server, &frames[..frames.len() - 1]);
-    assert_eq!(msgs[..2], [TMessage::Pong(b"p".to_vec().into()), TMessage::Binary(vec![4; 3000].into())]);
-    assert!(matches!(&msgs[2], TMessage::Close(Some(f)) if f.reason == "x"), "{msgs:?}");
+    ready(c.service());
+    assert_eq!(sent(&log).len(), 2, "the pong and one fragment");
+    ready(c.service());
+    assert_eq!(sent(&log).len(), 3);
+    assert_eq!(c.next_job(), Job::Frame(4 + 148, Work::Fragment));
+    log.borrow_mut().room = Some(0);
+    ready(c.service());
+    // the dropped send's room wait, then this one's
+    assert_eq!((sent(&log).len(), log.borrow().waited.clone()), (3, vec!["room", "room"]));
+    log.borrow_mut().room = None;
+    ready(c.service());
+    assert_eq!(
+        messages(Role::Server, &log),
+        [TMessage::Pong(b"p".to_vec().into()), TMessage::Binary(vec![4; 3000].into())]
+    );
 }
 
 /// A ping answered while a large message is going out: the pong goes between its fragments.

@@ -60,4 +60,17 @@ impl<F: RxFrame, T> PlainRx for Raw<F, T> {
         assert!(n <= self.current().len(), "consume past the current run");
         self.pos += n;
     }
+
+    fn discard(&mut self) {
+        self.frame = None;
+        self.pos = 0;
+    }
+
+    fn eof(&self) -> bool {
+        false
+    }
+
+    fn fin(&mut self, _: &mut T) -> Result<(), Infallible> {
+        Ok(())
+    }
 }

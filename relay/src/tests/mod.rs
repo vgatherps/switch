@@ -13,10 +13,51 @@ pub(crate) use crate::tx::TxCore;
 mod differential;
 mod peer;
 mod rules;
+mod session;
 mod split;
 mod tx;
 mod tx_walk;
 mod wss;
+
+/// The wakers of a mock's pending waits. Like switchnet's futures, a wait unregisters when it
+/// is dropped (an [`OnDrop`] calling `remove`), so a caller that drops and rebuilds its waits
+/// across pending polls is never woken.
+#[derive(Default)]
+pub struct Wakers {
+    next: u64,
+    waiting: Vec<(u64, Waker)>,
+}
+
+impl Wakers {
+    /// A fresh wait's id.
+    pub fn id(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    pub fn register(&mut self, id: u64, waker: &Waker) {
+        self.remove(id);
+        self.waiting.push((id, waker.clone()));
+    }
+
+    pub fn remove(&mut self, id: u64) {
+        self.waiting.retain(|(i, _)| *i != id);
+    }
+
+    /// Every registered waker, unregistered.
+    pub fn take(&mut self) -> Vec<Waker> {
+        std::mem::take(&mut self.waiting).into_iter().map(|(_, w)| w).collect()
+    }
+}
+
+/// Runs its closure when dropped.
+pub struct OnDrop<F: FnMut()>(pub F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
 
 pub struct VecFrame {
     pub data: Vec<u8>,

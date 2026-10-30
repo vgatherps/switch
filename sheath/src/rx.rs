@@ -298,6 +298,12 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
             tx.fail(e.clone());
         }
         self.state = state;
+        self.discard();
+    }
+
+    /// Drops everything held: the frame, the bytes kept in scratch, the run. The caller reads
+    /// no more: `chunk` returns `Ok(None)` until a `push`, and nothing should be pushed.
+    pub fn discard(&mut self) {
         self.frame = None;
         self.scratch.clear();
         self.seen = 0;

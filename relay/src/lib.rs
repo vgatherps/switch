@@ -10,6 +10,7 @@
 mod lower;
 mod raw;
 mod rx;
+mod session;
 mod tx;
 mod upgrade;
 mod utf8;

@@ -427,6 +427,44 @@ fn retained_handshake_records_are_bounded() {
     }
 }
 
+/// A frame that counts itself live while held.
+struct LiveFrame {
+    data: Vec<u8>,
+    _live: std::rc::Rc<()>,
+}
+
+impl sheath::RxFrame for LiveFrame {
+    fn payload(&self) -> &[u8] {
+        &self.data
+    }
+    fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+    fn rx_timestamp(&self) -> u64 {
+        0
+    }
+}
+
+/// `discard` with a record's run held in the frame and another record behind it: the frame
+/// is released, nothing is current, and `chunk` returns nothing more.
+#[test]
+fn discard_releases_the_frame_and_the_run() {
+    let mut peer = connect(None);
+    let mut stream = Stream::default();
+    peer.flush(&mut stream);
+    peer.send(&mut stream, b"hello");
+    peer.send(&mut stream, b"world");
+    let live = std::rc::Rc::new(());
+    let mut rx: TlsRx<LiveFrame, TestTx> = TlsRx::new();
+    rx.push(LiveFrame { data: stream.bytes, _live: live.clone() });
+    assert_eq!(rx.chunk(&mut peer.tx).unwrap().unwrap().bytes, b"hello");
+    rx.discard();
+    assert_eq!(std::rc::Rc::strong_count(&live), 1, "the frame is still held");
+    assert_eq!(rx.current(), b"");
+    assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
+    assert!(!rx.eof());
+}
+
 /// A fresh receive half with frame `stamp` holding `data`.
 fn pushed(data: Vec<u8>, stamp: u64) -> TlsRx<VecFrame, TestTx> {
     let mut rx = TlsRx::new();
