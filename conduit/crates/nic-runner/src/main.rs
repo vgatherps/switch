@@ -218,7 +218,7 @@ fn run(args: Args) -> i32 {
             workload_start,
         ),
         Mode::Feed(f) => {
-            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET, turn_request: None });
             let result = feed::run(
                 &mut net,
                 f,

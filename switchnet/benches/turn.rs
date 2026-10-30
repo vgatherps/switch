@@ -107,7 +107,7 @@ impl Bench {
             rt: Runtime::new(0),
             to_peer: a.link_to(b),
             to_net: b.link_to(a),
-            net: Net::new(net, NetConfig { ingress_budget: BUDGET }),
+            net: Net::new(net, NetConfig { ingress_budget: BUDGET, turn_request: None }),
             peer,
             now: T0,
             tcp,

@@ -142,6 +142,10 @@ impl Device {
     pub(crate) fn frame_source(&self) -> TxSource {
         self.port.frame_source()
     }
+
+    pub(crate) fn tx_burst_size(&self) -> usize {
+        self.port.tx_burst_size()
+    }
 }
 
 /// Reserve a free pending slot and a full-frame TX packet: the spare if one

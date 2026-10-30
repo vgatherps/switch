@@ -139,7 +139,7 @@ fn main() {
         }
     };
     let code = driver::run(NAME, &tester, role.max_sockets(), BUFFER, None, |stack, start, stop| {
-        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET, turn_request: None });
         let result = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE).map_err(|e| e.to_string());
         let stack = net.into_stack().ok().expect("drive dropped every handle and socket");
         (stack, result)

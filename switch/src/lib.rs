@@ -14,7 +14,9 @@
 //! each round polls a snapshot of the woken tasks, and tasks woken or spawned during a
 //! round run in the next one, until none are left or 1024 tasks were polled (checked
 //! between rounds). [`StoredWaker::wake_deferred`] and [`yield_now`] instead move a task
-//! to the next poll, unless an ordinary wake already queued it.
+//! to the next poll, unless an ordinary wake already queued it; it runs after the tasks
+//! woken or spawned between the polls. A set [`TurnRequest`] stops a poll before its next
+//! task; the next poll first finishes the stopped round.
 //! Work that wakes or spawns tasks must run before [`Runtime::poll`]; those tasks are polled by
 //! that call. The runtime never waits, though future code can block. A regressed tick returns
 //! [`RuntimeError::TimeRegressed`] without changing runtime state.
@@ -158,7 +160,7 @@ mod timer_wheel;
 mod waker;
 
 pub use remote::RemoteWaker;
-pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
+pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner, TurnRequest};
 pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;
 pub use task::SpawnToken;

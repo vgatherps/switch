@@ -124,8 +124,9 @@ fn a_yielding_task_is_polled_once_per_poll() {
     assert_eq!((last.tasks_polled, last.live_tasks), (1, 0));
 }
 
+/// Tasks woken or spawned between polls run before tasks deferred in the last poll.
 #[test]
-fn deferred_tasks_run_before_work_queued_after_them() {
+fn deferred_tasks_run_after_work_queued_between_polls() {
     let mut runtime = Runtime::new(0);
     let order = Rc::new(RefCell::new(Vec::new()));
     #[switch::task]
@@ -144,7 +145,7 @@ fn deferred_tasks_run_before_work_queued_after_them() {
         .spawn(named("spawned", false, order.clone()))
         .unwrap();
     runtime.poll(0).unwrap();
-    assert_eq!(*order.borrow(), ["deferred", "spawned"]);
+    assert_eq!(*order.borrow(), ["spawned", "deferred"]);
 }
 
 #[test]

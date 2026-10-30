@@ -14,6 +14,7 @@ use crate::__private::Task;
 use crate::intrusive::NIL;
 use crate::oneshot::Sender;
 use crate::remote::Mailbox;
+use crate::runtime::TurnRequest;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
@@ -62,12 +63,16 @@ pub(crate) const POLL_BUDGET: usize = 1024;
 
 /// Single-threaded executor.
 ///
-/// Three queues: wakes go to `incoming`, deferred wakes to `deferred` (moved to
-/// the front of `incoming` when a `Runtime::poll` starts), and each round swaps
-/// `incoming` into `run_queue` and polls it. Simple iteration, no VecDeque.
+/// Three queues: wakes go to `incoming`, deferred wakes to `deferred` (appended
+/// to `incoming` when a `Runtime::poll` starts), and each round swaps `incoming`
+/// into `run_queue` and polls it from `cursor`. A turn request stops the round
+/// after a task poll; the next `Runtime::poll` finishes `run_queue[cursor..]`
+/// first. Simple iteration, no VecDeque.
 pub struct Executor {
-    /// Tasks to poll this cycle, by header.
+    /// Tasks to poll this round, by header; `run_queue[cursor..]` are still to
+    /// poll, and keep QUEUED until then.
     run_queue: Vec<*const TaskHeader>,
+    cursor: usize,
     /// Incoming wakes (spawns and wakes during poll).
     incoming: Vec<*const TaskHeader>,
     /// Tasks woken with `StoredWaker::wake_deferred`; moved into `incoming` at
@@ -77,10 +82,11 @@ pub struct Executor {
     task_count: usize,
     /// Slots in use, including a finished task's slot until its queue entry
     /// drains. `reserve` grows all three queues to at least this capacity before
-    /// counting a slot; capacities never shrink (rounds and `undefer` only trade
-    /// buffers between the queues). Each entry in `incoming` and `deferred`
-    /// belongs to a distinct QUEUED slot, and a QUEUED slot is not reclaimed
-    /// until its entry drains, so `incoming.len() + deferred.len() <= allocated`.
+    /// counting a slot; capacities never shrink (rounds only trade buffers
+    /// between the queues). Each entry in `incoming`, `deferred` and
+    /// `run_queue[cursor..]` belongs to a distinct QUEUED slot, and a QUEUED slot
+    /// is not reclaimed until its entry drains, so `incoming.len() +
+    /// deferred.len() + run_queue.len() - cursor <= allocated`.
     allocated: usize,
     /// One pool per task function this executor has spawned.
     pools: Vec<*mut RuntimePool>,
@@ -90,6 +96,8 @@ pub struct Executor {
     lifecycle: Lifecycle,
     /// The task being polled, for `Sleep`; null between polls.
     pub(crate) current: *const TaskHeader,
+    /// Set by the network side: stop polling tasks so the loop turns the Net.
+    turn_request: TurnRequest,
     pub(crate) timers: TimerStore,
     /// Wake requests from other threads; outlives this executor.
     mailbox: *const Mailbox,
@@ -103,6 +111,7 @@ impl Executor {
     pub(crate) fn with_capacity(initial_tick: u64, tasks: usize, timers: usize) -> Self {
         Self {
             run_queue: Vec::with_capacity(tasks),
+            cursor: 0,
             incoming: Vec::with_capacity(tasks),
             deferred: Vec::with_capacity(tasks),
             task_count: 0,
@@ -112,6 +121,7 @@ impl Executor {
             active: false,
             lifecycle: Lifecycle::Open,
             current: std::ptr::null(),
+            turn_request: TurnRequest::new(),
             timers: TimerStore::new(initial_tick, timers),
             mailbox: Mailbox::create(),
         }
@@ -272,7 +282,8 @@ impl Executor {
         }
     }
 
-    /// Move deferred wakes into `incoming`, at the start of a poll.
+    /// Move deferred wakes to the end of `incoming`, at the start of a poll: they
+    /// run after the tasks woken since the last poll.
     ///
     /// # Safety
     /// Stable owner-thread pointer to a live executor.
@@ -281,12 +292,15 @@ impl Executor {
         unsafe {
             if !(*this).deferred.is_empty() {
                 // DEFERRED stays set until the task's round clears it with QUEUED.
-                // Deferred wakes came first (during the last poll): they run first.
                 // Every slot has at most one queue entry: no reallocation.
-                (*this).deferred.append(&mut (*this).incoming);
-                std::mem::swap(&mut (*this).deferred, &mut (*this).incoming);
+                (*this).incoming.append(&mut (*this).deferred);
             }
         }
+    }
+
+    /// The flag the network side sets to stop polling.
+    pub(crate) fn turn_request(&self) -> TurnRequest {
+        self.turn_request.clone()
     }
 
     /// Poll one round (one snapshot of `incoming`), for tests of round order.
@@ -301,7 +315,8 @@ impl Executor {
                 return false;
             }
             let turn = Self::enter_turn(this);
-            Self::poll_round(this);
+            std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
+            Self::drain(this);
             turn.finish();
             true
         }
@@ -327,32 +342,49 @@ impl Executor {
         }
     }
 
-    /// Poll rounds: each round polls a snapshot of `incoming`, and another round
-    /// follows while `incoming` is not empty and fewer than [`POLL_BUDGET`] polls
-    /// were made (the budget never cuts a round short).
+    /// Finish the round a turn request stopped, then poll rounds: each round
+    /// polls a snapshot of `incoming`, and another round follows while `incoming`
+    /// is not empty and fewer than [`POLL_BUDGET`] polls were made (the budget
+    /// never cuts a round short). A turn request, set now or by a task, stops
+    /// before the next task poll.
     ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
     pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> usize {
         unsafe {
             let this = turn.owner;
             let mut polled = 0;
-            while !(*this).incoming.is_empty() && polled < POLL_BUDGET {
-                polled += Self::poll_round(this);
+            if (*this).turn_request.is_set() {
+                return 0;
+            }
+            if !(*this).run_queue.is_empty() {
+                polled += Self::drain(this);
+            }
+            while (*this).run_queue.is_empty()
+                && !(*this).incoming.is_empty()
+                && polled < POLL_BUDGET
+                && !(*this).turn_request.is_set()
+            {
+                std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
+                polled += Self::drain(this);
             }
             polled
         }
     }
 
-    /// Poll one snapshot of `incoming`; returns the futures polled.
+    /// Poll `run_queue` from `cursor` until its end, which clears it, or until a
+    /// turn request follows a task poll; returns the futures polled.
     ///
     /// # Safety
     /// As for [`Self::poll_batch`].
-    unsafe fn poll_round(this: *mut Self) -> usize {
+    unsafe fn drain(this: *mut Self) -> usize {
         unsafe {
             let mut polled = 0;
-            std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
             let batch_len = (*this).run_queue.len();
-            let mut cursor = 0;
+            // The cursor stays local and is stored only on an early return: task code
+            // cannot reach it, and an unwind leaves the executor Panicked, whose
+            // cleanup resets it. The request's Rc lives as long as the executor.
+            let request = (*this).turn_request.cell();
+            let mut cursor = (*this).cursor;
             while cursor < batch_len {
                 let index = cursor;
                 cursor += 1;
@@ -374,8 +406,14 @@ impl Executor {
                 if result.is_ready() {
                     Self::complete(this, header);
                 }
+                if (*request).get() {
+                    // Possibly at the end: the next drain then only clears.
+                    (*this).cursor = cursor;
+                    return polled;
+                }
             }
             (*this).run_queue.clear();
+            (*this).cursor = 0;
             polled
         }
     }
@@ -431,6 +469,7 @@ impl Executor {
             (*this).lifecycle = Lifecycle::Closing;
             Mailbox::close((*this).mailbox);
             (*this).run_queue.clear();
+            (*this).cursor = 0;
             (*this).incoming.clear();
             (*this).deferred.clear();
             // No spawn succeeds while Closing, and no reservation is open.
@@ -477,6 +516,12 @@ impl Executor {
     #[inline]
     pub unsafe fn task_count(this: *mut Self) -> usize {
         unsafe { (*this).task_count }
+    }
+
+    /// Entries of the stopped round still to poll.
+    #[cfg(test)]
+    pub(crate) unsafe fn tail_len(this: *mut Self) -> usize {
+        unsafe { (*this).run_queue.len() - (*this).cursor }
     }
 
     /// Entries in `incoming` and `deferred`.
