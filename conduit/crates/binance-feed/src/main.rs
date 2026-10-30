@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    connect, run, Clock, FeedError, Target, DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT,
-    DEFAULT_PRINT, INGRESS_BUDGET, SOCKET_BUFFER,
+    run, stream, Clock, Event, FeedError, Summary, Target, DEFAULT_HOST, DEFAULT_PATH,
+    DEFAULT_PORT, DEFAULT_PRINT, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use rustls::ClientConfig;
-use switchnet::{first, Net, NetConfig};
+use switchnet::{Net, NetConfig};
 use tap_echo::driver::{self, ZHIDA_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP};
 
 const NAME: &str = "binance-feed";
@@ -229,45 +229,42 @@ fn feed(
         std::thread::sleep(Duration::from_millis(1));
     }
     let target = target.clone();
-    let count = run(net, &clock, stop, move |handle, spawner, mut stop| async move {
+    let count = run(net, &clock, stop, move |handle, spawner, stop| async move {
         let socket = binance_feed::socket(None);
-        let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT);
-        let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {
-            let _ = writeln!(io::stdout(), "{NAME}: the tester exited before the feed connected");
-            return Ok(0);
+        let report = |event: Event<'_>| {
+            let mut out = io::stdout();
+            let _ = match event {
+                Event::Connected => writeln!(
+                    out,
+                    "{NAME}: connected to {} ({}) from {ZHIDA_IP}:{local_port} over Zhida, TLS 1.3, WebSocket open",
+                    target.url(),
+                    target.addr,
+                ),
+                Event::Ticker { count, ticker } if count <= print as u64 => writeln!(out, "#{count} {ticker}"),
+                Event::Ticker { .. } => Ok(()),
+                Event::Read(Summary { count, update_ids }) => {
+                    let secs = start.elapsed().as_secs_f64();
+                    match update_ids {
+                        Some((first, last)) => writeln!(
+                            out,
+                            "{NAME}: {count} bookTicker messages in {secs:.1} s since start, \
+                             update ids {first}..{last}",
+                        ),
+                        None => writeln!(out, "{NAME}: 0 bookTicker messages in {secs:.1} s since start"),
+                    }
+                }
+                Event::Closed => writeln!(out, "{NAME}: closed (WebSocket close handshake, TLS close_notify, FIN)"),
+                Event::CloseFailed(error) => writeln!(out, "{NAME}: close failed too: {error}"),
+            };
         };
-        let _ = writeln!(
-            io::stdout(),
-            "{NAME}: connected to {} ({}) from {ZHIDA_IP}:{local_port} over Zhida, TLS 1.3, WebSocket open",
-            target.url(),
-            target.addr,
-        );
-        let mut count = 0usize;
-        let mut first = None;
-        let mut last = None;
-        while let Some(ticker) = feed.next(&mut stop).await? {
-            count = count.checked_add(1).expect("bookTicker count fits usize");
-            if first.is_none() {
-                first = Some(ticker.update_id);
-            }
-            last = Some(ticker.update_id);
-            if count <= print {
-                let _ = writeln!(io::stdout(), "#{count} {ticker}");
-            }
+        let summary = stream(
+            &handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT, CLOSE_LIMIT, stop, report,
+        )
+        .await?;
+        if summary.is_none() {
+            let _ = writeln!(io::stdout(), "{NAME}: the tester exited before the feed connected");
         }
-        let secs = start.elapsed().as_secs_f64();
-        if let (Some(first), Some(last)) = (first, last) {
-            let _ = writeln!(
-                io::stdout(),
-                "{NAME}: {count} bookTicker messages in {secs:.1} s since start, \
-                 update ids {first}..{last}",
-            );
-        } else {
-            let _ = writeln!(io::stdout(), "{NAME}: 0 bookTicker messages in {secs:.1} s since start");
-        }
-        feed.close(&spawner, CLOSE_LIMIT).await?;
-        let _ = writeln!(io::stdout(), "{NAME}: closed (WebSocket close handshake, TLS close_notify, FIN)");
-        Ok::<_, FeedError>(count)
+        Ok::<_, FeedError>(summary.map_or(0, |summary| summary.count))
     })
     .and_then(|count| count)
     .map_err(|error| error.to_string())?;

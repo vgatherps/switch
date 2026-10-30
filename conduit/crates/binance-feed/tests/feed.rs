@@ -15,8 +15,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    client_config, connect, run, socket, webpki_client_config, BookTicker, Clock, FeedError,
-    Target, INGRESS_BUDGET, SOCKET_BUFFER,
+    client_config, connect, run, socket, stream, webpki_client_config, BookTicker, Clock, Event,
+    FeedError, Summary, Target, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
 use dpdk_smoltcp::smoltcp::socket::tcp;
@@ -618,6 +618,63 @@ fn feed_reads_tickers_answers_ping_and_closes() {
         assert!(saw.pong, "server did not receive Pong(keepalive)");
         assert!(saw.close, "server did not receive the client's Close");
         assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
+    });
+}
+
+/// `stream` after a failed read (a text that is not a bookTicker, after two that are) still
+/// closes: the server gets the Close, then close_notify and FIN (checked by `serve`), and the
+/// read error is what `stream` returns.
+#[zhida_test_support::pinned_test]
+fn stream_closes_after_a_read_error() {
+    with_net(&[], None, |net, clock, listener| {
+        let (server_tls, roots) = server_config();
+        let (mut texts, expected) = tickers();
+        texts.truncate(2);
+        texts.push("not a bookTicker".to_owned());
+        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Tickers(texts)));
+        let should_stop = || {
+            guard(clock);
+            false
+        };
+        let events = run(net, clock, should_stop, |handle, spawner, stop| async move {
+            let mut events = Vec::new();
+            let result = stream(
+                &handle,
+                &spawner,
+                &target(),
+                socket(None),
+                client_config(roots),
+                LOCAL_PORT,
+                CONNECT_LIMIT,
+                CLOSE_LIMIT,
+                stop,
+                |event| events.push(format!("{event:?}")),
+            )
+            .await;
+            match result {
+                Err(FeedError::Parse { text, .. }) => assert_eq!(text, "not a bookTicker"),
+                other => panic!("expected the parse error, got {other:?}"),
+            }
+            events
+        })
+        .expect("run the client");
+        let saw = join(server);
+        assert!(saw.close, "server did not receive the client's Close");
+        assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
+        let summary = Summary {
+            count: 2,
+            update_ids: Some((expected[0].update_id, expected[1].update_id)),
+        };
+        assert_eq!(
+            events,
+            [
+                "Connected".to_owned(),
+                format!("{:?}", Event::Ticker { count: 1, ticker: &expected[0] }),
+                format!("{:?}", Event::Ticker { count: 2, ticker: &expected[1] }),
+                format!("{:?}", Event::Read(summary)),
+                "Closed".to_owned(),
+            ]
+        );
     });
 }
 
