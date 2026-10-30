@@ -1013,26 +1013,6 @@ mod invalidation {
     }
 
     #[test]
-    fn source_address_removal_closes_silently_when_data_is_queued() {
-        let mut peer = Peer::new(2, PEER, None);
-        peer.warm();
-        let before = peer.iface.inner.template_frames;
-        peer.iface.update_ip_addrs(|addrs| addrs.clear());
-        peer.sockets.dispatches.clear();
-        peer.egress(2);
-        assert_eq!(peer.sockets.get(peer.handle).state(), tcp::State::Established);
-        assert!(peer.sockets.dispatches.is_empty());
-        assert!(peer.device.tx_queue.is_empty());
-        peer.sockets.get_mut(peer.handle).send_slice(b"x").unwrap();
-        peer.egress(3);
-        assert_eq!(peer.sockets.dispatches, vec![0]);
-        assert_eq!(peer.sockets.get(peer.handle).state(), tcp::State::Closed);
-        assert!(peer.sockets.get(peer.handle).remote_endpoint().is_none());
-        assert!(peer.device.tx_queue.is_empty());
-        assert_eq!(peer.iface.inner.template_frames, before);
-    }
-
-    #[test]
     fn burst_cap_templates_preserve_window() {
         let mut peer = Peer::configured(2, PEER, None, |iface, _| {
             iface.inner.caps.max_burst_size = Some(1);

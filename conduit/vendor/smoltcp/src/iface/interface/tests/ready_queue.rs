@@ -909,69 +909,6 @@ fn address_change_leaves_idle_sockets_established() {
 }
 
 #[test]
-fn parked_socket_resets_on_queued_data_after_address_removal() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
-    iface.poll(START, &mut device, &mut sockets);
-    device.tx_queue.clear();
-    iface.inner.neighbor_cache.fill(
-        REMOTE.into(),
-        HardwareAddress::Ethernet(REMOTE_HARDWARE),
-        START,
-    );
-    let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.get_mut(handle).send_slice(b"abc").unwrap();
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(take_tcp(&mut device).3, b"abc");
-    iface.inner.neighbor_cache.flush();
-    let retry = START + Duration::from_secs(1);
-    sockets.dispatches.clear();
-    iface.poll_egress(retry, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
-    assert_eq!(sockets.waiting, vec![0]);
-    let bytes = device.tx_queue.pop_front().unwrap();
-    let ethernet = EthernetFrame::new_checked(&bytes).unwrap();
-    assert_eq!(ethernet.ethertype(), EthernetProtocol::Arp);
-    assert!(device.tx_queue.is_empty());
-
-    let ack_at = retry + Duration::from_millis(1);
-    receive_at(
-        &mut iface,
-        &mut sockets,
-        &mut device,
-        ack_at,
-        segment(1234, TcpControl::None, 101, seq + 3),
-    );
-    assert_eq!(sockets.get(handle).send_queue(), 0);
-    assert_eq!(
-        sockets.get(handle).poll_at(iface.context()),
-        PollAt::Ingress
-    );
-    let silent_until = retry + Duration::from_secs(1);
-    assert_eq!(
-        iface.poll_at(ack_at, &mut sockets),
-        Some(Instant::from_millis(2048))
-    );
-    iface.update_ip_addrs(|addrs| addrs.retain(|addr| addr.address() != LOCAL.into()));
-    sockets.dispatches.clear();
-    iface.poll(ack_at, &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    assert!(device.tx_queue.is_empty());
-
-    let after_silence = silent_until + Duration::from_millis(1);
-    assert_eq!(iface.poll_at(after_silence, &mut sockets), None);
-    iface.poll(after_silence, &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    assert!(device.tx_queue.is_empty());
-    sockets.get_mut(handle).send_slice(b"next").unwrap();
-    iface.poll_egress(after_silence, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
-    assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
-    assert!(device.tx_queue.is_empty());
-}
-
-#[test]
 fn now_is_due_at_negative_time() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let now = Instant::from_millis(-100);
@@ -1270,27 +1207,6 @@ fn address_change_only_admits_due_sockets_after_device_refusal() {
 }
 
 #[test]
-fn disabling_any_ip_leaves_idle_socket_until_queued_data() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let (handle, _) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    iface.set_any_ip(true);
-    iface.update_ip_addrs(|addrs| addrs.clear());
-    iface.poll(START, &mut device, &mut sockets);
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    sockets.dispatches.clear();
-    iface.set_any_ip(false);
-    iface.poll(START, &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    assert!(device.tx_queue.is_empty());
-    sockets.get_mut(handle).send_slice(b"next").unwrap();
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
-    assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
-    assert!(device.tx_queue.is_empty());
-}
-
-#[test]
 fn dirty_sockets_readmitted_in_slot_order() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
@@ -1393,26 +1309,6 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
     iface.poll_egress(now, &mut device, &mut sockets);
     assert_eq!(sockets.dispatches, vec![0]);
     assert!(device.tx_queue.is_empty());
-}
-
-#[test]
-fn address_removal_resets_idle_socket_on_queued_data() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let (handle, _) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    iface.update_ip_addrs(|addrs| addrs.clear());
-    sockets.dispatches.clear();
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    assert!(device.tx_queue.is_empty());
-    sockets.get_mut(handle).send_slice(b"abc").unwrap();
-    assert_eq!(sockets.dirty_list, vec![0]);
-    assert_eq!(sockets.get(handle).poll_at(iface.context()), PollAt::Now);
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
-    assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
-    assert!(device.tx_queue.is_empty());
-    assert_eq!(iface.poll_at(START, &mut sockets), None);
 }
 
 #[test]
@@ -1628,54 +1524,6 @@ fn segment_cap_end_reclassifies() {
     }
     assert!(device.tx_queue.is_empty());
     assert!(sockets.dirty_list.is_empty());
-}
-
-#[test]
-fn address_removal_resets_socket_only_when_retransmit_timer_fires() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let (handle, _) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.get_mut(handle).send_slice(&[1; 512]).unwrap();
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(take_tcp(&mut device).3, [1; 512]);
-    let PollAt::Time(deadline) = sockets.get(handle).poll_at(&mut iface.inner) else {
-        panic!("sending must arm the retransmit timer");
-    };
-    let boundary = iface.poll_at(START, &mut sockets).unwrap();
-    assert!(boundary <= deadline);
-    assert_eq!(sockets.stored_deadline(0), PollAt::Time(deadline));
-    sockets.dispatches.clear();
-    iface.update_ip_addrs(|addrs| addrs.clear());
-    assert_eq!(
-        iface.poll_egress(START, &mut device, &mut sockets),
-        PollResult::None
-    );
-    assert!(sockets.dispatches.is_empty());
-    assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    assert!(sockets.dirty_list.is_empty());
-    assert_eq!(sockets.stored_deadline(0), PollAt::Time(deadline));
-    assert_eq!(
-        sockets.get(handle).poll_at(&mut iface.inner),
-        PollAt::Time(deadline)
-    );
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(boundary));
-    let now = deadline + Duration::from_millis(1);
-    assert_eq!(iface.poll_at(now, &mut sockets), Some(deadline));
-    assert_eq!(
-        sockets.get(handle).poll_at(&mut iface.inner),
-        PollAt::Time(deadline)
-    );
-    sockets.dispatches.clear();
-    assert_eq!(
-        iface.poll_egress(now, &mut device, &mut sockets),
-        PollResult::None
-    );
-    assert_eq!(sockets.dispatches, vec![0]);
-    assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
-    assert!(device.tx_queue.is_empty());
-    let next_deadline = sockets.get(handle).poll_at(&mut iface.inner);
-    assert_eq!(next_deadline, PollAt::Ingress);
-    assert_eq!(sockets.stored_deadline(0), next_deadline);
-    assert_eq!(iface.poll_at(now, &mut sockets), None);
 }
 
 /// While another socket is ready a visit sends one segment; once the other has nothing left,

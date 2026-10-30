@@ -2285,56 +2285,6 @@ fn raw_listener_on_unowned_address_never_gets_a_syn() {
     assert_eq!(sockets.get(on_owned).state(), tcp::State::SynReceived);
 }
 
-/// Connections whose local address is owned keep sending after the interface addresses are
-/// removed (the owned set is fixed; each connection checks its address against it at its first
-/// egress dispatch): one accepted on an owned address and one connected from one. A connection
-/// on the removed interface address is reset on its next egress visit and sends nothing.
-#[test]
-fn owned_address_connections_survive_interface_address_removal() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    own_prefix(&mut iface);
-    let owned = Ipv4Address::new(10, 9, 0, 1);
-    let source = Ipv4Address::new(10, 9, 0, 2);
-    let (on_primary, _) = establish(&mut iface, &mut sockets, &mut device);
-    let mut listener = socket();
-    listener.listen((owned, LOCAL_PORT + 1)).unwrap();
-    let accepted = sockets.add(listener);
-    let syn = TcpRepr { dst_port: LOCAL_PORT + 1, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
-    device.rx_queue.push_back(packet_bytes_to(syn, owned));
-    iface.poll(Instant::ZERO, &mut device, &mut sockets);
-    let bytes = take_reply(&mut device);
-    let (_, synack) = reply_from(&bytes);
-    let ack = TcpRepr {
-        dst_port: LOCAL_PORT + 1,
-        ..segment(TcpControl::None, REMOTE_SEQ + 1, Some(synack.seq_number + 1))
-    };
-    device.rx_queue.push_back(packet_bytes_to(ack, owned));
-    iface.poll(Instant::ZERO, &mut device, &mut sockets);
-    assert_eq!(sockets.get(accepted).state(), tcp::State::Established);
-    let connected = sockets.add(socket());
-    sockets.connect(connected, iface.context(), IpEndpoint::new(REMOTE_ADDR.into(), 80), (source, 40000))
-        .unwrap();
-    for handle in [on_primary, accepted] {
-        assert_eq!(sockets.get_mut(handle).send_slice(b"data"), Ok(4));
-    }
-    iface.update_ip_addrs(|addrs| addrs.clear());
-    iface.poll(Instant::ZERO, &mut device, &mut sockets);
-    assert_eq!(sockets.get(on_primary).state(), tcp::State::Closed);
-    assert_eq!(sockets.get(accepted).state(), tcp::State::Established);
-    assert_eq!(sockets.get(connected).state(), tcp::State::SynSent);
-    let mut sent: Vec<_> = device
-        .tx_queue
-        .drain(..)
-        .map(|bytes| {
-            let ip = Ipv4Packet::new_checked(&bytes[..]).unwrap();
-            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-            (ip.src_addr(), tcp.syn(), tcp.payload().to_vec())
-        })
-        .collect();
-    sent.sort();
-    assert_eq!(sent, [(owned, false, b"data".to_vec()), (source, true, Vec::new())]);
-}
-
 /// `count` owned single addresses 10.10.x.y, every other one skipped.
 fn own_singles(iface: &mut Interface, count: u32) -> Vec<Ipv4Address> {
     let base = u32::from(Ipv4Address::new(10, 10, 0, 0));

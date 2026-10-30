@@ -329,7 +329,9 @@ impl Interface {
         self.inner.get_source_address(dst_addr)
     }
 
-    /// Update the IP addresses of the interface.
+    /// Update the IP addresses of the interface. Call it before any TCP socket holds a
+    /// connection or listens: a connection on a removed address is not reset and keeps sending
+    /// from it, and a listener bound to one keeps it.
     ///
     /// # Panics
     /// This function panics if any of the addresses are not unicast.

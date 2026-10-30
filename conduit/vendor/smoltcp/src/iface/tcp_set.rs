@@ -398,7 +398,6 @@ impl<'a> TcpSet<'a> {
             return Err(tcp::ConnectError::AddressInUse);
         }
         self.item_mut(handle).socket.connect(cx, remote_endpoint, local_endpoint)?;
-        self.admit_exact(cx, handle.index);
         self.update_identity(handle.index);
         self.identity_changed(handle.index);
         Ok(())
@@ -743,21 +742,6 @@ impl TcpSet<'_> {
         }
         self.flow_slots[index].registered = FlowKey::None;
         self.flow_slots[index].next = usize::MAX;
-    }
-
-    /// `admit_local` for a connect's tuple, firing the socket's tokens when it is refused.
-    #[cold]
-    #[inline(never)]
-    fn admit_exact(&mut self, cx: &InterfaceInner, index: usize) -> bool {
-        let item = self.sockets[index]
-            .inner
-            .as_mut()
-            .expect("exact flow key without a socket");
-        if item.socket.admit_local(cx) {
-            return true;
-        }
-        self.fire(index);
-        false
     }
 
     /// Registers the slot's current flow key if it changed: called by every operation that can
@@ -1728,7 +1712,6 @@ mod tests {
             ("rx_fin_received", 3),
             ("in_rto_loss_episode", 4),
             ("remote_has_sack", 5),
-            ("local_owned", 6),
             ("timer", 8),
             ("ack_at", 24),
             ("local_seq_no", 32),
@@ -1771,8 +1754,6 @@ mod tests {
             ("rx_fin_received", 1),
             ("in_rto_loss_episode", 1),
             ("remote_has_sack", 1),
-            // Read once per egress dispatch with hop_limit and Meta's next hop, same line.
-            ("local_owned", 1),
             ("timer", 2),
             ("ack_at", 2),
             ("local_seq_no", 2),
