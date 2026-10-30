@@ -130,7 +130,7 @@ impl<const TLS: bool> Walk<TLS> {
                 self.send(Kind::Binary, vec![self.attempts; 3000]);
             }
             Ev::Step => {
-                let _ = poll(pin!(self.c.step()));
+                let _ = poll(pin!(self.c.try_step()));
             }
             Ev::RefuseNext => self.log.borrow_mut().refuse += 1,
             Ev::PendingAlert => self.log.borrow_mut().pending.push(b"alert".to_vec()),
@@ -156,7 +156,7 @@ impl<const TLS: bool> Walk<TLS> {
     /// Steps until no job is left; panics past the bound or if a step pends.
     fn finish_bounded(&mut self, seq: &[Ev]) {
         for _ in 0..STEP_BOUND {
-            let stepped = poll(pin!(self.c.step()));
+            let stepped = poll(pin!(self.c.try_step()));
             match stepped {
                 Poll::Ready(true) => self.c.check_invariants(),
                 Poll::Ready(false) => return,

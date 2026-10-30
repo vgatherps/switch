@@ -16,6 +16,17 @@ const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
 
+/// Most plaintext rustls puts in one record without a client `max_fragment_size` (TLS's 2^14).
+const MAX_RECORD_PLAINTEXT: usize = 1 << 14;
+
+/// Plaintext one frame of `room` bytes carries as one record: the room less the record
+/// overhead, and at most one record's plaintext: the client's `max_fragment_size` (rustls's
+/// limit counts the record header and is at least 32 B), else 2^14.
+pub(crate) fn plain_room(room: usize, max_fragment_size: Option<usize>) -> usize {
+    let record = max_fragment_size.map_or(MAX_RECORD_PLAINTEXT, |max| max - RECORD_HEAD);
+    (room - OVERHEAD).min(record)
+}
+
 /// A frame holding records that used sequence numbers. Only [`TlsTx`] makes one, and only
 /// [`TlsTx::try_send`](FrameTx::try_send) takes one, so a frame that was not sealed cannot be
 /// sent in place of the sealed one:
@@ -43,8 +54,9 @@ enum State {
 ///
 /// One [`Sealed`] frame at a time: the one from `seal`, `take_pending` or
 /// [`TlsTx::close_notify`] must be accepted by `try_send` (offered again while it is handed
-/// back) before the next is made. Its records used sequence numbers, so dropping it would
-/// break every later record; the next of those three calls panics if it was dropped.
+/// back) before the next is made. Its records used sequence numbers, so dropping it breaks
+/// every later record: the next of those three calls (and every one after) fails with
+/// [`TxError::Broken`].
 pub struct TlsTx<L> {
     pub(crate) conn: UnbufferedClientConnection,
     lower: L,
@@ -59,12 +71,16 @@ pub struct TlsTx<L> {
     state: State,
     /// A `Sealed` frame exists that the lower layer has not accepted.
     in_flight: bool,
+    /// Plaintext per frame ([`plain_room`]): rustls would split a larger seal into several
+    /// records, past the frame.
+    room: usize,
 }
 
 impl<L: FrameTx> TlsTx<L> {
-    /// `conn` must have completed a TLS 1.3 handshake. Panics if `lower`'s frames cannot carry
-    /// a record with one byte of plaintext.
-    pub fn new(conn: UnbufferedClientConnection, lower: L) -> Self {
+    /// `conn` must have completed a TLS 1.3 handshake; `max_fragment_size` is the
+    /// `ClientConfig::max_fragment_size` it was made with. Panics if `lower`'s frames cannot
+    /// carry a record with one byte of plaintext.
+    pub fn new(conn: UnbufferedClientConnection, lower: L, max_fragment_size: Option<usize>) -> Self {
         assert!(
             !conn.is_handshaking(),
             "TlsTx needs a connection whose handshake is complete"
@@ -76,14 +92,17 @@ impl<L: FrameTx> TlsTx<L> {
         );
         let (_, room) = lower.plain();
         assert!(room > OVERHEAD, "frame room {room} B below one TLS record");
+        let room = plain_room(room, max_fragment_size);
         Self {
             conn,
             lower,
             held: Vec::new(),
-            plaintext: Vec::with_capacity(room - OVERHEAD),
+            // allocated at the first seal, then kept
+            plaintext: Vec::new(),
             pending: Vec::new(),
             state: State::Open,
             in_flight: false,
+            room,
         }
     }
 
@@ -92,7 +111,7 @@ impl<L: FrameTx> TlsTx<L> {
         &mut self,
         mut f: L::Frame,
     ) -> Result<Sealed<L::Sealed>, TxError<L::Error>> {
-        self.check_sent();
+        self.check_sent()?;
         let (head, room) = self.lower.plain();
         let mut traffic = self.write_traffic()?;
         let n = traffic
@@ -139,11 +158,14 @@ impl<L: FrameTx> TlsTx<L> {
         }
     }
 
-    fn check_sent(&self) {
-        assert!(
-            !self.in_flight,
-            "the last sealed frame was not sent: it is still held or was dropped"
-        );
+    /// The last sealed frame was taken by the lower layer. If not (dropped, or still held and
+    /// never sent), its sequence numbers are lost to every later record: the sender is broken.
+    fn check_sent(&mut self) -> Result<(), TxError<L::Error>> {
+        if self.in_flight {
+            self.state = State::Broken;
+            return Err(TxError::Broken);
+        }
+        Ok(())
     }
 
     fn write_traffic(
@@ -199,7 +221,7 @@ impl<L: FrameTx> TlsTx<L> {
         &mut self,
         mut f: L::Frame,
     ) -> Result<Option<Sealed<L::Sealed>>, TxError<L::Error>> {
-        self.check_sent();
+        self.check_sent()?;
         if matches!(self.state, State::Broken) {
             return Err(TxError::Broken);
         }
@@ -230,23 +252,23 @@ impl<L: FrameTx> FrameTx for TlsTx<L> {
     }
 
     fn plain(&self) -> (usize, usize) {
-        let (head, room) = self.lower.plain();
-        (head + RECORD_HEAD, room - OVERHEAD)
+        (self.lower.plain().0 + RECORD_HEAD, self.room)
     }
 
     /// Encrypts the plaintext into one record in place of it, behind any KeyUpdate records
     /// rustls has to send first. Panics if `len` is 0 (rustls makes no record of nothing) or
     /// exceeds the room.
     fn seal(&mut self, mut f: L::Frame, len: usize) -> Result<Self::Sealed, Self::Error> {
-        self.check_sent();
+        self.check_sent()?;
         let (head, room) = self.lower.plain();
         assert!(len > 0, "sealing an empty record");
         assert!(
-            len <= room - OVERHEAD,
+            len <= self.room,
             "{len} B of plaintext exceed the frame room"
         );
         let start = head + RECORD_HEAD;
         self.plaintext.clear();
+        self.plaintext.reserve_exact(self.room);
         self.plaintext
             .extend_from_slice(&f.room_mut()[start..start + len]);
         let plaintext = core::mem::take(&mut self.plaintext);

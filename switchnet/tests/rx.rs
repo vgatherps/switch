@@ -149,9 +149,28 @@ fn queued_data_then_reset_gives_the_data_then_invalid_state() {
     })
 }
 
-/// After the Net accepted the peer's FIN, a reset still ends in `Finished`.
+/// The peer's FIN alone: the data before it is delivered, then `Finished`.
 #[zhida_test_support::pinned_test]
-fn accepted_fin_then_reset_gives_finished() {
+fn accepted_fin_gives_finished() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["fina", "finb"]);
+        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        peer_send(&mut mixed, &peer, b"last");
+        mixed.peer.tcp_mut(&peer).close();
+        mixed.until(|m| m.peer.tcp(&peer).state() == State::FinWait2);
+        let (frame, error) = recv_twice(&mut mixed, stream);
+        assert_eq!(frame.unwrap().payload(), b"last");
+        assert_eq!(error, RecvError::Finished);
+        drop(peer);
+        mixed.close();
+    })
+}
+
+/// The peer's FIN, then its reset: the data before them is delivered, then the reset
+/// (`InvalidState`), not a clean end. (Before, `Finished`: a caller could not tell it from a
+/// FIN alone.)
+#[zhida_test_support::pinned_test]
+fn accepted_fin_then_reset_gives_the_reset() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["frsa", "frsb"]);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
@@ -162,7 +181,7 @@ fn accepted_fin_then_reset_gives_finished() {
         assert_eq!(mixed.peer.tcp(&peer).state(), State::Closed);
         let (frame, error) = recv_twice(&mut mixed, stream);
         assert_eq!(frame.unwrap().payload(), b"last");
-        assert_eq!(error, RecvError::Finished);
+        assert_eq!(error, RecvError::InvalidState);
         drop(peer);
         mixed.close();
     })

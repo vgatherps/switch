@@ -291,24 +291,32 @@ fn sealing_nothing_panics() {
     let _ = peer.tx.seal(f, 0);
 }
 
-/// The review's case: frame A is sealed, another frame goes out, A is dropped. Only a
-/// `Sealed` can be sent, and only one exists at a time, so A's loss is caught.
+/// Frame A is sealed and dropped unsent: its sequence number is lost, so the sender is broken.
+/// The next seal fails with `Broken` instead of panicking, and so does every later call that
+/// would make a record. (Before, the next seal panicked.)
 #[test]
-#[should_panic(expected = "the last sealed frame was not sent")]
-fn sealing_after_dropping_a_sealed_frame_panics() {
+fn sealing_after_dropping_a_sealed_frame_is_broken() {
     let mut peer = connect(None);
-    let a = seal(&mut peer.tx, b"a");
-    drop(a);
-    let _ = seal(&mut peer.tx, b"b");
+    drop(seal(&mut peer.tx, b"a"));
+    let f = frame(&mut peer.tx, b"b");
+    assert!(matches!(peer.tx.seal(f, 1), Err(TxError::Broken)));
+    let f = ready(peer.tx.alloc()).unwrap();
+    assert!(matches!(peer.tx.take_pending(f), Err(TxError::Broken)));
+    let f = ready(peer.tx.alloc()).unwrap();
+    assert!(matches!(peer.tx.close_notify(f), Err(TxError::Broken)));
+    assert!(peer.wire.sent.borrow().is_empty());
 }
 
+/// A second record while the first sealed frame is still held unsent: the sender is broken
+/// (the held one's records can no longer be followed), with `Broken`, not a panic.
 #[test]
-#[should_panic(expected = "the last sealed frame was not sent")]
 fn two_sealed_frames_cannot_exist() {
     let mut peer = connect(None);
     let _a = seal(&mut peer.tx, b"a");
     let f = ready(peer.tx.alloc()).unwrap();
-    let _ = peer.tx.take_pending(f);
+    assert!(matches!(peer.tx.take_pending(f), Err(TxError::Broken)));
+    let f = frame(&mut peer.tx, b"b");
+    assert!(matches!(peer.tx.seal(f, 1), Err(TxError::Broken)));
 }
 
 #[test]
@@ -318,7 +326,7 @@ fn new_needs_completed_handshake() {
     let client =
         UnbufferedClientConnection::new(client_config, ServerName::try_from(HOST).unwrap())
             .unwrap();
-    TlsTx::new(client, TestTx(Wire::default()));
+    TlsTx::new(client, TestTx(Wire::default()), None);
 }
 
 /// The alert rustls queues on a receive error is visible to `has_pending` as soon as the
@@ -380,4 +388,26 @@ fn sealing_while_a_handshake_message_is_half_received() {
     assert!(rx.chunk(&mut peer.tx).unwrap().is_none());
     assert_eq!(seal_and_send(&mut peer, b"end"), RECORD + 3);
     assert_eq!(peer.deliver().unwrap(), b"end");
+}
+
+/// Over a lower layer with 64 KiB frames and the default fragment limit (None: rustls's 16 KiB
+/// records), a seal of the whole advertised plaintext room is one record that fits the frame.
+/// (Before, the room was the frame less the overhead, 65,460 B: rustls split it into four
+/// records past the frame and the seal panicked.)
+#[test]
+fn default_fragment_limit_caps_the_room_at_one_record() {
+    let mut peer = connect_over(default_provider(), None, Wire { frame_room: 1 << 16, ..Wire::default() });
+    let (_, room) = peer.tx.plain();
+    assert_eq!(room, 1 << 14);
+    let payload = vec![7; room];
+    let wire_len = seal_and_send(&mut peer, &payload);
+    assert_eq!(wire_len, RECORD + room);
+    let mut tls = &peer.wire.sent.borrow()[..];
+    while !tls.is_empty() {
+        peer.server.read_tls(&mut tls).unwrap();
+    }
+    peer.server.process_new_packets().unwrap();
+    let mut got = vec![0; room];
+    std::io::Read::read_exact(&mut peer.server.reader(), &mut got).unwrap();
+    assert_eq!(got, payload);
 }

@@ -19,16 +19,14 @@ pub struct Config {
     pub max_frame: usize,
     /// Largest message accepted.
     pub max_message: usize,
-    /// Scratch capacity reserved at construction.
-    pub scratch: usize,
     /// Largest message sent.
     pub max_send: usize,
 }
 
 impl Config {
-    /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way); 64 KiB scratch.
+    /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way).
     pub fn new(role: Role) -> Config {
-        Config { role, max_frame: 16 << 20, max_message: 64 << 20, scratch: 64 << 10, max_send: 64 << 20 }
+        Config { role, max_frame: 16 << 20, max_message: 64 << 20, max_send: 64 << 20 }
     }
 }
 
@@ -508,7 +506,8 @@ impl<R: PlainRx> WsRx<R> {
                 ctrl: Control::EMPTY,
                 msg: None,
                 utf8: Utf8::default(),
-                scratch: Vec::with_capacity(config.scratch.min(config.max_message)),
+                // allocated on the first message spanning runs, then kept
+                scratch: Vec::new(),
                 pong: Control::EMPTY,
                 pong_due: false,
                 close: None,
@@ -712,9 +711,9 @@ mod tests {
     /// Doubling would pass `max_message`; capacity stops at it.
     #[test]
     fn scratch_capacity_never_exceeds_max_message() {
-        let cfg = Config { max_frame: 100, max_message: 1000, scratch: 16, ..Config::new(Role::Client) };
+        let cfg = Config { max_frame: 100, max_message: 1000, ..Config::new(Role::Client) };
         let mut rx = WsRx::new(Raw::new(), cfg);
-        // 10 fragments of 100 B: capacity 16 -> 100 -> 200 -> 400 -> 800 -> 1000 (doubling alone: 1600).
+        // 10 fragments of 100 B: capacity 0 -> 100 -> 200 -> 400 -> 800 -> 1000 (doubling alone: 1600).
         for i in 0..10 {
             let b0 = match i {
                 0 => 2,
@@ -729,7 +728,7 @@ mod tests {
         assert_eq!(rx.core.scratch.capacity(), 1000);
 
         // One frame spanning two pushes: the reservation is clamped too.
-        let cfg = Config { max_frame: 1000, max_message: 1000, scratch: 600, ..Config::new(Role::Client) };
+        let cfg = Config { max_frame: 1000, max_message: 1000, ..Config::new(Role::Client) };
         let mut rx = WsRx::new(Raw::new(), cfg);
         let mut wire = vec![0x82, 126];
         wire.extend_from_slice(&1000u16.to_be_bytes());

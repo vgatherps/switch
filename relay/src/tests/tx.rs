@@ -520,7 +520,7 @@ fn next_job_order() {
     let mut order = Vec::new();
     while let job @ (Job::Resend(_) | Job::Frame(..)) = c.next_job() {
         order.push(job);
-        assert!(ready(c.step()));
+        assert!(ready(c.try_step()));
     }
     let works: Vec<_> = order.iter().map(|j| if let Job::Frame(_, w) = j { Some(*w) } else { None }).collect();
     assert_eq!(
@@ -631,7 +631,7 @@ fn refused_close_and_close_notify_complete_only_when_taken() {
     c.peer_close(&[0x03, 0xe8]);
     log.borrow_mut().refuse = 1;
     log.borrow_mut().room = Some(ROOM);
-    assert!(ready(c.step()));
+    assert!(ready(c.try_step()));
     assert_eq!((c.end(), c.next_job()), (End::Notify, Job::Resend(ROOM)));
     assert_eq!(log.borrow().shutdowns, 0);
     log.borrow_mut().room = None;
@@ -652,7 +652,7 @@ fn failure_drains_only_what_is_sealed_or_owed_below() {
         assert!(poll_n(c.send(Kind::Binary, &[4; 4000]), 2).is_none());
         log.borrow_mut().refuse = 1;
         log.borrow_mut().room = Some(ROOM);
-        assert!(ready(c.step()));
+        assert!(ready(c.try_step()));
         assert_eq!(c.next_job(), Job::Resend(ROOM));
         c.ping(b"p");
         log.borrow_mut().pending.push(b"alert".to_vec());
@@ -706,7 +706,7 @@ fn every_op_after_a_failure() {
     c.ping(b"p");
     c.fail(Failure::Protocol(crate::ProtocolError::ReservedBits));
     assert_eq!((state(&c), sent(&log)), before);
-    c.die();
+    c.reset();
     assert_eq!(c.failed(), Some(&Failure::PeerEof));
 }
 
@@ -746,7 +746,7 @@ fn close_after_a_cancelled_linger_is_closed() {
 }
 
 /// A send whose drain of earlier work finds the socket dead accepts nothing: it returns the
-/// death without copying its message in or sealing it.
+/// death without sealing its message.
 #[test]
 fn send_whose_drain_dies_accepts_nothing() {
     let (mut c, log) = core(Role::Server, ROOM);
@@ -754,7 +754,7 @@ fn send_whose_drain_dies_accepts_nothing() {
     assert!(poll_n(c.send(Kind::Binary, b"x"), 1).is_none());
     log.borrow_mut().dead = true;
     assert_eq!(ready(c.send(Kind::Binary, &[1; 4000])), Err(TxError::Failed(Failure::Dead)));
-    assert_eq!((c.buf_capacity(), log.borrow().seals), (0, 1));
+    assert_eq!(log.borrow().seals, 1);
 }
 
 /// After death, records the lower layer still owes are never sealed.
@@ -762,7 +762,7 @@ fn send_whose_drain_dies_accepts_nothing() {
 fn dead_seals_nothing_more() {
     let (mut c, log) = core(Role::Server, ROOM);
     log.borrow_mut().pending.push(b"alert".to_vec());
-    c.die();
+    c.stop();
     assert_eq!(c.next_job(), Job::Idle);
     ready(c.finish());
     assert_eq!(log.borrow().seals, 0);

@@ -62,7 +62,11 @@ struct Wss {
 impl Wss {
     /// Handshake done, the session tickets delivered.
     fn new() -> Wss {
-        let Peer { tx, wire, mut server } = connect();
+        Wss::with(connect())
+    }
+
+    fn with(peer: Peer) -> Wss {
+        let Peer { tx, wire, mut server } = peer;
         // tungstenite writes whole messages; rustls would stop taking plaintext at 64 KiB.
         server.set_buffer_limit(None);
         let mut w = Wss {
@@ -412,4 +416,18 @@ fn server_key_update_mid_stream() {
     // Both directions keep working under the new keys.
     let at = w.server_send(vec![TMessage::Text("again".into())]);
     assert_eq!(w.client_read(FRAME_ROOM), [Got { kind: Kind::Text, payload: b"again".to_vec(), stamp: w.stamp_of(at) }]);
+}
+
+/// A client configured with a small `max_fragment_size` (256: 251 B of plaintext per record,
+/// still above the largest control frame): every seal stays one record, so a 1384 B message
+/// (the plaintext room of a 1460 B frame without the limit) goes out in records of at most
+/// 251 B of plaintext and arrives whole. (Before, sheath advertised the frame's room, rustls
+/// split one seal into 6 records past the frame, and the seal panicked.)
+#[test]
+#[cfg_attr(miri, ignore)]
+fn small_max_fragment_size_keeps_each_seal_one_record() {
+    let mut w = Wss::with(connect_with(Some(256)));
+    w.client_send(Kind::Binary, &message(4, 1384));
+    assert!(records(&w.wire.sent.borrow()).iter().all(|r| r.len() <= 5 + 251 + 17));
+    assert_eq!(w.server_read(), [TMessage::Binary(message(4, 1384).into())]);
 }

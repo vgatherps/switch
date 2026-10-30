@@ -227,19 +227,20 @@ pub fn stamp(i: usize) -> u64 {
 
 /// Feed `chunks` as frames stamped `stamp(i)`, draining messages after each push.
 pub fn drive(rx: &mut Rx, chunks: &[&[u8]]) -> Run {
-    let mut frames: Vec<Range<usize>> = Vec::new();
     let mut msgs = Vec::new();
     for (i, c) in chunks.iter().enumerate() {
         let f = VecFrame { data: c.to_vec(), stamp: stamp(i) };
         let p = f.data.as_ptr() as usize;
-        frames.push(p..p + f.data.len());
+        // Raw holds only the frame pushed last, so a direct message is in it (an earlier
+        // frame's freed memory may hold the scratch since)
+        let frame: Range<usize> = p..p + f.data.len();
         rx.push(f);
         loop {
             match rx.recv(&mut ()) {
                 Ok(Some(m)) => {
                     let b = m.bytes();
                     let at = b.as_ptr() as usize;
-                    let direct = !b.is_empty() && frames.iter().any(|r| r.contains(&at));
+                    let direct = !b.is_empty() && frame.contains(&at);
                     if m.kind() == Kind::Text {
                         assert_eq!(m.text().unwrap().as_bytes(), b);
                     } else {

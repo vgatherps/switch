@@ -4,10 +4,12 @@
 //! call those.
 //!
 //! The input's end: the peer's FIN while reading fails the connection (`PeerEof`, or the TLS
-//! truncation) and is the normal end after its close. A reset, seen by the input or by a send
-//! wait, is the socket's death; before the peer's close it is the connection's failure
-//! (`Failed(Dead)`), after it a clean end: reading had stopped there anyway, and what we still
-//! owed the peer (our echo, close_notify) is moot.
+//! truncation) and is the normal end after its close. A reset is the socket's death; a send
+//! wait that sees it only stops sending (the call that saw it fails with `Failed(Dead)`). Once
+//! the death is known and the input ended (by FIN or reset, after the frames received before
+//! it are read), `settle` decides the outcome: before the peer's close it is the connection's
+//! failure (`Failed(Dead)`), after it a clean end: reading had stopped there anyway, and what
+//! we still owed the peer (our echo, close_notify) is moot. A failure stored before stays.
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
@@ -15,7 +17,7 @@ use core::task::Poll;
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::rx::{Message, WsError, WsRx};
-use crate::tx::{End, Failure, Job, Stepped, TxCore, TxError};
+use crate::tx::{End, Failure, Job, TxCore, TxError};
 
 /// How the input ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +69,9 @@ where
         self.rx_in
     }
 
-    /// The next message, or `None` once the close handshake is done and our FIN delivered;
-    /// after a failure, the first failure once the drain is done (or the socket died).
+    /// The next message, or `None` once the close handshake is done and our FIN delivered (or
+    /// the socket died after the peer's close); after a failure, the first failure once the
+    /// drain is done (or the socket died).
     /// With a message in hand, queued output gets one bounded pass (`TxCore::service`) and
     /// the message returns without waiting on it. Without one, input and the next send job
     /// are awaited together; whichever is ready first is handled, both if both are.
@@ -76,11 +79,19 @@ where
         // Parsing stops only where it needs input, so it runs again only once input came.
         let mut parse = true;
         loop {
+            self.settle();
             if parse && self.rx_in == RxIn::Reading && self.rx_step() {
                 self.tx.service().await;
                 return Ok(self.rx.take_message());
             }
-            if matches!(self.tx.end(), End::Delivered | End::Dead) {
+            let over = match self.tx.end() {
+                End::Delivered => true,
+                // the outcome is known once the input ended, or a failure or the peer's close
+                // already decided it
+                End::Dead => self.rx_in == RxIn::Eof || self.tx.failed().is_some() || self.tx.peer_closed(),
+                End::Open | End::Notify | End::Fin => false,
+            };
+            if over {
                 return self.tx.result().map(|()| None);
             }
             parse = self.wait().await;
@@ -107,6 +118,7 @@ where
         while !(self.rx_in == RxIn::Eof && matches!(self.tx.end(), End::Fin | End::Delivered | End::Dead)) {
             self.wait().await;
         }
+        self.settle();
         match (self.tx.end(), self.tx.failed()) {
             (End::Dead, Some(_)) => Err(TxError::Failed(Failure::Dead)),
             (End::Dead, None) | (End::Open | End::Notify | End::Fin | End::Delivered, _) => Ok(()),
@@ -141,8 +153,8 @@ where
     }
 
     /// One input result: a frame is pushed while reading, dropped unread after; the peer's
-    /// FIN while reading fails the connection (PeerEof, or the TLS truncation); a reset is
-    /// the socket's death (see the module docs).
+    /// FIN while reading fails the connection (PeerEof, or the TLS truncation); a reset (the
+    /// input reports one after a FIN too) is the socket's death, whose outcome is `settle`d.
     fn take_input(&mut self, input: Result<R::Frame, InputEnd>) {
         match input {
             Ok(frame) => match self.rx_in {
@@ -157,11 +169,20 @@ where
                     },
                     // receiving was over: the peer's close came first, or a failure did
                     (InputEnd::Fin, RxIn::Stopped | RxIn::Eof) => {}
-                    (InputEnd::Reset, _) => self.tx.die(),
+                    (InputEnd::Reset, _) => self.tx.stop(),
                 }
                 self.rx.discard();
                 self.rx_in = RxIn::Eof;
+                self.settle();
             }
+        }
+    }
+
+    /// Once the socket's death is known and the input ended (every frame before it read): the
+    /// death is the connection's failure unless the peer's close came first or a failure did.
+    fn settle(&mut self) {
+        if self.tx.end() == End::Dead && self.rx_in == RxIn::Eof {
+            self.tx.reset();
         }
     }
 
@@ -173,18 +194,12 @@ where
         let reading = self.rx_in != RxIn::Eof;
         let job = self.tx.next_job() != Job::Idle;
         assert!(reading || job, "input ended with no job left, but the connection is not over");
-        let (input, stepped) = either(reading.then(|| self.input.recv()), job.then(|| self.tx.try_step())).await;
+        let (input, _) = either(reading.then(|| self.input.recv()), job.then(|| self.tx.try_step())).await;
         let took = input.is_some();
         if let Some(input) = input {
             self.take_input(input);
         }
-        // A death the send side saw while input came in the same poll waits for the input,
-        // which reports the reset itself after the frames before it: the peer's close among
-        // them (Close, then a reset) makes it a clean end. Each such pass takes input, so
-        // this ends.
-        if stepped == Some(Stepped::Dead) && !took {
-            self.tx.die();
-        }
+        self.settle();
         took
     }
 }

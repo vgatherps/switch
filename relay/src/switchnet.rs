@@ -334,6 +334,7 @@ impl Input for TcpRx {
     type Frame = TcpFrame;
 
     async fn recv(&mut self) -> Result<TcpFrame, InputEnd> {
+        // switchnet reports a reset after the peer's FIN as the reset, not `Finished`
         TcpRx::recv(self).await.map_err(|e| match e {
             RecvError::Finished => InputEnd::Fin,
             _ => InputEnd::Reset,

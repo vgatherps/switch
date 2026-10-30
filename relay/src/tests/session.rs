@@ -289,8 +289,10 @@ fn recv_is_woken_by_delivery_alone() {
     assert_eq!(task.got(), [Ok(None)]);
 }
 
-/// A reset reported by the input alone, or by the send side alone (while it waits for room),
-/// wakes recv: `Failed(Dead)`, nothing more sent.
+/// A reset reported by the input alone wakes recv: `Failed(Dead)`, nothing more sent. Seen by
+/// the send side alone (while it waits for room), it wakes recv too, which stops sending and
+/// drops what was owed but keeps reading: the input decides the outcome once it reports the
+/// reset, after any frame received before it.
 #[test]
 fn recv_is_woken_by_a_reset_alone() {
     for on_input in [true, false] {
@@ -303,6 +305,11 @@ fn recv_is_woken_by_a_reset_alone() {
             end(&input, InputEnd::Reset);
         } else {
             set(&log, |l| l.dead = true);
+            assert_eq!(task.turn(), 1);
+            assert!(task.got().is_empty(), "decided before the input ended");
+            assert_eq!(log.borrow().live_frames(), 0);
+            task.assert_parked();
+            end(&input, InputEnd::Reset);
         }
         assert_eq!(task.turn(), 1, "on input {on_input}");
         assert_eq!(task.got(), [Err(TxError::Failed(Failure::Dead))], "on input {on_input}");
@@ -359,6 +366,28 @@ fn a_reset_after_the_peer_close_with_something_owed_is_a_clean_end() {
     }
 }
 
+/// The peer sends Close (1008, a reason) and resets before our next recv, and the app calls
+/// `send` or `close` first: that call finds the socket dead and fails with `Failed(Dead)`, but
+/// the connection's outcome waits for the input. recv still reads the Close queued before the
+/// reset, so it ends clean (`None`) with the peer's code and reason. (Before, the send side's
+/// death decided `Failed(Dead)` at once and the Close was never read.)
+#[test]
+fn close_then_reset_while_the_app_sends_or_closes_keeps_the_peer_close() {
+    for closing in [false, true] {
+        let (mut s, log, input) = raw();
+        let mut close = 1008u16.to_be_bytes().to_vec();
+        close.extend_from_slice(b"policy");
+        feed(&input, &client_frame(CLOSE, &close), false);
+        end(&input, InputEnd::Reset);
+        log.borrow_mut().dead = true;
+        let own = if closing { ready(s.close(1000, "")) } else { ready(s.send(Kind::Text, b"ping")) };
+        assert_eq!(own, Err(TxError::Failed(Failure::Dead)), "closing {closing}");
+        assert_eq!(recv_n(&mut s, 1), Some(Ok(None)), "closing {closing}");
+        assert_eq!(s.rx.peer_close(), Some(&close[..]), "closing {closing}");
+        assert_eq!((sent(&log).len(), input.borrow().live_frames()), (0, 0));
+    }
+}
+
 /// The peer sends its close and resets at once (Close, then SO_LINGER 0) while recv waits on
 /// input and on a send job (a dropped large send's rest): in one poll the send side sees the
 /// death and the input has the frames. The frames are parsed first (a message before the
@@ -382,6 +411,52 @@ fn close_then_reset_in_one_poll_with_a_send_pending_is_a_clean_end() {
         assert_eq!(recv_n(&mut s, 4), Some(Ok(None)), "message first {message_first}");
         assert_eq!((sent(&log).len(), log.borrow().live_frames(), input.borrow().live_frames()), (1, 0, 0));
     }
+}
+
+/// The peer sends FIN and then resets, with no Close (switchnet's input reports the reset
+/// after the data, not the FIN): data first, then `Failed(Dead)` for recv, and for linger;
+/// also when the app's send saw the death first. The FIN alone is `PeerEof` for recv and a
+/// clean end for linger.
+#[test]
+fn the_peer_fin_then_reset_is_dead_and_a_fin_alone_is_not() {
+    for (reset, lingering, sending) in [(true, false, false), (true, false, true), (true, true, false), (false, false, false), (false, true, false)] {
+        let case = format!("reset {reset} lingering {lingering} sending {sending}");
+        let (mut s, log, input) = raw();
+        feed(&input, &client_frame(TEXT, b"last"), false);
+        end(&input, if reset { InputEnd::Reset } else { InputEnd::Fin });
+        if reset {
+            log.borrow_mut().dead = true;
+        }
+        if sending {
+            assert_eq!(ready(s.send(Kind::Text, b"ping")), Err(TxError::Failed(Failure::Dead)), "{case}");
+        }
+        let got = if lingering {
+            poll_n(s.linger(), 2)
+        } else {
+            assert_eq!(recv_n(&mut s, 1), Some(msg(Kind::Text, b"last")), "{case}");
+            recv_n(&mut s, 2).map(|r| r.map(drop))
+        };
+        let want = match (reset, lingering) {
+            (true, _) => Err(TxError::Failed(Failure::Dead)),
+            (false, true) => Ok(()),
+            (false, false) => Err(TxError::Failed(Failure::PeerEof)),
+        };
+        assert_eq!(got, Some(want), "{case}");
+    }
+}
+
+/// `linger` reads the peer's FIN first, then its close_notify finds the socket dead: the
+/// death came before any peer Close, so `Failed(Dead)`. (Before, Ok.)
+#[test]
+fn linger_seeing_the_peer_fin_then_a_death_is_dead() {
+    let (mut s, log, input) = shaped::<true>();
+    log.borrow_mut().room = Some(0);
+    end(&input, InputEnd::Fin);
+    assert_eq!(poll_n(s.linger(), 2), None);
+    assert_eq!(log.borrow().waited.last().copied(), Some("room"));
+    log.borrow_mut().dead = true;
+    assert_eq!(poll_n(s.linger(), 2), Some(Err(TxError::Failed(Failure::Dead))));
+    assert_eq!(sent(&log).len(), 0);
 }
 
 /// Our close sent, then `linger` with the peer's close not in: our FIN goes out and is

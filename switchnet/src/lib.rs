@@ -592,9 +592,9 @@ pub struct TcpRx(Half);
 impl TcpRx {
     /// `Future<Output = Result<TcpFrame, RecvError>>`: the next in-order frame.
     /// In-order data already received is delivered first, also after a reset.
-    /// Then: after an accepted FIN, conduit's `RecvError::Finished`, even if a
-    /// reset followed it; after a reset without one, or in a state without
-    /// receive, `RecvError::InvalidState`.
+    /// Then: after the peer's reset (with or without an accepted FIN before it),
+    /// or in a state without receive, `RecvError::InvalidState`; after an
+    /// accepted FIN and no reset, conduit's `RecvError::Finished`.
     pub fn recv(&mut self) -> Recv<'_> {
         Recv { rx: self }
     }
@@ -616,9 +616,13 @@ impl Future for Recv<'_> {
             if !tcp_recv_ready(stack.tcp(handle)) {
                 return None;
             }
-            match stack.tcp_mut(handle).recv() {
+            let socket = stack.tcp_mut(handle);
+            match socket.recv() {
                 Ok(None) => None,
                 Ok(Some(frame)) => Some(Ok(TcpFrame(frame))),
+                // a FIN followed by the peer's reset ends in the reset: every caller sees the
+                // connection's death, not a clean end of the stream
+                Err(RecvError::Finished) if socket.reset_by_peer() => Some(Err(RecvError::InvalidState)),
                 Err(error) => Some(Err(error)),
             }
         })
