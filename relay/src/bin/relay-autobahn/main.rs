@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use relay::Kind;
-use relay::switchnet::{Error, Ws, accept_ws, connect_ws};
+use relay::switchnet::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
 use switch::{Runtime, Spawner};
 use switchnet::{
     Closed, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, OpenError, RoundError, boxed, round,
@@ -375,13 +375,13 @@ async fn echo(ws: &mut Ws, buf: &mut Vec<u8>) -> &'static str {
                 m.kind()
             }
             Ok(None) => return "close handshake",
-            Err(Error::Protocol(_)) => {
+            Err(Error::Failed(WsFailure::Protocol(_))) => {
                 return match ws.linger().await {
                     Ok(()) => "protocol error",
                     Err(_) => "protocol error, then receive failed",
                 };
             }
-            Err(Error::Recv(_)) => return "receive failed",
+            Err(Error::Failed(WsFailure::PeerEof)) => return "peer ended the stream",
             Err(Error::Failed(_)) => return "connection failed",
             Err(e) => unreachable!("plain ws:// recv: {e}"),
         };

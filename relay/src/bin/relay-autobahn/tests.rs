@@ -409,7 +409,7 @@ fn client_sequence_failures_are_errors() {
             let _ = ws.get_mut().shutdown(Shutdown::Both);
         }
     });
-    assert!(matches!(no_reply, (2, Why::NoCloseReply(Error::Recv(_)))), "{no_reply:?}");
+    assert!(matches!(no_reply, (2, Why::NoCloseReply(Error::Failed(WsFailure::PeerEof)))), "{no_reply:?}");
     let stalled = fails("stalled", 1, 1, |_, mut ws| {
         let _ = read(&mut ws);
     });

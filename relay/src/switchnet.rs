@@ -15,8 +15,9 @@ use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
-use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx};
-use crate::tx::{End, Failure as TxFailure, TxCore, TxError, max_control_frame};
+use crate::rx::{Config, Kind, Message, Role, WsError, WsRx};
+pub use crate::tx::Failure;
+use crate::tx::{End, TxCore, TxError, max_control_frame};
 use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
@@ -38,16 +39,14 @@ impl PlainTx for SwitchTx {
 
 #[derive(Debug)]
 pub enum Error {
-    /// TCP receive failed, or the stream ended (FIN) before the WebSocket close.
+    /// TCP receive failed during setup, or (from `linger`) while draining the peer's bytes.
     Recv(RecvError),
-    /// The TLS handshake or a received record failed.
+    /// The TLS handshake failed.
     Tls(sheath::Error),
     /// Sending the upgrade failed below WebSocket (TLS or TCP).
     Send(TlsTxError<SendError>),
     /// The TLS handshake could not start or ended in a state other than application traffic.
     Handshake(String),
-    /// The peer broke the WebSocket protocol.
-    Protocol(ProtocolError),
     /// The server refused or botched the WebSocket upgrade.
     Upgrade(UpgradeError),
     /// A send or close after our close (or after `linger`).
@@ -55,7 +54,7 @@ pub enum Error {
     /// The connection could not be set up (a handle from another Net, or a frame room below
     /// the largest control frame); nothing was sent.
     Config(SetupError),
-    /// The connection failed.
+    /// The connection failed; every later `send` and `close` reports this first failure.
     Failed(Failure),
     /// A Text message that is not UTF-8; nothing was sent.
     InvalidText,
@@ -69,29 +68,10 @@ impl From<TxError> for Error {
     fn from(e: TxError) -> Self {
         match e {
             TxError::Closed => Self::Closed,
-            TxError::Failed(f) => f.into(),
+            TxError::Failed(f) => Self::Failed(f),
             TxError::TooBig => Self::TooBig,
             TxError::InvalidText => Self::InvalidText,
             TxError::InvalidClose => Self::InvalidClose,
-        }
-    }
-}
-
-/// Why a connection failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Failure {
-    /// The socket closed or reset.
-    Dead,
-}
-
-/// The connection's first failure, as every later call reports it.
-impl From<TxFailure> for Error {
-    fn from(f: TxFailure) -> Self {
-        match f {
-            TxFailure::Protocol(e) => Self::Protocol(e),
-            TxFailure::PeerEof => Self::Recv(RecvError::Finished),
-            TxFailure::Tls(e) => Self::Tls(e),
-            TxFailure::Dead => Self::Failed(Failure::Dead),
         }
     }
 }
@@ -103,7 +83,6 @@ impl fmt::Display for Error {
             Self::Tls(e) => write!(f, "{e}"),
             Self::Send(e) => write!(f, "send: {e}"),
             Self::Handshake(e) => write!(f, "tls handshake: {e}"),
-            Self::Protocol(e) => write!(f, "websocket protocol: {e:?}"),
             Self::Upgrade(e) => write!(f, "websocket upgrade: {e}"),
             Self::Closed => f.write_str("websocket closed for sending"),
             Self::Config(e) => write!(f, "setup: {e}"),
@@ -252,8 +231,8 @@ impl Wss {
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
     /// Dropped before the message is accepted (sealed whole, or copied in if it spans
     /// frames), nothing of it is sent; once accepted it goes out whole and alone, the next
-    /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, the
-    /// connection's first failure, `InvalidText`, `TooBig`.
+    /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, `Failed`,
+    /// `InvalidText`, `TooBig`.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
         self.0.send(kind, payload).await
     }
@@ -291,8 +270,8 @@ impl Ws {
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
     /// Dropped before the message is accepted (sealed whole, or copied in if it spans
     /// frames), nothing of it is sent; once accepted it goes out whole and alone, the next
-    /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, the
-    /// connection's first failure, `InvalidText`, `TooBig`.
+    /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, `Failed`,
+    /// `InvalidText`, `TooBig`.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
         self.0.send(kind, payload).await
     }
@@ -331,7 +310,7 @@ impl<R, T> Session<R, T>
 where
     R: PlainRx<Frame = TcpFrame, Tx = T>,
     T: PlainTx,
-    TxFailure: From<R::Error>,
+    Failure: From<R::Error>,
 {
     fn new(rx: R, tx: T, tcp: TcpRx, role: Role) -> Self {
         let config = Config::new(role);
@@ -355,7 +334,7 @@ where
                     return self.end().await;
                 }
                 Err(WsError::Protocol(e)) => {
-                    self.tx.fail(TxFailure::Protocol(e));
+                    self.tx.fail(Failure::Protocol(e));
                     return self.end().await;
                 }
                 Err(WsError::Lower(e)) => {
@@ -379,7 +358,7 @@ where
             }
             match self.tcp.recv().await {
                 Ok(frame) => self.rx.push(frame),
-                Err(RecvError::Finished) => self.tx.fail(TxFailure::PeerEof),
+                Err(RecvError::Finished) => self.tx.fail(Failure::PeerEof),
                 Err(_) => self.tx.die(),
             }
         }
@@ -402,14 +381,14 @@ where
     }
 }
 
-impl From<Infallible> for TxFailure {
+impl From<Infallible> for Failure {
     fn from(e: Infallible) -> Self {
         match e {}
     }
 }
 
-impl From<sheath::Error> for TxFailure {
+impl From<sheath::Error> for Failure {
     fn from(e: sheath::Error) -> Self {
-        TxFailure::Tls(e)
+        Failure::Tls(e)
     }
 }

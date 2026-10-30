@@ -829,7 +829,7 @@ fn wss_receive_error_sends_the_alert_and_fin() {
         |handle, stream| async move {
             let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
             match wss.recv().await {
-                Err(WssError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
+                Err(WssError::Failed(relay::switchnet::Failure::Tls(sheath::Error::Tls(rustls::Error::DecryptError)))) => {}
                 Err(e) => panic!("unexpected error {e}"),
                 Ok(_) => panic!("a message from a corrupted record"),
             }
