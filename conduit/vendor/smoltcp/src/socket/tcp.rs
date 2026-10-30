@@ -482,6 +482,15 @@ pub(crate) struct PendingRxCommit {
     payload_len: usize,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Open connections `dispatch` reset because their source address was no longer ours. A
+    /// CLOSED socket still holding a tuple (aborted before its flow was admitted) is not counted:
+    /// its silent reset only drops the RST it owed for a SYN never sent.
+    pub(crate) static SOURCE_ADDRESS_RESETS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 /// A Transmission Control Protocol socket.
 ///
 /// A TCP socket may passively listen for connections or actively connect to another endpoint.
@@ -1111,6 +1120,36 @@ impl<'a> Socket<'a> {
     /// tuple: the interface's own address clears `local_owned`, an owned one sets it, and any
     /// other resets the socket without an RST (the address is not ours to send from). Returns
     /// whether the tuple stands.
+    /// Cross-field invariants every socket holds between calls.
+    #[cfg(test)]
+    pub(crate) fn check_invariants(&self) {
+        match self.state {
+            State::Closed => {}
+            State::Listen => assert!(self.tuple.is_none(), "LISTEN socket has a tuple"),
+            state => assert!(self.tuple.is_some(), "{state} socket has no tuple"),
+        }
+        if self.state == State::TimeWait || (self.orphaned && self.state == State::FinWait2) {
+            assert!(
+                matches!(self.timer, Timer::Close { .. }),
+                "{} socket (orphaned: {}) has timer {:?}",
+                self.state,
+                self.orphaned,
+                self.timer
+            );
+        }
+        if !matches!(self.state, State::Closed | State::Listen) {
+            assert!(
+                self.local_seq_no <= self.remote_last_seq
+                    && self.remote_last_seq <= self.remote_max_seq,
+                "{} socket: unacked {}, last sent {}, max sent {}",
+                self.state,
+                self.local_seq_no,
+                self.remote_last_seq,
+                self.remote_max_seq
+            );
+        }
+    }
+
     pub(crate) fn admit_local(&mut self, cx: &Context) -> bool {
         let local = self.tuple.expect("admit_local needs a tuple").local.addr;
         if cx.has_interface_addr(local) {
@@ -3108,6 +3147,10 @@ impl<'a> Socket<'a> {
         // an RST packet with the now-invalid source IP. An owned address never goes away.
         if !cx.has_interface_addr(tuple.local.addr) && !self.local_owned {
             net_debug!("source IP address no longer available, closing socket");
+            #[cfg(test)]
+            if self.state != State::Closed {
+                SOURCE_ADDRESS_RESETS.with(|resets| resets.set(resets.get() + 1));
+            }
             self.reset();
             return Ok(());
         }

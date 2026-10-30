@@ -579,3 +579,7 @@ impl Drop for SlotGuard {
 #[cfg(test)]
 #[path = "executor/ownership_tests.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+#[path = "executor/state_walk_tests.rs"]
+mod state_walk_tests;
