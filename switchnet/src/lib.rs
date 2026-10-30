@@ -145,8 +145,8 @@ impl Inner {
     }
 
     fn park(&mut self, index: u32, interest: Interest, cx: &Context<'_>) {
-        // A stale handle is harmless: switch never frees task blocks, and a
-        // wake of a finished task does nothing.
+        // A stale handle (a leaked future's) is memory-safe: switch never frees task
+        // blocks. Its wake polls whatever task then holds the slot: a spurious poll.
         let waker = StoredWaker::new(cx);
         let side = interest.side();
         let entry = &mut self.entries[index as usize];
@@ -427,8 +427,11 @@ impl Future for TxFrameWait<'_> {
         if let Some(frame) = inner.stack.tx_frame() {
             return Poll::Ready(frame);
         }
-        // Stale handle harmless as in `Inner::park`; a dropped future's
-        // handle stays until the next free frame wakes it.
+        // Stale handles are memory-safe as in `Inner::park`. A dropped future's handle
+        // stays until the next free frame wakes it, which spuriously polls its task, or
+        // the task that reused the slot once its task finished. Entries are unique per task
+        // slot (a reused slot has the same header), so the list holds at most one entry per
+        // switch task slot however many waits are dropped.
         let waker = StoredWaker::new(cx);
         if !inner.frame_waiters.contains(&waker) {
             inner.frame_waiters.push(waker);
