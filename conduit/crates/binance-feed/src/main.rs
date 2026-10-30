@@ -22,6 +22,8 @@ const READY_LIMIT: Duration = Duration::from_secs(60);
 const FIRST_LOCAL_PORT: u16 = 49152;
 const CONNECT_LIMIT: Duration = Duration::from_secs(20);
 const CLOSE_LIMIT: Duration = Duration::from_secs(10);
+/// The longest idle sleep of a round that moved nothing: the tester shares the CPU.
+const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const DEFAULT_HOST: &str = "stream.binance.com";
 const DEFAULT_PORT: u16 = 9443;
 const DEFAULT_PATH: &str = "/ws/btcusdt@bookTicker";
@@ -230,7 +232,7 @@ fn feed(
         std::thread::sleep(Duration::from_millis(1));
     }
     let target = target.clone();
-    let count = run(net, &clock, stop, move |handle, spawner, mut stop| async move {
+    let count = run(net, &clock, Some(IDLE_SLEEP), stop, move |handle, spawner, mut stop| async move {
         let socket = binance_feed::socket(None);
         let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT);
         let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {

@@ -1,5 +1,5 @@
-//! Running a Net's tasks: the loop owner's round (turn, poll, idle sleep), any future as a
-//! switch task, and the races tasks bound their waits with.
+//! Running a Net's tasks: the loop owner's round (turn, poll), any future as a switch task,
+//! and the races tasks bound their waits with.
 
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
@@ -10,32 +10,19 @@ use switch::{Runtime, RuntimeError, Spawner};
 
 use crate::{Instant, Net, StackError};
 
-/// Longest idle sleep of `round`: a timer the Stack does not report (a Runtime sleep) is late by
-/// at most this.
-const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
-
 #[derive(Debug)]
 pub enum RoundError {
     Stack(StackError),
     Runtime(RuntimeError),
 }
 
-/// One `net.turn(now)` and one `rt.poll(tick)`. When neither moved anything (nothing received,
-/// processed, sent, staged or pending; no task polled), sleeps until the Stack's next timer, at
-/// most 1 ms.
-pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result<(), RoundError> {
+/// One `net.turn(now)` and one `rt.poll(tick)`; never sleeps. Returns whether anything moved:
+/// something received, processed, sent, staged or still pending, or a task polled. A loop that
+/// may sleep when nothing moved does so itself, until `net.poll_at()` at the latest.
+pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result<bool, RoundError> {
     let turn = net.turn(now).map_err(RoundError::Stack)?;
     let polled = rt.poll(tick).map_err(RoundError::Runtime)?;
-    if turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0 {
-        return Ok(());
-    }
-    let sleep = match net.poll_at() {
-        None => MAX_IDLE_SLEEP,
-        Some(at) if at <= now => return Ok(()),
-        Some(at) => Duration::from_micros((at - now).total_micros()).min(MAX_IDLE_SLEEP),
-    };
-    std::thread::sleep(sleep);
-    Ok(())
+    Ok(turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0)
 }
 
 /// Any future as a switch task.

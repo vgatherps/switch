@@ -41,6 +41,8 @@ const FIRST_LOCAL_PORT: u16 = 49152;
 const CLIENT_RUN: &str = "autobahn/run/client";
 /// Longest a connection may live, from its acceptance (server) or connect (client).
 const DEADLINE: Duration = Duration::from_secs(120);
+/// The longest sleep of a loop iteration that moved nothing.
+const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// Counted from the start of the client role. zhida-tester.sh's own 60 s wait for
 /// fuzzingserver starts once it saw the netdev up, which can be later; this limit can then
 /// expire first by that gap, and expiry only fails the run.
@@ -253,8 +255,16 @@ fn drive(
         let since = elapsed();
         let now = Instant::from_micros(i64::try_from(since.as_micros()).expect("elapsed fits i64 microseconds"));
         let tick = u64::try_from(since.as_millis()).expect("elapsed fits u64 ms");
-        if let Err(e) = round(net, &mut rt, now, tick) {
-            break Err(Failure::Round(e));
+        match round(net, &mut rt, now, tick) {
+            Ok(true) => {}
+            // Nothing moved: sleep until the Stack's next timer, at most 1 ms (wstest shares the CPU).
+            Ok(false) => match net.poll_at() {
+                Some(at) if at <= now => {}
+                at => std::thread::sleep(at.map_or(IDLE_SLEEP, |at| {
+                    Duration::from_micros((at - now).total_micros()).min(IDLE_SLEEP)
+                })),
+            },
+            Err(e) => break Err(Failure::Round(e)),
         }
         if outcome.borrow().as_ref().is_some_and(Result::is_err) || stop() {
             break Ok(());

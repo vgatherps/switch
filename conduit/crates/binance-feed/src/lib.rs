@@ -178,11 +178,13 @@ impl std::error::Error for FeedError {}
 
 /// Runs `client(handle, spawner, stop)` as a switch task on a new Runtime, turning `net` until it
 /// finishes, and returns its output. `stop` finishes once `should_stop()`, asked each round,
-/// first returns true. The Runtime is shut down before this returns, dropping the task if a
-/// turn failed.
+/// first returns true. A round that moved nothing sleeps until the Stack's next timer, at most
+/// `idle_sleep`; `None` busy-polls. The Runtime is shut down before this returns, dropping the
+/// task if a turn failed.
 pub fn run<T: 'static, F: Future<Output = T> + 'static>(
     net: &mut Net,
     clock: &Clock,
+    idle_sleep: Option<Duration>,
     mut should_stop: impl FnMut() -> bool,
     client: impl FnOnce(NetHandle, Spawner, oneshot::Receiver<()>) -> F,
 ) -> Result<T, FeedError> {
@@ -202,11 +204,20 @@ pub fn run<T: 'static, F: Future<Output = T> + 'static>(
         if let Some(out) = done.borrow_mut().take() {
             break Ok(out);
         }
-        if let Err(error) = switchnet::round(net, &mut rt, clock.now(), clock.ms()) {
-            break Err(match error {
-                RoundError::Stack(error) => FeedError::Stack(error),
-                RoundError::Runtime(error) => FeedError::Runtime(error),
-            });
+        let now = clock.now();
+        match switchnet::round(net, &mut rt, now, clock.ms()) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(max) = idle_sleep {
+                    sleep_until_timer(net, now, max);
+                }
+            }
+            Err(error) => {
+                break Err(match error {
+                    RoundError::Stack(error) => FeedError::Stack(error),
+                    RoundError::Runtime(error) => FeedError::Runtime(error),
+                });
+            }
         }
         if stop_tx.is_some() && should_stop() {
             let _ = stop_tx.take().expect("checked above").send(());
@@ -214,6 +225,16 @@ pub fn run<T: 'static, F: Future<Output = T> + 'static>(
     };
     rt.shutdown();
     result
+}
+
+/// Sleeps until `net`'s next Stack timer after `now`, at most `max`; not at all if it is due.
+fn sleep_until_timer(net: &mut Net, now: Instant, max: Duration) {
+    let sleep = match net.poll_at() {
+        None => max,
+        Some(at) if at <= now => return,
+        Some(at) => Duration::from_micros((at - now).total_micros()).min(max),
+    };
+    std::thread::sleep(sleep);
 }
 
 /// `work`, or `Timeout { step, limit }` once `limit` passed; dropping `work` drops what it holds.
