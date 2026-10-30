@@ -2515,3 +2515,36 @@ fn foreign_context_connect_gets_no_flow_for_an_inbound_segment() {
     assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
     assert_eq!(sockets.get(handle).local_endpoint(), None);
 }
+
+/// A SYN+FIN that a TIME-WAIT tuple would accept as a new SYN stays with the TIME-WAIT socket,
+/// with or without a listener on the port: only a plain SYN retires TIME-WAIT for a listener. The
+/// TIME-WAIT socket ACKs it and keeps its state; the listener sees nothing.
+#[test]
+fn time_wait_syn_fin_is_acked_with_or_without_listener() {
+    for with_listener in [true, false] {
+        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (exact, local_seq) =
+            enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, None);
+        let listener = with_listener.then(|| {
+            let mut listener = socket();
+            listener.listen(LOCAL_PORT).unwrap();
+            sockets.add(listener)
+        });
+        receive(
+            &mut iface,
+            &mut sockets,
+            &mut device,
+            Instant::from_millis(1),
+            segment(TcpControl::SynFin, REMOTE_SEQ + 3, None),
+        );
+        let bytes = take_reply(&mut device);
+        let ack = reply(&bytes);
+        assert_control(&ack, LOCAL_PORT, TcpControl::None, Some(REMOTE_SEQ + 2));
+        assert_eq!(ack.seq_number, local_seq);
+        assert_eq!(sockets.get(exact).state(), tcp::State::TimeWait);
+        if let Some(listener) = listener {
+            assert_eq!(sockets.get(listener).state(), tcp::State::Listen);
+        }
+        sockets.check_flow_index();
+    }
+}
