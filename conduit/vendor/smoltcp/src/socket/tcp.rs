@@ -1238,7 +1238,7 @@ impl<'a> Socket<'a> {
     }
 
     /// Validate a connect and resolve its local endpoint without changing the socket.
-    pub fn connect_local_endpoint(
+    pub(crate) fn connect_local_endpoint(
         &self,
         cx: &Context,
         remote_endpoint: IpEndpoint,

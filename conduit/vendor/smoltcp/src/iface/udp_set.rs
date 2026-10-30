@@ -2,7 +2,7 @@ use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use core::ops::Range;
 
 use super::Interface;
-use super::{bind_word, slot_map, BindKey, SlotMap};
+use super::{bind_word, slot_map, SlotMap};
 use crate::phy::{HeldFrames, RxBuf, RxShared, TxSource};
 use crate::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv4AddressExt};
 

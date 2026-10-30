@@ -1807,9 +1807,9 @@ fn sent_tcp(fixture: &Fixture) -> Vec<(Ipv4Address, bool, bool)> {
         .collect()
 }
 
-/// Reconnecting an aborted socket with the same tuple on an owned (not interface) address before
-/// the Stack runs keeps the connection: the reconnect is admitted again even though its flow key
-/// is unchanged, so the next send emits its SYN from the owned address instead of resetting it.
+/// Abort, then reconnect on the same tuple from an owned (not interface) address before the
+/// Stack runs: the reconnect replaces the RST the abort owed, so the next send emits only the
+/// new SYN, from the owned address.
 #[zhida_test_support::pinned_test]
 fn same_tuple_reconnect_on_owned_address_sends_syn() {
     use smoltcp::socket::tcp::State;

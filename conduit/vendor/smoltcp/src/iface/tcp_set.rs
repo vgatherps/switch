@@ -549,9 +549,11 @@ impl<'a> TcpSet<'a> {
         !self.reapable.is_empty()
     }
 
-    /// Drain reapable orphan handles, retaining the list's allocation.
+    /// Drain reapable orphan handles, in no particular order, retaining the list's allocation.
+    /// Each handle leaves the list before `f` sees it, so a panic in `f` leaves the handles
+    /// not yet reported queued.
     pub fn take_reapable(&mut self, mut f: impl FnMut(SocketHandle)) {
-        for handle in self.reapable.drain(..) {
+        while let Some(handle) = self.reapable.pop() {
             self.flow_slots[handle.index].reap_at = REPORTED;
             f(handle);
         }
@@ -1098,6 +1100,7 @@ impl TcpSet<'_> {
     }
 
     /// The exact flow for the segment, else for a SYN-like segment the listener.
+    #[cfg(test)]
     pub(crate) fn tcp_lookup(
         &mut self,
         dst: IpEndpoint,
@@ -1270,6 +1273,36 @@ mod tests {
         set.orphan(handles[0], Instant::ZERO);
         assert!(!set.has_reapable());
         set.remove(handles[0]);
+        set.check_list_positions();
+    }
+
+    /// A panic in the `take_reapable` callback leaves the orphans not yet reported queued: the
+    /// next call reports them, and each can still be removed.
+    #[test]
+    fn panic_in_take_reapable_keeps_the_rest_queued() {
+        let mut set = TcpSet::new(2);
+        let handles: Vec<_> = (0..2)
+            .map(|port| {
+                let handle = set.add(socket());
+                set.listen(handle, 80 + port).unwrap();
+                set.orphan(handle, Instant::ZERO);
+                handle
+            })
+            .collect();
+        let mut panicked = None;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set.take_reapable(|handle| {
+                panicked = Some(handle);
+                panic!("callback panics");
+            })
+        }));
+        assert!(caught.is_err());
+        set.check_list_positions();
+        let panicked = panicked.unwrap();
+        let rest = handles.iter().copied().find(|&handle| handle != panicked).unwrap();
+        assert_reapable(&mut set, &[rest]);
+        set.remove(panicked);
+        set.remove(rest);
         set.check_list_positions();
     }
 

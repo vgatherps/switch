@@ -1076,9 +1076,7 @@ mod test {
                 Answer::NotFound
             );
             assert_eq!(cache.storage.len(), 3);
-            assert_eq!(cache.storage.len(), cache.storage.len());
             cache.flush();
-            assert_eq!(cache.storage.len(), 0);
             assert_eq!(cache.storage.len(), 0);
             assert_eq!(cache.next_expiry, None);
             for address in &colliding {

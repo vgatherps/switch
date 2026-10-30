@@ -1169,9 +1169,8 @@ fn queued_socket_with_refreshed_idle_deadline_is_not_dispatched() {
     };
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(sockets.dispatches, vec![0]);
-    let socket = sockets.get_mut(handle);
-    socket.abort();
-    socket.listen(1234).unwrap();
+    sockets.abort(handle);
+    sockets.listen(handle, 1234).unwrap();
     sockets.dispatches.clear();
     device.remaining = 1;
     iface.poll_egress(START, &mut device, &mut sockets);
@@ -1669,7 +1668,7 @@ fn parked_socket_allows_lone_socket_to_burst() {
         START,
     );
     let (active, seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
-    sockets.connect(parked, 
+    sockets.connect(parked,
             iface.context(),
             (Ipv4Address::new(192, 168, 1, 3), 65000),
             (LOCAL, 1234),

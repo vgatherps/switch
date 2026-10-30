@@ -216,7 +216,7 @@ impl Peer {
     }
 
     fn connect_with_syn(&mut self, millis: i64, configure_syn: impl FnOnce(&mut TcpRepr<'static>)) {
-        self.sockets.connect(self.handle, 
+        self.sockets.connect(self.handle,
                 self.iface.context(),
                 (self.remote, self.remote_port),
                 (self.local, self.local_port),

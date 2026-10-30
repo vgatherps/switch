@@ -1052,14 +1052,6 @@ impl InterfaceInner {
         self.owned_ipv4.contains(addr)
     }
 
-    /// `owns_ipv4` for an IP address.
-    #[inline]
-    pub(crate) fn owns(&self, addr: IpAddress) -> bool {
-        match addr {
-            IpAddress::Ipv4(addr) => self.owns_ipv4(addr),
-        }
-    }
-
     #[cfg(feature = "medium-ip")]
     fn process_ip<'frame>(
         &mut self,

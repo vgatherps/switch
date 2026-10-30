@@ -620,7 +620,7 @@ fn alternating_established_tuples_use_their_own_slots() {
 fn egress_after_get_mut_change_without_ingress() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let handle = sockets.add(socket());
-    sockets.connect(handle, 
+    sockets.connect(handle,
             iface.context(),
             (REMOTE_ADDR, REMOTE_PORT),
             (LOCAL_ADDR, LOCAL_PORT),
@@ -669,7 +669,7 @@ fn get_mut_connect_receives_synack_next_poll() {
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());
 
-    sockets.connect(handle, 
+    sockets.connect(handle,
             iface.context(),
             (REMOTE_ADDR, REMOTE_PORT),
             (LOCAL_ADDR, LOCAL_PORT),
@@ -1537,7 +1537,7 @@ fn close_listener_and_relisten_same_slot() {
 fn close_synsent_and_reconnect_same_slot() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let handle = sockets.add(socket());
-    sockets.connect(handle, 
+    sockets.connect(handle,
             iface.context(),
             (REMOTE_ADDR, REMOTE_PORT),
             (LOCAL_ADDR, LOCAL_PORT),
@@ -1568,7 +1568,7 @@ fn close_synsent_and_reconnect_same_slot() {
     );
     assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
 
-    sockets.connect(handle, 
+    sockets.connect(handle,
             iface.context(),
             (REMOTE_ADDR, REMOTE_PORT + 1),
             (LOCAL_ADDR, LOCAL_PORT + 1),
@@ -1750,7 +1750,7 @@ fn flow_index_matches_linear_scan_under_churn() {
         iface.poll(now, &mut device, &mut sockets);
         handles[index] = sockets.add(socket());
         let first = handles[index];
-        sockets.connect(first, 
+        sockets.connect(first,
                 iface.context(),
                 (REMOTE_ADDR, remote_port),
                 (LOCAL_ADDR, local_port),
