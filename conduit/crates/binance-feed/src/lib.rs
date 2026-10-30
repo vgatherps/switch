@@ -20,6 +20,13 @@ use switchnet::{
 };
 
 pub const INGRESS_BUDGET: usize = 32;
+/// The feed's defaults, shared by binance-feed and `zhida-nic feed`. The host speaks TLS 1.3;
+/// data-stream.binance.vision speaks TLS 1.2 only, which sheath does not.
+pub const DEFAULT_HOST: &str = "stream.binance.com";
+pub const DEFAULT_PORT: u16 = 9443;
+pub const DEFAULT_PATH: &str = "/ws/btcusdt@bookTicker";
+/// Updates printed.
+pub const DEFAULT_PRINT: usize = 10;
 /// RX and TX buffer bytes of the feed's socket.
 pub const SOCKET_BUFFER: usize = 256 * 1024;
 
@@ -301,3 +308,79 @@ impl Feed {
         within(spawner, "WebSocket close", limit, close).await
     }
 }
+
+/// What a feed saw: the updates read and their first and last update ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub count: u64,
+    pub update_ids: Option<(u64, u64)>,
+}
+
+/// What [`stream`] reports as it goes, for the caller to print.
+#[derive(Debug)]
+pub enum Event<'a> {
+    /// TCP, TLS and WebSocket are open.
+    Connected,
+    /// Update number `count` (from 1).
+    Ticker { count: u64, ticker: &'a BookTicker },
+    /// Reading ended (stop, or an error returned after the close); the close starts.
+    Read(Summary),
+    /// The close handshake finished: WebSocket close, TLS close_notify, FIN.
+    Closed,
+    /// The close failed after reading had failed; `stream` returns the read error.
+    CloseFailed(&'a FeedError),
+}
+
+/// The feed: connects (within `connect_limit`), reads updates until `stop` finishes or a read
+/// fails, then always attempts the close (within `close_limit`), after a failed read too.
+/// `Ok(None)` if `stop` finished before the connect did. A read error comes before a close error.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream(
+    handle: &NetHandle,
+    spawner: &Spawner,
+    target: &Target,
+    socket: tcp::Config,
+    tls: Arc<ClientConfig>,
+    local_port: u16,
+    connect_limit: Duration,
+    close_limit: Duration,
+    mut stop: impl Future + Unpin,
+    mut on: impl FnMut(Event<'_>),
+) -> Result<Option<Summary>, FeedError> {
+    let connecting = connect(handle, spawner, target, socket, tls, local_port, connect_limit);
+    let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {
+        return Ok(None);
+    };
+    on(Event::Connected);
+    let mut summary = Summary { count: 0, update_ids: None };
+    let read = loop {
+        match feed.next(&mut stop).await {
+            Ok(Some(ticker)) => {
+                summary.count += 1;
+                let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
+                summary.update_ids = Some((first, ticker.update_id));
+                on(Event::Ticker { count: summary.count, ticker: &ticker });
+            }
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        }
+    };
+    on(Event::Read(summary));
+    let closed = feed.close(spawner, close_limit).await;
+    match (read, closed) {
+        (Ok(()), Ok(())) => {
+            on(Event::Closed);
+            Ok(Some(summary))
+        }
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(())) => {
+            on(Event::Closed);
+            Err(error)
+        }
+        (Err(error), Err(close)) => {
+            on(Event::CloseFailed(&close));
+            Err(error)
+        }
+    }
+}
+

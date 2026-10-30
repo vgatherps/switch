@@ -247,7 +247,7 @@ fn main() {
         Ok(args) => args,
         Err(e) => {
             line("error", e);
-            line("usage", args::USAGE);
+            line("usage", args::usage());
             std::process::exit(3);
         }
     };

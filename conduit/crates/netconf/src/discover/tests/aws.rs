@@ -565,6 +565,30 @@ fn aws_required_items_and_address_selection() {
     );
 }
 
+/// An unnumbered interface (no kernel IPv4): `--ipv4` selects from IMDS local-ipv4s; an address
+/// not in that list is an error, not the first IMDS address.
+#[test]
+fn aws_unnumbered_interface_honours_ipv4_selection() {
+    let tree = Tree::new();
+    let select = |ipv4: &str| {
+        let server = ordinary((200, "1.2.3.4"));
+        discover_aws(&tree.roots, "eth1", &[], Some(ipv4.parse().unwrap()), &server.imds)
+    };
+    assert_eq!(
+        select("10.0.1.24").unwrap().config.ipv4,
+        "10.0.1.24/24".parse().unwrap()
+    );
+    assert_eq!(
+        select("10.0.1.99").err().unwrap().to_string(),
+        "10.0.1.99 is not in IMDS local-ipv4s (10.0.1.23, 10.0.1.24)"
+    );
+    let server = ordinary((200, "1.2.3.4"));
+    assert_eq!(
+        aws(&tree, &server, &[]).unwrap().config.ipv4,
+        "10.0.1.23/24".parse().unwrap()
+    );
+}
+
 const MAC: &str = "0a:12:34:56:78:9a";
 fn with_prefixes(prefixes: (u16, &str)) -> Server {
     metadata_with_prefixes(
@@ -697,4 +721,92 @@ fn kernel_rediscover_keeps_configured_owned_ipv4() {
     crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
     assert_eq!(Config::load(&path).unwrap().owned_ipv4, previous.owned_ipv4);
     assert_eq!(String::from_utf8(output).unwrap(), "");
+}
+
+/// The config written at `name` in a fresh tree, its loaded form and the new discovery.
+fn rediscover_fixture(name: &str) -> (Tree, std::path::PathBuf, Config, Discovered) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let mut previous = discovered.config.clone();
+    previous.mtu = 1400;
+    let path = tree.dir.join(name);
+    fs::write(&path, previous.to_json()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    (tree, path, loaded, discovered)
+}
+
+/// Names in `dir` starting with `.{name}.`: temp files of `name`.
+fn temp_files(dir: &std::path::Path, name: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(&format!(".{name}.")))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A rediscovery replaces the file whole (a new inode with the full new config and the old
+/// file's permissions), never truncates it in place, and leaves no temp file.
+#[test]
+fn rediscover_replaces_the_file_atomically() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (tree, path, loaded, discovered) = rediscover_fixture("config.json");
+    let inode = fs::metadata(&path).unwrap().ino();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    let expected = crate::rediscover::merge(discovered.config.clone(), false, &loaded).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected.to_json());
+    let metadata = fs::metadata(&path).unwrap();
+    assert_ne!(metadata.ino(), inode, "rewritten in place");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
+/// If the temp file cannot be created (here its name is too long for the file system, even for
+/// root), the write fails and the old bytes stay.
+#[test]
+fn failed_temp_file_leaves_the_old_config() {
+    let name = "c".repeat(250);
+    let (tree, path, loaded, discovered) = rediscover_fixture(&name);
+    let old = fs::read(&path).unwrap();
+    let mut output = Vec::new();
+    assert!(crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).is_err());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        old,
+        "a failed write changed the old config"
+    );
+    assert_eq!(temp_files(&tree.dir, &name), Vec::<String>::new());
+}
+
+/// Temp files a killed run left behind (under the old fixed name, and under the names this
+/// process would try next, as after pid reuse) do not block the next rediscovery.
+#[test]
+fn leftover_temp_file_does_not_block_rediscover() {
+    let (tree, path, loaded, discovered) = rediscover_fixture("config.json");
+    let next = crate::rediscover::TEMP_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+    let mut leftovers = vec![tree.dir.join(".config.json.tmp")];
+    leftovers.extend((next..next + 8).map(|n| crate::rediscover::temp_path(&path, n)));
+    for leftover in &leftovers {
+        fs::write(leftover, "partial").unwrap();
+    }
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    let expected = crate::rediscover::merge(discovered.config.clone(), false, &loaded).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected.to_json());
+    let mut left: Vec<String> = leftovers
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        temp_files(&tree.dir, "config.json"),
+        left,
+        "only the leftovers remain"
+    );
 }

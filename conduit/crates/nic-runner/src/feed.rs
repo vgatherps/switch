@@ -4,8 +4,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{connect, webpki_client_config, Clock, FeedError, Target};
-use switchnet::{first, tcp, Net};
+use binance_feed::{stream, webpki_client_config, Clock, Event, FeedError, Summary, Target};
+use switchnet::{tcp, Net};
 
 use crate::args::Feed;
 use crate::{line, stopped};
@@ -50,60 +50,46 @@ pub fn run(
         net,
         clock,
         stop,
-        move |handle, spawner, mut stop| async move {
-            let tls = webpki_client_config();
-            let limit = Duration::from_secs(20);
-            let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, limit);
-            let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {
-                line("feed_stopped", "before the feed connected");
-                return Ok(0);
-            };
-            line(
-                "feed_connected",
-                format_args!("{} local_port={local_port} TLS 1.3", target.url()),
-            );
-            task_connected.set(Some(Instant::now()));
-            let mut count = 0u64;
-            let mut first = None;
-            let mut last = None;
-            let read = loop {
-                match feed.next(&mut stop).await {
-                    Ok(Some(ticker)) => {
-                        count += 1;
-                        if first.is_none() {
-                            first = Some(ticker.update_id);
+        move |handle, spawner, stop| async move {
+            let report = |event: Event<'_>| match event {
+                Event::Connected => {
+                    line(
+                        "feed_connected",
+                        format_args!("{} local_port={local_port} TLS 1.3", target.url()),
+                    );
+                    task_connected.set(Some(Instant::now()));
+                }
+                Event::Ticker { count, ticker } if count <= print as u64 => {
+                    line("feed_message", format_args!("#{count} {ticker}"))
+                }
+                Event::Ticker { .. } => {}
+                Event::Read(Summary { count, update_ids }) => {
+                    line("feed_count", count);
+                    match update_ids {
+                        Some((first, last)) => {
+                            line("feed_update_ids", format_args!("{first}..{last}"))
                         }
-                        last = Some(ticker.update_id);
-                        if count <= print as u64 {
-                            line("feed_message", format_args!("#{count} {ticker}"));
-                        }
+                        None => line("feed_update_ids", "none"),
                     }
-                    Ok(None) => break Ok(()),
-                    Err(e) => break Err(e),
                 }
-            };
-            line("feed_count", count);
-            match (first, last) {
-                (Some(first), Some(last)) => {
-                    line("feed_update_ids", format_args!("{first}..{last}"))
-                }
-                _ => line("feed_update_ids", "none"),
-            }
-            let closed = feed.close(&spawner, Duration::from_secs(10)).await;
-            if closed.is_ok() {
-                line(
+                Event::Closed => line(
                     "feed_close",
                     "WebSocket close handshake, TLS close_notify, FIN",
-                );
+                ),
+                Event::CloseFailed(e) => line("feed_close_error", e),
+            };
+            let limit = Duration::from_secs(20);
+            let close_limit = Duration::from_secs(10);
+            let tls = webpki_client_config();
+            let summary = stream(
+                &handle, &spawner, &target, socket, tls, local_port, limit, close_limit, stop,
+                report,
+            )
+            .await?;
+            if summary.is_none() {
+                line("feed_stopped", "before the feed connected");
             }
-            if read.is_err() {
-                if let Err(e) = &closed {
-                    line("feed_close_error", e);
-                }
-            }
-            read?;
-            closed?;
-            Ok::<_, FeedError>(count)
+            Ok::<_, FeedError>(summary.map_or(0, |summary| summary.count))
         },
     )
     .and_then(|count| count)

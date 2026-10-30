@@ -53,25 +53,30 @@ pub(crate) fn derive(
         .collect::<Result<_, _>>()?;
     let subnet = required("subnet-ipv4-cidr-block")?;
     let subnet = parse_block(subnet.trim(), "subnet-ipv4-cidr-block")?;
+    let not_in_imds = |address: Ipv4Address| {
+        DiscoverError(format!(
+            "{address} is not in IMDS local-ipv4s ({})",
+            addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    };
     let ipv4 = if kernel.addresses.is_empty() {
-        Ipv4Cidr::new(
-            *addresses
+        // unnumbered interface: the address comes from IMDS, `select` picks among its list
+        let address = match select {
+            Some(select) if addresses.contains(&select) => select,
+            Some(select) => return Err(not_in_imds(select)),
+            None => *addresses
                 .first()
                 .ok_or_else(|| DiscoverError("IMDS local-ipv4s is empty".into()))?,
-            subnet.prefix_len(),
-        )
+        };
+        Ipv4Cidr::new(address, subnet.prefix_len())
     } else {
         let chosen = choose_address(interface, &kernel.addresses, select)?;
         if !addresses.contains(&chosen.address()) {
-            return Err(DiscoverError(format!(
-                "{} is not in IMDS local-ipv4s ({})",
-                chosen.address(),
-                addresses
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            return Err(not_in_imds(chosen.address()));
         }
         if chosen.prefix_len() != subnet.prefix_len() {
             return Err(DiscoverError(format!(
