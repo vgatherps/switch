@@ -243,7 +243,7 @@ impl Future for Wide {
     }
 }
 
-#[switch::task(capacity = 128)]
+#[switch::task]
 fn wide(slot: Rc<RefCell<Option<Waker>>>) -> impl Future<Output = ()> {
     Wide(Publish(slot), [0; 30_000])
 }
@@ -267,7 +267,7 @@ const NEW_BLOCKS: u32 = 4096;
 const SAMPLE_BLOCKS: u64 = 16;
 
 /// Never polled; two fit a 64 KiB task block.
-#[switch::task(capacity = 8192)]
+#[switch::task]
 fn wide_parked() -> impl Future<Output = ()> {
     Wide(Publish(Rc::new(RefCell::new(None))), [0; 30_000])
 }

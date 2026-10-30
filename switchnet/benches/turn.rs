@@ -26,7 +26,6 @@
 
 use std::future::Future;
 use std::hint::black_box;
-use std::pin::Pin;
 use std::time::{Duration as Wall, Instant as Clock};
 
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -35,16 +34,11 @@ use dpdk_smoltcp::{
     frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, Port, Stack, StackConfig, TcpHandle, UdpHandle,
 };
 use switch::Runtime;
-use switchnet::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig};
+use switchnet::{boxed, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
 use zhida_test_kit::with_eal;
-
-#[switch::task(capacity = 8192)]
-fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-    future
-}
 
 const SIZES: [usize; 5] = [0, 1, 16, 1000, 4096];
 const RX_CAPACITY: usize = 6 * 1460;
@@ -113,7 +107,7 @@ impl Bench {
             rt: Runtime::new(0),
             to_peer: a.link_to(b),
             to_net: b.link_to(a),
-            net: Net::new(net, NetConfig { ingress_budget: BUDGET }),
+            net: Net::new(net, NetConfig { ingress_budget: BUDGET, turn_request: None }),
             peer,
             now: T0,
             tcp,

@@ -25,6 +25,8 @@ const READY_LIMIT: Duration = Duration::from_secs(60);
 const FIRST_LOCAL_PORT: u16 = 49152;
 const CONNECT_LIMIT: Duration = Duration::from_secs(20);
 const CLOSE_LIMIT: Duration = Duration::from_secs(10);
+/// The longest idle sleep of a round that moved nothing: the tester shares the CPU.
+const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 fn usage() -> String {
     format!(
@@ -183,7 +185,7 @@ fn main() {
         SOCKET_BUFFER,
         Some(TESTER_IP),
         |stack, start, stop| {
-            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET, turn_request: None });
             let result = feed(&mut net, start, stop, &target, tls, local_port, args.print);
             let stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
             (stack, result)
@@ -229,7 +231,7 @@ fn feed(
         std::thread::sleep(Duration::from_millis(1));
     }
     let target = target.clone();
-    let count = run(net, &clock, stop, move |handle, spawner, stop| async move {
+    let count = run(net, &clock, Some(IDLE_SLEEP), stop, move |handle, spawner, stop| async move {
         let socket = binance_feed::socket(None);
         let report = |event: Event<'_>| {
             let mut out = io::stdout();

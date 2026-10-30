@@ -8,6 +8,8 @@ use std::task::{Context, Poll, Waker};
 mod clock_tests;
 #[path = "drain_tests.rs"]
 mod drain_tests;
+#[path = "turn_request_tests.rs"]
+mod turn_request_tests;
 
 #[switch::task]
 async fn empty() {}

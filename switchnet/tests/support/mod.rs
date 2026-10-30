@@ -13,17 +13,10 @@ use std::task::{Context, Poll};
 use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
 use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, StackConfig};
 use switch::Runtime;
-use switchnet::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
+use switchnet::{boxed, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
-
-/// Any test future, boxed so one task function serves every test; room for a
-/// task per socket of the largest fixture.
-#[switch::task(capacity = 2048)]
-fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-    future
-}
 
 pub const MAX_TCP: usize = 4;
 pub const MAX_UDP: usize = 4;
@@ -72,15 +65,27 @@ impl Mixed {
 
     /// `new` with `tcp` TCP and `udp` UDP socket slots on each side.
     pub fn with_sockets(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
-        Self::build(eal, names, tcp, udp, &[])
+        Self::build(eal, names, tcp, udp, &[], false)
     }
 
     /// `new` with the Net also owning `owned`; the peer owns only its own address.
     pub fn with_owned(eal: &Eal, names: [&str; 2], owned: &'static [Ipv4Cidr]) -> Self {
-        Self::build(eal, names, MAX_TCP, MAX_UDP, owned)
+        Self::build(eal, names, MAX_TCP, MAX_UDP, owned, false)
     }
 
-    fn build(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, owned: &'static [Ipv4Cidr]) -> Self {
+    /// `new` with the Net setting the Runtime's turn request (`NetConfig::turn_request`).
+    pub fn with_turn_request(eal: &Eal, names: [&str; 2]) -> Self {
+        Self::build(eal, names, MAX_TCP, MAX_UDP, &[], true)
+    }
+
+    fn build(
+        eal: &Eal,
+        names: [&str; 2],
+        tcp: usize,
+        udp: usize,
+        owned: &'static [Ipv4Cidr],
+        turn_request: bool,
+    ) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [net_stack, peer] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
@@ -102,11 +107,13 @@ impl Mixed {
             }
         });
         let [a, b] = &fixtures;
+        let rt = Runtime::new(0);
+        let turn_request = turn_request.then(|| rt.turn_request());
         Self {
-            rt: Runtime::new(0),
+            rt,
             to_peer: a.link_to(b),
             to_net: b.link_to(a),
-            net: Net::new(net_stack, NetConfig { ingress_budget: BUDGET }),
+            net: Net::new(net_stack, NetConfig { ingress_budget: BUDGET, turn_request }),
             peer,
             now: T0,
             fixtures,

@@ -156,6 +156,7 @@ fn with_net<T>(
             stack,
             NetConfig {
                 ingress_budget: INGRESS_BUDGET,
+                turn_request: None,
             },
         );
         let result = body(&mut net, &clock, listener);
@@ -472,6 +473,7 @@ fn refused_connect_releases_the_only_slot() {
         run(
             net,
             clock,
+            Some(IDLE_SLEEP),
             || {
                 guard(clock);
                 false
@@ -491,6 +493,7 @@ fn timed_out_connect_releases_the_only_slot() {
         run(
             net,
             clock,
+            Some(IDLE_SLEEP),
             || {
                 guard(clock);
                 false
@@ -584,6 +587,7 @@ fn feed_reads_tickers_answers_ping_and_closes() {
         run(
             net,
             clock,
+            Some(IDLE_SLEEP),
             should_stop,
             |handle, spawner, mut stop| async move {
                 let tls = client_config(roots);
@@ -636,7 +640,7 @@ fn stream_closes_after_a_read_error() {
             guard(clock);
             false
         };
-        let events = run(net, clock, should_stop, |handle, spawner, stop| async move {
+        let events = run(net, clock, Some(IDLE_SLEEP), should_stop, |handle, spawner, stop| async move {
             let mut events = Vec::new();
             let result = stream(
                 &handle,
@@ -688,6 +692,7 @@ fn received_update_comes_before_a_finished_stop() {
         run(
             net,
             clock,
+            Some(IDLE_SLEEP),
             || {
                 guard(clock);
                 false
@@ -751,7 +756,7 @@ fn server_close_reports_its_status_and_reason() {
             guard(clock);
             false
         };
-        run(net, clock, should_stop, |handle, spawner, mut stop| async move {
+        run(net, clock, Some(IDLE_SLEEP), should_stop, |handle, spawner, mut stop| async move {
             let target = target();
             let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
             let mut feed = connecting.await.expect("connect Zhida TLS WebSocket client");
@@ -779,7 +784,7 @@ fn stop_during_connect_ends_it_and_drops_the_socket() {
             guard(clock);
             server.is_finished()
         };
-        run(net, clock, should_stop, |handle, spawner, stop| async move {
+        run(net, clock, Some(IDLE_SLEEP), should_stop, |handle, spawner, stop| async move {
             let target = target();
             let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
             let early = spawner.sleep(200).expect("open Runtime");
@@ -805,6 +810,7 @@ fn upgrade_refused_with_http_451_reports_the_status() {
         run(
             net,
             clock,
+            Some(IDLE_SLEEP),
             should_stop,
             |handle, spawner, stop| async move {
                 let error = match connect(
@@ -848,6 +854,7 @@ fn unknown_certificate_fails_tls_and_alerts_the_server() {
         run(
             net,
             clock,
+            Some(IDLE_SLEEP),
             should_stop,
             |handle, spawner, stop| async move {
                 let error = match connect(

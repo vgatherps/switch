@@ -14,7 +14,9 @@
 //! each round polls a snapshot of the woken tasks, and tasks woken or spawned during a
 //! round run in the next one, until none are left or 1024 tasks were polled (checked
 //! between rounds). [`StoredWaker::wake_deferred`] and [`yield_now`] instead move a task
-//! to the next poll, unless an ordinary wake already queued it.
+//! to the next poll, unless an ordinary wake already queued it; it runs after the tasks
+//! woken or spawned between the polls. A set [`TurnRequest`] stops a poll before its next
+//! task; the next poll first finishes the stopped round.
 //! Work that wakes or spawns tasks must run before [`Runtime::poll`]; those tasks are polled by
 //! that call. The runtime never waits, though future code can block. A regressed tick returns
 //! [`RuntimeError::TimeRegressed`] without changing runtime state.
@@ -44,10 +46,9 @@
 //! [`JoinHandle`] that resolves to the value, or to [`oneshot::Canceled`] if the
 //! task ends without one (its runtime shut down or dropped, or its poll
 //! panicked); it allocates one [`oneshot`] channel. Both kinds of spawn share the function's
-//! pool and capacity. Each task function, and each instantiation of a
-//! generic one, has its own task blocks and capacity.
-//! `#[switch::task(capacity = N)]` sets that capacity: the most occupied slots per
-//! runtime (default: one block's slots, `1 <= N < 2^25`).
+//! pool. Each task function, and each instantiation of a generic one, has its own
+//! task blocks; a pool adds a block when every slot of its blocks is occupied, so
+//! the number of live tasks has no limit.
 //!
 //! A runtime allocates its own task blocks and keeps them for its whole life;
 //! blocks are never shared between runtimes. Shutdown drops the tasks, and a
@@ -159,7 +160,7 @@ mod timer_wheel;
 mod waker;
 
 pub use remote::RemoteWaker;
-pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
+pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner, TurnRequest};
 pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;
 pub use task::SpawnToken;

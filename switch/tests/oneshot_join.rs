@@ -182,7 +182,7 @@ fn an_untaken_value_drops_once_with_the_last_side() {
 fn a_sender_dropped_after_its_receiver_does_not_wake_the_slot() {
     /// Polls its receiver until `done`, then drops it and completes. Keeps its
     /// waker in `waker`.
-    #[switch::task(capacity = 1)]
+    #[switch::task]
     fn waits(
         receiver: Receiver<u32>,
         done: Rc<Cell<bool>>,
@@ -220,7 +220,7 @@ fn a_sender_dropped_after_its_receiver_does_not_wake_the_slot() {
     waker.borrow_mut().take().unwrap().wake();
     runtime.poll(0).unwrap();
     assert_eq!(old_polls.get(), 2);
-    // Capacity 1: a newer task takes the old one's slot.
+    // A newer task takes the old one's slot, the lowest free.
     let (_new_sender, new_receiver) = oneshot::channel();
     let new_polls = Rc::new(Cell::new(0));
     spawner
@@ -361,46 +361,27 @@ fn detached_spawn_drops_the_value_at_completion() {
     assert_eq!(drops.get(), 1);
 }
 
-#[switch::task(capacity = 2)]
-async fn limited(gate: Receiver<()>) -> u32 {
+#[switch::task]
+async fn after_gate(gate: Receiver<()>) -> u32 {
     let _ = gate.await;
     3
 }
 
 #[test]
-fn detached_and_joined_spawns_share_one_pool() {
-    let runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let (_open_a, gate_a) = oneshot::channel();
-    let (_open_b, gate_b) = oneshot::channel();
-    let (_open_c, gate_c) = oneshot::channel();
-    let (_open_d, gate_d) = oneshot::channel();
-    spawner.spawn(limited(gate_a)).unwrap();
-    let _handle = spawner.spawn_join(limited(gate_b)).unwrap();
-    let detached = spawner.spawn(limited(gate_c)).unwrap_err();
-    assert_eq!(detached.reason, RuntimeError::Exhausted);
-    let joined = spawner.spawn_join(limited(gate_d)).unwrap_err();
-    assert_eq!(joined.reason, RuntimeError::Exhausted);
-}
-
-#[test]
 fn failed_spawn_join_returns_the_token() {
+    let mut closed = Runtime::new(0);
+    let spawner = closed.spawner();
+    closed.shutdown();
+    let (open, gate) = oneshot::channel();
+    let error = spawner.spawn_join(after_gate(gate)).unwrap_err();
+    assert_eq!(error.reason, RuntimeError::Closed);
+    // The returned token still holds its argument: the gate it was built with.
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
-    let (open_a, gate_a) = oneshot::channel();
-    let (_open_b, gate_b) = oneshot::channel();
-    let (open_c, gate_c) = oneshot::channel();
-    spawner.spawn(limited(gate_a)).unwrap();
-    spawner.spawn(limited(gate_b)).unwrap();
-    let error = spawner.spawn_join(limited(gate_c)).unwrap_err();
-    assert_eq!(error.reason, RuntimeError::Exhausted);
-    open_a.send(()).unwrap();
-    run(&mut runtime);
-    // The returned token still holds its argument: the gate it was built with.
     let handle = spawner.spawn_join(error.token).unwrap();
     let out = slot();
     spawner.spawn(store(handle, out.clone())).unwrap();
-    open_c.send(()).unwrap();
+    open.send(()).unwrap();
     run(&mut runtime);
     assert_eq!(*out.borrow(), Some(Ok(3)));
 }

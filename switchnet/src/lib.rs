@@ -29,19 +29,24 @@ use std::task::{Context, Poll};
 
 pub use dpdk_smoltcp::smoltcp::phy::TxFrame;
 pub use dpdk_smoltcp::smoltcp::socket::tcp;
-pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendError, SendFrameError};
+pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendFrameError};
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
 pub use dpdk_smoltcp::{
     AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
 };
 use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
-use switch::StoredWaker;
+use switch::{StoredWaker, TurnRequest};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct NetConfig {
     /// Passed to `Stack::turn` each turn.
     pub ingress_budget: usize,
+    /// The loop's `Runtime::turn_request()`, to end its poll early: once the
+    /// frames handed to the Stack since the last turn (each `UdpTx::send` and
+    /// `TcpTx::try_send` that succeeded) reach one `Stack::tx_burst`, the Net sets
+    /// it, and a successful `turn` clears it. `None`: sends never set it.
+    pub turn_request: Option<TurnRequest>,
 }
 
 type Shared = Rc<RefCell<Inner>>;
@@ -98,9 +103,25 @@ struct Inner {
     /// socket slot; more simultaneous waiters than that grow it.
     frame_waiters: Vec<StoredWaker>,
     ingress_budget: usize,
+    turn_request: Option<TurnRequest>,
+    /// Frames handed to the Stack since the last turn; counted only with a `turn_request`.
+    tx_handed: usize,
+    /// `Stack::tx_burst`: `tx_handed` that sets the turn request.
+    tx_burst: usize,
 }
 
 impl Inner {
+    /// One frame handed to the Stack: at one TX burst since the last turn, request a turn.
+    #[inline]
+    fn handed_over(&mut self) {
+        if let Some(request) = &self.turn_request {
+            self.tx_handed += 1;
+            if self.tx_handed >= self.tx_burst {
+                request.set();
+            }
+        }
+    }
+
     fn insert(&mut self, socket: Socket) -> u32 {
         let index = self.free.pop().expect("more sockets than the Stack holds");
         let entry = &mut self.entries[index as usize];
@@ -287,12 +308,16 @@ impl Net {
         assert!(u32::try_from(2 * slots).is_ok(), "socket slots exceed the readiness tokens");
         let entries =
             (0..slots).map(|_| Entry { socket: None, parked: [None; 2], halves: 0, token_out: [false; 2] }).collect();
+        let tx_burst = stack.tx_burst();
         let inner = Inner {
             stack,
             entries,
             free: (0..slots as u32).rev().collect(),
             frame_waiters: Vec::with_capacity(slots),
             ingress_budget: config.ingress_budget,
+            turn_request: config.turn_request,
+            tx_handed: 0,
+            tx_burst,
         };
         Net { shared: Rc::new(RefCell::new(inner)) }
     }
@@ -305,13 +330,21 @@ impl Net {
     /// became ready, and every task waiting for a TX frame if the pool has
     /// one, also when the turn returns an error (egress can fail after
     /// ingress queued data). Only sockets whose readiness tokens fired since
-    /// the last turn are checked, never every parked one. After a panic out of
-    /// `turn`, drop the Net.
+    /// the last turn are checked, never every parked one. A successful turn
+    /// (which flushed) clears the `NetConfig::turn_request` and restarts its frame
+    /// count, also with frames still pending. After a panic out of `turn`, drop
+    /// the Net.
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut inner = self.shared.borrow_mut();
-        let Inner { stack, entries, frame_waiters, ingress_budget, .. } = &mut *inner;
+        let Inner { stack, entries, frame_waiters, ingress_budget, turn_request, tx_handed, .. } = &mut *inner;
         let turn = stack.turn(now, *ingress_budget);
+        if turn.is_ok() {
+            *tx_handed = 0;
+            if let Some(request) = turn_request {
+                request.clear();
+            }
+        }
         if let Some(token) = stack.pop_fired() {
             wake_fired(stack, entries, token);
         }
@@ -605,8 +638,9 @@ impl TcpTx {
     /// `Future<Output = Result<(), SendError>>`: `Ok` once a frame of `len`
     /// bytes fits (free bytes and a free frame slot), so `try_send` of such a
     /// frame succeeds until the next turn; `Err(InvalidState)` once the
-    /// socket can no longer send (reset, closed, or after `shutdown`).
-    /// Panics if `len` exceeds the socket's send capacity: it would never fit.
+    /// socket can no longer send (reset, closed, or after `shutdown`);
+    /// `Err(TooLarge)` on the first poll if `len` exceeds the socket's send capacity
+    /// (or u32): it would never fit.
     pub fn room(&mut self, len: usize) -> Room<'_> {
         Room { tx: self, len }
     }
@@ -617,7 +651,9 @@ impl TcpTx {
     pub fn try_send(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.tcp(self.0.index);
-        stack.tcp_send_frame(handle, frame)
+        stack.tcp_send_frame(handle, frame)?;
+        inner.handed_over();
+        Ok(())
     }
 
     /// The socket's send buffer size: the largest `room` that can ever resolve.
@@ -675,18 +711,43 @@ pub struct Room<'a> {
     len: usize,
 }
 
+/// Why a [`TcpTx::room`] failed.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SendError {
+    /// The socket can no longer send: reset, closed, or after `shutdown`.
+    InvalidState,
+    /// `len` exceeds the socket's send buffer, `capacity` bytes (or u32): it would never fit.
+    TooLarge { len: usize, capacity: usize },
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::InvalidState => f.write_str("invalid state"),
+            Self::TooLarge { len, capacity } => write!(f, "{len} B exceeds the {capacity} B send buffer"),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
+
 impl Future for Room<'_> {
     type Output = Result<(), SendError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (half, len) = (&self.tx.0, self.len);
         let index = half.index;
-        let interest = Interest::TcpRoom(u32::try_from(len).expect("room length exceeds u32"));
-        poll_op(&half.shared, index, interest, cx, |inner| {
+        let Ok(interest) = u32::try_from(len) else {
+            let capacity = self.tx.send_capacity();
+            return Poll::Ready(Err(SendError::TooLarge { len, capacity }));
+        };
+        poll_op(&half.shared, index, Interest::TcpRoom(interest), cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
-            assert!(len <= socket.send_capacity(), "room({len}) exceeds the send capacity");
-            if !socket.may_send() {
+            let capacity = socket.send_capacity();
+            if len > capacity {
+                Some(Err(SendError::TooLarge { len, capacity }))
+            } else if !socket.may_send() {
                 Some(Err(SendError::InvalidState))
             } else {
                 tcp_room_ready(socket, len).then_some(Ok(()))
@@ -759,7 +820,9 @@ impl UdpTx {
     pub fn send(&mut self, to: Option<IpEndpoint>, frame: TxFrame) -> Result<(), (TxFrame, UdpSendFrameError)> {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.udp(self.0.index);
-        stack.udp_send_frame(handle, to, frame)
+        stack.udp_send_frame(handle, to, frame)?;
+        inner.handed_over();
+        Ok(())
     }
 }
 

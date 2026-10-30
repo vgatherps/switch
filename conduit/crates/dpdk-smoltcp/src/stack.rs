@@ -520,6 +520,11 @@ impl Stack {
         self.max_udp_sockets
     }
 
+    /// The port's `PortConfig::tx_burst`: the most frames one flush burst offers the PMD.
+    pub fn tx_burst(&self) -> usize {
+        self.device.tx_burst_size()
+    }
+
     /// When sockets next want a turn, evaluated at the latest time given
     /// to `new`, `turn` or `receive`; a deadline already past is reported as
     /// that time, as is a socket with a segment ready to send. `None`: no

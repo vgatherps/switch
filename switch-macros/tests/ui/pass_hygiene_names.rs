@@ -4,9 +4,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use switch::RuntimeError;
-
-/// Types named like generated items, used as argument types and in `capacity`.
+/// Types named like generated items, used as argument types.
 mod types {
     pub struct Key(pub u32);
     pub struct POOL(pub u32);
@@ -19,7 +17,7 @@ mod types {
 
 use types::{Key, Marker, POOL};
 
-#[switch::task(capacity = Marker::N)]
+#[switch::task]
 async fn typed(key: Key, pool: POOL, marker: Marker, count: Rc<Cell<u32>>) {
     count.set(count.get() + key.0 + pool.0 + marker.0);
 }
@@ -92,9 +90,7 @@ mod helpers {
 struct Limits;
 
 impl Limits {
-    const LIMIT: u32 = 2;
-
-    #[switch::task(capacity = Self::LIMIT)]
+    #[switch::task]
     async fn limited() {}
 }
 
@@ -107,11 +103,6 @@ fn main() {
             .spawn(typed(Key(1), POOL(10), Marker(100), counts[0].clone()))
             .unwrap();
     }
-    let reason = spawner
-        .spawn(typed(Key(1), POOL(10), Marker(100), counts[0].clone()))
-        .unwrap_err()
-        .reason;
-    assert_eq!(reason, RuntimeError::Exhausted);
     spawner
         .spawn(arguments::named(
             1,
@@ -129,11 +120,7 @@ fn main() {
     spawner
         .spawn(helpers::calls_plain(counts[3].clone()))
         .unwrap();
-    for _ in 0..Limits::LIMIT {
-        spawner.spawn(Limits::limited()).unwrap();
-    }
-    let reason = spawner.spawn(Limits::limited()).unwrap_err().reason;
-    assert_eq!(reason, RuntimeError::Exhausted);
+    spawner.spawn(Limits::limited()).unwrap();
     while runtime.poll(0).unwrap().live_tasks != 0 {}
     assert_eq!(counts[0].get(), 3 * 111);
     assert_eq!(counts[1].get(), 255);

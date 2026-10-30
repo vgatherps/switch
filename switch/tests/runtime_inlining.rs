@@ -95,9 +95,10 @@ fn equal_ticks_refresh_then_expiry_deduplicates_and_spawn_runs_this_turn() {
         }
     );
     assert_eq!((polls.get(), drops.get()), (3, 1));
+    // The spawn came between polls, so it runs before the deferred sleeper.
     assert_eq!(
         *trace.borrow(),
-        ["pending", "pending", "sleep ready", "drop", "spawned ready"]
+        ["pending", "pending", "spawned ready", "sleep ready", "drop"]
     );
     assert_eq!(
         runtime.poll(19),

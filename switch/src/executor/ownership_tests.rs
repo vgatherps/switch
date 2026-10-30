@@ -27,12 +27,23 @@ fn constructor_reserves_ready_storage_and_uses_initial_timer_tick() {
     }
     owner.cleanup();
 }
+/// A wake queue at capacity: one more append panics rather than writing past the buffer.
+#[test]
+#[should_panic(expected = "wake queue full")]
+fn append_to_a_full_wake_queue_panics() {
+    let mut queue: Vec<*const TaskHeader> = Vec::with_capacity(1);
+    while queue.len() < queue.capacity() {
+        append_reserved(&mut queue, std::ptr::null());
+    }
+    append_reserved(&mut queue, std::ptr::null());
+}
+
 impl Owner {
     fn new() -> Self {
         Self(Box::into_raw(Box::new(Executor::new())))
     }
     fn spawn<T: Task>(&self, token: SpawnToken<T>) {
-        assert!(unsafe { Executor::spawn(self.0, token, None) }.is_ok());
+        unsafe { Executor::spawn(self.0, token, None) };
     }
     /// The most recently spawned task (spawn pushes onto `incoming`).
     fn last(&self) -> *const TaskHeader {
@@ -198,7 +209,7 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
     async fn spawn_many(ptr: *mut Executor, inner: Rc<Cell<usize>>) {
         for _ in 0..(DEFAULT_CAPACITY * 3) {
             unsafe {
-                assert!(Executor::spawn(ptr, count_task(inner.clone()), None).is_ok());
+                Executor::spawn(ptr, count_task(inner.clone()), None);
             }
         }
     }
@@ -462,10 +473,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
             self.drops.set(self.drops.get() + 1);
             for _ in 0..(DEFAULT_CAPACITY * 3) {
                 unsafe {
-                    assert!(
-                        Executor::spawn(self.owner, count_task(self.completed.clone()), None)
-                            .is_ok()
-                    );
+                    Executor::spawn(self.owner, count_task(self.completed.clone()), None);
                 }
             }
             // Target slot remains live whether idle or in this batch.

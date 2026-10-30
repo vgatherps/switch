@@ -1,318 +1,135 @@
 //! # depot
 //!
-//! A cache-optimized pool allocator returning compact typed handles.
-//! Designed for high-frequency alloc/free of packet metadata and ECS-style indices.
+//! [`DynDepot`]: slot numbers with no capacity. A bitmap of free slots (bit `s % 64` of word
+//! `s / 64` set = slot `s` free) and a summary above it (bit `w % 64` of word `w / 64` set =
+//! bitmap word `w` has a free slot). Both grow by a word when every slot is taken. `alloc` hands
+//! out the lowest free slot, so never-used slots go out in increasing order.
 
-use std::cell::UnsafeCell;
-use std::num::NonZeroU32;
-
-mod algorithm;
-mod dyn_depot;
-pub mod fixed;
-mod index_ring;
-pub mod pool;
-
-#[cfg(test)]
-mod stress_tests;
-#[cfg(any(test, feature = "test-utils"))]
-mod test_heap;
-
-pub use dyn_depot::DynDepot;
-pub use fixed::FixedDepot;
-#[doc(hidden)]
-pub use pool::{
-    Claim, ClaimBorrowError, ClaimError, Component, ComponentRef, ComponentRefMut, Entity,
-    EntityId, EntityRef, GlobalPool, PoolBinding, PoolClaim, PoolHandle, StaticClaim,
-    StaticPoolHandle,
-};
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub use pool::{LocalPool, LocalPoolBinding, OwnedClaim};
-#[cfg(any(test, feature = "test-utils"))]
-pub use test_heap::{HeapOp, SlabHeap, run_heap_oracle};
-
-/// Types that expose a fixed slot capacity for use as rake index spaces.
-pub trait HasSlots {
-    const SLOTS: usize;
+/// Slot numbers from 0, lowest free first, growing on demand; no handles or generations.
+#[derive(Debug, Default)]
+pub struct DynDepot {
+    free: Vec<u64>,
+    summary: Vec<u64>,
 }
 
-/// Alloc/free interface over a depot — enables generic code to work with any depot type.
-pub trait DepotAlloc {
-    fn alloc(&mut self) -> Option<DepotHandle>;
-
-    /// Resolve an optional handle for null-tolerant access.
-    ///
-    /// `None` and slot-0 handles return `Some(0)`. Live handles return their slot.
-    /// Stale, dead, poisoned, and out-of-range handles return `None`.
-    fn get_or_sentinel(&self, handle: Option<DepotHandle>) -> Option<u32>;
-
-    /// Validate a handle as a live allocation. The default implementation reports every failure as
-    /// `StaleGeneration`; `FixedDepot` overrides it and reports slot 0 and out-of-range slots as
-    /// `OutOfRange`.
-    fn validate(&self, handle: DepotHandle) -> Result<u32, AccessError> {
-        self.validate_live(handle)
-            .ok_or(AccessError::StaleGeneration)
-    }
-
-    /// Strictly validate a public/raw handle as a currently live allocation.
-    ///
-    /// Stale, out-of-range, freed, and poisoned handles return `None`. Unlike `get_or_sentinel`,
-    /// a slot-0 handle also returns `None` here instead of `Some(0)`.
-    fn validate_live(&self, handle: DepotHandle) -> Option<u32>;
-
-    /// # Safety
-    /// `handle` must be currently allocated in this depot.
-    unsafe fn free_unchecked(&mut self, handle: DepotHandle);
-
-    /// Permanently invalidate a currently allocated slot without making it reusable.
-    ///
-    /// This is available to owners layered above depot when a slot must become dead without being
-    /// reused. Stale ids fail generation checks immediately and the slot is intentionally leaked.
-    ///
-    /// # Safety
-    /// `handle` must refer to a currently allocated slot in this depot.
-    unsafe fn poison_unchecked(&mut self, handle: DepotHandle);
-}
-
-const HANDLE_SLOT_BITS: u32 = 25;
-const HANDLE_SLOT_MASK: u32 = (1 << HANDLE_SLOT_BITS) - 1;
-pub(crate) const MAX_SLOTS: usize = 1 << HANDLE_SLOT_BITS;
-
-/// Compact typed handle: 25-bit slot + 7-bit generation packed into a NonZeroU32.
-/// Raw 0 is unrepresentable, so `Option<DepotHandle>` is the same size as `u32`
-/// with `None` as null. Live generations are 1 through 127 and wrap to 1.
-/// Slot 0 is still reserved as rake's sentinel row.
-// Guarantees an all-zero `Option<DepotHandle>` is `None`; `FixedDepot::new()` relies on it.
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DepotHandle(NonZeroU32);
-
-impl DepotHandle {
-    #[inline(always)]
-    pub const fn raw(self) -> u32 {
-        self.0.get()
-    }
-
-    #[inline(always)]
-    pub const fn slot(self) -> u32 {
-        self.0.get() & HANDLE_SLOT_MASK
-    }
-
-    #[inline(always)]
-    pub const fn generation(self) -> u8 {
-        (self.0.get() >> HANDLE_SLOT_BITS) as u8
-    }
-
-    #[inline(always)]
-    #[cfg(test)]
-    pub(crate) const fn from_raw(raw: u32) -> Self {
-        match NonZeroU32::new(raw) {
-            Some(v) => Self(v),
-            None => panic!("DepotHandle::from_raw(0) is invalid"),
+impl DynDepot {
+    pub const fn new() -> Self {
+        Self {
+            free: Vec::new(),
+            summary: Vec::new(),
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreeError {
-    OutOfRange,
-    StaleGeneration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessError {
-    OutOfRange,
-    StaleGeneration,
-}
-
-pub(crate) const GENERATION_MASK: u8 = (1u8 << (32 - HANDLE_SLOT_BITS)) - 1; // 0x7F for 7 bits
-pub(crate) const DEAD_BIT: u8 = 1u8 << (32 - HANDLE_SLOT_BITS); // 0x80
-pub(crate) const BAD_GENERATION: u8 = 0;
-pub(crate) const FIRST_GENERATION: u8 = 1;
-
-#[inline(always)]
-pub(crate) const fn next_live_generation(generation: u8) -> u8 {
-    let next = generation.wrapping_add(1) & GENERATION_MASK;
-    next + (next == BAD_GENERATION) as u8
-}
-
-#[inline(always)]
-pub(crate) fn encode_handle(slot: u32, generation: u8) -> DepotHandle {
-    debug_assert!((slot as usize) < MAX_SLOTS);
-    let g = (generation & GENERATION_MASK) as u32;
-    let raw = (g << HANDLE_SLOT_BITS) | slot;
-    debug_assert!(raw != 0, "encode_handle produced zero (slot=0, gen=0)");
-    debug_assert!(
-        slot == 0 || (generation & GENERATION_MASK) != BAD_GENERATION,
-        "live handle encoded with bad generation"
-    );
-    DepotHandle(unsafe { NonZeroU32::new_unchecked(raw) })
-}
-
-/// Define a static pool with a ZST handle.
-///
-/// ```
-/// depot::define_static_ecs!(OrderPool, 64);
-///
-/// fn main() {
-///     let _claim = OrderPool::claim().unwrap();
-/// }
-/// ```
-///
-/// ```compile_fail,E0080
-/// depot::define_static_ecs!(OversizedPool, (1usize << 25) + 1);
-///
-/// fn main() {}
-/// ```
-#[macro_export]
-macro_rules! define_static_ecs {
-    ($name:ident, $capacity:expr) => {
-        $crate::define_static_ecs!($name, $capacity, core: () = ());
-    };
-    ($name:ident, $capacity:expr, core: $core_ty:ty = $core_init:expr) => {
-        const _: () = <$crate::fixed_depot_type!($capacity)>::validate_config();
-
-        #[derive(Clone, Copy)]
-        pub struct $name;
-
-        impl $name {
-            #[inline]
-            fn __pool() -> &'static $crate::GlobalPool<
-                $crate::fixed_depot_type!($capacity), $core_ty,
-            > {
-                static POOL: $crate::GlobalPool<
-                    $crate::fixed_depot_type!($capacity),
-                    $core_ty,
-                > = $crate::GlobalPool::new(
-                    <$crate::fixed_depot_type!($capacity)>::new(),
-                    $core_init,
-                );
-                &POOL
-            }
-
-            #[inline]
-            pub fn claim() -> Result<$crate::StaticClaim<Self>, $crate::ClaimError> {
-                <Self as $crate::StaticPoolHandle>::claim_static()
-            }
+    /// The lowest free slot, now taken; adds 64 slots when none is free.
+    #[inline]
+    pub fn alloc(&mut self) -> u32 {
+        let Some(top) = self.summary.iter().position(|&bits| bits != 0) else {
+            return self.grow();
+        };
+        let summary = &mut self.summary[top];
+        let word = top * 64 + summary.trailing_zeros() as usize;
+        let free = &mut self.free[word];
+        let bit = free.trailing_zeros();
+        *free &= *free - 1;
+        if *free == 0 {
+            *summary &= *summary - 1;
         }
-
-        unsafe impl $crate::PoolBinding for $name {
-            type Depot = $crate::fixed_depot_type!($capacity);
-            type Core = $core_ty;
-
-            #[inline(always)]
-            fn pool_id(&self) -> *const () { Self::__pool().pool_id() }
-            #[inline(always)]
-            fn depot_ptr(&self) -> *mut Self::Depot { Self::__pool().depot_ptr() }
-            #[inline(always)]
-            fn core_ptr(&self) -> *mut Self::Core { Self::__pool().core_ptr() }
-            #[inline(always)]
-            fn borrow_set_ptr(
-                &self,
-            ) -> *const <Self::Depot as $crate::pool::SlotBorrowStorage>::SlotBorrows {
-                Self::__pool().borrow_set_ptr()
-            }
-        }
-
-        unsafe impl $crate::PoolHandle for $name {}
-
-        unsafe impl $crate::StaticPoolHandle for $name {
-            #[inline(always)]
-            fn static_pool() -> &'static $crate::GlobalPool<Self::Depot, Self::Core> {
-                Self::__pool()
-            }
-
-            #[inline(always)]
-            fn static_handle() -> Self {
-                $name
-            }
-        }
-    };
-}
-
-/// `Sync` wrapper for `UnsafeCell<T>` used by static component and follower storage.
-/// Safety is guaranteed by the pool's thread-affinity claim.
-#[doc(hidden)]
-pub struct SyncCell<T>(pub UnsafeCell<T>);
-unsafe impl<T> Sync for SyncCell<T> {}
-
-impl<T> SyncCell<T> {
-    pub const fn new(val: T) -> Self {
-        Self(UnsafeCell::new(val))
+        (word * 64) as u32 + bit
     }
-    pub fn get(&self) -> *mut T {
-        self.0.get()
+
+    /// Takes the first slot of a new bitmap word.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) -> u32 {
+        let word = self.free.len();
+        // Every slot number, plus one, fits u32.
+        let end = u32::try_from(word * 64 + 64).expect("slot numbers exceed u32");
+        if word.is_multiple_of(64) {
+            self.summary.push(0);
+        }
+        self.free.push(!1);
+        self.summary[word / 64] |= 1 << (word % 64);
+        end - 64
+    }
+
+    /// Returns a slot `alloc` handed out and nobody freed since. Panics if `alloc` never
+    /// reached it.
+    #[inline]
+    pub fn free(&mut self, slot: u32) {
+        let word = slot as usize / 64;
+        let free = &mut self.free[word];
+        debug_assert_eq!(*free & 1 << (slot % 64), 0, "slot {slot} freed twice");
+        *free |= 1 << (slot % 64);
+        self.summary[word / 64] |= 1 << (word % 64);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::DynDepot;
 
-    struct DefaultValidateDepot(fixed_depot_type!(256));
-
-    impl DepotAlloc for DefaultValidateDepot {
-        fn alloc(&mut self) -> Option<DepotHandle> {
-            self.0.alloc()
+    #[test]
+    fn hands_out_slots_in_increasing_order_across_word_boundaries() {
+        let mut slots = DynDepot::new();
+        for expected in 0..64 * 64 + 65 {
+            assert_eq!(slots.alloc(), expected);
         }
+        assert_eq!((slots.free.len(), slots.summary.len()), (66, 2));
+    }
 
-        fn get_or_sentinel(&self, handle: Option<DepotHandle>) -> Option<u32> {
-            self.0.get_or_sentinel(handle)
+    #[test]
+    fn reuses_the_lowest_free_slot_first() {
+        let mut slots = DynDepot::new();
+        for _ in 0..64 * 64 + 10 {
+            slots.alloc();
         }
-
-        fn validate_live(&self, handle: DepotHandle) -> Option<u32> {
-            self.0.validate_live(handle)
+        for slot in [4100, 70, 4095, 3, 64] {
+            slots.free(slot);
         }
-
-        unsafe fn free_unchecked(&mut self, handle: DepotHandle) {
-            // SAFETY: This method has the same contract as the delegated method.
-            unsafe { self.0.free_unchecked(handle) }
-        }
-
-        unsafe fn poison_unchecked(&mut self, handle: DepotHandle) {
-            // SAFETY: This method has the same contract as the delegated method.
-            unsafe { self.0.poison_unchecked(handle) }
+        for expected in [3, 64, 70, 4095, 4100, 4106] {
+            assert_eq!(slots.alloc(), expected);
         }
     }
 
     #[test]
-    fn handle_roundtrip() {
-        let h = encode_handle(12345, 17);
-        assert_eq!(h.slot(), 12345);
-        assert_eq!(h.generation(), 17);
+    fn a_full_word_is_reused_after_a_free() {
+        let mut slots = DynDepot::new();
+        for _ in 0..128 {
+            slots.alloc();
+        }
+        slots.free(127);
+        slots.free(0);
+        assert_eq!(slots.alloc(), 0);
+        assert_eq!(slots.alloc(), 127);
+        assert_eq!(slots.alloc(), 128);
     }
 
+    /// Random allocs and frees against a model: `alloc` returns the lowest slot not taken.
     #[test]
-    fn option_handle_is_u32_sized() {
-        assert_eq!(
-            std::mem::size_of::<Option<DepotHandle>>(),
-            std::mem::size_of::<u32>()
-        );
-    }
-
-    #[test]
-    fn handle_layout_25_slot_7_generation() {
-        let h = encode_handle((1 << HANDLE_SLOT_BITS) - 1, GENERATION_MASK);
-        assert_eq!(h.slot(), (1 << HANDLE_SLOT_BITS) - 1);
-        assert_eq!(h.generation(), 127);
-    }
-
-    #[test]
-    fn next_live_generation_wraps_127_to_1() {
-        assert_eq!(next_live_generation(126), 127);
-        assert_eq!(next_live_generation(127), FIRST_GENERATION);
-    }
-
-    #[test]
-    fn trait_default_validate_collapses_to_stale_generation() {
-        let mut depot = DefaultValidateDepot(<fixed_depot_type!(256)>::new());
-        let live = depot.alloc().unwrap();
-        assert_eq!(DepotAlloc::validate(&depot, live), Ok(live.slot()));
-
-        let out_of_range = DepotHandle::from_raw((1 << HANDLE_SLOT_BITS) | 999);
-        assert_eq!(
-            DepotAlloc::validate(&depot, out_of_range),
-            Err(AccessError::StaleGeneration)
-        );
+    fn random_allocs_and_frees_match_a_lowest_free_model() {
+        let rounds = if cfg!(miri) { 2_000 } else { 200_000 };
+        let mut slots = DynDepot::new();
+        // Model: taken slots, freed slots below `high`, and `high`, the first never taken.
+        let (mut taken, mut freed, mut high) = (Vec::new(), std::collections::BTreeSet::new(), 0);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..rounds {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Allocs outnumber frees 5:4, so the population climbs past several summary words.
+            if taken.is_empty() || state % 9 < 5 {
+                let lowest = freed.pop_first().unwrap_or_else(|| {
+                    high += 1;
+                    high - 1
+                });
+                assert_eq!(slots.alloc(), lowest);
+                taken.push(lowest);
+            } else {
+                let slot = taken.swap_remove((state >> 32) as usize % taken.len());
+                freed.insert(slot);
+                slots.free(slot);
+            }
+        }
+        assert!(cfg!(miri) || taken.len() > 64 * 64, "the walk stayed below one summary word");
     }
 }

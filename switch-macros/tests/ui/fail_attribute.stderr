@@ -1,11 +1,11 @@
-error: expected `capacity = N`
+error: `#[switch::task]` takes no arguments
  --> tests/ui/fail_attribute.rs:1:16
   |
 1 | #[switch::task(name = "x")]
-  |                ^^^^
+  |                ^^^^^^^^^^
 
-error: expected `capacity = N`
- --> tests/ui/fail_attribute.rs:4:30
+error: `#[switch::task]` takes no arguments
+ --> tests/ui/fail_attribute.rs:4:16
   |
-4 | #[switch::task(capacity = 1, capacity = 2)]
-  |                              ^^^^^^^^
+4 | #[switch::task(capacity = 1)]
+  |                ^^^^^^^^^^^^

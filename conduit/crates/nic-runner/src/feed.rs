@@ -46,9 +46,11 @@ pub fn run(
     let task_connected = connected.clone();
     let stop = || stopped() || connected.get().is_some_and(|at| at.elapsed() >= seconds);
     let (target, print) = (target.clone(), args.print);
+    // The feed core busy-polls: a sleep would hold received packets until it ends.
     let count = binance_feed::run(
         net,
         clock,
+        None,
         stop,
         move |handle, spawner, stop| async move {
             let report = |event: Event<'_>| match event {

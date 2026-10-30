@@ -369,6 +369,38 @@ fn udp_halves_receive_and_send_a_frame() {
     })
 }
 
+/// A `room` longer than the send buffer, or than u32, could never resolve: it fails at once with
+/// `TooLarge`, and the socket still sends.
+#[zhida_test_support::pinned_test]
+fn room_beyond_the_send_capacity_fails() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["rbga", "rbgb"]);
+        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
+        let (_rx, mut tx) = stream.split();
+        let handle = mixed.handle();
+        let (task, _polls) = counted(async move {
+            let capacity = tx.send_capacity();
+            assert_eq!(capacity, 1500);
+            let over = poll_once(tx.room(capacity + 1)).await;
+            let huge = poll_once(tx.room(usize::MAX)).await;
+            let fits = poll_once(tx.room(capacity)).await;
+            let frame = filled(&handle, &[3; CHUNK]).await;
+            tx.try_send(frame).map_err(|(_, error)| error).unwrap();
+            (tx, over, huge, fits)
+        });
+        let slot = mixed.spawn(task);
+        mixed.turn();
+        let (tx, over, huge, fits) = slot.take();
+        assert_eq!(over, Some(Err(SendError::TooLarge { len: 1501, capacity: 1500 })));
+        assert_eq!(huge, Some(Err(SendError::TooLarge { len: usize::MAX, capacity: 1500 })));
+        assert_eq!(fits, Some(Ok(())));
+        assert_eq!(peer_receive(&mut mixed, &peer, CHUNK), [3; CHUNK]);
+        drop((tx, _rx, peer));
+        mixed.close();
+    })
+}
+
 /// Free bytes, not frame slots, limit `room`. With `tx_capacity` 1500 the
 /// socket has 6 frame slots; one 1000-byte frame queued leaves 5 slots but
 /// 500 bytes, so `room(400)` resolves and `room(1000)` parks. The peer's ACK
