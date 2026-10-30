@@ -1898,6 +1898,33 @@ fn refused_foreign_connect_fires_armed_token() {
     });
 }
 
+/// Reconnecting an aborted socket with the same tuple on an owned (not interface) address before
+/// the Stack runs keeps the connection: the reconnect is admitted again even though its flow key
+/// is unchanged, so the next send emits its SYN from the owned address instead of resetting it.
+#[zhida_test_support::pinned_test]
+fn same_tuple_reconnect_on_owned_address_sends_syn() {
+    use smoltcp::socket::tcp::State;
+    use smoltcp::wire::Ipv4Cidr;
+
+    with_test_eal(|eal| {
+        let owned = Ipv4Address::new(10, 0, 0, 77);
+        let (fixture, mut stack, _other, handle) =
+            foreign_context_stack(eal, &[Ipv4Cidr::new(owned, 32)]);
+        stack.connect(&handle, (Side::B.ip(), 80), (owned, 49152)).unwrap();
+        stack.send().unwrap();
+        assert_eq!(sent_tcp(&fixture), [(owned, true, false)]);
+        stack.tcp_mut(&handle).abort();
+        stack.connect(&handle, (Side::B.ip(), 80), (owned, 49152)).unwrap();
+        stack.send().unwrap();
+        assert_eq!(sent_tcp(&fixture), [(owned, true, false)]);
+        assert_eq!(stack.tcp(&handle).state(), State::SynSent);
+        stack.tcp_mut(&handle).abort();
+        stack.send().unwrap();
+        assert_eq!(sent_tcp(&fixture), [(owned, false, true)]);
+        close_foreign_context_stack(fixture, stack);
+    });
+}
+
 #[zhida_test_support::pinned_test]
 fn tcp_views_carry_hardware_stamps() {
     with_test_eal(|eal| {

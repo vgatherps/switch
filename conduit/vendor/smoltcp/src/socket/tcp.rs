@@ -1152,8 +1152,9 @@ impl<'a> Socket<'a> {
         self.rx_fin_seq = None;
         self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
-        // Set again only when a new tuple is admitted, so a tuple set by connect and closed by
-        // abort before admission never inherits the previous tuple's ownership.
+        // Set again only when a new tuple is admitted (or connect sets the same tuple), so a
+        // tuple set by connect and closed by abort before admission never inherits the previous
+        // tuple's ownership.
         self.local_owned = false;
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
@@ -1246,12 +1247,16 @@ impl<'a> Socket<'a> {
 
         let local_endpoint = self.connect_local_endpoint(cx, remote_endpoint, local_endpoint)?;
 
-        self.reset();
         let tuple = Tuple {
             local: local_endpoint,
             remote: remote_endpoint,
         };
+        // The same tuple keeps its admission: its flow key is unchanged, so it is not admitted
+        // again, and the owned set never changes. Any other tuple waits for admission.
+        let local_owned = self.local_owned && self.tuple == Some(tuple);
+        self.reset();
         self.tuple = Some(tuple);
+        self.local_owned = local_owned;
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
         self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
