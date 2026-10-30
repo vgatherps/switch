@@ -458,7 +458,10 @@ fn plans() -> Vec<(Vec<Event>, bool)> {
     plans
 }
 
+/// A foreign thread per scenario and 814 runtimes: a stress test, not a Miri test. The
+/// targeted lifecycle tests cover these paths under Miri.
 #[test]
+#[cfg_attr(miri, ignore = "stress test: runs natively only")]
 fn runtime_lifecycle_matrix() {
     for (plan, drop_cleanup) in plans() {
         if excluded(&plan, drop_cleanup).is_none() {

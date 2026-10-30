@@ -302,7 +302,8 @@ fn apply(owner: &Owner, model: &Rc<Model>, event: &Event) {
 
 #[test]
 fn executor_state_walk() {
-    let (seeds, steps) = if cfg!(miri) { (3, 20) } else { (384, 60) };
+    // Under Miri one short seed: the scripted prefix covers defer, round and turn.
+    let (seeds, steps) = if cfg!(miri) { (1, 20) } else { (384, 60) };
     for seed in 1..=seeds {
         let owner = Owner(Box::into_raw(Box::new(Executor::with_capacity(0, 0, 0))));
         let model = Rc::new(Model::default());
