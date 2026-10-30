@@ -1,10 +1,12 @@
-use smoltcp::socket::tcp;
-
 /// RX mbufs reserved for the driver, staging queue and one lcore's cache.
 /// The count is max(rx_descriptors, 32) + rx_staging + floor(3 * rx_cache_size / 2).
 /// A NIC keeps its RX descriptors filled; memif copy mode needs 32 mbufs
 /// before it can receive. Staged packets still use mbufs. A DPDK cache can
 /// hold up to its flush threshold of 1.5 times its configured size.
+/// `Stack::new` refuses a smaller RX pool. Size the RX pool as this plus the
+/// received mbufs all sockets together may hold (unread data, out-of-order
+/// segments, frames the application holds); it does not grow with the
+/// socket count. Each TCP socket holds at most `tcp::rx_mbuf_budget` of them.
 ///
 /// Panics if the reserve exceeds usize.
 pub fn rx_reserve(rx_descriptors: u16, rx_staging: usize, rx_cache_size: u32) -> usize {
@@ -39,63 +41,16 @@ pub fn tx_reserve(tx_descriptors: u16, tx_pending: usize) -> usize {
 /// Each packet the PMD or the pending queue holds keeps at most one frame-pool
 /// mbuf that no socket or application counts (a frame the socket already
 /// released at ACK, or a sent UDP frame); the one extra frame means those
-/// packets can never take the last frame. Size the frame pool as this plus
-/// every TCP socket's frame limit plus the frames the application holds.
+/// packets can never take the last frame. Size the frame pool as this plus the
+/// frames all sockets and the application together may hold (queued or
+/// unacknowledged TCP data, frames from `Stack::tx_frame`); it does not grow
+/// with the socket count. Each TCP socket queues at most `tcp::tx_mbuf_budget`.
 ///
 /// Panics if the reserve exceeds usize.
 pub fn frame_reserve(tx_descriptors: u16, tx_pending: usize) -> usize {
     tx_reserve(tx_descriptors, tx_pending)
         .checked_add(1)
         .expect("frame reserve exceeds usize")
-}
-
-/// RX pool count is the reserve plus every uncapped TCP socket's RX mbuf budget.
-/// The reserve keeps the driver supplied while sockets hold received data.
-/// For capped sockets, add `tcp::rx_mbuf_budget(&config, usize::from(ip_mtu))`
-/// to the reserve instead. Use the same config for sizing and admission.
-///
-/// Panics if `ip_mtu` is below 68 or the pool count exceeds u32.
-pub fn rx_pool_count(
-    reserve: usize,
-    ip_mtu: u16,
-    recv_capacities: impl IntoIterator<Item = usize>,
-) -> u32 {
-    assert!(ip_mtu >= 68, "IP MTU must be at least 68 bytes");
-    let mut count = u32::try_from(reserve).expect("RX pool count exceeds u32");
-    for rx_capacity in recv_capacities {
-        let config = tcp::Config { rx_capacity, tx_capacity: 0, mss_cap: None };
-        let budget = u32::try_from(tcp::rx_mbuf_budget(&config, usize::from(ip_mtu)))
-            .expect("RX mbuf budget exceeds u32");
-        count = count
-            .checked_add(budget)
-            .expect("RX pool count exceeds u32");
-    }
-    count
-}
-
-/// Frame pool count is the reserve (`frame_reserve`) plus every uncapped TCP
-/// socket's TX frame limit. For capped sockets, add
-/// `tcp::tx_mbuf_budget(&config, usize::from(ip_mtu))` to the reserve instead.
-/// Frames the application holds at once from `Stack::tx_frame` come on top.
-/// Use the same config for sizing and admission.
-///
-/// Panics if `ip_mtu` is below 68 or the pool count exceeds u32.
-pub fn frame_pool_count(
-    reserve: usize,
-    ip_mtu: u16,
-    send_capacities: impl IntoIterator<Item = usize>,
-) -> u32 {
-    assert!(ip_mtu >= 68, "IP MTU must be at least 68 bytes");
-    let mut count = u32::try_from(reserve).expect("frame pool count exceeds u32");
-    for tx_capacity in send_capacities {
-        let config = tcp::Config { rx_capacity: 0, tx_capacity, mss_cap: None };
-        let budget = u32::try_from(tcp::tx_mbuf_budget(&config, usize::from(ip_mtu)))
-            .expect("TX frame limit exceeds u32");
-        count = count
-            .checked_add(budget)
-            .expect("frame pool count exceeds u32");
-    }
-    count
 }
 
 #[cfg(test)]
@@ -138,64 +93,10 @@ mod tests {
     }
 
     #[test]
-    fn rx_pool_count_covers_reserve_and_budgets() {
-        let nic = rx_reserve(1024, 32, 64);
-        assert_eq!(nic, 1024 + 32 + 96);
-        assert_eq!(
-            rx_pool_count(nic, 1500, [4096, 65536, 262144]),
-            1152 + 6 + 45 + 180
-        );
-        assert_eq!(
-            rx_pool_count(nic, 9000, [4096, 65536, 262144]),
-            1152 + 6 + 8 + 30
-        );
-        assert_eq!(rx_pool_count(nic, 1500, []), 1152);
-        assert_eq!(rx_pool_count(nic, 9000, []), 1152);
-
-        let memif = rx_reserve(64, 32, 8);
-        assert_eq!(memif, 64 + 32 + 12);
-        assert_eq!(rx_pool_count(memif, 1500, [8192, 65536]), 108 + 6 + 45);
-        assert_eq!(rx_pool_count(memif, 9000, [8192, 65536]), 108 + 6 + 8);
-        let small = rx_reserve(16, 32, 8);
-        assert_eq!(small, 32 + 32 + 12);
-        assert_eq!(rx_pool_count(small, 1500, []), 76);
+    fn rx_reserve_covers_descriptors_staging_and_cache() {
+        assert_eq!(rx_reserve(1024, 32, 64), 1024 + 32 + 96);
+        assert_eq!(rx_reserve(64, 32, 8), 64 + 32 + 12);
+        assert_eq!(rx_reserve(16, 32, 8), 32 + 32 + 12);
         assert_eq!(rx_reserve(16, 0, 1), 33);
-    }
-
-    #[test]
-    fn rx_pool_count_accepts_capacities_with_capped_budget_in_reserve() {
-        let capped = tcp::Config {
-            rx_capacity: 65536,
-            tx_capacity: 4096,
-            mss_cap: Some(536),
-        };
-        let reserve = 76 + tcp::rx_mbuf_budget(&capped, 1500);
-        let capacities = std::iter::once(0).chain(std::iter::repeat_n(65536, 2));
-        assert_eq!(rx_pool_count(reserve, 1500, capacities), 76 + 123 + 6 + 45 + 45);
-    }
-
-    #[test]
-    #[should_panic(expected = "RX pool count exceeds u32")]
-    fn rx_pool_count_refuses_overflow() {
-        rx_pool_count(u32::MAX as usize, 1500, [4096]);
-    }
-
-    #[test]
-    fn frame_pool_count_covers_reserve_and_frame_limits() {
-        let nic = frame_reserve(1024, 32);
-        assert_eq!(nic, 1057);
-        // max(ceil(B / 1460), 6) at MTU 1500; P = 8960 at 9000.
-        assert_eq!(frame_pool_count(nic, 1500, [4096, 65536, 262144]), 1057 + 6 + 45 + 180);
-        assert_eq!(frame_pool_count(nic, 9000, [4096, 65536, 262144]), 1057 + 6 + 8 + 30);
-        assert_eq!(frame_pool_count(nic, 1500, []), 1057);
-        let capped = tcp::Config { rx_capacity: 4096, tx_capacity: 20_000, mss_cap: Some(100) };
-        let reserve = nic + tcp::tx_mbuf_budget(&capped, 1500);
-        assert_eq!(frame_pool_count(reserve, 1500, [4096]), 1057 + 200 + 6);
-    }
-
-    #[test]
-    #[should_panic(expected = "frame pool count exceeds u32")]
-    fn frame_pool_count_refuses_overflow() {
-        frame_pool_count(u32::MAX as usize, 1500, [4096]);
     }
 }

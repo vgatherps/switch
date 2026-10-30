@@ -1,13 +1,14 @@
 //! The Stack's TX frame pool on net_ring: `Stack::tx_frame`, `Stack::new`'s
-//! frame-pool admission, kit descriptor sizing, and frames outliving the Stack
-//! and the Port.
+//! frame-pool and RX-pool floors, kit descriptor sizing, and frames outliving
+//! the Stack and the Port.
 
 use std::process::Command;
 
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    tx_reserve, Port, PortError, Stack, StackConfig, StackError, DEFAULT_NEIGHBOR_CAPACITY,
+    rx_reserve, tx_reserve, Port, PortError, Stack, StackConfig, StackError,
+    DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_test_kit::ring_port::{self, RingPort};
 use zhida_test_kit::with_eal;
@@ -104,6 +105,35 @@ fn frame_pool_admission_refuses() {
                 }
                 Ok(stack) => {
                     assert_eq!(count, 25);
+                    finish(fixture, stack.into_port());
+                }
+            }
+        }
+    });
+}
+
+/// An RX pool one below `rx_reserve` (16 descriptors floored at 32, staging 8,
+/// cache 8: 52) is refused with the Port returned unchanged; at the reserve the
+/// Stack is built.
+#[zhida_test_support::pinned_test]
+fn rx_pool_floor_refuses() {
+    with_eal(|eal| {
+        assert_eq!(rx_reserve(16, 8, 8), 52);
+        for count in [51, 52] {
+            let fixture = RingPort::new("rx_floor", 16, 16);
+            let mut port_config = fixture.config();
+            port_config.rx_pool.count = count;
+            let port = fixture.open_with(eal, port_config);
+            let identity = format!("{port:?}");
+            match Stack::new(port, config(8), T) {
+                Err((port, error)) => {
+                    assert_eq!(count, 51);
+                    assert_eq!(error, StackError::RxPoolTooSmall { count: 51, required: 52 });
+                    assert_eq!(format!("{port:?}"), identity);
+                    finish(fixture, port);
+                }
+                Ok(stack) => {
+                    assert_eq!(count, 52);
                     finish(fixture, stack.into_port());
                 }
             }

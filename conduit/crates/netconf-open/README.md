@@ -8,7 +8,7 @@ Used by `nic-runner`. Depends on [`zhida-netconf`](../netconf/README.md), [`dpdk
 
 - `unsafe fn open(&Config, &Sizing, &mut impl FnMut() -> Instant) -> Result<Opened, OpenError>`: builds the EAL arguments from the config (main lcore on the one allowed CPU, `--file-prefix`, `-a <pci>,<devargs>` or `--vdev`), initializes EAL, sizes the pools, picks offloads, opens the `Port` and `Stack` (with the config's `owned_ipv4`), waits for link, and resolves the gateway if one is configured. The safety contract is in the doc comment.
 - `Opened { stack, eal, report }` and `OpenReport` (its `Display` prints the lines `zhida-nic` shows: link status, `gateway: <ip> at <mac> after <n> ms`, ...). `OpenError` names the failing step.
-- `Sizing`: required fields `tcp_rx_frames`, `udp_rx_datagrams`, `max_sockets` and `max_udp_sockets` (zero disables UDP).
+- `Sizing`: required fields `rx_share` and `frame_share` (mbufs all sockets together may hold beyond the driver reserves; nothing is reserved per socket), `max_sockets` and `max_udp_sockets` (zero disables UDP).
 - `offloads`: resolves `Offloads::Auto` and explicit settings against what the PMD advertises.
 
 `open` fails with `OpenError::NotPinned` unless the process may run on exactly one CPU, so run under `taskset -c N` or `docker --cpuset-cpus=N`. The setup code in [docs/USAGE.md](../../docs/USAGE.md) is `examples/setup.rs`, and a test fails if they differ.

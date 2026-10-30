@@ -82,8 +82,8 @@ impl Drop for TcpHandle {
 /// Access it through `&handle` on the Stack that made it. `Stack::remove_udp`
 /// consumes it and removes the socket immediately. Dropping it queues cleanup
 /// at the start of the Stack's next `turn`, `receive`, `send`,
-/// `add_tcp` or `add_udp`, freeing the port binding and RX budget.
-/// Datagrams the application holds stay valid and count against RX admission
+/// `add_tcp` or `add_udp`, freeing the port binding.
+/// Datagrams the application holds stay valid and keep their RX mbufs
 /// until dropped. This handle holds an Rc and is single-threaded, not Send.
 ///
 /// ```compile_fail,E0382

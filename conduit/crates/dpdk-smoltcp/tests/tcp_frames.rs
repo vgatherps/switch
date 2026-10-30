@@ -1,7 +1,7 @@
 //! TCP frames on net_ring, with the test as the TCP peer: who frees a sent
 //! frame and when, the mbuf and wire bytes of each zero-copy and copy case,
-//! one frame broadcast over TCP sockets, a socket outliving its Stack, the
-//! frame pool's admission at `add_tcp`, and that no other TX packet is taken
+//! one frame broadcast over TCP sockets, a socket outliving its Stack, sockets
+//! sharing an exhausted frame pool, and that no other TX packet is taken
 //! for a frame send. Every test ends with every pool idle and each object
 //! returned once.
 
@@ -17,7 +17,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     TcpRepr, TcpSeqNumber,
 };
 use dpdk_smoltcp::{
-    frame_reserve, rx_pool_count, rx_reserve, AddTcpError, Stack, StackConfig, TcpHandle, Turn,
+    frame_reserve, rx_reserve, ReadySide, Stack, StackConfig, TcpHandle, Turn,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_dpdk_sys::{
@@ -234,16 +234,13 @@ fn pool_named(name: &str, suffix: &str) -> *mut rte_mempool {
 
 impl Host {
     /// IP MTU 1500, TX ring and descriptors 16, tx_pending 8, kit TX pool,
-    /// an RX pool for `max_sockets` 4 KiB sockets; the frame pool holds
+    /// an RX pool of its reserve plus six mbufs per socket; the frame pool holds
     /// `frame_pool` frames when given, else the kit's 63.
     fn new(eal: &dpdk_smoltcp::Eal, name: &str, max_sockets: usize, frame_pool: Option<u32>) -> Self {
         let fixture = RingPort::new(name, RING, RING);
         let mut config = fixture.config();
-        config.rx_pool.count = rx_pool_count(
-            rx_reserve(config.rx_descriptors, 8, config.rx_pool.cache_size),
-            config.mtu,
-            std::iter::repeat_n(4096, max_sockets),
-        );
+        let reserve = rx_reserve(config.rx_descriptors, 8, config.rx_pool.cache_size);
+        config.rx_pool.count = u32::try_from(reserve + 6 * max_sockets).unwrap();
         if let Some(count) = frame_pool {
             config.frame_pool.count = count;
         }
@@ -771,35 +768,107 @@ fn tcp_frame_from_other_stack_is_foreign() {
     });
 }
 
-/// `add_tcp` admits a socket only while the frame pool covers
-/// `frame_reserve` plus every TCP socket's frame limit; removing a socket
-/// frees its share.
+/// Sockets share the frame pool: three are added to a pool of `frame_reserve` plus one
+/// socket's frame limit. With the application holding all but three frames, one socket's
+/// 4096-byte send takes them; the second socket's send then queues nothing (`Ok(0)`) and
+/// `tx_frame` has none, until the first socket's data is ACKed and its frames return.
 #[zhida_test_support::pinned_test]
-fn add_tcp_refuses_when_frame_pool_cannot_back_frame_limit() {
+fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
     with_eal(|eal| {
-        let reserve = frame_reserve(RING as u16, PENDING);
-        let pool = reserve + 2 * SMALL_FRAMES;
-        let mut host = Host::new(eal, "framadm", 3, Some(pool as u32));
-        let first = host.stack.add_tcp(small_socket()).unwrap();
-        let _second = host.stack.add_tcp(small_socket()).unwrap();
-        assert_eq!(
-            host.stack.add_tcp(small_socket()).unwrap_err(),
-            AddTcpError::TxFramePoolTooSmall {
-                config: small_socket(),
-                required: reserve + 3 * SMALL_FRAMES,
-                pool,
-            }
-        );
-        host.stack.remove_tcp(first);
+        let pool = frame_reserve(RING as u16, PENDING) + SMALL_FRAMES;
+        let mut host = Host::new(eal, "framshr", 3, Some(pool as u32));
+        let first = host.connect(LOCAL_PORT, small_socket());
+        let second = host.connect(LOCAL_PORT + 1, small_socket());
         let third = host.stack.add_tcp(small_socket()).unwrap();
         assert_eq!(host.stack.tcp(&third).tx_frame_cap(), SMALL_FRAMES);
+        let mut held = Vec::new();
+        while let Some(frame) = host.stack.tx_frame() {
+            held.push(frame);
+        }
+        assert_eq!(held.len(), pool);
+        held.truncate(pool - 3);
+
+        let fill = pair::pattern(4096, 9);
+        assert_eq!(host.stack.tcp_mut(&first.handle).send_slice(&fill), Ok(4096));
+        assert_eq!(host.stack.tcp_mut(&second.handle).send_slice(b"waits"), Ok(0));
+        assert_eq!(host.stack.tcp(&second.handle).send_queue(), 0);
+        assert!(host.stack.tx_frame().is_none());
+        host.turn();
+        let sent = host.take();
+        let bytes: Vec<u8> = sent.iter().flat_map(|sent| sent.tcp().payload.to_vec()).collect();
+        assert_eq!(bytes, fill);
+        drop(sent);
+        // The TX ring released its references; the unacknowledged data still holds the frames.
+        assert_eq!(host.stack.tcp_mut(&second.handle).send_slice(b"waits"), Ok(0));
+
+        host.ack(&first, first.seq + 4096);
+        assert_eq!(host.stack.tcp_mut(&second.handle).send_slice(b"waits"), Ok(5));
+        host.turn();
+        let sent = host.take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].tcp().payload, b"waits");
+        drop(sent);
+        host.ack(&second, second.seq + 5);
+        drop(held);
+        drop(third);
         host.finish();
     });
 }
 
-/// The application holds every frame beyond the sockets' reserved share: the
-/// peer's data is still ACKed, an ARP request is still answered, and the
-/// socket still fills all its frame slots.
+/// With the application holding the rest, sockets A and C take the shared frame pool's last
+/// frames. B's `send_slice` returns `Ok(0)` and
+/// B's application arms B's TX token; D is in the same wait and is removed. When the peer ACKs
+/// A's data, the next turn finds free frames and fires B's token, with no retry from B; B's send
+/// then goes out. Removing D took it off the wait.
+#[zhida_test_support::pinned_test]
+fn frame_pool_wait_fires_the_tx_token_when_frames_return() {
+    with_eal(|eal| {
+        let pool = frame_reserve(RING as u16, PENDING);
+        let mut host = Host::new(eal, "framwake", 4, Some(pool as u32));
+        let a = host.connect(LOCAL_PORT, small_socket());
+        let c = host.connect(LOCAL_PORT + 1, small_socket());
+        let b = host.connect(LOCAL_PORT + 2, small_socket());
+        let d = host.connect(LOCAL_PORT + 3, small_socket());
+        // The app holds all but 2 * 3 frames; A's and C's 4096-byte sends take those.
+        let mut held = Vec::new();
+        while let Some(frame) = host.stack.tx_frame() {
+            held.push(frame);
+        }
+        held.truncate(pool - 6);
+        let fill = pair::pattern(4096, 13);
+        assert_eq!(host.stack.tcp_mut(&a.handle).send_slice(&fill), Ok(4096));
+        assert_eq!(host.stack.tcp_mut(&c.handle).send_slice(&fill), Ok(4096));
+        assert!(host.stack.tx_frame().is_none());
+        assert_eq!(host.stack.tcp_mut(&b.handle).send_slice(b"b waits"), Ok(0));
+        assert_eq!(host.stack.tcp_mut(&d.handle).send_slice(b"d waits"), Ok(0));
+        let key = host.stack.tcp_ready_key(&b.handle);
+        host.stack.arm_tcp(key, ReadySide::Tx, 7);
+        host.stack.remove_tcp(d.handle);
+        host.turn();
+        drop(host.take());
+        assert_eq!(host.stack.pop_fired(), None, "A's and C's frames are not acknowledged yet");
+
+        host.ack(&a, a.seq + 4096);
+        // The ACK freed A's frames; the next turn finds one and fires B's token.
+        host.turn();
+        assert_eq!(host.stack.pop_fired(), Some(7));
+        assert_eq!(host.stack.pop_fired(), None);
+        assert_eq!(host.stack.tcp_mut(&b.handle).send_slice(b"b waits"), Ok(7));
+        host.turn();
+        let sent = host.take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].tcp().payload, b"b waits");
+        drop(sent);
+        host.ack(&b, b.seq + 7);
+        host.ack(&c, c.seq + 4096);
+        drop(held);
+        host.finish();
+    });
+}
+
+/// The application holds every frame but the reserve and one socket's frame limit:
+/// the peer's data is still ACKed, an ARP request is still answered, and the socket
+/// still fills all its frame slots.
 #[zhida_test_support::pinned_test]
 fn app_held_saturation_leaves_ack_and_arp_working() {
     with_eal(|eal| {

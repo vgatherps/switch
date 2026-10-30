@@ -70,9 +70,8 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
         mss_cap: Some(config.path_mtu(server) - 40),
     };
     let sizing = zhida_open::Sizing {
-        tcp_rx_frames: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
-        tcp_tx_frames: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
-        udp_rx_datagrams: 0,
+        rx_share: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
+        frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,
         rx_staging: 32,
@@ -95,19 +94,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Build the TCP config before calling `open`: `open` sizes the RX and frame pools, and they must hold
-every socket's receive budget and TX frame limit. Use the same config, including its MSS cap, for
-sizing and admission. `Sizing` has no defaults; fill all nine fields:
+`open` sizes the RX and frame pools as the driver's reserve plus a share every socket draws on;
+nothing is reserved per socket and `add_tcp` never refuses a socket for pool size. Size each share
+for what all sockets together may hold at once, not sockets x window. Here one socket may fill its
+window each way. `Sizing` has no defaults; fill all eight fields:
 
 | field | what to put there |
 |---|---|
-| `tcp_rx_frames` | sum of `tcp::rx_mbuf_budget(&config, mtu)` over every TCP config you will add (see "Pool sizing" below) |
-| `tcp_tx_frames` | sum of `tcp::tx_mbuf_budget(&config, mtu)` over every TCP config you will add, plus the frames the application holds at once from `Stack::tx_frame` |
-| `udp_rx_datagrams` | sum of `UdpConfig::rx_queue` over every UDP socket you will add |
+| `rx_share` | RX mbufs all sockets together may hold: unread TCP data, out-of-order segments, queued UDP datagrams, frames the application holds (see "Pool sizing" below) |
+| `frame_share` | frames all TCP send queues and the application (`Stack::tx_frame`) may hold at once |
 | `max_sockets`, `max_udp_sockets`, `rx_staging`, `tx_pending`, `neighbor_capacity` | passed to the `StackConfig` fields of the same name ("Configure the Stack" below) |
-
-A socket that does not fit gets `AddTcpError::RxPoolTooSmall` or `AddTcpError::TxFramePoolTooSmall`
-from `add_tcp`.
 
 `open` checks the process is pinned to one CPU, initializes EAL (`--lcores=0@cpu`, the config's file
 prefix, the PCI address or vdev, then `eal.extra`), checks the PCI MAC against the config, resolves
@@ -336,13 +332,15 @@ both traffic directions. `Stack::new(port, config, now)` consumes the Port on su
 returns `(Port, StackError)`. Invalid configuration or negative start time gives `InvalidConfig`;
 IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` from the path table,
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
-`TxPoolTooSmall { count, required }`, and a frame pool smaller than `frame_reserve(negotiated TX
-descriptors, tx_pending)` gives `TxFramePoolTooSmall { count, required }`. Creation does not check
-the RX pool against sockets added afterwards.
+`TxPoolTooSmall { count, required }`, a frame pool smaller than `frame_reserve(negotiated TX
+descriptors, tx_pending)` gives `TxFramePoolTooSmall { count, required }`, and an RX pool smaller
+than `rx_reserve(negotiated RX descriptors, rx_staging, RX cache size)` gives
+`RxPoolTooSmall { count, required }`. These are the only pool checks: sockets added afterwards
+share the pools and are never refused for pool size.
 
 ## Pool sizing
 
-### RX reserve and socket budgets
+### RX reserve and the shared RX share
 
 Socket receive data occupies RX mbufs. Size the RX pool for held data as well as the driver's
 working space. `rx_reserve(rx_descriptors, rx_staging, rx_cache_size) -> usize` computes:
@@ -356,32 +354,45 @@ one lcore's DPDK cache flush threshold. The 32 minimum also covers memif copy RX
 it allocates 32 mbufs per call and receives nothing if that allocation fails.
 `crates/memif-bench/src/memif.rs` documents additional memif room and disconnect requirements.
 
-`rx_pool_count(reserve, ip_mtu, recv_capacities) -> u32` adds uncapped TCP socket budgets:
+Size the RX pool as `rx_reserve(...)` plus a share: the RX mbufs all sockets together may hold at
+once (unread in-order data, out-of-order segments, queued UDP datagrams, frames and datagrams the
+application holds). Every TCP and UDP socket draws on the same share; none is reserved per socket,
+so the share does not grow with the socket count. As with the kernel's per-socket receive buffer,
+each socket is capped instead: a TCP socket holds at most `tcp::rx_mbuf_budget(&config, ip_mtu)`
+RX frames,
 
 ```text
-reserve + sum(max(ceil(recv_capacity / (ip_mtu - 40)), 6))
+max(ceil(rx_capacity / min(ip_mtu - 40, mss_cap)), 6)
 ```
 
-Each receive capacity is in bytes, not packets. Six is the minimum frame budget even for a small or
-zero-capacity socket. For MTU 1500, a 65536-byte uncapped receive buffer charges 45 mbufs. For MTU
-9000, it charges 8. These are admission budgets, not throughput estimates.
+and advertises a window of at most that many frames' worth of payload and at most `rx_capacity`
+bytes. For MTU 1500, a 65536-byte uncapped receive buffer is capped at 45 frames; for MTU 9000, at
+8. A UDP socket holds at most `UdpConfig::rx_queue` datagrams, queued or held. A drained `TcpFrame`
+keeps its slot in the socket's cap, and a `UdpDatagram` taken from the queue keeps its slot in
+`rx_queue`, until the application drops it; frames and datagrams held after their socket is
+removed keep their mbufs until dropped.
 
-For a socket with an MSS cap, add `tcp::rx_mbuf_budget(&config, usize::from(ip_mtu))` to the
-reserve instead, using the same config for sizing and admission. Admission computes the budget with
-`min(ip_mtu - 40, configured MSS cap)` bytes per frame. Add every UDP socket's
-`UdpConfig::rx_queue` to the same RX pool count; TCP and UDP share the pool. A drained `TcpFrame`
-keeps its slot in the socket's frame budget, and a `UdpDatagram` taken from the queue keeps its
-slot in `rx_queue`, until the application drops it. `Stack::add_tcp` charges the new socket's frame
-budget beside the reserve and existing TCP and UDP budgets. `Stack::add_udp` charges its receive
-queue capacity. A Closed TCP socket keeps its slot and budget until removed or, after its handle is
-dropped, reaped. A removed TCP or UDP socket releases its budget, but frames and datagrams held by
-the application count against future admission until dropped.
+When the share runs out, the driver has no mbuf for new arrivals and drops them (the test kit's
+`Link` counts them in `pool_empty`); the stack never sees those packets and TCP peers retransmit.
+Reading data and dropping held frames returns mbufs. The Stack computes its reserve from the
+negotiated RX descriptor count, which the PMD may raise; leave room for that.
 
-`AddTcpError::RxPoolTooSmall { config, required, pool }` means the pool's object count is smaller
-than the full admission requirement, not that an allocation failed. Both admission errors return the
-config unchanged. `AddUdpError::RxPoolTooSmall` reports the same failure without a socket value.
-The Stack computes its reserve from the negotiated RX descriptor count, which the PMD may raise;
-leave room for that.
+Out-of-order segments are freed only when the gap before them fills, so sockets holding them
+could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. As Linux
+prunes the receiving socket's out-of-order queue under memory pressure, each `turn` and `receive`
+whose RX burst staged frames checks whether fewer RX mbufs are free than one refill of the RX
+ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
+refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
+receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
+at once; while that fails ENA still returns completed packets, but stops receiving once the
+buffers already posted run out. So the check must fire while a refill can still succeed.
+Out-of-order data is kept only while at least that
+many mbufs are free, so size the RX share for it on top of what sockets hold.
+While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
+out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
+ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
+resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
+blocks, and the sender must then resend it too.
 
 ### TX pool
 
@@ -409,12 +420,17 @@ dropping a frame returns it. Frame-pool mbufs may be shared (refcount above 1) b
 single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame
 pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pending queue holds keeps
 at most one frame no socket or application counts, and the extra frame means those packets can never
-take the last one. `Stack::add_tcp` also charges each TCP socket's frame limit,
-`tcp::tx_mbuf_budget(&config, ip_mtu)` (one frame per segment payload of `tx_capacity`, at least
-six), and refuses a socket whose limit does not fit beside `frame_reserve` and the sockets already
-added with `AddTcpError::TxFramePoolTooSmall { config, required, pool }`; removing a socket releases
-its share. Frames the application holds come on top. `net_ring` ports opened by the test kit use
-their TX ring size as the TX descriptor count.
+take the last one. A NIC PMD frees sent frames only on later TX, so without that floor a pool could
+sit empty with every frame held by the PMD. Size the frame pool as `frame_reserve(...)` plus the
+frames all TCP send queues and the application may hold at once; sockets share them. Each TCP
+socket queues at most `tcp::tx_mbuf_budget(&config, ip_mtu)` frames (one per segment payload of
+`tx_capacity`, at least six). With the pool empty, `send_slice` queues nothing and returns `Ok(0)`,
+`udp_send` returns `WouldBlock` and `tx_frame` returns `None`; frames return when the peer ACKs
+queued data and the PMD releases sent frames. A socket whose `send_slice` found the pool empty
+is woken (its armed readiness tokens fire) at the start of the first `turn`, `receive` or `send` that finds a free
+frame; `tx_frame` callers get no such wake. TCP egress, retransmissions included, takes no
+frame-pool frame. `net_ring` ports opened by the test kit use their TX ring size as the TX
+descriptor count.
 
 To send TCP data without a copy, fill a frame and pass it by value:
 `stack.tcp_send_frame(&handle, frame)` queues it, and `Err((frame, error))` returns it untouched
@@ -583,7 +599,7 @@ TCP timestamp options are not negotiated or emitted. Peer timestamp offers are i
 
 ## TCP
 
-### Build and admit a socket
+### Build and add a socket
 
 Pass receive and transmit byte capacities and an optional MSS cap to `add_tcp`:
 
@@ -602,10 +618,11 @@ stack.listen(&handle, 7000)?;
 
 `rx_capacity` sets a byte capacity without allocating a payload byte ring. Received payload stays in
 owned RX mbufs until the application drains and drops it. The byte capacity sets the advertised
-window and window scale; the admitted frame count also limits how much the socket can hold. After
-admission the socket queues sent data as frames from the frame pool: `tx_capacity` bytes and
+window and window scale; the socket's RX frame cap (`tcp::rx_mbuf_budget`) also limits how much it
+can hold. The socket queues sent data as frames from the shared frame pool: `tx_capacity` bytes and
 `tcp::tx_mbuf_budget(&config, ip_mtu)` frames at most, unacknowledged data included. Many tiny
-writes can reach the frame limit before the byte limit.
+writes can reach the frame limit before the byte limit. Both are per-socket limits; the mbufs come
+from pools every socket shares ("Pool sizing").
 
 Each received segment uses its own buffer unless it is a small in-order one appended to the last
 frame, so a peer sending many tiny segments can fill a socket's buffers before its byte window;
@@ -613,14 +630,14 @@ refused segments are counted by `rx_refused_segments()`.
 
 The config's `mss_cap` limits the advertised MSS and outgoing segment payloads. `None` applies no
 application cap; local MTU and peer MSS apply regardless. The cap survives reset/reconnect and
-cannot be changed after admission. `set_initial_window(bytes)` sets Cubic's initial congestion
+cannot be changed after `add_tcp`. `set_initial_window(bytes)` sets Cubic's initial congestion
 window for the handshake and survives reset/reconnect. The default is 1048576 bytes. Set it before
 connect/listen. The peer's advertised window limits transmission. `set_rto` takes
 `smoltcp::time::Duration`; `set_ack_delay` takes `Option<smoltcp::time::Duration>` (see Time rules).
 
 `add_tcp(config) -> Result<TcpHandle, AddTcpError>` returns the config unchanged if TCP slots are
-full or RX admission fails. Configure the admitted socket through `stack.tcp_mut(&handle)`, then
-call `stack.connect` or `stack.listen`. Admission alone leaves the socket closed.
+full; pool size never refuses a socket. Configure the added socket through `stack.tcp_mut(&handle)`,
+then call `stack.connect` or `stack.listen`. Adding alone leaves the socket closed.
 
 ### Handles
 
@@ -634,7 +651,7 @@ afterwards does nothing.
 Dropping a handle queues cleanup. The Stack processes the queue at the start of its next `turn`,
 `receive`, `send`, `add_tcp`, `add_udp`, or `remove_tcp`; `flush`
 does not process it, and `poll_at` reports the current time while it is non-empty. A dropped UDP
-handle frees its port binding, queued datagrams, and RX budget. A dropped TCP handle closes the
+handle frees its port binding and queued datagrams. A dropped TCP handle closes the
 connection like Linux `close()`:
 
 | State at drop | Result |
@@ -649,7 +666,7 @@ connection like Linux `close()`:
 An orphan's RST is attempted once during egress and not retried on failure (for example no TX
 capacity). The orphan keeps its slot, so `add_tcp` can return `SocketsFull`, until it is Closed with
 its remote endpoint cleared (for an abortive drop, after egress attempts the RST); the next cleanup
-call then frees the slot and budget. In FinWait1 or FinWait2, acceptable new payload or an
+call then frees the slot. In FinWait1 or FinWait2, acceptable new payload or an
 out-of-order FIN makes an orphan reply RST and close. An orphan in FinWait2 closes after 60 s; an
 orphan that receives the peer FIN waits the usual 10 s in TimeWait. An orphan closes silently at an
 RTO or zero-window-probe expiry once its backoff count reaches 8 (Linux `tcp_orphan_retries`);
@@ -719,7 +736,7 @@ loop {
 
 `TcpFrame` owns its RX mbuf. `payload()` gives `&[u8]`, `payload_mut()` gives `&mut [u8]`, and
 `rx_timestamp()` gives the raw hardware stamp (see Hardware RX timestamps). A frame stays valid after
-socket removal, handle drop, or Stack teardown, but it occupies the socket's frame budget, and
+socket removal, handle drop, or Stack teardown, but it occupies the socket's RX frame cap, and
 therefore the receive window, until dropped. Copy bytes out if a parser needs them longer. Dropping
 a frame that makes a window update due queues the socket for a readiness check, so `poll_at`
 reports the current time and the next egress attempts to send the update, subject to TX capacity.
@@ -763,9 +780,9 @@ emit one RST, subject to TX capacity, and forgets the tuple after successful emi
 socket or unconnected listener has no remote endpoint to reset. To send the RST, drive egress before removing or reconnecting the
 socket. `abort` itself does not transmit or discard queued receive frames.
 
-`remove_tcp(handle)` removes the socket immediately, freeing the slot and budget, and returns
+`remove_tcp(handle)` removes the socket immediately, freeing the slot, and returns
 nothing. It discards queued receive data and sends neither FIN nor RST. Frames already drained stay
-valid and count against admission until dropped. To close gracefully instead, `close()` and keep
+valid and keep their RX mbufs until dropped. To close gracefully instead, `close()` and keep
 driving, or drop the handle.
 
 Neither `abort`, `remove_tcp`, nor a handle drop cancels TCP frames already in the shared pending
@@ -862,8 +879,8 @@ drop(datagram);
 `payload_mut()` gives `&mut [u8]`. A held datagram consumes receive credit even when
 `rx_queued() == 0`. Datagrams arriving at the credit limit are dropped and counted; UDP does not
 backpressure the sender. `udp(&handle).stats()` reads the socket's `rx_dropped_full` count. `remove_udp(handle)` consumes the handle, frees queued datagrams, unbinds the
-port, and releases the budget immediately; dropping the handle does the same at the next cleanup
-call (see Handles). Held datagrams remain charged until dropped. Do not replace a socket through
+port immediately; dropping the handle does the same at the next cleanup
+call (see Handles). Held datagrams keep their RX mbufs until dropped. Do not replace a socket through
 `udp_mut`.
 
 Neither `remove_udp` nor a handle drop cancels datagram frames already in the shared pending FIFO.
@@ -979,23 +996,22 @@ data rooms, unsupported or changed offloads, invalid adjusted descriptors, and s
 error contains `PoolCreateError`: `CacheDisabled`, `DataRoomTooSmall { provided, minimum }`, `Dpdk {
 errno }`, or `OwnerCacheUnavailable { lcore_id }`. A valid lcore-local production cache is required.
 
-### Stack admission and drive errors
+### Stack creation, socket add and drive errors
 
 `StackError::InvalidConfig(reason)` covers configuration validation and negative start time.
 `IpMtuBelowIpv4Minimum { mtu }` rejects MTU below 68 during creation (68-87 is `InvalidConfig`). `TxPoolTooSmall { count,
-required }` rejects a TX pool below `tx_reserve` during creation, and `TxFramePoolTooSmall { count,
-required }` a frame pool below `frame_reserve`. `TimeWentBackwards { last, now
+required }` rejects a TX pool below `tx_reserve` during creation, `TxFramePoolTooSmall { count,
+required }` a frame pool below `frame_reserve`, and `RxPoolTooSmall { count, required }` an RX pool
+below `rx_reserve`. `TimeWentBackwards { last, now
 }` rejects an earlier ingress-drive time before doing work. `Port(error)` propagates a Port
 burst/flush error. `Stack::new` returns its Port with the error; drive methods return the error
-directly. `AddTcpError::SocketsFull(config)` means all
-TCP slots are occupied. `RxPoolTooSmall { config, required, pool }` means admission would exceed the
-RX pool count. Both return the unchanged config.
+directly. `AddTcpError::SocketsFull(config)` means all TCP slots are occupied; it returns the
+unchanged config.
 `AddUdpError::Full` means all UDP slots are occupied, including when UDP is disabled. `PortInUse`
 means a socket is already bound to that local address (or all-IP) and port. `InvalidConfig(reason)`
 rejects port zero or receive queue zero. `Unaddressable` rejects a `local_addr` the Stack does not
-own. `RxPoolTooSmall { required, pool }` rejects the shared RX requirement. The order is
-`RxPoolTooSmall`, `InvalidConfig`, `Unaddressable`, `PortInUse`, `Full`, so a request with
-multiple problems can report pool insufficiency first. A refused socket changes nothing.
+own. The order is `InvalidConfig`, `Unaddressable`, `PortInUse`, `Full`. A refused socket changes
+nothing.
 
 ### Socket errors
 
@@ -1041,11 +1057,11 @@ request goes out on a later send. UDP receive reports drops through counters, no
 These panic:
 
 - using a handle with a Stack that did not create it
-- TCP admission with receive capacity above 1 GiB; admission or budget sizing with `mss_cap: Some(0)`
+- adding a TCP socket with receive capacity above 1 GiB; adding or `rx_mbuf_budget` with `mss_cap: Some(0)`
 - `set_initial_window(0)`, `set_rto(Duration::ZERO)` or RTO above 60 seconds, `set_ack_delay` above
   60 seconds, `set_hop_limit(Some(0))`
-- `rx_mbuf_budget` and `rx_pool_count` below MTU 68
-- overflow in pool-count/reserve arithmetic, frame-budget conversions, or timer arithmetic near the
+- `rx_mbuf_budget` and `tx_mbuf_budget` below MTU 68
+- overflow in reserve arithmetic, frame-budget conversions, or timer arithmetic near the
   integer limit; excessive `neighbor_capacity` at startup
 - a TX-done cleanup failure other than `-ENOTSUP` when a drive operation allocates a TX packet
 - with TX checksum offload, the PMD's checksum preparation refusing a frame during flush (Zhida does

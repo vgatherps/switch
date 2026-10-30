@@ -13,7 +13,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress,
     IpProtocol, Ipv4Packet, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve, Turn};
+use dpdk_smoltcp::{rx_reserve, Turn};
 
 /// A's ARP request for B's address.
 fn arp_request() -> Vec<u8> {
@@ -230,15 +230,12 @@ fn with_ports_rx_burst_lets_one_turn_take_more_than_eight_frames() {
         let configs = [config(Side::A), config(Side::B)];
         let mut pair = Pair::with_ports(eal, ["kfwa", "kfwb"], configs, T0, 64, |side, port| {
             port.rx_burst = 32;
-            port.rx_pool.count = rx_pool_count(
-                rx_reserve(
-                    port.rx_descriptors,
-                    configs[side.index()].rx_staging,
-                    port.rx_pool.cache_size,
-                ),
-                port.mtu,
-                [],
-            );
+            port.rx_pool.count = u32::try_from(rx_reserve(
+                port.rx_descriptors,
+                configs[side.index()].rx_staging,
+                port.rx_pool.cache_size,
+            ))
+            .unwrap();
         });
         let now = pair.now();
         pair.inject(Side::B, &vec![arp_request(); 20]);

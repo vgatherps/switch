@@ -122,6 +122,10 @@ impl Device {
         self.tx.len()
     }
 
+    pub(crate) fn rx_pool_low(&self) -> bool {
+        self.port.rx_pool_low()
+    }
+
     /// Release every staged, pending and spare packet, then return the Port.
     pub(crate) fn into_port(self) -> Port {
         let Self {

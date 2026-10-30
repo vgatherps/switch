@@ -22,7 +22,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as NetInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, IpEndpoint, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    frame_reserve, rx_pool_count, rx_reserve, Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
+    frame_reserve, rx_reserve, Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use memif_bench::memif::MemifVdev;
 use memif_bench::workload::{
@@ -167,6 +167,12 @@ fn bare_stack(port: Port, host: u8) -> ManuallyDrop<Stack> {
 
 fn bare_socket() -> tcp::Config {
     tcp::Config { rx_capacity: 8192, tx_capacity: 8192, mss_cap: None }
+}
+
+/// The RX reserve plus one `bare_socket`'s RX frame cap.
+fn one_socket_rx_pool(config: &dpdk_smoltcp::PortConfig<'_>) -> u32 {
+    let reserve = rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size);
+    u32::try_from(reserve + tcp::rx_mbuf_budget(&bare_socket(), usize::from(config.mtu))).unwrap()
 }
 
 fn net_time(origin: Instant, now: Instant) -> NetInstant {
@@ -574,11 +580,7 @@ fn peer_detects_corrupted_byte() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.client_rx.as_c_str() {
-            config.rx_pool.count = rx_pool_count(
-                rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size),
-                config.mtu,
-                [8192],
-            );
+            config.rx_pool.count = one_socket_rx_pool(&config);
         }
         config
     });
@@ -630,11 +632,7 @@ fn client_detects_corrupted_echo() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.server_rx.as_c_str() {
-            config.rx_pool.count = rx_pool_count(
-                rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size),
-                config.mtu,
-                [8192],
-            );
+            config.rx_pool.count = one_socket_rx_pool(&config);
         }
         config
     });
@@ -687,11 +685,7 @@ fn peer_echo_leaves_in_the_poll_that_received_the_request() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.client_rx.as_c_str() {
-            config.rx_pool.count = rx_pool_count(
-                rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size),
-                config.mtu,
-                [8192],
-            );
+            config.rx_pool.count = one_socket_rx_pool(&config);
         }
         config
     });

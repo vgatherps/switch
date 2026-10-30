@@ -1,6 +1,6 @@
 use zhida_test_kit::pair::drain_bytes;
 use zhida_test_kit::many;
-use zhida_test_kit::pair::{self, tcp_socket_sized, Pair, Side, T0};
+use zhida_test_kit::pair::{self, pool_count, tcp_socket_sized, windows, Pair, Side, T0};
 use zhida_test_kit::peers;
 use zhida_test_kit::ring_port::{arp, RingPort};
 use zhida_test_kit::with_eal;
@@ -10,7 +10,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Cidr,
     Ipv4Address, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr,
 };
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, NoRoute, Stack, StackConfig, StackError, DEFAULT_NEIGHBOR_CAPACITY};
 
 fn request(ip: Ipv4Address) -> Vec<u8> {
@@ -50,20 +50,12 @@ fn reconnect(eal: &Eal, p: usize, neighbor_capacity: usize) -> [(usize, Duration
         64,
         |side, port| {
             port.rx_burst = 32;
-            port.rx_pool.count = rx_pool_count(
-                rx_reserve(
-                    port.rx_descriptors,
-                    configs[side.index()].rx_staging,
-                    port.rx_pool.cache_size,
-                ),
-                port.mtu,
-                std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
-            );
-            port.frame_pool.count = frame_pool_count(
-                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                port.mtu,
-                std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
-            );
+            let full = windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 }));
+            let reserve =
+                rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size);
+            port.rx_pool.count = pool_count(reserve, full);
+            port.frame_pool.count =
+                pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), full);
             port.tx_pool.count = 127;
         },
     );
@@ -187,14 +179,9 @@ fn zero_neighbor_capacity_is_invalid_config() {
         let fixture = RingPort::new("nbrzero", 16, 16);
         let valid = pair::config(Side::A);
         let mut port_config = fixture.config();
-        port_config.rx_pool.count = rx_pool_count(
-            rx_reserve(
-                port_config.rx_descriptors,
-                valid.rx_staging,
-                port_config.rx_pool.cache_size,
-            ),
-            port_config.mtu,
-            [],
+        port_config.rx_pool.count = pool_count(
+            rx_reserve(port_config.rx_descriptors, valid.rx_staging, port_config.rx_pool.cache_size),
+            0,
         );
         let port = fixture.open_with(eal, port_config);
         let identity = format!("{port:?}");

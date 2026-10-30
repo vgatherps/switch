@@ -100,10 +100,10 @@ in-container `make test` runs under `timeout --kill-after=10 $(MAKE_TEST_TIMEOUT
 ## Stack configuration in the drivers
 
 The shared driver for tap-echo, relay-autobahn and binance-feed sizes DPDK memory from its RX and TX
-pool counts: `-m` requests `64 + ceil((rx_count + tx_count) * 4096 / 1048576)` MB. The RX pool
-grows with sockets × receive buffer through `rx_pool_count`. relay-autobahn sizes for a socket
-per case (a socket closed first holds its slot through TIME-WAIT), so memory grows with the Autobahn case count: 91 RX mbufs per case at 128 KiB, about
-250 MB for 517 cases (249 MB server, 250 MB client).
+pool counts: `-m` requests `64 + ceil((rx_count + tx_count) * 4096 / 1048576)` MB. The RX and frame
+pools hold their reserves plus one socket's full window, shared by every socket, so memory does not
+grow with the socket count: relay-autobahn keeps a socket per case (a socket closed first holds its
+slot through TIME-WAIT) in the same pools.
 
 tap-echo, relay-autobahn, binance-feed and memif-bench read `StackConfig.random_seed` from
 `/dev/urandom` on each run. Tests and library benches use fixed seeds. memif-bench has no seed

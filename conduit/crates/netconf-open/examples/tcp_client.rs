@@ -52,15 +52,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("server has no IPv4 address".into());
     };
 
-    // Include the path MSS cap when sizing the RX and frame pools.
+    // One socket: room for its full window each way, with the path MSS cap.
     let socket = tcp::Config {
         rx_capacity: BUFFER, tx_capacity: BUFFER,
         mss_cap: Some(config.path_mtu(*server.ip()) - 40),
     };
     let sizing = Sizing {
-        tcp_rx_frames: tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)),
-        tcp_tx_frames: tcp::tx_mbuf_budget(&socket, usize::from(config.mtu)),
-        udp_rx_datagrams: 0,
+        rx_share: tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)),
+        frame_share: tcp::tx_mbuf_budget(&socket, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,
         rx_staging: 32,

@@ -28,8 +28,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, Offloads, Port, PortConfig,
-    Stack, StackConfig,
+    frame_reserve, rx_reserve, Eal, Offloads, Port, PortConfig, Stack, StackConfig,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use tap_echo::{serve, EchoServer};
@@ -144,14 +143,13 @@ const JUMBO: PortSize = PortSize {
     room: 9216,
 };
 
-/// The frame pool backs the same capacities as send buffers (every socket
-/// here uses equal receive and send capacities).
-fn port_config(
-    port_id: u16,
-    size: PortSize,
-    recv_capacities: impl IntoIterator<Item = usize>,
-) -> PortConfig<'static> {
-    let capacities: Vec<usize> = recv_capacities.into_iter().collect();
+/// Beyond the reserves, the RX and frame pools hold one `buffer`-byte socket's
+/// full window each (sockets here use equal receive and send buffers), shared
+/// by every socket.
+fn port_config(port_id: u16, size: PortSize, buffer: usize) -> PortConfig<'static> {
+    let socket = tcp::Config { rx_capacity: buffer, tx_capacity: buffer, mss_cap: None };
+    let mtu = usize::from(size.mtu);
+    let count = |count: usize| u32::try_from(count).unwrap();
     let pool = |name, count| PoolConfig {
         name,
         count,
@@ -167,14 +165,11 @@ fn port_config(
         rx_burst: 32,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(
-            RX_POOL,
-            rx_pool_count(rx_reserve(16, 32, 8), size.mtu, capacities.iter().copied()),
-        ),
+        rx_pool: pool(RX_POOL, count(rx_reserve(16, 32, 8) + tcp::rx_mbuf_budget(&socket, mtu))),
         tx_pool: pool(TX_POOL, 127),
         frame_pool: pool(
             FRAME_POOL,
-            frame_pool_count(frame_reserve(16, 32), size.mtu, capacities).max(127),
+            count(frame_reserve(16, 32) + tcp::tx_mbuf_budget(&socket, mtu)).max(127),
         ),
         offloads: Offloads::default(),
     }
@@ -199,7 +194,7 @@ fn stack_config() -> StackConfig<'static> {
 
 /// Open a Port on the tap vdev.
 fn open(eal: &Eal, tap: &TapVdev, size: PortSize) -> Port {
-    unsafe { Port::open(eal, port_config(tap.port_id(), size, [ZHIDA_BUFFER])) }.unwrap()
+    unsafe { Port::open(eal, port_config(tap.port_id(), size, ZHIDA_BUFFER)) }.unwrap()
 }
 
 /// After `open` with `size`: the ethdev runs at `size.mtu`, the kernel side
@@ -820,7 +815,7 @@ fn serve_client_configured<T: Send + 'static>(
     with_eal(|eal| {
         // Declared before the Port, so a failure drops the Port first.
         let tap = TapVdev::new(VDEV, IFACE);
-        let mut config = port_config(tap.port_id(), size, [ECHO_BUFFER; 2]);
+        let mut config = port_config(tap.port_id(), size, ECHO_BUFFER);
         config.offloads = offloads;
         let port = unsafe { Port::open(eal, config) }.unwrap();
         sync_kernel_mtu(&tap, size);
@@ -900,7 +895,7 @@ fn kernel_echo_with_held_rx() {
         const BYTES: usize = 64 * 1024;
         let tap = TapVdev::new(VDEV, IFACE);
         let port =
-            unsafe { Port::open(eal, port_config(tap.port_id(), STANDARD, [BUFFER])) }.unwrap();
+            unsafe { Port::open(eal, port_config(tap.port_id(), STANDARD, BUFFER)) }.unwrap();
         let descriptors = u32::from(port.descriptor_counts().0);
         sync_kernel_mtu(&tap, STANDARD);
         set_kernel_address();
@@ -1448,7 +1443,7 @@ struct DataLoss {
 fn data_loss_transfer(direction: Direction) -> DataLoss {
     with_eal(|eal| {
         let tap = TapVdev::new(VDEV, IFACE);
-        let port = unsafe { Port::open(eal, port_config(tap.port_id(), STANDARD, [ECHO_BUFFER])) }
+        let port = unsafe { Port::open(eal, port_config(tap.port_id(), STANDARD, ECHO_BUFFER)) }
             .unwrap();
         sync_kernel_mtu(&tap, STANDARD);
         set_kernel_address();

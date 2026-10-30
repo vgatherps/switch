@@ -33,8 +33,9 @@ sends; a peer FIN before that closes as without it.
 Zhida: MAC {zhida_mac}, IPv4 {ZHIDA_IP}/{PREFIX_LEN}. DPDK vdev {vdev} with
 devargs {devargs}: kernel netdev {IFACE}. Port: MTU {MTU}, {DESCRIPTORS}/{DESCRIPTORS}
 descriptors, bursts {BURST}/{BURST}, a TX pool of {POOL_COUNT} mbufs, a frame pool of
-dpdk_smoltcp::frame_reserve plus N sockets' TX frame limits for BYTES send bytes, and an RX pool sized by
-dpdk_smoltcp::rx_pool_count for N sockets of BYTES receive bytes (cache {POOL_CACHE}, data room
+dpdk_smoltcp::frame_reserve plus one socket's TX frame limit for BYTES send bytes, and an RX pool of
+dpdk_smoltcp::rx_reserve plus one socket's RX frame cap for BYTES receive bytes, shared by all N
+sockets (cache {POOL_CACHE}, data room
 headroom + {FRAME_ROOM}). Stack: random_seed from /dev/urandom each run, max_sockets N, rx_staging
 {RX_STAGING}, tx_pending {TX_PENDING}.
 

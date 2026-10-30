@@ -31,7 +31,7 @@ use std::time::{Duration as Wall, Instant as Clock};
 use criterion::{criterion_group, criterion_main, Criterion};
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, Port, Stack, StackConfig, TcpHandle, UdpHandle,
+    frame_reserve, rx_reserve, Eal, Port, Stack, StackConfig, TcpHandle, UdpHandle,
 };
 use switch::Runtime;
 use switchnet::{boxed, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig};
@@ -64,14 +64,13 @@ fn udp_config(port: u16) -> UdpConfig {
 fn open(eal: &Eal, fixture: &RingPort, side: Side, tcp: usize, udp: usize) -> Stack {
     let stack_config = StackConfig { max_sockets: tcp.max(1), max_udp_sockets: udp.max(1), ..pair::config(side) };
     let mut config = fixture.config();
+    // Every socket's window and UDP queue full at once: the bench asserts lossless links.
+    let rx_share = tcp * tcp::rx_mbuf_budget(&tcp_config(), config.mtu.into()) + udp.max(1) * UDP_QUEUE;
+    let frame_share = tcp * tcp::tx_mbuf_budget(&tcp_config(), config.mtu.into()) + 64;
     let reserve = rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
-    config.rx_pool.count = rx_pool_count(reserve, config.mtu, std::iter::repeat_n(RX_CAPACITY, tcp))
-        + u32::try_from(udp.max(1) * UDP_QUEUE).unwrap();
-    config.frame_pool.count = frame_pool_count(
-        frame_reserve(config.tx_descriptors, stack_config.tx_pending),
-        config.mtu,
-        std::iter::repeat_n(TX_CAPACITY, tcp),
-    ) + 64;
+    config.rx_pool.count = u32::try_from(reserve + rx_share).unwrap();
+    config.frame_pool.count =
+        u32::try_from(frame_reserve(config.tx_descriptors, stack_config.tx_pending) + frame_share).unwrap();
     match Stack::new(fixture.open_with(eal, config), stack_config, T0) {
         Ok(stack) => stack,
         Err((_, error)) => panic!("{error}"),

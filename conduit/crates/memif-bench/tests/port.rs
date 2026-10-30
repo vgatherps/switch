@@ -56,14 +56,15 @@ fn tiny_segments_keep_memif_bulk_reserve() {
     use dpdk_smoltcp::smoltcp::wire::{
         ArpOperation, EthernetAddress, TcpControl, TcpRepr, TcpSeqNumber,
     };
-    use dpdk_smoltcp::{rx_pool_count, rx_reserve, Stack};
+    use dpdk_smoltcp::{rx_reserve, Stack};
 
     const CAPACITY: usize = 4096;
     // One byte above the stack's 64-byte append limit: each segment keeps its own RX mbuf.
     const SEGMENT: usize = 65;
     let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
     let reserve = rx_reserve(64, usize::from(BURST), 8);
-    let pool_count = rx_pool_count(reserve, 1500, [CAPACITY; 2]);
+    // Room for two sockets' RX frame caps beyond the reserve.
+    let pool_count = u32::try_from(reserve + 2 * cap).unwrap();
     let names = names("tinyreserve");
     let (mut server, mut client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = config(id, rx, tx, frame);
@@ -207,6 +208,136 @@ fn tiny_segments_keep_memif_bulk_reserve() {
         },
         &names,
     );
+}
+
+/// memif copy mode receives nothing unless it can allocate 32 mbufs at once, whatever the
+/// RX burst. The server's burst is 8 and its RX pool its reserve plus 32 mbufs. Three
+/// connections each lose their first segment and receive the next 40 out of order, more
+/// than the pool holds, while the application keeps reading (there is nothing in order).
+/// The Stack must see the pool low while memif can still receive: the receiving sockets
+/// drop their out-of-order frames, so the resent first segments arrive and every byte is
+/// delivered. With the pool's low mark below memif's 32, memif stops receiving with the
+/// out-of-order frames still held and the first segments never arrive.
+#[zhida_test_support::pinned_test]
+fn out_of_order_receiver_keeps_memif_receiving() {
+    use zhida_test_kit::pair::{self, drain_bytes, Side, T0};
+    use dpdk_smoltcp::smoltcp::socket::tcp::State;
+    use dpdk_smoltcp::smoltcp::wire::{ArpOperation, EthernetAddress, TcpControl, TcpRepr, TcpSeqNumber};
+    use dpdk_smoltcp::{rx_reserve, Stack};
+
+    const SERVER_BURST: u16 = 8;
+    const STAGING: usize = 8;
+    const SOCKETS: usize = 3;
+    const SEGMENT: usize = 1460;
+    /// Segments after the first, each within the 65535-byte window.
+    const LATER: usize = 40;
+    let pool_count = u32::try_from(rx_reserve(64, STAGING, 8) + 32).unwrap();
+    let names = names("oooreader");
+    let (server, mut client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
+        let mut config = config(id, rx, tx, frame);
+        if rx == names.server_rx.as_c_str() {
+            config.rx_burst = SERVER_BURST;
+            config.rx_pool.count = pool_count;
+        }
+        config
+    });
+    let mut staged = VecDeque::with_capacity(usize::from(BURST));
+    assert_eq!(client.port.rx_burst(&mut staged).unwrap().accepted, 0);
+    let drain_client = |client: &mut End| {
+        let mut staged = VecDeque::with_capacity(usize::from(BURST));
+        while client.port.rx_burst(&mut staged).unwrap().accepted != 0 {
+            staged.clear();
+        }
+    };
+    let End { vdev, port } = server;
+    let config = dpdk_smoltcp::StackConfig { max_sockets: SOCKETS, rx_staging: STAGING, ..pair::config(Side::B) };
+    let mut stack = Stack::new(std::mem::ManuallyDrop::into_inner(port), config, T0)
+        .map_err(|(_, error)| error)
+        .unwrap();
+    let handles: Vec<_> = (0..SOCKETS as u16)
+        .map(|index| {
+            let handle = stack.add_tcp(pair::tcp_socket_sized(65536)).unwrap();
+            stack.tcp_mut(&handle).set_ack_delay(None);
+            stack.listen(&handle, pair::SERVER_PORT + index).unwrap();
+            handle
+        })
+        .collect();
+    let arp = zhida_test_kit::ring_port::arp(
+        ArpOperation::Request,
+        EthernetAddress::BROADCAST,
+        (Side::A.mac(), Side::A.ip()),
+        (EthernetAddress::BROADCAST, Side::B.ip()),
+    );
+    send(&mut client, &[arp]);
+    assert_eq!(stack.turn(T0, pair::BUDGET).unwrap().rx_received, 1);
+    drain_client(&mut client);
+    let mut peers = Vec::new();
+    for index in 0..SOCKETS as u16 {
+        let mut tcp = TcpRepr {
+            src_port: pair::CLIENT_PORT + index,
+            dst_port: pair::SERVER_PORT + index,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(7000),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1460),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        send(&mut client, &[pair::tcp_frame(Side::A, &tcp)]);
+        assert_eq!(stack.turn(T0, pair::BUDGET).unwrap().rx_received, 1);
+        let reply = receive(&mut client, 1);
+        let syn_ack = pair::segment(reply[0].data(), Side::B);
+        tcp.control = TcpControl::None;
+        tcp.seq_number += 1;
+        tcp.ack_number = Some(syn_ack.seq_number + 1);
+        tcp.max_seg_size = None;
+        drop(reply);
+        send(&mut client, &[pair::tcp_frame(Side::A, &tcp)]);
+        assert_eq!(stack.turn(T0, pair::BUDGET).unwrap().rx_received, 1);
+        assert_eq!(stack.tcp(&handles[usize::from(index)]).state(), State::Established);
+        peers.push(tcp);
+    }
+    let data: Vec<_> = (0..SOCKETS as u32).map(|index| pair::pattern((LATER + 1) * SEGMENT, 60 + index)).collect();
+    let segment = |index: usize, number: usize| TcpRepr {
+        seq_number: peers[index].seq_number + number * SEGMENT,
+        payload: &data[index][number * SEGMENT..(number + 1) * SEGMENT],
+        ..peers[index]
+    };
+    let mut received = vec![Vec::new(); SOCKETS];
+    let read = |stack: &mut Stack, received: &mut Vec<Vec<u8>>| {
+        for (index, handle) in handles.iter().enumerate() {
+            received[index].extend(drain_bytes(stack.tcp_mut(handle)).unwrap());
+        }
+    };
+    for number in 1..=LATER {
+        for index in 0..SOCKETS {
+            send(&mut client, &[pair::tcp_frame(Side::A, &segment(index, number))]);
+            stack.turn(T0, pair::BUDGET).unwrap();
+            read(&mut stack, &mut received);
+            drain_client(&mut client);
+        }
+    }
+    assert!(received.iter().all(Vec::is_empty), "only out-of-order data so far");
+
+    // The resent first segments, then every later one again, in order.
+    for number in 0..=LATER {
+        for index in 0..SOCKETS {
+            send(&mut client, &[pair::tcp_frame(Side::A, &segment(index, number))]);
+            let turn = stack.turn(T0, pair::BUDGET).unwrap();
+            assert_eq!(turn.rx_received, 1, "memif stopped receiving: segment {number} of connection {index}");
+            read(&mut stack, &mut received);
+            drain_client(&mut client);
+        }
+    }
+    assert_eq!(received, data);
+    let port = stack.into_port();
+    drain_client(&mut client);
+    assert_eq!(in_use(&names.server_rx), 0);
+    close_pair(client, End { vdev, port: std::mem::ManuallyDrop::new(port) }, &names);
 }
 
 /// 255 mbufs cover RX staging (`BURST`) + memif's 32-mbuf bulk allocation +

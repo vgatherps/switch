@@ -5,7 +5,7 @@
 use zhida_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::rx_reserve;
 use dpdk_smoltcp::{Eal, Sent, Stack, StackConfig, Turn};
 
 use zhida_test_kit::{pair, wire, with_eal};
@@ -377,7 +377,7 @@ fn backpressure(eal: &Eal, names: [&str; 2], queued: usize, mode: Mode) -> (Turn
         configs,
         T0,
         4,
-        rx_pool_count(rx_reserve(16, configs[0].rx_staging, 8), 1500, [4096]),
+        pair::pool_count(rx_reserve(16, configs[0].rx_staging, 8), pair::windows(1500, [4096])),
         63,
         63,
     );

@@ -9,7 +9,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, UdpPacket,
 };
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, tx_reserve, Eal, Stack, UdpConfig, UdpHandle,
+    frame_reserve, tx_reserve, Eal, Stack, UdpConfig, UdpHandle,
     UdpSendError,
 };
 
@@ -43,10 +43,9 @@ fn new_pair_owning(
         port.rx_pool.count = 255;
         port.tx_pool.count = tx_pool;
         // One 4 KiB TCP socket for `udp_tcp_share_pending_in_call_order`.
-        port.frame_pool.count = frame_pool_count(
+        port.frame_pool.count = pair::pool_count(
             frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-            port.mtu,
-            [4096],
+            pair::windows(port.mtu, [4096]),
         );
     });
     let handles =

@@ -11,6 +11,9 @@ pub(crate) struct RxShared {
     /// The app-held count at which a window update becomes due, as of the socket's last
     /// quiet `poll_at`; `usize::MAX` when no drop can make one due.
     pub(crate) wake_at_held: Cell<usize>,
+    /// The socket is on its DropQueue's frame-wait list: a send found the shared frame pool
+    /// empty, and the driver wakes the socket once the pool has a frame again.
+    pub(crate) frame_wait_queued: Cell<bool>,
 }
 
 impl RxShared {
@@ -21,6 +24,7 @@ impl RxShared {
             wake: RefCell::new(None),
             wake_queued: Cell::new(false),
             wake_at_held: Cell::new(usize::MAX),
+            frame_wait_queued: Cell::new(false),
         })
     }
 
@@ -41,6 +45,25 @@ impl RxShared {
         if let Some((queue, handle)) = self.wake.borrow().as_ref() {
             if !self.wake_queued.replace(true) {
                 queue.push_wake(*handle);
+            }
+        }
+    }
+
+    /// Queue the socket's wake for when the frame pool has a free frame again, once per wait.
+    #[cold]
+    pub(crate) fn queue_frame_wait(&self) {
+        if let Some((queue, handle)) = self.wake.borrow().as_ref() {
+            if !self.frame_wait_queued.replace(true) {
+                queue.push_frame_wait(*handle);
+            }
+        }
+    }
+
+    /// Take the socket off the frame-wait list, as when it is removed.
+    pub(crate) fn cancel_frame_wait(&self) {
+        if self.frame_wait_queued.replace(false) {
+            if let Some((queue, handle)) = self.wake.borrow().as_ref() {
+                queue.remove_frame_wait(*handle);
             }
         }
     }

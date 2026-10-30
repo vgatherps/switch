@@ -23,24 +23,21 @@ const CACHE: u32 = 8;
 ///
 /// Every field is required. The RX pool holds the driver's working space
 /// (`rx_reserve` over the adjusted RX descriptors and `rx_staging`) plus
-/// `tcp_rx_frames` plus `udp_rx_datagrams`. The frame pool holds
-/// `frame_reserve` over the adjusted TX descriptors and `tx_pending` plus
-/// `tcp_tx_frames`.
+/// `rx_share`. The frame pool holds `frame_reserve` over the adjusted TX
+/// descriptors and `tx_pending` plus `frame_share`. Every socket draws on the
+/// shares; none is reserved per socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
-    /// RX mbufs for TCP receive data: the sum of `tcp::rx_mbuf_budget(&config, mtu)`
-    /// over every TCP config the application will add, including its MSS cap.
-    /// `Stack::add_tcp` refuses a config that does
-    /// not fit.
-    pub tcp_rx_frames: usize,
-    /// Frame-pool mbufs for TCP send queues and application-held TX frames:
-    /// the sum of `tcp::tx_mbuf_budget(&config, mtu)` over every TCP config
-    /// the application will add, plus the frames it holds itself at once
-    /// (`Stack::tx_frame`). `Stack::add_tcp` refuses a config that does not fit.
-    pub tcp_tx_frames: usize,
-    /// RX mbufs for UDP receive data: the sum of `UdpConfig::rx_queue` over
-    /// every UDP socket the application will add.
-    pub udp_rx_datagrams: usize,
+    /// RX mbufs all sockets together may hold: unread TCP data, out-of-order
+    /// segments, queued UDP datagrams and frames the application holds. Each TCP
+    /// socket holds at most `tcp::rx_mbuf_budget(&config, mtu)` and each UDP
+    /// socket `UdpConfig::rx_queue`. When it runs out, arrivals are dropped and
+    /// peers retransmit.
+    pub rx_share: usize,
+    /// Frames all TCP send queues and the application (`Stack::tx_frame`) may hold
+    /// at once. Each TCP socket queues at most `tcp::tx_mbuf_budget(&config, mtu)`.
+    /// When it runs out, sends queue nothing until frames return.
+    pub frame_share: usize,
     /// `StackConfig::max_sockets`: TCP socket slots. Must be positive.
     pub max_sockets: usize,
     /// `StackConfig::max_udp_sockets`: UDP socket slots. Zero disables UDP.
@@ -75,23 +72,20 @@ fn port_config(
     (rx_desc, tx_desc): (u16, u16),
     sizing: &Sizing,
 ) -> Result<PortConfig<'static>, String> {
-    let reserve = rx_reserve(rx_desc, sizing.rx_staging, CACHE)
-        .checked_add(sizing.udp_rx_datagrams)
-        .ok_or("RX reserve overflow")?;
     let rx_count = u32::try_from(
-        reserve
-            .checked_add(sizing.tcp_rx_frames)
+        rx_reserve(rx_desc, sizing.rx_staging, CACHE)
+            .checked_add(sizing.rx_share)
             .ok_or("RX pool count exceeds u32")?,
     )
     .map_err(|_| "RX pool count exceeds u32")?;
-    // Stack::new refuses a TX pool below tx_reserve (a NIC PMD may hold a full
-    // TX ring of sent mbufs until it reclaims them) and a frame pool below
-    // frame_reserve.
+    // Stack::new refuses an RX pool below rx_reserve, a TX pool below tx_reserve
+    // (a NIC PMD may hold a full TX ring of sent mbufs until it reclaims them)
+    // and a frame pool below frame_reserve.
     let tx_count = u32::try_from(tx_reserve(tx_desc, sizing.tx_pending))
         .map_err(|_| "TX pool count exceeds u32")?;
     let frame_count = u32::try_from(
         frame_reserve(tx_desc, sizing.tx_pending)
-            .checked_add(sizing.tcp_tx_frames)
+            .checked_add(sizing.frame_share)
             .ok_or("frame pool count exceeds u32")?,
     )
     .map_err(|_| "frame pool count exceeds u32")?;
@@ -165,9 +159,8 @@ mod tests {
             (
                 (1024, 1024),
                 Sizing {
-                    tcp_rx_frames: 0,
-                    tcp_tx_frames: 0,
-                    udp_rx_datagrams: 0,
+                    rx_share: 0,
+                    frame_share: 0,
                     max_sockets: 1,
                     max_udp_sockets: 0,
                     rx_staging: 32,
@@ -178,9 +171,8 @@ mod tests {
             (
                 (127, 128),
                 Sizing {
-                    tcp_rx_frames: 0,
-                    tcp_tx_frames: 0,
-                    udp_rx_datagrams: 0,
+                    rx_share: 0,
+                    frame_share: 0,
                     max_sockets: 1,
                     max_udp_sockets: 0,
                     rx_staging: 32,
@@ -191,9 +183,8 @@ mod tests {
             (
                 (4096, 4096),
                 Sizing {
-                    tcp_rx_frames: 2880,
-                    tcp_tx_frames: 2880,
-                    udp_rx_datagrams: 32,
+                    rx_share: 2912,
+                    frame_share: 2880,
                     max_sockets: 64,
                     max_udp_sockets: 1,
                     rx_staging: 32,
@@ -206,7 +197,9 @@ mod tests {
             assert_eq!((config.rx_descriptors, config.tx_descriptors), adjusted);
             let held = u32::from(adjusted.1) + u32::try_from(sizing.tx_pending).unwrap();
             assert_eq!(config.tx_pool.count, held);
-            assert_eq!(config.frame_pool.count, held + 1 + u32::try_from(sizing.tcp_tx_frames).unwrap());
+            assert_eq!(config.frame_pool.count, held + 1 + u32::try_from(sizing.frame_share).unwrap());
+            let reserve = rx_reserve(adjusted.0, sizing.rx_staging, CACHE);
+            assert_eq!(config.rx_pool.count, u32::try_from(reserve + sizing.rx_share).unwrap());
         }
     }
 }

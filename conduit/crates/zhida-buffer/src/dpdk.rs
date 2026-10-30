@@ -1082,6 +1082,14 @@ impl PoolManager {
         unsafe { rte_mempool_in_use_count(self.pool) }
     }
 
+    /// Buffers this lcore can allocate now: the pool's backing store plus this pool's
+    /// cache. Cheaper than `in_use_count`, which walks every lcore's cache.
+    #[inline]
+    pub fn free_count(&self) -> u32 {
+        // SAFETY: `pool` is live and `cache` is its cache on this lcore while self lives.
+        unsafe { zhida_dpdk_sys::zhida_mempool_free_count(self.pool, self.cache) }
+    }
+
     /// Forcibly close pool NO MATTER WHAT.
     /// Returns true if pool was clean (no outstanding mbufs).
     /// Returns false if pool had outstanding mbufs (indicates bug/cycle).

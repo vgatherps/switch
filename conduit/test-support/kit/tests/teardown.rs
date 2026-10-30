@@ -8,14 +8,15 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::null_mut;
 
 use zhida_test_kit::pair::{
-    ceil_ms, config, establish, new_pair, tcp_socket_sized, Side, CLIENT_PORT, SERVER_PORT, T0,
+    ceil_ms, config, establish, new_pair, pool_count, tcp_socket_sized, Side, CLIENT_PORT,
+    SERVER_PORT, T0,
 };
 use zhida_test_kit::ring_port::{frame, send, RingPort};
 use zhida_test_kit::wire::{copy_into, in_use, pool_exists, Verdict};
 use zhida_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::IpEndpoint;
-use dpdk_smoltcp::{Port, Stack};
+use dpdk_smoltcp::{rx_reserve, Port, Stack};
 use zhida_dpdk_sys::{
     dpdk_raw_pktmbuf_free, dpdk_raw_ring_dequeue_burst, rte_ring_create, zhida_errno,
     RTE_PKTMBUF_HEADROOM,
@@ -78,7 +79,13 @@ fn ring_port_unwind_frees_queued_frames_and_releases_rings_and_vdev() {
     with_eal(|eal| {
         let payload = catch_unwind(AssertUnwindSafe(|| {
             let fixture = RingPort::new("td_unwind", 16, 16);
-            let _stack = match Stack::new(fixture.open(eal), config(Side::A), T0) {
+            let mut port = fixture.config();
+            let stack = config(Side::A);
+            port.rx_pool.count = pool_count(
+                rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
+                0,
+            );
+            let _stack = match Stack::new(fixture.open_with(eal, port), stack, T0) {
                 Ok(stack) => stack,
                 Err((_, error)) => panic!("{error}"),
             };

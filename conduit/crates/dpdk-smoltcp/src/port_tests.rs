@@ -46,6 +46,14 @@ thread_local! {
 }
 
 #[test]
+fn rx_low_mark_covers_a_full_ring_refill_plus_a_burst() {
+    // The kit's net_ring (16 descriptors, burst 8), memif with a short burst, an ENA ring.
+    assert_eq!(rx_low_mark(16, 8), 32 + 8);
+    assert_eq!(rx_low_mark(64, 8), 64 + 8);
+    assert_eq!(rx_low_mark(1024, 32), 1024 + 32);
+}
+
+#[test]
 fn device_info_advertised_maps_bits() {
     let info = |rx_capa, tx_capa| DeviceInfo {
         driver_name: "test".into(),

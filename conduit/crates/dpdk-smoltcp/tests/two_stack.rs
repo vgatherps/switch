@@ -53,10 +53,9 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
         const CAPACITY: usize = 6 * SEGMENT;
         let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
         let configs = [pair::config(Side::A), pair::config(Side::B)];
-        let count = dpdk_smoltcp::rx_pool_count(
+        let count = pair::pool_count(
             dpdk_smoltcp::rx_reserve(16, configs[0].rx_staging, 8),
-            1500,
-            [CAPACITY],
+            pair::windows(1500, [CAPACITY]),
         );
         let mut pair = Pair::with_ports(
             eal,
@@ -696,22 +695,18 @@ fn two_stack_mixed_sizes_follow_mbuf_window() {
             16,
             |_, port| {
                 assert_eq!(usize::from(port.mtu), IP_MTU);
-                port.rx_pool.count = dpdk_smoltcp::rx_pool_count(
+                let full = pair::windows(port.mtu, [CAPACITY]);
+                port.rx_pool.count = pair::pool_count(
                     dpdk_smoltcp::rx_reserve(
                         port.rx_descriptors,
                         pair::config(Side::A).rx_staging,
                         port.rx_pool.cache_size,
                     ),
-                    port.mtu,
-                    [CAPACITY],
+                    full,
                 );
-                port.frame_pool.count = dpdk_smoltcp::frame_pool_count(
-                    dpdk_smoltcp::frame_reserve(
-                        port.tx_descriptors,
-                        pair::config(Side::A).tx_pending,
-                    ),
-                    port.mtu,
-                    [CAPACITY],
+                port.frame_pool.count = pair::pool_count(
+                    dpdk_smoltcp::frame_reserve(port.tx_descriptors, pair::config(Side::A).tx_pending),
+                    full,
                 );
             },
         );

@@ -29,7 +29,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, StackConfig};
 
 use zhida_test_kit::many;
@@ -68,20 +68,12 @@ fn setup(eal: &Eal, p: usize) -> (Pair, Vec<TcpHandle>) {
         64,
         |side, port| {
             port.rx_burst = 32;
-            port.rx_pool.count = rx_pool_count(
-                rx_reserve(
-                    port.rx_descriptors,
-                    configs[side.index()].rx_staging,
-                    port.rx_pool.cache_size,
-                ),
-                port.mtu,
-                std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
-            );
-            port.frame_pool.count = frame_pool_count(
-                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                port.mtu,
-                std::iter::repeat_n(256, if side == Side::A { p } else { 0 }),
-            );
+            port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+                port.rx_descriptors,
+                configs[side.index()].rx_staging,
+                port.rx_pool.cache_size,
+            ), zhida_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));
+            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));
             port.tx_pool.count = 127;
         },
     );

@@ -8,7 +8,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpEndpoint,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr,
 };
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_reserve, tx_reserve};
 use dpdk_smoltcp::{
     Eal, Port, PortConfig, Stack, StackConfig, TcpHandle, Turn, DEFAULT_NEIGHBOR_CAPACITY,
 };
@@ -24,6 +24,9 @@ pub const IDLE_ROUNDS: u32 = 16;
 /// Rounds that fail a Pair drive, or the lifetime of a `Rounds`, whatever
 /// progress they made.
 pub const MAX_ROUNDS: u32 = 100_000;
+/// RX mbufs and TX frames `Pair::new` adds to each pool's reserve, shared by all of a
+/// Stack's sockets.
+pub const SHARE: usize = 64;
 
 /// Drain every queued frame in order, returning an error only when no bytes were read.
 pub fn drain_bytes(socket: &mut tcp::Socket<'_>) -> Result<Vec<u8>, tcp::RecvError> {
@@ -113,29 +116,18 @@ impl Drop for DrainFirst {
 
 impl Pair {
     /// `names` are short and unique among live fixtures; rings hold 15 and TX pools 63.
-    /// Each RX pool covers its Stack's reserve and `max_sockets` sockets with
-    /// receive buffers up to 8688 bytes (6 * (1500 - 52)), and each frame pool
-    /// its `frame_reserve` and `max_sockets` sockets with send buffers of that
-    /// size. Larger buffers need counts from `rx_pool_count` and
-    /// `frame_pool_count` passed through `with_pools` or `with_ports`.
+    /// Each RX pool is its Stack's `rx_reserve` plus `SHARE` mbufs and each frame pool its
+    /// `frame_reserve` plus `SHARE` frames, shared by every socket. Tests that need more
+    /// in flight pass counts through `with_pools` or `with_ports`.
     pub fn new(eal: &Eal, names: [&str; 2], configs: [StackConfig<'_>; 2], now: Instant) -> Self {
-        const SMALL: usize = 6 * (1500 - 52);
         Self::with_ports(eal, names, configs, now, 16, |side, port| {
             let stack = configs[side.index()];
-            port.rx_pool.count = rx_pool_count(
-                rx_reserve(
-                    port.rx_descriptors,
-                    stack.rx_staging,
-                    port.rx_pool.cache_size,
-                ),
-                port.mtu,
-                std::iter::repeat_n(SMALL, stack.max_sockets),
-            );
-            port.frame_pool.count = frame_pool_count(
-                frame_reserve(port.tx_descriptors, stack.tx_pending),
-                port.mtu,
-                std::iter::repeat_n(SMALL, stack.max_sockets),
-            );
+            let share = |reserve: usize| {
+                u32::try_from(reserve + SHARE).expect("pool count fits u32")
+            };
+            port.rx_pool.count =
+                share(rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size));
+            port.frame_pool.count = share(frame_reserve(port.tx_descriptors, stack.tx_pending));
         })
     }
 
@@ -162,9 +154,9 @@ impl Pair {
 
     /// `new` with RX and TX rings of `ring` slots (holding `ring - 1`; a power
     /// of two) and each side's `RingPort::config` changed by `adjust`. Before
-    /// `adjust`, the TX and frame pools are raised to `tx_reserve` and
-    /// `frame_reserve` of the TX descriptors (the ring size) and the side's
-    /// `tx_pending` if the kit's pools are smaller.
+    /// `adjust`, the RX, TX and frame pools are raised to `rx_reserve`, `tx_reserve`
+    /// and `frame_reserve` (of the descriptor counts and the side's `rx_staging` and
+    /// `tx_pending`) if the kit's pools are smaller.
     pub fn with_ports(
         eal: &Eal,
         names: [&str; 2],
@@ -191,12 +183,19 @@ impl Pair {
         let [a, b] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
             let mut config = fixture.config();
-            let tx_pending = configs[side.index()].tx_pending;
+            let stack = configs[side.index()];
             let floor = |reserve: usize| u32::try_from(reserve).expect("pool count fits u32");
+            config.rx_pool.count = config.rx_pool.count.max(floor(rx_reserve(
+                config.rx_descriptors,
+                stack.rx_staging,
+                config.rx_pool.cache_size,
+            )));
             config.tx_pool.count =
-                config.tx_pool.count.max(floor(tx_reserve(config.tx_descriptors, tx_pending)));
-            config.frame_pool.count =
-                config.frame_pool.count.max(floor(frame_reserve(config.tx_descriptors, tx_pending)));
+                config.tx_pool.count.max(floor(tx_reserve(config.tx_descriptors, stack.tx_pending)));
+            config.frame_pool.count = config
+                .frame_pool
+                .count
+                .max(floor(frame_reserve(config.tx_descriptors, stack.tx_pending)));
             adjust(side, &mut config);
             let mut port = fixture.open_with(eal, config);
             opened(side, &mut port);
@@ -437,6 +436,24 @@ pub fn new_pair(eal: &Eal, names: [&str; 2]) -> Pair {
 /// Cubic, `size`-byte buffers each way.
 pub fn tcp_socket_sized(size: usize) -> tcp::Config {
     tcp::Config { rx_capacity: size, tx_capacity: size, mss_cap: None }
+}
+
+/// Frames for every listed `tcp_socket_sized` buffer's full window at once, at `mtu`: the
+/// share a test adds to a pool's reserve when every socket may fill its window at once over
+/// a link that must not drop (RX), or every send queue may be full (frames).
+pub fn windows(mtu: u16, buffers: impl IntoIterator<Item = usize>) -> usize {
+    buffers
+        .into_iter()
+        .map(|size| tcp::rx_mbuf_budget(&tcp_socket_sized(size), usize::from(mtu)))
+        .sum()
+}
+
+/// `reserve` plus `share` as a pool count.
+pub fn pool_count(reserve: usize, share: usize) -> u32 {
+    reserve
+        .checked_add(share)
+        .and_then(|count| u32::try_from(count).ok())
+        .expect("pool count fits u32")
 }
 
 /// `establish_sized` with 4 KiB buffers.

@@ -138,8 +138,6 @@ pub struct TcpStorage<'a> {
     /// Bumped on every remove, so handles to a removed socket stop matching.
     generation: u64,
     inner: Option<Item<'a>>,
-    admitted_rx_budget: usize,
-    admitted_tx_budget: usize,
     /// Readiness tokens armed for the receive and send halves ([`ReadySide`]). In the last
     /// line's padding, so the slot keeps its size and line map.
     tokens: [Option<u32>; 2],
@@ -150,8 +148,6 @@ impl<'a> TcpStorage<'a> {
         inner: None,
         generation: 0,
         tokens: [None; 2],
-        admitted_rx_budget: 0,
-        admitted_tx_budget: 0,
     };
 }
 
@@ -324,7 +320,7 @@ impl<'a> TcpSet<'a> {
         }
     }
 
-    /// Add a socket to the set without RX admission, and return its handle.
+    /// Add a socket to the set without fixing its RX frame count, and return its handle.
     ///
     /// # Panics
     /// This function panics if the storage is fixed-size (not a `Vec`) and is full.
@@ -340,8 +336,6 @@ impl<'a> TcpSet<'a> {
                 generation: slot.generation,
             };
             let meta = Meta::default();
-            slot.admitted_rx_budget = 0;
-            slot.admitted_tx_budget = 0;
             slot.inner = Some(Item { meta, socket });
             handle
         }
@@ -385,9 +379,10 @@ impl<'a> TcpSet<'a> {
 
     /// Build a socket from `config`, fix its RX frame count to
     /// [`tcp::rx_mbuf_budget`]`(config, ip_mtu)` and add it. Its TX frames come from
-    /// `tx_source`, at most [`tcp::tx_mbuf_budget`]`(config, ip_mtu)` queued at a time. The
-    /// caller has already admitted both counts. Outside this crate, sockets are created only
-    /// here and [`TcpSet::remove`] drops them, so no owned socket leaves the set.
+    /// `tx_source`, at most [`tcp::tx_mbuf_budget`]`(config, ip_mtu)` queued at a time. Both
+    /// are per-socket limits; the frames come from pools shared by every socket. Outside this
+    /// crate, sockets are created only here and [`TcpSet::remove`] drops them, so no owned
+    /// socket leaves the set.
     ///
     /// # Panics
     /// This function panics if `ip_mtu` is below 68, `config.rx_capacity` exceeds 1 GiB,
@@ -402,13 +397,8 @@ impl<'a> TcpSet<'a> {
     ) -> SocketHandle {
         let mut socket = tcp::Socket::from_config(config, ip_mtu, tx_source);
         socket.set_rx_mbuf_budget(ip_mtu);
-        let budget = socket.rx_frame_cap();
-        let tx_budget = socket.tx_frame_cap();
         let handle = self.add(socket);
-        let slot = &mut self.sockets[handle.index];
-        slot.admitted_rx_budget = budget;
-        slot.admitted_tx_budget = tx_budget;
-        slot.inner.as_mut().unwrap().socket.set_rx_wake(wake, handle);
+        self.item_mut(handle).socket.set_rx_wake(wake, handle);
         handle
     }
 
@@ -502,6 +492,18 @@ impl<'a> TcpSet<'a> {
         self.mark_dirty(handle.index);
     }
 
+    /// Complete a frame wait: the frame pool has a free frame again, so fire the socket's
+    /// readiness tokens and schedule its readiness check. Removal takes a socket off the
+    /// wait list, so `handle` names a live socket.
+    pub fn frame_woken(&mut self, handle: SocketHandle) {
+        let socket = &mut self.sockets.get_mut(handle.index)
+            .filter(|slot| slot.generation == handle.generation)
+            .and_then(|slot| slot.inner.as_mut())
+            .expect("frame wake does not name a live TCP socket").socket;
+        socket.clear_frame_wait_queued();
+        self.mark_dirty(handle.index);
+    }
+
     /// Close the socket after its application handle is dropped, keeping it in the set.
     pub fn orphan(&mut self, handle: SocketHandle, now: Instant) {
         self.item(handle);
@@ -537,22 +539,19 @@ impl<'a> TcpSet<'a> {
     }
 
     /// Removes a socket from the set without changing its state, discarding unread received
-    /// bytes and clearing receive wakes. Returns the frames the application still holds, the
-    /// socket's admitted RX budget and its admitted TX frame budget. The socket itself is
-    /// dropped, releasing its queued TX frames: handing it out would let a caller write it over
-    /// another admitted socket through `get_mut`.
+    /// bytes and clearing receive wakes. Returns the frames the application still holds. The
+    /// socket itself is dropped, releasing its queued TX frames: handing it out would let a
+    /// caller write it over another socket through `get_mut`.
     ///
     /// # Panics
     /// This function may panic if the handle does not belong to this socket set,
     /// and panics if the socket it named was already removed.
-    pub fn remove(&mut self, handle: SocketHandle) -> (crate::phy::HeldFrames, usize, usize) {
-        let (socket, budget) = self.take(handle);
-        let tx_budget = self.sockets[handle.index].admitted_tx_budget;
-        (socket.held_frames(), budget, tx_budget)
+    pub fn remove(&mut self, handle: SocketHandle) -> crate::phy::HeldFrames {
+        self.take(handle).held_frames()
     }
 
     /// `remove`, but returns the socket with an empty receive buffer.
-    pub(crate) fn take(&mut self, handle: SocketHandle) -> (tcp::Socket<'a>, usize) {
+    pub(crate) fn take(&mut self, handle: SocketHandle) -> tcp::Socket<'a> {
         net_trace!("[{}]: removing", handle.index);
         self.item(handle);
         let slot = &mut self.sockets[handle.index];
@@ -584,7 +583,7 @@ impl<'a> TcpSet<'a> {
             Some(mut item) => {
                 item.socket.clear_rx_wake();
                 item.socket.discard_received();
-                (item.socket, self.sockets[handle.index].admitted_rx_budget)
+                item.socket
             }
             None => unreachable!(),
         }
@@ -1695,8 +1694,6 @@ mod tests {
 
         let storage = TcpStorage {
             generation: 0,
-            admitted_rx_budget: 0,
-            admitted_tx_budget: 0,
             tokens: [None; 2],
             inner: Some(Item {
                 meta: Meta::default(),
@@ -1748,7 +1745,7 @@ mod tests {
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
         // In the last line's padding (576..639).
-        assert_eq!(offset_of!(TcpStorage<'static>, tokens), 592);
+        assert_eq!(offset_of!(TcpStorage<'static>, tokens), 576);
         assert_eq!(item_offset, 8);
         assert_eq!(offset_of!(Item<'static>, meta), 0);
         assert_eq!(offset_of!(Item<'static>, socket), 112);
@@ -1982,7 +1979,7 @@ mod tests {
         );
         assert_eq!(b_set.get(b_handle).recv_queue(), 6);
         assert_eq!(b_set.get_mut(b_handle).send_slice(b"queued"), Ok(6));
-        let (removed, _) = b_set.take(b_handle);
+        let removed = b_set.take(b_handle);
         assert_eq!(removed.recv_queue(), 0);
         assert_eq!(removed.recv_capacity(), 64);
         assert_eq!(removed.send_queue(), 6);
@@ -2031,31 +2028,6 @@ mod tests {
         // 4096 bytes / 100-byte frames = 41; a 1000-byte cap would give the six-frame floor.
         assert_eq!(budget, 41);
         assert_eq!(socket.rx_frame_cap(), budget);
-    }
-
-    /// `remove` returns the TX frame budget admitted into the slot, even after the slot's
-    /// socket was swapped with one built for a different budget.
-    #[test]
-    fn remove_returns_admitted_tx_budget() {
-        let wake = || super::super::DropQueue::with_capacity(1, #[cfg(feature = "udp-set")] 0);
-        let config = tcp::Config { rx_capacity: 4096, tx_capacity: 20_000, mss_cap: Some(100) };
-        let budget = tcp::tx_mbuf_budget(&config, 1500);
-        // 20000 bytes / 100-byte segments.
-        assert_eq!(budget, 200);
-        let mut set = TcpSet::new(vec![]);
-        let handle = set.add_admitted(&config, 1500, crate::tests::tx_test_source(1460), wake());
-        assert_eq!(set.get(handle).tx_frame_cap(), budget);
-
-        let small = tcp::Config { rx_capacity: 4096, tx_capacity: 64, mss_cap: None };
-        let mut other = TcpSet::new(vec![]);
-        let swapped = other.add_admitted(&small, 1500, crate::tests::tx_test_source(1460), wake());
-        core::mem::swap(set.get_mut(handle), other.get_mut(swapped));
-        assert_eq!(set.get(handle).tx_frame_cap(), 6);
-
-        let (_, rx_budget, tx_budget) = set.remove(handle);
-        assert_eq!((rx_budget, tx_budget), (41, budget));
-        let (_, _, tx_budget) = other.remove(swapped);
-        assert_eq!(tx_budget, 6);
     }
 
     #[test]

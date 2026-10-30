@@ -41,7 +41,7 @@ pub struct Config {
     pub mss_cap: Option<u16>,
 }
 
-/// RX mbufs a socket built from `config` is admitted with:
+/// RX mbufs a socket built from `config` may hold at most (its RX frame cap):
 /// max(ceil(rx_capacity / min(ip_mtu - 40, mss_cap)), 6).
 /// An IPv4 TCP segment without options has 40 bytes of headers. Six
 /// mbufs cover small receive buffers and short segments.
@@ -978,7 +978,7 @@ impl<'a> Socket<'a> {
         self.mss_cap = cap.and_then(core::num::NonZeroU16::new);
     }
 
-    /// RX mbufs needed to admit this socket using its MSS cap; see [`rx_mbuf_budget`].
+    /// The RX frame cap this socket gets from its MSS cap; see [`rx_mbuf_budget`].
     /// Panics if `ip_mtu` is below 68.
     pub(crate) fn rx_mbuf_budget(&self, ip_mtu: usize) -> usize {
         rx_mbuf_budget_for_payload(
@@ -987,7 +987,7 @@ impl<'a> Socket<'a> {
         )
     }
 
-    /// Return the socket's admitted RX frame count.
+    /// Return the socket's RX frame cap: how many RX frames it holds at most.
     pub fn rx_frame_cap(&self) -> usize {
         self.rx_mbuf_cap as usize
     }
@@ -1001,8 +1001,7 @@ impl<'a> Socket<'a> {
     /// The count survives reset and reconnect; per-frame bytes follow each connection.
     /// Panics if the app still holds received frames, `ip_mtu` is below 68,
     /// or the frame count exceeds u32.
-    /// Use [`crate::iface::TcpSet::add_admitted`] after the pool has admitted
-    /// [`rx_mbuf_budget`].
+    /// Used by [`crate::iface::TcpSet::add_admitted`].
     pub(crate) fn set_rx_mbuf_budget(&mut self, ip_mtu: usize) {
         assert_eq!(self.rx_buffer.shared.held.get(), 0,
             "socket admitted while the app still holds its received frames");
@@ -1589,6 +1588,8 @@ impl<'a> Socket<'a> {
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 && self.tx_queue.frame_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
+                // The shared frame pool is empty: wake this socket once frames return.
+                self.rx_buffer.shared.queue_frame_wait();
                 break;
             };
             let count = (data.len() - written)
@@ -1625,13 +1626,19 @@ impl<'a> Socket<'a> {
         *self.rx_buffer.shared.wake.borrow_mut() = Some((queue, handle));
     }
 
-    /// Stop receive frame drops from scheduling readiness checks for this socket.
+    /// Stop receive frame drops, and frames returning to an empty pool, from scheduling
+    /// readiness checks for this socket.
     pub(crate) fn clear_rx_wake(&mut self) {
+        self.rx_buffer.shared.cancel_frame_wait();
         *self.rx_buffer.shared.wake.borrow_mut() = None;
     }
 
     pub(crate) fn clear_rx_wake_queued(&mut self) {
         self.rx_buffer.shared.wake_queued.set(false);
+    }
+
+    pub(crate) fn clear_frame_wait_queued(&mut self) {
+        self.rx_buffer.shared.frame_wait_queued.set(false);
     }
 
     /// Frames the app still holds; they keep their RX pool buffers until dropped.
@@ -1756,6 +1763,19 @@ impl<'a> Socket<'a> {
     pub(crate) fn discard_received(&mut self) {
         self.remote_seq_no += self.rx_buffer.store.in_order_len();
         self.rx_buffer.store.clear();
+    }
+
+    /// Drop received data past the first gap, frames and a FIN alike; in-order data stays.
+    /// Called for every segment while the RX pool is low: with nothing out of order it only
+    /// clears a FIN past a gap, and otherwise visits only the dropped views. Kept out of line
+    /// so the segment path's code stays as it was.
+    #[cold]
+    #[inline(never)]
+    fn prune_out_of_order(&mut self) {
+        self.rx_fin_seq = None;
+        if self.rx_buffer.store.out_of_order_span() != 0 {
+            self.rx_buffer.store.drop_out_of_order();
+        }
     }
 
     fn set_state(&mut self, state: State) {
@@ -2055,6 +2075,8 @@ impl<'a> Socket<'a> {
         self.rx_buffer.store.attach(frame);
     }
 
+    /// Per segment; the truncation itself runs only for a FIN.
+    #[inline]
     fn truncate_at_fin(&mut self, fin_offset: Option<usize>) {
         if let Some(offset) = fin_offset {
             self.rx_buffer.store.truncate_from(offset);
@@ -2439,6 +2461,15 @@ impl<'a> Socket<'a> {
             }
         }
 
+        // While the shared RX pool is low, this socket keeps no out-of-order data, as Linux
+        // prunes the receiving socket's out-of-order queue under memory pressure: what it
+        // holds goes now, and an out-of-order segment or FIN is refused below. The peer
+        // resends it; in-order data is still stored, so the gap can fill.
+        let rx_pool_low = cx.rx_pool_low;
+        if rx_pool_low {
+            self.prune_out_of_order();
+        }
+
         // Disregard control flags we don't care about or shouldn't act on yet.
         let mut control = repr.control;
         control = control.quash_psh();
@@ -2486,6 +2517,8 @@ impl<'a> Socket<'a> {
             .expect("TCP receive offset overflow");
         let decision = if payload.is_empty() {
             None
+        } else if rx_pool_low && payload_offset != 0 {
+            Some(Decision::Refused)
         } else {
             Some(
                 self.rx_buffer
@@ -2495,7 +2528,7 @@ impl<'a> Socket<'a> {
                         .expect("app-held frames exceed RX mbuf cap")),
             )
         };
-        let refused = matches!(decision, Some(Decision::Refused));
+        let refused = matches!(decision, Some(Decision::Refused)) || (rx_pool_low && out_of_order_fin);
         if refused {
             // A statistic the peer can drive; it must never panic the stack.
             self.rx_refused_segments = self.rx_refused_segments.saturating_add(1);
@@ -5382,7 +5415,7 @@ mod test {
         let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
         let handle = set.add(s.socket);
         set.get_mut(handle).set_rx_wake(queue.clone(), handle);
-        let (held, _, _) = set.remove(handle);
+        let held = set.remove(handle);
         frames.pop();
         assert!(drain_wakes(&queue).is_empty(), "removed socket must not queue a wake");
         assert_eq!(held.count(), frames.len());
@@ -5581,6 +5614,78 @@ mod test {
         assert_eq!(ack.window_len, 49220 >> 2);
         assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 22000));
         assert_eq!(s.rx_refused_segments(), 0);
+    }
+
+    /// While the RX pool is low, the socket processing a segment drops its own out-of-order
+    /// frames and out-of-order FIN, refuses an out-of-order segment with an ACK at the in-order
+    /// edge, and still stores in-order data. Once the pool recovers it holds out-of-order data
+    /// again, and the resent gap delivers every byte in order.
+    #[test]
+    fn low_rx_pool_prunes_and_refuses_out_of_order_data() {
+        let mut s = socket_with_mbuf_window(2);
+        for index in 1..=3 {
+            receive_window_segment(&mut s, index * 1100, &[index as u8; 1100]);
+        }
+        send(&mut s, Instant::from_millis(0), &TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1 + 4400,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[4; 100],
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.rx_buffer.store.held(), 4);
+        assert_eq!(s.rx_buffer.store.out_of_order_len(), 3400);
+        assert_eq!(s.rx_fin_seq, Some(REMOTE_SEQ + 1 + 4500));
+
+        s.cx.rx_pool_low = true;
+        let ack = receive_window_segment(&mut s, 5500, &[5; 1100]);
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
+        assert_eq!(s.rx_buffer.store.held(), 0);
+        assert_eq!(s.rx_buffer.store.out_of_order_len(), 0);
+        assert_eq!(s.rx_fin_seq, None);
+        assert_eq!(s.rx_refused_segments(), 1);
+        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
+        assert_eq!(s.rx_buffer.store.held(), 1);
+        assert_eq!(s.rx_refused_segments(), 1);
+
+        s.cx.rx_pool_low = false;
+        let ack = receive_window_segment(&mut s, 2200, &[2; 1100]);
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
+        assert_eq!(s.rx_buffer.store.out_of_order_len(), 1100);
+        let ack = receive_window_segment(&mut s, 1100, &[1; 1100]);
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 3300));
+        assert_eq!(drain_bytes(&mut s), [[0; 1100], [1; 1100], [2; 1100]].concat());
+        assert_eq!(s.rx_refused_segments(), 1);
+    }
+
+    /// A FIN past a gap arriving while the RX pool is low is refused with its data. Once the
+    /// pool recovers, the gap and the resent FIN deliver every byte and then end of stream.
+    #[test]
+    fn low_rx_pool_refuses_out_of_order_fin_until_recovery() {
+        let fin = |offset: usize| TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1 + offset,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[1; 100],
+            ..SEND_TEMPL
+        };
+        let mut s = socket_with_mbuf_window(2);
+        s.cx.rx_pool_low = true;
+        send(&mut s, Instant::from_millis(0), &fin(1100));
+        assert_eq!(s.rx_fin_seq, None);
+        assert_eq!(s.rx_buffer.store.held(), 0);
+        assert_eq!(s.rx_refused_segments(), 1);
+        assert_eq!(s.state, State::Established);
+
+        s.cx.rx_pool_low = false;
+        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
+        send(&mut s, Instant::from_millis(0), &fin(1100));
+        assert_eq!(s.state, State::CloseWait);
+        assert_eq!(drain_bytes(&mut s), [&[0; 1100][..], &[1; 100][..]].concat());
+        assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
+        assert_eq!(s.rx_refused_segments(), 1);
     }
 
     #[test]

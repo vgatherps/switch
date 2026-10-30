@@ -11,7 +11,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     Ipv4Repr, UdpPacket, UdpRepr,
 };
 use dpdk_smoltcp::{
-    rx_reserve, AddTcpError, AddUdpError, Port, PortError, Stack, StackConfig, UdpConfig,
+    rx_reserve, AddUdpError, Port, PortError, Stack, StackConfig, UdpConfig,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use zhida_dpdk_sys::dpdk_raw_ring_enqueue_burst;
@@ -253,8 +253,10 @@ fn over_limit_dropped_counted_tcp_progresses() {
     });
 }
 
+/// The RX pool holds 11 mbufs beyond its reserve; a 4096-byte TCP socket (6 frames) and UDP
+/// queues of 5 and 64 datagrams are all added.
 #[zhida_test_support::pinned_test]
-fn add_udp_refused_when_pool_cannot_back_it() {
+fn add_udp_admits_queues_beyond_the_shared_rx_pool() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpcap", 16, 16);
         let port_config = fixture.config();
@@ -264,48 +266,23 @@ fn add_udp_refused_when_pool_cannot_back_it() {
             port_config.rx_pool.cache_size,
         );
         let pool = usize::try_from(port_config.rx_pool.count).unwrap();
+        assert_eq!(pool, reserve + 6 + 5);
         let mut stack = new_stack(fixture.open_with(eal, port_config), 2);
         let tcp = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap();
         let udp = stack.add_udp(udp_config(PORT, 5)).unwrap();
-        assert_eq!(pool, reserve + 6 + 5);
-        assert_eq!(
-            stack.add_udp(udp_config(PORT + 1, 1)).unwrap_err(),
-            AddUdpError::RxPoolTooSmall {
-                required: reserve + 6 + 5 + 1,
-                pool,
-            }
-        );
+        let big = stack.add_udp(udp_config(PORT + 1, 64)).unwrap();
         assert_eq!(stack.udp(&udp).config(), &udp_config(PORT, 5));
+        assert_eq!(stack.udp(&big).config(), &udp_config(PORT + 1, 64));
         assert_eq!(stack.tcp(&tcp).recv_capacity(), 4096);
+        stack.remove_udp(big);
         stack.remove_udp(udp);
-        assert_eq!(
-            stack.add_udp(udp_config(PORT, 6)).unwrap_err(),
-            AddUdpError::RxPoolTooSmall {
-                required: reserve + 6 + 6,
-                pool,
-            }
-        );
-        let udp = stack.add_udp(udp_config(PORT, 5)).unwrap();
-        let AddTcpError::RxPoolTooSmall {
-            required,
-            pool: actual,
-            config,
-        } = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap_err()
-        else {
-            panic!("UDP budget should prevent another TCP socket");
-        };
-        assert_eq!((required, actual), (reserve + 6 + 5 + 6, pool));
-        assert_eq!(config, pair::tcp_socket_sized(4096));
         stack.remove_tcp(tcp);
-        let extra = stack.add_udp(udp_config(PORT + 1, 6)).unwrap();
-        stack.remove_udp(extra);
-        stack.remove_udp(udp);
         finish(fixture, stack);
     });
 }
 
 #[zhida_test_support::pinned_test]
-fn removed_socket_held_datagrams_count_until_dropped() {
+fn removed_socket_held_datagrams_keep_rx_mbufs_until_dropped() {
     with_eal(|eal| {
         let fixture = RingPort::new("udprm", 16, 16);
         let mut port_config = fixture.config();
@@ -315,7 +292,6 @@ fn removed_socket_held_datagrams_count_until_dropped() {
             port_config.rx_pool.cache_size,
         );
         port_config.rx_pool.count = u32::try_from(reserve + 6).unwrap();
-        let pool = usize::try_from(port_config.rx_pool.count).unwrap();
         let mut stack = new_stack(fixture.open_with(eal, port_config), 1);
         let old = stack.add_udp(udp_config(PORT, 6)).unwrap();
         fixture.inject(&[
@@ -333,25 +309,11 @@ fn removed_socket_held_datagrams_count_until_dropped() {
         stack.remove_udp(replacement);
         assert_eq!(fixture.in_use().0, 2);
         for (held, datagram) in [(2, first), (1, second)] {
-            assert_eq!(
-                stack.add_udp(udp_config(PORT, 6)).unwrap_err(),
-                AddUdpError::RxPoolTooSmall {
-                    required: reserve + held + 6,
-                    pool,
-                }
-            );
-            let AddTcpError::RxPoolTooSmall {
-                required,
-                pool: actual,
-                config,
-            } = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap_err()
-            else {
-                panic!("held UDP datagrams should prevent TCP admission");
-            };
-            assert_eq!((required, actual), (reserve + held + 6, pool));
-            assert_eq!(config, pair::tcp_socket_sized(4096));
+            let udp = stack.add_udp(udp_config(PORT, 6)).unwrap();
+            stack.remove_udp(udp);
+            assert_eq!(fixture.in_use().0, held);
             drop(datagram);
-            assert_eq!(fixture.in_use().0, held as u32 - 1);
+            assert_eq!(fixture.in_use().0, held - 1);
         }
         let udp = stack.add_udp(udp_config(PORT, 6)).unwrap();
         stack.remove_udp(udp);
@@ -361,101 +323,23 @@ fn removed_socket_held_datagrams_count_until_dropped() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn removed_tcp_and_udp_frames_share_admission_count() {
-    with_eal(|eal| {
-        let configs = [Side::A, Side::B].map(|side| StackConfig {
-            max_udp_sockets: 1,
-            ..pair::config(side)
-        });
-        let reserve = rx_reserve(16, configs[0].rx_staging, 8);
-        let pool = reserve.checked_add(7).unwrap();
-        let mut pair = Pair::with_pools(
-            eal,
-            ["mixhelda", "mixheldb"],
-            configs,
-            T0,
-            16,
-            u32::try_from(pool).unwrap(),
-            63,
-            63,
-        );
-        let ([client, server], _) = pair::establish(&mut pair, Side::A);
-        pair.a.tcp_mut(&client).set_ack_delay(None);
-        pair.b.tcp_mut(&server).set_ack_delay(None);
-        assert_eq!(pair.b.tcp_mut(&server).send_slice(b"tcp"), Ok(3));
-        pair.drive(|_, _| {}, |a, b| {
-            if a.tcp(&client).recv_queue() == 3 && b.tcp(&server).send_queue() == 0 {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        let frame = pair.a.tcp_mut(&client).recv().unwrap().unwrap();
-        assert_eq!(frame.payload(), b"tcp");
-        let udp = pair.a.add_udp(udp_config(PORT, 1)).unwrap();
-        pair.inject(Side::A, &[from_peer(PEER_PORT, b"udp")]);
-        pair.round(|_, _| {});
-        let datagram = pair.a.udp_mut(&udp).recv().unwrap();
-        assert_eq!(datagram.payload(), b"udp");
-        pair.a.remove_tcp(client);
-        pair.a.remove_udp(udp);
-        let check_refused = |stack: &mut Stack, held| {
-            assert_eq!(
-                stack.add_udp(udp_config(PORT, 7)).unwrap_err(),
-                AddUdpError::RxPoolTooSmall {
-                    required: reserve + held + 7,
-                    pool,
-                }
-            );
-            let AddTcpError::RxPoolTooSmall {
-                required,
-                pool: actual,
-                config,
-            } = stack.add_tcp(pair::tcp_socket_sized(7 * (1500 - 40))).unwrap_err()
-            else {
-                panic!("held TCP and UDP frames should prevent TCP admission");
-            };
-            assert_eq!((required, actual), (reserve + held + 7, pool));
-            assert_eq!(config, pair::tcp_socket_sized(7 * (1500 - 40)));
-        };
-        check_refused(&mut pair.a, 2);
-        drop(frame);
-        check_refused(&mut pair.a, 1);
-        drop(datagram);
-        let udp = pair.a.add_udp(udp_config(PORT, 7)).unwrap();
-        pair.a.remove_udp(udp);
-        let tcp = pair.a.add_tcp(pair::tcp_socket_sized(7 * (1500 - 40))).unwrap();
-        pair.a.remove_tcp(tcp);
-        assert_eq!(pair.close(), 0);
-    });
-}
-
-/// A local address the Stack does not own is refused with nothing changed: no slot and no RX
-/// budget taken, so a socket needing the whole remaining pool and the only slot then fits on an
-/// owned address (also outside the subnet). The pool check still comes first.
+/// A local address the Stack does not own is refused with nothing changed: no slot taken, so a
+/// socket needing the only slot then fits on an owned address (also outside the subnet).
 #[zhida_test_support::pinned_test]
 fn unowned_local_address_refused_without_change() {
     const OWNED: Ipv4Address = Ipv4Address::new(10, 9, 0, 1);
     with_eal(|eal| {
         let fixture = RingPort::new("udpunown", 16, 16);
         let port_config = fixture.config();
-        let reserve = rx_reserve(port_config.rx_descriptors, 8, port_config.rx_pool.cache_size);
-        let pool = usize::try_from(port_config.rx_pool.count).unwrap();
         let owned = [Ipv4Cidr::new(OWNED, 32)];
         let config = StackConfig { owned_ipv4: &owned, ..config(1) };
         let mut stack = match Stack::new(fixture.open_with(eal, port_config), config, T0) {
             Ok(stack) => stack,
             Err((_, error)) => panic!("{error}"),
         };
-        let whole = pool - reserve;
-        let at = |local_addr| UdpConfig { local_addr: Some(local_addr), ..udp_config(PORT, whole) };
+        let at = |local_addr| UdpConfig { local_addr: Some(local_addr), ..udp_config(PORT, 6) };
         for unowned in [Ipv4Address::new(10, 0, 0, 9), Ipv4Address::new(10, 9, 0, 2), Ipv4Address::BROADCAST] {
             assert_eq!(stack.add_udp(at(unowned)).unwrap_err(), AddUdpError::Unaddressable);
-            assert_eq!(
-                stack.add_udp(UdpConfig { rx_queue: whole + 1, ..at(unowned) }).unwrap_err(),
-                AddUdpError::RxPoolTooSmall { required: pool + 1, pool }
-            );
         }
         let handle = stack.add_udp(at(OWNED)).unwrap();
         assert_eq!(stack.udp(&handle).config().local_addr, Some(OWNED));

@@ -21,7 +21,7 @@ fn open_passes_config_paths_to_stack() {
     }];
     let mut sizing = common::sizing();
     sizing.max_udp_sockets = 1;
-    sizing.udp_rx_datagrams = 1;
+    sizing.rx_share = 1;
     let mut now = 0i64;
     // SAFETY: EAL creates this private net_tap vdev; this worker owns it and its
     // packets, and the vdev lives for the process lifetime.

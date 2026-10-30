@@ -255,6 +255,10 @@ unsafe extern "C" {
 
     /// Name of the mempool ops backing `mp` (for example `ring_sp_sc`).
     pub fn zhida_mempool_ops_name(mp: *const rte_mempool) -> *const std::ffi::c_char;
+
+    /// Free objects the lcore owning `cache` can allocate from `mp`: the backing
+    /// store's count plus `cache`'s length. Other lcores' caches are not counted.
+    pub fn zhida_mempool_free_count(mp: *const rte_mempool, cache: *const rte_mempool_cache) -> u32;
 }
 
 /// Allocate an mbuf from a mempool.

@@ -525,6 +525,18 @@ impl RxStore {
         self.pending = false;
     }
 
+    /// Drop every view past the in-order data, releasing their frames; the in-order views stay
+    /// as they are. Visits only the dropped views. The in-order data ends at a view boundary:
+    /// a view that continues it would be in order itself.
+    pub(super) fn drop_out_of_order(&mut self) {
+        self.assert_attached();
+        let end = self.absolute(self.in_order_len());
+        while self.views.back().is_some_and(|view| view.start >= end) {
+            self.views.pop_back();
+        }
+        debug_assert!(self.views.back().is_none_or(|view| view.end() == end));
+    }
+
     pub(super) fn truncate_from(&mut self, offset: usize) {
         let offset = self.absolute(offset);
         assert!(

@@ -87,7 +87,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, Ipv4Address, Ipv4Cidr, ETHERNET_HEADER_LEN,
     IPV4_HEADER_LEN,
 };
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Packet, Port, PortConfig, RxBurst, Stack, StackConfig, TxPacket};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::*;
@@ -243,20 +243,12 @@ struct Templates {
 fn tcp_bench(c: &mut Criterion, eal: &Eal) -> Templates {
     let configs = [config(Side::A), config(Side::B)];
     let mut pair = Pair::with_ports(eal, ["sbta", "sbtb"], configs, T0, 16, |side, port| {
-        port.rx_pool.count = rx_pool_count(
-            rx_reserve(
-                port.rx_descriptors,
-                configs[side.index()].rx_staging,
-                port.rx_pool.cache_size,
-            ),
-            port.mtu,
-            [TCP_BUFFER],
-        );
-        port.frame_pool.count = frame_pool_count(
-            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-            port.mtu,
-            [TCP_BUFFER],
-        );
+        port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+            port.rx_descriptors,
+            configs[side.index()].rx_staging,
+            port.rx_pool.cache_size,
+        ), zhida_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));
+        port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));
     });
     let (mut data, mut ack) = (Vec::new(), Vec::new());
     let mut established = Established::connect(&mut pair);

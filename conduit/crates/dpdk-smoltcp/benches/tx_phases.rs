@@ -74,7 +74,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     IPV4_HEADER_LEN,
 };
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, Sent, TcpHandle, Turn,
+    frame_reserve, rx_reserve, Eal, Sent, TcpHandle, Turn,
 };
 
 use zhida_test_kit::pair::{
@@ -352,21 +352,13 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
             port.tx_pool.count = TX_POOL;
             // The frame reserve, the socket's frame limit and the one frame
             // the application holds between allocate and enqueue.
-            port.frame_pool.count = frame_pool_count(
-                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                port.mtu,
-                [buffer],
-            ) + 1;
+            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [buffer])) + 1;
             // A's RX pool also holds up to RING - 1 injected ACKs.
-            port.rx_pool.count = rx_pool_count(
-                rx_reserve(
-                    port.rx_descriptors,
-                    configs[side.index()].rx_staging,
-                    port.rx_pool.cache_size,
-                ),
-                port.mtu,
-                [buffer],
-            ) + RING;
+            port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+                port.rx_descriptors,
+                configs[side.index()].rx_staging,
+                port.rx_pool.cache_size,
+            ), zhida_test_kit::pair::windows(port.mtu, [buffer])) + RING;
         },
         |side, port| {
             if side == Side::A && case.offload {

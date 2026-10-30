@@ -36,16 +36,16 @@ pub fn sizing(
     };
     let socket = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
     let mtu = usize::from(config.mtu);
-    let budget = |per_socket: fn(&tcp::Config, usize) -> usize| match mode {
+    // Shares independent of the socket count: one TCP socket's full window each way and one
+    // UDP socket's queue, drawn on by every socket.
+    let window = |per_socket: fn(&tcp::Config, usize) -> usize| match mode {
         Mode::Feed(_) => per_socket(feed.expect("feed mode has a config"), mtu),
-        _ => tcp
-            .checked_mul(per_socket(&socket, mtu))
-            .expect("TCP frame budget overflow"),
+        _ if tcp > 0 => per_socket(&socket, mtu),
+        _ => 0,
     };
     Sizing {
-        tcp_rx_frames: budget(tcp::rx_mbuf_budget),
-        tcp_tx_frames: budget(tcp::tx_mbuf_budget),
-        udp_rx_datagrams: udp.checked_mul(UDP_QUEUE).expect("UDP RX budget overflow"),
+        rx_share: window(tcp::rx_mbuf_budget) + if udp > 0 { UDP_QUEUE } else { 0 },
+        frame_share: window(tcp::tx_mbuf_budget),
         max_sockets: tcp.max(1),
         max_udp_sockets: udp,
         rx_staging: STAGING,
@@ -100,7 +100,7 @@ pub fn close(port: Port, mut code: i32) -> i32 {
 mod tests {
     use std::ffi::OsString;
 
-    use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+    use dpdk_smoltcp::smoltcp::socket::tcp;
 
     use super::{feed_socket, sizing, STAGING, UDP_QUEUE};
     use crate::args::Args;
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn sizing_matches_rx_pool_count() {
+    fn sizing_shares_hold_one_window_whatever_the_socket_count() {
         for (args, tcp, udp, bytes) in [
             (
                 &["--config", "nic.json", "info"][..],
@@ -146,12 +146,11 @@ mod tests {
                 let config = test_config(mtu, "[]");
                 let socket = feed_socket(&config, "203.0.113.1".parse().unwrap());
                 let sizing = sizing(&config, &args.mode, Some(&socket));
-                let reserve = rx_reserve(config.descriptors, STAGING, 8) + udp * UDP_QUEUE;
-                let old = rx_pool_count(reserve, mtu, std::iter::repeat_n(bytes, tcp));
-                let new = rx_reserve(config.descriptors, sizing.rx_staging, 8)
-                    + sizing.udp_rx_datagrams
-                    + sizing.tcp_rx_frames;
-                assert_eq!(u32::try_from(new).unwrap(), old);
+                let window = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
+                let expected = usize::from(tcp > 0) * tcp::rx_mbuf_budget(&window, usize::from(mtu))
+                    + usize::from(udp > 0) * UDP_QUEUE;
+                assert_eq!(sizing.rx_share, expected);
+                assert_eq!(sizing.rx_staging, STAGING);
             }
         }
     }
@@ -173,16 +172,16 @@ mod tests {
         assert_eq!(capped, 180);
         assert_eq!(uncapped, 30);
         let feed_sizing = sizing(&config, &args.mode, Some(&socket));
-        assert_eq!(feed_sizing.tcp_rx_frames, capped);
+        assert_eq!(feed_sizing.rx_share, capped);
         // The send side's frame limit follows the same 1460-byte cap: 256 KiB / 1460.
-        assert_eq!(feed_sizing.tcp_tx_frames, 180);
+        assert_eq!(feed_sizing.frame_share, 180);
         assert!(capped > uncapped);
 
         let socket = feed_socket(&config, "203.0.114.1".parse().unwrap());
         let feed_sizing = sizing(&config, &args.mode, Some(&socket));
-        assert_eq!(feed_sizing.tcp_rx_frames, uncapped);
+        assert_eq!(feed_sizing.rx_share, uncapped);
         // Uncapped at MTU 9000: 256 KiB / 8960.
-        assert_eq!(feed_sizing.tcp_tx_frames, 30);
+        assert_eq!(feed_sizing.frame_share, 30);
     }
 
     fn test_config(mtu: u16, paths: &str) -> zhida_netconf::Config {
