@@ -18,7 +18,7 @@ use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint, boxed};
-use switchnet::{NetHandle, TcpStream, Turn, tcp};
+use switchnet::{Net, NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Error as WsError, Message};
@@ -138,14 +138,14 @@ fn until_client_on<T: Send + 'static, H: 'static, F: Future<Output = H> + 'stati
     until_client_watching(tap, listener_setup, serve, client, |_| {})
 }
 
-/// `until_client_on`, calling `each_turn` with every Net turn's report (before the client is
+/// `until_client_on`, calling `each_turn` with the Net after every turn (before the client is
 /// polled in that round).
 fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     tap: &TapConfig,
     listener_setup: impl FnOnce(&TcpListener),
     serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
     client: impl FnOnce(NetHandle, TcpStream) -> F + 'static,
-    mut each_turn: impl FnMut(&Turn),
+    mut each_turn: impl FnMut(&Net),
 ) -> T {
     let socket = tap.socket;
     with_tap_net(tap, |net, clock| {
@@ -164,7 +164,8 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();
-            each_turn(&net.turn(clock.now()).expect("turn the Net"));
+            net.turn(clock.now()).expect("turn the Net");
+            each_turn(net);
             rt.poll(clock.ms()).expect("poll the client");
             std::thread::sleep(ROUND_SLEEP);
         }
@@ -1296,16 +1297,16 @@ fn wss_with_a_fragment_limit_below_a_control_frame_is_refused() {
 /// WebSocket close), and the client reads only after the Net took all of it in: by `recv`
 /// (the message, then the outcome) or by `linger`.
 ///
-/// The barrier: the server signals once `close` returned (the kernel hands the reset to the
-/// tap device within that call); from then on the Net is turned until a turn finds nothing
-/// received or staged, so every segment the server sent, the reset included, has been
-/// processed; only then does the client read.
+/// The barrier, with a reset: the client reads only once its socket reports the peer's reset
+/// (the Net has processed every segment before it too). Without one: once the server
+/// returned after its FIN, and the Net turned since.
 fn fin_then(reset: bool, lingering: bool) -> Result<(), WssError> {
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let outcome = Rc::new(RefCell::new(None));
     let seen = outcome.clone();
     let taken_in = Rc::new(Cell::new(false));
     let client_taken_in = taken_in.clone();
+    let mut rounds = 0;
     let mut told = false;
     until_client_watching(
         &TAP,
@@ -1318,8 +1319,9 @@ fn fin_then(reset: bool, lingering: bool) -> Result<(), WssError> {
                 let (go_tx, go_rx) = mpsc::channel();
                 go_tx.send(()).unwrap();
                 reset_when_told(go_rx)(sock);
+            } else {
+                done_tx.send(()).unwrap();
             }
-            done_tx.send(()).unwrap();
         },
         move |handle, stream| async move {
             let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
@@ -1336,11 +1338,19 @@ fn fin_then(reset: bool, lingering: bool) -> Result<(), WssError> {
             *seen.borrow_mut() = Some(got);
             ws
         },
-        move |turn| {
-            if told && turn.rx_received == 0 && turn.rx_staged == 0 {
-                taken_in.set(true);
+        move |net| {
+            if taken_in.get() {
+                return;
             }
-            told |= done_rx.try_recv().is_ok();
+            if reset {
+                rounds += 1;
+                assert!(rounds < 100_000, "the peer's reset never reached the client's socket");
+                taken_in.set(net.tcp_reset_by_peer());
+            } else {
+                // a turn after the server's FIN was sent
+                taken_in.set(told);
+                told |= done_rx.try_recv().is_ok();
+            }
         },
     );
     outcome.take().expect("the client ran")
