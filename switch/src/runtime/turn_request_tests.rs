@@ -24,11 +24,17 @@ enum Act {
     RequestAndFinish,
     /// Set the turn request and panic.
     RequestAndPanic,
+    /// Set the turn request and park; later polls finish.
+    RequestAndPark,
+    /// Panic.
+    Panic,
+    /// Wake itself, set the turn request and finish.
+    WakeRequestAndFinish,
     /// Defer itself; the next poll finishes.
     Defer,
 }
 
-/// Logs its name on every poll; drops count in `drops`.
+/// Logs its name on every poll and in `dropped` when dropped; drops count in `drops`.
 struct Step {
     name: &'static str,
     act: Act,
@@ -37,6 +43,7 @@ struct Step {
     log: Log,
     waker: Rc<RefCell<Option<Waker>>>,
     drops: Rc<Cell<u32>>,
+    dropped: Log,
 }
 
 impl Future for Step {
@@ -63,6 +70,16 @@ impl Future for Step {
                 self.request.set();
                 panic_any(7u32)
             }
+            Act::RequestAndPark => {
+                self.request.set();
+                Poll::Pending
+            }
+            Act::Panic => panic_any(7u32),
+            Act::WakeRequestAndFinish => {
+                cx.waker().wake_by_ref();
+                self.request.set();
+                Poll::Ready(())
+            }
             Act::Defer => {
                 StoredWaker::new(cx).wake_deferred();
                 Poll::Pending
@@ -74,6 +91,7 @@ impl Future for Step {
 impl Drop for Step {
     fn drop(&mut self) {
         self.drops.set(self.drops.get() + 1);
+        self.dropped.borrow_mut().push(self.name);
     }
 }
 
@@ -88,6 +106,7 @@ struct Fixture {
     log: Log,
     wakers: Vec<Rc<RefCell<Option<Waker>>>>,
     drops: Rc<Cell<u32>>,
+    dropped: Log,
 }
 
 impl Fixture {
@@ -96,7 +115,7 @@ impl Fixture {
         let runtime = Runtime::new(0);
         let request = runtime.turn_request();
         let (log, drops) = (Log::default(), Rc::new(Cell::new(0)));
-        let mut f = Self { runtime, request, log, wakers: Vec::new(), drops };
+        let mut f = Self { runtime, request, log, wakers: Vec::new(), drops, dropped: Log::default() };
         for &(name, act) in steps {
             f.spawn(name, act);
         }
@@ -113,9 +132,15 @@ impl Fixture {
             log: self.log.clone(),
             waker: waker.clone(),
             drops: self.drops.clone(),
+            dropped: self.dropped.clone(),
         };
         self.runtime.spawner().spawn(step(task)).unwrap();
         self.wakers.push(waker);
+    }
+
+    /// The task header of the `index`th task spawned (its waker's data pointer), once polled.
+    fn slot(&self, index: usize) -> *const () {
+        self.wakers[index].borrow().as_ref().unwrap().data()
     }
 
     fn wake(&self, index: usize) {
@@ -225,4 +250,68 @@ fn wakes_while_a_round_is_left_run_after_it_in_order() {
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (4, 0));
     assert_eq!(f.taken(), ["b", "c", "d", "e"]);
+}
+
+/// Two stops in one resume sequence, a reused slot and a panic with tasks still queued:
+/// a finishes and stops the poll; n, spawned between polls, takes a's slot; b, in the
+/// stopped round, stops the resume; c panics with d still in the round. Each task is
+/// polled in that order and dropped once.
+#[test]
+fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
+    let mut f = Fixture::new(&[
+        ("a", Act::RequestAndFinish),
+        ("b", Act::RequestAndPark),
+        ("c", Act::Panic),
+        ("d", Act::Park),
+    ]);
+    let root = f.root();
+    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(f.taken(), ["a"]);
+    assert_eq!(*f.dropped.borrow(), ["a"]);
+    assert_eq!(unsafe { Executor::tail_len(root) }, 3);
+    f.request.clear();
+    let a_slot = f.slot(0);
+    f.spawn("n", Act::Park);
+    assert_eq!(unsafe { Executor::incoming_last(root) }.cast(), a_slot, "n did not take a's freed slot");
+    let report = f.runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 4));
+    assert_eq!(f.taken(), ["b"]);
+    assert_eq!(unsafe { Executor::tail_len(root) }, 2);
+    assert_eq!(unsafe { Executor::queue_lengths(root) }, (1, 0));
+    f.request.clear();
+    let payload = catch_unwind(AssertUnwindSafe(|| f.runtime.poll(0))).unwrap_err();
+    assert_eq!(payload.downcast_ref::<u32>(), Some(&7));
+    assert_eq!(f.taken(), ["c"]);
+    assert_eq!(f.runtime.poll(0).unwrap_err(), crate::RuntimeError::Panicked);
+    f.runtime.shutdown();
+    assert!(f.taken().is_empty(), "a task was polled after the panic");
+    let mut dropped = f.dropped.borrow().clone();
+    dropped.sort_unstable();
+    assert_eq!(dropped, ["a", "b", "c", "d", "n"]);
+}
+
+/// A task that wakes itself, requests a turn and finishes in one poll: the poll stops after
+/// it, and its slot stays occupied until its queued wake drains in the next poll.
+#[test]
+fn a_self_wake_with_a_request_and_ready_in_one_poll() {
+    let mut f = Fixture::new(&[("a", Act::WakeRequestAndFinish), ("b", Act::Park)]);
+    let report = f.runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 1));
+    assert_eq!(f.taken(), ["a"]);
+    assert_eq!(f.drops.get(), 1);
+    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 1);
+    assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (1, 0));
+    f.spawn("n", Act::Park);
+    let n_slot = unsafe { Executor::incoming_last(f.root()) }.cast();
+    assert_ne!(n_slot, f.slot(0), "n took a slot whose wake is still queued");
+    f.request.clear();
+    let report = f.runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (2, 2));
+    assert_eq!(f.taken(), ["b", "n"]);
+    f.spawn("m", Act::Park);
+    let m_slot = unsafe { Executor::incoming_last(f.root()) }.cast();
+    assert_eq!(m_slot, f.slot(0), "a's slot was not freed when its wake drained");
+    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(f.taken(), ["m"]);
+    assert_eq!(f.drops.get(), 1);
 }

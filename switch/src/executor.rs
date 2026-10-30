@@ -516,6 +516,12 @@ impl Executor {
         unsafe { (*this).task_count }
     }
 
+    /// The last entry of `incoming` (a spawn's, right after it).
+    #[cfg(test)]
+    pub(crate) unsafe fn incoming_last(this: *mut Self) -> *const TaskHeader {
+        unsafe { *(*this).incoming.last().unwrap() }
+    }
+
     /// Entries of the stopped round still to poll.
     #[cfg(test)]
     pub(crate) unsafe fn tail_len(this: *mut Self) -> usize {
