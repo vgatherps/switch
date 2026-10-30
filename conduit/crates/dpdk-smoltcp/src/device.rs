@@ -122,8 +122,8 @@ impl Device {
         self.tx.len()
     }
 
-    pub(crate) fn rx_pool_low(&self) -> bool {
-        self.port.rx_pool_low()
+    pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
+        self.port.rx_pool_low(received)
     }
 
     /// Release every staged, pending and spare packet, then return the Port.
