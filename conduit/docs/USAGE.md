@@ -773,7 +773,9 @@ FIFO. They remain eligible for later flushes, subject to PMD acceptance.
 
 `Stack::tcp(&handle)` reads state, queues, endpoints, and counters and marks nothing.
 `tcp_mut(&handle)` schedules a readiness check before `poll_at` or egress; use it for drains and
-changes. Do not swap the socket behind `tcp_mut` with one from another `TcpSet` or Stack.
+changes. Do not swap the socket behind `tcp_mut` with one from another `TcpSet` or Stack. The
+Stack's address guarantees assume its own interface: passing another `Interface`'s `context()` to a
+raw socket method such as `tcp_mut(&h).connect(..)` is unsupported.
 
 ## UDP
 

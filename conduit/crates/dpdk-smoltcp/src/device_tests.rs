@@ -1750,66 +1750,151 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u
     assert_no_pools();
 }
 
+/// Owned by the foreign interface in the tests below, never by the Stack.
+const FOREIGN: Ipv4Address = Ipv4Address::new(10, 0, 0, 78);
+
+/// A Stack on Side A owning `stack_owned` with the peer's MAC resolved and one TCP socket, plus
+/// a separately built Interface that owns `FOREIGN`; its context is what a raw socket method
+/// could be handed instead of the Stack's own.
+fn foreign_context_stack(
+    eal: &crate::Eal,
+    stack_owned: &[smoltcp::wire::Ipv4Cidr],
+) -> (Fixture, crate::Stack, Interface, crate::TcpHandle) {
+    use crate::{Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY};
+    use smoltcp::iface::OwnedIpv4;
+    use smoltcp::wire::{ArpOperation, Ipv4Cidr};
+
+    let subnet = Ipv4Cidr::new(Side::A.ip(), 24);
+    assert!(subnet.contains_addr(&FOREIGN));
+    let (fixture, mut device) = open(eal, 4, 4);
+    let mut config = Config::new(Side::A.mac().into());
+    config.owned_ipv4 = OwnedIpv4::new(&[Ipv4Cidr::new(FOREIGN, 32)], subnet, None).unwrap();
+    let other = Interface::new(config, &mut device, NOW);
+    let arp = zhida_test_kit::ring_port::arp(
+        ArpOperation::Reply,
+        Side::A.mac(),
+        (Side::B.mac(), Side::B.ip()),
+        (Side::A.mac(), Side::A.ip()),
+    );
+    produce(&fixture, &[rx_frame_bytes(&device.port, &arp)]);
+    let config = StackConfig {
+        ethernet: Side::A.mac(),
+        ipv4: subnet,
+        gateway: None,
+        paths: &[],
+        owned_ipv4: stack_owned,
+        random_seed: 1,
+        neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
+        max_sockets: 1,
+        max_udp_sockets: 0,
+        rx_staging: 8,
+        tx_pending: 8,
+    };
+    let mut stack = match Stack::new(device.into_port(), config, NOW) {
+        Ok(stack) => stack,
+        Err((_, error)) => panic!("{error}"),
+    };
+    let handle = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap();
+    stack.turn(NOW, 8).unwrap();
+    assert!(peer_receive(&fixture, 16).is_empty());
+    (fixture, stack, other, handle)
+}
+
+fn close_foreign_context_stack(fixture: Fixture, stack: crate::Stack) {
+    let port = stack.into_port();
+    assert_eq!(in_use(&port), (0, 0));
+    port.try_close().unwrap();
+    fixture.close().unwrap();
+    assert_no_pools();
+}
+
+/// Source address and TCP flags (SYN, RST) of each frame the peer received.
+fn sent_tcp(fixture: &Fixture) -> Vec<(Ipv4Address, bool, bool)> {
+    peer_receive(fixture, 16)
+        .iter()
+        .map(|frame| {
+            let ip = Ipv4Packet::new_checked(&frame.data()[14..]).unwrap();
+            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+            (ip.src_addr(), tcp.syn(), tcp.rst())
+        })
+        .collect()
+}
+
 /// A raw connect given another interface's context, one that owns the source address, then
 /// `Stack::send` with no receive: the Stack's egress checks the tuple against its own addresses
 /// before the first dispatch, so no SYN leaves from an address this Stack does not own and the
 /// socket is reset.
 #[zhida_test_support::pinned_test]
 fn foreign_context_connect_then_send_emits_nothing() {
-    use crate::{Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY};
-    use smoltcp::iface::OwnedIpv4;
     use smoltcp::socket::tcp::State;
-    use smoltcp::wire::{ArpOperation, Ipv4Cidr};
 
     with_test_eal(|eal| {
-        let foreign = Ipv4Address::new(10, 0, 0, 77);
-        let subnet = Ipv4Cidr::new(Side::A.ip(), 24);
-        assert!(subnet.contains_addr(&foreign));
-        let (fixture, mut device) = open(eal, 4, 4);
-        let mut config = Config::new(Side::A.mac().into());
-        config.owned_ipv4 = OwnedIpv4::new(&[Ipv4Cidr::new(foreign, 32)], subnet, None).unwrap();
-        let mut other = Interface::new(config, &mut device, NOW);
-        let arp = zhida_test_kit::ring_port::arp(
-            ArpOperation::Reply,
-            Side::A.mac(),
-            (Side::B.mac(), Side::B.ip()),
-            (Side::A.mac(), Side::A.ip()),
-        );
-        produce(&fixture, &[rx_frame_bytes(&device.port, &arp)]);
-        let config = StackConfig {
-            ethernet: Side::A.mac(),
-            ipv4: subnet,
-            gateway: None,
-            paths: &[],
-            owned_ipv4: &[],
-            random_seed: 1,
-            neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-            max_sockets: 1,
-            max_udp_sockets: 0,
-            rx_staging: 8,
-            tx_pending: 8,
-        };
-        let mut stack = match Stack::new(device.into_port(), config, NOW) {
-            Ok(stack) => stack,
-            Err((_, error)) => panic!("{error}"),
-        };
-        let handle = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap();
-        stack.turn(NOW, 8).unwrap();
-        assert!(peer_receive(&fixture, 16).is_empty());
+        let (fixture, mut stack, mut other, handle) = foreign_context_stack(eal, &[]);
         stack
             .tcp_mut(&handle)
-            .connect(other.context(), (Side::B.ip(), 80), (foreign, 49152))
+            .connect(other.context(), (Side::B.ip(), 80), (FOREIGN, 49152))
             .unwrap();
         assert_eq!(stack.tcp(&handle).state(), State::SynSent);
         stack.send().unwrap();
-        assert!(peer_receive(&fixture, 16).is_empty());
+        assert!(sent_tcp(&fixture).is_empty());
         assert_eq!(stack.tcp(&handle).state(), State::Closed);
         assert_eq!(stack.tcp(&handle).local_endpoint(), None);
-        let port = stack.into_port();
-        assert_eq!(in_use(&port), (0, 0));
-        port.try_close().unwrap();
-        fixture.close().unwrap();
-        assert_no_pools();
+        close_foreign_context_stack(fixture, stack);
+    });
+}
+
+/// A socket admitted on an owned address X keeps no ownership for its next tuple: abort, a raw
+/// connect from the foreign address and abort again, all before the Stack runs, close the socket
+/// with the foreign tuple and no flow to admit. `Stack::send` sends no RST from the foreign
+/// address and resets the socket.
+#[zhida_test_support::pinned_test]
+fn aborted_foreign_connect_does_not_inherit_ownership() {
+    use smoltcp::socket::tcp::State;
+    use smoltcp::wire::Ipv4Cidr;
+
+    with_test_eal(|eal| {
+        let owned = Ipv4Address::new(10, 0, 0, 77);
+        let (fixture, mut stack, mut other, handle) =
+            foreign_context_stack(eal, &[Ipv4Cidr::new(owned, 32)]);
+        stack.connect(&handle, (Side::B.ip(), 80), (owned, 49152)).unwrap();
+        stack.send().unwrap();
+        assert_eq!(sent_tcp(&fixture), [(owned, true, false)]);
+        let socket = stack.tcp_mut(&handle);
+        socket.abort();
+        socket
+            .connect(other.context(), (Side::B.ip(), 80), (FOREIGN, 49153))
+            .unwrap();
+        socket.abort();
+        stack.send().unwrap();
+        assert_eq!(sent_tcp(&fixture), []);
+        assert_eq!(stack.tcp(&handle).state(), State::Closed);
+        assert_eq!(stack.tcp(&handle).local_endpoint(), None);
+        close_foreign_context_stack(fixture, stack);
+    });
+}
+
+/// Refusing a foreign tuple changes the socket's state, so it fires a token armed after the
+/// connect: the waiter learns the socket closed instead of sleeping with no deadline.
+#[zhida_test_support::pinned_test]
+fn refused_foreign_connect_fires_armed_token() {
+    use smoltcp::iface::ReadySide;
+    use smoltcp::socket::tcp::State;
+
+    with_test_eal(|eal| {
+        let (fixture, mut stack, mut other, handle) = foreign_context_stack(eal, &[]);
+        stack
+            .tcp_mut(&handle)
+            .connect(other.context(), (Side::B.ip(), 80), (FOREIGN, 49152))
+            .unwrap();
+        let key = stack.tcp_ready_key(&handle);
+        stack.arm_tcp(key, ReadySide::Rx, 7);
+        assert_eq!(stack.pop_fired(), None);
+        stack.send().unwrap();
+        assert_eq!(stack.pop_fired(), Some(7));
+        assert_eq!(stack.pop_fired(), None);
+        assert_eq!(stack.tcp(&handle).state(), State::Closed);
+        assert!(sent_tcp(&fixture).is_empty());
+        close_foreign_context_stack(fixture, stack);
     });
 }
 

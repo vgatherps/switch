@@ -741,20 +741,36 @@ impl TcpSet<'_> {
 
     /// Registers the slot's flow key after an application change, with `cx` the interface
     /// driving the set. A new exact tuple whose local address `cx` neither has nor owns resets
-    /// the socket and registers nothing, so demux and egress only ever see tuples on our
-    /// addresses.
+    /// the socket, fires its tokens (its readiness changed) and registers nothing, so demux and
+    /// egress only ever see tuples on our addresses.
     pub(crate) fn sync_identity(&mut self, cx: &InterfaceInner, index: usize) {
         let mut key = self.slot_flow_key(index);
         if key == self.flow_slots[index].registered {
             return;
         }
         if let FlowKey::Exact { .. } = key
-            && let Some(item) = &mut self.sockets[index].inner
-            && !item.socket.admit_local(cx)
+            && !self.admit_exact(cx, index)
         {
             key = FlowKey::None;
         }
         self.register_identity(index, key);
+    }
+
+    /// `admit_local` for a new exact tuple, firing the socket's tokens when it is refused. Out of
+    /// line: it runs once per connection, and inlined it slows `sync_identity`'s unchanged-key
+    /// return, which runs for every dirty socket.
+    #[cold]
+    #[inline(never)]
+    fn admit_exact(&mut self, cx: &InterfaceInner, index: usize) -> bool {
+        let item = self.sockets[index]
+            .inner
+            .as_mut()
+            .expect("exact flow key without a socket");
+        if item.socket.admit_local(cx) {
+            return true;
+        }
+        self.fire(index);
+        false
     }
 
     /// Registers the slot's flow key after the driving interface changed the socket's state

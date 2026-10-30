@@ -762,7 +762,9 @@ impl Stack {
     /// Change a socket and schedule a readiness check before the next
     /// `poll_at` call or egress pass. No public API hands out an owned socket, so
     /// this reference cannot be overwritten with a new one; swapping it with a
-    /// socket held by another `TcpSet` or Stack is unsupported.
+    /// socket held by another `TcpSet` or Stack is unsupported. The Stack's address
+    /// guarantees assume its own interface: passing another `Interface`'s `context()`
+    /// to a raw socket method such as `connect` is unsupported.
     pub fn tcp_mut(&mut self, handle: &TcpHandle) -> &mut tcp::Socket<'static> {
         let raw = self.tcp_raw(handle);
         self.sockets.get_mut(raw)
