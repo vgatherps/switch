@@ -108,7 +108,8 @@ fn port_config<'a>(port_id: u16, config: &TapConfig, [rx, tx, frame]: &'a [CStri
         data_room_size: RTE_PKTMBUF_HEADROOM as u16 + 2048,
         socket_id: -1,
     };
-    let sockets = |budget: usize| budget * config.max_sockets;
+    // Beyond the reserves: one socket's full window plus 64, shared by every socket.
+    let share = |frames: usize| frames + 64;
     PortConfig {
         port_id,
         mtu: MTU,
@@ -117,9 +118,9 @@ fn port_config<'a>(port_id: u16, config: &TapConfig, [rx, tx, frame]: &'a [CStri
         rx_burst: 32,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(rx.as_c_str(), rx_reserve(16, 32, 8) + sockets(tcp::rx_mbuf_budget(&config.socket, MTU.into()))),
+        rx_pool: pool(rx.as_c_str(), rx_reserve(16, 32, 8) + share(tcp::rx_mbuf_budget(&config.socket, MTU.into()))),
         tx_pool: pool(tx.as_c_str(), 127),
-        frame_pool: pool(frame.as_c_str(), frame_reserve(16, 32) + sockets(tcp::tx_mbuf_budget(&config.socket, MTU.into()))),
+        frame_pool: pool(frame.as_c_str(), frame_reserve(16, 32) + share(tcp::tx_mbuf_budget(&config.socket, MTU.into()))),
         offloads: Offloads::default(),
     }
 }

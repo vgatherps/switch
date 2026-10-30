@@ -19,8 +19,6 @@ const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EchoError {
     SocketsFull,
-    RxPoolTooSmall { required: usize, pool: usize },
-    TxFramePoolTooSmall { required: usize, pool: usize },
     Listen(tcp::ListenError),
 }
 
@@ -28,18 +26,6 @@ impl fmt::Display for EchoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EchoError::SocketsFull => write!(f, "stack has no free socket slot"),
-            EchoError::RxPoolTooSmall { required, pool } => {
-                write!(
-                    f,
-                    "RX pool has {pool} mbufs; adding this socket requires {required}"
-                )
-            }
-            EchoError::TxFramePoolTooSmall { required, pool } => {
-                write!(
-                    f,
-                    "frame pool has {pool} mbufs; adding this socket requires {required}"
-                )
-            }
             EchoError::Listen(error) => write!(f, "listen failed: {error}"),
         }
     }
@@ -71,15 +57,7 @@ impl EchoServer {
         for _ in 0..listeners {
             let added = stack
                 .add_tcp(listener(buffer))
-                .map_err(|error| match error {
-                    AddTcpError::SocketsFull(_) => EchoError::SocketsFull,
-                    AddTcpError::RxPoolTooSmall { required, pool, .. } => {
-                        EchoError::RxPoolTooSmall { required, pool }
-                    }
-                    AddTcpError::TxFramePoolTooSmall { required, pool, .. } => {
-                        EchoError::TxFramePoolTooSmall { required, pool }
-                    }
-                })
+                .map_err(|AddTcpError::SocketsFull(_)| EchoError::SocketsFull)
                 .and_then(|handle| {
                     if let Err(error) = stack.listen(&handle, port) {
                         stack.remove_tcp(handle);

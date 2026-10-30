@@ -12,9 +12,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
     TcpTimestampRepr,
 };
-use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, Stack, StackConfig,
-};
+use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, Stack, StackConfig};
 use tap_echo::{EchoError, EchoServer};
 
 use zhida_test_kit::{pair, ring_port, with_eal};
@@ -881,20 +879,14 @@ impl Server {
         let fixture = RingPort::new(name, 16, 16);
         let stack_config = config(Side::B, listeners);
         let mut port_config = fixture.config();
-        port_config.rx_pool.count = rx_pool_count(
-            rx_reserve(
-                port_config.rx_descriptors,
-                stack_config.rx_staging,
-                port_config.rx_pool.cache_size,
-            ),
-            port_config.mtu,
-            std::iter::repeat_n(1024, listeners),
-        );
-        port_config.frame_pool.count = frame_pool_count(
-            frame_reserve(port_config.tx_descriptors, stack_config.tx_pending),
-            port_config.mtu,
-            std::iter::repeat_n(1024, listeners),
-        );
+        let share = |reserve: usize| u32::try_from(reserve + pair::SHARE).unwrap();
+        port_config.rx_pool.count = share(rx_reserve(
+            port_config.rx_descriptors,
+            stack_config.rx_staging,
+            port_config.rx_pool.cache_size,
+        ));
+        port_config.frame_pool.count =
+            share(frame_reserve(port_config.tx_descriptors, stack_config.tx_pending));
         let mut stack = match Stack::new(fixture.open_with(eal, port_config), stack_config, T0) {
             Ok(stack) => stack,
             Err((_, error)) => panic!("{error}"),

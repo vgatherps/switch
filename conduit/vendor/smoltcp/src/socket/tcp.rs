@@ -41,7 +41,7 @@ pub struct Config {
     pub mss_cap: Option<u16>,
 }
 
-/// RX mbufs a socket built from `config` is admitted with:
+/// RX mbufs a socket built from `config` may hold at most (its RX frame cap):
 /// max(ceil(rx_capacity / min(ip_mtu - 40, mss_cap)), 6).
 /// An IPv4 TCP segment without options has 40 bytes of headers. Six
 /// mbufs cover small receive buffers and short segments.
@@ -978,7 +978,7 @@ impl<'a> Socket<'a> {
         self.mss_cap = cap.and_then(core::num::NonZeroU16::new);
     }
 
-    /// RX mbufs needed to admit this socket using its MSS cap; see [`rx_mbuf_budget`].
+    /// The RX frame cap this socket gets from its MSS cap; see [`rx_mbuf_budget`].
     /// Panics if `ip_mtu` is below 68.
     pub(crate) fn rx_mbuf_budget(&self, ip_mtu: usize) -> usize {
         rx_mbuf_budget_for_payload(
@@ -987,7 +987,7 @@ impl<'a> Socket<'a> {
         )
     }
 
-    /// Return the socket's admitted RX frame count.
+    /// Return the socket's RX frame cap: how many RX frames it holds at most.
     pub fn rx_frame_cap(&self) -> usize {
         self.rx_mbuf_cap as usize
     }
@@ -1001,8 +1001,7 @@ impl<'a> Socket<'a> {
     /// The count survives reset and reconnect; per-frame bytes follow each connection.
     /// Panics if the app still holds received frames, `ip_mtu` is below 68,
     /// or the frame count exceeds u32.
-    /// Use [`crate::iface::TcpSet::add_admitted`] after the pool has admitted
-    /// [`rx_mbuf_budget`].
+    /// Used by [`crate::iface::TcpSet::add_admitted`].
     pub(crate) fn set_rx_mbuf_budget(&mut self, ip_mtu: usize) {
         assert_eq!(self.rx_buffer.shared.held.get(), 0,
             "socket admitted while the app still holds its received frames");
@@ -5382,7 +5381,7 @@ mod test {
         let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
         let handle = set.add(s.socket);
         set.get_mut(handle).set_rx_wake(queue.clone(), handle);
-        let (held, _, _) = set.remove(handle);
+        let held = set.remove(handle);
         frames.pop();
         assert!(drain_wakes(&queue).is_empty(), "removed socket must not queue a wake");
         assert_eq!(held.count(), frames.len());

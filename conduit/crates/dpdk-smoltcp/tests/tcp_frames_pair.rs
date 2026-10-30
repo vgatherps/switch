@@ -4,7 +4,7 @@
 //! each object returned once.
 
 use dpdk_smoltcp::smoltcp::wire::TcpSeqNumber;
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Stack, TcpHandle};
+use dpdk_smoltcp::{frame_reserve, rx_reserve, Stack, TcpHandle};
 use zhida_test_kit::many;
 use zhida_test_kit::pair::{
     self, drain_bytes, establish, establish_sized, new_pair, pattern, segment, App, Dir, Pair,
@@ -24,7 +24,7 @@ fn send_frames(stack: &mut Stack, handle: &TcpHandle, data: &[u8], sent: &mut us
         if room == 0 {
             break;
         }
-        let mut frame = stack.tx_frame().expect("admission backs the socket's frame slots");
+        let mut frame = stack.tx_frame().expect("the frame pool backs the socket's frame slots");
         let len = (data.len() - *sent).min(mss).min(room);
         frame.room_mut()[..len].copy_from_slice(&data[*sent..*sent + len]);
         frame.set_len(len);
@@ -91,16 +91,13 @@ fn tcp_frames_1mib_byte_exact() {
         let configs = [pair::config(Side::A), pair::config(Side::B)];
         let mut pair = Pair::with_ports(eal, ["mibfa", "mibfb"], configs, T0, 16, |side, port| {
             let stack = configs[side.index()];
-            port.rx_pool.count = rx_pool_count(
+            let full = pair::windows(port.mtu, [BUFFER]);
+            port.rx_pool.count = pair::pool_count(
                 rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
-                port.mtu,
-                [BUFFER],
+                full,
             );
-            port.frame_pool.count = frame_pool_count(
-                frame_reserve(port.tx_descriptors, stack.tx_pending),
-                port.mtu,
-                [BUFFER],
-            );
+            port.frame_pool.count =
+                pair::pool_count(frame_reserve(port.tx_descriptors, stack.tx_pending), full);
         });
         let ([client, server], _) = establish_sized(&mut pair, Side::A, BUFFER);
         let data = pattern(1 << 20, 11);

@@ -12,8 +12,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     UdpPacket,
 };
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, AddTcpError, AddUdpError, Eal,
-    Stack, TcpHandle, UdpConfig,
+    frame_reserve, rx_reserve, AddTcpError, Eal, Stack, TcpHandle, UdpConfig,
 };
 
 type Frames = Vec<(Dir, Vec<u8>)>;
@@ -26,7 +25,8 @@ fn new_pair(eal: &Eal, names: [&str; 2]) -> Pair {
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         );
-        port.rx_pool.count = rx_pool_count(reserve, port.mtu, [4096]);
+        // One 4096-byte socket's six RX frames beyond the reserve.
+        port.rx_pool.count = u32::try_from(reserve + 6).unwrap();
     })
 }
 
@@ -97,12 +97,12 @@ fn connect_pair(eal: &Eal, names: [&str; 2]) -> Pair {
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         );
-        port.rx_pool.count = rx_pool_count(reserve, port.mtu, [4096; 3]);
-        port.frame_pool.count = frame_pool_count(
-            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-            port.mtu,
-            [4096; 3],
-        );
+        // Three 4096-byte sockets' six RX and six TX frames each.
+        port.rx_pool.count = u32::try_from(reserve + 18).unwrap();
+        port.frame_pool.count = u32::try_from(
+            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending) + 18,
+        )
+        .unwrap();
     })
 }
 
@@ -559,10 +559,9 @@ fn udp_drop_frees_port() {
         assert_eq!(held.src(), endpoint(Side::B, UDP_PORT));
         assert_eq!(held.payload(), b"held");
         pair.a.remove_udp(replacement);
-        assert!(matches!(
-            pair.a.add_udp(udp_config(2)),
-            Err(AddUdpError::RxPoolTooSmall { .. })
-        ));
+        // The held datagram does not stop a new socket from being added.
+        let other = pair.a.add_udp(udp_config(2)).unwrap();
+        pair.a.remove_udp(other);
         drop(held);
         assert_eq!(pair.in_use()[0].0, idle);
         let replacement = pair.a.add_udp(udp_config(2)).unwrap();
@@ -592,8 +591,7 @@ fn stack_drop_with_live_sockets_returns_mbufs() {
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             );
-            port.rx_pool.count = rx_pool_count(reserve, port.mtu, [4096])
-                .checked_add(2).unwrap();
+            port.rx_pool.count = u32::try_from(reserve + 6 + 2).unwrap();
         });
         let ([a, b], _) = establish(&mut pair, Side::A);
         let udp_a = pair.a.add_udp(udp_config(2)).unwrap();
@@ -649,7 +647,7 @@ fn plain_stack_drop_with_live_sockets_releases_pools() {
             let fixture = &fixtures[side.index()];
             let mut port = fixture.config();
             let reserve = rx_reserve(port.rx_descriptors, config.rx_staging, port.rx_pool.cache_size);
-            port.rx_pool.count = rx_pool_count(reserve, port.mtu, [4096]).checked_add(2).unwrap();
+            port.rx_pool.count = u32::try_from(reserve + 6 + 2).unwrap();
             match Stack::new(fixture.open_with(eal, port), config, T0) {
                 Ok(stack) => stack,
                 Err((_, error)) => panic!("{error}"),
@@ -815,8 +813,7 @@ fn dropped_udp_is_cleaned_at_each_entry() {
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 );
-                port.rx_pool.count = rx_pool_count(reserve, port.mtu, [4096])
-                    .checked_add(1).unwrap();
+                port.rx_pool.count = u32::try_from(reserve + 6 + 1).unwrap();
             });
             let a = pair.a.add_udp(udp_config(1)).unwrap();
             let b = pair.b.add_udp(udp_config(1)).unwrap();

@@ -8,7 +8,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     IpEndpoint, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
     TcpRepr, TcpSeqNumber, TcpTimestampRepr,
 };
-use dpdk_smoltcp::{rx_pool_count, rx_reserve};
+use dpdk_smoltcp::rx_reserve;
 use dpdk_smoltcp::{AddTcpError, Port, Stack, StackConfig, Turn, DEFAULT_NEIGHBOR_CAPACITY};
 
 use zhida_test_kit::pair::{self, ceil_ms, App, Pair, Side};
@@ -130,14 +130,15 @@ fn finish(fixture: RingPort, stack: Stack) {
     fixture.close();
 }
 
-fn limited_stack(eal: &dpdk_smoltcp::Eal, fixture: &RingPort) -> (Stack, usize, usize) {
+/// A Stack with three socket slots whose RX pool is its reserve plus 12 mbufs: two
+/// 4096-byte sockets' worth.
+fn limited_stack(eal: &dpdk_smoltcp::Eal, fixture: &RingPort) -> Stack {
     let mut config = fixture.config();
     let reserve = rx_reserve(config.rx_descriptors, 8, config.rx_pool.cache_size);
-    config.rx_pool.count = rx_pool_count(reserve, config.mtu, [4096; 2]);
-    let pool = usize::try_from(config.rx_pool.count).unwrap();
+    config.rx_pool.count = u32::try_from(reserve + 12).unwrap();
     let port = fixture.open_with(eal, config);
     assert_eq!(port.descriptor_counts().0, 16);
-    (stack(port, 3, 4), reserve, pool)
+    stack(port, 3, 4)
 }
 
 #[zhida_test_support::pinned_test]
@@ -156,170 +157,38 @@ fn sockets_full_returns_config_without_allocating_tx_ring() {
     });
 }
 
+/// The RX pool backs 12 mbufs beyond its reserve; three sockets whose RX frame caps sum to
+/// 45 + 8 + 6 = 59 are all added, each with its own cap, and the third listens.
 #[zhida_test_support::pinned_test]
-fn rx_pool_refusal_returns_config_without_allocating_tx_ring() {
+fn add_tcp_admits_sockets_beyond_the_shared_rx_pool() {
     with_eal(|eal| {
-        let fixture = RingPort::new("rxtxpool", 16, 16);
-        let (mut stack, reserve, pool) = limited_stack(eal, &fixture);
-        let config = tcp::Config {
-            rx_capacity: 65536,
-            tx_capacity: usize::MAX,
-            mss_cap: Some(536),
-        };
+        let fixture = RingPort::new("rxshare", 16, 16);
+        let mut stack = limited_stack(eal, &fixture);
+        let big = stack.add_tcp(pair::tcp_socket_sized(65536)).unwrap();
+        let capped = stack.add_tcp(tcp::Config { mss_cap: Some(512), ..tcp_socket() }).unwrap();
+        let listener = stack.add_tcp(tcp_socket()).unwrap();
+        stack.listen(&listener, 1001).unwrap();
+        assert_eq!(stack.tcp(&big).rx_frame_cap(), 45);
+        assert_eq!(stack.tcp(&capped).rx_frame_cap(), 8);
+        assert_eq!(stack.tcp(&listener).rx_frame_cap(), 6);
+        assert_eq!(stack.tcp(&listener).state(), State::Listen);
         assert_eq!(
-            stack.add_tcp(config).unwrap_err(),
-            AddTcpError::RxPoolTooSmall { config, required: reserve + 123, pool }
+            stack.add_tcp(tcp_socket()).unwrap_err(),
+            AddTcpError::SocketsFull(tcp_socket())
         );
+        stack.remove_tcp(big);
+        let _again = stack.add_tcp(pair::tcp_socket_sized(65536)).unwrap();
         finish(fixture, stack);
     });
 }
 
 #[zhida_test_support::pinned_test]
-fn add_tcp_refuses_when_rx_pool_cannot_back_budget() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxcap", 16, 16);
-        let (mut stack, reserve, pool) = limited_stack(eal, &fixture);
-        assert_eq!(pool, reserve + 2 * 6);
-        let _first = stack.add_tcp(tcp_socket()).unwrap();
-        let _second = stack.add_tcp(tcp_socket()).unwrap();
-        let AddTcpError::RxPoolTooSmall {
-            config: socket,
-            required,
-            pool: actual,
-        } = stack.add_tcp(tcp_socket()).unwrap_err()
-        else {
-            panic!("RX pool should refuse a third socket");
-        };
-        assert_eq!((required, actual), (reserve + 3 * 6, pool));
-        assert_eq!(socket, tcp_socket());
-        finish(fixture, stack);
-
-        let fixture = RingPort::new("rxbig", 16, 16);
-        let (mut stack, reserve, pool) = limited_stack(eal, &fixture);
-        let AddTcpError::RxPoolTooSmall {
-            config: socket,
-            required,
-            pool: actual,
-        } = stack.add_tcp(pair::tcp_socket_sized(65536)).unwrap_err()
-        else {
-            panic!("RX pool should refuse a 64 KiB socket");
-        };
-        assert_eq!((required, actual), (reserve + 45, pool));
-        assert_eq!(socket, pair::tcp_socket_sized(65536));
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn refused_config_returned_unchanged() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxsame", 16, 16);
-        let (mut stack, _, _) = limited_stack(eal, &fixture);
-        let first = stack.add_tcp(tcp_socket()).unwrap();
-        let _second = stack.add_tcp(tcp_socket()).unwrap();
-        let config = tcp::Config { tx_capacity: 1234, mss_cap: Some(1460), ..tcp_socket() };
-        let AddTcpError::RxPoolTooSmall { config: refused, .. } =
-            stack.add_tcp(config).unwrap_err()
-        else {
-            panic!("RX budget should be full");
-        };
-        assert_eq!(refused, config);
-        stack.remove_tcp(first);
-        let handle = stack.add_tcp(refused).unwrap();
-        stack.listen(&handle, 1003).unwrap();
-        assert_eq!(stack.tcp(&handle).state(), State::Listen);
-        assert_eq!(stack.tcp(&handle).listen_endpoint().port, 1003);
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn add_tcp_capped_socket_requires_more_rx_mbufs() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxmss", 16, 16);
-        let (mut stack, reserve, pool) = limited_stack(eal, &fixture);
-        assert_eq!(pool, reserve + 12);
-        let _first = stack.add_tcp(tcp_socket()).unwrap();
-        let mut capped = tcp_socket();
-        capped.mss_cap = Some(512);
-        let AddTcpError::RxPoolTooSmall {
-            config: socket,
-            required,
-            pool: actual,
-        } = stack.add_tcp(capped).unwrap_err()
-        else {
-            panic!("RX pool should refuse the capped socket's eight frames");
-        };
-        assert_eq!((required, actual), (reserve + 6 + 8, pool));
-        assert_eq!(socket, capped);
-        finish(fixture, stack);
-
-        let fixture = RingPort::new("rxmssok", 16, 16);
-        let (mut stack, _, _) = limited_stack(eal, &fixture);
-        let _second = stack.add_tcp(socket).unwrap();
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn listener_costs_m() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxlisten", 16, 16);
-        let (mut stack, reserve, pool) = limited_stack(eal, &fixture);
-        let mut handles = Vec::new();
-        for port in [1001, 1002] {
-            let handle = stack.add_tcp(tcp_socket()).unwrap();
-            stack.listen(&handle, port).unwrap();
-            assert_eq!(stack.tcp(&handle).state(), State::Listen);
-            handles.push(handle);
-        }
-        let config = tcp_socket();
-        let AddTcpError::RxPoolTooSmall {
-            config: socket,
-            required,
-            pool: actual,
-        } = stack.add_tcp(config).unwrap_err()
-        else {
-            panic!("listeners should fill the RX budget");
-        };
-        assert_eq!((required, actual), (reserve + 3 * 6, pool));
-        assert_eq!(socket, config);
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn remove_tcp_releases_admitted_budget_once() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxonce", 16, 16);
-        let mut config = fixture.config();
-        let reserve = rx_reserve(config.rx_descriptors, 8, config.rx_pool.cache_size);
-        config.rx_pool.count = rx_pool_count(reserve, config.mtu, [4096]);
-        let pool = config.rx_pool.count as usize;
-        let mut stack = stack(fixture.open_with(eal, config), 2, 4);
-        let first = stack.add_tcp(tcp_socket()).unwrap();
-        stack.remove_tcp(first);
-        let second = stack.add_tcp(tcp_socket()).unwrap();
-        let AddTcpError::RxPoolTooSmall { config, required, pool: actual } =
-            stack.add_tcp(tcp_socket()).unwrap_err()
-        else {
-            panic!("the second socket must still charge its budget");
-        };
-        assert_eq!(config, tcp_socket());
-        assert_eq!((required, actual), (reserve + 12, pool));
-        stack.remove_tcp(second);
-        let _third = stack.add_tcp(tcp_socket()).unwrap();
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn removed_tcp_frame_keeps_rx_pool_budget_until_dropped() {
+fn removed_tcp_frame_keeps_its_rx_mbuf_until_dropped() {
     held_tcp_frame_after_removal(false);
 }
 
 #[zhida_test_support::pinned_test]
-fn reaped_tcp_frame_keeps_rx_pool_budget_until_dropped() {
+fn reaped_tcp_frame_keeps_its_rx_mbuf_until_dropped() {
     held_tcp_frame_after_removal(true);
 }
 
@@ -331,10 +200,11 @@ fn held_tcp_frame_after_removal(reap: bool) {
             ..pair::config(side)
         });
         let reserve = rx_reserve(16, configs[0].rx_staging, 8);
-        let pool = rx_pool_count(reserve, 1500, [4096]);
+        let pool = u32::try_from(reserve + 6).unwrap();
         let names = if reap { ["rxreapa", "rxreapb"] } else { ["rxhelda", "rxheldb"] };
         let mut pair = Pair::with_pools(eal, names, configs, pair::T0, 16, pool, 63, 63);
         let ([client, server], _) = pair::establish(&mut pair, Side::A);
+        let idle = pair.in_use()[1].0;
         pair.a.tcp_mut(&client).set_ack_delay(None);
         pair.b.tcp_mut(&server).set_ack_delay(None);
         assert_eq!(pair.a.tcp_mut(&client).send_slice(b"held"), Ok(4));
@@ -372,66 +242,18 @@ fn held_tcp_frame_after_removal(reap: bool) {
         } else {
             pair.b.remove_tcp(server);
         }
-        let AddTcpError::RxPoolTooSmall { config: socket, required, pool: actual } =
-            pair.b.add_tcp(tcp_socket()).unwrap_err()
-        else {
-            panic!("the held frame must still count after removal");
-        };
-        assert_eq!(socket, tcp_socket());
-        assert_eq!((required, actual), (reserve + 6 + 1, pool as usize));
+        assert_eq!(pair.in_use()[1].0, idle + 1, "the held frame keeps its RX mbuf");
+        let replacement = pair.b.add_tcp(tcp_socket()).unwrap();
         assert_eq!(frame.payload(), b"held");
         drop(frame);
-        let _replacement = pair.b.add_tcp(socket).unwrap();
+        assert_eq!(pair.in_use()[1].0, idle);
+        drop(replacement);
         assert_eq!(pair.close(), 0);
     });
 }
 
 #[zhida_test_support::pinned_test]
-fn remove_tcp_discards_unread_rx_and_returns_budget() {
-    with_eal(|eal| {
-        let configs = [Side::A, Side::B].map(|side| StackConfig {
-            max_udp_sockets: 0,
-            max_sockets: 2,
-            ..pair::config(side)
-        });
-        let reserve = rx_reserve(16, configs[0].rx_staging, 8);
-        let pool = rx_pool_count(reserve, 1500, [4096]);
-        let mut pair = Pair::with_pools(eal, ["rxrma", "rxrmb"], configs, pair::T0, 16, pool, 63, 63);
-        let (handles, _) = pair::establish(&mut pair, Side::A);
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"unread"), Ok(6));
-        pair.drive(
-            |_, _| {},
-            |_, b| {
-                if b.tcp(&handles[1]).recv_queue() == 6 {
-                    App::Done
-                } else {
-                    App::Idle
-                }
-            },
-        );
-        pair.round(|_, _| {});
-        let AddTcpError::RxPoolTooSmall {
-            config: socket,
-            required,
-            pool: actual,
-        } = pair.b.add_tcp(tcp_socket()).unwrap_err()
-        else {
-            panic!("the added socket should hold the whole RX budget");
-        };
-        assert_eq!(socket, tcp_socket());
-        assert_eq!(
-            (required, actual),
-            (reserve + 12, usize::try_from(pool).unwrap())
-        );
-        let [_client, server] = handles;
-        pair.b.remove_tcp(server);
-        let _replacement = pair.b.add_tcp(socket).unwrap();
-        assert_eq!(pair.close(), 0);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn remove_tcp_frees_one_slot_full_rx_budget_and_unread_mbufs_without_sending() {
+fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(|side| StackConfig {
             max_udp_sockets: 0,
@@ -439,7 +261,7 @@ fn remove_tcp_frees_one_slot_full_rx_budget_and_unread_mbufs_without_sending() {
             ..pair::config(side)
         });
         let reserve = rx_reserve(16, configs[0].rx_staging, 8);
-        let pool = rx_pool_count(reserve, 1500, [4096]);
+        let pool = u32::try_from(reserve + 6).unwrap();
         let mut pair = Pair::with_pools(eal, ["rxrm1a", "rxrm1b"], configs, pair::T0, 16, pool, 63, 63);
         let ([client, server], _) = pair::establish(&mut pair, Side::A);
         let idle = pair.in_use()[1].0;
@@ -534,24 +356,17 @@ fn socket_capacity_refused_then_slot_reused() {
     with_eal(|eal| {
         let fixture = RingPort::new("cap", 16, 16);
         let mut port_config = fixture.config();
-        port_config.rx_pool.count = rx_pool_count(
-            rx_reserve(
-                port_config.rx_descriptors,
-                8,
-                port_config.rx_pool.cache_size,
-            ),
-            port_config.mtu,
-            [4096; 2],
-        );
+        port_config.rx_pool.count = u32::try_from(
+            rx_reserve(port_config.rx_descriptors, 8, port_config.rx_pool.cache_size) + 12,
+        )
+        .unwrap();
         let mut stack = stack(fixture.open_with(eal, port_config), 2, 4);
         let first = stack.add_tcp(tcp_socket()).unwrap();
         stack.listen(&first, 1001).unwrap();
         let second = stack.add_tcp(tcp_socket()).unwrap();
         stack.listen(&second, 1002).unwrap();
         let config = tcp::Config { tx_capacity: 1234, mss_cap: Some(1460), ..tcp_socket() };
-        let AddTcpError::SocketsFull(refused) = stack.add_tcp(config).unwrap_err() else {
-            panic!("socket slots should be full");
-        };
+        let AddTcpError::SocketsFull(refused) = stack.add_tcp(config).unwrap_err();
         assert_eq!(refused, config);
 
         let first_slot = first.to_string();
@@ -565,9 +380,7 @@ fn socket_capacity_refused_then_slot_reused() {
         assert_eq!(stack.tcp(&second).listen_endpoint().port, 1002);
 
         // Full again: the storage did not grow.
-        let AddTcpError::SocketsFull(refused) = stack.add_tcp(config).unwrap_err() else {
-            panic!("socket slots should be full");
-        };
+        let AddTcpError::SocketsFull(refused) = stack.add_tcp(config).unwrap_err();
         assert_eq!(refused, config);
         assert_eq!(stack.turn(T0, 8), Ok(IDLE));
         finish(fixture, stack);

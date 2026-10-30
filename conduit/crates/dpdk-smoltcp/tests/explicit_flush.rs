@@ -5,11 +5,11 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, EthernetAddress, EthernetFrame, EthernetProtocol, TcpControl,
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, TCP_HEADER_LEN,
 };
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Sent, StackConfig, Turn, UdpConfig};
 
 use zhida_test_kit::{many, pair, wire, with_eal};
-use pair::{config, establish, segment, Dir, Pair, Side, T0};
+use pair::{config, establish, pool_count, segment, windows, Dir, Pair, Side, T0};
 use wire::Link;
 
 const BUDGET: usize = 32;
@@ -32,22 +32,13 @@ fn new_pair(eal: &Eal, names: [&str; 2], pending: usize) -> Pair {
     });
     Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
         port.mtu = MTU;
-        port.rx_pool.count = rx_pool_count(
-            rx_reserve(
-                port.rx_descriptors,
-                configs[side.index()].rx_staging,
-                port.rx_pool.cache_size,
-            ),
-            port.mtu,
-            std::iter::repeat_n(4096, configs[side.index()].max_sockets),
-        )
-        .checked_add(1)
-        .expect("UDP receive slot fits the RX pool");
-        port.frame_pool.count = frame_pool_count(
-            frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-            port.mtu,
-            std::iter::repeat_n(4096, configs[side.index()].max_sockets),
-        );
+        let full = windows(port.mtu, std::iter::repeat_n(4096, configs[side.index()].max_sockets));
+        let reserve =
+            rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size);
+        // Every window full at once, plus one UDP datagram.
+        port.rx_pool.count = pool_count(reserve, full + 1);
+        port.frame_pool.count =
+            pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), full);
     })
 }
 
@@ -138,20 +129,16 @@ fn template_acks_keep_exact_tx_pool_counts() {
             let mut pair =
                 Pair::with_ports(eal, ["eq7a", "eq7b"], configs, T0, 16, |side, port| {
                     port.mtu = MTU;
-                    port.rx_pool.count = rx_pool_count(
-                        rx_reserve(
-                            port.rx_descriptors,
-                            configs[side.index()].rx_staging,
-                            port.rx_pool.cache_size,
-                        ),
-                        port.mtu,
-                        std::iter::repeat_n(4096, configs[side.index()].max_sockets),
+                    let full =
+                        windows(port.mtu, std::iter::repeat_n(4096, configs[side.index()].max_sockets));
+                    let reserve = rx_reserve(
+                        port.rx_descriptors,
+                        configs[side.index()].rx_staging,
+                        port.rx_pool.cache_size,
                     );
-                    port.frame_pool.count = frame_pool_count(
-                        frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                        port.mtu,
-                        std::iter::repeat_n(4096, configs[side.index()].max_sockets),
-                    );
+                    port.rx_pool.count = pool_count(reserve, full);
+                    let frames = frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending);
+                    port.frame_pool.count = pool_count(frames, full);
                 });
             let conns = many::open(&mut pair, 0..CONNECTIONS, 4096);
             let now = pair.now();

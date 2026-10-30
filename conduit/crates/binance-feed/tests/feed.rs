@@ -172,8 +172,10 @@ fn with_net<T>(
     })
 }
 
+/// On a jumbo stack, the feed socket capped to the 1500-byte path gets the capped RX frame
+/// cap and its full window even when the shared pools hold far fewer mbufs than that cap.
 #[zhida_test_support::pinned_test]
-fn capped_feed_socket_admits_on_jumbo_stack() {
+fn capped_feed_socket_keeps_capped_frame_cap_on_jumbo_stack() {
     use zhida_test_kit::pair::{config, Side};
     use zhida_test_kit::ring_port::{resize, RingPort};
 
@@ -182,68 +184,37 @@ fn capped_feed_socket_admits_on_jumbo_stack() {
             prefix: Ipv4Cidr::new(Side::B.ip(), 32),
             mtu: 1500,
         }];
-        for (name, tcp_config, admits) in [
-            ("bnc_cap", socket(Some(1460)), true),
-            ("bnc_small", socket(None), false),
-        ] {
-            let budget = tcp::rx_mbuf_budget(&tcp_config, 9000);
-            let ring = RingPort::new(name, 64, 64);
-            let mut stack_config = config(Side::A);
-            stack_config.paths = &paths;
-            let mut port_config = ring.config();
-            resize(&mut port_config, 9000, 9216);
-            let reserve = rx_reserve(
-                port_config.rx_descriptors,
-                stack_config.rx_staging,
-                port_config.rx_pool.cache_size,
-            );
-            port_config.rx_pool.count = u32::try_from(
-                reserve
-                    .checked_add(budget)
-                    .expect("RX pool count fits usize"),
-            )
+        let capped = tcp::rx_mbuf_budget(&socket(Some(1460)), 9000);
+        let uncapped = tcp::rx_mbuf_budget(&socket(None), 9000);
+        assert_eq!((capped, uncapped), (180, 30));
+        let ring = RingPort::new("bnc_cap", 64, 64);
+        let mut stack_config = config(Side::A);
+        stack_config.paths = &paths;
+        let mut port_config = ring.config();
+        resize(&mut port_config, 9000, 9216);
+        let reserve = rx_reserve(
+            port_config.rx_descriptors,
+            stack_config.rx_staging,
+            port_config.rx_pool.cache_size,
+        );
+        port_config.rx_pool.count = u32::try_from(reserve + uncapped).unwrap();
+        // net_ring's TX descriptors are its 64-slot TX ring.
+        let (tx, pending) = (port_config.tx_descriptors, stack_config.tx_pending);
+        port_config.tx_pool.count = u32::try_from(tx_reserve(tx, pending)).unwrap();
+        port_config.frame_pool.count = u32::try_from(
+            frame_reserve(tx, pending) + tcp::tx_mbuf_budget(&socket(None), 9000),
+        )
+        .unwrap();
+        let port = ring.open_with(eal, port_config);
+        let mut stack = Stack::new(port, stack_config, StackInstant::ZERO)
+            .map_err(|(_, error)| error)
             .unwrap();
-            // net_ring's TX descriptors are its 64-slot TX ring.
-            let (tx, pending) = (port_config.tx_descriptors, stack_config.tx_pending);
-            port_config.tx_pool.count = u32::try_from(tx_reserve(tx, pending)).unwrap();
-            port_config.frame_pool.count = u32::try_from(
-                frame_reserve(tx, pending)
-                    .checked_add(tcp::tx_mbuf_budget(&tcp_config, 9000))
-                    .expect("frame pool count fits usize"),
-            )
-            .unwrap();
-            let port = ring.open_with(eal, port_config);
-            let mut stack = Stack::new(port, stack_config, StackInstant::ZERO)
-                .map_err(|(_, error)| error)
-                .unwrap();
-            let result = stack.add_tcp(socket(Some(1460)));
-            if admits {
-                let handle = result.expect("capped budget admits the feed socket");
-                assert_eq!(stack.tcp(&handle).rx_frame_cap(), budget);
-                assert_eq!(stack.tcp(&handle).recv_room(), SOCKET_BUFFER);
-                drop(handle);
-            } else {
-                match result {
-                    Err(AddTcpError::RxPoolTooSmall {
-                        config,
-                        required,
-                        pool,
-                    }) => {
-                        assert_eq!(config, socket(Some(1460)));
-                        assert_eq!(pool, reserve.checked_add(budget).unwrap());
-                        assert_eq!(
-                            required,
-                            reserve
-                                .checked_add(tcp::rx_mbuf_budget(&socket(Some(1460)), 9000))
-                                .unwrap(),
-                        );
-                    }
-                    other => panic!("uncapped pool must reject capped socket: {other:?}"),
-                }
-            }
-            stack.into_port().try_close().expect("close jumbo Port");
-            ring.close();
-        }
+        let handle = stack.add_tcp(socket(Some(1460))).unwrap();
+        assert_eq!(stack.tcp(&handle).rx_frame_cap(), capped);
+        assert_eq!(stack.tcp(&handle).recv_room(), SOCKET_BUFFER);
+        drop(handle);
+        stack.into_port().try_close().expect("close jumbo Port");
+        ring.close();
     });
 }
 

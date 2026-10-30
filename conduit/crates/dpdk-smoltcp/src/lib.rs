@@ -83,7 +83,7 @@ pub use port::{
     device_info, port_by_name, DeviceInfo, Offloads, Packet, Port, PortConfig, PortError,
     PortOpenError, RxBurst, TxPacket,
 };
-pub use rx_pool::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
+pub use rx_pool::{frame_reserve, rx_reserve, tx_reserve};
 pub use smoltcp;
 pub use smoltcp::phy::HeldFrames;
 pub use smoltcp::socket::tcp::TcpFrame;

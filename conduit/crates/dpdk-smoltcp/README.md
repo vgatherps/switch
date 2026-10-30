@@ -15,7 +15,7 @@ Depended on by `zhida-open`, `tap-echo`, `binance-feed`, `memif-bench`, `nic-run
 | `device_info`, `port_by_name`, `Offloads` | Look up an ethdev and its advertised offloads. |
 | `Stack`, `StackConfig` | `Stack::new(port, config, now)`; `turn`, `receive`, `send`, `flush`, `poll_at`, `into_port`. |
 | `TcpHandle`, `UdpHandle` | Socket handles from `add_tcp` / `add_udp`. Using one with another Stack panics. |
-| `rx_reserve`, `tx_reserve`, `rx_pool_count` | Pool sizing helpers. |
+| `rx_reserve`, `tx_reserve`, `frame_reserve` | Pool floors `Stack::new` checks. Size each pool as its floor plus what all sockets together may hold; sockets share the pools, nothing is reserved per socket. |
 | `smoltcp`, `TcpFrame`, `HeldFrames`, `UdpSocket` | Re-exports. |
 
 The caller supplies the time on every drive call. The stack never reads a clock or blocks.

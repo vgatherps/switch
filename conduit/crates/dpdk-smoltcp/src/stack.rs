@@ -7,7 +7,7 @@ use smoltcp::iface::{
     SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
-use smoltcp::phy::{HeldFrames, TxFrame};
+use smoltcp::phy::TxFrame;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
@@ -76,6 +76,8 @@ pub enum StackError {
     TxPoolTooSmall { count: usize, required: usize },
     /// The frame pool holds fewer than `frame_reserve(TX descriptors, tx_pending)` mbufs.
     TxFramePoolTooSmall { count: usize, required: usize },
+    /// The RX pool holds fewer than `rx_reserve(RX descriptors, rx_staging, cache size)` mbufs.
+    RxPoolTooSmall { count: usize, required: usize },
     TimeWentBackwards { last: Instant, now: Instant },
     Port(PortError),
 }
@@ -93,37 +95,12 @@ impl std::error::Error for StackError {}
 pub enum AddTcpError {
     /// Every socket slot is in use (`StackConfig::max_sockets`).
     SocketsFull(tcp::Config),
-    /// The RX pool cannot back this socket's receive budget beside the sockets already added.
-    RxPoolTooSmall {
-        config: tcp::Config,
-        required: usize,
-        pool: usize,
-    },
-    /// The frame pool cannot back this socket's TX frame limit beside the frame
-    /// reserve and the TCP sockets already added.
-    TxFramePoolTooSmall {
-        config: tcp::Config,
-        required: usize,
-        pool: usize,
-    },
 }
 
 impl fmt::Display for AddTcpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SocketsFull(_) => write!(f, "stack has no free socket slot"),
-            Self::RxPoolTooSmall { required, pool, .. } => {
-                write!(
-                    f,
-                    "RX pool has {pool} mbufs; adding this socket requires {required}"
-                )
-            }
-            Self::TxFramePoolTooSmall { required, pool, .. } => {
-                write!(
-                    f,
-                    "frame pool has {pool} mbufs; adding this socket requires {required}"
-                )
-            }
         }
     }
 }
@@ -137,7 +114,6 @@ pub enum AddUdpError {
     InvalidConfig(&'static str),
     /// `UdpConfig::local_addr` is not an address this Stack owns.
     Unaddressable,
-    RxPoolTooSmall { required: usize, pool: usize },
 }
 
 /// `Stack::udp_send_frame` refused the frame; it comes back with the error.
@@ -215,22 +191,13 @@ pub struct Stack {
     /// Exactly `max_sockets` slots, never grown.
     sockets: TcpSet<'static>,
     udp: UdpSet,
-    removed_held: Vec<HeldFrames>,
     dropped: DropQueue,
     dropped_tcp: Vec<SocketHandle>,
     dropped_udp: Vec<smoltcp::iface::UdpHandle>,
     rx_wakes: Vec<SocketHandle>,
     max_sockets: usize,
     max_udp_sockets: usize,
-    rx_pool_count: usize,
-    rx_reserve: usize,
-    frame_pool_count: usize,
-    /// `frame_reserve(TX descriptors, tx_pending)`.
-    frame_reserve: usize,
-    /// Sum of the TX frame limits of the TCP sockets in `sockets`.
-    tx_frames_held: usize,
     ip_mtu: u16,
-    rx_budget_held: usize,
     /// Holds every staged and pending packet; its Port drops after them.
     device: Device,
     now: Instant,
@@ -244,7 +211,9 @@ impl Stack {
     /// A TX pool below `tx_reserve` returns the Port with `TxPoolTooSmall`.
     /// A frame pool below `frame_reserve` returns the Port with
     /// `TxFramePoolTooSmall`: packets the PMD holds and pending packets can
-    /// then never take the last frame.
+    /// then never take the last frame. An RX pool below `rx_reserve` returns
+    /// the Port with `RxPoolTooSmall`: the driver could not keep its RX
+    /// descriptors and the staging queue supplied.
     /// The negotiated TX descriptor count bounds sent mbufs held by NIC PMDs.
     /// net_ring ignores that count and keeps sent mbufs on its attached ring
     /// instead: open it with TX descriptors equal to the TX ring size.
@@ -293,12 +262,21 @@ impl Stack {
                 },
             ));
         }
-        let rx_pool_count = port.rx_pool_count();
-        let rx_reserve = rx_reserve(
+        let rx_count = port.rx_pool_count();
+        let rx_required = rx_reserve(
             port.descriptor_counts().0,
             config.rx_staging,
             port.rx_pool_cache_size(),
         );
+        if rx_count < rx_required {
+            return Err((
+                port,
+                StackError::RxPoolTooSmall {
+                    count: rx_count,
+                    required: rx_required,
+                },
+            ));
+        }
         let mut device = Device::new(port, config.rx_staging, config.tx_pending);
         let mut iface_config = Config::new(config.ethernet.into());
         iface_config.random_seed = config.random_seed;
@@ -317,20 +295,13 @@ impl Stack {
             iface,
             sockets: TcpSet::new(storage),
             udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
-            removed_held: Vec::new(),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
             dropped_tcp: Vec::with_capacity(config.max_sockets),
             dropped_udp: Vec::with_capacity(config.max_udp_sockets),
             rx_wakes: Vec::with_capacity(config.max_sockets),
             max_sockets: config.max_sockets,
             max_udp_sockets: config.max_udp_sockets,
-            rx_pool_count,
-            rx_reserve,
-            frame_pool_count: frame_count,
-            frame_reserve: frame_required,
-            tx_frames_held: 0,
             ip_mtu: mtu,
-            rx_budget_held: 0,
             device,
             now,
         })
@@ -552,15 +523,13 @@ impl Stack {
             .map(|at| at.max(self.now))
     }
 
-    /// Build a TCP socket from `config` and admit it. Returns the config when all
-    /// `max_sockets` slots are occupied, when the RX pool cannot back the socket's
-    /// receive budget, `tcp::rx_mbuf_budget(&config, ip_mtu)`, beside the RX reserve
-    /// and every socket already added, or when the frame pool cannot back the
-    /// socket's TX frame limit, `tcp::tx_mbuf_budget(&config, ip_mtu)`, beside
-    /// `frame_reserve` and every TCP socket already added (checked in that order).
-    /// Frames the application holds are not counted: they get what the pool has
-    /// beyond that sum.
-    /// Held TCP frames and UDP datagrams from removed sockets count until dropped.
+    /// Build a TCP socket from `config` and add it. Returns the config when all
+    /// `max_sockets` slots are occupied. The socket's buffer sizes are limits, not
+    /// reservations: it holds at most `tcp::rx_mbuf_budget(&config, ip_mtu)` RX
+    /// frames and queues at most `tcp::tx_mbuf_budget(&config, ip_mtu)` TX frames,
+    /// taken from the RX and frame pools every socket shares. With the RX pool
+    /// empty the driver drops arrivals and the peer retransmits; with the frame
+    /// pool empty `send_slice` queues nothing until frames return.
     /// Connections never use TCP timestamps.
     /// A dropped connection holds its slot until it closes; `SocketsFull` is
     /// returned until then. If it closes during a call, the next tidying call
@@ -574,90 +543,31 @@ impl Stack {
         if self.sockets.len() == self.max_sockets {
             return Err(AddTcpError::SocketsFull(config));
         }
-        let budget = tcp::rx_mbuf_budget(&config, usize::from(self.ip_mtu));
-        let held = self
-            .rx_budget_held
-            .checked_add(budget)
-            .expect("RX socket budgets exceed usize");
-        let required = self.required_rx_pool(budget);
-        if required > self.rx_pool_count {
-            return Err(AddTcpError::RxPoolTooSmall {
-                config,
-                required,
-                pool: self.rx_pool_count,
-            });
-        }
-        let tx_frames = tcp::tx_mbuf_budget(&config, usize::from(self.ip_mtu));
-        let frames_held = self
-            .tx_frames_held
-            .checked_add(tx_frames)
-            .expect("TX socket frame limits exceed usize");
-        let frames_required = self
-            .frame_reserve
-            .checked_add(frames_held)
-            .expect("frame pool requirement exceeds usize");
-        if frames_required > self.frame_pool_count {
-            return Err(AddTcpError::TxFramePoolTooSmall {
-                config,
-                required: frames_required,
-                pool: self.frame_pool_count,
-            });
-        }
         let handle = self.sockets.add_admitted(
             &config,
             usize::from(self.ip_mtu),
             self.device.frame_source(),
             self.dropped.clone(),
         );
-        self.rx_budget_held = held;
-        self.tx_frames_held = frames_held;
         Ok(TcpHandle {
             raw: handle,
             queue: self.dropped.clone(),
         })
     }
 
-    fn required_rx_pool(&mut self, budget: usize) -> usize {
-        let mut held_by_removed = 0usize;
-        self.removed_held.retain(|held| {
-            let count = held.count();
-            held_by_removed = held_by_removed
-                .checked_add(count)
-                .expect("removed frame counts exceed usize");
-            count != 0
-        });
-        self.rx_reserve
-            .checked_add(self.rx_budget_held)
-            .and_then(|count| count.checked_add(held_by_removed))
-            .and_then(|count| count.checked_add(budget))
-            .expect("RX pool requirement exceeds usize")
-    }
-
     /// Bind a local UDP port on one owned address (`local_addr`) or on all of them (`None`);
     /// each (address or all-IP, port) at most once. A datagram goes to the socket bound to its
-    /// destination, else to the port's all-IP socket; broadcasts only to the all-IP one. The
-    /// RX pool must back `rx_queue` datagrams beside the RX reserve and every TCP and UDP
-    /// socket's budget. Held TCP frames and UDP datagrams from removed sockets count until
-    /// dropped. A refused socket changes nothing.
+    /// destination, else to the port's all-IP socket; broadcasts only to the all-IP one. At
+    /// most `rx_queue` datagrams are queued or held by the application; their mbufs come
+    /// from the RX pool every socket shares. A refused socket changes nothing.
     pub fn add_udp(&mut self, config: UdpConfig) -> Result<UdpHandle, AddUdpError> {
         self.tidy();
-        let required = self.required_rx_pool(config.rx_queue);
-        if required > self.rx_pool_count {
-            return Err(AddUdpError::RxPoolTooSmall {
-                required,
-                pool: self.rx_pool_count,
-            });
-        }
         let handle = self.udp.add(&self.iface, config).map_err(|error| match error {
             UdpAddError::Full => AddUdpError::Full,
             UdpAddError::PortInUse => AddUdpError::PortInUse,
             UdpAddError::InvalidConfig(reason) => AddUdpError::InvalidConfig(reason),
             UdpAddError::Unaddressable => AddUdpError::Unaddressable,
         })?;
-        self.rx_budget_held = self
-            .rx_budget_held
-            .checked_add(config.rx_queue)
-            .expect("RX socket budgets exceed usize");
         Ok(UdpHandle {
             raw: handle,
             queue: self.dropped.clone(),
@@ -670,8 +580,7 @@ impl Stack {
     }
 
     /// Change a UDP socket.
-    /// Replacing the socket through this reference is unsupported:
-    /// its receive budget is charged at `add_udp`.
+    /// Replacing the socket through this reference is unsupported.
     pub fn udp_mut(&mut self, handle: &UdpHandle) -> &mut UdpSocket {
         let raw = self.udp_raw(handle);
         self.udp.get_mut(raw)
@@ -735,23 +644,15 @@ impl Stack {
             .map_err(|(frame, error)| (frame, UdpSendFrameError::Udp(error)))
     }
 
-    /// Free queued datagrams and release the socket's RX budget.
-    /// Datagrams the application still holds count against admission until dropped.
+    /// Free queued datagrams. Datagrams the application still holds keep their RX
+    /// mbufs until dropped.
     pub fn remove_udp(&mut self, handle: UdpHandle) {
         self.udp_raw(&handle);
         self.remove_udp_raw(handle.into_raw());
     }
 
     fn remove_udp_raw(&mut self, handle: smoltcp::iface::UdpHandle) {
-        let budget = self.udp.get(handle).config().rx_queue;
-        let held = self.udp.remove(handle);
-        self.rx_budget_held = self
-            .rx_budget_held
-            .checked_sub(budget)
-            .expect("removed socket's RX budget was held");
-        if held.count() != 0 {
-            self.removed_held.push(held);
-        }
+        self.udp.remove(handle);
     }
 
     /// Read-only access to a socket, including retransmits, loss_events and congestion_window. Marks nothing.
@@ -835,11 +736,11 @@ impl Stack {
         Ok(())
     }
 
-    /// Remove the socket immediately, freeing its slot, RX budget and TX frame
-    /// limit, and releasing its queued TX frames (the PMD and pending queue
-    /// keep their own references to frames already sent).
+    /// Remove the socket immediately, freeing its slot and releasing its queued
+    /// TX frames (the PMD and pending queue keep their own references to frames
+    /// already sent).
     /// Discards unread received bytes and sends nothing on the wire.
-    /// Frames the application still holds count against admission until dropped.
+    /// Frames the application still holds keep their RX mbufs until dropped.
     pub fn remove_tcp(&mut self, handle: TcpHandle) {
         self.tcp_raw(&handle);
         self.tidy();
@@ -847,18 +748,7 @@ impl Stack {
     }
 
     fn remove_tcp_raw(&mut self, handle: SocketHandle) {
-        let (held, budget, tx_frames) = self.sockets.remove(handle);
-        if held.count() != 0 {
-            self.removed_held.push(held);
-        }
-        self.rx_budget_held = self
-            .rx_budget_held
-            .checked_sub(budget)
-            .expect("removed socket's RX budget was held");
-        self.tx_frames_held = self
-            .tx_frames_held
-            .checked_sub(tx_frames)
-            .expect("removed socket's TX frame limit was held");
+        self.sockets.remove(handle);
     }
 
     /// The socket's readiness key, checked against `handle` as `tcp` does: it belongs to this

@@ -386,7 +386,7 @@ fn challenge_ack_uses_template_and_unknown_flow_reset_stays_generic() {
 #[test]
 fn ingress_reply_rebuilds_template_in_winning_slot() {
     let mut peer = Peer::new(2, PEER, None);
-    let (socket, _) = peer.sockets.take(peer.handle);
+    let socket = peer.sockets.take(peer.handle);
     let unrelated = peer.sockets.add(tcp::Socket::test_socket(64, 64));
     peer.sockets.get_mut(unrelated).listen(40001).unwrap();
     peer.handle = peer.sockets.add(socket);
@@ -615,7 +615,7 @@ fn removed_slot_uses_new_peer() {
     peer.arp(1, remote2, NEW_MAC);
     peer.send(1);
     peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    let (mut socket, _) = peer.sockets.take(peer.handle);
+    let mut socket = peer.sockets.take(peer.handle);
     socket.abort();
     peer.handle = peer.sockets.add(socket);
     peer.remote = remote2;
@@ -960,7 +960,7 @@ mod invalidation {
         peer.warm();
         let before = peer.iface.inner.template_frames;
         let handle = peer.handle;
-        let (mut socket, _) = peer.sockets.take(handle);
+        let mut socket = peer.sockets.take(handle);
         socket.abort();
         peer.handle = peer.sockets.add(socket);
         assert_ne!(peer.handle, handle);

@@ -6,7 +6,7 @@ use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, RecvError, SendError, State};
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::{TcpControl, TcpSeqNumber};
-use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, tx_reserve};
+use dpdk_smoltcp::{frame_reserve, rx_reserve, tx_reserve};
 use dpdk_smoltcp::{Stack, StackConfig, StackError, Turn};
 
 use zhida_test_kit::ring_port::RingPort;
@@ -55,7 +55,7 @@ fn pair_loss_reorder_mixed_sizes() {
     with_eal(|eal| {
         const CAPACITY: usize = 4096;
         let configs = [config(Side::A), config(Side::B)];
-        let pool_count = rx_pool_count(rx_reserve(16, configs[0].rx_staging, 8), 1500, [CAPACITY]);
+        let pool_count = pair::pool_count(rx_reserve(16, configs[0].rx_staging, 8), pair::windows(1500, [CAPACITY]));
         let mut pair =
             Pair::with_ports(eal, ["mixlossa", "mixlossb"], configs, T0, 16, |_, port| {
                 port.rx_pool.count = pool_count;
@@ -215,22 +215,14 @@ fn connect_with(pair: &mut Pair, socket: tcp::Config) -> ([TcpHandle; 2], TcpSeq
 const MESSAGE_SOCKET: tcp::Config =
     tcp::Config { rx_capacity: 4096, tx_capacity: MESSAGES * 1460, mss_cap: None };
 
-/// A Pair with default Stack configs whose pools admit one `MESSAGE_SOCKET`
-/// per side.
+/// A Pair with default Stack configs whose pools hold one `MESSAGE_SOCKET`'s full
+/// windows per side beyond the reserves.
 fn message_pair(eal: &dpdk_smoltcp::Eal, names: [&str; 2]) -> Pair {
     let configs = [config(Side::A), config(Side::B)];
     Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
         let stack = configs[side.index()];
-        port.rx_pool.count = rx_pool_count(
-            rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
-            port.mtu,
-            [MESSAGE_SOCKET.rx_capacity],
-        );
-        port.frame_pool.count = frame_pool_count(
-            frame_reserve(port.tx_descriptors, stack.tx_pending),
-            port.mtu,
-            [MESSAGE_SOCKET.tx_capacity],
-        );
+        port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [MESSAGE_SOCKET.rx_capacity]));
+        port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, stack.tx_pending), pair::windows(port.mtu, [MESSAGE_SOCKET.tx_capacity]));
     })
 }
 
@@ -823,7 +815,7 @@ fn bulk(pair: &mut Pair, handles: &[TcpHandle; 2], data: &[Vec<u8>; 2]) -> ([Vec
 fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
     with_eal(|eal| {
         // The TX pool covers 16 descriptors and Q = 16 pending slots: 32 mbufs.
-        // The RX pool is the smallest admission accepts for one 64 KiB socket.
+        // The RX pool is the reserve plus one 64 KiB socket's full window.
         // Q = 16: measured, Q <= 8 never overflows a receiver's RX ring (a
         // sender's turn then fits in the ring, the receiver drains at most an
         // 8-frame burst per turn) and nothing stays pending; Q >= 9 does.
@@ -844,9 +836,9 @@ fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
             [sized(Side::A), sized(Side::B)],
             T0,
             16,
-            rx_pool_count(rx_reserve(16, S, 8), 1500, [BULK]),
+            pair::pool_count(rx_reserve(16, S, 8), pair::windows(1500, [BULK])),
             tx_reserve(16, Q) as u32,
-            frame_pool_count(frame_reserve(16, Q), 1500, [BULK]),
+            pair::pool_count(frame_reserve(16, Q), pair::windows(1500, [BULK])),
         );
         // 64 KiB buffers each way allow flights larger than one ring.
         let (handles, _) = establish_sized(&mut pair, Side::A, BULK);
@@ -881,7 +873,7 @@ fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
 fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
     with_eal(|eal| {
         // The TX pool covers 16 descriptors and Q = 16 pending slots: 32 mbufs.
-        // The RX pool is the smallest admission accepts for one 64 KiB socket.
+        // The RX pool is the reserve plus one 64 KiB socket's full window.
         // A 7-frame ring fits in one 8-frame RX burst and S = 8 staging, so
         // the receiver drains the whole ring every turn: no frame is lost,
         // the windows grow, and both sides queue more per turn than the ring
@@ -904,9 +896,9 @@ fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
             [sized(Side::A), sized(Side::B)],
             T0,
             8,
-            rx_pool_count(rx_reserve(16, S, 8), 1500, [BULK]),
+            pair::pool_count(rx_reserve(16, S, 8), pair::windows(1500, [BULK])),
             tx_reserve(16, Q) as u32,
-            frame_pool_count(frame_reserve(8, Q), 1500, [BULK]),
+            pair::pool_count(frame_reserve(8, Q), pair::windows(1500, [BULK])),
         );
         let (handles, _) = establish_sized(&mut pair, Side::A, BULK);
         let data = [pattern(4 * BULK, 7), pattern(4 * BULK, 8)];
@@ -1009,7 +1001,7 @@ fn admission_refuses_tx_pools_for_full_ring() {
             let fixture = RingPort::new("admittx", 16, 16);
             let mut port_config = fixture.config();
             port_config.rx_pool.count =
-                rx_pool_count(rx_reserve(16, q1.rx_staging, 8), 1500, [4096]);
+                pair::pool_count(rx_reserve(16, q1.rx_staging, 8), pair::windows(1500, [4096]));
             port_config.tx_pool.count = count;
             let port = fixture.open_with(eal, port_config);
             assert_eq!(port.descriptor_counts().1, 16);
@@ -1050,17 +1042,9 @@ fn admission_full_tx_ring_still_answers() {
             |side, port| {
                 assert_eq!(port.tx_descriptors, 16);
                 assert_eq!(port.tx_pool.cache_size, 8);
-                port.rx_pool.count = rx_pool_count(
-                    rx_reserve(16, q1(side).rx_staging, 8),
-                    1500,
-                    [MESSAGE_SOCKET.rx_capacity],
-                );
+                port.rx_pool.count = pair::pool_count(rx_reserve(16, q1(side).rx_staging, 8), pair::windows(1500, [MESSAGE_SOCKET.rx_capacity]));
                 port.tx_pool.count = count;
-                port.frame_pool.count = frame_pool_count(
-                    frame_reserve(16, q1(side).tx_pending),
-                    1500,
-                    [MESSAGE_SOCKET.tx_capacity],
-                );
+                port.frame_pool.count = pair::pool_count(frame_reserve(16, q1(side).tx_pending), pair::windows(1500, [MESSAGE_SOCKET.tx_capacity]));
             },
             |_, port| assert_eq!(port.descriptor_counts().1, 16),
         );
@@ -1484,20 +1468,12 @@ fn cubic_send_allowance_trace_with_sequence_pinned_losses() {
         let configs = [config(Side::A), config(Side::B)];
         let mut pair =
             Pair::with_ports(eal, ["cubicta", "cubictb"], configs, T0, 64, |side, port| {
-                port.rx_pool.count = rx_pool_count(
-                    rx_reserve(
-                        port.rx_descriptors,
-                        configs[side.index()].rx_staging,
-                        port.rx_pool.cache_size,
-                    ),
-                    port.mtu,
-                    [65536],
-                );
-                port.frame_pool.count = frame_pool_count(
-                    frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                    port.mtu,
-                    [65536],
-                );
+                port.rx_pool.count = pair::pool_count(rx_reserve(
+                    port.rx_descriptors,
+                    configs[side.index()].rx_staging,
+                    port.rx_pool.cache_size,
+                ), pair::windows(port.mtu, [65536]));
+                port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), pair::windows(port.mtu, [65536]));
             });
         let (handles, frames) = establish_sized(&mut pair, Side::A, 65536);
         pair.b.tcp_mut(&handles[1]).set_ack_delay(None);
@@ -1637,16 +1613,8 @@ fn burst_loss_partial_acks_repair_all_holes_before_rto() {
         const CAPACITY: usize = 16384;
         let configs = [config(Side::A), config(Side::B)];
         let mut pair = Pair::with_ports(eal, ["nrbursta", "nrburstb"], configs, T0, 64, |side, port| {
-            port.rx_pool.count = rx_pool_count(
-                rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size),
-                port.mtu,
-                [CAPACITY],
-            );
-            port.frame_pool.count = frame_pool_count(
-                frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                port.mtu,
-                [CAPACITY],
-            );
+            port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [CAPACITY]));
+            port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), pair::windows(port.mtu, [CAPACITY]));
         });
         let (handles, frames) = establish_sized(&mut pair, Side::A, CAPACITY);
         pair.b.tcp_mut(&handles[1]).set_ack_delay(None);
@@ -1882,16 +1850,8 @@ fn cubic_growth_and_recovery_across_rtts() {
                 port.rx_burst = 256;
                 port.tx_burst = 256;
                 port.tx_pool.count = tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
-                port.rx_pool.count = rx_pool_count(
-                    rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size),
-                    port.mtu,
-                    [CAPACITY],
-                );
-                port.frame_pool.count = frame_pool_count(
-                    frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-                    port.mtu,
-                    [CAPACITY],
-                );
+                port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [CAPACITY]));
+                port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), pair::windows(port.mtu, [CAPACITY]));
             });
             let a = pair.a.add_tcp(pair::tcp_socket_sized(CAPACITY)).unwrap();
             let b = pair.b.add_tcp(pair::tcp_socket_sized(CAPACITY)).unwrap();

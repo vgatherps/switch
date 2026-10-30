@@ -14,7 +14,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::{Duration as NetDuration, Instant as NetInstant};
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, IpEndpoint, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    rx_pool_count, rx_reserve, Offloads, Port, PortConfig, Sent, Stack, StackConfig, StackError,
+    rx_reserve, Offloads, Port, PortConfig, Sent, Stack, StackConfig, StackError,
     Turn, UdpConfig, UdpHandle, UdpSendError,
     UdpSendFrameError, DEFAULT_NEIGHBOR_CAPACITY,
 };
@@ -161,11 +161,11 @@ pub fn port_config<'a>(
         queue_socket: -1,
         rx_pool: PoolConfig {
             name: rx_pool,
-            count: rx_pool_count(
-                rx_reserve(64, RX_STAGING, POOL_CACHE),
-                1500,
-                std::iter::repeat_n(SOCKET_BUFFER, conns),
-            ),
+            // Every connection's receive window full at once: the workloads stream on all.
+            count: u32::try_from(
+                rx_reserve(64, RX_STAGING, POOL_CACHE) + conns * tcp::rx_mbuf_budget(&socket(), 1500),
+            )
+            .expect("RX pool count fits u32"),
             cache_size: POOL_CACHE,
             data_room_size: headroom + BUFFER_SIZE,
             socket_id: -1,
@@ -209,8 +209,7 @@ fn udp_config(port: u16) -> UdpConfig {
     UdpConfig {
         port,
         local_addr: None,
-        rx_queue: usize::try_from(rx_pool_count(0, 1500, [SOCKET_BUFFER]))
-            .expect("one socket RX budget fits usize"),
+        rx_queue: tcp::rx_mbuf_budget(&socket(), 1500),
         tx_checksum: true,
         broadcast: false,
     }
@@ -287,7 +286,7 @@ fn send_pattern(stack: &mut Stack, handle: &TcpHandle, key: u64, from: usize, to
         if room == 0 {
             break;
         }
-        let mut frame = stack.tx_frame().expect("admission backs the socket's frame slots");
+        let mut frame = stack.tx_frame().expect("the frame pool backs every socket's frame slots");
         let n = (to - at).min(SEGMENT_PAYLOAD).min(room).min(frame.capacity());
         fill_pattern(&mut frame.room_mut()[..n], key, at as u64);
         frame.set_len(n);

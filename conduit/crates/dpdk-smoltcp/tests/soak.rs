@@ -12,7 +12,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol, Ipv4Packet,
 };
 use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, tx_reserve, Stack, StackConfig, TcpHandle, UdpConfig,
+    frame_reserve, tx_reserve, Stack, StackConfig, TcpHandle, UdpConfig,
     UdpHandle, UdpSendError, UdpSendFrameError,
 };
 
@@ -161,7 +161,7 @@ impl Stream {
             if room == 0 {
                 return;
             }
-            let mut frame = stack.tx_frame().expect("admission backs the socket's frame slots");
+            let mut frame = stack.tx_frame().expect("the frame pool backs both sockets' frame slots");
             let count = mss
                 .min(room)
                 .min(frame.capacity())
@@ -450,10 +450,12 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
             port.rx_pool.count = 8191;
             let tx_pending = configs[side.index()].tx_pending;
             port.tx_pool.count = tx_reserve(port.tx_descriptors, tx_pending) as u32;
-            // Exactly the admission bound for the two TCP sockets: Stream::send
-            // expects a frame whenever its socket has frame room.
-            port.frame_pool.count =
-                frame_pool_count(frame_reserve(port.tx_descriptors, tx_pending), port.mtu, [BUFFER; 2]);
+            // Both TCP sockets' full send queues beyond the reserve: Stream::send expects a
+            // frame whenever its socket has frame room.
+            port.frame_pool.count = zhida_test_kit::pair::pool_count(
+                frame_reserve(port.tx_descriptors, tx_pending),
+                zhida_test_kit::pair::windows(port.mtu, [BUFFER; 2]),
+            );
             port.rx_burst = 64;
             port.tx_burst = 32;
         },

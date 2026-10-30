@@ -48,15 +48,15 @@ fn packet_rx_full_window_64_connections() {
         const COUNT: u16 = 64;
         const CAPACITY: usize = 4096;
         let configs = [many::config(Side::A, 64), many::config(Side::B, 64)];
-        let pool_count = dpdk_smoltcp::rx_pool_count(
+        // Every connection's full window each way at once: the test fills all 64.
+        let full = zhida_test_kit::pair::windows(1500, [CAPACITY; 64]);
+        let pool_count = zhida_test_kit::pair::pool_count(
             dpdk_smoltcp::rx_reserve(16, configs[0].rx_staging, 8),
-            1500,
-            [CAPACITY; 64],
+            full,
         );
-        let frame_count = dpdk_smoltcp::frame_pool_count(
+        let frame_count = zhida_test_kit::pair::pool_count(
             dpdk_smoltcp::frame_reserve(16, configs[0].tx_pending),
-            1500,
-            [CAPACITY; 64],
+            full,
         );
         let mut pair = Pair::with_ports(eal, ["full64a", "full64b"], configs, T0, 16, |_, port| {
             port.rx_pool.count = pool_count;

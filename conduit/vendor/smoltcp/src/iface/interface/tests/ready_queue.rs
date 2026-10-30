@@ -1035,7 +1035,7 @@ fn check_close_timer_after_idle_wheel(now: Instant, fresh: bool, poll_at_first: 
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).1, TcpControl::None);
     assert_eq!(sockets.get(handle).state(), tcp::State::TimeWait);
-    let (socket, _) = sockets.take(handle);
+    let socket = sockets.take(handle);
     let mut sockets = TcpSet::new(Vec::new());
     if !fresh {
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
@@ -1240,7 +1240,7 @@ fn remove_queued_socket_before_slot_reuse() {
     }
     iface.poll_egress(START, &mut device, &mut sockets);
     device.tx_queue.clear();
-    let (mut removed, _) = sockets.take(a);
+    let mut removed = sockets.take(a);
     removed.abort();
     removed.listen(1234).unwrap();
     let reused = sockets.add(removed);

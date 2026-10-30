@@ -37,9 +37,8 @@ pub fn config_with_gateway(
 
 pub fn sizing() -> Sizing {
     Sizing {
-        tcp_rx_frames: 0,
-        tcp_tx_frames: 0,
-        udp_rx_datagrams: 0,
+        rx_share: 0,
+        frame_share: 0,
         max_sockets: 1,
         max_udp_sockets: 0,
         rx_staging: 32,

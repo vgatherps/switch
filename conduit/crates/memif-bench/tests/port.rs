@@ -56,14 +56,15 @@ fn tiny_segments_keep_memif_bulk_reserve() {
     use dpdk_smoltcp::smoltcp::wire::{
         ArpOperation, EthernetAddress, TcpControl, TcpRepr, TcpSeqNumber,
     };
-    use dpdk_smoltcp::{rx_pool_count, rx_reserve, Stack};
+    use dpdk_smoltcp::{rx_reserve, Stack};
 
     const CAPACITY: usize = 4096;
     // One byte above the stack's 64-byte append limit: each segment keeps its own RX mbuf.
     const SEGMENT: usize = 65;
     let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
     let reserve = rx_reserve(64, usize::from(BURST), 8);
-    let pool_count = rx_pool_count(reserve, 1500, [CAPACITY; 2]);
+    // Room for two sockets' RX frame caps beyond the reserve.
+    let pool_count = u32::try_from(reserve + 2 * cap).unwrap();
     let names = names("tinyreserve");
     let (mut server, mut client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = config(id, rx, tx, frame);

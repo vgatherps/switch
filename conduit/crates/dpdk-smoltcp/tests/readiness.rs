@@ -4,9 +4,7 @@
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::IpEndpoint;
-use dpdk_smoltcp::{
-    frame_pool_count, frame_reserve, ReadySide, Stack, StackConfig, UdpConfig, UdpSendError,
-};
+use dpdk_smoltcp::{frame_reserve, ReadySide, Stack, StackConfig, UdpConfig, UdpSendError};
 use zhida_test_kit::pair::{self, establish_sized, Pair, Side, BUDGET, MAX_ROUNDS};
 use zhida_test_kit::with_eal;
 
@@ -164,10 +162,9 @@ fn udp_pair(eal: &dpdk_smoltcp::Eal) -> Pair {
     let configs = [Side::A, Side::B].map(|side| StackConfig { max_udp_sockets: 2, ..pair::config(side) });
     Pair::with_ports(eal, ["rdua", "rdub"], configs, pair::T0, 16, |side, port| {
         port.rx_pool.count = 255;
-        port.frame_pool.count = frame_pool_count(
+        port.frame_pool.count = pair::pool_count(
             frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending),
-            port.mtu,
-            [SMALL],
+            pair::windows(port.mtu, [SMALL]),
         );
     })
 }

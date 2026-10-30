@@ -152,7 +152,7 @@ fn duplicate_connection(sockets: &mut TcpSet<'static>, local_seq: TcpSeqNumber) 
     let (mut iface, mut other_sockets, mut device) = setup(Medium::Ip);
     let (handle, other_seq) = establish(&mut iface, &mut other_sockets, &mut device);
     assert_eq!(other_seq, local_seq);
-    let (socket, _) = other_sockets.take(handle);
+    let socket = other_sockets.take(handle);
     sockets.add(socket)
 }
 
@@ -1590,7 +1590,7 @@ fn time_wait_duplicate_tuples_reopen_before_listener() {
     for listener_slot in 0..3 {
         let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
         let (first, _) = enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, None);
-        let (first, _) = sockets.take(first);
+        let first = sockets.take(first);
         let (mut other_iface, mut other_sockets, mut other_device) = setup(Medium::Ip);
         let (second, _) = enter_time_wait(
             &mut other_iface,
@@ -1599,7 +1599,7 @@ fn time_wait_duplicate_tuples_reopen_before_listener() {
             REMOTE_SEQ,
             None,
         );
-        let (second, _) = other_sockets.take(second);
+        let second = other_sockets.take(second);
         let mut listener = socket();
         listener.listen(LOCAL_PORT).unwrap();
         let (first, second, listener) = match listener_slot {
