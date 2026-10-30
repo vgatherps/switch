@@ -1982,3 +1982,163 @@ fn arp_from_unspecified_sender_leaves_cache_unchanged() {
     }
     assert_eq!(iface.inner.neighbor_cache.changes(), changes);
 }
+
+const SPOOFER_MAC: EthernetAddress = EthernetAddress([0x0a, 0, 0, 0, 0, 0x0a]);
+const WIRE_PEER_MAC: EthernetAddress = EthernetAddress([0x52, 0x54, 0, 0, 0, 1]);
+const OWNED_ONLY: Ipv4Address = Ipv4Address::new(192, 168, 1, 50);
+
+fn arp_frame_from(
+    operation: ArpOperation,
+    sender: Ipv4Address,
+    sender_mac: EthernetAddress,
+    target: Ipv4Address,
+) -> Vec<u8> {
+    let arp = ArpRepr::EthernetIpv4 {
+        operation,
+        source_hardware_addr: sender_mac,
+        source_protocol_addr: sender,
+        target_hardware_addr: EthernetAddress::default(),
+        target_protocol_addr: target,
+    };
+    let mut bytes = vec![0u8; EthernetFrame::<&[u8]>::buffer_len(arp.buffer_len())];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+    frame.set_dst_addr(EthernetAddress::BROADCAST);
+    frame.set_src_addr(sender_mac);
+    frame.set_ethertype(EthernetProtocol::Arp);
+    arp.emit(&mut ArpPacket::new_unchecked(frame.payload_mut()));
+    bytes
+}
+
+/// Ethernet frame to us carrying an IPv4 packet whose source AND destination are `own`.
+fn own_source_frame(own: Ipv4Address, tcp: bool, iface_mac: EthernetAddress) -> Vec<u8> {
+    let caps = ChecksumCapabilities::default();
+    let (next_header, payload) = if tcp {
+        let repr = TcpRepr {
+            src_port: 4242,
+            dst_port: 4243,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(0),
+            ack_number: None,
+            window_len: 256,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let mut bytes = vec![0u8; repr.buffer_len()];
+        repr.emit(&mut TcpPacket::new_unchecked(&mut bytes[..]), &own.into(), &own.into(), &caps);
+        (IpProtocol::Tcp, bytes)
+    } else {
+        let repr = Icmpv4Repr::EchoRequest { ident: 1, seq_no: 1, data: &[0x5a; 8] };
+        let mut bytes = vec![0u8; repr.buffer_len()];
+        repr.emit(&mut Icmpv4Packet::new_unchecked(&mut bytes[..]), &caps);
+        (IpProtocol::Icmp, bytes)
+    };
+    let ip = Ipv4Repr { src_addr: own, dst_addr: own, next_header, payload_len: payload.len(), hop_limit: 64 };
+    let mut bytes = vec![0u8; EthernetFrame::<&[u8]>::buffer_len(ip.buffer_len() + payload.len())];
+    let mut frame = EthernetFrame::new_unchecked(&mut bytes[..]);
+    frame.set_dst_addr(iface_mac);
+    frame.set_src_addr(WIRE_PEER_MAC);
+    frame.set_ethertype(EthernetProtocol::Ipv4);
+    ip.emit(&mut Ipv4Packet::new_unchecked(frame.payload_mut()), &caps);
+    frame.payload_mut()[ip.buffer_len()..].copy_from_slice(&payload);
+    bytes
+}
+
+/// Feed `own -> own` through ingress and dispatch whatever the stack answers; return the frame
+/// put on the wire.
+fn answer_to_own_source(iface: &mut Interface, sockets: &mut TcpSet, own: Ipv4Address, tcp: bool) -> Vec<u8> {
+    let mac = iface.inner.hardware_addr.ethernet_or_panic();
+    let bytes = own_source_frame(own, tcp, mac);
+    let packet = iface
+        .inner
+        .process_ethernet(
+            sockets,
+            PacketMeta::default(),
+            &bytes,
+            #[cfg(feature = "udp-set")]
+            None,
+        )
+        .expect("a reply to the own-source packet is generated");
+    let mut wire = Vec::new();
+    // `Err(NeighborPending)` means an ARP request went out instead of the reply: still a frame.
+    let _ = iface.inner.dispatch(CaptureTxToken(&mut wire), packet);
+    wire
+}
+
+/// Control: with no ARP from a spoofer, the stack's answer to an `own -> own` packet is a
+/// broadcast ARP request for our own address; nothing goes to any unicast MAC.
+#[rstest]
+fn control_own_source_without_spoofed_arp_sends_arp_request(
+    #[values(false, true)] tcp: bool,
+    #[values(false, true)] owned_only: bool,
+) {
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+    let own = if owned_only {
+        iface.set_owned_ipv4(
+            crate::iface::OwnedIpv4::new(
+                &[Ipv4Cidr::new(OWNED_ONLY, 32)],
+                Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 1), 24),
+                None,
+            )
+            .unwrap(),
+        );
+        OWNED_ONLY
+    } else {
+        Ipv4Address::new(192, 168, 1, 1)
+    };
+    let wire = answer_to_own_source(&mut iface, &mut sockets, own, tcp);
+    let frame = EthernetFrame::new_checked(&wire[..]).unwrap();
+    assert_eq!(frame.dst_addr(), EthernetAddress::BROADCAST);
+    assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+}
+
+/// An ARP request or reply whose sender IP is one of our addresses (interface or owned; a
+/// conflict or a spoof) creates no neighbor entry, as Linux treats such a sender as martian: our
+/// later answer to a packet from that address goes out as an ARP request, not to the sender's
+/// MAC. A request is still answered as before.
+#[rstest]
+fn arp_sender_claiming_own_address_is_answered_not_learned(
+    #[values(false, true)] tcp: bool,
+    #[values(false, true)] owned_only: bool,
+    #[values(ArpOperation::Request, ArpOperation::Reply)] operation: ArpOperation,
+) {
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
+    let iface_ip = Ipv4Address::new(192, 168, 1, 1);
+    let own = if owned_only {
+        iface.set_owned_ipv4(
+            crate::iface::OwnedIpv4::new(&[Ipv4Cidr::new(OWNED_ONLY, 32)], Ipv4Cidr::new(iface_ip, 24), None)
+                .unwrap(),
+        );
+        OWNED_ONLY
+    } else {
+        iface_ip
+    };
+    let changes = iface.inner.neighbor_cache.changes();
+    let arp = arp_frame_from(operation, own, SPOOFER_MAC, iface_ip);
+    let answer = iface.inner.process_ethernet(
+        &mut sockets,
+        PacketMeta::default(),
+        &arp,
+        #[cfg(feature = "udp-set")]
+        None,
+    );
+    let expected = (operation == ArpOperation::Request).then(|| {
+        EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Reply,
+            source_hardware_addr: iface.inner.hardware_addr.ethernet_or_panic(),
+            source_protocol_addr: iface_ip,
+            target_hardware_addr: SPOOFER_MAC,
+            target_protocol_addr: own,
+        })
+    });
+    assert_eq!(answer, expected);
+    assert_eq!(iface.inner.neighbor_cache.changes(), changes);
+    assert!(!iface.inner.neighbor_cache.lookup(&own.into(), Instant::ZERO).found());
+    let wire = answer_to_own_source(&mut iface, &mut sockets, own, tcp);
+    let frame = EthernetFrame::new_checked(&wire[..]).unwrap();
+    assert_eq!(frame.dst_addr(), EthernetAddress::BROADCAST);
+    assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
+}

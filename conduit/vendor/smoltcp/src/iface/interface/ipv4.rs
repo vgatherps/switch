@@ -205,12 +205,18 @@ impl InterfaceInner {
                     // whose sender is in our network. We fill from requests too because if someone
                     // is requesting our address they are probably going to talk to us, so we avoid
                     // having to request their address when we later reply to them. Requests from
-                    // other networks are still answered (RFC 826), but not learned.
-                    self.neighbor_cache.fill(
-                        source_protocol_addr.into(),
-                        source_hardware_addr.into(),
-                        timestamp,
-                    );
+                    // other networks are still answered (RFC 826), but not learned. A sender
+                    // claiming one of our own addresses is answered but never learned (Linux
+                    // treats it as martian), so it cannot steer frames sent to that address.
+                    if self.has_ip_addr(source_protocol_addr) {
+                        net_debug!("arp: sender claims our address {}", source_protocol_addr);
+                    } else {
+                        self.neighbor_cache.fill(
+                            source_protocol_addr.into(),
+                            source_hardware_addr.into(),
+                            timestamp,
+                        );
+                    }
                 } else {
                     net_debug!("arp: source IP address not in same network as us");
                 }
