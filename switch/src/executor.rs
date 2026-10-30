@@ -359,11 +359,9 @@ impl Executor {
             if !(*this).run_queue.is_empty() {
                 polled += Self::drain(this);
             }
-            while (*this).run_queue.is_empty()
-                && !(*this).incoming.is_empty()
-                && polled < POLL_BUDGET
-                && !(*this).turn_request.is_set()
-            {
+            // A drain that saw the request returned with `run_queue` not cleared, so
+            // only the checks above and after each task poll are needed.
+            while (*this).run_queue.is_empty() && !(*this).incoming.is_empty() && polled < POLL_BUDGET {
                 std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
                 polled += Self::drain(this);
             }
