@@ -425,6 +425,25 @@ impl TimerWheel {
         self.linked_count != 0
     }
 
+    /// Every linked entry with the position of the list holding it.
+    #[cfg(test)]
+    pub(crate) fn linked<T: WheelEntry>(&self, entries: &[T]) -> Vec<(u32, WheelPosition)> {
+        let mut linked = Vec::new();
+        for (level, slots) in self.levels.iter().enumerate() {
+            for (slot, head) in slots.iter().enumerate() {
+                assert_eq!(
+                    self.pending[level] & (1 << slot) != 0,
+                    !head.is_empty(),
+                    "wheel pending bit out of date"
+                );
+                let position = WheelPosition::Linked { level: level as u8, slot: slot as u8 };
+                linked.extend(head.iter(entries).map(|idx| (idx, position)));
+            }
+        }
+        assert_eq!(linked.len(), self.linked_count);
+        linked
+    }
+
     pub(crate) fn insert<T: WheelEntry>(&mut self, entries: &mut [T], idx: u32) -> InsertOutcome {
         assert!(idx != NIL, "invalid timer index");
         assert!(
