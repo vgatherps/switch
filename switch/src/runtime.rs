@@ -230,7 +230,9 @@ impl Drop for CleanupContinuation<'_> {
 }
 
 /// Dropping a `Runtime` shuts it down: its remaining tasks are dropped, in an
-/// unspecified order.
+/// unspecified order. Dropping the `Runtime` from a task destructor that its own
+/// cleanup runs (after `shutdown`, or a shutdown a task factory requested)
+/// aborts the process.
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _continuation = CleanupContinuation(&self.control);
