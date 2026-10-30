@@ -21,7 +21,7 @@ use rand::rngs::StdRng;
 use sheath::TxFrame;
 
 use crate::lower::PlainTx;
-use crate::rx::{Control, Kind, ProtocolError, Role, close_sendable, grow};
+use crate::rx::{Config, Control, Kind, ProtocolError, Role, close_sendable, grow};
 
 const CONT: u8 = 0;
 const TEXT: u8 = 1;
@@ -29,9 +29,6 @@ const BINARY: u8 = 2;
 const CLOSE: u8 = 8;
 const PONG: u8 = 10;
 const FIN: u8 = 0x80;
-
-/// The largest message `send` accepts (the receive side's message limit).
-pub(crate) const MAX_SEND: usize = 64 << 20;
 
 /// Why a connection failed. The first failure is kept and reported by every later call.
 #[derive(Clone, Debug, PartialEq)]
@@ -176,11 +173,28 @@ pub(crate) enum Work {
     Notify,
 }
 
+/// [`TxCore::snapshot`].
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct Snapshot {
+    job: Job,
+    unsent: Option<usize>,
+    out: Out,
+    pub(crate) buf: Vec<u8>,
+    pong: Option<Control>,
+    pub(crate) local: Local,
+    peer: Peer,
+    end: End,
+    failed: Option<Failure>,
+}
+
 /// The send core over lower layer `L`.
 pub(crate) struct TxCore<L: PlainTx> {
     lower: L,
     /// Mask source; `Some` iff client role.
     rng: Option<StdRng>,
+    /// The largest message `send` accepts.
+    max_send: usize,
     /// A sealed frame TCP refused, and the room its job waited for (lower records and
     /// close_notify wait for a whole frame's room; their length is not known before sealing).
     unsent: Option<(L::Sealed, usize)>,
@@ -196,11 +210,13 @@ pub(crate) struct TxCore<L: PlainTx> {
 
 impl<L: PlainTx> TxCore<L> {
     /// Panics if one frame cannot carry the largest control frame (setup checks this).
-    pub(crate) fn new(lower: L, role: Role) -> TxCore<L> {
+    pub(crate) fn new(lower: L, config: &Config) -> TxCore<L> {
+        let role = config.role;
         assert!(lower.plain().1 >= max_control_frame(role), "frame room below a control frame");
         TxCore {
             lower,
             rng: (role == Role::Client).then(rand::make_rng),
+            max_send: config.max_send,
             unsent: None,
             out: Out::Idle,
             buf: Vec::new(),
@@ -449,7 +465,7 @@ impl<L: PlainTx> TxCore<L> {
     /// `send`'s checks, before anything changes.
     pub(crate) fn check_send(&self, kind: Kind, payload: &[u8]) -> Result<(), TxError> {
         self.refuse()?;
-        if payload.len() > MAX_SEND {
+        if payload.len() > self.max_send {
             return Err(TxError::TooBig);
         }
         if kind == Kind::Text && core::str::from_utf8(payload).is_err() {
@@ -474,7 +490,7 @@ impl<L: PlainTx> TxCore<L> {
     pub(crate) fn accept_large(&mut self, kind: Kind, payload: &[u8]) {
         debug_assert!(self.next_job() == Job::Idle && self.small(payload.len()).is_none());
         self.buf.clear();
-        grow(&mut self.buf, payload.len(), MAX_SEND);
+        grow(&mut self.buf, payload.len(), self.max_send);
         self.buf.extend_from_slice(payload);
         self.out = Out::Large { kind, offset: 0 };
     }
@@ -516,12 +532,23 @@ impl<L: PlainTx> TxCore<L> {
         self.local == Local::Sent && self.unsent.is_none()
     }
 
-    /// Jobs that cannot wait for the next send: the refused frame, lower records, a pong, our
-    /// close. (A large message's fragments go on in `send`, `close` and the end of `recv`.)
+    /// Jobs that go out before `recv` returns a message it has: the refused frame, lower
+    /// records, a pong, our close. (The rest of a large message goes out before `recv` waits
+    /// for input, see `backlog`.)
     pub(crate) fn urgent(&self) -> bool {
         match self.next_job() {
             Job::Resend(_) | Job::Frame(_, Work::Pending | Work::Pong | Work::Close) => true,
             Job::Idle | Job::Frame(_, Work::Fragment | Work::Notify) | Job::Fin | Job::Delivered => false,
+        }
+    }
+
+    /// Work that goes out before `recv` waits for input: every job but waiting for our FIN's
+    /// delivery (which needs the peer). Without it an accepted message's rest, and a Close
+    /// queued behind it, would wait for input the peer sends only after them.
+    pub(crate) fn backlog(&self) -> bool {
+        match self.next_job() {
+            Job::Resend(_) | Job::Frame(..) | Job::Fin => true,
+            Job::Idle | Job::Delivered => false,
         }
     }
 
@@ -530,6 +557,22 @@ impl<L: PlainTx> TxCore<L> {
         match &self.failed {
             Some(f) => Err(TxError::Failed(f.clone())),
             None => Ok(()),
+        }
+    }
+
+    /// All the state a refused call must leave as it was.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            job: self.next_job(),
+            unsent: self.unsent.as_ref().map(|(_, len)| *len),
+            out: self.out,
+            buf: self.buf.clone(),
+            pong: self.pong,
+            local: self.local,
+            peer: self.peer,
+            end: self.end,
+            failed: self.failed.clone(),
         }
     }
 
@@ -543,6 +586,10 @@ impl<L: PlainTx> TxCore<L> {
         }
         if let Out::Large { offset, .. } = self.out {
             assert!(offset < self.buf.len(), "offset {offset} of {}", self.buf.len());
+        }
+        assert!(self.buf.capacity() <= self.max_send, "buffer {} over {}", self.buf.capacity(), self.max_send);
+        if self.peer == Peer::Closed {
+            assert_ne!(self.local, Local::Open, "the peer's close neither echoed nor answered");
         }
         // Open: nothing ended, so `send`'s first drive never reaches a Close or the end.
         if self.local == Local::Open {
@@ -614,7 +661,8 @@ impl<L: PlainTx> TxCore<L> {
     pub(crate) async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), TxError> {
         self.check_send(kind, payload)?;
         self.drive(|c| c.next_job() != Job::Idle).await;
-        self.check_send(kind, payload)?;
+        // The drain changes only the failure state (Local stays Open while open).
+        self.result()?;
         match self.small(payload.len()) {
             Some(len) => match self.frame_after_room(len).await {
                 Some(f) => self.accept_small(kind, payload, f),
@@ -636,6 +684,11 @@ impl<L: PlainTx> TxCore<L> {
     /// Sends the jobs that cannot wait (see `urgent`).
     pub(crate) async fn flush(&mut self) {
         self.drive(Self::urgent).await;
+    }
+
+    /// Sends everything that does not need the peer (see `backlog`).
+    pub(crate) async fn drain(&mut self) {
+        self.drive(Self::backlog).await;
     }
 
     /// Everything left, through the transport's end, as far as it goes without the peer.

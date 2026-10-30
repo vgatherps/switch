@@ -21,12 +21,14 @@ pub struct Config {
     pub max_message: usize,
     /// Scratch capacity reserved at construction.
     pub scratch: usize,
+    /// Largest message sent.
+    pub max_send: usize,
 }
 
 impl Config {
-    /// tungstenite's limits: frame 16 MiB, message 64 MiB; 64 KiB scratch.
+    /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way); 64 KiB scratch.
     pub fn new(role: Role) -> Config {
-        Config { role, max_frame: 16 << 20, max_message: 64 << 20, scratch: 64 << 10 }
+        Config { role, max_frame: 16 << 20, max_message: 64 << 20, scratch: 64 << 10, max_send: 64 << 20 }
     }
 }
 

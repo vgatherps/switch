@@ -1,15 +1,15 @@
-//! The send core, runtime-free: its sync transitions, and its async methods polled by hand
-//! with a no-op waker over a mock lower layer whose waits are gated. Frames are read back by
-//! relay's receive core and by tungstenite.
+//! The send core: its sync transitions, and its async methods polled by hand with a no-op
+//! waker (or in a switch runtime, for wakes) over a mock lower layer whose waits are gated.
+//! Frames are read back by relay's receive core and by tungstenite.
 
 use std::cell::RefCell;
 use std::io::Cursor;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 use super::*;
-use crate::tx::{End, Failure, Job, MAX_SEND, TxCore, TxError, Work};
+use crate::tx::{End, Failure, Job, Snapshot, TxCore, TxError, Work};
 use tungstenite::Message as TMessage;
 use tungstenite::protocol::{Role as TRole, WebSocket};
 
@@ -20,7 +20,7 @@ pub(super) const ROOM: usize = 1430;
 
 pub(super) const CLOSE_RECORD: &[u8] = b"close_notify";
 
-/// The lower layer reporting a dead socket.
+/// The lower layer reporting a dead socket, or refusing to seal.
 #[derive(Debug, PartialEq)]
 pub(super) struct Dead;
 
@@ -36,17 +36,24 @@ pub(super) struct Log {
     pub(super) stall: bool,
     /// Each wait that pended, in order.
     pub(super) waited: Vec<&'static str>,
+    /// The wakers of pending waits; [`set`] wakes them.
+    wakers: Vec<Waker>,
     /// Upcoming `try_send` calls to refuse; a refusal also takes all room away, as a full
     /// socket would.
     pub(super) refuse: usize,
     /// The socket is dead: waits fail, sends are refused.
     pub(super) dead: bool,
+    /// The next seal (data, lower record or close record) fails, dropping its frame.
+    pub(super) seal_fails: bool,
     /// A sealed frame is held by the core, not yet taken (sheath allows one).
     pub(super) in_flight: bool,
+    pub(super) allocs: u64,
     pub(super) seals: u64,
+    /// Plaintext of the last frame sealed.
+    pub(super) last_sealed: Vec<u8>,
     /// Sealed frames TCP took.
     pub(super) taken: u64,
-    /// Records the lower layer sends on its own, oldest first.
+    /// Records the lower layer sends on its own (TLS shape only), oldest first.
     pub(super) pending: Vec<Vec<u8>>,
     pub(super) shutdowns: usize,
     /// `delivered` resolves.
@@ -62,9 +69,21 @@ impl Log {
     }
 }
 
-/// A TLS-shaped lower layer: plaintext at `HEAD`, `TAIL` bytes after it. Every seal entry
-/// point asserts the previous sealed frame was taken; TCP takes frames in seal order.
-pub(super) struct MockTx {
+/// Changes the gates, then wakes every pending wait (as switchnet does when room, a frame or
+/// a reset comes).
+pub(super) fn set(log: &Rc<RefCell<Log>>, change: impl FnOnce(&mut Log)) {
+    let wakers = {
+        let mut l = log.borrow_mut();
+        change(&mut l);
+        std::mem::take(&mut l.wakers)
+    };
+    wakers.into_iter().for_each(Waker::wake);
+}
+
+/// A lower layer with plaintext at `HEAD` and `TAIL` bytes after it: TLS-shaped (`TLS`: its
+/// own records and a close record) or raw TCP (neither). Every seal entry point asserts the
+/// previous sealed frame was taken; TCP takes frames in seal order.
+pub(super) struct MockTx<const TLS: bool> {
     room: usize,
     log: Rc<RefCell<Log>>,
 }
@@ -87,20 +106,24 @@ pub(super) struct MockSealed {
     _live: Rc<()>,
 }
 
-impl MockTx {
-    fn sealed(&mut self, f: MockFrame, len: usize) -> MockSealed {
+impl<const TLS: bool> MockTx<TLS> {
+    fn sealed(&mut self, f: MockFrame, len: usize) -> Result<MockSealed, Dead> {
         assert!(len <= self.room);
         let mut log = self.log.borrow_mut();
         assert!(!log.in_flight, "sealed while a sealed frame was not taken");
+        if std::mem::take(&mut log.seal_fails) {
+            return Err(Dead);
+        }
         log.in_flight = true;
         log.seals += 1;
-        MockSealed { buf: f.buf, len, seq: log.seals - 1, _live: f._live }
+        log.last_sealed = f.buf[HEAD..HEAD + len].to_vec();
+        Ok(MockSealed { buf: f.buf, len, seq: log.seals - 1, _live: f._live })
     }
 
     /// A gated wait: pends once if stalling (recording `name`), then while `blocked`.
     async fn wait(&self, name: &'static str, blocked: impl Fn(&Log) -> bool) -> Result<(), Dead> {
         let mut first = true;
-        std::future::poll_fn(|_| {
+        std::future::poll_fn(|cx| {
             let mut log = self.log.borrow_mut();
             if log.dead {
                 return Poll::Ready(Err(Dead));
@@ -108,6 +131,7 @@ impl MockTx {
             if (first && log.stall) || blocked(&log) {
                 first = false;
                 log.waited.push(name);
+                log.wakers.push(cx.waker().clone());
                 return Poll::Pending;
             }
             Poll::Ready(Ok(()))
@@ -116,18 +140,19 @@ impl MockTx {
     }
 }
 
-impl FrameTx for MockTx {
+impl<const TLS: bool> FrameTx for MockTx<TLS> {
     type Frame = MockFrame;
     type Sealed = MockSealed;
     type Error = Dead;
 
     async fn alloc(&mut self) -> Result<MockFrame, Dead> {
         self.wait("alloc", |l| l.frames == Some(0)).await?;
-        if let Some(n) = &mut self.log.borrow_mut().frames {
+        let mut log = self.log.borrow_mut();
+        if let Some(n) = &mut log.frames {
             *n -= 1;
         }
-        let live = self.log.borrow().live.clone();
-        Ok(MockFrame { buf: vec![FILL; HEAD + self.room + TAIL], _live: live })
+        log.allocs += 1;
+        Ok(MockFrame { buf: vec![FILL; HEAD + self.room + TAIL], _live: log.live.clone() })
     }
 
     async fn room(&mut self, len: usize) -> Result<(), Dead> {
@@ -139,7 +164,7 @@ impl FrameTx for MockTx {
     }
 
     fn seal(&mut self, f: MockFrame, len: usize) -> Result<MockSealed, Dead> {
-        Ok(self.sealed(f, len))
+        self.sealed(f, len)
     }
 
     fn try_send(&mut self, s: MockSealed) -> Result<(), MockSealed> {
@@ -170,30 +195,37 @@ impl FrameTx for MockTx {
     }
 }
 
-impl PlainTx for MockTx {
-    const HAS_CLOSE_RECORD: bool = true;
+impl<const TLS: bool> PlainTx for MockTx<TLS> {
+    const HAS_CLOSE_RECORD: bool = TLS;
 
     fn has_pending(&self) -> bool {
-        !self.log.borrow().pending.is_empty()
+        TLS && !self.log.borrow().pending.is_empty()
     }
 
     fn take_pending(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Dead> {
+        assert!(TLS, "raw TCP has no records of its own");
         let record = self.log.borrow_mut().pending.remove(0);
         f.buf[HEAD..HEAD + record.len()].copy_from_slice(&record);
-        Ok(Some(self.sealed(f, record.len())))
+        self.sealed(f, record.len()).map(Some)
     }
 
     fn seal_close(&mut self, mut f: MockFrame) -> Result<Option<MockSealed>, Dead> {
+        assert!(TLS, "raw TCP ends with FIN alone");
         f.buf[HEAD..HEAD + CLOSE_RECORD.len()].copy_from_slice(CLOSE_RECORD);
-        Ok(Some(self.sealed(f, CLOSE_RECORD.len())))
+        self.sealed(f, CLOSE_RECORD.len()).map(Some)
     }
 }
 
-pub(super) type Core = TxCore<MockTx>;
+pub(super) type Core = TxCore<MockTx<true>>;
+
+/// A core over a mock of shape `TLS`, every gate open.
+pub(super) fn mock<const TLS: bool>(config: &Config, room: usize) -> (TxCore<MockTx<TLS>>, Rc<RefCell<Log>>) {
+    let log = Rc::new(RefCell::new(Log { delivered: true, ..Log::default() }));
+    (TxCore::new(MockTx { room, log: log.clone() }, config), log)
+}
 
 pub(super) fn core(role: Role, room: usize) -> (Core, Rc<RefCell<Log>>) {
-    let log = Rc::new(RefCell::new(Log { delivered: true, ..Log::default() }));
-    (TxCore::new(MockTx { room, log: log.clone() }, role), log)
+    mock::<true>(&Config::new(role), room)
 }
 
 fn peer(role: Role) -> Role {
@@ -208,7 +240,7 @@ pub(super) fn sent(log: &Rc<RefCell<Log>>) -> Vec<Vec<u8>> {
 }
 
 /// The frames as relay's receive core of the peer reads them, one TCP frame each.
-fn relay_reads(sender: Role, frames: &[Vec<u8>]) -> Run {
+pub(super) fn relay_reads(sender: Role, frames: &[Vec<u8>]) -> Run {
     let chunks: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
     drive(&mut rx(peer(sender)), &chunks)
 }
@@ -259,8 +291,8 @@ fn poll_n<F: Future>(f: F, n: usize) -> Option<F::Output> {
 }
 
 /// The core's state that a refused call must leave as it was.
-pub(super) fn state(c: &Core) -> (Job, bool, Option<Failure>, End) {
-    (c.next_job(), c.sent(), c.failed().cloned(), c.end())
+pub(super) fn state<const TLS: bool>(c: &TxCore<MockTx<TLS>>) -> Snapshot {
+    c.snapshot()
 }
 
 #[test]
@@ -369,27 +401,43 @@ fn send_waits_for_room_then_a_frame_before_sealing() {
 }
 
 /// A send dropped at each of its awaits, then a second send (same kind, and in another run the
-/// other kind): tungstenite reads either just the second message (the first was dropped before
-/// acceptance) or both, whole and apart. Never a merged message, never half of one. (The old
-/// send core left the message open: the next same-kind send continued it, the other kind
-/// panicked.)
+/// other kind): tungstenite reads exactly the messages accepted, whole and apart. Where the
+/// first send stopped decides: a one-frame message dropped at its room or frame wait was not
+/// accepted (it is accepted at its seal); a longer one is accepted on the first poll (copied
+/// in), so from then on it goes out whole before the second. (The old send core left the
+/// message open: the next same-kind send continued it, the other kind panicked.)
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_dropped_send_never_merges_into_the_next_message() {
     for first_len in [10, 4000] {
+        let large = first_len > 1422;
         for second in [Kind::Binary, Kind::Text] {
             let first = vec![1u8; first_len];
             for cut in 0.. {
                 let (mut c, log) = core(Role::Client, ROOM);
                 log.borrow_mut().stall = true;
                 if poll_n(c.send(Kind::Binary, &first), cut).is_some() {
+                    assert_eq!(cut, if large { 7 } else { 3 }, "len {first_len}: done after a room and a frame wait per frame");
                     break;
                 }
+                let gate = log.borrow().waited.last().copied();
+                // Not polled: nothing. Otherwise it stopped at a room or frame wait: a fragment's
+                // (copied in already) or the one-frame message's own (before its seal).
+                let accepted = match gate {
+                    None => false,
+                    Some(gate) => {
+                        assert!(gate == "room" || gate == "alloc", "len {first_len} cut {cut}: {gate}");
+                        large
+                    }
+                };
                 log.borrow_mut().stall = false;
                 send_all(&mut c, second, b"second");
                 let got = messages(Role::Client, &log);
-                let whole = [TMessage::Binary(first.clone().into()), tmsg(second, b"second")];
-                assert!(got == whole[1..] || got == whole, "len {first_len} cut {cut}: {got:?}");
+                let mut want = vec![tmsg(second, b"second")];
+                if accepted {
+                    want.insert(0, TMessage::Binary(first.clone().into()));
+                }
+                assert_eq!(got, want, "len {first_len} cut {cut}");
             }
         }
     }
@@ -477,6 +525,30 @@ fn next_job_order() {
         works,
         [None, Some(Work::Pending), Some(Work::Pong), Some(Work::Fragment), Some(Work::Fragment), Some(Work::Close)]
     );
+}
+
+/// What `recv` sends before it waits for input (`drain`): a dropped large send's rest and a
+/// close queued behind it, everything short of waiting for the peer; what it sends before
+/// returning a message it has (`flush`): the pong, not the rest of the message.
+#[test]
+fn drain_sends_an_accepted_messages_rest_and_the_close_behind_it() {
+    let (mut c, log) = core(Role::Server, ROOM);
+    log.borrow_mut().room = Some(ROOM);
+    assert!(poll_n(c.send(Kind::Binary, &[4; 3000]), 1).is_none());
+    c.ping(b"p");
+    assert!(poll_n(c.close(1000, "x"), 1).is_none());
+    log.borrow_mut().room = None;
+    ready(c.flush());
+    assert_eq!(c.next_job(), Job::Frame(1430, Work::Fragment));
+    c.peer_close(&[0x03, 0xe8]);
+    log.borrow_mut().delivered = false;
+    ready(c.drain());
+    assert_eq!((c.next_job(), log.borrow().shutdowns), (Job::Delivered, 1));
+    let frames = sent(&log);
+    assert_eq!(frames.last().unwrap(), CLOSE_RECORD);
+    let msgs = tungstenite_reads(Role::Server, &frames[..frames.len() - 1]);
+    assert_eq!(msgs[..2], [TMessage::Pong(b"p".to_vec().into()), TMessage::Binary(vec![4; 3000].into())]);
+    assert!(matches!(&msgs[2], TMessage::Close(Some(f)) if f.reason == "x"), "{msgs:?}");
 }
 
 /// A ping answered while a large message is going out: the pong goes between its fragments.
@@ -692,45 +764,143 @@ fn dead_seals_nothing_more() {
     assert_eq!(log.borrow().seals, 0);
 }
 
-/// Caller input refused before anything changes: Text not UTF-8, a message over MAX_SEND, a
-/// close code we may not send or a reason over 123 B, a send after our close.
+/// Caller input refused with earlier work retained (a large message's rest, a pong owed)
+/// changes nothing, all of the retained payload, offset and control payloads included: Text
+/// not UTF-8, a message one byte over `max_send`, a close code we may not send or a reason
+/// over 123 B. A message of exactly `max_send` is accepted; after our close a send is
+/// `Closed`.
 #[test]
-#[cfg_attr(miri, ignore)]
 fn invalid_input_changes_nothing() {
-    let (mut c, log) = core(Role::Server, ROOM);
+    const MAX: usize = 4000;
+    let (mut c, log) = mock::<true>(&Config { max_send: MAX, ..Config::new(Role::Server) }, ROOM);
+    log.borrow_mut().room = Some(ROOM);
+    assert!(poll_n(c.send(Kind::Binary, &[4; 3000]), 1).is_none());
+    c.ping(b"p");
     let before = state(&c);
     assert_eq!(ready(c.send(Kind::Text, &[b'a', 0xff])), Err(TxError::InvalidText));
-    assert_eq!(ready(c.send(Kind::Binary, &vec![0; MAX_SEND + 1])), Err(TxError::TooBig));
+    assert_eq!(ready(c.send(Kind::Binary, &[0; MAX + 1])), Err(TxError::TooBig));
     assert_eq!(ready(c.close(1000, &"r".repeat(124))), Err(TxError::InvalidClose));
     for code in [999, 1005, 1006, 1015] {
         assert_eq!(ready(c.close(code, "")), Err(TxError::InvalidClose), "{code}");
     }
-    assert_eq!((state(&c), log.borrow().seals), (before, 0));
-    send_all(&mut c, Kind::Binary, &vec![0; MAX_SEND]);
+    assert_eq!(state(&c), before);
+    c.check_invariants();
+    log.borrow_mut().room = None;
+    assert_eq!(ready(c.send(Kind::Binary, &[5; MAX])), Ok(()));
     assert_eq!(ready(c.close(1000, &"r".repeat(123))), Ok(()));
     assert_eq!(ready(c.send(Kind::Text, b"late")), Err(TxError::Closed));
+    let msgs = messages(Role::Server, &log);
+    assert_eq!(msgs[..3], [TMessage::Pong(b"p".to_vec().into()), TMessage::Binary(vec![4; 3000].into()), TMessage::Binary(vec![5; MAX].into())]);
 }
 
 /// The send buffer grows by clamped doubling: across increasing message sizes (40, 41, 63 MiB)
-/// its capacity never passes MAX_SEND, where plain `Vec` growth would reach 80 MiB.
+/// its capacity never passes the default `max_send` (64 MiB), where plain `Vec` growth would
+/// reach 80 MiB.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn send_buffer_never_grows_past_max_send() {
     let (mut c, log) = core(Role::Server, 70_000);
     for mib in [40, 41, 63] {
         send_all(&mut c, Kind::Binary, &vec![0; mib << 20]);
-        assert!(c.buf_capacity() <= MAX_SEND, "{mib} MiB: {}", c.buf_capacity());
+        assert!(c.buf_capacity() <= 64 << 20, "{mib} MiB: {}", c.buf_capacity());
+        c.check_invariants();
         log.borrow_mut().sent.clear();
     }
 }
 
-/// A queued close waits for the message in progress (data accepted before the close goes
-/// first).
+/// A seal that fails (TLS refusing to encrypt) is the socket's death, at each of the three
+/// seal points: a data frame, a lower record, close_notify. Its frame is released, nothing
+/// is sealed later, and a failure stored before is the one reported.
 #[test]
-fn queued_close_waits_for_the_message() {
-    let (mut c, log) = core(Role::Server, ROOM);
-    log.borrow_mut().room = Some(ROOM);
-    assert!(poll_n(c.send(Kind::Binary, &[4; 3000]), 1).is_none());
-    assert_eq!(c.queue_close(1000, ""), Ok(()));
-    assert!(matches!(c.next_job(), Job::Frame(_, Work::Fragment)));
+fn a_failed_seal_is_death_at_every_seal_point() {
+    // A data frame: one-frame and fragmented messages.
+    for len in [10, 3000] {
+        let (mut c, log) = core(Role::Server, ROOM);
+        log.borrow_mut().seal_fails = true;
+        assert_eq!(ready(c.send(Kind::Binary, &vec![1; len])), Err(TxError::Failed(Failure::Dead)), "len {len}");
+        log.borrow_mut().pending.push(b"alert".to_vec());
+        ready(c.finish());
+        c.check_invariants();
+        let log = log.borrow();
+        assert_eq!((c.end(), log.seals, log.live_frames(), log.sent.len()), (End::Dead, 0, 0, 0), "len {len}");
+    }
+    // A lower record, then close_notify, each after an earlier failure.
+    for (first, record) in [(Failure::Protocol(crate::ProtocolError::ReservedBits), true), (Failure::PeerEof, false)] {
+        let (mut c, log) = core(Role::Server, ROOM);
+        if record {
+            log.borrow_mut().pending.push(b"alert".to_vec());
+        }
+        c.fail(first.clone());
+        log.borrow_mut().seal_fails = true;
+        ready(c.finish());
+        log.borrow_mut().pending.push(b"later".to_vec());
+        ready(c.finish());
+        c.check_invariants();
+        assert_eq!(c.result(), Err(TxError::Failed(first)));
+        let log = log.borrow();
+        assert_eq!((c.end(), log.seals, log.live_frames(), log.shutdowns), (End::Dead, 0, 0, 0), "record {record}");
+    }
+}
+
+/// Raw TCP: our close, then the peer's, ends with FIN alone: with no frame to be had, nothing
+/// is allocated or sealed for the end, and FIN's delivery completes it.
+#[test]
+fn raw_close_handshake_ends_with_fin_alone() {
+    let (mut c, log) = mock::<false>(&Config::new(Role::Server), ROOM);
+    assert_eq!(ready(c.close(1000, "")), Ok(()));
+    let (allocs, seals) = (log.borrow().allocs, log.borrow().seals);
+    log.borrow_mut().frames = Some(0);
+    c.peer_close(&[0x03, 0xe8]);
+    ready(c.finish());
+    c.check_invariants();
+    let log = log.borrow();
+    assert_eq!((c.end(), log.shutdowns, log.allocs, log.seals), (End::Delivered, 1, allocs, seals));
+    assert_eq!(log.sent, [vec![0x88, 2, 0x03, 0xe8]]);
+}
+
+type Out = Rc<RefCell<Option<Result<(), TxError>>>>;
+
+/// `send` in a task; its result into `out`.
+#[switch::task]
+async fn sending(mut c: Core, out: Out) {
+    *out.borrow_mut() = Some(c.send(Kind::Binary, &[3; 3000]).await);
+}
+
+/// `close` in a task; its result into `out`.
+#[switch::task]
+async fn closing(mut c: Core, out: Out) {
+    *out.borrow_mut() = Some(c.close(1000, "").await);
+}
+
+/// A pending `send` or `close` in a switch runtime, woken by one gate alone: room coming, or
+/// the socket dying while it waits for a frame. Until the gate moves the task is not polled
+/// (no spin); then one turn finishes it. A wait that dropped its waker would never finish.
+#[test]
+fn room_or_death_alone_wakes_a_pending_send_or_close() {
+    for close in [false, true] {
+        for death in [false, true] {
+            let (c, log) = core(Role::Server, ROOM);
+            if death {
+                log.borrow_mut().frames = Some(0);
+            } else {
+                log.borrow_mut().room = Some(0);
+            }
+            let mut runtime = switch::Runtime::new(0);
+            let out: Out = Rc::default();
+            let spawner = runtime.spawner();
+            let spawned = if close { spawner.spawn(closing(c, out.clone())).is_ok() } else { spawner.spawn(sending(c, out.clone())).is_ok() };
+            assert!(spawned);
+            runtime.poll(0).unwrap();
+            assert_eq!(*out.borrow(), None, "close {close} death {death}");
+            assert_eq!(log.borrow().waited, [if death { "alloc" } else { "room" }]);
+            for _ in 0..3 {
+                assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0, "polled with no gate moved");
+            }
+            set(&log, |l| if death { l.dead = true } else { l.room = None });
+            assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+            let want = if death { Err(TxError::Failed(Failure::Dead)) } else { Ok(()) };
+            assert_eq!(*out.borrow(), Some(want), "close {close} death {death}");
+            assert_eq!(log.borrow().live_frames(), 0);
+        }
+    }
 }

@@ -334,11 +334,13 @@ where
     TxFailure: From<R::Error>,
 {
     fn new(rx: R, tx: T, tcp: TcpRx, role: Role) -> Self {
-        Session { rx: WsRx::new(rx, Config::new(role)), tx: TxCore::new(tx, role), tcp }
+        let config = Config::new(role);
+        Session { rx: WsRx::new(rx, config), tx: TxCore::new(tx, &config), tcp }
     }
 
     /// The next message. Before returning one, what cannot wait goes out (refused frame,
-    /// lower records, pong, our close). A peer close, a failure or the socket's death runs the
+    /// lower records, pong, our close); before waiting for input, everything that does not
+    /// need the peer (an accepted message's rest and a close behind it too). A peer close, a failure or the socket's death runs the
     /// rest of the connection's sending through the transport's end, then returns `None` (a
     /// clean close) or the first failure; so the caller may drop the connection at once.
     async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
@@ -364,7 +366,11 @@ where
             if let Some(p) = self.rx.take_pong() {
                 self.tx.ping(p);
             }
-            self.tx.flush().await;
+            if ready {
+                self.tx.flush().await;
+            } else {
+                self.tx.drain().await;
+            }
             if self.tx.failed().is_some() {
                 return self.end().await;
             }

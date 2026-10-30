@@ -67,7 +67,7 @@ impl Wss {
         server.set_buffer_limit(None);
         let mut w = Wss {
             rx: WsRx::new(TlsRx::new(), Config::new(Role::Client)),
-            tx: TxCore::new(tx, Role::Client),
+            tx: TxCore::new(tx, &Config::new(Role::Client)),
             wire,
             server: WebSocket::from_raw_socket(ServerIo(server), TRole::Server, None),
             server_done: false,

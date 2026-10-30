@@ -636,6 +636,75 @@ fn dropped_multi_frame_send_then_an_other_kind_send_is_two_messages() {
     dropped_multi_frame_send_then(Kind::Text);
 }
 
+/// A server that reads nothing until told, then reads messages (answering a Binary with Text
+/// "got") until the stream ends; what it read.
+fn read_after_go(go: mpsc::Receiver<()>) -> impl FnOnce(std::net::TcpStream) -> Vec<Message> + Send + 'static {
+    move |sock| {
+        go.recv_timeout(LIMIT).expect("the client's go");
+        let mut ws = tungstenite::WebSocket::from_raw_socket(sock, tungstenite::protocol::Role::Server, None);
+        let mut read = Vec::new();
+        loop {
+            match ws.read() {
+                Ok(m) => {
+                    if m.is_binary() {
+                        ws.send(Message::Text("got".into())).expect("answer");
+                    }
+                    read.push(m);
+                }
+                Err(WsError::ConnectionClosed) => return read,
+                Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => panic!("server read: {e}"),
+            }
+        }
+    }
+}
+
+/// A 1 MiB send dropped mid-message (the server not reading), then `recv`: the message's rest
+/// goes out while recv waits, so the server reads it whole and answers. (Before the fix recv
+/// waited for input only and the server for the rest of the message: neither moved.)
+#[zhida_test_support::pinned_test]
+fn recv_sends_the_rest_of_a_dropped_send() {
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let read = ws_until_client(
+        |listener| set_rcvbuf(listener, 4096),
+        read_after_go(go_rx),
+        move |mut ws| async move {
+            assert!(within_rounds(2000, ws.send(Kind::Binary, &[7; 1 << 20])).await.is_none(), "1 MiB found room");
+            go_tx.send(()).unwrap();
+            let answer = within_rounds(20_000, ws.recv()).await.expect("recv stalled behind the dropped send");
+            assert_eq!(answer.expect("recv").expect("a message").text(), Some("got"));
+            ws.close(1000, "").await.expect("close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert_eq!(read[0], Message::Binary(vec![7; 1 << 20].into()));
+    assert!(matches!(read[1..], [Message::Close(_)]), "{:?}", &read[1..]);
+}
+
+/// A 1 MiB send dropped mid-message, then a close dropped behind it, then `recv`: the
+/// message's rest and the close go out, the server echoes, recv ends cleanly. (Before the fix
+/// both stayed queued while recv waited for input.)
+#[zhida_test_support::pinned_test]
+fn recv_sends_a_dropped_close_behind_a_dropped_send() {
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let read = ws_until_client(
+        |listener| set_rcvbuf(listener, 4096),
+        read_after_go(go_rx),
+        move |mut ws| async move {
+            assert!(within_rounds(2000, ws.send(Kind::Binary, &[7; 1 << 20])).await.is_none(), "1 MiB found room");
+            assert!(within_rounds(50, ws.close(1000, "bye")).await.is_none(), "close found room");
+            go_tx.send(()).unwrap();
+            while let Some(m) = within_rounds(20_000, ws.recv()).await.expect("recv stalled behind the dropped send").expect("recv") {
+                assert_eq!(m.text(), Some("got"));
+            }
+            ws
+        },
+    );
+    assert_eq!(read[0], Message::Binary(vec![7; 1 << 20].into()));
+    assert!(matches!(&read[1..], [Message::Close(Some(c))] if c.reason == "bye"), "{:?}", &read[1..]);
+}
+
 /// The server closes: the client's recv returns the end, after echoing the close and ending
 /// TLS and TCP.
 #[zhida_test_support::pinned_test]
