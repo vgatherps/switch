@@ -134,6 +134,17 @@ fn add_address(iface: &CString, addr: Ipv4Addr, prefix: u8) {
     assert!(output.status.success(), "ip address add {cidr}: {}", String::from_utf8_lossy(&output.stderr));
 }
 
+impl Net {
+    /// Test inspection: whether the peer reset any TCP socket open on this Net.
+    pub fn tcp_reset_by_peer(&self) -> bool {
+        let inner = self.shared.borrow();
+        inner.entries.iter().any(|entry| match &entry.socket {
+            Some(crate::Socket::Tcp(handle, _)) => inner.stack.tcp(handle).reset_by_peer(),
+            _ => false,
+        })
+    }
+}
+
 /// A local port no earlier connection of this process used. The kernel keeps a test's socket
 /// after the test (in FIN-WAIT-1 or LAST-ACK when the Net stopped turning before the close
 /// finished); a new connection on the same address pair would collide with it and never
