@@ -6,6 +6,7 @@ use std::{
     os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -21,13 +22,16 @@ struct Tree {
 
 impl Tree {
     fn new() -> Self {
+        // the counter: parallel tests in one clock tick (macOS clocks tick in microseconds)
+        static TREES: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "netconf-devbind-{}-{}",
+            "netconf-devbind-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TREES.fetch_add(1, Ordering::Relaxed)
         ));
         let roots = Roots {
             sys: dir.join("sys"),
