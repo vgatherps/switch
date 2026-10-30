@@ -17,7 +17,7 @@ use core::task::Poll;
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::rx::{Message, WsError, WsRx};
-use crate::tx::{End, Failure, Job, Stepped, TxCore, TxError};
+use crate::tx::{End, Failure, Job, TxCore, TxError};
 
 /// How the input ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,17 +183,10 @@ where
         let reading = self.rx_in != RxIn::Eof;
         let job = self.tx.next_job() != Job::Idle;
         assert!(reading || job, "input ended with no job left, but the connection is not over");
-        let (input, stepped) = either(reading.then(|| self.input.recv()), job.then(|| self.tx.try_step())).await;
+        let (input, _) = either(reading.then(|| self.input.recv()), job.then(|| self.tx.try_step())).await;
         let took = input.is_some();
         if let Some(input) = input {
             self.take_input(input);
-        }
-        // A death the send side saw while input came in the same poll waits for the input,
-        // which reports the reset itself after the frames before it: the peer's close among
-        // them (Close, then a reset) makes it a clean end. Each such pass takes input, so
-        // this ends.
-        if stepped == Some(Stepped::Dead) && !took {
-            self.tx.stop();
         }
         took
     }

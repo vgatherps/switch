@@ -520,7 +520,7 @@ fn next_job_order() {
     let mut order = Vec::new();
     while let job @ (Job::Resend(_) | Job::Frame(..)) = c.next_job() {
         order.push(job);
-        assert!(ready(c.step()));
+        assert!(ready(c.try_step()));
     }
     let works: Vec<_> = order.iter().map(|j| if let Job::Frame(_, w) = j { Some(*w) } else { None }).collect();
     assert_eq!(
@@ -631,7 +631,7 @@ fn refused_close_and_close_notify_complete_only_when_taken() {
     c.peer_close(&[0x03, 0xe8]);
     log.borrow_mut().refuse = 1;
     log.borrow_mut().room = Some(ROOM);
-    assert!(ready(c.step()));
+    assert!(ready(c.try_step()));
     assert_eq!((c.end(), c.next_job()), (End::Notify, Job::Resend(ROOM)));
     assert_eq!(log.borrow().shutdowns, 0);
     log.borrow_mut().room = None;
@@ -652,7 +652,7 @@ fn failure_drains_only_what_is_sealed_or_owed_below() {
         assert!(poll_n(c.send(Kind::Binary, &[4; 4000]), 2).is_none());
         log.borrow_mut().refuse = 1;
         log.borrow_mut().room = Some(ROOM);
-        assert!(ready(c.step()));
+        assert!(ready(c.try_step()));
         assert_eq!(c.next_job(), Job::Resend(ROOM));
         c.ping(b"p");
         log.borrow_mut().pending.push(b"alert".to_vec());
