@@ -1588,6 +1588,8 @@ impl<'a> Socket<'a> {
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 && self.tx_queue.frame_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
+                // The shared frame pool is empty: wake this socket once frames return.
+                self.rx_buffer.shared.queue_frame_wait();
                 break;
             };
             let count = (data.len() - written)
@@ -1624,13 +1626,19 @@ impl<'a> Socket<'a> {
         *self.rx_buffer.shared.wake.borrow_mut() = Some((queue, handle));
     }
 
-    /// Stop receive frame drops from scheduling readiness checks for this socket.
+    /// Stop receive frame drops, and frames returning to an empty pool, from scheduling
+    /// readiness checks for this socket.
     pub(crate) fn clear_rx_wake(&mut self) {
+        self.rx_buffer.shared.cancel_frame_wait();
         *self.rx_buffer.shared.wake.borrow_mut() = None;
     }
 
     pub(crate) fn clear_rx_wake_queued(&mut self) {
         self.rx_buffer.shared.wake_queued.set(false);
+    }
+
+    pub(crate) fn clear_frame_wait_queued(&mut self) {
+        self.rx_buffer.shared.frame_wait_queued.set(false);
     }
 
     /// Frames the app still holds; they keep their RX pool buffers until dropped.
@@ -1758,12 +1766,16 @@ impl<'a> Socket<'a> {
     }
 
     /// Drop received data past the first gap, frames and a FIN alike; in-order data stays.
-    /// Only under RX pool pressure: kept out of line so the segment path's code stays as it was.
+    /// Called for every segment while the RX pool is low: with nothing out of order it only
+    /// clears a FIN past a gap, and otherwise visits only the dropped views. Kept out of line
+    /// so the segment path's code stays as it was.
     #[cold]
     #[inline(never)]
     fn prune_out_of_order(&mut self) {
-        self.rx_buffer.store.truncate_from(self.rx_buffer.store.in_order_len());
         self.rx_fin_seq = None;
+        if self.rx_buffer.store.out_of_order_span() != 0 {
+            self.rx_buffer.store.drop_out_of_order();
+        }
     }
 
     fn set_state(&mut self, state: State) {
@@ -2063,6 +2075,8 @@ impl<'a> Socket<'a> {
         self.rx_buffer.store.attach(frame);
     }
 
+    /// Per segment; the truncation itself runs only for a FIN.
+    #[inline]
     fn truncate_at_fin(&mut self, fin_offset: Option<usize>) {
         if let Some(offset) = fin_offset {
             self.rx_buffer.store.truncate_from(offset);
@@ -5642,6 +5656,35 @@ mod test {
         let ack = receive_window_segment(&mut s, 1100, &[1; 1100]);
         assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 3300));
         assert_eq!(drain_bytes(&mut s), [[0; 1100], [1; 1100], [2; 1100]].concat());
+        assert_eq!(s.rx_refused_segments(), 1);
+    }
+
+    /// A FIN past a gap arriving while the RX pool is low is refused with its data. Once the
+    /// pool recovers, the gap and the resent FIN deliver every byte and then end of stream.
+    #[test]
+    fn low_rx_pool_refuses_out_of_order_fin_until_recovery() {
+        let fin = |offset: usize| TcpRepr {
+            control: TcpControl::Fin,
+            seq_number: REMOTE_SEQ + 1 + offset,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload: &[1; 100],
+            ..SEND_TEMPL
+        };
+        let mut s = socket_with_mbuf_window(2);
+        s.cx.rx_pool_low = true;
+        send(&mut s, Instant::from_millis(0), &fin(1100));
+        assert_eq!(s.rx_fin_seq, None);
+        assert_eq!(s.rx_buffer.store.held(), 0);
+        assert_eq!(s.rx_refused_segments(), 1);
+        assert_eq!(s.state, State::Established);
+
+        s.cx.rx_pool_low = false;
+        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
+        send(&mut s, Instant::from_millis(0), &fin(1100));
+        assert_eq!(s.state, State::CloseWait);
+        assert_eq!(drain_bytes(&mut s), [&[0; 1100][..], &[1; 100][..]].concat());
+        assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
         assert_eq!(s.rx_refused_segments(), 1);
     }
 

@@ -161,11 +161,9 @@ pub fn port_config<'a>(
         queue_socket: -1,
         rx_pool: PoolConfig {
             name: rx_pool,
-            // Every connection's receive window full at once: the workloads stream on all.
-            count: u32::try_from(
-                rx_reserve(64, RX_STAGING, POOL_CACHE) + conns * tcp::rx_mbuf_budget(&socket(), 1500),
-            )
-            .expect("RX pool count fits u32"),
+            // Beyond the reserve, one connection's full receive window, shared by all.
+            count: u32::try_from(rx_reserve(64, RX_STAGING, POOL_CACHE) + tcp::rx_mbuf_budget(&socket(), 1500))
+                .expect("RX pool count fits u32"),
             cache_size: POOL_CACHE,
             data_room_size: headroom + BUFFER_SIZE,
             socket_id: -1,
@@ -173,7 +171,7 @@ pub fn port_config<'a>(
         tx_pool: pool(tx_pool, tx_pending(conns), headroom + FRAME),
         frame_pool: pool(
             frame_pool,
-            tx_pending(conns) + 1 + conns * tcp::tx_mbuf_budget(&socket(), 1500),
+            tx_pending(conns) + 1 + tcp::tx_mbuf_budget(&socket(), 1500),
             headroom + FRAME,
         ),
         offloads: Offloads::default(),
@@ -276,9 +274,8 @@ fn message_key(conn: usize, round: usize) -> u64 {
 }
 
 /// Enqueue pattern bytes `from..to` of stream `key` in frames filled in place,
-/// one per local segment payload, while the socket has frame room; returns how
-/// many fit. Admission backs every frame slot, so the pool has a frame whenever
-/// the socket has room.
+/// one per local segment payload, while the socket has frame room and the shared
+/// frame pool has a frame; returns how many fit. The caller polls again later.
 fn send_pattern(stack: &mut Stack, handle: &TcpHandle, key: u64, from: usize, to: usize) -> usize {
     let mut at = from;
     while at < to {
@@ -286,7 +283,9 @@ fn send_pattern(stack: &mut Stack, handle: &TcpHandle, key: u64, from: usize, to
         if room == 0 {
             break;
         }
-        let mut frame = stack.tx_frame().expect("the frame pool backs every socket's frame slots");
+        let Some(mut frame) = stack.tx_frame() else {
+            break;
+        };
         let n = (to - at).min(SEGMENT_PAYLOAD).min(room).min(frame.capacity());
         fill_pattern(&mut frame.room_mut()[..n], key, at as u64);
         frame.set_len(n);

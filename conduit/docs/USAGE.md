@@ -380,8 +380,13 @@ negotiated RX descriptor count, which the PMD may raise; leave room for that.
 Out-of-order segments are freed only when the gap before them fills, so sockets holding them
 could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. As Linux
 prunes the receiving socket's out-of-order queue under memory pressure, each `turn` and `receive`
-checks after its RX burst whether at most one RX burst of mbufs (`PortConfig::rx_burst`) is free.
-While that holds, a TCP socket that processes a segment drops its own out-of-order data (and an
+whose RX burst staged frames checks whether fewer RX mbufs are free than one refill of the RX
+ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
+refill in chunks up to that size and receive nothing while a chunk cannot be had (ENA allocates
+every free descriptor at once, ixgbe vector RX 64, memif copy mode 32 per receive), so the check
+must fire while a refill can still succeed. Out-of-order data is kept only while at least that
+many mbufs are free, so size the RX share for it on top of what sockets hold.
+While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
 out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
 ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
 resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
@@ -419,7 +424,9 @@ frames all TCP send queues and the application may hold at once; sockets share t
 socket queues at most `tcp::tx_mbuf_budget(&config, ip_mtu)` frames (one per segment payload of
 `tx_capacity`, at least six). With the pool empty, `send_slice` queues nothing and returns `Ok(0)`,
 `udp_send` returns `WouldBlock` and `tx_frame` returns `None`; frames return when the peer ACKs
-queued data and the PMD releases sent frames. TCP egress, retransmissions included, takes no
+queued data and the PMD releases sent frames. A socket whose `send_slice` found the pool empty
+is woken (its armed readiness tokens fire) at the start of the first `turn`, `receive` or `send` that finds a free
+frame; `tx_frame` callers get no such wake. TCP egress, retransmissions included, takes no
 frame-pool frame. `net_ring` ports opened by the test kit use their TX ring size as the TX
 descriptor count.
 

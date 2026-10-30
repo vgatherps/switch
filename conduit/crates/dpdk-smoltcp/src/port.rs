@@ -457,6 +457,8 @@ pub struct Port {
     /// TX data room after headroom: the largest `alloc_tx` length.
     tx_room: u16,
     descriptors: (u16, u16),
+    /// Free RX mbufs below which the pool is low; see `rx_pool_low`.
+    rx_low_mark: usize,
     rx: ManuallyDrop<PoolResources>,
     tx: ManuallyDrop<PoolResources>,
     /// This Port's clone of the frame pool; other clones may outlive the Port.
@@ -605,6 +607,7 @@ impl Port {
             // `data_room_size` >= headroom + frame was checked above.
             tx_room: config.tx_pool.data_room_size - RTE_PKTMBUF_HEADROOM as u16,
             descriptors: (config.rx_descriptors, config.tx_descriptors),
+            rx_low_mark: rx_low_mark(config.rx_descriptors, config.rx_burst),
             rx: ManuallyDrop::new(rx),
             tx: ManuallyDrop::new(tx),
             frame_origin: NonNull::new(frame_pool.mempool()).expect("a frame pool has a mempool").cast(),
@@ -670,6 +673,7 @@ impl Port {
             }
         }
         self.descriptors = (rx_desc, tx_desc);
+        self.rx_low_mark = rx_low_mark(rx_desc, self.rx_scratch.len() as u16);
         let mut rxconf = info.default_rxconf;
         rxconf.offloads = 0;
         rxconf.rx_deferred_start = 0;
@@ -753,10 +757,10 @@ impl Port {
     }
 
     /// Whether the RX mbufs this lcore can allocate (the RX pool's backing store plus this
-    /// lcore's cache, which the PMD refills from) are at most one RX burst (`rx_burst`).
+    /// lcore's cache, which the PMD refills from) fall short of `rx_low_mark`.
     #[inline]
     pub(crate) fn rx_pool_low(&self) -> bool {
-        (self.rx.pool().free_count() as usize) <= self.rx_scratch.len()
+        (self.rx.pool().free_count() as usize) < self.rx_low_mark
     }
 
     pub(crate) fn tx_pool_count(&self) -> usize {
@@ -1045,6 +1049,15 @@ fn check_configuration(mtu: u16, offloads: Offloads, conf: &rte_eth_conf) -> Res
         }
     }
     Ok(())
+}
+
+/// One refill of the whole RX ring plus one RX burst: max(RX descriptors, 32) + `rx_burst`.
+/// DPDK 25.11.3 PMDs refill in chunks up to that size and receive nothing while a chunk cannot
+/// be had: ENA bulk-allocates every free descriptor at once, ixgbe's vector RX rearms 64, memif
+/// copy mode allocates 32 per receive whatever the burst; net_tap takes one per packet and
+/// net_ring none. The 32 floor is `rx_reserve`'s.
+fn rx_low_mark(rx_descriptors: u16, rx_burst: u16) -> usize {
+    usize::from(rx_descriptors.max(32)) + usize::from(rx_burst)
 }
 
 fn importable(m: &rte_mbuf, rx_pool: *mut rte_mempool) -> bool {

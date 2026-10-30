@@ -492,6 +492,18 @@ impl<'a> TcpSet<'a> {
         self.mark_dirty(handle.index);
     }
 
+    /// Complete a frame wait: the frame pool has a free frame again, so fire the socket's
+    /// readiness tokens and schedule its readiness check. Removal takes a socket off the
+    /// wait list, so `handle` names a live socket.
+    pub fn frame_woken(&mut self, handle: SocketHandle) {
+        let socket = &mut self.sockets.get_mut(handle.index)
+            .filter(|slot| slot.generation == handle.generation)
+            .and_then(|slot| slot.inner.as_mut())
+            .expect("frame wake does not name a live TCP socket").socket;
+        socket.clear_frame_wait_queued();
+        self.mark_dirty(handle.index);
+    }
+
     /// Close the socket after its application handle is dropped, keeping it in the set.
     pub fn orphan(&mut self, handle: SocketHandle, now: Instant) {
         self.item(handle);

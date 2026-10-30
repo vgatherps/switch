@@ -195,6 +195,8 @@ pub struct Stack {
     dropped_tcp: Vec<SocketHandle>,
     dropped_udp: Vec<smoltcp::iface::UdpHandle>,
     rx_wakes: Vec<SocketHandle>,
+    /// Sockets taken off the DropQueue's frame-wait list for waking; empty between turns.
+    frame_waiters: Vec<SocketHandle>,
     max_sockets: usize,
     max_udp_sockets: usize,
     ip_mtu: u16,
@@ -299,6 +301,7 @@ impl Stack {
             dropped_tcp: Vec::with_capacity(config.max_sockets),
             dropped_udp: Vec::with_capacity(config.max_udp_sockets),
             rx_wakes: Vec::with_capacity(config.max_sockets),
+            frame_waiters: Vec::with_capacity(config.max_sockets),
             max_sockets: config.max_sockets,
             max_udp_sockets: config.max_udp_sockets,
             ip_mtu: mtu,
@@ -420,10 +423,11 @@ impl Stack {
         Ok(())
     }
 
-    /// Time check, flush, one RX burst, maintenance, then ingress. A burst that staged
-    /// frames also tells the Interface whether the RX pool is low (at most one RX burst of
-    /// mbufs free); while it is, each TCP socket that processes a segment keeps no
-    /// out-of-order data (`Interface::set_rx_pool_low`). An empty burst keeps the last
+    /// Time check, tidying (which wakes sockets waiting for a free frame if one is free), flush,
+    /// one RX burst, maintenance, then ingress. A burst that staged frames also tells the
+    /// Interface whether the RX pool is low (fewer free mbufs than one refill of the RX ring
+    /// plus one RX burst, see `Port`); while it is, each TCP socket that processes a segment
+    /// keeps no out-of-order data (`Interface::set_rx_pool_low`). An empty burst keeps the last
     /// answer: the frames still staged were taken before it, and only a burst takes mbufs.
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
@@ -458,6 +462,21 @@ impl Stack {
             tx_accepted,
             tx_pending: self.device.pending(),
         })
+    }
+
+    /// A socket whose `send_slice` found the shared frame pool empty waits for a free frame:
+    /// once the pool has one, fire its readiness tokens and schedule its readiness check.
+    #[cold]
+    #[inline(never)]
+    fn wake_frame_waiters(&mut self) {
+        let pool = self.device.frame_pool();
+        if pool.in_use_count() as usize >= pool.count() {
+            return;
+        }
+        self.dropped.drain_frame_waiters(&mut self.frame_waiters);
+        for handle in self.frame_waiters.drain(..) {
+            self.sockets.frame_woken(handle);
+        }
     }
 
     /// Egress passes at the stored time, then flush; returns the frames the
@@ -771,7 +790,10 @@ impl Stack {
     /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
     /// that can make the socket readable, writable or change its state fires it: a received
     /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), a receive wake
-    /// from a dropped frame, or a state change in egress (close timers, TIME-WAIT end). A fired
+    /// from a dropped frame, the start of the first `turn`, `receive` or `send` that finds a
+    /// free frame after the socket's `send_slice` found the shared frame pool empty, or a state
+    /// change in egress
+    /// (close timers, TIME-WAIT end). A fired
     /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
     /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
     /// processes a dropped handle; `disarm_tcp` stops a token at once.
@@ -832,8 +854,14 @@ impl Stack {
         handle.raw
     }
 
+    /// Wake sockets waiting for a free frame if one is free, then process dropped handles,
+    /// receive wakes and reapable sockets.
     fn tidy(&mut self) {
-        if self.dropped.is_empty() && !self.sockets.has_reapable() {
+        let (empty, frame_waiters) = self.dropped.state();
+        if frame_waiters {
+            self.wake_frame_waiters();
+        }
+        if empty && !self.sockets.has_reapable() {
             return;
         }
         self.dropped
