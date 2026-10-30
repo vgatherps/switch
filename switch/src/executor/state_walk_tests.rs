@@ -267,16 +267,21 @@ fn apply(owner: &Owner, model: &Rc<Model>, event: &Event) {
                     record.pending.set(Pending::Eager);
                 }
             }
+            let polls = || model.records.borrow().iter().map(|record| record.polls.get()).sum::<usize>();
+            let before = polls();
             model.mode.set(Mode::Turn);
-            let polled = unsafe {
+            let reported = unsafe {
                 Executor::check_turn(root);
                 let mut turn = Executor::enter_turn(root);
                 Executor::undefer(root);
-                let polled = Executor::poll_batch(&mut turn);
+                let reported = Executor::poll_batch(&mut turn);
                 turn.finish();
-                polled
+                reported
             };
             model.mode.set(Mode::Idle);
+            // Counted by the probes themselves; the budget only stops rounds once reached.
+            let polled = polls() - before;
+            assert_eq!(reported, polled, "poll_batch's count");
             if polled < POLL_BUDGET {
                 assert_eq!(model.live_with(Pending::Eager), 0, "lost wake: an eager task did not run in the turn");
             }
