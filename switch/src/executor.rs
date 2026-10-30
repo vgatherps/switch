@@ -36,18 +36,25 @@ pub(crate) enum Lifecycle {
 #[inline]
 fn unlikely() {}
 
-/// Append to a wake queue without a capacity check.
-///
-/// # Safety
-/// `queue.len() < queue.capacity()`.
+/// Append to a wake queue whose room is reserved (see `allocated`); never reallocates.
+/// A full queue means that reservation broke: it panics, out of line.
 #[inline]
-unsafe fn append_reserved(queue: &mut Vec<*const TaskHeader>, header: *const TaskHeader) {
+fn append_reserved(queue: &mut Vec<*const TaskHeader>, header: *const TaskHeader) {
     let len = queue.len();
-    debug_assert!(len < queue.capacity());
+    if len == queue.capacity() {
+        wake_queue_full();
+    }
+    // SAFETY: `len < capacity`, checked above.
     unsafe {
         queue.as_mut_ptr().add(len).write(header);
         queue.set_len(len + 1);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn wake_queue_full() -> ! {
+    panic!("wake queue full: a queued task was not counted in `allocated`")
 }
 
 /// Most task polls in one `Runtime::poll`, checked between rounds.
@@ -225,8 +232,8 @@ impl Executor {
             // never polled again and are freed with it.
             let this = Meta::executor(TaskHeader::meta(header));
             flags.set(current | QUEUED);
-            // SAFETY: the slot is LIVE without QUEUED, so it is counted in
-            // `allocated` and has no entry: `incoming.len() < allocated <=
+            // The slot is LIVE without QUEUED, so it is counted in `allocated`
+            // and has no entry: `incoming.len() < allocated <=
             // incoming.capacity()` (see `allocated`).
             append_reserved(&mut (*this).incoming, header);
         }
@@ -273,7 +280,7 @@ impl Executor {
             // Alive, and any lifecycle takes the wake, as in `wake`.
             let this = Meta::executor(TaskHeader::meta(header));
             flags.set(current | QUEUED | DEFERRED);
-            // SAFETY: as in `wake`, `deferred.len() < allocated <= deferred.capacity()`.
+            // As in `wake`, `deferred.len() < allocated <= deferred.capacity()`.
             append_reserved(&mut (*this).deferred, header);
         }
     }

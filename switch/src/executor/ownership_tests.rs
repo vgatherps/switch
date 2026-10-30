@@ -27,6 +27,17 @@ fn constructor_reserves_ready_storage_and_uses_initial_timer_tick() {
     }
     owner.cleanup();
 }
+/// A wake queue at capacity: one more append panics rather than writing past the buffer.
+#[test]
+#[should_panic(expected = "wake queue full")]
+fn append_to_a_full_wake_queue_panics() {
+    let mut queue: Vec<*const TaskHeader> = Vec::with_capacity(1);
+    while queue.len() < queue.capacity() {
+        append_reserved(&mut queue, std::ptr::null());
+    }
+    append_reserved(&mut queue, std::ptr::null());
+}
+
 impl Owner {
     fn new() -> Self {
         Self(Box::into_raw(Box::new(Executor::new())))
