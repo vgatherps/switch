@@ -2,7 +2,14 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-pub const USAGE: &str = "usage: zhida-nic --config FILE <MODE> [MODE OPTIONS]
+use binance_feed::{DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT, DEFAULT_PRINT};
+
+/// Seconds `feed` reads after the WebSocket opens.
+const DEFAULT_FEED_SECONDS: u64 = 30;
+
+pub fn usage() -> String {
+    format!(
+        "usage: zhida-nic --config FILE <MODE> [MODE OPTIONS]
 OPTIONS (each at most once, before MODE):
   --config FILE        required Zhida network and EAL config
 MODES:
@@ -13,10 +20,12 @@ MODES:
     Socket buffers support messages through 65507 bytes. UDP above MTU - 28
     (1472 at MTU 1500) requires IP fragment reassembly; Zhida does not do it.
   feed [--host H] [--port P] [--path P] [--print N] [--seconds S]
-    Defaults: stream.binance.com, 9443, /ws/btcusdt@bookTicker, N=10, S=30. TLS 1.3 only:
+    Defaults: {DEFAULT_HOST}, {DEFAULT_PORT}, {DEFAULT_PATH}, N={DEFAULT_PRINT}, S={DEFAULT_FEED_SECONDS}. TLS 1.3 only:
     data-stream.binance.vision (TLS 1.2 only) is unreachable; stream.binance.com may answer
     HTTP 451 from restricted locations. S counts from the WebSocket open.
-Exit codes: 0 success; 2 buffers in use at close; 3 args/setup/run error; 101 panic.";
+Exit codes: 0 success; 2 buffers in use at close; 3 args/setup/run error; 101 panic."
+    )
+}
 
 pub struct Args {
     pub config: PathBuf,
@@ -93,11 +102,11 @@ pub fn parse(args: impl Iterator<Item = OsString>) -> Result<Args, String> {
         report_seconds: 5,
     };
     let mut feed = Feed {
-        host: "data-stream.binance.vision".into(),
-        port: 9443,
-        path: "/ws/btcusdt@bookTicker".into(),
-        print: 10,
-        seconds: 30,
+        host: DEFAULT_HOST.into(),
+        port: DEFAULT_PORT,
+        path: DEFAULT_PATH.into(),
+        print: DEFAULT_PRINT,
+        seconds: DEFAULT_FEED_SECONDS,
     };
     while let Some(flag) = args.next() {
         let flag = flag?;
@@ -233,5 +242,29 @@ mod tests {
         assert_eq!(server.tcp_connections, 4);
         assert_eq!(server.seconds, 2);
         assert_eq!(server.report_seconds, 1);
+    }
+
+    fn feed(args: &[&str]) -> Feed {
+        let parsed = parse(args.iter().map(OsString::from)).unwrap();
+        let Mode::Feed(feed) = parsed.mode else {
+            panic!("expected feed mode");
+        };
+        feed
+    }
+
+    #[test]
+    fn feed_defaults_to_the_tls13_stream() {
+        let feed = feed(&["--config", "x", "feed"]);
+        assert_eq!(
+            (feed.host.as_str(), feed.port, feed.path.as_str()),
+            ("stream.binance.com", 9443, "/ws/btcusdt@bookTicker")
+        );
+        assert_eq!((feed.print, feed.seconds), (10, 30));
+    }
+
+    #[test]
+    fn feed_host_override() {
+        let feed = feed(&["--config", "x", "feed", "--host", "testnet.binance.vision"]);
+        assert_eq!(feed.host, "testnet.binance.vision");
     }
 }

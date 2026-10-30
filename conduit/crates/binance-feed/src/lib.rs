@@ -20,6 +20,13 @@ use switchnet::{
 };
 
 pub const INGRESS_BUDGET: usize = 32;
+/// The feed's defaults, shared by binance-feed and `zhida-nic feed`. The host speaks TLS 1.3;
+/// data-stream.binance.vision speaks TLS 1.2 only, which sheath does not.
+pub const DEFAULT_HOST: &str = "stream.binance.com";
+pub const DEFAULT_PORT: u16 = 9443;
+pub const DEFAULT_PATH: &str = "/ws/btcusdt@bookTicker";
+/// Updates printed.
+pub const DEFAULT_PRINT: usize = 10;
 /// RX and TX buffer bytes of the feed's socket.
 pub const SOCKET_BUFFER: usize = 256 * 1024;
 
