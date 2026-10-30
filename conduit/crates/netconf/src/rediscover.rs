@@ -1,5 +1,10 @@
 use crate::{discover::Discovered, Config, ConfigError, Device};
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::{ErrorKind, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// Discovered facts replace the previous ones; what the source cannot discover is kept as
 /// configured: devargs, offloads, rx_timestamps, descriptors, eal, path rules other than `vpc`
@@ -43,6 +48,51 @@ pub fn load_existing(path: &Path) -> Result<Option<Config>, ConfigError> {
     }
 }
 
+/// Numbers this process's temp files (with the pid, unique among live processes).
+pub(crate) static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Temp names tried before giving up; a name is taken only by a leftover of a dead process that
+/// had this pid.
+const TEMP_TRIES: u64 = 64;
+
+/// Temp file number `n` of this process for `path`, in the same directory.
+pub(crate) fn temp_path(path: &Path, n: u64) -> PathBuf {
+    let name = path.file_name().map_or_else(Default::default, |n| n.to_string_lossy().into_owned());
+    path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
+}
+
+/// Replaces the file at `path` (through a symlink, its target) with `bytes` and its permissions:
+/// writes and fsyncs a new temp file in the same directory, then renames it over the file, so a
+/// failure or a kill leaves the old file whole. A temp file left by a killed run never blocks a
+/// later one: each run takes a fresh name.
+fn replace(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    let error = |at: &Path, e: std::io::Error| ConfigError(format!("{}: {e}", at.display()));
+    let path = fs::canonicalize(path).map_err(|e| error(path, e))?;
+    let permissions = fs::metadata(&path).map_err(|e| error(&path, e))?.permissions();
+    let mut tries = 0;
+    let (temp, mut file) = loop {
+        let temp = temp_path(&path, TEMP_SEQ.fetch_add(1, Ordering::Relaxed));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && tries + 1 < TEMP_TRIES => tries += 1,
+            Err(e) => return Err(error(&temp, e)),
+        }
+    };
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.set_permissions(permissions))
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp, &path));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(error(&temp, e));
+    }
+    Ok(())
+}
+
 pub fn write(
     path: &Path,
     discovered: &Discovered,
@@ -80,18 +130,17 @@ pub fn write(
             }
         }
     }
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
     if previous.is_some() {
-        options.truncate(true);
+        replace(path, config.to_json().as_bytes())?;
     } else {
-        options.create_new(true);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
+        file.write_all(config.to_json().as_bytes())
+            .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
     }
-    let mut file = options
-        .open(path)
-        .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
-    file.write_all(config.to_json().as_bytes())
-        .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
     let report = |changes: &mut dyn Write, line: std::fmt::Arguments| {
         writeln!(changes, "{line}").map_err(|e| ConfigError(e.to_string()))
     };
