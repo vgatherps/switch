@@ -706,7 +706,7 @@ fn every_op_after_a_failure() {
     c.ping(b"p");
     c.fail(Failure::Protocol(crate::ProtocolError::ReservedBits));
     assert_eq!((state(&c), sent(&log)), before);
-    c.die();
+    c.reset();
     assert_eq!(c.failed(), Some(&Failure::PeerEof));
 }
 
@@ -762,7 +762,7 @@ fn send_whose_drain_dies_accepts_nothing() {
 fn dead_seals_nothing_more() {
     let (mut c, log) = core(Role::Server, ROOM);
     log.borrow_mut().pending.push(b"alert".to_vec());
-    c.die();
+    c.stop();
     assert_eq!(c.next_job(), Job::Idle);
     ready(c.finish());
     assert_eq!(log.borrow().seals, 0);

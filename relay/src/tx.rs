@@ -262,6 +262,11 @@ impl<L: PlainTx> TxCore<L> {
         self.failed.as_ref()
     }
 
+    /// The peer's close arrived.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.peer == Peer::Closed
+    }
+
     pub(crate) fn end(&self) -> End {
         self.end
     }
@@ -357,12 +362,12 @@ impl<L: PlainTx> TxCore<L> {
         }
     }
 
-    /// Seals `len` bytes of `f` and sends them; a seal error ends the connection (a TLS
+    /// Seals `len` bytes of `f` and sends them; a seal error fails the connection (a TLS
     /// sender refusing after a failure, or a record lost below).
     fn seal_put(&mut self, f: L::Frame, len: usize) {
         match self.lower.seal(f, len) {
             Ok(s) => self.put(s, len),
-            Err(_) => self.die(),
+            Err(_) => self.broken(),
         }
     }
 
@@ -383,7 +388,7 @@ impl<L: PlainTx> TxCore<L> {
             Work::Pending => match self.lower.take_pending(f) {
                 Ok(Some(s)) => self.put(s, len),
                 Ok(None) => {}
-                Err(_) => self.die(),
+                Err(_) => self.broken(),
             },
             Work::Notify => match self.lower.seal_close(f) {
                 Ok(Some(s)) => {
@@ -391,7 +396,7 @@ impl<L: PlainTx> TxCore<L> {
                     self.put(s, len);
                 }
                 Ok(None) => self.end = End::Notify,
-                Err(_) => self.die(),
+                Err(_) => self.broken(),
             },
             Work::Pong => {
                 let p = self.pong.take().expect("a pong job");
@@ -467,22 +472,42 @@ impl<L: PlainTx> TxCore<L> {
         self.abandon();
     }
 
-    /// The socket died: nothing more is sent. A failure stored before stays; otherwise the
-    /// death is the failure, unless the peer's close came first (receiving was over, and what
-    /// we still owed it is moot: the decided clean end).
-    pub(crate) fn die(&mut self) {
-        if self.peer == Peer::Open {
-            self.failed.get_or_insert(Failure::Dead);
-        }
+    /// The socket died (a send wait reported it): nothing more is sent, what is owed is
+    /// dropped. The connection's outcome waits for the input's end ([`reset`](Self::reset)):
+    /// the frames received before it may hold the peer's close.
+    pub(crate) fn stop(&mut self) {
         self.unsent = None;
         self.abandon();
         self.end = End::Dead;
     }
 
-    fn refuse(&self) -> Result<(), TxError> {
-        if let Some(f) = &self.failed {
-            return Err(TxError::Failed(f.clone()));
+    /// The input reported the reset, after every frame before it: the socket's death is the
+    /// connection's failure unless the peer's close came first (receiving was over, and what
+    /// we still owed it is moot: a clean end). A failure stored before stays.
+    pub(crate) fn reset(&mut self) {
+        if self.peer == Peer::Open {
+            self.failed.get_or_insert(Failure::Dead);
         }
+        self.stop();
+    }
+
+    /// The lower layer refused to seal: nothing more can be sent, and the connection failed.
+    fn broken(&mut self) {
+        self.failed.get_or_insert(Failure::Dead);
+        self.stop();
+    }
+
+    /// Whether this call can still send: the first failure, else the socket's death.
+    fn alive(&self) -> Result<(), TxError> {
+        self.result()?;
+        if self.end == End::Dead {
+            return Err(TxError::Failed(Failure::Dead));
+        }
+        Ok(())
+    }
+
+    fn refuse(&self) -> Result<(), TxError> {
+        self.alive()?;
         if self.local != Local::Open {
             return Err(TxError::Closed);
         }
@@ -535,9 +560,7 @@ impl<L: PlainTx> TxCore<L> {
     /// Queues our close (`code`, `reason`); a second call while ours is queued or out does
     /// nothing.
     pub(crate) fn queue_close(&mut self, code: u16, reason: &str) -> Result<(), TxError> {
-        if let Some(f) = &self.failed {
-            return Err(TxError::Failed(f.clone()));
-        }
+        self.alive()?;
         if !close_sendable(code, reason) {
             return Err(TxError::InvalidClose);
         }
@@ -559,7 +582,7 @@ impl<L: PlainTx> TxCore<L> {
         self.local == Local::Sent && self.unsent.is_none()
     }
 
-    /// The first failure, if any.
+    /// The connection's outcome so far: the first failure, if any.
     pub(crate) fn result(&self) -> Result<(), TxError> {
         match &self.failed {
             Some(f) => Err(TxError::Failed(f.clone())),
@@ -623,7 +646,6 @@ impl<L: PlainTx> TxCore<L> {
             }
             End::Dead => {
                 assert!(self.unsent.is_none() && job == Job::Idle);
-                assert!(self.failed.is_some() || self.peer == Peer::Closed, "dead with no failure before the peer's close");
             }
         }
     }
@@ -637,7 +659,7 @@ impl<L: PlainTx> TxCore<L> {
             Stepped::Idle => false,
             Stepped::Done => true,
             Stepped::Dead => {
-                self.die();
+                self.stop();
                 true
             }
         }
@@ -682,24 +704,24 @@ impl<L: PlainTx> TxCore<L> {
     pub(crate) async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), TxError> {
         self.check_send(kind, payload)?;
         self.drive(|c| c.next_job() != Job::Idle).await;
-        // The drain changes only the failure state (Local stays Open while open).
-        self.result()?;
+        // The drain changes only whether we can send (Local stays Open while we can).
+        self.alive()?;
         match self.small(payload.len()) {
             Some(len) => match self.frame_after_room(len).await {
                 Some(f) => self.accept_small(kind, payload, f),
-                None => self.die(),
+                None => self.stop(),
             },
             None => self.accept_large(kind, payload),
         }
         self.drive(|c| !c.sent()).await;
-        self.result()
+        self.alive()
     }
 
     /// Queues our close and sends it once the message in progress is out.
     pub(crate) async fn close(&mut self, code: u16, reason: &str) -> Result<(), TxError> {
         self.queue_close(code, reason)?;
         self.drive(|c| !c.close_sent()).await;
-        self.result()
+        self.alive()
     }
 
     /// The service `recv` gives the jobs once it has a message: each job in order is polled

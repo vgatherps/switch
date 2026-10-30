@@ -4,10 +4,12 @@
 //! call those.
 //!
 //! The input's end: the peer's FIN while reading fails the connection (`PeerEof`, or the TLS
-//! truncation) and is the normal end after its close. A reset, seen by the input or by a send
-//! wait, is the socket's death; before the peer's close it is the connection's failure
-//! (`Failed(Dead)`), after it a clean end: reading had stopped there anyway, and what we still
-//! owed the peer (our echo, close_notify) is moot.
+//! truncation) and is the normal end after its close. A reset is the socket's death. A send
+//! wait that sees it only stops sending (the call that saw it fails with `Failed(Dead)`); the
+//! connection's outcome is decided once the input reports it, after the frames received before
+//! it are read: before the peer's close it is the connection's failure (`Failed(Dead)`), after
+//! it a clean end: reading had stopped there anyway, and what we still owed the peer (our
+//! echo, close_notify) is moot.
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
@@ -67,8 +69,9 @@ where
         self.rx_in
     }
 
-    /// The next message, or `None` once the close handshake is done and our FIN delivered;
-    /// after a failure, the first failure once the drain is done (or the socket died).
+    /// The next message, or `None` once the close handshake is done and our FIN delivered (or
+    /// the socket died after the peer's close); after a failure, the first failure once the
+    /// drain is done (or the socket died).
     /// With a message in hand, queued output gets one bounded pass (`TxCore::service`) and
     /// the message returns without waiting on it. Without one, input and the next send job
     /// are awaited together; whichever is ready first is handled, both if both are.
@@ -80,7 +83,14 @@ where
                 self.tx.service().await;
                 return Ok(self.rx.take_message());
             }
-            if matches!(self.tx.end(), End::Delivered | End::Dead) {
+            let over = match self.tx.end() {
+                End::Delivered => true,
+                // the outcome is known once the input ended, or a failure or the peer's close
+                // already decided it
+                End::Dead => self.rx_in == RxIn::Eof || self.tx.failed().is_some() || self.tx.peer_closed(),
+                End::Open | End::Notify | End::Fin => false,
+            };
+            if over {
                 return self.tx.result().map(|()| None);
             }
             parse = self.wait().await;
@@ -157,7 +167,7 @@ where
                     },
                     // receiving was over: the peer's close came first, or a failure did
                     (InputEnd::Fin, RxIn::Stopped | RxIn::Eof) => {}
-                    (InputEnd::Reset, _) => self.tx.die(),
+                    (InputEnd::Reset, _) => self.tx.reset(),
                 }
                 self.rx.discard();
                 self.rx_in = RxIn::Eof;
@@ -183,7 +193,7 @@ where
         // them (Close, then a reset) makes it a clean end. Each such pass takes input, so
         // this ends.
         if stepped == Some(Stepped::Dead) && !took {
-            self.tx.die();
+            self.tx.stop();
         }
         took
     }

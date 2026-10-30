@@ -289,8 +289,10 @@ fn recv_is_woken_by_delivery_alone() {
     assert_eq!(task.got(), [Ok(None)]);
 }
 
-/// A reset reported by the input alone, or by the send side alone (while it waits for room),
-/// wakes recv: `Failed(Dead)`, nothing more sent.
+/// A reset reported by the input alone wakes recv: `Failed(Dead)`, nothing more sent. Seen by
+/// the send side alone (while it waits for room), it wakes recv too, which stops sending and
+/// drops what was owed but keeps reading: the input decides the outcome once it reports the
+/// reset, after any frame received before it.
 #[test]
 fn recv_is_woken_by_a_reset_alone() {
     for on_input in [true, false] {
@@ -303,6 +305,11 @@ fn recv_is_woken_by_a_reset_alone() {
             end(&input, InputEnd::Reset);
         } else {
             set(&log, |l| l.dead = true);
+            assert_eq!(task.turn(), 1);
+            assert!(task.got().is_empty(), "decided before the input ended");
+            assert_eq!(log.borrow().live_frames(), 0);
+            task.assert_parked();
+            end(&input, InputEnd::Reset);
         }
         assert_eq!(task.turn(), 1, "on input {on_input}");
         assert_eq!(task.got(), [Err(TxError::Failed(Failure::Dead))], "on input {on_input}");
@@ -356,6 +363,28 @@ fn a_reset_after_the_peer_close_with_something_owed_is_a_clean_end() {
     for on_input in [true, false] {
         check::<false>(on_input);
         check::<true>(on_input);
+    }
+}
+
+/// The peer sends Close (1008, a reason) and resets before our next recv, and the app calls
+/// `send` or `close` first: that call finds the socket dead and fails with `Failed(Dead)`, but
+/// the connection's outcome waits for the input. recv still reads the Close queued before the
+/// reset, so it ends clean (`None`) with the peer's code and reason. (Before, the send side's
+/// death decided `Failed(Dead)` at once and the Close was never read.)
+#[test]
+fn close_then_reset_while_the_app_sends_or_closes_keeps_the_peer_close() {
+    for closing in [false, true] {
+        let (mut s, log, input) = raw();
+        let mut close = 1008u16.to_be_bytes().to_vec();
+        close.extend_from_slice(b"policy");
+        feed(&input, &client_frame(CLOSE, &close), false);
+        end(&input, InputEnd::Reset);
+        log.borrow_mut().dead = true;
+        let own = if closing { ready(s.close(1000, "")) } else { ready(s.send(Kind::Text, b"ping")) };
+        assert_eq!(own, Err(TxError::Failed(Failure::Dead)), "closing {closing}");
+        assert_eq!(recv_n(&mut s, 1), Some(Ok(None)), "closing {closing}");
+        assert_eq!(s.rx.peer_close(), Some(&close[..]), "closing {closing}");
+        assert_eq!((sent(&log).len(), input.borrow().live_frames()), (0, 0));
     }
 }
 
