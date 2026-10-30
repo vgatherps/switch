@@ -421,6 +421,7 @@ pub fn config(side: Side) -> StackConfig<'static> {
         ipv4: Ipv4Cidr::new(side.ip(), 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1 + side as u64,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 1,

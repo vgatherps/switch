@@ -93,6 +93,7 @@ fn with_stack_gateway(
         ipv4: Ipv4Cidr::new(Ipv4Address::new(a, b, c, d), 24),
         gateway,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 1,
@@ -295,6 +296,7 @@ fn add_udp(stack: &mut Stack, tx_checksum: bool) -> UdpHandle {
     stack
         .add_udp(UdpConfig {
             port: PORT,
+            local_addr: None,
             rx_queue: BURST,
             tx_checksum,
             broadcast: false,

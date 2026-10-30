@@ -39,6 +39,7 @@ fn stack(port: Port, max_sockets: usize, tx_pending: usize) -> Stack {
         ipv4: Ipv4Cidr::new(OUR_IP, 24),
         gateway: None,
         paths: &[],
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets,

@@ -7,6 +7,9 @@ use crate::phy::{ChecksumCapabilities, TxFrame, UniqueTxBuf};
 impl Interface {
     /// Check one UDP send of `len` payload bytes before any device work.
     /// Errors come in this order: `NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`.
+    /// `Unaddressable` includes our own addresses, the owned set too. The set is not searched for
+    /// the destination of the socket's header template: a template exists only for a destination
+    /// that passed here, and the set is fixed.
     ///
     /// Panics if the interface medium is not Ethernet or `handle` is stale.
     pub fn udp_target(
@@ -31,7 +34,9 @@ impl Interface {
         };
         if dst_addr.is_unspecified()
             || dst_addr.is_multicast()
-            || self.inner.has_ip_addr(dst_addr)
+            || self.inner.has_interface_addr(to.addr)
+            || (socket.template.as_ref().is_none_or(|template| template.dst() != dst_addr)
+                && self.inner.owns_ipv4(dst_addr))
             || to.port == 0
             || (self.inner.is_broadcast(&to.addr) && !socket.config().broadcast)
         {
@@ -229,6 +234,8 @@ fn udp_copy(udp: &UdpSet, len: usize, payload: &[u8]) -> Result<UniqueTxBuf, Udp
 impl InterfaceInner {
     /// One send's IPv4 header (`None` without a source address for `dst_addr`), UDP ports and
     /// checksum capabilities, the UDP checksum on only if the socket and device both ask for it.
+    /// The source is the socket's bound address, or for an all-IP socket the interface's
+    /// address for `dst_addr`.
     #[inline]
     fn udp_reprs(
         &self,
@@ -241,7 +248,11 @@ impl InterfaceInner {
             src_port: socket.config().port,
             dst_port: to.port,
         };
-        let ip_repr = self.get_source_address_ipv4(&dst_addr).map(|src_addr| Ipv4Repr {
+        let src_addr = match socket.config().local_addr {
+            Some(addr) => Some(addr),
+            None => self.get_source_address_ipv4(&dst_addr),
+        };
+        let ip_repr = src_addr.map(|src_addr| Ipv4Repr {
             src_addr,
             dst_addr,
             next_header: IpProtocol::Udp,
@@ -259,11 +270,14 @@ impl InterfaceInner {
         (ip_repr, udp_repr, checksum_caps)
     }
 
+    /// `dst_ours` is `process_ipv4`'s `has_ip_addr` answer for the destination, so an owned
+    /// address is searched once per datagram.
     pub(super) fn process_udp<'frame>(
         &mut self,
         udp: Option<&mut UdpSet>,
         meta: PacketMeta,
         ipv4_repr: Ipv4Repr,
+        dst_ours: bool,
         ip_payload: &'frame [u8],
         payload_offset: usize,
     ) -> Option<Packet<'frame>> {
@@ -278,12 +292,13 @@ impl InterfaceInner {
         {
             return None;
         }
-        if !self.is_broadcast_v4(ipv4_repr.dst_addr)
-            && (!self.has_ip_addr(ipv4_repr.dst_addr) || !ipv4_repr.dst_addr.x_is_unicast())
+        let broadcast = self.is_broadcast_v4(ipv4_repr.dst_addr);
+        if !broadcast
+            && (!dst_ours || !ipv4_repr.dst_addr.x_is_unicast())
         {
             return None;
         }
-        let slot = udp.lookup(packet.dst_port())?;
+        let slot = udp.lookup(ipv4_repr.dst_addr, packet.dst_port(), broadcast)?;
         let src = IpEndpoint::new(ipv4_repr.src_addr.into(), packet.src_port());
         let socket = udp.socket_at_mut(slot);
         if socket.peer().is_some_and(|peer| src != peer) {

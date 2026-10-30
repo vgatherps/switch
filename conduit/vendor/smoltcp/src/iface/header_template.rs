@@ -254,6 +254,15 @@ pub(crate) struct UdpTemplate {
 
 #[cfg(feature = "udp-set")]
 impl UdpTemplate {
+    /// The destination address the template was built for.
+    #[inline]
+    pub(crate) fn dst(&self) -> Ipv4Address {
+        self.prefix.dst
+    }
+}
+
+#[cfg(feature = "udp-set")]
+impl UdpTemplate {
     pub(crate) fn new(
         src_mac: EthernetAddress,
         dst_mac: EthernetAddress,

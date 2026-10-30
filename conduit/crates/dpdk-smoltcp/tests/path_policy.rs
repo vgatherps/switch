@@ -297,6 +297,7 @@ fn mixed_udp_destinations() {
         let mut net = Network::new(eal, ["mixua", "mixub", "mixuc"]);
         let udp_config = |port| UdpConfig {
             port, rx_queue: 8, tx_checksum: true, broadcast: false,
+            local_addr: None,
         };
         let handles = net.stacks.each_mut().map(|stack| stack.add_udp(udp_config(UDP_PORT)).unwrap());
         for to in [B, C] {

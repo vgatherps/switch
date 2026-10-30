@@ -55,6 +55,7 @@ fn fill_tx_ring(pair: &mut Pair) {
     let udp = pair.a
         .add_udp(UdpConfig {
             port: 5000,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: false,
             broadcast: false,

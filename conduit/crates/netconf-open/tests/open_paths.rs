@@ -33,6 +33,7 @@ fn open_passes_config_paths_to_stack() {
     }.unwrap();
     let handle = opened.stack.add_udp(UdpConfig {
         port: 12345,
+        local_addr: None,
         rx_queue: 1,
         tx_checksum: true,
         broadcast: false,

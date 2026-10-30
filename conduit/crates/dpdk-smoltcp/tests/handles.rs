@@ -493,6 +493,7 @@ const UDP_PORT: u16 = 1234;
 fn udp_config(rx_queue: usize) -> UdpConfig {
     UdpConfig {
         port: UDP_PORT,
+        local_addr: None,
         rx_queue,
         tx_checksum: true,
         broadcast: false,

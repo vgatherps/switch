@@ -1,7 +1,17 @@
-use crate::{Config, ConfigError, Device};
+use crate::{discover::Discovered, Config, ConfigError, Device};
 use std::{fs, io::Write, path::Path};
 
-pub(crate) fn merge(mut discovered: Config, previous: &Config) -> Result<Config, ConfigError> {
+/// Discovered facts replace the previous ones; what the source cannot discover is kept as
+/// configured: devargs, offloads, rx_timestamps, descriptors, eal, path rules other than `vpc`
+/// and `default`, and `owned_ipv4` unless the source enumerates the interface's addresses.
+pub(crate) fn merge(
+    mut discovered: Config,
+    enumerates_owned_ipv4: bool,
+    previous: &Config,
+) -> Result<Config, ConfigError> {
+    if !enumerates_owned_ipv4 {
+        discovered.owned_ipv4.clone_from(&previous.owned_ipv4);
+    }
     if let (Device::Pci(new), Device::Pci(old)) = (&mut discovered.device, &previous.device) {
         new.devargs.clone_from(&old.devargs);
     }
@@ -35,13 +45,17 @@ pub fn load_existing(path: &Path) -> Result<Option<Config>, ConfigError> {
 
 pub fn write(
     path: &Path,
-    discovered: Config,
+    discovered: &Discovered,
     previous: Option<&Config>,
     changes: &mut impl Write,
 ) -> Result<(), ConfigError> {
     let config = match previous {
-        Some(old) => merge(discovered, old)?,
-        None => discovered,
+        Some(old) => merge(
+            discovered.config.clone(),
+            discovered.enumerates_owned_ipv4,
+            old,
+        )?,
+        None => discovered.config.clone(),
     };
     let mut changed = Vec::new();
     if let Some(old) = previous {
@@ -53,6 +67,7 @@ pub fn write(
             "mac",
             "ipv4",
             "gateway",
+            "owned_ipv4",
             "mtu",
             "paths",
             "offloads",
@@ -77,8 +92,20 @@ pub fn write(
         .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
     file.write_all(config.to_json().as_bytes())
         .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
+    let report = |changes: &mut dyn Write, line: std::fmt::Arguments| {
+        writeln!(changes, "{line}").map_err(|e| ConfigError(e.to_string()))
+    };
     for key in changed {
-        writeln!(changes, "changed: {key}").map_err(|e| ConfigError(e.to_string()))?;
+        report(changes, format_args!("changed: {key}"))?;
+        if key == "owned_ipv4" {
+            let old = &previous.expect("a changed key has a previous config").owned_ipv4;
+            for cidr in old.iter().filter(|cidr| !config.owned_ipv4.contains(cidr)) {
+                report(changes, format_args!("owned_ipv4 removed: {cidr}"))?;
+            }
+            for cidr in config.owned_ipv4.iter().filter(|cidr| !old.contains(cidr)) {
+                report(changes, format_args!("owned_ipv4 added: {cidr}"))?;
+            }
+        }
     }
     Ok(())
 }

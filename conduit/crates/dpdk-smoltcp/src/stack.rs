@@ -2,7 +2,8 @@ use std::fmt;
 use std::io::Read;
 
 use smoltcp::iface::{
-    Config, DropQueue, Interface, NoRoute, PathMtu, PathMtus, PollIngressSingleResult, PollResult,
+    Config, DropQueue, Interface, NoRoute, OwnedIpv4, PathMtu, PathMtus, PollIngressSingleResult,
+    PollResult, ReadySide,
     SocketHandle, TcpSet, TcpStorage, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
@@ -44,6 +45,14 @@ pub struct StackConfig<'a> {
     /// Empty paths give every destination the Port IP MTU.
     /// TCP connects cap MSS at path MTU minus 40. Copied at `Stack::new`.
     pub paths: &'a [PathMtu],
+    /// Addresses the Stack owns besides `ipv4`'s address: single addresses
+    /// (/32) and prefixes, inside or outside the subnet. It answers ARP for
+    /// each and accepts IPv4 traffic to each; routing, the subnet broadcast
+    /// and the default source stay with `ipv4`. Duplicates and overlaps are
+    /// merged. Every address must be unicast, and none may be the gateway or
+    /// the subnet's broadcast address; a prefix must not have host bits set.
+    /// Copied at `Stack::new`.
+    pub owned_ipv4: &'a [Ipv4Cidr],
     /// Interface PRNG seed, including the TCP ISN secret. Production callers
     /// use [`os_random_seed`]; tests and library benchmarks may fix it.
     pub random_seed: u64,
@@ -126,6 +135,8 @@ pub enum AddUdpError {
     Full,
     PortInUse,
     InvalidConfig(&'static str),
+    /// `UdpConfig::local_addr` is not an address this Stack owns.
+    Unaddressable,
     RxPoolTooSmall { required: usize, pool: usize },
 }
 
@@ -136,6 +147,14 @@ pub enum UdpSendFrameError {
     /// The frame is not from this Stack's frame pool.
     Foreign,
 }
+
+/// A TCP socket's readiness key from [`Stack::tcp_ready_key`], checked once against its handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpReadyKey(SocketHandle);
+
+/// A UDP socket's readiness key from [`Stack::udp_ready_key`], checked once against its handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpReadyKey(smoltcp::iface::UdpHandle);
 
 /// Outcome of one `Stack::turn` or `Stack::receive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +273,10 @@ impl Stack {
             Ok(paths) => paths,
             Err(reason) => return Err((port, StackError::InvalidConfig(reason))),
         };
+        let owned = match OwnedIpv4::new(config.owned_ipv4, config.ipv4, config.gateway) {
+            Ok(owned) => owned,
+            Err(reason) => return Err((port, StackError::InvalidConfig(reason))),
+        };
         let count = port.tx_pool_count();
         let required = tx_reserve(port.descriptor_counts().1, config.tx_pending);
         if count < required {
@@ -280,6 +303,7 @@ impl Stack {
         let mut iface_config = Config::new(config.ethernet.into());
         iface_config.random_seed = config.random_seed;
         iface_config.neighbor_capacity = config.neighbor_capacity;
+        iface_config.owned_ipv4 = owned;
         let mut iface = Interface::new(iface_config, &mut device, now);
         iface.update_ip_addrs(|addrs| {
             // The address list starts empty and holds at least one entry.
@@ -609,9 +633,12 @@ impl Stack {
             .expect("RX pool requirement exceeds usize")
     }
 
-    /// Bind one local UDP port exclusively. The RX pool must back `rx_queue`
-    /// datagrams beside the RX reserve and every TCP and UDP socket's budget.
-    /// Held TCP frames and UDP datagrams from removed sockets count until dropped.
+    /// Bind a local UDP port on one owned address (`local_addr`) or on all of them (`None`);
+    /// each (address or all-IP, port) at most once. A datagram goes to the socket bound to its
+    /// destination, else to the port's all-IP socket; broadcasts only to the all-IP one. The
+    /// RX pool must back `rx_queue` datagrams beside the RX reserve and every TCP and UDP
+    /// socket's budget. Held TCP frames and UDP datagrams from removed sockets count until
+    /// dropped. A refused socket changes nothing.
     pub fn add_udp(&mut self, config: UdpConfig) -> Result<UdpHandle, AddUdpError> {
         self.tidy();
         let required = self.required_rx_pool(config.rx_queue);
@@ -621,10 +648,11 @@ impl Stack {
                 pool: self.rx_pool_count,
             });
         }
-        let handle = self.udp.add(config).map_err(|error| match error {
+        let handle = self.udp.add(&self.iface, config).map_err(|error| match error {
             UdpAddError::Full => AddUdpError::Full,
             UdpAddError::PortInUse => AddUdpError::PortInUse,
             UdpAddError::InvalidConfig(reason) => AddUdpError::InvalidConfig(reason),
+            UdpAddError::Unaddressable => AddUdpError::Unaddressable,
         })?;
         self.rx_budget_held = self
             .rx_budget_held
@@ -734,7 +762,9 @@ impl Stack {
     /// Change a socket and schedule a readiness check before the next
     /// `poll_at` call or egress pass. No public API hands out an owned socket, so
     /// this reference cannot be overwritten with a new one; swapping it with a
-    /// socket held by another `TcpSet` or Stack is unsupported.
+    /// socket held by another `TcpSet` or Stack is unsupported. The Stack's address
+    /// guarantees assume its own interface: passing another `Interface`'s `context()`
+    /// to a raw socket method such as `connect` is unsupported.
     pub fn tcp_mut(&mut self, handle: &TcpHandle) -> &mut tcp::Socket<'static> {
         let raw = self.tcp_raw(handle);
         self.sockets.get_mut(raw)
@@ -783,13 +813,23 @@ impl Stack {
         Ok(())
     }
 
-    /// `tcp::Socket::listen`. A failed listen leaves the socket unchanged.
+    /// `tcp::Socket::listen`, refusing an explicit local address that is
+    /// neither `StackConfig::ipv4`'s address nor in `StackConfig::owned_ipv4`
+    /// (`Unaddressable`). A failed listen leaves the socket unchanged.
+    ///
+    /// `tcp_mut(handle).listen(..)` does not check the address; such a
+    /// listener never receives a SYN, because a segment to an address we do
+    /// not own is dropped before any listener is consulted.
     pub fn listen<T: Into<IpListenEndpoint>>(
         &mut self,
         handle: &TcpHandle,
         local: T,
     ) -> Result<(), tcp::ListenError> {
         let raw = self.tcp_raw(handle);
+        let local = local.into();
+        if local.addr.is_some_and(|addr| !self.iface.has_ip_addr(addr)) {
+            return Err(tcp::ListenError::Unaddressable);
+        }
         let socket = self.sockets.get_mut(raw);
         socket.listen(local)?;
         Ok(())
@@ -819,6 +859,64 @@ impl Stack {
             .tx_frames_held
             .checked_sub(tx_frames)
             .expect("removed socket's TX frame limit was held");
+    }
+
+    /// The socket's readiness key, checked against `handle` as `tcp` does: it belongs to this
+    /// Stack and names a live socket. Arming then runs on every park without repeating that
+    /// check. The key is valid for this Stack until the socket is removed; take it once per
+    /// socket and keep it beside the handle.
+    pub fn tcp_ready_key(&self, handle: &TcpHandle) -> TcpReadyKey {
+        let raw = self.tcp_raw(handle);
+        self.sockets.get(raw);
+        TcpReadyKey(raw)
+    }
+
+    /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
+    /// that can make the socket readable, writable or change its state fires it: a received
+    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), a receive wake
+    /// from a dropped frame, or a state change in egress (close timers, TIME-WAIT end). A fired
+    /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
+    /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
+    /// processes a dropped handle; `disarm_tcp` stops a token at once.
+    ///
+    /// Only debug builds check that `key` still names a live socket; a key used after its
+    /// socket was removed, or on another Stack, misdirects the token to whatever socket holds
+    /// that slot, where it fires spuriously, and panics if the slot does not exist.
+    pub fn arm_tcp(&mut self, key: TcpReadyKey, side: ReadySide, token: u32) {
+        self.sockets.arm(key.0, side, token);
+    }
+
+    /// Disarm `side` of the socket. `true` when a token was armed; `false` when none was, or
+    /// it fired and `pop_fired` has not returned it yet. Key checks as in [`Self::arm_tcp`].
+    pub fn disarm_tcp(&mut self, key: TcpReadyKey, side: ReadySide) -> bool {
+        self.sockets.disarm(key.0, side)
+    }
+
+    /// [`Self::tcp_ready_key`] for a UDP socket.
+    pub fn udp_ready_key(&self, handle: &UdpHandle) -> UdpReadyKey {
+        let raw = self.udp_raw(handle);
+        self.udp.get(raw);
+        UdpReadyKey(raw)
+    }
+
+    /// Arm `token` for the UDP socket's receive queue, replacing a token armed there; the next
+    /// queued datagram fires it as in [`Self::arm_tcp`]. `remove_udp`, or the Stack processing
+    /// a dropped handle, disarms it. Key checks as in [`Self::arm_tcp`].
+    pub fn arm_udp(&mut self, key: UdpReadyKey, token: u32) {
+        self.udp.arm_rx(key.0, token);
+    }
+
+    /// [`Self::disarm_tcp`] for the UDP socket's receive queue.
+    pub fn disarm_udp(&mut self, key: UdpReadyKey) -> bool {
+        self.udp.disarm_rx(key.0)
+    }
+
+    /// One fired token, in no particular order; `None` once every fired token was returned.
+    /// The lists are sized at `new` for every token armed once: re-arming a token before it
+    /// was returned can grow them.
+    #[inline]
+    pub fn pop_fired(&mut self) -> Option<u32> {
+        self.sockets.pop_fired().or_else(|| self.udp.pop_fired())
     }
 
     fn tcp_raw(&self, handle: &TcpHandle) -> SocketHandle {

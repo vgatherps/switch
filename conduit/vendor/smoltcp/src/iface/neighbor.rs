@@ -190,6 +190,7 @@ impl Cache {
         removed
     }
 
+    #[inline(always)]
     pub fn reset_expiry_if_existing(
         &mut self,
         protocol_addr: IpAddress,

@@ -78,7 +78,9 @@ zhida-netconf check dut.json                                      # prints the c
 from the kernel (and with `--aws` the ENI facts from IMDSv2), writes the file and prints
 `wrote dut.json`; warnings start `zhida-netconf: warning:`. With several IPv4 addresses on the
 interface it asks for `--ipv4 ADDR`. Running it over an existing file keeps hand-added path rules and
-prints `changed: <key>` for each changed field. Off EC2, if the interface has no default route in the main
+prints `changed: <key>` for each changed field. `--aws` replaces `owned_ipv4` with the IMDS list and
+prints `owned_ipv4 removed: <cidr>` / `owned_ipv4 added: <cidr>` for each entry dropped or added,
+hand-added ones included. Off EC2, if the interface has no default route in the main
 table, set `gateway` by hand (or null for on-link peers only). `--aws` inside docker needs
 `--network host` (IMDS answers only one hop by default). Edit `offloads`, `rx_timestamps`, `descriptors`,
 `eal` and ENA's `devargs` (e.g. `llq_policy=1`) as needed; `check` must exit 0.

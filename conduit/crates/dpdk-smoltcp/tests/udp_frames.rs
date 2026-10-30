@@ -38,6 +38,7 @@ fn config(max_udp_sockets: usize) -> StackConfig<'static> {
         ipv4: Ipv4Cidr::new(IP, 24),
         gateway: None,
         paths: &PATHS,
+        owned_ipv4: &[],
         random_seed: 1,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
         max_sockets: 1,
@@ -57,6 +58,7 @@ fn add_udp(stack: &mut Stack, port: u16) -> UdpHandle {
     stack
         .add_udp(UdpConfig {
             port,
+            local_addr: None,
             rx_queue: 1,
             tx_checksum: true,
             broadcast: false,

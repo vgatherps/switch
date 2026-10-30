@@ -5,20 +5,22 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::socket_meta::Meta;
+use super::interface::InterfaceInner;
 use crate::socket::tcp;
 
-use super::flow_table::FlowTable;
+use super::flow_table::{BindKey, FlowTable};
 use super::timer_wheel::{
     InsertOutcome, IntrusiveLinks, Linked, ListHead, Timed, TimerWheel, WheelEntry, WheelPosition,
 };
 use crate::socket::PollAt;
 use crate::time::Instant;
-use crate::wire::IpEndpoint;
+use crate::wire::{IpAddress, IpEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FlowKey {
     None,
-    Listener(u16),
+    /// A listener's (local address or all-IP, port).
+    Listener(BindKey),
     Exact {
         local: IpEndpoint,
         remote: IpEndpoint,
@@ -31,7 +33,11 @@ pub(crate) fn flow_key(socket: &tcp::Socket) -> FlowKey {
         tcp::State::Listen => {
             debug_assert!(socket.local_endpoint().is_none());
             debug_assert!(socket.remote_endpoint().is_none());
-            return FlowKey::Listener(socket.listen_endpoint().port);
+            let endpoint = socket.listen_endpoint();
+            let addr = endpoint.addr.map(|addr| match addr {
+                IpAddress::Ipv4(addr) => addr,
+            });
+            return FlowKey::Listener((addr, endpoint.port));
         }
         tcp::State::SynSent => "TCP SynSent requires local and remote endpoints",
         tcp::State::SynReceived => "TCP SynReceived requires local and remote endpoints",
@@ -63,6 +69,8 @@ struct FlowSlot {
     due: bool,
     orphaned: bool,
     reap_queued: bool,
+    /// `TcpStorage::tokens` holds an armed token: the one check `mark_dirty` makes.
+    armed: bool,
 }
 
 impl FlowSlot {
@@ -78,6 +86,7 @@ impl FlowSlot {
         due: false,
         orphaned: false,
         reap_queued: false,
+        armed: false,
     };
 }
 
@@ -131,15 +140,26 @@ pub struct TcpStorage<'a> {
     inner: Option<Item<'a>>,
     admitted_rx_budget: usize,
     admitted_tx_budget: usize,
+    /// Readiness tokens armed for the receive and send halves ([`ReadySide`]). In the last
+    /// line's padding, so the slot keeps its size and line map.
+    tokens: [Option<u32>; 2],
 }
 
 impl<'a> TcpStorage<'a> {
     pub const EMPTY: Self = Self {
         inner: None,
         generation: 0,
+        tokens: [None; 2],
         admitted_rx_budget: 0,
         admitted_tx_budget: 0,
     };
+}
+
+/// The half of a TCP socket a readiness token watches; an index into its two tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadySide {
+    Rx = 0,
+    Tx = 1,
 }
 
 /// An item of a socket set.
@@ -179,6 +199,13 @@ impl fmt::Display for SocketHandle {
 /// port for Listen, and the 4-tuple otherwise. The flow index is resynced on state
 /// changes. App changes go through `get_mut` or `iter_mut`, which mark slots dirty.
 ///
+/// Readiness tokens: [`arm`](Self::arm) stores a caller's `u32` for one half of a socket.
+/// Every change that marks the socket dirty (ingress, `get_mut`, a receive wake, timer and
+/// neighbor rescans) and every state change in egress fires each armed token of the socket:
+/// it moves to a list that [`pop_fired`](Self::pop_fired) drains, and is disarmed. A token
+/// fires at most once per arm; the list holds two per slot without growing while no token is
+/// re-armed before it was popped.
+///
 /// If a socket method unwinds out of `Interface::poll`, the set must not be polled again.
 #[derive(Debug)]
 pub struct TcpSet<'a> {
@@ -191,7 +218,8 @@ pub struct TcpSet<'a> {
     occupied: Vec<u64>,
     flow_slots: Vec<FlowSlot>,
     exact: FlowTable<(IpEndpoint, IpEndpoint)>,
-    listeners: FlowTable<u16>,
+    /// Listener chains by (local address or all-IP, port), each ascending by slot.
+    listeners: FlowTable<BindKey>,
     flow_epoch: u64,
     last_exact: Option<(usize, u64)>,
     pub(crate) dirty_list: Vec<usize>,
@@ -203,6 +231,7 @@ pub struct TcpSet<'a> {
     pub(crate) neighbor_changes: u64,
     ready: VecDeque<usize>,
     reapable: Vec<SocketHandle>,
+    fired: Vec<u32>,
     #[cfg(test)]
     pub(crate) dispatches: Vec<usize>,
     #[cfg(test)]
@@ -249,6 +278,7 @@ impl<'a> TcpSet<'a> {
             neighbor_changes: 0,
             ready: VecDeque::with_capacity(slot_count),
             reapable: Vec::with_capacity(slot_count),
+            fired: Vec::with_capacity(2 * slot_count),
             #[cfg(test)]
             dispatches: Vec::new(),
             #[cfg(test)]
@@ -256,8 +286,8 @@ impl<'a> TcpSet<'a> {
             #[cfg(test)]
             slot_visits: 0,
         };
+        // Occupied slots register their flows at the driving interface's first sync.
         for index in 0..slot_count {
-            set.sync_identity(index);
             if set.sockets[index].inner.is_some() {
                 set.mark_dirty(index);
             }
@@ -340,13 +370,15 @@ impl<'a> TcpSet<'a> {
                         self.dirty_list
                             .reserve_exact(sockets.len() - self.dirty_list.len());
                     }
+                    if self.fired.capacity() < 2 * sockets.len() {
+                        self.fired.reserve_exact(2 * sockets.len() - self.fired.len());
+                    }
                     index
                 }
             },
         };
         self.set_occupied(index, true);
         let handle = put(index, &mut self.sockets[index], socket);
-        self.sync_identity(index);
         self.mark_dirty(index);
         handle
     }
@@ -401,6 +433,65 @@ impl<'a> TcpSet<'a> {
         &mut self.item_mut(handle).socket
     }
 
+    /// Arm `token` for `side` of the socket, replacing a token armed there. Removing the
+    /// socket or orphaning it (its handle dropped) disarms both halves.
+    ///
+    /// Arming runs on every park: the caller checks `handle` once (as `get` does) and keeps it
+    /// while the socket lives; only debug builds check it here. A stale handle misdirects the
+    /// token to whatever socket the slot holds or holds next, where it fires spuriously.
+    ///
+    /// # Panics
+    /// If the handle's slot index is out of range; in debug builds, as `get`.
+    pub fn arm(&mut self, handle: SocketHandle, side: ReadySide, token: u32) {
+        self.debug_assert_live(handle);
+        self.sockets[handle.index].tokens[side as usize] = Some(token);
+        self.flow_slots[handle.index].armed = true;
+    }
+
+    /// Disarm `side` of the socket. Returns whether a token was armed there; `false` when none
+    /// was, or it fired and waits in the fired list until popped. Handle checks as in `arm`.
+    pub fn disarm(&mut self, handle: SocketHandle, side: ReadySide) -> bool {
+        self.debug_assert_live(handle);
+        let tokens = &mut self.sockets[handle.index].tokens;
+        let armed = tokens[side as usize].take().is_some();
+        self.flow_slots[handle.index].armed = tokens.iter().any(Option::is_some);
+        armed
+    }
+
+    fn debug_assert_live(&self, handle: SocketHandle) {
+        debug_assert!(
+            self.sockets.get(handle.index).is_some_and(|slot| {
+                slot.inner.is_some() && slot.generation == handle.generation
+            }),
+            "handle does not refer to a valid socket"
+        );
+    }
+
+    /// One fired token, in no particular order; `None` once the list is empty.
+    #[inline]
+    pub fn pop_fired(&mut self) -> Option<u32> {
+        self.fired.pop()
+    }
+
+    /// Move every token armed on slot `index` to the fired list.
+    #[inline]
+    pub(crate) fn fire(&mut self, index: usize) {
+        if self.flow_slots[index].armed {
+            self.fire_armed(index);
+        }
+    }
+
+    /// Out of line, so `mark_dirty` stays small enough to inline.
+    #[inline(never)]
+    fn fire_armed(&mut self, index: usize) {
+        self.flow_slots[index].armed = false;
+        for token in &mut self.sockets[index].tokens {
+            if let Some(token) = token.take() {
+                self.fired.push(token);
+            }
+        }
+    }
+
     /// Complete a queued receive wake and schedule the socket's readiness check.
     pub fn rx_woken(&mut self, handle: SocketHandle) {
         let socket = &mut self.sockets.get_mut(handle.index)
@@ -413,6 +504,9 @@ impl<'a> TcpSet<'a> {
 
     /// Close the socket after its application handle is dropped, keeping it in the set.
     pub fn orphan(&mut self, handle: SocketHandle, now: Instant) {
+        self.item(handle);
+        self.sockets[handle.index].tokens = [None; 2];
+        self.flow_slots[handle.index].armed = false;
         self.get_mut(handle).orphan(now);
         self.flow_slots[handle.index].orphaned = true;
         self.check_reapable(handle.index);
@@ -466,6 +560,8 @@ impl<'a> TcpSet<'a> {
             .generation
             .checked_add(1)
             .expect("socket slot generation overflow");
+        slot.tokens = [None; 2];
+        self.flow_slots[handle.index].armed = false;
         if self.flow_slots[handle.index].reap_queued {
             self.reapable.retain(|&queued| queued != handle);
         }
@@ -586,7 +682,7 @@ impl TcpSet<'_> {
     fn flow_head(&self, key: FlowKey) -> Option<usize> {
         match key {
             FlowKey::None => None,
-            FlowKey::Listener(port) => self.listeners.get(&port),
+            FlowKey::Listener(bind) => self.listeners.get(&bind),
             FlowKey::Exact { local, remote } => self.exact.get(&(local, remote)),
         }
     }
@@ -595,11 +691,11 @@ impl TcpSet<'_> {
         self.flow_epoch = self.flow_epoch.wrapping_add(1);
         match key {
             FlowKey::None => unreachable!(),
-            FlowKey::Listener(port) => {
+            FlowKey::Listener(bind) => {
                 if head == usize::MAX {
-                    self.listeners.remove(&port);
+                    self.listeners.remove(&bind);
                 } else {
-                    self.listeners.set(port, head);
+                    self.listeners.set(bind, head);
                 }
             }
             FlowKey::Exact { local, remote } => {
@@ -643,14 +739,59 @@ impl TcpSet<'_> {
         self.flow_slots[index].next = usize::MAX;
     }
 
-    pub(crate) fn sync_identity(&mut self, index: usize) {
-        let key = self.sockets[index]
-            .inner
-            .as_ref()
-            .map_or(FlowKey::None, |item| flow_key(&item.socket));
+    /// Registers the slot's flow key after an application change, with `cx` the interface
+    /// driving the set. A new exact tuple whose local address `cx` neither has nor owns resets
+    /// the socket, fires its tokens (its readiness changed) and registers nothing, so demux and
+    /// egress only ever see tuples on our addresses.
+    pub(crate) fn sync_identity(&mut self, cx: &InterfaceInner, index: usize) {
+        let mut key = self.slot_flow_key(index);
         if key == self.flow_slots[index].registered {
             return;
         }
+        if let FlowKey::Exact { .. } = key
+            && !self.admit_exact(cx, index)
+        {
+            key = FlowKey::None;
+        }
+        self.register_identity(index, key);
+    }
+
+    /// `admit_local` for a new exact tuple, firing the socket's tokens when it is refused. Out of
+    /// line: it runs once per connection, and inlined it slows `sync_identity`'s unchanged-key
+    /// return, which runs for every dirty socket.
+    #[cold]
+    #[inline(never)]
+    fn admit_exact(&mut self, cx: &InterfaceInner, index: usize) -> bool {
+        let item = self.sockets[index]
+            .inner
+            .as_mut()
+            .expect("exact flow key without a socket");
+        if item.socket.admit_local(cx) {
+            return true;
+        }
+        self.fire(index);
+        false
+    }
+
+    /// Registers the slot's flow key after the driving interface changed the socket's state
+    /// itself: a segment it accepted for one of its addresses, or its egress. Such a change
+    /// sets no tuple on another address, so nothing is checked.
+    pub(crate) fn resync_identity(&mut self, index: usize) {
+        let key = self.slot_flow_key(index);
+        if key == self.flow_slots[index].registered {
+            return;
+        }
+        self.register_identity(index, key);
+    }
+
+    fn slot_flow_key(&self, index: usize) -> FlowKey {
+        self.sockets[index]
+            .inner
+            .as_ref()
+            .map_or(FlowKey::None, |item| flow_key(&item.socket))
+    }
+
+    fn register_identity(&mut self, index: usize, key: FlowKey) {
         self.set_deadline(index, PollAt::Ingress, false);
         if let Some(item) = &mut self.sockets[index].inner {
             item.meta = Meta::default();
@@ -705,8 +846,16 @@ impl TcpSet<'_> {
         }
     }
 
+    /// Also fires the slot's tokens; the armed check shares the dirty check's slot load.
+    /// Always inlined: the out-of-line `fire_armed` call otherwise moves it out of `get_mut`.
+    #[inline(always)]
     pub(crate) fn mark_dirty(&mut self, index: usize) {
-        if !self.flow_slots[index].dirty {
+        let slot = &self.flow_slots[index];
+        let (armed, dirty) = (slot.armed, slot.dirty);
+        if armed {
+            self.fire_armed(index);
+        }
+        if !dirty {
             self.remove_deadline(index);
             self.flow_slots[index].dirty = true;
             self.dirty_list.push(index);
@@ -739,13 +888,13 @@ impl TcpSet<'_> {
         self.identity_synced = 0;
     }
 
-    pub(crate) fn sync_dirty_identities(&mut self) {
+    pub(crate) fn sync_dirty_identities(&mut self, cx: &InterfaceInner) {
         for position in self.identity_synced..self.dirty_list.len() {
             #[cfg(test)]
             {
                 self.slot_visits += 1;
             }
-            self.sync_identity(self.dirty_list[position]);
+            self.sync_identity(cx, self.dirty_list[position]);
         }
         self.identity_synced = self.dirty_list.len();
     }
@@ -998,6 +1147,23 @@ impl TcpSet<'_> {
         src: IpEndpoint,
         syn_like: bool,
     ) -> Option<usize> {
+        let exact = self.tcp_exact_lookup(dst, src, syn_like);
+        if exact.is_none() && syn_like {
+            self.tcp_listener_lookup(dst)
+        } else {
+            exact
+        }
+    }
+
+    /// The exact (4-tuple) flow for a segment from `src` to `dst`, without the listener
+    /// fallback. A non-SYN segment's hit is cached for the next lookup.
+    #[inline]
+    pub(crate) fn tcp_exact_lookup(
+        &mut self,
+        dst: IpEndpoint,
+        src: IpEndpoint,
+        syn_like: bool,
+    ) -> Option<usize> {
         if !syn_like
             && let Some((index, epoch)) = self.last_exact
             && epoch == self.flow_epoch
@@ -1013,34 +1179,17 @@ impl TcpSet<'_> {
         if !syn_like && let Some(index) = e {
             self.last_exact = Some((index, self.flow_epoch));
         }
-        if e.is_some() {
-            return e;
-        }
-        if syn_like {
-            self.tcp_listener_lookup(dst)
-        } else {
-            None
-        }
+        e
     }
 
+    /// The listener a SYN to `dst` goes to: the lowest slot listening on `dst`'s address and
+    /// port, else the lowest slot listening on the port on every address (Linux's rule: an exact
+    /// bind beats all-IP, whatever the creation order).
     pub(crate) fn tcp_listener_lookup(&self, dst: IpEndpoint) -> Option<usize> {
-        let mut index = self.listeners.get(&dst.port).unwrap_or(usize::MAX);
-        while index != usize::MAX {
-            let socket = &self.sockets[index]
-                .inner
-                .as_ref()
-                .expect("TCP listener chain contains an empty slot")
-                .socket;
-            if socket
-                .listen_endpoint()
-                .addr
-                .is_none_or(|addr| addr == dst.addr)
-            {
-                return Some(index);
-            }
-            index = self.flow_slots[index].next;
-        }
-        None
+        let IpAddress::Ipv4(addr) = dst.addr;
+        self.listeners
+            .get(&(Some(addr), dst.port))
+            .or_else(|| self.listeners.get(&(None, dst.port)))
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1050,7 +1199,7 @@ impl TcpSet<'_> {
         let entries = self
             .listeners
             .entries()
-            .map(|(port, head)| (FlowKey::Listener(port), head))
+            .map(|(bind, head)| (FlowKey::Listener(bind), head))
             .chain(
                 self.exact
                     .entries()
@@ -1438,6 +1587,108 @@ mod tests {
         assert_reapable(&mut b_set, &[]);
     }
 
+    #[cfg(feature = "medium-ip")]
+    #[test]
+    fn readiness_tokens_fire_on_ingress_app_changes_and_egress_state_changes() {
+        use crate::phy::Medium;
+        use crate::wire::{IpAddress, IpCidr};
+        use ReadySide::{Rx, Tx};
+
+        fn fired(set: &mut TcpSet) -> alloc::vec::Vec<u32> {
+            let mut fired: alloc::vec::Vec<u32> = core::iter::from_fn(|| set.pop_fired()).collect();
+            fired.sort_unstable();
+            fired
+        }
+
+        let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
+        let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+        let remote = IpAddress::v4(192, 168, 1, 2);
+        b.update_ip_addrs(|addrs| {
+            addrs.clear();
+            addrs.push(IpCidr::new(remote, 24)).unwrap();
+        });
+        let buffered = || tcp::Socket::test_socket(64, 64);
+        macro_rules! exchange {
+            () => {
+                for _ in 0..8 {
+                    a.poll(Instant::ZERO, &mut a_device, &mut a_set);
+                    b_device.rx_queue.append(&mut a_device.tx_queue);
+                    b.poll(Instant::ZERO, &mut b_device, &mut b_set);
+                    a_device.rx_queue.append(&mut b_device.tx_queue);
+                }
+            };
+        }
+        let ah = a_set.add(buffered());
+        let bh = b_set.add(buffered());
+        b_set.get_mut(bh).listen(80).unwrap();
+        a_set.get_mut(ah).connect(a.context(), (remote, 80), 1234).unwrap();
+        exchange!();
+        assert_eq!(a_set.get(ah).state(), tcp::State::Established);
+        assert_eq!(a.poll_at(Instant::ZERO, &mut a_set), None);
+        assert_eq!(fired(&mut a_set), [], "nothing was armed");
+
+        // An idle poll and a read-only access fire nothing.
+        a_set.arm(ah, Rx, 10);
+        a_set.arm(ah, Tx, 11);
+        a.poll(Instant::ZERO, &mut a_device, &mut a_set);
+        a_set.get(ah);
+        assert_eq!(fired(&mut a_set), []);
+
+        // A received segment fires both halves, once.
+        b_set.get_mut(bh).send_slice(b"data").unwrap();
+        b.poll(Instant::ZERO, &mut b_device, &mut b_set);
+        a_device.rx_queue.append(&mut b_device.tx_queue);
+        a.poll(Instant::ZERO, &mut a_device, &mut a_set);
+        assert!(a_set.get(ah).can_recv());
+        assert_eq!(fired(&mut a_set), [10, 11]);
+        a_set.get_mut(ah);
+        assert_eq!(fired(&mut a_set), [], "a fired token is disarmed");
+
+        // App changes and receive wakes fire; a re-arm replaces the token.
+        a_set.arm(ah, Rx, 12);
+        a_set.arm(ah, Rx, 13);
+        a_set.get_mut(ah);
+        assert_eq!(fired(&mut a_set), [13]);
+        a_set.arm(ah, Tx, 14);
+        a_set.rx_woken(ah);
+        assert_eq!(fired(&mut a_set), [14]);
+
+        // disarm reports whether the token was still armed.
+        a_set.arm(ah, Rx, 15);
+        assert!(a_set.disarm(ah, Rx));
+        assert!(!a_set.disarm(ah, Rx));
+        a_set.arm(ah, Rx, 16);
+        a_set.get_mut(ah);
+        assert!(!a_set.disarm(ah, Rx), "fired, not yet popped");
+        assert_eq!(fired(&mut a_set), [16]);
+
+        // TIME-WAIT ends on a timer in egress: no segment, no app call.
+        a_set.get_mut(ah).close();
+        exchange!();
+        b_set.get_mut(bh).close();
+        exchange!();
+        assert_eq!(a_set.get(ah).state(), tcp::State::TimeWait);
+        assert_eq!(fired(&mut a_set), []);
+        a_set.arm(ah, Rx, 17);
+        a_set.arm(ah, Tx, 18);
+        a.poll_egress(Instant::from_secs(10), &mut a_device, &mut a_set);
+        assert_eq!(a_set.get(ah).state(), tcp::State::Closed);
+        assert_eq!(fired(&mut a_set), [17, 18]);
+
+        // Orphaning (handle dropped) and removing disarm; the next socket in a slot starts
+        // unarmed.
+        a_set.arm(ah, Rx, 19);
+        a_set.orphan(ah, Instant::from_secs(10));
+        assert_eq!(fired(&mut a_set), []);
+        let ch = a_set.add(buffered());
+        a_set.arm(ch, Tx, 20);
+        a_set.remove(ch);
+        let dh = a_set.add(buffered());
+        assert_eq!(dh.index, ch.index);
+        a_set.get_mut(dh);
+        assert_eq!(fired(&mut a_set), []);
+    }
+
     #[test]
     fn tcp_storage_line_map() {
         use core::mem::{align_of, offset_of, size_of};
@@ -1446,6 +1697,7 @@ mod tests {
             generation: 0,
             admitted_rx_budget: 0,
             admitted_tx_budget: 0,
+            tokens: [None; 2],
             inner: Some(Item {
                 meta: Meta::default(),
                 socket: socket(),
@@ -1495,6 +1747,8 @@ mod tests {
         assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
         assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
         assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
+        // In the last line's padding (576..639).
+        assert_eq!(offset_of!(TcpStorage<'static>, tokens), 592);
         assert_eq!(item_offset, 8);
         assert_eq!(offset_of!(Item<'static>, meta), 0);
         assert_eq!(offset_of!(Item<'static>, socket), 112);
@@ -1510,6 +1764,7 @@ mod tests {
             ("rx_fin_received", 3),
             ("in_rto_loss_episode", 4),
             ("remote_has_sack", 5),
+            ("local_owned", 6),
             ("timer", 8),
             ("ack_at", 24),
             ("local_seq_no", 32),
@@ -1552,6 +1807,8 @@ mod tests {
             ("rx_fin_received", 1),
             ("in_rto_loss_episode", 1),
             ("remote_has_sack", 1),
+            // Read once per egress dispatch with hop_limit and Meta's next hop, same line.
+            ("local_owned", 1),
             ("timer", 2),
             ("ack_at", 2),
             ("local_seq_no", 2),
@@ -2064,6 +2321,7 @@ mod tests {
             assert_eq!(set.tcp_lookup(local, remote, true), Some(first.index));
             assert_eq!(set.tcp_lookup(local, remote, false), None);
             let second = set.add(listener(local.port));
+            iface.classify_dirty(&mut set, Instant::ZERO);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, true), Some(first.index));
             assert_eq!(set.tcp_lookup(local, remote, false), None);
@@ -2104,6 +2362,7 @@ mod tests {
             assert_eq!(set.tcp_lookup(local, remote, false), Some(1));
             let reused = set.add(connected(local, remote));
             assert_eq!(reused.index, 0);
+            iface.classify_dirty(&mut set, Instant::ZERO);
             set.remove(handles[1]);
             set.check_flow_index();
             assert_eq!(set.flow_slots[0].next, 2);
@@ -2125,6 +2384,7 @@ mod tests {
             };
             let mut set = TcpSet::new(vec![]);
             let handle = set.add(connected(local, remote));
+            iface.classify_dirty(&mut set, Instant::ZERO);
             *set.get_mut(handle) = connected(other_local, remote);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, false), Some(handle.index));
@@ -2147,6 +2407,7 @@ mod tests {
                 let port = local.port + index as u16;
                 let handle = set.add(listener(port));
                 assert_eq!(handle.index, index);
+                iface.classify_dirty(&mut set, Instant::ZERO);
                 set.check_flow_index();
                 assert_eq!(set.tcp_lookup(local, remote, false), Some(first.index));
                 for expected in 1..=index {
@@ -2182,6 +2443,7 @@ mod tests {
 
         #[test]
         fn flow_index_filters_bound_listeners_and_keeps_lowest_match() {
+            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
             let (local, remote) = endpoints();
             for exact_first in [false, true] {
                 let mut set = TcpSet::new(vec![]);
@@ -2199,6 +2461,7 @@ mod tests {
                         set.add(connected(local, remote)),
                     )
                 };
+                iface.classify_dirty(&mut set, Instant::ZERO);
                 set.check_flow_index();
                 let exact = if exact_first { first } else { second };
                 assert_eq!(set.tcp_lookup(local, remote, true), Some(exact.index));
@@ -2246,12 +2509,16 @@ mod tests {
         }
 
         #[test]
-        fn flow_index_constructor_registers_occupied_storage() {
+        fn flow_index_constructor_registers_occupied_storage_at_first_sync() {
+            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
             let (local, remote) = endpoints();
             let mut set = TcpSet::new(vec![]);
             set.add(listener(local.port));
             set.add(connected(local, remote));
             let mut set = TcpSet::new(set.sockets);
+            set.check_flow_index();
+            assert_eq!(set.tcp_lookup(local, remote, true), None);
+            iface.classify_dirty(&mut set, Instant::ZERO);
             set.check_flow_index();
             assert_eq!(set.tcp_lookup(local, remote, true), Some(1));
             assert_eq!(set.tcp_lookup(local, remote, false), Some(1));

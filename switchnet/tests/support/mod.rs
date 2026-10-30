@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
+use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
 use dpdk_smoltcp::{frame_pool_count, frame_reserve, rx_pool_count, rx_reserve, Eal, StackConfig};
 use switch::Runtime;
 use switchnet::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
@@ -17,8 +18,9 @@ use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
 
-/// Any test future, boxed so one task function serves every test.
-#[switch::task]
+/// Any test future, boxed so one task function serves every test; room for a
+/// task per socket of the largest fixture.
+#[switch::task(capacity = 2048)]
 fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
     future
 }
@@ -35,8 +37,8 @@ pub fn tcp_config() -> tcp::Config {
     tcp::Config { rx_capacity: RX_CAPACITY, tx_capacity: 64 * 1024, mss_cap: None }
 }
 
-fn stack_config(side: Side) -> StackConfig<'static> {
-    StackConfig { max_sockets: MAX_TCP, max_udp_sockets: MAX_UDP, ..pair::config(side) }
+fn stack_config(side: Side, tcp: usize, udp: usize, owned: &'static [Ipv4Cidr]) -> StackConfig<'static> {
+    StackConfig { max_sockets: tcp, max_udp_sockets: udp, owned_ipv4: owned, ..pair::config(side) }
 }
 
 pub fn net_ip() -> switchnet::Ipv4Address {
@@ -65,20 +67,33 @@ pub struct Mixed {
 impl Mixed {
     /// `names` are short and unique among live fixtures.
     pub fn new(eal: &Eal, names: [&str; 2]) -> Self {
+        Self::with_sockets(eal, names, MAX_TCP, MAX_UDP)
+    }
+
+    /// `new` with `tcp` TCP and `udp` UDP socket slots on each side.
+    pub fn with_sockets(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
+        Self::build(eal, names, tcp, udp, &[])
+    }
+
+    /// `new` with the Net also owning `owned`; the peer owns only its own address.
+    pub fn with_owned(eal: &Eal, names: [&str; 2], owned: &'static [Ipv4Cidr]) -> Self {
+        Self::build(eal, names, MAX_TCP, MAX_UDP, owned)
+    }
+
+    fn build(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, owned: &'static [Ipv4Cidr]) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [net_stack, peer] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
-            let stack_config = stack_config(side);
+            let stack_config = stack_config(side, tcp, udp, if side == Side::A { owned } else { &[] });
             let mut config = fixture.config();
-            let tcp = std::iter::repeat_n(RX_CAPACITY, MAX_TCP);
             let reserve =
                 rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
-            config.rx_pool.count = rx_pool_count(reserve, config.mtu, tcp)
-                + u32::try_from(MAX_UDP * UDP_QUEUE).unwrap();
+            config.rx_pool.count = rx_pool_count(reserve, config.mtu, std::iter::repeat_n(RX_CAPACITY, tcp))
+                + u32::try_from(udp * UDP_QUEUE).unwrap();
             config.frame_pool.count = frame_pool_count(
                 frame_reserve(config.tx_descriptors, stack_config.tx_pending),
                 config.mtu,
-                std::iter::repeat_n(tcp_config().tx_capacity, MAX_TCP),
+                std::iter::repeat_n(tcp_config().tx_capacity, tcp),
             );
             let port = fixture.open_with(eal, config);
             match Stack::new(port, stack_config, T0) {
@@ -216,8 +231,18 @@ pub fn local(port: u16) -> IpListenEndpoint {
     IpListenEndpoint { addr: None, port }
 }
 
+/// `port` on one of the Net's addresses only.
+pub fn local_at(addr: switchnet::Ipv4Address, port: u16) -> IpListenEndpoint {
+    IpListenEndpoint { addr: Some(addr.into()), port }
+}
+
 pub fn udp_config(port: u16) -> UdpConfig {
-    UdpConfig { port, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
+    UdpConfig { port, local_addr: None, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
+}
+
+/// `udp_config` bound to one of the Net's addresses.
+pub fn udp_config_at(addr: switchnet::Ipv4Address, port: u16) -> UdpConfig {
+    UdpConfig { local_addr: Some(addr), ..udp_config(port) }
 }
 
 /// Net connects from `port` to the peer's listener in a task; drives until
@@ -242,7 +267,18 @@ pub fn peer_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, data: &[u8])
 
 /// Peer sends `payload` to the Net's `port`, turning until the Net's MAC is resolved.
 pub fn peer_udp_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::UdpHandle, port: u16, payload: &[u8]) {
-    let to = Some(IpEndpoint::new(net_ip().into(), port));
+    peer_udp_send_to(mixed, peer, net_ip(), port, payload);
+}
+
+/// `peer_udp_send` to the Net's address `addr`, which the peer resolves on its own.
+pub fn peer_udp_send_to(
+    mixed: &mut Mixed,
+    peer: &dpdk_smoltcp::UdpHandle,
+    addr: switchnet::Ipv4Address,
+    port: u16,
+    payload: &[u8],
+) {
+    let to = Some(IpEndpoint::new(addr.into(), port));
     mixed.until(|m| match m.peer.udp_send(peer, to, payload) {
         Ok(()) => true,
         Err(error) => {
