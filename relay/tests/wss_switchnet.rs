@@ -585,6 +585,57 @@ fn close_dropped_while_waiting_for_room_is_sent_by_recv() {
 }
 
 
+/// A server that stops reading until told: a 1 MiB send fills its window and the send buffer
+/// mid-message and is dropped there (the message was accepted whole when copied in). Then a
+/// `second`-kind send: the server reads the first message whole, then the second, apart. On
+/// the old send path the dropped message stayed open: a same-kind send continued it (one
+/// merged message) and the other kind panicked.
+fn dropped_multi_frame_send_then(second: Kind) {
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let first = vec![7u8; 1 << 20];
+    let messages = ws_until_client(
+        |listener| set_rcvbuf(listener, 4096),
+        move |sock| {
+            go_rx.recv_timeout(LIMIT).expect("the client's go");
+            let mut ws = tungstenite::WebSocket::from_raw_socket(sock, tungstenite::protocol::Role::Server, None);
+            let mut messages = Vec::new();
+            loop {
+                match ws.read() {
+                    Ok(Message::Close(_)) => {}
+                    Ok(m) => messages.push(m),
+                    Err(WsError::ConnectionClosed) => return messages,
+                    Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("server read: {e}"),
+                }
+            }
+        },
+        move |mut ws| async move {
+            assert!(within_rounds(2000, ws.send(Kind::Binary, &[7; 1 << 20])).await.is_none(), "1 MiB found room");
+            go_tx.send(()).unwrap();
+            ws.send(second, b"second").await.expect("second send");
+            ws.close(1000, "").await.expect("close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    let second = match second {
+        Kind::Binary => Message::Binary(b"second".to_vec().into()),
+        Kind::Text => Message::Text("second".into()),
+    };
+    assert_eq!(messages.len(), 2, "the server read {} messages", messages.len());
+    assert_eq!(messages, [Message::Binary(first.into()), second]);
+}
+
+#[zhida_test_support::pinned_test]
+fn dropped_multi_frame_send_then_a_same_kind_send_is_two_messages() {
+    dropped_multi_frame_send_then(Kind::Binary);
+}
+
+#[zhida_test_support::pinned_test]
+fn dropped_multi_frame_send_then_an_other_kind_send_is_two_messages() {
+    dropped_multi_frame_send_then(Kind::Text);
+}
+
 /// The server closes: the client's recv returns the end, after echoing the close and ending
 /// TLS and TCP.
 #[zhida_test_support::pinned_test]

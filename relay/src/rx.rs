@@ -1,8 +1,7 @@
 //! Receive core: parses WebSocket frames (RFC 6455) out of the lower layer's
 //! runs and hands out messages that borrow the received bytes in place.
 
-use crate::lower::{PlainRx, PlainTx};
-use crate::tx::WsTx;
+use crate::lower::PlainRx;
 use crate::utf8::Utf8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,7 +148,7 @@ struct Located {
 }
 
 /// A control frame payload (at most 125 B, RFC 6455 §5.5).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Control {
     buf: [u8; 125],
     len: usize,
@@ -234,7 +233,7 @@ pub(crate) fn close_sendable(code: u16, reason: &str) -> bool {
 
 /// Make room for `additional` more bytes: at least doubling, never past `max`.
 /// The caller has checked `len + additional <= max`.
-fn grow(v: &mut Vec<u8>, additional: usize, max: usize) {
+pub(crate) fn grow(v: &mut Vec<u8>, additional: usize, max: usize) {
     let need = v.len() + additional;
     if need > v.capacity() {
         let target = need.max(2 * v.capacity()).min(max);
@@ -487,7 +486,7 @@ pub struct WsRx<R: PlainRx> {
     core: Core,
     /// Payload of the last direct message, consumed at the next `recv`.
     pending: usize,
-    /// A complete message found by `has_message_via`, returned by the next `recv`.
+    /// A complete message found by `has_message`, returned by the next `take_message`.
     ready: Option<Located>,
 }
 
@@ -517,7 +516,7 @@ impl<R: PlainRx> WsRx<R> {
         }
     }
 
-    /// Hand the next frame to the lower layer. Call after `recv` returned `Ok(None)`.
+    /// Hand the next frame to the lower layer. Call after `has_message` returned `false`.
     pub fn push(&mut self, f: R::Frame) {
         self.lower.push(f)
     }
@@ -526,39 +525,31 @@ impl<R: PlainRx> WsRx<R> {
     /// frames are handled here: a ping's payload is owed as a pong ([`take_pong`](Self::take_pong)),
     /// a valid close ends the connection with [`WsError::Closed`].
     ///
-    /// The message borrows `self`, so no further `recv` runs while it is held.
+    /// The message borrows `self`, so no further `recv` runs while it is held. (The async
+    /// receive loop uses `has_message` and `take_message`, which a loop can hold across awaits.)
+    #[cfg(test)]
     pub fn recv(&mut self, tx: &mut R::Tx) -> Result<Option<Message<'_>>, WsError<R::Error>> {
-        let at = match self.ready.take() {
-            Some(at) => Some(at),
-            None => self.next(tx)?,
-        };
-        let rx: &WsRx<R> = self;
-        Ok(at.map(|at| Message {
+        self.has_message(tx)?;
+        Ok(self.take_message())
+    }
+
+    /// The message the last `has_message` found, once; `None` if it found none. Parses
+    /// nothing.
+    pub(crate) fn take_message(&mut self) -> Option<Message<'_>> {
+        let at = self.ready.take()?;
+        Some(Message {
             kind: at.kind,
-            bytes: if at.direct { &rx.lower.current()[..at.len] } else { &rx.core.scratch[..at.len] },
+            bytes: if at.direct { &self.lower.current()[..at.len] } else { &self.core.scratch[..at.len] },
             rx_timestamp: at.stamp,
-        }))
+        })
     }
 
-    /// [`recv`](Self::recv) for a lower layer that receives through the send
-    /// half's connection (TLS).
-    pub fn recv_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<Option<Message<'_>>, WsError<R::Error>>
-    where
-        R: PlainRx<Tx = L>,
-    {
-        self.recv(tx.lower_mut())
-    }
-
-    /// Parse until a message is complete: `Ok(true)` and the next `recv_via`
-    /// returns it without parsing, or `Ok(false)` when a frame must be pushed.
-    /// An async receive loop awaits frames on `false`; it cannot keep the
-    /// message `recv_via` returns across such a loop.
-    pub fn has_message_via<L: PlainTx>(&mut self, tx: &mut WsTx<L>) -> Result<bool, WsError<R::Error>>
-    where
-        R: PlainRx<Tx = L>,
-    {
+    /// Parse until a message is complete: `Ok(true)` and `take_message` returns it, or
+    /// `Ok(false)` when a frame must be pushed. An async receive loop awaits frames on
+    /// `false`; it cannot keep a message across such a loop.
+    pub fn has_message(&mut self, tx: &mut R::Tx) -> Result<bool, WsError<R::Error>> {
         if self.ready.is_none() {
-            self.ready = self.next(tx.lower_mut())?;
+            self.ready = self.next(tx)?;
         }
         Ok(self.ready.is_some())
     }

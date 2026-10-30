@@ -19,7 +19,8 @@ test:
 docker-test:
 	$(MAKE) -C conduit docker-test
 
-# switch's unsafe code under Miri, Stacked and Tree Borrows.
+# switch's unsafe code under Miri, Stacked and Tree Borrows; relay's core and its one unsafe (Message::text).
 miri:
 	cargo +nightly miri test -p switch --lib --test oneshot_join
 	MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p switch --lib --test oneshot_join
+	cargo +nightly miri test -p relay --lib

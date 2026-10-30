@@ -43,7 +43,7 @@ struct Got {
 
 struct Wss {
     rx: WsRx<TlsRx<VecFrame, TestTx>>,
-    tx: WsTx<TlsTx<TestTx>>,
+    tx: TxCore<TlsTx<TestTx>>,
     /// Client-to-server TLS bytes.
     wire: Wire,
     server: WebSocket<ServerIo>,
@@ -67,7 +67,7 @@ impl Wss {
         server.set_buffer_limit(None);
         let mut w = Wss {
             rx: WsRx::new(TlsRx::new(), Config::new(Role::Client)),
-            tx: WsTx::new(tx, Role::Client),
+            tx: TxCore::new(tx, Role::Client),
             wire,
             server: WebSocket::from_raw_socket(ServerIo(server), TRole::Server, None),
             server_done: false,
@@ -151,7 +151,7 @@ impl Wss {
     fn client_read(&mut self, frame_len: usize) -> Vec<Got> {
         let mut got = Vec::new();
         loop {
-            match self.rx.recv_via(&mut self.tx) {
+            match self.rx.recv(self.tx.lower_mut()) {
                 Ok(Some(m)) => {
                     // runs text()'s debug_assert over TLS frame and scratch runs
                     match m.kind() {
@@ -179,9 +179,9 @@ impl Wss {
     /// Answers a ping the client received.
     fn client_pong(&mut self) {
         if let Some(p) = self.rx.take_pong() {
-            self.tx.pong(p);
+            self.tx.ping(p);
         }
-        assert_eq!(ready(self.tx.flush()), Ok(()));
+        ready(self.tx.flush());
     }
 }
 
@@ -240,15 +240,10 @@ fn fragments_and_ping() {
     want.extend_from_slice(&[b'!'; 2000]);
     assert_eq!(got, [Got { kind: Kind::Text, payload: want, stamp: w.stamp_of(at) }]);
 
-    // The client opens a fragmented message, answers the ping inside it, then finishes it.
-    let mut f = ready(w.tx.frame(Kind::Binary)).unwrap();
-    f.room()[..3].copy_from_slice(b"abc");
-    ready(f.commit(3, false)).unwrap();
+    // The client answers the ping, then sends a message of three TLS records.
     w.client_pong();
     assert_eq!(ready(w.tx.send(Kind::Binary, &[7; 3000])), Ok(()));
-    let mut want = b"abc".to_vec();
-    want.extend_from_slice(&[7; 3000]);
-    assert_eq!(w.server_read(), [TMessage::Pong(b"hb".to_vec().into()), TMessage::Binary(want.into())]);
+    assert_eq!(w.server_read(), [TMessage::Pong(b"hb".to_vec().into()), TMessage::Binary(vec![7; 3000].into())]);
 }
 
 /// tungstenite pings; the client answers once with the same payload.
@@ -268,17 +263,17 @@ fn server_ping_is_answered() {
 #[cfg_attr(miri, ignore)]
 fn close_started_by_the_client() {
     let mut w = Wss::new();
-    w.tx.close(&[&1000u16.to_be_bytes()[..], b"done"].concat());
-    assert_eq!(ready(w.tx.flush()), Ok(()));
+    assert_eq!(ready(w.tx.close(1000, "done")), Ok(()));
     let msgs = w.server_read();
     assert!(matches!(&msgs[..], [TMessage::Close(Some(c))] if c.code == CloseCode::Normal && c.reason == "done"));
     // tungstenite wrote its echo while reading; it reaches the client.
     w.server_flush();
     w.push(FRAME_ROOM);
-    assert!(matches!(w.rx.recv_via(&mut w.tx), Err(WsError::Closed)));
+    assert!(matches!(w.rx.recv(w.tx.lower_mut()), Err(WsError::Closed)));
     assert_eq!(w.rx.peer_close(), Some(&[&1000u16.to_be_bytes()[..], b"done"].concat()[..]));
     // Then the client ends the TLS stream.
-    assert_eq!(ready(w.tx.shutdown()), Ok(()));
+    w.tx.peer_close(w.rx.peer_close().unwrap());
+    ready(w.tx.finish());
     assert!(w.wire.shut.get(), "no FIN after close_notify");
     let (msgs, closed) = w.server_deliver();
     assert!(msgs.is_empty() && closed, "no close_notify");
@@ -292,12 +287,12 @@ fn close_started_by_the_server() {
     w.server.flush().unwrap();
     w.server_flush();
     w.push(FRAME_ROOM);
-    assert!(matches!(w.rx.recv_via(&mut w.tx), Err(WsError::Closed)));
+    assert!(matches!(w.rx.recv(w.tx.lower_mut()), Err(WsError::Closed)));
     let echo = w.rx.peer_close().unwrap().to_vec();
     assert_eq!(echo, [&1001u16.to_be_bytes()[..], b"bye"].concat());
     // Echo the close, then end the TLS stream with close_notify behind it.
-    w.tx.close(&echo);
-    assert_eq!(ready(w.tx.shutdown()), Ok(()));
+    w.tx.peer_close(&echo);
+    ready(w.tx.finish());
     let (msgs, closed) = w.server_deliver();
     assert!(closed, "no close_notify");
     assert!(matches!(&msgs[..], [TMessage::Close(Some(c))] if c.code == CloseCode::Away && c.reason == "bye"));
@@ -321,14 +316,14 @@ fn record_split_across_frames() {
             break;
         }
         w.push(cut);
-        assert!(w.rx.recv_via(&mut w.tx).unwrap().is_none(), "cut {cut}");
+        assert!(w.rx.recv(w.tx.lower_mut()).unwrap().is_none(), "cut {cut}");
         w.push(len);
         let want = w.stamp_of(at);
         assert_eq!(want, w.frame_starts.len() as u64 - 2);
-        let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
+        let m = w.rx.recv(w.tx.lower_mut()).unwrap().unwrap();
         assert_eq!(m.rx_timestamp(), want, "cut {cut}");
         assert_eq!(m.bytes(), payload);
-        assert!(w.rx.recv_via(&mut w.tx).unwrap().is_none());
+        assert!(w.rx.recv(w.tx.lower_mut()).unwrap().is_none());
     }
     assert_eq!(record, Some(5 + 2 + 109 + 17));
 }
@@ -344,12 +339,12 @@ fn message_inside_one_record_is_read_in_the_frame() {
     w.push(FRAME_ROOM);
     let want = w.stamp_of(at);
     let frame = w.frame_bytes.last().unwrap().clone();
-    let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
+    let m = w.rx.recv(w.tx.lower_mut()).unwrap().unwrap();
     assert_eq!(m.rx_timestamp(), want);
     assert_eq!(m.bytes(), payload);
     // Record header (5) + WebSocket header (2): the payload sits right behind them.
     assert_eq!(m.bytes().as_ptr(), frame.start.wrapping_add(7));
-    assert!(w.rx.recv_via(&mut w.tx).unwrap().is_none());
+    assert!(w.rx.recv(w.tx.lower_mut()).unwrap().is_none());
 
     let first = w.server_send(vec![TMessage::Binary(b"one".to_vec().into())]);
     w.server_send(vec![TMessage::Binary(b"two".to_vec().into())]);
@@ -357,7 +352,7 @@ fn message_inside_one_record_is_read_in_the_frame() {
     let want = w.stamp_of(first);
     let frame = w.frame_bytes.last().unwrap().clone();
     for expected in [&b"one"[..], b"two"] {
-        let m = w.rx.recv_via(&mut w.tx).unwrap().unwrap();
+        let m = w.rx.recv(w.tx.lower_mut()).unwrap().unwrap();
         assert_eq!((m.bytes(), m.rx_timestamp()), (expected, want));
         assert!(frame.contains(&m.bytes().as_ptr()), "{expected:?} not read in the frame");
     }
@@ -375,7 +370,7 @@ fn message_spanning_records_is_assembled() {
     let mut received = false;
     loop {
         let want = w.stamp_of(at);
-        match w.rx.recv_via(&mut w.tx).unwrap() {
+        match w.rx.recv(w.tx.lower_mut()).unwrap() {
             Some(m) => {
                 assert_eq!(m.rx_timestamp(), want);
                 assert_eq!(m.bytes(), payload);

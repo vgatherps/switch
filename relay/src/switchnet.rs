@@ -10,17 +10,19 @@ use std::sync::Arc;
 use rustls::ClientConfig;
 pub use sheath::switchnet::SetupError;
 use sheath::switchnet::{SwitchTx, send_bytes, tls_connect};
-use sheath::{FrameTx, TlsRx, TlsTx, TxError as TlsTxError};
+use sheath::{TlsRx, TlsTx, TxError as TlsTxError};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
-use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx, close_sendable};
-use crate::tx::{TxError, WsTx, max_control_frame};
+use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx};
+use crate::tx::{End, Failure as TxFailure, TxCore, TxError, max_control_frame};
 use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
 impl PlainTx for SwitchTx {
+    const HAS_CLOSE_RECORD: bool = false;
+
     fn has_pending(&self) -> bool {
         false
     }
@@ -40,15 +42,15 @@ pub enum Error {
     Recv(RecvError),
     /// The TLS handshake or a received record failed.
     Tls(sheath::Error),
-    /// Sending failed below WebSocket (TLS or TCP).
+    /// Sending the upgrade failed below WebSocket (TLS or TCP).
     Send(TlsTxError<SendError>),
     /// The TLS handshake could not start or ended in a state other than application traffic.
     Handshake(String),
-    /// The server broke the WebSocket protocol.
+    /// The peer broke the WebSocket protocol.
     Protocol(ProtocolError),
     /// The server refused or botched the WebSocket upgrade.
     Upgrade(UpgradeError),
-    /// A send after close.
+    /// A send or close after our close (or after `linger`).
     Closed,
     /// The connection could not be set up (a handle from another Net, or a frame room below
     /// the largest control frame); nothing was sent.
@@ -59,6 +61,20 @@ pub enum Error {
     InvalidText,
     /// A close code we may not send, or a reason over 123 B; nothing was sent.
     InvalidClose,
+    /// A message over 64 MiB; nothing was sent.
+    TooBig,
+}
+
+impl From<TxError> for Error {
+    fn from(e: TxError) -> Self {
+        match e {
+            TxError::Closed => Self::Closed,
+            TxError::Failed(f) => f.into(),
+            TxError::TooBig => Self::TooBig,
+            TxError::InvalidText => Self::InvalidText,
+            TxError::InvalidClose => Self::InvalidClose,
+        }
+    }
 }
 
 /// Why a connection failed.
@@ -66,6 +82,18 @@ pub enum Error {
 pub enum Failure {
     /// The socket closed or reset.
     Dead,
+}
+
+/// The connection's first failure, as every later call reports it.
+impl From<TxFailure> for Error {
+    fn from(f: TxFailure) -> Self {
+        match f {
+            TxFailure::Protocol(e) => Self::Protocol(e),
+            TxFailure::PeerEof => Self::Recv(RecvError::Finished),
+            TxFailure::Tls(e) => Self::Tls(e),
+            TxFailure::Dead => Self::Failed(Failure::Dead),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -79,9 +107,10 @@ impl fmt::Display for Error {
             Self::Upgrade(e) => write!(f, "websocket upgrade: {e}"),
             Self::Closed => f.write_str("websocket closed for sending"),
             Self::Config(e) => write!(f, "setup: {e}"),
-            Self::Failed(Failure::Dead) => f.write_str("connection closed or reset"),
+            Self::Failed(e) => write!(f, "connection failed: {e:?}"),
             Self::InvalidText => f.write_str("text message is not UTF-8"),
             Self::InvalidClose => f.write_str("close code not sendable or reason over 123 B"),
+            Self::TooBig => f.write_str("message over 64 MiB"),
         }
     }
 }
@@ -110,12 +139,7 @@ impl From<SetupError> for Error {
     }
 }
 
-impl From<sheath::Error> for Error {
-    fn from(e: sheath::Error) -> Self {
-        Self::Tls(e)
-    }
-}
-
+/// The upgrade's sends.
 impl From<TlsTxError<SendError>> for Error {
     fn from(e: TlsTxError<SendError>) -> Self {
         Self::Send(e)
@@ -225,7 +249,11 @@ impl Wss {
         self.0.recv().await
     }
 
-    /// Sends `payload` as one message, a TCP frame at a time.
+    /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
+    /// Dropped before the message is accepted (sealed whole, or copied in if it spans
+    /// frames), nothing of it is sent; once accepted it goes out whole and alone, the next
+    /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, the
+    /// connection's first failure, `InvalidText`, `TooBig`.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
         self.0.send(kind, payload).await
     }
@@ -260,7 +288,11 @@ impl Ws {
         self.0.recv().await
     }
 
-    /// Sends `payload` as one message, a TCP frame at a time.
+    /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
+    /// Dropped before the message is accepted (sealed whole, or copied in if it spans
+    /// frames), nothing of it is sent; once accepted it goes out whole and alone, the next
+    /// `send`, `close` or `recv` finishing it. Refused with nothing sent: `Closed`, the
+    /// connection's first failure, `InvalidText`, `TooBig`.
     pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
         self.0.send(kind, payload).await
     }
@@ -276,7 +308,8 @@ impl Ws {
     /// the peer still sends until it ends the stream too, so dropping the `Ws` afterwards sends
     /// no RST (a socket dropped with data unread aborts). Waits for the peer: bound it.
     pub async fn linger(&mut self) -> Result<(), Error> {
-        self.0.tx.lower_mut().shutdown();
+        self.0.tx.abandon();
+        self.0.tx.finish().await;
         loop {
             match self.0.tcp.recv().await {
                 Ok(_) => {}
@@ -287,10 +320,10 @@ impl Ws {
     }
 }
 
-/// The WebSocket halves over one lower layer, and the TCP receive half that feeds it.
+/// The receive half, the send core, and the TCP receive half that feeds them.
 struct Session<R: PlainRx, T: PlainTx> {
     rx: WsRx<R>,
-    tx: WsTx<T>,
+    tx: TxCore<T>,
     tcp: TcpRx,
 }
 
@@ -298,68 +331,79 @@ impl<R, T> Session<R, T>
 where
     R: PlainRx<Frame = TcpFrame, Tx = T>,
     T: PlainTx,
-    Error: From<R::Error> + From<T::Error>,
+    TxFailure: From<R::Error>,
 {
     fn new(rx: R, tx: T, tcp: TcpRx, role: Role) -> Self {
-        Session { rx: WsRx::new(rx, Config::new(role)), tx: WsTx::new(tx, role), tcp }
+        Session { rx: WsRx::new(rx, Config::new(role)), tx: TxCore::new(tx, role), tcp }
     }
 
+    /// The next message. Before returning one, what cannot wait goes out (refused frame,
+    /// lower records, pong, our close). A peer close, a failure or the socket's death runs the
+    /// rest of the connection's sending through the transport's end, then returns `None` (a
+    /// clean close) or the first failure; so the caller may drop the connection at once.
     async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         loop {
-            let ready = match self.rx.has_message_via(&mut self.tx) {
+            if self.tx.failed().is_some() || matches!(self.tx.end(), End::Delivered | End::Dead) {
+                return self.end().await;
+            }
+            let ready = match self.rx.has_message(self.tx.lower_mut()) {
                 Ok(ready) => ready,
                 Err(WsError::Closed) => {
-                    self.tx.close(self.rx.peer_close().expect("a close was received"));
-                    self.tx.shutdown().await?;
-                    return Ok(None);
+                    self.tx.peer_close(self.rx.peer_close().expect("a close was received"));
+                    return self.end().await;
                 }
-                Err(WsError::Lower(e)) => return Err(self.lower_failed(e).await),
-                Err(WsError::Protocol(e)) => return Err(Error::Protocol(e)),
+                Err(WsError::Protocol(e)) => {
+                    self.tx.fail(TxFailure::Protocol(e));
+                    return self.end().await;
+                }
+                Err(WsError::Lower(e)) => {
+                    self.tx.fail(e.into());
+                    return self.end().await;
+                }
             };
             if let Some(p) = self.rx.take_pong() {
-                self.tx.pong(p);
+                self.tx.ping(p);
             }
-            self.tx.flush().await?;
+            self.tx.flush().await;
+            if self.tx.failed().is_some() {
+                return self.end().await;
+            }
             if ready {
-                return match self.rx.recv_via(&mut self.tx) {
-                    Ok(m) => Ok(Some(m.expect("has_message_via found one"))),
-                    Err(_) => unreachable!("has_message_via found a message"),
-                };
+                return Ok(self.rx.take_message());
             }
-            self.rx.push(self.tcp.recv().await.map_err(Error::Recv)?);
+            match self.tcp.recv().await {
+                Ok(frame) => self.rx.push(frame),
+                Err(RecvError::Finished) => self.tx.fail(TxFailure::PeerEof),
+                Err(_) => self.tx.die(),
+            }
         }
     }
 
-    /// A receive error below WebSocket (TLS): sends the alert the lower layer queued for it,
-    /// best effort, then FIN, and waits until the peer acked them (`delivered`), so the caller
-    /// may drop the connection, and the Net, at once (a drop with server data unread then
-    /// aborts with RST, after the alert and FIN). A peer that never acks keeps this waiting:
-    /// the caller bounds `recv`.
-    async fn lower_failed(&mut self, e: R::Error) -> Error {
-        let _ = self.tx.flush().await;
-        let lower = self.tx.lower_mut();
-        lower.shutdown();
-        lower.delivered().await;
-        e.into()
+    /// Sends everything left through the transport's end; `None` after a clean close, else the
+    /// first failure.
+    async fn end(&mut self) -> Result<Option<Message<'_>>, Error> {
+        self.tx.finish().await;
+        self.tx.result()?;
+        Ok(None)
     }
 
     async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
-        if kind == Kind::Text && core::str::from_utf8(payload).is_err() {
-            return Err(Error::InvalidText);
-        }
-        self.tx.send(kind, payload).await.map_err(|e| match e {
-            TxError::Closed => Error::Closed,
-            TxError::Lower(e) => e.into(),
-        })
+        Ok(self.tx.send(kind, payload).await?)
     }
 
     async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
-        if !close_sendable(code, reason) {
-            return Err(Error::InvalidClose);
-        }
-        let mut payload = code.to_be_bytes().to_vec();
-        payload.extend_from_slice(reason.as_bytes());
-        self.tx.close(&payload);
-        Ok(self.tx.flush().await?)
+        Ok(self.tx.close(code, reason).await?)
+    }
+}
+
+impl From<Infallible> for TxFailure {
+    fn from(e: Infallible) -> Self {
+        match e {}
+    }
+}
+
+impl From<sheath::Error> for TxFailure {
+    fn from(e: sheath::Error) -> Self {
+        TxFailure::Tls(e)
     }
 }

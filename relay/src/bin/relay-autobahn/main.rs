@@ -382,7 +382,7 @@ async fn echo(ws: &mut Ws, buf: &mut Vec<u8>) -> &'static str {
                 };
             }
             Err(Error::Recv(_)) => return "receive failed",
-            Err(Error::Send(_)) => return "send failed",
+            Err(Error::Failed(_)) => return "connection failed",
             Err(e) => unreachable!("plain ws:// recv: {e}"),
         };
         if ws.send(kind, buf).await.is_err() {
