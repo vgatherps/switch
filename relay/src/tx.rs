@@ -164,6 +164,15 @@ pub(crate) enum End {
     Dead,
 }
 
+/// What [`TxCore::try_step`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stepped {
+    Idle,
+    Done,
+    /// A wait reported the socket's death; not applied.
+    Dead,
+}
+
 /// What the shell waits for next, in this order: the refused frame, the lower layer's own
 /// records, a pong, the next fragment, our close, the end of the transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,17 +631,30 @@ impl<L: PlainTx> TxCore<L> {
 
 // The shell: each method awaits the lower layer and calls the core; none changes state itself.
 impl<L: PlainTx> TxCore<L> {
-    /// One job of `next_job`; `false` when there is none.
+    /// One job of `next_job`, a death a wait reported applied; `false` when there is none.
     pub(crate) async fn step(&mut self) -> bool {
+        match self.try_step().await {
+            Stepped::Idle => false,
+            Stepped::Done => true,
+            Stepped::Dead => {
+                self.die();
+                true
+            }
+        }
+    }
+
+    /// One job of `next_job`, except that a wait reporting the socket's death changes
+    /// nothing: the caller applies it (`die`).
+    pub(crate) async fn try_step(&mut self) -> Stepped {
         match self.next_job() {
-            Job::Idle => return false,
+            Job::Idle => return Stepped::Idle,
             Job::Resend(len) => match self.lower.room(len).await {
                 Ok(()) => self.resend(),
-                Err(_) => self.die(),
+                Err(_) => return Stepped::Dead,
             },
             Job::Frame(len, work) => match self.frame_after_room(len).await {
                 Some(f) => self.emit(f, len, work),
-                None => self.die(),
+                None => return Stepped::Dead,
             },
             Job::Fin => self.fin(),
             Job::Delivered => {
@@ -640,7 +662,7 @@ impl<L: PlainTx> TxCore<L> {
                 self.delivered();
             }
         }
-        true
+        Stepped::Done
     }
 
     /// Room for `len` bytes, then a frame; `None` if the socket died.
@@ -682,17 +704,19 @@ impl<L: PlainTx> TxCore<L> {
 
     /// The service `recv` gives the jobs once it has a message: each job in order is polled
     /// once, stopping at the first that is not ready or after one fragment of a large
-    /// message. Never waits.
+    /// message. Never waits. A death a wait reports stops it without being applied: `recv`'s
+    /// next wait sees it again, and applies it after the input that came before it.
     pub(crate) async fn service(&mut self) {
         loop {
             let job = self.next_job();
             if job == Job::Idle {
                 return;
             }
-            let mut step = pin!(self.step());
-            let done = poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx).is_ready())).await;
-            if !done || matches!(job, Job::Frame(_, Work::Fragment)) {
-                return;
+            let mut step = pin!(self.try_step());
+            let stepped = poll_fn(|cx| Poll::Ready(step.as_mut().poll(cx))).await;
+            match stepped {
+                Poll::Ready(Stepped::Done) if !matches!(job, Job::Frame(_, Work::Fragment)) => {}
+                Poll::Ready(Stepped::Idle | Stepped::Done | Stepped::Dead) | Poll::Pending => return,
             }
         }
     }

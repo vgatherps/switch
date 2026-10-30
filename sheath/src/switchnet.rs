@@ -264,12 +264,9 @@ pub async fn tls_connect(
     min_plain: usize,
 ) -> Result<Tls, Error> {
     let (mut tcp_rx, tcp) = stream.split();
-    // a record carries at least one byte (TlsTx's floor)
-    let Some(need) = min_plain.max(1).checked_add(OVERHEAD) else {
-        // no frame carries it: refused with the frame's room, `need` past what usize holds
-        let raw = SwitchTx::new(handle, tcp, 0).await.map_err(Error::Setup)?;
-        return Err(Error::Setup(SetupError::RoomTooSmall { room: raw.room, need: usize::MAX }));
-    };
+    // a record carries at least one byte (TlsTx's floor); saturating on purpose: a minimum past
+    // usize::MAX is impossible, and the room check refuses it as RoomTooSmall
+    let need = min_plain.max(1).saturating_add(OVERHEAD);
     let mut raw = SwitchTx::new(handle, tcp, need).await.map_err(Error::Setup)?;
     let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Handshake(format!("server name {host}: {e}")))?;
     let mut conn = UnbufferedClientConnection::new(config, name).map_err(|e| Error::Tls(TlsError::Tls(e)))?;

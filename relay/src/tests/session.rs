@@ -359,6 +359,31 @@ fn a_reset_after_the_peer_close_with_something_owed_is_a_clean_end() {
     }
 }
 
+/// The peer sends its close and resets at once (Close, then SO_LINGER 0) while recv waits on
+/// input and on a send job (a dropped large send's rest): in one poll the send side sees the
+/// death and the input has the frames. The frames are parsed first (a message before the
+/// close is still returned), the peer's close among them, so it ends clean: `None`. (Before,
+/// the send side's death was applied first: `Failed(Dead)`.)
+#[test]
+fn close_then_reset_in_one_poll_with_a_send_pending_is_a_clean_end() {
+    for message_first in [false, true] {
+        let (mut s, log, input) = raw();
+        drop_large_send(&mut s, &log, 4000, Some(0));
+        assert_eq!(recv_n(&mut s, 2), None);
+        if message_first {
+            feed(&input, &client_frame(TEXT, b"last"), false);
+        }
+        feed(&input, &client_frame(CLOSE, &1000u16.to_be_bytes()), false);
+        end(&input, InputEnd::Reset);
+        log.borrow_mut().dead = true;
+        if message_first {
+            assert_eq!(recv_n(&mut s, 1), Some(msg(Kind::Text, b"last")));
+        }
+        assert_eq!(recv_n(&mut s, 4), Some(Ok(None)), "message first {message_first}");
+        assert_eq!((sent(&log).len(), log.borrow().live_frames(), input.borrow().live_frames()), (1, 0, 0));
+    }
+}
+
 /// Our close sent, then `linger` with the peer's close not in: our FIN goes out and is
 /// delivered, then the peer resets. Its close never came, so the reset is the socket's death,
 /// though nothing of ours was lost.
