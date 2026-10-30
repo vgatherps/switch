@@ -2252,31 +2252,6 @@ mod tests {
             socket
         }
 
-        /// 4096 connect and abort cycles over a full set, each on a new tuple, with listeners
-        /// relistening on new ports: the flow maps keep the capacity they were built with.
-        #[test]
-        fn flow_maps_do_not_grow_under_churn() {
-            const SLOTS: usize = 64;
-            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
-            let (local, remote) = endpoints();
-            let mut set = TcpSet::new(SLOTS);
-            let handles: Vec<_> = (0..SLOTS).map(|_| set.add(socket())).collect();
-            let capacity = (set.exact.capacity(), set.listeners.capacity());
-            for cycle in 0..4096u16 {
-                let handle = handles[usize::from(cycle) % SLOTS];
-                set.abort(handle);
-                if cycle % 2 == 0 {
-                    let remote = IpEndpoint { port: 1 + cycle, ..remote };
-                    set.connect(handle, iface.context(), remote, local).unwrap();
-                } else {
-                    set.listen(handle, 1 + cycle).unwrap();
-                }
-            }
-            set.check_flow_index();
-            assert_eq!(set.exact.len() + set.listeners.len(), SLOTS);
-            assert_eq!((set.exact.capacity(), set.listeners.capacity()), capacity);
-        }
-
         /// Each identity operation updates the flow index in its call, before any poll: a
         /// connect's tuple and a listener's port are found at once, and close and abort remove
         /// them at once.

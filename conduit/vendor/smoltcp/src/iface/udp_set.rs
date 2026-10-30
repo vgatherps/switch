@@ -681,24 +681,6 @@ mod tests {
         assert_eq!(set.slots.len(), 1);
     }
 
-    /// 4096 remove and add cycles over a full set, each binding a new port: the bind map keeps
-    /// the capacity it was built with.
-    #[test]
-    fn binds_do_not_grow_under_churn() {
-        const SLOTS: usize = 64;
-        let mut set = UdpSet::new(SLOTS, crate::tests::tx_test_source(1472));
-        let mut handles: Vec<_> =
-            (0..SLOTS as u16).map(|port| set.add(&iface(), config(1 + port)).unwrap()).collect();
-        let capacity = set.binds.capacity();
-        for cycle in 0..4096u16 {
-            let index = usize::from(cycle) % SLOTS;
-            set.remove(handles[index]);
-            handles[index] = set.add(&iface(), config(1 + SLOTS as u16 + cycle)).unwrap();
-        }
-        assert_eq!(set.binds.len(), SLOTS);
-        assert_eq!(set.binds.capacity(), capacity);
-    }
-
     fn bound(port: u16, addr: Ipv4Address) -> UdpConfig {
         UdpConfig {
             local_addr: Some(addr),

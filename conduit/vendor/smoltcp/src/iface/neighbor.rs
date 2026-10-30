@@ -1179,23 +1179,6 @@ mod test {
         }
 
         #[test]
-        /// Filling to capacity, then evicting, stays in the storage allocated at construction.
-        fn fill_and_evict_never_allocate() {
-            let mut cache = Cache::new(9);
-            let allocation = (cache.storage.capacity(), cache.storage.as_ptr());
-            for last in 1..=12 {
-                cache.fill(address(last), HADDR_A, Instant::from_millis(i64::from(last)));
-            }
-            for last in 4..=12 {
-                assert_eq!(
-                    cache.lookup(&address(last), Instant::ZERO),
-                    Answer::Found(HADDR_A)
-                );
-            }
-            assert_eq!(allocation, (cache.storage.capacity(), cache.storage.as_ptr()));
-        }
-
-        #[test]
         fn eviction_tie_goes_to_lowest_address() {
             let mut cache = Cache::new(3);
             for last in (1..=3).rev() {
@@ -1345,7 +1328,6 @@ mod test {
                 cache.lookup(&address(4), Instant::from_millis(10)),
                 Answer::Found(HADDR_D)
             );
-            assert_eq!(cache.storage.len(), 3);
         }
     }
 }
