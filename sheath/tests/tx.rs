@@ -389,3 +389,25 @@ fn sealing_while_a_handshake_message_is_half_received() {
     assert_eq!(seal_and_send(&mut peer, b"end"), RECORD + 3);
     assert_eq!(peer.deliver().unwrap(), b"end");
 }
+
+/// Over a lower layer with 64 KiB frames and the default fragment limit (None: rustls's 16 KiB
+/// records), a seal of the whole advertised plaintext room is one record that fits the frame.
+/// (Before, the room was the frame less the overhead, 65,460 B: rustls split it into four
+/// records past the frame and the seal panicked.)
+#[test]
+fn default_fragment_limit_caps_the_room_at_one_record() {
+    let mut peer = connect_over(default_provider(), None, Wire { frame_room: 1 << 16, ..Wire::default() });
+    let (_, room) = peer.tx.plain();
+    assert_eq!(room, 1 << 14);
+    let payload = vec![7; room];
+    let wire_len = seal_and_send(&mut peer, &payload);
+    assert_eq!(wire_len, RECORD + room);
+    let mut tls = &peer.wire.sent.borrow()[..];
+    while !tls.is_empty() {
+        peer.server.read_tls(&mut tls).unwrap();
+    }
+    peer.server.process_new_packets().unwrap();
+    let mut got = vec![0; room];
+    std::io::Read::read_exact(&mut peer.server.reader(), &mut got).unwrap();
+    assert_eq!(got, payload);
+}

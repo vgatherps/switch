@@ -16,12 +16,15 @@ const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
 
+/// Most plaintext rustls puts in one record without a client `max_fragment_size` (TLS's 2^14).
+const MAX_RECORD_PLAINTEXT: usize = 1 << 14;
+
 /// Plaintext one frame of `room` bytes carries as one record: the room less the record
-/// overhead, and at most one record's plaintext under the client's `max_fragment_size`
-/// (rustls's limit counts the record header and is at least 32 B).
+/// overhead, and at most one record's plaintext: the client's `max_fragment_size` (rustls's
+/// limit counts the record header and is at least 32 B), else 2^14.
 pub(crate) fn plain_room(room: usize, max_fragment_size: Option<usize>) -> usize {
-    let plain = room - OVERHEAD;
-    max_fragment_size.map_or(plain, |max| plain.min(max - RECORD_HEAD))
+    let record = max_fragment_size.map_or(MAX_RECORD_PLAINTEXT, |max| max - RECORD_HEAD);
+    (room - OVERHEAD).min(record)
 }
 
 /// A frame holding records that used sequence numbers. Only [`TlsTx`] makes one, and only

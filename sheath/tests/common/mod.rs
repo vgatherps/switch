@@ -63,8 +63,10 @@ impl TestFrame {
 }
 
 /// What the raw sender below `TlsTx` put on the wire, shared with the test.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Wire {
+    /// Bytes per frame.
+    pub frame_room: usize,
     pub sent: Rc<RefCell<Vec<u8>>>,
     /// The next this many `try_send`s are refused.
     pub refuse: Rc<Cell<usize>>,
@@ -72,6 +74,18 @@ pub struct Wire {
     pub fail_seal: Rc<Cell<bool>>,
     /// `shutdown` was called (TCP FIN).
     pub shut: Rc<Cell<bool>>,
+}
+
+impl Default for Wire {
+    fn default() -> Self {
+        Wire {
+            frame_room: FRAME_ROOM,
+            sent: Rc::default(),
+            refuse: Rc::default(),
+            fail_seal: Rc::default(),
+            shut: Rc::default(),
+        }
+    }
 }
 
 /// Raw TCP sender: frames go out as they are.
@@ -87,7 +101,7 @@ impl FrameTx for TestTx {
 
     async fn alloc(&mut self) -> Result<TestFrame, SealFailed> {
         Ok(TestFrame {
-            room: vec![0; FRAME_ROOM],
+            room: vec![0; self.0.frame_room],
             len: 0,
         })
     }
@@ -97,7 +111,7 @@ impl FrameTx for TestTx {
     }
 
     fn plain(&self) -> (usize, usize) {
-        (0, FRAME_ROOM)
+        (0, self.0.frame_room)
     }
 
     fn seal(&mut self, mut f: TestFrame, len: usize) -> Result<TestFrame, SealFailed> {
@@ -173,6 +187,11 @@ pub fn connect(max_fragment_size: Option<usize>) -> Peer {
 /// Completes the handshake. The server's records sent after it (session tickets) stay queued
 /// for the stream under test.
 pub fn connect_with(provider: CryptoProvider, max_fragment_size: Option<usize>) -> Peer {
+    connect_over(provider, max_fragment_size, Wire::default())
+}
+
+/// `connect_with` over the raw sender of `wire`.
+pub fn connect_over(provider: CryptoProvider, max_fragment_size: Option<usize>, wire: Wire) -> Peer {
     enum Next {
         Continue,
         Blocked,
@@ -220,7 +239,6 @@ pub fn connect_with(provider: CryptoProvider, max_fragment_size: Option<usize>) 
     }
     assert!(to_client.is_empty());
     assert!(!server.is_handshaking());
-    let wire = Wire::default();
     Peer {
         tx: TlsTx::new(client, TestTx(wire.clone()), None),
         wire,
