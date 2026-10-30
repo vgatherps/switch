@@ -106,12 +106,20 @@ impl Input for MockInput {
 type RawSession = Session<Raw<LiveFrame, MockTx<false>>, MockTx<false>, MockInput>;
 type TlsSession = Session<TlsRx<LiveFrame, TestTx>, TlsTx<TestTx>, MockInput>;
 
-/// A raw (ws://) server-role connection over the send mock and a gated input.
-fn raw() -> (RawSession, Rc<RefCell<Log>>, Inputs) {
+type MockSession<const TLS: bool> = Session<Raw<LiveFrame, MockTx<TLS>>, MockTx<TLS>, MockInput>;
+
+/// A server-role connection over the send mock of shape `TLS` (its close record and own
+/// records) and a gated input of unencrypted frames.
+fn shaped<const TLS: bool>() -> (MockSession<TLS>, Rc<RefCell<Log>>, Inputs) {
     let config = Config::new(Role::Server);
-    let (tx, log) = mock::<false>(&config, ROOM);
+    let (tx, log) = mock::<TLS>(&config, ROOM);
     let input = Inputs::default();
     (Session::new(WsRx::new(Raw::new(), config), tx, MockInput(input.clone())), log, input)
+}
+
+/// A raw (ws://) server-role connection over the send mock and a gated input.
+fn raw() -> (RawSession, Rc<RefCell<Log>>, Inputs) {
+    shaped::<false>()
 }
 
 /// A wss:// client connection after the handshake; the rustls server, and what the client
@@ -320,6 +328,37 @@ fn a_reset_after_the_peer_close_is_a_clean_end() {
     assert_eq!((task.got(), task.lingered.borrow().clone()), (vec![Ok(None)], Some(Ok(()))));
 }
 
+/// The peer resets right after its close while we still owe it something, the reset seen by
+/// the input or by the send side's room wait: our echo (raw TCP, the peer started the close)
+/// or close_notify (TLS, after our close and its echo). The peer's close came first, so it is
+/// a clean end, `None`, with nothing more sent. (Before, the send side's death stored
+/// `Failed(Dead)`.)
+#[test]
+fn a_reset_after_the_peer_close_with_something_owed_is_a_clean_end() {
+    fn check<const TLS: bool>(on_input: bool) {
+        let (mut s, log, input) = shaped::<TLS>();
+        if TLS {
+            assert_eq!(ready(s.close(1000, "")), Ok(()));
+        }
+        let before = sent(&log).len();
+        log.borrow_mut().room = Some(0);
+        feed(&input, &client_frame(CLOSE, &1000u16.to_be_bytes()), false);
+        assert_eq!(recv_n(&mut s, 2), None, "tls {TLS} on input {on_input}");
+        assert_eq!(log.borrow().waited.last().copied(), Some("room"));
+        if on_input {
+            end(&input, InputEnd::Reset);
+        } else {
+            log.borrow_mut().dead = true;
+        }
+        assert_eq!(recv_n(&mut s, 2), Some(Ok(None)), "tls {TLS} on input {on_input}");
+        assert_eq!((sent(&log).len(), log.borrow().shutdowns), (before, 0), "tls {TLS} on input {on_input}");
+    }
+    for on_input in [true, false] {
+        check::<false>(on_input);
+        check::<true>(on_input);
+    }
+}
+
 /// Our close sent, then `linger` with the peer's close not in: our FIN goes out and is
 /// delivered, then the peer resets. Its close never came, so the reset is the socket's death,
 /// though nothing of ours was lost.
@@ -367,6 +406,59 @@ fn a_ready_message_gets_at_most_one_fragment_of_service() {
     log.borrow_mut().room = Some(0);
     assert_eq!(recv_n(&mut s, 1), Some(msg(Kind::Text, b"c")));
     assert_eq!(sent(&log).len(), 4);
+}
+
+/// A receive lower layer that counts the parses (`chunk` calls) of the one it wraps.
+struct Counted<R>(R, Rc<std::cell::Cell<usize>>);
+
+impl<R: PlainRx> PlainRx for Counted<R> {
+    type Frame = R::Frame;
+    type Tx = R::Tx;
+    type Error = R::Error;
+
+    fn push(&mut self, f: R::Frame) {
+        self.0.push(f)
+    }
+    fn chunk(&mut self, tx: &mut R::Tx) -> Result<Option<sheath::Chunk<'_>>, R::Error> {
+        self.1.set(self.1.get() + 1);
+        self.0.chunk(tx)
+    }
+    fn current(&self) -> &[u8] {
+        self.0.current()
+    }
+    fn consume(&mut self, n: usize) {
+        self.0.consume(n)
+    }
+    fn discard(&mut self) {
+        self.0.discard()
+    }
+    fn eof(&self) -> bool {
+        self.0.eof()
+    }
+    fn fin(&mut self, tx: &mut R::Tx) -> Result<(), R::Error> {
+        self.0.fin(tx)
+    }
+}
+
+/// While recv waits and only the send side moves (a dropped send's rest going out a fragment
+/// per room grant), nothing is parsed again: parsing stops only where it needs input. (Under
+/// TLS each parse is a rustls call.)
+#[test]
+fn send_only_wakes_do_not_parse_again() {
+    let config = Config::new(Role::Server);
+    let (mut tx, log) = mock::<false>(&config, ROOM);
+    let input = Inputs::default();
+    log.borrow_mut().room = Some(ROOM);
+    assert!(poll_n(tx.send(Kind::Binary, &[7; 5000]), 1).is_none());
+    let parses = Rc::new(std::cell::Cell::new(0));
+    let mut s = Session::new(WsRx::new(Counted(Raw::new(), parses.clone()), config), tx, MockInput(input.clone()));
+    let mut f = pin!(s.recv());
+    for _ in 0..4 {
+        set(&log, |l| l.room = Some(ROOM));
+        assert!(poll(f.as_mut()).is_pending());
+    }
+    assert_eq!(messages(Role::Server, &log), [TMessage::Binary(vec![7; 5000].into())]);
+    assert_eq!(parses.get(), 1, "parsed again after send-only wakes");
 }
 
 /// Input ready on every pass (a message arriving a byte per frame) does not starve sending:

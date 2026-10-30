@@ -1,7 +1,9 @@
 //! WebSocket (RFC 6455) over switchnet TCP: clients, plain (ws://) or through sheath's TLS 1.3
 //! (wss://), and a plain ws:// server: feature `switchnet`, module [`switchnet`]. Received messages borrow the frame
 //! bytes in place; only messages spanning frames or fragments are copied, into one reusable
-//! scratch buffer. Sent payloads are written straight into the frame buffer, behind the header.
+//! scratch buffer. A sent message that fits one frame is written straight into the frame
+//! buffer, behind the header; a longer one is copied once into a reusable send buffer, then
+//! out a frame at a time.
 //!
 //! Without the feature only the protocol core builds, crate-private and exercised by its unit
 //! tests (it needs no DPDK, so they run on any host and under Miri).

@@ -368,10 +368,3 @@ fn close_sendable_checks_code_and_reason_length() {
     }
 }
 
-/// The largest control frame: 125 B payload, a 2 B header, and the mask as a client.
-#[test]
-fn max_control_frame_by_role() {
-    use crate::tx::max_control_frame;
-    assert_eq!((max_control_frame(Role::Client), max_control_frame(Role::Server)), (131, 127));
-}
-

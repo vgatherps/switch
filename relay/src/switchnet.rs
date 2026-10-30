@@ -40,7 +40,7 @@ impl PlainTx for SwitchTx {
 
 #[derive(Debug)]
 pub enum Error {
-    /// TCP receive failed during setup, or (from `linger`) while draining the peer's bytes.
+    /// TCP receive failed during setup (the upgrade).
     Recv(RecvError),
     /// The TLS handshake failed.
     Tls(sheath::Error),
@@ -231,7 +231,7 @@ pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx, TcpRx>);
 impl Wss {
     /// The next message; `None` once the close handshake is done (ours or the server's) and the
     /// transport's end delivered. After a failure, the first failure, once what is owed (the
-    /// TLS alert, close_notify, FIN) went out. Bytes the server sends after its close are read
+    /// TLS alert, close_notify, FIN) is delivered. Bytes the server sends after its close are read
     /// and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         Ok(self.0.recv().await?)
@@ -271,7 +271,7 @@ impl Wss {
 
 impl Ws {
     /// The next message; `None` once the close handshake is done (ours or the peer's) and the
-    /// FIN delivered. After a failure, the first failure, once FIN went out. Bytes the peer
+    /// FIN delivered. After a failure, the first failure, once our FIN is delivered. Bytes the peer
     /// sends after its close are read and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         Ok(self.0.recv().await?)

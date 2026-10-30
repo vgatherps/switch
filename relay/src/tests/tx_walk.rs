@@ -278,7 +278,8 @@ fn random_walks_of_twelve_events() {
     }
 }
 
-/// The depth-3 sequence that once never ended: a failure, a refused frame, the socket's death.
+/// A failure with a refused frame retained, then the socket's death (the combination that once
+/// never ended): it ends Dead.
 #[test]
 fn fail_refuse_die_ends() {
     let seq = [Ev::SendSmall, Ev::RefuseNext, Ev::SendSmall, Ev::FailProtocol, Ev::KillSocket, Ev::Step];

@@ -249,14 +249,8 @@ impl<L: PlainTx> TxCore<L> {
         &mut self.lower
     }
 
-    #[cfg(test)]
     pub(crate) fn failed(&self) -> Option<&Failure> {
         self.failed.as_ref()
-    }
-
-    /// The peer's close arrived.
-    pub(crate) fn peer_closed(&self) -> bool {
-        self.peer == Peer::Closed
     }
 
     pub(crate) fn end(&self) -> End {
@@ -372,26 +366,24 @@ impl<L: PlainTx> TxCore<L> {
         self.seal_put(f, len);
     }
 
-    /// After `room` and a frame for the `Job::Frame` that `next_job` returned (nothing changed
-    /// since): fills, seals and sends it.
-    pub(crate) fn emit(&mut self, mut f: L::Frame) {
-        let job = self.next_job();
-        let Job::Frame(len, work) = job else {
-            debug_assert!(false, "emit for {job:?}: the shell raced the core");
-            return;
-        };
+    /// After `room` and a frame for `Job::Frame(len, work)`, which `next_job` returned
+    /// (nothing changed since): fills, seals and sends it.
+    pub(crate) fn emit(&mut self, mut f: L::Frame, len: usize, work: Work) {
+        debug_assert_eq!(self.next_job(), Job::Frame(len, work), "the shell raced the core");
         match work {
-            Work::Pending | Work::Notify => {
-                let sealed = if work == Work::Pending { self.lower.take_pending(f) } else { self.lower.seal_close(f) };
-                match sealed {
-                    Ok(Some(s)) => self.put(s, len),
-                    Ok(None) => {}
-                    Err(_) => return self.die(),
-                }
-                if work == Work::Notify {
+            Work::Pending => match self.lower.take_pending(f) {
+                Ok(Some(s)) => self.put(s, len),
+                Ok(None) => {}
+                Err(_) => self.die(),
+            },
+            Work::Notify => match self.lower.seal_close(f) {
+                Ok(Some(s)) => {
                     self.end = End::Notify;
+                    self.put(s, len);
                 }
-            }
+                Ok(None) => self.end = End::Notify,
+                Err(_) => self.die(),
+            },
             Work::Pong => {
                 let p = self.pong.take().expect("a pong job");
                 self.frame(f, FIN | PONG, p.bytes());
@@ -466,9 +458,13 @@ impl<L: PlainTx> TxCore<L> {
         self.abandon();
     }
 
-    /// The socket died: whatever failed first, nothing more is sent.
+    /// The socket died: nothing more is sent. A failure stored before stays; otherwise the
+    /// death is the failure, unless the peer's close came first (receiving was over, and what
+    /// we still owed it is moot: the decided clean end).
     pub(crate) fn die(&mut self) {
-        self.failed.get_or_insert(Failure::Dead);
+        if self.peer == Peer::Open {
+            self.failed.get_or_insert(Failure::Dead);
+        }
         self.unsent = None;
         self.abandon();
         self.end = End::Dead;
@@ -617,7 +613,8 @@ impl<L: PlainTx> TxCore<L> {
                 }
             }
             End::Dead => {
-                assert!(self.unsent.is_none() && job == Job::Idle && self.failed.is_some());
+                assert!(self.unsent.is_none() && job == Job::Idle);
+                assert!(self.failed.is_some() || self.peer == Peer::Closed, "dead with no failure before the peer's close");
             }
         }
     }
@@ -633,8 +630,8 @@ impl<L: PlainTx> TxCore<L> {
                 Ok(()) => self.resend(),
                 Err(_) => self.die(),
             },
-            Job::Frame(len, _) => match self.frame_after_room(len).await {
-                Some(f) => self.emit(f),
+            Job::Frame(len, work) => match self.frame_after_room(len).await {
+                Some(f) => self.emit(f, len, work),
                 None => self.die(),
             },
             Job::Fin => self.fin(),

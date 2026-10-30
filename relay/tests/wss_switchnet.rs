@@ -1087,7 +1087,7 @@ fn reset_while_send_waits_for_a_frame_fails_the_send() {
                 assert!(within_rounds(50, sending.as_mut()).await.is_none(), "sent without a frame");
                 go_tx.send(()).unwrap();
                 let got = within_rounds(20_000, sending).await.expect("send still waiting after the reset");
-                assert!(got.is_err(), "send after a reset");
+                assert!(matches!(got, Err(WssError::Failed(relay::switchnet::Failure::Dead))), "{got:?}");
             }
             drop(held);
             ws
@@ -1184,4 +1184,55 @@ fn a_large_send_waits_for_frames_then_completes() {
         },
     );
     assert_eq!(read, [Message::Binary(vec![5; LEN].into())]);
+}
+
+/// The peer resets the connection; once the client saw it (its receive half reports the
+/// reset), a free frame is not handed to the dead socket: the setup probe is `Dead`, and an
+/// alloc on a sender set up before is refused (before the fix, the frame wait was polled
+/// first and won).
+#[zhida_test_support::pinned_test]
+fn a_reset_socket_gets_no_frame_though_one_is_free() {
+    use sheath::FrameTx;
+    use sheath::switchnet::{SetupError, SwitchTx};
+    for probe in [true, false] {
+        let (go_tx, go_rx) = mpsc::channel();
+        until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+            let (mut rx, tcp) = stream.split();
+            let mut early = None;
+            let mut late = Some(tcp);
+            if !probe {
+                early = Some(SwitchTx::new(&handle, late.take().unwrap(), 1).await.expect("setup"));
+            }
+            go_tx.send(()).unwrap();
+            let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+            assert!(seen.is_err(), "data instead of the reset");
+            if let Some(tcp) = late {
+                let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the probe waited");
+                assert!(matches!(got, Err(SetupError::Dead)), "probe: {:?}", got.map(drop));
+            }
+            if let Some(mut tx) = early {
+                let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
+                assert!(got.is_err(), "a frame for a reset socket");
+            }
+        });
+    }
+}
+
+/// `tls_connect`'s plaintext minimum: 0 counts as one byte (a record's floor), so a 76 B send
+/// buffer (one record's overhead, no byte of plaintext) is refused, where it once passed setup
+/// and panicked after the handshake; a minimum past `usize::MAX` once its overhead is added is
+/// refused too. Nothing reaches the server in either case.
+#[zhida_test_support::pinned_test]
+fn tls_minimum_zero_or_overflowing_is_refused_before_any_byte() {
+    use sheath::switchnet::{Error as TlsError, SetupError, tls_connect};
+    for (min_plain, tx, need) in [(0, 76, 77), (usize::MAX, 64 * 1024, usize::MAX)] {
+        let (_, client_tls) = tls_configs();
+        until_client_on(&tap_with_send_buffer(tx), |_| {}, sees_nothing, move |handle, stream| async move {
+            let got = tls_connect(&handle, stream, client_tls, HOST, min_plain).await.map(drop);
+            assert!(
+                matches!(got, Err(TlsError::Setup(SetupError::RoomTooSmall { need: n, .. })) if n == need),
+                "min {min_plain}: {got:?}"
+            );
+        });
+    }
 }

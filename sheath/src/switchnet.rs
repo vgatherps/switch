@@ -3,13 +3,16 @@
 //! futures run as switch tasks. switchnet's frames are this crate's [`RxFrame`]/[`TxFrame`].
 
 use std::fmt;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use rustls::ClientConfig;
 use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::ServerName;
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
-use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx, first};
+use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
 
 use crate::tx::OVERHEAD;
 use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
@@ -97,10 +100,19 @@ impl FrameTx for SwitchTx {
     type Sealed = switchnet::TxFrame;
     type Error = SendError;
 
-    /// A frame from the Net, or `InvalidState` if the socket closes or resets first. Called
-    /// only before `shutdown`, where the connection ending is the only way `delivered` resolves.
+    /// A frame from the Net, or `InvalidState` if the socket has closed or reset (checked
+    /// first on every poll, so a dead socket never gets a frame). Called only before
+    /// `shutdown`, where the connection ending is the only way `delivered` resolves.
     async fn alloc(&mut self) -> Result<switchnet::TxFrame, SendError> {
-        first(self.handle.tx_frame(), self.tcp.delivered()).await.ok_or(SendError::InvalidState)
+        let mut dead = pin!(self.tcp.delivered());
+        let mut frame = pin!(self.handle.tx_frame());
+        poll_fn(|cx| {
+            if dead.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(SendError::InvalidState));
+            }
+            frame.as_mut().poll(cx).map(Ok)
+        })
+        .await
     }
 
     async fn room(&mut self, len: usize) -> Result<(), SendError> {
@@ -242,8 +254,8 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
 /// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert
 /// it queued goes out, then FIN, and the error returns once the server acked them (or the
 /// connection ended): until then a failing handshake stays pending, so the caller bounds it.
-/// `min_plain` is the largest plaintext record the caller will send; a frame that cannot carry
-/// it as a record is `Setup(RoomTooSmall)` before the ClientHello.
+/// `min_plain` is the largest plaintext record the caller will send (0 counts as 1); a frame
+/// that cannot carry it as a record is `Setup(RoomTooSmall)` before the ClientHello.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -252,7 +264,13 @@ pub async fn tls_connect(
     min_plain: usize,
 ) -> Result<Tls, Error> {
     let (mut tcp_rx, tcp) = stream.split();
-    let mut raw = SwitchTx::new(handle, tcp, min_plain + OVERHEAD).await.map_err(Error::Setup)?;
+    // a record carries at least one byte (TlsTx's floor)
+    let Some(need) = min_plain.max(1).checked_add(OVERHEAD) else {
+        // no frame carries it: refused with the frame's room, `need` past what usize holds
+        let raw = SwitchTx::new(handle, tcp, 0).await.map_err(Error::Setup)?;
+        return Err(Error::Setup(SetupError::RoomTooSmall { room: raw.room, need: usize::MAX }));
+    };
+    let mut raw = SwitchTx::new(handle, tcp, need).await.map_err(Error::Setup)?;
     let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Handshake(format!("server name {host}: {e}")))?;
     let mut conn = UnbufferedClientConnection::new(config, name).map_err(|e| Error::Tls(TlsError::Tls(e)))?;
 

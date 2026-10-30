@@ -4,9 +4,10 @@
 //! call those.
 //!
 //! The input's end: the peer's FIN while reading fails the connection (`PeerEof`, or the TLS
-//! truncation) and is the normal end after its close. A reset before the peer's close is the
-//! socket's death; after it, the reset only ends the input, as reading would have stopped
-//! there anyway (a send still owed finds the socket dead on its own).
+//! truncation) and is the normal end after its close. A reset, seen by the input or by a send
+//! wait, is the socket's death; before the peer's close it is the connection's failure
+//! (`Failed(Dead)`), after it a clean end: reading had stopped there anyway, and what we still
+//! owed the peer (our echo, close_notify) is moot.
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
@@ -72,15 +73,17 @@ where
     /// the message returns without waiting on it. Without one, input and the next send job
     /// are awaited together; whichever is ready first is handled, both if both are.
     pub(crate) async fn recv(&mut self) -> Result<Option<Message<'_>>, TxError> {
+        // Parsing stops only where it needs input, so it runs again only once input came.
+        let mut parse = true;
         loop {
-            if self.rx_in == RxIn::Reading && self.rx_step() {
+            if parse && self.rx_in == RxIn::Reading && self.rx_step() {
                 self.tx.service().await;
                 return Ok(self.rx.take_message());
             }
             if matches!(self.tx.end(), End::Delivered | End::Dead) {
                 return self.tx.result().map(|()| None);
             }
-            self.wait().await;
+            parse = self.wait().await;
         }
     }
 
@@ -95,7 +98,7 @@ where
     /// Sends no close frame (one already sealed still goes out), stops receiving, drains to
     /// FIN, and reads and drops input until the peer's FIN: dropping the connection then sends
     /// no RST. `Err(Failed(Dead))` if the socket reset before the peer's close (after it, a
-    /// reset ends the input like a FIN); a failure before is not reported.
+    /// reset is a clean end); a failure before is not reported.
     pub(crate) async fn linger(&mut self) -> Result<(), TxError> {
         self.tx.abandon();
         if self.rx_in == RxIn::Reading {
@@ -104,9 +107,9 @@ where
         while !(self.rx_in == RxIn::Eof && matches!(self.tx.end(), End::Fin | End::Delivered | End::Dead)) {
             self.wait().await;
         }
-        match self.tx.end() {
-            End::Dead => Err(TxError::Failed(Failure::Dead)),
-            End::Open | End::Notify | End::Fin | End::Delivered => Ok(()),
+        match (self.tx.end(), self.tx.failed()) {
+            (End::Dead, Some(_)) => Err(TxError::Failed(Failure::Dead)),
+            (End::Dead, None) | (End::Open | End::Notify | End::Fin | End::Delivered, _) => Ok(()),
         }
     }
 
@@ -139,7 +142,7 @@ where
 
     /// One input result: a frame is pushed while reading, dropped unread after; the peer's
     /// FIN while reading fails the connection (PeerEof, or the TLS truncation); a reset is
-    /// the socket's death unless the peer's close came first.
+    /// the socket's death (see the module docs).
     fn take_input(&mut self, input: Result<R::Frame, InputEnd>) {
         match input {
             Ok(frame) => match self.rx_in {
@@ -154,7 +157,6 @@ where
                     },
                     // receiving was over: the peer's close came first, or a failure did
                     (InputEnd::Fin, RxIn::Stopped | RxIn::Eof) => {}
-                    (InputEnd::Reset, _) if self.tx.peer_closed() => {}
                     (InputEnd::Reset, _) => self.tx.die(),
                 }
                 self.rx.discard();
@@ -166,15 +168,17 @@ where
     /// Awaits the input (unless it ended) and the send core's next job (unless there is
     /// none), both polled on every poll; handles what either produced. Both futures live
     /// across pending polls (their wake registrations with them) and end before anything is
-    /// parsed.
-    async fn wait(&mut self) {
+    /// parsed. `true` if input (a frame or its end) was taken.
+    async fn wait(&mut self) -> bool {
         let reading = self.rx_in != RxIn::Eof;
         let job = self.tx.next_job() != Job::Idle;
         assert!(reading || job, "input ended with no job left, but the connection is not over");
         let (input, _) = either(reading.then(|| self.input.recv()), job.then(|| self.tx.step())).await;
+        let took = input.is_some();
         if let Some(input) = input {
             self.take_input(input);
         }
+        took
     }
 }
 
