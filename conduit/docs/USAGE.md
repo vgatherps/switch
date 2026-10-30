@@ -323,7 +323,9 @@ Stack sends no gratuitous ARP for it.
 `random_seed: u64` seeds the interface PRNG, including the TCP initial-sequence-number secret.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
 only in tests and benchmarks. `neighbor_capacity: usize` controls the ARP cache. `DEFAULT_NEIGHBOR_CAPACITY` is 256. A
-new neighbor in a full cache evicts the neighbor that expires first. Egress sends one segment per
+new neighbor in a full cache evicts the neighbor that expires first. A lookup scans the cached
+neighbors, so it is sized for the gateway and a few on-link peers; hundreds of on-link peers make
+each lookup proportionally slower. Egress sends one segment per
 TCP socket visit while other sockets have frames ready; a socket alone keeps sending while it is due.
 
 `max_sockets: usize` is the TCP slot limit and must be positive, even for a UDP-only application.

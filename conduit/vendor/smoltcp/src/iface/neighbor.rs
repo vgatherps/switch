@@ -1,7 +1,6 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP.
 
-use crate::table_hash::{C1, finish, mix};
 use alloc::vec::Vec;
 use core::cell::Cell;
 #[cfg(test)]
@@ -68,17 +67,16 @@ impl Entry {
 /// the lowest address goes.
 #[derive(Debug)]
 pub struct Cache {
-    /// Linear-probing slots, a power of two at least twice `capacity` long.
-    storage: Vec<Option<(IpAddress, Entry)>>,
-    hash_shift: u32,
-    len: usize,
+    /// Entries in no order, allocated for `capacity` at construction. A Stack talks to its
+    /// gateway and a few on-link peers, so a scan beats hashing.
+    storage: Vec<(IpAddress, Entry)>,
     capacity: usize,
     changes: u64,
     next_expiry: Option<Instant>,
     #[cfg(test)]
     pub(crate) lookup_calls: AtomicUsize,
-    /// Slot of the last address found. Checked against the slot's address before use,
-    /// so moves and removals never make it wrong; it only skips the hash when a Stack
+    /// Index of the last address found. Checked against the entry's address before use,
+    /// so moves and removals never make it wrong; it only skips the scan when a Stack
     /// keeps talking to the same neighbor.
     last_found: Cell<usize>,
 }
@@ -100,17 +98,11 @@ impl Cache {
     /// Create a cache holding up to `capacity` neighbors.
     ///
     /// # Panics
-    /// Panics if `capacity` is 0 or too large to allocate twice over.
+    /// Panics if `capacity` is 0.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "Neighbor capacity must be nonzero.");
-        let slots = capacity
-            .checked_mul(2)
-            .and_then(usize::checked_next_power_of_two)
-            .expect("Neighbor capacity is too large.");
         Self {
-            storage: alloc::vec![None; slots],
-            hash_shift: 64 - slots.trailing_zeros(),
-            len: 0,
+            storage: Vec::with_capacity(capacity),
             capacity,
             last_found: Cell::new(0),
             changes: 0,
@@ -120,64 +112,34 @@ impl Cache {
         }
     }
 
-    fn home(&self, address: &IpAddress) -> usize {
-        let hash = match address {
-            IpAddress::Ipv4(address) => mix(C1, u32::from_be_bytes(address.octets()) as u64),
-        };
-        (finish(hash) >> self.hash_shift) as usize
-    }
-
-    fn find(&self, address: &IpAddress) -> Result<usize, usize> {
+    fn find(&self, address: &IpAddress) -> Option<usize> {
         let last = self.last_found.get();
-        if let Some((stored_address, _)) = &self.storage[last]
-            && stored_address == address
-        {
-            return Ok(last);
+        if self.storage.get(last).is_some_and(|(stored, _)| stored == address) {
+            return Some(last);
         }
-        let mut index = self.home(address);
-        while let Some((stored_address, _)) = &self.storage[index] {
-            if stored_address == address {
-                self.last_found.set(index);
-                return Ok(index);
-            }
-            index = (index + 1) & (self.storage.len() - 1);
-        }
-        Err(index)
+        let index = self.storage.iter().position(|(stored, _)| stored == address)?;
+        self.last_found.set(index);
+        Some(index)
     }
 
-    fn remove(&mut self, mut hole: usize) -> (IpAddress, Entry) {
-        let removed = self.storage[hole].take().unwrap();
-        let mask = self.storage.len() - 1;
-        let mut index = (hole + 1) & mask;
-        while let Some((address, _)) = &self.storage[index] {
-            let home = self.home(address);
-            if (hole.wrapping_sub(home) & mask) < (index.wrapping_sub(home) & mask) {
-                self.storage[hole] = self.storage[index].take();
-                hole = index;
-            }
-            index = (index + 1) & mask;
-        }
-        self.len -= 1;
-        removed
+    fn remove(&mut self, index: usize) -> (IpAddress, Entry) {
+        self.storage.swap_remove(index)
     }
 
     fn earliest(&self) -> usize {
         self.storage
             .iter()
             .enumerate()
-            .filter_map(|(index, slot)| {
-                slot.as_ref()
-                    .map(|(address, entry)| (index, entry.expires_at(), *address))
-            })
+            .map(|(index, (address, entry))| (index, entry.expires_at(), *address))
             .min_by_key(|(_, expires_at, address)| (*expires_at, *address))
             .expect("empty neighbor cache storage")
             .0
     }
 
     fn pending_eviction_is_silent(&self, timestamp: Instant) -> bool {
-        self.len == self.capacity
+        self.storage.len() == self.capacity
             && matches!(
-                self.storage[self.earliest()].as_ref().unwrap().1,
+                self.storage[self.earliest()].1,
                 Entry::Pending { silent_until } if timestamp < silent_until
             )
     }
@@ -197,8 +159,8 @@ impl Cache {
         source_hardware_addr: HardwareAddress,
         timestamp: Instant,
     ) {
-        if let Ok(index) = self.find(&protocol_addr)
-            && let Entry::Resolved(neighbor) = &mut self.storage[index].as_mut().unwrap().1
+        if let Some(index) = self.find(&protocol_addr)
+            && let Entry::Resolved(neighbor) = &mut self.storage[index].1
         {
             if source_hardware_addr == neighbor.hardware_addr {
                 let expired = timestamp >= neighbor.expires_at;
@@ -223,9 +185,9 @@ impl Cache {
         hardware_addr: HardwareAddress,
         timestamp: Instant,
     ) {
-        if let Ok(index) = self.find(&protocol_addr) {
+        if let Some(index) = self.find(&protocol_addr) {
             if matches!(
-                &self.storage[index].as_ref().unwrap().1,
+                &self.storage[index].1,
                 Entry::Resolved(neighbor) if neighbor.hardware_addr == hardware_addr
             ) {
                 return;
@@ -269,12 +231,9 @@ impl Cache {
             expires_at,
             hardware_addr,
         });
-        let mut index = match self.find(&protocol_addr) {
-            Ok(index) => {
-                let old_neighbor = self.storage[index]
-                    .replace((protocol_addr, neighbor))
-                    .unwrap()
-                    .1;
+        match self.find(&protocol_addr) {
+            Some(index) => {
+                let old_neighbor = core::mem::replace(&mut self.storage[index].1, neighbor);
                 if let Entry::Resolved(old_neighbor) = old_neighbor
                     && old_neighbor.hardware_addr != hardware_addr
                 {
@@ -287,11 +246,10 @@ impl Cache {
                 }
                 return;
             }
-            Err(index) => index,
-        };
-        if self.len == self.capacity {
+            None => {}
+        }
+        if self.storage.len() == self.capacity {
             let (old_protocol_addr, _old_neighbor) = self.evict_earliest();
-            index = self.find(&protocol_addr).unwrap_err();
             net_trace!(
                 "filled {} => {} (evicted {} => {:?})",
                 protocol_addr,
@@ -302,8 +260,7 @@ impl Cache {
         } else {
             net_trace!("filled {} => {} (was empty)", protocol_addr, hardware_addr);
         }
-        self.storage[index] = Some((protocol_addr, neighbor));
-        self.len += 1;
+        self.storage.push((protocol_addr, neighbor));
     }
 
     pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
@@ -311,8 +268,8 @@ impl Cache {
         self.lookup_calls.fetch_add(1, Ordering::Relaxed);
         assert!(protocol_addr.is_unicast());
 
-        if let Ok(index) = self.find(protocol_addr) {
-            match &self.storage[index].as_ref().unwrap().1 {
+        if let Some(index) = self.find(protocol_addr) {
+            match &self.storage[index].1 {
                 Entry::Resolved(neighbor) => {
                     if timestamp < neighbor.expires_at {
                         return Answer::Found(neighbor.hardware_addr);
@@ -359,34 +316,28 @@ impl Cache {
                 .checked_add(Self::SILENT_TIME.total_micros() as i64)
                 .expect("neighbor silence overflow"),
         );
-        let index = match self.find(&protocol_addr) {
-            Ok(index) => {
-                if let Entry::Resolved(neighbor) = &mut self.storage[index].as_mut().unwrap().1 {
+        match self.find(&protocol_addr) {
+            Some(index) => {
+                if let Entry::Resolved(neighbor) = &mut self.storage[index].1 {
                     neighbor.silent_until = silent_until;
                     return;
                 }
-                index
+                self.storage[index].1 = Entry::Pending { silent_until };
             }
-            Err(index) => {
+            None => {
                 if self.pending_eviction_is_silent(timestamp) {
                     return;
                 }
-                let index = if self.len == self.capacity {
+                if self.storage.len() == self.capacity {
                     self.evict_earliest();
-                    self.find(&protocol_addr).unwrap_err()
-                } else {
-                    index
-                };
-                self.len += 1;
-                index
+                }
+                self.storage.push((protocol_addr, Entry::Pending { silent_until }));
             }
-        };
-        self.storage[index] = Some((protocol_addr, Entry::Pending { silent_until }));
+        }
     }
 
     pub(crate) fn flush(&mut self) {
-        self.storage.fill(None);
-        self.len = 0;
+        self.storage.clear();
         {
             self.bump();
             self.next_expiry = None;
@@ -413,7 +364,7 @@ impl Cache {
         }
         let mut expired = false;
         let mut next_expiry: Option<Instant> = None;
-        for (_, entry) in self.storage.iter().flatten() {
+        for (_, entry) in &self.storage {
             let Entry::Resolved(neighbor) = entry else {
                 continue;
             };
@@ -454,7 +405,7 @@ mod test {
             Answer::NotFound
         );
         {
-            assert_eq!(cache.len, 0);
+            assert_eq!(cache.storage.len(), 0);
             assert_eq!(cache.changes(), 0);
         }
     }
@@ -476,12 +427,12 @@ mod test {
         );
         assert_eq!(cache.changes(), changes + 1);
         let index = cache.find(&MOCK_IP_ADDR_1.into()).unwrap();
-        let Entry::Resolved(neighbor) = &cache.storage[index].as_ref().unwrap().1 else {
+        let Entry::Resolved(neighbor) = &cache.storage[index].1 else {
             panic!("neighbor remains pending");
         };
         assert_eq!(neighbor.expires_at, now + Cache::ENTRY_LIFETIME);
         assert_eq!(neighbor.silent_until, neighbor.expires_at);
-        assert_eq!(cache.len, 1);
+        assert_eq!(cache.storage.len(), 1);
     }
 
     #[test]
@@ -518,7 +469,7 @@ mod test {
         {
             assert_eq!(cache.changes(), changes);
             let index = cache.find(&MOCK_IP_ADDR_1.into()).unwrap();
-            let Entry::Resolved(neighbor) = &cache.storage[index].as_ref().unwrap().1 else {
+            let Entry::Resolved(neighbor) = &cache.storage[index].1 else {
                 panic!("resolved neighbor became pending");
             };
             assert_eq!(neighbor.expires_at, Instant::ZERO + Cache::ENTRY_LIFETIME);
@@ -683,104 +634,6 @@ mod test {
     mod alloc_tests {
         use super::*;
 
-        fn assert_spread(
-            name: &str,
-            capacity: usize,
-            addresses: impl IntoIterator<Item = IpAddress>,
-            max_probe: usize,
-        ) {
-            let mut cache = Cache::new(capacity);
-            assert_eq!(cache.storage.len(), 2 * capacity);
-            let mut count = 0;
-            for address in addresses {
-                cache.fill(address, HADDR_A, Instant::ZERO);
-                count += 1;
-            }
-            let mask = cache.storage.len() - 1;
-            let mut longest = 0;
-            let mut total = 0;
-            let mut at_home = 0;
-            for (index, entry) in cache.storage.iter().enumerate() {
-                if let Some((address, _)) = entry {
-                    assert_eq!(cache.lookup(address, Instant::ZERO), Answer::Found(HADDR_A));
-                    let distance = index.wrapping_sub(cache.home(address)) & mask;
-                    longest = longest.max(distance);
-                    total += distance;
-                    at_home += usize::from(distance == 0);
-                }
-            }
-            assert_eq!(count, capacity);
-            assert_eq!(cache.len, count);
-            std::println!(
-                "{name}: max={longest}, mean={total}/{count} ({}), home={at_home}/{count}",
-                total as f64 / count as f64,
-            );
-            assert!(longest <= 40, "{name}: max {longest} > 40");
-            assert!(longest <= max_probe, "{name}: max {longest} > {max_probe}");
-            assert!(total * 2 <= 3 * count, "{name}: mean {total}/{count} > 1.5");
-        }
-
-        #[test]
-        fn sequential_addresses_spread() {
-            let config = crate::iface::Config::new(HADDR_A);
-            assert_eq!(config.neighbor_capacity, 256);
-            assert_spread(
-                "neighbor default",
-                config.neighbor_capacity,
-                (1..=256u32).map(|index| {
-                    crate::wire::Ipv4Address::from((0x0a000000 + index).to_be_bytes()).into()
-                }),
-                13,
-            );
-        }
-
-        #[test]
-        fn sequential_subnet_22_addresses_spread() {
-            assert_spread(
-                "neighbor /22",
-                1024,
-                (0..1024u32).map(|index| {
-                    crate::wire::Ipv4Address::from((0x0a000000 + index).to_be_bytes()).into()
-                }),
-                27,
-            );
-        }
-
-        #[test]
-        fn sequential_third_octets_spread() {
-            assert_spread(
-                "neighbor third octet",
-                256,
-                (0..=255).map(|third| IpAddress::v4(172, 16, third, 1)),
-                10,
-            );
-        }
-
-        #[test]
-        fn reviewer_address_stride_65537_spread() {
-            assert_spread(
-                "neighbor stride 65537",
-                128,
-                (0..128u32).map(|index| {
-                    crate::wire::Ipv4Address::from((0x0a010001 + 65537 * index).to_be_bytes())
-                        .into()
-                }),
-                7,
-            );
-        }
-
-        #[test]
-        fn reviewer_address_stride_3600_spread() {
-            assert_spread(
-                "neighbor stride 3600",
-                256,
-                (0..256u32).map(|index| {
-                    crate::wire::Ipv4Address::from((0x0a010001 + 3600 * index).to_be_bytes()).into()
-                }),
-                11,
-            );
-        }
-
         fn address(last: u8) -> IpAddress {
             return crate::wire::Ipv4Address::new(192, 0, 2, last).into();
         }
@@ -900,7 +753,7 @@ mod test {
                     }
                 );
                 assert_eq!(cache.changes(), changes);
-                assert_eq!(cache.len, 2);
+                assert_eq!(cache.storage.len(), 2);
                 assert_eq!(cache.next_expiry, None);
             }
         }
@@ -1026,7 +879,7 @@ mod test {
                 cache.lookup(&address(1), Instant::from_millis(2_000)),
                 Answer::NotFound
             );
-            assert_eq!(cache.len, 1);
+            assert_eq!(cache.storage.len(), 1);
         }
 
         #[test]
@@ -1072,7 +925,7 @@ mod test {
                 Answer::NotFound
             );
             assert_eq!(cache.changes(), 2);
-            assert_eq!(cache.len, 2);
+            assert_eq!(cache.storage.len(), 2);
         }
 
         #[test]
@@ -1082,12 +935,12 @@ mod test {
             let changes = cache.changes();
             cache.limit_rate(address(2), Instant::from_millis(2));
             assert_eq!(cache.changes(), changes + 1);
-            assert!(cache.find(&address(1)).is_err());
+            assert!(cache.find(&address(1)).is_none());
             assert_eq!(
                 cache.lookup(&address(2), Instant::from_millis(2)),
                 Answer::RateLimited
             );
-            assert_eq!(cache.len, 1);
+            assert_eq!(cache.storage.len(), 1);
             cache.expire(Instant::from_millis(60_000));
             assert_eq!(cache.changes(), changes + 1);
             assert_eq!(cache.next_expiry, None);
@@ -1142,16 +995,16 @@ mod test {
                 assert_eq!(cache.lookup(&address(2), now), Answer::RateLimited);
                 cache.limit_rate(address(2), now);
                 assert_eq!(cache.lookup(&address(1), now), Answer::RateLimited);
-                assert!(cache.find(&address(2)).is_err());
-                assert_eq!(cache.len, 1);
+                assert!(cache.find(&address(2)).is_none());
+                assert_eq!(cache.storage.len(), 1);
                 assert_eq!(cache.changes(), 0);
             }
             let now = Instant::from_millis(1_000);
             assert_eq!(cache.lookup(&address(2), now), Answer::NotFound);
             cache.limit_rate(address(2), now);
-            assert!(cache.find(&address(1)).is_err());
+            assert!(cache.find(&address(1)).is_none());
             assert_eq!(cache.lookup(&address(2), now), Answer::RateLimited);
-            assert_eq!(cache.len, 1);
+            assert_eq!(cache.storage.len(), 1);
             assert_eq!(cache.changes(), 0);
         }
 
@@ -1169,7 +1022,7 @@ mod test {
             assert_eq!(cache.lookup(&address(1), now), Answer::Found(HADDR_A));
             assert_eq!(cache.lookup(&address(3), now), Answer::NotFound);
             assert_eq!(cache.lookup(&address(4), now), Answer::Found(HADDR_D));
-            assert_eq!(cache.len, 2);
+            assert_eq!(cache.storage.len(), 2);
         }
 
         #[test]
@@ -1201,25 +1054,17 @@ mod test {
         #[test]
         fn len_exact_with_pending() {
             let mut cache = Cache::new(3);
-            let mask = cache.storage.len() - 1;
-            let colliding: Vec<IpAddress> = (1..=254)
-                .map(address)
-                .filter(|address| cache.home(address) == mask)
-                .take(4)
-                .collect();
-            assert_eq!(colliding.len(), 4);
+            let colliding: Vec<IpAddress> = (1..=4).map(address).collect();
             for (index, address) in colliding[..3].iter().enumerate() {
                 cache.limit_rate(*address, Instant::from_millis(index as i64));
-                assert_eq!(cache.len, index + 1);
-                assert_eq!(cache.len, cache.storage.iter().flatten().count());
+                assert_eq!(cache.storage.len(), index + 1);
             }
             cache.limit_rate(colliding[1], Instant::from_millis(100));
             cache.fill(colliding[2], HADDR_C, Instant::ZERO);
-            assert_eq!(cache.len, 3);
+            assert_eq!(cache.storage.len(), 3);
             cache.lookup(&colliding[2], Instant::ZERO);
             cache.limit_rate(colliding[3], Instant::from_millis(200));
-            assert_eq!(cache.len, 3);
-            assert_eq!(cache.len, cache.storage.iter().flatten().count());
+            assert_eq!(cache.storage.len(), 3);
             let now = Instant::from_millis(200);
             assert_eq!(cache.lookup(&colliding[0], now), Answer::RateLimited);
             assert_eq!(cache.lookup(&colliding[1], now), Answer::RateLimited);
@@ -1230,11 +1075,11 @@ mod test {
                 cache.lookup(&colliding[1], Instant::from_millis(1_200)),
                 Answer::NotFound
             );
-            assert_eq!(cache.len, 3);
-            assert_eq!(cache.len, cache.storage.iter().flatten().count());
+            assert_eq!(cache.storage.len(), 3);
+            assert_eq!(cache.storage.len(), cache.storage.len());
             cache.flush();
-            assert_eq!(cache.len, 0);
-            assert_eq!(cache.storage.iter().flatten().count(), 0);
+            assert_eq!(cache.storage.len(), 0);
+            assert_eq!(cache.storage.len(), 0);
             assert_eq!(cache.next_expiry, None);
             for address in &colliding {
                 assert_eq!(cache.lookup(address, Instant::ZERO), Answer::NotFound);
@@ -1334,21 +1179,20 @@ mod test {
         }
 
         #[test]
-        fn nine_neighbors_fit_in_default_capacity() {
-            let config = crate::iface::Config::new(HADDR_A);
-            assert_eq!(config.neighbor_capacity, 256);
-            let mut cache = Cache::new(config.neighbor_capacity);
-            assert_eq!(cache.storage.len(), 512);
-
-            for last in 1..=9 {
-                cache.fill(address(last), HADDR_A, Instant::ZERO);
+        /// Filling to capacity, then evicting, stays in the storage allocated at construction.
+        fn fill_and_evict_never_allocate() {
+            let mut cache = Cache::new(9);
+            let allocation = (cache.storage.capacity(), cache.storage.as_ptr());
+            for last in 1..=12 {
+                cache.fill(address(last), HADDR_A, Instant::from_millis(i64::from(last)));
             }
-            for last in 1..=9 {
+            for last in 4..=12 {
                 assert_eq!(
                     cache.lookup(&address(last), Instant::ZERO),
                     Answer::Found(HADDR_A)
                 );
             }
+            assert_eq!(allocation, (cache.storage.capacity(), cache.storage.as_ptr()));
         }
 
         #[test]
@@ -1381,8 +1225,8 @@ mod test {
             let index = cache.find(&address(1)).unwrap();
             cache.fill(address(1), HADDR_D, Instant::from_millis(1_000));
 
-            assert_eq!(cache.find(&address(1)), Ok(index));
-            assert_eq!(cache.len, 3);
+            assert_eq!(cache.find(&address(1)), Some(index));
+            assert_eq!(cache.storage.len(), 3);
             assert_eq!(
                 cache.lookup(&address(1), Instant::ZERO),
                 Answer::Found(HADDR_D)
@@ -1426,7 +1270,7 @@ mod test {
                 cache.lookup(&address(1), Instant::from_millis(63_000)),
                 Answer::NotFound
             );
-            assert_eq!(cache.len, 1);
+            assert_eq!(cache.storage.len(), 1);
 
             cache.reset_expiry_if_existing(address(1), HADDR_A, Instant::from_millis(60_000));
             assert_eq!(
@@ -1450,7 +1294,7 @@ mod test {
                 cache.lookup(&address(2), Instant::from_millis(60_000)),
                 Answer::NotFound
             );
-            assert_eq!(cache.len, 1);
+            assert_eq!(cache.storage.len(), 1);
         }
 
         #[test]
@@ -1474,55 +1318,34 @@ mod test {
                 cache.lookup(&address(1), Instant::from_millis(5_000)),
                 Answer::NotFound
             );
-            assert_eq!(cache.len, 1);
+            assert_eq!(cache.storage.len(), 1);
         }
 
+        /// The remembered index of the last address found is checked before use: an eviction
+        /// that moves entries leaves it pointing at another address, and finds still answer
+        /// right.
         #[test]
-        fn colliding_keys_probe_and_delete() {
+        fn remembered_index_survives_eviction() {
             let mut cache = Cache::new(3);
-            let mask = cache.storage.len() - 1;
-            let colliding: Vec<IpAddress> = (1..=254)
-                .map(address)
-                .filter(|address| cache.home(address) == mask)
-                .take(4)
-                .collect();
-            assert_eq!(colliding.len(), 4);
-
-            for (index, address) in colliding[..3].iter().enumerate() {
-                cache.fill(*address, HADDR_A, Instant::from_millis(index as i64));
+            for last in 1..=3 {
+                cache.fill(address(last), HADDR_A, Instant::from_millis(i64::from(last)));
             }
-            assert_eq!(cache.find(&colliding[0]), Ok(mask));
-            assert_eq!(cache.find(&colliding[1]), Ok(0));
-            assert_eq!(cache.find(&colliding[2]), Ok(1));
-            for address in &colliding[..3] {
+            assert_eq!(cache.find(&address(3)), Some(2));
+            assert_eq!(cache.last_found.get(), 2);
+            cache.fill(address(4), HADDR_D, Instant::from_millis(4));
+            assert_eq!(cache.lookup(&address(1), Instant::from_millis(10)), Answer::NotFound);
+            assert_eq!(cache.last_found.get(), 2);
+            for last in 2..=3 {
                 assert_eq!(
-                    cache.lookup(address, Instant::from_millis(10)),
-                    Answer::Found(HADDR_A)
-                );
-            }
-            // The last lookup remembered colliding[2]'s slot.
-            assert_eq!(cache.last_found.get(), 1);
-
-            cache.fill(colliding[3], HADDR_D, Instant::from_millis(3));
-            assert_eq!(
-                cache.lookup(&colliding[0], Instant::from_millis(10)),
-                Answer::NotFound
-            );
-            // Eviction moved colliding[2] out of the remembered slot and put colliding[3]
-            // there; finds must not trust it.
-            assert_eq!(cache.last_found.get(), 1);
-            assert_eq!(cache.find(&colliding[1]), Ok(mask));
-            assert_eq!(cache.find(&colliding[2]), Ok(0));
-            for address in &colliding[1..3] {
-                assert_eq!(
-                    cache.lookup(address, Instant::from_millis(10)),
+                    cache.lookup(&address(last), Instant::from_millis(10)),
                     Answer::Found(HADDR_A)
                 );
             }
             assert_eq!(
-                cache.lookup(&colliding[3], Instant::from_millis(10)),
+                cache.lookup(&address(4), Instant::from_millis(10)),
                 Answer::Found(HADDR_D)
             );
+            assert_eq!(cache.storage.len(), 3);
         }
     }
 }
