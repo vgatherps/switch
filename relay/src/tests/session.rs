@@ -302,6 +302,37 @@ fn recv_is_woken_by_a_reset_alone() {
     }
 }
 
+/// The peer resets the socket once the close handshake is done: switchnet reports our FIN
+/// delivered (the socket closed) and the input reset in the same poll. The peer's close came
+/// first, so the reset only ends the input: `None`, and `linger` after it is `Ok`.
+/// (Autobahn's fuzzingserver aborts its control connections this way.)
+#[test]
+fn a_reset_after_the_peer_close_is_a_clean_end() {
+    let (s, log, input) = raw();
+    log.borrow_mut().delivered = false;
+    feed(&input, &client_frame(CLOSE, &1000u16.to_be_bytes()), false);
+    let mut task = Task::spawn(s, true);
+    task.turn();
+    task.assert_parked();
+    log.borrow_mut().delivered = true;
+    end(&input, InputEnd::Reset);
+    assert_eq!(task.turn(), 1);
+    assert_eq!((task.got(), task.lingered.borrow().clone()), (vec![Ok(None)], Some(Ok(()))));
+}
+
+/// Our close sent, then `linger` with the peer's close not in: our FIN goes out and is
+/// delivered, then the peer resets. Its close never came, so the reset is the socket's death,
+/// though nothing of ours was lost.
+#[test]
+fn a_reset_before_the_peer_close_is_dead_even_after_our_fin() {
+    let (mut s, log, input) = raw();
+    assert_eq!(ready(s.close(1000, "")), Ok(()));
+    assert!(poll_n(s.linger(), 2).is_none());
+    assert_eq!((s.tx.end(), log.borrow().shutdowns), (crate::tx::End::Delivered, 1));
+    end(&input, InputEnd::Reset);
+    assert_eq!(poll_n(s.linger(), 1), Some(Err(TxError::Failed(Failure::Dead))));
+}
+
 /// The send job and a frame of input ready in the same poll: the job's frame goes out, and
 /// the input frame is parsed and its message delivered once (not lost with the wait).
 #[test]

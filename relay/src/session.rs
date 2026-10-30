@@ -4,7 +4,9 @@
 //! call those.
 //!
 //! The input's end: the peer's FIN while reading fails the connection (`PeerEof`, or the TLS
-//! truncation) and is the normal end after its close. A reset is the socket's death.
+//! truncation) and is the normal end after its close. A reset before the peer's close is the
+//! socket's death; after it, the reset only ends the input, as reading would have stopped
+//! there anyway (a send still owed finds the socket dead on its own).
 
 use core::future::{Future, poll_fn};
 use core::pin::pin;
@@ -92,7 +94,8 @@ where
 
     /// Sends no close frame (one already sealed still goes out), stops receiving, drains to
     /// FIN, and reads and drops input until the peer's FIN: dropping the connection then sends
-    /// no RST. `Err(Failed(Dead))` if the socket reset; a failure before is not reported.
+    /// no RST. `Err(Failed(Dead))` if the socket reset before the peer's close (after it, a
+    /// reset ends the input like a FIN); a failure before is not reported.
     pub(crate) async fn linger(&mut self) -> Result<(), TxError> {
         self.tx.abandon();
         if self.rx_in == RxIn::Reading {
@@ -136,7 +139,7 @@ where
 
     /// One input result: a frame is pushed while reading, dropped unread after; the peer's
     /// FIN while reading fails the connection (PeerEof, or the TLS truncation); a reset is
-    /// the socket's death.
+    /// the socket's death unless the peer's close came first.
     fn take_input(&mut self, input: Result<R::Frame, InputEnd>) {
         match input {
             Ok(frame) => match self.rx_in {
@@ -151,6 +154,7 @@ where
                     },
                     // receiving was over: the peer's close came first, or a failure did
                     (InputEnd::Fin, RxIn::Stopped | RxIn::Eof) => {}
+                    (InputEnd::Reset, _) if self.tx.peer_closed() => {}
                     (InputEnd::Reset, _) => self.tx.die(),
                 }
                 self.rx.discard();

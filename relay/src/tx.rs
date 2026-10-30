@@ -254,6 +254,11 @@ impl<L: PlainTx> TxCore<L> {
         self.failed.as_ref()
     }
 
+    /// The peer's close arrived.
+    pub(crate) fn peer_closed(&self) -> bool {
+        self.peer == Peer::Closed
+    }
+
     pub(crate) fn end(&self) -> End {
         self.end
     }

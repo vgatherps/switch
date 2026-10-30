@@ -263,7 +263,7 @@ impl Wss {
     /// Ends without a close frame (one already sent still goes out): close_notify (unless a TLS
     /// failure) and FIN, then reads and drops what the server still sends until its FIN, so
     /// dropping the `Wss` afterwards sends no RST (a socket dropped with data unread aborts).
-    /// `Err(Failed(Dead))` if the socket reset. Waits for the server: bound it.
+    /// `Err(Failed(Dead))` if the socket reset before the peer's close. Waits for the server: bound it.
     pub async fn linger(&mut self) -> Result<(), Error> {
         Ok(self.0.linger().await?)
     }
@@ -301,7 +301,7 @@ impl Ws {
     /// Ends without a close frame (one already sent still goes out), as after `recv` failed
     /// the connection: FIN, then reads and drops what the peer still sends until its FIN, so
     /// dropping the `Ws` afterwards sends no RST (a socket dropped with data unread aborts).
-    /// `Err(Failed(Dead))` if the socket reset. Waits for the peer: bound it.
+    /// `Err(Failed(Dead))` if the socket reset before the peer's close. Waits for the peer: bound it.
     pub async fn linger(&mut self) -> Result<(), Error> {
         Ok(self.0.linger().await?)
     }
