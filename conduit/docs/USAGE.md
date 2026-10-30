@@ -377,6 +377,16 @@ When the share runs out, the driver has no mbuf for new arrivals and drops them 
 Reading data and dropping held frames returns mbufs. The Stack computes its reserve from the
 negotiated RX descriptor count, which the PMD may raise; leave room for that.
 
+Out-of-order segments are freed only when the gap before them fills, so sockets holding them
+could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. As Linux
+prunes the receiving socket's out-of-order queue under memory pressure, each `turn` and `receive`
+checks after its RX burst whether at most one RX burst of mbufs (`PortConfig::rx_burst`) is free.
+While that holds, a TCP socket that processes a segment drops its own out-of-order data (and an
+out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
+ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
+resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
+blocks, and the sender must then resend it too.
+
 ### TX pool
 
 TCP send queues hold frames from the frame pool (below); the TX pool holds ACKs, ARP, RSTs and

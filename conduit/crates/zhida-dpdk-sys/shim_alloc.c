@@ -34,6 +34,15 @@ zhida_mempool_ops_name(const struct rte_mempool *mp) {
   return rte_mempool_get_ops(mp->ops_index)->name;
 }
 
+// Free objects this lcore can allocate: the backing store's count plus `cache`'s.
+// Unlike rte_mempool_avail_count, it does not walk every lcore's cache.
+__attribute__((nonnull(1, 2))) unsigned
+zhida_mempool_free_count(const struct rte_mempool *mp,
+                         const struct rte_mempool_cache *cache) {
+  // rte_mempool_ops_get_count is internal to DPDK; call the pool's ops directly.
+  return rte_mempool_get_ops(mp->ops_index)->get_count(mp) + cache->len;
+}
+
 static void zhida_set_cache_ptr_cb(struct rte_mempool *mp
                                    __attribute__((unused)),
                                    void *opaque, void *obj,

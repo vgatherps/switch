@@ -752,6 +752,13 @@ impl Port {
         unsafe { (*self.rx.pool().pool()).cache_size }
     }
 
+    /// Whether the RX mbufs this lcore can allocate (the RX pool's backing store plus this
+    /// lcore's cache, which the PMD refills from) are at most one RX burst (`rx_burst`).
+    #[inline]
+    pub(crate) fn rx_pool_low(&self) -> bool {
+        (self.rx.pool().free_count() as usize) <= self.rx_scratch.len()
+    }
+
     pub(crate) fn tx_pool_count(&self) -> usize {
         // SAFETY: this Port owns the live TX pool; its object count is fixed.
         usize::try_from(unsafe { (*self.tx.pool().pool()).size })

@@ -64,6 +64,9 @@ fn assert_distinct(objects: impl Iterator<Item = *mut rte_mbuf>) {
 }
 
 fn exhaustion_and_circulation(pool: &PoolManager, cfg: PoolConfig<'_>) {
+    // On the pool's own lcore, free_count (backing store plus this lcore's cache) is the
+    // pool's count less what is in use, as objects leave and return through the cache.
+    assert_eq!(pool.free_count(), cfg.count - pool.in_use_count());
     let mut all = Vec::new();
     while let Some(m) = pool.alloc() {
         assert_object(pool, m.as_ptr(), cfg.data_room_size);
@@ -72,10 +75,12 @@ fn exhaustion_and_circulation(pool: &PoolManager, cfg: PoolConfig<'_>) {
     assert_eq!(all.len(), cfg.count as usize);
     assert_distinct(all.iter().map(Mbuf::as_ptr));
     assert_eq!(pool.in_use_count(), cfg.count);
+    assert_eq!(pool.free_count(), 0);
     assert!(pool.alloc().is_none());
     assert!(pool.alloc_with_len(0).is_none());
     drop(all);
     assert_eq!(pool.in_use_count(), 0);
+    assert_eq!(pool.free_count(), cfg.count);
 
     // Hold every standard allocation, then alternate standard and custom frees.
     let mut raw = Vec::new();
