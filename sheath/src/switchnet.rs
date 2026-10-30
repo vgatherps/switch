@@ -9,8 +9,9 @@ use rustls::ClientConfig;
 use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::ServerName;
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
-use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
+use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx, first};
 
+use crate::tx::OVERHEAD;
 use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
 
 /// Most TCP payload per sent frame: the Ethernet MSS. A lower effective MSS makes conduit cut
@@ -42,20 +43,52 @@ impl TxFrame for switchnet::TxFrame {
     }
 }
 
+/// Why a [`SwitchTx`] (and so a connection) could not be set up. Nothing was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupError {
+    /// The stream is not on `handle`'s Net: its frames would be refused as foreign.
+    ForeignHandle,
+    /// One frame carries `room` bytes (the frame room, clamped to the send buffer), fewer than
+    /// the `need` bytes the caller's largest frame takes.
+    RoomTooSmall { room: usize, need: usize },
+    /// The socket closed or reset before a frame could be taken.
+    Dead,
+}
+
+impl fmt::Display for SetupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ForeignHandle => f.write_str("the stream is not on the handle's Net"),
+            Self::RoomTooSmall { room, need } => write!(f, "frame room {room} B, below the {need} B needed"),
+            Self::Dead => f.write_str("the socket closed before setup"),
+        }
+    }
+}
+
 /// Raw TCP: frames go out as they are. Below [`TlsTx`], or alone for a plain stream.
 pub struct SwitchTx {
     handle: NetHandle,
     tcp: TcpTx,
-    /// `frame_room` of the Stack's frames.
+    /// `frame_room` of the Stack's frames, clamped to the socket's send buffer.
     room: usize,
 }
 
 impl SwitchTx {
     /// Sends on `tcp`, in frames from `handle`, sized by the Stack's frame capacity (one frame
-    /// is taken to read it).
-    pub async fn new(handle: &NetHandle, tcp: TcpTx) -> SwitchTx {
-        let room = frame_room(handle.tx_frame().await.capacity());
-        SwitchTx { handle: handle.clone(), tcp, room }
+    /// is taken to read it) and clamped to the socket's send buffer, so every `room` request
+    /// can resolve. `min_room` is the largest frame the caller will send; a smaller room is
+    /// refused here, before any byte goes out.
+    pub async fn new(handle: &NetHandle, tcp: TcpTx, min_room: usize) -> Result<SwitchTx, SetupError> {
+        if !tcp.is_on(handle) {
+            return Err(SetupError::ForeignHandle);
+        }
+        let mut tx = SwitchTx { handle: handle.clone(), tcp, room: 0 };
+        let capacity = tx.alloc().await.map_err(|_| SetupError::Dead)?.capacity();
+        tx.room = frame_room(capacity).min(tx.tcp.send_capacity());
+        if tx.room < min_room {
+            return Err(SetupError::RoomTooSmall { room: tx.room, need: min_room });
+        }
+        Ok(tx)
     }
 }
 
@@ -64,8 +97,10 @@ impl FrameTx for SwitchTx {
     type Sealed = switchnet::TxFrame;
     type Error = SendError;
 
+    /// A frame from the Net, or `InvalidState` if the socket closes or resets first. Called
+    /// only before `shutdown`, where the connection ending is the only way `delivered` resolves.
     async fn alloc(&mut self) -> Result<switchnet::TxFrame, SendError> {
-        Ok(self.handle.tx_frame().await)
+        first(self.handle.tx_frame(), self.tcp.delivered()).await.ok_or(SendError::InvalidState)
     }
 
     async fn room(&mut self, len: usize) -> Result<(), SendError> {
@@ -105,6 +140,8 @@ pub enum Error {
     /// The handshake could not start (a bad server name) or ended in a state other than
     /// application traffic.
     Handshake(String),
+    /// The connection could not be set up; nothing was sent.
+    Setup(SetupError),
 }
 
 impl fmt::Display for Error {
@@ -114,6 +151,7 @@ impl fmt::Display for Error {
             Self::Tls(e) => write!(f, "{e}"),
             Self::Send(e) => write!(f, "send: {e}"),
             Self::Handshake(e) => write!(f, "tls handshake: {e}"),
+            Self::Setup(e) => write!(f, "setup: {e}"),
         }
     }
 }
@@ -204,14 +242,17 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
 /// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert
 /// it queued goes out, then FIN, and the error returns once the server acked them (or the
 /// connection ended): until then a failing handshake stays pending, so the caller bounds it.
+/// `min_plain` is the largest plaintext record the caller will send; a frame that cannot carry
+/// it as a record is `Setup(RoomTooSmall)` before the ClientHello.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
     config: Arc<ClientConfig>,
     host: &str,
+    min_plain: usize,
 ) -> Result<Tls, Error> {
     let (mut tcp_rx, tcp) = stream.split();
-    let mut raw = SwitchTx::new(handle, tcp).await;
+    let mut raw = SwitchTx::new(handle, tcp, min_plain + OVERHEAD).await.map_err(Error::Setup)?;
     let name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Handshake(format!("server name {host}: {e}")))?;
     let mut conn = UnbufferedClientConnection::new(config, name).map_err(|e| Error::Tls(TlsError::Tls(e)))?;
 

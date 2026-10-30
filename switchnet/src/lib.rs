@@ -575,6 +575,18 @@ impl TcpTx {
         stack.tcp_send_frame(handle, frame)
     }
 
+    /// The socket's send buffer size: the largest `room` that can ever resolve.
+    pub fn send_capacity(&self) -> usize {
+        let mut inner = self.0.shared.borrow_mut();
+        let (stack, handle) = inner.tcp(self.0.index);
+        stack.tcp(handle).send_capacity()
+    }
+
+    /// Whether this stream is on `handle`'s Net, so frames from `handle` are its own.
+    pub fn is_on(&self, handle: &NetHandle) -> bool {
+        Rc::ptr_eq(&self.0.shared, &handle.shared)
+    }
+
     /// Half-close: a FIN after the queued data. Receiving continues.
     pub fn shutdown(&mut self) {
         let mut inner = self.0.shared.borrow_mut();

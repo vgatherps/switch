@@ -226,6 +226,12 @@ fn close_code_allowed(c: u16) -> bool {
     matches!(c, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
+/// Whether we may send a close with `code` and `reason`: a code a peer may send, and a
+/// payload (2 B code + reason) within a control frame's 125 B.
+pub(crate) fn close_sendable(code: u16, reason: &str) -> bool {
+    close_code_allowed(code) && reason.len() <= 123
+}
+
 /// Make room for `additional` more bytes: at least doubling, never past `max`.
 /// The caller has checked `len + additional <= max`.
 fn grow(v: &mut Vec<u8>, additional: usize, max: usize) {

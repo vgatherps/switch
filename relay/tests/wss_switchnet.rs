@@ -125,7 +125,18 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
     client: impl FnOnce(NetHandle, TcpStream) -> F + 'static,
 ) -> T {
-    with_tap_net(&TAP, |net, clock| {
+    until_client_on(&TAP, listener_setup, serve, client)
+}
+
+/// `until_client` on `tap`'s Net and socket config.
+fn until_client_on<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
+    tap: &TapConfig,
+    listener_setup: impl FnOnce(&TcpListener),
+    serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
+    client: impl FnOnce(NetHandle, TcpStream) -> F + 'static,
+) -> T {
+    let socket = tap.socket;
+    with_tap_net(tap, |net, clock| {
         let listener = TcpListener::bind((KERNEL_ADDR, SERVER_PORT)).expect("bind the peer");
         listener_setup(&listener);
         let server = std::thread::spawn(move || {
@@ -141,7 +152,7 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
         let task = async move {
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
             let local = IpListenEndpoint { addr: None, port: 49152 };
-            let stream = handle.tcp_connect(TAP.socket, remote, local).expect("open TCP").await.expect("TCP connect");
+            let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
             *task_held.borrow_mut() = Some(client(handle, stream).await);
         };
         rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
@@ -794,3 +805,210 @@ fn plain_ws_echoes_and_closes() {
     );
     assert_eq!(echoed, 101);
 }
+
+// Setup checks (slice 2): refusals before any byte, and socket death noticed while waiting for a
+// frame.
+
+/// The peer side of a refused setup: nothing arrives within a second (the Net stops turning
+/// once the client is done, so its FIN may never leave).
+fn sees_nothing(mut sock: std::net::TcpStream) {
+    sock.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let mut rest = Vec::new();
+    let _ = sock.read_to_end(&mut rest);
+    assert_eq!(rest, b"", "bytes from a refused setup");
+}
+
+/// A TapConfig whose sockets have a `tx`-byte send buffer.
+const fn tap_with_send_buffer(tx: usize) -> TapConfig {
+    TapConfig { socket: tcp::Config { tx_capacity: tx, ..TAP.socket }, ..TAP }
+}
+
+/// A stream from one Net with the handle of another: refused as `Config(ForeignHandle)` before
+/// any byte (before the fix, frames from the other Net were refused as foreign and the request's
+/// send retried forever).
+#[zhida_test_support::pinned_test]
+fn ws_connect_with_another_nets_handle_is_refused() {
+    until_client(
+        |_| {},
+        sees_nothing,
+        |_, stream| async move {
+            const OTHER: TapConfig = TapConfig { name: "wsso", ..TAP };
+            with_tap_net(&OTHER, |other, _| {
+                // the other tap only lends a handle: take its address off so routes stay on ours
+                let status = std::process::Command::new("ip")
+                    .args(["address", "del", &format!("{KERNEL_ADDR}/24"), "dev", "cdtap_wsso"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "ip address del");
+                let handle = other.handle();
+                let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH));
+                let polled = connecting.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+                assert!(
+                    matches!(polled, std::task::Poll::Ready(Err(WssError::Config(relay::switchnet::SetupError::ForeignHandle)))),
+                    "{:?}",
+                    polled.map(|r| r.map(drop))
+                );
+            });
+        },
+    );
+}
+
+/// A send buffer below the largest control frame (131 B as a client) is refused before any byte,
+/// for ws:// and for wss:// (207 B: 131 + the TLS record overhead). Before the fix the first send
+/// asked for a frame room's worth (1460 B) and hit switchnet's capacity assert.
+#[zhida_test_support::pinned_test]
+fn send_buffer_below_the_largest_control_frame_is_refused() {
+    for (tls, tx, need) in [(false, 130, 131), (true, 206, 207)] {
+        let (_, client_tls) = tls_configs();
+        let tap = tap_with_send_buffer(tx);
+        until_client_on(&tap, |_| {}, sees_nothing, move |handle, stream| async move {
+            let got = if tls {
+                connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.map(drop)
+            } else {
+                connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.map(drop)
+            };
+            let want = relay::switchnet::SetupError::RoomTooSmall { room: tx, need };
+            assert!(matches!(got, Err(WssError::Config(e)) if e == want), "tls {tls}: {got:?}");
+        });
+    }
+}
+
+/// At exactly the largest control frame (131 B send buffer) the connection works: the upgrade
+/// goes out in pieces, a 125 B ping is answered with its pong, and our close with a 123 B reason
+/// goes out whole and is echoed.
+#[zhida_test_support::pinned_test]
+fn largest_control_frames_fit_a_131_byte_send_buffer() {
+    let reason = "r".repeat(123);
+    let want_close = close_payload(1000, &reason);
+    let ping = vec![7u8; 125];
+    let (pong, close) = until_client_on(
+        &tap_with_send_buffer(131),
+        |_| {},
+        {
+            let ping = ping.clone();
+            move |sock| {
+                let mut sock = tungstenite::accept(sock).expect("server WebSocket handshake").into_inner();
+                sock.write_all(&[&[0x80 | PING, 125][..], &ping].concat()).unwrap();
+                let pong = read_frame(&mut sock);
+                let close = read_frame(&mut sock);
+                sock.write_all(&[&[0x80 | CLOSE, 125][..], &close.1].concat()).unwrap();
+                assert_fin(&mut sock);
+                (pong, close)
+            }
+        },
+        move |handle, stream| async move {
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            // the ping is answered inside recv, which then waits for a message: bound it
+            assert!(within_rounds(2000, ws.recv()).await.is_none(), "a message besides the ping");
+            ws.close(1000, &reason).await.expect("close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert_eq!(pong, (0x80 | 0xa, ping));
+    assert_eq!(close, (0x80 | CLOSE, want_close));
+}
+
+/// Every frame of the Net taken, so a frame wait cannot end by a frame returning.
+async fn take_every_frame(handle: &NetHandle) -> Vec<switchnet::TxFrame> {
+    let mut held = Vec::new();
+    while let Some(frame) = within_rounds(1, handle.tx_frame()).await {
+        held.push(frame);
+    }
+    assert!(!held.is_empty());
+    held
+}
+
+/// The peer resets (SO_LINGER 0, then close) once told to.
+fn reset_when_told(go: mpsc::Receiver<()>) -> impl FnOnce(std::net::TcpStream) + Send + 'static {
+    move |sock| {
+        go.recv_timeout(LIMIT).expect("the client's go");
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        // SAFETY: a valid socket and a linger option of the right size.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                (&linger as *const libc::linger).cast(),
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "set SO_LINGER");
+        drop(sock);
+    }
+}
+
+/// With the frame pool empty, connect_ws waits for its first frame; the peer resets, and the
+/// wait ends with `Failed(Dead)` (before the fix it waited for a frame forever). With a frame
+/// available, setup on a socket about to die may succeed: the death is reported by the first
+/// later operation.
+#[zhida_test_support::pinned_test]
+fn reset_while_setup_waits_for_a_frame_is_dead() {
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let held = take_every_frame(&handle).await;
+        let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH));
+        assert!(within_rounds(50, connecting.as_mut()).await.is_none(), "setup without a frame");
+        go_tx.send(()).unwrap();
+        let got = within_rounds(20_000, connecting).await.expect("setup still waiting after the reset");
+        assert!(matches!(got, Err(WssError::Failed(relay::switchnet::Failure::Dead))), "{:?}", got.map(drop));
+        drop(held);
+    });
+}
+
+/// An open connection whose send waits for a frame (the pool empty) when the peer resets: the
+/// send fails instead of waiting forever (before the fix it never returned).
+#[zhida_test_support::pinned_test]
+fn reset_while_send_waits_for_a_frame_fails_the_send() {
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(
+        |_| {},
+        move |sock| {
+            let ws = tungstenite::accept(sock).expect("server WebSocket handshake");
+            reset_when_told(go_rx)(ws.into_inner())
+        },
+        move |handle, stream| async move {
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let held = take_every_frame(&handle).await;
+            {
+                let mut sending = std::pin::pin!(ws.send(Kind::Text, b"stuck"));
+                assert!(within_rounds(50, sending.as_mut()).await.is_none(), "sent without a frame");
+                go_tx.send(()).unwrap();
+                let got = within_rounds(20_000, sending).await.expect("send still waiting after the reset");
+                assert!(got.is_err(), "send after a reset");
+            }
+            drop(held);
+            ws
+        },
+    );
+}
+
+/// A Text message that is not UTF-8 and an unsendable close are refused with nothing sent; the
+/// connection stays usable. Before the fix the invalid text went out and the 124 B reason
+/// panicked.
+#[zhida_test_support::pinned_test]
+fn invalid_text_and_close_are_refused_before_anything_is_sent() {
+    let frames = ws_until_client(
+        |_| {},
+        |mut sock| {
+            let text = read_frame(&mut sock);
+            let close = read_frame(&mut sock);
+            sock.write_all(&server_frame(CLOSE, &close.1)).unwrap();
+            assert_fin(&mut sock);
+            (text, close)
+        },
+        |mut ws| async move {
+            assert!(matches!(ws.send(Kind::Text, &[b'o', 0xff]).await, Err(WssError::InvalidText)));
+            assert!(matches!(ws.close(1000, &"r".repeat(124)).await, Err(WssError::InvalidClose)));
+            assert!(matches!(ws.close(1005, "").await, Err(WssError::InvalidClose)));
+            ws.send(Kind::Text, b"ok").await.expect("send");
+            ws.close(1000, "").await.expect("close");
+            assert!(ws.recv().await.expect("recv after close").is_none());
+            ws
+        },
+    );
+    assert_eq!(frames.0, (0x80 | TEXT, b"ok".to_vec()));
+    assert_eq!(frames.1, (0x80 | CLOSE, close_payload(1000, "")));
+}
+

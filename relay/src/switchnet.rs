@@ -8,14 +8,15 @@ use std::fmt;
 use std::sync::Arc;
 
 use rustls::ClientConfig;
+pub use sheath::switchnet::SetupError;
 use sheath::switchnet::{SwitchTx, send_bytes, tls_connect};
 use sheath::{FrameTx, TlsRx, TlsTx, TxError as TlsTxError};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
-use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx};
-use crate::tx::{TxError, WsTx};
+use crate::rx::{Config, Kind, Message, ProtocolError, Role, WsError, WsRx, close_sendable};
+use crate::tx::{TxError, WsTx, max_control_frame};
 use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
@@ -49,6 +50,22 @@ pub enum Error {
     Upgrade(UpgradeError),
     /// A send after close.
     Closed,
+    /// The connection could not be set up (a handle from another Net, or a frame room below
+    /// the largest control frame); nothing was sent.
+    Config(SetupError),
+    /// The connection failed.
+    Failed(Failure),
+    /// A Text message that is not UTF-8; nothing was sent.
+    InvalidText,
+    /// A close code we may not send, or a reason over 123 B; nothing was sent.
+    InvalidClose,
+}
+
+/// Why a connection failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The socket closed or reset.
+    Dead,
 }
 
 impl fmt::Display for Error {
@@ -61,6 +78,10 @@ impl fmt::Display for Error {
             Self::Protocol(e) => write!(f, "websocket protocol: {e:?}"),
             Self::Upgrade(e) => write!(f, "websocket upgrade: {e}"),
             Self::Closed => f.write_str("websocket closed for sending"),
+            Self::Config(e) => write!(f, "setup: {e}"),
+            Self::Failed(Failure::Dead) => f.write_str("connection closed or reset"),
+            Self::InvalidText => f.write_str("text message is not UTF-8"),
+            Self::InvalidClose => f.write_str("close code not sendable or reason over 123 B"),
         }
     }
 }
@@ -74,6 +95,17 @@ impl From<sheath::switchnet::Error> for Error {
             sheath::switchnet::Error::Tls(e) => Self::Tls(e),
             sheath::switchnet::Error::Send(e) => Self::Send(e),
             sheath::switchnet::Error::Handshake(e) => Self::Handshake(e),
+            sheath::switchnet::Error::Setup(e) => e.into(),
+        }
+    }
+}
+
+/// A socket that died before setup is the same failure as one that dies later.
+impl From<SetupError> for Error {
+    fn from(e: SetupError) -> Self {
+        match e {
+            SetupError::Dead => Self::Failed(Failure::Dead),
+            e => Self::Config(e),
         }
     }
 }
@@ -112,7 +144,7 @@ pub async fn connect(
     port: u16,
     path: &str,
 ) -> Result<Wss, Error> {
-    let mut tls = tls_connect(handle, stream, config, host).await?;
+    let mut tls = tls_connect(handle, stream, config, host, max_control_frame(Role::Client)).await?;
     let (request, key) = upgrade::request(host, port, 443, path, rand::random());
     send_bytes(&mut tls.tx, request.as_bytes()).await?;
     let mut head = Vec::new();
@@ -133,7 +165,7 @@ pub async fn connect(
 /// The ws:// upgrade for `path` on `stream`, connected to `host`'s `port`.
 pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port: u16, path: &str) -> Result<Ws, Error> {
     let (mut tcp, tcp_tx) = stream.split();
-    let mut tx = SwitchTx::new(handle, tcp_tx).await;
+    let mut tx = SwitchTx::new(handle, tcp_tx, max_control_frame(Role::Client)).await?;
     let (request, key) = upgrade::request(host, port, 80, path, rand::random());
     send_bytes(&mut tx, request.as_bytes()).await?;
     let mut rx = Raw::new();
@@ -147,7 +179,7 @@ pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port:
 /// WebSocket upgrade is `Error::Upgrade`, with nothing sent.
 pub async fn accept_ws(handle: &NetHandle, stream: TcpStream) -> Result<Ws, Error> {
     let (mut tcp, tcp_tx) = stream.split();
-    let mut tx = SwitchTx::new(handle, tcp_tx).await;
+    let mut tx = SwitchTx::new(handle, tcp_tx, max_control_frame(Role::Server)).await?;
     let mut rx = Raw::new();
     let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
     let response = upgrade::accept(&head).map_err(Error::Upgrade)?;
@@ -312,6 +344,9 @@ where
     }
 
     async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
+        if kind == Kind::Text && core::str::from_utf8(payload).is_err() {
+            return Err(Error::InvalidText);
+        }
         self.tx.send(kind, payload).await.map_err(|e| match e {
             TxError::Closed => Error::Closed,
             TxError::Lower(e) => e.into(),
@@ -319,6 +354,9 @@ where
     }
 
     async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
+        if !close_sendable(code, reason) {
+            return Err(Error::InvalidClose);
+        }
         let mut payload = code.to_be_bytes().to_vec();
         payload.extend_from_slice(reason.as_bytes());
         self.tx.close(&payload);

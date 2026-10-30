@@ -127,7 +127,7 @@ fn rejected_handshake_sends_the_alert_before_the_rst() {
             read_alert(&mut conn, &mut stream)
         },
         |handle, stream, config| async move {
-            match tls_connect(&handle, stream, config, HOST).await {
+            match tls_connect(&handle, stream, config, HOST, 1).await {
                 Err(TlsError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 Err(e) => panic!("unexpected error {e}"),
                 Ok(_) => panic!("the corrupted Finished record was accepted"),
@@ -159,7 +159,7 @@ fn receive_error_after_the_handshake_sends_the_alert_before_the_rst() {
             read_alert(&mut conn, &mut stream)
         },
         |handle, stream, config| async move {
-            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
+            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST, 1).await.expect("handshake");
             match tls.ready().await {
                 Err(TlsError::Tls(sheath::Error::Tls(rustls::Error::DecryptError))) => {}
                 other => panic!("unexpected {other:?}"),
@@ -354,7 +354,7 @@ fn receive_error_returns_once_the_alert_and_fin_are_delivered() {
             read_to_end(&mut conn, &mut stream)
         },
         move |handle, _, stream, config| async move {
-            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
+            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST, 1).await.expect("handshake");
             send_bytes(&mut tls.tx, &[7; BULK]).await.expect("queue the bulk");
             failing.store(true, Ordering::Release);
             match tls.ready().await {
@@ -380,7 +380,7 @@ fn close_returns_once_close_notify_and_fin_are_delivered() {
             read_to_end(&mut conn, &mut stream)
         },
         move |handle, _, stream, config| async move {
-            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
+            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST, 1).await.expect("handshake");
             send_bytes(&mut tls.tx, &[7; BULK]).await.expect("queue the bulk");
             closing.store(true, Ordering::Release);
             tls.close().await.expect("close");
@@ -406,7 +406,7 @@ fn receive_error_waits_for_a_server_that_never_reads_until_the_caller_gives_up()
             wait_for(&server_done);
         },
         move |handle, spawner, stream, config| async move {
-            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST).await.expect("handshake");
+            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST, 1).await.expect("handshake");
             send_bytes(&mut tls.tx, &[7; BULK]).await.expect("queue the bulk");
             if let Some(out) = within(&spawner, 500, tls.ready()).await {
                 panic!("returned before the server acked the alert: {out:?}");

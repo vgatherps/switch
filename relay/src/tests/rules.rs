@@ -352,3 +352,26 @@ fn consumed_frames_are_dropped_before_recv_asks_for_more() {
     assert!(r.recv(&mut ()).unwrap().is_none());
     assert_eq!(drops.get(), 3);
 }
+
+/// What we may send in a close: the codes a peer may send, and a reason up to 123 B.
+#[test]
+fn close_sendable_checks_code_and_reason_length() {
+    use crate::rx::close_sendable;
+    let reason = |n| "r".repeat(n);
+    assert!(close_sendable(1000, &reason(123)));
+    assert!(!close_sendable(1000, &reason(124)));
+    for code in [1000, 1003, 1007, 1014, 3000, 4999] {
+        assert!(close_sendable(code, ""), "{code}");
+    }
+    for code in [0, 999, 1004, 1005, 1006, 1015, 2999, 5000] {
+        assert!(!close_sendable(code, ""), "{code}");
+    }
+}
+
+/// The largest control frame: 125 B payload, a 2 B header, and the mask as a client.
+#[test]
+fn max_control_frame_by_role() {
+    use crate::tx::max_control_frame;
+    assert_eq!((max_control_frame(Role::Client), max_control_frame(Role::Server)), (131, 127));
+}
+

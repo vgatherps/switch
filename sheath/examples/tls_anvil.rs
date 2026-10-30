@@ -125,7 +125,7 @@ async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfi
         Ok(stream) => stream,
         Err(e) => return format!("TCP connect: {e:?}"),
     };
-    let mut tls = match tls_connect(handle, stream, config, HOST).await {
+    let mut tls = match tls_connect(handle, stream, config, HOST, 1).await {
         Ok(tls) => tls,
         Err(e) => return format!("handshake: {e}"),
     };

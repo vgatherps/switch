@@ -36,6 +36,12 @@ fn header_len(len: usize, masked: bool) -> usize {
     2 + ext + if masked { 4 } else { 0 }
 }
 
+/// Bytes of the largest control frame `role` sends: 125 B of payload and its header (masked as
+/// a client). Every frame room must carry it.
+pub(crate) fn max_control_frame(role: Role) -> usize {
+    header_len(125, role == Role::Client) + 125
+}
+
 /// `h` is exactly `header_len(len, mask.is_some())` bytes.
 fn write_header(h: &mut [u8], b0: u8, len: usize, mask: Option<[u8; 4]>) {
     let m = if mask.is_some() { 0x80 } else { 0 };

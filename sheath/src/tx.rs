@@ -14,7 +14,7 @@ const KEY_UPDATE_LEN: usize = RECORD_HEAD + 4 + 1 + RECORD_TAIL;
 /// peer's request, and its own update at the cipher suite's confidentiality limit.
 const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
-const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
+pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
 
 /// A frame holding records that used sequence numbers. Only [`TlsTx`] makes one, and only
 /// [`TlsTx::try_send`](FrameTx::try_send) takes one, so a frame that was not sealed cannot be
