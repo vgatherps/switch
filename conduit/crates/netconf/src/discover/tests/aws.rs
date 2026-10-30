@@ -565,6 +565,30 @@ fn aws_required_items_and_address_selection() {
     );
 }
 
+/// An unnumbered interface (no kernel IPv4): `--ipv4` selects from IMDS local-ipv4s; an address
+/// not in that list is an error, not the first IMDS address.
+#[test]
+fn aws_unnumbered_interface_honours_ipv4_selection() {
+    let tree = Tree::new();
+    let select = |ipv4: &str| {
+        let server = ordinary((200, "1.2.3.4"));
+        discover_aws(&tree.roots, "eth1", &[], Some(ipv4.parse().unwrap()), &server.imds)
+    };
+    assert_eq!(
+        select("10.0.1.24").unwrap().config.ipv4,
+        "10.0.1.24/24".parse().unwrap()
+    );
+    assert_eq!(
+        select("10.0.1.99").err().unwrap().to_string(),
+        "10.0.1.99 is not in IMDS local-ipv4s (10.0.1.23, 10.0.1.24)"
+    );
+    let server = ordinary((200, "1.2.3.4"));
+    assert_eq!(
+        aws(&tree, &server, &[]).unwrap().config.ipv4,
+        "10.0.1.23/24".parse().unwrap()
+    );
+}
+
 const MAC: &str = "0a:12:34:56:78:9a";
 fn with_prefixes(prefixes: (u16, &str)) -> Server {
     metadata_with_prefixes(
