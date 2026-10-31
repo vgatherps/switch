@@ -1,11 +1,10 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP.
 
-use alloc::vec::Vec;
 use core::cell::Cell;
 
 use crate::time::{Duration, Instant};
-use crate::wire::{HardwareAddress, IpAddress};
+use crate::wire::{HardwareAddress, IpAddress, Ipv4Address};
 
 /// A cached neighbor.
 ///
@@ -65,9 +64,9 @@ impl Entry {
 /// the lowest address goes.
 #[derive(Debug)]
 pub struct Cache {
-    /// Entries in no order, allocated for `capacity` at construction. A Stack talks to its
-    /// gateway and a few on-link peers, so a scan beats hashing.
-    storage: Vec<(IpAddress, Entry)>,
+    /// Entries by IPv4 address as an integer (`key`). Sized like `SlotMap` (iface/mod.rs), for
+    /// twice `capacity`, so the remove and insert of an eviction never force it to grow.
+    storage: std::collections::HashMap<u32, Entry, rustc_hash::FxBuildHasher>,
     capacity: usize,
     changes: u64,
     next_expiry: Option<Instant>,
@@ -94,27 +93,23 @@ impl Cache {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "Neighbor capacity must be nonzero.");
         Self {
-            storage: Vec::with_capacity(capacity),
+            storage: std::collections::HashMap::with_capacity_and_hasher(
+                capacity.checked_mul(2).expect("neighbor capacity overflow"),
+                rustc_hash::FxBuildHasher,
+            ),
             capacity,
             changes: 0,
             next_expiry: None,
         }
     }
 
-    fn find(&self, address: &IpAddress) -> Option<usize> {
-        self.storage.iter().position(|(stored, _)| stored == address)
-    }
-
-    fn remove(&mut self, index: usize) -> (IpAddress, Entry) {
-        self.storage.swap_remove(index)
-    }
-
-    fn earliest(&self) -> usize {
-        self.storage
+    /// The entry that expires first; among those, the lowest address (an integer key orders like
+    /// the address). Scans the whole cache, so only a full cache calls it.
+    fn earliest(&self) -> u32 {
+        *self
+            .storage
             .iter()
-            .enumerate()
-            .map(|(index, (address, entry))| (index, entry.expires_at(), *address))
-            .min_by_key(|(_, expires_at, address)| (*expires_at, *address))
+            .min_by_key(|&(key, entry)| (entry.expires_at(), *key))
             .expect("empty neighbor cache storage")
             .0
     }
@@ -122,17 +117,18 @@ impl Cache {
     fn pending_eviction_is_silent(&self, timestamp: Instant) -> bool {
         self.storage.len() == self.capacity
             && matches!(
-                self.storage[self.earliest()].1,
+                self.storage[&self.earliest()],
                 Entry::Pending { silent_until } if timestamp < silent_until
             )
     }
 
-    fn evict_earliest(&mut self) -> (IpAddress, Entry) {
-        let removed = self.remove(self.earliest());
-        if matches!(removed.1, Entry::Resolved(_)) {
+    fn evict_earliest(&mut self) -> (Ipv4Address, Entry) {
+        let key = self.earliest();
+        let removed = self.storage.remove(&key).expect("earliest neighbor is missing");
+        if matches!(removed, Entry::Resolved(_)) {
             self.bump();
         }
-        removed
+        (Ipv4Address::from(key), removed)
     }
 
     #[inline(always)]
@@ -142,9 +138,7 @@ impl Cache {
         source_hardware_addr: HardwareAddress,
         timestamp: Instant,
     ) {
-        if let Some(index) = self.find(&protocol_addr)
-            && let Entry::Resolved(neighbor) = &mut self.storage[index].1
-        {
+        if let Some(Entry::Resolved(neighbor)) = self.storage.get_mut(&key(&protocol_addr)) {
             if source_hardware_addr == neighbor.hardware_addr {
                 let expired = timestamp >= neighbor.expires_at;
                 neighbor.expires_at = timestamp + Self::ENTRY_LIFETIME;
@@ -168,9 +162,9 @@ impl Cache {
         hardware_addr: HardwareAddress,
         timestamp: Instant,
     ) {
-        if let Some(index) = self.find(&protocol_addr) {
+        if let Some(entry) = self.storage.get(&key(&protocol_addr)) {
             if matches!(
-                &self.storage[index].1,
+                entry,
                 Entry::Resolved(neighbor) if neighbor.hardware_addr == hardware_addr
             ) {
                 return;
@@ -192,12 +186,12 @@ impl Cache {
         debug_assert!(hardware_addr.is_unicast());
 
         let expires_at = timestamp + Self::ENTRY_LIFETIME;
-        if let Some(index) = self.find(&protocol_addr)
-            && let Entry::Resolved(neighbor) = &self.storage[index].1
+        if let Some(entry) = self.storage.get_mut(&key(&protocol_addr))
+            && let Entry::Resolved(neighbor) = entry
             && neighbor.hardware_addr == hardware_addr
             && timestamp < neighbor.expires_at
         {
-            self.storage[index].1 = Entry::Resolved(Neighbor {
+            *entry = Entry::Resolved(Neighbor {
                 silent_until: expires_at,
                 stale_until: Cell::new(None),
                 expires_at,
@@ -234,9 +228,10 @@ impl Cache {
             expires_at,
             hardware_addr,
         });
-        match self.find(&protocol_addr) {
-            Some(index) => {
-                let old_neighbor = core::mem::replace(&mut self.storage[index].1, neighbor);
+        let key = key(&protocol_addr);
+        match self.storage.get_mut(&key) {
+            Some(entry) => {
+                let old_neighbor = core::mem::replace(entry, neighbor);
                 if let Entry::Resolved(old_neighbor) = old_neighbor
                     && old_neighbor.hardware_addr != hardware_addr
                 {
@@ -263,14 +258,14 @@ impl Cache {
         } else {
             net_trace!("filled {} => {} (was empty)", protocol_addr, hardware_addr);
         }
-        self.storage.push((protocol_addr, neighbor));
+        self.storage.insert(key, neighbor);
     }
 
     pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
         assert!(protocol_addr.is_unicast());
 
-        if let Some(index) = self.find(protocol_addr) {
-            match &self.storage[index].1 {
+        if let Some(entry) = self.storage.get(&key(protocol_addr)) {
+            match entry {
                 Entry::Resolved(neighbor) => {
                     if timestamp < neighbor.expires_at {
                         return Answer::Found(neighbor.hardware_addr);
@@ -317,13 +312,14 @@ impl Cache {
                 .checked_add(Self::SILENT_TIME.total_micros() as i64)
                 .expect("neighbor silence overflow"),
         );
-        match self.find(&protocol_addr) {
-            Some(index) => {
-                if let Entry::Resolved(neighbor) = &mut self.storage[index].1 {
+        let key = key(&protocol_addr);
+        match self.storage.get_mut(&key) {
+            Some(entry) => {
+                if let Entry::Resolved(neighbor) = entry {
                     neighbor.silent_until = silent_until;
                     return;
                 }
-                self.storage[index].1 = Entry::Pending { silent_until };
+                *entry = Entry::Pending { silent_until };
             }
             None => {
                 if self.pending_eviction_is_silent(timestamp) {
@@ -332,7 +328,7 @@ impl Cache {
                 if self.storage.len() == self.capacity {
                     self.evict_earliest();
                 }
-                self.storage.push((protocol_addr, Entry::Pending { silent_until }));
+                self.storage.insert(key, Entry::Pending { silent_until });
             }
         }
     }
@@ -365,7 +361,7 @@ impl Cache {
         }
         let mut expired = false;
         let mut next_expiry: Option<Instant> = None;
-        for (_, entry) in &self.storage {
+        for entry in self.storage.values() {
             let Entry::Resolved(neighbor) = entry else {
                 continue;
             };
@@ -382,6 +378,13 @@ impl Cache {
         }
         self.next_expiry = next_expiry;
     }
+}
+
+/// `addr` as the cache's map key.
+#[inline]
+fn key(addr: &IpAddress) -> u32 {
+    let IpAddress::Ipv4(addr) = addr;
+    u32::from(*addr)
 }
 
 #[cfg(test)]
@@ -427,8 +430,7 @@ mod test {
             Answer::Found(HADDR_B)
         );
         assert_eq!(cache.changes(), changes + 1);
-        let index = cache.find(&MOCK_IP_ADDR_1.into()).unwrap();
-        let Entry::Resolved(neighbor) = &cache.storage[index].1 else {
+        let Entry::Resolved(neighbor) = &cache.storage[&key(&MOCK_IP_ADDR_1.into())] else {
             panic!("neighbor remains pending");
         };
         assert_eq!(neighbor.expires_at, now + Cache::ENTRY_LIFETIME);
@@ -469,8 +471,7 @@ mod test {
         );
         {
             assert_eq!(cache.changes(), changes);
-            let index = cache.find(&MOCK_IP_ADDR_1.into()).unwrap();
-            let Entry::Resolved(neighbor) = &cache.storage[index].1 else {
+            let Entry::Resolved(neighbor) = &cache.storage[&key(&MOCK_IP_ADDR_1.into())] else {
                 panic!("resolved neighbor became pending");
             };
             assert_eq!(neighbor.expires_at, Instant::ZERO + Cache::ENTRY_LIFETIME);
@@ -936,7 +937,7 @@ mod test {
             let changes = cache.changes();
             cache.limit_rate(address(2), Instant::from_millis(2));
             assert_eq!(cache.changes(), changes + 1);
-            assert!(cache.find(&address(1)).is_none());
+            assert!(!cache.storage.contains_key(&key(&address(1))));
             assert_eq!(
                 cache.lookup(&address(2), Instant::from_millis(2)),
                 Answer::RateLimited
@@ -996,14 +997,14 @@ mod test {
                 assert_eq!(cache.lookup(&address(2), now), Answer::RateLimited);
                 cache.limit_rate(address(2), now);
                 assert_eq!(cache.lookup(&address(1), now), Answer::RateLimited);
-                assert!(cache.find(&address(2)).is_none());
+                assert!(!cache.storage.contains_key(&key(&address(2))));
                 assert_eq!(cache.storage.len(), 1);
                 assert_eq!(cache.changes(), 0);
             }
             let now = Instant::from_millis(1_000);
             assert_eq!(cache.lookup(&address(2), now), Answer::NotFound);
             cache.limit_rate(address(2), now);
-            assert!(cache.find(&address(1)).is_none());
+            assert!(!cache.storage.contains_key(&key(&address(1))));
             assert_eq!(cache.lookup(&address(2), now), Answer::RateLimited);
             assert_eq!(cache.storage.len(), 1);
             assert_eq!(cache.changes(), 0);
@@ -1204,10 +1205,9 @@ mod test {
             for last in 1..=3 {
                 cache.fill(address(last), HADDR_A, Instant::ZERO);
             }
-            let index = cache.find(&address(1)).unwrap();
             cache.fill(address(1), HADDR_D, Instant::from_millis(1_000));
 
-            assert_eq!(cache.find(&address(1)), Some(index));
+            assert!(cache.storage.contains_key(&key(&address(1))));
             assert_eq!(cache.storage.len(), 3);
             assert_eq!(
                 cache.lookup(&address(1), Instant::ZERO),
@@ -1303,8 +1303,7 @@ mod test {
             assert_eq!(cache.storage.len(), 1);
         }
 
-        /// Eviction swap-removes the earliest entry, moving the last one into its place; every
-        /// remaining address is still found.
+        /// Eviction removes the earliest entry; every remaining address is still found.
         #[test]
         fn eviction_keeps_remaining_entries_findable() {
             let mut cache = Cache::new(3);
