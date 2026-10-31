@@ -38,6 +38,15 @@ fn open(eal: &crate::Eal, rx_staging: usize, tx_pending: usize) -> (Fixture, Dev
     (fixture, Device::new(port, rx_staging, tx_pending))
 }
 
+/// The fixture's config with its RX pool at `rx_reserve` for a Stack staging `rx_staging`,
+/// the smallest RX pool `Stack::new` accepts.
+fn stack_port_config(fixture: &Fixture, rx_staging: usize) -> crate::port::PortConfig<'static> {
+    let mut config = fixture.config();
+    let reserve = crate::rx_reserve(config.rx_descriptors, config.rx_burst, rx_staging, config.rx_pool.cache_size);
+    config.rx_pool.count = u32::try_from(reserve).unwrap();
+    config
+}
+
 /// Peer drains the TX ring; every buffer must be back before close. Every
 /// frame-pool object then allocates once and only once, so a double free
 /// (an object queued twice) fails here.
@@ -1558,7 +1567,7 @@ fn udp_datagram_reports_hardware_stamp() {
         let fixture = Fixture::new();
         // SAFETY: the fixture owns this newly created ethdev and its rings on
         // the EAL owner thread; Port::open preserves the production pool contract.
-        let mut port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
+        let mut port = unsafe { Port::open(eal, stack_port_config(&fixture, 8)) }.unwrap();
         enable_rx_timestamp(&mut port);
         let field = port.rx_timestamp_field().unwrap();
         let stamps = [0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210];
@@ -1634,7 +1643,9 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u
     use smoltcp::socket::tcp::State;
     use smoltcp::wire::{ArpOperation, Ipv4Cidr};
 
-    let (fixture, mut device) = open(eal, 8, 8);
+    let fixture = Fixture::new();
+    let port = unsafe { Port::open(eal, stack_port_config(&fixture, 8)) }.unwrap();
+    let mut device = Device::new(port, 8, 8);
     enable_rx_timestamp(&mut device.port);
     let field = device.port.rx_timestamp_field().unwrap();
     let stamps = [0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210];
@@ -1756,7 +1767,9 @@ fn owned_address_stack(
     use crate::{Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY};
     use smoltcp::wire::{ArpOperation, Ipv4Cidr};
 
-    let (fixture, device) = open(eal, 4, 4);
+    let fixture = Fixture::new();
+    let port = unsafe { Port::open(eal, stack_port_config(&fixture, 8)) }.unwrap();
+    let device = Device::new(port, 4, 4);
     let arp = zhida_test_kit::ring_port::arp(
         ArpOperation::Reply,
         Side::A.mac(),
@@ -2319,7 +2332,7 @@ fn interface_answers_arp_request_through_paired_token_exact_bytes() {
 fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
-        let mut port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
+        let mut port = unsafe { Port::open(eal, stack_port_config(&fixture, 4)) }.unwrap();
         enable_rx_checksum(&mut port);
         let syn = checksum_syn();
         let raw = rx_frame_bytes(&port, &syn);

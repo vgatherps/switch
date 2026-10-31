@@ -93,7 +93,7 @@ fn tcp_frames_1mib_byte_exact() {
             let stack = configs[side.index()];
             let full = pair::windows(port.mtu, [BUFFER]);
             port.rx_pool.count = pair::pool_count(
-                rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
+                rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size),
                 full,
             );
             port.frame_pool.count =

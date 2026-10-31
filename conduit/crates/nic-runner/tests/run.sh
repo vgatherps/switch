@@ -91,7 +91,7 @@ write_config() {
   "descriptors": 1024,
   "eal": {
     "file_prefix": "$prefix",
-    "extra": ["--no-huge", "-m", "128", "--no-shconf"]
+    "extra": ["--no-huge", "-m", "256", "--no-shconf"]
   }
 }
 EOF

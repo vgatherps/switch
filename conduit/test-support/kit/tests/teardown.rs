@@ -82,7 +82,7 @@ fn ring_port_unwind_frees_queued_frames_and_releases_rings_and_vdev() {
             let mut port = fixture.config();
             let stack = config(Side::A);
             port.rx_pool.count = pool_count(
-                rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size),
+                rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size),
                 0,
             );
             let _stack = match Stack::new(fixture.open_with(eal, port), stack, T0) {

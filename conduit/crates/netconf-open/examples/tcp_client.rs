@@ -52,13 +52,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("server has no IPv4 address".into());
     };
 
-    // One socket: room for its full window each way, with the path MSS cap.
+    // One socket: room for its full send window, with the path MSS cap.
     let socket = tcp::Config {
         rx_capacity: BUFFER, tx_capacity: BUFFER,
         mss_cap: Some(config.path_mtu(*server.ip()) - 40),
     };
     let sizing = Sizing {
-        rx_share: tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)),
         frame_share: tcp::tx_mbuf_budget(&socket, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,

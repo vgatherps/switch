@@ -6,7 +6,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dpdk_smoltcp::{frame_reserve, rx_reserve, tx_reserve, Offloads, PortConfig};
+use dpdk_smoltcp::{frame_reserve, tx_reserve, Offloads, PortConfig};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::{
     rte_eth_dev_adjust_nb_rx_tx_desc, rte_eth_link, rte_eth_link_get_nowait, RTE_PKTMBUF_HEADROOM,
@@ -18,22 +18,22 @@ mod open;
 pub use open::{open, OpenError, OpenReport, Opened};
 
 const CACHE: u32 = 8;
+const RX_BURST: u16 = 32;
+/// RX pool mbufs: 15.4 times `rx_reserve` at 1024 RX descriptors, burst 32, staging 32 and
+/// cache 8 (2124), and 2^15 - 1 as DPDK prefers. The pool reads low below its low mark, and
+/// then TCP sockets keep no out-of-order data; this many mbufs keeps it from reading low in
+/// practice. 82 MiB of 2 MiB hugepages at MTU 1500, 306 MiB at MTU 9001.
+const RX_POOL: u32 = 32767;
 
 /// What the application needs from the Port and Stack.
 ///
-/// Every field is required. The RX pool holds the driver's working space
-/// (`rx_reserve` over the adjusted RX descriptors and `rx_staging`) plus
-/// `rx_share`. The frame pool holds `frame_reserve` over the adjusted TX
-/// descriptors and `tx_pending` plus `frame_share`. Every socket draws on the
-/// shares; none is reserved per socket.
+/// Every field is required. The RX pool holds `RX_POOL` (32767) mbufs, which all sockets
+/// share; `Stack::new` refuses it if it is below `rx_reserve` over the adjusted RX
+/// descriptors, the RX burst and `rx_staging`. The frame pool holds `frame_reserve` over
+/// the adjusted TX descriptors and `tx_pending` plus `frame_share`. Every socket draws on
+/// the shares; none is reserved per socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
-    /// RX mbufs all sockets together may hold: unread TCP data, out-of-order
-    /// segments, queued UDP datagrams and frames the application holds. Each TCP
-    /// socket holds at most `tcp::rx_mbuf_budget(&config, mtu)` and each UDP
-    /// socket `UdpConfig::rx_queue`. When it runs out, arrivals are dropped and
-    /// peers retransmit.
-    pub rx_share: usize,
     /// Frames all TCP send queues and the application (`Stack::tx_frame`) may hold
     /// at once. Each TCP socket queues at most `tcp::tx_mbuf_budget(&config, mtu)`.
     /// When it runs out, sends queue nothing until frames return.
@@ -43,7 +43,7 @@ pub struct Sizing {
     /// `StackConfig::max_udp_sockets`: UDP socket slots. Zero disables UDP.
     pub max_udp_sockets: usize,
     /// `StackConfig::rx_staging`: received packets held before processing.
-    /// Also counted in the RX pool.
+    /// Also counted in `rx_reserve`.
     pub rx_staging: usize,
     /// `StackConfig::tx_pending`: frames built but not yet accepted by the
     /// PMD. Also counted in the TX pool and the frame pool.
@@ -72,12 +72,6 @@ fn port_config(
     (rx_desc, tx_desc): (u16, u16),
     sizing: &Sizing,
 ) -> Result<PortConfig<'static>, String> {
-    let rx_count = u32::try_from(
-        rx_reserve(rx_desc, sizing.rx_staging, CACHE)
-            .checked_add(sizing.rx_share)
-            .ok_or("RX pool count exceeds u32")?,
-    )
-    .map_err(|_| "RX pool count exceeds u32")?;
     // Stack::new refuses an RX pool below rx_reserve, a TX pool below tx_reserve
     // (a NIC PMD may hold a full TX ring of sent mbufs until it reclaims them)
     // and a frame pool below frame_reserve.
@@ -106,10 +100,10 @@ fn port_config(
         mtu,
         rx_descriptors: rx_desc,
         tx_descriptors: tx_desc,
-        rx_burst: 32,
+        rx_burst: RX_BURST,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(c"nic_rx", rx_count, rx_room)?,
+        rx_pool: pool(c"nic_rx", RX_POOL, rx_room)?,
         tx_pool: pool(c"nic_tx", tx_count, tx_room)?,
         frame_pool: pool(c"nic_frame", frame_count, tx_room)?,
         offloads,
@@ -148,10 +142,10 @@ fn wait_link(port_id: u16) -> Result<Link, String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dpdk_smoltcp::rx_reserve;
 
     #[test]
     fn pools_follow_the_adjusted_descriptor_counts() {
@@ -159,7 +153,6 @@ mod tests {
             (
                 (1024, 1024),
                 Sizing {
-                    rx_share: 0,
                     frame_share: 0,
                     max_sockets: 1,
                     max_udp_sockets: 0,
@@ -171,7 +164,6 @@ mod tests {
             (
                 (127, 128),
                 Sizing {
-                    rx_share: 0,
                     frame_share: 0,
                     max_sockets: 1,
                     max_udp_sockets: 0,
@@ -183,7 +175,6 @@ mod tests {
             (
                 (4096, 4096),
                 Sizing {
-                    rx_share: 2912,
                     frame_share: 2880,
                     max_sockets: 64,
                     max_udp_sockets: 1,
@@ -198,8 +189,9 @@ mod tests {
             let held = u32::from(adjusted.1) + u32::try_from(sizing.tx_pending).unwrap();
             assert_eq!(config.tx_pool.count, held);
             assert_eq!(config.frame_pool.count, held + 1 + u32::try_from(sizing.frame_share).unwrap());
-            let reserve = rx_reserve(adjusted.0, sizing.rx_staging, CACHE);
-            assert_eq!(config.rx_pool.count, u32::try_from(reserve + sizing.rx_share).unwrap());
+            // Stack::new accepts the RX pool at every geometry.
+            let reserve = rx_reserve(adjusted.0, config.rx_burst, sizing.rx_staging, CACHE);
+            assert!(config.rx_pool.count as usize >= reserve, "RX pool below {reserve}");
         }
     }
 }

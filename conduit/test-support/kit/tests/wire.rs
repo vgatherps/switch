@@ -65,7 +65,7 @@ fn link_duplicates_each_frame_in_order_without_leak() {
 
         link.impair(|_| Verdict::Duplicate);
         let pool = receiver.rx_pool();
-        let taken: Vec<_> = (0..62).map(|_| unsafe { dpdk_raw_pktmbuf_alloc(pool) }).collect();
+        let taken: Vec<_> = (0..126).map(|_| unsafe { dpdk_raw_pktmbuf_alloc(pool) }).collect();
         assert!(taken.iter().all(|packet| !packet.is_null()));
         send(&mut sender_port, &[frame(40)]);
         assert_eq!(link.forward(), 1);
@@ -223,7 +223,7 @@ fn link_held_frame_under_ring_and_pool_pressure() {
             }
             taken.push(packet);
         }
-        assert_eq!((taken.len(), receiver.in_use()), (62, (63, 0)));
+        assert_eq!((taken.len(), receiver.in_use()), (126, (127, 0)));
         send(&mut sender_port, &[frame(12)]);
         assert_eq!(link.forward_with(|bytes| delivered.push(bytes[0])), 1);
         assert_eq!(counts(&link), (1, 1, 0, 2));
@@ -240,9 +240,9 @@ fn link_held_frame_under_ring_and_pool_pressure() {
         assert!(!link.free_held());
 
         // RX pool empty when a frame is to be held: counted, nothing held.
-        let taken: Vec<_> = (0..63).map(|_| unsafe { dpdk_raw_pktmbuf_alloc(pool) }).collect();
+        let taken: Vec<_> = (0..127).map(|_| unsafe { dpdk_raw_pktmbuf_alloc(pool) }).collect();
         assert!(taken.iter().all(|packet| !packet.is_null()));
-        assert_eq!(receiver.in_use(), (63, 0));
+        assert_eq!(receiver.in_use(), (127, 0));
         send(&mut sender_port, &[frame(21)]);
         assert_eq!(link.forward(), 1);
         assert_eq!(counts(&link), (2, 1, 0, 2));
@@ -292,7 +292,7 @@ fn link_counts_drops_without_leak() {
             }
             held.push(packet);
         }
-        assert_eq!(receiver.in_use(), (63, 0));
+        assert_eq!(receiver.in_use(), (127, 0));
         for packet in held.drain(..2) {
             unsafe { dpdk_raw_pktmbuf_free(packet) };
         }
@@ -301,7 +301,7 @@ fn link_counts_drops_without_leak() {
         assert_eq!(link.forward(), 5);
         assert_eq!((link.pool_empty, link.ring_full), (3, 10));
         assert_eq!(sender.in_use(), (0, 0));
-        assert_eq!(receiver.in_use(), (63, 0));
+        assert_eq!(receiver.in_use(), (127, 0));
         assert_eq!(receive(&mut receiver_port), sent[..2]);
         for packet in held {
             unsafe { dpdk_raw_pktmbuf_free(packet) };
@@ -338,7 +338,7 @@ fn link_inject_copies_into_destination_pool_without_leak() {
         assert_eq!(receive(&mut receiver_port), queued);
 
         let pool = receiver.rx_pool();
-        let taken: Vec<_> = (0..63)
+        let taken: Vec<_> = (0..127)
             .map(|_| unsafe { dpdk_raw_pktmbuf_alloc(pool) })
             .collect();
         assert!(taken.iter().all(|packet| !packet.is_null()));

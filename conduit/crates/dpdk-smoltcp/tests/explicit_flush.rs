@@ -34,7 +34,7 @@ fn new_pair(eal: &Eal, names: [&str; 2], pending: usize) -> Pair {
         port.mtu = MTU;
         let full = windows(port.mtu, std::iter::repeat_n(4096, configs[side.index()].max_sockets));
         let reserve =
-            rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size);
+            rx_reserve(port.rx_descriptors, port.rx_burst, configs[side.index()].rx_staging, port.rx_pool.cache_size);
         // Every window full at once, plus one UDP datagram.
         port.rx_pool.count = pool_count(reserve, full + 1);
         port.frame_pool.count =
@@ -133,6 +133,7 @@ fn template_acks_keep_exact_tx_pool_counts() {
                         windows(port.mtu, std::iter::repeat_n(4096, configs[side.index()].max_sockets));
                     let reserve = rx_reserve(
                         port.rx_descriptors,
+                        port.rx_burst,
                         configs[side.index()].rx_staging,
                         port.rx_pool.cache_size,
                     );

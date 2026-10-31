@@ -232,6 +232,7 @@ fn with_ports_rx_burst_lets_one_turn_take_more_than_eight_frames() {
             port.rx_burst = 32;
             port.rx_pool.count = u32::try_from(rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             ))

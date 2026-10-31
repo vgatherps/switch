@@ -85,7 +85,7 @@ impl Mixed {
             let rx_share = tcp * rx_window + udp * UDP_QUEUE;
             let frame_share = tcp::tx_mbuf_budget(&tcp_config(), config.mtu.into()) + 64;
             config.rx_pool.count = u32::try_from(
-                rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size)
+                rx_reserve(config.rx_descriptors, config.rx_burst, stack_config.rx_staging, config.rx_pool.cache_size)
                     + rx_share,
             )
             .unwrap();

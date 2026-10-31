@@ -55,7 +55,7 @@ fn pair_loss_reorder_mixed_sizes() {
     with_eal(|eal| {
         const CAPACITY: usize = 4096;
         let configs = [config(Side::A), config(Side::B)];
-        let pool_count = pair::pool_count(rx_reserve(16, configs[0].rx_staging, 8), pair::windows(1500, [CAPACITY]));
+        let pool_count = pair::pool_count(rx_reserve(16, 8, configs[0].rx_staging, 8), pair::windows(1500, [CAPACITY]));
         let mut pair =
             Pair::with_ports(eal, ["mixlossa", "mixlossb"], configs, T0, 16, |_, port| {
                 port.rx_pool.count = pool_count;
@@ -221,7 +221,7 @@ fn message_pair(eal: &dpdk_smoltcp::Eal, names: [&str; 2]) -> Pair {
     let configs = [config(Side::A), config(Side::B)];
     Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
         let stack = configs[side.index()];
-        port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [MESSAGE_SOCKET.rx_capacity]));
+        port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [MESSAGE_SOCKET.rx_capacity]));
         port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, stack.tx_pending), pair::windows(port.mtu, [MESSAGE_SOCKET.tx_capacity]));
     })
 }
@@ -835,7 +835,7 @@ fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
             [sized(Side::A), sized(Side::B)],
             T0,
             16,
-            pair::pool_count(rx_reserve(16, S, 8), pair::windows(1500, [BULK])),
+            pair::pool_count(rx_reserve(16, 8, S, 8), pair::windows(1500, [BULK])),
             tx_reserve(16, Q) as u32,
             pair::pool_count(frame_reserve(16, Q), pair::windows(1500, [BULK])),
         );
@@ -895,7 +895,7 @@ fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
             [sized(Side::A), sized(Side::B)],
             T0,
             8,
-            pair::pool_count(rx_reserve(16, S, 8), pair::windows(1500, [BULK])),
+            pair::pool_count(rx_reserve(16, 8, S, 8), pair::windows(1500, [BULK])),
             tx_reserve(16, Q) as u32,
             pair::pool_count(frame_reserve(8, Q), pair::windows(1500, [BULK])),
         );
@@ -1000,7 +1000,7 @@ fn admission_refuses_tx_pools_for_full_ring() {
             let fixture = RingPort::new("admittx", 16, 16);
             let mut port_config = fixture.config();
             port_config.rx_pool.count =
-                pair::pool_count(rx_reserve(16, q1.rx_staging, 8), pair::windows(1500, [4096]));
+                pair::pool_count(rx_reserve(16, 8, q1.rx_staging, 8), pair::windows(1500, [4096]));
             port_config.tx_pool.count = count;
             let port = fixture.open_with(eal, port_config);
             assert_eq!(port.descriptor_counts().1, 16);
@@ -1041,7 +1041,7 @@ fn admission_full_tx_ring_still_answers() {
             |side, port| {
                 assert_eq!(port.tx_descriptors, 16);
                 assert_eq!(port.tx_pool.cache_size, 8);
-                port.rx_pool.count = pair::pool_count(rx_reserve(16, q1(side).rx_staging, 8), pair::windows(1500, [MESSAGE_SOCKET.rx_capacity]));
+                port.rx_pool.count = pair::pool_count(rx_reserve(16, 8, q1(side).rx_staging, 8), pair::windows(1500, [MESSAGE_SOCKET.rx_capacity]));
                 port.tx_pool.count = count;
                 port.frame_pool.count = pair::pool_count(frame_reserve(16, q1(side).tx_pending), pair::windows(1500, [MESSAGE_SOCKET.tx_capacity]));
             },
@@ -1469,6 +1469,7 @@ fn cubic_send_allowance_trace_with_sequence_pinned_losses() {
             Pair::with_ports(eal, ["cubicta", "cubictb"], configs, T0, 64, |side, port| {
                 port.rx_pool.count = pair::pool_count(rx_reserve(
                     port.rx_descriptors,
+                    port.rx_burst,
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 ), pair::windows(port.mtu, [65536]));
@@ -1612,7 +1613,7 @@ fn burst_loss_partial_acks_repair_all_holes_before_rto() {
         const CAPACITY: usize = 16384;
         let configs = [config(Side::A), config(Side::B)];
         let mut pair = Pair::with_ports(eal, ["nrbursta", "nrburstb"], configs, T0, 64, |side, port| {
-            port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [CAPACITY]));
+            port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, port.rx_burst, configs[side.index()].rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [CAPACITY]));
             port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), pair::windows(port.mtu, [CAPACITY]));
         });
         let (handles, frames) = establish_sized(&mut pair, Side::A, CAPACITY);
@@ -1849,7 +1850,7 @@ fn cubic_growth_and_recovery_across_rtts() {
                 port.rx_burst = 256;
                 port.tx_burst = 256;
                 port.tx_pool.count = tx_reserve(port.tx_descriptors, configs[side.index()].tx_pending) as u32;
-                port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [CAPACITY]));
+                port.rx_pool.count = pair::pool_count(rx_reserve(port.rx_descriptors, port.rx_burst, configs[side.index()].rx_staging, port.rx_pool.cache_size), pair::windows(port.mtu, [CAPACITY]));
                 port.frame_pool.count = pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), pair::windows(port.mtu, [CAPACITY]));
             });
             let a = pair.a.add_tcp(pair::tcp_socket_sized(CAPACITY)).unwrap();

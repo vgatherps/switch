@@ -61,7 +61,7 @@ impl Network {
             stack.paths = if node == A { &paths } else { &[] };
             let mut port = rings[node].config();
             resize(&mut port, 9000, 9216);
-            let reserve = rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size);
+            let reserve = rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size);
             let tcp = tcp::rx_mbuf_budget(&tcp_socket_sized(BUFFER), 9000)
                 .checked_mul(stack.max_sockets).expect("TCP budget overflow");
             let count = reserve.checked_add(tcp).and_then(|n| n.checked_add(16))

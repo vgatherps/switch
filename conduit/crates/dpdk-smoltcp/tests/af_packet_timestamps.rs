@@ -243,7 +243,8 @@ fn af_packet_hardware_mode_opens_and_stamps() {
             rx_burst: BURST as u16,
             tx_burst: BURST as u16,
             queue_socket: -1,
-            rx_pool: pool(rx_pool.as_c_str()),
+            // At least rx_reserve(16, BURST, BURST, 8).
+            rx_pool: PoolConfig { count: 127, ..pool(rx_pool.as_c_str()) },
             tx_pool: pool(tx_pool.as_c_str()),
             frame_pool: pool(frame_pool.as_c_str()),
             offloads: Offloads {

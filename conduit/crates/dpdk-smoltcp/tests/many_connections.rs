@@ -51,7 +51,7 @@ fn packet_rx_full_window_64_connections() {
         // Every connection's full window each way at once: the test fills all 64.
         let full = zhida_test_kit::pair::windows(1500, [CAPACITY; 64]);
         let pool_count = zhida_test_kit::pair::pool_count(
-            dpdk_smoltcp::rx_reserve(16, configs[0].rx_staging, 8),
+            dpdk_smoltcp::rx_reserve(16, 8, configs[0].rx_staging, 8),
             full,
         );
         let frame_count = zhida_test_kit::pair::pool_count(

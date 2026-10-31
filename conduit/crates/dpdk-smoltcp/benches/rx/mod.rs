@@ -63,6 +63,7 @@ pub(super) fn setup(eal: &Eal, k: usize, buffer: usize) -> (Pair, [TcpHandle; 2]
         |side, port| {
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             ), zhida_test_kit::pair::windows(port.mtu, [buffer]));

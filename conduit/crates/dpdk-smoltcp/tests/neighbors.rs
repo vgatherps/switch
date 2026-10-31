@@ -52,7 +52,7 @@ fn reconnect(eal: &Eal, p: usize, neighbor_capacity: usize) -> [(usize, Duration
             port.rx_burst = 32;
             let full = windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 }));
             let reserve =
-                rx_reserve(port.rx_descriptors, configs[side.index()].rx_staging, port.rx_pool.cache_size);
+                rx_reserve(port.rx_descriptors, port.rx_burst, configs[side.index()].rx_staging, port.rx_pool.cache_size);
             port.rx_pool.count = pool_count(reserve, full);
             port.frame_pool.count =
                 pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), full);
@@ -180,7 +180,7 @@ fn zero_neighbor_capacity_is_invalid_config() {
         let valid = pair::config(Side::A);
         let mut port_config = fixture.config();
         port_config.rx_pool.count = pool_count(
-            rx_reserve(port_config.rx_descriptors, valid.rx_staging, port_config.rx_pool.cache_size),
+            rx_reserve(port_config.rx_descriptors, port_config.rx_burst, valid.rx_staging, port_config.rx_pool.cache_size),
             0,
         );
         let port = fixture.open_with(eal, port_config);

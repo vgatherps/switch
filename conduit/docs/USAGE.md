@@ -70,7 +70,6 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
         mss_cap: Some(config.path_mtu(server) - 40),
     };
     let sizing = zhida_open::Sizing {
-        rx_share: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,
@@ -94,14 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`open` sizes the RX and frame pools as the driver's reserve plus a share every socket draws on;
-nothing is reserved per socket and `add_tcp` never refuses a socket for pool size. Size each share
-for what all sockets together may hold at once, not sockets x window. Here one socket may fill its
-window each way. `Sizing` has no defaults; fill all eight fields:
+`open` gives the RX pool a fixed 32767 mbufs, far above `rx_reserve` (see "Pool sizing" below), and
+sizes the frame pool as the driver's reserve plus a share every socket draws on; nothing is
+reserved per socket and `add_tcp` never refuses a socket for pool size. Size the frame share for
+what all sockets together may hold at once, not sockets x window. Here one socket may fill its
+send window. `Sizing` has no defaults; fill all seven fields:
 
 | field | what to put there |
 |---|---|
-| `rx_share` | RX mbufs all sockets together may hold: unread TCP data, out-of-order segments, queued UDP datagrams, frames the application holds (see "Pool sizing" below) |
 | `frame_share` | frames all TCP send queues and the application (`Stack::tx_frame`) may hold at once |
 | `max_sockets`, `max_udp_sockets`, `rx_staging`, `tx_pending`, `neighbor_capacity` | passed to the `StackConfig` fields of the same name ("Configure the Stack" below) |
 
@@ -338,7 +337,7 @@ IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` f
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
 `TxPoolTooSmall { count, required }`, a frame pool smaller than `frame_reserve(negotiated TX
 descriptors, tx_pending)` gives `TxFramePoolTooSmall { count, required }`, and an RX pool smaller
-than `rx_reserve(negotiated RX descriptors, rx_staging, RX cache size)` gives
+than `rx_reserve(negotiated RX descriptors, rx_burst, rx_staging, RX cache size)` gives
 `RxPoolTooSmall { count, required }`. These are the only pool checks: sockets added afterwards
 share the pools and are never refused for pool size.
 
@@ -347,15 +346,20 @@ share the pools and are never refused for pool size.
 ### RX reserve and the shared RX share
 
 Socket receive data occupies RX mbufs. Size the RX pool for held data as well as the driver's
-working space. `rx_reserve(rx_descriptors, rx_staging, rx_cache_size) -> usize` computes:
+working space. `rx_reserve(rx_descriptors, rx_burst, rx_staging, rx_cache_size) -> usize` computes:
 
 ```text
-max(rx_descriptors, 32) + rx_staging + floor(3 * rx_cache_size / 2)
+max(rx_descriptors, 32) + low mark + rx_staging + floor(3 * rx_cache_size / 2)
+low mark = max(rx_descriptors, 32) + rx_burst
 ```
 
-The descriptors keep the NIC supplied, staging holds unprocessed packets, and the cache term covers
-one lcore's DPDK cache flush threshold. The 32 minimum also covers memif copy RX: with data waiting,
-it allocates 32 mbufs per call and receives nothing if that allocation fails.
+The descriptors keep the NIC supplied: a NIC keeps its ring posted (ENA refills once
+min(ring / 8, 256) descriptors are empty). Staging holds unprocessed packets, and the cache term
+covers one lcore's DPDK cache flush threshold. The 32 minimum also covers memif copy RX: with data
+waiting, it allocates 32 mbufs per call and receives nothing if that allocation fails. The low
+mark (below) must stay free on top of those, or the pool reads low on every burst and TCP sockets
+never keep out-of-order data. At 1024 RX descriptors, rx_burst 32, staging 32 and cache 8 the
+reserve is 1024 + 1056 + 32 + 12 = 2124.
 `crates/memif-bench/src/memif.rs` documents additional memif room and disconnect requirements.
 
 Size the RX pool as `rx_reserve(...)` plus a share: the RX mbufs all sockets together may hold at
@@ -390,18 +394,27 @@ refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs 
 receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
 at once; while that fails ENA still returns completed packets, but stops receiving once the
 buffers already posted run out. So the check must fire while a refill can still succeed.
-Out-of-order data is kept only while at least that
-many mbufs are free, so size the RX share for it on top of what sockets hold. The free count is
-read only when the last reading no longer rules out "low": only the driver takes RX mbufs, at
-most max(negotiated RX descriptors, 32) posted plus one per packet it returns, so a reading of
-`free` covers the next `free - mark - max(RX descriptors, 32)` received packets. A test driver
-that allocates RX mbufs outside the PMD (the kit's `Link`, with an RX ring larger than 32)
-breaks that bound.
+Out-of-order data is kept only while at least that many mbufs are free; `rx_reserve` counts the
+mark, so a pool of reserve plus share clears it while the sockets together hold at most the
+share. The free count is read only when the last reading no longer rules out "low": only the
+driver takes RX mbufs, at most max(negotiated RX descriptors, 32) posted plus one per packet it
+returns, so a reading of `free` covers the next `free - mark - max(RX descriptors, 32)` received
+packets. A test driver that allocates RX mbufs outside the PMD (the kit's `Link`, with an RX ring
+larger than 32) breaks that bound.
 While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
 out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
 ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
 resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
 blocks, and the sender must then resend it too.
+
+`zhida-open::open` (used by `nic-runner` and the `netconf-open` examples) does not size from a share:
+its RX pool is a fixed 32767 mbufs (2^15 - 1), 15.4 times the reserve at 1024 descriptors, burst 32,
+staging 32 and cache 8. Keeping out-of-order data needs the posted buffers, the low mark and what
+the sockets hold all at once; a pool that big leaves room for all of them, so it does not read low
+in practice. Each mbuf costs 2560 bytes at MTU 1500 and 9728 bytes at MTU 9001 (arm64 build:
+128-byte header, 128-byte mbuf, 8-byte private area, data room, padding); 32767 of them take
+41 2 MiB hugepages (82 MiB) at MTU 1500 and 153 (306 MiB) at MTU 9001. Under `--no-huge` an object
+never crosses a 4 KiB page, so at MTU 1500 the pool takes 130 MiB of the `-m` budget.
 
 ### TX pool
 

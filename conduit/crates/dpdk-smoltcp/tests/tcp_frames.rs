@@ -239,7 +239,7 @@ impl Host {
     fn new(eal: &dpdk_smoltcp::Eal, name: &str, max_sockets: usize, frame_pool: Option<u32>) -> Self {
         let fixture = RingPort::new(name, RING, RING);
         let mut config = fixture.config();
-        let reserve = rx_reserve(config.rx_descriptors, 8, config.rx_pool.cache_size);
+        let reserve = rx_reserve(config.rx_descriptors, config.rx_burst, 8, config.rx_pool.cache_size);
         config.rx_pool.count = u32::try_from(reserve + 6 * max_sockets).unwrap();
         if let Some(count) = frame_pool {
             config.frame_pool.count = count;

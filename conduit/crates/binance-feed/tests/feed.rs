@@ -77,7 +77,7 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
         rx_pool: pool(
             RX_POOL,
             u32::try_from(
-                rx_reserve(16, 32, 8)
+                rx_reserve(16, 32, 32, 8)
                     .checked_add(tcp::rx_mbuf_budget(&socket(mss_cap), 1500))
                     .expect("RX pool count fits usize"),
             )
@@ -194,6 +194,7 @@ fn capped_feed_socket_keeps_capped_frame_cap_on_jumbo_stack() {
         resize(&mut port_config, 9000, 9216);
         let reserve = rx_reserve(
             port_config.rx_descriptors,
+            port_config.rx_burst,
             stack_config.rx_staging,
             port_config.rx_pool.cache_size,
         );

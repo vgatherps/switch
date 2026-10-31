@@ -70,6 +70,7 @@ fn sized_pair_with_paths(
         socket.mss_cap = cap;
         let reserve = rx_reserve(
             port.rx_descriptors,
+            port.rx_burst,
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         );

@@ -10,6 +10,7 @@ use zhida_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
 use zhida_dpdk_sys::*;
 
 use crate::eal::{Eal, PoolResources};
+use crate::rx_pool::rx_low_mark;
 
 /// Static properties and MAC address reported by a DPDK ethdev.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,7 +674,7 @@ impl Port {
             }
         }
         self.descriptors = (rx_desc, tx_desc);
-        self.rx_pressure = RxPressure::new(rx_desc, self.rx_scratch.len() as u16);
+        self.rx_pressure = RxPressure::new(rx_desc, self.rx_burst_size());
         let mut rxconf = info.default_rxconf;
         rxconf.offloads = 0;
         rxconf.rx_deferred_start = 0;
@@ -754,6 +755,11 @@ impl Port {
     pub(crate) fn rx_pool_cache_size(&self) -> u32 {
         // SAFETY: this Port owns the live RX pool; its cache size is fixed.
         unsafe { (*self.rx.pool().pool()).cache_size }
+    }
+
+    /// Packets requested from the PMD per RX burst at most: `PortConfig::rx_burst`.
+    pub(crate) fn rx_burst_size(&self) -> u16 {
+        u16::try_from(self.rx_scratch.len()).expect("rx_burst is a u16")
     }
 
     /// After an RX burst that returned `received` packets (accepted and rejected), whether the
@@ -1060,16 +1066,6 @@ fn check_configuration(mtu: u16, offloads: Offloads, conf: &rte_eth_conf) -> Res
         }
     }
     Ok(())
-}
-
-/// One refill of the whole RX ring plus one RX burst: max(RX descriptors, 32) + `rx_burst`.
-/// DPDK 25.11.3 PMDs refill in chunks up to that size, all or nothing: memif copy mode
-/// allocates 32 per receive whatever the burst and receives nothing without them; ixgbe's
-/// vector RX rearms 64; ENA bulk-allocates every free descriptor at once, and while that fails
-/// still returns completed packets until the buffers already posted run out, then receives
-/// nothing. net_tap takes one per packet and net_ring none. The 32 floor is `rx_reserve`'s.
-fn rx_low_mark(rx_descriptors: u16, rx_burst: u16) -> usize {
-    rx_posted(rx_descriptors) + usize::from(rx_burst)
 }
 
 /// The most RX mbufs a driver holds posted for receive: max(RX descriptors, 32). A NIC posts

@@ -14,7 +14,6 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
         mss_cap: Some(config.path_mtu(server) - 40),
     };
     let sizing = zhida_open::Sizing {
-        rx_share: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,

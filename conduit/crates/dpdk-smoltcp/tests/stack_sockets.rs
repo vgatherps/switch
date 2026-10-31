@@ -134,7 +134,7 @@ fn finish(fixture: RingPort, stack: Stack) {
 /// 4096-byte sockets' worth.
 fn limited_stack(eal: &dpdk_smoltcp::Eal, fixture: &RingPort) -> Stack {
     let mut config = fixture.config();
-    let reserve = rx_reserve(config.rx_descriptors, 8, config.rx_pool.cache_size);
+    let reserve = rx_reserve(config.rx_descriptors, config.rx_burst, 8, config.rx_pool.cache_size);
     config.rx_pool.count = u32::try_from(reserve + 12).unwrap();
     let port = fixture.open_with(eal, config);
     assert_eq!(port.descriptor_counts().0, 16);
@@ -199,7 +199,7 @@ fn held_tcp_frame_after_removal(reap: bool) {
             max_sockets: 1,
             ..pair::config(side)
         });
-        let reserve = rx_reserve(16, configs[0].rx_staging, 8);
+        let reserve = rx_reserve(16, 8, configs[0].rx_staging, 8);
         let pool = u32::try_from(reserve + 6).unwrap();
         let names = if reap { ["rxreapa", "rxreapb"] } else { ["rxhelda", "rxheldb"] };
         let mut pair = Pair::with_pools(eal, names, configs, pair::T0, 16, pool, 63, 63);
@@ -260,7 +260,7 @@ fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
             max_sockets: 1,
             ..pair::config(side)
         });
-        let reserve = rx_reserve(16, configs[0].rx_staging, 8);
+        let reserve = rx_reserve(16, 8, configs[0].rx_staging, 8);
         let pool = u32::try_from(reserve + 6).unwrap();
         let mut pair = Pair::with_pools(eal, ["rxrm1a", "rxrm1b"], configs, pair::T0, 16, pool, 63, 63);
         let ([client, server], _) = pair::establish(&mut pair, Side::A);
@@ -357,7 +357,7 @@ fn socket_capacity_refused_then_slot_reused() {
         let fixture = RingPort::new("cap", 16, 16);
         let mut port_config = fixture.config();
         port_config.rx_pool.count = u32::try_from(
-            rx_reserve(port_config.rx_descriptors, 8, port_config.rx_pool.cache_size) + 12,
+            rx_reserve(port_config.rx_descriptors, port_config.rx_burst, 8, port_config.rx_pool.cache_size) + 12,
         )
         .unwrap();
         let mut stack = stack(fixture.open_with(eal, port_config), 2, 4);

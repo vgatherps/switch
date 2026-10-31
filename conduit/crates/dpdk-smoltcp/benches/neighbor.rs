@@ -70,6 +70,7 @@ fn setup(eal: &Eal, p: usize) -> (Pair, Vec<TcpHandle>) {
             port.rx_burst = 32;
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             ), zhida_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));

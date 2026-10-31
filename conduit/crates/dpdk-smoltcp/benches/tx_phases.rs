@@ -356,6 +356,7 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
             // A's RX pool also holds up to RING - 1 injected ACKs.
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             ), zhida_test_kit::pair::windows(port.mtu, [buffer])) + RING;

@@ -186,6 +186,7 @@ fn new_pair(eal: &Eal, tag: &str, n: usize, active_buffer: usize) -> Pair {
         |side, port| {
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             ), zhida_test_kit::pair::windows(port.mtu, std::iter::once(active_buffer).chain(
@@ -480,6 +481,7 @@ fn burst_pair(eal: &Eal, tag: &str, n: usize, burst: usize, buffer: usize) -> Pa
             port.rx_burst = burst as u16;
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             ), zhida_test_kit::pair::windows(port.mtu, std::iter::repeat_n(buffer, n)));

@@ -881,6 +881,7 @@ impl Server {
         let share = |reserve: usize| u32::try_from(reserve + pair::SHARE).unwrap();
         port_config.rx_pool.count = share(rx_reserve(
             port_config.rx_descriptors,
+            port_config.rx_burst,
             stack_config.rx_staging,
             port_config.rx_pool.cache_size,
         ));

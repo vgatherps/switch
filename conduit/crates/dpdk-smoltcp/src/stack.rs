@@ -76,7 +76,7 @@ pub enum StackError {
     TxPoolTooSmall { count: usize, required: usize },
     /// The frame pool holds fewer than `frame_reserve(TX descriptors, tx_pending)` mbufs.
     TxFramePoolTooSmall { count: usize, required: usize },
-    /// The RX pool holds fewer than `rx_reserve(RX descriptors, rx_staging, cache size)` mbufs.
+    /// The RX pool holds fewer than `rx_reserve(RX descriptors, rx_burst, rx_staging, cache size)` mbufs.
     RxPoolTooSmall { count: usize, required: usize },
     TimeWentBackwards { last: Instant, now: Instant },
     Port(PortError),
@@ -214,8 +214,8 @@ impl Stack {
     /// A frame pool below `frame_reserve` returns the Port with
     /// `TxFramePoolTooSmall`: packets the PMD holds and pending packets can
     /// then never take the last frame. An RX pool below `rx_reserve` returns
-    /// the Port with `RxPoolTooSmall`: the driver could not keep its RX
-    /// descriptors and the staging queue supplied.
+    /// the Port with `RxPoolTooSmall`: with the RX descriptors posted and the
+    /// staging queue full, the pool could not stay above its low mark.
     /// The negotiated TX descriptor count bounds sent mbufs held by NIC PMDs.
     /// net_ring ignores that count and keeps sent mbufs on its attached ring
     /// instead: open it with TX descriptors equal to the TX ring size.
@@ -267,6 +267,7 @@ impl Stack {
         let rx_count = port.rx_pool_count();
         let rx_required = rx_reserve(
             port.descriptor_counts().0,
+            port.rx_burst_size(),
             config.rx_staging,
             port.rx_pool_cache_size(),
         );

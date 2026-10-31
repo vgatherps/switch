@@ -67,7 +67,7 @@ fn open(eal: &Eal, fixture: &RingPort, side: Side, tcp: usize, udp: usize) -> St
     // Every socket's window and UDP queue full at once: the bench asserts lossless links.
     let rx_share = tcp * tcp::rx_mbuf_budget(&tcp_config(), config.mtu.into()) + udp.max(1) * UDP_QUEUE;
     let frame_share = tcp * tcp::tx_mbuf_budget(&tcp_config(), config.mtu.into()) + 64;
-    let reserve = rx_reserve(config.rx_descriptors, stack_config.rx_staging, config.rx_pool.cache_size);
+    let reserve = rx_reserve(config.rx_descriptors, config.rx_burst, stack_config.rx_staging, config.rx_pool.cache_size);
     config.rx_pool.count = u32::try_from(reserve + rx_share).unwrap();
     config.frame_pool.count =
         u32::try_from(frame_reserve(config.tx_descriptors, stack_config.tx_pending) + frame_share).unwrap();
