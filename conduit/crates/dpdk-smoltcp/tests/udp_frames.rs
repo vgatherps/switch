@@ -176,7 +176,7 @@ fn refused(
 
 /// Refusals before the device return the frame untouched and send nothing:
 /// a frame from another Stack's pool (`Foreign`, even to a valid
-/// destination), then `udp_target`'s errors in its order.
+/// destination), then the destination errors in their order.
 #[zhida_test_support::pinned_test]
 fn udp_send_frame_refusals_return_frame_and_send_nothing() {
     with_eal(|eal| {

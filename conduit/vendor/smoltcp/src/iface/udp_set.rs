@@ -53,17 +53,6 @@ pub enum UdpSendError {
     WouldBlock,
 }
 
-/// A validated UDP send: socket, destination and payload length.
-/// `Interface::udp_target` makes one; pass it to `udp_send` of the same `Interface`, with the
-/// same `UdpSet`, before the socket or the interface's addresses change.
-#[derive(Debug, PartialEq, Eq)]
-pub struct UdpTarget {
-    pub(crate) handle: UdpHandle,
-    pub(crate) to: IpEndpoint,
-    pub(crate) dst_addr: Ipv4Address,
-    pub(crate) len: usize,
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UdpSocketStats {
     pub rx_dropped_full: u64,

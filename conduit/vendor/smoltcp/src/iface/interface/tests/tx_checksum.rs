@@ -247,13 +247,8 @@ fn udp_direct_and_template_carry_checksum_metadata() {
                 })
                 .unwrap();
             for _ in 0..2 {
-                let target = iface
-                    .udp_target(&udp, handle, Some(IpEndpoint::new(REMOTE.into(), 80)), 4)
-                    .unwrap();
-                assert_eq!(
-                    iface.udp_send(&mut device, &mut udp, target, b"data"),
-                    Ok(())
-                );
+                let to = Some(IpEndpoint::new(REMOTE.into(), 80));
+                assert_eq!(iface.udp_send(&mut device, &mut udp, handle, to, b"data"), Ok(()));
                 let (meta, bytes) = device.tx.last().unwrap();
                 assert_eq!(
                     meta.tx_checksum,
@@ -292,11 +287,7 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
                 .unwrap();
             let to = Some(IpEndpoint::new(REMOTE.into(), 80));
             for _ in 0..2 {
-                let target = iface.udp_target(&udp, handle, to, 4).unwrap();
-                assert_eq!(
-                    iface.udp_send(&mut device, &mut udp, target, b"data"),
-                    Ok(())
-                );
+                assert_eq!(iface.udp_send(&mut device, &mut udp, handle, to, b"data"), Ok(()));
             }
             let copies = core::mem::take(&mut device.tx);
             udp.remove(handle);
@@ -313,8 +304,7 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
                 let mut frame = crate::phy::TxFrame::alloc(&alloc).unwrap();
                 frame.room_mut().copy_from_slice(b"data");
                 frame.set_len(4);
-                let target = iface.udp_target(&udp, handle, to, 4).unwrap();
-                assert!(iface.udp_send_frame(&mut device, &mut udp, target, frame).is_ok());
+                assert!(iface.udp_send_frame(&mut device, &mut udp, handle, to, frame).is_ok());
             }
             assert_eq!(device.tx, copies);
             assert_eq!(
