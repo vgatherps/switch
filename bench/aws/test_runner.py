@@ -388,6 +388,42 @@ class HostTest(unittest.TestCase):
         return z.Host({"role": "sender3", "id": "i-4", "public_ip": "1.2.3.4"}, "/k.pem", "/rd", run=run,
                       sleep=lambda s: None, clock=iter(range(0, 100000, 5)).__next__)
 
+    def test_wait_ssh_deadline_reports_last_exit_and_stderr(self):
+        run = mock.Mock(side_effect=[
+            Proc(255, stderr="Connection refused"),
+            Proc(255, stderr="Permission denied (publickey).\n"),
+        ])
+        h = self.host(run)
+        h._sleep = mock.Mock()
+        with self.assertRaises(RuntimeError) as raised:
+            h.wait_ssh(limit=15)
+        self.assertIn("sender3: no SSH within 15 s", str(raised.exception))
+        self.assertIn("SSH exited 255: Permission denied (publickey).", str(raised.exception))
+        self.assertNotIn("Connection refused", str(raised.exception))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(h._sleep.call_args_list, [mock.call(5), mock.call(5)])
+        self.assertTrue(all(call.args[0][-1] == "true" for call in run.call_args_list))
+        self.assertTrue(all(call.kwargs["timeout"] == z.SSH_S for call in run.call_args_list))
+
+    def test_wait_ssh_recovers_without_changing_success_or_retry_delay(self):
+        run = mock.Mock(side_effect=[Proc(255, stderr="Connection refused"), Proc(0)])
+        h = self.host(run)
+        h._sleep = mock.Mock()
+        self.assertIsNone(h.wait_ssh(limit=15))
+        self.assertEqual(run.call_count, 2)
+        h._sleep.assert_called_once_with(5)
+
+    def test_wait_ssh_preserves_individual_ssh_timeout(self):
+        timeout = subprocess.TimeoutExpired("ssh", z.SSH_S)
+        run = mock.Mock(side_effect=timeout)
+        h = self.host(run)
+        h._sleep = mock.Mock()
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            h.wait_ssh()
+        self.assertIs(raised.exception, timeout)
+        run.assert_called_once()
+        h._sleep.assert_not_called()
+
     def test_streamed_progress_arrives_before_the_remote_command_exits(self):
         with tempfile.TemporaryDirectory() as tmp:
             ack = os.path.join(tmp, "ack")

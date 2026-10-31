@@ -91,6 +91,8 @@ probe passes, then sweep start (dispatching the first rate) and sweep end with t
 These milestones appear once per sweep, not once per rate. Stderr is also kept in each `.coord.log`;
 JSON results remain in `.jsonl`. A failed startup or clock check never claims synchronization.
 
+The initial SSH reachability wait allows 600 s; if that deadline expires, its error includes the
+last SSH exit code and stderr (up to 2,000 characters).
 Host setup retries verification through the reboot and transient SSH failures for up to 900 s.
 An observed failed `zhida-host.service` stops polling early. Before teardown, an apply failure,
 failed service or verification timeout includes the last verify output (when available), the service

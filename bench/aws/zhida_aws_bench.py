@@ -430,11 +430,14 @@ class Host:
 
     def wait_ssh(self, limit=600):
         deadline = self._clock() + limit
+        last = "no SSH attempt completed"
         while self._clock() < deadline:
-            if self.ssh("true", check=False).returncode == 0:
+            r = self.ssh("true", check=False)
+            if r.returncode == 0:
                 return
+            last = f"SSH exited {r.returncode}: {(r.stderr or '').strip()[-2000:]}"
             self._sleep(5)
-        raise RuntimeError(f"{self.role}: no SSH within {limit} s")
+        raise RuntimeError(f"{self.role}: no SSH within {limit} s; last attempt: {last}")
 
     def put_text(self, remote, text, mode):
         self.ssh(f"umask 077 && cat > {remote} && chmod {mode} {remote}", input=text)
