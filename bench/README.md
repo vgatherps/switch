@@ -91,6 +91,12 @@ probe passes, then sweep start (dispatching the first rate) and sweep end with t
 These milestones appear once per sweep, not once per rate. Stderr is also kept in each `.coord.log`;
 JSON results remain in `.jsonl`. A failed startup or clock check never claims synchronization.
 
+Host setup retries verification through the reboot and transient SSH failures for up to 900 s.
+An observed failed `zhida-host.service` stops polling early. Before teardown, an apply failure,
+failed service or verification timeout includes the last verify output (when available), the service
+status and current-boot journal, and loaded/on-disk `vfio_pci_core` source versions in the setup
+error. If SSH prevents collecting those diagnostics, the error reports that failure too.
+
 The AWS runner uses a 500 ms measurement window per rate, 250 ms warmup and 200 ms drain, with the
 unchanged 50 ms scheduling lead. All 18 rates remain: 9 s of measurement and 18 s of scheduled time per
 protocol, or 27 s of measurement and 54 s of scheduled time for UDP/TCP/ws together. Add 3 s receiver

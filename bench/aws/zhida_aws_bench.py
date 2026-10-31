@@ -450,6 +450,20 @@ class Host:
             return None
         return f"{self.role}:{remote}: scp exited {r.returncode}: {(r.stderr or '').strip()[-500:]}"
 
+    def setup_diagnostics(self):
+        command = ("echo 'systemctl status zhida-host.service:'; "
+                   "systemctl status zhida-host.service --no-pager; "
+                   "echo 'journalctl -u zhida-host.service -b --no-pager:'; "
+                   "journalctl -u zhida-host.service -b --no-pager; "
+                   "echo 'loaded vfio_pci_core srcversion:'; "
+                   "cat /sys/module/vfio_pci_core/srcversion; "
+                   "echo 'on-disk vfio_pci_core srcversion:'; modinfo -F srcversion vfio_pci_core")
+        try:
+            r = self.root(command, check=False)
+        except subprocess.TimeoutExpired:
+            return f"setup diagnostics: SSH timed out after {SSH_S} s"
+        return f"setup diagnostics (exit {r.returncode}):\n{r.stdout.rstrip()}\n{r.stderr.rstrip()}"
+
     def install(self, archive):
         """Source, hft-host.sh apply (builds, reboots), verify. Returns (ok, report text)."""
         self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive,
@@ -457,16 +471,32 @@ class Host:
         apply = self.root(f"sh {HFT} apply", check=False, timeout=BUILD_S)
         text = [f"[{self.role} {self.info['id']}]", "apply:", apply.stdout.rstrip()]
         if apply.returncode not in (0, 100, 255):  # 100: rebooting; 255: SSH dropped by the reboot
-            return False, "\n".join(text + [f"apply exited {apply.returncode}: {apply.stderr.strip()[-2000:]}"])
-        # Before the reboot verify fails (cmdline), during it SSH fails; zhida-host.service runs `boot`
-        # after it. So: retry verify until it passes.
+            return False, "\n".join(text + [f"apply exited {apply.returncode}: {apply.stderr.strip()[-2000:]}",
+                                            self.setup_diagnostics()])
+        # Before reboot verify and SSH can fail normally; the new boot unit failing is terminal.
         deadline = self._clock() + SETUP_REBOOT_S
         while True:
-            v = self.root(f"sh {HFT} verify", check=False)
-            if v.returncode == 0 or self._clock() >= deadline:
+            try:
+                v = self.root(f"sh {HFT} verify", check=False)
+            except subprocess.TimeoutExpired:
+                v = subprocess.CompletedProcess([], 255, "", f"verify SSH timed out after {SSH_S} s")
+            if v.returncode == 0:
+                break
+            if v.returncode != 255:
+                try:
+                    state = self.root("systemctl is-failed zhida-host.service", check=False)
+                except subprocess.TimeoutExpired:
+                    state = None
+                if state is not None and state.returncode == 0 and state.stdout.strip() == "failed":
+                    text += ["zhida-host.service failed"]
+                    break
+            if self._clock() >= deadline:
+                text += [f"verify did not pass within {SETUP_REBOOT_S} s"]
                 break
             self._sleep(10)
-        text += ["verify:", v.stdout.rstrip()]
+        text += ["verify:", v.stdout.rstrip(), v.stderr.rstrip()]
+        if v.returncode != 0:
+            text += [self.setup_diagnostics()]
         return v.returncode == 0, "\n".join(text)
 
     def setup(self, archive):

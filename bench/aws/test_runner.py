@@ -441,14 +441,25 @@ class HostTest(unittest.TestCase):
             seen.append(cmd)
             if "hft-host.sh apply" in cmd:
                 return Proc(255, "reboot: rebooting now for: cmdline\n", "Connection closed")
-            if "hft-host.sh verify" in cmd:  # host down, then booted
-                return Proc(0, "cmdline: ok\n") if sum("verify" in c for c in seen) >= 3 else Proc(255)
+            if "hft-host.sh verify" in cmd:
+                attempt = sum("verify" in c for c in seen)
+                if attempt == 1:
+                    return Proc(1, "cmdline: FAIL reboot needed\n")
+                if attempt == 2:
+                    return Proc(255, stderr="Connection refused")
+                if attempt == 3:
+                    raise subprocess.TimeoutExpired(argv, z.SSH_S)
+                return Proc(0, "cmdline: ok\n")
+            if "systemctl is-failed" in cmd:
+                return Proc(1, "inactive\n")
             return Proc(0)
 
         ok, text = self.host(run).setup(b"tar")
         self.assertTrue(ok, text)
         order = [k for c in seen for k in ("apply", "verify", "bootstrap.sh") if k in c]
-        self.assertEqual(order, ["apply", "verify", "verify", "verify", "bootstrap.sh"])
+        self.assertEqual(order, ["apply", "verify", "verify", "verify", "verify", "bootstrap.sh"])
+        self.assertEqual(sum("systemctl is-failed" in c for c in seen), 1)
+        self.assertFalse(any("journalctl" in c for c in seen))
         self.assertIn(f"SRC={z.SRC_DIR} sh {z.SRC_DIR}/bench/aws/bootstrap.sh", seen[-1])
         self.assertIn("cmdline: ok", text)
 
@@ -465,6 +476,99 @@ class HostTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("hugepages: FAIL", text)
         self.assertFalse(any("bootstrap.sh" in c for c in seen))
+
+    def test_apply_failure_collects_diagnostics_without_verifying_or_building(self):
+        h = self.host(lambda argv, **kw: Proc())
+        h.root = mock.Mock(side_effect=[
+            Proc(1, "apply output\n", "apply error\n"), Proc(0, "boot service journal\n"),
+        ])
+        ok, text = h.setup(b"tar")
+        self.assertFalse(ok)
+        self.assertIn("apply exited 1: apply error", text)
+        self.assertIn("boot service journal", text)
+        self.assertEqual(h.root.call_count, 2)
+
+    def test_failed_boot_service_reports_journal_promptly_without_building(self):
+        h = self.host(lambda argv, **kw: Proc())
+        h._sleep = mock.Mock()
+        h.root = mock.Mock(side_effect=[
+            Proc(100, "reboot requested\n"),
+            Proc(1, "data: FAIL data NIC on ena\n", "verify stderr\n"),
+            Proc(0, "failed\n"),
+            Proc(0, "zhida-host.service: Failed\nbind: incompatible vfio module\n"
+                    "loaded vfio_pci_core srcversion:\nOLD\non-disk vfio_pci_core srcversion:\nNEW\n"),
+        ])
+        ok, text = h.setup(b"tar")
+        self.assertFalse(ok)
+        self.assertIn("zhida-host.service failed", text)
+        self.assertIn("data: FAIL data NIC on ena", text)
+        self.assertIn("verify stderr", text)
+        self.assertIn("bind: incompatible vfio module", text)
+        self.assertIn("srcversion:\nOLD", text)
+        self.assertIn("srcversion:\nNEW", text)
+        h._sleep.assert_not_called()
+        self.assertEqual(h.root.call_count, 4)  # no benchmark build
+        command = h.root.call_args.args[0]
+        for expected in ("systemctl status zhida-host.service --no-pager",
+                         "journalctl -u zhida-host.service -b --no-pager",
+                         "cat /sys/module/vfio_pci_core/srcversion",
+                         "modinfo -F srcversion vfio_pci_core"):
+            self.assertIn(expected, command)
+
+    def test_transient_service_probe_ssh_failures_still_allow_success(self):
+        for transient in (Proc(255, "failed\n", "Connection closed"),
+                          subprocess.TimeoutExpired("ssh", z.SSH_S)):
+            with self.subTest(transient=transient):
+                h = self.host(lambda argv, **kw: Proc())
+                h.root = mock.Mock(side_effect=[
+                    Proc(100), Proc(1, "data: FAIL on ena\n"), transient,
+                    Proc(0, "data: ok vfio-pci\n"), Proc(0),
+                ])
+                ok, text = h.setup(b"tar")
+                self.assertTrue(ok, text)
+                self.assertIn("bootstrap.sh", h.root.call_args.args[0])
+                self.assertNotIn("setup diagnostics", text)
+
+    def test_verify_timeout_without_failed_service_collects_diagnostics(self):
+        h = self.host(lambda argv, **kw: Proc())
+        h._clock = iter((0, z.SETUP_REBOOT_S)).__next__
+        h.root = mock.Mock(side_effect=[
+            Proc(100), Proc(1, "data: FAIL on ena\n"), Proc(1, "activating\n"),
+            Proc(1, "service status and journal\n", "modinfo: module not found\n"),
+        ])
+        ok, text = h.setup(b"tar")
+        self.assertFalse(ok)
+        self.assertIn(f"verify did not pass within {z.SETUP_REBOOT_S} s", text)
+        self.assertIn("service status and journal", text)
+        self.assertIn("modinfo: module not found", text)
+        self.assertNotIn("zhida-host.service failed", text)
+        self.assertEqual(h.root.call_count, 4)
+
+    def test_diagnostics_ssh_failure_preserves_verify_failure(self):
+        for failure in (Proc(255, stderr="Connection refused"),
+                        subprocess.TimeoutExpired("ssh", z.SSH_S)):
+            with self.subTest(failure=failure):
+                h = self.host(lambda argv, **kw: Proc())
+                h.root = mock.Mock(side_effect=[
+                    Proc(100), Proc(1, "data: FAIL on ena\n"), Proc(0, "failed\n"), failure,
+                ])
+                ok, text = h.setup(b"tar")
+                self.assertFalse(ok)
+                self.assertIn("data: FAIL on ena", text)
+                self.assertIn("setup diagnostics", text)
+                self.assertIn("Connection refused" if isinstance(failure, Proc) else "SSH timed out", text)
+
+    def test_verify_ssh_timeout_at_deadline_reports_diagnostics(self):
+        h = self.host(lambda argv, **kw: Proc())
+        h._clock = iter((0, z.SETUP_REBOOT_S)).__next__
+        h.root = mock.Mock(side_effect=[
+            Proc(255), subprocess.TimeoutExpired("ssh", z.SSH_S), Proc(0, "boot journal\n"),
+        ])
+        ok, text = h.setup(b"tar")
+        self.assertFalse(ok)
+        self.assertIn("verify SSH timed out", text)
+        self.assertIn("boot journal", text)
+        self.assertEqual(h.root.call_count, 3)  # no service probe on an unreachable host
 
 
 # ---------------------------------------------------------------- six-host orchestration
