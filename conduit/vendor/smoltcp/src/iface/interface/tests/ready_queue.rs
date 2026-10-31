@@ -2,11 +2,11 @@ use super::*;
 use crate::iface::SocketHandle;
 use crate::socket::tcp;
 use crate::tests::TestingDevice;
+use crate::tests::PEER_HARDWARE as REMOTE_HARDWARE;
 use crate::time::Duration;
 
 const LOCAL: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
 const REMOTE: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
-const REMOTE_HARDWARE: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 1]);
 const START: Instant = Instant::from_millis_const(100);
 
 fn connect(iface: &mut Interface, sockets: &mut TcpSet<'static>, port: u16) -> SocketHandle {
@@ -46,14 +46,14 @@ fn receive_at(
     now: Instant,
     tcp: TcpRepr,
 ) {
-    queue_segment(iface, device, tcp);
+    queue_segment(device, tcp);
     assert_eq!(
         iface.poll_ingress_single(now, device, sockets),
         PollIngressSingleResult::SocketStateChanged
     );
 }
 
-fn queue_segment(iface: &Interface, device: &mut TestingDevice, tcp: TcpRepr) {
+fn queue_segment(device: &mut TestingDevice, tcp: TcpRepr) {
     let ip = Ipv4Repr {
         src_addr: REMOTE,
         dst_addr: LOCAL,
@@ -73,13 +73,7 @@ fn queue_segment(iface: &Interface, device: &mut TestingDevice, tcp: TcpRepr) {
         &ChecksumCapabilities::default(),
     );
     if device.capabilities().medium == Medium::Ethernet {
-        let mut frame = vec![0; EthernetFrame::<&[u8]>::buffer_len(bytes.len())];
-        let mut ethernet = EthernetFrame::new_unchecked(&mut frame);
-        ethernet.set_src_addr(REMOTE_HARDWARE);
-        ethernet.set_dst_addr(iface.inner.hardware_addr.ethernet_or_panic());
-        ethernet.set_ethertype(EthernetProtocol::Ipv4);
-        ethernet.payload_mut().copy_from_slice(&bytes);
-        device.rx_queue.push_back(frame);
+        device.rx_queue.push_back(crate::tests::wrap_eth(&bytes));
     } else {
         device.rx_queue.push_back(bytes);
     }
@@ -87,11 +81,8 @@ fn queue_segment(iface: &Interface, device: &mut TestingDevice, tcp: TcpRepr) {
 
 fn take_tcp(device: &mut TestingDevice) -> (u16, TcpControl, TcpSeqNumber, Vec<u8>) {
     let bytes = device.tx_queue.pop_front().unwrap();
-    let ethernet;
     let ip_bytes = if device.capabilities().medium == Medium::Ethernet {
-        ethernet = EthernetFrame::new_checked(&bytes).unwrap();
-        assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv4);
-        ethernet.payload()
+        crate::tests::strip_eth(&bytes)
     } else {
         bytes.as_slice()
     };
@@ -327,7 +318,7 @@ fn ingress_finds_app_relisten_of_already_dirty_socket() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
-    queue_segment(&iface, &mut device, segment(1234, TcpControl::None, 101, seq));
+    queue_segment(&mut device, segment(1234, TcpControl::None, 101, seq));
     assert_eq!(
         iface.poll_ingress_single_udp(START, &mut device, &mut sockets, &mut udp),
         PollIngressSingleResult::SocketStateChanged
@@ -336,7 +327,7 @@ fn ingress_finds_app_relisten_of_already_dirty_socket() {
     sockets.abort(handle);
     sockets.listen(handle, 1235).unwrap();
     assert_eq!(sockets.dirty_list, vec![0]);
-    queue_segment(&iface, &mut device, TcpRepr {
+    queue_segment(&mut device, TcpRepr {
         ack_number: None,
         ..segment(1235, TcpControl::Syn, 200, seq)
     });

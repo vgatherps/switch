@@ -5,6 +5,11 @@ use crate::phy::{self, Device, DeviceCapabilities, Medium};
 use crate::time::Instant;
 use crate::wire::*;
 
+/// MAC of `setup`'s Ethernet interface.
+pub(crate) const HARDWARE: EthernetAddress = EthernetAddress([0x02; 6]);
+/// MAC of the test peer: the source of `wrap_eth` frames and the destination `strip_eth` expects.
+pub(crate) const PEER_HARDWARE: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 1]);
+
 pub(crate) fn setup<'a>(medium: Medium) -> (Interface, TcpSet<'a>, TestingDevice) {
     let mut device = TestingDevice::new(medium);
     let iface = setup_with_device(medium, &mut device);
@@ -12,9 +17,7 @@ pub(crate) fn setup<'a>(medium: Medium) -> (Interface, TcpSet<'a>, TestingDevice
 }
 fn setup_with_device(medium: Medium, device: &mut impl Device) -> Interface {
     let config = Config::new(match medium {
-        Medium::Ethernet => {
-            HardwareAddress::Ethernet(EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]))
-        }
+        Medium::Ethernet => HardwareAddress::Ethernet(HARDWARE),
         #[cfg(feature = "medium-ip")]
         Medium::Ip => HardwareAddress::Ip,
     });
@@ -33,6 +36,27 @@ fn setup_with_device(medium: Medium, device: &mut impl Device) -> Interface {
     }
 
     iface
+}
+
+/// IPv4 packet `ip` in an Ethernet frame from `PEER_HARDWARE` to `HARDWARE`.
+pub(crate) fn wrap_eth(ip: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0; EthernetFrame::<&[u8]>::buffer_len(ip.len())];
+    let mut ethernet = EthernetFrame::new_unchecked(&mut frame);
+    ethernet.set_src_addr(PEER_HARDWARE);
+    ethernet.set_dst_addr(HARDWARE);
+    ethernet.set_ethertype(EthernetProtocol::Ipv4);
+    ethernet.payload_mut().copy_from_slice(ip);
+    frame
+}
+
+/// IPv4 packet of `frame`, which must be an Ethernet frame from `HARDWARE` to `PEER_HARDWARE`.
+pub(crate) fn strip_eth(frame: &[u8]) -> &[u8] {
+    let ethernet = EthernetFrame::new_checked(frame).unwrap();
+    assert_eq!(
+        (ethernet.src_addr(), ethernet.dst_addr(), ethernet.ethertype()),
+        (HARDWARE, PEER_HARDWARE, EthernetProtocol::Ipv4)
+    );
+    &frame[EthernetFrame::<&[u8]>::header_len()..]
 }
 
 /// A testing device.
