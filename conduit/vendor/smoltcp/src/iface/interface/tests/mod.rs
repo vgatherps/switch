@@ -1,10 +1,7 @@
 mod ipv4;
 mod next_hop;
-#[cfg(feature = "medium-ip")]
 mod poll_at_cache;
-#[cfg(feature = "medium-ip")]
 mod ready_queue;
-#[cfg(feature = "medium-ip")]
 mod tcp_demux;
 mod template;
 

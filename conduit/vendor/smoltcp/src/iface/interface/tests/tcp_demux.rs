@@ -1,7 +1,7 @@
 use super::*;
 use crate::iface::SocketHandle;
 use crate::socket::tcp;
-use crate::tests::TestingDevice;
+use crate::tests::{setup_eth, strip_eth, wrap_eth, TestingDevice};
 use crate::time::Duration;
 
 const LOCAL_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
@@ -40,7 +40,7 @@ fn receive(
     now: Instant,
     tcp: TcpRepr,
 ) {
-    device.rx_queue.push_back(packet_bytes(tcp));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes(tcp)));
     iface.poll(now, device, sockets);
 }
 
@@ -77,7 +77,7 @@ fn take_reply(device: &mut TestingDevice) -> Vec<u8> {
 }
 
 fn reply(bytes: &[u8]) -> TcpRepr<'_> {
-    let ip = Ipv4Packet::new_checked(bytes).unwrap();
+    let ip = Ipv4Packet::new_checked(strip_eth(bytes)).unwrap();
     assert!(ip.verify_checksum());
     assert_eq!(ip.src_addr(), LOCAL_ADDR);
     assert_eq!(ip.dst_addr(), REMOTE_ADDR);
@@ -151,7 +151,7 @@ fn establish_with_options(
 /// An established connection on the test tuple, built in another set and added to `sockets`,
 /// whose tuple must be free.
 fn adopt_connection(sockets: &mut TcpSet<'static>, local_seq: TcpSeqNumber) -> SocketHandle {
-    let (mut iface, mut other_sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut other_sockets, mut device) = setup_eth();
     let (handle, other_seq) = establish(&mut iface, &mut other_sockets, &mut device);
     assert_eq!(other_seq, local_seq);
     let socket = other_sockets.take(handle);
@@ -159,7 +159,7 @@ fn adopt_connection(sockets: &mut TcpSet<'static>, local_seq: TcpSeqNumber) -> S
 }
 
 fn active_sequence() -> TcpSeqNumber {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut active = socket();
     active
         .connect(
@@ -179,17 +179,17 @@ fn active_sequence() -> TcpSeqNumber {
 #[test]
 fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
     for entry in ["batch", "single", "udp_single"] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let handles: Vec<_> = (0..2).map(|_| sockets.add(socket())).collect();
         for &handle in &handles {
             sockets.listen(handle, LOCAL_PORT).unwrap();
         }
         let syn = segment(TcpControl::Syn, REMOTE_SEQ, None);
         for port in [REMOTE_PORT, REMOTE_PORT + 1] {
-            device.rx_queue.push_back(packet_bytes(TcpRepr {
+            device.rx_queue.push_back(wrap_eth(&packet_bytes(TcpRepr {
                 src_port: port,
                 ..syn
-            }));
+            })));
         }
         if entry == "batch" {
             iface.poll(Instant::ZERO, &mut device, &mut sockets);
@@ -225,7 +225,7 @@ fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
 
 #[test]
 fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     let frame = crate::phy::RxBuf::from_vec(packet_bytes(TcpRepr {
         payload: b"abc",
@@ -257,10 +257,10 @@ fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
     assert_eq!(bytes.len(), 3);
     assert_eq!(&bytes, b"abc");
 
-    device.rx_queue.push_back(packet_bytes(TcpRepr {
+    device.rx_queue.push_back(wrap_eth(&packet_bytes(TcpRepr {
         payload: b"def",
         ..segment(TcpControl::None, REMOTE_SEQ + 4, Some(local_seq))
-    }));
+    })));
     assert_eq!(
         iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets),
         PollIngressSingleResult::SocketStateChanged,
@@ -274,7 +274,7 @@ fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
 
 #[test]
 fn ingress_commits_payload_after_reply_dispatch() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     receive(
         &mut iface,
@@ -375,7 +375,7 @@ fn assert_data_received(
 
 #[test]
 fn two_listeners_lowest_slot_takes_syn() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut first = socket();
     first.listen(LOCAL_PORT).unwrap();
     let first = sockets.add(first);
@@ -442,7 +442,7 @@ fn two_listeners_lowest_slot_takes_syn() {
 
 #[test]
 fn syn_to_port_zero_is_dropped_with_wildcard_listener() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut listener = socket();
     assert_eq!(listener.listen(0), Err(tcp::ListenError::Unaddressable));
     listener.listen(LOCAL_PORT).unwrap();
@@ -468,7 +468,7 @@ fn syn_to_port_zero_is_dropped_with_wildcard_listener() {
 /// slot is removed, a socket in another slot that takes the same tuple gets its segments.
 #[test]
 fn fast_path_follows_tuple_to_a_new_slot() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let empty = sockets.add(socket());
     let (first, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     assert_data_received(
@@ -495,7 +495,7 @@ fn fast_path_follows_tuple_to_a_new_slot() {
 
 #[test]
 fn cached_exact_tuple_challenges_syn_before_lower_listener() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let empty = sockets.add(socket());
     let (exact, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     sockets.remove(empty);
@@ -533,7 +533,7 @@ fn cached_exact_tuple_challenges_syn_before_lower_listener() {
 
 #[test]
 fn alternating_established_tuples_use_their_own_slots() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (first, first_seq) = establish(&mut iface, &mut sockets, &mut device);
     let mut listener = socket();
     listener.listen(LOCAL_PORT).unwrap();
@@ -606,7 +606,7 @@ fn alternating_established_tuples_use_their_own_slots() {
 
 #[test]
 fn egress_after_get_mut_change_without_ingress() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handle = sockets.add(socket());
     sockets.connect(handle,
             iface.context(),
@@ -651,7 +651,7 @@ fn egress_after_get_mut_change_without_ingress() {
 #[test]
 fn get_mut_connect_receives_synack_next_poll() {
     let initial_seq = active_sequence();
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handle = sockets.add(socket());
     assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
@@ -729,7 +729,7 @@ fn assert_listener_receives_syn(
 fn index_follows_socket_lifecycle() {
     // 1. A reset returns a passive SYN-RECEIVED socket to LISTEN.
     {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let mut listener = socket();
         listener.listen(LOCAL_PORT).unwrap();
         let handle = sockets.add(listener);
@@ -798,7 +798,7 @@ fn index_follows_socket_lifecycle() {
 
     // 2. An ACK of the LAST-ACK socket's FIN closes it.
     {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
         receive(
             &mut iface,
@@ -853,7 +853,7 @@ fn index_follows_socket_lifecycle() {
 
     // 3. Polling past the TIME-WAIT timer closes the socket.
     {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
         sockets.close(handle);
         assert_eq!(sockets.get(handle).state(), tcp::State::FinWait1);
@@ -917,7 +917,7 @@ fn index_follows_socket_lifecycle() {
 
     // 4. Aborting an established socket sends a reset and closes it.
     {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
         sockets.abort(handle);
         assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
@@ -939,7 +939,7 @@ fn index_follows_socket_lifecycle() {
 
     // 5. Removing a socket lets the same tuple or another port reuse its slot.
     {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
         sockets.remove(handle);
         let replacement = adopt_connection(&mut sockets, local_seq);
@@ -978,7 +978,7 @@ fn index_follows_socket_lifecycle() {
 #[test]
 fn precedence_across_match_classes() {
     for bound_first in [false, true] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let mut wildcard = socket();
         wildcard.listen(LOCAL_PORT).unwrap();
         let mut bound = socket();
@@ -993,7 +993,7 @@ fn precedence_across_match_classes() {
         assert_eq!(sockets.get(wildcard).state(), tcp::State::Listen);
     }
 
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let listener = sockets.add(socket());
     let (connected, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     sockets.listen(listener, LOCAL_PORT).unwrap();
@@ -1043,7 +1043,7 @@ fn precedence_across_match_classes() {
 fn exact_tuple_takes_syn_before_lower_listener() {
     for bound in [false, true] {
         for exact_first in [false, true] {
-            let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+            let (mut iface, mut sockets, mut device) = setup_eth();
             let mut listener = socket();
             if bound {
                 listener.listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
@@ -1099,7 +1099,7 @@ fn exact_tuple_takes_syn_before_lower_listener() {
 
 #[test]
 fn exact_syn_received_resends_identical_synack_before_lower_listener() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let lower = sockets.add(socket());
     let mut exact = socket();
     exact.listen(LOCAL_PORT).unwrap();
@@ -1138,7 +1138,7 @@ fn exact_syn_received_resends_identical_synack_before_lower_listener() {
 
 #[test]
 fn exact_established_challenges_syn_before_lower_listener() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let lower = sockets.add(socket());
     let (exact, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     sockets.listen(lower, LOCAL_PORT).unwrap();
@@ -1200,7 +1200,7 @@ fn time_wait_reopens_on_higher_sequence_only() {
         (REMOTE_SEQ + 2, 11, false),
         (REMOTE_SEQ + 3, 9, true),
     ] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (exact, local_seq) =
             enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, Some(10));
         let mut listener = socket();
@@ -1235,7 +1235,7 @@ fn time_wait_reopens_on_higher_sequence_only() {
 
 #[test]
 fn time_wait_reopen_clears_cached_close_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (exact, _) = enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, None);
     let close_deadline = Instant::from_millis(10_000);
     let wake = iface.poll_at(Instant::ZERO, &mut sockets).unwrap();
@@ -1276,7 +1276,7 @@ fn time_wait_acceptable_syn_reopens_lowest_listener() {
 #[track_caller]
 fn assert_time_wait_syn_reopens(cases: &[(TcpSeqNumber, Option<u32>, TcpSeqNumber, Option<u32>)]) {
     for &(peer_seq, recent, seq, tsval) in cases {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let lower = sockets.add(socket());
         let (exact, _) = enter_time_wait(&mut iface, &mut sockets, &mut device, peer_seq, recent);
         sockets.listen(lower, LOCAL_PORT).unwrap();
@@ -1326,7 +1326,7 @@ fn time_wait_unacceptable_syn_challenges_before_lower_listener() {
         (Some(10), REMOTE_SEQ + 1, Some(9)),
         (Some(0), REMOTE_SEQ + 2, Some(u32::MAX)),
     ] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let lower = sockets.add(socket());
         let (exact, local_seq) =
             enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, recent);
@@ -1364,7 +1364,7 @@ fn time_wait_unacceptable_syn_challenges_before_lower_listener() {
 #[test]
 fn time_wait_acceptable_syn_without_listener_acks_and_keeps_tuple() {
     for wrong_address_listener in [false, true] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (exact, local_seq) =
             enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, None);
         if wrong_address_listener {
@@ -1441,7 +1441,7 @@ fn time_wait_syn_sequence_half_space_reopens() {
 
 #[test]
 fn time_wait_syn_ack_does_not_reopen() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let lower = sockets.add(socket());
     let (exact, local_seq) =
         enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, Some(10));
@@ -1486,7 +1486,7 @@ fn time_wait_syn_ack_does_not_reopen() {
 
 #[test]
 fn close_listener_and_relisten_same_slot() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut listener = socket();
     listener.listen(LOCAL_PORT).unwrap();
     let handle = sockets.add(listener);
@@ -1523,7 +1523,7 @@ fn close_listener_and_relisten_same_slot() {
 
 #[test]
 fn close_synsent_and_reconnect_same_slot() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handle = sockets.add(socket());
     sockets.connect(handle,
             iface.context(),
@@ -1594,7 +1594,7 @@ fn close_synsent_and_reconnect_same_slot() {
 
 #[test]
 fn incoming_rst_closes_established_socket() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     receive(
         &mut iface,
@@ -1619,7 +1619,7 @@ fn incoming_rst_closes_established_socket() {
 
 #[test]
 fn app_abort_closes_established_socket_after_idle() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
 
     iface.poll(Instant::from_millis(5), &mut device, &mut sockets);
@@ -1650,7 +1650,7 @@ fn app_abort_closes_established_socket_after_idle() {
 
 #[test]
 fn flow_index_matches_linear_scan_under_churn() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut handles: [SocketHandle; 16] = core::array::from_fn(|_| sockets.add(socket()));
     let mut seed = 0x5eeda11u32;
 
@@ -1777,14 +1777,14 @@ fn flow_index_matches_linear_scan_under_churn() {
 
 #[test]
 fn tcp_bad_checksum_dropped_without_delivery_or_ack_advance() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     let mut bytes = packet_bytes(TcpRepr {
         payload: b"abc",
         ..segment(TcpControl::None, REMOTE_SEQ + 1, Some(local_seq))
     });
     bytes[20 + 16] ^= 1;
-    device.rx_queue.push_back(bytes);
+    device.rx_queue.push_back(wrap_eth(&bytes));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     assert_eq!(sockets.get(handle).recv_queue(), 0);
     assert!(device.tx_queue.is_empty());
@@ -1806,7 +1806,7 @@ fn tcp_bad_checksum_dropped_without_delivery_or_ack_advance() {
 
 #[test]
 fn tcp_truncated_and_zero_ports_dropped() {
-    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let (mut iface, mut sockets, _) = setup_eth();
     let bytes = packet_bytes(segment(TcpControl::Syn, REMOTE_SEQ, None));
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
     let ip = Ipv4Repr::parse(&packet, &ChecksumCapabilities::default()).unwrap();
@@ -1840,13 +1840,13 @@ const NON_UNICAST_DSTS: [Ipv4Address; 4] = [
 // Linux tcp_v4_rcv drops TCP that is not addressed to this host (pkt_type != PACKET_HOST).
 #[test]
 fn syn_to_broadcast_leaves_wildcard_listener_listening() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut listener = socket();
     listener.listen(LOCAL_PORT).unwrap();
     let handle = sockets.add(listener);
     for (i, dst) in NON_UNICAST_DSTS.into_iter().enumerate() {
         let syn = segment(TcpControl::Syn, REMOTE_SEQ, None);
-        device.rx_queue.push_back(packet_bytes_to(syn, dst));
+        device.rx_queue.push_back(wrap_eth(&packet_bytes_to(syn, dst)));
         iface.poll(Instant::from_millis(2 * i as i64), &mut device, &mut sockets);
         iface.poll(Instant::from_millis(2 * i as i64 + 1), &mut device, &mut sockets);
         assert!(device.tx_queue.is_empty(), "replied to a SYN sent to {dst}");
@@ -1860,9 +1860,12 @@ fn syn_to_broadcast_leaves_wildcard_listener_listening() {
 
 #[test]
 fn broadcast_syn_without_socket_gets_no_rst() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     for dst in NON_UNICAST_DSTS {
-        device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), dst));
+        device.rx_queue.push_back(wrap_eth(&packet_bytes_to(
+            segment(TcpControl::Syn, REMOTE_SEQ, None),
+            dst,
+        )));
         iface.poll(Instant::ZERO, &mut device, &mut sockets);
         assert!(device.tx_queue.is_empty(), "answered a SYN sent to {dst}");
     }
@@ -1886,7 +1889,7 @@ fn own_prefix(iface: &mut Interface) {
 
 /// The reply's source address and TCP header, for a reply from any of our addresses.
 fn reply_from(bytes: &[u8]) -> (Ipv4Address, TcpRepr<'_>) {
-    let ip = Ipv4Packet::new_checked(bytes).unwrap();
+    let ip = Ipv4Packet::new_checked(strip_eth(bytes)).unwrap();
     assert!(ip.verify_checksum());
     assert_eq!(ip.dst_addr(), REMOTE_ADDR);
     let tcp = TcpRepr::parse(
@@ -1905,7 +1908,7 @@ fn reply_from(bytes: &[u8]) -> (Ipv4Address, TcpRepr<'_>) {
 /// from that address.
 #[test]
 fn segments_to_unowned_addresses_get_no_reply() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     own_prefix(&mut iface);
     let mut listener = socket();
     listener.listen(LOCAL_PORT).unwrap();
@@ -1917,19 +1920,22 @@ fn segments_to_unowned_addresses_get_no_reply() {
         Ipv4Address::new(192, 168, 1, 255),
     ] {
         for tcp in [segment(TcpControl::Syn, REMOTE_SEQ, None), unknown] {
-            device.rx_queue.push_back(packet_bytes_to(tcp, dst));
+            device.rx_queue.push_back(wrap_eth(&packet_bytes_to(tcp, dst)));
             iface.poll(Instant::ZERO, &mut device, &mut sockets);
             assert!(device.tx_queue.is_empty(), "{dst} {:?}", tcp.control);
             assert_eq!(sockets.get(handle).state(), tcp::State::Listen);
         }
     }
     let owned = Ipv4Address::new(10, 9, 0, 3);
-    device.rx_queue.push_back(packet_bytes_to(unknown, owned));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(unknown, owned)));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     let bytes = take_reply(&mut device);
     let (src, rst) = reply_from(&bytes);
     assert_eq!((src, rst.control), (owned, TcpControl::Rst));
-    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), owned));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(
+        segment(TcpControl::Syn, REMOTE_SEQ, None),
+        owned,
+    )));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     let bytes = take_reply(&mut device);
     let (src, synack) = reply_from(&bytes);
@@ -1947,13 +1953,13 @@ fn segments_to_unowned_addresses_get_no_reply() {
 /// address now gets nothing.
 #[test]
 fn established_flow_takes_segments_without_an_address_check() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, local_seq) = establish(&mut iface, &mut sockets, &mut device);
     iface.update_ip_addrs(|addrs| addrs.clear());
-    device.rx_queue.push_back(packet_bytes(TcpRepr {
+    device.rx_queue.push_back(wrap_eth(&packet_bytes(TcpRepr {
         payload: b"abc",
         ..segment(TcpControl::None, REMOTE_SEQ + 1, Some(local_seq))
-    }));
+    })));
     assert_eq!(
         iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets),
         PollIngressSingleResult::SocketStateChanged
@@ -1962,10 +1968,10 @@ fn established_flow_takes_segments_without_an_address_check() {
     let mut listener = socket();
     listener.listen(LOCAL_PORT + 1).unwrap();
     let listener = sockets.add(listener);
-    device.rx_queue.push_back(packet_bytes(TcpRepr {
+    device.rx_queue.push_back(wrap_eth(&packet_bytes(TcpRepr {
         dst_port: LOCAL_PORT + 1,
         ..segment(TcpControl::Syn, REMOTE_SEQ, None)
-    }));
+    })));
     iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets);
     assert_eq!(sockets.get(listener).state(), tcp::State::Listen);
     assert!(device.tx_queue.is_empty());
@@ -1976,7 +1982,7 @@ fn established_flow_takes_segments_without_an_address_check() {
 /// foreign address and a SYN to one create no flow.
 #[test]
 fn flows_only_exist_for_owned_addresses() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     own_prefix(&mut iface);
     let mut listener = socket();
     listener.listen(LOCAL_PORT).unwrap();
@@ -1989,10 +1995,10 @@ fn flows_only_exist_for_owned_addresses() {
         let mut listener = socket();
         listener.listen(LOCAL_PORT).unwrap();
         sockets.add(listener);
-        device.rx_queue.push_back(packet_bytes_to(
+        device.rx_queue.push_back(wrap_eth(&packet_bytes_to(
             TcpRepr { src_port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) },
             dst,
-        ));
+        )));
         iface.poll(Instant::ZERO, &mut device, &mut sockets);
         device.tx_queue.clear();
     }
@@ -2023,7 +2029,7 @@ fn flows_only_exist_for_owned_addresses() {
 /// the same port goes to the matching listener.
 #[test]
 fn raw_listener_on_unowned_address_never_gets_a_syn() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     own_prefix(&mut iface);
     let foreign = Ipv4Address::new(192, 168, 1, 3);
     let owned = Ipv4Address::new(10, 9, 0, 2);
@@ -2033,12 +2039,18 @@ fn raw_listener_on_unowned_address_never_gets_a_syn() {
     let mut on_owned = socket();
     on_owned.listen((owned, LOCAL_PORT)).unwrap();
     let on_owned = sockets.add(on_owned);
-    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), foreign));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(
+        segment(TcpControl::Syn, REMOTE_SEQ, None),
+        foreign,
+    )));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());
     assert_eq!(sockets.get(unowned).state(), tcp::State::Listen);
     assert_eq!(sockets.get(unowned).local_endpoint(), None);
-    device.rx_queue.push_back(packet_bytes_to(segment(TcpControl::Syn, REMOTE_SEQ, None), owned));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(
+        segment(TcpControl::Syn, REMOTE_SEQ, None),
+        owned,
+    )));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     let bytes = take_reply(&mut device);
     let (src, synack) = reply_from(&bytes);
@@ -2065,7 +2077,7 @@ fn own_singles(iface: &mut Interface, count: u32) -> Vec<Ipv4Address> {
 #[test]
 fn thousand_exact_listeners_on_one_port_each_get_their_syn() {
     const PORT: u16 = 443;
-    let (mut iface, _, mut device) = setup(Medium::Ip);
+    let (mut iface, _, mut device) = setup_eth();
     let owned = own_singles(&mut iface, 1000);
     let mut sockets = TcpSet::new(1001);
     let mut all = socket();
@@ -2085,7 +2097,7 @@ fn thousand_exact_listeners_on_one_port_each_get_their_syn() {
             src_port: 10000 + index as u16,
             ..segment(TcpControl::Syn, REMOTE_SEQ, None)
         };
-        device.rx_queue.push_back(packet_bytes_to(syn, addr));
+        device.rx_queue.push_back(wrap_eth(&packet_bytes_to(syn, addr)));
         iface.poll(Instant::ZERO, &mut device, &mut sockets);
         let bytes = take_reply(&mut device);
         let (src, synack) = reply_from(&bytes);
@@ -2094,7 +2106,7 @@ fn thousand_exact_listeners_on_one_port_each_get_their_syn() {
     }
     assert_eq!(sockets.get(all).state(), tcp::State::Listen);
     let syn = TcpRepr { dst_port: PORT, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
-    device.rx_queue.push_back(packet_bytes_to(syn, LOCAL_ADDR));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(syn, LOCAL_ADDR)));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     let bytes = take_reply(&mut device);
     assert_eq!(reply_from(&bytes).0, LOCAL_ADDR);
@@ -2107,7 +2119,7 @@ fn thousand_exact_listeners_on_one_port_each_get_their_syn() {
 /// to the all-IP listener.
 #[test]
 fn identical_exact_listeners_then_all_ip_fallback() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let owned = own_singles(&mut iface, 1)[0];
     let mut all = socket();
     all.listen(LOCAL_PORT).unwrap();
@@ -2119,7 +2131,7 @@ fn identical_exact_listeners_then_all_ip_fallback() {
     });
     let syn_from = |port: u16| TcpRepr { src_port: port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) };
     for (src_port, handle) in [(50001, first), (50002, second)] {
-        device.rx_queue.push_back(packet_bytes_to(syn_from(src_port), owned));
+        device.rx_queue.push_back(wrap_eth(&packet_bytes_to(syn_from(src_port), owned)));
         iface.poll(Instant::ZERO, &mut device, &mut sockets);
         let bytes = take_reply(&mut device);
         assert_eq!(reply_from(&bytes).0, owned);
@@ -2132,7 +2144,7 @@ fn identical_exact_listeners_then_all_ip_fallback() {
     assert_eq!(sockets.get(all).state(), tcp::State::Listen);
     sockets.remove(first);
     sockets.remove(second);
-    device.rx_queue.push_back(packet_bytes_to(syn_from(50003), owned));
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(syn_from(50003), owned)));
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
     let bytes = take_reply(&mut device);
     assert_eq!(reply_from(&bytes).0, owned);
@@ -2147,7 +2159,7 @@ fn identical_exact_listeners_then_all_ip_fallback() {
 #[test]
 fn time_wait_syn_fin_is_acked_with_or_without_listener() {
     for with_listener in [true, false] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (exact, local_seq) =
             enter_time_wait(&mut iface, &mut sockets, &mut device, REMOTE_SEQ, None);
         let listener = with_listener.then(|| {

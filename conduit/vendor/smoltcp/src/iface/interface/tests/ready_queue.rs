@@ -1,7 +1,7 @@
 use super::*;
 use crate::iface::SocketHandle;
 use crate::socket::tcp;
-use crate::tests::TestingDevice;
+use crate::tests::{setup_eth, strip_eth, wrap_eth, TestingDevice};
 use crate::tests::PEER_HARDWARE as REMOTE_HARDWARE;
 use crate::time::Duration;
 
@@ -72,21 +72,12 @@ fn queue_segment(device: &mut TestingDevice, tcp: TcpRepr) {
         &LOCAL.into(),
         &ChecksumCapabilities::default(),
     );
-    if device.capabilities().medium == Medium::Ethernet {
-        device.rx_queue.push_back(crate::tests::wrap_eth(&bytes));
-    } else {
-        device.rx_queue.push_back(bytes);
-    }
+    device.rx_queue.push_back(wrap_eth(&bytes));
 }
 
 fn take_tcp(device: &mut TestingDevice) -> (u16, TcpControl, TcpSeqNumber, Vec<u8>) {
     let bytes = device.tx_queue.pop_front().unwrap();
-    let ip_bytes = if device.capabilities().medium == Medium::Ethernet {
-        crate::tests::strip_eth(&bytes)
-    } else {
-        bytes.as_slice()
-    };
-    let ip = Ipv4Packet::new_checked(ip_bytes).unwrap();
+    let ip = Ipv4Packet::new_checked(strip_eth(&bytes)).unwrap();
     assert!(ip.verify_checksum());
     let tcp = TcpRepr::parse(
         &TcpPacket::new_checked(ip.payload()).unwrap(),
@@ -198,12 +189,11 @@ fn egress_idle_means_next_pass_does_nothing() {
     for scenario in [
         "burst", "refused", "bounded", "parked", "touched", "source", "due",
     ] {
-        let medium = if scenario == "parked" {
-            Medium::Ethernet
+        let (mut iface, mut sockets, mut device) = if scenario == "parked" {
+            setup(Medium::Ethernet)
         } else {
-            Medium::Ip
+            setup_eth()
         };
-        let (mut iface, mut sockets, mut device) = setup(medium);
         let handle = if scenario == "parked" {
             connect(&mut iface, &mut sockets, 1234)
         } else {
@@ -292,7 +282,7 @@ fn egress_idle_means_next_pass_does_nothing() {
 
 #[test]
 fn ingress_sync_keeps_deadline_dirty() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     sockets.get_mut(handle).send_slice(&[1; 64]).unwrap();
     for _ in 0..2 {
@@ -315,7 +305,7 @@ fn ingress_sync_keeps_deadline_dirty() {
 
 #[test]
 fn ingress_finds_app_relisten_of_already_dirty_socket() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
     queue_segment(&mut device, segment(1234, TcpControl::None, 101, seq));
@@ -347,7 +337,7 @@ fn ingress_finds_app_relisten_of_already_dirty_socket() {
 
 #[test]
 fn poll_at_reports_queued_send_due_now() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, _) = establish(&mut iface, &mut sockets, &mut device, 1234);
     sockets.get_mut(handle).send_slice(&[1; 64]).unwrap();
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::ZERO));
@@ -531,7 +521,7 @@ fn waiting_sockets_send_on_neighbor_reply_or_rearp_at_deadline(
 
 #[test]
 fn due_timer_and_dirty_sockets_admitted_in_slot_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handles: Vec<_> = (1234..1237)
         .map(|port| establish(&mut iface, &mut sockets, &mut device, port).0)
         .collect();
@@ -557,7 +547,7 @@ fn due_timer_and_dirty_sockets_admitted_in_slot_order() {
 
 #[test]
 fn idle_sockets_not_dispatched() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     idle_sockets(&mut iface, &mut sockets, &mut device);
     let (active, _) = establish(&mut iface, &mut sockets, &mut device, 1334);
     for handle in sockets.iter().map(|(handle, _)| handle).collect::<Vec<_>>() {
@@ -572,7 +562,7 @@ fn idle_sockets_not_dispatched() {
 
 #[test]
 fn refused_socket_retried_first() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handles: Vec<_> = (1234..1237)
         .map(|port| establish(&mut iface, &mut sockets, &mut device, port).0)
         .collect();
@@ -595,7 +585,7 @@ fn refused_socket_retried_first() {
 
 #[test]
 fn still_ready_socket_goes_to_tail() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let b = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     for handle in [a, b] {
@@ -742,7 +732,7 @@ fn reconnect_to_cached_neighbor_sends_syn_without_old_neighbor_silence() {
 
 #[test]
 fn address_change_leaves_idle_sockets_established() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     idle_sockets(&mut iface, &mut sockets, &mut device);
     iface.update_ip_addrs(|addrs| addrs.clear());
     assert_eq!(
@@ -758,7 +748,7 @@ fn address_change_leaves_idle_sockets_established() {
 
 #[test]
 fn now_is_due_at_negative_time() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let now = Instant::from_millis(-100);
     iface.poll(now, &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());
@@ -775,7 +765,7 @@ fn now_is_due_at_negative_time() {
 }
 
 fn check_close_timer_after_idle_wheel(now: Instant, fresh: bool, poll_at_first: bool) {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     sockets.close(handle);
     iface.poll_egress(START, &mut device, &mut sockets);
@@ -843,7 +833,7 @@ fn close_timer_added_to_fresh_set_at_large_time_uses_caller_time() {
 
 #[test]
 fn poll_at_after_advance_stays_between_now_and_rounded_earliest_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let first = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let second = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     let first_rto = Duration::from_micros(40_250);
@@ -877,7 +867,7 @@ fn poll_at_after_advance_stays_between_now_and_rounded_earliest_deadline() {
 #[test]
 fn timers_fire_among_idle_sockets() {
     for timer in ["RTO", "delayed ACK", "configured RTO", "TIME-WAIT"] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         idle_sockets(&mut iface, &mut sockets, &mut device);
         let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1334);
         let delay = match timer {
@@ -981,7 +971,7 @@ fn timers_fire_among_idle_sockets() {
 
 #[test]
 fn remove_queued_socket_before_slot_reuse() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let b = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     for handle in [a, b] {
@@ -1001,7 +991,7 @@ fn remove_queued_socket_before_slot_reuse() {
 
 #[test]
 fn queued_socket_with_refreshed_idle_deadline_is_not_dispatched() {
-    let (mut iface, mut sockets, device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, device) = setup_eth();
     let handle = connect(&mut iface, &mut sockets, 1234);
     let mut device = RefusingDevice {
         inner: device,
@@ -1018,7 +1008,7 @@ fn queued_socket_with_refreshed_idle_deadline_is_not_dispatched() {
 
 #[test]
 fn address_change_only_admits_due_sockets_after_device_refusal() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let b = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     establish(&mut iface, &mut sockets, &mut device, 1236);
@@ -1026,6 +1016,8 @@ fn address_change_only_admits_due_sockets_after_device_refusal() {
         sockets.get_mut(handle).send_slice(&[1; 1024]).unwrap();
     }
     iface.update_ip_addrs(|_| {});
+    // On Ethernet the address change flushes the neighbor cache; re-learn the peer.
+    iface.resolve_neighbor(crate::tests::PEER, REMOTE_HARDWARE);
     let mut device = RefusingDevice {
         inner: device,
         remaining: 1,
@@ -1041,7 +1033,7 @@ fn address_change_only_admits_due_sockets_after_device_refusal() {
 
 #[test]
 fn dirty_sockets_readmitted_in_slot_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let (b, b_seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
     let (c, c_seq) = establish(&mut iface, &mut sockets, &mut device, 1236);
@@ -1070,7 +1062,7 @@ fn dirty_sockets_readmitted_in_slot_order() {
 
 #[test]
 fn dirty_due_and_timer_sockets_admitted_together_in_slot_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (low, low_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let timer = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     let (high, high_seq) = establish(&mut iface, &mut sockets, &mut device, 1236);
@@ -1097,7 +1089,7 @@ fn dirty_due_and_timer_sockets_admitted_together_in_slot_order() {
 
 #[test]
 fn dirty_socket_due_before_wheel_advances_admitted_once() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     sockets
         .get_mut(handle)
@@ -1138,12 +1130,12 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
 #[test]
 fn dropped_dispatch_ends_lone_socket_visit() {
     // The dropped SYN rearms its RTO; the future deadline ends this visit.
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handle = connect(&mut iface, &mut sockets, 1234);
     sockets.get_mut(handle).set_rto(Duration::from_millis(1));
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).1, TcpControl::Syn);
-    iface.inner.caps.max_transmission_unit = 40;
+    iface.inner.caps.max_transmission_unit = 40 + ETHERNET_HEADER_LEN;
     for (elapsed, next) in [(1, 3), (3, 7)] {
         let now = START + Duration::from_millis(elapsed);
         assert_eq!(
@@ -1158,7 +1150,7 @@ fn dropped_dispatch_ends_lone_socket_visit() {
 
 #[test]
 fn lone_socket_sends_its_window_in_one_visit() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     assert_eq!(
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
@@ -1195,7 +1187,7 @@ fn lone_socket_sends_its_window_in_one_visit() {
 
 #[test]
 fn lone_burst_stores_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, _) = establish(&mut iface, &mut sockets, &mut device, 1234);
     assert_eq!(
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
@@ -1219,7 +1211,7 @@ fn lone_burst_stores_deadline() {
 
 #[test]
 fn visit_end_after_pure_ack_stores_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let mut data = segment(1234, TcpControl::None, 101, seq);
     data.payload = b"a";
@@ -1230,7 +1222,7 @@ fn visit_end_after_pure_ack_stores_deadline() {
         PollResult::SocketStateChanged
     );
     assert_eq!(device.tx_queue.len(), 1);
-    let ip = Ipv4Packet::new_checked(device.tx_queue.front().unwrap()).unwrap();
+    let ip = Ipv4Packet::new_checked(strip_eth(device.tx_queue.front().unwrap())).unwrap();
     let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
     assert!(tcp.ack());
     assert_eq!(tcp.ack_number(), TcpSeqNumber(102));
@@ -1246,7 +1238,7 @@ fn visit_end_after_pure_ack_stores_deadline() {
 
 #[test]
 fn visit_end_after_fin_stores_retransmit_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     assert_eq!(sockets.get(handle).send_queue(), 0);
     sockets.close(handle);
@@ -1267,7 +1259,7 @@ fn visit_end_after_fin_stores_retransmit_deadline() {
 
 #[test]
 fn visit_end_with_peer_window_full_stores_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let mut window = segment(1234, TcpControl::None, 101, seq);
     window.window_len = 1024;
@@ -1299,7 +1291,7 @@ fn visit_end_with_peer_window_full_stores_deadline() {
 /// deadline.
 #[test]
 fn segment_cap_end_reclassifies() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let (b, b_seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
     for (handle, port, seq, byte) in [(a, 1234, a_seq, 1), (b, 1235, b_seq, 2)] {
@@ -1335,7 +1327,7 @@ fn segment_cap_end_reclassifies() {
 #[test]
 fn one_segment_per_visit_while_others_wait_then_lone_burst() {
     for a_segments in [4, 1] {
-        let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+        let (mut iface, mut sockets, mut device) = setup_eth();
         let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
         let (b, b_seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
         assert_eq!(
@@ -1395,7 +1387,7 @@ fn one_segment_per_visit_while_others_wait_then_lone_burst() {
 
 #[test]
 fn burst_stops_at_device_refusal() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     assert_eq!(
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
@@ -1503,7 +1495,7 @@ fn parked_socket_allows_lone_socket_to_burst() {
 
 #[test]
 fn two_ready_sockets_keep_strict_interleave_by_default() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (a, a_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let (b, b_seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
     for handle in [a, b] {
@@ -1537,7 +1529,7 @@ fn two_ready_sockets_keep_strict_interleave_by_default() {
 #[test]
 fn one_busy_socket_request_reply_at_any_slot_count() {
     for slot_count in [64, 10240] {
-        let (mut iface, _, mut device) = setup(Medium::Ip);
+        let (mut iface, _, mut device) = setup_eth();
         let mut sockets = TcpSet::new(slot_count);
         let (handle, mut seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
         assert_eq!(sockets.slot_count(), slot_count);
@@ -1590,7 +1582,7 @@ fn one_busy_socket_request_reply_at_any_slot_count() {
 
 #[test]
 fn expired_timers_admitted_in_slot_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let b = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     send_for_rto(&mut iface, &mut sockets, &mut device, a, Duration::from_millis(20));
@@ -1610,7 +1602,7 @@ fn expired_timers_admitted_in_slot_order() {
 
 #[test]
 fn unqueued_future_deadline_stays_on_wheel_after_device_refusal() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let b = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     send_for_rto(&mut iface, &mut sockets, &mut device, b, Duration::from_micros(300_500));
@@ -1640,7 +1632,7 @@ fn unqueued_future_deadline_stays_on_wheel_after_device_refusal() {
 
 #[test]
 fn queued_future_deadline_stays_exact_after_device_refusal() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let (b, seq) = establish(&mut iface, &mut sockets, &mut device, 1235);
     send_for_rto(&mut iface, &mut sockets, &mut device, b, Duration::from_micros(300_500));
@@ -1678,7 +1670,7 @@ fn queued_future_deadline_stays_exact_after_device_refusal() {
 
 #[test]
 fn simultaneous_rto_expiry_retransmits_in_slot_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let connections: Vec<_> = (1234..1298)
         .map(|port| establish(&mut iface, &mut sockets, &mut device, port))
         .collect();
@@ -1705,7 +1697,7 @@ fn simultaneous_rto_expiry_retransmits_in_slot_order() {
 
 #[test]
 fn simultaneous_rto_expiry_polled_before_egress_keeps_slot_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let connections: Vec<_> = (1234..1298)
         .map(|port| establish(&mut iface, &mut sockets, &mut device, port))
         .collect();
@@ -1734,7 +1726,7 @@ fn simultaneous_rto_expiry_polled_before_egress_keeps_slot_order() {
 
 #[test]
 fn rto_deadlines_preserve_timer_queue_order() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let handles: Vec<_> = (1234..1237)
         .map(|port| establish(&mut iface, &mut sockets, &mut device, port))
         .collect();
@@ -1755,7 +1747,7 @@ fn rto_deadlines_preserve_timer_queue_order() {
 
 #[test]
 fn rto_deadline_cancellation_removes_idle_socket() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(20));
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(120)));

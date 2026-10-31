@@ -1,7 +1,7 @@
 use super::*;
 use crate::iface::SocketHandle;
 use crate::socket::tcp;
-use crate::tests::TestingDevice;
+use crate::tests::{setup_eth, strip_eth, wrap_eth, TestingDevice};
 use crate::time::Duration;
 
 const LOCAL: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
@@ -69,7 +69,7 @@ fn receive(
         &LOCAL.into(),
         &ChecksumCapabilities::default(),
     );
-    device.rx_queue.push_back(bytes);
+    device.rx_queue.push_back(wrap_eth(&bytes));
     assert_eq!(
         iface.poll_ingress_single(now, device, sockets),
         PollIngressSingleResult::SocketStateChanged
@@ -79,7 +79,7 @@ fn receive(
 
 fn take_tcp(device: &mut TestingDevice) -> (u16, TcpControl, TcpSeqNumber, Vec<u8>) {
     let bytes = device.tx_queue.pop_front().unwrap();
-    let ip = Ipv4Packet::new_checked(&bytes).unwrap();
+    let ip = Ipv4Packet::new_checked(strip_eth(&bytes)).unwrap();
     assert!(ip.verify_checksum());
     assert_eq!((ip.src_addr(), ip.dst_addr()), (LOCAL, REMOTE));
     let tcp = TcpRepr::parse(
@@ -131,7 +131,7 @@ fn establish(
 
 #[test]
 fn deadline_follows_app_change_without_ingress() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device);
     sockets.get_mut(handle).set_rto(Duration::from_millis(100));
     assert_eq!(iface.poll_at(START, &mut sockets), None);
@@ -232,7 +232,7 @@ fn neighbor_learned_releases_waiting_deadline() {
 
 #[test]
 fn cached_poll_at_matches_full_scan_under_churn() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let mut handles = Vec::new();
     let mut local_seq = [TcpSeqNumber(0); 16];
     for index in 0..16 {
@@ -407,7 +407,7 @@ fn cached_poll_at_matches_full_scan_under_churn() {
 
 #[test]
 fn poll_at_matches_full_scan_with_wheel() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, mut device) = setup_eth();
     let start = Instant::from_millis(-100);
     assert_eq!(iface.poll_at(start, &mut sockets), None);
     let mut handles = Vec::new();
