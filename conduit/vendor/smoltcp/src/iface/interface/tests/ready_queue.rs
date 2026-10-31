@@ -793,7 +793,7 @@ fn check_close_timer_after_idle_wheel(now: Instant, fresh: bool, poll_at_first: 
         segment(1234, TcpControl::None, 102, seq + 1),
     );
     let deadline = now + Duration::from_secs(10);
-    assert_eq!(sockets.get(handle).poll_at(iface.context()), PollAt::Time(deadline));
+    assert_eq!(sockets.get(handle).poll_at(), PollAt::Time(deadline));
     if poll_at_first {
         let at = iface.poll_at(now, &mut sockets).unwrap();
         assert!(at > now && at <= deadline, "poll_at returned {at} at {now}");
@@ -841,11 +841,11 @@ fn poll_at_after_advance_stays_between_now_and_rounded_earliest_deadline() {
     send_for_rto(&mut iface, &mut sockets, &mut device, first, first_rto);
     send_for_rto(&mut iface, &mut sockets, &mut device, second, second_rto);
     assert_eq!(
-        sockets.get(first).poll_at(iface.context()),
+        sockets.get(first).poll_at(),
         PollAt::Time(START + first_rto)
     );
     assert_eq!(
-        sockets.get(second).poll_at(iface.context()),
+        sockets.get(second).poll_at(),
         PollAt::Time(START + second_rto)
     );
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(128)));
@@ -1130,7 +1130,7 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
     );
     assert_eq!(sockets.dirty_list, vec![0]);
     assert_eq!(
-        sockets.get(handle).poll_at(iface.context()),
+        sockets.get(handle).poll_at(),
         PollAt::Time(Instant::from_millis(120))
     );
     let now = Instant::from_millis(120);
@@ -1140,7 +1140,7 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
     assert!(payload.is_empty());
     assert!(device.tx_queue.is_empty());
     assert_eq!(
-        sockets.get(handle).poll_at(iface.context()),
+        sockets.get(handle).poll_at(),
         PollAt::Time(Instant::from_millis(125))
     );
     assert_eq!(
@@ -1202,7 +1202,7 @@ fn lone_burst_stores_deadline() {
     );
     assert_eq!(sent_ports(&mut device), [1234; 4]);
     assert!(sockets.dirty_list.is_empty());
-    let deadline = sockets.get(handle).poll_at(&mut iface.inner);
+    let deadline = sockets.get(handle).poll_at();
     assert!(matches!(deadline, PollAt::Time(time) if time > START));
     assert_eq!(sockets.stored_deadline(0), deadline);
     assert_eq!(
@@ -1233,7 +1233,7 @@ fn visit_end_after_pure_ack_stores_deadline() {
     assert_eq!((port, control, sent_seq), (1234, TcpControl::None, seq));
     assert!(payload.is_empty());
     assert!(device.tx_queue.is_empty());
-    let deadline = sockets.get(handle).poll_at(&mut iface.inner);
+    let deadline = sockets.get(handle).poll_at();
     assert_eq!(deadline, PollAt::Ingress);
     assert_eq!(sockets.stored_deadline(0), deadline);
     assert!(sockets.dirty_list.is_empty());
@@ -1254,7 +1254,7 @@ fn visit_end_after_fin_stores_retransmit_deadline() {
     assert_eq!((port, control, sent_seq), (1234, TcpControl::Fin, seq));
     assert!(payload.is_empty());
     assert!(device.tx_queue.is_empty());
-    let deadline = sockets.get(handle).poll_at(&mut iface.inner);
+    let deadline = sockets.get(handle).poll_at();
     assert!(matches!(deadline, PollAt::Time(time) if time > START));
     assert_eq!(sockets.stored_deadline(0), deadline);
     assert!(sockets.dirty_list.is_empty());
@@ -1284,7 +1284,7 @@ fn visit_end_with_peer_window_full_stores_deadline() {
     }
     assert!(device.tx_queue.is_empty());
     assert_eq!(sockets.get(handle).send_queue(), 4 * 512);
-    let deadline = sockets.get(handle).poll_at(&mut iface.inner);
+    let deadline = sockets.get(handle).poll_at();
     assert!(matches!(deadline, PollAt::Time(time) if time > START));
     assert_eq!(sockets.stored_deadline(0), deadline);
     assert!(sockets.dirty_list.is_empty());
@@ -1317,7 +1317,7 @@ fn segment_cap_end_reclassifies() {
         assert_eq!(sent_seq, seq);
         assert_eq!(payload, [byte; 512]);
         assert_eq!(sockets.get(handle).send_queue(), 4 * 512);
-        let deadline = sockets.get(handle).poll_at(&mut iface.inner);
+        let deadline = sockets.get(handle).poll_at();
         assert!(matches!(deadline, PollAt::Time(time) if time > START));
         assert_eq!(sockets.stored_deadline(index), deadline);
     }

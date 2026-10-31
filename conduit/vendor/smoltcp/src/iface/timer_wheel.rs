@@ -69,7 +69,7 @@ mod list {
 
     use super::links::{ListLinked, NIL};
     #[cfg(test)]
-    use alloc::{vec, vec::Vec};
+    use alloc::vec::Vec;
 
     /// Head of an intrusive doubly-linked list.
     #[derive(Clone, Copy, Debug, Default)]
@@ -149,13 +149,6 @@ mod list {
             entries[idx as usize].set_next(NIL);
 
             Some(idx)
-        }
-
-        /// Drain all entries, calling f for each.
-        pub(crate) fn drain<T: ListLinked, F: FnMut(u32)>(&mut self, entries: &mut [T], mut f: F) {
-            while let Some(idx) = self.pop_front(entries) {
-                f(idx);
-            }
         }
     }
 
@@ -292,22 +285,6 @@ mod list {
             assert_eq!(list.last, 1);
             assert_eq!(entries[1].next(), NIL);
         }
-
-        #[test]
-        fn test_drain() {
-            let mut entries = make_entries(5);
-            let mut list = ListHead::new();
-
-            list.push_back(&mut entries, 0);
-            list.push_back(&mut entries, 1);
-            list.push_back(&mut entries, 2);
-
-            let mut drained = Vec::new();
-            list.drain(&mut entries, |idx| drained.push(idx));
-
-            assert_eq!(drained, vec![0, 1, 2]);
-            assert!(list.is_empty());
-        }
     }
 }
 
@@ -378,6 +355,7 @@ impl TimerWheel {
         self.current_tick
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending(&self) -> bool {
         self.linked_count != 0
     }

@@ -374,6 +374,7 @@ impl UniqueTxBuf {
         self.0.len()
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn payload(&self) -> &[u8] {
         self.0.payload()
@@ -466,6 +467,7 @@ impl TxFrame {
         self.0.origin()
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn unique(&self) -> bool {
         self.0.unique()

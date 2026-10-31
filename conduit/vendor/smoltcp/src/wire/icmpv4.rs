@@ -614,30 +614,6 @@ impl<'a> fmt::Display for Repr<'a> {
     }
 }
 
-use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
-
-impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
-    fn pretty_print(
-        buffer: &dyn AsRef<[u8]>,
-        f: &mut fmt::Formatter,
-        indent: &mut PrettyIndent,
-    ) -> fmt::Result {
-        let packet = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{indent}({err})"),
-            Ok(packet) => packet,
-        };
-        write!(f, "{indent}{packet}")?;
-
-        match packet.msg_type() {
-            Message::DstUnreachable | Message::TimeExceeded => {
-                indent.increase(f)?;
-                super::Ipv4Packet::<&[u8]>::pretty_print(&packet.data(), f, indent)
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;

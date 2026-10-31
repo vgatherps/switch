@@ -2888,7 +2888,7 @@ impl<'a> Socket<'a> {
         }
     }
 
-    fn seq_to_transmit(&self, cx: &Context) -> bool {
+    fn seq_to_transmit(&self) -> bool {
         // Fast retransmits should always send, even if later congestion checks would disallow
         if self.pending_fast_retransmit {
             return true;
@@ -3132,7 +3132,7 @@ impl<'a> Socket<'a> {
         }
 
         // Decide whether we're sending a packet.
-        if self.seq_to_transmit(cx) {
+        if self.seq_to_transmit() {
             // If we have data to transmit and it fits into partner's window, do it.
             tcp_trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
@@ -3509,14 +3509,14 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    pub(crate) fn poll_at(&self, cx: &mut Context) -> PollAt {
-        let (poll_at, wake_at_held) = self.poll_at_read(cx);
+    pub(crate) fn poll_at(&self) -> PollAt {
+        let (poll_at, wake_at_held) = self.poll_at_read();
         self.rx_buffer.shared.wake_at_held.set(wake_at_held);
         poll_at
     }
 
     #[allow(clippy::if_same_then_else)]
-    pub(crate) fn poll_at_read(&self, cx: &Context) -> (PollAt, usize) {
+    pub(crate) fn poll_at_read(&self) -> (PollAt, usize) {
         // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
@@ -3527,7 +3527,7 @@ impl<'a> Socket<'a> {
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
             (PollAt::Now, usize::MAX)
-        } else if self.seq_to_transmit(cx) {
+        } else if self.seq_to_transmit() {
             // We have a data or flag packet to transmit.
             (PollAt::Now, usize::MAX)
         } else {
@@ -3626,12 +3626,9 @@ fn rtt_sampling_round_trips() {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::config::IFACE_MAX_ADDR_COUNT;
     use crate::phy::TxPool;
     use crate::wire::{IpCidr, IpRepr, TcpTimestampRepr};
-    use std::cell::Cell;
     use std::ops::{Deref, DerefMut};
-    use std::rc::Rc;
     use std::vec::Vec;
 
     #[test]
@@ -4205,8 +4202,6 @@ mod test {
     }
 
     fn receive_window_socket(ip_mtu: usize, capacity: usize) -> TestSocket {
-        use crate::phy::Device;
-
         let mut device = MtuDevice(
             crate::tests::TestingDevice::new(crate::phy::Medium::Ethernet),
             ip_mtu + crate::wire::ETHERNET_HEADER_LEN,
@@ -5241,7 +5236,7 @@ mod test {
         recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(seq + 3).win(0)]);
         frames.push(s.recv().unwrap().unwrap());
         assert_eq!(frames.len(), s.rx_frame_cap());
-        assert_ne!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        assert_ne!(s.socket.poll_at(), PollAt::Now);
         assert_eq!(s.rx_buffer.shared.wake_at_held.get(), frames.len() - 1);
         (s, frames, seq + 3)
     }
@@ -5304,7 +5299,7 @@ mod test {
         let mut s = socket_established();
         s.set_rx_wake(queue.clone(), handle);
         let frames = hold_rx_frames(&mut s, 1);
-        assert_ne!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        assert_ne!(s.socket.poll_at(), PollAt::Now);
         assert_eq!(s.rx_buffer.shared.wake_at_held.get(), usize::MAX);
         drop(frames);
         assert!(!s.window_to_update());
@@ -5351,7 +5346,7 @@ mod test {
                 s.timer.poll_at().min(PollAt::Ingress)
             };
             assert_eq!(
-                s.socket.poll_at(&mut s.cx),
+                s.socket.poll_at(),
                 expected,
                 "unread {unread}, last window {last_win}, {ack_timer:?}"
             );
@@ -6798,7 +6793,7 @@ mod test {
         });
         send!(s, time 40, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2));
         assert_eq!(s.state(), State::FinWait2);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(60_040)));
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(60_040)));
         recv_nothing(&mut s, Instant::from_millis(60_039));
         assert_eq!(s.state(), State::FinWait2);
         recv_nothing(&mut s, Instant::from_millis(60_040));
@@ -6811,7 +6806,7 @@ mod test {
     fn orphan_fin_wait_2_arms_timeout_from_drop() {
         let mut s = socket_fin_wait_2();
         s.orphan(Instant::from_millis(70));
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(60_070)));
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(60_070)));
         recv_nothing(&mut s, Instant::from_millis(60_069));
         assert_eq!(s.state(), State::FinWait2);
         recv_nothing(&mut s, Instant::from_millis(60_070));
@@ -6844,7 +6839,7 @@ mod test {
         recv_nothing(&mut s, Instant::from_secs(120));
         assert_eq!(s.state(), State::FinWait2);
         assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        assert_eq!(s.socket.poll_at(), PollAt::Ingress);
     }
 
     #[test]
@@ -6856,14 +6851,14 @@ mod test {
         for at in 200..206 {
             for window in [0, 256] {
                 send!(s, time at, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(window));
-                assert_eq!(s.socket.poll_at(&mut s.cx), deadline);
+                assert_eq!(s.socket.poll_at(), deadline);
             }
             let reply = send(&mut s, Instant::from_millis(at), &SEND_TEMPL.seq(REMOTE_SEQ)
                 .ack(LOCAL_SEQ + 2));
             if let Some(reply) = reply {
                 assert_eq!(reply.control, TcpControl::None);
             }
-            assert_eq!(s.socket.poll_at(&mut s.cx), deadline);
+            assert_eq!(s.socket.poll_at(), deadline);
             recv_nothing(&mut s, Instant::from_millis(at));
         }
         recv_nothing(&mut s, Instant::from_millis(60_100));
@@ -7101,8 +7096,8 @@ mod test {
         assert_eq!(aborted.state(), State::Closed);
         assert!(aborted.tuple.is_some());
         rows.push(("aborted".into(), aborted, PollAt::Now));
-        for (name, mut s, expected) in rows {
-            let poll_at = s.socket.poll_at(&mut s.cx);
+        for (name, s, expected) in rows {
+            let poll_at = s.socket.poll_at();
             assert_eq!(poll_at, expected, "{name}");
         }
     }
@@ -7257,7 +7252,7 @@ mod test {
         );
         assert_eq!(s.remote_last_win_bytes, 65535);
         recv_nothing!(s);
-        assert_eq!(s.socket.poll_at(&mut s.cx),
+        assert_eq!(s.socket.poll_at(),
             PollAt::Time(Instant::from_millis(300)));
         recv_nothing!(s, time 299);
         send!(
@@ -7593,7 +7588,7 @@ mod test {
         assert_eq!(sent, WINDOW);
         assert_eq!(s.flight_size(), WINDOW);
         assert!(s.cwnd_remaining() > 0);
-        assert!(!s.socket.seq_to_transmit(&mut s.cx));
+        assert!(!s.socket.seq_to_transmit());
         recv_nothing!(s);
     }
 
@@ -7662,7 +7657,7 @@ mod test {
             assert_eq!(s.flight_size(), WINDOW - (acked - prior));
             assert_eq!(flight(&mut s, 0), acked - prior);
             assert_eq!(s.flight_size(), WINDOW);
-            assert!(!s.socket.seq_to_transmit(&mut s.cx));
+            assert!(!s.socket.seq_to_transmit());
             recv_nothing!(s);
             prior = acked;
         }
@@ -8640,7 +8635,7 @@ mod test {
             SEND_TEMPL.syn().seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1)
         );
         assert_eq!(s.state, State::Established);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        assert_eq!(s.socket.poll_at(), PollAt::Now);
     }
 
     #[test]
@@ -12422,7 +12417,7 @@ mod test {
             recv_nothing!(s, time 11_001);
             assert_eq!(s.state(), State::Closed);
             assert_eq!(s.tuple, None);
-            assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+            assert_eq!(s.socket.poll_at(), PollAt::Ingress);
             assert_eq!(s.recv_queue(), 6);
             match reopen {
                 None => {
@@ -14690,7 +14685,7 @@ mod test {
             assert_eq!(s.ack_delay_timer(),
                        AckDelayTimer::Waiting(Instant::from_millis(1210)));
             assert!(!s.delayed_ack_expired(s.cx.now()));
-            assert!(!s.socket.seq_to_transmit(&mut s.cx));
+            assert!(!s.socket.seq_to_transmit());
             assert!(!s.window_to_update());
             recv_nothing!(s, time 1200);
             assert_eq!(s.recv_room() == 0, rx_len == 1024);
@@ -14705,7 +14700,7 @@ mod test {
             assert_eq!(s.window_to_update(), rx_len == 1024);
             assert_eq!(s.ack_delay_timer(),
                        AckDelayTimer::Waiting(Instant::from_millis(1210)));
-            assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+            assert_eq!(s.socket.poll_at(), PollAt::Now);
 
             let ack = RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(data_seq + 1024).win(rx_len as u16);
             if rx_len == 1024 {
@@ -14715,7 +14710,7 @@ mod test {
                 assert!(!s.window_to_update());
             } else {
                 recv_nothing!(s, time 1200);
-                assert_eq!(s.socket.poll_at(&mut s.cx),
+                assert_eq!(s.socket.poll_at(),
                            PollAt::Time(Instant::from_millis(1210)));
                 recv_nothing!(s, time 1209);
                 recv!(s, time 1210, Ok(ack));
@@ -14724,7 +14719,7 @@ mod test {
                 expires_at: Instant::from_millis(1500),
                 backoff_applied: false,
             });
-            assert_eq!(s.socket.poll_at(&mut s.cx),
+            assert_eq!(s.socket.poll_at(),
                        PollAt::Time(Instant::from_millis(1500)));
             recv_nothing!(s, time 1210);
             assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1);
@@ -14737,7 +14732,7 @@ mod test {
                 assert_eq!(s.recv_room(), 0);
                 assert_eq!(s.scaled_window(), 0);
                 assert!(!s.window_to_update());
-                assert_eq!(s.socket.poll_at(&mut s.cx),
+                assert_eq!(s.socket.poll_at(),
                            PollAt::Time(Instant::from_millis(1310)));
                 recv_nothing!(s, time 1309);
                 recv!(s, time 1310, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(data_seq + 2048).win(0)));
@@ -14791,13 +14786,13 @@ mod test {
         let mut s = socket_established();
         send!(s, time 100_000, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
         s.send_slice(b"abc").unwrap();
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        assert_eq!(s.socket.poll_at(), PollAt::Now);
         recv_nothing!(s, time 100_000);
         assert_eq!(s.timer, Timer::ZeroWindowProbe {
             expires_at: Instant::from_millis(100_300),
             backoff_applied: false,
         });
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(100_300)));
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(100_300)));
         recv_nothing!(s, time 100_299);
         recv!(s, time 100_300, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"a"[..])]);
         assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(100_900)));
@@ -14817,7 +14812,7 @@ mod test {
             expires_at: Instant::from_millis(100_900),
             backoff_applied: false,
         });
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(100_900)));
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(100_900)));
         recv_nothing!(s, time 100_899);
         recv!(s, time 100_900, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"a"[..])]);
         assert_eq!(s.timer, Timer::ZeroWindowProbe {
@@ -16015,15 +16010,15 @@ mod test {
         let mut s = socket_established();
         send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
         recv_nothing!(s, time 10_000);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        assert_eq!(s.socket.poll_at(), PollAt::Ingress);
         assert_eq!(s.send_slice(b"abc"), Ok(3));
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
+        assert_eq!(s.socket.poll_at(), PollAt::Now);
         recv_nothing!(s, time 20_000);
         assert_eq!(s.timer, Timer::ZeroWindowProbe {
             expires_at: Instant::from_millis(20_300),
             backoff_applied: false,
         });
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(20_300)));
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(20_300)));
         recv_nothing!(s, time 20_299);
         recv!(s, time 20_300, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"a")]);
         assert_eq!(s.send_queue(), 3);
@@ -16035,7 +16030,7 @@ mod test {
         let mut s = socket_established();
         for millis in [0, 300, 60_000, 3_600_000] {
             s.cx.set_now(Instant::from_millis(millis));
-            assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+            assert_eq!(s.socket.poll_at(), PollAt::Ingress);
             assert_eq!(s.state(), State::Established);
         }
     }
@@ -16075,13 +16070,13 @@ mod test {
         send!(s, time 1000, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2));
         recv!(s, time 1000, [RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2)]);
         assert_eq!(s.state(), State::TimeWait);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Time(Instant::from_millis(11_000)));
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(11_000)));
         recv_nothing!(s, time 10_999);
         assert_eq!(s.state(), State::TimeWait);
         recv_nothing!(s, time 11_000);
         assert_eq!(s.state(), State::Closed);
         assert_eq!(s.tuple, None);
-        assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+        assert_eq!(s.socket.poll_at(), PollAt::Ingress);
     }
 
     #[test]
@@ -16089,7 +16084,7 @@ mod test {
         let mut s = socket_established();
         for millis in [0, 100, 300, 60_000, 3_600_000] {
             recv_nothing!(s, time millis);
-            assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Ingress);
+            assert_eq!(s.socket.poll_at(), PollAt::Ingress);
             assert_eq!(s.state(), State::Established);
             assert_eq!(s.remote_max_seq, LOCAL_SEQ + 1);
         }
