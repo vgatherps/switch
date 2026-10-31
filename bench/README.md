@@ -17,7 +17,9 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   it measured the generator, so the sweep stops there with `generator_bound: true` and exits non-zero. Exit 0
   iff `complete` and not `generator_bound`. When a worker fails, the steps already printed stand and the
   summary says `complete: false`. A worker that does not answer within the step's time plus 10 s fails the
-  sweep, and every worker's process group is killed. Before each step every worker's wall clock is probed: one
+  sweep, and every worker's process group is killed. A shutdown failure also kills all workers still awaiting
+  shutdown, including their child processes, before returning the incomplete summary.
+  Before each step every worker's wall clock is probed: one
   more than 1 ms off the coordinator's fails the sweep, and so does a worker that gets a step after its start
   time (50 ms ahead). `--budget-us W` (TCP, ws): the first step runs without a budget and its median
   service round trip (echo time - actual send time) is the baseline; from then on each connection may have its
@@ -69,8 +71,9 @@ under overload, a blocked sender not holding back the others, flow control kept 
 backlog at the cutoff), receive accounting (latency, warmup, loss, ignored duplicates/stale/malformed echoes,
 in-window receives), the histogram, the rate list, the worker start offsets, merging of worker results
 (achieved rates, loss, budget, generator-bound), the outstanding-budget rule, the coordinator's reply and exit
-timeouts (silent workers and their process groups killed), its clock and late-start checks, its summary after
-a worker dies, after total loss and after a generator-bound step (fake workers), the TCP stream cutter and the
+timeouts (silent workers and their process groups killed), cleanup of remaining process groups after a worker
+fails shutdown, its clock and late-start checks, its summary after a worker dies, after total loss and after
+a generator-bound step (fake workers), the TCP stream cutter and the
 ws client framing. With `--features e2e` (`make -C conduit test-bench`, in `make test`; needs NET_ADMIN and
 /dev/net/tun) it also runs the TCP echo receiver on net_tap against a kernel peer whose small segments conduit
 appends into one received frame larger than a TX frame: every byte must come back.
