@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+"""zhida-aws-bench: the latency/load bench on EC2 in one command, 1 receiver + 5 sender hosts.
+
+  zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
+  zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
+  zhida_aws_bench.py cleanup --run-id ID
+
+Needs python3 with boto3, ssh, scp, ssh-keygen, git, a clean committed tree (the hosts build
+`git archive HEAD`) and AWS credentials for the region. Design: plans/bench/design.md.
+
+`run` provisions six c7gn.2xlarge on-demand instances (one run_instances) in one cluster placement
+group, one data ENI each; builds natively (bootstrap.sh, `deploy/hft-host.sh build`, S3 cache keyed
+by versions); applies `deploy/hft-host.sh` (reboot, verify); runs the fixed sweep matrix with the
+coordinator on sender0 driving one worker per sender host over SSH; fetches every result; runs
+bench/report.py; tears down. Billable per-run resources carry the run id and expiry tags; each
+instance powers itself off (terminate) at the TTL; the runner tears down on exit, Ctrl-C and SIGTERM.
+"""
+import argparse
+import datetime
+import json
+import os
+import random
+import shlex
+import signal
+import string
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import janitor  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+SHARED = {"Key": janitor.SHARED_TAG, "Value": "shared"}
+ROLE_TAG = "zhida-bench-role"
+AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+VPC_CIDR, SUBNET_CIDR = "10.80.0.0/16", "10.80.1.0/24"
+NAME = "zhida-bench"
+KEY_DIR = os.path.expanduser("~/.zhida-bench")
+REGION = "ap-northeast-1"
+TTL = "2h"
+
+INSTANCE_TYPE, HOST_VCPUS, ROOT_GB = "c7gn.2xlarge", 8, 40
+ROLES = ["receiver"] + [f"sender{i}" for i in range(5)]
+SENDER_HOSTS = len(ROLES) - 1
+SENDERS = 4 * SENDER_HOSTS
+SIZE = 64
+RATE_MIN, RATE_MAX = 10_000, 5_000_000
+BUDGET_US = 50
+SWEEPS = [("udp", None), ("tcp", BUDGET_US), ("ws", BUDGET_US)]
+PORT = 7000
+DPDK_VERSION = "25.11.3"
+MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
+SRC_DIR = "/opt/zhida-src"
+HFT = f"{SRC_DIR}/deploy/hft-host.sh"
+REMOTE = "/var/tmp/zhida"
+RECEIVER_UNIT = "zhida-bench-receiver"
+# One sweep's upper bound: <= 20 rate steps x (0.5 s warmup + 2 s window + 0.2 s drain + 5 s stall
+# limit) plus worker start-up, rounded up. Also the coordinator's timeout.
+SWEEP_WORST_S = 15 * 60
+TEARDOWN_MARGIN_S = 10 * 60
+CLOCK_LIMIT_S = 0.001
+BOOTSTRAP_S = 3600
+SETUP_REBOOT_S = 900
+
+
+def log(msg):
+    print(f"zhida-aws-bench: {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- pure parts
+
+
+def parse_duration(text):
+    """'90m', '2h', '45s' or plain seconds -> seconds."""
+    units = {"s": 1, "m": 60, "h": 3600}
+    if text and text[-1] in units:
+        return int(float(text[:-1]) * units[text[-1]])
+    return int(text)
+
+
+def new_run_id(now):
+    return now.strftime("%Y%m%d-%H%M%S-") + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+
+
+def run_tags(run_id, expires):
+    return [{"Key": janitor.RUN_TAG, "Value": run_id}, {"Key": janitor.EXPIRES_TAG, "Value": expires.isoformat()},
+            {"Key": "Name", "Value": f"{NAME}-{run_id}"}]
+
+
+def tag(proto, budget):
+    return f"{proto}-n{SENDERS}-s{SIZE}-{'uncapped' if budget is None else f'b{budget}'}"
+
+
+def sweep_tags():
+    return [tag(p, b) for p, b in SWEEPS]
+
+
+def gen_template(proto, receiver_ip, t):
+    """--gen-cmd: the coordinator runs it with `sh -c` on sender0 for {i} = 0..4; it starts worker
+    {i} on sender{i} through the run's ssh_config, pinned to that host's APP_CPU."""
+    inner = (f". /etc/zhida/host.env; exec env {MIMALLOC_ENV} taskset -c $APP_CPU zhida-bench gen"
+             f" --config /etc/zhida/dut.json --proto {proto} --target {receiver_ip}:{PORT} --senders {{senders}}"
+             f" --size {SIZE} --local-port 40000 2>>{REMOTE}/gen-{t}.log")
+    return f"ssh -F {REMOTE}/ssh_config sender{{i}} {shlex.quote('sudo sh -c ' + shlex.quote(inner))}"
+
+
+def sweep_command(proto, budget, receiver_ip, housekeeping):
+    """The coordinator, run as ec2-user on sender0's housekeeping CPUs."""
+    t = tag(proto, budget)
+    budget_arg = "" if budget is None else f" --budget-us {budget}"
+    return (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDER_HOSTS}"
+            f" --senders {SENDERS} --size {SIZE} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
+            f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
+            f" > {REMOTE}/{t}.jsonl 2> {REMOTE}/{t}.coord.log")
+
+
+def serve_command(proto, app_cpu, t):
+    """The receiver as a transient systemd unit; `systemctl stop` (SIGTERM) writes its counter log."""
+    return (f"systemd-run --unit {RECEIVER_UNIT} --setenv={MIMALLOC_ENV} taskset -c {shlex.quote(app_cpu)}"
+            f" zhida-bench serve --config /etc/zhida/dut.json --proto {proto} --port {PORT}"
+            f" --counter-log {REMOTE}/dut-counters-{t}.jsonl")
+
+
+def ssh_config(sender_ips):
+    """sender0's ssh_config: the five senders by their primary private IPs, the run's key."""
+    lines = []
+    for i, ip in enumerate(sender_ips):
+        lines += [f"Host sender{i}", f"    HostName {ip}"]
+    lines += ["Host *", "    User ec2-user", f"    IdentityFile {REMOTE}/id_run", "    BatchMode yes",
+              f"    UserKnownHostsFile {REMOTE}/known_hosts", "    StrictHostKeyChecking accept-new",
+              "    ConnectTimeout 10", "    ServerAliveInterval 15"]
+    return "\n".join(lines) + "\n"
+
+
+HOST_ENV_KEYS = ("MGMT_IF", "DATA_IF", "DATA_PCI", "DATA_MAC", "NUMA_NODE", "APP_CPU", "ISOLATED", "HOUSEKEEPING")
+
+
+def parse_host_env(text):
+    """/etc/zhida/host.env (shell assignments) -> dict; every key hft-host.sh writes must be there."""
+    out = {}
+    for line in text.splitlines():
+        words = shlex.split(line, comments=True)
+        for w in words:
+            if "=" in w:
+                k, v = w.split("=", 1)
+                out[k] = v
+    missing = [k for k in HOST_ENV_KEYS if not out.get(k)]
+    if missing:
+        raise ValueError(f"host.env lacks {', '.join(missing)}")
+    return out
+
+
+def data_ip(dut_json):
+    """The data ENI's address from /etc/zhida/dut.json ("ipv4": "10.80.1.23/24")."""
+    return json.loads(dut_json)["ipv4"].split("/")[0]
+
+
+def parse_chrony(text):
+    """`chronyc tracking` -> (ok, detail): synchronised and |system time offset| <= CLOCK_LIMIT_S."""
+    fields = {}
+    for line in text.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fields[k.strip()] = v.strip()
+    leap, system = fields.get("Leap status"), fields.get("System time")
+    if leap is None or system is None:
+        return False, "no chronyc tracking output"
+    if leap != "Normal":
+        return False, f"leap status {leap}"
+    words = system.split()
+    offset = float(words[0]) * (-1 if len(words) > 2 and words[2] == "slow" else 1)
+    if abs(offset) > CLOCK_LIMIT_S:
+        return False, f"offset {offset * 1e6:.0f} us"
+    return True, f"offset {offset * 1e6:.1f} us"
+
+
+def rust_toolchain(repo=REPO):
+    with open(os.path.join(repo, "rust-toolchain.toml")) as f:
+        for line in f:
+            k, _, v = line.partition("=")
+            if k.strip() == "channel":
+                return v.strip().strip('"')
+    raise ValueError("rust-toolchain.toml has no channel")
+
+
+def cache_keys(prefix, arch, version_id, tree, rust):
+    """S3 cache objects, keyed by the versions that determine their content."""
+    return (f"{prefix}/dpdk-{DPDK_VERSION}-{arch}-al2023-{version_id}.tar.gz",
+            f"{prefix}/bench-{tree}-{arch}-dpdk{DPDK_VERSION}-rust{rust}.tar.gz")
+
+
+def user_data(deadline, now):
+    """Instance user data: a persistent systemd timer powers the instance off at `deadline` (which
+    terminates it: InstanceInitiatedShutdownBehavior=terminate), surviving the setup reboot; plus an
+    immediate `shutdown -h` as a second guard for the first boot."""
+    stamp = deadline.strftime("%Y-%m-%d %H:%M:%S UTC")
+    minutes = max(1, int((deadline - now).total_seconds() // 60))
+    return f"""#!/bin/sh
+cat >/etc/systemd/system/zhida-deadman.timer <<EOF
+[Unit]
+Description=zhida-bench dead-man: power off (terminate) at the run's TTL
+[Timer]
+OnCalendar={stamp}
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+cat >/etc/systemd/system/zhida-deadman.service <<EOF
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl poweroff
+EOF
+systemctl daemon-reload
+systemctl enable --now zhida-deadman.timer
+shutdown -h +{minutes}
+"""
+
+
+def plan_text(region, ttl, run_id, expires):
+    lines = [
+        f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
+        f"hosts: {len(ROLES)} x {INSTANCE_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
+        f" cluster placement group {NAME}, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 DPDK data ENI"
+        " (vfio-pci, DeleteOnTermination); CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
+        f"  {'receiver':9} zhida-bench serve on APP_CPU (systemd unit {RECEIVER_UNIT})",
+        f"  {'sender0':9} zhida-bench sweep (coordinator) on HOUSEKEEPING; worker 0 (zhida-bench gen) on APP_CPU",
+    ]
+    lines += [f"  {f'sender{i}':9} worker {i} (zhida-bench gen, over SSH from sender0) on APP_CPU"
+              for i in range(1, SENDER_HOSTS)]
+    lines += [
+        f"sweeps: {SENDERS} senders ({SENDERS // SENDER_HOSTS} per sender host), {SIZE} B messages,"
+        f" {RATE_MIN}..{RATE_MAX} msg/s; before each: clock (chrony |offset| <= {CLOCK_LIMIT_S * 1e3:g} ms on all"
+        f" six) and TTL (>= {SWEEP_WORST_S // 60} min sweep + {TEARDOWN_MARGIN_S // 60} min teardown left)",
+    ]
+    lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
+    lines += [
+        f"needs: on-demand Standard vCPU quota L-1216C47A with {len(ROLES) * HOST_VCPUS} vCPUs free in {region};"
+        " permissions: see `zhida_aws_bench.py -h`",
+        f"billable while the run lives: {len(ROLES)} instances, {len(ROLES)} x {ROOT_GB} GB gp3 root volumes,"
+        f" {len(ROLES)} public IPv4 addresses; until `cleanup --shared`: the S3 build cache",
+        "expiry: each instance powers itself off (terminates) at the TTL; the runner tears down on exit,"
+        " Ctrl-C and SIGTERM",
+    ]
+    return "\n".join(lines)
+
+
+def error_code(e):
+    return getattr(e, "response", {}).get("Error", {}).get("Code")
+
+
+# ---------------------------------------------------------------- AWS
+
+
+class Aws:
+    def __init__(self, region, clients=None):
+        if clients is None:
+            import boto3
+
+            session = boto3.session.Session(region_name=region)
+            clients = {n: session.client(n) for n in ("ec2", "iam", "s3", "ssm", "sts")}
+        self.region = region
+        self.ec2, self.iam, self.s3 = clients["ec2"], clients["iam"], clients["s3"]
+        self.ssm, self.sts = clients["ssm"], clients["sts"]
+
+    def shared_one(self, describe, key, filters):
+        items = describe(Filters=[{"Name": f"tag:{janitor.SHARED_TAG}", "Values": ["shared"]}] + filters)[key]
+        return items[0] if items else None
+
+    def ensure_shared(self, my_ip):
+        """Resources reused across runs; idempotent."""
+        ec2 = self.ec2
+        account = self.sts.get_caller_identity()["Account"]
+
+        def tagspec(kind):
+            return [{"ResourceType": kind, "Tags": [SHARED, {"Key": "Name", "Value": NAME}]}]
+
+        vpc = self.shared_one(ec2.describe_vpcs, "Vpcs", [])
+        if vpc is None:
+            vpc = ec2.create_vpc(CidrBlock=VPC_CIDR, TagSpecifications=tagspec("vpc"))["Vpc"]
+            ec2.get_waiter("vpc_available").wait(VpcIds=[vpc["VpcId"]])
+            ec2.modify_vpc_attribute(VpcId=vpc["VpcId"], EnableDnsHostnames={"Value": True})
+        vpc_id = vpc["VpcId"]
+        in_vpc = [{"Name": "vpc-id", "Values": [vpc_id]}]
+        subnet = self.shared_one(ec2.describe_subnets, "Subnets", in_vpc)
+        if subnet is None:
+            subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock=SUBNET_CIDR, AvailabilityZone=self.zone_offering(),
+                                       TagSpecifications=tagspec("subnet"))["Subnet"]
+        igw = self.shared_one(ec2.describe_internet_gateways, "InternetGateways", [])
+        if igw is None:
+            igw = ec2.create_internet_gateway(TagSpecifications=tagspec("internet-gateway"))["InternetGateway"]
+            ec2.attach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id)
+        rt = self.shared_one(ec2.describe_route_tables, "RouteTables", in_vpc)
+        if rt is None:
+            rt = ec2.create_route_table(VpcId=vpc_id, TagSpecifications=tagspec("route-table"))["RouteTable"]
+            ec2.create_route(RouteTableId=rt["RouteTableId"], DestinationCidrBlock="0.0.0.0/0",
+                             GatewayId=igw["InternetGatewayId"])
+            ec2.associate_route_table(RouteTableId=rt["RouteTableId"], SubnetId=subnet["SubnetId"])
+        sg = self.shared_one(ec2.describe_security_groups, "SecurityGroups", in_vpc)
+        if sg is None:
+            sg_id = ec2.create_security_group(GroupName=NAME, Description="zhida-bench hosts", VpcId=vpc_id,
+                                              TagSpecifications=tagspec("security-group"))["GroupId"]
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
+                {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": sg_id}]}])
+        else:
+            sg_id = sg["GroupId"]
+        try:
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
+                {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": f"{my_ip}/32"}]}])
+        except Exception as e:
+            if error_code(e) != "InvalidPermission.Duplicate":
+                raise
+        if not ec2.describe_placement_groups(Filters=[{"Name": "group-name", "Values": [NAME]}])["PlacementGroups"]:
+            ec2.create_placement_group(GroupName=NAME, Strategy="cluster", TagSpecifications=tagspec("placement-group"))
+        key_path = os.path.join(KEY_DIR, f"{NAME}-{self.region}.pem")
+        keys = ec2.describe_key_pairs(Filters=[{"Name": "key-name", "Values": [NAME]}])["KeyPairs"]
+        if keys and not os.path.exists(key_path):
+            raise RuntimeError(f"key pair {NAME} exists but {key_path} is missing: restore the file, or run"
+                               " `cleanup --shared` and start over")
+        if not keys:
+            os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
+            material = ec2.create_key_pair(KeyName=NAME, TagSpecifications=tagspec("key-pair"))["KeyMaterial"]
+            with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                f.write(material)
+        bucket = f"{NAME}-cache-{account}-{self.region}"
+        try:
+            self.s3.head_bucket(Bucket=bucket)
+        except Exception as e:
+            if error_code(e) not in ("404", "NoSuchBucket", "NotFound"):
+                raise
+            self.s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": self.region})
+            self.s3.put_bucket_tagging(Bucket=bucket, Tagging={"TagSet": [SHARED]})
+        profile = self.ensure_host_profile(bucket)
+        return {"vpc": vpc_id, "subnet": subnet["SubnetId"], "zone": subnet["AvailabilityZone"], "sg": sg_id,
+                "key_path": key_path, "bucket": bucket, "host_profile": profile}
+
+    def zone_offering(self):
+        offered = self.ec2.describe_instance_type_offerings(
+            LocationType="availability-zone",
+            Filters=[{"Name": "instance-type", "Values": [INSTANCE_TYPE]}])["InstanceTypeOfferings"]
+        zones = sorted(o["Location"] for o in offered)
+        if not zones:
+            raise RuntimeError(f"no zone in {self.region} offers {INSTANCE_TYPE}")
+        return zones[0]
+
+    def ensure_host_profile(self, bucket):
+        """Role + instance profile letting the hosts read and write the S3 build cache."""
+        name = f"{NAME}-host"
+        trust = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+        policy = {"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"arn:aws:s3:::{bucket}/*"},
+            {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}"}]}
+        try:
+            self.iam.get_role(RoleName=name)
+        except Exception as e:
+            if error_code(e) != "NoSuchEntity":
+                raise
+            self.iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust), Tags=[SHARED])
+        self.iam.put_role_policy(RoleName=name, PolicyName=name, PolicyDocument=json.dumps(policy))
+        try:
+            self.iam.get_instance_profile(InstanceProfileName=name)
+        except Exception as e:
+            if error_code(e) != "NoSuchEntity":
+                raise
+            self.iam.create_instance_profile(InstanceProfileName=name, Tags=[SHARED])
+            self.iam.add_role_to_instance_profile(InstanceProfileName=name, RoleName=name)
+        return name
+
+    def launch_hosts(self, shared, run_id, expires, now):
+        """Six instances in one run_instances into the placement group; then one data ENI each
+        (create, attach, DeleteOnTermination). Returns host records in ROLES order."""
+        ec2 = self.ec2
+        ami = self.ssm.get_parameter(Name=AMI_PARAM)["Parameter"]["Value"]
+        tags = run_tags(run_id, expires)
+        r = ec2.run_instances(
+            ImageId=ami, InstanceType=INSTANCE_TYPE, MinCount=len(ROLES), MaxCount=len(ROLES), KeyName=NAME,
+            InstanceInitiatedShutdownBehavior="terminate",
+            Placement={"GroupName": NAME, "AvailabilityZone": shared["zone"]},
+            IamInstanceProfile={"Name": shared["host_profile"]},
+            NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": shared["subnet"], "Groups": [shared["sg"]],
+                                "AssociatePublicIpAddress": True, "DeleteOnTermination": True}],
+            BlockDeviceMappings=[{"DeviceName": "/dev/xvda", "Ebs": {
+                "VolumeSize": ROOT_GB, "VolumeType": "gp3", "DeleteOnTermination": True}}],
+            UserData=user_data(expires, now),
+            TagSpecifications=[{"ResourceType": k, "Tags": tags} for k in ("instance", "volume", "network-interface")])
+        ids = [i["InstanceId"] for i in sorted(r["Instances"], key=lambda i: i["AmiLaunchIndex"])]
+        for iid, role in zip(ids, ROLES):
+            ec2.create_tags(Resources=[iid], Tags=[{"Key": ROLE_TAG, "Value": role},
+                                                   {"Key": "Name", "Value": f"{NAME}-{run_id}-{role}"}])
+        ec2.get_waiter("instance_running").wait(InstanceIds=ids)
+        enis = {}
+        for iid in ids:
+            eni = ec2.create_network_interface(
+                SubnetId=shared["subnet"], Groups=[shared["sg"]],
+                TagSpecifications=[{"ResourceType": "network-interface", "Tags": tags}])["NetworkInterface"]
+            att = ec2.attach_network_interface(NetworkInterfaceId=eni["NetworkInterfaceId"], InstanceId=iid,
+                                               DeviceIndex=1)["AttachmentId"]
+            ec2.modify_network_interface_attribute(NetworkInterfaceId=eni["NetworkInterfaceId"],
+                                                   Attachment={"AttachmentId": att, "DeleteOnTermination": True})
+            enis[iid] = {"id": eni["NetworkInterfaceId"], "mac": eni["MacAddress"], "ip": eni["PrivateIpAddress"]}
+        described = {i["InstanceId"]: i
+                     for page in ec2.get_paginator("describe_instances").paginate(InstanceIds=ids)
+                     for res in page["Reservations"] for i in res["Instances"]}
+        return [{"role": role, "id": iid, "public_ip": described[iid]["PublicIpAddress"],
+                 "private_ip": described[iid]["PrivateIpAddress"], "data_eni": enis[iid]}
+                for iid, role in zip(ids, ROLES)]
+
+
+# ---------------------------------------------------------------- hosts
+
+
+class Host:
+    def __init__(self, info, key_path, run_dir, run=subprocess.run, sleep=time.sleep, clock=time.monotonic):
+        self.info, self.key, self.run_dir = info, key_path, run_dir
+        self.role = info["role"]
+        self._run, self._sleep, self._clock = run, sleep, clock
+
+    def _opts(self):
+        return ["-i", self.key, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+                "-o", f"UserKnownHostsFile={self.run_dir}/known_hosts", "-o", "ConnectTimeout=10"]
+
+    def ssh(self, command, check=True, timeout=None, input=None):
+        argv = ["ssh", *self._opts(), "-o", "ServerAliveInterval=15", f"ec2-user@{self.info['public_ip']}", command]
+        r = self._run(argv, capture_output=True, input=input, text=not isinstance(input, bytes), timeout=timeout)
+        if check and r.returncode != 0:
+            err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
+            raise RuntimeError(f"{self.role}: `{command[:120]}` exited {r.returncode}: {err[-2000:]}")
+        return r
+
+    def root(self, command, **kw):
+        return self.ssh(f"sudo sh -c {shlex.quote(command)}", **kw)
+
+    def wait_ssh(self, limit=600):
+        deadline = self._clock() + limit
+        while self._clock() < deadline:
+            if self.ssh("true", check=False).returncode == 0:
+                return
+            self._sleep(5)
+        raise RuntimeError(f"{self.role}: no SSH within {limit} s")
+
+    def put_text(self, remote, text, mode):
+        self.ssh(f"umask 077 && cat > {remote} && chmod {mode} {remote}", input=text)
+
+    def fetch(self, remote, local):
+        """scp remote -> local; None on success, else what failed."""
+        argv = ["scp", "-q", *self._opts(), f"ec2-user@{self.info['public_ip']}:{remote}", local]
+        r = self._run(argv, capture_output=True, text=True)
+        if r.returncode == 0:
+            return None
+        return f"{self.role}:{remote}: scp exited {r.returncode}: {(r.stderr or '').strip()[-500:]}"
+
+    def setup(self, archive, cache_prefix, tree, rust):
+        """Source, bootstrap (cached), hft-host.sh apply (reboot), verify. Returns (ok, report text)."""
+        self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive)
+        arch, version_id = self.ssh("uname -m; . /etc/os-release; echo $VERSION_ID").stdout.split()
+        dpdk_key, bench_key = cache_keys(cache_prefix, arch, version_id, tree, rust)
+        self.root(f"SRC={SRC_DIR} DPDK_KEY={dpdk_key} BENCH_KEY={bench_key} sh {SRC_DIR}/bench/aws/bootstrap.sh",
+                  timeout=BOOTSTRAP_S)
+        apply = self.root(f"sh {HFT} apply", check=False, timeout=BOOTSTRAP_S)
+        text = [f"[{self.role} {self.info['id']} {INSTANCE_TYPE}]", "apply:", apply.stdout.rstrip()]
+        if apply.returncode not in (0, 100, 255):  # 100: rebooting; 255: SSH dropped by the reboot
+            return False, "\n".join(text + [f"apply exited {apply.returncode}: {apply.stderr.strip()[-2000:]}"])
+        # Before the reboot verify fails (cmdline), during it SSH fails; zhida-host.service runs `boot`
+        # after it. So: retry verify until it passes.
+        deadline = self._clock() + SETUP_REBOOT_S
+        while True:
+            v = self.root(f"sh {HFT} verify", check=False)
+            if v.returncode == 0 or self._clock() >= deadline:
+                break
+            self._sleep(10)
+        text += ["verify:", v.stdout.rstrip()]
+        return v.returncode == 0, "\n".join(text)
+
+
+# ---------------------------------------------------------------- run
+
+
+class Env:
+    """What run() touches outside this process; tests substitute fakes."""
+
+    def __init__(self, aws=Aws, host=Host, local=subprocess.run, my_ip=None, now=None, sleep=time.sleep):
+        self.aws, self.host, self.local, self.sleep = aws, host, local, sleep
+        self.my_ip = my_ip or (lambda: urllib.request.urlopen("https://checkip.amazonaws.com", timeout=10)
+                               .read().decode().strip())
+        self.now = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
+
+
+class Notes:
+    """runner.txt: what the runner decided (clock, TTL, sweep exits), also logged."""
+
+    def __init__(self, run_dir):
+        self.path = os.path.join(run_dir, "runner.txt")
+
+    def add(self, line):
+        log(line)
+        with open(self.path, "a") as f:
+            f.write(line + "\n")
+
+
+def source_tree(local):
+    """The pushed source is `git archive HEAD`: refuse uncommitted tracked changes."""
+    dirty = local(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no"],
+                  capture_output=True, text=True, check=True).stdout.strip()
+    if dirty:
+        raise SystemExit(f"the hosts build `git archive HEAD`; commit these tracked changes first:\n{dirty}")
+    if local(["git", "-C", REPO, "cat-file", "-e", "HEAD:deploy/hft-host.sh"], capture_output=True).returncode:
+        raise SystemExit("HEAD has no deploy/hft-host.sh: the hosts need it")
+    archive = local(["git", "-C", REPO, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
+    tree = local(["git", "-C", REPO, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
+                 check=True).stdout.strip()
+    return archive, tree
+
+
+def setup_hosts(hosts, archive, cache_prefix, tree, rust):
+    """All six in parallel; raises listing every host that failed."""
+    results, threads = {}, []
+
+    def one(h):
+        try:
+            results[h.role] = h.setup(archive, cache_prefix, tree, rust)
+        except Exception as e:  # reported below with the others
+            results[h.role] = (False, f"[{h.role}] setup error: {e}")
+
+    for h in hosts:
+        t = threading.Thread(target=one, args=(h,), daemon=True)  # Ctrl-C tears down without waiting
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    failed = [r for r in ROLES if not results[r][0]]
+    text = [results[r][1] for r in ROLES]
+    if failed:
+        raise RuntimeError(f"host setup failed on {', '.join(failed)}:\n" + "\n".join(text))
+    return text
+
+
+def read_facts(hosts, receiver_eni_ip):
+    """host.env of every host; the receiver's data IP from its dut.json, which must be its data ENI's."""
+    facts = {h.role: parse_host_env(h.root("cat /etc/zhida/host.env").stdout) for h in hosts}
+    ip = data_ip(hosts[0].root("cat /etc/zhida/dut.json").stdout)
+    if ip != receiver_eni_ip:
+        raise RuntimeError(f"receiver dut.json ipv4 {ip} is not its data ENI's address {receiver_eni_ip}")
+    return facts, ip
+
+
+def connect_senders(hosts, run_dir, run_id, local):
+    """A run-scoped key: sender0 reaches sender0..4 as ec2-user through REMOTE/ssh_config."""
+    key = os.path.join(run_dir, "run_key")
+    local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{NAME}-{run_id}", "-f", key], check=True)
+    with open(key) as f:
+        private = f.read()
+    with open(key + ".pub") as f:
+        public = f.read().strip()
+    senders = hosts[1:]
+    for h in senders:
+        h.ssh(f"grep -qxF {shlex.quote(public)} ~/.ssh/authorized_keys || echo {shlex.quote(public)}"
+              " >> ~/.ssh/authorized_keys")
+    sender0 = senders[0]
+    sender0.put_text(f"{REMOTE}/id_run", private, "600")
+    sender0.put_text(f"{REMOTE}/ssh_config", ssh_config([h.info["private_ip"] for h in senders]), "644")
+    sender0.ssh(f"rm -f {REMOTE}/known_hosts")
+
+
+def fetch_sweep(t, hosts, run_dir):
+    """Every file of sweep `t` into run_dir; returns the failures."""
+    receiver, senders = hosts[0], hosts[1:]
+    wanted = [(senders[0], f"{REMOTE}/{t}.jsonl", run_dir), (senders[0], f"{REMOTE}/{t}.coord.log", run_dir),
+              (receiver, f"{REMOTE}/dut-counters-{t}.jsonl", run_dir)]
+    for h in senders:
+        d = os.path.join(run_dir, h.role)
+        os.makedirs(d, exist_ok=True)
+        wanted.append((h, f"{REMOTE}/gen-{t}.log", d))
+    return [e for e in (h.fetch(remote, local) for h, remote, local in wanted) if e]
+
+
+def clock_problems(hosts):
+    out = []
+    for h in hosts:
+        ok, detail = parse_chrony(h.ssh("chronyc tracking", check=False, timeout=60).stdout)
+        if not ok:
+            out.append(f"{h.role}: {detail}")
+    return out
+
+
+def run_sweep(proto, budget, hosts, facts, receiver_ip, env, notes):
+    """One sweep: receiver unit up, coordinator on sender0, receiver stopped. Returns the coordinator's
+    exit code, or None when it did not run or timed out."""
+    receiver, sender0 = hosts[0], hosts[1]
+    t = tag(proto, budget)
+    receiver.root(f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
+                  f" {serve_command(proto, facts['receiver']['APP_CPU'], t)}")
+    try:
+        env.sleep(3)
+        if receiver.root(f"systemctl is-active {RECEIVER_UNIT}", check=False).stdout.strip() != "active":
+            journal = receiver.root(f"journalctl -u {RECEIVER_UNIT} --no-pager | tail -20", check=False).stdout
+            notes.add(f"{t}: receiver did not start:\n{journal}")
+            return None
+        try:
+            return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"]),
+                               check=False, timeout=SWEEP_WORST_S).returncode
+        except subprocess.TimeoutExpired:
+            notes.add(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
+            sender0.ssh("pkill -f 'zhida-bench sweep'", check=False, timeout=60)
+            return None
+    finally:
+        receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
+
+
+def measure(hosts, facts, receiver_ip, run_dir, expires, env, notes):
+    """The fixed matrix. A failed sweep is recorded and the next one runs; the clock and TTL checks
+    stop measuring (a host without SSH fails the clock check). Every sweep started is fetched.
+    Returns the fetch failures."""
+    with open(os.path.join(run_dir, "expected.json"), "w") as f:
+        json.dump({"sweeps": sweep_tags()}, f)
+    fetch_errors, pending = [], []
+    try:
+        for proto, budget in SWEEPS:
+            t = tag(proto, budget)
+            left = (expires - env.now()).total_seconds()
+            if left < SWEEP_WORST_S + TEARDOWN_MARGIN_S:
+                notes.add(f"stop before {t}: {left:.0f} s of TTL left, a sweep needs up to {SWEEP_WORST_S} s"
+                          f" plus {TEARDOWN_MARGIN_S} s for teardown")
+                break
+            bad = clock_problems(hosts)
+            if bad:
+                notes.add(f"stop before {t}: clocks not synchronised within {CLOCK_LIMIT_S * 1e3:g} ms: "
+                          + "; ".join(bad))
+                break
+            pending.append(t)
+            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env, notes)
+            notes.add(f"{t}: coordinator exit {code}")
+            pending.remove(t)
+            fetch_errors += fetch_sweep(t, hosts, run_dir)
+    finally:
+        for t in pending:
+            fetch_errors += fetch_sweep(t, hosts, run_dir)
+    return fetch_errors
+
+
+def run(args, env=None):
+    env = env or Env()
+    now = env.now()
+    ttl_s = parse_duration(args.ttl)
+    expires = now + datetime.timedelta(seconds=ttl_s)
+    run_id = new_run_id(now)
+    print(plan_text(args.region, args.ttl, run_id, expires))
+    if ttl_s < SWEEP_WORST_S + TEARDOWN_MARGIN_S:
+        raise SystemExit(f"--ttl {args.ttl} leaves no time for a sweep")
+    archive, tree = source_tree(env.local)
+    rust = rust_toolchain()
+    run_dir = os.path.join(args.out, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    notes = Notes(run_dir)
+    aws = env.aws(args.region)
+    shared = aws.ensure_shared(env.my_ip())
+
+    def on_signal(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    failed, hosts, fetch_errors = True, None, []
+    # From here on every exit path deletes the run's billable resources.
+    try:
+        infos = aws.launch_hosts(shared, run_id, expires, now)
+        with open(os.path.join(run_dir, "hosts.json"), "w") as f:
+            json.dump(infos, f, indent=1)
+        hosts = [env.host(info, shared["key_path"], run_dir) for info in infos]
+        for h in hosts:
+            h.wait_ssh()
+        setup = setup_hosts(hosts, archive, f"s3://{shared['bucket']}/cache", tree, rust)
+        facts, receiver_ip = read_facts(hosts, infos[0]["data_eni"]["ip"])
+        for h in hosts:
+            h.root(f"install -d -m 1777 {REMOTE}")
+        setup += [f"[{r} host.env] " + " ".join(f"{k}={v}" for k, v in sorted(facts[r].items())) for r in ROLES]
+        with open(os.path.join(run_dir, "host-setup.txt"), "w") as f:
+            f.write("\n".join(setup) + "\n")
+        connect_senders(hosts, run_dir, run_id, env.local)
+        fetch_errors = measure(hosts, facts, receiver_ip, run_dir, expires, env, notes)
+        failed = False
+    finally:
+        report_code = None
+        if os.path.exists(os.path.join(run_dir, "expected.json")):
+            if fetch_errors:
+                with open(os.path.join(run_dir, "fetch-errors.txt"), "w") as f:
+                    f.write("\n".join(fetch_errors) + "\n")
+                notes.add(f"{len(fetch_errors)} fetch failures: {os.path.join(run_dir, 'fetch-errors.txt')}")
+            report_code = env.local([sys.executable, os.path.join(REPO, "bench", "report.py"), run_dir, "--title",
+                                     f"zhida-bench {run_id} (1 receiver + {SENDER_HOSTS} senders, {INSTANCE_TYPE})"]
+                                    ).returncode
+            log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
+        log(f"tearing down run {run_id}")
+        done = janitor.clean(aws.ec2, run_id=run_id, log=log)
+        log(f"teardown: {json.dumps(done)}")
+    return 0 if not failed and report_code == 0 and not fetch_errors else 1
+
+
+def cleanup(args, env=None):
+    env = env or Env()
+    aws = env.aws(args.region)
+    done = janitor.clean(aws.ec2, run_id=args.run_id, log=log)
+    log(f"cleanup: {json.dumps(done)}")
+    return 0
+
+
+def parser():
+    p = argparse.ArgumentParser(prog="zhida-aws-bench", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("run", "plan"):
+        r = sub.add_parser(name)
+        r.add_argument("--region", default=REGION)
+        r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
+        r.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
+    c = sub.add_parser("cleanup")
+    c.add_argument("--run-id", required=True)
+    c.add_argument("--region", default=REGION)
+    return p
+
+
+def main(argv, env=None):
+    args = parser().parse_args(argv)
+    if args.cmd == "plan":
+        now = datetime.datetime.now(datetime.timezone.utc)
+        print(plan_text(args.region, args.ttl, new_run_id(now),
+                        now + datetime.timedelta(seconds=parse_duration(args.ttl))))
+        return 0
+    if args.cmd == "run":
+        return run(args, env)
+    return cleanup(args, env)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
