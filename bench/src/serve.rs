@@ -19,12 +19,12 @@ pub struct Args {
     pub config: PathBuf,
     pub proto: Proto,
     pub port: u16,
-    /// TCP: connections served at once, and accepts kept armed.
-    pub max_conns: usize,
-    pub accepts: usize,
 }
 
 const UDP_QUEUE: usize = 4096;
+/// TCP: connections served at once, and accepts kept armed.
+const MAX_CONNS: usize = 256;
+const ACCEPTS: usize = 64;
 
 pub fn run(args: &Args) -> Result<(), String> {
     let config = Host::config(&args.config)?;
@@ -34,7 +34,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         mss_cap: None,
     };
     let mtu = usize::from(config.mtu);
-    let sockets = args.max_conns + args.accepts;
+    let sockets = MAX_CONNS + ACCEPTS;
     let sizing = match args.proto {
         Proto::Udp => Sizing {
             frame_share: 64,
@@ -52,7 +52,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     match args.proto {
         Proto::Udp => udp_echo(&host, &handle, args.port)?,
         Proto::Tcp | Proto::Ws => {
-            for _ in 0..args.accepts {
+            for _ in 0..ACCEPTS {
                 arm_accept(
                     &host.rt.spawner(),
                     handle.clone(),

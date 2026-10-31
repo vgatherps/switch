@@ -78,16 +78,13 @@ def flags(step):
 
 def table(steps):
     rows = [
-        "| step | offered pps | sent pps | received pps | p50 µs | p99 µs | p99.9 µs | max µs | drop % | unsent |"
-        " flags | budget |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
+        "| offered pps | sent pps | received pps | drop % | p50 µs | p99 µs | p99.9 µs | max µs | flags |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
-    for s in sorted(steps, key=lambda s: (s["offered_pps"], s["step"])):
+    for s in sorted(steps, key=lambda s: s["offered_pps"]):
         rows.append(
-            f"| {s['step']} | {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} |"
-            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
-            f" {100 * s['drop_fraction']:.3f} | {s['unsent']} | {flags(s)} |"
-            f" {s.get('budget') or '-'} |"
+            f"| {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} | {100 * s['drop_fraction']:.3f} |"
+            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} | {flags(s)} |"
         )
     return "\n".join(rows)
 
@@ -97,7 +94,7 @@ def svg_plot(steps, title):
     A step where nothing came back has no latency: it is drawn as an x at the top of the latency
     axis, and its 100% drop is on the drop line like every other step's."""
     W, H, L, R, T, B = 760, 420, 70, 70, 40, 50
-    steps = sorted(steps, key=lambda s: (s["offered_pps"], s["step"]))
+    steps = sorted(steps, key=lambda s: s["offered_pps"])
     pts = [s for s in steps if s.get("latency_ns")]
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif" font-size="11">',
            f'<rect width="{W}" height="{H}" fill="white"/>',
@@ -164,8 +161,6 @@ def build(directory, title):
         with open(setup) as f:
             md += ["## Host setup", "", "```", f.read().rstrip(), "```", ""]
     results = {"title": title, "sweeps": []}
-    sweeps = ["| sweep | proto | gens | senders | size | steps | baseline RTT p50 µs | budget window µs | complete |",
-              "|---|---|---:|---:|---:|---:|---:|---:|:-:|"]
     sections = []
     summaries = {}
     for name, path in sweep_files(directory):
@@ -173,12 +168,6 @@ def build(directory, title):
         stem = name[: -len(".jsonl")]
         summaries[stem] = summary
         results["sweeps"].append({"name": stem, "summary": summary, "steps": steps})
-        if summary:
-            sweeps.append(f"| {stem} | {summary['proto']} | {summary['gens']} | {summary['senders']} | {summary['size']} |"
-                          f" {summary['steps']} | {us(summary.get('baseline_rtt_p50_ns'))} |"
-                          f" {summary.get('budget_window_us') or '-'} | {'yes' if summary.get('complete') else 'NO'} |")
-        else:
-            sweeps.append(f"| {stem} | - | - | - | - | {len(steps)} | - | - | NO (no summary) |")
         with open(os.path.join(directory, stem + ".svg"), "w") as f:
             f.write(svg_plot(steps, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
@@ -194,9 +183,9 @@ def build(directory, title):
     if issues:
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
                 *[f"- {i}" for i in issues], ""]
-    md = head + md + ["## Sweeps", "", "\n".join(sweeps), "", *sections]
+    md = head + md + sections
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
-           " measured messages not echoed by the end of the drain, unsent ones included (sending stops at the end"
+           " measured messages not echoed by the end of the drain, never-sent ones included (sending stops at the end"
            " of the window); sent / received pps are what actually left the generators and came back within the"
            " window; baseline RTT is the first step's median echo time minus actual send time (TCP/ws); no TLS"
            " (ws:// only)."]

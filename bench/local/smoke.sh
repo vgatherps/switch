@@ -78,7 +78,7 @@ run_sweep() { # proto addr out-file [flags...]: the sweep's exit status; its std
     proto=$1 addr=$2 file=$3
     shift 3
     echo "== sweep $proto -> $addr $(date +%T.%N)" >>"$out/sweep.log"
-    taskset -c "$first" "$bench" sweep --proto "$proto" --gens "$gens" --senders "$senders" --size 64 \
+    taskset -c "$first" "$bench" sweep --proto "$proto" --gens "$gens" --senders "$senders" \
         --gen-cmd "sh $out/gen.sh {i} $proto $addr {senders} 64" "$@" >"$file" 2>>"$out/sweep.log"
 }
 
@@ -125,10 +125,10 @@ python3 - "$out/overload-check.jsonl" "$took" <<'PY' || exit 1
 import json, sys
 lines = [json.loads(l) for l in open(sys.argv[1])]
 step, summary = lines[0], lines[-1]
-ok = (step["kind"] == "step" and step["drop_fraction"] == 1.0 and step["unsent"] > 0
+ok = (step["kind"] == "step" and step["drop_fraction"] == 1.0 and step["sent_pps"] < step["offered_pps"]
       and summary["kind"] == "summary" and summary["complete"] and int(sys.argv[2]) < 30)
-print(f"smoke: bounded overload: {sys.argv[2]}s, drop {step['drop_fraction']}, unsent {step['unsent']}"
-      f" of {step['measured']}, summary complete={summary['complete']}")
+print(f"smoke: bounded overload: {sys.argv[2]}s, drop {step['drop_fraction']}, sent {step['sent_pps']:.0f}"
+      f" of {step['offered_pps']:.0f} pps, summary complete={summary['complete']}")
 sys.exit(0 if ok else 1)
 PY
 stop_dut

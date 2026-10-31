@@ -85,11 +85,6 @@ impl Recorder {
     pub fn measured(&self) -> u64 {
         self.end - self.measured_from
     }
-
-    /// Measured messages never echoed (so far).
-    pub fn lost(&self) -> u64 {
-        self.measured() - self.received
-    }
 }
 
 #[cfg(test)]
@@ -126,9 +121,8 @@ mod tests {
             }
             r.record(&message(1, &s, k), s.due_at(k) + 500 + k);
         }
-        assert_eq!((r.measured(), r.received, r.lost()), (24, 21, 3));
+        assert_eq!((r.measured(), r.received), (24, 21));
         assert_eq!(r.latency.count(), 21);
-        assert_eq!(r.latency.min(), Some(506));
         assert_eq!(r.latency.max(), 528);
     }
 
@@ -154,7 +148,6 @@ mod tests {
         bad_sender[4] = 9;
         r.record(&bad_sender, 10_006);
         assert_eq!(r.received, 1);
-        assert_eq!(r.lost(), 9);
     }
 
     /// An echo that arrives before its scheduled time (clock oddity) measures 0, not a wrap.

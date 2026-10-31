@@ -11,16 +11,14 @@ import report
 SVG = "{http://www.w3.org/2000/svg}"
 
 
-def step(pps, p99, drop=0.0, bound=False, n=0):
-    return {"kind": "step", "proto": "udp", "step": n, "offered_pps": pps, "sent_pps": pps * 0.99,
-            "received_pps": pps * 0.98, "drop_fraction": drop, "unsent": 0, "generator_bound": bound,
-            "budget_bound": False, "budget": None,
+def step(pps, p99, drop=0.0, bound=False):
+    return {"kind": "step", "offered_pps": pps, "sent_pps": pps * 0.99, "received_pps": pps * 0.98,
+            "drop_fraction": drop, "budget_bound": False, "generator_bound": bound,
             "latency_ns": None if p99 is None else {"p50": p99 // 2, "p99": p99, "p999": p99 * 2, "max": p99 * 3}}
 
 
 def summary(steps=2, complete=True, error=None, bound=False):
-    return {"kind": "summary", "proto": "udp", "gens": 2, "senders": 4, "size": 64, "steps": steps,
-            "baseline_rtt_p50_ns": None, "budget_window_us": None, "complete": complete, "generator_bound": bound, "error": error}
+    return {"kind": "summary", "steps": steps, "complete": complete, "generator_bound": bound, "error": error}
 
 
 def write_jsonl(path, lines):
@@ -38,7 +36,7 @@ class ReportTest(unittest.TestCase):
 
     def test_a_step_with_total_loss_stays_on_the_plot(self):
         """Regression: a step with no echo at all (100% loss) used to vanish from the plot."""
-        steps = [step(1000, 10_000, n=0), step(2000, None, drop=1.0, n=1)]
+        steps = [step(1000, 10_000), step(2000, None, drop=1.0)]
         root = ET.fromstring(report.svg_plot(steps, "loss"))
         self.assertEqual(len(root.findall(f"{SVG}path[@class='no-echo']")), 1)
         drop_line = root.findall(f"{SVG}polyline")[-1].get("points").split()
@@ -64,7 +62,7 @@ class ReportTest(unittest.TestCase):
             for line in ("- udp-d: missing", "- tcp-b: no summary (the sweep did not finish)",
                          "- ws-c: incomplete after 1 steps: generator 3: exited"):
                 self.assertIn(line, md)
-            self.assertNotIn("udp-a:", md.split("## Sweeps")[0])
+            self.assertNotIn("udp-a:", md.split("\n## ")[0])
             with open(os.path.join(d, "results.json")) as f:
                 self.assertEqual(len(json.load(f)["incomplete"]), 3)
 
@@ -82,14 +80,13 @@ class ReportTest(unittest.TestCase):
 
     def test_build_writes_report_results_and_plots(self):
         with tempfile.TemporaryDirectory() as d:
-            lines = [step(1000, 10_000), step(2000, 90_000, bound=True, n=1), summary()]
+            lines = [step(1000, 10_000), step(2000, 90_000, bound=True), summary()]
             write_jsonl(os.path.join(d, "udp-zhida.jsonl"), lines)
             md, issues = report.build(d, "T")
             md = "\n".join(md)
             self.assertEqual(issues, [])
             self.assertTrue(md.startswith("# T"))
-            self.assertIn("| udp-zhida | udp | 2 | 4 | 64 | 2 | - | - | yes |", md)
-            self.assertIn("| 0 | 1000 | 990 | 980 | 5.0 | 10.0 | 20.0 | 30.0 | 0.000 | 0 | - | - |", md)
+            self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - |", md)
             self.assertIn("GEN-BOUND", md)
             self.assertTrue(os.path.exists(os.path.join(d, "udp-zhida.svg")))
             with open(os.path.join(d, "results.json")) as f:

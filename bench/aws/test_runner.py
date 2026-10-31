@@ -193,7 +193,7 @@ EOF
     def test_sweep_command_and_template_expand_for_every_sender(self):
         calls = self.run_sh(z.sweep_command("tcp", 50, RECEIVER_DATA_IP, "0-6"))
         self.assertEqual(calls[0], "taskset -c 0-6 MIMALLOC=unset")
-        self.assertEqual(calls[1], "zhida-bench sweep --proto tcp --gens 5 --senders 20 --size 64 --rate-min 10000"
+        self.assertEqual(calls[1], "zhida-bench sweep --proto tcp --gens 5 --senders 20 --rate-min 10000"
                                    " --rate-max 5000000 --budget-us 50 --gen-cmd")
         gen = ("zhida-bench gen --config /etc/zhida/dut.json --proto tcp --target 10.80.1.100:7000 --senders 4"
                " --size 64 --local-port 40000")

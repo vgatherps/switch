@@ -139,7 +139,7 @@ def sweep_command(proto, budget, receiver_ip, housekeeping):
     t = tag(proto, budget)
     budget_arg = "" if budget is None else f" --budget-us {budget}"
     return (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDER_HOSTS}"
-            f" --senders {SENDERS} --size {SIZE} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
+            f" --senders {SENDERS} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
             f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
             f" > {REMOTE}/{t}.jsonl 2> {REMOTE}/{t}.coord.log")
 
