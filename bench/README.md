@@ -78,6 +78,11 @@ ws client framing. With `--features e2e` (`make -C conduit test-bench`, in `make
 /dev/net/tun) it also runs the TCP echo receiver on net_tap against a kernel peer whose small segments conduit
 appends into one received frame larger than a TX frame: every byte must come back.
 
+`python3 -m unittest discover -s bench/aws` needs no AWS account. Its SSH authentication regression
+starts a temporary localhost `sshd` and separate `ssh-agent` with unrelated keys; it never changes
+the user's agent. It checks real SSH/SCP authentication and sender SSH configuration with the run
+key. Missing OpenSSH executables skip that test; an installed but unusable server fails visibly.
+
 ## AWS
 
 `--region` defaults to the AWS profile's region (`aws configure`, or `AWS_REGION`); without either the runner stops before touching AWS. AWS project accounts (the "new AWS experience") are locked to one region, so leave it at the profile's. Binance's servers are in Tokyo: from another region the `binance` command's NIC-to-receive latency is still valid, only the wire path to Binance is longer.

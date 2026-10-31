@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests of zhida_aws_bench.py with fake AWS clients, hosts and local commands (no AWS, no boto3):
+"""Tests with AWS/host fakes and isolated localhost OpenSSH authentication (no AWS, no boto3):
 python3 -m unittest discover -s bench/aws"""
 import argparse
 import contextlib
@@ -7,9 +7,12 @@ import datetime
 import io
 import json
 import os
+import pwd
 import shlex
 import select
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -381,6 +384,108 @@ class LaunchTest(unittest.TestCase):
 class Proc:
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+class OpenSshIdentityTest(unittest.TestCase):
+    def test_run_key_authenticates_despite_unrelated_agent_keys(self):
+        tools = {name: shutil.which(name) for name in ("ssh", "scp", "sshd", "ssh-keygen", "ssh-agent", "ssh-add")}
+        missing = [name for name, path in tools.items() if path is None]
+        if missing:
+            self.skipTest("required OpenSSH executable unavailable: " + ", ".join(missing))
+        with tempfile.TemporaryDirectory() as tmp:
+            def command(name, *args, **kwargs):
+                return subprocess.run([tools[name], *args], capture_output=True, text=True,
+                                      check=True, timeout=10, **kwargs)
+
+            keys = [os.path.join(tmp, name) for name in ("host", "id_run", "unrelated1", "unrelated2")]
+            for key in keys:
+                command("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key)
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            user = pwd.getpwuid(os.getuid()).pw_name
+            config = os.path.join(tmp, "sshd_config")
+            with open(config, "w") as f:
+                f.write(f"ListenAddress 127.0.0.1\nPort {port}\nHostKey {keys[0]}\n"
+                        f"AuthorizedKeysFile {keys[1]}.pub\nPidFile {tmp}/sshd.pid\nAllowUsers {user}\n"
+                        "StrictModes no\nUsePAM no\nUseDNS no\nPermitRootLogin yes\n"
+                        "PasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+                        "PubkeyAuthentication yes\nMaxAuthTries 1\nSubsystem sftp internal-sftp\n")
+            empty_config = os.path.join(tmp, "empty_config")
+            with open(empty_config, "w"):
+                pass
+            agent_socket = os.path.join(tmp, "agent.sock")
+            agent_env = dict(os.environ, SSH_AUTH_SOCK=agent_socket)
+            agent_env.pop("SSH_AGENT_PID", None)
+            agent = subprocess.Popen([tools["ssh-agent"], "-D", "-a", agent_socket],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            server = None
+            try:
+                server = subprocess.Popen([tools["sshd"], "-D", "-e", "-f", config],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    for process in (agent, server):
+                        if process.poll() is not None:
+                            self.fail(f"OpenSSH fixture exited {process.returncode}: "
+                                      f"{process.stderr.read().decode(errors='replace')}")
+                    if os.path.exists(agent_socket):
+                        try:
+                            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                                break
+                        except OSError:
+                            pass
+                    time.sleep(0.02)
+                else:
+                    self.fail("isolated SSH server/agent did not become ready")
+                command("ssh-add", *keys[2:], env=agent_env)
+                unrestricted = False
+
+                def run(argv, **kwargs):
+                    name = argv[0]
+                    args = [arg.replace("ec2-user@", f"{user}@", 1) for arg in argv[1:]]
+                    if unrestricted:
+                        args = [arg.replace("IdentitiesOnly=yes", "IdentitiesOnly=no") for arg in args]
+                    # Only redirect the production client's username/port to this local fixture.
+                    return subprocess.run([tools[name], "-F", empty_config,
+                                           "-p" if name == "ssh" else "-P", str(port), *args],
+                                          env=agent_env, **kwargs)
+
+                host = z.Host({"role": "sender0", "id": "i-0", "public_ip": "127.0.0.1"},
+                              keys[1], tmp, run=run)
+                remote = os.path.join(tmp, "source")
+                local = os.path.join(tmp, "fetched")
+                with open(remote, "w") as f:
+                    f.write("run-key authenticated transfer\n")
+                unrestricted = True
+                rejected = host.ssh("printf authenticated", check=False)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("Too many authentication failures", rejected.stderr)
+                self.assertIsNotNone(host.fetch(remote, local))
+                self.assertFalse(os.path.exists(local))
+                unrestricted = False
+                self.assertEqual(host.ssh("printf authenticated").stdout, "authenticated")
+                self.assertIsNone(host.fetch(remote, local))
+                with open(local) as f:
+                    self.assertEqual(f.read(), "run-key authenticated transfer\n")
+                sender_config = os.path.join(tmp, "sender_config")
+                with mock.patch.object(z, "REMOTE", tmp):
+                    with open(sender_config, "w") as f:
+                        f.write(z.ssh_config(["127.0.0.1"]))
+                sender = command("ssh", "-F", sender_config, "-p", str(port), "-l", user,
+                                 "sender0", "printf sender-authenticated", env=agent_env)
+                self.assertEqual(sender.stdout, "sender-authenticated")
+            finally:
+                for process in (server, agent):
+                    if process is None:
+                        continue
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate(timeout=5)
 
 
 class HostTest(unittest.TestCase):
