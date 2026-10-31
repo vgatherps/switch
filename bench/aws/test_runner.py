@@ -27,6 +27,24 @@ HOST_ENV = ("MGMT_IF=ens5\nDATA_IF=ens6\nDATA_PCI=0000:00:06.0\nDATA_MAC=0a:00:0
             "APP_CPU=7\nISOLATED=7\nHOUSEKEEPING=0-6\n")
 
 
+# zhida-nic's lines (conduit/crates/nic-runner/src/main.rs `line`: "zhida-nic: {key}: {value}"); the
+# feed_latency value is binance-feed's Latencies Display, its own test's example
+# (latencies_print_nonempty_buckets in conduit/crates/binance-feed/src/lib.rs).
+FEED_OUT = """run-binance: 2026-11-01T12:00:00Z zhida-nic feed --seconds 30 on CPU 3 with /etc/zhida/binance.json
+zhida-nic: resolved: stream.binance.com -> 54.249.1.2:9443
+zhida-nic: feed_connected: wss://stream.binance.com:9443/ws/btcusdt@bookTicker local_port=50000 TLS 1.3
+zhida-nic: feed_count: 8
+zhida-nic: feed_latency: no_stamp=0 not_ready=0 impossible=1 max_bound_ns=40 <=0:2 8192..16384:5 1073741824..:1
+zhida-nic: feed_update_ids: 100..107
+zhida-nic: feed_close: WebSocket close handshake, TLS close_notify, FIN
+zhida-nic: port_close: ok
+"""
+PORT_OPEN_FAILED = """run-binance: 2026-11-01T12:00:00Z zhida-nic feed --seconds 30 on CPU 3 with /etc/zhida/binance.json
+zhida-nic: resolved: stream.binance.com -> 54.249.1.2:9443
+zhida-nic: port_open_error: PMD lacks the requested RX timestamp offload
+"""
+
+
 def write_exe(path, body):
     with open(path, "w") as f:
         f.write("#!/bin/sh\n" + body)
@@ -86,6 +104,39 @@ class PureTest(unittest.TestCase):
         for t in z.sweep_tags():
             self.assertIn(f"\n  {t}", text)
         self.assertIn("L-1216C47A with 48 vCPUs free", text)
+
+
+class FeedSummaryTest(unittest.TestCase):
+    def test_count_and_latency_buckets_from_the_feed_lines(self):
+        # 8 samples: p50 is the 4th (8192..16384), p99 and p99.9 the 8th (the >= 2^30 ns bucket)
+        self.assertEqual(z.feed_summary(FEED_OUT, 0), [
+            "run-binance.sh exit 0", "messages: 8",
+            "latency: 8 samples, no_stamp=0 not_ready=0 impossible=1 max_bound_ns=40, p50 8192..16384 ns,"
+            " p99 1073741824.. ns, p99.9 1073741824.. ns, max 1073741824.. ns"])
+
+    def test_percentile_ranks(self):
+        # 1000 samples: p50 = 500th, p99 = 990th, p99.9 = 999th
+        text = z.latency_text("no_stamp=3 not_ready=7 impossible=0 max_bound_ns=12 4096..8192:500 8192..16384:490"
+                              " 16384..32768:9 65536..131072:1")
+        self.assertEqual(text, "1000 samples, no_stamp=3 not_ready=7 impossible=0 max_bound_ns=12, p50 4096..8192 ns,"
+                               " p99 8192..16384 ns, p99.9 16384..32768 ns, max 65536..131072 ns")
+
+    def test_no_samples(self):
+        self.assertEqual(z.latency_text("no_stamp=8 not_ready=0 impossible=0 max_bound_ns=0"),
+                         "0 samples, no_stamp=8 not_ready=0 impossible=0 max_bound_ns=0")
+
+    def test_clock_jump_is_the_reason(self):
+        text = FEED_OUT.replace(FEED_OUT.splitlines()[4], "zhida-nic: feed_latency: latency invalid: NIC clock jumped")
+        self.assertEqual(z.feed_summary(text, 0)[2], "latency: latency invalid: NIC clock jumped")
+
+    def test_no_feed_latency_line(self):
+        text = "".join(l + "\n" for l in FEED_OUT.splitlines() if "feed_latency" not in l)
+        self.assertEqual(z.feed_summary(text, 0), ["run-binance.sh exit 0", "messages: 8", "no feed_latency line"])
+
+    def test_a_failed_feed_shows_its_error(self):
+        self.assertEqual(z.feed_summary(PORT_OPEN_FAILED, 3), [
+            "run-binance.sh exit 3", "no feed_latency line", "feed output ends:", *PORT_OPEN_FAILED.splitlines()])
+        self.assertEqual(z.feed_summary(None, None), ["run-binance.sh did not finish", "no feed output fetched"])
 
 
 # ---------------------------------------------------------------- worker/coordinator command quoting
@@ -422,6 +473,11 @@ class World:
         self.interrupt_teardown = False  # a second Ctrl-C inside teardown
         self.teardown_done = False
         self.hang = False               # receiver stop and every scp time out
+        self.offered = True             # the instance type is offered in the region
+        self.feed_code = 0              # run-binance.sh's exit code
+        self.feed_timeouts = []
+        self.feed_hang = False          # the run-binance.sh ssh times out
+        self.feed_text = FEED_OUT
 
 
 class FakeHost:
@@ -430,6 +486,10 @@ class FakeHost:
 
     def wait_ssh(self):
         pass
+
+    def install(self, archive):
+        self.w.calls.append((self.role, f"install {archive!r}"))
+        return self.role not in self.w.verify_fail, f"[{self.role}] verify: {'FAIL' if self.role in self.w.verify_fail else 'ok'}"
 
     def setup(self, archive):
         self.w.calls.append((self.role, f"setup {archive!r}"))
@@ -445,6 +505,11 @@ class FakeHost:
             return Proc(0, "active\n")
         if command.startswith("systemctl stop") and self.w.hang:
             raise subprocess.TimeoutExpired(command, z.SSH_S)
+        if "run-binance.sh" in command:
+            self.w.feed_timeouts.append(kw["timeout"])
+            if self.w.feed_hang:
+                raise subprocess.TimeoutExpired(command, kw["timeout"])
+            return Proc(self.w.feed_code)
         return Proc(0)
 
     def ssh(self, command, check=True, timeout=None, input=None):
@@ -468,7 +533,7 @@ class FakeHost:
         if self.w.hang:
             return f"{self.role}:{remote}: scp timed out after {z.SSH_S} s"
         with open(os.path.join(local, os.path.basename(remote)), "w") as f:
-            f.write("{}\n")
+            f.write(self.w.feed_text if remote == z.FEED_OUT else "{}\n")
         return None
 
 
@@ -501,10 +566,14 @@ def running(itype, vcpus, spot=False):
 
 
 class FakeQuotaEc2:
-    """describe_instances (running/pending) over two pages."""
+    """describe_instances (running/pending) over two pages; the zones offering every type."""
 
-    def __init__(self, instances):
-        self.instances = instances
+    def __init__(self, instances, zones=("zone-a",)):
+        self.instances, self.zones = instances, zones
+
+    def describe_instance_type_offerings(self, LocationType, Filters):
+        assert LocationType == "availability-zone"
+        return {"InstanceTypeOfferings": [{"Location": z} for z in self.zones]}
 
     def get_paginator(self, name):
         assert name == "describe_instances"
@@ -529,17 +598,27 @@ def launch_aws(ec2):
 
 
 class PreflightTest(unittest.TestCase):
-    def check(self, quota=96, instances=(), sts_error=None, quota_error=None, local=None):
-        aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances)), "ssm": None,
+    def check(self, quota=96, instances=(), sts_error=None, quota_error=None, local=None, zones=("zone-a",),
+              itype="c7gn.2xlarge", vcpus=48):
+        aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances), zones), "ssm": None,
                                        "sts": FakeSts(sts_error), "service-quotas": FakeQuotas(quota, quota_error)})
         env = z.Env(aws=lambda region: aws, local=local or (lambda argv, **kw: Proc(0, "")))
-        return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1")[0]}
+        return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1", itype, vcpus)[0]}
 
     def test_all_pass(self):
         r = self.check(quota=96, instances=[running("c7g.4xlarge", 16), running("m5.large", 2, spot=True)])
         self.assertEqual(r["source"], (True, "clean, HEAD has deploy/hft-host.sh"))
         self.assertEqual(r["credentials"], (True, "account 123456789012 as arn:aws:iam::123456789012:user/owner"))
         self.assertEqual(r["quota"], (True, "L-1216C47A 96 vCPUs, 16 in use, 80 free, need 48"))
+        self.assertEqual(r["offering"], (True, "c7gn.2xlarge in zone-a"))
+
+    def test_binance_needs_its_type_offered_and_four_vcpus(self):
+        r = self.check(quota=5, zones=("zone-c", "zone-b"), itype="m7g.xlarge", vcpus=4)
+        self.assertEqual(r["offering"], (True, "m7g.xlarge in zone-b"))
+        self.assertEqual(r["quota"], (True, "L-1216C47A 5 vCPUs, 0 in use, 5 free, need 4"))
+        self.assertFalse(self.check(quota=3, itype="m7g.xlarge", vcpus=4)["quota"][0])
+        self.assertEqual(self.check(zones=(), itype="m7g.xlarge", vcpus=4)["offering"],
+                         (False, "no zone in ap-northeast-1 offers m7g.xlarge"))
 
     def test_quota_minus_running_on_demand_vcpus(self):
         # 16 on-demand vCPUs in use (spot is another quota): 64 leaves exactly 48, 63 not
@@ -561,6 +640,7 @@ class PreflightTest(unittest.TestCase):
         r = self.check(sts_error=Exception("Unable to locate credentials"))
         self.assertEqual(r["credentials"], (False, "Unable to locate credentials"))
         self.assertEqual(r["quota"], (False, "not checked without credentials"))
+        self.assertEqual(r["offering"], (False, "not checked without credentials"))
 
     def test_quota_api_denied(self):
         r = self.check(quota_error=ClientError("AccessDeniedException", "not authorized: servicequotas:GetServiceQuota"))
@@ -602,14 +682,22 @@ class FakeAws:
             f.write("PRIVATE\n")
         return dict(NET)
 
+    def zone_offering(self, instance_type):
+        if not self.w.offered:
+            raise RuntimeError(f"no zone in ap-northeast-1 offers {instance_type}")
+        return "zone-a"
+
     def launch_hosts(self, net, run_id, expires, record, instance_type, roles):
-        assert (instance_type, roles) == ("c7gn.2xlarge", z.ROLES)
-        self.w.calls.append(("aws", "launch_hosts"))
-        for k in range(len(z.ROLES)):
+        self.w.calls.append(("aws", f"launch_hosts {instance_type} {' '.join(roles)}"))
+        for k in range(len(roles)):
             record("instance", f"i-{k}")
         return [{"role": r, "id": f"i-{k}", "public_ip": f"pub{k}", "private_ip": f"10.80.1.{10 + k}",
                  "data_eni": {"id": f"eni-{k}", "mac": f"m{k}", "ip": RECEIVER_DATA_IP if k == 0 else f"10.80.1.{110 + k}"}}
-                for k, r in enumerate(z.ROLES)]
+                for k, r in enumerate(roles)]
+
+    def attach_eip(self, eni, run_id, expires, record):
+        self.w.calls.append(("aws", f"attach_eip {eni['id']} {eni['ip']}"))
+        record("address", "eipalloc-1")
 
 
 class RunTest(unittest.TestCase):
@@ -658,6 +746,8 @@ class RunTest(unittest.TestCase):
     def test_six_hosts_end_to_end(self):
         self.assertEqual(self.run_bench(), 0)
         w = self.w
+        self.assertEqual([c for r, c in w.calls if r == "aws"], [
+            "create_network 203.0.113.9 c7gn.2xlarge cluster", "launch_hosts c7gn.2xlarge " + " ".join(z.ROLES)])
         self.assertEqual(sorted(r for r, c in w.calls if c == "setup b'TAR'"), sorted(z.ROLES))
         cfg = w.put[("sender0", f"{z.REMOTE}/ssh_config")]
         self.assertEqual([l for l in cfg.splitlines() if l.startswith("Host sender")],
@@ -773,6 +863,116 @@ class RunTest(unittest.TestCase):
         self.assertIn("preflight source: FAIL the hosts build `git archive HEAD`", out.getvalue())
         self.assertEqual(self.w.calls, [])
         self.assertEqual(os.listdir(self.out), [])
+
+
+class BinanceTest(unittest.TestCase):
+    """`binance` end to end: fake AWS and host, the real runner flow and Created file."""
+
+    def setUp(self):
+        self.w = World()
+        self.out = tempfile.mkdtemp()
+
+    def run_binance(self, seconds=30):
+        w = self.w
+
+        def local(argv, **kw):
+            w.local_calls.append(argv)
+            assert argv[0] == "git", argv
+            return Proc(0, b"TAR" if "archive" in argv else "")
+
+        def clean_run(ec2, run_id, recorded, log=print, **kw):
+            w.clean_calls.append((run_id, {k: list(v) for k, v in recorded.items()}))
+            w.teardown_done = True
+            return list(w.left_after_teardown)
+
+        env = z.Env(aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
+                    local=local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        self.log = io.StringIO()
+        with mock.patch.object(z.janitor, "clean_run", clean_run), contextlib.redirect_stdout(self.log):
+            try:
+                code = z.main(["binance", "--seconds", str(seconds), "--out", self.out], env)
+            except BaseException as e:
+                code = e
+            finally:
+                for s, h in handlers.items():
+                    signal.signal(s, h)
+        runs = os.listdir(self.out)
+        self.run_dir = os.path.join(self.out, runs[0]) if runs else None
+        return code
+
+    def feed_runs(self):
+        return [c for r, c in self.w.calls if "run-binance.sh" in c]
+
+    def test_one_host_end_to_end(self):
+        self.assertEqual(self.run_binance(seconds=30), 0)
+        w = self.w
+        self.assertEqual(w.calls[:4], [
+            ("aws", "create_network 203.0.113.9 m7g.xlarge precision-time"), ("aws", "launch_hosts m7g.xlarge binance"),
+            ("aws", f"attach_eip eni-0 {RECEIVER_DATA_IP}"), ("binance", "install b'TAR'")])
+        self.assertFalse(any("setup" in c or "bootstrap" in c for r, c in w.calls), "no zhida-bench build")
+        self.assertEqual(self.feed_runs(), [f"root mkdir -p {z.REMOTE} && {z.SRC_DIR}/deploy/run-binance.sh"
+                                            f" --seconds 30 > {z.REMOTE}/feed.out 2>&1"])
+        self.assertEqual(w.feed_timeouts, [30 + z.FEED_MARGIN_S])
+        self.assertEqual(w.fetched, [("binance", "/var/log/zhida/binance.log"), ("binance", z.FEED_OUT)])
+        for name in ("binance.log", "feed.out", "verify.txt", "hosts.json"):
+            self.assertTrue(os.path.exists(os.path.join(self.run_dir, name)), name)
+        with open(os.path.join(self.run_dir, "verify.txt")) as f:
+            self.assertEqual(f.read(), "[binance] verify: ok\n")
+        recorded = {"vpc": ["vpc-1"], "subnet": ["subnet-1"], "instance": ["i-0"], "address": ["eipalloc-1"]}
+        self.assertEqual(janitor.read_created(os.path.join(self.run_dir, "created.json")), recorded)
+        self.assertEqual(w.clean_calls, [(os.path.basename(self.run_dir), recorded)])
+        log = self.log.getvalue()
+        self.assertIn("messages: 8", log)
+        self.assertIn("p50 8192..16384 ns", log)
+        self.assertLess(log.index("tearing down"), log.index("messages: 8"), "summary last")
+
+    def test_a_failed_feed_fetches_reports_and_fails(self):
+        self.w.feed_code, self.w.feed_text = 3, PORT_OPEN_FAILED
+        self.assertEqual(self.run_binance(), 1)
+        self.assertEqual(len(self.w.fetched), 2)
+        log = self.log.getvalue()
+        for line in ("run-binance.sh exit 3", "no feed_latency line", "port_open_error: PMD lacks"):
+            self.assertIn(line, log)
+        self.assertTrue(self.w.teardown_done)
+
+    def test_a_failed_fetch_fails_the_run(self):
+        self.w.fetch_fail.add(("binance", "/var/log/zhida/binance.log"))
+        self.assertEqual(self.run_binance(), 1)
+        self.assertIn("fetch failed: binance:/var/log/zhida/binance.log: scp exited 1", self.log.getvalue())
+        self.assertIn("messages: 8", self.log.getvalue())
+
+    def test_a_hung_feed_is_still_fetched_and_torn_down(self):
+        self.w.feed_hang = True
+        self.assertIsInstance(self.run_binance(), subprocess.TimeoutExpired)
+        self.assertEqual(len(self.w.fetched), 2)
+        self.assertIn("run-binance.sh did not finish", self.log.getvalue())
+        self.assertTrue(self.w.teardown_done)
+
+    def test_failed_verify_tears_down_without_running_the_feed(self):
+        self.w.verify_fail.add("binance")
+        code = self.run_binance()
+        self.assertIsInstance(code, RuntimeError)
+        self.assertIn("host setup failed", str(code))
+        self.assertEqual(self.feed_runs(), [])
+        self.assertEqual(len(self.w.clean_calls), 1)
+        with open(os.path.join(self.run_dir, "verify.txt")) as f:
+            self.assertIn("verify: FAIL", f.read())
+
+    def test_resources_left_after_teardown_fail_the_run(self):
+        self.w.left_after_teardown = ["address eipalloc-1"]
+        self.assertEqual(self.run_binance(), 1)
+        self.assertIn("NOT VERIFIED GONE", self.log.getvalue())
+
+    def test_type_not_offered_fails_before_anything_is_created(self):
+        self.w.offered = False
+        code = self.run_binance()
+        self.assertIsInstance(code, SystemExit)
+        self.assertEqual(str(code), "preflight failed; nothing was created")
+        self.assertIn("preflight offering: FAIL no zone in ap-northeast-1 offers m7g.xlarge", self.log.getvalue())
+        self.assertEqual(self.w.calls, [])
+        self.assertIsNone(self.run_dir)
+        self.assertEqual(self.w.clean_calls, [])
 
 
 class BootstrapTest(unittest.TestCase):
