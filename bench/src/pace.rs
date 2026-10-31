@@ -77,12 +77,7 @@ impl Pacer {
 
     /// Messages of sender `i` the cursor has passed: those it owes or has sent.
     fn released(&self, i: u32) -> u64 {
-        let (n, i) = (u64::from(self.schedule.senders), u64::from(i));
-        if self.cursor <= i {
-            0
-        } else {
-            (self.cursor - i).div_ceil(n)
-        }
+        self.count_below(self.cursor, i)
     }
 
     /// The next message to try this poll, `None` when the poll is over.
@@ -173,6 +168,23 @@ impl Pacer {
     /// connection's flow control) rather than fresh off the schedule.
     pub fn is_owed(&self, k: u64) -> bool {
         self.is_blocked[self.schedule.split(k).0 as usize]
+    }
+
+    /// Messages `from..end` never sent: a sender's sends are its first messages in order, so
+    /// sender i's unsent ones are those past its `sent[i]`.
+    pub fn unsent_from(&self, from: u64) -> u64 {
+        (0..self.schedule.senders)
+            .map(|i| {
+                let ahead = self.count_below(from, i).max(self.sent[i as usize]);
+                self.count_below(self.end, i).saturating_sub(ahead)
+            })
+            .sum()
+    }
+
+    /// Messages of sender `i` numbered below `k`.
+    fn count_below(&self, k: u64, i: u32) -> u64 {
+        let (n, i) = (u64::from(self.schedule.senders), u64::from(i));
+        if k <= i { 0 } else { (k - i).div_ceil(n) }
     }
 }
 
@@ -319,5 +331,42 @@ mod tests {
         });
         assert_eq!(p.backlog_at_end(), 0);
         assert!(p.owed_at_end() > 0);
+    }
+
+    /// Cut off at 24 µs with sender 1 blocked throughout: sender 1's messages and those not yet
+    /// due never left; unsent counts exactly them, from any message number on.
+    #[test]
+    fn unsent_counts_what_never_left() {
+        let s = Schedule {
+            senders: 3,
+            interval_ns: 3000,
+            origin_ns: 0,
+        }; // one message per µs
+        let mut p = Pacer::new(s, 30, 32);
+        let mut sent = vec![];
+        for poll in 0..25u64 {
+            p.begin(poll * 1000);
+            while let Some(k) = p.next_try() {
+                let o = if k % 3 == 1 {
+                    Outcome::Blocked
+                } else {
+                    Outcome::Sent
+                };
+                if o == Outcome::Sent {
+                    sent.push(k);
+                }
+                p.result(k, o);
+            }
+            p.finish(poll * 1000);
+        }
+        // polls 0..25 released messages 0..=24; of those sender 1's (1, 4, .., 22) are owed
+        let never: Vec<u64> = (0..30).filter(|k| !sent.contains(k)).collect();
+        assert_eq!(p.unsent_from(0), never.len() as u64);
+        assert_eq!(
+            p.unsent_from(9),
+            never.iter().filter(|&&k| k >= 9).count() as u64
+        );
+        assert_eq!(p.unsent_from(30), 0);
+        assert!(!p.done());
     }
 }

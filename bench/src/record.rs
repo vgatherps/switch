@@ -1,6 +1,8 @@
 //! What the generator learns from echoes in one rate step: latency of every measured message
 //! (receive time - scheduled time), which messages came back (a bitmap over the step's message
-//! numbers), duplicates, and echoes that do not belong to this step.
+//! numbers), duplicates, echoes that do not belong to this step, how many of this step's echoes
+//! arrived within the measurement window (the achieved receive rate), and (TCP/ws) the service
+//! round trip: echo time - actual send time.
 
 use crate::hist::Histogram;
 use crate::schedule::Schedule;
@@ -22,12 +24,24 @@ pub struct Recorder {
     pub stale: u64,
     /// Shorter than a header, or a header whose scheduled time does not match the schedule.
     pub malformed: u64,
+    /// This step's echoes (warmup and measured, once each) that arrived within `window`.
+    pub received_in_window: u64,
+    /// Monotonic ns `[start, end)` of the measurement window.
+    window: [u64; 2],
+    /// Echo time - actual send time (TCP/ws; recorded by the connection's receive task).
+    pub service_rtt: Histogram,
 }
 
 impl Recorder {
     /// For step `step` sending messages `0..end` of `schedule`, of which `measured_from..end`
-    /// are measured. Allocates the bitmap here, not while recording.
-    pub fn new(step: u32, schedule: Schedule, measured_from: u64, end: u64) -> Recorder {
+    /// are measured within `window`. Allocates the bitmap here, not while recording.
+    pub fn new(
+        step: u32,
+        schedule: Schedule,
+        measured_from: u64,
+        end: u64,
+        window: [u64; 2],
+    ) -> Recorder {
         assert!(measured_from <= end);
         let words = (end - measured_from).div_ceil(64) as usize;
         Recorder {
@@ -42,6 +56,9 @@ impl Recorder {
             duplicates: 0,
             stale: 0,
             malformed: 0,
+            received_in_window: 0,
+            window,
+            service_rtt: Histogram::new(),
         }
     }
 
@@ -65,8 +82,10 @@ impl Recorder {
             self.malformed += 1;
             return;
         }
+        let in_window = (self.window[0]..self.window[1]).contains(&now_ns);
         if k < self.measured_from {
             self.warmup_received += 1;
+            self.received_in_window += u64::from(in_window);
             return;
         }
         let bit = k - self.measured_from;
@@ -77,6 +96,7 @@ impl Recorder {
         }
         self.seen[word] |= mask;
         self.received += 1;
+        self.received_in_window += u64::from(in_window);
         self.latency.record(now_ns.saturating_sub(header.sched_ns));
     }
 
@@ -118,7 +138,7 @@ mod tests {
             interval_ns: 3000,
             origin_ns: 10_000,
         };
-        let mut r = Recorder::new(1, s, 6, 30);
+        let mut r = Recorder::new(1, s, 6, 30, [0, u64::MAX]);
         for k in 0..30 {
             if k % 10 == 9 {
                 continue; // lost: 9, 19, 29
@@ -141,7 +161,7 @@ mod tests {
             interval_ns: 1000,
             origin_ns: 0,
         };
-        let mut r = Recorder::new(5, s, 0, 10);
+        let mut r = Recorder::new(5, s, 0, 10, [0, u64::MAX]);
         r.record(&message(5, &s, 3), 10_000);
         r.record(&message(5, &s, 3), 10_001);
         r.record(&message(4, &s, 3), 10_002);
@@ -168,8 +188,28 @@ mod tests {
             interval_ns: 1000,
             origin_ns: 5000,
         };
-        let mut r = Recorder::new(0, s, 0, 1);
+        let mut r = Recorder::new(0, s, 0, 1, [0, u64::MAX]);
         r.record(&message(0, &s, 0), 4000);
         assert_eq!(r.latency.max(), 0);
+    }
+
+    /// The achieved receive count takes this step's first echoes (warmup or measured) that
+    /// arrive inside the window; late, duplicate and stale echoes are not throughput of it.
+    #[test]
+    fn received_in_window_counts_first_echoes_inside_it() {
+        let s = Schedule {
+            senders: 1,
+            interval_ns: 1000,
+            origin_ns: 0,
+        };
+        let mut r = Recorder::new(2, s, 2, 10, [2000, 10_000]);
+        r.record(&message(2, &s, 0), 1999); // warmup, before the window
+        r.record(&message(2, &s, 1), 2000); // warmup, inside
+        r.record(&message(2, &s, 2), 2500);
+        r.record(&message(2, &s, 2), 2600); // duplicate
+        r.record(&message(1, &s, 3), 3000); // stale
+        r.record(&message(2, &s, 3), 10_000); // after the window
+        assert_eq!(r.received_in_window, 2);
+        assert_eq!((r.warmup_received, r.received), (2, 2));
     }
 }

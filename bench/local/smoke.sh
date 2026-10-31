@@ -10,8 +10,8 @@
 # counter-capture check: one rate (CHECK_RATE) of UDP against the DUT with capture on and off.
 # Every process's stderr goes to OUT_DIR/*.log. A failed sweep sends SIGUSR1 to the DUT and kernel
 # echo processes (each prints its per-connection state to its log), saves `ss -tnoi`, and stops.
-# Last, the stall watchdog check: a TCP sweep against a listener that never reads must fail fast
-# with the generator's stall dump.
+# Last, the bounded-overload check: a TCP sweep against a listener that never reads must end on
+# time with its loss reported and a complete summary.
 # Usage: [GENS=2] [SENDERS=2*GENS] [PROTOS="udp tcp ws"] smoke.sh OUT_DIR [extra sweep flags...]
 set -eu
 out=$1
@@ -107,8 +107,11 @@ for proto in udp tcp ws; do
 done
 
 for proto in $protos; do
-    start_dut "$proto" --counter-log "$out/dut-counters-$proto.jsonl"
-    sweep "$proto" zhida $dut_addr:7000 "$out/$proto-zhida.jsonl" "$@"
+    start_dut "$proto" --counter-log "$out/dut-counters-$proto-zhida.jsonl"
+    budget=
+    [ "$proto" = udp ] || budget="--budget-us 50"
+    # shellcheck disable=SC2086 # budget is zero or two words
+    sweep "$proto" zhida $dut_addr:7000 "$out/$proto-zhida.jsonl" $budget "$@"
     sweep "$proto" kernel $kernel_addr:"$(kernel_port "$proto")" "$out/$proto-kernel.jsonl" "$@"
     if [ "$proto" = tcp ]; then
         for target in zhida:$dut_addr:7000 kernel:$kernel_addr:7001; do
@@ -131,10 +134,10 @@ for mode in on off; do
     stop_dut
 done
 
-# Stall watchdog: a listener that accepts and never reads (tiny receive buffer); the generators'
-# connections fill, the step cannot finish, and each worker must fail with its stall dump well
-# before the coordinator's own reply timeout. The DUT runs only so that its tap gives the kernel
-# the 10.10.0.1 address.
+# Bounded overload: a listener that accepts and never reads (tiny receive buffer). The generators'
+# connections fill; the step must still end on time with every measured message lost (most never
+# sent), and the sweep must complete with its summary instead of hanging or aborting. The DUT runs
+# only so that its tap gives the kernel the 10.10.0.1 address.
 start_dut tcp
 python3 -c '
 import socket
@@ -150,15 +153,20 @@ while True:
 kerns="$kerns $!"
 sleep 0.5
 started=$(date +%s)
-if run_sweep tcp $kernel_addr:7003 "$out/stall-check.jsonl" --rate-min 64000 --rate-max 64000 \
-    --step-ms 300 --warmup-ms 100 --drain-ms 100; then
-    echo "smoke: stall watchdog: the sweep against a sink succeeded" >&2
-    exit 1
-fi
+run_sweep tcp $kernel_addr:7003 "$out/overload-check.jsonl" --rate-min 64000 --rate-max 64000 \
+    --step-ms 300 --warmup-ms 100 --drain-ms 100 --budget-us 50 ||
+    { echo "smoke: bounded overload: the sweep against a sink failed: $(tail -1 "$out/sweep.log")" >&2; exit 1; }
 took=$(($(date +%s) - started))
-grep -q '"kind":"stall"' "$out"/gen*.log || { echo "smoke: stall watchdog: no stall dump" >&2; exit 1; }
-grep -q 'stalled: not done' "$out"/gen*.log || { echo "smoke: stall watchdog: no stall error" >&2; exit 1; }
-echo "smoke: stall watchdog: sweep failed in ${took}s with the generator's stall dump"
+python3 - "$out/overload-check.jsonl" "$took" <<'PY' || exit 1
+import json, sys
+lines = [json.loads(l) for l in open(sys.argv[1])]
+step, summary = lines[0], lines[-1]
+ok = (step["kind"] == "step" and step["drop_fraction"] == 1.0 and step["unsent"] > 0
+      and summary["kind"] == "summary" and summary["complete"] and int(sys.argv[2]) < 30)
+print(f"smoke: bounded overload: {sys.argv[2]}s, drop {step['drop_fraction']}, unsent {step['unsent']}"
+      f" of {step['measured']}, summary complete={summary['complete']} stop={summary['stop']}")
+sys.exit(0 if ok else 1)
+PY
 stop_dut
 trap - EXIT
 kill $kerns 2>/dev/null || true

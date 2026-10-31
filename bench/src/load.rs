@@ -3,12 +3,15 @@
 //! `Command` and `StepResult`). Between steps it turns the Net and reads stdin (non-blocking);
 //! during a step the loop makes no syscall.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
 use std::net::SocketAddrV4;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -62,7 +65,8 @@ pub const TCP_BUFFER: usize = 64 * 1024;
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
 /// A step to run: this worker's share of the rate, starting at a wall-clock time common to all
-/// workers.
+/// workers. Sending stops at the end of the window (warmup + step) whatever is still owed;
+/// echoes are taken until the drain ends.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Command {
     pub step: u32,
@@ -71,6 +75,9 @@ pub struct Command {
     pub warmup_ms: u64,
     pub step_ms: u64,
     pub drain_ms: u64,
+    /// TCP/ws: messages each connection may have sent and not yet had echoed; a message due
+    /// beyond it waits (its latency still runs from its scheduled time). `None`: no limit.
+    pub budget: Option<u32>,
 }
 
 /// What a worker reports for one step.
@@ -78,10 +85,17 @@ pub struct Command {
 pub struct StepResult {
     pub step: u32,
     pub offered_pps: f64,
-    /// Scheduled times of the measured messages, wall clock.
+    /// The measurement window (scheduled times of the measured messages), wall clock.
     pub window_unix_ns: [u64; 2],
     pub measured: u64,
     pub received: u64,
+    /// Measured messages that never left the generator before the window ended (included in
+    /// the loss: measured - received).
+    pub unsent: u64,
+    /// Messages actually sent, and this step's echoes received, within the window: the achieved
+    /// rates, against `offered_pps`.
+    pub sent_in_window: u64,
+    pub received_in_window: u64,
     pub duplicates: u64,
     pub stale: u64,
     pub malformed: u64,
@@ -89,10 +103,23 @@ pub struct StepResult {
     pub latency: Sparse,
     /// Actual send - scheduled time of messages sent fresh off the schedule.
     pub send_lag: Sparse,
-    /// The same for messages a full connection owed (TCP flow control): the receiver's doing.
+    /// The same for messages a connection owed (TCP flow control or the budget): the
+    /// receiver's doing.
     pub owed_wait: Sparse,
     pub backlog_at_end: u64,
     pub owed_at_end: u64,
+    /// TCP/ws: echo time - actual send time.
+    pub service_rtt: Sparse,
+    pub budget: Option<u32>,
+    /// Measured messages that waited at least once because their connection was at `budget`.
+    pub budget_waits: u64,
+    /// TCP/ws: a connection's messages in flight right after each measured send (sum, count,
+    /// max), and over all connections at the step's start and after its settle.
+    pub in_flight_sum: u64,
+    pub in_flight_samples: u64,
+    pub in_flight_max: u64,
+    pub in_flight_at_start: u64,
+    pub in_flight_after: u64,
     /// The worker's loop over the step: wall time per round (Net turn + Runtime poll).
     pub ns_per_round: u64,
     pub turns: TurnSums,
@@ -100,12 +127,18 @@ pub struct StepResult {
     pub rx_dropped_full: u64,
 }
 
-/// What the send task leaves for the loop once it has sent the whole step.
+/// What the send task leaves for the loop once it has sent the whole step or been cut off.
 struct Sent {
     lag: Histogram,
     owed_wait: Histogram,
     backlog_at_end: u64,
     owed_at_end: u64,
+    unsent: u64,
+    in_window: u64,
+    budget_waits: u64,
+    in_flight_sum: u64,
+    in_flight_samples: u64,
+    in_flight_max: u64,
 }
 
 /// The senders' send halves (ws: the upgraded connections' TCP halves).
@@ -151,21 +184,22 @@ struct Worker {
     handle: NetHandle,
     senders: Rc<RefCell<Senders>>,
     recorder: Rc<RefCell<Option<Recorder>>>,
-    /// TCP/ws connections' receive side, for the stall dump (empty for UDP).
-    conns: Rc<Vec<ConnStats>>,
+    /// TCP/ws connections (empty for UDP).
+    conns: Rc<Vec<Conn>>,
     target: IpEndpoint,
     args: Args,
 }
 
-/// A step that has not finished this long after its drain fails, with a state dump.
-const STALL_LIMIT_NS: u64 = 5_000_000_000;
+/// TCP/ws: how long after its drain a step waits for its connections' echoes to come back, so
+/// the next step starts with nothing in flight (what is left is reported).
+const SETTLE_LIMIT_NS: u64 = 1_000_000_000;
+/// A send task not finished this long after its cutoff is a bug, not overload.
+const CUTOFF_LIMIT_NS: u64 = 1_000_000_000;
 
-/// One TCP/ws connection's receive side, for the stall dump.
-#[derive(Default)]
-struct ConnStats {
-    rx_bytes: Cell<u64>,
-    last_rx_ns: Cell<u64>,
-    ended: Cell<bool>,
+/// One TCP/ws connection: the actual send times of its messages not yet echoed, oldest first
+/// (TCP echoes in order), so its length is the connection's in-flight count.
+struct Conn {
+    in_flight: RefCell<VecDeque<u64>>,
 }
 
 /// Opens the Stack, binds or connects the senders, prints `{"kind":"ready"}`, then serves
@@ -211,9 +245,15 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     let clock = host.clock;
     let recorder: Rc<RefCell<Option<Recorder>>> = Rc::default();
     let target = IpEndpoint::new((*args.target.ip()).into(), args.target.port());
-    let conns: Rc<Vec<ConnStats>> = Rc::new(match args.proto {
+    // in flight at most what the generator's and the receiver's send and receive buffers hold
+    let in_flight_cap = 4 * TCP_BUFFER / args.size;
+    let conns: Rc<Vec<Conn>> = Rc::new(match args.proto {
         Proto::Udp => Vec::new(),
-        Proto::Tcp | Proto::Ws => (0..n).map(|_| ConnStats::default()).collect(),
+        Proto::Tcp | Proto::Ws => (0..n)
+            .map(|_| Conn {
+                in_flight: RefCell::new(VecDeque::with_capacity(in_flight_cap)),
+            })
+            .collect(),
     });
     let senders = match args.proto {
         Proto::Udp => {
@@ -314,7 +354,7 @@ fn connect_all(
     config: tcp::Config,
     target: IpEndpoint,
     recorder: &Rc<RefCell<Option<Recorder>>>,
-    conns: &Rc<Vec<ConnStats>>,
+    conns: &Rc<Vec<Conn>>,
 ) -> Result<Vec<TcpTx>, String> {
     let n = args.senders as usize;
     let connected: Rc<RefCell<Vec<Option<TcpTx>>>> =
@@ -367,26 +407,26 @@ fn connect_all(
                 partial.extend_from_slice(&head[n..]);
             }
             connected.borrow_mut()[i as usize] = Some(tx);
-            let stats = &conns[i as usize];
+            let conn = &conns[i as usize];
             while let Ok(frame) = rx.recv().await {
                 let now = clock.now_ns();
-                stats
-                    .rx_bytes
-                    .set(stats.rx_bytes.get() + frame.payload().len() as u64);
-                stats.last_rx_ns.set(now);
                 let mut r = recorder.borrow_mut();
+                let mut in_flight = conn.in_flight.borrow_mut();
                 messages(&mut partial, frame.payload(), unit, |m| {
                     let m = if ws {
                         wsclient::decode(m, size).unwrap_or_else(|e| panic!("connection {i}: {e}"))
                     } else {
                         m
                     };
+                    let sent_ns = in_flight.pop_front();
                     if let Some(r) = r.as_mut() {
                         r.record(m, now);
+                        if let Some(sent_ns) = sent_ns {
+                            r.service_rtt.record(now.saturating_sub(sent_ns));
+                        }
                     }
                 });
             }
-            stats.ended.set(true);
         })?;
     }
     let deadline = host.clock.now_ns() + CONNECT_LIMIT.as_nanos() as u64;
@@ -428,106 +468,102 @@ pub fn messages(partial: &mut Vec<u8>, mut data: &[u8], size: usize, mut each: i
 }
 
 impl Worker {
+    /// Messages in flight over all TCP/ws connections.
+    fn in_flight(&self) -> u64 {
+        self.conns
+            .iter()
+            .map(|c| c.in_flight.borrow().len() as u64)
+            .sum()
+    }
+
     fn step(&mut self, c: Command) -> Result<StepResult, String> {
+        let in_flight_at_start = self.in_flight();
         let host = &mut self.host;
         let clock = host.clock;
         let eth_before = EthStats::read(host.port_id)?;
         let dropped_before = self.senders.borrow().rx_dropped_full();
         let origin = clock.mono_of_unix(c.start_unix_ns);
         let schedule = Schedule::for_rate(self.args.senders, c.rate_pps, origin);
-        let measured_from = schedule.count_before(origin + c.warmup_ms * 1_000_000);
-        let window_end = origin + (c.warmup_ms + c.step_ms) * 1_000_000;
-        let end = schedule.count_before(window_end);
-        *self.recorder.borrow_mut() = Some(Recorder::new(c.step, schedule, measured_from, end));
+        let window = [
+            origin + c.warmup_ms * 1_000_000,
+            origin + (c.warmup_ms + c.step_ms) * 1_000_000,
+        ];
+        let measured_from = schedule.count_before(window[0]);
+        let end = schedule.count_before(window[1]);
+        *self.recorder.borrow_mut() =
+            Some(Recorder::new(c.step, schedule, measured_from, end, window));
         let sent: Rc<RefCell<Option<Sent>>> = Rc::default();
-        let pacer = Rc::new(RefCell::new(Pacer::new(
-            schedule,
-            end,
-            self.args.send_budget,
-        )));
-        let phase = Rc::new(Cell::new("start"));
         let task = send_step(
-            self.handle.clone(),
-            self.senders.clone(),
-            clock,
-            pacer.clone(),
-            phase.clone(),
-            schedule,
-            measured_from,
-            c.step,
-            self.args.size,
-            self.target,
+            SendStep {
+                handle: self.handle.clone(),
+                senders: self.senders.clone(),
+                conns: self.conns.clone(),
+                clock,
+                pacer: Pacer::new(schedule, end, self.args.send_budget),
+                schedule,
+                measured_from,
+                window,
+                budget: c.budget,
+                step: c.step,
+                size: self.args.size,
+                target: self.target,
+            },
             sent.clone(),
         );
         spawn(host, task)?;
         let mut turns = TurnSums::default();
         let started_ns = clock.now_ns();
-        let drain_ns = c.drain_ms * 1_000_000;
-        let (mut last_round, mut max_gap) = (started_ns, 0);
+        let drain_end = window[1] + c.drain_ms * 1_000_000;
         loop {
             let now = host.round(&mut turns)?;
-            max_gap = max_gap.max(now - last_round);
-            last_round = now;
             if host::stopped() {
                 return Err("stopped".into());
             }
-            if sent.borrow().is_some() && now >= window_end + drain_ns {
+            if sent.borrow().is_some() && now >= drain_end {
                 break;
             }
-            if now >= window_end + drain_ns + STALL_LIMIT_NS {
-                let conns: Vec<_> = self
-                    .conns
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({"rx_bytes": c.rx_bytes.get(),
-                            "last_rx_ago_ms": now.saturating_sub(c.last_rx_ns.get()) / 1_000_000,
-                            "ended": c.ended.get()})
-                    })
-                    .collect();
-                let received = self.recorder.borrow().as_ref().map(|r| r.received);
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"kind": "stall", "step": c.step, "rate_pps": c.rate_pps,
-                        "past_drain_ms": (now - window_end - drain_ns) / 1_000_000,
-                        "send_task": phase.get(), "pacer": format!("{:?}", pacer.borrow()),
-                        "received": received, "max_round_gap_us": max_gap / 1000, "turns": turns,
-                        "eth": EthStats::read(host.port_id)?.since(&eth_before), "conns": conns})
-                );
+            if now >= drain_end.max(window[1] + CUTOFF_LIMIT_NS) {
                 return Err(format!(
-                    "step {} stalled: not done {} ms after its drain (state on stderr)",
-                    c.step,
-                    STALL_LIMIT_NS / 1_000_000
+                    "step {}: the send task outlived its cutoff",
+                    c.step
                 ));
             }
         }
-        let Sent {
-            lag,
-            owed_wait,
-            backlog_at_end,
-            owed_at_end,
-        } = sent.borrow_mut().take().expect("checked above");
         let elapsed_ns = clock.now_ns() - started_ns;
         let r = self.recorder.borrow_mut().take().expect("set above");
+        let settle_end = clock.now_ns() + SETTLE_LIMIT_NS;
+        let mut settle_turns = TurnSums::default();
+        while self.in_flight() > 0 && self.host.round(&mut settle_turns)? < settle_end {}
+        let host = &mut self.host;
+        let s = sent.borrow_mut().take().expect("checked above");
         let eth = EthStats::read(host.port_id)?.since(&eth_before);
         let dropped_after = self.senders.borrow().rx_dropped_full();
         Ok(StepResult {
             step: c.step,
             offered_pps: schedule.offered_pps(),
-            window_unix_ns: [
-                clock.unix_ns(schedule.due_at(measured_from)),
-                clock.unix_ns(window_end),
-            ],
+            window_unix_ns: window.map(|ns| clock.unix_ns(ns)),
             measured: r.measured(),
             received: r.received,
+            unsent: s.unsent,
+            sent_in_window: s.in_window,
+            received_in_window: r.received_in_window,
             duplicates: r.duplicates,
             stale: r.stale,
             malformed: r.malformed,
             warmup_received: r.warmup_received,
             latency: r.latency.to_sparse(),
-            send_lag: lag.to_sparse(),
-            owed_wait: owed_wait.to_sparse(),
-            backlog_at_end,
-            owed_at_end,
+            send_lag: s.lag.to_sparse(),
+            owed_wait: s.owed_wait.to_sparse(),
+            backlog_at_end: s.backlog_at_end,
+            owed_at_end: s.owed_at_end,
+            service_rtt: r.service_rtt.to_sparse(),
+            budget: c.budget,
+            budget_waits: s.budget_waits,
+            in_flight_sum: s.in_flight_sum,
+            in_flight_samples: s.in_flight_samples,
+            in_flight_max: s.in_flight_max,
+            in_flight_at_start,
+            in_flight_after: self.in_flight(),
             ns_per_round: elapsed_ns / turns.turns.max(1),
             turns,
             eth,
@@ -536,36 +572,94 @@ impl Worker {
     }
 }
 
-/// Sends the step's messages on schedule through the pacer (at most its budget per poll),
-/// yielding to the loop between batches. Send lag is recorded for measured messages only (the
-/// warmup absorbs ARP and connection start); a full connection's owed messages are timed apart.
-#[allow(clippy::too_many_arguments)]
-async fn send_step(
+/// One step's send task.
+struct SendStep {
     handle: NetHandle,
     senders: Rc<RefCell<Senders>>,
+    conns: Rc<Vec<Conn>>,
     clock: Clock,
-    pacer: Rc<RefCell<Pacer>>,
-    phase: Rc<Cell<&'static str>>,
+    pacer: Pacer,
     schedule: Schedule,
     measured_from: u64,
+    /// Monotonic ns of the measurement window; sending stops at its end.
+    window: [u64; 2],
+    budget: Option<u32>,
     step: u32,
     size: usize,
     target: IpEndpoint,
-    done: Rc<RefCell<Option<Sent>>>,
-) {
-    let (mut lag, mut owed_wait) = (Histogram::new(), Histogram::new());
+}
+
+/// An empty frame if the pool has one now; never waits (a cut-off send task must not be left
+/// parked on the pool).
+async fn try_tx_frame(handle: &NetHandle) -> Option<TxFrame> {
+    let mut wait = handle.tx_frame();
+    std::future::poll_fn(|cx| {
+        Poll::Ready(match Pin::new(&mut wait).poll(cx) {
+            Poll::Ready(frame) => Some(frame),
+            Poll::Pending => None,
+        })
+    })
+    .await
+}
+
+/// Sends the step's messages on schedule through the pacer (at most its budget per poll),
+/// yielding to the loop between batches, until all are sent or the window ends. Send lag is
+/// recorded for measured messages only (the warmup absorbs ARP and connection start); owed
+/// messages (a full connection, or one at its budget) are timed apart.
+async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
+    let SendStep {
+        handle,
+        senders,
+        conns,
+        clock,
+        mut pacer,
+        schedule,
+        measured_from,
+        window,
+        budget,
+        step,
+        size,
+        target,
+    } = s;
+    let mut out = Sent {
+        lag: Histogram::new(),
+        owed_wait: Histogram::new(),
+        backlog_at_end: 0,
+        owed_at_end: 0,
+        unsent: 0,
+        in_window: 0,
+        budget_waits: 0,
+        in_flight_sum: 0,
+        in_flight_samples: 0,
+        in_flight_max: 0,
+    };
+    // per sender, the last message refused for its budget (each counts once however often
+    // it is retried)
+    let mut refused = vec![u64::MAX; schedule.senders as usize];
     let ws = matches!(&*senders.borrow(), Senders::Ws(_));
-    while !pacer.borrow().done() {
-        phase.set("pacing");
-        pacer.borrow_mut().begin(clock.now_ns());
-        loop {
-            // no pacer borrow across the await: the stall dump reads it
-            let next = pacer.borrow_mut().next_try();
-            let Some(k) = next else { break };
-            phase.set("frame");
-            let mut frame = handle.tx_frame().await;
-            phase.set("pacing");
+    loop {
+        let now = clock.now_ns();
+        if pacer.done() || now >= window[1] {
+            break;
+        }
+        pacer.begin(now);
+        while let Some(k) = pacer.next_try() {
             let (sender, seq) = schedule.split(k);
+            let conn = conns.get(sender as usize);
+            if let (Some(cap), Some(conn)) = (budget, conn)
+                && conn.in_flight.borrow().len() >= cap as usize
+            {
+                if k >= measured_from && refused[sender as usize] != k {
+                    refused[sender as usize] = k;
+                    out.budget_waits += 1;
+                }
+                pacer.result(k, Outcome::Blocked);
+                continue;
+            }
+            let Some(mut frame) = try_tx_frame(&handle).await else {
+                pacer.result(k, Outcome::Stop);
+                continue;
+            };
             let sched_ns = schedule.due_at(k);
             let header = Header {
                 step,
@@ -580,30 +674,43 @@ async fn send_step(
                 size
             };
             frame.set_len(len);
-            let owed = pacer.borrow().is_owed(k);
+            let owed = pacer.is_owed(k);
             let outcome = senders.borrow_mut().send(sender, frame, target);
-            if outcome == Outcome::Sent && k >= measured_from {
-                let wait = clock.now_ns().saturating_sub(sched_ns);
-                if owed {
-                    owed_wait.record(wait)
-                } else {
-                    lag.record(wait)
+            if outcome == Outcome::Sent {
+                let now = clock.now_ns();
+                out.in_window += u64::from((window[0]..window[1]).contains(&now));
+                let in_flight = conn.map_or(0, |c| {
+                    let mut q = c.in_flight.borrow_mut();
+                    q.push_back(now);
+                    q.len() as u64
+                });
+                if k >= measured_from {
+                    let wait = now.saturating_sub(sched_ns);
+                    if owed {
+                        out.owed_wait.record(wait)
+                    } else {
+                        out.lag.record(wait)
+                    }
+                    if conn.is_some() {
+                        out.in_flight_sum += in_flight;
+                        out.in_flight_samples += 1;
+                        out.in_flight_max = out.in_flight_max.max(in_flight);
+                    }
                 }
             }
-            pacer.borrow_mut().result(k, outcome);
+            pacer.result(k, outcome);
         }
-        pacer.borrow_mut().finish(clock.now_ns());
-        phase.set("yield");
+        pacer.finish(clock.now_ns());
         switch::yield_now().await;
     }
-    phase.set("done");
-    let pacer = pacer.borrow();
-    *done.borrow_mut() = Some(Sent {
-        lag,
-        owed_wait,
-        backlog_at_end: pacer.backlog_at_end(),
-        owed_at_end: pacer.owed_at_end(),
-    });
+    // cut off: a last look at what was due and not sent, if no poll did after the last message
+    let now = clock.now_ns();
+    pacer.begin(now);
+    pacer.finish(now);
+    out.backlog_at_end = pacer.backlog_at_end();
+    out.owed_at_end = pacer.owed_at_end();
+    out.unsent = pacer.unsent_from(measured_from);
+    *done.borrow_mut() = Some(out);
 }
 
 /// Line-buffered non-blocking stdin.

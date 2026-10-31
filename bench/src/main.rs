@@ -19,9 +19,12 @@ usage:
   zhida-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N --size S
                     --rate-min PPS --rate-max PPS [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200]
                     [--bisect 4] [--p99-factor 3] [--max-drop 0.001] [--lag-limit-us 20] [--lead-ms 50]
+                    [--budget-us W]
       The sweep coordinator: starts G generator workers (`sh -c CMD` with {i} = 0..G-1 and
       {senders} = N/G), runs each rate step on all of them (rate split evenly), merges, doubles
-      then bisects to the knee. Prints one JSON line per step and a summary line.
+      then bisects to the knee, repeats around it and runs points past it. Prints one JSON line
+      per step and always a summary line. --budget-us (tcp, ws): after the first step, each
+      connection may have its rate share x (the first step's median round trip + W) in flight.
   zhida-bench gen --config F --proto udp|tcp|ws --target IP:PORT --senders N --size S
                   [--send-budget 32] [--local-port 40000]
       One generator worker (a Zhida Stack on its own Port and core); takes steps on stdin.
@@ -124,7 +127,11 @@ fn main_inner() -> Result<(), String> {
                 drain_ms: flags.or("drain-ms", 200)?,
                 lag_limit_us: flags.or("lag-limit-us", 20)?,
                 lead_ms: flags.or("lead-ms", 50)?,
+                budget_window_us: flags.take("budget-us")?,
             };
+            if args.budget_window_us.is_some() && proto == Proto::Udp {
+                return Err("--budget-us is for tcp and ws".into());
+            }
             flags.done()?;
             if args.limits.rate_min == 0 || args.limits.rate_min > args.limits.rate_max {
                 return Err("need 0 < --rate-min <= --rate-max".into());

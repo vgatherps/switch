@@ -3,10 +3,15 @@
 
 Usage: report.py RESULTS_DIR [--title T]
 
-RESULTS_DIR holds `<proto>-<target>[-<tag>].jsonl` sweep outputs (`zhida-bench sweep` lines), and
-optionally `dut-counters*.jsonl` (`zhida-bench serve` counter logs), `host-setup.txt` (the host
-setup verification) and `counters-on.jsonl` / `counters-off.jsonl` (the counter-capture check:
-the same single rate with DUT counter capture on and off). Python stdlib only.
+RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and optionally
+`dut-counters-<sweep>.jsonl` (the `zhida-bench serve` counter log of that sweep's DUT),
+`expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce),
+`host-setup.txt` (the host setup verification), `pingpong-*.jsonl` and `counters-on.jsonl` /
+`counters-off.jsonl` (the counter-capture check: the same single rate with DUT counter capture on
+and off). Python stdlib only.
+
+Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
+summary, or a sweep did not complete. The report is still written, headed INCOMPLETE.
 """
 import json
 import math
@@ -22,7 +27,7 @@ def load_jsonl(path):
 
 def sweep_files(directory):
     for name in sorted(os.listdir(directory)):
-        if name.endswith(".jsonl") and not name.startswith(("dut-counters", "counters-", "pingpong-", "kernel-sender-")):
+        if name.endswith(".jsonl") and not name.startswith(("dut-counters-", "counters-", "pingpong-")):
             yield name, os.path.join(directory, name)
 
 
@@ -32,12 +37,31 @@ def split_sweep(lines):
     return steps, summary
 
 
-def dut_samples(directory):
-    """Every `sample` of every DUT counter log, oldest first."""
-    samples = []
-    for name in sorted(os.listdir(directory)):
-        if name.startswith("dut-counters") and name.endswith(".jsonl"):
-            samples += [l["sample"] for l in load_jsonl(os.path.join(directory, name)) if l.get("kind") == "sample"]
+def problems(directory, sweeps):
+    """Why the results are incomplete, one line each; empty if complete. `sweeps` maps a sweep's
+    name to its summary (None if it has none)."""
+    out = []
+    expected_path = os.path.join(directory, "expected.json")
+    if os.path.exists(expected_path):
+        with open(expected_path) as f:
+            expected = json.load(f)["sweeps"]
+        out += [f"{name}: missing" for name in expected if name not in sweeps]
+    elif not sweeps:
+        out.append("no sweep results")
+    for name, summary in sweeps.items():
+        if summary is None:
+            out.append(f"{name}: no summary (the sweep did not finish)")
+        elif not summary.get("complete"):
+            out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
+    return out
+
+
+def dut_samples(directory, sweep):
+    """The `sample`s of the sweep's DUT counter log, oldest first."""
+    path = os.path.join(directory, f"dut-counters-{sweep}.jsonl")
+    if not os.path.exists(path):
+        return []
+    samples = [l["sample"] for l in load_jsonl(path) if l.get("kind") == "sample"]
     return sorted(samples, key=lambda s: s["unix_ns"])
 
 
@@ -85,43 +109,72 @@ def owed(step):
     return sum(g.get("owed_at_end", 0) for g in step.get("per_gen", []))
 
 
+def flags(step):
+    out = []
+    if step.get("generator_bound"):
+        out.append("GEN-BOUND")
+    if step.get("budget_bound"):
+        out.append("BUDGET-BOUND")
+    if step.get("latency_ns") is None:
+        out.append("NO ECHO")
+    return " ".join(out) or "-"
+
+
+def in_flight(step):
+    mean = step.get("in_flight_mean")
+    return "-" if mean is None else f"{mean:.1f} / {step.get('in_flight_max', 0)}"
+
+
 def table(steps, samples):
     rows = [
-        "| offered pps | p50 µs | p99 µs | p99.9 µs | max µs | drop % | good | gen-bound | max gen lag p99 µs |"
-        " flow-control owed | DUT echoed | DUT full-queue drops | gen µs/round (tasks/round) |",
-        "|---:|---:|---:|---:|---:|---:|:-:|:-:|---:|---:|---:|---:|---:|",
+        "| step | offered pps | sent pps | received pps | p50 µs | p99 µs | p99.9 µs | max µs | drop % | unsent |"
+        " good | flags | service RTT p50 µs | budget | in flight mean / max | owed | max gen lag p99 µs |"
+        " DUT echoed | DUT full-queue drops | gen µs/round (tasks/round) |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:-:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for s in sorted(steps, key=lambda s: s["offered_pps"]):
+    for s in sorted(steps, key=lambda s: (s["offered_pps"], s["step"])):
         d = dut_delta(samples, s["window_unix_ns"]) if samples else None
+        rtt = s.get("service_rtt_ns")
         rows.append(
-            f"| {s['offered_pps']:.0f} | {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} |"
-            f" {us(lat(s, 'max'))} | {100 * s['drop_fraction']:.3f} | {'yes' if s['good'] else 'no'} |"
-            f" {'YES' if s['generator_bound'] else 'no'} | {us(max_gen_lag_p99(s))} | {owed(s)} |"
-            f" {'-' if d is None else d['echoed']} | {'-' if d is None else d['rx_dropped_full']} |"
-            f" {round_cost(s)} |"
+            f"| {s['step']} | {s['offered_pps']:.0f} | {s.get('sent_pps', 0):.0f} | {s.get('received_pps', 0):.0f} |"
+            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
+            f" {100 * s['drop_fraction']:.3f} | {s.get('unsent', 0)} | {'yes' if s['good'] else 'no'} | {flags(s)} |"
+            f" {us(rtt['p50'] if rtt else None)} | {s.get('budget') or '-'} | {in_flight(s)} | {owed(s)} |"
+            f" {us(max_gen_lag_p99(s))} | {'-' if d is None else d['echoed']} |"
+            f" {'-' if d is None else d['rx_dropped_full']} | {round_cost(s)} |"
         )
     return "\n".join(rows)
 
 
-def svg_plot(steps, knee, title):
-    """p50/p99/p99.9/max latency (log y, left) and drop % (linear, right) vs offered pps (log x)."""
+def knee_text(summary):
+    knee = summary.get("knee_pps")
+    if knee is None:
+        return "none"
+    return f">= {knee} (rate max)" if summary.get("knee_lower_bound") else str(knee)
+
+
+def svg_plot(steps, summary, title):
+    """p50/p99/p99.9/max latency (log y, left) and drop % (linear, right) vs offered pps (log x).
+    A step where nothing came back has no latency: it is drawn as an x at the top of the latency
+    axis, and its 100% drop is on the drop line like every other step's."""
     W, H, L, R, T, B = 760, 420, 70, 70, 40, 50
-    pts = sorted((s for s in steps if s.get("latency_ns")), key=lambda s: s["offered_pps"])
+    steps = sorted(steps, key=lambda s: (s["offered_pps"], s["step"]))
+    pts = [s for s in steps if s.get("latency_ns")]
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" font-family="sans-serif" font-size="11">',
            f'<rect width="{W}" height="{H}" fill="white"/>',
            f'<text x="{W / 2}" y="20" text-anchor="middle" font-size="14">{escape(title)}</text>']
-    if not pts:
+    if not steps:
         out.append(f'<text x="{W / 2}" y="{H / 2}" text-anchor="middle">no data</text></svg>')
         return "\n".join(out)
-    xs = [s["offered_pps"] for s in pts]
-    ys = [s["latency_ns"][k] / 1000 for s in pts for k in ("p50", "p99", "p999", "max")]
+    xs = [s["offered_pps"] for s in steps]
+    ys = [s["latency_ns"][k] / 1000 for s in pts for k in ("p50", "p99", "p999", "max")] or [1.0]
     x0, x1 = math.log10(min(xs)), math.log10(max(xs))
     if x1 - x0 < 1e-9:
         x0, x1 = x0 - 0.5, x1 + 0.5
     y0, y1 = math.floor(math.log10(max(min(ys), 0.1))), math.ceil(math.log10(max(ys)))
     if y1 <= y0:
         y1 = y0 + 1
-    dmax = max(1.0, max(100 * s["drop_fraction"] for s in pts))
+    dmax = max(1.0, max(100 * s["drop_fraction"] for s in steps))
 
     def px(x):
         return L + (math.log10(x) - x0) / (x1 - x0) * (W - L - R)
@@ -147,16 +200,25 @@ def svg_plot(steps, knee, title):
     out.append(f'<text x="{W - R + 4}" y="{H - B}">0%</text>')
     colors = {"p50": "#1f77b4", "p99": "#ff7f0e", "p999": "#2ca02c", "max": "#d62728"}
     for i, (key, color) in enumerate(colors.items()):
-        path = " ".join(f"{px(s['offered_pps']):.1f},{py(s['latency_ns'][key] / 1000):.1f}" for s in pts)
-        out.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="1.5"/>')
+        if pts:
+            path = " ".join(f"{px(s['offered_pps']):.1f},{py(s['latency_ns'][key] / 1000):.1f}" for s in pts)
+            out.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="1.5"/>')
         out.append(f'<text x="{L + 8 + 70 * i}" y="{T + 14}" fill="{color}">{key}</text>')
-    path = " ".join(f"{px(s['offered_pps']):.1f},{pd(100 * s['drop_fraction']):.1f}" for s in pts)
+    path = " ".join(f"{px(s['offered_pps']):.1f},{pd(100 * s['drop_fraction']):.1f}" for s in steps)
     out.append(f'<polyline points="{path}" fill="none" stroke="#9467bd" stroke-dasharray="4 3"/>')
     out.append(f'<text x="{L + 8 + 280}" y="{T + 14}" fill="#9467bd">drop %</text>')
+    for s in steps:
+        if not s.get("latency_ns"):
+            x = px(s["offered_pps"])
+            out.append(f'<path class="no-echo" d="M{x - 4:.1f},{T + 2} l8,8 m0,-8 l-8,8" stroke="black"/>')
+    if any(not s.get("latency_ns") for s in steps):
+        out.append(f'<text x="{L + 8 + 350}" y="{T + 14}">x: no echo (100% loss)</text>')
+    knee = summary.get("knee_pps") if summary else None
     if knee:
         x = px(knee)
+        label = f"knee >= {knee:g} pps (rate max)" if summary.get("knee_lower_bound") else f"knee {knee:g} pps"
         out.append(f'<line x1="{x:.1f}" y1="{T}" x2="{x:.1f}" y2="{H - B}" stroke="black" stroke-dasharray="2 2"/>')
-        out.append(f'<text x="{x + 4:.1f}" y="{T + 30}">knee {knee:g} pps</text>')
+        out.append(f'<text x="{x + 4:.1f}" y="{T + 30}">{escape(label)}</text>')
     out.append("</svg>")
     return "\n".join(out)
 
@@ -173,19 +235,6 @@ def pingpong(directory):
     return "\n".join(rows) if len(rows) > 2 else None
 
 
-def kernel_sender(directory):
-    """Attribution: kernel sockperf under-load (one socket) -> the Zhida DUT's sockperf server."""
-    rows = ["| kernel sender | size | offered pps | p50 µs | p99 µs | p99.9 µs | max µs | dropped |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|"]
-    for name in sorted(os.listdir(directory)):
-        if name.startswith("kernel-sender-") and name.endswith(".jsonl"):
-            for r in load_jsonl(os.path.join(directory, name)):
-                cell = lambda k: "-" if r.get(k) is None else f"{r[k]:.1f}"
-                rows.append(f"| {r['proto']} | {r['size']} | {r['rate_pps']} | {cell('p50_us')} | {cell('p99_us')} |"
-                            f" {cell('p99.9_us')} | {cell('max_us')} | {r.get('dropped', '-')} |")
-    return "\n".join(rows) if len(rows) > 2 else None
-
-
 def counters_check(directory):
     paths = [os.path.join(directory, f"counters-{m}.jsonl") for m in ("on", "off")]
     if not all(os.path.exists(p) for p in paths):
@@ -199,46 +248,53 @@ def counters_check(directory):
 
 
 def build(directory, title):
-    samples = dut_samples(directory)
-    md = [f"# {title}", ""]
+    """Writes report.md, results.json and the plots; returns (markdown lines, problems)."""
+    md = []
     setup = os.path.join(directory, "host-setup.txt")
     if os.path.exists(setup):
         with open(setup) as f:
             md += ["## Host setup", "", "```", f.read().rstrip(), "```", ""]
     results = {"title": title, "sweeps": []}
-    knees = ["| sweep | proto | gens | senders | size | knee pps | stopped by | last good pps | steps |",
-             "|---|---|---:|---:|---:|---:|---|---:|---:|"]
+    knees = ["| sweep | proto | gens | senders | size | knee pps | stopped by | last good pps | steps |"
+             " baseline RTT p50 / p99 µs | budget window µs | first bad step budget-bound | complete |",
+             "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|:-:|:-:|"]
     sections = []
+    summaries = {}
     for name, path in sweep_files(directory):
         steps, summary = split_sweep(load_jsonl(path))
         stem = name[: -len(".jsonl")]
-        knee = summary.get("knee_pps") if summary else None
-        results["sweeps"].append({"name": stem, "summary": summary, "steps": steps})
+        summaries[stem] = summary
+        samples = dut_samples(directory, stem)
+        results["sweeps"].append({"name": stem, "summary": summary, "steps": steps, "dut_samples": samples})
         if summary:
+            base = summary.get("baseline_rtt_ns")
             knees.append(f"| {stem} | {summary['proto']} | {summary['gens']} | {summary['senders']} | {summary['size']} |"
-                         f" {knee if knee is not None else 'none'} | {summary.get('stop', '-')} |"
-                         f" {summary.get('last_good_pps') or '-'} | {summary['steps']} |")
+                         f" {knee_text(summary)} | {summary.get('stop', '-')} | {summary.get('last_good_pps') or '-'} |"
+                         f" {summary['steps']} | {us(base['p50']) + ' / ' + us(base['p99']) if base else '-'} |"
+                         f" {summary.get('budget_window_us') or '-'} |"
+                         f" {'YES' if summary.get('first_bad_budget_bound') else 'no'} |"
+                         f" {'yes' if summary.get('complete') else 'NO'} |")
+        else:
+            knees.append(f"| {stem} | - | - | - | - | - | no summary | - | {len(steps)} | - | - | - | NO |")
         with open(os.path.join(directory, stem + ".svg"), "w") as f:
-            f.write(svg_plot(steps, knee, stem))
-        zhida_dut = len(stem.split("-")) > 1 and stem.split("-")[1] == "zhida"
-        sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps, samples if zhida_dut else []), ""]
-        if zhida_dut:
+            f.write(svg_plot(steps, summary, stem))
+        sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps, samples), ""]
+        if samples:
             sections += ["DUT columns: the Zhida DUT's counters between its samples (every 100 ms) bracketing the"
                          " step's measured window, warmup included.", ""]
         if any(s["generator_bound"] for s in steps):
-            sections += ["A generator fell behind its schedule in at least one step (gen-bound): that step measured"
-                         " the generator, not the DUT, and the sweep stopped there.", ""]
-    md += ["## Knees", "", "\n".join(knees), "", *sections]
-    ks = kernel_sender(directory)
-    if ks:
-        md += ["## Kernel sender -> Zhida DUT (attribution)", "",
-               "sockperf under-load (kernel, one socket, round-trip times) against the Zhida DUT's sockperf server,"
-               " doubling until drops or p99 > 3x the first step: a knee here that matches Zhida -> Zhida's says"
-               " the DUT, not the Zhida generator, set it.", "", ks, ""]
-    smoke = os.path.join(directory, "binance-smoke.txt")
-    if os.path.exists(smoke):
-        with open(smoke) as f:
-            md += ["## Binance smoke", "", "```", f.read().rstrip(), "```", ""]
+            sections += ["GEN-BOUND: a generator fell behind its schedule; that step measured the generator, not the"
+                         " DUT, and the sweep stopped there.", ""]
+        if any(s.get("budget_bound") for s in steps):
+            sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
+                         " flight (rate share x (baseline RTT + window)). Where service RTT stays near the baseline,"
+                         " the latency there is the budget's, not receiver saturation.", ""]
+    issues = problems(directory, summaries)
+    head = [f"# {title}", ""]
+    if issues:
+        head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
+                *[f"- {i}" for i in issues], ""]
+    md = head + md + ["## Knees", "", "\n".join(knees), "", *sections]
     pp = pingpong(directory)
     if pp:
         md += ["## Ping-pong", "", "Round-trip time of one message at a time on one connection.", "", pp, ""]
@@ -248,14 +304,17 @@ def build(directory, title):
                "The same rate with the DUT's in-loop counter capture on and off: p99 and max should agree within noise.",
                "", check, ""]
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
-           " measured messages never echoed after the drain; flow-control owed = messages a full TCP connection"
-           " still owed at the end of the send window (the receiver's flow control, not the generator); DUT echoed"
-           " counts datagrams (UDP) or bytes (TCP); no TLS (ws:// only)."]
+           " measured messages not echoed by the end of the drain, unsent ones included (sending stops at the end"
+           " of the window); sent / received pps are what actually left the generators and came back within the"
+           " window; service RTT is echo time minus actual send time (TCP/ws); owed = messages a TCP connection"
+           " still owed at the end of the window (flow control or budget: the receiver side, not the generator);"
+           " DUT echoed counts datagrams (UDP) or bytes (TCP); no TLS (ws:// only)."]
+    results["incomplete"] = issues
     with open(os.path.join(directory, "report.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     with open(os.path.join(directory, "results.json"), "w") as f:
         json.dump(results, f, indent=1)
-    return md
+    return md, issues
 
 
 def main(argv):
@@ -263,9 +322,11 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         return 2
     title = argv[argv.index("--title") + 1] if "--title" in argv else "Zhida bench"
-    build(argv[1], title)
+    _, issues = build(argv[1], title)
     print(f"wrote {os.path.join(argv[1], 'report.md')}")
-    return 0
+    for i in issues:
+        print(f"incomplete: {i}", file=sys.stderr)
+    return 1 if issues else 0
 
 
 if __name__ == "__main__":
