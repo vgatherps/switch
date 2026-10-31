@@ -110,3 +110,5 @@ sh deploy/test-hft-host.sh
 It runs apply, boot, verify and run-binance.sh against a fake `/proc`, `/sys`, `/etc` tree with stub
 commands. The build step is checked separately by running `hft-host.sh build` in an `amazonlinux:2023`
 container. Kernel modules, grubby, the reboot, networkd, IRQs and vfio binding run only on a real instance.
+Native WC integrity cases hash real fixture files; their checksum wrapper rejects GNU-only
+verification switches so the same comparison works with GNU and macOS `sha256sum`.

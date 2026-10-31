@@ -304,7 +304,8 @@ native_vfio_wc() {
     digest=$(printf '%s\n' "$file_digests" | awk -v module="$module" '$1 == module {print $2}')
     [ -n "$digest" ] || return 1
     vfio_wc_error="module SHA256 differs from its owning RPM: $module"
-    printf '%s  %s\n' "$digest" "$module" | sha256sum --check --status
+    actual_digest=$(sha256sum "$module") || return 1
+    [ "${actual_digest%% *}" = "$digest" ]
 }
 
 # AWS's get-vfio-with-wc.sh keeps the stock module beside the patched one as *_no_wc.

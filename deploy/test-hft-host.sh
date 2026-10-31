@@ -279,6 +279,10 @@ native_host() {
     echo NATIVE >"$root/sys/module/vfio_pci_core/srcversion"
 }
 
+# Preserve real file hashing, but reject GNU-only verification flags even on Linux.
+native_checksum=$(command -v sha256sum)
+stub sha256sum "case \"\$1\" in --*) exit 2 ;; esac; exec '$native_checksum' \"\$@\""
+
 native_host
 check "a fresh native fixture resets the earlier x86_64 architecture" sh -c '[ "$(uname -m)" = aarch64 ]'
 check "normal depmod metadata makes whole-package verification fail" sh -c "! rpm -Vf '$native_module' >/dev/null"
