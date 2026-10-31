@@ -465,3 +465,47 @@ fn frames_follow_the_peer_mss() {
     );
     assert!(got == data, "the bytes arrived changed or out of order");
 }
+
+/// The server sends half-RTT data (RFC 8446 §2.3: application data right after its Finished,
+/// before the client's Finished), 100 B in two records (its fragment limit is 64 B): the
+/// handshake completes and the data is the first thing the client reads, whole.
+#[zhida_test_support::pinned_test]
+fn half_rtt_data_right_after_the_server_finished_is_read() {
+    until_client(
+        |_| {},
+        |mut stream, config| {
+            let mut config = (*config).clone();
+            config.send_half_rtt_data = true;
+            config.max_fragment_size = Some(64);
+            let mut conn = ServerConnection::new(Arc::new(config)).unwrap();
+            while !conn.wants_write() {
+                conn.read_tls(&mut stream).unwrap();
+                conn.process_new_packets().unwrap();
+            }
+            conn.writer().write_all(&[5; 100]).unwrap();
+            let mut flight = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut flight).unwrap();
+            }
+            stream.write_all(&flight).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut stream).expect("server handshake");
+            }
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest);
+        },
+        move |handle, _, stream, config| async move {
+            let mut tls: ClientTls = tls_connect(&handle, stream, config, HOST, 1).await.expect("handshake");
+            let mut got = Vec::new();
+            while got.len() < 100 {
+                assert!(tls.ready().await.expect("receive"), "the stream ended");
+                got.extend_from_slice(tls.rx.current());
+                let n = tls.rx.current().len();
+                tls.rx.consume(n);
+            }
+            assert_eq!(got, [5; 100]);
+            tls.close().await.expect("close");
+            tls
+        },
+    );
+}

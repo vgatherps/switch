@@ -284,7 +284,11 @@ pub async fn tls_connect(
             Done,
             Failed(rustls::Error),
         }
-        let UnbufferedStatus { discard, state } = conn.process_tls_records(&mut received);
+        // Once the handshake is over (the server's Finished processed), what follows is for
+        // `TlsRx`, unseen: given it, rustls would decrypt the next record (half-RTT data) and
+        // offer ReadTraffic before WriteTraffic. It holds nothing then (Finished ends a flight).
+        let fresh = if conn.is_handshaking() { received.len() } else { 0 };
+        let UnbufferedStatus { discard, state } = conn.process_tls_records(&mut received[..fresh]);
         let next = match state {
             Ok(ConnectionState::EncodeTlsData(mut data)) => {
                 encode_into(&mut out, &mut data);
