@@ -2,10 +2,11 @@
 //! with a bound.
 //!
 //! One background thread runs [`run`]: every 100 ms it reads the PHC between two reads of the
-//! CPU's invariant [`counter`], fits the counter → PHC line, and stores it in a static global.
+//! CPU's invariant counter, fits the counter → PHC line, and stores it in a static global.
 //! [`since`] on the receive path reads that global and the counter: no syscall, allocation or
-//! lock. Until the fit is ready (1 s of consistent reads), and whenever it is not (the thread
-//! stopped, reads failing for 300 ms, a read contradicting the fit), `since` returns `None`.
+//! lock. Until the fit is ready (1 s of consistent reads), and whenever it is not (no `run`, the
+//! counter not invariant, the thread stopped, reads failing for 300 ms, a read contradicting
+//! the fit), `since` returns `None`.
 
 mod counter;
 mod fit;
@@ -15,11 +16,11 @@ mod tests;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::time::Duration;
 
-pub use counter::{counter, counter_invariant};
+use counter::counter;
 use fit::Fit;
 
 /// Time between PHC reads (10 reads/s; ENA allows 125).
-pub const PERIOD: Duration = Duration::from_millis(100);
+const PERIOD: Duration = Duration::from_millis(100);
 /// The fit's base read is at least this many PHC ns before its latest read.
 const BASELINE_NS: u64 = 1_000_000_000;
 /// The fit is not ready this many PHC ns after its latest read.
@@ -44,11 +45,10 @@ impl Latency {
 
 static MAPPING: Mapping = Mapping::new();
 
-/// Latency from `stamp` (PHC ns) to now; `None` if `stamp` is 0, the counter is not invariant
-/// ([`counter_invariant`]) or the fit is not ready.
+/// Latency from `stamp` (PHC ns) to now; `None` if `stamp` is 0 or the fit is not ready.
 #[inline]
 pub fn since(stamp: u64) -> Option<Latency> {
-    if stamp == 0 || !counter_invariant() {
+    if stamp == 0 {
         return None;
     }
     MAPPING.latency(stamp, counter())
@@ -56,8 +56,9 @@ pub fn since(stamp: u64) -> Option<Latency> {
 
 /// Reads the PHC with `read_phc` (`None`: this read failed) every [`PERIOD`] and updates the
 /// global fit, until `stop` is set; then the fit is not ready. Run it on a thread off the
-/// receive core.
-pub fn run(mut read_phc: impl FnMut() -> Option<u64>, stop: &AtomicBool) {
+/// receive core. `Err`, publishing nothing, if the CPU counter is not invariant.
+pub fn run(mut read_phc: impl FnMut() -> Option<u64>, stop: &AtomicBool) -> Result<(), &'static str> {
+    counter::invariant()?;
     let mut calibration = Calibration::default();
     while !stop.load(Ordering::Relaxed) {
         let before = counter();
@@ -69,6 +70,7 @@ pub fn run(mut read_phc: impl FnMut() -> Option<u64>, stop: &AtomicBool) {
         std::thread::sleep(PERIOD);
     }
     MAPPING.publish(None);
+    Ok(())
 }
 
 /// The PHC showed `phc` ns at some counter value in `before..=after`.

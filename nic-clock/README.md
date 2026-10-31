@@ -3,12 +3,13 @@
 Latency from a NIC hardware RX stamp (ns on the NIC's PTP hardware clock, PHC) to now, with an error bound. No
 dependencies, no DPDK: `cargo test -p nic-clock`. Design: `plans/clock/design.md`.
 
-- `run(read_phc, &stop)`: one background thread, off the receive core. Every `PERIOD` (100 ms) it reads the PHC
-  (`read_phc() -> Option<u64>`, `None` = this read failed) between two `counter()` reads and updates a static global
+- `run(read_phc, &stop) -> Result<(), &str>`: one background thread, off the receive core. It first checks the CPU
+  counter is invariant (`Err(why)` otherwise, publishing nothing). Every 100 ms it reads the PHC
+  (`read_phc() -> Option<u64>`, `None` = this read failed) between two counter reads and updates a static global
   fit; after `stop` the fit is not ready. Stop and join it before the NIC's port closes.
 - `since(stamp) -> Option<Latency { ns, bound_ns }>` on the receive path: one seqlock read of the global, one counter
-  read, integer math; no syscall, allocation or lock. The true latency is in `ns ± bound_ns`. `None`: stamp 0, counter
-  not invariant, or fit not ready (under 1 s of consistent reads, latest read over 300 ms old, or stopped).
+  read, integer math; no syscall, allocation or lock. The true latency is in `ns ± bound_ns`. `None`: stamp 0, or fit
+  not ready (no `run`, under 1 s of consistent reads, latest read over 300 ms old, or stopped).
   `Latency::impossible()`: below `-bound_ns`, the stamp is after now; a bug, never a sample.
 - Counter: x86_64 `lfence; rdtsc`, required invariant (CPUID 0x80000007 EDX bit 8) with Linux clocksource `tsc`;
   aarch64 `isb; mrs cntvct_el0` (constant-rate by architecture, CNTFRQ_EL0 set).

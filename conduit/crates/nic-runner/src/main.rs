@@ -233,9 +233,12 @@ fn run(args: Args) -> i32 {
             let result = std::thread::scope(|scope| {
                 let _stop = SetOnDrop(&stop_clock);
                 if nic::read_clock(port_id).is_some() {
-                    scope.spawn(|| match nic::to_housekeeping() {
-                        Ok(()) => nic_clock::run(|| nic::read_clock(port_id), &stop_clock),
-                        Err(e) => line("nic_clock_error", e),
+                    scope.spawn(|| {
+                        let ran = nic::to_housekeeping()
+                            .and_then(|()| Ok(nic_clock::run(|| nic::read_clock(port_id), &stop_clock)?));
+                        if let Err(e) = ran {
+                            line("nic_clock_error", e);
+                        }
                     });
                 } else {
                     line("nic_clock", "none: the port has no readable clock");

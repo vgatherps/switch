@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use nic_clock::{counter_invariant, since};
+use nic_clock::since;
 
 const TRUTH: u64 = 50_000;
 
@@ -12,18 +12,18 @@ fn run_publishes_and_stop_retracts() {
     let start = Instant::now();
     let phc = || 1_700_000_000_000_000_000 + u64::try_from(start.elapsed().as_nanos()).unwrap();
     let stop = AtomicBool::new(false);
-    let (early, ready) = std::thread::scope(|scope| {
-        scope.spawn(|| nic_clock::run(|| Some(phc()), &stop));
+    let (early, ready, ran) = std::thread::scope(|scope| {
+        let calibration = scope.spawn(|| nic_clock::run(|| Some(phc()), &stop));
         let early = since(phc());
         std::thread::sleep(Duration::from_millis(1_300));
         let ready = since(phc() - TRUTH);
         stop.store(true, Ordering::Relaxed);
-        (early, ready)
+        (early, ready, calibration.join().unwrap())
     });
     assert_eq!(early, None, "ready before 1 s of reads");
     assert_eq!(since(phc()), None, "ready after stop");
-    if !counter_invariant() {
-        assert_eq!(ready, None);
+    if let Err(why) = ran {
+        assert_eq!(ready, None, "ready with a counter that is not invariant: {why}");
         return;
     }
     let latency = ready.expect("ready after 1.3 s");
