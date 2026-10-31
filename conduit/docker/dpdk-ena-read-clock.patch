@@ -1,3 +1,11 @@
+DPDK 25.11.3 ENA PMD changes for conduit (applied by docker/Dockerfile).
+- read_clock: the device PHC (ns) through rte_eth_read_clock; PHC set up at device init and
+  destroyed at close, so rte_eth_dev_reset frees and rebuilds it.
+- ena_timer_wd_callback: when trigger_reset is already set (a datapath fault: bad TX/RX
+  req_id, malformed RX descriptor, TX prepare-context error), raise RTE_ETH_EVENT_INTR_RESET
+  instead of returning early, so the application learns of it and calls rte_eth_dev_reset.
+  Stock code returns early and never reports those faults.
+
 diff --git a/drivers/net/ena/base/ena_com.c b/drivers/net/ena/base/ena_com.c
 index f0936a6..72cb95f 100644
 --- a/drivers/net/ena/base/ena_com.c
@@ -45,7 +53,7 @@ index c84420d..be577e8 100644
  const struct rte_memzone *
  ena_mem_alloc_coherent(struct rte_eth_dev_data *data, size_t size,
 diff --git a/drivers/net/ena/ena_ethdev.c b/drivers/net/ena/ena_ethdev.c
-index ea4afbc..dd3196e 100644
+index ea4afbc..aa5d87f 100644
 --- a/drivers/net/ena/ena_ethdev.c
 +++ b/drivers/net/ena/ena_ethdev.c
 @@ -275,6 +275,7 @@ static int ena_start(struct rte_eth_dev *dev);
@@ -139,7 +147,21 @@ index ea4afbc..dd3196e 100644
  	aenq_groups = BIT(ENA_ADMIN_LINK_CHANGE) |
  		      BIT(ENA_ADMIN_KEEP_ALIVE) |
  		      BIT(ENA_ADMIN_CONF_NOTIFICATIONS);
-@@ -2487,7 +2527,7 @@ static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
+@@ -2185,8 +2225,12 @@ static void ena_timer_wd_callback(__rte_unused struct rte_timer *timer,
+ 	struct rte_eth_dev *dev = arg;
+ 	struct ena_adapter *adapter = dev->data->dev_private;
+ 
+-	if (unlikely(adapter->trigger_reset))
++	/* A datapath fault set trigger_reset outside the watchdog: report it. */
++	if (unlikely(adapter->trigger_reset)) {
++		rte_eth_dev_callback_process(dev, RTE_ETH_EVENT_INTR_RESET,
++			NULL);
+ 		return;
++	}
+ 
+ 	check_for_missing_keep_alive(adapter);
+ 	check_for_admin_com_state(adapter);
+@@ -2487,7 +2531,7 @@ static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
  					     &get_feat_ctx.llq, &llq_config);
  	if (unlikely(rc)) {
  		PMD_INIT_LOG_LINE(CRIT, "Failed to set placement policy");
@@ -148,7 +170,7 @@ index ea4afbc..dd3196e 100644
  	}
  
  	if (ena_dev->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_HOST) {
-@@ -2615,6 +2655,7 @@ err_delete_debug_area:
+@@ -2615,6 +2659,7 @@ err_delete_debug_area:
  	ena_com_delete_debug_area(ena_dev);
  
  err_device_destroy:
