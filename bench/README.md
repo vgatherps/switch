@@ -38,7 +38,7 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   relay's `accept_ws` and `Ws`). Its loop makes no syscall while serving; it runs until SIGINT/SIGTERM.
 - `report.py DIR`: `report.md` (a sweeps table and per-sweep step tables), `results.json` and one SVG per sweep
   (latency quantiles and drop % against offered rate; a step with no echo stays on the plot). Exit 1 when
-  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or every sweep
+  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or any sweep
   generator-bound. Python stdlib only; tests: `python3 bench/test_report.py`.
 
 Protocols: UDP, TCP, ws:// (no TLS). The binary's global allocator is mimalloc;

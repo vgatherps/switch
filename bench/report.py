@@ -8,7 +8,8 @@ RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and
 `host-setup.txt` (the host setup verification). Python stdlib only.
 
 Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
-summary, a sweep did not complete, or every sweep stopped at a generator-bound step. The report is still written, headed INCOMPLETE.
+summary, a sweep did not complete, or a sweep stopped at a generator-bound step (the generators,
+not the receiver, were the limit). The report is still written, headed INCOMPLETE.
 """
 import json
 import math
@@ -50,9 +51,8 @@ def problems(directory, sweeps):
             out.append(f"{name}: no summary (the sweep did not finish)")
         elif not summary.get("complete"):
             out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
-    bound = [s for s in sweeps.values() if s]
-    if bound and all(s.get("generator_bound") for s in bound):
-        out.append("every sweep stopped at a generator-bound step: no receiver measurement")
+        elif summary.get("generator_bound"):
+            out.append(f"{name}: stopped at a generator-bound step: not a receiver measurement")
     return out
 
 

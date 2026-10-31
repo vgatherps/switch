@@ -68,13 +68,13 @@ class ReportTest(unittest.TestCase):
             with open(os.path.join(d, "results.json")) as f:
                 self.assertEqual(len(json.load(f)["incomplete"]), 3)
 
-    def test_every_sweep_generator_bound_is_incomplete(self):
+    def test_any_generator_bound_sweep_is_incomplete(self):
+        """Regression: one generator-bound sweep next to good ones passed."""
         with tempfile.TemporaryDirectory() as d:
-            write_jsonl(os.path.join(d, "udp-a.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
-            write_jsonl(os.path.join(d, "tcp-b.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
-            self.assertEqual(report.main(["report.py", d]), 1)
-            write_jsonl(os.path.join(d, "ws-c.jsonl"), [step(1000, 10_000), summary(1)])
+            write_jsonl(os.path.join(d, "tcp-b.jsonl"), [step(1000, 10_000), summary(1)])
             self.assertEqual(report.main(["report.py", d]), 0)
+            write_jsonl(os.path.join(d, "udp-a.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
+            self.assertEqual(report.main(["report.py", d]), 1)
 
     def test_an_empty_results_directory_is_incomplete(self):
         with tempfile.TemporaryDirectory() as d:
