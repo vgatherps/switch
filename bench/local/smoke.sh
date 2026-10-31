@@ -118,7 +118,7 @@ sink=$!
 sleep 0.5
 started=$(date +%s)
 run_sweep tcp $kernel_addr:7003 "$out/overload-check.jsonl" --rate-min 64000 --rate-max 64000 \
-    --step-ms 300 --warmup-ms 100 --drain-ms 100 --budget-us 50 ||
+    --step-ms 300 --warmup-ms 100 --drain-ms 100 ||
     { echo "smoke: bounded overload: the sweep against a sink failed: $(tail -1 "$out/sweep.log")" >&2; exit 1; }
 took=$(($(date +%s) - started))
 python3 - "$out/overload-check.jsonl" "$took" <<'PY' || exit 1
