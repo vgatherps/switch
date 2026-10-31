@@ -592,7 +592,7 @@ impl Interface {
             let result = if let Some(index) = sockets.pending_tcp_reply.take() {
                 // The socket's cached next hop is current only while the neighbor
                 // generation is; an entry that expired since the last egress pass
-                // must bump it, so the reply resolves (and ARPs) like egress does.
+                // must bump it, so the reply looks it up (and probes it) like egress does.
                 self.inner.neighbor_cache.expire(self.inner.now);
                 let EthernetPacket::Ip(packet) = packet else {
                     unreachable!("TCP socket reply is not an IP packet")
@@ -1047,11 +1047,8 @@ impl Interface {
             NeighborAnswer::Found(hardware_addr) => {
                 return Ok(Some(hardware_addr.ethernet_or_panic()));
             }
-            NeighborAnswer::Stale {
-                hardware_addr,
-                probe,
-            } => {
-                if probe && self.inner.probe_owed.is_none() {
+            NeighborAnswer::Stale(hardware_addr) => {
+                if self.inner.probe_owed.is_none() {
                     self.inner.probe_owed = Some(next_hop);
                 }
                 return Ok(Some(hardware_addr.ethernet_or_panic()));
@@ -1119,12 +1116,8 @@ impl InterfaceInner {
                 }
                 Ok(HardwareLookup::Found(hardware_addr))
             }
-            NeighborAnswer::Stale {
-                hardware_addr,
-                probe,
-            } if matches!(dst_addr, IpAddress::Ipv4(_)) =>
-            {
-                if probe && self.probe_owed.is_none() {
+            NeighborAnswer::Stale(hardware_addr) if matches!(dst_addr, IpAddress::Ipv4(_)) => {
+                if self.probe_owed.is_none() {
                     #[allow(irrefutable_let_patterns)]
                     if let IpAddress::Ipv4(addr) = dst_addr {
                         self.probe_owed = Some(addr);
@@ -1207,7 +1200,7 @@ impl InterfaceInner {
     fn dispatch_owed_probe(&mut self, device: &mut (impl Device + ?Sized), addr: Ipv4Address) {
         if !matches!(
             self.neighbor_cache.lookup(&addr.into(), self.now),
-            NeighborAnswer::Stale { probe: true, .. }
+            NeighborAnswer::Stale(_)
         ) {
             self.probe_owed = None;
             return;

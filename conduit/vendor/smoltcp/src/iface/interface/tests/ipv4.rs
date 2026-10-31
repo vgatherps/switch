@@ -644,8 +644,10 @@ mod stale_neighbors {
         assert!(conn.iface.egress_idle(&conn.sockets));
     }
 
+    /// The send at expiry goes to the cached MAC and probes once; the probe makes the entry
+    /// fresh, so the next send caches the next hop again and sends no ARP.
     #[test]
-    fn one_way_stream_no_pending_at_expiry() {
+    fn one_way_stream_probes_once_at_expiry() {
         let mut conn = Connection::new();
         conn.send(60_000, b"a");
         conn.take_data(b"a", 0);
@@ -654,37 +656,10 @@ mod stale_neighbors {
         conn.send(60_500, b"b");
         conn.take_data(b"b", 1);
         assert!(conn.device.inner.tx_queue.is_empty());
-        conn.assert_stale_send();
-        conn.send(61_000, b"c");
-        conn.take_data(b"abc", 0);
-        conn.take_probe();
-        conn.assert_stale_send();
-        conn.arp_reply(61_001);
-        conn.send(61_002, b"d");
-        conn.take_data(b"d", 3);
-        assert!(conn.device.inner.tx_queue.is_empty());
         assert_eq!(
             conn.sockets.item_at_mut(0).unwrap().meta.next_hop,
             Some((conn.iface.inner.neighbor_cache.changes(), PEER_MAC))
         );
-    }
-
-    #[test]
-    fn stale_ends_after_three_seconds() {
-        let mut conn = Connection::new();
-        conn.send(60_000, b"a");
-        conn.take_data(b"a", 0);
-        conn.take_probe();
-        conn.send(61_000, b"b");
-        conn.take_data(b"ab", 0);
-        conn.take_probe();
-        conn.send(62_000, b"c");
-        conn.take_data(b"c", 2);
-        conn.take_probe();
-        conn.send(63_000, b"d");
-        conn.take_probe();
-        assert!(conn.sockets.item_at_mut(0).unwrap().meta.is_waiting());
-        assert_eq!(conn.sockets.get(conn.handle).send_queue(), 4);
     }
 
     #[test]
@@ -702,10 +677,7 @@ mod stale_neighbors {
                 .inner
                 .neighbor_cache
                 .lookup(&PEER.into(), Instant::from_millis(60_000)),
-            NeighborAnswer::Stale {
-                hardware_addr: PEER_MAC.into(),
-                probe: true
-            }
+            NeighborAnswer::Stale(PEER_MAC.into())
         );
         conn.device.tx_left = Some(1);
         conn.egress(60_000);
@@ -717,10 +689,7 @@ mod stale_neighbors {
                 .inner
                 .neighbor_cache
                 .lookup(&PEER.into(), Instant::from_millis(60_000)),
-            NeighborAnswer::Stale {
-                hardware_addr: PEER_MAC.into(),
-                probe: false
-            }
+            NeighborAnswer::Found(PEER_MAC.into())
         );
     }
 }

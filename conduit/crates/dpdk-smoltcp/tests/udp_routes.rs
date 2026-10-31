@@ -236,9 +236,9 @@ fn gateway_stale_keeps_sending() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, Some(Side::B.ip()), PEERS);
         resolve_gateway(&mut pair, &handle);
-        let mut last_probe = None;
+        // One probe at expiry; the gateway answers it only at 64 s and the stream never stops.
         let mut probes = 0;
-        for offset in [0, 59_999, 60_000, 60_500, 61_000, 61_500, 62_000] {
+        for offset in [0, 59_999, 60_000, 60_500, 61_000, 62_000, 63_000, 64_000] {
             pair.a.receive(now(offset), BURST).unwrap();
             assert_eq!(
                 pair.a.udp_send(&handle, Some(endpoint(PEER)), b"stream"),
@@ -251,13 +251,6 @@ fn gateway_stale_keeps_sending() {
                 match eth.ethertype() {
                     EthernetProtocol::Arp => {
                         assert_eq!(frame, request(Side::B.ip()));
-                        if let Some(last) = last_probe {
-                            assert!(
-                                offset.checked_sub(last).expect("probe time went backwards")
-                                    >= 1000
-                            );
-                        }
-                        last_probe = Some(offset);
                         requests += 1;
                     }
                     EthernetProtocol::Ipv4 => {
@@ -268,16 +261,13 @@ fn gateway_stale_keeps_sending() {
                 }
             });
             assert_eq!(datagrams, 1);
-            assert_eq!(
-                requests,
-                usize::from(offset >= 60_000 && offset % 1000 == 0)
-            );
+            assert_eq!(requests, usize::from(offset == 60_000));
             probes += requests;
         }
-        assert_eq!(probes, 3);
+        assert_eq!(probes, 1);
         pair.inject(Side::A, &[reply(Side::B.ip(), Side::B.mac())]);
-        assert_eq!(pair.a.receive(now(62_001), BURST).unwrap().rx_processed, 1);
-        for offset in [62_001, 63_001, 65_000] {
+        assert_eq!(pair.a.receive(now(64_001), BURST).unwrap().rx_processed, 1);
+        for offset in [64_001, 65_000] {
             pair.a.receive(now(offset), BURST).unwrap();
             assert_eq!(
                 pair.a.udp_send(&handle, Some(endpoint(PEER)), b"answered"),

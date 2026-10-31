@@ -818,8 +818,10 @@ fn template_follows_dst_mac_expiry() {
         assert_eq!(test.device.tx, expected);
         let ip_packet = Ipv4Packet::new_checked(&test.device.tx[0][ETH_LEN..]).unwrap();
         let ip_repr = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).unwrap();
-        assert!(
-            !test.udp.get(test.handle).template.as_ref().unwrap().fits(
+        // The send past expiry does not refresh the template; the probe makes the entry fresh,
+        // so the next send rebuilds it.
+        assert_eq!(
+            test.udp.get(test.handle).template.as_ref().unwrap().fits(
                 test.iface.inner.neighbor_cache.changes(),
                 LOCAL_MAC,
                 &ip_repr,
@@ -827,7 +829,8 @@ fn template_follows_dst_mac_expiry() {
                     src_port: PORT,
                     dst_port: PEER_PORT,
                 },
-            )
+            ),
+            !probe
         );
         assert!(test.iface.inner.probe_owed.is_none());
         test.device.tx.clear();
@@ -1312,10 +1315,7 @@ fn first_udp_send_after_idle_uses_stale_gateway() {
             .inner
             .neighbor_cache
             .lookup(&remote.into(), Instant::from_secs(70)),
-        NeighborAnswer::Stale {
-            hardware_addr: REMOTE_MAC.into(),
-            probe: true,
-        }
+        NeighborAnswer::Stale(REMOTE_MAC.into())
     );
     assert!(test.device.tx.is_empty());
     test.iface.inner.set_now(Instant::from_secs(70));
@@ -1365,38 +1365,37 @@ fn received_datagrams_leave_neighbor_entry_untouched() {
     );
     assert_eq!(
         cache.lookup(&REMOTE.into(), Instant::from_millis(60_000)),
-        NeighborAnswer::Stale {
-            hardware_addr: REMOTE_MAC.into(),
-            probe: true,
-        }
+        NeighborAnswer::Stale(REMOTE_MAC.into())
     );
     assert!(test.device.tx.is_empty());
 }
 
+/// UDP sends past the entry's lifetime go to the cached MAC; the first probes, and the probe
+/// keeps the entry usable for the next lifetime even unanswered.
 #[test]
 fn expiry_without_tcp_egress() {
     let mut test = Test::new(1);
     resolve(&mut test, REMOTE, REMOTE_MAC);
     let changes = test.iface.inner.neighbor_cache.changes();
     let peer = IpEndpoint::new(REMOTE.into(), PEER_PORT);
-    for millis in [60_000, 60_999, 61_000, 62_999] {
+    for (millis, probe, expiries) in [
+        (60_000, true, 1),
+        (60_999, false, 1),
+        (63_000, false, 1),
+        (119_999, false, 1),
+        (120_000, true, 2),
+    ] {
         test.iface.inner.set_now(Instant::from_millis(millis));
         assert_eq!(test.send(Some(peer), &[9]), Ok(()));
         let mut expected = vec![send_frame(REMOTE, REMOTE_MAC, &[9], true)];
-        if millis != 60_999 {
+        if probe {
             expected.push(arp_request(REMOTE));
         }
-        assert_eq!(test.device.tx, expected);
-        assert_eq!(test.iface.inner.neighbor_cache.changes(), changes + 1);
+        assert_eq!(test.device.tx, expected, "at {millis}");
+        assert_eq!(test.iface.inner.neighbor_cache.changes(), changes + expiries);
         assert!(test.iface.inner.probe_owed.is_none());
         test.device.tx.clear();
     }
-    // Past the stale window the probe sent at 62,999 ms still silences ARP for 1 s.
-    test.iface.inner.set_now(Instant::from_millis(63_000));
-    assert_eq!(test.send(Some(peer), &[0]), Err(UdpSendError::NeighborPending));
-    assert!(test.device.tx.is_empty());
-    test.iface.inner.set_now(Instant::from_millis(63_999));
-    assert_send_error(&mut test, Some(peer), 1, UdpSendError::NeighborPending);
 }
 
 #[test]

@@ -410,9 +410,9 @@ fn one_way_stream_across_neighbor_expiry() {
         });
         recv(&mut pair.b, &handles[1], endpoint(Side::A), &[0]);
         let mut replies = Vec::new();
-        let mut last_probe = None;
+        // One probe at expiry. B's reply is held back, and the entry stays usable past 63 s.
         let mut probes = 0;
-        for (sequence, offset) in [60_001, 60_501, 61_001, 61_501, 62_001]
+        for (sequence, offset) in [60_001, 60_501, 61_001, 62_001, 63_001, 64_001]
             .into_iter()
             .enumerate()
         {
@@ -440,10 +440,6 @@ fn one_way_stream_across_neighbor_expiry() {
                                 (EthernetAddress::BROADCAST, Side::B.ip())
                             )
                         );
-                        if let Some(last) = last_probe {
-                            assert!(offset.checked_sub(last).unwrap() >= 1000);
-                        }
-                        last_probe = Some(offset);
                         requests += 1;
                     }
                     EthernetProtocol::Ipv4 => {
@@ -459,7 +455,7 @@ fn one_way_stream_across_neighbor_expiry() {
                 }
             });
             assert_eq!(datagrams, 1);
-            assert_eq!(requests, usize::from(sequence % 2 == 0));
+            assert_eq!(requests, usize::from(sequence == 0));
             probes += requests;
             pair.b.receive(now, BURST).unwrap();
             recv(&mut pair.b, &handles[1], endpoint(Side::A), &payload);
@@ -479,10 +475,10 @@ fn one_way_stream_across_neighbor_expiry() {
                 requests
             );
         }
-        assert_eq!(probes, 3);
+        assert_eq!(probes, 1);
         pair.inject(Side::A, &replies);
-        let now = Instant::from_millis(pair::T0.total_millis().checked_add(62_002).unwrap());
-        assert_eq!(pair.a.receive(now, BURST).unwrap().rx_processed, 3);
+        let now = Instant::from_millis(pair::T0.total_millis().checked_add(64_002).unwrap());
+        assert_eq!(pair.a.receive(now, BURST).unwrap().rx_processed, 1);
         pair.a
             .udp_send(&handles[0], Some(endpoint(Side::B)), &[6])
             .unwrap();
