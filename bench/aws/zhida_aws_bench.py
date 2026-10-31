@@ -756,6 +756,9 @@ def run(args, env=None):
         fetch_errors = measure(hosts, facts, receiver_ip, run_dir, expires, env, notes)
         failed = False
     finally:
+        # teardown first: the report is local, and a second Ctrl-C during it must not skip teardown
+        log(f"tearing down run {run_id}")
+        torn = teardown(aws.ec2, run_id)
         report_code = None
         if os.path.exists(os.path.join(run_dir, "expected.json")):
             if fetch_errors:
@@ -766,8 +769,6 @@ def run(args, env=None):
                                      f"zhida-bench {run_id} (1 receiver + {SENDER_HOSTS} senders, {INSTANCE_TYPE})"]
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
-        log(f"tearing down run {run_id}")
-        torn = teardown(aws.ec2, run_id)
     return 0 if not failed and report_code == 0 and not fetch_errors and torn else 1
 
 
