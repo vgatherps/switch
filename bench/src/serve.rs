@@ -238,14 +238,13 @@ async fn ws_echo(mut ws: Ws) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "e2e"))]
 mod tests {
     use super::*;
 
     /// The Zhida TCP echo on net_tap (the production `Host` and pools) against a kernel peer that
     /// sends full segments each followed by small ones: conduit appends the small ones into the
     /// full one's tailroom, so a received frame outgrows a TX frame. Every byte must come back.
-    #[cfg(feature = "e2e")]
     #[zhida_test_support::pinned_test]
     fn echo_returns_a_received_frame_larger_than_a_tx_frame() {
         use std::cell::Cell;
