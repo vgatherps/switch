@@ -66,6 +66,8 @@ def merge(files):
         achieved += sent / run if run > 0 else 0.0
     if len(kinds) != 1:
         raise ValueError("files mix --full-rtt and half-RTT samples")
+    if not all_samples:
+        raise ValueError("no latency samples in any file")
     all_samples.sort()
     return {
         "unit": f"{kinds.pop()} usec",
@@ -119,6 +121,16 @@ def self_test():
             raise AssertionError(f"{name} accepted")
         except ValueError as error:
             assert name in str(error), error
+    empty = SELF_TEST[1].replace("ReceivedMessages=1", "ReceivedMessages=0").replace(
+        "0, 2.000000000, 2.000020000, 20.000\n", ""
+    )
+    try:
+        merge([("empty.full", empty)])
+        raise AssertionError("an all-empty merge returned percentiles")
+    except ValueError as error:
+        assert str(error) == "no latency samples in any file", error
+    r = merge([files[0], ("empty.full", empty)])
+    assert r["samples"] == 2 and r["p50"] == 10.0 and r["offered_mps"] == 1500, r
     print("self-test ok")
 
 

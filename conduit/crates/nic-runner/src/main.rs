@@ -114,20 +114,19 @@ fn run(args: Args) -> i32 {
         },
         _ => None,
     };
-    let feed_socket = target
-        .as_ref()
-        .map(|target| nic::feed_socket(&config, *target.addr.ip()));
+    let tcp_socket = match (&args.mode, &target) {
+        (Mode::Feed(_), Some(target)) => Some(nic::feed_socket(&config, *target.addr.ip())),
+        (Mode::Server(s), _) => s.tcp_port.map(|_| nic::server_socket()),
+        _ => None,
+    };
     if let Err(e) = signals() {
         line("error", e);
         return 3;
     }
     let clock = Clock::new(Instant::now());
-    let sizing = nic::sizing(&config, &args.mode, feed_socket.as_ref());
-    if let Some(target) = &target {
-        let cap = config.path_mtu(*target.addr.ip())
-            .checked_sub(40)
-            .expect("path MTU exceeds TCP headers");
-        line("feed_mss_cap", cap);
+    let sizing = nic::sizing(&config, &args.mode, tcp_socket.as_ref());
+    if let (Mode::Feed(_), Some(socket)) = (&args.mode, &tcp_socket) {
+        line("feed_mss_cap", socket.mss_cap.expect("feed_socket caps the MSS"));
     }
     // SAFETY: EAL creates the configured PCI device or vdev from the config, so
     // the ethdev is new and no caller-attached ring exists. This sole thread
@@ -223,7 +222,7 @@ fn run(args: Args) -> i32 {
                 &mut net,
                 f,
                 target.as_ref().unwrap(),
-                feed_socket.expect("feed mode has a socket"),
+                tcp_socket.expect("feed mode has a socket"),
                 &clock,
             );
             stack = net.into_stack().ok().expect("the feed dropped every handle and socket");

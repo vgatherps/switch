@@ -202,17 +202,19 @@ fn bind_plan(
     Ok(plan)
 }
 
+fn detach_step(roots: &Roots, pci: &PciDevice, current: Option<&str>) -> Option<SysfsWrite> {
+    current
+        .filter(|d| *d != pci.kernel_driver)
+        .map(|_| step(roots.sys.join("bus/pci/drivers/vfio-pci/unbind"), &pci.pci))
+}
+
 fn unbind_plan(roots: &Roots, state: &State<'_>) -> Vec<SysfsWrite> {
     if state.driver.as_deref() == Some(&state.pci.kernel_driver) {
         return Vec::new();
     }
-    let mut plan = Vec::new();
-    if state.driver.is_some() {
-        plan.push(step(
-            roots.sys.join("bus/pci/drivers/vfio-pci/unbind"),
-            &state.pci.pci,
-        ));
-    }
+    let mut plan: Vec<_> = detach_step(roots, state.pci, state.driver.as_deref())
+        .into_iter()
+        .collect();
     plan.push(step(state.device.join("driver_override"), "\n"));
     plan.push(step(
         roots.sys.join("bus/pci/drivers_probe"),
@@ -271,6 +273,10 @@ fn recover(
     failure: DiscoverError,
     output: &mut impl Write,
 ) -> DiscoverError {
+    let detach = driver(&state.device).and_then(|current| {
+        detach_step(roots, state.pci, current.as_deref())
+            .map_or(Ok(()), |write| write_sysfs(&write, false, output))
+    });
     let clear = write_sysfs(
         &step(state.device.join("driver_override"), "\n"),
         false,
@@ -292,6 +298,10 @@ fn recover(
         Ok(()) => "rebind ok".into(),
         Err(e) => format!("rebind: {e}"),
     };
+    let detach = match detach {
+        Ok(()) => String::new(),
+        Err(e) => format!("; detach: {e}"),
+    };
     let clear = match clear {
         Ok(()) => String::new(),
         Err(e) => format!("; override clear: {e}"),
@@ -301,7 +311,7 @@ fn recover(
         Err(e) => format!("unreadable ({e})"),
     };
     error(format!(
-        "{failure}{clear}; {recovery}; current driver {current}"
+        "{failure}{detach}{clear}; {recovery}; current driver {current}"
     ))
 }
 
@@ -381,15 +391,19 @@ pub fn bind(
             }
         }
     }
+    let unbind_path = state.device.join("driver/unbind");
     let bind_path = vfio.join("bind");
+    // a failure while the device has no driver puts it back on its kernel driver
+    let mut unbound = state.driver.is_none();
     for write in &plan {
         if let Err(e) = write_sysfs(write, dry_run, output) {
-            return Err(if write.path == bind_path && !dry_run {
+            return Err(if unbound && !dry_run {
                 recover(roots, &state, e, output)
             } else {
                 e
             });
         }
+        unbound = (unbound || write.path == unbind_path) && write.path != bind_path;
     }
     if !dry_run {
         let group = verify_bind(roots, &state).map_err(|e| recover(roots, &state, e, output))?;

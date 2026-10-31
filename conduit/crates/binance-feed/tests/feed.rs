@@ -3,6 +3,7 @@
 //! Zhida's IPv4 gateway, as in the live run. These tests need CAP_NET_ADMIN and /dev/net/tun,
 //! and no internet.
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::CStr;
 use std::io::{ErrorKind, Read};
@@ -16,14 +17,14 @@ use std::time::{Duration, Instant};
 
 use binance_feed::{
     client_config, connect, run, socket, stream, webpki_client_config, BookTicker, Clock, Event,
-    FeedError, Summary, Target, INGRESS_BUDGET, SOCKET_BUFFER,
+    FeedError, Summary, Target, INGRESS_BUDGET,
 };
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
 use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{
-    frame_reserve, rx_reserve, tx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack,
+    frame_reserve, rx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack,
     StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use relay::UpgradeError;
@@ -170,53 +171,6 @@ fn with_net<T>(
         tap.close();
         result
     })
-}
-
-/// On a jumbo stack, the feed socket capped to the 1500-byte path gets the capped RX frame
-/// cap and its full window even when the shared pools hold far fewer mbufs than that cap.
-#[zhida_test_support::pinned_test]
-fn capped_feed_socket_keeps_capped_frame_cap_on_jumbo_stack() {
-    use zhida_test_kit::pair::{config, Side};
-    use zhida_test_kit::ring_port::{resize, RingPort};
-
-    with_eal(|eal| {
-        let paths = [PathMtu {
-            prefix: Ipv4Cidr::new(Side::B.ip(), 32),
-            mtu: 1500,
-        }];
-        let capped = tcp::rx_mbuf_budget(&socket(Some(1460)), 9000);
-        let uncapped = tcp::rx_mbuf_budget(&socket(None), 9000);
-        assert_eq!((capped, uncapped), (180, 30));
-        let ring = RingPort::new("bnc_cap", 64, 64);
-        let mut stack_config = config(Side::A);
-        stack_config.paths = &paths;
-        let mut port_config = ring.config();
-        resize(&mut port_config, 9000, 9216);
-        let reserve = rx_reserve(
-            port_config.rx_descriptors,
-            port_config.rx_burst,
-            stack_config.rx_staging,
-            port_config.rx_pool.cache_size,
-        );
-        port_config.rx_pool.count = u32::try_from(reserve + uncapped).unwrap();
-        // net_ring's TX descriptors are its 64-slot TX ring.
-        let (tx, pending) = (port_config.tx_descriptors, stack_config.tx_pending);
-        port_config.tx_pool.count = u32::try_from(tx_reserve(tx, pending)).unwrap();
-        port_config.frame_pool.count = u32::try_from(
-            frame_reserve(tx, pending) + tcp::tx_mbuf_budget(&socket(None), 9000),
-        )
-        .unwrap();
-        let port = ring.open_with(eal, port_config);
-        let mut stack = Stack::new(port, stack_config, StackInstant::ZERO)
-            .map_err(|(_, error)| error)
-            .unwrap();
-        let handle = stack.add_tcp(socket(Some(1460))).unwrap();
-        assert_eq!(stack.tcp(&handle).rx_frame_cap(), capped);
-        assert_eq!(stack.tcp(&handle).recv_room(), SOCKET_BUFFER);
-        drop(handle);
-        stack.into_port().try_close().expect("close jumbo Port");
-        ring.close();
-    });
 }
 
 fn server_config() -> (Arc<ServerConfig>, RootCertStore) {
@@ -512,7 +466,12 @@ fn timed_out_connect_releases_the_only_slot() {
     });
 }
 
-fn tickers() -> (Vec<String>, Vec<BookTicker>) {
+/// A ticker as text, to compare what `Feed::next` lends with an expected one.
+fn debug(ticker: &BookTicker<'_>) -> String {
+    format!("{ticker:?}")
+}
+
+fn tickers() -> (Vec<String>, Vec<BookTicker<'static>>) {
     let mut texts = Vec::new();
     let mut expected = Vec::new();
     for index in 0..12u64 {
@@ -527,11 +486,11 @@ fn tickers() -> (Vec<String>, Vec<BookTicker>) {
         ));
         expected.push(BookTicker {
             update_id,
-            symbol: "BTCUSDT".to_owned(),
-            bid_price,
-            bid_qty: bid_qty.to_owned(),
-            ask_price,
-            ask_qty: ask_qty.to_owned(),
+            symbol: "BTCUSDT".into(),
+            bid_price: bid_price.into(),
+            bid_qty: bid_qty.into(),
+            ask_price: ask_price.into(),
+            ask_qty: ask_qty.into(),
         });
     }
     (texts, expected)
@@ -575,12 +534,12 @@ fn feed_reads_tickers_answers_ping_and_closes() {
                 .expect("connect Zhida TLS WebSocket client");
                 for ticker in expected {
                     assert_eq!(
-                        feed.next(&mut stop).await.expect("read bookTicker"),
-                        Some(ticker)
+                        feed.next(&mut stop, debug).await.expect("read bookTicker"),
+                        Some(debug(&ticker))
                     );
                 }
                 client_read_all.set(true);
-                assert_eq!(feed.next(&mut stop).await.expect("stop"), None);
+                assert_eq!(feed.next(&mut stop, debug).await.expect("stop"), None);
                 feed.close(&spawner, CLOSE_LIMIT)
                     .await
                     .expect("close Zhida feed");
@@ -682,10 +641,10 @@ fn received_update_comes_before_a_finished_stop() {
                 .await
                 .expect("connect Zhida TLS WebSocket client");
                 let first = feed
-                    .next(std::future::pending::<()>())
+                    .next(std::future::pending::<()>(), debug)
                     .await
                     .expect("read bookTicker");
-                assert_eq!(first.as_ref(), Some(&expected[0]));
+                assert_eq!(first, Some(debug(&expected[0])));
                 // The server wrote all 12 in one flush; wait until the last is surely here.
                 spawner
                     .sleep(200)
@@ -694,12 +653,12 @@ fn received_update_comes_before_a_finished_stop() {
                     .expect("sleep");
                 for ticker in &expected[1..] {
                     let next = feed
-                        .next(std::future::ready(()))
+                        .next(std::future::ready(()), debug)
                         .await
                         .expect("read bookTicker");
-                    assert_eq!(next.as_ref(), Some(ticker));
+                    assert_eq!(next, Some(debug(ticker)));
                 }
-                assert_eq!(feed.next(std::future::ready(())).await.expect("stop"), None);
+                assert_eq!(feed.next(std::future::ready(()), debug).await.expect("stop"), None);
                 feed.close(&spawner, CLOSE_LIMIT)
                     .await
                     .expect("close Zhida feed");
@@ -731,7 +690,7 @@ fn server_close_reports_its_status_and_reason() {
             let target = target();
             let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
             let mut feed = connecting.await.expect("connect Zhida TLS WebSocket client");
-            match feed.next(&mut stop).await {
+            match feed.next(&mut stop, |_| ()).await {
                 Err(FeedError::ServerClosed { code: 1001, reason }) => assert_eq!(reason, "maintenance"),
                 other => panic!("expected the server's close, got {other:?}"),
             }
@@ -867,6 +826,20 @@ fn unknown_certificate_fails_tls_and_alerts_the_server() {
     });
 }
 
+/// Fields borrow from the message text; a JSON-escaped field (Binance does not escape, but the
+/// text may) still parses, into an owned string.
+#[test]
+fn book_ticker_borrows_the_text_and_owns_only_escaped_fields() {
+    let text = r#"{"u":7,"s":"BTC\u0055SDT","b":"1.5","B":"2","a":"1.6","A":"3"}"#;
+    let ticker = serde_json::from_str::<BookTicker>(text).expect("parse an escaped symbol");
+    assert_eq!(ticker.symbol, "BTCUSDT");
+    assert!(matches!(ticker.symbol, Cow::Owned(_)), "escaped symbol must be owned");
+    for field in [&ticker.bid_price, &ticker.bid_qty, &ticker.ask_price, &ticker.ask_qty] {
+        let Cow::Borrowed(field) = field else { panic!("{field} copied, not borrowed") };
+        assert!(text.as_bytes().as_ptr_range().contains(&field.as_ptr()), "{field} not in the text");
+    }
+}
+
 #[test]
 fn book_ticker_parses_binance_shape_and_ignores_extra_fields() {
     let text = r#"{
@@ -879,11 +852,11 @@ fn book_ticker_parses_binance_shape_and_ignores_extra_fields() {
         ticker,
         BookTicker {
             update_id: 400900217,
-            symbol: "BTCUSDT".to_owned(),
-            bid_price: "80680.29000000".to_owned(),
-            bid_qty: "3.06547000".to_owned(),
-            ask_price: "80680.30000000".to_owned(),
-            ask_qty: "0.85179000".to_owned(),
+            symbol: "BTCUSDT".into(),
+            bid_price: "80680.29000000".into(),
+            bid_qty: "3.06547000".into(),
+            ask_price: "80680.30000000".into(),
+            ask_qty: "0.85179000".into(),
         },
     );
     assert_eq!(

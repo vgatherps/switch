@@ -248,38 +248,45 @@ impl Drop for Tree {
     }
 }
 
-// Regular files do not run driver callbacks. Change only the fake driver link,
-// after the bind write (at the following clear log), or before drivers_probe.
+// Regular files do not run driver callbacks. Each step moves the fake driver link when the
+// output ends with its trigger write, in order: after the bind write (at the following clear
+// log), before drivers_probe, or after `driver/unbind` (at the next write's log; that write
+// resolves through the link).
 struct KernelOutput<'a> {
     tree: &'a Tree,
-    target: &'static str,
+    steps: Vec<(String, Option<&'static str>)>,
+    next: usize,
     text: String,
-    changed: bool,
 }
 impl<'a> KernelOutput<'a> {
     fn new(tree: &'a Tree, target: &'static str) -> Self {
+        let trigger = if target == "vfio-pci" {
+            ("bus/pci/devices/0000:00:06.0/driver_override", "\n")
+        } else {
+            ("bus/pci/drivers_probe", BDF)
+        };
+        Self::steps(tree, &[(trigger, Some(target))])
+    }
+    fn steps(tree: &'a Tree, steps: &[((&str, &str), Option<&'static str>)]) -> Self {
         Self {
             tree,
-            target,
+            steps: steps
+                .iter()
+                .map(|&(write, driver)| (tree.log(&[write], false), driver))
+                .collect(),
+            next: 0,
             text: String::new(),
-            changed: false,
         }
     }
 }
 impl Write for KernelOutput<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.text.push_str(std::str::from_utf8(bytes).unwrap());
-        let trigger = if self.target == "vfio-pci" {
-            self.tree.log(
-                &[("bus/pci/devices/0000:00:06.0/driver_override", "\n")],
-                false,
-            )
-        } else {
-            self.tree.log(&[("bus/pci/drivers_probe", BDF)], false)
-        };
-        if !self.changed && self.text.ends_with(&trigger) {
-            self.tree.driver(Some(self.target));
-            self.changed = true;
+        if let Some((trigger, driver)) = self.steps.get(self.next) {
+            if self.text.ends_with(trigger.as_str()) {
+                self.tree.driver(*driver);
+                self.next += 1;
+            }
         }
         Ok(bytes.len())
     }
@@ -601,6 +608,73 @@ fn bind_failure_clears_override_before_kernel_rebind() {
             assert!(err.contains("current driver ena"), "{err}");
         }
     }
+}
+
+#[test]
+fn bind_override_failure_after_kernel_unbind_rebinds_kernel_driver() {
+    let tree = Tree::new();
+    fs::remove_file(tree.roots.sys.join(DEVICE).join("driver_override")).unwrap();
+    let mut output = KernelOutput::steps(
+        &tree,
+        &[
+            (
+                ("bus/pci/devices/0000:00:06.0/driver_override", "vfio-pci"),
+                None,
+            ),
+            (("bus/pci/drivers/ena/bind", BDF), Some("ena")),
+        ],
+    );
+    let err = devbind::bind(&tree.roots, &tree.config, 0, false, false, &mut output)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        output.text,
+        tree.log(
+            &[
+                ("bus/pci/devices/0000:00:06.0/driver/unbind", BDF),
+                ("bus/pci/devices/0000:00:06.0/driver_override", "vfio-pci"),
+                ("bus/pci/devices/0000:00:06.0/driver_override", "\n"),
+                ("bus/pci/drivers/ena/bind", BDF),
+            ],
+            false
+        )
+    );
+    assert!(err.contains("driver_override: "), "{err}");
+    assert!(err.contains("; override clear: "), "{err}");
+    assert!(err.ends_with("; rebind ok; current driver ena"), "{err}");
+}
+
+#[test]
+fn bind_verification_failure_detaches_vfio_before_kernel_rebind() {
+    let tree = Tree::new();
+    fs::remove_file(tree.roots.dev.join("vfio/7")).unwrap();
+    let mut output = KernelOutput::steps(
+        &tree,
+        &[
+            (
+                ("bus/pci/devices/0000:00:06.0/driver_override", "vfio-pci"),
+                None,
+            ),
+            (
+                ("bus/pci/devices/0000:00:06.0/driver_override", "\n"),
+                Some("vfio-pci"),
+            ),
+            (("bus/pci/drivers/vfio-pci/unbind", BDF), None),
+            (("bus/pci/drivers/ena/bind", BDF), Some("ena")),
+        ],
+    );
+    let err = devbind::bind(&tree.roots, &tree.config, 0, false, false, &mut output)
+        .unwrap_err()
+        .to_string();
+    let mut expected = tree.bind_writes(true);
+    expected.extend([
+        ("bus/pci/drivers/vfio-pci/unbind", BDF),
+        ("bus/pci/devices/0000:00:06.0/driver_override", "\n"),
+        ("bus/pci/drivers/ena/bind", BDF),
+    ]);
+    assert_eq!(output.text, tree.log(&expected, false));
+    assert!(err.contains("bind verification: neither"), "{err}");
+    assert!(err.ends_with("; rebind ok; current driver ena"), "{err}");
 }
 
 fn success_unbind(bound: bool, back: bool) {

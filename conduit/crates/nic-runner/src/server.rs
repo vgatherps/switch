@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use binance_feed::Clock;
-use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
+use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::{Stack, TcpHandle, UdpConfig, UdpDatagram, UdpHandle, UdpSendError};
 use sockperf_wire::sockperf::{reply, validate_udp, Framer, MAX_MESSAGE};
 
@@ -320,10 +320,7 @@ pub fn run(
         }
         if let Some(port) = args.tcp_port {
             for _ in 0..args.tcp_connections {
-                let socket = tcp::Config {
-                    rx_capacity: MAX_MESSAGE, tx_capacity: MAX_MESSAGE, mss_cap: None,
-                };
-                let handle = stack.add_tcp(socket).map_err(|e| format!("TCP add: {e}"))?;
+                let handle = stack.add_tcp(crate::nic::server_socket()).map_err(|e| format!("TCP add: {e}"))?;
                 stack
                     .listen(&handle, port)
                     .map_err(|e| format!("TCP listen {port}: {e:?}"))?;

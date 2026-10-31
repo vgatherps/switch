@@ -243,8 +243,10 @@ concurrent TCP under-load clients. net_tap also runs a UDP-only server.
 
 It passes when every client reports zero dropped, duplicated and out-of-order messages, the
 server exits 0 after SIGTERM with zero malformed messages and 4 TCP connections accepted and
-closed, and, over af_packet (`--rx-timestamps`), every UDP datagram and TCP segment carries a
-kernel receive stamp with no decreases. The af_packet part turns TX checksum offload off on
+closed, and, over af_packet (config `"rx_timestamps": true`), every UDP datagram and TCP segment
+carries a kernel receive stamp. Decreases are reported, not checked: TCP stamps follow stream
+order (reordering and recovery deliver earlier stamps later), and two CPUs can fill af_packet's
+ring out of stamp order. The af_packet part turns TX checksum offload off on
 `vethc1` (`ethtool`, in the image); with it on, kernel frames cross the veth with unfinished
 UDP/TCP checksums and Zhida drops them as bad. The script needs root or
 CAP_NET_ADMIN+CAP_NET_RAW and /dev/net/tun, and runs every process on `DOCKER_CPUSET`.
@@ -513,13 +515,16 @@ Benchmark timings inside Docker are VM measurements and must be labeled so.
 
 ## Autobahn testsuite image
 
-`docker/autobahn.Dockerfile` builds Autobahn|Testsuite 25.10.1 (`wstest`) natively for arm64,
-adapted from upstream's `docker/Dockerfile` (which installs a local wheel and publishes no arm64
-image). `make docker-autobahn-image` builds it, or directly:
+`docker/autobahn.Dockerfile` builds Autobahn|Testsuite 25.10.1 (`wstest`) for the host's own
+architecture (arm64 or x86-64), adapted from upstream's `docker/Dockerfile` (which installs a local
+wheel and publishes no arm64 image). `make docker-autobahn-image` builds it, or directly:
 
 ```sh
-docker build --platform linux/arm64 -t zhida-autobahn:25.10.1 -f docker/autobahn.Dockerfile docker
+docker build -t zhida-autobahn:25.10.1 - < docker/autobahn.Dockerfile
 ```
+
+With `DOCKER_PLATFORM` set, as for the Zhida image, the build goes through `docker buildx build
+--platform $(DOCKER_PLATFORM)` and the tag gains the platform (`zhida-autobahn:25.10.1-linux-amd64`).
 
 The base `pypy:2-7-bullseye` is pinned by index digest (PyPy 7.3.20, Python 2.7.18, OpenSSL 1.1;
 cryptography 3.3.2 does not build against OpenSSL 3). Every pip package is pinned `==` and

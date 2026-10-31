@@ -2,10 +2,12 @@
 //! sheath) on one switchnet TCP socket, run as a switch task. The Runtime's ticks are
 //! milliseconds ([`Clock::ms`]).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
-use std::net::SocketAddrV4;
+use std::io::Read as _;
+use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant as WallInstant};
@@ -29,6 +31,12 @@ pub const DEFAULT_PATH: &str = "/ws/btcusdt@bookTicker";
 pub const DEFAULT_PRINT: usize = 10;
 /// RX and TX buffer bytes of the feed's socket.
 pub const SOCKET_BUFFER: usize = 256 * 1024;
+/// The feed's local port is drawn from here to 65535 (IANA dynamic ports).
+pub const FIRST_LOCAL_PORT: u16 = 49152;
+/// TCP, TLS and WebSocket connect, together.
+pub const CONNECT_LIMIT: Duration = Duration::from_secs(20);
+/// The WebSocket close handshake, close_notify and FIN.
+pub const CLOSE_LIMIT: Duration = Duration::from_secs(10);
 
 /// Wall clock since `start`: Stack time in microseconds (panics past i64 microseconds) and
 /// Runtime ticks in milliseconds.
@@ -69,24 +77,55 @@ impl Target {
     }
 }
 
-/// One bookTicker update; prices and quantities keep Binance's decimal strings.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct BookTicker {
-    #[serde(rename = "u")]
-    pub update_id: u64,
-    #[serde(rename = "s")]
-    pub symbol: String,
-    #[serde(rename = "b")]
-    pub bid_price: String,
-    #[serde(rename = "B")]
-    pub bid_qty: String,
-    #[serde(rename = "a")]
-    pub ask_price: String,
-    #[serde(rename = "A")]
-    pub ask_qty: String,
+/// `host` resolved by the kernel resolver to its first IPv4 address, at `port`, with `path`.
+pub fn resolve(host: &str, port: u16, path: &str) -> Result<Target, String> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("DNS: resolving {host}: {error}"))?;
+    let addr = addresses
+        .into_iter()
+        .find_map(|addr| match addr {
+            SocketAddr::V4(addr) => Some(addr),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("DNS: {host} has no IPv4 address"))?;
+    Ok(Target {
+        addr,
+        host: host.to_owned(),
+        path: path.to_owned(),
+    })
 }
 
-impl fmt::Display for BookTicker {
+/// A local port from FIRST_LOCAL_PORT to 65535, from OS entropy, so a run does not reuse the
+/// previous run's 4-tuple (Docker Desktop's network once answered a repeated SYN with segments
+/// of the earlier connection; the Stack's ISNs are now seeded per run, so this is a precaution).
+pub fn random_local_port() -> std::io::Result<u16> {
+    let mut bytes = [0; 2];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let span = u16::MAX - FIRST_LOCAL_PORT + 1;
+    Ok(FIRST_LOCAL_PORT + u16::from_ne_bytes(bytes) % span)
+}
+
+/// One bookTicker update; prices and quantities keep Binance's decimal strings. The strings
+/// borrow the message text; one with a JSON escape (which Binance does not send) is unescaped
+/// into an owned copy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct BookTicker<'a> {
+    #[serde(rename = "u")]
+    pub update_id: u64,
+    #[serde(rename = "s", borrow)]
+    pub symbol: Cow<'a, str>,
+    #[serde(rename = "b", borrow)]
+    pub bid_price: Cow<'a, str>,
+    #[serde(rename = "B", borrow)]
+    pub bid_qty: Cow<'a, str>,
+    #[serde(rename = "a", borrow)]
+    pub ask_price: Cow<'a, str>,
+    #[serde(rename = "A", borrow)]
+    pub ask_qty: Cow<'a, str>,
+}
+
+impl fmt::Display for BookTicker<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -300,22 +339,28 @@ pub async fn connect(
 pub struct Feed(Wss);
 
 impl Feed {
-    /// The next update, or `None` once `stop` finishes; messages already received come first.
-    /// Server pings are answered inside.
-    pub async fn next(&mut self, stop: impl Future) -> Result<Option<BookTicker>, FeedError> {
-        first(self.recv(), stop).await.transpose()
+    /// Hands the next update to `on` and returns what it returns, or `None` once `stop`
+    /// finishes; messages already received come first. Server pings are answered inside. The
+    /// update borrows the received message, so it is only lent to `on`.
+    pub async fn next<R>(
+        &mut self,
+        stop: impl Future,
+        on: impl FnOnce(&BookTicker<'_>) -> R,
+    ) -> Result<Option<R>, FeedError> {
+        first(self.recv(on), stop).await.transpose()
     }
 
-    async fn recv(&mut self) -> Result<BookTicker, FeedError> {
+    async fn recv<R>(&mut self, on: impl FnOnce(&BookTicker<'_>) -> R) -> Result<R, FeedError> {
         let Some(message) = self.0.recv().await.map_err(FeedError::Ws)? else {
             let (code, reason) = self.0.peer_close().expect("recv returned None after the server's close");
             return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
         };
         let text = message.text().ok_or(FeedError::Binary)?;
-        serde_json::from_str(text).map_err(|error| FeedError::Parse {
+        let ticker = serde_json::from_str(text).map_err(|error| FeedError::Parse {
             text: text.to_owned(),
             error,
-        })
+        })?;
+        Ok(on(&ticker))
     }
 
     /// Sends the WebSocket close (1000) and reads until the server's close echo, dropping the
@@ -344,7 +389,7 @@ pub enum Event<'a> {
     /// TCP, TLS and WebSocket are open.
     Connected,
     /// Update number `count` (from 1).
-    Ticker { count: u64, ticker: &'a BookTicker },
+    Ticker { count: u64, ticker: &'a BookTicker<'a> },
     /// Reading ended (stop, or an error returned after the close); the close starts.
     Read(Summary),
     /// The close handshake finished: WebSocket close, TLS close_notify, FIN.
@@ -376,13 +421,14 @@ pub async fn stream(
     on(Event::Connected);
     let mut summary = Summary { count: 0, update_ids: None };
     let read = loop {
-        match feed.next(&mut stop).await {
-            Ok(Some(ticker)) => {
-                summary.count += 1;
-                let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
-                summary.update_ids = Some((first, ticker.update_id));
-                on(Event::Ticker { count: summary.count, ticker: &ticker });
-            }
+        let next = feed.next(&mut stop, |ticker| {
+            summary.count += 1;
+            let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
+            summary.update_ids = Some((first, ticker.update_id));
+            on(Event::Ticker { count: summary.count, ticker });
+        });
+        match next.await {
+            Ok(Some(())) => {}
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         }
@@ -406,3 +452,19 @@ pub async fn stream(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_takes_the_first_ipv4_address() {
+        let target = resolve("127.0.0.1", 9443, "/ws/x").unwrap();
+        assert_eq!(target.url(), "wss://127.0.0.1:9443/ws/x");
+        assert_eq!(target.addr, "127.0.0.1:9443".parse().unwrap());
+        assert_eq!(resolve("::1", 9443, "/").err().unwrap(), "DNS: ::1 has no IPv4 address");
+        assert!(resolve("no-such-host.invalid", 9443, "/")
+            .err()
+            .unwrap()
+            .starts_with("DNS: resolving no-such-host.invalid: "));
+    }
+}

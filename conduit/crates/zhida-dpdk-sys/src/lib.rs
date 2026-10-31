@@ -68,7 +68,7 @@ unsafe extern "C" {
     /// Returns null if the calling thread has no lcore ID or caches are disabled.
     pub fn zhida_get_pool_cache(mp: *mut rte_mempool) -> *mut rte_mempool_cache;
 
-    /// Alloc with precomputed cache pointer stored in dynfield2.
+    /// Alloc through `cache`, the caller's precomputed per-lcore cache of `mp`.
     /// Cache pointer must come from zhida_get_pool_cache called on same lcore.
     pub fn zhida_pktmbuf_alloc_fast(
         mp: *mut rte_mempool,
