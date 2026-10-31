@@ -17,7 +17,7 @@ use zhida_open::{Sizing, open};
 pub const INGRESS_BUDGET: usize = 32;
 
 /// Monotonic ns since the process's origin, with the wall-clock time of that origin for joining
-/// samples across hosts.
+/// samples across hosts and starting steps at a common wall-clock time (see `resync`).
 #[derive(Clone, Copy)]
 pub struct Clock {
     origin: WallInstant,
@@ -33,14 +33,17 @@ impl Default for Clock {
 impl Clock {
     pub fn new() -> Clock {
         let origin = WallInstant::now();
-        let unix_origin_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after 1970")
-            .as_nanos() as u64;
         Clock {
             origin,
-            unix_origin_ns,
+            unix_origin_ns: unix_now_ns(),
         }
+    }
+
+    /// Re-reads the wall clock behind `unix_ns` and `mono_of_unix`; `now_ns` is unchanged.
+    /// The wall clock is slewed (NTP) while the process runs, so a mapping taken once drifts.
+    pub fn resync(&mut self) {
+        let mono = self.now_ns();
+        self.unix_origin_ns = unix_now_ns() - mono;
     }
 
     #[inline]
@@ -60,6 +63,13 @@ impl Clock {
     pub fn stack_now(&self, ns: u64) -> Instant {
         Instant::from_micros((ns / 1000) as i64)
     }
+}
+
+fn unix_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_nanos() as u64
 }
 
 /// `Turn` counters summed over a window; staged and pending are maxima.
@@ -243,4 +253,23 @@ pub fn stopped() -> bool {
 #[inline]
 pub fn dump_requested() -> bool {
     DUMP.load(Ordering::Relaxed) && DUMP.swap(false, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mapping that has drifted 5 ms from the wall clock is put back by `resync`, without
+    /// moving the monotonic time.
+    #[test]
+    fn resync_follows_the_wall_clock_and_keeps_monotonic_time() {
+        let mut clock = Clock::new();
+        clock.unix_origin_ns -= 5_000_000;
+        let drift = |c: &Clock| unix_now_ns().abs_diff(c.unix_ns(c.now_ns()));
+        assert!(drift(&clock) > 4_000_000);
+        let before = clock.now_ns();
+        clock.resync();
+        assert!(drift(&clock) < 1_000_000, "drift {}", drift(&clock));
+        assert!(clock.now_ns() >= before);
+    }
 }

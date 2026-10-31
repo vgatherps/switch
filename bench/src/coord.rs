@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use crate::hist::Histogram;
 use crate::host::{EthStats, TurnSums};
-use crate::load::{self, StepResult};
+use crate::load::{self, Reply, Request, StepResult};
 use crate::sweep::{Limits, Next, Outcome, Sweep};
 
 #[derive(Debug, Clone)]
@@ -99,8 +99,6 @@ pub struct GenReport {
     pub budget_waits: u64,
     pub in_flight_mean: Option<f64>,
     pub in_flight_max: u64,
-    pub in_flight_at_start: u64,
-    pub in_flight_after: u64,
     pub generator_bound: bool,
     /// The worker's loop: wall time per round, and Runtime task polls per round.
     pub ns_per_round: u64,
@@ -148,9 +146,6 @@ pub struct StepReport {
     /// A connection's in-flight messages right after each measured send.
     pub in_flight_mean: Option<f64>,
     pub in_flight_max: u64,
-    /// Over all connections: left from the step before, and left after this step's settle.
-    pub in_flight_at_start: u64,
-    pub in_flight_after: u64,
     /// Any generator fell behind its schedule: the step measured the generator, not the DUT.
     pub generator_bound: bool,
     pub good: bool,
@@ -172,9 +167,6 @@ pub struct Summary {
     pub knee_pps: Option<u64>,
     /// The sweep reached `rate_max` without a bad step: the knee is at least `knee_pps`.
     pub knee_lower_bound: bool,
-    /// A run at the first rate above the knee waited on the budget: the knee may be the
-    /// budget's, not the receiver's (compare its `service_rtt_ns` with the baseline).
-    pub first_bad_budget_bound: bool,
     pub last_good_pps: Option<u64>,
     /// "knee", "rate_max", "no_good_step", "generator_bound" or "failed".
     pub stop: &'static str,
@@ -231,8 +223,6 @@ pub fn merge(
             in_flight_mean: (r.in_flight_samples > 0)
                 .then(|| r.in_flight_sum as f64 / r.in_flight_samples as f64),
             in_flight_max: r.in_flight_max,
-            in_flight_at_start: r.in_flight_at_start,
-            in_flight_after: r.in_flight_after,
             ns_per_round: r.ns_per_round,
             tasks_per_round: r.turns.tasks_polled as f64 / r.turns.turns.max(1) as f64,
             generator_bound: r.backlog_at_end > 0 || lag_bound,
@@ -290,8 +280,6 @@ pub fn merge(
         in_flight_mean: (in_flight_samples > 0)
             .then(|| sum(|r| r.in_flight_sum) as f64 / in_flight_samples as f64),
         in_flight_max: results.iter().map(|r| r.in_flight_max).max().unwrap_or(0),
-        in_flight_at_start: sum(|r| r.in_flight_at_start),
-        in_flight_after: sum(|r| r.in_flight_after),
         generator_bound: per_gen.iter().any(|g| g.generator_bound),
         good: false,
         per_gen,
@@ -315,8 +303,7 @@ struct Worker {
 
 /// How long a worker may take to open its Port and connect.
 const READY_LIMIT: Duration = Duration::from_secs(60);
-/// A step's reply may come this long after the step's drain (the worker's settle and its own
-/// cutoff check come first).
+/// A step's reply may come this long after the step's drain.
 const REPLY_SLACK: Duration = Duration::from_secs(10);
 /// How long a worker may take to exit once its input closes.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
@@ -437,7 +424,6 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
         baseline_rtt_ns: None,
         knee_pps: None,
         knee_lower_bound: false,
-        first_bad_budget_bound: false,
         last_good_pps: None,
         stop: "failed",
         steps: 0,
@@ -451,6 +437,51 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     result
 }
 
+/// How far a worker's clock may be from the coordinator's, beyond the probe's half round trip:
+/// workers start each step at a common wall-clock time.
+const CLOCK_LIMIT_NS: u64 = 1_000_000;
+/// How long a worker may take to answer a clock probe.
+const PROBE_LIMIT: Duration = Duration::from_secs(5);
+
+fn send(w: &mut Worker, request: &Request) -> Result<(), String> {
+    writeln!(
+        w.stdin,
+        "{}",
+        serde_json::to_string(request).expect("request serializes")
+    )
+    .and_then(|()| w.stdin.flush())
+    .map_err(|e| format!("generator input: {e}"))
+}
+
+fn parse(i: usize, line: &str) -> Result<Reply, String> {
+    serde_json::from_str(line).map_err(|e| format!("generator {i}: {e}: {line:?}"))
+}
+
+/// Probes each worker's clock; fails if one is off this host's by more than `CLOCK_LIMIT_NS`
+/// beyond its probe's half round trip.
+fn check_clocks(workers: &mut [Worker]) -> Result<(), String> {
+    for (i, w) in workers.iter_mut().enumerate() {
+        let sent = unix_now_ns();
+        send(w, &Request::Clock)?;
+        let line = w
+            .line(PROBE_LIMIT)
+            .map_err(|e| format!("generator {i}: {e}"))?;
+        let answered = unix_now_ns();
+        let Reply::Clock { unix_ns } = parse(i, &line)? else {
+            return Err(format!("generator {i}: expected its clock, got {line:?}"));
+        };
+        let offset = unix_ns as i64 - sent.midpoint(answered) as i64;
+        let slack = (answered - sent) / 2;
+        if offset.unsigned_abs() > CLOCK_LIMIT_NS + slack {
+            return Err(format!(
+                "generator {i}: its clock is {offset} ns off the coordinator's (probe +-{slack} ns, \
+                 limit {CLOCK_LIMIT_NS} ns)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     let per = args.senders / args.gens;
     let mut workers = Workers(Vec::new());
@@ -462,7 +493,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         workers.0.push(Worker::spawn(&cmd)?);
     }
     for (i, line) in replies(&mut workers.0, READY_LIMIT)?.iter().enumerate() {
-        if line.trim() != r#"{"kind":"ready"}"# {
+        if !matches!(parse(i, line), Ok(Reply::Ready)) {
             return Err(format!("generator {i}: expected ready, got {line:?}"));
         }
     }
@@ -471,44 +502,51 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
             + REPLY_SLACK;
     let window_ns = args.budget_window_us.map(|us| us * 1000);
     let mut sweep = Sweep::new(args.limits);
-    let (mut rate, mut step) = (sweep.first(), 0u32);
-    // (rate, budget_bound) of every judged step
-    let mut judged: Vec<(u64, bool)> = Vec::new();
+    let mut rate = sweep.first();
+    let mut id = 0u32;
     loop {
-        let start_unix_ns = unix_now_ns() + args.lead_ms * 1_000_000;
+        check_clocks(&mut workers.0)?;
         let baseline = summary.baseline_rtt_ns.as_ref().map(|q| q.p50);
+        let start_unix_ns = unix_now_ns() + args.lead_ms * 1_000_000;
         for (w, share) in workers.0.iter_mut().zip(split_rate(rate, args.gens)) {
-            let command = load::Command {
-                step,
-                rate_pps: share,
-                start_unix_ns,
-                warmup_ms: args.warmup_ms,
-                step_ms: args.step_ms,
-                drain_ms: args.drain_ms,
-                budget: window_ns
-                    .zip(baseline)
-                    .map(|(w, b)| budget_per_connection(share, per, b, w)),
-            };
-            writeln!(
-                w.stdin,
-                "{}",
-                serde_json::to_string(&command).expect("command serializes")
-            )
-            .and_then(|()| w.stdin.flush())
-            .map_err(|e| format!("generator input: {e}"))?;
+            let budget = window_ns
+                .zip(baseline)
+                .map(|(w, b)| budget_per_connection(share, per, b, w));
+            send(
+                w,
+                &Request::Step(load::Command {
+                    step: id,
+                    rate_pps: share,
+                    start_unix_ns,
+                    warmup_ms: args.warmup_ms,
+                    step_ms: args.step_ms,
+                    drain_ms: args.drain_ms,
+                    budget,
+                }),
+            )?;
         }
         let mut results = Vec::with_capacity(workers.0.len());
         for (i, line) in replies(&mut workers.0, step_limit)?.iter().enumerate() {
-            results.push(
-                serde_json::from_str::<StepResult>(line)
-                    .map_err(|e| format!("generator {i}: {e}: {line:?}"))?,
-            );
+            match parse(i, line)? {
+                Reply::Step(r) => results.push(r),
+                Reply::Late { late_ns, .. } => {
+                    return Err(format!(
+                        "generator {i} got the step at {rate} pps {late_ns} ns after its start"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "generator {i}: expected a step result, got {line:?}"
+                    ));
+                }
+            }
         }
-        let mut report = merge(args, step, rate, &results)?;
-        summary.steps = step + 1;
-        if step == 0 && window_ns.is_some() {
+        let mut report = merge(args, id, rate, &results)?;
+        if id == 0 && window_ns.is_some() {
             summary.baseline_rtt_ns = report.service_rtt_ns.clone();
         }
+        id += 1;
+        summary.steps = id;
         if report.generator_bound {
             out(&serde_json::to_string(&report).expect("report serializes"));
             summary.stop = "generator_bound";
@@ -524,7 +562,6 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         );
         report.good = good;
         out(&serde_json::to_string(&report).expect("report serializes"));
-        judged.push((rate, report.budget_bound));
         if good {
             summary.last_good_pps = Some(summary.last_good_pps.map_or(rate, |g| g.max(rate)));
         }
@@ -541,14 +578,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
                 break;
             }
         }
-        step += 1;
     }
-    summary.first_bad_budget_bound = summary.knee_pps.is_some_and(|knee| {
-        let first_bad = judged.iter().map(|j| j.0).filter(|&r| r > knee).min();
-        judged
-            .iter()
-            .any(|&(r, bound)| Some(r) == first_bad && bound)
-    });
     for (i, w) in std::mem::take(&mut workers.0).into_iter().enumerate() {
         let status = w
             .exit(EXIT_LIMIT)
@@ -622,8 +652,6 @@ mod tests {
             in_flight_sum: 0,
             in_flight_samples: 0,
             in_flight_max: 0,
-            in_flight_at_start: 0,
-            in_flight_after: 0,
             ns_per_round: 0,
             turns: TurnSums::default(),
             eth: EthStats::default(),
@@ -666,16 +694,59 @@ mod tests {
         assert_eq!(m.per_gen[1].budget_waits, 0);
     }
 
-    /// A fake worker: ready, then for each command the canned `result` line with the command's
-    /// step number; it exits after `steps` commands.
-    fn fake_worker(name: &str, result: &StepResult, steps: u32) -> String {
+    /// A fake worker script: ready; a clock probe answers its wall clock plus `skew_ns`; the
+    /// first `late` step commands answer late; the others answer the canned `result` with the
+    /// command's step id; it exits on its step command number `steps`.
+    fn fake(name: &str, result: &StepResult, steps: u32, skew_ns: i64, late: u32) -> String {
         let path =
             std::env::temp_dir().join(format!("zhida-bench-{name}-{}.json", std::process::id()));
-        std::fs::write(&path, serde_json::to_string(result).unwrap() + "\n").unwrap();
-        format!(
-            r#"echo '{{"kind":"ready"}}'; n=0; while read line; do [ $n -ge {steps} ] && exit 1; sed "s/\"step\":0,/\"step\":$n,/" {}; n=$((n+1)); done"#,
-            path.display()
-        )
+        let line = serde_json::to_string(&Reply::Step(result.clone())).unwrap();
+        std::fs::write(&path, line + "\n").unwrap();
+        r#"echo '{"kind":"ready"}'; n=0
+        while read line; do
+            case "$line" in *'"kind":"clock"'*)
+                echo "{\"kind\":\"clock\",\"unix_ns\":$(($(date +%s%N) + SKEW))}"; continue;; esac
+            [ $n -ge STEPS ] && exit 1
+            if [ $n -lt LATE ]; then echo "{\"kind\":\"late\",\"step\":$n,\"late_ns\":1000}"
+            else sed "s/\"step\":0,/\"step\":$n,/" FILE; fi
+            n=$((n+1))
+        done"#
+            .replace("SKEW", &skew_ns.to_string())
+            .replace("STEPS", &steps.to_string())
+            .replace("LATE", &late.to_string())
+            .replace("FILE", &path.display().to_string())
+    }
+
+    fn fake_worker(name: &str, result: &StepResult, steps: u32) -> String {
+        fake(name, result, steps, 0, 0)
+    }
+
+    /// A worker that got a step after its start time fails the sweep: its step would not have
+    /// overlapped the others'. The summary says why.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_late_start_fails_the_sweep() {
+        let mut args = args();
+        args.gens = 1;
+        args.gen_cmd = fake("late", &result(0, &[1000], &[100], 1, 0), 10, 0, 1);
+        let (r, lines) = run_lines(&args);
+        assert!(r.unwrap_err().contains("ns after its start"));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["complete"], false);
+    }
+
+    /// A worker whose clock is 50 ms off fails the sweep before the step runs; one on time runs.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_worker_clock_off_fails_the_sweep_before_the_step() {
+        let mut args = args();
+        args.gens = 1;
+        args.gen_cmd = fake("skew", &result(0, &[1000], &[100], 1, 0), 10, 50_000_000, 0);
+        let (r, lines) = run_lines(&args);
+        assert!(r.unwrap_err().contains("generator 0: its clock is"));
+        assert_eq!(lines.len(), 1, "no step ran");
+        args.gen_cmd = fake("noskew", &result(0, &[1000], &[100], 1, 0), 10, 0, 0);
+        assert_eq!(run_lines(&args).0, Ok(()));
     }
 
     fn run_lines(args: &Args) -> (Result<(), String>, Vec<serde_json::Value>) {

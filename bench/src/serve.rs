@@ -153,6 +153,8 @@ pub fn run(args: &Args) -> Result<(), String> {
             }
         }
         if args.counters && now >= next_sample {
+            // the wall clock drifts from the monotonic one; samples are joined across hosts by it
+            host.clock.resync();
             ring.push(Sample {
                 unix_ns: host.clock.unix_ns(now),
                 turns,

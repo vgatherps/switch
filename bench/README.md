@@ -18,7 +18,9 @@ sweep to the knee, and a report. Design: `plans/bench/design.md`.
   stand and the summary says `complete: false`. A step where any generator fell behind (a backlog at the end of
   its send window, or send-lag p99 over `--lag-limit-us`) is `generator_bound`: it measured the generator, and
   the sweep stops. A worker that does not answer within the step's time plus 10 s fails the sweep, and every
-  worker's process group is killed. `--budget-us W` (TCP, ws): the first step runs without a budget and its
+  worker's process group is killed. Before each step every worker's wall clock is probed: one more than 1 ms
+  off the coordinator's fails the sweep, and so does a worker that gets a step after its start time (`--lead-ms`
+  ahead). `--budget-us W` (TCP, ws): the first step runs without a budget and its
   median service round trip (echo time - actual send time) is the baseline; from then on each connection may
   have its rate share x (baseline + W) messages sent and not yet echoed. A message due beyond that waits, its
   latency still charged from its scheduled time; a step where any measured message waited is `budget_bound`,
@@ -34,8 +36,7 @@ sweep to the knee, and a report. Design: `plans/bench/design.md`.
   order later (`owed_at_end`, `owed_wait_ns`: the receiver side, not generator backlog). Latency = receive time
   - scheduled time (no coordinated omission); drops = measured messages not echoed by the end of the drain.
   Sending stops at the end of the window: what is still owed or behind is `unsent` (part of the loss), so a step
-  past the knee ends on time. TCP/ws connections then get up to 1 s for their echoes to come back
-  (`in_flight_after`; the next step's `in_flight_at_start`).
+  past the knee ends on time.
 - `zhida-bench pingpong`: closed-loop TCP on one Zhida connection, the round-trip baseline.
 - `zhida-bench serve`: the Zhida echo DUT (UDP, or TCP/ws with `--accepts` pre-armed accepts; ws through relay's
   `accept_ws` and `Ws`). During a run its loop makes no syscall: counters go into a

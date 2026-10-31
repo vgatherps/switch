@@ -24,7 +24,7 @@ def step(pps, p99, drop=0.0, good=True, bound=False, window=(0, 0), lag=1000, n=
 def summary(knee, stop="knee", steps=2, complete=True, lower_bound=False, error=None):
     return {"kind": "summary", "proto": "udp", "gens": 2, "senders": 4, "size": 64, "knee_pps": knee,
             "knee_lower_bound": lower_bound, "stop": stop, "last_good_pps": knee, "steps": steps,
-            "baseline_rtt_ns": None, "budget_window_us": None, "first_bad_budget_bound": False,
+            "baseline_rtt_ns": None, "budget_window_us": None,
             "complete": complete, "error": error}
 
 
@@ -118,7 +118,7 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(issues, [])
             self.assertTrue(md.startswith("# T"))
             self.assertIn("| zhida | 64 | 10 | 20.0 | 30.0 | 40.0 | 50.0 |", md)
-            self.assertIn("| udp-zhida | udp | 2 | 4 | 64 | 1000 | knee | 1000 | 2 | - | - | no | yes |", md)
+            self.assertIn("| udp-zhida | udp | 2 | 4 | 64 | 1000 | knee | 1000 | 2 | - | - | yes |", md)
             self.assertIn("| 0 | 1000 | 990 | 980 | 5.0 | 10.0 | 20.0 | 30.0 | 0.000 | 0 | yes | - | - | - | - | 3 |"
                           " 2.0 | 99 | 2 | 1.25 (9.5) |", md)
             self.assertIn("GEN-BOUND", md)

@@ -256,8 +256,8 @@ def build(directory, title):
             md += ["## Host setup", "", "```", f.read().rstrip(), "```", ""]
     results = {"title": title, "sweeps": []}
     knees = ["| sweep | proto | gens | senders | size | knee pps | stopped by | last good pps | steps |"
-             " baseline RTT p50 / p99 µs | budget window µs | first bad step budget-bound | complete |",
-             "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|:-:|:-:|"]
+             " baseline RTT p50 / p99 µs | budget window µs | complete |",
+             "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|:-:|"]
     sections = []
     summaries = {}
     for name, path in sweep_files(directory):
@@ -271,11 +271,9 @@ def build(directory, title):
             knees.append(f"| {stem} | {summary['proto']} | {summary['gens']} | {summary['senders']} | {summary['size']} |"
                          f" {knee_text(summary)} | {summary.get('stop', '-')} | {summary.get('last_good_pps') or '-'} |"
                          f" {summary['steps']} | {us(base['p50']) + ' / ' + us(base['p99']) if base else '-'} |"
-                         f" {summary.get('budget_window_us') or '-'} |"
-                         f" {'YES' if summary.get('first_bad_budget_bound') else 'no'} |"
-                         f" {'yes' if summary.get('complete') else 'NO'} |")
+                         f" {summary.get('budget_window_us') or '-'} | {'yes' if summary.get('complete') else 'NO'} |")
         else:
-            knees.append(f"| {stem} | - | - | - | - | - | no summary | - | {len(steps)} | - | - | - | NO |")
+            knees.append(f"| {stem} | - | - | - | - | - | no summary | - | {len(steps)} | - | - | NO |")
         with open(os.path.join(directory, stem + ".svg"), "w") as f:
             f.write(svg_plot(steps, summary, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps, samples), ""]

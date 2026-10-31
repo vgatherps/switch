@@ -64,6 +64,33 @@ const UDP_QUEUE: usize = 256;
 pub const TCP_BUFFER: usize = 64 * 1024;
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
 
+/// A line from the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Request {
+    /// Run a step, unless its start time has already passed here (`Reply::Late`).
+    Step(Command),
+    /// Report this worker's wall clock (`Reply::Clock`), the one its steps start by.
+    Clock,
+}
+
+/// A line to the coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Reply {
+    /// Port open and senders bound or connected.
+    Ready,
+    Clock {
+        unix_ns: u64,
+    },
+    /// The step's start time had passed when its command arrived: not run.
+    Late {
+        step: u32,
+        late_ns: u64,
+    },
+    Step(StepResult),
+}
+
 /// A step to run: this worker's share of the rate, starting at a wall-clock time common to all
 /// workers. Sending stops at the end of the window (warmup + step) whatever is still owed;
 /// echoes are taken until the drain ends.
@@ -114,12 +141,10 @@ pub struct StepResult {
     /// Measured messages that waited at least once because their connection was at `budget`.
     pub budget_waits: u64,
     /// TCP/ws: a connection's messages in flight right after each measured send (sum, count,
-    /// max), and over all connections at the step's start and after its settle.
+    /// max).
     pub in_flight_sum: u64,
     pub in_flight_samples: u64,
     pub in_flight_max: u64,
-    pub in_flight_at_start: u64,
-    pub in_flight_after: u64,
     /// The worker's loop over the step: wall time per round (Net turn + Runtime poll).
     pub ns_per_round: u64,
     pub turns: TurnSums,
@@ -190,20 +215,14 @@ struct Worker {
     args: Args,
 }
 
-/// TCP/ws: how long after its drain a step waits for its connections' echoes to come back, so
-/// the next step starts with nothing in flight (what is left is reported).
-const SETTLE_LIMIT_NS: u64 = 1_000_000_000;
-/// A send task not finished this long after its cutoff is a bug, not overload.
-const CUTOFF_LIMIT_NS: u64 = 1_000_000_000;
-
 /// One TCP/ws connection: the actual send times of its messages not yet echoed, oldest first
 /// (TCP echoes in order), so its length is the connection's in-flight count.
 struct Conn {
     in_flight: RefCell<VecDeque<u64>>,
 }
 
-/// Opens the Stack, binds or connects the senders, prints `{"kind":"ready"}`, then serves
-/// commands from stdin until it closes or SIGINT/SIGTERM.
+/// Opens the Stack, binds or connects the senders, prints `Reply::Ready`, then serves requests
+/// from stdin until it closes or SIGINT/SIGTERM.
 pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     let n = args.senders as usize;
     if args.size < HEADER {
@@ -301,17 +320,29 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
         target,
         args: args.clone(),
     };
-    out(r#"{"kind":"ready"}"#);
+    let reply = |r: &Reply| serde_json::to_string(r).expect("reply serializes");
+    out(&reply(&Reply::Ready));
     let mut stdin = Stdin::nonblocking()?;
     let mut idle = TurnSums::default();
     loop {
         match stdin.line()? {
             Some(line) if line.trim().is_empty() => {}
             Some(line) => {
-                let command: Command =
-                    serde_json::from_str(&line).map_err(|e| format!("command {line:?}: {e}"))?;
-                let result = worker.step(command)?;
-                out(&serde_json::to_string(&result).expect("result serializes"));
+                let request: Request =
+                    serde_json::from_str(&line).map_err(|e| format!("request {line:?}: {e}"))?;
+                worker.host.clock.resync();
+                let clock = worker.host.clock;
+                let now_unix_ns = clock.unix_ns(clock.now_ns());
+                out(&reply(&match request {
+                    Request::Clock => Reply::Clock {
+                        unix_ns: now_unix_ns,
+                    },
+                    Request::Step(c) if now_unix_ns > c.start_unix_ns => Reply::Late {
+                        step: c.step,
+                        late_ns: now_unix_ns - c.start_unix_ns,
+                    },
+                    Request::Step(c) => Reply::Step(worker.step(c)?),
+                }));
             }
             None if stdin.closed => break,
             None => {
@@ -468,16 +499,7 @@ pub fn messages(partial: &mut Vec<u8>, mut data: &[u8], size: usize, mut each: i
 }
 
 impl Worker {
-    /// Messages in flight over all TCP/ws connections.
-    fn in_flight(&self) -> u64 {
-        self.conns
-            .iter()
-            .map(|c| c.in_flight.borrow().len() as u64)
-            .sum()
-    }
-
     fn step(&mut self, c: Command) -> Result<StepResult, String> {
-        let in_flight_at_start = self.in_flight();
         let host = &mut self.host;
         let clock = host.clock;
         let eth_before = EthStats::read(host.port_id)?;
@@ -522,19 +544,9 @@ impl Worker {
             if sent.borrow().is_some() && now >= drain_end {
                 break;
             }
-            if now >= drain_end.max(window[1] + CUTOFF_LIMIT_NS) {
-                return Err(format!(
-                    "step {}: the send task outlived its cutoff",
-                    c.step
-                ));
-            }
         }
         let elapsed_ns = clock.now_ns() - started_ns;
         let r = self.recorder.borrow_mut().take().expect("set above");
-        let settle_end = clock.now_ns() + SETTLE_LIMIT_NS;
-        let mut settle_turns = TurnSums::default();
-        while self.in_flight() > 0 && self.host.round(&mut settle_turns)? < settle_end {}
-        let host = &mut self.host;
         let s = sent.borrow_mut().take().expect("checked above");
         let eth = EthStats::read(host.port_id)?.since(&eth_before);
         let dropped_after = self.senders.borrow().rx_dropped_full();
@@ -562,8 +574,6 @@ impl Worker {
             in_flight_sum: s.in_flight_sum,
             in_flight_samples: s.in_flight_samples,
             in_flight_max: s.in_flight_max,
-            in_flight_at_start,
-            in_flight_after: self.in_flight(),
             ns_per_round: elapsed_ns / turns.turns.max(1),
             turns,
             eth,
