@@ -312,6 +312,12 @@ impl Drop for DeferredShutdown<'_> {
     }
 }
 
+/// The executor of an open runtime, for white-box tests of executor state.
+#[cfg(test)]
+pub(crate) fn core(runtime: &Runtime) -> *mut Executor {
+    runtime.control.open_core().unwrap()
+}
+
 #[cfg(test)]
 #[path = "runtime/tests.rs"]
 mod tests;
