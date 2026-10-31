@@ -179,6 +179,9 @@ impl Cache {
         }
     }
 
+    /// Learn `protocol_addr` at `hardware_addr`. A refill of a live entry with the same MAC only
+    /// moves its expiry: templates and cached next hops stay valid, so `changes` is not bumped.
+    /// A new entry, a changed MAC, or a refill after expiry bumps it.
     pub fn fill(
         &mut self,
         protocol_addr: IpAddress,
@@ -189,6 +192,23 @@ impl Cache {
         debug_assert!(hardware_addr.is_unicast());
 
         let expires_at = timestamp + Self::ENTRY_LIFETIME;
+        if let Some(index) = self.find(&protocol_addr)
+            && let Entry::Resolved(neighbor) = &self.storage[index].1
+            && neighbor.hardware_addr == hardware_addr
+            && timestamp < neighbor.expires_at
+        {
+            self.storage[index].1 = Entry::Resolved(Neighbor {
+                silent_until: expires_at,
+                stale_until: Cell::new(None),
+                expires_at,
+                hardware_addr,
+            });
+            self.next_expiry = Some(
+                self.next_expiry
+                    .map_or(expires_at, |old| old.min(expires_at)),
+            );
+            return;
+        }
         self.fill_with_expiration(protocol_addr, hardware_addr, expires_at);
     }
 
@@ -1302,6 +1322,29 @@ mod test {
             assert_eq!(
                 cache.lookup(&address(4), Instant::from_millis(10)),
                 Answer::Found(HADDR_D)
+            );
+        }
+
+        /// A same-MAC refill of a live entry moves its expiry without bumping `changes`; a
+        /// changed MAC, or a same-MAC refill once the entry has expired, bumps it.
+        #[test]
+        fn same_mac_refill_bumps_changes_only_after_expiry() {
+            let mut cache = Cache::new(2);
+            cache.fill(address(1), HADDR_A, Instant::from_millis(0));
+            let changes = cache.changes();
+            cache.fill(address(1), HADDR_A, Instant::from_millis(30_000));
+            assert_eq!(cache.changes(), changes);
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_millis(89_999)),
+                Answer::Found(HADDR_A)
+            );
+            cache.fill(address(1), HADDR_B, Instant::from_millis(70_000));
+            assert_eq!(cache.changes(), changes + 1);
+            cache.fill(address(1), HADDR_B, Instant::from_millis(130_000));
+            assert_eq!(cache.changes(), changes + 2);
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_millis(189_999)),
+                Answer::Found(HADDR_B)
             );
         }
     }
