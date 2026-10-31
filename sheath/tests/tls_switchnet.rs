@@ -419,3 +419,49 @@ fn receive_error_waits_for_a_server_that_never_reads_until_the_caller_gives_up()
         },
     );
 }
+
+/// TCP_MAXSEG of `mss` on `listener`: accepted connections advertise it in their SYN-ACK.
+fn set_maxseg(listener: &TcpListener, mss: libc::c_int) {
+    // SAFETY: a valid socket and an int option of the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            (&mss as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "set TCP_MAXSEG");
+}
+
+/// The peer advertises an MSS of 1200: SwitchTx sizes its frames by it (each frame one
+/// segment, sent without a copy), and 64 KiB sent in those frames arrive whole and in order.
+/// (Before, frames were sized by a fixed 1460 B whatever the peer's MSS.)
+#[zhida_test_support::pinned_test]
+fn frames_follow_the_peer_mss() {
+    use sheath::FrameTx;
+    use sheath::switchnet::SwitchTx;
+    const LEN: usize = 64 * 1024;
+    let data: Vec<u8> = (0..LEN).map(|i| (i * 7) as u8).collect();
+    let sent = data.clone();
+    let got = until_client(
+        |listener| set_maxseg(listener, 1200),
+        |mut stream, _| {
+            let mut got = vec![0; LEN];
+            stream.read_exact(&mut got).unwrap();
+            got
+        },
+        move |handle, _, stream, _| async move {
+            let (rx, tcp) = stream.split();
+            let mut tx = SwitchTx::new(&handle, tcp, 1).await.expect("setup");
+            assert_eq!(tx.plain(), (0, 1200));
+            send_bytes(&mut tx, &sent).await.expect("send");
+            // the Net turns only until this returns: wait until the peer has every byte
+            tx.shutdown();
+            tx.delivered().await;
+            (rx, tx)
+        },
+    );
+    assert!(got == data, "the bytes arrived changed or out of order");
+}

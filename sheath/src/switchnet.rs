@@ -17,15 +17,6 @@ use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, Tcp
 use crate::tx::{OVERHEAD, plain_room};
 use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
 
-/// Most TCP payload per sent frame: the Ethernet MSS. A lower effective MSS makes conduit cut
-/// and copy each frame, which stays correct.
-const FRAME_PAYLOAD: usize = 1460;
-
-/// The plaintext room advertised for frames of `capacity` bytes.
-fn frame_room(capacity: usize) -> usize {
-    capacity.min(FRAME_PAYLOAD)
-}
-
 impl RxFrame for TcpFrame {
     fn payload(&self) -> &[u8] {
         TcpFrame::payload(self)
@@ -72,22 +63,25 @@ impl fmt::Display for SetupError {
 pub struct SwitchTx {
     handle: NetHandle,
     tcp: TcpTx,
-    /// `frame_room` of the Stack's frames, clamped to the socket's send buffer.
+    /// Bytes per frame: the Stack's frame capacity, the connection's MSS and the socket's send
+    /// buffer, whichever is least.
     room: usize,
 }
 
 impl SwitchTx {
     /// Sends on `tcp`, in frames from `handle`, sized by the Stack's frame capacity (one frame
-    /// is taken to read it) and clamped to the socket's send buffer, so every `room` request
-    /// can resolve. `min_room` is the largest frame the caller will send; a smaller room is
-    /// refused here, before any byte goes out.
+    /// is taken to read it), the connection's MSS (so each frame is one segment, sent without
+    /// a copy) and the socket's send buffer (so every `room` request can resolve). `min_room`
+    /// is the largest frame the caller will send; a smaller room is refused here, before any
+    /// byte goes out.
     pub async fn new(handle: &NetHandle, tcp: TcpTx, min_room: usize) -> Result<SwitchTx, SetupError> {
         if !tcp.is_on(handle) {
             return Err(SetupError::ForeignHandle);
         }
         let mut tx = SwitchTx { handle: handle.clone(), tcp, room: 0 };
         let capacity = tx.alloc().await.map_err(|_| SetupError::Dead)?.capacity();
-        tx.room = frame_room(capacity).min(tx.tcp.send_capacity());
+        let mss = tx.tcp.max_segment_payload().ok_or(SetupError::Dead)?;
+        tx.room = capacity.min(mss).min(tx.tcp.send_capacity());
         if tx.room < min_room {
             return Err(SetupError::RoomTooSmall { room: tx.room, need: min_room });
         }
@@ -354,18 +348,4 @@ pub async fn send_bytes<L: FrameTx>(lower: &mut L, bytes: &[u8]) -> Result<(), L
         send_sealed(lower, sealed, piece.len()).await?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Frames below the Ethernet MSS (an IP MTU of 1280 gives 1252 B) are advertised as they
-    /// are, so TLS never seals past the frame.
-    #[test]
-    fn frame_room_is_the_capacity_up_to_the_mss() {
-        assert_eq!(frame_room(1472), 1460);
-        assert_eq!(frame_room(1460), 1460);
-        assert_eq!(frame_room(1252), 1252);
-    }
 }
