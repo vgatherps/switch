@@ -6,8 +6,8 @@
 //! message refused for its own sender only (`Outcome::Blocked`: that TCP connection is full)
 //! blocks just that sender: its later messages are owed, and after each poll's fresh messages
 //! every blocked sender is retried once, its owed messages going out in order once it takes
-//! sends again. So the generator's own backlog (`backlog_at_end`) and a receiver's flow control
-//! (`owed_at_end`) stay apart.
+//! sends again. So the generator's own backlog (`backlog_at_end`) does not count a receiver's flow
+//! control.
 
 use std::collections::VecDeque;
 
@@ -40,9 +40,9 @@ pub struct Pacer {
     left: u64,
     visited_blocked: usize,
     stopped: bool,
-    /// At the end of the first poll after the last message's scheduled time: (due and not yet
-    /// reached by the cursor, owed by blocked senders).
-    at_end: Option<(u64, u64)>,
+    /// At the end of the first poll after the last message's scheduled time: due and not yet
+    /// reached by the cursor.
+    at_end: Option<u64>,
 }
 
 impl Pacer {
@@ -138,8 +138,7 @@ impl Pacer {
     #[inline]
     pub fn finish(&mut self, now_ns: u64) {
         if self.at_end.is_none() && self.end > 0 && now_ns >= self.schedule.due_at(self.end - 1) {
-            let behind = self.due - self.cursor;
-            self.at_end = Some((behind, self.cursor - self.total_sent));
+            self.at_end = Some(self.due - self.cursor);
         }
     }
 
@@ -155,13 +154,7 @@ impl Pacer {
     /// time because of the generator itself (its budget, or a transport-wide refusal): 0 if it
     /// kept up.
     pub fn backlog_at_end(&self) -> u64 {
-        self.at_end.map_or(0, |a| a.0)
-    }
-
-    /// Owed by senders whose connection was full at that same point: the receiver's flow
-    /// control, not the generator.
-    pub fn owed_at_end(&self) -> u64 {
-        self.at_end.map_or(0, |a| a.1)
+        self.at_end.unwrap_or(0)
     }
 
     /// Whether message `k` goes out as a blocked sender's owed message (its wait includes the
@@ -330,7 +323,6 @@ mod tests {
             }
         });
         assert_eq!(p.backlog_at_end(), 0);
-        assert!(p.owed_at_end() > 0);
     }
 
     /// Cut off at 24 µs with sender 1 blocked throughout: sender 1's messages and those not yet
