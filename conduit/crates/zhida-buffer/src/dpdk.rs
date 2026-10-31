@@ -457,10 +457,6 @@ impl Mbuf {
     /// Returns independent chain pointing to same buffer DATA.
     /// Each indirect has independent data_off/data_len.
     /// Maps to: rte_pktmbuf_clone
-    ///
-    /// Known gap: unlike DPDK `rte_pktmbuf_attach`, zhida's attach does not copy
-    /// dynfields, so each indirect keeps its pool object's stale dynfields, and a
-    /// header segment `prepend` links on an indirect head copies those.
     #[inline]
     pub fn clone_indirect(&self, pool: &PoolManager) -> Option<Mbuf> {
         let ptr = unsafe {
@@ -473,9 +469,6 @@ impl Mbuf {
     /// Clone only head as indirect, share tail segments directly. O(n).
     /// Returns new chain: [indirect-head] -> [shared-tails...]
     /// Both chains share the same tail mbufs (refcount incremented).
-    ///
-    /// Known gap: the indirect head's dynfields are not copied from the original
-    /// (see `clone_indirect`); a header segment prepended on it copies the stale ones.
     #[inline]
     pub fn clone_indirect_head(&self, pool: &PoolManager) -> Option<Mbuf> {
         let ptr = unsafe {
@@ -2085,6 +2078,71 @@ mod tests {
         assert_eq!(original.refcount(), 1);
         drop(original);
         assert_pool_returned_exactly_once(&pool, 256);
+    }
+
+    /// The RX timestamp dynfield (DPDK's registered one) at its offset in an mbuf, and the
+    /// ol_flags bit that marks it valid.
+    fn rx_timestamp_field() -> (usize, u64) {
+        let (mut offset, mut flag) = (0, 0);
+        let code =
+            unsafe { zhida_dpdk_sys::rte_mbuf_dyn_rx_timestamp_register(&mut offset, &mut flag) };
+        assert_eq!(code, 0, "register the RX timestamp dynfield");
+        (offset as usize, flag)
+    }
+
+    fn timestamp(m: &Mbuf, offset: usize) -> u64 {
+        unsafe { m.as_ptr().cast::<u8>().add(offset).cast::<u64>().read_unaligned() }
+    }
+
+    fn set_timestamp(m: &Mbuf, offset: usize, value: u64) {
+        unsafe { m.as_ptr().cast::<u8>().add(offset).cast::<u64>().write_unaligned(value) }
+    }
+
+    /// An indirect mbuf from any of the three indirect APIs carries its source's dynfields (here
+    /// the RX timestamp), not the stale ones of the recycled pool object it was built in, and a
+    /// header segment prepended on it carries them too.
+    #[zhida_test_support::pinned_test]
+    fn test_indirect_clones_carry_the_source_timestamp_dynfield() {
+        const SOURCE: u64 = 0x5050_5050_0000_0001;
+        const STALE: u64 = 0xDEAD_0000_0000_0002;
+        let pool = PoolManager::new(64); // initializes EAL, which the registration needs
+        let (offset, valid) = rx_timestamp_field();
+        // every pool object recycled with a stale timestamp
+        let mut held = Vec::new();
+        while let Some(m) = pool.alloc() {
+            set_timestamp(&m, offset, STALE);
+            held.push(m);
+        }
+        drop(held);
+        let source = |len| {
+            let m = pool.alloc_with_len(len).unwrap();
+            set_timestamp(&m, offset, SOURCE);
+            unsafe { (*m.as_ptr()).ol_flags |= valid };
+            m
+        };
+
+        let original = source(100);
+        let clone = original.clone_indirect(&pool).unwrap();
+        let head = original.clone_indirect_head(&pool).unwrap();
+        let converted = source(100)
+            .into_indirect_head(&pool)
+            .unwrap_or_else(|_| panic!("convert"));
+        for (name, m) in [
+            ("clone_indirect", &clone),
+            ("clone_indirect_head", &head),
+            ("into_indirect_head", &converted),
+        ] {
+            assert!(m.is_head_indirect(), "{name}");
+            assert_eq!(timestamp(m, offset), SOURCE, "{name}: timestamp");
+            assert_ne!(unsafe { (*m.as_ptr()).ol_flags } & valid, 0, "{name}: valid flag");
+        }
+        // the original still shares the clone's buffer: a header segment, from the pool
+        let mut clone = clone;
+        assert_prepends_header(&mut clone, 20, 0xBB);
+        assert_eq!(timestamp(&clone, offset), SOURCE, "prepended header segment: timestamp");
+
+        drop((clone, head, converted, original));
+        assert_pool_returned_exactly_once(&pool, 64);
     }
 
     #[zhida_test_support::pinned_test]

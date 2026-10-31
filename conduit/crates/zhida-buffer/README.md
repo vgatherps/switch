@@ -47,11 +47,11 @@ m.is_tail_unique(); // lastseg.refcount == 1
 |-----------|-----------|------|-------|----------|
 | `share()` | 0 | same mbuf, refcount++ | N/A (single only) | Alias, same data_off |
 | `share_all()` | 0 | same chain, all refcount++ | same chain | Alias entire chain |
-| `clone_indirect()` | n | new indirect mbufs | new indirect mbufs | Independent data_off per segment; dynfields not copied |
-| `clone_indirect_head()` | 1 | new indirect mbuf | shared (refcount++) | Independent head data_off; `prepend` links a header segment while the original (or any other holder of the backing buffer) lives, writes in place once this head is the sole holder; dynfields not copied |
+| `clone_indirect()` | n | new indirect mbufs | new indirect mbufs | Independent data_off per segment |
+| `clone_indirect_head()` | 1 | new indirect mbuf | shared (refcount++) | Independent head data_off; `prepend` links a header segment while the original (or any other holder of the backing buffer) lives, writes in place once this head is the sole holder |
 | `into_indirect_head()` | 1 | new indirect; original header becomes its backing buffer, which returns to the pool when its last counted reference drops (other holders, e.g. a `share()` alias, keep it alive) | transferred (no refcount change) | Replace head with indirect; `Err(self)` if head is indirect, or shared and chained |
 
-Unlike DPDK `rte_pktmbuf_attach`, zhida's attach does not copy dynfields. An indirect head carries its pool object's stale dynfields, and a header segment prepended on it copies those.
+Like DPDK `rte_pktmbuf_attach`, each new indirect mbuf copies its source's header metadata (port, VLAN tags, tx_offload, hash, packet_type, dynfields) and ol_flags, so an RX timestamp or other dynamic field follows the clone, and a header segment prepended on it.
 
 ## Prepend
 
