@@ -14,6 +14,36 @@ index f0936a6..72cb95f 100644
  		/* req_id was updated by the device which indicates that
  		 * PHC timestamp, error_bound and error_flags are updated too,
  		 * checking errors before retrieving timestamp and
+diff --git a/drivers/net/ena/base/ena_plat_dpdk.h b/drivers/net/ena/base/ena_plat_dpdk.h
+index c84420d..be577e8 100644
+--- a/drivers/net/ena/base/ena_plat_dpdk.h
++++ b/drivers/net/ena/base/ena_plat_dpdk.h
+@@ -198,19 +198,17 @@ typedef struct {
+ #define ena_time_t uint64_t
+ #define ena_time_high_res_t uint64_t
+ 
+-/* Note that high resolution timers are not used by the ENA PMD for now.
+- * Although these macro definitions compile, it shall fail the
+- * compilation in case the unimplemented API is called prematurely.
+- */
++/* High resolution timers (PHC reads) count timer cycles, like the low resolution ones. */
+ #define ENA_TIME_EXPIRE(timeout)  ((timeout) < rte_get_timer_cycles())
+-#define ENA_TIME_EXPIRE_HIGH_RES(timeout) (RTE_SET_USED(timeout), 0)
++#define ENA_TIME_EXPIRE_HIGH_RES(timeout) ENA_TIME_EXPIRE(timeout)
+ #define ENA_TIME_INIT_HIGH_RES() 0
+-#define ENA_TIME_COMPARE_HIGH_RES(time1, time2) (RTE_SET_USED(time1), RTE_SET_USED(time2), 0)
++#define ENA_TIME_COMPARE_HIGH_RES(time1, time2) \
++	(((time1) > (time2)) - ((time1) < (time2)))
+ #define ENA_GET_SYSTEM_TIMEOUT(timeout_us) \
+ 	((timeout_us) * rte_get_timer_hz() / 1000000 + rte_get_timer_cycles())
+ #define ENA_GET_SYSTEM_TIMEOUT_HIGH_RES(current_time, timeout_us) \
+-	(RTE_SET_USED(current_time), RTE_SET_USED(timeout_us), 0)
+-#define ENA_GET_SYSTEM_TIME_HIGH_RES() 0
++	((current_time) + (uint64_t)(timeout_us) * rte_get_timer_hz() / 1000000)
++#define ENA_GET_SYSTEM_TIME_HIGH_RES() rte_get_timer_cycles()
+ 
+ const struct rte_memzone *
+ ena_mem_alloc_coherent(struct rte_eth_dev_data *data, size_t size,
 diff --git a/drivers/net/ena/ena_ethdev.c b/drivers/net/ena/ena_ethdev.c
 index ea4afbc..acf48ab 100644
 --- a/drivers/net/ena/ena_ethdev.c
