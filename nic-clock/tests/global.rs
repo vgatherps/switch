@@ -31,4 +31,5 @@ fn run_publishes_and_stop_retracts() {
     assert!(!latency.impossible(), "{latency:?}");
     assert!(i128::from(latency.ns) + i128::from(latency.bound_ns) >= i128::from(TRUTH), "{latency:?}");
     assert!(latency.ns < 1_000_000, "{latency:?}");
+    assert!(!nic_clock::jumped(), "a steady clock jumped");
 }

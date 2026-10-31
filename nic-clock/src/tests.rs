@@ -152,6 +152,7 @@ fn a_contradicting_read_restarts_the_fit() {
     let next = last + LINE.ticks(100 * MS);
     f.add(stepped.read(next, 0, 0));
     assert_eq!(f.latency(stepped.phc(next), next), None);
+    assert!(f.calibration.jumped);
     let last = f.exact_reads(stepped, next + LINE.ticks(100 * MS), 9);
     assert_eq!(f.latency(stepped.phc(last), last), None);
     let last = f.exact_reads(stepped, last + LINE.ticks(100 * MS), 1);
@@ -160,14 +161,21 @@ fn a_contradicting_read_restarts_the_fit() {
 
 #[test]
 fn a_backward_read_restarts_the_fit() {
+    // Before the first fit, a backward read restarts warm-up without marking a jump.
+    let mut f = Fixture::default();
+    let last = f.exact_reads(LINE, 1 << 40, 5);
+    f.add(LINE.read(last - 1, 0, 0));
+    assert!(!f.calibration.jumped);
     let mut f = Fixture::default();
     let last = f.exact_reads(LINE, 1 << 40, 11);
     f.add(LINE.read(last - 1, 0, 0));
     assert_eq!(f.latency(LINE.phc(last), last), None);
+    assert!(f.calibration.jumped);
     let mut f = Fixture::default();
     let last = f.exact_reads(LINE, 1 << 40, 11);
     f.add(Read { before: last + 10, phc: LINE.phc(last + 5), after: last + 1 });
     assert_eq!(f.latency(LINE.phc(last), last), None);
+    assert!(f.calibration.jumped);
 }
 
 /// A writer publishes fits whose fields all equal one value; a reader on another thread must

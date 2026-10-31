@@ -67,7 +67,11 @@ pub fn run(
                 Event::Ticker { .. } => {}
                 Event::Read(Summary { count, update_ids, latencies }) => {
                     line("feed_count", count);
-                    line("feed_latency", latencies);
+                    if nic_clock::jumped() {
+                        line("feed_latency", "latency invalid: NIC clock jumped");
+                    } else {
+                        line("feed_latency", latencies);
+                    }
                     match update_ids {
                         Some((first, last)) => {
                             line("feed_update_ids", format_args!("{first}..{last}"))

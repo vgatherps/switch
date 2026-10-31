@@ -227,6 +227,9 @@ bound and a log2 histogram in ns. On ENA (with the DPDK patch in `docker/dpdk-en
 in /sys/devices/system/cpu/isolated, minus Zhida's) maps the NIC clock onto the CPU counter, skipping failed reads.
 Otherwise, or with no housekeeping CPU, `nic_clock: none` is printed and every stamped message is `not_ready`.
 Other drivers' `read_clock` is not their RX stamps' clock (ice returns CLOCK_MONOTONIC_RAW), so they get none.
+If a NIC clock read ever contradicts the mapping (the clock jumped, e.g. stepped), samples taken in the up to 100 ms
+before that read may be wrong by more than their bound, and they are not removed. So the run's latency result is
+invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and histogram.
 
 ### 3c. sockperf-server
 ```

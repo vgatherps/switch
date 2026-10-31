@@ -44,6 +44,14 @@ impl Latency {
 }
 
 static MAPPING: Mapping = Mapping::new();
+static JUMPED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a read ever contradicted a fit or went backwards (the NIC clock jumped). Samples
+/// taken up to one read (100 ms) before that may be wrong by more than their bound, so the
+/// run's latencies are not valid.
+pub fn jumped() -> bool {
+    JUMPED.load(Ordering::Relaxed)
+}
 
 /// Latency from `stamp` (PHC ns) to now; `None` if `stamp` is 0 or the fit is not ready.
 #[inline]
@@ -72,6 +80,9 @@ pub fn run(mut read_phc: impl FnMut() -> Option<u64>, stop: &AtomicBool) -> Resu
         let after = counter();
         if let Some(phc) = phc {
             MAPPING.publish(calibration.add(Read { before, phc, after }));
+            if calibration.jumped {
+                JUMPED.store(true, Ordering::Relaxed);
+            }
         }
         std::thread::sleep(PERIOD);
     }
@@ -87,11 +98,12 @@ struct Read {
     after: u64,
 }
 
-/// Consistent reads, oldest first, and the fit through the latest.
+/// Consistent reads, oldest first, the fit through the latest, and whether a fit was dropped.
 #[derive(Default)]
 struct Calibration {
     reads: Vec<Read>,
     fit: Option<Fit>,
+    jumped: bool,
 }
 
 impl Calibration {
@@ -102,7 +114,9 @@ impl Calibration {
             || self.reads.last().is_some_and(|last| read.before <= last.after || read.phc <= last.phc);
         if backwards || self.fit.is_some_and(|fit| fit.contradicts(read)) {
             self.reads.clear();
-            self.fit = None;
+            if self.fit.take().is_some() {
+                self.jumped = true;
+            }
             if read.after < read.before {
                 return None;
             }

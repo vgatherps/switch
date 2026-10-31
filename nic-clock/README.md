@@ -14,8 +14,10 @@ dependencies, no DPDK: `cargo test -p nic-clock`. Design: `plans/clock/design.md
 - Counter: x86_64 `lfence; rdtsc`, required invariant (CPUID 0x80000007 EDX bit 8) with Linux clocksource `tsc`;
   aarch64 `isb; mrs cntvct_el0` (constant-rate by architecture, CNTFRQ_EL0 set).
 - Fit (`src/fit.rs`): rate from the latest read and the narrowest-window kept read at least 1 s of PHC before it,
-  offset from the latest read; bound = half the latest read's window + rate uncertainty × distance + 2 ns of rounding.
-  It holds while both clocks keep a constant rate. A read outside the fit's bound, or going backwards, drops the fit.
+  offset from the latest read; bound = half the latest read's window plus a tick + rate uncertainty × distance + 2 ns
+  of rounding. It holds while both clocks keep a constant rate. A read outside the fit's bound, or going backwards,
+  drops the fit and sets `jumped()`: samples from up to one read (100 ms) before it may be wrong, so the caller
+  treats the run's latencies as invalid.
 
 Tests: `src/fit.rs` (bound arithmetic, overlap and overflow cases), `src/counter.rs` (the x86 invariance rule),
 `src/tests.rs` (fake clocks: not ready before 1 s and after 300 ms, sparse reads, a PHC step, a backward read,
