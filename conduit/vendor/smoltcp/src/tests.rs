@@ -9,6 +9,8 @@ use crate::wire::*;
 pub(crate) const HARDWARE: EthernetAddress = EthernetAddress([0x02; 6]);
 /// MAC of the test peer: the source of `wrap_eth` frames and the destination `strip_eth` expects.
 pub(crate) const PEER_HARDWARE: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 1]);
+/// The test peer's address, on `setup`'s 192.168.1.1/24 subnet.
+pub(crate) const PEER: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 
 pub(crate) fn setup<'a>(medium: Medium) -> (Interface, TcpSet<'a>, TestingDevice) {
     let mut device = TestingDevice::new(medium);
@@ -36,6 +38,27 @@ fn setup_with_device(medium: Medium, device: &mut impl Device) -> Interface {
     }
 
     iface
+}
+
+/// `setup(Medium::Ethernet)` with `PEER` resolved at `PEER_HARDWARE` for the whole test, so
+/// egress to the peer never ARPs. `update_ip_addrs` flushes that entry.
+pub(crate) fn setup_eth<'a>() -> (Interface, TcpSet<'a>, TestingDevice) {
+    let (mut iface, sockets, device) = setup(Medium::Ethernet);
+    iface.resolve_neighbor(PEER, PEER_HARDWARE);
+    (iface, sockets, device)
+}
+
+/// The other end of `setup_eth`: `PEER`/24 at `PEER_HARDWARE`, with 192.168.1.1 resolved at
+/// `HARDWARE` for the whole test.
+pub(crate) fn setup_eth_peer<'a>() -> (Interface, TcpSet<'a>, TestingDevice) {
+    let (mut iface, sockets, device) = setup(Medium::Ethernet);
+    iface.set_hardware_addr(PEER_HARDWARE.into());
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        addrs.push(IpCidr::new(PEER.into(), 24)).unwrap();
+    });
+    iface.resolve_neighbor(Ipv4Address::new(192, 168, 1, 1), HARDWARE);
+    (iface, sockets, device)
 }
 
 /// IPv4 packet `ip` in an Ethernet frame from `PEER_HARDWARE` to `HARDWARE`.

@@ -301,6 +301,16 @@ impl Interface {
         self.inner.hardware_addr = addr;
     }
 
+    /// Resolve `addr` at `mac` with no expiry, so egress to it never sends ARP.
+    #[cfg(test)]
+    pub(crate) fn resolve_neighbor(&mut self, addr: Ipv4Address, mac: EthernetAddress) {
+        self.inner.neighbor_cache.fill_with_expiration(
+            addr.into(),
+            mac.into(),
+            Instant::from_micros(i64::MAX),
+        );
+    }
+
     /// Get the IP addresses of the interface.
     pub fn ip_addrs(&self) -> &[IpCidr] {
         self.inner.ip_addrs.as_ref()

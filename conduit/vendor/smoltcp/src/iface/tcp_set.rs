@@ -1256,10 +1256,9 @@ mod tests {
         set.check_list_positions();
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn reapable_immediate_orphans_and_slot_reuse() {
-        let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (mut iface, _, _) = crate::tests::setup_eth();
         let mut set = TcpSet::new(2);
         for _ in 0..2 {
             let handle = set.add(socket());
@@ -1282,10 +1281,9 @@ mod tests {
         assert_reapable(&mut set, &[]);
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn reapable_abort_rst_dispatch() {
-        let (mut iface, mut set, mut device) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (mut iface, mut set, mut device) = crate::tests::setup_eth();
         let handle = set.add(socket());
         set.connect(handle, iface.context(), (crate::wire::IpAddress::v4(192, 168, 1, 2), 80), 1234).unwrap();
         set.abort(handle);
@@ -1306,19 +1304,13 @@ mod tests {
         assert_reapable(&mut set, &[]);
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn owned_time_wait_reopen_keeps_received_data_and_eof() {
-        use crate::phy::Medium;
-        use crate::wire::{IpAddress, IpCidr};
+        use crate::wire::IpAddress;
 
-        let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
-        let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+        let (mut a, mut a_set, mut a_device) = crate::tests::setup_eth();
+        let (mut b, mut b_set, mut b_device) = crate::tests::setup_eth_peer();
         let remote = IpAddress::v4(192, 168, 1, 2);
-        b.update_ip_addrs(|addrs| {
-            addrs.clear();
-            addrs.push(IpCidr::new(remote, 24)).unwrap();
-        });
         let buffered = || tcp::Socket::test_socket(64, 64);
         let ah = a_set.add(buffered());
         let bh = b_set.add(buffered());
@@ -1354,7 +1346,8 @@ mod tests {
         b_set.connect(bh, b.context(), (IpAddress::v4(192, 168, 1, 1), 1234), 80).unwrap();
         b.poll_egress(Instant::from_millis(1), &mut b_device, &mut b_set);
         let bytes = b_device.tx_queue.front_mut().unwrap();
-        let mut ip = crate::wire::Ipv4Packet::new_unchecked(bytes.as_mut_slice());
+        let mut frame = crate::wire::EthernetFrame::new_unchecked(bytes.as_mut_slice());
+        let mut ip = crate::wire::Ipv4Packet::new_unchecked(frame.payload_mut());
         let (src, dst) = (ip.src_addr().into(), ip.dst_addr().into());
         let mut syn = crate::wire::TcpPacket::new_unchecked(ip.payload_mut());
         syn.set_seq_number(syn.seq_number() + 6);
@@ -1372,20 +1365,14 @@ mod tests {
         assert!(matches!(a_set.get_mut(ah).recv(), Err(tcp::RecvError::Finished)));
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn reapable_ingress_and_time_wait_expiry() {
-        use crate::phy::Medium;
-        use crate::wire::{IpAddress, IpCidr};
+        use crate::wire::IpAddress;
 
         for (orphaned, reset_with_syn) in [(true, false), (false, false), (true, true)] {
-            let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
-            let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+            let (mut a, mut a_set, mut a_device) = crate::tests::setup_eth();
+            let (mut b, mut b_set, mut b_device) = crate::tests::setup_eth_peer();
             let remote = IpAddress::v4(192, 168, 1, 2);
-            b.update_ip_addrs(|addrs| {
-                addrs.clear();
-                addrs.push(IpCidr::new(remote, 24)).unwrap();
-            });
             let buffered = || tcp::Socket::test_socket(64, 64);
             let ah = a_set.add(buffered());
             let bh = b_set.add(buffered());
@@ -1424,7 +1411,8 @@ mod tests {
                 b_set.connect(bh, b.context(), (crate::wire::IpAddress::v4(192, 168, 1, 1), 1234), 80).unwrap();
                 b.poll_egress(Instant::from_millis(1), &mut b_device, &mut b_set);
                 let bytes = b_device.tx_queue.front_mut().unwrap();
-                let mut ip = crate::wire::Ipv4Packet::new_unchecked(bytes.as_mut_slice());
+                let mut frame = crate::wire::EthernetFrame::new_unchecked(bytes.as_mut_slice());
+                let mut ip = crate::wire::Ipv4Packet::new_unchecked(frame.payload_mut());
                 let (src, dst) = (ip.src_addr().into(), ip.dst_addr().into());
                 let mut syn = crate::wire::TcpPacket::new_unchecked(ip.payload_mut());
                 syn.set_seq_number(syn.seq_number() + 3);
@@ -1444,20 +1432,14 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn reapable_retry_limit_and_ingress_rst() {
-        use crate::phy::Medium;
-        use crate::wire::{IpAddress, IpCidr};
+        use crate::wire::IpAddress;
 
         for (orphaned, rst) in [(true, false), (false, false), (true, true), (false, true)] {
-            let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
-            let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+            let (mut a, mut a_set, mut a_device) = crate::tests::setup_eth();
+            let (mut b, mut b_set, mut b_device) = crate::tests::setup_eth_peer();
             let remote = IpAddress::v4(192, 168, 1, 2);
-            b.update_ip_addrs(|addrs| {
-                addrs.clear();
-                addrs.push(IpCidr::new(remote, 24)).unwrap();
-            });
             let buffered = || tcp::Socket::test_socket(64, 64);
             let ah = a_set.add(buffered());
             let bh = b_set.add(buffered());
@@ -1513,19 +1495,13 @@ mod tests {
         assert_eq!(set.get(current).state(), tcp::State::Closed);
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn orphan_established_schedules_fin_and_close_deadline() {
-        use crate::phy::Medium;
-        use crate::wire::{IpAddress, IpCidr, Ipv4Packet, TcpPacket};
+        use crate::wire::{IpAddress, Ipv4Packet, TcpPacket};
 
-        let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
-        let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+        let (mut a, mut a_set, mut a_device) = crate::tests::setup_eth();
+        let (mut b, mut b_set, mut b_device) = crate::tests::setup_eth_peer();
         let remote = IpAddress::v4(192, 168, 1, 2);
-        b.update_ip_addrs(|addrs| {
-            addrs.clear();
-            addrs.push(IpCidr::new(remote, 24)).unwrap();
-        });
         let buffered = || tcp::Socket::test_socket(64, 64);
         let a_handle = a_set.add(buffered());
         let b_handle = b_set.add(buffered());
@@ -1545,7 +1521,8 @@ mod tests {
         assert_eq!(a_set.get(a_handle).state(), tcp::State::FinWait1);
         a.poll_egress(Instant::from_millis(10), &mut a_device, &mut a_set);
         assert_eq!(a_device.tx_queue.len(), 1);
-        let ip = Ipv4Packet::new_checked(a_device.tx_queue.front().unwrap().as_slice()).unwrap();
+        let ip = Ipv4Packet::new_checked(crate::tests::strip_eth(a_device.tx_queue.front().unwrap()))
+            .unwrap();
         let segment = TcpPacket::new_checked(ip.payload()).unwrap();
         assert!(segment.fin());
         assert!(!segment.rst());
@@ -1570,11 +1547,9 @@ mod tests {
         assert_reapable(&mut b_set, &[]);
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn readiness_tokens_fire_on_ingress_app_changes_and_egress_state_changes() {
-        use crate::phy::Medium;
-        use crate::wire::{IpAddress, IpCidr};
+        use crate::wire::IpAddress;
         use ReadySide::{Rx, Tx};
 
         fn fired(set: &mut TcpSet) -> alloc::vec::Vec<u32> {
@@ -1583,13 +1558,9 @@ mod tests {
             fired
         }
 
-        let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
-        let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+        let (mut a, mut a_set, mut a_device) = crate::tests::setup_eth();
+        let (mut b, mut b_set, mut b_device) = crate::tests::setup_eth_peer();
         let remote = IpAddress::v4(192, 168, 1, 2);
-        b.update_ip_addrs(|addrs| {
-            addrs.clear();
-            addrs.push(IpCidr::new(remote, 24)).unwrap();
-        });
         let buffered = || tcp::Socket::test_socket(64, 64);
         macro_rules! exchange {
             () => {
@@ -1710,19 +1681,13 @@ mod tests {
         set.iter().map(|(h, _)| h.index).collect()
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn remove_discards_unread_received_bytes() {
-        use crate::phy::Medium;
         use crate::wire::IpAddress;
 
-        let (mut a, mut a_set, mut a_device) = crate::tests::setup(Medium::Ip);
-        let (mut b, mut b_set, mut b_device) = crate::tests::setup(Medium::Ip);
+        let (mut a, mut a_set, mut a_device) = crate::tests::setup_eth();
+        let (mut b, mut b_set, mut b_device) = crate::tests::setup_eth_peer();
         let remote = IpAddress::v4(192, 168, 1, 2);
-        b.update_ip_addrs(|addrs| {
-            addrs.clear();
-            addrs.push(crate::wire::IpCidr::new(remote, 24)).unwrap();
-        });
         let buffered = || tcp::Socket::test_socket(64, 64);
         let a_handle = a_set.add(buffered());
         let b_handle = b_set.add(buffered());
@@ -1786,10 +1751,8 @@ mod tests {
         assert_eq!(&bytes, b"next");
     }
 
-    #[cfg(feature = "medium-ip")]
     #[test]
     fn add_admitted_preserves_configured_rx_budget() {
-        use crate::phy::Medium;
         use crate::wire::IpAddress;
 
         let mut set = TcpSet::new(64);
@@ -1802,7 +1765,7 @@ mod tests {
             super::super::DropQueue::with_capacity(1, 0),
         );
         // Raising the cap after admission must not change the admitted frame count.
-        let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
+        let (mut iface, _, _) = crate::tests::setup_eth();
         let socket = set.get_mut(handle);
         socket.set_mss_cap(Some(1000));
         socket
@@ -1987,10 +1950,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "medium-ip")]
     mod flow_index {
         use super::*;
-        use crate::phy::Medium;
         use crate::wire::IpAddress;
 
         fn endpoints() -> (IpEndpoint, IpEndpoint) {
@@ -2001,7 +1962,7 @@ mod tests {
         }
 
         fn connected(local: IpEndpoint, remote: IpEndpoint) -> tcp::Socket<'static> {
-            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
+            let (mut iface, _, _) = crate::tests::setup_eth();
             let mut socket = socket();
             socket.connect(iface.context(), remote, local).unwrap();
             assert_eq!(socket.state(), tcp::State::SynSent);
@@ -2019,7 +1980,7 @@ mod tests {
         /// them at once.
         #[test]
         fn identity_operations_update_the_index_in_the_call() {
-            let (mut iface, mut set, _) = crate::tests::setup(Medium::Ip);
+            let (mut iface, mut set, _) = crate::tests::setup_eth();
             let (local, remote) = endpoints();
             let client = set.add(socket());
             let server = set.add(socket());
@@ -2041,7 +2002,7 @@ mod tests {
         /// free again.
         #[test]
         fn connect_on_a_live_tuple_is_refused() {
-            let (mut iface, mut set, _) = crate::tests::setup(Medium::Ip);
+            let (mut iface, mut set, _) = crate::tests::setup_eth();
             let (local, remote) = endpoints();
             let first = set.add(socket());
             let second = set.add(socket());
@@ -2061,7 +2022,7 @@ mod tests {
 
         #[test]
         fn mutable_access_unlinks_tcp_timer() {
-            let (mut iface, mut set, mut device) = crate::tests::setup(Medium::Ip);
+            let (mut iface, mut set, mut device) = crate::tests::setup_eth();
             let (local, remote) = endpoints();
             let handle = set.add(connected(local, remote));
             iface.poll_egress(Instant::ZERO, &mut device, &mut set);
@@ -2091,7 +2052,7 @@ mod tests {
 
         #[test]
         fn flow_index_tracks_add_remove_and_listen() {
-            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
+            let (mut iface, _, _) = crate::tests::setup_eth();
             let (local, remote) = endpoints();
             let mut set = TcpSet::new(64);
             let first = set.add(socket());
@@ -2125,7 +2086,7 @@ mod tests {
 
         #[test]
         fn flow_index_filters_bound_listeners_and_keeps_lowest_match() {
-            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
+            let (mut iface, _, _) = crate::tests::setup_eth();
             let (local, remote) = endpoints();
             for exact_first in [false, true] {
                 let mut set = TcpSet::new(64);
@@ -2161,7 +2122,7 @@ mod tests {
 
         #[test]
         fn flow_index_marks_only_mutably_yielded_slots() {
-            let (mut iface, _, _) = crate::tests::setup(Medium::Ip);
+            let (mut iface, _, _) = crate::tests::setup_eth();
             let (local, remote) = endpoints();
             let mut set = TcpSet::new(64);
             let handles: Vec<_> = (0..3).map(|_| set.add(socket())).collect();

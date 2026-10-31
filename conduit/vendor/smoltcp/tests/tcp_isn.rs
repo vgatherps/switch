@@ -1,21 +1,57 @@
-#![cfg(feature = "medium-ip")]
-
 use smoltcp::iface::{Config, DropQueue, Interface, SocketHandle, TcpSet};
 use smoltcp::phy::{Device, Loopback, Medium, RxToken, TxPool, TxSource, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet, TcpControl, TcpPacket};
+use smoltcp::wire::{
+    ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
+    HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet, TcpControl, TcpPacket,
+};
 
 const LOCAL: Ipv4Address = Ipv4Address::new(192, 0, 2, 1);
 const REMOTE: Ipv4Address = Ipv4Address::new(192, 0, 2, 2);
+const LOCAL_MAC: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 1]);
+const REMOTE_MAC: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 2]);
 
+/// An interface that has learned `REMOTE` from an ARP reply, so its first frame to the peer is
+/// TCP, not an ARP request.
 fn interface(seed: u64) -> (Interface, Loopback) {
-    let mut device = Loopback::new(Medium::Ip);
-    let mut config = Config::new(HardwareAddress::Ip);
+    let mut device = Loopback::new(Medium::Ethernet);
+    let mut config = Config::new(HardwareAddress::Ethernet(LOCAL_MAC));
     config.random_seed = seed;
     let mut iface = Interface::new(config, &mut device, Instant::ZERO);
     iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(LOCAL.into(), 24)).unwrap());
+    let arp = ArpRepr::EthernetIpv4 {
+        operation: ArpOperation::Reply,
+        source_hardware_addr: REMOTE_MAC,
+        source_protocol_addr: REMOTE,
+        target_hardware_addr: LOCAL_MAC,
+        target_protocol_addr: LOCAL,
+    };
+    inject(&mut device, Instant::ZERO, EthernetProtocol::Arp, arp.buffer_len(), |payload| {
+        arp.emit(&mut ArpPacket::new_unchecked(payload))
+    });
+    iface.poll_ingress_single(Instant::ZERO, &mut device, &mut TcpSet::new(1));
     (iface, device)
+}
+
+/// Queue a frame from `REMOTE_MAC` to `LOCAL_MAC` whose payload `fill` writes.
+fn inject(
+    device: &mut Loopback,
+    now: Instant,
+    ethertype: EthernetProtocol,
+    payload_len: usize,
+    fill: impl FnOnce(&mut [u8]),
+) {
+    device
+        .transmit(now)
+        .unwrap()
+        .consume(EthernetFrame::<&[u8]>::buffer_len(payload_len), |bytes| {
+            let mut frame = EthernetFrame::new_unchecked(bytes);
+            frame.set_src_addr(REMOTE_MAC);
+            frame.set_dst_addr(LOCAL_MAC);
+            frame.set_ethertype(ethertype);
+            fill(frame.payload_mut());
+        });
 }
 
 fn add_socket(sockets: &mut TcpSet<'static>) -> SocketHandle {
@@ -26,7 +62,9 @@ fn add_socket(sockets: &mut TcpSet<'static>) -> SocketHandle {
 
 fn take_syn(device: &mut Loopback) -> u32 {
     let frame = device.receive(Instant::ZERO).unwrap().0.into_buf();
-    let ip = Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+    let ethernet = EthernetFrame::new_checked(frame.as_slice()).unwrap();
+    assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv4);
+    let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();
     let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
     assert!(tcp.syn());
     tcp.seq_number().0 as u32
@@ -96,18 +134,16 @@ fn passive_syn_isn_uses_interface_seed_and_time() {
             hop_limit: 64,
         };
         let checksums = ChecksumCapabilities::default();
-        device
-            .transmit(now)
-            .unwrap()
-            .consume(ip.buffer_len() + tcp.buffer_len(), |bytes| {
-                ip.emit(&mut Ipv4Packet::new_unchecked(&mut *bytes), &checksums);
-                tcp.emit(
-                    &mut TcpPacket::new_unchecked(&mut bytes[ip.buffer_len()..]),
-                    &REMOTE.into(),
-                    &LOCAL.into(),
-                    &checksums,
-                );
-            });
+        let len = ip.buffer_len() + tcp.buffer_len();
+        inject(&mut device, now, EthernetProtocol::Ipv4, len, |bytes| {
+            ip.emit(&mut Ipv4Packet::new_unchecked(&mut *bytes), &checksums);
+            tcp.emit(
+                &mut TcpPacket::new_unchecked(&mut bytes[ip.buffer_len()..]),
+                &REMOTE.into(),
+                &LOCAL.into(),
+                &checksums,
+            );
+        });
         iface.poll_ingress_single(now, &mut device, &mut sockets);
         iface.poll_egress(now, &mut device, &mut sockets);
         take_syn(&mut device)
