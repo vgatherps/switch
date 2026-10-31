@@ -4,10 +4,10 @@
   zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
   zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
   zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
-  zhida_aws_bench.py cleanup --run-id ID | --shared       delete a run's resources | the shared ones
+  zhida_aws_bench.py cleanup --run-id ID [--region R] [--out DIR]   delete a leftover run's resources
 
-Needs python3 with boto3, ssh, scp, ssh-keygen, git, a clean committed tree (the hosts build
-`git archive HEAD`) and AWS credentials for the region. Design: plans/bench/design.md.
+Needs python3 with boto3, ssh, scp, git, a clean committed tree (the hosts build `git archive HEAD`)
+and AWS credentials for the region. Design: plans/bench/design.md.
 `preflight` (also the first step of `run`) checks the tree, the credentials and the on-demand
 Standard vCPU quota (L-1216C47A: 48 free) before anything is created.
 
@@ -16,13 +16,15 @@ placement group, key pair, run/terminate/describe instances, create/attach/delet
 interfaces, delete volumes, create tags, describe instance type offerings), ssm:GetParameter (the
 AL2023 AMI), sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 
-`run` provisions six c7gn.2xlarge on-demand instances (one run_instances) in one cluster placement
-group, one data ENI each; applies `deploy/hft-host.sh` (builds DPDK and the toolchain, reboots,
-verify), then builds zhida-bench natively (bootstrap.sh); runs the fixed sweep matrix with the
-coordinator on sender0 driving one worker per sender host over SSH; fetches every result; runs
-bench/report.py; tears down. Billable per-run resources carry the run id and expiry tags; each
-instance powers itself off (terminate) at the TTL; the runner tears down on exit, errors, Ctrl-C and
-SIGTERM, and exits non-zero if a final describe still finds any of the run's resources.
+`run` creates a VPC, subnet, internet gateway, route table, security group (SSH from the caller's
+address), cluster placement group and key pair for the run; provisions six c7gn.2xlarge on-demand
+instances (one run_instances) in the placement group, one data ENI each; applies
+`deploy/hft-host.sh` (builds DPDK and the toolchain, reboots, verify), then builds zhida-bench
+natively (bootstrap.sh); runs the fixed sweep matrix with the coordinator on sender0 driving one
+worker per sender host over SSH; fetches every result; tears down; runs bench/report.py. Every
+resource carries the run id and expiry tags and is recorded in RUN_DIR/created.json as it is
+created; teardown deletes all of them and exits non-zero if a final describe still finds any. Each
+instance powers itself off (terminate) at the TTL. Teardown runs on exit, errors, Ctrl-C and SIGTERM.
 """
 import argparse
 import datetime
@@ -44,11 +46,9 @@ import janitor  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-SHARED = {"Key": janitor.SHARED_TAG, "Value": "shared"}
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 VPC_CIDR, SUBNET_CIDR = "10.80.0.0/16", "10.80.1.0/24"
 NAME = janitor.NAME
-KEY_DIR = os.path.expanduser("~/.zhida-bench")
 REGION = "ap-northeast-1"
 TTL = "2h"
 
@@ -92,10 +92,6 @@ def parse_duration(text):
 
 def new_run_id(now):
     return now.strftime("%Y%m%d-%H%M%S-") + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
-
-
-def shared_key_path(region):
-    return os.path.join(KEY_DIR, f"{NAME}-{region}.pem")
 
 
 def run_tags(run_id, expires):
@@ -198,7 +194,7 @@ def plan_text(region, ttl, run_id, expires):
     lines = [
         f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
         f"hosts: {len(ROLES)} x {INSTANCE_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
-        f" cluster placement group {NAME}, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 DPDK data ENI"
+        f" its cluster placement group, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 DPDK data ENI"
         " (vfio-pci, DeleteOnTermination); CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
         f"  {'receiver':9} zhida-bench serve on APP_CPU (systemd unit {RECEIVER_UNIT})",
         f"  {'sender0':9} zhida-bench sweep (coordinator) on HOUSEKEEPING; worker 0 (zhida-bench gen) on APP_CPU",
@@ -213,16 +209,14 @@ def plan_text(region, ttl, run_id, expires):
     lines += [
         f"needs: on-demand Standard vCPU quota L-1216C47A with {len(ROLES) * HOST_VCPUS} vCPUs free in {region};"
         " permissions: see `zhida_aws_bench.py -h`",
+        "created for the run and deleted at teardown, tagged with the run id: VPC, subnet, internet gateway,"
+        " route table, security group, placement group, key pair, the instances and data ENIs",
         f"billable while the run lives: {len(ROLES)} instances, {len(ROLES)} x {ROOT_GB} GB gp3 root volumes,"
         f" {len(ROLES)} public IPv4 addresses",
-        "expiry: each instance powers itself off (terminates) at the TTL; the runner tears down on exit,"
+        "expiry: each instance powers itself off (terminates) at the TTL; the runner tears down on exit, errors,"
         " Ctrl-C and SIGTERM",
     ]
     return "\n".join(lines)
-
-
-def error_code(e):
-    return getattr(e, "response", {}).get("Error", {}).get("Code")
 
 
 # ---------------------------------------------------------------- AWS
@@ -242,66 +236,44 @@ class Aws:
         self.ec2, self.ssm = clients["ec2"], clients["ssm"]
         self.sts, self.quotas = clients["sts"], clients["service-quotas"]
 
-    def shared_one(self, describe, key, filters):
-        items = describe(Filters=[{"Name": f"tag:{janitor.SHARED_TAG}", "Values": ["shared"]}] + filters)[key]
-        return items[0] if items else None
-
-    def ensure_shared(self, my_ip):
-        """Resources reused across runs; idempotent."""
+    def create_network(self, run_id, expires, my_ip, record, key_path):
+        """The run's VPC, subnet, internet gateway and route, security group, placement group and key
+        pair (private key to `key_path`), each passed to `record` as its create succeeds."""
         ec2 = self.ec2
+        name = f"{NAME}-{run_id}"
 
-        def tagspec(kind):
-            return [{"ResourceType": kind, "Tags": [SHARED, {"Key": "Name", "Value": NAME}]}]
+        def spec(kind):
+            return [{"ResourceType": kind, "Tags": run_tags(run_id, expires)}]
 
-        vpc = self.shared_one(ec2.describe_vpcs, "Vpcs", [])
-        if vpc is None:
-            vpc = ec2.create_vpc(CidrBlock=VPC_CIDR, TagSpecifications=tagspec("vpc"))["Vpc"]
-            ec2.get_waiter("vpc_available").wait(VpcIds=[vpc["VpcId"]])
-            ec2.modify_vpc_attribute(VpcId=vpc["VpcId"], EnableDnsHostnames={"Value": True})
-        vpc_id = vpc["VpcId"]
-        in_vpc = [{"Name": "vpc-id", "Values": [vpc_id]}]
-        subnet = self.shared_one(ec2.describe_subnets, "Subnets", in_vpc)
-        if subnet is None:
-            subnet = ec2.create_subnet(VpcId=vpc_id, CidrBlock=SUBNET_CIDR, AvailabilityZone=self.zone_offering(),
-                                       TagSpecifications=tagspec("subnet"))["Subnet"]
-        igw = self.shared_one(ec2.describe_internet_gateways, "InternetGateways", [])
-        if igw is None:
-            igw = ec2.create_internet_gateway(TagSpecifications=tagspec("internet-gateway"))["InternetGateway"]
-            ec2.attach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc_id)
-        rt = self.shared_one(ec2.describe_route_tables, "RouteTables", in_vpc)
-        if rt is None:
-            rt = ec2.create_route_table(VpcId=vpc_id, TagSpecifications=tagspec("route-table"))["RouteTable"]
-            ec2.create_route(RouteTableId=rt["RouteTableId"], DestinationCidrBlock="0.0.0.0/0",
-                             GatewayId=igw["InternetGatewayId"])
-            ec2.associate_route_table(RouteTableId=rt["RouteTableId"], SubnetId=subnet["SubnetId"])
-        sg = self.shared_one(ec2.describe_security_groups, "SecurityGroups", in_vpc)
-        if sg is None:
-            sg_id = ec2.create_security_group(GroupName=NAME, Description="zhida-bench hosts", VpcId=vpc_id,
-                                              TagSpecifications=tagspec("security-group"))["GroupId"]
-            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
-                {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": sg_id}]}])
-        else:
-            sg_id = sg["GroupId"]
-        try:
-            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
-                {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": f"{my_ip}/32"}]}])
-        except Exception as e:
-            if error_code(e) != "InvalidPermission.Duplicate":
-                raise
-        if not ec2.describe_placement_groups(Filters=[{"Name": "group-name", "Values": [NAME]}])["PlacementGroups"]:
-            ec2.create_placement_group(GroupName=NAME, Strategy="cluster", TagSpecifications=tagspec("placement-group"))
-        key_path = shared_key_path(self.region)
-        keys = ec2.describe_key_pairs(Filters=[{"Name": "key-name", "Values": [NAME]}])["KeyPairs"]
-        if keys and not os.path.exists(key_path):
-            raise RuntimeError(f"key pair {NAME} exists but {key_path} is missing: restore the file, or run"
-                               " `cleanup --shared` and start over")
-        if not keys:
-            os.makedirs(KEY_DIR, mode=0o700, exist_ok=True)
-            material = ec2.create_key_pair(KeyName=NAME, TagSpecifications=tagspec("key-pair"))["KeyMaterial"]
-            with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-                f.write(material)
-        return {"vpc": vpc_id, "subnet": subnet["SubnetId"], "zone": subnet["AvailabilityZone"], "sg": sg_id,
-                "key_path": key_path}
+        vpc = ec2.create_vpc(CidrBlock=VPC_CIDR, TagSpecifications=spec("vpc"))["Vpc"]["VpcId"]
+        record("vpc", vpc)
+        ec2.get_waiter("vpc_available").wait(VpcIds=[vpc])
+        ec2.modify_vpc_attribute(VpcId=vpc, EnableDnsHostnames={"Value": True})
+        zone = self.zone_offering()
+        subnet = ec2.create_subnet(VpcId=vpc, CidrBlock=SUBNET_CIDR, AvailabilityZone=zone,
+                                   TagSpecifications=spec("subnet"))["Subnet"]["SubnetId"]
+        record("subnet", subnet)
+        igw = ec2.create_internet_gateway(TagSpecifications=spec("internet-gateway"))["InternetGateway"]
+        record("internet-gateway", igw["InternetGatewayId"])
+        ec2.attach_internet_gateway(InternetGatewayId=igw["InternetGatewayId"], VpcId=vpc)
+        rt = ec2.create_route_table(VpcId=vpc, TagSpecifications=spec("route-table"))["RouteTable"]["RouteTableId"]
+        record("route-table", rt)
+        ec2.create_route(RouteTableId=rt, DestinationCidrBlock="0.0.0.0/0", GatewayId=igw["InternetGatewayId"])
+        ec2.associate_route_table(RouteTableId=rt, SubnetId=subnet)
+        sg = ec2.create_security_group(GroupName=name, Description="zhida-bench hosts", VpcId=vpc,
+                                       TagSpecifications=spec("security-group"))["GroupId"]
+        record("security-group", sg)
+        ec2.authorize_security_group_ingress(GroupId=sg, IpPermissions=[
+            {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": sg}]},
+            {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": f"{my_ip}/32"}]}])
+        ec2.create_placement_group(GroupName=name, Strategy="cluster", TagSpecifications=spec("placement-group"))
+        record("placement-group", name)
+        material = ec2.create_key_pair(KeyName=name, KeyType="ed25519",
+                                       TagSpecifications=spec("key-pair"))["KeyMaterial"]
+        record("key-pair", name)
+        with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(material)
+        return {"name": name, "subnet": subnet, "zone": zone, "sg": sg}
 
     def zone_offering(self):
         offered = self.ec2.describe_instance_type_offerings(
@@ -312,29 +284,33 @@ class Aws:
             raise RuntimeError(f"no zone in {self.region} offers {INSTANCE_TYPE}")
         return zones[0]
 
-    def launch_hosts(self, shared, run_id, expires):
+    def launch_hosts(self, net, run_id, expires, record):
         """Six instances in one run_instances into the placement group; then one data ENI each
-        (create, attach, DeleteOnTermination). Returns host records in ROLES order."""
+        (create, attach, DeleteOnTermination); every ID passed to `record` as its create succeeds.
+        Returns host records in ROLES order."""
         ec2 = self.ec2
         ami = self.ssm.get_parameter(Name=AMI_PARAM)["Parameter"]["Value"]
         tags = run_tags(run_id, expires)
         r = ec2.run_instances(
-            ImageId=ami, InstanceType=INSTANCE_TYPE, MinCount=len(ROLES), MaxCount=len(ROLES), KeyName=NAME,
+            ImageId=ami, InstanceType=INSTANCE_TYPE, MinCount=len(ROLES), MaxCount=len(ROLES), KeyName=net["name"],
             InstanceInitiatedShutdownBehavior="terminate",
-            Placement={"GroupName": NAME, "AvailabilityZone": shared["zone"]},
-            NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": shared["subnet"], "Groups": [shared["sg"]],
+            Placement={"GroupName": net["name"], "AvailabilityZone": net["zone"]},
+            NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": net["subnet"], "Groups": [net["sg"]],
                                 "AssociatePublicIpAddress": True, "DeleteOnTermination": True}],
             BlockDeviceMappings=[{"DeviceName": "/dev/xvda", "Ebs": {
                 "VolumeSize": ROOT_GB, "VolumeType": "gp3", "DeleteOnTermination": True}}],
             UserData=user_data(expires),
             TagSpecifications=[{"ResourceType": k, "Tags": tags} for k in ("instance", "volume", "network-interface")])
         ids = [i["InstanceId"] for i in sorted(r["Instances"], key=lambda i: i["AmiLaunchIndex"])]
+        for iid in ids:
+            record("instance", iid)
         ec2.get_waiter("instance_running").wait(InstanceIds=ids)
         enis = {}
         for iid in ids:
             eni = ec2.create_network_interface(
-                SubnetId=shared["subnet"], Groups=[shared["sg"]],
+                SubnetId=net["subnet"], Groups=[net["sg"]],
                 TagSpecifications=[{"ResourceType": "network-interface", "Tags": tags}])["NetworkInterface"]
+            record("network-interface", eni["NetworkInterfaceId"])
             att = ec2.attach_network_interface(NetworkInterfaceId=eni["NetworkInterfaceId"], InstanceId=iid,
                                                DeviceIndex=1)["AttachmentId"]
             ec2.modify_network_interface_attribute(NetworkInterfaceId=eni["NetworkInterfaceId"],
@@ -520,22 +496,12 @@ def read_facts(hosts, receiver_eni_ip):
     return facts, ip
 
 
-def connect_senders(hosts, run_dir, run_id, local):
-    """A run-scoped key: sender0 reaches sender0..4 as ec2-user through REMOTE/ssh_config."""
-    key = os.path.join(run_dir, "run_key")
-    local(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"{NAME}-{run_id}", "-f", key], check=True)
-    with open(key) as f:
-        private = f.read()
-    with open(key + ".pub") as f:
-        public = f.read().strip()
+def connect_senders(hosts, key_path):
+    """sender0 reaches sender0..4 as ec2-user through REMOTE/ssh_config, with the run's key pair."""
     senders = hosts[1:]
-    for h in senders:
-        h.ssh(f"grep -qxF {shlex.quote(public)} ~/.ssh/authorized_keys || echo {shlex.quote(public)}"
-              " >> ~/.ssh/authorized_keys")
-    sender0 = senders[0]
-    sender0.put_text(f"{REMOTE}/id_run", private, "600")
-    sender0.put_text(f"{REMOTE}/ssh_config", ssh_config([h.info["private_ip"] for h in senders]), "644")
-    sender0.ssh(f"rm -f {REMOTE}/known_hosts")
+    with open(key_path) as f:
+        senders[0].put_text(f"{REMOTE}/id_run", f.read(), "600")
+    senders[0].put_text(f"{REMOTE}/ssh_config", ssh_config([h.info["private_ip"] for h in senders]), "644")
 
 
 def fetch_sweep(t, hosts, run_dir):
@@ -598,7 +564,9 @@ def run(args, env=None):
     archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
-    shared = aws.ensure_shared(env.my_ip())
+    created = janitor.Created(os.path.join(run_dir, "created.json"))
+    key_path = os.path.join(run_dir, "key.pem")
+    my_ip = env.my_ip()
 
     def on_signal(signum, _frame):
         raise SystemExit(128 + signum)
@@ -606,12 +574,13 @@ def run(args, env=None):
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
     fetch_errors = []
-    # From here on every exit path deletes the run's billable resources.
+    # From here on every exit path deletes the run's resources.
     try:
-        infos = aws.launch_hosts(shared, run_id, expires)
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path)
+        infos = aws.launch_hosts(net, run_id, expires, created.add)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump(infos, f, indent=1)
-        hosts = [env.host(info, shared["key_path"], run_dir) for info in infos]
+        hosts = [env.host(info, key_path, run_dir) for info in infos]
         for h in hosts:
             h.wait_ssh()
         setup = setup_hosts(hosts, archive)
@@ -621,12 +590,12 @@ def run(args, env=None):
         setup += [f"[{r} host.env] " + " ".join(f"{k}={v}" for k, v in sorted(facts[r].items())) for r in ROLES]
         with open(os.path.join(run_dir, "host-setup.txt"), "w") as f:
             f.write("\n".join(setup) + "\n")
-        connect_senders(hosts, run_dir, run_id, env.local)
+        connect_senders(hosts, key_path)
         fetch_errors = measure(hosts, facts, receiver_ip, run_dir, env)
     finally:
         # teardown first: the report is local, and a second Ctrl-C during it must not skip teardown
         log(f"tearing down run {run_id}")
-        torn = teardown(aws.ec2, run_id)
+        torn = teardown(aws.ec2, run_id, created.ids)
         report_code = None
         if os.path.exists(os.path.join(run_dir, "expected.json")):
             if fetch_errors:
@@ -640,9 +609,9 @@ def run(args, env=None):
     return 0 if report_code == 0 and not fetch_errors and torn else 1
 
 
-def teardown(ec2, run_id):
+def teardown(ec2, run_id, recorded):
     """Deletes the run's resources; True only when a describe found none of them left."""
-    remaining = janitor.clean_run(ec2, run_id, log=log)
+    remaining = janitor.clean_run(ec2, run_id, recorded, log=log)
     if remaining:
         log(f"run {run_id}: STILL PRESENT after teardown (rerun `cleanup --run-id {run_id}`): {'; '.join(remaining)}")
         return False
@@ -651,31 +620,27 @@ def teardown(ec2, run_id):
 
 
 def cleanup(args, env=None):
+    """A leftover run: the IDs its run_dir/created.json recorded, plus a tag lookup."""
     aws = (env or Env()).aws(args.region)
-    if args.run_id:
-        return 0 if teardown(aws.ec2, args.run_id) else 1
-    remaining = janitor.clean_shared(aws.ec2, shared_key_path(args.region), log=log)
-    if remaining:
-        log(f"cleanup --shared: STILL PRESENT: {'; '.join(remaining)}")
-        return 1
-    log("cleanup --shared: nothing left")
-    return 0
+    path = os.path.join(args.out, args.run_id, "created.json")
+    recorded = janitor.read_created(path) if os.path.exists(path) else {}
+    log(f"run {args.run_id}: {sum(map(len, recorded.values()))} recorded IDs from {path}" if recorded
+        else f"run {args.run_id}: no {path}; tag lookup only")
+    return 0 if teardown(aws.ec2, args.run_id, recorded) else 1
 
 
 def parser():
     p = argparse.ArgumentParser(prog="zhida-aws-bench", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "plan", "preflight"):
+    for name in ("run", "plan", "preflight", "cleanup"):
         r = sub.add_parser(name)
         r.add_argument("--region", default=REGION)
-        r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
         r.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
-    c = sub.add_parser("cleanup")
-    which = c.add_mutually_exclusive_group(required=True)
-    which.add_argument("--run-id")
-    which.add_argument("--shared", action="store_true")
-    c.add_argument("--region", default=REGION)
+        if name == "cleanup":
+            r.add_argument("--run-id", required=True)
+        else:
+            r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
     return p
 
 

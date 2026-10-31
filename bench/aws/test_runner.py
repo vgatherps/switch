@@ -175,8 +175,20 @@ class FakeWaiter:
 
 
 class FakeLaunchEc2:
+    """Records every call; `record` (the runner's Created.add) lands in the same list."""
+
+    CREATED = {"create_vpc": {"Vpc": {"VpcId": "vpc-1"}}, "create_subnet": {"Subnet": {"SubnetId": "subnet-1"}},
+               "create_internet_gateway": {"InternetGateway": {"InternetGatewayId": "igw-1"}},
+               "create_route_table": {"RouteTable": {"RouteTableId": "rtb-1"}},
+               "create_security_group": {"GroupId": "sg-1"}, "create_key_pair": {"KeyMaterial": "PRIVATE\n"},
+               "describe_instance_type_offerings": {"InstanceTypeOfferings": [{"Location": "zone-b"},
+                                                                              {"Location": "zone-a"}]}}
+
     def __init__(self):
         self.calls, self.n = [], 0
+
+    def record(self, kind, rid):
+        self.calls.append(("record", (kind, rid)))
 
     def __getattr__(self, name):
         def call(**kw):
@@ -190,7 +202,7 @@ class FakeLaunchEc2:
                                              "PrivateIpAddress": f"10.80.1.{100 + self.n}"}}
             if name == "attach_network_interface":
                 return {"AttachmentId": f"att-{kw['NetworkInterfaceId']}"}
-            return {}
+            return self.CREATED.get(name, {})
         return call
 
     def get_waiter(self, name):
@@ -216,19 +228,47 @@ class FakeSsm:
         return {"Parameter": {"Value": "ami-arm64"}}
 
 
-SHARED_INFO = {"vpc": "vpc-1", "subnet": "subnet-1", "zone": "apne1-az4", "sg": "sg-1", "key_path": "/k.pem"}
+NET = {"name": "zhida-bench-r1", "subnet": "subnet-1", "zone": "zone-a", "sg": "sg-1"}
 
 
 class LaunchTest(unittest.TestCase):
+    def test_network_is_per_run_tagged_and_recorded_as_created(self):
+        ec2 = FakeLaunchEc2()
+        key = os.path.join(tempfile.mkdtemp(), "key.pem")
+        net = launch_aws(ec2).create_network("r1", NOW, "203.0.113.9", ec2.record, key)
+        self.assertEqual(net, NET)
+        creates = [c[:2] for c in ec2.calls if c[0].startswith("create_") and c[0] != "create_route"]
+        for n, kw in creates:
+            tags = {t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}
+            self.assertEqual(tags[janitor.RUN_TAG], "r1", n)
+        # each ID recorded right after its create, before anything uses it
+        recorded = {"create_vpc": ("vpc", "vpc-1"), "create_subnet": ("subnet", "subnet-1"),
+                    "create_internet_gateway": ("internet-gateway", "igw-1"),
+                    "create_route_table": ("route-table", "rtb-1"), "create_security_group": ("security-group", "sg-1"),
+                    "create_placement_group": ("placement-group", "zhida-bench-r1"),
+                    "create_key_pair": ("key-pair", "zhida-bench-r1")}
+        names = [c[0] for c in ec2.calls]
+        for create, rec in recorded.items():
+            i = names.index(create)
+            self.assertEqual(ec2.calls[i + 1], ("record", rec))
+        self.assertEqual(len(creates), len(recorded))
+        sg_rules = ec2.calls[names.index("authorize_security_group_ingress")][1]["IpPermissions"]
+        self.assertEqual(sg_rules[1]["IpRanges"], [{"CidrIp": "203.0.113.9/32"}])
+        self.assertEqual(ec2.calls[names.index("create_placement_group")][1]["Strategy"], "cluster")
+        self.assertEqual(oct(os.stat(key).st_mode & 0o777), "0o600")
+        with open(key) as f:
+            self.assertEqual(f.read(), "PRIVATE\n")
+
     def test_one_run_instances_of_six_into_the_placement_group_then_eni_attach(self):
         ec2 = FakeLaunchEc2()
         aws = launch_aws(ec2)
-        hosts = aws.launch_hosts(SHARED_INFO, "r1", NOW + datetime.timedelta(hours=2))
+        hosts = aws.launch_hosts(NET, "r1", NOW + datetime.timedelta(hours=2), ec2.record)
         names = [c[0] for c in ec2.calls]
         self.assertEqual(names.count("run_instances"), 1)
         ri = ec2.calls[names.index("run_instances")][1]
         self.assertEqual((ri["MinCount"], ri["MaxCount"], ri["InstanceType"]), (6, 6, "c7gn.2xlarge"))
-        self.assertEqual(ri["Placement"], {"GroupName": "zhida-bench", "AvailabilityZone": "apne1-az4"})
+        self.assertEqual(ri["Placement"], {"GroupName": "zhida-bench-r1", "AvailabilityZone": "zone-a"})
+        self.assertEqual(ri["KeyName"], "zhida-bench-r1")
         self.assertNotIn("InstanceMarketOptions", ri, "on-demand, not spot")
         self.assertEqual(ri["InstanceInitiatedShutdownBehavior"], "terminate")
         self.assertEqual({t["ResourceType"] for t in ri["TagSpecifications"]}, {"instance", "volume", "network-interface"})
@@ -236,6 +276,10 @@ class LaunchTest(unittest.TestCase):
                          "no ENA Express call")
         self.assertNotIn("create_tags", names, "tags only via TagSpecifications")
         wait = names.index("wait")
+        self.assertEqual(ec2.calls[names.index("run_instances") + 1: wait],
+                         [("record", ("instance", f"i-{k}")) for k in range(6)], "recorded before the waiter")
+        self.assertEqual([c[1][1] for c in ec2.calls[wait:] if c[0] == "record"],
+                         [f"eni-{k}" for k in range(1, 7)])
         eni_calls = [c for c in ec2.calls[wait + 1:] if c[0] in (
             "create_network_interface", "attach_network_interface", "modify_network_interface_attribute")]
         self.assertEqual([c[0] for c in eni_calls], ["create_network_interface", "attach_network_interface",
@@ -318,8 +362,9 @@ class World:
         self.put = {}          # (role, path) -> text
         self.report_code = 0
         self.local_calls = []
-        self.clean_calls = []
+        self.clean_calls = []  # (run id, recorded IDs)
         self.left_after_teardown = []
+        self.network_fails = False
 
 
 class FakeHost:
@@ -483,12 +528,20 @@ class FakeAws:
         self.w, self.ec2 = world, FakeQuotaEc2([])
         self.sts, self.quotas = FakeSts(), FakeQuotas(96)
 
-    def ensure_shared(self, my_ip):
-        self.w.calls.append(("aws", f"ensure_shared {my_ip}"))
-        return dict(SHARED_INFO)
+    def create_network(self, run_id, expires, my_ip, record, key_path):
+        self.w.calls.append(("aws", f"create_network {my_ip}"))
+        record("vpc", "vpc-1")
+        if self.w.network_fails:
+            raise ClientError("RequestLimitExceeded", "slow down")
+        record("subnet", "subnet-1")
+        with open(key_path, "w") as f:
+            f.write("PRIVATE\n")
+        return dict(NET)
 
-    def launch_hosts(self, shared, run_id, expires):
+    def launch_hosts(self, net, run_id, expires, record):
         self.w.calls.append(("aws", "launch_hosts"))
+        for k in range(len(z.ROLES)):
+            record("instance", f"i-{k}")
         return [{"role": r, "id": f"i-{k}", "public_ip": f"pub{k}", "private_ip": f"10.80.1.{10 + k}",
                  "data_eni": {"id": f"eni-{k}", "mac": f"m{k}", "ip": RECEIVER_DATA_IP if k == 0 else f"10.80.1.{110 + k}"}}
                 for k, r in enumerate(z.ROLES)]
@@ -503,13 +556,6 @@ class RunTest(unittest.TestCase):
         self.w.local_calls.append(argv)
         if argv[0] == "git":
             return Proc(0, b"TAR" if "archive" in argv else "")
-        if argv[0] == "ssh-keygen":
-            key = argv[argv.index("-f") + 1]
-            with open(key, "w") as f:
-                f.write("PRIVATE\n")
-            with open(key + ".pub", "w") as f:
-                f.write("ssh-ed25519 AAAA zhida-bench-r\n")
-            return Proc(0)
         if argv[1].endswith("report.py"):
             return Proc(self.w.report_code)
         raise AssertionError(argv)
@@ -520,8 +566,8 @@ class RunTest(unittest.TestCase):
                     local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
         args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out)
 
-        def clean_run(ec2, run_id, log=print, **kw):
-            w.clean_calls.append(run_id)
+        def clean_run(ec2, run_id, recorded, log=print, **kw):
+            w.clean_calls.append((run_id, {k: list(v) for k, v in recorded.items()}))
             return list(w.left_after_teardown)
 
         self.log = io.StringIO()
@@ -546,8 +592,6 @@ class RunTest(unittest.TestCase):
                          [f"Host sender{i}" for i in range(5)])
         self.assertIn("HostName 10.80.1.11", cfg)
         self.assertEqual(w.put[("sender0", f"{z.REMOTE}/id_run")], "PRIVATE\n")
-        for i in range(5):
-            self.assertTrue(any(r == f"sender{i}" and "authorized_keys" in c for r, c in w.calls))
         sweeps = self.sweeps_run()
         self.assertEqual(len(sweeps), 3)
         self.assertEqual(w.sweep_timeouts, [z.SWEEP_WORST_S] * 3)
@@ -576,7 +620,10 @@ class RunTest(unittest.TestCase):
         report = [a for a in w.local_calls if a[1].endswith("report.py")]
         self.assertEqual(len(report), 1)
         self.assertEqual(report[0][2], self.run_dir)
-        self.assertEqual(w.clean_calls, [os.path.basename(self.run_dir)])
+        run_id = os.path.basename(self.run_dir)
+        recorded = {"vpc": ["vpc-1"], "subnet": ["subnet-1"], "instance": [f"i-{k}" for k in range(6)]}
+        self.assertEqual(w.clean_calls, [(run_id, recorded)])
+        self.assertEqual(janitor.read_created(os.path.join(self.run_dir, "created.json")), recorded)
         with open(os.path.join(self.run_dir, "host-setup.txt")) as f:
             setup = f.read()
         self.assertIn("[sender4 host.env]", setup)
@@ -611,6 +658,11 @@ class RunTest(unittest.TestCase):
         self.w.left_after_teardown = ["network-interface eni-9 (in-use, run r)"]
         self.assertEqual(self.run_bench(), 1)
         self.assertEqual(len(self.sweeps_run()), 3)
+
+    def test_a_failed_create_tears_down_what_was_recorded(self):
+        self.w.network_fails = True
+        self.assertIsInstance(self.run_bench(), ClientError)
+        self.assertEqual(self.w.clean_calls, [(os.path.basename(self.run_dir), {"vpc": ["vpc-1"]})])
 
     def test_dirty_tree_refused_before_anything_is_created(self):
         def local(argv, **kw):

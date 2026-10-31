@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tests of janitor.py and `cleanup` against fake EC2/S3/IAM (one item per describe page, so a
-describe that skips pagination misses resources): python3 -m unittest discover -s bench/aws"""
+"""Tests of janitor.py and `cleanup` against a fake EC2 (one item per describe page, so a describe
+that skips pagination misses resources): python3 -m unittest discover -s bench/aws"""
 import contextlib
 import functools
 import io
@@ -25,309 +25,300 @@ def run_tag(run):
     return [{"Key": janitor.RUN_TAG, "Value": run}, {"Key": janitor.EXPIRES_TAG, "Value": "2026-11-01T12:00:00+00:00"}]
 
 
-SHARED = [{"Key": janitor.SHARED_TAG, "Value": "shared"}]
-PAGED = {"describe_instances": "Reservations", "describe_network_interfaces": "NetworkInterfaces",
-         "describe_volumes": "Volumes", "describe_vpcs": "Vpcs", "describe_subnets": "Subnets",
-         "describe_security_groups": "SecurityGroups", "describe_route_tables": "RouteTables",
-         "describe_internet_gateways": "InternetGateways"}
-
-
-def matches(r, filters):
-    t = janitor.tags(r)
-    for f in filters:
-        n, vals = f["Name"], f["Values"]
-        if n == "tag-key" and not any(k in t for k in vals):
-            return False
-        if n.startswith("tag:") and t.get(n[4:]) not in vals:
-            return False
-        if n == "vpc-id" and r.get("VpcId") not in vals:
-            return False
-        if n == "attachment.vpc-id" and not any(a["VpcId"] in vals for a in r.get("Attachments", [])):
-            return False
-    return True
+KIND_OF_OP = {v[0]: kind for kind, v in janitor.KINDS.items()}
 
 
 class FakeEc2:
-    """Instances: running -> (terminate) shutting-down -> terminated one describe later, taking
-    their DeleteOnTermination ENIs and volumes with them. An ENI or volume with _busy=N stays in-use
-    for N more describes. Deletes enforce the dependencies EC2 enforces."""
+    """Per-kind stores. Instances: running -> (terminate) shutting-down -> terminated one describe
+    later, taking the ENIs and volumes they own (DeleteOnTermination) with them. An ENI or volume
+    with _busy=N stays in-use for N more describes. IDs in `hidden` are invisible to describes.
+    Deletes enforce the dependencies EC2 enforces; `deleted` lists successful deletes in order."""
 
     def __init__(self):
-        self.instances, self.enis, self.volumes = {}, {}, {}
-        self.vpcs, self.subnets, self.sgs, self.rts, self.igws = {}, {}, {}, {}, {}
-        self.keys, self.pgs = {"zhida-bench"}, {"zhida-bench"}
-        self.calls, self.fail = [], {}   # fail: call name -> ClientError raised every time
+        self.store = {kind: {} for kind in janitor.KINDS}
+        self.hidden, self.calls, self.deleted, self.fail = set(), [], [], {}
 
-    # ---- describes: paginated only, one item per page
-    def get_paginator(self, op):
-        ec2 = self
+    def add(self, kind, rid, run="r1", **attrs):
+        self.store[kind][rid] = {janitor.KINDS[kind][2]: rid, **attrs, **({"Tags": run_tag(run)} if run else {})}
 
-        class P:
-            def paginate(self, Filters=()):
-                for item in ec2.items(op, Filters):
-                    if op == "describe_instances":
-                        yield {"Reservations": [{"Instances": [item]}]}
-                    else:
-                        yield {PAGED[op]: [item]}
-        return P()
-
-    def items(self, op, filters):
-        if op == "describe_instances":
-            for i in self.instances.values():
+    # ---- describes
+    def _items(self, op, filters):
+        kind = KIND_OF_OP[op]
+        store = self.store[kind]
+        if kind == "instance":
+            for i in store.values():
                 if i["State"]["Name"] == "shutting-down" and i.pop("_seen", False):
                     i["State"]["Name"] = "terminated"
-                    for store in (self.enis, self.volumes):
-                        for k in [k for k, v in store.items() if v.get("_owner") == i["InstanceId"]]:
-                            del store[k]
+                    for owned in ("network-interface", "volume"):
+                        self.store[owned] = {k: v for k, v in self.store[owned].items()
+                                             if v.get("_owner") != i["InstanceId"]}
                 elif i["State"]["Name"] == "shutting-down":
                     i["_seen"] = True
-            store = self.instances
-        else:
-            store = {"describe_network_interfaces": self.enis, "describe_volumes": self.volumes,
-                     "describe_vpcs": self.vpcs, "describe_subnets": self.subnets,
-                     "describe_security_groups": self.sgs, "describe_route_tables": self.rts,
-                     "describe_internet_gateways": self.igws}[op]
         for r in store.values():
             if r.get("_busy"):
                 r["_busy"] -= 1
                 if not r["_busy"]:
                     r["Status" if "Status" in r else "State"] = "available"
-        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in list(store.values())
-                if matches(r, filters)]
+        field, id_filter = janitor.KINDS[kind][2:4]
+        out = []
+        for rid, r in store.items():
+            tags = {t["Key"]: t["Value"] for t in r.get("Tags", [])}
+            ok = all((tags.get(f["Name"][4:]) in f["Values"]) if f["Name"].startswith("tag:")
+                     else (f["Name"] == id_filter and r[field] in f["Values"]) for f in filters)
+            if ok and rid not in self.hidden:
+                out.append({k: v for k, v in r.items() if not k.startswith("_")})
+        return out
 
-    def _call(self, name, **kw):
-        self.calls.append((name, kw))
-        if name in self.fail:
-            raise self.fail[name]
+    def get_paginator(self, op):
+        ec2 = self
 
-    # ---- run resources
-    def terminate_instances(self, InstanceIds):
-        self._call("terminate_instances", InstanceIds=InstanceIds)
-        for i in InstanceIds:
-            self.instances[i]["State"]["Name"] = "shutting-down"
+        class P:
+            def paginate(self, Filters):
+                for item in ec2._items(op, Filters):
+                    yield {"Reservations": [{"Instances": [item]}]} if op == "describe_instances" else \
+                        {janitor.KINDS[KIND_OF_OP[op]][1]: [item]}
+        return P()
 
-    def delete_network_interface(self, NetworkInterfaceId):
-        self._call("delete_network_interface", NetworkInterfaceId=NetworkInterfaceId)
-        if self.enis[NetworkInterfaceId]["Status"] != "available":
-            raise ClientError("InvalidNetworkInterface.InUse")
-        del self.enis[NetworkInterfaceId]
-
-    def delete_volume(self, VolumeId):
-        self._call("delete_volume", VolumeId=VolumeId)
-        if self.volumes[VolumeId]["State"] != "available":
-            raise ClientError("VolumeInUse")
-        del self.volumes[VolumeId]
-
-    # ---- shared
     def describe_key_pairs(self, Filters):
-        return {"KeyPairs": [{"KeyName": k} for k in self.keys]}
+        return {"KeyPairs": self._items("describe_key_pairs", Filters)}
 
     def describe_placement_groups(self, Filters):
-        return {"PlacementGroups": [{"GroupName": g} for g in self.pgs]}
+        return {"PlacementGroups": self._items("describe_placement_groups", Filters)}
+
+    # ---- deletes
+    def _need(self, name, kind, rid, code="InvalidID.NotFound"):
+        self.calls.append((name, rid))
+        if name in self.fail:
+            raise self.fail[name]
+        if rid not in self.store[kind]:
+            raise ClientError(code)
+        return self.store[kind][rid]
+
+    def _delete(self, kind, rid, busy=None):
+        if busy:
+            raise ClientError("DependencyViolation", busy)
+        del self.store[kind][rid]
+        self.deleted.append((kind, rid))
+
+    def live_instances(self):
+        return [i for i in self.store["instance"].values() if i["State"]["Name"] != "terminated"]
+
+    def terminate_instances(self, InstanceIds):
+        for rid in InstanceIds:
+            i = self._need("terminate_instances", "instance", rid)
+            if i["State"]["Name"] != "terminated":
+                i["State"]["Name"] = "shutting-down"
+
+    def delete_network_interface(self, NetworkInterfaceId):
+        eni = self._need("delete_network_interface", "network-interface", NetworkInterfaceId)
+        if eni["Status"] != "available":
+            raise ClientError("InvalidNetworkInterface.InUse")
+        self._delete("network-interface", NetworkInterfaceId)
+
+    def delete_volume(self, VolumeId):
+        vol = self._need("delete_volume", "volume", VolumeId)
+        if vol["State"] != "available":
+            raise ClientError("VolumeInUse")
+        self._delete("volume", VolumeId)
 
     def delete_key_pair(self, KeyName):
-        self._call("delete_key_pair", KeyName=KeyName)
-        self.keys.discard(KeyName)  # EC2 succeeds on a missing key pair
+        self.calls.append(("delete_key_pair", KeyName))
+        if self.store["key-pair"].pop(KeyName, None):  # EC2 succeeds on a missing key pair
+            self.deleted.append(("key-pair", KeyName))
 
     def delete_placement_group(self, GroupName):
-        self._call("delete_placement_group", GroupName=GroupName)
-        if GroupName not in self.pgs:
-            raise ClientError("InvalidPlacementGroup.Unknown")
-        self.pgs.remove(GroupName)
+        self._need("delete_placement_group", "placement-group", GroupName, "InvalidPlacementGroup.Unknown")
+        if [i for i in self.live_instances() if i["_pg"] == GroupName]:
+            raise ClientError("InvalidPlacementGroup.InUse")
+        self._delete("placement-group", GroupName)
+
+    def enis_in(self, vpc):
+        return [e for e in self.store["network-interface"].values() if e.get("_vpc") == vpc]
 
     def delete_security_group(self, GroupId):
-        self._call("delete_security_group", GroupId=GroupId)
-        assert not self.enis, "SG deleted while ENIs exist"
-        del self.sgs[GroupId]
+        sg = self._need("delete_security_group", "security-group", GroupId)
+        self._delete("security-group", GroupId, self.enis_in(sg["VpcId"]) and "ENIs use it")
+
+    def delete_subnet(self, SubnetId):
+        sn = self._need("delete_subnet", "subnet", SubnetId)
+        self._delete("subnet", SubnetId, self.enis_in(sn["VpcId"]) and "ENIs in it")
 
     def disassociate_route_table(self, AssociationId):
-        self._call("disassociate_route_table", AssociationId=AssociationId)
-        for rt in self.rts.values():
+        self.calls.append(("disassociate_route_table", AssociationId))
+        for rt in self.store["route-table"].values():
             rt["Associations"] = [a for a in rt["Associations"] if a["RouteTableAssociationId"] != AssociationId]
 
     def delete_route_table(self, RouteTableId):
-        self._call("delete_route_table", RouteTableId=RouteTableId)
-        assert not self.rts[RouteTableId]["Associations"], "route table deleted while associated"
-        del self.rts[RouteTableId]
+        rt = self._need("delete_route_table", "route-table", RouteTableId)
+        self._delete("route-table", RouteTableId, rt["Associations"] and "associated")
 
     def detach_internet_gateway(self, InternetGatewayId, VpcId):
-        self._call("detach_internet_gateway", InternetGatewayId=InternetGatewayId, VpcId=VpcId)
-        self.igws[InternetGatewayId]["Attachments"] = []
+        self._need("detach_internet_gateway", "internet-gateway", InternetGatewayId)["Attachments"] = []
 
     def delete_internet_gateway(self, InternetGatewayId):
-        self._call("delete_internet_gateway", InternetGatewayId=InternetGatewayId)
-        assert not self.igws[InternetGatewayId]["Attachments"], "IGW deleted while attached"
-        del self.igws[InternetGatewayId]
-
-    def delete_subnet(self, SubnetId):
-        self._call("delete_subnet", SubnetId=SubnetId)
-        del self.subnets[SubnetId]
+        igw = self._need("delete_internet_gateway", "internet-gateway", InternetGatewayId)
+        self._delete("internet-gateway", InternetGatewayId, igw["Attachments"] and "attached")
 
     def delete_vpc(self, VpcId):
-        self._call("delete_vpc", VpcId=VpcId)
-        assert not any(s["VpcId"] == VpcId for s in self.subnets.values()), "VPC deleted with subnets"
-        assert not any(g["VpcId"] == VpcId and g["GroupName"] != "default" for g in self.sgs.values()), "with SGs"
-        main = lambda r: any(a.get("Main") for a in r["Associations"])  # noqa: E731
-        assert not any(r["VpcId"] == VpcId and not main(r) for r in self.rts.values()), "with route tables"
-        assert not any(a["VpcId"] == VpcId for g in self.igws.values() for a in g["Attachments"]), "with IGW"
-        del self.vpcs[VpcId]
-        self.sgs = {k: g for k, g in self.sgs.items() if g["VpcId"] != VpcId}
-        self.rts = {k: r for k, r in self.rts.items() if r["VpcId"] != VpcId}
+        self._need("delete_vpc", "vpc", VpcId)
+        inside = [r for kind in ("subnet", "security-group", "route-table") for r in self.store[kind].values()
+                  if r["VpcId"] == VpcId]
+        inside += [g for g in self.store["internet-gateway"].values()
+                   if any(a["VpcId"] == VpcId for a in g["Attachments"])]
+        self._delete("vpc", VpcId, inside and "not empty")
 
 
-def run_world():
-    ec2 = FakeEc2()
-    for iid, run in [("i-a", "r1"), ("i-b", "r1"), ("i-c", "r2")]:
-        ec2.instances[iid] = {"InstanceId": iid, "State": {"Name": "running"}, "Tags": run_tag(run)}
-        ec2.enis[f"eni-{iid}"] = {"NetworkInterfaceId": f"eni-{iid}", "Status": "in-use", "Tags": run_tag(run),
-                                  "_owner": iid}
-        ec2.volumes[f"vol-{iid}"] = {"VolumeId": f"vol-{iid}", "State": "in-use", "Tags": run_tag(run), "_owner": iid}
-    ec2.instances["i-other"] = {"InstanceId": "i-other", "State": {"Name": "running"}, "Tags": []}
-    ec2.enis["eni-loose"] = {"NetworkInterfaceId": "eni-loose", "Status": "available", "Tags": run_tag("r1")}
-    return ec2
+def run_world(ec2=None, run="r1", n=""):
+    """What a run creates (ids suffixed `n`), and the IDs the runner recorded for it."""
+    ec2 = ec2 or FakeEc2()
+    vpc = f"vpc{n}"
+    ec2.add("vpc", vpc, run)
+    ec2.add("subnet", f"subnet{n}", run, VpcId=vpc)
+    ec2.add("internet-gateway", f"igw{n}", run, Attachments=[{"VpcId": vpc}])
+    ec2.add("route-table", f"rtb{n}", run, VpcId=vpc,
+            Associations=[{"RouteTableAssociationId": f"rtbassoc{n}", "SubnetId": f"subnet{n}", "Main": False}])
+    ec2.add("security-group", f"sg{n}", run, VpcId=vpc)
+    ec2.add("placement-group", f"zhida-bench-{run}", run)
+    ec2.add("key-pair", f"zhida-bench-{run}", run)
+    recorded = {"vpc": [vpc], "subnet": [f"subnet{n}"], "internet-gateway": [f"igw{n}"], "route-table": [f"rtb{n}"],
+                "security-group": [f"sg{n}"], "placement-group": [f"zhida-bench-{run}"],
+                "key-pair": [f"zhida-bench-{run}"], "instance": [], "network-interface": []}
+    for k in range(2):
+        iid = f"i-{k}{n}"
+        ec2.add("instance", iid, run, State={"Name": "running"}, _pg=f"zhida-bench-{run}")
+        ec2.add("volume", f"vol-{k}{n}", run, State="in-use", _owner=iid)
+        ec2.add("network-interface", f"eni-primary-{k}{n}", run, Status="in-use", _owner=iid, _vpc=vpc)
+        ec2.add("network-interface", f"eni-data-{k}{n}", run, Status="in-use", _owner=iid, _vpc=vpc)
+        recorded["instance"].append(iid)
+        recorded["network-interface"].append(f"eni-data-{k}{n}")
+    return ec2, recorded
 
 
-def clean(ec2, run="r1", deadline_s=600):
+def clean(ec2, recorded=None, run="r1", deadline_s=600):
     clock = iter(range(0, 100000, 10))
-    return janitor.clean_run(ec2, run, deadline_s=deadline_s, poll_s=10, log=lambda m: None, sleep=lambda s: None,
-                             clock=lambda: next(clock))
+    return janitor.clean_run(ec2, run, recorded, deadline_s=deadline_s, poll_s=10, log=lambda m: None,
+                             sleep=lambda s: None, clock=lambda: next(clock))
+
+
+def left(ec2, run="r1"):
+    return sorted(rid for kind, store in ec2.store.items() for rid, r in store.items()
+                  if {"Key": janitor.RUN_TAG, "Value": run} in r.get("Tags", []) and
+                  not (kind == "instance" and r["State"]["Name"] == "terminated"))
 
 
 class CleanRunTest(unittest.TestCase):
-    def test_run_cleanup_deletes_everything_of_that_run_and_verifies(self):
-        ec2 = run_world()
-        self.assertEqual(clean(ec2), [])
-        self.assertEqual([c for c in ec2.calls if c[0] == "terminate_instances"],
-                         [("terminate_instances", {"InstanceIds": ["i-a", "i-b"]})])
-        self.assertEqual(sorted(ec2.enis), ["eni-i-c"])
-        self.assertEqual(sorted(ec2.volumes), ["vol-i-c"])
-        self.assertEqual(ec2.instances["i-c"]["State"]["Name"], "running", "another run touched")
-        self.assertEqual(ec2.instances["i-other"]["State"]["Name"], "running", "untagged instance touched")
+    def test_deletes_the_run_by_recorded_ids_in_dependency_order(self):
+        ec2, recorded = run_world()
+        run_world(ec2, run="r2", n="-other")
+        # a data ENI a half-failed launch left unattached, whose tags the lookup does not see
+        ec2.add("network-interface", "eni-untagged", None, Status="available")
+        recorded["network-interface"].append("eni-untagged")
+        self.assertEqual(clean(ec2, recorded), [])
+        self.assertEqual(left(ec2), [])
+        self.assertNotIn("eni-untagged", ec2.store["network-interface"])
+        self.assertEqual(len(left(ec2, "r2")), 15, "another run touched")
+        order = [kind for kind, _ in ec2.deleted]
+        self.assertEqual(set(order), {"network-interface", "key-pair", "placement-group", "security-group", "subnet",
+                                      "route-table", "internet-gateway", "vpc"})
+        self.assertEqual(order[-1], "vpc")
+        last_eni = max(i for i, k in enumerate(order) if k == "network-interface")
+        self.assertLess(last_eni, order.index("security-group"))
+        self.assertLess(last_eni, order.index("subnet"))
+        names = [c[0] for c in ec2.calls]
+        self.assertLess(names.index("disassociate_route_table"), names.index("delete_route_table"))
+        self.assertLess(names.index("detach_internet_gateway"), names.index("delete_internet_gateway"))
+
+    def test_a_recorded_id_no_describe_shows_yet_is_still_deleted(self):
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-fresh", Status="available")
+        ec2.hidden.add("eni-fresh")
+        recorded["network-interface"].append("eni-fresh")
+        self.assertEqual(clean(ec2, recorded), [])
+        self.assertIn(("network-interface", "eni-fresh"), ec2.deleted)
+
+    def test_tag_lookup_alone_cleans_a_leftover_run(self):
+        ec2, _ = run_world()
+        self.assertEqual(clean(ec2, {}), [])
+        self.assertEqual(left(ec2), [])
+        self.assertEqual(ec2.store["vpc"], {})
 
     def test_resources_on_later_pages_are_deleted(self):
         ec2 = FakeEc2()
         for k in range(5):
-            ec2.enis[f"eni-{k}"] = {"NetworkInterfaceId": f"eni-{k}", "Status": "available", "Tags": run_tag("r1")}
-            ec2.volumes[f"vol-{k}"] = {"VolumeId": f"vol-{k}", "State": "available", "Tags": run_tag("r1")}
+            ec2.add("network-interface", f"eni-{k}", Status="available")
+            ec2.add("volume", f"vol-{k}", State="available")
         self.assertEqual(clean(ec2), [])
-        self.assertEqual((ec2.enis, ec2.volumes), ({}, {}))
+        self.assertEqual((ec2.store["network-interface"], ec2.store["volume"]), ({}, {}))
 
     def test_in_use_eni_is_retried_until_it_frees(self):
-        ec2 = run_world()
-        ec2.enis["eni-detaching"] = {"NetworkInterfaceId": "eni-detaching", "Status": "in-use", "Tags": run_tag("r1"),
-                                     "_busy": 4}
-        ec2.volumes["vol-detaching"] = {"VolumeId": "vol-detaching", "State": "in-use", "Tags": run_tag("r1"),
-                                        "_busy": 3}
-        self.assertEqual(clean(ec2), [])
-        self.assertNotIn("eni-detaching", ec2.enis)
-        self.assertNotIn("vol-detaching", ec2.volumes)
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-detaching", Status="in-use", _busy=4)
+        ec2.add("volume", "vol-detaching", State="in-use", _busy=3)
+        self.assertEqual(clean(ec2, recorded), [])
+        self.assertNotIn("eni-detaching", ec2.store["network-interface"])
+        self.assertNotIn("vol-detaching", ec2.store["volume"])
 
-    def test_in_use_eni_that_never_frees_is_reported_not_declared_done(self):
-        ec2 = run_world()
-        ec2.enis["eni-stuck"] = {"NetworkInterfaceId": "eni-stuck", "Status": "in-use", "Tags": run_tag("r1")}
-        self.assertEqual(clean(ec2, deadline_s=60), ["network-interface eni-stuck (in-use, run r1)"])
-        self.assertEqual(ec2.instances["i-a"]["State"]["Name"], "terminated")
+    def test_in_use_eni_that_never_frees_is_listed_as_remaining(self):
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-stuck", Status="in-use", _vpc="vpc")
+        remaining = clean(ec2, recorded, deadline_s=120)
+        self.assertEqual(remaining, ["network-interface eni-stuck", "security-group sg", "subnet subnet", "vpc vpc"])
+        self.assertEqual(ec2.store["instance"]["i-0"]["State"]["Name"], "terminated")
 
     def test_a_failing_delete_does_not_stop_the_rest(self):
-        ec2 = run_world()
-        ec2.volumes["vol-loose"] = {"VolumeId": "vol-loose", "State": "available", "Tags": run_tag("r1")}
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-loose", Status="available")
+        ec2.add("volume", "vol-loose", State="available")
         ec2.fail["delete_network_interface"] = ClientError("UnauthorizedOperation", "not allowed")
-        self.assertEqual(clean(ec2, deadline_s=60), ["network-interface eni-loose (available, run r1)"])
-        self.assertNotIn("vol-loose", ec2.volumes)
-        self.assertEqual(ec2.instances["i-a"]["State"]["Name"], "terminated")
+        remaining = clean(ec2, recorded, deadline_s=120)
+        self.assertIn("network-interface eni-loose", remaining)
+        self.assertNotIn("vol-loose", ec2.store["volume"])
+        self.assertIn(("key-pair", "zhida-bench-r1"), ec2.deleted)
+        self.assertEqual(ec2.store["instance"]["i-0"]["State"]["Name"], "terminated")
 
     def test_second_cleanup_is_a_no_op(self):
-        ec2 = run_world()
-        clean(ec2)
+        ec2, recorded = run_world()
+        clean(ec2, recorded)
         ec2.calls.clear()
-        self.assertEqual(clean(ec2), [])
+        self.assertEqual(clean(ec2, {}), [])
         self.assertEqual(ec2.calls, [])
-
-
-def shared_world(tmp):
-    ec2 = FakeEc2()
-    ec2.vpcs["vpc-1"] = {"VpcId": "vpc-1", "Tags": SHARED}
-    ec2.subnets["subnet-1"] = {"SubnetId": "subnet-1", "VpcId": "vpc-1", "Tags": SHARED}
-    ec2.sgs["sg-default"] = {"GroupId": "sg-default", "GroupName": "default", "VpcId": "vpc-1"}
-    ec2.sgs["sg-1"] = {"GroupId": "sg-1", "GroupName": "zhida-bench", "VpcId": "vpc-1", "Tags": SHARED}
-    ec2.rts["rtb-main"] = {"RouteTableId": "rtb-main", "VpcId": "vpc-1",
-                           "Associations": [{"RouteTableAssociationId": "rtbassoc-main", "Main": True}]}
-    ec2.rts["rtb-1"] = {"RouteTableId": "rtb-1", "VpcId": "vpc-1", "Tags": SHARED,
-                        "Associations": [{"RouteTableAssociationId": "rtbassoc-1", "SubnetId": "subnet-1",
-                                          "Main": False}]}
-    ec2.igws["igw-1"] = {"InternetGatewayId": "igw-1", "Attachments": [{"VpcId": "vpc-1"}], "Tags": SHARED}
-    pem = os.path.join(tmp, "zhida-bench-ap-northeast-1.pem")
-    with open(pem, "w") as f:
-        f.write("key")
-    return ec2, pem
-
-
-class CleanSharedTest(unittest.TestCase):
-    def test_deletes_everything_in_order_and_is_idempotent(self):
-        ec2, pem = shared_world(tempfile.mkdtemp())
-        self.assertEqual(janitor.clean_shared(ec2, pem, log=lambda m: None), [])
-        names = [c[0] for c in ec2.calls]
-        self.assertLess(names.index("disassociate_route_table"), names.index("delete_route_table"))
-        self.assertLess(names.index("detach_internet_gateway"), names.index("delete_internet_gateway"))
-        for child in ("delete_security_group", "delete_route_table", "delete_subnet", "delete_internet_gateway"):
-            self.assertLess(names.index(child), names.index("delete_vpc"), child)
-        self.assertNotIn({"GroupId": "sg-default"}, [kw for n, kw in ec2.calls if n == "delete_security_group"])
-        self.assertFalse(os.path.exists(pem))
-        self.assertEqual((ec2.vpcs, ec2.igws, ec2.keys, ec2.pgs), ({}, {}, set(), set()))
-        # again: everything already gone, nothing raised, nothing left
-        self.assertEqual(janitor.clean_shared(ec2, pem, log=lambda m: None), [])
-
-    def test_refuses_while_run_resources_exist(self):
-        ec2, pem = shared_world(tempfile.mkdtemp())
-        ec2.enis["eni-r9"] = {"NetworkInterfaceId": "eni-r9", "Status": "available", "Tags": run_tag("r9")}
-        self.assertEqual(janitor.clean_shared(ec2, pem, log=lambda m: None),
-                         ["network-interface eni-r9 (available, run r9)"])
-        self.assertEqual(ec2.calls, [])
-        self.assertTrue(os.path.exists(pem))
-
-
-class FakeSts:
-    def get_caller_identity(self):
-        return {"Account": "123456789012"}
 
 
 class CleanupCommandTest(unittest.TestCase):
     def main(self, argv, ec2):
-        aws = z.Aws("ap-northeast-1", {"ec2": ec2, "ssm": None, "sts": FakeSts(), "service-quotas": None})
-        fast = functools.partial(janitor.clean_run, deadline_s=30, poll_s=10, sleep=lambda s: None,
+        aws = z.Aws("ap-northeast-1", {"ec2": ec2, "ssm": None, "sts": None, "service-quotas": None})
+        fast = functools.partial(janitor.clean_run, deadline_s=120, poll_s=10, sleep=lambda s: None,
                                  clock=iter(range(0, 100000, 10)).__next__)
         out = io.StringIO()
         with mock.patch.object(z.janitor, "clean_run", fast), contextlib.redirect_stdout(out):
             code = z.main(argv, z.Env(aws=lambda region: aws))
         return code, out.getvalue()
 
-    def test_run_id_exit_status_follows_what_remains(self):
-        code, out = self.main(["cleanup", "--run-id", "r1"], run_world())
+    def test_run_id_uses_the_recorded_ids_and_the_tags(self):
+        out_dir = tempfile.mkdtemp()
+        os.makedirs(os.path.join(out_dir, "r1"))
+        created = janitor.Created(os.path.join(out_dir, "r1", "created.json"))
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-untagged", None, Status="available")
+        for kind, ids in recorded.items():
+            for rid in ids:
+                created.add(kind, rid)
+        created.add("network-interface", "eni-untagged")
+        self.assertEqual(janitor.read_created(created.path), created.ids)
+        code, out = self.main(["cleanup", "--run-id", "r1", "--out", out_dir], ec2)
         self.assertEqual(code, 0, out)
+        self.assertIn("run r1: 12 recorded IDs from", out)
         self.assertIn("run r1: nothing left", out)
-        ec2 = run_world()
-        ec2.enis["eni-stuck"] = {"NetworkInterfaceId": "eni-stuck", "Status": "in-use", "Tags": run_tag("r1")}
-        code, out = self.main(["cleanup", "--run-id", "r1"], ec2)
+        self.assertNotIn("eni-untagged", ec2.store["network-interface"])
+
+    def test_exit_status_follows_what_remains(self):
+        ec2, _ = run_world()
+        ec2.add("network-interface", "eni-stuck", Status="in-use")
+        code, out = self.main(["cleanup", "--run-id", "r1", "--out", tempfile.mkdtemp()], ec2)
         self.assertEqual(code, 1)
+        self.assertIn("tag lookup only", out)
         self.assertIn("STILL PRESENT after teardown", out)
-        self.assertIn("eni-stuck", out)
-
-    def test_shared_uses_the_runner_names(self):
-        tmp = tempfile.mkdtemp()
-        ec2, _ = shared_world(tmp)
-        pem = os.path.join(tmp, "zhida-bench-ap-northeast-1.pem")
-        with mock.patch.object(z, "KEY_DIR", tmp):
-            code, out = self.main(["cleanup", "--shared"], ec2)
-        self.assertEqual(code, 0, out)
-        self.assertFalse(os.path.exists(pem))
-        self.assertIn("cleanup --shared: nothing left", out)
-
-    def test_shared_refusal_exits_non_zero(self):
-        ec2, _ = shared_world(tempfile.mkdtemp())
-        ec2.instances["i-r9"] = {"InstanceId": "i-r9", "State": {"Name": "running"}, "Tags": run_tag("r9")}
-        code, out = self.main(["cleanup", "--shared"], ec2)
-        self.assertEqual(code, 1)
-        self.assertIn("STILL PRESENT: instance i-r9 (running, run r9)", out)
+        self.assertIn("network-interface eni-stuck", out)
 
 
 if __name__ == "__main__":
