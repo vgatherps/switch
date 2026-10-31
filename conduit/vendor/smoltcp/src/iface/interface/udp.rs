@@ -162,13 +162,6 @@ impl Interface {
             let (headers, payload) = frame.headroom_mut(UDP_FRAME_HEADER_LEN);
             template.emit_header(headers, ip_repr, payload, &checksum_caps);
             token.consume(frame.into_buf(), UDP_FRAME_HEADER_LEN, tx_checksum);
-            #[cfg(test)]
-            {
-                udp.template_frames = udp
-                    .template_frames
-                    .checked_add(1)
-                    .expect("UDP template frame count overflow");
-            }
             self.inner.dispatch_neighbor_probe(device);
             return Ok(());
         }

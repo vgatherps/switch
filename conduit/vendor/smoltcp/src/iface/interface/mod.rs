@@ -167,8 +167,6 @@ pub struct InterfaceInner {
     caps: DeviceCapabilities,
     now: Instant,
     pub(crate) tcp_isn_secret: [u64; 2],
-    #[cfg(test)]
-    pub(crate) template_frames: usize,
 
     neighbor_cache: NeighborCache,
     probe_owed: Option<Ipv4Address>,
@@ -273,8 +271,6 @@ impl Interface {
                 neighbor_cache: NeighborCache::new(config.neighbor_capacity),
                 probe_owed: None,
                 tcp_isn_secret,
-                #[cfg(test)]
-                template_frames: 0,
             },
         }
     }
@@ -714,8 +710,6 @@ impl Interface {
 
             let mut end_poll_at = None;
             let result = loop {
-                #[cfg(test)]
-                sockets.dispatches.push(index);
                 let item = sockets.item_at_mut(index).expect("ready TCP slot is empty");
                 let before = item.socket.state();
                 let next_hop = &mut item.meta.next_hop;
@@ -914,10 +908,6 @@ pub(crate) fn classify(
         let socket_poll_at = item.socket.poll_at(inner);
         classify_polled(inner, sockets, index, timestamp, socket_poll_at);
     } else {
-        #[cfg(test)]
-        {
-            sockets.classify_calls += 1;
-        }
         sockets.set_deadline(index, PollAt::Ingress, false);
     }
 }
@@ -929,10 +919,6 @@ pub(crate) fn classify_polled(
     timestamp: Instant,
     socket_poll_at: PollAt,
 ) {
-    #[cfg(test)]
-    {
-        sockets.classify_calls += 1;
-    }
     let item = sockets.item_at_mut(index).expect("ready TCP slot is empty");
     let deadline = item.meta.poll_at(
         socket_poll_at,
@@ -958,19 +944,11 @@ fn classify_dirty(
     };
     if rescan_waiting {
         for position in 0..sockets.waiting.len() {
-            #[cfg(test)]
-            {
-                sockets.slot_visits += 1;
-            }
             sockets.mark_dirty(sockets.waiting[position]);
         }
     }
     sockets.dirty_list.sort_unstable();
     for position in 0..sockets.dirty_list.len() {
-        #[cfg(test)]
-        {
-            sockets.slot_visits += 1;
-        }
         let index = sockets.dirty_list[position];
         classify(inner, sockets, index, timestamp);
     }

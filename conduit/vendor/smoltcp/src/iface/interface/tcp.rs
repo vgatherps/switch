@@ -83,15 +83,7 @@ impl InterfaceInner {
         let tx_checksum = self.tx_checksum(&ip, TCP_HEADER_LEN);
         let (headers, payload) = frame.headroom_mut(header_len);
         template.emit_header(headers, &ip4, &tcp, payload, &self.caps.checksum);
-        let frame = frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum);
-        #[cfg(test)]
-        {
-            self.template_frames = self
-                .template_frames
-                .checked_add(1)
-                .expect("TCP template frame count overflow");
-        }
-        frame
+        frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum)
     }
 
     pub(super) fn dispatch_tcp<Tx: TxToken>(
@@ -149,13 +141,6 @@ impl InterfaceInner {
             tx.consume(14 + 20 + ip4.payload_len, |frame| {
                 template.as_ref().unwrap().emit(frame, &ip4, &tcp, &self.caps.checksum)
             });
-            #[cfg(test)]
-            {
-                self.template_frames = self
-                    .template_frames
-                    .checked_add(1)
-                    .expect("TCP template frame count overflow");
-            }
             return Ok(());
         }
 

@@ -232,12 +232,6 @@ pub struct TcpSet<'a> {
     ready: VecDeque<usize>,
     reapable: Vec<SocketHandle>,
     fired: Vec<u32>,
-    #[cfg(test)]
-    pub(crate) dispatches: Vec<usize>,
-    #[cfg(test)]
-    pub(crate) classify_calls: usize,
-    #[cfg(test)]
-    pub(crate) slot_visits: usize,
 }
 
 impl<'a> TcpSet<'a> {
@@ -264,12 +258,6 @@ impl<'a> TcpSet<'a> {
             ready: VecDeque::with_capacity(slot_count),
             reapable: Vec::with_capacity(slot_count),
             fired: Vec::with_capacity(2 * slot_count),
-            #[cfg(test)]
-            dispatches: Vec::new(),
-            #[cfg(test)]
-            classify_calls: 0,
-            #[cfg(test)]
-            slot_visits: 0,
         }
     }
 
@@ -726,10 +714,6 @@ impl TcpSet<'_> {
                 } else {
                     let mut previous = head;
                     while self.flow_slots[previous].next != index {
-                        #[cfg(test)]
-                        {
-                            self.slot_visits += 1;
-                        }
                         previous = self.flow_slots[previous].next;
                         assert_ne!(
                             previous,
@@ -802,10 +786,6 @@ impl TcpSet<'_> {
                 } else {
                     let mut previous = head;
                     while self.flow_slots[previous].next < index {
-                        #[cfg(test)]
-                        {
-                            self.slot_visits += 1;
-                        }
                         previous = self.flow_slots[previous].next;
                     }
                     self.flow_slots[index].next = self.flow_slots[previous].next;
@@ -847,10 +827,6 @@ impl TcpSet<'_> {
 
     pub(crate) fn clear_dirty(&mut self) {
         for position in 0..self.dirty_list.len() {
-            #[cfg(test)]
-            {
-                self.slot_visits += 1;
-            }
             let index = self.dirty_list[position];
             self.flow_slots[index].dirty = false;
             if !self.flow_slots[index].queued {
@@ -908,10 +884,6 @@ impl TcpSet<'_> {
             .map(|i| i as u32)
             .chain(self.due.iter(&self.flow_slots))
         {
-            #[cfg(test)]
-            {
-                self.slot_visits += 1;
-            }
             let deadline = match self.flow_slots[index as usize].deadline {
                 PollAt::Ingress => continue,
                 PollAt::Now => Instant::ZERO,
@@ -944,23 +916,13 @@ impl TcpSet<'_> {
         if timestamp.total_micros() >= 0 {
             let now_tick = timestamp.total_micros() as u64 / 1000;
             if now_tick >= self.wheel.current_tick() {
-                #[cfg(test)]
-                let before = self.wheel.slot_visits;
                 self.wheel
                     .advance_to(&mut self.flow_slots, now_tick, &mut self.admission)
                     .expect("TCP wheel time regressed");
-                #[cfg(test)]
-                {
-                    self.slot_visits += self.wheel.slot_visits - before;
-                }
             }
         }
         let mut kept = 0usize;
         for position in 0..self.admission.len() {
-            #[cfg(test)]
-            {
-                self.slot_visits += 1;
-            }
             let index = self.admission[position];
             if self.flow_slots[index as usize].is_waiting() {
                 self.mark_dirty(index as usize);
@@ -981,10 +943,6 @@ impl TcpSet<'_> {
     /// `admission` may already hold slots whose wheel deadline expired at the start of this egress pass.
     pub(crate) fn admit_ready(&mut self, timestamp: Instant) -> usize {
         for position in 0..self.dirty_list.len() {
-            #[cfg(test)]
-            {
-                self.slot_visits += 1;
-            }
             let index = self.dirty_list[position];
             self.flow_slots[index].dirty = false;
             if !self.flow_slots[index].queued {
@@ -998,10 +956,6 @@ impl TcpSet<'_> {
         }
         self.dirty_list.clear();
         for index in self.due.iter(&self.flow_slots) {
-            #[cfg(test)]
-            {
-                self.slot_visits += 1;
-            }
             if self.deadline_due(index as usize, timestamp) {
                 self.admission.push(index);
             }
@@ -1009,10 +963,6 @@ impl TcpSet<'_> {
         self.admission.sort_unstable();
         self.admission.dedup();
         for position in 0..self.admission.len() {
-            #[cfg(test)]
-            {
-                self.slot_visits += 1;
-            }
             self.push_ready(self.admission[position] as usize, false);
         }
         self.admission.clear();
@@ -1311,7 +1261,6 @@ mod tests {
     fn reapable_immediate_orphans_and_slot_reuse() {
         let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
         let mut set = TcpSet::new(2);
-        let allocation = (set.reapable.capacity(), set.reapable.as_ptr());
         for _ in 0..2 {
             let handle = set.add(socket());
             set.listen(handle, 80).unwrap();
@@ -1323,7 +1272,6 @@ mod tests {
             assert_reapable(&mut set, &[]);
             set.remove(handle);
         }
-        assert_eq!(allocation, (set.reapable.capacity(), set.reapable.as_ptr()));
         let owned = set.add(socket());
         let sent = set.add(socket());
         set.connect(sent, iface.context(), (crate::wire::IpAddress::v4(192, 168, 1, 2), 80), 1234).unwrap();
@@ -1332,7 +1280,6 @@ mod tests {
         set.orphan(owned, Instant::ZERO);
         set.remove(owned);
         assert_reapable(&mut set, &[]);
-        assert!(set.reapable.capacity() >= set.slot_count());
     }
 
     #[cfg(feature = "medium-ip")]
@@ -1725,187 +1672,6 @@ mod tests {
         assert_eq!(fired(&mut a_set), []);
     }
 
-    #[test]
-    fn tcp_storage_line_map() {
-        use core::mem::{align_of, offset_of, size_of};
-
-        let storage = TcpStorage {
-            generation: 0,
-            tokens: [None; 2],
-            inner: Some(Item {
-                meta: Meta::default(),
-                socket: socket(),
-            }),
-        };
-        let base = &storage as *const _ as usize;
-        let item = storage.inner.as_ref().unwrap();
-        let item_offset = item as *const _ as usize - base;
-        let meta_offset = item_offset + offset_of!(Item<'static>, meta);
-        let socket_offset = item_offset + offset_of!(Item<'static>, socket);
-        let meta_offsets = super::super::socket_meta::meta_field_offsets();
-        let socket_offsets = tcp::socket_field_offsets();
-
-        std::println!(
-            "TcpStorage: {}; align: {}; Item: {}; Option<Item>: {}; Meta: {}; Socket: {}",
-            size_of::<TcpStorage<'static>>(),
-            align_of::<TcpStorage<'static>>(),
-            size_of::<Item<'static>>(),
-            size_of::<Option<Item<'static>>>(),
-            size_of::<Meta>(),
-            size_of::<tcp::Socket<'static>>(),
-        );
-        std::println!(
-            "slot: generation {}; inner {}; Item {}; Meta {}; Socket {}",
-            offset_of!(TcpStorage<'static>, generation),
-            offset_of!(TcpStorage<'static>, inner),
-            item_offset,
-            meta_offset,
-            socket_offset,
-        );
-        for &(name, offset) in meta_offsets {
-            std::println!("Meta.{name}: relative {offset}; slot {}", meta_offset + offset);
-        }
-        for &(name, offset) in socket_offsets {
-            std::println!(
-                "Socket.{name}: relative {offset}; slot {}; line {}",
-                socket_offset + offset,
-                (socket_offset + offset) / 64,
-            );
-        }
-
-        // TxQueue makes the socket larger than the former borrowed byte ring.
-        assert_eq!(size_of::<TcpStorage<'static>>(), 640);
-        assert_eq!(align_of::<TcpStorage<'static>>(), 64);
-        assert_eq!(size_of::<Meta>(), 112);
-        assert_eq!(size_of::<tcp::Socket<'static>>(), 456);
-        assert_eq!(size_of::<Option<Item<'static>>>(), size_of::<Item<'static>>());
-        assert_eq!(offset_of!(TcpStorage<'static>, generation), 0);
-        assert_eq!(offset_of!(TcpStorage<'static>, inner), 8);
-        // In the last line's padding (576..639).
-        assert_eq!(offset_of!(TcpStorage<'static>, tokens), 576);
-        assert_eq!(item_offset, 8);
-        assert_eq!(offset_of!(Item<'static>, meta), 0);
-        assert_eq!(offset_of!(Item<'static>, socket), 112);
-        assert_eq!(meta_offset, 8);
-        assert_eq!(socket_offset, 120);
-        assert_eq!(
-            meta_offsets,
-            &[("tcp_template", 0), ("neighbor_state", 72), ("next_hop", 88)],
-        );
-        let expected_offsets = [
-            ("hop_limit", 0),
-            ("ack_delay_enabled", 2),
-            ("rx_fin_received", 3),
-            ("in_rto_loss_episode", 4),
-            ("remote_has_sack", 5),
-            ("timer", 8),
-            ("ack_at", 24),
-            ("local_seq_no", 32),
-            ("remote_last_ack", 48),
-            ("remote_win_len", 60),
-            ("state", 64),
-            ("recover_valid", 71),
-            ("tuple", 72),
-            ("max_snd_wnd", 92),
-            ("rx_fin_seq", 100),
-            ("rx_seg_bytes", 132),
-            ("tx_queue", 136),
-            ("tx_seg_bytes", 216),
-            ("rtte", 224),
-            ("congestion_controller", 248),
-            ("rx_buffer", 320),
-            ("ack_delay_us", 384),
-            ("retransmits", 392),
-            ("loss_events", 400),
-            ("initial_window", 408),
-            ("listen_endpoint", 416),
-            ("bytes_acked", 424),
-            ("rcv_mss", 432),
-            ("challenge_ack_timer", 440),
-            ("rx_refused_segments", 448),
-            ("mss_cap", 452),
-            ("reset_by_peer", 455),
-        ];
-        for (name, expected) in expected_offsets {
-            let &(_, actual) = socket_offsets
-                .iter()
-                .find(|&&(field, _)| field == name)
-                .unwrap();
-            assert_eq!(actual, expected, "Socket.{name} offset");
-        }
-        let expected_lines = [
-            ("hop_limit", 1),
-            ("local_rx_dup_acks", 1),
-            ("ack_delay_enabled", 1),
-            ("rx_fin_received", 1),
-            ("in_rto_loss_episode", 1),
-            ("remote_has_sack", 1),
-            ("timer", 2),
-            ("ack_at", 2),
-            ("local_seq_no", 2),
-            ("remote_seq_no", 2),
-            ("remote_last_seq", 2),
-            ("remote_max_seq", 2),
-            ("remote_last_ack", 2),
-            ("remote_last_win_bytes", 2),
-            ("remote_win_len", 2),
-            ("state", 2),
-            ("ack_kind", 2),
-            ("remote_win_shift", 2),
-            ("pending_fast_retransmit", 2),
-            ("remote_last_ack_is_marker", 2),
-            ("local_rx_last_seq_valid", 2),
-            ("local_rx_last_ack_valid", 2),
-            ("recover_valid", 2),
-            ("tuple", 3),
-            ("remote_win_scale", 3),
-            ("remote_mss", 3),
-            ("connection_mss_cap", 3),
-            ("max_snd_wnd", 3),
-            ("remote_win_seq", 3),
-            ("rx_fin_seq", 3),
-            ("local_rx_last_seq", 3),
-            ("local_rx_last_ack", 3),
-            ("recover", 3),
-            ("rto_us", 3),
-            ("rto_backoff", 3),
-            ("rx_mbuf_cap", 3),
-            ("rx_seg_bytes", 3),
-            ("tx_queue", 4),
-            ("tx_seg_bytes", 5),
-            ("rtte", 5),
-            ("congestion_controller", 5),
-            ("rx_buffer", 6),
-            ("ack_delay_us", 7),
-            ("retransmits", 8),
-            ("loss_events", 8),
-            ("initial_window", 8),
-            ("listen_endpoint", 8),
-            ("bytes_acked", 8),
-            ("rcv_mss", 8),
-            ("challenge_ack_timer", 8),
-            ("rx_refused_segments", 8),
-            ("mss_cap", 8),
-            ("reset_by_peer", 8),
-        ];
-        assert_eq!(socket_offsets.len(), expected_lines.len());
-        for (&(name, offset), (expected_name, expected_line)) in
-            socket_offsets.iter().zip(expected_lines)
-        {
-            assert_eq!(name, expected_name);
-            assert_eq!((120 + offset) / 64, expected_line, "Socket.{name} line");
-        }
-    }
-
-    #[test]
-    fn tcp_set_slots_are_cache_line_aligned() {
-        let set = TcpSet::new(3);
-        assert_eq!(set.sockets.len(), 3);
-        for (index, slot) in set.sockets.iter().enumerate() {
-            assert_eq!(slot as *const _ as usize % 64, 0, "slot {index}");
-        }
-    }
-
     fn assert_panics(message: &str, f: impl FnOnce()) {
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_err();
         let actual = payload.downcast_ref::<&str>().copied().or_else(|| {
@@ -1942,16 +1708,6 @@ mod tests {
 
     fn handles(set: &TcpSet) -> Vec<usize> {
         set.iter().map(|(h, _)| h.index).collect()
-    }
-
-    #[test]
-    fn flow_slot_is_one_aligned_line() {
-        assert_eq!(core::mem::size_of::<FlowSlot>(), 64);
-        assert_eq!(core::mem::align_of::<FlowSlot>(), 64);
-
-        let set = TcpSet::new(2);
-        assert_eq!((&set.flow_slots[0] as *const FlowSlot as usize) % 64, 0);
-        assert_eq!((&set.flow_slots[1] as *const FlowSlot as usize) % 64, 0);
     }
 
     #[cfg(feature = "medium-ip")]

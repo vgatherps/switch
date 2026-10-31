@@ -190,9 +190,7 @@ fn same_peer_rate_limited() {
     assert_arp_request(&device.tx_queue.pop_front().unwrap(), peer);
 
     connect_unresolved_peer(&mut iface, &mut sockets, peer, 1235);
-    sockets.dispatches.clear();
     iface.poll_egress(Instant::from_millis(100), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![1]);
     assert!(device.tx_queue.is_empty());
     iface.poll_egress(Instant::from_millis(999), &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());

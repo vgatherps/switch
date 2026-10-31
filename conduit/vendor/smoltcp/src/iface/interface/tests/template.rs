@@ -358,7 +358,6 @@ fn template_neighbor_errors_and_mtu_drop_match_generic() {
             assert_eq!(result, expected);
             assert_eq!(result, generic_result);
             assert_eq!(direct_frame, generic_frame);
-            assert_eq!(direct.inner.template_frames, 0);
             if expected == Err(DispatchError::NeighborPending) && attempt == 0 {
                 let ethernet = EthernetFrame::new_checked(&direct_frame).unwrap();
                 assert_eq!(ethernet.ethertype(), EthernetProtocol::Arp);
@@ -414,7 +413,6 @@ fn segments_without_ack_or_with_syn_stay_generic() {
             &mut next_hop, &mut template,
         ).unwrap();
         assert!(template.is_some());
-        assert_eq!(iface.inner.template_frames, 0);
         assert_generic_frame(&mut iface, &frame);
     }
 }

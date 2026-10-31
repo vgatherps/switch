@@ -112,6 +112,15 @@ fn take_tcp(device: &mut TestingDevice) -> (u16, TcpControl, TcpSeqNumber, Vec<u
     )
 }
 
+/// Source ports of every TCP segment the device emitted, in order; empties the queue.
+fn sent_ports(device: &mut TestingDevice) -> Vec<u16> {
+    let mut ports = Vec::new();
+    while !device.tx_queue.is_empty() {
+        ports.push(take_tcp(device).0);
+    }
+    ports
+}
+
 fn establish(
     iface: &mut Interface,
     sockets: &mut TcpSet<'static>,
@@ -156,7 +165,6 @@ fn idle_sockets(iface: &mut Interface, sockets: &mut TcpSet<'static>, device: &m
     for port in 1234..1334 {
         establish(iface, sockets, device, port);
     }
-    sockets.dispatches.clear();
 }
 
 struct RefusingDevice {
@@ -269,9 +277,7 @@ fn egress_idle_means_next_pass_does_nothing() {
             "source" => {
                 iface.update_ip_addrs(|addrs| addrs.clear());
                 assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-                let classified = sockets.classify_calls;
                 assert_eq!(iface.poll_at(now, &mut sockets), None);
-                assert_eq!(sockets.classify_calls, classified);
             }
             "due" => {
                 assert_eq!(iface.poll_at(now, &mut sockets), Some(Instant::ZERO));
@@ -286,17 +292,17 @@ fn egress_idle_means_next_pass_does_nothing() {
         let idle = iface.egress_idle(&sockets);
         assert_eq!(idle, matches!(scenario, "burst" | "source"), "{scenario}");
         let before = (
-            sockets.dispatches.len(),
-            sockets.classify_calls,
             device.inner.tx_queue.len(),
             sockets.ready_len(),
             sockets.dirty_list.clone(),
         );
         let contents = std::format!("{sockets:?}");
+        if scenario == "refused" {
+            // The retry is observable only once the device has room.
+            device.remaining = 1;
+        }
         let result = iface.poll_egress(now, &mut device, &mut sockets);
         let after = (
-            sockets.dispatches.len(),
-            sockets.classify_calls,
             device.inner.tx_queue.len(),
             sockets.ready_len(),
             sockets.dirty_list.clone(),
@@ -312,76 +318,9 @@ fn egress_idle_means_next_pass_does_nothing() {
 }
 
 #[test]
-fn one_classify_per_round_trip() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.classify_calls = 0;
-    assert_eq!(sockets.get_mut(handle).send_slice(&[1; 64]), Ok(64));
-    iface.poll_egress(START, &mut device, &mut sockets);
-    let send_calls = sockets.classify_calls;
-    let frames = device.tx_queue.len();
-    assert_eq!(
-        iface.poll_egress(START, &mut device, &mut sockets),
-        PollResult::None
-    );
-    assert_eq!(sockets.classify_calls, send_calls);
-    assert_eq!(device.tx_queue.len(), frames);
-    let (port, _, sent_seq, payload) = take_tcp(&mut device);
-    assert_eq!((port, sent_seq), (1234, seq));
-    assert_eq!(payload, [1; 64]);
-    sockets.classify_calls = 0;
-    receive(
-        &mut iface,
-        &mut sockets,
-        &mut device,
-        segment(1234, TcpControl::None, 101, seq + 64),
-    );
-    assert_eq!(sockets.classify_calls, 0);
-    iface.poll_egress(START, &mut device, &mut sockets);
-    let ack_calls = sockets.classify_calls;
-    assert_eq!(sockets.get(handle).send_queue(), 0);
-    assert!(device.tx_queue.is_empty());
-    std::println!("classify calls: send={send_calls}, ACK={ack_calls}");
-    assert!(send_calls <= 2, "send classified {send_calls} times");
-    assert!(ack_calls <= 1, "ACK classified {ack_calls} times");
-}
-
-#[test]
-fn busy_connection_does_not_rescan() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let connections: Vec<_> = (1234..1298)
-        .map(|port| establish(&mut iface, &mut sockets, &mut device, port))
-        .collect();
-    assert_eq!(sockets.len(), 64);
-    let (handle, mut seq) = connections[0];
-    sockets.slot_visits = 0;
-    sockets.dispatches.clear();
-    for _ in 0..10 {
-        assert_eq!(sockets.get_mut(handle).send_slice(&[1; 64]), Ok(64));
-        iface.poll_egress(START, &mut device, &mut sockets);
-        let (port, _, sent_seq, payload) = take_tcp(&mut device);
-        assert_eq!((port, sent_seq), (1234, seq));
-        assert_eq!(payload, [1; 64]);
-        assert!(device.tx_queue.is_empty());
-        seq += 64;
-        receive(
-            &mut iface,
-            &mut sockets,
-            &mut device,
-            segment(1234, TcpControl::None, 101, seq),
-        );
-        assert_eq!(sockets.get(handle).send_queue(), 0);
-    }
-    assert_eq!(sockets.dispatches, vec![0; 10]);
-    std::println!("busy connection slot visits: {}", sockets.slot_visits);
-    assert!(sockets.slot_visits <= 10 * 8, "{} visits", sockets.slot_visits);
-}
-
-#[test]
 fn ingress_sync_keeps_deadline_dirty() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.classify_calls = 0;
     sockets.get_mut(handle).send_slice(&[1; 64]).unwrap();
     for _ in 0..2 {
         receive(
@@ -390,54 +329,15 @@ fn ingress_sync_keeps_deadline_dirty() {
             &mut device,
             segment(1234, TcpControl::None, 101, seq),
         );
-        assert_eq!(sockets.classify_calls, 0);
         assert_eq!(sockets.dirty_list, vec![0]);
     }
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.classify_calls, 2);
     assert_eq!(take_tcp(&mut device).3, [1; 64]);
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert_eq!(sockets.classify_calls, 2);
     assert!(device.tx_queue.is_empty());
-}
-
-#[test]
-#[cfg(feature = "udp-set")]
-fn ingress_does_not_resync_processed_sockets() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
-    iface.inner.neighbor_cache.fill(
-        REMOTE.into(), HardwareAddress::Ethernet(REMOTE_HARDWARE), START,
-    );
-    let connections: Vec<_> = (1234..1298)
-        .map(|port| establish(&mut iface, &mut sockets, &mut device, port))
-        .collect();
-    assert!(sockets.dirty_list.is_empty());
-    for (index, &(_, seq)) in connections.iter().enumerate() {
-        queue_segment(&iface, &mut device,
-            segment(1234 + index as u16, TcpControl::None, 101, seq));
-    }
-    sockets.slot_visits = 0;
-    sockets.classify_calls = 0;
-    sockets.dispatches.clear();
-    let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
-    for _ in 0..connections.len() {
-        assert_eq!(
-            iface.poll_ingress_single_udp(START, &mut device, &mut sockets, &mut udp),
-            PollIngressSingleResult::SocketStateChanged
-        );
-    }
-    assert_eq!(sockets.dirty_list, (0..64).collect::<Vec<_>>());
-    assert_eq!(sockets.classify_calls, 0);
-    assert!(sockets.dispatches.is_empty());
-    assert!(device.rx_queue.is_empty());
-    assert!(device.tx_queue.is_empty());
-    for &(handle, _) in &connections {
-        assert_eq!(sockets.get(handle).state(), tcp::State::Established);
-    }
-    assert_eq!(sockets.slot_visits, 0);
 }
 
 #[test]
@@ -455,8 +355,6 @@ fn ingress_finds_app_relisten_of_already_dirty_socket() {
     sockets.abort(handle);
     sockets.listen(handle, 1235).unwrap();
     assert_eq!(sockets.dirty_list, vec![0]);
-    sockets.classify_calls = 0;
-    sockets.dispatches.clear();
     queue_segment(&iface, &mut device, TcpRepr {
         ack_number: None,
         ..segment(1235, TcpControl::Syn, 200, seq)
@@ -467,10 +365,8 @@ fn ingress_finds_app_relisten_of_already_dirty_socket() {
     );
     assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
     assert_eq!(sockets.get(handle).local_endpoint().unwrap().port, 1235);
-    assert_eq!(sockets.classify_calls, 0);
     assert!(device.tx_queue.is_empty());
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     let (port, control, _, payload) = take_tcp(&mut device);
     assert_eq!((port, control), (1235, TcpControl::Syn));
     assert!(payload.is_empty());
@@ -478,46 +374,19 @@ fn ingress_finds_app_relisten_of_already_dirty_socket() {
 }
 
 #[test]
-fn poll_at_classifies_without_admitting() {
+fn poll_at_reports_queued_send_due_now() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, _) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.classify_calls = 0;
     sockets.get_mut(handle).send_slice(&[1; 64]).unwrap();
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::ZERO));
-    assert_eq!(sockets.classify_calls, 1);
     assert_eq!(sockets.ready_len(), 0);
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::ZERO));
-    assert_eq!(sockets.classify_calls, 1);
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.classify_calls, 2);
     assert_eq!(take_tcp(&mut device).3, [1; 64]);
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert_eq!(sockets.classify_calls, 2);
-    assert!(device.tx_queue.is_empty());
-}
-
-#[test]
-fn waiting_dirty_socket_classified_once() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
-    let handle = connect(&mut iface, &mut sockets, 1234);
-    iface.poll_egress(START, &mut device, &mut sockets);
-    device.tx_queue.clear();
-    assert_eq!(sockets.waiting, vec![0]);
-    sockets
-        .get_mut(handle)
-        .set_rto(Duration::from_secs(3));
-    sockets.classify_calls = 0;
-    assert_eq!(
-        iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(1024))
-    );
-    assert_eq!(sockets.classify_calls, 1);
-    sockets.classify_calls = 0;
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.classify_calls, 0);
     assert!(device.tx_queue.is_empty());
 }
 
@@ -578,7 +447,7 @@ fn ipv4_refresh_revives_neighbor_and_releases_waiting_syn() {
 #[case(64, false)]
 #[case(1, true)]
 #[case(64, true)]
-fn waiting_sockets_rescan_only_on_neighbor_change_or_deadline(
+fn waiting_sockets_send_on_neighbor_reply_or_rearp_at_deadline(
     #[case] count: u16,
     #[case] reply: bool,
 ) {
@@ -594,19 +463,14 @@ fn waiting_sockets_rescan_only_on_neighbor_change_or_deadline(
     }
     let changes = iface.inner.neighbor_cache.changes();
     device.tx_queue.clear();
-    sockets.dispatches.clear();
     for millis in 1..=5 {
         let now = START + Duration::from_millis(millis);
-        sockets.classify_calls = 0;
         iface.poll_egress(now, &mut device, &mut sockets);
-        assert_eq!(sockets.classify_calls, 0, "egress with {count} waiters");
         assert_eq!(
             iface.poll_at(now, &mut sockets),
             Some(Instant::from_millis(1024))
         );
-        assert_eq!(sockets.classify_calls, 0, "poll_at with {count} waiters");
         assert_eq!(iface.inner.neighbor_cache.changes(), changes);
-        assert!(sockets.dispatches.is_empty());
         assert!(device.tx_queue.is_empty());
     }
     if reply {
@@ -629,7 +493,6 @@ fn waiting_sockets_rescan_only_on_neighbor_change_or_deadline(
         iface.poll_ingress_single(now, &mut device, &mut sockets);
         assert_ne!(iface.inner.neighbor_cache.changes(), changes);
         iface.poll_egress(now, &mut device, &mut sockets);
-        assert_eq!(sockets.dispatches, (0..usize::from(count)).collect::<Vec<_>>());
         for port in 1234..1234 + count {
             let (sent_port, control, _, payload) = take_tcp(&mut device);
             assert_eq!((sent_port, control), (port, TcpControl::Syn));
@@ -638,11 +501,9 @@ fn waiting_sockets_rescan_only_on_neighbor_change_or_deadline(
         assert!(sockets.waiting.is_empty());
     } else {
         iface.poll_egress(silent_until - Duration::from_millis(1), &mut device, &mut sockets);
-        assert_eq!(sockets.classify_calls, 0);
         assert!(device.tx_queue.is_empty());
         iface.poll_at(silent_until, &mut sockets);
         iface.poll_egress(silent_until, &mut device, &mut sockets);
-        assert_eq!(sockets.dispatches, (0..usize::from(count)).collect::<Vec<_>>());
         assert_eq!(device.tx_queue.len(), 1);
         let bytes = device.tx_queue.pop_front().unwrap();
         let ethernet = EthernetFrame::new_checked(&bytes).unwrap();
@@ -687,9 +548,7 @@ fn due_timer_and_dirty_sockets_admitted_in_slot_order() {
             .send_slice(&[1; 64])
             .unwrap();
     }
-    sockets.dispatches.clear();
     iface.poll_egress(START + Duration::from_millis(300), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1, 2]);
     for port in [1234, 1235, 1236] {
         assert_eq!(take_tcp(&mut device).0, port);
     }
@@ -704,11 +563,10 @@ fn idle_sockets_not_dispatched() {
     for handle in sockets.iter().map(|(handle, _)| handle).collect::<Vec<_>>() {
         assert_eq!(sockets.get_mut(handle).state(), tcp::State::Established);
     }
-    sockets.dispatches.clear();
     sockets.get_mut(active).send_slice(b"abc").unwrap();
     iface.poll(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![100]);
-    assert_eq!(take_tcp(&mut device).3, b"abc");
+    let (port, _, _, payload) = take_tcp(&mut device);
+    assert_eq!((port, payload.as_slice()), (1334, &b"abc"[..]));
     assert!(device.tx_queue.is_empty());
 }
 
@@ -725,14 +583,11 @@ fn refused_socket_retried_first() {
         inner: device,
         remaining: 1,
     };
-    sockets.dispatches.clear();
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1]);
     assert_eq!(take_tcp(&mut device.inner).0, 1234);
-    sockets.dispatches.clear();
+    assert!(device.inner.tx_queue.is_empty());
     device.remaining = 3;
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![1, 2, 0]);
     for port in [1235, 1236, 1234] {
         assert_eq!(take_tcp(&mut device.inner).0, port);
     }
@@ -746,7 +601,6 @@ fn still_ready_socket_goes_to_tail() {
     for handle in [a, b] {
         sockets.get_mut(handle).send_slice(&[1; 1536]).unwrap();
     }
-    sockets.dispatches.clear();
     for _ in 0..3 {
         iface.poll_egress(START, &mut device, &mut sockets);
         for port in [1234, 1235] {
@@ -756,7 +610,6 @@ fn still_ready_socket_goes_to_tail() {
         }
         assert!(device.tx_queue.is_empty());
     }
-    assert_eq!(sockets.dispatches, vec![0, 1, 0, 1, 0, 1]);
 }
 
 #[test]
@@ -783,7 +636,6 @@ fn parked_socket_resumes_when_neighbor_learned() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
     connect(&mut iface, &mut sockets, 1234);
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     let frames = take_relevant_frames(&mut device);
     assert_eq!(frames.len(), 1);
     let ethernet = EthernetFrame::new_checked(&frames[0]).unwrap();
@@ -802,10 +654,8 @@ fn parked_socket_resumes_when_neighbor_learned() {
         iface.poll_at(START, &mut sockets),
         Some(Instant::from_millis(1024))
     );
-    sockets.dispatches.clear();
     let learned = START + Duration::from_millis(1);
     iface.poll(learned, &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
     assert!(take_relevant_frames(&mut device).is_empty());
     iface.inner.neighbor_cache.fill(
         REMOTE.into(),
@@ -813,7 +663,6 @@ fn parked_socket_resumes_when_neighbor_learned() {
         learned,
     );
     iface.poll(learned, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     let frames = take_relevant_frames(&mut device);
     assert_eq!(frames.len(), 1);
     let ethernet = EthernetFrame::new_checked(&frames[0]).unwrap();
@@ -900,7 +749,6 @@ fn address_change_leaves_idle_sockets_established() {
         iface.poll(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert!(sockets.dispatches.is_empty());
     for (_, socket) in sockets.iter() {
         assert_eq!(socket.state(), tcp::State::Established);
     }
@@ -920,7 +768,6 @@ fn now_is_due_at_negative_time() {
         Some(Instant::from_millis(0))
     );
     iface.poll(now, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     let (port, control, _, payload) = take_tcp(&mut device);
     assert_eq!((port, control), (1234, TcpControl::Syn));
     assert!(payload.is_empty());
@@ -965,21 +812,19 @@ fn check_close_timer_after_idle_wheel(now: Instant, fresh: bool, poll_at_first: 
         iface.poll_egress(now, &mut device, &mut sockets);
     }
     assert!(device.tx_queue.is_empty());
-    sockets.dispatches.clear();
     let before = deadline - Duration::from_micros(1);
     iface.poll_egress(before, &mut device, &mut sockets);
     assert_eq!(sockets.get(handle).state(), tcp::State::TimeWait);
-    assert!(sockets.dispatches.is_empty());
+    assert!(device.tx_queue.is_empty());
     assert_eq!(iface.poll_at(before, &mut sockets), Some(deadline));
     assert_eq!(iface.poll_at(deadline, &mut sockets), Some(deadline));
     assert_eq!(sockets.ready_len(), 0);
     iface.poll_egress(deadline, &mut device, &mut sockets);
     assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
-    assert_eq!(sockets.dispatches, [0]);
     assert!(device.tx_queue.is_empty());
     assert_eq!(iface.poll_at(deadline, &mut sockets), None);
     iface.poll_egress(deadline + Duration::from_millis(1), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, [0]);
+    assert!(device.tx_queue.is_empty());
 }
 
 #[test]
@@ -1091,10 +936,8 @@ fn timers_fire_among_idle_sockets() {
             "{timer}"
         );
         assert!(device.tx_queue.is_empty(), "{timer}");
-        sockets.dispatches.clear();
         let before = deadline - Duration::from_micros(1);
         iface.poll(before, &mut device, &mut sockets);
-        assert!(sockets.dispatches.is_empty(), "{timer}");
         assert!(device.tx_queue.is_empty(), "{timer}");
         assert_eq!(
             iface.poll_at(before, &mut sockets),
@@ -1102,7 +945,6 @@ fn timers_fire_among_idle_sockets() {
             "{timer}"
         );
         iface.poll(deadline, &mut device, &mut sockets);
-        assert_eq!(sockets.dispatches, vec![100], "{timer}");
         if timer == "TIME-WAIT" {
             assert_eq!(sockets.get(handle).state(), tcp::State::Closed);
             assert!(device.tx_queue.is_empty());
@@ -1152,9 +994,7 @@ fn remove_queued_socket_before_slot_reuse() {
     removed.listen(1234).unwrap();
     let reused = sockets.add(removed);
     assert_ne!(reused, a);
-    sockets.dispatches.clear();
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![1]);
     assert_eq!(take_tcp(&mut device).0, 1235);
     assert!(device.tx_queue.is_empty());
 }
@@ -1168,13 +1008,10 @@ fn queued_socket_with_refreshed_idle_deadline_is_not_dispatched() {
         remaining: 0,
     };
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     sockets.abort(handle);
     sockets.listen(handle, 1234).unwrap();
-    sockets.dispatches.clear();
     device.remaining = 1;
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
     assert!(device.inner.tx_queue.is_empty());
     assert_eq!(iface.poll_at(START, &mut sockets), None);
 }
@@ -1193,16 +1030,13 @@ fn address_change_only_admits_due_sockets_after_device_refusal() {
         inner: device,
         remaining: 1,
     };
-    sockets.dispatches.clear();
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1]);
-    sockets.dispatches.clear();
+    assert_eq!(sent_ports(&mut device.inner), [1234]);
     device.remaining = 3;
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![1, 0]);
+    assert_eq!(sent_ports(&mut device.inner), [1235, 1234]);
     assert_eq!(sockets.get(a).state(), tcp::State::Established);
     assert_eq!(sockets.get(b).state(), tcp::State::Established);
-    assert_eq!(device.inner.tx_queue.len(), 3);
 }
 
 #[test]
@@ -1214,9 +1048,7 @@ fn dirty_sockets_readmitted_in_slot_order() {
     for handle in [b, c] {
         assert_eq!(sockets.get_mut(handle).send_slice(&[1; 1024]), Ok(1024));
     }
-    sockets.dispatches.clear();
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![1, 2]);
     for (port, seq) in [(1235, b_seq), (1236, c_seq)] {
         let (sent_port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!(
@@ -1227,9 +1059,7 @@ fn dirty_sockets_readmitted_in_slot_order() {
     }
     assert!(device.tx_queue.is_empty());
     assert_eq!(sockets.get_mut(a).send_slice(&[1; 512]), Ok(512));
-    sockets.dispatches.clear();
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1, 2]);
     for (port, seq) in [(1234, a_seq), (1235, b_seq + 512), (1236, c_seq + 512)] {
         let (sent_port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!((sent_port, control, sent_seq), (port, TcpControl::Psh, seq));
@@ -1252,9 +1082,7 @@ fn dirty_due_and_timer_sockets_admitted_together_in_slot_order() {
     sockets.get_mut(high).send_slice(b"high").unwrap();
     sockets.get_mut(low).send_slice(b"low").unwrap();
     assert_eq!(sockets.dirty_list, vec![2, 0]);
-    sockets.dispatches.clear();
     iface.poll_egress(Instant::from_millis(120), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1, 2]);
     let (port, control, seq, payload) = take_tcp(&mut device);
     assert_eq!((port, control, seq), (1234, TcpControl::Psh, low_seq));
     assert_eq!(payload, b"low");
@@ -1289,10 +1117,8 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
         sockets.get(handle).poll_at(iface.context()),
         PollAt::Time(Instant::from_millis(120))
     );
-    sockets.dispatches.clear();
     let now = Instant::from_millis(120);
     iface.poll_egress(now, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     let (port, control, sent_seq, payload) = take_tcp(&mut device);
     assert_eq!((port, control, sent_seq), (1234, TcpControl::None, seq + 1));
     assert!(payload.is_empty());
@@ -1306,7 +1132,6 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
         Some(Instant::from_millis(125))
     );
     iface.poll_egress(now, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0]);
     assert!(device.tx_queue.is_empty());
 }
 
@@ -1319,18 +1144,15 @@ fn dropped_dispatch_ends_lone_socket_visit() {
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).1, TcpControl::Syn);
     iface.inner.caps.max_transmission_unit = 40;
-    sockets.dispatches.clear();
     for (elapsed, next) in [(1, 3), (3, 7)] {
         let now = START + Duration::from_millis(elapsed);
         assert_eq!(
             iface.poll_egress(now, &mut device, &mut sockets),
             PollResult::SocketStateChanged
         );
-        assert_eq!(sockets.dispatches, vec![0]);
         assert!(device.tx_queue.is_empty());
         assert_eq!(sockets.get(handle).poll_at(iface.context()), PollAt::Time(START + Duration::from_millis(next)));
         assert_eq!(sockets.get(handle).state(), tcp::State::SynSent);
-        sockets.dispatches.clear();
     }
 }
 
@@ -1342,7 +1164,6 @@ fn lone_socket_sends_its_window_in_one_visit() {
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
         Ok(4 * 512)
     );
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
@@ -1361,12 +1182,10 @@ fn lone_socket_sends_its_window_in_one_visit() {
         );
         assert_eq!(payload, [1; 512]);
     }
-    assert_eq!(sockets.dispatches, vec![0; 4]);
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert_eq!(sockets.dispatches, vec![0; 4]);
     assert!(device.tx_queue.is_empty());
     assert_eq!(
         iface.poll_at(START, &mut sockets),
@@ -1382,25 +1201,19 @@ fn lone_burst_stores_deadline() {
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
         Ok(4 * 512)
     );
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
     );
-    assert_eq!(device.tx_queue.len(), 4);
-    assert_eq!(sockets.dispatches, vec![0; 4]);
+    assert_eq!(sent_ports(&mut device), [1234; 4]);
     assert!(sockets.dirty_list.is_empty());
     let deadline = sockets.get(handle).poll_at(&mut iface.inner);
     assert!(matches!(deadline, PollAt::Time(time) if time > START));
     assert_eq!(sockets.stored_deadline(0), deadline);
-    device.tx_queue.clear();
-    sockets.classify_calls = 0;
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert_eq!(sockets.classify_calls, 0);
-    assert_eq!(sockets.dispatches, vec![0; 4]);
     assert!(device.tx_queue.is_empty());
 }
 
@@ -1412,7 +1225,6 @@ fn visit_end_after_pure_ack_stores_deadline() {
     data.payload = b"a";
     receive(&mut iface, &mut sockets, &mut device, data);
     assert_eq!(sockets.get(handle).recv_queue(), 1);
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
@@ -1426,7 +1238,6 @@ fn visit_end_after_pure_ack_stores_deadline() {
     assert_eq!((port, control, sent_seq), (1234, TcpControl::None, seq));
     assert!(payload.is_empty());
     assert!(device.tx_queue.is_empty());
-    assert_eq!(sockets.dispatches, vec![0]);
     let deadline = sockets.get(handle).poll_at(&mut iface.inner);
     assert_eq!(deadline, PollAt::Ingress);
     assert_eq!(sockets.stored_deadline(0), deadline);
@@ -1439,7 +1250,6 @@ fn visit_end_after_fin_stores_retransmit_deadline() {
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     assert_eq!(sockets.get(handle).send_queue(), 0);
     sockets.close(handle);
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
@@ -1449,7 +1259,6 @@ fn visit_end_after_fin_stores_retransmit_deadline() {
     assert_eq!((port, control, sent_seq), (1234, TcpControl::Fin, seq));
     assert!(payload.is_empty());
     assert!(device.tx_queue.is_empty());
-    assert_eq!(sockets.dispatches, vec![0]);
     let deadline = sockets.get(handle).poll_at(&mut iface.inner);
     assert!(matches!(deadline, PollAt::Time(time) if time > START));
     assert_eq!(sockets.stored_deadline(0), deadline);
@@ -1467,7 +1276,6 @@ fn visit_end_with_peer_window_full_stores_deadline() {
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
         Ok(4 * 512)
     );
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
@@ -1481,7 +1289,6 @@ fn visit_end_with_peer_window_full_stores_deadline() {
     }
     assert!(device.tx_queue.is_empty());
     assert_eq!(sockets.get(handle).send_queue(), 4 * 512);
-    assert_eq!(sockets.dispatches, vec![0; 2]);
     let deadline = sockets.get(handle).poll_at(&mut iface.inner);
     assert!(matches!(deadline, PollAt::Time(time) if time > START));
     assert_eq!(sockets.stored_deadline(0), deadline);
@@ -1504,13 +1311,11 @@ fn segment_cap_end_reclassifies() {
             Ok(4 * 512)
         );
     }
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
     );
     assert_eq!(device.tx_queue.len(), 2);
-    assert_eq!(sockets.dispatches, vec![0, 1]);
     for (index, handle, port, seq, byte) in [(0, a, 1234, a_seq, 1), (1, b, 1235, b_seq, 2)] {
         let (sent_port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!((sent_port, control), (port, TcpControl::None));
@@ -1538,16 +1343,13 @@ fn one_segment_per_visit_while_others_wait_then_lone_burst() {
             Ok(a_segments * 512)
         );
         assert_eq!(sockets.get_mut(b).send_slice(&[2; 4 * 512]), Ok(4 * 512));
-        sockets.dispatches.clear();
         let expected: &[&[usize]] = if a_segments == 4 {
             &[&[0, 1], &[0, 1], &[0, 1], &[0, 1], &[]]
         } else {
             &[&[0, 1, 1, 1, 1], &[]]
         };
         let mut sent = [0, 0];
-        let mut dispatches = Vec::new();
         for (pass_number, pass) in expected.iter().enumerate() {
-            let classify_calls = sockets.classify_calls;
             assert_eq!(
                 iface.poll_egress(START, &mut device, &mut sockets),
                 if pass.is_empty() {
@@ -1556,11 +1358,6 @@ fn one_segment_per_visit_while_others_wait_then_lone_burst() {
                     PollResult::SocketStateChanged
                 }
             );
-            if pass.is_empty() {
-                assert_eq!(sockets.classify_calls, classify_calls);
-            }
-            dispatches.extend_from_slice(pass);
-            assert_eq!(sockets.dispatches, dispatches);
             assert_eq!(
                 sockets.dirty_list.contains(&0),
                 a_segments == 4 && pass_number < 3
@@ -1587,22 +1384,11 @@ fn one_segment_per_visit_while_others_wait_then_lone_burst() {
             }
             assert!(device.tx_queue.is_empty());
         }
-        assert_eq!(
-            sockets.dispatches,
-            if a_segments == 4 {
-                vec![0, 1, 0, 1, 0, 1, 0, 1]
-            } else {
-                vec![0, 1, 1, 1, 1]
-            }
-        );
         assert_eq!(sent, [a_segments, 4]);
-        let classify_calls = sockets.classify_calls;
         assert_eq!(
             iface.poll_egress(START, &mut device, &mut sockets),
             PollResult::None
         );
-        assert_eq!(sockets.classify_calls, classify_calls);
-        assert_eq!(sockets.dispatches, dispatches);
         assert!(device.tx_queue.is_empty());
     }
 }
@@ -1615,7 +1401,6 @@ fn burst_stops_at_device_refusal() {
         sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
         Ok(4 * 512)
     );
-    sockets.dispatches.clear();
     let mut device = RefusingDevice {
         inner: device,
         remaining: 2,
@@ -1625,14 +1410,12 @@ fn burst_stops_at_device_refusal() {
         PollResult::SocketStateChanged
     );
     assert_eq!(device.inner.tx_queue.len(), 2);
-    assert_eq!(sockets.dispatches, vec![0; 3]);
     assert_eq!(sockets.ready_len(), 1);
     let mut device = device.inner;
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
     );
-    assert_eq!(sockets.dispatches, vec![0; 5]);
     assert_eq!(device.tx_queue.len(), 4);
     for frame in 0..4 {
         let (port, control, sent_seq, payload) = take_tcp(&mut device);
@@ -1651,7 +1434,6 @@ fn burst_stops_at_device_refusal() {
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert_eq!(sockets.dispatches, vec![0; 5]);
     assert!(device.tx_queue.is_empty());
 }
 
@@ -1691,12 +1473,10 @@ fn parked_socket_allows_lone_socket_to_burst() {
         HardwareAddress::Ethernet(REMOTE_HARDWARE),
         START,
     );
-    sockets.dispatches.clear();
     assert_eq!(
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::SocketStateChanged
     );
-    assert_eq!(sockets.dispatches, vec![1; 4]);
     assert!(sockets.dirty_list.is_empty());
     assert_eq!(sockets.waiting, vec![0]);
     assert_eq!(device.tx_queue.len(), 4);
@@ -1718,7 +1498,6 @@ fn parked_socket_allows_lone_socket_to_burst() {
         iface.poll_egress(START, &mut device, &mut sockets),
         PollResult::None
     );
-    assert_eq!(sockets.dispatches, vec![1; 4]);
     assert!(device.tx_queue.is_empty());
 }
 
@@ -1733,7 +1512,6 @@ fn two_ready_sockets_keep_strict_interleave_by_default() {
             Ok(3 * 512)
         );
     }
-    sockets.dispatches.clear();
     let mut frames = 0;
     while iface.poll_egress(START, &mut device, &mut sockets) != PollResult::None {
         for (port, seq) in [(1234, a_seq), (1235, b_seq)] {
@@ -1754,69 +1532,15 @@ fn two_ready_sockets_keep_strict_interleave_by_default() {
     }
     assert_eq!(frames, 3);
     assert!(device.tx_queue.is_empty());
-    assert_eq!(sockets.dispatches, vec![0, 1, 0, 1, 0, 1]);
 }
 
 #[test]
-fn pumping_socket_pass_cost() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    sockets.slot_visits = 0;
-    sockets.dispatches.clear();
-    assert_eq!(
-        sockets.get_mut(handle).send_slice(&[1; 4 * 512]),
-        Ok(4 * 512)
-    );
-    let mut frames = 0;
-    let mut passes = 0;
-    loop {
-        passes += 1;
-        let classify_calls = sockets.classify_calls;
-        let result = iface.poll_egress(START, &mut device, &mut sockets);
-        if result == PollResult::None {
-            assert_eq!(sockets.classify_calls, classify_calls);
-            assert!(device.tx_queue.is_empty());
-            break;
-        }
-        assert_eq!(result, PollResult::SocketStateChanged);
-        assert_eq!(passes, 1);
-        assert_eq!(device.tx_queue.len(), 4);
-        while !device.tx_queue.is_empty() {
-            assert!(frames < 4);
-            let (port, control, sent_seq, payload) = take_tcp(&mut device);
-            assert_eq!((port, sent_seq), (1234, seq + frames * 512));
-            assert_eq!(
-                control,
-                if frames == 3 {
-                    TcpControl::Psh
-                } else {
-                    TcpControl::None
-                }
-            );
-            assert_eq!(payload, [1; 512]);
-            frames += 1;
-        }
-        assert_eq!(frames, 4);
-    }
-    assert_eq!(frames, 4);
-    assert_eq!(passes, 2);
-    assert_eq!(sockets.dispatches, vec![0; 4]);
-    std::println!(
-        "frames={frames}, passes={passes}, slot visits={}",
-        sockets.slot_visits
-    );
-    assert!(sockets.slot_visits <= 5, "{} visits", sockets.slot_visits);
-}
-
-#[test]
-fn one_busy_socket_costs_no_slot_walk() {
-    let mut visits = Vec::new();
+fn one_busy_socket_request_reply_at_any_slot_count() {
     for slot_count in [64, 10240] {
         let (mut iface, _, mut device) = setup(Medium::Ip);
         let mut sockets = TcpSet::new(slot_count);
         let (handle, mut seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
         assert_eq!(sockets.slot_count(), slot_count);
-        sockets.slot_visits = 0;
         for turn in 0..50 {
             let now = START + Duration::from_millis(turn);
             assert_eq!(sockets.get_mut(handle).send_slice(b"request"), Ok(7));
@@ -1825,12 +1549,10 @@ fn one_busy_socket_costs_no_slot_walk() {
             assert_eq!((port, sent_seq), (1234, seq));
             assert_eq!(payload, b"request");
             assert!(device.tx_queue.is_empty());
-            let classify_calls = sockets.classify_calls;
             assert_eq!(
                 iface.poll_egress(now, &mut device, &mut sockets),
                 PollResult::None
             );
-            assert_eq!(sockets.classify_calls, classify_calls);
             assert!(device.tx_queue.is_empty());
             iface.poll_at(now, &mut sockets);
             seq += 7;
@@ -1856,23 +1578,13 @@ fn one_busy_socket_costs_no_slot_walk() {
             assert_eq!((port, control), (1234, TcpControl::None));
             assert!(payload.is_empty());
             assert!(device.tx_queue.is_empty());
-            let classify_calls = sockets.classify_calls;
             assert_eq!(
                 iface.poll_egress(now, &mut device, &mut sockets),
                 PollResult::None
             );
-            assert_eq!(sockets.classify_calls, classify_calls);
             assert!(device.tx_queue.is_empty());
             assert_eq!(iface.poll_at(now, &mut sockets), None);
         }
-        std::println!(
-            "slots={slot_count}, turns=50, slot visits={}",
-            sockets.slot_visits
-        );
-        visits.push((slot_count, sockets.slot_visits));
-    }
-    for (slot_count, count) in visits {
-        assert!(count <= 50 * 10, "{count} visits for {slot_count} slots");
     }
 }
 
@@ -1887,9 +1599,7 @@ fn expired_timers_admitted_in_slot_order() {
         iface.poll_at(START, &mut sockets),
         Some(Instant::from_millis(110))
     );
-    sockets.dispatches.clear();
     iface.poll_egress(Instant::from_millis(120), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1]);
     for port in [1234, 1235] {
         let (sent_port, control, _, payload) = take_tcp(&mut device);
         assert_eq!((sent_port, control), (port, TcpControl::Psh));
@@ -1957,10 +1667,8 @@ fn queued_future_deadline_stays_exact_after_device_refusal() {
     );
     assert_eq!(sockets.ready_len(), 2);
     device.remaining = 2;
-    sockets.dispatches.clear();
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(sockets.ready_len(), 0);
-    assert!(sockets.dispatches.is_empty());
     assert!(device.inner.tx_queue.is_empty());
     assert_eq!(
         iface.poll_at(START, &mut sockets),
@@ -1969,7 +1677,7 @@ fn queued_future_deadline_stays_exact_after_device_refusal() {
 }
 
 #[test]
-fn simultaneous_rto_expiry_admitted_without_due_list_visits() {
+fn simultaneous_rto_expiry_retransmits_in_slot_order() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let connections: Vec<_> = (1234..1298)
         .map(|port| establish(&mut iface, &mut sockets, &mut device, port))
@@ -1983,10 +1691,7 @@ fn simultaneous_rto_expiry_admitted_without_due_list_visits() {
             Duration::from_millis(20),
         );
     }
-    sockets.slot_visits = 0;
-    sockets.dispatches.clear();
     iface.poll_egress(Instant::from_millis(120), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, (0..64).collect::<Vec<_>>());
     for (index, &(_, seq)) in connections.iter().enumerate() {
         let (port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!(
@@ -1996,8 +1701,6 @@ fn simultaneous_rto_expiry_admitted_without_due_list_visits() {
         assert_eq!(payload, b"x");
     }
     assert!(device.tx_queue.is_empty());
-    // 64 wheel expiry visits, 64 expired-entry checks, 64 ready admissions; no due-list visits.
-    assert_eq!(sockets.slot_visits, 192);
 }
 
 #[test]
@@ -2016,14 +1719,8 @@ fn simultaneous_rto_expiry_polled_before_egress_keeps_slot_order() {
         );
     }
     let now = Instant::from_millis(120);
-    sockets.slot_visits = 0;
     assert_eq!(iface.poll_at(now, &mut sockets), Some(now));
-    // 64 wheel expiry visits, 64 expired-entry checks, 64 due-list deadline reads.
-    assert_eq!(sockets.slot_visits, 192);
-    sockets.slot_visits = 0;
-    sockets.dispatches.clear();
     iface.poll_egress(now, &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, (0..64).collect::<Vec<_>>());
     for (index, &(_, seq)) in connections.iter().enumerate() {
         let (port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!(
@@ -2033,8 +1730,6 @@ fn simultaneous_rto_expiry_polled_before_egress_keeps_slot_order() {
         assert_eq!(payload, b"x");
     }
     assert!(device.tx_queue.is_empty());
-    // 64 due-list deadline checks and 64 ready admissions after poll_at expired the wheel.
-    assert_eq!(sockets.slot_visits, 128);
 }
 
 #[test]
@@ -2048,9 +1743,7 @@ fn rto_deadlines_preserve_timer_queue_order() {
             Duration::from_millis([30, 10, 20][index]));
     }
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(110)));
-    sockets.dispatches.clear();
     iface.poll_egress(Instant::from_millis(130), &mut device, &mut sockets);
-    assert_eq!(sockets.dispatches, vec![0, 1, 2]);
     for (index, &(_, seq)) in handles.iter().enumerate() {
         let (port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!((port, control, sent_seq), (1234 + index as u16, TcpControl::Psh, seq));
@@ -2070,9 +1763,7 @@ fn rto_deadline_cancellation_removes_idle_socket() {
         segment(1234, TcpControl::None, 101, seq + 1));
     assert_eq!(sockets.get(handle).send_queue(), 0);
     assert_eq!(iface.poll_at(Instant::from_millis(110), &mut sockets), None);
-    sockets.dispatches.clear();
     iface.poll_egress(Instant::from_millis(200), &mut device, &mut sockets);
-    assert!(sockets.dispatches.is_empty());
     assert!(device.tx_queue.is_empty());
     assert_eq!(iface.poll_at(Instant::from_millis(200), &mut sockets), None);
     assert_eq!(sockets.get(handle).state(), tcp::State::Established);

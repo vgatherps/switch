@@ -3,8 +3,6 @@
 
 use alloc::vec::Vec;
 use core::cell::Cell;
-#[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::time::{Duration, Instant};
 use crate::wire::{HardwareAddress, IpAddress};
@@ -73,8 +71,6 @@ pub struct Cache {
     capacity: usize,
     changes: u64,
     next_expiry: Option<Instant>,
-    #[cfg(test)]
-    pub(crate) lookup_calls: AtomicUsize,
     /// Index of the last address found. Checked against the entry's address before use,
     /// so moves and removals never make it wrong; it only skips the scan when a Stack
     /// keeps talking to the same neighbor.
@@ -107,8 +103,6 @@ impl Cache {
             last_found: Cell::new(0),
             changes: 0,
             next_expiry: None,
-            #[cfg(test)]
-            lookup_calls: AtomicUsize::new(0),
         }
     }
 
@@ -264,8 +258,6 @@ impl Cache {
     }
 
     pub(crate) fn lookup(&self, protocol_addr: &IpAddress, timestamp: Instant) -> Answer {
-        #[cfg(test)]
-        self.lookup_calls.fetch_add(1, Ordering::Relaxed);
         assert!(protocol_addr.is_unicast());
 
         if let Some(index) = self.find(protocol_addr) {

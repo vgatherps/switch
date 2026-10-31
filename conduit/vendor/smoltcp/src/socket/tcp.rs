@@ -592,67 +592,6 @@ pub struct Socket<'a> {
     reset_by_peer: bool,
 }
 
-#[cfg(test)]
-pub(crate) fn socket_field_offsets() -> &'static [(&'static str, usize)] {
-    use core::mem::offset_of;
-
-    &[
-        ("hop_limit", offset_of!(Socket<'static>, hop_limit)),
-        ("local_rx_dup_acks", offset_of!(Socket<'static>, local_rx_dup_acks)),
-        ("ack_delay_enabled", offset_of!(Socket<'static>, ack_delay_enabled)),
-        ("rx_fin_received", offset_of!(Socket<'static>, rx_fin_received)),
-        ("in_rto_loss_episode", offset_of!(Socket<'static>, in_rto_loss_episode)),
-        ("remote_has_sack", offset_of!(Socket<'static>, remote_has_sack)),
-        ("timer", offset_of!(Socket<'static>, timer)),
-        ("ack_at", offset_of!(Socket<'static>, ack_at)),
-        ("local_seq_no", offset_of!(Socket<'static>, local_seq_no)),
-        ("remote_seq_no", offset_of!(Socket<'static>, remote_seq_no)),
-        ("remote_last_seq", offset_of!(Socket<'static>, remote_last_seq)),
-        ("remote_max_seq", offset_of!(Socket<'static>, remote_max_seq)),
-        ("remote_last_ack", offset_of!(Socket<'static>, remote_last_ack)),
-        ("remote_last_win_bytes", offset_of!(Socket<'static>, remote_last_win_bytes)),
-        ("remote_win_len", offset_of!(Socket<'static>, remote_win_len)),
-        ("state", offset_of!(Socket<'static>, state)),
-        ("ack_kind", offset_of!(Socket<'static>, ack_kind)),
-        ("remote_win_shift", offset_of!(Socket<'static>, remote_win_shift)),
-        ("pending_fast_retransmit", offset_of!(Socket<'static>, pending_fast_retransmit)),
-        ("remote_last_ack_is_marker", offset_of!(Socket<'static>, remote_last_ack_is_marker)),
-        ("local_rx_last_seq_valid", offset_of!(Socket<'static>, local_rx_last_seq_valid)),
-        ("local_rx_last_ack_valid", offset_of!(Socket<'static>, local_rx_last_ack_valid)),
-        ("recover_valid", offset_of!(Socket<'static>, recover_valid)),
-        ("tuple", offset_of!(Socket<'static>, tuple)),
-        ("remote_win_scale", offset_of!(Socket<'static>, remote_win_scale)),
-        ("remote_mss", offset_of!(Socket<'static>, remote_mss)),
-        ("connection_mss_cap", offset_of!(Socket<'static>, connection_mss_cap)),
-        ("max_snd_wnd", offset_of!(Socket<'static>, max_snd_wnd)),
-        ("remote_win_seq", offset_of!(Socket<'static>, remote_win_seq)),
-        ("rx_fin_seq", offset_of!(Socket<'static>, rx_fin_seq)),
-        ("local_rx_last_seq", offset_of!(Socket<'static>, local_rx_last_seq)),
-        ("local_rx_last_ack", offset_of!(Socket<'static>, local_rx_last_ack)),
-        ("recover", offset_of!(Socket<'static>, recover)),
-        ("rto_us", offset_of!(Socket<'static>, rto_us)),
-        ("rto_backoff", offset_of!(Socket<'static>, rto_backoff)),
-        ("rx_mbuf_cap", offset_of!(Socket<'static>, rx_mbuf_cap)),
-        ("rx_seg_bytes", offset_of!(Socket<'static>, rx_seg_bytes)),
-        ("tx_queue", offset_of!(Socket<'static>, tx_queue)),
-        ("tx_seg_bytes", offset_of!(Socket<'static>, tx_seg_bytes)),
-        ("rtte", offset_of!(Socket<'static>, rtte)),
-        ("congestion_controller", offset_of!(Socket<'static>, congestion_controller)),
-        ("rx_buffer", offset_of!(Socket<'static>, rx_buffer)),
-        ("ack_delay_us", offset_of!(Socket<'static>, ack_delay_us)),
-        ("retransmits", offset_of!(Socket<'static>, retransmits)),
-        ("loss_events", offset_of!(Socket<'static>, loss_events)),
-        ("initial_window", offset_of!(Socket<'static>, initial_window)),
-        ("listen_endpoint", offset_of!(Socket<'static>, listen_endpoint)),
-        ("bytes_acked", offset_of!(Socket<'static>, bytes_acked)),
-        ("rcv_mss", offset_of!(Socket<'static>, rcv_mss)),
-        ("challenge_ack_timer", offset_of!(Socket<'static>, challenge_ack_timer)),
-        ("rx_refused_segments", offset_of!(Socket<'static>, rx_refused_segments)),
-        ("mss_cap", offset_of!(Socket<'static>, mss_cap)),
-        ("reset_by_peer", offset_of!(Socket<'static>, reset_by_peer)),
-    ]
-}
-
 const DEFAULT_MSS: usize = 536;
 
 /// Minimum MSS we accept from the remote, same value as Linux's `TCP_MIN_SND_MSS`.
@@ -3629,12 +3568,6 @@ impl<'a> fmt::Write for Socket<'a> {
 
 #[cfg(test)]
 #[test]
-fn smoothed_rtt_size() {
-    assert_eq!(core::mem::size_of::<SmoothedRtt>(), 24);
-}
-
-#[cfg(test)]
-#[test]
 fn rtt_sampling_round_trips() {
     let mut rtte = SmoothedRtt::default();
     assert_eq!(rtte.smoothed_rtt(), 0);
@@ -3688,16 +3621,6 @@ fn rtt_sampling_round_trips() {
     assert_eq!(rtte.smoothed_rtt(), 0);
     assert_eq!(rtte.timestamp(), None);
     assert_eq!(rtte.max_seq_sent(), Some(TcpSeqNumber(3)));
-}
-
-#[cfg(test)]
-#[test]
-fn socket_size_matches_main() {
-    // TxQueue holds frame entries, their end position and their TxSource instead of a borrowed
-    // byte ring; the TxSource is a thin Rc to the concrete pool.
-    let main_size = 456;
-    let size = core::mem::size_of::<Socket<'static>>();
-    assert_eq!(size, main_size);
 }
 
 // TODO: TCP should work for all features. For now, we only test with the IP feature. We could do

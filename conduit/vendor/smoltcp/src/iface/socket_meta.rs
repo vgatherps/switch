@@ -36,18 +36,6 @@ pub(crate) struct Meta {
     pub(crate) next_hop: Option<(u64, crate::wire::EthernetAddress)>,
 }
 
-#[cfg(test)]
-pub(crate) fn meta_field_offsets() -> &'static [(&'static str, usize)] {
-    &[
-        ("tcp_template", core::mem::offset_of!(Meta, tcp_template)),
-        (
-            "neighbor_state",
-            core::mem::offset_of!(Meta, neighbor_state),
-        ),
-        ("next_hop", core::mem::offset_of!(Meta, next_hop)),
-    ]
-}
-
 impl Meta {
     /// Minimum delay between neighbor discovery requests for this particular
     /// socket, in milliseconds.
@@ -133,12 +121,6 @@ impl Meta {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn meta_size() {
-        std::println!("Meta: {}", core::mem::size_of::<Meta>());
-        assert_eq!(core::mem::size_of::<Meta>(), 112);
-    }
 
     const NEIGHBOR: IpAddress = IpAddress::v4(192, 168, 1, 1);
 

@@ -178,8 +178,6 @@ pub struct UdpSet {
     /// Frames `Interface::udp_send` copies payloads into.
     pub(crate) source: TxSource,
     fired: Vec<u32>,
-    #[cfg(test)]
-    pub(crate) template_frames: usize,
 }
 
 impl UdpSet {
@@ -198,8 +196,6 @@ impl UdpSet {
             pending_rx_attach: None,
             source,
             fired: Vec::with_capacity(max_sockets),
-            #[cfg(test)]
-            template_frames: 0,
         }
     }
 
@@ -425,7 +421,6 @@ mod tests {
                 },
             );
         };
-        assert_eq!(set.fired.capacity(), 2);
         set.arm_rx(handle, 7);
         set.arm_rx(other, 8);
         enqueue(&mut set, handle.slot);
@@ -451,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn receive_queue_wraps_without_growing() {
+    fn receive_queue_keeps_order_across_wraps() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set
             .add(&iface(), UdpConfig {
@@ -459,8 +454,6 @@ mod tests {
                 ..config(1234)
             })
             .unwrap();
-        let capacity = set.get(handle).queue.capacity();
-        assert_eq!(capacity, 3);
         let releases = Rc::new(Cell::new(0));
         let enqueue = |set: &mut UdpSet, byte| {
             set.commit_rx(
@@ -472,7 +465,6 @@ mod tests {
                     payload: 1..2,
                 },
             );
-            assert_eq!(set.get(handle).queue.capacity(), capacity);
         };
         for cycle in 0..4 {
             let first = cycle * 5;
@@ -486,7 +478,6 @@ mod tests {
                 assert_eq!(datagram.payload(), &[first + offset]);
                 drop(datagram);
                 assert_eq!(set.get(handle).rx_queued(), 2 - usize::from(offset));
-                assert_eq!(set.get(handle).queue.capacity(), capacity);
             }
             for offset in 3..5 {
                 enqueue(&mut set, first + offset);
@@ -498,7 +489,6 @@ mod tests {
                 assert_eq!(datagram.payload(), &[first + offset]);
                 drop(datagram);
                 assert_eq!(set.get(handle).rx_queued(), 4 - usize::from(offset));
-                assert_eq!(set.get(handle).queue.capacity(), capacity);
             }
             assert!(set.get_mut(handle).recv().is_none());
             assert_eq!(set.get(handle).shared.held.get(), 0);

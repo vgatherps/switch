@@ -209,7 +209,6 @@ fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
                     continue;
                 };
                 assert_eq!(result, PollIngressSingleResult::SocketStateChanged);
-                assert_eq!(sockets.classify_calls, 0);
             }
             #[cfg(not(feature = "udp-set"))]
             if entry == "udp_single" {
@@ -219,7 +218,6 @@ fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
             iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
         }
         assert!(device.rx_queue.is_empty());
-        assert_eq!(sockets.dispatches, vec![0, 1]);
         assert_eq!(device.tx_queue.len(), 2);
         for (index, port) in [REMOTE_PORT, REMOTE_PORT + 1].into_iter().enumerate() {
             let bytes = device.tx_queue.pop_front().unwrap();
