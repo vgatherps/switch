@@ -87,8 +87,6 @@ mod udp;
 
 use core::fmt;
 
-use crate::phy::Medium;
-
 pub use self::pretty_print::PrettyPrinter;
 
 pub use self::ethernet::{
@@ -148,30 +146,19 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Representation of an hardware address, such as an Ethernet address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareAddress {
-    #[cfg(feature = "medium-ip")]
-    Ip,
     Ethernet(EthernetAddress),
 }
 
 #[cfg(test)]
 impl Default for HardwareAddress {
     fn default() -> Self {
-        #![allow(unreachable_code)]
-        {
-            return Self::Ethernet(EthernetAddress::default());
-        }
-        #[cfg(feature = "medium-ip")]
-        {
-            return Self::Ip;
-        }
+        Self::Ethernet(EthernetAddress::default())
     }
 }
 
 impl HardwareAddress {
     pub const fn as_bytes(&self) -> &[u8] {
         match self {
-            #[cfg(feature = "medium-ip")]
-            HardwareAddress::Ip => unreachable!(),
             HardwareAddress::Ethernet(addr) => addr.as_bytes(),
         }
     }
@@ -179,8 +166,6 @@ impl HardwareAddress {
     /// Query whether the address is an unicast address.
     pub fn is_unicast(&self) -> bool {
         match self {
-            #[cfg(feature = "medium-ip")]
-            HardwareAddress::Ip => unreachable!(),
             HardwareAddress::Ethernet(addr) => addr.is_unicast(),
         }
     }
@@ -188,35 +173,19 @@ impl HardwareAddress {
     /// Query whether the address is a broadcast address.
     pub fn is_broadcast(&self) -> bool {
         match self {
-            #[cfg(feature = "medium-ip")]
-            HardwareAddress::Ip => unreachable!(),
             HardwareAddress::Ethernet(addr) => addr.is_broadcast(),
         }
     }
 
     pub(crate) fn ethernet_or_panic(&self) -> EthernetAddress {
-        match self {
-            HardwareAddress::Ethernet(addr) => *addr,
-            #[allow(unreachable_patterns)]
-            _ => panic!("HardwareAddress is not Ethernet."),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn medium(&self) -> Medium {
-        match self {
-            #[cfg(feature = "medium-ip")]
-            HardwareAddress::Ip => Medium::Ip,
-            HardwareAddress::Ethernet(_) => Medium::Ethernet,
-        }
+        let HardwareAddress::Ethernet(addr) = self;
+        *addr
     }
 }
 
 impl core::fmt::Display for HardwareAddress {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            #[cfg(feature = "medium-ip")]
-            HardwareAddress::Ip => write!(f, "no hardware addr"),
             HardwareAddress::Ethernet(addr) => write!(f, "{addr}"),
         }
     }

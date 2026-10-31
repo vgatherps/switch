@@ -223,12 +223,11 @@ test-autobahn-check:
 	$(TIMEOUT) python3 autobahn/check.py --self-test
 	$(TIMEOUT) sh autobahn/peer-self-test.sh
 
-# smoltcp's own lib unit test gate uses Zhida's smoltcp features (crates/dpdk-smoltcp/Cargo.toml)
-# plus medium-ip, which gates smoltcp's TCP socket tests. vendor/smoltcp is outside the
-# workspace, so it has its own lockfile and target dir. Include the TCP ISN integration
-# test: it exercises production ISNs, while socket unit tests keep their fixed ISN. The second
-# run adds diagnostics, the O(N)-per-packet TCP cross-checks.
-SMOLTCP_TEST_FEATURES = medium-ip,auto-icmp-echo-reply
+# smoltcp's own lib unit test gate uses Zhida's smoltcp features (crates/dpdk-smoltcp/Cargo.toml).
+# vendor/smoltcp is outside the workspace, so it has its own lockfile and target dir. Include the
+# TCP ISN integration test: it exercises production ISNs, while socket unit tests keep their fixed
+# ISN. The second run adds diagnostics, the O(N)-per-packet TCP cross-checks.
+SMOLTCP_TEST_FEATURES = auto-icmp-echo-reply
 test-smoltcp:
 	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
 		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES)

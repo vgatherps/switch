@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn transmit_frame_copies_headers_and_payload() {
-        let mut device = Loopback::new(Medium::Ip);
+        let mut device = Loopback::new(Medium::Ethernet);
         let mut frame = crate::tests::tx_test_buf(&[3, 4]);
         frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
         let frame = device

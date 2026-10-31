@@ -14,15 +14,11 @@ pub(crate) const PEER: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
 
 pub(crate) fn setup<'a>(medium: Medium) -> (Interface, TcpSet<'a>, TestingDevice) {
     let mut device = TestingDevice::new(medium);
-    let iface = setup_with_device(medium, &mut device);
+    let iface = setup_with_device(&mut device);
     (iface, TcpSet::new(2048), device)
 }
-fn setup_with_device(medium: Medium, device: &mut impl Device) -> Interface {
-    let config = Config::new(match medium {
-        Medium::Ethernet => HardwareAddress::Ethernet(HARDWARE),
-        #[cfg(feature = "medium-ip")]
-        Medium::Ip => HardwareAddress::Ip,
-    });
+fn setup_with_device(device: &mut impl Device) -> Interface {
+    let config = Config::new(HardwareAddress::Ethernet(HARDWARE));
 
     let mut iface = Interface::new(config, device, Instant::ZERO);
 
@@ -101,11 +97,7 @@ impl TestingDevice {
         TestingDevice {
             tx_queue: VecDeque::new(),
             rx_queue: VecDeque::new(),
-            max_transmission_unit: match medium {
-                Medium::Ethernet => 1514,
-                #[cfg(feature = "medium-ip")]
-                Medium::Ip => 1500,
-            },
+            max_transmission_unit: 1514,
             medium,
         }
     }
@@ -213,7 +205,7 @@ pub(crate) fn tx_test_source(room: usize) -> phy::TxSource {
 fn testing_device_frame_token_writes_before_publish() {
     use crate::phy::FrameToken as _;
 
-    let mut device = TestingDevice::new(Medium::Ip);
+    let mut device = TestingDevice::new(Medium::Ethernet);
     let mut frame = tx_test_buf(&[3, 4]);
     frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
     assert!(device.tx_queue.is_empty());
@@ -232,7 +224,7 @@ fn testing_device_owned_frame_releases_after_publish() {
     frame.room_mut()[..2].copy_from_slice(&[3, 4]);
     frame.set_len(2);
     frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
-    let mut device = TestingDevice::new(Medium::Ip);
+    let mut device = TestingDevice::new(Medium::Ethernet);
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()

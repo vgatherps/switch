@@ -11,7 +11,7 @@ impl Interface {
     /// the destination of the socket's header template: a template exists only for a destination
     /// that passed here, and the set is fixed.
     ///
-    /// Panics if the interface medium is not Ethernet or `handle` is stale.
+    /// Panics if `handle` is stale.
     pub fn udp_target(
         &self,
         udp: &UdpSet,
@@ -19,10 +19,6 @@ impl Interface {
         to: Option<IpEndpoint>,
         len: usize,
     ) -> Result<UdpTarget, UdpSendError> {
-        assert!(
-            matches!(self.inner.caps.medium, Medium::Ethernet),
-            "UDP send needs an Ethernet interface"
-        );
         let socket = udp.get(handle);
         let to = match (to, socket.peer()) {
             (None, None) => return Err(UdpSendError::NoDestination),
@@ -63,8 +59,7 @@ impl Interface {
     /// `NoRoute` and `NeighborPending`, in `udp_send_frame`'s order; an empty frame source is
     /// `WouldBlock` before the neighbor lookup.
     ///
-    /// Panics if `payload` is not the target's length, the interface medium is not Ethernet
-    /// or the target's handle is stale.
+    /// Panics if `payload` is not the target's length or the target's handle is stale.
     pub fn udp_send(
         &mut self,
         device: &mut (impl Device + ?Sized),
@@ -88,7 +83,7 @@ impl Interface {
     ///
     /// `target` must be `udp_target`'s for `frame.len()` bytes, at most 65527.
     ///
-    /// Panics if the interface medium is not Ethernet or the target's handle is stale.
+    /// Panics if the target's handle is stale.
     pub fn udp_send_frame(
         &mut self,
         device: &mut (impl Device + ?Sized),

@@ -307,7 +307,7 @@ mod stale_neighbors {
         use crate::phy::FrameToken as _;
 
         let mut device = LimitedDevice {
-            inner: TestingDevice::new(Medium::Ip),
+            inner: TestingDevice::new(Medium::Ethernet),
             tx_left: Some(1),
         };
         let mut frame = crate::tests::tx_test_buf(&[2]);
@@ -726,8 +726,6 @@ mod stale_neighbors {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 fn test_unknown_protocol_with_payload_no_reply(#[case] medium: Medium) {
     let (mut iface, mut sockets, _) = setup(medium);
@@ -757,8 +755,6 @@ fn test_unknown_protocol_with_payload_no_reply(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 fn test_no_icmp_no_unicast(#[case] medium: Medium) {
     let (mut iface, mut sockets, _) = setup(medium);
@@ -796,8 +792,6 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 fn test_unknown_protocol_without_payload_no_reply(#[case] medium: Medium) {
     let (mut iface, mut sockets, _device) = setup(medium);
@@ -827,8 +821,6 @@ fn test_unknown_protocol_without_payload_no_reply(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 fn test_local_subnet_broadcasts(#[case] medium: Medium) {
     let (mut iface, _, _device) = setup(medium);
@@ -933,8 +925,6 @@ fn test_local_subnet_broadcasts(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(all(feature = "medium-ip", feature = "auto-icmp-echo-reply"))]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "auto-icmp-echo-reply")]
 fn test_unicast_echo_reply(#[case] medium: Medium) {
@@ -983,8 +973,6 @@ fn test_unicast_echo_reply(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(all(feature = "medium-ip", feature = "auto-icmp-echo-reply"))]
 #[case(Medium::Ethernet)]
 #[cfg(feature = "auto-icmp-echo-reply")]
 fn test_broadcast_echo_no_reply(#[case] medium: Medium) {
@@ -1481,8 +1469,6 @@ fn test_arp_flush_after_update_ip(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 fn get_source_address(#[case] medium: Medium) {
     let (mut iface, _, _) = setup(medium);
@@ -1528,8 +1514,6 @@ fn get_source_address(#[case] medium: Medium) {
 }
 
 #[rstest]
-#[case(Medium::Ip)]
-#[cfg(feature = "medium-ip")]
 #[case(Medium::Ethernet)]
 fn get_source_address_empty_interface(#[case] medium: Medium) {
     let (mut iface, _, _) = setup(medium);
@@ -1559,13 +1543,10 @@ fn get_source_address_empty_interface(#[case] medium: Medium) {
 }
 
 use crate::wire::ipv4::HEADER_LEN;
-#[cfg(feature = "medium-ip")]
 const CHECKSUM_SRC: Ipv4Address = Ipv4Address::new(127, 0, 0, 2);
-#[cfg(feature = "medium-ip")]
 const CHECKSUM_DST: Ipv4Address = Ipv4Address::new(127, 0, 0, 1);
 
 /// IPv4 packet CHECKSUM_SRC -> CHECKSUM_DST with correct header checksum.
-#[cfg(feature = "medium-ip")]
 fn ipv4_packet_bytes(next_header: IpProtocol, payload: &[u8]) -> Vec<u8> {
     let repr = Ipv4Repr {
         src_addr: CHECKSUM_SRC,
@@ -1584,7 +1565,7 @@ fn ipv4_packet_bytes(next_header: IpProtocol, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Unicast echo request with valid IPv4 and ICMP checksums.
-#[cfg(all(feature = "medium-ip", feature = "auto-icmp-echo-reply"))]
+#[cfg(feature = "auto-icmp-echo-reply")]
 fn icmp_echo_request_bytes() -> Vec<u8> {
     let icmp = Icmpv4Repr::EchoRequest {
         ident: 0x1234,
@@ -1599,7 +1580,6 @@ fn icmp_echo_request_bytes() -> Vec<u8> {
     ipv4_packet_bytes(IpProtocol::Icmp, &bytes)
 }
 
-#[cfg(feature = "medium-ip")]
 fn corrupt_ipv4_checksum(bytes: &mut [u8]) {
     let mut packet = Ipv4Packet::new_unchecked(bytes);
     let checksum = packet.checksum();
@@ -1608,9 +1588,8 @@ fn corrupt_ipv4_checksum(bytes: &mut [u8]) {
 }
 
 /// Protocol of the stack's reply to `bytes` received with `meta`; `None` when dropped.
-#[cfg(feature = "medium-ip")]
 fn ipv4_reply_protocol(meta: PacketMeta, bytes: &[u8]) -> Option<IpProtocol> {
-    let (mut iface, mut sockets, _device) = setup(Medium::Ip);
+    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
     iface
         .inner
         .process_ipv4(
@@ -1623,7 +1602,6 @@ fn ipv4_reply_protocol(meta: PacketMeta, bytes: &[u8]) -> Option<IpProtocol> {
 }
 
 /// SYN to a port with no socket: when accepted, the stack answers with RST.
-#[cfg(feature = "medium-ip")]
 fn tcp_syn_bytes() -> Vec<u8> {
     let tcp = TcpRepr {
         src_port: 4242,
@@ -1649,21 +1627,6 @@ fn tcp_syn_bytes() -> Vec<u8> {
     ipv4_packet_bytes(IpProtocol::Tcp, &tcp_bytes)
 }
 
-#[cfg(feature = "medium-ip")]
-fn ipv4_ip_reply(bytes: &[u8]) -> bool {
-    let (mut iface, mut sockets, _device) = setup(Medium::Ip);
-    iface
-        .inner
-        .process_ip(
-            &mut sockets,
-            PacketMeta::default(),
-            bytes,
-            None,
-        )
-        .is_some()
-}
-
-#[cfg(feature = "medium-ip")]
 fn ipv4_ethernet_reply(bytes: &[u8]) -> bool {
     let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
     let mut eth_bytes = vec![0u8; EthernetFrame::<&[u8]>::buffer_len(bytes.len())];
@@ -1684,9 +1647,7 @@ fn ipv4_ethernet_reply(bytes: &[u8]) -> bool {
 }
 
 #[rstest]
-#[case::ip(ipv4_ip_reply, &[1, 19])]
 #[case::ethernet(ipv4_ethernet_reply, &[0, 1, 19])]
-#[cfg(feature = "medium-ip")]
 fn malformed_ipv4_lengths_dropped(
     #[case] reply: fn(&[u8]) -> bool,
     #[case] truncated_lengths: &[usize],
@@ -1723,9 +1684,7 @@ fn malformed_ipv4_lengths_dropped(
 }
 
 #[rstest]
-#[case::ip(ipv4_ip_reply)]
 #[case::ethernet(ipv4_ethernet_reply)]
-#[cfg(feature = "medium-ip")]
 fn malformed_tcp_lengths_dropped(#[case] reply: fn(&[u8]) -> bool) {
     let good = tcp_syn_bytes();
     assert!(reply(&good));
@@ -1751,9 +1710,7 @@ fn malformed_tcp_lengths_dropped(#[case] reply: fn(&[u8]) -> bool) {
 }
 
 #[rstest]
-#[case::ip(ipv4_ip_reply)]
 #[case::ethernet(ipv4_ethernet_reply)]
-#[cfg(feature = "medium-ip")]
 fn trailing_bytes_after_ipv4_total_length_still_answered(#[case] reply: fn(&[u8]) -> bool) {
     let mut bytes = tcp_syn_bytes();
     assert!(reply(&bytes));
@@ -1762,7 +1719,6 @@ fn trailing_bytes_after_ipv4_total_length_still_answered(#[case] reply: fn(&[u8]
     assert!(reply(&bytes));
 }
 
-#[cfg(feature = "medium-ip")]
 fn corrupt_tcp_checksum(bytes: &mut [u8]) {
     let mut packet = TcpPacket::new_unchecked(&mut bytes[HEADER_LEN..]);
     let checksum = packet.checksum();
@@ -1771,7 +1727,7 @@ fn corrupt_tcp_checksum(bytes: &mut [u8]) {
 }
 
 #[test]
-#[cfg(all(feature = "medium-ip", feature = "auto-icmp-echo-reply"))]
+#[cfg(feature = "auto-icmp-echo-reply")]
 fn default_meta_verifies_ipv4_checksum() {
     let good = icmp_echo_request_bytes();
     assert_eq!(
@@ -1785,7 +1741,7 @@ fn default_meta_verifies_ipv4_checksum() {
 }
 
 #[test]
-#[cfg(all(feature = "medium-ip", feature = "auto-icmp-echo-reply"))]
+#[cfg(feature = "auto-icmp-echo-reply")]
 fn meta_verified_accepts_corrupt_checksum_ipv4() {
     let mut bytes = icmp_echo_request_bytes();
     corrupt_ipv4_checksum(&mut bytes);
@@ -1798,7 +1754,7 @@ fn meta_verified_accepts_corrupt_checksum_ipv4() {
 
 /// The transport-layer flag does not vouch for the IPv4 header.
 #[test]
-#[cfg(all(feature = "medium-ip", feature = "auto-icmp-echo-reply"))]
+#[cfg(feature = "auto-icmp-echo-reply")]
 fn meta_unverified_drops_corrupt_checksum_ipv4() {
     let mut bytes = icmp_echo_request_bytes();
     corrupt_ipv4_checksum(&mut bytes);
@@ -1810,7 +1766,6 @@ fn meta_unverified_drops_corrupt_checksum_ipv4() {
 }
 
 #[test]
-#[cfg(feature = "medium-ip")]
 fn default_meta_verifies_tcp_checksum() {
     let good = tcp_syn_bytes();
     assert_eq!(
@@ -1824,7 +1779,6 @@ fn default_meta_verifies_tcp_checksum() {
 }
 
 #[test]
-#[cfg(feature = "medium-ip")]
 fn meta_verified_accepts_corrupt_checksum_tcp() {
     let mut bytes = tcp_syn_bytes();
     corrupt_tcp_checksum(&mut bytes);
@@ -1837,7 +1791,6 @@ fn meta_verified_accepts_corrupt_checksum_tcp() {
 
 /// The IPv4 header flag does not vouch for the TCP checksum.
 #[test]
-#[cfg(feature = "medium-ip")]
 fn meta_unverified_drops_corrupt_checksum_tcp() {
     let mut bytes = tcp_syn_bytes();
     corrupt_tcp_checksum(&mut bytes);
