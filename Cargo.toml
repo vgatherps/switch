@@ -32,10 +32,10 @@ members = [
     "relay",
     # TLS 1.3 client over conduit frames
     "sheath",
-    # NIC hardware RX stamp → now latency on the CPU's invariant counter
-    "nic-clock",
     # latency/load bench (plans/bench/design.md)
     "bench",
+    # NIC hardware RX stamp → now latency on the CPU's invariant counter
+    "nic-clock",
 ]
 exclude = ["conduit/vendor/smoltcp", "vendor/rustls"]
 

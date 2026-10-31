@@ -5,6 +5,7 @@
   zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
   zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
   zhida_aws_bench.py cleanup --run-id ID [--region R] [--out DIR]   delete a leftover run's resources
+  zhida_aws_bench.py binance [--region R] [--seconds 600] [--out DIR] [--ttl 2h]   the Binance listener
 
 Needs python3 with boto3, ssh, scp, git, a clean committed tree (the hosts build `git archive HEAD`)
 and AWS credentials for the region. Design: plans/bench/design.md.
@@ -13,8 +14,9 @@ Standard vCPU quota (L-1216C47A: 48 free) before anything is created.
 
 Permissions the caller needs: ec2 (VPC, subnet, internet gateway, route table, security group,
 placement group, key pair, run/terminate/describe instances, create/attach/delete/modify network
-interfaces, delete volumes, create tags, describe instance type offerings), ssm:GetParameter (the
-AL2023 AMI), sts:GetCallerIdentity, servicequotas:GetServiceQuota.
+interfaces, delete volumes, create tags, describe instance type offerings; for `binance` also
+allocate/associate/disassociate/release/describe addresses), ssm:GetParameter (the AL2023 AMI),
+sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 
 `run` creates a VPC, subnet, internet gateway, route table, security group (SSH from the caller's
 address), cluster placement group and key pair for the run; provisions six c7gn.2xlarge on-demand
@@ -25,6 +27,12 @@ worker per sender host over SSH; fetches every result; tears down; runs bench/re
 resource carries the run id and expiry tags and is recorded in RUN_DIR/created.json as it is
 created; teardown deletes all of them and exits non-zero if a final describe still finds any. Each
 instance powers itself off (terminate) at the TTL. Teardown runs on exit, errors, Ctrl-C and SIGTERM.
+
+`binance` does the same with one m7g.xlarge (BINANCE_TYPE) in a precision-time placement group (ENA
+hardware RX timestamps and the PHC), its data ENI with a run Elastic IP (the feed's route out): source,
+hft-host.sh apply, verify, then `deploy/run-binance.sh --seconds N`; fetches /var/log/zhida/binance.log
+and the feed's output into RUN_DIR (with verify.txt), prints the message count and latency, tears down.
+Exit 0 only when the feed exited 0, both files were fetched and teardown verified nothing is left.
 """
 import argparse
 import datetime
@@ -76,6 +84,13 @@ SETUP_REBOOT_S = 900
 # fetches while unwinding to teardown.
 SSH_S = 120
 QUOTA_CODE = "L-1216C47A"
+# The Binance listener host: the smallest 4-vCPU arm64 type of a family that gives ENA hardware RX
+# timestamps and the PHC in a precision-time placement group (deploy/README.md; not c7gn).
+BINANCE_TYPE, BINANCE_VCPUS = "m7g.xlarge", 4
+BINANCE_LOG = "/var/log/zhida/binance.log"
+FEED_OUT = f"{REMOTE}/feed.out"
+# run-binance.sh beyond the feed's --seconds: verify, DNS, port open, the connect (20 s limit), the close.
+FEED_MARGIN_S = 300
 
 
 def log(msg):
@@ -193,6 +208,48 @@ systemctl enable --now zhida-deadman.timer
 """
 
 
+def latency_text(value):
+    """zhida-nic's feed_latency value (conduit/crates/binance-feed/src/lib.rs, Display for Latencies:
+    `no_stamp=N not_ready=N impossible=N max_bound_ns=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
+    per nonempty log2 ns bucket, ascending) -> those counts and the buckets holding p50/p99/p99.9/max
+    of the sampled messages. Anything else (`latency invalid: NIC clock jumped`) is the reason as is."""
+    words = value.split()
+    if not words or not words[0].startswith("no_stamp="):
+        return value
+    counts = [w for w in words if ":" not in w]
+    buckets = [(label, int(n)) for label, n in (w.rsplit(":", 1) for w in words if ":" in w)]
+    samples = sum(n for _, n in buckets)
+    head = f"{samples} samples, {' '.join(counts)}"
+    if not samples:
+        return head
+
+    def bucket(permille):  # nearest rank, in integers: no float rounding past a bucket edge
+        rank, seen = max(1, -(-permille * samples // 1000)), 0
+        for label, n in buckets:
+            seen += n
+            if seen >= rank:
+                return label
+
+    return head + "".join(f", p{pm / 10:g} {bucket(pm)} ns" for pm in (500, 990, 999)) + f", max {buckets[-1][0]} ns"
+
+
+def feed_summary(text, code):
+    """What the Binance run did, from run-binance.sh's exit code (None: it did not finish) and output
+    (None: not fetched): zhida-nic's `feed_count` and `feed_latency` lines, or why there are none."""
+    out = ["run-binance.sh " + ("did not finish" if code is None else f"exit {code}")]
+    if text is None:
+        return out + ["no feed output fetched"]
+    fields = dict(line[len("zhida-nic: "):].split(": ", 1) for line in text.splitlines()
+                  if line.startswith("zhida-nic: ") and ": " in line[len("zhida-nic: "):])
+    if "feed_count" in fields:
+        out.append(f"messages: {fields['feed_count']}")
+    out.append(f"latency: {latency_text(fields['feed_latency'])}" if "feed_latency" in fields
+               else "no feed_latency line")
+    if code != 0:
+        out += ["feed output ends:"] + text.splitlines()[-5:]
+    return out
+
+
 def plan_text(region, ttl, run_id, expires):
     lines = [
         f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
@@ -239,9 +296,10 @@ class Aws:
         self.ec2, self.ssm = clients["ec2"], clients["ssm"]
         self.sts, self.quotas = clients["sts"], clients["service-quotas"]
 
-    def create_network(self, run_id, expires, my_ip, record, key_path):
-        """The run's VPC, subnet, internet gateway and route, security group, placement group and key
-        pair (private key to `key_path`), each passed to `record` as its create succeeds."""
+    def create_network(self, run_id, expires, my_ip, record, key_path, instance_type, strategy):
+        """The run's VPC, subnet (in a zone offering `instance_type`), internet gateway and route,
+        security group, placement group (`strategy`) and key pair (private key to `key_path`), each
+        passed to `record` as its create succeeds."""
         ec2 = self.ec2
         name = f"{NAME}-{run_id}"
 
@@ -252,7 +310,7 @@ class Aws:
         record("vpc", vpc)
         ec2.get_waiter("vpc_available").wait(VpcIds=[vpc])
         ec2.modify_vpc_attribute(VpcId=vpc, EnableDnsHostnames={"Value": True})
-        zone = self.zone_offering()
+        zone = self.zone_offering(instance_type)
         subnet = ec2.create_subnet(VpcId=vpc, CidrBlock=SUBNET_CIDR, AvailabilityZone=zone,
                                    TagSpecifications=spec("subnet"))["Subnet"]["SubnetId"]
         record("subnet", subnet)
@@ -269,7 +327,7 @@ class Aws:
         ec2.authorize_security_group_ingress(GroupId=sg, IpPermissions=[
             {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": sg}]},
             {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": f"{my_ip}/32"}]}])
-        ec2.create_placement_group(GroupName=name, Strategy="cluster", TagSpecifications=spec("placement-group"))
+        ec2.create_placement_group(GroupName=name, Strategy=strategy, TagSpecifications=spec("placement-group"))
         record("placement-group", name)
         material = ec2.create_key_pair(KeyName=name, KeyType="ed25519",
                                        TagSpecifications=spec("key-pair"))["KeyMaterial"]
@@ -278,24 +336,24 @@ class Aws:
             f.write(material)
         return {"name": name, "subnet": subnet, "zone": zone, "sg": sg}
 
-    def zone_offering(self):
+    def zone_offering(self, instance_type):
         offered = self.ec2.describe_instance_type_offerings(
             LocationType="availability-zone",
-            Filters=[{"Name": "instance-type", "Values": [INSTANCE_TYPE]}])["InstanceTypeOfferings"]
+            Filters=[{"Name": "instance-type", "Values": [instance_type]}])["InstanceTypeOfferings"]
         zones = sorted(o["Location"] for o in offered)
         if not zones:
-            raise RuntimeError(f"no zone in {self.region} offers {INSTANCE_TYPE}")
+            raise RuntimeError(f"no zone in {self.region} offers {instance_type}")
         return zones[0]
 
-    def launch_hosts(self, net, run_id, expires, record):
-        """Six instances in one run_instances into the placement group; then one data ENI each
-        (create, attach, DeleteOnTermination); every ID passed to `record` as its create succeeds.
-        Returns host records in ROLES order."""
+    def launch_hosts(self, net, run_id, expires, record, instance_type, roles):
+        """One instance per role in one run_instances into the placement group; then one data ENI
+        each (create, attach, DeleteOnTermination); every ID passed to `record` as its create
+        succeeds. Returns host records in `roles` order."""
         ec2 = self.ec2
         ami = self.ssm.get_parameter(Name=AMI_PARAM)["Parameter"]["Value"]
         tags = run_tags(run_id, expires)
         r = ec2.run_instances(
-            ImageId=ami, InstanceType=INSTANCE_TYPE, MinCount=len(ROLES), MaxCount=len(ROLES), KeyName=net["name"],
+            ImageId=ami, InstanceType=instance_type, MinCount=len(roles), MaxCount=len(roles), KeyName=net["name"],
             InstanceInitiatedShutdownBehavior="terminate",
             Placement={"GroupName": net["name"], "AvailabilityZone": net["zone"]},
             NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": net["subnet"], "Groups": [net["sg"]],
@@ -324,7 +382,15 @@ class Aws:
                      for res in page["Reservations"] for i in res["Instances"]}
         return [{"role": role, "id": iid, "public_ip": described[iid]["PublicIpAddress"],
                  "private_ip": described[iid]["PrivateIpAddress"], "data_eni": enis[iid]}
-                for iid, role in zip(ids, ROLES)]
+                for iid, role in zip(ids, roles)]
+
+    def attach_eip(self, eni, run_id, expires, record):
+        """A run's Elastic IP on the data ENI's private address (`eni` as launch_hosts gives it): an
+        instance with two ENIs gets no public IPv4, and the feed on the data ENI needs one."""
+        alloc = self.ec2.allocate_address(Domain="vpc", TagSpecifications=[
+            {"ResourceType": "elastic-ip", "Tags": run_tags(run_id, expires)}])["AllocationId"]
+        record("address", alloc)
+        self.ec2.associate_address(AllocationId=alloc, NetworkInterfaceId=eni["id"], PrivateIpAddress=eni["ip"])
 
 
 # ---------------------------------------------------------------- hosts
@@ -375,13 +441,12 @@ class Host:
             return None
         return f"{self.role}:{remote}: scp exited {r.returncode}: {(r.stderr or '').strip()[-500:]}"
 
-    def setup(self, archive):
-        """Source, hft-host.sh apply (builds, reboots), verify, then zhida-bench (bootstrap.sh).
-        Returns (ok, report text)."""
+    def install(self, archive):
+        """Source, hft-host.sh apply (builds, reboots), verify. Returns (ok, report text)."""
         self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive,
                  timeout=BUILD_S)
         apply = self.root(f"sh {HFT} apply", check=False, timeout=BUILD_S)
-        text = [f"[{self.role} {self.info['id']} {INSTANCE_TYPE}]", "apply:", apply.stdout.rstrip()]
+        text = [f"[{self.role} {self.info['id']}]", "apply:", apply.stdout.rstrip()]
         if apply.returncode not in (0, 100, 255):  # 100: rebooting; 255: SSH dropped by the reboot
             return False, "\n".join(text + [f"apply exited {apply.returncode}: {apply.stderr.strip()[-2000:]}"])
         # Before the reboot verify fails (cmdline), during it SSH fails; zhida-host.service runs `boot`
@@ -393,10 +458,14 @@ class Host:
                 break
             self._sleep(10)
         text += ["verify:", v.stdout.rstrip()]
-        if v.returncode != 0:
-            return False, "\n".join(text)
-        self.root(f"SRC={SRC_DIR} sh {SRC_DIR}/bench/aws/bootstrap.sh", timeout=BUILD_S)
-        return True, "\n".join(text)
+        return v.returncode == 0, "\n".join(text)
+
+    def setup(self, archive):
+        """install, then zhida-bench (bootstrap.sh)."""
+        ok, text = self.install(archive)
+        if ok:
+            self.root(f"SRC={SRC_DIR} sh {SRC_DIR}/bench/aws/bootstrap.sh", timeout=BUILD_S)
+        return ok, text
 
 
 # ---------------------------------------------------------------- run
@@ -424,10 +493,9 @@ def tree_problems(local):
     return out
 
 
-def quota_check(aws):
-    """(ok, detail): L-1216C47A minus the running on-demand vCPUs leaves room for six hosts. Counts
-    every family (the quota covers only Standard ones), so it can only err towards refusing."""
-    need = len(ROLES) * HOST_VCPUS
+def quota_check(aws, need):
+    """(ok, detail): L-1216C47A minus the running on-demand vCPUs leaves `need`. Counts every family
+    (the quota covers only Standard ones), so it can only err towards refusing."""
     quota = int(aws.quotas.get_service_quota(ServiceCode="ec2", QuotaCode=QUOTA_CODE)["Quota"]["Value"])
     used = 0
     for page in aws.ec2.get_paginator("describe_instances").paginate(
@@ -443,8 +511,9 @@ def quota_check(aws):
     return free >= need, detail
 
 
-def preflight(env, region):
-    """Every check, before anything is created: ([(name, ok, detail)], Aws)."""
+def preflight(env, region, instance_type, vcpus):
+    """Every check, before anything is created: ([(name, ok, detail)], Aws). `vcpus`: the run's
+    instances of `instance_type` together."""
     problems = tree_problems(env.local)
     out = [("source", not problems, "; ".join(problems) or "clean, HEAD has deploy/hft-host.sh")]
     aws = env.aws(region)
@@ -452,16 +521,21 @@ def preflight(env, region):
         who = aws.sts.get_caller_identity()
         out.append(("credentials", True, f"account {who['Account']} as {who['Arn']}"))
     except Exception as e:
-        return out + [("credentials", False, str(e)), ("quota", False, "not checked without credentials")], aws
+        return out + [("credentials", False, str(e))] + [
+            (name, False, "not checked without credentials") for name in ("offering", "quota")], aws
     try:
-        out.append(("quota", *quota_check(aws)))
+        out.append(("offering", True, f"{instance_type} in {aws.zone_offering(instance_type)}"))
+    except Exception as e:
+        out.append(("offering", False, str(e)))
+    try:
+        out.append(("quota", *quota_check(aws, vcpus)))
     except Exception as e:
         out.append(("quota", False, str(e)))
     return out, aws
 
 
-def checked_preflight(env, region):
-    results, aws = preflight(env, region)
+def checked_preflight(env, region, instance_type, vcpus):
+    results, aws = preflight(env, region, instance_type, vcpus)
     for name, ok, detail in results:
         log(f"preflight {name}: {'ok' if ok else 'FAIL'} {detail}")
     if not all(ok for _, ok, _ in results):
@@ -566,13 +640,22 @@ def measure(hosts, facts, receiver_ip, run_dir, env):
     return fetch_errors, failed
 
 
+def exit_on_signal(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def on_signals(handler):
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 def run(args, env=None):
     env = env or Env()
     now = env.now()
     expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
     run_id = new_run_id(now)
     print(plan_text(args.region, args.ttl, run_id, expires))
-    aws = checked_preflight(env, args.region)
+    aws = checked_preflight(env, args.region, INSTANCE_TYPE, len(ROLES) * HOST_VCPUS)
     archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
@@ -580,16 +663,12 @@ def run(args, env=None):
     key_path = os.path.join(run_dir, "key.pem")
     my_ip = env.my_ip()
 
-    def on_signal(signum, _frame):
-        raise SystemExit(128 + signum)
-
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
+    on_signals(exit_on_signal)
     fetch_errors, failed = [], ["(not measured)"]
     # From here on every exit path deletes the run's resources.
     try:
-        net = aws.create_network(run_id, expires, my_ip, created.add, key_path)
-        infos = aws.launch_hosts(net, run_id, expires, created.add)
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, INSTANCE_TYPE, "cluster")
+        infos = aws.launch_hosts(net, run_id, expires, created.add, INSTANCE_TYPE, ROLES)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump(infos, f, indent=1)
         hosts = [env.host(info, key_path, run_dir) for info in infos]
@@ -606,8 +685,7 @@ def run(args, env=None):
         fetch_errors, failed = measure(hosts, facts, receiver_ip, run_dir, env)
     finally:
         # Nothing interrupts teardown; it goes first because the report is local.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        on_signals(signal.SIG_IGN)
         log(f"tearing down run {run_id}")
         torn = teardown(aws.ec2, run_id, created.ids)
         report_code = None
@@ -635,6 +713,59 @@ def teardown(ec2, run_id, recorded):
     return True
 
 
+def binance(args, env=None):
+    """The Binance listener on one BINANCE_TYPE host for --seconds; fetches its output, tears down."""
+    env = env or Env()
+    now = env.now()
+    expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
+    run_id = new_run_id(now)
+    log(f"binance run {run_id}: 1 x {BINANCE_TYPE} in a precision-time placement group, {args.region},"
+        f" feed {args.seconds} s, everything expires {expires.isoformat()}")
+    aws = checked_preflight(env, args.region, BINANCE_TYPE, BINANCE_VCPUS)
+    archive = source_archive(env.local)
+    run_dir = os.path.join(args.out, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    created = janitor.Created(os.path.join(run_dir, "created.json"))
+    key_path = os.path.join(run_dir, "key.pem")
+    my_ip = env.my_ip()
+    on_signals(exit_on_signal)
+    code, fetch_errors, summary = None, ["(not run)"], None
+    # From here on every exit path deletes the run's resources.
+    try:
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, BINANCE_TYPE, "precision-time")
+        [info] = aws.launch_hosts(net, run_id, expires, created.add, BINANCE_TYPE, ["binance"])
+        aws.attach_eip(info["data_eni"], run_id, expires, created.add)
+        with open(os.path.join(run_dir, "hosts.json"), "w") as f:
+            json.dump([info], f, indent=1)
+        host = env.host(info, key_path, run_dir)
+        host.wait_ssh()
+        ok, text = host.install(archive)
+        with open(os.path.join(run_dir, "verify.txt"), "w") as f:
+            f.write(text + "\n")
+        if not ok:
+            raise RuntimeError(f"host setup failed:\n{text}")
+        try:
+            code = host.root(f"mkdir -p {REMOTE} && {SRC_DIR}/deploy/run-binance.sh --seconds {args.seconds}"
+                             f" > {FEED_OUT} 2>&1", check=False, timeout=args.seconds + FEED_MARGIN_S).returncode
+        finally:
+            fetch_errors = [e for e in (host.fetch(BINANCE_LOG, run_dir), host.fetch(FEED_OUT, run_dir)) if e]
+            for e in fetch_errors:
+                log(f"fetch failed: {e}")
+            feed_path = os.path.join(run_dir, os.path.basename(FEED_OUT))
+            if os.path.exists(feed_path):
+                with open(feed_path, errors="replace") as f:
+                    summary = feed_summary(f.read(), code)
+            else:
+                summary = feed_summary(None, code)
+    finally:
+        on_signals(signal.SIG_IGN)
+        log(f"tearing down run {run_id}")
+        torn = teardown(aws.ec2, run_id, created.ids)
+        if summary:
+            log(f"results in {run_dir}:\n  " + "\n  ".join(summary))
+    return 0 if code == 0 and not fetch_errors and torn else 1
+
+
 def cleanup(args, env=None):
     """A leftover run: the IDs its run_dir/created.json recorded, plus a tag lookup."""
     aws = (env or Env()).aws(args.region)
@@ -642,8 +773,7 @@ def cleanup(args, env=None):
     recorded = janitor.read_created(path) if os.path.exists(path) else {}
     log(f"run {args.run_id}: {sum(map(len, recorded.values()))} recorded IDs from {path}" if recorded
         else f"run {args.run_id}: no {path}; tag lookup only")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    on_signals(signal.SIG_IGN)
     return 0 if teardown(aws.ec2, args.run_id, recorded) else 1
 
 
@@ -659,13 +789,18 @@ def parser():
             r.add_argument("--run-id", required=True)
         else:
             r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
+    b = sub.add_parser("binance", help="run the Binance listener (deploy/run-binance.sh) on one EC2 host")
+    b.add_argument("--region", default=REGION)
+    b.add_argument("--seconds", type=int, default=600, help="the feed's --seconds (from the WebSocket open)")
+    b.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
+    b.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
     return p
 
 
 def main(argv, env=None):
     args = parser().parse_args(argv)
     if args.cmd == "preflight":
-        checked_preflight(env or Env(), args.region)
+        checked_preflight(env or Env(), args.region, INSTANCE_TYPE, len(ROLES) * HOST_VCPUS)
         return 0
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -674,6 +809,8 @@ def main(argv, env=None):
         return 0
     if args.cmd == "run":
         return run(args, env)
+    if args.cmd == "binance":
+        return binance(args, env)
     return cleanup(args, env)
 
 
