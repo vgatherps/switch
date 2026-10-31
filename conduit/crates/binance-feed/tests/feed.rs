@@ -156,7 +156,6 @@ fn with_net<T>(
             stack,
             NetConfig {
                 ingress_budget: INGRESS_BUDGET,
-                turn_request: None,
             },
         );
         let result = body(&mut net, &clock, listener);

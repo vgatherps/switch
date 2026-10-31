@@ -1,6 +1,6 @@
-//! A Net with `NetConfig::turn_request`: once a poll's tasks hand the Stack one `tx_burst` of
-//! frames, the poll stops before its next task; the Net turn then sends them and clears the
-//! request, and the next poll goes on with the tasks left.
+//! Once a poll's tasks hand the Stack one `tx_burst` of frames, the poll ends before its next
+//! task (`switch::request_turn`); the Net turn then sends them, and the next poll goes on
+//! with the tasks left. Nothing to configure.
 
 use switchnet::{IpEndpoint, NetHandle, TxFrame};
 use zhida_test_kit::with_eal;
@@ -21,15 +21,13 @@ async fn filled(handle: &NetHandle, data: &[u8]) -> TxFrame {
 #[zhida_test_support::pinned_test]
 fn a_udp_burst_stops_the_poll_until_the_net_turns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_turn_request(eal, ["urua", "urub"]);
-        let request = mixed.rt.turn_request();
+        let mut mixed = Mixed::new(eal, ["urua", "urub"]);
         let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let reader = mixed.spawn(async move { (rx.recv().await, rx) });
         peer_udp_send(&mut mixed, &peer, 7000, b"ping");
         let (ping, rx) = mixed.wait(&reader);
-        assert!(!request.is_set(), "receiving set the request");
         let handle = mixed.handle();
         let to = IpEndpoint::new(peer_ip().into(), 7001);
         let writer = mixed.spawn(async move {
@@ -43,10 +41,8 @@ fn a_udp_burst_stops_the_poll_until_the_net_turns() {
         let later = mixed.spawn(later);
         mixed.rt.poll(0).unwrap();
         assert!(writer.is_full());
-        assert!(request.is_set());
         assert_eq!(polls.get(), 0, "a task after the burst was polled before the Net turned");
         mixed.net.turn(mixed.now).unwrap();
-        assert!(!request.is_set());
         assert_eq!(mixed.to_peer.forward(), TX_BURST);
         mixed.rt.poll(0).unwrap();
         assert_eq!(polls.get(), 1);
@@ -64,11 +60,9 @@ fn a_udp_burst_stops_the_poll_until_the_net_turns() {
 #[zhida_test_support::pinned_test]
 fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_turn_request(eal, ["urta", "urtb"]);
-        let request = mixed.rt.turn_request();
+        let mut mixed = Mixed::new(eal, ["urta", "urtb"]);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         mixed.net.turn(mixed.now).unwrap();
-        assert!(!request.is_set());
         let (rx, mut tx) = stream.split();
         let handle = mixed.handle();
         let writer = mixed.spawn(async move {
@@ -83,10 +77,8 @@ fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
         let later = mixed.spawn(later);
         mixed.rt.poll(0).unwrap();
         assert!(writer.is_full());
-        assert!(request.is_set());
         assert_eq!(polls.get(), 0, "a task after the burst was polled before the Net turned");
         mixed.net.turn(mixed.now).unwrap();
-        assert!(!request.is_set());
         assert!(mixed.to_peer.forward() > 0);
         mixed.rt.poll(0).unwrap();
         assert_eq!(polls.get(), 1);
@@ -103,12 +95,11 @@ fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
     })
 }
 
-/// Fewer frames than one burst leave the request unset and the poll whole.
+/// Fewer frames than one burst leave the poll whole.
 #[zhida_test_support::pinned_test]
 fn fewer_frames_than_a_burst_do_not_stop_the_poll() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_turn_request(eal, ["urfa", "urfb"]);
-        let request = mixed.rt.turn_request();
+        let mut mixed = Mixed::new(eal, ["urfa", "urfb"]);
         let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -127,10 +118,47 @@ fn fewer_frames_than_a_burst_do_not_stop_the_poll() {
         let (later, polls) = counted(async {});
         let later = mixed.spawn(later);
         mixed.rt.poll(0).unwrap();
-        assert!(!request.is_set());
         assert_eq!(polls.get(), 1);
         later.take();
         drop((ping, rx, writer.take(), peer));
+        mixed.close();
+    })
+}
+
+/// Frames sent outside any task, past one burst: no panic, and the next poll is whole.
+#[zhida_test_support::pinned_test]
+fn a_burst_sent_outside_any_task_does_not_stop_the_next_poll() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["uroa", "urob"]);
+        let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let (mut rx, mut tx) = socket.split();
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        let reader = mixed.spawn(async move { (rx.recv().await, rx) });
+        peer_udp_send(&mut mixed, &peer, 7000, b"ping");
+        let (ping, rx) = mixed.wait(&reader);
+        let handle = mixed.handle();
+        let frames = mixed.spawn(async move {
+            let mut frames = Vec::new();
+            for i in 0..=TX_BURST {
+                frames.push(filled(&handle, &[i as u8; 16]).await);
+            }
+            frames
+        });
+        let frames = mixed.wait(&frames);
+        let to = IpEndpoint::new(peer_ip().into(), 7001);
+        for frame in frames {
+            tx.send(Some(to), frame).map_err(|(_, error)| error).unwrap();
+        }
+        let (first, first_polls) = counted(async {});
+        let (second, second_polls) = counted(async {});
+        let (first, second) = (mixed.spawn(first), mixed.spawn(second));
+        mixed.rt.poll(0).unwrap();
+        assert_eq!((first_polls.get(), second_polls.get()), (1, 1));
+        first.take();
+        second.take();
+        mixed.net.turn(mixed.now).unwrap();
+        assert_eq!(mixed.to_peer.forward(), TX_BURST + 1);
+        drop((ping, rx, tx, peer));
         mixed.close();
     })
 }

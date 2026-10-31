@@ -1,5 +1,5 @@
-//! A `TurnRequest` stops `Runtime::poll` after the task being polled; the next poll first
-//! finishes that round, then tasks woken between polls, then deferred ones.
+//! `request_turn` from a task ends `Runtime::poll` after that task's poll; the next poll
+//! first finishes that round, then tasks woken between polls, then deferred ones.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -8,7 +8,8 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use crate::executor::Executor;
-use crate::runtime::{Runtime, TurnRequest};
+use crate::request_turn;
+use crate::runtime::Runtime;
 use crate::StoredWaker;
 
 type Log = Rc<RefCell<Vec<&'static str>>>;
@@ -18,13 +19,13 @@ type Log = Rc<RefCell<Vec<&'static str>>>;
 enum Act {
     /// Park; later polls finish.
     Park,
-    /// Set the turn request and wake itself; the next poll finishes.
+    /// Request a turn and wake itself; the next poll finishes.
     RequestAndWake,
-    /// Set the turn request and finish.
+    /// Request a turn and finish.
     RequestAndFinish,
-    /// Set the turn request and panic.
+    /// Request a turn and panic.
     RequestAndPanic,
-    /// Set the turn request and park; later polls finish.
+    /// Request a turn and park; later polls finish.
     RequestAndPark,
     /// Panic.
     Panic,
@@ -39,7 +40,6 @@ struct Step {
     name: &'static str,
     act: Act,
     polls: u32,
-    request: TurnRequest,
     log: Log,
     waker: Rc<RefCell<Option<Waker>>>,
     drops: Rc<Cell<u32>>,
@@ -58,26 +58,26 @@ impl Future for Step {
         match self.act {
             Act::Park => Poll::Pending,
             Act::RequestAndWake => {
-                self.request.set();
+                request_turn();
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Act::RequestAndFinish => {
-                self.request.set();
+                request_turn();
                 Poll::Ready(())
             }
             Act::RequestAndPanic => {
-                self.request.set();
+                request_turn();
                 panic_any(7u32)
             }
             Act::RequestAndPark => {
-                self.request.set();
+                request_turn();
                 Poll::Pending
             }
             Act::Panic => panic_any(7u32),
             Act::WakeRequestAndFinish => {
                 cx.waker().wake_by_ref();
-                self.request.set();
+                request_turn();
                 Poll::Ready(())
             }
             Act::Defer => {
@@ -102,7 +102,6 @@ fn step(step: Step) -> impl Future<Output = ()> {
 
 struct Fixture {
     runtime: Runtime,
-    request: TurnRequest,
     log: Log,
     wakers: Vec<Rc<RefCell<Option<Waker>>>>,
     drops: Rc<Cell<u32>>,
@@ -113,9 +112,8 @@ impl Fixture {
     /// One task per `(name, act)`, spawned in order.
     fn new(steps: &[(&'static str, Act)]) -> Self {
         let runtime = Runtime::new(0);
-        let request = runtime.turn_request();
         let (log, drops) = (Log::default(), Rc::new(Cell::new(0)));
-        let mut f = Self { runtime, request, log, wakers: Vec::new(), drops, dropped: Log::default() };
+        let mut f = Self { runtime, log, wakers: Vec::new(), drops, dropped: Log::default() };
         for &(name, act) in steps {
             f.spawn(name, act);
         }
@@ -128,7 +126,6 @@ impl Fixture {
             name,
             act,
             polls: 0,
-            request: self.request.clone(),
             log: self.log.clone(),
             waker: waker.clone(),
             drops: self.drops.clone(),
@@ -156,16 +153,13 @@ impl Fixture {
     }
 }
 
+/// Outside a `Runtime::poll` a request does nothing: the next poll polls every task.
 #[test]
-fn a_set_request_polls_no_task_but_still_queues_work() {
-    let mut f = Fixture::new(&[("a", Act::Park)]);
-    f.request.set();
-    let report = f.runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.live_tasks), (0, 1));
-    assert!(f.taken().is_empty());
-    f.request.clear();
-    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
-    assert_eq!(f.taken(), ["a"]);
+fn a_request_outside_a_poll_does_nothing() {
+    let mut f = Fixture::new(&[("a", Act::Park), ("b", Act::Park)]);
+    request_turn();
+    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 2);
+    assert_eq!(f.taken(), ["a", "b"]);
 }
 
 #[test]
@@ -177,9 +171,7 @@ fn a_request_after_a_self_wake_stops_the_poll_and_the_round_resumes_first() {
     // b and c are left in the round; a's self-wake is one entry in `incoming`.
     assert_eq!(unsafe { Executor::tail_len(f.root()) }, 2);
     assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (1, 0));
-    // Still set: the next poll polls nothing.
-    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 0);
-    f.request.clear();
+    // The request lasted one poll: the next one resumes.
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (3, 2));
     assert_eq!(f.taken(), ["b", "c", "a"]);
@@ -193,7 +185,6 @@ fn a_request_from_a_finishing_task_stops_after_it_is_reclaimed() {
     assert_eq!(f.taken(), ["a"]);
     assert_eq!(f.drops.get(), 1);
     assert_eq!(unsafe { Executor::tail_len(f.root()) }, 1);
-    f.request.clear();
     // A task spawned between polls runs after the leftover b.
     f.spawn("n", Act::Park);
     let report = f.runtime.poll(0).unwrap();
@@ -218,7 +209,6 @@ fn a_panic_in_the_last_task_polled_leaves_the_round_to_shutdown() {
     let payload = catch_unwind(AssertUnwindSafe(|| f.runtime.poll(0))).unwrap_err();
     assert_eq!(payload.downcast_ref::<u32>(), Some(&7));
     assert_eq!(f.taken(), ["a"]);
-    f.request.clear();
     assert_eq!(f.runtime.poll(0).unwrap_err(), crate::RuntimeError::Panicked);
     f.runtime.shutdown();
     assert!(f.taken().is_empty());
@@ -246,7 +236,6 @@ fn wakes_while_a_round_is_left_run_after_it_in_order() {
     f.wake(0);
     assert_eq!(unsafe { Executor::tail_len(f.root()) }, 2);
     assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (1, 1));
-    f.request.clear();
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (4, 0));
     assert_eq!(f.taken(), ["b", "c", "d", "e"]);
@@ -269,7 +258,6 @@ fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
     assert_eq!(f.taken(), ["a"]);
     assert_eq!(*f.dropped.borrow(), ["a"]);
     assert_eq!(unsafe { Executor::tail_len(root) }, 3);
-    f.request.clear();
     let a_slot = f.slot(0);
     f.spawn("n", Act::Park);
     assert_eq!(unsafe { Executor::incoming_last(root) }.cast(), a_slot, "n did not take a's freed slot");
@@ -278,7 +266,6 @@ fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
     assert_eq!(f.taken(), ["b"]);
     assert_eq!(unsafe { Executor::tail_len(root) }, 2);
     assert_eq!(unsafe { Executor::queue_lengths(root) }, (1, 0));
-    f.request.clear();
     let payload = catch_unwind(AssertUnwindSafe(|| f.runtime.poll(0))).unwrap_err();
     assert_eq!(payload.downcast_ref::<u32>(), Some(&7));
     assert_eq!(f.taken(), ["c"]);
@@ -304,7 +291,6 @@ fn a_self_wake_with_a_request_and_ready_in_one_poll() {
     f.spawn("n", Act::Park);
     let n_slot = unsafe { Executor::incoming_last(f.root()) }.cast();
     assert_ne!(n_slot, f.slot(0), "n took a slot whose wake is still queued");
-    f.request.clear();
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (2, 2));
     assert_eq!(f.taken(), ["b", "n"]);
@@ -314,4 +300,30 @@ fn a_self_wake_with_a_request_and_ready_in_one_poll() {
     assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
     assert_eq!(f.taken(), ["m"]);
     assert_eq!(f.drops.get(), 1);
+}
+
+/// A task that polls another Runtime, then requests a turn: the inner poll restored the
+/// outer one as the polling executor, so the request ends the outer poll.
+#[test]
+fn a_request_after_an_inner_poll_ends_the_outer_poll() {
+    #[switch::task]
+    async fn polls_inner_then_requests(log: Log) {
+        let mut inner = Runtime::new(0);
+        inner.spawner().spawn(noted("inner", log.clone())).unwrap();
+        assert_eq!(inner.poll(0).unwrap().tasks_polled, 1);
+        log.borrow_mut().push("outer");
+        request_turn();
+    }
+    #[switch::task]
+    async fn noted(name: &'static str, log: Log) {
+        log.borrow_mut().push(name);
+    }
+    let mut runtime = Runtime::new(0);
+    let log = Log::default();
+    runtime.spawner().spawn(polls_inner_then_requests(log.clone())).unwrap();
+    runtime.spawner().spawn(noted("next", log.clone())).unwrap();
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(*log.borrow(), ["inner", "outer"]);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(*log.borrow(), ["inner", "outer", "next"]);
 }
