@@ -11,7 +11,7 @@ __attribute__((nonnull(1, 2))) void zhida_pktmbuf_attach(struct rte_mbuf *mi,
   rte_pktmbuf_attach(mi, md);
 }
 
-// DPDK's field copy pattern + overflow check. Returns underlying direct mbuf.
+// rte_pktmbuf_attach's field copies for a direct-buffer source. Returns underlying direct mbuf.
 __attribute__((always_inline)) static inline struct rte_mbuf *
 zhida_pktmbuf_attach_fast(struct rte_mbuf *__restrict mi,
                           struct rte_mbuf *__restrict md) {
@@ -24,12 +24,9 @@ zhida_pktmbuf_attach_fast(struct rte_mbuf *__restrict mi,
   mi->priv_size = md->priv_size;
   mi->ol_flags = md->ol_flags | RTE_MBUF_F_INDIRECT;
 
-  mi->port = md->port;
-  mi->vlan_tci = md->vlan_tci;
-  mi->vlan_tci_outer = md->vlan_tci_outer;
-  mi->tx_offload = md->tx_offload;
-  mi->hash = md->hash;
-  mi->packet_type = md->packet_type;
+  // port, VLAN tags, tx_offload, hash, packet_type and the dynamic fields, as
+  // rte_pktmbuf_attach copies them.
+  __rte_pktmbuf_copy_hdr(mi, md);
 
   mi->data_off = md->data_off;
   mi->data_len = md->data_len;
@@ -57,12 +54,9 @@ zhida_pktmbuf_attach_for_clone(struct rte_mbuf *__restrict mi,
   mi->priv_size = md->priv_size;
   mi->ol_flags = md->ol_flags | RTE_MBUF_F_INDIRECT;
 
-  mi->port = md->port;
-  mi->vlan_tci = md->vlan_tci;
-  mi->vlan_tci_outer = md->vlan_tci_outer;
-  mi->tx_offload = md->tx_offload;
-  mi->hash = md->hash;
-  mi->packet_type = md->packet_type;
+  // port, VLAN tags, tx_offload, hash, packet_type and the dynamic fields, as
+  // rte_pktmbuf_attach copies them.
+  __rte_pktmbuf_copy_hdr(mi, md);
 
   mi->data_off = md->data_off;
   mi->data_len = md->data_len;
