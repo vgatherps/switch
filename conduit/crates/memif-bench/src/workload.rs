@@ -1068,7 +1068,7 @@ impl Peer {
     }
 }
 
-/// Echo up to the free send space, retaining any unread frame bytes for the next poll.
+/// Echo up to the free send space and TX frames, retaining any unsent frame bytes for the next poll.
 fn echo(socket: &mut tcp::Socket<'static>, pending: &mut Option<(tcp::TcpFrame, usize)>) -> usize {
     let mut echoed = 0usize;
     loop {
@@ -1085,11 +1085,14 @@ fn echo(socket: &mut tcp::Socket<'static>, pending: &mut Option<(tcp::TcpFrame, 
         }
         let (frame, offset) = pending.as_mut().unwrap();
         let read = room.min(frame.payload().len() - *offset);
+        // Short when the socket's TX frame limit or the shared frame pool runs out before its bytes do.
         let sent = socket.send_slice(&frame.payload()[*offset..*offset + read])
             .expect("Established or CloseWait");
-        assert_eq!(sent, read, "send buffer had room for every byte read");
-        *offset = offset.checked_add(read).expect("echo frame offset exceeds usize");
-        echoed = echoed.checked_add(read).expect("echo count exceeds usize");
+        if sent == 0 {
+            return echoed;
+        }
+        *offset = offset.checked_add(sent).expect("echo frame offset exceeds usize");
+        echoed = echoed.checked_add(sent).expect("echo count exceeds usize");
         if *offset == frame.payload().len() {
             *pending = None;
         }
@@ -1197,6 +1200,49 @@ mod tests {
             assert_eq!(socket.held_frames().count(), 1);
             let mut received = Vec::new();
             let mut echoed = 4;
+            pair.drive(|_, _| {}, |a, b| {
+                let bytes = pair::drain_bytes(a.tcp_mut(&client)).unwrap();
+                received.extend_from_slice(&bytes);
+                let sent = echo(b.tcp_mut(&server), &mut pending);
+                echoed += sent;
+                if received.len() == prefix.len() + payload.len() { App::Done }
+                else if sent > 0 || !bytes.is_empty() { App::Moved } else { App::Idle }
+            });
+            assert_eq!(echoed, payload.len());
+            assert_eq!(&received[..prefix.len()], prefix.as_slice());
+            assert_eq!(&received[prefix.len()..], payload.as_slice());
+            assert!(pending.is_none());
+            assert_eq!(pair.b.tcp(&server).held_frames().count(), 0);
+            assert_eq!(pair.close(), 0);
+        });
+    }
+
+    #[zhida_test_support::pinned_test]
+    fn echo_retains_bytes_until_tx_frames_return() {
+        zhida_test_kit::with_eal(|eal| {
+            use zhida_test_kit::pair::{self, App, Side};
+            let mut pair = pair::new_pair(eal, ["echfrmea", "echfrmeb"]);
+            let ([client, server], _) = pair::establish(&mut pair, Side::A);
+            let payload = pair::pattern(2000, 43);
+            assert_eq!(pair.a.tcp_mut(&client).send_slice(&payload), Ok(payload.len()));
+            pair.drive(|_, _| {}, |_, b| {
+                if b.tcp(&server).recv_queue() == payload.len() { App::Done } else { App::Idle }
+            });
+            // An unsent 100-byte tail frame, then the app holds every free frame: the socket
+            // keeps byte room, but send_slice can only fill the tail frame up to MSS 1460.
+            let prefix = vec![0xa5; 100];
+            assert_eq!(pair.b.tcp_mut(&server).send_slice(&prefix), Ok(prefix.len()));
+            let held: Vec<_> = std::iter::from_fn(|| pair.b.tx_frame()).collect();
+            let socket = pair.b.tcp_mut(&server);
+            let mut pending = None;
+            assert_eq!(echo(socket, &mut pending), 1360);
+            assert_eq!(socket.send_queue(), 1460);
+            assert!(socket.send_capacity() > socket.send_queue());
+            assert_eq!(pending.as_ref().map(|(_, offset)| *offset), Some(1360));
+            assert_eq!(echo(socket, &mut pending), 0);
+            drop(held);
+            let mut received = Vec::new();
+            let mut echoed = 1360;
             pair.drive(|_, _| {}, |a, b| {
                 let bytes = pair::drain_bytes(a.tcp_mut(&client)).unwrap();
                 received.extend_from_slice(&bytes);
