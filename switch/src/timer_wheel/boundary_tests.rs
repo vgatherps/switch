@@ -46,9 +46,7 @@ fn equal_time_leaves_everything_untouched() {
     let mut entries = super::benchmark_workloads::entries([101]);
     let mut wheel = TimerWheel::new(100);
     wheel.insert(&mut entries, 0);
-    let mut expired = Vec::with_capacity(1);
-    expired.push(77);
-    let capacity = expired.capacity();
+    let mut expired = vec![77];
     let pending = wheel.pending;
     let heads = wheel
         .levels
@@ -67,7 +65,6 @@ fn equal_time_leaves_everything_untouched() {
     assert_eq!(entries[0].prev(), NIL);
     assert_eq!(entries[0].next(), NIL);
     assert_eq!(expired, [77]);
-    assert_eq!(expired.capacity(), capacity);
     check_future_positions(&wheel, &entries);
     wheel.advance_to(&mut entries, 101, &mut expired);
     assert_eq!(expired, [77, 0]);

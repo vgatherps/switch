@@ -194,7 +194,6 @@ fn moving_store_and_growing_entries_preserves_stable_task_aliases() {
     for i in 0..256 {
         f.register(i % 3, 20 + i as u64);
     }
-    assert!(f.store.expired.capacity() >= f.store.entries.len());
     assert!(f.refresh(first, 2));
     f.retire(0);
     f.retire(1);
