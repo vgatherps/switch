@@ -388,26 +388,13 @@ fn ingress_reply_rebuilds_template_in_winning_slot() {
 }
 
 /// The gateway's entry expires at 60 s and no egress pass ran since. An
-/// out-of-order segment from the routed peer gets an immediate ACK from the
-/// socket. First use starts the 3 s stale window: the ACK uses the old gateway
-/// MAC and egress sends its ARP probe. After that window, only ARP goes out.
+/// out-of-order segment from the routed peer gets an immediate ACK at the
+/// cached gateway MAC, and egress sends the gateway's ARP probe.
 #[test]
-fn ingress_reply_after_gateway_expiry_sends_arp() {
+fn ingress_reply_after_gateway_expiry_probes() {
     let remote = Ipv4Address::new(198, 51, 100, 2);
-    for (millis, ack_sent) in [(61_000, true), (64_000, false), (70_000, true)] {
+    for millis in [61_000, 70_000] {
         let mut peer = Peer::new(2, remote, Some(PEER));
-        if !ack_sent {
-            assert_eq!(
-                peer.iface
-                    .inner
-                    .neighbor_cache
-                    .lookup(&PEER.into(), Instant::from_millis(61_000)),
-                NeighborAnswer::Stale {
-                    hardware_addr: PEER_MAC.into(),
-                    probe: true,
-                }
-            );
-        }
         let mut tcp = peer.reply(TcpControl::None, peer.ack);
         tcp.seq_number = TcpSeqNumber(111);
         tcp.max_seg_size = None;
@@ -416,11 +403,9 @@ fn ingress_reply_after_gateway_expiry_sends_arp() {
         peer.iface.poll_ingress_single(
             Instant::from_millis(millis), &mut peer.device, &mut peer.sockets,
         );
-        if ack_sent {
-            peer.take_tcp(TcpControl::None, &[]);
-            assert!(peer.device.tx_queue.is_empty());
-            peer.egress(millis);
-        }
+        peer.take_tcp(TcpControl::None, &[]);
+        assert!(peer.device.tx_queue.is_empty());
+        peer.egress(millis);
         peer.take_arp_request(PEER);
     }
 }
@@ -438,14 +423,50 @@ fn arp_mac_change_updates_next_segment() {
     assert!(peer.device.tx_queue.is_empty());
 }
 
+/// An expired entry sends to its cached MAC and probes once per lifetime; an unanswered probe
+/// leaves it usable, so the retransmit after 63 s still goes out with no ARP.
 #[test]
-fn expired_entry_sends_arp() {
+fn expired_entry_probes_once_and_keeps_sending() {
     let mut peer = Peer::new(2, PEER, None);
     peer.send(60_001);
     peer.take_tcp(TcpControl::Psh, &[0x5a]);
     peer.take_arp_request(PEER);
     peer.egress(63_001);
-    peer.take_arp_request(PEER);
+    peer.take_tcp(TcpControl::Psh, &[0x5a]);
+    assert!(peer.device.tx_queue.is_empty());
+}
+
+/// A peer that never answers the lifetime probe keeps getting ACKs at its cached MAC, well past
+/// 63 s, with one probe per 60 s lifetime.
+#[test]
+fn unanswered_probe_keeps_acks_flowing() {
+    let mut peer = Peer::new(2, PEER, None);
+    let mut seq = TcpSeqNumber(101);
+    for (millis, probe) in [
+        (30_000, false),
+        (60_000, true),
+        (63_000, false),
+        (64_001, false),
+        (119_999, false),
+        (120_000, true),
+        (150_000, false),
+    ] {
+        let mut tcp = peer.reply(TcpControl::None, peer.ack);
+        tcp.seq_number = seq;
+        tcp.max_seg_size = None;
+        tcp.payload = &[0x5a];
+        peer.device.rx_queue.push_back(peer.frame(tcp));
+        peer.iface.poll_ingress_single(
+            Instant::from_millis(millis), &mut peer.device, &mut peer.sockets,
+        );
+        seq += 1;
+        peer.egress(millis);
+        peer.take_tcp(TcpControl::None, &[]);
+        if probe {
+            peer.take_arp_request(PEER);
+        }
+        assert!(peer.device.tx_queue.is_empty(), "extra frame at {millis}");
+    }
 }
 
 /// TCP segments received from a known peer leave its neighbor entry untouched: `changes` stays
@@ -648,20 +669,10 @@ mod invalidation {
         let mut peer = Peer::new(2, PEER, None);
         peer.warm();
         peer.send(60_002);
-        peer.take_generic_tcp(TcpControl::Psh, &[0x5a]);
+        peer.ack = peer.take_generic_tcp(TcpControl::Psh, &[0x5a]);
         peer.take_arp_request(PEER);
-        peer.egress(63_002);
-        peer.take_arp_request(PEER);
-        // The retransmit parked at 63_002 (NotFound after the stale window). A same-MAC answer
-        // does not bump `changes`, so it resumes at its 1 s discovery deadline.
-        let changes = peer.iface.inner.neighbor_cache.changes();
-        peer.arp(63_003, peer.remote, peer.mac);
-        assert_eq!(peer.iface.inner.neighbor_cache.changes(), changes);
-        peer.egress(64_001);
-        assert!(peer.device.tx_queue.is_empty());
-        peer.egress(64_002);
-        peer.check_data(64_002);
-        peer.data(64_003);
+        peer.acknowledge(60_002);
+        peer.data(60_003);
     }
 
     #[test]

@@ -373,65 +373,6 @@ fn waiting_socket_changed_by_app_keeps_arp_deadline() {
     assert_eq!(sockets.waiting, vec![0]);
 }
 
-/// A SYN parks after its neighbor's stale window has ended. A late same-MAC ARP answer does not
-/// bump `changes`, so the socket stays parked and sends nothing until its 1 s discovery deadline;
-/// at the deadline it finds the neighbor and sends the SYN.
-#[test]
-fn late_same_mac_answer_releases_parked_syn_at_discovery_deadline() {
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
-    iface
-        .inner
-        .neighbor_cache
-        .fill_with_expiration(REMOTE.into(), REMOTE_HARDWARE.into(), START);
-    assert!(matches!(
-        iface.inner.neighbor_cache.lookup(&REMOTE.into(), START),
-        NeighborAnswer::Stale { .. }
-    ));
-    let now = START + Duration::from_millis(3_000);
-    assert_eq!(
-        iface.inner.neighbor_cache.lookup(&REMOTE.into(), now),
-        NeighborAnswer::NotFound
-    );
-    connect(&mut iface, &mut sockets, 1234);
-    iface.poll_egress(now, &mut device, &mut sockets);
-    assert_eq!(sockets.waiting.len(), 1);
-    device.tx_queue.clear();
-
-    let local_hardware = iface.inner.hardware_addr.ethernet_or_panic();
-    let arp = ArpRepr::EthernetIpv4 {
-        operation: ArpOperation::Reply,
-        source_hardware_addr: REMOTE_HARDWARE,
-        source_protocol_addr: REMOTE,
-        target_hardware_addr: local_hardware,
-        target_protocol_addr: LOCAL,
-    };
-    let mut bytes = vec![0; EthernetFrame::<&[u8]>::buffer_len(arp.buffer_len())];
-    let mut ethernet = EthernetFrame::new_unchecked(&mut bytes);
-    ethernet.set_src_addr(REMOTE_HARDWARE);
-    ethernet.set_dst_addr(local_hardware);
-    ethernet.set_ethertype(EthernetProtocol::Arp);
-    arp.emit(&mut ArpPacket::new_unchecked(ethernet.payload_mut()));
-    device.rx_queue.push_back(bytes);
-    let answer = now + Duration::from_millis(200);
-    let changes = iface.inner.neighbor_cache.changes();
-    iface.poll_ingress_single(answer, &mut device, &mut sockets);
-    assert_eq!(iface.inner.neighbor_cache.changes(), changes);
-
-    let deadline = now + crate::iface::socket_meta::Meta::DISCOVERY_SILENT_TIME;
-    for before in [answer, deadline - Duration::from_millis(1)] {
-        iface.poll_egress(before, &mut device, &mut sockets);
-        assert!(device.tx_queue.is_empty(), "sent at {before}");
-        assert_eq!(sockets.waiting.len(), 1);
-    }
-    iface.poll_at(deadline, &mut sockets);
-    iface.poll_egress(deadline, &mut device, &mut sockets);
-    let (port, control, _, payload) = take_tcp(&mut device);
-    assert_eq!((port, control), (1234, TcpControl::Syn));
-    assert!(payload.is_empty());
-    assert!(device.tx_queue.is_empty());
-    assert!(sockets.waiting.is_empty());
-}
-
 #[rstest::rstest]
 #[case(1, false)]
 #[case(64, false)]

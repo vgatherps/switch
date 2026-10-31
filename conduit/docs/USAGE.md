@@ -335,9 +335,11 @@ Stack sends no gratuitous ARP for it.
 only in tests and benchmarks. `neighbor_capacity: usize` controls the ARP cache. `DEFAULT_NEIGHBOR_CAPACITY` is 256. A
 new neighbor in a full cache evicts the neighbor that expires first; only that eviction scans the
 cache, and a lookup is one hash probe. Only ARP updates an entry; received IP traffic does not
-refresh it. Past its 60 s lifetime an entry keeps forwarding for 3 s from its first use, while a
-broadcast ARP probe goes out once a second; an answer with the same MAC extends it without invalidating
-sockets' cached headers, and a changed MAC replaces it. Egress sends one segment per
+refresh it. A resolved entry keeps forwarding indefinitely: the first send after its 60 s lifetime
+goes out with one broadcast ARP probe, and the probe extends the entry by another 60 s whether or
+not it is answered. An ARP reply or request to us with the same MAC extends the entry without
+invalidating sockets' cached headers; a gratuitous ARP with the same MAC changes nothing. Any of
+them with a changed MAC replaces the entry (a gratuitous ARP only an existing one). Egress sends one segment per
 TCP socket visit while other sockets have frames ready; a socket alone keeps sending while it is due.
 
 `max_sockets: usize` is the TCP slot limit and must be positive, even for a UDP-only application.
