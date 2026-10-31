@@ -1,7 +1,8 @@
 use super::*;
 use crate::StoredWaker;
+use crate::runtime::{Capacity, Runtime, RuntimeError, core};
 use crate::task::header::{DEFERRED, DROP_STARTED, LIVE, QUEUED, TAKEN};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -10,19 +11,21 @@ use std::task::{Context, Poll, Waker};
 #[path = "waker_tests.rs"]
 mod waker_tests;
 
-#[path = "registration_tests.rs"]
-mod registration_tests;
-
-struct Owner(*mut Executor);
+/// A runtime driven through `Runtime::poll`, and its executor for white-box checks.
+struct Owner(*mut Executor, RefCell<Runtime>);
 
 #[test]
 fn constructor_uses_initial_timer_tick() {
-    let ptr = Box::into_raw(Box::new(Executor::with_capacity(123, 17, 23)));
-    let owner = Owner(ptr);
+    let owner = Owner::with(Runtime::with_capacity(
+        123,
+        Capacity {
+            tasks: 17,
+            timers: 23,
+        },
+    ));
     unsafe {
-        assert_eq!((*ptr).timers.current_tick(), 123);
+        assert_eq!((*owner.0).timers.current_tick(), 123);
     }
-    owner.cleanup();
 }
 /// A wake queue at capacity: one more append panics rather than writing past the buffer.
 #[test]
@@ -37,7 +40,10 @@ fn append_to_a_full_wake_queue_panics() {
 
 impl Owner {
     fn new() -> Self {
-        Self(Box::into_raw(Box::new(Executor::new())))
+        Self::with(Runtime::new(0))
+    }
+    fn with(runtime: Runtime) -> Self {
+        Self(core(&runtime), RefCell::new(runtime))
     }
     fn spawn<T: Task>(&self, token: SpawnToken<T>) {
         unsafe { Executor::spawn(self.0, token, None) };
@@ -46,22 +52,17 @@ impl Owner {
     fn last(&self) -> *const TaskHeader {
         unsafe { *(*self.0).incoming.last().expect("no queued task") }
     }
-    fn poll(&self) -> bool {
-        unsafe { Executor::poll(self.0) }
+    /// One `Runtime::poll`; the tasks it polled.
+    fn poll(&self) -> Result<usize, RuntimeError> {
+        self.1.borrow_mut().poll(0).map(|report| report.tasks_polled)
     }
     fn counts(&self) -> (usize, usize) {
         unsafe { ((*self.0).task_count, (*self.0).allocated) }
     }
+    /// Cleanup without freeing the executor, so tests can inspect it; the
+    /// runtime's own shutdown repeats it when the owner drops.
     fn cleanup(&self) {
         unsafe { Executor::cleanup(self.0) }
-    }
-}
-impl Drop for Owner {
-    fn drop(&mut self) {
-        self.cleanup();
-        unsafe {
-            drop(Box::from_raw(self.0));
-        }
     }
 }
 
@@ -96,6 +97,8 @@ struct Probe {
     panic_poll: bool,
     panic_drop: bool,
     wake_drop: bool,
+    /// Call `request_turn` in every poll: the `Runtime::poll` ends after it.
+    turn: bool,
     waker: Option<Waker>,
 }
 impl Probe {
@@ -108,6 +111,7 @@ impl Probe {
             panic_poll: false,
             panic_drop: false,
             wake_drop: false,
+            turn: false,
             waker: None,
         }
     }
@@ -119,6 +123,9 @@ impl Future for Probe {
         self.waker = Some(cx.waker().clone());
         for _ in 0..self.wakes {
             cx.waker().wake_by_ref();
+        }
+        if self.turn {
+            request_turn();
         }
         if self.panic_poll {
             panic_any(1234usize);
@@ -150,16 +157,16 @@ fn self_wake_ready_retains_header_until_claim_drains() {
     let owner = Owner::new();
     let mut task = Probe::new();
     task.wakes = 3;
+    task.turn = true;
     let polls = task.polls.clone();
     let drops = task.drops.clone();
     owner.spawn(probe(task));
-    assert!(owner.poll());
+    assert_eq!(owner.poll(), Ok(1));
     assert_eq!(owner.counts(), (0, 1));
     assert_eq!((polls.get(), drops.get()), (1, 1));
-    assert!(owner.poll());
+    assert_eq!(owner.poll(), Ok(0));
     assert_eq!(owner.counts(), (0, 0));
     assert_eq!((polls.get(), drops.get()), (1, 1));
-    assert!(!owner.poll());
 }
 
 #[test]
@@ -169,9 +176,9 @@ fn idle_future_remains_owned_until_cleanup() {
     task.pending = true;
     let drops = task.drops.clone();
     owner.spawn(probe(task));
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     assert_eq!(owner.counts(), (1, 1));
-    assert!(!owner.poll());
+    assert_eq!(owner.poll(), Ok(0));
     owner.cleanup();
     owner.cleanup();
     assert_eq!(owner.counts(), (0, 0));
@@ -184,11 +191,12 @@ fn duplicate_wakes_make_one_next_batch_claim() {
     let mut task = Probe::new();
     task.wakes = 10;
     task.pending = true;
+    task.turn = true;
     let polls = task.polls.clone();
     let drops = task.drops.clone();
     owner.spawn(probe(task));
-    owner.poll();
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
+    assert_eq!(owner.poll(), Ok(1));
     assert_eq!(polls.get(), 2);
     unsafe {
         assert_eq!((*owner.0).incoming.len(), 1);
@@ -198,7 +206,7 @@ fn duplicate_wakes_make_one_next_batch_claim() {
 }
 
 #[test]
-fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
+fn nested_spawn_grows_both_vectors_without_repolling_current_round() {
     let owner = Owner::new();
     let ptr = owner.0;
     let inner = Rc::new(Cell::new(0));
@@ -210,11 +218,16 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
             }
         }
     }
+    /// Polled after `spawn_many` in the same round: records how many of its spawns ran.
+    #[switch::task]
+    async fn observe(inner: Rc<Cell<usize>>, seen: Rc<Cell<Option<usize>>>) {
+        seen.set(Some(inner.get()));
+    }
+    let seen = Rc::new(Cell::new(None));
     owner.spawn(spawn_many(ptr, inner.clone()));
-    owner.spawn(empty());
-    owner.poll();
-    assert_eq!(inner.get(), 0);
-    owner.poll();
+    owner.spawn(observe(inner.clone(), seen.clone()));
+    assert_eq!(owner.poll(), Ok(2 + DEFAULT_CAPACITY * 3));
+    assert_eq!(seen.get(), Some(0));
     assert_eq!(inner.get(), DEFAULT_CAPACITY * 3);
     assert_eq!(owner.counts(), (0, 0));
 }
@@ -226,9 +239,9 @@ fn ready_destructor_wake_is_terminal_noop() {
     task.wake_drop = true;
     let drops = task.drops.clone();
     owner.spawn(probe(task));
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     assert_eq!(owner.counts(), (0, 0));
-    assert!(!owner.poll());
+    assert_eq!(owner.poll(), Ok(0));
     assert_eq!(drops.get(), 1);
 }
 
@@ -283,7 +296,7 @@ fn failed_poll_preserves_payload_future_and_both_queues() {
         assert_eq!((*owner.0).incoming.len(), 1);
         assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
     }
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
     assert!(catch_unwind(AssertUnwindSafe(|| owner.spawn(empty()))).is_err());
     owner.cleanup();
     assert_eq!(drops.get(), 1);
@@ -336,14 +349,14 @@ fn over_aligned_future_has_exactly_one_drop() {
     let owner = Owner::new();
     let drops = Rc::new(Cell::new(0));
     owner.spawn(aligned(drops.clone()));
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     owner.cleanup();
     assert_eq!(drops.get(), 1);
     assert_eq!(owner.counts(), (0, 0));
 }
 
 #[test]
-fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
+fn reentrant_turn_rejects_before_vector_mutation_and_keeps_remainder() {
     struct Recursive {
         root: *mut Executor,
         drops: Rc<Cell<usize>>,
@@ -351,7 +364,8 @@ fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
     impl Future for Recursive {
         type Output = ();
         fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-            unsafe { Executor::poll(self.root) };
+            // The check `Runtime::poll` makes before it touches a queue.
+            unsafe { Executor::check_turn(self.root) };
             Poll::Ready(())
         }
     }
@@ -404,7 +418,7 @@ fn recursive_kernel_poll_rejects_before_vector_mutation_and_keeps_remainder() {
 }
 
 #[test]
-fn waking_another_current_batch_task_does_not_add_a_next_batch_claim() {
+fn waking_another_current_round_task_does_not_add_a_next_round_claim() {
     let owner = Owner::new();
     #[switch::task]
     async fn wake_target(target: Rc<Cell<Option<*const TaskHeader>>>) {
@@ -418,10 +432,10 @@ fn waking_another_current_batch_task_does_not_add_a_next_batch_claim() {
     let drops = task.drops.clone();
     owner.spawn(probe(task));
     target.set(Some(owner.last()));
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(2));
     assert_eq!(polls.get(), 1);
     assert_eq!(owner.counts(), (1, 1));
-    assert!(!owner.poll());
+    assert_eq!(owner.poll(), Ok(0));
     assert_eq!(polls.get(), 1);
     unsafe {
         assert!((*owner.0).incoming.is_empty());
@@ -438,7 +452,7 @@ fn ready_destructor_spawns_and_wakes_an_idle_task_during_reclamation() {
 }
 
 #[test]
-fn ready_destructor_spawns_and_wakes_a_current_batch_task_during_reclamation() {
+fn ready_destructor_spawns_and_wakes_a_current_round_task_during_reclamation() {
     destructor_spawn_and_wake(false, false);
     destructor_spawn_and_wake(false, true);
 }
@@ -450,12 +464,17 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
         completed: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
         self_wake: bool,
+        /// Last task of its round: end the `Runtime::poll` with it.
+        turn: bool,
     }
     impl Future for SpawnDuringDrop {
         type Output = ();
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
             if self.self_wake {
                 cx.waker().wake_by_ref();
+            }
+            if self.turn {
+                request_turn();
             }
             Poll::Ready(())
         }
@@ -468,7 +487,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
                     Executor::spawn(self.owner, count_task(self.completed.clone()), None);
                 }
             }
-            // Target slot remains live whether idle or in this batch.
+            // Target slot remains live whether idle or in this round.
             wake(self.target.get().unwrap());
         }
     }
@@ -486,22 +505,25 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
         completed: completed.clone(),
         drops: drops.clone(),
         self_wake,
+        turn: target_idle,
     };
+    // The round with `spawn_during_drop` ends the poll whichever task is last in it.
     let mut task = Probe::new();
     task.pending = true;
+    task.turn = true;
     let target_polls = task.polls.clone();
     let target_drops = task.drops.clone();
     if target_idle {
         owner.spawn(probe(task));
         target.set(Some(owner.last()));
-        owner.poll();
+        assert_eq!(owner.poll(), Ok(1));
         owner.spawn(spawn_during_drop(drop_spawner));
     } else {
         owner.spawn(spawn_during_drop(drop_spawner));
         owner.spawn(probe(task));
         target.set(Some(owner.last()));
     }
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(2 - usize::from(target_idle)));
     assert_eq!(drops.get(), 1);
     assert_eq!(completed.get(), 0);
     assert_eq!(target_polls.get(), 1);
@@ -518,7 +540,10 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
             DEFAULT_CAPACITY * 3 + usize::from(target_idle) + usize::from(self_wake)
         );
     }
-    owner.poll();
+    assert_eq!(
+        owner.poll(),
+        Ok(DEFAULT_CAPACITY * 3 + usize::from(target_idle))
+    );
     assert_eq!(completed.get(), DEFAULT_CAPACITY * 3);
     assert_eq!(target_polls.get(), 1 + usize::from(target_idle));
     assert_eq!(owner.counts(), (1, 1));
@@ -527,7 +552,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
 }
 
 #[test]
-fn middle_batch_panic_allows_only_cleanup_with_exact_drops() {
+fn middle_round_panic_allows_only_cleanup_with_exact_drops() {
     for preceding_self_wake in [false, true] {
         let owner = Owner::new();
         let mut preceding = Probe::new();
@@ -569,7 +594,7 @@ fn middle_batch_panic_allows_only_cleanup_with_exact_drops() {
             assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
             assert!(!(*owner.0).active);
         }
-        assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+        assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
         assert!(catch_unwind(AssertUnwindSafe(|| owner.spawn(empty()))).is_err());
         owner.cleanup();
         owner.cleanup();
@@ -588,7 +613,7 @@ fn middle_batch_panic_allows_only_cleanup_with_exact_drops() {
 }
 
 #[test]
-fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
+fn active_selfwake_and_cross_task_wakes_keep_round_order_and_claims() {
     struct Ordered {
         id: usize,
         targets: Rc<[Cell<Option<*const TaskHeader>>; 3]>,
@@ -619,6 +644,8 @@ fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
                 for _ in 0..8 {
                     wake(self.targets[0].get().unwrap());
                 }
+                // Last of the first round: stop there to inspect the next one.
+                request_turn();
             }
             Poll::Pending
         }
@@ -646,7 +673,7 @@ fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
         }));
         targets[id].set(Some(owner.last()));
     }
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(3));
     assert_eq!(*trace.borrow(), [0, 1, 2]);
     assert_eq!(owner.counts(), (3, 3));
     let target = |id: usize| targets[id].get().unwrap();
@@ -659,10 +686,10 @@ fn active_selfwake_and_cross_task_wakes_keep_batch_order_and_claims() {
     for id in 0..3 {
         assert_eq!(flags(target(id)), LIVE | QUEUED);
     }
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(3));
     assert_eq!(*trace.borrow(), [0, 1, 2, 0, 2, 1]);
     assert_eq!(owner.counts(), (0, 0));
-    assert!(!owner.poll());
+    assert_eq!(owner.poll(), Ok(0));
     assert_eq!(drops.each_ref().map(|count| count.get()), [1, 1, 1]);
 }
 
@@ -695,7 +722,7 @@ fn multiple_selfwakes_then_panic_keep_one_claim_and_original_payload() {
         assert_eq!((*owner.0).incoming.len(), 1);
         assert_eq!(flags((&(*owner.0).incoming)[0]) & LIVE, 0);
     }
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
     owner.cleanup();
     assert_eq!(owner.counts(), (0, 0));
     assert_eq!(
@@ -742,7 +769,7 @@ fn panicked_lifecycle_rejects_work_and_queues_destructor_wake_to_idle_target() {
     let idle_polls = idle.polls.clone();
     owner.spawn(probe(idle));
     let target = owner.last();
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     let mut failing = Probe::new();
     failing.panic_poll = true;
     failing.wake_drop = true;
@@ -753,7 +780,7 @@ fn panicked_lifecycle_rejects_work_and_queues_destructor_wake_to_idle_target() {
     unsafe {
         assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
     }
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
     let rejected_drops = Rc::new(Cell::new(0));
     assert!(
         catch_unwind(AssertUnwindSafe(|| owner.spawn(rejected(
@@ -771,7 +798,7 @@ fn panicked_lifecycle_rejects_work_and_queues_destructor_wake_to_idle_target() {
         assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
     }
     assert_eq!(flags(target), LIVE | QUEUED);
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
     assert_eq!(idle_polls.get(), 1);
     assert_eq!(owner.counts(), (1, 2));
     owner.cleanup();
@@ -802,7 +829,8 @@ fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
             self.drops.set(self.drops.get() + 1);
             unsafe {
                 assert_eq!((*self.owner).lifecycle, Lifecycle::Closing);
-                assert!(catch_unwind(AssertUnwindSafe(|| Executor::poll(self.owner))).is_err());
+                // The check `Runtime::poll` makes before it touches a queue.
+                assert!(catch_unwind(AssertUnwindSafe(|| Executor::check_turn(self.owner))).is_err());
                 assert!(
                     catch_unwind(AssertUnwindSafe(|| Executor::spawn(
                         self.owner,
@@ -827,7 +855,7 @@ fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
     let target_drops = target.drops.clone();
     owner.spawn(probe(target));
     let target = owner.last();
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     let drops = Rc::new(Cell::new(0));
     let rejected_drops = Rc::new(Cell::new(0));
     #[switch::task]
@@ -850,7 +878,7 @@ fn closing_lifecycle_survives_destructor_panic_and_cleanup_retry() {
         assert_eq!((*owner.0).lifecycle, Lifecycle::Closing);
         assert!(!(*owner.0).active);
     }
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    assert_eq!(owner.poll(), Err(RuntimeError::Closed));
     assert!(
         catch_unwind(AssertUnwindSafe(|| owner.spawn(rejected(
             RejectedWakeOnDrop {
@@ -932,7 +960,7 @@ fn stored_wakes_after_open(lifecycle: Lifecycle) {
     let eager_header = owner.last();
     owner.spawn(stored_park(deferred));
     let deferred_header = owner.last();
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(2));
     match lifecycle {
         Lifecycle::Panicked => {
             let mut failing = Probe::new();
@@ -961,7 +989,11 @@ fn stored_wakes_after_open(lifecycle: Lifecycle) {
         assert_eq!(*(*owner.0).incoming, [eager_header, deferred_header]);
         assert!((*owner.0).deferred.is_empty());
     }
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.poll())).is_err());
+    let rejected = match lifecycle {
+        Lifecycle::Panicked => RuntimeError::Panicked,
+        _ => RuntimeError::Closed,
+    };
+    assert_eq!(owner.poll(), Err(rejected));
     assert_eq!(polls.each_ref().map(|polls| polls.get()), [1, 1]);
     owner.cleanup();
     assert_eq!(owner.counts(), (0, 0));
@@ -975,17 +1007,25 @@ fn stored_wakes_after_open(lifecycle: Lifecycle) {
 /// the self-wake of a finished task, whose slot stays in use until it drains.
 #[test]
 fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
-    let owner = Owner(Box::into_raw(Box::new(Executor::with_capacity(0, 0, 0))));
-    let mut finishing = Probe::new();
-    finishing.wakes = 1;
-    owner.spawn(probe(finishing));
-    let stale = owner.last();
+    let owner = Owner::with(Runtime::with_capacity(
+        0,
+        Capacity {
+            tasks: 0,
+            timers: 0,
+        },
+    ));
     let parked: Vec<StoredPark> = (0..4).map(|_| StoredPark::new()).collect();
     let stored: Vec<_> = parked.iter().map(|task| task.stored.clone()).collect();
     for task in parked {
         owner.spawn(stored_park(task));
     }
-    owner.poll();
+    // Last of the round: its self-wake stays queued when the poll ends with it.
+    let mut finishing = Probe::new();
+    finishing.wakes = 1;
+    finishing.turn = true;
+    owner.spawn(probe(finishing));
+    let stale = owner.last();
+    assert_eq!(owner.poll(), Ok(5));
     assert_eq!(flags(stale) & (LIVE | QUEUED), QUEUED);
     unsafe {
         assert_eq!(*(*owner.0).incoming, [stale]);
@@ -1007,6 +1047,6 @@ fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
         assert_eq!(incoming + deferred, (*owner.0).allocated);
     }
     // The stale entry drains and frees its slot; the new task completes.
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(5));
     assert_eq!(owner.counts(), (4, 4));
 }

@@ -49,10 +49,7 @@ impl Sleep {
 
     fn cancel(&mut self) {
         if let Some(token) = self.token.take() {
-            // Every token is registered through this Sleep's immutable Control.
-            unsafe {
-                self.control.cancel_timer(token);
-            }
+            self.control.cancel_timer(token);
         }
     }
 

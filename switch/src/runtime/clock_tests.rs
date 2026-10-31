@@ -1,6 +1,4 @@
 use super::*;
-use crate::intrusive::NIL;
-use crate::task::TaskHeader;
 use crate::timer_registration::Token;
 use std::cell::RefCell;
 
@@ -15,7 +13,6 @@ struct TimedTask {
     deadline: u64,
     registrations: usize,
     tokens: Rc<RefCell<Vec<Token>>>,
-    header: Rc<Cell<*const TaskHeader>>,
     polls: Rc<Cell<usize>>,
     drops: Rc<Cell<usize>>,
 }
@@ -26,7 +23,6 @@ impl TimedTask {
             deadline,
             registrations,
             tokens: Rc::new(RefCell::new(Vec::new())),
-            header: Rc::new(Cell::new(std::ptr::null())),
             polls: Rc::new(Cell::new(0)),
             drops: Rc::new(Cell::new(0)),
         }
@@ -38,7 +34,6 @@ impl Future for TimedTask {
         self.polls.set(self.polls.get() + 1);
         let header = unsafe { (*self.root).current };
         assert_eq!(cx.waker().data(), header.cast());
-        self.header.set(header);
         unsafe {
             if (*self.root).timers.current_tick() >= self.deadline {
                 return Poll::Ready(());
@@ -56,11 +51,6 @@ impl Future for TimedTask {
 impl Drop for TimedTask {
     fn drop(&mut self) {
         self.drops.set(self.drops.get() + 1);
-        if !self.header.get().is_null() {
-            unsafe {
-                assert_eq!(TaskHeader::reg_head(self.header.get()).get(), NIL);
-            }
-        }
     }
 }
 

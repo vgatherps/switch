@@ -1,4 +1,4 @@
-//! Versioned timer subscriptions with independent wheel and task membership.
+//! Versioned timer subscriptions: each records the task its expiry wakes.
 
 use crate::intrusive::{IntrusiveLinks, Linked, NIL, Timed};
 use crate::task::TaskHeader;
@@ -26,8 +26,9 @@ struct Entry {
     deadline: u64,
     version: u64,
     state: State,
-    owner_prev: u32,
-    owner_next: u32,
+    /// Free-list link while `Free`.
+    next_free: u32,
+    /// The task the expiry wakes: the last task that polled the Sleep.
     owner: *const TaskHeader,
 }
 
@@ -94,8 +95,8 @@ impl TimerStore {
     }
 
     /// # Safety
-    /// Stable live task on this store's owner thread. Its reg_head belongs
-    /// exclusively to this store; retire here before freeing the task.
+    /// `owner` heads a task slot of this store's executor; its expiry wakes it,
+    /// possibly after the task ended (a free slot ignores the wake).
     pub(crate) unsafe fn register(
         &mut self,
         owner: *const TaskHeader,
@@ -106,13 +107,9 @@ impl TimerStore {
             deadline > self.wheel.current_tick(),
             "registration deadline is due"
         );
-        debug_assert!(
-            unsafe { TaskHeader::is_live(owner) },
-            "terminal timer owner"
-        );
         let index = if self.free_head != NIL {
             let index = self.free_head;
-            self.free_head = self.entries[index as usize].owner_next;
+            self.free_head = self.entries[index as usize].next_free;
             self.entries[index as usize].version += 1;
             index
         } else {
@@ -128,8 +125,7 @@ impl TimerStore {
                 deadline,
                 version: 1,
                 state: State::Free,
-                owner_prev: NIL,
-                owner_next: NIL,
+                next_free: NIL,
                 owner: std::ptr::null(),
             });
             index
@@ -137,9 +133,7 @@ impl TimerStore {
         let entry = &mut self.entries[index as usize];
         entry.deadline = deadline;
         entry.state = State::Pending;
-        unsafe {
-            self.attach(index, owner);
-        }
+        entry.owner = owner;
         self.wheel.insert(&mut self.entries, index);
         Ok(Token {
             index,
@@ -147,58 +141,27 @@ impl TimerStore {
         })
     }
 
-    /// # Safety
-    /// Token originated in this store (possibly stale). Every referenced task
-    /// remains stable, and its reg_head belongs exclusively to this store.
-    /// Call on the owner thread with the expiry handoff fully drained.
-    pub(crate) unsafe fn cancel(&mut self, token: Token) -> bool {
+    /// Token originated in this store (possibly stale). Call with the expiry
+    /// handoff fully drained.
+    pub(crate) fn cancel(&mut self, token: Token) -> bool {
         self.drained();
         if !self.valid(token) {
             return false;
         }
-        unsafe {
-            self.release(token.index);
-        }
+        self.release(token.index);
         true
     }
 
     /// # Safety
-    /// Token originated in this store (possibly stale). New owner is a stable
-    /// live task on the owner thread; both task reg_heads belong exclusively
-    /// to this store. All referenced tasks remain alive; handoff is drained.
+    /// Token originated in this store (possibly stale); `owner` as for
+    /// [`Self::register`]. Handoff is drained.
     pub(crate) unsafe fn refresh(&mut self, token: Token, owner: *const TaskHeader) -> bool {
         self.drained();
         if !self.valid(token) {
             return false;
         }
-        debug_assert!(
-            unsafe { TaskHeader::is_live(owner) },
-            "terminal timer owner"
-        );
-        unsafe {
-            if self.entries[token.index as usize].owner != owner {
-                self.detach(token.index);
-                self.attach(token.index, owner);
-            }
-        }
+        self.entries[token.index as usize].owner = owner;
         true
-    }
-
-    /// No allocations or user callbacks.
-    /// # Safety
-    /// Stable task on the owner thread, with reg_head owned exclusively by this
-    /// store. Every referenced task remains alive and the handoff is drained.
-    pub(crate) unsafe fn retire(&mut self, owner: *const TaskHeader) {
-        self.drained();
-        unsafe {
-            loop {
-                let head = TaskHeader::reg_head(owner).get();
-                if head == NIL {
-                    break;
-                }
-                self.release(head);
-            }
-        }
     }
 
     /// Stage without callbacks. Drain completely before mutation or user code.
@@ -217,47 +180,11 @@ impl TimerStore {
         Some(entry.owner)
     }
 
-    unsafe fn attach(&mut self, index: u32, owner: *const TaskHeader) {
-        unsafe {
-            let next = TaskHeader::reg_head(owner).get();
-            let entry = &mut self.entries[index as usize];
-            entry.owner = owner;
-            entry.owner_prev = NIL;
-            entry.owner_next = next;
-            if next != NIL {
-                self.entries[next as usize].owner_prev = index;
-            }
-            TaskHeader::reg_head(owner).set(index);
-        }
-    }
-
-    unsafe fn detach(&mut self, index: u32) {
-        unsafe {
-            let entry = &self.entries[index as usize];
-            let (owner, prev, next) = (entry.owner, entry.owner_prev, entry.owner_next);
-            if prev == NIL {
-                TaskHeader::reg_head(owner).set(next);
-            } else {
-                self.entries[prev as usize].owner_next = next;
-            }
-            if next != NIL {
-                self.entries[next as usize].owner_prev = prev;
-            }
-            let entry = &mut self.entries[index as usize];
-            entry.owner = std::ptr::null();
-            entry.owner_prev = NIL;
-            entry.owner_next = NIL;
-        }
-    }
-
-    unsafe fn release(&mut self, index: u32) {
+    fn release(&mut self, index: u32) {
         self.wheel.remove(&mut self.entries, index);
-        unsafe {
-            self.detach(index);
-        }
         let entry = &mut self.entries[index as usize];
         entry.state = State::Free;
-        entry.owner_next = self.free_head;
+        entry.next_free = self.free_head;
         self.free_head = index;
     }
 }

@@ -74,10 +74,6 @@ impl Drop for Counted {
     }
 }
 
-fn core(runtime: &Runtime) -> *mut Executor {
-    runtime.control.open_core().unwrap()
-}
-
 #[test]
 fn moving_owner_with_live_task_keeps_root_stable() {
     let runtime = Runtime::new(123);

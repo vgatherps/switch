@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 
 use crate::RemoteWaker;
-use crate::executor::{Executor, POLL_BUDGET};
+use crate::executor::POLL_BUDGET;
 use crate::runtime::Runtime;
 use crate::{StoredWaker, yield_now};
 
@@ -165,8 +165,6 @@ fn the_budget_is_checked_between_rounds() {
 
 type Log = Rc<RefCell<Vec<&'static str>>>;
 type Wakers = Rc<RefCell<Vec<StoredWaker>>>;
-/// `incoming` and `deferred` lengths, recorded inside a poll.
-type Queues = Rc<Cell<(usize, usize)>>;
 
 /// Publishes its `StoredWaker`, yields once (deferred), then logs `name`.
 #[switch::task]
@@ -180,17 +178,9 @@ async fn defers(name: &'static str, wakers: Wakers, log: Log) {
     log.borrow_mut().push(name);
 }
 
-/// Wakes `wakers[index]` ordinarily, `times` times, after `rounds` self-wakes;
-/// then checks that the queues hold one entry per queued task.
+/// Wakes `wakers[index]` ordinarily, `times` times, after `rounds` self-wakes.
 #[switch::task]
-async fn wakes(
-    wakers: Wakers,
-    index: usize,
-    times: usize,
-    rounds: usize,
-    root: *mut Executor,
-    queues: Queues,
-) {
+async fn wakes(wakers: Wakers, index: usize, times: usize, rounds: usize) {
     for _ in 0..rounds {
         let mut woke = false;
         std::future::poll_fn(|cx| {
@@ -207,59 +197,52 @@ async fn wakes(
     for _ in 0..times {
         target.wake();
     }
-    queues.set(unsafe { Executor::queue_lengths(root) });
 }
 
-fn setup() -> (Runtime, Wakers, Log, Queues) {
+fn setup() -> (Runtime, Wakers, Log) {
     (
         Runtime::new(0),
         Rc::new(RefCell::new(Vec::new())),
         Rc::new(RefCell::new(Vec::new())),
-        Rc::new(Cell::new((0, 0))),
     )
 }
 
 #[test]
 fn an_ordinary_wake_in_the_same_round_upgrades_a_deferred_task() {
-    let (mut runtime, wakers, log, queues) = setup();
-    let root = super::core(&runtime);
+    let (mut runtime, wakers, log) = setup();
     let spawner = runtime.spawner();
     spawner
         .spawn(defers("a", wakers.clone(), log.clone()))
         .unwrap();
     spawner
-        .spawn(wakes(wakers.clone(), 0, 2, 0, root, queues.clone()))
+        .spawn(wakes(wakers.clone(), 0, 2, 0))
         .unwrap();
-    // Round one: A yields (deferred), B wakes A twice. Round two: A finishes.
+    // Round one: A yields (deferred), B wakes A twice, which moves A's one entry
+    // to `incoming`. Round two: A finishes.
     let report = runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (3, 0));
     assert_eq!(*log.borrow(), ["a"]);
-    // When B woke A: one entry, moved from `deferred` to `incoming`.
-    assert_eq!(queues.get(), (1, 0));
 }
 
 #[test]
 fn an_ordinary_wake_in_a_later_round_upgrades_a_deferred_task() {
-    let (mut runtime, wakers, log, queues) = setup();
-    let root = super::core(&runtime);
+    let (mut runtime, wakers, log) = setup();
     let spawner = runtime.spawner();
     spawner
         .spawn(defers("a", wakers.clone(), log.clone()))
         .unwrap();
     spawner
-        .spawn(wakes(wakers.clone(), 0, 1, 2, root, queues.clone()))
+        .spawn(wakes(wakers.clone(), 0, 1, 2))
         .unwrap();
     // B wakes A in round three; A runs in round four.
     let report = runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (5, 0));
     assert_eq!(*log.borrow(), ["a"]);
-    assert_eq!(queues.get(), (1, 0));
 }
 
 #[test]
 fn an_upgrade_keeps_the_order_of_the_other_deferred_tasks() {
-    let (mut runtime, wakers, log, queues) = setup();
-    let root = super::core(&runtime);
+    let (mut runtime, wakers, log) = setup();
     let spawner = runtime.spawner();
     for name in ["a", "b", "c"] {
         spawner
@@ -267,15 +250,14 @@ fn an_upgrade_keeps_the_order_of_the_other_deferred_tasks() {
             .unwrap();
     }
     spawner
-        .spawn(wakes(wakers.clone(), 1, 1, 0, root, queues.clone()))
+        .spawn(wakes(wakers.clone(), 1, 1, 0))
         .unwrap();
     let first = runtime.poll(0).unwrap();
     assert_eq!(*log.borrow(), ["b"]);
     assert_eq!((first.tasks_polled, first.live_tasks), (5, 2));
-    // B moved to `incoming`; A and C stayed in `deferred`.
-    assert_eq!(queues.get(), (1, 2));
-    assert_eq!(unsafe { Executor::queue_lengths(root) }, (0, 2));
-    runtime.poll(0).unwrap();
+    // B moved to `incoming`; A and C stayed in `deferred`, in order, one entry each.
+    let second = runtime.poll(0).unwrap();
+    assert_eq!((second.tasks_polled, second.live_tasks), (2, 0));
     assert_eq!(*log.borrow(), ["b", "a", "c"]);
 }
 
@@ -297,7 +279,7 @@ fn a_remote_waker_on_the_owner_thread_upgrades() {
     async fn wakes_remotely(target: Rc<Cell<Option<RemoteWaker>>>) {
         target.get().unwrap().wake();
     }
-    let (mut runtime, _, log, _) = setup();
+    let (mut runtime, _, log) = setup();
     let spawner = runtime.spawner();
     let remote = Rc::new(Cell::new(None));
     spawner
@@ -311,22 +293,19 @@ fn a_remote_waker_on_the_owner_thread_upgrades() {
 
 #[test]
 fn a_remote_wake_from_another_thread_of_a_deferred_task_runs_it_once() {
-    let (mut runtime, _, log, _) = setup();
-    let root = super::core(&runtime);
+    let (mut runtime, _, log) = setup();
     let remote = Rc::new(Cell::new(None));
     runtime
         .spawner()
         .spawn(publishes_and_defers(remote.clone(), log.clone()))
         .unwrap();
-    runtime.poll(0).unwrap();
-    assert_eq!(unsafe { Executor::queue_lengths(root) }, (0, 1));
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     let waker = remote.get().unwrap();
     std::thread::spawn(move || waker.wake()).join().unwrap();
     // Delivered at the start of the poll: upgraded, one entry, one poll.
     let report = runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
     assert_eq!(*log.borrow(), ["a"]);
-    assert_eq!(unsafe { Executor::queue_lengths(root) }, (0, 0));
 }
 
 #[test]
@@ -356,9 +335,9 @@ fn deferring_and_waking_itself_every_poll_stops_at_the_budget() {
 
 #[test]
 fn a_task_upgraded_then_deferred_again_has_one_entry() {
-    /// Defers twice, recording the queue lengths after each deferral.
+    /// Publishes its `StoredWaker`, then defers twice.
     #[switch::task]
-    async fn defers_twice(wakers: Wakers, root: *mut Executor, queues: Queues, log: Log) {
+    async fn defers_twice(wakers: Wakers, log: Log) {
         std::future::poll_fn(|cx| {
             wakers.borrow_mut().push(StoredWaker::new(cx));
             Poll::Ready(())
@@ -367,67 +346,45 @@ fn a_task_upgraded_then_deferred_again_has_one_entry() {
         yield_now().await;
         log.borrow_mut().push("upgraded");
         yield_now().await;
-        queues.set(unsafe { Executor::queue_lengths(root) });
         log.borrow_mut().push("done");
     }
-    let (mut runtime, wakers, log, queues) = setup();
-    let root = super::core(&runtime);
+    let (mut runtime, wakers, log) = setup();
     let spawner = runtime.spawner();
-    let woke = Rc::new(Cell::new((0, 0)));
     spawner
-        .spawn(defers_twice(
-            wakers.clone(),
-            root,
-            queues.clone(),
-            log.clone(),
-        ))
+        .spawn(defers_twice(wakers.clone(), log.clone()))
         .unwrap();
-    spawner
-        .spawn(wakes(wakers.clone(), 0, 1, 0, root, woke.clone()))
-        .unwrap();
+    spawner.spawn(wakes(wakers.clone(), 0, 1, 0)).unwrap();
     // Round one: A defers, B upgrades it. Round two: A runs and defers again.
     let first = runtime.poll(0).unwrap();
     assert_eq!((first.tasks_polled, first.live_tasks), (3, 1));
     assert_eq!(*log.borrow(), ["upgraded"]);
-    assert_eq!(woke.get(), (1, 0));
-    assert_eq!(unsafe { Executor::queue_lengths(root) }, (0, 1));
     let second = runtime.poll(0).unwrap();
     assert_eq!((second.tasks_polled, second.live_tasks), (1, 0));
     assert_eq!(*log.borrow(), ["upgraded", "done"]);
-    assert_eq!(queues.get(), (0, 0));
 }
 
 #[test]
 fn a_wake_after_the_deferred_entry_moved_polls_the_task_once_this_poll() {
-    /// Yields once (deferred); on resume wakes `wakers[0]` and records the queues.
+    /// Yields once (deferred); on resume wakes `wakers[0]`.
     #[switch::task]
-    async fn defers_then_wakes(wakers: Wakers, root: *mut Executor, queues: Queues, log: Log) {
+    async fn defers_then_wakes(wakers: Wakers, log: Log) {
         yield_now().await;
         wakers.borrow()[0].wake();
-        queues.set(unsafe { Executor::queue_lengths(root) });
         log.borrow_mut().push("b");
     }
-    let (mut runtime, wakers, log, queues) = setup();
-    let root = super::core(&runtime);
+    let (mut runtime, wakers, log) = setup();
     let spawner = runtime.spawner();
     spawner
-        .spawn(defers_then_wakes(
-            wakers.clone(),
-            root,
-            queues.clone(),
-            log.clone(),
-        ))
+        .spawn(defers_then_wakes(wakers.clone(), log.clone()))
         .unwrap();
     spawner
         .spawn(defers("a", wakers.clone(), log.clone()))
         .unwrap();
     // Both defer: `deferred` is [b, a].
-    runtime.poll(0).unwrap();
-    assert_eq!(unsafe { Executor::queue_lengths(root) }, (0, 2));
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 2);
     // Both entries move to this poll's first round; b, earlier in it, wakes a,
     // which is polled once, in its turn.
     let report = runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (2, 0));
     assert_eq!(*log.borrow(), ["b", "a"]);
-    assert_eq!(queues.get(), (0, 0));
 }

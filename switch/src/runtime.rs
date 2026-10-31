@@ -101,8 +101,8 @@ impl Control {
         }
     }
 
-    /// Token must have originated in this Control's timer store.
-    pub(crate) unsafe fn cancel_timer(&self, token: crate::timer_registration::Token) {
+    /// Cancel a token of this Control's timer store, if the executor still exists.
+    pub(crate) fn cancel_timer(&self, token: crate::timer_registration::Token) {
         let root = self.root.get();
         if !root.is_null() {
             unsafe {
@@ -310,6 +310,12 @@ impl Drop for DeferredShutdown<'_> {
             self.0.shutdown();
         }
     }
+}
+
+/// The executor of an open runtime, for white-box tests of executor state.
+#[cfg(test)]
+pub(crate) fn core(runtime: &Runtime) -> *mut Executor {
+    runtime.control.open_core().unwrap()
 }
 
 #[cfg(test)]

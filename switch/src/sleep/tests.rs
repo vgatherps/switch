@@ -3,7 +3,6 @@ use crate::runtime::{Runtime, RuntimeError};
 use crate::task::TaskHeader;
 use crate::task::block::Meta;
 use std::cell::{Cell, RefCell};
-use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::task::Waker;
 
@@ -13,7 +12,6 @@ fn poll_noop(sleep: &mut Sleep) -> Poll<Result<(), SleepError>> {
 struct Holder {
     sleep: Rc<RefCell<Option<Sleep>>>,
     complete: Rc<Cell<bool>>,
-    forget: Option<Rc<RefCell<Option<ManuallyDrop<Sleep>>>>>,
     wake: Option<Rc<Cell<Option<Waker>>>>,
 }
 impl Future for Holder {
@@ -24,9 +22,6 @@ impl Future for Holder {
             wake.set(Some(cx.waker().clone()));
         }
         if this.complete.get() {
-            if let Some(target) = &this.forget {
-                *target.borrow_mut() = this.sleep.borrow_mut().take().map(ManuallyDrop::new);
-            }
             return Poll::Ready(());
         }
         let mut slot = this.sleep.borrow_mut();
@@ -45,7 +40,6 @@ fn new_holder(sleep: Rc<RefCell<Option<Sleep>>>, complete: Rc<Cell<bool>>) -> Ho
     Holder {
         sleep,
         complete,
-        forget: None,
         wake: None,
     }
 }
@@ -136,7 +130,7 @@ fn other_runtime_context_rejects_without_migration() {
 }
 
 #[test]
-fn transfer_before_retirement_and_stale_after_retirement() {
+fn transfer_keeps_registration_before_and_after_original_task_ends() {
     for transfer_first in [false, true] {
         let mut runtime = Runtime::new(0);
         let spawner = runtime.spawner();
@@ -163,7 +157,7 @@ fn transfer_before_retirement_and_stale_after_retirement() {
                 .spawn(holder(slot.clone(), Rc::new(Cell::new(false))))
                 .unwrap();
             runtime.poll(0).unwrap();
-            assert_ne!(slot.borrow().as_ref().unwrap().token, Some(old));
+            assert_eq!(slot.borrow().as_ref().unwrap().token, Some(old));
         }
         let report = runtime.poll(8).unwrap();
         assert_eq!(report.tasks_polled, 1);
@@ -194,45 +188,6 @@ fn drop_cancels_and_reused_slot_does_not_accept_old_token() {
     });
     assert_eq!(runtime.poll(5).unwrap().tasks_polled, 0);
     assert_eq!(runtime.poll(6).unwrap().tasks_polled, 1);
-}
-
-#[test]
-fn retirement_cleans_undropped_pending_and_expired_sleep() {
-    for expired in [false, true] {
-        let mut runtime = Runtime::new(0);
-        let spawner = runtime.spawner();
-        let slot = Rc::new(RefCell::new(Some(spawner.sleep_until(5).unwrap())));
-        let done = Rc::new(Cell::new(false));
-        let retained = Rc::new(RefCell::new(None));
-        let wake = Rc::new(Cell::new(None));
-        spawner
-            .spawn(holding(Holder {
-                sleep: slot.clone(),
-                complete: done.clone(),
-                forget: Some(retained.clone()),
-                wake: Some(wake.clone()),
-            }))
-            .unwrap();
-        runtime.poll(0).unwrap();
-        done.set(true);
-        if !expired {
-            wake.take().unwrap().wake();
-        }
-        let report = runtime.poll(if expired { 5 } else { 0 }).unwrap();
-        assert_eq!(report.tasks_polled, 1);
-        let held = ManuallyDrop::into_inner(retained.borrow_mut().take().unwrap());
-        let token = held.token.unwrap();
-        let root = held.control.open_core().unwrap();
-        assert!(!unsafe { (*root).timers.cancel(token) });
-        let replacement = Rc::new(RefCell::new(Some(spawner.sleep_until(9).unwrap())));
-        spawner
-            .spawn(holder(replacement.clone(), Rc::new(Cell::new(false))))
-            .unwrap();
-        runtime.poll(if expired { 5 } else { 0 }).unwrap();
-        assert_ne!(replacement.borrow().as_ref().unwrap().token, Some(token));
-        drop(held); // Stale cancellation must not cancel the replacement.
-        assert_eq!(runtime.poll(9).unwrap().tasks_polled, 1);
-    }
 }
 
 #[test]

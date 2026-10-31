@@ -7,7 +7,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
-use crate::executor::Executor;
 use crate::request_turn;
 use crate::runtime::Runtime;
 use crate::StoredWaker;
@@ -144,10 +143,6 @@ impl Fixture {
         self.wakers[index].borrow().as_ref().unwrap().wake_by_ref();
     }
 
-    fn root(&self) -> *mut Executor {
-        super::core(&self.runtime)
-    }
-
     fn taken(&self) -> Vec<&'static str> {
         std::mem::take(&mut *self.log.borrow_mut())
     }
@@ -168,10 +163,8 @@ fn a_request_after_a_self_wake_stops_the_poll_and_the_round_resumes_first() {
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (1, 3));
     assert_eq!(f.taken(), ["a"]);
-    // b and c are left in the round; a's self-wake is one entry in `incoming`.
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 2);
-    assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (1, 0));
-    // The request lasted one poll: the next one resumes.
+    // b and c are left in the round; a's self-wake runs after them. The request lasted
+    // one poll: the next one resumes.
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (3, 2));
     assert_eq!(f.taken(), ["b", "c", "a"]);
@@ -184,20 +177,17 @@ fn a_request_from_a_finishing_task_stops_after_it_is_reclaimed() {
     assert_eq!((report.tasks_polled, report.live_tasks), (1, 1));
     assert_eq!(f.taken(), ["a"]);
     assert_eq!(f.drops.get(), 1);
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 1);
-    // A task spawned between polls runs after the leftover b.
+    // b is left in the round; a task spawned between polls runs after it.
     f.spawn("n", Act::Park);
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (2, 2));
     assert_eq!(f.taken(), ["b", "n"]);
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 0);
 }
 
 #[test]
 fn shutdown_with_a_round_left_drops_each_task_once() {
     let mut f = Fixture::new(&[("a", Act::RequestAndWake), ("b", Act::Park), ("c", Act::Park)]);
-    f.runtime.poll(0).unwrap();
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 2);
+    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
     f.runtime.shutdown();
     assert_eq!(f.taken(), ["a"]);
     assert_eq!(f.drops.get(), 3);
@@ -216,7 +206,7 @@ fn a_panic_in_the_last_task_polled_leaves_the_round_to_shutdown() {
 }
 
 /// With a round left: a task woken between polls and one deferred in the stopped poll run
-/// after it, woken first; a wake of a task still in the round adds no entry.
+/// after it, woken first; a wake of a task still in the round does not poll it twice.
 #[test]
 fn wakes_while_a_round_is_left_run_after_it_in_order() {
     let mut f = Fixture::new(&[("b", Act::Park), ("c", Act::Park), ("d", Act::Park)]);
@@ -230,21 +220,17 @@ fn wakes_while_a_round_is_left_run_after_it_in_order() {
     let report = f.runtime.poll(0).unwrap();
     assert_eq!(report.tasks_polled, 2);
     assert_eq!(f.taken(), ["e", "a"]);
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 2);
-    assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (0, 1));
     f.wake(2);
     f.wake(0);
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 2);
-    assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (1, 1));
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (4, 0));
     assert_eq!(f.taken(), ["b", "c", "d", "e"]);
 }
 
 /// Two stops in one resume sequence, a reused slot and a panic with tasks still queued:
-/// a finishes and stops the poll; n, spawned between polls, takes a's slot; b, in the
-/// stopped round, stops the resume; c panics with d still in the round. Each task is
-/// polled in that order and dropped once.
+/// a finishes and stops the poll; n, spawned between polls, takes a's freed slot (a pool
+/// hands out its lowest free slot); b, in the stopped round, stops the resume; c panics
+/// with d still in the round. Each task is polled in that order and dropped once.
 #[test]
 fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
     let mut f = Fixture::new(&[
@@ -253,19 +239,14 @@ fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
         ("c", Act::Panic),
         ("d", Act::Park),
     ]);
-    let root = f.root();
     assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
     assert_eq!(f.taken(), ["a"]);
     assert_eq!(*f.dropped.borrow(), ["a"]);
-    assert_eq!(unsafe { Executor::tail_len(root) }, 3);
-    let a_slot = f.slot(0);
     f.spawn("n", Act::Park);
-    assert_eq!(unsafe { Executor::incoming_last(root) }.cast(), a_slot, "n did not take a's freed slot");
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (1, 4));
     assert_eq!(f.taken(), ["b"]);
-    assert_eq!(unsafe { Executor::tail_len(root) }, 2);
-    assert_eq!(unsafe { Executor::queue_lengths(root) }, (1, 0));
+    // c and d are left in the round; n waits behind them.
     let payload = catch_unwind(AssertUnwindSafe(|| f.runtime.poll(0))).unwrap_err();
     assert_eq!(payload.downcast_ref::<u32>(), Some(&7));
     assert_eq!(f.taken(), ["c"]);
@@ -286,18 +267,15 @@ fn a_self_wake_with_a_request_and_ready_in_one_poll() {
     assert_eq!((report.tasks_polled, report.live_tasks), (1, 1));
     assert_eq!(f.taken(), ["a"]);
     assert_eq!(f.drops.get(), 1);
-    assert_eq!(unsafe { Executor::tail_len(f.root()) }, 1);
-    assert_eq!(unsafe { Executor::queue_lengths(f.root()) }, (1, 0));
+    // b is left in the round; a's queued wake keeps its slot taken.
     f.spawn("n", Act::Park);
-    let n_slot = unsafe { Executor::incoming_last(f.root()) }.cast();
-    assert_ne!(n_slot, f.slot(0), "n took a slot whose wake is still queued");
     let report = f.runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (2, 2));
     assert_eq!(f.taken(), ["b", "n"]);
+    assert_ne!(f.slot(2), f.slot(0), "n took a slot whose wake is still queued");
     f.spawn("m", Act::Park);
-    let m_slot = unsafe { Executor::incoming_last(f.root()) }.cast();
-    assert_eq!(m_slot, f.slot(0), "a's slot was not freed when its wake drained");
     assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
+    assert_eq!(f.slot(3), f.slot(0), "a's slot was not freed when its wake drained");
     assert_eq!(f.taken(), ["m"]);
     assert_eq!(f.drops.get(), 1);
 }

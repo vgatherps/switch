@@ -55,7 +55,7 @@ fn foreign_ops(ptr: *mut Executor) -> impl Future<Output = ()> {
 fn foreign_wake_clone_and_drop_reject_without_scheduling() {
     let owner = Owner::new();
     owner.spawn(foreign_ops(owner.0));
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     assert_eq!(owner.counts(), (0, 0));
 }
 
@@ -101,6 +101,8 @@ fn local_ordinary_and_cloned_wakes_share_one_claim() {
                 by_value.wake();
                 let clone = cx.waker().clone();
                 clone.wake_by_ref();
+                // End the poll here to see the one queue entry the three wakes made.
+                request_turn();
                 Poll::Pending
             } else {
                 Poll::Ready(())
@@ -110,11 +112,11 @@ fn local_ordinary_and_cloned_wakes_share_one_claim() {
     let owner = Owner::new();
     let polls = Rc::new(Cell::new(0));
     owner.spawn(wake_three_ways(polls.clone()));
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     unsafe {
         assert_eq!((*owner.0).incoming.len(), 1);
     }
-    owner.poll();
+    assert_eq!(owner.poll(), Ok(1));
     assert_eq!(polls.get(), 2);
     assert_eq!(owner.counts(), (0, 0));
 }

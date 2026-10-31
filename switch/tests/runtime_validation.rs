@@ -28,7 +28,7 @@ impl Future for Retain {
             assert!(Pin::new(&mut self.sleep).poll(cx).is_pending());
             self.registered = true;
         }
-        // Expiry may poll us again; leave Sleep unobserved for task retirement.
+        // Expiry may poll us again; the Sleep stays registered until shutdown drops it.
         Poll::Pending
     }
 }

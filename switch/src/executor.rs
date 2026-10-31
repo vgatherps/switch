@@ -12,7 +12,6 @@ use std::cell::Cell;
 use std::mem::ManuallyDrop;
 
 use crate::__private::Task;
-use crate::intrusive::NIL;
 use crate::oneshot::Sender;
 use crate::remote::Mailbox;
 use crate::task::SpawnToken;
@@ -58,7 +57,10 @@ fn wake_queue_full() -> ! {
     panic!("wake queue full: a queued task was not counted in `allocated`")
 }
 
-/// Most task polls in one `Runtime::poll`, checked between rounds.
+/// `Runtime::poll` starts another round only while fewer task polls than this
+/// were made. The check runs between rounds and a started round always
+/// finishes, so one call makes at most `POLL_BUDGET - 1` polls plus the length
+/// of its last round.
 pub(crate) const POLL_BUDGET: usize = 1024;
 
 /// Single-threaded executor.
@@ -105,10 +107,6 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn new() -> Self {
-        Self::with_capacity(0, DEFAULT_CAPACITY, 0)
-    }
-
     pub(crate) fn with_capacity(initial_tick: u64, tasks: usize, timers: usize) -> Self {
         Self {
             run_queue: Vec::with_capacity(tasks),
@@ -258,7 +256,7 @@ impl Executor {
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() & !DEFERRED);
             // The entry moved: queue lengths sum to at most `allocated`.
-            (*this).incoming.push(header);
+            append_reserved(&mut (*this).incoming, header);
         }
     }
 
@@ -296,25 +294,6 @@ impl Executor {
                 // Every slot has at most one queue entry: no reallocation.
                 (*this).incoming.append(&mut (*this).deferred);
             }
-        }
-    }
-
-    /// Poll one round (one snapshot of `incoming`), for tests of round order.
-    ///
-    /// # Safety
-    /// Stable owner-thread pointer; no active turn/cleanup; executor accepts work.
-    #[cfg(test)]
-    pub unsafe fn poll(this: *mut Self) -> bool {
-        unsafe {
-            Self::check_turn(this);
-            if (*this).incoming.is_empty() {
-                return false;
-            }
-            let turn = Self::enter_turn(this);
-            std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
-            Self::drain(this);
-            turn.finish();
-            true
         }
     }
 
@@ -433,9 +412,6 @@ impl Executor {
             if current & LIVE != 0 {
                 flags.set(current & !LIVE);
                 (*this).task_count -= 1;
-                if TaskHeader::reg_head(header).get() != NIL {
-                    (*this).timers.retire(header);
-                }
             }
         }
     }
@@ -507,24 +483,6 @@ impl Executor {
     #[inline]
     pub unsafe fn task_count(this: *mut Self) -> usize {
         unsafe { (*this).task_count }
-    }
-
-    /// The last entry of `incoming` (a spawn's, right after it).
-    #[cfg(test)]
-    pub(crate) unsafe fn incoming_last(this: *mut Self) -> *const TaskHeader {
-        unsafe { *(*this).incoming.last().unwrap() }
-    }
-
-    /// Entries of the stopped round still to poll.
-    #[cfg(test)]
-    pub(crate) unsafe fn tail_len(this: *mut Self) -> usize {
-        unsafe { (*this).run_queue.len() - (*this).cursor }
-    }
-
-    /// Entries in `incoming` and `deferred`.
-    #[cfg(test)]
-    pub(crate) unsafe fn queue_lengths(this: *mut Self) -> (usize, usize) {
-        unsafe { ((*this).incoming.len(), (*this).deferred.len()) }
     }
 }
 
@@ -601,7 +559,8 @@ impl Reservation {
             let executor = this.executor;
             (*executor).spawning -= 1;
             (*executor).task_count += 1;
-            (*executor).incoming.push(this.header);
+            // The reservation counted this slot in `allocated` (see `reserve`).
+            append_reserved(&mut (*executor).incoming, this.header);
         }
     }
 }

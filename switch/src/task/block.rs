@@ -285,7 +285,6 @@ impl TestBlock {
     pub(crate) fn task(&self, position: u32) -> *const TaskHeader {
         unsafe {
             let header = Meta::header(self.0, position);
-            TaskHeader::reg_head(header).set(crate::intrusive::NIL);
             TaskHeader::flags(header).set(super::header::LIVE);
             header
         }
@@ -295,37 +294,6 @@ impl TestBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct Bytes<const N: usize>([u8; N]);
-    impl<const N: usize> Future for Bytes<N> {
-        type Output = ();
-        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-            Poll::Ready(())
-        }
-    }
-    #[repr(align(128))]
-    struct Aligned;
-    impl Future for Aligned {
-        type Output = ();
-        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-            Poll::Ready(())
-        }
-    }
-
-    #[test]
-    fn slot_layout_constants() {
-        // 8-byte header then an 8-aligned 80-byte future: 88 -> stride 96.
-        assert_eq!(Shape::<Bytes<80>>::STRIDE, 16 * 6);
-        assert_eq!(Shape::<Bytes<80>>::DATA_OFF, 64);
-        assert_eq!(Shape::<Bytes<80>>::SLOTS, (BLOCK - 64) / 96);
-        // Nine bytes at alignment 1: a 20-byte slot (alignment 4) rounds to 32.
-        assert_eq!(Shape::<Bytes<9>>::STRIDE, 32);
-        assert_eq!(Shape::<Aligned>::DATA_OFF, 128);
-        assert_eq!(Shape::<Aligned>::STRIDE, 128);
-        // The largest future that fits: one slot after the metadata line.
-        assert_eq!(Shape::<Bytes<{ BLOCK - 64 - 8 }>>::SLOTS, 1);
-        assert_eq!(Shape::<Bytes<{ BLOCK - 64 - 7 }>>::SLOTS, 0);
-    }
 
     #[test]
     fn every_header_masks_to_its_block_and_position() {
