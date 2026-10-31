@@ -350,7 +350,7 @@ class CleanupCommandTest(unittest.TestCase):
                                  clock=iter(range(0, 100000, 10)).__next__)
         out = io.StringIO()
         with mock.patch.object(z.janitor, "clean_run", fast), contextlib.redirect_stdout(out):
-            code = z.main(argv, z.Env(aws=lambda region: aws))
+            code = z.main(argv, z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: aws))
         return code, out.getvalue()
 
     def test_run_id_uses_the_recorded_ids_and_the_tags(self):

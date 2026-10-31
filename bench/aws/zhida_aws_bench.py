@@ -8,7 +8,7 @@
   zhida_aws_bench.py binance [--region R] [--seconds 600] [--out DIR] [--ttl 2h]   the Binance listener
 
 Needs python3 with boto3, ssh, scp, git, a clean committed tree (the hosts build `git archive HEAD`)
-and AWS credentials for the region. Design: plans/bench/design.md.
+and AWS credentials; --region defaults to the AWS profile's region. Design: plans/bench/design.md.
 `preflight` (also the first step of `run`) checks the tree, the credentials and the on-demand
 Standard vCPU quota (L-1216C47A: 48 free) before anything is created.
 
@@ -57,7 +57,6 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 VPC_CIDR, SUBNET_CIDR = "10.80.0.0/16", "10.80.1.0/24"
 NAME = janitor.NAME
-REGION = "ap-northeast-1"
 TTL = "2h"
 
 INSTANCE_TYPE, HOST_VCPUS, ROOT_GB = "c7gn.2xlarge", 8, 40
@@ -471,11 +470,23 @@ class Host:
 # ---------------------------------------------------------------- run
 
 
+def default_region():
+    """The AWS profile's region (AWS_REGION, AWS_DEFAULT_REGION or the profile's config), as boto3
+    resolves it; None if none is set."""
+    try:
+        import boto3
+    except ImportError:
+        raise SystemExit("boto3 is not importable: pip3 install boto3") from None
+    return boto3.session.Session().region_name
+
+
 class Env:
     """What run() touches outside this process; tests substitute fakes."""
 
-    def __init__(self, aws=Aws, host=Host, local=subprocess.run, my_ip=None, now=None, sleep=time.sleep):
+    def __init__(self, aws=Aws, host=Host, local=subprocess.run, my_ip=None, now=None, sleep=time.sleep,
+                 profile_region=None):
         self.aws, self.host, self.local, self.sleep = aws, host, local, sleep
+        self.profile_region = profile_region or default_region
         self.my_ip = my_ip or (lambda: urllib.request.urlopen("https://checkip.amazonaws.com", timeout=10)
                                .read().decode().strip())
         self.now = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
@@ -783,14 +794,14 @@ def parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("run", "plan", "preflight", "cleanup"):
         r = sub.add_parser(name)
-        r.add_argument("--region", default=REGION)
+        r.add_argument("--region", help="default: the AWS profile's region")
         r.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
         if name == "cleanup":
             r.add_argument("--run-id", required=True)
         else:
             r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
     b = sub.add_parser("binance", help="run the Binance listener (deploy/run-binance.sh) on one EC2 host")
-    b.add_argument("--region", default=REGION)
+    b.add_argument("--region", help="default: the AWS profile's region")
     b.add_argument("--seconds", type=int, default=600, help="the feed's --seconds (from the WebSocket open)")
     b.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
     b.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
@@ -799,12 +810,16 @@ def parser():
 
 def main(argv, env=None):
     args = parser().parse_args(argv)
+    if args.cmd != "plan" and not args.region:
+        args.region = (env or Env()).profile_region()
+        if not args.region:
+            raise SystemExit("no region: pass --region, or set one in the AWS profile (aws configure) or AWS_REGION")
     if args.cmd == "preflight":
         checked_preflight(env or Env(), args.region, INSTANCE_TYPE, len(ROLES) * HOST_VCPUS)
         return 0
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)
-        print(plan_text(args.region, args.ttl, new_run_id(now),
+        print(plan_text(args.region or "(the AWS profile's)", args.ttl, new_run_id(now),
                         now + datetime.timedelta(seconds=parse_duration(args.ttl))))
         return 0
     if args.cmd == "run":
