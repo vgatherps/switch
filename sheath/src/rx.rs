@@ -356,9 +356,15 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         if self.run.at.is_empty() {
             self.drop_run();
             let found = self.next_run(tx);
-            // what rustls holds and wants sent must be visible to the send half now
+            // what rustls holds and wants sent must be visible to the send half now. It queues
+            // a record on receive only rarely (close_notify at receive sequence exhaustion), and
+            // a ReadTraffic state is handed out before it: collect when something is queued
+            // (`wants_write`), or this step already encoded a record (its transmission may still
+            // be pending in rustls); otherwise skip the extra rustls call.
             tx.hold(&self.scratch[..self.seen]);
-            tx.collect();
+            if tx.conn.wants_write() || !tx.pending.is_empty() {
+                tx.collect();
+            }
             if !found? {
                 return Ok(None);
             }
