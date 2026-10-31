@@ -108,16 +108,11 @@ failed service or verification timeout includes the last verify output (when ava
 status and current-boot journal, and loaded/on-disk `vfio_pci_core` source versions in the setup
 error. If SSH prevents collecting those diagnostics, the error reports that failure too.
 
-The AWS runner uses a 500 ms measurement window per rate, 250 ms warmup and 200 ms drain, with the
-unchanged 50 ms scheduling lead. All 18 rates remain: 9 s of measurement and 18 s of scheduled time per
-protocol, or 27 s of measurement and 54 s of scheduled time for UDP/TCP/ws together. Add 3 s receiver
-startup per protocol, clock probes, worker startup/exit, fetching and teardown. Host provisioning,
-toolchain/DPDK setup, reboot verification and native builds happen separately before the sweeps and
-can take much longer. Previously each rate used 2 s measurement and 500 ms warmup: 36 s measurement /
-49.5 s scheduled per protocol. These quick windows locate the knee, not stable tail estimates: even
-the lowest rate offers 5,000 measured messages total, but p99.9 has few samples. Drain loss accounting,
-send-lag rejection, budgets, per-rate clock checks and late-start rejection are unchanged. Manual
-`zhida-bench sweep` defaults remain 2 s measurement / 500 ms warmup / 200 ms drain.
+The AWS runner measures each rate for 5 seconds, after 250 ms warmup and a 50 ms lead, then waits
+200 ms for replies. The 18 rates take 90 seconds of measurement and 99 seconds of scheduled time
+per protocol. Setup, worker startup, clock probes, result collection and teardown take additional
+time. Manual `zhida-bench sweep` defaults remain 2 seconds measurement / 500 ms warmup /
+200 ms drain.
 
 `plan` prints the hosts, sweeps and what gets created, with no AWS calls; `preflight` runs only the checks; `cleanup --run-id ID [--region R] [--out DIR]` deletes a leftover run using `DIR/ID/created.json` plus a tag lookup (tag lookup only if the file is gone). Needs python3 with boto3, ssh, scp, git; the IAM permissions are listed in the runner's `-h`. Tests (no AWS): `python3 -m unittest discover -s bench/aws`, `sh deploy/test-hft-host.sh`.
 

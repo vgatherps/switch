@@ -71,7 +71,7 @@ CONNECTIONS = 4 * SENDERS
 SIZE = 64
 RATE_MIN, RATE_MAX = 10_000, 5_000_000
 BUDGET_US = 50
-STEP_MS, WARMUP_MS, DRAIN_MS = 500, 250, 200
+STEP_MS, WARMUP_MS, DRAIN_MS = 5000, 250, 200
 SWEEPS = [("udp", None), ("tcp", BUDGET_US), ("ws", BUDGET_US)]
 PORT = 7000
 MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=0"
@@ -80,7 +80,7 @@ HFT = f"{SRC_DIR}/deploy/hft-host.sh"
 REMOTE = "/var/tmp/zhida"
 RECEIVER_UNIT = "zhida-bench-receiver"
 # The coordinator's worst case and timeout: one step per rate RATE_MIN x sqrt(2)^k <= RATE_MAX, each
-# <= 50 ms lead + 0.25 s warmup + 0.5 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
+# <= 50 ms lead + 0.25 s warmup + 5 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
 # a backstop only: the coordinator bounds its own steps and workers
 SWEEP_WORST_S = 15 * 60
 BUILD_S = 3600

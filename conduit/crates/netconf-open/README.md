@@ -13,6 +13,17 @@ Used by `nic-runner`. Depends on [`zhida-netconf`](../netconf/README.md), [`dpdk
 
 `open` fails with `OpenError::NotPinned` unless the process may run on exactly one CPU, so run under `taskset -c N` or `docker --cpuset-cpus=N`. The setup code in [docs/USAGE.md](../../docs/USAGE.md) is `examples/setup.rs`, and a test fails if they differ.
 
+On Linux, if that polling CPU appears in `/sys/devices/system/cpu/isolated`,
+setup temporarily includes online non-isolated CPUs in the calling thread's
+affinity before EAL starts. The kernel applies the effective cgroup cpuset;
+DPDK can place interrupt/control helpers on the available housekeeping CPUs
+while its main lcore stays on the original polling CPU. No other isolated CPU
+is included. With no usable housekeeping CPU (including a one-CPU Docker
+cpuset), helpers retain the existing single-CPU behavior. Non-isolated polling
+CPUs keep the existing startup behavior. Affinity is restored after failed EAL
+initialization too; an EAL error and any restoration error are both reported.
+This affects setup only and adds no polling-loop work or configuration.
+
 ## Example
 
 ```sh
@@ -29,3 +40,11 @@ make test-netconf    # cargo test -p zhida-netconf -p zhida-open -- --test-threa
 ```
 
 Needs DPDK 25.11.3 (Docker image on macOS). Tests in `tests/open_*.rs` use net_tap, so the container needs `CAP_NET_ADMIN` and `/dev/net/tun`.
+
+The Linux `eal_affinity::tests::eal_helpers_avoid_polling_cpu` regression starts
+real EAL in a child process, checks main/helper thread masks through Linux
+affinity syscalls, and checks restoration after invalid EAL arguments. It
+models the isolated polling CPU in the internal setup function, so it does not
+require changing host boot isolation. It skips when fewer than two CPUs are
+allowed or no allowed non-isolated housekeeping CPU remains. DPDK startup
+failures are test failures, not skips.

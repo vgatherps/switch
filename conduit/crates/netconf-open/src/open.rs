@@ -22,6 +22,11 @@ pub struct Opened {
 pub enum OpenError {
     NotPinned(AffinityError),
     Eal(EalError),
+    HelperAffinity(std::io::Error),
+    EalAffinityRestore {
+        error: EalError,
+        restore: std::io::Error,
+    },
     DeviceNotFound {
         name: String,
     },
@@ -67,6 +72,12 @@ impl fmt::Debug for OpenError {
         match self {
             Self::NotPinned(error) => f.debug_tuple("NotPinned").field(error).finish(),
             Self::Eal(error) => f.debug_tuple("Eal").field(error).finish(),
+            Self::HelperAffinity(error) => f.debug_tuple("HelperAffinity").field(error).finish(),
+            Self::EalAffinityRestore { error, restore } => f
+                .debug_struct("EalAffinityRestore")
+                .field("error", error)
+                .field("restore", restore)
+                .finish(),
             Self::DeviceNotFound { name } => {
                 f.debug_struct("DeviceNotFound").field("name", name).finish()
             }
@@ -129,6 +140,11 @@ impl fmt::Display for OpenError {
         match self {
             Self::NotPinned(error) => write!(f, "CPU affinity: {error}"),
             Self::Eal(error) => write!(f, "EAL initialization: {error}"),
+            Self::HelperAffinity(error) => write!(f, "EAL helper CPU affinity: {error}"),
+            Self::EalAffinityRestore { error, restore } => write!(
+                f,
+                "EAL initialization: {error}; restoring polling CPU affinity: {restore}"
+            ),
             Self::DeviceNotFound { name } => write!(f, "device lookup: {name:?} was not found"),
             Self::DeviceInfo(error) => write!(f, "device information: {error}"),
             Self::MacMismatch { config, device } => {
@@ -265,6 +281,9 @@ pub unsafe fn open(
     };
     argv.extend(config.eal.extra.iter().cloned());
     let args: Vec<_> = argv.iter().map(String::as_str).collect();
+    #[cfg(target_os = "linux")]
+    let eal = crate::eal_affinity::init(cpu, &args)?;
+    #[cfg(not(target_os = "linux"))]
     let eal = Eal::init(&args).map_err(OpenError::Eal)?;
     let port_id = port_by_name(&eal, &device_name)
         .ok_or_else(|| OpenError::DeviceNotFound { name: device_name })?;

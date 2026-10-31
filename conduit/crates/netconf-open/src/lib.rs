@@ -14,6 +14,8 @@ use zhida_dpdk_sys::{
 
 pub mod offloads;
 mod open;
+#[cfg(target_os = "linux")]
+mod eal_affinity;
 
 pub use open::{open, OpenError, OpenReport, Opened};
 

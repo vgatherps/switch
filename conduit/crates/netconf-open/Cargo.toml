@@ -9,10 +9,10 @@ zhida-netconf.workspace = true
 dpdk-smoltcp.workspace = true
 zhida-buffer.workspace = true
 zhida-dpdk-sys.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 zhida-test-support.workspace = true
-libc.workspace = true
 
 [lints]
 workspace = true
