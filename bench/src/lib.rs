@@ -9,6 +9,5 @@ pub mod pace;
 pub mod record;
 pub mod schedule;
 pub mod serve;
-pub mod sweep;
 pub mod wire;
 pub mod wsclient;

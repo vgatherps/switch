@@ -1,6 +1,6 @@
 //! The sweep coordinator: spawns G generator workers (`zhida-bench gen`, each its own Stack, Port
-//! and core), runs every rate step on all of them at a common start time, merges their results,
-//! judges the step and picks the next rate. No DPDK here.
+//! and core), runs every rate of a fixed log-spaced list (`rates`) on all of them at a common
+//! start time and merges their results. No DPDK here.
 //!
 //! Output: one JSON line per step, then always one `summary` line, also when a worker fails
 //! (`complete: false` with the error; the steps already printed stand).
@@ -22,7 +22,14 @@ use serde::Serialize;
 
 use crate::hist::Histogram;
 use crate::load::{self, Reply, Request, StepResult};
-use crate::sweep::{Limits, Next, Outcome, Sweep};
+
+/// The sweep's rates: `rate_min` x sqrt(2)^k for k = 0, 1, .. while at most `rate_max`.
+pub fn rates(rate_min: u64, rate_max: u64) -> Vec<u64> {
+    (0..)
+        .map(|k| (rate_min as f64 * 2f64.powf(f64::from(k) / 2.0)).round() as u64)
+        .take_while(|&r| r <= rate_max)
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -32,7 +39,8 @@ pub struct Args {
     pub gen_cmd: String,
     pub senders: u32,
     pub size: usize,
-    pub limits: Limits,
+    pub rate_min: u64,
+    pub rate_max: u64,
     pub step_ms: u64,
     pub warmup_ms: u64,
     pub drain_ms: u64,
@@ -102,7 +110,6 @@ pub struct StepReport {
     pub budget_bound: bool,
     /// Any generator fell behind its schedule: the step measured the generator, not the DUT.
     pub generator_bound: bool,
-    pub good: bool,
     /// TCP/ws: echo time - actual send time, median; the first step's is the budget's baseline.
     #[serde(skip)]
     pub service_rtt_p50_ns: Option<u64>,
@@ -120,20 +127,14 @@ pub struct Summary {
     pub budget_window_us: Option<u64>,
     /// The first step's median service round trip (TCP/ws): the budget's baseline.
     pub baseline_rtt_p50_ns: Option<u64>,
-    pub knee_pps: Option<u64>,
-    /// The sweep reached `rate_max` without a bad step: the knee is at least `knee_pps`.
-    pub knee_lower_bound: bool,
-    pub last_good_pps: Option<u64>,
-    /// "knee", "rate_max", "no_good_step", "generator_bound" or "failed".
-    pub stop: &'static str,
     pub steps: u32,
-    /// Every step ran and the sweep ended on its own; false: see `error`.
+    /// Every step ran or the sweep stopped at a generator-bound step; false: see `error`.
     pub complete: bool,
     pub error: Option<String>,
 }
 
-/// Merges the workers' results of one step (`results[g]` from worker g). `good` and `budget`
-/// are left for the caller.
+/// Merges the workers' results of one step (`results[g]` from worker g). `budget` is left for
+/// the caller.
 pub fn merge(
     args: &Args,
     step: u32,
@@ -182,7 +183,6 @@ pub fn merge(
         budget: None,
         budget_bound: sum(|r| r.budget_waits) > 0,
         generator_bound,
-        good: false,
         service_rtt_p50_ns: rtt.quantile(0.5),
     })
 }
@@ -320,13 +320,9 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
         gens: args.gens,
         senders: args.senders,
         size: args.size,
-        rate_max: args.limits.rate_max,
+        rate_max: args.rate_max,
         budget_window_us: args.budget_window_us,
         baseline_rtt_p50_ns: None,
-        knee_pps: None,
-        knee_lower_bound: false,
-        last_good_pps: None,
-        stop: "failed",
         steps: 0,
         complete: false,
         error: None,
@@ -402,10 +398,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         Duration::from_millis(args.lead_ms + args.warmup_ms + args.step_ms + args.drain_ms)
             + REPLY_SLACK;
     let window_ns = args.budget_window_us.map(|us| us * 1000);
-    let mut sweep = Sweep::new(args.limits);
-    let mut rate = sweep.first();
-    let mut id = 0u32;
-    loop {
+    for (id, rate) in (0u32..).zip(rates(args.rate_min, args.rate_max)) {
         check_clocks(&mut workers.0)?;
         let start_unix_ns = unix_now_ns() + args.lead_ms * 1_000_000;
         let mut max_budget = None;
@@ -448,38 +441,10 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         if id == 0 && window_ns.is_some() {
             summary.baseline_rtt_p50_ns = report.service_rtt_p50_ns;
         }
-        id += 1;
-        summary.steps = id;
-        if report.generator_bound {
-            out(&serde_json::to_string(&report).expect("report serializes"));
-            summary.stop = "generator_bound";
-            summary.knee_pps = sweep.knee();
-            break;
-        }
-        let (good, next) = sweep.next(
-            rate,
-            Outcome {
-                p99_ns: report.latency_ns.as_ref().map(|q| q.p99),
-                drop_fraction: report.drop_fraction,
-            },
-        );
-        report.good = good;
+        summary.steps = id + 1;
         out(&serde_json::to_string(&report).expect("report serializes"));
-        if good {
-            summary.last_good_pps = Some(summary.last_good_pps.map_or(rate, |g| g.max(rate)));
-        }
-        match next {
-            Next::Run(r) => rate = r,
-            Next::Done(knee) => {
-                summary.knee_pps = knee.map(|k| k.pps);
-                summary.knee_lower_bound = knee.is_some_and(|k| k.lower_bound);
-                summary.stop = match knee {
-                    None => "no_good_step",
-                    Some(k) if k.lower_bound => "rate_max",
-                    Some(_) => "knee",
-                };
-                break;
-            }
+        if report.generator_bound {
+            break;
         }
     }
     for (i, w) in std::mem::take(&mut workers.0).into_iter().enumerate() {
@@ -505,13 +470,8 @@ mod tests {
             gen_cmd: String::new(),
             senders: 4,
             size: 64,
-            limits: Limits {
-                rate_min: 1,
-                rate_max: 2,
-                bisect_steps: 0,
-                p99_factor: 3.0,
-                max_drop: 0.001,
-            },
+            rate_min: 1000,
+            rate_max: 1000,
             step_ms: 1,
             warmup_ms: 0,
             drain_ms: 0,
@@ -644,7 +604,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn a_failed_worker_keeps_the_steps_and_ends_with_an_incomplete_summary() {
         let mut args = args();
-        args.limits.rate_max = 1000;
+        args.rate_max = 2000;
         args.gen_cmd = fake_worker("dies", &result(0, &[1000], &[100], 1, 0), 2);
         let (r, lines) = run_lines(&args);
         assert!(r.is_err());
@@ -652,15 +612,14 @@ mod tests {
         assert_eq!(kinds, ["step", "step", "summary"]);
         let summary = &lines[2];
         assert_eq!(summary["complete"], false);
-        assert_eq!(summary["stop"], "failed");
         assert_eq!(summary["steps"], 2);
         assert!(summary["error"].as_str().unwrap().contains("generator 0"));
     }
 
-    /// A step where nothing comes back is reported (no latency, 100% loss) and judged bad.
+    /// A step where nothing comes back is reported (no latency, 100% loss) and the sweep goes on.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn a_step_with_total_loss_is_reported_and_bad() {
+    fn a_step_with_total_loss_is_reported() {
         let mut args = args();
         args.gen_cmd = fake_worker("silent", &result(0, &[], &[100], 5, 0), 10);
         let (r, lines) = run_lines(&args);
@@ -668,11 +627,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["drop_fraction"], 1.0);
         assert!(lines[0]["latency_ns"].is_null());
-        assert_eq!(lines[0]["good"], false);
-        assert_eq!(
-            (lines[1]["complete"].clone(), lines[1]["stop"].clone()),
-            (true.into(), "no_good_step".into())
-        );
+        assert_eq!(lines[1]["complete"], true);
     }
 
     /// Counts add up across generators, latency quantiles are those of all echoes together,
@@ -713,6 +668,17 @@ mod tests {
             &[result(2, &[], &[], 0, 0), result(1, &[], &[], 0, 0)],
         );
         assert!(m.is_err());
+    }
+
+    /// 10k..5M: 18 rates, each sqrt(2) above the last, the last at most rate_max; a single rate
+    /// when rate_min = rate_max.
+    #[test]
+    fn rates_are_log_spaced_by_sqrt_two() {
+        let r = rates(10_000, 5_000_000);
+        assert_eq!(r.len(), 18);
+        assert_eq!(&r[..4], [10_000, 14_142, 20_000, 28_284]);
+        assert_eq!(r[17], 3_620_387);
+        assert_eq!(rates(64_000, 64_000), [64_000]);
     }
 
     #[test]

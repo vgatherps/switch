@@ -145,7 +145,7 @@ BENCH_CPUSET ?= 9-12
 BENCH_GENS ?= 2
 BENCH_SENDERS ?= 4
 BENCH_PROTOS ?= udp tcp ws
-BENCH_SMOKE_ARGS ?= --rate-min 1000 --rate-max 512000 --step-ms 300 --warmup-ms 100 --drain-ms 100 --bisect 2
+BENCH_SMOKE_ARGS ?= --rate-min 1000 --rate-max 512000 --step-ms 300 --warmup-ms 100 --drain-ms 100
 
 # Scapy fuzzer (fuzz/scapy): seeded connection count; a run past FUZZ_TIMEOUT seconds fails.
 FUZZ_SEED ?= 1

@@ -125,7 +125,7 @@ step, summary = lines[0], lines[-1]
 ok = (step["kind"] == "step" and step["drop_fraction"] == 1.0 and step["unsent"] > 0
       and summary["kind"] == "summary" and summary["complete"] and int(sys.argv[2]) < 30)
 print(f"smoke: bounded overload: {sys.argv[2]}s, drop {step['drop_fraction']}, unsent {step['unsent']}"
-      f" of {step['measured']}, summary complete={summary['complete']} stop={summary['stop']}")
+      f" of {step['measured']}, summary complete={summary['complete']}")
 sys.exit(0 if ok else 1)
 PY
 stop_dut

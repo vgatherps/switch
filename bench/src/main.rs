@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use zhida_bench::load::Proto;
-use zhida_bench::sweep::Limits;
 use zhida_bench::{coord, load, serve};
 
 #[global_allocator]
@@ -18,12 +17,11 @@ const USAGE: &str = "\
 usage:
   zhida-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N --size S
                     --rate-min PPS --rate-max PPS [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200]
-                    [--bisect 4] [--p99-factor 3] [--max-drop 0.001] [--lag-limit-us 20] [--lead-ms 50]
-                    [--budget-us W]
+                    [--lag-limit-us 20] [--lead-ms 50] [--budget-us W]
       The sweep coordinator: starts G generator workers (`sh -c CMD` with {i} = 0..G-1 and
-      {senders} = N/G), runs each rate step on all of them (rate split evenly), merges, doubles
-      then bisects to the knee, repeats around it and runs points past it. Prints one JSON line
-      per step and always a summary line. --budget-us (tcp, ws): after the first step, each
+      {senders} = N/G) and runs each rate PPS-min x sqrt(2)^k up to PPS-max on all of them (rate
+      split evenly), stopping early at a generator-bound step. Prints one JSON line per step and
+      always a summary line. --budget-us (tcp, ws): after the first step, each
       connection may have its rate share x (the first step's median round trip + W) in flight.
   zhida-bench gen --config F --proto udp|tcp|ws --target IP:PORT --senders N --size S
                   [--send-budget 32] [--local-port 40000]
@@ -109,13 +107,8 @@ fn main_inner() -> Result<(), String> {
                 gen_cmd: flags.need("gen-cmd")?,
                 senders: flags.need("senders")?,
                 size: flags.need("size")?,
-                limits: Limits {
-                    rate_min: flags.need("rate-min")?,
-                    rate_max: flags.need("rate-max")?,
-                    bisect_steps: flags.or("bisect", 4)?,
-                    p99_factor: flags.or("p99-factor", 3.0)?,
-                    max_drop: flags.or("max-drop", 0.001)?,
-                },
+                rate_min: flags.need("rate-min")?,
+                rate_max: flags.need("rate-max")?,
                 step_ms: flags.or("step-ms", 2000)?,
                 warmup_ms: flags.or("warmup-ms", 500)?,
                 drain_ms: flags.or("drain-ms", 200)?,
@@ -127,7 +120,7 @@ fn main_inner() -> Result<(), String> {
                 return Err("--budget-us is for tcp and ws".into());
             }
             flags.done()?;
-            if args.limits.rate_min == 0 || args.limits.rate_min > args.limits.rate_max {
+            if args.rate_min == 0 || args.rate_min > args.rate_max {
                 return Err("need 0 < --rate-min <= --rate-max".into());
             }
             coord::run(&args, &mut print_line)

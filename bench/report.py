@@ -76,27 +76,20 @@ def flags(step):
 def table(steps):
     rows = [
         "| step | offered pps | sent pps | received pps | p50 µs | p99 µs | p99.9 µs | max µs | drop % | unsent |"
-        " good | flags | budget |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:-:|---|---:|",
+        " flags | budget |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for s in sorted(steps, key=lambda s: (s["offered_pps"], s["step"])):
         rows.append(
             f"| {s['step']} | {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} |"
             f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
-            f" {100 * s['drop_fraction']:.3f} | {s['unsent']} | {'yes' if s['good'] else 'no'} | {flags(s)} |"
+            f" {100 * s['drop_fraction']:.3f} | {s['unsent']} | {flags(s)} |"
             f" {s.get('budget') or '-'} |"
         )
     return "\n".join(rows)
 
 
-def knee_text(summary):
-    knee = summary.get("knee_pps")
-    if knee is None:
-        return "none"
-    return f">= {knee} (rate max)" if summary.get("knee_lower_bound") else str(knee)
-
-
-def svg_plot(steps, summary, title):
+def svg_plot(steps, title):
     """p50/p99/p99.9/max latency (log y, left) and drop % (linear, right) vs offered pps (log x).
     A step where nothing came back has no latency: it is drawn as an x at the top of the latency
     axis, and its 100% drop is on the drop line like every other step's."""
@@ -156,12 +149,6 @@ def svg_plot(steps, summary, title):
             out.append(f'<path class="no-echo" d="M{x - 4:.1f},{T + 2} l8,8 m0,-8 l-8,8" stroke="black"/>')
     if any(not s.get("latency_ns") for s in steps):
         out.append(f'<text x="{L + 8 + 350}" y="{T + 14}">x: no echo (100% loss)</text>')
-    knee = summary.get("knee_pps") if summary else None
-    if knee:
-        x = px(knee)
-        label = f"knee >= {knee:g} pps (rate max)" if summary.get("knee_lower_bound") else f"knee {knee:g} pps"
-        out.append(f'<line x1="{x:.1f}" y1="{T}" x2="{x:.1f}" y2="{H - B}" stroke="black" stroke-dasharray="2 2"/>')
-        out.append(f'<text x="{x + 4:.1f}" y="{T + 30}">{escape(label)}</text>')
     out.append("</svg>")
     return "\n".join(out)
 
@@ -174,9 +161,8 @@ def build(directory, title):
         with open(setup) as f:
             md += ["## Host setup", "", "```", f.read().rstrip(), "```", ""]
     results = {"title": title, "sweeps": []}
-    knees = ["| sweep | proto | gens | senders | size | knee pps | stopped by | last good pps | steps |"
-             " baseline RTT p50 µs | budget window µs | complete |",
-             "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|:-:|"]
+    sweeps = ["| sweep | proto | gens | senders | size | steps | baseline RTT p50 µs | budget window µs | complete |",
+              "|---|---|---:|---:|---:|---:|---:|---:|:-:|"]
     sections = []
     summaries = {}
     for name, path in sweep_files(directory):
@@ -185,14 +171,13 @@ def build(directory, title):
         summaries[stem] = summary
         results["sweeps"].append({"name": stem, "summary": summary, "steps": steps})
         if summary:
-            knees.append(f"| {stem} | {summary['proto']} | {summary['gens']} | {summary['senders']} | {summary['size']} |"
-                         f" {knee_text(summary)} | {summary.get('stop', '-')} | {summary.get('last_good_pps') or '-'} |"
-                         f" {summary['steps']} | {us(summary.get('baseline_rtt_p50_ns'))} |"
-                         f" {summary.get('budget_window_us') or '-'} | {'yes' if summary.get('complete') else 'NO'} |")
+            sweeps.append(f"| {stem} | {summary['proto']} | {summary['gens']} | {summary['senders']} | {summary['size']} |"
+                          f" {summary['steps']} | {us(summary.get('baseline_rtt_p50_ns'))} |"
+                          f" {summary.get('budget_window_us') or '-'} | {'yes' if summary.get('complete') else 'NO'} |")
         else:
-            knees.append(f"| {stem} | - | - | - | - | - | no summary | - | {len(steps)} | - | - | NO |")
+            sweeps.append(f"| {stem} | - | - | - | - | {len(steps)} | - | - | NO (no summary) |")
         with open(os.path.join(directory, stem + ".svg"), "w") as f:
-            f.write(svg_plot(steps, summary, stem))
+            f.write(svg_plot(steps, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
             sections += ["GEN-BOUND: a generator fell behind its schedule; that step measured the generator, not the"
@@ -206,7 +191,7 @@ def build(directory, title):
     if issues:
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
                 *[f"- {i}" for i in issues], ""]
-    md = head + md + ["## Knees", "", "\n".join(knees), "", *sections]
+    md = head + md + ["## Sweeps", "", "\n".join(sweeps), "", *sections]
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
            " measured messages not echoed by the end of the drain, unsent ones included (sending stops at the end"
            " of the window); sent / received pps are what actually left the generators and came back within the"
