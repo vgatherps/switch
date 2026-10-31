@@ -178,11 +178,7 @@ impl Mapping {
         if ready == 0 || now > stale_at {
             return None;
         }
-        let (phc, bound) = Fit { m, h, p, r, u }.at(now);
-        let bound_ns = u64::try_from(bound).unwrap_or(u64::MAX);
-        // Beyond ±292 years only for a bogus stamp; saturating keeps the sign.
-        let ns = phc - i128::from(stamp);
-        let ns = i64::try_from(ns).unwrap_or(if ns < 0 { i64::MIN } else { i64::MAX });
-        Some(Latency { ns, bound_ns })
+        let (phc, bound) = Fit { m, h, p, r, u }.at(now)?;
+        Some(Latency { ns: i64::try_from(phc - i128::from(stamp)).ok()?, bound_ns: u64::try_from(bound).ok()? })
     }
 }

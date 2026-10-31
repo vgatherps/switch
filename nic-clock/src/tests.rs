@@ -121,6 +121,16 @@ fn impossible_past_minus_bound() {
 }
 
 #[test]
+fn unrepresentable_latency_is_none() {
+    // PHC near 1.7e19 ns: a stamp of 1 gives a latency beyond i64.
+    let line = Line { phc0: 17_000_000_000_000_000_000, k: LINE.k };
+    let mut f = Fixture::default();
+    let now = f.exact_reads(line, 1 << 40, 11);
+    check(f.latency(line.phc(now) - 5, now), 5);
+    assert_eq!(f.latency(1, now), None);
+}
+
+#[test]
 fn sparse_reads_still_fit() {
     // Every other read failed: 200 ms apart.
     let mut f = Fixture::default();
