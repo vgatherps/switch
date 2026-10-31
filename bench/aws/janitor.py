@@ -6,10 +6,11 @@ pair, six instances (with their root volumes and primary ENIs) and six data ENIs
 RUN_TAG=<run id> through TagSpecifications. The runner records each ID as its create succeeds
 (Created: in memory and run_dir/created.json). clean_run uses both sources: a resource is present
 while a describe finds it by tag or by recorded ID, or while it is recorded and no delete of it has
-yet succeeded or answered not-found (a fresh ID can be invisible to describes). Each round deletes
-what is present, dependents first; a delete that fails (instance still shutting down, ENI in use, a
-dependency) is retried next round. It returns [] once a round finds nothing present, else at the
-deadline what remains.
+yet succeeded or answered not-found. Each round deletes what is present, dependents first; a delete
+that fails (instance still shutting down, ENI in use, a dependency) is retried next round. It
+returns [] only when a round finds nothing and no describe failed and no recorded ID answered
+not-found (a fresh ID can be invisible for a while); otherwise the caller says to rerun
+`cleanup --run-id`.
 """
 import json
 import time
@@ -77,14 +78,21 @@ def describe(ec2, kind, filters):
     return items
 
 
-def present(ec2, run_id, recorded, unconfirmed):
-    """{kind: {id: resource, or None when only recorded}} in deletion order."""
+def present(ec2, run_id, recorded, unconfirmed, problems, log):
+    """{kind: {id: resource, or None when only recorded}} in deletion order. A failed describe is
+    added to `problems` and that kind's unconfirmed recorded IDs still count as present."""
     out = {}
     for kind, (_, _, field, id_filter, _) in KINDS.items():
         searches = [[{"Name": f"tag:{RUN_TAG}", "Values": [run_id]}]]
         if recorded.get(kind):
             searches.append([{"Name": id_filter, "Values": recorded[kind]}])
-        found = {r[field]: r for filters in searches for r in describe(ec2, kind, filters)}
+        found = {}
+        for filters in searches:
+            try:
+                found.update((r[field], r) for r in describe(ec2, kind, filters))
+            except Exception as e:
+                log(f"janitor: describe {kind}: {e}")
+                problems.append(f"describe {kind} failed: {e}")
         found.update((rid, None) for k, rid in unconfirmed if k == kind and rid not in found)
         if found:
             out[kind] = found
@@ -117,15 +125,20 @@ def delete(ec2, kind, rid, r):
 
 def clean_run(ec2, run_id, recorded=None, deadline_s=900, poll_s=10, log=print, sleep=time.sleep,
               clock=time.monotonic):
-    """Deletes run `run_id`'s resources (found by tag, plus `recorded`: {kind: [id]}); returns what
-    the last look still found, so [] means verified absent."""
+    """Deletes run `run_id`'s resources (found by tag, plus `recorded`: {kind: [id]}). Returns the
+    problems: what the last look still found, every failed describe, and every recorded ID that
+    answered not-found without any describe having shown it (possibly not visible yet, so not
+    proof of deletion; one seen and then gone was deleted, e.g. a data ENI with its instance). [] means verified absent;
+    anything else means rerun `cleanup --run-id`."""
     recorded = recorded or {}
     unconfirmed = {(kind, rid) for kind, ids in recorded.items() for rid in ids}
+    problems, seen = [], set()
     end = clock() + deadline_s
     while True:
-        found = present(ec2, run_id, recorded, unconfirmed)
+        found = present(ec2, run_id, recorded, unconfirmed, problems, log)
+        seen |= {(kind, rid) for kind, items in found.items() for rid, r in items.items() if r is not None}
         if not found or clock() >= end:
-            return [f"{kind} {rid}" for kind, items in found.items() for rid in items]
+            return [f"{kind} {rid}" for kind, items in found.items() for rid in items] + problems
         for kind, items in found.items():
             for rid, r in items.items():
                 if busy(kind, r):
@@ -137,5 +150,7 @@ def clean_run(ec2, run_id, recorded=None, deadline_s=900, poll_s=10, log=print, 
                     if not not_found(e):
                         log(f"janitor: {kind} {rid}: {e}")
                         continue
+                    if (kind, rid) not in seen:
+                        problems.append(f"{kind} {rid}: recorded but never found")
                 unconfirmed.discard((kind, rid))
         sleep(poll_s)

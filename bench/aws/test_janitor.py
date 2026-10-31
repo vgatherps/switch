@@ -5,6 +5,7 @@ import contextlib
 import functools
 import io
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -265,6 +266,33 @@ class CleanRunTest(unittest.TestCase):
         self.assertEqual(remaining, ["network-interface eni-stuck", "security-group sg", "subnet subnet", "vpc vpc"])
         self.assertEqual(ec2.store["instance"]["i-0"]["State"]["Name"], "terminated")
 
+    def test_a_failed_describe_does_not_stop_deleting_and_is_reported(self):
+        """Regression: one describe error used to abort teardown before any delete."""
+        ec2, recorded = run_world()
+
+        failures = {"n": 3}
+        paginator = ec2.get_paginator
+
+        def get_paginator(op):
+            if op == "describe_instances" and failures["n"]:
+                failures["n"] -= 1
+                raise ClientError("RequestLimitExceeded", "slow down")
+            return paginator(op)
+        ec2.get_paginator = get_paginator
+        problems = clean(ec2, recorded, deadline_s=600)
+        self.assertEqual([i["State"]["Name"] for i in ec2.store["instance"].values()], ["terminated"] * 2)
+        self.assertNotIn("vpc", [k for k, v in ec2.store.items() if v and k != "instance"])
+        self.assertTrue(problems and all(p.startswith("describe instance failed") for p in problems), problems)
+
+    def test_a_recorded_id_never_seen_that_answers_not_found_is_not_verified_gone(self):
+        """Regression: a recorded VPC hidden from describes and answering not-found was taken as
+        deleted, and the run reported nothing left while it still existed."""
+        ec2, recorded = run_world()
+        ec2.hidden.add("vpc")
+        ec2.fail["delete_vpc"] = ClientError("InvalidVpcID.NotFound")
+        problems = clean(ec2, recorded, deadline_s=600)
+        self.assertEqual(problems, ["vpc vpc: recorded but never found"])
+
     def test_a_failing_delete_does_not_stop_the_rest(self):
         ec2, recorded = run_world()
         ec2.add("network-interface", "eni-loose", Status="available")
@@ -311,13 +339,31 @@ class CleanupCommandTest(unittest.TestCase):
         self.assertIn("run r1: nothing left", out)
         self.assertNotIn("eni-untagged", ec2.store["network-interface"])
 
+    def test_cleanup_is_not_interrupted_by_ctrl_c(self):
+        """Regression: standalone cleanup kept the default SIGINT handler."""
+        ec2, _ = run_world()
+        seen = []
+        real = ec2.get_paginator
+
+        def get_paginator(op):
+            seen.append((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)))
+            return real(op)
+        ec2.get_paginator = get_paginator
+        saved = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            self.main(["cleanup", "--run-id", "r1", "--out", tempfile.mkdtemp()], ec2)
+        finally:
+            for s, h in saved.items():
+                signal.signal(s, h)
+        self.assertTrue(seen and all(h == (signal.SIG_IGN, signal.SIG_IGN) for h in seen))
+
     def test_exit_status_follows_what_remains(self):
         ec2, _ = run_world()
         ec2.add("network-interface", "eni-stuck", Status="in-use")
         code, out = self.main(["cleanup", "--run-id", "r1", "--out", tempfile.mkdtemp()], ec2)
         self.assertEqual(code, 1)
         self.assertIn("tag lookup only", out)
-        self.assertIn("STILL PRESENT after teardown", out)
+        self.assertIn("NOT VERIFIED GONE; rerun `cleanup --run-id r1`", out)
         self.assertIn("network-interface eni-stuck", out)
 
 
