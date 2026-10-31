@@ -288,13 +288,23 @@ amzn() {
 
 vfio_dir() { echo "$R/lib/modules/$(uname -r)/kernel/drivers/vfio"; }
 # Amazon's kernel6.18 source applies vfio-pci-enable-mmap-ing-ena-device.patch. Trust that vendor
-# contract only for the unmodified official package matching this kernel, not arbitrary modules.
+# contract only for an unmodified module from the official package matching this kernel.
 native_vfio_wc() {
+    vfio_wc_error="modinfo cannot resolve vfio_pci_core for $(uname -r); check the installed module indexes"
     module=$(modinfo -n vfio_pci_core 2>/dev/null) || return 1
+    vfio_wc_error="module file missing: $module"
     [ -f "$module" ] || return 1
+    vfio_wc_error="$module is not owned by the official Amazon Linux kernel6.18 package for $(uname -r)"
     [ "$(rpm -qf --qf '%{NAME} %{VENDOR} %{VERSION}-%{RELEASE}.%{ARCH}\n' "$module" 2>/dev/null)" \
         = "kernel6.18 Amazon Linux $(uname -r)" ] || return 1
-    rpm -Vf "$module" >/dev/null 2>&1
+    vfio_wc_error="unsupported or unavailable RPM file digest algorithm for $module (requires SHA256)"
+    [ "$(rpm -qf --qf '%{FILEDIGESTALGO}\n' "$module" 2>/dev/null)" = 8 ] || return 1
+    vfio_wc_error="RPM SHA256 digest unavailable for $module"
+    file_digests=$(rpm -qf --qf '[%{FILENAMES} %{FILEDIGESTS}\n]' "$module" 2>/dev/null) || return 1
+    digest=$(printf '%s\n' "$file_digests" | awk -v module="$module" '$1 == module {print $2}')
+    [ -n "$digest" ] || return 1
+    vfio_wc_error="module SHA256 differs from its owning RPM: $module"
+    printf '%s  %s\n' "$digest" "$module" | sha256sum --check --status
 }
 
 # AWS's get-vfio-with-wc.sh keeps the stock module beside the patched one as *_no_wc.
@@ -308,7 +318,7 @@ vfio_wc_installed() {
 step_vfio_wc() {
     if ! vfio_wc_installed; then
         case "$(uname -r)" in
-            6.18.*) fatal vfio_wc "requires the unmodified official AL2023 kernel6.18 package for $(uname -r)" ;;
+            6.18.*) fatal vfio_wc "requires the unmodified official AL2023 kernel6.18 module for $(uname -r): $vfio_wc_error" ;;
         esac
         dir=$(amzn) || fatal vfio_wc "kernel-devel-$(uname -r) or amzn-drivers $AMZN_COMMIT unavailable"
         (cd "$dir/userspace/dpdk/enav2-vfio-patch" && TERM=dumb bash get-vfio-with-wc.sh) >/var/log/zhida-vfio-wc.log 2>&1 \
@@ -493,7 +503,7 @@ verify() {
     check_irqs
 
     if ! vfio_wc_installed; then
-        report vfio_wc FAIL "no write-combining vfio-pci for $(uname -r): rerun apply"
+        report vfio_wc FAIL "no write-combining vfio-pci for $(uname -r): rerun apply${vfio_wc_error:+; $vfio_wc_error}"
     elif [ -n "$(modinfo -F srcversion vfio_pci_core)" ] \
         && [ "$(cat "$R/sys/module/vfio_pci_core/srcversion" 2>/dev/null)" = "$(modinfo -F srcversion vfio_pci_core)" ]; then
         case "$(uname -r)" in

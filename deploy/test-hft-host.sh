@@ -34,12 +34,18 @@ stub pgrep "[ -e '$tmp/irqbalance' ]"
 stub mountpoint '[ "$1" = -q ] && shift; [ -e "$1/.mounted" ]'
 stub modinfo "case \"\$*\" in
     '-F srcversion vfio_pci_core') printf '%s\\n' \"\${FAKE_SRCVERSION-PATCHED}\" ;;
-    '-n vfio_pci_core') echo '$root/lib/modules/'\"\$(uname -r)\"'/kernel/drivers/vfio/pci/vfio-pci-core.ko.zst' ;;
+    '-n vfio_pci_core') [ \"\${FAKE_MODINFO_LOOKUP_FAIL:-no}\" = no ] || exit 1
+        echo '$root/lib/modules/'\"\$(uname -r)\"'/kernel/drivers/vfio/pci/vfio-pci-core.ko.zst' ;;
 esac"
 stub rpm 'case "$1" in
     -qf) [ "${FAKE_RPM_ID:-}" != MISSING ] || exit 1
-        printf "%s\n" "${FAKE_RPM_ID:-kernel6.18 Amazon Linux $(uname -r)}" ;;
-    -Vf) [ "${FAKE_RPM_DIRTY:-no}" = no ] ;;
+        case "$3" in
+            "%{FILEDIGESTALGO}"*) echo "${FAKE_RPM_ALGO:-8}" ;;
+            "[%{FILENAMES}"*) printf "%s %s\n" "$4" "${FAKE_RPM_DIGEST:-}" ;;
+            *) printf "%s\n" "${FAKE_RPM_ID:-kernel6.18 Amazon Linux $(uname -r)}" ;;
+        esac ;;
+    # Real depmod rewrites this RPM-owned index; whole-package verification fails on its mtime.
+    -Vf) echo ".......T. /lib/modules/$(uname -r)/modules.builtin.alias.bin"; exit 1 ;;
     *) exit 1 ;;
 esac'
 # zhida-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
@@ -67,7 +73,7 @@ dpdk_stamp="dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bb
 
 # A fresh c7g-like host: CPUs 0-7 on node 0, no SMT, management ens5, data ens6, stock modules.
 host() {
-    unset FAKE_ARCH FAKE_KERNEL FAKE_SRCVERSION FAKE_RPM_ID FAKE_RPM_DIRTY
+    unset FAKE_ARCH FAKE_KERNEL FAKE_SRCVERSION FAKE_RPM_ID FAKE_RPM_ALGO FAKE_RPM_DIGEST FAKE_MODINFO_LOOKUP_FAIL
     rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance"
     mkdir -p "$root/proc" "$root/run" "$root/etc" "$root/dev/hugepages" "$root/sys/kernel/iommu_groups" \
         "$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB" "$root/sys/module/vfio_pci_core" \
@@ -268,15 +274,18 @@ native_host() {
     native_module=$root/lib/modules/$FAKE_KERNEL/kernel/drivers/vfio/pci/vfio-pci-core.ko.zst
     mkdir -p "$(dirname "$native_module")"
     : >"$native_module"
+    FAKE_RPM_DIGEST=$(sha256sum "$native_module" | cut -d' ' -f1)
+    export FAKE_RPM_DIGEST
     echo NATIVE >"$root/sys/module/vfio_pci_core/srcversion"
 }
 
 native_host
 check "a fresh native fixture resets the earlier x86_64 architecture" sh -c '[ "$(uname -m)" = aarch64 ]'
+check "normal depmod metadata makes whole-package verification fail" sh -c "! rpm -Vf '$native_module' >/dev/null"
 run apply
 check "official 6.18 apply reboots for cmdline, not a VFIO rebuild" status_is 100
 check "native WC needs no kernel-devel or amzn-drivers download" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
-check "native WC checks the module's owning RPM and integrity" sh -c "grep -q '^rpm -qf ' '$calls' && grep -q '^rpm -Vf ' '$calls'"
+check "native WC checks RPM ownership and the module's own digest" sh -c "grep -q '^rpm -qf ' '$calls' && grep -q 'FILEDIGESTALGO' '$calls' && grep -q 'FILEDIGESTS' '$calls'"
 check "native apply does not touch the data ENI before reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
 reboot
 run boot
@@ -297,10 +306,9 @@ check "native apply reboots to replace a different loaded module" status_is 100
 check "native apply names the module reboot reason" has vfio_wc "changed write-combining vfio-pci installed"
 
 native_host
-FAKE_RPM_DIRTY=yes
-export FAKE_RPM_DIRTY
+printf 'changed module bytes\n' >>"$native_module"
 run apply
-check "modified official 6.18 modules are refused" has vfio_wc "FAIL requires the unmodified official AL2023 kernel6.18 package"
+check "modified official 6.18 modules are refused with a digest diagnostic" grep -q "vfio_wc: FAIL .*module SHA256 differs from its owning RPM" "$tmp/out"
 check "modified native modules do not fall back to the incompatible installer" sh -c "! grep -q 'kernel-devel\|amzn-drivers\|systemctl reboot' '$calls'"
 run verify
 check "verify does not accept modified native modules" has vfio_wc "FAIL no write-combining vfio-pci"
@@ -313,12 +321,26 @@ for identity in MISSING "kernel6.18 Custom Linux $FAKE_KERNEL" \
     # A legacy backup must not authorize an untrusted 6.18 module.
     : >"${native_module}_no_wc"
     run apply
-    check "native WC refuses wrong module provenance ($identity)" has vfio_wc "FAIL requires the unmodified official AL2023 kernel6.18 package"
+    check "native WC refuses wrong module provenance ($identity)" grep -q "vfio_wc: FAIL .*not owned by the official Amazon Linux kernel6.18 package" "$tmp/out"
 done
 native_host
 rm "$native_module"
 run apply
-check "native WC refuses a missing module even when package metadata claims it" has vfio_wc "FAIL requires the unmodified official AL2023 kernel6.18 package"
+check "native WC diagnoses a missing module file" grep -q "vfio_wc: FAIL .*module file missing:" "$tmp/out"
+native_host
+FAKE_MODINFO_LOOKUP_FAIL=yes
+export FAKE_MODINFO_LOOKUP_FAIL
+run apply
+check "native WC diagnoses unavailable module indexes" grep -q "vfio_wc: FAIL .*modinfo cannot resolve vfio_pci_core" "$tmp/out"
+native_host
+FAKE_RPM_ALGO=10
+export FAKE_RPM_ALGO
+run apply
+check "native WC rejects an unsupported RPM digest algorithm" grep -q "vfio_wc: FAIL .*unsupported or unavailable RPM file digest algorithm" "$tmp/out"
+native_host
+FAKE_RPM_DIGEST=
+run apply
+check "native WC diagnoses a missing recorded module digest" grep -q "vfio_wc: FAIL .*RPM SHA256 digest unavailable" "$tmp/out"
 native_host
 run apply
 FAKE_SRCVERSION=

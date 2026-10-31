@@ -86,12 +86,20 @@ It is not invoked for the official AL2023 6.18 path.
 The supported 6.18 policy trusts Amazon's kernel package contract, grounded in that published source;
 it is not an independent runtime measurement of BAR memory attributes or a guarantee inferred from
 a module symbol. `modinfo` must resolve an existing module owned by `kernel6.18`, vendor
-`Amazon Linux`, with version/release/architecture matching `uname -r`; `rpm -Vf` must report the
-owning package unmodified. Verification also requires nonempty, equal installed/loaded
+`Amazon Linux`, with version/release/architecture matching `uname -r`. Its file bytes must match
+that file's SHA256 digest in the owning RPM's metadata. Do not use `rpm -Vf` for this: it verifies
+the entire package, and ordinary `depmod` rewrites the RPM-owned `modules.builtin.alias.bin`
+index's timestamp even when VFIO is untouched. Verification also requires nonempty, equal installed/loaded
 `vfio_pci_core` source versions. Custom, unowned, modified or mismatched modules fail rather than
 falling back to the incompatible installer. No kernel downgrade, header substitution or extra
 kernel-upgrade phase is needed. The existing command-line reboot and boot service still apply;
 reconnect and run `verify` as above.
+
+An offline inspection of the exact binary RPM reproduced that whole-package verification failure
+after `depmod`, while the VFIO module's recorded digest still matched. Altering the module bytes
+then failed the module-only digest check. This is a reproduced defect in the verifier, not proof
+of the exact sub-check that failed on the subsequent EC2 attempt: that attempt did not log it.
+Native failures now name module lookup, file existence, package ownership or digest verification.
 
 ## Test (local, no root)
 
