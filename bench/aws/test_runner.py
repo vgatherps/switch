@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shlex
+import select
 import signal
 import subprocess
 import sys
@@ -181,7 +182,8 @@ EOF
         calls = self.run_sh(z.sweep_command("tcp", 50, RECEIVER_DATA_IP, "0-6"))
         self.assertEqual(calls[0], "taskset -c 0-6 MIMALLOC=unset")
         self.assertEqual(calls[1], "zhida-bench sweep --proto tcp --gens 3 --senders 12 --rate-min 10000"
-                                   " --rate-max 5000000 --budget-us 50 --gen-cmd")
+                                   " --rate-max 5000000 --budget-us 50"
+                                   " --step-ms 500 --warmup-ms 250 --drain-ms 200 --gen-cmd")
         gen = ("zhida-bench gen --config /etc/zhida/dut.json --proto tcp --target 10.80.1.100:7000 --senders 4"
                " --size 64 --local-port 40000")
         for i in range(z.SENDERS):
@@ -386,6 +388,32 @@ class HostTest(unittest.TestCase):
         return z.Host({"role": "sender3", "id": "i-4", "public_ip": "1.2.3.4"}, "/k.pem", "/rd", run=run,
                       sleep=lambda s: None, clock=iter(range(0, 100000, 5)).__next__)
 
+    def test_streamed_progress_arrives_before_the_remote_command_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ack = os.path.join(tmp, "ack")
+            write_exe(os.path.join(tmp, "ssh"),
+                      f'echo "processes synced" >&2\n'
+                      f'while [ ! -e {shlex.quote(ack)} ]; do sleep 0.05; done\nexit 7\n')
+            code = (
+                f"import sys; sys.path.insert(0, {os.path.dirname(z.__file__)!r}); "
+                "import zhida_aws_bench as z; "
+                "h = z.Host({'role':'sender0','public_ip':'unused'}, '/key', '/run'); "
+                "sys.exit(h.ssh('sweep', check=False, timeout=10, stream=True).returncode)"
+            )
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}")
+            with subprocess.Popen([sys.executable, "-c", code], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+                try:
+                    readable, _, _ = select.select([child.stdout], [], [], 5)
+                    self.assertTrue(readable, "progress was buffered until command exit")
+                    self.assertEqual(child.stdout.readline(), b"processes synced\n")
+                    self.assertIsNone(child.poll(), "command must still be waiting")
+                finally:
+                    with open(ack, "w"):
+                        pass
+                    child.communicate(timeout=15)
+                self.assertEqual(child.returncode, 7, "streaming must preserve sweep failure")
+
     def test_failed_scp_is_reported_not_ignored(self):
         h = self.host(lambda argv, **kw: Proc(1, stderr="scp: /var/tmp/zhida/x.jsonl: No such file or directory"))
         err = h.fetch("/var/tmp/zhida/x.jsonl", "/rd")
@@ -499,7 +527,7 @@ class FakeHost:
             return Proc(self.w.feed_code)
         return Proc(0)
 
-    def ssh(self, command, check=True, timeout=None, input=None):
+    def ssh(self, command, check=True, timeout=None, input=None, stream=False):
         self.w.calls.append((self.role, command))
         if "zhida-bench sweep" in command:
             t = command.split(f"> {z.REMOTE}/")[1].split(".jsonl")[0]
@@ -746,14 +774,15 @@ class RunTest(unittest.TestCase):
         self.assertEqual(w.sweep_timeouts, [z.SWEEP_WORST_S] * 3)
         self.assertTrue(all(r == "sender0" for r, c in w.calls if "zhida-bench sweep" in c))
         for cmd, t in zip(sweeps, z.sweep_tags()):
-            argv = shlex.split(cmd.split(" > ")[0])
+            inner = shlex.split(cmd)[2]
+            argv = shlex.split(inner.split(" > ")[0])
             self.assertEqual(argv[:3], ["taskset", "-c", "0-6"], "coordinator on HOUSEKEEPING")
             self.assertEqual(argv[argv.index("--gens") + 1], str(z.SENDERS))
             tmpl = argv[argv.index("--gen-cmd") + 1]
             for i in range(z.SENDERS):
                 self.assertTrue(tmpl.replace("{i}", str(i)).startswith(f"ssh -F {z.REMOTE}/ssh_config sender{i} "))
             self.assertIn(f"--target {RECEIVER_DATA_IP}:7000", tmpl)
-            self.assertIn(f"> {z.REMOTE}/{t}.jsonl 2> {z.REMOTE}/{t}.coord.log", cmd)
+            self.assertIn(f"> {z.REMOTE}/{t}.jsonl 2> >(tee {z.REMOTE}/{t}.coord.log >&2)", inner)
         serves = [c for r, c in w.calls if r == "receiver" and "zhida-bench serve" in c]
         self.assertEqual(len(serves), 3)
         for c, (proto, _) in zip(serves, z.SWEEPS):
@@ -777,6 +806,15 @@ class RunTest(unittest.TestCase):
             setup = f.read()
         self.assertIn(f"[sender{z.SENDERS - 1} host.env]", setup)
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, "fetch-errors.txt")))
+
+    def test_failed_host_setup_never_claims_code_built_or_starts_a_sweep(self):
+        self.w.verify_fail.add("sender1")
+        self.assertIsInstance(self.run_bench(), RuntimeError)
+        output = self.log.getvalue()
+        self.assertIn("hosts up:", output)
+        self.assertNotIn("code built:", output)
+        self.assertEqual(self.sweeps_run(), [])
+        self.assertIn("end: failed", output)
 
     def test_failing_sweep_does_not_stop_later_sweeps_and_is_fetched(self):
         self.w.sweep_exit[UDP] = 1

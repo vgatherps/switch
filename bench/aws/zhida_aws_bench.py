@@ -72,6 +72,7 @@ CONNECTIONS = 4 * SENDERS
 SIZE = 64
 RATE_MIN, RATE_MAX = 10_000, 5_000_000
 BUDGET_US = 50
+STEP_MS, WARMUP_MS, DRAIN_MS = 500, 250, 200
 SWEEPS = [("udp", None), ("tcp", BUDGET_US), ("ws", BUDGET_US)]
 PORT = 7000
 MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
@@ -80,7 +81,7 @@ HFT = f"{SRC_DIR}/deploy/hft-host.sh"
 REMOTE = "/var/tmp/zhida"
 RECEIVER_UNIT = "zhida-bench-receiver"
 # The coordinator's worst case and timeout: one step per rate RATE_MIN x sqrt(2)^k <= RATE_MAX, each
-# <= 50 ms lead + 0.5 s warmup + 2 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
+# <= 50 ms lead + 0.25 s warmup + 0.5 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
 # a backstop only: the coordinator bounds its own steps and workers
 SWEEP_WORST_S = 15 * 60
 BUILD_S = 3600
@@ -143,10 +144,12 @@ def sweep_command(proto, budget, receiver_ip, housekeeping):
     """The coordinator, run as ec2-user on sender0's housekeeping CPUs."""
     t = tag(proto, budget)
     budget_arg = "" if budget is None else f" --budget-us {budget}"
-    return (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDERS}"
-            f" --senders {CONNECTIONS} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
-            f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
-            f" > {REMOTE}/{t}.jsonl 2> {REMOTE}/{t}.coord.log")
+    command = (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDERS}"
+               f" --senders {CONNECTIONS} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
+               f" --step-ms {STEP_MS} --warmup-ms {WARMUP_MS} --drain-ms {DRAIN_MS}"
+               f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
+               f" > {REMOTE}/{t}.jsonl 2> >(tee {REMOTE}/{t}.coord.log >&2)")
+    return f"bash -c {shlex.quote(command)}"
 
 
 def serve_command(proto, app_cpu):
@@ -269,6 +272,8 @@ def plan_text(region, ttl, run_id, expires):
     lines += [
         f"sweeps: {CONNECTIONS} senders ({CONNECTIONS // SENDERS} per sender host), {SIZE} B messages,"
         f" {RATE_MIN}..{RATE_MAX} msg/s in steps of x sqrt(2); coordinator killed after {SWEEP_WORST_S} s",
+        f"timing per rate: {STEP_MS} ms measurement + {WARMUP_MS} ms warmup + {DRAIN_MS} ms drain"
+        " + 50 ms lead; host setup/builds, worker startup and clock probes are additional",
     ]
     lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
     lines += [
@@ -412,9 +417,9 @@ class Host:
                 "-o", f"UserKnownHostsFile={self.run_dir}/known_hosts", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=15"]
 
-    def ssh(self, command, check=True, timeout=None, input=None):
+    def ssh(self, command, check=True, timeout=None, input=None, stream=False):
         argv = ["ssh", *self._opts(), f"ec2-user@{self.info['public_ip']}", command]
-        r = self._run(argv, capture_output=True, input=input, text=not isinstance(input, bytes),
+        r = self._run(argv, capture_output=not stream, input=input, text=not isinstance(input, bytes),
                       timeout=timeout or SSH_S)
         if check and r.returncode != 0:
             err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
@@ -618,7 +623,7 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env):
             return None
         try:
             return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"]),
-                               check=False, timeout=SWEEP_WORST_S).returncode
+                               check=False, timeout=SWEEP_WORST_S, stream=True).returncode
         except subprocess.TimeoutExpired:
             log(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
             sender0.ssh("pkill -f 'zhida-bench sweep'", check=False, timeout=60)
@@ -672,6 +677,7 @@ def run(args, env=None):
     fetch_errors, failed = [], ["(not measured)"]
     # From here on every exit path deletes the run's resources.
     try:
+        log(f"run {run_id} start: provisioning hosts")
         net = aws.create_network(run_id, expires, my_ip, created.add, key_path, HOST_TYPE, "cluster")
         infos = aws.launch_hosts(net, run_id, expires, created.add, HOST_TYPE, ROLES)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
@@ -679,7 +685,9 @@ def run(args, env=None):
         hosts = [env.host(info, key_path, run_dir) for info in infos]
         for h in hosts:
             h.wait_ssh()
+        log(f"hosts up: all {len(hosts)} hosts reachable over SSH; setting up and building")
         setup = setup_hosts(hosts, archive)
+        log(f"code built: all {len(hosts)} hosts passed setup verification and built zhida-bench")
         facts, receiver_ip = read_facts(hosts, infos[0]["data_eni"]["ip"])
         for h in hosts:
             h.root(f"install -d -m 1777 {REMOTE}")
@@ -705,6 +713,7 @@ def run(args, env=None):
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
         if failed:
             log(f"sweeps that failed or were generator-bound: {', '.join(failed)}")
+        log(f"run {run_id} end: {'success' if report_code == 0 and not fetch_errors and not failed and torn else 'failed'}")
     return 0 if report_code == 0 and not fetch_errors and not failed and torn else 1
 
 

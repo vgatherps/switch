@@ -119,7 +119,9 @@ fn main_inner() -> Result<(), String> {
             if args.rate_min == 0 || args.rate_min > args.rate_max {
                 return Err("need 0 < --rate-min <= --rate-max".into());
             }
-            coord::run(&args, &mut print_line)
+            coord::run(&args, &mut print_line, &mut |stage| {
+                eprintln!("zhida-bench {proto:?}: {stage}");
+            })
         }
         "gen" => {
             let proto = proto(&mut flags)?;
