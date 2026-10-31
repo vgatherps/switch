@@ -4,7 +4,7 @@
   zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
   zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
   zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
-  zhida_aws_bench.py cleanup --run-id ID
+  zhida_aws_bench.py cleanup --run-id ID | --shared       delete a run's resources | the shared ones
 
 Needs python3 with boto3, ssh, scp, ssh-keygen, git, a clean committed tree (the hosts build
 `git archive HEAD`) and AWS credentials for the region. Design: plans/bench/design.md.
@@ -23,7 +23,8 @@ group, one data ENI each; builds natively (bootstrap.sh, `deploy/hft-host.sh bui
 by versions); applies `deploy/hft-host.sh` (reboot, verify); runs the fixed sweep matrix with the
 coordinator on sender0 driving one worker per sender host over SSH; fetches every result; runs
 bench/report.py; tears down. Billable per-run resources carry the run id and expiry tags; each
-instance powers itself off (terminate) at the TTL; the runner tears down on exit, Ctrl-C and SIGTERM.
+instance powers itself off (terminate) at the TTL; the runner tears down on exit, errors, Ctrl-C and
+SIGTERM, and exits non-zero if a final describe still finds any of the run's resources.
 """
 import argparse
 import datetime
@@ -48,7 +49,7 @@ SHARED = {"Key": janitor.SHARED_TAG, "Value": "shared"}
 ROLE_TAG = "zhida-bench-role"
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 VPC_CIDR, SUBNET_CIDR = "10.80.0.0/16", "10.80.1.0/24"
-NAME = "zhida-bench"
+NAME = janitor.NAME
 KEY_DIR = os.path.expanduser("~/.zhida-bench")
 REGION = "ap-northeast-1"
 TTL = "2h"
@@ -95,6 +96,14 @@ def parse_duration(text):
 
 def new_run_id(now):
     return now.strftime("%Y%m%d-%H%M%S-") + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+
+
+def shared_key_path(region):
+    return os.path.join(KEY_DIR, f"{NAME}-{region}.pem")
+
+
+def bucket_name(account, region):
+    return f"{NAME}-cache-{account}-{region}"
 
 
 def run_tags(run_id, expires):
@@ -329,7 +338,7 @@ class Aws:
                 raise
         if not ec2.describe_placement_groups(Filters=[{"Name": "group-name", "Values": [NAME]}])["PlacementGroups"]:
             ec2.create_placement_group(GroupName=NAME, Strategy="cluster", TagSpecifications=tagspec("placement-group"))
-        key_path = os.path.join(KEY_DIR, f"{NAME}-{self.region}.pem")
+        key_path = shared_key_path(self.region)
         keys = ec2.describe_key_pairs(Filters=[{"Name": "key-name", "Values": [NAME]}])["KeyPairs"]
         if keys and not os.path.exists(key_path):
             raise RuntimeError(f"key pair {NAME} exists but {key_path} is missing: restore the file, or run"
@@ -339,7 +348,7 @@ class Aws:
             material = ec2.create_key_pair(KeyName=NAME, TagSpecifications=tagspec("key-pair"))["KeyMaterial"]
             with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
                 f.write(material)
-        bucket = f"{NAME}-cache-{account}-{self.region}"
+        bucket = bucket_name(account, self.region)
         try:
             self.s3.head_bucket(Bucket=bucket)
         except Exception as e:
@@ -362,7 +371,7 @@ class Aws:
 
     def ensure_host_profile(self, bucket):
         """Role + instance profile letting the hosts read and write the S3 build cache."""
-        name = f"{NAME}-host"
+        name = janitor.HOST_PROFILE
         trust = {"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
         policy = {"Version": "2012-10-17", "Statement": [
@@ -758,21 +767,37 @@ def run(args, env=None):
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
         log(f"tearing down run {run_id}")
-        done = janitor.clean(aws.ec2, run_id=run_id, log=log)
-        log(f"teardown: {json.dumps(done)}")
-    return 0 if not failed and report_code == 0 and not fetch_errors else 1
+        torn = teardown(aws.ec2, run_id)
+    return 0 if not failed and report_code == 0 and not fetch_errors and torn else 1
+
+
+def teardown(ec2, run_id):
+    """Deletes the run's resources; True only when a describe found none of them left."""
+    remaining = janitor.clean_run(ec2, run_id, log=log)
+    if remaining:
+        log(f"run {run_id}: STILL PRESENT after teardown (rerun `cleanup --run-id {run_id}`): {'; '.join(remaining)}")
+        return False
+    log(f"run {run_id}: nothing left")
+    return True
 
 
 def cleanup(args, env=None):
-    env = env or Env()
-    aws = env.aws(args.region)
-    done = janitor.clean(aws.ec2, run_id=args.run_id, log=log)
-    log(f"cleanup: {json.dumps(done)}")
+    aws = (env or Env()).aws(args.region)
+    if args.run_id:
+        return 0 if teardown(aws.ec2, args.run_id) else 1
+    account = aws.sts.get_caller_identity()["Account"]
+    remaining = janitor.clean_shared(aws.ec2, aws.s3, aws.iam, bucket_name(account, args.region),
+                                     shared_key_path(args.region), log=log)
+    if remaining:
+        log(f"cleanup --shared: STILL PRESENT: {'; '.join(remaining)}")
+        return 1
+    log("cleanup --shared: nothing left")
     return 0
 
 
 def parser():
-    p = argparse.ArgumentParser(prog="zhida-aws-bench", description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="zhida-aws-bench", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("run", "plan", "preflight"):
         r = sub.add_parser(name)
@@ -780,7 +805,9 @@ def parser():
         r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
         r.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
     c = sub.add_parser("cleanup")
-    c.add_argument("--run-id", required=True)
+    which = c.add_mutually_exclusive_group(required=True)
+    which.add_argument("--run-id")
+    which.add_argument("--shared", action="store_true")
     c.add_argument("--region", default=REGION)
     return p
 

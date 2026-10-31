@@ -341,6 +341,7 @@ class World:
         self.report_code = 0
         self.local_calls = []
         self.clean_calls = []
+        self.left_after_teardown = []
 
 
 class FakeHost:
@@ -545,11 +546,11 @@ class RunTest(unittest.TestCase):
                     local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: w.now, sleep=lambda s: None)
         args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out)
 
-        def clean(ec2, run_id=None, log=print, **kw):
+        def clean_run(ec2, run_id, log=print, **kw):
             w.clean_calls.append(run_id)
-            return {}
+            return list(w.left_after_teardown)
 
-        with mock.patch.object(z.janitor, "clean", clean), mock.patch.object(z.signal, "signal"), \
+        with mock.patch.object(z.janitor, "clean_run", clean_run), mock.patch.object(z.signal, "signal"), \
                 contextlib.redirect_stdout(io.StringIO()):
             try:
                 code = z.run(args, env)
@@ -659,6 +660,11 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.sweeps_run(), [])
         self.assertEqual(len(self.w.clean_calls), 1)
         self.assertEqual([a for a in self.w.local_calls if a[1].endswith("report.py")], [])
+
+    def test_resources_left_after_teardown_fail_the_run(self):
+        self.w.left_after_teardown = ["network-interface eni-9 (in-use, run r)"]
+        self.assertEqual(self.run_bench(), 1)
+        self.assertEqual(len(self.sweeps_run()), 3)
 
     def test_dirty_tree_refused_before_anything_is_created(self):
         def local(argv, **kw):

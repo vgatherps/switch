@@ -86,8 +86,18 @@ received frame larger than a TX frame: every byte must come back.
 
 ## AWS
 
-`bench/aws/zhida_aws_bench.py run|plan|cleanup` provisions spot hosts in one region, builds natively, applies
-`deploy/hft-host.sh`, runs the matrix (Zhida and kernel DUTs, kernel sockperf sender), writes the report and
-tears down; everything billable expires at `--ttl` without the laptop (a scheduled janitor Lambda plus an
-instance power-off timer). Needs python3 with boto3, ssh, git and AWS credentials. Tests (no AWS):
-`python3 bench/aws/test_janitor.py`, `python3 bench/aws/test_runner.py`, `sh deploy/test-hft-host.sh`.
+`python3 bench/aws/zhida_aws_bench.py run [--region ap-northeast-1] [--ttl 2h] [--out DIR]` runs the whole
+thing: preflight (clean committed tree with `deploy/hft-host.sh`, credentials, on-demand Standard vCPU quota
+L-1216C47A with 48 free), six c7gn.2xlarge on-demand hosts in one cluster placement group (1 receiver, 5
+senders, one DPDK data ENI each), native build (`bench/aws/bootstrap.sh`: `deploy/hft-host.sh build`, S3 cache
+keyed by DPDK/AL2023/git-tree/Rust versions), `hft-host.sh apply`, reboot, `verify`; then the fixed matrix
+(udp uncapped, tcp and ws `--budget-us 50`; 20 senders, 64 B) with the coordinator on sender0 driving one worker
+per sender host over SSH. Before each sweep it checks chrony (|offset| <= 1 ms on all six) and the TTL; a failed
+sweep is recorded and the next runs. Every result is fetched with checked scp (failures in `fetch-errors.txt`),
+`bench/report.py` writes the report, and teardown deletes the run's instances, volumes and ENIs and verifies
+none are left (exit non-zero otherwise). Each instance also powers itself off (terminates) at the TTL.
+`plan` prints the hosts and sweeps without AWS calls; `preflight` runs only the checks; `cleanup --run-id ID`
+is the same teardown; `cleanup --shared` deletes the VPC, subnet, IGW, route table, SG, placement group, key
+pair (and its local pem), S3 cache bucket and host role/instance profile, refusing while run resources exist.
+Needs python3 with boto3, ssh, scp, ssh-keygen, git; the IAM permissions are listed in the runner's `-h`.
+Tests (no AWS): `python3 -m unittest discover -s bench/aws`, `sh deploy/test-hft-host.sh`.
