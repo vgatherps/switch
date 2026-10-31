@@ -353,6 +353,16 @@ class CleanupCommandTest(unittest.TestCase):
             code = z.main(argv, z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: aws))
         return code, out.getvalue()
 
+    def recorded_run(self, recorded):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        os.makedirs(os.path.join(directory.name, "r1"))
+        created = janitor.Created(os.path.join(directory.name, "r1", "created.json"))
+        for kind, ids in recorded.items():
+            for rid in ids:
+                created.add(kind, rid)
+        return directory.name, created
+
     def test_run_id_uses_the_recorded_ids_and_the_tags(self):
         out_dir = tempfile.mkdtemp()
         os.makedirs(os.path.join(out_dir, "r1"))
@@ -369,6 +379,110 @@ class CleanupCommandTest(unittest.TestCase):
         self.assertIn("run r1: 12 recorded IDs from", out)
         self.assertIn("run r1: nothing left", out)
         self.assertNotIn("eni-untagged", ec2.store["network-interface"])
+
+    def test_repeated_standalone_cleanup_keeps_the_same_recorded_ids(self):
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-hidden", None, Status="available")
+        ec2.hidden.add("eni-hidden")
+        recorded["network-interface"].append("eni-hidden")
+        out_dir, created = self.recorded_run(recorded)
+        argv = ["cleanup", "--run-id", "r1", "--out", out_dir]
+
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(left(ec2), [])
+        self.assertIn(("network-interface", "eni-hidden"), ec2.deleted)
+        self.assertEqual(janitor.read_created(created.path), recorded)
+        ec2.calls.clear()
+
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 0, out)
+        self.assertIn("run r1: 12 recorded IDs from", out)
+        self.assertIn("run r1: nothing left", out)
+        self.assertNotIn("recorded but never found", out)
+        self.assertEqual(ec2.calls, [])
+        self.assertEqual(janitor.read_created(created.path), recorded)
+
+    def test_partial_cleanup_witnesses_survive_a_standalone_retry(self):
+        ec2, recorded = run_world()
+        ec2.add("network-interface", "eni-stuck", Status="in-use", _vpc="vpc")
+        out_dir, created = self.recorded_run(recorded)
+        argv = ["cleanup", "--run-id", "r1", "--out", out_dir]
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 1, out)
+        self.assertIn("network-interface eni-stuck", out)
+        self.assertNotIn("zhida-bench-r1", ec2.store["placement-group"])
+
+        ec2.store["network-interface"]["eni-stuck"]["Status"] = "available"
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 0, out)
+        self.assertIn("run r1: nothing left", out)
+        self.assertEqual(left(ec2), [])
+        self.assertEqual(janitor.read_created(created.path), recorded)
+
+    def test_repeated_cleanup_does_not_confirm_a_fresh_hidden_not_found(self):
+        ec2 = FakeEc2()
+        ec2.add("vpc", "vpc-fresh")
+        ec2.hidden.add("vpc-fresh")
+        ec2.fail["delete_vpc"] = ClientError("InvalidVpcID.NotFound")
+        out_dir, created = self.recorded_run({"vpc": ["vpc-fresh"]})
+        argv = ["cleanup", "--run-id", "r1", "--out", out_dir]
+
+        for _ in range(2):
+            code, out = self.main(argv, ec2)
+            self.assertEqual(code, 1, out)
+            self.assertIn("vpc vpc-fresh: recorded but never found", out)
+            self.assertNotIn("run r1: nothing left", out)
+            self.assertIn("vpc-fresh", ec2.store["vpc"])
+        self.assertEqual(janitor.read_journal(created.path)[1], set())
+
+        ec2.hidden.clear()
+        ec2.fail.clear()
+        for _ in range(2):
+            code, out = self.main(argv, ec2)
+            self.assertEqual(code, 0, out)
+            self.assertIn("run r1: nothing left", out)
+
+    def test_accepted_async_delete_is_still_described_by_id_on_retry(self):
+        ec2 = FakeEc2()
+        ec2.add("instance", "i-pending", None, State={"Name": "running"})
+        out_dir, _ = self.recorded_run({"instance": ["i-pending"]})
+        argv = ["cleanup", "--run-id", "r1", "--out", out_dir]
+        items = ec2._items
+
+        def still_shutting_down(op, filters):
+            ec2.store["instance"]["i-pending"].pop("_seen", None)
+            return items(op, filters)
+
+        with mock.patch.object(ec2, "_items", still_shutting_down):
+            for _ in range(2):
+                code, out = self.main(argv, ec2)
+                self.assertEqual(code, 1, out)
+                self.assertIn("instance i-pending", out)
+                self.assertNotIn("run r1: nothing left", out)
+        self.assertEqual(ec2.calls, [("terminate_instances", "i-pending")])
+
+        ec2.store["instance"]["i-pending"]["State"]["Name"] = "terminated"
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 0, out)
+        self.assertIn("run r1: nothing left", out)
+
+    def test_a_new_create_with_the_same_name_resets_its_cleanup_witness(self):
+        ec2 = FakeEc2()
+        ec2.add("placement-group", "pg")
+        out_dir, created = self.recorded_run({"placement-group": ["pg"]})
+        argv = ["cleanup", "--run-id", "r1", "--out", out_dir]
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 0, out)
+
+        ec2.add("placement-group", "pg")
+        created.add("placement-group", "pg")
+        ec2.hidden.add("pg")
+        ec2.fail["delete_placement_group"] = ClientError("InvalidPlacementGroup.Unknown")
+        code, out = self.main(argv, ec2)
+        self.assertEqual(code, 1, out)
+        self.assertIn("placement-group pg: recorded but never found", out)
+        self.assertIn("pg", ec2.store["placement-group"])
 
     def test_cleanup_is_not_interrupted_by_ctrl_c(self):
         """Regression: standalone cleanup kept the default SIGINT handler."""

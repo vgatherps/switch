@@ -711,7 +711,7 @@ def run(args, env=None):
         # Nothing interrupts teardown; it goes first because the report is local.
         on_signals(signal.SIG_IGN)
         log(f"tearing down run {run_id}")
-        torn = teardown(aws.ec2, run_id, created.ids)
+        torn = teardown(aws.ec2, run_id, created.ids, created.path)
         report_code = None
         if os.path.exists(os.path.join(run_dir, "expected.json")):
             if fetch_errors:
@@ -728,9 +728,9 @@ def run(args, env=None):
     return 0 if report_code == 0 and not fetch_errors and not failed and torn else 1
 
 
-def teardown(ec2, run_id, recorded):
+def teardown(ec2, run_id, recorded, journal_path):
     """Deletes the run's resources; True only when nothing was found left and nothing errored."""
-    problems = janitor.clean_run(ec2, run_id, recorded, log=log)
+    problems = janitor.clean_run(ec2, run_id, recorded, log=log, journal_path=journal_path)
     if problems:
         log(f"run {run_id}: NOT VERIFIED GONE; rerun `cleanup --run-id {run_id}`: {'; '.join(problems)}")
         return False
@@ -785,7 +785,7 @@ def binance(args, env=None):
     finally:
         on_signals(signal.SIG_IGN)
         log(f"tearing down run {run_id}")
-        torn = teardown(aws.ec2, run_id, created.ids)
+        torn = teardown(aws.ec2, run_id, created.ids, created.path)
         if summary:
             log(f"results in {run_dir}:\n  " + "\n  ".join(summary))
     return 0 if code == 0 and not fetch_errors and torn else 1
@@ -799,7 +799,7 @@ def cleanup(args, env=None):
     log(f"run {args.run_id}: {sum(map(len, recorded.values()))} recorded IDs from {path}" if recorded
         else f"run {args.run_id}: no {path}; tag lookup only")
     on_signals(signal.SIG_IGN)
-    return 0 if teardown(aws.ec2, args.run_id, recorded) else 1
+    return 0 if teardown(aws.ec2, args.run_id, recorded, path) else 1
 
 
 def parser():

@@ -101,6 +101,14 @@ send-lag rejection, budgets, per-rate clock checks and late-start rejection are 
 
 `plan` prints the hosts, sweeps and what gets created, with no AWS calls; `preflight` runs only the checks; `cleanup --run-id ID [--region R] [--out DIR]` deletes a leftover run using `DIR/ID/created.json` plus a tag lookup (tag lookup only if the file is gone). Needs python3 with boto3, ssh, scp, git; the IAM permissions are listed in the runner's `-h`. Tests (no AWS): `python3 -m unittest discover -s bench/aws`, `sh deploy/test-hft-host.sh`.
 
+Teardown and standalone cleanup keep the recorded IDs and append describe/delete-acceptance witnesses
+to the same `created.json`. Keep that file for repeated cleanup, including after a partially failed
+teardown. An accepted delete is not proof that an asynchronous deletion has finished: every cleanup
+still describes recorded IDs as well as tags. A newly created ID that no describe has shown and whose
+delete only answers NotFound remains unverified, even on a later cleanup attempt.
+Older journals without witnesses cannot distinguish an already deleted resource from one not yet
+visible; NotFound alone remains unverified for those IDs.
+
 Before the first paid run:
 - [ ] quota: `preflight` passes (L-1216C47A >= 16 free in the region)
 - [ ] credentials: `preflight` shows the intended account/ARN
