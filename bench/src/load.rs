@@ -641,10 +641,6 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
         pacer.finish(clock.now_ns());
         switch::yield_now().await;
     }
-    // cut off: a last look at what was due and not sent, if no poll did after the last message
-    let now = clock.now_ns();
-    pacer.begin(now);
-    pacer.finish(now);
     out.backlog_at_end = pacer.backlog_at_end();
     out.unsent = pacer.unsent_from(measured_from);
     *done.borrow_mut() = Some(out);
