@@ -2,6 +2,7 @@
 //! sheath) on one switchnet TCP socket, run as a switch task. The Runtime's ticks are
 //! milliseconds ([`Clock::ms`]).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
@@ -69,24 +70,26 @@ impl Target {
     }
 }
 
-/// One bookTicker update; prices and quantities keep Binance's decimal strings.
+/// One bookTicker update; prices and quantities keep Binance's decimal strings. The strings
+/// borrow the message text; one with a JSON escape (which Binance does not send) is unescaped
+/// into an owned copy.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct BookTicker {
+pub struct BookTicker<'a> {
     #[serde(rename = "u")]
     pub update_id: u64,
-    #[serde(rename = "s")]
-    pub symbol: String,
-    #[serde(rename = "b")]
-    pub bid_price: String,
-    #[serde(rename = "B")]
-    pub bid_qty: String,
-    #[serde(rename = "a")]
-    pub ask_price: String,
-    #[serde(rename = "A")]
-    pub ask_qty: String,
+    #[serde(rename = "s", borrow)]
+    pub symbol: Cow<'a, str>,
+    #[serde(rename = "b", borrow)]
+    pub bid_price: Cow<'a, str>,
+    #[serde(rename = "B", borrow)]
+    pub bid_qty: Cow<'a, str>,
+    #[serde(rename = "a", borrow)]
+    pub ask_price: Cow<'a, str>,
+    #[serde(rename = "A", borrow)]
+    pub ask_qty: Cow<'a, str>,
 }
 
-impl fmt::Display for BookTicker {
+impl fmt::Display for BookTicker<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -299,22 +302,28 @@ pub async fn connect(
 pub struct Feed(Wss);
 
 impl Feed {
-    /// The next update, or `None` once `stop` finishes; messages already received come first.
-    /// Server pings are answered inside.
-    pub async fn next(&mut self, stop: impl Future) -> Result<Option<BookTicker>, FeedError> {
-        first(self.recv(), stop).await.transpose()
+    /// Hands the next update to `on` and returns what it returns, or `None` once `stop`
+    /// finishes; messages already received come first. Server pings are answered inside. The
+    /// update borrows the received message, so it is only lent to `on`.
+    pub async fn next<R>(
+        &mut self,
+        stop: impl Future,
+        on: impl FnOnce(&BookTicker<'_>) -> R,
+    ) -> Result<Option<R>, FeedError> {
+        first(self.recv(on), stop).await.transpose()
     }
 
-    async fn recv(&mut self) -> Result<BookTicker, FeedError> {
+    async fn recv<R>(&mut self, on: impl FnOnce(&BookTicker<'_>) -> R) -> Result<R, FeedError> {
         let Some(message) = self.0.recv().await.map_err(FeedError::Ws)? else {
             let (code, reason) = self.0.peer_close().expect("recv returned None after the server's close");
             return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
         };
         let text = message.text().ok_or(FeedError::Binary)?;
-        serde_json::from_str(text).map_err(|error| FeedError::Parse {
+        let ticker = serde_json::from_str(text).map_err(|error| FeedError::Parse {
             text: text.to_owned(),
             error,
-        })
+        })?;
+        Ok(on(&ticker))
     }
 
     /// Sends the WebSocket close (1000) and reads until the server's close echo, dropping the
@@ -343,7 +352,7 @@ pub enum Event<'a> {
     /// TCP, TLS and WebSocket are open.
     Connected,
     /// Update number `count` (from 1).
-    Ticker { count: u64, ticker: &'a BookTicker },
+    Ticker { count: u64, ticker: &'a BookTicker<'a> },
     /// Reading ended (stop, or an error returned after the close); the close starts.
     Read(Summary),
     /// The close handshake finished: WebSocket close, TLS close_notify, FIN.
@@ -375,13 +384,14 @@ pub async fn stream(
     on(Event::Connected);
     let mut summary = Summary { count: 0, update_ids: None };
     let read = loop {
-        match feed.next(&mut stop).await {
-            Ok(Some(ticker)) => {
-                summary.count += 1;
-                let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
-                summary.update_ids = Some((first, ticker.update_id));
-                on(Event::Ticker { count: summary.count, ticker: &ticker });
-            }
+        let next = feed.next(&mut stop, |ticker| {
+            summary.count += 1;
+            let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
+            summary.update_ids = Some((first, ticker.update_id));
+            on(Event::Ticker { count: summary.count, ticker });
+        });
+        match next.await {
+            Ok(Some(())) => {}
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         }
