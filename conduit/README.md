@@ -75,6 +75,7 @@ Imported files keep their own licenses:
 - packetdrill scripts from freebsd-net/tcp-testsuite: BSD-2-Clause, notice in each file.
 - packetdrill scripts from google/packetdrill, and `docker/packetdrill-relearn-isn.patch`:
   GPL-2.0-or-later.
+- `docker/dpdk-ena-read-clock.patch` (to DPDK's ENA driver): BSD-3-Clause.
 - `autobahn/expected-results-relay.json`: derived from tungstenite's expected results, MIT OR
   Apache-2.0 (`autobahn/LICENSE-MIT-tungstenite`).
 

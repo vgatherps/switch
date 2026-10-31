@@ -725,7 +725,10 @@ A Linux machine runs the same targets without Docker. It needs what docker/Docke
   names).
 - DPDK 25.11.3 built from source into `/opt/dpdk` with the Dockerfile's meson options
   (`-Dplatform=generic -Denable_stdatomic=false -Dmbuf_refcnt_atomic=false`, its driver list and
-  the rest). `make doctor` refuses any other DPDK version.
+  the rest). `make doctor` refuses any other DPDK version. `docker/dpdk-ena-read-clock.patch` is
+  applied first: ENA gets `rte_eth_read_clock` (the device PHC, initialized whenever the device
+  has one) and the read barrier the kernel driver has in its PHC read. Hosts that build DPDK
+  themselves must apply it too.
 - packetdrill at the Dockerfile's commit with `docker/packetdrill-relearn-isn.patch` applied, the
   binary on `PATH` and `packetdrill.h` in `/opt/packetdrill/include`.
 - python3-scapy.

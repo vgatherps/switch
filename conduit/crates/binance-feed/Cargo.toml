@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+nic-clock.workspace = true
 relay = { workspace = true, features = ["switchnet"] }
 switch.workspace = true
 switchnet.workspace = true
