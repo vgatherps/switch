@@ -1418,7 +1418,13 @@ impl InterfaceInner {
         match &mut ip_repr {
             IpRepr::Ipv4(repr) => {
                 // IPv4 packets larger than the IP MTU are dropped; there is no fragmentation.
+                // An ICMP echo reply is the size of the peer's request, so may be dropped. A TCP
+                // segment is sized to the path MTU, so an oversize one is a stack bug.
                 let should_fragment = total_ip_len > self.caps.ip_mtu();
+                debug_assert!(
+                    !should_fragment || !matches!(packet.payload(), IpPayload::Tcp(_)),
+                    "TCP segment exceeds the IP MTU"
+                );
 
                 if should_fragment {
                     {

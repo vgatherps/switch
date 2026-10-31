@@ -261,7 +261,7 @@ fn template_checksums_match_generic_random() {
 }
 
 #[test]
-fn template_neighbor_errors_and_mtu_drop_match_generic() {
+fn template_neighbor_errors_match_generic() {
     let payload = [0x5a; 64];
     let tcp = TcpRepr {
         src_port: 40000,
@@ -277,11 +277,10 @@ fn template_neighbor_errors_and_mtu_drop_match_generic() {
         timestamp: None,
         payload: &payload,
     };
-    for (dst, mtu, known, expected) in [
-        (Ipv4Address::new(192, 168, 1, 2), 1514, false, Err(DispatchError::NeighborPending)),
-        (Ipv4Address::new(192, 168, 1, 2), 54, false, Err(DispatchError::NeighborPending)),
-        (Ipv4Address::new(192, 168, 1, 2), 54, true, Ok(())),
-        (Ipv4Address::new(198, 51, 100, 2), 1514, false, Err(DispatchError::NoRoute)),
+    for (dst, mtu, expected) in [
+        (Ipv4Address::new(192, 168, 1, 2), 1514, Err(DispatchError::NeighborPending)),
+        (Ipv4Address::new(192, 168, 1, 2), 54, Err(DispatchError::NeighborPending)),
+        (Ipv4Address::new(198, 51, 100, 2), 1514, Err(DispatchError::NoRoute)),
     ] {
         let (mut direct, _, _) = setup(Medium::Ethernet);
         let (mut generic, _, _) = setup(Medium::Ethernet);
@@ -294,11 +293,6 @@ fn template_neighbor_errors_and_mtu_drop_match_generic() {
         };
         for iface in [&mut direct, &mut generic] {
             iface.inner.caps.max_transmission_unit = mtu;
-            if known {
-                iface.inner.neighbor_cache.fill(
-                    dst.into(), EthernetAddress([2, 0, 0, 0, 0, 2]).into(), Instant::ZERO,
-                );
-            }
         }
         let mut next_hop = None;
         let mut template = None;
