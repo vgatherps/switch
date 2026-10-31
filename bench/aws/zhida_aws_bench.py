@@ -69,8 +69,6 @@ RECEIVER_UNIT = "zhida-bench-receiver"
 # One sweep's upper bound: <= 20 rate steps x (0.5 s warmup + 2 s window + 0.2 s drain + 5 s stall
 # limit) plus worker start-up, rounded up. Also the coordinator's timeout.
 SWEEP_WORST_S = 15 * 60
-TEARDOWN_MARGIN_S = 10 * 60
-CLOCK_LIMIT_S = 0.001
 BUILD_S = 3600
 SETUP_REBOOT_S = 900
 QUOTA_CODE = "L-1216C47A"
@@ -172,31 +170,10 @@ def data_ip(dut_json):
     return json.loads(dut_json)["ipv4"].split("/")[0]
 
 
-def parse_chrony(text):
-    """`chronyc tracking` -> (ok, detail): synchronised and |system time offset| <= CLOCK_LIMIT_S."""
-    fields = {}
-    for line in text.splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            fields[k.strip()] = v.strip()
-    leap, system = fields.get("Leap status"), fields.get("System time")
-    if leap is None or system is None:
-        return False, "no chronyc tracking output"
-    if leap != "Normal":
-        return False, f"leap status {leap}"
-    words = system.split()
-    offset = float(words[0]) * (-1 if len(words) > 2 and words[2] == "slow" else 1)
-    if abs(offset) > CLOCK_LIMIT_S:
-        return False, f"offset {offset * 1e6:.0f} us"
-    return True, f"offset {offset * 1e6:.1f} us"
-
-
-def user_data(deadline, now):
+def user_data(deadline):
     """Instance user data: a persistent systemd timer powers the instance off at `deadline` (which
-    terminates it: InstanceInitiatedShutdownBehavior=terminate), surviving the setup reboot; plus an
-    immediate `shutdown -h` as a second guard for the first boot."""
+    terminates it: InstanceInitiatedShutdownBehavior=terminate); it survives the setup reboot."""
     stamp = deadline.strftime("%Y-%m-%d %H:%M:%S UTC")
-    minutes = max(1, int((deadline - now).total_seconds() // 60))
     return f"""#!/bin/sh
 cat >/etc/systemd/system/zhida-deadman.timer <<EOF
 [Unit]
@@ -214,7 +191,6 @@ ExecStart=/usr/bin/systemctl poweroff
 EOF
 systemctl daemon-reload
 systemctl enable --now zhida-deadman.timer
-shutdown -h +{minutes}
 """
 
 
@@ -231,8 +207,7 @@ def plan_text(region, ttl, run_id, expires):
               for i in range(1, SENDER_HOSTS)]
     lines += [
         f"sweeps: {SENDERS} senders ({SENDERS // SENDER_HOSTS} per sender host), {SIZE} B messages,"
-        f" {RATE_MIN}..{RATE_MAX} msg/s; before each: clock (chrony |offset| <= {CLOCK_LIMIT_S * 1e3:g} ms on all"
-        f" six) and TTL (>= {SWEEP_WORST_S // 60} min sweep + {TEARDOWN_MARGIN_S // 60} min teardown left)",
+        f" {RATE_MIN}..{RATE_MAX} msg/s",
     ]
     lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
     lines += [
@@ -337,7 +312,7 @@ class Aws:
             raise RuntimeError(f"no zone in {self.region} offers {INSTANCE_TYPE}")
         return zones[0]
 
-    def launch_hosts(self, shared, run_id, expires, now):
+    def launch_hosts(self, shared, run_id, expires):
         """Six instances in one run_instances into the placement group; then one data ENI each
         (create, attach, DeleteOnTermination). Returns host records in ROLES order."""
         ec2 = self.ec2
@@ -351,7 +326,7 @@ class Aws:
                                 "AssociatePublicIpAddress": True, "DeleteOnTermination": True}],
             BlockDeviceMappings=[{"DeviceName": "/dev/xvda", "Ebs": {
                 "VolumeSize": ROOT_GB, "VolumeType": "gp3", "DeleteOnTermination": True}}],
-            UserData=user_data(expires, now),
+            UserData=user_data(expires),
             TagSpecifications=[{"ResourceType": k, "Tags": tags} for k in ("instance", "volume", "network-interface")])
         ids = [i["InstanceId"] for i in sorted(r["Instances"], key=lambda i: i["AmiLaunchIndex"])]
         for iid, role in zip(ids, ROLES):
@@ -453,18 +428,6 @@ class Env:
         self.my_ip = my_ip or (lambda: urllib.request.urlopen("https://checkip.amazonaws.com", timeout=10)
                                .read().decode().strip())
         self.now = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
-
-
-class Notes:
-    """runner.txt: what the runner decided (clock, TTL, sweep exits), also logged."""
-
-    def __init__(self, run_dir):
-        self.path = os.path.join(run_dir, "runner.txt")
-
-    def add(self, line):
-        log(line)
-        with open(self.path, "a") as f:
-            f.write(line + "\n")
 
 
 def tree_problems(local):
@@ -590,16 +553,7 @@ def fetch_sweep(t, hosts, run_dir):
     return [e for e in (h.fetch(remote, local) for h, remote, local in wanted) if e]
 
 
-def clock_problems(hosts):
-    out = []
-    for h in hosts:
-        ok, detail = parse_chrony(h.ssh("chronyc tracking", check=False, timeout=60).stdout)
-        if not ok:
-            out.append(f"{h.role}: {detail}")
-    return out
-
-
-def run_sweep(proto, budget, hosts, facts, receiver_ip, env, notes):
+def run_sweep(proto, budget, hosts, facts, receiver_ip, env):
     """One sweep: receiver unit up, coordinator on sender0, receiver stopped. Returns the coordinator's
     exit code, or None when it did not run or timed out."""
     receiver, sender0 = hosts[0], hosts[1]
@@ -610,46 +564,30 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, notes):
         env.sleep(3)
         if receiver.root(f"systemctl is-active {RECEIVER_UNIT}", check=False).stdout.strip() != "active":
             journal = receiver.root(f"journalctl -u {RECEIVER_UNIT} --no-pager | tail -20", check=False).stdout
-            notes.add(f"{t}: receiver did not start:\n{journal}")
+            log(f"{t}: receiver did not start:\n{journal}")
             return None
         try:
             return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"]),
                                check=False, timeout=SWEEP_WORST_S).returncode
         except subprocess.TimeoutExpired:
-            notes.add(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
+            log(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
             sender0.ssh("pkill -f 'zhida-bench sweep'", check=False, timeout=60)
             return None
     finally:
         receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
 
 
-def measure(hosts, facts, receiver_ip, run_dir, expires, env, notes):
-    """The fixed matrix. A failed sweep is recorded and the next one runs; the clock and TTL checks
-    stop measuring (a host without SSH fails the clock check). Every sweep started is fetched.
-    Returns the fetch failures."""
+def measure(hosts, facts, receiver_ip, run_dir, env):
+    """The fixed matrix. A failed sweep is logged and the next one runs; every sweep started is
+    fetched. Returns the fetch failures."""
     with open(os.path.join(run_dir, "expected.json"), "w") as f:
         json.dump({"sweeps": sweep_tags()}, f)
-    fetch_errors, pending = [], []
-    try:
-        for proto, budget in SWEEPS:
-            t = tag(proto, budget)
-            left = (expires - env.now()).total_seconds()
-            if left < SWEEP_WORST_S + TEARDOWN_MARGIN_S:
-                notes.add(f"stop before {t}: {left:.0f} s of TTL left, a sweep needs up to {SWEEP_WORST_S} s"
-                          f" plus {TEARDOWN_MARGIN_S} s for teardown")
-                break
-            bad = clock_problems(hosts)
-            if bad:
-                notes.add(f"stop before {t}: clocks not synchronised within {CLOCK_LIMIT_S * 1e3:g} ms: "
-                          + "; ".join(bad))
-                break
-            pending.append(t)
-            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env, notes)
-            notes.add(f"{t}: coordinator exit {code}")
-            pending.remove(t)
-            fetch_errors += fetch_sweep(t, hosts, run_dir)
-    finally:
-        for t in pending:
+    fetch_errors = []
+    for proto, budget in SWEEPS:
+        t = tag(proto, budget)
+        try:
+            log(f"{t}: coordinator exit {run_sweep(proto, budget, hosts, facts, receiver_ip, env)}")
+        finally:
             fetch_errors += fetch_sweep(t, hosts, run_dir)
     return fetch_errors
 
@@ -657,17 +595,13 @@ def measure(hosts, facts, receiver_ip, run_dir, expires, env, notes):
 def run(args, env=None):
     env = env or Env()
     now = env.now()
-    ttl_s = parse_duration(args.ttl)
-    expires = now + datetime.timedelta(seconds=ttl_s)
+    expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
     run_id = new_run_id(now)
     print(plan_text(args.region, args.ttl, run_id, expires))
-    if ttl_s < SWEEP_WORST_S + TEARDOWN_MARGIN_S:
-        raise SystemExit(f"--ttl {args.ttl} leaves no time for a sweep")
     aws = checked_preflight(env, args.region)
     archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
-    notes = Notes(run_dir)
     shared = aws.ensure_shared(env.my_ip())
 
     def on_signal(signum, _frame):
@@ -675,10 +609,10 @@ def run(args, env=None):
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
-    failed, hosts, fetch_errors = True, None, []
+    fetch_errors = []
     # From here on every exit path deletes the run's billable resources.
     try:
-        infos = aws.launch_hosts(shared, run_id, expires, now)
+        infos = aws.launch_hosts(shared, run_id, expires)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump(infos, f, indent=1)
         hosts = [env.host(info, shared["key_path"], run_dir) for info in infos]
@@ -692,8 +626,7 @@ def run(args, env=None):
         with open(os.path.join(run_dir, "host-setup.txt"), "w") as f:
             f.write("\n".join(setup) + "\n")
         connect_senders(hosts, run_dir, run_id, env.local)
-        fetch_errors = measure(hosts, facts, receiver_ip, run_dir, expires, env, notes)
-        failed = False
+        fetch_errors = measure(hosts, facts, receiver_ip, run_dir, env)
     finally:
         # teardown first: the report is local, and a second Ctrl-C during it must not skip teardown
         log(f"tearing down run {run_id}")
@@ -703,12 +636,12 @@ def run(args, env=None):
             if fetch_errors:
                 with open(os.path.join(run_dir, "fetch-errors.txt"), "w") as f:
                     f.write("\n".join(fetch_errors) + "\n")
-                notes.add(f"{len(fetch_errors)} fetch failures: {os.path.join(run_dir, 'fetch-errors.txt')}")
+                log(f"{len(fetch_errors)} fetch failures: {os.path.join(run_dir, 'fetch-errors.txt')}")
             report_code = env.local([sys.executable, os.path.join(REPO, "bench", "report.py"), run_dir, "--title",
                                      f"zhida-bench {run_id} (1 receiver + {SENDER_HOSTS} senders, {INSTANCE_TYPE})"]
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
-    return 0 if not failed and report_code == 0 and not fetch_errors and torn else 1
+    return 0 if report_code == 0 and not fetch_errors and torn else 1
 
 
 def teardown(ec2, run_id):

@@ -23,11 +23,6 @@ NOW = datetime.datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 RECEIVER_DATA_IP = "10.80.1.100"
 HOST_ENV = ("MGMT_IF=ens5\nDATA_IF=ens6\nDATA_PCI=0000:00:06.0\nDATA_MAC=0a:00:00:00:00:01\nNUMA_NODE=0\n"
             "APP_CPU=7\nISOLATED=7\nHOUSEKEEPING=0-6\n")
-CHRONY_OK = """Reference ID    : A9FEA97B (169.254.169.123)
-Stratum         : 4
-System time     : 0.000002164 seconds slow of NTP time
-Leap status     : Normal
-"""
 
 
 def write_exe(path, body):
@@ -54,12 +49,11 @@ class PureTest(unittest.TestCase):
 
     def test_user_data_powers_off_at_the_deadline_and_survives_reboot(self):
         deadline = NOW + datetime.timedelta(minutes=30)
-        ud = z.user_data(deadline, NOW)
+        ud = z.user_data(deadline)
         self.assertIn(f"OnCalendar={deadline.strftime('%Y-%m-%d %H:%M:%S')} UTC", ud)
         self.assertIn("Persistent=true", ud)
         self.assertIn("systemctl enable --now zhida-deadman.timer", ud)
         self.assertIn("ExecStart=/usr/bin/systemctl poweroff", ud)
-        self.assertIn("shutdown -h +30\n", ud)
 
     def test_host_env_needs_every_key(self):
         env = z.parse_host_env(HOST_ENV + "# comment\n")
@@ -70,16 +64,6 @@ class PureTest(unittest.TestCase):
 
     def test_data_ip_from_dut_json(self):
         self.assertEqual(z.data_ip('{"version": 1, "ipv4": "10.80.1.23/24"}'), "10.80.1.23")
-
-    def test_chrony_guard(self):
-        self.assertEqual(z.parse_chrony(CHRONY_OK), (True, "offset -2.2 us"))
-        fast = CHRONY_OK.replace("0.000002164 seconds slow", "0.001500000 seconds fast")
-        self.assertEqual(z.parse_chrony(fast), (False, "offset 1500 us"))
-        slow = CHRONY_OK.replace("0.000002164", "0.002000000")
-        self.assertFalse(z.parse_chrony(slow)[0])
-        unsync = CHRONY_OK.replace("Leap status     : Normal", "Leap status     : Not synchronised")
-        self.assertEqual(z.parse_chrony(unsync), (False, "leap status Not synchronised"))
-        self.assertEqual(z.parse_chrony(""), (False, "no chronyc tracking output"))
 
     def test_ssh_config_lists_the_five_senders(self):
         cfg = z.ssh_config([f"10.80.1.{10 + i}" for i in range(5)])
@@ -235,7 +219,7 @@ class LaunchTest(unittest.TestCase):
     def test_one_run_instances_of_six_into_the_placement_group_then_eni_attach(self):
         ec2 = FakeLaunchEc2()
         aws = launch_aws(ec2)
-        hosts = aws.launch_hosts(SHARED_INFO, "r1", NOW + datetime.timedelta(hours=2), NOW)
+        hosts = aws.launch_hosts(SHARED_INFO, "r1", NOW + datetime.timedelta(hours=2))
         names = [c[0] for c in ec2.calls]
         self.assertEqual(names.count("run_instances"), 1)
         ri = ec2.calls[names.index("run_instances")][1]
@@ -325,9 +309,7 @@ class World:
         self.sweep_exit = {}   # tag -> coordinator exit code
         self.fetch_fail = set()
         self.verify_fail = set()
-        self.chrony = {}       # role -> chronyc output
         self.put = {}          # (role, path) -> text
-        self.now = NOW
         self.report_code = 0
         self.local_calls = []
         self.clean_calls = []
@@ -357,11 +339,8 @@ class FakeHost:
 
     def ssh(self, command, check=True, timeout=None, input=None):
         self.w.calls.append((self.role, command))
-        if command == "chronyc tracking":
-            return Proc(0, self.w.chrony.get(self.role, CHRONY_OK))
         if "zhida-bench sweep" in command:
             t = command.split(f"> {z.REMOTE}/")[1].split(".jsonl")[0]
-            self.w.now += datetime.timedelta(minutes=5)
             return Proc(self.w.sweep_exit.get(t, 0))
         return Proc(0)
 
@@ -501,7 +480,7 @@ class FakeAws:
         self.w.calls.append(("aws", f"ensure_shared {my_ip}"))
         return dict(SHARED_INFO)
 
-    def launch_hosts(self, shared, run_id, expires, now):
+    def launch_hosts(self, shared, run_id, expires):
         self.w.calls.append(("aws", "launch_hosts"))
         return [{"role": r, "id": f"i-{k}", "public_ip": f"pub{k}", "private_ip": f"10.80.1.{10 + k}",
                  "data_eni": {"id": f"eni-{k}", "mac": f"m{k}", "ip": RECEIVER_DATA_IP if k == 0 else f"10.80.1.{110 + k}"}}
@@ -531,15 +510,16 @@ class RunTest(unittest.TestCase):
     def run_bench(self):
         w = self.w
         env = z.Env(aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
-                    local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: w.now, sleep=lambda s: None)
+                    local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
         args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out)
 
         def clean_run(ec2, run_id, log=print, **kw):
             w.clean_calls.append(run_id)
             return list(w.left_after_teardown)
 
+        self.log = io.StringIO()
         with mock.patch.object(z.janitor, "clean_run", clean_run), mock.patch.object(z.signal, "signal"), \
-                contextlib.redirect_stdout(io.StringIO()):
+                contextlib.redirect_stdout(self.log):
             try:
                 code = z.run(args, env)
             except Exception as e:
@@ -549,10 +529,6 @@ class RunTest(unittest.TestCase):
 
     def sweeps_run(self):
         return [c for r, c in self.w.calls if "zhida-bench sweep" in c]
-
-    def notes(self):
-        with open(os.path.join(self.run_dir, "runner.txt")) as f:
-            return f.read()
 
     def test_six_hosts_end_to_end(self):
         self.assertEqual(self.run_bench(), 0)
@@ -603,7 +579,7 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.run_bench(), 1)
         self.assertEqual(len(self.sweeps_run()), 3)
         self.assertIn(("sender0", f"{z.REMOTE}/udp-n20-s64-uncapped.jsonl"), self.w.fetched)
-        self.assertIn("udp-n20-s64-uncapped: coordinator exit 1", self.notes())
+        self.assertIn("udp-n20-s64-uncapped: coordinator exit 1", self.log.getvalue())
         self.assertEqual(len(self.w.clean_calls), 1)
 
     def test_scp_failure_is_recorded_and_fails_the_run(self):
@@ -612,33 +588,6 @@ class RunTest(unittest.TestCase):
         with open(os.path.join(self.run_dir, "fetch-errors.txt")) as f:
             self.assertEqual(f.read(), f"sender2:{z.REMOTE}/gen-tcp-n20-s64-b50.log: scp exited 1\n")
         self.assertEqual(len(self.sweeps_run()), 3)
-
-    def test_ttl_guard_stops_before_a_sweep_that_cannot_finish(self):
-        # 2 h TTL; each fake sweep takes 5 min; push the clock so only one sweep fits
-        self.w.now = NOW
-        orig = FakeHost.ssh
-
-        def slow(host, command, **kw):
-            r = orig(host, command, **kw)
-            if "zhida-bench sweep" in command:
-                host.w.now += datetime.timedelta(minutes=100)
-            return r
-
-        self.w.report_code = 1
-        with mock.patch.object(FakeHost, "ssh", slow):
-            self.assertEqual(self.run_bench(), 1)
-        self.assertEqual(len(self.sweeps_run()), 1)
-        self.assertIn("stop before tcp-n20-s64-b50: 900 s of TTL left", self.notes())
-        self.assertEqual(len(self.w.clean_calls), 1)
-
-    def test_clock_guard_refuses_to_measure(self):
-        self.w.chrony["sender3"] = CHRONY_OK.replace("Normal", "Not synchronised")
-        self.w.report_code = 1
-        self.assertEqual(self.run_bench(), 1)
-        self.assertEqual(self.sweeps_run(), [])
-        self.assertIn("stop before udp-n20-s64-uncapped: clocks not synchronised within 1 ms: sender3: leap status"
-                      " Not synchronised", self.notes())
-        self.assertEqual(len([a for a in self.w.local_calls if a[1].endswith("report.py")]), 1)
 
     def test_failed_verify_aborts_with_teardown(self):
         self.w.verify_fail.add("sender2")
