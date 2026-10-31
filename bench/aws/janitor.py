@@ -4,15 +4,15 @@
 A run creates a VPC, subnet, internet gateway, route table, security group, placement group, key
 pair, instances (with their root volumes and primary ENIs), one data ENI each and, for `binance`, an
 Elastic IP on the data ENI, all tagged RUN_TAG=<run id> through TagSpecifications. The runner records each ID as its create succeeds
-(Created: in memory and run_dir/created.json). clean_run uses both sources: a resource is present
-while a describe finds it by tag or by recorded ID, or while it is recorded and no delete of it has
-yet succeeded or answered not-found. Each round deletes what is present, dependents first; a delete
-that fails (instance still shutting down, ENI in use, a dependency) is retried next round. It
-returns [] only when a round finds nothing and no describe failed and no recorded ID answered
-not-found (a fresh ID can be invisible for a while); otherwise the caller says to rerun
-`cleanup --run-id`.
+(Created: in memory and run_dir/created.json). Cleanup appends witnesses to that same journal when
+a describe shows a recorded resource or its delete is accepted. Witnesses survive separate cleanup
+invocations; they are not proof of absence. clean_run still describes every recorded ID and finds
+resources by tag. Each round deletes what is present, dependents first; failures are retried next
+round. It returns [] only when nothing is found, no describe failed and no unwitnessed recorded ID
+answered not-found (a fresh ID can be invisible for a while); otherwise rerun `cleanup --run-id`.
 """
 import json
+import os
 import time
 
 NAME = "zhida-bench"
@@ -42,7 +42,7 @@ UNPAGED = {"describe_addresses", "describe_key_pairs", "describe_placement_group
 
 class Created:
     """The run's resource IDs by kind, recorded as each create succeeds; each also appended to
-    `path` as one JSON line ({"kind": ..., "id": ...}), which `cleanup --run-id` reads back."""
+    `path` as one JSON line ({"kind": ..., "id": ...}). Cleanup adds witness rows, retaining IDs."""
 
     def __init__(self, path):
         self.path, self.ids = path, {}
@@ -53,13 +53,22 @@ class Created:
             f.write(json.dumps({"kind": kind, "id": rid}) + "\n")
 
 
-def read_created(path):
-    ids = {}
+def read_journal(path):
+    ids, witnessed = {}, set()
     with open(path) as f:
         for line in f:
             r = json.loads(line)
-            ids.setdefault(r["kind"], []).append(r["id"])
-    return ids
+            pair = r["kind"], r["id"]
+            if r.get("cleanup_witness"):
+                witnessed.add(pair)
+            else:
+                ids.setdefault(r["kind"], []).append(r["id"])
+                witnessed.discard(pair)  # A new create needs its own cleanup witness.
+    return ids, witnessed
+
+
+def read_created(path):
+    return read_journal(path)[0]
 
 
 def not_found(e):
@@ -127,19 +136,35 @@ def delete(ec2, kind, rid, r):
 
 
 def clean_run(ec2, run_id, recorded=None, deadline_s=900, poll_s=10, log=print, sleep=time.sleep,
-              clock=time.monotonic):
+              clock=time.monotonic, journal_path=None):
     """Deletes run `run_id`'s resources (found by tag, plus `recorded`: {kind: [id]}). Returns the
     problems: what the last look still found, every failed describe, and every recorded ID that
-    answered not-found without any describe having shown it (possibly not visible yet, so not
-    proof of deletion; one seen and then gone was deleted, e.g. a data ENI with its instance). [] means verified absent;
+    answered not-found without a prior describe or accepted delete. `journal_path` persists those
+    witnesses in created.json for later cleanup invocations, but all IDs are still described until
+    absent. A fresh ID answering not-found is not proof of deletion. [] means verified absent;
     anything else means rerun `cleanup --run-id`."""
     recorded = recorded or {}
-    unconfirmed = {(kind, rid) for kind, ids in recorded.items() for rid in ids}
-    problems, seen = [], set()
+    recorded_ids = {(kind, rid) for kind, ids in recorded.items() for rid in ids}
+    witnessed = read_journal(journal_path)[1] if journal_path and os.path.exists(journal_path) else set()
+    unconfirmed = recorded_ids - witnessed
+    problems = []
+
+    def remember(kind, rid, reason):
+        pair = kind, rid
+        if pair in witnessed:
+            return
+        if journal_path and pair in recorded_ids:
+            with open(journal_path, "a") as f:
+                f.write(json.dumps({"kind": kind, "id": rid, "cleanup_witness": reason}) + "\n")
+        witnessed.add(pair)
+
     end = clock() + deadline_s
     while True:
         found = present(ec2, run_id, recorded, unconfirmed, problems, log)
-        seen |= {(kind, rid) for kind, items in found.items() for rid, r in items.items() if r is not None}
+        for kind, items in found.items():
+            for rid, r in items.items():
+                if r is not None:
+                    remember(kind, rid, "describe")
         if not found or clock() >= end:
             return [f"{kind} {rid}" for kind, items in found.items() for rid in items] + problems
         for kind, items in found.items():
@@ -153,7 +178,9 @@ def clean_run(ec2, run_id, recorded=None, deadline_s=900, poll_s=10, log=print, 
                     if not not_found(e):
                         log(f"janitor: {kind} {rid}: {e}")
                         continue
-                    if (kind, rid) not in seen:
+                    if (kind, rid) not in witnessed:
                         problems.append(f"{kind} {rid}: recorded but never found")
+                else:
+                    remember(kind, rid, "delete-accepted")
                 unconfirmed.discard((kind, rid))
         sleep(poll_s)

@@ -757,6 +757,7 @@ class RunTest(unittest.TestCase):
         args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out)
 
         def clean_run(ec2, run_id, recorded, log=print, **kw):
+            self.assertEqual(kw["journal_path"], os.path.join(self.out, run_id, "created.json"))
             w.clean_calls.append((run_id, {k: list(v) for k, v in recorded.items()}))
             if w.interrupt_teardown:
                 os.kill(os.getpid(), signal.SIGINT)
@@ -928,6 +929,7 @@ class BinanceTest(unittest.TestCase):
             return Proc(0, b"TAR" if "archive" in argv else "")
 
         def clean_run(ec2, run_id, recorded, log=print, **kw):
+            self.assertEqual(kw["journal_path"], os.path.join(self.out, run_id, "created.json"))
             w.clean_calls.append((run_id, {k: list(v) for k, v in recorded.items()}))
             w.teardown_done = True
             return list(w.left_after_teardown)
