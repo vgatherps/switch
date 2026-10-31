@@ -5,7 +5,7 @@ use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
 use zhida_buffer::{PoolConfig, PoolCreateError, PoolManager};
-use zhida_dpdk_sys::{rte_eal_init, zhida_errno, zhida_lcore_id};
+use zhida_dpdk_sys::{rte_eal_init, rte_timer_subsystem_init, zhida_errno, zhida_lcore_id, EALREADY};
 
 /// The calling thread's process-lifetime EAL setup.
 ///
@@ -36,6 +36,8 @@ impl Eal {
     /// strings passed to DPDK remain allocated until process exit because DPDK
     /// retains pointers to parsed string options, even after a returned failure.
     /// No options are added, and the calling thread becomes EAL's main lcore.
+    /// Then initializes DPDK's timer subsystem (already initialized, e.g. by the ENA PMD at
+    /// probe, is success), so `rte_timer_manage` is valid on every PMD; see `Stack::turn`.
     ///
     /// Empty argv, an unrepresentable count and interior NUL bytes are rejected
     /// before calling DPDK. Returned DPDK failures preserve its return code and
@@ -74,7 +76,11 @@ impl Eal {
         if return_code < 0 {
             return Err(EalError::Initialization { return_code, errno });
         }
-
+        // SAFETY: EAL is initialized; this is its main lcore.
+        let return_code = unsafe { rte_timer_subsystem_init() };
+        if return_code != 0 && return_code != -(EALREADY as c_int) {
+            return Err(EalError::TimerSubsystem { return_code });
+        }
         Ok(Self {
             owner_lcore_id: unsafe { zhida_lcore_id() },
             _thread_local: PhantomData,
@@ -132,6 +138,8 @@ pub enum EalError {
     ArgumentCountTooLarge { count: usize },
     InteriorNul { argument: usize, position: usize },
     Initialization { return_code: c_int, errno: c_int },
+    /// `rte_timer_subsystem_init` failed after EAL initialized.
+    TimerSubsystem { return_code: c_int },
 }
 
 impl fmt::Display for EalError {
@@ -152,6 +160,9 @@ impl fmt::Display for EalError {
                     f,
                     "rte_eal_init returned {return_code} with rte_errno {errno}"
                 )
+            }
+            Self::TimerSubsystem { return_code } => {
+                write!(f, "rte_timer_subsystem_init returned {return_code}")
             }
         }
     }

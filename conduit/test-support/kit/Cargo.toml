@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-dpdk-smoltcp.workspace = true
+dpdk-smoltcp = { workspace = true, features = ["testing"] }
 libc.workspace = true
 zhida-buffer.workspace = true
 zhida-dpdk-sys.workspace = true

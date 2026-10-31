@@ -199,6 +199,8 @@ let eal = Eal::init(&eal_args)?;
 
 The tap's device/memory options are example-specific; `--no-pci` disables PCI probing. Use options
 for your device and keep the one-CPU mapping. `owner_lcore_id()` reports the initialized lcore.
+After EAL, `Eal::init` initializes DPDK's timer subsystem (`rte_timer_subsystem_init`; the ENA PMD
+may have done so at probe), which the Stack's once-a-second `rte_timer_manage` needs.
 
 EAL creates writable argument strings and a pointer array for initialization. Only the strings
 remain allocated until process exit, because DPDK retains pointers to parsed options. A failed
@@ -493,6 +495,28 @@ Application work after `turn` sees received data. TCP bytes written then wait fo
 smoltcp, not frames fetched in the RX burst, frames drained by the application, or egress work. A
 zero budget stages RX and runs maintenance and egress without processing staged RX. Staged frames
 are processed on subsequent calls even when the new burst receives nothing.
+
+### Timers and device resets
+
+Once a second (the first `turn` or `receive` at least 1 s after the last such call) the Stack calls
+`rte_timer_manage` before anything else, running the DPDK timers due on its lcore. The one that
+matters is ENA's health watchdog, armed on the lcore that started the port (the Stack's): it checks
+device keep-alives, the admin queue and TX completions, and on a fault (or a datapath fault the
+conduit DPDK patch reports) raises `RTE_ETH_EVENT_INTR_RESET`. AWS maintenance resets arrive the
+same way. `Port::open` registers a callback for that event that only marks the Port.
+
+A turn that finds the mark recovers the Port before its RX burst: `rte_eth_dev_reset` (on a PMD
+without reset, `rte_eth_dev_stop`), then the same configure, queue setup and start as `Port::open`.
+What the device held is gone: posted RX buffers and accepted-but-unsent TX frames return to their
+pools, and frames on the wire then are lost. Staged RX and pending TX frames, sockets and neighbors
+are untouched; TCP retransmits what was lost. `dpdk_smoltcp::port_resets()` counts completed
+recoveries in the process. A failed recovery returns `StackError::Port` and leaves the Port not
+ready, so later turns fail too: close the Stack. It fails if a step fails, or if the device now
+negotiates other descriptor counts than at open (the Stack sized its pools from them).
+
+A reset frees and rebuilds ENA's PTP hardware clock. Read the NIC clock from other threads only
+through `dpdk_smoltcp::read_clock(port_id)`, never `rte_eth_read_clock` directly: it holds the lock
+recovery and Port close hold. The receive and send paths never take that lock.
 
 ### Receive, application work, send
 

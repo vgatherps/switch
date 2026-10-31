@@ -482,6 +482,35 @@ fn real_open_start_close_reuses_all_names_and_reports_descriptors() {
     });
 }
 
+/// `recover` sets the port up again with the counts open negotiated. Counts that come out
+/// different (here: a changed request, as changed device limits after a reset would give)
+/// fail it, since the Stack sized its pools from them: the Port stays not ready and still
+/// closes cleanly.
+#[zhida_test_support::pinned_test]
+fn recover_refuses_changed_descriptor_counts() {
+    with_test_eal(|eal| {
+        let fixture = Fixture::new();
+        let mut port = unsafe { Port::open(eal, fixture.config()) }.unwrap();
+        port.recover().unwrap();
+        assert!(port.ready);
+        assert_eq!(port.descriptor_counts(), (8, 16));
+        port.queue_setup.rx_descriptors = 16;
+        assert_eq!(
+            port.recover(),
+            Err(PortError::InvalidSettings(
+                "device reset changed the negotiated descriptor counts"
+            ))
+        );
+        assert!(!port.ready);
+        let mut staged = VecDeque::with_capacity(4);
+        assert_eq!(port.rx_burst(&mut staged), Err(PortError::NotReady));
+        fixture.drain();
+        port.try_close().unwrap();
+        assert_no_pools();
+        fixture.close().unwrap();
+    });
+}
+
 #[zhida_test_support::pinned_test]
 fn preflight_failures_leave_the_caller_device_and_pool_names_untouched() {
     with_test_eal(|eal| {

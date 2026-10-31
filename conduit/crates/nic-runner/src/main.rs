@@ -237,10 +237,12 @@ fn run(args: Args) -> i32 {
         Mode::Feed(f) => {
             let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
             // The clock thread reads the port's clock: the scope joins it before the port closes.
+            // `read_clock` excludes a device reset, which rebuilds ENA's PHC: a reset marks the
+            // run's latencies not valid (`mark_jumped`), the PHC may not continue across it.
             // Only ENA's clock is the RX stamps' clock (ice's read_clock is CLOCK_MONOTONIC_RAW).
             let clock_cpus = if report.device.driver_name != "net_ena" {
                 Err("the driver is not net_ena".to_owned())
-            } else if nic::read_clock(port_id) == Err(-libc::ENOTSUP) {
+            } else if dpdk_smoltcp::read_clock(port_id) == Err(-libc::ENOTSUP) {
                 Err("the device has no PHC".to_owned())
             } else {
                 nic::housekeeping_cpus(report.cpu)
@@ -251,9 +253,17 @@ fn run(args: Args) -> i32 {
                 match &clock_cpus {
                     Ok(cpus) => {
                         scope.spawn(|| {
-                            let ran = nic::pin(cpus).and_then(|()| {
-                                Ok(nic_clock::run(|| nic::read_clock(port_id).ok(), &stop_clock)?)
-                            });
+                            let mut resets = dpdk_smoltcp::port_resets();
+                            let read = || {
+                                let now = dpdk_smoltcp::port_resets();
+                                if now != resets {
+                                    resets = now;
+                                    nic_clock::mark_jumped();
+                                }
+                                dpdk_smoltcp::read_clock(port_id).ok()
+                            };
+                            let ran = nic::pin(cpus)
+                                .and_then(|()| Ok(nic_clock::run(read, &stop_clock)?));
                             if let Err(e) = ran {
                                 line("nic_clock_error", e);
                             }
