@@ -371,6 +371,27 @@ fn poll_at_reports_queued_send_due_now() {
     assert!(device.tx_queue.is_empty());
 }
 
+/// A socket waiting for ARP that the application touches through `get_mut` keeps its ARP
+/// deadline and sends nothing before it.
+#[test]
+fn waiting_socket_changed_by_app_keeps_arp_deadline() {
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    let handle = connect(&mut iface, &mut sockets, 1234);
+    iface.poll_egress(START, &mut device, &mut sockets);
+    device.tx_queue.clear();
+    assert_eq!(sockets.waiting, vec![0]);
+    sockets
+        .get_mut(handle)
+        .set_rto(Duration::from_secs(3));
+    assert_eq!(
+        iface.poll_at(START, &mut sockets),
+        Some(Instant::from_millis(1024))
+    );
+    iface.poll_egress(START, &mut device, &mut sockets);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.waiting, vec![0]);
+}
+
 #[test]
 fn ipv4_refresh_revives_neighbor_and_releases_waiting_syn() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
