@@ -28,6 +28,7 @@ SIGTERM, and exits non-zero if a final describe still finds any of the run's res
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import random
@@ -207,9 +208,16 @@ def rust_toolchain(repo=REPO):
     raise ValueError("rust-toolchain.toml has no channel")
 
 
-def cache_keys(prefix, arch, version_id, tree, rust):
+def dpdk_patch(repo=REPO):
+    """The DPDK patch hft-host.sh applies (conduit/docker/dpdk-ena-read-clock.patch): its sha256, first 12."""
+    with open(os.path.join(repo, "conduit", "docker", "dpdk-ena-read-clock.patch"), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:12]
+
+
+def cache_keys(prefix, arch, version_id, tree, rust, patch=None):
     """S3 cache objects, keyed by the versions that determine their content."""
-    return (f"{prefix}/dpdk-{DPDK_VERSION}-{arch}-al2023-{version_id}.tar.gz",
+    patch = patch or dpdk_patch()
+    return (f"{prefix}/dpdk-{DPDK_VERSION}-patch{patch}-{arch}-al2023-{version_id}.tar.gz",
             f"{prefix}/bench-{tree}-{arch}-dpdk{DPDK_VERSION}-rust{rust}.tar.gz")
 
 

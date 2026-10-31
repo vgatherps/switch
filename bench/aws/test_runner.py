@@ -82,10 +82,13 @@ class PureTest(unittest.TestCase):
         self.assertEqual(z.parse_chrony(""), (False, "no chronyc tracking output"))
 
     def test_cache_keys_name_versions_not_amis(self):
-        self.assertEqual(z.cache_keys("s3://b/cache", "aarch64", "2023", "abc123", "1.93.0"), (
-            "s3://b/cache/dpdk-25.11.3-aarch64-al2023-2023.tar.gz",
+        self.assertEqual(z.cache_keys("s3://b/cache", "aarch64", "2023", "abc123", "1.93.0", "p1"), (
+            "s3://b/cache/dpdk-25.11.3-patchp1-aarch64-al2023-2023.tar.gz",
             "s3://b/cache/bench-abc123-aarch64-dpdk25.11.3-rust1.93.0.tar.gz"))
         self.assertEqual(z.rust_toolchain(), "1.93.0")
+        # a changed DPDK patch must not restore an /opt/dpdk built without it
+        self.assertEqual(len(z.dpdk_patch()), 12)
+        self.assertIn(f"-patch{z.dpdk_patch()}-", z.cache_keys("s3://b", "aarch64", "2023", "t", "r")[0])
 
     def test_ssh_config_lists_the_five_senders(self):
         cfg = z.ssh_config([f"10.80.1.{10 + i}" for i in range(5)])
@@ -305,7 +308,7 @@ class HostTest(unittest.TestCase):
         ok, text = self.host(run).setup(b"tar", "s3://b/cache", "tree1", "1.93.0")
         self.assertTrue(ok, text)
         boot = next(c for c in seen if "bootstrap.sh" in c)
-        self.assertIn("DPDK_KEY=s3://b/cache/dpdk-25.11.3-aarch64-al2023-2023.tar.gz", boot)
+        self.assertIn(f"DPDK_KEY=s3://b/cache/dpdk-25.11.3-patch{z.dpdk_patch()}-aarch64-al2023-2023.tar.gz", boot)
         self.assertIn("BENCH_KEY=s3://b/cache/bench-tree1-aarch64-dpdk25.11.3-rust1.93.0.tar.gz", boot)
         order = [k for c in seen for k in ("bootstrap.sh", "apply", "verify") if k in c]
         self.assertEqual(order, ["bootstrap.sh", "apply", "verify", "verify", "verify"])
