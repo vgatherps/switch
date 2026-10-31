@@ -1,5 +1,6 @@
 mod args;
 mod feed;
+mod hugepages;
 mod nic;
 mod server;
 
@@ -15,6 +16,9 @@ use zhida_open::{open, OpenError, Opened};
 use dpdk_smoltcp::Stack;
 
 use args::{Args, Mode};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -129,6 +133,7 @@ fn run(args: Args) -> i32 {
             .expect("path MTU exceeds TCP headers");
         line("feed_mss_cap", cap);
     }
+    let free_before = hugepages::free(std::path::Path::new(hugepages::SYSFS));
     // SAFETY: EAL creates the configured PCI device or vdev from the config, so
     // the ethdev is new and no caller-attached ring exists. This sole thread
     // owns its queue pair and all packets. The selected PMD must honor Port's
@@ -201,6 +206,10 @@ fn run(args: Args) -> i32 {
     } = opened;
     for report_line in report.to_string().lines() {
         let _ = writeln!(io::stdout(), "zhida-nic: {report_line}");
+    }
+    let free_after = hugepages::free(std::path::Path::new(hugepages::SYSFS));
+    for size in hugepages::report(&free_before, &free_after) {
+        line("hugepages", size);
     }
     let port_id = report.port_id;
     let rx_timestamps = report.offloads.offloads.rx_timestamp;

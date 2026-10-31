@@ -64,6 +64,10 @@ Per-PMD setup:
   VPC and 1460 to the internet. The peer's interface must be at 9001 for jumbo frames. UDP `--msg-size`
   above path MTU - 28 needs fragmentation, which Zhida does not do.
 
+On an Amazon Linux 2023 EC2 instance, `deploy/hft-host.sh apply` does sections 2 and 3 for `feed` in one
+command (build, discover, hugepages, isolated CPU, IRQs, vfio-pci bind); see
+[deploy/README.md](../../../deploy/README.md).
+
 ## 2. Discover, bind (root), unbind
 `zhida-netconf` (crate `zhida-netconf`) writes the config file that `zhida-nic` and `zhida_open::open`
 read, and moves the NIC between its kernel driver and vfio-pci. It does not need DPDK. Build it on the
@@ -200,7 +204,8 @@ nic --config dut.json info 2>&1 | tee info.log
 nic --config dut-offloads.json info 2>&1 | tee info-offloads.log
 ```
 A good run exits 0 and prints `driver`, the RX/TX offload capability bits, `max_rx_pktlen`, MTU limits,
-`mac`, pool counts, `descriptors`, link speed/duplex/status `up`, and `port_close: ok`. For each offload
+`mac`, pool counts, `descriptors`, link speed/duplex/status `up`, `hugepages: <size> used=N free=M` per
+hugepage size (pages this process took at open), and `port_close: ok`. For each offload
 it prints the requested bit and the reason. A refused offload fails Port open with
 `port_open_error: InvalidSettings("PMD lacks the requested ... offload")` naming it; turn that setting off.
 

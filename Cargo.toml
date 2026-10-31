@@ -44,6 +44,8 @@ version = "0.1.0"
 # external
 criterion = "0.5"
 libc = "0.2"
+# zhida-nic's global allocator
+mimalloc = "0.1.52"
 proptest = "1.5"
 quickcheck = "1"
 quickcheck_macros = "1"
