@@ -9,6 +9,8 @@ bench-offload = []
 # smoltcp's O(N)-per-packet cross-checks, for the debug test and fuzz builds (Makefile
 # DIAGNOSTICS); never for release or production builds.
 diagnostics = ["smoltcp/diagnostics"]
+# Test hooks (`Stack::raise_reset`); enabled only through zhida-test-kit.
+testing = []
 
 [dependencies]
 smoltcp = { workspace = true, features = ["auto-icmp-echo-reply", "dpdk"] }

@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_int, c_void, CStr, CString};
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr::{null_mut, NonNull};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use smoltcp::phy::{RxBuf, TxSource};
 use zhida_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
@@ -446,6 +448,72 @@ fn register_rx_timestamp() -> Result<RxTimestampField, PortError> {
     })
 }
 
+/// Device resets `Port::recover` completed in this process.
+static PORT_RESETS: AtomicU64 = AtomicU64::new(0);
+
+/// Device resets completed in this process (`Stack::turn` recovers a Port whose PMD raised
+/// `RTE_ETH_EVENT_INTR_RESET`). A NIC clock read across a reset may not continue the clock.
+pub fn port_resets() -> u64 {
+    PORT_RESETS.load(Ordering::Relaxed)
+}
+
+/// Held by `read_clock`, and by `Port::recover` and Port close around the device reset and
+/// close: ENA's reset and close free its PHC, which `rte_eth_read_clock` reads unlocked.
+static CLOCK: Mutex<()> = Mutex::new(());
+
+fn clock_lock() -> MutexGuard<'static, ()> {
+    // Guards no data: a panic while holding it leaves nothing inconsistent.
+    CLOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The port's NIC clock (ENA: the PHC, ns) through `rte_eth_read_clock`, or its negative
+/// errno. Any thread; never concurrent with a device reset or close of a Port (it takes the
+/// lock they hold). The receive and send paths never take that lock.
+pub fn read_clock(port_id: u16) -> Result<u64, i32> {
+    let _clock = clock_lock();
+    let mut clock = 0;
+    // SAFETY: `clock` is writable; an invalid port returns -ENODEV, and the lock excludes the
+    // reset and close that free the device's clock state.
+    match unsafe { rte_eth_read_clock(port_id, &mut clock) } {
+        0 => Ok(clock),
+        error => Err(error),
+    }
+}
+
+/// `RTE_ETH_EVENT_INTR_RESET` callback: only records the event; `Stack::turn` recovers.
+unsafe extern "C" fn on_reset(
+    _port_id: u16,
+    _event: rte_eth_event_type,
+    flag: *mut c_void,
+    _ret_param: *mut c_void,
+) -> c_int {
+    // SAFETY: `flag` is the Port's boxed AtomicBool, registered until before the box drops.
+    unsafe { &*flag.cast::<AtomicBool>() }.store(true, Ordering::Relaxed);
+    0
+}
+
+/// What `Port::setup` asks of the ethdev, at open and again at each `recover`.
+#[derive(Clone, Copy)]
+struct QueueSetup {
+    mtu: u16,
+    offloads: Offloads,
+    rx_descriptors: u16,
+    tx_descriptors: u16,
+    queue_socket: i32,
+}
+
+impl From<&PortConfig<'_>> for QueueSetup {
+    fn from(config: &PortConfig<'_>) -> Self {
+        Self {
+            mtu: config.mtu,
+            offloads: config.offloads,
+            rx_descriptors: config.rx_descriptors,
+            tx_descriptors: config.tx_descriptors,
+            queue_socket: config.queue_socket,
+        }
+    }
+}
+
 /// Null slots after a TX burst's packet pointers. ENA's `eth_ena_xmit_pkts` prefetches
 /// `tx_pkts[i + 4]` (masked by its ring size, not the burst) after each packet it sends
 /// (DPDK 25.11.3 drivers/net/ena/ena_ethdev.c:3438), so a full burst of n reads up to index
@@ -475,6 +543,11 @@ pub struct Port {
     frame_origin: NonNull<()>,
     rx_scratch: Box<[*mut rte_mbuf]>,
     tx_scratch: Box<[*mut rte_mbuf]>,
+    queue_setup: QueueSetup,
+    /// Set by `on_reset`; its address is the callback's argument while `reset_registered`, so
+    /// it is freed only after unregistering (and leaked if that never succeeded).
+    reset: ManuallyDrop<Box<AtomicBool>>,
+    reset_registered: bool,
     ready: bool,
     stopped: bool,
     closed: bool,
@@ -622,6 +695,9 @@ impl Port {
             rx_scratch: vec![null_mut(); usize::from(config.rx_burst)].into_boxed_slice(),
             tx_scratch: vec![null_mut(); usize::from(config.tx_burst) + TX_LOOKAHEAD]
                 .into_boxed_slice(),
+            queue_setup: QueueSetup::from(&config),
+            reset: ManuallyDrop::new(Box::new(AtomicBool::new(false))),
+            reset_registered: false,
             ready: false,
             stopped: false,
             closed: false,
@@ -629,7 +705,7 @@ impl Port {
             released: false,
             cleanup_attempted: false,
         };
-        if let Err(cause) = port.setup(config) {
+        if let Err(cause) = port.register_reset().and_then(|()| port.setup()) {
             port.cleanup_attempted = true;
             return Err(match port.cleanup() {
                 Ok(()) => cause.into(),
@@ -644,7 +720,24 @@ impl Port {
         Ok(port)
     }
 
-    unsafe fn setup(&mut self, config: PortConfig<'_>) -> Result<(), PortError> {
+    fn register_reset(&mut self) -> Result<(), PortError> {
+        let flag: *const AtomicBool = &**self.reset;
+        // SAFETY: the callback only stores to `flag`, which stays allocated until after
+        // `cleanup` unregisters it (or forever).
+        checked("rte_eth_dev_callback_register", unsafe {
+            rte_eth_dev_callback_register(
+                self.port_id,
+                rte_eth_event_type_RTE_ETH_EVENT_INTR_RESET,
+                Some(on_reset),
+                flag.cast_mut().cast(),
+            )
+        })?;
+        self.reset_registered = true;
+        Ok(())
+    }
+
+    unsafe fn setup(&mut self) -> Result<(), PortError> {
+        let config = self.queue_setup;
         let mut conf: rte_eth_conf = std::mem::zeroed();
         conf.rxmode.mtu = u32::from(config.mtu);
         conf.rxmode.offloads = config.offloads.rx_flags();
@@ -734,6 +827,52 @@ impl Port {
             ),
         )?;
         checked("rte_eth_dev_start", start(self.port_id))
+    }
+
+    /// Whether the PMD raised `RTE_ETH_EVENT_INTR_RESET` since the last `recover`.
+    #[inline]
+    pub(crate) fn reset_pending(&self) -> bool {
+        self.reset.load(Ordering::Relaxed)
+    }
+
+    /// Sets the flag `RTE_ETH_EVENT_INTR_RESET` sets.
+    #[cfg(feature = "testing")]
+    pub(crate) fn raise_reset(&self) {
+        self.reset.store(true, Ordering::Relaxed);
+    }
+
+    /// After `RTE_ETH_EVENT_INTR_RESET`: reset the device (`rte_eth_dev_reset`, or
+    /// `rte_eth_dev_stop` on a PMD without reset), then configure, set up both queues and
+    /// start again as `open` did, holding the clock lock (`read_clock`) throughout. Packets
+    /// the PMD held are back in their pools: posted RX buffers and unsent TX frames. Staged
+    /// and pending packets are the caller's and stay valid.
+    ///
+    /// Fails, leaving the Port not ready for cleanup, if a step fails or the negotiated
+    /// descriptor counts change (the Stack sized its pools from them).
+    pub(crate) fn recover(&mut self) -> Result<(), PortError> {
+        self.ready = false;
+        check_owner(self.owner_lcore)?;
+        // Cleared first: an event raised from here on asks for another recovery.
+        self.reset.store(false, Ordering::Relaxed);
+        let _clock = clock_lock();
+        // SAFETY: the owner thread, between bursts; the ethdev stays open.
+        let code = unsafe { rte_eth_dev_reset(self.port_id) };
+        if code == -(ENOTSUP as i32) {
+            checked("rte_eth_dev_stop", unsafe { stop(self.port_id) })?;
+        } else {
+            checked("rte_eth_dev_reset", code)?;
+        }
+        let descriptors = self.descriptors;
+        // SAFETY: the ethdev is stopped and stays under this Port's exclusive control.
+        unsafe { self.setup() }?;
+        if self.descriptors != descriptors {
+            return Err(PortError::InvalidSettings(
+                "device reset changed the negotiated descriptor counts",
+            ));
+        }
+        self.ready = true;
+        PORT_RESETS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Stop/close and release backing, or return the same owner for cleanup.
@@ -1000,10 +1139,24 @@ impl Port {
             return Err(error);
         }
         if !self.closed {
+            if self.reset_registered {
+                let flag: *const AtomicBool = &**self.reset;
+                // SAFETY: the registration `register_reset` made with these arguments.
+                checked("rte_eth_dev_callback_unregister", unsafe {
+                    rte_eth_dev_callback_unregister(
+                        self.port_id,
+                        rte_eth_event_type_RTE_ETH_EVENT_INTR_RESET,
+                        Some(on_reset),
+                        flag.cast_mut().cast(),
+                    )
+                })?;
+                self.reset_registered = false;
+            }
             if !self.stopped {
                 checked("rte_eth_dev_stop", unsafe { stop(self.port_id) })?;
                 self.stopped = true;
             }
+            let _clock = clock_lock();
             let result = unsafe { close(self.port_id) };
             self.closed = unsafe { rte_eth_dev_is_valid_port(self.port_id) } == 0;
             if let Err(error) = checked("rte_eth_dev_close", result) {
@@ -1045,6 +1198,10 @@ impl Drop for Port {
                 std::io::stderr(),
                 "Zhida retained port backing after refused cleanup"
             );
+        }
+        if !self.reset_registered {
+            // SAFETY: no callback registration refers to the flag any more; dropped once.
+            unsafe { ManuallyDrop::drop(&mut self.reset) };
         }
     }
 }

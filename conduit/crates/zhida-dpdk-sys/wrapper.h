@@ -6,3 +6,4 @@
 #include <rte_eth_ring.h>
 #include <rte_bus_vdev.h>
 #include <rte_alarm.h>
+#include <rte_timer.h>

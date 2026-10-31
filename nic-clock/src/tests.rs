@@ -228,6 +228,13 @@ fn mid_publish_is_not_ready() {
     assert_eq!(f.latency(LINE.phc(now) - 5, now), None);
 }
 
+/// `mark_jumped` sets the flag `jumped` reports, as a contradicting read does.
+#[test]
+fn mark_jumped_marks_the_run() {
+    mark_jumped();
+    assert!(jumped());
+}
+
 proptest! {
     /// Whatever the rates, windows, sample placement (sub-tick phase included) and
     /// extrapolation distance, the truth lies within the bound.

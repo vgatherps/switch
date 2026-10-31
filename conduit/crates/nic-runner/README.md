@@ -231,11 +231,15 @@ handing it over (`nic-clock`): `no_stamp` (unstamped: `rx_timestamps` off or the
 bound and a log2 histogram in ns. On ENA (with the DPDK patch in `docker/dpdk-ena-read-clock.patch`) unless
 `rte_eth_read_clock` returns -ENOTSUP (no PHC on the device), a thread on the housekeeping CPUs (online CPUs not
 in /sys/devices/system/cpu/isolated, minus Zhida's) maps the NIC clock onto the CPU counter, skipping failed reads.
+It reads through `dpdk_smoltcp::read_clock`, which never runs during an ENA device reset (the reset frees and
+rebuilds the PHC).
 Otherwise, or with no housekeeping CPU, `nic_clock: none` is printed and every stamped message is `not_ready`.
 Other drivers' `read_clock` is not their RX stamps' clock (ice returns CLOCK_MONOTONIC_RAW), so they get none.
 If a NIC clock read ever contradicts the mapping (the clock jumped, e.g. stepped), samples taken in the up to 100 ms
 before that read may be wrong by more than their bound, and they are not removed. So the run's latency result is
-invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and histogram.
+invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and histogram. A device
+reset the Stack recovered from (`dpdk_smoltcp::port_resets()` changed) marks the run the same way: nothing says
+the PHC continues across the reset.
 
 ### 3c. sockperf-server
 ```

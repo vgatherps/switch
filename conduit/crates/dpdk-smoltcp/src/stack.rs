@@ -9,7 +9,7 @@ use smoltcp::iface::{
 };
 use smoltcp::phy::TxFrame;
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr,
 };
@@ -18,6 +18,9 @@ use crate::device::Device;
 use crate::handle::{TcpHandle, UdpHandle};
 use crate::port::{Port, PortError};
 use crate::rx_pool::{frame_reserve, rx_reserve, tx_reserve};
+
+/// How often a turn runs DPDK's timers (`rte_timer_manage`): ENA's watchdog is a 1 s timer.
+const SERVICE_PERIOD: Duration = Duration::from_secs(1);
 
 /// Default number of on-link neighbors the ARP cache holds.
 pub const DEFAULT_NEIGHBOR_CAPACITY: usize = 256;
@@ -203,6 +206,8 @@ pub struct Stack {
     /// Holds every staged and pending packet; its Port drops after them.
     device: Device,
     now: Instant,
+    /// The first turn at or after this time runs DPDK's timers.
+    next_service: Instant,
 }
 
 impl Stack {
@@ -306,12 +311,23 @@ impl Stack {
             ip_mtu: mtu,
             device,
             now,
+            next_service: now,
         })
     }
 
-    /// One bounded turn at `now`: flush pending, one RX burst, maintenance, up
-    /// to `ingress_budget` received packets, egress passes until one reports no
+    /// One bounded turn at `now`: DPDK's timers once a second, device recovery if the PMD
+    /// asked for a reset, flush pending, one RX burst, maintenance, up to
+    /// `ingress_budget` received packets, egress passes until one reports no
     /// socket progress or queues no frame, flush.
+    ///
+    /// Once a second (the first `turn` or `receive` at or after a second since the last) the
+    /// turn calls `rte_timer_manage`, which runs DPDK timers due on this lcore: ENA's
+    /// health watchdog, which raises `RTE_ETH_EVENT_INTR_RESET` on a device fault. A Port
+    /// with that event pending is reset, configured and started again before the RX burst:
+    /// frames the device held return to their pools, staged and pending frames stay, sockets
+    /// and neighbors are untouched, and TCP retransmits what the device dropped.
+    /// A failed recovery returns `StackError::Port` and leaves the Port not ready, so later
+    /// turns fail too: close the Stack.
     ///
     /// `now` earlier than the previous `new`/`turn`/`receive`
     /// time returns
@@ -422,7 +438,8 @@ impl Stack {
         Ok(())
     }
 
-    /// Time check, tidying (which wakes sockets waiting for a free frame if one is free), flush,
+    /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
+    /// tidying (which wakes sockets waiting for a free frame if one is free), flush,
     /// one RX burst, maintenance, then ingress. A burst that returned packets also tells the
     /// Interface whether the RX pool is low (fewer free mbufs than one refill of the RX ring
     /// plus one RX burst, see `Port`); while it is, each TCP socket that processes a segment
@@ -430,6 +447,14 @@ impl Stack {
     /// answer: the frames still staged were taken before it.
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
+        if now >= self.next_service {
+            // SAFETY: the Port's owner thread, an EAL lcore.
+            unsafe { zhida_dpdk_sys::rte_timer_manage() };
+            self.next_service = now + SERVICE_PERIOD;
+        }
+        if self.device.port_mut().reset_pending() {
+            self.device.port_mut().recover().map_err(StackError::Port)?;
+        }
         self.tidy();
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
@@ -873,6 +898,14 @@ impl Stack {
             self.remove_tcp_raw(self.dropped_tcp[index]);
         }
         self.dropped_tcp.clear();
+    }
+
+    /// Mark the Port as if its PMD raised `RTE_ETH_EVENT_INTR_RESET`: the next `turn` or
+    /// `receive` recovers it.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn raise_reset(&mut self) {
+        self.device.port_mut().raise_reset();
     }
 
     /// Drop sockets, interface and every staged and pending packet, then

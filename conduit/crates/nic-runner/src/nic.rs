@@ -1,6 +1,6 @@
 use dpdk_smoltcp::smoltcp::{socket::tcp, wire::Ipv4Address};
 use dpdk_smoltcp::{Port, PortError, DEFAULT_NEIGHBOR_CAPACITY};
-use zhida_dpdk_sys::{rte_eth_read_clock, rte_eth_stats, rte_eth_stats_get};
+use zhida_dpdk_sys::{rte_eth_stats, rte_eth_stats_get};
 
 use crate::args::Mode;
 use crate::line;
@@ -90,17 +90,6 @@ pub fn close(port: Port, mut code: i32) -> i32 {
         }
     }
     code
-}
-
-/// The port's NIC clock (ENA: the PHC, ns), or rte_eth_read_clock's negative errno.
-pub fn read_clock(port_id: u16) -> Result<u64, i32> {
-    let mut clock = 0;
-    // SAFETY: the ethdev stays open while this runs (the clock thread is joined before the port
-    // closes) and `clock` is a writable output.
-    match unsafe { rte_eth_read_clock(port_id, &mut clock) } {
-        0 => Ok(clock),
-        error => Err(error),
-    }
 }
 
 /// The online CPUs not in /sys/devices/system/cpu/isolated (the hft host's housekeeping CPUs)

@@ -126,6 +126,10 @@ impl Device {
         self.port.rx_pool_low(received)
     }
 
+    pub(crate) fn port_mut(&mut self) -> &mut Port {
+        &mut self.port
+    }
+
     /// Release every staged, pending and spare packet, then return the Port.
     pub(crate) fn into_port(self) -> Port {
         let Self {

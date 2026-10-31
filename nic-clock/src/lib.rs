@@ -53,6 +53,12 @@ pub fn jumped() -> bool {
     JUMPED.load(Ordering::Relaxed)
 }
 
+/// Mark the run's latencies not valid, as a read contradicting the fit does: for a clock that
+/// may have jumped without a read showing it (the NIC was reset).
+pub fn mark_jumped() {
+    JUMPED.store(true, Ordering::Relaxed);
+}
+
 /// Latency from `stamp` (PHC ns) to now; `None` if `stamp` is 0 or the fit is not ready.
 #[inline]
 pub fn since(stamp: u64) -> Option<Latency> {

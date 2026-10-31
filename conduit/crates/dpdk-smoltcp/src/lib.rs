@@ -80,8 +80,8 @@ mod stack;
 pub use eal::{Eal, EalError};
 pub use handle::{TcpHandle, UdpHandle};
 pub use port::{
-    device_info, port_by_name, DeviceInfo, Offloads, Packet, Port, PortConfig, PortError,
-    PortOpenError, RxBurst, TxPacket,
+    device_info, port_by_name, port_resets, read_clock, DeviceInfo, Offloads, Packet, Port,
+    PortConfig, PortError, PortOpenError, RxBurst, TxPacket,
 };
 pub use rx_pool::{frame_reserve, rx_reserve, tx_reserve};
 pub use smoltcp;
