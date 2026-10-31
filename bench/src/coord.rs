@@ -455,11 +455,16 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         }
         let mut report = merge(args, id, rate, &results)?;
         report.budget = max_budget;
-        if id == 0 && window_ns.is_some() {
-            summary.baseline_rtt_p50_ns = report.service_rtt_p50_ns;
-        }
         summary.steps = id + 1;
         out(&serde_json::to_string(&report).expect("report serializes"));
+        if id == 0 && window_ns.is_some() {
+            summary.baseline_rtt_p50_ns = report.service_rtt_p50_ns;
+            if summary.baseline_rtt_p50_ns.is_none() {
+                return Err(
+                    "no echo in the first step: no baseline round trip for the budget".into(),
+                );
+            }
+        }
         if report.generator_bound {
             summary.generator_bound = true;
             break;
@@ -646,6 +651,21 @@ mod tests {
         assert_eq!(lines[0]["drop_fraction"], 1.0);
         assert!(lines[0]["latency_ns"].is_null());
         assert_eq!(lines[1]["complete"], true);
+    }
+
+    /// TCP/ws with a budget: no echo in the first step leaves no baseline, and the sweep fails
+    /// instead of running the later steps uncapped.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn no_baseline_fails_a_budgeted_sweep() {
+        let mut args = args();
+        args.budget_window_us = Some(50);
+        args.rate_max = 4000;
+        args.gen_cmd = fake_worker("nobase", &result(0, &[], &[100], 5, 0), 10);
+        let (r, lines) = run_lines(&args);
+        assert!(r.unwrap_err().contains("no baseline"));
+        assert_eq!(lines.len(), 2, "the first step, then the summary");
+        assert_eq!(lines[1]["complete"], false);
     }
 
     /// A sweep that stops at a generator-bound step ends with a complete summary that says so,
