@@ -12,7 +12,6 @@ use std::cell::Cell;
 use std::mem::ManuallyDrop;
 
 use crate::__private::Task;
-use crate::intrusive::NIL;
 use crate::oneshot::Sender;
 use crate::remote::Mailbox;
 use crate::task::SpawnToken;
@@ -433,9 +432,6 @@ impl Executor {
             if current & LIVE != 0 {
                 flags.set(current & !LIVE);
                 (*this).task_count -= 1;
-                if TaskHeader::reg_head(header).get() != NIL {
-                    (*this).timers.retire(header);
-                }
             }
         }
     }

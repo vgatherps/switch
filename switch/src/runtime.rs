@@ -101,8 +101,8 @@ impl Control {
         }
     }
 
-    /// Token must have originated in this Control's timer store.
-    pub(crate) unsafe fn cancel_timer(&self, token: crate::timer_registration::Token) {
+    /// Cancel a token of this Control's timer store, if the executor still exists.
+    pub(crate) fn cancel_timer(&self, token: crate::timer_registration::Token) {
         let root = self.root.get();
         if !root.is_null() {
             unsafe {

@@ -10,9 +10,6 @@ use std::task::{Context, Poll, Waker};
 #[path = "waker_tests.rs"]
 mod waker_tests;
 
-#[path = "registration_tests.rs"]
-mod registration_tests;
-
 struct Owner(*mut Executor);
 
 #[test]

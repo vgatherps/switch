@@ -60,10 +60,7 @@ impl RuntimePool {
             if block == (*this).blocks.len() {
                 Self::grow(this, spec);
             }
-            let header = Meta::header((&(*this).blocks)[block], slot % spec.slots);
-            // A zeroed block's headers have no timer list yet; a freed slot keeps NIL.
-            TaskHeader::reg_head(header).set(crate::intrusive::NIL);
-            header
+            Meta::header((&(*this).blocks)[block], slot % spec.slots)
         }
     }
 
@@ -81,12 +78,12 @@ impl RuntimePool {
     /// Return a slot whose future is gone (or was never written) to its pool.
     ///
     /// # Safety
-    /// Owner thread; the slot is reserved, no queue entry or timer registration
-    /// refers to it, and its future is dropped or uninitialized.
+    /// Owner thread; the slot is reserved, no queue entry refers to it, and its
+    /// future is dropped or uninitialized. A timer may still name the slot: its
+    /// expiry only wakes it.
     pub(crate) unsafe fn release(header: *const TaskHeader) {
         unsafe {
             let meta = TaskHeader::meta(header);
-            debug_assert_eq!(TaskHeader::reg_head(header).get(), crate::intrusive::NIL);
             TaskHeader::flags(header).set(0);
             let slot = Meta::block(meta) * Meta::slots(meta) + Meta::position(meta, header);
             (*Meta::pool(meta)).depot.free(slot);
