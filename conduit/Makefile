@@ -56,7 +56,8 @@ PACKETDRILL_CPUS = DOCKER_CPUSET=$(DOCKER_CPUSET) PACKETDRILL_CPUSET=$(PACKETDRI
 DOCKER_MAKE_TEST = $(DOCKER) run --rm --init $(DOCKER_DPDK) -v $(PACKETDRILL_LOCK_VOLUME):/packetdrill-lock \
 	--cpuset-cpus=$(DOCKER_CPUSET),$(PACKETDRILL_CPUSET),$(PACKETDRILL_ZHIDA_CPUSET) $(DOCKER_IMAGE) \
 	taskset -c $(DOCKER_CPUSET) timeout --kill-after=10 $(MAKE_TEST_TIMEOUT) make $(PACKETDRILL_CPUS)
-AUTOBAHN_IMAGE ?= zhida-autobahn:25.10.1
+# Built for DOCKER_PLATFORM (native when empty), tagged per platform like DOCKER_IMAGE.
+AUTOBAHN_IMAGE ?= zhida-autobahn:25.10.1$(if $(DOCKER_PLATFORM),-$(DOCKER_PLATFORM_TAG))
 # Seconds for the driver and for wstest each; expiry fails the run.
 AUTOBAHN_TIMEOUT ?= 600
 # The CPU of the Autobahn peer container; it must differ from DOCKER_CPUSET.
@@ -430,7 +431,8 @@ docker-autobahn-image:
 		kill -KILL $$pid 2>/dev/null; wait $$pid; \
 	}; \
 	trap '[ -z "$$pid" ] || stop; exit 130' INT TERM HUP; \
-	$(DOCKER) build --platform linux/arm64 -t $(AUTOBAHN_IMAGE) - < docker/autobahn.Dockerfile & pid=$$!; \
+	$(if $(DOCKER_PLATFORM),$(DOCKER) buildx build --load --platform $(DOCKER_PLATFORM),$(DOCKER) build) \
+		-t $(AUTOBAHN_IMAGE) - < docker/autobahn.Dockerfile & pid=$$!; \
 	deadline=$$(( $$(date +%s) + $(AUTOBAHN_IMAGE_TIMEOUT) )); \
 	while kill -0 $$pid 2>/dev/null; do \
 		if [ "$$(date +%s)" -ge $$deadline ]; then \

@@ -1,4 +1,5 @@
-# Autobahn|Testsuite 25.10.1 (wstest), native arm64. Provenance and evidence: docker/README.md.
+# Autobahn|Testsuite 25.10.1 (wstest), for the host platform (or DOCKER_PLATFORM). Provenance and
+# evidence: docker/README.md.
 # Python 2.7 / PyPy / OpenSSL 1.1 only: do not move the base past bullseye.
 FROM pypy:2-7-bullseye@sha256:3164eef9333b814d8cc2fef87c6d65bcdd78ae95e515bf91d4797671c9b933ac
 

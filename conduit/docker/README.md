@@ -514,13 +514,16 @@ Benchmark timings inside Docker are VM measurements and must be labeled so.
 
 ## Autobahn testsuite image
 
-`docker/autobahn.Dockerfile` builds Autobahn|Testsuite 25.10.1 (`wstest`) natively for arm64,
-adapted from upstream's `docker/Dockerfile` (which installs a local wheel and publishes no arm64
-image). `make docker-autobahn-image` builds it, or directly:
+`docker/autobahn.Dockerfile` builds Autobahn|Testsuite 25.10.1 (`wstest`) for the host's own
+architecture (arm64 or x86-64), adapted from upstream's `docker/Dockerfile` (which installs a local
+wheel and publishes no arm64 image). `make docker-autobahn-image` builds it, or directly:
 
 ```sh
-docker build --platform linux/arm64 -t zhida-autobahn:25.10.1 -f docker/autobahn.Dockerfile docker
+docker build -t zhida-autobahn:25.10.1 - < docker/autobahn.Dockerfile
 ```
+
+With `DOCKER_PLATFORM` set, as for the Zhida image, the build goes through `docker buildx build
+--platform $(DOCKER_PLATFORM)` and the tag gains the platform (`zhida-autobahn:25.10.1-linux-amd64`).
 
 The base `pypy:2-7-bullseye` is pinned by index digest (PyPy 7.3.20, Python 2.7.18, OpenSSL 1.1;
 cryptography 3.3.2 does not build against OpenSSL 3). Every pip package is pinned `==` and
