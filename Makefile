@@ -10,10 +10,12 @@ vendor-check:
 HOST_PACKAGES = switch switch-macros depot relay sheath nic-clock \
 	ceph-rseq ceph-ring ceph-fifo ceph-proto ceph-control
 
-# Then the vendored smoltcp tests. TIMEOUT is cleared: GNU timeout is not on macOS.
+# Then the vendored smoltcp tests (TIMEOUT is cleared: GNU timeout is not on macOS) and the EC2
+# host setup script's tests (deploy/README.md).
 test:
 	cargo test $(addprefix -p ,$(HOST_PACKAGES))
 	$(MAKE) -C conduit test-smoltcp TIMEOUT=
+	sh deploy/test-hft-host.sh
 
 # Everything, DPDK included, in conduit's Docker image.
 docker-test:

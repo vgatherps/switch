@@ -1,0 +1,33 @@
+[package]
+name = "zhida-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "zhida-bench"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc.workspace = true
+dpdk-smoltcp.workspace = true
+libc.workspace = true
+relay = { workspace = true, features = ["switchnet"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+switch.workspace = true
+switchnet.workspace = true
+tungstenite.workspace = true
+zhida-netconf.workspace = true
+zhida-open.workspace = true
+
+[features]
+# Test-only: the Docker end-to-end test over net_tap (NET_ADMIN, /dev/net/tun).
+e2e = []
+
+[dev-dependencies]
+zhida-test-support.workspace = true
+
+[lints]
+workspace = true

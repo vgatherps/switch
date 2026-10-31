@@ -214,6 +214,28 @@ fn udp_datagrams_arrive_with_source_address() {
     })
 }
 
+/// Datagrams beyond the socket's receive queue are dropped by the Stack and counted;
+/// `UdpTx::stats` reports that count.
+#[zhida_test_support::pinned_test]
+fn udp_stats_count_datagrams_dropped_on_a_full_queue() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["udsa", "udsb"]);
+        let (rx, tx) = mixed.handle().udp_bind(udp_config(7000)).unwrap().split();
+        let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
+        assert_eq!(tx.stats().rx_dropped_full, 0);
+        peer_udp_send(&mut mixed, &peer, 7000, b"first");
+        let to = Some(IpEndpoint::new(net_ip().into(), 7000));
+        for _ in 0..support::UDP_QUEUE + 2 {
+            mixed.peer.udp_send(&peer, to, b"more").unwrap();
+            mixed.turn();
+        }
+        mixed.rounds(4);
+        assert_eq!(tx.stats().rx_dropped_full, 3);
+        drop((rx, tx, peer));
+        mixed.close();
+    })
+}
+
 /// A task drops its parked `recv` and waits on nothing; data then arriving
 /// must not poll it.
 #[zhida_test_support::pinned_test]
