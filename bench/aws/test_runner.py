@@ -555,12 +555,13 @@ class RunTest(unittest.TestCase):
             self.assertIn(f"> {z.REMOTE}/{t}.jsonl 2> {z.REMOTE}/{t}.coord.log", cmd)
         serves = [c for r, c in w.calls if r == "receiver" and "zhida-bench serve" in c]
         self.assertEqual(len(serves), 3)
-        self.assertTrue(all("taskset -c 7 zhida-bench serve" in c for c in serves))
+        for c, (proto, _) in zip(serves, z.SWEEPS):
+            self.assertTrue(c.endswith(f"taskset -c 7 zhida-bench serve --config /etc/zhida/dut.json --proto {proto}"
+                                       " --port 7000"), c)
         for t in z.sweep_tags():
-            want = {("sender0", f"{z.REMOTE}/{t}.jsonl"), ("sender0", f"{z.REMOTE}/{t}.coord.log"),
-                    ("receiver", f"{z.REMOTE}/dut-counters-{t}.jsonl")}
+            want = {("sender0", f"{z.REMOTE}/{t}.jsonl"), ("sender0", f"{z.REMOTE}/{t}.coord.log")}
             want |= {(f"sender{i}", f"{z.REMOTE}/gen-{t}.log") for i in range(5)}
-            self.assertLessEqual(want, set(w.fetched))
+            self.assertEqual(want, {f for f in w.fetched if t in f[1]})
             self.assertTrue(os.path.exists(os.path.join(self.run_dir, "sender4", f"gen-{t}.log")))
         with open(os.path.join(self.run_dir, "expected.json")) as f:
             self.assertEqual(json.load(f), {"sweeps": z.sweep_tags()})

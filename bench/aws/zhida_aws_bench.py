@@ -129,11 +129,10 @@ def sweep_command(proto, budget, receiver_ip, housekeeping):
             f" > {REMOTE}/{t}.jsonl 2> {REMOTE}/{t}.coord.log")
 
 
-def serve_command(proto, app_cpu, t):
-    """The receiver as a transient systemd unit; `systemctl stop` (SIGTERM) writes its counter log."""
+def serve_command(proto, app_cpu):
+    """The receiver as a transient systemd unit."""
     return (f"systemd-run --unit {RECEIVER_UNIT} --setenv={MIMALLOC_ENV} taskset -c {shlex.quote(app_cpu)}"
-            f" zhida-bench serve --config /etc/zhida/dut.json --proto {proto} --port {PORT}"
-            f" --counter-log {REMOTE}/dut-counters-{t}.jsonl")
+            f" zhida-bench serve --config /etc/zhida/dut.json --proto {proto} --port {PORT}")
 
 
 def ssh_config(sender_ips):
@@ -543,9 +542,8 @@ def connect_senders(hosts, run_dir, run_id, local):
 
 def fetch_sweep(t, hosts, run_dir):
     """Every file of sweep `t` into run_dir; returns the failures."""
-    receiver, senders = hosts[0], hosts[1:]
-    wanted = [(senders[0], f"{REMOTE}/{t}.jsonl", run_dir), (senders[0], f"{REMOTE}/{t}.coord.log", run_dir),
-              (receiver, f"{REMOTE}/dut-counters-{t}.jsonl", run_dir)]
+    senders = hosts[1:]
+    wanted = [(senders[0], f"{REMOTE}/{t}.jsonl", run_dir), (senders[0], f"{REMOTE}/{t}.coord.log", run_dir)]
     for h in senders:
         d = os.path.join(run_dir, h.role)
         os.makedirs(d, exist_ok=True)
@@ -559,7 +557,7 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env):
     receiver, sender0 = hosts[0], hosts[1]
     t = tag(proto, budget)
     receiver.root(f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
-                  f" {serve_command(proto, facts['receiver']['APP_CPU'], t)}")
+                  f" {serve_command(proto, facts['receiver']['APP_CPU'])}")
     try:
         env.sleep(3)
         if receiver.root(f"systemctl is-active {RECEIVER_UNIT}", check=False).stdout.strip() != "active":
