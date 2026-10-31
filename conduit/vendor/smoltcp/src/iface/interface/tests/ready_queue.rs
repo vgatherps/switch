@@ -1169,27 +1169,6 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
 }
 
 #[test]
-fn dropped_dispatch_ends_lone_socket_visit() {
-    // The dropped SYN rearms its RTO; the future deadline ends this visit.
-    let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
-    let handle = connect(&mut iface, &mut sockets, 1234);
-    sockets.get_mut(handle).set_rto(Duration::from_millis(1));
-    iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(take_tcp(&mut device).1, TcpControl::Syn);
-    iface.inner.caps.max_transmission_unit = 40;
-    for (elapsed, next) in [(1, 3), (3, 7)] {
-        let now = START + Duration::from_millis(elapsed);
-        assert_eq!(
-            iface.poll_egress(now, &mut device, &mut sockets),
-            PollResult::SocketStateChanged
-        );
-        assert!(device.tx_queue.is_empty());
-        assert_eq!(sockets.get(handle).poll_at(iface.context()), PollAt::Time(START + Duration::from_millis(next)));
-        assert_eq!(sockets.get(handle).state(), tcp::State::SynSent);
-    }
-}
-
-#[test]
 fn lone_socket_sends_its_window_in_one_visit() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);

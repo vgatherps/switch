@@ -1,24 +1,24 @@
 use super::*;
 use crate::iface::header_template::UdpTemplate;
 use crate::iface::udp_set::PendingUdp;
-use crate::iface::{UdpHandle, UdpSendError, UdpSocket, UdpTarget};
+use crate::iface::{UdpHandle, UdpSendError, UdpSocket};
 use crate::phy::{ChecksumCapabilities, TxFrame, UniqueTxBuf};
 
 impl Interface {
-    /// Check one UDP send of `len` payload bytes before any device work.
+    /// The destination of one UDP send of `len` payload bytes, checked before any device work.
     /// Errors come in this order: `NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`.
     /// `Unaddressable` includes our own addresses, the owned set too. The set is not searched for
     /// the destination of the socket's header template: a template exists only for a destination
     /// that passed here, and the set is fixed.
     ///
     /// Panics if the interface medium is not Ethernet or `handle` is stale.
-    pub fn udp_target(
+    fn udp_destination(
         &self,
         udp: &UdpSet,
         handle: UdpHandle,
         to: Option<IpEndpoint>,
         len: usize,
-    ) -> Result<UdpTarget, UdpSendError> {
+    ) -> Result<IpEndpoint, UdpSendError> {
         assert!(
             matches!(self.inner.caps.medium, Medium::Ethernet),
             "UDP send needs an Ethernet interface"
@@ -29,9 +29,7 @@ impl Interface {
             (Some(to), Some(peer)) if to != peer => return Err(UdpSendError::PeerMismatch),
             (Some(to), _) | (None, Some(to)) => to,
         };
-        let dst_addr = match to.addr {
-            IpAddress::Ipv4(addr) => addr,
-        };
+        let IpAddress::Ipv4(dst_addr) = to.addr;
         if dst_addr.is_unspecified()
             || dst_addr.is_multicast()
             || self.inner.has_interface_addr(to.addr)
@@ -50,59 +48,58 @@ impl Interface {
         {
             return Err(UdpSendError::TooLarge);
         }
-        Ok(UdpTarget {
-            handle,
-            to,
-            dst_addr,
-            len,
-        })
+        Ok(to)
     }
 
     /// Copy `payload` into a frame from the UDP set's frame source and send it as one datagram
-    /// to `target`, which `udp_target` made for `payload.len()` bytes. Errors are `WouldBlock`,
-    /// `NoRoute` and `NeighborPending`, in `udp_send_frame`'s order; an empty frame source is
+    /// from `handle` to `to` (`None` for the socket's peer). Errors are the destination errors
+    /// (`NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`), then `WouldBlock`,
+    /// `NoRoute` and `NeighborPending` in `udp_send_frame`'s order; an empty frame source is
     /// `WouldBlock` before the neighbor lookup.
     ///
-    /// Panics if `payload` is not the target's length, the interface medium is not Ethernet
-    /// or the target's handle is stale.
+    /// Panics if the interface medium is not Ethernet or `handle` is stale.
     pub fn udp_send(
         &mut self,
         device: &mut (impl Device + ?Sized),
         udp: &mut UdpSet,
-        target: UdpTarget,
+        handle: UdpHandle,
+        to: Option<IpEndpoint>,
         payload: &[u8],
     ) -> Result<(), UdpSendError> {
-        let frame = udp_copy(udp, target.len, payload)?;
-        self.udp_send_unique(device, udp, target, frame)
+        let to = self.udp_destination(udp, handle, to, payload.len())?;
+        let frame = udp_copy(udp, payload)?;
+        self.udp_send_unique(device, udp, handle, to, frame)
             .map_err(|(_, error)| error)
     }
 
-    /// Send `frame` as one UDP datagram to `target`, made for `frame.len()` payload bytes.
+    /// Send `frame` as one UDP datagram from `handle` to `to` (`None` for the socket's peer).
     /// A unique frame is published in place: its headers go in front of its payload and its
     /// only reference moves to the device. A shared frame's payload is copied into a frame from
     /// the UDP set's frame source, as `udp_send` does; on success this reference is dropped.
-    /// Errors are `WouldBlock`, `NoRoute` and `NeighborPending`, each with the frame back. The
-    /// neighbor lookup runs first and takes a TX token only to send an ARP request; the publish
-    /// slot is taken after it, so a full device reports `WouldBlock` only for a resolved
+    /// Errors are the destination errors (`NoDestination`, `PeerMismatch`, `Unaddressable`,
+    /// `TooLarge`), then `WouldBlock`, `NoRoute` and `NeighborPending`, each with the frame back.
+    /// The neighbor lookup runs first and takes a TX token only to send an ARP request; the
+    /// publish slot is taken after it, so a full device reports `WouldBlock` only for a resolved
     /// neighbor. A shared frame with an empty frame source is `WouldBlock` before the lookup.
     ///
-    /// `target` must be `udp_target`'s for `frame.len()` bytes, at most 65527.
-    ///
-    /// Panics if the interface medium is not Ethernet or the target's handle is stale.
+    /// Panics if the interface medium is not Ethernet or `handle` is stale.
     pub fn udp_send_frame(
         &mut self,
         device: &mut (impl Device + ?Sized),
         udp: &mut UdpSet,
-        target: UdpTarget,
+        handle: UdpHandle,
+        to: Option<IpEndpoint>,
         frame: TxFrame,
     ) -> Result<(), (TxFrame, UdpSendError)> {
-        debug_assert_eq!(frame.len(), target.len, "UDP frame length is not its target's");
-        debug_assert!(UDP_HEADER_LEN + frame.len() <= usize::from(u16::MAX));
+        let to = match self.udp_destination(udp, handle, to, frame.len()) {
+            Ok(to) => to,
+            Err(error) => return Err((frame, error)),
+        };
         match frame.into_unique() {
             Ok(unique) => self
-                .udp_send_unique(device, udp, target, unique)
+                .udp_send_unique(device, udp, handle, to, unique)
                 .map_err(|(unique, error)| (unique.into_frame(), error)),
-            Err(shared) => self.udp_send_shared(device, udp, target, shared),
+            Err(shared) => self.udp_send_shared(device, udp, handle, to, shared),
         }
     }
 
@@ -114,32 +111,30 @@ impl Interface {
         &mut self,
         device: &mut (impl Device + ?Sized),
         udp: &mut UdpSet,
-        target: UdpTarget,
+        handle: UdpHandle,
+        to: IpEndpoint,
         shared: TxFrame,
     ) -> Result<(), (TxFrame, UdpSendError)> {
-        let copy = match udp_copy(udp, target.len, shared.payload()) {
+        let copy = match udp_copy(udp, shared.payload()) {
             Ok(copy) => copy,
             Err(error) => return Err((shared, error)),
         };
-        self.udp_send_unique(device, udp, target, copy)
+        self.udp_send_unique(device, udp, handle, to, copy)
             .map_err(|(_, error)| (shared, error))
     }
 
-    /// Publish the unique `frame` as one UDP datagram to `target`; errors give it back.
+    /// Publish the unique `frame` as one UDP datagram to `to`; errors give it back.
     #[inline(always)]
     fn udp_send_unique(
         &mut self,
         device: &mut (impl Device + ?Sized),
         udp: &mut UdpSet,
-        target: UdpTarget,
+        handle: UdpHandle,
+        to: IpEndpoint,
         mut frame: UniqueTxBuf,
     ) -> Result<(), (UniqueTxBuf, UdpSendError)> {
-        let UdpTarget {
-            handle,
-            to,
-            dst_addr,
-            len,
-        } = target;
+        let IpAddress::Ipv4(dst_addr) = to.addr;
+        let len = frame.len();
         let socket = udp.get_mut(handle);
         let now = self.inner.now;
         self.inner.neighbor_cache.expire(now);
@@ -212,13 +207,13 @@ impl Interface {
     }
 }
 
-/// A unique frame from `udp`'s frame source holding `payload`, which must be `len` bytes.
-/// `WouldBlock` when the source is empty.
+/// A unique frame from `udp`'s frame source holding `payload`. `WouldBlock` when the source is
+/// empty.
 #[inline]
-fn udp_copy(udp: &UdpSet, len: usize, payload: &[u8]) -> Result<UniqueTxBuf, UdpSendError> {
+fn udp_copy(udp: &UdpSet, payload: &[u8]) -> Result<UniqueTxBuf, UdpSendError> {
     let mut frame = udp.source.alloc_unique().ok_or(UdpSendError::WouldBlock)?;
-    frame.room_mut()[..len].copy_from_slice(payload);
-    frame.set_len(len);
+    frame.room_mut()[..payload.len()].copy_from_slice(payload);
+    frame.set_len(payload.len());
     Ok(frame)
 }
 

@@ -202,9 +202,8 @@ impl Test {
     }
 
     fn send(&mut self, to: Option<IpEndpoint>, payload: &[u8]) -> Result<(), UdpSendError> {
-        let target = self.iface.udp_target(&self.udp, self.handle, to, payload.len())?;
         self.iface
-            .udp_send(&mut self.device, &mut self.udp, target, payload)
+            .udp_send(&mut self.device, &mut self.udp, self.handle, to, payload)
     }
 }
 
@@ -1091,16 +1090,9 @@ fn arp_request(addr: Ipv4Address) -> Vec<u8> {
 }
 
 /// A send of `len` bytes to `to` fails with `error` and puts nothing but an ARP request on the
-/// device. Target errors return before a payload exists, so `len` may be any size.
+/// device.
 fn assert_send_error(test: &mut Test, to: Option<IpEndpoint>, len: usize, error: UdpSendError) {
-    let result = test
-        .iface
-        .udp_target(&test.udp, test.handle, to, len)
-        .and_then(|target| {
-            test.iface
-                .udp_send(&mut test.device, &mut test.udp, target, &vec![0; len])
-        });
-    assert_eq!(result, Err(error));
+    assert_eq!(test.send(to, &vec![0; len]), Err(error));
     if error == UdpSendError::NeighborPending {
         let IpAddress::Ipv4(addr) = to.unwrap().addr else {
             panic!("ARP requires IPv4");
@@ -1120,7 +1112,7 @@ fn send_errors_put_nothing_on_the_device() {
     assert_send_error(
         &mut test,
         Some(IpEndpoint::new(peer.addr, PEER_PORT + 1)),
-        usize::MAX,
+        1473,
         UdpSendError::PeerMismatch,
     );
     for addr in [
@@ -1135,7 +1127,7 @@ fn send_errors_put_nothing_on_the_device() {
         assert_send_error(
             &mut Test::new(1),
             Some(IpEndpoint::new(addr.into(), PEER_PORT)),
-            usize::MAX,
+            1473,
             UdpSendError::Unaddressable,
         );
     }
@@ -1148,7 +1140,7 @@ fn send_errors_put_nothing_on_the_device() {
     assert_send_error(
         &mut Test::new(1),
         Some(peer),
-        usize::MAX,
+        1473,
         UdpSendError::TooLarge,
     );
     let off_subnet = IpEndpoint::new(IpAddress::v4(10, 0, 0, 1), PEER_PORT);
@@ -1174,59 +1166,33 @@ fn send_errors_put_nothing_on_the_device() {
 }
 
 #[test]
-fn udp_target_error_order() {
+fn udp_send_error_order() {
     let peer = IpEndpoint::new(REMOTE.into(), PEER_PORT);
     let mut test = Test::new(1);
     test.device.tx_left = Some(1);
-    let target = |test: &Test, to, len| test.iface.udp_target(&test.udp, test.handle, to, len);
-    assert_eq!(
-        target(&test, None, usize::MAX),
-        Err(UdpSendError::NoDestination)
-    );
-    assert_eq!(
-        target(
-            &test,
-            Some(IpEndpoint::new(LOCAL.into(), PEER_PORT)),
-            usize::MAX
-        ),
-        Err(UdpSendError::Unaddressable)
-    );
-    assert_eq!(target(&test, Some(peer), 1473), Err(UdpSendError::TooLarge));
+    let local = Some(IpEndpoint::new(LOCAL.into(), PEER_PORT));
+    assert_eq!(test.send(None, &[0; 1473]), Err(UdpSendError::NoDestination));
+    assert_eq!(test.send(local, &[0; 1473]), Err(UdpSendError::Unaddressable));
+    assert_eq!(test.send(Some(peer), &[0; 1473]), Err(UdpSendError::TooLarge));
     test.udp.get_mut(test.handle).connect(peer).unwrap();
     assert_eq!(
-        target(
-            &test,
-            Some(IpEndpoint::new(peer.addr, PEER_PORT + 1)),
-            usize::MAX
-        ),
+        test.send(Some(IpEndpoint::new(peer.addr, PEER_PORT + 1)), &[0; 1473]),
         Err(UdpSendError::PeerMismatch)
     );
-    assert_eq!(
-        target(
-            &test,
-            Some(IpEndpoint::new(LOCAL.into(), PEER_PORT)),
-            usize::MAX
-        ),
-        Err(UdpSendError::PeerMismatch)
-    );
-    assert_eq!(target(&test, None, 1473), Err(UdpSendError::TooLarge));
+    assert_eq!(test.send(local, &[0; 1473]), Err(UdpSendError::PeerMismatch));
+    assert_eq!(test.send(None, &[0; 1473]), Err(UdpSendError::TooLarge));
     assert_eq!(test.device.tx_left, Some(1));
     assert!(test.device.tx.is_empty());
-    let resolved = target(&test, None, 1472).unwrap();
-    assert_eq!(
-        test.iface
-            .udp_send(&mut test.device, &mut test.udp, resolved, &[0; 1472]),
-        Err(UdpSendError::NeighborPending)
-    );
+    assert_eq!(test.send(None, &[0; 1472]), Err(UdpSendError::NeighborPending));
     assert_eq!(test.device.tx_left, Some(0));
     assert_eq!(test.device.tx, vec![arp_request(REMOTE)]);
 }
 
-/// An owned address is `Unaddressable` in `udp_target`'s order (before `TooLarge`), in and
-/// outside the subnet, also once the socket has a header template for a peer; the peer's
+/// An owned address is `Unaddressable` in the destination checks' order (before `TooLarge`), in
+/// and outside the subnet, also once the socket has a header template for a peer; the peer's
 /// sends, which skip the owned-set search, still go out.
 #[test]
-fn udp_target_refuses_owned_addresses_in_order() {
+fn udp_send_refuses_owned_addresses_in_order() {
     let owned = Ipv4Address::new(192, 168, 1, 9);
     let elsewhere = Ipv4Address::new(10, 9, 0, 1);
     let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
@@ -1242,7 +1208,7 @@ fn udp_target_refuses_owned_addresses_in_order() {
     resolve(&mut test, REMOTE, REMOTE_MAC);
     for sent in 0..3 {
         for addr in [LOCAL, owned, elsewhere] {
-            for len in [1, usize::MAX] {
+            for len in [1, 1473] {
                 assert_send_error(
                     &mut test,
                     Some(IpEndpoint::new(addr.into(), PEER_PORT)),
@@ -1667,11 +1633,12 @@ fn send_panics_on_ip_medium() {
             broadcast: true,
         })
         .unwrap();
-    let _ = iface.udp_target(
-        &udp,
+    let _ = iface.udp_send(
+        &mut device,
+        &mut udp,
         handle,
         Some(IpEndpoint::new(Ipv4Address::BROADCAST.into(), PEER_PORT)),
-        1,
+        &[0],
     );
 }
 
@@ -1768,12 +1735,8 @@ fn send_tx_frame(
     to: Option<IpEndpoint>,
     frame: crate::phy::TxFrame,
 ) -> Result<(), (crate::phy::TxFrame, UdpSendError)> {
-    let target = match test.iface.udp_target(&test.udp, test.handle, to, frame.len()) {
-        Ok(target) => target,
-        Err(error) => return Err((frame, error)),
-    };
     test.iface
-        .udp_send_frame(&mut test.device, &mut test.udp, target, frame)
+        .udp_send_frame(&mut test.device, &mut test.udp, test.handle, to, frame)
 }
 
 #[track_caller]
@@ -2025,26 +1988,6 @@ fn udp_shared_frame_looks_up_neighbor_before_token() {
     );
     assert!(kept.unique());
     drop(kept);
-    assert_eq!(alloc.live(), 0);
-}
-
-#[test]
-fn udp_frame_length_must_match_target() {
-    let alloc = crate::phy::TxPool::new(8);
-    let mut test = Test::new(1);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    let target = test
-        .iface
-        .udp_target(&test.udp, test.handle, Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), 4)
-        .unwrap();
-    let frame = tx_frame(&alloc, b"abc");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = test
-            .iface
-            .udp_send_frame(&mut test.device, &mut test.udp, target, frame);
-    }));
-    assert!(result.is_err());
-    assert!(test.device.tx.is_empty());
     assert_eq!(alloc.live(), 0);
 }
 

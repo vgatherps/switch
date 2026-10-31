@@ -71,6 +71,7 @@ impl InterfaceInner {
     ) -> TxBuf {
         let IpRepr::Ipv4(ip4) = ip;
         // dispatch puts options only on segments without payload, and sends no timestamps.
+        debug_assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
         debug_assert_eq!(tcp.header_len(), TCP_HEADER_LEN, "TCP frame header carries options");
         let header_len = 14 + ip4.buffer_len() + TCP_HEADER_LEN;
         let tx_checksum = self.tx_checksum(&ip, TCP_HEADER_LEN);
@@ -118,6 +119,10 @@ impl InterfaceInner {
                     self.neighbor_cache.changes(),
                 ));
             }
+            debug_assert!(
+                20 + ip4.payload_len <= self.caps.ip_mtu(),
+                "TCP segment exceeds the IP MTU"
+            );
             if 20 + ip4.payload_len > self.caps.ip_mtu() {
                 return Ok(());
             }

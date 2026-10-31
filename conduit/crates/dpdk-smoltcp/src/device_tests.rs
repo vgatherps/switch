@@ -1193,18 +1193,8 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
                 })
                 .unwrap();
             let payload = b"datagram";
-            let target = iface
-                .udp_target(
-                    &udp,
-                    handle,
-                    Some(IpEndpoint::new(Side::B.ip().into(), 80)),
-                    payload.len(),
-                )
-                .unwrap();
-            assert_eq!(
-                iface.udp_send(&mut device, &mut udp, target, payload),
-                Ok(())
-            );
+            let to = Some(IpEndpoint::new(Side::B.ip().into(), 80));
+            assert_eq!(iface.udp_send(&mut device, &mut udp, handle, to, payload), Ok(()));
             let expected = if offload {
                 (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, 14, 20, 8)
             } else {
@@ -1303,18 +1293,8 @@ fn udp_template_frames_match_generic_and_flags() {
                 .unwrap();
             let payload = b"datagram";
             for _ in 0..2 {
-                let target = iface
-                    .udp_target(
-                        &udp,
-                        handle,
-                        Some(IpEndpoint::new(Side::B.ip().into(), 80)),
-                        payload.len(),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    iface.udp_send(&mut device, &mut udp, target, payload),
-                    Ok(())
-                );
+                let to = Some(IpEndpoint::new(Side::B.ip().into(), 80));
+                assert_eq!(iface.udp_send(&mut device, &mut udp, handle, to, payload), Ok(()));
             }
             let expected = if offload {
                 (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, 14, 20, 8)
@@ -3181,8 +3161,7 @@ fn send_udp_frame(
     to: smoltcp::wire::IpEndpoint,
     frame: smoltcp::phy::TxFrame,
 ) -> Result<(), (smoltcp::phy::TxFrame, smoltcp::iface::UdpSendError)> {
-    let target = iface.udp_target(udp, handle, Some(to), frame.len()).unwrap();
-    iface.udp_send_frame(device, udp, target, frame)
+    iface.udp_send_frame(device, udp, handle, Some(to), frame)
 }
 
 /// A unique UDP frame goes out in place on the generic path (first send) and
@@ -3231,11 +3210,7 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
                     assert_eq!(ring_bytes(&fixture), [sent.last().unwrap().clone()]);
                     assert_eq!(frame_in_use(&device), 0);
                 }
-                let target = iface.udp_target(&udp, handle, Some(to), len).unwrap();
-                assert_eq!(
-                    iface.udp_send(&mut device, &mut udp, target, &payload),
-                    Ok(())
-                );
+                assert_eq!(iface.udp_send(&mut device, &mut udp, handle, Some(to), &payload), Ok(()));
                 assert_eq!(tx_metadata(&device.tx[0]), metadata);
                 assert_eq!(sent, [device.tx[0].data(), device.tx[0].data()]);
                 assert_eq!(device.flush(), Ok(1));

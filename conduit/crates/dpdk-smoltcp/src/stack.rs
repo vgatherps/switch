@@ -639,9 +639,8 @@ impl Stack {
         payload: &[u8],
     ) -> Result<(), UdpSendError> {
         let raw = self.udp_raw(handle);
-        let target = self.iface.udp_target(&self.udp, raw, to, payload.len())?;
         self.iface
-            .udp_send(&mut self.device, &mut self.udp, target, payload)
+            .udp_send(&mut self.device, &mut self.udp, raw, to, payload)
     }
 
     /// Send `frame` as one datagram; `to` may be omitted for a connected
@@ -666,12 +665,8 @@ impl Stack {
             return Err((frame, UdpSendFrameError::Foreign));
         }
         let raw = self.udp_raw(handle);
-        let target = match self.iface.udp_target(&self.udp, raw, to, frame.len()) {
-            Ok(target) => target,
-            Err(error) => return Err((frame, UdpSendFrameError::Udp(error))),
-        };
         self.iface
-            .udp_send_frame(&mut self.device, &mut self.udp, target, frame)
+            .udp_send_frame(&mut self.device, &mut self.udp, raw, to, frame)
             .map_err(|(frame, error)| (frame, UdpSendFrameError::Udp(error)))
     }
 
@@ -898,6 +893,9 @@ impl Stack {
 fn validate(config: &StackConfig<'_>) -> Result<(), &'static str> {
     if !config.ethernet.is_unicast() {
         return Err("Ethernet address must be unicast");
+    }
+    if config.ethernet == EthernetAddress([0; 6]) {
+        return Err("Ethernet address must be nonzero");
     }
     if !IpAddress::Ipv4(config.ipv4.address()).is_unicast() {
         return Err("IPv4 address must be unicast");

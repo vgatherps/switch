@@ -58,7 +58,7 @@ pub use self::tcp_set::{ReadySide, SocketHandle, TcpSet};
 pub use self::drop_queue::DropQueue;
 pub use self::udp_set::{
     UdpAddError, UdpConfig, UdpConnectError, UdpDatagram, UdpHandle,
-    UdpSendError, UdpSet, UdpSocket, UdpSocketStats, UdpTarget,
+    UdpSendError, UdpSet, UdpSocket, UdpSocketStats,
 };
 
 pub use self::owned_ipv4::OwnedIpv4;

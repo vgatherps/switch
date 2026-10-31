@@ -913,7 +913,8 @@ mod invalidation {
     }
 
     #[test]
-    fn oversize_frame_drops_without_emitting() {
+    #[should_panic(expected = "TCP segment exceeds the IP MTU")]
+    fn oversize_segment_panics() {
         let mut peer = Peer::new(2, PEER, None);
         peer.warm();
         let frame = peer.frames.last().unwrap();
@@ -936,25 +937,14 @@ mod invalidation {
         assert!(ip.buffer_len() + tcp.buffer_len() > peer.iface.inner.caps.ip_mtu());
         let meta = &mut peer.sockets.item_at_mut(0).unwrap().meta;
         assert!(meta.tcp_template.is_some());
-        peer.iface
-            .inner
-            .dispatch_tcp(
-                peer.device.transmit(Instant::from_millis(2)).unwrap(),
-                PacketMeta::default(),
-                IpRepr::Ipv4(ip),
-                tcp,
-                &mut meta.next_hop,
-                &mut meta.tcp_template,
-            )
-            .unwrap();
-        assert!(peer.device.tx_queue.is_empty());
-        assert_eq!(
-            peer.sockets.get(peer.handle).state(),
-            tcp::State::Established
+        let _ = peer.iface.inner.dispatch_tcp(
+            peer.device.transmit(Instant::from_millis(2)).unwrap(),
+            PacketMeta::default(),
+            IpRepr::Ipv4(ip),
+            tcp,
+            &mut meta.next_hop,
+            &mut meta.tcp_template,
         );
-        peer.iface.inner.caps.max_transmission_unit = mtu;
-        peer.data(3);
-        assert!(peer.device.tx_queue.is_empty());
     }
 
     mod producers {
