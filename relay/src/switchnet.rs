@@ -15,7 +15,7 @@ use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
-use crate::rx::{Config, Kind, Message, Role, WsRx};
+use crate::rx::{Config, Kind, Limits, Message, Role, WsRx};
 use crate::session::{Input, InputEnd, Session};
 pub use crate::tx::Failure;
 use crate::tx::{TxCore, TxError, max_control_frame};
@@ -61,7 +61,7 @@ pub enum Error {
     InvalidText,
     /// A close code we may not send, or a reason over 123 B; nothing was sent.
     InvalidClose,
-    /// A message over 64 MiB; nothing was sent.
+    /// A message over the connection's `Limits::max_send`; nothing was sent.
     TooBig,
 }
 
@@ -139,7 +139,7 @@ impl From<Infallible> for Error {
 }
 
 /// The wss:// handshake for `host` on `stream`, connected to the server's `port`, then the
-/// WebSocket upgrade for `path`.
+/// WebSocket upgrade for `path`; the connection keeps to `limits`.
 pub async fn connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -147,6 +147,7 @@ pub async fn connect(
     host: &str,
     port: u16,
     path: &str,
+    limits: Limits,
 ) -> Result<Wss, Error> {
     let mut tls = tls_connect(handle, stream, config, host, max_control_frame(Role::Client)).await?;
     let (request, key) = upgrade::request(host, port, 443, path, rand::random());
@@ -163,11 +164,19 @@ pub async fn connect(
         }
     }
     upgrade::check(&head, &key).map_err(Error::Upgrade)?;
-    Ok(Wss(session(tls.rx, tls.tx, tls.tcp, Role::Client)))
+    Ok(Wss(session(tls.rx, tls.tx, tls.tcp, Config::new(Role::Client, limits))))
 }
 
-/// The ws:// upgrade for `path` on `stream`, connected to `host`'s `port`.
-pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port: u16, path: &str) -> Result<Ws, Error> {
+/// The ws:// upgrade for `path` on `stream`, connected to `host`'s `port`; the connection keeps
+/// to `limits`.
+pub async fn connect_ws(
+    handle: &NetHandle,
+    stream: TcpStream,
+    host: &str,
+    port: u16,
+    path: &str,
+    limits: Limits,
+) -> Result<Ws, Error> {
     let (mut tcp, tcp_tx) = stream.split();
     let mut tx = SwitchTx::new(handle, tcp_tx, max_control_frame(Role::Client)).await?;
     let (request, key) = upgrade::request(host, port, 80, path, rand::random());
@@ -175,20 +184,20 @@ pub async fn connect_ws(handle: &NetHandle, stream: TcpStream, host: &str, port:
     let mut rx = Raw::new();
     let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
     upgrade::check(&head, &key).map_err(Error::Upgrade)?;
-    Ok(Ws(session(rx, tx, tcp, Role::Client)))
+    Ok(Ws(session(rx, tx, tcp, Config::new(Role::Client, limits))))
 }
 
 /// The server side of the ws:// upgrade on an accepted `stream`: the client's request is
 /// answered with 101, selecting no extension or subprotocol. A request that is not a
-/// WebSocket upgrade is `Error::Upgrade`, with nothing sent.
-pub async fn accept_ws(handle: &NetHandle, stream: TcpStream) -> Result<Ws, Error> {
+/// WebSocket upgrade is `Error::Upgrade`, with nothing sent. The connection keeps to `limits`.
+pub async fn accept_ws(handle: &NetHandle, stream: TcpStream, limits: Limits) -> Result<Ws, Error> {
     let (mut tcp, tcp_tx) = stream.split();
     let mut tx = SwitchTx::new(handle, tcp_tx, max_control_frame(Role::Server)).await?;
     let mut rx = Raw::new();
     let head = read_head(&mut rx, &mut tx, &mut tcp).await?;
     let response = upgrade::accept(&head).map_err(Error::Upgrade)?;
     send_bytes(&mut tx, response.as_bytes()).await?;
-    Ok(Ws(session(rx, tx, tcp, Role::Server)))
+    Ok(Ws(session(rx, tx, tcp, Config::new(Role::Server, limits))))
 }
 
 /// Reads an HTTP head off plain TCP, through its blank line; what follows stays in `rx`.
@@ -319,14 +328,13 @@ fn peer_close(p: &[u8]) -> Option<(u16, &str)> {
     })
 }
 
-/// A connection's halves and TCP input, under `role`'s limits.
-fn session<R, T>(rx: R, tx: T, tcp: TcpRx, role: Role) -> Session<R, T, TcpRx>
+/// A connection's halves and TCP input, with its role and limits.
+fn session<R, T>(rx: R, tx: T, tcp: TcpRx, config: Config) -> Session<R, T, TcpRx>
 where
     R: PlainRx<Frame = TcpFrame, Tx = T>,
     T: PlainTx,
     Failure: From<R::Error>,
 {
-    let config = Config::new(role);
     Session::new(WsRx::new(rx, config), TxCore::new(tx, &config), tcp)
 }
 

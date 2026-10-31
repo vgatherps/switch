@@ -227,7 +227,7 @@ pub(super) fn mock<const TLS: bool>(config: &Config, room: usize) -> (TxCore<Moc
 }
 
 pub(super) fn core(role: Role, room: usize) -> (Core, Rc<RefCell<Log>>) {
-    mock::<true>(&Config::new(role), room)
+    mock::<true>(&Config::new(role, Limits::default()), room)
 }
 
 fn peer(role: Role) -> Role {
@@ -776,7 +776,7 @@ fn dead_seals_nothing_more() {
 #[test]
 fn invalid_input_changes_nothing() {
     const MAX: usize = 4000;
-    let (mut c, log) = mock::<true>(&Config { max_send: MAX, ..Config::new(Role::Server) }, ROOM);
+    let (mut c, log) = mock::<true>(&Config::new(Role::Server, Limits { max_send: MAX, ..Limits::default() }), ROOM);
     log.borrow_mut().room = Some(ROOM);
     assert!(poll_n(c.send(Kind::Binary, &[4; 3000]), 1).is_none());
     c.ping(b"p");
@@ -850,7 +850,7 @@ fn a_failed_seal_is_death_at_every_seal_point() {
 /// is allocated or sealed for the end, and FIN's delivery completes it.
 #[test]
 fn raw_close_handshake_ends_with_fin_alone() {
-    let (mut c, log) = mock::<false>(&Config::new(Role::Server), ROOM);
+    let (mut c, log) = mock::<false>(&Config::new(Role::Server, Limits::default()), ROOM);
     assert_eq!(ready(c.close(1000, "")), Ok(()));
     let (allocs, seals) = (log.borrow().allocs, log.borrow().seals);
     log.borrow_mut().frames = Some(0);

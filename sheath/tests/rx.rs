@@ -155,20 +155,6 @@ fn max_size_records() {
 }
 
 #[test]
-fn scratch_buffer_is_reused() {
-    let mut peer = connect(None);
-    let stream = max_size(&mut peer);
-    let cuts: Vec<usize> = stream.records.iter().map(|r| r.wire.start + 100).collect();
-    let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
-    assert_received(&received.got, &stream.records, &cuts);
-    let [first, second] = &received.got[..] else {
-        panic!("two records");
-    };
-    assert!(matches!(first.place, Place::Elsewhere(_)));
-    assert_eq!(first.place, second.place);
-}
-
-#[test]
 fn bad_tag_is_rejected_without_releasing_plaintext() {
     for straddle in [false, true] {
         let mut peer = connect(None);

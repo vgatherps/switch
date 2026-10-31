@@ -63,7 +63,7 @@ fn header_rules_fail_at_the_header() {
 #[test]
 fn rules_check_in_tungstenite_order() {
     // Unknown opcode before size, size before mask, mask before reserved bits.
-    let small = Config { max_frame: 10, ..Config::new(Role::Server) };
+    let small = Config::new(Role::Server, Limits { max_frame: 10, ..Limits::default() });
     let run = feed(&mut WsRx::new(Raw::new(), small), &[header(0x70 | 3, None, 11)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::UnknownOpcode(3))));
     let run = feed(&mut WsRx::new(Raw::new(), small), &[header(0x70 | BINARY, None, 11)]);
@@ -73,10 +73,10 @@ fn rules_check_in_tungstenite_order() {
 
 #[test]
 fn size_limits() {
-    let cfg = Config { max_frame: 8, max_message: 12, ..Config::new(Role::Client) };
+    let cfg = Config::new(Role::Client, Limits { max_frame: 8, max_message: 12, ..Limits::default() });
     let run = feed(&mut WsRx::new(Raw::new(), cfg), &[header(fin(BINARY), None, 9)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::FrameTooBig)));
-    let run = feed(&mut WsRx::new(Raw::new(), Config { max_message: 7, ..cfg }), &[header(fin(TEXT), None, 8)]);
+    let run = feed(&mut WsRx::new(Raw::new(), Config::new(cfg.role, Limits { max_message: 7, ..cfg.limits })), &[header(fin(TEXT), None, 8)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
     // Fragments: 8 + 4 fits exactly, 8 + 5 fails at the second header.
     let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(BINARY, None, &[1; 8]), encode(fin(CONT), None, &[2; 4])]);
@@ -332,7 +332,7 @@ impl RxFrame for CountedFrame {
 fn consumed_frames_are_dropped_before_recv_asks_for_more() {
     let drops = Rc::new(Cell::new(0));
     let frame = |data: Vec<u8>| CountedFrame { data, drops: drops.clone() };
-    let mut r = WsRx::new(Raw::new(), Config::new(Role::Client));
+    let mut r = WsRx::new(Raw::new(), Config::new(Role::Client, Limits::default()));
 
     // Direct: the message borrows the frame, so it lives until the message is gone.
     r.push(frame(encode(fin(TEXT), None, b"direct")));

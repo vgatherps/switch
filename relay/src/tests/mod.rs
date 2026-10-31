@@ -7,7 +7,7 @@ pub(crate) use sheath::{FrameTx, RxFrame, TxFrame};
 
 pub(crate) use crate::lower::PlainTx;
 pub(crate) use crate::raw::Raw;
-pub(crate) use crate::rx::{Config, Kind, Role, WsError, WsRx};
+pub(crate) use crate::rx::{Config, Kind, Limits, Role, WsError, WsRx};
 pub(crate) use crate::tx::TxCore;
 
 mod differential;
@@ -80,7 +80,7 @@ pub type Rx = WsRx<Raw<VecFrame>>;
 pub type Error = WsError<Infallible>;
 
 pub fn rx(role: Role) -> Rx {
-    WsRx::new(Raw::new(), Config::new(role))
+    WsRx::new(Raw::new(), Config::new(role, Limits::default()))
 }
 
 pub const TEXT: u8 = 1;

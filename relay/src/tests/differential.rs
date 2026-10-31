@@ -62,7 +62,7 @@ fn tungstenite(role: Role, wire: &[u8]) -> Outcome {
 }
 
 fn relay(role: Role, wire: &[u8], cuts: &[usize]) -> Outcome {
-    let cfg = Config { max_frame: MAX_FRAME, max_message: MAX_MESSAGE, ..Config::new(role) };
+    let cfg = Config::new(role, Limits { max_frame: MAX_FRAME, max_message: MAX_MESSAGE, ..Limits::default() });
     let mut rx = WsRx::new(Raw::new(), cfg);
     let run = drive(&mut rx, &split(wire, cuts));
     let end = match run.end {
