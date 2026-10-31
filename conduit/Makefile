@@ -192,7 +192,7 @@ test-stack-release: doctor
 	$(TIMEOUT) cargo test --locked --release -p dpdk-smoltcp -- --test-threads=1
 
 test-echo: doctor
-	$(TIMEOUT) cargo test --locked -p tap-echo -- --test-threads=1 --show-output
+	$(TIMEOUT) cargo test --locked -p tap-echo $(DIAGNOSTICS) -- --test-threads=1 --show-output
 
 test-nic-runner: doctor
 	TEST_TIMEOUT=$(TEST_TIMEOUT) DOCKER_CPUSET=$(DOCKER_CPUSET) $(TIMEOUT) sh crates/nic-runner/tests/run.sh

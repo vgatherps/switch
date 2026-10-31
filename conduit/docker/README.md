@@ -151,7 +151,7 @@ container), so a hung test fails the step with 124 (137 if it ignores TERM). Car
 --locked. The property invocation runs only the `props` test target, the one target its
 `proptest` feature adds. Two documentation examples are marked ignored. `docker-test` runs
 `test-stack-release` after `test-stack`, testing dpdk-smoltcp in release. `test-stack`,
-`packetdrill-build` and `fuzz` build with `dpdk-smoltcp/diagnostics`, which turns on smoltcp's
+`test-echo`, `packetdrill-build` and `fuzz` build with `dpdk-smoltcp/diagnostics`, which turns on smoltcp's
 O(N)-per-packet TCP cross-checks; release, bench and application builds leave it off.
 
 ### Pinned tests
