@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
 use std::future::Future;
-use std::net::SocketAddrV4;
+use std::io::Read as _;
+use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant as WallInstant};
@@ -30,6 +31,12 @@ pub const DEFAULT_PATH: &str = "/ws/btcusdt@bookTicker";
 pub const DEFAULT_PRINT: usize = 10;
 /// RX and TX buffer bytes of the feed's socket.
 pub const SOCKET_BUFFER: usize = 256 * 1024;
+/// The feed's local port is drawn from here to 65535 (IANA dynamic ports).
+pub const FIRST_LOCAL_PORT: u16 = 49152;
+/// TCP, TLS and WebSocket connect, together.
+pub const CONNECT_LIMIT: Duration = Duration::from_secs(20);
+/// The WebSocket close handshake, close_notify and FIN.
+pub const CLOSE_LIMIT: Duration = Duration::from_secs(10);
 
 /// Wall clock since `start`: Stack time in microseconds (panics past i64 microseconds) and
 /// Runtime ticks in milliseconds.
@@ -68,6 +75,35 @@ impl Target {
     pub fn url(&self) -> String {
         format!("wss://{}:{}{}", self.host, self.addr.port(), self.path)
     }
+}
+
+/// `host` resolved by the kernel resolver to its first IPv4 address, at `port`, with `path`.
+pub fn resolve(host: &str, port: u16, path: &str) -> Result<Target, String> {
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("DNS: resolving {host}: {error}"))?;
+    let addr = addresses
+        .into_iter()
+        .find_map(|addr| match addr {
+            SocketAddr::V4(addr) => Some(addr),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or_else(|| format!("DNS: {host} has no IPv4 address"))?;
+    Ok(Target {
+        addr,
+        host: host.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
+/// A local port from FIRST_LOCAL_PORT to 65535, from OS entropy, so a run does not reuse the
+/// previous run's 4-tuple (Docker Desktop's network once answered a repeated SYN with segments
+/// of the earlier connection; the Stack's ISNs are now seeded per run, so this is a precaution).
+pub fn random_local_port() -> std::io::Result<u16> {
+    let mut bytes = [0; 2];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let span = u16::MAX - FIRST_LOCAL_PORT + 1;
+    Ok(FIRST_LOCAL_PORT + u16::from_ne_bytes(bytes) % span)
 }
 
 /// One bookTicker update; prices and quantities keep Binance's decimal strings. The strings
@@ -415,3 +451,19 @@ pub async fn stream(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_takes_the_first_ipv4_address() {
+        let target = resolve("127.0.0.1", 9443, "/ws/x").unwrap();
+        assert_eq!(target.url(), "wss://127.0.0.1:9443/ws/x");
+        assert_eq!(target.addr, "127.0.0.1:9443".parse().unwrap());
+        assert_eq!(resolve("::1", 9443, "/").err().unwrap(), "DNS: ::1 has no IPv4 address");
+        assert!(resolve("no-such-host.invalid", 9443, "/")
+            .err()
+            .unwrap()
+            .starts_with("DNS: resolving no-such-host.invalid: "));
+    }
+}

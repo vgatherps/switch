@@ -3,16 +3,16 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read as _, Write as _};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    run, stream, Clock, Event, FeedError, Summary, Target, DEFAULT_HOST, DEFAULT_PATH,
-    DEFAULT_PORT, DEFAULT_PRINT, INGRESS_BUDGET, SOCKET_BUFFER,
+    random_local_port, resolve, run, stream, Clock, Event, FeedError, Summary, Target, CLOSE_LIMIT,
+    CONNECT_LIMIT, DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT, DEFAULT_PRINT, FIRST_LOCAL_PORT,
+    INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use rustls::ClientConfig;
 use switchnet::{Net, NetConfig};
@@ -21,10 +21,6 @@ use tap_echo::driver::{self, ZHIDA_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP}
 const NAME: &str = "binance-feed";
 const READY: &str = "target/binance-feed/ready";
 const READY_LIMIT: Duration = Duration::from_secs(60);
-/// The local port is drawn from here to 65535 (IANA dynamic ports).
-const FIRST_LOCAL_PORT: u16 = 49152;
-const CONNECT_LIMIT: Duration = Duration::from_secs(20);
-const CLOSE_LIMIT: Duration = Duration::from_secs(10);
 /// The longest idle sleep of a round that moved nothing: the tester shares the CPU.
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -129,28 +125,18 @@ fn main() {
             process::exit(EXIT_ERROR);
         }
     };
-    let mut addresses = match (args.host.as_str(), args.port).to_socket_addrs() {
-        Ok(addresses) => addresses,
+    let target = match resolve(&args.host, args.port, &args.path) {
+        Ok(target) => target,
         Err(error) => {
-            driver::report(NAME, format_args!("DNS: resolving {}: {error}", args.host));
-            process::exit(EXIT_ERROR);
-        }
-    };
-    let addr = match addresses.find_map(|addr| match addr {
-        SocketAddr::V4(addr) => Some(addr),
-        SocketAddr::V6(_) => None,
-    }) {
-        Some(addr) => addr,
-        None => {
-            driver::report(NAME, format_args!("DNS: {} has no IPv4 address", args.host));
+            driver::report(NAME, format_args!("{error}"));
             process::exit(EXIT_ERROR);
         }
     };
     let _ = writeln!(
         io::stdout(),
         "{NAME}: {} resolved to {} by the kernel resolver",
-        args.host,
-        addr.ip(),
+        target.host,
+        target.addr.ip(),
     );
     let tls = binance_feed::webpki_client_config();
     let local_port = match random_local_port() {
@@ -173,11 +159,6 @@ fn main() {
         driver::report(NAME, format_args!("creating {}: {error}", parent.display()));
         process::exit(EXIT_ERROR);
     }
-    let target = Target {
-        addr,
-        host: args.host,
-        path: args.path,
-    };
     let code = driver::run(
         NAME,
         &args.tester,
@@ -192,17 +173,6 @@ fn main() {
         },
     );
     process::exit(code);
-}
-
-/// A port from FIRST_LOCAL_PORT to 65535, from OS entropy. The Stack's initial
-/// sequence numbers repeat every run (fixed random seed), so a fixed port would
-/// repeat the previous run's SYN exactly; Docker Desktop's network answered such
-/// a repeat with segments of the earlier connection.
-fn random_local_port() -> io::Result<u16> {
-    let mut bytes = [0; 2];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    let span = u16::MAX - FIRST_LOCAL_PORT + 1;
-    Ok(FIRST_LOCAL_PORT + u16::from_ne_bytes(bytes) % span)
 }
 
 /// Turns `net` until the tester created READY, then runs the feed as a switch task: connect,

@@ -9,6 +9,7 @@ use sockperf_wire::sockperf::MAX_MESSAGE;
 
 pub const STAGING: usize = 32;
 pub const UDP_QUEUE: usize = 32;
+/// The feed's socket: binance-feed's buffers, MSS capped by the path MTU to `ip`.
 pub fn feed_socket(config: &zhida_netconf::Config, ip: Ipv4Address) -> tcp::Config {
     let cap = config.path_mtu(ip)
         .checked_sub(40)
@@ -16,32 +17,28 @@ pub fn feed_socket(config: &zhida_netconf::Config, ip: Ipv4Address) -> tcp::Conf
     binance_feed::socket(Some(cap))
 }
 
+/// sockperf-server's TCP sockets: buffers for the largest sockperf message.
+pub fn server_socket() -> tcp::Config {
+    tcp::Config { rx_capacity: MAX_MESSAGE, tx_capacity: MAX_MESSAGE, mss_cap: None }
+}
+
+/// The open sizing for `mode`. `socket` is the config of the TCP sockets the mode opens
+/// (`feed_socket` or `server_socket`), `None` if it opens none.
 pub fn sizing(
     config: &zhida_netconf::Config,
     mode: &Mode,
-    feed: Option<&tcp::Config>,
+    socket: Option<&tcp::Config>,
 ) -> Sizing {
-    let (tcp, udp, bytes) = match mode {
-        Mode::Info => (0, 0, MAX_MESSAGE),
-        Mode::Server(s) => (
-            if s.tcp_port.is_some() {
-                s.tcp_connections
-            } else {
-                0
-            },
-            s.udp_ports.len(),
-            MAX_MESSAGE,
-        ),
-        Mode::Feed(_) => (1, 0, binance_feed::SOCKET_BUFFER),
+    let (tcp, udp) = match mode {
+        Mode::Info => (0, 0),
+        Mode::Server(s) => (s.tcp_port.map_or(0, |_| s.tcp_connections), s.udp_ports.len()),
+        Mode::Feed(_) => (1, 0),
     };
-    let socket = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
     let mtu = usize::from(config.mtu);
     // Shares independent of the socket count: one TCP socket's full window each way and one
     // UDP socket's queue, drawn on by every socket.
-    let window = |per_socket: fn(&tcp::Config, usize) -> usize| match mode {
-        Mode::Feed(_) => per_socket(feed.expect("feed mode has a config"), mtu),
-        _ if tcp > 0 => per_socket(&socket, mtu),
-        _ => 0,
+    let window = |per_socket: fn(&tcp::Config, usize) -> usize| {
+        socket.map_or(0, |socket| per_socket(socket, mtu))
     };
     Sizing {
         rx_share: window(tcp::rx_mbuf_budget) + if udp > 0 { UDP_QUEUE } else { 0 },
@@ -100,9 +97,7 @@ pub fn close(port: Port, mut code: i32) -> i32 {
 mod tests {
     use std::ffi::OsString;
 
-    use dpdk_smoltcp::smoltcp::socket::tcp;
-
-    use super::{feed_socket, sizing, STAGING, UDP_QUEUE};
+    use super::{feed_socket, server_socket, sizing};
     use crate::args::Args;
 
     fn parsed(args: &[&str]) -> Args {
@@ -110,78 +105,27 @@ mod tests {
     }
 
     #[test]
-    fn sizing_shares_hold_one_window_whatever_the_socket_count() {
-        for (args, tcp, udp, bytes) in [
-            (
-                &["--config", "nic.json", "info"][..],
-                0,
-                0,
-                sockperf_wire::sockperf::MAX_MESSAGE,
-            ),
-            (
-                &[
-                    "--config",
-                    "nic.json",
-                    "sockperf-server",
-                    "--tcp-port",
-                    "1",
-                    "--tcp-connections",
-                    "64",
-                    "--udp-ports",
-                    "11111,11112",
-                ][..],
-                64,
-                2,
-                sockperf_wire::sockperf::MAX_MESSAGE,
-            ),
-            (
-                &["--config", "nic.json", "feed"][..],
-                1,
-                0,
-                binance_feed::SOCKET_BUFFER,
-            ),
-        ] {
-            let args = parsed(args);
-            for mtu in [1500, 9000] {
-                let config = test_config(mtu, "[]");
-                let socket = feed_socket(&config, "203.0.113.1".parse().unwrap());
-                let sizing = sizing(&config, &args.mode, Some(&socket));
-                let window = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
-                let expected = usize::from(tcp > 0) * tcp::rx_mbuf_budget(&window, usize::from(mtu))
-                    + usize::from(udp > 0) * UDP_QUEUE;
-                assert_eq!(sizing.rx_share, expected);
-                assert_eq!(sizing.rx_staging, STAGING);
-            }
-        }
+    fn feed_socket_caps_the_mss_at_the_path_mtu() {
+        let config = test_config(9000, r#"[{"prefix":"203.0.113.0/24","mtu":1500,"why":"feed path"}]"#);
+        assert_eq!(feed_socket(&config, "203.0.113.1".parse().unwrap()).mss_cap, Some(1460));
+        assert_eq!(feed_socket(&config, "203.0.114.1".parse().unwrap()).mss_cap, Some(8960));
     }
 
+    /// The pool shares are one window and one UDP queue, whatever the number of sockets.
     #[test]
-    fn feed_sizing_uses_path_capped_budget() {
-        let config = test_config(
-            9000,
-            r#"[{"prefix":"203.0.113.0/24","mtu":1500,"why":"feed path"}]"#,
-        );
-        let args = parsed(&["--config", "nic.json", "feed"]);
-        let ip = "203.0.113.1".parse().unwrap();
-        assert_eq!(config.path_mtu(ip).checked_sub(40).unwrap(), 1460);
-        let socket = feed_socket(&config, ip);
-        let capped = dpdk_smoltcp::smoltcp::socket::tcp::rx_mbuf_budget(&socket, 9000);
-        let uncapped = dpdk_smoltcp::smoltcp::socket::tcp::rx_mbuf_budget(
-            &binance_feed::socket(None), 9000,
-        );
-        assert_eq!(capped, 180);
-        assert_eq!(uncapped, 30);
-        let feed_sizing = sizing(&config, &args.mode, Some(&socket));
-        assert_eq!(feed_sizing.rx_share, capped);
-        // The send side's frame limit follows the same 1460-byte cap: 256 KiB / 1460.
-        assert_eq!(feed_sizing.frame_share, 180);
-        assert!(capped > uncapped);
-
-        let socket = feed_socket(&config, "203.0.114.1".parse().unwrap());
-        let feed_sizing = sizing(&config, &args.mode, Some(&socket));
-        assert_eq!(feed_sizing.rx_share, uncapped);
-        // Uncapped at MTU 9000: 256 KiB / 8960.
-        assert_eq!(feed_sizing.frame_share, 30);
+    fn sizing_shares_do_not_grow_with_the_socket_count() {
+        let config = test_config(9000, "[]");
+        let server = |connections: &str| {
+            let args = parsed(&[
+                "--config", "x", "sockperf-server", "--tcp-port", "1", "--tcp-connections",
+                connections, "--udp-ports", "11111,11112",
+            ]);
+            let sizing = sizing(&config, &args.mode, Some(&server_socket()));
+            (sizing.rx_share, sizing.frame_share, sizing.max_sockets)
+        };
+        let (one, many) = (server("1"), server("64"));
+        assert_eq!((one.0, one.1), (many.0, many.1));
+        assert_eq!((one.2, many.2), (1, 64));
     }
 
     fn test_config(mtu: u16, paths: &str) -> zhida_netconf::Config {

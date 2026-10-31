@@ -1,31 +1,20 @@
 use std::cell::Cell;
-use std::io::Read;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use binance_feed::{stream, webpki_client_config, Clock, Event, FeedError, Summary, Target};
+use binance_feed::{
+    random_local_port, stream, webpki_client_config, Clock, Event, FeedError, Summary, Target,
+    CLOSE_LIMIT, CONNECT_LIMIT,
+};
 use switchnet::{tcp, Net};
 
 use crate::args::Feed;
 use crate::{line, stopped};
 
 pub fn resolve(args: &Feed) -> Result<Target, String> {
-    let mut addresses = (args.host.as_str(), args.port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS {}: {e}", args.host))?;
-    let addr = addresses
-        .find_map(|a| match a {
-            SocketAddr::V4(a) => Some(a),
-            SocketAddr::V6(_) => None,
-        })
-        .ok_or_else(|| format!("DNS {} has no IPv4 address", args.host))?;
-    line("resolved", format_args!("{} -> {addr}", args.host));
-    Ok(Target {
-        addr,
-        host: args.host.clone(),
-        path: args.path.clone(),
-    })
+    let target = binance_feed::resolve(&args.host, args.port, &args.path)?;
+    line("resolved", format_args!("{} -> {}", target.host, target.addr));
+    Ok(target)
 }
 
 /// Connects, reads for `args.seconds` after the connect (or until a stop signal), closes.
@@ -36,11 +25,7 @@ pub fn run(
     socket: tcp::Config,
     clock: &Clock,
 ) -> Result<(), String> {
-    let mut bytes = [0; 2];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| format!("local port entropy: {e}"))?;
-    let local_port = 49152 + u16::from_ne_bytes(bytes) % (u16::MAX - 49152 + 1);
+    let local_port = random_local_port().map_err(|e| format!("local port entropy: {e}"))?;
     let seconds = Duration::from_secs(args.seconds);
     let connected: Rc<Cell<Option<Instant>>> = Rc::default();
     let task_connected = connected.clone();
@@ -80,11 +65,17 @@ pub fn run(
                 ),
                 Event::CloseFailed(e) => line("feed_close_error", e),
             };
-            let limit = Duration::from_secs(20);
-            let close_limit = Duration::from_secs(10);
             let tls = webpki_client_config();
             let summary = stream(
-                &handle, &spawner, &target, socket, tls, local_port, limit, close_limit, stop,
+                &handle,
+                &spawner,
+                &target,
+                socket,
+                tls,
+                local_port,
+                CONNECT_LIMIT,
+                CLOSE_LIMIT,
+                stop,
                 report,
             )
             .await?;
