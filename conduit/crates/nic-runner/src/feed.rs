@@ -65,8 +65,9 @@ pub fn run(
                     line("feed_message", format_args!("#{count} {ticker}"))
                 }
                 Event::Ticker { .. } => {}
-                Event::Read(Summary { count, update_ids }) => {
+                Event::Read(Summary { count, update_ids, latencies }) => {
                     line("feed_count", count);
+                    line("feed_latency", latencies);
                     match update_ids {
                         Some((first, last)) => {
                             line("feed_update_ids", format_args!("{first}..{last}"))

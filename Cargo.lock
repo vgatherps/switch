@@ -819,6 +819,7 @@ dependencies = [
  "binance-feed",
  "dpdk-smoltcp",
  "libc",
+ "nic-clock",
  "sockperf-wire",
  "switchnet",
  "zhida-dpdk-sys",

@@ -26,6 +26,15 @@ pub fn stopped() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
+/// Sets the flag when dropped, so a panicking feed still stops the clock thread its scope joins.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -219,13 +228,26 @@ fn run(args: Args) -> i32 {
         ),
         Mode::Feed(f) => {
             let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-            let result = feed::run(
-                &mut net,
-                f,
-                target.as_ref().unwrap(),
-                feed_socket.expect("feed mode has a socket"),
-                &clock,
-            );
+            // The clock thread reads the port's clock: the scope joins it before the port closes.
+            let stop_clock = AtomicBool::new(false);
+            let result = std::thread::scope(|scope| {
+                let _stop = SetOnDrop(&stop_clock);
+                if nic::read_clock(port_id).is_some() {
+                    scope.spawn(|| match nic::to_housekeeping() {
+                        Ok(()) => nic_clock::run(|| nic::read_clock(port_id), &stop_clock),
+                        Err(e) => line("nic_clock_error", e),
+                    });
+                } else {
+                    line("nic_clock", "none: the port has no readable clock");
+                }
+                feed::run(
+                    &mut net,
+                    f,
+                    target.as_ref().unwrap(),
+                    feed_socket.expect("feed mode has a socket"),
+                    &clock,
+                )
+            });
             stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
             result
         }

@@ -19,7 +19,7 @@ from [crates/netconf-open/examples/tcp_client.rs](../netconf-open/examples/tcp_c
 [docs/USAGE.md](../../docs/USAGE.md).
 
 The package is `nic-runner` and the binary is `zhida-nic`. It depends on `zhida-open`, `zhida-netconf`,
-`dpdk-smoltcp`, `zhida-dpdk-sys`, `switchnet`, `binance-feed` and `sockperf-wire`; nothing depends on it. The modes live
+`dpdk-smoltcp`, `zhida-dpdk-sys`, `switchnet`, `binance-feed`, `nic-clock` and `sockperf-wire`; nothing depends on it. The modes live
 in `src/server.rs` (sockperf-server), `src/feed.rs` and `src/nic.rs` (info), with argument parsing in
 `src/args.rs`. `make test-nic-runner` runs `tests/run.sh` in the Docker image: the `zhida-nic` and
 sockperf-wire unit tests, `sockperf_merge.py --self-test`, then `zhida-nic` against kernel `sockperf`
@@ -215,6 +215,14 @@ client over sheath (TLS 1.3 only), as a switch task on a switchnet Net. data-str
 speaks TLS 1.2 only and is unreachable; stream.binance.com may answer HTTP 451 from restricted
 locations. Output is up to N bookTicker messages, a message count and the update-id range. Success
 requires at least one message and successful read/close.
+
+`feed_latency` gives each message's latency from the NIC's RX stamp of the frame holding its first byte to relay
+handing it over (`nic-clock`): `no_stamp` (unstamped: `rx_timestamps` off or the PMD left no stamp), `not_ready`
+(no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the largest error
+bound and a log2 histogram in ns. If the port's first `rte_eth_read_clock` succeeds (ENA with the DPDK patch in
+`docker/dpdk-ena-read-clock.patch`, on instances with a PHC), a thread on the housekeeping CPUs (online CPUs not
+in /sys/devices/system/cpu/isolated) maps the NIC clock onto the CPU counter; otherwise `nic_clock: none` is
+printed and every stamped message is `not_ready`.
 
 ### 3c. sockperf-server
 ```
