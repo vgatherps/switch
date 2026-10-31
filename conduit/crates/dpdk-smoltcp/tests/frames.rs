@@ -313,7 +313,7 @@ fn bulk_scenario(mut scenario: impl FnMut(&mut Pair, &RefCell<Trace>, &[TcpHandl
             [config(Side::A), config(Side::B)],
             T0,
             512,
-            pool_count(rx_reserve(16, config(Side::A).rx_staging, 8), windows(1500, [BULK])),
+            pool_count(rx_reserve(16, 8, config(Side::A).rx_staging, 8), windows(1500, [BULK])),
             tx_reserve(512, config(Side::A).tx_pending) as u32,
             pool_count(frame_reserve(512, config(Side::A).tx_pending), windows(1500, [BULK])),
         );
@@ -886,7 +886,7 @@ fn bulk_frames_match_committed() {
             [config(Side::A), config(Side::B)],
             T0,
             512,
-            pool_count(rx_reserve(16, config(Side::A).rx_staging, 8), windows(1500, [BULK])),
+            pool_count(rx_reserve(16, 8, config(Side::A).rx_staging, 8), windows(1500, [BULK])),
             tx_reserve(512, config(Side::A).tx_pending) as u32,
             pool_count(frame_reserve(512, config(Side::A).tx_pending), windows(1500, [BULK])),
         );

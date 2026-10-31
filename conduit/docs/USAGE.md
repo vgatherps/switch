@@ -338,7 +338,7 @@ IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` f
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
 `TxPoolTooSmall { count, required }`, a frame pool smaller than `frame_reserve(negotiated TX
 descriptors, tx_pending)` gives `TxFramePoolTooSmall { count, required }`, and an RX pool smaller
-than `rx_reserve(negotiated RX descriptors, rx_staging, RX cache size)` gives
+than `rx_reserve(negotiated RX descriptors, rx_burst, rx_staging, RX cache size)` gives
 `RxPoolTooSmall { count, required }`. These are the only pool checks: sockets added afterwards
 share the pools and are never refused for pool size.
 
@@ -347,15 +347,20 @@ share the pools and are never refused for pool size.
 ### RX reserve and the shared RX share
 
 Socket receive data occupies RX mbufs. Size the RX pool for held data as well as the driver's
-working space. `rx_reserve(rx_descriptors, rx_staging, rx_cache_size) -> usize` computes:
+working space. `rx_reserve(rx_descriptors, rx_burst, rx_staging, rx_cache_size) -> usize` computes:
 
 ```text
-max(rx_descriptors, 32) + rx_staging + floor(3 * rx_cache_size / 2)
+max(rx_descriptors, 32) + low mark + rx_staging + floor(3 * rx_cache_size / 2)
+low mark = max(rx_descriptors, 32) + rx_burst
 ```
 
-The descriptors keep the NIC supplied, staging holds unprocessed packets, and the cache term covers
-one lcore's DPDK cache flush threshold. The 32 minimum also covers memif copy RX: with data waiting,
-it allocates 32 mbufs per call and receives nothing if that allocation fails.
+The descriptors keep the NIC supplied: a NIC keeps its ring posted (ENA refills once
+min(ring / 8, 256) descriptors are empty). Staging holds unprocessed packets, and the cache term
+covers one lcore's DPDK cache flush threshold. The 32 minimum also covers memif copy RX: with data
+waiting, it allocates 32 mbufs per call and receives nothing if that allocation fails. The low
+mark (below) must stay free on top of those, or the pool reads low on every burst and TCP sockets
+never keep out-of-order data. At 1024 RX descriptors, rx_burst 32, staging 32 and cache 8 the
+reserve is 1024 + 1056 + 32 + 12 = 2124.
 `crates/memif-bench/src/memif.rs` documents additional memif room and disconnect requirements.
 
 Size the RX pool as `rx_reserve(...)` plus a share: the RX mbufs all sockets together may hold at
@@ -390,13 +395,9 @@ refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs 
 receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
 at once; while that fails ENA still returns completed packets, but stops receiving once the
 buffers already posted run out. So the check must fire while a refill can still succeed.
-Out-of-order data is kept only while at least that
-many mbufs are free, so size the RX share for it on top of what sockets hold. The free count is
-read only when the last reading no longer rules out "low": only the driver takes RX mbufs, at
-most max(negotiated RX descriptors, 32) posted plus one per packet it returns, so a reading of
-`free` covers the next `free - mark - max(RX descriptors, 32)` received packets. A test driver
-that allocates RX mbufs outside the PMD (the kit's `Link`, with an RX ring larger than 32)
-breaks that bound.
+Out-of-order data is kept only while at least that many mbufs are free; `rx_reserve` counts the
+mark, so a pool of reserve plus share clears it while the sockets together hold at most the
+share.
 While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
 out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
 ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer

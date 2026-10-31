@@ -377,7 +377,7 @@ fn backpressure(eal: &Eal, names: [&str; 2], queued: usize, mode: Mode) -> (Turn
         configs,
         T0,
         4,
-        pair::pool_count(rx_reserve(16, configs[0].rx_staging, 8), pair::windows(1500, [4096])),
+        pair::pool_count(rx_reserve(16, 8, configs[0].rx_staging, 8), pair::windows(1500, [4096])),
         63,
         63,
     );

@@ -259,14 +259,14 @@ fn over_limit_dropped_counted_tcp_progresses() {
 fn add_udp_admits_queues_beyond_the_shared_rx_pool() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpcap", 16, 16);
-        let port_config = fixture.config();
+        let mut port_config = fixture.config();
         let reserve = rx_reserve(
             port_config.rx_descriptors,
+            port_config.rx_burst,
             8,
             port_config.rx_pool.cache_size,
         );
-        let pool = usize::try_from(port_config.rx_pool.count).unwrap();
-        assert_eq!(pool, reserve + 6 + 5);
+        port_config.rx_pool.count = u32::try_from(reserve + 6 + 5).unwrap();
         let mut stack = new_stack(fixture.open_with(eal, port_config), 2);
         let tcp = stack.add_tcp(pair::tcp_socket_sized(4096)).unwrap();
         let udp = stack.add_udp(udp_config(PORT, 5)).unwrap();
@@ -288,6 +288,7 @@ fn removed_socket_held_datagrams_keep_rx_mbufs_until_dropped() {
         let mut port_config = fixture.config();
         let reserve = rx_reserve(
             port_config.rx_descriptors,
+            port_config.rx_burst,
             8,
             port_config.rx_pool.cache_size,
         );

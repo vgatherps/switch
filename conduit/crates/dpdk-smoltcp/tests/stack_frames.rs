@@ -112,14 +112,14 @@ fn frame_pool_admission_refuses() {
     });
 }
 
-/// An RX pool one below `rx_reserve` (16 descriptors floored at 32, staging 8,
-/// cache 8: 52) is refused with the Port returned unchanged; at the reserve the
-/// Stack is built.
+/// An RX pool one below `rx_reserve` (16 descriptors floored at 32, plus the low mark of 32
+/// and the RX burst of 8, staging 8, cache 8: 92) is refused with the Port returned
+/// unchanged; at the reserve the Stack is built.
 #[zhida_test_support::pinned_test]
 fn rx_pool_floor_refuses() {
     with_eal(|eal| {
-        assert_eq!(rx_reserve(16, 8, 8), 52);
-        for count in [51, 52] {
+        assert_eq!(rx_reserve(16, 8, 8, 8), 92);
+        for count in [91, 92] {
             let fixture = RingPort::new("rx_floor", 16, 16);
             let mut port_config = fixture.config();
             port_config.rx_pool.count = count;
@@ -127,13 +127,13 @@ fn rx_pool_floor_refuses() {
             let identity = format!("{port:?}");
             match Stack::new(port, config(8), T) {
                 Err((port, error)) => {
-                    assert_eq!(count, 51);
-                    assert_eq!(error, StackError::RxPoolTooSmall { count: 51, required: 52 });
+                    assert_eq!(count, 91);
+                    assert_eq!(error, StackError::RxPoolTooSmall { count: 91, required: 92 });
                     assert_eq!(format!("{port:?}"), identity);
                     finish(fixture, port);
                 }
                 Ok(stack) => {
-                    assert_eq!(count, 52);
+                    assert_eq!(count, 92);
                     finish(fixture, stack.into_port());
                 }
             }

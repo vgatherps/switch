@@ -83,14 +83,15 @@ impl RingPort {
 
     /// IP MTU 1500, 16 RX descriptors, TX descriptors equal to the TX ring size
     /// (net_ring keeps sent mbufs on that ring, so it bounds what the PMD
-    /// holds), bursts of 8 each way, RX, TX and frame pools of 63 packets with
+    /// holds), bursts of 8 each way, an RX pool of 127 packets (at least
+    /// `rx_reserve` for RX staging up to 43) and TX and frame pools of 63, with
     /// per-lcore cache 8, each with 2048 usable bytes, under this fixture's
     /// pool names.
     pub fn config(&self) -> PortConfig<'_> {
-        fn pool(name: &CStr) -> PoolConfig<'_> {
+        fn pool(name: &CStr, count: u32) -> PoolConfig<'_> {
             PoolConfig {
                 name,
-                count: 63,
+                count,
                 cache_size: 8,
                 data_room_size: RTE_PKTMBUF_HEADROOM as u16 + 2048,
                 socket_id: -1,
@@ -104,9 +105,9 @@ impl RingPort {
             rx_burst: 8,
             tx_burst: 8,
             queue_socket: -1,
-            rx_pool: pool(&self.rx_pool),
-            tx_pool: pool(&self.tx_pool),
-            frame_pool: pool(&self.frame_pool),
+            rx_pool: pool(&self.rx_pool, 127),
+            tx_pool: pool(&self.tx_pool, 63),
+            frame_pool: pool(&self.frame_pool, 63),
             offloads: Offloads::default(),
         }
     }

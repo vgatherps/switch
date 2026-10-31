@@ -20,8 +20,10 @@ use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, Stack, UdpConfig, UdpHandle, 
 
 /// Each socket's receive and send buffer: 180 RX frames at IP MTU 1500.
 const WINDOW: usize = 256 * 1024;
-/// RX mbufs each Stack's pool holds beyond its reserve.
-const RX_SHARE: usize = 64;
+/// RX mbufs each Stack's pool holds beyond its reserve. net_ring posts no RX mbufs, so the
+/// sockets can also take the reserve's posted-buffer and low-mark room: each pool holds 140
+/// mbufs in all, fewer than one window of frames.
+const RX_SHARE: usize = 24;
 const UDP_PORT: u16 = 7000;
 
 /// `sockets` TCP and `udp` UDP slots per side; RX pools of the reserve plus `RX_SHARE`,
@@ -33,7 +35,7 @@ fn shared_pair(eal: &Eal, names: [&str; 2], sockets: usize, udp: usize) -> Pair 
     });
     Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
         let stack = configs[side.index()];
-        let reserve = rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size);
+        let reserve = rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size);
         port.rx_pool.count = pool_count(reserve, RX_SHARE);
         let queues = windows(port.mtu, std::iter::repeat_n(WINDOW, sockets));
         port.frame_pool.count = pool_count(frame_reserve(port.tx_descriptors, stack.tx_pending), queues);
@@ -43,7 +45,7 @@ fn shared_pair(eal: &Eal, names: [&str; 2], sockets: usize, udp: usize) -> Pair 
 /// B's RX pool count in a `shared_pair`: the kit's RingPort has 16 RX descriptors and an
 /// RX cache of 8.
 fn b_rx_pool() -> usize {
-    rx_reserve(16, many::config(Side::B, 1).rx_staging, 8) + RX_SHARE
+    rx_reserve(16, 8, many::config(Side::B, 1).rx_staging, 8) + RX_SHARE
 }
 
 /// The Stack's low mark on the kit's RingPort: its 16 RX descriptors floored at 32, plus the

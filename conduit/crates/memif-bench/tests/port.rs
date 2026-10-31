@@ -62,7 +62,7 @@ fn tiny_segments_keep_memif_bulk_reserve() {
     // One byte above the stack's 64-byte append limit: each segment keeps its own RX mbuf.
     const SEGMENT: usize = 65;
     let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
-    let reserve = rx_reserve(64, usize::from(BURST), 8);
+    let reserve = rx_reserve(64, BURST, usize::from(BURST), 8);
     // Room for two sockets' RX frame caps beyond the reserve.
     let pool_count = u32::try_from(reserve + 2 * cap).unwrap();
     let names = names("tinyreserve");
@@ -231,7 +231,7 @@ fn out_of_order_receiver_keeps_memif_receiving() {
     const SEGMENT: usize = 1460;
     /// Segments after the first, each within the 65535-byte window.
     const LATER: usize = 40;
-    let pool_count = u32::try_from(rx_reserve(64, STAGING, 8) + 32).unwrap();
+    let pool_count = u32::try_from(rx_reserve(64, SERVER_BURST, STAGING, 8) + 32).unwrap();
     let names = names("oooreader");
     let (server, mut client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = config(id, rx, tx, frame);

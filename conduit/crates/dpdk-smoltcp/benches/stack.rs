@@ -245,6 +245,7 @@ fn tcp_bench(c: &mut Criterion, eal: &Eal) -> Templates {
     let mut pair = Pair::with_ports(eal, ["sbta", "sbtb"], configs, T0, 16, |side, port| {
         port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
             port.rx_descriptors,
+            port.rx_burst,
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         ), zhida_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));

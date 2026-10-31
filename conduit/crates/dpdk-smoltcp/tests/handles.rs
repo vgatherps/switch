@@ -22,6 +22,7 @@ fn new_pair(eal: &Eal, names: [&str; 2]) -> Pair {
     Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
         let reserve = rx_reserve(
             port.rx_descriptors,
+            port.rx_burst,
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         );
@@ -94,6 +95,7 @@ fn connect_pair(eal: &Eal, names: [&str; 2]) -> Pair {
     Pair::with_ports(eal, names, configs, T0, 16, |side, port| {
         let reserve = rx_reserve(
             port.rx_descriptors,
+            port.rx_burst,
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         );
@@ -530,6 +532,7 @@ fn udp_drop_frees_port() {
         let mut pair = Pair::with_ports(eal, ["h_udpa", "h_udpb"], configs, T0, 16, |side, port| {
             let reserve = rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             );
@@ -588,6 +591,7 @@ fn stack_drop_with_live_sockets_returns_mbufs() {
         let mut pair = Pair::with_ports(eal, ["h_livea", "h_liveb"], configs, T0, 16, |side, port| {
             let reserve = rx_reserve(
                 port.rx_descriptors,
+                port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
             );
@@ -646,7 +650,7 @@ fn plain_stack_drop_with_live_sockets_releases_pools() {
             };
             let fixture = &fixtures[side.index()];
             let mut port = fixture.config();
-            let reserve = rx_reserve(port.rx_descriptors, config.rx_staging, port.rx_pool.cache_size);
+            let reserve = rx_reserve(port.rx_descriptors, port.rx_burst, config.rx_staging, port.rx_pool.cache_size);
             port.rx_pool.count = u32::try_from(reserve + 6 + 2).unwrap();
             match Stack::new(fixture.open_with(eal, port), config, T0) {
                 Ok(stack) => stack,
@@ -810,6 +814,7 @@ fn dropped_udp_is_cleaned_at_each_entry() {
             let mut pair = Pair::with_ports(eal, ["h_entrya", "h_entryb"], configs, T0, 16, |side, port| {
                 let reserve = rx_reserve(
                     port.rx_descriptors,
+                    port.rx_burst,
                     configs[side.index()].rx_staging,
                     port.rx_pool.cache_size,
                 );

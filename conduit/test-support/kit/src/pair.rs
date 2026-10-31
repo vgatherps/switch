@@ -126,7 +126,7 @@ impl Pair {
                 u32::try_from(reserve + SHARE).expect("pool count fits u32")
             };
             port.rx_pool.count =
-                share(rx_reserve(port.rx_descriptors, stack.rx_staging, port.rx_pool.cache_size));
+                share(rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size));
             port.frame_pool.count = share(frame_reserve(port.tx_descriptors, stack.tx_pending));
         })
     }
@@ -187,6 +187,7 @@ impl Pair {
             let floor = |reserve: usize| u32::try_from(reserve).expect("pool count fits u32");
             config.rx_pool.count = config.rx_pool.count.max(floor(rx_reserve(
                 config.rx_descriptors,
+                config.rx_burst,
                 stack.rx_staging,
                 config.rx_pool.cache_size,
             )));

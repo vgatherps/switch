@@ -18,11 +18,12 @@ mod open;
 pub use open::{open, OpenError, OpenReport, Opened};
 
 const CACHE: u32 = 8;
+const RX_BURST: u16 = 32;
 
 /// What the application needs from the Port and Stack.
 ///
 /// Every field is required. The RX pool holds the driver's working space
-/// (`rx_reserve` over the adjusted RX descriptors and `rx_staging`) plus
+/// (`rx_reserve` over the adjusted RX descriptors, the RX burst and `rx_staging`) plus
 /// `rx_share`. The frame pool holds `frame_reserve` over the adjusted TX
 /// descriptors and `tx_pending` plus `frame_share`. Every socket draws on the
 /// shares; none is reserved per socket.
@@ -73,7 +74,7 @@ fn port_config(
     sizing: &Sizing,
 ) -> Result<PortConfig<'static>, String> {
     let rx_count = u32::try_from(
-        rx_reserve(rx_desc, sizing.rx_staging, CACHE)
+        rx_reserve(rx_desc, RX_BURST, sizing.rx_staging, CACHE)
             .checked_add(sizing.rx_share)
             .ok_or("RX pool count exceeds u32")?,
     )
@@ -106,7 +107,7 @@ fn port_config(
         mtu,
         rx_descriptors: rx_desc,
         tx_descriptors: tx_desc,
-        rx_burst: 32,
+        rx_burst: RX_BURST,
         tx_burst: 32,
         queue_socket: -1,
         rx_pool: pool(c"nic_rx", rx_count, rx_room)?,
@@ -198,7 +199,7 @@ mod tests {
             let held = u32::from(adjusted.1) + u32::try_from(sizing.tx_pending).unwrap();
             assert_eq!(config.tx_pool.count, held);
             assert_eq!(config.frame_pool.count, held + 1 + u32::try_from(sizing.frame_share).unwrap());
-            let reserve = rx_reserve(adjusted.0, sizing.rx_staging, CACHE);
+            let reserve = rx_reserve(adjusted.0, config.rx_burst, sizing.rx_staging, CACHE);
             assert_eq!(config.rx_pool.count, u32::try_from(reserve + sizing.rx_share).unwrap());
         }
     }

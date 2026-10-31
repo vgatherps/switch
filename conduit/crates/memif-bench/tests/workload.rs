@@ -171,7 +171,7 @@ fn bare_socket() -> tcp::Config {
 
 /// The RX reserve plus one `bare_socket`'s RX frame cap.
 fn one_socket_rx_pool(config: &dpdk_smoltcp::PortConfig<'_>) -> u32 {
-    let reserve = rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size);
+    let reserve = rx_reserve(config.rx_descriptors, config.rx_burst, 32, config.rx_pool.cache_size);
     u32::try_from(reserve + tcp::rx_mbuf_budget(&bare_socket(), usize::from(config.mtu))).unwrap()
 }
 
@@ -255,7 +255,7 @@ fn bulk_poll_sends_two_pending_queues() {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.server_rx.as_c_str() {
             config.rx_pool.count = u32::try_from(
-                rx_reserve(config.rx_descriptors, 32, config.rx_pool.cache_size)
+                rx_reserve(config.rx_descriptors, config.rx_burst, 32, config.rx_pool.cache_size)
                     .checked_add(tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)))
                     .expect("peer RX pool count fits usize"),
             ).expect("peer RX pool count fits u32");

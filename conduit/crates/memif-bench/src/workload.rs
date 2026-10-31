@@ -162,7 +162,7 @@ pub fn port_config<'a>(
         rx_pool: PoolConfig {
             name: rx_pool,
             // Beyond the reserve, one connection's full receive window, shared by all.
-            count: u32::try_from(rx_reserve(64, RX_STAGING, POOL_CACHE) + tcp::rx_mbuf_budget(&socket(), 1500))
+            count: u32::try_from(rx_reserve(64, BURST, RX_STAGING, POOL_CACHE) + tcp::rx_mbuf_budget(&socket(), 1500))
                 .expect("RX pool count fits u32"),
             cache_size: POOL_CACHE,
             data_room_size: headroom + BUFFER_SIZE,

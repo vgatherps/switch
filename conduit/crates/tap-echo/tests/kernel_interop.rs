@@ -165,7 +165,7 @@ fn port_config(port_id: u16, size: PortSize, buffer: usize) -> PortConfig<'stati
         rx_burst: 32,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(RX_POOL, count(rx_reserve(16, 32, 8) + tcp::rx_mbuf_budget(&socket, mtu))),
+        rx_pool: pool(RX_POOL, count(rx_reserve(16, 32, 32, 8) + tcp::rx_mbuf_budget(&socket, mtu))),
         tx_pool: pool(TX_POOL, 127),
         frame_pool: pool(
             FRAME_POOL,

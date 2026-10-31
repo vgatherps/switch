@@ -54,7 +54,7 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
         let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
         let configs = [pair::config(Side::A), pair::config(Side::B)];
         let count = pair::pool_count(
-            dpdk_smoltcp::rx_reserve(16, configs[0].rx_staging, 8),
+            dpdk_smoltcp::rx_reserve(16, 8, configs[0].rx_staging, 8),
             pair::windows(1500, [CAPACITY]),
         );
         let mut pair = Pair::with_ports(
@@ -699,6 +699,7 @@ fn two_stack_mixed_sizes_follow_mbuf_window() {
                 port.rx_pool.count = pair::pool_count(
                     dpdk_smoltcp::rx_reserve(
                         port.rx_descriptors,
+                        port.rx_burst,
                         pair::config(Side::A).rx_staging,
                         port.rx_pool.cache_size,
                     ),

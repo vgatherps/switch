@@ -207,7 +207,7 @@ fn port_config(port_id: u16, buffer: usize) -> PortConfig<'static> {
         rx_pool: pool(
             RX_POOL,
             count(
-                rx_reserve(DESCRIPTORS, RX_STAGING, POOL_CACHE),
+                rx_reserve(DESCRIPTORS, BURST, RX_STAGING, POOL_CACHE),
                 tcp::rx_mbuf_budget(&socket, usize::from(MTU)),
             ),
         ),
