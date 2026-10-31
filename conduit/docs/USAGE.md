@@ -396,7 +396,11 @@ at once; while that fails ENA still returns completed packets, but stops receivi
 buffers already posted run out. So the check must fire while a refill can still succeed.
 Out-of-order data is kept only while at least that many mbufs are free; `rx_reserve` counts the
 mark, so a pool of reserve plus share clears it while the sockets together hold at most the
-share.
+share. The free count is read only when the last reading no longer rules out "low": only the
+driver takes RX mbufs, at most max(negotiated RX descriptors, 32) posted plus one per packet it
+returns, so a reading of `free` covers the next `free - mark - max(RX descriptors, 32)` received
+packets. A test driver that allocates RX mbufs outside the PMD (the kit's `Link`, with an RX ring
+larger than 32) breaks that bound.
 While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
 out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
 ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer

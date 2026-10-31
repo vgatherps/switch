@@ -435,7 +435,7 @@ impl Stack {
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
         let received = burst.accepted + burst.rejected;
         if received != 0 {
-            self.iface.set_rx_pool_low(self.device.rx_pool_low());
+            self.iface.set_rx_pool_low(self.device.rx_pool_low(received));
         }
         self.iface.poll_maintenance(now);
 

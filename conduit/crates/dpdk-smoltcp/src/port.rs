@@ -458,8 +458,8 @@ pub struct Port {
     /// TX data room after headroom: the largest `alloc_tx` length.
     tx_room: u16,
     descriptors: (u16, u16),
-    /// The RX pool is low below this many free mbufs; see `rx_pool_low`.
-    rx_low_mark: usize,
+    /// Whether the RX pool is low; see `rx_pool_low`.
+    rx_pressure: RxPressure,
     rx: ManuallyDrop<PoolResources>,
     tx: ManuallyDrop<PoolResources>,
     /// This Port's clone of the frame pool; other clones may outlive the Port.
@@ -608,7 +608,7 @@ impl Port {
             // `data_room_size` >= headroom + frame was checked above.
             tx_room: config.tx_pool.data_room_size - RTE_PKTMBUF_HEADROOM as u16,
             descriptors: (config.rx_descriptors, config.tx_descriptors),
-            rx_low_mark: rx_low_mark(config.rx_descriptors, config.rx_burst),
+            rx_pressure: RxPressure::new(config.rx_descriptors, config.rx_burst),
             rx: ManuallyDrop::new(rx),
             tx: ManuallyDrop::new(tx),
             frame_origin: NonNull::new(frame_pool.mempool()).expect("a frame pool has a mempool").cast(),
@@ -674,7 +674,7 @@ impl Port {
             }
         }
         self.descriptors = (rx_desc, tx_desc);
-        self.rx_low_mark = rx_low_mark(rx_desc, self.rx_burst_size());
+        self.rx_pressure = RxPressure::new(rx_desc, self.rx_burst_size());
         let mut rxconf = info.default_rxconf;
         rxconf.offloads = 0;
         rxconf.rx_deferred_start = 0;
@@ -762,11 +762,22 @@ impl Port {
         u16::try_from(self.rx_scratch.len()).expect("rx_burst is a u16")
     }
 
-    /// Whether the RX mbufs this lcore can allocate (the RX pool's backing store plus this
-    /// lcore's cache, which the PMD refills from) fall short of the low mark (`rx_low_mark`).
+    /// After an RX burst that returned `received` packets (accepted and rejected), whether the
+    /// RX mbufs this lcore can allocate (the RX pool's backing store plus this lcore's cache,
+    /// which the PMD refills from) fall short of the low mark (`rx_low_mark`). Reads the free
+    /// count only when its last reading does not already rule that out (`RxPressure`).
     #[inline]
-    pub(crate) fn rx_pool_low(&self) -> bool {
-        (self.rx.pool().free_count() as usize) < self.rx_low_mark
+    pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
+        if self.rx_pressure.covers(received) {
+            return false;
+        }
+        self.read_rx_pool_low()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_rx_pool_low(&mut self) -> bool {
+        self.rx_pressure.read(self.rx.pool().free_count() as usize)
     }
 
     pub(crate) fn tx_pool_count(&self) -> usize {
@@ -1055,6 +1066,50 @@ fn check_configuration(mtu: u16, offloads: Offloads, conf: &rte_eth_conf) -> Res
         }
     }
     Ok(())
+}
+
+/// The most RX mbufs a driver holds posted for receive: max(RX descriptors, 32). A NIC posts
+/// at most one per descriptor; memif copy mode posts none between receives.
+fn rx_posted(rx_descriptors: u16) -> usize {
+    usize::from(rx_descriptors.max(32))
+}
+
+/// Whether the RX pool is below its low mark, reading its free count only when needed.
+///
+/// Only the driver takes RX mbufs from the pool, inside its RX burst: buffers it posts, at most
+/// `rx_posted`, and one per packet it returns. So the free count can fall by at most `posted`
+/// plus the packets received since a reading. A reading of `free` therefore rules out "below
+/// the mark" for the next `free - low_mark - posted` received packets, and no reading is needed
+/// until they are used up: the answer is the one an exact reading would give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RxPressure {
+    low_mark: usize,
+    posted: usize,
+    /// Packets that may still be received before the pool could fall below the low mark.
+    unchecked: usize,
+}
+
+impl RxPressure {
+    fn new(rx_descriptors: u16, rx_burst: u16) -> Self {
+        Self { low_mark: rx_low_mark(rx_descriptors, rx_burst), posted: rx_posted(rx_descriptors), unchecked: 0 }
+    }
+
+    /// Count `received` packets against the last reading; `true` while it still rules out low.
+    #[inline]
+    fn covers(&mut self, received: usize) -> bool {
+        if received <= self.unchecked {
+            self.unchecked -= received;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take a reading of `free` mbufs: whether the pool is low now.
+    fn read(&mut self, free: usize) -> bool {
+        self.unchecked = free.saturating_sub(self.low_mark + self.posted);
+        free < self.low_mark
+    }
 }
 
 fn importable(m: &rte_mbuf, rx_pool: *mut rte_mempool) -> bool {
