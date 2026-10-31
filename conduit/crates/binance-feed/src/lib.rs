@@ -290,7 +290,8 @@ pub struct Latencies {
     /// Samples by ns: bucket 0 holds ns <= 0, bucket i holds [2^(i-1), 2^i), bucket 31 holds
     /// ns >= 2^30 (about 1.07 s).
     pub buckets: [u64; 32],
-    /// The largest error bound of a sample.
+    /// Largest mapper sampling uncertainty under the mapper's assumptions, not a measured
+    /// bound on cross-interface skew or AWS clock error.
     pub max_bound_ns: u64,
 }
 
@@ -312,13 +313,13 @@ impl Latencies {
     }
 }
 
-/// `no_stamp=N not_ready=N impossible=N max_bound_ns=N`, then `<=0:N`, `<lo>..<hi>:N` and
+/// `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N`, then `<=0:N`, `<lo>..<hi>:N` and
 /// `1073741824..:N` (ns) for each nonempty bucket.
 impl fmt::Display for Latencies {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no_stamp={} not_ready={} impossible={} max_bound_ns={}",
+            "no_stamp={} not_ready={} impossible={} max_mapping_bound_ns={}",
             self.no_stamp, self.not_ready, self.impossible, self.max_bound_ns
         )?;
         for (i, &count) in self.buckets.iter().enumerate().filter(|(_, &count)| count > 0) {
@@ -488,7 +489,7 @@ mod tests {
         latencies.buckets[31] = 1;
         assert_eq!(
             latencies.to_string(),
-            "no_stamp=0 not_ready=0 impossible=1 max_bound_ns=40 <=0:2 8192..16384:5 1073741824..:1"
+            "no_stamp=0 not_ready=0 impossible=1 max_mapping_bound_ns=40 <=0:2 8192..16384:5 1073741824..:1"
         );
     }
 
@@ -501,7 +502,7 @@ mod tests {
         write_latency(&mut output, "test", latencies, || false).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "test: feed_latency: no_stamp=2 not_ready=0 impossible=0 max_bound_ns=0\n"
+            "test: feed_latency: no_stamp=2 not_ready=0 impossible=0 max_mapping_bound_ns=0\n"
         );
     }
 }

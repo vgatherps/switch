@@ -109,7 +109,7 @@ host() {
     printf '%s\n' 'default via 10.0.0.1 dev ens6 proto dhcp src 10.0.0.20 metric 513' \
         'default via 10.0.0.1 dev ens5 proto dhcp src 10.0.0.10 metric 512' >"$tmp/routes"
 }
-want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1,2,3,4,5,6 transparent_hugepage=madvise hugepagesz=2M hugepages=0:512"
+want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1,2,3,4,5,6 transparent_hugepage=madvise hugepagesz=2M hugepages=0:512 ena.phc_enable=1"
 # What the reboot changes: the kernel command line, the modules, and what the kernel then reports.
 reboot() {
     echo "ro console=ttyS0 $want_args" >"$root/proc/cmdline"
@@ -200,9 +200,20 @@ check "run-binance refuses while verify fails" sh -c "[ $? = 1 ] && ! grep -q '^
 echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489' >>"$root/var/log/zhida/binance.log"
 run verify
 check "the last run's own report is what counts" has pools "ok last run took 23 of 512"
+# A missing or ordinary file cannot stand in for the real PHC device.
 : >"$calls"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
+check "missing PHC refuses before launching feed" sh -c "[ $? = 1 ] && ! grep -q '^taskset' '$calls'"
+: >"$root/dev/ptp_ena"
+: >"$calls"
+HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "ordinary file PHC refuses before launching feed" sh -c "[ $? = 1 ] && ! grep -q '^taskset' '$calls'"
+rm "$root/dev/ptp_ena"
+# The fake tree uses an existing character device; the real feed validates clock reads.
+ln -s /dev/null "$root/dev/ptp_ena"
+: >"$calls"
+HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5 --phc /dev/ptp_ena"
 check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/binance.json"
 check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/zhida/binance.json' | cmp -s - '$root/etc/zhida/dut.json'"
 check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"

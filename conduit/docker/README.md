@@ -703,7 +703,7 @@ binance-feed: feed_message: #8 u=102142966982 BTCUSDT bid 77506.56000000 x 1.209
 binance-feed: feed_message: #9 u=102142966983 BTCUSDT bid 77506.56000000 x 1.20962000 ask 77506.57000000 x 2.01645000
 binance-feed: feed_message: #10 u=102142967031 BTCUSDT bid 77506.56000000 x 1.30112000 ask 77506.57000000 x 2.01645000
 binance-feed: feed_count: 145
-binance-feed: feed_latency: no_stamp=145 not_ready=0 impossible=0 max_bound_ns=0
+binance-feed: feed_latency: no_stamp=145 not_ready=0 impossible=0 max_mapping_bound_ns=0
 binance-feed: feed_update_ids: 102142966886..102142968048
 binance-feed: feed_close: WebSocket close handshake, TLS close_notify, FIN
 ```

@@ -218,7 +218,7 @@ systemctl enable --now zhida-deadman.timer
 
 def latency_text(value):
     """zhida-nic's feed_latency value (conduit/crates/binance-feed/src/lib.rs, Display for Latencies:
-    `no_stamp=N not_ready=N impossible=N max_bound_ns=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
+    `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
     per nonempty log2 ns bucket, ascending) -> those counts and the buckets holding p50/p99/p99.9/max
     of the sampled messages. Anything else (`latency invalid: NIC clock jumped`) is the reason as is."""
     words = value.split()
@@ -798,14 +798,18 @@ def binance(args, env=None):
             json.dump([info], f, indent=1)
         host = env.host(info, key_path, run_dir)
         host.wait_ssh()
+        log("Binance host ready (SSH available); setup started")
         ok, text = host.install(archive)
         with open(os.path.join(run_dir, "verify.txt"), "w") as f:
             f.write(text + "\n")
         if not ok:
             raise RuntimeError(f"host setup failed:\n{text}")
+        log("Binance host setup finished (verify passed)")
         try:
+            log("Binance feed started (requesting remote run)")
             code = host.root(f"mkdir -p {REMOTE} && {SRC_DIR}/deploy/run-binance.sh --seconds {args.seconds}"
                              f" > {FEED_OUT} 2>&1", check=False, timeout=args.seconds + FEED_MARGIN_S).returncode
+            log(f"Binance feed finished (remote exit {code})")
         finally:
             fetch_errors = [e for e in (host.fetch(BINANCE_LOG, run_dir), host.fetch(FEED_OUT, run_dir)) if e]
             for e in fetch_errors:
