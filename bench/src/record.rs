@@ -15,6 +15,7 @@ pub struct Recorder {
     measured_from: u64,
     /// Messages `measured_from..end` are measured.
     end: u64,
+    /// Messages `0..end` echoed so far: each counts at its first echo only.
     seen: Vec<u64>,
     pub latency: Histogram,
     pub received: u64,
@@ -37,7 +38,7 @@ impl Recorder {
         window: [u64; 2],
     ) -> Recorder {
         assert!(measured_from <= end);
-        let words = (end - measured_from).div_ceil(64) as usize;
+        let words = end.div_ceil(64) as usize;
         Recorder {
             step,
             schedule,
@@ -65,19 +66,16 @@ impl Recorder {
         if k >= self.end || header.sched_ns != self.schedule.due_at(k) {
             return;
         }
-        let in_window = (self.window[0]..self.window[1]).contains(&now_ns);
-        if k < self.measured_from {
-            self.received_in_window += u64::from(in_window);
-            return;
-        }
-        let bit = k - self.measured_from;
-        let (word, mask) = ((bit / 64) as usize, 1u64 << (bit % 64));
+        let (word, mask) = ((k / 64) as usize, 1u64 << (k % 64));
         if self.seen[word] & mask != 0 {
             return;
         }
         self.seen[word] |= mask;
+        self.received_in_window += u64::from((self.window[0]..self.window[1]).contains(&now_ns));
+        if k < self.measured_from {
+            return;
+        }
         self.received += 1;
-        self.received_in_window += u64::from(in_window);
         self.latency.record(now_ns.saturating_sub(header.sched_ns));
     }
 
@@ -181,5 +179,24 @@ mod tests {
         r.record(&message(2, &s, 3), 10_000); // after the window
         assert_eq!(r.received_in_window, 2);
         assert_eq!(r.received, 2);
+    }
+
+    /// A warmup message echoed twice counts once in the window, at its first echo: a copy
+    /// arriving inside the window after the first arrived before it, or a second copy inside
+    /// it, is not another receive.
+    #[test]
+    fn a_duplicated_warmup_echo_counts_once() {
+        let s = Schedule {
+            senders: 1,
+            interval_ns: 1000,
+            origin_ns: 0,
+        };
+        let mut r = Recorder::new(0, s, 2, 10, [2000, 10_000]);
+        r.record(&message(0, &s, 0), 1999); // before the window
+        r.record(&message(0, &s, 0), 2500); // its duplicate, inside
+        r.record(&message(0, &s, 1), 2100);
+        r.record(&message(0, &s, 1), 2200); // its duplicate
+        assert_eq!(r.received_in_window, 1);
+        assert_eq!(r.received, 0);
     }
 }
