@@ -241,7 +241,7 @@ SHARED_INFO = {"vpc": "vpc-1", "subnet": "subnet-1", "zone": "apne1-az4", "sg": 
 class LaunchTest(unittest.TestCase):
     def test_one_run_instances_of_six_into_the_placement_group_then_eni_attach(self):
         ec2 = FakeLaunchEc2()
-        aws = z.Aws("ap-northeast-1", {"ec2": ec2, "iam": None, "s3": None, "ssm": FakeSsm(), "sts": None})
+        aws = launch_aws(ec2)
         hosts = aws.launch_hosts(SHARED_INFO, "r1", NOW + datetime.timedelta(hours=2), NOW)
         names = [c[0] for c in ec2.calls]
         self.assertEqual(names.count("run_instances"), 1)
@@ -386,9 +386,127 @@ class FakeHost:
         return None
 
 
+class FakeSts:
+    def __init__(self, error=None):
+        self.error = error
+
+    def get_caller_identity(self):
+        if self.error:
+            raise self.error
+        return {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/owner"}
+
+
+class FakeQuotas:
+    def __init__(self, value, error=None):
+        self.value, self.error = value, error
+
+    def get_service_quota(self, ServiceCode, QuotaCode):
+        assert (ServiceCode, QuotaCode) == ("ec2", "L-1216C47A")
+        if self.error:
+            raise self.error
+        return {"Quota": {"Value": float(self.value)}}
+
+
+def running(itype, vcpus, spot=False):
+    i = {"InstanceType": itype, "CpuOptions": {"CoreCount": vcpus, "ThreadsPerCore": 1}}
+    if spot:
+        i["InstanceLifecycle"] = "spot"
+    return i
+
+
+class FakeQuotaEc2:
+    """describe_instances (running/pending) over two pages."""
+
+    def __init__(self, instances):
+        self.instances = instances
+
+    def get_paginator(self, name):
+        assert name == "describe_instances"
+        instances = self.instances
+
+        class P:
+            def paginate(self, Filters):
+                assert Filters == [{"Name": "instance-state-name", "Values": ["pending", "running"]}]
+                yield {"Reservations": [{"Instances": instances[:1]}]}
+                yield {"Reservations": [{"Instances": instances[1:]}]}
+        return P()
+
+
+class ClientError(Exception):
+    def __init__(self, code, message):
+        super().__init__(f"An error occurred ({code}): {message}")
+        self.response = {"Error": {"Code": code, "Message": message}}
+
+
+def launch_aws(ec2):
+    return z.Aws("ap-northeast-1", {"ec2": ec2, "iam": None, "s3": None, "ssm": FakeSsm(), "sts": None,
+                                    "service-quotas": None})
+
+
+class PreflightTest(unittest.TestCase):
+    def check(self, quota=96, instances=(), sts_error=None, quota_error=None, local=None):
+        aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances)), "iam": None, "s3": None, "ssm": None,
+                                       "sts": FakeSts(sts_error), "service-quotas": FakeQuotas(quota, quota_error)})
+        env = z.Env(aws=lambda region: aws, local=local or (lambda argv, **kw: Proc(0, "")))
+        return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1")[0]}
+
+    def test_all_pass(self):
+        r = self.check(quota=96, instances=[running("c7g.4xlarge", 16), running("m5.large", 2, spot=True)])
+        self.assertEqual(r["source"], (True, "clean, HEAD has deploy/hft-host.sh"))
+        self.assertEqual(r["credentials"], (True, "account 123456789012 as arn:aws:iam::123456789012:user/owner"))
+        self.assertEqual(r["quota"], (True, "L-1216C47A 96 vCPUs, 16 in use, 80 free, need 48"))
+
+    def test_quota_minus_running_on_demand_vcpus(self):
+        # 16 on-demand vCPUs in use (spot is another quota): 64 leaves exactly 48, 63 not
+        instances = [running("c7gn.2xlarge", 8), running("t3.large", 2), running("r7g.xlarge", 4),
+                     running("g5.large", 2), running("c7g.8xlarge", 32, spot=True)]
+        self.assertEqual(self.check(quota=64, instances=instances)["quota"],
+                         (True, "L-1216C47A 64 vCPUs, 16 in use, 48 free, need 48"))
+        ok, detail = self.check(quota=63, instances=instances)["quota"]
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("L-1216C47A 63 vCPUs, 16 in use, 47 free, need 48: request"), detail)
+
+    def test_fresh_account_quota_fails_with_the_fix(self):
+        ok, detail = self.check(quota=5)["quota"]
+        self.assertFalse(ok)
+        self.assertEqual(detail, "L-1216C47A 5 vCPUs, 0 in use, 5 free, need 48: request an increase in Service"
+                                 " Quotas (ap-northeast-1, EC2, Running On-Demand Standard)")
+
+    def test_no_credentials(self):
+        r = self.check(sts_error=Exception("Unable to locate credentials"))
+        self.assertEqual(r["credentials"], (False, "Unable to locate credentials"))
+        self.assertEqual(r["quota"], (False, "not checked without credentials"))
+
+    def test_quota_api_denied(self):
+        r = self.check(quota_error=ClientError("AccessDeniedException", "not authorized: servicequotas:GetServiceQuota"))
+        self.assertFalse(r["quota"][0])
+        self.assertIn("servicequotas:GetServiceQuota", r["quota"][1])
+
+    def test_dirty_tree_and_missing_hft_host(self):
+        def local(argv, **kw):
+            if "status" in argv:
+                return Proc(0, " M bench/src/main.rs\n")
+            return Proc(128 if "cat-file" in argv else 0, "")
+
+        ok, detail = self.check(local=local)["source"]
+        self.assertFalse(ok)
+        self.assertIn("commit these tracked changes first:\nM bench/src/main.rs", detail)
+        self.assertIn("HEAD has no deploy/hft-host.sh", detail)
+
+    def test_preflight_command_fails_clearly(self):
+        aws = z.Aws("r", {"ec2": None, "iam": None, "s3": None, "ssm": None, "sts": FakeSts(Exception("expired token")),
+                          "service-quotas": None})
+        env = z.Env(aws=lambda region: aws, local=lambda argv, **kw: Proc(0, ""))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, "preflight failed; nothing was created"):
+            z.main(["preflight"], env)
+        self.assertIn("preflight credentials: FAIL expired token", out.getvalue())
+
+
 class FakeAws:
     def __init__(self, world):
-        self.w, self.ec2 = world, object()
+        self.w, self.ec2 = world, FakeQuotaEc2([])
+        self.sts, self.quotas = FakeSts(), FakeQuotas(96)
 
     def ensure_shared(self, my_ip):
         self.w.calls.append(("aws", f"ensure_shared {my_ip}"))
@@ -542,13 +660,18 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(self.w.clean_calls), 1)
         self.assertEqual([a for a in self.w.local_calls if a[1].endswith("report.py")], [])
 
-    def test_dirty_tree_refused_before_any_aws_call(self):
+    def test_dirty_tree_refused_before_anything_is_created(self):
         def local(argv, **kw):
+            self.w.local_calls.append(argv)
             return Proc(0, " M bench/src/main.rs\n")
 
-        env = z.Env(aws=lambda r: self.fail("AWS touched"), local=local, now=lambda: NOW)
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "commit these"):
+        env = z.Env(aws=lambda r: FakeAws(self.w), local=local, now=lambda: NOW)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, "preflight failed"):
             z.run(argparse.Namespace(region="r", ttl="2h", out=self.out), env)
+        self.assertIn("preflight source: FAIL the hosts build `git archive HEAD`", out.getvalue())
+        self.assertEqual(self.w.calls, [])
+        self.assertEqual(os.listdir(self.out), [])
 
 
 class BootstrapTest(unittest.TestCase):

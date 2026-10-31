@@ -2,11 +2,21 @@
 """zhida-aws-bench: the latency/load bench on EC2 in one command, 1 receiver + 5 sender hosts.
 
   zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
+  zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
   zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
   zhida_aws_bench.py cleanup --run-id ID
 
 Needs python3 with boto3, ssh, scp, ssh-keygen, git, a clean committed tree (the hosts build
 `git archive HEAD`) and AWS credentials for the region. Design: plans/bench/design.md.
+`preflight` (also the first step of `run`) checks the tree, the credentials and the on-demand
+Standard vCPU quota (L-1216C47A: 48 free) before anything is created.
+
+Permissions the caller needs: ec2 (VPC, subnet, internet gateway, route table, security group,
+placement group, key pair, run/terminate/describe instances, create/attach/delete/modify network
+interfaces, delete volumes, create tags, describe instance type offerings), ssm:GetParameter (the
+AL2023 AMI), s3 (create/tag/delete bucket, list/delete object versions), iam (create/delete role,
+role policy, instance profile; add/remove role to instance profile; iam:PassRole on
+zhida-bench-host), sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 
 `run` provisions six c7gn.2xlarge on-demand instances (one run_instances) in one cluster placement
 group, one data ENI each; builds natively (bootstrap.sh, `deploy/hft-host.sh build`, S3 cache keyed
@@ -65,6 +75,7 @@ TEARDOWN_MARGIN_S = 10 * 60
 CLOCK_LIMIT_S = 0.001
 BOOTSTRAP_S = 3600
 SETUP_REBOOT_S = 900
+QUOTA_CODE = "L-1216C47A"
 
 
 def log(msg):
@@ -258,13 +269,16 @@ def error_code(e):
 class Aws:
     def __init__(self, region, clients=None):
         if clients is None:
-            import boto3
+            try:
+                import boto3
+            except ImportError:
+                raise SystemExit("boto3 is not importable: pip3 install boto3") from None
 
             session = boto3.session.Session(region_name=region)
-            clients = {n: session.client(n) for n in ("ec2", "iam", "s3", "ssm", "sts")}
+            clients = {n: session.client(n) for n in ("ec2", "iam", "s3", "ssm", "sts", "service-quotas")}
         self.region = region
         self.ec2, self.iam, self.s3 = clients["ec2"], clients["iam"], clients["s3"]
-        self.ssm, self.sts = clients["ssm"], clients["sts"]
+        self.ssm, self.sts, self.quotas = clients["ssm"], clients["sts"], clients["service-quotas"]
 
     def shared_one(self, describe, key, filters):
         items = describe(Filters=[{"Name": f"tag:{janitor.SHARED_TAG}", "Values": ["shared"]}] + filters)[key]
@@ -501,14 +515,64 @@ class Notes:
             f.write(line + "\n")
 
 
-def source_tree(local):
-    """The pushed source is `git archive HEAD`: refuse uncommitted tracked changes."""
+def tree_problems(local):
+    """The pushed source is `git archive HEAD`: no uncommitted tracked changes, hft-host.sh in it."""
+    out = []
     dirty = local(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no"],
                   capture_output=True, text=True, check=True).stdout.strip()
     if dirty:
-        raise SystemExit(f"the hosts build `git archive HEAD`; commit these tracked changes first:\n{dirty}")
+        out.append(f"the hosts build `git archive HEAD`; commit these tracked changes first:\n{dirty}")
     if local(["git", "-C", REPO, "cat-file", "-e", "HEAD:deploy/hft-host.sh"], capture_output=True).returncode:
-        raise SystemExit("HEAD has no deploy/hft-host.sh: the hosts need it")
+        out.append("HEAD has no deploy/hft-host.sh: the hosts need it")
+    return out
+
+
+def quota_check(aws):
+    """(ok, detail): L-1216C47A minus the running on-demand vCPUs leaves room for six hosts. Counts
+    every family (the quota covers only Standard ones), so it can only err towards refusing."""
+    need = len(ROLES) * HOST_VCPUS
+    quota = int(aws.quotas.get_service_quota(ServiceCode="ec2", QuotaCode=QUOTA_CODE)["Quota"]["Value"])
+    used = 0
+    for page in aws.ec2.get_paginator("describe_instances").paginate(
+            Filters=[{"Name": "instance-state-name", "Values": ["pending", "running"]}]):
+        for res in page["Reservations"]:
+            for i in res["Instances"]:
+                if i.get("InstanceLifecycle") != "spot":
+                    used += i["CpuOptions"]["CoreCount"] * i["CpuOptions"]["ThreadsPerCore"]
+    free = quota - used
+    detail = f"{QUOTA_CODE} {quota} vCPUs, {used} in use, {free} free, need {need}"
+    if free < need:
+        detail += f": request an increase in Service Quotas ({aws.region}, EC2, Running On-Demand Standard)"
+    return free >= need, detail
+
+
+def preflight(env, region):
+    """Every check, before anything is created: ([(name, ok, detail)], Aws)."""
+    problems = tree_problems(env.local)
+    out = [("source", not problems, "; ".join(problems) or "clean, HEAD has deploy/hft-host.sh")]
+    aws = env.aws(region)
+    try:
+        who = aws.sts.get_caller_identity()
+        out.append(("credentials", True, f"account {who['Account']} as {who['Arn']}"))
+    except Exception as e:
+        return out + [("credentials", False, str(e)), ("quota", False, "not checked without credentials")], aws
+    try:
+        out.append(("quota", *quota_check(aws)))
+    except Exception as e:
+        out.append(("quota", False, str(e)))
+    return out, aws
+
+
+def checked_preflight(env, region):
+    results, aws = preflight(env, region)
+    for name, ok, detail in results:
+        log(f"preflight {name}: {'ok' if ok else 'FAIL'} {detail}")
+    if not all(ok for _, ok, _ in results):
+        raise SystemExit("preflight failed; nothing was created")
+    return aws
+
+
+def source_tree(local):
     archive = local(["git", "-C", REPO, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
     tree = local(["git", "-C", REPO, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
                  check=True).stdout.strip()
@@ -650,12 +714,12 @@ def run(args, env=None):
     print(plan_text(args.region, args.ttl, run_id, expires))
     if ttl_s < SWEEP_WORST_S + TEARDOWN_MARGIN_S:
         raise SystemExit(f"--ttl {args.ttl} leaves no time for a sweep")
+    aws = checked_preflight(env, args.region)
     archive, tree = source_tree(env.local)
     rust = rust_toolchain()
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
     notes = Notes(run_dir)
-    aws = env.aws(args.region)
     shared = aws.ensure_shared(env.my_ip())
 
     def on_signal(signum, _frame):
@@ -710,7 +774,7 @@ def cleanup(args, env=None):
 def parser():
     p = argparse.ArgumentParser(prog="zhida-aws-bench", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "plan"):
+    for name in ("run", "plan", "preflight"):
         r = sub.add_parser(name)
         r.add_argument("--region", default=REGION)
         r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
@@ -723,6 +787,9 @@ def parser():
 
 def main(argv, env=None):
     args = parser().parse_args(argv)
+    if args.cmd == "preflight":
+        checked_preflight(env or Env(), args.region)
+        return 0
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)
         print(plan_text(args.region, args.ttl, new_run_id(now),
