@@ -442,7 +442,10 @@ fn sweep(
             break;
         }
     }
-    for (i, w) in std::mem::take(&mut workers.0).into_iter().enumerate() {
+    // Pop in launch order, leaving workers not yet stopped under the cleanup owner.
+    workers.0.reverse();
+    for i in 0..workers.0.len() {
+        let w = workers.0.pop().expect("remaining worker");
         let status = w
             .exit(EXIT_LIMIT)
             .map_err(|e| format!("generator {i}: {e}"))?;
@@ -645,6 +648,74 @@ mod tests {
         assert_eq!(summary["complete"], false);
         assert_eq!(summary["steps"], 2);
         assert!(summary["error"].as_str().unwrap().contains("generator 0"));
+    }
+
+    /// A shutdown failure must kill later workers, including children that ignore stdin EOF.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_shutdown_failure_kills_the_remaining_worker_process_groups() {
+        let dir = std::env::temp_dir().join(format!("zhida-bench-shutdown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut args = args();
+        let worker = fake_worker("shutdown", &result(0, &[1000], &[100], 1, 0), 1);
+        args.gen_cmd = format!(
+            "echo $$ > '{dir}/group-{{i}}'; \
+             if [ {{i}} -eq 1 ]; then sleep 30 & fi; \
+             {worker}; \
+             if [ {{i}} -eq 0 ]; then exit 3; fi; wait",
+            dir = dir.display(),
+        );
+        let (status, lines) = run_lines(&args);
+        let groups: Vec<libc::pid_t> = (0..args.gens)
+            .map(|i| {
+                std::fs::read_to_string(dir.join(format!("group-{i}")))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        // SIGKILL delivery is asynchronous; zombies are stopped, even before their parent
+        // reaps them. Inspect every group member, not just the shell that leads it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let all_stopped = loop {
+            let ps = Command::new("ps")
+                .args(["-eo", "pgid=,stat="])
+                .output()
+                .unwrap();
+            assert!(ps.status.success());
+            let running = String::from_utf8(ps.stdout).unwrap().lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let group = fields.next().and_then(|s| s.parse::<libc::pid_t>().ok());
+                let state = fields.next().unwrap_or("");
+                group.is_some_and(|g| groups.contains(&g)) && !state.starts_with('Z')
+            });
+            if !running {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        // Clean up even when the regression fails against the old implementation.
+        for group in groups {
+            // SAFETY: these are process groups spawned by this test.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(all_stopped, "a worker process group survived the failed sweep");
+        let error = status.unwrap_err();
+        assert!(
+            error.starts_with("generator 0 exited with ") && error.ends_with('3'),
+            "{error}"
+        );
+        assert_eq!(lines.len(), 2, "the completed step, then the summary");
+        assert_eq!(lines[0]["kind"], "step");
+        assert_eq!(lines[1]["kind"], "summary");
+        assert_eq!(lines[1]["steps"], 1);
+        assert_eq!(lines[1]["complete"], false);
+        assert_eq!(lines[1]["error"], error);
     }
 
     /// A step where nothing comes back is reported (no latency, 100% loss) and the sweep goes on.
