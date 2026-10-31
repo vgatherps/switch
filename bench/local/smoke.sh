@@ -87,7 +87,10 @@ for proto in $protos; do
     budget=
     [ "$proto" = udp ] || budget="--budget-us 50"
     # shellcheck disable=SC2086 # budget is zero or two words
-    if ! run_sweep "$proto" $dut_addr:7000 "$out/$proto-zhida.jsonl" $budget "$@"; then
+    # a sweep stopped at a generator-bound step exits non-zero with a complete summary: expected
+    # over net_tap, where the generators hit the tap syscall early
+    if ! run_sweep "$proto" $dut_addr:7000 "$out/$proto-zhida.jsonl" $budget "$@" &&
+        ! tail -1 "$out/$proto-zhida.jsonl" | grep -q '"complete":true,"generator_bound":true'; then
         echo "smoke: $proto FAILED: $(tail -1 "$out/sweep.log")" >&2
         exit 1
     fi

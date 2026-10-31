@@ -18,9 +18,9 @@ def step(pps, p99, drop=0.0, bound=False, n=0):
             "latency_ns": None if p99 is None else {"p50": p99 // 2, "p99": p99, "p999": p99 * 2, "max": p99 * 3}}
 
 
-def summary(steps=2, complete=True, error=None):
+def summary(steps=2, complete=True, error=None, bound=False):
     return {"kind": "summary", "proto": "udp", "gens": 2, "senders": 4, "size": 64, "steps": steps,
-            "baseline_rtt_p50_ns": None, "budget_window_us": None, "complete": complete, "error": error}
+            "baseline_rtt_p50_ns": None, "budget_window_us": None, "complete": complete, "generator_bound": bound, "error": error}
 
 
 def write_jsonl(path, lines):
@@ -67,6 +67,14 @@ class ReportTest(unittest.TestCase):
             self.assertNotIn("udp-a:", md.split("## Sweeps")[0])
             with open(os.path.join(d, "results.json")) as f:
                 self.assertEqual(len(json.load(f)["incomplete"]), 3)
+
+    def test_every_sweep_generator_bound_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_jsonl(os.path.join(d, "udp-a.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
+            write_jsonl(os.path.join(d, "tcp-b.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
+            self.assertEqual(report.main(["report.py", d]), 1)
+            write_jsonl(os.path.join(d, "ws-c.jsonl"), [step(1000, 10_000), summary(1)])
+            self.assertEqual(report.main(["report.py", d]), 0)
 
     def test_an_empty_results_directory_is_incomplete(self):
         with tempfile.TemporaryDirectory() as d:

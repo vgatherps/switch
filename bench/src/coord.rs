@@ -130,6 +130,9 @@ pub struct Summary {
     pub steps: u32,
     /// Every step ran or the sweep stopped at a generator-bound step; false: see `error`.
     pub complete: bool,
+    /// The sweep stopped at a generator-bound step: it measured the generators, not the
+    /// receiver, so it is not a success (`run` fails) even when complete.
+    pub generator_bound: bool,
     pub error: Option<String>,
 }
 
@@ -331,13 +334,21 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
         baseline_rtt_p50_ns: None,
         steps: 0,
         complete: false,
+        generator_bound: false,
         error: None,
     };
     let result = sweep(args, &mut summary, out);
     summary.complete = result.is_ok();
     summary.error = result.as_ref().err().cloned();
     out(&serde_json::to_string(&summary).expect("summary serializes"));
-    result
+    result?;
+    if summary.generator_bound {
+        return Err(format!(
+            "stopped at a generator-bound step after {} steps: not a receiver measurement",
+            summary.steps
+        ));
+    }
+    Ok(())
 }
 
 /// How far a worker's clock may be from the coordinator's, beyond the probe's half round trip:
@@ -450,6 +461,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         summary.steps = id + 1;
         out(&serde_json::to_string(&report).expect("report serializes"));
         if report.generator_bound {
+            summary.generator_bound = true;
             break;
         }
     }
@@ -634,6 +646,21 @@ mod tests {
         assert_eq!(lines[0]["drop_fraction"], 1.0);
         assert!(lines[0]["latency_ns"].is_null());
         assert_eq!(lines[1]["complete"], true);
+    }
+
+    /// A sweep that stops at a generator-bound step ends with a complete summary that says so,
+    /// and is not a success.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_generator_bound_sweep_is_not_a_success() {
+        let mut args = args();
+        args.rate_max = 4000;
+        args.gen_cmd = fake_worker("bound", &result(0, &[1000], &[100], 1, 7), 10);
+        let (r, lines) = run_lines(&args);
+        assert!(r.unwrap_err().contains("generator-bound"));
+        assert_eq!(lines.len(), 2, "stopped after the first step");
+        assert_eq!(lines[1]["complete"], true);
+        assert_eq!(lines[1]["generator_bound"], true);
     }
 
     /// Counts add up across generators, latency quantiles are those of all echoes together,
