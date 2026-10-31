@@ -32,6 +32,8 @@ members = [
     "relay",
     # TLS 1.3 client over conduit frames
     "sheath",
+    # latency/load bench (plans/bench/design.md)
+    "bench",
 ]
 exclude = ["conduit/vendor/smoltcp", "vendor/rustls"]
 
@@ -44,6 +46,7 @@ version = "0.1.0"
 # external
 criterion = "0.5"
 libc = "0.2"
+mimalloc = "0.1.52"
 proptest = "1.5"
 quickcheck = "1"
 quickcheck_macros = "1"

@@ -33,7 +33,7 @@ pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvErro
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
 pub use dpdk_smoltcp::{
-    AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
+    AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError, UdpSocketStats,
 };
 use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
 use switch::StoredWaker;
@@ -816,6 +816,15 @@ impl UdpTx {
         stack.udp_send_frame(handle, to, frame)?;
         inner.handed_over();
         Ok(())
+    }
+
+    /// The socket's counters, receive side included (datagrams dropped on a full receive
+    /// queue): on this half because a task keeps the receive half parked in `recv`. Not for a
+    /// hot path: it borrows the Net's shared state.
+    pub fn stats(&self) -> UdpSocketStats {
+        let mut inner = self.0.shared.borrow_mut();
+        let (stack, handle) = inner.udp(self.0.index);
+        stack.udp(handle).stats()
     }
 }
 

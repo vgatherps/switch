@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
-.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
+.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -138,6 +138,15 @@ cpuset_free = ids=$$($(DOCKER) ps -q) || { echo '$@: docker ps failed.' >&2; exi
 	printf '%s\n' "$$running" | sh docker/cpuset-overlap.sh '$(1)' || \
 		{ echo '$@ needs $(2) ($(1)) free of other containers.' >&2; exit 1; }
 
+# Bench harness smoke (../bench/local/smoke.sh): validates the tooling, not a measurement. Its
+# CPUs: the kernel echo and coordinator, the Zhida DUT, then BENCH_GENS generators; output in
+# ../bench/out/smoke (report.md, results.json, plots).
+BENCH_CPUSET ?= 9-12
+BENCH_GENS ?= 2
+BENCH_SENDERS ?= 4
+BENCH_PROTOS ?= udp tcp ws
+BENCH_SMOKE_ARGS ?= --rate-min 1000 --rate-max 512000 --step-ms 300 --warmup-ms 100 --drain-ms 100 --bisect 2
+
 # Scapy fuzzer (fuzz/scapy): seeded connection count; a run past FUZZ_TIMEOUT seconds fails.
 FUZZ_SEED ?= 1
 FUZZ_CONNECTIONS ?= 300
@@ -147,8 +156,8 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 	FUZZ_TIMEOUT=$(FUZZ_TIMEOUT)
 
 help:
-	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench memif-bench fuzz binance test-smoltcp bench-stack soak' \
-		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
+	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench memif-bench fuzz binance test-smoltcp bench-stack soak' \
+		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
 
@@ -196,6 +205,9 @@ test-echo: doctor
 
 test-nic-runner: doctor
 	TEST_TIMEOUT=$(TEST_TIMEOUT) DOCKER_CPUSET=$(DOCKER_CPUSET) $(TIMEOUT) sh crates/nic-runner/tests/run.sh
+
+test-bench: doctor
+	$(TIMEOUT) cargo test --locked -p zhida-bench --features e2e -- --test-threads=1
 
 test-netconf: doctor
 	$(TIMEOUT) cargo test --locked -p zhida-netconf -p zhida-open -- --test-threads=1
@@ -246,7 +258,7 @@ test-packetdrill: packetdrill-build
 test-scapy:
 	$(TIMEOUT) python3 -B -m unittest discover -s fuzz/scapy
 
-test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-switchnet test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
+test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-packetdrill test-switchnet test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
 
 bench: doctor
 	cargo bench --locked -p zhida-buffer --bench buffer
@@ -388,6 +400,13 @@ docker-bench:
 
 # Timed numbers need MEMIF_CPUSET to itself (cpuset_free). The cpuset is
 # MEMIF_CPUSET only, never DOCKER_CPUSET.
+docker-bench-smoke:
+	@$(call cpuset_free,$(BENCH_CPUSET),BENCH_CPUSET)
+	$(DOCKER) run --rm --init --cpuset-cpus=$(BENCH_CPUSET) --sysctl net.ipv4.ip_forward=1 $(DOCKER_ACCESS) \
+		$(DOCKER_IMAGE) sh -c 'set -e; cargo build --locked --release -p zhida-bench; rm -rf ../bench/out/smoke; \
+		GENS=$(BENCH_GENS) SENDERS=$(BENCH_SENDERS) PROTOS="$(BENCH_PROTOS)" timeout 900 sh ../bench/local/smoke.sh ../bench/out/smoke $(BENCH_SMOKE_ARGS); \
+		python3 ../bench/report.py ../bench/out/smoke --title "Local smoke (tooling validation over net_tap; not a measurement)"'
+
 docker-memif-bench:
 	@$(call cpuset_free,$(MEMIF_CPUSET),MEMIF_CPUSET)
 	$(DOCKER) run --rm --cpuset-cpus=$(MEMIF_CPUSET) $(DOCKER_ACCESS) $(DOCKER_IMAGE) \
