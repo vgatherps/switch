@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use binance_feed::{
     client_config, connect, run, socket, stream, webpki_client_config, BookTicker, Clock, Event,
-    FeedError, Summary, Target, INGRESS_BUDGET, SOCKET_BUFFER,
+    FeedError, Latencies, Summary, Target, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
 use dpdk_smoltcp::smoltcp::socket::tcp;
@@ -635,9 +635,12 @@ fn stream_closes_after_a_read_error() {
         let saw = join(server);
         assert!(saw.close, "server did not receive the client's Close");
         assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
+        // net_tap without the timestamp offload: every message, the unparsable one too, is
+        // unstamped.
         let summary = Summary {
             count: 2,
             update_ids: Some((expected[0].update_id, expected[1].update_id)),
+            latencies: Latencies { no_stamp: 3, ..Latencies::default() },
         };
         assert_eq!(
             events,
@@ -645,7 +648,7 @@ fn stream_closes_after_a_read_error() {
                 "Connected".to_owned(),
                 format!("{:?}", Event::Ticker { count: 1, ticker: &expected[0] }),
                 format!("{:?}", Event::Ticker { count: 2, ticker: &expected[1] }),
-                format!("{:?}", Event::Read(summary)),
+                format!("{:?}", Event::Read(&summary)),
                 "Closed".to_owned(),
             ]
         );
