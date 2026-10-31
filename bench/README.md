@@ -81,6 +81,24 @@ appends into one received frame larger than a TX frame: every byte must come bac
 
 `python3 bench/aws/zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]` runs the whole thing. Preflight first, before anything is created: clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, on-demand Standard vCPU quota L-1216C47A with 16 free. Then it creates, for this run only and tagged with the run id: a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; four c7gn.xlarge on-demand instances (1 receiver, 3 senders; 4 vCPUs each: hft-host.sh isolates CPU 3 for the app, CPUs 0-2 housekeep and run the coordinator on sender0) in one run_instances, one DPDK data ENI each. The shape is two constants in `zhida_aws_bench.py`, `SENDERS` and `HOST_TYPE`; 1 + 5 x c7gn.2xlarge needs 48 vCPUs of quota. Every ID is recorded as its create succeeds (in memory and `RUN_DIR/created.json`). Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (one `cargo build --release -p zhida-bench` with hft-host.sh's build env). Then the fixed matrix (udp uncapped, tcp and ws `--budget-us 50`; 12 connections (4 per sender host), 64 B, 10k..5M msg/s in 18 x sqrt(2) steps) with the coordinator on sender0 driving one worker per sender host over SSH; a failed sweep is logged and the next one runs; every sweep's files are fetched. Teardown runs on normal exit, errors, Ctrl-C and SIGTERM; once it starts, Ctrl-C/SIGTERM are ignored, and every ssh/scp before it has a timeout. It deletes everything the run created by recorded ID and by tag (instances, data ENIs, key pair, placement group, security group, subnet, route table, internet gateway, VPC, in that dependency order), checks nothing is left, and exits non-zero if anything remains. Then `bench/report.py RUN_DIR`. Each instance also powers itself off (terminates) at the TTL as a backstop. Exit 0 only if report.py passed, every fetch succeeded and nothing remains.
 
+The laptop shows run start, hosts up (every host reachable over SSH), and code built (every host's
+setup verification and benchmark build succeeded). For each protocol, live coordinator stderr reports
+processes up only after every worker replies ready, then processes synced only after every initial clock
+probe passes, then sweep start (dispatching the first rate) and sweep end with the completion status.
+These milestones appear once per sweep, not once per rate. Stderr is also kept in each `.coord.log`;
+JSON results remain in `.jsonl`. A failed startup or clock check never claims synchronization.
+
+The AWS runner uses a 500 ms measurement window per rate, 250 ms warmup and 200 ms drain, with the
+unchanged 50 ms scheduling lead. All 18 rates remain: 9 s of measurement and 18 s of scheduled time per
+protocol, or 27 s of measurement and 54 s of scheduled time for UDP/TCP/ws together. Add 3 s receiver
+startup per protocol, clock probes, worker startup/exit, fetching and teardown. Host provisioning,
+toolchain/DPDK setup, reboot verification and native builds happen separately before the sweeps and
+can take much longer. Previously each rate used 2 s measurement and 500 ms warmup: 36 s measurement /
+49.5 s scheduled per protocol. These quick windows locate the knee, not stable tail estimates: even
+the lowest rate offers 5,000 measured messages total, but p99.9 has few samples. Drain loss accounting,
+send-lag rejection, budgets, per-rate clock checks and late-start rejection are unchanged. Manual
+`zhida-bench sweep` defaults remain 2 s measurement / 500 ms warmup / 200 ms drain.
+
 `plan` prints the hosts, sweeps and what gets created, with no AWS calls; `preflight` runs only the checks; `cleanup --run-id ID [--region R] [--out DIR]` deletes a leftover run using `DIR/ID/created.json` plus a tag lookup (tag lookup only if the file is gone). Needs python3 with boto3, ssh, scp, git; the IAM permissions are listed in the runner's `-h`. Tests (no AWS): `python3 -m unittest discover -s bench/aws`, `sh deploy/test-hft-host.sh`.
 
 Before the first paid run:

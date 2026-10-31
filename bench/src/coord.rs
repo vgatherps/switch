@@ -282,7 +282,11 @@ fn unix_now_ns() -> u64 {
 }
 
 /// Runs the sweep and prints its steps, then its summary whatever happened.
-pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
+pub fn run(
+    args: &Args,
+    out: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     if args.gens == 0 || !args.senders.is_multiple_of(args.gens) {
         return Err("--senders must be a positive multiple of --gens".into());
     }
@@ -293,10 +297,14 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
         generator_bound: false,
         error: None,
     };
-    let result = sweep(args, &mut summary, out);
+    let result = sweep(args, &mut summary, out, progress);
     summary.complete = result.is_ok();
     summary.error = result.as_ref().err().cloned();
     out(&serde_json::to_string(&summary).expect("summary serializes"));
+    progress(&format!(
+        "sweep end: {} steps, complete={}, generator_bound={}",
+        summary.steps, summary.complete, summary.generator_bound
+    ));
     result?;
     if summary.generator_bound {
         return Err(format!(
@@ -352,7 +360,12 @@ fn check_clocks(workers: &mut [Worker]) -> Result<(), String> {
     Ok(())
 }
 
-fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Result<(), String> {
+fn sweep(
+    args: &Args,
+    summary: &mut Summary,
+    out: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     let per = args.senders / args.gens;
     let mut workers = Workers(Vec::new());
     for i in 0..args.gens {
@@ -367,6 +380,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
             return Err(format!("generator {i}: expected ready, got {line:?}"));
         }
     }
+    progress("processes up: all workers replied ready");
     let step_limit = Duration::from_millis(LEAD_MS + args.warmup_ms + args.step_ms + args.drain_ms)
         + REPLY_SLACK;
     let window_ns = args.budget_window_us.map(|us| us * 1000);
@@ -374,6 +388,10 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
     let mut baseline_rtt_ns = None;
     for (id, rate) in (0u32..).zip(rates(args.rate_min, args.rate_max)) {
         check_clocks(&mut workers.0)?;
+        if id == 0 {
+            progress("processes synced: all worker clocks checked");
+            progress("sweep start: dispatching first rate");
+        }
         let start_unix_ns = unix_now_ns() + LEAD_MS * 1_000_000;
         for (g, (w, share)) in (0u32..).zip(workers.0.iter_mut().zip(split_rate(rate, args.gens))) {
             let budget = window_ns
@@ -564,8 +582,51 @@ mod tests {
 
     fn run_lines(args: &Args) -> (Result<(), String>, Vec<serde_json::Value>) {
         let mut lines = vec![];
-        let r = run(args, &mut |l| lines.push(serde_json::from_str(l).unwrap()));
+        let r = run(
+            args,
+            &mut |l| lines.push(serde_json::from_str(l).unwrap()),
+            &mut |_| {},
+        );
         (r, lines)
+    }
+
+    /// Readiness and synchronization are different: neither launch nor a failed clock probe
+    /// may claim the workers are synchronized, and later rates do not repeat the milestones.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn progress_follows_worker_readiness_and_checked_clocks_once_per_sweep() {
+        let mut args = args();
+        args.gens = 1;
+        args.rate_max = 2000;
+        let sample = result(0, &[1000], &[100], 1, 0);
+        for (name, command, expected) in [
+            ("not-ready", "echo '{\"kind\":\"clock\",\"unix_ns\":0}'".into(), 0),
+            ("bad-clock", fake("progress-skew", &sample, 10, 50_000_000, 0), 1),
+            ("on-time", fake_worker("progress-ok", &sample, 10), 3),
+        ] {
+            args.gen_cmd = command;
+            let mut stages = Vec::new();
+            let mut lines = Vec::new();
+            let status = run(
+                &args,
+                &mut |line| lines.push(serde_json::from_str::<serde_json::Value>(line).unwrap()),
+                &mut |stage| stages.push(stage.to_owned()),
+            );
+            assert_eq!(status.is_ok(), name == "on-time", "{name}");
+            let milestones = &stages[..stages.len() - 1];
+            assert_eq!(
+                milestones,
+                &[
+                    "processes up: all workers replied ready",
+                    "processes synced: all worker clocks checked",
+                    "sweep start: dispatching first rate",
+                ][..expected],
+                "{name}"
+            );
+            assert!(stages.last().unwrap().starts_with("sweep end:"), "{name}");
+            assert_eq!(lines.last().unwrap()["complete"], name == "on-time");
+            assert_eq!(lines.len(), if name == "on-time" { 4 } else { 1 });
+        }
     }
 
     /// A worker dying mid-sweep fails the sweep, but the steps already run are printed and the
