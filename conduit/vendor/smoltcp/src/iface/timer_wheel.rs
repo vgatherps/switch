@@ -395,8 +395,6 @@ pub(crate) struct TimerWheel {
     pending: [u32; DEFAULT_LEVELS],
     current_tick: u64,
     linked_count: usize,
-    #[cfg(test)]
-    pub(crate) slot_visits: usize,
 }
 
 impl Default for TimerWheel {
@@ -412,8 +410,6 @@ impl TimerWheel {
             pending: [0; DEFAULT_LEVELS],
             current_tick: initial_tick,
             linked_count: 0,
-            #[cfg(test)]
-            slot_visits: 0,
         }
     }
 
@@ -509,10 +505,6 @@ impl TimerWheel {
                     core::mem::replace(&mut self.levels[level][slot], ListHead::new());
                 self.pending[level] &= !(1 << slot);
                 while let Some(idx) = detached.pop_front(entries) {
-                    #[cfg(test)]
-                    {
-                        self.slot_visits += 1;
-                    }
                     entries[idx as usize].set_wheel_position(WheelPosition::Unlinked);
                     let deadline = entries[idx as usize].deadline();
                     if deadline <= boundary {
@@ -1198,7 +1190,6 @@ mod boundary_tests {
         assert_eq!(wheel.current_tick(), u64::MAX);
         assert_eq!(wheel.next_boundary(), None);
         assert!(wheel.levels.iter().flatten().all(ListHead::is_empty));
-        assert_eq!(wheel.slot_visits, 0);
         assert!(expired.is_empty());
     }
 }

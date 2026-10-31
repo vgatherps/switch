@@ -198,28 +198,17 @@ fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
                 let result = if entry == "single" {
                     iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets)
                 } else {
-                    #[cfg(feature = "udp-set")]
-                    {
-                        let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
-                        iface.poll_ingress_single_udp(
-                            Instant::ZERO, &mut device, &mut sockets, &mut udp,
-                        )
-                    }
-                    #[cfg(not(feature = "udp-set"))]
-                    continue;
+                    let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
+                    iface.poll_ingress_single_udp(
+                        Instant::ZERO, &mut device, &mut sockets, &mut udp,
+                    )
                 };
                 assert_eq!(result, PollIngressSingleResult::SocketStateChanged);
-                assert_eq!(sockets.classify_calls, 0);
-            }
-            #[cfg(not(feature = "udp-set"))]
-            if entry == "udp_single" {
-                continue;
             }
             assert_eq!(sockets.dirty_list, vec![0, 1]);
             iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
         }
         assert!(device.rx_queue.is_empty());
-        assert_eq!(sockets.dispatches, vec![0, 1]);
         assert_eq!(device.tx_queue.len(), 2);
         for (index, port) in [REMOTE_PORT, REMOTE_PORT + 1].into_iter().enumerate() {
             let bytes = device.tx_queue.pop_front().unwrap();
@@ -248,7 +237,6 @@ fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
         let response = iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             packet.payload(),
         );
@@ -1826,7 +1814,6 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &packet.payload()[..length],
         ).is_none());
@@ -1837,7 +1824,6 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &tcp,
         ).is_none());

@@ -181,14 +181,18 @@ test-buffer: doctor
 test-props: doctor
 	$(TIMEOUT) cargo test --locked -p zhida-buffer --features proptest --test props -- --test-threads=1
 
+# Debug test and fuzz builds of the stack also run smoltcp's O(N)-per-packet cross-checks
+# (vendor/smoltcp's diagnostics feature). Release, bench and application builds never do.
+DIAGNOSTICS = --features dpdk-smoltcp/diagnostics
+
 test-stack: doctor
-	$(TIMEOUT) cargo test --locked -p dpdk-smoltcp -p zhida-test-kit -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p dpdk-smoltcp -p zhida-test-kit $(DIAGNOSTICS) -- --test-threads=1
 
 test-stack-release: doctor
 	$(TIMEOUT) cargo test --locked --release -p dpdk-smoltcp -- --test-threads=1
 
 test-echo: doctor
-	$(TIMEOUT) cargo test --locked -p tap-echo -- --test-threads=1 --show-output
+	$(TIMEOUT) cargo test --locked -p tap-echo $(DIAGNOSTICS) -- --test-threads=1 --show-output
 
 test-nic-runner: doctor
 	TEST_TIMEOUT=$(TEST_TIMEOUT) DOCKER_CPUSET=$(DOCKER_CPUSET) $(TIMEOUT) sh crates/nic-runner/tests/run.sh
@@ -222,11 +226,14 @@ test-autobahn-check:
 # smoltcp's own lib unit test gate uses Zhida's smoltcp features (crates/dpdk-smoltcp/Cargo.toml)
 # plus medium-ip, which gates smoltcp's TCP socket tests. vendor/smoltcp is outside the
 # workspace, so it has its own lockfile and target dir. Include the TCP ISN integration
-# test: it exercises production ISNs, while socket unit tests keep their fixed ISN.
-SMOLTCP_TEST_FEATURES = udp-set,medium-ip,auto-icmp-echo-reply
+# test: it exercises production ISNs, while socket unit tests keep their fixed ISN. The second
+# run adds diagnostics, the O(N)-per-packet TCP cross-checks.
+SMOLTCP_TEST_FEATURES = medium-ip,auto-icmp-echo-reply
 test-smoltcp:
 	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
 		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES)
+	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
+		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES),diagnostics
 
 # The packetdrill lock's self-test, then under that lock the packetdrill suite,
 # the runner's self-tests and the CPU checks' self-test (fuzz/packetdrill/README.md).
@@ -262,14 +269,14 @@ memif-bench: doctor
 
 # tap-echo and the packetdrill shim, the inputs of fuzz/packetdrill/run.sh.
 packetdrill-build: doctor
-	cargo build --locked -p tap-echo
+	cargo build --locked -p tap-echo $(DIAGNOSTICS)
 	mkdir -p target/fuzz
 	clang -shared -fPIC -Wall -Werror -I/opt/packetdrill/include \
 		-o target/fuzz/zhida_shim.so fuzz/packetdrill/zhida_shim.c
 
 # The Scapy mutation fuzzer only; its unit tests run in make test.
 fuzz: doctor
-	cargo build --locked -p tap-echo
+	cargo build --locked -p tap-echo $(DIAGNOSTICS)
 	timeout --kill-after=10 $(FUZZ_TIMEOUT) ../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py \
 		--seed $(FUZZ_SEED) --connections $(FUZZ_CONNECTIONS) $(if $(FUZZ_ONLY),--only $(FUZZ_ONLY))
 

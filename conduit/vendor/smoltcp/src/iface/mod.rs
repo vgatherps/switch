@@ -13,7 +13,6 @@ mod socket_meta;
 mod tcp_set;
 mod timer_wheel;
 
-#[cfg(feature = "udp-set")]
 mod udp_set;
 mod drop_queue;
 
@@ -57,7 +56,6 @@ pub use self::interface::{
 
 pub use self::tcp_set::{ReadySide, SocketHandle, TcpSet};
 pub use self::drop_queue::DropQueue;
-#[cfg(feature = "udp-set")]
 pub use self::udp_set::{
     UdpAddError, UdpConfig, UdpConnectError, UdpDatagram, UdpHandle,
     UdpSendError, UdpSet, UdpSocket, UdpSocketStats, UdpTarget,

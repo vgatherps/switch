@@ -28,10 +28,12 @@ repository = "https://github.com/smoltcp-rs/smoltcp.git"
 
 [features]
 auto-icmp-echo-reply = []
+# O(N)-per-packet cross-checks of the TCP flow index, ready queue and poll_at cache. Off by
+# default; one test-smoltcp run enables it.
+diagnostics = []
 # TX buffers are frame-pool mbufs (conduit). Without it they are heap buffers (smoltcp's tests).
 dpdk = ["dep:zhida-buffer", "dep:zhida-dpdk-sys"]
 medium-ip = []
-udp-set = []
 
 [lib]
 name = "smoltcp"

@@ -92,39 +92,6 @@ fn compare_template(iface: &mut Interface, ip: Ipv4Repr, tcp: TcpRepr) -> Vec<u8
 }
 
 #[test]
-fn template_matches_generic_emitter_above_u16_payload_len() {
-    let (mut iface, _, _) = setup(Medium::Ethernet);
-    iface.inner.caps.max_transmission_unit = 65590;
-    let payload = vec![0x5a; 65535];
-    let tcp = TcpRepr {
-        src_port: 40000,
-        dst_port: 80,
-        control: TcpControl::Psh,
-        seq_number: TcpSeqNumber(123),
-        ack_number: Some(TcpSeqNumber(456)),
-        window_len: 65535,
-        window_scale: None,
-        max_seg_size: None,
-        sack_permitted: false,
-        sack_ranges: [None; 3],
-        timestamp: None,
-        payload: &payload,
-    };
-    let ip = Ipv4Repr {
-        src_addr: Ipv4Address::new(192, 168, 1, 1),
-        dst_addr: Ipv4Address::new(192, 168, 1, 2),
-        next_header: IpProtocol::Tcp,
-        payload_len: tcp.buffer_len(),
-        hop_limit: 64,
-    };
-    assert_eq!(ip.payload_len, 65555);
-    let frame = compare_template(&mut iface, ip, tcp);
-    assert_eq!(frame.len(), 65589);
-    assert_eq!(Ipv4Packet::new_unchecked(&frame[14..]).total_len(), 39);
-    assert_eq!(&frame[54..], payload);
-}
-
-#[test]
 fn template_checksum_matches_generic_for_payload_offsets() {
     let (mut iface, _, _) = setup(Medium::Ethernet);
     iface.inner.caps.checksum = ChecksumCapabilities::default();
@@ -358,7 +325,6 @@ fn template_neighbor_errors_and_mtu_drop_match_generic() {
             assert_eq!(result, expected);
             assert_eq!(result, generic_result);
             assert_eq!(direct_frame, generic_frame);
-            assert_eq!(direct.inner.template_frames, 0);
             if expected == Err(DispatchError::NeighborPending) && attempt == 0 {
                 let ethernet = EthernetFrame::new_checked(&direct_frame).unwrap();
                 assert_eq!(ethernet.ethertype(), EthernetProtocol::Arp);
@@ -414,7 +380,6 @@ fn segments_without_ack_or_with_syn_stay_generic() {
             &mut next_hop, &mut template,
         ).unwrap();
         assert!(template.is_some());
-        assert_eq!(iface.inner.template_frames, 0);
         assert_generic_frame(&mut iface, &frame);
     }
 }

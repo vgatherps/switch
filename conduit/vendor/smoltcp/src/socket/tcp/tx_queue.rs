@@ -57,7 +57,7 @@ pub(crate) enum Seg<'a> {
 impl TxQueue {
     pub(crate) fn new(byte_cap: usize, frame_cap: usize, source: TxSource) -> TxQueue {
         TxQueue {
-            entries: VecDeque::with_capacity(frame_cap),
+            entries: VecDeque::new(),
             acked: 0,
             end: 0,
             byte_cap,

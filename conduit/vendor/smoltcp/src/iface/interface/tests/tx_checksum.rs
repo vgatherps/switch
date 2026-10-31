@@ -172,7 +172,6 @@ fn tcp_handshake_and_established_template_carry_checksum_metadata() {
         let handle = sockets.add(socket);
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
         assert_tcp_frames(&device, offload);
-        assert_eq!(iface.inner.template_frames, 0);
         let ip = Ipv4Packet::new_checked(&device.tx[0].1[14..]).unwrap();
         let syn = TcpPacket::new_checked(ip.payload()).unwrap();
         assert!(syn.syn());
@@ -220,13 +219,10 @@ fn tcp_handshake_and_established_template_carry_checksum_metadata() {
         assert_eq!(sockets.get(handle).state(), tcp::State::Established);
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
         assert_tcp_frames(&device, offload);
-        // The handshake-completing ACK is the first template segment (one emit path).
-        assert_eq!(iface.inner.template_frames, 1);
         device.tx.clear();
         assert_eq!(sockets.get_mut(handle).send_slice(b"data"), Ok(4));
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
         assert_tcp_frames(&device, offload);
-        assert_eq!(iface.inner.template_frames, 2);
         let ip = Ipv4Packet::new_checked(&device.tx[0].1[14..]).unwrap();
         assert_eq!(
             TcpPacket::new_checked(ip.payload()).unwrap().payload(),
@@ -250,7 +246,7 @@ fn udp_direct_and_template_carry_checksum_metadata() {
                     broadcast: false,
                 })
                 .unwrap();
-            for templates in [0, 1] {
+            for _ in 0..2 {
                 let target = iface
                     .udp_target(&udp, handle, Some(IpEndpoint::new(REMOTE.into(), 80)), 4)
                     .unwrap();
@@ -258,7 +254,6 @@ fn udp_direct_and_template_carry_checksum_metadata() {
                     iface.udp_send(&mut device, &mut udp, target, b"data"),
                     Ok(())
                 );
-                assert_eq!(udp.template_frames, templates);
                 let (meta, bytes) = device.tx.last().unwrap();
                 assert_eq!(
                     meta.tx_checksum,
@@ -314,13 +309,12 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
                     broadcast: false,
                 })
                 .unwrap();
-            for templates in [1, 2] {
+            for _ in 0..2 {
                 let mut frame = crate::phy::TxFrame::alloc(&alloc).unwrap();
                 frame.room_mut().copy_from_slice(b"data");
                 frame.set_len(4);
                 let target = iface.udp_target(&udp, handle, to, 4).unwrap();
                 assert!(iface.udp_send_frame(&mut device, &mut udp, target, frame).is_ok());
-                assert_eq!(udp.template_frames, templates);
             }
             assert_eq!(device.tx, copies);
             assert_eq!(

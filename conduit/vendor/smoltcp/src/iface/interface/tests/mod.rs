@@ -8,10 +8,8 @@ mod ready_queue;
 mod tcp_demux;
 mod template;
 
-#[cfg(feature = "udp-set")]
 mod tx_checksum;
 
-#[cfg(feature = "udp-set")]
 mod udp;
 
 #[allow(unused)]
@@ -263,7 +261,6 @@ pub fn tcp_listen_drops_unspecified_src() {
     let reply = iface.inner.process_tcp(
         &mut sockets,
         PacketMeta::default(),
-        HardwareAddress::Ip,
         IpRepr::Ipv4(Ipv4Repr {
             src_addr: Ipv4Address::UNSPECIFIED,
             dst_addr: Ipv4Address::new(127, 0, 0, 1),

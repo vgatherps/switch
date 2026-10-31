@@ -65,33 +65,18 @@ impl InterfaceInner {
         &mut self,
         frame_token: Frame,
         ip: IpRepr,
-        mut tcp: TcpRepr,
+        tcp: TcpRepr,
         mut frame: UniqueTxBuf,
         template: &crate::iface::header_template::TcpTemplate,
     ) -> TxBuf {
         let IpRepr::Ipv4(ip4) = ip;
         // dispatch puts options only on segments without payload, and sends no timestamps.
         debug_assert_eq!(tcp.header_len(), TCP_HEADER_LEN, "TCP frame header carries options");
-        if let Some(max_burst_size) = self.caps.max_burst_size {
-            let max_segment_size = self.caps.max_transmission_unit - 20 - TCP_HEADER_LEN;
-            let max_window_size = max_burst_size * max_segment_size;
-            if tcp.window_len as usize > max_window_size {
-                tcp.window_len = max_window_size as u16;
-            }
-        }
         let header_len = 14 + ip4.buffer_len() + TCP_HEADER_LEN;
         let tx_checksum = self.tx_checksum(&ip, TCP_HEADER_LEN);
         let (headers, payload) = frame.headroom_mut(header_len);
         template.emit_header(headers, &ip4, &tcp, payload, &self.caps.checksum);
-        let frame = frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum);
-        #[cfg(test)]
-        {
-            self.template_frames = self
-                .template_frames
-                .checked_add(1)
-                .expect("TCP template frame count overflow");
-        }
-        frame
+        frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum)
     }
 
     pub(super) fn dispatch_tcp<Tx: TxToken>(
@@ -136,26 +121,11 @@ impl InterfaceInner {
             if 20 + ip4.payload_len > self.caps.ip_mtu() {
                 return Ok(());
             }
-            let mut tcp = tcp;
-            if let Some(max_burst_size) = self.caps.max_burst_size {
-                let max_segment_size = self.caps.max_transmission_unit - 20 - tcp.header_len();
-                let max_window_size = max_burst_size * max_segment_size;
-                if tcp.window_len as usize > max_window_size {
-                    tcp.window_len = max_window_size as u16;
-                }
-            }
             meta.tx_checksum = self.tx_checksum(&ip, tcp.header_len());
             tx.set_meta(meta);
             tx.consume(14 + 20 + ip4.payload_len, |frame| {
                 template.as_ref().unwrap().emit(frame, &ip4, &tcp, &self.caps.checksum)
             });
-            #[cfg(test)]
-            {
-                self.template_frames = self
-                    .template_frames
-                    .checked_add(1)
-                    .expect("TCP template frame count overflow");
-            }
             return Ok(());
         }
 
@@ -220,8 +190,8 @@ impl InterfaceInner {
     /// checking the destination, since a flow's local address is ours by construction
     /// (`Socket::connect` refuses another, and a listener only accepts SYNs to our addresses).
     /// On a miss the destination must be ours, else the segment is dropped without a reply;
-    /// only then do listeners and the RST reply apply. `source_hardware_addr` refreshes the
-    /// sender's neighbor entry for a segment to one of our unicast addresses, malformed or not.
+    /// only then do listeners and the RST reply apply. Received segments never touch the
+    /// neighbor cache.
     /// Inlined into its one caller, `process_ipv4`: left out of line, each TCP segment paid
     /// about 25 instructions more for the call (callgrind, established round).
     #[inline(always)]
@@ -229,27 +199,20 @@ impl InterfaceInner {
         &mut self,
         sockets: &mut TcpSet,
         meta: PacketMeta,
-        source_hardware_addr: HardwareAddress,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         assert!(sockets.pending_rx_attach.is_none());
         assert!(sockets.pending_tcp_reply.is_none());
 
-        let IpRepr::Ipv4(ipv4_repr) = ip_repr;
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
-        let Some(tcp_repr) = self.tcp_segment(meta, src_addr, dst_addr, ip_payload) else {
-            if self.has_ip_addr(dst_addr) {
-                self.refresh_sender(ipv4_repr, source_hardware_addr);
-            }
-            return None;
-        };
+        let tcp_repr = self.tcp_segment(meta, src_addr, dst_addr, ip_payload)?;
 
         let syn_like = tcp_repr.ack_number.is_none() && tcp_repr.control != TcpControl::Rst;
         let dst = IpEndpoint::new(dst_addr, tcp_repr.dst_port);
         let src = IpEndpoint::new(src_addr, tcp_repr.src_port);
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         let linear = {
             // The lowest listener bound to the destination address, else the lowest all-IP one.
             let mut listeners = [None, None];
@@ -285,7 +248,6 @@ impl InterfaceInner {
                 winner = sockets.tcp_listener_lookup(dst);
             }
         }
-        self.refresh_sender(ipv4_repr, source_hardware_addr);
         // Only a plain SYN retires an acceptable TIME-WAIT tuple for a listener; a SYN+FIN goes
         // to the TIME-WAIT socket, which ACKs it, listener or not.
         if tcp_repr.control == TcpControl::Syn
@@ -306,7 +268,7 @@ impl InterfaceInner {
             }
         }
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         {
             assert_eq!(
                 linear, winner,
@@ -335,7 +297,7 @@ impl InterfaceInner {
             if let Some(pending) = pending {
                 sockets.pending_rx_attach = Some((index, pending));
             }
-            #[cfg(test)]
+            #[cfg(feature = "diagnostics")]
             sockets.check_flow_index();
             return reply.map(|(ip, tcp)| {
                 if self.caps.medium == Medium::Ethernet && ip.version() == IpVersion::Ipv4 {

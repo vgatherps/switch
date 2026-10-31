@@ -6,7 +6,7 @@ impl InterfaceInner {
         sockets: &mut TcpSet,
         meta: crate::phy::PacketMeta,
         frame: &'frame [u8],
-        #[cfg(feature = "udp-set")] udp: Option<&mut UdpSet>,
+        udp: Option<&mut UdpSet>,
     ) -> Option<EthernetPacket<'frame>> {
         let eth_frame = check!(EthernetFrame::new_checked(frame));
 
@@ -26,9 +26,7 @@ impl InterfaceInner {
                 self.process_ipv4(
                     sockets,
                     meta,
-                    eth_frame.src_addr().into(),
                     &ipv4_packet,
-                    #[cfg(feature = "udp-set")]
                     udp,
                 )
                 .map(EthernetPacket::Ip)

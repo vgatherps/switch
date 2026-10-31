@@ -150,7 +150,9 @@ separate Make invocations sequentially too. Each `cargo test` step runs under
 container), so a hung test fails the step with 124 (137 if it ignores TERM). Cargo commands use
 --locked. The property invocation runs only the `props` test target, the one target its
 `proptest` feature adds. Two documentation examples are marked ignored. `docker-test` runs
-`test-stack-release` after `test-stack`, testing dpdk-smoltcp in release.
+`test-stack-release` after `test-stack`, testing dpdk-smoltcp in release. `test-stack`,
+`test-echo`, `packetdrill-build` and `fuzz` build with `dpdk-smoltcp/diagnostics`, which turns on smoltcp's
+O(N)-per-packet TCP cross-checks; release, bench and application builds leave it off.
 
 ### Pinned tests
 
@@ -414,7 +416,7 @@ A failure prints the reason, writes `target/fuzz/fail-s<seed>-c<i>.pcap` (frames
 the previous connection, both directions) and `.json` (both plans), prints a replay command and
 exits 1 (tap-echo then exits 1). A replay repeats the plan, not the timing. Replay one
 connection (then the end probe) inside a container started with the Makefile's `DOCKER_RUN`
-flags, after `make fuzz` (or `cargo build --locked -p tap-echo`) built `tap-echo`:
+flags, after `make fuzz` (or `cargo build --locked -p tap-echo --features dpdk-smoltcp/diagnostics`) built `tap-echo`:
 `../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed 1 --only 17`, or a whole
 seed: `make docker-fuzz FUZZ_SEED=7` (`FUZZ_ONLY=17` there runs only that connection).
 
@@ -442,12 +444,14 @@ fail it too (needs Linux `/proc`, awk, python3).
 ### smoltcp (`make test-smoltcp`)
 
 `make test-smoltcp` runs smoltcp's own lib unit tests from `vendor/smoltcp` with Zhida's smoltcp
-features plus `medium-ip`, which gates smoltcp's TCP socket tests. The fork supports only
-Zhida's configuration (IPv4 TCP and UDP over Ethernet, with std); its only features are
-`udp-set`, `auto-icmp-echo-reply` and `medium-ip`. The crate is outside the workspace: it builds
-into `../target/smoltcp` against its own `vendor/smoltcp/Cargo.lock` (`--locked`). Its
-dev-dependencies are downloaded from crates.io into the `zhida-cargo-registry` volume on the
-first run, so that run needs network.
+features plus `medium-ip`, which gates smoltcp's TCP socket tests, then runs them again with
+`diagnostics`. That feature turns on the O(N)-per-packet TCP cross-checks (the flow index against
+a linear scan, the ready queue, the cached `poll_at`), which other builds skip. The fork supports
+only Zhida's configuration (IPv4 TCP and UDP over Ethernet, with std); its features are
+`auto-icmp-echo-reply`, `medium-ip`, `dpdk` and `diagnostics`. The crate is outside the
+workspace: it builds into `../target/smoltcp` against its own `vendor/smoltcp/Cargo.lock`
+(`--locked`). Its dev-dependencies are downloaded from crates.io into the `zhida-cargo-registry`
+volume on the first run, so that run needs network.
 
 ## `make docker-test`
 
