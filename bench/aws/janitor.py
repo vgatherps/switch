@@ -17,8 +17,7 @@ NAME = "zhida-bench"
 RUN_TAG = "zhida-bench-run"
 EXPIRES_TAG = "zhida-bench-expires"
 SHARED_TAG = "zhida-bench"
-HOST_PROFILE = f"{NAME}-host"
-NOT_FOUND = {"NoSuchEntity", "NoSuchBucket", "404", "InvalidPlacementGroup.Unknown"}
+NOT_FOUND = {"InvalidPlacementGroup.Unknown"}
 
 
 def tags(resource):
@@ -78,7 +77,7 @@ def clean_run(ec2, run_id, deadline_s=900, poll_s=10, log=print, sleep=time.slee
         sleep(poll_s)
 
 
-def clean_shared(ec2, s3, iam, bucket, key_path, log=print):
+def clean_shared(ec2, key_path, log=print):
     """Deletes the shared resources, children before parents; returns what a final check still
     found. Refuses (returns the run resources) while any run resource exists."""
     runs = listing(run_resources(ec2, [{"Name": "tag-key", "Values": [RUN_TAG]}]))
@@ -94,27 +93,9 @@ def clean_shared(ec2, s3, iam, bucket, key_path, log=print):
             if not gone(e):
                 raise
 
-    step(f"remove role from {HOST_PROFILE}", iam.remove_role_from_instance_profile,
-         InstanceProfileName=HOST_PROFILE, RoleName=HOST_PROFILE)
-    step(f"delete instance profile {HOST_PROFILE}", iam.delete_instance_profile, InstanceProfileName=HOST_PROFILE)
-    step(f"delete role policy {HOST_PROFILE}", iam.delete_role_policy, RoleName=HOST_PROFILE, PolicyName=HOST_PROFILE)
-    step(f"delete role {HOST_PROFILE}", iam.delete_role, RoleName=HOST_PROFILE)
-
     step(f"delete key pair {NAME}", ec2.delete_key_pair, KeyName=NAME)
     if os.path.exists(key_path):
         os.remove(key_path)
-
-    try:
-        for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
-            objects = [{"Key": o["Key"], "VersionId": o["VersionId"]}
-                       for o in page.get("Versions", []) + page.get("DeleteMarkers", [])]
-            if objects:
-                step(f"delete {len(objects)} object versions from {bucket}", s3.delete_objects, Bucket=bucket,
-                     Delete={"Objects": objects, "Quiet": True})
-    except Exception as e:
-        if not gone(e):
-            raise
-    step(f"delete bucket {bucket}", s3.delete_bucket, Bucket=bucket)
 
     step(f"delete placement group {NAME}", ec2.delete_placement_group, GroupName=NAME)
 
@@ -143,10 +124,10 @@ def clean_shared(ec2, s3, iam, bucket, key_path, log=print):
              InternetGatewayId=igw["InternetGatewayId"])
     for vpc in vpcs:
         step(f"delete vpc {vpc}", ec2.delete_vpc, VpcId=vpc)
-    return shared_remaining(ec2, s3, iam, bucket, key_path)
+    return shared_remaining(ec2, key_path)
 
 
-def shared_remaining(ec2, s3, iam, bucket, key_path):
+def shared_remaining(ec2, key_path):
     """What of the shared resources a fresh look still finds."""
     shared = [{"Name": f"tag:{SHARED_TAG}", "Values": ["shared"]}]
     out = [f"vpc {v['VpcId']}" for v in pages(ec2, "describe_vpcs", "Vpcs", Filters=shared)]
@@ -156,15 +137,6 @@ def shared_remaining(ec2, s3, iam, bucket, key_path):
             ec2.describe_key_pairs(Filters=[{"Name": "key-name", "Values": [NAME]}])["KeyPairs"]]
     out += [f"placement group {g['GroupName']}" for g in
             ec2.describe_placement_groups(Filters=[{"Name": "group-name", "Values": [NAME]}])["PlacementGroups"]]
-    for what, call, kw in (("bucket", s3.head_bucket, {"Bucket": bucket}),
-                           ("instance profile", iam.get_instance_profile, {"InstanceProfileName": HOST_PROFILE}),
-                           ("role", iam.get_role, {"RoleName": HOST_PROFILE})):
-        try:
-            call(**kw)
-            out.append(f"{what} {next(iter(kw.values()))}")
-        except Exception as e:
-            if not gone(e):
-                raise
     if os.path.exists(key_path):
         out.append(f"file {key_path}")
     return out

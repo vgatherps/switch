@@ -175,81 +175,6 @@ class FakeEc2:
         self.rts = {k: r for k, r in self.rts.items() if r["VpcId"] != VpcId}
 
 
-class FakeS3:
-    def __init__(self, versions=0):
-        self.objects = {(f"k{i}", f"v{i}") for i in range(versions)}
-        self.bucket, self.calls = True, []
-
-    def get_paginator(self, op):
-        s3 = self
-
-        class P:
-            def paginate(self, Bucket):
-                if not s3.bucket:
-                    raise ClientError("NoSuchBucket")
-                objs = sorted(s3.objects)
-                half = len(objs) // 2
-                for chunk in (objs[:half], objs[half:]):
-                    yield {"Versions": [{"Key": k, "VersionId": v} for k, v in chunk if k != "marker"],
-                           "DeleteMarkers": [{"Key": k, "VersionId": v} for k, v in chunk if k == "marker"]}
-        return P()
-
-    def delete_objects(self, Bucket, Delete):
-        self.calls.append(("delete_objects", len(Delete["Objects"])))
-        for o in Delete["Objects"]:
-            self.objects.discard((o["Key"], o["VersionId"]))
-
-    def delete_bucket(self, Bucket):
-        self.calls.append(("delete_bucket", Bucket))
-        if not self.bucket:
-            raise ClientError("NoSuchBucket")
-        assert not self.objects, "bucket deleted while not empty"
-        self.bucket = False
-
-    def head_bucket(self, Bucket):
-        if not self.bucket:
-            raise ClientError("404")
-
-
-class FakeIam:
-    """One role in one instance profile, one inline policy; deletes of missing things: NoSuchEntity."""
-
-    def __init__(self):
-        self.profile, self.role, self.policies, self.calls = ["zhida-bench-host"], True, ["zhida-bench-host"], []
-
-    def _need(self, ok):
-        if not ok:
-            raise ClientError("NoSuchEntity")
-
-    def get_instance_profile(self, InstanceProfileName):
-        self._need(self.profile is not None)
-
-    def remove_role_from_instance_profile(self, InstanceProfileName, RoleName):
-        self.calls.append("remove_role_from_instance_profile")
-        self._need(self.profile and RoleName in self.profile)
-        self.profile.remove(RoleName)
-
-    def delete_instance_profile(self, InstanceProfileName):
-        self.calls.append("delete_instance_profile")
-        self._need(self.profile is not None)
-        assert not self.profile, "profile deleted with a role in it"
-        self.profile = None
-
-    def delete_role_policy(self, RoleName, PolicyName):
-        self.calls.append("delete_role_policy")
-        self._need(PolicyName in self.policies)
-        self.policies.remove(PolicyName)
-
-    def delete_role(self, RoleName):
-        self.calls.append("delete_role")
-        self._need(self.role)
-        assert not self.policies and not self.profile, "role deleted with policies or in a profile"
-        self.role = False
-
-    def get_role(self, RoleName):
-        self._need(self.role)
-
-
 def run_world():
     ec2 = FakeEc2()
     for iid, run in [("i-a", "r1"), ("i-b", "r1"), ("i-c", "r2")]:
@@ -334,34 +259,30 @@ def shared_world(tmp):
     pem = os.path.join(tmp, "zhida-bench-ap-northeast-1.pem")
     with open(pem, "w") as f:
         f.write("key")
-    return ec2, FakeS3(versions=5), FakeIam(), pem
+    return ec2, pem
 
 
 class CleanSharedTest(unittest.TestCase):
     def test_deletes_everything_in_order_and_is_idempotent(self):
-        ec2, s3, iam, pem = shared_world(tempfile.mkdtemp())
-        s3.objects.add(("marker", "dm1"))
-        self.assertEqual(janitor.clean_shared(ec2, s3, iam, "bucket", pem, log=lambda m: None), [])
+        ec2, pem = shared_world(tempfile.mkdtemp())
+        self.assertEqual(janitor.clean_shared(ec2, pem, log=lambda m: None), [])
         names = [c[0] for c in ec2.calls]
         self.assertLess(names.index("disassociate_route_table"), names.index("delete_route_table"))
         self.assertLess(names.index("detach_internet_gateway"), names.index("delete_internet_gateway"))
         for child in ("delete_security_group", "delete_route_table", "delete_subnet", "delete_internet_gateway"):
             self.assertLess(names.index(child), names.index("delete_vpc"), child)
         self.assertNotIn({"GroupId": "sg-default"}, [kw for n, kw in ec2.calls if n == "delete_security_group"])
-        self.assertEqual(s3.calls, [("delete_objects", 3), ("delete_objects", 3), ("delete_bucket", "bucket")])
-        self.assertEqual(iam.calls, ["remove_role_from_instance_profile", "delete_instance_profile",
-                                     "delete_role_policy", "delete_role"])
         self.assertFalse(os.path.exists(pem))
         self.assertEqual((ec2.vpcs, ec2.igws, ec2.keys, ec2.pgs), ({}, {}, set(), set()))
         # again: everything already gone, nothing raised, nothing left
-        self.assertEqual(janitor.clean_shared(ec2, s3, iam, "bucket", pem, log=lambda m: None), [])
+        self.assertEqual(janitor.clean_shared(ec2, pem, log=lambda m: None), [])
 
     def test_refuses_while_run_resources_exist(self):
-        ec2, s3, iam, pem = shared_world(tempfile.mkdtemp())
+        ec2, pem = shared_world(tempfile.mkdtemp())
         ec2.enis["eni-r9"] = {"NetworkInterfaceId": "eni-r9", "Status": "available", "Tags": run_tag("r9")}
-        self.assertEqual(janitor.clean_shared(ec2, s3, iam, "bucket", pem, log=lambda m: None),
+        self.assertEqual(janitor.clean_shared(ec2, pem, log=lambda m: None),
                          ["network-interface eni-r9 (available, run r9)"])
-        self.assertEqual((ec2.calls, iam.calls, s3.calls), ([], [], []))
+        self.assertEqual(ec2.calls, [])
         self.assertTrue(os.path.exists(pem))
 
 
@@ -371,9 +292,8 @@ class FakeSts:
 
 
 class CleanupCommandTest(unittest.TestCase):
-    def main(self, argv, ec2, s3=None, iam=None):
-        aws = z.Aws("ap-northeast-1", {"ec2": ec2, "s3": s3, "iam": iam, "ssm": None, "sts": FakeSts(),
-                                       "service-quotas": None})
+    def main(self, argv, ec2):
+        aws = z.Aws("ap-northeast-1", {"ec2": ec2, "ssm": None, "sts": FakeSts(), "service-quotas": None})
         fast = functools.partial(janitor.clean_run, deadline_s=30, poll_s=10, sleep=lambda s: None,
                                  clock=iter(range(0, 100000, 10)).__next__)
         out = io.StringIO()
@@ -394,20 +314,18 @@ class CleanupCommandTest(unittest.TestCase):
 
     def test_shared_uses_the_runner_names(self):
         tmp = tempfile.mkdtemp()
-        ec2, s3, iam, _ = shared_world(tmp)
+        ec2, _ = shared_world(tmp)
         pem = os.path.join(tmp, "zhida-bench-ap-northeast-1.pem")
-        with mock.patch.object(z, "KEY_DIR", tmp), mock.patch.object(s3, "delete_bucket",
-                                                                      wraps=s3.delete_bucket) as delete_bucket:
-            code, out = self.main(["cleanup", "--shared"], ec2, s3, iam)
+        with mock.patch.object(z, "KEY_DIR", tmp):
+            code, out = self.main(["cleanup", "--shared"], ec2)
         self.assertEqual(code, 0, out)
-        delete_bucket.assert_called_once_with(Bucket="zhida-bench-cache-123456789012-ap-northeast-1")
         self.assertFalse(os.path.exists(pem))
         self.assertIn("cleanup --shared: nothing left", out)
 
     def test_shared_refusal_exits_non_zero(self):
-        ec2, s3, iam, _ = shared_world(tempfile.mkdtemp())
+        ec2, _ = shared_world(tempfile.mkdtemp())
         ec2.instances["i-r9"] = {"InstanceId": "i-r9", "State": {"Name": "running"}, "Tags": run_tag("r9")}
-        code, out = self.main(["cleanup", "--shared"], ec2, s3, iam)
+        code, out = self.main(["cleanup", "--shared"], ec2)
         self.assertEqual(code, 1)
         self.assertIn("STILL PRESENT: instance i-r9 (running, run r9)", out)
 

@@ -81,15 +81,6 @@ class PureTest(unittest.TestCase):
         self.assertEqual(z.parse_chrony(unsync), (False, "leap status Not synchronised"))
         self.assertEqual(z.parse_chrony(""), (False, "no chronyc tracking output"))
 
-    def test_cache_keys_name_versions_not_amis(self):
-        self.assertEqual(z.cache_keys("s3://b/cache", "aarch64", "2023", "abc123", "1.93.0", "p1"), (
-            "s3://b/cache/dpdk-25.11.3-patchp1-aarch64-al2023-2023.tar.gz",
-            "s3://b/cache/bench-abc123-aarch64-dpdk25.11.3-rust1.93.0.tar.gz"))
-        self.assertEqual(z.rust_toolchain(), "1.93.0")
-        # a changed DPDK patch must not restore an /opt/dpdk built without it
-        self.assertEqual(len(z.dpdk_patch()), 12)
-        self.assertIn(f"-patch{z.dpdk_patch()}-", z.cache_keys("s3://b", "aarch64", "2023", "t", "r")[0])
-
     def test_ssh_config_lists_the_five_senders(self):
         cfg = z.ssh_config([f"10.80.1.{10 + i}" for i in range(5)])
         for i in range(5):
@@ -237,8 +228,7 @@ class FakeSsm:
         return {"Parameter": {"Value": "ami-arm64"}}
 
 
-SHARED_INFO = {"vpc": "vpc-1", "subnet": "subnet-1", "zone": "apne1-az4", "sg": "sg-1", "key_path": "/k.pem",
-               "bucket": "b", "host_profile": "zhida-bench-host"}
+SHARED_INFO = {"vpc": "vpc-1", "subnet": "subnet-1", "zone": "apne1-az4", "sg": "sg-1", "key_path": "/k.pem"}
 
 
 class LaunchTest(unittest.TestCase):
@@ -291,41 +281,38 @@ class HostTest(unittest.TestCase):
         self.assertIn("No such file", err)
         self.assertIsNone(self.host(lambda argv, **kw: Proc(0)).fetch("/f", "/rd"))
 
-    def test_setup_retries_verify_through_the_apply_reboot(self):
+    def test_setup_retries_verify_through_the_apply_reboot_then_builds(self):
         seen = []
 
         def run(argv, **kw):
             cmd = argv[-1]
             seen.append(cmd)
-            if "uname -m" in cmd:
-                return Proc(0, "aarch64\n2023\n")
             if "hft-host.sh apply" in cmd:
                 return Proc(255, "reboot: rebooting now for: cmdline\n", "Connection closed")
             if "hft-host.sh verify" in cmd:  # host down, then booted
                 return Proc(0, "cmdline: ok\n") if sum("verify" in c for c in seen) >= 3 else Proc(255)
             return Proc(0)
 
-        ok, text = self.host(run).setup(b"tar", "s3://b/cache", "tree1", "1.93.0")
+        ok, text = self.host(run).setup(b"tar")
         self.assertTrue(ok, text)
-        boot = next(c for c in seen if "bootstrap.sh" in c)
-        self.assertIn(f"DPDK_KEY=s3://b/cache/dpdk-25.11.3-patch{z.dpdk_patch()}-aarch64-al2023-2023.tar.gz", boot)
-        self.assertIn("BENCH_KEY=s3://b/cache/bench-tree1-aarch64-dpdk25.11.3-rust1.93.0.tar.gz", boot)
-        order = [k for c in seen for k in ("bootstrap.sh", "apply", "verify") if k in c]
-        self.assertEqual(order, ["bootstrap.sh", "apply", "verify", "verify", "verify"])
+        order = [k for c in seen for k in ("apply", "verify", "bootstrap.sh") if k in c]
+        self.assertEqual(order, ["apply", "verify", "verify", "verify", "bootstrap.sh"])
+        self.assertIn(f"SRC={z.SRC_DIR} sh {z.SRC_DIR}/bench/aws/bootstrap.sh", seen[-1])
         self.assertIn("cmdline: ok", text)
 
-    def test_failed_verify_fails_setup(self):
+    def test_failed_verify_fails_setup_without_building(self):
+        seen = []
+
         def run(argv, **kw):
-            cmd = argv[-1]
-            if "uname -m" in cmd:
-                return Proc(0, "aarch64\n2023\n")
-            if "hft-host.sh verify" in cmd:
+            seen.append(argv[-1])
+            if "hft-host.sh verify" in argv[-1]:
                 return Proc(1, "hugepages: FAIL node 0\n")
             return Proc(0, "b\n")
 
-        ok, text = self.host(run).setup(b"tar", "s3://b/cache", "t", "1.93.0")
+        ok, text = self.host(run).setup(b"tar")
         self.assertFalse(ok)
         self.assertIn("hugepages: FAIL", text)
+        self.assertFalse(any("bootstrap.sh" in c for c in seen))
 
 
 # ---------------------------------------------------------------- six-host orchestration
@@ -354,8 +341,8 @@ class FakeHost:
     def wait_ssh(self):
         pass
 
-    def setup(self, archive, cache_prefix, tree, rust):
-        self.w.calls.append((self.role, f"setup {cache_prefix} {tree} {rust}"))
+    def setup(self, archive):
+        self.w.calls.append((self.role, f"setup {archive!r}"))
         return self.role not in self.w.verify_fail, f"[{self.role}] verify: {'FAIL' if self.role in self.w.verify_fail else 'ok'}"
 
     def root(self, command, check=True, **kw):
@@ -443,13 +430,12 @@ class ClientError(Exception):
 
 
 def launch_aws(ec2):
-    return z.Aws("ap-northeast-1", {"ec2": ec2, "iam": None, "s3": None, "ssm": FakeSsm(), "sts": None,
-                                    "service-quotas": None})
+    return z.Aws("ap-northeast-1", {"ec2": ec2, "ssm": FakeSsm(), "sts": None, "service-quotas": None})
 
 
 class PreflightTest(unittest.TestCase):
     def check(self, quota=96, instances=(), sts_error=None, quota_error=None, local=None):
-        aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances)), "iam": None, "s3": None, "ssm": None,
+        aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances)), "ssm": None,
                                        "sts": FakeSts(sts_error), "service-quotas": FakeQuotas(quota, quota_error)})
         env = z.Env(aws=lambda region: aws, local=local or (lambda argv, **kw: Proc(0, "")))
         return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1")[0]}
@@ -498,8 +484,7 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("HEAD has no deploy/hft-host.sh", detail)
 
     def test_preflight_command_fails_clearly(self):
-        aws = z.Aws("r", {"ec2": None, "iam": None, "s3": None, "ssm": None, "sts": FakeSts(Exception("expired token")),
-                          "service-quotas": None})
+        aws = z.Aws("r", {"ec2": None, "ssm": None, "sts": FakeSts(Exception("expired token")), "service-quotas": None})
         env = z.Env(aws=lambda region: aws, local=lambda argv, **kw: Proc(0, ""))
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, "preflight failed; nothing was created"):
@@ -531,7 +516,7 @@ class RunTest(unittest.TestCase):
     def local(self, argv, **kw):
         self.w.local_calls.append(argv)
         if argv[0] == "git":
-            return Proc(0, b"TAR" if "archive" in argv else ("tree1\n" if "rev-parse" in argv else ""))
+            return Proc(0, b"TAR" if "archive" in argv else "")
         if argv[0] == "ssh-keygen":
             key = argv[argv.index("-f") + 1]
             with open(key, "w") as f:
@@ -572,7 +557,7 @@ class RunTest(unittest.TestCase):
     def test_six_hosts_end_to_end(self):
         self.assertEqual(self.run_bench(), 0)
         w = self.w
-        self.assertEqual(sorted(r for r, c in w.calls if c.startswith("setup s3://b/cache tree1 1.93.0")), sorted(z.ROLES))
+        self.assertEqual(sorted(r for r, c in w.calls if c == "setup b'TAR'"), sorted(z.ROLES))
         cfg = w.put[("sender0", f"{z.REMOTE}/ssh_config")]
         self.assertEqual([l for l in cfg.splitlines() if l.startswith("Host sender")],
                          [f"Host sender{i}" for i in range(5)])

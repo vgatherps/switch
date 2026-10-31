@@ -14,13 +14,11 @@ Standard vCPU quota (L-1216C47A: 48 free) before anything is created.
 Permissions the caller needs: ec2 (VPC, subnet, internet gateway, route table, security group,
 placement group, key pair, run/terminate/describe instances, create/attach/delete/modify network
 interfaces, delete volumes, create tags, describe instance type offerings), ssm:GetParameter (the
-AL2023 AMI), s3 (create/tag/delete bucket, list/delete object versions), iam (create/delete role,
-role policy, instance profile; add/remove role to instance profile; iam:PassRole on
-zhida-bench-host), sts:GetCallerIdentity, servicequotas:GetServiceQuota.
+AL2023 AMI), sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 
 `run` provisions six c7gn.2xlarge on-demand instances (one run_instances) in one cluster placement
-group, one data ENI each; builds natively (bootstrap.sh, `deploy/hft-host.sh build`, S3 cache keyed
-by versions); applies `deploy/hft-host.sh` (reboot, verify); runs the fixed sweep matrix with the
+group, one data ENI each; applies `deploy/hft-host.sh` (builds DPDK and the toolchain, reboots,
+verify), then builds zhida-bench natively (bootstrap.sh); runs the fixed sweep matrix with the
 coordinator on sender0 driving one worker per sender host over SSH; fetches every result; runs
 bench/report.py; tears down. Billable per-run resources carry the run id and expiry tags; each
 instance powers itself off (terminate) at the TTL; the runner tears down on exit, errors, Ctrl-C and
@@ -28,7 +26,6 @@ SIGTERM, and exits non-zero if a final describe still finds any of the run's res
 """
 import argparse
 import datetime
-import hashlib
 import json
 import os
 import random
@@ -64,7 +61,6 @@ RATE_MIN, RATE_MAX = 10_000, 5_000_000
 BUDGET_US = 50
 SWEEPS = [("udp", None), ("tcp", BUDGET_US), ("ws", BUDGET_US)]
 PORT = 7000
-DPDK_VERSION = "25.11.3"
 MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
 SRC_DIR = "/opt/zhida-src"
 HFT = f"{SRC_DIR}/deploy/hft-host.sh"
@@ -75,7 +71,7 @@ RECEIVER_UNIT = "zhida-bench-receiver"
 SWEEP_WORST_S = 15 * 60
 TEARDOWN_MARGIN_S = 10 * 60
 CLOCK_LIMIT_S = 0.001
-BOOTSTRAP_S = 3600
+BUILD_S = 3600
 SETUP_REBOOT_S = 900
 QUOTA_CODE = "L-1216C47A"
 
@@ -101,10 +97,6 @@ def new_run_id(now):
 
 def shared_key_path(region):
     return os.path.join(KEY_DIR, f"{NAME}-{region}.pem")
-
-
-def bucket_name(account, region):
-    return f"{NAME}-cache-{account}-{region}"
 
 
 def run_tags(run_id, expires):
@@ -199,28 +191,6 @@ def parse_chrony(text):
     return True, f"offset {offset * 1e6:.1f} us"
 
 
-def rust_toolchain(repo=REPO):
-    with open(os.path.join(repo, "rust-toolchain.toml")) as f:
-        for line in f:
-            k, _, v = line.partition("=")
-            if k.strip() == "channel":
-                return v.strip().strip('"')
-    raise ValueError("rust-toolchain.toml has no channel")
-
-
-def dpdk_patch(repo=REPO):
-    """The DPDK patch hft-host.sh applies (conduit/docker/dpdk-ena-read-clock.patch): its sha256, first 12."""
-    with open(os.path.join(repo, "conduit", "docker", "dpdk-ena-read-clock.patch"), "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()[:12]
-
-
-def cache_keys(prefix, arch, version_id, tree, rust, patch=None):
-    """S3 cache objects, keyed by the versions that determine their content."""
-    patch = patch or dpdk_patch()
-    return (f"{prefix}/dpdk-{DPDK_VERSION}-patch{patch}-{arch}-al2023-{version_id}.tar.gz",
-            f"{prefix}/bench-{tree}-{arch}-dpdk{DPDK_VERSION}-rust{rust}.tar.gz")
-
-
 def user_data(deadline, now):
     """Instance user data: a persistent systemd timer powers the instance off at `deadline` (which
     terminates it: InstanceInitiatedShutdownBehavior=terminate), surviving the setup reboot; plus an
@@ -269,7 +239,7 @@ def plan_text(region, ttl, run_id, expires):
         f"needs: on-demand Standard vCPU quota L-1216C47A with {len(ROLES) * HOST_VCPUS} vCPUs free in {region};"
         " permissions: see `zhida_aws_bench.py -h`",
         f"billable while the run lives: {len(ROLES)} instances, {len(ROLES)} x {ROOT_GB} GB gp3 root volumes,"
-        f" {len(ROLES)} public IPv4 addresses; until `cleanup --shared`: the S3 build cache",
+        f" {len(ROLES)} public IPv4 addresses",
         "expiry: each instance powers itself off (terminates) at the TTL; the runner tears down on exit,"
         " Ctrl-C and SIGTERM",
     ]
@@ -292,10 +262,10 @@ class Aws:
                 raise SystemExit("boto3 is not importable: pip3 install boto3") from None
 
             session = boto3.session.Session(region_name=region)
-            clients = {n: session.client(n) for n in ("ec2", "iam", "s3", "ssm", "sts", "service-quotas")}
+            clients = {n: session.client(n) for n in ("ec2", "ssm", "sts", "service-quotas")}
         self.region = region
-        self.ec2, self.iam, self.s3 = clients["ec2"], clients["iam"], clients["s3"]
-        self.ssm, self.sts, self.quotas = clients["ssm"], clients["sts"], clients["service-quotas"]
+        self.ec2, self.ssm = clients["ec2"], clients["ssm"]
+        self.sts, self.quotas = clients["sts"], clients["service-quotas"]
 
     def shared_one(self, describe, key, filters):
         items = describe(Filters=[{"Name": f"tag:{janitor.SHARED_TAG}", "Values": ["shared"]}] + filters)[key]
@@ -304,7 +274,6 @@ class Aws:
     def ensure_shared(self, my_ip):
         """Resources reused across runs; idempotent."""
         ec2 = self.ec2
-        account = self.sts.get_caller_identity()["Account"]
 
         def tagspec(kind):
             return [{"ResourceType": kind, "Tags": [SHARED, {"Key": "Name", "Value": NAME}]}]
@@ -356,17 +325,8 @@ class Aws:
             material = ec2.create_key_pair(KeyName=NAME, TagSpecifications=tagspec("key-pair"))["KeyMaterial"]
             with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
                 f.write(material)
-        bucket = bucket_name(account, self.region)
-        try:
-            self.s3.head_bucket(Bucket=bucket)
-        except Exception as e:
-            if error_code(e) not in ("404", "NoSuchBucket", "NotFound"):
-                raise
-            self.s3.create_bucket(Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": self.region})
-            self.s3.put_bucket_tagging(Bucket=bucket, Tagging={"TagSet": [SHARED]})
-        profile = self.ensure_host_profile(bucket)
         return {"vpc": vpc_id, "subnet": subnet["SubnetId"], "zone": subnet["AvailabilityZone"], "sg": sg_id,
-                "key_path": key_path, "bucket": bucket, "host_profile": profile}
+                "key_path": key_path}
 
     def zone_offering(self):
         offered = self.ec2.describe_instance_type_offerings(
@@ -376,30 +336,6 @@ class Aws:
         if not zones:
             raise RuntimeError(f"no zone in {self.region} offers {INSTANCE_TYPE}")
         return zones[0]
-
-    def ensure_host_profile(self, bucket):
-        """Role + instance profile letting the hosts read and write the S3 build cache."""
-        name = janitor.HOST_PROFILE
-        trust = {"Version": "2012-10-17", "Statement": [
-            {"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
-        policy = {"Version": "2012-10-17", "Statement": [
-            {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": f"arn:aws:s3:::{bucket}/*"},
-            {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}"}]}
-        try:
-            self.iam.get_role(RoleName=name)
-        except Exception as e:
-            if error_code(e) != "NoSuchEntity":
-                raise
-            self.iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps(trust), Tags=[SHARED])
-        self.iam.put_role_policy(RoleName=name, PolicyName=name, PolicyDocument=json.dumps(policy))
-        try:
-            self.iam.get_instance_profile(InstanceProfileName=name)
-        except Exception as e:
-            if error_code(e) != "NoSuchEntity":
-                raise
-            self.iam.create_instance_profile(InstanceProfileName=name, Tags=[SHARED])
-            self.iam.add_role_to_instance_profile(InstanceProfileName=name, RoleName=name)
-        return name
 
     def launch_hosts(self, shared, run_id, expires, now):
         """Six instances in one run_instances into the placement group; then one data ENI each
@@ -411,7 +347,6 @@ class Aws:
             ImageId=ami, InstanceType=INSTANCE_TYPE, MinCount=len(ROLES), MaxCount=len(ROLES), KeyName=NAME,
             InstanceInitiatedShutdownBehavior="terminate",
             Placement={"GroupName": NAME, "AvailabilityZone": shared["zone"]},
-            IamInstanceProfile={"Name": shared["host_profile"]},
             NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": shared["subnet"], "Groups": [shared["sg"]],
                                 "AssociatePublicIpAddress": True, "DeleteOnTermination": True}],
             BlockDeviceMappings=[{"DeviceName": "/dev/xvda", "Ebs": {
@@ -484,14 +419,11 @@ class Host:
             return None
         return f"{self.role}:{remote}: scp exited {r.returncode}: {(r.stderr or '').strip()[-500:]}"
 
-    def setup(self, archive, cache_prefix, tree, rust):
-        """Source, bootstrap (cached), hft-host.sh apply (reboot), verify. Returns (ok, report text)."""
+    def setup(self, archive):
+        """Source, hft-host.sh apply (builds, reboots), verify, then zhida-bench (bootstrap.sh).
+        Returns (ok, report text)."""
         self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive)
-        arch, version_id = self.ssh("uname -m; . /etc/os-release; echo $VERSION_ID").stdout.split()
-        dpdk_key, bench_key = cache_keys(cache_prefix, arch, version_id, tree, rust)
-        self.root(f"SRC={SRC_DIR} DPDK_KEY={dpdk_key} BENCH_KEY={bench_key} sh {SRC_DIR}/bench/aws/bootstrap.sh",
-                  timeout=BOOTSTRAP_S)
-        apply = self.root(f"sh {HFT} apply", check=False, timeout=BOOTSTRAP_S)
+        apply = self.root(f"sh {HFT} apply", check=False, timeout=BUILD_S)
         text = [f"[{self.role} {self.info['id']} {INSTANCE_TYPE}]", "apply:", apply.stdout.rstrip()]
         if apply.returncode not in (0, 100, 255):  # 100: rebooting; 255: SSH dropped by the reboot
             return False, "\n".join(text + [f"apply exited {apply.returncode}: {apply.stderr.strip()[-2000:]}"])
@@ -504,7 +436,10 @@ class Host:
                 break
             self._sleep(10)
         text += ["verify:", v.stdout.rstrip()]
-        return v.returncode == 0, "\n".join(text)
+        if v.returncode != 0:
+            return False, "\n".join(text)
+        self.root(f"SRC={SRC_DIR} sh {SRC_DIR}/bench/aws/bootstrap.sh", timeout=BUILD_S)
+        return True, "\n".join(text)
 
 
 # ---------------------------------------------------------------- run
@@ -589,20 +524,17 @@ def checked_preflight(env, region):
     return aws
 
 
-def source_tree(local):
-    archive = local(["git", "-C", REPO, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
-    tree = local(["git", "-C", REPO, "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
-                 check=True).stdout.strip()
-    return archive, tree
+def source_archive(local):
+    return local(["git", "-C", REPO, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
 
 
-def setup_hosts(hosts, archive, cache_prefix, tree, rust):
+def setup_hosts(hosts, archive):
     """All six in parallel; raises listing every host that failed."""
     results, threads = {}, []
 
     def one(h):
         try:
-            results[h.role] = h.setup(archive, cache_prefix, tree, rust)
+            results[h.role] = h.setup(archive)
         except Exception as e:  # reported below with the others
             results[h.role] = (False, f"[{h.role}] setup error: {e}")
 
@@ -732,8 +664,7 @@ def run(args, env=None):
     if ttl_s < SWEEP_WORST_S + TEARDOWN_MARGIN_S:
         raise SystemExit(f"--ttl {args.ttl} leaves no time for a sweep")
     aws = checked_preflight(env, args.region)
-    archive, tree = source_tree(env.local)
-    rust = rust_toolchain()
+    archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
     notes = Notes(run_dir)
@@ -753,7 +684,7 @@ def run(args, env=None):
         hosts = [env.host(info, shared["key_path"], run_dir) for info in infos]
         for h in hosts:
             h.wait_ssh()
-        setup = setup_hosts(hosts, archive, f"s3://{shared['bucket']}/cache", tree, rust)
+        setup = setup_hosts(hosts, archive)
         facts, receiver_ip = read_facts(hosts, infos[0]["data_eni"]["ip"])
         for h in hosts:
             h.root(f"install -d -m 1777 {REMOTE}")
@@ -794,9 +725,7 @@ def cleanup(args, env=None):
     aws = (env or Env()).aws(args.region)
     if args.run_id:
         return 0 if teardown(aws.ec2, args.run_id) else 1
-    account = aws.sts.get_caller_identity()["Account"]
-    remaining = janitor.clean_shared(aws.ec2, aws.s3, aws.iam, bucket_name(account, args.region),
-                                     shared_key_path(args.region), log=log)
+    remaining = janitor.clean_shared(aws.ec2, shared_key_path(args.region), log=log)
     if remaining:
         log(f"cleanup --shared: STILL PRESENT: {'; '.join(remaining)}")
         return 1
