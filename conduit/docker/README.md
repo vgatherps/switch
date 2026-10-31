@@ -443,15 +443,14 @@ fail it too (needs Linux `/proc`, awk, python3).
 
 ### smoltcp (`make test-smoltcp`)
 
-`make test-smoltcp` runs smoltcp's own lib unit tests from `vendor/smoltcp` with Zhida's smoltcp
-features plus `medium-ip`, which gates smoltcp's TCP socket tests, then runs them again with
-`diagnostics`. That feature turns on the O(N)-per-packet TCP cross-checks (the flow index against
-a linear scan, the ready queue, the cached `poll_at`), which other builds skip. The fork supports
-only Zhida's configuration (IPv4 TCP and UDP over Ethernet, with std); its features are
-`auto-icmp-echo-reply`, `medium-ip`, `dpdk` and `diagnostics`. The crate is outside the
-workspace: it builds into `../target/smoltcp` against its own `vendor/smoltcp/Cargo.lock`
-(`--locked`). Its dev-dependencies are downloaded from crates.io into the `zhida-cargo-registry`
-volume on the first run, so that run needs network.
+`make test-smoltcp` runs smoltcp's own lib unit tests and its TCP ISN test from `vendor/smoltcp`
+with Zhida's smoltcp features, then runs them again with `diagnostics`. That feature turns on the
+O(N)-per-packet TCP cross-checks (the flow index against a linear scan, the ready queue, the
+cached `poll_at`), which other builds skip. The fork supports only Zhida's configuration (IPv4
+TCP and UDP over Ethernet, with std); its features are `auto-icmp-echo-reply`, `dpdk` and
+`diagnostics`. The crate is outside the workspace: it builds into `../target/smoltcp` against its
+own `vendor/smoltcp/Cargo.lock` (`--locked`). Its dev-dependencies are downloaded from crates.io
+into the `zhida-cargo-registry` volume on the first run, so that run needs network.
 
 ## `make docker-test`
 

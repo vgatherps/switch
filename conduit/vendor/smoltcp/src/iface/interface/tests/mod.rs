@@ -1,10 +1,7 @@
 mod ipv4;
 mod next_hop;
-#[cfg(feature = "medium-ip")]
 mod poll_at_cache;
-#[cfg(feature = "medium-ip")]
 mod ready_queue;
-#[cfg(feature = "medium-ip")]
 mod tcp_demux;
 mod template;
 
@@ -162,15 +159,6 @@ fn assert_generic_frame(iface: &mut Interface, frame: &[u8]) {
 }
 
 #[test]
-#[should_panic(expected = "The hardware address does not match the medium of the interface.")]
-#[cfg(feature = "medium-ip")]
-fn test_new_panic() {
-    let mut device = Loopback::new(Medium::Ethernet);
-    let config = Config::new(HardwareAddress::Ip);
-    Interface::new(config, &mut device, Instant::ZERO);
-}
-
-#[test]
 fn capacity_from_config() {
     let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0, 0, 0, 0, 0, 1]));
     let mut config = Config::new(hardware_addr);
@@ -246,11 +234,10 @@ fn broadcast_gateway_panics() {
 }
 
 #[test]
-#[cfg(feature = "medium-ip")]
 pub fn tcp_listen_drops_unspecified_src() {
     use crate::socket::tcp;
 
-    let (mut iface, mut sockets, _) = setup(Medium::Ip);
+    let (mut iface, mut sockets, _) = crate::tests::setup_eth();
 
     let tcp_socket = tcp::Socket::test_socket(64, 64);
     let handle = sockets.add(tcp_socket);

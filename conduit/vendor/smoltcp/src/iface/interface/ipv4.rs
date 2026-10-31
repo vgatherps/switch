@@ -106,12 +106,7 @@ impl InterfaceInner {
             IpProtocol::Icmp => self.process_icmpv4(ipv4_repr, ip_payload),
 
             IpProtocol::Udp => {
-                let link_header_len = match self.caps.medium {
-                    Medium::Ethernet => EthernetFrame::<&[u8]>::header_len(),
-                    #[cfg(feature = "medium-ip")]
-                    Medium::Ip => 0,
-                };
-                let payload_offset = link_header_len
+                let payload_offset = EthernetFrame::<&[u8]>::header_len()
                     .checked_add(ipv4_packet.header_len() as usize)
                     .expect("UDP payload offset overflow");
                 self.process_udp(udp, meta, ipv4_repr, dst_ours, ip_payload, payload_offset)

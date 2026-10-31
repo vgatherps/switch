@@ -33,7 +33,6 @@ auto-icmp-echo-reply = []
 diagnostics = []
 # TX buffers are frame-pool mbufs (conduit). Without it they are heap buffers (smoltcp's tests).
 dpdk = ["dep:zhida-buffer", "dep:zhida-dpdk-sys"]
-medium-ip = []
 
 [lib]
 name = "smoltcp"
@@ -42,7 +41,6 @@ path = "src/lib.rs"
 [[test]]
 name = "tcp_isn"
 path = "tests/tcp_isn.rs"
-required-features = ["medium-ip"]
 
 [dependencies.byteorder]
 version = "1.0"

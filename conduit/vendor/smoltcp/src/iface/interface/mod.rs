@@ -221,9 +221,8 @@ impl Interface {
     /// Create a network interface using the previously provided configuration.
     ///
     /// # Panics
-    /// This function panics if the configured `hardware_addr` does not match
-    /// the medium of the device, or is an Ethernet address that is not unicast or is all zeros.
-    /// It also panics if [`Config::neighbor_capacity`] is zero.
+    /// This function panics if the configured `hardware_addr` is not unicast or is all zeros,
+    /// or if [`Config::neighbor_capacity`] is zero.
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
         assert!(
             config.neighbor_capacity != 0,
@@ -231,14 +230,7 @@ impl Interface {
         );
 
         let caps = device.capabilities();
-        assert_eq!(
-            config.hardware_addr.medium(),
-            caps.medium,
-            "The hardware address does not match the medium of the interface."
-        );
-        if caps.medium == Medium::Ethernet {
-            InterfaceInner::check_hardware_addr(&config.hardware_addr);
-        }
+        InterfaceInner::check_hardware_addr(&config.hardware_addr);
 
         let mut rand = Rand::new(config.random_seed);
 
@@ -282,26 +274,29 @@ impl Interface {
     }
 
     /// Get the HardwareAddress address of the interface.
-    ///
-    /// # Panics
-    /// This function panics if the medium is not Ethernet.
     #[cfg(test)]
     pub(crate) fn hardware_addr(&self) -> HardwareAddress {
-        assert!(self.inner.caps.medium == Medium::Ethernet);
-
         self.inner.hardware_addr
     }
 
     /// Set the HardwareAddress address of the interface.
     ///
     /// # Panics
-    /// This function panics if the address is not unicast, and if the medium is not Ethernet.
+    /// This function panics if the address is not unicast.
     #[cfg(test)]
     pub(crate) fn set_hardware_addr(&mut self, addr: HardwareAddress) {
-        assert!(self.inner.caps.medium == Medium::Ethernet);
-
         InterfaceInner::check_hardware_addr(&addr);
         self.inner.hardware_addr = addr;
+    }
+
+    /// Resolve `addr` at `mac` with no expiry, so egress to it never sends ARP.
+    #[cfg(test)]
+    pub(crate) fn resolve_neighbor(&mut self, addr: Ipv4Address, mac: EthernetAddress) {
+        self.inner.neighbor_cache.fill_with_expiration(
+            addr.into(),
+            mac.into(),
+            Instant::from_micros(i64::MAX),
+        );
     }
 
     /// Get the IP addresses of the interface.
@@ -589,58 +584,38 @@ impl Interface {
             return PollIngressSingleResult::PacketProcessed;
         }
 
-        match self.inner.caps.medium {
-            Medium::Ethernet => {
-                if let Some(packet) = self.inner.process_ethernet(
-                    sockets,
-                    rx_meta,
-                    bytes,
-                    udp.as_deref_mut(),
-                ) {
-                    let result = if let Some(index) = sockets.pending_tcp_reply.take() {
-                        // The socket's cached next hop is current only while the neighbor
-                        // generation is; an entry that expired since the last egress pass
-                        // must bump it, so the reply resolves (and ARPs) like egress does.
-                        self.inner.neighbor_cache.expire(self.inner.now);
-                        let EthernetPacket::Ip(packet) = packet else {
-                            unreachable!("TCP socket reply is not an IP packet")
-                        };
-                        let IpPayload::Tcp(tcp) = packet.payload() else {
-                            unreachable!("TCP socket reply is not a TCP segment")
-                        };
-                        let meta = &mut sockets.item_at_mut(index)
-                            .expect("TCP reply socket is missing").meta;
-                        self.inner.dispatch_tcp(
-                            tx_token,
-                            PacketMeta::default(),
-                            packet.ip_repr(),
-                            *tcp,
-                            &mut meta.next_hop,
-                            &mut meta.tcp_template,
-                        )
-                    } else {
-                        self.inner.dispatch(tx_token, packet)
-                    };
-                    if let Err(err) = result {
-                        net_debug!("Failed to send response: {:?}", err);
-                    }
-                }
-            }
-            #[cfg(feature = "medium-ip")]
-            Medium::Ip => {
-                if let Some(packet) = self.inner.process_ip(
-                    sockets,
-                    rx_meta,
-                    bytes,
-                    udp.as_deref_mut(),
-                ) && let Err(err) = self.inner.dispatch_ip(
+        if let Some(packet) = self.inner.process_ethernet(
+            sockets,
+            rx_meta,
+            bytes,
+            udp.as_deref_mut(),
+        ) {
+            let result = if let Some(index) = sockets.pending_tcp_reply.take() {
+                // The socket's cached next hop is current only while the neighbor
+                // generation is; an entry that expired since the last egress pass
+                // must bump it, so the reply resolves (and ARPs) like egress does.
+                self.inner.neighbor_cache.expire(self.inner.now);
+                let EthernetPacket::Ip(packet) = packet else {
+                    unreachable!("TCP socket reply is not an IP packet")
+                };
+                let IpPayload::Tcp(tcp) = packet.payload() else {
+                    unreachable!("TCP socket reply is not a TCP segment")
+                };
+                let meta = &mut sockets.item_at_mut(index)
+                    .expect("TCP reply socket is missing").meta;
+                self.inner.dispatch_tcp(
                     tx_token,
                     PacketMeta::default(),
-                    packet,
-                    None,
-                ) {
-                    net_debug!("Failed to send response: {:?}", err);
-                }
+                    packet.ip_repr(),
+                    *tcp,
+                    &mut meta.next_hop,
+                    &mut meta.tcp_template,
+                )
+            } else {
+                self.inner.dispatch(tx_token, packet)
+            };
+            if let Err(err) = result {
+                net_debug!("Failed to send response: {:?}", err);
             }
         }
 
@@ -706,64 +681,40 @@ impl Interface {
                                    frame: Option<UniqueTxBuf>| {
                     neighbor_addr = Some(ip.dst_addr());
                     if let Some(frame) = frame {
-                        if inner.caps.medium == Medium::Ethernet {
-                            if !inner.tcp_frame_template_ready(&ip, &tcp, next_hop, template) {
-                                let now = inner.now;
-                                if let Err(error) = inner.prepare_tcp_frame(
-                                    &ip,
-                                    &tcp,
-                                    &mut *next_hop,
-                                    &mut *template,
-                                    || {
-                                        device.transmit(now).map(|t| TrackedTxToken {
-                                            inner: t,
-                                            consumed: &mut emitted,
-                                        })
-                                    },
-                                ) {
-                                    return (Err(error), Some(frame.into_buf()));
-                                }
+                        if !inner.tcp_frame_template_ready(&ip, &tcp, next_hop, template) {
+                            let now = inner.now;
+                            if let Err(error) = inner.prepare_tcp_frame(
+                                &ip,
+                                &tcp,
+                                &mut *next_hop,
+                                &mut *template,
+                                || {
+                                    device.transmit(now).map(|t| TrackedTxToken {
+                                        inner: t,
+                                        consumed: &mut emitted,
+                                    })
+                                },
+                            ) {
+                                return (Err(error), Some(frame.into_buf()));
                             }
-                            let Some(t) = device.transmit_frame(inner.now) else {
-                                net_debug!("failed to transmit frame: device exhausted");
-                                return (Err(EgressError::Exhausted), Some(frame.into_buf()));
-                            };
-                            let t = TrackedFrameToken {
-                                inner: t,
-                                consumed: &mut emitted,
-                            };
-                            let frame = inner.dispatch_tcp_frame(
-                                t,
-                                ip,
-                                tcp,
-                                frame,
-                                template.as_ref().expect("TCP frame template is missing"),
-                            );
-                            result = PollResult::SocketStateChanged;
-                            return (Ok(()), Some(frame));
                         }
-
-                        let Some(t) = device.transmit(inner.now) else {
-                            net_debug!("failed to transmit IP: device exhausted");
+                        let Some(t) = device.transmit_frame(inner.now) else {
+                            net_debug!("failed to transmit frame: device exhausted");
                             return (Err(EgressError::Exhausted), Some(frame.into_buf()));
                         };
-                        let t = TrackedTxToken {
+                        let t = TrackedFrameToken {
                             inner: t,
                             consumed: &mut emitted,
                         };
-                        let tcp = TcpRepr { payload: frame.payload(), ..tcp };
-                        let dispatch = inner.dispatch_tcp(
+                        let frame = inner.dispatch_tcp_frame(
                             t,
-                            meta,
                             ip,
                             tcp,
-                            &mut *next_hop,
-                            &mut *template,
+                            frame,
+                            template.as_ref().expect("TCP frame template is missing"),
                         );
-                        if dispatch.is_ok() {
-                            result = PollResult::SocketStateChanged;
-                        }
-                        return (dispatch.map_err(|_| EgressError::Dispatch), Some(frame.into_buf()));
+                        result = PollResult::SocketStateChanged;
+                        return (Ok(()), Some(frame));
                     }
 
                     let Some(t) = device.transmit(inner.now) else {
@@ -1012,29 +963,6 @@ impl InterfaceInner {
         self.owned_ipv4.contains(addr)
     }
 
-    #[cfg(feature = "medium-ip")]
-    fn process_ip<'frame>(
-        &mut self,
-        sockets: &mut TcpSet,
-        meta: PacketMeta,
-        ip_payload: &'frame [u8],
-        udp: Option<&mut UdpSet>,
-    ) -> Option<Packet<'frame>> {
-        match IpVersion::of_packet(ip_payload) {
-            Ok(IpVersion::Ipv4) => {
-                let ipv4_packet = Ipv4Packet::new_unchecked(ip_payload);
-                self.process_ipv4(
-                    sockets,
-                    meta,
-                    &ipv4_packet,
-                    udp,
-                )
-            }
-            // Drop all other traffic.
-            _ => None,
-        }
-    }
-
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
     pub(crate) fn is_broadcast(&self, address: &IpAddress) -> bool {
@@ -1097,11 +1025,7 @@ impl InterfaceInner {
 
     pub(crate) fn has_neighbor(&self, addr: &IpAddress) -> bool {
         match self.route(addr) {
-            Some(_routed_addr) => match self.caps.medium {
-                Medium::Ethernet => self.neighbor_cache.lookup(&_routed_addr, self.now).found(),
-                #[cfg(feature = "medium-ip")]
-                Medium::Ip => true,
-            },
+            Some(routed_addr) => self.neighbor_cache.lookup(&routed_addr, self.now).found(),
             None => false,
         }
     }
@@ -1168,32 +1092,20 @@ impl InterfaceInner {
             *kept = None;
         }
         if self.is_broadcast(dst_addr) {
-            let hardware_addr = match self.caps.medium {
-                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress::BROADCAST),
-                #[cfg(feature = "medium-ip")]
-                Medium::Ip => unreachable!(),
-            };
-            return Ok(HardwareLookup::Found(hardware_addr));
+            return Ok(HardwareLookup::Found(HardwareAddress::Ethernet(EthernetAddress::BROADCAST)));
         }
 
         if dst_addr.is_multicast() {
-            let hardware_addr = match *dst_addr {
-                IpAddress::Ipv4(addr) => match self.caps.medium {
-                    Medium::Ethernet => {
-                        let b = addr.octets();
-                        HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
-                            0x01,
-                            0x00,
-                            0x5e,
-                            b[1] & 0x7F,
-                            b[2],
-                            b[3],
-                        ]))
-                    }
-                    #[cfg(feature = "medium-ip")]
-                    Medium::Ip => unreachable!(),
-                },
-            };
+            let IpAddress::Ipv4(addr) = *dst_addr;
+            let b = addr.octets();
+            let hardware_addr = HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
+                0x01,
+                0x00,
+                0x5e,
+                b[1] & 0x7F,
+                b[2],
+                b[3],
+            ]));
             return Ok(HardwareLookup::Found(hardware_addr));
         }
 
@@ -1211,8 +1123,7 @@ impl InterfaceInner {
             NeighborAnswer::Stale {
                 hardware_addr,
                 probe,
-            } if matches!(dst_addr, IpAddress::Ipv4(_))
-                && matches!(self.caps.medium, Medium::Ethernet) =>
+            } if matches!(dst_addr, IpAddress::Ipv4(_)) =>
             {
                 if probe && self.probe_owed.is_none() {
                     #[allow(irrefutable_let_patterns)]
@@ -1223,13 +1134,10 @@ impl InterfaceInner {
                 Ok(HardwareLookup::Found(hardware_addr))
             }
             NeighborAnswer::RateLimited => Err(DispatchError::NeighborPending),
-            _ => match dst_addr {
-                IpAddress::Ipv4(dst_addr) if matches!(self.caps.medium, Medium::Ethernet) => {
-                    Ok(HardwareLookup::Arp(dst_addr))
-                }
-                #[allow(unreachable_patterns)]
-                _ => Err(DispatchError::NeighborPending),
-            },
+            _ => {
+                let IpAddress::Ipv4(dst_addr) = dst_addr;
+                Ok(HardwareLookup::Arp(dst_addr))
+            }
         }
     }
 
@@ -1361,27 +1269,10 @@ impl InterfaceInner {
         let caps = self.caps.clone();
 
         // First we calculate the total length that we will have to emit.
-        let mut total_len = ip_repr.buffer_len();
+        let total_len = EthernetFrame::<&[u8]>::buffer_len(ip_repr.buffer_len());
 
-        // Add the size of the Ethernet header if the medium is Ethernet.
-        if matches!(self.caps.medium, Medium::Ethernet) {
-            total_len = EthernetFrame::<&[u8]>::buffer_len(total_len);
-        }
-
-        // If the medium is Ethernet, then we need to retrieve the destination hardware address.
-        let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
-            Medium::Ethernet => {
-                match self.lookup_hardware_addr(
-                    tx_token,
-                    &ip_repr.dst_addr(),
-                    next_hop,
-                )? {
-                    (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
-                    (_, _) => unreachable!(),
-                }
-            }
-            _ => (EthernetAddress([0; 6]), tx_token),
-        };
+        let (HardwareAddress::Ethernet(dst_hardware_addr), mut tx_token) =
+            self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), next_hop)?;
 
         // Emit function for the Ethernet header.
         let emit_ethernet = |repr: &IpRepr, tx_buffer: &mut [u8]| {
@@ -1429,10 +1320,8 @@ impl InterfaceInner {
 
                     // No fragmentation is required.
                     tx_token.consume(total_len, |mut tx_buffer| {
-                        if matches!(self.caps.medium, Medium::Ethernet) {
-                            emit_ethernet(&ip_repr, tx_buffer);
-                            tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
-                        }
+                        emit_ethernet(&ip_repr, tx_buffer);
+                        tx_buffer = &mut tx_buffer[EthernetFrame::<&[u8]>::header_len()..];
 
                         emit_ip(&ip_repr, tx_buffer);
                     });

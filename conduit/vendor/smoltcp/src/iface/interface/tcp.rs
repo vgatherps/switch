@@ -12,8 +12,7 @@ impl InterfaceInner {
         template: &Option<crate::iface::header_template::TcpTemplate>,
     ) -> bool {
         let IpRepr::Ipv4(ip4) = ip;
-        self.caps.medium == Medium::Ethernet
-            && TcpTemplate::is_eligible(tcp)
+        TcpTemplate::is_eligible(tcp)
             && next_hop.is_some_and(|(generation, _)| generation == self.neighbor_cache.changes())
             && template.as_ref().is_some_and(|template| {
                 template.fits(
@@ -34,7 +33,6 @@ impl InterfaceInner {
         reserve: impl FnOnce() -> Option<Tx>,
     ) -> Result<(), EgressError> {
         let IpRepr::Ipv4(ip4) = ip;
-        assert_eq!(self.caps.medium, Medium::Ethernet);
         assert!(TcpTemplate::is_eligible(tcp));
         let changes = self.neighbor_cache.changes();
         let src_mac = self.hardware_addr.ethernet_or_panic();
@@ -93,7 +91,6 @@ impl InterfaceInner {
 
         #[allow(irrefutable_let_patterns)]
         if let IpRepr::Ipv4(ip4) = ip
-            && self.caps.medium == Medium::Ethernet
             && TcpTemplate::is_eligible(&tcp)
         {
             assert!(!ip4.dst_addr.is_unspecified());
@@ -142,7 +139,6 @@ impl InterfaceInner {
         )?;
         #[allow(irrefutable_let_patterns)]
         if let IpRepr::Ipv4(ip4) = ip
-            && self.caps.medium == Medium::Ethernet
             && let Some((changes, mac)) = *next_hop
             && changes == self.neighbor_cache.changes()
         {
@@ -305,7 +301,7 @@ impl InterfaceInner {
             #[cfg(feature = "diagnostics")]
             sockets.check_flow_index();
             return reply.map(|(ip, tcp)| {
-                if self.caps.medium == Medium::Ethernet && ip.version() == IpVersion::Ipv4 {
+                if ip.version() == IpVersion::Ipv4 {
                     sockets.pending_tcp_reply = Some(index);
                 }
                 Packet::new(ip, IpPayload::Tcp(tcp))

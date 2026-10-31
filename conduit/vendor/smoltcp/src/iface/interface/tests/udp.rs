@@ -1618,30 +1618,6 @@ fn send_ipv4_checksum_follows_device_caps() {
     assert_eq!(test.device.tx, vec![expected]);
 }
 
-#[cfg(feature = "medium-ip")]
-#[test]
-#[should_panic(expected = "UDP send needs an Ethernet interface")]
-fn send_panics_on_ip_medium() {
-    let (mut iface, _, mut device) = setup(Medium::Ip);
-    let mut udp = UdpSet::new(1, crate::tests::tx_test_source(1472));
-    let handle = udp
-        .add(&iface, UdpConfig {
-            port: PORT,
-            local_addr: None,
-            rx_queue: 1,
-            tx_checksum: true,
-            broadcast: true,
-        })
-        .unwrap();
-    let _ = iface.udp_send(
-        &mut device,
-        &mut udp,
-        handle,
-        Some(IpEndpoint::new(Ipv4Address::BROADCAST.into(), PEER_PORT)),
-        &[0],
-    );
-}
-
 #[test]
 fn no_gateway_sends_on_subnet_directly() {
     let mut test = Test::new(1);

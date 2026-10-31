@@ -3623,10 +3623,7 @@ fn rtt_sampling_round_trips() {
     assert_eq!(rtte.max_seq_sent(), Some(TcpSeqNumber(3)));
 }
 
-// TODO: TCP should work for all features. For now, we only test with the IP feature. We could do
-// it for other features as well with rstest, however, this means we have to modify a lot of the
-// tests in here, which I didn't had the time for at the moment.
-#[cfg(all(test, feature = "medium-ip"))]
+#[cfg(test)]
 mod test {
     use super::*;
     use crate::config::IFACE_MAX_ADDR_COUNT;
@@ -4155,7 +4152,7 @@ mod test {
     }
 
     fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
-        let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (iface, _, _) = crate::tests::setup_eth();
 
         let mut socket = Socket::test_socket(rx_len, tx_len);
         socket.set_ack_delay(None);
@@ -4196,7 +4193,8 @@ mod test {
     fn mtu_device_transmit_frame_delegates() {
         use crate::phy::{Device as _, FrameToken as _};
 
-        let mut device = MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ip), 1280);
+        let mut device =
+            MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ethernet), 1280);
         let mut frame = crate::tests::tx_test_buf(&[2]);
         frame.headroom_mut(1).0[0] = 1;
         device
@@ -4209,15 +4207,19 @@ mod test {
     fn receive_window_socket(ip_mtu: usize, capacity: usize) -> TestSocket {
         use crate::phy::Device;
 
-        let mut device = MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ip), ip_mtu);
+        let mut device = MtuDevice(
+            crate::tests::TestingDevice::new(crate::phy::Medium::Ethernet),
+            ip_mtu + crate::wire::ETHERNET_HEADER_LEN,
+        );
         let mut iface = crate::iface::Interface::new(
-            crate::iface::Config::new(crate::wire::HardwareAddress::Ip),
+            crate::iface::Config::new(crate::tests::HARDWARE.into()),
             &mut device,
             Instant::ZERO,
         );
         iface.update_ip_addrs(|addrs| {
             addrs.push(IpCidr::new(LOCAL_ADDR.into(), 24)).unwrap();
         });
+        iface.resolve_neighbor(REMOTE_ADDR, crate::tests::PEER_HARDWARE);
         let mut s = socket_with_buffer_sizes(64, capacity);
         s.cx = iface.inner;
         s.set_rx_mbuf_budget(ip_mtu);
@@ -5771,7 +5773,7 @@ mod test {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn debug_poll_at_scan_preserves_receive_wake_threshold() {
-        let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (mut iface, _, _) = crate::tests::setup_eth();
         let socket = socket().socket;
         let shared = socket.rx_buffer.shared.clone();
         let mut sockets = crate::iface::TcpSet::new(64);

@@ -257,13 +257,7 @@ pub struct DeviceCapabilities {
 
 impl DeviceCapabilities {
     pub fn ip_mtu(&self) -> usize {
-        match self.medium {
-            Medium::Ethernet => {
-                self.max_transmission_unit - crate::wire::EthernetFrame::<&[u8]>::header_len()
-            }
-            #[cfg(feature = "medium-ip")]
-            Medium::Ip => self.max_transmission_unit,
-        }
+        self.max_transmission_unit - crate::wire::EthernetFrame::<&[u8]>::header_len()
     }
 }
 
@@ -275,13 +269,6 @@ pub enum Medium {
     ///
     /// Examples of devices of this type are Ethernet, WiFi (802.11), Linux `tap`, and VPNs in tap (layer 2) mode.
     Ethernet,
-
-    /// IP medium. Devices of this type send and receive IP frames, without an
-    /// Ethernet header. MAC addresses are not used, and no ARP is done.
-    ///
-    /// Examples of devices of this type are the Linux `tun`, PPP interfaces, VPNs in tun (layer 3) mode.
-    #[cfg(feature = "medium-ip")]
-    Ip,
 }
 
 impl Default for Medium {
