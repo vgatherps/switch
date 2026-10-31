@@ -22,7 +22,7 @@ use switchnet::{
 use zhida_open::Sizing;
 
 use crate::hist::{Histogram, Sparse};
-use crate::host::{self, Clock, EthStats, Host, TurnSums};
+use crate::host::{self, Clock, Host};
 use crate::pace::{Outcome, Pacer};
 use crate::record::Recorder;
 use crate::schedule::Schedule;
@@ -58,7 +58,7 @@ pub struct Args {
     pub local_port: u16,
 }
 
-/// Datagrams each UDP socket may hold before the Stack drops (counted as `rx_dropped_full`).
+/// Datagrams each UDP socket may hold before the Stack drops.
 const UDP_QUEUE: usize = 256;
 /// Receive and send buffer of each generator TCP connection.
 pub const TCP_BUFFER: usize = 64 * 1024;
@@ -112,8 +112,6 @@ pub struct Command {
 pub struct StepResult {
     pub step: u32,
     pub offered_pps: f64,
-    /// The measurement window (scheduled times of the measured messages), wall clock.
-    pub window_unix_ns: [u64; 2],
     pub measured: u64,
     pub received: u64,
     /// Measured messages that never left the generator before the window ended (included in
@@ -123,47 +121,25 @@ pub struct StepResult {
     /// rates, against `offered_pps`.
     pub sent_in_window: u64,
     pub received_in_window: u64,
-    pub duplicates: u64,
-    pub stale: u64,
-    pub malformed: u64,
-    pub warmup_received: u64,
     pub latency: Sparse,
-    /// Actual send - scheduled time of messages sent fresh off the schedule.
+    /// Actual send - scheduled time of measured messages sent fresh off the schedule (not those
+    /// a connection owed: TCP flow control or the budget is the receiver's doing).
     pub send_lag: Sparse,
-    /// The same for messages a connection owed (TCP flow control or the budget): the
-    /// receiver's doing.
-    pub owed_wait: Sparse,
+    /// Messages due and not sent, not owed by a blocked connection: the generator's backlog.
     pub backlog_at_end: u64,
-    pub owed_at_end: u64,
     /// TCP/ws: echo time - actual send time.
     pub service_rtt: Sparse,
-    pub budget: Option<u32>,
-    /// Measured messages that waited at least once because their connection was at `budget`.
+    /// Measured messages that waited at least once because their connection was at its budget.
     pub budget_waits: u64,
-    /// TCP/ws: a connection's messages in flight right after each measured send (sum, count,
-    /// max).
-    pub in_flight_sum: u64,
-    pub in_flight_samples: u64,
-    pub in_flight_max: u64,
-    /// The worker's loop over the step: wall time per round (Net turn + Runtime poll).
-    pub ns_per_round: u64,
-    pub turns: TurnSums,
-    pub eth: EthStats,
-    pub rx_dropped_full: u64,
 }
 
 /// What the send task leaves for the loop once it has sent the whole step or been cut off.
 struct Sent {
     lag: Histogram,
-    owed_wait: Histogram,
     backlog_at_end: u64,
-    owed_at_end: u64,
     unsent: u64,
     in_window: u64,
     budget_waits: u64,
-    in_flight_sum: u64,
-    in_flight_samples: u64,
-    in_flight_max: u64,
 }
 
 /// The senders' send halves (ws: the upgraded connections' TCP halves).
@@ -193,13 +169,6 @@ impl Senders {
                 Err((_, SendFrameError::Full)) => Outcome::Blocked,
                 Err((_, e)) => panic!("tcp send on connection {sender}: {e:?}"),
             },
-        }
-    }
-
-    fn rx_dropped_full(&self) -> u64 {
-        match self {
-            Senders::Udp(txs) => txs.iter().map(|tx| tx.stats().rx_dropped_full).sum(),
-            Senders::Tcp(_) | Senders::Ws(_) => 0,
         }
     }
 }
@@ -323,7 +292,6 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     let reply = |r: &Reply| serde_json::to_string(r).expect("reply serializes");
     out(&reply(&Reply::Ready));
     let mut stdin = Stdin::nonblocking()?;
-    let mut idle = TurnSums::default();
     loop {
         match stdin.line()? {
             Some(line) if line.trim().is_empty() => {}
@@ -346,7 +314,7 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
             }
             None if stdin.closed => break,
             None => {
-                worker.host.round(&mut idle)?;
+                worker.host.round()?;
             }
         }
         if host::stopped() {
@@ -461,9 +429,8 @@ fn connect_all(
         })?;
     }
     let deadline = host.clock.now_ns() + CONNECT_LIMIT.as_nanos() as u64;
-    let mut turns = TurnSums::default();
     while connected.borrow().iter().any(Option::is_none) {
-        if host.round(&mut turns)? > deadline {
+        if host.round()? > deadline {
             return Err(format!(
                 "{} connections not established within {CONNECT_LIMIT:?}",
                 n
@@ -502,8 +469,6 @@ impl Worker {
     fn step(&mut self, c: Command) -> Result<StepResult, String> {
         let host = &mut self.host;
         let clock = host.clock;
-        let eth_before = EthStats::read(host.port_id)?;
-        let dropped_before = self.senders.borrow().rx_dropped_full();
         let origin = clock.mono_of_unix(c.start_unix_ns);
         let schedule = Schedule::for_rate(self.args.senders, c.rate_pps, origin);
         let window = [
@@ -533,11 +498,9 @@ impl Worker {
             sent.clone(),
         );
         spawn(host, task)?;
-        let mut turns = TurnSums::default();
-        let started_ns = clock.now_ns();
         let drain_end = window[1] + c.drain_ms * 1_000_000;
         loop {
-            let now = host.round(&mut turns)?;
+            let now = host.round()?;
             if host::stopped() {
                 return Err("stopped".into());
             }
@@ -545,39 +508,21 @@ impl Worker {
                 break;
             }
         }
-        let elapsed_ns = clock.now_ns() - started_ns;
         let r = self.recorder.borrow_mut().take().expect("set above");
         let s = sent.borrow_mut().take().expect("checked above");
-        let eth = EthStats::read(host.port_id)?.since(&eth_before);
-        let dropped_after = self.senders.borrow().rx_dropped_full();
         Ok(StepResult {
             step: c.step,
             offered_pps: schedule.offered_pps(),
-            window_unix_ns: window.map(|ns| clock.unix_ns(ns)),
             measured: r.measured(),
             received: r.received,
             unsent: s.unsent,
             sent_in_window: s.in_window,
             received_in_window: r.received_in_window,
-            duplicates: r.duplicates,
-            stale: r.stale,
-            malformed: r.malformed,
-            warmup_received: r.warmup_received,
             latency: r.latency.to_sparse(),
             send_lag: s.lag.to_sparse(),
-            owed_wait: s.owed_wait.to_sparse(),
             backlog_at_end: s.backlog_at_end,
-            owed_at_end: s.owed_at_end,
             service_rtt: r.service_rtt.to_sparse(),
-            budget: c.budget,
             budget_waits: s.budget_waits,
-            in_flight_sum: s.in_flight_sum,
-            in_flight_samples: s.in_flight_samples,
-            in_flight_max: s.in_flight_max,
-            ns_per_round: elapsed_ns / turns.turns.max(1),
-            turns,
-            eth,
-            rx_dropped_full: dropped_after - dropped_before,
         })
     }
 }
@@ -614,8 +559,8 @@ async fn try_tx_frame(handle: &NetHandle) -> Option<TxFrame> {
 
 /// Sends the step's messages on schedule through the pacer (at most its budget per poll),
 /// yielding to the loop between batches, until all are sent or the window ends. Send lag is
-/// recorded for measured messages only (the warmup absorbs ARP and connection start); owed
-/// messages (a full connection, or one at its budget) are timed apart.
+/// recorded for measured messages only (the warmup absorbs ARP and connection start), and not for
+/// owed messages (a full connection, or one at its budget).
 async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let SendStep {
         handle,
@@ -633,15 +578,10 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     } = s;
     let mut out = Sent {
         lag: Histogram::new(),
-        owed_wait: Histogram::new(),
         backlog_at_end: 0,
-        owed_at_end: 0,
         unsent: 0,
         in_window: 0,
         budget_waits: 0,
-        in_flight_sum: 0,
-        in_flight_samples: 0,
-        in_flight_max: 0,
     };
     // per sender, the last message refused for its budget (each counts once however often
     // it is retried)
@@ -689,23 +629,11 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
             if outcome == Outcome::Sent {
                 let now = clock.now_ns();
                 out.in_window += u64::from((window[0]..window[1]).contains(&now));
-                let in_flight = conn.map_or(0, |c| {
-                    let mut q = c.in_flight.borrow_mut();
-                    q.push_back(now);
-                    q.len() as u64
-                });
-                if k >= measured_from {
-                    let wait = now.saturating_sub(sched_ns);
-                    if owed {
-                        out.owed_wait.record(wait)
-                    } else {
-                        out.lag.record(wait)
-                    }
-                    if conn.is_some() {
-                        out.in_flight_sum += in_flight;
-                        out.in_flight_samples += 1;
-                        out.in_flight_max = out.in_flight_max.max(in_flight);
-                    }
+                if let Some(c) = conn {
+                    c.in_flight.borrow_mut().push_back(now);
+                }
+                if k >= measured_from && !owed {
+                    out.lag.record(now.saturating_sub(sched_ns));
                 }
             }
             pacer.result(k, outcome);
@@ -718,7 +646,6 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     pacer.begin(now);
     pacer.finish(now);
     out.backlog_at_end = pacer.backlog_at_end();
-    out.owed_at_end = pacer.owed_at_end();
     out.unsent = pacer.unsent_from(measured_from);
     *done.borrow_mut() = Some(out);
 }

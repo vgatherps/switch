@@ -1,5 +1,5 @@
 //! What every Zhida side of the bench shares: the clock, opening the Net from a netconf config,
-//! the busy-poll round, summed `Turn` counters, ethdev stats and the stop signal.
+//! the busy-poll round and the stop signal.
 
 use std::io;
 use std::path::Path;
@@ -7,10 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant as WallInstant, SystemTime, UNIX_EPOCH};
 
 use dpdk_smoltcp::Eal;
-use serde::{Deserialize, Serialize};
 use switch::Runtime;
-use switchnet::{Instant, Net, NetConfig, Turn};
-use zhida_dpdk_sys::{rte_eth_stats, rte_eth_stats_get};
+use switchnet::{Instant, Net, NetConfig};
 use zhida_netconf::Config;
 use zhida_open::{Sizing, open};
 
@@ -72,82 +70,11 @@ fn unix_now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// `Turn` counters summed over a window; staged and pending are maxima.
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-pub struct TurnSums {
-    pub turns: u64,
-    /// Task polls of the Runtime, summed over the turns' rounds.
-    #[serde(default)]
-    pub tasks_polled: u64,
-    pub rx_received: u64,
-    pub rx_rejected: u64,
-    pub rx_processed: u64,
-    pub tx_accepted: u64,
-    pub max_rx_staged: u64,
-    pub max_tx_pending: u64,
-}
-
-impl TurnSums {
-    #[inline]
-    pub fn add(&mut self, t: &Turn) {
-        self.turns += 1;
-        self.rx_received += t.rx_received as u64;
-        self.rx_rejected += t.rx_rejected as u64;
-        self.rx_processed += t.rx_processed as u64;
-        self.tx_accepted += t.tx_accepted as u64;
-        self.max_rx_staged = self.max_rx_staged.max(t.rx_staged as u64);
-        self.max_tx_pending = self.max_tx_pending.max(t.tx_pending as u64);
-    }
-}
-
-/// The ethdev counters the bench reports.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EthStats {
-    pub ipackets: u64,
-    pub opackets: u64,
-    pub imissed: u64,
-    pub ierrors: u64,
-    pub oerrors: u64,
-    pub rx_nombuf: u64,
-}
-
-impl EthStats {
-    /// `rte_eth_stats_get`: may be slow (ENA asks the device), so only at step boundaries.
-    pub fn read(port_id: u16) -> Result<EthStats, String> {
-        // SAFETY: the ethdev is open while the Port lives and `stats` is a writable output.
-        let mut stats: rte_eth_stats = unsafe { std::mem::zeroed() };
-        let rc = unsafe { rte_eth_stats_get(port_id, &mut stats) };
-        if rc != 0 {
-            return Err(format!("rte_eth_stats_get: {rc}"));
-        }
-        Ok(EthStats {
-            ipackets: stats.ipackets,
-            opackets: stats.opackets,
-            imissed: stats.imissed,
-            ierrors: stats.ierrors,
-            oerrors: stats.oerrors,
-            rx_nombuf: stats.rx_nombuf,
-        })
-    }
-
-    pub fn since(&self, earlier: &EthStats) -> EthStats {
-        EthStats {
-            ipackets: self.ipackets - earlier.ipackets,
-            opackets: self.opackets - earlier.opackets,
-            imissed: self.imissed - earlier.imissed,
-            ierrors: self.ierrors - earlier.ierrors,
-            oerrors: self.oerrors - earlier.oerrors,
-            rx_nombuf: self.rx_nombuf - earlier.rx_nombuf,
-        }
-    }
-}
-
 /// An open Net and what must outlive it.
 pub struct Host {
     pub net: Net,
     pub rt: Runtime,
     pub clock: Clock,
-    pub port_id: u16,
     _eal: Eal,
 }
 
@@ -164,7 +91,6 @@ impl Host {
         // packets; EAL is kept in the Host and outlives the Port, which `close` closes first.
         let opened = unsafe { open(config, sizing, &mut || clock.stack_now(clock.now_ns())) }
             .map_err(|e| format!("open: {e}"))?;
-        let port_id = opened.report.port_id;
         let net = Net::new(
             opened.stack,
             NetConfig {
@@ -175,25 +101,20 @@ impl Host {
             net,
             rt: Runtime::new(clock.now_ns() / 1_000_000),
             clock,
-            port_id,
             _eal: opened.eal,
         })
     }
 
     /// One busy-poll round: turn the Net, poll the tasks; never sleeps.
     #[inline]
-    pub fn round(&mut self, sums: &mut TurnSums) -> Result<u64, String> {
+    pub fn round(&mut self) -> Result<u64, String> {
         let now = self.clock.now_ns();
-        let turn = self
-            .net
+        self.net
             .turn(self.clock.stack_now(now))
             .map_err(|e| format!("turn: {e}"))?;
-        sums.add(&turn);
-        let polled = self
-            .rt
+        self.rt
             .poll(now / 1_000_000)
             .map_err(|e| format!("poll: {e:?}"))?;
-        sums.tasks_polled += polled.tasks_polled as u64;
         Ok(now)
     }
 
@@ -212,33 +133,20 @@ impl Host {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
-static DUMP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-extern "C" fn dump_signal(_: libc::c_int) {
-    DUMP.store(true, Ordering::Relaxed);
-}
-
-/// SIGINT and SIGTERM set the stop flag; SIGUSR1 requests a state dump ([`dump_requested`]).
+/// SIGINT and SIGTERM set the stop flag.
 pub fn catch_stop() -> Result<(), String> {
-    for (signals, handler) in [
-        (
-            &[libc::SIGINT, libc::SIGTERM][..],
-            stop_signal as extern "C" fn(libc::c_int),
-        ),
-        (&[libc::SIGUSR1][..], dump_signal),
-    ] {
-        // SAFETY: sigaction is initialized with a C handler that only sets an atomic.
-        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-        action.sa_sigaction = handler as *const () as usize;
-        unsafe { libc::sigemptyset(&mut action.sa_mask) };
-        for &signal in signals {
-            if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
-                return Err(format!("sigaction: {}", io::Error::last_os_error()));
-            }
+    // SAFETY: sigaction is initialized with a C handler that only sets an atomic.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = stop_signal as extern "C" fn(libc::c_int) as *const () as usize;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        if unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) } != 0 {
+            return Err(format!("sigaction: {}", io::Error::last_os_error()));
         }
     }
     Ok(())
@@ -247,12 +155,6 @@ pub fn catch_stop() -> Result<(), String> {
 #[inline]
 pub fn stopped() -> bool {
     STOP.load(Ordering::Relaxed)
-}
-
-/// Whether a SIGUSR1 arrived since the last call.
-#[inline]
-pub fn dump_requested() -> bool {
-    DUMP.load(Ordering::Relaxed) && DUMP.swap(false, Ordering::Relaxed)
 }
 
 #[cfg(test)]

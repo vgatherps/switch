@@ -19,7 +19,6 @@ serde_json.workspace = true
 switch.workspace = true
 switchnet.workspace = true
 tungstenite.workspace = true
-zhida-dpdk-sys.workspace = true
 zhida-netconf.workspace = true
 zhida-open.workspace = true
 

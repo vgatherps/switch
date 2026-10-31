@@ -4,7 +4,6 @@
 Usage: report.py RESULTS_DIR [--title T]
 
 RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and optionally
-`dut-counters-<sweep>.jsonl` (the `zhida-bench serve` counter log of that sweep's DUT),
 `expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce) and
 `host-setup.txt` (the host setup verification). Python stdlib only.
 
@@ -25,7 +24,7 @@ def load_jsonl(path):
 
 def sweep_files(directory):
     for name in sorted(os.listdir(directory)):
-        if name.endswith(".jsonl") and not name.startswith("dut-counters-"):
+        if name.endswith(".jsonl"):
             yield name, os.path.join(directory, name)
 
 
@@ -54,32 +53,6 @@ def problems(directory, sweeps):
     return out
 
 
-def dut_samples(directory, sweep):
-    """The `sample`s of the sweep's DUT counter log, oldest first."""
-    path = os.path.join(directory, f"dut-counters-{sweep}.jsonl")
-    if not os.path.exists(path):
-        return []
-    samples = [l["sample"] for l in load_jsonl(path) if l.get("kind") == "sample"]
-    return sorted(samples, key=lambda s: s["unix_ns"])
-
-
-def dut_delta(samples, window):
-    """DUT counter deltas over [start, end] from the last sample at or before `start` to the first at
-    or after `end`; None if the samples do not bracket the window."""
-    start, end = window
-    before = [s for s in samples if s["unix_ns"] <= start]
-    after = [s for s in samples if s["unix_ns"] >= end]
-    if not before or not after:
-        return None
-    a, b = before[-1], after[0]
-    return {
-        "echoed": b["echoed"] - a["echoed"],
-        "rx_dropped_full": b["rx_dropped_full"] - a["rx_dropped_full"],
-        "rx_received": b["turns"]["rx_received"] - a["turns"]["rx_received"],
-        "send_errors": b["send_errors"] - a["send_errors"],
-    }
-
-
 def us(ns):
     return "-" if ns is None else f"{ns / 1000:.1f}"
 
@@ -87,24 +60,6 @@ def us(ns):
 def lat(step, key):
     q = step.get("latency_ns")
     return None if q is None else q[key]
-
-
-def max_gen_lag_p99(step):
-    lags = [g["send_lag_ns"]["p99"] for g in step.get("per_gen", []) if g.get("send_lag_ns")]
-    return max(lags) if lags else None
-
-
-def round_cost(step):
-    """The slowest generator worker's loop: µs per round and Runtime task polls per round."""
-    gens = [g for g in step.get("per_gen", []) if g.get("ns_per_round")]
-    if not gens:
-        return "-"
-    g = max(gens, key=lambda g: g["ns_per_round"])
-    return f"{g['ns_per_round'] / 1000:.2f} ({g['tasks_per_round']:.1f})"
-
-
-def owed(step):
-    return sum(g.get("owed_at_end", 0) for g in step.get("per_gen", []))
 
 
 def flags(step):
@@ -118,28 +73,18 @@ def flags(step):
     return " ".join(out) or "-"
 
 
-def in_flight(step):
-    mean = step.get("in_flight_mean")
-    return "-" if mean is None else f"{mean:.1f} / {step.get('in_flight_max', 0)}"
-
-
-def table(steps, samples):
+def table(steps):
     rows = [
         "| step | offered pps | sent pps | received pps | p50 µs | p99 µs | p99.9 µs | max µs | drop % | unsent |"
-        " good | flags | service RTT p50 µs | budget | in flight mean / max | owed | max gen lag p99 µs |"
-        " DUT echoed | DUT full-queue drops | gen µs/round (tasks/round) |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:-:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        " good | flags | budget |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:-:|---|---:|",
     ]
     for s in sorted(steps, key=lambda s: (s["offered_pps"], s["step"])):
-        d = dut_delta(samples, s["window_unix_ns"]) if samples else None
-        rtt = s.get("service_rtt_ns")
         rows.append(
-            f"| {s['step']} | {s['offered_pps']:.0f} | {s.get('sent_pps', 0):.0f} | {s.get('received_pps', 0):.0f} |"
+            f"| {s['step']} | {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} |"
             f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
-            f" {100 * s['drop_fraction']:.3f} | {s.get('unsent', 0)} | {'yes' if s['good'] else 'no'} | {flags(s)} |"
-            f" {us(rtt['p50'] if rtt else None)} | {s.get('budget') or '-'} | {in_flight(s)} | {owed(s)} |"
-            f" {us(max_gen_lag_p99(s))} | {'-' if d is None else d['echoed']} |"
-            f" {'-' if d is None else d['rx_dropped_full']} | {round_cost(s)} |"
+            f" {100 * s['drop_fraction']:.3f} | {s['unsent']} | {'yes' if s['good'] else 'no'} | {flags(s)} |"
+            f" {s.get('budget') or '-'} |"
         )
     return "\n".join(rows)
 
@@ -230,7 +175,7 @@ def build(directory, title):
             md += ["## Host setup", "", "```", f.read().rstrip(), "```", ""]
     results = {"title": title, "sweeps": []}
     knees = ["| sweep | proto | gens | senders | size | knee pps | stopped by | last good pps | steps |"
-             " baseline RTT p50 / p99 µs | budget window µs | complete |",
+             " baseline RTT p50 µs | budget window µs | complete |",
              "|---|---|---:|---:|---:|---:|---|---:|---:|---:|---:|:-:|"]
     sections = []
     summaries = {}
@@ -238,29 +183,24 @@ def build(directory, title):
         steps, summary = split_sweep(load_jsonl(path))
         stem = name[: -len(".jsonl")]
         summaries[stem] = summary
-        samples = dut_samples(directory, stem)
-        results["sweeps"].append({"name": stem, "summary": summary, "steps": steps, "dut_samples": samples})
+        results["sweeps"].append({"name": stem, "summary": summary, "steps": steps})
         if summary:
-            base = summary.get("baseline_rtt_ns")
             knees.append(f"| {stem} | {summary['proto']} | {summary['gens']} | {summary['senders']} | {summary['size']} |"
                          f" {knee_text(summary)} | {summary.get('stop', '-')} | {summary.get('last_good_pps') or '-'} |"
-                         f" {summary['steps']} | {us(base['p50']) + ' / ' + us(base['p99']) if base else '-'} |"
+                         f" {summary['steps']} | {us(summary.get('baseline_rtt_p50_ns'))} |"
                          f" {summary.get('budget_window_us') or '-'} | {'yes' if summary.get('complete') else 'NO'} |")
         else:
             knees.append(f"| {stem} | - | - | - | - | - | no summary | - | {len(steps)} | - | - | NO |")
         with open(os.path.join(directory, stem + ".svg"), "w") as f:
             f.write(svg_plot(steps, summary, stem))
-        sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps, samples), ""]
-        if samples:
-            sections += ["DUT columns: the Zhida DUT's counters between its samples (every 100 ms) bracketing the"
-                         " step's measured window, warmup included.", ""]
+        sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
             sections += ["GEN-BOUND: a generator fell behind its schedule; that step measured the generator, not the"
                          " DUT, and the sweep stopped there.", ""]
         if any(s.get("budget_bound") for s in steps):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
-                         " flight (rate share x (baseline RTT + window)). Where service RTT stays near the baseline,"
-                         " the latency there is the budget's, not receiver saturation.", ""]
+                         " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"
+                         " receiver saturation.", ""]
     issues = problems(directory, summaries)
     head = [f"# {title}", ""]
     if issues:
@@ -270,9 +210,8 @@ def build(directory, title):
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
            " measured messages not echoed by the end of the drain, unsent ones included (sending stops at the end"
            " of the window); sent / received pps are what actually left the generators and came back within the"
-           " window; service RTT is echo time minus actual send time (TCP/ws); owed = messages a TCP connection"
-           " still owed at the end of the window (flow control or budget: the receiver side, not the generator);"
-           " DUT echoed counts datagrams (UDP) or bytes (TCP); no TLS (ws:// only)."]
+           " window; baseline RTT is the first step's median echo time minus actual send time (TCP/ws); no TLS"
+           " (ws:// only)."]
     results["incomplete"] = issues
     with open(os.path.join(directory, "report.md"), "w") as f:
         f.write("\n".join(md) + "\n")

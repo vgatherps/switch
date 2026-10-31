@@ -83,7 +83,7 @@ run_sweep() { # proto addr out-file [flags...]: the sweep's exit status; its std
 }
 
 for proto in $protos; do
-    start_dut "$proto" --counter-log "$out/dut-counters-$proto-zhida.jsonl"
+    start_dut "$proto"
     budget=
     [ "$proto" = udp ] || budget="--budget-us 50"
     # shellcheck disable=SC2086 # budget is zero or two words

@@ -1,8 +1,8 @@
 //! What the generator learns from echoes in one rate step: latency of every measured message
 //! (receive time - scheduled time), which messages came back (a bitmap over the step's message
-//! numbers), duplicates, echoes that do not belong to this step, how many of this step's echoes
-//! arrived within the measurement window (the achieved receive rate), and (TCP/ws) the service
-//! round trip: echo time - actual send time.
+//! numbers; duplicates, echoes of another step and mangled headers are ignored), how many of this
+//! step's echoes arrived within the measurement window (the achieved receive rate), and (TCP/ws)
+//! the service round trip: echo time - actual send time.
 
 use crate::hist::Histogram;
 use crate::schedule::Schedule;
@@ -18,12 +18,6 @@ pub struct Recorder {
     seen: Vec<u64>,
     pub latency: Histogram,
     pub received: u64,
-    pub warmup_received: u64,
-    pub duplicates: u64,
-    /// Echoes of another step, or of a message number outside this step's schedule.
-    pub stale: u64,
-    /// Shorter than a header, or a header whose scheduled time does not match the schedule.
-    pub malformed: u64,
     /// This step's echoes (warmup and measured, once each) that arrived within `window`.
     pub received_in_window: u64,
     /// Monotonic ns `[start, end)` of the measurement window.
@@ -52,10 +46,6 @@ impl Recorder {
             seen: vec![0; words],
             latency: Histogram::new(),
             received: 0,
-            warmup_received: 0,
-            duplicates: 0,
-            stale: 0,
-            malformed: 0,
             received_in_window: 0,
             window,
             service_rtt: Histogram::new(),
@@ -66,32 +56,23 @@ impl Recorder {
     #[inline]
     pub fn record(&mut self, payload: &[u8], now_ns: u64) {
         let Some(header) = Header::read(payload) else {
-            self.malformed += 1;
             return;
         };
         if header.step != self.step || header.sender >= self.schedule.senders {
-            self.stale += 1;
             return;
         }
         let k = header.seq * u64::from(self.schedule.senders) + u64::from(header.sender);
-        if k >= self.end {
-            self.stale += 1;
-            return;
-        }
-        if header.sched_ns != self.schedule.due_at(k) {
-            self.malformed += 1;
+        if k >= self.end || header.sched_ns != self.schedule.due_at(k) {
             return;
         }
         let in_window = (self.window[0]..self.window[1]).contains(&now_ns);
         if k < self.measured_from {
-            self.warmup_received += 1;
             self.received_in_window += u64::from(in_window);
             return;
         }
         let bit = k - self.measured_from;
         let (word, mask) = ((bit / 64) as usize, 1u64 << (bit % 64));
         if self.seen[word] & mask != 0 {
-            self.duplicates += 1;
             return;
         }
         self.seen[word] |= mask;
@@ -129,8 +110,8 @@ mod tests {
         buf
     }
 
-    /// Latency is receive time minus the scheduled time; warmup echoes are counted apart and
-    /// not measured; every measured message not echoed is lost.
+    /// Latency is receive time minus the scheduled time; warmup echoes are not measured; every
+    /// measured message not echoed is lost.
     #[test]
     fn latency_warmup_and_loss() {
         let s = Schedule {
@@ -145,17 +126,16 @@ mod tests {
             }
             r.record(&message(1, &s, k), s.due_at(k) + 500 + k);
         }
-        assert_eq!(r.warmup_received, 6);
         assert_eq!((r.measured(), r.received, r.lost()), (24, 21, 3));
         assert_eq!(r.latency.count(), 21);
         assert_eq!(r.latency.min(), Some(506));
         assert_eq!(r.latency.max(), 528);
     }
 
-    /// A second copy of a message is a duplicate, not a second receive; an echo of another
-    /// step, or past the step's end, is stale; a mangled header is malformed.
+    /// A second copy of a message, an echo of another step or past the step's end, and a
+    /// mangled header are not receives.
     #[test]
-    fn duplicates_stale_and_malformed() {
+    fn duplicates_stale_and_malformed_are_ignored() {
         let s = Schedule {
             senders: 2,
             interval_ns: 1000,
@@ -173,10 +153,7 @@ mod tests {
         let mut bad_sender = message(5, &s, 1);
         bad_sender[4] = 9;
         r.record(&bad_sender, 10_006);
-        assert_eq!(
-            (r.received, r.duplicates, r.stale, r.malformed),
-            (1, 1, 3, 2)
-        );
+        assert_eq!(r.received, 1);
         assert_eq!(r.lost(), 9);
     }
 
@@ -210,6 +187,6 @@ mod tests {
         r.record(&message(1, &s, 3), 3000); // stale
         r.record(&message(2, &s, 3), 10_000); // after the window
         assert_eq!(r.received_in_window, 2);
-        assert_eq!((r.warmup_received, r.received), (2, 2));
+        assert_eq!(r.received, 2);
     }
 }

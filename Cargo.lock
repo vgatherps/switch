@@ -1948,7 +1948,6 @@ dependencies = [
  "switch",
  "switchnet",
  "tungstenite",
- "zhida-dpdk-sys",
  "zhida-netconf",
  "zhida-open",
  "zhida-test-support",

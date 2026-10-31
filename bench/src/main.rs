@@ -30,9 +30,8 @@ usage:
       One generator worker (a Zhida Stack on its own Port and core); takes steps on stdin.
       udp: N sockets; tcp: N connections, S-byte messages on each (S at most the MSS);
       ws: N ws:// connections, S-byte binary messages (S at most 1400: one TCP frame).
-  zhida-bench serve --config F --proto udp|tcp|ws --port P [--counter-log F]
-                    [--ring 36000] [--max-conns 256] [--accepts 64]
-      Zhida echo server; runs until SIGINT/SIGTERM, then writes its counter log.";
+  zhida-bench serve --config F --proto udp|tcp|ws --port P [--max-conns 256] [--accepts 64]
+      Zhida echo server; runs until SIGINT/SIGTERM.";
 
 struct Flags(HashMap<String, String>);
 
@@ -158,8 +157,6 @@ fn main_inner() -> Result<(), String> {
                 port: flags.need("port")?,
                 max_conns: flags.or("max-conns", 256)?,
                 accepts: flags.or("accepts", 64)?,
-                counter_log: flags.take("counter-log")?,
-                ring: flags.or("ring", 36_000)?,
             };
             flags.done()?;
             serve::run(&args)
