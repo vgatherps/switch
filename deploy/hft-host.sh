@@ -243,12 +243,18 @@ ISOLATED=$ISOLATED
 HOUSEKEEPING=$HOUSEKEEPING" || true
 }
 
+# discover writes rx_timestamps false and later discovers keep what the file has; the listener wants
+# the ENA hardware RX stamps, so the file says true. Port open then fails on an instance whose ENA
+# does not offer them (README: instance requirements).
 step_config() {
     if [ "$(pci_driver "$DATA_PCI")" != vfio-pci ]; then
         zhida-netconf discover --interface "$DATA_IF" --aws -o "$DUT" || fatal config "zhida-netconf discover failed"
     fi
-    zhida-netconf check "$DUT" >/dev/null || fatal config "zhida-netconf check $DUT failed"
-    report config ok "$DUT"
+    sed 's/^  "rx_timestamps": false,$/  "rx_timestamps": true,/' "$DUT" >"$DUT.new" || fatal config "reading $DUT failed"
+    mv "$DUT.new" "$DUT" || fatal config "writing $DUT failed"
+    zhida-netconf check "$DUT" | grep -qx 'rx_timestamps: true' \
+        || fatal config "zhida-netconf check $DUT failed or rx_timestamps is not true"
+    report config ok "$DUT, rx_timestamps true"
 }
 
 cmdline_args() {
@@ -495,7 +501,11 @@ verify() {
         report unit FAIL "zhida-host.service not enabled"
     fi
 
-    if zhida-netconf check "$DUT" >/dev/null 2>&1; then report config ok "$DUT"; else report config FAIL "zhida-netconf check $DUT"; fi
+    if zhida-netconf check "$DUT" 2>/dev/null | grep -qx 'rx_timestamps: true'; then
+        report config ok "$DUT, rx_timestamps true"
+    else
+        report config FAIL "zhida-netconf check $DUT failed or rx_timestamps is not true"
+    fi
     exit $failed
 }
 

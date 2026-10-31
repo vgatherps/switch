@@ -32,10 +32,12 @@ stub systemctl "case \"\$1\" in is-enabled) [ -e '$tmp/enabled' ] ;; enable) tou
 stub pgrep "[ -e '$tmp/irqbalance' ]"
 stub mountpoint '[ "$1" = -q ] && shift; [ -e "$1/.mounted" ]'
 stub modinfo "[ \"\$*\" = '-F srcversion vfio_pci_core' ] && echo PATCHED; exit 0"
-# zhida-netconf: discover writes the config; check needs it; bind moves the data device to vfio-pci.
+# zhida-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
+# prints the field as the real one does, or fails without the file; bind moves the data device to
+# vfio-pci.
 stub zhida-netconf "case \"\$1\" in
-    discover) echo '{}' >\"\$6\" ;;
-    check) [ -f \"\$2\" ] ;;
+    discover) printf '{\\n  \"version\": 1,\\n  \"rx_timestamps\": false,\\n  \"descriptors\": 1024\\n}\\n' >\"\$6\" ;;
+    check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" ;;
     bind) ln -sfn ../../drivers/vfio-pci '$root/sys/bus/pci/devices/0000:00:06.0/driver' ;;
 esac"
 stub zhida-nic "echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489'"
@@ -123,6 +125,8 @@ check "management is the lowest-metric default route" env_has MGMT_IF=ens5
 check "data is the other ena interface" sh -c "grep -qx DATA_IF=ens6 '$root/etc/zhida/host.env' && grep -qx DATA_PCI=0000:00:06.0 '$root/etc/zhida/host.env'"
 check "the app CPU is the node's highest, alone isolated" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx ISOLATED=7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3,4,5,6 '$root/etc/zhida/host.env'"
 check "the config comes from zhida-netconf discover --aws on the data ENI" called "zhida-netconf discover --interface ens6 --aws -o $root/etc/zhida/dut.json"
+check "the generated config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/dut.json"
+check "and keeps the rest of the file" sh -c "grep -qx '  \"descriptors\": 1024' '$root/etc/zhida/dut.json' && [ ! -e '$root/etc/zhida/dut.json.new' ]"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
 check "nothing touches an interface before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
 
@@ -148,6 +152,12 @@ check "a finished host verifies clean" status_is 0
 check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 12 ]"
 check "verify sees management on its kernel driver with the default route" has management "ok ens5 on ena with the default route"
 check "verify reports no run yet" has pools "ok no run logged yet"
+check "verify reports rx_timestamps true" has config "ok $root/etc/zhida/dut.json, rx_timestamps true"
+sed 's/"rx_timestamps": true/"rx_timestamps": false/' "$root/etc/zhida/dut.json" >"$tmp/dut" && cp "$tmp/dut" "$root/etc/zhida/dut.json"
+run verify
+check "verify fails when rx_timestamps is false" sh -c "grep -q '^config: FAIL' '$tmp/out' && [ \$(cat '$tmp/status') = 1 ]"
+run apply
+check "apply turns rx_timestamps back on for a bound data ENI" sh -c "grep -qx '  \"rx_timestamps\": true,' '$root/etc/zhida/dut.json' && ! grep -q discover '$calls'"
 
 mkdir -p "$root/var/log/zhida"
 echo 'zhida-nic: hugepages: hugepages-2048kB used=600 free=0' >"$root/var/log/zhida/binance.log"
