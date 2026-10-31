@@ -226,10 +226,14 @@ speaks TLS 1.2 only and is unreachable; stream.binance.com may answer HTTP 451 f
 locations. Output is up to N bookTicker messages, a message count and the update-id range. Success
 requires at least one message and successful read/close.
 
-`feed_latency` gives each message's latency from the NIC's RX stamp of the frame holding its first byte to relay
-handing it over (`nic-clock`): `no_stamp` (unstamped: `rx_timestamps` off or the PMD left no stamp), `not_ready`
-(no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the largest error
-bound and a log2 histogram in ns. On ENA (with the DPDK patch in `docker/dpdk-ena-read-clock.patch`),
+`feed_latency` measures from the retained RX-buffer timestamp of the TLS record containing a
+message's first WebSocket byte until relay hands over the complete message (`nic-clock`). Multiple
+messages can share a timestamp; TCP can append a later small packet to an earlier buffer and retain
+the earlier timestamp. These intervals can therefore start before the message's own packet.
+The output gives `no_stamp` (unstamped: `rx_timestamps` off or the PMD left no stamp), `not_ready`
+(no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the
+largest mapping uncertainty and a log2 histogram in ns. On ENA (with the DPDK patch in
+`docker/dpdk-ena-read-clock.patch`),
 the default source is `dpdk_smoltcp::read_clock`, which never runs during an ENA device reset
 (the reset frees and rebuilds the PHC). If the port reports -ENOTSUP, no mapping is available.
 A thread on the housekeeping CPUs (online CPUs not in /sys/devices/system/cpu/isolated, minus

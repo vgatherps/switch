@@ -277,8 +277,8 @@ pub struct Summary {
     pub latencies: Latencies,
 }
 
-/// Per message: NIC RX stamp of the frame holding its first byte to relay handing it over
-/// (`nic_clock::since`).
+/// Per message: the retained RX-buffer stamp for its first WebSocket byte's TLS record
+/// to relay handing the complete message over (`nic_clock::since`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Latencies {
     /// Messages without a NIC stamp.
