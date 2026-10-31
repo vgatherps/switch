@@ -18,6 +18,7 @@ check() { # description, command...
 root=$tmp/root
 calls=$tmp/calls
 stubs=$tmp/bin
+printf '%s\n' '[Match]' 'MACAddress=0a:00:00:00:00:06' '' '[Link]' 'Unmanaged=yes' >"$tmp/unmanaged.network"
 mkdir -p "$stubs"
 stub() { # name body
     printf '#!/bin/sh\necho "%s $*" >>"%s"\n%s\n' "$1" "$calls" "$2" >"$stubs/$1"
@@ -29,7 +30,11 @@ stub uname 'case "$1" in -r) echo "${FAKE_KERNEL:-6.1.0-test}" ;; *) echo "${FAK
 stub pkg-config 'echo 25.11.3'
 stub ip "[ \"\$*\" = '-4 route show default' ] && cat '$tmp/routes'; exit 0"
 stub grubby "case \"\$1\" in --info=*) echo \"args=\\\"\$(cat '$tmp/grubby')\\\"\" ;; --update-kernel=*) echo \"\${2#--args=}\" >>'$tmp/grubby' ;; esac"
-stub systemctl "case \"\$1\" in is-enabled) [ -e '$tmp/enabled' ] ;; enable) touch '$tmp/enabled' ;; esac"
+stub systemctl "case \"\$1\" in
+    is-enabled) [ -e '$tmp/enabled' ] ;;
+    enable) touch '$tmp/enabled' ;;
+    reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' && touch '$tmp/unmanaged-before-reboot' ;;
+esac"
 stub pgrep "[ -e '$tmp/irqbalance' ]"
 stub mountpoint '[ "$1" = -q ] && shift; [ -e "$1/.mounted" ]'
 stub modinfo "case \"\$*\" in
@@ -74,7 +79,7 @@ dpdk_stamp="dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bb
 # A fresh c7g-like host: CPUs 0-7 on node 0, no SMT, management ens5, data ens6, stock modules.
 host() {
     unset FAKE_ARCH FAKE_KERNEL FAKE_SRCVERSION FAKE_RPM_ID FAKE_RPM_ALGO FAKE_RPM_DIGEST FAKE_MODINFO_LOOKUP_FAIL
-    rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance"
+    rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance" "$tmp/unmanaged-before-reboot"
     mkdir -p "$root/proc" "$root/run" "$root/etc" "$root/dev/hugepages" "$root/sys/kernel/iommu_groups" \
         "$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB" "$root/sys/module/vfio_pci_core" \
         "$root/sys/devices/system/clocksource/clocksource0" "$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci" \
@@ -115,6 +120,12 @@ reboot() {
     : >"$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci/vfio-pci-core.ko.xz_no_wc"
     # irqaffinity= puts the IRQs on the housekeeping CPUs at boot.
     for irq in 10 11 12; do echo 0-6 >"$root/proc/irq/$irq/effective_affinity_list"; done
+    # Model networkd's next boot: without the MAC-matched unmanaged file, data DHCP wins.
+    if cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-zhida-data.network"; then
+        echo 'default via 10.0.0.1 dev ens5 proto dhcp metric 512' >"$tmp/routes"
+    else
+        echo 'default via 10.0.0.1 dev ens6 proto dhcp metric 100' >"$tmp/routes"
+    fi
 }
 run() { # mode [args]
     HFT_ROOT=$root sh "$script" "$@" >"$tmp/out" 2>&1
@@ -137,6 +148,8 @@ fresh_apply() {
 fresh_apply
 check "first apply reboots (exit 100) for the command line" status_is 100
 check "the reboot is requested" called "systemctl reboot"
+check "the exact MAC-matched unmanaged config exists when reboot is requested" test -e "$tmp/unmanaged-before-reboot"
+check "staging reloads networkd before reboot" called "networkctl reload"
 check "grubby gets every argument" grep -qx "$want_args" "$tmp/grubby"
 check "management is the lowest-metric default route" env_has MGMT_IF=ens5
 check "data is the other ena interface" sh -c "grep -qx DATA_IF=ens6 '$root/etc/zhida/host.env' && grep -qx DATA_PCI=0000:00:06.0 '$root/etc/zhida/host.env'"
@@ -144,7 +157,7 @@ check "the app CPU is the node's highest, alone isolated" sh -c "grep -qx APP_CP
 check "the config comes from zhida-netconf discover --aws on the data ENI" called "zhida-netconf discover --interface ens6 --aws -o $root/etc/zhida/dut.json"
 check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
-check "nothing touches an interface before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+check "no interface is flushed or bound before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
 
 reboot
 HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
@@ -162,6 +175,15 @@ check "apply after the reboot needs no reboot and succeeds" status_is 0
 check "a second apply does not rerun grubby" sh -c "! grep -q '^grubby --update' '$calls'"
 check "a bound data ENI is not rediscovered" sh -c "! grep -q 'discover' '$calls'"
 check "apply reports the data ENI as already bound" has interfaces "ok management ens5; data 0000:00:06.0 (0a:00:00:00:00:06) already on vfio-pci"
+check "an unchanged unmanaged config does not reload networkd" sh -c "! grep -q '^networkctl reload' '$calls'"
+
+rm "$root/etc/systemd/network/00-zhida-data.network"
+: >"$calls"
+run apply
+check "no-reboot reapply restores a missing unmanaged config" status_is 0
+check "no-reboot reapply writes the exact MAC-matched config" cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-zhida-data.network"
+check "no-reboot reapply reloads networkd for the restored config" called "networkctl reload"
+check "restoring unmanaged config does not request a reboot" sh -c "! grep -q '^systemctl reboot' '$calls'"
 
 run verify
 check "a finished host verifies clean" status_is 0
@@ -217,9 +239,27 @@ fresh_apply
 reboot
 printf '%s\n' 'default via 10.0.0.1 dev ens6 metric 100' >"$tmp/routes"
 : >"$calls"
-HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+run boot
 check "boot refuses when the default route moved" has unmanaged "FAIL default route moved from ens5 to ens6"
-check "and touches no interface" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+check "a changed management route exits unsuccessfully" status_is 1
+check "and neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|zhida-netconf bind' '$calls'"
+
+stub networkctl 'exit 1'
+fresh_apply
+check "a failed staging reload fails apply" status_is 1
+check "the staging reload failure is reported" has unmanaged "FAIL networkctl reload failed"
+check "a failed staging reload neither reboots nor touches an interface" sh -c "! grep -q 'systemctl reboot\|flush\|zhida-netconf bind' '$calls'"
+stub networkctl ""
+
+fresh_apply
+reboot
+rm "$root/etc/systemd/network/00-zhida-data.network"
+mkdir "$root/etc/systemd/network/00-zhida-data.network"
+: >"$calls"
+run boot
+check "an unwritable unmanaged config fails boot" status_is 1
+check "the config write failure is reported" has unmanaged "FAIL cannot write"
+check "a failed config write neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|zhida-netconf bind' '$calls'"
 
 host
 echo 3,7 >"$root/sys/devices/system/cpu/cpu7/topology/thread_siblings_list"

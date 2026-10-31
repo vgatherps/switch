@@ -53,8 +53,16 @@ Use `--interface IF` only when the host has more than one non-management ENA int
 | vfio_wc | official AL2023 `kernel6.18` already supplies ENA write-combining (needed for LLQ); check package ownership/integrity and loaded module identity, without installing headers or rebuilding it. Legacy kernels retain amzn-drivers' `get-vfio-with-wc.sh`, pinned commit and sha256 |
 | cmdline (x86_64) | also `clocksource=tsc` (not `tsc=reliable`, which turns off the kernel's TSC stability checks). Graviton's `arch_sys_counter` needs nothing |
 | unit | `zhida-host.service` runs `hft-host.sh boot` at every boot |
+| unmanaged config | before requesting a reboot, write `/etc/systemd/network/00-zhida-data.network` with the data ENI's MAC and `Unmanaged=yes`; reload networkd only when the file changes. No addresses or routes are flushed until `boot` |
 | reboot | when the command line or a module changed |
 | boot | irqbalance off; every movable IRQ on the housekeeping CPUs; the data ENI unmanaged by systemd-networkd (`/etc/systemd/network/00-zhida-data.network`, matched by MAC) with its addresses and routes flushed; `zhida-netconf bind` (`--noiommu` without IOMMU groups) |
+
+The unmanaged file must exist before the first reboot: otherwise AL2023 can give the data ENI a DHCP
+default route before `zhida-host.service` starts, making it the lowest-metric default route instead
+of management. `boot` still checks the saved management interface against the live default route
+before configuring or flushing data, and refuses if it changed; it never flushes the new default-route
+interface to recover. A no-reboot `apply`, reapply, or standalone `boot` also writes a missing or changed
+unmanaged file and reloads networkd. Write and reload failures stop setup before flushing or binding.
 
 `verify` prints one `<step>: ok|FAIL <detail>` line for each of: cmdline, management (on its kernel
 driver, with the default route), data (on vfio-pci), cpus (`isolated` and `nohz_full` in sysfs), hugepages,
@@ -109,6 +117,10 @@ sh deploy/test-hft-host.sh
 
 It runs apply, boot, verify and run-binance.sh against a fake `/proc`, `/sys`, `/etc` tree with stub
 commands. The build step is checked separately by running `hft-host.sh build` in an `amazonlinux:2023`
-container. Kernel modules, grubby, the reboot, networkd, IRQs and vfio binding run only on a real instance.
+container. The reboot stub checks the exact unmanaged file at the reboot request; the simulated next
+boot lets data DHCP win if it is absent, and a separate case forces a genuine management-route change
+and checks that setup fails without reload, flush, or bind. Write/reload failures and no-reboot config
+restoration are covered too. Real kernel modules, grubby, reboot, networkd, IRQs and vfio binding still
+require a real instance.
 Native WC integrity cases hash real fixture files; their checksum wrapper rejects GNU-only
 verification switches so the same comparison works with GNU and macOS `sha256sum`.

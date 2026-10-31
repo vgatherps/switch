@@ -376,15 +376,21 @@ guard_mgmt() { # step
     [ "${DATA_IF:-}" != "$now" ] || fatal "$1" "data interface $DATA_IF carries the default route: refusing"
 }
 
-step_unmanaged() {
+stage_unmanaged() {
     guard_mgmt unmanaged
-    if put "$NETWORK" "[Match]
+    config="[Match]
 MACAddress=$DATA_MAC
 
 [Link]
-Unmanaged=yes"; then
+Unmanaged=yes"
+    if [ ! -f "$NETWORK" ] || [ "$(cat "$NETWORK")" != "$config" ]; then
+        put "$NETWORK" "$config" || fatal unmanaged "cannot write $NETWORK"
         networkctl reload || fatal unmanaged "networkctl reload failed"
     fi
+}
+
+step_unmanaged() {
+    stage_unmanaged
     if [ -e "$R/sys/class/net/$DATA_IF" ]; then
         ip addr flush dev "$DATA_IF" || fatal unmanaged "flushing $DATA_IF addresses failed"
         ip -4 route flush table all dev "$DATA_IF" || fatal unmanaged "flushing $DATA_IF routes failed"
@@ -418,6 +424,7 @@ apply() {
     step_vfio_wc
     step_unit
     if [ -n "$reboot_needed" ]; then
+        stage_unmanaged
         echo "reboot: rebooting now for:$reboot_needed; zhida-host.service finishes at boot, then run hft-host.sh verify"
         systemctl reboot
         exit 100
