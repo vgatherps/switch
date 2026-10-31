@@ -656,6 +656,15 @@ impl TcpTx {
         stack.tcp(handle).send_capacity()
     }
 
+    /// The most TCP payload one segment carries (the connection's effective MSS); `None` once
+    /// the connection is not synchronized (closed or reset). A frame larger than this is cut
+    /// and copied on the way out.
+    pub fn max_segment_payload(&self) -> Option<usize> {
+        let mut inner = self.0.shared.borrow_mut();
+        let (stack, handle) = inner.tcp(self.0.index);
+        stack.tcp(handle).max_segment_payload()
+    }
+
     /// Whether this stream is on `handle`'s Net, so frames from `handle` are its own.
     pub fn is_on(&self, handle: &NetHandle) -> bool {
         Rc::ptr_eq(&self.0.shared, &handle.shared)
