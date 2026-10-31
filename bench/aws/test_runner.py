@@ -43,10 +43,6 @@ class PureTest(unittest.TestCase):
     def test_fixed_matrix_tags(self):
         self.assertEqual(z.sweep_tags(), ["udp-n20-s64-uncapped", "tcp-n20-s64-b50", "ws-n20-s64-b50"])
 
-    def test_coordinator_timeout_is_the_fixed_rate_list_bound(self):
-        # 10k..5M in x sqrt(2) steps: 18; 18 x (0.05 + 0.5 + 2 + 0.2 + 10) s + 60 s
-        self.assertEqual((z.SWEEP_STEPS, z.SWEEP_WORST_S), (18, 290))
-
     def test_every_run_resource_carries_the_run_id_and_expiry(self):
         expires = datetime.datetime(2026, 11, 1, 13, 30, tzinfo=UTC)
         tags = {t["Key"]: t["Value"] for t in z.run_tags("r1", expires)}
@@ -669,6 +665,13 @@ class RunTest(unittest.TestCase):
         self.assertIn(("sender0", f"{z.REMOTE}/udp-n20-s64-uncapped.jsonl"), self.w.fetched)
         self.assertIn("udp-n20-s64-uncapped: coordinator exit 1", self.log.getvalue())
         self.assertEqual(len(self.w.clean_calls), 1)
+
+    def test_one_failed_sweep_fails_the_run_even_if_the_report_passes(self):
+        """Regression: a generator-bound udp sweep (coordinator exit 1) next to good tcp/ws sweeps
+        gave run exit 0."""
+        self.w.sweep_exit["udp-n20-s64-uncapped"] = 1
+        self.assertEqual(self.run_bench(), 1)
+        self.assertIn("generator-bound: udp-n20-s64-uncapped", self.log.getvalue())
 
     def test_scp_failure_is_recorded_and_fails_the_run(self):
         self.w.fetch_fail.add(("sender2", f"{z.REMOTE}/gen-tcp-n20-s64-b50.log"))

@@ -68,8 +68,8 @@ REMOTE = "/var/tmp/zhida"
 RECEIVER_UNIT = "zhida-bench-receiver"
 # The coordinator's worst case and timeout: one step per rate RATE_MIN x sqrt(2)^k <= RATE_MAX, each
 # <= 50 ms lead + 0.5 s warmup + 2 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
-SWEEP_STEPS = sum(1 for k in range(64) if RATE_MIN * 2 ** (k / 2) <= RATE_MAX)
-SWEEP_WORST_S = math.ceil(SWEEP_STEPS * (0.05 + 0.5 + 2 + 0.2 + 10) + 60)
+# a backstop only: the coordinator bounds its own steps and workers
+SWEEP_WORST_S = 15 * 60
 BUILD_S = 3600
 SETUP_REBOOT_S = 900
 # The bound of every ssh/scp without its own: the receiver stop (systemd SIGKILLs after 90 s), the
@@ -206,7 +206,7 @@ def plan_text(region, ttl, run_id, expires):
               for i in range(1, SENDER_HOSTS)]
     lines += [
         f"sweeps: {SENDERS} senders ({SENDERS // SENDER_HOSTS} per sender host), {SIZE} B messages,"
-        f" {RATE_MIN}..{RATE_MAX} msg/s in {SWEEP_STEPS} steps of x sqrt(2); coordinator timeout {SWEEP_WORST_S} s",
+        f" {RATE_MIN}..{RATE_MAX} msg/s in steps of x sqrt(2); coordinator killed after {SWEEP_WORST_S} s",
     ]
     lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
     lines += [
@@ -550,17 +550,20 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env):
 
 def measure(hosts, facts, receiver_ip, run_dir, env):
     """The fixed matrix. A failed sweep is logged and the next one runs; every sweep started is
-    fetched. Returns the fetch failures."""
+    fetched. Returns (fetch failures, sweeps whose coordinator did not exit 0)."""
     with open(os.path.join(run_dir, "expected.json"), "w") as f:
         json.dump({"sweeps": sweep_tags()}, f)
-    fetch_errors = []
+    fetch_errors, failed = [], []
     for proto, budget in SWEEPS:
         t = tag(proto, budget)
         try:
-            log(f"{t}: coordinator exit {run_sweep(proto, budget, hosts, facts, receiver_ip, env)}")
+            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env)
+            log(f"{t}: coordinator exit {code}")
+            if code != 0:
+                failed.append(t)
         finally:
             fetch_errors += fetch_sweep(t, hosts, run_dir)
-    return fetch_errors
+    return fetch_errors, failed
 
 
 def run(args, env=None):
@@ -582,7 +585,7 @@ def run(args, env=None):
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
-    fetch_errors = []
+    fetch_errors, failed = [], ["(not measured)"]
     # From here on every exit path deletes the run's resources.
     try:
         net = aws.create_network(run_id, expires, my_ip, created.add, key_path)
@@ -600,7 +603,7 @@ def run(args, env=None):
         with open(os.path.join(run_dir, "host-setup.txt"), "w") as f:
             f.write("\n".join(setup) + "\n")
         connect_senders(hosts, key_path)
-        fetch_errors = measure(hosts, facts, receiver_ip, run_dir, env)
+        fetch_errors, failed = measure(hosts, facts, receiver_ip, run_dir, env)
     finally:
         # Nothing interrupts teardown; it goes first because the report is local.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -617,14 +620,16 @@ def run(args, env=None):
                                      f"zhida-bench {run_id} (1 receiver + {SENDER_HOSTS} senders, {INSTANCE_TYPE})"]
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
-    return 0 if report_code == 0 and not fetch_errors and torn else 1
+        if failed:
+            log(f"sweeps that failed or were generator-bound: {', '.join(failed)}")
+    return 0 if report_code == 0 and not fetch_errors and not failed and torn else 1
 
 
 def teardown(ec2, run_id, recorded):
-    """Deletes the run's resources; True only when a describe found none of them left."""
-    remaining = janitor.clean_run(ec2, run_id, recorded, log=log)
-    if remaining:
-        log(f"run {run_id}: STILL PRESENT after teardown (rerun `cleanup --run-id {run_id}`): {'; '.join(remaining)}")
+    """Deletes the run's resources; True only when nothing was found left and nothing errored."""
+    problems = janitor.clean_run(ec2, run_id, recorded, log=log)
+    if problems:
+        log(f"run {run_id}: NOT VERIFIED GONE; rerun `cleanup --run-id {run_id}`: {'; '.join(problems)}")
         return False
     log(f"run {run_id}: nothing left")
     return True
@@ -637,6 +642,8 @@ def cleanup(args, env=None):
     recorded = janitor.read_created(path) if os.path.exists(path) else {}
     log(f"run {args.run_id}: {sum(map(len, recorded.values()))} recorded IDs from {path}" if recorded
         else f"run {args.run_id}: no {path}; tag lookup only")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     return 0 if teardown(aws.ec2, args.run_id, recorded) else 1
 
 
