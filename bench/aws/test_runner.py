@@ -602,7 +602,7 @@ class PreflightTest(unittest.TestCase):
               itype="c7gn.2xlarge", vcpus=48):
         aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances), zones), "ssm": None,
                                        "sts": FakeSts(sts_error), "service-quotas": FakeQuotas(quota, quota_error)})
-        env = z.Env(aws=lambda region: aws, local=local or (lambda argv, **kw: Proc(0, "")))
+        env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: aws, local=local or (lambda argv, **kw: Proc(0, "")))
         return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1", itype, vcpus)[0]}
 
     def test_all_pass(self):
@@ -660,11 +660,33 @@ class PreflightTest(unittest.TestCase):
 
     def test_preflight_command_fails_clearly(self):
         aws = z.Aws("r", {"ec2": None, "ssm": None, "sts": FakeSts(Exception("expired token")), "service-quotas": None})
-        env = z.Env(aws=lambda region: aws, local=lambda argv, **kw: Proc(0, ""))
+        env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: aws, local=lambda argv, **kw: Proc(0, ""))
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, "preflight failed; nothing was created"):
             z.main(["preflight"], env)
         self.assertIn("preflight credentials: FAIL expired token", out.getvalue())
+
+    def test_region_defaults_to_the_profiles_and_fails_clearly_without_one(self):
+        """Project accounts are locked to one region: --region defaults to the AWS profile's."""
+        regions = []
+
+        def aws(region):
+            regions.append(region)
+            return z.Aws(region, {"ec2": None, "ssm": None, "sts": FakeSts(Exception("stop here")),
+                                  "service-quotas": None})
+        local = lambda argv, **kw: Proc(0, "")
+        for argv, profile, want in ((["preflight"], "ap-southeast-2", "ap-southeast-2"),
+                                    (["preflight", "--region", "us-east-1"], "ap-southeast-2", "us-east-1"),
+                                    (["preflight", "--region", "us-east-1"], None, "us-east-1")):
+            env = z.Env(profile_region=lambda: profile, aws=aws, local=local)
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                z.main(argv, env)
+            self.assertEqual(regions.pop(), want)
+        env = z.Env(profile_region=lambda: None, aws=aws, local=local)
+        for cmd in (["preflight"], ["run"], ["binance"], ["cleanup", "--run-id", "x"]):
+            with self.assertRaisesRegex(SystemExit, "no region: pass --region, or set one in the AWS profile"):
+                z.main(cmd, env)
+        self.assertEqual(regions, [], "nothing touched AWS without a region")
 
 
 class FakeAws:
@@ -715,7 +737,7 @@ class RunTest(unittest.TestCase):
 
     def run_bench(self):
         w = self.w
-        env = z.Env(aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
+        env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
                     local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
         args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out)
 
@@ -856,7 +878,7 @@ class RunTest(unittest.TestCase):
             self.w.local_calls.append(argv)
             return Proc(0, " M bench/src/main.rs\n")
 
-        env = z.Env(aws=lambda r: FakeAws(self.w), local=local, now=lambda: NOW)
+        env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda r: FakeAws(self.w), local=local, now=lambda: NOW)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, "preflight failed"):
             z.run(argparse.Namespace(region="r", ttl="2h", out=self.out), env)
@@ -885,7 +907,7 @@ class BinanceTest(unittest.TestCase):
             w.teardown_done = True
             return list(w.left_after_teardown)
 
-        env = z.Env(aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
+        env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
                     local=local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
         handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
         self.log = io.StringIO()
