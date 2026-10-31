@@ -6,15 +6,16 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::Path;
 use std::process;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    random_local_port, resolve, run, stream, Clock, Event, FeedError, Summary, Target, CLOSE_LIMIT,
-    CONNECT_LIMIT, DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT, DEFAULT_PRINT, FIRST_LOCAL_PORT,
-    INGRESS_BUDGET, SOCKET_BUFFER,
+    random_local_port, resolve, Clock, Target, DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT,
+    DEFAULT_PRINT, FIRST_LOCAL_PORT, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use rustls::ClientConfig;
+use switch::{oneshot, Runtime};
 use switchnet::{Net, NetConfig};
 use tap_echo::driver::{self, ZHIDA_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP};
 
@@ -175,8 +176,8 @@ fn main() {
     process::exit(code);
 }
 
-/// Turns `net` until the tester created READY, then runs the feed as a switch task: connect,
-/// print the first `print` updates, read until the tester exits, print the count, close.
+/// Turns `net` until the tester created READY, then runs the feed task until it finished, telling
+/// it to stop once the tester exited.
 fn feed(
     net: &mut Net,
     start: Instant,
@@ -200,47 +201,41 @@ fn feed(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    let target = target.clone();
-    let count = run(net, &clock, Some(IDLE_SLEEP), stop, move |handle, spawner, stop| async move {
-        let socket = binance_feed::socket(None);
-        let report = |event: Event<'_>| {
-            let mut out = io::stdout();
-            let _ = match event {
-                Event::Connected => writeln!(
-                    out,
-                    "{NAME}: connected to {} ({}) from {ZHIDA_IP}:{local_port} over Zhida, TLS 1.3, WebSocket open",
-                    target.url(),
-                    target.addr,
-                ),
-                Event::Ticker { count, ticker } if count <= print as u64 => writeln!(out, "#{count} {ticker}"),
-                Event::Ticker { .. } => Ok(()),
-                Event::Read(Summary { count, update_ids, .. }) => {
-                    let secs = start.elapsed().as_secs_f64();
-                    match update_ids {
-                        Some((first, last)) => writeln!(
-                            out,
-                            "{NAME}: {count} bookTicker messages in {secs:.1} s since start, \
-                             update ids {first}..{last}",
-                        ),
-                        None => writeln!(out, "{NAME}: 0 bookTicker messages in {secs:.1} s since start"),
-                    }
-                }
-                Event::Closed => writeln!(out, "{NAME}: closed (WebSocket close handshake, TLS close_notify, FIN)"),
-                Event::CloseFailed(error) => writeln!(out, "{NAME}: close failed too: {error}"),
-            };
-        };
-        let summary = stream(
-            &handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT, CLOSE_LIMIT, stop, report,
-        )
-        .await?;
-        if summary.is_none() {
-            let _ = writeln!(io::stdout(), "{NAME}: the tester exited before the feed connected");
+    let mut rt = Runtime::new(clock.ms());
+    let (stop_feed, stop_rx) = oneshot::channel();
+    let mut stop_feed = Some(stop_feed);
+    let out = Rc::default();
+    let task = binance_feed::feed(
+        net.handle(),
+        rt.spawner(),
+        target.clone(),
+        binance_feed::socket(None),
+        tls,
+        local_port,
+        NAME,
+        print,
+        None,
+        stop_rx,
+        Rc::clone(&out),
+    );
+    rt.spawner()
+        .spawn(task)
+        .map_err(|error| format!("spawning the feed: {:?}", error.reason))?;
+    let (summary, result) = loop {
+        if let Some(outcome) = out.take() {
+            break outcome;
         }
-        Ok::<_, FeedError>(summary.map_or(0, |summary| summary.count))
-    })
-    .and_then(|count| count)
-    .map_err(|error| error.to_string())?;
-    if count == 0 {
+        let moved = switchnet::round(net, &mut rt, clock.now(), clock.ms())
+            .map_err(|error| format!("round: {error:?}"))?;
+        if !moved {
+            std::thread::sleep(IDLE_SLEEP);
+        }
+        if let Some(stop_feed) = stop_feed.take_if(|_| stop()) {
+            let _ = stop_feed.send(());
+        }
+    };
+    result.map_err(|error| error.to_string())?;
+    if summary.count == 0 {
         return Err("no bookTicker message received".to_owned());
     }
     Ok(())

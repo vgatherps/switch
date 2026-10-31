@@ -11,13 +11,14 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::panic::resume_unwind;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use binance_feed::{
-    client_config, connect, run, socket, stream, webpki_client_config, BookTicker, Clock, Event,
-    FeedError, Latencies, Summary, Target, INGRESS_BUDGET,
+    client_config, connect, feed, socket, webpki_client_config, BookTicker, Clock, FeedError,
+    Latencies, Outcome, Summary, Target, INGRESS_BUDGET,
 };
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
 use dpdk_smoltcp::smoltcp::socket::tcp;
@@ -31,8 +32,8 @@ use relay::UpgradeError;
 use relay::switchnet::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use switch::Spawner;
-use switchnet::{first, Net, NetConfig, NetHandle, OpenError};
+use switch::{oneshot, Runtime, Spawner};
+use switchnet::{Net, NetConfig, NetHandle, OpenError};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -54,7 +55,6 @@ const HOST: &str = "binance.test";
 const PATH: &str = "/ws/btcusdt@bookTicker";
 const LOCAL_PORT: u16 = 49152;
 const CONNECT_LIMIT: Duration = Duration::from_secs(20);
-const CLOSE_LIMIT: Duration = Duration::from_secs(10);
 /// Every test's client, and the server's accept and socket reads and writes.
 const LIMIT: Duration = Duration::from_secs(60);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -193,7 +193,8 @@ fn server_config() -> (Arc<ServerConfig>, RootCertStore) {
 }
 
 enum ServerPlan {
-    Tickers(Vec<String>),
+    /// The texts, a Ping after the third; the flag is set once all were flushed.
+    Tickers(Vec<String>, Arc<AtomicBool>),
     Refuse451,
     /// The client rejects the certificate; the server's handshake ends at its alert.
     TlsOnly,
@@ -273,12 +274,12 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
             return saw;
         }
     };
-    let texts = match plan {
-        ServerPlan::Tickers(texts) => texts,
+    let (texts, flushed) = match plan {
+        ServerPlan::Tickers(texts, flushed) => (texts, Some(flushed)),
         ServerPlan::CloseAway => {
             let frame = CloseFrame { code: CloseCode::Away, reason: "maintenance".into() };
             ws.close(Some(frame)).expect("send the server's Close");
-            Vec::new()
+            (Vec::new(), None)
         }
         ServerPlan::Silent => unreachable!("answered above"),
         ServerPlan::Refuse451 => panic!("HTTP 451 was accepted"),
@@ -293,6 +294,9 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>, plan: ServerPlan) -> 
             .expect("send bookTicker");
     }
     ws.flush().expect("flush bookTickers and Ping");
+    if let Some(flushed) = flushed {
+        flushed.store(true, Ordering::Relaxed);
+    }
     loop {
         match ws.read() {
             Ok(Message::Pong(payload)) if payload.as_ref() == b"keepalive" => saw.pong = true,
@@ -347,12 +351,47 @@ fn closed_target() -> Target {
     }
 }
 
-/// Asked each round by `run`: panics once the test ran `LIMIT`.
-fn guard(clock: &Clock) {
-    assert!(
-        clock.ms() < LIMIT.as_millis() as u64,
-        "test not done within {LIMIT:?}"
+/// Turns `net` and polls `rt` until `done()`, sleeping IDLE_SLEEP after a round that moved
+/// nothing; panics once the test ran LIMIT.
+fn turn_until(net: &mut Net, clock: &Clock, rt: &mut Runtime, mut done: impl FnMut() -> bool) {
+    while !done() {
+        assert!(clock.ms() < LIMIT.as_millis() as u64, "test not done within {LIMIT:?}");
+        if !switchnet::round(net, rt, clock.now(), clock.ms()).expect("round") {
+            thread::sleep(IDLE_SLEEP);
+        }
+    }
+}
+
+/// Spawns the feed task on `target()`, reading until its stop (the returned sender; dropping it
+/// stops the feed too).
+fn spawn_feed(net: &Net, rt: &Runtime, roots: RootCertStore, mss_cap: Option<u16>) -> (oneshot::Sender<()>, Outcome) {
+    let (stop, stop_rx) = oneshot::channel();
+    let out = Outcome::default();
+    let task = feed(
+        net.handle(),
+        rt.spawner(),
+        target(),
+        socket(mss_cap),
+        client_config(roots),
+        LOCAL_PORT,
+        "test",
+        usize::MAX,
+        None,
+        stop_rx,
+        out.clone(),
     );
+    rt.spawner().spawn(task).expect("spawn the feed");
+    (stop, out)
+}
+
+/// Turns until the feed task finished; what it read and its result.
+fn finish(net: &mut Net, clock: &Clock, rt: &mut Runtime, out: &Outcome) -> (Summary, Result<(), FeedError>) {
+    let mut outcome = None;
+    turn_until(net, clock, rt, || {
+        outcome = out.take();
+        outcome.is_some()
+    });
+    outcome.expect("the loop ends once the feed finished")
 }
 
 /// A connect to a closed port on the Net's only slot: it must be refused (the slot is free).
@@ -392,83 +431,63 @@ async fn connect_refused(handle: &NetHandle, spawner: &Spawner, at_once: bool) {
     }
 }
 
+#[switch::task]
+async fn refused_twice(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>) {
+    connect_refused(&handle, &spawner, true).await;
+    connect_refused(&handle, &spawner, true).await;
+    done.set(true);
+}
+
 #[zhida_test_support::pinned_test]
 fn refused_connect_releases_the_only_slot() {
     with_net(&[], None, |net, clock, _listener| {
-        run(
-            net,
-            clock,
-            Some(IDLE_SLEEP),
-            || {
-                guard(clock);
-                false
-            },
-            |handle, spawner, _stop| async move {
-                connect_refused(&handle, &spawner, true).await;
-                connect_refused(&handle, &spawner, true).await;
-            },
-        )
-        .expect("run the client");
+        let mut rt = Runtime::new(clock.ms());
+        let done = Rc::new(Cell::new(false));
+        rt.spawner().spawn(refused_twice(net.handle(), rt.spawner(), done.clone())).expect("spawn the client");
+        turn_until(net, clock, &mut rt, || done.get());
     });
+}
+
+#[switch::task]
+async fn timed_out_then_refused(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>) {
+    // 192.0.2.3 is unassigned in this TAP fixture; connect waits for ARP.
+    let target = Target {
+        addr: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 3), SERVER_PORT),
+        host: HOST.to_owned(),
+        path: PATH.to_owned(),
+    };
+    let limit = Duration::from_millis(100);
+    let started = Instant::now();
+    let error = match connect(&handle, &spawner, &target, socket(None), webpki_client_config(), LOCAL_PORT, limit).await {
+        Ok(_) => panic!("an unanswered ARP opened a feed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, FeedError::Timeout { limit: actual, .. } if actual == limit),
+        "{error:?}",
+    );
+    // Runtime ticks are whole milliseconds of `clock`, and `started` is read within
+    // the tick the sleep counts from: up to 1 ms of the limit may precede it.
+    assert!(
+        started.elapsed() + Duration::from_millis(1) >= limit,
+        "timed out after {:?}",
+        started.elapsed()
+    );
+    // A dropped SYN-SENT socket closes without sending anything (Linux
+    // tcp_close), so the very next connect gets the slot.
+    connect_refused(&handle, &spawner, true).await;
+    done.set(true);
 }
 
 #[zhida_test_support::pinned_test]
 fn timed_out_connect_releases_the_only_slot() {
     with_net(&[], None, |net, clock, _listener| {
-        run(
-            net,
-            clock,
-            Some(IDLE_SLEEP),
-            || {
-                guard(clock);
-                false
-            },
-            |handle, spawner, _stop| async move {
-                // 192.0.2.3 is unassigned in this TAP fixture; connect waits for ARP.
-                let target = Target {
-                    addr: SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 3), SERVER_PORT),
-                    host: HOST.to_owned(),
-                    path: PATH.to_owned(),
-                };
-                let limit = Duration::from_millis(100);
-                let started = Instant::now();
-                let error = match connect(
-                    &handle,
-                    &spawner,
-                    &target,
-                    socket(None),
-                    webpki_client_config(),
-                    LOCAL_PORT,
-                    limit,
-                )
-                .await
-                {
-                    Ok(_) => panic!("an unanswered ARP opened a feed"),
-                    Err(error) => error,
-                };
-                assert!(
-                    matches!(error, FeedError::Timeout { limit: actual, .. } if actual == limit),
-                    "{error:?}",
-                );
-                // Runtime ticks are whole milliseconds of `clock`, and `started` is read within
-                // the tick the sleep counts from: up to 1 ms of the limit may precede it.
-                assert!(
-                    started.elapsed() + Duration::from_millis(1) >= limit,
-                    "timed out after {:?}",
-                    started.elapsed()
-                );
-                // A dropped SYN-SENT socket closes without sending anything (Linux
-                // tcp_close), so the very next connect gets the slot.
-                connect_refused(&handle, &spawner, true).await;
-            },
-        )
-        .expect("run the client");
+        let mut rt = Runtime::new(clock.ms());
+        let done = Rc::new(Cell::new(false));
+        let task = timed_out_then_refused(net.handle(), rt.spawner(), done.clone());
+        rt.spawner().spawn(task).expect("spawn the client");
+        turn_until(net, clock, &mut rt, || done.get());
     });
-}
-
-/// A ticker as text, to compare what `Feed::next` lends with an expected one.
-fn debug(ticker: &BookTicker<'_>) -> String {
-    format!("{ticker:?}")
 }
 
 fn tickers() -> (Vec<String>, Vec<BookTicker<'static>>) {
@@ -496,8 +515,18 @@ fn tickers() -> (Vec<String>, Vec<BookTicker<'static>>) {
     (texts, expected)
 }
 
-/// 12 updates with a Ping after the third, through a 1400-byte path MTU and a capped MSS. Once
-/// all were read, `run`'s stop ends `next`; then close.
+/// What the feed read of all 12 `tickers()` on net_tap, which has no RX timestamps.
+fn read_all_twelve() -> Summary {
+    let (_, expected) = tickers();
+    Summary {
+        count: 12,
+        update_ids: Some((expected[0].update_id, expected[11].update_id)),
+        latencies: Latencies { no_stamp: 12, ..Latencies::default() },
+    }
+}
+
+/// 12 updates with a Ping after the third, through a 1400-byte path MTU and a capped MSS. 200 ms
+/// after the server sent them all, the stop ends the waiting read; then the close.
 #[zhida_test_support::pinned_test]
 fn feed_reads_tickers_answers_ping_and_closes() {
     let paths = [PathMtu {
@@ -506,46 +535,19 @@ fn feed_reads_tickers_answers_ping_and_closes() {
     }];
     with_net(&paths, Some(1360), |net, clock, listener| {
         let (server_tls, roots) = server_config();
-        let (texts, expected) = tickers();
-        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Tickers(texts)));
-        let read_all = Rc::new(Cell::new(false));
-        let client_read_all = read_all.clone();
-        let should_stop = || {
-            guard(clock);
-            read_all.get()
-        };
-        run(
-            net,
-            clock,
-            Some(IDLE_SLEEP),
-            should_stop,
-            |handle, spawner, mut stop| async move {
-                let tls = client_config(roots);
-                let mut feed = connect(
-                    &handle,
-                    &spawner,
-                    &target(),
-                    socket(Some(1360)),
-                    tls,
-                    LOCAL_PORT,
-                    CONNECT_LIMIT,
-                )
-                .await
-                .expect("connect Zhida TLS WebSocket client");
-                for ticker in expected {
-                    assert_eq!(
-                        feed.next(&mut stop, debug).await.expect("read bookTicker"),
-                        Some(debug(&ticker))
-                    );
-                }
-                client_read_all.set(true);
-                assert_eq!(feed.next(&mut stop, debug).await.expect("stop"), None);
-                feed.close(&spawner, CLOSE_LIMIT)
-                    .await
-                    .expect("close Zhida feed");
-            },
-        )
-        .expect("run the client");
+        let (texts, _) = tickers();
+        let flushed = Arc::new(AtomicBool::new(false));
+        let plan = ServerPlan::Tickers(texts, flushed.clone());
+        let server = thread::spawn(move || serve(listener, server_tls, plan));
+        let mut rt = Runtime::new(clock.ms());
+        let (stop, out) = spawn_feed(net, &rt, roots, Some(1360));
+        turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
+        let sent = clock.ms();
+        turn_until(net, clock, &mut rt, || clock.ms() >= sent + 200);
+        let _ = stop.send(());
+        let (summary, result) = finish(net, clock, &mut rt, &out);
+        result.expect("feed reads, then closes");
+        assert_eq!(summary, read_all_twelve());
         let saw = join(server);
         assert_eq!(saw.path, PATH);
         assert_eq!(saw.host, "binance.test:9443");
@@ -555,180 +557,121 @@ fn feed_reads_tickers_answers_ping_and_closes() {
     });
 }
 
-/// `stream` after a failed read (a text that is not a bookTicker, after two that are) still
-/// closes: the server gets the Close, then close_notify and FIN (checked by `serve`), and the
-/// read error is what `stream` returns.
+/// A finished stop does not hide updates already received: the Net is turned without running the
+/// feed until all 12 are surely here, then the stop is sent; the feed reads all 12 first.
 #[zhida_test_support::pinned_test]
-fn stream_closes_after_a_read_error() {
+fn received_updates_come_before_a_finished_stop() {
+    with_net(&[], None, |net, clock, listener| {
+        let (server_tls, roots) = server_config();
+        let (texts, _) = tickers();
+        let flushed = Arc::new(AtomicBool::new(false));
+        let plan = ServerPlan::Tickers(texts, flushed.clone());
+        let server = thread::spawn(move || serve(listener, server_tls, plan));
+        let mut rt = Runtime::new(clock.ms());
+        let (stop, out) = spawn_feed(net, &rt, roots, None);
+        turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
+        let sent = clock.ms();
+        while clock.ms() < sent + 200 {
+            net.turn(clock.now()).expect("turn");
+            thread::sleep(IDLE_SLEEP);
+        }
+        let _ = stop.send(());
+        let (summary, result) = finish(net, clock, &mut rt, &out);
+        result.expect("feed reads, then closes");
+        assert_eq!(summary, read_all_twelve());
+        let saw = join(server);
+        assert!(saw.close && saw.error.is_none(), "server close {} error {:?}", saw.close, saw.error);
+    });
+}
+
+/// After a failed read (a text that is not a bookTicker, after two that are) the feed still
+/// closes: the server gets the Close, then close_notify and FIN (checked by `serve`), and the
+/// read error is the feed's result.
+#[zhida_test_support::pinned_test]
+fn feed_closes_after_a_read_error() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let (mut texts, expected) = tickers();
         texts.truncate(2);
         texts.push("not a bookTicker".to_owned());
-        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Tickers(texts)));
-        let should_stop = || {
-            guard(clock);
-            false
-        };
-        let events = run(net, clock, Some(IDLE_SLEEP), should_stop, |handle, spawner, stop| async move {
-            let mut events = Vec::new();
-            let result = stream(
-                &handle,
-                &spawner,
-                &target(),
-                socket(None),
-                client_config(roots),
-                LOCAL_PORT,
-                CONNECT_LIMIT,
-                CLOSE_LIMIT,
-                stop,
-                |event| events.push(format!("{event:?}")),
-            )
-            .await;
-            match result {
-                Err(FeedError::Parse { text, .. }) => assert_eq!(text, "not a bookTicker"),
-                other => panic!("expected the parse error, got {other:?}"),
-            }
-            events
-        })
-        .expect("run the client");
-        let saw = join(server);
-        assert!(saw.close, "server did not receive the client's Close");
-        assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
-        // net_tap without the timestamp offload: every message, the unparsable one too, is
-        // unstamped.
-        let summary = Summary {
+        let plan = ServerPlan::Tickers(texts, Arc::default());
+        let server = thread::spawn(move || serve(listener, server_tls, plan));
+        let mut rt = Runtime::new(clock.ms());
+        let (_stop, out) = spawn_feed(net, &rt, roots, None);
+        let (summary, result) = finish(net, clock, &mut rt, &out);
+        match result {
+            Err(FeedError::Parse { text, .. }) => assert_eq!(text, "not a bookTicker"),
+            other => panic!("expected the parse error, got {other:?}"),
+        }
+        // Every message, the unparsable one too, is unstamped.
+        let read = Summary {
             count: 2,
             update_ids: Some((expected[0].update_id, expected[1].update_id)),
             latencies: Latencies { no_stamp: 3, ..Latencies::default() },
         };
-        assert_eq!(
-            events,
-            [
-                "Connected".to_owned(),
-                format!("{:?}", Event::Ticker { count: 1, ticker: &expected[0] }),
-                format!("{:?}", Event::Ticker { count: 2, ticker: &expected[1] }),
-                format!("{:?}", Event::Read(&summary)),
-                "Closed".to_owned(),
-            ]
-        );
-    });
-}
-
-/// A finished stop does not hide an update already received: `next` returns it first.
-#[zhida_test_support::pinned_test]
-fn received_update_comes_before_a_finished_stop() {
-    with_net(&[], None, |net, clock, listener| {
-        let (server_tls, roots) = server_config();
-        let (texts, expected) = tickers();
-        let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Tickers(texts)));
-        run(
-            net,
-            clock,
-            Some(IDLE_SLEEP),
-            || {
-                guard(clock);
-                false
-            },
-            |handle, spawner, _stop| async move {
-                let tls = client_config(roots);
-                let mut feed = connect(
-                    &handle,
-                    &spawner,
-                    &target(),
-                    socket(None),
-                    tls,
-                    LOCAL_PORT,
-                    CONNECT_LIMIT,
-                )
-                .await
-                .expect("connect Zhida TLS WebSocket client");
-                let first = feed
-                    .next(std::future::pending::<()>(), debug)
-                    .await
-                    .expect("read bookTicker");
-                assert_eq!(first, Some(debug(&expected[0])));
-                // The server wrote all 12 in one flush; wait until the last is surely here.
-                spawner
-                    .sleep(200)
-                    .expect("open Runtime")
-                    .await
-                    .expect("sleep");
-                for ticker in &expected[1..] {
-                    let next = feed
-                        .next(std::future::ready(()), debug)
-                        .await
-                        .expect("read bookTicker");
-                    assert_eq!(next, Some(debug(ticker)));
-                }
-                assert_eq!(feed.next(std::future::ready(()), debug).await.expect("stop"), None);
-                feed.close(&spawner, CLOSE_LIMIT)
-                    .await
-                    .expect("close Zhida feed");
-            },
-        )
-        .expect("run the client");
+        assert_eq!(summary, read);
         let saw = join(server);
-        assert!(
-            saw.close && saw.error.is_none(),
-            "server close {} error {:?}",
-            saw.close,
-            saw.error
-        );
+        assert!(saw.close, "server did not receive the client's Close");
+        assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
     });
 }
 
-/// The server closes: `next` reports its status and reason, after relay echoed the close and
-/// sent close_notify and FIN (checked by `serve`, the Net not turned once `run` returned).
+/// The server closes: the feed reports its status and reason, after relay echoed the close and
+/// sent close_notify and FIN (checked by `serve`, the Net not turned once the feed finished).
 #[zhida_test_support::pinned_test]
 fn server_close_reports_its_status_and_reason() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::CloseAway));
-        let should_stop = || {
-            guard(clock);
-            false
-        };
-        run(net, clock, Some(IDLE_SLEEP), should_stop, |handle, spawner, mut stop| async move {
-            let target = target();
-            let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
-            let mut feed = connecting.await.expect("connect Zhida TLS WebSocket client");
-            match feed.next(&mut stop, |_| ()).await {
-                Err(FeedError::ServerClosed { code: 1001, reason }) => assert_eq!(reason, "maintenance"),
-                other => panic!("expected the server's close, got {other:?}"),
-            }
-        })
-        .expect("run the client");
+        let mut rt = Runtime::new(clock.ms());
+        let (_stop, out) = spawn_feed(net, &rt, roots, None);
+        let (summary, result) = finish(net, clock, &mut rt, &out);
+        match result {
+            Err(FeedError::ServerClosed { code: 1001, reason }) => assert_eq!(reason, "maintenance"),
+            other => panic!("expected the server's close, got {other:?}"),
+        }
+        assert_eq!(summary.count, 0);
         let saw = join(server);
         assert!(saw.close, "server did not receive the echo");
         assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
     });
 }
 
-/// A stop while `connect` waits (the server never answers the ClientHello) ends it at once,
-/// before `CONNECT_LIMIT`, and drops its socket: the server reads the end of the stream (the
-/// run stops once the server returned).
+/// A stop while the connect waits (the server never answers the ClientHello) ends it at once,
+/// before CONNECT_LIMIT, without an error, and drops its socket: the server reads the end of the
+/// stream.
 #[zhida_test_support::pinned_test]
 fn stop_during_connect_ends_it_and_drops_the_socket() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Silent));
-        let should_stop = || {
-            guard(clock);
-            server.is_finished()
-        };
-        run(net, clock, Some(IDLE_SLEEP), should_stop, |handle, spawner, stop| async move {
-            let target = target();
-            let connecting = connect(&handle, &spawner, &target, socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT);
-            let early = spawner.sleep(200).expect("open Runtime");
-            let started = Instant::now();
-            assert!(first(connecting, early).await.is_none(), "connect finished against a silent server");
-            assert!(started.elapsed() < CONNECT_LIMIT / 2, "connect outlived the stop");
-            let _ = stop.await;
-        })
-        .expect("run the client");
+        let mut rt = Runtime::new(clock.ms());
+        let started = Instant::now();
+        let (stop, out) = spawn_feed(net, &rt, roots, None);
+        turn_until(net, clock, &mut rt, || started.elapsed() >= Duration::from_millis(200));
+        let _ = stop.send(());
+        let (summary, result) = finish(net, clock, &mut rt, &out);
+        assert!(started.elapsed() < CONNECT_LIMIT / 2, "connect outlived the stop");
+        result.expect("a stop during the connect is no error");
+        assert_eq!(summary, Summary::default());
+        turn_until(net, clock, &mut rt, || server.is_finished());
         join(server);
     });
+}
+
+#[switch::task]
+async fn refused_451_then_slot_free(handle: NetHandle, spawner: Spawner, roots: RootCertStore, done: Rc<Cell<bool>>) {
+    let error = match connect(&handle, &spawner, &target(), socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT).await {
+        Ok(_) => panic!("HTTP 451 opened a WebSocket"),
+        Err(error) => error,
+    };
+    match &error {
+        FeedError::Ws(WsError::Upgrade(UpgradeError::Status(Some(451)))) => {}
+        other => panic!("expected the HTTP 451 refusal, got {other:?}"),
+    }
+    assert!(error.to_string().contains("451"), "{error}");
+    connect_refused(&handle, &spawner, false).await;
+    done.set(true);
 }
 
 #[zhida_test_support::pinned_test]
@@ -736,43 +679,33 @@ fn upgrade_refused_with_http_451_reports_the_status() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Refuse451));
-        let should_stop = || {
-            guard(clock);
-            server.is_finished()
-        };
-        run(
-            net,
-            clock,
-            Some(IDLE_SLEEP),
-            should_stop,
-            |handle, spawner, stop| async move {
-                let error = match connect(
-                    &handle,
-                    &spawner,
-                    &target(),
-                    socket(None),
-                    client_config(roots),
-                    LOCAL_PORT,
-                    CONNECT_LIMIT,
-                )
-                .await
-                {
-                    Ok(_) => panic!("HTTP 451 opened a WebSocket"),
-                    Err(error) => error,
-                };
-                match &error {
-                    FeedError::Ws(WsError::Upgrade(UpgradeError::Status(Some(451)))) => {}
-                    other => panic!("expected the HTTP 451 refusal, got {other:?}"),
-                }
-                assert!(error.to_string().contains("451"), "{error}");
-                connect_refused(&handle, &spawner, false).await;
-                let _ = stop.await;
-            },
-        )
-        .expect("run the client");
+        let mut rt = Runtime::new(clock.ms());
+        let done = Rc::new(Cell::new(false));
+        let task = refused_451_then_slot_free(net.handle(), rt.spawner(), roots, done.clone());
+        rt.spawner().spawn(task).expect("spawn the client");
+        turn_until(net, clock, &mut rt, || done.get() && server.is_finished());
         let saw = join(server);
         assert!(saw.error.is_some(), "server accepted the upgrade");
     });
+}
+
+#[switch::task]
+async fn unknown_issuer_then_slot_free(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>) {
+    let error = match connect(&handle, &spawner, &target(), socket(None), webpki_client_config(), LOCAL_PORT, CONNECT_LIMIT).await {
+        Ok(_) => panic!("Mozilla roots trusted the self-signed certificate"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            FeedError::Ws(WsError::Tls(sheath::Error::Tls(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer
+            ))))
+        ),
+        "expected UnknownIssuer, got {error:?}",
+    );
+    connect_refused(&handle, &spawner, false).await;
+    done.set(true);
 }
 
 #[zhida_test_support::pinned_test]
@@ -780,52 +713,14 @@ fn unknown_certificate_fails_tls_and_alerts_the_server() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, _) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::TlsOnly));
-        let should_stop = || {
-            guard(clock);
-            server.is_finished()
-        };
-        run(
-            net,
-            clock,
-            Some(IDLE_SLEEP),
-            should_stop,
-            |handle, spawner, stop| async move {
-                let error = match connect(
-                    &handle,
-                    &spawner,
-                    &target(),
-                    socket(None),
-                    webpki_client_config(),
-                    LOCAL_PORT,
-                    CONNECT_LIMIT,
-                )
-                .await
-                {
-                    Ok(_) => panic!("Mozilla roots trusted the self-signed certificate"),
-                    Err(error) => error,
-                };
-                assert!(
-                    matches!(
-                        error,
-                        FeedError::Ws(WsError::Tls(sheath::Error::Tls(
-                            rustls::Error::InvalidCertificate(
-                                rustls::CertificateError::UnknownIssuer
-                            )
-                        )))
-                    ),
-                    "expected UnknownIssuer, got {error:?}",
-                );
-                connect_refused(&handle, &spawner, false).await;
-                let _ = stop.await;
-            },
-        )
-        .expect("run the client");
+        let mut rt = Runtime::new(clock.ms());
+        let done = Rc::new(Cell::new(false));
+        let task = unknown_issuer_then_slot_free(net.handle(), rt.spawner(), done.clone());
+        rt.spawner().spawn(task).expect("spawn the client");
+        turn_until(net, clock, &mut rt, || done.get() && server.is_finished());
         let saw = join(server);
         let error = saw.error.expect("server TLS handshake did not fail");
-        assert!(
-            error.contains("UnknownCA"),
-            "server did not receive the client's alert: {error}"
-        );
+        assert!(error.contains("UnknownCA"), "server did not receive the client's alert: {error}");
     });
 }
 
