@@ -21,7 +21,7 @@ use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 use zhida_test_kit::{tap::TapVdev, with_eal};
 
-use crate::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, boxed, tcp};
+use crate::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, tcp};
 
 pub const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 pub const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -212,6 +212,22 @@ impl<T: Send + 'static> KernelPeer<T> {
     }
 }
 
+/// Connects to the kernel peer on `port` from a fresh local port, runs `client` on the stream,
+/// and puts what it hands back in `held`.
+#[switch::task]
+async fn connect_client<H: 'static, F: Future<Output = H> + 'static, C: FnOnce(NetHandle, TcpStream) -> F + 'static>(
+    handle: NetHandle,
+    socket: tcp::Config,
+    port: u16,
+    client: C,
+    held: Rc<RefCell<Option<H>>>,
+) {
+    let remote = IpEndpoint::new(KERNEL_ADDR.into(), port);
+    let local = IpListenEndpoint { addr: None, port: next_local_port() };
+    let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
+    *held.borrow_mut() = Some(client(handle, stream).await);
+}
+
 /// One client against one kernel peer: the peer, on a thread, runs `serve` on the connection
 /// it accepts on 192.0.2.1:`port` (after `listener_setup` on its listener); `client` runs as
 /// a switch task on the Net's handle and the connected stream (from a fresh local port), and
@@ -232,15 +248,8 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
         let mut rt = Runtime::new(0);
         let handle = net.handle();
         let held: Rc<RefCell<Option<H>>> = Rc::default();
-        let task_held = held.clone();
-        let socket = tap.socket;
-        let task = async move {
-            let remote = IpEndpoint::new(KERNEL_ADDR.into(), port);
-            let local = IpListenEndpoint { addr: None, port: next_local_port() };
-            let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
-            *task_held.borrow_mut() = Some(client(handle, stream).await);
-        };
-        rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
+        let task = connect_client(handle, tap.socket, port, client, held.clone());
+        rt.spawner().spawn(task).expect("spawn the client");
         let client_done = || held.borrow().is_some();
         while !(client_done() && peer.is_finished()) {
             assert!(clock.elapsed() < LIMIT, "client done {}, peer done {}", client_done(), peer.is_finished());

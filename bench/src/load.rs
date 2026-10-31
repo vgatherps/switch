@@ -15,9 +15,10 @@ use std::task::Poll;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use switch::SpawnError;
 use switchnet::{
-    IpEndpoint, IpListenEndpoint, NetHandle, SendFrameError, TcpTx, TxFrame, UdpConfig,
-    UdpSendError, UdpSendFrameError, UdpTx, boxed, tcp,
+    Connecting, IpEndpoint, IpListenEndpoint, NetHandle, SendFrameError, TcpTx, TxFrame, UdpConfig,
+    UdpRx, UdpSendError, UdpSendFrameError, UdpTx, tcp,
 };
 use zhida_open::Sizing;
 
@@ -253,21 +254,15 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
                     tx_checksum: true,
                     broadcast: false,
                 };
-                let (mut rx, tx) = handle
+                let (rx, tx) = handle
                     .udp_bind(config)
                     .map_err(|e| format!("udp bind {port}: {e:?}"))?
                     .split();
                 txs.push(tx);
-                let recorder = recorder.clone();
-                spawn(&host, async move {
-                    loop {
-                        let datagram = rx.recv().await;
-                        let now = clock.now_ns();
-                        if let Some(r) = recorder.borrow_mut().as_mut() {
-                            r.record(datagram.payload(), now);
-                        }
-                    }
-                })?;
+                host.rt
+                    .spawner()
+                    .spawn(udp_receive(rx, clock, recorder.clone()))
+                    .map_err(spawn_error)?;
             }
             Senders::Udp(txs)
         }
@@ -335,11 +330,8 @@ fn local_port(args: &Args, i: u32) -> Result<u16, String> {
     u16::try_from(u32::from(args.local_port) + i).map_err(|_| "local ports past 65535".to_owned())
 }
 
-fn spawn(host: &Host, task: impl Future<Output = ()> + 'static) -> Result<(), String> {
-    host.rt
-        .spawner()
-        .spawn(boxed(Box::pin(task)))
-        .map_err(|e| format!("spawn: {:?}", e.reason))
+fn spawn_error<T>(e: SpawnError<T>) -> String {
+    format!("spawn: {:?}", e.reason)
 }
 
 /// Connects the N TCP senders (ws: and upgrades each), turning the Net until all are ready, and
@@ -368,63 +360,12 @@ fn connect_all(
         let (connected, recorder, size) = (connected.clone(), recorder.clone(), args.size);
         let (ws, handle, peer) = (args.proto == Proto::Ws, handle.clone(), args.target);
         let conns = conns.clone();
-        spawn(host, async move {
-            let stream = match connecting.await {
-                Ok(stream) => stream,
-                Err(closed) => panic!("tcp connect {i}: {closed:?}"),
-            };
-            let (mut rx, mut tx) = stream.split();
-            let mut partial = Vec::with_capacity(size);
-            let unit = if ws {
-                wsclient::server_frame_len(size)
-            } else {
-                size
-            };
-            if ws {
-                let request = wsclient::request(&peer.ip().to_string(), peer.port());
-                let mut frame = handle.tx_frame().await;
-                frame.room_mut()[..request.len()].copy_from_slice(request.as_bytes());
-                frame.set_len(request.len());
-                if let Err((_, e)) = tx.try_send(frame) {
-                    panic!("ws upgrade request {i}: {e:?}");
-                }
-                let mut head = Vec::new();
-                let n = loop {
-                    match rx.recv().await {
-                        Ok(frame) => head.extend_from_slice(frame.payload()),
-                        Err(e) => panic!("ws upgrade {i}: connection ended: {e:?}"),
-                    }
-                    if let Some(n) = wsclient::head_len(&head) {
-                        break n;
-                    }
-                };
-                if let Err(e) = wsclient::check_response(&head[..n]) {
-                    panic!("ws upgrade {i}: {e}");
-                }
-                partial.extend_from_slice(&head[n..]);
-            }
-            connected.borrow_mut()[i as usize] = Some(tx);
-            let conn = &conns[i as usize];
-            while let Ok(frame) = rx.recv().await {
-                let now = clock.now_ns();
-                let mut r = recorder.borrow_mut();
-                let mut in_flight = conn.in_flight.borrow_mut();
-                messages(&mut partial, frame.payload(), unit, |m| {
-                    let m = if ws {
-                        wsclient::decode(m, size).unwrap_or_else(|e| panic!("connection {i}: {e}"))
-                    } else {
-                        m
-                    };
-                    let sent_ns = in_flight.pop_front();
-                    if let Some(r) = r.as_mut() {
-                        r.record(m, now);
-                        if let Some(sent_ns) = sent_ns {
-                            r.service_rtt.record(now.saturating_sub(sent_ns));
-                        }
-                    }
-                });
-            }
-        })?;
+        host.rt
+            .spawner()
+            .spawn(tcp_receive(
+                i, connecting, ws, peer, size, handle, connected, recorder, conns, clock,
+            ))
+            .map_err(spawn_error)?;
     }
     let deadline = host.clock.now_ns() + CONNECT_LIMIT.as_nanos() as u64;
     while connected.borrow().iter().any(Option::is_none) {
@@ -440,6 +381,92 @@ fn connect_all(
         .iter_mut()
         .map(|tx| tx.take().expect("checked above"))
         .collect())
+}
+
+/// Connection `i`'s receive task: waits for the connection (ws: upgrades it), hands its sending
+/// half to `connected`, then cuts the echoed byte stream into messages (ws: frames) and records
+/// them.
+#[switch::task]
+#[allow(clippy::too_many_arguments)]
+async fn tcp_receive(
+    i: u32,
+    connecting: Connecting,
+    ws: bool,
+    peer: SocketAddrV4,
+    size: usize,
+    handle: NetHandle,
+    connected: Rc<RefCell<Vec<Option<TcpTx>>>>,
+    recorder: Rc<RefCell<Option<Recorder>>>,
+    conns: Rc<Vec<Conn>>,
+    clock: Clock,
+) {
+    let stream = match connecting.await {
+        Ok(stream) => stream,
+        Err(closed) => panic!("tcp connect {i}: {closed:?}"),
+    };
+    let (mut rx, mut tx) = stream.split();
+    let mut partial = Vec::with_capacity(size);
+    let unit = if ws {
+        wsclient::server_frame_len(size)
+    } else {
+        size
+    };
+    if ws {
+        let request = wsclient::request(&peer.ip().to_string(), peer.port());
+        let mut frame = handle.tx_frame().await;
+        frame.room_mut()[..request.len()].copy_from_slice(request.as_bytes());
+        frame.set_len(request.len());
+        if let Err((_, e)) = tx.try_send(frame) {
+            panic!("ws upgrade request {i}: {e:?}");
+        }
+        let mut head = Vec::new();
+        let n = loop {
+            match rx.recv().await {
+                Ok(frame) => head.extend_from_slice(frame.payload()),
+                Err(e) => panic!("ws upgrade {i}: connection ended: {e:?}"),
+            }
+            if let Some(n) = wsclient::head_len(&head) {
+                break n;
+            }
+        };
+        if let Err(e) = wsclient::check_response(&head[..n]) {
+            panic!("ws upgrade {i}: {e}");
+        }
+        partial.extend_from_slice(&head[n..]);
+    }
+    connected.borrow_mut()[i as usize] = Some(tx);
+    let conn = &conns[i as usize];
+    while let Ok(frame) = rx.recv().await {
+        let now = clock.now_ns();
+        let mut r = recorder.borrow_mut();
+        let mut in_flight = conn.in_flight.borrow_mut();
+        messages(&mut partial, frame.payload(), unit, |m| {
+            let m = if ws {
+                wsclient::decode(m, size).unwrap_or_else(|e| panic!("connection {i}: {e}"))
+            } else {
+                m
+            };
+            let sent_ns = in_flight.pop_front();
+            if let Some(r) = r.as_mut() {
+                r.record(m, now);
+                if let Some(sent_ns) = sent_ns {
+                    r.service_rtt.record(now.saturating_sub(sent_ns));
+                }
+            }
+        });
+    }
+}
+
+/// Records every datagram `rx` receives.
+#[switch::task]
+async fn udp_receive(mut rx: UdpRx, clock: Clock, recorder: Rc<RefCell<Option<Recorder>>>) {
+    loop {
+        let datagram = rx.recv().await;
+        let now = clock.now_ns();
+        if let Some(r) = recorder.borrow_mut().as_mut() {
+            r.record(datagram.payload(), now);
+        }
+    }
 }
 
 /// Cuts `data` into `size`-byte messages, continuing the one in `partial`; calls `each` for every
@@ -495,7 +522,7 @@ impl Worker {
             },
             sent.clone(),
         );
-        spawn(host, task)?;
+        host.rt.spawner().spawn(task).map_err(spawn_error)?;
         let drain_end = window[1] + c.drain_ms * 1_000_000;
         loop {
             let now = host.round()?;
@@ -559,6 +586,7 @@ async fn try_tx_frame(handle: &NetHandle) -> Option<TxFrame> {
 /// yielding to the loop between batches, until all are sent or the window ends. Send lag is
 /// recorded for measured messages only (the warmup absorbs ARP and connection start), and not for
 /// owed messages (a full connection, or one at its budget).
+#[switch::task]
 async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let SendStep {
         handle,

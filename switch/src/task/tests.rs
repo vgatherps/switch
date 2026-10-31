@@ -160,20 +160,30 @@ fn a_completed_task_frees_its_slot_for_the_next_spawn() {
     assert_eq!(header(&waker(&again)), header(&waker(&states[4])));
 }
 
-/// One task function holds more live tasks than the old one-block default allowed
-/// (2046 of a boxed future): 4096 parked `Pin<Box<dyn Future>>` tasks, then all complete.
+/// `crate::boxed` runs the future it was given: parked until woken, then to completion.
+#[test]
+fn boxed_runs_its_future() {
+    let mut runtime = Runtime::new(0);
+    let state = state();
+    runtime.spawner().spawn(crate::boxed(Box::pin(Parked(state.clone())))).unwrap();
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 1));
+    state.done.set(true);
+    waker(&state).wake_by_ref();
+    let report = runtime.poll(0).unwrap();
+    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
+}
+
+/// One task function holds 4096 live tasks (more than one 64 KiB block's slots), then all
+/// complete.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn one_function_holds_4096_live_boxed_tasks() {
-    #[switch::task]
-    fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-        future
-    }
+fn one_function_holds_4096_live_tasks() {
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let states: Vec<_> = (0..4096).map(|_| state()).collect();
     for state in &states {
-        spawner.spawn(boxed(Box::pin(Parked(state.clone())))).unwrap();
+        spawner.spawn(parked(state.clone())).unwrap();
     }
     let report = runtime.poll(0).unwrap();
     assert_eq!((report.tasks_polled, report.live_tasks), (4096, 4096));

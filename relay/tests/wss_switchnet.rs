@@ -17,7 +17,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
-use switchnet::{IpEndpoint, IpListenEndpoint, boxed};
+use switchnet::{IpEndpoint, IpListenEndpoint};
 use switchnet::{Net, NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -128,6 +128,21 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     until_client_on(&TAP, listener_setup, serve, client)
 }
 
+/// Connects to the kernel peer from a fresh local port, runs `client` on the stream, and puts
+/// what it hands back in `held`.
+#[switch::task]
+async fn connect_client<H: 'static, F: Future<Output = H> + 'static, C: FnOnce(NetHandle, TcpStream) -> F + 'static>(
+    handle: NetHandle,
+    socket: tcp::Config,
+    client: C,
+    held: Rc<RefCell<Option<H>>>,
+) {
+    let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
+    let local = IpListenEndpoint { addr: None, port: next_local_port() };
+    let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
+    *held.borrow_mut() = Some(client(handle, stream).await);
+}
+
 /// `until_client` on `tap`'s Net and socket config.
 fn until_client_on<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     tap: &TapConfig,
@@ -153,14 +168,7 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
         let mut rt = switch::Runtime::new(0);
         let handle = net.handle();
         let held: Rc<RefCell<Option<H>>> = Rc::default();
-        let task_held = held.clone();
-        let task = async move {
-            let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
-            let local = IpListenEndpoint { addr: None, port: next_local_port() };
-            let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
-            *task_held.borrow_mut() = Some(client(handle, stream).await);
-        };
-        rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
+        rt.spawner().spawn(connect_client(handle, socket, client, held.clone())).expect("spawn the client");
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();

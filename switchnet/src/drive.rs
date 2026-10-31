@@ -1,8 +1,8 @@
-//! Running a Net's tasks: the loop owner's round (turn, poll), any future as a switch task,
-//! and the races tasks bound their waits with.
+//! Running a Net's tasks: the loop owner's round (turn, poll) and the races tasks bound their
+//! waits with.
 
 use std::future::{Future, poll_fn};
-use std::pin::{Pin, pin};
+use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -23,12 +23,6 @@ pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result
     let turn = net.turn(now).map_err(RoundError::Stack)?;
     let polled = rt.poll(tick).map_err(RoundError::Runtime)?;
     Ok(turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0)
-}
-
-/// Any future as a switch task.
-#[switch::task]
-pub fn boxed(future: Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
-    future
 }
 
 /// `a`'s output, or `None` if `b` finishes first; `a` is polled first. Dropping `a` drops what

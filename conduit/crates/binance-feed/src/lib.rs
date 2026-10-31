@@ -239,7 +239,7 @@ pub fn run<T: 'static, F: Future<Output = T> + 'static>(
     let done = Rc::new(RefCell::new(None));
     let slot = done.clone();
     let future = client(net.handle(), rt.spawner(), stop_rx);
-    let task = switchnet::boxed(Box::pin(
+    let task = switch::boxed(Box::pin(
         async move { *slot.borrow_mut() = Some(future.await) },
     ));
     rt.spawner()

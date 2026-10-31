@@ -24,7 +24,6 @@
 //! TCP flushes. UDP keeps the clock still, so the peer's neighbor entry for
 //! the Net never expires.
 
-use std::future::Future;
 use std::hint::black_box;
 use std::time::{Duration as Wall, Instant as Clock};
 
@@ -34,7 +33,7 @@ use dpdk_smoltcp::{
     frame_reserve, rx_reserve, Eal, Port, Stack, StackConfig, TcpHandle, UdpHandle,
 };
 use switch::Runtime;
-use switchnet::{boxed, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig};
+use switchnet::{tcp, Connecting, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig, UdpSocket};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
@@ -112,10 +111,6 @@ impl Bench {
             tcp,
             fixtures,
         }
-    }
-
-    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
-        self.rt.spawner().spawn(boxed(Box::pin(future))).expect("spawn");
     }
 
     /// Net turn, task poll, Net→peer, peer turn, peer→Net; whether a frame moved.
@@ -215,12 +210,7 @@ fn setup_tcp(eal: &Eal, n: usize) -> (Bench, Source) {
             let remote = IpEndpoint::new(Side::B.ip().into(), SERVER_BASE + id);
             let local = IpListenEndpoint { addr: None, port: CLIENT_BASE + id };
             let connecting = handle.tcp_connect(tcp_config(), remote, local).unwrap();
-            bench.spawn(async move {
-                let mut stream = connecting.await.expect("connect");
-                loop {
-                    drop(black_box(stream.recv().await.expect("recv")));
-                }
-            });
+            bench.rt.spawner().spawn(tcp_reader(connecting)).expect("spawn");
         }
         bench.until(|b| peers[start..].iter().all(|p| b.peer.tcp(p).state() == tcp::State::Established));
     }
@@ -228,17 +218,30 @@ fn setup_tcp(eal: &Eal, n: usize) -> (Bench, Source) {
     (bench, Source::Tcp(peers))
 }
 
+/// Reads `connecting`'s stream forever.
+#[switch::task]
+async fn tcp_reader(connecting: Connecting) {
+    let mut stream = connecting.await.expect("connect");
+    loop {
+        drop(black_box(stream.recv().await.expect("recv")));
+    }
+}
+
+/// Reads `socket` forever.
+#[switch::task]
+async fn udp_reader(mut socket: UdpSocket) {
+    loop {
+        drop(black_box(socket.recv().await));
+    }
+}
+
 /// `n` bound sockets, each read by a task parked in `recv`.
 fn setup_udp(eal: &Eal, n: usize) -> (Bench, Source) {
     let mut bench = Bench::new(eal, "bu", n, false);
     let handle = bench.net.handle();
     for id in 0..n {
-        let mut socket = handle.udp_bind(udp_config(UDP_BASE + u16::try_from(id).unwrap())).unwrap();
-        bench.spawn(async move {
-            loop {
-                drop(black_box(socket.recv().await));
-            }
-        });
+        let socket = handle.udp_bind(udp_config(UDP_BASE + u16::try_from(id).unwrap())).unwrap();
+        bench.rt.spawner().spawn(udp_reader(socket)).expect("spawn");
     }
     let peer = bench.peer.add_udp(udp_config(PEER_UDP)).unwrap();
     bench.round();

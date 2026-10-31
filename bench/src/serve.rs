@@ -2,10 +2,10 @@
 
 use std::path::PathBuf;
 
-use switch::Spawner;
+use switch::{SpawnError, Spawner};
 use switchnet::{
-    IpListenEndpoint, NetHandle, SendFrameError, TcpStream, UdpConfig, UdpSendError,
-    UdpSendFrameError, boxed, tcp,
+    Accepting, IpListenEndpoint, NetHandle, SendFrameError, TcpStream, UdpConfig, UdpRx,
+    UdpSendError, UdpSendFrameError, UdpTx, tcp,
 };
 use zhida_open::Sizing;
 
@@ -86,10 +86,8 @@ fn tcp_sizing(sockets: usize, tcp_config: &tcp::Config, mtu: usize) -> Sizing {
     }
 }
 
-fn spawn(spawner: &Spawner, task: impl Future<Output = ()> + 'static) -> Result<(), String> {
-    spawner
-        .spawn(boxed(Box::pin(task)))
-        .map_err(|e| format!("spawn: {:?}", e.reason))
+fn spawn_error<T>(e: SpawnError<T>) -> String {
+    format!("spawn: {:?}", e.reason)
 }
 
 /// Binds `port` and echoes every datagram to its source.
@@ -101,30 +99,35 @@ fn udp_echo(host: &Host, handle: &NetHandle, port: u16) -> Result<(), String> {
         tx_checksum: true,
         broadcast: false,
     };
-    let (mut rx, mut tx) = handle
+    let (rx, tx) = handle
         .udp_bind(config)
         .map_err(|e| format!("udp bind: {e:?}"))?
         .split();
-    let handle = handle.clone();
-    spawn(&host.rt.spawner(), async move {
-        loop {
-            let datagram = rx.recv().await;
-            let src = datagram.src();
-            let mut frame = handle.tx_frame().await;
-            let len = datagram.payload().len();
-            frame.room_mut()[..len].copy_from_slice(datagram.payload());
-            frame.set_len(len);
-            drop(datagram);
-            while let Err((
-                back,
-                UdpSendFrameError::Udp(UdpSendError::WouldBlock | UdpSendError::NeighborPending),
-            )) = tx.send(Some(src), frame)
-            {
-                frame = back;
-                switch::yield_now().await;
-            }
+    host.rt
+        .spawner()
+        .spawn(echo_datagrams(handle.clone(), rx, tx))
+        .map_err(spawn_error)
+}
+
+#[switch::task]
+async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
+    loop {
+        let datagram = rx.recv().await;
+        let src = datagram.src();
+        let mut frame = handle.tx_frame().await;
+        let len = datagram.payload().len();
+        frame.room_mut()[..len].copy_from_slice(datagram.payload());
+        frame.set_len(len);
+        drop(datagram);
+        while let Err((
+            back,
+            UdpSendFrameError::Udp(UdpSendError::WouldBlock | UdpSendError::NeighborPending),
+        )) = tx.send(Some(src), frame)
+        {
+            frame = back;
+            switch::yield_now().await;
         }
-    })
+    }
 }
 
 /// One pre-armed accept on `port` (conduit has no accept queue: each accept is a listening
@@ -139,21 +142,40 @@ fn arm_accept(
     let accepting = handle
         .tcp_accept(config, IpListenEndpoint { addr: None, port })
         .map_err(|e| format!("tcp accept on {port}: {e:?}"))?;
-    let task_spawner = spawner.clone();
-    spawn(spawner, async move {
-        let stream = accepting.await;
-        if let Err(e) = arm_accept(&task_spawner, handle.clone(), port, config, ws) {
-            eprintln!("zhida-bench serve: {e}");
+    spawner
+        .spawn(serve_accepted(
+            accepting,
+            spawner.clone(),
+            handle,
+            port,
+            config,
+            ws,
+        ))
+        .map_err(spawn_error)
+}
+
+/// Waits for `accepting`'s connection, arms the next accept, and echoes the connection.
+#[switch::task]
+async fn serve_accepted(
+    accepting: Accepting,
+    spawner: Spawner,
+    handle: NetHandle,
+    port: u16,
+    config: tcp::Config,
+    ws: bool,
+) {
+    let stream = accepting.await;
+    if let Err(e) = arm_accept(&spawner, handle.clone(), port, config, ws) {
+        eprintln!("zhida-bench serve: {e}");
+    }
+    if ws {
+        match accept_ws(&handle, stream, Limits::default()).await {
+            Ok(ws) => ws_echo(ws).await,
+            Err(e) => eprintln!("zhida-bench serve: ws upgrade: {e}"),
         }
-        if ws {
-            match accept_ws(&handle, stream, Limits::default()).await {
-                Ok(ws) => ws_echo(ws).await,
-                Err(e) => eprintln!("zhida-bench serve: ws upgrade: {e}"),
-            }
-        } else {
-            tcp_echo(&handle, stream).await;
-        }
-    })
+    } else {
+        tcp_echo(&handle, stream).await;
+    }
 }
 
 #[cfg(test)]
@@ -265,12 +287,14 @@ mod tests {
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
         arm_accept(&spawner, handle.clone(), PORT, tcp_config, false).unwrap();
+        #[switch::task]
+        async fn frame_room(handle: NetHandle, room: Rc<Cell<usize>>) {
+            room.set(handle.tx_frame().await.room_mut().len());
+        }
         let room = Rc::new(Cell::new(0));
-        let (task_handle, task_room) = (handle.clone(), room.clone());
-        spawn(&spawner, async move {
-            task_room.set(task_handle.tx_frame().await.room_mut().len());
-        })
-        .unwrap();
+        spawner
+            .spawn(frame_room(handle.clone(), room.clone()))
+            .unwrap();
 
         let sent: Vec<u8> = (0..ROUNDS * (1460 + SMALL * 64))
             .map(|i| (i % 251) as u8)
