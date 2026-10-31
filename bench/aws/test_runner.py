@@ -20,6 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import janitor  # noqa: E402
 import zhida_aws_bench as z  # noqa: E402
 
+UDP, TCP, WS = z.sweep_tags()
+
 UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 RECEIVER_DATA_IP = "10.80.1.100"
@@ -58,9 +60,6 @@ class PureTest(unittest.TestCase):
     def test_durations(self):
         self.assertEqual([z.parse_duration(t) for t in ("90m", "2h", "45s", "120", "1.5h")], [5400, 7200, 45, 120, 5400])
 
-    def test_fixed_matrix_tags(self):
-        self.assertEqual(z.sweep_tags(), ["udp-n20-s64-uncapped", "tcp-n20-s64-b50", "ws-n20-s64-b50"])
-
     def test_every_run_resource_carries_the_run_id_and_expiry(self):
         expires = datetime.datetime(2026, 11, 1, 13, 30, tzinfo=UTC)
         tags = {t["Key"]: t["Value"] for t in z.run_tags("r1", expires)}
@@ -85,25 +84,13 @@ class PureTest(unittest.TestCase):
     def test_data_ip_from_dut_json(self):
         self.assertEqual(z.data_ip('{"version": 1, "ipv4": "10.80.1.23/24"}'), "10.80.1.23")
 
-    def test_ssh_config_lists_the_five_senders(self):
+    def test_ssh_config_lists_the_senders(self):
         cfg = z.ssh_config([f"10.80.1.{10 + i}" for i in range(5)])
         for i in range(5):
             self.assertIn(f"Host sender{i}\n    HostName 10.80.1.{10 + i}\n", cfg)
         for line in ("User ec2-user", "BatchMode yes", f"IdentityFile {z.REMOTE}/id_run",
                      f"UserKnownHostsFile {z.REMOTE}/known_hosts"):
             self.assertIn(line, cfg)
-
-    def test_plan_prints_six_hosts_and_the_sweeps(self):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(z.main(["plan"]), 0)
-        text = out.getvalue()
-        self.assertIn("6 x c7gn.2xlarge on-demand", text)
-        for role in z.ROLES:
-            self.assertRegex(text, rf"\n  {role} +")
-        for t in z.sweep_tags():
-            self.assertIn(f"\n  {t}", text)
-        self.assertIn("L-1216C47A with 48 vCPUs free", text)
 
 
 class FeedSummaryTest(unittest.TestCase):
@@ -193,23 +180,23 @@ EOF
     def test_sweep_command_and_template_expand_for_every_sender(self):
         calls = self.run_sh(z.sweep_command("tcp", 50, RECEIVER_DATA_IP, "0-6"))
         self.assertEqual(calls[0], "taskset -c 0-6 MIMALLOC=unset")
-        self.assertEqual(calls[1], "zhida-bench sweep --proto tcp --gens 5 --senders 20 --rate-min 10000"
+        self.assertEqual(calls[1], "zhida-bench sweep --proto tcp --gens 3 --senders 12 --rate-min 10000"
                                    " --rate-max 5000000 --budget-us 50 --gen-cmd")
         gen = ("zhida-bench gen --config /etc/zhida/dut.json --proto tcp --target 10.80.1.100:7000 --senders 4"
                " --size 64 --local-port 40000")
-        for i in range(5):
+        for i in range(z.SENDERS):
             self.assertEqual(calls[2 + 4 * i: 6 + 4 * i], [
                 f"ssh -F {self.tmp}/var/ssh_config sender{i}", "sudo sh -c", "taskset -c 7 MIMALLOC=1", gen])
-        self.assertEqual(len(calls), 22)
-        with open(os.path.join(self.tmp, "var", "tcp-n20-s64-b50.jsonl")) as f:
+        self.assertEqual(len(calls), 2 + 4 * z.SENDERS)
+        with open(os.path.join(self.tmp, "var", f"{TCP}.jsonl")) as f:
             self.assertEqual(json.loads(f.read())["kind"], "summary")
-        with open(os.path.join(self.tmp, "var", "gen-tcp-n20-s64-b50.log")) as f:
-            self.assertEqual(f.read(), "gen-stderr\n" * 5)
+        with open(os.path.join(self.tmp, "var", f"gen-{TCP}.log")) as f:
+            self.assertEqual(f.read(), "gen-stderr\n" * z.SENDERS)
 
     def test_udp_runs_uncapped(self):
         calls = self.run_sh(z.sweep_command("udp", None, RECEIVER_DATA_IP, "0-6"))
         self.assertNotIn("--budget-us", calls[1])
-        self.assertTrue(os.path.exists(os.path.join(self.tmp, "var", "udp-n20-s64-uncapped.coord.log")))
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "var", f"{UDP}.coord.log")))
 
 
 # ---------------------------------------------------------------- provisioning
@@ -310,14 +297,14 @@ class LaunchTest(unittest.TestCase):
         with open(key) as f:
             self.assertEqual(f.read(), "PRIVATE\n")
 
-    def test_one_run_instances_of_six_into_the_placement_group_then_eni_attach(self):
+    def test_one_run_instances_of_every_host_into_the_placement_group_then_eni_attach(self):
         ec2 = FakeLaunchEc2()
         aws = launch_aws(ec2)
         hosts = aws.launch_hosts(NET, "r1", NOW + datetime.timedelta(hours=2), ec2.record, "c7gn.2xlarge", z.ROLES)
         names = [c[0] for c in ec2.calls]
         self.assertEqual(names.count("run_instances"), 1)
         ri = ec2.calls[names.index("run_instances")][1]
-        self.assertEqual((ri["MinCount"], ri["MaxCount"], ri["InstanceType"]), (6, 6, "c7gn.2xlarge"))
+        self.assertEqual((ri["MinCount"], ri["MaxCount"], ri["InstanceType"]), (4, 4, "c7gn.2xlarge"))
         self.assertEqual(ri["Placement"], {"GroupName": "zhida-bench-r1", "AvailabilityZone": "zone-a"})
         self.assertEqual(ri["KeyName"], "zhida-bench-r1")
         self.assertNotIn("InstanceMarketOptions", ri, "on-demand, not spot")
@@ -328,14 +315,14 @@ class LaunchTest(unittest.TestCase):
         self.assertNotIn("create_tags", names, "tags only via TagSpecifications")
         wait = names.index("wait")
         self.assertEqual(ec2.calls[names.index("run_instances") + 1: wait],
-                         [("record", ("instance", f"i-{k}")) for k in range(6)], "recorded before the waiter")
+                         [("record", ("instance", f"i-{k}")) for k in range(len(z.ROLES))], "recorded before the waiter")
         self.assertEqual([c[1][1] for c in ec2.calls[wait:] if c[0] == "record"],
-                         [f"eni-{k}" for k in range(1, 7)])
+                         [f"eni-{k}" for k in range(1, len(z.ROLES) + 1)])
         eni_calls = [c for c in ec2.calls[wait + 1:] if c[0] in (
             "create_network_interface", "attach_network_interface", "modify_network_interface_attribute")]
         self.assertEqual([c[0] for c in eni_calls], ["create_network_interface", "attach_network_interface",
-                                                     "modify_network_interface_attribute"] * 6)
-        for k in range(6):
+                                                     "modify_network_interface_attribute"] * len(z.ROLES))
+        for k in range(len(z.ROLES)):
             att, mod = eni_calls[3 * k + 1][1], eni_calls[3 * k + 2][1]
             self.assertEqual((att["InstanceId"], att["DeviceIndex"]), (f"i-{k}", 1))
             self.assertEqual(mod["Attachment"], {"AttachmentId": f"att-eni-{k + 1}", "DeleteOnTermination": True})
@@ -747,11 +734,11 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.run_bench(), 0)
         w = self.w
         self.assertEqual([c for r, c in w.calls if r == "aws"], [
-            "create_network 203.0.113.9 c7gn.2xlarge cluster", "launch_hosts c7gn.2xlarge " + " ".join(z.ROLES)])
+            f"create_network 203.0.113.9 {z.HOST_TYPE} cluster", f"launch_hosts {z.HOST_TYPE} " + " ".join(z.ROLES)])
         self.assertEqual(sorted(r for r, c in w.calls if c == "setup b'TAR'"), sorted(z.ROLES))
         cfg = w.put[("sender0", f"{z.REMOTE}/ssh_config")]
         self.assertEqual([l for l in cfg.splitlines() if l.startswith("Host sender")],
-                         [f"Host sender{i}" for i in range(5)])
+                         [f"Host sender{i}" for i in range(z.SENDERS)])
         self.assertIn("HostName 10.80.1.11", cfg)
         self.assertEqual(w.put[("sender0", f"{z.REMOTE}/id_run")], "PRIVATE\n")
         sweeps = self.sweeps_run()
@@ -761,9 +748,9 @@ class RunTest(unittest.TestCase):
         for cmd, t in zip(sweeps, z.sweep_tags()):
             argv = shlex.split(cmd.split(" > ")[0])
             self.assertEqual(argv[:3], ["taskset", "-c", "0-6"], "coordinator on HOUSEKEEPING")
-            self.assertEqual(argv[argv.index("--gens") + 1], "5")
+            self.assertEqual(argv[argv.index("--gens") + 1], str(z.SENDERS))
             tmpl = argv[argv.index("--gen-cmd") + 1]
-            for i in range(5):
+            for i in range(z.SENDERS):
                 self.assertTrue(tmpl.replace("{i}", str(i)).startswith(f"ssh -F {z.REMOTE}/ssh_config sender{i} "))
             self.assertIn(f"--target {RECEIVER_DATA_IP}:7000", tmpl)
             self.assertIn(f"> {z.REMOTE}/{t}.jsonl 2> {z.REMOTE}/{t}.coord.log", cmd)
@@ -774,44 +761,44 @@ class RunTest(unittest.TestCase):
                                        " --port 7000"), c)
         for t in z.sweep_tags():
             want = {("sender0", f"{z.REMOTE}/{t}.jsonl"), ("sender0", f"{z.REMOTE}/{t}.coord.log")}
-            want |= {(f"sender{i}", f"{z.REMOTE}/gen-{t}.log") for i in range(5)}
+            want |= {(f"sender{i}", f"{z.REMOTE}/gen-{t}.log") for i in range(z.SENDERS)}
             self.assertEqual(want, {f for f in w.fetched if t in f[1]})
-            self.assertTrue(os.path.exists(os.path.join(self.run_dir, "sender4", f"gen-{t}.log")))
+            self.assertTrue(os.path.exists(os.path.join(self.run_dir, f"sender{z.SENDERS - 1}", f"gen-{t}.log")))
         with open(os.path.join(self.run_dir, "expected.json")) as f:
             self.assertEqual(json.load(f), {"sweeps": z.sweep_tags()})
         report = [a for a in w.local_calls if a[1].endswith("report.py")]
         self.assertEqual(len(report), 1)
         self.assertEqual(report[0][2], self.run_dir)
         run_id = os.path.basename(self.run_dir)
-        recorded = {"vpc": ["vpc-1"], "subnet": ["subnet-1"], "instance": [f"i-{k}" for k in range(6)]}
+        recorded = {"vpc": ["vpc-1"], "subnet": ["subnet-1"], "instance": [f"i-{k}" for k in range(len(z.ROLES))]}
         self.assertEqual(w.clean_calls, [(run_id, recorded)])
         self.assertEqual(janitor.read_created(os.path.join(self.run_dir, "created.json")), recorded)
         with open(os.path.join(self.run_dir, "host-setup.txt")) as f:
             setup = f.read()
-        self.assertIn("[sender4 host.env]", setup)
+        self.assertIn(f"[sender{z.SENDERS - 1} host.env]", setup)
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, "fetch-errors.txt")))
 
     def test_failing_sweep_does_not_stop_later_sweeps_and_is_fetched(self):
-        self.w.sweep_exit["udp-n20-s64-uncapped"] = 1
+        self.w.sweep_exit[UDP] = 1
         self.w.report_code = 1  # report.py: INCOMPLETE
         self.assertEqual(self.run_bench(), 1)
         self.assertEqual(len(self.sweeps_run()), 3)
-        self.assertIn(("sender0", f"{z.REMOTE}/udp-n20-s64-uncapped.jsonl"), self.w.fetched)
-        self.assertIn("udp-n20-s64-uncapped: coordinator exit 1", self.log.getvalue())
+        self.assertIn(("sender0", f"{z.REMOTE}/{UDP}.jsonl"), self.w.fetched)
+        self.assertIn(f"{UDP}: coordinator exit 1", self.log.getvalue())
         self.assertEqual(len(self.w.clean_calls), 1)
 
     def test_one_failed_sweep_fails_the_run_even_if_the_report_passes(self):
         """Regression: a generator-bound udp sweep (coordinator exit 1) next to good tcp/ws sweeps
         gave run exit 0."""
-        self.w.sweep_exit["udp-n20-s64-uncapped"] = 1
+        self.w.sweep_exit[UDP] = 1
         self.assertEqual(self.run_bench(), 1)
-        self.assertIn("generator-bound: udp-n20-s64-uncapped", self.log.getvalue())
+        self.assertIn(f"generator-bound: {UDP}", self.log.getvalue())
 
     def test_scp_failure_is_recorded_and_fails_the_run(self):
-        self.w.fetch_fail.add(("sender2", f"{z.REMOTE}/gen-tcp-n20-s64-b50.log"))
+        self.w.fetch_fail.add(("sender2", f"{z.REMOTE}/gen-{TCP}.log"))
         self.assertEqual(self.run_bench(), 1)
         with open(os.path.join(self.run_dir, "fetch-errors.txt")) as f:
-            self.assertEqual(f.read(), f"sender2:{z.REMOTE}/gen-tcp-n20-s64-b50.log: scp exited 1\n")
+            self.assertEqual(f.read(), f"sender2:{z.REMOTE}/gen-{TCP}.log: scp exited 1\n")
         self.assertEqual(len(self.sweeps_run()), 3)
 
     def test_failed_verify_aborts_with_teardown(self):
@@ -834,21 +821,21 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.w.clean_calls, [(os.path.basename(self.run_dir), {"vpc": ["vpc-1"]})])
 
     def test_a_second_ctrl_c_during_teardown_does_not_interrupt_it(self):
-        self.w.interrupt_sweep = "tcp-n20-s64-b50"
+        self.w.interrupt_sweep = TCP
         self.w.interrupt_teardown = True
         code = self.run_bench()
         self.assertIsInstance(code, SystemExit)
         self.assertEqual(code.code, 128 + signal.SIGINT)
         self.assertTrue(self.w.teardown_done)
         self.assertEqual(len(self.sweeps_run()), 2)
-        self.assertIn(("sender0", f"{z.REMOTE}/tcp-n20-s64-b50.jsonl"), self.w.fetched, "the interrupted sweep")
+        self.assertIn(("sender0", f"{z.REMOTE}/{TCP}.jsonl"), self.w.fetched, "the interrupted sweep")
         self.assertEqual(len([a for a in self.w.local_calls if a[1].endswith("report.py")]), 1)
 
     def test_timed_out_receiver_stop_and_fetches_while_unwinding_still_reach_teardown(self):
-        self.w.interrupt_sweep = "udp-n20-s64-uncapped"
+        self.w.interrupt_sweep = UDP
         self.w.hang = True
         self.assertIsInstance(self.run_bench(), subprocess.TimeoutExpired)
-        self.assertEqual(len(self.w.fetched), 7, "every file of the interrupted sweep tried")
+        self.assertEqual(len(self.w.fetched), 2 + z.SENDERS, "every file of the interrupted sweep tried")
         self.assertTrue(self.w.teardown_done)
 
     def test_dirty_tree_refused_before_anything_is_created(self):

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""zhida-aws-bench: the latency/load bench on EC2 in one command, 1 receiver + 5 sender hosts.
+"""zhida-aws-bench: the latency/load bench on EC2 in one command, 1 receiver + SENDERS sender hosts
+(the shape constants below).
 
   zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
   zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
@@ -10,7 +11,7 @@
 Needs python3 with boto3, ssh, scp, git, a clean committed tree (the hosts build `git archive HEAD`)
 and AWS credentials for the region. Design: plans/bench/design.md.
 `preflight` (also the first step of `run`) checks the tree, the credentials and the on-demand
-Standard vCPU quota (L-1216C47A: 48 free) before anything is created.
+Standard vCPU quota (L-1216C47A: the hosts' vCPUs free) before anything is created.
 
 Permissions the caller needs: ec2 (VPC, subnet, internet gateway, route table, security group,
 placement group, key pair, run/terminate/describe instances, create/attach/delete/modify network
@@ -19,7 +20,7 @@ allocate/associate/disassociate/release/describe addresses), ssm:GetParameter (t
 sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 
 `run` creates a VPC, subnet, internet gateway, route table, security group (SSH from the caller's
-address), cluster placement group and key pair for the run; provisions six c7gn.2xlarge on-demand
+address), cluster placement group and key pair for the run; provisions the HOST_TYPE on-demand
 instances (one run_instances) in the placement group, one data ENI each; applies
 `deploy/hft-host.sh` (builds DPDK and the toolchain, reboots, verify), then builds zhida-bench
 natively (bootstrap.sh); runs the fixed sweep matrix with the coordinator on sender0 driving one
@@ -60,10 +61,14 @@ NAME = janitor.NAME
 REGION = "ap-northeast-1"
 TTL = "2h"
 
-INSTANCE_TYPE, HOST_VCPUS, ROOT_GB = "c7gn.2xlarge", 8, 40
-ROLES = ["receiver"] + [f"sender{i}" for i in range(5)]
-SENDER_HOSTS = len(ROLES) - 1
-SENDERS = 4 * SENDER_HOSTS
+# The fixed shape: 1 receiver + SENDERS sender hosts, all HOST_TYPE. 1 + 3 x c7gn.xlarge = 16 vCPUs
+# (the account's quota); 1 + 5 x c7gn.2xlarge (48 vCPUs) is SENDERS = 5, HOST_TYPE = "c7gn.2xlarge".
+# Each host: hft-host.sh isolates its highest CPU for the app, the rest (at least 3) housekeep.
+SENDERS, HOST_TYPE = 3, "c7gn.xlarge"
+HOST_VCPUS = {"c7gn.xlarge": 4, "c7gn.2xlarge": 8}[HOST_TYPE]
+ROOT_GB = 40
+ROLES = ["receiver"] + [f"sender{i}" for i in range(SENDERS)]
+CONNECTIONS = 4 * SENDERS
 SIZE = 64
 RATE_MIN, RATE_MAX = 10_000, 5_000_000
 BUDGET_US = 50
@@ -118,7 +123,7 @@ def run_tags(run_id, expires):
 
 
 def tag(proto, budget):
-    return f"{proto}-n{SENDERS}-s{SIZE}-{'uncapped' if budget is None else f'b{budget}'}"
+    return f"{proto}-n{CONNECTIONS}-s{SIZE}-{'uncapped' if budget is None else f'b{budget}'}"
 
 
 def sweep_tags():
@@ -138,8 +143,8 @@ def sweep_command(proto, budget, receiver_ip, housekeeping):
     """The coordinator, run as ec2-user on sender0's housekeeping CPUs."""
     t = tag(proto, budget)
     budget_arg = "" if budget is None else f" --budget-us {budget}"
-    return (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDER_HOSTS}"
-            f" --senders {SENDERS} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
+    return (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDERS}"
+            f" --senders {CONNECTIONS} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
             f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
             f" > {REMOTE}/{t}.jsonl 2> {REMOTE}/{t}.coord.log")
 
@@ -151,7 +156,7 @@ def serve_command(proto, app_cpu):
 
 
 def ssh_config(sender_ips):
-    """sender0's ssh_config: the five senders by their primary private IPs, the run's key."""
+    """sender0's ssh_config: the senders by their primary private IPs, the run's key."""
     lines = []
     for i, ip in enumerate(sender_ips):
         lines += [f"Host sender{i}", f"    HostName {ip}"]
@@ -253,16 +258,16 @@ def feed_summary(text, code):
 def plan_text(region, ttl, run_id, expires):
     lines = [
         f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
-        f"hosts: {len(ROLES)} x {INSTANCE_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
+        f"hosts: {len(ROLES)} x {HOST_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
         f" its cluster placement group, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 DPDK data ENI"
         " (vfio-pci, DeleteOnTermination); CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
         f"  {'receiver':9} zhida-bench serve on APP_CPU (systemd unit {RECEIVER_UNIT})",
         f"  {'sender0':9} zhida-bench sweep (coordinator) on HOUSEKEEPING; worker 0 (zhida-bench gen) on APP_CPU",
     ]
     lines += [f"  {f'sender{i}':9} worker {i} (zhida-bench gen, over SSH from sender0) on APP_CPU"
-              for i in range(1, SENDER_HOSTS)]
+              for i in range(1, SENDERS)]
     lines += [
-        f"sweeps: {SENDERS} senders ({SENDERS // SENDER_HOSTS} per sender host), {SIZE} B messages,"
+        f"sweeps: {CONNECTIONS} senders ({CONNECTIONS // SENDERS} per sender host), {SIZE} B messages,"
         f" {RATE_MIN}..{RATE_MAX} msg/s in steps of x sqrt(2); coordinator killed after {SWEEP_WORST_S} s",
     ]
     lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
@@ -548,7 +553,7 @@ def source_archive(local):
 
 
 def setup_hosts(hosts, archive):
-    """All six in parallel; raises listing every host that failed."""
+    """All hosts in parallel; raises listing every host that failed."""
     results, threads = {}, []
 
     def one(h):
@@ -655,7 +660,7 @@ def run(args, env=None):
     expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
     run_id = new_run_id(now)
     print(plan_text(args.region, args.ttl, run_id, expires))
-    aws = checked_preflight(env, args.region, INSTANCE_TYPE, len(ROLES) * HOST_VCPUS)
+    aws = checked_preflight(env, args.region, HOST_TYPE, len(ROLES) * HOST_VCPUS)
     archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
@@ -667,8 +672,8 @@ def run(args, env=None):
     fetch_errors, failed = [], ["(not measured)"]
     # From here on every exit path deletes the run's resources.
     try:
-        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, INSTANCE_TYPE, "cluster")
-        infos = aws.launch_hosts(net, run_id, expires, created.add, INSTANCE_TYPE, ROLES)
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, HOST_TYPE, "cluster")
+        infos = aws.launch_hosts(net, run_id, expires, created.add, HOST_TYPE, ROLES)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump(infos, f, indent=1)
         hosts = [env.host(info, key_path, run_dir) for info in infos]
@@ -695,7 +700,7 @@ def run(args, env=None):
                     f.write("\n".join(fetch_errors) + "\n")
                 log(f"{len(fetch_errors)} fetch failures: {os.path.join(run_dir, 'fetch-errors.txt')}")
             report_code = env.local([sys.executable, os.path.join(REPO, "bench", "report.py"), run_dir, "--title",
-                                     f"zhida-bench {run_id} (1 receiver + {SENDER_HOSTS} senders, {INSTANCE_TYPE})"]
+                                     f"zhida-bench {run_id} (1 receiver + {SENDERS} senders, {HOST_TYPE})"]
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
         if failed:
@@ -800,7 +805,7 @@ def parser():
 def main(argv, env=None):
     args = parser().parse_args(argv)
     if args.cmd == "preflight":
-        checked_preflight(env or Env(), args.region, INSTANCE_TYPE, len(ROLES) * HOST_VCPUS)
+        checked_preflight(env or Env(), args.region, HOST_TYPE, len(ROLES) * HOST_VCPUS)
         return 0
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)
