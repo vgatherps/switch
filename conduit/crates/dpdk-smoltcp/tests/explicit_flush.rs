@@ -182,6 +182,9 @@ fn template_acks_keep_exact_tx_pool_counts() {
                 assert_eq!(tcp.payload, b"x");
                 expected.push((tcp.src_port, tcp.seq_number + 1));
             }
+            // B egresses in marking order: the last server is still marked from the warm-up's
+            // final ACK, before the others' data marks them.
+            expected.rotate_right(1);
             assert_eq!(pair.in_use()[0].1, 0);
             assert_eq!(
                 pair.b.receive(now, BUDGET),

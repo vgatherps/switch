@@ -9,7 +9,7 @@ use crate::socket::tcp;
 
 use super::{bind_word, slot_map, tuple_word, BindKey, SlotMap};
 use super::timer_wheel::{
-    InsertOutcome, IntrusiveLinks, Linked, ListHead, Timed, TimerWheel, WheelEntry, WheelPosition,
+    InsertOutcome, IntrusiveLinks, Linked, Timed, TimerWheel, WheelEntry, WheelPosition,
 };
 use crate::socket::PollAt;
 use crate::time::Instant;
@@ -67,7 +67,6 @@ struct FlowSlot {
     queued: bool,
     timer_links: IntrusiveLinks,
     timer_position: WheelPosition,
-    due: bool,
     orphaned: bool,
     /// Position in `TcpSet::reapable`; `REPORTED` once `take_reapable` returned the slot,
     /// until it is removed; `UNLISTED` otherwise.
@@ -86,7 +85,6 @@ impl FlowSlot {
         queued: false,
         timer_links: IntrusiveLinks::new(),
         timer_position: WheelPosition::Unlinked,
-        due: false,
         orphaned: false,
         reap_at: UNLISTED,
         armed: false,
@@ -225,8 +223,8 @@ pub struct TcpSet<'a> {
     last_exact: Option<usize>,
     pub(crate) dirty_list: Vec<usize>,
     wheel: TimerWheel,
-    due: ListHead,
-    admission: Vec<u32>,
+    /// Slots the wheel expired in the current advance; empty between calls.
+    expired: Vec<u32>,
     pub(crate) waiting: Vec<usize>,
     pub(crate) neighbor_changes: u64,
     ready: VecDeque<usize>,
@@ -251,8 +249,7 @@ impl<'a> TcpSet<'a> {
             last_exact: None,
             dirty_list: Vec::with_capacity(slot_count),
             wheel: TimerWheel::default(),
-            due: ListHead::new(),
-            admission: Vec::with_capacity(slot_count),
+            expired: Vec::with_capacity(slot_count),
             waiting: Vec::with_capacity(slot_count),
             neighbor_changes: 0,
             ready: VecDeque::with_capacity(slot_count),
@@ -313,9 +310,13 @@ impl<'a> TcpSet<'a> {
 
         let index = self.lowest_free().expect("adding a socket to a full TcpSet");
         self.set_occupied(index, true);
+        let idle = socket.state() == tcp::State::Closed && socket.remote_endpoint().is_none();
         let handle = put(index, &mut self.sockets[index], socket);
         self.update_identity(index);
-        self.mark_dirty(index);
+        // A Closed socket with no peer has nothing to send; `connect` or `listen` marks it.
+        if !idle {
+            self.mark_dirty(index);
+        }
         handle
     }
 
@@ -647,7 +648,6 @@ impl<'a> TcpSet<'a> {
         let dirty_list = &mut self.dirty_list;
         let flow_slots = &mut self.flow_slots;
         let wheel = &mut self.wheel;
-        let due = &mut self.due;
         self.sockets
             .iter_mut()
             .enumerate()
@@ -656,10 +656,6 @@ impl<'a> TcpSet<'a> {
                 if !flow_slots[index].dirty {
                     let timer_index = u32::try_from(index).expect("TCP timer index overflow");
                     wheel.remove(flow_slots, timer_index);
-                    if flow_slots[index].due {
-                        due.remove(flow_slots, timer_index);
-                        flow_slots[index].due = false;
-                    }
                     flow_slots[index].dirty = true;
                     dirty_list.push(index);
                 }
@@ -796,16 +792,9 @@ impl TcpSet<'_> {
     }
 
     fn remove_deadline(&mut self, index: usize) {
-        if self.flow_slots[index].timer_position == WheelPosition::Unlinked
-            && !self.flow_slots[index].due
-        {
-            return;
-        }
-        let timer_index = u32::try_from(index).expect("TCP timer index overflow");
-        self.wheel.remove(&mut self.flow_slots, timer_index);
-        if self.flow_slots[index].due {
-            self.due.remove(&mut self.flow_slots, timer_index);
-            self.flow_slots[index].due = false;
+        if self.flow_slots[index].timer_position != WheelPosition::Unlinked {
+            let timer_index = u32::try_from(index).expect("TCP timer index overflow");
+            self.wheel.remove(&mut self.flow_slots, timer_index);
         }
     }
 
@@ -825,7 +814,9 @@ impl TcpSet<'_> {
         }
     }
 
-    pub(crate) fn clear_dirty(&mut self) {
+    /// Clear the dirty list; each slot not already queued is queued if due, else timed on the
+    /// wheel. Returns the ready queue length.
+    pub(crate) fn clear_dirty(&mut self) -> usize {
         for position in 0..self.dirty_list.len() {
             let index = self.dirty_list[position];
             self.flow_slots[index].dirty = false;
@@ -834,15 +825,14 @@ impl TcpSet<'_> {
             }
         }
         self.dirty_list.clear();
+        self.ready.len()
     }
 
+    /// Store the slot's deadline, unlinking an old wheel entry. The caller schedules it.
     pub(crate) fn set_deadline(&mut self, index: usize, deadline: PollAt, waiting: bool) {
         if self.flow_slots[index].deadline != deadline {
             self.remove_deadline(index);
             self.flow_slots[index].deadline = deadline;
-            if !self.flow_slots[index].dirty && !self.flow_slots[index].queued {
-                self.include_deadline(index);
-            }
         }
         self.set_waiting(index, waiting);
     }
@@ -877,14 +867,9 @@ impl TcpSet<'_> {
                     .expect("TCP timer boundary exceeds Instant"),
             )
         });
-        for index in self
-            .ready
-            .iter()
-            .copied()
-            .map(|i| i as u32)
-            .chain(self.due.iter(&self.flow_slots))
-        {
-            let deadline = match self.flow_slots[index as usize].deadline {
+        // A queued slot can have gained a future deadline, or none, since it was queued.
+        for &index in &self.ready {
+            let deadline = match self.flow_slots[index].deadline {
                 PollAt::Ingress => continue,
                 PollAt::Now => Instant::ZERO,
                 PollAt::Time(instant) => instant,
@@ -911,62 +896,27 @@ impl TcpSet<'_> {
         self.flow_slots[index].deadline
     }
 
-    pub(crate) fn advance_wheel(&mut self, timestamp: Instant, admit: bool) {
-        debug_assert!(self.admission.is_empty());
+    /// Advance the wheel to `timestamp`. Expired slots are queued in expiry order; one waiting
+    /// for a neighbor is marked dirty instead.
+    pub(crate) fn advance_wheel(&mut self, timestamp: Instant) {
+        debug_assert!(self.expired.is_empty());
         if timestamp.total_micros() >= 0 {
             let now_tick = timestamp.total_micros() as u64 / 1000;
             if now_tick >= self.wheel.current_tick() {
                 self.wheel
-                    .advance_to(&mut self.flow_slots, now_tick, &mut self.admission)
+                    .advance_to(&mut self.flow_slots, now_tick, &mut self.expired)
                     .expect("TCP wheel time regressed");
             }
         }
-        let mut kept = 0usize;
-        for position in 0..self.admission.len() {
-            let index = self.admission[position];
-            if self.flow_slots[index as usize].is_waiting() {
-                self.mark_dirty(index as usize);
-                continue;
-            }
-            if admit {
-                debug_assert!(!self.flow_slots[index as usize].dirty);
-                self.admission[kept] = index;
-                kept = kept.checked_add(1).expect("TCP admission length overflow");
+        for position in 0..self.expired.len() {
+            let index = self.expired[position] as usize;
+            if self.flow_slots[index].is_waiting() {
+                self.mark_dirty(index);
             } else {
-                self.flow_slots[index as usize].due = true;
-                self.due.push_back(&mut self.flow_slots, index);
+                self.push_ready(index, false);
             }
         }
-        self.admission.truncate(kept);
-    }
-
-    /// `admission` may already hold slots whose wheel deadline expired at the start of this egress pass.
-    pub(crate) fn admit_ready(&mut self, timestamp: Instant) -> usize {
-        for position in 0..self.dirty_list.len() {
-            let index = self.dirty_list[position];
-            self.flow_slots[index].dirty = false;
-            if !self.flow_slots[index].queued {
-                if self.sockets[index].inner.is_some() && self.deadline_due(index, timestamp) {
-                    self.admission
-                        .push(u32::try_from(index).expect("TCP timer index overflow"));
-                } else {
-                    self.include_deadline(index);
-                }
-            }
-        }
-        self.dirty_list.clear();
-        for index in self.due.iter(&self.flow_slots) {
-            if self.deadline_due(index as usize, timestamp) {
-                self.admission.push(index);
-            }
-        }
-        self.admission.sort_unstable();
-        self.admission.dedup();
-        for position in 0..self.admission.len() {
-            self.push_ready(self.admission[position] as usize, false);
-        }
-        self.admission.clear();
-        self.ready.len()
+        self.expired.clear();
     }
 
     pub(crate) fn ready_len(&self) -> usize {
@@ -974,10 +924,7 @@ impl TcpSet<'_> {
     }
 
     pub(crate) fn egress_idle(&self) -> bool {
-        self.ready.is_empty()
-            && self.dirty_list.is_empty()
-            && self.waiting.is_empty()
-            && self.due.is_empty()
+        self.ready.is_empty() && self.dirty_list.is_empty() && self.waiting.is_empty()
     }
 
     pub(crate) fn pop_ready(&mut self) -> usize {
@@ -986,13 +933,11 @@ impl TcpSet<'_> {
         index
     }
 
+    /// Queue the slot if its deadline is due by the wheel's clock, else link it on the wheel.
     pub(crate) fn include_deadline(&mut self, index: usize) {
         let slot = &self.flow_slots[index];
         debug_assert!(!slot.dirty && !slot.queued);
-        if self.sockets[index].inner.is_none()
-            || slot.due
-            || slot.timer_position != WheelPosition::Unlinked
-        {
+        if self.sockets[index].inner.is_none() || slot.timer_position != WheelPosition::Unlinked {
             return;
         }
         let timer_index = u32::try_from(index).expect("TCP timer index overflow");
@@ -1004,8 +949,7 @@ impl TcpSet<'_> {
             }
         };
         if due {
-            self.due.push_back(&mut self.flow_slots, timer_index);
-            self.flow_slots[index].due = true;
+            self.push_ready(index, false);
         }
     }
 

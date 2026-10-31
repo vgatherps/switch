@@ -157,32 +157,6 @@ mod list {
                 f(idx);
             }
         }
-
-        /// Iterate over all indices (non-mutating).
-        pub(crate) fn iter<'a, T: ListLinked>(&self, entries: &'a [T]) -> ListIter<'a, T> {
-            ListIter {
-                entries,
-                current: self.first,
-            }
-        }
-    }
-
-    pub(crate) struct ListIter<'a, T> {
-        entries: &'a [T],
-        current: u32,
-    }
-
-    impl<T: ListLinked> Iterator for ListIter<'_, T> {
-        type Item = u32;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.current == NIL {
-                return None;
-            }
-            let idx = self.current;
-            self.current = self.entries[idx as usize].next();
-            Some(idx)
-        }
     }
 
     #[cfg(test)]
@@ -317,19 +291,6 @@ mod list {
 
             assert_eq!(list.last, 1);
             assert_eq!(entries[1].next(), NIL);
-        }
-
-        #[test]
-        fn test_iter() {
-            let mut entries = make_entries(5);
-            let mut list = ListHead::new();
-
-            list.push_back(&mut entries, 0);
-            list.push_back(&mut entries, 2);
-            list.push_back(&mut entries, 4);
-
-            let indices: Vec<_> = list.iter(&entries).collect();
-            assert_eq!(indices, vec![0, 2, 4]);
         }
 
         #[test]

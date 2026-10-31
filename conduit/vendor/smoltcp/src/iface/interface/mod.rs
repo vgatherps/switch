@@ -558,7 +558,7 @@ impl Interface {
     }
 
     pub(crate) fn classify_dirty(&mut self, sockets: &mut TcpSet, timestamp: Instant) {
-        classify_dirty(&mut self.inner, sockets, timestamp, false);
+        classify_dirty(&mut self.inner, sockets, timestamp);
     }
 
     fn socket_ingress(
@@ -657,7 +657,7 @@ impl Interface {
     ) -> PollResult {
         self.inner.neighbor_cache.expire(self.inner.now);
         let timestamp = self.inner.now;
-        let visits = classify_dirty(&mut self.inner, sockets, timestamp, true);
+        let visits = classify_dirty(&mut self.inner, sockets, timestamp);
 
         let mut result = PollResult::None;
         for _ in 0..visits {
@@ -901,13 +901,10 @@ pub(crate) fn classify_polled(
     sockets.set_deadline(index, deadline, waiting);
 }
 
-fn classify_dirty(
-    inner: &mut InterfaceInner,
-    sockets: &mut TcpSet,
-    timestamp: Instant,
-    admit: bool,
-) -> usize {
-    sockets.advance_wheel(timestamp, admit);
+/// Advance the wheel, then classify dirty slots in the order they were marked. Due slots join
+/// the ready queue in that order, after the expired ones; returns its length.
+fn classify_dirty(inner: &mut InterfaceInner, sockets: &mut TcpSet, timestamp: Instant) -> usize {
+    sockets.advance_wheel(timestamp);
     let rescan_waiting = {
         let changes = inner.neighbor_cache.changes();
         let changed = sockets.neighbor_changes != changes;
@@ -919,17 +916,11 @@ fn classify_dirty(
             sockets.mark_dirty(sockets.waiting[position]);
         }
     }
-    sockets.dirty_list.sort_unstable();
     for position in 0..sockets.dirty_list.len() {
         let index = sockets.dirty_list[position];
         classify(inner, sockets, index, timestamp);
     }
-    if admit {
-        sockets.admit_ready(timestamp)
-    } else {
-        sockets.clear_dirty();
-        sockets.ready_len()
-    }
+    sockets.clear_dirty()
 }
 
 impl InterfaceInner {
