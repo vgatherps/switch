@@ -243,7 +243,7 @@ fn run(args: Args) -> i32 {
             let clock_cpus = if report.device.driver_name != "net_ena" {
                 Err("the driver is not net_ena".to_owned())
             } else if dpdk_smoltcp::read_clock(port_id) == Err(-libc::ENOTSUP) {
-                Err("the device has no PHC".to_owned())
+                Err("the driver cannot read this NIC's clock".to_owned())
             } else {
                 nic::housekeeping_cpus(report.cpu)
             };
