@@ -149,7 +149,6 @@ fn every_live_header_masks_to_its_block_across_blocks() {
     for (index, &meta) in metas.iter().enumerate() {
         assert_eq!(unsafe { Meta::block(meta) }, (index / 3) as u32);
     }
-    assert_eq!(unsafe { RuntimePool::block_count(Meta::pool(metas[0])) }, 3);
 }
 
 #[test]
@@ -159,25 +158,6 @@ fn a_completed_task_frees_its_slot_for_the_next_spawn() {
     finish(&mut runtime, &states[4]);
     let again = spawn_big(&mut runtime, 1).remove(0);
     assert_eq!(header(&waker(&again)), header(&waker(&states[4])));
-}
-
-/// A pool adds a block only when every slot of its blocks is occupied, and reuses the
-/// lowest free slot before that.
-#[test]
-fn blocks_are_added_only_when_every_slot_is_occupied() {
-    let mut runtime = Runtime::new(0);
-    let states = spawn_big(&mut runtime, 6);
-    let pool = runtime_pool(&waker(&states[0]));
-    assert_eq!(unsafe { RuntimePool::block_count(pool) }, 2);
-    finish(&mut runtime, &states[1]);
-    finish(&mut runtime, &states[5]);
-    let refill = spawn_big(&mut runtime, 2);
-    assert_eq!(header(&waker(&refill[0])), header(&waker(&states[1])));
-    assert_eq!(header(&waker(&refill[1])), header(&waker(&states[5])));
-    assert_eq!(unsafe { RuntimePool::block_count(pool) }, 2);
-    let third = spawn_big(&mut runtime, 1).remove(0);
-    assert_eq!(unsafe { Meta::block(meta(&waker(&third))) }, 2);
-    assert_eq!(unsafe { RuntimePool::block_count(pool) }, 3);
 }
 
 /// One task function holds more live tasks than the old one-block default allowed

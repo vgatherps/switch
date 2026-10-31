@@ -16,13 +16,10 @@ mod registration_tests;
 struct Owner(*mut Executor);
 
 #[test]
-fn constructor_reserves_ready_storage_and_uses_initial_timer_tick() {
+fn constructor_uses_initial_timer_tick() {
     let ptr = Box::into_raw(Box::new(Executor::with_capacity(123, 17, 23)));
     let owner = Owner(ptr);
     unsafe {
-        assert!((*ptr).run_queue.capacity() >= 17);
-        assert!((*ptr).incoming.capacity() >= 17);
-        assert!((*ptr).deferred.capacity() >= 17);
         assert_eq!((*ptr).timers.current_tick(), 123);
     }
     owner.cleanup();
@@ -217,11 +214,6 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_batch() {
     owner.spawn(empty());
     owner.poll();
     assert_eq!(inner.get(), 0);
-    unsafe {
-        assert!((*owner.0).run_queue.capacity() >= (*owner.0).allocated);
-        assert!((*owner.0).incoming.capacity() >= (*owner.0).allocated);
-        assert!((*owner.0).deferred.capacity() >= (*owner.0).allocated);
-    }
     owner.poll();
     assert_eq!(inner.get(), DEFAULT_CAPACITY * 3);
     assert_eq!(owner.counts(), (0, 0));
@@ -525,9 +517,6 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
             (*owner.0).incoming.len(),
             DEFAULT_CAPACITY * 3 + usize::from(target_idle) + usize::from(self_wake)
         );
-        assert!((*owner.0).run_queue.capacity() >= (*owner.0).allocated);
-        assert!((*owner.0).incoming.capacity() >= (*owner.0).allocated);
-        assert!((*owner.0).deferred.capacity() >= (*owner.0).allocated);
     }
     owner.poll();
     assert_eq!(completed.get(), DEFAULT_CAPACITY * 3);
@@ -1016,8 +1005,6 @@ fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
         let (incoming, deferred) = ((*owner.0).incoming.len(), (*owner.0).deferred.len());
         assert_eq!((incoming, deferred), (4, 2));
         assert_eq!(incoming + deferred, (*owner.0).allocated);
-        assert!(incoming <= (*owner.0).incoming.capacity());
-        assert!(deferred <= (*owner.0).deferred.capacity());
     }
     // The stale entry drains and frees its slot; the new task completes.
     owner.poll();

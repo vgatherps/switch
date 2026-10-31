@@ -93,11 +93,6 @@ impl RuntimePool {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) unsafe fn block_count(this: *mut Self) -> usize {
-        unsafe { (*this).blocks.len() }
-    }
-
     /// The header of every slot ever handed out here (so shutdown scans the
     /// peak in use, not the capacity).
     ///
