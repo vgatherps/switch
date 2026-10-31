@@ -50,6 +50,9 @@ nic() { # name pci mac driver
     echo 0 >"$d/numa_node"
 }
 
+patch_file=$here/../conduit/docker/dpdk-ena-read-clock.patch
+dpdk_stamp="dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490 patch $(sha256sum "$patch_file" | cut -d' ' -f1)"
+
 # A fresh c7g-like host: CPUs 0-7 on node 0, no SMT, management ens5, data ens6, stock modules.
 host() {
     rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance"
@@ -69,6 +72,9 @@ host() {
     echo STOCK >"$root/sys/module/vfio_pci_core/srcversion"
     echo arch_sys_counter >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
     : >"$root/dev/hugepages/.mounted"
+    # /opt/dpdk as this script builds it: 25.11.3 with the ENA read_clock patch.
+    mkdir -p "$root/opt/dpdk/share"
+    echo "$dpdk_stamp" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
     for irq in 10 11 12; do
         mkdir -p "$root/proc/irq/$irq"
         echo 0-7 >"$root/proc/irq/$irq/smp_affinity_list"
@@ -214,6 +220,20 @@ for opt in $(grep -o -- "-D[a-z_]*=[^ ]*" "$dockerfile" | tr -d "'\\\\"); do
 done
 set +f
 check "the Dockerfile's meson options are all in hft-host.sh" [ "$(grep -o -- "-D[a-z_]*=" "$dockerfile" | wc -l)" -ge 7 ]
+
+# A stock 25.11.3 (no stamp) or one built with another patch is rebuilt; the patched one is kept.
+host
+run build
+check "a patched DPDK is not rebuilt" sh -c "! grep -q 'curl.*dpdk-25.11.3.tar.xz' '$calls'"
+check "build names the patch" has dpdk "ok 25.11.3 with dpdk-ena-read-clock.patch"
+rm "$root/opt/dpdk/share/zhida-dpdk.stamp"
+run build
+check "a stock DPDK (pkg-config says 25.11.3, no stamp) is rebuilt" called "curl --fail --location --retry 2 -s -o $root/var/tmp/dpdk-25.11.3.tar.xz https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz"
+echo "dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490 patch 0000" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
+: >"$calls"
+run build
+check "a DPDK built with another patch is rebuilt" called "curl .*dpdk-25.11.3.tar.xz"
+check "the patch hft-host.sh applies is in the repository" [ -s "$patch_file" ]
 
 if [ "$fails" -ne 0 ]; then
     echo "test-hft-host: $fails failed"
