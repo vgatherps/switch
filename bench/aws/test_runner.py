@@ -8,9 +8,11 @@ import io
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -314,6 +316,18 @@ class HostTest(unittest.TestCase):
         self.assertIn("No such file", err)
         self.assertIsNone(self.host(lambda argv, **kw: Proc(0)).fetch("/f", "/rd"))
 
+    def test_a_hung_ssh_or_scp_is_bounded_by_its_timeout(self):
+        bin_dir = tempfile.mkdtemp()
+        for exe in ("ssh", "scp"):
+            write_exe(os.path.join(bin_dir, exe), "exec sleep 30\n")
+        h = z.Host({"role": "receiver", "id": "i-0", "public_ip": "1.2.3.4"}, "/k.pem", "/rd")  # real subprocess.run
+        with mock.patch.dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}"), mock.patch.object(z, "SSH_S", 0.5):
+            start = time.monotonic()
+            self.assertEqual(h.fetch(f"{z.REMOTE}/x.jsonl", "/rd"), f"receiver:{z.REMOTE}/x.jsonl: scp timed out after 0.5 s")
+            with self.assertRaises(subprocess.TimeoutExpired):
+                h.root(f"systemctl stop {z.RECEIVER_UNIT}", check=False)
+            self.assertLess(time.monotonic() - start, 5)
+
     def test_setup_retries_verify_through_the_apply_reboot_then_builds(self):
         seen = []
 
@@ -365,6 +379,10 @@ class World:
         self.clean_calls = []  # (run id, recorded IDs)
         self.left_after_teardown = []
         self.network_fails = False
+        self.interrupt_sweep = None     # tag whose coordinator gets the first Ctrl-C
+        self.interrupt_teardown = False  # a second Ctrl-C inside teardown
+        self.teardown_done = False
+        self.hang = False               # receiver stop and every scp time out
 
 
 class FakeHost:
@@ -386,6 +404,8 @@ class FakeHost:
             return Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24"}))
         if command.startswith("systemctl is-active"):
             return Proc(0, "active\n")
+        if command.startswith("systemctl stop") and self.w.hang:
+            raise subprocess.TimeoutExpired(command, z.SSH_S)
         return Proc(0)
 
     def ssh(self, command, check=True, timeout=None, input=None):
@@ -393,6 +413,9 @@ class FakeHost:
         if "zhida-bench sweep" in command:
             t = command.split(f"> {z.REMOTE}/")[1].split(".jsonl")[0]
             self.w.sweep_timeouts.append(timeout)
+            if t == self.w.interrupt_sweep:
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.01)
             return Proc(self.w.sweep_exit.get(t, 0))
         return Proc(0)
 
@@ -403,6 +426,8 @@ class FakeHost:
         self.w.fetched.append((self.role, remote))
         if (self.role, remote) in self.w.fetch_fail:
             return f"{self.role}:{remote}: scp exited 1"
+        if self.w.hang:
+            return f"{self.role}:{remote}: scp timed out after {z.SSH_S} s"
         with open(os.path.join(local, os.path.basename(remote)), "w") as f:
             f.write("{}\n")
         return None
@@ -568,15 +593,22 @@ class RunTest(unittest.TestCase):
 
         def clean_run(ec2, run_id, recorded, log=print, **kw):
             w.clean_calls.append((run_id, {k: list(v) for k, v in recorded.items()}))
+            if w.interrupt_teardown:
+                os.kill(os.getpid(), signal.SIGINT)
+                time.sleep(0.01)
+            w.teardown_done = True
             return list(w.left_after_teardown)
 
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
         self.log = io.StringIO()
-        with mock.patch.object(z.janitor, "clean_run", clean_run), mock.patch.object(z.signal, "signal"), \
-                contextlib.redirect_stdout(self.log):
+        with mock.patch.object(z.janitor, "clean_run", clean_run), contextlib.redirect_stdout(self.log):
             try:
                 code = z.run(args, env)
-            except Exception as e:
+            except BaseException as e:  # SystemExit from the Ctrl-C handler too
                 code = e
+            finally:
+                for s, h in handlers.items():
+                    signal.signal(s, h)
         self.run_dir = os.path.join(self.out, os.listdir(self.out)[0])
         return code
 
@@ -663,6 +695,24 @@ class RunTest(unittest.TestCase):
         self.w.network_fails = True
         self.assertIsInstance(self.run_bench(), ClientError)
         self.assertEqual(self.w.clean_calls, [(os.path.basename(self.run_dir), {"vpc": ["vpc-1"]})])
+
+    def test_a_second_ctrl_c_during_teardown_does_not_interrupt_it(self):
+        self.w.interrupt_sweep = "tcp-n20-s64-b50"
+        self.w.interrupt_teardown = True
+        code = self.run_bench()
+        self.assertIsInstance(code, SystemExit)
+        self.assertEqual(code.code, 128 + signal.SIGINT)
+        self.assertTrue(self.w.teardown_done)
+        self.assertEqual(len(self.sweeps_run()), 2)
+        self.assertIn(("sender0", f"{z.REMOTE}/tcp-n20-s64-b50.jsonl"), self.w.fetched, "the interrupted sweep")
+        self.assertEqual(len([a for a in self.w.local_calls if a[1].endswith("report.py")]), 1)
+
+    def test_timed_out_receiver_stop_and_fetches_while_unwinding_still_reach_teardown(self):
+        self.w.interrupt_sweep = "udp-n20-s64-uncapped"
+        self.w.hang = True
+        self.assertIsInstance(self.run_bench(), subprocess.TimeoutExpired)
+        self.assertEqual(len(self.w.fetched), 7, "every file of the interrupted sweep tried")
+        self.assertTrue(self.w.teardown_done)
 
     def test_dirty_tree_refused_before_anything_is_created(self):
         def local(argv, **kw):

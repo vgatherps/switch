@@ -72,6 +72,9 @@ SWEEP_STEPS = sum(1 for k in range(64) if RATE_MIN * 2 ** (k / 2) <= RATE_MAX)
 SWEEP_WORST_S = math.ceil(SWEEP_STEPS * (0.05 + 0.5 + 2 + 0.2 + 10) + 60)
 BUILD_S = 3600
 SETUP_REBOOT_S = 900
+# The bound of every ssh/scp without its own: the receiver stop (systemd SIGKILLs after 90 s), the
+# fetches while unwinding to teardown.
+SSH_S = 120
 QUOTA_CODE = "L-1216C47A"
 
 
@@ -335,11 +338,13 @@ class Host:
 
     def _opts(self):
         return ["-i", self.key, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
-                "-o", f"UserKnownHostsFile={self.run_dir}/known_hosts", "-o", "ConnectTimeout=10"]
+                "-o", f"UserKnownHostsFile={self.run_dir}/known_hosts", "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=15"]
 
     def ssh(self, command, check=True, timeout=None, input=None):
-        argv = ["ssh", *self._opts(), "-o", "ServerAliveInterval=15", f"ec2-user@{self.info['public_ip']}", command]
-        r = self._run(argv, capture_output=True, input=input, text=not isinstance(input, bytes), timeout=timeout)
+        argv = ["ssh", *self._opts(), f"ec2-user@{self.info['public_ip']}", command]
+        r = self._run(argv, capture_output=True, input=input, text=not isinstance(input, bytes),
+                      timeout=timeout or SSH_S)
         if check and r.returncode != 0:
             err = r.stderr.decode(errors="replace") if isinstance(r.stderr, bytes) else (r.stderr or "")
             raise RuntimeError(f"{self.role}: `{command[:120]}` exited {r.returncode}: {err[-2000:]}")
@@ -362,7 +367,10 @@ class Host:
     def fetch(self, remote, local):
         """scp remote -> local; None on success, else what failed."""
         argv = ["scp", "-q", *self._opts(), f"ec2-user@{self.info['public_ip']}:{remote}", local]
-        r = self._run(argv, capture_output=True, text=True)
+        try:
+            r = self._run(argv, capture_output=True, text=True, timeout=SSH_S)
+        except subprocess.TimeoutExpired:
+            return f"{self.role}:{remote}: scp timed out after {SSH_S} s"
         if r.returncode == 0:
             return None
         return f"{self.role}:{remote}: scp exited {r.returncode}: {(r.stderr or '').strip()[-500:]}"
@@ -370,7 +378,8 @@ class Host:
     def setup(self, archive):
         """Source, hft-host.sh apply (builds, reboots), verify, then zhida-bench (bootstrap.sh).
         Returns (ok, report text)."""
-        self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive)
+        self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive,
+                 timeout=BUILD_S)
         apply = self.root(f"sh {HFT} apply", check=False, timeout=BUILD_S)
         text = [f"[{self.role} {self.info['id']} {INSTANCE_TYPE}]", "apply:", apply.stdout.rstrip()]
         if apply.returncode not in (0, 100, 255):  # 100: rebooting; 255: SSH dropped by the reboot
@@ -593,7 +602,9 @@ def run(args, env=None):
         connect_senders(hosts, key_path)
         fetch_errors = measure(hosts, facts, receiver_ip, run_dir, env)
     finally:
-        # teardown first: the report is local, and a second Ctrl-C during it must not skip teardown
+        # Nothing interrupts teardown; it goes first because the report is local.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         log(f"tearing down run {run_id}")
         torn = teardown(aws.ec2, run_id, created.ids)
         report_code = None
