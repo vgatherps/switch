@@ -26,7 +26,6 @@ impl InterfaceInner {
                 self.process_ipv4(
                     sockets,
                     meta,
-                    eth_frame.src_addr().into(),
                     &ipv4_packet,
                     udp,
                 )

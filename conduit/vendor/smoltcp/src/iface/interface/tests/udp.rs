@@ -753,6 +753,7 @@ fn garp_changes_udp_template_destination() {
     }
     assert!(test.udp.get(test.handle).template.is_some());
     let new_mac = EthernetAddress([6; 6]);
+    let changes = test.iface.inner.neighbor_cache.changes();
     test.receive(
         arp_frame(
             ArpRepr::EthernetIpv4 {
@@ -767,6 +768,7 @@ fn garp_changes_udp_template_destination() {
         ),
         false,
     );
+    assert_eq!(test.iface.inner.neighbor_cache.changes(), changes + 1);
     assert!(test.device.tx.is_empty());
     for _ in 0..2 {
         assert_eq!(
@@ -1338,12 +1340,16 @@ fn first_udp_send_after_idle_uses_stale_gateway() {
         );
         assert_eq!(test.recv().unwrap().payload(), b"in");
     }
+    // Received datagrams do not refresh the sender's entry: it expired at 60 s.
     assert_eq!(
         test.iface
             .inner
             .neighbor_cache
             .lookup(&remote.into(), Instant::from_secs(70)),
-        NeighborAnswer::Found(REMOTE_MAC.into())
+        NeighborAnswer::Stale {
+            hardware_addr: REMOTE_MAC.into(),
+            probe: true,
+        }
     );
     assert!(test.device.tx.is_empty());
     test.iface.inner.set_now(Instant::from_secs(70));
@@ -1358,6 +1364,47 @@ fn first_udp_send_after_idle_uses_stale_gateway() {
             arp_request(gateway)
         ]
     );
+}
+
+/// Datagrams received from a known peer leave its neighbor entry untouched: `changes` stays put
+/// and the entry still expires at its original time.
+#[test]
+fn received_datagrams_leave_neighbor_entry_untouched() {
+    let mut test = Test::new(1);
+    resolve(&mut test, REMOTE, REMOTE_MAC);
+    let changes = test.iface.inner.neighbor_cache.changes();
+    for millis in [30_000, 59_999] {
+        let mut bytes = datagram(b"in", LOCAL, PEER_PORT);
+        EthernetFrame::new_unchecked(&mut bytes[..]).set_src_addr(REMOTE_MAC);
+        test.device.rx.push_back(FrameToken {
+            frame: RxBuf::counted_frame(bytes, 0, test.device.releases.clone()),
+            meta: PacketMeta::default(),
+        });
+        assert_eq!(
+            test.iface.poll_ingress_single_udp(
+                Instant::from_millis(millis),
+                &mut test.device,
+                &mut test.tcp,
+                &mut test.udp,
+            ),
+            PollIngressSingleResult::SocketStateChanged,
+        );
+        assert_eq!(test.recv().unwrap().payload(), b"in");
+        assert_eq!(test.iface.inner.neighbor_cache.changes(), changes);
+    }
+    let cache = &test.iface.inner.neighbor_cache;
+    assert_eq!(
+        cache.lookup(&REMOTE.into(), Instant::from_millis(59_999)),
+        NeighborAnswer::Found(REMOTE_MAC.into())
+    );
+    assert_eq!(
+        cache.lookup(&REMOTE.into(), Instant::from_millis(60_000)),
+        NeighborAnswer::Stale {
+            hardware_addr: REMOTE_MAC.into(),
+            probe: true,
+        }
+    );
+    assert!(test.device.tx.is_empty());
 }
 
 #[test]

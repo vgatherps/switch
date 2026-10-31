@@ -60,7 +60,6 @@ impl InterfaceInner {
         &mut self,
         sockets: &mut TcpSet,
         meta: PacketMeta,
-        source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
         udp: Option<&mut UdpSet>,
     ) -> Option<Packet<'a>> {
@@ -88,7 +87,7 @@ impl InterfaceInner {
         // TCP checks its destination in process_tcp, only when no flow matches: established
         // traffic never searches our addresses.
         if ipv4_repr.next_header == IpProtocol::Tcp {
-            return self.process_tcp(sockets, meta, source_hardware_addr, ip_repr, ip_payload);
+            return self.process_tcp(sockets, meta, ip_repr, ip_payload);
         }
 
         let dst_ours = self.has_ip_addr(ipv4_repr.dst_addr);
@@ -102,8 +101,6 @@ impl InterfaceInner {
                 return None;
             }
         }
-
-        self.refresh_sender(ipv4_repr, source_hardware_addr);
 
         match ipv4_repr.next_header {
             IpProtocol::Icmp => self.process_icmpv4(ipv4_repr, ip_payload),
@@ -121,24 +118,6 @@ impl InterfaceInner {
             }
 
             _ => None,
-        }
-    }
-
-    /// Keep the sender's neighbor entry alive for a packet to one of our unicast addresses; the
-    /// caller decided the destination is ours. Inlined with the cache refresh at both callers
-    /// (TCP and the other protocols), as when it was written once in `process_ipv4`.
-    #[inline(always)]
-    pub(super) fn refresh_sender(
-        &mut self,
-        ipv4_repr: Ipv4Repr,
-        source_hardware_addr: HardwareAddress,
-    ) {
-        if self.is_unicast_v4(ipv4_repr.dst_addr) {
-            self.neighbor_cache.reset_expiry_if_existing(
-                IpAddress::Ipv4(ipv4_repr.src_addr),
-                source_hardware_addr,
-                self.now,
-            );
         }
     }
 

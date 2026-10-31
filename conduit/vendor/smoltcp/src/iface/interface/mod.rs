@@ -1024,7 +1024,6 @@ impl InterfaceInner {
                 self.process_ipv4(
                     sockets,
                     meta,
-                    HardwareAddress::Ip,
                     &ipv4_packet,
                     udp,
                 )

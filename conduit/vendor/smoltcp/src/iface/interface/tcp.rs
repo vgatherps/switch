@@ -190,8 +190,8 @@ impl InterfaceInner {
     /// checking the destination, since a flow's local address is ours by construction
     /// (`Socket::connect` refuses another, and a listener only accepts SYNs to our addresses).
     /// On a miss the destination must be ours, else the segment is dropped without a reply;
-    /// only then do listeners and the RST reply apply. `source_hardware_addr` refreshes the
-    /// sender's neighbor entry for a segment to one of our unicast addresses, malformed or not.
+    /// only then do listeners and the RST reply apply. Received segments never touch the
+    /// neighbor cache.
     /// Inlined into its one caller, `process_ipv4`: left out of line, each TCP segment paid
     /// about 25 instructions more for the call (callgrind, established round).
     #[inline(always)]
@@ -199,21 +199,14 @@ impl InterfaceInner {
         &mut self,
         sockets: &mut TcpSet,
         meta: PacketMeta,
-        source_hardware_addr: HardwareAddress,
         ip_repr: IpRepr,
         ip_payload: &'frame [u8],
     ) -> Option<Packet<'frame>> {
         assert!(sockets.pending_rx_attach.is_none());
         assert!(sockets.pending_tcp_reply.is_none());
 
-        let IpRepr::Ipv4(ipv4_repr) = ip_repr;
         let (src_addr, dst_addr) = (ip_repr.src_addr(), ip_repr.dst_addr());
-        let Some(tcp_repr) = self.tcp_segment(meta, src_addr, dst_addr, ip_payload) else {
-            if self.has_ip_addr(dst_addr) {
-                self.refresh_sender(ipv4_repr, source_hardware_addr);
-            }
-            return None;
-        };
+        let tcp_repr = self.tcp_segment(meta, src_addr, dst_addr, ip_payload)?;
 
         let syn_like = tcp_repr.ack_number.is_none() && tcp_repr.control != TcpControl::Rst;
         let dst = IpEndpoint::new(dst_addr, tcp_repr.dst_port);
@@ -255,7 +248,6 @@ impl InterfaceInner {
                 winner = sockets.tcp_listener_lookup(dst);
             }
         }
-        self.refresh_sender(ipv4_repr, source_hardware_addr);
         // Only a plain SYN retires an acceptable TIME-WAIT tuple for a listener; a SYN+FIN goes
         // to the TIME-WAIT socket, which ACKs it, listener or not.
         if tcp_repr.control == TcpControl::Syn

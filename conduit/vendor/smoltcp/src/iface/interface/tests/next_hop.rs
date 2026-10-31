@@ -448,28 +448,46 @@ fn expired_entry_sends_arp() {
     peer.take_arp_request(PEER);
 }
 
+/// TCP segments received from a known peer leave its neighbor entry untouched: `changes` stays
+/// put and the entry still expires at 60 s, so the next send forwards and probes.
 #[test]
-fn received_packet_refreshes_entry_past_original_expiry() {
+fn received_segments_leave_neighbor_entry_untouched() {
     let mut peer = Peer::new(2, PEER, None);
-    peer.acknowledge(10_000);
+    let changes = peer.iface.inner.neighbor_cache.changes();
+    for millis in [10_000, 59_999] {
+        peer.acknowledge(millis);
+        assert_eq!(peer.iface.inner.neighbor_cache.changes(), changes);
+    }
+    assert_eq!(
+        peer.iface.inner.neighbor_cache.lookup(&PEER.into(), Instant::from_millis(59_999)),
+        NeighborAnswer::Found(PEER_MAC.into())
+    );
     peer.send(60_000);
     peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    assert!(peer.device.tx_queue.is_empty());
+    peer.take_arp_request(PEER);
 }
 
+/// An entry in use past its lifetime forwards and probes; a same-MAC answer to the probe keeps
+/// `changes`, and the entry forwards without probing until its new lifetime ends.
 #[test]
-fn revived_entry_expires_again() {
+fn same_mac_probe_answer_keeps_changes_and_forwards() {
     let mut peer = Peer::new(2, PEER, None);
-    peer.egress(60_000);
-    assert!(peer.device.tx_queue.is_empty());
-    peer.acknowledge(61_000);
-    peer.send(61_000);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    assert!(peer.device.tx_queue.is_empty());
-    peer.send(121_000);
-    peer.take_tcp(TcpControl::Psh, &[0x5a; 2]);
+    peer.send(60_000);
+    peer.ack = peer.take_tcp(TcpControl::Psh, &[0x5a]);
     peer.take_arp_request(PEER);
-    peer.egress(124_000);
+    let changes = peer.iface.inner.neighbor_cache.changes();
+    peer.arp(60_500, PEER, PEER_MAC);
+    assert_eq!(peer.iface.inner.neighbor_cache.changes(), changes);
+    peer.acknowledge(60_500);
+    for millis in [61_000, 120_499] {
+        peer.send(millis);
+        peer.ack = peer.take_tcp(TcpControl::Psh, &[0x5a]);
+        assert!(peer.device.tx_queue.is_empty());
+        peer.acknowledge(millis);
+    }
+    assert_eq!(peer.iface.inner.neighbor_cache.changes(), changes);
+    peer.send(120_500);
+    peer.take_tcp(TcpControl::Psh, &[0x5a]);
     peer.take_arp_request(PEER);
 }
 
@@ -634,7 +652,16 @@ mod invalidation {
         peer.take_arp_request(PEER);
         peer.egress(63_002);
         peer.take_arp_request(PEER);
-        peer.recover(63_003);
+        // The retransmit parked at 63_002 (NotFound after the stale window). A same-MAC answer
+        // does not bump `changes`, so it resumes at its 1 s discovery deadline.
+        let changes = peer.iface.inner.neighbor_cache.changes();
+        peer.arp(63_003, peer.remote, peer.mac);
+        assert_eq!(peer.iface.inner.neighbor_cache.changes(), changes);
+        peer.egress(64_001);
+        assert!(peer.device.tx_queue.is_empty());
+        peer.egress(64_002);
+        peer.check_data(64_002);
+        peer.data(64_003);
     }
 
     #[test]

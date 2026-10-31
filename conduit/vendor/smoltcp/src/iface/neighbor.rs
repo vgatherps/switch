@@ -131,31 +131,6 @@ impl Cache {
         (Ipv4Address::from(key), removed)
     }
 
-    #[inline(always)]
-    pub fn reset_expiry_if_existing(
-        &mut self,
-        protocol_addr: IpAddress,
-        source_hardware_addr: HardwareAddress,
-        timestamp: Instant,
-    ) {
-        if let Some(Entry::Resolved(neighbor)) = self.storage.get_mut(&key(&protocol_addr)) {
-            if source_hardware_addr == neighbor.hardware_addr {
-                let expired = timestamp >= neighbor.expires_at;
-                neighbor.expires_at = timestamp + Self::ENTRY_LIFETIME;
-                neighbor.stale_until.set(None);
-                {
-                    self.next_expiry = Some(
-                        self.next_expiry
-                            .map_or(neighbor.expires_at, |old| old.min(neighbor.expires_at)),
-                    );
-                    if expired {
-                        self.bump();
-                    }
-                }
-            }
-        }
-    }
-
     pub fn update_existing(
         &mut self,
         protocol_addr: IpAddress,
@@ -173,9 +148,9 @@ impl Cache {
         }
     }
 
-    /// Learn `protocol_addr` at `hardware_addr`. A refill of a live entry with the same MAC only
-    /// moves its expiry: templates and cached next hops stay valid, so `changes` is not bumped.
-    /// A new entry, a changed MAC, or a refill after expiry bumps it.
+    /// Learn `protocol_addr` at `hardware_addr` from ARP. A refill of a resolved entry with the
+    /// same MAC, live or expired, only moves its expiry: templates and cached next hops stay
+    /// valid, so `changes` is not bumped. A new entry, a pending one, or a changed MAC bumps it.
     pub fn fill(
         &mut self,
         protocol_addr: IpAddress,
@@ -189,7 +164,6 @@ impl Cache {
         if let Some(entry) = self.storage.get_mut(&key(&protocol_addr))
             && let Entry::Resolved(neighbor) = entry
             && neighbor.hardware_addr == hardware_addr
-            && timestamp < neighbor.expires_at
         {
             *entry = Entry::Resolved(Neighbor {
                 silent_until: expires_at,
@@ -663,41 +637,35 @@ mod test {
 
         #[test]
         fn idle_stale_window_refresh() {
-            for refill in [false, true] {
-                let mut cache = Cache::new(1);
-                cache.fill(address(1), HADDR_A, Instant::ZERO);
-                let now = Instant::from_secs(70);
-                assert_eq!(
-                    cache.lookup(&address(1), now),
-                    Answer::Stale {
-                        hardware_addr: HADDR_A,
-                        probe: true,
-                    }
-                );
-                cache.limit_rate(address(1), now);
-                let refresh = Instant::from_millis(70_500);
-                if refill {
-                    cache.fill(address(1), HADDR_A, refresh);
-                } else {
-                    cache.reset_expiry_if_existing(address(1), HADDR_A, refresh);
+            let mut cache = Cache::new(1);
+            cache.fill(address(1), HADDR_A, Instant::ZERO);
+            let now = Instant::from_secs(70);
+            assert_eq!(
+                cache.lookup(&address(1), now),
+                Answer::Stale {
+                    hardware_addr: HADDR_A,
+                    probe: true,
                 }
-                assert_eq!(cache.lookup(&address(1), refresh), Answer::Found(HADDR_A));
-                assert_eq!(
-                    cache.lookup(&address(1), Instant::from_millis(130_499)),
-                    Answer::Found(HADDR_A)
-                );
-                assert_eq!(
-                    cache.lookup(&address(1), Instant::from_secs(140)),
-                    Answer::Stale {
-                        hardware_addr: HADDR_A,
-                        probe: true,
-                    }
-                );
-                assert_eq!(
-                    cache.lookup(&address(1), Instant::from_secs(143)),
-                    Answer::NotFound
-                );
-            }
+            );
+            cache.limit_rate(address(1), now);
+            let refresh = Instant::from_millis(70_500);
+            cache.fill(address(1), HADDR_A, refresh);
+            assert_eq!(cache.lookup(&address(1), refresh), Answer::Found(HADDR_A));
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_millis(130_499)),
+                Answer::Found(HADDR_A)
+            );
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_secs(140)),
+                Answer::Stale {
+                    hardware_addr: HADDR_A,
+                    probe: true,
+                }
+            );
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_secs(143)),
+                Answer::NotFound
+            );
         }
 
         #[test]
@@ -817,12 +785,11 @@ mod test {
         }
 
         #[test]
-        fn reset_expiry_refreshes_stale() {
+        fn same_mac_fill_in_stale_window_refreshes_without_bumping() {
             let mut cache = Cache::new(1);
             cache.fill(address(1), HADDR_A, Instant::ZERO);
             let now = Instant::from_millis(60_500);
             cache.limit_rate(address(1), now);
-            cache.reset_expiry_if_existing(address(1), HADDR_B, now);
             assert_eq!(
                 cache.lookup(&address(1), now),
                 Answer::Stale {
@@ -831,7 +798,7 @@ mod test {
                 }
             );
             let changes = cache.changes();
-            cache.reset_expiry_if_existing(address(1), HADDR_A, now);
+            cache.fill(address(1), HADDR_A, now);
             assert_eq!(cache.lookup(&address(1), now), Answer::Found(HADDR_A));
             assert_eq!(
                 cache.lookup(&address(1), Instant::from_millis(120_499)),
@@ -844,7 +811,7 @@ mod test {
                     probe: true
                 }
             );
-            assert_eq!(cache.changes(), changes + 1);
+            assert_eq!(cache.changes(), changes);
         }
 
         #[test]
@@ -889,7 +856,6 @@ mod test {
             let mut cache = Cache::new(2);
             cache.limit_rate(address(1), Instant::ZERO);
             cache.limit_rate(address(2), Instant::ZERO);
-            cache.reset_expiry_if_existing(address(1), HADDR_A, Instant::ZERO);
             assert_eq!(
                 cache.lookup(&address(1), Instant::ZERO),
                 Answer::RateLimited
@@ -1126,12 +1092,11 @@ mod test {
         }
 
         #[test]
-        fn refresh_reschedules_without_bumping() {
+        fn same_mac_fill_reschedules_without_bumping() {
             let mut cache = Cache::new(1);
             cache.fill(address(1), HADDR_A, Instant::ZERO);
-            cache.reset_expiry_if_existing(address(1), HADDR_B, Instant::from_millis(1_000));
             assert_eq!(cache.changes(), 1);
-            cache.reset_expiry_if_existing(address(1), HADDR_A, Instant::from_millis(10_000));
+            cache.fill(address(1), HADDR_A, Instant::from_millis(10_000));
             assert_eq!(cache.changes(), 1);
             cache.expire(Instant::from_millis(60_000));
             assert_eq!(cache.changes(), 1);
@@ -1141,25 +1106,25 @@ mod test {
         }
 
         #[test]
-        fn refresh_revives_counted_entry_and_can_shorten_expiry() {
+        fn same_mac_fill_after_expiry_reschedules_and_can_shorten_expiry() {
             let mut cache = Cache::new(1);
             cache.fill(address(1), HADDR_A, Instant::ZERO);
             cache.expire(Instant::from_millis(60_000));
             assert_eq!(cache.changes(), 2);
-            cache.reset_expiry_if_existing(address(1), HADDR_A, Instant::from_millis(61_000));
-            assert_eq!(cache.changes(), 3);
+            cache.fill(address(1), HADDR_A, Instant::from_millis(61_000));
+            assert_eq!(cache.changes(), 2);
             assert_eq!(cache.next_expiry, Some(Instant::from_millis(121_000)));
             cache.expire(Instant::from_millis(121_000));
-            assert_eq!(cache.changes(), 4);
+            assert_eq!(cache.changes(), 3);
             cache.fill_with_expiration(address(1), HADDR_A, Instant::from_millis(300_000));
             cache.expire(Instant::from_millis(122_000));
-            cache.reset_expiry_if_existing(address(1), HADDR_A, Instant::from_millis(123_000));
-            assert_eq!(cache.changes(), 5);
+            cache.fill(address(1), HADDR_A, Instant::from_millis(123_000));
+            assert_eq!(cache.changes(), 4);
             assert_eq!(cache.next_expiry, Some(Instant::from_millis(183_000)));
             cache.expire(Instant::from_millis(183_000));
-            assert_eq!(cache.changes(), 6);
+            assert_eq!(cache.changes(), 5);
             cache.expire(Instant::from_millis(400_000));
-            assert_eq!(cache.changes(), 6);
+            assert_eq!(cache.changes(), 5);
         }
 
         #[test]
@@ -1237,10 +1202,9 @@ mod test {
         }
 
         #[test]
-        fn refresh_extends_expiry() {
+        fn same_mac_fill_after_stale_window_extends_expiry() {
             let mut cache = Cache::new(3);
             cache.fill(address(1), HADDR_A, Instant::ZERO);
-            cache.reset_expiry_if_existing(address(1), HADDR_B, Instant::from_millis(10_000));
             assert_eq!(
                 cache.lookup(&address(1), Instant::from_millis(60_000)),
                 Answer::Stale {
@@ -1254,7 +1218,7 @@ mod test {
             );
             assert_eq!(cache.storage.len(), 1);
 
-            cache.reset_expiry_if_existing(address(1), HADDR_A, Instant::from_millis(60_000));
+            cache.fill(address(1), HADDR_A, Instant::from_millis(60_000));
             assert_eq!(
                 cache.lookup(&address(1), Instant::from_millis(119_999)),
                 Answer::Found(HADDR_A)
@@ -1270,13 +1234,6 @@ mod test {
                 cache.lookup(&address(1), Instant::from_millis(123_000)),
                 Answer::NotFound
             );
-
-            cache.reset_expiry_if_existing(address(2), HADDR_A, Instant::from_millis(60_000));
-            assert_eq!(
-                cache.lookup(&address(2), Instant::from_millis(60_000)),
-                Answer::NotFound
-            );
-            assert_eq!(cache.storage.len(), 1);
         }
 
         #[test]
@@ -1324,10 +1281,10 @@ mod test {
             );
         }
 
-        /// A same-MAC refill of a live entry moves its expiry without bumping `changes`; a
-        /// changed MAC, or a same-MAC refill once the entry has expired, bumps it.
+        /// A same-MAC refill moves the expiry and never bumps `changes`: while live, inside the
+        /// stale window, and after the window has ended. A changed MAC bumps it.
         #[test]
-        fn same_mac_refill_bumps_changes_only_after_expiry() {
+        fn same_mac_refill_never_bumps_changes() {
             let mut cache = Cache::new(2);
             cache.fill(address(1), HADDR_A, Instant::from_millis(0));
             let changes = cache.changes();
@@ -1337,12 +1294,34 @@ mod test {
                 cache.lookup(&address(1), Instant::from_millis(89_999)),
                 Answer::Found(HADDR_A)
             );
-            cache.fill(address(1), HADDR_B, Instant::from_millis(70_000));
-            assert_eq!(cache.changes(), changes + 1);
-            cache.fill(address(1), HADDR_B, Instant::from_millis(130_000));
-            assert_eq!(cache.changes(), changes + 2);
+            assert!(matches!(
+                cache.lookup(&address(1), Instant::from_millis(90_000)),
+                Answer::Stale { .. }
+            ));
+            cache.fill(address(1), HADDR_A, Instant::from_millis(91_000));
+            assert_eq!(cache.changes(), changes);
             assert_eq!(
-                cache.lookup(&address(1), Instant::from_millis(189_999)),
+                cache.lookup(&address(1), Instant::from_millis(150_999)),
+                Answer::Found(HADDR_A)
+            );
+            assert!(matches!(
+                cache.lookup(&address(1), Instant::from_millis(151_000)),
+                Answer::Stale { .. }
+            ));
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_millis(154_000)),
+                Answer::NotFound
+            );
+            cache.fill(address(1), HADDR_A, Instant::from_millis(155_000));
+            assert_eq!(cache.changes(), changes);
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_millis(155_000)),
+                Answer::Found(HADDR_A)
+            );
+            cache.fill(address(1), HADDR_B, Instant::from_millis(156_000));
+            assert_eq!(cache.changes(), changes + 1);
+            assert_eq!(
+                cache.lookup(&address(1), Instant::from_millis(156_000)),
                 Answer::Found(HADDR_B)
             );
         }

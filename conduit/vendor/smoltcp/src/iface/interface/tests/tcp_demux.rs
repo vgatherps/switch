@@ -237,7 +237,6 @@ fn ingress_keeps_commit_in_set_and_poll_attaches_payload() {
         let response = iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             packet.payload(),
         );
@@ -1815,7 +1814,6 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &packet.payload()[..length],
         ).is_none());
@@ -1826,7 +1824,6 @@ fn tcp_truncated_and_zero_ports_dropped() {
         assert!(iface.inner.process_tcp(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::Ip,
             IpRepr::Ipv4(ip),
             &tcp,
         ).is_none());

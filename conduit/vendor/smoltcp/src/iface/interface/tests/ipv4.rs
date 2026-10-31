@@ -749,7 +749,6 @@ fn test_unknown_protocol_with_payload_no_reply(#[case] medium: Medium) {
         iface.inner.process_ipv4(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::default(),
             &Ipv4Packet::new_checked(&bytes[..]).unwrap(),
             None,
         ),
@@ -789,7 +788,6 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
         iface.inner.process_ipv4(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::default(),
             &frame,
             None,
         ),
@@ -821,7 +819,6 @@ fn test_unknown_protocol_without_payload_no_reply(#[case] medium: Medium) {
         iface.inner.process_ipv4(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::default(),
             &frame,
             None,
         ),
@@ -978,7 +975,6 @@ fn test_unicast_echo_reply(#[case] medium: Medium) {
         iface.inner.process_ipv4(
             &mut sockets,
             PacketMeta::default(),
-            HardwareAddress::default(),
             &Ipv4Packet::new_checked(&bytes[..]).unwrap(),
             None,
         ),
@@ -1022,7 +1018,6 @@ fn test_broadcast_echo_no_reply(#[case] medium: Medium) {
             iface.inner.process_ipv4(
                 &mut sockets,
                 PacketMeta::default(),
-                HardwareAddress::default(),
                 &Ipv4Packet::new_checked(&bytes[..]).unwrap(),
                 None,
             ),
@@ -1621,7 +1616,6 @@ fn ipv4_reply_protocol(meta: PacketMeta, bytes: &[u8]) -> Option<IpProtocol> {
         .process_ipv4(
             &mut sockets,
             meta,
-            HardwareAddress::default(),
             &Ipv4Packet::new_unchecked(bytes),
             None,
         )
