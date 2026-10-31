@@ -45,7 +45,6 @@ import janitor  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 SHARED = {"Key": janitor.SHARED_TAG, "Value": "shared"}
-ROLE_TAG = "zhida-bench-role"
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
 VPC_CIDR, SUBNET_CIDR = "10.80.0.0/16", "10.80.1.0/24"
 NAME = janitor.NAME
@@ -330,9 +329,6 @@ class Aws:
             UserData=user_data(expires),
             TagSpecifications=[{"ResourceType": k, "Tags": tags} for k in ("instance", "volume", "network-interface")])
         ids = [i["InstanceId"] for i in sorted(r["Instances"], key=lambda i: i["AmiLaunchIndex"])]
-        for iid, role in zip(ids, ROLES):
-            ec2.create_tags(Resources=[iid], Tags=[{"Key": ROLE_TAG, "Value": role},
-                                                   {"Key": "Name", "Value": f"{NAME}-{run_id}-{role}"}])
         ec2.get_waiter("instance_running").wait(InstanceIds=ids)
         enis = {}
         for iid in ids:

@@ -234,6 +234,7 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual({t["ResourceType"] for t in ri["TagSpecifications"]}, {"instance", "volume", "network-interface"})
         self.assertFalse(any("EnaSrdSpecification" in c[1] for c in ec2.calls if isinstance(c[1], dict)),
                          "no ENA Express call")
+        self.assertNotIn("create_tags", names, "tags only via TagSpecifications")
         wait = names.index("wait")
         eni_calls = [c for c in ec2.calls[wait + 1:] if c[0] in (
             "create_network_interface", "attach_network_interface", "modify_network_interface_attribute")]
