@@ -70,7 +70,6 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
         mss_cap: Some(config.path_mtu(server) - 40),
     };
     let sizing = zhida_open::Sizing {
-        rx_share: tcp::rx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,
@@ -94,14 +93,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`open` sizes the RX and frame pools as the driver's reserve plus a share every socket draws on;
-nothing is reserved per socket and `add_tcp` never refuses a socket for pool size. Size each share
-for what all sockets together may hold at once, not sockets x window. Here one socket may fill its
-window each way. `Sizing` has no defaults; fill all eight fields:
+`open` gives the RX pool a fixed 32767 mbufs, far above `rx_reserve` (see "Pool sizing" below), and
+sizes the frame pool as the driver's reserve plus a share every socket draws on; nothing is
+reserved per socket and `add_tcp` never refuses a socket for pool size. Size the frame share for
+what all sockets together may hold at once, not sockets x window. Here one socket may fill its
+send window. `Sizing` has no defaults; fill all seven fields:
 
 | field | what to put there |
 |---|---|
-| `rx_share` | RX mbufs all sockets together may hold: unread TCP data, out-of-order segments, queued UDP datagrams, frames the application holds (see "Pool sizing" below) |
 | `frame_share` | frames all TCP send queues and the application (`Stack::tx_frame`) may hold at once |
 | `max_sockets`, `max_udp_sockets`, `rx_staging`, `tx_pending`, `neighbor_capacity` | passed to the `StackConfig` fields of the same name ("Configure the Stack" below) |
 
@@ -403,6 +402,15 @@ out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segm
 ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
 resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
 blocks, and the sender must then resend it too.
+
+`zhida-open::open` (used by `nic-runner` and the `netconf-open` examples) does not size from a share:
+its RX pool is a fixed 32767 mbufs (2^15 - 1), 15.4 times the reserve at 1024 descriptors, burst 32,
+staging 32 and cache 8. Keeping out-of-order data needs the posted buffers, the low mark and what
+the sockets hold all at once; a pool that big leaves room for all of them, so it does not read low
+in practice. Each mbuf costs 2560 bytes at MTU 1500 and 9728 bytes at MTU 9001 (arm64 build:
+128-byte header, 128-byte mbuf, 8-byte private area, data room, padding); 32767 of them take
+41 2 MiB hugepages (82 MiB) at MTU 1500 and 153 (306 MiB) at MTU 9001. Under `--no-huge` an object
+never crosses a 4 KiB page, so at MTU 1500 the pool takes 130 MiB of the `-m` budget.
 
 ### TX pool
 

@@ -158,7 +158,7 @@ A vdev config for a local tap is:
   "offloads": {"rx_checksum": false, "tx_tcp_checksum": false, "tx_udp_checksum": false},
   "rx_timestamps": false,
   "descriptors": 1024,
-  "eal": {"file_prefix": "zhida-tap", "extra": ["--no-huge", "-m", "128", "--no-shconf"]}
+  "eal": {"file_prefix": "zhida-tap", "extra": ["--no-huge", "-m", "256", "--no-shconf"]}
 }
 ```
 

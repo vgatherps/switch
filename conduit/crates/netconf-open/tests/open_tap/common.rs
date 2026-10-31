@@ -28,7 +28,7 @@ pub fn config_with_gateway(
           "descriptors": 16,
           "eal": {{
             "file_prefix": "{vdev}",
-            "extra": ["--no-huge", "-m", "128", "--no-shconf"]
+            "extra": ["--no-huge", "-m", "256", "--no-shconf"]
           }}
         }}"#
     ))
@@ -37,7 +37,6 @@ pub fn config_with_gateway(
 
 pub fn sizing() -> Sizing {
     Sizing {
-        rx_share: 0,
         frame_share: 0,
         max_sockets: 1,
         max_udp_sockets: 0,

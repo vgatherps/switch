@@ -36,15 +36,14 @@ pub fn sizing(
     };
     let socket = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
     let mtu = usize::from(config.mtu);
-    // Shares independent of the socket count: one TCP socket's full window each way and one
-    // UDP socket's queue, drawn on by every socket.
+    // A share independent of the socket count: one TCP socket's full send window, drawn on
+    // by every socket.
     let window = |per_socket: fn(&tcp::Config, usize) -> usize| match mode {
         Mode::Feed(_) => per_socket(feed.expect("feed mode has a config"), mtu),
         _ if tcp > 0 => per_socket(&socket, mtu),
         _ => 0,
     };
     Sizing {
-        rx_share: window(tcp::rx_mbuf_budget) + if udp > 0 { UDP_QUEUE } else { 0 },
         frame_share: window(tcp::tx_mbuf_budget),
         max_sockets: tcp.max(1),
         max_udp_sockets: udp,
@@ -102,7 +101,7 @@ mod tests {
 
     use dpdk_smoltcp::smoltcp::socket::tcp;
 
-    use super::{feed_socket, sizing, STAGING, UDP_QUEUE};
+    use super::{feed_socket, sizing, STAGING};
     use crate::args::Args;
 
     fn parsed(args: &[&str]) -> Args {
@@ -111,10 +110,9 @@ mod tests {
 
     #[test]
     fn sizing_shares_hold_one_window_whatever_the_socket_count() {
-        for (args, tcp, udp, bytes) in [
+        for (args, tcp, bytes) in [
             (
                 &["--config", "nic.json", "info"][..],
-                0,
                 0,
                 sockperf_wire::sockperf::MAX_MESSAGE,
             ),
@@ -131,13 +129,11 @@ mod tests {
                     "11111,11112",
                 ][..],
                 64,
-                2,
                 sockperf_wire::sockperf::MAX_MESSAGE,
             ),
             (
                 &["--config", "nic.json", "feed"][..],
                 1,
-                0,
                 binance_feed::SOCKET_BUFFER,
             ),
         ] {
@@ -147,9 +143,8 @@ mod tests {
                 let socket = feed_socket(&config, "203.0.113.1".parse().unwrap());
                 let sizing = sizing(&config, &args.mode, Some(&socket));
                 let window = tcp::Config { rx_capacity: bytes, tx_capacity: bytes, mss_cap: None };
-                let expected = usize::from(tcp > 0) * tcp::rx_mbuf_budget(&window, usize::from(mtu))
-                    + usize::from(udp > 0) * UDP_QUEUE;
-                assert_eq!(sizing.rx_share, expected);
+                let expected = usize::from(tcp > 0) * tcp::tx_mbuf_budget(&window, usize::from(mtu));
+                assert_eq!(sizing.frame_share, expected);
                 assert_eq!(sizing.rx_staging, STAGING);
             }
         }
@@ -165,21 +160,12 @@ mod tests {
         let ip = "203.0.113.1".parse().unwrap();
         assert_eq!(config.path_mtu(ip).checked_sub(40).unwrap(), 1460);
         let socket = feed_socket(&config, ip);
-        let capped = dpdk_smoltcp::smoltcp::socket::tcp::rx_mbuf_budget(&socket, 9000);
-        let uncapped = dpdk_smoltcp::smoltcp::socket::tcp::rx_mbuf_budget(
-            &binance_feed::socket(None), 9000,
-        );
-        assert_eq!(capped, 180);
-        assert_eq!(uncapped, 30);
         let feed_sizing = sizing(&config, &args.mode, Some(&socket));
-        assert_eq!(feed_sizing.rx_share, capped);
-        // The send side's frame limit follows the same 1460-byte cap: 256 KiB / 1460.
+        // The send side's frame limit follows the 1460-byte cap: 256 KiB / 1460.
         assert_eq!(feed_sizing.frame_share, 180);
-        assert!(capped > uncapped);
 
         let socket = feed_socket(&config, "203.0.114.1".parse().unwrap());
         let feed_sizing = sizing(&config, &args.mode, Some(&socket));
-        assert_eq!(feed_sizing.rx_share, uncapped);
         // Uncapped at MTU 9000: 256 KiB / 8960.
         assert_eq!(feed_sizing.frame_share, 30);
     }

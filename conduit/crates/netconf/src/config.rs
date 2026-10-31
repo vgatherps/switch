@@ -538,7 +538,7 @@ mod tests {
         value["device"] = json!({"vdev": "net_tap0,iface=cdnic0"});
         value["mac"] = Value::Null;
         value["gateway"] = Value::Null;
-        value["eal"]["extra"] = json!(["--no-huge", "-m", "128", "--no-shconf"]);
+        value["eal"]["extra"] = json!(["--no-huge", "-m", "256", "--no-shconf"]);
         value["offloads"] =
             json!({"rx_checksum": true, "tx_tcp_checksum": false, "tx_udp_checksum": true});
         let vdev = Config::from_json(&value.to_string()).unwrap();
