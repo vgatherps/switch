@@ -1,8 +1,6 @@
 //! The Zhida echo DUT (UDP, TCP, ws). The busy-poll loop does no syscall while serving.
 
-use std::cell::Cell;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use switch::Spawner;
 use switchnet::{
@@ -61,7 +59,6 @@ pub fn run(args: &Args) -> Result<(), String> {
                     args.port,
                     tcp_config,
                     args.proto == Proto::Ws,
-                    Rc::default(),
                 )?;
             }
         }
@@ -133,14 +130,12 @@ fn udp_echo(host: &Host, handle: &NetHandle, port: u16) -> Result<(), String> {
 
 /// One pre-armed accept on `port` (conduit has no accept queue: each accept is a listening
 /// socket); the connection it takes is echoed, and it arms the next accept first.
-/// `max_rx_frame`: the largest TCP frame payload received (the echo test's precondition).
 fn arm_accept(
     spawner: &Spawner,
     handle: NetHandle,
     port: u16,
     config: tcp::Config,
     ws: bool,
-    max_rx_frame: Rc<Cell<usize>>,
 ) -> Result<(), String> {
     let accepting = handle
         .tcp_accept(config, IpListenEndpoint { addr: None, port })
@@ -148,14 +143,7 @@ fn arm_accept(
     let task_spawner = spawner.clone();
     spawn(spawner, async move {
         let stream = accepting.await;
-        if let Err(e) = arm_accept(
-            &task_spawner,
-            handle.clone(),
-            port,
-            config,
-            ws,
-            max_rx_frame.clone(),
-        ) {
+        if let Err(e) = arm_accept(&task_spawner, handle.clone(), port, config, ws) {
             eprintln!("zhida-bench serve: {e}");
         }
         if ws {
@@ -164,22 +152,29 @@ fn arm_accept(
                 Err(e) => eprintln!("zhida-bench serve: ws upgrade: {e}"),
             }
         } else {
-            tcp_echo(&handle, stream, &max_rx_frame).await;
+            tcp_echo(&handle, stream).await;
         }
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    // the largest TCP frame payload received: the echo test's precondition
+    static MAX_RX_FRAME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Echoes the connection's bytes. A received frame may hold more than one TX frame's room
 /// (conduit appends small in-order segments into a frame's tailroom), so it goes back as as many
 /// TX frames as it needs.
-async fn tcp_echo(handle: &NetHandle, stream: TcpStream, max_rx_frame: &Cell<usize>) {
+async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
     let (mut rx, mut tx) = stream.split();
     loop {
         let Ok(received) = rx.recv().await else {
             return;
         };
         let payload = received.payload();
-        max_rx_frame.set(max_rx_frame.get().max(payload.len()));
+        #[cfg(test)]
+        MAX_RX_FRAME.with(|m| m.set(m.get().max(payload.len())));
         let mut rest = payload;
         while !rest.is_empty() {
             let mut frame = handle.tx_frame().await;
@@ -232,7 +227,9 @@ mod tests {
     #[cfg(feature = "e2e")]
     #[zhida_test_support::pinned_test]
     fn echo_returns_a_received_frame_larger_than_a_tx_frame() {
+        use std::cell::Cell;
         use std::io::{Read, Write as _};
+        use std::rc::Rc;
         use std::time::{Duration, Instant};
 
         const PORT: u16 = 7100;
@@ -267,17 +264,8 @@ mod tests {
             assert!(status.success(), "ip {args:?}");
         }
         let handle = host.net.handle();
-        let max_rx_frame = Rc::new(Cell::new(0));
         let spawner = host.rt.spawner();
-        arm_accept(
-            &spawner,
-            handle.clone(),
-            PORT,
-            tcp_config,
-            false,
-            max_rx_frame.clone(),
-        )
-        .unwrap();
+        arm_accept(&spawner, handle.clone(), PORT, tcp_config, false).unwrap();
         let room = Rc::new(Cell::new(0));
         let (task_handle, task_room) = (handle.clone(), room.clone());
         spawn(&spawner, async move {
@@ -320,7 +308,7 @@ mod tests {
             std::thread::sleep(Duration::from_micros(50));
         }
         assert!(peer.join().unwrap() == expected, "echoed bytes differ");
-        let max_frame = max_rx_frame.get();
+        let max_frame = MAX_RX_FRAME.with(|m| m.get());
         assert!(
             max_frame > room.get(),
             "precondition: largest received frame {max_frame} B, TX frame room {} B",
