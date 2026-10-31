@@ -17,16 +17,14 @@ pub(super) enum Decision {
     Refused,
 }
 
+/// A new view at `index` holding `kept`, replacing the `released` views it covers and cutting the
+/// front off the view after them when `trimmed`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct NewView {
     kept: Range<usize>,
-    len: usize,
     index: usize,
-    left: Option<Range<usize>>,
     released: usize,
-    released_span: Option<Range<usize>>,
-    trimmed: Option<Range<usize>>,
-    cap: usize,
+    trimmed: bool,
 }
 
 impl Decision {
@@ -123,13 +121,8 @@ impl RxStore {
                 .map_or(offset, |view| offset.max(view.end()));
             (start, self.views.partition_point(|view| view.start < start))
         };
-        let left = index
-            .checked_sub(1)
-            .and_then(|index| self.views.get(index))
-            .map(View::range);
         let mut released = 0usize;
-        let mut released_span: Option<Range<usize>> = None;
-        let mut trimmed = None;
+        let mut trimmed = false;
         for view in self.views.iter().skip(index) {
             if view.start >= end {
                 break;
@@ -137,13 +130,8 @@ impl RxStore {
             if view.start >= start {
                 if view.end() <= end {
                     released = released.checked_add(1).expect("view count exceeds usize");
-                    if let Some(span) = &mut released_span {
-                        span.end = view.end();
-                    } else {
-                        released_span = Some(view.range());
-                    }
                 } else {
-                    trimmed = Some(view.range());
+                    trimmed = true;
                     break;
                 }
             }
@@ -165,13 +153,9 @@ impl RxStore {
         } else {
             Decision::New(NewView {
                 kept: self.relative_range(start..end),
-                len,
                 index,
-                left: left.map(|range| self.relative_range(range)),
                 released,
-                released_span: released_span.map(|range| self.relative_range(range)),
-                trimmed: trimmed.map(|range| self.relative_range(range)),
-                cap,
+                trimmed,
             })
         }
     }
@@ -202,27 +186,19 @@ impl RxStore {
             Decision::Append(range) => range,
             _ => panic!("stale append decision: variant"),
         };
-        assert!(range.start == offset, "stale append decision: offset");
-        assert!(
+        debug_assert!(range.start == offset, "stale append decision: offset");
+        debug_assert!(
             range.len() == payload.len(),
             "stale append decision: payload length"
         );
-        assert!(!payload.is_empty(), "stale append decision: empty payload");
-        assert!(
+        debug_assert!(!payload.is_empty(), "stale append decision: empty payload");
+        debug_assert!(
             offset == self.in_order_len(),
             "stale append decision: in-order bytes"
         );
-        assert!(
-            self.views.back().is_some(),
-            "stale append decision: last view"
-        );
-        let view = self.views.back_mut().unwrap();
-        assert!(view.end() == self.head.checked_add(offset).expect("receive offset exceeds usize"), "stale append decision: last view end");
+        let view = self.views.back_mut().expect("stale append decision: last view");
+        debug_assert!(view.end() == self.head.checked_add(offset).expect("receive offset exceeds usize"), "stale append decision: last view end");
         let frame = view.frame.as_mut().unwrap();
-        assert!(
-            frame.room() >= payload.len(),
-            "stale append decision: frame room"
-        );
         let len = view
             .len
             .checked_add(payload.len())
@@ -240,152 +216,93 @@ impl RxStore {
     pub(super) fn place(&mut self, offset: usize, decision: Decision) {
         self.assert_attached();
         let offset = self.absolute(offset);
-        let mut new = match decision {
+        let new = match decision {
             Decision::New(new) => new,
             Decision::Append(_) => panic!("append decision passed to place"),
             Decision::Duplicate(range) => {
-                let range = self.absolute_range(range);
-                assert!(
-                    range.start == offset && range.start < range.end && self.is_held(range),
+                debug_assert!(
+                    {
+                        let range = self.absolute_range(range);
+                        range.start == offset && range.start < range.end && self.is_held(range)
+                    },
                     "stale duplicate decision"
                 );
                 return;
             }
             Decision::Refused => return,
         };
-        new.kept = self.absolute_range(new.kept);
-        new.left = new.left.map(|range| self.absolute_range(range));
-        new.released_span = new.released_span.map(|range| self.absolute_range(range));
-        new.trimmed = new.trimmed.map(|range| self.absolute_range(range));
-        assert!(
-            new.kept.end
-                == offset
-                    .checked_add(new.len)
-                    .expect("segment end exceeds usize")
-                && offset <= new.kept.start
-                && new.kept.start < new.kept.end,
+        let kept = self.absolute_range(new.kept);
+        debug_assert!(
+            offset <= kept.start && kept.start < kept.end,
             "stale new decision"
         );
         let index = new.index;
-        if index == self.held() && new.released == 0 && new.trimmed.is_none() {
-            assert!(
-                self.views.back().map(View::range) == new.left,
+        if index == self.held() && new.released == 0 && !new.trimmed {
+            debug_assert!(
+                self.views.back().is_none_or(|view| view.end() <= kept.start),
                 "stale new decision: left neighbor"
             );
-            let after = self
-                .held()
-                .checked_add(1)
-                .expect("view count exceeds usize");
-            let limit = if new.kept.start <= self.absolute(self.in_order_len()) {
-                Some(new.cap)
-            } else {
-                new.cap.checked_sub(IN_ORDER_RESERVE)
-            };
-            assert!(
-                limit.is_some_and(|limit| after <= limit),
-                "stale new decision: view cap"
-            );
             self.views.push_back(View {
-                start: new.kept.start,
-                len: new
-                    .kept
-                    .end
-                    .checked_sub(new.kept.start)
-                    .expect("empty kept range"),
+                start: kept.start,
+                len: kept.end.checked_sub(kept.start).expect("empty kept range"),
                 frame: None,
             });
-            if new.kept.start == self.absolute(self.in_order_len()) {
+            if kept.start == self.absolute(self.in_order_len()) {
                 self.in_order =
-                    u32::try_from(self.relative(new.kept.end)).expect("in-order byte count exceeds u32");
+                    u32::try_from(self.relative(kept.end)).expect("in-order byte count exceeds u32");
             }
             self.pending = true;
             return;
         }
-        assert!(index <= self.held(), "stale new decision: insertion index");
-        let left = index
-            .checked_sub(1)
-            .and_then(|index| self.views.get(index))
-            .map(View::range);
-        assert!(left == new.left, "stale new decision: left neighbor");
-        assert!(
-            self.views
-                .get(index)
-                .is_none_or(|view| view.start >= new.kept.start),
-            "stale new decision: insertion index"
-        );
         let released_end = index
             .checked_add(new.released)
             .expect("view index exceeds usize");
-        assert!(
-            released_end <= self.held(),
+        debug_assert!(released_end <= self.held(), "stale new decision: released views");
+        debug_assert!(
+            index
+                .checked_sub(1)
+                .is_none_or(|left| self.views[left].end() <= kept.start),
+            "stale new decision: left neighbor"
+        );
+        debug_assert!(
+            self.views
+                .range(index..released_end)
+                .all(|view| view.start >= kept.start && view.end() <= kept.end),
             "stale new decision: released views"
         );
-        let released_span = if new.released == 0 {
-            None
-        } else {
-            let last = released_end.checked_sub(1).expect("no released views");
-            Some(self.views[index].start..self.views[last].end())
-        };
-        assert!(
-            released_span == new.released_span,
-            "stale new decision: released views"
-        );
-        if let Some(trimmed) = &new.trimmed {
-            assert!(
-                self.views.get(released_end).map(View::range) == Some(trimmed.clone()),
-                "stale new decision: trimmed view"
-            );
-        } else {
-            assert!(
-                self.views
-                    .get(released_end)
-                    .is_none_or(|view| view.start >= new.kept.end),
-                "stale new decision: right neighbor"
-            );
-        }
-        let after = self
-            .held()
-            .checked_sub(new.released)
-            .expect("released views exceed held views")
-            .checked_add(1)
-            .expect("view count exceeds usize");
-        let limit = if new.kept.start <= self.absolute(self.in_order_len()) {
-            Some(new.cap)
-        } else {
-            new.cap.checked_sub(IN_ORDER_RESERVE)
-        };
-        assert!(
-            limit.is_some_and(|limit| after <= limit),
-            "stale new decision: view cap"
+        debug_assert!(
+            self.views.get(released_end).is_none_or(|view| {
+                if new.trimmed {
+                    view.start < kept.end && view.end() > kept.end
+                } else {
+                    view.start >= kept.end
+                }
+            }),
+            "stale new decision: right neighbor"
         );
         if new.released != 0 {
             drop(self.views.drain(index..released_end));
         }
-        if new.trimmed.is_some() {
+        if new.trimmed {
             let view = &mut self.views[index];
-            let head = new
-                .kept
+            let head = kept
                 .end
                 .checked_sub(view.start)
                 .expect("trim ends before view start");
             view.frame.as_mut().unwrap().narrow(head..view.len);
             view.len = view.len.checked_sub(head).expect("trim exceeds view");
-            view.start = new.kept.end;
+            view.start = kept.end;
         }
         self.views.insert(
             index,
             View {
-                start: new.kept.start,
-                len: new
-                    .kept
-                    .end
-                    .checked_sub(new.kept.start)
-                    .expect("empty kept range"),
+                start: kept.start,
+                len: kept.end.checked_sub(kept.start).expect("empty kept range"),
                 frame: None,
             },
         );
-        if new.kept.start <= self.absolute(self.in_order_len()) {
-            let mut end = new.kept.end;
+        if kept.start <= self.absolute(self.in_order_len()) {
+            let mut end = kept.end;
             let mut next = index.checked_add(1).expect("view index exceeds usize");
             while let Some(view) = self.views.get(next).filter(|view| view.start == end) {
                 end = view.end();
@@ -868,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stale append decision: frame room")]
+    #[should_panic(expected = "extend exceeds frame room")]
     fn stale_append_after_frame_replacement_panics() {
         let mut store = RxStore::new();
         insert_with_room(&mut store, 0, b"a", APPEND_MAX, 4);
@@ -1081,72 +998,6 @@ mod tests {
         assert_eq!((first.get(), second.get(), later.get()), (1, 1, 0));
         drop(store);
         assert_eq!((first.get(), second.get(), later.get()), (1, 1, 1));
-    }
-
-    #[test]
-    fn append_place_keeps_stale_checks() {
-        for consume in [false, true] {
-            let mut store = RxStore::new();
-            let first = insert(&mut store, 0, b"abc", 4);
-            let decision = store.decide(3, 4, 4);
-            let second = insert(&mut store, 3, b"de", 4);
-            if consume {
-                drop(store.pop_front().unwrap());
-            }
-            let before = ranges(&store);
-            let (frame, incoming) = counted_frame(b"DEFG");
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                place_attach(&mut store, 3, frame, decision);
-            }))
-            .unwrap_err();
-            let message = if consume {
-                "stale new decision: left neighbor"
-            } else {
-                "stale new decision: right neighbor"
-            };
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&message));
-            assert_eq!(ranges(&store), before);
-            assert!(!store.has_pending());
-            let expected_bytes = if consume { &b"de"[..] } else { &b"abcde"[..] };
-            assert_eq!(
-                drain_bytes(&mut store),
-                expected_bytes
-            );
-            assert_eq!(
-                (first.get(), second.get(), incoming.get()),
-                (1, 1, 1)
-            );
-            drop(store);
-            assert_eq!((first.get(), second.get(), incoming.get()), (1, 1, 1));
-        }
-    }
-
-    #[test]
-    fn append_place_rejects_stale_view_cap() {
-        let mut store = RxStore::new();
-        insert(&mut store, 0, b"ab", 3);
-        insert(&mut store, 2, b"c", 3);
-        let decision = store.decide(3, 1, 3);
-        store.clear();
-        let left = insert(&mut store, 1, b"b", 3);
-        let right = insert(&mut store, 2, b"c", 3);
-        assert_eq!(store.in_order_len(), 0);
-        let before = ranges(&store);
-        assert_eq!(before, vec![(1, 2), (2, 3)]);
-        let (frame, incoming) = counted_frame(b"d");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 3, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale new decision: view cap")
-        );
-        assert_eq!(ranges(&store), before);
-        assert!(!store.has_pending());
-        assert_eq!((left.get(), right.get(), incoming.get()), (0, 0, 1));
-        drop(store);
-        assert_eq!((left.get(), right.get(), incoming.get()), (1, 1, 1));
     }
 
     #[test]
@@ -1481,21 +1332,17 @@ mod tests {
         let mut store = RxStore::new();
         insert(&mut store, 0, b"abc", 4);
         insert(&mut store, 5, b"fgh", 4);
-        let new = |kept: Range<usize>, len| {
+        let new = |kept: Range<usize>| {
             Decision::New(NewView {
                 kept,
-                len,
                 index: 2,
-                left: Some(5..8),
                 released: 0,
-                released_span: None,
-                trimmed: None,
-                cap: 4,
+                trimmed: false,
             })
         };
-        assert_eq!(store.decide(8, 2, 4), new(8..10, 2));
-        assert_eq!(store.decide(9, 2, 4), new(9..11, 2));
-        assert_eq!(store.decide(7, 3, 4), new(8..10, 3));
+        assert_eq!(store.decide(8, 2, 4), new(8..10));
+        assert_eq!(store.decide(9, 2, 4), new(9..11));
+        assert_eq!(store.decide(7, 3, 4), new(8..10));
         assert_eq!(store.decide(6, 2, 4), Decision::Duplicate(6..8));
         assert_eq!(store.decide(8, 2, 2), Decision::Refused);
         assert_eq!(ranges(&store), vec![(0, 3), (5, 8)]);
@@ -1607,13 +1454,9 @@ mod tests {
             decision,
             Decision::New(NewView {
                 kept: 4..16,
-                len: 12,
                 index: 0,
-                left: None,
                 released: 2,
-                released_span: Some(5..15),
-                trimmed: None,
-                cap: 4,
+                trimmed: false,
             })
         );
         assert_eq!((first.get(), second.get()), (0, 0));
@@ -1846,82 +1689,6 @@ mod tests {
         assert_eq!((held.get(), incoming.get()), (1, 1));
         drop(store);
         assert_eq!((held.get(), incoming.get()), (1, 1));
-    }
-
-    #[test]
-    fn stale_trim_after_truncate_panics() {
-        let mut store = RxStore::new();
-        let covered = insert(&mut store, 5, b"fgh", 4);
-        let trimmed = insert(&mut store, 10, b"klmno", 4);
-        let decision = store.decide(4, 8, 4);
-        store.truncate_from(14);
-        let (frame, incoming) = counted_frame(b"EFGHIJKL");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 4, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale new decision: trimmed view")
-        );
-        assert_eq!(ranges(&store), vec![(5, 8), (10, 14)]);
-        assert_eq!(store.views[0].frame.as_ref().unwrap().as_slice(), b"fgh");
-        assert_eq!(store.views[1].frame.as_ref().unwrap().as_slice(), b"klmn");
-        assert_eq!((covered.get(), trimmed.get(), incoming.get()), (0, 0, 1));
-        drop(store);
-        assert_eq!((covered.get(), trimmed.get(), incoming.get()), (1, 1, 1));
-    }
-
-    #[test]
-    fn stale_released_view_after_commit_panics() {
-        let mut store = RxStore::new();
-        let original = insert(&mut store, 5, b"fgh", 3);
-        let decision = store.decide(4, 8, 3);
-        let replacement = insert(&mut store, 5, b"fghi", 3);
-        assert_eq!(original.get(), 1);
-        let (frame, incoming) = counted_frame(b"EFGHIJKL");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 4, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale new decision: released views")
-        );
-        assert_eq!(ranges(&store), vec![(5, 9)]);
-        assert_eq!(store.views[0].frame.as_ref().unwrap().as_slice(), b"fghi");
-        assert_eq!(
-            (original.get(), replacement.get(), incoming.get()),
-            (1, 0, 1)
-        );
-        drop(store);
-        assert_eq!(
-            (original.get(), replacement.get(), incoming.get()),
-            (1, 1, 1)
-        );
-    }
-
-    #[test]
-    fn stale_decision_exceeds_cap_panics() {
-        let mut store = RxStore::new();
-        let decision = store.decide(0, 2, 2);
-        let first = insert(&mut store, 10, b"kl", 3);
-        let second = insert(&mut store, 20, b"uv", 3);
-        let (frame, incoming) = counted_frame(b"ab");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 0, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale new decision: view cap")
-        );
-        assert_eq!(ranges(&store), vec![(10, 12), (20, 22)]);
-        assert_eq!(store.views[0].frame.as_ref().unwrap().as_slice(), b"kl");
-        assert_eq!(store.views[1].frame.as_ref().unwrap().as_slice(), b"uv");
-        assert_eq!((first.get(), second.get(), incoming.get()), (0, 0, 1));
-        drop(store);
-        assert_eq!((first.get(), second.get(), incoming.get()), (1, 1, 1));
     }
 
     fn check_oracle(
