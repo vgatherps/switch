@@ -113,11 +113,11 @@ impl Calibration {
     }
 }
 
-/// The published fit; one writer (`run`), a seqlock: `seq` is odd while writing.
+/// The published fit; one writer (`run`), a seqlock: `seq` is odd while writing. `stale_at`
+/// is the counter value from which the fit is not ready; 0 when there is none.
 #[repr(C, align(64))]
 struct Mapping {
     seq: AtomicU64,
-    ready: AtomicU64,
     m: AtomicU64,
     h: AtomicU64,
     p: AtomicU64,
@@ -130,7 +130,6 @@ impl Mapping {
     const fn new() -> Self {
         Mapping {
             seq: AtomicU64::new(0),
-            ready: AtomicU64::new(0),
             m: AtomicU64::new(0),
             h: AtomicU64::new(0),
             p: AtomicU64::new(0),
@@ -142,8 +141,8 @@ impl Mapping {
 
     fn publish(&self, fit: Option<Fit>) {
         let fields = match fit {
-            Some(fit) => [1, fit.m, fit.h, fit.p, fit.r, fit.u, fit.m.saturating_add(fit.ticks(STALE_NS))],
-            None => [0; 7],
+            Some(fit) => [fit.m, fit.h, fit.p, fit.r, fit.u, fit.m.saturating_add(fit.ticks(STALE_NS))],
+            None => [0; 6],
         };
         let seq = self.seq.load(Ordering::Relaxed);
         self.seq.store(seq + 1, Ordering::Relaxed);
@@ -154,28 +153,24 @@ impl Mapping {
         self.seq.store(seq + 2, Ordering::Release);
     }
 
-    fn fields(&self) -> [&AtomicU64; 7] {
-        [&self.ready, &self.m, &self.h, &self.p, &self.r, &self.u, &self.stale_at]
+    fn fields(&self) -> [&AtomicU64; 6] {
+        [&self.m, &self.h, &self.p, &self.r, &self.u, &self.stale_at]
     }
 
+    /// The fields, or `None` while the writer is mid-publish.
     #[inline]
-    fn load(&self) -> [u64; 7] {
-        loop {
-            let seq = self.seq.load(Ordering::Acquire);
-            let values = self.fields().map(|field| field.load(Ordering::Relaxed));
-            fence(Ordering::Acquire);
-            if seq.is_multiple_of(2) && self.seq.load(Ordering::Relaxed) == seq {
-                return values;
-            }
-            std::hint::spin_loop();
-        }
+    fn load(&self) -> Option<[u64; 6]> {
+        let seq = self.seq.load(Ordering::Acquire);
+        let values = self.fields().map(|field| field.load(Ordering::Relaxed));
+        fence(Ordering::Acquire);
+        (seq.is_multiple_of(2) && self.seq.load(Ordering::Relaxed) == seq).then_some(values)
     }
 
     /// Latency from `stamp` to the moment the counter read `now`.
     #[inline]
     fn latency(&self, stamp: u64, now: u64) -> Option<Latency> {
-        let [ready, m, h, p, r, u, stale_at] = self.load();
-        if ready == 0 || now > stale_at {
+        let [m, h, p, r, u, stale_at] = self.load()?;
+        if now >= stale_at {
             return None;
         }
         let (phc, bound) = Fit { m, h, p, r, u }.at(now)?;

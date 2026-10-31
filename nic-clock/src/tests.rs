@@ -193,16 +193,31 @@ fn seqlock_never_tears() {
             v
         })
     };
+    let mut seen = 0;
     for _ in 0..100_000 {
-        let [ready, m, h, p, r, u, stale_at] = mapping.load();
-        if ready == 0 {
+        let Some([m, h, p, r, u, stale_at]) = mapping.load() else {
+            continue;
+        };
+        if stale_at == 0 {
             continue;
         }
+        seen += 1;
         assert_eq!([h, p, r, u], [m; 4]);
         assert_eq!(stale_at, m.saturating_add(fit(m).ticks(STALE_NS)));
     }
     stop.store(true, Ordering::Relaxed);
     assert!(writer.join().unwrap() > 1);
+    assert!(seen > 0);
+}
+
+/// While the writer is mid-publish (odd `seq`) the reader gets no latency instead of waiting.
+#[test]
+fn mid_publish_is_not_ready() {
+    let mut f = Fixture::default();
+    let now = f.exact_reads(LINE, 1 << 40, 11);
+    check(f.latency(LINE.phc(now) - 5, now), 5);
+    f.mapping.seq.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(f.latency(LINE.phc(now) - 5, now), None);
 }
 
 proptest! {
