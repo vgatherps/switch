@@ -22,8 +22,8 @@
 # Hugepages: 512 x 2 MiB on the data ENI's NUMA node, reserved on the kernel command line.
 # x86_64 also gets clocksource=tsc (not tsc=reliable: that turns off the kernel's TSC stability
 # checks); Graviton's arch_sys_counter needs nothing.
-# Kernel module: vfio-pci with write-combining (ENA LLQ) from amzn-drivers at AMZN_COMMIT, built for
-# the running kernel, so rerun apply after a kernel update.
+# Kernel module: official AL2023 kernel6.18 supplies ENA write-combining (LLQ); older kernels use
+# amzn-drivers at AMZN_COMMIT, built for the running kernel. Rerun apply after a kernel update.
 set -u
 R=${HFT_ROOT:-}
 ETC=$R/etc/zhida
@@ -287,18 +287,36 @@ amzn() {
 }
 
 vfio_dir() { echo "$R/lib/modules/$(uname -r)/kernel/drivers/vfio"; }
+# Amazon's kernel6.18 source applies vfio-pci-enable-mmap-ing-ena-device.patch. Trust that vendor
+# contract only for the unmodified official package matching this kernel, not arbitrary modules.
+native_vfio_wc() {
+    module=$(modinfo -n vfio_pci_core 2>/dev/null) || return 1
+    [ -f "$module" ] || return 1
+    [ "$(rpm -qf --qf '%{NAME} %{VENDOR} %{VERSION}-%{RELEASE}.%{ARCH}\n' "$module" 2>/dev/null)" \
+        = "kernel6.18 Amazon Linux $(uname -r)" ] || return 1
+    rpm -Vf "$module" >/dev/null 2>&1
+}
+
 # AWS's get-vfio-with-wc.sh keeps the stock module beside the patched one as *_no_wc.
-vfio_wc_installed() { ls "$(vfio_dir)"/pci/vfio-pci-core.ko*_no_wc >/dev/null 2>&1; }
+vfio_wc_installed() {
+    case "$(uname -r)" in
+        6.18.*) native_vfio_wc ;;
+        *) ls "$(vfio_dir)"/pci/vfio-pci-core.ko*_no_wc >/dev/null 2>&1 ;;
+    esac
+}
 
 step_vfio_wc() {
     if ! vfio_wc_installed; then
+        case "$(uname -r)" in
+            6.18.*) fatal vfio_wc "requires the unmodified official AL2023 kernel6.18 package for $(uname -r)" ;;
+        esac
         dir=$(amzn) || fatal vfio_wc "kernel-devel-$(uname -r) or amzn-drivers $AMZN_COMMIT unavailable"
         (cd "$dir/userspace/dpdk/enav2-vfio-patch" && TERM=dumb bash get-vfio-with-wc.sh) >/var/log/zhida-vfio-wc.log 2>&1 \
             || fatal vfio_wc "get-vfio-with-wc.sh failed; see /var/log/zhida-vfio-wc.log"
         vfio_wc_installed || fatal vfio_wc "get-vfio-with-wc.sh left no patched vfio-pci-core in $(vfio_dir)"
     fi
     if [ -d "$R/sys/module/vfio_pci_core" ] && [ "$(cat "$R/sys/module/vfio_pci_core/srcversion")" != "$(modinfo -F srcversion vfio_pci_core)" ]; then
-        report vfio_wc changed "patched vfio-pci installed; the loaded stock module goes at reboot"
+        report vfio_wc changed "write-combining vfio-pci installed; the loaded module goes at reboot"
         reboot_needed="$reboot_needed vfio"
         return 0
     fi
@@ -476,10 +494,17 @@ verify() {
 
     if ! vfio_wc_installed; then
         report vfio_wc FAIL "no write-combining vfio-pci for $(uname -r): rerun apply"
-    elif [ "$(cat "$R/sys/module/vfio_pci_core/srcversion" 2>/dev/null)" = "$(modinfo -F srcversion vfio_pci_core)" ]; then
-        report vfio_wc ok "patched vfio-pci-core loaded"
+    elif [ -n "$(modinfo -F srcversion vfio_pci_core)" ] \
+        && [ "$(cat "$R/sys/module/vfio_pci_core/srcversion" 2>/dev/null)" = "$(modinfo -F srcversion vfio_pci_core)" ]; then
+        case "$(uname -r)" in
+            6.18.*) report vfio_wc ok "Amazon Linux ENA write-combining vfio-pci-core loaded" ;;
+            *) report vfio_wc ok "patched vfio-pci-core loaded" ;;
+        esac
     else
-        report vfio_wc FAIL "loaded vfio-pci-core is not the patched one"
+        case "$(uname -r)" in
+            6.18.*) report vfio_wc FAIL "loaded vfio-pci-core differs from the verified on-disk module" ;;
+            *) report vfio_wc FAIL "loaded vfio-pci-core is not the patched one" ;;
+        esac
     fi
 
     cs=$(cat "$R/sys/devices/system/clocksource/clocksource0/current_clocksource" 2>/dev/null)

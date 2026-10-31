@@ -23,15 +23,25 @@ stub() { # name body
     printf '#!/bin/sh\necho "%s $*" >>"%s"\n%s\n' "$1" "$calls" "$2" >"$stubs/$1"
     chmod +x "$stubs/$1"
 }
-for c in dnf pip3 curl rustup cargo install networkctl make taskset; do stub "$c" ""; done
-stub uname 'case "$1" in -r) echo 6.1.0-test ;; *) echo "${FAKE_ARCH:-aarch64}" ;; esac'
+for c in pip3 curl rustup cargo install networkctl make taskset; do stub "$c" ""; done
+stub dnf 'case "$*" in *kernel-devel*) exit 1 ;; esac'
+stub uname 'case "$1" in -r) echo "${FAKE_KERNEL:-6.1.0-test}" ;; *) echo "${FAKE_ARCH:-aarch64}" ;; esac'
 stub pkg-config 'echo 25.11.3'
 stub ip "[ \"\$*\" = '-4 route show default' ] && cat '$tmp/routes'; exit 0"
 stub grubby "case \"\$1\" in --info=*) echo \"args=\\\"\$(cat '$tmp/grubby')\\\"\" ;; --update-kernel=*) echo \"\${2#--args=}\" >>'$tmp/grubby' ;; esac"
 stub systemctl "case \"\$1\" in is-enabled) [ -e '$tmp/enabled' ] ;; enable) touch '$tmp/enabled' ;; esac"
 stub pgrep "[ -e '$tmp/irqbalance' ]"
 stub mountpoint '[ "$1" = -q ] && shift; [ -e "$1/.mounted" ]'
-stub modinfo "[ \"\$*\" = '-F srcversion vfio_pci_core' ] && echo PATCHED; exit 0"
+stub modinfo "case \"\$*\" in
+    '-F srcversion vfio_pci_core') printf '%s\\n' \"\${FAKE_SRCVERSION-PATCHED}\" ;;
+    '-n vfio_pci_core') echo '$root/lib/modules/'\"\$(uname -r)\"'/kernel/drivers/vfio/pci/vfio-pci-core.ko.zst' ;;
+esac"
+stub rpm 'case "$1" in
+    -qf) [ "${FAKE_RPM_ID:-}" != MISSING ] || exit 1
+        printf "%s\n" "${FAKE_RPM_ID:-kernel6.18 Amazon Linux $(uname -r)}" ;;
+    -Vf) [ "${FAKE_RPM_DIRTY:-no}" = no ] ;;
+    *) exit 1 ;;
+esac'
 # zhida-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
 # prints the field as the real one does, or fails without the file; bind moves the data device to
 # vfio-pci.
@@ -57,6 +67,7 @@ dpdk_stamp="dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bb
 
 # A fresh c7g-like host: CPUs 0-7 on node 0, no SMT, management ens5, data ens6, stock modules.
 host() {
+    unset FAKE_ARCH FAKE_KERNEL FAKE_SRCVERSION FAKE_RPM_ID FAKE_RPM_DIRTY
     rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance"
     mkdir -p "$root/proc" "$root/run" "$root/etc" "$root/dev/hugepages" "$root/sys/kernel/iommu_groups" \
         "$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB" "$root/sys/module/vfio_pci_core" \
@@ -91,7 +102,7 @@ want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1
 # What the reboot changes: the kernel command line, the modules, and what the kernel then reports.
 reboot() {
     echo "ro console=ttyS0 $want_args" >"$root/proc/cmdline"
-    echo PATCHED >"$root/sys/module/vfio_pci_core/srcversion"
+    echo "${FAKE_SRCVERSION-PATCHED}" >"$root/sys/module/vfio_pci_core/srcversion"
     echo 512 >"$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
     echo 7 >"$root/sys/devices/system/cpu/isolated"
     echo 7 >"$root/sys/devices/system/cpu/nohz_full"
@@ -247,6 +258,84 @@ echo "dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7
 run build
 check "a DPDK built with another patch is rebuilt" called "curl .*dpdk-25.11.3.tar.xz"
 check "the patch hft-host.sh applies is in the repository" [ -s "$patch_file" ]
+
+# Standard AL2023 6.18 already supplies ENA WC. No headers, source download or *_no_wc marker.
+native_host() {
+    host
+    FAKE_KERNEL=${1:-6.18.56-125.164.amzn2023.aarch64}
+    FAKE_SRCVERSION=NATIVE
+    export FAKE_KERNEL FAKE_SRCVERSION
+    native_module=$root/lib/modules/$FAKE_KERNEL/kernel/drivers/vfio/pci/vfio-pci-core.ko.zst
+    mkdir -p "$(dirname "$native_module")"
+    : >"$native_module"
+    echo NATIVE >"$root/sys/module/vfio_pci_core/srcversion"
+}
+
+native_host
+check "a fresh native fixture resets the earlier x86_64 architecture" sh -c '[ "$(uname -m)" = aarch64 ]'
+run apply
+check "official 6.18 apply reboots for cmdline, not a VFIO rebuild" status_is 100
+check "native WC needs no kernel-devel or amzn-drivers download" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
+check "native WC checks the module's owning RPM and integrity" sh -c "grep -q '^rpm -qf ' '$calls' && grep -q '^rpm -Vf ' '$calls'"
+check "native apply does not touch the data ENI before reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+reboot
+run boot
+check "native WC resumes host setup after reboot" status_is 0
+run verify
+check "native 6.18 host verifies without a legacy backup marker" status_is 0
+check "verify identifies Amazon's native ENA WC" has vfio_wc "ok Amazon Linux ENA write-combining vfio-pci-core loaded"
+: >"$calls"
+run apply
+check "native apply after reboot is idempotent" status_is 0
+check "native reapply does not request another reboot" sh -c "! grep -q '^systemctl reboot' '$calls'"
+
+echo DIFFERENT >"$root/sys/module/vfio_pci_core/srcversion"
+run verify
+check "native WC rejects a loaded module that differs from disk" has vfio_wc "FAIL loaded vfio-pci-core differs from the verified on-disk module"
+run apply
+check "native apply reboots to replace a different loaded module" status_is 100
+check "native apply names the module reboot reason" has vfio_wc "changed write-combining vfio-pci installed"
+
+native_host
+FAKE_RPM_DIRTY=yes
+export FAKE_RPM_DIRTY
+run apply
+check "modified official 6.18 modules are refused" has vfio_wc "FAIL requires the unmodified official AL2023 kernel6.18 package"
+check "modified native modules do not fall back to the incompatible installer" sh -c "! grep -q 'kernel-devel\|amzn-drivers\|systemctl reboot' '$calls'"
+run verify
+check "verify does not accept modified native modules" has vfio_wc "FAIL no write-combining vfio-pci"
+
+for identity in MISSING "kernel6.18 Custom Linux $FAKE_KERNEL" \
+    "kernel6.18 Amazon Linux 6.18.55-other.aarch64" "custom-kernel Amazon Linux $FAKE_KERNEL"; do
+    native_host
+    FAKE_RPM_ID=$identity
+    export FAKE_RPM_ID
+    # A legacy backup must not authorize an untrusted 6.18 module.
+    : >"${native_module}_no_wc"
+    run apply
+    check "native WC refuses wrong module provenance ($identity)" has vfio_wc "FAIL requires the unmodified official AL2023 kernel6.18 package"
+done
+native_host
+rm "$native_module"
+run apply
+check "native WC refuses a missing module even when package metadata claims it" has vfio_wc "FAIL requires the unmodified official AL2023 kernel6.18 package"
+native_host
+run apply
+FAKE_SRCVERSION=
+export FAKE_SRCVERSION
+: >"$root/sys/module/vfio_pci_core/srcversion"
+run verify
+check "empty loaded and disk source versions cannot verify WC" has vfio_wc "FAIL loaded vfio-pci-core differs from the verified on-disk module"
+
+native_host 6.18.56-125.164.amzn2023.x86_64
+FAKE_ARCH=x86_64 run apply
+check "official x86_64 6.18 also uses vendor-native WC" status_is 100
+check "native x86_64 WC needs no external rebuild" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
+
+host
+run apply
+check "legacy kernels still fail when exact kernel-devel is missing" has vfio_wc "FAIL kernel-devel-6.1.0-test or amzn-drivers"
+check "legacy missing headers do not trigger a reboot" sh -c "! grep -q '^systemctl reboot' '$calls'"
 
 if [ "$fails" -ne 0 ]; then
     echo "test-hft-host: $fails failed"

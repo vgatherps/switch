@@ -35,8 +35,9 @@ sudo deploy/hft-host.sh verify       # every line ok, exit 0
 sudo deploy/run-binance.sh --seconds 3600
 ```
 
-`apply` is idempotent: run it again after `git pull` (it rebuilds), after a kernel update (it rebuilds
-the write-combining vfio-pci) or after changing the instance type (it recomputes CPUs and the command line).
+`apply` is idempotent: run it again after `git pull` (it rebuilds), after a kernel update (it checks
+vendor-native ENA write-combining on AL2023 6.18, or rebuilds vfio-pci on legacy kernels), or after
+changing the instance type (it recomputes CPUs and the command line).
 Use `--interface IF` only when the host has more than one non-management ENA interface.
 
 ## What apply does
@@ -49,7 +50,7 @@ Use `--interface IF` only when the host has more than one non-management ENA int
 | cpus | app CPU = highest-numbered CPU on the data ENI's NUMA node; it and its SMT siblings are isolated, every other CPU is housekeeping. Written to `/etc/zhida/host.env` |
 | config | `zhida-netconf discover --interface <data> --aws -o /etc/zhida/dut.json`, then `check`. `rx_timestamps` stays as discovered (false); run-binance.sh turns it on in its own copy |
 | cmdline | via grubby: `isolcpus=managed_irq,domain,<iso> nohz_full=<iso> rcu_nocbs=<iso> irqaffinity=<housekeeping> transparent_hugepage=madvise hugepagesz=2M hugepages=<node>:512` (1 GiB of 2 MiB pages on the data ENI's node) |
-| vfio_wc | vfio-pci with write-combining (needed for ENA LLQ) from amzn-drivers' `get-vfio-with-wc.sh`, pinned commit and sha256 |
+| vfio_wc | official AL2023 `kernel6.18` already supplies ENA write-combining (needed for LLQ); check package ownership/integrity and loaded module identity, without installing headers or rebuilding it. Legacy kernels retain amzn-drivers' `get-vfio-with-wc.sh`, pinned commit and sha256 |
 | cmdline (x86_64) | also `clocksource=tsc` (not `tsc=reliable`, which turns off the kernel's TSC stability checks). Graviton's `arch_sys_counter` needs nothing |
 | unit | `zhida-host.service` runs `hft-host.sh boot` at every boot |
 | reboot | when the command line or a module changed |
@@ -57,7 +58,7 @@ Use `--interface IF` only when the host has more than one non-management ENA int
 
 `verify` prints one `<step>: ok|FAIL <detail>` line for each of: cmdline, management (on its kernel
 driver, with the default route), data (on vfio-pci), cpus (`isolated` and `nohz_full` in sysfs), hugepages,
-pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core is the patched one), clocksource (the current
+pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed WC module), clocksource (the current
 one; anything but `tsc` fails on x86_64), unit, config.
 `pools` reads zhida-nic's own `hugepages: hugepages-2048kB used=N free=M` line from the last run in
 `/var/log/zhida/binance.log` and fails if the run took more than the 512 reserved pages.
@@ -66,6 +67,31 @@ one; anything but `tsc` fails on x86_64), unit, config.
 with `rx_timestamps: true`. It refuses to start unless `zhida-netconf check` reads that back, then runs
 `zhida-nic --config /etc/zhida/binance.json feed` pinned to the app CPU, appending to
 `/var/log/zhida/binance.log`.
+
+## AL2023 6.18 and the first host setup failure
+
+On the first m7g.xlarge run, `kernel-devel-6.18.56-125.164.amzn2023.aarch64` could not be found.
+The package name was wrong: AL2023 uses `kernel6.18-devel` for 6.18; generic `kernel-devel` is the
+6.1 package. [AWS documents the kernel-specific names](https://docs.aws.amazon.com/linux/al2023/ug/kernel-update.html).
+[AL2023 repositories are version-locked](https://docs.aws.amazon.com/linux/al2023/ug/deterministic-upgrades-usage.html);
+changing to `latest` or installing unrelated headers is not a fix.
+
+More importantly, that host does not need an external VFIO rebuild. The official
+[`kernel6.18-6.18.56-125.164.amzn2023` source RPM](https://cdn.amazonlinux.com/al2023/blobstore/ec20d3a788e0c8493ac8340fcac7ec15ddf92f3e776d53ad14849d82907d612d/kernel6.18-6.18.56-125.164.amzn2023.src.rpm)
+applies `0065-vfio-pci-enable-mmap-ing-ena-device.patch`: ENA prefetchable BARs use `pci_iomap_wc`
+and `pgprot_writecombine`. Its installed VFIO modules use `.ko.zst`. The pinned external installer
+both requests the wrong package names and compresses replacements with `xz` even for `.zst` modules.
+It is not invoked for the official AL2023 6.18 path.
+
+The supported 6.18 policy trusts Amazon's kernel package contract, grounded in that published source;
+it is not an independent runtime measurement of BAR memory attributes or a guarantee inferred from
+a module symbol. `modinfo` must resolve an existing module owned by `kernel6.18`, vendor
+`Amazon Linux`, with version/release/architecture matching `uname -r`; `rpm -Vf` must report the
+owning package unmodified. Verification also requires nonempty, equal installed/loaded
+`vfio_pci_core` source versions. Custom, unowned, modified or mismatched modules fail rather than
+falling back to the incompatible installer. No kernel downgrade, header substitution or extra
+kernel-upgrade phase is needed. The existing command-line reboot and boot service still apply;
+reconnect and run `verify` as above.
 
 ## Test (local, no root)
 
