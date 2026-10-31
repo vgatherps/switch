@@ -361,7 +361,7 @@ impl<'a> TcpSet<'a> {
     pub fn get_mut(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'a> {
         self.item(handle);
         self.mark_dirty(handle.index);
-        &mut self.item_mut(handle).socket
+        &mut self.item_at_mut(handle.index).expect("validated TCP slot is empty").socket
     }
 
     /// [`tcp::Socket::connect`] through the set, with `cx` the context of the interface that

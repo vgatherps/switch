@@ -681,7 +681,7 @@ impl Interface {
             }
 
             let mut end_poll_at = None;
-            let result = loop {
+            let dispatched = loop {
                 let item = sockets.item_at_mut(index).expect("ready TCP slot is empty");
                 let before = item.socket.state();
                 let next_hop = &mut item.meta.next_hop;
@@ -835,7 +835,7 @@ impl Interface {
                     break dispatch_result;
                 }
             };
-            if matches!(result, Err(EgressError::Exhausted)) {
+            if matches!(dispatched, Err(EgressError::Exhausted)) {
                 let waiting = sockets
                     .item_at_mut(index)
                     .expect("ready TCP slot is empty")
@@ -856,7 +856,7 @@ impl Interface {
                     sockets.include_deadline(index);
                 }
             }
-            if matches!(result, Err(EgressError::Exhausted)) {
+            if matches!(dispatched, Err(EgressError::Exhausted)) {
                 break;
             }
         }
