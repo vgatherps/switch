@@ -181,8 +181,12 @@ test-buffer: doctor
 test-props: doctor
 	$(TIMEOUT) cargo test --locked -p zhida-buffer --features proptest --test props -- --test-threads=1
 
+# Debug test and fuzz builds of the stack also run smoltcp's O(N)-per-packet cross-checks
+# (vendor/smoltcp's diagnostics feature). Release, bench and application builds never do.
+DIAGNOSTICS = --features dpdk-smoltcp/diagnostics
+
 test-stack: doctor
-	$(TIMEOUT) cargo test --locked -p dpdk-smoltcp -p zhida-test-kit -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p dpdk-smoltcp -p zhida-test-kit $(DIAGNOSTICS) -- --test-threads=1
 
 test-stack-release: doctor
 	$(TIMEOUT) cargo test --locked --release -p dpdk-smoltcp -- --test-threads=1
@@ -269,14 +273,14 @@ memif-bench: doctor
 
 # tap-echo and the packetdrill shim, the inputs of fuzz/packetdrill/run.sh.
 packetdrill-build: doctor
-	cargo build --locked -p tap-echo
+	cargo build --locked -p tap-echo $(DIAGNOSTICS)
 	mkdir -p target/fuzz
 	clang -shared -fPIC -Wall -Werror -I/opt/packetdrill/include \
 		-o target/fuzz/zhida_shim.so fuzz/packetdrill/zhida_shim.c
 
 # The Scapy mutation fuzzer only; its unit tests run in make test.
 fuzz: doctor
-	cargo build --locked -p tap-echo
+	cargo build --locked -p tap-echo $(DIAGNOSTICS)
 	timeout --kill-after=10 $(FUZZ_TIMEOUT) ../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py \
 		--seed $(FUZZ_SEED) --connections $(FUZZ_CONNECTIONS) $(if $(FUZZ_ONLY),--only $(FUZZ_ONLY))
 

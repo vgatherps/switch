@@ -150,7 +150,9 @@ separate Make invocations sequentially too. Each `cargo test` step runs under
 container), so a hung test fails the step with 124 (137 if it ignores TERM). Cargo commands use
 --locked. The property invocation runs only the `props` test target, the one target its
 `proptest` feature adds. Two documentation examples are marked ignored. `docker-test` runs
-`test-stack-release` after `test-stack`, testing dpdk-smoltcp in release.
+`test-stack-release` after `test-stack`, testing dpdk-smoltcp in release. `test-stack`,
+`packetdrill-build` and `fuzz` build with `dpdk-smoltcp/diagnostics`, which turns on smoltcp's
+O(N)-per-packet TCP cross-checks; release, bench and application builds leave it off.
 
 ### Pinned tests
 
@@ -437,7 +439,7 @@ A failure prints the reason, writes `target/fuzz/fail-s<seed>-c<i>.pcap` (frames
 the previous connection, both directions) and `.json` (both plans), prints a replay command and
 exits 1 (tap-echo then exits 1). A replay repeats the plan, not the timing. Replay one
 connection (then the end probe) inside a container started with the Makefile's `DOCKER_RUN`
-flags, after `make fuzz` (or `cargo build --locked -p tap-echo`) built `tap-echo`:
+flags, after `make fuzz` (or `cargo build --locked -p tap-echo --features dpdk-smoltcp/diagnostics`) built `tap-echo`:
 `../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed 1 --only 17`, or a whole
 seed: `make docker-fuzz FUZZ_SEED=7` (`FUZZ_ONLY=17` there runs only that connection).
 
