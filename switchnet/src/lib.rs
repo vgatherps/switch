@@ -20,7 +20,7 @@ mod drive;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
-pub use drive::{RoundError, boxed, first, round, within};
+pub use drive::{RoundError, first, round, within};
 
 use std::cell::RefCell;
 use std::pin::Pin;

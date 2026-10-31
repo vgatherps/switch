@@ -17,7 +17,7 @@ use relay::{Kind, Limits};
 use relay::switchnet::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
 use switch::{Runtime, Spawner};
 use switchnet::{
-    Closed, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, OpenError, RoundError, boxed, round,
+    Closed, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, OpenError, RoundError, round,
     tcp, within,
 };
 use tap_echo::driver::{self, ECHO_PORT, EXIT_ERROR, IFACE, TESTER_IP, ZHIDA_IP};
@@ -239,18 +239,8 @@ fn drive(
     let mut rt = Runtime::new(0);
     let tally: Rc<RefCell<Tally>> = Rc::default();
     let outcome: Rc<RefCell<Option<Result<(), Failure>>>> = Rc::default();
-    let (handle, spawner) = (net.handle(), rt.spawner());
-    let task = {
-        let (tally, outcome, role) = (tally.clone(), outcome.clone(), role.clone());
-        async move {
-            let result = match role {
-                Role::Server { .. } => server(&handle, &spawner, deadline, &tally).await,
-                Role::Client { cases, run } => client(&handle, &spawner, cases, &run, deadline, &tally).await,
-            };
-            *outcome.borrow_mut() = Some(result);
-        }
-    };
-    rt.spawner().spawn(boxed(Box::pin(task))).map_err(|_| Failure::Spawn)?;
+    let task = run_role(net.handle(), rt.spawner(), role.clone(), deadline, tally.clone(), outcome.clone());
+    rt.spawner().spawn(task).map_err(|_| Failure::Spawn)?;
     let turned = loop {
         let since = elapsed();
         let now = Instant::from_micros(i64::try_from(since.as_micros()).expect("elapsed fits i64 microseconds"));
@@ -282,6 +272,23 @@ fn drive(
         (Role::Server { .. }, _) | (Role::Client { .. }, Some(Ok(()))) => Ok(()),
         (Role::Client { cases, .. }, None) => Err(Failure::Incomplete { started: tally.connections, of: cases + 2 }),
     }
+}
+
+/// `role`'s run as a switch task; its result goes to `outcome`.
+#[switch::task]
+async fn run_role(
+    handle: NetHandle,
+    spawner: Spawner,
+    role: Role,
+    deadline: Duration,
+    tally: Rc<RefCell<Tally>>,
+    outcome: Rc<RefCell<Option<Result<(), Failure>>>>,
+) {
+    let result = match role {
+        Role::Server { .. } => server(&handle, &spawner, deadline, &tally).await,
+        Role::Client { cases, run } => client(&handle, &spawner, cases, &run, deadline, &tally).await,
+    };
+    *outcome.borrow_mut() = Some(result);
 }
 
 /// The echo server on `ECHO_PORT`, one connection at a time, forever. The next connection's

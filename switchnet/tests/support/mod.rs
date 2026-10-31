@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
 use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, StackConfig};
 use switch::Runtime;
-use switchnet::{boxed, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
+use switchnet::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
@@ -115,11 +115,9 @@ impl Mixed {
     }
 
     /// Runs `future` as a switch task; its output lands in the returned slot.
-    pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Slot<T> {
+    pub fn spawn<T: 'static, F: Future<Output = T> + 'static>(&self, future: F) -> Slot<T> {
         let slot = Slot::default();
-        let out = slot.clone();
-        let token = boxed(Box::pin(async move { *out.0.borrow_mut() = Some(future.await) }));
-        self.rt.spawner().spawn(token).expect("spawn");
+        self.rt.spawner().spawn(fill(future, slot.clone())).expect("spawn");
         slot
     }
 
@@ -290,6 +288,12 @@ pub fn peer_drain(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, into: &mut 
     while let Ok(Some(frame)) = mixed.peer.tcp_mut(peer).recv() {
         into.extend_from_slice(frame.payload());
     }
+}
+
+/// Runs `future` and puts its output in `out`.
+#[switch::task]
+async fn fill<T: 'static, F: Future<Output = T> + 'static>(future: F, out: Slot<T>) {
+    *out.0.borrow_mut() = Some(future.await);
 }
 
 /// A spawned task's output.

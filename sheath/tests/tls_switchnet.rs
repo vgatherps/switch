@@ -21,7 +21,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use sheath::switchnet::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
 use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
-use switchnet::{AddTcpError, Closed, IpEndpoint, IpListenEndpoint, NetHandle, OpenError, TcpStream, boxed, tcp};
+use switchnet::{AddTcpError, Closed, IpEndpoint, IpListenEndpoint, NetHandle, OpenError, TcpStream, tcp};
 
 const SERVER_PORT: u16 = 8443;
 const HOST: &str = "tls.test";
@@ -182,6 +182,26 @@ const SETTLE: Duration = Duration::from_millis(200);
 /// A server read stalling this long means the client sends nothing more.
 const STALL: Duration = Duration::from_secs(5);
 
+/// Connects to the kernel peer from a fresh local port, runs `client` on the stream, and puts
+/// what it hands back in `held`.
+#[switch::task]
+async fn connect_client<
+    H: 'static,
+    F: Future<Output = H> + 'static,
+    C: FnOnce(NetHandle, Spawner, TcpStream, Arc<ClientConfig>) -> F + 'static,
+>(
+    handle: NetHandle,
+    spawner: Spawner,
+    tls: Arc<ClientConfig>,
+    client: C,
+    held: Rc<RefCell<Option<H>>>,
+) {
+    let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
+    let local = IpListenEndpoint { addr: None, port: next_local_port() };
+    let stream = handle.tcp_connect(TAP.socket, remote, local).expect("open TCP").await.expect("TCP connect");
+    *held.borrow_mut() = Some(client(handle, spawner, stream, tls).await);
+}
+
 /// One client against one kernel peer, like `client_server`, except that the Net is turned only
 /// until the client task finishes, and the task gets the runtime's spawner (for timers). What
 /// the peer reads after that was on the wire by then, not sent by later turns. What the client
@@ -198,14 +218,8 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
         let handle = net.handle();
         let spawner = rt.spawner();
         let held: Rc<RefCell<Option<H>>> = Rc::default();
-        let task_held = held.clone();
-        let task = async move {
-            let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
-            let local = IpListenEndpoint { addr: None, port: next_local_port() };
-            let stream = handle.tcp_connect(TAP.socket, remote, local).expect("open TCP").await.expect("TCP connect");
-            *task_held.borrow_mut() = Some(client(handle, spawner, stream, client_tls).await);
-        };
-        rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn the client");
+        let task = connect_client(handle, spawner, client_tls, client, held.clone());
+        rt.spawner().spawn(task).expect("spawn the client");
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();

@@ -33,7 +33,6 @@ use rustls::version::TLS13;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use sheath::switchnet::{send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
-use switchnet::boxed;
 use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};
 
@@ -148,11 +147,18 @@ async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfi
     }
 }
 
-/// `connection`, abandoned after `CONNECTION_LIMIT_MS`.
-async fn bounded(spawner: &Spawner, handle: &NetHandle, local_port: u16, config: Arc<ClientConfig>) -> String {
-    let mut work = pin!(connection(handle, local_port, config));
+/// `connection`, abandoned after `CONNECTION_LIMIT_MS`; how it ended goes to `ended`.
+#[switch::task]
+async fn bounded(
+    spawner: Spawner,
+    handle: NetHandle,
+    local_port: u16,
+    config: Arc<ClientConfig>,
+    ended: Rc<RefCell<Option<String>>>,
+) {
+    let mut work = pin!(connection(&handle, local_port, config));
     let mut limit = pin!(spawner.sleep(CONNECTION_LIMIT_MS).expect("the runtime is open"));
-    poll_fn(|cx| {
+    let outcome = poll_fn(|cx| {
         if let Poll::Ready(ended) = work.as_mut().poll(cx) {
             return Poll::Ready(ended);
         }
@@ -160,8 +166,8 @@ async fn bounded(spawner: &Spawner, handle: &NetHandle, local_port: u16, config:
             return Poll::Ready("abandoned after the time limit".to_owned());
         }
         Poll::Pending
-    })
-    .await
+    });
+    *ended.borrow_mut() = Some(outcome.await);
 }
 
 fn marker(dir: &Path, name: &str) {
@@ -204,14 +210,10 @@ fn main() {
                 started += 1;
                 let slot: Rc<RefCell<Option<String>>> = Rc::default();
                 running = Some(slot.clone());
-                let (handle, spawner, config) = (handle.clone(), rt.spawner(), client_config());
                 // successive local ports, so no connection meets the previous one's TIME-WAIT
                 let local_port = 49152 + u16::try_from(started % 16384).unwrap();
-                let task = async move {
-                    let ended = bounded(&spawner, &handle, local_port, config).await;
-                    *slot.borrow_mut() = Some(ended);
-                };
-                rt.spawner().spawn(boxed(Box::pin(task))).expect("spawn a connection");
+                let task = bounded(rt.spawner(), handle.clone(), local_port, client_config(), slot);
+                rt.spawner().spawn(task).expect("spawn a connection");
             }
             net.turn(clock.now()).expect("turn the Net");
             rt.poll(clock.ms()).expect("poll the connections");

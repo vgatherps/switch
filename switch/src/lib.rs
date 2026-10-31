@@ -145,7 +145,7 @@
 //! }
 //! ```
 
-#[cfg(test)]
+// `#[task]` expansions name the crate `::switch`, here too (`boxed`, tests).
 extern crate self as switch;
 
 mod executor;
@@ -158,6 +158,14 @@ pub(crate) mod task;
 mod timer_registration;
 mod timer_wheel;
 mod waker;
+
+/// A task whose future is heap-allocated: one allocation per spawn, and one dynamic call per
+/// poll. For slow-path spawns only, where writing a task function is not practical; normal
+/// code writes a `#[switch::task]` function, whose future lives in its pool's slot.
+#[task]
+pub fn boxed(future: std::pin::Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
+    future
+}
 
 pub use remote::RemoteWaker;
 pub use executor::request_turn;
