@@ -219,10 +219,11 @@ requires at least one message and successful read/close.
 `feed_latency` gives each message's latency from the NIC's RX stamp of the frame holding its first byte to relay
 handing it over (`nic-clock`): `no_stamp` (unstamped: `rx_timestamps` off or the PMD left no stamp), `not_ready`
 (no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the largest error
-bound and a log2 histogram in ns. If the port's first `rte_eth_read_clock` succeeds (ENA with the DPDK patch in
-`docker/dpdk-ena-read-clock.patch`, on instances with a PHC), a thread on the housekeeping CPUs (online CPUs not
-in /sys/devices/system/cpu/isolated) maps the NIC clock onto the CPU counter; otherwise `nic_clock: none` is
-printed and every stamped message is `not_ready`.
+bound and a log2 histogram in ns. On ENA (with the DPDK patch in `docker/dpdk-ena-read-clock.patch`) unless
+`rte_eth_read_clock` returns -ENOTSUP (no PHC on the device), a thread on the housekeeping CPUs (online CPUs not
+in /sys/devices/system/cpu/isolated) maps the NIC clock onto the CPU counter, skipping failed reads; otherwise
+`nic_clock: none` is printed and every stamped message is `not_ready`. Other drivers' `read_clock` is not their RX
+stamps' clock (ice returns CLOCK_MONOTONIC_RAW), so they get none.
 
 ### 3c. sockperf-server
 ```

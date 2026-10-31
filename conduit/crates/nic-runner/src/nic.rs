@@ -96,12 +96,15 @@ pub fn close(port: Port, mut code: i32) -> i32 {
     code
 }
 
-/// The port's NIC clock (ENA: the PHC, ns); `None` if this read failed or the PMD has no clock.
-pub fn read_clock(port_id: u16) -> Option<u64> {
+/// The port's NIC clock (ENA: the PHC, ns), or rte_eth_read_clock's negative errno.
+pub fn read_clock(port_id: u16) -> Result<u64, i32> {
     let mut clock = 0;
     // SAFETY: the ethdev stays open while this runs (the clock thread is joined before the port
     // closes) and `clock` is a writable output.
-    (unsafe { rte_eth_read_clock(port_id, &mut clock) } == 0).then_some(clock)
+    match unsafe { rte_eth_read_clock(port_id, &mut clock) } {
+        0 => Ok(clock),
+        error => Err(error),
+    }
 }
 
 /// Moves the calling thread to the online CPUs not in /sys/devices/system/cpu/isolated (the
