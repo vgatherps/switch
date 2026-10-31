@@ -126,8 +126,8 @@ fn template_checksum_matches_generic_for_payload_offsets() {
     }
 }
 
-// The template sums its fixed header from field values; every header field, SACK block count and
-// timestamp option must give the generic emitter's bytes and checksum.
+// The template sums its fixed header from field values; every header field and SACK block count
+// must give the generic emitter's bytes and checksum.
 #[test]
 fn template_header_checksum_matches_generic_random_fields_and_options() {
     let (mut iface, _, _) = setup(Medium::Ethernet);
@@ -156,10 +156,7 @@ fn template_header_checksum_matches_generic_random_fields_and_options() {
             sack_ranges: core::array::from_fn(|index| {
                 (index < blocks).then(|| (rng.r#gen(), rng.r#gen()))
             }),
-            timestamp: rng.r#gen::<bool>().then(|| TcpTimestampRepr {
-                tsval: rng.r#gen(),
-                tsecr: rng.r#gen(),
-            }),
+            timestamp: None,
             payload: &payload[..len],
         };
         let ip = Ipv4Repr {

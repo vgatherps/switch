@@ -117,6 +117,7 @@ impl TcpTemplate {
             && self.dst_port == tcp.dst_port
     }
 
+    /// Writes the whole segment into `frame`: headers, then `tcp.payload`.
     pub(crate) fn emit(
         &self,
         frame: &mut [u8],
@@ -128,8 +129,28 @@ impl TcpTemplate {
             tcp.max_seg_size.is_none() && tcp.window_scale.is_none() && !tcp.sack_permitted,
             "ACK-bearing TCP template segment carries SYN-only options"
         );
+        let (headers, payload) = frame.split_at_mut(34 + tcp.header_len());
+        self.emit_header(headers, ip, tcp, tcp.payload, checksum);
+        payload.copy_from_slice(tcp.payload);
+    }
+
+    /// Writes the Ethernet, IPv4 and TCP headers, SACK option included, into `frame`
+    /// (`34 + tcp.header_len()` long) and sums `payload` where it lies, which need not be behind
+    /// the headers. The stack sends no timestamp option. The TCP header length is taken from
+    /// `frame`, so a caller with a fixed 20-byte header compiles out the options.
+    #[inline]
+    pub(crate) fn emit_header(
+        &self,
+        frame: &mut [u8],
+        ip: &Ipv4Repr,
+        tcp: &TcpRepr,
+        payload: &[u8],
+        checksum: &ChecksumCapabilities,
+    ) {
+        debug_assert!(tcp.timestamp.is_none(), "TCP template segment carries a timestamp");
+        let header_len = frame.len() - 34;
+        debug_assert_eq!(header_len, tcp.header_len(), "TCP header length is not the frame's");
         self.prefix.emit(frame, ip, checksum);
-        let header_len = tcp.header_len();
 
         let mut packet = TcpPacket::new_unchecked(&mut frame[34..]);
         packet.set_src_port(tcp.src_port);
@@ -149,25 +170,19 @@ impl TcpTemplate {
         packet.set_window_len(tcp.window_len);
         packet.set_checksum(0);
         packet.set_urgent_at(0);
-        let mut options = packet.options_mut();
-        if tcp.sack_ranges.iter().any(Option::is_some) {
-            options = TcpOption::SackRange(tcp.sack_ranges).emit(options);
-        }
-        if let Some(timestamp) = tcp.timestamp {
-            options = TcpOption::TimeStamp {
-                tsval: timestamp.tsval,
-                tsecr: timestamp.tsecr,
+        let options_sum = if header_len > 20 {
+            let options = TcpOption::SackRange(tcp.sack_ranges).emit(packet.options_mut());
+            if !options.is_empty() {
+                TcpOption::EndOfList.emit(options);
             }
-            .emit(options);
-        }
-        if !options.is_empty() {
-            TcpOption::EndOfList.emit(options);
-        }
-        packet.payload_mut().copy_from_slice(tcp.payload);
+            checksum::data(&packet.as_ref()[20..header_len])
+        } else {
+            0
+        };
         if checksum.tcp.tx() {
             let tcp_len = ip.payload_len as u16;
             // The fixed header is summed from its field values and the payload from its source, so
-            // no checksum load spans the narrow header stores or reads back the copied payload.
+            // no checksum load spans the narrow header stores or reads back a copied payload.
             let seq = tcp.seq_number.0 as u32;
             let ack = tcp.ack_number.expect("TCP template requires ACK").0 as u32;
             let sum = !checksum::combine(&[
@@ -181,61 +196,7 @@ impl TcpTemplate {
                 ack as u16,
                 NetworkEndian::read_u16(&packet.as_ref()[12..14]),
                 tcp.window_len,
-                checksum::data(&packet.as_ref()[20..header_len]),
-                checksum::data(tcp.payload),
-            ]);
-            packet.set_checksum(sum);
-        }
-    }
-
-    /// `emit` for a payload that is not behind the headers: writes the 54 header bytes into
-    /// `frame` (54 long) and sums `payload` where it lies.
-    #[inline]
-    pub(crate) fn emit_header(
-        &self,
-        frame: &mut [u8],
-        ip: &Ipv4Repr,
-        tcp: &TcpRepr,
-        payload: &[u8],
-        checksum: &ChecksumCapabilities,
-    ) {
-        debug_assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
-        debug_assert_eq!(tcp.header_len(), 20, "TCP frame header carries options");
-        self.prefix.emit(frame, ip, checksum);
-        let mut packet = TcpPacket::new_unchecked(&mut frame[34..]);
-        packet.set_src_port(tcp.src_port);
-        packet.set_dst_port(tcp.dst_port);
-        packet.set_seq_number(tcp.seq_number);
-        packet.set_ack_number(tcp.ack_number.expect("TCP template requires ACK"));
-        packet.set_header_len(20);
-        packet.clear_flags();
-        packet.set_ack(true);
-        match tcp.control {
-            TcpControl::None => (),
-            TcpControl::Psh => packet.set_psh(true),
-            TcpControl::Fin => packet.set_fin(true),
-            TcpControl::Rst => packet.set_rst(true),
-            _ => unreachable!("TCP control does not fit template"),
-        }
-        packet.set_window_len(tcp.window_len);
-        packet.set_checksum(0);
-        packet.set_urgent_at(0);
-        if checksum.tcp.tx() {
-            let tcp_len = ip.payload_len as u16;
-            let seq = tcp.seq_number.0 as u32;
-            let ack = tcp.ack_number.expect("TCP template requires ACK").0 as u32;
-            let sum = !checksum::combine(&[
-                self.prefix.pseudo_sum,
-                tcp_len,
-                tcp.src_port,
-                tcp.dst_port,
-                (seq >> 16) as u16,
-                seq as u16,
-                (ack >> 16) as u16,
-                ack as u16,
-                NetworkEndian::read_u16(&packet.as_ref()[12..14]),
-                tcp.window_len,
-                checksum::data(&packet.as_ref()[20..20]),
+                options_sum,
                 checksum::data(payload),
             ]);
             packet.set_checksum(sum);
