@@ -92,7 +92,8 @@ put() {
     [ -f "$1" ] && [ "$(cat "$1")" = "$2" ] && return 1
     mkdir -p "$(dirname "$1")" && printf '%s\n' "$2" >"$1"
 }
-repo() { cd "$(dirname "$0")/.." && pwd; }
+# The repository this script is in, absolute: build steps cd elsewhere.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 
 # ---------------------------------------------------------------- build
 # clang/lld 18, as in the Docker image (AL2023's default clang 15 rejects the shims' [[clang::musttail]]).
@@ -114,7 +115,7 @@ step_packages() {
 }
 
 step_rust() {
-    channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' "$(repo)/rust-toolchain.toml")
+    channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")
     if ! command -v rustup >/dev/null; then
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y -q --profile minimal --default-toolchain "$channel" >/dev/null \
@@ -125,8 +126,17 @@ step_rust() {
     report rust ok "$channel"
 }
 
+# The DPDK patch conduit/docker/Dockerfile applies: ENA read_clock (the device PHC) and the PHC read
+# barrier.
+DPDK_PATCH=$REPO/conduit/docker/dpdk-ena-read-clock.patch
+# What a /opt/dpdk built by this script records in $DPDK_STAMP: the release tarball and the patch.
+# pkg-config alone cannot tell a patched 25.11.3 from a stock one.
+DPDK_STAMP=$R/opt/dpdk/share/zhida-dpdk.stamp
+dpdk_stamp() { echo "dpdk-$DPDK_VERSION $DPDK_SHA256 patch $(sha256sum "$DPDK_PATCH" | cut -d' ' -f1)"; }
+
 # The meson options of conduit/docker/Dockerfile; test-hft-host.sh checks they stay equal.
 build_dpdk() {
+    patch -s -p1 <"$DPDK_PATCH" && \
     CC=clang meson setup build . --buildtype=release --prefix=/opt/dpdk --libdir=lib \
         -Dplatform=generic -Denable_stdatomic=false -Dmbuf_refcnt_atomic=false \
         -Denable_iova_as_pa=true -Dtests=false -Ddisable_apps='*' \
@@ -135,28 +145,31 @@ build_dpdk() {
 }
 
 step_dpdk() {
-    have=$(pkg-config --modversion libdpdk 2>/dev/null)
-    if [ "$have" != "$DPDK_VERSION" ]; then
-        src=/var/tmp/dpdk-$DPDK_VERSION
+    want=$(dpdk_stamp)
+    if [ "$(cat "$DPDK_STAMP" 2>/dev/null)" != "$want" ]; then
+        src=$R/var/tmp/dpdk-$DPDK_VERSION
         rm -rf "$src"
         mkdir -p "$src" || fatal dpdk "cannot create $src"
         curl --fail --location --retry 2 -s -o "$src.tar.xz" "https://fast.dpdk.org/rel/dpdk-$DPDK_VERSION.tar.xz" \
             || fatal dpdk "download failed"
         echo "$DPDK_SHA256  $src.tar.xz" | sha256sum --check --quiet || fatal dpdk "sha256 mismatch"
         tar -xJf "$src.tar.xz" -C "$src" --strip-components=1 || fatal dpdk "unpack failed"
-        (cd "$src" && build_dpdk) || fatal dpdk "meson/ninja build failed"
+        # A stock or older install goes first, so nothing of it outlives the rebuild.
+        rm -rf "$R/opt/dpdk"
+        (cd "$src" && build_dpdk) || fatal dpdk "patch or meson/ninja build failed"
         echo /opt/dpdk/lib >/etc/ld.so.conf.d/dpdk.conf && ldconfig
         rm -rf "$src" "$src.tar.xz"
+        echo "$want" >"$DPDK_STAMP" || fatal dpdk "cannot write $DPDK_STAMP"
     fi
     have=$(pkg-config --modversion libdpdk 2>/dev/null)
     [ "$have" = "$DPDK_VERSION" ] || fatal dpdk "pkg-config reports '${have}', want $DPDK_VERSION"
-    report dpdk ok "$DPDK_VERSION in /opt/dpdk"
+    report dpdk ok "$DPDK_VERSION with dpdk-ena-read-clock.patch in /opt/dpdk"
 }
 
 step_binaries() {
-    (cd "$(repo)" && cargo build -q --release --locked -p nic-runner -p zhida-netconf) \
+    (cd "$REPO" && cargo build -q --release --locked -p nic-runner -p zhida-netconf) \
         || fatal binaries "cargo build failed"
-    install -m 0755 "$(repo)/target/release/zhida-nic" "$(repo)/target/release/zhida-netconf" /usr/local/bin/ \
+    install -m 0755 "$REPO/target/release/zhida-nic" "$REPO/target/release/zhida-netconf" /usr/local/bin/ \
         || fatal binaries "install failed"
     report binaries ok "/usr/local/bin/zhida-nic /usr/local/bin/zhida-netconf (release)"
 }

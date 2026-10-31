@@ -32,7 +32,7 @@ Use `--interface IF` only when the host has more than one non-management ENA int
 
 | step | what |
 |---|---|
-| packages, rust, dpdk | dnf toolchain; rustup with `rust-toolchain.toml`'s channel; DPDK 25.11.3 under `/opt/dpdk` built with `conduit/docker/Dockerfile`'s meson options (skipped when `pkg-config` already reports 25.11.3) |
+| packages, rust, dpdk | dnf toolchain with clang/lld 18; rustup with `rust-toolchain.toml`'s channel; DPDK 25.11.3 under `/opt/dpdk` with `conduit/docker/dpdk-ena-read-clock.patch` (ENA `rte_eth_read_clock` from the device PHC) and `conduit/docker/Dockerfile`'s meson options. `/opt/dpdk/share/zhida-dpdk.stamp` records the tarball and patch sha256; a missing or different stamp (a stock 25.11.3, an older patch) means a clean rebuild |
 | binaries | `cargo build --release --locked -p nic-runner -p zhida-netconf`; `zhida-nic` (mimalloc global allocator) and `zhida-netconf` go into `/usr/local/bin` |
 | interfaces | management = the interface of the lowest-metric IPv4 default route; data = the one other `ena` interface. Never the same interface; every step that touches the data ENI checks again first |
 | cpus | app CPU = highest-numbered CPU on the data ENI's NUMA node; it and its SMT siblings are isolated, every other CPU is housekeeping. Written to `/etc/zhida/host.env` |
