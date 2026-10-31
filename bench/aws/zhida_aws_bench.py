@@ -27,6 +27,7 @@ SIGTERM, and exits non-zero if a final describe still finds any of the run's res
 import argparse
 import datetime
 import json
+import math
 import os
 import random
 import shlex
@@ -66,9 +67,10 @@ SRC_DIR = "/opt/zhida-src"
 HFT = f"{SRC_DIR}/deploy/hft-host.sh"
 REMOTE = "/var/tmp/zhida"
 RECEIVER_UNIT = "zhida-bench-receiver"
-# One sweep's upper bound: <= 20 rate steps x (0.5 s warmup + 2 s window + 0.2 s drain + 5 s stall
-# limit) plus worker start-up, rounded up. Also the coordinator's timeout.
-SWEEP_WORST_S = 15 * 60
+# The coordinator's worst case and timeout: one step per rate RATE_MIN x sqrt(2)^k <= RATE_MAX, each
+# <= 50 ms lead + 0.5 s warmup + 2 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
+SWEEP_STEPS = sum(1 for k in range(64) if RATE_MIN * 2 ** (k / 2) <= RATE_MAX)
+SWEEP_WORST_S = math.ceil(SWEEP_STEPS * (0.05 + 0.5 + 2 + 0.2 + 10) + 60)
 BUILD_S = 3600
 SETUP_REBOOT_S = 900
 QUOTA_CODE = "L-1216C47A"
@@ -206,7 +208,7 @@ def plan_text(region, ttl, run_id, expires):
               for i in range(1, SENDER_HOSTS)]
     lines += [
         f"sweeps: {SENDERS} senders ({SENDERS // SENDER_HOSTS} per sender host), {SIZE} B messages,"
-        f" {RATE_MIN}..{RATE_MAX} msg/s",
+        f" {RATE_MIN}..{RATE_MAX} msg/s in {SWEEP_STEPS} steps of x sqrt(2); coordinator timeout {SWEEP_WORST_S} s",
     ]
     lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
     lines += [

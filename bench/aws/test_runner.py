@@ -41,6 +41,10 @@ class PureTest(unittest.TestCase):
     def test_fixed_matrix_tags(self):
         self.assertEqual(z.sweep_tags(), ["udp-n20-s64-uncapped", "tcp-n20-s64-b50", "ws-n20-s64-b50"])
 
+    def test_coordinator_timeout_is_the_fixed_rate_list_bound(self):
+        # 10k..5M in x sqrt(2) steps: 18; 18 x (0.05 + 0.5 + 2 + 0.2 + 10) s + 60 s
+        self.assertEqual((z.SWEEP_STEPS, z.SWEEP_WORST_S), (18, 290))
+
     def test_every_run_resource_carries_the_run_id_and_expiry(self):
         expires = datetime.datetime(2026, 11, 1, 13, 30, tzinfo=UTC)
         tags = {t["Key"]: t["Value"] for t in z.run_tags("r1", expires)}
@@ -307,6 +311,7 @@ class World:
         self.calls = []        # (role, command)
         self.fetched = []      # (role, remote)
         self.sweep_exit = {}   # tag -> coordinator exit code
+        self.sweep_timeouts = []
         self.fetch_fail = set()
         self.verify_fail = set()
         self.put = {}          # (role, path) -> text
@@ -341,6 +346,7 @@ class FakeHost:
         self.w.calls.append((self.role, command))
         if "zhida-bench sweep" in command:
             t = command.split(f"> {z.REMOTE}/")[1].split(".jsonl")[0]
+            self.w.sweep_timeouts.append(timeout)
             return Proc(self.w.sweep_exit.get(t, 0))
         return Proc(0)
 
@@ -543,6 +549,7 @@ class RunTest(unittest.TestCase):
             self.assertTrue(any(r == f"sender{i}" and "authorized_keys" in c for r, c in w.calls))
         sweeps = self.sweeps_run()
         self.assertEqual(len(sweeps), 3)
+        self.assertEqual(w.sweep_timeouts, [z.SWEEP_WORST_S] * 3)
         self.assertTrue(all(r == "sender0" for r, c in w.calls if "zhida-bench sweep" in c))
         for cmd, t in zip(sweeps, z.sweep_tags()):
             argv = shlex.split(cmd.split(" > ")[0])
