@@ -74,7 +74,7 @@ BUDGET_US = 50
 STEP_MS, WARMUP_MS, DRAIN_MS = 500, 250, 200
 SWEEPS = [("udp", None), ("tcp", BUDGET_US), ("ws", BUDGET_US)]
 PORT = 7000
-MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=1"
+MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=0"
 SRC_DIR = "/opt/zhida-src"
 HFT = f"{SRC_DIR}/deploy/hft-host.sh"
 REMOTE = "/var/tmp/zhida"

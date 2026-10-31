@@ -76,6 +76,17 @@ with `rx_timestamps: true`. It refuses to start unless `zhida-netconf check` rea
 `zhida-nic --config /etc/zhida/binance.json feed` pinned to the app CPU, appending to
 `/var/log/zhida/binance.log`.
 
+The 512 x 2 MiB HugeTLB pages (1 GiB) are reserved for DPDK. `run-binance.sh` and the AWS benchmark's
+receiver and senders explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding any inherited value.
+The binaries still use mimalloc; its default transparent hugepage support stays enabled, and the host
+keeps `transparent_hugepage=madvise`. THP uses ordinary memory rather than the reserved HugeTLB pool;
+THP backing is possible, not guaranteed.
+
+An AWS diagnostic run with `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` showed mimalloc reserving its default
+1 GiB arena before EAL: 2 HugeTLB pages used and 510 still reserved left none available for DPDK.
+EAL then failed allocating its services array with errno 12. Keeping the two memory sources separate
+avoids that competition without enlarging the HugeTLB pool or replacing mimalloc.
+
 ## AL2023 6.18 and the first host setup failure
 
 On the first m7g.xlarge run, `kernel-devel-6.18.56-125.164.amzn2023.aarch64` could not be found.

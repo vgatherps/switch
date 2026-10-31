@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs the Binance listener (zhida-nic feed) on the host deploy/hft-host.sh set up: pinned to the
-# isolated app CPU, mimalloc on large pages, output also appended to /var/log/zhida/binance.log
+# isolated app CPU, mimalloc with the HugeTLB pool left for DPDK, output appended to /var/log/zhida/binance.log
 # (hft-host.sh verify reads zhida-nic's hugepage line from it). Refuses to start unless verify passes.
 # The listener asks for ENA hardware RX timestamps: it runs with /etc/zhida/binance.json, the host's
 # dut.json with rx_timestamps true, and refuses to start unless zhida-netconf reads that back. On an
@@ -26,5 +26,5 @@ fi
 . "$R/etc/zhida/host.env"
 mkdir -p "$(dirname "$log")"
 echo "run-binance: $(date -u +%FT%TZ) zhida-nic feed $* on CPU $APP_CPU with $config" | tee -a "$log"
-MIMALLOC_ALLOW_LARGE_OS_PAGES=1 taskset -c "$APP_CPU" \
+MIMALLOC_ALLOW_LARGE_OS_PAGES=0 taskset -c "$APP_CPU" \
     zhida-nic --config "$config" feed "$@" 2>&1 | tee -a "$log"

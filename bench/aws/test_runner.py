@@ -153,7 +153,7 @@ class CommandTest(unittest.TestCase):
                   f'exec sh -c "$(printf %s "$3" | sed "s#/etc/zhida/host.env#{self.tmp}/etc/host.env#g;'
                   f' s#{z.REMOTE}/#{self.tmp}/var/#g")"\n')
         write_exe(os.path.join(self.bin, "taskset"),
-                  f'echo "taskset $1 $2 MIMALLOC=${{MIMALLOC_ALLOW_LARGE_OS_PAGES:-unset}}" >>{self.calls}\n'
+                  f'echo "taskset $1 $2" >>{self.calls}\n'
                   'shift 2\nexec "$@"\n')
         # zhida-bench: `sweep` expands and runs each worker like the coordinator (sh -c, {i}, {senders})
         write_exe(os.path.join(self.bin, "zhida-bench"), f"""python3 - "$@" <<'EOF'
@@ -174,7 +174,6 @@ EOF
 
     def run_sh(self, cmd):
         env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
-        env.pop("MIMALLOC_ALLOW_LARGE_OS_PAGES", None)
         r = subprocess.run(["sh", "-c", cmd.replace(f"{z.REMOTE}/", f"{self.tmp}/var/")], env=env,
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -183,7 +182,7 @@ EOF
 
     def test_sweep_command_and_template_expand_for_every_sender(self):
         calls = self.run_sh(z.sweep_command("tcp", 50, RECEIVER_DATA_IP, "0-6"))
-        self.assertEqual(calls[0], "taskset -c 0-6 MIMALLOC=unset")
+        self.assertEqual(calls[0], "taskset -c 0-6")
         self.assertEqual(calls[1], "zhida-bench sweep --proto tcp --gens 3 --senders 12 --rate-min 10000"
                                    " --rate-max 5000000 --budget-us 50"
                                    " --step-ms 500 --warmup-ms 250 --drain-ms 200 --gen-cmd")
@@ -191,7 +190,7 @@ EOF
                " --size 64 --local-port 40000")
         for i in range(z.SENDERS):
             self.assertEqual(calls[2 + 4 * i: 6 + 4 * i], [
-                f"ssh -F {self.tmp}/var/ssh_config sender{i}", "sudo sh -c", "taskset -c 7 MIMALLOC=1", gen])
+                f"ssh -F {self.tmp}/var/ssh_config sender{i}", "sudo sh -c", "taskset -c 7", gen])
         self.assertEqual(len(calls), 2 + 4 * z.SENDERS)
         with open(os.path.join(self.tmp, "var", f"{TCP}.jsonl")) as f:
             self.assertEqual(json.loads(f.read())["kind"], "summary")

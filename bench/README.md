@@ -43,9 +43,11 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or any sweep
   generator-bound. Python stdlib only; tests: `python3 bench/test_report.py`.
 
-Protocols: UDP, TCP, ws:// (no TLS). The binary's global allocator is mimalloc;
-`MIMALLOC_ALLOW_LARGE_OS_PAGES=1` puts its heap on large pages. Message: step u32, sender u32, seq u64,
-scheduled ns u64 (24 B header), then padding.
+Protocols: UDP, TCP, ws:// (no TLS). The binary's global allocator is mimalloc. AWS receiver and sender
+launches explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding an inherited value so mimalloc
+does not take DPDK's reserved HugeTLB pages. Mimalloc's transparent hugepage support stays at its default;
+THP backing is possible, not guaranteed. Message: step u32, sender u32, seq u64, scheduled ns u64 (24 B header),
+then padding.
 
 ## Local smoke
 
