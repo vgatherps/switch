@@ -227,7 +227,7 @@ impl UdpSet {
         self.slots[slot].socket = Some(UdpSocket {
             config,
             peer: None,
-            queue: VecDeque::with_capacity(config.rx_queue),
+            queue: VecDeque::new(),
             shared: RxShared::new(),
             stats: UdpSocketStats::default(),
             template: None,
