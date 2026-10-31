@@ -361,4 +361,31 @@ mod tests {
         assert_eq!(p.unsent_from(30), 0);
         assert!(!p.done());
     }
+
+    /// The send task stopped being polled at 10 µs (starved); the one poll at the cutoff tries
+    /// one budget's worth of the 20 overdue messages, and the rest is the generator's backlog.
+    /// Without that poll nothing would have been counted.
+    #[test]
+    fn a_starved_send_task_shows_its_backlog_at_the_cutoff_poll() {
+        let s = Schedule {
+            senders: 2,
+            interval_ns: 2000,
+            origin_ns: 0,
+        }; // one message per µs
+        let mut p = Pacer::new(s, 30, 8);
+        for now in (0..10_000).step_by(1000) {
+            p.begin(now);
+            while let Some(k) = p.next_try() {
+                p.result(k, Outcome::Sent);
+            }
+            p.finish(now);
+        }
+        assert_eq!(p.backlog_at_end(), 0, "not yet at the end");
+        p.begin(30_000);
+        while let Some(k) = p.next_try() {
+            p.result(k, Outcome::Sent);
+        }
+        p.finish(30_000);
+        assert_eq!(p.backlog_at_end(), 30 - 10 - 8);
+    }
 }

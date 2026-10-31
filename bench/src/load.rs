@@ -589,9 +589,12 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let ws = matches!(&*senders.borrow(), Senders::Ws(_));
     loop {
         let now = clock.now_ns();
-        if pacer.done() || now >= window[1] {
+        if pacer.done() {
             break;
         }
+        // the poll at or after the window's end is the last: it still tries what fell due in the
+        // window (one budget's worth), and what it cannot send is the generator's backlog
+        let last = now >= window[1];
         pacer.begin(now);
         while let Some(k) = pacer.next_try() {
             let (sender, seq) = schedule.split(k);
@@ -639,6 +642,9 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
             pacer.result(k, outcome);
         }
         pacer.finish(clock.now_ns());
+        if last {
+            break;
+        }
         switch::yield_now().await;
     }
     out.backlog_at_end = pacer.backlog_at_end();
