@@ -78,13 +78,14 @@
 //! scaling_active pressure/N, N = `PRESSURE_N`: a Stack sends at most
 //! `tx_pending` frames per turn. Its pending TX queue is flushed to the Port
 //! only at the start and end of a turn, so once it holds `tx_pending`
-//! frames smoltcp egress gets no transmit token and stops at the refusal,
-//! having visited slots from 0. (With the kit's default Ports the rings bind
-//! first: at most 15 frames leave a Stack per round, and the peer takes 8 per
-//! turn.) Here both Stacks have `tx_pending` and RX staging 64 and turn with
-//! budget 64, and the Ports take RX bursts of 64 with 128-slot rings, so
-//! `tx_pending` is the limit. N connections set up as above, with 1024-byte
-//! buffers; each client keeps 256 bytes queued, refilled once B has
+//! frames smoltcp egress gets no transmit token and stops at the refusal;
+//! sockets it did not reach stay queued, in order, for the next turn. (With
+//! the kit's default Ports the rings bind first: at most 15 frames leave a
+//! Stack per round, and the peer takes 8 per turn.) Here both Stacks have
+//! `tx_pending` and RX staging 64 and turn with budget 64, and the Ports take
+//! RX bursts of 64 with 128-slot rings, so `tx_pending` is the limit. N
+//! connections set up as above, with 1024-byte buffers; each client keeps
+//! 256 bytes queued, refilled once B has
 //! acknowledged them, so it sends them as one segment and B's window never
 //! closes. One turn: A's turn (takes the previous turn's 64 ACKs, sends
 //! exactly 64 segments, one from each of 64 clients), A→B, B's turn (takes
@@ -95,11 +96,11 @@
 //! the refilled bytes. After the bench an untimed window of
 //! `PRESSURE_TURNS` turns, reads checked the same way, counts segments per
 //! client and prints the min and max: fairness is reported, not asserted,
-//! beyond a positive total. Today's egress scan from slot 0 gives a fixed
-//! pattern: clients 0..63 send in one turn and 64..127 in the next, because
-//! a client refills only after the turn that brings its ACK, so in that
-//! turn its queue is empty and the scan passes it; 128..1023 never send.
-//! The line reads min 0, max 32, total 4096.
+//! beyond a positive total. All 1024 clients start queued in slot order and
+//! each turn sends the next 64 in the queue; a client rejoins at the back
+//! when it refills, at the end of the turn after it sent, so the clients
+//! take turns. The line reads min 4, max 4, total 4096: every client sends 4
+//! segments in the 64 turns.
 //!
 //! scaling_churn remove_add_low/N, remove_add_high/N: `Stack::remove_tcp`
 //! then `Stack::add_tcp` of the same Closed socket, on a Stack whose N slots
