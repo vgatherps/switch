@@ -70,8 +70,8 @@ impl Wss {
         // tungstenite writes whole messages; rustls would stop taking plaintext at 64 KiB.
         server.set_buffer_limit(None);
         let mut w = Wss {
-            rx: WsRx::new(TlsRx::new(), Config::new(Role::Client)),
-            tx: TxCore::new(tx, &Config::new(Role::Client)),
+            rx: WsRx::new(TlsRx::new(), Config::new(Role::Client, Limits::default())),
+            tx: TxCore::new(tx, &Config::new(Role::Client, Limits::default())),
             wire,
             server: WebSocket::from_raw_socket(ServerIo(server), TRole::Server, None),
             server_done: false,

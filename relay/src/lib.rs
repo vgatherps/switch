@@ -23,5 +23,5 @@ pub mod switchnet;
 #[cfg(test)]
 mod tests;
 
-pub use rx::{Kind, Message, ProtocolError};
+pub use rx::{Kind, Limits, Message, ProtocolError};
 pub use upgrade::UpgradeError;

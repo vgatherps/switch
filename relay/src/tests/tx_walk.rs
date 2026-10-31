@@ -72,7 +72,7 @@ struct Walk<const TLS: bool> {
 
 impl<const TLS: bool> Walk<TLS> {
     fn new() -> Self {
-        let (c, log) = mock::<TLS>(&Config::new(Role::Server), ROOM);
+        let (c, log) = mock::<TLS>(&Config::new(Role::Server, Limits::default()), ROOM);
         Walk { c, log, first: None, seals_at_death: None, attempts: 0, accepted: Vec::new() }
     }
 

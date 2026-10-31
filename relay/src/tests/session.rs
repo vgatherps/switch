@@ -111,7 +111,7 @@ type MockSession<const TLS: bool> = Session<Raw<LiveFrame, MockTx<TLS>>, MockTx<
 /// A server-role connection over the send mock of shape `TLS` (its close record and own
 /// records) and a gated input of unencrypted frames.
 fn shaped<const TLS: bool>() -> (MockSession<TLS>, Rc<RefCell<Log>>, Inputs) {
-    let config = Config::new(Role::Server);
+    let config = Config::new(Role::Server, Limits::default());
     let (tx, log) = mock::<TLS>(&config, ROOM);
     let input = Inputs::default();
     (Session::new(WsRx::new(Raw::new(), config), tx, MockInput(input.clone())), log, input)
@@ -125,7 +125,7 @@ fn raw() -> (RawSession, Rc<RefCell<Log>>, Inputs) {
 /// A wss:// client connection after the handshake; the rustls server, and what the client
 /// sent.
 fn tls() -> (TlsSession, ServerConnection, Wire, Inputs) {
-    let config = Config::new(Role::Client);
+    let config = Config::new(Role::Client, Limits::default());
     let Peer { tx, wire, server } = connect();
     let input = Inputs::default();
     let session = Session::new(WsRx::new(TlsRx::new(), config), TxCore::new(tx, &config), MockInput(input.clone()));
@@ -545,7 +545,7 @@ impl<R: PlainRx> PlainRx for Counted<R> {
 /// TLS each parse is a rustls call.)
 #[test]
 fn send_only_wakes_do_not_parse_again() {
-    let config = Config::new(Role::Server);
+    let config = Config::new(Role::Server, Limits::default());
     let (mut tx, log) = mock::<false>(&config, ROOM);
     let input = Inputs::default();
     log.borrow_mut().room = Some(ROOM);

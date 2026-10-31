@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use relay::Kind;
+use relay::{Kind, Limits};
 use relay::switchnet::{Error as WssError, Ws, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
@@ -110,7 +110,7 @@ fn wss_run<T: Send + 'static, F: Future<Output = Wss> + 'static>(
         listener_setup,
         |stream, config| serve(StreamOwned::new(ServerConnection::new(config).unwrap(), stream)),
         |handle, stream, config| async move {
-            let wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            let wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
             client(wss).await
         },
         each_round,
@@ -187,7 +187,7 @@ fn wss_until_client<T: Send + 'static, F: Future<Output = Wss> + 'static>(
         |_| {},
         move |stream| serve(upgrade(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), stream)).into_inner()),
         move |handle, stream| async move {
-            let wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            let wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
             client(wss).await
         },
     )
@@ -204,7 +204,7 @@ fn ws_until_client<T: Send + 'static, F: Future<Output = Ws> + 'static>(
         listener_setup,
         move |stream| serve(tungstenite::accept(stream).expect("server WebSocket handshake").into_inner()),
         move |handle, stream| async move {
-            let ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
             client(ws).await
         },
     )
@@ -840,7 +840,7 @@ fn wss_receive_error_sends_the_alert_and_fin() {
             read_alert(&mut tls.conn, &mut tls.sock)
         },
         |handle, stream| async move {
-            let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
             match wss.recv().await {
                 Err(WssError::Failed(relay::switchnet::Failure::Tls(sheath::Error::Tls(rustls::Error::DecryptError)))) => {}
                 Err(e) => panic!("unexpected error {e}"),
@@ -910,7 +910,7 @@ fn plain_ws_echoes_and_closes() {
             echo(ws)
         },
         |handle, stream, _| async move {
-            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
             for i in 0..100 {
                 let sent = text(i, message_len(i));
                 ws.send(Kind::Text, sent.as_bytes()).await.expect("send");
@@ -965,7 +965,7 @@ fn ws_connect_with_another_nets_handle_is_refused() {
                     .unwrap();
                 assert!(status.success(), "ip address del");
                 let handle = other.handle();
-                let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH));
+                let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()));
                 let polled = connecting.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
                 assert!(
                     matches!(polled, std::task::Poll::Ready(Err(WssError::Config(relay::switchnet::SetupError::ForeignHandle)))),
@@ -987,9 +987,9 @@ fn send_buffer_below_the_largest_control_frame_is_refused() {
         let tap = tap_with_send_buffer(tx);
         until_client_on(&tap, |_| {}, sees_nothing, move |handle, stream| async move {
             let got = if tls {
-                connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.map(drop)
+                connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.map(drop)
             } else {
-                connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.map(drop)
+                connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.map(drop)
             };
             let want = relay::switchnet::SetupError::RoomTooSmall { room: tx, need };
             assert!(matches!(got, Err(WssError::Config(e)) if e == want), "tls {tls}: {got:?}");
@@ -1021,7 +1021,7 @@ fn largest_control_frames_fit_a_131_byte_send_buffer() {
             }
         },
         move |handle, stream| async move {
-            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
             // the ping is answered inside recv, which then waits for a message: bound it
             assert!(within_rounds(2000, ws.recv()).await.is_none(), "a message besides the ping");
             ws.close(1000, &reason).await.expect("close");
@@ -1072,7 +1072,7 @@ fn reset_while_setup_waits_for_a_frame_is_dead() {
     let (go_tx, go_rx) = mpsc::channel();
     until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
         let held = take_every_frame(&handle).await;
-        let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH));
+        let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()));
         assert!(within_rounds(50, connecting.as_mut()).await.is_none(), "setup without a frame");
         go_tx.send(()).unwrap();
         let got = within_rounds(20_000, connecting).await.expect("setup still waiting after the reset");
@@ -1093,7 +1093,7 @@ fn reset_while_send_waits_for_a_frame_fails_the_send() {
             reset_when_told(go_rx)(ws.into_inner())
         },
         move |handle, stream| async move {
-            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
             let held = take_every_frame(&handle).await;
             {
                 let mut sending = std::pin::pin!(ws.send(Kind::Text, b"stuck"));
@@ -1181,7 +1181,7 @@ fn a_large_send_waits_for_frames_then_completes() {
             }
         },
         |handle, stream| async move {
-            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
             let held = take_every_frame(&handle).await;
             let total = held.len();
             {
@@ -1268,7 +1268,7 @@ fn wss_with_a_small_max_fragment_size_echoes() {
         |_| {},
         move |stream| echo(upgrade(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), stream))),
         move |handle, stream| async move {
-            let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.expect("wss connect");
+            let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
             let payload: Vec<u8> = (0..1384).map(|i| i as u8).collect();
             wss.send(Kind::Binary, &payload).await.expect("send");
             let got = wss.recv().await.expect("recv").expect("the echo");
@@ -1287,7 +1287,7 @@ fn wss_with_a_small_max_fragment_size_echoes() {
 fn wss_with_a_fragment_limit_below_a_control_frame_is_refused() {
     let (_, client_tls) = tls_configs_with_fragment(64);
     until_client(|_| {}, sees_nothing, move |handle, stream| async move {
-        let got = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH).await.map(drop);
+        let got = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.map(drop);
         let want = relay::switchnet::SetupError::RoomTooSmall { room: 59 + 76, need: 131 + 76 };
         assert!(matches!(got, Err(WssError::Config(e)) if e == want), "{got:?}");
     });
@@ -1324,7 +1324,7 @@ fn fin_then(reset: bool, lingering: bool) -> Result<(), WssError> {
             }
         },
         move |handle, stream| async move {
-            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH).await.expect("ws connect");
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
             while !client_taken_in.get() {
                 assert!(within_rounds(1, std::future::pending::<()>()).await.is_none());
             }
@@ -1373,4 +1373,34 @@ fn peer_fin_then_reset_without_a_close_is_dead() {
         let got = fin_then(true, lingering);
         assert!(matches!(got, Err(WssError::Failed(relay::switchnet::Failure::Dead))), "lingering {lingering}: {got:?}");
     }
+}
+
+/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB (within the
+/// default `max_frame`), followed by one byte, fails the connection with `MessageTooBig`
+/// (close code 1009) at the header, and FIN goes out. (Before, the limit could not be set:
+/// every connection took 64 MiB messages.)
+#[zhida_test_support::pinned_test]
+fn a_message_over_the_configured_limit_fails_at_its_header() {
+    let limits = Limits { max_message: 1 << 20, ..Limits::default() };
+    let rest = until_client(
+        |_| {},
+        |sock| {
+            let mut sock = tungstenite::accept(sock).expect("server WebSocket handshake").into_inner();
+            let mut frame = vec![0x82, 127];
+            frame.extend_from_slice(&(16u64 << 20).to_be_bytes());
+            frame.push(7);
+            sock.write_all(&frame).unwrap();
+            let mut rest = Vec::new();
+            sock.read_to_end(&mut rest).expect("FIN, not RST");
+            rest
+        },
+        move |handle, stream| async move {
+            let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, limits).await.expect("ws connect");
+            let got = ws.recv().await.map(|m| m.is_some());
+            let Err(WssError::Failed(relay::switchnet::Failure::Protocol(e))) = got else { panic!("{got:?}") };
+            assert_eq!((e, e.close_code()), (relay::ProtocolError::MessageTooBig, 1009));
+            ws
+        },
+    );
+    assert_eq!(rest, b"", "a close frame after a protocol error");
 }

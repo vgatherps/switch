@@ -13,7 +13,7 @@ use std::process;
 use std::rc::Rc;
 use std::time::Duration;
 
-use relay::Kind;
+use relay::{Kind, Limits};
 use relay::switchnet::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
 use switch::{Runtime, Spawner};
 use switchnet::{
@@ -298,7 +298,7 @@ async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally
         let n = tally.borrow().connections;
         tally.borrow_mut().connections += 1;
         let session = async {
-            let mut ws = accept_ws(handle, stream).await.map_err(Why::Upgrade)?;
+            let mut ws = accept_ws(handle, stream, Limits::default()).await.map_err(Why::Upgrade)?;
             Ok(echo(&mut ws, &mut buf).await)
         };
         let ending = within(spawner, deadline, session).await.unwrap_or(Err(Why::Deadline(deadline)));
@@ -351,7 +351,7 @@ async fn connection(handle: &NetHandle, n: usize, path: &str, cases: usize, buf:
     let local = IpListenEndpoint { addr: None, port };
     let connecting = handle.tcp_connect(SOCKET, remote, local).map_err(Why::Open)?;
     let stream = connecting.await.map_err(Why::NotEstablished)?;
-    let mut ws = connect_ws(handle, stream, &TESTER_IP.to_string(), FUZZINGSERVER_PORT, path).await.map_err(Why::Upgrade)?;
+    let mut ws = connect_ws(handle, stream, &TESTER_IP.to_string(), FUZZINGSERVER_PORT, path, Limits::default()).await.map_err(Why::Upgrade)?;
     if (1..=cases).contains(&n) {
         return Ok(echo(&mut ws, buf).await);
     }

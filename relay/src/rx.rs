@@ -12,9 +12,11 @@ pub enum Role {
     Server,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Config {
-    pub role: Role,
+/// A connection's size limits. A received frame or message over its limit fails the connection
+/// (`MessageTooBig`/`FrameTooBig`, close code 1009); a send over `max_send` is refused. The
+/// receive buffer grows only with bytes received, up to `max_message`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
     /// Largest frame payload accepted.
     pub max_frame: usize,
     /// Largest message accepted.
@@ -23,10 +25,22 @@ pub struct Config {
     pub max_send: usize,
 }
 
-impl Config {
+impl Default for Limits {
     /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way).
-    pub fn new(role: Role) -> Config {
-        Config { role, max_frame: 16 << 20, max_message: 64 << 20, max_send: 64 << 20 }
+    fn default() -> Limits {
+        Limits { max_frame: 16 << 20, max_message: 64 << 20, max_send: 64 << 20 }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub role: Role,
+    pub limits: Limits,
+}
+
+impl Config {
+    pub fn new(role: Role, limits: Limits) -> Config {
+        Config { role, limits }
     }
 }
 
@@ -340,7 +354,6 @@ impl Core {
                 if len > self.max_message - self.scratch.len() {
                     return Err(ProtocolError::MessageTooBig);
                 }
-                grow(&mut self.scratch, len, self.max_message);
                 Body::Scratch
             }
             Op::Text | Op::Binary => {
@@ -440,7 +453,6 @@ impl Core {
                         return Ok((pos, None));
                     }
                     self.scratch.clear();
-                    grow(&mut self.scratch, f.left, self.max_message);
                     self.msg = Some(Msg { kind, stamp: self.hdr_stamp });
                     f.body = Body::Scratch;
                     self.frame = Some(f);
@@ -453,6 +465,9 @@ impl Core {
                     if msg.kind == Kind::Text && self.utf8.feed(piece).is_err() {
                         return Err(ProtocolError::InvalidUtf8.into());
                     }
+                    // grown by the bytes received, not the length a header claims (the header
+                    // checks kept the message within `max_message`)
+                    grow(&mut self.scratch, n, self.max_message);
                     self.scratch.extend_from_slice(piece);
                     pos += n;
                     f.left -= n;
@@ -496,8 +511,8 @@ impl<R: PlainRx> WsRx<R> {
             lower,
             core: Core {
                 role: config.role,
-                max_frame: config.max_frame,
-                max_message: config.max_message,
+                max_frame: config.limits.max_frame,
+                max_message: config.limits.max_message,
                 stop: None,
                 hdr: [0; 14],
                 hdr_len: 0,
@@ -692,7 +707,7 @@ mod tests {
     #[test]
     fn text_is_the_payload_validated_on_receipt() {
         let t = "a€𝄞b";
-        let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client));
+        let mut rx = WsRx::new(Raw::new(), Config::new(Role::Client, Limits::default()));
         rx.push(F(frame(0x81, t.as_bytes())));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), Some(t));
         assert!(rx.recv(&mut ()).unwrap().is_none());
@@ -711,7 +726,7 @@ mod tests {
     /// Doubling would pass `max_message`; capacity stops at it.
     #[test]
     fn scratch_capacity_never_exceeds_max_message() {
-        let cfg = Config { max_frame: 100, max_message: 1000, ..Config::new(Role::Client) };
+        let cfg = Config::new(Role::Client, Limits { max_frame: 100, max_message: 1000, ..Limits::default() });
         let mut rx = WsRx::new(Raw::new(), cfg);
         // 10 fragments of 100 B: capacity 0 -> 100 -> 200 -> 400 -> 800 -> 1000 (doubling alone: 1600).
         for i in 0..10 {
@@ -725,18 +740,17 @@ mod tests {
             assert_eq!(got, (i == 9).then_some(1000));
             assert!(rx.core.scratch.capacity() <= 1000, "{}", rx.core.scratch.capacity());
         }
-        assert_eq!(rx.core.scratch.capacity(), 1000);
 
-        // One frame spanning two pushes: the reservation is clamped too.
-        let cfg = Config { max_frame: 1000, max_message: 1000, ..Config::new(Role::Client) };
+        // One frame spanning two pushes: clamped too.
+        let cfg = Config::new(Role::Client, Limits { max_frame: 1000, max_message: 1000, ..Limits::default() });
         let mut rx = WsRx::new(Raw::new(), cfg);
         let mut wire = vec![0x82, 126];
         wire.extend_from_slice(&1000u16.to_be_bytes());
         wire.extend_from_slice(&[7; 1000]);
         rx.push(F(wire[..10].to_vec()));
         assert!(rx.recv(&mut ()).unwrap().is_none());
-        assert_eq!(rx.core.scratch.capacity(), 1000);
         rx.push(F(wire[10..].to_vec()));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes(), &[7; 1000][..]);
+        assert!(rx.core.scratch.capacity() <= 1000, "{}", rx.core.scratch.capacity());
     }
 }

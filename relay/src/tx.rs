@@ -232,7 +232,7 @@ impl<L: PlainTx> TxCore<L> {
         TxCore {
             lower,
             rng: (role == Role::Client).then(rand::make_rng),
-            max_send: config.max_send,
+            max_send: config.limits.max_send,
             unsent: None,
             out: Out::Idle,
             buf: Vec::new(),
