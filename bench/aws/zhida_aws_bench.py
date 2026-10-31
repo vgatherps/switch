@@ -162,7 +162,8 @@ def ssh_config(sender_ips):
     lines = []
     for i, ip in enumerate(sender_ips):
         lines += [f"Host sender{i}", f"    HostName {ip}"]
-    lines += ["Host *", "    User ec2-user", f"    IdentityFile {REMOTE}/id_run", "    BatchMode yes",
+    lines += ["Host *", "    User ec2-user", f"    IdentityFile {REMOTE}/id_run", "    IdentitiesOnly yes",
+              "    BatchMode yes",
               f"    UserKnownHostsFile {REMOTE}/known_hosts", "    StrictHostKeyChecking accept-new",
               "    ConnectTimeout 10", "    ServerAliveInterval 15"]
     return "\n".join(lines) + "\n"
@@ -412,7 +413,7 @@ class Host:
         self._run, self._sleep, self._clock = run, sleep, clock
 
     def _opts(self):
-        return ["-i", self.key, "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
+        return ["-i", self.key, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes",
                 "-o", f"UserKnownHostsFile={self.run_dir}/known_hosts", "-o", "ConnectTimeout=10",
                 "-o", "ServerAliveInterval=15"]
 

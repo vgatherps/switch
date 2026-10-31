@@ -91,6 +91,8 @@ probe passes, then sweep start (dispatching the first rate) and sweep end with t
 These milestones appear once per sweep, not once per rate. Stderr is also kept in each `.coord.log`;
 JSON results remain in `.jsonl`. A failed startup or clock check never claims synchronization.
 
+SSH/SCP and sender-to-sender SSH use `IdentitiesOnly` with the run key so unrelated ssh-agent keys
+do not exhaust the server's authentication attempts.
 The initial SSH reachability wait allows 600 s; if that deadline expires, its error includes the
 last SSH exit code and stderr (up to 2,000 characters).
 Host setup retries verification through the reboot and transient SSH failures for up to 900 s.
