@@ -365,6 +365,16 @@ fn turn_until(net: &mut Net, clock: &Clock, rt: &mut Runtime, mut done: impl FnM
 /// Spawns the feed task on `target()`, reading until its stop (the returned sender; dropping it
 /// stops the feed too).
 fn spawn_feed(net: &Net, rt: &Runtime, roots: RootCertStore, mss_cap: Option<u16>) -> (oneshot::Sender<()>, Outcome) {
+    spawn_feed_with_reset_check(net, rt, roots, mss_cap, || false)
+}
+
+fn spawn_feed_with_reset_check(
+    net: &Net,
+    rt: &Runtime,
+    roots: RootCertStore,
+    mss_cap: Option<u16>,
+    clock_reset: impl FnOnce() -> bool + 'static,
+) -> (oneshot::Sender<()>, Outcome) {
     let (stop, stop_rx) = oneshot::channel();
     let out = Outcome::default();
     let task = feed(
@@ -379,6 +389,7 @@ fn spawn_feed(net: &Net, rt: &Runtime, roots: RootCertStore, mss_cap: Option<u16
         None,
         stop_rx,
         out.clone(),
+        clock_reset,
     );
     rt.spawner().spawn(task).expect("spawn the feed");
     (stop, out)
@@ -554,6 +565,69 @@ fn feed_reads_tickers_answers_ping_and_closes() {
         assert!(saw.pong, "server did not receive Pong(keepalive)");
         assert!(saw.close, "server did not receive the client's Close");
         assert!(saw.error.is_none(), "server failed: {:?}", saw.error);
+    });
+}
+
+/// Run the actual feed in a child so the assertion checks its emitted latency line, not just
+/// a formatting helper. The reset is synchronous; no clock thread or timing race is needed.
+#[zhida_test_support::pinned_test]
+fn reset_after_last_clock_poll_suppresses_feed_histogram() {
+    const CHILD: &str = "BINANCE_FEED_RESET_REPORT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact", "reset_after_last_clock_poll_suppresses_feed_histogram",
+                "--nocapture", "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the feed reset regression");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        let lines: Vec<_> = stdout.lines()
+            .filter(|line| line.starts_with("test: feed_latency:"))
+            .collect();
+        assert_eq!(lines, ["test: feed_latency: latency invalid: NIC clock jumped"], "{stdout}");
+        return;
+    }
+
+    with_net(&[], None, |net, clock, listener| {
+        let (server_tls, roots) = server_config();
+        let (texts, _) = tickers();
+        let flushed = Arc::new(AtomicBool::new(false));
+        let plan = ServerPlan::Tickers(texts, flushed.clone());
+        let server = thread::spawn(move || serve(listener, server_tls, plan));
+        let resets = dpdk_smoltcp::port_resets();
+        let mut rt = Runtime::new(clock.ms());
+        let (stop, out) = spawn_feed_with_reset_check(
+            net, &rt, roots, None,
+            move || dpdk_smoltcp::port_resets() != resets,
+        );
+        // Give the feed its messages, but leave the read pending until the explicit stop.
+        turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
+        let sent = clock.ms();
+        turn_until(net, clock, &mut rt, || clock.ms() >= sent + 200);
+        assert!(out.take().is_none(), "the feed must not have reported yet");
+        assert_eq!(dpdk_smoltcp::port_resets(), resets, "last clock poll sees no reset");
+        assert!(!nic_clock::jumped(), "the clock mapper has not observed a jump");
+
+        with_eal(|eal| {
+            let mut pair = zhida_test_kit::pair::new_pair(eal, ["bncra", "bncrb"]);
+            let port = dpdk_smoltcp::port_by_name(eal, "net_ring_bncrb").unwrap();
+            assert_eq!(unsafe { zhida_dpdk_sys::rte_eth_dev_stop(port) }, 0);
+            pair.b.raise_reset();
+            let now = pair.now();
+            pair.b.turn(now, INGRESS_BUDGET).expect("recover the reset port");
+            assert_eq!(dpdk_smoltcp::port_resets(), resets + 1);
+            pair.close();
+        });
+
+        let _ = stop.send(());
+        let (summary, result) = finish(net, clock, &mut rt, &out);
+        result.expect("feed reads and closes after reset");
+        assert_eq!(summary, read_all_twelve());
+        let saw = join(server);
+        assert!(saw.close && saw.error.is_none(), "server close {} error {:?}", saw.close, saw.error);
     });
 }
 

@@ -341,6 +341,8 @@ pub type Outcome = Rc<Cell<Option<(Summary, Result<(), FeedError>)>>>;
 /// feed_message for the first `print` updates, feed_count, feed_latency, feed_update_ids, then
 /// feed_close or feed_close_error; feed_stopped if `stop` finished before the connect did. Puts
 /// what it read and the read error, else the connect or close error, into `out`.
+/// `clock_reset` is called once, immediately before reporting latency, to synchronously detect
+/// a device reset during the measurement. A reset or mapper jump suppresses the histogram.
 #[allow(clippy::too_many_arguments)]
 #[switch::task]
 pub async fn feed(
@@ -355,6 +357,7 @@ pub async fn feed(
     read_for: Option<Duration>,
     mut stop: oneshot::Receiver<()>,
     out: Outcome,
+    clock_reset: impl FnOnce() -> bool + 'static,
 ) {
     let mut summary = Summary::default();
     let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT);
@@ -373,11 +376,7 @@ pub async fn feed(
                 None => reading.await,
             };
             line(name, "feed_count", summary.count);
-            if nic_clock::jumped() {
-                line(name, "feed_latency", "latency invalid: NIC clock jumped");
-            } else {
-                line(name, "feed_latency", summary.latencies);
-            }
+            let _ = write_latency(&mut io::stdout(), name, summary.latencies, clock_reset);
             match summary.update_ids {
                 Some((first, last)) => line(name, "feed_update_ids", format_args!("{first}..{last}")),
                 None => line(name, "feed_update_ids", "none"),
@@ -396,6 +395,19 @@ pub async fn feed(
 
 fn line(name: &str, key: &str, value: impl fmt::Display) {
     let _ = writeln!(io::stdout(), "{name}: {key}: {value}");
+}
+
+fn write_latency(
+    out: &mut impl io::Write,
+    name: &str,
+    latencies: Latencies,
+    clock_reset: impl FnOnce() -> bool,
+) -> io::Result<()> {
+    if clock_reset() || nic_clock::jumped() {
+        writeln!(out, "{name}: feed_latency: latency invalid: NIC clock jumped")
+    } else {
+        writeln!(out, "{name}: feed_latency: {latencies}")
+    }
 }
 
 /// Reads updates into `summary` until `stop` finishes, printing the first `print`; messages
@@ -477,6 +489,19 @@ mod tests {
         assert_eq!(
             latencies.to_string(),
             "no_stamp=0 not_ready=0 impossible=1 max_bound_ns=40 <=0:2 8192..16384:5 1073741824..:1"
+        );
+    }
+
+    #[test]
+    fn local_tap_without_hardware_timestamps_keeps_no_stamp_report() {
+        let mut latencies = Latencies::default();
+        latencies.record(0);
+        latencies.record(0);
+        let mut output = Vec::new();
+        write_latency(&mut output, "test", latencies, || false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "test: feed_latency: no_stamp=2 not_ready=0 impossible=0 max_bound_ns=0\n"
         );
     }
 }
