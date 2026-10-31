@@ -840,6 +840,7 @@ dependencies = [
  "mimalloc",
  "nic-clock",
  "sockperf-wire",
+ "switch",
  "switchnet",
  "zhida-dpdk-sys",
  "zhida-netconf",

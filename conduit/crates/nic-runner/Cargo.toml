@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 binance-feed.workspace = true
 nic-clock.workspace = true
+switch.workspace = true
 switchnet.workspace = true
 zhida-open.workspace = true
 zhida-netconf.workspace = true

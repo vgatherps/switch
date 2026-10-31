@@ -689,21 +689,23 @@ client sends the WebSocket close, TLS close_notify and FIN, and reads until the 
 Example output:
 
 ```text
-binance-feed: stream.binance.com resolved to 54.65.198.96 by the kernel resolver
-binance-tester: ready: Zhida 192.0.2.2, gateway 192.0.2.1 on cdtap_echo, NAT out of eth0; running 30 s
-binance-feed: connected to wss://stream.binance.com:9443/ws/btcusdt@bookTicker (54.65.198.96:9443) from 192.0.2.2:57223 over Zhida, TLS 1.3, WebSocket open
-#1 u=102034499541 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95972000
-#2 u=102034499542 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95772000
-#3 u=102034499545 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95779000
-#4 u=102034499553 BTCUSDT bid 80192.90000000 x 7.58537000 ask 80192.91000000 x 1.95779000
-#5 u=102034499558 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95779000
-#6 u=102034499559 BTCUSDT bid 80192.90000000 x 7.58537000 ask 80192.91000000 x 1.95779000
-#7 u=102034499564 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95779000
-#8 u=102034499569 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95579000
-#9 u=102034499570 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95379000
-#10 u=102034499571 BTCUSDT bid 80192.90000000 x 7.95695000 ask 80192.91000000 x 1.95400000
-binance-feed: 916 bookTicker messages in 30.1 s since start, update ids 102034499541..102034503110
-binance-feed: closed (WebSocket close handshake, TLS close_notify, FIN)
+binance-feed: stream.binance.com resolved to 13.113.186.162 by the kernel resolver
+binance-tester: ready: Zhida 192.0.2.2, gateway 192.0.2.1 on cdtap_echo, NAT out of eth0; running 10 s
+binance-feed: feed_connected: wss://stream.binance.com:9443/ws/btcusdt@bookTicker local_port=61620 TLS 1.3
+binance-feed: feed_message: #1 u=102142966886 BTCUSDT bid 77506.56000000 x 1.20989000 ask 77506.57000000 x 2.02236000
+binance-feed: feed_message: #2 u=102142966948 BTCUSDT bid 77506.56000000 x 1.20989000 ask 77506.57000000 x 2.02212000
+binance-feed: feed_message: #3 u=102142966953 BTCUSDT bid 77506.56000000 x 1.20989000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #4 u=102142966963 BTCUSDT bid 77506.56000000 x 1.20935000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #5 u=102142966971 BTCUSDT bid 77506.56000000 x 1.20897000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #6 u=102142966980 BTCUSDT bid 77506.56000000 x 1.20986000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #7 u=102142966981 BTCUSDT bid 77506.56000000 x 1.20970000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #8 u=102142966982 BTCUSDT bid 77506.56000000 x 1.20978000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #9 u=102142966983 BTCUSDT bid 77506.56000000 x 1.20962000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_message: #10 u=102142967031 BTCUSDT bid 77506.56000000 x 1.30112000 ask 77506.57000000 x 2.01645000
+binance-feed: feed_count: 145
+binance-feed: feed_latency: no_stamp=145 not_ready=0 impossible=0 max_bound_ns=0
+binance-feed: feed_update_ids: 102142966886..102142968048
+binance-feed: feed_close: WebSocket close handshake, TLS close_notify, FIN
 ```
 
 `make test-binance` (part of `make test`) runs the same client offline: a kernel TCP rustls +

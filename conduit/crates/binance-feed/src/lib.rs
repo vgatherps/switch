@@ -3,10 +3,10 @@
 //! milliseconds ([`Clock::ms`]).
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
-use std::io::Read as _;
+use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,11 +15,8 @@ use std::time::{Duration, Instant as WallInstant};
 use relay::switchnet::{Error as WsError, Wss};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
-use switch::{oneshot, Runtime, RuntimeError, Spawner};
-use switchnet::{
-    first, tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetHandle, OpenError, RoundError,
-    StackError,
-};
+use switch::{oneshot, Spawner};
+use switchnet::{first, tcp, Instant, IpEndpoint, IpListenEndpoint, NetHandle, OpenError};
 
 pub const INGRESS_BUDGET: usize = 32;
 /// The feed's defaults, shared by binance-feed and `zhida-nic feed`. The host speaks TLS 1.3;
@@ -186,8 +183,6 @@ pub enum FeedError {
     Binary,
     /// The server closed the WebSocket with this status and reason (its close was echoed).
     ServerClosed { code: u16, reason: String },
-    Stack(StackError),
-    Runtime(RuntimeError),
 }
 
 impl fmt::Display for FeedError {
@@ -214,74 +209,11 @@ impl fmt::Display for FeedError {
             Self::Parse { text, error } => write!(f, "not a bookTicker message ({error}): {text}"),
             Self::Binary => write!(f, "unexpected WebSocket binary message"),
             Self::ServerClosed { code, reason } => write!(f, "server closed the WebSocket: {code} {reason}"),
-            Self::Stack(error) => write!(f, "Zhida stack: {error}"),
-            Self::Runtime(error) => write!(f, "switch runtime: {error:?}"),
         }
     }
 }
 
 impl std::error::Error for FeedError {}
-
-/// Runs `client(handle, spawner, stop)` as a switch task on a new Runtime, turning `net` until it
-/// finishes, and returns its output. `stop` finishes once `should_stop()`, asked each round,
-/// first returns true. A round that moved nothing sleeps until the Stack's next timer, at most
-/// `idle_sleep`; `None` busy-polls. The Runtime is shut down before this returns, dropping the
-/// task if a turn failed.
-pub fn run<T: 'static, F: Future<Output = T> + 'static>(
-    net: &mut Net,
-    clock: &Clock,
-    idle_sleep: Option<Duration>,
-    mut should_stop: impl FnMut() -> bool,
-    client: impl FnOnce(NetHandle, Spawner, oneshot::Receiver<()>) -> F,
-) -> Result<T, FeedError> {
-    let mut rt = Runtime::new(clock.ms());
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let done = Rc::new(RefCell::new(None));
-    let slot = done.clone();
-    let future = client(net.handle(), rt.spawner(), stop_rx);
-    let task = switchnet::boxed(Box::pin(
-        async move { *slot.borrow_mut() = Some(future.await) },
-    ));
-    rt.spawner()
-        .spawn(task)
-        .map_err(|error| FeedError::Runtime(error.reason))?;
-    let mut stop_tx = Some(stop_tx);
-    let result = loop {
-        if let Some(out) = done.borrow_mut().take() {
-            break Ok(out);
-        }
-        let now = clock.now();
-        match switchnet::round(net, &mut rt, now, clock.ms()) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Some(max) = idle_sleep {
-                    sleep_until_timer(net, now, max);
-                }
-            }
-            Err(error) => {
-                break Err(match error {
-                    RoundError::Stack(error) => FeedError::Stack(error),
-                    RoundError::Runtime(error) => FeedError::Runtime(error),
-                });
-            }
-        }
-        if stop_tx.is_some() && should_stop() {
-            let _ = stop_tx.take().expect("checked above").send(());
-        }
-    };
-    rt.shutdown();
-    result
-}
-
-/// Sleeps until `net`'s next Stack timer after `now`, at most `max`; not at all if it is due.
-fn sleep_until_timer(net: &mut Net, now: Instant, max: Duration) {
-    let sleep = match net.poll_at() {
-        None => max,
-        Some(at) if at <= now => return,
-        Some(at) => Duration::from_micros((at - now).total_micros()).min(max),
-    };
-    std::thread::sleep(sleep);
-}
 
 /// `work`, or `Timeout { step, limit }` once `limit` passed; dropping `work` drops what it holds.
 async fn within<T>(
@@ -305,7 +237,7 @@ pub async fn connect(
     tls: Arc<ClientConfig>,
     local_port: u16,
     limit: Duration,
-) -> Result<Feed, FeedError> {
+) -> Result<Wss, FeedError> {
     let open = async {
         let remote = IpEndpoint::new((*target.addr.ip()).into(), target.addr.port());
         let local = IpListenEndpoint {
@@ -331,55 +263,14 @@ pub async fn connect(
         )
         .await
         .map_err(FeedError::Ws)?;
-        Ok(Feed(wss, Latencies::default()))
+        Ok(wss)
     };
     within(spawner, "TCP, TLS and WebSocket connect", limit, open).await
 }
 
-pub struct Feed(Wss, Latencies);
-
-impl Feed {
-    /// Hands the next update to `on` and returns what it returns, or `None` once `stop`
-    /// finishes; messages already received come first. Server pings are answered inside. The
-    /// update borrows the received message, so it is only lent to `on`.
-    pub async fn next<R>(
-        &mut self,
-        stop: impl Future,
-        on: impl FnOnce(&BookTicker<'_>) -> R,
-    ) -> Result<Option<R>, FeedError> {
-        first(self.recv(on), stop).await.transpose()
-    }
-
-    async fn recv<R>(&mut self, on: impl FnOnce(&BookTicker<'_>) -> R) -> Result<R, FeedError> {
-        let Some(message) = self.0.recv().await.map_err(FeedError::Ws)? else {
-            let (code, reason) = self.0.peer_close().expect("recv returned None after the server's close");
-            return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
-        };
-        self.1.record(message.rx_timestamp());
-        let text = message.text().ok_or(FeedError::Binary)?;
-        let ticker = serde_json::from_str(text).map_err(|error| FeedError::Parse {
-            text: text.to_owned(),
-            error,
-        })?;
-        Ok(on(&ticker))
-    }
-
-    /// Sends the WebSocket close (1000) and reads until the server's close echo, dropping the
-    /// updates before it; relay then sends close_notify and FIN and returns once the server acked
-    /// them, so the Net may be dropped right after. All within `limit`.
-    pub async fn close(mut self, spawner: &Spawner, limit: Duration) -> Result<(), FeedError> {
-        let close = async {
-            self.0.close(1000, "").await.map_err(FeedError::Ws)?;
-            while self.0.recv().await.map_err(FeedError::Ws)?.is_some() {}
-            Ok(())
-        };
-        within(spawner, "WebSocket close", limit, close).await
-    }
-}
-
 /// What a feed saw: the updates read, their first and last update ids, and the latency of every
 /// message received.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Summary {
     pub count: u64,
     pub update_ids: Option<(u64, u64)>,
@@ -441,74 +332,114 @@ impl fmt::Display for Latencies {
     }
 }
 
-/// What [`stream`] reports as it goes, for the caller to print.
-#[derive(Debug)]
-pub enum Event<'a> {
-    /// TCP, TLS and WebSocket are open.
-    Connected,
-    /// Update number `count` (from 1).
-    Ticker { count: u64, ticker: &'a BookTicker<'a> },
-    /// Reading ended (stop, or an error returned after the close); the close starts.
-    Read(&'a Summary),
-    /// The close handshake finished: WebSocket close, TLS close_notify, FIN.
-    Closed,
-    /// The close failed after reading had failed; `stream` returns the read error.
-    CloseFailed(&'a FeedError),
-}
+/// Where [`feed`] puts what it read and its result.
+pub type Outcome = Rc<Cell<Option<(Summary, Result<(), FeedError>)>>>;
 
-/// The feed: connects (within `connect_limit`), reads updates until `stop` finishes or a read
-/// fails, then always attempts the close (within `close_limit`), after a failed read too.
-/// `Ok(None)` if `stop` finished before the connect did. A read error comes before a close error.
+/// The feed, as a switch task: connects within CONNECT_LIMIT, reads updates until `stop`
+/// finishes, `read_for` passed since the connect, or a read fails, then attempts the close within
+/// CLOSE_LIMIT, after a failed read too. Prints `{name}: {key}: {value}` lines: feed_connected,
+/// feed_message for the first `print` updates, feed_count, feed_latency, feed_update_ids, then
+/// feed_close or feed_close_error; feed_stopped if `stop` finished before the connect did. Puts
+/// what it read and the read error, else the connect or close error, into `out`.
 #[allow(clippy::too_many_arguments)]
-pub async fn stream(
-    handle: &NetHandle,
-    spawner: &Spawner,
-    target: &Target,
+#[switch::task]
+pub async fn feed(
+    handle: NetHandle,
+    spawner: Spawner,
+    target: Target,
     socket: tcp::Config,
     tls: Arc<ClientConfig>,
     local_port: u16,
-    connect_limit: Duration,
-    close_limit: Duration,
-    mut stop: impl Future + Unpin,
-    mut on: impl FnMut(Event<'_>),
-) -> Result<Option<Summary>, FeedError> {
-    let connecting = connect(handle, spawner, target, socket, tls, local_port, connect_limit);
-    let Some(mut feed) = first(connecting, &mut stop).await.transpose()? else {
-        return Ok(None);
-    };
-    on(Event::Connected);
-    let mut summary = Summary { count: 0, update_ids: None, latencies: Latencies::default() };
-    let read = loop {
-        let next = feed.next(&mut stop, |ticker| {
-            summary.count += 1;
-            let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
-            summary.update_ids = Some((first, ticker.update_id));
-            on(Event::Ticker { count: summary.count, ticker });
-        });
-        match next.await {
-            Ok(Some(())) => {}
-            Ok(None) => break Ok(()),
-            Err(error) => break Err(error),
+    name: &'static str,
+    print: usize,
+    read_for: Option<Duration>,
+    mut stop: oneshot::Receiver<()>,
+    out: Outcome,
+) {
+    let mut summary = Summary::default();
+    let connecting = connect(&handle, &spawner, &target, socket, tls, local_port, CONNECT_LIMIT);
+    let result = match first(connecting, &mut stop).await {
+        None => {
+            line(name, "feed_stopped", "before the feed connected");
+            Ok(())
+        }
+        Some(Err(error)) => Err(error),
+        Some(Ok(mut wss)) => {
+            let url = target.url();
+            line(name, "feed_connected", format_args!("{url} local_port={local_port} TLS 1.3"));
+            let reading = read(&mut wss, &mut stop, &mut summary, name, print);
+            let read = match read_for {
+                Some(limit) => switchnet::within(&spawner, limit, reading).await.unwrap_or(Ok(())),
+                None => reading.await,
+            };
+            line(name, "feed_count", summary.count);
+            if nic_clock::jumped() {
+                line(name, "feed_latency", "latency invalid: NIC clock jumped");
+            } else {
+                line(name, "feed_latency", summary.latencies);
+            }
+            match summary.update_ids {
+                Some((first, last)) => line(name, "feed_update_ids", format_args!("{first}..{last}")),
+                None => line(name, "feed_update_ids", "none"),
+            }
+            let closed = close(wss, &spawner).await;
+            match (&read, &closed) {
+                (_, Ok(())) => line(name, "feed_close", "WebSocket close handshake, TLS close_notify, FIN"),
+                (Err(_), Err(error)) => line(name, "feed_close_error", error),
+                (Ok(()), Err(_)) => {}
+            }
+            read.and(closed)
         }
     };
-    summary.latencies = feed.1;
-    on(Event::Read(&summary));
-    let closed = feed.close(spawner, close_limit).await;
-    match (read, closed) {
-        (Ok(()), Ok(())) => {
-            on(Event::Closed);
-            Ok(Some(summary))
-        }
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Ok(())) => {
-            on(Event::Closed);
-            Err(error)
-        }
-        (Err(error), Err(close)) => {
-            on(Event::CloseFailed(&close));
-            Err(error)
+    out.set(Some((summary, result)));
+}
+
+fn line(name: &str, key: &str, value: impl fmt::Display) {
+    let _ = writeln!(io::stdout(), "{name}: {key}: {value}");
+}
+
+/// Reads updates into `summary` until `stop` finishes, printing the first `print`; messages
+/// already received come first. Server pings are answered inside `recv`.
+async fn read(
+    wss: &mut Wss,
+    stop: &mut oneshot::Receiver<()>,
+    summary: &mut Summary,
+    name: &str,
+    print: usize,
+) -> Result<(), FeedError> {
+    loop {
+        let Some(received) = first(wss.recv(), &mut *stop).await else {
+            return Ok(());
+        };
+        let Some(message) = received.map_err(FeedError::Ws)? else {
+            let (code, reason) = wss.peer_close().expect("recv returned None after the server's close");
+            return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
+        };
+        summary.latencies.record(message.rx_timestamp());
+        let text = message.text().ok_or(FeedError::Binary)?;
+        let ticker: BookTicker = serde_json::from_str(text).map_err(|error| FeedError::Parse {
+            text: text.to_owned(),
+            error,
+        })?;
+        summary.count += 1;
+        let first = summary.update_ids.map_or(ticker.update_id, |(first, _)| first);
+        summary.update_ids = Some((first, ticker.update_id));
+        if summary.count <= print as u64 {
+            line(name, "feed_message", format_args!("#{} {ticker}", summary.count));
         }
     }
+}
+
+/// Sends the WebSocket close (1000) and reads until the server's close echo, dropping the updates
+/// before it; relay then sends close_notify and FIN and returns once the server acked them, so the
+/// Net may be dropped right after. All within CLOSE_LIMIT.
+async fn close(mut wss: Wss, spawner: &Spawner) -> Result<(), FeedError> {
+    let close = async {
+        wss.close(1000, "").await.map_err(FeedError::Ws)?;
+        while wss.recv().await.map_err(FeedError::Ws)?.is_some() {}
+        Ok(())
+    };
+    within(spawner, "WebSocket close", CLOSE_LIMIT, close).await
 }
 
 #[cfg(test)]
