@@ -34,6 +34,8 @@ members = [
     "sheath",
     # latency/load bench (plans/bench/design.md)
     "bench",
+    # NIC hardware RX stamp → now latency on the CPU's invariant counter
+    "nic-clock",
 ]
 exclude = ["conduit/vendor/smoltcp", "vendor/rustls"]
 
@@ -64,6 +66,7 @@ ceph-proto = { path = "cephalopod/crates/proto" }
 ceph-control = { path = "cephalopod/crates/control" }
 depot = { path = "depot" }
 dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
+nic-clock = { path = "nic-clock" }
 relay = { path = "relay" }
 sheath = { path = "sheath" }
 smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-features = false }

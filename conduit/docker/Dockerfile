@@ -8,17 +8,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 \
     && update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
 
+# ENA: read_clock (the device PHC, initialized when the device has one) and a missing read barrier
+# in the PHC read.
+COPY dpdk-ena-read-clock.patch /tmp/dpdk-ena-read-clock.patch
 RUN curl --fail --location --retry 2 -o /tmp/dpdk.tar.xz \
         https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz \
     && echo '3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490  /tmp/dpdk.tar.xz' | sha256sum --check \
     && mkdir /tmp/dpdk && tar -xJf /tmp/dpdk.tar.xz -C /tmp/dpdk --strip-components=1 \
+    && patch -d /tmp/dpdk -p1 < /tmp/dpdk-ena-read-clock.patch \
     && CC=clang meson setup /tmp/dpdk/build /tmp/dpdk \
         --buildtype=release --prefix=/opt/dpdk --libdir=lib \
         -Dplatform=generic -Denable_stdatomic=false -Dmbuf_refcnt_atomic=false \
         -Denable_iova_as_pa=true -Dtests=false -Ddisable_apps='*' \
         -Denable_drivers=net/ring,net/pcap,net/tap,net/memif,net/af_packet,net/ena,net/intel/ixgbe,net/intel/i40e,net/intel/ice \
     && ninja -C /tmp/dpdk/build && meson install -C /tmp/dpdk/build \
-    && rm -rf /tmp/dpdk /tmp/dpdk.tar.xz
+    && rm -rf /tmp/dpdk /tmp/dpdk.tar.xz /tmp/dpdk-ena-read-clock.patch
 
 COPY packetdrill-relearn-isn.patch /tmp/packetdrill-relearn-isn.patch
 RUN apt-get update && apt-get install -y --no-install-recommends flex bison patch \

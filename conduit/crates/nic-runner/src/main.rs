@@ -30,6 +30,15 @@ pub fn stopped() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
+/// Sets the flag when dropped, so a panicking feed still stops the clock thread its scope joins.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -228,13 +237,39 @@ fn run(args: Args) -> i32 {
         ),
         Mode::Feed(f) => {
             let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-            let result = feed::run(
-                &mut net,
-                f,
-                target.as_ref().unwrap(),
-                feed_socket.expect("feed mode has a socket"),
-                &clock,
-            );
+            // The clock thread reads the port's clock: the scope joins it before the port closes.
+            // Only ENA's clock is the RX stamps' clock (ice's read_clock is CLOCK_MONOTONIC_RAW).
+            let clock_cpus = if report.device.driver_name != "net_ena" {
+                Err("the driver is not net_ena".to_owned())
+            } else if nic::read_clock(port_id) == Err(-libc::ENOTSUP) {
+                Err("the device has no PHC".to_owned())
+            } else {
+                nic::housekeeping_cpus(report.cpu)
+            };
+            let stop_clock = AtomicBool::new(false);
+            let result = std::thread::scope(|scope| {
+                let _stop = SetOnDrop(&stop_clock);
+                match &clock_cpus {
+                    Ok(cpus) => {
+                        scope.spawn(|| {
+                            let ran = nic::pin(cpus).and_then(|()| {
+                                Ok(nic_clock::run(|| nic::read_clock(port_id).ok(), &stop_clock)?)
+                            });
+                            if let Err(e) = ran {
+                                line("nic_clock_error", e);
+                            }
+                        });
+                    }
+                    Err(why) => line("nic_clock", format_args!("none: {why}")),
+                }
+                feed::run(
+                    &mut net,
+                    f,
+                    target.as_ref().unwrap(),
+                    feed_socket.expect("feed mode has a socket"),
+                    &clock,
+                )
+            });
             stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
             result
         }

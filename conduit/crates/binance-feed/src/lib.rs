@@ -291,12 +291,12 @@ pub async fn connect(
         )
         .await
         .map_err(FeedError::Ws)?;
-        Ok(Feed(wss))
+        Ok(Feed(wss, Latencies::default()))
     };
     within(spawner, "TCP, TLS and WebSocket connect", limit, open).await
 }
 
-pub struct Feed(Wss);
+pub struct Feed(Wss, Latencies);
 
 impl Feed {
     /// The next update, or `None` once `stop` finishes; messages already received come first.
@@ -310,6 +310,7 @@ impl Feed {
             let (code, reason) = self.0.peer_close().expect("recv returned None after the server's close");
             return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
         };
+        self.1.record(message.rx_timestamp());
         let text = message.text().ok_or(FeedError::Binary)?;
         serde_json::from_str(text).map_err(|error| FeedError::Parse {
             text: text.to_owned(),
@@ -330,11 +331,68 @@ impl Feed {
     }
 }
 
-/// What a feed saw: the updates read and their first and last update ids.
+/// What a feed saw: the updates read, their first and last update ids, and the latency of every
+/// message received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Summary {
     pub count: u64,
     pub update_ids: Option<(u64, u64)>,
+    pub latencies: Latencies,
+}
+
+/// Per message: NIC RX stamp of the frame holding its first byte to relay handing it over
+/// (`nic_clock::since`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Latencies {
+    /// Messages without a NIC stamp.
+    pub no_stamp: u64,
+    /// Stamped messages while the clock mapping was not ready.
+    pub not_ready: u64,
+    /// Latencies below minus their bound: the stamp is after now, a bug. Never samples.
+    pub impossible: u64,
+    /// Samples by ns: bucket 0 holds ns <= 0, bucket i holds [2^(i-1), 2^i), bucket 31 holds
+    /// ns >= 2^30 (about 1.07 s).
+    pub buckets: [u64; 32],
+    /// The largest error bound of a sample.
+    pub max_bound_ns: u64,
+}
+
+impl Latencies {
+    fn record(&mut self, stamp: u64) {
+        if stamp == 0 {
+            self.no_stamp += 1;
+            return;
+        }
+        match nic_clock::since(stamp) {
+            None => self.not_ready += 1,
+            Some(latency) if latency.impossible() => self.impossible += 1,
+            Some(latency) => {
+                let bits = 64 - u64::try_from(latency.ns).unwrap_or(0).leading_zeros();
+                self.buckets[bits.min(31) as usize] += 1;
+                self.max_bound_ns = self.max_bound_ns.max(latency.bound_ns);
+            }
+        }
+    }
+}
+
+/// `no_stamp=N not_ready=N impossible=N max_bound_ns=N`, then `<=0:N`, `<lo>..<hi>:N` and
+/// `1073741824..:N` (ns) for each nonempty bucket.
+impl fmt::Display for Latencies {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no_stamp={} not_ready={} impossible={} max_bound_ns={}",
+            self.no_stamp, self.not_ready, self.impossible, self.max_bound_ns
+        )?;
+        for (i, &count) in self.buckets.iter().enumerate().filter(|(_, &count)| count > 0) {
+            match i {
+                0 => write!(f, " <=0:{count}")?,
+                31 => write!(f, " {}..:{count}", 1u64 << 30)?,
+                _ => write!(f, " {}..{}:{count}", 1u64 << (i - 1), 1u64 << i)?,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What [`stream`] reports as it goes, for the caller to print.
@@ -345,7 +403,7 @@ pub enum Event<'a> {
     /// Update number `count` (from 1).
     Ticker { count: u64, ticker: &'a BookTicker },
     /// Reading ended (stop, or an error returned after the close); the close starts.
-    Read(Summary),
+    Read(&'a Summary),
     /// The close handshake finished: WebSocket close, TLS close_notify, FIN.
     Closed,
     /// The close failed after reading had failed; `stream` returns the read error.
@@ -373,7 +431,7 @@ pub async fn stream(
         return Ok(None);
     };
     on(Event::Connected);
-    let mut summary = Summary { count: 0, update_ids: None };
+    let mut summary = Summary { count: 0, update_ids: None, latencies: Latencies::default() };
     let read = loop {
         match feed.next(&mut stop).await {
             Ok(Some(ticker)) => {
@@ -386,7 +444,8 @@ pub async fn stream(
             Err(error) => break Err(error),
         }
     };
-    on(Event::Read(summary));
+    summary.latencies = feed.1;
+    on(Event::Read(&summary));
     let closed = feed.close(spawner, close_limit).await;
     match (read, closed) {
         (Ok(()), Ok(())) => {
@@ -405,3 +464,30 @@ pub async fn stream(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::Latencies;
+
+    #[test]
+    fn latencies_count_unstamped_and_not_ready() {
+        // No clock thread runs in this process: every stamped message is not ready.
+        let mut latencies = Latencies::default();
+        latencies.record(0);
+        latencies.record(0);
+        latencies.record(1_700_000_000_000_000_000);
+        assert_eq!(latencies, Latencies { no_stamp: 2, not_ready: 1, ..Latencies::default() });
+    }
+
+    #[test]
+    fn latencies_print_nonempty_buckets() {
+        let mut latencies = Latencies { impossible: 1, max_bound_ns: 40, ..Latencies::default() };
+        latencies.buckets[0] = 2;
+        latencies.buckets[14] = 5;
+        latencies.buckets[31] = 1;
+        assert_eq!(
+            latencies.to_string(),
+            "no_stamp=0 not_ready=0 impossible=1 max_bound_ns=40 <=0:2 8192..16384:5 1073741824..:1"
+        );
+    }
+}

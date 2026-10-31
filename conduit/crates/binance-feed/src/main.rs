@@ -244,7 +244,7 @@ fn feed(
                 ),
                 Event::Ticker { count, ticker } if count <= print as u64 => writeln!(out, "#{count} {ticker}"),
                 Event::Ticker { .. } => Ok(()),
-                Event::Read(Summary { count, update_ids }) => {
+                Event::Read(Summary { count, update_ids, .. }) => {
                     let secs = start.elapsed().as_secs_f64();
                     match update_ids {
                         Some((first, last)) => writeln!(

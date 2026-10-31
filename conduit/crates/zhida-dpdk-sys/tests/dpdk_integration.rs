@@ -105,3 +105,25 @@ fn test_pool_create_and_alloc() {
     // Free the pool
     unsafe { rte_mempool_free(pool) };
 }
+
+/// rte_eth_read_clock (an experimental symbol) links, and a PMD without a clock (net_ring, like
+/// net_tap) refuses it: the app then starts no clock thread.
+#[zhida_test_support::pinned_test]
+fn read_clock_without_a_clock() {
+    assert!(ensure_eal_init(), "EAL init failed");
+    let mut clock = 0;
+    assert_eq!(unsafe { rte_eth_read_clock(u16::MAX, &mut clock) }, -libc::ENODEV);
+    let rings: Vec<_> = [c"read_clock_rx", c"read_clock_tx"]
+        .iter()
+        .map(|name| unsafe { rte_ring_create(name.as_ptr(), 8, -1, RING_F_SP_ENQ | RING_F_SC_DEQ) })
+        .collect();
+    assert!(rings.iter().all(|ring| !ring.is_null()));
+    let port = unsafe { rte_eth_from_rings(c"read_clock".as_ptr(), &rings[0], 1, &rings[1], 1, 0) };
+    assert!(port >= 0, "rte_eth_from_rings: {port}");
+    let port = port as u16;
+    assert_eq!(unsafe { rte_eth_read_clock(port, &mut clock) }, -(ENOTSUP as i32));
+    assert_eq!(unsafe { rte_eth_dev_close(port) }, 0);
+    for ring in rings {
+        unsafe { rte_ring_free(ring) };
+    }
+}

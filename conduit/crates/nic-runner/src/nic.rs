@@ -1,6 +1,6 @@
 use dpdk_smoltcp::smoltcp::{socket::tcp, wire::Ipv4Address};
 use dpdk_smoltcp::{Port, PortError, DEFAULT_NEIGHBOR_CAPACITY};
-use zhida_dpdk_sys::{rte_eth_stats, rte_eth_stats_get};
+use zhida_dpdk_sys::{rte_eth_read_clock, rte_eth_stats, rte_eth_stats_get};
 
 use crate::args::Mode;
 use crate::line;
@@ -96,13 +96,78 @@ pub fn close(port: Port, mut code: i32) -> i32 {
     code
 }
 
+/// The port's NIC clock (ENA: the PHC, ns), or rte_eth_read_clock's negative errno.
+pub fn read_clock(port_id: u16) -> Result<u64, i32> {
+    let mut clock = 0;
+    // SAFETY: the ethdev stays open while this runs (the clock thread is joined before the port
+    // closes) and `clock` is a writable output.
+    match unsafe { rte_eth_read_clock(port_id, &mut clock) } {
+        0 => Ok(clock),
+        error => Err(error),
+    }
+}
+
+/// The online CPUs not in /sys/devices/system/cpu/isolated (the hft host's housekeeping CPUs)
+/// other than `polling`; `Err` if there are none.
+pub fn housekeeping_cpus(polling: usize) -> Result<Vec<usize>, String> {
+    let read = |name| {
+        std::fs::read_to_string(format!("/sys/devices/system/cpu/{name}"))
+            .map_err(|e| format!("cpu/{name}: {e}"))
+    };
+    housekeeping(&read("online")?, &read("isolated")?, polling)
+}
+
+fn housekeeping(online: &str, isolated: &str, polling: usize) -> Result<Vec<usize>, String> {
+    let isolated_cpus = cpu_list(isolated)?;
+    let cpus: Vec<usize> = cpu_list(online)?
+        .into_iter()
+        .filter(|cpu| *cpu != polling && !isolated_cpus.contains(cpu))
+        .collect();
+    if cpus.is_empty() {
+        return Err(format!(
+            "no housekeeping CPU: online {}, isolated {}, polling {polling}",
+            online.trim(),
+            isolated.trim()
+        ));
+    }
+    Ok(cpus)
+}
+
+/// Moves the calling thread to `cpus` (as far as its cpuset allows them).
+pub fn pin(cpus: &[usize]) -> Result<(), String> {
+    // SAFETY: cpu_set_t is plain data; all-zero bytes are the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for &cpu in cpus {
+        // SAFETY: CPU_SET writes one bit of `set`; an index past CPU_SETSIZE panics.
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+    }
+    // SAFETY: `set` is initialized and its size passed; pid 0 is this thread.
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) } != 0 {
+        return Err(format!("sched_setaffinity {cpus:?}: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// A sysfs CPU list (`0-3,8,10-11`, empty for none).
+fn cpu_list(text: &str) -> Result<Vec<usize>, String> {
+    let number = |s: &str| s.parse::<usize>().map_err(|e| format!("CPU list {text:?}: {e}"));
+    let mut cpus = Vec::new();
+    for range in text.trim().split(',').filter(|range| !range.is_empty()) {
+        match range.split_once('-') {
+            Some((first, last)) => cpus.extend(number(first)?..=number(last)?),
+            None => cpus.push(number(range)?),
+        }
+    }
+    Ok(cpus)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
     use dpdk_smoltcp::smoltcp::socket::tcp;
 
-    use super::{feed_socket, sizing, STAGING, UDP_QUEUE};
+    use super::{cpu_list, feed_socket, housekeeping, sizing, STAGING, UDP_QUEUE};
     use crate::args::Args;
 
     fn parsed(args: &[&str]) -> Args {
@@ -182,6 +247,23 @@ mod tests {
         assert_eq!(feed_sizing.rx_share, uncapped);
         // Uncapped at MTU 9000: 256 KiB / 8960.
         assert_eq!(feed_sizing.frame_share, 30);
+    }
+
+    #[test]
+    fn cpu_lists() {
+        assert_eq!(cpu_list("0-3,8,10-11\n").unwrap(), [0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(cpu_list("5\n").unwrap(), [5]);
+        assert!(cpu_list("\n").unwrap().is_empty());
+        assert!(cpu_list("1-x").is_err());
+    }
+
+    #[test]
+    fn housekeeping_excludes_isolated_and_polling_cpus() {
+        assert_eq!(housekeeping("0-7\n", "6-7\n", 6).unwrap(), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(housekeeping("0-3\n", "\n", 2).unwrap(), [0, 1, 3]);
+        // Every CPU isolated, or the only one the polling CPU: no thread.
+        assert!(housekeeping("0-3\n", "0-3\n", 3).is_err());
+        assert!(housekeeping("0\n", "\n", 0).is_err());
     }
 
     fn test_config(mtu: u16, paths: &str) -> zhida_netconf::Config {
