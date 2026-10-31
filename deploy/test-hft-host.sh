@@ -32,10 +32,12 @@ stub systemctl "case \"\$1\" in is-enabled) [ -e '$tmp/enabled' ] ;; enable) tou
 stub pgrep "[ -e '$tmp/irqbalance' ]"
 stub mountpoint '[ "$1" = -q ] && shift; [ -e "$1/.mounted" ]'
 stub modinfo "[ \"\$*\" = '-F srcversion vfio_pci_core' ] && echo PATCHED; exit 0"
-# zhida-netconf: discover writes the config; check needs it; bind moves the data device to vfio-pci.
+# zhida-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
+# prints the field as the real one does, or fails without the file; bind moves the data device to
+# vfio-pci.
 stub zhida-netconf "case \"\$1\" in
-    discover) echo '{}' >\"\$6\" ;;
-    check) [ -f \"\$2\" ] ;;
+    discover) printf '{\\n  \"version\": 1,\\n  \"rx_timestamps\": false,\\n  \"descriptors\": 1024\\n}\\n' >\"\$6\" ;;
+    check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" ;;
     bind) ln -sfn ../../drivers/vfio-pci '$root/sys/bus/pci/devices/0000:00:06.0/driver' ;;
 esac"
 stub zhida-nic "echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489'"
@@ -123,6 +125,7 @@ check "management is the lowest-metric default route" env_has MGMT_IF=ens5
 check "data is the other ena interface" sh -c "grep -qx DATA_IF=ens6 '$root/etc/zhida/host.env' && grep -qx DATA_PCI=0000:00:06.0 '$root/etc/zhida/host.env'"
 check "the app CPU is the node's highest, alone isolated" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx ISOLATED=7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3,4,5,6 '$root/etc/zhida/host.env'"
 check "the config comes from zhida-netconf discover --aws on the data ENI" called "zhida-netconf discover --interface ens6 --aws -o $root/etc/zhida/dut.json"
+check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
 check "nothing touches an interface before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
 
@@ -160,7 +163,17 @@ run verify
 check "the last run's own report is what counts" has pools "ok last run took 23 of 512"
 : >"$calls"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance pins zhida-nic feed to the app CPU" called "taskset -c 7 zhida-nic --config $root/etc/zhida/dut.json feed --seconds 5"
+check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
+check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/binance.json"
+check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/zhida/binance.json' | cmp -s - '$root/etc/zhida/dut.json'"
+check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
+# A config whose rx_timestamps line is not netconf's format cannot be turned on: refuse.
+cp "$root/etc/zhida/dut.json" "$tmp/dut"
+printf '{"version": 1, "rx_timestamps": false}\n' >"$root/etc/zhida/dut.json"
+: >"$calls"
+HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "run-binance refuses when rx_timestamps cannot be set" sh -c "[ $? = 1 ] && grep -q 'not starting' '$tmp/out' && ! grep -q '^taskset' '$calls'"
+cp "$tmp/dut" "$root/etc/zhida/dut.json"
 
 echo 7 >"$root/proc/irq/11/effective_affinity_list"
 ln -sfn ../../drivers/ena "$root/sys/bus/pci/devices/0000:00:06.0/driver"
