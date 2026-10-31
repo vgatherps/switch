@@ -1021,7 +1021,7 @@ impl TcpSet<'_> {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn debug_assert_ready<F>(&self, timestamp: Instant, has_neighbor: F)
     where
         F: Fn(crate::wire::IpAddress) -> bool,
@@ -1118,7 +1118,7 @@ impl TcpSet<'_> {
         }
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn check_flow_index(&self) {
         assert_eq!(self.flow_slots.len(), self.sockets.len());
         let mut seen = alloc::vec![false; self.sockets.len()];

@@ -5843,7 +5843,7 @@ mod test {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn debug_poll_at_scan_preserves_receive_wake_threshold() {
         let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);

@@ -222,11 +222,14 @@ test-autobahn-check:
 # smoltcp's own lib unit test gate uses Zhida's smoltcp features (crates/dpdk-smoltcp/Cargo.toml)
 # plus medium-ip, which gates smoltcp's TCP socket tests. vendor/smoltcp is outside the
 # workspace, so it has its own lockfile and target dir. Include the TCP ISN integration
-# test: it exercises production ISNs, while socket unit tests keep their fixed ISN.
+# test: it exercises production ISNs, while socket unit tests keep their fixed ISN. The second
+# run adds diagnostics, the O(N)-per-packet TCP cross-checks.
 SMOLTCP_TEST_FEATURES = udp-set,medium-ip,auto-icmp-echo-reply
 test-smoltcp:
 	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
 		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES)
+	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
+		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES),diagnostics
 
 # The packetdrill lock's self-test, then under that lock the packetdrill suite,
 # the runner's self-tests and the CPU checks' self-test (fuzz/packetdrill/README.md).

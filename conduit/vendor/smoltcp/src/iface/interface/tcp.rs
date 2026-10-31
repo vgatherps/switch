@@ -234,7 +234,7 @@ impl InterfaceInner {
         let dst = IpEndpoint::new(dst_addr, tcp_repr.dst_port);
         let src = IpEndpoint::new(src_addr, tcp_repr.src_port);
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         let linear = {
             // The lowest listener bound to the destination address, else the lowest all-IP one.
             let mut listeners = [None, None];
@@ -291,7 +291,7 @@ impl InterfaceInner {
             }
         }
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         {
             assert_eq!(
                 linear, winner,
@@ -320,7 +320,7 @@ impl InterfaceInner {
             if let Some(pending) = pending {
                 sockets.pending_rx_attach = Some((index, pending));
             }
-            #[cfg(test)]
+            #[cfg(feature = "diagnostics")]
             sockets.check_flow_index();
             return reply.map(|(ip, tcp)| {
                 if self.caps.medium == Medium::Ethernet && ip.version() == IpVersion::Ipv4 {

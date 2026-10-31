@@ -515,7 +515,7 @@ impl Interface {
 
         self.classify_dirty(sockets, timestamp);
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         let full = sockets
             .items()
             .filter_map(|item| {
@@ -534,7 +534,7 @@ impl Interface {
 
         let cached = sockets.poll_at();
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         assert!(
             match (cached, full) {
                 (None, None) => true,
@@ -554,10 +554,7 @@ impl Interface {
             full
         );
 
-        #[allow(unused_mut)]
-        let mut res = cached;
-
-        res
+        cached
     }
 
     /// Return an _advisory wait time_ for calling [poll] the next time.
@@ -669,11 +666,6 @@ impl Interface {
             }
         }
 
-        // TODO: Propagate the PollIngressSingleResult from deeper.
-        // There's many received packets that we process but can't cause sockets
-        // to change state. For example IP fragments, multicast stuff, ICMP pings.
-        // We should return `PacketProcessed` for these to save the user from
-        // doing useless socket polls.
         PollIngressSingleResult::SocketStateChanged
     }
 
@@ -685,7 +677,6 @@ impl Interface {
         self.inner.neighbor_cache.expire(self.inner.now);
         let timestamp = self.inner.now;
         let visits = classify_dirty(&mut self.inner, sockets, timestamp, true);
-        let _caps = device.capabilities();
 
         let mut result = PollResult::None;
         for _ in 0..visits {
@@ -891,7 +882,7 @@ impl Interface {
 
         self.inner.dispatch_neighbor_probe(device);
 
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "diagnostics")]
         sockets.debug_assert_ready(self.inner.now, |ip| self.inner.has_neighbor(&ip));
 
         result
