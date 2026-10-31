@@ -5,10 +5,8 @@ Usage: report.py RESULTS_DIR [--title T]
 
 RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and optionally
 `dut-counters-<sweep>.jsonl` (the `zhida-bench serve` counter log of that sweep's DUT),
-`expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce),
-`host-setup.txt` (the host setup verification), `pingpong-*.jsonl` and `counters-on.jsonl` /
-`counters-off.jsonl` (the counter-capture check: the same single rate with DUT counter capture on
-and off). Python stdlib only.
+`expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce) and
+`host-setup.txt` (the host setup verification). Python stdlib only.
 
 Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
 summary, or a sweep did not complete. The report is still written, headed INCOMPLETE.
@@ -27,7 +25,7 @@ def load_jsonl(path):
 
 def sweep_files(directory):
     for name in sorted(os.listdir(directory)):
-        if name.endswith(".jsonl") and not name.startswith(("dut-counters-", "counters-", "pingpong-")):
+        if name.endswith(".jsonl") and not name.startswith("dut-counters-"):
             yield name, os.path.join(directory, name)
 
 
@@ -223,30 +221,6 @@ def svg_plot(steps, summary, title):
     return "\n".join(out)
 
 
-def pingpong(directory):
-    rows = ["| ping-pong (TCP, closed loop) | size | count | p50 µs | p99 µs | p99.9 µs | max µs |",
-            "|---|---:|---:|---:|---:|---:|---:|"]
-    for name in sorted(os.listdir(directory)):
-        if name.startswith("pingpong-") and name.endswith(".jsonl"):
-            for r in load_jsonl(os.path.join(directory, name)):
-                q = r.get("rtt_ns") or {}
-                rows.append(f"| {name[len('pingpong-'):-len('.jsonl')]} | {r['size']} | {r['count']} |"
-                            f" {us(q.get('p50'))} | {us(q.get('p99'))} | {us(q.get('p999'))} | {us(q.get('max'))} |")
-    return "\n".join(rows) if len(rows) > 2 else None
-
-
-def counters_check(directory):
-    paths = [os.path.join(directory, f"counters-{m}.jsonl") for m in ("on", "off")]
-    if not all(os.path.exists(p) for p in paths):
-        return None
-    rows = ["| DUT counter capture | offered pps | p50 µs | p99 µs | max µs | drop % |", "|---|---:|---:|---:|---:|---:|"]
-    for mode, path in zip(("on", "off"), paths):
-        for s in split_sweep(load_jsonl(path))[0]:
-            rows.append(f"| {mode} | {s['offered_pps']:.0f} | {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} |"
-                        f" {us(lat(s, 'max'))} | {100 * s['drop_fraction']:.3f} |")
-    return "\n".join(rows)
-
-
 def build(directory, title):
     """Writes report.md, results.json and the plots; returns (markdown lines, problems)."""
     md = []
@@ -293,14 +267,6 @@ def build(directory, title):
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
                 *[f"- {i}" for i in issues], ""]
     md = head + md + ["## Knees", "", "\n".join(knees), "", *sections]
-    pp = pingpong(directory)
-    if pp:
-        md += ["## Ping-pong", "", "Round-trip time of one message at a time on one connection.", "", pp, ""]
-    check = counters_check(directory)
-    if check:
-        md += ["## DUT counter capture check", "",
-               "The same rate with the DUT's in-loop counter capture on and off: p99 and max should agree within noise.",
-               "", check, ""]
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
            " measured messages not echoed by the end of the drain, unsent ones included (sending stops at the end"
            " of the window); sent / received pps are what actually left the generators and came back within the"

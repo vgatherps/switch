@@ -108,21 +108,14 @@ class ReportTest(unittest.TestCase):
             write_jsonl(os.path.join(d, "udp-zhida.jsonl"), lines)
             write_jsonl(os.path.join(d, "dut-counters-udp-zhida.jsonl"),
                         [{"kind": "sample", "sample": s} for s in [sample(100, 0, 0), sample(300, 99, 2)]])
-            for mode in ("on", "off"):
-                write_jsonl(os.path.join(d, f"counters-{mode}.jsonl"), [step(5000, 20_000)])
-            write_jsonl(os.path.join(d, "pingpong-zhida.jsonl"),
-                        [{"kind": "pingpong", "proto": "tcp", "size": 64, "count": 10,
-                          "rtt_ns": {"p50": 20_000, "p99": 30_000, "p999": 40_000, "max": 50_000}}])
             md, issues = report.build(d, "T")
             md = "\n".join(md)
             self.assertEqual(issues, [])
             self.assertTrue(md.startswith("# T"))
-            self.assertIn("| zhida | 64 | 10 | 20.0 | 30.0 | 40.0 | 50.0 |", md)
             self.assertIn("| udp-zhida | udp | 2 | 4 | 64 | 1000 | knee | 1000 | 2 | - | - | yes |", md)
             self.assertIn("| 0 | 1000 | 990 | 980 | 5.0 | 10.0 | 20.0 | 30.0 | 0.000 | 0 | yes | - | - | - | - | 3 |"
                           " 2.0 | 99 | 2 | 1.25 (9.5) |", md)
             self.assertIn("GEN-BOUND", md)
-            self.assertIn("## DUT counter capture check", md)
             self.assertTrue(os.path.exists(os.path.join(d, "udp-zhida.svg")))
             with open(os.path.join(d, "results.json")) as f:
                 results = json.load(f)

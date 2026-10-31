@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use zhida_bench::load::Proto;
 use zhida_bench::sweep::Limits;
-use zhida_bench::{coord, kernel, load, pingpong, serve};
+use zhida_bench::{coord, load, serve};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -30,14 +30,9 @@ usage:
       One generator worker (a Zhida Stack on its own Port and core); takes steps on stdin.
       udp: N sockets; tcp: N connections, S-byte messages on each (S at most the MSS);
       ws: N ws:// connections, S-byte binary messages (S at most 1400: one TCP frame).
-  zhida-bench pingpong --config F --target IP:PORT --size S [--count 100000] [--warmup 1000]
-                       [--local-port 40000]
-      Closed-loop TCP ping-pong on one Zhida connection; prints the round-trip times.
-  zhida-bench serve --config F --proto udp|tcp|ws --port P [--counters on|off] [--counter-log F]
+  zhida-bench serve --config F --proto udp|tcp|ws --port P [--counter-log F]
                     [--ring 36000] [--max-conns 256] [--accepts 64]
-      Zhida echo server; runs until SIGINT/SIGTERM, then writes its counter log.
-  zhida-bench kernel-serve --proto udp|tcp|ws --bind IP:PORT
-      Kernel echo server; runs until SIGINT/SIGTERM.";
+      Zhida echo server; runs until SIGINT/SIGTERM, then writes its counter log.";
 
 struct Flags(HashMap<String, String>);
 
@@ -155,18 +150,6 @@ fn main_inner() -> Result<(), String> {
             }
             load::run(&args, &mut print_line)
         }
-        "pingpong" => {
-            let args = pingpong::Args {
-                config: flags.need("config")?,
-                target: flags.need("target")?,
-                size: flags.need("size")?,
-                warmup: flags.or("warmup", 1000)?,
-                count: flags.or("count", 100_000)?,
-                local_port: flags.or("local-port", 40000)?,
-            };
-            flags.done()?;
-            pingpong::run(&args, &mut print_line)
-        }
         "serve" => {
             let proto = proto(&mut flags)?;
             let args = serve::Args {
@@ -175,26 +158,11 @@ fn main_inner() -> Result<(), String> {
                 port: flags.need("port")?,
                 max_conns: flags.or("max-conns", 256)?,
                 accepts: flags.or("accepts", 64)?,
-                counters: match flags.or::<String>("counters", "on".into())?.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    other => return Err(format!("--counters {other}: on or off")),
-                },
                 counter_log: flags.take("counter-log")?,
                 ring: flags.or("ring", 36_000)?,
             };
             flags.done()?;
             serve::run(&args)
-        }
-        "kernel-serve" => {
-            let proto = proto(&mut flags)?;
-            let bind = flags.need("bind")?;
-            flags.done()?;
-            match proto {
-                Proto::Udp => kernel::udp(bind),
-                Proto::Tcp => kernel::tcp(bind),
-                Proto::Ws => kernel::ws(bind),
-            }
         }
         other => Err(format!("unknown subcommand {other}")),
     }

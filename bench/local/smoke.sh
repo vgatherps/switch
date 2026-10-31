@@ -3,13 +3,9 @@
 # (NET_ADMIN, /dev/net/tun, net.ipv4.ip_forward=1, at least 2 + GENS CPUs), from /work/conduit.
 # Each Zhida process has its own net_tap port on its own subnet, with the kernel side as its gateway;
 # the kernel routes between them (no bridge: net_tap gives the kernel side of a tap the Zhida MAC,
-# which a bridge would take as its own). Zhida DUT 10.10.0.2 (gateway 10.10.0.1, where the kernel
-# echo also listens), ping-pong 10.9.0.2, generator i 10.(20+i).0.2.
-# Per protocol (PROTOS, default "udp tcp"): a sweep against the Zhida DUT and one against the kernel
-# echo (udp and tcp on port 7001, ws on 7002); for TCP also ping-pong against both. Then the
-# counter-capture check: one rate (CHECK_RATE) of UDP against the DUT with capture on and off.
-# Every process's stderr goes to OUT_DIR/*.log. A failed sweep sends SIGUSR1 to the DUT and kernel
-# echo processes (each prints its per-connection state to its log), saves `ss -tnoi`, and stops.
+# which a bridge would take as its own). Zhida DUT 10.10.0.2 (gateway 10.10.0.1), generator i
+# 10.(20+i).0.2.
+# Per protocol (PROTOS): a sweep against the Zhida DUT. Every process's stderr goes to OUT_DIR/*.log.
 # Last, the bounded-overload check: a TCP sweep against a listener that never reads must end on
 # time with its loss reported and a complete summary.
 # Usage: [GENS=2] [SENDERS=2*GENS] [PROTOS="udp tcp ws"] smoke.sh OUT_DIR [extra sweep flags...]
@@ -44,7 +40,6 @@ ip link set cd$1 up
 EOF
 }
 node dut 10
-node pp 9
 i=0
 while [ $i -lt "$gens" ]; do
     node gen$i $((20 + i))
@@ -62,8 +57,8 @@ exec taskset -c \$(($gen_cpu + \$1)) $bench gen --config $out/gen\$1.json --prot
 EOF
 
 dut=
-kerns=
-trap 'kill $dut $kerns 2>/dev/null; wait' EXIT
+sink=
+trap 'kill $dut $sink 2>/dev/null; wait' EXIT
 start_dut() { # proto serve-flags...
     proto=$1
     shift
@@ -86,51 +81,17 @@ run_sweep() { # proto addr out-file [flags...]: the sweep's exit status; its std
     taskset -c "$first" "$bench" sweep --proto "$proto" --gens "$gens" --senders "$senders" --size 64 \
         --gen-cmd "sh $out/gen.sh {i} $proto $addr {senders} 64" "$@" >"$file" 2>>"$out/sweep.log"
 }
-sweep() { # proto target-name addr out-file [flags...]
-    proto=$1 name=$2 addr=$3 file=$4
-    shift 4
-    if ! run_sweep "$proto" "$addr" "$file" "$@"; then
-        echo "smoke: $proto -> $name FAILED: $(tail -1 "$out/sweep.log")" >&2
-        kill -USR1 $dut $kerns 2>/dev/null || true
-        ss -tnoi >"$out/ss.txt" 2>&1 || true
-        sleep 1
-        exit 1
-    fi
-    echo "smoke: $proto -> $name: $(tail -1 "$file")"
-}
-
-kernel_port() { if [ "$1" = ws ]; then echo 7002; else echo 7001; fi; }
-for proto in udp tcp ws; do
-    taskset -c "$first" "$bench" kernel-serve --proto $proto --bind 0.0.0.0:"$(kernel_port $proto)" \
-        2>>"$out/kernel-$proto.log" &
-    kerns="$kerns $!"
-done
 
 for proto in $protos; do
     start_dut "$proto" --counter-log "$out/dut-counters-$proto-zhida.jsonl"
     budget=
     [ "$proto" = udp ] || budget="--budget-us 50"
     # shellcheck disable=SC2086 # budget is zero or two words
-    sweep "$proto" zhida $dut_addr:7000 "$out/$proto-zhida.jsonl" $budget "$@"
-    sweep "$proto" kernel $kernel_addr:"$(kernel_port "$proto")" "$out/$proto-kernel.jsonl" "$@"
-    if [ "$proto" = tcp ]; then
-        for target in zhida:$dut_addr:7000 kernel:$kernel_addr:7001; do
-            name=${target%%:*}
-            sh "$out/up-pp.sh" &
-            taskset -c "$gen_cpu" "$bench" pingpong --config "$out/pp.json" --target "${target#*:}" \
-                --size 64 --count "${PINGPONG_COUNT:-20000}" >"$out/pingpong-$name.jsonl"
-            echo "smoke: tcp ping-pong -> $name: $(cut -c1-160 "$out/pingpong-$name.jsonl")"
-        done
+    if ! run_sweep "$proto" $dut_addr:7000 "$out/$proto-zhida.jsonl" $budget "$@"; then
+        echo "smoke: $proto FAILED: $(tail -1 "$out/sweep.log")" >&2
+        exit 1
     fi
-    stop_dut
-done
-
-# The DUT's in-loop counter capture must not change latency: one rate, capture on and off.
-rate=${CHECK_RATE:-32000}
-for mode in on off; do
-    start_dut udp --counters $mode
-    sweep udp zhida $dut_addr:7000 "$out/counters-$mode.jsonl" --rate-min "$rate" --rate-max "$rate" \
-        --step-ms 2000 --warmup-ms 200
+    echo "smoke: $proto: $(tail -1 "$out/$proto-zhida.jsonl")"
     stop_dut
 done
 
@@ -150,7 +111,7 @@ held = []
 while True:
     held.append(s.accept()[0])
 ' &
-kerns="$kerns $!"
+sink=$!
 sleep 0.5
 started=$(date +%s)
 run_sweep tcp $kernel_addr:7003 "$out/overload-check.jsonl" --rate-min 64000 --rate-max 64000 \
@@ -169,4 +130,4 @@ sys.exit(0 if ok else 1)
 PY
 stop_dut
 trap - EXIT
-kill $kerns 2>/dev/null || true
+kill $sink 2>/dev/null || true

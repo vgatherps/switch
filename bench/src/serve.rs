@@ -1,4 +1,4 @@
-//! The Zhida echo DUT (UDP, TCP). The busy-poll loop does no syscall while serving: with counters on, every
+//! The Zhida echo DUT (UDP, TCP). The busy-poll loop does no syscall while serving: every
 //! 100 ms it copies its cumulative counters into a preallocated ring; ethdev stats are read at
 //! start and at stop only; everything is written to the counter log after it stops.
 
@@ -27,7 +27,6 @@ pub struct Args {
     /// TCP: connections served at once, and accepts kept armed.
     pub max_conns: usize,
     pub accepts: usize,
-    pub counters: bool,
     pub counter_log: Option<PathBuf>,
     /// Ring slots: samples kept, newest last (one per 100 ms).
     pub ring: usize,
@@ -152,7 +151,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 );
             }
         }
-        if args.counters && now >= next_sample {
+        if now >= next_sample {
             // the wall clock drifts from the monotonic one; samples are joined across hosts by it
             host.clock.resync();
             ring.push(Sample {

@@ -139,7 +139,7 @@ cpuset_free = ids=$$($(DOCKER) ps -q) || { echo '$@: docker ps failed.' >&2; exi
 		{ echo '$@ needs $(2) ($(1)) free of other containers.' >&2; exit 1; }
 
 # Bench harness smoke (../bench/local/smoke.sh): validates the tooling, not a measurement. Its
-# CPUs: the kernel echo and coordinator, the Zhida DUT, then BENCH_GENS generators; output in
+# CPUs: the coordinator, the Zhida DUT, then BENCH_GENS generators; output in
 # ../bench/out/smoke (report.md, results.json, plots).
 BENCH_CPUSET ?= 9-12
 BENCH_GENS ?= 2
