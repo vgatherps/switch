@@ -187,6 +187,12 @@ pub fn merge(
     })
 }
 
+/// Worker `g`'s step start: `g / rate` s after the common start `start_unix_ns`, so the workers'
+/// schedules (each `rate / G`) interleave evenly instead of sending in phase.
+pub fn gen_start(start_unix_ns: u64, g: u32, rate: u64) -> u64 {
+    start_unix_ns + (u128::from(g) * 1_000_000_000 / u128::from(rate)) as u64
+}
+
 /// Rate `rate` split over `gens` workers: as even as integers allow, worker 0 takes the rest.
 pub fn split_rate(rate: u64, gens: u32) -> Vec<u64> {
     let g = u64::from(gens);
@@ -402,7 +408,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         check_clocks(&mut workers.0)?;
         let start_unix_ns = unix_now_ns() + args.lead_ms * 1_000_000;
         let mut max_budget = None;
-        for (w, share) in workers.0.iter_mut().zip(split_rate(rate, args.gens)) {
+        for (g, (w, share)) in (0u32..).zip(workers.0.iter_mut().zip(split_rate(rate, args.gens))) {
             let budget = window_ns
                 .zip(summary.baseline_rtt_p50_ns)
                 .map(|(w, b)| budget_per_connection(share, per, b, w));
@@ -412,7 +418,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
                 &Request::Step(load::Command {
                     step: id,
                     rate_pps: share,
-                    start_unix_ns,
+                    start_unix_ns: gen_start(start_unix_ns, g, rate),
                     warmup_ms: args.warmup_ms,
                     step_ms: args.step_ms,
                     drain_ms: args.drain_ms,
@@ -679,6 +685,22 @@ mod tests {
         assert_eq!(&r[..4], [10_000, 14_142, 20_000, 28_284]);
         assert_eq!(r[17], 3_620_387);
         assert_eq!(rates(64_000, 64_000), [64_000]);
+    }
+
+    /// Five workers at 10k pps in total: worker g starts g x 100 µs late, and all their messages
+    /// together are evenly 100 µs apart.
+    #[test]
+    fn worker_offsets_interleave_evenly() {
+        let (gens, rate) = (5u32, 10_000);
+        assert_eq!(gen_start(1_000, 3, rate), 301_000);
+        let mut due: Vec<u64> = (0..gens)
+            .flat_map(|g| {
+                let s = crate::schedule::Schedule::for_rate(4, rate / 5, gen_start(0, g, rate));
+                (0..40).map(move |k| s.due_at(k))
+            })
+            .collect();
+        due.sort_unstable();
+        assert!(due.windows(2).all(|w| w[1] - w[0] == 100_000), "{due:?}");
     }
 
     #[test]
