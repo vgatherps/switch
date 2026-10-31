@@ -17,6 +17,7 @@ dpdk-smoltcp.workspace = true
 zhida-dpdk-sys.workspace = true
 sockperf-wire.workspace = true
 libc.workspace = true
+mimalloc.workspace = true
 
 [lints]
 workspace = true
