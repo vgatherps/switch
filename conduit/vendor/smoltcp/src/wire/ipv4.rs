@@ -3,7 +3,7 @@ use core::fmt;
 
 use super::{Error, Result};
 use crate::phy::ChecksumCapabilities;
-use crate::wire::ip::{checksum, pretty_print_ip_payload};
+use crate::wire::ip::checksum;
 
 pub use super::IpProtocol as Protocol;
 
@@ -622,45 +622,6 @@ impl fmt::Display for Repr {
             "IPv4 src={} dst={} proto={}",
             self.src_addr, self.dst_addr, self.next_header
         )
-    }
-}
-
-use crate::wire::pretty_print::{PrettyIndent, PrettyPrint};
-
-impl<T: AsRef<[u8]>> PrettyPrint for Packet<T> {
-    fn pretty_print(
-        buffer: &dyn AsRef<[u8]>,
-        f: &mut fmt::Formatter,
-        indent: &mut PrettyIndent,
-    ) -> fmt::Result {
-        use crate::wire::ip::checksum::format_checksum;
-
-        let checksum_caps = ChecksumCapabilities::ignored();
-
-        let (ip_repr, payload) = match Packet::new_checked(buffer) {
-            Err(err) => return write!(f, "{indent}({err})"),
-            Ok(ip_packet) => match Repr::parse(&ip_packet, &checksum_caps) {
-                Err(_) => return Ok(()),
-                Ok(ip_repr) => {
-                    if ip_packet.more_frags() || ip_packet.frag_offset() != 0 {
-                        write!(
-                            f,
-                            "{}IPv4 Fragment more_frags={} offset={}",
-                            indent,
-                            ip_packet.more_frags(),
-                            ip_packet.frag_offset()
-                        )?;
-                        return Ok(());
-                    } else {
-                        write!(f, "{indent}{ip_repr}")?;
-                        format_checksum(f, ip_packet.verify_checksum(), false)?;
-                        (ip_repr, ip_packet.payload())
-                    }
-                }
-            },
-        };
-
-        pretty_print_ip_payload(f, indent, ip_repr, payload)
     }
 }
 

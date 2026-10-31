@@ -2,7 +2,6 @@ use super::*;
 use crate::iface::SocketHandle;
 use crate::socket::tcp;
 use crate::tests::TestingDevice;
-use core::sync::atomic::Ordering;
 
 const LOCAL: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
 const PEER: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
@@ -22,10 +21,6 @@ struct Peer {
     handle: SocketHandle,
     ack: TcpSeqNumber,
     frames: Vec<Vec<u8>>,
-}
-
-fn tcp_frame(remote: Ipv4Address, mac: EthernetAddress, tcp: TcpRepr) -> Vec<u8> {
-    tcp_frame_to(LOCAL, LOCAL_MAC, remote, mac, tcp)
 }
 
 fn tcp_frame_to(
@@ -929,7 +924,6 @@ mod invalidation {
             &caps,
         )
         .unwrap();
-        let mtu = peer.iface.inner.caps.max_transmission_unit;
         assert!(crate::iface::header_template::TcpTemplate::is_eligible(
             &tcp
         ));

@@ -20,7 +20,7 @@ use super::*;
 
 use crate::iface::Interface;
 use crate::phy::ChecksumCapabilities;
-use crate::phy::Loopback;
+use crate::phy::{Loopback, Medium};
 use crate::time::Instant;
 
 struct CountingFrameToken<'a>(&'a mut usize);

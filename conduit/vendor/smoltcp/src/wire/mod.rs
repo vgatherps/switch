@@ -74,8 +74,6 @@ mod field {
     pub type Rest = ::core::ops::RangeFrom<usize>;
 }
 
-pub mod pretty_print;
-
 mod arp;
 mod ethernet;
 mod icmp;
@@ -86,8 +84,6 @@ mod tcp;
 mod udp;
 
 use core::fmt;
-
-pub use self::pretty_print::PrettyPrinter;
 
 pub use self::ethernet::{
     Address as EthernetAddress, EtherType as EthernetProtocol, Frame as EthernetFrame,

@@ -1257,7 +1257,7 @@ fn time_wait_reopen_clears_cached_close_deadline() {
     assert_eq!(sockets.get(listener).state(), tcp::State::SynReceived);
     let bytes = take_reply(&mut device);
     assert_control(&reply(&bytes), LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 4));
-    assert_eq!(sockets.get(exact).poll_at(iface.context()), PollAt::Ingress);
+    assert_eq!(sockets.get(exact).poll_at(), PollAt::Ingress);
     assert!(
         !sockets.deadline_due(0, close_deadline),
         "reopened TIME-WAIT slot retains its cached close deadline"

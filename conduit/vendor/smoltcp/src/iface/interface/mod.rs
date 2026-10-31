@@ -25,8 +25,7 @@ use crate::config::{
 };
 use crate::phy::{PacketMeta, TxChecksum};
 use crate::phy::{
-    Device, DeviceCapabilities, FrameToken as PhyFrameToken, Medium, RxToken, TxBuf, TxToken,
-    UniqueTxBuf,
+    Device, DeviceCapabilities, FrameToken as PhyFrameToken, RxToken, TxBuf, TxToken, UniqueTxBuf,
 };
 use crate::rand::Rand;
 use crate::socket::*;
@@ -509,7 +508,7 @@ impl Interface {
         let full = sockets
             .items()
             .filter_map(|item| {
-                let (socket_poll_at, _) = item.socket.poll_at_read(&self.inner);
+                let (socket_poll_at, _) = item.socket.poll_at_read();
                 match item.meta.poll_at(
                     socket_poll_at,
                     |ip_addr| self.inner.has_neighbor(&ip_addr),
@@ -791,7 +790,7 @@ impl Interface {
                         self.inner.now,
                     ) == PollAt::Now
                 );
-                let socket_poll_at = item.socket.poll_at(&mut self.inner);
+                let socket_poll_at = item.socket.poll_at();
                 if socket_poll_at != PollAt::Now {
                     end_poll_at = Some(socket_poll_at);
                     break dispatch_result;
@@ -839,7 +838,7 @@ pub(crate) fn classify(
     timestamp: Instant,
 ) {
     if let Some(item) = sockets.item_at_mut(index) {
-        let socket_poll_at = item.socket.poll_at(inner);
+        let socket_poll_at = item.socket.poll_at();
         classify_polled(inner, sockets, index, timestamp, socket_poll_at);
     } else {
         sockets.set_deadline(index, PollAt::Ingress, false);
@@ -1298,7 +1297,7 @@ impl InterfaceInner {
         let total_ip_len = ip_repr.buffer_len();
 
         match &mut ip_repr {
-            IpRepr::Ipv4(repr) => {
+            IpRepr::Ipv4(_) => {
                 // IPv4 packets larger than the IP MTU are dropped; there is no fragmentation.
                 // An ICMP echo reply is the size of the peer's request, so may be dropped. A TCP
                 // segment is sized to the path MTU, so an oversize one is a stack bug.

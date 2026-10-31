@@ -194,7 +194,7 @@ fn waiting_socket_switches_when_silence_ends() {
         );
         assert_eq!(sockets.waiting, vec![0]);
     }
-    assert_eq!(sockets.get(handle).poll_at(iface.context()), PollAt::Now);
+    assert_eq!(sockets.get(handle).poll_at(), PollAt::Now);
     assert_eq!(
         iface.poll_at(silent_until, &mut sockets),
         Some(Instant::ZERO)
@@ -220,7 +220,7 @@ fn neighbor_learned_releases_waiting_deadline() {
         HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 1])),
         learned,
     );
-    assert_eq!(sockets.get(handle).poll_at(iface.context()), PollAt::Now);
+    assert_eq!(sockets.get(handle).poll_at(), PollAt::Now);
     assert_eq!(iface.poll_at(learned, &mut sockets), Some(Instant::ZERO));
     iface.poll_egress(learned, &mut device, &mut sockets);
     assert!(sockets.waiting.is_empty());
@@ -503,7 +503,7 @@ fn poll_at_matches_full_scan_with_wheel() {
     assert_eq!(iface.poll_at(Instant::from_millis(40), &mut sockets), Some(Instant::from_millis(896)));
     iface.poll_egress(start, &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());
-    for (index, &handle) in handles.iter().enumerate().skip(6) {
+    for index in 6..handles.len() {
         if pending[index] {
             receive(&mut iface, &mut sockets, &mut device, start,
                 segment(1234 + index as u16, TcpControl::None, 101, Some(sequences[index] + 1)));
