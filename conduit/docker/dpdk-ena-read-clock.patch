@@ -45,7 +45,7 @@ index c84420d..be577e8 100644
  const struct rte_memzone *
  ena_mem_alloc_coherent(struct rte_eth_dev_data *data, size_t size,
 diff --git a/drivers/net/ena/ena_ethdev.c b/drivers/net/ena/ena_ethdev.c
-index ea4afbc..acf48ab 100644
+index ea4afbc..dd3196e 100644
 --- a/drivers/net/ena/ena_ethdev.c
 +++ b/drivers/net/ena/ena_ethdev.c
 @@ -275,6 +275,7 @@ static int ena_start(struct rte_eth_dev *dev);
@@ -139,6 +139,15 @@ index ea4afbc..acf48ab 100644
  	aenq_groups = BIT(ENA_ADMIN_LINK_CHANGE) |
  		      BIT(ENA_ADMIN_KEEP_ALIVE) |
  		      BIT(ENA_ADMIN_CONF_NOTIFICATIONS);
+@@ -2487,7 +2527,7 @@ static int eth_ena_dev_init(struct rte_eth_dev *eth_dev)
+ 					     &get_feat_ctx.llq, &llq_config);
+ 	if (unlikely(rc)) {
+ 		PMD_INIT_LOG_LINE(CRIT, "Failed to set placement policy");
+-		return rc;
++		goto err_device_destroy;
+ 	}
+ 
+ 	if (ena_dev->tx_mem_queue_type == ENA_ADMIN_PLACEMENT_POLICY_HOST) {
 @@ -2615,6 +2655,7 @@ err_delete_debug_area:
  	ena_com_delete_debug_area(ena_dev);
  
