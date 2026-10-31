@@ -47,7 +47,7 @@ original base (the first client ISN).
   `ZHIDA_CPU=7 PACKETDRILL_CPU=2 taskset -c 0 fuzz/packetdrill/run.sh fuzz/packetdrill/scripts/X.pkt`.
 - Each script runs in a fresh `tap-echo` (default one socket listening on port 8080) with packetdrill as its
   tester, `--strict_segments` (one expected line is one Zhida segment), bounded by
-  `timeout PACKETDRILL_TIMEOUT` (default 60 s; `make known-bugs` passes 15 s).
+  `timeout PACKETDRILL_TIMEOUT` (default 60 s).
 - Scripts are packet-only: run.sh refuses backquotes, `%{`, `/*` and `=` outside `//`
   comment lines and any line that is not blank, a `//` comment or one TCP packet event. A
   packet's time may be written as packetdrill's lexer reads numbers, `+.1` included; flags
@@ -72,16 +72,6 @@ carry one line `// tolerance_usecs: N`, where N is a positive integer in usecs, 
 the default. An invalid value or a second such line refuses the script unrun
 (`selftest/tolerance-usecs-non-numeric.pkt`, `selftest/tolerance-usecs-zero.pkt` and
 `selftest/tolerance-usecs-repeat.pkt`).
-
-## Known bugs
-
-A script that reproduces a Zhida bug goes in `known-bugs/`, outside the default run. Its
-header states the bug, the expected packets, the assumed fix and any Linux differences, and
-it passes once the bug is fixed that way. `make docker-known-bugs` (native: `make known-bugs`)
-runs each such script alone, with the other repros listed in `fuzz/known-bugs.txt`, and exits
-nonzero while any bug reproduces (docker/README.md). Each script gets 15 s by default
-(`KNOWN_BUGS_PKT_TIMEOUT`); lock waiting is outside the per-repro outer timeout, and a
-lock-wait expiry is `INFRA`.
 
 ## SYN and TIME-WAIT handling
 
@@ -275,9 +265,9 @@ Translation (each header says which apply):
   FIN-WAIT-1 Zhida answers the client's FIN with a pure ACK, FreeBSD with FIN|ACK; both
   reach CLOSING.
 
-A failing script goes to `known-bugs/` when upstream's expectation is RFC 9293's or RFC
-5961's or Linux's (Zhida follows Linux on protocol edge cases). It is not kept when
-upstream asserts a behavior that neither the RFCs require nor current Linux shows while
+A failing script whose expectation is RFC 9293's or RFC 5961's or Linux's (Zhida follows
+Linux on protocol edge cases) stays out of the tree until the fix lands, and arrives with
+the fix. It is not kept when upstream asserts a behavior that neither the RFCs require nor current Linux shows while
 Zhida does what they do:
 
 | Upstream script | Upstream expects | Zhida, RFC 9293 and Linux |

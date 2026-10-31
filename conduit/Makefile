@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
-.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance known-bugs docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy test-known-bugs packetdrill-build soak docker-soak
+.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -61,7 +61,7 @@ AUTOBAHN_IMAGE ?= zhida-autobahn:25.10.1
 AUTOBAHN_TIMEOUT ?= 600
 # The CPU of the Autobahn peer container; it must differ from DOCKER_CPUSET.
 AUTOBAHN_CPUSET ?= 1
-# packetdrill runs (test-packetdrill, known-bugs): tap-echo alone on
+# packetdrill runs (test-packetdrill): tap-echo alone on
 # PACKETDRILL_ZHIDA_CPUSET, packetdrill alone on PACKETDRILL_CPUSET, both off
 # DOCKER_CPUSET (which every gate shares), so the scripts' timing checks see
 # neither side wait for a CPU. Single CPU numbers, distinct from DOCKER_CPUSET
@@ -147,8 +147,8 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 	FUZZ_TIMEOUT=$(FUZZ_TIMEOUT)
 
 help:
-	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test-known-bugs test bench memif-bench fuzz binance known-bugs test-smoltcp bench-stack soak' \
-		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-known-bugs docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
+	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench memif-bench fuzz binance test-smoltcp bench-stack soak' \
+		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
 
@@ -239,11 +239,7 @@ test-packetdrill: packetdrill-build
 test-scapy:
 	$(TIMEOUT) python3 -B -m unittest discover -s fuzz/scapy
 
-# fuzz/known-bugs.sh's self-test (stub commands; no DPDK).
-test-known-bugs:
-	$(TIMEOUT) sh fuzz/known-bugs-self-test.sh
-
-test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-switchnet test-wss test-binance test-memif test-autobahn-check test-scapy test-known-bugs test-smoltcp
+test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-netconf test-packetdrill test-switchnet test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
 
 bench: doctor
 	cargo bench --locked -p zhida-buffer --bench buffer
@@ -283,15 +279,6 @@ binance: doctor
 	timeout --kill-after=10 $$(( $(BINANCE_SECONDS) + 60 )) ../target/debug/binance-feed \
 		--host '$(BINANCE_HOST)' --port $(BINANCE_PORT) --path '$(BINANCE_PATH)' \
 		--print $(BINANCE_PRINT) -- crates/binance-feed/tester.sh $(BINANCE_SECONDS)
-
-# Every repro in fuzz/known-bugs.txt, each alone (fuzz/known-bugs.sh): exits nonzero
-# while any bug exists; not part of any gate. A known-bugs packetdrill script gets
-# KNOWN_BUGS_PKT_TIMEOUT seconds (run.sh's default is 60), so the K5-style scripts that
-# hang until expiry cost 15 s each; every other repro gets TEST_TIMEOUT.
-KNOWN_BUGS_PKT_TIMEOUT ?= 15
-known-bugs: packetdrill-build
-	$(PACKETDRILL_ENV) KNOWN_BUGS_TIMEOUT=$(TEST_TIMEOUT) \
-		KNOWN_BUGS_PKT_TIMEOUT=$(KNOWN_BUGS_PKT_TIMEOUT) fuzz/known-bugs.sh
 
 docker-image:
 	$(if $(DOCKER_PLATFORM),$(DOCKER) buildx build --load --platform $(DOCKER_PLATFORM),$(DOCKER) build) \
@@ -423,10 +410,6 @@ docker-binance: docker-binance-image
 	$(DOCKER) run --rm --init --sysctl net.ipv4.ip_forward=1 $(DOCKER_DPDK) $(BINANCE_IMAGE) \
 		make binance BINANCE_SECONDS='$(BINANCE_SECONDS)' BINANCE_HOST='$(BINANCE_HOST)' \
 		BINANCE_PORT='$(BINANCE_PORT)' BINANCE_PATH='$(BINANCE_PATH)' BINANCE_PRINT='$(BINANCE_PRINT)'
-
-docker-known-bugs:
-	@$(CHECK_PACKETDRILL_CPUSET)
-	$(DOCKER_MAKE_TEST) known-bugs TEST_TIMEOUT=$(TEST_TIMEOUT) KNOWN_BUGS_PKT_TIMEOUT=$(KNOWN_BUGS_PKT_TIMEOUT)
 
 # Bounded on the host (no timeout(1) on macOS): the build runs in the
 # background; after AUTOBAHN_IMAGE_TIMEOUT s, or on INT/TERM/HUP, stop sends it

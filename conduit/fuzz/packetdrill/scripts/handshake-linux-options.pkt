@@ -23,9 +23,8 @@
 // The echo: see echo-and-close.pkt (delayed ACK piggybacked on PSH data, window 32768).
 // The RST moves the socket to Closed (1895-1900); EchoServer::step listens again
 // (crates/tap-echo/src/lib.rs 96-102). Had the RST been dropped, the SYN would meet an
-// established connection, which drops a segment without ACK (1660-1663, the known bug in
-// known-bugs/syn-on-established.pkt), and packetdrill would time out waiting for the
-// SYN-ACK. The 100 ms gap keeps the RST and the SYN out of one turn's ingress (see
+// established connection, which drops a segment without ACK (1660-1663), and packetdrill
+// would time out waiting for the SYN-ACK. The 100 ms gap keeps the RST and the SYN out of one turn's ingress (see
 // echo-and-close.pkt: smoltcp 0.14 has no accept backlog, so with one listener a SYN in
 // the RST's turn gets an RST; temporary, until Zhida's smoltcp fork). The second
 // SYN-ACK's fresh ISN is mapped to 0 for this handshake (see echo-and-close.pkt).

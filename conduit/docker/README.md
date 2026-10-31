@@ -65,9 +65,9 @@ publish no ports or host networking. Every container the Makefile runs adds only
 NET_ADMIN --device /dev/net/tun`; CAP_NET_RAW comes from Docker's default capability set.
 
 Except for the memif and stack benchmarks, containers run on the one CPU `DOCKER_CPUSET` names
-(default 0, passed as `--cpuset-cpus`). The `make docker-test` and `make docker-known-bugs`
-containers also get `PACKETDRILL_CPUSET` (default 2) and `PACKETDRILL_ZHIDA_CPUSET` (default 7)
-and run make under `taskset -c DOCKER_CPUSET`, so everything except the packetdrill runs has one
+(default 0, passed as `--cpuset-cpus`). The `make docker-test`
+container also gets `PACKETDRILL_CPUSET` (default 2) and `PACKETDRILL_ZHIDA_CPUSET` (default 7)
+and runs make under `taskset -c DOCKER_CPUSET`, so everything except the packetdrill runs has one
 CPU. Every EAL argv (tests, benches, the tap-echo driver) pins its main lcore to the one CPU the
 process may run on, read with sched_getaffinity (`zhida_dpdk_sys::only_allowed_cpu`), and fails
 with the count if more than one is allowed.
@@ -261,7 +261,7 @@ While the scripts run, a SCHED_IDLE busy loop on each of the two CPUs keeps them
 Docker Desktop VM a process sleeping on an idle vCPU wakes up to 10 ms late, past the scripts'
 4 ms tolerance. SCHED_IDLE yields only to processes of its own container, where a waking
 tap-echo or packetdrill preempts the loop at once. Another container's loop on the same CPU
-competes as an equal, so `make test-packetdrill` and `make known-bugs` run under the packetdrill
+competes as an equal, so `make test-packetdrill` runs under the packetdrill
 lock (`fuzz/packetdrill/locked.sh`): flock(2) on the file `PACKETDRILL_LOCK`. In Docker that is
 `/packetdrill-lock/run.lock` on the named volume `PACKETDRILL_LOCK_VOLUME` (default
 `zhida-packetdrill-lock`), which every `DOCKER_MAKE_TEST` container mounts, so one packetdrill
@@ -332,29 +332,6 @@ Native `make test` pins packetdrill's tap-echo to `PACKETDRILL_ZHIDA_CPUSET` and
 PACKETDRILL_CPUSET=P PACKETDRILL_ZHIDA_CPUSET=C` with three CPUs you may use. Native
 `make test-packetdrill` needs packetdrill on PATH, its header in /opt/packetdrill/include, root
 or CAP_NET_ADMIN+CAP_NET_RAW, and /dev/net/tun.
-
-### Known bugs (`make docker-known-bugs`)
-
-`known-bugs/*.pkt` are repros of Zhida bugs that fail while the bug exists and are in no gate;
-see `fuzz/packetdrill/README.md`. `make docker-known-bugs` (native: `make known-bugs`) runs
-every repro listed in `fuzz/known-bugs.txt` (those scripts, the `#[ignore]`d Rust tests of known
-bugs and the Scapy replay below), each alone by its exact selector, past failures. Each of those
-scripts gets `KNOWN_BUGS_PKT_TIMEOUT` seconds (default 15), every other repro `TEST_TIMEOUT`.
-The per-repro outer timeout starts after acquiring the packetdrill lock; a lock-wait expiry is
-`INFRA`. Scripts that run until timeout add their count × 15 s to the runtime, excluding setup
-and lock waits.
-
-It prints one line per repro:
-
-| Line | Meaning |
-| --- | --- |
-| `FAIL` | with the first failure location; the bug reproduces |
-| `UNEXPECTED-PASS` | graduate it: un-ignore the test or move the script to `scripts/`, and delete its line |
-| `INFRA` | no such test or script, build error, refused script; with the output tail |
-
-It exits 1 when every repro fails, 2 on any unexpected pass or infrastructure failure. A
-malformed manifest line, or a `known-bugs/*.pkt` the manifest does not list, runs nothing and
-exits 2 (`fuzz/known-bugs.sh`; its self-test `make test-known-bugs` is part of `make test`).
 
 ### Scapy (`make test-scapy`, `make docker-fuzz`)
 

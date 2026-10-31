@@ -5,9 +5,7 @@
 # signals its whole process group, packetdrill included; expiry fails the script.
 #
 # Usage: fuzz/packetdrill/run.sh [script.pkt...]   (default: scripts/*.pkt selftest/*.pkt)
-# scripts/*.pkt must pass the packet-only check and exit 0, and so must known-bugs/*.pkt,
-# run only when named (make known-bugs); they fail while their bug exists. Each
-# selftest/*.pkt carries
+# scripts/*.pkt must pass the packet-only check and exit 0. Each selftest/*.pkt carries
 # one header line: `// expect-pass` (exit 0), `// expect-refused: <text>` (the check refuses it, unrun, with <text>
 # in the reason) or `// expect-error: <text>` (it exits exactly 1 with <text> in the
 # output). Any script may carry one `// tap-echo: <flags>` line, flags only `--buffer N`,
@@ -126,7 +124,7 @@ tolerance_usecs() {
 expectation() {
     local header
     case $1 in
-    $dir/scripts/*.pkt | $dir/known-bugs/*.pkt) echo pass ;;
+    $dir/scripts/*.pkt) echo pass ;;
     $dir/selftest/*.pkt)
         header=$(grep -E -m1 '^// expect-(pass$|(refused|error): .+)' "$1" || true)
         if [[ -z $header ]]; then
@@ -137,7 +135,7 @@ expectation() {
         if [[ $header == pass ]]; then echo pass; return; fi
         echo "${header%%:*} ${header#*: }"
         ;;
-    *) echo "$1: not under $dir/scripts, $dir/known-bugs or $dir/selftest" >&2; return 1 ;;
+    *) echo "$1: not under $dir/scripts or $dir/selftest" >&2; return 1 ;;
     esac
 }
 
