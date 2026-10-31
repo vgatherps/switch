@@ -67,45 +67,8 @@ impl<T> fmt::Debug for SpawnError<T> {
     }
 }
 
-/// A request that `Runtime::poll` stop polling tasks, so the loop turns the
-/// network sooner. Whoever queues network work sets it (switchnet's `Net`, once
-/// enough frames wait to leave); the loop owner's network turn clears it. While
-/// it is set, `poll` still takes remote wakes, deferred wakes and expired
-/// timers, but polls no task; set during a poll, it stops the poll after the
-/// task being polled, and the next poll first finishes that round.
-#[derive(Clone, Debug)]
-pub struct TurnRequest(Rc<Cell<bool>>);
-
-impl TurnRequest {
-    pub(crate) fn new() -> Self {
-        Self(Rc::new(Cell::new(false)))
-    }
-
-    #[inline]
-    pub fn set(&self) {
-        self.0.set(true);
-    }
-
-    #[inline]
-    pub fn clear(&self) {
-        self.0.set(false);
-    }
-
-    #[inline]
-    pub fn is_set(&self) -> bool {
-        self.0.get()
-    }
-
-    /// The flag itself, valid while this handle lives.
-    pub(crate) fn cell(&self) -> *const Cell<bool> {
-        Rc::as_ptr(&self.0)
-    }
-}
-
 pub(crate) struct Control {
     core: UnsafeCell<Option<Box<Executor>>>,
-    /// Shared with the network side; outlives the executor.
-    turn_request: TurnRequest,
     root: Cell<*mut Executor>,
     /// Shutdown was requested while a task factory ran; the outermost spawn finishes it.
     close_deferred: Cell<bool>,
@@ -115,7 +78,6 @@ impl Control {
     fn new(initial_tick: u64, capacity: Capacity) -> Rc<Self> {
         let executor = Box::new(Executor::with_capacity(initial_tick, capacity.tasks, capacity.timers));
         let control = Rc::new(Self {
-            turn_request: executor.turn_request(),
             core: UnsafeCell::new(Some(executor)),
             root: Cell::new(std::ptr::null_mut()),
             close_deferred: Cell::new(false),
@@ -198,12 +160,6 @@ impl Runtime {
         }
     }
 
-    /// The flag that makes `poll` stop polling tasks (see [`TurnRequest`]); every
-    /// call returns the same flag.
-    pub fn turn_request(&self) -> TurnRequest {
-        self.control.turn_request.clone()
-    }
-
     /// Return a local capability for submitting tasks and creating sleeps.
     pub fn spawner(&self) -> Spawner {
         Spawner {
@@ -215,11 +171,11 @@ impl Runtime {
     ///
     /// Equal ticks are accepted. A lower tick returns `TimeRegressed` before state changes.
     /// This method never waits, though future code can block. First it finishes the
-    /// round a [`TurnRequest`] stopped, if any; then the next round polls the tasks woken
-    /// or spawned before this call, then those deferred with `wake_deferred`; tasks woken
-    /// or spawned in a round run in the next. Rounds continue until no task is woken or
-    /// 1024 tasks were polled; the limit is checked between rounds. A set `TurnRequest`
-    /// stops polling before the next task.
+    /// round a [`request_turn`](crate::request_turn) stopped, if any; then the next round
+    /// polls the tasks woken or spawned before this call, then those deferred with
+    /// `wake_deferred`; tasks woken or spawned in a round run in the next. Rounds continue
+    /// until no task is woken or 1024 tasks were polled; the limit is checked between
+    /// rounds. `request_turn` from a task ends this call after that task's poll.
     pub fn poll(&mut self, now: u64) -> Result<PollReport, RuntimeError> {
         let root = self.control.open_core()?;
         unsafe {

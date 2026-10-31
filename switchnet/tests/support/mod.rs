@@ -65,27 +65,15 @@ impl Mixed {
 
     /// `new` with `tcp` TCP and `udp` UDP socket slots on each side.
     pub fn with_sockets(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
-        Self::build(eal, names, tcp, udp, &[], false)
+        Self::build(eal, names, tcp, udp, &[])
     }
 
     /// `new` with the Net also owning `owned`; the peer owns only its own address.
     pub fn with_owned(eal: &Eal, names: [&str; 2], owned: &'static [Ipv4Cidr]) -> Self {
-        Self::build(eal, names, MAX_TCP, MAX_UDP, owned, false)
+        Self::build(eal, names, MAX_TCP, MAX_UDP, owned)
     }
 
-    /// `new` with the Net setting the Runtime's turn request (`NetConfig::turn_request`).
-    pub fn with_turn_request(eal: &Eal, names: [&str; 2]) -> Self {
-        Self::build(eal, names, MAX_TCP, MAX_UDP, &[], true)
-    }
-
-    fn build(
-        eal: &Eal,
-        names: [&str; 2],
-        tcp: usize,
-        udp: usize,
-        owned: &'static [Ipv4Cidr],
-        turn_request: bool,
-    ) -> Self {
+    fn build(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, owned: &'static [Ipv4Cidr]) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [net_stack, peer] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
@@ -111,13 +99,11 @@ impl Mixed {
             }
         });
         let [a, b] = &fixtures;
-        let rt = Runtime::new(0);
-        let turn_request = turn_request.then(|| rt.turn_request());
         Self {
-            rt,
+            rt: Runtime::new(0),
             to_peer: a.link_to(b),
             to_net: b.link_to(a),
-            net: Net::new(net_stack, NetConfig { ingress_budget: BUDGET, turn_request }),
+            net: Net::new(net_stack, NetConfig { ingress_budget: BUDGET }),
             peer,
             now: T0,
             fixtures,

@@ -36,17 +36,12 @@ pub use dpdk_smoltcp::{
     AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
 };
 use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
-use switch::{StoredWaker, TurnRequest};
+use switch::StoredWaker;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetConfig {
     /// Passed to `Stack::turn` each turn.
     pub ingress_budget: usize,
-    /// The loop's `Runtime::turn_request()`, to end its poll early: once the
-    /// frames handed to the Stack since the last turn (each `UdpTx::send` and
-    /// `TcpTx::try_send` that succeeded) reach one `Stack::tx_burst`, the Net sets
-    /// it, and a successful `turn` clears it. `None`: sends never set it.
-    pub turn_request: Option<TurnRequest>,
 }
 
 type Shared = Rc<RefCell<Inner>>;
@@ -103,22 +98,21 @@ struct Inner {
     /// socket slot; more simultaneous waiters than that grow it.
     frame_waiters: Vec<StoredWaker>,
     ingress_budget: usize,
-    turn_request: Option<TurnRequest>,
-    /// Frames handed to the Stack since the last turn; counted only with a `turn_request`.
+    /// Frames handed to the Stack since the last successful turn.
     tx_handed: usize,
-    /// `Stack::tx_burst`: `tx_handed` that sets the turn request.
+    /// `Stack::tx_burst`: from this many `tx_handed` on, each handed frame requests a turn.
     tx_burst: usize,
 }
 
 impl Inner {
-    /// One frame handed to the Stack: at one TX burst since the last turn, request a turn.
+    /// One frame handed to the Stack: at one TX burst since the last turn, end the
+    /// running `Runtime::poll` after this task (`switch::request_turn`), so the loop
+    /// turns the Net and the frames leave sooner.
     #[inline]
     fn handed_over(&mut self) {
-        if let Some(request) = &self.turn_request {
-            self.tx_handed += 1;
-            if self.tx_handed >= self.tx_burst {
-                request.set();
-            }
+        self.tx_handed += 1;
+        if self.tx_handed >= self.tx_burst {
+            switch::request_turn();
         }
     }
 
@@ -315,7 +309,6 @@ impl Net {
             free: (0..slots as u32).rev().collect(),
             frame_waiters: Vec::with_capacity(slots),
             ingress_budget: config.ingress_budget,
-            turn_request: config.turn_request,
             tx_handed: 0,
             tx_burst,
         };
@@ -331,19 +324,15 @@ impl Net {
     /// one, also when the turn returns an error (egress can fail after
     /// ingress queued data). Only sockets whose readiness tokens fired since
     /// the last turn are checked, never every parked one. A successful turn
-    /// (which flushed) clears the `NetConfig::turn_request` and restarts its frame
-    /// count, also with frames still pending. After a panic out of `turn`, drop
-    /// the Net.
+    /// (which flushed) restarts the count of handed frames that requests a turn,
+    /// also with frames still pending. After a panic out of `turn`, drop the Net.
     #[inline]
     pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut inner = self.shared.borrow_mut();
-        let Inner { stack, entries, frame_waiters, ingress_budget, turn_request, tx_handed, .. } = &mut *inner;
+        let Inner { stack, entries, frame_waiters, ingress_budget, tx_handed, .. } = &mut *inner;
         let turn = stack.turn(now, *ingress_budget);
         if turn.is_ok() {
             *tx_handed = 0;
-            if let Some(request) = turn_request {
-                request.clear();
-            }
         }
         if let Some(token) = stack.pop_fired() {
             wake_fired(stack, entries, token);

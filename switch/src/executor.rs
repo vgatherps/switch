@@ -8,13 +8,13 @@
 //! `&mut self` borrows would invalidate those stored pointers.
 
 use std::any::TypeId;
+use std::cell::Cell;
 use std::mem::ManuallyDrop;
 
 use crate::__private::Task;
 use crate::intrusive::NIL;
 use crate::oneshot::Sender;
 use crate::remote::Mailbox;
-use crate::runtime::TurnRequest;
 use crate::task::SpawnToken;
 use crate::task::TaskHeader;
 use crate::task::block::{BlockSpec, Meta};
@@ -65,9 +65,9 @@ pub(crate) const POLL_BUDGET: usize = 1024;
 ///
 /// Three queues: wakes go to `incoming`, deferred wakes to `deferred` (appended
 /// to `incoming` when a `Runtime::poll` starts), and each round swaps `incoming`
-/// into `run_queue` and polls it from `cursor`. A turn request stops the round
-/// after a task poll; the next `Runtime::poll` finishes `run_queue[cursor..]`
-/// first. Simple iteration, no VecDeque.
+/// into `run_queue` and polls it from `cursor`. A turn request (`request_turn`)
+/// stops the round after a task poll; the next `Runtime::poll` finishes
+/// `run_queue[cursor..]` first. Simple iteration, no VecDeque.
 pub struct Executor {
     /// Tasks to poll this round, by header; `run_queue[cursor..]` are still to
     /// poll, and keep QUEUED until then.
@@ -96,8 +96,9 @@ pub struct Executor {
     lifecycle: Lifecycle,
     /// The task being polled, for `Sleep`; null between polls.
     pub(crate) current: *const TaskHeader,
-    /// Set by the network side: stop polling tasks so the loop turns the Net.
-    turn_request: TurnRequest,
+    /// Set by `request_turn` during a task poll: the drain stops after that poll
+    /// and clears it.
+    turn_requested: bool,
     pub(crate) timers: TimerStore,
     /// Wake requests from other threads; outlives this executor.
     mailbox: *const Mailbox,
@@ -121,7 +122,7 @@ impl Executor {
             active: false,
             lifecycle: Lifecycle::Open,
             current: std::ptr::null(),
-            turn_request: TurnRequest::new(),
+            turn_requested: false,
             timers: TimerStore::new(initial_tick, timers),
             mailbox: Mailbox::create(),
         }
@@ -298,11 +299,6 @@ impl Executor {
         }
     }
 
-    /// The flag the network side sets to stop polling.
-    pub(crate) fn turn_request(&self) -> TurnRequest {
-        self.turn_request.clone()
-    }
-
     /// Poll one round (one snapshot of `incoming`), for tests of round order.
     ///
     /// # Safety
@@ -339,28 +335,25 @@ impl Executor {
         TurnGuard {
             owner: this,
             finished: false,
+            outer: POLLING.replace(this),
         }
     }
 
     /// Finish the round a turn request stopped, then poll rounds: each round
     /// polls a snapshot of `incoming`, and another round follows while `incoming`
     /// is not empty and fewer than [`POLL_BUDGET`] polls were made (the budget
-    /// never cuts a round short). A turn request, set now or by a task, stops
-    /// before the next task poll.
+    /// never cuts a round short). A turn request from a task stops before the
+    /// next task poll.
     ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
     pub(crate) unsafe fn poll_batch(turn: &mut TurnGuard) -> usize {
         unsafe {
             let this = turn.owner;
             let mut polled = 0;
-            if (*this).turn_request.is_set() {
-                return 0;
-            }
             if !(*this).run_queue.is_empty() {
                 polled += Self::drain(this);
             }
-            // A drain that saw the request returned with `run_queue` not cleared, so
-            // only the checks above and after each task poll are needed.
+            // A drain that saw the request returned with `run_queue` not cleared.
             while (*this).run_queue.is_empty() && !(*this).incoming.is_empty() && polled < POLL_BUDGET {
                 std::mem::swap(&mut (*this).run_queue, &mut (*this).incoming);
                 polled += Self::drain(this);
@@ -370,7 +363,7 @@ impl Executor {
     }
 
     /// Poll `run_queue` from `cursor` until its end, which clears it, or until a
-    /// turn request follows a task poll; returns the futures polled.
+    /// task poll requested a turn (cleared here); returns the futures polled.
     ///
     /// # Safety
     /// As for [`Self::poll_batch`].
@@ -380,8 +373,7 @@ impl Executor {
             let batch_len = (*this).run_queue.len();
             // The cursor stays local and is stored only on an early return: task code
             // cannot reach it, and an unwind leaves the executor Panicked, whose
-            // cleanup resets it. The request's Rc lives as long as the executor.
-            let request = (*this).turn_request.cell();
+            // cleanup resets it.
             let mut cursor = (*this).cursor;
             while cursor < batch_len {
                 let index = cursor;
@@ -404,8 +396,9 @@ impl Executor {
                 if result.is_ready() {
                     Self::complete(this, header);
                 }
-                if (*request).get() {
+                if (*this).turn_requested {
                     // Possibly at the end: the next drain then only clears.
+                    (*this).turn_requested = false;
                     (*this).cursor = cursor;
                     return polled;
                 }
@@ -535,9 +528,28 @@ impl Executor {
     }
 }
 
+thread_local! {
+    /// The executor whose turn (a `Runtime::poll`, or cleanup) runs on this thread;
+    /// null outside one. `TurnGuard` restores the outer one.
+    static POLLING: Cell<*mut Executor> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Ends the `Runtime::poll` running on this thread after the task being polled, so
+/// the loop turns the network sooner; the next poll first finishes the rest of the
+/// round. Lasts that one poll. Does nothing outside a `Runtime::poll`.
+pub fn request_turn() {
+    let executor = POLLING.get();
+    if !executor.is_null() {
+        // SAFETY: set by a live executor's `TurnGuard` for the duration of its turn.
+        unsafe { (*executor).turn_requested = true };
+    }
+}
+
 pub(crate) struct TurnGuard {
     owner: *mut Executor,
     finished: bool,
+    /// `POLLING` before this turn.
+    outer: *mut Executor,
 }
 
 impl TurnGuard {
@@ -562,6 +574,7 @@ impl Drop for TurnGuard {
             }
             (*self.owner).active = false;
         }
+        POLLING.set(self.outer);
     }
 }
 

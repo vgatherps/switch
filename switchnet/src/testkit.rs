@@ -91,7 +91,7 @@ pub fn with_tap_net<T>(config: &TapConfig, body: impl FnOnce(&mut Net, &Clock) -
         };
         let clock = Clock(std::time::Instant::now());
         let stack = Stack::new(port, stack_config, clock.now()).map_err(|(_, e)| e).expect("create Zhida Stack");
-        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET, turn_request: None });
+        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
         let out = body(&mut net, &clock);
         let stack = net.into_stack().ok().expect("a handle or socket outlived the body");
         stack.into_port().try_close().expect("close the Port with every buffer returned");

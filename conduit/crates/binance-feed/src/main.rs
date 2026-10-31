@@ -185,7 +185,7 @@ fn main() {
         SOCKET_BUFFER,
         Some(TESTER_IP),
         |stack, start, stop| {
-            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET, turn_request: None });
+            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
             let result = feed(&mut net, start, stop, &target, tls, local_port, args.print);
             let stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
             (stack, result)
