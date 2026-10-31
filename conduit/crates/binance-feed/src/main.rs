@@ -217,6 +217,7 @@ fn feed(
         None,
         stop_rx,
         Rc::clone(&out),
+        || false,
     );
     rt.spawner()
         .spawn(task)

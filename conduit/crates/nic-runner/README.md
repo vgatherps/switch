@@ -239,7 +239,9 @@ If a NIC clock read ever contradicts the mapping (the clock jumped, e.g. stepped
 before that read may be wrong by more than their bound, and they are not removed. So the run's latency result is
 invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and histogram. A device
 reset the Stack recovered from (`dpdk_smoltcp::port_resets()` changed) marks the run the same way: nothing says
-the PHC continues across the reset.
+the PHC continues across the reset. The feed snapshots this counter before running and checks it synchronously
+immediately before reporting, so even a reset after the clock thread's last poll suppresses the histogram.
+This adds no per-packet or per-turn reset check.
 
 ### 3c. sockperf-server
 ```

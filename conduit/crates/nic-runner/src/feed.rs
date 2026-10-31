@@ -23,6 +23,7 @@ pub fn run(
     socket: tcp::Config,
     clock: &Clock,
 ) -> Result<(), String> {
+    let resets = dpdk_smoltcp::port_resets();
     let local_port = random_local_port().map_err(|e| format!("local port entropy: {e}"))?;
     let mut rt = Runtime::new(clock.ms());
     let (stop_feed, stop_rx) = oneshot::channel();
@@ -40,6 +41,7 @@ pub fn run(
         Some(Duration::from_secs(args.seconds)),
         stop_rx,
         Rc::clone(&out),
+        move || dpdk_smoltcp::port_resets() != resets,
     );
     rt.spawner()
         .spawn(task)
