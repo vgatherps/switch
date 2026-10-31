@@ -62,6 +62,12 @@ pub fn run(mut read_phc: impl FnMut() -> Option<u64>, stop: &AtomicBool) -> Resu
     let mut calibration = Calibration::default();
     while !stop.load(Ordering::Relaxed) {
         let before = counter();
+        // x86_64: later instructions (the PHC read) may start before rdtsc reads the counter.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: lfence has no memory effects.
+        unsafe {
+            std::arch::x86_64::_mm_lfence()
+        };
         let phc = read_phc();
         let after = counter();
         if let Some(phc) = phc {
