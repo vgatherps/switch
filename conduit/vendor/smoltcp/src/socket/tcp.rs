@@ -7277,28 +7277,6 @@ mod test {
     }
 
     #[test]
-    fn test_listen_syn_tiny_mss_is_clamped() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(10)
-        );
-        assert_eq!(s.state, State::SynReceived);
-        assert_eq!(usize::from(s.remote_mss), MIN_REMOTE_MSS);
-    }
-
-    #[test]
-    fn test_listen_syn_zero_mss_is_ignored() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(0)
-        );
-        assert_eq!(s.state, State::SynReceived);
-        assert_eq!(usize::from(s.remote_mss), DEFAULT_MSS);
-    }
-
-    #[test]
     fn test_listen_sanity() {
         let mut s = socket();
         s.listen(LOCAL_PORT).unwrap();
@@ -7319,17 +7297,6 @@ mod test {
         assert_eq!(s.listen(80), Ok(()));
         s.set_state(State::SynReceived); // state change, simulate incoming connection
         assert_eq!(s.listen(80), Err(ListenError::InvalidState));
-    }
-
-    #[test]
-    fn test_listen_syn() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack()
-        );
-        assert_eq!(s.remote_win_seq, REMOTE_SEQ);
-        sanity!(s, socket_syn_received());
     }
 
     #[test]
@@ -7485,48 +7452,6 @@ mod test {
             Some(RECV_TEMPL.rst().seq(LOCAL_SEQ + 2).no_ack().win(0))
         );
         assert_eq!(s.state, State::SynReceived);
-    }
-
-    #[test]
-    fn test_syn_received_fin() {
-        let mut s = socket_syn_received();
-        recv!(
-            s,
-            [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS)]
-        );
-        send!(
-            s,
-            SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..])
-        );
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6 + 1).win(64)]
-        );
-        assert_eq!(s.state, State::CloseWait);
-
-        let mut s2 = socket_close_wait();
-        s2.remote_last_ack = Some(REMOTE_SEQ + 1 + 6 + 1);
-        s2.remote_last_win_bytes = 64;
-        sanity!(s, s2);
-    }
-
-    #[test]
-    fn test_syn_received_rst() {
-        let mut s = socket_syn_received();
-        s.listen_endpoint = LISTEN_END;
-        recv!(
-            s,
-            [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS)]
-        );
-        send!(
-            s,
-            SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ)
-        );
-        assert_eq!(s.state, State::Listen);
-        assert_eq!(s.listen_endpoint, LISTEN_END);
-        assert_eq!(s.tuple, None);
-        // Back to Listen, not closed: no peer reset to report.
-        assert!(!s.reset_by_peer());
     }
 
     #[test]
@@ -10929,21 +10854,6 @@ mod test {
     }
 
     #[test]
-    fn test_established_fin() {
-        let mut s = socket_established();
-        send!(
-            s,
-            SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1)
-        );
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1)]
-        );
-        assert_eq!(s.state, State::CloseWait);
-        sanity!(s, socket_close_wait());
-    }
-
-    #[test]
     fn test_established_fin_after_missing() {
         let mut s = socket_established();
         send!(
@@ -11445,29 +11355,218 @@ mod test {
         recv_nothing!(s);
     }
 
-    #[test]
-    fn test_established_send_fin() {
-        let mut s = socket_established();
-        s.send_slice(b"abcdef").unwrap();
-        send!(
-            s,
-            SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1)
-        );
-        assert_eq!(s.state, State::CloseWait);
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1).data(&b"abcdef"[..])]
-        );
+    /// One segment against one state: (name, socket, time ms, segment, expected reply,
+    /// resulting state, timer unchanged, remaining checks). Segment and reply see the
+    /// socket before the segment arrives.
+    type SegCase = (
+        &'static str,
+        fn() -> TestSocket,
+        i64,
+        fn(&TestSocket) -> TcpRepr<'static>,
+        fn(&TestSocket) -> Option<TcpRepr<'static>>,
+        State,
+        bool,
+        fn(TestSocket),
+    );
+
+    /// Names the failing row when any check inside it panics, including `then`.
+    struct RowGuard(&'static str);
+
+    impl Drop for RowGuard {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                std::eprintln!("failed row: {}", self.0);
+            }
+        }
+    }
+
+    fn run_seg_cases(cases: &[SegCase]) {
+        for &(name, make, time, seg, reply, state, timer_kept, then) in cases {
+            let _guard = RowGuard(name);
+            let mut s = make();
+            let (seg, reply, timer) = (seg(&s), reply(&s), s.timer);
+            assert_eq!(send(&mut s, Instant::from_millis(time), &seg), reply, "{name}: reply");
+            assert_eq!(s.state, state, "{name}: state");
+            if timer_kept {
+                assert_eq!(s.timer, timer, "{name}: timer");
+            }
+            then(s);
+        }
+    }
+
+    fn no_reply(_: &TestSocket) -> Option<TcpRepr<'static>> {
+        None
+    }
+
+    fn no_tuple(s: TestSocket) {
+        assert_eq!(s.tuple, None);
+    }
+
+    fn keeps_tuple(s: TestSocket) {
+        assert_eq!(s.tuple, Some(TUPLE));
+    }
+
+    fn time_wait_rst_closes(s: TestSocket) {
+        assert_eq!(s.tuple, None);
+        // Our close came first: a TIME-WAIT RST is not a peer reset.
+        assert!(!s.reset_by_peer());
+    }
+
+    fn syn_received_after_syn_ack() -> TestSocket {
+        let mut s = socket_syn_received();
+        recv!(s, [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS)]);
+        s
+    }
+
+    fn fin_wait_1_after_fin() -> TestSocket {
+        let mut s = socket_fin_wait_1();
+        recv!(s, [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)]);
+        s
+    }
+
+    fn rst_before_rcv_nxt(s: &TestSocket) -> TcpRepr<'static> {
+        SEND_TEMPL.rst().seq(s.remote_seq_no + s.rx_buffer.store.in_order_len() - 1).no_ack()
+    }
+
+    fn rst_at_rcv_nxt(s: &TestSocket) -> TcpRepr<'static> {
+        SEND_TEMPL.rst().seq(s.remote_seq_no + s.rx_buffer.store.in_order_len()).no_ack()
     }
 
     #[test]
-    fn test_established_rst() {
-        let mut s = socket_established();
-        send!(
-            s,
-            SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1)
-        );
-        assert_eq!(s.state, State::Closed);
+    fn rst_by_state() {
+        run_seg_cases(&[
+            ("syn received: RST at RCV.NXT", || {
+                let mut s = socket_syn_received();
+                s.listen_endpoint = LISTEN_END;
+                recv!(s, [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS)]);
+                s
+            }, 0, |_| SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ), no_reply,
+                State::Listen, false, |s| {
+                assert_eq!(s.listen_endpoint, LISTEN_END);
+                assert_eq!(s.tuple, None);
+                // Back to Listen, not closed: no peer reset to report.
+                assert!(!s.reset_by_peer());
+            }),
+            ("established: RST+ACK at RCV.NXT", socket_established, 0,
+                |_| SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1), no_reply,
+                State::Closed, false, drop),
+            ("established: RST at RCV.NXT", socket_established, 0,
+                |_| SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).no_ack(), no_reply, State::Closed, false, drop),
+            ("close wait: RST at the peer FIN", socket_close_wait, 0,
+                |s| SEND_TEMPL.rst().seq(s.remote_seq_no - 1).no_ack(), no_reply,
+                State::Closed, false, no_tuple),
+            ("last ack: RST at the peer FIN", socket_last_ack, 0,
+                |s| SEND_TEMPL.rst().seq(s.remote_seq_no - 1).ack(LOCAL_SEQ + 1000), no_reply,
+                State::Closed, false, no_tuple),
+            ("closing: RST at the peer FIN", socket_closing, 0,
+                |s| SEND_TEMPL.rst().seq(s.remote_seq_no - 1).no_ack(), no_reply,
+                State::Closed, false, no_tuple),
+            ("time wait from fin wait 2: RST at RCV.NXT", || socket_time_wait(false), 0,
+                rst_at_rcv_nxt, no_reply, State::Closed, false, time_wait_rst_closes),
+            ("time wait from closing: RST at RCV.NXT", || socket_time_wait(true), 0,
+                rst_at_rcv_nxt, no_reply, State::Closed, false, time_wait_rst_closes),
+            ("fin wait 2: RST at the out-of-order FIN end",
+                || socket_fin_wait_2_with_out_of_order_fin(b"abc"), 0,
+                |_| SEND_TEMPL.rst().seq(TcpSeqNumber(107)).no_ack(), no_reply,
+                State::Closed, false, no_tuple),
+            ("fin wait 2: RST at a bare out-of-order FIN end",
+                || socket_fin_wait_2_with_out_of_order_fin(b""), 0,
+                |_| SEND_TEMPL.rst().seq(TcpSeqNumber(104)).no_ack(), no_reply,
+                State::Closed, false, no_tuple),
+            ("fin wait 2: RST at the out-of-order data end",
+                || socket_fin_wait_2_with_out_of_order_fin(b"abc"), 0,
+                |_| SEND_TEMPL.rst().seq(TcpSeqNumber(106)).no_ack(),
+                |_| Some(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(TcpSeqNumber(100))
+                    .sack([Some((103, 107)), None, None])),
+                State::FinWait2, true, keeps_tuple),
+            ("established: RST before RCV.NXT", socket_established, 0, rst_before_rcv_nxt,
+                no_reply, State::Established, true, keeps_tuple),
+            ("fin wait 1: RST before RCV.NXT", socket_fin_wait_1, 0, rst_before_rcv_nxt,
+                no_reply, State::FinWait1, true, keeps_tuple),
+            ("fin wait 2: RST before RCV.NXT", socket_fin_wait_2, 0, rst_before_rcv_nxt,
+                no_reply, State::FinWait2, true, keeps_tuple),
+        ]);
+    }
+
+    #[test]
+    fn syn_by_state() {
+        let syn_ack_below_una = |s: &TestSocket| SEND_TEMPL.syn().seq(s.remote_seq_no)
+            .ack(s.local_seq_no - 1);
+        let challenge_ack = |s: &TestSocket| Some(RECV_TEMPL.seq(s.local_seq_no)
+            .ack(s.remote_seq_no));
+        run_seg_cases(&[
+            ("listen: SYN", socket_listen, 0, |_| SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack(),
+                no_reply, State::SynReceived, false, |s| {
+                assert_eq!(s.remote_win_seq, REMOTE_SEQ);
+                sanity!(s, socket_syn_received());
+            }),
+            ("listen: SYN with MSS 10 is clamped", socket_listen, 0,
+                |_| SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(10), no_reply,
+                State::SynReceived, false,
+                |s| assert_eq!(usize::from(s.remote_mss), MIN_REMOTE_MSS)),
+            ("listen: SYN with MSS 0 is ignored", socket_listen, 0,
+                |_| SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(0), no_reply,
+                State::SynReceived, false, |s| assert_eq!(usize::from(s.remote_mss), DEFAULT_MSS)),
+            ("established: SYN+ACK below SND.UNA", socket_established, 2000, syn_ack_below_una,
+                challenge_ack, State::Established, true, drop),
+            ("time wait: SYN+ACK below SND.UNA", || socket_time_wait(true), 2000,
+                syn_ack_below_una, challenge_ack, State::TimeWait, false, |s| {
+                assert_eq!(s.timer, Timer::Close {
+                    expires_at: Instant::from_millis(2000) + CLOSE_DELAY,
+                });
+            }),
+        ]);
+    }
+
+    #[test]
+    fn fin_by_state() {
+        run_seg_cases(&[
+            ("syn received: FIN with data", syn_received_after_syn_ack, 0,
+                |_| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..]),
+                no_reply, State::CloseWait, false, |mut s| {
+                recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6 + 1).win(64)]);
+                let mut s2 = socket_close_wait();
+                s2.remote_last_ack = Some(REMOTE_SEQ + 1 + 6 + 1);
+                s2.remote_last_win_bytes = 64;
+                sanity!(s, s2);
+            }),
+            ("established: FIN", socket_established, 0,
+                |_| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1), no_reply,
+                State::CloseWait, false, |mut s| {
+                recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1)]);
+                sanity!(s, socket_close_wait());
+            }),
+            ("established with data queued: FIN", || {
+                let mut s = socket_established();
+                s.send_slice(b"abcdef").unwrap();
+                s
+            }, 0, |_| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1), no_reply,
+                State::CloseWait, false, |mut s| {
+                recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1).data(&b"abcdef"[..])]);
+            }),
+            ("fin wait 1: ACK of our FIN", fin_wait_1_after_fin, 0,
+                |_| SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 1), no_reply,
+                State::FinWait2, false, |s| sanity!(s, socket_fin_wait_2())),
+            ("fin wait 1: FIN", fin_wait_1_after_fin, 0,
+                |_| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1), no_reply,
+                State::Closing, false, |s| sanity!(s, socket_closing())),
+            ("fin wait 2: FIN", socket_fin_wait_2, 1_000,
+                |_| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 1), no_reply,
+                State::TimeWait, false, |s| sanity!(s, socket_time_wait(false))),
+            ("closing: ACK of our FIN", || {
+                let mut s = socket_closing();
+                recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1 + 1).ack(REMOTE_SEQ + 1 + 1)]);
+                s
+            }, 1_000, |_| SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 1), no_reply,
+                State::TimeWait, false, |s| sanity!(s, socket_time_wait(true))),
+            ("last ack: ACK of our FIN", || {
+                let mut s = socket_last_ack();
+                recv!(s, [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1)]);
+                assert_eq!(s.state, State::LastAck);
+                s
+            }, 0, |_| SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 1), no_reply,
+                State::Closed, false, drop),
+        ]);
     }
 
     #[test]
@@ -11523,26 +11622,6 @@ mod test {
         };
         assert_eq!(tx, b"tx");
         assert_eq!((s.recv_queue(), s.send_queue()), (0, 2));
-    }
-
-    #[test]
-    fn test_synchronized_syn_ack_below_snd_una_challenge_ack() {
-        for mut s in [socket_established(), socket_time_wait(true)] {
-            let state = s.state;
-            let timer = s.timer;
-            let seq = s.remote_seq_no;
-            let local_seq = s.local_seq_no;
-            send!(s, time 2000, SEND_TEMPL.syn().seq(seq).ack(local_seq - 1), Some(RECV_TEMPL
-                .seq(local_seq).ack(seq)));
-            assert_eq!(s.state, state);
-            if state == State::TimeWait {
-                assert_eq!(s.timer, Timer::Close {
-                    expires_at: Instant::from_millis(2000) + CLOSE_DELAY,
-                });
-            } else {
-                assert_eq!(s.timer, timer);
-            }
-        }
     }
 
     #[test]
@@ -11986,33 +12065,6 @@ mod test {
     }
 
     #[test]
-    fn test_fin_wait_2_rst_at_out_of_order_fin_end() {
-        let mut s = socket_fin_wait_2_with_out_of_order_fin(b"abc");
-        send!(s, SEND_TEMPL.rst().seq(TcpSeqNumber(107)).no_ack());
-        assert_eq!(s.state, State::Closed);
-        assert_eq!(s.tuple, None);
-    }
-
-    #[test]
-    fn test_fin_wait_2_rst_at_out_of_order_data_end_challenge_ack() {
-        let mut s = socket_fin_wait_2_with_out_of_order_fin(b"abc");
-        let timer = s.timer;
-        send!(s, SEND_TEMPL.rst().seq(TcpSeqNumber(106)).no_ack(), Some(RECV_TEMPL
-            .seq(LOCAL_SEQ + 2).ack(TcpSeqNumber(100)).sack([Some((103, 107)), None, None])));
-        assert_eq!(s.state, State::FinWait2);
-        assert_eq!(s.tuple, Some(TUPLE));
-        assert_eq!(s.timer, timer);
-    }
-
-    #[test]
-    fn test_fin_wait_2_rst_at_bare_out_of_order_fin_end() {
-        let mut s = socket_fin_wait_2_with_out_of_order_fin(b"");
-        send!(s, SEND_TEMPL.rst().seq(TcpSeqNumber(104)).no_ack());
-        assert_eq!(s.state, State::Closed);
-        assert_eq!(s.tuple, None);
-    }
-
-    #[test]
     fn test_close_wait_rst_after_fin_purges_out_of_order_data() {
         for rst_seq in [TcpSeqNumber(106), TcpSeqNumber(107)] {
             let mut s = socket_established();
@@ -12101,59 +12153,6 @@ mod test {
     }
 
     #[test]
-    fn test_close_wait_rst_at_peer_fin() {
-        let mut s = socket_close_wait();
-        let seq = s.remote_seq_no - 1;
-        send!(s, SEND_TEMPL.rst().seq(seq).no_ack());
-        assert_eq!(s.state, State::Closed);
-        assert_eq!(s.tuple, None);
-    }
-
-    #[test]
-    fn test_last_ack_rst_at_peer_fin() {
-        let mut s = socket_last_ack();
-        let seq = s.remote_seq_no - 1;
-        send!(s, SEND_TEMPL.rst().seq(seq).ack(LOCAL_SEQ + 1000));
-        assert_eq!(s.state, State::Closed);
-        assert_eq!(s.tuple, None);
-    }
-
-    #[test]
-    fn test_closing_rst_at_peer_fin() {
-        let mut s = socket_closing();
-        let seq = s.remote_seq_no - 1;
-        send!(s, SEND_TEMPL.rst().seq(seq).no_ack());
-        assert_eq!(s.state, State::Closed);
-        assert_eq!(s.tuple, None);
-    }
-
-    #[test]
-    fn test_rst_before_rcv_nxt_without_peer_fin() {
-        for mut s in [socket_established(), socket_fin_wait_1(), socket_fin_wait_2()] {
-            let state = s.state;
-            let timer = s.timer;
-            let seq = s.remote_seq_no + s.rx_buffer.store.in_order_len();
-            send!(s, SEND_TEMPL.rst().seq(seq - 1).no_ack());
-            assert_eq!(s.state, state);
-            assert_eq!(s.timer, timer);
-            assert_eq!(s.tuple, Some(TUPLE));
-        }
-    }
-
-    #[test]
-    fn test_time_wait_rst_exact_seq() {
-        for from_closing in [false, true] {
-            let mut s = socket_time_wait(from_closing);
-            let seq = s.remote_seq_no + s.rx_buffer.store.in_order_len();
-            send!(s, SEND_TEMPL.rst().seq(seq).no_ack());
-            assert_eq!(s.state, State::Closed);
-            assert_eq!(s.tuple, None);
-            // Our close came first: a TIME-WAIT RST is not a peer reset.
-            assert!(!s.reset_by_peer());
-        }
-    }
-
-    #[test]
     fn test_time_wait_rst_other_seq_ignored() {
         for offset in [1, 63, 64] {
             for from_closing in [false, true] {
@@ -12170,16 +12169,6 @@ mod test {
                 recv_nothing!(s, time 500);
             }
         }
-    }
-
-    #[test]
-    fn test_established_rst_no_ack() {
-        let mut s = socket_established();
-        send!(
-            s,
-            SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).no_ack()
-        );
-        assert_eq!(s.state, State::Closed);
     }
 
     #[test]
@@ -12293,36 +12282,6 @@ mod test {
     // =========================================================================================//
 
     #[test]
-    fn test_fin_wait_1_fin_ack() {
-        let mut s = socket_fin_wait_1();
-        recv!(
-            s,
-            [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)]
-        );
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 1)
-        );
-        assert_eq!(s.state, State::FinWait2);
-        sanity!(s, socket_fin_wait_2());
-    }
-
-    #[test]
-    fn test_fin_wait_1_fin_fin() {
-        let mut s = socket_fin_wait_1();
-        recv!(
-            s,
-            [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)]
-        );
-        send!(
-            s,
-            SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1)
-        );
-        assert_eq!(s.state, State::Closing);
-        sanity!(s, socket_closing());
-    }
-
-    #[test]
     fn test_fin_wait_1_fin_with_data_queued() {
         let mut s = socket_established();
         s.remote_win_len = 6;
@@ -12366,14 +12325,6 @@ mod test {
     // =========================================================================================//
 
     #[test]
-    fn test_fin_wait_2_fin() {
-        let mut s = socket_fin_wait_2();
-        send!(s, time 1_000, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 1));
-        assert_eq!(s.state, State::TimeWait);
-        sanity!(s, socket_time_wait(false));
-    }
-
-    #[test]
     fn test_fin_wait_2_recv() {
         let mut s = socket_fin_wait_2();
         send!(
@@ -12402,18 +12353,6 @@ mod test {
     // =========================================================================================//
     // Tests for the CLOSING state.
     // =========================================================================================//
-
-    #[test]
-    fn test_closing_ack_fin() {
-        let mut s = socket_closing();
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1 + 1).ack(REMOTE_SEQ + 1 + 1)]
-        );
-        send!(s, time 1_000, SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 1));
-        assert_eq!(s.state, State::TimeWait);
-        sanity!(s, socket_time_wait(true));
-    }
 
     #[test]
     fn test_closing_close() {
@@ -12600,21 +12539,6 @@ mod test {
     // =========================================================================================//
     // Tests for the LAST-ACK state.
     // =========================================================================================//
-    #[test]
-    fn test_last_ack_fin_ack() {
-        let mut s = socket_last_ack();
-        recv!(
-            s,
-            [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1)]
-        );
-        assert_eq!(s.state, State::LastAck);
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 1)
-        );
-        assert_eq!(s.state, State::Closed);
-    }
-
     #[test]
     fn test_last_ack_ack_not_of_fin() {
         let mut s = socket_last_ack();
