@@ -230,20 +230,20 @@ fn run(args: Args) -> i32 {
             let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
             // The clock thread reads the port's clock: the scope joins it before the port closes.
             // Only ENA's clock is the RX stamps' clock (ice's read_clock is CLOCK_MONOTONIC_RAW).
-            let no_clock = if report.device.driver_name != "net_ena" {
-                Some("the driver is not net_ena")
+            let clock_cpus = if report.device.driver_name != "net_ena" {
+                Err("the driver is not net_ena".to_owned())
             } else if nic::read_clock(port_id) == Err(-libc::ENOTSUP) {
-                Some("the device has no PHC")
+                Err("the device has no PHC".to_owned())
             } else {
-                None
+                nic::housekeeping_cpus(report.cpu)
             };
             let stop_clock = AtomicBool::new(false);
             let result = std::thread::scope(|scope| {
                 let _stop = SetOnDrop(&stop_clock);
-                match no_clock {
-                    None => {
+                match &clock_cpus {
+                    Ok(cpus) => {
                         scope.spawn(|| {
-                            let ran = nic::to_housekeeping().and_then(|()| {
+                            let ran = nic::pin(cpus).and_then(|()| {
                                 Ok(nic_clock::run(|| nic::read_clock(port_id).ok(), &stop_clock)?)
                             });
                             if let Err(e) = ran {
@@ -251,7 +251,7 @@ fn run(args: Args) -> i32 {
                             }
                         });
                     }
-                    Some(why) => line("nic_clock", format_args!("none: {why}")),
+                    Err(why) => line("nic_clock", format_args!("none: {why}")),
                 }
                 feed::run(
                     &mut net,

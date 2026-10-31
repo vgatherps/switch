@@ -124,14 +124,17 @@ the same Dockerfile):
 ```
 make docker-image DOCKER_IMAGE=zhida-dpdk-test:local
 ```
-Run (the cargo volumes keep the build between runs; the first run compiles for a few minutes):
+Run (the cargo volumes keep the build between runs; the first run compiles for a few minutes). The container gets
+Zhida's core plus a housekeeping core for `feed`'s clock thread (section 3b); `taskset` keeps Zhida on its own:
 ```
 nic() {
-  docker run --rm -it --privileged --network host --cpuset-cpus="${ZHIDA_CPU:-2}" \
+  docker run --rm -it --privileged --network host \
+    --cpuset-cpus="${ZHIDA_CPU:-2},${HOUSEKEEPING_CPU:-0}" \
     -v /dev/hugepages:/dev/hugepages -v /dev/vfio:/dev/vfio -v /lib/firmware:/lib/firmware:ro \
     -v "$PWD/..:/work" -w /work/conduit \
     -v zhida-cargo-registry:/usr/local/cargo/registry -v zhida-nic-target:/work/target \
-    zhida-dpdk-test:local cargo run --locked --release -p nic-runner -- "$@"
+    zhida-dpdk-test:local sh -c 'cargo build --locked --release -p nic-runner &&
+      exec taskset -c "$0" ../target/release/zhida-nic "$@"' "${ZHIDA_CPU:-2}" "$@"
 }
 ```
 Native: install DPDK 25.11.3 under /opt/dpdk with the meson options in docker/Dockerfile, Rust 1.93,
@@ -221,9 +224,9 @@ handing it over (`nic-clock`): `no_stamp` (unstamped: `rx_timestamps` off or the
 (no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the largest error
 bound and a log2 histogram in ns. On ENA (with the DPDK patch in `docker/dpdk-ena-read-clock.patch`) unless
 `rte_eth_read_clock` returns -ENOTSUP (no PHC on the device), a thread on the housekeeping CPUs (online CPUs not
-in /sys/devices/system/cpu/isolated) maps the NIC clock onto the CPU counter, skipping failed reads; otherwise
-`nic_clock: none` is printed and every stamped message is `not_ready`. Other drivers' `read_clock` is not their RX
-stamps' clock (ice returns CLOCK_MONOTONIC_RAW), so they get none.
+in /sys/devices/system/cpu/isolated, minus Zhida's) maps the NIC clock onto the CPU counter, skipping failed reads.
+Otherwise, or with no housekeeping CPU, `nic_clock: none` is printed and every stamped message is `not_ready`.
+Other drivers' `read_clock` is not their RX stamps' clock (ice returns CLOCK_MONOTONIC_RAW), so they get none.
 
 ### 3c. sockperf-server
 ```
