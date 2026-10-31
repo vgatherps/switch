@@ -11,9 +11,7 @@ const BUCKETS: usize = SUB + (64 - SUB_BITS as usize) * SUB;
 pub struct Histogram {
     counts: Box<[u64; BUCKETS]>,
     count: u64,
-    min: u64,
     max: u64,
-    sum: u128,
 }
 
 impl Default for Histogram {
@@ -26,7 +24,6 @@ impl std::fmt::Debug for Histogram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Histogram")
             .field("count", &self.count)
-            .field("min", &self.min)
             .field("max", &self.max)
             .finish()
     }
@@ -58,9 +55,7 @@ impl Histogram {
         Histogram {
             counts: Box::new([0; BUCKETS]),
             count: 0,
-            min: u64::MAX,
             max: 0,
-            sum: 0,
         }
     }
 
@@ -68,9 +63,7 @@ impl Histogram {
     pub fn record(&mut self, value: u64) {
         self.counts[index(value)] += 1;
         self.count += 1;
-        self.min = self.min.min(value);
         self.max = self.max.max(value);
-        self.sum += u128::from(value);
     }
 
     pub fn count(&self) -> u64 {
@@ -79,14 +72,6 @@ impl Histogram {
 
     pub fn max(&self) -> u64 {
         self.max
-    }
-
-    pub fn min(&self) -> Option<u64> {
-        (self.count > 0).then_some(self.min)
-    }
-
-    pub fn mean(&self) -> Option<f64> {
-        (self.count > 0).then(|| self.sum as f64 / self.count as f64)
     }
 
     /// The value at quantile `q` (0..=1): the upper bound of the bucket holding the
@@ -111,12 +96,10 @@ impl Histogram {
             *a += b;
         }
         self.count += other.count;
-        self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
-        self.sum += other.sum;
     }
 
-    /// The non-empty buckets and the summary fields, for sending to the coordinator.
+    /// The non-empty buckets, the count and the max, for sending to the coordinator.
     pub fn to_sparse(&self) -> Sparse {
         let buckets = self
             .counts
@@ -127,9 +110,7 @@ impl Histogram {
             .collect();
         Sparse {
             count: self.count,
-            min: self.min,
             max: self.max,
-            sum: self.sum as f64,
             buckets,
         }
     }
@@ -145,9 +126,7 @@ impl Histogram {
             return Err("bucket counts do not add up to count".into());
         }
         h.count = s.count;
-        h.min = s.min;
         h.max = s.max;
-        h.sum = s.sum as u128;
         Ok(h)
     }
 }
@@ -156,9 +135,7 @@ impl Histogram {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sparse {
     pub count: u64,
-    pub min: u64,
     pub max: u64,
-    pub sum: f64,
     pub buckets: Vec<(u32, u64)>,
 }
 
@@ -205,7 +182,6 @@ mod tests {
             (h.quantile(0.5), h.quantile(0.99), h.quantile(1.0)),
             (Some(50), Some(99), Some(100))
         );
-        assert_eq!(h.min(), Some(1));
         let mut h = Histogram::new();
         for v in 1..=10_000u64 {
             h.record(v * 1000);
@@ -222,7 +198,6 @@ mod tests {
             );
         }
         assert_eq!(h.quantile(1.0), Some(10_000_000));
-        assert_eq!(h.mean(), Some(5_000_500.0));
     }
 
     #[test]
@@ -241,10 +216,7 @@ mod tests {
         for q in [0.0, 0.5, 0.9, 0.99, 1.0] {
             assert_eq!(a.quantile(q), both.quantile(q));
         }
-        assert_eq!(
-            (a.count(), a.min(), a.max()),
-            (both.count(), both.min(), both.max())
-        );
+        assert_eq!((a.count(), a.max()), (both.count(), both.max()));
     }
 
     /// A histogram sent as sparse buckets and rebuilt gives the same quantiles; tampered
@@ -261,10 +233,7 @@ mod tests {
         for q in [0.0, 0.5, 0.99, 1.0] {
             assert_eq!(back.quantile(q), h.quantile(q));
         }
-        assert_eq!(
-            (back.count(), back.min(), back.max()),
-            (5, Some(3), 5_000_000_000)
-        );
+        assert_eq!((back.count(), back.max()), (5, 5_000_000_000));
         let mut bad = s.clone();
         bad.buckets[0].1 += 1;
         assert!(Histogram::from_sparse(&bad).is_err());

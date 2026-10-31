@@ -15,20 +15,20 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const USAGE: &str = "\
 usage:
-  zhida-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N --size S
+  zhida-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N
                     --rate-min PPS --rate-max PPS [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200]
-                    [--lag-limit-us 20] [--lead-ms 50] [--budget-us W]
+                    [--budget-us W]
       The sweep coordinator: starts G generator workers (`sh -c CMD` with {i} = 0..G-1 and
       {senders} = N/G) and runs each rate PPS-min x sqrt(2)^k up to PPS-max on all of them (rate
       split evenly), stopping early at a generator-bound step. Prints one JSON line per step and
       always a summary line. --budget-us (tcp, ws): after the first step, each
       connection may have its rate share x (the first step's median round trip + W) in flight.
   zhida-bench gen --config F --proto udp|tcp|ws --target IP:PORT --senders N --size S
-                  [--send-budget 32] [--local-port 40000]
+                  [--local-port 40000]
       One generator worker (a Zhida Stack on its own Port and core); takes steps on stdin.
       udp: N sockets; tcp: N connections, S-byte messages on each (S at most the MSS);
       ws: N ws:// connections, S-byte binary messages (S at most 1400: one TCP frame).
-  zhida-bench serve --config F --proto udp|tcp|ws --port P [--max-conns 256] [--accepts 64]
+  zhida-bench serve --config F --proto udp|tcp|ws --port P
       Zhida echo server; runs until SIGINT/SIGTERM.";
 
 struct Flags(HashMap<String, String>);
@@ -102,18 +102,14 @@ fn main_inner() -> Result<(), String> {
         "sweep" => {
             let proto = proto(&mut flags)?;
             let args = coord::Args {
-                proto: proto.name(),
                 gens: flags.need("gens")?,
                 gen_cmd: flags.need("gen-cmd")?,
                 senders: flags.need("senders")?,
-                size: flags.need("size")?,
                 rate_min: flags.need("rate-min")?,
                 rate_max: flags.need("rate-max")?,
                 step_ms: flags.or("step-ms", 2000)?,
                 warmup_ms: flags.or("warmup-ms", 500)?,
                 drain_ms: flags.or("drain-ms", 200)?,
-                lag_limit_us: flags.or("lag-limit-us", 20)?,
-                lead_ms: flags.or("lead-ms", 50)?,
                 budget_window_us: flags.take("budget-us")?,
             };
             if args.budget_window_us.is_some() && proto == Proto::Udp {
@@ -133,12 +129,11 @@ fn main_inner() -> Result<(), String> {
                 target: flags.need("target")?,
                 senders: flags.need("senders")?,
                 size: flags.need("size")?,
-                send_budget: flags.or("send-budget", 32)?,
                 local_port: flags.or("local-port", 40000)?,
             };
             flags.done()?;
-            if args.senders == 0 || args.send_budget == 0 {
-                return Err("need --senders > 0 and --send-budget > 0".into());
+            if args.senders == 0 {
+                return Err("need --senders > 0".into());
             }
             load::run(&args, &mut print_line)
         }
@@ -148,8 +143,6 @@ fn main_inner() -> Result<(), String> {
                 config: flags.need("config")?,
                 proto,
                 port: flags.need("port")?,
-                max_conns: flags.or("max-conns", 256)?,
-                accepts: flags.or("accepts", 64)?,
             };
             flags.done()?;
             serve::run(&args)

@@ -54,11 +54,12 @@ pub struct Args {
     pub target: SocketAddrV4,
     pub senders: u32,
     pub size: usize,
-    pub send_budget: u32,
     /// First local port; sender i uses `local_port + i`.
     pub local_port: u16,
 }
 
+/// Most sends the send task tries per poll before the loop turns the Net.
+const SEND_BUDGET: u32 = 32;
 /// Datagrams each UDP socket may hold before the Stack drops.
 const UDP_QUEUE: usize = 256;
 /// Receive and send buffer of each generator TCP connection.
@@ -115,9 +116,6 @@ pub struct StepResult {
     pub offered_pps: f64,
     pub measured: u64,
     pub received: u64,
-    /// Measured messages that never left the generator before the window ended (included in
-    /// the loss: measured - received).
-    pub unsent: u64,
     /// Messages actually sent, and this step's echoes received, within the window: the achieved
     /// rates, against `offered_pps`.
     pub sent_in_window: u64,
@@ -138,7 +136,6 @@ pub struct StepResult {
 struct Sent {
     lag: Histogram,
     backlog_at_end: u64,
-    unsent: u64,
     in_window: u64,
     budget_waits: u64,
 }
@@ -511,7 +508,7 @@ impl Worker {
                 senders: self.senders.clone(),
                 conns: self.conns.clone(),
                 clock,
-                pacer: Pacer::new(schedule, end, self.args.send_budget),
+                pacer: Pacer::new(schedule, end, SEND_BUDGET),
                 schedule,
                 measured_from,
                 window,
@@ -540,7 +537,6 @@ impl Worker {
             offered_pps: schedule.offered_pps(),
             measured: r.measured(),
             received: r.received,
-            unsent: s.unsent,
             sent_in_window: s.in_window,
             received_in_window: r.received_in_window,
             latency: r.latency.to_sparse(),
@@ -605,7 +601,6 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let mut out = Sent {
         lag: Histogram::new(),
         backlog_at_end: 0,
-        unsent: 0,
         in_window: 0,
         budget_waits: 0,
     };
@@ -674,7 +669,6 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
         switch::yield_now().await;
     }
     out.backlog_at_end = pacer.backlog_at_end();
-    out.unsent = pacer.unsent_from(measured_from);
     *done.borrow_mut() = Some(out);
 }
 

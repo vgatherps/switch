@@ -33,20 +33,15 @@ pub fn rates(rate_min: u64, rate_max: u64) -> Vec<u64> {
 
 #[derive(Debug, Clone)]
 pub struct Args {
-    pub proto: &'static str,
     pub gens: u32,
     /// `sh -c` command of worker `{i}` with `{senders}` senders.
     pub gen_cmd: String,
     pub senders: u32,
-    pub size: usize,
     pub rate_min: u64,
     pub rate_max: u64,
     pub step_ms: u64,
     pub warmup_ms: u64,
     pub drain_ms: u64,
-    pub lag_limit_us: u64,
-    /// How far ahead of sending a step's command its start time lies.
-    pub lead_ms: u64,
     /// TCP/ws: the outstanding budget's window beyond the baseline round trip; `None`: no budget.
     pub budget_window_us: Option<u64>,
 }
@@ -85,26 +80,14 @@ pub fn budget_per_connection(
 #[derive(Debug, Clone, Serialize)]
 pub struct StepReport {
     pub kind: &'static str,
-    pub proto: &'static str,
-    pub step: u32,
-    pub gens: u32,
-    pub senders: u32,
-    pub size: usize,
-    pub rate_pps: u64,
     pub offered_pps: f64,
     /// What actually left the generators, and what came back, within the window.
     pub sent_pps: f64,
     pub received_pps: f64,
-    pub measured: u64,
-    pub received: u64,
-    /// Measured messages still owed or behind when the window ended: never sent (part of the
-    /// loss).
-    pub unsent: u64,
-    /// (measured - received) / measured.
+    /// Measured messages not echoed by the end of the drain, over measured messages (those never
+    /// sent included).
     pub drop_fraction: f64,
     pub latency_ns: Option<Quantiles>,
-    /// TCP/ws: messages in flight per connection allowed this step (largest over workers).
-    pub budget: Option<u32>,
     /// Some measured message waited on the budget: a knee here may be the budget's, not the
     /// receiver's.
     pub budget_bound: bool,
@@ -119,14 +102,6 @@ pub struct StepReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub kind: &'static str,
-    pub proto: &'static str,
-    pub gens: u32,
-    pub senders: u32,
-    pub size: usize,
-    pub rate_max: u64,
-    pub budget_window_us: Option<u64>,
-    /// The first step's median service round trip (TCP/ws): the budget's baseline.
-    pub baseline_rtt_p50_ns: Option<u64>,
     pub steps: u32,
     /// Every step ran or the sweep stopped at a generator-bound step; false: see `error`.
     pub complete: bool,
@@ -136,14 +111,11 @@ pub struct Summary {
     pub error: Option<String>,
 }
 
-/// Merges the workers' results of one step (`results[g]` from worker g). `budget` is left for
-/// the caller.
-pub fn merge(
-    args: &Args,
-    step: u32,
-    rate_pps: u64,
-    results: &[StepResult],
-) -> Result<StepReport, String> {
+/// A generator whose send lag (actual - scheduled send time) p99 is above this fell behind.
+const LAG_LIMIT_NS: u64 = 20_000;
+
+/// Merges the workers' results of one step (`results[g]` from worker g).
+pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepReport, String> {
     let mut latency = Histogram::new();
     let mut rtt = Histogram::new();
     let mut generator_bound = false;
@@ -157,33 +129,22 @@ pub fn merge(
         latency.merge(&Histogram::from_sparse(&r.latency)?);
         rtt.merge(&Histogram::from_sparse(&r.service_rtt)?);
         let lag_p99 = Histogram::from_sparse(&r.send_lag)?.quantile(0.99);
-        generator_bound |=
-            r.backlog_at_end > 0 || lag_p99.is_some_and(|p| p > args.lag_limit_us * 1000);
+        generator_bound |= r.backlog_at_end > 0 || lag_p99.is_some_and(|p| p > LAG_LIMIT_NS);
     }
     let sum = |f: fn(&StepResult) -> u64| results.iter().map(f).sum::<u64>();
     let (measured, received) = (sum(|r| r.measured), sum(|r| r.received));
     let window_s = args.step_ms as f64 / 1e3;
     Ok(StepReport {
         kind: "step",
-        proto: args.proto,
-        step,
-        gens: results.len() as u32,
-        senders: args.senders,
-        size: args.size,
-        rate_pps,
         offered_pps: results.iter().map(|r| r.offered_pps).sum(),
         sent_pps: sum(|r| r.sent_in_window) as f64 / window_s,
         received_pps: sum(|r| r.received_in_window) as f64 / window_s,
-        measured,
-        received,
-        unsent: sum(|r| r.unsent),
         drop_fraction: if measured == 0 {
             0.0
         } else {
             (measured - received) as f64 / measured as f64
         },
         latency_ns: Quantiles::of(&latency),
-        budget: None,
         budget_bound: sum(|r| r.budget_waits) > 0,
         generator_bound,
         service_rtt_p50_ns: rtt.quantile(0.5),
@@ -215,6 +176,8 @@ struct Worker {
 const READY_LIMIT: Duration = Duration::from_secs(60);
 /// A step's reply may come this long after the step's drain.
 const REPLY_SLACK: Duration = Duration::from_secs(10);
+/// How far ahead of sending a step's command its start time lies.
+const LEAD_MS: u64 = 50;
 /// How long a worker may take to exit once its input closes.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
@@ -325,13 +288,6 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     }
     let mut summary = Summary {
         kind: "summary",
-        proto: args.proto,
-        gens: args.gens,
-        senders: args.senders,
-        size: args.size,
-        rate_max: args.rate_max,
-        budget_window_us: args.budget_window_us,
-        baseline_rtt_p50_ns: None,
         steps: 0,
         complete: false,
         generator_bound: false,
@@ -411,19 +367,18 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
             return Err(format!("generator {i}: expected ready, got {line:?}"));
         }
     }
-    let step_limit =
-        Duration::from_millis(args.lead_ms + args.warmup_ms + args.step_ms + args.drain_ms)
-            + REPLY_SLACK;
+    let step_limit = Duration::from_millis(LEAD_MS + args.warmup_ms + args.step_ms + args.drain_ms)
+        + REPLY_SLACK;
     let window_ns = args.budget_window_us.map(|us| us * 1000);
+    // the first step's median service round trip (TCP/ws): the budget's baseline
+    let mut baseline_rtt_ns = None;
     for (id, rate) in (0u32..).zip(rates(args.rate_min, args.rate_max)) {
         check_clocks(&mut workers.0)?;
-        let start_unix_ns = unix_now_ns() + args.lead_ms * 1_000_000;
-        let mut max_budget = None;
+        let start_unix_ns = unix_now_ns() + LEAD_MS * 1_000_000;
         for (g, (w, share)) in (0u32..).zip(workers.0.iter_mut().zip(split_rate(rate, args.gens))) {
             let budget = window_ns
-                .zip(summary.baseline_rtt_p50_ns)
+                .zip(baseline_rtt_ns)
                 .map(|(w, b)| budget_per_connection(share, per, b, w));
-            max_budget = max_budget.max(budget);
             send(
                 w,
                 &Request::Step(load::Command {
@@ -453,13 +408,12 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
                 }
             }
         }
-        let mut report = merge(args, id, rate, &results)?;
-        report.budget = max_budget;
+        let report = merge(args, id, &results)?;
         summary.steps = id + 1;
         out(&serde_json::to_string(&report).expect("report serializes"));
         if id == 0 && window_ns.is_some() {
-            summary.baseline_rtt_p50_ns = report.service_rtt_p50_ns;
-            if summary.baseline_rtt_p50_ns.is_none() {
+            baseline_rtt_ns = report.service_rtt_p50_ns;
+            if baseline_rtt_ns.is_none() {
                 return Err(
                     "no echo in the first step: no baseline round trip for the budget".into(),
                 );
@@ -488,18 +442,14 @@ mod tests {
 
     fn args() -> Args {
         Args {
-            proto: "udp",
             gens: 2,
             gen_cmd: String::new(),
             senders: 4,
-            size: 64,
             rate_min: 1000,
             rate_max: 1000,
             step_ms: 1,
             warmup_ms: 0,
             drain_ms: 0,
-            lag_limit_us: 20,
-            lead_ms: 0,
             budget_window_us: None,
         }
     }
@@ -519,7 +469,6 @@ mod tests {
             offered_pps: 500.0,
             measured,
             received: latencies.len() as u64,
-            unsent: 0,
             sent_in_window: measured,
             received_in_window: latencies.len() as u64,
             latency: lat.to_sparse(),
@@ -541,23 +490,21 @@ mod tests {
     }
 
     /// Achieved rates come from what was sent and received within the window, not the
-    /// schedule; unsent messages are part of the loss; any budget wait marks the step.
+    /// schedule; loss is over all measured messages; any budget wait marks the step.
     #[test]
-    fn merge_reports_achieved_rates_unsent_and_budget_waits() {
+    fn merge_reports_achieved_rates_loss_and_budget_waits() {
         let mut a = result(1, &[1000; 4], &[100], 10, 0);
         a.sent_in_window = 6;
-        a.unsent = 4;
         a.budget_waits = 2;
         let b = result(1, &[1000; 10], &[100], 10, 0);
         let mut args = args();
         args.step_ms = 2000;
-        let m = merge(&args, 1, 10, &[a.clone(), b.clone()]).unwrap();
-        assert_eq!((m.measured, m.received, m.unsent), (20, 14, 4));
+        let m = merge(&args, 1, &[a.clone(), b.clone()]).unwrap();
         assert!((m.drop_fraction - 0.3).abs() < 1e-12);
         assert_eq!((m.sent_pps, m.received_pps), (8.0, 7.0));
         assert!(m.budget_bound);
         a.budget_waits = 0;
-        assert!(!merge(&args, 1, 10, &[a, b]).unwrap().budget_bound);
+        assert!(!merge(&args, 1, &[a, b]).unwrap().budget_bound);
     }
 
     /// A fake worker script: ready; a clock probe answers its wall clock plus `skew_ns`; the
@@ -683,14 +630,13 @@ mod tests {
         assert_eq!(lines[1]["generator_bound"], true);
     }
 
-    /// Counts add up across generators, latency quantiles are those of all echoes together,
-    /// and loss is measured minus received over both.
+    /// Latency quantiles are those of all echoes together, and loss is measured minus received
+    /// over all generators.
     #[test]
-    fn merge_sums_counts_and_pools_latency() {
+    fn merge_pools_latency_and_loss() {
         let a = result(3, &[1000, 2000], &[100, 200], 3, 0);
         let b = result(3, &[3000, 4000, 5000], &[100], 3, 0);
-        let m = merge(&args(), 3, 1000, &[a, b]).unwrap();
-        assert_eq!((m.measured, m.received), (6, 5));
+        let m = merge(&args(), 3, &[a, b]).unwrap();
         assert!((m.drop_fraction - 1.0 / 6.0).abs() < 1e-12);
         let q = m.latency_ns.unwrap();
         assert!(q.p50 >= 3000 && q.p50 <= 3000 + 3000 / 128, "p50 {}", q.p50);
@@ -706,7 +652,7 @@ mod tests {
         let fine = result(0, &[1000], &[1000], 1, 0);
         let backlogged = result(0, &[1000], &[1000], 1, 7);
         let lagging = result(0, &[1000], &[25_000; 100], 1, 0);
-        let bound = |r: &[StepResult]| merge(&args(), 0, 1000, r).unwrap().generator_bound;
+        let bound = |r: &[StepResult]| merge(&args(), 0, r).unwrap().generator_bound;
         assert!(!bound(&[fine.clone(), fine.clone()]));
         assert!(bound(&[fine.clone(), backlogged]));
         assert!(bound(&[lagging, fine]));
@@ -717,7 +663,6 @@ mod tests {
         let m = merge(
             &args(),
             2,
-            1000,
             &[result(2, &[], &[], 0, 0), result(1, &[], &[], 0, 0)],
         );
         assert!(m.is_err());
