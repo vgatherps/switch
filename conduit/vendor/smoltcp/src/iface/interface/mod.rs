@@ -202,7 +202,7 @@ pub struct Config {
     /// Set the Hardware address the interface will use.
     ///
     /// # Panics
-    /// Creating the interface panics if the address is not unicast.
+    /// Creating the interface panics if an Ethernet address is not unicast or is all zeros.
     pub(crate) hardware_addr: HardwareAddress,
 }
 
@@ -222,7 +222,7 @@ impl Interface {
     ///
     /// # Panics
     /// This function panics if the configured `hardware_addr` does not match
-    /// the medium of the device.
+    /// the medium of the device, or is an Ethernet address that is not unicast or is all zeros.
     /// It also panics if [`Config::neighbor_capacity`] is zero.
     pub fn new(config: Config, device: &mut (impl Device + ?Sized), now: Instant) -> Self {
         assert!(
@@ -236,6 +236,9 @@ impl Interface {
             caps.medium,
             "The hardware address does not match the medium of the interface."
         );
+        if caps.medium == Medium::Ethernet {
+            InterfaceInner::check_hardware_addr(&config.hardware_addr);
+        }
 
         let mut rand = Rand::new(config.random_seed);
 
@@ -337,7 +340,15 @@ impl Interface {
         InterfaceInner::check_ip_addrs(&self.inner.ip_addrs);
     }
 
+    /// # Panics
+    /// This function panics if the gateway is not unicast.
     pub fn set_ipv4_gateway(&mut self, gateway: Option<Ipv4Address>) {
+        if let Some(gateway) = gateway {
+            assert!(
+                IpAddress::Ipv4(gateway).is_unicast(),
+                "IPv4 gateway {gateway} is not unicast"
+            );
+        }
         self.inner.neighbor_cache.bump();
         self.inner.ipv4_gateway = gateway;
     }
@@ -973,8 +984,8 @@ impl InterfaceInner {
     }
 
     fn check_hardware_addr(addr: &HardwareAddress) {
-        if !addr.is_unicast() {
-            panic!("Hardware address {addr} is not unicast")
+        if !addr.is_unicast() || *addr == HardwareAddress::Ethernet(EthernetAddress([0; 6])) {
+            panic!("Hardware address {addr} is not unicast and nonzero")
         }
     }
 

@@ -300,7 +300,7 @@ fn create_stack(port: Port) -> Result<Stack, Box<dyn std::error::Error>> {
 }
 ```
 
-`ethernet` and the `ipv4` address must be unicast. A destination inside the configured subnet is
+`ethernet` must be unicast and nonzero, and the `ipv4` address unicast. A destination inside the configured subnet is
 reached directly; any other destination goes to the gateway's MAC. There is no route table. With
 `gateway: None` only on-link peers are reachable: UDP sends to other addresses fail with `NoRoute`
 and a TCP connect to them sends nothing. A gateway must be unicast, inside the configured subnet, and

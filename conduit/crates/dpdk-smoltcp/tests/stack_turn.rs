@@ -358,6 +358,14 @@ fn invalid_config_returns_port() {
             (
                 StackConfig {
                     max_udp_sockets: 0,
+                    ethernet: EthernetAddress([0; 6]),
+                    ..valid
+                },
+                "Ethernet address must be nonzero",
+            ),
+            (
+                StackConfig {
+                    max_udp_sockets: 0,
                     ipv4: Ipv4Cidr::new(Ipv4Address::BROADCAST, 24),
                     ..valid
                 },

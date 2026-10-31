@@ -893,6 +893,9 @@ fn validate(config: &StackConfig<'_>) -> Result<(), &'static str> {
     if !config.ethernet.is_unicast() {
         return Err("Ethernet address must be unicast");
     }
+    if config.ethernet == EthernetAddress([0; 6]) {
+        return Err("Ethernet address must be nonzero");
+    }
     if !IpAddress::Ipv4(config.ipv4.address()).is_unicast() {
         return Err("IPv4 address must be unicast");
     }

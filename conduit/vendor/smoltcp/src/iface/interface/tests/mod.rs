@@ -225,6 +225,27 @@ fn zero_neighbor_capacity_panics() {
 }
 
 #[test]
+#[should_panic(expected = "is not unicast and nonzero")]
+fn zero_mac_panics() {
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress([0; 6])));
+    Interface::new(config, &mut Loopback::new(Medium::Ethernet), Instant::ZERO);
+}
+
+#[test]
+#[should_panic(expected = "is not unicast and nonzero")]
+fn multicast_mac_panics() {
+    let config = Config::new(HardwareAddress::Ethernet(EthernetAddress([1, 0, 0x5e, 0, 0, 1])));
+    Interface::new(config, &mut Loopback::new(Medium::Ethernet), Instant::ZERO);
+}
+
+#[test]
+#[should_panic(expected = "IPv4 gateway 255.255.255.255 is not unicast")]
+fn broadcast_gateway_panics() {
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    iface.set_ipv4_gateway(Some(Ipv4Address::BROADCAST));
+}
+
+#[test]
 #[cfg(feature = "medium-ip")]
 pub fn tcp_listen_drops_unspecified_src() {
     use crate::socket::tcp;
