@@ -1,5 +1,20 @@
 # Zhida application guide
 
+## Which layer
+
+Applications in this repo run on `switchnet`: a `Net` wraps the `Stack` and gives `switch` tasks
+async TCP and UDP sockets (`NetHandle::tcp_connect`, `tcp_accept`, `udp_bind`, `tx_frame`), and
+`relay` (WebSocket) and `sheath` (TLS 1.3) layer on its TCP streams. The loop that owns the
+thread calls `switchnet::round(net, rt, now, tick)`, one `Net::turn` and one `Runtime::poll`, and
+on a dedicated core calls it again at once: a sleep holds every packet that arrives during it
+(`zhida-nic feed` busy-polls through `binance_feed::run(.., None, ..)`). Sleep only when the core is
+shared, as the tap demos (binance-feed, relay-autobahn) do, 1 ms at most, with their tester
+process. switchnet's README, relay's crate docs and binance-feed's README are the place to
+start.
+
+This guide is the contract underneath: the `Stack` itself, which switchnet drives and which a
+program may also drive directly (its readiness tokens: `arm_tcp`, `arm_udp`, `pop_fired`).
+
 ## What Zhida is
 
 Zhida runs a TCP/UDP stack on DPDK with IPv4 over Ethernet. One `Stack` owns one `Port`, which
@@ -27,7 +42,7 @@ its own CPU. Share no Zhida ports, stacks, sockets, pools, or buffers between th
 
 EAL lasts for the process. Dropping `Eal` does not clean up DPDK or unregister its main lcore. After
 successful initialization, it cannot be initialized again. The application owns connection
-deadlines, scheduling, waiting, and protocols, as in `binance-feed`.
+deadlines, scheduling, waiting, and protocols.
 
 ## Setup
 
@@ -461,7 +476,7 @@ runs TCP egress passes, then flushes. Egress stops when a pass makes no socket p
 frame. A full pending queue bounds how much it can build in that call.
 
 Application work after `turn` sees received data. TCP bytes written then wait for `send` or the next
-`turn`, as in the feed pump and echo server's `serve` loop. `ingress_budget` bounds frames handed to
+`turn`, as in tap-echo's `serve` loop. `ingress_budget` bounds frames handed to
 smoltcp, not frames fetched in the RX burst, frames drained by the application, or egress work. A
 zero budget stages RX and runs maintenance and egress without processing staged RX. Staged frames
 are processed on subsequent calls even when the new burst receives nothing.
@@ -516,8 +531,9 @@ supplied to `new`, `turn`, or `receive`. A ready socket or past deadline is repo
 time. Unprocessed dropped handles or frame-drop wakes, or a dropped TCP socket that reached Closed,
 also report that time, so the next drive call cleans them up. `None` means no socket deadline. The
 timer wheel can report a boundary before the actual socket deadline. `poll_at` does not cover
-staged RX frames, pending TX frames, or packet arrivals, so never wait on it indefinitely. The feed
-caps its idle wait at 1 ms; a busy-poll application calls again immediately.
+staged RX frames, pending TX frames, or packet arrivals, so never wait on it indefinitely.
+binance-feed's tap demo caps its idle wait at 1 ms; a busy-poll application (`zhida-nic feed`)
+calls again immediately.
 
 If `rx_staged > 0`, call ingress again promptly: either the ingress budget ran out, or processing
 needs a pending slot and a TX packet, in which case flush and retry as the PMD accepts frames or
@@ -684,7 +700,7 @@ handle is owned retries without limit.
 
 ### Connect and listen
 
-The active-open shape in `binance-feed` is:
+The active-open shape is:
 
 ```rust
 let endpoint = IpEndpoint::new((*target.addr.ip()).into(), target.addr.port());
@@ -1104,8 +1120,9 @@ Keep EAL and its owner identity alive until every buffer has returned.
   `try_close`.
 - `crates/nic-runner`: the real-NIC runbook and `zhida-nic`, which calls `open` and handles each
   `OpenError` variant (`src/main.rs`, sizing in `src/nic.rs`). Also lists RX timestamp support per NIC.
-- `crates/binance-feed`: bookTicker over TCP, TLS and WebSocket, with application deadlines. It sets up
-  by hand through tap-echo's driver, not through `open`.
+- `crates/binance-feed`: bookTicker over TLS 1.3 and WebSocket (relay and sheath) as a switch task on
+  a switchnet `Net`, with application deadlines; its binary sets up by hand through tap-echo's
+  driver, and `zhida-nic feed` runs the same client after `open`.
 - `crates/tap-echo`: EAL/vdev/Port setup by hand, bounded echo I/O, drive loop, and explicit teardown.
 - `crates/memif-bench`: pool sizing, queued drive calls, stream workloads, and in-place UDP sending.
 - [docker/README.md](../docker/README.md): Linux DPDK test setup and commands.

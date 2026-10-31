@@ -29,4 +29,4 @@ cargo bench -p switch    # executor, timer_wheel, runtime (Criterion)
 cargo run -p switch --example manual_loop
 ```
 
-Examples are `basic` and `manual_loop`. `plans/` and `provenance/` hold the design notes and measurement records.
+Examples are `basic` and `manual_loop`.

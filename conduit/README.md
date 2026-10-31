@@ -33,7 +33,7 @@ Docker Desktop with at least 8 CPUs for its VM. No NIC or hugepages needed.
 
 ```sh
 make docker-image    # Ubuntu 24.04, Rust 1.93.0, DPDK 25.11.3 built from source
-make docker-build    # whole workspace, all targets
+make docker-build    # whole workspace, all targets except the `e2e` ones (make test builds those)
 make docker-test     # every test suite, then the Autobahn WebSocket suite
 make docker-fuzz     # Scapy TCP fuzzer
 ```
@@ -55,8 +55,10 @@ with `zhida-netconf discover`, hugepages, binding the NIC to vfio-pci, and `zhid
 
 ## Writing a program
 
-[docs/USAGE.md](docs/USAGE.md) is the API guide: setup, pool sizing, the drive loop, time, TCP, UDP,
-errors and shutdown. [crates/netconf-open/examples/tcp_client.rs](crates/netconf-open/examples/tcp_client.rs)
+Applications run on switchnet (async sockets for `switch` tasks), with relay (WebSocket) and
+sheath (TLS 1.3) on top; [docs/USAGE.md](docs/USAGE.md) starts with which layer to use, then is the
+guide to the Stack underneath: setup, pool sizing, the drive loop, time, TCP, UDP, errors and
+shutdown. [crates/netconf-open/examples/tcp_client.rs](crates/netconf-open/examples/tcp_client.rs)
 loads a config, opens the stack, connects to a TCP server, prints what it sends and closes the port.
 
 ```sh

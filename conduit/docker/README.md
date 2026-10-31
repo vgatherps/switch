@@ -243,8 +243,10 @@ concurrent TCP under-load clients. net_tap also runs a UDP-only server.
 
 It passes when every client reports zero dropped, duplicated and out-of-order messages, the
 server exits 0 after SIGTERM with zero malformed messages and 4 TCP connections accepted and
-closed, and, over af_packet (`--rx-timestamps`), every UDP datagram and TCP segment carries a
-kernel receive stamp with no decreases. The af_packet part turns TX checksum offload off on
+closed, and, over af_packet (config `"rx_timestamps": true`), every UDP datagram and TCP segment
+carries a kernel receive stamp. Decreases are reported, not checked: TCP stamps follow stream
+order (reordering and recovery deliver earlier stamps later), and two CPUs can fill af_packet's
+ring out of stamp order. The af_packet part turns TX checksum offload off on
 `vethc1` (`ethtool`, in the image); with it on, kernel frames cross the veth with unfinished
 UDP/TCP checksums and Zhida drops them as bad. The script needs root or
 CAP_NET_ADMIN+CAP_NET_RAW and /dev/net/tun, and runs every process on `DOCKER_CPUSET`.
