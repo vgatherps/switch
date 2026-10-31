@@ -1,6 +1,6 @@
-//! Fake clocks: the PHC is `phc0 + floor(c·k / 2^32)` ns at counter value `c`, and each read
-//! samples it at a counter value inside its `before..=after` window. A local `Mapping` stands
-//! in for the global one.
+//! Fake clocks: the PHC is `phc0 + floor(t·k / 2^32)` ns at counter time `t` (ticks, with a
+//! sub-tick phase: the counter reads `floor(t)`), and each read samples it at a counter time in
+//! its `before ..= after + 1` window. A local `Mapping` stands in for the global one.
 
 use std::sync::Arc;
 
@@ -19,7 +19,13 @@ struct Line {
 
 impl Line {
     fn phc(&self, c: u64) -> u64 {
-        self.phc0 + u64::try_from((u128::from(c) * u128::from(self.k)) >> 32).unwrap()
+        self.phc_sub(c, 0)
+    }
+
+    /// PHC ns `sub`/1024 of a tick after counter value `c`.
+    fn phc_sub(&self, c: u64, sub: u64) -> u64 {
+        let t = u128::from(c) * 1024 + u128::from(sub);
+        self.phc0 + u64::try_from((t * u128::from(self.k)) >> 42).unwrap()
     }
 
     /// Ticks in `ns` ns, rounded up.
@@ -190,27 +196,39 @@ fn seqlock_never_tears() {
 }
 
 proptest! {
-    /// Whatever the rates, windows, sample placement and extrapolation distance, the truth
-    /// lies within the bound.
+    /// Whatever the rates, windows, sample placement (sub-tick phase included) and
+    /// extrapolation distance, the truth lies within the bound.
     #[test]
     fn truth_within_bound(
         // 0.25 to 10 ns per tick: 100 MHz to 4 GHz counters.
         k in (1u64 << 30)..(10u64 << 32),
         phc0 in 0u64..(1 << 62),
         start in (1u64 << 20)..(1 << 50),
-        windows in prop::collection::vec((0u64..10_000, 0u64..10_000, 0u64..20 * MS), 13..40),
-        distance_ns in 0u64..250 * MS,
+        // Zero-width windows and zero distance half the time: there sub-tick phases are most
+        // of the error.
+        windows in prop::collection::vec(
+            (
+                prop_oneof![Just(0u64), 0u64..10_000],
+                prop_oneof![Just(0u64), 0u64..10_000],
+                0u64..1024,
+                0u64..20 * MS,
+            ),
+            13..40,
+        ),
+        distance_ns in prop_oneof![Just(0u64), 0u64..250 * MS],
+        now_sub in 0u64..1024,
         truth in 0u64..10 * MS,
     ) {
         let line = Line { phc0, k };
         let mut f = Fixture::default();
         let mut at = start;
-        for &(lead_ns, lag_ns, jitter_ns) in &windows {
+        for &(lead_ns, lag_ns, sub, jitter_ns) in &windows {
             at += line.ticks(90 * MS + jitter_ns);
-            f.add(line.read(at, line.ticks(lead_ns), line.ticks(lag_ns)));
+            let (lead, lag) = (line.ticks(lead_ns), line.ticks(lag_ns));
+            f.add(Read { before: at - lead, phc: line.phc_sub(at, sub), after: at + lag });
         }
         let now = at + line.ticks(distance_ns);
-        let phc = line.phc(now);
+        let phc = line.phc_sub(now, now_sub);
         prop_assume!(phc > truth);
         check(f.latency(phc - truth, now), truth);
     }
