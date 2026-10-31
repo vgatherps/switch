@@ -751,73 +751,9 @@ fn test_unknown_protocol_with_payload_no_reply(#[case] medium: Medium) {
             PacketMeta::default(),
             HardwareAddress::default(),
             &Ipv4Packet::new_checked(&bytes[..]).unwrap(),
-            #[cfg(feature = "udp-set")]
             None,
         ),
         None
-    );
-}
-
-#[rstest]
-#[case(Medium::Ethernet)]
-fn test_any_ip_accept_arp(#[case] medium: Medium) {
-    let mut buffer = [0u8; 64];
-    #[allow(non_snake_case)]
-    fn ETHERNET_FRAME_ARP(buffer: &mut [u8]) -> &[u8] {
-        let ethernet_repr = EthernetRepr {
-            src_addr: EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x03]),
-            dst_addr: EthernetAddress::from_bytes(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
-            ethertype: EthernetProtocol::Arp,
-        };
-        let frame_repr = ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Request,
-            source_hardware_addr: EthernetAddress::from_bytes(&[
-                0x02, 0x02, 0x02, 0x02, 0x02, 0x03,
-            ]),
-            source_protocol_addr: Ipv4Address::from_octets([192, 168, 1, 2]),
-            target_hardware_addr: EthernetAddress::from_bytes(&[
-                0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
-            ]),
-            target_protocol_addr: Ipv4Address::from_octets([192, 168, 1, 3]),
-        };
-        let mut frame = EthernetFrame::new_unchecked(&mut buffer[..]);
-        ethernet_repr.emit(&mut frame);
-
-        let mut frame = ArpPacket::new_unchecked(&mut buffer[ethernet_repr.buffer_len()..]);
-        frame_repr.emit(&mut frame);
-
-        &buffer[..ethernet_repr.buffer_len() + frame_repr.buffer_len()]
-    }
-
-    let (mut iface, mut sockets, _) = setup(medium);
-
-    assert!(
-        iface
-            .inner
-            .process_ethernet(
-                &mut sockets,
-                PacketMeta::default(),
-                ETHERNET_FRAME_ARP(buffer.as_mut()),
-                #[cfg(feature = "udp-set")]
-                None,
-            )
-            .is_none()
-    );
-
-    // Accept any IP address
-    iface.set_any_ip(true);
-
-    assert!(
-        iface
-            .inner
-            .process_ethernet(
-                &mut sockets,
-                PacketMeta::default(),
-                ETHERNET_FRAME_ARP(buffer.as_mut()),
-                #[cfg(feature = "udp-set")]
-                None,
-            )
-            .is_some()
     );
 }
 
@@ -855,7 +791,6 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
             PacketMeta::default(),
             HardwareAddress::default(),
             &frame,
-            #[cfg(feature = "udp-set")]
             None,
         ),
         None
@@ -888,7 +823,6 @@ fn test_unknown_protocol_without_payload_no_reply(#[case] medium: Medium) {
             PacketMeta::default(),
             HardwareAddress::default(),
             &frame,
-            #[cfg(feature = "udp-set")]
             None,
         ),
         None
@@ -1046,7 +980,6 @@ fn test_unicast_echo_reply(#[case] medium: Medium) {
             PacketMeta::default(),
             HardwareAddress::default(),
             &Ipv4Packet::new_checked(&bytes[..]).unwrap(),
-            #[cfg(feature = "udp-set")]
             None,
         ),
         Some(Packet::new_ipv4(expected_ip, IpPayload::Icmpv4(expected_icmp)))
@@ -1091,7 +1024,6 @@ fn test_broadcast_echo_no_reply(#[case] medium: Medium) {
                 PacketMeta::default(),
                 HardwareAddress::default(),
                 &Ipv4Packet::new_checked(&bytes[..]).unwrap(),
-                #[cfg(feature = "udp-set")]
                 None,
             ),
             None,
@@ -1133,7 +1065,6 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
             &mut sockets,
             PacketMeta::default(),
             frame.into_inner(),
-            #[cfg(feature = "udp-set")]
             None,
         ),
         Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
@@ -1418,7 +1349,6 @@ fn test_handle_off_subnet_arp_request(#[case] medium: Medium) {
             &mut sockets,
             PacketMeta::default(),
             frame.into_inner(),
-            #[cfg(feature = "udp-set")]
             None,
         ),
         Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
@@ -1471,7 +1401,6 @@ fn test_handle_other_arp_request(#[case] medium: Medium) {
             &mut sockets,
             PacketMeta::default(),
             frame.into_inner(),
-            #[cfg(feature = "udp-set")]
             None,
         ),
         None
@@ -1523,7 +1452,6 @@ fn test_arp_flush_after_update_ip(#[case] medium: Medium) {
             &mut sockets,
             PacketMeta::default(),
             frame.into_inner(),
-            #[cfg(feature = "udp-set")]
             None,
         ),
         Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
@@ -1695,7 +1623,6 @@ fn ipv4_reply_protocol(meta: PacketMeta, bytes: &[u8]) -> Option<IpProtocol> {
             meta,
             HardwareAddress::default(),
             &Ipv4Packet::new_unchecked(bytes),
-            #[cfg(feature = "udp-set")]
             None,
         )
         .map(|reply| reply.ip_repr().next_header())
@@ -1737,7 +1664,6 @@ fn ipv4_ip_reply(bytes: &[u8]) -> bool {
             &mut sockets,
             PacketMeta::default(),
             bytes,
-            #[cfg(feature = "udp-set")]
             None,
         )
         .is_some()
@@ -1758,7 +1684,6 @@ fn ipv4_ethernet_reply(bytes: &[u8]) -> bool {
             &mut sockets,
             PacketMeta::default(),
             frame.into_inner(),
-            #[cfg(feature = "udp-set")]
             None,
         )
         .is_some()
@@ -2054,7 +1979,6 @@ fn answer_to_own_source(iface: &mut Interface, sockets: &mut TcpSet, own: Ipv4Ad
             sockets,
             PacketMeta::default(),
             &bytes,
-            #[cfg(feature = "udp-set")]
             None,
         )
         .expect("a reply to the own-source packet is generated");
@@ -2118,7 +2042,6 @@ fn arp_sender_claiming_own_address_is_answered_not_learned(
         &mut sockets,
         PacketMeta::default(),
         &arp,
-        #[cfg(feature = "udp-set")]
         None,
     );
     let expected = (operation == ArpOperation::Request).then(|| {

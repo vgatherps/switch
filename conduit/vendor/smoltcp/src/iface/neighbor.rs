@@ -71,10 +71,6 @@ pub struct Cache {
     capacity: usize,
     changes: u64,
     next_expiry: Option<Instant>,
-    /// Index of the last address found. Checked against the entry's address before use,
-    /// so moves and removals never make it wrong; it only skips the scan when a Stack
-    /// keeps talking to the same neighbor.
-    last_found: Cell<usize>,
 }
 
 impl Cache {
@@ -100,20 +96,13 @@ impl Cache {
         Self {
             storage: Vec::with_capacity(capacity),
             capacity,
-            last_found: Cell::new(0),
             changes: 0,
             next_expiry: None,
         }
     }
 
     fn find(&self, address: &IpAddress) -> Option<usize> {
-        let last = self.last_found.get();
-        if self.storage.get(last).is_some_and(|(stored, _)| stored == address) {
-            return Some(last);
-        }
-        let index = self.storage.iter().position(|(stored, _)| stored == address)?;
-        self.last_found.set(index);
-        Some(index)
+        self.storage.iter().position(|(stored, _)| stored == address)
     }
 
     fn remove(&mut self, index: usize) -> (IpAddress, Entry) {
@@ -1294,20 +1283,16 @@ mod test {
             assert_eq!(cache.storage.len(), 1);
         }
 
-        /// The remembered index of the last address found is checked before use: an eviction
-        /// that moves entries leaves it pointing at another address, and finds still answer
-        /// right.
+        /// Eviction swap-removes the earliest entry, moving the last one into its place; every
+        /// remaining address is still found.
         #[test]
-        fn remembered_index_survives_eviction() {
+        fn eviction_keeps_remaining_entries_findable() {
             let mut cache = Cache::new(3);
             for last in 1..=3 {
                 cache.fill(address(last), HADDR_A, Instant::from_millis(i64::from(last)));
             }
-            assert_eq!(cache.find(&address(3)), Some(2));
-            assert_eq!(cache.last_found.get(), 2);
             cache.fill(address(4), HADDR_D, Instant::from_millis(4));
             assert_eq!(cache.lookup(&address(1), Instant::from_millis(10)), Answer::NotFound);
-            assert_eq!(cache.last_found.get(), 2);
             for last in 2..=3 {
                 assert_eq!(
                     cache.lookup(&address(last), Instant::from_millis(10)),

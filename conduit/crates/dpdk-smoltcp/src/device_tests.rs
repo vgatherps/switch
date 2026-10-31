@@ -2239,7 +2239,6 @@ fn capabilities_frame_is_mtu_plus_14() {
         let caps = device.capabilities();
         assert_eq!(caps.medium, Medium::Ethernet);
         assert_eq!((caps.max_transmission_unit, caps.ip_mtu()), (FRAME, 1500));
-        assert_eq!(caps.max_burst_size, None);
         let sums = &caps.checksum;
         for sum in [sums.ipv4, sums.udp, sums.tcp, sums.icmpv4] {
             assert!(matches!(sum, Checksum::Both));

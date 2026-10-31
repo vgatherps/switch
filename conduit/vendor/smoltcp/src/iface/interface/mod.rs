@@ -9,7 +9,6 @@ mod ethernet;
 mod ipv4;
 
 mod tcp;
-#[cfg(feature = "udp-set")]
 mod udp;
 
 use super::packet::*;
@@ -20,7 +19,6 @@ use heapless::Vec;
 
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::tcp_set::TcpSet;
-#[cfg(feature = "udp-set")]
 use super::udp_set::UdpSet;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT,
@@ -172,7 +170,6 @@ pub struct InterfaceInner {
     probe_owed: Option<Ipv4Address>,
     hardware_addr: HardwareAddress,
     ip_addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
-    any_ip: bool,
     ipv4_gateway: Option<Ipv4Address>,
     path_mtus: Option<PathMtus>,
     pub(crate) owned_ipv4: OwnedIpv4,
@@ -263,7 +260,6 @@ impl Interface {
                 caps,
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
-                any_ip: false,
                 ipv4_gateway: None,
                 path_mtus: None,
                 owned_ipv4: config.owned_ipv4,
@@ -367,15 +363,6 @@ impl Interface {
         self.inner.owned_ipv4 = owned;
     }
 
-    /// Enable or disable the AnyIP capability.
-    ///
-    /// When enabled, packets for any destination address are accepted locally,
-    /// regardless of the interface's configured [`ip_addrs`](Self::ip_addrs).
-    #[cfg(test)]
-    pub(crate) fn set_any_ip(&mut self, any_ip: bool) {
-        self.inner.any_ip = any_ip;
-    }
-
     /// Transmit packets queued in the sockets, and receive packets queued
     /// in the device.
     ///
@@ -412,7 +399,6 @@ impl Interface {
             match self.socket_ingress(
                 device,
                 sockets,
-                #[cfg(feature = "udp-set")]
                 None,
             ) {
                 PollIngressSingleResult::None => break,
@@ -476,13 +462,11 @@ impl Interface {
         self.socket_ingress(
             device,
             sockets,
-            #[cfg(feature = "udp-set")]
             None,
         )
     }
 
     /// Process one frame with TCP and UDP sockets.
-    #[cfg(feature = "udp-set")]
     pub fn poll_ingress_single_udp(
         &mut self,
         timestamp: Instant,
@@ -581,7 +565,7 @@ impl Interface {
         &mut self,
         device: &mut (impl Device + ?Sized),
         sockets: &mut TcpSet<'_>,
-        #[cfg(feature = "udp-set")] mut udp: Option<&mut UdpSet>,
+        mut udp: Option<&mut UdpSet>,
     ) -> PollIngressSingleResult {
         let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
             return PollIngressSingleResult::None;
@@ -600,7 +584,6 @@ impl Interface {
                     sockets,
                     rx_meta,
                     bytes,
-                    #[cfg(feature = "udp-set")]
                     udp.as_deref_mut(),
                 ) {
                     let result = if let Some(index) = sockets.pending_tcp_reply.take() {
@@ -638,7 +621,6 @@ impl Interface {
                     sockets,
                     rx_meta,
                     bytes,
-                    #[cfg(feature = "udp-set")]
                     udp.as_deref_mut(),
                 ) && let Err(err) = self.inner.dispatch_ip(
                     tx_token,
@@ -658,7 +640,6 @@ impl Interface {
                 .socket
                 .commit_rx(frame, pending);
         } else {
-            #[cfg(feature = "udp-set")]
             if let Some(udp) = udp
                 && let Some((slot, pending)) = udp.pending_rx_attach.take()
             {
@@ -1007,8 +988,6 @@ impl InterfaceInner {
 
     /// Check whether the interface has the given IP address assigned: its own address, then the
     /// owned set.
-    ///
-    /// Always returns true if [`InterfaceInner::any_ip`].
     pub(crate) fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
         if self.has_interface_addr(addr) {
@@ -1019,12 +998,10 @@ impl InterfaceInner {
         }
     }
 
-    /// `has_ip_addr` without the owned set: the interface's own address, or any address with
-    /// [`InterfaceInner::any_ip`].
+    /// `has_ip_addr` without the owned set: the interface's own address.
     #[inline]
     pub(crate) fn has_interface_addr(&self, addr: IpAddress) -> bool {
-        // If any IP is set to true, we don't bother about checking the IP.
-        self.any_ip || self.ip_addrs.iter().any(|probe| probe.address() == addr)
+        self.ip_addrs.iter().any(|probe| probe.address() == addr)
     }
 
     /// Whether `addr` is in the owned set (not the interface's own address).
@@ -1039,7 +1016,7 @@ impl InterfaceInner {
         sockets: &mut TcpSet,
         meta: PacketMeta,
         ip_payload: &'frame [u8],
-        #[cfg(feature = "udp-set")] udp: Option<&mut UdpSet>,
+        udp: Option<&mut UdpSet>,
     ) -> Option<Packet<'frame>> {
         match IpVersion::of_packet(ip_payload) {
             Ok(IpVersion::Ipv4) => {
@@ -1049,7 +1026,6 @@ impl InterfaceInner {
                     meta,
                     HardwareAddress::Ip,
                     &ipv4_packet,
-                    #[cfg(feature = "udp-set")]
                     udp,
                 )
             }

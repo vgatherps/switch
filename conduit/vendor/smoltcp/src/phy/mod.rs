@@ -50,7 +50,6 @@ impl phy::Device for StmPhy {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.max_transmission_unit = 1536;
-        caps.max_burst_size = Some(1);
         caps.medium = Medium::Ethernet;
         caps
     }
@@ -248,15 +247,6 @@ pub struct DeviceCapabilities {
     ///
     /// Most common IP MTU is 1500. Minimum is 576 (for IPv4) or 1280 (for IPv6). Maximum is 9216 octets.
     pub max_transmission_unit: usize,
-
-    /// Maximum burst size, in terms of MTU.
-    ///
-    /// The network device is unable to send or receive bursts large than the value returned
-    /// by this function.
-    ///
-    /// If `None`, there is no fixed limit on burst size, e.g. if network buffers are
-    /// dynamically allocated.
-    pub max_burst_size: Option<usize>,
 
     /// Checksum behavior.
     ///

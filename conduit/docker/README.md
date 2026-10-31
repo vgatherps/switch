@@ -468,7 +468,7 @@ fail it too (needs Linux `/proc`, awk, python3).
 features plus `medium-ip`, which gates smoltcp's TCP socket tests, then runs them again with
 `diagnostics`. That feature turns on the O(N)-per-packet TCP cross-checks (the flow index against
 a linear scan, the ready queue, the cached `poll_at`), which other builds skip. The fork supports
-only Zhida's configuration (IPv4 TCP and UDP over Ethernet, with std); its features are `udp-set`,
+only Zhida's configuration (IPv4 TCP and UDP over Ethernet, with std); its features are
 `auto-icmp-echo-reply`, `medium-ip`, `dpdk` and `diagnostics`. The crate is outside the
 workspace: it builds into `../target/smoltcp` against its own `vendor/smoltcp/Cargo.lock`
 (`--locked`). Its dev-dependencies are downloaded from crates.io into the `zhida-cargo-registry`

@@ -203,24 +203,6 @@ impl Device for RefusingDevice {
 }
 
 #[test]
-fn refusing_device_transmit_frame_uses_existing_limit() {
-    use crate::phy::FrameToken as _;
-
-    let mut device = RefusingDevice {
-        inner: TestingDevice::new(Medium::Ip),
-        remaining: 1,
-    };
-    let mut frame = crate::tests::tx_test_buf(&[2]);
-    frame.headroom_mut(1).0[0] = 1;
-    device
-        .transmit_frame(Instant::ZERO)
-        .unwrap()
-        .consume_retain(frame, 1, None);
-    assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
-    assert!(device.transmit_frame(Instant::ZERO).is_none());
-}
-
-#[test]
 fn egress_idle_means_next_pass_does_nothing() {
     for scenario in [
         "burst", "refused", "bounded", "parked", "touched", "source", "due",
@@ -341,7 +323,6 @@ fn ingress_sync_keeps_deadline_dirty() {
 }
 
 #[test]
-#[cfg(feature = "udp-set")]
 fn ingress_finds_app_relisten_of_already_dirty_socket() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ip);
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);

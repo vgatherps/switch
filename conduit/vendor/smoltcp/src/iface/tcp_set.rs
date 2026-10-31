@@ -1799,7 +1799,7 @@ mod tests {
             &config,
             1500,
             crate::tests::tx_test_source(1460),
-            super::super::DropQueue::with_capacity(1, #[cfg(feature = "udp-set")] 0),
+            super::super::DropQueue::with_capacity(1, 0),
         );
         // Raising the cap after admission must not change the admitted frame count.
         let (mut iface, _, _) = crate::tests::setup(Medium::Ip);

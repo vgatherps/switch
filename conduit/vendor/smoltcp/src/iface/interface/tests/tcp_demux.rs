@@ -198,21 +198,12 @@ fn ingress_syncs_app_listeners_and_rekeys_after_each_syn() {
                 let result = if entry == "single" {
                     iface.poll_ingress_single(Instant::ZERO, &mut device, &mut sockets)
                 } else {
-                    #[cfg(feature = "udp-set")]
-                    {
-                        let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
-                        iface.poll_ingress_single_udp(
-                            Instant::ZERO, &mut device, &mut sockets, &mut udp,
-                        )
-                    }
-                    #[cfg(not(feature = "udp-set"))]
-                    continue;
+                    let mut udp = crate::iface::UdpSet::new(0, crate::tests::tx_test_source(1472));
+                    iface.poll_ingress_single_udp(
+                        Instant::ZERO, &mut device, &mut sockets, &mut udp,
+                    )
                 };
                 assert_eq!(result, PollIngressSingleResult::SocketStateChanged);
-            }
-            #[cfg(not(feature = "udp-set"))]
-            if entry == "udp_single" {
-                continue;
             }
             assert_eq!(sockets.dirty_list, vec![0, 1]);
             iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);

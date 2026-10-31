@@ -8,10 +8,8 @@ mod ready_queue;
 mod tcp_demux;
 mod template;
 
-#[cfg(feature = "udp-set")]
 mod tx_checksum;
 
-#[cfg(feature = "udp-set")]
 mod udp;
 
 #[allow(unused)]

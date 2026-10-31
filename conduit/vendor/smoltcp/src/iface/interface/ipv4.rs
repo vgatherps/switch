@@ -62,7 +62,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv4_packet: &Ipv4Packet<&'a [u8]>,
-        #[cfg(feature = "udp-set")] udp: Option<&mut UdpSet>,
+        udp: Option<&mut UdpSet>,
     ) -> Option<Packet<'a>> {
         let mut checksum_caps = self.caps.checksum.clone();
         if meta.ipv4_checksum_verified {
@@ -95,11 +95,8 @@ impl InterfaceInner {
         if !dst_ours {
             // Only UDP may arrive on a broadcast or multicast destination. Like Linux, TCP and
             // ICMP sent there get no RST and no echo reply.
-            #[cfg(feature = "udp-set")]
             let accept = ipv4_repr.next_header == IpProtocol::Udp
                 && (ipv4_repr.dst_addr.is_multicast() || self.is_broadcast_v4(ipv4_repr.dst_addr));
-            #[cfg(not(feature = "udp-set"))]
-            let accept = false;
             if !accept {
                 net_trace!("Rejecting IPv4 packet to {}", ipv4_repr.dst_addr);
                 return None;
@@ -111,7 +108,6 @@ impl InterfaceInner {
         match ipv4_repr.next_header {
             IpProtocol::Icmp => self.process_icmpv4(ipv4_repr, ip_payload),
 
-            #[cfg(feature = "udp-set")]
             IpProtocol::Udp => {
                 let link_header_len = match self.caps.medium {
                     Medium::Ethernet => EthernetFrame::<&[u8]>::header_len(),

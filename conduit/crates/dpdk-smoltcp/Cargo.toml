@@ -8,7 +8,7 @@ license.workspace = true
 bench-offload = []
 
 [dependencies]
-smoltcp = { workspace = true, features = ["udp-set", "auto-icmp-echo-reply", "dpdk"] }
+smoltcp = { workspace = true, features = ["auto-icmp-echo-reply", "dpdk"] }
 zhida-buffer.workspace = true
 zhida-dpdk-sys.workspace = true
 

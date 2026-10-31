@@ -224,7 +224,7 @@ test-autobahn-check:
 # workspace, so it has its own lockfile and target dir. Include the TCP ISN integration
 # test: it exercises production ISNs, while socket unit tests keep their fixed ISN. The second
 # run adds diagnostics, the O(N)-per-packet TCP cross-checks.
-SMOLTCP_TEST_FEATURES = udp-set,medium-ip,auto-icmp-echo-reply
+SMOLTCP_TEST_FEATURES = medium-ip,auto-icmp-echo-reply
 test-smoltcp:
 	$(TIMEOUT) cargo test --locked --manifest-path vendor/smoltcp/Cargo.toml --target-dir ../target/smoltcp \
 		--lib --test tcp_isn --no-default-features --features $(SMOLTCP_TEST_FEATURES)

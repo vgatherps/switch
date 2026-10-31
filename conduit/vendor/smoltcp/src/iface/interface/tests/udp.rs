@@ -113,27 +113,6 @@ impl Device for UdpDevice {
     }
 }
 
-#[test]
-fn udp_device_transmit_frame_uses_existing_limit() {
-    use crate::phy::FrameToken as _;
-
-    let mut device = UdpDevice {
-        rx: VecDeque::new(),
-        tx: Vec::new(),
-        releases: Rc::new(Cell::new(0)),
-        caps: DeviceCapabilities::default(),
-        tx_left: Some(1),
-    };
-    let mut frame = crate::tests::tx_test_buf(&[3, 4]);
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
-    device
-        .transmit_frame(Instant::ZERO)
-        .unwrap()
-        .consume_retain(frame, 2, None);
-    assert_eq!(device.tx, vec![vec![1, 2, 3, 4]]);
-    assert!(device.transmit_frame(Instant::ZERO).is_none());
-}
-
 struct Test {
     iface: Interface,
     tcp: TcpSet<'static>,

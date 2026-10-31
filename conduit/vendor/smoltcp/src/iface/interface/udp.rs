@@ -35,8 +35,7 @@ impl Interface {
         if dst_addr.is_unspecified()
             || dst_addr.is_multicast()
             || self.inner.has_interface_addr(to.addr)
-            || (socket.template.as_ref().is_none_or(|template| template.dst() != dst_addr)
-                && self.inner.owns_ipv4(dst_addr))
+            || self.inner.owns_ipv4(dst_addr)
             || to.port == 0
             || (self.inner.is_broadcast(&to.addr) && !socket.config().broadcast)
         {

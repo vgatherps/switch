@@ -930,20 +930,6 @@ mod invalidation {
         assert!(peer.device.tx_queue.is_empty());
     }
 
-    #[test]
-    fn burst_cap_templates_preserve_window() {
-        let mut peer = Peer::configured(2, PEER, None, |iface, _| {
-            iface.inner.caps.max_burst_size = Some(1);
-        });
-        for millis in [1, 2, 3] {
-            peer.data(millis);
-            let frame = peer.frames.last().unwrap();
-            let ip = Ipv4Packet::new_checked(&frame[14..]).unwrap();
-            let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
-            assert_eq!(tcp.window_len(), 1474);
-        }
-    }
-
     mod producers {
         use super::*;
 

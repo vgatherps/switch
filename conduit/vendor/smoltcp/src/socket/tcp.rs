@@ -5234,7 +5234,6 @@ mod test {
     }
 
     /// Drained wakes: handles pushed since the last drain.
-    #[cfg(feature = "udp-set")]
     fn drain_wakes(queue: &crate::iface::DropQueue) -> Vec<crate::iface::SocketHandle> {
         let mut wakes = Vec::new();
         queue.drain_into(&mut Vec::new(), &mut Vec::new(), &mut wakes);
@@ -5243,7 +5242,6 @@ mod test {
 
     /// Every frame held, the last ACK advertised a zero window, and a quiet poll_at armed the
     /// wake at one frame below the cap. Returns the socket, its frames and the next peer seq.
-    #[cfg(feature = "udp-set")]
     fn zero_window_with_wake(
         queue: &crate::iface::DropQueue,
         handle: crate::iface::SocketHandle,
@@ -5271,7 +5269,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "udp-set")]
     fn add_admitted_registers_frame_drop_wake() {
         let mut set = crate::iface::TcpSet::new(64);
         let queue = crate::iface::DropQueue::with_capacity(1, 0);
@@ -5288,7 +5285,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "udp-set")]
     fn remove_clears_frame_drop_wake() {
         let mut set = crate::iface::TcpSet::new(64);
         let placeholder = set.add(Socket::test_socket(64, 64));
@@ -5303,7 +5299,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "udp-set")]
     fn frame_drop_wakes_socket_only_when_window_update_becomes_due() {
         let mut set = crate::iface::TcpSet::new(64);
         let handle = set.add(Socket::test_socket(64, 64));

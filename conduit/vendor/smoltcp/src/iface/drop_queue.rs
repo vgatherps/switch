@@ -2,7 +2,6 @@ use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
 
 use super::SocketHandle;
-#[cfg(feature = "udp-set")]
 use super::UdpHandle;
 
 #[derive(Clone, Debug)]
@@ -14,18 +13,16 @@ struct Dropped {
     wake: Vec<SocketHandle>,
     /// Sockets whose send found the frame pool empty; each at most once.
     frame_wait: Vec<SocketHandle>,
-    #[cfg(feature = "udp-set")]
     udp: Vec<UdpHandle>,
 }
 
 impl DropQueue {
     /// Capacities are the maximum number of live TCP and UDP handles, so pushes never allocate.
-    pub fn with_capacity(tcp: usize, #[cfg(feature = "udp-set")] udp: usize) -> Self {
+    pub fn with_capacity(tcp: usize, udp: usize) -> Self {
         Self(Rc::new(RefCell::new(Dropped {
             tcp: Vec::with_capacity(tcp),
             wake: Vec::with_capacity(tcp),
             frame_wait: Vec::with_capacity(tcp),
-            #[cfg(feature = "udp-set")]
             udp: Vec::with_capacity(udp),
         })))
     }
@@ -58,7 +55,6 @@ impl DropQueue {
     pub fn state(&self) -> (bool, bool) {
         let dropped = self.0.borrow();
         let empty = dropped.tcp.is_empty() && dropped.wake.is_empty();
-        #[cfg(feature = "udp-set")]
         let empty = empty && dropped.udp.is_empty();
         (empty, !dropped.frame_wait.is_empty())
     }
@@ -68,7 +64,6 @@ impl DropQueue {
         waiters.append(&mut self.0.borrow_mut().frame_wait);
     }
 
-    #[cfg(feature = "udp-set")]
     pub fn push_udp(&self, handle: UdpHandle) {
         let mut dropped = self.0.borrow_mut();
         debug_assert!(dropped.udp.len() < dropped.udp.capacity());
@@ -79,7 +74,6 @@ impl DropQueue {
     pub fn is_empty(&self) -> bool {
         let dropped = self.0.borrow();
         let empty = dropped.tcp.is_empty() && dropped.wake.is_empty();
-        #[cfg(feature = "udp-set")]
         let empty = empty && dropped.udp.is_empty();
         empty
     }
@@ -88,12 +82,11 @@ impl DropQueue {
     pub fn drain_into(
         &self,
         tcp: &mut Vec<SocketHandle>,
-        #[cfg(feature = "udp-set")] udp: &mut Vec<UdpHandle>,
+        udp: &mut Vec<UdpHandle>,
         wake: &mut Vec<SocketHandle>,
     ) {
         let mut dropped = self.0.borrow_mut();
         tcp.append(&mut dropped.tcp);
-        #[cfg(feature = "udp-set")]
         udp.append(&mut dropped.udp);
         wake.append(&mut dropped.wake);
     }
@@ -104,7 +97,7 @@ impl DropQueue {
     }
 }
 
-#[cfg(all(test, feature = "udp-set"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::iface::{TcpSet, UdpConfig, UdpSet};

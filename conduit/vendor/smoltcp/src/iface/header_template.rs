@@ -5,7 +5,6 @@ use crate::wire::{
 };
 use crate::wire::{TcpControl, TcpOption, TcpPacket, TcpRepr};
 use byteorder::{ByteOrder, NetworkEndian};
-#[cfg(feature = "udp-set")]
 use crate::wire::{UdpPacket, UdpRepr};
 
 /// Ethernet and IPv4 headers with zero total length and checksum, plus their partial sums.
@@ -245,23 +244,12 @@ impl TcpTemplate {
 }
 
 #[derive(Debug)]
-#[cfg(feature = "udp-set")]
 pub(crate) struct UdpTemplate {
     prefix: Ipv4Prefix,
     src_port: u16,
     dst_port: u16,
 }
 
-#[cfg(feature = "udp-set")]
-impl UdpTemplate {
-    /// The destination address the template was built for.
-    #[inline]
-    pub(crate) fn dst(&self) -> Ipv4Address {
-        self.prefix.dst
-    }
-}
-
-#[cfg(feature = "udp-set")]
 impl UdpTemplate {
     pub(crate) fn new(
         src_mac: EthernetAddress,
