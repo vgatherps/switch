@@ -2,8 +2,8 @@
 `zhida-aws-bench cleanup --run-id`.
 
 A run creates a VPC, subnet, internet gateway, route table, security group, placement group, key
-pair, six instances (with their root volumes and primary ENIs) and six data ENIs, all tagged
-RUN_TAG=<run id> through TagSpecifications. The runner records each ID as its create succeeds
+pair, instances (with their root volumes and primary ENIs), one data ENI each and, for `binance`, an
+Elastic IP on the data ENI, all tagged RUN_TAG=<run id> through TagSpecifications. The runner records each ID as its create succeeds
 (Created: in memory and run_dir/created.json). clean_run uses both sources: a resource is present
 while a describe finds it by tag or by recorded ID, or while it is recorded and no delete of it has
 yet succeeded or answered not-found. Each round deletes what is present, dependents first; a delete
@@ -23,6 +23,7 @@ EXPIRES_TAG = "zhida-bench-expires"
 # delete operation), in deletion order
 KINDS = {
     "instance": ("describe_instances", "Reservations", "InstanceId", "instance-id", "terminate_instances"),
+    "address": ("describe_addresses", "Addresses", "AllocationId", "allocation-id", "release_address"),
     "network-interface": ("describe_network_interfaces", "NetworkInterfaces", "NetworkInterfaceId",
                           "network-interface-id", "delete_network_interface"),
     "volume": ("describe_volumes", "Volumes", "VolumeId", "volume-id", "delete_volume"),
@@ -36,7 +37,7 @@ KINDS = {
                          "internet-gateway-id", "delete_internet_gateway"),
     "vpc": ("describe_vpcs", "Vpcs", "VpcId", "vpc-id", "delete_vpc"),
 }
-UNPAGED = {"describe_key_pairs", "describe_placement_groups"}
+UNPAGED = {"describe_addresses", "describe_key_pairs", "describe_placement_groups"}
 
 
 class Created:
@@ -112,6 +113,8 @@ def delete(ec2, kind, rid, r):
     if kind == "instance":
         ec2.terminate_instances(InstanceIds=[rid])
         return
+    if kind == "address" and (r or {}).get("AssociationId"):
+        ec2.disassociate_address(AssociationId=r["AssociationId"])
     if kind == "route-table":
         for a in (r or {}).get("Associations", []):
             if not a.get("Main"):

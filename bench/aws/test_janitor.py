@@ -83,6 +83,9 @@ class FakeEc2:
     def describe_key_pairs(self, Filters):
         return {"KeyPairs": self._items("describe_key_pairs", Filters)}
 
+    def describe_addresses(self, Filters):
+        return {"Addresses": self._items("describe_addresses", Filters)}
+
     def describe_placement_groups(self, Filters):
         return {"PlacementGroups": self._items("describe_placement_groups", Filters)}
 
@@ -127,6 +130,18 @@ class FakeEc2:
         if self.store["key-pair"].pop(KeyName, None):  # EC2 succeeds on a missing key pair
             self.deleted.append(("key-pair", KeyName))
 
+    def disassociate_address(self, AssociationId):
+        self.calls.append(("disassociate_address", AssociationId))
+        for a in self.store["address"].values():
+            if a.get("AssociationId") == AssociationId:
+                del a["AssociationId"]
+
+    def release_address(self, AllocationId):
+        a = self._need("release_address", "address", AllocationId, "InvalidAllocationID.NotFound")
+        if a.get("AssociationId"):
+            raise ClientError("InvalidIPAddress.InUse")
+        self._delete("address", AllocationId)
+
     def delete_placement_group(self, GroupName):
         self._need("delete_placement_group", "placement-group", GroupName, "InvalidPlacementGroup.Unknown")
         if [i for i in self.live_instances() if i["_pg"] == GroupName]:
@@ -154,6 +169,8 @@ class FakeEc2:
         self._delete("route-table", RouteTableId, rt["Associations"] and "associated")
 
     def detach_internet_gateway(self, InternetGatewayId, VpcId):
+        if any(a.get("AssociationId") for a in self.store["address"].values()):
+            raise ClientError("DependencyViolation", "the network has mapped public addresses")
         self._need("detach_internet_gateway", "internet-gateway", InternetGatewayId)["Attachments"] = []
 
     def delete_internet_gateway(self, InternetGatewayId):
@@ -303,6 +320,20 @@ class CleanRunTest(unittest.TestCase):
         self.assertNotIn("vol-loose", ec2.store["volume"])
         self.assertIn(("key-pair", "zhida-bench-r1"), ec2.deleted)
         self.assertEqual(ec2.store["instance"]["i-0"]["State"]["Name"], "terminated")
+
+    def test_an_elastic_ip_on_a_data_eni_is_disassociated_then_released(self):
+        for recorded_address in (True, False):  # the runner's record, and the tag lookup alone
+            ec2, recorded = run_world()
+            ec2.add("address", "eipalloc-1", AssociationId="eipassoc-1", NetworkInterfaceId="eni-data-0")
+            if recorded_address:
+                recorded["address"] = ["eipalloc-1"]
+            self.assertEqual(clean(ec2, recorded if recorded_address else {}), [])
+            self.assertEqual(left(ec2), [])
+            self.assertIn(("address", "eipalloc-1"), ec2.deleted)
+            names = [c[0] for c in ec2.calls]
+            self.assertLess(names.index("disassociate_address"), names.index("release_address"))
+            self.assertLess(names.index("release_address"), names.index("detach_internet_gateway"))
+            self.assertEqual(ec2.store["vpc"], {})
 
     def test_second_cleanup_is_a_no_op(self):
         ec2, recorded = run_world()

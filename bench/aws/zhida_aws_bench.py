@@ -239,9 +239,10 @@ class Aws:
         self.ec2, self.ssm = clients["ec2"], clients["ssm"]
         self.sts, self.quotas = clients["sts"], clients["service-quotas"]
 
-    def create_network(self, run_id, expires, my_ip, record, key_path):
-        """The run's VPC, subnet, internet gateway and route, security group, placement group and key
-        pair (private key to `key_path`), each passed to `record` as its create succeeds."""
+    def create_network(self, run_id, expires, my_ip, record, key_path, instance_type, strategy):
+        """The run's VPC, subnet (in a zone offering `instance_type`), internet gateway and route,
+        security group, placement group (`strategy`) and key pair (private key to `key_path`), each
+        passed to `record` as its create succeeds."""
         ec2 = self.ec2
         name = f"{NAME}-{run_id}"
 
@@ -252,7 +253,7 @@ class Aws:
         record("vpc", vpc)
         ec2.get_waiter("vpc_available").wait(VpcIds=[vpc])
         ec2.modify_vpc_attribute(VpcId=vpc, EnableDnsHostnames={"Value": True})
-        zone = self.zone_offering()
+        zone = self.zone_offering(instance_type)
         subnet = ec2.create_subnet(VpcId=vpc, CidrBlock=SUBNET_CIDR, AvailabilityZone=zone,
                                    TagSpecifications=spec("subnet"))["Subnet"]["SubnetId"]
         record("subnet", subnet)
@@ -269,7 +270,7 @@ class Aws:
         ec2.authorize_security_group_ingress(GroupId=sg, IpPermissions=[
             {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": sg}]},
             {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": f"{my_ip}/32"}]}])
-        ec2.create_placement_group(GroupName=name, Strategy="cluster", TagSpecifications=spec("placement-group"))
+        ec2.create_placement_group(GroupName=name, Strategy=strategy, TagSpecifications=spec("placement-group"))
         record("placement-group", name)
         material = ec2.create_key_pair(KeyName=name, KeyType="ed25519",
                                        TagSpecifications=spec("key-pair"))["KeyMaterial"]
@@ -278,24 +279,24 @@ class Aws:
             f.write(material)
         return {"name": name, "subnet": subnet, "zone": zone, "sg": sg}
 
-    def zone_offering(self):
+    def zone_offering(self, instance_type):
         offered = self.ec2.describe_instance_type_offerings(
             LocationType="availability-zone",
-            Filters=[{"Name": "instance-type", "Values": [INSTANCE_TYPE]}])["InstanceTypeOfferings"]
+            Filters=[{"Name": "instance-type", "Values": [instance_type]}])["InstanceTypeOfferings"]
         zones = sorted(o["Location"] for o in offered)
         if not zones:
-            raise RuntimeError(f"no zone in {self.region} offers {INSTANCE_TYPE}")
+            raise RuntimeError(f"no zone in {self.region} offers {instance_type}")
         return zones[0]
 
-    def launch_hosts(self, net, run_id, expires, record):
-        """Six instances in one run_instances into the placement group; then one data ENI each
-        (create, attach, DeleteOnTermination); every ID passed to `record` as its create succeeds.
-        Returns host records in ROLES order."""
+    def launch_hosts(self, net, run_id, expires, record, instance_type, roles):
+        """One instance per role in one run_instances into the placement group; then one data ENI
+        each (create, attach, DeleteOnTermination); every ID passed to `record` as its create
+        succeeds. Returns host records in `roles` order."""
         ec2 = self.ec2
         ami = self.ssm.get_parameter(Name=AMI_PARAM)["Parameter"]["Value"]
         tags = run_tags(run_id, expires)
         r = ec2.run_instances(
-            ImageId=ami, InstanceType=INSTANCE_TYPE, MinCount=len(ROLES), MaxCount=len(ROLES), KeyName=net["name"],
+            ImageId=ami, InstanceType=instance_type, MinCount=len(roles), MaxCount=len(roles), KeyName=net["name"],
             InstanceInitiatedShutdownBehavior="terminate",
             Placement={"GroupName": net["name"], "AvailabilityZone": net["zone"]},
             NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": net["subnet"], "Groups": [net["sg"]],
@@ -324,7 +325,15 @@ class Aws:
                      for res in page["Reservations"] for i in res["Instances"]}
         return [{"role": role, "id": iid, "public_ip": described[iid]["PublicIpAddress"],
                  "private_ip": described[iid]["PrivateIpAddress"], "data_eni": enis[iid]}
-                for iid, role in zip(ids, ROLES)]
+                for iid, role in zip(ids, roles)]
+
+    def attach_eip(self, eni, run_id, expires, record):
+        """A run's Elastic IP on the data ENI's private address (`eni` as launch_hosts gives it): an
+        instance with two ENIs gets no public IPv4, and the feed on the data ENI needs one."""
+        alloc = self.ec2.allocate_address(Domain="vpc", TagSpecifications=[
+            {"ResourceType": "elastic-ip", "Tags": run_tags(run_id, expires)}])["AllocationId"]
+        record("address", alloc)
+        self.ec2.associate_address(AllocationId=alloc, NetworkInterfaceId=eni["id"], PrivateIpAddress=eni["ip"])
 
 
 # ---------------------------------------------------------------- hosts
@@ -588,8 +597,8 @@ def run(args, env=None):
     fetch_errors, failed = [], ["(not measured)"]
     # From here on every exit path deletes the run's resources.
     try:
-        net = aws.create_network(run_id, expires, my_ip, created.add, key_path)
-        infos = aws.launch_hosts(net, run_id, expires, created.add)
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, INSTANCE_TYPE, "cluster")
+        infos = aws.launch_hosts(net, run_id, expires, created.add, INSTANCE_TYPE, ROLES)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump(infos, f, indent=1)
         hosts = [env.host(info, key_path, run_dir) for info in infos]

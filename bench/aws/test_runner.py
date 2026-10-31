@@ -179,6 +179,7 @@ class FakeLaunchEc2:
                "create_internet_gateway": {"InternetGateway": {"InternetGatewayId": "igw-1"}},
                "create_route_table": {"RouteTable": {"RouteTableId": "rtb-1"}},
                "create_security_group": {"GroupId": "sg-1"}, "create_key_pair": {"KeyMaterial": "PRIVATE\n"},
+               "allocate_address": {"AllocationId": "eipalloc-1"},
                "describe_instance_type_offerings": {"InstanceTypeOfferings": [{"Location": "zone-b"},
                                                                               {"Location": "zone-a"}]}}
 
@@ -193,7 +194,8 @@ class FakeLaunchEc2:
             self.calls.append((name, kw))
             if name == "run_instances":
                 # out of launch-index order on purpose
-                return {"Instances": [{"InstanceId": f"i-{k}", "AmiLaunchIndex": k} for k in (3, 0, 5, 1, 4, 2)]}
+                return {"Instances": [{"InstanceId": f"i-{k}", "AmiLaunchIndex": k}
+                                      for k in sorted(range(kw["MinCount"]), key=lambda k: (k % 2, -k))]}
             if name == "create_network_interface":
                 self.n += 1
                 return {"NetworkInterface": {"NetworkInterfaceId": f"eni-{self.n}", "MacAddress": f"m{self.n}",
@@ -233,7 +235,7 @@ class LaunchTest(unittest.TestCase):
     def test_network_is_per_run_tagged_and_recorded_as_created(self):
         ec2 = FakeLaunchEc2()
         key = os.path.join(tempfile.mkdtemp(), "key.pem")
-        net = launch_aws(ec2).create_network("r1", NOW, "203.0.113.9", ec2.record, key)
+        net = launch_aws(ec2).create_network("r1", NOW, "203.0.113.9", ec2.record, key, "c7gn.2xlarge", "cluster")
         self.assertEqual(net, NET)
         creates = [c[:2] for c in ec2.calls if c[0].startswith("create_") and c[0] != "create_route"]
         for n, kw in creates:
@@ -260,7 +262,7 @@ class LaunchTest(unittest.TestCase):
     def test_one_run_instances_of_six_into_the_placement_group_then_eni_attach(self):
         ec2 = FakeLaunchEc2()
         aws = launch_aws(ec2)
-        hosts = aws.launch_hosts(NET, "r1", NOW + datetime.timedelta(hours=2), ec2.record)
+        hosts = aws.launch_hosts(NET, "r1", NOW + datetime.timedelta(hours=2), ec2.record, "c7gn.2xlarge", z.ROLES)
         names = [c[0] for c in ec2.calls]
         self.assertEqual(names.count("run_instances"), 1)
         ri = ec2.calls[names.index("run_instances")][1]
@@ -290,6 +292,47 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual([(h["role"], h["id"], h["public_ip"]) for h in hosts],
                          [(r, f"i-{k}", f"pub-i-{k}") for k, r in enumerate(z.ROLES)])
         self.assertEqual(hosts[0]["data_eni"], {"id": "eni-1", "mac": "m1", "ip": "10.80.1.101"})
+
+    def test_one_instance_in_a_precision_time_group_with_an_elastic_ip_on_its_data_eni(self):
+        ec2 = FakeLaunchEc2()
+        aws = launch_aws(ec2)
+        key = os.path.join(tempfile.mkdtemp(), "key.pem")
+        expires = NOW + datetime.timedelta(hours=2)
+        net = aws.create_network("r1", expires, "203.0.113.9", ec2.record, key, "m7g.xlarge", "precision-time")
+        [host] = aws.launch_hosts(net, "r1", expires, ec2.record, "m7g.xlarge", ["binance"])
+        aws.attach_eip(host["data_eni"], "r1", expires, ec2.record)
+        names = [c[0] for c in ec2.calls]
+        offer = ec2.calls[names.index("describe_instance_type_offerings")][1]
+        self.assertEqual(offer["Filters"], [{"Name": "instance-type", "Values": ["m7g.xlarge"]}])
+        pg = ec2.calls[names.index("create_placement_group")][1]
+        self.assertEqual((pg["GroupName"], pg["Strategy"]), ("zhida-bench-r1", "precision-time"))
+        ri = ec2.calls[names.index("run_instances")][1]
+        self.assertEqual((ri["MinCount"], ri["MaxCount"], ri["InstanceType"]), (1, 1, "m7g.xlarge"))
+        self.assertEqual(ri["Placement"], {"GroupName": "zhida-bench-r1", "AvailabilityZone": "zone-a"})
+        self.assertLess(names.index("create_placement_group"), names.index("run_instances"))
+        self.assertIn(f"OnCalendar={expires.strftime('%Y-%m-%d %H:%M:%S')} UTC", ri["UserData"])
+        self.assertEqual((host["role"], host["id"]), ("binance", "i-0"))
+        tail = [c for c in ec2.calls[names.index("run_instances") + 2:] if c[0] != "paginate"]
+        self.assertEqual(tail, [
+            ("wait", "instance_running", {"InstanceIds": ["i-0"]}),
+            ("create_network_interface", {"SubnetId": "subnet-1", "Groups": ["sg-1"], "TagSpecifications": [
+                {"ResourceType": "network-interface", "Tags": z.run_tags("r1", expires)}]}),
+            ("record", ("network-interface", "eni-1")),
+            ("attach_network_interface", {"NetworkInterfaceId": "eni-1", "InstanceId": "i-0", "DeviceIndex": 1}),
+            ("modify_network_interface_attribute", {"NetworkInterfaceId": "eni-1", "Attachment": {
+                "AttachmentId": "att-eni-1", "DeleteOnTermination": True}}),
+            ("allocate_address", {"Domain": "vpc", "TagSpecifications": [
+                {"ResourceType": "elastic-ip", "Tags": z.run_tags("r1", expires)}]}),
+            ("record", ("address", "eipalloc-1")),
+            ("associate_address", {"AllocationId": "eipalloc-1", "NetworkInterfaceId": "eni-1",
+                                   "PrivateIpAddress": "10.80.1.101"}),
+        ])
+        self.assertFalse(any("EnaSrdSpecification" in c[1] for c in ec2.calls if isinstance(c[1], dict)),
+                         "no ENA Express call")
+        self.assertEqual([c[1] for c in ec2.calls if c[0] == "record"], [
+            ("vpc", "vpc-1"), ("subnet", "subnet-1"), ("internet-gateway", "igw-1"), ("route-table", "rtb-1"),
+            ("security-group", "sg-1"), ("placement-group", "zhida-bench-r1"), ("key-pair", "zhida-bench-r1"),
+            ("instance", "i-0"), ("network-interface", "eni-1"), ("address", "eipalloc-1")])
 
 
 # ---------------------------------------------------------------- Host (real class, fake subprocess)
@@ -549,8 +592,8 @@ class FakeAws:
         self.w, self.ec2 = world, FakeQuotaEc2([])
         self.sts, self.quotas = FakeSts(), FakeQuotas(96)
 
-    def create_network(self, run_id, expires, my_ip, record, key_path):
-        self.w.calls.append(("aws", f"create_network {my_ip}"))
+    def create_network(self, run_id, expires, my_ip, record, key_path, instance_type, strategy):
+        self.w.calls.append(("aws", f"create_network {my_ip} {instance_type} {strategy}"))
         record("vpc", "vpc-1")
         if self.w.network_fails:
             raise ClientError("RequestLimitExceeded", "slow down")
@@ -559,7 +602,8 @@ class FakeAws:
             f.write("PRIVATE\n")
         return dict(NET)
 
-    def launch_hosts(self, net, run_id, expires, record):
+    def launch_hosts(self, net, run_id, expires, record, instance_type, roles):
+        assert (instance_type, roles) == ("c7gn.2xlarge", z.ROLES)
         self.w.calls.append(("aws", "launch_hosts"))
         for k in range(len(z.ROLES)):
             record("instance", f"i-{k}")
