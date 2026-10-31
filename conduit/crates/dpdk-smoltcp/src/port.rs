@@ -446,6 +446,12 @@ fn register_rx_timestamp() -> Result<RxTimestampField, PortError> {
     })
 }
 
+/// Null slots after a TX burst's packet pointers. ENA's `eth_ena_xmit_pkts` prefetches
+/// `tx_pkts[i + 4]` (masked by its ring size, not the burst) after each packet it sends
+/// (DPDK 25.11.3 drivers/net/ena/ena_ethdev.c:3438), so a full burst of n reads up to index
+/// n + 3. `tx_scratch` holds `tx_burst + TX_LOOKAHEAD` pointers, the tail always null.
+const TX_LOOKAHEAD: usize = 4;
+
 /// One exclusively controlled ethdev and its separate RX/TX pool backing.
 pub struct Port {
     port_id: u16,
@@ -614,7 +620,8 @@ impl Port {
             frame_origin: NonNull::new(frame_pool.mempool()).expect("a frame pool has a mempool").cast(),
             frame: ManuallyDrop::new(Rc::new(frame_pool)),
             rx_scratch: vec![null_mut(); usize::from(config.rx_burst)].into_boxed_slice(),
-            tx_scratch: vec![null_mut(); usize::from(config.tx_burst)].into_boxed_slice(),
+            tx_scratch: vec![null_mut(); usize::from(config.tx_burst) + TX_LOOKAHEAD]
+                .into_boxed_slice(),
             ready: false,
             stopped: false,
             closed: false,
@@ -848,7 +855,7 @@ impl Port {
 
     /// Configured `tx_burst`: the most packets one `tx_burst` call offers.
     pub(crate) fn tx_burst_size(&self) -> usize {
-        self.tx_scratch.len()
+        self.tx_scratch.len() - TX_LOOKAHEAD
     }
 
     /// Allocate a TX packet with `len` data bytes; `None` if `len` exceeds the
@@ -964,11 +971,11 @@ impl Port {
         if pending.is_empty() {
             return Ok(0);
         }
-        let count = pending.len().min(self.tx_scratch.len());
-        for (slot, packet) in self.tx_scratch.iter_mut().zip(pending.iter()) {
+        let count = pending.len().min(self.tx_burst_size());
+        for (slot, packet) in self.tx_scratch[..count].iter_mut().zip(pending.iter()) {
             *slot = packet.as_ptr();
         }
-        // `count` fits: the scratch length came from a u16.
+        // `count` fits: it is at most the configured u16 `tx_burst`.
         let accepted =
             unsafe { eth_tx_burst(self.port_id, 0, self.tx_scratch.as_mut_ptr(), count as u16) };
         // The PMD may already have freed the accepted prefix. Disarm those owners
