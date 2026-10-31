@@ -88,7 +88,7 @@ pub enum Reply {
         step: u32,
         late_ns: u64,
     },
-    Step(StepResult),
+    Step(Box<StepResult>),
 }
 
 /// A step to run: this worker's share of the rate, starting at a wall-clock time common to all
@@ -309,7 +309,7 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
                         step: c.step,
                         late_ns: now_unix_ns - c.start_unix_ns,
                     },
-                    Request::Step(c) => Reply::Step(worker.step(c)?),
+                    Request::Step(c) => Reply::Step(Box::new(worker.step(c)?)),
                 }));
             }
             None if stdin.closed => break,

@@ -440,7 +440,7 @@ fn sweep(args: &Args, summary: &mut Summary, out: &mut dyn FnMut(&str)) -> Resul
         let mut results = Vec::with_capacity(workers.0.len());
         for (i, line) in replies(&mut workers.0, step_limit)?.iter().enumerate() {
             match parse(i, line)? {
-                Reply::Step(r) => results.push(r),
+                Reply::Step(r) => results.push(*r),
                 Reply::Late { late_ns, .. } => {
                     return Err(format!(
                         "generator {i} got the step at {rate} pps {late_ns} ns after its start"
@@ -566,7 +566,7 @@ mod tests {
     fn fake(name: &str, result: &StepResult, steps: u32, skew_ns: i64, late: u32) -> String {
         let path =
             std::env::temp_dir().join(format!("zhida-bench-{name}-{}.json", std::process::id()));
-        let line = serde_json::to_string(&Reply::Step(result.clone())).unwrap();
+        let line = serde_json::to_string(&Reply::Step(Box::new(result.clone()))).unwrap();
         std::fs::write(&path, line + "\n").unwrap();
         r#"echo '{"kind":"ready"}'; n=0
         while read line; do
