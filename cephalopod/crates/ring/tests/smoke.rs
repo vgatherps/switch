@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::io::ErrorKind;
 
 use ceph_ring::{Config, Reader, Writer};
 
@@ -21,18 +21,6 @@ fn push_and_read_back() {
         dir: "/dev/shm".into(),
     })
     .unwrap();
-    let name = Path::new(reader.name())
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    assert_eq!(name.len(), 19);
-    assert!(name.starts_with("cph"));
-    assert!(
-        name[3..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    );
     let writer = Writer::attach(reader.name()).unwrap();
     let records: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; i as usize * 3]).collect();
     for (seq, r) in records.iter().enumerate() {
@@ -64,4 +52,32 @@ fn push_and_read_back() {
         .map(|(seq, payload)| (seq as u64, 11, payload))
         .collect();
     assert_eq!(seen, expected);
+}
+
+#[test]
+fn reader_owns_name_and_attached_writer_survives_unlink() {
+    let mut reader = Reader::create(Config {
+        ring_size: 64 * 1024,
+        max_record: 100,
+        dir: "/dev/shm".into(),
+    })
+    .unwrap();
+    let name = reader.name().to_owned();
+
+    drop(Writer::attach(&name).unwrap());
+    let writer = Writer::attach(&name).expect("dropping a writer must preserve the reader's name");
+    writer.try_push(b"before unlink", 7, 0).unwrap();
+    let mut seen = Vec::new();
+    for ring in 0..reader.nr_rings() {
+        seen.extend(drain(&mut reader, ring));
+    }
+    assert_eq!(seen, vec![(7, 0, b"before unlink".to_vec())]);
+
+    drop(reader);
+    let error = match Writer::attach(&name) {
+        Ok(_) => panic!("dropping the reader must remove its name"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    writer.try_push(b"after unlink", 7, 1).unwrap();
 }

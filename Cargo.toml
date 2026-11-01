@@ -35,6 +35,10 @@ members = [
     # latency/load bench (plans/bench/design.md)
     "bench",
     # NIC hardware RX stamp → now latency on the CPU's invariant counter
+    # shared-memory backing and single/double mappings
+    "shared-memory",
+    # vendored
+    "vendor/slice_ringbuffer",
 ]
 exclude = ["conduit/vendor/smoltcp", "vendor/rustls"]
 
@@ -67,6 +71,8 @@ depot = { path = "depot" }
 dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
 relay = { path = "relay" }
 sheath = { path = "sheath" }
+shared-memory = { path = "shared-memory" }
+slice_ringbuffer = { path = "vendor/slice_ringbuffer" }
 smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-features = false }
 sockperf-wire = { path = "conduit/crates/sockperf-wire" }
 switch = { path = "switch" }

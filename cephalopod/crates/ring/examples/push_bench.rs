@@ -13,6 +13,10 @@ mod linux {
 
     const PUSHES: u128 = 20_000_000;
 
+    #[repr(align(64))]
+    struct Payload([u8; 4096]);
+    static PAYLOAD: Payload = Payload([0; 4096]);
+
     fn pin(cpu: usize) {
         // SAFETY: the zeroed set is initialized before the affinity syscall reads it.
         unsafe {
@@ -64,8 +68,8 @@ mod linux {
             }
         });
         pin(1);
-        measure(&writer, &[0; 16], "push");
-        measure(&writer, &[0; 4096], "push 4096");
+        measure(&writer, &PAYLOAD.0[..16], "push");
+        measure(&writer, &PAYLOAD.0, "push 4096");
         stop.store(true, Ordering::Release);
         consumer.join().unwrap();
     }
