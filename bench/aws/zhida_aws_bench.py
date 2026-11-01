@@ -756,7 +756,7 @@ for _ in range(4):
     sender.ssh(shlex.join(["python3", "-c", script, receiver_ip]))
 
 
-def kernel_snapshot(receiver, facts, configure=False, activate=None, wait=False):
+def kernel_snapshot(receiver, facts, configure=False, activate=None, wait=False, initial_error=None):
     """Data IRQ placement plus counters; NET_RX is host-wide, including management SSH."""
     script = r'''
 import json, pathlib, sys
@@ -838,7 +838,9 @@ print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_
                 not irq["write_error"] and irq["requested"] == facts["APP_CPU"]
                 for irq in error["irqs"].values()):
             activate()
-            return kernel_snapshot(receiver, facts, wait=True)
+            return kernel_snapshot(receiver, facts, wait=True, initial_error=error)
+        if initial_error is not None:
+            error["initial"] = initial_error
         path = os.path.join(receiver.run_dir, "kernel-irq-affinity-error.json")
         with open(path, "w") as f:
             json.dump(error, f, indent=2)

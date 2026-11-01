@@ -70,7 +70,9 @@ class AffinitySetupTest(unittest.TestCase):
                                       configure=True, activate=activate)
             activate.assert_called_once()
             with open(os.path.join(run_dir, "kernel-irq-affinity-error.json")) as f:
-                self.assertEqual(json.load(f), error)
+                saved = json.load(f)
+            self.assertEqual(saved["irqs"], error["irqs"])
+            self.assertEqual(saved["initial"], error)
 
 class RemoteAffinityTest(unittest.TestCase):
     def exercise(self, moves):
@@ -151,6 +153,8 @@ class RemoteAffinityTest(unittest.TestCase):
                 with open(os.path.join(run_dir, "kernel-irq-affinity-error.json")) as f:
                     error = json.load(f)
                 self.assertEqual(error["irqs"]["45"]["effective"], "25")
+                self.assertEqual(error["initial"]["irqs"]["45"]["before"]["requested"], "0")
+                self.assertEqual(error["irqs"]["45"]["before"]["requested"], "31")
             self.assertEqual(state["writes"], 1)
 
     def test_waits_after_packets_without_rewriting(self):

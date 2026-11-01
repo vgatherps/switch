@@ -137,8 +137,9 @@ report with `run --region R` for the Zhida receiver; no performance numbers are 
 
 If IRQ placement is deferred, a sender sends a brief UDP burst to the receiver before measurement;
 the runner then waits up to five seconds for actual IRQ affinities to converge without rewriting them. On failure,
-`kernel-irq-affinity-error.json` saves each data-ENI IRQ's name, requested and effective CPU lists
-before and after the placement attempt, any write error, and available kernel IRQ debug state.
+`kernel-irq-affinity-error.json` saves each data-ENI IRQ's name, requested and effective CPU lists,
+any write error, and available kernel IRQ debug state. A failed post-traffic check also retains the
+original placement attempt under `initial`.
 
 The laptop shows run start, hosts up (every host reachable over SSH), and code built (every host's
 setup verification and benchmark build succeeded). For each protocol, live coordinator stderr reports
