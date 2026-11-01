@@ -133,7 +133,8 @@ counter resets, or affinity/RPS drift fail the run. `NET_RX` also includes manag
 its housekeeping deltas are reported, not falsely attributed to the data ENI. Compare this run's
 report with `run --region R` for the Zhida receiver; no performance numbers are implied here.
 
-The runner waits up to five seconds for IRQ affinity to take effect. On failure,
+If IRQ placement is deferred, a sender sends a brief UDP burst to the receiver before measurement;
+the runner then checks the actual IRQ affinities again. On failure,
 `kernel-irq-affinity-error.json` saves each data-ENI IRQ's name, requested and effective CPU lists
 before and after the placement attempt, any write error, and available kernel IRQ debug state.
 

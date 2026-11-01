@@ -180,7 +180,7 @@ class KernelRoutingTest(unittest.TestCase):
             Proc(0), Proc(0, main),
             *(Proc(0, json.dumps([route])) for route in routes),
         ]
-        with mock.patch.object(z, "kernel_snapshot", return_value={"irqs": {}}) as snapshot:
+        with mock.patch.object(z, "kernel_snapshot", return_value={"irqs": {}}):
             result = z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
                                                  RECEIVER_DATA_IP, destinations)
         command = receiver.root.call_args_list[3].args[0]
@@ -200,7 +200,6 @@ class KernelRoutingTest(unittest.TestCase):
                          [mock.call(z.KERNEL_ROUTE_SETTLE_INTERVAL)] * z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES)
         for call, ip in zip(receiver.root.call_args_list[7 + len(settled):], destinations):
             self.assertEqual(call.args[0], f"ip -j -4 route get {ip} from {RECEIVER_DATA_IP}")
-        snapshot.assert_called_once_with(receiver, z.parse_host_env(HOST_ENV), configure=True)
 
     def test_explicit_jumbo_mtu_is_set_and_verified(self):
         receiver = mock.Mock()

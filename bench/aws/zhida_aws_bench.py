@@ -674,7 +674,7 @@ def check_kernel_route(text, destination, source, interface):
         raise RuntimeError(f"kernel receiver route mismatch for {destination} from {source}: {text}")
 
 
-def configure_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
+def configure_kernel_receiver(receiver, facts, receiver_ip, sender_ips, sender=None):
     """Configure the already-ENA data device without changing management routes."""
     config = json.loads(receiver.root("cat /etc/zhida/dut.json").stdout)
     data = ipaddress.IPv4Interface(config["ipv4"])
@@ -730,12 +730,28 @@ def configure_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
         text = receiver.root(f"ip -j -4 route get {shlex.quote(sender_ip)} from {data.ip}").stdout
         check_kernel_route(text, sender_ip, receiver_ip, facts["DATA_IF"])
         checked_routes += json.loads(text)
+    activate = (lambda: activate_kernel_irqs(sender, receiver_ip)) if sender is not None else None
     return {"address": str(data), "interface": facts["DATA_IF"], "routes": checked_routes,
             "main_routes_before": json.loads(before), "main_routes_after": json.loads(after),
-            "placement": kernel_snapshot(receiver, facts, configure=True)}
+            "placement": kernel_snapshot(receiver, facts, configure=True, activate=activate)}
 
 
-def kernel_snapshot(receiver, facts, configure=False):
+def activate_kernel_irqs(sender, receiver_ip):
+    """Deliver packets to the data ENI before checking deferred IRQ moves."""
+    script = r'''
+import socket, sys, time
+sockets = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(512)]
+for s in sockets:
+    s.bind(("", 0))
+for _ in range(4):
+    for s in sockets:
+        s.sendto(b"irq", (sys.argv[1], 7000))
+    time.sleep(0.2)
+'''
+    sender.ssh(shlex.join(["python3", "-c", script, receiver_ip]))
+
+
+def kernel_snapshot(receiver, facts, configure=False, activate=None):
     """Data IRQ placement plus counters; NET_RX is host-wide, including management SSH."""
     script = r'''
 import json, pathlib, sys
@@ -774,16 +790,6 @@ if configure and not any(info["write_error"] for info in details.values()):
         pathlib.Path("/proc/irq", irq, "effective_affinity_list").read_text().strip())
     for key, value in affinity.items():
         details[key]["effective"] = value
-if any(info["write_error"] or info["effective"] != cpu for info in details.values()):
-    for key, info in details.items():
-        debug = pathlib.Path("/sys/kernel/debug/irq/irqs", key)
-        if debug.exists():
-            try:
-                info["kernel_irq_state"] = debug.read_text()
-            except OSError as exc:
-                info["kernel_irq_state_error"] = str(exc)
-    print(json.dumps({"affinity_error": {"target_cpu": cpu, "irqs": details}}))
-    sys.exit(0)
 queues = list(pathlib.Path("/sys/class/net", interface, "queues").glob("rx-*/rps_cpus"))
 if not queues:
     raise RuntimeError("data ENI has no RX queues")
@@ -794,6 +800,16 @@ for path in queues:
     rps[str(path)] = path.read_text().strip()
     if int(rps[str(path)].replace(",", ""), 16) != 0:
         raise RuntimeError(f"RPS enabled: {path}")
+if any(info["write_error"] or info["effective"] != cpu for info in details.values()):
+    for key, info in details.items():
+        debug = pathlib.Path("/sys/kernel/debug/irq/irqs", key)
+        if debug.exists():
+            try:
+                info["kernel_irq_state"] = debug.read_text()
+            except OSError as exc:
+                info["kernel_irq_state_error"] = str(exc)
+    print(json.dumps({"affinity_error": {"target_cpu": cpu, "irqs": details}}))
+    sys.exit(0)
 lines = pathlib.Path("/proc/interrupts").read_text().splitlines()
 counts = {}
 for line in lines[1:]:
@@ -812,9 +828,15 @@ print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_
                facts["DATA_IF"], facts["APP_CPU"], str(configure)]
     snapshot = json.loads(receiver.root(shlex.join(command)).stdout)
     if "affinity_error" in snapshot:
+        error = snapshot["affinity_error"]
+        if configure and activate is not None and all(
+                not irq["write_error"] and irq["requested"] == facts["APP_CPU"]
+                for irq in error["irqs"].values()):
+            activate()
+            return kernel_snapshot(receiver, facts)
         path = os.path.join(receiver.run_dir, "kernel-irq-affinity-error.json")
         with open(path, "w") as f:
-            json.dump(snapshot["affinity_error"], f, indent=2)
+            json.dump(error, f, indent=2)
         raise RuntimeError(f"receiver data IRQ affinity differs from CPU {facts['APP_CPU']}; details: {path}")
     return snapshot
 
@@ -1028,7 +1050,7 @@ def run(args, env=None, kernel=False):
         facts, receiver_ip = read_facts(hosts, infos[0]["data_eni"]["ip"])
         if kernel:
             evidence = configure_kernel_receiver(hosts[0], facts["receiver"], receiver_ip,
-                                               [info["data_eni"]["ip"] for info in infos[1:]])
+                                               [info["data_eni"]["ip"] for info in infos[1:]], hosts[1])
             with open(os.path.join(run_dir, "kernel-receiver.json"), "w") as f:
                 json.dump(evidence, f, indent=2)
         for h in hosts:
