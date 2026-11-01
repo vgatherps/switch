@@ -10,33 +10,33 @@
 // 1024-byte echoes fit (4096 bytes). A fifth 1024-byte client segment
 // releases only the remaining 204 bytes, at 14337:14541. The RST ends
 // the connection with 4300 echo bytes unacknowledged and 820 queued.
-// Receive window 23040 units: the peer's MSS 1024 caps each of the 90 admitted frames
-// (128 KiB / 1460) at 1024 bytes, 92160 bytes >> shift 2. The SYN-ACK stays 65535
-// (unscaled cap); 92160 < 2 x 65535, so no window-update ACK follows the handshake.
+// The 128 KiB receive window is advertised as 32768 units at scale 2.
+// After the unscaled 65535-byte SYN-ACK, a pure ACK advertises the larger window.
 
 0     < S 0:0(0) win 64240 <mss 1024,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
 +0    < . 1:1(0) ack 1 win 502
++0    > . 1:1(0) ack 1 win 32768
 +0    < P. 1:1025(1024) ack 1 win 502
-+0    > P. 1:1025(1024) ack 1025 win 23040
++0    > P. 1:1025(1024) ack 1025 win 32768
 +0    < P. 1025:2049(1024) ack 1 win 502
-+0    > P. 1025:2049(1024) ack 2049 win 23040
++0    > P. 1025:2049(1024) ack 2049 win 32768
 +0    < P. 2049:3073(1024) ack 1 win 502
-+0    > P. 2049:3073(1024) ack 3073 win 23040
++0    > P. 2049:3073(1024) ack 3073 win 32768
 +0    < P. 3073:4097(1024) ack 1 win 502
-+0    > P. 3073:4097(1024) ack 4097 win 23040
++0    > P. 3073:4097(1024) ack 4097 win 32768
 +0    < P. 4097:5121(1024) ack 1 win 502
-+0    > P. 4097:5121(1024) ack 5121 win 23040
++0    > P. 4097:5121(1024) ack 5121 win 32768
 +0    < P. 5121:6145(1024) ack 1 win 502
-+0    > P. 5121:6145(1024) ack 6145 win 23040
++0    > P. 5121:6145(1024) ack 6145 win 32768
 +0    < P. 6145:7169(1024) ack 1 win 502
-+0    > P. 6145:7169(1024) ack 7169 win 23040
++0    > P. 6145:7169(1024) ack 7169 win 32768
 +0    < P. 7169:8193(1024) ack 1 win 502
-+0    > P. 7169:8193(1024) ack 8193 win 23040
++0    > P. 7169:8193(1024) ack 8193 win 32768
 +0    < P. 8193:9217(1024) ack 1 win 502
-+0    > P. 8193:9217(1024) ack 9217 win 23040
++0    > P. 8193:9217(1024) ack 9217 win 32768
 +0    < P. 9217:10241(1024) ack 1 win 502
-+0    > P. 9217:10241(1024) ack 10241 win 23040
++0    > P. 9217:10241(1024) ack 10241 win 32768
 
 +0    < . 10241:10241(0) ack 1025 win 502
 +0    < . 10241:10241(0) ack 2049 win 502
@@ -46,17 +46,17 @@
 +0    < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:6145>
 +0.05 < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:7169>
 +0.05 < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:8193>
-+0    > . 4097:5121(1024) ack 10241 win 23040
++0    > . 4097:5121(1024) ack 10241 win 32768
 
 +0    < . 10241:10241(0) ack 10241 win 502
 +0    < P. 10241:11265(1024) ack 10241 win 502
-+0    > P. 10241:11265(1024) ack 11265 win 23040
++0    > P. 10241:11265(1024) ack 11265 win 32768
 +0    < P. 11265:12289(1024) ack 10241 win 502
-+0    > P. 11265:12289(1024) ack 12289 win 23040
++0    > P. 11265:12289(1024) ack 12289 win 32768
 +0    < P. 12289:13313(1024) ack 10241 win 502
-+0    > P. 12289:13313(1024) ack 13313 win 23040
++0    > P. 12289:13313(1024) ack 13313 win 32768
 +0    < P. 13313:14337(1024) ack 10241 win 502
-+0    > P. 13313:14337(1024) ack 14337 win 23040
++0    > P. 13313:14337(1024) ack 14337 win 32768
 +0    < P. 14337:15361(1024) ack 10241 win 502
-+0    > . 14337:14541(204) ack 15361 win 23040
++0    > . 14337:14541(204) ack 15361 win 32768
 +0    < R. 15361:15361(0) ack 13313 win 0

@@ -17,6 +17,7 @@
 0    < S 0:0(0) win 32792 <mss 1000,sackOK,nop,nop,nop,wscale 7>
 +0   > S. 0:0(0) ack 1 <mss 1460,wscale 2,sackOK,eol,eol,eol>
 +0   < . 1:1(0) ack 1 win 257
++0   > . 1:1(0) ack 1 win 32768
 
 // Client closes first.
 +.01 < F. 1:1(0) ack 1 win 257

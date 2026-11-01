@@ -9,6 +9,7 @@
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
 +0    < . 1:1(0) ack 1 win 502
++0    > . 1:1(0) ack 1 win 32768
 +0    < P. 1:11(10) ack 1 win 502
 +0    > F. 1:11(10) ack 11 win 32768
 +0    < F. 11:11(0) ack 12 win 502

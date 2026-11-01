@@ -34,30 +34,28 @@
 //      at 0.220 s or later, at least 9 ms late, 5 ms outside the tolerance, whatever
 //      packetdrill's pauses. Whether both segments are processed in one turn does not
 //      matter (Waiting, then Immediate).
-// - Windows on the ACKs of checks 2 and 3 are not checked: step drains the rx buffer only
-//   after a turn's egress (lib.rs 174-175), so they depend on which turn read the last
-//   segment, which says nothing about delayed ACKs.
+// - The receive window remains at the 128 KiB target, including while data is unread.
 // - The RST ends the run with data still queued (1895-1900).
-// Receive window 23040 units: the peer's MSS 1024 caps each of the 90 admitted frames
-// (128 KiB / 1460) at 1024 bytes, 92160 bytes >> shift 2. The SYN-ACK stays 65535
-// (unscaled cap); 92160 < 2 x 65535, so no window-update ACK follows the handshake.
+// The 128 KiB receive window is advertised as 32768 units at scale 2.
+// After the unscaled 65535-byte SYN-ACK, a pure ACK advertises the larger window.
 
 0      < S 0:0(0) win 64240 <mss 1024,nop,nop,sackOK,nop,wscale 7>
 +0     > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
 +0     < . 1:1(0) ack 1 win 16
++0     > . 1:1(0) ack 1 win 32768
 +0     < P. 1:1025(1024) ack 1 win 16
-+0     > P. 1:1025(1024) ack 1025 win 23040
++0     > P. 1:1025(1024) ack 1025 win 32768
 +0     < P. 1025:2049(1024) ack 1 win 16
-+0     > P. 1025:2049(1024) ack 2049 win 23040
++0     > P. 1025:2049(1024) ack 2049 win 32768
 
 +0     < P. 2049:2149(100) ack 1 win 16
-+0.01  > . 2049:2049(0) ack 2149 win 23040
++0.01  > . 2049:2049(0) ack 2149 win 32768
 
 0.100  < P. 2149:2249(100) ack 1 win 16
 0.106  < P. 2249:2349(100) ack 1 win 16
-0.110  > . 2049:2049(0) ack 2349
+0.110  > . 2049:2049(0) ack 2349 win 32768
 
 0.210  < P. 2349:2449(100) ack 1 win 16
 0.211  < P. 2449:3473(1024) ack 1 win 16
-0.211  > . 2049:2049(0) ack 3473
+0.211  > . 2049:2049(0) ack 3473 win 32768
 +0     < R. 3473:3473(0) ack 2049 win 0

@@ -1,0 +1,44 @@
+// tap-echo: --buffer 1024
+// tolerance_usecs: 4000
+// The peer holds its receive window at zero, so the first 1024-byte echo fills
+// Zhida's tx buffer and later in-order segments remain unread. Zhida advertises
+// its 1024-byte receive window target throughout, independent of those held frames.
+// Each full-window segment triggers an immediate window-update ACK. The peer's
+// probe gets an ACK, then opening its window lets every queued echo drain.
+// The peer opens at 1.46 s, before Zhida's 1.5 s zero-window probe.
+
+0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
++0    > S. 0:0(0) ack 1 win 1024 <mss 1460,wscale 0,sackOK,eol,eol,eol>
++0    < . 1:1(0) ack 1 win 0
++1.2  < P. 1:1025(1024) ack 1 win 0
++0    > . 1:1(0) ack 1025 win 1024
++0    < . 1025:1025(0) ack 1 win 0
+1.3   < P. 1025:2049(1024) ack 1 win 0
++0    > . 1:1(0) ack 2049 win 1024
++0.01 < P. 2049:3073(1024) ack 1 win 0
++0    > . 1:1(0) ack 3073 win 1024
++0.01 < P. 3073:4097(1024) ack 1 win 0
++0    > . 1:1(0) ack 4097 win 1024
++0.01 < P. 4097:5121(1024) ack 1 win 0
++0    > . 1:1(0) ack 5121 win 1024
++0.01 < P. 5121:6145(1024) ack 1 win 0
++0    > . 1:1(0) ack 6145 win 1024
++0.01 < P. 6145:7169(1024) ack 1 win 0
++0    > . 1:1(0) ack 7169 win 1024
++0.06 < . 7168:7168(0) ack 1 win 0
++0    > . 1:1(0) ack 7169 win 1024
++0.05 < . 7169:7169(0) ack 1 win 502
++0    > P. 1:1025(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 1025 win 502
++0    > P. 1025:2049(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 2049 win 502
++0    > P. 2049:3073(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 3073 win 502
++0    > P. 3073:4097(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 4097 win 502
++0    > P. 4097:5121(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 5121 win 502
++0    > P. 5121:6145(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 6145 win 502
++0    > P. 6145:7169(1024) ack 7169 win 1024
++0    < . 7169:7169(0) ack 7169 win 502

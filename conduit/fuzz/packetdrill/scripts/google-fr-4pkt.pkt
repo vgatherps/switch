@@ -23,8 +23,8 @@
 // - close(): tap-echo closes only after its peer, so the client closes first: its FIN,
 //   Zhida's ACK, Zhida's FIN, the client's ACK (upstream: Zhida's FIN first).
 // Window-update ACK after the handshake: the SYN-ACK window is unscaled, capped 65535;
-// the scaled allowance, 90 frames x 1460 B capped by the 128 KiB buffer = 131072
-// (32768 << 2), is >= 2 x 65535, so Zhida sends one pure window-update ACK.
+// the 128 KiB receive window is 32768 << 2, at least twice 65535,
+// so Zhida sends one pure window-update ACK.
 
 0    < S 0:0(0) win 32792 <mss 1460,nop,wscale 7>
 +0   > S. 0:0(0) ack 1 <mss 1460,wscale 2,eol>

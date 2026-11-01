@@ -138,10 +138,9 @@ the default. An invalid value or a second such line refuses the script unrun
   (300 ms) after the data, then probes 600 ms and 1.2 s apart; data released by the window
   update. It pins 4000 usecs because the 10 ms ACK is finer than the 25 ms default can
   distinguish from an immediate ACK.
-- `zhida-zero-window.pkt` (`--buffer 1024`): Zhida's window closes to 0, it answers the
-  client's probe with window 0, and its reopened window rides on the drained echo. It pins
-  4000 usecs because the 10 ms ACK is finer than the 25 ms default can distinguish from an
-  immediate ACK.
+- `held-receive-frames.pkt` (`--buffer 1024`): when the peer's window is closed, Zhida
+  keeps its receive window open while retaining six in-order segments, answers a probe,
+  and sends every echo after the peer reopens its window.
 - `zhida-fin-first.pkt` (`--close-after 10`): Zhida's FIN after 10 bytes; data received
   in FIN-WAIT-2 is ACKed and discarded with the window kept open; the client's FIN is ACKed
   and moves Zhida to TIME-WAIT (re-ACK of a retransmitted FIN). It pins 4000 usecs because

@@ -15,10 +15,9 @@
 //   the whole rx buffer, 131072 >> 2.
 // - The client's ACK of the FIN: FinWait1 to FinWait2 (2000-2004), nothing to send.
 // - The 100 bytes in FinWait2 (2019) start the delayed-ACK timer; step discards them, and
-//   the ACK goes out when the timer expires 10 ms later (2524) with window 32768. Unread,
-//   they would leave (131072 - 100) >> 2, 32743. Nothing is sent before: no data, no FIN
-//   pending (2349-2372), and a window that only returns to its last value is no update
-//   (2415-2431).
+//   the ACK goes out when the timer expires 10 ms later (2524) with window 32768.
+//   Nothing is sent before: no data or FIN pending, and the receive window target
+//   is unchanged whether the data has been read or not.
 // - The client's FIN: FinWait2 to TimeWait (2021-2027). A FIN carries no payload, so
 //   process returns before the delayed-ACK code (2206-2209) and the same turn's egress
 //   ACKs it (2524; timer idle, 2377).
@@ -31,6 +30,7 @@
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
 +0    < . 1:1(0) ack 1 win 502
++0    > . 1:1(0) ack 1 win 32768
 +0    < P. 1:21(20) ack 1 win 502
 +0    > F. 1:11(10) ack 21 win 32768
 +0    < . 21:21(0) ack 12 win 502

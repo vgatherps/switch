@@ -42,8 +42,8 @@
 //   (src/iface/interface/tcp.rs 43-56); Linux queues it on the listener. Temporary, until
 //   Zhida's smoltcp fork.
 // - Window update after each handshake: the SYN-ACK window is unscaled, capped 65535;
-//   the scaled allowance is 90 frames x 1460 B capped by the 128 KiB buffer = 131072
-//   (32768 << 2) >= 2 x 65535, so Zhida sends one pure window-update ACK.
+//   the 128 KiB receive window is 32768 << 2, at least twice 65535,
+//   so Zhida sends one pure window-update ACK.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
