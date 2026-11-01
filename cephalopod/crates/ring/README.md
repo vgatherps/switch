@@ -2,7 +2,7 @@
 
 Shared-memory ring layout with one consumer (`Reader`) and per-CPU writers (`Writer`). There is one ring per CPU. A producer pushes into the ring of the CPU it is running on, so producers never contend.
 
-Used by `ceph-fifo`. Depends on [`ceph-rseq`](../rseq/README.md) and `libc`. The design is in the [cephalopod README](../../README.md).
+Used by `ceph-fifo`. Depends on [`ceph-rseq`](../rseq/README.md) for publication and [`shared-memory`](../../../shared-memory/README.md) for backing ownership and mappings. The design is in the [cephalopod README](../../README.md).
 
 ## API
 
@@ -27,3 +27,6 @@ make bench    # example push_bench (needs Linux)
 ```
 
 The tests need hugepages and `--privileged`, which `scripts/test-linux.sh` sets up.
+
+`push_bench` uses a 64-byte-aligned payload so binary layout does not change the
+source alignment between builds.

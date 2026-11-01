@@ -75,3 +75,18 @@ b1f61ef 2026-10-18 Workspace scaffold and Linux test runner
 ce26b98 2026-05-03 Add benchmark harness and AWS sweep automation
 18b520e 2026-05-01 Add local runtime benchmark baseline
 ```
+
+## slice_ringbuffer and mapping (cantor-core)
+
+Imported `potatomato/core/{slice_ringbuffer,mapping}` from
+`~/trading/cantor-core` at `da50a9709f7c9d35480a0df3d9a3dbe99cf0da75`.
+Initially imported unchanged, with registry dependencies external.
+
+The shared-memory extraction moves backing ownership, page sizing and single/double
+mappings into `shared-memory`, shared by `ceph-ring` and `slice_ringbuffer`. The
+vendored `mapping` crate is removed; both queues retain their own publication
+protocols. Backing descriptors and names now have separate RAII ownership, creator
+cleanup is idempotent, and new objects use mode `0600`.
+
+The `slice_ringbuffer` read-view reference lifetime bug, unchecked queue/metadata
+association and final-write/close race remain unfixed. Its closure API is unchanged.
