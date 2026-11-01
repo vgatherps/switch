@@ -360,7 +360,7 @@ class Aws:
             f.write(material)
         return {"name": name, "subnet": subnet, "zone": zone, "sg": sg}
 
-    def zone_offering(self, instance_types):
+    def zone_offering(self, instance_types, requested=None):
         common = None
         for instance_type in dict.fromkeys(instance_types):
             zones = set()
@@ -378,6 +378,10 @@ class Aws:
             common = zones if common is None else common & zones
         if not common:
             raise RuntimeError(f"no zone in {self.region} offers {', '.join(dict.fromkeys(instance_types))}")
+        if requested:
+            if requested not in common:
+                raise RuntimeError(f"{requested} does not offer {', '.join(dict.fromkeys(instance_types))}")
+            return requested
         return sorted(common)[0]
 
     def launch_hosts(self, net, run_id, expires, record, instance_type, roles, ami_param):
@@ -591,7 +595,7 @@ def quota_check(aws, need):
     return free >= need, detail
 
 
-def preflight(env, region, instance_types, vcpus):
+def preflight(env, region, instance_types, vcpus, requested_zone=None):
     """Every check before creation: ([(name, ok, detail)], Aws, common zone)."""
     problems = tree_problems(env.local)
     out = [("source", not problems, "; ".join(problems) or "clean, HEAD has deploy/hft-host.sh")]
@@ -604,7 +608,8 @@ def preflight(env, region, instance_types, vcpus):
         return out + [("credentials", False, str(e))] + [
             (name, False, "not checked without credentials") for name in ("offering", "quota")], aws, zone
     try:
-        zone = aws.zone_offering(instance_types)
+        zone = (aws.zone_offering(instance_types, requested_zone) if requested_zone
+                else aws.zone_offering(instance_types))
         out.append(("offering", True, f"{', '.join(dict.fromkeys(instance_types))} in {zone}"))
     except Exception as e:
         out.append(("offering", False, str(e)))
@@ -615,8 +620,8 @@ def preflight(env, region, instance_types, vcpus):
     return out, aws, zone
 
 
-def checked_preflight(env, region, instance_types, vcpus):
-    results, aws, zone = preflight(env, region, instance_types, vcpus)
+def checked_preflight(env, region, instance_types, vcpus, requested_zone=None):
+    results, aws, zone = preflight(env, region, instance_types, vcpus, requested_zone)
     for name, ok, detail in results:
         log(f"preflight {name}: {'ok' if ok else 'FAIL'} {detail}")
     if not all(ok for _, ok, _ in results):
@@ -1017,7 +1022,8 @@ def run(args, env=None, kernel=False):
     print(plan_text(args.region, args.ttl, run_id, expires, kernel, args.shape))
     if kernel:
         print("receiver: Linux kernel sockets on the same data ENI; generators: unchanged Zhida/DPDK")
-    aws, zone = checked_preflight(env, args.region, (receiver_type, sender_type), vcpus)
+    aws, zone = checked_preflight(env, args.region, (receiver_type, sender_type), vcpus,
+                                  getattr(args, "zone", None))
     revision = env.local(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     archive = source_archive(env.local, revision)
     run_dir = os.path.join(args.out, run_id)
@@ -1173,6 +1179,8 @@ def parser():
         else:
             r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
             r.add_argument("--shape", choices=SHAPES, default="arm", help="benchmark host shape (default: arm)")
+            if name in ("run", "kernel", "preflight"):
+                r.add_argument("--zone", help="availability zone offering both instance types")
     b = sub.add_parser("binance", help="run the Binance listener (deploy/run-binance.sh) on one EC2 host")
     b.add_argument("--region", help="default: the AWS profile's region")
     b.add_argument("--seconds", type=int, default=600, help="the feed's --seconds (from the WebSocket open)")
@@ -1189,7 +1197,7 @@ def main(argv, env=None):
             raise SystemExit("no region: pass --region, or set one in the AWS profile (aws configure) or AWS_REGION")
     if args.cmd == "preflight":
         receiver_type, sender_type, _, vcpus = SHAPES[args.shape]
-        checked_preflight(env or Env(), args.region, (receiver_type, sender_type), vcpus)
+        checked_preflight(env or Env(), args.region, (receiver_type, sender_type), vcpus, args.zone)
         return 0
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)

@@ -1125,6 +1125,14 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(self.check(zones=zones, itype=types, vcpus=56)["offering"],
                          (False, "no zone in ap-northeast-1 offers c6in.8xlarge, c6in.2xlarge"))
 
+    def test_requested_zone_must_offer_both_instance_types(self):
+        types = ("c6in.8xlarge", "c6in.2xlarge")
+        zones = {types[0]: ("zone-a", "zone-b"), types[1]: ("zone-b", "zone-c")}
+        aws = launch_aws(FakeQuotaEc2([], zones))
+        self.assertEqual(aws.zone_offering(types, "zone-b"), "zone-b")
+        with self.assertRaisesRegex(RuntimeError, "zone-a does not offer"):
+            aws.zone_offering(types, "zone-a")
+
     def test_common_zone_offerings_paginate(self):
         class PagedEc2:
             def describe_instance_type_offerings(self, LocationType, Filters, NextToken=None):
@@ -1222,10 +1230,10 @@ class FakeAws:
             f.write("PRIVATE\n")
         return dict(NET, zone=zone)
 
-    def zone_offering(self, instance_types):
+    def zone_offering(self, instance_types, requested=None):
         if not self.w.offered:
             raise RuntimeError(f"no zone in ap-northeast-1 offers {', '.join(dict.fromkeys(instance_types))}")
-        return z.Aws.zone_offering(self, instance_types)
+        return z.Aws.zone_offering(self, instance_types, requested)
 
     def launch_hosts(self, net, run_id, expires, record, instance_type, roles, ami_param):
         self.w.calls.append(("aws", f"launch_hosts {instance_type} {' '.join(roles)}"))
