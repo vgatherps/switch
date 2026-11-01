@@ -738,7 +738,8 @@ def configure_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
 def kernel_snapshot(receiver, facts, configure=False):
     """Data IRQ placement plus counters; NET_RX is host-wide, including management SSH."""
     script = r'''
-import json, pathlib, sys, time
+import json, pathlib, sys
+from kernel_irq import wait_for_affinity
 pci, interface, cpu, configure = sys.argv[1:]
 configure = configure == "True"
 irqs = sorted(int(p.name) for p in pathlib.Path("/sys/bus/pci/devices", pci, "msi_irqs").iterdir())
@@ -769,13 +770,10 @@ for irq in irqs:
                     "requested": requested.read_text().strip(), "effective": affinity[key],
                     "write_error": error}
 if configure and not any(info["write_error"] for info in details.values()):
-    deadline = time.monotonic() + 5
-    while any(value != cpu for value in affinity.values()) and time.monotonic() < deadline:
-        time.sleep(0.05)
-        for irq in irqs:
-            key = str(irq)
-            affinity[key] = pathlib.Path("/proc/irq", key, "effective_affinity_list").read_text().strip()
-            details[key]["effective"] = affinity[key]
+    affinity = wait_for_affinity(affinity, cpu, lambda irq:
+        pathlib.Path("/proc/irq", irq, "effective_affinity_list").read_text().strip())
+    for key, value in affinity.items():
+        details[key]["effective"] = value
 if any(info["write_error"] or info["effective"] != cpu for info in details.values()):
     for key, info in details.items():
         debug = pathlib.Path("/sys/kernel/debug/irq/irqs", key)
@@ -810,7 +808,8 @@ net_rx = next(list(map(int, line.split(":")[1].split())) for line in soft[1:] if
 print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_rx": net_rx,
                   "effective_affinity": affinity, "rps_cpus": rps}))
 '''
-    command = ["python3", "-c", script, facts["DATA_PCI"], facts["DATA_IF"], facts["APP_CPU"], str(configure)]
+    command = ["env", f"PYTHONPATH={SRC_DIR}/bench/aws", "python3", "-c", script, facts["DATA_PCI"],
+               facts["DATA_IF"], facts["APP_CPU"], str(configure)]
     snapshot = json.loads(receiver.root(shlex.join(command)).stdout)
     if "affinity_error" in snapshot:
         path = os.path.join(receiver.run_dir, "kernel-irq-affinity-error.json")
