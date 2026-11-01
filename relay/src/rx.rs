@@ -2,6 +2,7 @@
 //! runs and hands out messages that borrow the received bytes in place.
 
 use crate::lower::PlainRx;
+use crate::mask::apply as unmask;
 use crate::utf8::Utf8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,15 +223,6 @@ fn parse_header(h: &[u8]) -> Header {
         opcode: h[0] & 0x0f,
         mask: (h[1] & 0x80 != 0).then(|| rest[..4].try_into().unwrap()),
         len,
-    }
-}
-
-fn unmask(b: &mut [u8], mask: Option<[u8; 4]>, phase: &mut usize) {
-    if let Some(m) = mask {
-        for x in b {
-            *x ^= m[*phase & 3];
-            *phase += 1;
-        }
     }
 }
 

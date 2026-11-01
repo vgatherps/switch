@@ -117,9 +117,7 @@ fn write_frame(room: &mut [u8], b0: u8, payload: &[u8], mask: Option<[u8; 4]>) {
     body.copy_from_slice(payload);
     if let Some(k) = mask {
         room[key_at..key_at + 4].copy_from_slice(&k);
-        for (i, b) in room[h..h + len].iter_mut().enumerate() {
-            *b ^= k[i & 3];
-        }
+        crate::mask::apply(&mut room[h..h + len], Some(k), &mut 0);
     }
 }
 

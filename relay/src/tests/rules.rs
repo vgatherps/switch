@@ -213,6 +213,18 @@ fn mask_phase_carries_across_chunks() {
 }
 
 #[test]
+fn masked_fragment_frames_restart_key_phase() {
+    let first = encode(BINARY, Some(KEY), b"abc");
+    let second = encode(fin(CONT), Some(KEY), b"defghijkl");
+    let mut wire = first;
+    wire.extend_from_slice(&second);
+    let run = drive(&mut rx(Role::Server), &split(&wire, &[7, 8, 10, 16, 18]));
+    assert_eq!(run.end, None);
+    assert_eq!(run.msgs.len(), 1);
+    assert_eq!(run.msgs[0].payload, b"abcdefghijkl");
+}
+
+#[test]
 fn control_frames_between_fragments() {
     let frames = [
         encode(TEXT, None, b"ab"),

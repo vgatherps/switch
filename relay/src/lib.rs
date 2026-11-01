@@ -5,12 +5,14 @@
 //! buffer, behind the header; a longer one is copied once into a reusable send buffer, then
 //! out a frame at a time. Over wss these are the plaintext buffers: sheath copies each sealed
 //! record's plaintext once more for rustls to encrypt it into the frame.
+//! Masked payloads are XORed in eight-byte chunks, including across receive pieces.
 //!
 //! Without the feature only the protocol core builds, crate-private and exercised by its unit
 //! tests (it needs no DPDK, so they run on any host and under Miri).
 #![cfg_attr(not(feature = "switchnet"), allow(dead_code))]
 
 mod lower;
+mod mask;
 mod raw;
 mod rx;
 mod session;
