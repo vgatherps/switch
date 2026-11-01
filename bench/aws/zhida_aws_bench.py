@@ -5,6 +5,7 @@
   zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
   zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
   zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
+  zhida_aws_bench.py kernel [--region R] [--ttl 2h] [--out DIR]   same Zhida generators, Linux receiver
   zhida_aws_bench.py cleanup --run-id ID [--region R] [--out DIR]   delete a leftover run's resources
   zhida_aws_bench.py binance [--region R] [--seconds 600] [--out DIR] [--ttl 2h]   the Binance listener
 
@@ -37,6 +38,7 @@ Exit 0 only when the feed exited 0, both files were fetched and teardown verifie
 """
 import argparse
 import datetime
+import ipaddress
 import json
 import math
 import os
@@ -151,10 +153,12 @@ def sweep_command(proto, budget, receiver_ip, housekeeping):
     return f"bash -c {shlex.quote(command)}"
 
 
-def serve_command(proto, app_cpu):
-    """The receiver as a transient systemd unit."""
+def serve_command(proto, app_cpu, kernel_ip=None):
+    """The receiver as a transient systemd unit; generators never change."""
+    command = (f"serve --config /etc/zhida/dut.json" if kernel_ip is None
+               else f"kernel-serve --bind {shlex.quote(kernel_ip)}")
     return (f"systemd-run --unit {RECEIVER_UNIT} --setenv={MIMALLOC_ENV} taskset -c {shlex.quote(app_cpu)}"
-            f" zhida-bench serve --config /etc/zhida/dut.json --proto {proto} --port {PORT}")
+            f" zhida-bench {command} --proto {proto} --port {PORT}")
 
 
 def ssh_config(sender_ips):
@@ -258,13 +262,14 @@ def feed_summary(text, code):
     return out
 
 
-def plan_text(region, ttl, run_id, expires):
+def plan_text(region, ttl, run_id, expires, kernel=False):
     lines = [
         f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
         f"hosts: {len(ROLES)} x {HOST_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
-        f" its cluster placement group, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 DPDK data ENI"
-        " (vfio-pci, DeleteOnTermination); CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
-        f"  {'receiver':9} zhida-bench serve on APP_CPU (systemd unit {RECEIVER_UNIT})",
+        f" its cluster placement group, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 data ENI"
+        " (initially vfio-pci, DeleteOnTermination); CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
+        f"  {'receiver':9} zhida-bench {'kernel-serve' if kernel else 'serve'} on APP_CPU"
+        f" (systemd unit {RECEIVER_UNIT})",
         f"  {'sender0':9} zhida-bench sweep (coordinator) on HOUSEKEEPING; worker 0 (zhida-bench gen) on APP_CPU",
     ]
     lines += [f"  {f'sender{i}':9} worker {i} (zhida-bench gen, over SSH from sender0) on APP_CPU"
@@ -634,6 +639,119 @@ def read_facts(hosts, receiver_eni_ip):
     return facts, ip
 
 
+KERNEL_TABLE, KERNEL_RULE = 7000, 10000
+
+
+def check_kernel_route(text, destination, source, interface):
+    routes = json.loads(text)
+    if (len(routes) != 1 or routes[0].get("dst") != destination
+            or routes[0].get("from") != source or routes[0].get("dev") != interface
+            or str(routes[0].get("table")) != str(KERNEL_TABLE)):
+        raise RuntimeError(f"kernel receiver route mismatch for {destination} from {source}: {text}")
+
+
+def restore_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
+    """Only the data device changes; noprefixroute leaves management's main table intact."""
+    data = ipaddress.IPv4Interface(json.loads(receiver.root("cat /etc/zhida/dut.json").stdout)["ipv4"])
+    if str(data.ip) != receiver_ip or str(data.network) != SUBNET_CIDR:
+        raise RuntimeError(f"receiver data address/subnet mismatch: {data}, expected {receiver_ip} in {SUBNET_CIDR}")
+    if facts["DATA_IF"] == facts["MGMT_IF"]:
+        raise RuntimeError("receiver DATA_IF is the management interface")
+    before = receiver.root("ip -j -4 route show table main").stdout
+    interface = shlex.quote(facts["DATA_IF"])
+    pci = shlex.quote(facts["DATA_PCI"])
+    mac = shlex.quote(facts["DATA_MAC"])
+    # Refuse occupied policy slots rather than deleting somebody else's policy.
+    rules = json.loads(receiver.root("ip -j -4 rule show").stdout)
+    if any(r.get("priority") == KERNEL_RULE or str(r.get("table")) == str(KERNEL_TABLE) for r in rules):
+        raise RuntimeError("kernel receiver policy rule/table already in use")
+    routes = json.loads(receiver.root("ip -j -4 route show table all").stdout)
+    if any(str(r.get("table")) == str(KERNEL_TABLE) for r in routes):
+        raise RuntimeError("kernel receiver policy table already has routes")
+    receiver.root(
+        f"set -eu; zhida-netconf unbind /etc/zhida/dut.json; "
+        f"test \"$(basename \"$(readlink /sys/class/net/{interface}/device)\")\" = {pci}; "
+        f"test \"$(cat /sys/class/net/{interface}/address)\" = {mac}; "
+        f"ip link set dev {interface} up; "
+        f"ip -4 addr replace {data} dev {interface} noprefixroute; "
+        # Linux uses max(all, interface); loose (2) on DATA_IF works even if all is strict (1).
+        f"sysctl -w net.ipv4.conf.{interface}.rp_filter=2; "
+        f"ip -4 route add table {KERNEL_TABLE} {data.network} dev {interface} src {data.ip}; "
+        f"ip -4 route add table {KERNEL_TABLE} default via {data.network.network_address + 1} dev {interface}; "
+        f"ip -4 rule add priority {KERNEL_RULE} from {data.ip}/32 table {KERNEL_TABLE}")
+    after = receiver.root("ip -j -4 route show table main").stdout
+    if json.loads(before) != json.loads(after):
+        raise RuntimeError("kernel receiver changed the main routing table; refusing to measure")
+    checked_routes = []
+    for sender_ip in sender_ips:
+        text = receiver.root(f"ip -j -4 route get {shlex.quote(sender_ip)} from {data.ip}").stdout
+        check_kernel_route(text, sender_ip, receiver_ip, facts["DATA_IF"])
+        checked_routes += json.loads(text)
+    return {"address": str(data), "interface": facts["DATA_IF"], "routes": checked_routes,
+            "main_routes_before": json.loads(before), "main_routes_after": json.loads(after),
+            "placement": kernel_snapshot(receiver, facts, configure=True)}
+
+
+def kernel_snapshot(receiver, facts, configure=False):
+    """Data IRQ placement plus counters; NET_RX is host-wide, including management SSH."""
+    script = r'''
+import json, pathlib, sys
+pci, interface, cpu, configure = sys.argv[1:]
+configure = configure == "True"
+irqs = sorted(int(p.name) for p in pathlib.Path("/sys/bus/pci/devices", pci, "msi_irqs").iterdir())
+if not irqs:
+    raise RuntimeError("data ENI has no MSI IRQs")
+affinity = {}
+for irq in irqs:
+    directory = pathlib.Path("/proc/irq", str(irq))
+    if configure:
+        (directory / "smp_affinity_list").write_text(cpu)
+    affinity[str(irq)] = (directory / "effective_affinity_list").read_text().strip()
+    if affinity[str(irq)] != cpu:
+        raise RuntimeError(f"data IRQ {irq} is not exclusively on CPU {cpu}")
+queues = list(pathlib.Path("/sys/class/net", interface, "queues").glob("rx-*/rps_cpus"))
+if not queues:
+    raise RuntimeError("data ENI has no RX queues")
+rps = {}
+for path in queues:
+    if configure:
+        path.write_text("0")
+    rps[str(path)] = path.read_text().strip()
+    if int(rps[str(path)].replace(",", ""), 16) != 0:
+        raise RuntimeError(f"RPS enabled: {path}")
+lines = pathlib.Path("/proc/interrupts").read_text().splitlines()
+cpus = [int(c.removeprefix("CPU")) for c in lines[0].split()]
+counts = {}
+for line in lines[1:]:
+    name, _, values = line.partition(":")
+    if name.strip().isdigit() and int(name) in irqs:
+        counts[name.strip()] = list(map(int, values.split()[:len(cpus)]))
+if len(counts) != len(irqs):
+    raise RuntimeError("missing data IRQ counters")
+soft = pathlib.Path("/proc/softirqs").read_text().splitlines()
+soft_cpus = [int(c.removeprefix("CPU")) for c in soft[0].split()]
+net_rx = next(list(map(int, line.split(":")[1].split())) for line in soft[1:] if line.strip().startswith("NET_RX:"))
+print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_rx": net_rx,
+                  "effective_affinity": affinity, "rps_cpus": rps}))
+'''
+    command = ["python3", "-c", script, facts["DATA_PCI"], facts["DATA_IF"], facts["APP_CPU"], str(configure)]
+    return json.loads(receiver.root(shlex.join(command)).stdout)
+
+
+def kernel_counter_delta(before, after, app_cpu):
+    if before["cpus"] != after["cpus"] or before["irqs"].keys() != after["irqs"].keys():
+        raise RuntimeError("receiver data IRQs/CPUs changed during sweep")
+    irqs = {irq: [b - a for a, b in zip(values, after["irqs"][irq])]
+            for irq, values in before["irqs"].items()}
+    if any(value < 0 or (cpu != int(app_cpu) and value != 0)
+           for values in irqs.values() for cpu, value in zip(before["cpus"], values)):
+        raise RuntimeError("receiver data IRQ counters reset or ran outside APP_CPU")
+    if before["softirq_cpus"] != after["softirq_cpus"]:
+        raise RuntimeError("receiver softirq CPUs changed during sweep")
+    return {"cpus": before["cpus"], "data_irqs": irqs, "softirq_cpus": before["softirq_cpus"],
+            "net_rx_host_wide": [b - a for a, b in zip(before["net_rx"], after["net_rx"])]}
+
+
 def connect_senders(hosts, key_path):
     """sender0 reaches sender0..4 as ec2-user through REMOTE/ssh_config, with the run's key pair."""
     senders = hosts[1:]
@@ -653,13 +771,14 @@ def fetch_sweep(t, hosts, run_dir):
     return [e for e in (h.fetch(remote, local) for h, remote, local in wanted) if e]
 
 
-def run_sweep(proto, budget, hosts, facts, receiver_ip, env):
+def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_dir=None):
     """One sweep: receiver unit up, coordinator on sender0, receiver stopped. Returns the coordinator's
     exit code, or None when it did not run or timed out."""
     receiver, sender0 = hosts[0], hosts[1]
     t = tag(proto, budget)
+    before = kernel_snapshot(receiver, facts["receiver"]) if kernel else None
     receiver.root(f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
-                  f" {serve_command(proto, facts['receiver']['APP_CPU'])}")
+                  f" {serve_command(proto, facts['receiver']['APP_CPU'], receiver_ip if kernel else None)}")
     try:
         env.sleep(3)
         if receiver.root(f"systemctl is-active {RECEIVER_UNIT}", check=False).stdout.strip() != "active":
@@ -675,9 +794,22 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env):
             return None
     finally:
         receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
+        if kernel:
+            artifact = {"before": before,
+                        "net_rx_note": "Host-wide NET_RX includes management; not data-ENI attribution."}
+            try:
+                after = kernel_snapshot(receiver, facts["receiver"])
+                artifact["after"] = after
+                artifact["delta"] = kernel_counter_delta(before, after, facts["receiver"]["APP_CPU"])
+            except (RuntimeError, subprocess.CalledProcessError) as error:
+                artifact["error"] = str(error)
+                raise
+            finally:
+                with open(os.path.join(run_dir, f"{t}.kernel-cpu.json"), "w") as f:
+                    json.dump(artifact, f, indent=2)
 
 
-def measure(hosts, facts, receiver_ip, run_dir, env):
+def measure(hosts, facts, receiver_ip, run_dir, env, kernel=False):
     """The fixed matrix. A failed sweep is logged and the next one runs; every sweep started is
     fetched. Returns (fetch failures, sweeps whose coordinator did not exit 0)."""
     with open(os.path.join(run_dir, "expected.json"), "w") as f:
@@ -686,7 +818,7 @@ def measure(hosts, facts, receiver_ip, run_dir, env):
     for proto, budget in SWEEPS:
         t = tag(proto, budget)
         try:
-            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env)
+            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel, run_dir)
             log(f"{t}: coordinator exit {code}")
             if code != 0:
                 failed.append(t)
@@ -704,12 +836,14 @@ def on_signals(handler):
     signal.signal(signal.SIGTERM, handler)
 
 
-def run(args, env=None):
+def run(args, env=None, kernel=False):
     env = env or Env()
     now = env.now()
     expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
     run_id = new_run_id(now)
-    print(plan_text(args.region, args.ttl, run_id, expires))
+    print(plan_text(args.region, args.ttl, run_id, expires, kernel))
+    if kernel:
+        print("receiver: Linux kernel sockets on the same data ENI; generators: unchanged Zhida/DPDK")
     aws = checked_preflight(env, args.region, HOST_TYPE, len(ROLES) * HOST_VCPUS)
     archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
@@ -734,13 +868,18 @@ def run(args, env=None):
         setup = setup_hosts(hosts, archive)
         log(f"code built: all {len(hosts)} hosts passed setup verification and built zhida-bench")
         facts, receiver_ip = read_facts(hosts, infos[0]["data_eni"]["ip"])
+        if kernel:
+            evidence = restore_kernel_receiver(hosts[0], facts["receiver"], receiver_ip,
+                                               [info["data_eni"]["ip"] for info in infos[1:]])
+            with open(os.path.join(run_dir, "kernel-receiver.json"), "w") as f:
+                json.dump(evidence, f, indent=2)
         for h in hosts:
             h.root(f"install -d -m 1777 {REMOTE}")
         setup += [f"[{r} host.env] " + " ".join(f"{k}={v}" for k, v in sorted(facts[r].items())) for r in ROLES]
         with open(os.path.join(run_dir, "host-setup.txt"), "w") as f:
             f.write("\n".join(setup) + "\n")
         connect_senders(hosts, key_path)
-        fetch_errors, failed = measure(hosts, facts, receiver_ip, run_dir, env)
+        fetch_errors, failed = measure(hosts, facts, receiver_ip, run_dir, env, kernel)
     finally:
         # Nothing interrupts teardown; it goes first because the report is local.
         on_signals(signal.SIG_IGN)
@@ -753,7 +892,8 @@ def run(args, env=None):
                     f.write("\n".join(fetch_errors) + "\n")
                 log(f"{len(fetch_errors)} fetch failures: {os.path.join(run_dir, 'fetch-errors.txt')}")
             report_code = env.local([sys.executable, os.path.join(REPO, "bench", "report.py"), run_dir, "--title",
-                                     f"zhida-bench {run_id} (1 receiver + {SENDERS} senders, {HOST_TYPE})"]
+                                     f"zhida-bench {run_id} ({'Linux kernel' if kernel else 'Zhida'} receiver,"
+                                     f" {SENDERS} Zhida senders, {HOST_TYPE})"]
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
         if failed:
@@ -844,7 +984,7 @@ def parser():
     p = argparse.ArgumentParser(prog="zhida-aws-bench", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "plan", "preflight", "cleanup"):
+    for name in ("run", "kernel", "plan", "preflight", "cleanup"):
         r = sub.add_parser(name)
         r.add_argument("--region", help="default: the AWS profile's region")
         r.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
@@ -874,8 +1014,8 @@ def main(argv, env=None):
         print(plan_text(args.region or "(the AWS profile's)", args.ttl, new_run_id(now),
                         now + datetime.timedelta(seconds=parse_duration(args.ttl))))
         return 0
-    if args.cmd == "run":
-        return run(args, env)
+    if args.cmd in ("run", "kernel"):
+        return run(args, env, kernel=args.cmd == "kernel")
     if args.cmd == "binance":
         return binance(args, env)
     return cleanup(args, env)

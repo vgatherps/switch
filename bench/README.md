@@ -38,6 +38,9 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   window: what is still owed or behind is never sent (part of the loss), so a step past the knee ends on time.
 - `zhida-bench serve`: the Zhida echo receiver (UDP, or TCP/ws with 64 pre-armed accepts; ws through
   relay's `accept_ws` and `Ws`). Its loop makes no syscall while serving; it runs until SIGINT/SIGTERM.
+- `zhida-bench kernel-serve --proto udp|tcp|ws --bind IP --port P`: Linux-only kernel-socket echo
+  receiver. The generator remains Zhida; TCP uses the same fixed-size byte stream and WS is plain
+  `ws://`, not TLS.
 - `report.py DIR`: `report.md` (one step table per sweep), `results.json` and one SVG per sweep
   (latency quantiles and drop % against offered rate; a step with no echo stays on the plot). Exit 1 when
   incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or any sweep
@@ -90,6 +93,30 @@ key. Missing OpenSSH executables skip that test; an installed but unusable serve
 `--region` defaults to the AWS profile's region (`aws configure`, or `AWS_REGION`); without either the runner stops before touching AWS. AWS project accounts (the "new AWS experience") are locked to one region, so leave it at the profile's. Binance's servers are in Tokyo: from another region the `binance` command's NIC-to-receive latency is still valid, only the wire path to Binance is longer.
 
 `python3 bench/aws/zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]` runs the whole thing. Preflight first, before anything is created: clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, on-demand Standard vCPU quota L-1216C47A with 16 free. Then it creates, for this run only and tagged with the run id: a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; four c7gn.xlarge on-demand instances (1 receiver, 3 senders; 4 vCPUs each: hft-host.sh isolates CPU 3 for the app, CPUs 0-2 housekeep and run the coordinator on sender0) in one run_instances, one DPDK data ENI each. The shape is two constants in `zhida_aws_bench.py`, `SENDERS` and `HOST_TYPE`; 1 + 5 x c7gn.2xlarge needs 48 vCPUs of quota. Every ID is recorded as its create succeeds (in memory and `RUN_DIR/created.json`). Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (one `cargo build --release -p zhida-bench` with hft-host.sh's build env). Then the fixed matrix (udp uncapped, tcp and ws `--budget-us 50`; 12 connections (4 per sender host), 64 B, 10k..5M msg/s in 18 x sqrt(2) steps) with the coordinator on sender0 driving one worker per sender host over SSH; a failed sweep is logged and the next one runs; every sweep's files are fetched. Teardown runs on normal exit, errors, Ctrl-C and SIGTERM; once it starts, Ctrl-C/SIGTERM are ignored, and every ssh/scp before it has a timeout. It deletes everything the run created by recorded ID and by tag (instances, data ENIs, key pair, placement group, security group, subnet, route table, internet gateway, VPC, in that dependency order), checks nothing is left, and exits non-zero if anything remains. Then `bench/report.py RUN_DIR`. Each instance also powers itself off (terminates) at the TTL as a backstop. Exit 0 only if report.py passed, every fetch succeeded and nothing remains.
+
+For the Linux-kernel receiver comparison, run one command:
+
+```sh
+python3 bench/aws/zhida_aws_bench.py kernel --region R
+```
+
+This reuses `run`'s four hosts, three Zhida/DPDK sender workers, coordinator, 64-byte payloads,
+rate steps, warmup/measurement/drain schedule, TCP/WS budget, reports and teardown. It does not
+introduce a kernel generator. After normal host setup, verification and build, only the receiver's
+data ENI is restored with `zhida-netconf unbind /etc/zhida/dut.json`. Its original data IPv4/subnet
+is assigned without adding a main-table subnet route. Source routing uses policy table 7000,
+priority 10000; occupied slots are refused. Only the data interface gets loose reverse-path
+filtering. Main routes must remain unchanged, and each route to a sender from the receiver data
+IP must resolve through the data interface and policy table or the run fails. Management SSH and
+all sender data ENIs remain unchanged.
+
+`kernel-serve` is pinned to the receiver's `APP_CPU`. Every data-ENI MSI-X IRQ must have effective
+affinity exclusively on that CPU; data RX queues must have RPS disabled. Unsupported/managed IRQ
+affinity is an error, not a skipped check. Each sweep saves `TAG.kernel-cpu.json` with before/after
+data-IRQ counters and host-wide per-CPU `NET_RX` counters. Data IRQs running outside `APP_CPU`,
+counter resets, or affinity/RPS drift fail the run. `NET_RX` also includes management traffic:
+its housekeeping deltas are reported, not falsely attributed to the data ENI. Compare this run's
+report with `run --region R` for the Zhida receiver; no performance numbers are implied here.
 
 The laptop shows run start, hosts up (every host reachable over SSH), and code built (every host's
 setup verification and benchmark build succeeded). For each protocol, live coordinator stderr reports

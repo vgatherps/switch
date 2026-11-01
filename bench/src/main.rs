@@ -29,7 +29,9 @@ usage:
       udp: N sockets; tcp: N connections, S-byte messages on each (S at most the MSS);
       ws: N ws:// connections, S-byte binary messages (S at most 1400: one TCP frame).
   zhida-bench serve --config F --proto udp|tcp|ws --port P
-      Zhida echo server; runs until SIGINT/SIGTERM.";
+      Zhida echo server; runs until SIGINT/SIGTERM.
+  zhida-bench kernel-serve --proto udp|tcp|ws --bind IP --port P
+      Linux kernel-socket echo server; runs until SIGINT/SIGTERM.";
 
 struct Flags(HashMap<String, String>);
 
@@ -91,6 +93,17 @@ fn proto(flags: &mut Flags) -> Result<Proto, String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn kernel_args(flags: &mut Flags) -> Result<(Proto, std::net::Ipv4Addr, u16), String> {
+    let proto = proto(flags)?;
+    let bind = flags.need("bind")?;
+    let port = flags.need("port")?;
+    if port == 0 {
+        return Err("need --port > 0".into());
+    }
+    Ok((proto, bind, port))
+}
+
 fn main_inner() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
     let command = args
@@ -149,6 +162,12 @@ fn main_inner() -> Result<(), String> {
             flags.done()?;
             serve::run(&args)
         }
+        #[cfg(target_os = "linux")]
+        "kernel-serve" => {
+            let (proto, bind, port) = kernel_args(&mut flags)?;
+            flags.done()?;
+            zhida_bench::kernel_serve::run(proto, bind, port)
+        }
         other => Err(format!("unknown subcommand {other}")),
     }
 }
@@ -165,6 +184,38 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("zhida-bench: {e}\n\n{USAGE}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn parse_kernel(args: &[&str]) -> Result<(Proto, std::net::Ipv4Addr, u16), String> {
+        let mut flags = Flags::parse(args.iter().map(|arg| OsString::from(*arg)))?;
+        let args = kernel_args(&mut flags)?;
+        flags.done()?;
+        Ok(args)
+    }
+
+    #[test]
+    fn kernel_requires_explicit_ipv4_protocol_and_nonzero_port() {
+        for proto in ["udp", "tcp", "ws"] {
+            let args = parse_kernel(&["--proto", proto, "--bind", "10.80.1.23", "--port", "7000"])
+                .unwrap();
+            assert_eq!(args.1, std::net::Ipv4Addr::new(10, 80, 1, 23));
+            assert_eq!(args.2, 7000);
+        }
+        for args in [
+            vec!["--proto", "udp", "--port", "7000"],
+            vec!["--proto", "tls", "--bind", "10.80.1.23", "--port", "7000"],
+            vec!["--proto", "udp", "--bind", "::1", "--port", "7000"],
+            vec!["--proto", "udp", "--bind", "10.80.1.23", "--port", "0"],
+            vec!["--proto", "udp", "--bind", "10.80.1.23", "--port", "65536"],
+            vec!["--proto", "udp", "--bind", "10.80.1.23", "--port", "7000", "--config", "dut.json"],
+        ] {
+            assert!(parse_kernel(&args).is_err(), "{args:?}");
         }
     }
 }

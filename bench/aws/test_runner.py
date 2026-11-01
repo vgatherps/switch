@@ -97,6 +97,69 @@ class PureTest(unittest.TestCase):
             self.assertIn(line, cfg)
 
 
+class KernelRoutingTest(unittest.TestCase):
+    def test_source_route_must_use_data_interface_and_policy_table(self):
+        route = {"dst": "10.80.1.111", "from": RECEIVER_DATA_IP, "dev": "ens6", "table": z.KERNEL_TABLE}
+        z.check_kernel_route(json.dumps([route]), route["dst"], RECEIVER_DATA_IP, "ens6")
+        for field, wrong in [("dev", "ens5"), ("from", "10.80.1.10"), ("table", "main"),
+                             ("dst", "10.80.1.112")]:
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "route mismatch"):
+                z.check_kernel_route(json.dumps([dict(route, **{field: wrong})]),
+                                     route["dst"], RECEIVER_DATA_IP, "ens6")
+        with self.assertRaisesRegex(RuntimeError, "route mismatch"):
+            z.check_kernel_route("[]", route["dst"], RECEIVER_DATA_IP, "ens6")
+
+    def test_only_data_interrupts_are_attributed_to_receiver_core(self):
+        before = {"cpus": [0, 1], "irqs": {"40": [5, 10]}, "softirq_cpus": [0, 1], "net_rx": [20, 30]}
+        after = dict(before, irqs={"40": [5, 25]}, net_rx=[27, 45])
+        delta = z.kernel_counter_delta(before, after, "1")
+        self.assertEqual(delta["data_irqs"], {"40": [0, 15]})
+        # Management traffic may legitimately raise NET_RX on housekeeping.
+        self.assertEqual(delta["net_rx_host_wide"], [7, 15])
+        for irqs in ({"40": [6, 25]}, {"40": [5, 9]}, {"41": [5, 25]}):
+            with self.subTest(irqs=irqs), self.assertRaises(RuntimeError):
+                z.kernel_counter_delta(before, dict(after, irqs=irqs), "1")
+
+    def test_bad_data_subnet_or_management_device_refused_before_unbind(self):
+        for cidr, device in [("10.80.1.100/16", "ens6"), ("10.80.1.100/24", "ens5")]:
+            receiver = mock.Mock()
+            receiver.root.return_value = Proc(0, json.dumps({"ipv4": cidr}))
+            facts = dict(z.parse_host_env(HOST_ENV), DATA_IF=device)
+            with self.subTest(cidr=cidr, device=device), self.assertRaises(RuntimeError):
+                z.restore_kernel_receiver(receiver, facts, RECEIVER_DATA_IP, ["10.80.1.111"])
+            self.assertEqual(receiver.root.call_count, 1)
+
+    def test_occupied_policy_priority_is_not_overwritten(self):
+        receiver = mock.Mock()
+        receiver.root.side_effect = [
+            Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24"})),
+            Proc(0, "[]"),
+            Proc(0, json.dumps([{"priority": z.KERNEL_RULE, "table": "other"}])),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "already in use"):
+            z.restore_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+                                      RECEIVER_DATA_IP, ["10.80.1.111"])
+        self.assertEqual(receiver.root.call_count, 3)
+
+    def test_affinity_drift_fails_sweep_and_saves_evidence(self):
+        receiver, sender = mock.Mock(), mock.Mock()
+        receiver.root.return_value = Proc(0, "active\n")
+        sender.ssh.return_value = Proc(0)
+        before = {"cpus": [0, 1], "irqs": {"40": [0, 0]}, "softirq_cpus": [0, 1], "net_rx": [0, 0]}
+        facts = {"receiver": z.parse_host_env(HOST_ENV), "sender0": z.parse_host_env(HOST_ENV)}
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(z, "kernel_snapshot", side_effect=[
+                before, RuntimeError("data IRQ 40 is not exclusively on CPU 7")
+            ]), self.assertRaisesRegex(RuntimeError, "data IRQ 40"):
+                z.run_sweep("udp", None, [receiver, sender], facts, RECEIVER_DATA_IP,
+                            mock.Mock(), kernel=True, run_dir=directory)
+            with open(os.path.join(directory, f"{UDP}.kernel-cpu.json")) as f:
+                evidence = json.load(f)
+            self.assertEqual(evidence["before"], before)
+            self.assertIn("data IRQ 40", evidence["error"])
+            self.assertNotIn("delta", evidence)
+
+
 class FeedSummaryTest(unittest.TestCase):
     def test_count_and_latency_buckets_from_the_feed_lines(self):
         # 8 samples: p50 is the 4th (8192..16384), p99 and p99.9 the 8th (the >= 2^30 ns bucket)
@@ -926,7 +989,7 @@ class RunTest(unittest.TestCase):
             return Proc(self.w.report_code)
         raise AssertionError(argv)
 
-    def run_bench(self):
+    def run_bench(self, kernel=False):
         w = self.w
         env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
                     local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
@@ -945,7 +1008,7 @@ class RunTest(unittest.TestCase):
         self.log = io.StringIO()
         with mock.patch.object(z.janitor, "clean_run", clean_run), contextlib.redirect_stdout(self.log):
             try:
-                code = z.run(args, env)
+                code = z.run(args, env, kernel=kernel)
             except BaseException as e:  # SystemExit from the Ctrl-C handler too
                 code = e
             finally:
@@ -1005,6 +1068,16 @@ class RunTest(unittest.TestCase):
             setup = f.read()
         self.assertIn(f"[sender{z.SENDERS - 1} host.env]", setup)
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, "fetch-errors.txt")))
+
+    def test_kernel_route_failure_never_measures_and_still_cleans_up(self):
+        with mock.patch.object(z, "restore_kernel_receiver",
+                               side_effect=RuntimeError("kernel receiver route mismatch")):
+            error = self.run_bench(kernel=True)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("route mismatch", str(error))
+        self.assertEqual(self.sweeps_run(), [])
+        self.assertTrue(self.w.teardown_done)
+        self.assertFalse(os.path.exists(os.path.join(self.run_dir, "expected.json")))
 
     def test_failed_host_setup_never_claims_code_built_or_starts_a_sweep(self):
         self.w.verify_fail.add("sender1")
