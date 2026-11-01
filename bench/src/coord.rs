@@ -112,7 +112,7 @@ struct StepOutput<'a> {
 pub struct Summary {
     pub kind: &'static str,
     pub steps: u32,
-    /// Every step ran or the sweep stopped at a generator-bound step; false: see `error`.
+    /// Every step ran or the sweep stopped because a sender fell behind; false: see `error`.
     pub complete: bool,
     /// The sweep stopped because a sender fell behind; `run` fails even when complete.
     pub generator_bound: bool,

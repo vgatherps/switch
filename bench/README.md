@@ -45,8 +45,8 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   `ws://`, not TLS.
 - `report.py DIR`: `report.md` (one step table per sweep), `results.json` and one SVG per sweep
   (latency quantiles and not echoed % against offered rate; a step with no echo stays on the plot). Exit 1 when
-  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or any sweep
-  generator-bound. Python stdlib only; tests: `python3 bench/test_report.py`.
+  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or a sweep
+  stopped because a sender fell behind. Python stdlib only; tests: `python3 bench/test_report.py`.
 
 Protocols: UDP, TCP, ws:// (no TLS). The binary's global allocator is mimalloc. AWS receiver and sender
 launches explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding an inherited value so mimalloc
@@ -66,9 +66,9 @@ routing between them (its side of each tap is the gateway). Runs, per protocol, 
 (TCP/ws with `--budget-us 50`), then the bounded-overload check (a TCP sweep against a listener that never
 reads must end within seconds with 100% loss reported and a complete summary), then writes
 `bench/out/smoke/report.md`; the make target fails if the report is incomplete. Every process's stderr is
-kept in `bench/out/smoke/*.log`. It validates the tooling; net_tap numbers are not measurements (the
-generators hit the per-packet tap syscall early, so sweeps often end generator-bound, which the smoke
-accepts). A bridge does not work here: net_tap gives the kernel side of a tap the Zhida MAC, which a bridge
+kept in `bench/out/smoke/*.log`. It validates the tooling; net_tap numbers are not measurements.
+The smoke accepts a sweep that stops because a sender fell behind. A bridge does not work here: net_tap gives
+the kernel side of a tap the Zhida MAC, which a bridge
 takes as its own and keeps the frames.
 
 ## Tests
@@ -77,10 +77,10 @@ takes as its own and keeps the frames.
 under overload, a blocked sender not holding back the others, flow control kept apart from backlog, the
 backlog at the cutoff), receive accounting (latency, warmup, loss, ignored duplicates/stale/malformed echoes,
 in-window receives), the histogram, the rate list, the worker start offsets, merging of worker results
-(achieved rates, loss, budget, generator-bound), the outstanding-budget rule, the coordinator's reply and exit
+(achieved rates, loss, budget, sender delays), the outstanding-budget rule, the coordinator's reply and exit
 timeouts (silent workers and their process groups killed), cleanup of remaining process groups after a worker
 fails shutdown, its clock and late-start checks, its summary after a worker dies, after total loss and after
-a generator-bound step (fake workers), the TCP stream cutter and the
+a sender-late step (fake workers), the TCP stream cutter and the
 ws client framing. With `--features e2e` (`make -C conduit test-bench`, in `make test`; needs NET_ADMIN and
 /dev/net/tun) it also runs the TCP echo receiver on net_tap against a kernel peer whose small segments conduit
 appends into one received frame larger than a TX frame: every byte must come back.

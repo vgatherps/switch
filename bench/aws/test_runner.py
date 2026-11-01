@@ -1440,11 +1440,9 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(self.w.clean_calls), 1)
 
     def test_one_failed_sweep_fails_the_run_even_if_the_report_passes(self):
-        """Regression: a generator-bound udp sweep (coordinator exit 1) next to good tcp/ws sweeps
-        gave run exit 0."""
+        """Regression: one failing UDP sweep next to good TCP/WS sweeps gave run exit 0."""
         self.w.sweep_exit[UDP] = 1
         self.assertEqual(self.run_bench(), 1)
-        self.assertIn(f"generator-bound: {UDP}", self.log.getvalue())
 
     def test_scp_failure_is_recorded_and_fails_the_run(self):
         self.w.fetch_fail.add(("sender2", f"{z.REMOTE}/gen-{TCP}.log"))

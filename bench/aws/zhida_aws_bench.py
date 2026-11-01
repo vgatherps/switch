@@ -1085,7 +1085,7 @@ def run(args, env=None, kernel=False):
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
         if failed:
-            log(f"sweeps that failed or were generator-bound: {', '.join(failed)}")
+            log(f"sweeps that failed: {', '.join(failed)}")
         log(f"run {run_id} end: {'success' if report_code == 0 and not fetch_errors and not failed and torn else 'failed'}")
     return 0 if report_code == 0 and not fetch_errors and not failed and torn else 1
 
