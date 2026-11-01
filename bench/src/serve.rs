@@ -40,7 +40,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             frame_share: 64,
             max_sockets: 1,
             max_udp_sockets: 1,
-            rx_staging: 64,
+            rx_staging: 128,
             tx_pending: 64,
             neighbor_capacity: 256,
         },
@@ -80,7 +80,7 @@ fn tcp_sizing(sockets: usize, tcp_config: &tcp::Config, mtu: usize) -> Sizing {
         frame_share: sockets * tcp::tx_mbuf_budget(tcp_config, mtu) + 64,
         max_sockets: sockets,
         max_udp_sockets: 0,
-        rx_staging: 64,
+        rx_staging: 128,
         tx_pending: 64,
         neighbor_capacity: 256,
     }

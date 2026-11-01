@@ -12,7 +12,7 @@ use switchnet::{Instant, Net, NetConfig};
 use zhida_netconf::Config;
 use zhida_open::{Sizing, open};
 
-pub const INGRESS_BUDGET: usize = 32;
+pub const INGRESS_BUDGET: usize = 128;
 
 /// Monotonic ns since the process's origin, with the wall-clock time of that origin for joining
 /// samples across hosts and starting steps at a common wall-clock time (see `resync`).

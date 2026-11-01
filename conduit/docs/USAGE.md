@@ -427,9 +427,9 @@ resends what was dropped; RFC 2018 lets a receiver discard data it already repor
 blocks, and the sender must then resend it too.
 
 `zhida-open::open` (used by `nic-runner` and the `netconf-open` examples) does not size from a share:
-its RX pool is a fixed 32767 mbufs (2^15 - 1), 15.4 times the reserve at 1024 descriptors, burst 32,
-staging 32 and cache 8. Keeping out-of-order data needs the posted buffers, the low mark and what
-the sockets hold all at once; a pool that big leaves room for all of them, so it does not read low
+its RX pool is a fixed 32767 mbufs (2^15 - 1), with RX bursts of 128. At 1024 descriptors,
+staging 128 and cache 8, the reserve is 2316. Keeping out-of-order data needs the posted buffers,
+the low mark and what the sockets hold all at once; a pool that big leaves room for all of them, so it does not read low
 in practice. Each mbuf costs 2560 bytes at MTU 1500 and 9728 bytes at MTU 9001 (arm64 build:
 128-byte header, 128-byte mbuf, 8-byte private area, data room, padding); 32767 of them take
 41 2 MiB hugepages (82 MiB) at MTU 1500 and 153 (306 MiB) at MTU 9001. Under `--no-huge` an object

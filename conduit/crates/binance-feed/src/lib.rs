@@ -18,7 +18,7 @@ use rustls::{ClientConfig, RootCertStore};
 use switch::{oneshot, Spawner};
 use switchnet::{first, tcp, Instant, IpEndpoint, IpListenEndpoint, NetHandle, OpenError};
 
-pub const INGRESS_BUDGET: usize = 32;
+pub const INGRESS_BUDGET: usize = 128;
 /// The feed's defaults, shared by binance-feed and `zhida-nic feed`. The host speaks TLS 1.3;
 /// data-stream.binance.vision speaks TLS 1.2 only, which sheath does not.
 pub const DEFAULT_HOST: &str = "stream.binance.com";

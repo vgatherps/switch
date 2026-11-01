@@ -41,6 +41,7 @@ use tungstenite::{Error, Message};
 use zhida_buffer::PoolConfig;
 use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 use zhida_test_kit::{tap::TapVdev, with_eal};
+use zhida_test_kit::ring_port::RingPort;
 
 const VDEV: &CStr = c"net_tap_bnc";
 const IFACE: &CStr = c"cdtap_bnc";
@@ -171,6 +172,76 @@ fn with_net<T>(
         tap.close();
         result
     })
+}
+
+#[zhida_test_support::pinned_test]
+fn feed_sized_turn_imports_and_processes_one_hundred_packets() {
+    use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
+    use dpdk_smoltcp::smoltcp::wire::{
+        EthernetFrame, EthernetProtocol, EthernetRepr, IpProtocol, Ipv4Address, Ipv4Packet,
+        Ipv4Repr, UdpPacket, UdpRepr,
+    };
+    use dpdk_smoltcp::UdpConfig;
+
+    with_eal(|eal| {
+        let fixture = RingPort::new("feedburst", 128, 16);
+        let mut port_config = fixture.config();
+        port_config.rx_burst = INGRESS_BUDGET as u16;
+        port_config.rx_pool.count = u32::try_from(rx_reserve(
+            port_config.rx_descriptors,
+            port_config.rx_burst,
+            INGRESS_BUDGET,
+            port_config.rx_pool.cache_size,
+        ) + 100).unwrap();
+        let port = fixture.open_with(eal, port_config);
+        let config = StackConfig {
+            max_udp_sockets: 1,
+            ethernet: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            ipv4: Ipv4Cidr::new(Ipv4Address::new(192, 0, 2, 2), 24),
+            gateway: None,
+            paths: &[],
+            owned_ipv4: &[],
+            random_seed: 1,
+            neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
+            max_sockets: 1,
+            rx_staging: INGRESS_BUDGET,
+            tx_pending: 32,
+        };
+        let mut stack = Stack::new(port, config, StackInstant::ZERO)
+            .map_err(|(_, error)| error)
+            .unwrap();
+        let socket = stack.add_udp(UdpConfig {
+            port: 9000, local_addr: None, rx_queue: 128, tx_checksum: true, broadcast: false,
+        }).unwrap();
+        let src = Ipv4Address::new(192, 0, 2, 3);
+        let dst = Ipv4Address::new(192, 0, 2, 2);
+        let eth = EthernetRepr {
+            src_addr: EthernetAddress([0x02, 0, 0, 0, 0, 3]),
+            dst_addr: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            ethertype: EthernetProtocol::Ipv4,
+        };
+        let udp = UdpRepr { src_port: 9001, dst_port: 9000 };
+        let ip = Ipv4Repr { src_addr: src, dst_addr: dst, next_header: IpProtocol::Udp, payload_len: udp.header_len() + 1, hop_limit: 64 };
+        let caps = ChecksumCapabilities::default();
+        let packets: Vec<_> = (0..100u8).map(|i| {
+            let mut bytes = vec![0; eth.buffer_len() + ip.buffer_len() + ip.payload_len];
+            let mut frame = EthernetFrame::new_unchecked(&mut bytes);
+            eth.emit(&mut frame);
+            let mut packet = Ipv4Packet::new_unchecked(frame.payload_mut());
+            ip.emit(&mut packet, &caps);
+            udp.emit(&mut UdpPacket::new_unchecked(packet.payload_mut()), &src.into(), &dst.into(), 1, |b| b[0] = i, &caps);
+            bytes
+        }).collect();
+        fixture.inject(&packets);
+        let turn = stack.turn(StackInstant::ZERO, INGRESS_BUDGET).unwrap();
+        assert_eq!((turn.rx_received, turn.rx_rejected, turn.rx_processed, turn.rx_staged), (100, 0, 100, 0));
+        for i in 0..100u8 {
+            assert_eq!(stack.udp_mut(&socket).recv().unwrap().payload(), &[i]);
+        }
+        assert!(fixture.take_tx().is_empty());
+        stack.into_port().try_close().unwrap();
+        fixture.close();
+    });
 }
 
 fn server_config() -> (Arc<ServerConfig>, RootCertStore) {

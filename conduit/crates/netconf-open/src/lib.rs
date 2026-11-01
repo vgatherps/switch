@@ -20,9 +20,8 @@ mod eal_affinity;
 pub use open::{open, OpenError, OpenReport, Opened};
 
 const CACHE: u32 = 8;
-const RX_BURST: u16 = 32;
-/// RX pool mbufs: 15.4 times `rx_reserve` at 1024 RX descriptors, burst 32, staging 32 and
-/// cache 8 (2124), and 2^15 - 1 as DPDK prefers. The pool reads low below its low mark, and
+const RX_BURST: u16 = 128;
+/// RX pool mbufs: 2^15 - 1 as DPDK prefers. The pool reads low below its low mark, and
 /// then TCP sockets keep no out-of-order data; this many mbufs keeps it from reading low in
 /// practice. 82 MiB of 2 MiB hugepages at MTU 1500, 306 MiB at MTU 9001.
 const RX_POOL: u32 = 32767;
@@ -158,7 +157,7 @@ mod tests {
                     frame_share: 0,
                     max_sockets: 1,
                     max_udp_sockets: 0,
-                    rx_staging: 32,
+                    rx_staging: 128,
                     tx_pending: 32,
                     neighbor_capacity: 256,
                 },
@@ -188,6 +187,8 @@ mod tests {
         ] {
             let config = port_config(0, 1500, Offloads::default(), adjusted, &sizing).unwrap();
             assert_eq!((config.rx_descriptors, config.tx_descriptors), adjusted);
+            assert_eq!(config.rx_burst, 128);
+            assert_eq!(config.tx_burst, 32);
             let held = u32::from(adjusted.1) + u32::try_from(sizing.tx_pending).unwrap();
             assert_eq!(config.tx_pool.count, held);
             assert_eq!(config.frame_pool.count, held + 1 + u32::try_from(sizing.frame_share).unwrap());

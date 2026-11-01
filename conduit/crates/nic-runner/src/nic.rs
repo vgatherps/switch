@@ -44,7 +44,7 @@ pub fn sizing(
         frame_share: window(tcp::tx_mbuf_budget),
         max_sockets: tcp.max(1),
         max_udp_sockets: udp,
-        rx_staging: STAGING,
+        rx_staging: if matches!(mode, Mode::Feed(_)) { binance_feed::INGRESS_BUDGET } else { STAGING },
         tx_pending: STAGING.max(tcp),
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     }
@@ -162,6 +162,17 @@ mod tests {
         let config = test_config(9000, r#"[{"prefix":"203.0.113.0/24","mtu":1500,"why":"feed path"}]"#);
         assert_eq!(feed_socket(&config, "203.0.113.1".parse().unwrap()).mss_cap, Some(1460));
         assert_eq!(feed_socket(&config, "203.0.114.1".parse().unwrap()).mss_cap, Some(8960));
+    }
+
+    #[test]
+    fn feed_increases_only_rx_staging() {
+        let config = test_config(1500, "[]");
+        let feed = parsed(&["--config", "x", "feed"]);
+        let server = parsed(&["--config", "x", "sockperf-server", "--tcp-port", "1"]);
+        let feed = sizing(&config, &feed.mode, None);
+        let server = sizing(&config, &server.mode, None);
+        assert_eq!((feed.rx_staging, feed.tx_pending), (128, 32));
+        assert_eq!((server.rx_staging, server.tx_pending), (32, 32));
     }
 
     /// The frame share is one send window, whatever the number of sockets.
