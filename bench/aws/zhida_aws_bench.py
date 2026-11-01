@@ -738,7 +738,7 @@ def configure_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
 def kernel_snapshot(receiver, facts, configure=False):
     """Data IRQ placement plus counters; NET_RX is host-wide, including management SSH."""
     script = r'''
-import json, pathlib, sys
+import json, pathlib, sys, time
 pci, interface, cpu, configure = sys.argv[1:]
 configure = configure == "True"
 irqs = sorted(int(p.name) for p in pathlib.Path("/sys/bus/pci/devices", pci, "msi_irqs").iterdir())
@@ -768,7 +768,22 @@ for irq in irqs:
     details[key] = {"name": names.get(key), "before": before,
                     "requested": requested.read_text().strip(), "effective": affinity[key],
                     "write_error": error}
+if configure and not any(info["write_error"] for info in details.values()):
+    deadline = time.monotonic() + 5
+    while any(value != cpu for value in affinity.values()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+        for irq in irqs:
+            key = str(irq)
+            affinity[key] = pathlib.Path("/proc/irq", key, "effective_affinity_list").read_text().strip()
+            details[key]["effective"] = affinity[key]
 if any(info["write_error"] or info["effective"] != cpu for info in details.values()):
+    for key, info in details.items():
+        debug = pathlib.Path("/sys/kernel/debug/irq/irqs", key)
+        if debug.exists():
+            try:
+                info["kernel_irq_state"] = debug.read_text()
+            except OSError as exc:
+                info["kernel_irq_state_error"] = str(exc)
     print(json.dumps({"affinity_error": {"target_cpu": cpu, "irqs": details}}))
     sys.exit(0)
 queues = list(pathlib.Path("/sys/class/net", interface, "queues").glob("rx-*/rps_cpus"))
