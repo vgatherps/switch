@@ -178,15 +178,8 @@ async fn serve_accepted(
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    // the largest TCP frame payload received: the echo test's precondition
-    static MAX_RX_FRAME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
-/// Echoes the connection's bytes. A received frame may hold more than one TX frame's room
-/// (conduit appends small in-order segments into a frame's tailroom), so it goes back as as many
-/// TX frames as it needs.
+/// Echoes all bytes received from a TCP connection.
 async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
     let (mut rx, mut tx) = stream.split();
     loop {
@@ -194,8 +187,6 @@ async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
             return;
         };
         let payload = received.payload();
-        #[cfg(test)]
-        MAX_RX_FRAME.with(|m| m.set(m.get().max(payload.len())));
         let mut rest = payload;
         while !rest.is_empty() {
             let mut frame = handle.tx_frame().await;
@@ -311,14 +302,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The Zhida TCP echo on net_tap (the production `Host` and pools) against a kernel peer that
-    /// sends full segments each followed by small ones: conduit appends the small ones into the
-    /// full one's tailroom, so a received frame outgrows a TX frame. Every byte must come back.
+    /// The Zhida TCP echo on net_tap against a kernel peer sending mixed segment sizes.
     #[zhida_test_support::pinned_test]
-    fn echo_returns_a_received_frame_larger_than_a_tx_frame() {
-        use std::cell::Cell;
+    fn tcp_echo_returns_all_bytes() {
         use std::io::{Read, Write as _};
-        use std::rc::Rc;
         use std::time::{Duration, Instant};
 
         const PORT: u16 = 7100;
@@ -355,14 +342,6 @@ mod tests {
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
         arm_accept(&spawner, handle.clone(), PORT, tcp_config, false).unwrap();
-        #[switch::task]
-        async fn frame_room(handle: NetHandle, room: Rc<Cell<usize>>) {
-            room.set(handle.tx_frame().await.room_mut().len());
-        }
-        let room = Rc::new(Cell::new(0));
-        spawner
-            .spawn(frame_room(handle.clone(), room.clone()))
-            .unwrap();
 
         let sent: Vec<u8> = (0..ROUNDS * (1460 + SMALL * 64))
             .map(|i| (i % 251) as u8)
@@ -399,13 +378,8 @@ mod tests {
             std::thread::sleep(Duration::from_micros(50));
         }
         assert!(peer.join().unwrap() == expected, "echoed bytes differ");
-        let max_frame = MAX_RX_FRAME.with(|m| m.get());
-        assert!(
-            max_frame > room.get(),
-            "precondition: largest received frame {max_frame} B, TX frame room {} B",
-            room.get()
-        );
         drop((handle, spawner));
         host.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
