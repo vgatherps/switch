@@ -1,6 +1,7 @@
 //! Every socket of a Stack draws on one RX pool and one frame pool; nothing is reserved per
-//! socket. A socket's buffer sizes cap what it holds, like the kernel's per-socket buffer
-//! limits. When the RX pool is empty the link drops arrivals and the peer retransmits. While
+//! socket. TCP's receive capacity is an advertised window target, not an in-order data limit;
+//! transmit capacity bounds queued and unacknowledged bytes. When the RX pool is empty the link
+//! drops arrivals and the peer retransmits. While
 //! it is low, a TCP socket that receives a segment keeps no out-of-order data, so out-of-order
 //! frames cannot hold the pool while the segments filling their gaps are dropped.
 
