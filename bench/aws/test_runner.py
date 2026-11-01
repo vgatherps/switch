@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import janitor  # noqa: E402
 import zhida_aws_bench as z  # noqa: E402
 
-UDP, TCP, WS = z.sweep_tags()
+UDP, TCP, TCP_UNCAPPED, WS, WS_UNCAPPED = z.sweep_tags()
 
 UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
@@ -63,6 +63,28 @@ def write_exe(path, body):
 class PureTest(unittest.TestCase):
     def test_durations(self):
         self.assertEqual([z.parse_duration(t) for t in ("90m", "2h", "45s", "120", "1.5h")], [5400, 7200, 45, 120, 5400])
+
+    def test_shape_cli_plan_and_defaults(self):
+        for command in ("run", "kernel", "plan", "preflight"):
+            self.assertEqual(z.parser().parse_args([command]).shape, "arm")
+            self.assertEqual(z.parser().parse_args([command, "--shape", "intel"]).shape, "intel")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(z.main(["plan", "--shape", "intel", "--region", "ap-northeast-1"]), 0)
+        self.assertIn("1 x c6in.8xlarge receiver, 3 x c6in.2xlarge senders", out.getvalue())
+        self.assertIn("56 vCPUs free", out.getvalue())
+        self.assertIn("12 senders (4 per sender host)", out.getvalue())
+        self.assertIn("10000,100000,400000,800000,900000,1000000,1100000,1200000,1400000,1800000,2500000",
+                      out.getvalue())
+        for tag in ("udp-n12-s64-uncapped", "tcp-n12-s64-b50", "tcp-n12-s64-uncapped",
+                    "ws-n12-s64-b50", "ws-n12-s64-uncapped"):
+            self.assertIn(tag, out.getvalue())
+
+    def test_sweep_timeout_exceeds_scheduled_time(self):
+        scheduled = len(z.RATES) * (50 + z.WARMUP_MS + z.STEP_MS + z.DRAIN_MS) / 1000
+        self.assertEqual(scheduled, 115.5)
+        self.assertEqual(z.SWEEP_WORST_S, 900)
+        self.assertGreater(z.SWEEP_WORST_S, scheduled)
 
     def test_every_run_resource_carries_the_run_id_and_expiry(self):
         expires = datetime.datetime(2026, 11, 1, 13, 30, tzinfo=UTC)
@@ -270,6 +292,57 @@ class KernelRoutingTest(unittest.TestCase):
             self.assertNotIn("delta", evidence)
 
 
+class EnaEvidenceTest(unittest.TestCase):
+    def test_ethtool_names_missing_and_reset_are_explicit(self):
+        parsed = z.parse_ena_stats(
+            "NIC statistics:\n     pps_allowance_exceeded: 12\n"
+            "     bw_in_allowance_exceeded: 0\n     rx_packets: 400\n")
+        self.assertEqual(parsed["counters"], {"pps_allowance_exceeded": 12, "bw_in_allowance_exceeded": 0})
+        self.assertEqual(parsed["missing"], ["bw_out_allowance_exceeded"])
+        before = {"status": "ok", "counters": dict.fromkeys(z.ENA_COUNTERS, 10), "missing": []}
+        after = {"status": "unsupported", **parsed}
+        result = z.kernel_ena_result(before, after)
+        self.assertIn("snapshot unavailable or counters missing", result["invalid"])
+        self.assertIn("counter decreased: bw_in_allowance_exceeded", result["invalid"])
+        with self.assertRaises(ValueError):
+            z.parse_ena_stats("pps_allowance_exceeded: 4\npps_allowance_exceeded: 5\n")
+        with self.assertRaises(ValueError):
+            z.parse_ena_stats("pps_allowance_exceeded: unknown\n")
+
+    def test_failed_ethtool_is_not_zero(self):
+        receiver = mock.Mock()
+        receiver.root.return_value = Proc(1, stderr="Operation not supported")
+        result = z.kernel_ena_snapshot(receiver, "ens6")
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Operation not supported", result["error"])
+        self.assertNotIn("counters", result)
+        receiver.root.assert_called_once_with("ethtool -S ens6", check=False)
+
+    def test_failed_receiver_launch_still_saves_current_invocation(self):
+        receiver, sender = mock.Mock(), mock.Mock()
+        invocation = "1234567890abcdef1234567890abcdef"
+
+        def root(command, **kwargs):
+            if "systemd-run" in command:
+                return Proc(1, stderr="start failed")
+            if command.startswith("systemctl show"):
+                return Proc(0, invocation + "\n")
+            if command.startswith("journalctl"):
+                self.assertIn("_SYSTEMD_INVOCATION_ID=" + invocation, command)
+                return Proc(0, "receiver startup failed\n")
+            return Proc(0)
+
+        receiver.root.side_effect = root
+        facts = {"receiver": z.parse_host_env(HOST_ENV), "sender0": z.parse_host_env(HOST_ENV)}
+        with tempfile.TemporaryDirectory() as directory:
+            code = z.run_sweep("udp", None, [receiver, sender], facts, RECEIVER_DATA_IP,
+                               mock.Mock(), run_dir=directory)
+            self.assertIsNone(code)
+            with open(os.path.join(directory, f"{UDP}.receiver.log")) as f:
+                self.assertEqual(f.read(), "receiver startup failed\n")
+        sender.ssh.assert_not_called()
+
+
 class FeedSummaryTest(unittest.TestCase):
     def test_count_and_latency_buckets_from_the_feed_lines(self):
         # 8 samples: p50 is the 4th (8192..16384), p99 and p99.9 the 8th (the >= 2^30 ns bucket)
@@ -331,7 +404,7 @@ class FakeLaunchEc2:
                                                                               {"Location": "zone-a"}]}}
 
     def __init__(self):
-        self.calls, self.n = [], 0
+        self.calls, self.n, self.instance_count = [], 0, 0
 
     def record(self, kind, rid):
         self.calls.append(("record", (kind, rid)))
@@ -341,7 +414,9 @@ class FakeLaunchEc2:
             self.calls.append((name, kw))
             if name == "run_instances":
                 # out of launch-index order on purpose
-                return {"Instances": [{"InstanceId": f"i-{k}", "AmiLaunchIndex": k}
+                start = self.instance_count
+                self.instance_count += kw["MinCount"]
+                return {"Instances": [{"InstanceId": f"i-{start + k}", "AmiLaunchIndex": k}
                                       for k in sorted(range(kw["MinCount"]), key=lambda k: (k % 2, -k))]}
             if name == "create_network_interface":
                 self.n += 1
@@ -371,8 +446,7 @@ class FakeLaunchEc2:
 
 class FakeSsm:
     def get_parameter(self, Name):
-        assert Name == z.AMI_PARAM
-        return {"Parameter": {"Value": "ami-arm64"}}
+        return {"Parameter": {"Value": {z.AMI_PARAM: "ami-arm64", z.INTEL_AMI_PARAM: "ami-x86_64"}[Name]}}
 
 
 NET = {"name": "zhida-bench-r1", "subnet": "subnet-1", "zone": "zone-a", "sg": "sg-1"}
@@ -382,7 +456,7 @@ class LaunchTest(unittest.TestCase):
     def test_network_is_per_run_tagged_and_recorded_as_created(self):
         ec2 = FakeLaunchEc2()
         key = os.path.join(tempfile.mkdtemp(), "key.pem")
-        net = launch_aws(ec2).create_network("r1", NOW, "203.0.113.9", ec2.record, key, "c7gn.2xlarge", "cluster")
+        net = launch_aws(ec2).create_network("r1", NOW, "203.0.113.9", ec2.record, key, "zone-a", "cluster")
         self.assertEqual(net, NET)
         creates = [c[:2] for c in ec2.calls if c[0].startswith("create_") and c[0] != "create_route"]
         for n, kw in creates:
@@ -409,11 +483,12 @@ class LaunchTest(unittest.TestCase):
     def test_one_run_instances_of_every_host_into_the_placement_group_then_eni_attach(self):
         ec2 = FakeLaunchEc2()
         aws = launch_aws(ec2)
-        hosts = aws.launch_hosts(NET, "r1", NOW + datetime.timedelta(hours=2), ec2.record, "c7gn.2xlarge", z.ROLES)
+        hosts = aws.launch_hosts(NET, "r1", NOW + datetime.timedelta(hours=2), ec2.record, "c7gn.2xlarge", z.ROLES, z.AMI_PARAM)
         names = [c[0] for c in ec2.calls]
         self.assertEqual(names.count("run_instances"), 1)
         ri = ec2.calls[names.index("run_instances")][1]
         self.assertEqual((ri["MinCount"], ri["MaxCount"], ri["InstanceType"]), (4, 4, "c7gn.2xlarge"))
+        self.assertEqual(ri["ImageId"], "ami-arm64")
         self.assertEqual(ri["Placement"], {"GroupName": "zhida-bench-r1", "AvailabilityZone": "zone-a"})
         self.assertEqual(ri["KeyName"], "zhida-bench-r1")
         self.assertNotIn("InstanceMarketOptions", ri, "on-demand, not spot")
@@ -440,21 +515,45 @@ class LaunchTest(unittest.TestCase):
                          [(r, f"i-{k}", f"pub-i-{k}") for k, r in enumerate(z.ROLES)])
         self.assertEqual(hosts[0]["data_eni"], {"id": "eni-1", "mac": "m1", "ip": "10.80.1.101"})
 
+    def test_intel_launch_requests_use_x86_ami_and_record_before_wait(self):
+        ec2 = FakeLaunchEc2()
+        aws = launch_aws(ec2)
+        expires = NOW + datetime.timedelta(hours=2)
+        receiver = aws.launch_hosts(NET, "r1", expires, ec2.record, "c6in.8xlarge", z.ROLES[:1], z.INTEL_AMI_PARAM)
+        senders = aws.launch_hosts(NET, "r1", expires, ec2.record, "c6in.2xlarge", z.ROLES[1:], z.INTEL_AMI_PARAM)
+        launches = [(i, c[1]) for i, c in enumerate(ec2.calls) if c[0] == "run_instances"]
+        self.assertEqual([(r["InstanceType"], r["MinCount"], r["MaxCount"]) for _, r in launches],
+                         [("c6in.8xlarge", 1, 1), ("c6in.2xlarge", 3, 3)])
+        for (index, request), ids in zip(launches, (["i-0"], ["i-1", "i-2", "i-3"])):
+            self.assertEqual(request["ImageId"], "ami-x86_64")
+            self.assertEqual(request["Placement"], {"GroupName": NET["name"], "AvailabilityZone": NET["zone"]})
+            self.assertEqual(request["NetworkInterfaces"][0]["SubnetId"], NET["subnet"])
+            self.assertEqual(request["TagSpecifications"],
+                             [{"ResourceType": k, "Tags": z.run_tags("r1", expires)}
+                              for k in ("instance", "volume", "network-interface")])
+            self.assertIn(f"OnCalendar={expires.strftime('%Y-%m-%d %H:%M:%S')} UTC", request["UserData"])
+            self.assertEqual(ec2.calls[index + 1:index + 1 + len(ids)],
+                             [("record", ("instance", iid)) for iid in ids])
+            self.assertEqual(ec2.calls[index + 1 + len(ids)],
+                             ("wait", "instance_running", {"InstanceIds": ids}))
+        self.assertEqual([(h["role"], h["id"]) for h in receiver + senders],
+                         list(zip(z.ROLES, ["i-0", "i-1", "i-2", "i-3"])))
+        self.assertEqual(z.CONNECTIONS, 12)
+
     def test_one_instance_in_a_precision_time_group_with_an_elastic_ip_on_its_data_eni(self):
         ec2 = FakeLaunchEc2()
         aws = launch_aws(ec2)
         key = os.path.join(tempfile.mkdtemp(), "key.pem")
         expires = NOW + datetime.timedelta(hours=2)
-        net = aws.create_network("r1", expires, "203.0.113.9", ec2.record, key, "m7g.xlarge", "precision-time")
-        [host] = aws.launch_hosts(net, "r1", expires, ec2.record, "m7g.xlarge", ["binance"])
+        net = aws.create_network("r1", expires, "203.0.113.9", ec2.record, key, "zone-a", "precision-time")
+        [host] = aws.launch_hosts(net, "r1", expires, ec2.record, "m7g.xlarge", ["binance"], z.AMI_PARAM)
         aws.attach_eip(host["data_eni"], "r1", expires, ec2.record)
         names = [c[0] for c in ec2.calls]
-        offer = ec2.calls[names.index("describe_instance_type_offerings")][1]
-        self.assertEqual(offer["Filters"], [{"Name": "instance-type", "Values": ["m7g.xlarge"]}])
         pg = ec2.calls[names.index("create_placement_group")][1]
         self.assertEqual((pg["GroupName"], pg["Strategy"]), ("zhida-bench-r1", "precision-time"))
         ri = ec2.calls[names.index("run_instances")][1]
         self.assertEqual((ri["MinCount"], ri["MaxCount"], ri["InstanceType"]), (1, 1, "m7g.xlarge"))
+        self.assertEqual(ri["ImageId"], "ami-arm64")
         self.assertEqual(ri["Placement"], {"GroupName": "zhida-bench-r1", "AvailabilityZone": "zone-a"})
         self.assertLess(names.index("create_placement_group"), names.index("run_instances"))
         self.assertIn(f"OnCalendar={expires.strftime('%Y-%m-%d %H:%M:%S')} UTC", ri["UserData"])
@@ -836,6 +935,7 @@ class HostTest(unittest.TestCase):
 class World:
     def __init__(self):
         self.calls = []        # (role, command)
+        self.launch_amis = []
         self.fetched = []      # (role, remote)
         self.sweep_exit = {}   # tag -> coordinator exit code
         self.sweep_timeouts = []
@@ -847,9 +947,12 @@ class World:
         self.clean_calls = []  # (run id, recorded IDs)
         self.left_after_teardown = []
         self.network_fails = False
+        self.launch_fails = None
+        self.instance_count = 0
         self.interrupt_sweep = None     # tag whose coordinator gets the first Ctrl-C
         self.interrupt_teardown = False  # a second Ctrl-C inside teardown
         self.teardown_done = False
+        self.zones = ("zone-a",)
         self.hang = False               # receiver stop and every scp time out
         self.offered = True             # the instance type is offered in the region
         self.feed_code = 0              # run-binance.sh's exit code
@@ -887,6 +990,10 @@ class FakeHost:
             return Proc(0, f"{self.w.actual_mtu}\n")
         if command.startswith("systemctl is-active"):
             return Proc(0, "active\n")
+        if command.startswith("systemctl show") and "InvocationID" in command:
+            return Proc(0, "0123456789abcdef0123456789abcdef\n")
+        if command.startswith("journalctl") and "_SYSTEMD_INVOCATION_ID=" in command:
+            return Proc(0, '{"kind":"ena_xstats","phase":"close"}\n')
         if command.startswith("systemctl stop") and self.w.hang:
             raise subprocess.TimeoutExpired(command, z.SSH_S)
         if "run-binance.sh" in command:
@@ -957,7 +1064,9 @@ class FakeQuotaEc2:
 
     def describe_instance_type_offerings(self, LocationType, Filters):
         assert LocationType == "availability-zone"
-        return {"InstanceTypeOfferings": [{"Location": z} for z in self.zones]}
+        itype = Filters[0]["Values"][0]
+        zones = self.zones.get(itype, ()) if isinstance(self.zones, dict) else self.zones
+        return {"InstanceTypeOfferings": [{"Location": zone} for zone in zones]}
 
     def get_paginator(self, name):
         assert name == "describe_instances"
@@ -987,7 +1096,8 @@ class PreflightTest(unittest.TestCase):
         aws = z.Aws("ap-northeast-1", {"ec2": FakeQuotaEc2(list(instances), zones), "ssm": None,
                                        "sts": FakeSts(sts_error), "service-quotas": FakeQuotas(quota, quota_error)})
         env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: aws, local=local or (lambda argv, **kw: Proc(0, "")))
-        return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1", itype, vcpus)[0]}
+        types = (itype,) if isinstance(itype, str) else itype
+        return {name: (ok, detail) for name, ok, detail in z.preflight(env, "ap-northeast-1", types, vcpus)[0]}
 
     def test_all_pass(self):
         r = self.check(quota=96, instances=[running("c7g.4xlarge", 16), running("m5.large", 2, spot=True)])
@@ -1003,6 +1113,31 @@ class PreflightTest(unittest.TestCase):
         self.assertFalse(self.check(quota=3, itype="m7g.xlarge", vcpus=4)["quota"][0])
         self.assertEqual(self.check(zones=(), itype="m7g.xlarge", vcpus=4)["offering"],
                          (False, "no zone in ap-northeast-1 offers m7g.xlarge"))
+
+    def test_intel_common_zone_and_quota(self):
+        types = ("c6in.8xlarge", "c6in.2xlarge")
+        zones = {types[0]: ("zone-a", "zone-c"), types[1]: ("zone-b", "zone-c")}
+        r = self.check(quota=64, instances=[running("m5.2xlarge", 8)], zones=zones, itype=types, vcpus=56)
+        self.assertEqual(r["offering"], (True, "c6in.8xlarge, c6in.2xlarge in zone-c"))
+        self.assertEqual(r["quota"], (True, "L-1216C47A 64 vCPUs, 8 in use, 56 free, need 56"))
+        self.assertFalse(self.check(quota=63, instances=[running("m5.2xlarge", 8)],
+                                    zones=zones, itype=types, vcpus=56)["quota"][0])
+        zones[types[1]] = ("zone-b",)
+        self.assertEqual(self.check(zones=zones, itype=types, vcpus=56)["offering"],
+                         (False, "no zone in ap-northeast-1 offers c6in.8xlarge, c6in.2xlarge"))
+
+    def test_common_zone_offerings_paginate(self):
+        class PagedEc2:
+            def describe_instance_type_offerings(self, LocationType, Filters, NextToken=None):
+                self_type = Filters[0]["Values"][0]
+                if self_type == "c6in.8xlarge" and NextToken is None:
+                    return {"InstanceTypeOfferings": [{"Location": "zone-a"}], "NextToken": "next"}
+                if self_type == "c6in.8xlarge":
+                    assert NextToken == "next"
+                    return {"InstanceTypeOfferings": [{"Location": "zone-c"}]}
+                return {"InstanceTypeOfferings": [{"Location": "zone-c"}]}
+
+        self.assertEqual(launch_aws(PagedEc2()).zone_offering(("c6in.8xlarge", "c6in.2xlarge")), "zone-c")
 
     def test_quota_minus_running_on_demand_vcpus(self):
         # 16 on-demand vCPUs in use (spot is another quota): 64 leaves exactly 48, 63 not
@@ -1075,31 +1210,36 @@ class PreflightTest(unittest.TestCase):
 
 class FakeAws:
     def __init__(self, world):
-        self.w, self.ec2 = world, FakeQuotaEc2([])
+        self.w, self.ec2, self.region = world, FakeQuotaEc2([], world.zones), "ap-northeast-1"
         self.sts, self.quotas = FakeSts(), FakeQuotas(96)
 
-    def create_network(self, run_id, expires, my_ip, record, key_path, instance_type, strategy):
-        self.w.calls.append(("aws", f"create_network {my_ip} {instance_type} {strategy}"))
+    def create_network(self, run_id, expires, my_ip, record, key_path, zone, strategy):
+        self.w.calls.append(("aws", f"create_network {my_ip} {zone} {strategy}"))
         record("vpc", "vpc-1")
         if self.w.network_fails:
             raise ClientError("RequestLimitExceeded", "slow down")
         record("subnet", "subnet-1")
         with open(key_path, "w") as f:
             f.write("PRIVATE\n")
-        return dict(NET)
+        return dict(NET, zone=zone)
 
-    def zone_offering(self, instance_type):
+    def zone_offering(self, instance_types):
         if not self.w.offered:
-            raise RuntimeError(f"no zone in ap-northeast-1 offers {instance_type}")
-        return "zone-a"
+            raise RuntimeError(f"no zone in ap-northeast-1 offers {', '.join(dict.fromkeys(instance_types))}")
+        return z.Aws.zone_offering(self, instance_types)
 
-    def launch_hosts(self, net, run_id, expires, record, instance_type, roles):
+    def launch_hosts(self, net, run_id, expires, record, instance_type, roles, ami_param):
         self.w.calls.append(("aws", f"launch_hosts {instance_type} {' '.join(roles)}"))
-        for k in range(len(roles)):
+        self.w.launch_amis.append(ami_param)
+        if instance_type == self.w.launch_fails:
+            raise ClientError("InsufficientInstanceCapacity", "capacity unavailable")
+        start = self.w.instance_count
+        self.w.instance_count += len(roles)
+        for k in range(start, start + len(roles)):
             record("instance", f"i-{k}")
         return [{"role": r, "id": f"i-{k}", "public_ip": f"pub{k}", "private_ip": f"10.80.1.{10 + k}",
                  "data_eni": {"id": f"eni-{k}", "mac": f"m{k}", "ip": RECEIVER_DATA_IP if k == 0 else f"10.80.1.{110 + k}"}}
-                for k, r in enumerate(roles)]
+                for k, r in enumerate(roles, start)]
 
     def attach_eip(self, eni, run_id, expires, record):
         self.w.calls.append(("aws", f"attach_eip {eni['id']} {eni['ip']}"))
@@ -1114,16 +1254,16 @@ class RunTest(unittest.TestCase):
     def local(self, argv, **kw):
         self.w.local_calls.append(argv)
         if argv[0] == "git":
-            return Proc(0, b"TAR" if "archive" in argv else "")
+            return Proc(0, b"TAR" if "archive" in argv else "a" * 40 if "rev-parse" in argv else "")
         if argv[1].endswith("report.py"):
             return Proc(self.w.report_code)
         raise AssertionError(argv)
 
-    def run_bench(self, kernel=False):
+    def run_bench(self, kernel=False, shape="arm"):
         w = self.w
         env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda region: FakeAws(w), host=lambda info, key, rd: FakeHost(w, info, rd),
                     local=self.local, my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda s: None)
-        args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out)
+        args = argparse.Namespace(region="ap-northeast-1", ttl="2h", out=self.out, shape=shape)
 
         def clean_run(ec2, run_id, recorded, log=print, **kw):
             self.assertEqual(kw["journal_path"], os.path.join(self.out, run_id, "created.json"))
@@ -1144,7 +1284,8 @@ class RunTest(unittest.TestCase):
             finally:
                 for s, h in handlers.items():
                     signal.signal(s, h)
-        self.run_dir = os.path.join(self.out, os.listdir(self.out)[0])
+        runs = os.listdir(self.out)
+        self.run_dir = os.path.join(self.out, runs[0]) if runs else None
         return code
 
     def sweeps_run(self):
@@ -1154,7 +1295,12 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.run_bench(), 0)
         w = self.w
         self.assertEqual([c for r, c in w.calls if r == "aws"], [
-            f"create_network 203.0.113.9 {z.HOST_TYPE} cluster", f"launch_hosts {z.HOST_TYPE} " + " ".join(z.ROLES)])
+            "create_network 203.0.113.9 zone-a cluster", f"launch_hosts {z.HOST_TYPE} " + " ".join(z.ROLES)])
+        with open(os.path.join(self.run_dir, "source.json")) as f:
+            source = json.load(f)
+        self.assertEqual(source["commit"], "a" * 40)
+        self.assertEqual(source["archive_sha256"], "16a6862e095aa78fc80bb598b644371963b802a9f83ff254628379237e072466")
+        self.assertTrue(any(a[-1] == source["commit"] and "archive" in a for a in w.local_calls))
         self.assertEqual(sorted(r for r, c in w.calls if c == "setup b'TAR'"), sorted(z.ROLES))
         cfg = w.put[("sender0", f"{z.REMOTE}/ssh_config")]
         self.assertEqual([l for l in cfg.splitlines() if l.startswith("Host sender")],
@@ -1162,22 +1308,39 @@ class RunTest(unittest.TestCase):
         self.assertIn("HostName 10.80.1.11", cfg)
         self.assertEqual(w.put[("sender0", f"{z.REMOTE}/id_run")], "PRIVATE\n")
         sweeps = self.sweeps_run()
-        self.assertEqual(len(sweeps), 3)
-        self.assertEqual(w.sweep_timeouts, [z.SWEEP_WORST_S] * 3)
+        self.assertEqual(len(sweeps), 5)
+        self.assertEqual(w.sweep_timeouts, [900] * 5)
         self.assertTrue(all(r == "sender0" for r, c in w.calls if "zhida-bench sweep" in c))
-        for cmd, t in zip(sweeps, z.sweep_tags()):
+        self.assertEqual(z.sweep_tags(), [
+            "udp-n12-s64-uncapped", "tcp-n12-s64-b50", "tcp-n12-s64-uncapped",
+            "ws-n12-s64-b50", "ws-n12-s64-uncapped"])
+        for cmd, t, (proto, budget) in zip(sweeps, z.sweep_tags(), z.SWEEPS):
             inner = shlex.split(cmd)[2]
             argv = shlex.split(inner.split(" > ")[0])
             self.assertEqual(argv[:3], ["taskset", "-c", "0-6"], "coordinator on HOUSEKEEPING")
             self.assertEqual(argv[argv.index("--gens") + 1], str(z.SENDERS))
+            self.assertEqual(argv[argv.index("--proto") + 1], proto)
+            self.assertEqual(argv[argv.index("--rates") + 1],
+                             "10000,100000,400000,800000,900000,1000000,1100000,1200000,1400000,1800000,2500000")
+            self.assertEqual(argv[argv.index("--step-ms") + 1], "10000")
+            self.assertEqual(argv[argv.index("--warmup-ms") + 1], "250")
+            self.assertEqual(argv[argv.index("--drain-ms") + 1], "200")
+            self.assertNotIn("--rate-min", argv)
+            self.assertNotIn("--rate-max", argv)
+            if budget is None:
+                self.assertNotIn("--budget-us", argv)
+            else:
+                self.assertEqual(argv[argv.index("--budget-us") + 1], str(budget))
             tmpl = argv[argv.index("--gen-cmd") + 1]
+            self.assertIn(z.XSTATS_ENV, tmpl)
             for i in range(z.SENDERS):
                 self.assertTrue(tmpl.replace("{i}", str(i)).startswith(f"ssh -F {z.REMOTE}/ssh_config sender{i} "))
             self.assertIn(f"--target {RECEIVER_DATA_IP}:7000", tmpl)
             self.assertIn(f"> {z.REMOTE}/{t}.jsonl 2> >(tee {z.REMOTE}/{t}.coord.log >&2)", inner)
         serves = [c for r, c in w.calls if r == "receiver" and "zhida-bench serve" in c]
-        self.assertEqual(len(serves), 3)
+        self.assertEqual(len(serves), 5)
         for c, (proto, _) in zip(serves, z.SWEEPS):
+            self.assertIn(f"--setenv={z.XSTATS_ENV}", c)
             self.assertTrue(c.endswith(f"taskset -c 7 zhida-bench serve --config /etc/zhida/dut.json --proto {proto}"
                                        " --port 7000"), c)
         for t in z.sweep_tags():
@@ -1185,6 +1348,8 @@ class RunTest(unittest.TestCase):
             want |= {(f"sender{i}", f"{z.REMOTE}/gen-{t}.log") for i in range(z.SENDERS)}
             self.assertEqual(want, {f for f in w.fetched if t in f[1]})
             self.assertTrue(os.path.exists(os.path.join(self.run_dir, f"sender{z.SENDERS - 1}", f"gen-{t}.log")))
+            with open(os.path.join(self.run_dir, f"{t}.receiver.log")) as f:
+                self.assertEqual(json.loads(f.read())["phase"], "close")
         with open(os.path.join(self.run_dir, "expected.json")) as f:
             self.assertEqual(json.load(f), {"sweeps": z.sweep_tags()})
         report = [a for a in w.local_calls if a[1].endswith("report.py")]
@@ -1198,6 +1363,28 @@ class RunTest(unittest.TestCase):
             setup = f.read()
         self.assertIn(f"[sender{z.SENDERS - 1} host.env]", setup)
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, "fetch-errors.txt")))
+
+    def test_intel_run_uses_the_common_zone_and_both_launches(self):
+        self.w.zones = {"c6in.8xlarge": ("zone-a", "zone-c"), "c6in.2xlarge": ("zone-b", "zone-c")}
+        self.assertEqual(self.run_bench(shape="intel"), 0)
+        self.assertEqual([c for r, c in self.w.calls if r == "aws"], [
+            "create_network 203.0.113.9 zone-c cluster",
+            "launch_hosts c6in.8xlarge receiver",
+            "launch_hosts c6in.2xlarge sender0 sender1 sender2"])
+        self.assertEqual(self.w.launch_amis, [z.INTEL_AMI_PARAM, z.INTEL_AMI_PARAM])
+        self.assertIn("need 56", self.log.getvalue())
+        self.assertEqual(len(self.sweeps_run()), 5)
+        for command in self.sweeps_run()[1:]:
+            self.assertIn("--senders 12", command)
+        self.assertEqual(self.w.clean_calls[0][1]["instance"], ["i-0", "i-1", "i-2", "i-3"])
+
+    def test_intel_disjoint_zones_stop_before_creation(self):
+        self.w.zones = {"c6in.8xlarge": ("zone-a",), "c6in.2xlarge": ("zone-b",)}
+        self.assertIsInstance(self.run_bench(shape="intel"), SystemExit)
+        self.assertIn("preflight offering: FAIL", self.log.getvalue())
+        self.assertEqual(self.w.calls, [])
+        self.assertIsNone(self.run_dir)
+        self.assertEqual(self.w.clean_calls, [])
 
     def test_kernel_route_failure_never_measures_and_still_cleans_up(self):
         with mock.patch.object(z, "configure_kernel_receiver",
@@ -1238,8 +1425,10 @@ class RunTest(unittest.TestCase):
         self.w.sweep_exit[UDP] = 1
         self.w.report_code = 1  # report.py: INCOMPLETE
         self.assertEqual(self.run_bench(), 1)
-        self.assertEqual(len(self.sweeps_run()), 3)
+        self.assertEqual(len(self.sweeps_run()), 5)
         self.assertIn(("sender0", f"{z.REMOTE}/{UDP}.jsonl"), self.w.fetched)
+        with open(os.path.join(self.run_dir, f"{UDP}.receiver.log")) as f:
+            self.assertEqual(json.loads(f.read())["kind"], "ena_xstats")
         self.assertIn(f"{UDP}: coordinator exit 1", self.log.getvalue())
         self.assertEqual(len(self.w.clean_calls), 1)
 
@@ -1255,7 +1444,7 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.run_bench(), 1)
         with open(os.path.join(self.run_dir, "fetch-errors.txt")) as f:
             self.assertEqual(f.read(), f"sender2:{z.REMOTE}/gen-{TCP}.log: scp exited 1\n")
-        self.assertEqual(len(self.sweeps_run()), 3)
+        self.assertEqual(len(self.sweeps_run()), 5)
 
     def test_failed_verify_aborts_with_teardown(self):
         self.w.verify_fail.add("sender2")
@@ -1269,12 +1458,20 @@ class RunTest(unittest.TestCase):
     def test_resources_left_after_teardown_fail_the_run(self):
         self.w.left_after_teardown = ["network-interface eni-9 (in-use, run r)"]
         self.assertEqual(self.run_bench(), 1)
-        self.assertEqual(len(self.sweeps_run()), 3)
+        self.assertEqual(len(self.sweeps_run()), 5)
 
     def test_a_failed_create_tears_down_what_was_recorded(self):
         self.w.network_fails = True
         self.assertIsInstance(self.run_bench(), ClientError)
         self.assertEqual(self.w.clean_calls, [(os.path.basename(self.run_dir), {"vpc": ["vpc-1"]})])
+
+    def test_sender_launch_failure_cleans_the_recorded_receiver(self):
+        self.w.launch_fails = "c6in.2xlarge"
+        self.assertIsInstance(self.run_bench(shape="intel"), ClientError)
+        recorded = {"vpc": ["vpc-1"], "subnet": ["subnet-1"], "instance": ["i-0"]}
+        self.assertEqual(self.w.clean_calls, [(os.path.basename(self.run_dir), recorded)])
+        self.assertEqual(janitor.read_created(os.path.join(self.run_dir, "created.json")), recorded)
+        self.assertEqual(self.sweeps_run(), [])
 
     def test_a_second_ctrl_c_during_teardown_does_not_interrupt_it(self):
         self.w.interrupt_sweep = TCP
@@ -1302,7 +1499,7 @@ class RunTest(unittest.TestCase):
         env = z.Env(profile_region=lambda: "ap-southeast-2", aws=lambda r: FakeAws(self.w), local=local, now=lambda: NOW)
         out = io.StringIO()
         with contextlib.redirect_stdout(out), self.assertRaisesRegex(SystemExit, "preflight failed"):
-            z.run(argparse.Namespace(region="r", ttl="2h", out=self.out), env)
+            z.run(argparse.Namespace(region="r", ttl="2h", out=self.out, shape="arm"), env)
         self.assertIn("preflight source: FAIL the hosts build `git archive HEAD`", out.getvalue())
         self.assertEqual(self.w.calls, [])
         self.assertEqual(os.listdir(self.out), [])
@@ -1352,7 +1549,7 @@ class BinanceTest(unittest.TestCase):
         self.assertEqual(self.run_binance(seconds=30), 0)
         w = self.w
         self.assertEqual(w.calls[:4], [
-            ("aws", "create_network 203.0.113.9 m7g.xlarge precision-time"), ("aws", "launch_hosts m7g.xlarge binance"),
+            ("aws", "create_network 203.0.113.9 zone-a precision-time"), ("aws", "launch_hosts m7g.xlarge binance"),
             ("aws", f"attach_eip eni-0 {RECEIVER_DATA_IP}"), ("binance", "install b'TAR'")])
         self.assertFalse(any("setup" in c or "bootstrap" in c for r, c in w.calls), "no zhida-bench build")
         self.assertEqual(self.feed_runs(), [f"root mkdir -p {z.REMOTE} && {z.SRC_DIR}/deploy/run-binance.sh"

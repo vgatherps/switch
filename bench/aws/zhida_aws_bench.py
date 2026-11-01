@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""zhida-aws-bench: the latency/load bench on EC2 in one command, 1 receiver + SENDERS sender hosts
-(the shape constants below).
+"""zhida-aws-bench: the latency/load bench on EC2 in one command, 1 receiver + SENDERS sender hosts.
 
-  zhida_aws_bench.py plan                                 print hosts, sweeps and needs; no AWS calls
-  zhida_aws_bench.py preflight [--region R]               check tree, credentials, vCPU quota
-  zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]
-  zhida_aws_bench.py kernel [--region R] [--ttl 2h] [--out DIR]   same Zhida generators, Linux receiver
+  zhida_aws_bench.py plan [--shape arm|intel]              print hosts, sweeps and needs; no AWS calls
+  zhida_aws_bench.py preflight [--shape arm|intel] [--region R]   check tree, credentials, offerings, quota
+  zhida_aws_bench.py run [--shape arm|intel] [--region R] [--ttl 2h] [--out DIR]
+  zhida_aws_bench.py kernel [--shape arm|intel] [--region R] [--ttl 2h] [--out DIR]   Linux receiver
   zhida_aws_bench.py cleanup --run-id ID [--region R] [--out DIR]   delete a leftover run's resources
   zhida_aws_bench.py binance [--region R] [--seconds 600] [--out DIR] [--ttl 2h]   the Binance listener
 
 Needs python3 with boto3, ssh, scp, git, a clean committed tree (the hosts build `git archive HEAD`)
 and AWS credentials; --region defaults to the AWS profile's region. Design: plans/bench/design.md.
-`preflight` (also the first step of `run`) checks the tree, the credentials and the on-demand
-Standard vCPU quota (L-1216C47A: the hosts' vCPUs free) before anything is created.
+`preflight` (also the first step of `run`) checks the tree, credentials, a common zone offering
+every instance type and on-demand Standard vCPU quota (L-1216C47A) before anything is created.
 
 Permissions the caller needs: ec2 (VPC, subnet, internet gateway, route table, security group,
 placement group, key pair, run/terminate/describe instances, create/attach/delete/modify network
@@ -21,8 +20,8 @@ allocate/associate/disassociate/release/describe addresses), ssm:GetParameter (t
 sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 
 `run` creates a VPC, subnet, internet gateway, route table, security group (SSH from the caller's
-address), cluster placement group and key pair for the run; provisions the HOST_TYPE on-demand
-instances (one run_instances) in the placement group, one data ENI each; applies
+address), cluster placement group and key pair for the run; provisions on-demand instances in
+the placement group (one request for ARM, separate receiver and sender requests for Intel), one data ENI each; applies
 `deploy/hft-host.sh` (builds DPDK and the toolchain, reboots, verify), using Linux ENA on the
 receiver for `kernel` and DPDK on all other hosts, then builds zhida-bench
 natively (bootstrap.sh); runs the fixed sweep matrix with the coordinator on sender0 driving one
@@ -39,6 +38,7 @@ Exit 0 only when the feed exited 0, both files were fetched and teardown verifie
 """
 import argparse
 import datetime
+import hashlib
 import ipaddress
 import json
 import math
@@ -59,6 +59,7 @@ import janitor  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+INTEL_AMI_PARAM = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 VPC_CIDR, SUBNET_CIDR = "10.80.0.0/16", "10.80.1.0/24"
 NAME = janitor.NAME
 TTL = "2h"
@@ -68,23 +69,27 @@ TTL = "2h"
 # Each host: hft-host.sh isolates its highest CPU for the app, the rest (at least 3) housekeep.
 SENDERS, HOST_TYPE = 3, "c7gn.xlarge"
 HOST_VCPUS = {"c7gn.xlarge": 4, "c7gn.2xlarge": 8}[HOST_TYPE]
+SHAPES = {
+    "arm": (HOST_TYPE, HOST_TYPE, AMI_PARAM, (1 + SENDERS) * HOST_VCPUS),
+    "intel": ("c6in.8xlarge", "c6in.2xlarge", INTEL_AMI_PARAM, 32 + SENDERS * 8),
+}
 ROOT_GB = 40
 ROLES = ["receiver"] + [f"sender{i}" for i in range(SENDERS)]
 CONNECTIONS = 4 * SENDERS
 SIZE = 64
-RATE_MIN, RATE_MAX = 10_000, 5_000_000
-BUDGET_US = 50
-STEP_MS, WARMUP_MS, DRAIN_MS = 5000, 250, 200
-SWEEPS = [("udp", None), ("tcp", BUDGET_US), ("ws", BUDGET_US)]
+RATES = (10_000, 100_000, 400_000, 800_000, 900_000, 1_000_000,
+         1_100_000, 1_200_000, 1_400_000, 1_800_000, 2_500_000)
+STEP_MS, WARMUP_MS, DRAIN_MS = 10_000, 250, 200
+SWEEPS = [("udp", None), ("tcp", 50), ("tcp", None), ("ws", 50), ("ws", None)]
 PORT = 7000
 MIMALLOC_ENV = "MIMALLOC_ALLOW_LARGE_OS_PAGES=0"
+XSTATS_ENV = "ZHIDA_BENCH_XSTATS=1"
 SRC_DIR = "/opt/zhida-src"
 HFT = f"{SRC_DIR}/deploy/hft-host.sh"
 REMOTE = "/var/tmp/zhida"
 RECEIVER_UNIT = "zhida-bench-receiver"
-# The coordinator's worst case and timeout: one step per rate RATE_MIN x sqrt(2)^k <= RATE_MAX, each
-# <= 50 ms lead + 0.25 s warmup + 5 s window + 0.2 s drain + 10 s reply slack, plus 60 s start-up.
-# a backstop only: the coordinator bounds its own steps and workers
+# The 11 scheduled steps take 115.5 s; this 15-minute backstop also covers normal startup,
+# clock probes and shutdown. It does not cover every sequential per-worker timeout.
 SWEEP_WORST_S = 15 * 60
 BUILD_S = 3600
 SETUP_REBOOT_S = 900
@@ -136,7 +141,7 @@ def sweep_tags():
 def gen_template(proto, receiver_ip, t):
     """--gen-cmd: the coordinator runs it with `sh -c` on sender0 for {i} = 0..4; it starts worker
     {i} on sender{i} through the run's ssh_config, pinned to that host's APP_CPU."""
-    inner = (f". /etc/zhida/host.env; exec env {MIMALLOC_ENV} taskset -c $APP_CPU zhida-bench gen"
+    inner = (f". /etc/zhida/host.env; exec env {MIMALLOC_ENV} {XSTATS_ENV} taskset -c $APP_CPU zhida-bench gen"
              f" --config /etc/zhida/dut.json --proto {proto} --target {receiver_ip}:{PORT} --senders {{senders}}"
              f" --size {SIZE} --local-port 40000 2>>{REMOTE}/gen-{t}.log")
     return f"ssh -F {REMOTE}/ssh_config sender{{i}} {shlex.quote('sudo sh -c ' + shlex.quote(inner))}"
@@ -147,7 +152,7 @@ def sweep_command(proto, budget, receiver_ip, housekeeping):
     t = tag(proto, budget)
     budget_arg = "" if budget is None else f" --budget-us {budget}"
     command = (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDERS}"
-               f" --senders {CONNECTIONS} --rate-min {RATE_MIN} --rate-max {RATE_MAX}{budget_arg}"
+               f" --senders {CONNECTIONS} --rates {','.join(map(str, RATES))}{budget_arg}"
                f" --step-ms {STEP_MS} --warmup-ms {WARMUP_MS} --drain-ms {DRAIN_MS}"
                f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
                f" > {REMOTE}/{t}.jsonl 2> >(tee {REMOTE}/{t}.coord.log >&2)")
@@ -158,7 +163,7 @@ def serve_command(proto, app_cpu, kernel_ip=None):
     """The receiver as a transient systemd unit; generators never change."""
     command = (f"serve --config /etc/zhida/dut.json" if kernel_ip is None
                else f"kernel-serve --bind {shlex.quote(kernel_ip)}")
-    return (f"systemd-run --unit {RECEIVER_UNIT} --setenv={MIMALLOC_ENV} taskset -c {shlex.quote(app_cpu)}"
+    return (f"systemd-run --unit {RECEIVER_UNIT} --setenv={MIMALLOC_ENV} --setenv={XSTATS_ENV} taskset -c {shlex.quote(app_cpu)}"
             f" zhida-bench {command} --proto {proto} --port {PORT}")
 
 
@@ -263,11 +268,14 @@ def feed_summary(text, code):
     return out
 
 
-def plan_text(region, ttl, run_id, expires, kernel=False):
+def plan_text(region, ttl, run_id, expires, kernel=False, shape="arm"):
+    receiver_type, sender_type, _, vcpus = SHAPES[shape]
+    hosts = (f"{len(ROLES)} x {receiver_type}" if receiver_type == sender_type
+             else f"1 x {receiver_type} receiver, {SENDERS} x {sender_type} senders")
     lines = [
         f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
-        f"hosts: {len(ROLES)} x {HOST_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
-        f" its cluster placement group, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 data ENI"
+        f"hosts: {hosts} on-demand, in a cluster placement group, one subnet/AZ;"
+        f" each: primary ENI (SSH, public IPv4) + 1 data ENI"
         f" ({'receiver on Linux ena, senders on vfio-pci' if kernel else 'vfio-pci'}, DeleteOnTermination);"
         " CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
         f"  {'receiver':9} zhida-bench {'kernel-serve' if kernel else 'serve'} on APP_CPU"
@@ -278,13 +286,13 @@ def plan_text(region, ttl, run_id, expires, kernel=False):
               for i in range(1, SENDERS)]
     lines += [
         f"sweeps: {CONNECTIONS} senders ({CONNECTIONS // SENDERS} per sender host), {SIZE} B messages,"
-        f" {RATE_MIN}..{RATE_MAX} msg/s in steps of x sqrt(2); coordinator killed after {SWEEP_WORST_S} s",
+        f" rates {','.join(map(str, RATES))} msg/s; coordinator killed after {SWEEP_WORST_S} s",
         f"timing per rate: {STEP_MS} ms measurement + {WARMUP_MS} ms warmup + {DRAIN_MS} ms drain"
         " + 50 ms lead; host setup/builds, worker startup and clock probes are additional",
     ]
     lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
     lines += [
-        f"needs: on-demand Standard vCPU quota L-1216C47A with {len(ROLES) * HOST_VCPUS} vCPUs free in {region};"
+        f"needs: on-demand Standard vCPU quota L-1216C47A with {vcpus} vCPUs free in {region};"
         " permissions: see `zhida_aws_bench.py -h`",
         "created for the run and deleted at teardown, tagged with the run id: VPC, subnet, internet gateway,"
         " route table, security group, placement group, key pair, the instances and data ENIs",
@@ -313,8 +321,8 @@ class Aws:
         self.ec2, self.ssm = clients["ec2"], clients["ssm"]
         self.sts, self.quotas = clients["sts"], clients["service-quotas"]
 
-    def create_network(self, run_id, expires, my_ip, record, key_path, instance_type, strategy):
-        """The run's VPC, subnet (in a zone offering `instance_type`), internet gateway and route,
+    def create_network(self, run_id, expires, my_ip, record, key_path, zone, strategy):
+        """The run's VPC, subnet in `zone`, internet gateway and route,
         security group, placement group (`strategy`) and key pair (private key to `key_path`), each
         passed to `record` as its create succeeds."""
         ec2 = self.ec2
@@ -327,7 +335,6 @@ class Aws:
         record("vpc", vpc)
         ec2.get_waiter("vpc_available").wait(VpcIds=[vpc])
         ec2.modify_vpc_attribute(VpcId=vpc, EnableDnsHostnames={"Value": True})
-        zone = self.zone_offering(instance_type)
         subnet = ec2.create_subnet(VpcId=vpc, CidrBlock=SUBNET_CIDR, AvailabilityZone=zone,
                                    TagSpecifications=spec("subnet"))["Subnet"]["SubnetId"]
         record("subnet", subnet)
@@ -353,21 +360,32 @@ class Aws:
             f.write(material)
         return {"name": name, "subnet": subnet, "zone": zone, "sg": sg}
 
-    def zone_offering(self, instance_type):
-        offered = self.ec2.describe_instance_type_offerings(
-            LocationType="availability-zone",
-            Filters=[{"Name": "instance-type", "Values": [instance_type]}])["InstanceTypeOfferings"]
-        zones = sorted(o["Location"] for o in offered)
-        if not zones:
-            raise RuntimeError(f"no zone in {self.region} offers {instance_type}")
-        return zones[0]
+    def zone_offering(self, instance_types):
+        common = None
+        for instance_type in dict.fromkeys(instance_types):
+            zones = set()
+            token = None
+            while True:
+                kwargs = {"LocationType": "availability-zone",
+                          "Filters": [{"Name": "instance-type", "Values": [instance_type]}]}
+                if token:
+                    kwargs["NextToken"] = token
+                response = self.ec2.describe_instance_type_offerings(**kwargs)
+                zones.update(o["Location"] for o in response["InstanceTypeOfferings"])
+                token = response.get("NextToken")
+                if not token:
+                    break
+            common = zones if common is None else common & zones
+        if not common:
+            raise RuntimeError(f"no zone in {self.region} offers {', '.join(dict.fromkeys(instance_types))}")
+        return sorted(common)[0]
 
-    def launch_hosts(self, net, run_id, expires, record, instance_type, roles):
+    def launch_hosts(self, net, run_id, expires, record, instance_type, roles, ami_param):
         """One instance per role in one run_instances into the placement group; then one data ENI
         each (create, attach, DeleteOnTermination); every ID passed to `record` as its create
         succeeds. Returns host records in `roles` order."""
         ec2 = self.ec2
-        ami = self.ssm.get_parameter(Name=AMI_PARAM)["Parameter"]["Value"]
+        ami = self.ssm.get_parameter(Name=ami_param)["Parameter"]["Value"]
         tags = run_tags(run_id, expires)
         r = ec2.run_instances(
             ImageId=ami, InstanceType=instance_type, MinCount=len(roles), MaxCount=len(roles), KeyName=net["name"],
@@ -573,40 +591,41 @@ def quota_check(aws, need):
     return free >= need, detail
 
 
-def preflight(env, region, instance_type, vcpus):
-    """Every check, before anything is created: ([(name, ok, detail)], Aws). `vcpus`: the run's
-    instances of `instance_type` together."""
+def preflight(env, region, instance_types, vcpus):
+    """Every check before creation: ([(name, ok, detail)], Aws, common zone)."""
     problems = tree_problems(env.local)
     out = [("source", not problems, "; ".join(problems) or "clean, HEAD has deploy/hft-host.sh")]
     aws = env.aws(region)
+    zone = None
     try:
         who = aws.sts.get_caller_identity()
         out.append(("credentials", True, f"account {who['Account']} as {who['Arn']}"))
     except Exception as e:
         return out + [("credentials", False, str(e))] + [
-            (name, False, "not checked without credentials") for name in ("offering", "quota")], aws
+            (name, False, "not checked without credentials") for name in ("offering", "quota")], aws, zone
     try:
-        out.append(("offering", True, f"{instance_type} in {aws.zone_offering(instance_type)}"))
+        zone = aws.zone_offering(instance_types)
+        out.append(("offering", True, f"{', '.join(dict.fromkeys(instance_types))} in {zone}"))
     except Exception as e:
         out.append(("offering", False, str(e)))
     try:
         out.append(("quota", *quota_check(aws, vcpus)))
     except Exception as e:
         out.append(("quota", False, str(e)))
-    return out, aws
+    return out, aws, zone
 
 
-def checked_preflight(env, region, instance_type, vcpus):
-    results, aws = preflight(env, region, instance_type, vcpus)
+def checked_preflight(env, region, instance_types, vcpus):
+    results, aws, zone = preflight(env, region, instance_types, vcpus)
     for name, ok, detail in results:
         log(f"preflight {name}: {'ok' if ok else 'FAIL'} {detail}")
     if not all(ok for _, ok, _ in results):
         raise SystemExit("preflight failed; nothing was created")
-    return aws
+    return aws, zone
 
 
-def source_archive(local):
-    return local(["git", "-C", REPO, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
+def source_archive(local, revision="HEAD"):
+    return local(["git", "-C", REPO, "archive", "--format=tar", revision], capture_output=True, check=True).stdout
 
 
 def setup_hosts(hosts, archive, kernel=False):
@@ -775,6 +794,59 @@ def kernel_counter_delta(before, after, app_cpu):
     return {"cpus": before["cpus"], "data_irqs": irqs, "softirq_cpus": before["softirq_cpus"],
             "net_rx_host_wide": [b - a for a, b in zip(before["net_rx"], after["net_rx"])]}
 
+ENA_COUNTERS = ("pps_allowance_exceeded", "bw_in_allowance_exceeded", "bw_out_allowance_exceeded")
+
+
+def parse_ena_stats(text):
+    counters = {}
+    for line in text.splitlines():
+        name, sep, value = line.strip().partition(":")
+        if sep and name in ENA_COUNTERS:
+            if name in counters or not value.strip().isdigit():
+                raise ValueError(f"invalid ethtool counter {name}: {value.strip()}")
+            counters[name] = int(value.strip())
+    return {"counters": counters, "missing": [name for name in ENA_COUNTERS if name not in counters]}
+
+
+def kernel_ena_snapshot(receiver, interface):
+    unix_ns = time.time_ns()
+    try:
+        result = receiver.root(f"ethtool -S {shlex.quote(interface)}", check=False)
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        return {"status": "error", "error": str(error), "unix_ns": unix_ns}
+    if result.returncode:
+        return {"status": "error", "error": f"ethtool exited {result.returncode}: {result.stderr or ''}", "unix_ns": unix_ns}
+    try:
+        parsed = parse_ena_stats(result.stdout)
+        return {"status": "unsupported" if parsed["missing"] else "ok", "unix_ns": unix_ns, **parsed}
+    except ValueError as error:
+        return {"status": "error", "error": str(error), "unix_ns": unix_ns}
+
+
+def kernel_ena_result(before, after):
+    invalid = []
+    if before["status"] != "ok" or after["status"] != "ok":
+        invalid.append("snapshot unavailable or counters missing")
+    if before["status"] != "error" and after["status"] != "error":
+        for name, value in after["counters"].items():
+            if name in before["counters"] and value < before["counters"][name]:
+                invalid.append(f"counter decreased: {name}")
+    return {"before": before, "after": after, "invalid": invalid,
+            "reset_detection": "counter decreases only; a reset followed by counter growth may not be detectable"}
+
+
+def save_receiver_journal(receiver, invocation, path):
+    if not invocation or len(invocation) != 32 or any(c not in string.hexdigits for c in invocation):
+        text = f"receiver invocation ID unavailable or invalid: {invocation!r}\n"
+    else:
+        try:
+            result = receiver.root(f"journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID={invocation}", check=False)
+            text = result.stdout if result.returncode == 0 else f"journalctl exited {result.returncode}: {result.stderr or ''}\n"
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            text = f"journalctl failed: {error}\n"
+    with open(path, "w") as f:
+        f.write(text)
+
 
 def connect_senders(hosts, key_path):
     """sender0 reaches sender0..4 as ec2-user through REMOTE/ssh_config, with the run's key pair."""
@@ -801,13 +873,22 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
     receiver, sender0 = hosts[0], hosts[1]
     t = tag(proto, budget)
     before = kernel_snapshot(receiver, facts["receiver"]) if kernel else None
-    receiver.root(f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
-                  f" {serve_command(proto, facts['receiver']['APP_CPU'], receiver_ip if kernel else None)}")
+    ena_before = kernel_ena_snapshot(receiver, facts["receiver"]["DATA_IF"]) if kernel else None
+    invocation = None
     try:
+        launched = receiver.root(
+            f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
+            f" {serve_command(proto, facts['receiver']['APP_CPU'], receiver_ip if kernel else None)}",
+            check=False)
+        invocation_result = receiver.root(f"systemctl show {RECEIVER_UNIT} --property=InvocationID --value", check=False)
+        if invocation_result.returncode == 0:
+            invocation = invocation_result.stdout.strip()
+        if launched.returncode:
+            log(f"{t}: receiver launch failed: {launched.stderr or ''}")
+            return None
         env.sleep(3)
         if receiver.root(f"systemctl is-active {RECEIVER_UNIT}", check=False).stdout.strip() != "active":
-            journal = receiver.root(f"journalctl -u {RECEIVER_UNIT} --no-pager | tail -20", check=False).stdout
-            log(f"{t}: receiver did not start:\n{journal}")
+            log(f"{t}: receiver did not start")
             return None
         try:
             return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"]),
@@ -817,7 +898,14 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
             sender0.ssh("pkill -f 'zhida-bench sweep'", check=False, timeout=60)
             return None
     finally:
-        receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
+        try:
+            receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
+        finally:
+            save_receiver_journal(receiver, invocation, os.path.join(run_dir, f"{t}.receiver.log"))
+            if kernel:
+                ena_after = kernel_ena_snapshot(receiver, facts["receiver"]["DATA_IF"])
+                with open(os.path.join(run_dir, f"{t}.kernel-ena.json"), "w") as f:
+                    json.dump(kernel_ena_result(ena_before, ena_after), f, indent=2)
         if kernel:
             artifact = {"before": before,
                         "net_rx_note": "Host-wide NET_RX includes management; not data-ENI attribution."}
@@ -865,13 +953,17 @@ def run(args, env=None, kernel=False):
     now = env.now()
     expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
     run_id = new_run_id(now)
-    print(plan_text(args.region, args.ttl, run_id, expires, kernel))
+    receiver_type, sender_type, ami_param, vcpus = SHAPES[args.shape]
+    print(plan_text(args.region, args.ttl, run_id, expires, kernel, args.shape))
     if kernel:
         print("receiver: Linux kernel sockets on the same data ENI; generators: unchanged Zhida/DPDK")
-    aws = checked_preflight(env, args.region, HOST_TYPE, len(ROLES) * HOST_VCPUS)
-    archive = source_archive(env.local)
+    aws, zone = checked_preflight(env, args.region, (receiver_type, sender_type), vcpus)
+    revision = env.local(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    archive = source_archive(env.local, revision)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "source.json"), "w") as f:
+        json.dump({"commit": revision, "archive_sha256": hashlib.sha256(archive).hexdigest()}, f, indent=2)
     created = janitor.Created(os.path.join(run_dir, "created.json"))
     key_path = os.path.join(run_dir, "key.pem")
     my_ip = env.my_ip()
@@ -881,8 +973,12 @@ def run(args, env=None, kernel=False):
     # From here on every exit path deletes the run's resources.
     try:
         log(f"run {run_id} start: provisioning hosts")
-        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, HOST_TYPE, "cluster")
-        infos = aws.launch_hosts(net, run_id, expires, created.add, HOST_TYPE, ROLES)
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, zone, "cluster")
+        if receiver_type == sender_type:
+            infos = aws.launch_hosts(net, run_id, expires, created.add, receiver_type, ROLES, ami_param)
+        else:
+            infos = aws.launch_hosts(net, run_id, expires, created.add, receiver_type, ROLES[:1], ami_param)
+            infos += aws.launch_hosts(net, run_id, expires, created.add, sender_type, ROLES[1:], ami_param)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump(infos, f, indent=1)
         hosts = [env.host(info, key_path, run_dir) for info in infos]
@@ -917,7 +1013,7 @@ def run(args, env=None, kernel=False):
                 log(f"{len(fetch_errors)} fetch failures: {os.path.join(run_dir, 'fetch-errors.txt')}")
             report_code = env.local([sys.executable, os.path.join(REPO, "bench", "report.py"), run_dir, "--title",
                                      f"zhida-bench {run_id} ({'Linux kernel' if kernel else 'Zhida'} receiver,"
-                                     f" {SENDERS} Zhida senders, {HOST_TYPE})"]
+                                     f" {SENDERS} Zhida senders, {receiver_type} receiver, {sender_type} senders)"]
                                     ).returncode
             log(f"report: {os.path.join(run_dir, 'report.md')} (report.py exit {report_code})")
         if failed:
@@ -944,7 +1040,7 @@ def binance(args, env=None):
     run_id = new_run_id(now)
     log(f"binance run {run_id}: 1 x {BINANCE_TYPE} in a precision-time placement group, {args.region},"
         f" feed {args.seconds} s, everything expires {expires.isoformat()}")
-    aws = checked_preflight(env, args.region, BINANCE_TYPE, BINANCE_VCPUS)
+    aws, zone = checked_preflight(env, args.region, (BINANCE_TYPE,), BINANCE_VCPUS)
     archive = source_archive(env.local)
     run_dir = os.path.join(args.out, run_id)
     os.makedirs(run_dir, exist_ok=True)
@@ -955,8 +1051,8 @@ def binance(args, env=None):
     code, fetch_errors, summary = None, ["(not run)"], None
     # From here on every exit path deletes the run's resources.
     try:
-        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, BINANCE_TYPE, "precision-time")
-        [info] = aws.launch_hosts(net, run_id, expires, created.add, BINANCE_TYPE, ["binance"])
+        net = aws.create_network(run_id, expires, my_ip, created.add, key_path, zone, "precision-time")
+        [info] = aws.launch_hosts(net, run_id, expires, created.add, BINANCE_TYPE, ["binance"], AMI_PARAM)
         aws.attach_eip(info["data_eni"], run_id, expires, created.add)
         with open(os.path.join(run_dir, "hosts.json"), "w") as f:
             json.dump([info], f, indent=1)
@@ -1016,6 +1112,7 @@ def parser():
             r.add_argument("--run-id", required=True)
         else:
             r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
+            r.add_argument("--shape", choices=SHAPES, default="arm", help="benchmark host shape (default: arm)")
     b = sub.add_parser("binance", help="run the Binance listener (deploy/run-binance.sh) on one EC2 host")
     b.add_argument("--region", help="default: the AWS profile's region")
     b.add_argument("--seconds", type=int, default=600, help="the feed's --seconds (from the WebSocket open)")
@@ -1031,12 +1128,13 @@ def main(argv, env=None):
         if not args.region:
             raise SystemExit("no region: pass --region, or set one in the AWS profile (aws configure) or AWS_REGION")
     if args.cmd == "preflight":
-        checked_preflight(env or Env(), args.region, HOST_TYPE, len(ROLES) * HOST_VCPUS)
+        receiver_type, sender_type, _, vcpus = SHAPES[args.shape]
+        checked_preflight(env or Env(), args.region, (receiver_type, sender_type), vcpus)
         return 0
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)
         print(plan_text(args.region or "(the AWS profile's)", args.ttl, new_run_id(now),
-                        now + datetime.timedelta(seconds=parse_duration(args.ttl))))
+                        now + datetime.timedelta(seconds=parse_duration(args.ttl)), shape=args.shape))
         return 0
     if args.cmd in ("run", "kernel"):
         return run(args, env, kernel=args.cmd == "kernel")

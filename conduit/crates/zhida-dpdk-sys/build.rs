@@ -109,6 +109,8 @@ fn main() {
         .allowlist_type("rte_eth_link")
         .allowlist_function("rte_eth_stats_get")
         .allowlist_type("rte_eth_stats")
+        .allowlist_function("rte_eth_xstats_get")
+        .allowlist_function("rte_eth_xstats_get_names")
         .allowlist_function("rte_eth_read_clock")
         .allowlist_var("RTE_ETH_LINK_UP")
         .allowlist_function("rte_eal_alarm_set")

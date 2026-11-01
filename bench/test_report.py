@@ -82,15 +82,22 @@ class ReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             lines = [step(1000, 10_000), step(2000, 90_000, bound=True), summary()]
             write_jsonl(os.path.join(d, "udp-zhida.jsonl"), lines)
+            source = {"commit": "a" * 40, "archive_sha256": "b" * 64}
+            with open(os.path.join(d, "source.json"), "w") as f:
+                json.dump(source, f)
             md, issues = report.build(d, "T")
             md = "\n".join(md)
             self.assertEqual(issues, [])
             self.assertTrue(md.startswith("# T"))
+            self.assertIn("| not echoed % |", md)
             self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - |", md)
+            self.assertIn(f"Commit: `{source['commit']}`", md)
+            self.assertIn(f"Archive SHA-256: `{source['archive_sha256']}`", md)
             self.assertIn("GEN-BOUND", md)
             self.assertTrue(os.path.exists(os.path.join(d, "udp-zhida.svg")))
             with open(os.path.join(d, "results.json")) as f:
                 results = json.load(f)
+                self.assertEqual(results["source"], source)
             self.assertEqual(results["sweeps"][0]["summary"]["steps"], 2)
 
 

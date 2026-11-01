@@ -13,3 +13,4 @@ pub mod schedule;
 pub mod serve;
 pub mod wire;
 pub mod wsclient;
+mod xstats;

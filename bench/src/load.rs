@@ -225,6 +225,7 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     };
     host::catch_stop()?;
     let mut host = Host::open(&config, &sizing)?;
+    host.start_xstats("gen");
     let handle = host.net.handle();
     let clock = host.clock;
     let recorder: Rc<RefCell<Option<Recorder>>> = Rc::default();

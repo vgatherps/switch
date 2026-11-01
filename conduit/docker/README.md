@@ -730,8 +730,11 @@ A Linux machine runs the same targets without Docker. It needs what docker/Docke
   the rest). `make doctor` refuses any other DPDK version. `docker/dpdk-ena-read-clock.patch` is
   applied first: ENA gets `rte_eth_read_clock` (the device PHC, initialized whenever the device
   has one) and the read barrier the kernel driver has in its PHC read, and its watchdog reports
-  datapath faults as `RTE_ETH_EVENT_INTR_RESET` (stock ENA never reports them). Hosts that build
-  DPDK themselves must apply it too.
+  datapath faults as `RTE_ETH_EVENT_INTR_RESET` (stock ENA never reports them). Customer and legacy
+  metrics reads return query errors; customer metrics reads fail if any advertised counter is
+  unsupported. Hosts that build DPDK themselves must apply the patch too. The offline fault-path
+  test is `python3 docker/test-ena-metrics.py /path/to/unmodified/dpdk-25.11.3`; it needs a C
+  compiler and `patch`, but no NIC or DPDK build.
 - packetdrill at the Dockerfile's commit with `docker/packetdrill-relearn-isn.patch` applied, the
   binary on `PATH` and `packetdrill.h` in `/opt/packetdrill/include`.
 - python3-scapy.
