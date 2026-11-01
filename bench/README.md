@@ -136,7 +136,7 @@ its housekeeping deltas are reported, not falsely attributed to the data ENI. Co
 report with `run --region R` for the Zhida receiver; no performance numbers are implied here.
 
 If IRQ placement is deferred, a sender sends a brief UDP burst to the receiver before measurement;
-the runner then checks the actual IRQ affinities again. On failure,
+the runner then waits up to five seconds for actual IRQ affinities to converge without rewriting them. On failure,
 `kernel-irq-affinity-error.json` saves each data-ENI IRQ's name, requested and effective CPU lists
 before and after the placement attempt, any write error, and available kernel IRQ debug state.
 

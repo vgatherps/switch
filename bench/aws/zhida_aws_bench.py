@@ -756,13 +756,13 @@ for _ in range(4):
     sender.ssh(shlex.join(["python3", "-c", script, receiver_ip]))
 
 
-def kernel_snapshot(receiver, facts, configure=False, activate=None):
+def kernel_snapshot(receiver, facts, configure=False, activate=None, wait=False):
     """Data IRQ placement plus counters; NET_RX is host-wide, including management SSH."""
     script = r'''
 import json, pathlib, sys
 from kernel_irq import wait_for_affinity
-pci, interface, cpu, configure = sys.argv[1:]
-configure = configure == "True"
+pci, interface, cpu, configure, wait = sys.argv[1:]
+configure, wait = configure == "True", wait == "True"
 irqs = sorted(int(p.name) for p in pathlib.Path("/sys/bus/pci/devices", pci, "msi_irqs").iterdir())
 if not irqs:
     raise RuntimeError("data ENI has no MSI IRQs")
@@ -790,7 +790,7 @@ for irq in irqs:
     details[key] = {"name": names.get(key), "before": before,
                     "requested": requested.read_text().strip(), "effective": affinity[key],
                     "write_error": error}
-if configure and not any(info["write_error"] for info in details.values()):
+if (configure or wait) and not any(info["write_error"] for info in details.values()):
     affinity = wait_for_affinity(affinity, cpu, lambda irq:
         pathlib.Path("/proc/irq", irq, "effective_affinity_list").read_text().strip())
     for key, value in affinity.items():
@@ -830,7 +830,7 @@ print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_
                   "effective_affinity": affinity, "rps_cpus": rps}))
 '''
     command = ["env", f"PYTHONPATH={SRC_DIR}/bench/aws", "python3", "-c", script, facts["DATA_PCI"],
-               facts["DATA_IF"], facts["APP_CPU"], str(configure)]
+               facts["DATA_IF"], facts["APP_CPU"], str(configure), str(wait)]
     snapshot = json.loads(receiver.root(shlex.join(command)).stdout)
     if "affinity_error" in snapshot:
         error = snapshot["affinity_error"]
@@ -838,7 +838,7 @@ print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_
                 not irq["write_error"] and irq["requested"] == facts["APP_CPU"]
                 for irq in error["irqs"].values()):
             activate()
-            return kernel_snapshot(receiver, facts)
+            return kernel_snapshot(receiver, facts, wait=True)
         path = os.path.join(receiver.run_dir, "kernel-irq-affinity-error.json")
         with open(path, "w") as f:
             json.dump(error, f, indent=2)
