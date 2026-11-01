@@ -43,10 +43,10 @@ pub struct EchoServer {
 }
 
 impl EchoServer {
-    /// Adds `listeners` TCP sockets (RX and TX buffers of `buffer` bytes, Cubic)
-    /// listening on `port`. On error the sockets it already added are removed
-    /// again. `listeners` 0, `buffer` 0 or a `buffer` over smoltcp's 1 GiB
-    /// receive limit are caller errors `new` does not check.
+    /// Adds `listeners` TCP sockets (receive window target and transmit byte
+    /// capacity of `buffer` bytes, Cubic) listening on `port`. On error the
+    /// sockets it already added are removed again. `listeners` 0, `buffer` 0
+    /// or a `buffer` over smoltcp's 1 GiB window limit are caller errors `new` does not check.
     pub fn new(
         stack: &mut Stack,
         port: u16,
@@ -86,7 +86,7 @@ impl EchoServer {
 
     /// Per connection, echo at most `close_after` bytes: once exactly that
     /// many are queued back, close (the FIN follows them) and from then on read
-    /// and discard what the peer sends, so its window stays open. A peer FIN
+    /// and discard what the peer sends. A peer FIN
     /// before that closes as without the limit. The count restarts when the
     /// socket listens again. `None` (the default): no limit.
     pub fn with_close_after(mut self, close_after: Option<usize>) -> Self {
@@ -132,7 +132,7 @@ impl EchoServer {
                 }
                 let (frame, offset) = pending.as_mut().unwrap();
                 let n = room.min(frame.payload().len() - *offset);
-                // Short when the socket's TX frame limit fills before its bytes do.
+                // Short when the shared frame pool runs out before the socket's byte capacity.
                 let sent = socket.send_slice(&frame.payload()[*offset..*offset + n]).unwrap();
                 if sent == 0 {
                     break;

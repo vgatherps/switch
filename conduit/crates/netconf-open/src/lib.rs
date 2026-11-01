@@ -36,8 +36,9 @@ const RX_POOL: u32 = 32767;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
     /// Frames all TCP send queues and the application (`Stack::tx_frame`) may hold
-    /// at once. Each TCP socket queues at most `tcp::tx_mbuf_budget(&config, mtu)`.
-    /// When it runs out, sends queue nothing until frames return.
+    /// at once. `tcp::tx_mbuf_budget(&config, mtu)` estimates a socket's needs for
+    /// full-sized segments; smaller writes can use more frames. When the pool runs
+    /// out, sends queue nothing until frames return.
     pub frame_share: usize,
     /// `StackConfig::max_sockets`: TCP socket slots. Must be positive.
     pub max_sockets: usize,

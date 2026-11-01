@@ -8,7 +8,7 @@ use dpdk_smoltcp::{frame_reserve, ReadySide, Stack, StackConfig, UdpConfig, UdpS
 use zhida_test_kit::pair::{self, establish_sized, Pair, Side, BUDGET, MAX_ROUNDS};
 use zhida_test_kit::with_eal;
 
-/// Pair::new sizes pools for receive buffers up to this many bytes.
+/// Socket receive window target and transmit capacity used by these tests.
 const SMALL: usize = 6 * (1500 - 52);
 
 fn popped(stack: &mut Stack) -> Vec<u32> {
@@ -115,43 +115,6 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         pair.a.turn(now, BUDGET).unwrap();
         assert_eq!(popped(&mut pair.a), []);
         drop(bh);
-        pair.close();
-    })
-}
-
-/// The app holds every received frame until the window shuts; releasing them
-/// queues a receive wake, and the next turn fires the token with nothing
-/// received.
-#[zhida_test_support::pinned_test]
-fn tcp_token_fires_when_released_frames_reopen_the_window() {
-    with_eal(|eal| {
-        let mut pair = pair::new_pair(eal, ["rdwa", "rdwb"]);
-        let (h, _) = establish_sized(&mut pair, Side::A, SMALL);
-        let data = vec![5u8; 64 * 1024];
-        let (mut sent, mut held) = (0, Vec::new());
-        for _ in 0..200 {
-            sent += pair.b.tcp_mut(&h[1]).send_slice(&data[sent..]).unwrap();
-            while let Ok(Some(frame)) = pair.a.tcp_mut(&h[0]).recv() {
-                held.push(frame);
-            }
-            let at = [pair.a.poll_at(), pair.b.poll_at()].into_iter().flatten().min();
-            pair.round_at(at.unwrap_or(pair.now()).max(pair.now()), |_, _| {});
-        }
-        while let Ok(Some(frame)) = pair.a.tcp_mut(&h[0]).recv() {
-            held.push(frame);
-        }
-        assert!(held.len() >= 3, "only {} frames held", held.len());
-        assert_eq!(pair.a.tcp(&h[0]).recv_room(), 0, "the window did not shut");
-        pair.a.turn(pair.now(), BUDGET).unwrap();
-        popped(&mut pair.a);
-        let key = pair.a.tcp_ready_key(&h[0]);
-        pair.a.arm_tcp(key, ReadySide::Rx, 1);
-        held.clear();
-        assert_eq!(popped(&mut pair.a), [], "a dropped frame fires nothing by itself");
-        let turn = pair.a.turn(pair.now(), BUDGET).unwrap();
-        assert_eq!(turn.rx_received, 0);
-        assert_eq!(popped(&mut pair.a), [1]);
-        drop(h);
         pair.close();
     })
 }

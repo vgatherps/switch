@@ -551,10 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn removed_datagram_drop_clears_count_without_wake() {
+    fn removed_datagram_drop_clears_count() {
         let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
         let handle = set.add(&iface(), config(1234)).unwrap();
-        let shared = set.get(handle).shared.clone();
         let releases = Rc::new(Cell::new(0));
         for byte in [1, 2] {
             set.commit_rx(
@@ -566,23 +565,14 @@ mod tests {
                     payload: 0..1,
                 },
             );
-            assert!(shared.wake.borrow().is_none());
-            assert_eq!(shared.wake_at_held.get(), usize::MAX);
-            assert!(!shared.wake_queued.get());
         }
         let datagram = set.get_mut(handle).recv().unwrap();
         let held = set.remove(handle);
         assert_eq!(held.count(), 1);
         assert_eq!(releases.get(), 1);
-        assert!(shared.wake.borrow().is_none());
-        assert_eq!(shared.wake_at_held.get(), usize::MAX);
-        assert!(!shared.wake_queued.get());
         drop(datagram);
         assert_eq!(held.count(), 0);
         assert_eq!(releases.get(), 2);
-        assert!(shared.wake.borrow().is_none());
-        assert_eq!(shared.wake_at_held.get(), usize::MAX);
-        assert!(!shared.wake_queued.get());
     }
 
     #[test]

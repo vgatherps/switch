@@ -28,7 +28,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    frame_reserve, rx_reserve, Eal, Offloads, Port, PortConfig, Stack, StackConfig,
+    frame_reserve, Eal, Offloads, Port, PortConfig, Stack, StackConfig,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use tap_echo::{serve, EchoServer};
@@ -143,9 +143,7 @@ const JUMBO: PortSize = PortSize {
     room: 9216,
 };
 
-/// Beyond the reserves, the RX and frame pools hold one `buffer`-byte socket's
-/// full window each (sockets here use equal receive and send buffers), shared
-/// by every socket.
+/// The RX pool is shared; the frame pool holds one `buffer`-byte send window.
 fn port_config(port_id: u16, size: PortSize, buffer: usize) -> PortConfig<'static> {
     let socket = tcp::Config { rx_capacity: buffer, tx_capacity: buffer, mss_cap: None };
     let mtu = usize::from(size.mtu);
@@ -165,7 +163,7 @@ fn port_config(port_id: u16, size: PortSize, buffer: usize) -> PortConfig<'stati
         rx_burst: 32,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(RX_POOL, count(rx_reserve(16, 32, 32, 8) + tcp::rx_mbuf_budget(&socket, mtu))),
+        rx_pool: pool(RX_POOL, 8191),
         tx_pool: pool(TX_POOL, 127),
         frame_pool: pool(
             FRAME_POOL,
@@ -906,7 +904,6 @@ fn kernel_echo_with_held_rx() {
             .map_err(|(_, error)| error)
             .unwrap();
         let mut echo = EchoServer::new(&mut stack, ECHO_PORT, 1, BUFFER).unwrap();
-        let cap = tcp::rx_mbuf_budget(&tcp::Config { rx_capacity: BUFFER, tx_capacity: BUFFER, mss_cap: None }, usize::from(STANDARD.mtu));
         let client = thread::spawn(|| {
             let mut stream = connect();
             let data = payload(BYTES, SEED);
@@ -944,23 +941,14 @@ fn kernel_echo_with_held_rx() {
                 .checked_sub(descriptors)
                 .expect("net_tap keeps its RX descriptor buffers");
             max_held = max_held.max(held);
-            assert!(
-                held as usize <= cap,
-                "socket holds {held} RX mbufs; cap is {cap}"
-            );
             if elapsed >= next_read {
                 let before = stack.tcp(&echo.handles()[0]).recv_queue();
                 echo.step(&mut stack);
                 let consumed = before
                     .checked_sub(stack.tcp(&echo.handles()[0]).recv_queue())
                     .expect("app step does not receive new bytes");
-                assert!(consumed <= BUFFER);
                 read = read.checked_add(consumed).expect("read bytes fit usize");
                 next_read = elapsed + Duration::from_millis(20);
-                let held = in_use(RX_POOL)
-                    .checked_sub(descriptors)
-                    .expect("net_tap keeps its RX descriptor buffers");
-                assert!(held as usize <= cap);
             }
             if client.is_finished() && stack.tcp(&echo.handles()[0]).state() == State::Listen {
                 break;

@@ -13,7 +13,7 @@ use tap_echo::{serve, EchoServer};
 
 const NAME: &str = "tap-echo";
 const ECHO_BUFFER: usize = 128 * 1024;
-/// Largest receive buffer smoltcp accepts (it panics above 2^30); its window scale is 14.
+/// Largest receive window target smoltcp accepts (it panics above 2^30); its window scale is 14.
 const MAX_BUFFER: usize = 1 << 30;
 
 fn usage() -> String {
@@ -33,8 +33,8 @@ sends; a peer FIN before that closes as without it.
 Zhida: MAC {zhida_mac}, IPv4 {ZHIDA_IP}/{PREFIX_LEN}. DPDK vdev {vdev} with
 devargs {devargs}: kernel netdev {IFACE}. Port: MTU {MTU}, {DESCRIPTORS}/{DESCRIPTORS}
 descriptors, bursts {BURST}/{BURST}, a TX pool of {POOL_COUNT} mbufs, a frame pool of
-dpdk_smoltcp::frame_reserve plus one socket's TX frame limit for BYTES send bytes, and an RX pool of
-dpdk_smoltcp::rx_reserve plus one socket's RX frame cap for BYTES receive bytes, shared by all N
+dpdk_smoltcp::frame_reserve plus one socket's full-sized-segment estimate for BYTES send bytes, and an RX pool of
+dpdk_smoltcp::rx_reserve plus enough RX frames for BYTES in full-sized TCP segments, shared by all N
 sockets (cache {POOL_CACHE}, data room
 headroom + {FRAME_ROOM}). Stack: random_seed from /dev/urandom each run, max_sockets N, rx_staging
 {RX_STAGING}, tx_pending {TX_PENDING}.

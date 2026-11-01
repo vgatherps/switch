@@ -74,7 +74,7 @@ fn sized_pair_with_paths(
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
         );
-        let count = reserve.checked_add(tcp::rx_mbuf_budget(&socket, usize::from(port.mtu))).unwrap();
+        let count = reserve.checked_add(usize::try_from(RING).unwrap()).unwrap();
         port.rx_pool.count = u32::try_from(count).unwrap();
         let frames = frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending)
             .checked_add(tcp::tx_mbuf_budget(&socket, usize::from(port.mtu)))
@@ -244,27 +244,12 @@ fn mismatched_mss_respects_smaller_limit() {
         assert_eq!(offers, [Some(8960), Some(1460)]);
         let mss = usize::from(offers.into_iter().map(Option::unwrap).min().unwrap());
         // A sends no more than B's MSS allows; B no more than its own MTU.
-        let mut short_from_b = 0;
+        // Both directions must deliver the byte stream with the negotiated segment size.
         for (from, seed) in [(Side::A, 3), (Side::B, 4)] {
             let sizes = transfer(&mut pair, &handles, from, &pattern(TRANSFER, seed));
             assert_segments(&sizes, mss);
-            if from == Side::B {
-                short_from_b = sizes.iter().filter(|&&(payload, _)| payload < mss).count();
-            }
         }
-        // A's window is 6 frames x 1460 B and assumes full-sized segments. A short segment
-        // from B holds a whole frame, and never-shrink keeps edges promised at 0 held frames,
-        // so an in-window short segment can be refused and retransmitted; the transfer still
-        // completes byte-exact (U54: short segments holding whole frames accepted). B now
-        // sends from TX frames, so its byte ring's wrap-point splits are gone and only
-        // window-cut heads and tails stay short (this run: one short segment, no refusal).
-        // The bound is not a receive-window invariant: a full-sized segment refused again
-        // before A drains would count twice, and `sizes` includes B's retransmissions. It
-        // is a tripwire for this deterministic run, where every refusal traces to a short
-        // segment eating a frame.
-        let refused = pair.a.tcp(&handles[0]).rx_refused_segments();
-        assert!(usize::try_from(refused).unwrap() <= short_from_b,
-            "A refused {refused} segments; B sent {short_from_b} short segments");
+        assert_eq!(pair.a.tcp(&handles[0]).rx_refused_segments(), 0);
         assert_eq!(pair.b.tcp(&handles[1]).rx_refused_segments(), 0);
         assert_no_drops(&pair);
         pair.close();
@@ -435,22 +420,17 @@ fn empty_paths_keep_port_mtu() {
 }
 
 #[zhida_test_support::pinned_test]
-fn path_rule_window_uses_capped_frame_bytes() {
+fn path_rule_window_uses_byte_capacity() {
     with_eal(|eal| {
         let paths = [host_path(Side::B.ip(), 1500)];
         let mut pair = sized_pair_with_paths(eal, ["pmwina", "pmwinb"], [JUMBO, JUMBO], None, [&paths, &[]]);
-        let budget = tcp::rx_mbuf_budget(&tcp_socket_sized(BUFFER), 9000);
-        assert_eq!(budget, 6);
-        let (handles, frames) = establish_sized(&mut pair, Side::A, BUFFER);
-        assert_eq!(pair.a.tcp(&handles[0]).rx_frame_cap(), budget);
+        let (_handles, frames) = establish_sized(&mut pair, Side::A, BUFFER);
         let syn = segment(&frames[2].1, Side::A);
         assert_eq!(frames[4].0, Side::A.dir());
         let ack = segment(&frames[4].1, Side::A);
         assert_eq!(ack.control, TcpControl::None);
         assert!(ack.ack_number.is_some());
-        let expected = budget.checked_mul(1460).unwrap().min(BUFFER);
-        assert_eq!(expected, 8760);
-        assert_eq!(usize::from(ack.window_len) << syn.window_scale.unwrap(), expected);
+        assert_eq!(usize::from(ack.window_len) << syn.window_scale.unwrap(), BUFFER);
         assert_no_drops(&pair);
         pair.close();
     });
@@ -466,7 +446,6 @@ fn path_rule_caps_passive_synack_mss_from_syn_source() {
             );
             let mut socket = tcp_socket_sized(BUFFER);
             socket.mss_cap = cap;
-            let budget = tcp::rx_mbuf_budget(&socket, 9000);
             let server = pair.b.add_tcp(socket).unwrap();
             pair.b.listen(&server, SERVER_PORT).unwrap();
             let client = pair.a.add_tcp(tcp_socket_sized(BUFFER)).unwrap();
@@ -487,11 +466,8 @@ fn path_rule_caps_passive_synack_mss_from_syn_source() {
                 },
             );
             assert_eq!(handshake_mss(&frames, Side::A), [Some(8960), Some(expected)]);
-            assert_eq!(pair.b.tcp(&handles[1]).rx_frame_cap(), budget);
             let syn_ack = segment(&frames[3].1, Side::B);
-            let window = budget.checked_mul(usize::from(expected))
-                .expect("receive window exceeds usize").min(BUFFER);
-            assert_eq!(usize::from(syn_ack.window_len), window);
+            assert_eq!(usize::from(syn_ack.window_len), BUFFER);
             for (from, seed) in [(Side::A, 11), (Side::B, 12)] {
                 assert_segments(
                     &transfer(&mut pair, &handles, from, &pattern(TRANSFER, seed)),
@@ -610,6 +586,40 @@ fn invalid_syn_leaves_listener_unchanged() {
         assert_eq!(listener_reply(&mut pair, x, None), (TcpControl::Syn, Some(1460)));
         assert_eq!(pair.b.tcp(&fresh).state(), State::SynReceived);
         assert_no_drops(&pair);
+        pair.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn ten_small_segments_reach_one_jumbo_tcp_socket_in_one_turn() {
+    with_eal(|eal| {
+        let configs = [config(Side::A), config(Side::B)];
+        let mut pair = Pair::with_ports(eal, ["smallja", "smalljb"], configs, T0, 64, |side, port| {
+            resize(port, 9001, 9216);
+            port.rx_burst = 16;
+            port.rx_pool.count = u32::try_from(rx_reserve(
+                port.rx_descriptors, port.rx_burst, configs[side.index()].rx_staging, port.rx_pool.cache_size,
+            ) + 32).unwrap();
+            port.frame_pool.count = u32::try_from(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending) + 32).unwrap();
+        });
+        let (handles, frames) = establish_sized(&mut pair, Side::A, 65536);
+        let ack = frames.iter().rev().find(|(dir, _)| *dir == Dir::AToB).unwrap();
+        let first = segment(&ack.1, Side::A).seq_number;
+        let packets: Vec<_> = (0..10u8).map(|i| {
+            let payload = [i; 70];
+            let mut tcp = segment(&ack.1, Side::A);
+            tcp.seq_number = first + usize::from(i) * payload.len();
+            tcp.payload = &payload;
+            tcp_frame_between((Side::A.mac(), Side::A.ip()), (Side::B.mac(), Side::B.ip()), &tcp)
+        }).collect();
+        pair.inject(Side::B, &packets);
+        let now = pair.now();
+        let turn = pair.b.turn(now, 16).unwrap();
+        assert_eq!((turn.rx_received, turn.rx_processed), (10, 10));
+        assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), 700);
+        for i in 0..10u8 {
+            assert_eq!(pair.b.tcp_mut(&handles[1]).recv().unwrap().unwrap().payload(), &[i; 70]);
+        }
         pair.close();
     });
 }

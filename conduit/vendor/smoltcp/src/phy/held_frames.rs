@@ -7,23 +7,17 @@ use crate::iface::{DropQueue, SocketHandle};
 pub(crate) struct RxShared {
     pub(crate) held: Cell<usize>,
     pub(crate) wake: RefCell<Option<(DropQueue, SocketHandle)>>,
-    pub(crate) wake_queued: Cell<bool>,
-    /// The app-held count at which a window update becomes due, as of the socket's last
-    /// quiet `poll_at`; `usize::MAX` when no drop can make one due.
-    pub(crate) wake_at_held: Cell<usize>,
     /// The socket is on its DropQueue's frame-wait list: a send found the shared frame pool
     /// empty, and the driver wakes the socket once the pool has a frame again.
     pub(crate) frame_wait_queued: Cell<bool>,
 }
 
 impl RxShared {
-    /// Create an empty held-frame count with no readiness wake.
+    /// Create an empty held-frame count with no frame-pool wake.
     pub(crate) fn new() -> Rc<RxShared> {
         Rc::new(RxShared {
             held: Cell::new(0),
             wake: RefCell::new(None),
-            wake_queued: Cell::new(false),
-            wake_at_held: Cell::new(usize::MAX),
             frame_wait_queued: Cell::new(false),
         })
     }
@@ -34,19 +28,10 @@ impl RxShared {
         self.held.set(self.held.get().checked_add(1).expect("held frame count overflow"));
     }
 
-    /// Release one held frame and queue a readiness wake when its threshold is reached.
+    /// Release one held frame.
     #[inline]
     pub(crate) fn release(&self) {
-        let held = self.held.get().checked_sub(1).expect("held frame count underflow");
-        self.held.set(held);
-        if held != self.wake_at_held.get() {
-            return;
-        }
-        if let Some((queue, handle)) = self.wake.borrow().as_ref() {
-            if !self.wake_queued.replace(true) {
-                queue.push_wake(*handle);
-            }
-        }
+        self.held.set(self.held.get().checked_sub(1).expect("held frame count underflow"));
     }
 
     /// Queue the socket's wake for when the frame pool has a free frame again, once per wait.

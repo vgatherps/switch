@@ -99,22 +99,21 @@ impl Host {
         );
         Ok(Host {
             net,
-            rt: Runtime::new(clock.now_ns() / 1_000_000),
+            rt: Runtime::new(clock.now_ns()),
             clock,
             _eal: opened.eal,
         })
     }
 
-    /// One busy-poll round: turn the Net, poll the tasks; never sleeps.
+    /// One busy-poll round: turn the Net at microsecond resolution, poll tasks at the same
+    /// sampled time in nanoseconds; never sleeps.
     #[inline]
     pub fn round(&mut self) -> Result<u64, String> {
         let now = self.clock.now_ns();
         self.net
             .turn(self.clock.stack_now(now))
             .map_err(|e| format!("turn: {e}"))?;
-        self.rt
-            .poll(now / 1_000_000)
-            .map_err(|e| format!("poll: {e:?}"))?;
+        self.rt.poll(now).map_err(|e| format!("poll: {e:?}"))?;
         Ok(now)
     }
 

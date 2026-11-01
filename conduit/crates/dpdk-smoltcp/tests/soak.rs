@@ -150,8 +150,7 @@ impl Stream {
     }
 
     /// Queue stream bytes up to `end` in frames filled in place, one per MSS,
-    /// while the socket has frame room. Admission backs every frame slot, so
-    /// the pool has a frame whenever the socket has room.
+    /// while the socket has byte room and the shared pool has frames.
     fn send(&mut self, stack: &mut Stack, handle: &TcpHandle, end: u64) {
         while self.accepted != end {
             let socket = stack.tcp(handle);
@@ -161,7 +160,9 @@ impl Stream {
             if room == 0 {
                 return;
             }
-            let mut frame = stack.tx_frame().expect("the frame pool backs both sockets' frame slots");
+            let Some(mut frame) = stack.tx_frame() else {
+                return;
+            };
             let count = mss
                 .min(room)
                 .min(frame.capacity())
@@ -450,8 +451,7 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
             port.rx_pool.count = 8191;
             let tx_pending = configs[side.index()].tx_pending;
             port.tx_pool.count = tx_reserve(port.tx_descriptors, tx_pending) as u32;
-            // Both TCP sockets' full send queues beyond the reserve: Stream::send expects a
-            // frame whenever its socket has frame room.
+            // Reserve plus two full-sized-segment send-queue estimates.
             port.frame_pool.count = zhida_test_kit::pair::pool_count(
                 frame_reserve(port.tx_descriptors, tx_pending),
                 zhida_test_kit::pair::windows(port.mtu, [BUFFER; 2]),

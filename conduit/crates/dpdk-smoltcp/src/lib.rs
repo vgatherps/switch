@@ -31,10 +31,10 @@
 //! use zhida_buffer::{Mbuf, PoolConfig, PoolCreateError, PoolManager};
 //! let _ = PoolManager::new_production;
 //! ```
-//! Applications cannot disable receive frame drop wakes:
+//! Applications cannot disable TX frame-pool wakes:
 //! ```compile_fail,E0624
 //! fn disable_wake(stack: &mut dpdk_smoltcp::Stack, h: &dpdk_smoltcp::TcpHandle) {
-//!     stack.tcp_mut(h).clear_rx_wake();
+//!     stack.tcp_mut(h).clear_frame_wake();
 //! }
 //! ```
 //! Applications get TCP sockets from `Stack::add_tcp(tcp::Config)`, and no public API hands out

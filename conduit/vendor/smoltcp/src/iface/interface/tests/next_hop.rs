@@ -876,7 +876,7 @@ mod invalidation {
         .unwrap();
         assert_eq!(tcp.timestamp, None);
         assert_eq!(tcp.window_scale, Some(2));
-        assert_eq!(tcp.window_len, 23040); // 90 frames x 256 B peer MSS.
+        assert_eq!(tcp.window_len, u16::MAX); // SYN windows are unscaled.
         let mut ack = reply(TcpControl::None, ack);
         ack.seq_number = TcpSeqNumber(101);
         ack.max_seg_size = None;
@@ -887,9 +887,9 @@ mod invalidation {
         );
         peer.data(4);
         peer.assert_layout(64, 20);
-        peer.assert_window(5760); // 90 frames x 256 B, scaled by 4.
+        peer.assert_window(32768); // Configured 131072-byte window, scaled by 4.
         peer.data(5);
-        peer.assert_window(5760); // No received bytes; the same 23040 B window.
+        peer.assert_window(32768);
         let mut tcp = peer.reply(TcpControl::None, peer.ack);
         tcp.seq_number = TcpSeqNumber(101);
         tcp.max_seg_size = None;
@@ -899,7 +899,7 @@ mod invalidation {
         peer.take_generic_tcp(TcpControl::None, &[]);
         assert!(peer.device.tx_queue.is_empty());
         peer.assert_layout(64, 20);
-        peer.assert_window(5760); // Preserve 23039 B after 1 B received, rounded up / 4.
+        peer.assert_window(32768); // Buffered bytes do not shrink the advertised window.
     }
 
     #[test]
@@ -1094,7 +1094,7 @@ mod invalidation {
         }
 
         #[test]
-        fn window_update_uses_template() {
+        fn acknowledgements_for_held_data_use_template() {
             let mut peer = Peer::new(2, PEER, None);
             peer.warm();
             let seq = peer.ack;
@@ -1107,11 +1107,7 @@ mod invalidation {
                 peer.ingress(2, peer.frame(data));
                 peer.egress(2);
                 peer.expect_frame(TcpControl::None, seq, data.seq_number + payload.len(), &[]);
-                // Each free frame allows 512 bytes.
-                peer.assert_window(
-                    u16::try_from(4096usize.min((5 - n) * 512))
-                        .unwrap(),
-                );
+                peer.assert_window(4096);
                 assert!(peer.device.tx_queue.is_empty());
             }
             assert_eq!(peer.sockets.get(peer.handle).recv_queue(), 4096);
@@ -1122,8 +1118,7 @@ mod invalidation {
             assert_eq!(received.len(), 4096);
             assert_eq!(received, [0x35; 4096]);
             peer.egress(3);
-            peer.expect_frame(TcpControl::None, seq, TcpSeqNumber(4197), &[]);
-            peer.assert_window(3072); // All 6 frames free x 512 B peer MSS.
+            // Draining already-acknowledged data does not trigger a window update.
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).recv_queue(), 0);
         }
@@ -1176,7 +1171,7 @@ mod invalidation {
                 |syn| syn.window_scale = Some(7),
             );
             peer.warm();
-            peer.assert_window(11520); // 90 frames x 512 B peer MSS, scaled by 4.
+            peer.assert_window(32768); // Configured 131072-byte window, scaled by 4.
             let seq = peer.ack;
             let mut data = peer.reply(TcpControl::Psh, seq);
             data.seq_number = TcpSeqNumber(101);
@@ -1185,7 +1180,7 @@ mod invalidation {
             peer.ingress(2, peer.frame(data));
             peer.egress(2);
             peer.expect_frame(TcpControl::None, seq, TcpSeqNumber(103), &[]);
-            peer.assert_window(11520); // Preserve 46078 B after 2 B received, rounded up / 4.
+            peer.assert_window(32768); // Buffered bytes do not shrink the window.
             peer.assert_layout(64, 20);
             assert!(peer.device.tx_queue.is_empty());
             let mut ack = peer.reply(TcpControl::None, seq);
@@ -1200,7 +1195,7 @@ mod invalidation {
             );
             peer.egress(3);
             peer.expect_frame(TcpControl::None, seq, TcpSeqNumber(103), &payload[..128]);
-            peer.assert_window(11520); // Sending payload leaves the receive window unchanged.
+            peer.assert_window(32768); // Sending payload leaves the receive window unchanged.
             peer.assert_layout(64, 20);
             assert!(peer.device.tx_queue.is_empty());
             peer.egress(4);

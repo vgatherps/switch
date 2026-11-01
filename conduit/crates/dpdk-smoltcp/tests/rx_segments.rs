@@ -22,7 +22,7 @@ fn assert_turn(turn: Turn, received: usize, sent: usize) {
 }
 
 #[zhida_test_support::pinned_test]
-fn rx_append_returns_incoming_frames_to_pool() {
+fn rx_segments_keep_incoming_frames_until_read() {
     with_eal(|eal| {
         let k = 8usize;
         let buffer = 3usize
@@ -30,9 +30,7 @@ fn rx_append_returns_incoming_frames_to_pool() {
             .expect("buffer segments")
             .checked_mul(1448)
             .expect("socket buffer");
-        // Segments of at most 64 bytes are copied into the first frame's tailroom;
-        // larger ones keep their own frame.
-        for (seg, held) in [(64usize, 1u32), (65, 8), (200, 8), (512, 8), (1448, 8)] {
+        for seg in [64usize, 65, 200, 512, 1448] {
             let batch = k.checked_mul(seg).expect("batch bytes");
             let payload = pattern(batch, 7);
             let (mut pair, handles) = rx::setup(eal, k, buffer);
@@ -77,7 +75,7 @@ fn rx_append_returns_incoming_frames_to_pool() {
             assert_eq!(offset, batch);
             assert_eq!(pair.in_use()[1].0, 8, "B RX pool after forwarding");
             assert_turn(pair.b.turn(now, BUDGET).unwrap(), k, 1);
-            assert_eq!(pair.in_use()[1].0, held, "B RX pool after turn, seg={seg}");
+            assert_eq!(pair.in_use()[1].0, 8, "B RX pool after turn, seg={seg}");
             assert_eq!(pair.b.tcp(&server).recv_queue(), batch);
             let mut sink = vec![0; batch];
             let mut read = 0usize;
@@ -92,7 +90,7 @@ fn rx_append_returns_incoming_frames_to_pool() {
                 views = views.checked_add(1).expect("held frames");
             }
             assert_eq!(read, batch);
-            assert_eq!(views, held);
+            assert_eq!(views, 8);
             assert_eq!(sink, payload);
             assert_eq!(pair.in_use()[1].0, 0, "B RX pool after read");
             let expected = ack.expect("data frames");

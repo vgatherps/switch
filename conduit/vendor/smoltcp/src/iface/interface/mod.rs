@@ -508,7 +508,7 @@ impl Interface {
         let full = sockets
             .items()
             .filter_map(|item| {
-                let (socket_poll_at, _) = item.socket.poll_at_read();
+                let socket_poll_at = item.socket.poll_at();
                 match item.meta.poll_at(
                     socket_poll_at,
                     |ip_addr| self.inner.has_neighbor(&ip_addr),

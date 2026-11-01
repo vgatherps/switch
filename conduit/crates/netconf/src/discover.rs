@@ -263,7 +263,7 @@ fn build(
                 .iter()
                 .map(|prefix| PathRule {
                     prefix: *prefix,
-                    mtu: 9001,
+                    mtu: 1500,
                     why: "vpc".into(),
                 })
                 .collect()
@@ -280,7 +280,7 @@ fn build(
         ipv4,
         gateway: aws.as_ref().map(|a| a.gateway).or(kernel.gateway),
         owned_ipv4: aws.as_ref().map(|a| a.owned_ipv4.clone()).unwrap_or_default(),
-        mtu: kernel.mtu,
+        mtu: kernel.mtu.min(1500),
         paths,
         offloads: Offloads::Auto,
         rx_timestamps: false,
@@ -477,7 +477,7 @@ mod tests {
                 ipv4: addresses()[0],
                 gateway: Some("10.0.1.1".parse().unwrap()),
                 owned_ipv4: Vec::new(),
-                mtu: 9001,
+                mtu: 1500,
                 paths: vec![PathRule {
                     prefix: "0.0.0.0/0".parse().unwrap(),
                     mtu: 1500,
@@ -499,7 +499,7 @@ mod tests {
             );
             let facts = link(&tree.roots, "eth1").unwrap();
             assert_eq!(facts.mac, expected.mac.unwrap());
-            assert_eq!(facts.mtu, expected.mtu);
+            assert_eq!(facts.mtu, 9001);
             assert_eq!(facts.operstate, "up");
             assert_eq!(
                 Device::Pci(pci_device(&tree.roots, "eth1").unwrap()),
@@ -526,6 +526,36 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("class/net/eth1/address"));
+    }
+
+    #[test]
+    fn discover_caps_mtu_without_raising_smaller_nic_mtu() {
+        let tree = Tree::new();
+        for (nic_mtu, expected) in [(9001, 1500), (1500, 1500), (1400, 1400)] {
+            tree.write("class/net/eth1/mtu", &format!("{nic_mtu}\n"));
+            assert_eq!(tree.discover(&addresses(), None).unwrap().config.mtu, expected);
+        }
+    }
+
+    #[test]
+    fn rediscover_keeps_jumbo_mtu_but_updates_default_mtu() {
+        let tree = Tree::new();
+        let mut previous = tree.discover(&addresses(), None).unwrap().config;
+        tree.write("class/net/eth1/mtu", "1400\n");
+        let discovered = tree.discover(&addresses(), None).unwrap();
+        let path = tree.dir.join("config.json");
+
+        for (old_mtu, expected_mtu, changes) in [
+            (9001, 9001, ""),
+            (1500, 1400, "changed: mtu\n"),
+        ] {
+            previous.mtu = old_mtu;
+            fs::write(&path, previous.to_json()).unwrap();
+            let mut output = Vec::new();
+            crate::rediscover::write(&path, &discovered, Some(&previous), &mut output).unwrap();
+            assert_eq!(Config::load(&path).unwrap().mtu, expected_mtu);
+            assert_eq!(String::from_utf8(output).unwrap(), changes);
+        }
     }
 
     #[test]

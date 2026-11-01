@@ -237,6 +237,18 @@ pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>, TcpRx>);
 /// `recv` waiting: bound it. Progress and concurrency as on [`Wss`].
 pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx, TcpRx>);
 
+/// A send handle held alongside a message returned by [`Ws::recv_with_sender`].
+/// It borrows the connection until both the handle and message are no longer used.
+pub struct WsSender<'a>(&'a mut TxCore<SwitchTx>);
+
+impl WsSender<'_> {
+    /// Sends a message with the same ordering, errors and cancellation behavior as [`Ws::send`].
+    /// The payload may borrow the message returned with this handle.
+    pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error> {
+        Ok(self.0.send(kind, payload).await?)
+    }
+}
+
 impl Wss {
     /// The next message; `None` once the close handshake is done (ours or the server's) and the
     /// transport's end delivered. After a failure, the first failure, once what is owed (the
@@ -284,6 +296,13 @@ impl Ws {
     /// sends after its close are read and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         Ok(self.0.recv().await?)
+    }
+
+    /// Receives as in [`Ws::recv`], also borrowing a sender so the message's bytes can be
+    /// sent without first copying them into an application buffer. Sending still copies
+    /// into the outgoing frame (or the send buffer for a fragmented outgoing message).
+    pub async fn recv_with_sender(&mut self) -> Result<Option<(Message<'_>, WsSender<'_>)>, Error> {
+        Ok(self.0.recv_with_sender().await?.map(|(message, tx)| (message, WsSender(tx))))
     }
 
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.

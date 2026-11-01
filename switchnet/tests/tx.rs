@@ -21,8 +21,7 @@ use support::{
 /// Bytes per frame: below the 1460-byte segment payload, so frames go out whole.
 const CHUNK: usize = 1000;
 
-/// A send buffer larger than the peer's receive buffer (`RX_CAPACITY`), so
-/// with the peer not reading the Net's send buffer stays full.
+/// A send buffer larger than the peer's advertised receive window.
 fn stalling_config() -> tcp::Config {
     tcp::Config { tx_capacity: 32 * 1024, ..tcp_config() }
 }
@@ -84,16 +83,16 @@ fn room_then_try_send_delivers_every_frame_in_order() {
     })
 }
 
-/// The peer does not read: its window and then the Net's send buffer fill,
-/// and the writer parks in `room` without being polled. Once the peer reads,
-/// ACKs free room and the writer finishes.
+/// Queued bytes fill the send buffer while the link is paused. The writer
+/// stays parked until the peer receives and ACKs the first frame.
 #[zhida_test_support::pinned_test]
 fn room_parks_until_the_peer_acks() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["rpka", "rpkb"]);
-        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
+        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
-        let data = pattern(128 * 1024, 9);
+        let data = pattern(2 * CHUNK, 9);
         let handle = mixed.handle();
         let sent = data.clone();
         let (task, polls) = counted(async move {
@@ -101,14 +100,19 @@ fn room_parks_until_the_peer_acks() {
             tx
         });
         let slot = mixed.spawn(task);
-        mixed.rounds(50);
+        mixed.to_peer.paused = true;
+        mixed.turn();
         let stalled = polls.get();
-        mixed.rounds(20);
+        for _ in 0..20 {
+            mixed.turn();
+        }
         assert_eq!(polls.get(), stalled, "the parked writer was polled while no room opened");
         assert!(!slot.is_full());
+        mixed.to_peer.paused = false;
         let got = peer_receive(&mut mixed, &peer, data.len());
         assert_eq!(got, data);
         mixed.until(|_| slot.is_full());
+        assert!(polls.get() > stalled, "the ACK did not wake the writer");
         drop((slot.take(), _rx, peer));
         mixed.close();
     })
@@ -227,13 +231,13 @@ fn split_halves_echo_through_the_peer() {
     })
 }
 
-/// A writer that keeps the send buffer full parks in `room` once the peer's
-/// window is shut; a reset from the peer resolves it with an error.
+/// A writer parked on the full send buffer resolves with an error on reset.
 #[zhida_test_support::pinned_test]
 fn parked_room_resolves_with_an_error_on_reset() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["rrsa", "rrsb"]);
-        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
+        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();
         let (task, polls) = counted(async move {
@@ -246,9 +250,12 @@ fn parked_room_resolves_with_an_error_on_reset() {
             }
         });
         let slot = mixed.spawn(task);
-        mixed.rounds(50);
+        mixed.to_peer.paused = true;
+        mixed.turn();
         let parked = polls.get();
-        mixed.rounds(20);
+        for _ in 0..20 {
+            mixed.turn();
+        }
         assert_eq!(polls.get(), parked, "the writer is not parked");
         assert!(!slot.is_full());
         mixed.peer.abort(&peer);
@@ -263,15 +270,15 @@ fn parked_room_resolves_with_an_error_on_reset() {
     })
 }
 
-/// `delivered` after `shutdown` parks, unpolled, while the peer does not read: its window
-/// shut, the bytes and the FIN stay unacked. Once the peer reads them all, it resolves.
+/// `delivered` remains parked after the peer receives data and FIN until its
+/// ACK is forwarded to the sender.
 #[zhida_test_support::pinned_test]
 fn delivered_waits_until_the_peer_acks_the_fin() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["dlva", "dlvb"]);
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
         let (_rx, mut tx) = stream.split();
-        let data = pattern(20 * CHUNK, 21);
+        let data = pattern(2 * CHUNK, 21);
         let handle = mixed.handle();
         let sent = data.clone();
         let (task, polls) = counted(async move {
@@ -281,17 +288,20 @@ fn delivered_waits_until_the_peer_acks_the_fin() {
             tx
         });
         let slot = mixed.spawn(task);
-        mixed.rounds(50);
+        mixed.to_net.paused = true;
+        mixed.until(|m| m.peer.tcp(&peer).state() == State::CloseWait);
         let parked = polls.get();
-        mixed.rounds(20);
+        for _ in 0..20 {
+            mixed.turn();
+        }
         assert_eq!(polls.get(), parked, "the waiter is not parked");
-        assert!(!slot.is_full(), "delivered before the peer acked");
-        assert_eq!(mixed.peer.tcp(&peer).state(), State::Established, "the FIN reached the peer");
+        assert!(!slot.is_full(), "delivered before the peer's ACK was forwarded");
         let got = peer_receive(&mut mixed, &peer, data.len());
         assert_eq!(got, data);
-        mixed.until(|_| slot.is_full());
-        assert_eq!(mixed.peer.tcp(&peer).state(), State::CloseWait);
         assert_eq!(mixed.peer.tcp_mut(&peer).recv().map(|f| f.is_some()), Err(RecvError::Finished));
+        mixed.to_net.paused = false;
+        mixed.until(|_| slot.is_full());
+        assert!(polls.get() > parked, "the ACK did not wake the waiter");
         drop((slot.take(), _rx, peer));
         mixed.close();
     })
@@ -401,12 +411,11 @@ fn room_beyond_the_send_capacity_fails() {
     })
 }
 
-/// Free bytes, not frame slots, limit `room`. With `tx_capacity` 1500 the
-/// socket has 6 frame slots; one 1000-byte frame queued leaves 5 slots but
-/// 500 bytes, so `room(400)` resolves and `room(1000)` parks. The peer's ACK
-/// frees the bytes, and `try_send` of a 1000-byte frame then succeeds at once.
+/// With `tx_capacity` 1500, one 1000-byte frame leaves 500 bytes, so
+/// `room(400)` resolves and `room(1000)` parks. The peer's ACK frees the
+/// bytes, and `try_send` of a 1000-byte frame then succeeds at once.
 #[zhida_test_support::pinned_test]
-fn room_waits_for_bytes_while_frame_slots_remain() {
+fn room_waits_for_queued_bytes_to_be_acked() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["rbya", "rbyb"]);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
@@ -418,7 +427,7 @@ fn room_waits_for_bytes_while_frame_slots_remain() {
         let (task, polls) = counted(async move {
             let first = filled(&handle, &sent[..CHUNK]).await;
             tx.try_send(first).map_err(|(_, error)| error).unwrap();
-            assert_eq!(poll_once(tx.room(400)).await, Some(Ok(())), "a free slot and 500 free bytes");
+            assert_eq!(poll_once(tx.room(400)).await, Some(Ok(())), "500 free bytes");
             let second = filled(&handle, &sent[CHUNK..]).await;
             tx.room(CHUNK).await.unwrap();
             tx.try_send(second).map_err(|(_, error)| error).unwrap();
@@ -459,14 +468,15 @@ fn dropping_the_send_half_keeps_receiving() {
 }
 
 /// Dropping the receive half leaves a writer parked in `room` working: once
-/// the peer reads, everything arrives.
+/// the peer ACKs the queued bytes, everything arrives.
 #[zhida_test_support::pinned_test]
 fn dropping_the_receive_half_keeps_a_parked_writer() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["drxa", "drxb"]);
-        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
+        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
+        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (rx, mut tx) = stream.split();
-        let data = pattern(128 * 1024, 19);
+        let data = pattern(2 * CHUNK, 19);
         let handle = mixed.handle();
         let sent = data.clone();
         let (task, polls) = counted(async move {
@@ -474,14 +484,20 @@ fn dropping_the_receive_half_keeps_a_parked_writer() {
             tx
         });
         let slot = mixed.spawn(task);
-        mixed.rounds(50);
+        mixed.to_peer.paused = true;
+        mixed.turn();
         let parked = polls.get();
-        mixed.rounds(20);
+        for _ in 0..20 {
+            mixed.turn();
+        }
         assert_eq!(polls.get(), parked, "the writer is not parked");
+        assert!(!slot.is_full(), "the writer completed before the receive half was dropped");
         drop(rx);
+        mixed.to_peer.paused = false;
         let got = peer_receive(&mut mixed, &peer, data.len());
         assert_eq!(got, data);
         mixed.until(|_| slot.is_full());
+        assert!(polls.get() > parked, "the ACK did not wake the writer");
         drop((slot.take(), peer));
         mixed.close();
     })

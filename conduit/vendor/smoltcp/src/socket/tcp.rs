@@ -27,56 +27,42 @@ use rx_store::Decision;
 use tx_queue::{Seg, TxQueue};
 
 /// What a TCP socket is built from. Sockets exist only inside a [`crate::iface::TcpSet`], which
-/// builds them with [`crate::iface::TcpSet::add_admitted`]. `rx_capacity` and `mss_cap` decide the
-/// RX frame budget ([`rx_mbuf_budget`]).
+/// builds them with [`crate::iface::TcpSet::add_admitted`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Receive byte capacity, at most 1 GiB: the largest window advertised. Received payload
-    /// stays in RX frames; no byte ring is allocated.
+    /// Target advertised receive window in bytes, at most 1 GiB. RX frames are drawn from the
+    /// shared pool; this is not a limit on buffered or application-held data.
     pub rx_capacity: usize,
     /// Queued and unacknowledged transmit bytes.
     pub tx_capacity: usize,
-    /// Cap on the advertised MSS and outgoing segment payloads, never `Some(0)`. It also sets
-    /// the per-frame bytes of the RX frame budget.
+    /// Cap on the advertised MSS and outgoing segment payloads, never `Some(0)`.
     pub mss_cap: Option<u16>,
 }
 
-/// RX mbufs a socket built from `config` may hold at most (its RX frame cap):
-/// max(ceil(rx_capacity / min(ip_mtu - 40, mss_cap)), 6).
-/// An IPv4 TCP segment without options has 40 bytes of headers. Six
-/// mbufs cover small receive buffers and short segments.
-///
-/// Panics if `ip_mtu` is below IPv4's minimum of 68 bytes or `mss_cap` is `Some(0)`.
-pub fn rx_mbuf_budget(config: &Config, ip_mtu: usize) -> usize {
-    assert!(config.mss_cap != Some(0), "MSS cap must not be zero");
-    rx_mbuf_budget_for_payload(config.rx_capacity, rx_frame_bytes(ip_mtu, config.mss_cap))
-}
 
-/// TX mbufs kept by a socket built from `config`.
+/// Estimate TX mbufs for pool sizing, assuming full-size frames, with a minimum of six.
+/// Small frames can require more mbufs; this is not an admission guarantee or socket limit.
 ///
 /// Panics if `ip_mtu` is below IPv4's minimum of 68 bytes or `mss_cap` is `Some(0)`.
 pub fn tx_mbuf_budget(config: &Config, ip_mtu: usize) -> usize {
     assert!(config.mss_cap != Some(0), "MSS cap must not be zero");
-    tx_frame_cap(config.tx_capacity, rx_frame_bytes(ip_mtu, config.mss_cap))
+    full_frame_mbuf_estimate(config.tx_capacity, segment_payload(ip_mtu, config.mss_cap))
 }
 
-fn rx_frame_bytes(ip_mtu: usize, mss_cap: Option<u16>) -> usize {
+fn segment_payload(ip_mtu: usize, mss_cap: Option<u16>) -> usize {
     assert!(ip_mtu >= 68, "IP MTU must be at least 68 bytes");
     ip_mtu.checked_sub(40).expect("IP MTU is at least 68")
         .min(mss_cap.map_or(usize::MAX, usize::from))
 }
 
-fn rx_mbuf_budget_for_payload(recv_capacity: usize, payload: usize) -> usize {
-    let whole = recv_capacity / payload;
+fn full_frame_mbuf_estimate(tx_capacity: usize, payload: usize) -> usize {
+    let whole = tx_capacity / payload;
     let rounded = whole
-        .checked_add(usize::from(recv_capacity % payload != 0))
-        .expect("RX mbuf budget exceeds usize");
+        .checked_add(usize::from(tx_capacity % payload != 0))
+        .expect("TX mbuf budget exceeds usize");
     rounded.max(6)
 }
 
-fn tx_frame_cap(tx_capacity: usize, segment_payload: usize) -> usize {
-    rx_mbuf_budget_for_payload(tx_capacity, segment_payload)
-}
 
 macro_rules! tcp_trace {
     ($($arg:expr),*) => (net_log!(trace, $($arg),*));
@@ -557,10 +543,6 @@ pub struct Socket<'a> {
     recover: TcpSeqNumber,
     rto_us: u32,
     rto_backoff: u32,
-    /// Admission fixes the frame count; otherwise the receive context supplies it.
-    /// Segment bytes follow our advertised MSS and the peer MSS.
-    rx_mbuf_cap: u32,
-    rx_seg_bytes: u32,
     tx_queue: TxQueue,
     tx_seg_bytes: u32,
     lifetime: core::marker::PhantomData<&'a mut [u8]>,
@@ -611,12 +593,11 @@ impl<'a> Socket<'a> {
     pub(crate) fn new(
         rx_buffer: RxBuffer,
         tx_capacity: usize,
-        tx_frame_cap: usize,
         tx_source: TxSource,
         tx_seg_bytes: usize,
     ) -> Socket<'a> {
         let rx_capacity = rx_buffer.capacity;
-        let tx_queue = TxQueue::new(tx_capacity, tx_frame_cap, tx_source);
+        let tx_queue = TxQueue::new(tx_capacity, tx_source);
 
         // From RFC 1323:
         // [...] the above constraints imply that 2 * the max window size must be less
@@ -637,8 +618,6 @@ impl<'a> Socket<'a> {
             tx_seg_bytes: u32::try_from(tx_seg_bytes).expect("TX segment bytes exceed u32"),
             lifetime: core::marker::PhantomData,
             rx_buffer,
-            rx_mbuf_cap: 0,
-            rx_seg_bytes: 0,
             rx_refused_segments: 0,
             rx_fin_received: false,
             rx_fin_seq: None,
@@ -689,11 +668,10 @@ impl<'a> Socket<'a> {
     /// Build a socket from `config`. Panics if `rx_capacity` exceeds 1 GiB or `mss_cap` is
     /// `Some(0)`.
     pub(crate) fn from_config(config: &Config, ip_mtu: usize, source: TxSource) -> Socket<'a> {
-        let tx_seg_bytes = rx_frame_bytes(ip_mtu, config.mss_cap);
+        let tx_seg_bytes = segment_payload(ip_mtu, config.mss_cap);
         let mut socket = Socket::new(
             RxBuffer::new(config.rx_capacity),
             config.tx_capacity,
-            tx_frame_cap(config.tx_capacity, tx_seg_bytes),
             source,
             tx_seg_bytes,
         );
@@ -706,7 +684,6 @@ impl<'a> Socket<'a> {
         Socket::new(
             RxBuffer::new(rx_capacity),
             tx_capacity,
-            tx_frame_cap(tx_capacity, 1460),
             crate::tests::tx_test_source(1460),
             1460,
         )
@@ -781,26 +758,12 @@ impl<'a> Socket<'a> {
     }
 
     fn recv_window(&self) -> usize {
-        self.recv_window_within(self.rx_buffer.capacity)
+        self.rx_buffer.capacity
     }
 
-    fn recv_window_within(&self, byte_window: usize) -> usize {
-        assert!(self.rx_mbuf_cap != 0 && self.rx_seg_bytes != 0,
-            "RX frame cap and segment bytes must be known");
-        let out_of_order_span = self.rx_buffer.store.out_of_order_span();
-        let free_frames = (self.rx_mbuf_cap as usize)
-            .checked_sub(self.rx_buffer.store.held())
-            .expect("stored frames exceed RX mbuf cap")
-            .checked_sub(self.rx_buffer.shared.held.get())
-            .expect("app-held frames exceed RX mbuf cap");
-        let hole_frames = self.rx_buffer.store.out_of_order_hole_frames(self.rx_seg_bytes as usize);
-        let frame_window = free_frames
-            .saturating_sub(hole_frames)
-            .checked_mul(self.rx_seg_bytes as usize)
-            .expect("RX frame window exceeds usize")
-            .checked_add(out_of_order_span)
-            .expect("RX window exceeds usize");
-        byte_window.min(frame_window)
+    /// Sequence number after all in-order bytes. The queued length can span multiple wraps.
+    fn next_receive_seq(&self) -> TcpSeqNumber {
+        TcpSeqNumber(self.remote_seq_no.0.wrapping_add(self.rx_buffer.store.in_order_len() as i32))
     }
 
     /// Return the current window field value, including scaling according to RFC 1323.
@@ -813,9 +776,8 @@ impl<'a> Socket<'a> {
 
     #[inline]
     fn scaled_window_with_last(&self, last_window: Option<u16>) -> u16 {
-        let byte_window = self.rx_buffer.capacity;
-        let window = self.recv_window_within(byte_window) >> self.remote_win_shift;
-        let byte_window = byte_window >> self.remote_win_shift;
+        let window = self.recv_window() >> self.remote_win_shift;
+        let byte_window = self.rx_buffer.capacity >> self.remote_win_shift;
         let window =
             last_window.map_or(window, |last| window.max((last as usize).min(byte_window)));
         u16::try_from(window).unwrap_or(u16::MAX)
@@ -835,7 +797,7 @@ impl<'a> Socket<'a> {
             return None;
         }
         let last_ack = self.remote_last_ack?;
-        let next_ack = self.remote_seq_no + self.rx_buffer.store.in_order_len();
+        let next_ack = self.next_receive_seq();
 
         let last_win = self.remote_last_win_bytes as usize;
         let last_win_adjusted = if last_ack + last_win < next_ack {
@@ -908,41 +870,6 @@ impl<'a> Socket<'a> {
     pub(crate) fn set_mss_cap(&mut self, cap: Option<u16>) {
         assert!(cap != Some(0), "MSS cap must not be zero");
         self.mss_cap = cap.and_then(core::num::NonZeroU16::new);
-    }
-
-    /// The RX frame cap this socket gets from its MSS cap; see [`rx_mbuf_budget`].
-    /// Panics if `ip_mtu` is below 68.
-    pub(crate) fn rx_mbuf_budget(&self, ip_mtu: usize) -> usize {
-        rx_mbuf_budget_for_payload(
-            self.recv_capacity(),
-            rx_frame_bytes(ip_mtu, self.mss_cap.map(core::num::NonZeroU16::get)),
-        )
-    }
-
-    /// Return the socket's RX frame cap: how many RX frames it holds at most.
-    pub fn rx_frame_cap(&self) -> usize {
-        self.rx_mbuf_cap as usize
-    }
-
-    /// Return the socket's TX frame limit: how many frames its send queue holds at most.
-    pub fn tx_frame_cap(&self) -> usize {
-        self.tx_queue.frame_capacity()
-    }
-
-    /// Fix the socket's RX frame count and per-frame bytes using its configured cap.
-    /// The count survives reset and reconnect; per-frame bytes follow each connection.
-    /// Panics if the app still holds received frames, `ip_mtu` is below 68,
-    /// or the frame count exceeds u32.
-    /// Used by [`crate::iface::TcpSet::add_admitted`].
-    pub(crate) fn set_rx_mbuf_budget(&mut self, ip_mtu: usize) {
-        assert_eq!(self.rx_buffer.shared.held.get(), 0,
-            "socket admitted while the app still holds its received frames");
-        self.rx_mbuf_cap = u32::try_from(self.rx_mbuf_budget(ip_mtu))
-            .expect("RX mbuf cap exceeds u32");
-        self.rx_seg_bytes = u32::try_from(rx_frame_bytes(
-            ip_mtu, self.mss_cap.map(core::num::NonZeroU16::get),
-        ))
-            .expect("RX segment bytes exceed u32");
     }
 
     /// Set Cubic's initial congestion window in bytes. The default is 1 MiB.
@@ -1165,7 +1092,6 @@ impl<'a> Socket<'a> {
         self.reset();
         self.tuple = Some(tuple);
         self.set_connection_mss_cap(cx, remote_endpoint.addr);
-        self.update_rx_mbuf_budget(cx);
         self.set_state(State::SynSent);
 
         let seq = Self::random_seq_no(cx, tuple);
@@ -1383,6 +1309,7 @@ impl<'a> Socket<'a> {
 
     /// Check whether the transmit half of the full-duplex connection is open
     /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    /// This does not check whether the shared frame pool can supply another frame.
     #[inline]
     pub fn can_send(&self) -> bool {
         if !self.may_send() {
@@ -1392,32 +1319,15 @@ impl<'a> Socket<'a> {
             return false;
         }
         self.tx_queue.byte_room() != 0
-            && (self.tx_queue.frame_room() != 0
-                || self
-                    .tx_queue
-                    .tail_room(self.sent_payload_bytes(), self.tx_seg_bytes as usize)
-                    != 0)
     }
 
-    /// Return the maximum number of bytes inside the recv buffer.
+    /// Return the configured advertised receive window target.
     #[inline]
     pub fn recv_capacity(&self) -> usize {
         self.rx_buffer.capacity
     }
 
-    /// Return bytes beyond the in-order data the peer may still send,
-    /// counting frame overhead.
-    /// Returns 0 until the socket has a frame budget: admitted, or after connect or an accepted SYN.
-    #[inline]
-    pub fn recv_room(&self) -> usize {
-        if self.rx_mbuf_cap == 0 {
-            0
-        } else {
-            self.recv_window()
-        }
-    }
-
-    /// Return the number of segments dropped because their frame would exceed the held-frame cap.
+    /// Return the number of out-of-order segments refused while the shared RX pool is low.
     pub fn rx_refused_segments(&self) -> u32 {
         self.rx_refused_segments
     }
@@ -1449,19 +1359,13 @@ impl<'a> Socket<'a> {
         )
     }
 
-    /// Return how many bytes `send_frame` takes now in frames of the local segment
-    /// payload: free bytes, capped by free frame slots × that payload. The peer MSS
-    /// does not limit it; egress cuts frames larger than a segment.
+    /// Return the free transmit bytes available to `send_frame`.
+    /// This does not account for availability of frames from the shared pool.
     pub fn frame_send_room(&self) -> usize {
         if !self.may_send() || self.max_segment_payload().is_none() {
             return 0;
         }
-        self.tx_queue.byte_room().min(
-            self.tx_queue
-                .frame_room()
-                .checked_mul(self.tx_seg_bytes as usize)
-                .expect("TX frame room exceeds usize"),
-        )
+        self.tx_queue.byte_room()
     }
 
     /// Enqueue one owned frame as one send-queue entry. A frame longer than the
@@ -1477,7 +1381,7 @@ impl<'a> Socket<'a> {
             return Err((frame, SendFrameError::Empty));
         }
         debug_assert!(self.max_segment_payload().is_some(), "sendable TCP socket is not synchronized");
-        if frame.len() > self.tx_queue.byte_room() || self.tx_queue.frame_room() == 0 {
+        if frame.len() > self.tx_queue.byte_room() {
             return Err((frame, SendFrameError::Full));
         }
         self.tx_queue.push(frame.into_buf());
@@ -1486,8 +1390,8 @@ impl<'a> Socket<'a> {
 
     /// Enqueue a sequence of octets to be sent, and fill it from a slice.
     ///
-    /// This function returns the amount of octets actually enqueued, which is limited
-    /// by the amount of free space in the transmit buffer; down to zero.
+    /// This returns the number of octets enqueued, limited by free transmit bytes and
+    /// available frames in the shared pool; it may return zero.
     ///
     pub fn send_slice(&mut self, data: &[u8]) -> Result<usize, SendError> {
         if !self.may_send() {
@@ -1496,7 +1400,7 @@ impl<'a> Socket<'a> {
         debug_assert!(self.max_segment_payload().is_some(), "sendable TCP socket is not synchronized");
         let frame_payload = self.tx_seg_bytes as usize;
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
-        while written < data.len() && self.tx_queue.byte_room() != 0 && self.tx_queue.frame_room() != 0 {
+        while written < data.len() && self.tx_queue.byte_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
                 // The shared frame pool is empty: wake this socket once frames return.
                 self.rx_buffer.shared.queue_frame_wait();
@@ -1527,8 +1431,8 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    /// Schedule a readiness check when an application-held receive frame is dropped.
-    pub(crate) fn set_rx_wake(
+    /// Register the socket for a wake when the TX frame pool recovers.
+    pub(crate) fn set_frame_wake(
         &mut self,
         queue: crate::iface::DropQueue,
         handle: crate::iface::SocketHandle,
@@ -1536,15 +1440,10 @@ impl<'a> Socket<'a> {
         *self.rx_buffer.shared.wake.borrow_mut() = Some((queue, handle));
     }
 
-    /// Stop receive frame drops, and frames returning to an empty pool, from scheduling
-    /// readiness checks for this socket.
-    pub(crate) fn clear_rx_wake(&mut self) {
+    /// Remove the socket from the TX frame-pool wait list.
+    pub(crate) fn clear_frame_wake(&mut self) {
         self.rx_buffer.shared.cancel_frame_wait();
         *self.rx_buffer.shared.wake.borrow_mut() = None;
-    }
-
-    pub(crate) fn clear_rx_wake_queued(&mut self) {
-        self.rx_buffer.shared.wake_queued.set(false);
     }
 
     pub(crate) fn clear_frame_wait_queued(&mut self) {
@@ -1557,7 +1456,7 @@ impl<'a> Socket<'a> {
     }
 
     /// Drain the next whole in-order frame, or return None when no data is queued.
-    /// Frames keep occupying the socket's RX frame budget until dropped.
+    /// Frames retain their shared RX pool buffers until dropped.
     /// After a FIN, queued frames are drained before returning RecvError::Finished.
     /// Other closed receive states return RecvError::InvalidState.
     #[inline(always)]
@@ -1566,7 +1465,7 @@ impl<'a> Socket<'a> {
         let Some(frame) = self.rx_buffer.store.pop_front() else {
             return Ok(None);
         };
-        self.remote_seq_no += frame.len();
+        self.remote_seq_no = TcpSeqNumber(self.remote_seq_no.0.wrapping_add(frame.len() as i32));
         self.rx_buffer.shared.hold();
         Ok(Some(TcpFrame { frame, shared: self.rx_buffer.shared.clone() }))
     }
@@ -1614,18 +1513,6 @@ impl<'a> Socket<'a> {
         }
     }
 
-    fn update_rx_mbuf_budget(&mut self, cx: &Context) {
-        let payload = rx_frame_bytes(
-            cx.ip_mtu(), self.connection_mss_cap.map(core::num::NonZeroU16::get),
-        )
-            .min(self.local_mss(cx));
-        if self.rx_mbuf_cap == 0 {
-            self.rx_mbuf_cap = u32::try_from(rx_mbuf_budget_for_payload(self.recv_capacity(), payload))
-                .expect("RX mbuf cap exceeds u32");
-        }
-        self.rx_seg_bytes = u32::try_from(payload.min(usize::from(self.remote_mss)))
-            .expect("RX segment bytes exceed u32");
-    }
 
     /// Payload bytes of a full-sized segment (SMSS): the smaller of what our MTU and
     /// the remote's MSS allow.
@@ -1663,7 +1550,7 @@ impl<'a> Socket<'a> {
     }
 
     /// Return the number of in-order octets queued in the receive buffer.
-    /// This includes all queued frames, including bytes appended into them.
+    /// This includes all queued frames.
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn recv_queue(&self) -> usize {
@@ -1671,7 +1558,7 @@ impl<'a> Socket<'a> {
     }
 
     pub(crate) fn discard_received(&mut self) {
-        self.remote_seq_no += self.rx_buffer.store.in_order_len();
+        self.remote_seq_no = self.next_receive_seq();
         self.rx_buffer.store.clear();
     }
 
@@ -1742,7 +1629,7 @@ impl<'a> Socket<'a> {
     }
 
     fn sack_ranges(&self) -> impl Iterator<Item = (TcpSeqNumber, TcpSeqNumber)> + '_ {
-        let ack = self.remote_seq_no + self.rx_buffer.store.in_order_len();
+        let ack = self.next_receive_seq();
         let mut ranges = self.rx_buffer.store.out_of_order_ranges()
             .map(move |(left, right)| (ack + left, ack + right)).peekable();
         let mut fin_seq = self.rx_fin_seq;
@@ -1837,7 +1724,7 @@ impl<'a> Socket<'a> {
         // and an acknowledgment indicating the next sequence number expected
         // to be received.
         reply_repr.seq_number = self.acceptable_seq();
-        reply_repr.ack_number = Some(self.remote_seq_no + self.rx_buffer.store.in_order_len());
+        reply_repr.ack_number = Some(self.next_receive_seq());
 
         // From RFC 1323:
         // The window field [...] of every outgoing segment, with the exception of SYN
@@ -1903,7 +1790,7 @@ impl<'a> Socket<'a> {
             let end = repr.seq_number + repr.payload.len();
             let dsack = (!repr.payload.is_empty()
                 && self.state != State::TimeWait
-                && end <= self.remote_seq_no + self.rx_buffer.store.in_order_len())
+                && end <= self.next_receive_seq())
                 .then_some((repr.seq_number, end));
             return Some(self.ack_reply(cx, ip_repr, repr, dsack));
         }
@@ -1918,7 +1805,7 @@ impl<'a> Socket<'a> {
         {
             return false;
         }
-        self.remote_seq_no + self.rx_buffer.store.in_order_len() < repr.seq_number
+        self.next_receive_seq() < repr.seq_number
     }
 
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
@@ -1999,9 +1886,6 @@ impl<'a> Socket<'a> {
         ip_repr: &IpRepr,
         repr: &TcpRepr,
     ) -> (Option<(IpRepr, TcpRepr<'static>)>, Option<PendingRxCommit>) {
-        // The segment changes the state the threshold was computed from; the socket is now
-        // dirty and its next poll_at re-arms it.
-        self.rx_buffer.shared.wake_at_held.set(usize::MAX);
         let mut pending = None;
         let reply = self.process_inner(cx, ip_repr, repr, &mut pending);
         (reply, pending)
@@ -2051,7 +1935,7 @@ impl<'a> Socket<'a> {
             }
         }
 
-        let window_start = self.remote_seq_no + self.rx_buffer.store.in_order_len();
+        let window_start = self.next_receive_seq();
         let window_end = if let Some(last_ack) = self.remote_last_ack {
             last_ack + (self.remote_last_win_bytes as usize)
         } else {
@@ -2430,13 +2314,7 @@ impl<'a> Socket<'a> {
         } else if rx_pool_low && payload_offset != 0 {
             Some(Decision::Refused)
         } else {
-            Some(
-                self.rx_buffer
-                    .store
-                    .decide(offset, payload.len(), (self.rx_mbuf_cap as usize)
-                        .checked_sub(self.rx_buffer.shared.held.get())
-                        .expect("app-held frames exceed RX mbuf cap")),
-            )
+            Some(self.rx_buffer.store.decide(offset, payload.len()))
         };
         let refused = matches!(decision, Some(Decision::Refused)) || (rx_pool_low && out_of_order_fin);
         if refused {
@@ -2493,7 +2371,6 @@ impl<'a> Socket<'a> {
                     self.remote_win_shift = 0;
                 }
                 self.set_connection_mss_cap(cx, ip_repr.src_addr());
-                self.update_rx_mbuf_budget(cx);
                 self.congestion_controller.set_mss(self.effective_mss(cx));
                 self.congestion_controller.set_initial_window(self.initial_window);
                 // Initialize the SYN window without adding it to the ACK-age bound.
@@ -2519,7 +2396,7 @@ impl<'a> Socket<'a> {
             // 7th and 8th steps in the "SEGMENT ARRIVES" event describe this behavior.
             (State::SynReceived, TcpControl::Fin) => {
                 self.congestion_controller.on_handshake(cx.now(), self.initial_window);
-                fin_offset = Some(segment_end - self.remote_seq_no);
+                fin_offset = Some(self.rx_buffer.store.in_order_len() + (segment_end - window_start));
                 self.receive_fin(cx, ack_of_fin);
             }
 
@@ -2551,7 +2428,6 @@ impl<'a> Socket<'a> {
                 if self.remote_win_scale.is_none() {
                     self.remote_win_shift = 0;
                 }
-                self.update_rx_mbuf_budget(cx);
                 self.congestion_controller.set_mss(self.effective_mss(cx));
                 self.rcv_mss = self.local_mss(cx)
                     .min(self.effective_mss(cx))
@@ -2571,7 +2447,7 @@ impl<'a> Socket<'a> {
 
             // FIN packets in ESTABLISHED state indicate the remote side has closed.
             (State::Established, TcpControl::Fin) => {
-                fin_offset = Some(segment_end - self.remote_seq_no);
+                fin_offset = Some(self.rx_buffer.store.in_order_len() + (segment_end - window_start));
                 self.receive_fin(cx, ack_of_fin);
             }
 
@@ -2589,7 +2465,7 @@ impl<'a> Socket<'a> {
             // FIN packets in FIN-WAIT-1 state change it to CLOSING, or to TIME-WAIT
             // if they also acknowledge our FIN.
             (State::FinWait1, TcpControl::Fin) => {
-                fin_offset = Some(segment_end - self.remote_seq_no);
+                fin_offset = Some(self.rx_buffer.store.in_order_len() + (segment_end - window_start));
                 self.receive_fin(cx, ack_of_fin);
             }
 
@@ -2597,7 +2473,7 @@ impl<'a> Socket<'a> {
 
             // FIN packets in FIN-WAIT-2 state change it to TIME-WAIT.
             (State::FinWait2, TcpControl::Fin) => {
-                fin_offset = Some(segment_end - self.remote_seq_no);
+                fin_offset = Some(self.rx_buffer.store.in_order_len() + (segment_end - window_start));
                 self.receive_fin(cx, ack_of_fin);
             }
 
@@ -2826,9 +2702,6 @@ impl<'a> Socket<'a> {
                     payload_len,
                 });
             }
-            Some(decision @ Decision::Append(_)) => {
-                self.rx_buffer.store.append(offset, decision, payload);
-            }
             Some(Decision::Duplicate(_)) => {
                 // Every byte is already held out of order: D-SACK it (RFC 2883).
                 let start = window_start + payload_offset;
@@ -2845,7 +2718,7 @@ impl<'a> Socket<'a> {
         }
 
         if self.rx_fin_seq == Some(window_start + contig_len) {
-            fin_offset = Some(self.rx_fin_seq.unwrap() - self.remote_seq_no);
+            fin_offset = Some(in_order_len + contig_len);
             self.receive_fin(cx, ack_of_fin);
         }
         self.truncate_at_fin(fin_offset);
@@ -2946,7 +2819,7 @@ impl<'a> Socket<'a> {
 
     fn ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
-            remote_last_ack < self.remote_seq_no + self.rx_buffer.store.in_order_len()
+            remote_last_ack < self.next_receive_seq()
         } else {
             false
         }
@@ -2965,7 +2838,7 @@ impl<'a> Socket<'a> {
     fn immediate_ack_to_transmit(&self) -> bool {
         if let Some(remote_last_ack) = self.remote_last_ack {
             remote_last_ack + self.rcv_mss
-                < self.remote_seq_no + self.rx_buffer.store.in_order_len()
+                < self.next_receive_seq()
         } else {
             false
         }
@@ -2983,8 +2856,7 @@ impl<'a> Socket<'a> {
                 let Some(last_win) = self.last_scaled_window() else {
                     return false;
                 };
-                // The new window is at most the byte window, so a byte window below twice the
-                // last one cannot be a doubling, whatever the frame window is.
+                // A byte window below twice the last one cannot be a doubling.
                 if (self.rx_buffer.capacity >> self.remote_win_shift) / 2 < usize::from(last_win) {
                     return false;
                 }
@@ -2995,38 +2867,6 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// The largest app-held frame count at which `window_to_update` holds, everything else
-    /// as now; `usize::MAX` when no count does. The window grows as held frames drop, so a
-    /// drop that reaches this count makes a window update due.
-    fn rx_wake_at_held(&self) -> usize {
-        const NEVER: usize = usize::MAX;
-        if !matches!(self.state, State::Established | State::FinWait1 | State::FinWait2)
-            || self.rx_buffer.shared.held.get() == 0
-        {
-            return NEVER;
-        }
-        let Some(last_win) = self.last_scaled_window() else {
-            return NEVER;
-        };
-        // window_to_update: new_win > 0 && new_win / 2 >= last_win, new_win a u16.
-        let needed = (2 * usize::from(last_win)).max(1);
-        if needed > usize::from(u16::MAX) || self.rx_buffer.capacity >> self.remote_win_shift < needed {
-            return NEVER;
-        }
-        let needed_bytes = needed << self.remote_win_shift;
-        let unstored = (self.rx_mbuf_cap as usize)
-            .checked_sub(self.rx_buffer.store.held())
-            .expect("stored frames exceed RX mbuf cap");
-        let span = self.rx_buffer.store.out_of_order_span();
-        let missing = match needed_bytes.checked_sub(span) {
-            None | Some(0) => return unstored,
-            Some(missing) => missing,
-        };
-        let frames = missing.div_ceil(self.rx_seg_bytes as usize);
-        unstored
-            .checked_sub(self.rx_buffer.store.out_of_order_hole_frames(self.rx_seg_bytes as usize) + frames)
-            .unwrap_or(NEVER)
-    }
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
@@ -3167,7 +3007,7 @@ impl<'a> Socket<'a> {
             dst_port: tuple.remote.port,
             control: TcpControl::None,
             seq_number: self.remote_last_seq,
-            ack_number: Some(self.remote_seq_no + self.rx_buffer.store.in_order_len()),
+            ack_number: Some(self.next_receive_seq()),
             window_len: self.scaled_window(),
             window_scale: None,
             max_seg_size: None,
@@ -3207,14 +3047,7 @@ impl<'a> Socket<'a> {
                 repr.control = TcpControl::Syn;
                 repr.seq_number = self.local_seq_no;
                 // window len must NOT be scaled in SYNs.
-                let window = if self.state == State::SynSent {
-                    let per_frame = (self.rx_seg_bytes as usize).min(MIN_REMOTE_MSS);
-                    self.recv_window().min((self.rx_mbuf_cap as usize)
-                        .checked_mul(per_frame).expect("SYN receive window exceeds usize"))
-                } else {
-                    self.recv_window()
-                };
-                repr.window_len = u16::try_from(window).unwrap_or(u16::MAX);
+                repr.window_len = u16::try_from(self.recv_window()).unwrap_or(u16::MAX);
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
@@ -3509,27 +3342,21 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    pub(crate) fn poll_at(&self) -> PollAt {
-        let (poll_at, wake_at_held) = self.poll_at_read();
-        self.rx_buffer.shared.wake_at_held.set(wake_at_held);
-        poll_at
-    }
-
     #[allow(clippy::if_same_then_else)]
-    pub(crate) fn poll_at_read(&self) -> (PollAt, usize) {
+    pub(crate) fn poll_at(&self) -> PollAt {
         // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
-            (PollAt::Ingress, usize::MAX)
+            PollAt::Ingress
         } else if self.remote_win_len == 0 && !self.tx_queue.is_empty() && self.timer.is_idle() {
             // Dispatch must arm the first probe from the caller's current time.
-            (PollAt::Now, usize::MAX)
+            PollAt::Now
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
-            (PollAt::Now, usize::MAX)
+            PollAt::Now
         } else if self.seq_to_transmit() {
             // We have a data or flag packet to transmit.
-            (PollAt::Now, usize::MAX)
+            PollAt::Now
         } else {
             let want_ack = self.ack_to_transmit();
 
@@ -3542,15 +3369,14 @@ impl<'a> Socket<'a> {
             // An ACK due now and a significantly raised receive window both answer Now; the ACK
             // check goes first because it computes no window.
             if delayed_ack_poll_at == PollAt::Now || self.window_to_update() {
-                return (PollAt::Now, usize::MAX);
+                return PollAt::Now;
             }
 
             // We wait for the earliest of our timers to fire.
-            let poll_at = *[self.timer.poll_at(), delayed_ack_poll_at]
+            *[self.timer.poll_at(), delayed_ack_poll_at]
                 .iter()
                 .min()
-                .unwrap_or(&PollAt::Ingress);
-            (poll_at, self.rx_wake_at_held())
+                .unwrap_or(&PollAt::Ingress)
         }
     }
 }
@@ -3662,58 +3488,6 @@ mod test {
             s.set_ack_delay_timer(timer);
             assert_eq!(s.ack_delay_timer(), timer);
         }
-    }
-
-    #[test]
-    fn rx_mbuf_budget_covers_receive_capacity() {
-        let budget = |rx_capacity, mss_cap, ip_mtu| {
-            rx_mbuf_budget(&Config { rx_capacity, tx_capacity: 0, mss_cap }, ip_mtu)
-        };
-        assert_eq!(budget(4096, None, 1500), 6);
-        assert_eq!(budget(65536, None, 1500), 45);
-        assert_eq!(budget(262144, None, 1500), 180);
-        assert_eq!(budget(65536, None, 9000), 8);
-        assert_eq!(budget(6 * 1460, None, 1500), 6);
-        assert_eq!(budget(7 * 1460, None, 1500), 7);
-        assert_eq!(budget(7 * 1460 + 1, None, 1500), 8);
-        assert_eq!(budget(8 * 8960, None, 9000), 8);
-        assert_eq!(budget(6 * 28, None, 68), 6);
-        assert_eq!(budget(6 * 28 + 1, None, 68), 7);
-        assert_eq!(budget(0, None, 1500), 6);
-        assert_eq!(budget(usize::MAX, None, 68), usize::MAX / 28 + 1);
-        // The cap sets per-frame bytes only when it is below MTU - 40.
-        assert_eq!(budget(65536, Some(1460), 9000), 45);
-        assert_eq!(budget(65536, Some(100), 1500), 656);
-        assert_eq!(budget(65536, Some(9000), 1500), 45);
-    }
-
-    #[test]
-    #[should_panic(expected = "IP MTU must be at least 68 bytes")]
-    fn rx_mbuf_budget_refuses_ip_mtu_below_ipv4_minimum() {
-        rx_mbuf_budget(&Config { rx_capacity: 4096, tx_capacity: 0, mss_cap: None }, 67);
-    }
-
-    #[test]
-    #[should_panic(expected = "MSS cap must not be zero")]
-    fn rx_mbuf_budget_refuses_zero_mss_cap() {
-        rx_mbuf_budget(&Config { rx_capacity: 4096, tx_capacity: 0, mss_cap: Some(0) }, 1500);
-    }
-
-    #[test]
-    fn from_config_matches_config_and_its_budget() {
-        let config = Config { rx_capacity: 65536, tx_capacity: 1000, mss_cap: Some(100) };
-        let s = Socket::from_config(&config, 1500, crate::tests::tx_test_source(1460));
-        assert_eq!(s.recv_capacity(), 65536);
-        assert_eq!(s.send_capacity(), 1000);
-        assert_eq!(s.mss_cap, core::num::NonZeroU16::new(100));
-        assert_eq!(s.rx_mbuf_budget(1500), rx_mbuf_budget(&config, 1500));
-        assert_eq!(s.rx_frame_cap(), 0);
-    }
-
-    #[test]
-    fn frame_cap_is_count_not_bytes() {
-        let s = Socket::test_socket(64, 2 * 1024 * 1024);
-        assert_eq!(s.tx_queue.frame_room(), 1437);
     }
 
     // =========================================================================================//
@@ -4217,7 +3991,6 @@ mod test {
         iface.resolve_neighbor(REMOTE_ADDR, crate::tests::PEER_HARDWARE);
         let mut s = socket_with_buffer_sizes(64, capacity);
         s.cx = iface.inner;
-        s.set_rx_mbuf_budget(ip_mtu);
         s
     }
 
@@ -4247,344 +4020,32 @@ mod test {
     }
 
     #[test]
-    fn peer_mss_48_preserves_unscaled_handshake_right_edge() {
+    fn receive_window_is_independent_of_peer_mss() {
         for active in [false, true] {
-            let mut s = receive_window_socket(9000, 65536);
-            let window = open_receive_window(&mut s, active, Some(48));
-            assert_eq!(s.rx_mbuf_cap, 8);
-            assert_eq!(s.remote_win_shift, 1);
-            assert_eq!(window, if active { 192 } else { 384 });
-            let ack = receive_window_segment(&mut s, 0, b"a");
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 2));
-            assert_eq!(ack.window_len, 192);
-            assert_eq!(ack.ack_number.unwrap() + (usize::from(ack.window_len) << 1),
-                REMOTE_SEQ + 1 + 385);
-            assert_eq!(s.rx_seg_bytes, 48);
-            assert_eq!(s.rx_refused_segments(), 0);
-        }
-    }
-
-    #[test]
-    fn active_syn_window_is_bounded_before_peer_mss_is_known() {
-        let mut s = receive_window_socket(9000, 65536);
-        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
-        recv(&mut s, Instant::ZERO, |result| {
-            let syn = result.unwrap();
-            assert_eq!(syn.window_len, 384);
-            assert_eq!(syn.max_seg_size, Some(8960));
-        });
-        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1).mss(48).wscale(1));
-        assert!(s.remote_last_ack_is_marker);
-        // The peer SYN sequence is not an ACK we sent, so it cannot preserve the SYN window.
-        assert_eq!(s.last_scaled_window(), None);
-        recv(&mut s, Instant::ZERO, |result| {
-            assert_eq!(result.unwrap().window_len, 192);
-        });
-        assert!(!s.remote_last_ack_is_marker);
-    }
-
-    #[test]
-    fn jumbo_receive_window_uses_peer_mss_at_every_ack() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(9000, 32768);
-            let window = open_receive_window(&mut s, active, Some(1460));
-            assert_eq!(window, 6 * 1460);
-            for index in 0..6 {
-                let ack = receive_window_segment(&mut s, index * 1460, &[0; 1460]);
-                let available = (6 - s.rx_buffer.store.held()) * 1460;
-                assert_eq!(usize::from(ack.window_len), available);
-                assert_eq!(s.rx_seg_bytes, 1460);
-                assert_eq!(s.rx_mbuf_cap, 6);
-                assert_eq!(s.rx_refused_segments(), 0);
+            for peer_mss in [Some(48), None, Some(1460), Some(9000)] {
+                let mut s = receive_window_socket(9000, 32768);
+                assert_eq!(open_receive_window(&mut s, active, peer_mss), 32768);
+                let ack = receive_window_segment(&mut s, 0, b"abc");
+                assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 4));
+                assert_eq!(ack.window_len, 32768);
+                assert_eq!(drain_bytes(&mut s), b"abc");
             }
         }
     }
 
     #[test]
-    fn out_of_order_receive_window_excludes_reserved_frame() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(9000, 32768);
-            assert_eq!(open_receive_window(&mut s, active, Some(1460)), 8760);
-            assert_eq!(s.rx_mbuf_cap, 6);
-            assert_eq!(s.rx_seg_bytes, 1460);
-            let payload = [0xa5; 1460];
-            for index in 1..=5 {
-                let offset = index * payload.len();
-                assert!(offset + payload.len() <= s.remote_last_win_bytes as usize);
-                let ack = receive_window_segment(&mut s, offset, &payload);
-                assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-                assert_eq!(s.rx_buffer.store.held(), index);
-                assert_eq!(s.rx_buffer.store.out_of_order_len(), index * 1460);
-                // The span includes the 1460-byte hole; the reserve adds no room past it.
-                assert_eq!(s.recv_room(), 8760);
-                assert_eq!(s.scaled_window_with_last(None), 8760);
-                assert_eq!(ack.window_len, 8760);
-                assert_eq!(s.rx_refused_segments(), 0);
-                let duplicate = receive_window_segment(&mut s, offset, &payload);
-                assert_eq!(duplicate.ack_number, ack.ack_number);
-                assert_eq!(duplicate.window_len, ack.window_len);
-                assert_eq!(s.rx_buffer.store.held(), index);
-                assert_eq!(s.rx_refused_segments(), 0);
-            }
-            let ack = receive_window_segment(&mut s, 8760, &[0x5a; 648]);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-            assert_eq!(ack.window_len, 8760);
-            assert_eq!(s.rx_buffer.store.held(), 5);
-            assert_eq!(s.rx_refused_segments(), 0);
-
-            let ack = receive_window_segment(&mut s, 0, &payload);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 8760));
-            assert_eq!(ack.window_len, 0);
-            assert_eq!(s.rx_buffer.store.held(), 6);
-            assert_eq!(s.rx_buffer.store.out_of_order_len(), 0);
-            assert_eq!(s.rx_refused_segments(), 0);
-            let output = drain_bytes(&mut s);
-            assert_eq!(output.len(), 8760);
-            assert_eq!(output, [0xa5; 8760]);
-            assert_eq!(s.recv_room(), 8760);
-        }
-    }
-
-    #[test]
-    fn out_of_order_receive_window_reaches_last_view_plus_free_frames() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(9000, 32768);
-            assert_eq!(open_receive_window(&mut s, active, Some(1460)), 8760);
-            let payload = [0xa5; 1460];
-            receive_window_segment(&mut s, 0, &payload);
-            let prefix = drain_bytes(&mut s);
-            assert_eq!(prefix.len(), 1460);
-            assert_eq!(prefix, payload);
-            for index in 2..=3 {
-                let ack = receive_window_segment(&mut s, index * 1460, &payload);
-                assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1460));
-                assert_eq!(s.rx_buffer.store.held(), index - 1);
-            }
-            // RCV.NXT is 1460, the last view ends at 5840, and three free frames
-            // remain beyond the reserve: (5840 - 1460) + 3 * 1460 = 8760.
-            assert_eq!(s.recv_room(), 8760);
-            assert_eq!(s.remote_last_ack.unwrap() + s.remote_last_win_bytes as usize,
-                REMOTE_SEQ + 1 + 10220);
-            for index in 4..=6 {
-                let offset = index * 1460;
-                assert!(REMOTE_SEQ + 1 + offset + payload.len()
-                    <= s.remote_last_ack.unwrap() + s.remote_last_win_bytes as usize);
-                let ack = receive_window_segment(&mut s, offset, &payload);
-                assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1460));
-                assert_eq!(ack.window_len, 8760);
-                assert_eq!(s.rx_refused_segments(), 0);
-            }
-            assert_eq!(s.rx_buffer.store.held(), 5);
-            let ack = receive_window_segment(&mut s, 1460, &payload);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 10220));
-            assert_eq!(ack.window_len, 0);
-            assert_eq!(s.rx_buffer.store.held(), 6);
-            assert_eq!(s.rx_refused_segments(), 0);
-            let output = drain_bytes(&mut s);
-            assert_eq!(output.len(), 8760);
-            assert_eq!(output, [0xa5; 8760]);
-            assert_eq!(s.recv_room(), 8760);
-        }
-    }
-
-    #[test]
-    fn multi_hole_receive_window_keeps_both_hole_frames() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(9000, 32768);
-            assert_eq!(open_receive_window(&mut s, active, Some(1460)), 8760);
-            let payload = [0xa5; 1460];
-            for index in [1, 3, 4, 5] {
-                let ack = receive_window_segment(&mut s, index * 1460, &payload);
-                assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-                assert_eq!(s.recv_room(), 8760);
-                assert_eq!(ack.window_len, 8760);
-                assert_eq!(s.rx_refused_segments(), 0);
-            }
-            assert_eq!(s.rx_buffer.store.held(), 4);
-            // Segment 6 starts at the right edge, leaving frames for holes 0 and 2.
-            let ack = receive_window_segment(&mut s, 6 * 1460, &payload);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-            assert_eq!(ack.window_len, 8760);
-            assert_eq!(s.rx_buffer.store.held(), 4);
-            assert_eq!(s.rx_refused_segments(), 0);
-
-            // Fill the later hole first while the front frame remains reserved.
-            let ack = receive_window_segment(&mut s, 2 * 1460, &payload);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-            assert_eq!(ack.window_len, 8760);
-            assert_eq!(s.rx_buffer.store.held(), 5);
-            assert_eq!(s.rx_refused_segments(), 0);
-            let ack = receive_window_segment(&mut s, 0, &payload);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 8760));
-            assert_eq!(ack.window_len, 0);
-            assert_eq!(s.rx_buffer.store.held(), 6);
-            assert_eq!(s.rx_refused_segments(), 0);
-            let output = drain_bytes(&mut s);
-            assert_eq!(output.len(), 8760);
-            assert_eq!(output, [0xa5; 8760]);
-            assert_eq!(s.recv_room(), 8760);
-            recv(&mut s, Instant::ZERO, |result| {
-                let ack = result.unwrap();
-                assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 8760));
-                assert_eq!(ack.window_len, 8760);
-            });
-            let ack = receive_window_segment(&mut s, 6 * 1460, &payload);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 10220));
-            assert_eq!(s.recv_queue(), 1460);
-            assert_eq!(s.rx_refused_segments(), 0);
-        }
-    }
-
-    #[test]
-    fn two_segment_hole_window_stores_every_in_window_segment() {
-        // Six frames of 1460 bytes; the app holds nothing. Segments 0 and 1 are lost.
-        let mut s = receive_window_socket(9000, 32768);
-        assert_eq!(open_receive_window(&mut s, true, Some(1460)), 8760);
-        let payload = [0xa5; 1460];
-        let edge = |s: &TestSocket| s.remote_last_ack.unwrap() + s.remote_last_win_bytes as usize;
-        for index in [2, 3, 4, 5, 0, 1] {
-            // A one-frame-per-gap charge grew the right edge to segment 7 (byte 10220).
-            assert_eq!(edge(&s), REMOTE_SEQ + 1 + 8760, "before segment {index}");
-            receive_window_segment(&mut s, index * 1460, &payload);
-            assert_eq!(s.rx_buffer.shared.held.get(), 0);
-            assert_eq!(
-                s.rx_refused_segments(), 0,
-                "full-size segment {index} inside the advertised window was refused \
-                 (store holds {} of {} frames)",
-                s.rx_buffer.store.held(), s.rx_mbuf_cap,
-            );
-        }
-        assert_eq!(s.recv_queue(), 8760);
-    }
-
-    #[test]
-    fn gap_of_k_segments_costs_k_frames_and_one_more_byte_costs_another() {
-        // Six frames of 1460 bytes; one out-of-order segment after a gap.
-        for (gap, window) in [(2 * 1460, 8760), (2 * 1460 + 1, 5 * 1460 + 1)] {
-            let mut s = receive_window_socket(9000, 32768);
-            assert_eq!(open_receive_window(&mut s, true, Some(1460)), 8760);
-            receive_window_segment(&mut s, gap, &[0xa5; 1460]);
-            assert_eq!(s.rx_buffer.store.out_of_order_hole_frames(1460), gap.div_ceil(1460));
-            assert_eq!(s.recv_window(), window, "gap {gap}");
-        }
-    }
-
-    #[test]
-    fn out_of_order_receive_window_includes_812_byte_hole() {
-        let mut s = receive_window_socket(9000, 32768);
-        assert_eq!(open_receive_window(&mut s, true, Some(1460)), 8760);
-        receive_window_segment(&mut s, 0, &[0xa5; 648]);
-        let prefix = drain_bytes(&mut s);
-        assert_eq!(prefix.len(), 648);
-        assert_eq!(prefix, [0xa5; 648]);
-        for index in 1..=5 {
-            let ack = receive_window_segment(&mut s, index * 1460, &[0xa5; 1460]);
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 648));
-            // The span is 812 + index * 1460, with (5 - index) free frames
-            // beyond the reserve: 812 + 5 * 1460 = 8112.
-            assert_eq!(s.recv_room(), 8112);
-            assert_eq!(ack.window_len, 8112);
-            assert_eq!(s.rx_buffer.store.held(), index);
-            assert_eq!(s.rx_refused_segments(), 0);
-        }
-        let ack = receive_window_segment(&mut s, 8760, &[0x5a; 648]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 648));
-        assert_eq!(ack.window_len, 8112);
-        assert_eq!(s.rx_buffer.store.held(), 5);
-        assert_eq!(s.rx_refused_segments(), 0);
-        let ack = receive_window_segment(&mut s, 648, &[0xa5; 812]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 8760));
-        assert_eq!(ack.window_len, 0);
-        assert_eq!(s.rx_refused_segments(), 0);
-        let output = drain_bytes(&mut s);
-        assert_eq!(output.len(), 8112);
-        assert_eq!(output, [0xa5; 8112]);
-        assert_eq!(s.recv_room(), 8760);
-    }
-
-    #[test]
-    fn out_of_order_receive_window_with_no_free_frames() {
-        let mut s = receive_window_socket(9000, 32768);
-        assert_eq!(open_receive_window(&mut s, true, Some(1460)), 8760);
-        for index in 1..=5 {
-            receive_window_segment(&mut s, index * 1460, &[0xa5; 1460]);
-        }
-        let ack = receive_window_segment(&mut s, 0, &[0xa5; 812]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 812));
-        assert_eq!(ack.window_len, 7948);
-        assert_eq!(s.rx_buffer.store.held(), 6);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 7300);
-        // The last view ends 648 + 7300 bytes beyond RCV.NXT; no free frame adds room.
-        assert_eq!(s.recv_room(), 7948);
-        assert_eq!(s.rx_refused_segments(), 0);
-        let prefix = drain_bytes(&mut s);
-        assert_eq!(prefix.len(), 812);
-        assert_eq!(prefix, [0xa5; 812]);
-        assert_eq!(s.rx_buffer.store.held(), 5);
-        assert_eq!(s.recv_room(), 7948);
-        let ack = receive_window_segment(&mut s, 812, &[0xa5; 648]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 8760));
-        assert_eq!(ack.window_len, 0);
-        assert_eq!(s.rx_refused_segments(), 0);
-        let output = drain_bytes(&mut s);
-        assert_eq!(output.len(), 7948);
-        assert_eq!(output, [0xa5; 7948]);
-        assert_eq!(s.recv_room(), 8760);
-    }
-
-    #[test]
-    fn receive_window_without_hole_keeps_all_free_frames() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(9000, 32768);
-            assert_eq!(open_receive_window(&mut s, active, Some(1460)), 8760);
-            assert_eq!(s.recv_room(), 8760);
-            for index in 0..6 {
-                let ack = receive_window_segment(&mut s, index * 1460, &[0; 1460]);
-                let available = (5 - index) * 1460;
-                assert_eq!(s.rx_buffer.store.out_of_order_len(), 0);
-                assert_eq!(s.recv_room(), available);
-                assert_eq!(usize::from(ack.window_len), available);
-                assert_eq!(s.rx_refused_segments(), 0);
-            }
-            assert_eq!(drain_bytes(&mut s), vec![0; 8760]);
-            assert_eq!(s.recv_room(), 8760);
-        }
-    }
-
-    #[test]
-    fn peer_mss_above_ours_keeps_known_peer_window_numbers() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(1500, 4096);
-            assert_eq!(open_receive_window(&mut s, active, Some(9000)), 4096);
-            assert_eq!(s.rx_seg_bytes, u32::from(BASE_MSS));
-            let ack = receive_window_segment(&mut s, 0, &[0; 1460]);
-            assert_eq!(ack.window_len, 4096);
-            assert_eq!(s.rx_refused_segments(), 0);
-        }
-    }
-
-    #[test]
-    fn missing_or_zero_peer_mss_receive_window_survives_reconnect() {
-        for active in [false, true] {
-            let mut s = receive_window_socket(9000, 32768);
-            for peer_mss in [Some(48), None, Some(0), Some(1460)] {
-                let bytes = match peer_mss {
-                    Some(48) => 48,
-                    Some(1460) => 1460,
-                    _ => 536,
-                };
-                assert_eq!(usize::from(open_receive_window(&mut s, active, peer_mss)), 6 * bytes);
-                assert_eq!(s.rx_seg_bytes as usize, bytes);
-                let ack = receive_window_segment(&mut s, 0, &vec![0; bytes]);
-                assert_eq!(usize::from(ack.window_len), 5 * bytes);
-                assert_eq!(s.rx_mbuf_cap, 6);
-                assert_eq!(s.rx_refused_segments(), 0);
-                s.abort();
-                recv(&mut s, Instant::ZERO, |result| {
-                    assert_eq!(result.unwrap().control, TcpControl::Rst);
-                });
-            }
-        }
+    fn receive_window_reorders_segments_and_rejects_outside_edge() {
+        let mut s = receive_window_socket(1500, 6);
+        assert_eq!(open_receive_window(&mut s, true, Some(BASE_MSS)), 6);
+        let ack = receive_window_segment(&mut s, 3, b"def");
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
+        assert_eq!(ack.window_len, 6);
+        let ack = receive_window_segment(&mut s, 6, b"x");
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
+        let ack = receive_window_segment(&mut s, 0, b"abc");
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 7));
+        assert_eq!(ack.window_len, 6);
+        assert_eq!(drain_bytes(&mut s), b"abcdef");
     }
 
     fn connect_with_mss_cap(s: &mut TestSocket, advertised_mss: u16, peer_mss: u16) {
@@ -4609,78 +4070,6 @@ mod test {
         assert_eq!(s.state(), State::Established);
     }
 
-    #[test]
-    fn capped_receive_window_tracks_available_frames() {
-        for (cap, frames, bytes) in [(Some(512), 8, 512), (None, 6, 1460)] {
-            let mut s = socket_with_buffer_sizes(4096, 4096);
-            s.set_mss_cap(cap);
-            let mss = cap.unwrap_or(BASE_MSS);
-            connect_with_mss_cap(&mut s, mss, BASE_MSS);
-            let payload = vec![0xa5; mss as usize];
-            for index in 0..2 {
-                send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1 + index * payload.len()).ack(LOCAL_SEQ + 1)
-                    .data(&payload));
-                recv(&mut s, Instant::ZERO, |result| {
-                    let ack = result.unwrap();
-                    assert_eq!(ack.window_len as usize, 4096usize
-                        .min((frames - index - 1) * bytes));
-                });
-            }
-            assert_eq!(s.rx_mbuf_cap as usize, frames);
-            assert_eq!(s.rx_seg_bytes as usize, bytes);
-            assert_eq!(s.rx_buffer.store.held(), 2);
-        }
-    }
-
-    #[test]
-    fn capped_receive_allowance_is_known_at_handshake() {
-        for active in [true, false] {
-            let mut s = socket_with_buffer_sizes(4096, 4096);
-            s.set_mss_cap(Some(512));
-            if active {
-                s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
-            } else {
-                s.listen(LISTEN_END).unwrap();
-                send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
-            }
-            recv(&mut s, Instant::ZERO, |result| {
-                let syn = result.unwrap();
-                assert_eq!(syn.control, TcpControl::Syn);
-                assert_eq!(syn.max_seg_size, Some(512));
-                // Active SYN: 8 frames x 48 B; passive SYN-ACK: 8 x 512 B.
-                assert_eq!(syn.window_len, if active { 384 } else { 4096 });
-            });
-            assert_eq!(s.rx_mbuf_cap, 8);
-            assert_eq!(s.rx_seg_bytes, 512);
-        }
-    }
-
-    #[test]
-    fn receive_mbuf_budget_uses_configured_mss_cap_at_jumbo_mtu() {
-        let mut s = socket_with_buffer_sizes(4096, 32768);
-        assert_eq!(s.rx_mbuf_budget(9000), 6);
-        s.set_mss_cap(Some(1460));
-        assert_eq!(s.rx_mbuf_budget(9000), 23);
-        assert_eq!(s.rx_mbuf_budget(1500), 23);
-        s.set_mss_cap(Some(9000));
-        assert_eq!(s.rx_mbuf_budget(9000), 6);
-    }
-
-    #[test]
-    fn standalone_receive_frame_count_fixed_at_first_handshake() {
-        let mut s = socket_with_buffer_sizes(4096, 4096);
-        for (cap, frames, bytes) in [(Some(512), 8, 512), (Some(256), 8, 256), (None, 8, 1460)] {
-            s.set_mss_cap(cap);
-            connect_with_mss_cap(&mut s, cap.unwrap_or(BASE_MSS), BASE_MSS);
-            assert_eq!(s.rx_mbuf_cap, frames);
-            assert_eq!(s.rx_seg_bytes, bytes);
-            assert_eq!(s.recv_room(), 4096.min(8 * bytes as usize));
-            s.abort();
-            recv(&mut s, Instant::ZERO, |result| {
-                assert_eq!(result.unwrap().control, TcpControl::Rst);
-            });
-        }
-    }
 
     #[test]
     fn recv_frames_carry_arrival_timestamps_in_order() {
@@ -4710,129 +4099,6 @@ mod test {
         assert_eq!(s.recv_queue(), 0);
     }
 
-    #[test]
-    #[should_panic(expected = "socket admitted while the app still holds its received frames")]
-    fn admission_with_app_held_frame_panics() {
-        let mut s = socket_established();
-        receive_window_segment(&mut s, 0, b"abc");
-        let _frame = s.recv().unwrap().unwrap();
-        s.abort();
-        s.set_rx_mbuf_budget(1500);
-    }
-
-    #[test]
-    fn admission_after_received_frame_dropped() {
-        let mut s = socket_established();
-        receive_window_segment(&mut s, 0, b"abc");
-        let frame = s.recv().unwrap().unwrap();
-        assert_eq!(s.rx_buffer.shared.held.get(), 1);
-        drop(frame);
-        s.abort();
-        s.set_rx_mbuf_budget(1500);
-        assert_eq!(s.rx_buffer.shared.held.get(), 0);
-        assert_eq!(s.rx_frame_cap(), s.rx_mbuf_budget(1500));
-        assert_eq!(s.recv_room(), s.recv_capacity());
-    }
-
-    #[test]
-    fn recv_room_zero_until_accepted_syn() {
-        let mut s = socket();
-        assert_eq!(s.rx_frame_cap(), 0);
-        assert_eq!(s.recv_room(), 0);
-        s.listen(LISTEN_END).unwrap();
-        assert_eq!(s.rx_frame_cap(), 0);
-        assert_eq!(s.recv_room(), 0);
-        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
-        assert_eq!(s.state(), State::SynReceived);
-        let room = s.recv_room();
-        assert!(room > 0);
-        recv(&mut s, Instant::ZERO, |result| {
-            let syn_ack = result.unwrap();
-            assert_eq!(syn_ack.control, TcpControl::Syn);
-            assert_eq!(syn_ack.ack_number, Some(REMOTE_SEQ + 1));
-            assert_eq!(usize::from(syn_ack.window_len), room);
-        });
-        assert_eq!(s.recv_room(), room);
-    }
-
-    #[test]
-    fn closed_socket_cap_lowered_after_admission_keeps_rx_frame_count() {
-        let mut s = socket_with_buffer_sizes(64, 4096);
-        assert_eq!(s.state(), State::Closed);
-        s.set_mss_cap(Some(100));
-        let budget = s.rx_mbuf_budget(1500);
-        s.set_rx_mbuf_budget(1500);
-        s.set_mss_cap(Some(64));
-        assert_eq!(s.rx_mbuf_cap as usize, budget);
-        s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
-        assert_eq!(s.state(), State::SynSent);
-        assert_eq!(s.rx_frame_cap(), budget);
-    }
-
-    #[test]
-    fn cap_lowered_after_admission_keeps_frame_count_across_connections() {
-        for active in [true, false] {
-            let mut s = socket_with_buffer_sizes(4096, 4096);
-            assert_eq!(s.rx_mbuf_budget(1500), 6);
-            s.set_rx_mbuf_budget(1500);
-            for cap in [512, 256] {
-                s.set_mss_cap(Some(cap));
-                if active {
-                    s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END).unwrap();
-                } else {
-                    s.listen(LISTEN_END).unwrap();
-                    send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
-                }
-                s.set_mss_cap(Some(128));
-                recv(&mut s, Instant::ZERO, |result| {
-                    let syn = result.unwrap();
-                    assert_eq!(syn.control, TcpControl::Syn);
-                    assert_eq!(syn.max_seg_size, Some(cap));
-                    // Active SYN: 6 frames x 48 B; passive SYN-ACK: 6 x cap.
-                    assert_eq!(syn.window_len, if active { 288 } else { 6 * cap });
-                });
-                if active {
-                    send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1).mss(BASE_MSS));
-                    recv(&mut s, Instant::ZERO, |result| {
-                        assert_eq!(result.unwrap().window_len, 6 * cap);
-                    });
-                } else {
-                    send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
-                }
-                let payload = vec![0xa5; cap as usize];
-                send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&payload));
-                recv(&mut s, Instant::ZERO, |result| {
-                    assert_eq!(result.unwrap().window_len, 5 * cap);
-                });
-                assert_eq!(s.rx_mbuf_cap, 6);
-                assert_eq!(s.rx_seg_bytes, u32::from(cap));
-                assert_eq!(s.rx_buffer.store.held(), 1);
-                s.abort();
-                recv(&mut s, Instant::ZERO, |result| {
-                    assert_eq!(result.unwrap().control, TcpControl::Rst);
-                });
-            }
-        }
-    }
-
-    #[test]
-    fn closed_and_listening_readmission_uses_configured_cap() {
-        for listening in [true, false] {
-            let mut s = socket_with_buffer_sizes(4096, 4096);
-            s.set_mss_cap(Some(512));
-            s.set_rx_mbuf_budget(1500);
-            if listening {
-                s.listen(LISTEN_END).unwrap();
-            }
-            for (cap, frames, bytes) in [(Some(256), 16, 256), (None, 6, 1460)] {
-                s.set_mss_cap(cap);
-                assert_eq!(s.rx_mbuf_budget(1500), frames);
-                s.set_rx_mbuf_budget(1500);
-                assert_eq!(s.rx_mbuf_cap as usize, frames);
-                assert_eq!(s.rx_seg_bytes, bytes);
-            }
-        }
-    }
 
     fn send_mss_cap_payload(s: &mut TestSocket, mss: usize) {
         let data = vec![0xa5; mss * 2];
@@ -5003,7 +4269,6 @@ mod test {
         s.remote_win_len = 256;
         s.max_snd_wnd = 256;
         s.remote_win_seq = REMOTE_SEQ;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s
     }
 
@@ -5033,48 +4298,18 @@ mod test {
         s
     }
 
-    fn hold_rx_frames(s: &mut TestSocket, count: usize) -> Vec<TcpFrame> {
-        let ack_delay = s.ack_delay();
-        s.set_ack_delay(None);
-        let mut frames = Vec::new();
-        for _ in 0..count {
-            let next = s.remote_seq_no;
-            let peer_window = u16::try_from(s.remote_win_len).unwrap();
-            assert_eq!(send(s, Instant::ZERO, &SEND_TEMPL.seq(next).ack(LOCAL_SEQ + 1)
-                .win(peer_window).data(b"x")), None);
-            recv(s, Instant::ZERO, |result| {
-                let ack = result.unwrap();
-                assert_eq!(ack.ack_number, Some(next + 1));
-                assert!(ack.payload.is_empty());
-            });
-            frames.push(s.recv().unwrap().unwrap());
-            assert_eq!(frames.last().unwrap().payload(), b"x");
-        }
-        s.set_ack_delay(ack_delay);
-        assert_eq!(s.recv_queue(), 0);
-        assert_eq!(s.rx_buffer.shared.held.get(), frames.len());
-        frames
-    }
-
-    fn socket_with_held_rx_frames(
-        rx_len: usize,
-        next: TcpSeqNumber,
-        count: usize,
-    ) -> (TestSocket, Vec<TcpFrame>) {
+    fn socket_with_closing_receive_window(rx_len: usize, next: TcpSeqNumber) -> TestSocket {
         let mut s = socket_established_with_buffer_sizes(64, rx_len);
-        s.remote_seq_no = next - count;
-        s.remote_last_ack = Some(next - count);
-        let frames = hold_rx_frames(&mut s, count);
-        assert_eq!(s.remote_seq_no, next);
-        (s, frames)
+        s.remote_seq_no = next;
+        s.remote_last_ack = Some(next);
+        // The peer may still send the bytes already advertised before the window closed.
+        s.rx_buffer.capacity = 0;
+        s
     }
 
-    fn socket_with_mbuf_window(shift: u8) -> TestSocket {
+    fn socket_with_scaled_window(shift: u8) -> TestSocket {
         let mut s = socket_established_with_buffer_sizes(64, 65536);
         assert_eq!(s.cx.ip_mtu(), 1500);
-        // This peer advertises MSS 1460; the frame-budget tests use that allowance.
-        s.remote_mss = BASE_MSS;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.remote_win_shift = shift;
         s.remote_last_win_bytes = u32::from(u16::try_from(65536usize >> shift).unwrap_or(u16::MAX)) << shift;
         s
@@ -5108,23 +4343,20 @@ mod test {
 
     #[test]
     fn window_to_update_matches_full_window_check() {
-        // [byte window below twice the last window, doubling only in bytes, doubling]
-        let mut kinds = [0usize; 3];
+        let mut kinds = [0usize; 2];
         for shift in [0u8, 3] {
-            for (in_order, out_of_order, cap) in [
-                (0, 0, 4),
-                (6, 0, 4),
-                (6, 4, 4),
-                (2, 0, 3),
-                (40, 0, 8),
+            for (in_order, out_of_order) in [
+                (0, 0),
+                (6, 0),
+                (6, 4),
+                (2, 0),
+                (40, 0),
             ] {
                 let mut s = socket_established_with_buffer_sizes(64, 64);
                 s.remote_win_shift = shift;
-                s.rx_mbuf_cap = cap;
-                s.rx_seg_bytes = 10;
                 for (offset, len) in [(0, in_order), (in_order + 5, out_of_order)] {
                     if len > 0 {
-                        let decision = s.rx_buffer.store.decide(offset, len, 8);
+                        let decision = s.rx_buffer.store.decide(offset, len);
                         s.rx_buffer.store.place(offset, decision);
                         s.rx_buffer.store.attach(RxBuf::from_vec(vec![0; len]));
                     }
@@ -5140,14 +4372,9 @@ mod test {
                     assert_eq!(
                         s.window_to_update(),
                         expected,
-                        "shift {shift}, held {in_order}+{out_of_order}, cap {cap}, last {last}"
+                        "shift {shift}, held {in_order}+{out_of_order}, last {last}"
                     );
-                    let kind = if (s.rx_buffer.capacity >> shift) / 2 < usize::from(last_window) {
-                        0
-                    } else {
-                        1 + usize::from(expected)
-                    };
-                    kinds[kind] += 1;
+                    kinds[usize::from(expected)] += 1;
                 }
             }
         }
@@ -5157,163 +4384,6 @@ mod test {
         assert!(!s.window_to_update());
     }
 
-    #[test]
-    fn rx_wake_at_held_is_the_largest_held_count_with_window_update() {
-        // [no held count updates, some do]
-        let mut kinds = [0usize; 2];
-        for shift in [0u8, 3, 7] {
-            // (RX capacity, in-order bytes, out-of-order pieces x bytes, frame cap, segment bytes)
-            for (capacity, in_order, (pieces, out_of_order), cap, seg) in [
-                (64, 0, (0, 0), 8, 10),
-                (200, 6, (0, 0), 16, 10),
-                (200, 6, (1, 4), 16, 10),
-                (200, 40, (0, 0), 12, 10),
-                (1000, 3, (2, 20), 40, 10),
-                (1000, 3, (2, 20), 40, 4),
-                (1000, 3, (2, 20), 40, 10),
-                (1 << 24, 0, (1, 30), 1000, 1460),
-            ] {
-                let mut s = socket_established_with_buffer_sizes(64, capacity);
-                s.remote_win_shift = shift;
-                s.rx_mbuf_cap = cap;
-                s.rx_seg_bytes = seg;
-                let mut offset = 0;
-                for len in core::iter::once(in_order).chain(core::iter::repeat_n(out_of_order, pieces)) {
-                    if len > 0 {
-                        let decision = s.rx_buffer.store.decide(offset, len, 8);
-                        s.rx_buffer.store.place(offset, decision);
-                        s.rx_buffer.store.attach(RxBuf::from_vec(vec![0; len]));
-                    }
-                    offset += len + 5;
-                }
-                // Each gap is 5 bytes.
-                assert_eq!(
-                    s.rx_buffer.store.out_of_order_hole_frames(seg as usize),
-                    pieces * 5usize.div_ceil(seg as usize)
-                );
-                s.remote_last_ack = Some(s.remote_seq_no);
-                let unstored = cap as usize - s.rx_buffer.store.held();
-                let lasts = (0..=200u32).chain([16383, 16384, 32766, 32767, 32768]);
-                for last in lasts.filter(|&last| (last as usize) << shift <= capacity) {
-                    s.remote_last_win_bytes = last << shift;
-                    s.rx_buffer.shared.held.set(unstored);
-                    let wake_at = s.rx_wake_at_held();
-                    for held in 0..=unstored {
-                        s.rx_buffer.shared.held.set(held);
-                        assert_eq!(
-                            s.window_to_update(),
-                            wake_at != usize::MAX && held <= wake_at,
-                            "shift {shift}, capacity {capacity}, stored {in_order}+{pieces}x{out_of_order}, \
-                             cap {cap}, seg {seg}, last {last}, held {held}, wake_at {wake_at}"
-                        );
-                    }
-                    kinds[usize::from(wake_at != usize::MAX)] += 1;
-                }
-                s.rx_buffer.shared.held.set(0);
-                assert_eq!(s.rx_wake_at_held(), usize::MAX);
-            }
-        }
-        assert!(kinds.iter().all(|&count| count > 0), "{kinds:?}");
-    }
-
-    /// Drained wakes: handles pushed since the last drain.
-    fn drain_wakes(queue: &crate::iface::DropQueue) -> Vec<crate::iface::SocketHandle> {
-        let mut wakes = Vec::new();
-        queue.drain_into(&mut Vec::new(), &mut Vec::new(), &mut wakes);
-        wakes
-    }
-
-    /// Every frame held, the last ACK advertised a zero window, and a quiet poll_at armed the
-    /// wake at one frame below the cap. Returns the socket, its frames and the next peer seq.
-    fn zero_window_with_wake(
-        queue: &crate::iface::DropQueue,
-        handle: crate::iface::SocketHandle,
-    ) -> (TestSocket, Vec<TcpFrame>, TcpSeqNumber) {
-        let seq = REMOTE_SEQ + 1 + 5;
-        let (mut s, mut frames) = socket_with_held_rx_frames(3, seq, 5);
-        s.set_rx_wake(queue.clone(), handle);
-        send!(s, SEND_TEMPL.seq(seq).ack(LOCAL_SEQ + 1).data(&b"abc"[..]));
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(seq + 3).win(0)]);
-        frames.push(s.recv().unwrap().unwrap());
-        assert_eq!(frames.len(), s.rx_frame_cap());
-        assert_ne!(s.socket.poll_at(), PollAt::Now);
-        assert_eq!(s.rx_buffer.shared.wake_at_held.get(), frames.len() - 1);
-        (s, frames, seq + 3)
-    }
-
-    #[test]
-    fn add_admitted_registers_frame_drop_wake() {
-        let mut set = crate::iface::TcpSet::new(64);
-        let queue = crate::iface::DropQueue::with_capacity(1, 0);
-        let handle = set.add_admitted(
-            &Config { rx_capacity: 64, tx_capacity: 64, mss_cap: None },
-            1500,
-            crate::tests::tx_test_source(1460),
-            queue.clone(),
-        );
-        let shared = set.get(handle).rx_buffer.shared.clone();
-        let wake = shared.wake.borrow();
-        assert_eq!(wake.as_ref().map(|(_, handle)| *handle), Some(handle));
-        assert!(wake.as_ref().unwrap().0.same(&queue));
-    }
-
-    #[test]
-    fn remove_clears_frame_drop_wake() {
-        let mut set = crate::iface::TcpSet::new(64);
-        let placeholder = set.add(Socket::test_socket(64, 64));
-        let queue = crate::iface::DropQueue::with_capacity(2, 0);
-        let (s, mut frames, _) = zero_window_with_wake(&queue, placeholder);
-        let handle = set.add(s.socket);
-        set.get_mut(handle).set_rx_wake(queue.clone(), handle);
-        let held = set.remove(handle);
-        frames.pop();
-        assert!(drain_wakes(&queue).is_empty(), "removed socket must not queue a wake");
-        assert_eq!(held.count(), frames.len());
-    }
-
-    #[test]
-    fn frame_drop_wakes_socket_only_when_window_update_becomes_due() {
-        let mut set = crate::iface::TcpSet::new(64);
-        let handle = set.add(Socket::test_socket(64, 64));
-        let queue = crate::iface::DropQueue::with_capacity(1, 0);
-
-        let (mut s, mut frames, _) = zero_window_with_wake(&queue, handle);
-        frames.pop();
-        assert!(s.window_to_update());
-        assert_eq!(drain_wakes(&queue), [handle]);
-        // Held back up to the cap (as a recv of a stored frame would) and down to the due
-        // count again before the wake was handled: the queued wake is not pushed twice.
-        let shared = s.rx_buffer.shared.clone();
-        shared.held.set(shared.held.get() + 1);
-        frames.pop();
-        assert_eq!(shared.held.get(), shared.wake_at_held.get());
-        assert!(drain_wakes(&queue).is_empty(), "one queued wake per socket");
-        shared.held.set(shared.held.get() - 1);
-        frames.pop();
-        assert!(drain_wakes(&queue).is_empty(), "drops past the due count push nothing");
-        s.clear_rx_wake_queued();
-        drop(frames);
-        assert!(drain_wakes(&queue).is_empty(), "drops past the due count push nothing");
-
-        // One frame held under a large window: dropping it cannot double the window.
-        let mut s = socket_established();
-        s.set_rx_wake(queue.clone(), handle);
-        let frames = hold_rx_frames(&mut s, 1);
-        assert_ne!(s.socket.poll_at(), PollAt::Now);
-        assert_eq!(s.rx_buffer.shared.wake_at_held.get(), usize::MAX);
-        drop(frames);
-        assert!(!s.window_to_update());
-        assert!(drain_wakes(&queue).is_empty());
-
-        // A segment after arming (here an RST, which closes the socket) disarms the wake
-        // until the next poll_at: the drop pushes nothing.
-        let (mut s, mut frames, next) = zero_window_with_wake(&queue, handle);
-        send!(s, SEND_TEMPL.rst().seq(next).no_ack());
-        assert_eq!(s.state, State::Closed);
-        assert_eq!(s.rx_buffer.shared.wake_at_held.get(), usize::MAX);
-        frames.pop();
-        assert!(drain_wakes(&queue).is_empty());
-    }
 
     #[test]
     fn poll_at_answers_now_for_due_ack_or_window_update() {
@@ -5329,7 +4399,7 @@ mod test {
         ] {
             let mut s = socket_established_with_buffer_sizes(64, 64);
             if unread > 0 {
-                let decision = s.rx_buffer.store.decide(0, unread, 8);
+                let decision = s.rx_buffer.store.decide(0, unread);
                 s.rx_buffer.store.place(0, decision);
                 s.rx_buffer.store.attach(RxBuf::from_vec(vec![0; unread]));
             }
@@ -5378,82 +4448,29 @@ mod test {
     }
 
     #[test]
-    fn window_counts_mbufs_when_segments_pack_poorly() {
-        let mut s = socket_with_mbuf_window(2);
-        let segment = [0; 1100];
-        for index in 0..20 {
-            let ack = receive_window_segment(&mut s, index * 1100, &segment);
-            assert_eq!(ack.window_len, ((65536 - (index + 1) * 1100) >> 2) as u16);
+    fn unread_data_crosses_sequence_wrap_and_successive_windows() {
+        let mut s = socket_established_with_buffer_sizes(64, 4096);
+        let bytes: Vec<u8> = (0..80000).map(|i| (i % 251) as u8).collect();
+        let first_ack = receive_window_segment(&mut s, 0, &bytes[..1000]);
+        assert_eq!(first_ack.ack_number, Some(REMOTE_SEQ + 1001));
+        assert_eq!(first_ack.window_len, 4096);
+        let held = s.recv().unwrap().unwrap();
+        assert_eq!(held.payload(), &bytes[..1000]);
+
+        for (index, chunk) in bytes[1000..].chunks(1000).enumerate() {
+            let offset = 1000 + index * 1000;
+            let ack = receive_window_segment(&mut s, offset, chunk);
+            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + offset + chunk.len()));
+            assert_eq!(ack.window_len, 4096);
         }
-        assert_eq!(s.rx_buffer.store.held(), 20);
-        assert_eq!(drain_frames(&mut s, 10), vec![0; 11000]);
-        assert_eq!(s.rx_buffer.store.held(), 10);
-        assert_eq!(s.recv_room(), 51100);
-        let ack = receive_window_segment(&mut s, 0, &segment);
-        assert_eq!(ack.window_len, 51100 >> 2);
-        assert!(usize::from(ack.window_len) < (65536 - s.recv_queue()) >> 2);
-        let promised_edge = ack.ack_number.unwrap() + (usize::from(ack.window_len) << 2);
-        for index in 20..55 {
-            let last = s.remote_last_ack.unwrap() + s.remote_last_win_bytes as usize;
-            let ack = receive_window_segment(&mut s, index * 1100, &segment);
-            assert_eq!(
-                ack.ack_number.unwrap() + (usize::from(ack.window_len) << 2),
-                last
-            );
-        }
-        assert_eq!(s.rx_buffer.store.held(), 45);
-        assert_eq!(s.recv_queue(), 49500);
-        assert_eq!(s.recv_room(), 0);
-        let ack = receive_window_segment(&mut s, 60500, &segment);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 60500));
-        assert_eq!(
-            ack.ack_number.unwrap() + (usize::from(ack.window_len) << 2),
-            promised_edge
-        );
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(drain_bytes(&mut s), vec![0; 49500]);
-        assert_eq!(s.rx_buffer.store.held(), 0);
-        let ack = receive_window_segment(&mut s, 0, &segment);
-        assert_eq!(ack.window_len, (65536usize >> 2) as u16);
-        assert!(ack.ack_number.unwrap() + (usize::from(ack.window_len) << 2) > promised_edge);
+        assert_eq!(s.recv_queue(), 79000);
+        assert_eq!(held.payload(), &bytes[..1000]);
+        assert_eq!(drain_bytes(&mut s), bytes[1000..]);
+        assert!(s.recv().unwrap().is_none());
+        drop(s);
+        assert_eq!(held.payload(), &bytes[..1000]);
     }
 
-    #[test]
-    fn full_mss_out_of_order_frames_keep_advertised_window() {
-        let mut s = socket_with_mbuf_window(2);
-        for index in 0..20 {
-            receive_window_segment(&mut s, index * 1100, &[0; 1100]);
-        }
-        assert_eq!(drain_frames(&mut s, 10), vec![0; 11000]);
-        let previous = receive_window_segment(&mut s, 0, &[0; 1100]);
-        assert_eq!(previous.ack_number, Some(REMOTE_SEQ + 1 + 22000));
-        for index in 1..=3 {
-            let ack = receive_window_segment(&mut s, 22000 + index * 1460, &[0; 1460]);
-            assert_eq!(ack.ack_number, previous.ack_number);
-            assert_eq!(ack.window_len, previous.window_len);
-        }
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 3 * 1460);
-        assert_eq!(s.rx_refused_segments(), 0);
-    }
-
-    #[test]
-    fn window_counts_ooo_bytes_inside_window() {
-        let mut s = socket_with_mbuf_window(2);
-        for index in 0..20 {
-            receive_window_segment(&mut s, index * 1100, &[0; 1100]);
-        }
-        assert_eq!(drain_frames(&mut s, 10), vec![0; 11000]);
-        let ack = receive_window_segment(&mut s, 24000, &[0; 500]);
-        assert_eq!(s.rx_buffer.store.held(), 11);
-        assert_eq!(s.recv_queue(), 11000);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 500);
-        // The span is 24500 - 22000, plus (45 - 11 - 2) * 1460 free-frame bytes: the
-        // 2000-byte gap needs two 1460-byte frames.
-        assert_eq!(s.recv_room(), 49220);
-        assert_eq!(ack.window_len, 49220 >> 2);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 22000));
-        assert_eq!(s.rx_refused_segments(), 0);
-    }
 
     /// While the RX pool is low, the socket processing a segment drops its own out-of-order
     /// frames and out-of-order FIN, refuses an out-of-order segment with an ACK at the in-order
@@ -5461,7 +4478,7 @@ mod test {
     /// again, and the resent gap delivers every byte in order.
     #[test]
     fn low_rx_pool_prunes_and_refuses_out_of_order_data() {
-        let mut s = socket_with_mbuf_window(2);
+        let mut s = socket_with_scaled_window(2);
         for index in 1..=3 {
             receive_window_segment(&mut s, index * 1100, &[index as u8; 1100]);
         }
@@ -5499,7 +4516,7 @@ mod test {
     fn low_rx_pool_refuses_out_of_order_fin_until_recovery() {
         let fin = |offset: usize| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + offset).ack(LOCAL_SEQ + 1)
             .data(&[1; 100]);
-        let mut s = socket_with_mbuf_window(2);
+        let mut s = socket_with_scaled_window(2);
         s.cx.rx_pool_low = true;
         send(&mut s, Instant::from_millis(0), &fin(1100));
         assert_eq!(s.rx_fin_seq, None);
@@ -5518,86 +4535,14 @@ mod test {
     }
 
     #[test]
-    fn right_edge_holds_across_unaligned_acks() {
-        let mut s = socket_with_mbuf_window(1);
-        for index in 0..20 {
-            receive_window_segment(&mut s, index * 1100, &[0; 1100]);
-        }
-        assert_eq!(drain_frames(&mut s, 10), vec![0; 11000]);
-        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 22000));
-        assert_eq!(ack.window_len, 25550);
-        let mut edge = ack.ack_number.unwrap() + (usize::from(ack.window_len) << 1);
-        assert_eq!(edge, REMOTE_SEQ + 1 + 73100);
-        for index in 0..3 {
-            let ack = receive_window_segment(&mut s, 22000 + index * 1101, &[0; 1101]);
-            assert_eq!(
-                ack.ack_number,
-                Some(REMOTE_SEQ + 1 + 22000 + (index + 1) * 1101)
-            );
-            let next_edge = ack.ack_number.unwrap() + (usize::from(ack.window_len) << 1);
-            assert!(next_edge >= edge);
-            assert_eq!(next_edge, REMOTE_SEQ + 1 + 73101 + index);
-            edge = next_edge;
-        }
-    }
-
-    #[test]
-    fn no_window_update_when_edge_unchanged_after_unaligned_fill() {
-        let mut s = socket_with_mbuf_window(1);
-        for index in 0..20 {
-            receive_window_segment(&mut s, index * 1100, &[0; 1100]);
-        }
-        assert_eq!(drain_frames(&mut s, 10), vec![0; 11000]);
-        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
-        let edge = ack.ack_number.unwrap() + (usize::from(ack.window_len) << 1);
-        assert_eq!(edge, REMOTE_SEQ + 1 + 73100);
-        for index in 0..34 {
-            receive_window_segment(&mut s, 22000 + index * 1460, &[0; 1460]);
-        }
-        assert_eq!(s.rx_buffer.store.held(), 44);
-        assert_eq!(s.recv_room(), 1460);
-        assert_eq!(
-            s.remote_last_ack.unwrap() + s.remote_last_win_bytes as usize,
-            edge
-        );
-
-        s.set_ack_delay(Some(Duration::from_millis(10)));
-        send!(
-            s,
-            time 100,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 71640).ack(LOCAL_SEQ + 1).data(&[0; 1459])
-        );
-        assert_eq!(s.remote_seq_no + s.recv_queue(), edge - 1);
-        assert_eq!(s.rx_buffer.store.held(), 45);
-        assert_eq!(s.recv_room(), 0);
-        assert!(s.rx_buffer.capacity >= 2);
-        assert_eq!(s.scaled_window(), 1);
-        assert!(!s.window_to_update());
-        assert_eq!(s.last_scaled_window(), Some(1));
-        assert_eq!(
-            s.ack_delay_timer(),
-            AckDelayTimer::Waiting(Instant::from_millis(110))
-        );
-        recv_nothing!(s, time 100);
-        recv_nothing!(s, time 109);
-        recv!(
-            s,
-            time 110,
-            Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(edge - 1).win(1))
-        );
-    }
-
-    #[test]
     fn right_edge_never_retracts_by_a_unit() {
         use rand::{Rng, SeedableRng, rngs::StdRng};
 
         let mut saw_ooo = false;
-        let mut saw_frame_bound = false;
         let mut reads = 0;
         for shift in 0..=2 {
             for seed in [1, 7, 0x12345678, 0xabcdef01] {
-                let mut s = socket_with_mbuf_window(shift);
+                let mut s = socket_with_scaled_window(shift);
                 let mut rng = StdRng::seed_from_u64(seed);
                 let mut edge = REMOTE_SEQ + 1 + s.remote_last_win_bytes as usize;
                 for index in 0..20 {
@@ -5608,7 +4553,6 @@ mod test {
                     edge = next_edge;
                 }
                 assert_eq!(drain_frames(&mut s, 10), vec![0; 11000]);
-                assert_eq!(s.recv_room(), 51100);
                 for _ in 0..1000 {
                     if rng.gen_ratio(1, 4) {
                         for _ in 0..rng.gen_range(0..=2) {
@@ -5629,116 +4573,20 @@ mod test {
                         ack.ack_number.unwrap() + (usize::from(ack.window_len) << shift);
                     assert!(next_edge >= edge, "seed {seed}, offset {offset}, len {len}");
                     edge = next_edge;
-                    assert!(s.rx_buffer.store.held() <= 45);
                     saw_ooo |= s.rx_buffer.store.out_of_order_len() > 0;
-                    saw_frame_bound |= s.recv_room() < 65536 - s.recv_queue();
                 }
             }
         }
         assert!(saw_ooo);
-        assert!(saw_frame_bound);
         assert!(reads > 0);
     }
 
-    #[test]
-    fn cap_refusal_sends_dup_ack_keeps_state() {
-        let mut s = socket_with_mbuf_window(2);
-        let cap = s.rx_mbuf_budget(s.cx.ip_mtu());
-        for index in 0..cap {
-            receive_window_segment(&mut s, index * 1100, &[b'a'; 1100]);
-        }
-        let previous_ack = s.remote_last_ack.unwrap();
-        let previous_window = s.remote_last_win_bytes;
-        assert!(previous_window >= 1100);
-        assert_eq!(s.recv_room(), 0);
-        let state = s.state();
-        let remote_seq = s.remote_seq_no;
-        let local_seq = s.local_seq_no;
-        let ranges: Vec<_> = s.rx_buffer.store.ranges().collect();
-        let reply = send(
-            &mut s,
-            Instant::ZERO,
-            &SEND_TEMPL.seq(previous_ack).ack(LOCAL_SEQ + 1).data(&[b'z'; 1100]),
-        )
-        .unwrap();
-        assert_eq!(reply.ack_number, Some(previous_ack));
-        assert_eq!(u32::from(reply.window_len) << s.remote_win_shift, previous_window);
-        assert!(reply.payload.is_empty());
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(s.state(), state);
-        assert_eq!(s.remote_seq_no, remote_seq);
-        assert_eq!(s.local_seq_no, local_seq);
-        assert_eq!(s.rx_buffer.store.ranges().collect::<Vec<_>>(), ranges);
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        assert_eq!(s.recv_queue(), cap * 1100);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 0);
-        assert!(!s.rx_fin_received);
-        assert_eq!(s.rx_fin_seq, None);
-        let bytes = drain_bytes(&mut s);
-        assert_eq!(bytes.len(), cap * 1100);
-        assert_eq!(bytes, vec![b'a'; cap * 1100]);
-    }
 
     #[test]
-    fn refused_segment_counter_saturates() {
-        let mut s = socket_with_mbuf_window(2);
-        let cap = s.rx_mbuf_budget(s.cx.ip_mtu());
-        for index in 0..cap {
-            receive_window_segment(&mut s, index * 1100, &[b'a'; 1100]);
-        }
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        assert_eq!(s.recv_room(), 0);
-        let previous_ack = s.remote_last_ack.unwrap();
-        let previous_window = s.remote_last_win_bytes;
-        assert!(previous_window >= 1100);
-        s.rx_refused_segments = u32::MAX;
-        let reply = send(
-            &mut s,
-            Instant::ZERO,
-            &SEND_TEMPL.seq(previous_ack).ack(LOCAL_SEQ + 1).data(&[b'z'; 1100]),
-        )
-        .unwrap();
-        assert_eq!(reply.ack_number, Some(previous_ack));
-        assert_eq!(u32::from(reply.window_len) << s.remote_win_shift, previous_window);
-        assert!(reply.payload.is_empty());
-        assert_eq!(s.rx_refused_segments(), u32::MAX);
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        assert_eq!(s.recv_queue(), cap * 1100);
-    }
-
-    #[test]
-    fn full_segments_window_counts_frames() {
-        for shift in 0..=2 {
-            let mut s = socket_with_mbuf_window(shift);
-            let mut offset = 0;
-            while offset < 65536 {
-                let len = 1460.min(65536 - offset);
-                let ack = receive_window_segment(&mut s, offset, &vec![0; len]);
-                offset += len;
-                let room = ((45 - s.rx_buffer.store.held()) * 1460).min(65536);
-                assert_eq!(s.recv_room(), room);
-                // The last 1296-byte segment uses the last frame of a 1460-byte window.
-                // The window never shrinks, so the ACK still offers the other 164 bytes.
-                let advertised = if offset == 65536 { 164 } else { room };
-                assert_eq!(ack.window_len, (advertised >> shift) as u16);
-            }
-            assert_eq!(s.rx_buffer.store.held(), 45);
-            assert_eq!(drain_frames(&mut s, 10), vec![0; 14600]);
-            let ack = receive_window_segment(&mut s, 0, &[0; 1460]);
-            assert_eq!(s.recv_room(), 14600);
-            assert_eq!(ack.window_len, (14600 >> shift) as u16);
-            assert_eq!(s.rx_refused_segments(), 0);
-        }
-    }
-
-    #[test]
-    fn syn_windows_follow_peer_mss_availability() {
+    fn syn_windows_use_unscaled_receive_target() {
         for capacity in [64usize, 65536, 1048576] {
-            // ceil(capacity / 1460), at least 6 frames; SYN uses 48 B per frame.
-            let frames = capacity.div_ceil(1460).max(6);
-            let active_window = u16::try_from(capacity.min(frames * 48)).unwrap();
-            // Without a peer MSS option, SYN-ACK uses the default 536 B per frame.
-            let passive_window = u16::try_from(capacity.min(frames * 536)).unwrap_or(u16::MAX);
+            let active_window = u16::try_from(capacity).unwrap_or(u16::MAX);
+            let passive_window = active_window;
             let mut active = socket_syn_sent_with_buffer_sizes(64, capacity);
             recv(&mut active, Instant::ZERO, |reply| {
                 let reply = reply.unwrap();
@@ -5765,32 +4613,14 @@ mod test {
         }
     }
 
-    #[cfg(feature = "diagnostics")]
-    #[test]
-    fn debug_poll_at_scan_preserves_receive_wake_threshold() {
-        let (mut iface, _, _) = crate::tests::setup_eth();
-        let socket = socket().socket;
-        let shared = socket.rx_buffer.shared.clone();
-        let mut sockets = crate::iface::TcpSet::new(64);
-        sockets.add(socket);
-        iface.classify_dirty(&mut sockets, Instant::ZERO);
-        shared.wake_at_held.set(17);
-        assert_eq!(iface.poll_at(Instant::ZERO, &mut sockets), None);
-        assert_eq!(shared.wake_at_held.get(), 17);
-    }
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
     }
 
-    fn frame_socket(
-        byte_cap: usize,
-        frame_cap: usize,
-        mss: usize,
-        source: TxSource,
-    ) -> TestSocket {
+    fn frame_socket(byte_cap: usize, mss: usize, source: TxSource) -> TestSocket {
         let mut s = socket_established();
-        s.tx_queue = TxQueue::new(byte_cap, frame_cap, source);
+        s.tx_queue = TxQueue::new(byte_cap, source);
         s.tx_seg_bytes = u32::try_from(mss).unwrap();
         s.remote_mss = u16::try_from(mss).unwrap();
         s
@@ -5807,7 +4637,7 @@ mod test {
     fn frame_send_frame_foreign() {
         let source = crate::tests::tx_test_source(8);
         let foreign = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source);
+        let mut s = frame_socket(8, 4, source);
         let frame = owned_frame(&foreign, b"a");
         let (returned, error) = s.send_frame(frame).unwrap_err();
         assert_eq!(error, SendFrameError::Foreign);
@@ -5817,7 +4647,7 @@ mod test {
     #[test]
     fn frame_send_frame_invalid_state_after_close() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         s.close();
         let (returned, error) = s.send_frame(owned_frame(&source, b"a")).unwrap_err();
         assert_eq!(error, SendFrameError::InvalidState);
@@ -5827,7 +4657,7 @@ mod test {
     #[test]
     fn frame_send_frame_empty() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         let (returned, error) = s.send_frame(owned_frame(&source, b"")).unwrap_err();
         assert_eq!(error, SendFrameError::Empty);
         assert_eq!(returned.len(), 0);
@@ -5836,27 +4666,48 @@ mod test {
     #[test]
     fn frame_send_frame_full_bytes() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(3, 2, 4, source.clone());
+        let mut s = frame_socket(3, 4, source.clone());
         let (returned, error) = s.send_frame(owned_frame(&source, b"abcd")).unwrap_err();
         assert_eq!(error, SendFrameError::Full);
         assert_eq!(returned.payload(), b"abcd");
     }
 
     #[test]
-    fn frame_send_frame_full_slots() {
+    fn many_small_frames_use_byte_capacity_not_frame_count() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 1, 4, source.clone());
-        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
-        let (returned, error) = s.send_frame(owned_frame(&source, b"b")).unwrap_err();
+        let mut s = frame_socket(32, 4, source.clone());
+        for n in 0..32 {
+            assert!(s.can_send());
+            assert_eq!(s.frame_send_room(), 32 - n);
+            assert!(s.send_frame(owned_frame(&source, b"x")).is_ok());
+        }
+        assert_eq!(s.send_queue(), 32);
+        assert!(!s.can_send());
+        assert_eq!(s.frame_send_room(), 0);
+        let (returned, error) = s.send_frame(owned_frame(&source, b"x")).unwrap_err();
         assert_eq!(error, SendFrameError::Full);
-        assert_eq!(returned.payload(), b"b");
+        assert_eq!(returned.payload(), b"x");
+    }
+
+    #[test]
+    fn send_slice_accepts_data_after_many_small_frames_are_sent() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(32, 4, source.clone());
+        for _ in 0..8 {
+            assert!(s.send_frame(owned_frame(&source, b"x")).is_ok());
+            assert_eq!(emit_frame_segment(&mut s).2, b"x");
+        }
+        assert!(s.can_send());
+        assert_eq!(s.frame_send_room(), 24);
+        assert_eq!(s.send_slice(b"y"), Ok(1));
+        assert_eq!(s.send_queue(), 9);
     }
 
     #[test]
     fn frame_longer_than_mss_is_one_entry_sent_by_copy() {
         let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
         assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 1));
         assert_eq!(alloc.live(), 1);
@@ -5868,30 +4719,23 @@ mod test {
         assert_eq!(alloc.live(), 1);
     }
 
-    /// An unsent frame the app filled past the segment payload P takes no appended bytes: with
-    /// no free slot `can_send` is false and `send_slice` writes nothing; with a free slot the
-    /// bytes go to a new frame.
+    /// An unsent frame filled past the segment payload takes no appended bytes;
+    /// a subsequent slice uses a new frame.
     #[test]
     fn frame_longer_than_mss_takes_no_appended_bytes() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(16, 1, 4, source.clone());
-        assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
-        assert!(!s.can_send());
-        assert_eq!(s.frame_send_room(), 0);
-        assert_eq!(s.send_slice(b"x"), Ok(0));
-        assert_eq!((s.send_queue(), s.tx_queue.frames()), (6, 1));
-
-        let mut s = frame_socket(16, 2, 4, source.clone());
+        let mut s = frame_socket(16, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcdef")).is_ok());
         assert!(s.can_send());
+        assert_eq!(s.frame_send_room(), 10);
         assert_eq!(s.send_slice(b"x"), Ok(1));
         assert_eq!((s.send_queue(), s.tx_queue.frames()), (7, 2));
     }
 
     #[test]
-    fn frame_send_slice_caps_at_bytes_and_slots() {
+    fn frame_send_slice_caps_at_bytes() {
         let source = crate::tests::tx_test_source(4);
-        let mut s = frame_socket(7, 2, 4, source);
+        let mut s = frame_socket(7, 4, source);
         assert_eq!(s.send_slice(b"abcdefghi"), Ok(7));
         assert_eq!((s.send_queue(), s.tx_queue.frames()), (7, 2));
     }
@@ -5899,7 +4743,7 @@ mod test {
     #[test]
     fn frame_send_slice_appends_to_unsent_unique_tail_only() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source);
+        let mut s = frame_socket(8, 4, source);
         assert_eq!(s.send_slice(b"ab"), Ok(2));
         assert_eq!(s.send_slice(b"cd"), Ok(2));
         assert_eq!(s.tx_queue.frames(), 1);
@@ -5909,7 +4753,7 @@ mod test {
     #[test]
     fn frame_send_slice_never_appends_to_shared_tail() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source);
+        let mut s = frame_socket(8, 4, source);
         assert_eq!(s.send_slice(b"ab"), Ok(2));
         let frame = s.tx_queue.take(0);
         let shared = frame.clone();
@@ -5919,19 +4763,11 @@ mod test {
         drop(shared);
     }
 
-    #[test]
-    fn frame_can_send_false_when_slots_full() {
-        let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 1, 4, source.clone());
-        assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
-        assert!(!s.can_send());
-        assert_eq!(s.frame_send_room(), 0);
-    }
 
     #[test]
     fn frame_tx_capacity_zero_sends_nothing() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(0, 6, 4, source.clone());
+        let mut s = frame_socket(0, 4, source.clone());
         assert_eq!(s.send_capacity(), 0);
         assert_eq!(s.send_slice(b"a"), Ok(0));
         assert_eq!(s.send_frame(owned_frame(&source, b"a")).unwrap_err().1, SendFrameError::Full);
@@ -5940,7 +4776,7 @@ mod test {
     #[test]
     fn frame_send_frame_shared_longer_than_mss_is_one_entry() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         let frame = owned_frame(&source, b"abcdef");
         assert!(s.send_frame(frame.clone()).is_ok());
         assert_eq!(frame.payload(), b"abcdef");
@@ -5999,7 +4835,7 @@ mod test {
     #[test]
     fn frame_fin_rides_last_whole_frame() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         s.close();
         let (control, _, payload, whole) = emit_frame_segment(&mut s);
@@ -6009,7 +4845,7 @@ mod test {
     #[test]
     fn frame_zero_window_probe_cuts_one_byte() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         s.remote_win_len = 0;
         s.timer = Timer::ZeroWindowProbe {
@@ -6024,7 +4860,7 @@ mod test {
     #[test]
     fn frame_window_smaller_than_frame_cuts_then_rest() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         s.remote_win_len = 2;
         assert_eq!(emit_frame_segment(&mut s).2, b"ab");
@@ -6036,7 +4872,7 @@ mod test {
     #[test]
     fn frame_window_reopens_across_frames() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
         assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
         s.remote_win_len = 2;
@@ -6051,7 +4887,7 @@ mod test {
     #[test]
     fn frame_cut_remainder_merges_with_next_frame_like_ring() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
         assert!(s.send_frame(owned_frame(&source, b"cdef")).is_ok());
         s.remote_win_len = 1;
@@ -6066,7 +4902,7 @@ mod test {
     #[test]
     fn frame_partly_acked_frame_retransmits_tail_copy() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         let _ = emit_frame_segment(&mut s);
         ack_frame_bytes(&mut s, 2);
@@ -6079,7 +4915,7 @@ mod test {
     #[test]
     fn frame_rto_resends_whole_frame() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         assert!(emit_frame_segment(&mut s).3);
         s.cx.set_now(Instant::from_millis(300));
@@ -6091,7 +4927,7 @@ mod test {
     #[test]
     fn frame_fast_retransmit_head_frame() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         let _ = emit_frame_segment(&mut s);
         s.pending_fast_retransmit = true;
@@ -6103,7 +4939,7 @@ mod test {
     #[test]
     fn frame_rto_coalesces_unacked_frames_like_ring() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
         assert!(emit_frame_segment(&mut s).3);
         assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
@@ -6119,7 +4955,7 @@ mod test {
     #[test]
     fn frame_send_room_with_small_peer_mss_reaches_tx_capacity() {
         let source = crate::tests::tx_test_source(1460);
-        let mut s = frame_socket(65536, tx_frame_cap(65536, 1460), 1460, source.clone());
+        let mut s = frame_socket(65536, 1460, source.clone());
         s.remote_mss = 512;
         assert_eq!(s.frame_send_room(), 65536);
         let mut sent = 0;
@@ -6139,7 +4975,7 @@ mod test {
     #[test]
     fn frame_peer_mss_below_local_payload_keeps_byte_capacity() {
         let source = crate::tests::tx_test_source(1460);
-        let mut s = frame_socket(8192, tx_frame_cap(8192, 1460), 1460, source);
+        let mut s = frame_socket(8192, 1460, source);
         s.remote_mss = 536;
         s.remote_win_len = 8192;
         s.congestion_controller.set_initial_window(8192);
@@ -6157,7 +4993,7 @@ mod test {
     #[test]
     fn frame_peer_mss_cuts_across_local_send_slice_frames_like_ring() {
         let source = crate::tests::tx_test_source(1460);
-        let mut s = frame_socket(4380, tx_frame_cap(4380, 1460), 1460, source);
+        let mut s = frame_socket(4380, 1460, source);
         s.remote_mss = 1024;
         s.remote_win_len = 4380;
         s.congestion_controller.set_initial_window(4380);
@@ -6174,7 +5010,7 @@ mod test {
     #[test]
     fn frame_full_unique_frames_send_zero_copy_without_egress_between_writes() {
         let source = crate::tests::tx_test_source(4);
-        let mut s = frame_socket(12, 3, 4, source.clone());
+        let mut s = frame_socket(12, 4, source.clone());
         for bytes in [b"abcd", b"efgh", b"ijkl"] {
             assert!(s.send_frame(owned_frame(&source, bytes)).is_ok());
         }
@@ -6188,7 +5024,7 @@ mod test {
     #[test]
     fn frame_emit_error_returns_frame_to_entry() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         assert_eq!(
             s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err(()), frame.map(UniqueTxBuf::into_buf))),
@@ -6201,7 +5037,7 @@ mod test {
     #[test]
     fn frame_seq_wrap_across_frames() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 2, source.clone());
+        let mut s = frame_socket(8, 2, source.clone());
         let start = TcpSeqNumber(i32::MAX - 1);
         s.local_seq_no = start;
         s.remote_last_seq = start;
@@ -6216,7 +5052,7 @@ mod test {
     fn frame_reset_releases_queue() {
         let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         assert_eq!(alloc.live(), 1);
         s.reset();
@@ -6227,7 +5063,7 @@ mod test {
     fn frame_peer_rst_keeps_frames_until_reuse() {
         let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         send!(s, SEND_TEMPL.rst().seq(REMOTE_SEQ + 1).no_ack());
         assert_eq!(s.state(), State::Closed);
@@ -6239,7 +5075,7 @@ mod test {
     #[test]
     fn frame_orphan_with_unread_data_keeps_frames() {
         let source = crate::tests::tx_test_source(8);
-        let mut s = frame_socket(8, 2, 4, source.clone());
+        let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"abcd")).is_ok());
         send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(b"x"));
         assert_eq!(s.recv_queue(), 1);
@@ -6253,7 +5089,7 @@ mod test {
         let alloc = TxPool::new(8);
         let source = TxSource::new(alloc.clone());
         let mut s = socket_syn_sent();
-        s.tx_queue = TxQueue::new(8, 2, source);
+        s.tx_queue = TxQueue::new(8, source);
         s.tx_queue.push_bytes(b"abcd");
         assert_eq!(alloc.live(), 1);
         s.orphan(Instant::ZERO);
@@ -6611,44 +5447,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn orphan_regression_close_before_failed_window_update() {
-        let mut s = socket_established();
-        let count = s.rx_frame_cap();
-        let mut held = Vec::new();
-        for index in 0..count {
-            let len = if index == 0 { 64 - (count - 1) } else { 1 };
-            let next = s.remote_seq_no;
-            send!(s, SEND_TEMPL.seq(next).ack(LOCAL_SEQ + 1).data(&[0; 64][..len]));
-            held.push(s.recv().unwrap().unwrap());
-        }
-        recv(&mut s, Instant::ZERO, |reply| {
-            assert_eq!(reply.unwrap().window_len, 0);
-        });
-        s.close();
-        recv(&mut s, Instant::ZERO, |reply| {
-            assert_eq!(reply.unwrap().control, TcpControl::Fin);
-        });
-        send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 65).ack(LOCAL_SEQ + 2));
-        assert_eq!(s.state(), State::FinWait2);
-        assert_eq!(held.iter().flat_map(|frame| frame.payload().iter().copied()).collect::<Vec<_>>(), vec![0; 64]);
-        drop(held);
-        assert!(s.window_to_update());
-        s.orphan(Instant::ZERO);
-        assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(UniqueTxBuf::into_buf))), Err(()));
-        assert!(s.window_to_update());
-        s.cx.set_now(Instant::from_millis(60_001));
-        let mut attempts = 0;
-        let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| {
-            attempts += 1;
-            (Err(()), frame.map(UniqueTxBuf::into_buf))
-        });
-        assert_eq!(attempts, 0, "expired close timer must not emit a window update");
-        assert_eq!(result, Ok(()));
-        assert_eq!(s.state(), State::Closed);
-        assert_eq!(s.remote_endpoint(), None);
-        recv_nothing(&mut s, Instant::from_millis(60_001));
-    }
 
     #[test]
     fn orphan_established_sends_fin() {
@@ -7001,7 +5799,7 @@ mod test {
                         }
                     }
                     "ACK idle" => {
-                        let decision = s.rx_buffer.store.decide(0, 1, 6);
+                        let decision = s.rx_buffer.store.decide(0, 1);
                         s.rx_buffer.store.place(0, decision);
                         s.rx_buffer.store.attach(RxBuf::from_vec(b"a".to_vec()));
                         assert_eq!(s.rx_buffer.store.in_order_len(), 1);
@@ -7181,10 +5979,7 @@ mod test {
                     .no_ack()
                     .mss(BASE_MSS)
                     .wscale(shift)
-                    // ceil(capacity / 1460), at least 6 frames, x 48 B for active SYN.
-                    .win(u16::try_from(
-                        capacity.min(capacity.div_ceil(1460).max(6) * 48),
-                    ).unwrap())
+                    .win(u16::try_from(capacity).unwrap_or(u16::MAX))
                     .sack_perm(true)]
             );
         }
@@ -7225,10 +6020,7 @@ mod test {
                     .ack(REMOTE_SEQ + 1)
                     .mss(BASE_MSS)
                     .wscale(*shift_amt)
-                    // ceil(buffer_size / 1460), at least 6 frames, x 536 B default peer MSS.
-                    .win(u16::try_from(
-                        (*buffer_size).min(buffer_size.div_ceil(1460).max(6) * 536),
-                    ).unwrap_or(u16::MAX))]
+                    .win(u16::try_from(*buffer_size).unwrap_or(u16::MAX))]
             );
         }
     }
@@ -7243,8 +6035,6 @@ mod test {
         );
         assert_eq!(s.state(), State::SynReceived);
         assert_eq!(s.remote_win_shift, 3);
-        assert_eq!(s.rx_mbuf_cap, 360);
-        assert_eq!(s.rx_seg_bytes, 536);
         recv!(
             s,
             Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS).wscale(3)
@@ -7267,10 +6057,9 @@ mod test {
             [RECV_TEMPL
                 .seq(LOCAL_SEQ + 1)
                 .ack(REMOTE_SEQ + 1)
-                // 360 free frames x 536 B, divided by scale 8.
-                .win(24120)]
+                .win(65535)]
         );
-        assert_eq!(s.remote_last_win_bytes, 192960);
+        assert_eq!(s.remote_last_win_bytes, 524280);
     }
 
     #[test]
@@ -7455,7 +6244,7 @@ mod test {
     fn test_syn_received_rst_not_at_rcv_nxt_challenge_ack() {
         let mut s = socket_syn_received_with_buffer_sizes(65535, 65535);
         s.listen_endpoint = LISTEN_END;
-        let window = u16::try_from(s.recv_room()).unwrap();
+        let window = u16::try_from(s.recv_capacity()).unwrap();
         recv!(
             s,
             [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).win(window).mss(BASE_MSS)]
@@ -7476,7 +6265,7 @@ mod test {
     fn test_syn_received_rst_outside_window_silent() {
         let mut s = socket_syn_received_with_buffer_sizes(65535, 65535);
         s.listen_endpoint = LISTEN_END;
-        let window = u16::try_from(s.recv_room()).unwrap();
+        let window = u16::try_from(s.recv_capacity()).unwrap();
         recv!(
             s,
             [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).win(window).mss(BASE_MSS)]
@@ -7508,8 +6297,7 @@ mod test {
                 .seq(LOCAL_SEQ)
                 .ack(REMOTE_SEQ + 1)
                 .mss(BASE_MSS)
-                // 90 frames x 600 B peer MSS.
-                .win(54000)]
+                .win(65535)]
         );
         send!(
             s,
@@ -7528,7 +6316,7 @@ mod test {
                 .seq(LOCAL_SEQ)
                 .ack(REMOTE_SEQ + 1)
                 .mss(BASE_MSS)
-                .win(48240) // 90 frames x 536 B default peer MSS.
+                .win(65535)
                 .wscale(2)]
         );
         assert_eq!(usize::from(s.remote_mss), DEFAULT_MSS);
@@ -7866,8 +6654,7 @@ mod test {
                 .seq(LOCAL_SEQ)
                 .ack(REMOTE_SEQ + 1)
                 .mss(BASE_MSS)
-                // 6 frames x min(our 1460 B MSS, peer MSS or default 536 B).
-                .win(4096.min(6 * mss.map_or(536, |mss| mss.min(BASE_MSS)))))
+                .win(4096))
         );
         send!(
             s,
@@ -8180,10 +6967,7 @@ mod test {
                 .seq(LOCAL_SEQ)
                 .ack(REMOTE_SEQ + 1)
                 .mss(BASE_MSS)
-                // ceil(rx_len / 1460), at least 6 frames, x min(our MSS, peer MSS).
-                .win(rx_len.min(
-                    rx_len.div_ceil(1460).max(6) * usize::from(peer_mss.min(BASE_MSS)),
-                ) as u16))
+                .win(rx_len as u16))
         );
         send!(
             s,
@@ -8210,8 +6994,7 @@ mod test {
             [RECV_TEMPL
                 .seq(LOCAL_SEQ + 1)
                 .ack(REMOTE_SEQ + 401)
-                // 10 free frames x 200 B peer MSS.
-                .win(2000)]
+                .win(16384)]
         );
         assert_eq!(s.rcv_mss, 200);
     }
@@ -8265,11 +7048,7 @@ mod test {
             recv(&mut s, Instant::ZERO, |result| {
                 let ack = result.unwrap();
                 assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-                // ceil(rx_len / 1460), at least 6 frames, x min(our MSS, peer MSS).
-                let window = rx_len.min(
-                    rx_len.div_ceil(1460).max(6) * usize::from(peer_mss.min(BASE_MSS)),
-                );
-                assert_eq!(ack.window_len, window as u16);
+                assert_eq!(ack.window_len, rx_len as u16);
             });
             assert_eq!(s.rcv_mss, expected);
         }
@@ -8285,7 +7064,7 @@ mod test {
         recv!(
             s,
             time 10,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1001).win(16060)]
+            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1001).win(16384)]
         );
         send!(
             s,
@@ -8295,7 +7074,7 @@ mod test {
         recv!(
             s,
             time 20,
-            [ack_of_segments(1).win(15600)]
+            [ack_of_segments(1).win(16384)]
         );
         for (offset, payload) in [(1460, &[0; 600][..]), (2060, &[0; 700][..])] {
             send!(
@@ -8309,7 +7088,7 @@ mod test {
         recv!(
             s,
             time 30,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 2761).win(14300)]
+            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 2761).win(16384)]
         );
     }
 
@@ -8324,7 +7103,7 @@ mod test {
         send!(
             s,
             SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[0; 100]),
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1561).win(14824))
+            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1561).win(16384))
         );
         assert_eq!(s.rcv_mss, 536);
     }
@@ -8350,7 +7129,7 @@ mod test {
     /// Our ACK of the peer's first `n` full segments, none read by the app.
     fn ack_of_segments(n: usize) -> TcpRepr<'static> {
         RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + n * BASE_MSS as usize)
-            .win(16384usize.min((12 - n) * BASE_MSS as usize) as u16)
+            .win(16384)
     }
 
     /// A peer whose MSS (8960) exceeds ours (1460) sends full 1460-byte segments: the
@@ -8944,10 +7723,7 @@ mod test {
                     .no_ack()
                     .mss(BASE_MSS)
                     .wscale(*shift_amt)
-                    // ceil(buffer_size / 1460), at least 6 frames, x 48 B for active SYN.
-                    .win(u16::try_from(
-                        (*buffer_size).min(buffer_size.div_ceil(1460).max(6) * 48),
-                    ).unwrap_or(u16::MAX))
+                    .win(u16::try_from(*buffer_size).unwrap_or(u16::MAX))
                     .sack_perm(true)]
             );
         }
@@ -8964,7 +7740,7 @@ mod test {
                 .no_ack()
                 .mss(BASE_MSS)
                 // scaling does NOT apply to the window value in SYN packets
-                .win(34512) // 719 frames x 48 B for active SYN.
+                .win(65535)
                 .wscale(5)
                 .sack_perm(true)]
         );
@@ -9025,6 +7801,32 @@ mod test {
     }
 
     #[test]
+    fn dropping_received_frames_does_not_schedule_or_cancel_frame_wait() {
+        let mut handles = crate::iface::TcpSet::new(64);
+        let handle = handles.add(Socket::test_socket(0, 0));
+        let queue = crate::iface::DropQueue::with_capacity(1, 0);
+        let mut s = socket_established_with_buffer_sizes(64, 4096);
+        s.socket.set_frame_wake(queue.clone(), handle);
+
+        receive_window_segment(&mut s, 0, b"abc");
+        let first = s.recv().unwrap().unwrap();
+        receive_window_segment(&mut s, 3, b"def");
+        let second = s.recv().unwrap().unwrap();
+        let held = s.held_frames();
+        assert_eq!(held.count(), 2);
+        drop(first);
+        assert_eq!(held.count(), 1);
+        assert_eq!(queue.state(), (true, false));
+
+        s.rx_buffer.shared.queue_frame_wait();
+        drop(second);
+        assert_eq!(held.count(), 0);
+        assert_eq!(queue.state(), (true, true));
+        s.socket.clear_frame_wake();
+        assert_eq!(queue.state(), (true, false));
+    }
+
+    #[test]
     fn drain_returns_whole_frames_in_order() {
         let mut s = socket_established_with_buffer_sizes(64, 4096);
         let payloads = [vec![b'a'; 65], vec![b'b'; 90], vec![b'c'; 120]];
@@ -9046,101 +7848,15 @@ mod test {
     }
 
     #[test]
-    fn drain_after_append() {
-        let mut s = socket_established_with_buffer_sizes(64, 4096);
-        let first = vec![b'a'; DEFAULT_MSS];
-        let (_, releases) = send_counted_append_frame(&mut s, 0, &first, 80, TcpControl::None);
-        for offset in [DEFAULT_MSS, DEFAULT_MSS + 40] {
-            let (_, appended) = send_counted_append_frame(
-                &mut s, offset, &[b'b'; 40], 0, TcpControl::None,
-            );
-            assert_eq!(appended.get(), 1);
-        }
-        let frame = s.recv().unwrap().unwrap();
-        let mut expected = first;
-        expected.extend_from_slice(&[b'b'; 80]);
-        assert_eq!(frame.payload(), expected);
-        assert_eq!(s.recv_queue(), 0);
-        assert!(s.recv().unwrap().is_none());
-        assert_eq!(releases.get(), 0);
-        drop(frame);
-        assert_eq!(releases.get(), 1);
-    }
-
-    #[test]
-    fn app_held_frames_close_window_and_reopen_on_drop() {
-        let capacity = 6 * usize::from(BASE_MSS);
-        let mut s = receive_window_socket(1500, capacity);
-        assert_eq!(open_receive_window(&mut s, true, Some(BASE_MSS)), capacity as u16);
-        assert_eq!(s.rx_frame_cap(), 6);
-        for index in 0..6 {
-            send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1 + index * usize::from(BASE_MSS))
-                .ack(LOCAL_SEQ + 1).data(&[0; 1460]));
-        }
-        let mut frames = Vec::new();
-        for _ in 0..6 {
-            frames.push(s.recv().unwrap().unwrap());
-        }
-        assert_eq!(s.recv_queue(), 0);
-        assert_eq!(s.rx_buffer.shared.held.get(), 6);
-        assert_eq!(s.recv_room(), 0);
-        assert!(s.ack_to_transmit());
-        recv(&mut s, Instant::ZERO, |result| {
-            assert_eq!(result.unwrap().window_len, 0);
-        });
-        drop(frames);
-        assert_eq!(s.recv_room(), capacity.min(6 * s.rx_seg_bytes as usize));
-        assert!(s.window_to_update());
-        recv(&mut s, Instant::ZERO, |result| {
-            let ack = result.unwrap();
-            assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + capacity));
-            assert_eq!(usize::from(ack.window_len), capacity);
-        });
-        recv_nothing!(s);
-    }
-
-    #[test]
-    fn app_held_frames_refuse_in_window_segment_until_drop() {
-        let mut s = receive_window_socket(1500, 4096);
-        assert_eq!(open_receive_window(&mut s, true, Some(BASE_MSS)), 4096);
-        for index in 0..6 {
-            receive_window_segment(&mut s, index * 100, &[b'a'; 100]);
-        }
-        let previous_ack = s.remote_last_ack.unwrap();
-        assert!(s.remote_last_win_bytes >= 100);
-        let mut frames = Vec::new();
-        for _ in 0..6 {
-            frames.push(s.recv().unwrap().unwrap());
-        }
-        assert_eq!(s.rx_frame_cap(), 6);
-        assert_eq!(s.rx_buffer.store.held(), 0);
-        assert_eq!(s.rx_buffer.shared.held.get(), 6);
-        let ack = receive_window_segment(&mut s, 600, &[b'z'; 100]);
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(ack.ack_number, Some(previous_ack));
-        assert_eq!(s.recv_queue(), 0);
-        drop(frames);
-        let ack = receive_window_segment(&mut s, 600, &[b'z'; 100]);
-        assert_eq!(ack.ack_number, Some(previous_ack + 100));
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(drain_bytes(&mut s), vec![b'z'; 100]);
-    }
-
-    #[test]
     fn held_frames_survive_reset() {
         let mut s = socket_established_with_buffer_sizes(64, 4096);
         receive_window_segment(&mut s, 0, &[b'a'; 100]);
         let frame = s.recv().unwrap().unwrap();
         s.abort();
-        assert_eq!(s.rx_buffer.shared.held.get(), 1);
         s.reset();
-        assert_eq!(s.rx_buffer.shared.held.get(), 1);
         assert_eq!(frame.payload(), &[b'a'; 100]);
-        let held = s.rx_buffer.shared.clone();
         drop(s);
-        assert_eq!(held.held.get(), 1);
-        drop(frame);
-        assert_eq!(held.held.get(), 0);
+        assert_eq!(frame.payload(), &[b'a'; 100]);
     }
 
     #[test]
@@ -9188,91 +7904,8 @@ mod test {
         recv_nothing!(s, time 10);
     }
 
-    #[test]
-    fn pure_ack_at_right_edge_after_cap_refusal_updates_send_state() {
-        let mut s = socket_established();
-        let cap = s.rx_mbuf_budget(s.cx.ip_mtu());
-        for index in 0..cap {
-            receive_window_segment(&mut s, index, b"a");
-        }
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        assert_eq!(s.recv_room(), 0);
-        assert_eq!(s.send_slice(b"sent"), Ok(4));
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + cap).win(63).data(b"sent")]
-        );
-        let next_seq = s.remote_last_ack.unwrap();
-        let window = s.remote_last_win_bytes as usize;
-        assert!(window > 0);
-        assert_eq!(next_seq, s.remote_seq_no + s.rx_buffer.store.in_order_len());
-        send!(
-            s,
-            time 10,
-            SEND_TEMPL.seq(next_seq).ack(LOCAL_SEQ + 1).data(b"z"),
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 5).ack(next_seq)
-                .win(u16::try_from(s.remote_last_win_bytes >> s.remote_win_shift).unwrap()))
-        );
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(s.recv_queue(), cap);
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        assert_eq!(s.send_queue(), 4);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
-        assert_eq!(s.remote_max_seq, LOCAL_SEQ + 5);
-        assert_eq!(s.remote_win_len, 256);
-        send!(
-            s,
-            time 20,
-            SEND_TEMPL.seq(next_seq + window).ack(LOCAL_SEQ + 5).win(42)
-        );
-        assert_eq!(s.send_queue(), 0);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 5);
-        assert_eq!(s.remote_win_len, 42);
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(s.recv_queue(), cap);
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        recv_nothing!(s, time 20);
-    }
 
-    #[test]
-    fn data_fin_at_cap_refused_without_eof_peer_ack_processed() {
-        let mut s = socket_established();
-        let cap = s.rx_mbuf_budget(s.cx.ip_mtu());
-        for index in 0..cap {
-            send!(
-                s,
-                SEND_TEMPL.seq(REMOTE_SEQ + 1 + index).ack(LOCAL_SEQ + 1).data(b"a")
-            );
-        }
-        assert_eq!(s.rx_buffer.store.held(), cap);
-        assert_eq!(s.send_slice(b"sent"), Ok(4));
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + cap).win((64 - cap) as u16)
-                .data(b"sent")]
-        );
-        let reply = send(
-            &mut s,
-            Instant::from_millis(10),
-            &SEND_TEMPL.seq(REMOTE_SEQ + 1 + cap).ack(LOCAL_SEQ + 5).fin().data(b"z"),
-        )
-        .unwrap();
-        assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 1 + cap));
-        assert_eq!(reply.window_len, (64 - cap) as u16);
-        assert_eq!(s.send_queue(), 0);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 5);
-        assert_eq!(s.state(), State::Established);
-        assert!(!s.rx_fin_received);
-        assert_eq!(s.rx_fin_seq, None);
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(s.recv_queue(), cap);
-        let bytes = drain_bytes(&mut s);
-        assert_eq!(bytes.len(), cap);
-        assert_eq!(&bytes[..cap], vec![b'a'; cap]);
-        assert!(s.recv().unwrap().is_none());
-    }
-
-    fn send_counted_append_frame(
+    fn send_counted_frame(
         s: &mut TestSocket,
         offset: usize,
         payload: &[u8],
@@ -9293,164 +7926,61 @@ mod test {
     }
 
     #[test]
-    fn small_in_order_segments_append_into_one_frame() {
-        let mut s = socket_established_with_buffer_sizes(64, 1024);
-        let payload: Vec<u8> = (0..200).map(|index| (index % 251) as u8).collect();
-        let mut releases = Vec::new();
-        for (index, bytes) in payload.chunks(50).enumerate() {
-            let offset = index.checked_mul(50).unwrap();
-            let (reply, count) =
-                send_counted_append_frame(&mut s, offset, bytes, 1024, TcpControl::None);
-            assert_eq!(reply, None);
-            assert_eq!(count.get(), usize::from(index != 0));
-            releases.push(count);
-            assert_eq!(releases[0].get(), 0);
-        }
-        assert_eq!(s.recv_queue(), 200);
-        assert_eq!(s.rx_buffer.store.held(), 1);
-        let output = drain_bytes(&mut s);
-        assert_eq!(output.len(), 200);
-        assert_eq!(output.as_slice(), payload);
-        assert!(releases.iter().all(|count| count.get() == 1));
-        drop(s);
-        assert!(releases.iter().all(|count| count.get() == 1));
-    }
-
-    #[test]
-    fn append_keeps_window_and_cap_accounting() {
-        let buffer = 3usize.checked_mul(8).unwrap().checked_mul(1448).unwrap();
-        for shift in [0u8, 3] {
-            let mut s = socket_established_with_buffer_sizes(64, buffer);
-            // This peer advertises MSS 1460, matching the frame allowance below.
-            s.remote_mss = BASE_MSS;
-            s.socket.update_rx_mbuf_budget(&s.cx);
-            assert_eq!(s.cx.ip_mtu(), 1500);
-            s.remote_win_shift = shift;
-            s.remote_last_win_bytes = 1024;
-            for index in 0usize..4 {
-                let (reply, _) = send_counted_append_frame(
-                    &mut s,
-                    index.checked_mul(50).unwrap(),
-                    &[b'a'; 50],
-                    1024,
-                    TcpControl::None,
-                );
-                assert_eq!(reply, None);
-            }
-            assert_eq!(s.rx_buffer.store.held(), 1);
-            assert_eq!(s.recv_queue(), 200);
-            // 1500 - 40 = 1460 bytes per frame; ceil(34752 / 1460) = 24 frames.
-            // One stored frame leaves 23 * 1460 bytes, below the capacity.
-            // The prior 1024-byte window leaves an 824-byte floor, below the frame window.
-            let segment_bytes = 1500usize.checked_sub(40).unwrap();
-            let cap = (buffer / segment_bytes)
-                .checked_add(usize::from(buffer % segment_bytes != 0))
-                .unwrap()
-                .max(6);
-            let byte_window = buffer;
-            let frame_window = cap
-                .checked_sub(1)
-                .unwrap()
-                .checked_mul(segment_bytes)
-                .unwrap();
-            let expected = u16::try_from(byte_window.min(frame_window) >> shift).unwrap();
-            recv(&mut s, Instant::ZERO, |reply| {
-                let reply = reply.unwrap();
-                assert_eq!(reply.window_len, expected);
-                assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 201));
-            });
-        }
-
-        let mut s = socket_established_with_buffer_sizes(64, 1024);
-        for index in 0usize..6 {
-            let room = if index == 5 { 1024 } else { 0 };
-            let (reply, _) = send_counted_append_frame(
-                &mut s,
-                index.checked_mul(50).unwrap(),
-                &[b'a'; 50],
-                room,
-                TcpControl::None,
-            );
-            assert_eq!(reply, None);
-        }
-        assert_eq!(s.rx_mbuf_cap, 6);
-        assert_eq!(s.rx_buffer.store.held(), s.rx_mbuf_cap as usize);
-        let refused = s.rx_refused_segments();
-        let (reply, releases) =
-            send_counted_append_frame(&mut s, 300, &[b'b'; 50], 0, TcpControl::None);
-        assert_eq!(reply, None);
-        assert_eq!(releases.get(), 1);
-        assert_eq!(s.rx_buffer.store.held(), 6);
-        assert_eq!(s.rx_refused_segments(), refused);
-        assert_eq!(s.recv_queue(), 350);
-        recv(&mut s, Instant::ZERO, |reply| {
-            assert_eq!(reply.unwrap().ack_number, Some(REMOTE_SEQ + 351));
-        });
-    }
-
-    #[test]
-    fn retransmission_appends_only_its_new_bytes() {
-        // Eligibility counts the bytes the socket stores: a 100-byte retransmission whose
-        // first 40 bytes were already received appends its 60 new bytes.
+    fn retransmission_keeps_only_its_new_bytes() {
         let mut s = socket_established_with_buffer_sizes(64, 1024);
         let payload: Vec<u8> = (0..100).map(|index| index as u8).collect();
         let (reply, first) =
-            send_counted_append_frame(&mut s, 0, &payload[..40], 1024, TcpControl::None);
+            send_counted_frame(&mut s, 0, &payload[..40], 1024, TcpControl::None);
         assert_eq!(reply, None);
         let (reply, overlap) =
-            send_counted_append_frame(&mut s, 0, &payload, 0, TcpControl::None);
+            send_counted_frame(&mut s, 0, &payload, 0, TcpControl::None);
         assert_eq!(reply, None);
-        assert_eq!((first.get(), overlap.get()), (0, 1));
-        assert_eq!(s.rx_buffer.store.held(), 1);
+        assert_eq!((first.get(), overlap.get()), (0, 0));
+        assert_eq!(s.rx_buffer.store.held(), 2);
         assert_eq!(s.recv_queue(), 100);
         let output = drain_bytes(&mut s);
-        assert_eq!(output.len(), 100);
         assert_eq!(output.as_slice(), payload);
-        assert_eq!(first.get(), 1);
+        assert_eq!((first.get(), overlap.get()), (1, 1));
     }
 
     #[test]
-    fn fin_after_appended_data() {
+    fn fin_after_consecutive_segments() {
         let mut s = socket_established_with_buffer_sizes(64, 1024);
         let (reply, first) =
-            send_counted_append_frame(&mut s, 0, b"abc", rx_store::APPEND_MAX, TcpControl::None);
+            send_counted_frame(&mut s, 0, b"abc", 64, TcpControl::None);
         assert_eq!(reply, None);
-        let (reply, second) = send_counted_append_frame(&mut s, 3, b"def", 0, TcpControl::None);
+        let (reply, second) = send_counted_frame(&mut s, 3, b"def", 0, TcpControl::None);
         assert_eq!(reply, None);
-        assert_eq!((first.get(), second.get()), (0, 1));
-        assert_eq!(s.rx_buffer.store.held(), 1);
-        let (reply, fin) = send_counted_append_frame(&mut s, 6, b"", 0, TcpControl::Fin);
+        assert_eq!((first.get(), second.get()), (0, 0));
+        assert_eq!(s.rx_buffer.store.held(), 2);
+        let (reply, fin) = send_counted_frame(&mut s, 6, b"", 0, TcpControl::Fin);
         assert_eq!(reply, None);
         assert_eq!(fin.get(), 1);
         assert_eq!(s.state(), State::CloseWait);
         recv(&mut s, Instant::ZERO, |reply| {
             assert_eq!(reply.unwrap().ack_number, Some(REMOTE_SEQ + 8));
         });
-        let output = drain_bytes(&mut s);
-        assert_eq!(output.len(), 6);
-        assert_eq!(&output, b"abcdef");
-        assert_eq!(first.get(), 1);
+        assert_eq!(&drain_bytes(&mut s), b"abcdef");
+        assert_eq!((first.get(), second.get()), (1, 1));
         assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
     }
 
     #[test]
-    fn fin_on_last_appended_segment() {
+    fn fin_on_last_consecutive_segment() {
         let mut s = socket_established_with_buffer_sizes(64, 1024);
         let (reply, first) =
-            send_counted_append_frame(&mut s, 0, b"abc", rx_store::APPEND_MAX, TcpControl::None);
+            send_counted_frame(&mut s, 0, b"abc", 64, TcpControl::None);
         assert_eq!(reply, None);
-        let (reply, last) = send_counted_append_frame(&mut s, 3, b"def", 0, TcpControl::Fin);
+        let (reply, last) = send_counted_frame(&mut s, 3, b"def", 0, TcpControl::Fin);
         assert_eq!(reply, None);
-        assert_eq!((first.get(), last.get()), (0, 1));
-        assert_eq!(s.rx_buffer.store.held(), 1);
+        assert_eq!((first.get(), last.get()), (0, 0));
+        assert_eq!(s.rx_buffer.store.held(), 2);
         assert_eq!(s.state(), State::CloseWait);
         recv(&mut s, Instant::ZERO, |reply| {
             assert_eq!(reply.unwrap().ack_number, Some(REMOTE_SEQ + 8));
         });
-        let output = drain_bytes(&mut s);
-        assert_eq!(output.len(), 6);
-        assert_eq!(&output, b"abcdef");
-        assert_eq!(first.get(), 1);
+        assert_eq!(&drain_bytes(&mut s), b"abcdef");
+        assert_eq!((first.get(), last.get()), (1, 1));
         assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
     }
 
@@ -9676,12 +8206,8 @@ mod test {
         let mut s = socket_established_with_buffer_sizes(4000, rx_len);
         // This peer advertises MSS 1460 and sends 500-byte segments.
         s.remote_mss = BASE_MSS;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.remote_has_sack = true;
-        let frame_window = s.rx_frame_cap()
-            .checked_sub(1).expect("RX frame budget is empty")
-            .checked_mul(usize::from(BASE_MSS)).expect("RX frame window exceeds usize");
-        let window = u16::try_from(rx_len.min(frame_window)).unwrap();
+        let window = u16::try_from(rx_len).unwrap();
 
         // create a segment that is 500 bytes long
         let mut segment: Vec<u8> = Vec::with_capacity(500);
@@ -9710,7 +8236,7 @@ mod test {
     #[test]
     fn test_established_rfc2018_cases() {
         let (s, segment) = setup_rfc2018_cases(4000);
-        check_rfc2018_cases(s, segment, true);
+        check_rfc2018_cases(s, segment, 4000);
     }
 
     #[test]
@@ -9720,13 +8246,11 @@ mod test {
         s.remote_win_shift = 2;
         // The previous advertised window promises 14000 bytes.
         s.remote_last_win_bytes = 3500 << 2;
-        assert_eq!(s.rx_mbuf_budget(s.cx.ip_mtu()), 11);
-        assert_eq!(s.rx_frame_cap(), 11);
         assert_eq!(s.scaled_window(), 4000);
-        check_rfc2018_cases(s, segment, false);
+        check_rfc2018_cases(s, segment, 4000);
     }
 
-    fn check_rfc2018_cases(mut s: TestSocket, segment: Vec<u8>, capped: bool) {
+    fn check_rfc2018_cases(mut s: TestSocket, segment: Vec<u8>, window_len: u16) {
         // RFC 2018:
         //
         // Case 2: The first segment is dropped but the remaining 7 are received.
@@ -9747,13 +8271,8 @@ mod test {
         //   8000         5000     5500       8500
         //   8500         5000     5500       9000
         //
-        let expected_windows = if capped {
-            [4000; 6]
-        } else {
-            [3535; 6]
-        };
-        for (offset, window_len) in (500..3500).step_by(500).zip(expected_windows) {
-            let retained = if capped { offset.min(2500) } else { offset };
+        for offset in (500..4000).step_by(500) {
+            let retained = offset;
             send!(
                 s,
                 SEND_TEMPL.seq(REMOTE_SEQ + 1 + offset + 5000).ack(LOCAL_SEQ + 1).data(&segment),
@@ -9770,7 +8289,7 @@ mod test {
                         None
                     ]))
             );
-            assert_eq!(s.rx_refused_segments(), u32::from(capped && offset == 3000));
+            assert_eq!(s.rx_refused_segments(), 0);
             assert_eq!(s.rx_buffer.store.held(), retained / 500);
             assert_eq!(s.rx_buffer.store.out_of_order_len(), retained);
         }
@@ -9936,7 +8455,7 @@ mod test {
             assert!(send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(seq).ack(LOCAL_SEQ + 1)
                 .data(&b"ab"[..])).is_none());
             for (offset, len) in [(4, 2), (8, 2)] {
-                let decision = s.rx_buffer.store.decide(offset, len, 8);
+                let decision = s.rx_buffer.store.decide(offset, len);
                 s.rx_buffer.store.place(offset, decision);
                 s.rx_buffer.store.attach(RxBuf::from_vec(vec![0; len]));
             }
@@ -9953,42 +8472,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_window_with_six_out_of_order_holes() {
-        for (segment_bytes, expected_window) in [(536usize, 24120usize), (1460, 65536)] {
-            let mut s = socket_with_mbuf_window(2);
-            s.remote_has_sack = true;
-            s.remote_mss = u16::try_from(segment_bytes).expect("test MSS exceeds u16");
-            s.socket.update_rx_mbuf_budget(&s.cx);
-            s.remote_last_win_bytes = u32::try_from(expected_window).expect("test window exceeds u32");
-            let payload = vec![0x5a; segment_bytes];
-            let mut reply = None;
-            for index in 0..6 {
-                let offset = (2 * index + 1) * segment_bytes;
-                reply = Some(receive_window_segment(&mut s, offset, &payload));
-                assert_eq!(reply.as_ref().unwrap().ack_number, Some(REMOTE_SEQ + 1));
-            }
-            assert_eq!(s.rx_mbuf_cap, 45);
-            assert_eq!(s.rx_seg_bytes as usize, segment_bytes);
-            assert_eq!(s.rx_buffer.store.held(), 6);
-            assert_eq!(s.rx_buffer.store.out_of_order_hole_frames(segment_bytes), 6);
-            assert_eq!(s.rx_buffer.store.out_of_order_span(), 12 * segment_bytes);
-            let free_frames = (s.rx_mbuf_cap as usize)
-                .checked_sub(s.rx_buffer.store.held()).expect("held frames exceed cap");
-            let window = free_frames
-                .checked_sub(s.rx_buffer.store.out_of_order_hole_frames(segment_bytes))
-                .expect("holes exceed free frames")
-                .checked_mul(segment_bytes).expect("frame window exceeds usize")
-                .checked_add(s.rx_buffer.store.out_of_order_span()).expect("window exceeds usize")
-                .min(s.recv_capacity());
-            assert_eq!(window, expected_window);
-            assert_eq!(s.recv_window(), window);
-            assert_eq!(reply.unwrap().window_len,
-                u16::try_from(window >> s.remote_win_shift).expect("window field exceeds u16"));
-            assert_eq!(s.recv_queue(), 0);
-            assert_eq!(s.rx_refused_segments(), 0);
-        }
-    }
 
     #[test]
     fn test_fifth_out_of_order_range_is_kept() {
@@ -10061,7 +8544,7 @@ mod test {
         // Ensure that the received window size is shifted right by 2.
         recv!(
             s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1400).win(65185)]
+            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1400).win(65535)]
         );
     }
 
@@ -10564,17 +9047,17 @@ mod test {
             send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(32767));
             s.close();
             recv!(s, time 100, [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
-                .win(24120)]);
+                .win(65535)]);
             send!(s, time 200, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(32767));
-            recv!(s, time 200, [RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(24120)]);
+            recv!(s, time 200, [RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(65535)]);
             send!(s, time 300, SEND_TEMPL.syn().seq(seq).ack(LOCAL_SEQ).win(32767), Some(RECV_TEMPL
-                .seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(24120)));
+                .seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(65535)));
             assert_eq!(s.state(), State::TimeWait);
             assert_eq!(s.tuple, Some(TUPLE));
             assert_eq!(s.local_seq_no, LOCAL_SEQ + 2);
             assert_eq!(s.remote_win_len, 32767);
             send!(s, time 1400, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2)
-                .win(32767), Some(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(24120)));
+                .win(32767), Some(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(65535)));
             assert_eq!(s.state(), State::TimeWait);
         }
     }
@@ -10586,12 +9069,12 @@ mod test {
             send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(32767));
             s.close();
             recv!(s, time 100, [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
-                .win(24120)]);
+                .win(65535)]);
             send!(s, time 200, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(32767));
-            recv!(s, time 200, [RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(24120)]);
+            recv!(s, time 200, [RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(65535)]);
             let time_wait_timer = s.timer;
             send!(s, time 300, SEND_TEMPL.ctl(TcpControl::SynFin).seq(seq).no_ack()
-                .win(32767), Some(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(24120)));
+                .win(32767), Some(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 2).win(65535)));
             assert_eq!(s.state(), State::TimeWait);
             if seq == REMOTE_SEQ + 2 {
                 assert_eq!(s.timer, time_wait_timer);
@@ -10792,7 +9275,6 @@ mod test {
         const MSS: usize = 64;
         let mut s = socket_established_with_buffer_sizes(MSS + 12, 64);
         s.remote_mss = u16::try_from(MSS).expect("test MSS exceeds u16");
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(&[0; MSS + 12]).unwrap();
         recv!(
             s,
@@ -10808,7 +9290,6 @@ mod test {
         const MSS: usize = BASE_MSS as usize;
         let mut s = socket_established_with_buffer_sizes(MSS + 12, 64);
         s.remote_mss = 9999;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.remote_win_len = 9999;
         s.send_slice(&[0; MSS + 12]).unwrap();
         recv!(
@@ -10880,7 +9361,6 @@ mod test {
             let reply = receive_window_segment(&mut s, offset, &bytes[offset..offset + 2]);
             assert_eq!(reply.ack_number, Some(seq + 2));
         }
-        assert_eq!(s.rx_buffer.store.out_of_order_hole_frames(s.rx_seg_bytes as usize), 6);
         assert_eq!(s.rx_buffer.store.held(), 7);
         let reply = send(&mut s, Instant::from_millis(0), &SEND_TEMPL.fin().seq(seq + bytes.len())
             .ack(LOCAL_SEQ + 1)).unwrap();
@@ -11029,12 +9509,12 @@ mod test {
 
     #[test]
     fn test_fin_payload_truncated_at_right_edge() {
-        let (mut s, _frames) = socket_with_held_rx_frames(64, REMOTE_SEQ + 1, 5);
+        let mut s = socket_established_with_buffer_sizes(64, 64);
         send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[0; 65]));
         assert_eq!(s.state, State::Established);
         assert!(!s.rx_fin_received);
         assert_eq!(s.recv_queue(), 64);
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 64).win(0)]);
+        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 64).win(64)]);
     }
 
     #[test]
@@ -11043,17 +9523,15 @@ mod test {
             for len in [64, 1024] {
                 let mut s = socket_established_with_buffer_sizes(64, len);
                 s.remote_mss = BASE_MSS;
-                s.socket.update_rx_mbuf_budget(&s.cx);
-                s.remote_seq_no = seq - 5;
-                s.remote_last_ack = Some(seq - 5);
-                let _frames = hold_rx_frames(&mut s, 5);
+                s.remote_seq_no = seq;
+                s.remote_last_ack = Some(seq);
                 let data = vec![42; len];
                 send!(s, SEND_TEMPL.fin().seq(seq).ack(LOCAL_SEQ + 1).data(&data));
                 assert_eq!(s.state, State::CloseWait);
                 assert!(s.rx_fin_received);
                 assert_eq!(s.rx_fin_seq, None);
                 assert_eq!(s.recv_queue(), len);
-                recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(seq + len + 1).win(0)]);
+                recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(seq + len + 1).win(len as u16)]);
                 let received = drain_bytes(&mut s);
                 assert_eq!(received.len(), len);
                 assert_eq!(received, data);
@@ -11933,13 +10411,11 @@ mod test {
     }
 
     fn check_rst_window_zero_window_payload(seq: TcpSeqNumber) {
-        let (mut s, _frames) = socket_with_held_rx_frames(3, seq, 5);
+        let mut s = socket_with_closing_receive_window(3, seq);
         send!(s, SEND_TEMPL.seq(seq).ack(LOCAL_SEQ + 1).data(&b"abc"[..]));
         recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(seq + 3).win(0)]);
         assert_eq!(s.remote_last_ack, Some(seq + 3));
         assert_eq!(s.remote_last_win_bytes, 0);
-        assert_eq!(s.recv_room(), 0);
-        assert_eq!(s.rx_buffer.store.held() + s.rx_buffer.shared.held.get(), s.rx_frame_cap());
         send!(s, SEND_TEMPL.rst().seq(seq + 2).no_ack().data(&b"a"[..]), Some(RECV_TEMPL
             .seq(LOCAL_SEQ + 1).ack(seq + 3).win(0)));
         assert_eq!(s.state, State::Established);
@@ -12139,10 +10615,9 @@ mod test {
     #[test]
     fn test_established_rst_zero_receive_window() {
         for offset in [1, 0] {
-            let (mut s, _frames) = socket_with_held_rx_frames(3, REMOTE_SEQ + 1, 5);
+            let mut s = socket_with_closing_receive_window(3, REMOTE_SEQ + 1);
             send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abc"[..]));
             recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 4).win(0)]);
-            assert_eq!(s.recv_room(), 0);
             send!(s, SEND_TEMPL.rst().seq(REMOTE_SEQ + 4 + offset).no_ack());
             assert_eq!(s.state, if offset == 0 { State::Closed } else { State::Established });
             recv_nothing!(s);
@@ -12586,7 +11061,6 @@ mod test {
     fn test_last_ack_fast_retransmit_after_triple_duplicate_ack() {
         let mut s = socket_established();
         s.remote_mss = 3;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
         assert_eq!(s.state, State::CloseWait);
         s.send_slice(b"aaaBBBcccDDD").unwrap();
@@ -12596,7 +11070,7 @@ mod test {
         for (offset, payload) in [(0, b"aaa"), (3, b"BBB"), (6, b"ccc"), (9, b"DDD")] {
             recv!(s, time 0, Ok(RECV_TEMPL
                 .ctl(if offset == 9 { TcpControl::Fin } else { TcpControl::None })
-                .seq(LOCAL_SEQ + 1 + offset).ack(REMOTE_SEQ + 2).data(&payload[..]).win(63)));
+                .seq(LOCAL_SEQ + 1 + offset).ack(REMOTE_SEQ + 2).data(&payload[..]).win(64)));
         }
         assert_eq!(s.timer, Timer::Retransmit {
             expires_at: Instant::from_millis(300),
@@ -12608,7 +11082,7 @@ mod test {
         }
         assert_eq!(s.local_rx_dup_acks, 3);
         recv!(s, time 20, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 2).data(b"aaa")
-            .win(63)));
+            .win(64)));
         assert_eq!(s.state, State::LastAck);
     }
 
@@ -12947,7 +11421,6 @@ mod test {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
-        s.socket.update_rx_mbuf_budget(&s.cx);
 
         let data = [b'x'; 8192];
         s.send_slice(&data[..]).unwrap();
@@ -12971,7 +11444,6 @@ mod test {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
-        s.socket.update_rx_mbuf_budget(&s.cx);
 
         // Normal ACK of previously received segment
         send!(s, time 0, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(65535));
@@ -13000,7 +11472,6 @@ mod test {
     fn test_data_retransmit_bursts() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef012345").unwrap();
 
         recv!(s, time 0, Ok(RECV_TEMPL.ctl(TcpControl::None).seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
@@ -13022,7 +11493,6 @@ mod test {
     fn test_data_retransmit_bursts_half_ack() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef012345").unwrap();
 
         recv!(s, time 0, Ok(RECV_TEMPL.ctl(TcpControl::None).seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
@@ -13042,7 +11512,6 @@ mod test {
     fn test_retransmit_timer_restart_on_partial_ack() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef012345").unwrap();
 
         recv!(s, time 0, Ok(RECV_TEMPL.ctl(TcpControl::None).seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
@@ -13155,7 +11624,6 @@ mod test {
     fn test_data_retransmit_bursts_half_ack_close() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef012345").unwrap();
         s.close();
 
@@ -13179,7 +11647,6 @@ mod test {
         let mut s = socket_established();
         s.congestion_controller.set_mss(6);
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef012345").unwrap();
         recv!(s, time 0, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
             .data(&b"abcdef"[..])));
@@ -13197,7 +11664,7 @@ mod test {
         // at or above the peer's RCV.NXT (LOCAL_SEQ + 1 + 12), or the peer
         // drops it without reading its ACK.
         send!(s, time 310, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"xyz"[..]));
-        recv!(s, time 310, [RECV_TEMPL.seq(LOCAL_SEQ + 1 + 12).ack(REMOTE_SEQ + 1 + 3).win(61)]);
+        recv!(s, time 310, [RECV_TEMPL.seq(LOCAL_SEQ + 1 + 12).ack(REMOTE_SEQ + 1 + 3).win(64)]);
     }
 
     #[test]
@@ -13225,7 +11692,6 @@ mod test {
     fn test_zero_window_probe_without_data_keeps_send_cursor_seq() {
         let mut s = socket_established();
         s.remote_mss = 3;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef").unwrap();
         recv!(s, time 0, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"abc"[..])));
         recv!(s, time 0, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + 3).ack(REMOTE_SEQ + 1)
@@ -13340,7 +11806,6 @@ mod test {
     fn test_established_queue_during_retransmission() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef123456ABCDEF").unwrap();
         recv!(s, time 1000, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
             .data(&b"abcdef"[..]))); // this one is dropped
@@ -13395,7 +11860,6 @@ mod test {
     fn test_fast_retransmit_after_triple_duplicate_ack() {
         let mut s = socket_established();
         s.remote_mss = 3;
-        s.socket.update_rx_mbuf_budget(&s.cx);
 
         // Normal ACK of previously received segment
         send!(s, time 0, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
@@ -13440,7 +11904,6 @@ mod test {
     fn socket_fast_retransmit_emit_failed() -> TestSocket {
         let mut s = socket_established();
         s.remote_mss = 3;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"aaaBBBcccDDD").unwrap();
         for (offset, payload) in [(0, b"aaa"), (3, b"BBB"), (6, b"ccc"), (9, b"DDD")] {
             recv!(s, time 0, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + offset).ack(REMOTE_SEQ + 1)
@@ -13477,7 +11940,6 @@ mod test {
     fn socket_data_and_standalone_fin_lost() -> TestSocket {
         let mut s = socket_established();
         s.remote_mss = 3;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"aaaBBBcccDDD").unwrap();
         for offset in [0, 3, 6, 9] {
             recv!(s, time 0, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + offset).ack(REMOTE_SEQ + 1)
@@ -13588,7 +12050,6 @@ mod test {
         s.remote_last_seq = una;
         s.remote_max_seq = una;
         s.remote_mss = 3;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"aaaBBBcccDDD").unwrap();
         for offset in [0, 3, 6, 9] {
             recv!(s, Ok(RECV_TEMPL.seq(una + offset).ack(REMOTE_SEQ + 1)
@@ -13879,7 +12340,6 @@ mod test {
     fn test_fast_retransmit_duplicate_detection() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
 
         // Normal ACK of previously received segment
         send!(s, time 0, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
@@ -13998,7 +12458,6 @@ mod test {
     fn test_data_retransmit_ack_more_than_expected() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"aaaaaabbbbbbcccccc").unwrap();
 
         recv!(s, time 0, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
@@ -14097,7 +12556,7 @@ mod test {
     #[test]
     fn test_maximum_segment_size() {
         let mut s = socket_listen();
-        s.tx_queue = TxQueue::new(32767, 23, s.tx_queue.source().clone());
+        s.tx_queue = TxQueue::new(32767, s.tx_queue.source().clone());
         send!(
             s,
             SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(1000)
@@ -14142,7 +12601,7 @@ mod test {
         drop(s.recv().unwrap().unwrap());
         recv_nothing!(s);
 
-        // Another 32 bytes fit in the frame window without clipping.
+        // Another 32 bytes fit in the advertised window without clipping.
         send!(
             s,
             SEND_TEMPL.psh().seq(REMOTE_SEQ + 34).ack(LOCAL_SEQ + 1).data(&[0; 32])
@@ -14203,7 +12662,6 @@ mod test {
     fn test_psh_transmit() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef").unwrap();
         s.send_slice(b"123456").unwrap();
         recv!(s, time 0, Ok(RECV_TEMPL.ctl(TcpControl::None).seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
@@ -14227,7 +12685,7 @@ mod test {
 
     #[test]
     fn test_zero_window_ack() {
-        let (mut s, _frames) = socket_with_held_rx_frames(6, REMOTE_SEQ + 1, 5);
+        let mut s = socket_with_closing_receive_window(6, REMOTE_SEQ + 1);
         send!(
             s,
             SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..])
@@ -14241,14 +12699,13 @@ mod test {
             SEND_TEMPL.seq(REMOTE_SEQ + 1 + 6).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
             Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0))
         );
-        assert_eq!(s.recv_room(), 0);
         assert_eq!(s.recv_queue(), 6);
         recv_nothing!(s);
     }
 
     #[test]
     fn test_zero_window_ack_not_rate_limited() {
-        let (mut s, _frames) = socket_with_held_rx_frames(6, REMOTE_SEQ + 1, 5);
+        let mut s = socket_with_closing_receive_window(6, REMOTE_SEQ + 1);
         send!(
             s,
             SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..])
@@ -14262,7 +12719,6 @@ mod test {
             SEND_TEMPL.seq(REMOTE_SEQ + 1 + 6).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
             Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0))
         );
-        assert_eq!(s.recv_room(), 0);
         assert_eq!(s.recv_queue(), 6);
         recv_nothing!(s);
         // Repeated data in a zero window must be ACKed without challenge ACK rate limiting.
@@ -14276,7 +12732,7 @@ mod test {
 
     #[test]
     fn test_zero_window_fin() {
-        let (mut s, _frames) = socket_with_held_rx_frames(6, REMOTE_SEQ + 1, 5);
+        let mut s = socket_with_closing_receive_window(6, REMOTE_SEQ + 1);
         s.set_ack_delay(None);
 
         send!(
@@ -14301,22 +12757,6 @@ mod test {
         );
     }
 
-    #[test]
-    fn recv_room_counts_frames() {
-        let mut s = socket_established_with_buffer_sizes(8, 8);
-        assert_eq!(s.recv_room(), s.recv_capacity());
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(b"abcdef")
-        );
-        assert_eq!(s.recv_room(), 8);
-        let frame = s.recv().unwrap().unwrap();
-        assert_eq!(frame.payload(), b"abcdef");
-        assert_eq!(s.recv_room(), 8);
-        assert_eq!(s.recv_queue(), 0);
-        drop(frame);
-        assert_eq!(s.recv_room(), 8);
-    }
 
     #[test]
     fn drain_closed_socket() {
@@ -14341,7 +12781,6 @@ mod test {
     fn test_fill_peer_window() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef123456!@#$%^").unwrap();
         recv!(
             s,
@@ -14353,42 +12792,6 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_announce_window_after_read() {
-        let (mut s, mut frames) = socket_with_held_rx_frames(6, REMOTE_SEQ + 1, 5);
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abc"[..])
-        );
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 3).win(3)]
-        );
-        assert_eq!(s.remote_last_win_bytes, 3);
-        assert_eq!(s.recv_room(), 0);
-        drop(s.recv().unwrap().unwrap());
-        assert!(s.window_to_update());
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 3).win(6)]);
-        // Release another frame so both gap-fill frames fit.
-        drop(frames.pop().unwrap());
-        assert_eq!(s.remote_last_win_bytes as usize, s.rx_buffer.capacity);
-        // Provoke immediate ACK to test that `process` updates `remote_last_win_bytes`
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 6).ack(LOCAL_SEQ + 1).data(&b"def"[..]),
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 3).win(6))
-        );
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 3).ack(LOCAL_SEQ + 1).data(&b"abc"[..]),
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 9).win(0))
-        );
-        assert_eq!(s.remote_last_win_bytes, 0);
-        assert_eq!(s.recv_room(), 0);
-        drop(s.recv().unwrap().unwrap());
-        assert!(s.window_to_update());
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 9).win(6)]);
-    }
 
     // =========================================================================================//
     // Tests for zero-window probes.
@@ -14664,85 +13067,55 @@ mod test {
 
     #[test]
     fn test_zero_window_echo_ack_after_read() {
-        for rx_len in [1024, 16384] {
-            let mut s = socket_with_buffer_sizes(1024, rx_len);
-            s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
-            s.socket.listen(LISTEN_END).unwrap();
-            send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
-            recv!(s, Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).win(rx_len as u16)
-                .mss(BASE_MSS)));
-            send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
+        let rx_len = 16384;
+        let mut s = socket_with_buffer_sizes(1024, rx_len);
+        s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
+        s.socket.listen(LISTEN_END).unwrap();
+        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
+        recv!(s, Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).win(rx_len as u16)
+            .mss(BASE_MSS)));
+        send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
 
-            let held_count = if rx_len == 1024 {
-                s.rx_frame_cap().checked_sub(1).expect("RX frame budget is empty")
-            } else {
-                0
-            };
-            let _frames = hold_rx_frames(&mut s, held_count);
-            let data_seq = s.remote_seq_no;
-            send!(s, time 1200, SEND_TEMPL.seq(data_seq).ack(LOCAL_SEQ + 1).win(0)
-                .data(&[0; 1024]));
-            assert_eq!(s.ack_delay_timer(),
-                       AckDelayTimer::Waiting(Instant::from_millis(1210)));
-            assert!(!s.delayed_ack_expired(s.cx.now()));
-            assert!(!s.socket.seq_to_transmit());
-            assert!(!s.window_to_update());
-            recv_nothing!(s, time 1200);
-            assert_eq!(s.recv_room() == 0, rx_len == 1024);
+        let data_seq = s.remote_seq_no;
+        send!(s, time 1200, SEND_TEMPL.seq(data_seq).ack(LOCAL_SEQ + 1).win(0)
+            .data(&[0; 1024]));
+        assert_eq!(s.ack_delay_timer(),
+                   AckDelayTimer::Waiting(Instant::from_millis(1210)));
+        assert!(!s.delayed_ack_expired(s.cx.now()));
+        assert!(!s.socket.seq_to_transmit());
+        assert!(!s.window_to_update());
+        recv_nothing!(s, time 1200);
 
-            let echo = drain_bytes(&mut s);
-            assert_eq!(echo.len(), 1024);
-            assert_eq!(s.send_slice(&echo), Ok(1024));
+        let echo = drain_bytes(&mut s);
+        assert_eq!(echo.len(), 1024);
+        assert_eq!(s.send_slice(&echo), Ok(1024));
+        assert!(s.timer.is_idle());
+        assert_eq!(s.last_scaled_window(), Some(rx_len as u16 - 1024));
+        assert_eq!(s.scaled_window(), rx_len as u16);
+        assert!(!s.window_to_update());
+        assert_eq!(s.ack_delay_timer(),
+                   AckDelayTimer::Waiting(Instant::from_millis(1210)));
+        assert_eq!(s.socket.poll_at(), PollAt::Now);
 
-            assert!(s.timer.is_idle());
-            assert_eq!(s.last_scaled_window(), Some(rx_len as u16 - 1024));
-            assert_eq!(s.scaled_window(), rx_len as u16);
-            assert_eq!(s.window_to_update(), rx_len == 1024);
-            assert_eq!(s.ack_delay_timer(),
-                       AckDelayTimer::Waiting(Instant::from_millis(1210)));
-            assert_eq!(s.socket.poll_at(), PollAt::Now);
+        let ack = RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(data_seq + 1024).win(rx_len as u16);
+        recv_nothing!(s, time 1200);
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(1210)));
+        recv_nothing!(s, time 1209);
+        recv!(s, time 1210, Ok(ack));
+        assert_eq!(s.timer, Timer::ZeroWindowProbe {
+            expires_at: Instant::from_millis(1500),
+            backoff_applied: false,
+        });
+        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(1500)));
+        recv_nothing!(s, time 1210);
+        assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1);
+        assert_eq!(s.send_queue(), 1024);
 
-            let ack = RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(data_seq + 1024).win(rx_len as u16);
-            if rx_len == 1024 {
-                recv!(s, time 1200, Ok(ack));
-                assert_eq!(s.ack_delay_timer(), AckDelayTimer::Idle);
-                assert!(!s.ack_to_transmit());
-                assert!(!s.window_to_update());
-            } else {
-                recv_nothing!(s, time 1200);
-                assert_eq!(s.socket.poll_at(),
-                           PollAt::Time(Instant::from_millis(1210)));
-                recv_nothing!(s, time 1209);
-                recv!(s, time 1210, Ok(ack));
-            }
-            assert_eq!(s.timer, Timer::ZeroWindowProbe {
-                expires_at: Instant::from_millis(1500),
-                backoff_applied: false,
-            });
-            assert_eq!(s.socket.poll_at(),
-                       PollAt::Time(Instant::from_millis(1500)));
-            recv_nothing!(s, time 1210);
-            assert_eq!(s.remote_last_seq, LOCAL_SEQ + 1);
-            assert_eq!(s.send_queue(), 1024);
-
-            if rx_len == 1024 {
-                send!(s, time 1300, SEND_TEMPL.seq(data_seq + 1024).ack(LOCAL_SEQ + 1).win(0)
-                    .data(&[0; 1024]));
-                assert_eq!(s.send_capacity() - s.send_queue(), 0);
-                assert_eq!(s.recv_room(), 0);
-                assert_eq!(s.scaled_window(), 0);
-                assert!(!s.window_to_update());
-                assert_eq!(s.socket.poll_at(),
-                           PollAt::Time(Instant::from_millis(1310)));
-                recv_nothing!(s, time 1309);
-                recv!(s, time 1310, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(data_seq + 2048).win(0)));
-            }
-            let ack_number = s.remote_last_ack;
-            let window_len = s.scaled_window();
-            recv!(s, time 1500, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack_opt(ack_number).win(window_len)
-                .data(&[0])]);
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
-        }
+        let ack_number = s.remote_last_ack;
+        let window_len = s.scaled_window();
+        recv!(s, time 1500, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack_opt(ack_number).win(window_len)
+            .data(&[0])]);
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
     }
 
     #[test]
@@ -14881,7 +13254,6 @@ mod test {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
-        s.socket.update_rx_mbuf_budget(&s.cx);
 
         let data = [b'x'; 4096];
         s.send_slice(&data[..]).unwrap();
@@ -15418,7 +13790,6 @@ mod test {
 
         let mut s = socket_established_with_buffer_sizes(256, 64);
         s.remote_mss = u16::try_from(EFFECTIVE_MSS).expect("test MSS exceeds u16");
-        s.socket.update_rx_mbuf_budget(&s.cx);
 
         s.send_slice(b"abcdef").unwrap();
         recv!(
@@ -15438,7 +13809,6 @@ mod test {
     fn test_final_packet_in_stream_sent_promptly() {
         let mut s = socket_established();
         s.remote_mss = 6;
-        s.socket.update_rx_mbuf_budget(&s.cx);
         s.send_slice(b"abcdef0").unwrap();
         s.socket.close();
 
@@ -15547,7 +13917,6 @@ mod test {
             let mut s = socket_established();
             s.set_rto(rto);
             s.remote_mss = 6;
-            s.socket.update_rx_mbuf_budget(&s.cx);
             s.send_slice(b"abcdef012345").unwrap();
             for offset in [0, 6] {
                 recv(&mut s, Instant::ZERO, |result| {
@@ -15961,7 +14330,6 @@ mod test {
             let mut s = socket_established_with_buffer_sizes(1460, 64);
             assert_eq!(s.cx.ip_mtu(), 1500);
             s.remote_mss = remote_mss;
-            s.socket.update_rx_mbuf_budget(&s.cx);
             s.remote_win_len = 4096;
             s.send_slice(&[0; 1460]).unwrap();
             recv(&mut s, Instant::ZERO, |result| {
@@ -16102,10 +14470,10 @@ mod test {
     #[test]
     fn peer_keep_alive_and_zero_window_probe_are_acked() {
         for zero_window in [false, true] {
-            let (mut s, _frames) = if zero_window {
-                socket_with_held_rx_frames(64, REMOTE_SEQ + 1, 5)
+            let mut s = if zero_window {
+                socket_with_closing_receive_window(64, REMOTE_SEQ + 1)
             } else {
-                (socket_established(), Vec::new())
+                socket_established()
             };
             let next = if zero_window {
                 send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[7; 64]));
@@ -16114,7 +14482,6 @@ mod test {
             } else {
                 REMOTE_SEQ + 1
             };
-            assert_eq!(s.recv_room(), if zero_window { 0 } else { 64 });
             let window_len = if zero_window { 0 } else { 64 };
             let probes: &[&[u8]] = if zero_window { &[b"\x00"] } else { &[b"", b"\x00"] };
             for &payload in probes {

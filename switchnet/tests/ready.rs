@@ -105,7 +105,7 @@ fn one_of_a_thousand_parked_receivers_wakes() {
 fn halves_of_one_stream_wake_independently() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["hlva", "hlvb"]);
-        let stalling = tcp::Config { tx_capacity: 32 * 1024, ..tcp_config() };
+        let stalling = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling);
         let (mut rx, mut tx) = stream.split();
         let (reader, reads) = counted(async move {
@@ -113,7 +113,7 @@ fn halves_of_one_stream_wake_independently() {
             (rx, frame)
         });
         let reader = mixed.spawn(reader);
-        let data = pattern(64 * 1024, 4);
+        let data = pattern(2000, 4);
         let handle = mixed.handle();
         let sent = data.clone();
         let (writer, writes) = counted(async move {
@@ -127,25 +127,37 @@ fn halves_of_one_stream_wake_independently() {
             tx
         });
         let writer = mixed.spawn(writer);
-        mixed.rounds(50);
+        mixed.to_peer.paused = true;
+        mixed.turn();
         let (parked_reads, parked_writes) = (reads.get(), writes.get());
-        mixed.rounds(10);
+        for _ in 0..10 {
+            mixed.turn();
+        }
         assert_eq!((reads.get(), writes.get()), (parked_reads, parked_writes), "parked tasks were polled");
         assert!(!writer.is_full());
 
         peer_send(&mut mixed, &peer, b"to the reader");
-        mixed.until(|_| reader.is_full());
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        assert!(mixed.to_net.forward() > 0);
+        mixed.turn();
+        assert!(reader.is_full());
         assert_eq!(reads.get(), parked_reads + 1);
         assert_eq!(writes.get(), parked_writes, "data for the reader polled the writer");
         let (rx, frame) = reader.take();
         assert_eq!(frame.payload(), b"to the reader");
 
+        mixed.to_peer.paused = false;
         let mut got = Vec::new();
         mixed.until(|m| {
             peer_drain(m, &peer, &mut got);
             writer.is_full()
         });
         assert!(writes.get() > parked_writes);
+        mixed.until(|m| {
+            peer_drain(m, &peer, &mut got);
+            got.len() == data.len()
+        });
+        assert_eq!(got, data);
         let tx = writer.take();
         drop((rx, frame, tx, peer));
         mixed.close();

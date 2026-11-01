@@ -3,7 +3,6 @@
 //! segments and send one ACK, then read all k × 1448 bytes from B's socket.
 //! rx_seg receives eight in-order segments of 64, 200, 512 or 1448 bytes.
 //! A drain read returns each whole frame and drops it inside the timed region.
-//! A frame may contain several small in-order segments copied into its tailroom.
 //! The turn and read are timed together; one throughput element is a segment.
 //! A's write and turn, forwarding, frame checks and ACK handling are untimed.
 //! Both sockets use Cubic with the default 1 MiB initial window, no ACK delay,

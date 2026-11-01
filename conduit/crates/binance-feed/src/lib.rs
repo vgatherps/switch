@@ -1,6 +1,6 @@
 //! Client of Binance's bookTicker stream: TLS 1.3 and WebSocket (relay's wss client over
-//! sheath) on one switchnet TCP socket, run as a switch task. The Runtime's ticks are
-//! milliseconds ([`Clock::ms`]).
+//! sheath) on one switchnet TCP socket, run as a switch task. Runtime ticks are monotonic
+//! nanoseconds ([`Clock::ns`]).
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -35,8 +35,7 @@ pub const CONNECT_LIMIT: Duration = Duration::from_secs(20);
 /// The WebSocket close handshake, close_notify and FIN.
 pub const CLOSE_LIMIT: Duration = Duration::from_secs(10);
 
-/// Wall clock since `start`: Stack time in microseconds (panics past i64 microseconds) and
-/// Runtime ticks in milliseconds.
+/// Monotonic time since `start`: Stack time in microseconds and Runtime ticks in nanoseconds.
 pub struct Clock {
     start: WallInstant,
 }
@@ -50,6 +49,18 @@ impl Clock {
         let micros = i64::try_from(self.start.elapsed().as_micros())
             .expect("elapsed wall time fits i64 microseconds");
         Instant::from_micros(micros)
+    }
+
+    pub fn ns(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_nanos())
+            .expect("elapsed time fits u64 nanoseconds")
+    }
+
+    /// Stack time and Runtime ticks from the same clock sample.
+    pub fn sample(&self) -> (Instant, u64) {
+        let nanos = self.ns();
+        let micros = i64::try_from(nanos / 1_000).expect("elapsed time fits i64 microseconds");
+        (Instant::from_micros(micros), nanos)
     }
 
     pub fn ms(&self) -> u64 {
@@ -458,6 +469,17 @@ async fn close(mut wss: Wss, spawner: &Spawner) -> Result<(), FeedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_sample_uses_one_nanosecond_clock_for_both_times() {
+        let start = WallInstant::now() - Duration::from_millis(123);
+        let clock = Clock::new(start);
+        let before = start.elapsed().as_nanos();
+        let (stack, ticks) = clock.sample();
+        let after = start.elapsed().as_nanos();
+        assert!((before..=after).contains(&u128::from(ticks)));
+        assert_eq!(stack, Instant::from_micros(i64::try_from(ticks / 1_000).unwrap()));
+    }
 
     #[test]
     fn resolve_takes_the_first_ipv4_address() {

@@ -2,7 +2,7 @@
 # Turns a fresh Amazon Linux 2023 EC2 instance (x86_64 or arm64) with two ENIs into a host for the
 # Binance listener (`zhida-nic feed`, run by deploy/run-binance.sh). Run as root from the repository.
 #
-# Usage: hft-host.sh build|apply|boot|verify [--interface IF]
+# Usage: hft-host.sh build|apply|boot|verify [--interface IF] [--kernel-receiver]
 #
 #   build   dnf toolchain, rustup (rust-toolchain.toml), DPDK 25.11.3 under /opt/dpdk with
 #           conduit/docker/Dockerfile's meson options, release zhida-nic (mimalloc) and zhida-netconf
@@ -10,7 +10,7 @@
 #   apply   build, then every setting below. Reboots once when the kernel command line or the ENA
 #           module changed; zhida-host.service runs `boot` at every boot, after which verify passes.
 #   boot    the settings a reboot resets: irqbalance off, IRQs on the housekeeping CPUs, the data ENI
-#           unmanaged and flushed, the data ENI on vfio-pci.
+#           unmanaged and flushed, then bound to vfio-pci unless --kernel-receiver was used.
 #   verify  one line per setting, "<step>: ok <detail>" or "<step>: FAIL <detail>"; exit 1 if any failed.
 #
 # Interfaces: the management ENI is the interface of the lowest-metric IPv4 default route; nothing
@@ -33,6 +33,7 @@ LOG=$R/var/log/zhida/binance.log
 UNIT=$R/etc/systemd/system/zhida-host.service
 SELF=$R/usr/local/sbin/zhida-hft-host
 NETWORK=$R/etc/systemd/network/00-zhida-data.network
+NETWORKD_POLICY=$R/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf
 UNMOVABLE=$R/run/zhida-unmovable-irqs
 HUGEPAGES=512
 
@@ -42,14 +43,16 @@ AMZN_COMMIT=9d5ca4021f7c9f8421e404c1e89edb0b1325372c
 AMZN_SHA256=895f08f081023b4840d0555cb79d9d13ac1dd0a6722c4dc1181a34927e2b2d39
 
 die() { echo "hft-host: $*" >&2; exit 2; }
-usage="usage: hft-host.sh build|apply|boot|verify [--interface IF]"
+usage="usage: hft-host.sh build|apply|boot|verify [--interface IF] [--kernel-receiver]"
 mode=${1:-}
 case "$mode" in build | apply | boot | verify) ;; *) die "$usage" ;; esac
 shift
 want_if=
+requested_driver=vfio-pci
 while [ $# -gt 0 ]; do
     case "$1" in
         --interface) [ $# -ge 2 ] || die "--interface needs a value"; want_if=$2; shift 2 ;;
+        --kernel-receiver) requested_driver=ena; shift ;;
         *) die "unknown option $1; $usage" ;;
     esac
 done
@@ -240,6 +243,7 @@ DATA_MAC=$DATA_MAC
 NUMA_NODE=$NUMA_NODE
 APP_CPU=$APP_CPU
 ISOLATED=$ISOLATED
+DATA_DRIVER=$DATA_DRIVER
 HOUSEKEEPING=$HOUSEKEEPING" || true
 }
 
@@ -411,23 +415,35 @@ boot() {
     step_irqbalance
     step_irqs
     step_unmanaged
-    step_bind
+    [ "${DATA_DRIVER:-vfio-pci}" = ena ] || step_bind
 }
 
 apply() {
     build
     step_interfaces
+    DATA_DRIVER=$requested_driver
     step_cpus
     save_env
     step_config
     step_cmdline
-    step_vfio_wc
+    [ "$DATA_DRIVER" = ena ] || step_vfio_wc
     step_unit
+    if [ "$DATA_DRIVER" = ena ]; then
+        policy_config="[Network]
+ManageForeignRoutingPolicyRules=no"
+        if [ ! -f "$NETWORKD_POLICY" ] || [ "$(cat "$NETWORKD_POLICY")" != "$policy_config" ]; then
+            put "$NETWORKD_POLICY" "$policy_config" || fatal networkd_policy "cannot write $NETWORKD_POLICY"
+        fi
+    fi
     if [ -n "$reboot_needed" ]; then
         stage_unmanaged
         echo "reboot: rebooting now for:$reboot_needed; zhida-host.service finishes at boot, then run hft-host.sh verify"
         systemctl reboot
         exit 100
+    fi
+    if [ "$DATA_DRIVER" = ena ]; then
+        stage_unmanaged
+        systemctl restart systemd-networkd.service || fatal networkd_policy "cannot restart systemd-networkd"
     fi
     boot
 }
@@ -473,10 +489,11 @@ verify() {
     fi
 
     drv=$(pci_driver "$DATA_PCI")
-    if [ "$drv" = vfio-pci ]; then
-        report data ok "$DATA_PCI ($DATA_MAC) on vfio-pci"
+    want_driver=${DATA_DRIVER:-vfio-pci}
+    if [ "$drv" = "$want_driver" ]; then
+        report data ok "$DATA_PCI ($DATA_MAC) on $want_driver"
     else
-        report data FAIL "$DATA_PCI on '${drv}', want vfio-pci"
+        report data FAIL "$DATA_PCI on '${drv}', want $want_driver"
     fi
 
     iso=$(cat "$R/sys/devices/system/cpu/isolated" 2>/dev/null)
@@ -510,7 +527,9 @@ verify() {
     if pgrep -x irqbalance >/dev/null; then report irqbalance FAIL "running"; else report irqbalance ok "off"; fi
     check_irqs
 
-    if ! vfio_wc_installed; then
+    if [ "${DATA_DRIVER:-vfio-pci}" = ena ]; then
+        report vfio_wc ok "not required for kernel receiver"
+    elif ! vfio_wc_installed; then
         report vfio_wc FAIL "no write-combining vfio-pci for $(uname -r): rerun apply${vfio_wc_error:+; $vfio_wc_error}"
     elif [ -n "$(modinfo -F srcversion vfio_pci_core)" ] \
         && [ "$(cat "$R/sys/module/vfio_pci_core/srcversion" 2>/dev/null)" = "$(modinfo -F srcversion vfio_pci_core)" ]; then

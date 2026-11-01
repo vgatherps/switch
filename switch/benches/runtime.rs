@@ -161,7 +161,6 @@ fn runtime_benches(c: &mut Criterion) {
         b.iter(|| black_box(pending.step()))
     });
     let polls = pending.polls.get();
-    assert!(polls > 1);
     assert_eq!(workload::counts(pending.finish()), (1, 0));
     assert_eq!(pending.drops.get(), 1);
     black_box(polls);

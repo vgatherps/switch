@@ -76,13 +76,29 @@ where
     /// the message returns without waiting on it. Without one, input and the next send job
     /// are awaited together; whichever is ready first is handled, both if both are.
     pub(crate) async fn recv(&mut self) -> Result<Option<Message<'_>>, TxError> {
+        if self.message_ready().await? {
+            Ok(self.rx.take_message())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) async fn recv_with_sender(&mut self) -> Result<Option<(Message<'_>, &mut TxCore<T>)>, TxError> {
+        if self.message_ready().await? {
+            Ok(self.rx.take_message().map(|message| (message, &mut self.tx)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn message_ready(&mut self) -> Result<bool, TxError> {
         // Parsing stops only where it needs input, so it runs again only once input came.
         let mut parse = true;
         loop {
             self.settle();
             if parse && self.rx_in == RxIn::Reading && self.rx_step() {
                 self.tx.service().await;
-                return Ok(self.rx.take_message());
+                return Ok(true);
             }
             let over = match self.tx.end() {
                 End::Delivered => true,
@@ -92,7 +108,7 @@ where
                 End::Open | End::Notify | End::Fin => false,
             };
             if over {
-                return self.tx.result().map(|()| None);
+                return self.tx.result().map(|()| false);
             }
             parse = self.wait().await;
         }

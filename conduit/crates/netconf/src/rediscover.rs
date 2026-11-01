@@ -6,9 +6,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-/// Discovered facts replace the previous ones; what the source cannot discover is kept as
-/// configured: devargs, offloads, rx_timestamps, descriptors, eal, path rules other than `vpc`
-/// and `default`, and `owned_ipv4` unless the source enumerates the interface's addresses.
+/// Discovered facts replace the previous ones; a configured jumbo MTU, devargs, offloads,
+/// rx_timestamps, descriptors, eal, path rules other than `vpc` and `default`, and `owned_ipv4`
+/// unless the source enumerates the interface's addresses are kept.
 pub(crate) fn merge(
     mut discovered: Config,
     enumerates_owned_ipv4: bool,
@@ -16,6 +16,9 @@ pub(crate) fn merge(
 ) -> Result<Config, ConfigError> {
     if !enumerates_owned_ipv4 {
         discovered.owned_ipv4.clone_from(&previous.owned_ipv4);
+    }
+    if previous.mtu > 1500 {
+        discovered.mtu = previous.mtu;
     }
     if let (Device::Pci(new), Device::Pci(old)) = (&mut discovered.device, &previous.device) {
         new.devargs.clone_from(&old.devargs);

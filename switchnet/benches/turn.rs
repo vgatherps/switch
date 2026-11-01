@@ -58,13 +58,12 @@ fn udp_config(port: u16) -> UdpConfig {
     UdpConfig { port, local_addr: None, rx_queue: UDP_QUEUE, tx_checksum: true, broadcast: false }
 }
 
-/// A Stack with `tcp` TCP and `udp` UDP slots (at least one of each), pools
-/// sized for every socket.
+/// A Stack with `tcp` TCP and `udp` UDP slots (at least one of each).
 fn open(eal: &Eal, fixture: &RingPort, side: Side, tcp: usize, udp: usize) -> Stack {
     let stack_config = StackConfig { max_sockets: tcp.max(1), max_udp_sockets: udp.max(1), ..pair::config(side) };
     let mut config = fixture.config();
-    // Every socket's window and UDP queue full at once: the bench asserts lossless links.
-    let rx_share = tcp * tcp::rx_mbuf_budget(&tcp_config(), config.mtu.into()) + udp.max(1) * UDP_QUEUE;
+    // TCP transfers one ready segment at a time; UDP queues can all fill.
+    let rx_share = 64 + udp.max(1) * UDP_QUEUE;
     let frame_share = tcp * tcp::tx_mbuf_budget(&tcp_config(), config.mtu.into()) + 64;
     let reserve = rx_reserve(config.rx_descriptors, config.rx_burst, stack_config.rx_staging, config.rx_pool.cache_size);
     config.rx_pool.count = u32::try_from(reserve + rx_share).unwrap();

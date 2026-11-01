@@ -45,7 +45,7 @@ const HEADERS: usize = 54;
 const FRAME_DATA_OFF: u16 = RTE_PKTMBUF_HEADROOM as u16 + 42;
 /// A published TCP frame starts its 54 header bytes this far into its buffer.
 const PUBLISHED_DATA_OFF: u16 = FRAME_DATA_OFF - HEADERS as u16;
-/// Frames of one 4 KiB socket: the six-frame floor.
+/// Full-sized-segment estimate for one 4 KiB socket, including the six-frame floor.
 const SMALL_FRAMES: usize = 6;
 
 fn small_socket() -> tcp::Config {
@@ -769,9 +769,9 @@ fn tcp_frame_from_other_stack_is_foreign() {
 }
 
 /// Sockets share the frame pool: three are added to a pool of `frame_reserve` plus one
-/// socket's frame limit. With the application holding all but three frames, one socket's
-/// 4096-byte send takes them; the second socket's send then queues nothing (`Ok(0)`) and
-/// `tx_frame` has none, until the first socket's data is ACKed and its frames return.
+/// socket's full-sized-segment estimate. With the application holding all but three frames,
+/// one socket's 4096-byte send takes them; the second socket's send then queues nothing
+/// (`Ok(0)`) and `tx_frame` has none until the first socket's data is ACKed.
 #[zhida_test_support::pinned_test]
 fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
     with_eal(|eal| {
@@ -780,7 +780,6 @@ fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
         let first = host.connect(LOCAL_PORT, small_socket());
         let second = host.connect(LOCAL_PORT + 1, small_socket());
         let third = host.stack.add_tcp(small_socket()).unwrap();
-        assert_eq!(host.stack.tcp(&third).tx_frame_cap(), SMALL_FRAMES);
         let mut held = Vec::new();
         while let Some(frame) = host.stack.tx_frame() {
             held.push(frame);
@@ -811,6 +810,41 @@ fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
         host.ack(&second, second.seq + 5);
         drop(held);
         drop(third);
+        host.finish();
+    });
+}
+
+/// Individually emitted small writes may occupy more frames than the full-sized
+/// estimate; the byte limit and the shared pool still bound queued data.
+#[zhida_test_support::pinned_test]
+fn small_writes_exceed_frame_estimate_but_respect_byte_capacity() {
+    with_eal(|eal| {
+        let mut host = Host::new(eal, "smwrites", 1, None);
+        let config = tcp::Config { rx_capacity: 4096, tx_capacity: 8, mss_cap: None };
+        assert_eq!(tcp::tx_mbuf_budget(&config, 1500), 6);
+        let conn = host.connect(LOCAL_PORT, config);
+
+        for byte in 0..8u8 {
+            assert_eq!(host.stack.tcp_mut(&conn.handle).send_slice(&[byte]), Ok(1));
+            assert_eq!(host.turn().tx_accepted, 1);
+            let sent = host.take();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].tcp().seq_number, conn.seq + usize::from(byte));
+            assert_eq!(sent[0].tcp().payload, &[byte]);
+            drop(sent);
+        }
+        assert_eq!(host.frame_in_use(), 8);
+        assert_eq!(host.stack.tcp(&conn.handle).send_queue(), 8);
+        assert_eq!(host.stack.tcp_mut(&conn.handle).send_slice(b"x"), Ok(0));
+        host.ack(&conn, conn.seq + 8);
+        assert_eq!(host.stack.tcp(&conn.handle).send_queue(), 0);
+        assert_eq!(host.stack.tcp_mut(&conn.handle).send_slice(b"x"), Ok(1));
+        host.turn();
+        let sent = host.take();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].tcp().payload, b"x");
+        drop(sent);
+        host.ack(&conn, conn.seq + 9);
         host.finish();
     });
 }
@@ -866,9 +900,9 @@ fn frame_pool_wait_fires_the_tx_token_when_frames_return() {
     });
 }
 
-/// The application holds every frame but the reserve and one socket's frame limit:
-/// the peer's data is still ACKed, an ARP request is still answered, and the socket
-/// still fills all its frame slots.
+/// The application holds every frame but the reserve and one socket's full-sized
+/// estimate: the peer's data is still ACKed, an ARP request is still answered,
+/// and the socket can still queue its full byte capacity.
 #[zhida_test_support::pinned_test]
 fn app_held_saturation_leaves_ack_and_arp_working() {
     with_eal(|eal| {
@@ -960,8 +994,8 @@ fn frame_send_takes_no_tx_packet() {
 /// net_ring keeps sent frames on its TX ring, and the kit sets the TX
 /// descriptors to the ring size: with the ring full of frames the Stack
 /// published and the socket has since released, the frame pool still holds
-/// the socket's frame limit and C + 2 more, and published frames use no TX
-/// packet.
+/// the full-sized-segment estimate and C + 2 more, and published frames use
+/// no TX packet.
 #[zhida_test_support::pinned_test]
 fn kit_ring_descriptors_match_ring_size_with_published_frames() {
     with_eal(|eal| {

@@ -47,7 +47,7 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// fuzzingserver starts once it saw the netdev up, which can be later; this limit can then
 /// expire first by that gap, and expiry only fails the run.
 const SERVER_READY_LIMIT: Duration = Duration::from_secs(60);
-const SERVER_READY_POLL_MS: u64 = 10;
+const SERVER_READY_POLL: Duration = Duration::from_millis(10);
 
 fn usage() -> String {
     format!(
@@ -236,7 +236,7 @@ fn drive(
     role: &Role,
     deadline: Duration,
 ) -> Result<(), Failure> {
-    let mut rt = Runtime::new(0);
+    let mut rt = Runtime::new(u64::try_from(elapsed().as_nanos()).expect("elapsed fits u64 ns"));
     let tally: Rc<RefCell<Tally>> = Rc::default();
     let outcome: Rc<RefCell<Option<Result<(), Failure>>>> = Rc::default();
     let task = run_role(net.handle(), rt.spawner(), role.clone(), deadline, tally.clone(), outcome.clone());
@@ -244,7 +244,7 @@ fn drive(
     let turned = loop {
         let since = elapsed();
         let now = Instant::from_micros(i64::try_from(since.as_micros()).expect("elapsed fits i64 microseconds"));
-        let tick = u64::try_from(since.as_millis()).expect("elapsed fits u64 ms");
+        let tick = u64::try_from(since.as_nanos()).expect("elapsed fits u64 ns");
         match round(net, &mut rt, now, tick) {
             Ok(true) => {}
             // Nothing moved: sleep until the Stack's next timer, at most 1 ms (wstest shares the CPU).
@@ -330,7 +330,7 @@ async fn client(
         if waiting.elapsed() >= SERVER_READY_LIMIT {
             return Err(Failure::NoServerReady);
         }
-        let poll = spawner.sleep(SERVER_READY_POLL_MS).expect("the Runtime polling this task is open");
+        let poll = spawner.sleep(SERVER_READY_POLL.as_nanos() as u64).expect("the Runtime polling this task is open");
         poll.await.expect("a sleep in the task's own open Runtime");
     }
     let mut buf = Vec::new();

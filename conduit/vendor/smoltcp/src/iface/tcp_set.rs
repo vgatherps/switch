@@ -199,7 +199,7 @@ impl fmt::Display for SocketHandle {
 /// socket for data and settings, which cannot change the key, and marks it dirty.
 ///
 /// Readiness tokens: [`arm`](Self::arm) stores a caller's `u32` for one half of a socket.
-/// Every change that marks the socket dirty (ingress, `get_mut`, a receive wake, timer and
+/// Every change that marks the socket dirty (ingress, `get_mut`, a frame-pool wake, timer and
 /// neighbor rescans) and every state change in egress fires each armed token of the socket:
 /// it moves to a list that [`pop_fired`](Self::pop_fired) drains, and is disarmed. A token
 /// fires at most once per arm; the list holds two per slot without growing while no token is
@@ -320,16 +320,15 @@ impl<'a> TcpSet<'a> {
         handle
     }
 
-    /// Build a socket from `config`, fix its RX frame count to
-    /// [`tcp::rx_mbuf_budget`]`(config, ip_mtu)` and add it. Its TX frames come from
-    /// `tx_source`, at most [`tcp::tx_mbuf_budget`]`(config, ip_mtu)` queued at a time. Both
-    /// are per-socket limits; the frames come from pools shared by every socket. Outside this
-    /// crate, sockets are created only here and [`TcpSet::remove`] drops them, so no owned
-    /// socket leaves the set.
+    /// Build a socket from `config` and add it. Its receive window target is
+    /// `config.rx_capacity`; received frames come from the shared RX pool. Its TX frames
+    /// come from `tx_source`, with queued bytes limited by `config.tx_capacity`.
+    /// Outside this crate, sockets are created only here and [`TcpSet::remove`]
+    /// drops them, so no owned socket leaves the set.
     ///
     /// # Panics
     /// This function panics if `ip_mtu` is below 68, `config.rx_capacity` exceeds 1 GiB,
-    /// `config.mss_cap` is `Some(0)`, the frame count exceeds u32, or the set is full.
+    /// `config.mss_cap` is `Some(0)`, TX segment bytes exceed u32, or the set is full.
     pub fn add_admitted(
         &mut self,
         config: &tcp::Config,
@@ -337,10 +336,9 @@ impl<'a> TcpSet<'a> {
         tx_source: crate::phy::TxSource,
         wake: super::DropQueue,
     ) -> SocketHandle {
-        let mut socket = tcp::Socket::from_config(config, ip_mtu, tx_source);
-        socket.set_rx_mbuf_budget(ip_mtu);
+        let socket = tcp::Socket::from_config(config, ip_mtu, tx_source);
         let handle = self.add(socket);
-        self.item_mut(handle).socket.set_rx_wake(wake, handle);
+        self.item_mut(handle).socket.set_frame_wake(wake, handle);
         handle
     }
 
@@ -489,16 +487,6 @@ impl<'a> TcpSet<'a> {
         }
     }
 
-    /// Complete a queued receive wake and schedule the socket's readiness check.
-    pub fn rx_woken(&mut self, handle: SocketHandle) {
-        let socket = &mut self.sockets.get_mut(handle.index)
-            .filter(|slot| slot.generation == handle.generation)
-            .and_then(|slot| slot.inner.as_mut())
-            .expect("receive wake does not name a live TCP socket").socket;
-        socket.clear_rx_wake_queued();
-        self.mark_dirty(handle.index);
-    }
-
     /// Complete a frame wait: the frame pool has a free frame again, so fire the socket's
     /// readiness tokens and schedule its readiness check. Removal takes a socket off the
     /// wait list, so `handle` names a live socket.
@@ -552,7 +540,7 @@ impl<'a> TcpSet<'a> {
     }
 
     /// Removes a socket from the set without changing its state, discarding unread received
-    /// bytes and clearing receive wakes. Returns the frames the application still holds. The
+    /// bytes and cancelling a frame-pool wait. Returns the frames the application still holds. The
     /// socket itself is dropped, releasing its queued TX frames: handing it out would let a
     /// caller write it over another socket through `get_mut`.
     ///
@@ -598,7 +586,7 @@ impl<'a> TcpSet<'a> {
         self.set_occupied(handle.index, false);
         match self.sockets[handle.index].inner.take() {
             Some(mut item) => {
-                item.socket.clear_rx_wake();
+                item.socket.clear_frame_wake();
                 item.socket.discard_received();
                 item.socket
             }
@@ -1542,14 +1530,11 @@ mod tests {
         a_set.get_mut(ah);
         assert_eq!(fired(&mut a_set), [], "a fired token is disarmed");
 
-        // App changes and receive wakes fire; a re-arm replaces the token.
+        // App changes fire; a re-arm replaces the token.
         a_set.arm(ah, Rx, 12);
         a_set.arm(ah, Rx, 13);
         a_set.get_mut(ah);
         assert_eq!(fired(&mut a_set), [13]);
-        a_set.arm(ah, Tx, 14);
-        a_set.rx_woken(ah);
-        assert_eq!(fired(&mut a_set), [14]);
 
         // disarm reports whether the token was still armed.
         a_set.arm(ah, Rx, 15);
@@ -1696,19 +1681,17 @@ mod tests {
     }
 
     #[test]
-    fn add_admitted_preserves_configured_rx_budget() {
+    fn add_admitted_preserves_configured_rx_window() {
         use crate::wire::IpAddress;
 
         let mut set = TcpSet::new(64);
         let config = tcp::Config { rx_capacity: 4096, tx_capacity: 64, mss_cap: Some(100) };
-        let budget = tcp::rx_mbuf_budget(&config, 1500);
         let handle = set.add_admitted(
             &config,
             1500,
             crate::tests::tx_test_source(1460),
             super::super::DropQueue::with_capacity(1, 0),
         );
-        // Raising the cap after admission must not change the admitted frame count.
         let (mut iface, _, _) = crate::tests::setup_eth();
         let socket = set.get_mut(handle);
         socket.set_mss_cap(Some(1000));
@@ -1716,9 +1699,7 @@ mod tests {
             .connect(iface.context(), (IpAddress::v4(192, 168, 1, 2), 80), 1234)
             .unwrap();
         assert_eq!(socket.state(), tcp::State::SynSent);
-        // 4096 bytes / 100-byte frames = 41; a 1000-byte cap would give the six-frame floor.
-        assert_eq!(budget, 41);
-        assert_eq!(socket.rx_frame_cap(), budget);
+        assert_eq!(socket.recv_capacity(), 4096);
     }
 
     #[test]

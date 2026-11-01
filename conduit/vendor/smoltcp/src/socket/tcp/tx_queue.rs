@@ -12,7 +12,6 @@ pub(crate) struct TxQueue {
     /// Stream position after the last queued byte: the last entry's `end`, or `acked` when empty.
     end: u64,
     byte_cap: usize,
-    frame_cap: usize,
     hint: Cell<u32>,
     source: TxSource,
 }
@@ -23,7 +22,6 @@ impl core::fmt::Debug for TxQueue {
             .field("bytes", &self.len())
             .field("frames", &self.frames())
             .field("byte_cap", &self.byte_cap)
-            .field("frame_cap", &self.frame_cap)
             .finish()
     }
 }
@@ -55,13 +53,12 @@ pub(crate) enum Seg<'a> {
 // Positions are u64 byte counts that never wrap; lengths stay below `byte_cap`, a usize, and the
 // queue lives on a 64-bit target, so the conversions between them below are lossless.
 impl TxQueue {
-    pub(crate) fn new(byte_cap: usize, frame_cap: usize, source: TxSource) -> TxQueue {
+    pub(crate) fn new(byte_cap: usize, source: TxSource) -> TxQueue {
         TxQueue {
             entries: VecDeque::new(),
             acked: 0,
             end: 0,
             byte_cap,
-            frame_cap,
             hint: Cell::new(0),
             source,
         }
@@ -90,26 +87,16 @@ impl TxQueue {
         self.byte_cap
     }
 
-    pub(crate) fn frame_capacity(&self) -> usize {
-        self.frame_cap
-    }
-
     #[inline]
     pub(crate) fn byte_room(&self) -> usize {
         self.byte_cap - self.len()
     }
 
-    #[inline]
-    pub(crate) fn frame_room(&self) -> usize {
-        self.frame_cap - self.frames()
-    }
-
-    /// Append a frame. The caller checked it is not empty and fits the byte and frame room.
+    /// Append a frame. The caller checked it is not empty and fits the byte room.
     #[inline]
     pub(crate) fn push(&mut self, buf: TxBuf) {
         debug_assert!(buf.len() != 0, "cannot queue an empty TX buffer");
         debug_assert!(buf.len() <= self.byte_room(), "TX buffer exceeds byte room");
-        debug_assert!(self.frame_room() != 0, "TX queue has no frame room");
         self.end += buf.len() as u64;
         self.entries.push_back(Entry {
             buf: Some(buf),
@@ -142,20 +129,6 @@ impl TxQueue {
         entry.end += count as u64;
         self.end = entry.end;
         count
-    }
-
-    pub(crate) fn tail_room(&self, sent: usize, cap: usize) -> usize {
-        let first_never_sent = self.acked + sent as u64;
-        let Some(entry) = self.entries.back() else {
-            return 0;
-        };
-        let buf = entry.buf();
-        if first_never_sent > entry.start() || !buf.unique() {
-            return 0;
-        }
-        cap.saturating_sub(buf.len())
-            .min(buf.capacity() - buf.len())
-            .min(self.byte_room())
     }
 
     /// ACK `n` bytes, at most `len()`: release every frame they complete.
@@ -334,10 +307,10 @@ mod tests {
     use crate::phy::TxPool;
     use alloc::rc::Rc;
 
-    fn queue(byte_cap: usize, frame_cap: usize, room: usize) -> (TxQueue, Rc<TxPool>) {
+    fn queue(byte_cap: usize, room: usize) -> (TxQueue, Rc<TxPool>) {
         let alloc = TxPool::new(room);
         let source = TxSource::new(alloc.clone());
-        (TxQueue::new(byte_cap, frame_cap, source), alloc)
+        (TxQueue::new(byte_cap, source), alloc)
     }
 
     fn cut(seg: Seg<'_>) -> &[u8] {
@@ -349,7 +322,7 @@ mod tests {
 
     #[test]
     fn partial_ack_moves_acked_only() {
-        let (mut queue, alloc) = queue(16, 2, 8);
+        let (mut queue, alloc) = queue(16, 8);
         queue.push_bytes(&[1, 2, 3, 4]);
         queue.ack(2);
         assert_eq!(queue.len(), 2);
@@ -360,7 +333,7 @@ mod tests {
 
     #[test]
     fn ack_spanning_frames_releases_each_once() {
-        let (mut queue, alloc) = queue(32, 4, 8);
+        let (mut queue, alloc) = queue(32, 8);
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4, 5]);
         queue.push_bytes(&[6, 7]);
@@ -372,7 +345,7 @@ mod tests {
 
     #[test]
     fn clear_releases_all() {
-        let (mut queue, alloc) = queue(32, 4, 8);
+        let (mut queue, alloc) = queue(32, 8);
         queue.push_bytes(&[1]);
         queue.push_bytes(&[2]);
         queue.clear();
@@ -384,7 +357,7 @@ mod tests {
 
     #[test]
     fn append_tail_caps_and_appends_only_before_send() {
-        let (mut queue, _) = queue(8, 1, 6);
+        let (mut queue, _) = queue(8, 6);
         queue.push_bytes(&[1, 2]);
         assert_eq!(queue.append_tail(0, &[3, 4, 5], 4), 2);
         assert_eq!(queue.len(), 4);
@@ -394,7 +367,7 @@ mod tests {
 
     #[test]
     fn append_tail_refuses_shared_frame() {
-        let (mut queue, _) = queue(8, 1, 6);
+        let (mut queue, _) = queue(8, 6);
         queue.push_bytes(&[1, 2]);
         let clone = queue.entries[0].buf.as_ref().unwrap().clone();
         assert_eq!(queue.append_tail(0, &[3], 1), 0);
@@ -403,7 +376,7 @@ mod tests {
 
     #[test]
     fn lookup_head_hint_next_and_binary_search() {
-        let (mut queue, _) = queue(64, 32, 2);
+        let (mut queue, _) = queue(64, 2);
         for byte in 0..24 {
             queue.push_bytes(&[byte]);
         }
@@ -417,7 +390,7 @@ mod tests {
 
     #[test]
     fn binary_search_finds_every_entry_of_a_46_frame_flight() {
-        let (mut queue, _) = queue(46, 46, 1);
+        let (mut queue, _) = queue(46, 1);
         for byte in 0..46 {
             queue.push_bytes(&[byte]);
         }
@@ -429,7 +402,7 @@ mod tests {
 
     #[test]
     fn alternating_ack_and_segment_keeps_the_lookup_hint() {
-        let (mut queue, _) = queue(8, 8, 1);
+        let (mut queue, _) = queue(8, 1);
         for byte in 0..8 {
             queue.push_bytes(&[byte]);
         }
@@ -444,14 +417,14 @@ mod tests {
 
     #[test]
     fn segment_empty_for_zero_size() {
-        let (mut queue, _) = queue(8, 1, 8);
+        let (mut queue, _) = queue(8, 8);
         queue.push_bytes(&[1, 2]);
         assert!(matches!(queue.segment(0, 0), Seg::Empty));
     }
 
     #[test]
     fn segment_empty_at_or_past_bytes() {
-        let (mut queue, _) = queue(8, 1, 8);
+        let (mut queue, _) = queue(8, 8);
         assert!(matches!(queue.segment(0, 1), Seg::Empty));
         queue.push_bytes(&[1, 2]);
         assert!(matches!(queue.segment(2, 1), Seg::Empty));
@@ -460,7 +433,7 @@ mod tests {
 
     #[test]
     fn segment_whole_when_frame_start_and_fits() {
-        let (mut queue, _) = queue(8, 1, 8);
+        let (mut queue, _) = queue(8, 8);
         queue.push_bytes(&[1, 2, 3]);
         assert!(matches!(queue.segment(0, 3), Seg::Whole { index: 0 }));
         assert_eq!(cut(queue.segment(0, 2)), &[1, 2]);
@@ -471,7 +444,7 @@ mod tests {
 
     #[test]
     fn segment_cut_never_spans_frames() {
-        let (mut queue, _) = queue(16, 2, 8);
+        let (mut queue, _) = queue(16, 8);
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4]);
         assert_eq!(cut(queue.segment(1, 3)), &[2]);
@@ -479,7 +452,7 @@ mod tests {
 
     #[test]
     fn retransmit_copy_spans_consecutive_frames() {
-        let (mut queue, _) = queue(16, 3, 8);
+        let (mut queue, _) = queue(16, 8);
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4, 5]);
         queue.push_bytes(&[6, 7]);
@@ -491,7 +464,7 @@ mod tests {
 
     #[test]
     fn retransmit_copy_respects_partial_ack_position() {
-        let (mut queue, _) = queue(16, 2, 8);
+        let (mut queue, _) = queue(16, 8);
         queue.push_bytes(&[1, 2, 3]);
         queue.push_bytes(&[4, 5, 6]);
         queue.ack(2);
@@ -504,7 +477,7 @@ mod tests {
     /// every refusal leaves the queue as it was, and `put_back` restores a taken frame.
     #[test]
     fn take_whole_takes_only_a_fitting_unique_frame() {
-        let (mut queue, _) = queue(16, 2, 8);
+        let (mut queue, _) = queue(16, 8);
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4, 5]);
         assert!(queue.take_whole(0, 0).is_none());
@@ -528,7 +501,7 @@ mod tests {
 
     #[test]
     fn take_put_back_keeps_positions() {
-        let (mut queue, _) = queue(16, 2, 8);
+        let (mut queue, _) = queue(16, 8);
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4, 5]);
         let frame = queue.take(1);
@@ -542,7 +515,7 @@ mod tests {
 
     #[test]
     fn end_positions_survive_u64_far_from_zero() {
-        let (mut queue, _) = queue(16, 2, 8);
+        let (mut queue, _) = queue(16, 8);
         queue.acked = u64::MAX - 8;
         queue.end = queue.acked;
         queue.push_bytes(&[1, 2, 3]);

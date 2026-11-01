@@ -81,8 +81,9 @@ pub fn budget_per_connection(
 pub struct StepReport {
     pub kind: &'static str,
     pub offered_pps: f64,
-    /// What actually left the generators, and what came back, within the window.
+    /// Messages accepted by the generator stack within the window, not NIC transmit counts.
     pub sent_pps: f64,
+    /// Echoes received within the window, including echoes of warmup messages.
     pub received_pps: f64,
     /// Measured messages not echoed by the end of the drain, over measured messages (those never
     /// sent included).

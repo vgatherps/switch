@@ -23,7 +23,8 @@ sts:GetCallerIdentity, servicequotas:GetServiceQuota.
 `run` creates a VPC, subnet, internet gateway, route table, security group (SSH from the caller's
 address), cluster placement group and key pair for the run; provisions the HOST_TYPE on-demand
 instances (one run_instances) in the placement group, one data ENI each; applies
-`deploy/hft-host.sh` (builds DPDK and the toolchain, reboots, verify), then builds zhida-bench
+`deploy/hft-host.sh` (builds DPDK and the toolchain, reboots, verify), using Linux ENA on the
+receiver for `kernel` and DPDK on all other hosts, then builds zhida-bench
 natively (bootstrap.sh); runs the fixed sweep matrix with the coordinator on sender0 driving one
 worker per sender host over SSH; fetches every result; tears down; runs bench/report.py. Every
 resource carries the run id and expiry tags and is recorded in RUN_DIR/created.json as it is
@@ -267,7 +268,8 @@ def plan_text(region, ttl, run_id, expires, kernel=False):
         f"run {run_id}, region {region}, TTL {ttl} (expires {expires.isoformat()})",
         f"hosts: {len(ROLES)} x {HOST_TYPE} on-demand ({HOST_VCPUS} vCPU each), one run_instances into"
         f" its cluster placement group, one subnet/AZ; each: primary ENI (SSH, public IPv4) + 1 data ENI"
-        " (initially vfio-pci, DeleteOnTermination); CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
+        f" ({'receiver on Linux ena, senders on vfio-pci' if kernel else 'vfio-pci'}, DeleteOnTermination);"
+        " CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
         f"  {'receiver':9} zhida-bench {'kernel-serve' if kernel else 'serve'} on APP_CPU"
         f" (systemd unit {RECEIVER_UNIT})",
         f"  {'sender0':9} zhida-bench sweep (coordinator) on HOUSEKEEPING; worker 0 (zhida-bench gen) on APP_CPU",
@@ -473,11 +475,11 @@ class Host:
             return f"setup diagnostics: SSH timed out after {SSH_S} s"
         return f"setup diagnostics (exit {r.returncode}):\n{r.stdout.rstrip()}\n{r.stderr.rstrip()}"
 
-    def install(self, archive):
+    def install(self, archive, kernel_receiver=False):
         """Source, hft-host.sh apply (builds, reboots), verify. Returns (ok, report text)."""
         self.ssh(f"sudo rm -rf {SRC_DIR} && sudo mkdir -p {SRC_DIR} && sudo tar -x -C {SRC_DIR}", input=archive,
                  timeout=BUILD_S)
-        apply = self.root(f"sh {HFT} apply", check=False, timeout=BUILD_S)
+        apply = self.root(f"sh {HFT} apply{' --kernel-receiver' if kernel_receiver else ''}", check=False, timeout=BUILD_S)
         text = [f"[{self.role} {self.info['id']}]", "apply:", apply.stdout.rstrip()]
         if apply.returncode not in (0, 100, 255):  # 100: rebooting; 255: SSH dropped by the reboot
             return False, "\n".join(text + [f"apply exited {apply.returncode}: {apply.stderr.strip()[-2000:]}",
@@ -508,9 +510,9 @@ class Host:
             text += [self.setup_diagnostics()]
         return v.returncode == 0, "\n".join(text)
 
-    def setup(self, archive):
+    def setup(self, archive, kernel_receiver=False):
         """install, then zhida-bench (bootstrap.sh)."""
-        ok, text = self.install(archive)
+        ok, text = self.install(archive, kernel_receiver)
         if ok:
             self.root(f"SRC={SRC_DIR} sh {SRC_DIR}/bench/aws/bootstrap.sh", timeout=BUILD_S)
         return ok, text
@@ -607,13 +609,13 @@ def source_archive(local):
     return local(["git", "-C", REPO, "archive", "--format=tar", "HEAD"], capture_output=True, check=True).stdout
 
 
-def setup_hosts(hosts, archive):
+def setup_hosts(hosts, archive, kernel=False):
     """All hosts in parallel; raises listing every host that failed."""
     results, threads = {}, []
 
     def one(h):
         try:
-            results[h.role] = h.setup(archive)
+            results[h.role] = h.setup(archive, kernel_receiver=kernel and h.role == "receiver")
         except Exception as e:  # reported below with the others
             results[h.role] = (False, f"[{h.role}] setup error: {e}")
 
@@ -640,6 +642,9 @@ def read_facts(hosts, receiver_eni_ip):
 
 
 KERNEL_TABLE, KERNEL_RULE = 7000, 10000
+KERNEL_ROUTE_SETTLE_INTERVAL = 0.5
+KERNEL_ROUTE_SETTLE_STABLE_SAMPLES = 6
+KERNEL_ROUTE_SETTLE_MAX_SAMPLES = 20
 
 
 def check_kernel_route(text, destination, source, interface):
@@ -650,14 +655,15 @@ def check_kernel_route(text, destination, source, interface):
         raise RuntimeError(f"kernel receiver route mismatch for {destination} from {source}: {text}")
 
 
-def restore_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
-    """Only the data device changes; noprefixroute leaves management's main table intact."""
-    data = ipaddress.IPv4Interface(json.loads(receiver.root("cat /etc/zhida/dut.json").stdout)["ipv4"])
+def configure_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
+    """Configure the already-ENA data device without changing management routes."""
+    config = json.loads(receiver.root("cat /etc/zhida/dut.json").stdout)
+    data = ipaddress.IPv4Interface(config["ipv4"])
+    mtu = config["mtu"]
     if str(data.ip) != receiver_ip or str(data.network) != SUBNET_CIDR:
         raise RuntimeError(f"receiver data address/subnet mismatch: {data}, expected {receiver_ip} in {SUBNET_CIDR}")
     if facts["DATA_IF"] == facts["MGMT_IF"]:
         raise RuntimeError("receiver DATA_IF is the management interface")
-    before = receiver.root("ip -j -4 route show table main").stdout
     interface = shlex.quote(facts["DATA_IF"])
     pci = shlex.quote(facts["DATA_PCI"])
     mac = shlex.quote(facts["DATA_MAC"])
@@ -669,19 +675,37 @@ def restore_kernel_receiver(receiver, facts, receiver_ip, sender_ips):
     if any(str(r.get("table")) == str(KERNEL_TABLE) for r in routes):
         raise RuntimeError("kernel receiver policy table already has routes")
     receiver.root(
-        f"set -eu; zhida-netconf unbind /etc/zhida/dut.json; "
+        f"set -eu; test \"$(basename \"$(readlink /sys/bus/pci/devices/{pci}/driver)\")\" = ena; "
         f"test \"$(basename \"$(readlink /sys/class/net/{interface}/device)\")\" = {pci}; "
         f"test \"$(cat /sys/class/net/{interface}/address)\" = {mac}; "
-        f"ip link set dev {interface} up; "
-        f"ip -4 addr replace {data} dev {interface} noprefixroute; "
-        # Linux uses max(all, interface); loose (2) on DATA_IF works even if all is strict (1).
-        f"sysctl -w net.ipv4.conf.{interface}.rp_filter=2; "
+        f"ip link set dev {interface} mtu {shlex.quote(str(mtu))} up; "
+        f"ip -4 addr replace {data} dev {interface} noprefixroute")
+    actual_mtu = int(receiver.root(f"cat /sys/class/net/{interface}/mtu").stdout.strip())
+    if actual_mtu != mtu:
+        raise RuntimeError(f"kernel receiver MTU mismatch on {facts['DATA_IF']}: "
+                           f"configured {mtu}, actual {actual_mtu}")
+    before = receiver.root("ip -j -4 route show table main").stdout
+    stable = 0
+    for _ in range(KERNEL_ROUTE_SETTLE_MAX_SAMPLES):
+        receiver._sleep(KERNEL_ROUTE_SETTLE_INTERVAL)
+        current = receiver.root("ip -j -4 route show table main").stdout
+        stable = stable + 1 if json.loads(current) == json.loads(before) else 0
+        before = current
+        if stable == KERNEL_ROUTE_SETTLE_STABLE_SAMPLES:
+            break
+    else:
+        raise RuntimeError("kernel receiver main routes did not settle after "
+                           f"{KERNEL_ROUTE_SETTLE_MAX_SAMPLES} checks "
+                           f"({KERNEL_ROUTE_SETTLE_INTERVAL:g} second delay between checks)")
+    receiver.root(
+        f"set -eu; sysctl -w net.ipv4.conf.{interface}.rp_filter=2; "
         f"ip -4 route add table {KERNEL_TABLE} {data.network} dev {interface} src {data.ip}; "
         f"ip -4 route add table {KERNEL_TABLE} default via {data.network.network_address + 1} dev {interface}; "
         f"ip -4 rule add priority {KERNEL_RULE} from {data.ip}/32 table {KERNEL_TABLE}")
     after = receiver.root("ip -j -4 route show table main").stdout
     if json.loads(before) != json.loads(after):
-        raise RuntimeError("kernel receiver changed the main routing table; refusing to measure")
+        raise RuntimeError(f"kernel receiver changed the main routing table; refusing to measure\n"
+                           f"before: {before}\nafter: {after}")
     checked_routes = []
     for sender_ip in sender_ips:
         text = receiver.root(f"ip -j -4 route get {shlex.quote(sender_ip)} from {data.ip}").stdout
@@ -865,11 +889,11 @@ def run(args, env=None, kernel=False):
         for h in hosts:
             h.wait_ssh()
         log(f"hosts up: all {len(hosts)} hosts reachable over SSH; setting up and building")
-        setup = setup_hosts(hosts, archive)
+        setup = setup_hosts(hosts, archive, kernel)
         log(f"code built: all {len(hosts)} hosts passed setup verification and built zhida-bench")
         facts, receiver_ip = read_facts(hosts, infos[0]["data_eni"]["ip"])
         if kernel:
-            evidence = restore_kernel_receiver(hosts[0], facts["receiver"], receiver_ip,
+            evidence = configure_kernel_receiver(hosts[0], facts["receiver"], receiver_ip,
                                                [info["data_eni"]["ip"] for info in infos[1:]])
             with open(os.path.join(run_dir, "kernel-receiver.json"), "w") as f:
                 json.dump(evidence, f, indent=2)

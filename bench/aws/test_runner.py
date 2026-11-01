@@ -98,6 +98,12 @@ class PureTest(unittest.TestCase):
 
 
 class KernelRoutingTest(unittest.TestCase):
+    @staticmethod
+    def setup_calls(main_routes):
+        return [Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24", "mtu": 1500})),
+                Proc(0, "[]"), Proc(0, "[]"), Proc(0), Proc(0, "1500\n"),
+                *(Proc(0, route) for route in main_routes)]
+
     def test_source_route_must_use_data_interface_and_policy_table(self):
         route = {"dst": "10.80.1.111", "from": RECEIVER_DATA_IP, "dev": "ens6", "table": z.KERNEL_TABLE}
         z.check_kernel_route(json.dumps([route]), route["dst"], RECEIVER_DATA_IP, "ens6")
@@ -120,26 +126,130 @@ class KernelRoutingTest(unittest.TestCase):
             with self.subTest(irqs=irqs), self.assertRaises(RuntimeError):
                 z.kernel_counter_delta(before, dict(after, irqs=irqs), "1")
 
-    def test_bad_data_subnet_or_management_device_refused_before_unbind(self):
+    def test_bad_data_subnet_or_management_device_refused_before_configuration(self):
         for cidr, device in [("10.80.1.100/16", "ens6"), ("10.80.1.100/24", "ens5")]:
             receiver = mock.Mock()
-            receiver.root.return_value = Proc(0, json.dumps({"ipv4": cidr}))
+            receiver.root.return_value = Proc(0, json.dumps({"ipv4": cidr, "mtu": 1500}))
             facts = dict(z.parse_host_env(HOST_ENV), DATA_IF=device)
             with self.subTest(cidr=cidr, device=device), self.assertRaises(RuntimeError):
-                z.restore_kernel_receiver(receiver, facts, RECEIVER_DATA_IP, ["10.80.1.111"])
+                z.configure_kernel_receiver(receiver, facts, RECEIVER_DATA_IP, ["10.80.1.111"])
             self.assertEqual(receiver.root.call_count, 1)
 
     def test_occupied_policy_priority_is_not_overwritten(self):
         receiver = mock.Mock()
         receiver.root.side_effect = [
-            Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24"})),
-            Proc(0, "[]"),
+            Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24", "mtu": 1500})),
             Proc(0, json.dumps([{"priority": z.KERNEL_RULE, "table": "other"}])),
         ]
         with self.assertRaisesRegex(RuntimeError, "already in use"):
-            z.restore_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+            z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
                                       RECEIVER_DATA_IP, ["10.80.1.111"])
-        self.assertEqual(receiver.root.call_count, 3)
+        self.assertEqual(receiver.root.call_count, 2)
+
+    def test_configures_ena_data_interface_and_checks_source_routes(self):
+        receiver = mock.Mock()
+        receiver._sleep = mock.Mock()
+        destinations = ["10.80.1.111", "10.80.1.112"]
+        routes = [{"dst": ip, "from": RECEIVER_DATA_IP, "dev": "ens6", "table": z.KERNEL_TABLE}
+                  for ip in destinations]
+        main = '[{"dst":"default","dev":"ens5","metric":1024}]'
+        settled = [main] * (z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES + 1)
+        receiver.root.side_effect = self.setup_calls(settled) + [
+            Proc(0), Proc(0, main),
+            *(Proc(0, json.dumps([route])) for route in routes),
+        ]
+        with mock.patch.object(z, "kernel_snapshot", return_value={"irqs": {}}) as snapshot:
+            result = z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+                                                 RECEIVER_DATA_IP, destinations)
+        command = receiver.root.call_args_list[3].args[0]
+        policy = receiver.root.call_args_list[5 + len(settled)].args[0]
+        self.assertIn("/sys/bus/pci/devices/0000:00:06.0/driver", command)
+        self.assertIn('= ena', command)
+        self.assertNotIn("zhida-netconf bind", command)
+        self.assertNotIn("zhida-netconf unbind", command)
+        self.assertIn("ip link set dev ens6 mtu 1500 up", command)
+        self.assertIn("ip -4 addr replace 10.80.1.100/24 dev ens6 noprefixroute", command)
+        self.assertIn(f"ip -4 route add table {z.KERNEL_TABLE} 10.80.1.0/24 dev ens6 src {RECEIVER_DATA_IP}", policy)
+        self.assertIn(f"ip -4 rule add priority {z.KERNEL_RULE} from {RECEIVER_DATA_IP}/32", policy)
+        self.assertEqual(result["routes"], routes)
+        self.assertEqual(result["main_routes_before"], json.loads(main))
+        self.assertEqual(result["main_routes_after"], json.loads(main))
+        self.assertEqual(receiver._sleep.call_args_list,
+                         [mock.call(z.KERNEL_ROUTE_SETTLE_INTERVAL)] * z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES)
+        for call, ip in zip(receiver.root.call_args_list[7 + len(settled):], destinations):
+            self.assertEqual(call.args[0], f"ip -j -4 route get {ip} from {RECEIVER_DATA_IP}")
+        snapshot.assert_called_once_with(receiver, z.parse_host_env(HOST_ENV), configure=True)
+
+    def test_explicit_jumbo_mtu_is_set_and_verified(self):
+        receiver = mock.Mock()
+        receiver._sleep = mock.Mock()
+        main = '[{"dev":"ens5"}]'
+        calls = self.setup_calls([main] * (z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES + 1))
+        calls[0] = Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24", "mtu": 9001}))
+        calls[4] = Proc(0, "9001\n")
+        receiver.root.side_effect = calls + [Proc(0), Proc(0, main)]
+        with mock.patch.object(z, "kernel_snapshot", return_value={}):
+            z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV), RECEIVER_DATA_IP, [])
+        self.assertIn("ip link set dev ens6 mtu 9001 up", receiver.root.call_args_list[3].args[0])
+        self.assertEqual(receiver.root.call_args_list[4].args[0], "cat /sys/class/net/ens6/mtu")
+
+    def test_waits_for_management_route_change_before_installing_policy(self):
+        receiver = mock.Mock()
+        receiver._sleep = mock.Mock()
+        old = '[{"dev":"ens5","metric":512}]'
+        settled = '[{"dev":"ens5","metric":1024}]'
+        snapshots = [old, old] + [settled] * (z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES + 1)
+        destination = "10.80.1.111"
+        route = {"dst": destination, "from": RECEIVER_DATA_IP, "dev": "ens6", "table": z.KERNEL_TABLE}
+        receiver.root.side_effect = self.setup_calls(snapshots) + [
+            Proc(0), Proc(0, settled), Proc(0, json.dumps([route])),
+        ]
+        with mock.patch.object(z, "kernel_snapshot", return_value={}):
+            result = z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+                                                 RECEIVER_DATA_IP, [destination])
+        self.assertEqual(result["main_routes_before"], json.loads(settled))
+        self.assertEqual(result["main_routes_after"], json.loads(settled))
+        self.assertEqual(receiver._sleep.call_count, len(snapshots) - 1)
+        self.assertIn("ip -4 rule add", receiver.root.call_args_list[5 + len(snapshots)].args[0])
+
+    def test_never_settling_routes_fail_before_policy_installation(self):
+        receiver = mock.Mock()
+        receiver._sleep = mock.Mock()
+        snapshots = [json.dumps([{"dev": "ens5", "metric": i % 2}])
+                     for i in range(z.KERNEL_ROUTE_SETTLE_MAX_SAMPLES + 1)]
+        receiver.root.side_effect = self.setup_calls(snapshots)
+        with self.assertRaisesRegex(RuntimeError, "main routes did not settle after 20 checks"):
+            z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+                                        RECEIVER_DATA_IP, ["10.80.1.111"])
+        self.assertEqual(receiver._sleep.call_count, z.KERNEL_ROUTE_SETTLE_MAX_SAMPLES)
+        self.assertEqual(receiver.root.call_count, 5 + len(snapshots))
+
+    def test_main_route_change_reports_before_and_after(self):
+        receiver = mock.Mock()
+        receiver._sleep = mock.Mock()
+        before = '[{"dev":"ens5"}]'
+        receiver.root.side_effect = self.setup_calls([before] * (z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES + 1)) + [
+            Proc(0), Proc(0, '[{"dev":"ens5","linkdown":true}]'),
+        ]
+        with self.assertRaises(RuntimeError) as failure:
+            z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+                                        RECEIVER_DATA_IP, ["10.80.1.111"])
+        message = str(failure.exception)
+        self.assertIn('before: [{"dev":"ens5"}]', message)
+        self.assertIn('after: [{"dev":"ens5","linkdown":true}]', message)
+
+    def test_competing_routes_with_changed_metrics_are_rejected(self):
+        receiver = mock.Mock()
+        receiver._sleep = mock.Mock()
+        before = [{"dst": "default", "dev": "ens5", "metric": 512},
+                  {"dst": "default", "dev": "ens6", "metric": 1024}]
+        after = [dict(before[0], metric=2048), before[1]]
+        receiver.root.side_effect = self.setup_calls(
+            [json.dumps(before)] * (z.KERNEL_ROUTE_SETTLE_STABLE_SAMPLES + 1)
+        ) + [Proc(0), Proc(0, json.dumps(after))]
+        with self.assertRaisesRegex(RuntimeError, "changed the main routing table"):
+            z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
+                                        RECEIVER_DATA_IP, ["10.80.1.111"])
 
     def test_affinity_drift_fails_sweep_and_saves_evidence(self):
         receiver, sender = mock.Mock(), mock.Mock()
@@ -598,6 +708,20 @@ class HostTest(unittest.TestCase):
         self.assertIn(f"SRC={z.SRC_DIR} sh {z.SRC_DIR}/bench/aws/bootstrap.sh", seen[-1])
         self.assertIn("cmdline: ok", text)
 
+    def test_kernel_receiver_apply_flag_does_not_change_sender_setup(self):
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv[-1])
+            return Proc(0)
+
+        self.assertTrue(self.host(run).setup(b"tar", kernel_receiver=True)[0])
+        self.assertTrue(any("hft-host.sh apply --kernel-receiver" in cmd for cmd in seen))
+        seen.clear()
+        self.assertTrue(self.host(run).setup(b"tar")[0])
+        self.assertTrue(any("hft-host.sh apply" in cmd for cmd in seen))
+        self.assertFalse(any("--kernel-receiver" in cmd for cmd in seen))
+
     def test_failed_verify_fails_setup_without_building(self):
         seen = []
 
@@ -732,6 +856,8 @@ class World:
         self.feed_timeouts = []
         self.feed_hang = False          # the run-binance.sh ssh times out
         self.feed_text = FEED_OUT
+        self.dut_mtu = 1500
+        self.actual_mtu = 1500
 
 
 class FakeHost:
@@ -745,8 +871,8 @@ class FakeHost:
         self.w.calls.append((self.role, f"install {archive!r}"))
         return self.role not in self.w.verify_fail, f"[{self.role}] verify: {'FAIL' if self.role in self.w.verify_fail else 'ok'}"
 
-    def setup(self, archive):
-        self.w.calls.append((self.role, f"setup {archive!r}"))
+    def setup(self, archive, kernel_receiver=False):
+        self.w.calls.append((self.role, f"setup {archive!r}" + (" kernel_receiver" if kernel_receiver else "")))
         return self.role not in self.w.verify_fail, f"[{self.role}] verify: {'FAIL' if self.role in self.w.verify_fail else 'ok'}"
 
     def root(self, command, check=True, **kw):
@@ -754,7 +880,11 @@ class FakeHost:
         if command == "cat /etc/zhida/host.env":
             return Proc(0, HOST_ENV)
         if command == "cat /etc/zhida/dut.json":
-            return Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24"}))
+            return Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24", "mtu": self.w.dut_mtu}))
+        if command in ("ip -j -4 rule show", "ip -j -4 route show table all"):
+            return Proc(0, "[]")
+        if command == "cat /sys/class/net/ens6/mtu":
+            return Proc(0, f"{self.w.actual_mtu}\n")
         if command.startswith("systemctl is-active"):
             return Proc(0, "active\n")
         if command.startswith("systemctl stop") and self.w.hang:
@@ -1070,14 +1200,30 @@ class RunTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, "fetch-errors.txt")))
 
     def test_kernel_route_failure_never_measures_and_still_cleans_up(self):
-        with mock.patch.object(z, "restore_kernel_receiver",
+        with mock.patch.object(z, "configure_kernel_receiver",
                                side_effect=RuntimeError("kernel receiver route mismatch")):
             error = self.run_bench(kernel=True)
         self.assertIsInstance(error, RuntimeError)
         self.assertIn("route mismatch", str(error))
         self.assertEqual(self.sweeps_run(), [])
         self.assertTrue(self.w.teardown_done)
+        self.assertIn(("receiver", "setup b'TAR' kernel_receiver"), self.w.calls)
+        for i in range(z.SENDERS):
+            self.assertIn((f"sender{i}", "setup b'TAR'"), self.w.calls)
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, "expected.json")))
+
+    def test_kernel_mtu_mismatch_never_measures_and_still_cleans_up(self):
+        self.w.dut_mtu = 9001
+        self.w.actual_mtu = 1500
+        error = self.run_bench(kernel=True)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("MTU mismatch on ens6: configured 9001, actual 1500", str(error))
+        commands = [c for role, c in self.w.calls if role == "receiver"]
+        self.assertTrue(any("ip link set dev ens6 mtu 9001 up" in command for command in commands))
+        self.assertIn("root cat /sys/class/net/ens6/mtu", commands)
+        self.assertFalse(any("ip -4 rule add" in command for command in commands))
+        self.assertEqual(self.sweeps_run(), [])
+        self.assertTrue(self.w.teardown_done)
 
     def test_failed_host_setup_never_claims_code_built_or_starts_a_sweep(self):
         self.w.verify_fail.add("sender1")

@@ -157,20 +157,16 @@ fn sockets_full_returns_config_without_allocating_tx_ring() {
     });
 }
 
-/// The RX pool backs 12 mbufs beyond its reserve; three sockets whose RX frame caps sum to
-/// 45 + 8 + 6 = 59 are all added, each with its own cap, and the third listens.
+/// Three sockets share an RX pool with 12 mbufs beyond its reserve, and the third listens.
 #[zhida_test_support::pinned_test]
 fn add_tcp_admits_sockets_beyond_the_shared_rx_pool() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxshare", 16, 16);
         let mut stack = limited_stack(eal, &fixture);
         let big = stack.add_tcp(pair::tcp_socket_sized(65536)).unwrap();
-        let capped = stack.add_tcp(tcp::Config { mss_cap: Some(512), ..tcp_socket() }).unwrap();
+        let _capped = stack.add_tcp(tcp::Config { mss_cap: Some(512), ..tcp_socket() }).unwrap();
         let listener = stack.add_tcp(tcp_socket()).unwrap();
         stack.listen(&listener, 1001).unwrap();
-        assert_eq!(stack.tcp(&big).rx_frame_cap(), 45);
-        assert_eq!(stack.tcp(&capped).rx_frame_cap(), 8);
-        assert_eq!(stack.tcp(&listener).rx_frame_cap(), 6);
         assert_eq!(stack.tcp(&listener).state(), State::Listen);
         assert_eq!(
             stack.add_tcp(tcp_socket()).unwrap_err(),
@@ -560,6 +556,40 @@ fn peer_data(isn: TcpSeqNumber, peer_seq: TcpSeqNumber, payload: &[u8]) -> Vec<u
 }
 
 #[zhida_test_support::pinned_test]
+fn reused_port_refreshes_rx_pressure_at_stack_construction() {
+    with_eal(|eal| {
+        let fixture = RingPort::new("rxreuse", 16, 16);
+        let mut previous = stack(fixture.open(eal), 1, 4);
+        fixture.inject(&[ring_port::frame(0)]);
+        assert_eq!(previous.receive(T0, 1).unwrap().rx_received, 1);
+        fixture.take_tx();
+        let mut port = previous.into_port();
+
+        // Retain packets received directly through the Port after the previous Stack's reading.
+        let mut held = std::collections::VecDeque::with_capacity(88);
+        for _ in 0..11 {
+            fixture.inject(&vec![ring_port::frame(0); 8]);
+            let burst = port.rx_burst(&mut held).unwrap();
+            assert_eq!((burst.accepted, burst.rejected), (8, 0));
+        }
+        assert_eq!(fixture.in_use().0, 88);
+
+        let mut stack = stack(port, 1, 4);
+        let handle = stack.add_tcp(tcp_socket()).unwrap();
+        stack.tcp_mut(&handle).set_ack_delay(None);
+        stack.connect(&handle, remote(), LOCAL_PORT).unwrap();
+        let (isn, peer_isn, _) = handshake(&fixture, &mut stack, &handle);
+        fixture.inject(&[peer_data(isn, peer_isn + 10, b"out of order")]);
+        let turn = stack.receive(T0, 8).unwrap();
+        assert_eq!((turn.rx_received, turn.rx_processed), (1, 1));
+        assert_eq!(stack.tcp(&handle).rx_refused_segments(), 1);
+        fixture.take_tx();
+        drop(held);
+        finish(fixture, stack);
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn received_segment_stays_in_rx_mbuf_until_read() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxheld", 16, 16);
@@ -580,15 +610,15 @@ fn received_segment_stays_in_rx_mbuf_until_read() {
                 Some(peer_isn + 4 + 3 * index)
             );
             assert_eq!(stack.tcp(&handle).recv_queue(), 3 * (index + 1));
-            // "def" is copied into the tailroom of the frame holding "abc", and its own
-            // mbuf returns to the pool during the turn.
-            assert_eq!(fixture.in_use(), (1, 0));
+            assert_eq!(fixture.in_use(), (index as u32 + 1, 0));
         }
-        let frame = stack.tcp_mut(&handle).recv().unwrap().unwrap();
-        assert_eq!(frame.payload(), b"abcdef");
-        assert_eq!(fixture.in_use(), (1, 0));
-        drop(frame);
-        assert_eq!(fixture.in_use(), (0, 0));
+        for (index, expected) in [b"abc", b"def"].into_iter().enumerate() {
+            let frame = stack.tcp_mut(&handle).recv().unwrap().unwrap();
+            assert_eq!(frame.payload(), expected);
+            assert_eq!(fixture.in_use(), (2 - index as u32, 0));
+            drop(frame);
+            assert_eq!(fixture.in_use(), (1 - index as u32, 0));
+        }
         assert_eq!(stack.tcp(&handle).recv_queue(), 0);
         exhaust_and_reallocate_rx_pool(&fixture);
         finish(fixture, stack);
@@ -787,9 +817,7 @@ fn reset_remove_unwind_return_once() {
                 fixture.take_tx();
             }
             assert_eq!(stack.tcp(&handle).recv_queue(), 6);
-            // "def" is copied into the frame holding "abc"; "jkl" is out of order and keeps
-            // its own frame.
-            assert_eq!(fixture.in_use(), (2, 0));
+            assert_eq!(fixture.in_use(), (3, 0));
             assert_eq!(stack.tcp(&handle).rx_refused_segments(), 0);
             if reset {
                 let rst = from_peer(&TcpRepr {
@@ -814,7 +842,7 @@ fn reset_remove_unwind_return_once() {
                 assert_eq!(stack.tcp(&handle).recv_queue(), 6);
                 // The RST needs no reply: its unused TX packet stays as the
                 // Device's spare until `into_port`.
-                assert_eq!(fixture.in_use(), (2, 1));
+                assert_eq!(fixture.in_use(), (3, 1));
                 let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
                 assert_eq!(bytes.len(), 6);
                 assert_eq!(&bytes, b"abcdef");

@@ -121,8 +121,7 @@ impl Drop for Tester {
 }
 
 /// Spawns `tester` (non-empty) with `tester_env`, then runs `app` on a Stack
-/// with `max_sockets` slots, pools for that many uncapped sockets of
-/// `recv_capacity` receive and send bytes each, and optional IPv4 `gateway`
+/// with `max_sockets` slots, pools sized using `buffer` and optional IPv4 `gateway`
 /// until it returns, and composes the exit status.
 ///
 /// `app` gets the Stack, created at `Instant::ZERO` = the wall-clock `start`,
@@ -134,7 +133,7 @@ pub fn run(
     name: &'static str,
     tester: &[OsString],
     max_sockets: usize,
-    recv_capacity: usize,
+    buffer: usize,
     gateway: Option<Ipv4Addr>,
     app: impl FnOnce(Stack, Instant, &mut dyn FnMut() -> bool) -> (Stack, Result<(), String>),
 ) -> i32 {
@@ -172,15 +171,16 @@ pub fn run(
         &mut tester_process,
         cpu,
         max_sockets,
-        recv_capacity,
+        buffer,
         gateway,
         random_seed,
         app,
     )
 }
 
-/// Beyond `rx_reserve` and `frame_reserve`, the RX and frame pools hold one
-/// `buffer`-byte socket's full window each, shared by every socket.
+/// Beyond their reserves, the RX pool has space for one window of full-sized
+/// segments, shared by all sockets; smaller segments can consume more mbufs.
+/// The frame pool includes a full-sized-segment estimate for one `buffer`-byte socket.
 fn port_config(port_id: u16, buffer: usize) -> PortConfig<'static> {
     let pool = |name, count| PoolConfig {
         name,
@@ -208,7 +208,7 @@ fn port_config(port_id: u16, buffer: usize) -> PortConfig<'static> {
             RX_POOL,
             count(
                 rx_reserve(DESCRIPTORS, BURST, RX_STAGING, POOL_CACHE),
-                tcp::rx_mbuf_budget(&socket, usize::from(MTU)),
+                buffer.div_ceil(usize::from(MTU) - 40),
             ),
         ),
         tx_pool: pool(TX_POOL, POOL_COUNT),
@@ -245,12 +245,12 @@ fn serve(
     tester: &mut Tester,
     cpu: usize,
     max_sockets: usize,
-    recv_capacity: usize,
+    buffer: usize,
     gateway: Option<Ipv4Addr>,
     random_seed: u64,
     app: impl FnOnce(Stack, Instant, &mut dyn FnMut() -> bool) -> (Stack, Result<(), String>),
 ) -> i32 {
-    let mut config = port_config(u16::MAX, recv_capacity);
+    let mut config = port_config(u16::MAX, buffer);
     let pool_memory_bytes = u64::from(config.rx_pool.count)
         .checked_add(u64::from(config.tx_pool.count))
         .and_then(|count| count.checked_add(u64::from(config.frame_pool.count)))

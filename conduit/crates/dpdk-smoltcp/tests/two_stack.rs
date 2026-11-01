@@ -51,7 +51,7 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
     with_eal(|eal| {
         const SEGMENT: usize = 1448;
         const CAPACITY: usize = 6 * SEGMENT;
-        let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
+        const SEGMENTS: usize = CAPACITY / SEGMENT;
         let configs = [pair::config(Side::A), pair::config(Side::B)];
         let count = pair::pool_count(
             dpdk_smoltcp::rx_reserve(16, 8, configs[0].rx_staging, 8),
@@ -103,7 +103,7 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
         });
         pair.b_to_a.paused = true;
         let data = pattern(CAPACITY, 92);
-        assert_eq!(data.len() / SEGMENT, cap);
+        assert_eq!(data.len() / SEGMENT, SEGMENTS);
         for (index, bytes) in data.chunks(SEGMENT).enumerate() {
             assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(bytes), Ok(SEGMENT));
             let round = pair.round(|_, _| {});
@@ -114,7 +114,7 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
         }
         assert_eq!(
             pair.in_use()[1].0 as usize,
-            cap.checked_sub(1).expect("one slot remains for the hole")
+            SEGMENTS - 1
         );
         assert_eq!(pair.a_to_b.dropped, 1);
         pair.b_to_a.paused = false;
@@ -131,7 +131,7 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
                 }
             },
         );
-        assert_eq!(pair.in_use()[1].0 as usize, cap);
+        assert_eq!(pair.in_use()[1].0 as usize, SEGMENTS);
         let received = drain_bytes(pair.b.tcp_mut(&handles[1])).unwrap();
         assert_eq!(received.len(), data.len());
         assert_eq!(received, data);
@@ -487,25 +487,16 @@ const WRITE_CHUNK: usize = 1000;
 const READ_CHUNK: usize = 700;
 const ECHO_BUFFER: usize = 1500;
 
-/// Calls that moved fewer bytes than offered or asked; calls offering or
-/// asking nothing are not counted.
+/// Receive calls that moved fewer bytes than requested; empty requests are
+/// not counted.
 #[derive(Debug, Default)]
-struct ShortIo {
-    short_sends: usize,
+struct ShortReads {
     zero_recvs: usize,
     partial_recvs: usize,
     pending: Option<(tcp::TcpFrame, usize)>,
 }
 
-impl ShortIo {
-    fn send(&mut self, socket: &mut tcp::Socket<'static>, data: &[u8]) -> usize {
-        let sent = socket.send_slice(data).unwrap();
-        if sent < data.len() {
-            self.short_sends += 1;
-        }
-        sent
-    }
-
+impl ShortReads {
     fn recv(&mut self, socket: &mut tcp::Socket<'static>, buffer: &mut [u8]) -> usize {
         let mut read = 0usize;
         while read < buffer.len() {
@@ -532,7 +523,7 @@ impl ShortIo {
     }
 
     fn assert_seen(&self) {
-        let seen = [self.short_sends, self.zero_recvs, self.partial_recvs];
+        let seen = [self.zero_recvs, self.partial_recvs];
         assert!(seen.iter().all(|&count| count > 0), "{self:?}");
     }
 }
@@ -542,13 +533,13 @@ struct Writer<'d> {
     data: &'d [u8],
     written: usize,
     echoed: Vec<u8>,
-    short: ShortIo,
+    short: ShortReads,
 }
 
 impl Writer<'_> {
     fn step(&mut self, socket: &mut tcp::Socket<'static>) -> bool {
         let end = self.data.len().min(self.written + WRITE_CHUNK);
-        let sent = self.short.send(socket, &self.data[self.written..end]);
+        let sent = socket.send_slice(&self.data[self.written..end]).unwrap();
         self.written += sent;
         let mut buffer = [0; READ_CHUNK];
         let read = self.short.recv(socket, &mut buffer);
@@ -563,7 +554,7 @@ struct Echo {
     held: usize,
     read: usize,
     written: usize,
-    short: ShortIo,
+    short: ShortReads,
 }
 
 impl Echo {
@@ -573,7 +564,7 @@ impl Echo {
             held: 0,
             read: 0,
             written: 0,
-            short: ShortIo::default(),
+            short: ShortReads::default(),
         }
     }
 
@@ -581,7 +572,7 @@ impl Echo {
         let read = self.short.recv(socket, &mut self.buffer[self.held..]);
         self.held += read;
         self.read += read;
-        let sent = self.short.send(socket, &self.buffer[..self.held]);
+        let sent = socket.send_slice(&self.buffer[..self.held]).unwrap();
         self.buffer.copy_within(sent..self.held, 0);
         self.held -= sent;
         self.written += sent;
@@ -596,7 +587,7 @@ fn echo_phase(pair: &mut Pair, handles: &[TcpHandle; 2], writer: Side, data: &[u
         data,
         written: 0,
         echoed: Vec::with_capacity(data.len()),
-        short: ShortIo::default(),
+        short: ShortReads::default(),
     };
     let mut echo = Echo::new();
     pair.drive(
@@ -669,7 +660,7 @@ fn close_both(pair: &mut Pair, handles: &[TcpHandle; 2]) {
 }
 
 #[zhida_test_support::pinned_test]
-fn echo_64k_each_way_short_io_fin_close_all_pools_zero() {
+fn echo_64k_each_way_short_reads_fin_close_all_pools_zero() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["echoa", "echob"]);
         let (handles, _) = establish(&mut pair, Side::A);
@@ -682,89 +673,53 @@ fn echo_64k_each_way_short_io_fin_close_all_pools_zero() {
 }
 
 #[zhida_test_support::pinned_test]
-fn two_stack_mixed_sizes_follow_mbuf_window() {
+fn two_stack_mixed_sizes_deliver_bytes() {
     with_eal(|eal| {
         const CAPACITY: usize = 65536;
-        const IP_MTU: usize = 1500;
-        let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), IP_MTU);
+        const SEGMENTS: usize = 120;
+        let configs = [pair::config(Side::A), pair::config(Side::B)];
         let mut pair = Pair::with_ports(
             eal,
             ["mbufwina", "mbufwinb"],
-            [pair::config(Side::A), pair::config(Side::B)],
+            configs,
             pair::T0,
             16,
             |_, port| {
-                assert_eq!(usize::from(port.mtu), IP_MTU);
-                let full = pair::windows(port.mtu, [CAPACITY]);
                 port.rx_pool.count = pair::pool_count(
                     dpdk_smoltcp::rx_reserve(
                         port.rx_descriptors,
                         port.rx_burst,
-                        pair::config(Side::A).rx_staging,
+                        configs[0].rx_staging,
                         port.rx_pool.cache_size,
                     ),
-                    full,
+                    SEGMENTS,
                 );
                 port.frame_pool.count = pair::pool_count(
-                    dpdk_smoltcp::frame_reserve(port.tx_descriptors, pair::config(Side::A).tx_pending),
-                    full,
+                    dpdk_smoltcp::frame_reserve(port.tx_descriptors, configs[0].tx_pending),
+                    pair::windows(port.mtu, [CAPACITY]),
                 );
             },
         );
-        let (handles, handshake) = establish_sized(&mut pair, Side::A, CAPACITY);
-        // The handshake frames follow the ARP request and reply.
-        let shift = handshake[2..]
-            .iter()
-            .filter(|(dir, _)| *dir == Dir::BToA)
-            .map(|(_, frame)| segment(frame, Side::B))
-            .find(|tcp| tcp.control == TcpControl::Syn)
-            .unwrap()
-            .window_scale
-            .unwrap();
+        let (handles, _) = establish_sized(&mut pair, Side::A, CAPACITY);
         pair.a.tcp_mut(&handles[0]).set_ack_delay(None);
         pair.b.tcp_mut(&handles[1]).set_ack_delay(None);
-        let lengths: Vec<_> = (0..120).map(|index| [200, 1100, 1448][index % 3]).collect();
+        let lengths: Vec<_> = (0..SEGMENTS).map(|index| [200, 1100, 1448][index % 3]).collect();
         let data = pattern(lengths.iter().sum(), 91);
-        let first_read = lengths[..10].iter().sum();
         let mut received = Vec::new();
         let mut written = 0;
         let mut chunk = 0;
-        let mut partial_read = false;
-        let mut reader = ShortIo::default();
-        let mut frame_window_seen = false;
-        let mut max_held = 0;
+        let mut reading = false;
+        let mut reader = ShortReads::default();
         let mut at = pair.now();
         for round in 0..MAX_ROUNDS {
-            let mut advertised = None;
-            let last = pair.round_at(at, |dir, frame| {
-                if dir == Dir::BToA {
-                    advertised = Some(segment(frame, Side::B).window_len);
-                }
-            });
-            let held = pair.in_use()[Side::B.index()].0 as usize;
-            max_held = max_held.max(held);
-            assert!(held <= cap, "receiver holds {held} frames; cap is {cap}");
+            let last = pair.round_at(at, |_, _| {});
             let receiver = pair.b.tcp_mut(&handles[1]);
+            reading |= receiver.recv_queue() >= CAPACITY / 2;
             let mut read = 0;
-            if !partial_read && receiver.rx_refused_segments() > 0 {
-                assert_eq!(held, cap);
-                assert_eq!(received.len(), 0);
-                let mut buffer = vec![0; first_read];
-                read = reader.recv(receiver, &mut buffer);
-                assert_eq!(read, first_read);
-                received.extend_from_slice(&buffer);
-                partial_read = true;
-            } else if partial_read && !frame_window_seen {
-                if let Some(field) = advertised {
-                    assert!(usize::from(field) < (CAPACITY - receiver.recv_queue()) >> shift);
-                    frame_window_seen = true;
-                }
-            }
-            if frame_window_seen {
+            if reading {
                 let mut buffer = [0; 8192];
-                let len = reader.recv(receiver, &mut buffer);
-                received.extend_from_slice(&buffer[..len]);
-                read += len;
+                read = reader.recv(receiver, &mut buffer);
+                received.extend_from_slice(&buffer[..read]);
             }
             let sender = pair.a.tcp_mut(&handles[0]);
             let mut sent = 0;
@@ -786,18 +741,12 @@ fn two_stack_mixed_sizes_follow_mbuf_window() {
                     .expect("unfinished transfer has a deadline");
                 at = next.max(pair.now());
             }
-            assert!(
-                round + 1 < MAX_ROUNDS,
-                "mixed-size transfer did not complete"
-            );
+            assert!(round + 1 < MAX_ROUNDS, "mixed-size transfer did not complete");
         }
+        assert!(reading);
         assert_eq!(written, data.len());
         assert_eq!(received, data);
-        assert!(frame_window_seen);
-        assert_eq!(max_held, cap);
-        let refused = pair.b.tcp(&handles[1]).rx_refused_segments();
-        assert!(refused > 0);
-        eprintln!("mixed-size receiver refused {refused} segments");
+        assert_eq!(pair.b.tcp(&handles[1]).rx_refused_segments(), 0);
         pair.round(|_, _| {});
         assert_eq!(pair.in_use().map(|(rx, _)| rx), [0, 0]);
         assert_no_drops(&pair);
@@ -831,8 +780,8 @@ fn two_stacks_pipelined_messages_complete_without_ack_delay() {
         let (mut received, mut replies) = (0, 0);
         let (mut request, mut reply) = ([0; MESSAGE_LEN], [0; MESSAGE_LEN]);
         let (mut request_len, mut reply_len) = (0, 0);
-        let mut request_reader = ShortIo::default();
-        let mut reply_reader = ShortIo::default();
+        let mut request_reader = ShortReads::default();
+        let mut reply_reader = ShortReads::default();
         let mut at = pair.now();
 
         for round in 0..MAX_ROUNDS {

@@ -131,10 +131,11 @@ fn send_poll(stack: &mut Stack, conns: usize) -> Result<Sent, StackError> {
 }
 
 /// Port settings for a side with `conns` connections of 64 KiB buffers.
-/// The RX pool covers the driver reserve and socket budgets. The TX pool
-/// covers 64 descriptors and every pending slot, and the frame pool one frame
-/// more (`frame_reserve`) plus every socket's TX frame limit, each with cache
-/// slack; copy TX frees accepted mbufs.
+/// The RX pool adds space for one window of full-sized segments beyond the driver reserve;
+/// smaller segments can consume more mbufs. The TX pool covers 64 descriptors and every
+/// pending slot, and the frame pool one frame more (`frame_reserve`) plus one
+/// socket's full-sized-segment TX estimate, each with cache slack; copy TX frees
+/// accepted mbufs.
 pub fn port_config<'a>(
     port_id: u16,
     conns: usize,
@@ -161,8 +162,8 @@ pub fn port_config<'a>(
         queue_socket: -1,
         rx_pool: PoolConfig {
             name: rx_pool,
-            // Beyond the reserve, one connection's full receive window, shared by all.
-            count: u32::try_from(rx_reserve(64, BURST, RX_STAGING, POOL_CACHE) + tcp::rx_mbuf_budget(&socket(), 1500))
+            // One window of full-sized segments, shared by all connections.
+            count: u32::try_from(rx_reserve(64, BURST, RX_STAGING, POOL_CACHE) + SOCKET_BUFFER.div_ceil(SEGMENT_PAYLOAD))
                 .expect("RX pool count fits u32"),
             cache_size: POOL_CACHE,
             data_room_size: headroom + BUFFER_SIZE,
@@ -207,7 +208,7 @@ fn udp_config(port: u16) -> UdpConfig {
     UdpConfig {
         port,
         local_addr: None,
-        rx_queue: tcp::rx_mbuf_budget(&socket(), 1500),
+        rx_queue: SOCKET_BUFFER.div_ceil(SEGMENT_PAYLOAD),
         tx_checksum: true,
         broadcast: false,
     }
@@ -1085,7 +1086,7 @@ fn echo(socket: &mut tcp::Socket<'static>, pending: &mut Option<(tcp::TcpFrame, 
         }
         let (frame, offset) = pending.as_mut().unwrap();
         let read = room.min(frame.payload().len() - *offset);
-        // Short when the socket's TX frame limit or the shared frame pool runs out before its bytes do.
+        // Short when the shared frame pool runs out before the socket's byte capacity.
         let sent = socket.send_slice(&frame.payload()[*offset..*offset + read])
             .expect("Established or CloseWait");
         if sent == 0 {

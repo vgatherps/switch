@@ -51,9 +51,8 @@
 //!   reclaim both frees. Time advances by the RTO each iteration.
 //!
 //! A's send buffer is `depth` × 1460 bytes (1460: the segment payload at IP
-//! MTU 1500). Its frame limit is one frame per 1460 bytes, so it takes
-//! `depth` writes, each its own frame because an emit follows it. Throughput
-//! element = one segment. Caller time is fixed except in rto.
+//! MTU 1500). It takes `depth` writes, each its own frame because an emit
+//! follows it. Throughput element = one segment. Caller time is fixed except in rto.
 //! Every iteration checks each `Sent` and `Turn`, the reclaimed frame count
 //! and an empty send queue at the end. Warmup iterations after the first also
 //! check every frame's sequence number, length, flags and payload, a stable
@@ -350,8 +349,8 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
             port.rx_burst = BURST;
             port.tx_burst = BURST;
             port.tx_pool.count = TX_POOL;
-            // The frame reserve, the socket's frame limit and the one frame
-            // the application holds between allocate and enqueue.
+            // The frame reserve, the full-sized-segment estimate for the socket,
+            // and the one frame the application holds between allocate and enqueue.
             port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [buffer])) + 1;
             // A's RX pool also holds up to RING - 1 injected ACKs.
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
@@ -483,7 +482,7 @@ impl Bench {
             }
             Api::Frame => {
                 let frame = times.time(Phase::Allocate, || pair.a.tx_frame());
-                let mut frame = frame.expect("frame pool holds the socket's frame limit");
+                let mut frame = frame.expect("frame pool holds the benchmark's writes");
                 times.time(Phase::Fill, || {
                     frame.room_mut()[..len].copy_from_slice(payload);
                     frame.set_len(len);

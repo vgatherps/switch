@@ -10,15 +10,14 @@ use std::rc::Rc;
 
 use zhida_test_kit::many::{self, Conn, CLIENT_BASE};
 use zhida_test_kit::pair::{
-    self, pattern, pool_count, segment, windows, App, Pair, Side, MAX_ROUNDS, T0,
+    pattern, pool_count, segment, windows, App, Pair, Side, MAX_ROUNDS, T0,
 };
 use zhida_test_kit::wire::{Link, Verdict};
 use zhida_test_kit::with_eal;
-use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, TcpSeqNumber};
 use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, Stack, UdpConfig, UdpHandle, UdpSendError};
 
-/// Each socket's receive and send buffer: 180 RX frames at IP MTU 1500.
+/// Each socket's receive and send buffer.
 const WINDOW: usize = 256 * 1024;
 /// RX mbufs each Stack's pool holds beyond its reserve. net_ring posts no RX mbufs, so the
 /// sockets can also take the reserve's posted-buffer and low-mark room: each pool holds 140
@@ -76,8 +75,8 @@ fn read_all(b: &mut Stack, conn: &Conn, received: &mut Vec<u8>) -> bool {
     received.len() != before
 }
 
-/// Four connections whose receive caps total 720 frames share 64 RX mbufs beyond the
-/// reserve: all four are added and each delivers its whole 256 KiB intact while its reader
+/// Four connections share 24 RX mbufs beyond the reserve: all four are added and each
+/// delivers its whole 256 KiB intact while its reader
 /// keeps up; the pool's mbufs all return.
 #[zhida_test_support::pinned_test]
 fn sockets_beyond_the_sum_of_windows_all_deliver() {
@@ -85,12 +84,6 @@ fn sockets_beyond_the_sum_of_windows_all_deliver() {
         const SOCKETS: u16 = 4;
         let mut pair = shared_pair(eal, ["shra", "shrb"], usize::from(SOCKETS), 0);
         let conns = many::open(&mut pair, 0..SOCKETS, WINDOW);
-        let cap = tcp::rx_mbuf_budget(&pair::tcp_socket_sized(WINDOW), 1500);
-        assert_eq!(cap, 180);
-        for conn in &conns {
-            assert_eq!(pair.b.tcp(&conn.server).rx_frame_cap(), cap);
-        }
-        assert!(usize::from(SOCKETS) * cap > RX_SHARE);
         let data: Vec<_> = conns.iter().map(|conn| pattern(WINDOW, u32::from(conn.id))).collect();
         let mut sent = vec![0; conns.len()];
         let mut received = vec![Vec::new(); conns.len()];
@@ -114,8 +107,8 @@ fn sockets_beyond_the_sum_of_windows_all_deliver() {
     });
 }
 
-/// B's reader stops while A sends a whole 256 KiB window: B's socket would take 180 frames,
-/// but its share of the RX pool runs out first and the link drops the rest. Once B reads, the
+/// B's reader stops while A sends a whole 256 KiB window: its shared RX pool runs out
+/// and the link drops the rest. Once B reads, the
 /// mbufs return, A retransmits what was dropped, and every byte arrives in order.
 #[zhida_test_support::pinned_test]
 fn rx_pool_exhaustion_drops_until_the_app_reads() {
@@ -136,7 +129,6 @@ fn rx_pool_exhaustion_drops_until_the_app_reads() {
         }
         let held = pair.b.tcp(&conn.server).recv_queue();
         assert!(held < WINDOW, "B took its whole window into {RX_SHARE} shared mbufs");
-        assert!(pair.b.tcp(&conn.server).recv_room() > 0, "the drops came from the pool, not the window");
 
         let mut received = Vec::new();
         pair.drive(|_, _| {}, |a, b| {
@@ -285,6 +277,58 @@ fn low_rx_pool_refuses_out_of_order_until_it_recovers() {
         pair.round(|_, _| {});
         assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1, "held once the pool recovered");
         assert_eq!(pair.in_use()[1].0 as usize, idle + 1);
+
+        blocked.set(false);
+        let mut received = Vec::new();
+        pair.drive(|_, _| {}, |_, b| {
+            if read_all(b, conn, &mut received) && received.len() == data.len() {
+                App::Done
+            } else {
+                App::Idle
+            }
+        });
+        assert_eq!(received, data);
+        pair.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn empty_burst_rechecks_low_pool_before_processing_staged_segments() {
+    with_eal(|eal| {
+        let mut pair = shared_pair(eal, ["shea", "sheb"], 1, 1);
+        let conns = many::open(&mut pair, 0..1, WINDOW);
+        let conn = &conns[0];
+        pair.a.tcp_mut(&conn.client).set_ack_delay(None);
+        pair.b.tcp_mut(&conn.server).set_ack_delay(None);
+        let udp = udp_sockets(&mut pair);
+        let blocked = Rc::new(Cell::new(true));
+        block_gaps(&mut pair.a_to_b, vec![client_port(conn)], blocked.clone());
+        let idle = pair.in_use()[1].0 as usize;
+        hold_pool_low(&mut pair, &udp);
+
+        let data = pattern(3 * 1460, 21);
+        assert_eq!(pair.a.tcp_mut(&conn.client).send_slice(&data[..2 * 1460]), Ok(2 * 1460));
+        let now = pair.now();
+        pair.a.turn(now, 32).unwrap();
+        pair.a_to_b.forward();
+        assert_eq!(pair.a_to_b.dropped, 1);
+        let staged = pair.b.receive(now, 0).unwrap();
+        assert_eq!((staged.rx_received, staged.rx_processed, staged.rx_staged), (1, 0, 1));
+        let still_low = pair.b.receive(now, 32).unwrap();
+        assert_eq!((still_low.rx_received, still_low.rx_processed, still_low.rx_staged), (0, 1, 0));
+        assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1);
+
+        assert_eq!(pair.a.tcp_mut(&conn.client).send_slice(&data[2 * 1460..]), Ok(1460));
+        pair.a.turn(now, 32).unwrap();
+        pair.a_to_b.forward();
+        let staged = pair.b.receive(now, 0).unwrap();
+        assert_eq!((staged.rx_received, staged.rx_processed, staged.rx_staged), (1, 0, 1));
+        assert!(drain_udp(&mut pair.b, &udp[1]));
+        assert_eq!(pair.in_use()[1].0 as usize, idle + 1);
+        let recovered = pair.b.receive(now, 32).unwrap();
+        assert_eq!((recovered.rx_received, recovered.rx_processed, recovered.rx_staged), (0, 1, 0));
+        assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1);
+        assert_eq!(pair.in_use()[1].0 as usize, idle + 1, "out-of-order segment retained");
 
         blocked.set(false);
         let mut received = Vec::new();

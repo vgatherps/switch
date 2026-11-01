@@ -1618,7 +1618,7 @@ fn rx_token_owns_exact_bytes_and_returns_buffer() {
     });
 }
 
-fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u64]) {
+fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2]) {
     use crate::{Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY};
     use smoltcp::socket::tcp::State;
     use smoltcp::wire::{ArpOperation, Ipv4Cidr};
@@ -1722,14 +1722,12 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2], expected: &[u
         drop(peer_receive(&fixture, 16));
         reply.seq_number += payload.len();
     }
-    let mut stamps = Vec::new();
-    let mut bytes = Vec::new();
-    while let Some(frame) = stack.tcp_mut(&handle).recv().unwrap() {
-        stamps.push(frame.rx_timestamp());
-        bytes.extend_from_slice(frame.payload());
+    for (payload, stamp) in payloads.into_iter().zip(stamps) {
+        let frame = stack.tcp_mut(&handle).recv().unwrap().unwrap();
+        assert_eq!(frame.payload(), payload);
+        assert_eq!(frame.rx_timestamp(), stamp);
     }
-    assert_eq!(stamps, expected);
-    assert_eq!(bytes, payloads.concat());
+    assert!(stack.tcp_mut(&handle).recv().unwrap().is_none());
     assert_eq!(stack.tcp(&handle).recv_queue(), 0);
     let port = stack.into_port();
     assert!(peer_receive(&fixture, 16).is_empty());
@@ -1829,18 +1827,14 @@ fn same_tuple_reconnect_on_owned_address_sends_syn() {
 #[zhida_test_support::pinned_test]
 fn tcp_views_carry_hardware_stamps() {
     with_test_eal(|eal| {
-        check_tcp_rx_timestamps(
-            eal,
-            [&[b'a'; 200], &[b'b'; 200]],
-            &[0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210],
-        );
+        check_tcp_rx_timestamps(eal, [&[b'a'; 200], &[b'b'; 200]]);
     });
 }
 
 #[zhida_test_support::pinned_test]
-fn tcp_appended_segment_reports_first_stamp() {
+fn tcp_small_consecutive_segments_keep_hardware_stamps() {
     with_test_eal(|eal| {
-        check_tcp_rx_timestamps(eal, [b"abc", b"def"], &[0x1234_5678_9abc_def0]);
+        check_tcp_rx_timestamps(eal, [b"abc", b"def"]);
     });
 }
 

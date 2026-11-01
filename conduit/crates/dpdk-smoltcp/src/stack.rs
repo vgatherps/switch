@@ -191,13 +191,13 @@ pub struct Sent {
 /// call `into_port`, nothing else.
 pub struct Stack {
     iface: Interface,
+    rx_pool_low: bool,
     /// Exactly `max_sockets` slots, never grown.
     sockets: TcpSet<'static>,
     udp: UdpSet,
     dropped: DropQueue,
     dropped_tcp: Vec<SocketHandle>,
     dropped_udp: Vec<smoltcp::iface::UdpHandle>,
-    rx_wakes: Vec<SocketHandle>,
     /// Sockets taken off the DropQueue's frame-wait list for waking; empty between turns.
     frame_waiters: Vec<SocketHandle>,
     max_sockets: usize,
@@ -297,14 +297,16 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
+        let rx_pool_low = device.rx_pool_low(0);
+        iface.set_rx_pool_low(rx_pool_low);
         Ok(Self {
             iface,
+            rx_pool_low,
             sockets: TcpSet::new(config.max_sockets),
             udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
             dropped_tcp: Vec::with_capacity(config.max_sockets),
             dropped_udp: Vec::with_capacity(config.max_udp_sockets),
-            rx_wakes: Vec::with_capacity(config.max_sockets),
             frame_waiters: Vec::with_capacity(config.max_sockets),
             max_sockets: config.max_sockets,
             max_udp_sockets: config.max_udp_sockets,
@@ -440,11 +442,10 @@ impl Stack {
 
     /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
     /// tidying (which wakes sockets waiting for a free frame if one is free), flush,
-    /// one RX burst, maintenance, then ingress. A burst that returned packets also tells the
-    /// Interface whether the RX pool is low (fewer free mbufs than one refill of the RX ring
-    /// plus one RX burst, see `Port`); while it is, each TCP socket that processes a segment
-    /// keeps no out-of-order data (`Interface::set_rx_pool_low`). An empty burst keeps the last
-    /// answer: the frames still staged were taken before it.
+    /// one RX burst, maintenance, then ingress. A burst that returned packets, a previously
+    /// low RX pool, or a recovered Port prompts a check against the low mark (one RX ring
+    /// refill plus one burst). While low, each TCP socket processing a segment keeps no
+    /// out-of-order data (`Interface::set_rx_pool_low`).
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
         if now >= self.next_service {
@@ -452,15 +453,19 @@ impl Stack {
             unsafe { zhida_dpdk_sys::rte_timer_manage() };
             self.next_service = now + SERVICE_PERIOD;
         }
-        if self.device.port_mut().reset_pending() {
+        let recovered = if self.device.port_mut().reset_pending() {
             self.device.port_mut().recover().map_err(StackError::Port)?;
-        }
+            true
+        } else {
+            false
+        };
         self.tidy();
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
         let received = burst.accepted + burst.rejected;
-        if received != 0 {
-            self.iface.set_rx_pool_low(self.device.rx_pool_low(received));
+        if received != 0 || self.rx_pool_low || recovered {
+            self.rx_pool_low = self.device.rx_pool_low(if recovered { 0 } else { received });
+            self.iface.set_rx_pool_low(self.rx_pool_low);
         }
         self.iface.poll_maintenance(now);
 
@@ -580,12 +585,12 @@ impl Stack {
     }
 
     /// Build a TCP socket from `config` and add it. Returns the config when all
-    /// `max_sockets` slots are occupied. The socket's buffer sizes are limits, not
-    /// reservations: it holds at most `tcp::rx_mbuf_budget(&config, ip_mtu)` RX
-    /// frames and queues at most `tcp::tx_mbuf_budget(&config, ip_mtu)` TX frames,
-    /// taken from the RX and frame pools every socket shares. With the RX pool
-    /// empty the driver drops arrivals and the peer retransmits; with the frame
-    /// pool empty `send_slice` queues nothing until frames return.
+    /// `max_sockets` slots are occupied. `rx_capacity` is the advertised receive window
+    /// target, not a limit on received data; received data uses the shared RX pool.
+    /// Queued data uses the shared frame pool and is limited by `config.tx_capacity`
+    /// bytes, including unacknowledged data. With the RX pool empty the driver
+    /// drops arrivals and the peer retransmits; with the frame pool empty
+    /// `send_slice` queues nothing until frames return.
     /// Connections never use TCP timestamps.
     /// A dropped connection holds its slot until it closes; `SocketsFull` is
     /// returned until then. If it closes during a call, the next tidying call
@@ -805,11 +810,10 @@ impl Stack {
 
     /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
     /// that can make the socket readable, writable or change its state fires it: a received
-    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), a receive wake
-    /// from a dropped frame, the start of the first `turn`, `receive` or `send` that finds a
-    /// free frame after the socket's `send_slice` found the shared frame pool empty, or a state
-    /// change in egress
-    /// (close timers, TIME-WAIT end). A fired
+    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), the start of the
+    /// first `turn`, `receive` or `send` that finds a free frame after the socket's `send_slice`
+    /// found the shared frame pool empty, or a state change in egress (close timers, TIME-WAIT
+    /// end). A fired
     /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
     /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
     /// processes a dropped handle; `disarm_tcp` stops a token at once.
@@ -870,8 +874,8 @@ impl Stack {
         handle.raw
     }
 
-    /// Wake sockets waiting for a free frame if one is free, then process dropped handles,
-    /// receive wakes and reapable sockets.
+    /// Wake sockets waiting for a free frame if one is free, then process dropped handles
+    /// and reapable sockets.
     fn tidy(&mut self) {
         let (empty, frame_waiters) = self.dropped.state();
         if frame_waiters {
@@ -881,10 +885,7 @@ impl Stack {
             return;
         }
         self.dropped
-            .drain_into(&mut self.dropped_tcp, &mut self.dropped_udp, &mut self.rx_wakes);
-        for raw in self.rx_wakes.drain(..) {
-            self.sockets.rx_woken(raw);
-        }
+            .drain_into(&mut self.dropped_tcp, &mut self.dropped_udp);
         for &raw in &self.dropped_tcp {
             self.sockets.orphan(raw, self.now);
         }

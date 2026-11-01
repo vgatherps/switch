@@ -19,6 +19,7 @@ root=$tmp/root
 calls=$tmp/calls
 stubs=$tmp/bin
 printf '%s\n' '[Match]' 'MACAddress=0a:00:00:00:00:06' '' '[Link]' 'Unmanaged=yes' >"$tmp/unmanaged.network"
+printf '%s\n' '[Network]' 'ManageForeignRoutingPolicyRules=no' >"$tmp/networkd-policy.conf"
 mkdir -p "$stubs"
 stub() { # name body
     printf '#!/bin/sh\necho "%s $*" >>"%s"\n%s\n' "$1" "$calls" "$2" >"$stubs/$1"
@@ -33,7 +34,15 @@ stub grubby "case \"\$1\" in --info=*) echo \"args=\\\"\$(cat '$tmp/grubby')\\\"
 stub systemctl "case \"\$1\" in
     is-enabled) [ -e '$tmp/enabled' ] ;;
     enable) touch '$tmp/enabled' ;;
-    reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' && touch '$tmp/unmanaged-before-reboot' ;;
+    reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' && touch '$tmp/unmanaged-before-reboot'
+        cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf' && touch '$tmp/policy-before-reboot'
+        true ;;
+    restart) [ \"\${FAKE_NETWORKD_FAIL:-}\" != 1 ] || exit 1
+        if [ \"\$2\" = systemd-networkd.service ]; then
+            cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' &&
+            cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf' &&
+                touch '$tmp/policy-before-restart'
+        fi ;;
 esac"
 stub pgrep "[ -e '$tmp/irqbalance' ]"
 stub mountpoint '[ "$1" = -q ] && shift; [ -e "$1/.mounted" ]'
@@ -79,7 +88,8 @@ dpdk_stamp="dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bb
 # A fresh c7g-like host: CPUs 0-7 on node 0, no SMT, management ens5, data ens6, stock modules.
 host() {
     unset FAKE_ARCH FAKE_KERNEL FAKE_SRCVERSION FAKE_RPM_ID FAKE_RPM_ALGO FAKE_RPM_DIGEST FAKE_MODINFO_LOOKUP_FAIL
-    rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance" "$tmp/unmanaged-before-reboot"
+    rm -rf "$root" "$calls" "$tmp/enabled" "$tmp/irqbalance" "$tmp/unmanaged-before-reboot" \
+        "$tmp/policy-before-reboot" "$tmp/policy-before-restart"
     mkdir -p "$root/proc" "$root/run" "$root/etc" "$root/dev/hugepages" "$root/sys/kernel/iommu_groups" \
         "$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB" "$root/sys/module/vfio_pci_core" \
         "$root/sys/devices/system/clocksource/clocksource0" "$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci" \
@@ -145,9 +155,45 @@ fresh_apply() {
     run apply
 }
 
+host
+run apply --kernel-receiver
+check "kernel receiver apply reboots for CPU settings" status_is 100
+check "kernel receiver persists Linux ENA mode" env_has DATA_DRIVER=ena
+check "kernel receiver stages the data ENI unmanaged before reboot" test -e "$tmp/unmanaged-before-reboot"
+check "kernel receiver installs policy drop-in before reboot" test -e "$tmp/policy-before-reboot"
+check "kernel receiver does not restart networkd before a requested reboot" sh -c "! grep -q '^systemctl restart systemd-networkd.service' '$calls'"
+check "kernel receiver apply never binds or unbinds" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+reboot
+run boot
+check "kernel receiver boot succeeds" status_is 0
+check "kernel receiver boot keeps data ENI on ena" test "$(basename "$(readlink "$root/sys/bus/pci/devices/0000:00:06.0/driver")")" = ena
+check "kernel receiver boot leaves NIC binding alone" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+check "kernel receiver boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5,6" "$root/proc/irq/10/smp_affinity_list"
+run verify
+check "kernel receiver verifies on ena without VFIO" status_is 0
+check "kernel receiver verify reports its actual driver" has data "ok 0000:00:06.0 (0a:00:00:00:00:06) on ena"
+check "kernel receiver verify does not claim VFIO is loaded" has vfio_wc "ok not required for kernel receiver"
+rm "$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf"
+: >"$calls"
+run apply --kernel-receiver
+check "kernel receiver no-reboot apply succeeds" status_is 0
+check "no-reboot apply installs policy before restarting networkd" test -e "$tmp/policy-before-restart"
+check "no-reboot apply restarts networkd to activate policy" called "systemctl restart systemd-networkd.service"
+check "no-reboot apply does not bind or unbind" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+: >"$calls"
+FAKE_NETWORKD_FAIL=1 run apply --kernel-receiver
+check "networkd restart failure stops kernel receiver setup" status_is 1
+check "networkd restart failure is reported" has networkd_policy "FAIL cannot restart systemd-networkd"
+check "networkd restart failure does not flush or bind" sh -c "! grep -q 'flush\\|zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+ln -sfn ../../drivers/vfio-pci "$root/sys/bus/pci/devices/0000:00:06.0/driver"
+run verify
+check "kernel receiver verify rejects a non-ena data driver" has data "FAIL 0000:00:06.0 on 'vfio-pci', want ena"
+
 fresh_apply
 check "first apply reboots (exit 100) for the command line" status_is 100
 check "the reboot is requested" called "systemctl reboot"
+check "DPDK setup does not install kernel receiver policy" test ! -e "$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf"
+check "DPDK setup does not restart networkd" sh -c "! grep -q '^systemctl restart systemd-networkd.service' '$calls'"
 check "the exact MAC-matched unmanaged config exists when reboot is requested" test -e "$tmp/unmanaged-before-reboot"
 check "staging reloads networkd before reboot" called "networkctl reload"
 check "grubby gets every argument" grep -qx "$want_args" "$tmp/grubby"

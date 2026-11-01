@@ -60,7 +60,7 @@ fn chunk(call: usize) -> usize {
     call.wrapping_mul(7919) % 1500 + 1
 }
 
-/// Connects a fresh client socket with `rx`/`tx` byte buffers from `local`.
+/// Connects a fresh client socket with `rx` window target and `tx` byte capacity from `local`.
 fn connect(stack: &mut Stack, local: u16, rx: usize, tx: usize) -> TcpHandle {
     let socket = tcp::Config { rx_capacity: rx, tx_capacity: tx, mss_cap: None };
     let handle = stack.add_tcp(socket).unwrap();
@@ -269,40 +269,39 @@ fn echo_never_drops_bytes_when_send_buffer_is_full() {
         let mut server = EchoServer::new(&mut pair.b, ECHO_PORT, 1, 1024).unwrap();
         let handle = connect(&mut pair.a, CLIENT_PORT, 4096, 4096);
         let mut client = Client::new(&handle, pattern(16 * 1024, 3));
-        // Write only, until the client can store no more echo bytes, its send
-        // buffer is full and the server's send buffer is full: the server
-        // holds echo bytes it cannot send. The client's room can reach 0
-        // before 4096 unread bytes, since each unread echo segment holds an
-        // RX mbuf and the socket may hold six. 32 rounds in a row that
-        // neither write a byte nor change an echo socket fail.
-        let mut quiet = 0;
+        // Accumulate input before running the echo, then fill the server's send
+        // capacity in a single step without driving egress.
         pair.drive(
             |_, _| {},
             |a, b| {
-                let moved = server.step(b) | client.write(a);
-                let client_socket = a.tcp(&handle);
-                let client_state = (
-                    client_socket.recv_room(),
-                    client_socket.recv_queue(),
-                    client_socket.send_queue(),
-                );
-                let client_full =
-                    client_state.0 == 0 && client_state.2 == client_socket.send_capacity();
-                let server_socket = b.tcp(&server.handles()[0]);
-                let server_queue = server_socket.send_queue();
-                if client_full && server_queue == server_socket.send_capacity() {
-                    return App::Done;
+                if a.tcp(&handle).may_send() && b.tcp(&server.handles()[0]).may_send() {
+                    App::Done
+                } else {
+                    App::Idle
                 }
-                quiet = if moved { 0 } else { quiet + 1 };
-                assert!(
-                    quiet < 32,
-                    "buffers not full: client (recv room, recv, send) {client_state:?}, server \
-                     send {server_queue}"
-                );
-                progress(moved)
             },
         );
-        assert!(client.written < client.data.len(), "{}", client.written);
+        assert_eq!(
+            pair.a.tcp_mut(&handle).send_slice(&client.data[..4096]),
+            Ok(4096)
+        );
+        client.written = 4096;
+        pair.drive(
+            |_, _| {},
+            |a, b| {
+                if a.tcp(&handle).send_queue() == 0
+                    && b.tcp(&server.handles()[0]).recv_queue() == 4096
+                {
+                    App::Done
+                } else {
+                    App::Idle
+                }
+            },
+        );
+        assert!(server.step(&mut pair.b));
+        let socket = pair.b.tcp(&server.handles()[0]);
+        assert_eq!(socket.send_queue(), socket.send_capacity());
+        assert!(!server.step(&mut pair.b));
 
         let mut clients = [client];
         echo_all(&mut pair, &mut server, &mut clients);

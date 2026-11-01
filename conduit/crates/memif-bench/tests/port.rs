@@ -52,19 +52,18 @@ fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
 #[zhida_test_support::pinned_test]
 fn tiny_segments_keep_memif_bulk_reserve() {
     use zhida_test_kit::pair::{self, Side, T0};
-    use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
+    use dpdk_smoltcp::smoltcp::socket::tcp::State;
     use dpdk_smoltcp::smoltcp::wire::{
         ArpOperation, EthernetAddress, TcpControl, TcpRepr, TcpSeqNumber,
     };
     use dpdk_smoltcp::{rx_reserve, Stack};
 
     const CAPACITY: usize = 4096;
-    // One byte above the stack's 64-byte append limit: each segment keeps its own RX mbuf.
     const SEGMENT: usize = 65;
-    let cap = tcp::rx_mbuf_budget(&zhida_test_kit::pair::tcp_socket_sized(CAPACITY), 1500);
+    const SEGMENTS: usize = 6;
     let reserve = rx_reserve(64, BURST, usize::from(BURST), 8);
-    // Room for two sockets' RX frame caps beyond the reserve.
-    let pool_count = u32::try_from(reserve + 2 * cap).unwrap();
+    // Room for the segments retained by both sockets beyond the reserve.
+    let pool_count = u32::try_from(reserve + 2 * SEGMENTS).unwrap();
     let names = names("tinyreserve");
     let (mut server, mut client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = config(id, rx, tx, frame);
@@ -137,12 +136,10 @@ fn tiny_segments_keep_memif_bulk_reserve() {
         assert_eq!(stack.tcp(&handles[index]).state(), State::Established);
     }
     let data = [
-        pair::pattern(cap * SEGMENT, 94),
-        pair::pattern(cap * SEGMENT, 95),
+        pair::pattern(SEGMENTS * SEGMENT, 94),
+        pair::pattern(SEGMENTS * SEGMENT, 95),
     ];
     for (index, tcp) in peer.iter().enumerate() {
-        // Right edge the SYN-ACK promised.
-        let mut edge = CAPACITY;
         for (offset, bytes) in data[index].chunks(SEGMENT).enumerate() {
             let received = (offset + 1) * SEGMENT;
             let segment = TcpRepr {
@@ -156,18 +153,12 @@ fn tiny_segments_keep_memif_bulk_reserve() {
             let reply = receive(&mut client, 1);
             let ack = pair::segment(reply[0].data(), Side::B);
             assert_eq!(ack.ack_number, Some(tcp.seq_number + received));
-            // The frames-only window: the field advertises the free-frame room
-            // (capped at CAPACITY, not reduced by unread bytes) and never pulls
-            // back the right edge, even after the sixth held frame leaves no
-            // room (`recv_room` below).
-            edge = edge.max(received + stack.tcp(&handles[index]).recv_room());
-            assert_eq!(usize::from(ack.window_len), edge - received);
+            assert_eq!(usize::from(ack.window_len), CAPACITY);
             assert_eq!(stack.tcp(&handles[index]).recv_queue(), received);
             assert_eq!(stack.tcp(&handles[index]).rx_refused_segments(), 0);
-            let held = index * cap + offset + 1;
+            let held = index * SEGMENTS + offset + 1;
             assert_eq!(in_use(&names.server_rx) as usize, padding.len() + held);
         }
-        assert_eq!(stack.tcp(&handles[index]).recv_room(), 0);
     }
     let pool = wire::pool_by_name(&names.server_rx);
     assert_eq!(avail(pool), 31);
@@ -190,7 +181,7 @@ fn tiny_segments_keep_memif_bulk_reserve() {
     assert_eq!(avail(pool), 32);
     for (index, handle) in handles.into_iter().enumerate() {
         let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
-        assert_eq!(bytes.len(), cap * SEGMENT);
+        assert_eq!(bytes.len(), SEGMENTS * SEGMENT);
         assert_eq!(bytes, data[index]);
         assert_eq!(stack.tcp(&handle).rx_refused_segments(), 0);
     }

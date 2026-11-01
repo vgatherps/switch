@@ -434,18 +434,17 @@ pub fn new_pair(eal: &Eal, names: [&str; 2]) -> Pair {
     Pair::new(eal, names, [config(Side::A), config(Side::B)], T0)
 }
 
-/// Cubic, `size`-byte buffers each way.
+/// Cubic, `size`-byte receive window target and transmit capacity.
 pub fn tcp_socket_sized(size: usize) -> tcp::Config {
     tcp::Config { rx_capacity: size, tx_capacity: size, mss_cap: None }
 }
 
-/// Frames for every listed `tcp_socket_sized` buffer's full window at once, at `mtu`: the
-/// share a test adds to a pool's reserve when every socket may fill its window at once over
-/// a link that must not drop (RX), or every send queue may be full (frames).
+/// Full-sized-segment TX frame estimates for the listed socket buffers, also used
+/// to size RX pools in tests. Smaller segments can require more frames.
 pub fn windows(mtu: u16, buffers: impl IntoIterator<Item = usize>) -> usize {
     buffers
         .into_iter()
-        .map(|size| tcp::rx_mbuf_budget(&tcp_socket_sized(size), usize::from(mtu)))
+        .map(|size| tcp::tx_mbuf_budget(&tcp_socket_sized(size), usize::from(mtu)))
         .sum()
 }
 

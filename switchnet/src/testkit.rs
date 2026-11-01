@@ -36,7 +36,7 @@ pub struct TapConfig {
     /// Short and unique among live taps: the vdev is `net_tap_{name}`, the netdev
     /// `cdtap_{name}`, the pools `{name}_rx`, `{name}_tx`, `{name}_frame`.
     pub name: &'static str,
-    /// Every socket's config; the pools hold `max_sockets` of them.
+    /// Socket config used by the test; pools are shared.
     pub socket: tcp::Config,
     pub max_sockets: usize,
     pub random_seed: u64,
@@ -108,7 +108,8 @@ fn port_config<'a>(port_id: u16, config: &TapConfig, [rx, tx, frame]: &'a [CStri
         data_room_size: RTE_PKTMBUF_HEADROOM as u16 + 2048,
         socket_id: -1,
     };
-    // Beyond the reserves: one socket's full window plus 64, shared by every socket.
+    // Size the shared RX pool for one receive-window's worth of full-MTU
+    // segments plus 64 packets; short segments and retained frames use more.
     let share = |frames: usize| frames + 64;
     PortConfig {
         port_id,
@@ -118,7 +119,7 @@ fn port_config<'a>(port_id: u16, config: &TapConfig, [rx, tx, frame]: &'a [CStri
         rx_burst: 32,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(rx.as_c_str(), rx_reserve(16, 32, 32, 8) + share(tcp::rx_mbuf_budget(&config.socket, MTU.into()))),
+        rx_pool: pool(rx.as_c_str(), rx_reserve(16, 32, 32, 8) + share(config.socket.rx_capacity.div_ceil(usize::from(MTU) - 40))),
         tx_pool: pool(tx.as_c_str(), 127),
         frame_pool: pool(frame.as_c_str(), frame_reserve(16, 32) + share(tcp::tx_mbuf_budget(&config.socket, MTU.into()))),
         offloads: Offloads::default(),

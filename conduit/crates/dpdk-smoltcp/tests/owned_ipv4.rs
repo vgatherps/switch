@@ -231,8 +231,8 @@ fn stack_new_validates_owned_addresses() {
 }
 
 /// `Stack::listen` refuses an explicit local address we do not own with `Unaddressable` and
-/// changes nothing: a closed socket stays closed with its endpoint, capacities and receive
-/// room; a listening socket keeps listening on its owned address. A peer then connects to that
+/// changes nothing: a closed socket stays closed with its endpoint, window target and transmit
+/// capacity; a listening socket keeps listening on its owned address. A peer then connects to that
 /// owned address and the connection's local endpoint is it.
 #[zhida_test_support::pinned_test]
 fn listen_refuses_unowned_address_and_accepts_on_owned() {
@@ -254,7 +254,6 @@ fn listen_refuses_unowned_address_and_accepts_on_owned() {
                 socket.local_endpoint(),
                 socket.recv_capacity(),
                 socket.send_capacity(),
-                socket.recv_room(),
             )
         };
         let before = snapshot(&pair.b);

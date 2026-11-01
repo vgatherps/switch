@@ -3,14 +3,14 @@ use zhida_test_kit::ring_port::{resize, RingPort};
 use zhida_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
-use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
+use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, IpEndpoint, IpProtocol, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
 };
 use dpdk_smoltcp::{
-    frame_reserve, rx_reserve, Eal, Stack, TcpHandle, UdpConfig, UdpSendError,
+    frame_reserve, Eal, Stack, TcpHandle, UdpConfig, UdpSendError,
 };
 
 const A: usize = 0;
@@ -61,12 +61,7 @@ impl Network {
             stack.paths = if node == A { &paths } else { &[] };
             let mut port = rings[node].config();
             resize(&mut port, 9000, 9216);
-            let reserve = rx_reserve(port.rx_descriptors, port.rx_burst, stack.rx_staging, port.rx_pool.cache_size);
-            let tcp = tcp::rx_mbuf_budget(&tcp_socket_sized(BUFFER), 9000)
-                .checked_mul(stack.max_sockets).expect("TCP budget overflow");
-            let count = reserve.checked_add(tcp).and_then(|n| n.checked_add(16))
-                .expect("RX pool count overflow");
-            port.rx_pool.count = u32::try_from(count).unwrap();
+            port.rx_pool.count = 8191;
             port.tx_pool.count = 127;
             port.frame_pool.count = zhida_test_kit::pair::pool_count(
                 frame_reserve(port.tx_descriptors, stack.tx_pending),

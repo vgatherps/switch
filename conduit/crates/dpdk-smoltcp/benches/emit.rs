@@ -70,10 +70,7 @@ fn setup(eal: &Eal, case: Case, n: usize) -> (Pair, [TcpHandle; 2], Vec<Conn>) {
     let names = [format!("em{n}a"), format!("em{n}b")];
     let configs = [many::config(Side::A, n), many::config(Side::B, n)];
     let mut pair = Pair::new(eal, [&names[0], &names[1]], configs, T0);
-    // Every A write lands in an empty TX ring, which resets to offset 0.
-    // Whole messages keep B's RX ring copies contiguous as reads advance.
-    // After a read, B's window grows from two messages to three, below the
-    // update threshold.
+    // The TX byte capacity is three messages.
     let buffer = case.payload_len().checked_mul(3).expect("socket buffer");
     let (handles, _) = establish_sized(&mut pair, Side::A, buffer);
     for (stack, handle) in [(&mut pair.a, &handles[0]), (&mut pair.b, &handles[1])] {

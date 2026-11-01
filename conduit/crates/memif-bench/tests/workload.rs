@@ -22,7 +22,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as NetInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, IpEndpoint, Ipv4Address, Ipv4Cidr};
 use dpdk_smoltcp::{
-    frame_reserve, rx_reserve, Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
+    frame_reserve, Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use memif_bench::memif::MemifVdev;
 use memif_bench::workload::{
@@ -169,11 +169,7 @@ fn bare_socket() -> tcp::Config {
     tcp::Config { rx_capacity: 8192, tx_capacity: 8192, mss_cap: None }
 }
 
-/// The RX reserve plus one `bare_socket`'s RX frame cap.
-fn one_socket_rx_pool(config: &dpdk_smoltcp::PortConfig<'_>) -> u32 {
-    let reserve = rx_reserve(config.rx_descriptors, config.rx_burst, 32, config.rx_pool.cache_size);
-    u32::try_from(reserve + tcp::rx_mbuf_budget(&bare_socket(), usize::from(config.mtu))).unwrap()
-}
+const TEST_RX_POOL: u32 = 8191;
 
 fn net_time(origin: Instant, now: Instant) -> NetInstant {
     NetInstant::from_micros((now - origin).as_micros() as i64)
@@ -254,11 +250,7 @@ fn bulk_poll_sends_two_pending_queues() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.server_rx.as_c_str() {
-            config.rx_pool.count = u32::try_from(
-                rx_reserve(config.rx_descriptors, config.rx_burst, 32, config.rx_pool.cache_size)
-                    .checked_add(tcp::rx_mbuf_budget(&socket, usize::from(config.mtu)))
-                    .expect("peer RX pool count fits usize"),
-            ).expect("peer RX pool count fits u32");
+            config.rx_pool.count = TEST_RX_POOL;
             config.frame_pool.count = u32::try_from(
                 frame_reserve(config.tx_descriptors, 32)
                     .checked_add(tcp::tx_mbuf_budget(&socket, usize::from(config.mtu)))
@@ -277,7 +269,7 @@ fn bulk_poll_sends_two_pending_queues() {
         origin,
     ));
     let mut stack = bare_stack(ManuallyDrop::into_inner(server.port), 2);
-    let handle = stack.add_tcp(socket).unwrap_or_else(|_| panic!("free slot and RX budget"));
+    let handle = stack.add_tcp(socket).unwrap_or_else(|_| panic!("free socket slot"));
     stack.listen(&handle, PEER_PORT).unwrap();
     let deadline = origin + TEST;
     let now = loop {
@@ -580,7 +572,7 @@ fn peer_detects_corrupted_byte() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.client_rx.as_c_str() {
-            config.rx_pool.count = one_socket_rx_pool(&config);
+            config.rx_pool.count = TEST_RX_POOL;
         }
         config
     });
@@ -632,7 +624,7 @@ fn client_detects_corrupted_echo() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.server_rx.as_c_str() {
-            config.rx_pool.count = one_socket_rx_pool(&config);
+            config.rx_pool.count = TEST_RX_POOL;
         }
         config
     });
@@ -685,7 +677,7 @@ fn peer_echo_leaves_in_the_poll_that_received_the_request() {
     let (server, client) = common::open_pair(&names, RING, |id, rx, tx, frame| {
         let mut config = port_config(id, 1, rx, tx, frame);
         if rx == names.client_rx.as_c_str() {
-            config.rx_pool.count = one_socket_rx_pool(&config);
+            config.rx_pool.count = TEST_RX_POOL;
         }
         config
     });

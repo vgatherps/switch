@@ -36,12 +36,58 @@ pub async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
     .await
 }
 
-/// `work`'s output, or `None` once `limit` passed first, counted in Runtime ticks as
-/// milliseconds (the loop passes milliseconds to `round`). Called from a task of `spawner`'s
-/// Runtime, which is therefore open.
+/// `work`'s output, or `None` once `limit` passes from the Runtime's latest accepted tick.
+/// The Runtime's initial and poll ticks, and all relative sleeps on it, must use monotonic
+/// nanoseconds. Called from a task of `spawner`'s Runtime, which is therefore open.
+///
+/// Panics if `limit` does not fit in `u64` nanoseconds.
 pub async fn within<F: Future>(spawner: &Spawner, limit: Duration, work: F) -> Option<F::Output> {
-    let ticks = u64::try_from(limit.as_millis()).expect("limit fits u64 milliseconds");
+    let ticks = u64::try_from(limit.as_nanos()).expect("limit fits u64 nanoseconds");
     let sleep = spawner.sleep(ticks).expect("the Runtime polling this task is open");
     let expired = async { sleep.await.expect("a sleep in the task's own open Runtime") };
     first(work, expired).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::future::pending;
+    use std::rc::Rc;
+
+    use super::*;
+
+    #[switch::task]
+    async fn timeout(spawner: Spawner, completed: Rc<Cell<Option<bool>>>) {
+        let result = within(&spawner, Duration::from_nanos(123_456), pending::<()>()).await;
+        completed.set(Some(result.is_none()));
+    }
+
+    #[test]
+    fn sub_millisecond_timeout_expires_at_exact_deadline() {
+        let start = 1_000_037;
+        let deadline = start + 123_456;
+        let mut runtime = Runtime::new(start);
+        let spawner = runtime.spawner();
+        let completed = Rc::new(Cell::new(None));
+        spawner.spawn(timeout(spawner.clone(), completed.clone())).unwrap();
+
+        runtime.poll(start).unwrap();
+        assert_eq!(completed.get(), None);
+        runtime.poll(start).unwrap();
+        assert_eq!(completed.get(), None);
+        runtime.poll(deadline - 1).unwrap();
+        assert_eq!(completed.get(), None);
+        runtime.poll(deadline).unwrap();
+        assert_eq!(completed.get(), Some(true));
+    }
+
+    #[test]
+    #[should_panic(expected = "limit fits u64 nanoseconds")]
+    fn timeout_rejects_duration_larger_than_u64_nanoseconds() {
+        let runtime = Runtime::new(0);
+        let spawner = runtime.spawner();
+        let mut future = pin!(within(&spawner, Duration::from_secs(u64::MAX), pending::<()>()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = future.as_mut().poll(&mut context);
+    }
 }

@@ -147,16 +147,19 @@ and on an accepted SYN; a UDP send larger than path MTU - 28 returns `TooLarge`.
 must be at least 88, both in the config and in `Stack::new`. A peer raises an advertised MSS below
 48 up to 48 (Linux and zhida both do), so a smaller path cannot carry its full-size segments. The
 68-87 range is refused for UDP too.
-`zhida-netconf discover --aws` writes these rules:
+Fresh discovery sets the Port MTU to `min(NIC MTU, 1500)`. `zhida-netconf discover --aws`
+writes these path rules; the table shows effective MTUs after the Port MTU clamp:
 
 | destination | path MTU | TCP MSS | UDP payload max |
 |---|---:|---:|---:|
-| own subnet (implicit) | Port MTU (9001 on EC2) | 8961 | 8973 |
-| each VPC CIDR | 9001 | 8961 | 8973 |
-| `0.0.0.0/0` (internet gateway, NAT gateway) | 1500 | 1460 | 1472 |
+| own subnet (implicit) | Port MTU | Port MTU − 40 | Port MTU − 28 |
+| each VPC CIDR | min(Port MTU, 1500) | path MTU − 40 | path MTU − 28 |
+| `0.0.0.0/0` (internet gateway, NAT gateway) | min(Port MTU, 1500) | path MTU − 40 | path MTU − 28 |
 
-Add your own rules for peered VPCs (intra-region 9001; inter-region, transit gateway 8500), VPN
-(≤ 1446) or Direct Connect; without one they fall into the 1500 default. Before sizing sockets,
+For jumbo traffic, configure a jumbo Port MTU explicitly and, outside the implicit own-subnet
+rule, configure a matching custom path with a jumbo MTU. Rediscovery retains an existing jumbo
+Port MTU. Add custom rules for peered VPCs (intra-region 9001; inter-region, transit gateway 8500),
+VPN (≤ 1446) or Direct Connect; without one they fall into the 1500 default. Before sizing sockets,
 `config.path_mtu(addr)` returns the same answer the Stack will use.
 
 DNS: Zhida does not resolve names. Resolve with the kernel (`ToSocketAddrs`) before `open` or
@@ -383,21 +386,12 @@ reserve is 1024 + 1056 + 32 + 12 = 2124.
 
 Size the RX pool as `rx_reserve(...)` plus a share: the RX mbufs all sockets together may hold at
 once (unread in-order data, out-of-order segments, queued UDP datagrams, frames and datagrams the
-application holds). Every TCP and UDP socket draws on the same share; none is reserved per socket,
-so the share does not grow with the socket count. As with the kernel's per-socket receive buffer,
-each socket is capped instead: a TCP socket holds at most `tcp::rx_mbuf_budget(&config, ip_mtu)`
-RX frames,
-
-```text
-max(ceil(rx_capacity / min(ip_mtu - 40, mss_cap)), 6)
-```
-
-and advertises a window of at most that many frames' worth of payload and at most `rx_capacity`
-bytes. For MTU 1500, a 65536-byte uncapped receive buffer is capped at 45 frames; for MTU 9000, at
-8. A UDP socket holds at most `UdpConfig::rx_queue` datagrams, queued or held. A drained `TcpFrame`
-keeps its slot in the socket's cap, and a `UdpDatagram` taken from the queue keeps its slot in
-`rx_queue`, until the application drops it; frames and datagrams held after their socket is
-removed keep their mbufs until dropped.
+application holds). Every TCP and UDP socket draws on the same share; none is reserved per socket.
+Choose the share for the expected workload and concurrency. The TCP receive window does not limit
+retained data; smaller segments can consume more mbufs for the same amount of data.
+A UDP socket holds at most `UdpConfig::rx_queue` datagrams, queued or held. A `UdpDatagram` taken
+from the queue keeps its slot in `rx_queue` until dropped; frames and datagrams held after their
+socket is removed keep their mbufs until dropped.
 
 When the share runs out, the driver has no mbuf for new arrivals and drops them (the test kit's
 `Link` counts them in `pool_empty`); the stack never sees those packets and TCP peers retransmit.
@@ -463,9 +457,10 @@ pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pendi
 at most one frame no socket or application counts, and the extra frame means those packets can never
 take the last one. A NIC PMD frees sent frames only on later TX, so without that floor a pool could
 sit empty with every frame held by the PMD. Size the frame pool as `frame_reserve(...)` plus the
-frames all TCP send queues and the application may hold at once; sockets share them. Each TCP
-socket queues at most `tcp::tx_mbuf_budget(&config, ip_mtu)` frames (one per segment payload of
-`tx_capacity`, at least six). With the pool empty, `send_slice` queues nothing and returns `Ok(0)`,
+frames all TCP send queues and the application may hold at once; sockets share them.
+`tcp::tx_mbuf_budget(&config, ip_mtu)` estimates frames for a socket's `tx_capacity`
+in full-sized segment payloads (at least six), not a per-socket limit. Smaller writes
+can require more frames. With the pool empty, `send_slice` queues nothing and returns `Ok(0)`,
 `udp_send` returns `WouldBlock` and `tx_frame` returns `None`; frames return when the peer ACKs
 queued data and the PMD releases sent frames. A socket whose `send_slice` found the pool empty
 is woken (its armed readiness tokens fire) at the start of the first `turn`, `receive` or `send` that finds a free
@@ -476,7 +471,7 @@ descriptor count.
 To send TCP data without a copy, fill a frame and pass it by value:
 `stack.tcp_send_frame(&handle, frame)` queues it, and `Err((frame, error))` returns it untouched
 (`Foreign` from another Stack, `InvalidState`, `Empty`, `Full` beyond `frame_send_room()`). Each
-frame takes one frame slot; one longer than the segment payload is copied at send. A unique frame that starts the unsent
+frame holds payload bytes; one longer than the segment payload is copied at send. A unique frame that starts the unsent
 data and fits one segment goes out in place; the socket holds it until the peer ACKs it. Clones of a
 frame (one per socket, for broadcast) are copied at send. `send_slice` copies into frames.
 
@@ -595,8 +590,8 @@ only) arm a token without repeating that check; only debug builds check that the
 is still live, and a key used after its socket is removed misdirects tokens to whatever socket
 takes the slot. A change that can alter the socket's readiness
 fires every token armed on it: for TCP a received segment, `tcp_mut` (also through
-`tcp_send_frame`, `connect`, `listen`), a receive wake from a dropped frame, or a state change in
-egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and
+`tcp_send_frame`, `connect`, `listen`), recovery of the shared TX frame pool after exhaustion, or a
+state change in egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and
 returned once by `pop_fired()`; drain it after each drive call and check those sockets. Changes
 that leave readiness as it was may fire tokens too, also in a turn with no received segment and
 no call: egress fires a TCP socket's tokens when its timer comes due while it waits for a
@@ -665,7 +660,7 @@ TCP timestamp options are not negotiated or emitted. Peer timestamp offers are i
 
 ### Build and add a socket
 
-Pass receive and transmit byte capacities and an optional MSS cap to `add_tcp`:
+Pass a receive window target, transmit byte capacity and optional MSS cap to `add_tcp`:
 
 ```rust
 use dpdk_smoltcp::smoltcp::socket::tcp;
@@ -680,17 +675,16 @@ stack.tcp_mut(&handle).set_ack_delay(None);
 stack.listen(&handle, 7000)?;
 ```
 
-`rx_capacity` sets a byte capacity without allocating a payload byte ring. Received payload stays in
-owned RX mbufs until the application drains and drops it. The byte capacity sets the advertised
-window and window scale; the socket's RX frame cap (`tcp::rx_mbuf_budget`) also limits how much it
-can hold. The socket queues sent data as frames from the shared frame pool: `tx_capacity` bytes and
-`tcp::tx_mbuf_budget(&config, ip_mtu)` frames at most, unacknowledged data included. Many tiny
-writes can reach the frame limit before the byte limit. Both are per-socket limits; the mbufs come
-from pools every socket shares ("Pool sizing").
+`rx_capacity` sets the advertised TCP receive window target and window scale, not a limit on
+unread or application-held bytes. Received payload stays in owned RX mbufs until the application
+drains and drops it; the shared RX pool bounds the memory available to all sockets. Smaller
+segments can require more mbufs for the same byte volume. The socket queues sent data as frames
+from the shared frame pool, up to `tx_capacity` bytes including unacknowledged data. The frame
+pool is shared by all sockets; small writes can consume more frames than the full-sized-segment
+estimate `tcp::tx_mbuf_budget(&config, ip_mtu)` ("Pool sizing").
 
-Each received segment uses its own buffer unless it is a small in-order one appended to the last
-frame, so a peer sending many tiny segments can fill a socket's buffers before its byte window;
-refused segments are counted by `rx_refused_segments()`.
+Each retained received segment uses its own buffer. `rx_refused_segments()` counts out-of-order
+segments refused under RX pool pressure.
 
 The config's `mss_cap` limits the advertised MSS and outgoing segment payloads. `None` applies no
 application cap; local MTU and peer MSS apply regardless. The cap survives reset/reconnect and
@@ -799,16 +793,11 @@ loop {
 
 `TcpFrame` owns its RX mbuf. `payload()` gives `&[u8]`, `payload_mut()` gives `&mut [u8]`, and
 `rx_timestamp()` gives the raw hardware stamp (see Hardware RX timestamps). A frame stays valid after
-socket removal, handle drop, or Stack teardown, but it occupies the socket's RX frame cap, and
-therefore the receive window, until dropped. Copy bytes out if a parser needs them longer. Dropping
-a frame that makes a window update due queues the socket for a readiness check, so `poll_at`
-reports the current time and the next egress attempts to send the update, subject to TX capacity.
+socket removal, handle drop, or Stack teardown, and retains its RX mbuf until dropped. Copy bytes
+out if a parser needs them longer.
 
-A frame can contain several wire segments: an in-order payload of at most 64 bytes, measured after
-window and overlap trimming, can be copied into the last queued undrained frame if it ends at the
-new payload's start and has enough tailroom. The incoming mbuf is then returned immediately.
-Otherwise the payload keeps its own frame. Neither frame boundaries nor wire segments delimit
-application messages. `recv_queue()` counts all queued
+A frame contains bytes from one received segment, possibly trimmed during reassembly.
+Neither frame boundaries nor wire segments delimit application messages. `recv_queue()` counts all queued
 in-order bytes; `can_recv()` tests whether that count is positive. After peer FIN, queued frames
 drain first; then `recv` returns `RecvError::Finished`. `RecvError::InvalidState` means the receive
 half is unavailable without a clean EOF (for example reset, or before the connection is
@@ -959,8 +948,7 @@ field; a registration failure returns `PortError::Dpdk`. There is no fallback to
 Each received packet the PMD flags as stamped carries the PMD's raw `u64` unchanged; an unflagged
 packet, or any packet with the offload off, reports 0. Zhida converts nothing and never reads a
 clock. Read it with `UdpDatagram::rx_timestamp()` or `TcpFrame::rx_timestamp()`. A TCP frame reports
-the stamp of the segment that created it; small in-order segments appended into it keep that earlier
-stamp, so a frame's stamp can predate some of its bytes.
+the stamp of the received segment supplying its bytes.
 
 The unit and clock are the PMD's: ENA reports ns on the device clock (Amazon Time Sync PHC),
 `net_af_packet` reports ns of the kernel socket stamp, and `net_pcap` does not advertise the offload.
@@ -1018,7 +1006,7 @@ not add events until an ACK advances it.
 Both counters survive abort and other closes until socket reset runs, such as connect/listen,
 TimeWait expiry, or a peer reset that re-arms Listen. `congestion_window() -> usize` reports Cubic's
 current window in bytes. It is separate from the peer window and TX ring space. Also inspect
-`state`, endpoints, `send_queue`, `recv_queue`, `recv_room`, capacities, and `rx_refused_segments`.
+`state`, endpoints, `send_queue`, `recv_queue`, `recv_capacity`, `send_capacity`, and `rx_refused_segments`.
 The latter is a `u32` count that saturates at its maximum.
 
 Malformed IPv4 packets, software IPv4 checksum failures, rejected fragments, malformed UDP, bad
@@ -1120,10 +1108,10 @@ request goes out on a later send. UDP receive reports drops through counters, no
 These panic:
 
 - using a handle with a Stack that did not create it
-- adding a TCP socket with receive capacity above 1 GiB; adding or `rx_mbuf_budget` with `mss_cap: Some(0)`
+- adding a TCP socket with a receive window target above 1 GiB or `mss_cap: Some(0)`
 - `set_initial_window(0)`, `set_rto(Duration::ZERO)` or RTO above 60 seconds, `set_ack_delay` above
   60 seconds, `set_hop_limit(Some(0))`
-- `rx_mbuf_budget` and `tx_mbuf_budget` below MTU 68
+- `tx_mbuf_budget` below MTU 68
 - overflow in reserve arithmetic, frame-budget conversions, or timer arithmetic near the
   integer limit; excessive `neighbor_capacity` at startup
 - a TX-done cleanup failure other than `-ENOTSUP` when a drive operation allocates a TX packet

@@ -908,13 +908,13 @@ impl Port {
         u16::try_from(self.rx_scratch.len()).expect("rx_burst is a u16")
     }
 
-    /// After an RX burst that returned `received` packets (accepted and rejected), whether the
-    /// RX mbufs this lcore can allocate (the RX pool's backing store plus this lcore's cache,
-    /// which the PMD refills from) fall short of the low mark (`rx_low_mark`). Reads the free
-    /// count only when its last reading does not already rule that out (`RxPressure`).
+    /// After an RX burst, whether the RX mbufs this lcore can allocate (the RX pool's backing
+    /// store plus this lcore's cache, which the PMD refills from) fall short of the low mark
+    /// (`rx_low_mark`). A zero `received` count forces a fresh reading; otherwise the last reading
+    /// may already rule out a low pool (`RxPressure`).
     #[inline]
     pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
-        if self.rx_pressure.covers(received) {
+        if received != 0 && self.rx_pressure.covers(received) {
             return false;
         }
         self.read_rx_pool_low()

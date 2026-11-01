@@ -93,32 +93,6 @@ impl RxBuf {
         self.room = room;
     }
 
-    pub(crate) fn room(&self) -> usize {
-        self.room
-    }
-
-    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
-        assert!(bytes.len() <= self.room, "extend exceeds frame room");
-        let len = self
-            .len
-            .checked_add(bytes.len())
-            .expect("frame length exceeds usize");
-        let room = self
-            .room
-            .checked_sub(bytes.len())
-            .expect("extend exceeds frame room");
-        // SAFETY: the constructor gives this value exclusive writable tailroom.
-        // The assert keeps the copy within it, and the borrow keeps bytes separate.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.data.as_ptr().add(self.len),
-                bytes.len(),
-            );
-        }
-        self.len = len;
-        self.room = room;
-    }
 
     #[cfg(test)]
     pub(crate) fn counted_frame(
@@ -215,85 +189,23 @@ mod tests {
     }
 
     #[test]
-    fn rx_timestamp_kept_through_narrow_and_extend() {
+    fn rx_timestamp_kept_through_narrow() {
         let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3], 2, Rc::new(Cell::new(0)));
         frame.set_rx_timestamp(7);
         frame.narrow(1..2);
-        assert_eq!(frame.rx_timestamp(), 7);
-        frame.extend_from_slice(&[4, 5]);
-        assert_eq!(frame.as_slice(), &[2, 4, 5]);
+        assert_eq!(frame.as_slice(), &[2]);
         assert_eq!(frame.rx_timestamp(), 7);
     }
 
-    #[test]
-    fn extend_reads_back_old_and_new_bytes() {
-        let releases = Rc::new(Cell::new(0));
-        let mut frame = RxBuf::counted_frame(alloc::vec![1, 2], 4, releases);
-        frame.extend_from_slice(&[3, 4, 5]);
-        assert_eq!(frame.as_slice(), &[1, 2, 3, 4, 5]);
-        assert_eq!(frame.len(), 5);
-        assert_eq!(frame.room(), 1);
-    }
 
     #[test]
-    fn extend_exact_room_then_panic_leaves_frame_unchanged() {
-        let releases = Rc::new(Cell::new(0));
-        let mut frame = RxBuf::counted_frame(alloc::vec![1, 2], 2, releases.clone());
-        frame.extend_from_slice(&[3, 4]);
-        let data = frame.as_slice().as_ptr();
-        assert_eq!(frame.room(), 0);
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                frame.extend_from_slice(&[5]);
-            }))
-            .is_err()
-        );
-        assert_eq!(frame.as_slice().as_ptr(), data);
-        assert_eq!(frame.as_slice(), &[1, 2, 3, 4]);
-        assert_eq!(frame.len(), 4);
-        assert_eq!(frame.room(), 0);
-        assert_eq!(releases.get(), 0);
-    }
-
-    #[test]
-    fn narrow_tail_adds_room_for_extend() {
-        let releases = Rc::new(Cell::new(0));
-        let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3, 4], 2, releases);
-        frame.narrow(1..2);
-        assert_eq!(frame.room(), 4);
-        frame.extend_from_slice(&[5, 6, 7, 8]);
-        assert_eq!(frame.as_slice(), &[2, 5, 6, 7, 8]);
-        assert_eq!(frame.room(), 0);
-    }
-
-    #[test]
-    fn narrow_head_keeps_room() {
+    fn narrow_head_preserves_bytes() {
         let releases = Rc::new(Cell::new(0));
         let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3, 4], 2, releases);
         frame.narrow(2..4);
         assert_eq!(frame.as_slice(), &[3, 4]);
-        assert_eq!(frame.room(), 2);
     }
 
-    #[test]
-    fn release_runs_once_after_extends() {
-        let releases = Rc::new(Cell::new(0));
-        let mut frame = RxBuf::counted_frame(alloc::vec![1], 3, releases.clone());
-        frame.extend_from_slice(&[2]);
-        frame.extend_from_slice(&[3, 4]);
-        assert_eq!(releases.get(), 0);
-        drop(frame);
-        assert_eq!(releases.get(), 1);
-    }
-
-    #[test]
-    fn from_vec_has_no_spare_room() {
-        let mut bytes = Vec::with_capacity(32);
-        bytes.extend_from_slice(&[1, 2]);
-        assert!(bytes.capacity() > bytes.len());
-        let frame = RxBuf::from_vec(bytes);
-        assert_eq!(frame.room(), 0);
-    }
 
     fn owned_frame(len: usize) -> (RxBuf, Rc<Cell<usize>>, NonNull<Storage>) {
         assert!(len <= 4);

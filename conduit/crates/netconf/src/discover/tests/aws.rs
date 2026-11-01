@@ -334,11 +334,11 @@ fn aws_prefix_mismatch_is_error() {
     assert!(error.contains("10.0.1.23/22") && error.contains("10.0.1.0/24"));
 }
 #[test]
-fn aws_vpc_blocks_become_9001_rules() {
+fn aws_vpc_blocks_become_1500_rules() {
     let tree = Tree::new();
     let server = ordinary((200, "1.2.3.4"));
     let config = aws(&tree, &server, &addresses()).unwrap().config;
-    assert_eq!(config.mtu, 9001);
+    assert_eq!(config.mtu, 1500);
     assert_eq!(
         config
             .paths
@@ -346,8 +346,8 @@ fn aws_vpc_blocks_become_9001_rules() {
             .map(|p| (p.prefix.to_string(), p.mtu, p.why.as_str()))
             .collect::<Vec<_>>(),
         vec![
-            ("10.0.0.0/16".into(), 9001, "vpc"),
-            ("192.168.0.0/16".into(), 9001, "vpc"),
+            ("10.0.0.0/16".into(), 1500, "vpc"),
+            ("192.168.0.0/16".into(), 1500, "vpc"),
             ("0.0.0.0/0".into(), 1500, "default")
         ]
     );
@@ -404,7 +404,7 @@ fn operator_rules_survive_rediscover() {
     if let Device::Pci(p) = &mut previous.device {
         p.devargs = "custom=1".into();
     }
-    previous.mtu = 1500;
+    previous.mtu = 9001;
     let path = tree.dir.join("config.json");
     fs::write(&path, previous.to_json()).unwrap();
     let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
@@ -419,7 +419,7 @@ fn operator_rules_survive_rediscover() {
             previous.paths[1].clone(),
             PathRule {
                 prefix: "172.16.0.0/16".parse().unwrap(),
-                mtu: 9001,
+                mtu: 1500,
                 why: "vpc".into(),
             },
             PathRule {
@@ -433,6 +433,9 @@ fn operator_rules_survive_rediscover() {
         .paths
         .iter()
         .any(|p| p.prefix == "192.168.0.0/16".parse().unwrap()));
+    assert_eq!(merged.mtu, 9001);
+    assert_eq!(merged.path_mtu("10.2.3.4".parse().unwrap()), 8500);
+    assert_eq!(merged.path_mtu("172.16.1.1".parse().unwrap()), 1500);
     assert_eq!(merged.offloads, previous.offloads);
     assert_eq!(merged.descriptors, previous.descriptors);
     assert_eq!(merged.rx_timestamps, previous.rx_timestamps);
@@ -440,7 +443,7 @@ fn operator_rules_survive_rediscover() {
     assert_eq!(merged.device, previous.device);
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "changed: mtu\nchanged: paths\n"
+        "changed: paths\n"
     );
 }
 #[test]
@@ -559,10 +562,11 @@ fn aws_required_items_and_address_selection() {
     );
     tree.write("class/net/eth1/mtu", "1400\n");
     let server = ordinary((200, "1.2.3.4"));
-    assert_eq!(
-        aws(&tree, &server, &addresses[..1]).unwrap().config.mtu,
-        1400
-    );
+    let config = aws(&tree, &server, &addresses[..1]).unwrap().config;
+    assert_eq!(config.mtu, 1400);
+    assert!(config.paths.iter().all(|p| p.mtu == 1500));
+    assert_eq!(config.path_mtu("10.0.2.1".parse().unwrap()), 1400);
+    assert_eq!(config.path_mtu("8.8.8.8".parse().unwrap()), 1400);
 }
 
 /// An unnumbered interface (no kernel IPv4): `--ipv4` selects from IMDS local-ipv4s; an address

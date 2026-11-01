@@ -25,7 +25,7 @@ pub fn run(
 ) -> Result<(), String> {
     let resets = dpdk_smoltcp::port_resets();
     let local_port = random_local_port().map_err(|e| format!("local port entropy: {e}"))?;
-    let mut rt = Runtime::new(clock.ms());
+    let mut rt = Runtime::new(clock.ns());
     let (stop_feed, stop_rx) = oneshot::channel();
     let mut stop_feed = Some(stop_feed);
     let out = Rc::default();
@@ -50,7 +50,8 @@ pub fn run(
         if let Some(outcome) = out.take() {
             break outcome;
         }
-        switchnet::round(net, &mut rt, clock.now(), clock.ms())
+        let (now, tick) = clock.sample();
+        switchnet::round(net, &mut rt, now, tick)
             .map_err(|e| format!("round: {e:?}"))?;
         if let Some(stop_feed) = stop_feed.take_if(|_| stopped()) {
             let _ = stop_feed.send(());

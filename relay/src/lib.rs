@@ -6,6 +6,8 @@
 //! out a frame at a time. Over wss these are the plaintext buffers: sheath copies each sealed
 //! record's plaintext once more for rustls to encrypt it into the frame.
 //! Masked payloads are XORed in eight-byte chunks, including across receive pieces.
+//! For plain WebSocket connections, `Ws::recv_with_sender` permits sending directly from a
+//! borrowed received message without an intermediate payload buffer.
 //!
 //! Without the feature only the protocol core builds, crate-private and exercised by its unit
 //! tests (it needs no DPDK, so they run on any host and under Miri).

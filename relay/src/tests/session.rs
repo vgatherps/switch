@@ -245,6 +245,72 @@ fn recv_returns_messages_split_across_frames_and_answers_a_ping() {
     assert_eq!(input.borrow().live_frames(), 0);
 }
 
+#[test]
+fn received_bytes_can_be_sent_with_the_borrowed_sender() {
+    let (mut s, log, input) = raw();
+    let mask = Some([1, 2, 3, 4]);
+    let wire = [
+        client_frame(TEXT, b"hello"),
+        encode(BINARY, mask, &[0, 255]),
+        client_frame(PING, b"p"),
+        encode(fin(CONT), mask, &[2, 3]),
+        client_frame(CLOSE, &1000u16.to_be_bytes()),
+    ].concat();
+    for chunk in wire.chunks(7) {
+        feed(&input, chunk, false);
+    }
+
+    for (kind, bytes) in [(Kind::Text, &b"hello"[..]), (Kind::Binary, &[0, 255, 2, 3][..])] {
+        let (message, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
+        assert_eq!((message.kind(), message.bytes()), (kind, bytes));
+        assert_eq!(poll_n(sender.send(message.kind(), message.bytes()), 1), Some(Ok(())));
+    }
+    assert!(matches!(poll_n(s.recv_with_sender(), 1), Some(Ok(None))));
+    assert_eq!(
+        sent(&log),
+        [
+            encode(fin(TEXT), None, b"hello"),
+            encode(fin(PONG), None, b"p"),
+            encode(fin(BINARY), None, &[0, 255, 2, 3]),
+            encode(fin(CLOSE), None, &1000u16.to_be_bytes()),
+        ]
+    );
+}
+
+#[test]
+fn borrowed_send_cancellation_preserves_acceptance_and_next_receive() {
+    for (len, accepted) in [(10, false), (3000, true)] {
+        let (mut s, log, input) = raw();
+        assert!(poll_n(s.recv_with_sender(), 1).is_none());
+        let payload = vec![7; len];
+        feed(&input, &client_frame(BINARY, &payload), false);
+        let (message, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
+        log.borrow_mut().room = Some(if accepted { ROOM } else { 0 });
+        assert!(poll_n(sender.send(message.kind(), message.bytes()), 1).is_none());
+        log.borrow_mut().room = None;
+        feed(&input, &client_frame(TEXT, b"next"), false);
+        let (next, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
+        assert_eq!((next.kind(), next.bytes()), (Kind::Text, &b"next"[..]));
+        assert_eq!(poll_n(sender.send(next.kind(), next.bytes()), 1), Some(Ok(())));
+        let mut expected = Vec::new();
+        if accepted {
+            expected.push(tmsg(Kind::Binary, &payload));
+        }
+        expected.push(tmsg(Kind::Text, b"next"));
+        assert_eq!(messages(Role::Server, &log), expected);
+    }
+}
+
+#[test]
+fn receive_with_sender_reports_protocol_failure() {
+    let (mut s, _, input) = raw();
+    feed(&input, &encode(fin(TEXT), None, b"unmasked"), false);
+    assert!(matches!(
+        poll_n(s.recv_with_sender(), 1),
+        Some(Err(TxError::Failed(Failure::Protocol(crate::ProtocolError::UnmaskedFrame))))
+    ));
+}
+
 /// An idle `recv` waits on input alone without spinning; a frame wakes it.
 #[test]
 fn idle_recv_is_woken_by_input_alone() {

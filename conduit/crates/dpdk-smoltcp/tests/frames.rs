@@ -15,7 +15,6 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{RecvError, State, TcpFrame};
 use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
 use dpdk_smoltcp::smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpEndpoint, Ipv4Packet, TcpControl, TcpPacket, TcpRepr,
-    TcpSeqNumber,
     TCP_HEADER_LEN,
 };
 use dpdk_smoltcp::Stack;
@@ -57,7 +56,6 @@ impl Frame {
             other => panic!("unexpected Ethernet protocol {other:?}"),
         }
     }
-
     fn line(&self) -> String {
         let eth = EthernetFrame::new_checked(&self.bytes[..]).unwrap();
         let end = match eth.ethertype() {
@@ -81,6 +79,7 @@ impl Frame {
         }
         line
     }
+
 }
 
 fn tcp_frames(frames: &[Frame]) -> impl Iterator<Item = (&Frame, TcpRepr<'_>)> {
@@ -305,6 +304,7 @@ fn compare(name: &str, lines: Vec<String>) {
     );
 }
 
+
 fn bulk_scenario(mut scenario: impl FnMut(&mut Pair, &RefCell<Trace>, &[TcpHandle; 2]) -> u64) {
     with_eal(|eal| {
         let mut pair = Pair::with_pools(
@@ -358,11 +358,7 @@ fn bulk_handshake() {
         assert_eq!(update.ack_number, Some(syn.seq_number + 1));
         let shift = syn_ack.window_scale.unwrap();
         let socket = pair.b.tcp(&handles[1]);
-        // At the fixture's 1500-byte IP MTU, each free RX frame holds one peer MSS.
-        let allowance = dpdk_smoltcp::smoltcp::socket::tcp::rx_mbuf_budget(&tcp_socket_sized(BULK), 1500)
-            .checked_mul(usize::from(syn.max_seg_size.unwrap()))
-            .expect("RX frame allowance")
-            .min(socket.recv_capacity());
+        let allowance = socket.recv_capacity();
         let advertised = usize::from(update.window_len) << shift;
         assert_eq!(advertised, (allowance >> shift) << shift);
         assert!(advertised > usize::from(u16::MAX));
@@ -399,14 +395,8 @@ fn bulk_handshake_ack_receive_window() {
         assert!(!ack_frame.dropped);
         let shift = syn.window_scale.unwrap();
         let socket = pair.a.tcp(&handles[0]);
-        let frames = dpdk_smoltcp::smoltcp::socket::tcp::rx_mbuf_budget(&tcp_socket_sized(BULK), 1500);
-        // Before learning B's MSS, the SYN allows 48 bytes per frame: 180 x 48 = 8640.
-        assert_eq!(usize::from(syn.window_len), frames.checked_mul(48).unwrap());
-        // At the fixture's 1500-byte IP MTU, each free RX frame holds one peer MSS.
-        let allowance = frames
-            .checked_mul(usize::from(syn_ack.max_seg_size.unwrap()))
-            .expect("RX frame allowance")
-            .min(socket.recv_capacity());
+        assert_eq!(usize::from(syn.window_len), socket.recv_capacity().min(usize::from(u16::MAX)));
+        let allowance = socket.recv_capacity();
         let advertised = usize::from(ack.window_len) << shift;
         assert_eq!(advertised, (allowance >> shift) << shift);
         assert!(advertised > usize::from(syn.window_len));
@@ -487,56 +477,12 @@ fn bulk_small_writes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn bulk_receive_window_reopening() {
-    bulk_scenario(|pair, trace, handles| {
-        let data = pattern(3 * BULK / 4, 6);
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(&data), Ok(data.len()));
-        drive(pair, trace, |a, b| {
-            if a.tcp(&handles[0]).send_queue() == 0 && b.tcp(&handles[1]).recv_queue() == data.len() {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        let (window, ack) = tcp_frames(&trace.borrow().frames)
-            .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
-            .map(|(_, tcp)| (tcp.window_len, tcp.ack_number))
-            .last()
-            .unwrap();
-        let start = trace.borrow().frames.len();
-        read_b(pair, handles, &data);
-        let at = pair.now();
-        assert_eq!(pair.b.poll_at(), Some(at));
-        round(pair, trace, at);
-        {
-            let recorded = trace.borrow();
-            let updates: Vec<_> = tcp_frames(&recorded.frames[start..]).collect();
-            assert_eq!(
-                updates.len(),
-                1,
-                "B did not send one window update after the large read"
-            );
-            assert_eq!(updates[0].0.dir, Dir::BToA);
-            assert_eq!(updates[0].0.at, at);
-            assert!(pure_ack(&updates[0].1));
-            assert!(updates[0].1.window_len > window);
-            assert_eq!(updates[0].1.ack_number, ack);
-        }
-        round(pair, trace, at);
-        assert_eq!((pair.a.poll_at(), pair.b.poll_at()), (None, None));
-        0
-    });
-}
-
-/// A fills B's 4096-byte window in `rx_frame_cap` segments; B receives and
-/// holds every frame; the last B ACK closes A's window and B goes quiet.
-/// Returns the held frames and that ACK's number.
+/// Receive one window of data and return the held frames.
 fn hold_every_frame(
     pair: &mut Pair,
     trace: &RefCell<Trace>,
     handles: &[TcpHandle; 2],
-) -> (Vec<TcpFrame>, Option<TcpSeqNumber>) {
+) -> Vec<TcpFrame> {
     // Both sides quiet first: A has B's post-handshake window update.
     drive(pair, trace, |a, b| {
         if a.poll_at().is_none() && b.poll_at().is_none() {
@@ -546,77 +492,51 @@ fn hold_every_frame(
         }
     });
     let data = pattern(4096, 40);
-    let cap = pair.b.tcp(&handles[1]).rx_frame_cap();
-    for index in 0..cap {
-        let bytes = &data[index * data.len() / cap..(index + 1) * data.len() / cap];
+    const SEGMENTS: usize = 8;
+    for index in 0..SEGMENTS {
+        let bytes = &data[index * data.len() / SEGMENTS..(index + 1) * data.len() / SEGMENTS];
         assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(bytes), Ok(bytes.len()));
         assert_eq!(pair.a.send().unwrap().tx_accepted, 1);
     }
-    let mut held = Vec::new();
     drive(pair, trace, |a, b| {
-        while let Some(frame) = b.tcp_mut(&handles[1]).recv().unwrap() {
-            held.push(frame);
-        }
-        if a.tcp(&handles[0]).send_queue() == 0 && held.len() == cap {
+        if a.tcp(&handles[0]).send_queue() == 0 && b.tcp(&handles[1]).recv_queue() == data.len() {
             App::Done
         } else {
             App::Idle
         }
     });
-    let at = pair.now();
-    round(pair, trace, at);
-    let recorded = trace.borrow();
-    let (_, ack) = tcp_frames(&recorded.frames)
-        .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
-        .last()
-        .unwrap();
-    assert_eq!(ack.window_len, 0, "holding every frame did not close A's window");
-    assert_eq!(pair.b.poll_at(), None);
-    (held, ack.ack_number)
+    let mut held = Vec::new();
+    while let Some(frame) = pair.b.tcp_mut(&handles[1]).recv().unwrap() {
+        held.push(frame);
+    }
+    assert_eq!(held.len(), SEGMENTS);
+    assert_eq!(held.iter().flat_map(|frame| frame.payload().iter().copied()).collect::<Vec<_>>(), data);
+    held
 }
 
-/// B holds every received frame across turns, so its last ACK closes A's
-/// window. Dropping the frames between turns, with no Stack call and no peer
-/// packet, makes `poll_at` answer now, and the next turn sends one pure ACK
-/// reopening the window. Twice: the first wake does not suppress the second.
+/// Retaining frames does not limit delivery of the next receive window.
 #[zhida_test_support::pinned_test]
-fn held_frames_dropped_between_turns_reopen_zero_window() {
+fn receiving_continues_while_frames_are_held() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frza", "frzb"], [config(Side::A), config(Side::B)], T0);
         let trace = record(&mut pair);
         let handles = open(&mut pair, &trace, 4096);
-        for _ in 0..2 {
-            let (held, ack) = hold_every_frame(&mut pair, &trace, &handles);
-            let at = pair.now();
-            let start = trace.borrow().frames.len();
-            drop(held);
-            assert_eq!(pair.b.poll_at(), Some(at));
-            round(&mut pair, &trace, at);
-            {
-                let recorded = trace.borrow();
-                let updates: Vec<_> = tcp_frames(&recorded.frames[start..]).collect();
-                assert_eq!(updates.len(), 1, "B did not send one window update after the drop");
-                assert_eq!(updates[0].0.dir, Dir::BToA);
-                assert!(pure_ack(&updates[0].1));
-                assert!(updates[0].1.window_len > 0);
-                assert_eq!(updates[0].1.ack_number, ack);
-            }
-            assert_eq!(pair.b.poll_at(), None);
-            round(&mut pair, &trace, at);
-        }
+        let first = hold_every_frame(&mut pair, &trace, &handles);
+        let second = hold_every_frame(&mut pair, &trace, &handles);
+        assert_eq!(pair.b.tcp(&handles[1]).held_frames().count(), first.len() + second.len());
+        drop((first, second));
         finish(pair, &trace, 0);
     });
 }
 
-/// Frames held at a zero window, then B's socket removed: dropping them later
-/// names no socket and panics nothing; the Stack still turns.
+/// Frames remain valid when B's socket is removed and are released when dropped.
 #[zhida_test_support::pinned_test]
 fn held_frames_dropped_after_remove_tcp() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frra", "frrb"], [config(Side::A), config(Side::B)], T0);
         let trace = record(&mut pair);
         let handles = open(&mut pair, &trace, 4096);
-        let (held, _) = hold_every_frame(&mut pair, &trace, &handles);
+        let held = hold_every_frame(&mut pair, &trace, &handles);
         let [a, b] = handles;
         pair.b.remove_tcp(b);
         drop(held);
@@ -658,6 +578,101 @@ fn bulk_held_frames_dropped_between_turns_stay_quiet() {
         round(pair, trace, at);
         assert_eq!(trace.borrow().frames.len(), start, "dropping frames sent a frame");
         0
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn peer_zero_window_probe_then_full_delivery() {
+    with_eal(|eal| {
+        let mut pair = Pair::new(
+            eal,
+            ["frza", "frzb"],
+            [config(Side::A), config(Side::B)],
+            T0,
+        );
+        let trace = record(&mut pair);
+        let handles = open(&mut pair, &trace, 4096);
+        let (a_seq, b_seq) = {
+            let recorded = trace.borrow();
+            let (frame, ack) = tcp_frames(&recorded.frames).last().unwrap();
+            assert_eq!(frame.dir, Dir::AToB);
+            assert!(pure_ack(&ack));
+            (ack.seq_number, ack.ack_number.unwrap())
+        };
+        let mut peer_ack = TcpRepr {
+            src_port: SERVER_PORT,
+            dst_port: CLIENT_PORT,
+            control: TcpControl::None,
+            seq_number: b_seq,
+            ack_number: Some(a_seq),
+            window_len: 0,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        // Do not let the real peer's window updates override the injected zero window.
+        pair.b_to_a.paused = true;
+        pair.inject(Side::A, &[tcp_frame(Side::B, &peer_ack)]);
+        let at = pair.now();
+        assert_eq!(round(&mut pair, &trace, at).a.rx_processed, 1);
+
+        let data = pattern(1000, 37);
+        let start = trace.borrow().frames.len();
+        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(&data), Ok(data.len()));
+        round(&mut pair, &trace, at);
+        let mut deadline = at;
+        loop {
+            let next = pair.a.poll_at().expect("zero-window probe deadline");
+            assert!(next > deadline && next <= ceil_ms(at + RTO));
+            round(&mut pair, &trace, next - Duration::from_millis(1));
+            assert!(tcp_frames(&trace.borrow().frames[start..])
+                .all(|(frame, tcp)| frame.dir != Dir::AToB || tcp.payload.is_empty()));
+            round(&mut pair, &trace, next);
+            deadline = next;
+            if tcp_frames(&trace.borrow().frames[start..])
+                .any(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
+            {
+                break;
+            }
+        }
+        {
+            let recorded = trace.borrow();
+            let probes: Vec<_> = tcp_frames(&recorded.frames[start..])
+                .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
+                .collect();
+            assert_eq!(probes.len(), 1);
+            assert_eq!(probes[0].0.at, deadline);
+            assert_eq!(probes[0].1.seq_number, a_seq);
+            assert_eq!(probes[0].1.ack_number, Some(b_seq));
+            assert_eq!(probes[0].1.payload, &data[..1]);
+        }
+        assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), 1);
+        peer_ack.ack_number = Some(a_seq + 1);
+        peer_ack.window_len = 4096;
+        pair.inject(Side::A, &[tcp_frame(Side::B, &peer_ack)]);
+        assert_eq!(pair.a.receive(deadline, 32).unwrap().rx_processed, 1);
+        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), data.len() - 1);
+        pair.b_to_a.paused = false;
+        receive_acked(&mut pair, &trace, &handles, &data);
+
+        let after_delivery = pair.now() + RTO + RTO;
+        round(&mut pair, &trace, after_delivery);
+        let recorded = trace.borrow();
+        let mut next = a_seq;
+        for (_, tcp) in tcp_frames(&recorded.frames[start..])
+            .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
+        {
+            assert_eq!(tcp.seq_number, next, "data was retransmitted or skipped");
+            next = next + tcp.payload.len();
+        }
+        assert_eq!(next, a_seq + data.len());
+        assert_eq!((pair.a.tcp(&handles[0]).retransmits(), pair.a.tcp(&handles[0]).loss_events()), (0, 0));
+        assert_eq!(pair.a.poll_at(), None);
+        drop(recorded);
+        finish(pair, &trace, 0);
     });
 }
 
@@ -940,28 +955,8 @@ fn bulk_frames_match_committed() {
                 App::Idle
             }
         });
-        let (window, ack) = tcp_frames(&trace.borrow().frames)
-            .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
-            .map(|(_, tcp)| (tcp.window_len, tcp.ack_number))
-            .last()
-            .unwrap();
-        let start = trace.borrow().frames.len();
         read_b(&mut pair, &handles, &data);
         let at = pair.now();
-        round(&mut pair, &trace, at);
-        {
-            let recorded = trace.borrow();
-            let updates: Vec<_> = tcp_frames(&recorded.frames[start..])
-                .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
-                .collect();
-            assert_eq!(
-                updates.len(),
-                1,
-                "B did not send a window update after the large read"
-            );
-            assert!(updates[0].1.window_len > window);
-            assert_eq!(updates[0].1.ack_number, ack);
-        }
         round(&mut pair, &trace, at);
 
         let data = pattern(1000, 7);
@@ -1184,91 +1179,6 @@ fn plain_frames_match_committed() {
             "keep-alive reached the application"
         );
 
-        let data = pattern(4096, 30);
-        let cap = pair.b.tcp(&handles[1]).rx_frame_cap();
-        let start = trace.borrow().frames.len();
-        for index in 0..cap {
-            let from = index * data.len() / cap;
-            let to = (index + 1) * data.len() / cap;
-            let bytes = &data[from..to];
-            assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(bytes), Ok(bytes.len()));
-            assert_eq!(pair.a.send().unwrap().tx_accepted, 1);
-        }
-        drive(&mut pair, &trace, |a, b| {
-            if a.tcp(&handles[0]).send_queue() == 0 && b.tcp(&handles[1]).recv_queue() == data.len() {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        {
-            let recorded = trace.borrow();
-            let (_, ack) = tcp_frames(&recorded.frames[start..])
-                .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
-                .last()
-                .unwrap();
-            assert_eq!(ack.window_len, 0, "B did not close A's send window");
-            assert_eq!(ack.ack_number, Some(a_seq + data.len()));
-        }
-
-        let queued = pattern(1000, 31);
-        assert_eq!(
-            pair.a.tcp_mut(&handles[0]).send_slice(&queued),
-            Ok(queued.len())
-        );
-        let start = trace.borrow().frames.len();
-        let blocked_at = pair.now();
-        let blocked = round(&mut pair, &trace, blocked_at);
-        assert_eq!((blocked.a_to_b, blocked.b_to_a), (0, 0));
-        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), queued.len());
-        assert!(pair.a.poll_at().is_some_and(|at| at > blocked_at));
-        drive(&mut pair, &trace, |_, _| {
-            if trace.borrow().frames.len() > start {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        {
-            let recorded = trace.borrow();
-            let frames: Vec<_> = tcp_frames(&recorded.frames[start..]).collect();
-            assert_eq!(frames.len(), 2, "zero-window probe or its ACK is missing");
-            let (frame, probe) = &frames[0];
-            assert_eq!(frame.dir, Dir::AToB);
-            assert!(frame.at > blocked_at, "probe did not wait for its timer");
-            assert_eq!(frame.at, ceil_ms(blocked_at + RTO));
-            assert_eq!(probe.control, TcpControl::None);
-            assert_eq!(probe.seq_number, a_seq + data.len());
-            assert_eq!(probe.ack_number, Some(b_seq));
-            assert_eq!(probe.payload, &queued[..1]);
-            let (frame, ack) = &frames[1];
-            assert_eq!(frame.dir, Dir::BToA);
-            assert!(pure_ack(ack));
-            assert_eq!(ack.window_len, 0);
-            assert_eq!(ack.ack_number, Some(probe.seq_number));
-        }
-        let at = pair.now();
-        round(&mut pair, &trace, at);
-        assert_eq!(
-            pair.a.tcp(&handles[0]).send_queue(),
-            queued.len(),
-            "probe was acknowledged as data"
-        );
-        assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), data.len());
-        read_b(&mut pair, &handles, &data);
-        let start = trace.borrow().frames.len();
-        round(&mut pair, &trace, at);
-        {
-            let recorded = trace.borrow();
-            let updates: Vec<_> = tcp_frames(&recorded.frames[start..]).collect();
-            assert_eq!(updates.len(), 1);
-            assert_eq!(updates[0].0.dir, Dir::BToA);
-            assert!(pure_ack(&updates[0].1));
-            assert_eq!(updates[0].1.window_len, 4096);
-            assert_eq!(updates[0].1.ack_number, Some(a_seq + data.len()));
-        }
-        receive_acked(&mut pair, &trace, &handles, &queued);
-        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
 
         let start = trace.borrow().frames.len();
         pair.a.abort(&handles[0]);
@@ -1287,7 +1197,7 @@ fn plain_frames_match_committed() {
             assert_eq!(resets.len(), 1);
             assert_eq!(resets[0].0.dir, Dir::AToB);
             assert_eq!(resets[0].1.control, TcpControl::Rst);
-            assert_eq!(resets[0].1.seq_number, a_seq + data.len() + queued.len());
+            assert_eq!(resets[0].1.seq_number, a_seq);
             assert_eq!(resets[0].1.ack_number, Some(b_seq));
             assert!(resets[0].1.payload.is_empty());
         }

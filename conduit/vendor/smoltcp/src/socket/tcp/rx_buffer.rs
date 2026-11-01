@@ -3,7 +3,7 @@ use alloc::rc::Rc;
 use crate::phy::{RxBuf, RxShared};
 use super::rx_store::RxStore;
 
-/// An owned in-order TCP frame, including any appended payload.
+/// An owned in-order TCP frame from one received segment.
 #[derive(Debug)]
 pub struct TcpFrame {
     pub(super) frame: RxBuf,
@@ -20,7 +20,6 @@ impl TcpFrame {
     }
 
     /// Raw NIC stamp of the segment that created this frame; 0 means none.
-    /// Bytes appended into the frame keep its earlier stamp.
     pub fn rx_timestamp(&self) -> u64 {
         self.frame.rx_timestamp()
     }

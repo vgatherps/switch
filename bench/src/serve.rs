@@ -222,17 +222,12 @@ async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
 /// One ws connection of the DUT: every message back with its kind, through relay. Returns when
 /// the peer closes or fails the connection.
 async fn ws_echo(mut ws: Ws) {
-    let mut buf = Vec::new();
     loop {
-        let kind = match ws.recv().await {
-            Ok(Some(m)) => {
-                buf.clear();
-                buf.extend_from_slice(m.bytes());
-                m.kind()
-            }
+        let (message, mut sender) = match ws.recv_with_sender().await {
+            Ok(Some(received)) => received,
             Ok(None) | Err(_) => return,
         };
-        if ws.send(kind, &buf).await.is_err() {
+        if sender.send(message.kind(), message.bytes()).await.is_err() {
             return;
         }
     }
@@ -241,6 +236,80 @@ async fn ws_echo(mut ws: Ws) {
 #[cfg(all(test, feature = "e2e"))]
 mod tests {
     use super::*;
+
+    // Host::open initializes EAL once per process, so keep this host separate from the TCP test.
+    #[test]
+    fn websocket_echo_over_net_tap() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "serve::tests::websocket_echo_over_net_tap_child", "--ignored"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "WebSocket echo child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[zhida_test_support::pinned_test]
+    #[ignore = "run in a separate process by websocket_echo_over_net_tap"]
+    fn websocket_echo_over_net_tap_child() {
+        use std::time::{Duration, Instant};
+        use tungstenite::Message;
+        use tungstenite::protocol::frame::{Frame, coding::{Data, OpCode}};
+
+        const PORT: u16 = 7101;
+        let dir = std::env::temp_dir().join(format!("zhida-bench-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dut.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "device": {"vdev": "net_tap_benchws,iface=cdbenchws"}, "mac": null,
+             "ipv4": "10.78.0.2/24", "gateway": null, "mtu": 1500, "paths": [], "offloads": "auto",
+             "rx_timestamps": false, "descriptors": 512,
+             "eal": {"file_prefix": "benchws", "extra": ["--no-huge", "-m", "512", "--no-shconf"]}}"#,
+        ).unwrap();
+        let config = Host::config(&path).unwrap();
+        let tcp_config = tcp::Config { rx_capacity: TCP_BUFFER, tx_capacity: TCP_BUFFER, mss_cap: None };
+        let mut host = Host::open(&config, &tcp_sizing(2, &tcp_config, 1500)).unwrap();
+        for args in [
+            &["address", "add", "10.78.0.1/24", "dev", "cdbenchws"][..],
+            &["link", "set", "cdbenchws", "up"],
+        ] {
+            assert!(std::process::Command::new("ip").args(args).status().unwrap().success(), "ip {args:?}");
+        }
+        let handle = host.net.handle();
+        let spawner = host.rt.spawner();
+        arm_accept(&spawner, handle.clone(), PORT, tcp_config, true).unwrap();
+        let peer = std::thread::spawn(|| {
+            let stream = std::net::TcpStream::connect(("10.78.0.2", PORT)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(20))).unwrap();
+            let (mut ws, _) = tungstenite::client(format!("ws://10.78.0.2:{PORT}/"), stream).unwrap();
+            let text = Message::text("echo €");
+            ws.send(text.clone()).unwrap();
+            assert_eq!(ws.read().unwrap(), text);
+            ws.write(Message::Frame(Frame::message(&[0, 255][..], OpCode::Data(Data::Binary), false))).unwrap();
+            ws.write(Message::Frame(Frame::message(&[2, 3][..], OpCode::Data(Data::Continue), true))).unwrap();
+            ws.flush().unwrap();
+            assert_eq!(ws.read().unwrap(), Message::binary(vec![0, 255, 2, 3]));
+            ws.close(None).unwrap();
+            assert!(matches!(ws.read(), Ok(Message::Close(None))));
+            assert!(matches!(ws.read(), Err(tungstenite::Error::ConnectionClosed)));
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !peer.is_finished() {
+            assert!(Instant::now() < deadline, "WebSocket echo did not finish within 30 s");
+            host.round().unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        peer.join().unwrap();
+        drop((handle, spawner));
+        host.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// The Zhida TCP echo on net_tap (the production `Host` and pools) against a kernel peer that
     /// sends full segments each followed by small ones: conduit appends the small ones into the

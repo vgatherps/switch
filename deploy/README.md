@@ -40,6 +40,18 @@ vendor-native ENA write-combining on AL2023 6.18, or rebuilds vfio-pci on legacy
 changing the instance type (it recomputes CPUs and the command line).
 Use `--interface IF` only when the host has more than one non-management ENA interface.
 
+The AWS kernel comparison runs `apply --kernel-receiver` on a fresh receiver. It keeps the data
+ENI on Linux `ena` at apply and every boot, skips the VFIO module setup, and verifies `ena`
+instead of `vfio-pci`. It otherwise uses the same build, CPU isolation, IRQ housekeeping and
+unmanaged-interface setup; the benchmark configures the data IP and source routes afterward.
+The mode is saved in `host.env` for boot and verify. Repeat the flag when reapplying on that host.
+On the kernel receiver, `apply` also writes
+`/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf` with
+`ManageForeignRoutingPolicyRules=no`, so networkd does not remove the benchmark's source-routing
+rule when it reconfigures the management interface. The drop-in is written before reboot; when
+no reboot is needed, apply stages the unmanaged data interface and restarts systemd-networkd to
+activate the drop-in before proceeding.
+
 ## What apply does
 
 | step | what |

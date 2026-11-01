@@ -77,7 +77,7 @@ fn rx_seg_checks_all_bytes() {
                     );
                     if let rx::Read::Drain = style {
                         assert_eq!(
-                            reads, if seg == 64 { 1 } else { k },
+                            reads, k,
                             "draining returns every frame in order with exact payloads"
                         );
                     }

@@ -7,8 +7,7 @@
 /// out-of-order data. A DPDK cache can hold up to its flush threshold of 1.5 times its
 /// configured size. `Stack::new` refuses a smaller RX pool. Size the RX pool as this plus the
 /// received mbufs all sockets together may hold (unread data, out-of-order segments, frames
-/// the application holds); it does not grow with the socket count. Each TCP socket holds at
-/// most `tcp::rx_mbuf_budget` of them.
+/// the application holds). Smaller segments can require more mbufs for the same byte volume.
 ///
 /// Panics if the reserve exceeds usize.
 pub fn rx_reserve(rx_descriptors: u16, rx_burst: u16, rx_staging: usize, rx_cache_size: u32) -> usize {
@@ -57,7 +56,8 @@ pub fn tx_reserve(tx_descriptors: u16, tx_pending: usize) -> usize {
 /// packets can never take the last frame. Size the frame pool as this plus the
 /// frames all sockets and the application together may hold (queued or
 /// unacknowledged TCP data, frames from `Stack::tx_frame`); it does not grow
-/// with the socket count. Each TCP socket queues at most `tcp::tx_mbuf_budget`.
+/// with the socket count. `tcp::tx_mbuf_budget` estimates a socket's needs
+/// for full-sized segments; smaller writes can use more frames.
 ///
 /// Panics if the reserve exceeds usize.
 pub fn frame_reserve(tx_descriptors: u16, tx_pending: usize) -> usize {

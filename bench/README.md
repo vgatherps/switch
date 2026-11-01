@@ -9,9 +9,11 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   `--rate-min` x sqrt(2)^k (k = 0, 1, .. while at most `--rate-max`; 10k..5M is 18 steps) on all of them, rate
   and senders split evenly. Worker g starts each step g / rate s after the common start, so the workers'
   schedules interleave instead of sending in phase. Results are merged (counts summed, histograms merged:
-  percentiles are never averaged). Prints one `step` JSON line per rate (`offered_pps`, achieved `sent_pps` /
-  `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`) and
-  always one `summary` line (`steps`, `complete`, `generator_bound`, `error`). No knee is computed: the table
+  percentiles are never averaged). Prints one `step` JSON line per rate (`offered_pps`, `sent_pps` /
+  `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`).
+  `sent_pps` counts messages accepted by the generator stack, not NIC transmissions; `received_pps` counts
+  echoes arriving within the window, including warmup echoes. Always prints one
+  `summary` line (`steps`, `complete`, `generator_bound`, `error`). No knee is computed: the table
   and plot show it. A step where any generator fell behind (a backlog at the end of its send window, or
   send-lag p99 over 20 µs) is `generator_bound`:
   it measured the generator, so the sweep stops there with `generator_bound: true` and exits non-zero. Exit 0
@@ -100,15 +102,21 @@ For the Linux-kernel receiver comparison, run one command:
 python3 bench/aws/zhida_aws_bench.py kernel --region R
 ```
 
-This reuses `run`'s four hosts, three Zhida/DPDK sender workers, coordinator, 64-byte payloads,
-rate steps, warmup/measurement/drain schedule, TCP/WS budget, reports and teardown. It does not
-introduce a kernel generator. After normal host setup, verification and build, only the receiver's
-data ENI is restored with `zhida-netconf unbind /etc/zhida/dut.json`. Its original data IPv4/subnet
-is assigned without adding a main-table subnet route. Source routing uses policy table 7000,
-priority 10000; occupied slots are refused. Only the data interface gets loose reverse-path
-filtering. Main routes must remain unchanged, and each route to a sender from the receiver data
-IP must resolve through the data interface and policy table or the run fails. Management SSH and
-all sender data ENIs remain unchanged.
+Each command provisions fresh hosts. The kernel comparison uses the same host types, three
+Zhida/DPDK sender workers, coordinator, 64-byte payloads, rate steps, warmup/measurement/drain
+schedule, TCP/WS budget, reports and teardown; it does not introduce a kernel generator. The
+receiver's data ENI stays on Linux `ena` throughout host setup and reboot, while the senders'
+data ENIs use DPDK. The receiver uses the same CPU isolation and initial IRQ policy as the
+senders. Its data interface is brought up with the MTU in `/etc/zhida/dut.json`, and the run fails
+if the actual MTU differs. New discovery caps MTU at 1500 without raising a smaller NIC MTU;
+an explicitly configured jumbo MTU is preserved. Its data IPv4/subnet is assigned without adding a
+main-table subnet route. After bringing up the data interface, the runner waits for six consecutive
+unchanged main-route comparisons at
+0.5-second intervals before installing policy routes. If the routes do not settle within 20 checks,
+the run fails. Source routing uses policy table 7000, priority 10000; occupied slots are refused.
+Only the data interface gets loose reverse-path filtering. The main table must remain exactly
+unchanged across policy installation, and each route to a sender from the receiver data IP must
+resolve through the data interface and policy table or the run fails.
 
 `kernel-serve` is pinned to the receiver's `APP_CPU`. Every data-ENI MSI-X IRQ must have effective
 affinity exclusively on that CPU; data RX queues must have RPS disabled. Unsupported/managed IRQ

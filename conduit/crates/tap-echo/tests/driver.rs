@@ -112,7 +112,7 @@ fn tester_killed_by_signal_exits_one() {
 
 /// The flags parse in either order with 1-byte and 1 MiB buffers and zero
 /// --close-after. The 1 GiB upper bound is not run because its pool memory
-/// grows with the receive buffer.
+/// grows with the configured buffer size.
 #[test]
 fn buffer_and_close_after_flags_parse() {
     let _serial = serial();

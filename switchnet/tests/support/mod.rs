@@ -21,7 +21,7 @@ use zhida_test_kit::wire::Link;
 pub const MAX_TCP: usize = 4;
 pub const MAX_UDP: usize = 4;
 pub const UDP_QUEUE: usize = 8;
-/// Six full-MSS frames: the smallest TCP RX frame cap a socket gets.
+/// Receive window target for these test connections.
 pub const RX_CAPACITY: usize = 6 * 1460;
 pub const PEER_PORT: u16 = 80;
 pub const LOCAL_PORT: u16 = 49152;
@@ -79,10 +79,9 @@ impl Mixed {
             let fixture = &fixtures[side.index()];
             let stack_config = stack_config(side, tcp, udp, if side == Side::A { owned } else { &[] });
             let mut config = fixture.config();
-            // RX: every socket's receive window and UDP queue full at once, since these tests
-            // assert lossless links. Frames: one socket's full send buffer plus 64, shared.
-            let rx_window = tcp::rx_mbuf_budget(&tcp_config(), config.mtu.into());
-            let rx_share = tcp * rx_window + udp * UDP_QUEUE;
+            // The shared RX pool covers the tests' retained 64 KiB transfer,
+            // plus queued UDP datagrams and room for other TCP traffic.
+            let rx_share = 64 * tcp.max(1) + udp * UDP_QUEUE;
             let frame_share = tcp::tx_mbuf_budget(&tcp_config(), config.mtu.into()) + 64;
             config.rx_pool.count = u32::try_from(
                 rx_reserve(config.rx_descriptors, config.rx_burst, stack_config.rx_staging, config.rx_pool.cache_size)

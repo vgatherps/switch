@@ -18,12 +18,7 @@ pub const SEGMENTS: usize = 8;
 pub const MSS: usize = 1448;
 const OFFERED_MSS: u16 = 1460;
 pub const CHUNK: usize = SEGMENTS * MSS;
-/// A holds the unacknowledged `CHUNK` plus the next write; the third `CHUNK`
-/// keeps B's window update off: after B reads, its window goes from 2 to 3
-/// `CHUNK`s, short of the doubling smoltcp's `window_to_update` needs (with
-/// 2 `CHUNK`s it doubles, leaving a window update pending every round). A
-/// whole number of batches: smoltcp cuts a segment at the end of the TX
-/// ring buffer, so each batch must end before the ring wraps.
+/// A has capacity for the unacknowledged `CHUNK` plus later writes.
 pub const TCP_BUFFER: usize = 3 * CHUNK;
 pub const SETTLE_ROUNDS: usize = 2 * TCP_BUFFER / CHUNK;
 

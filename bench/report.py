@@ -186,9 +186,9 @@ def build(directory, title):
     md = head + md + sections
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
            " measured messages not echoed by the end of the drain, never-sent ones included (sending stops at the end"
-           " of the window); sent / received pps are what actually left the generators and came back within the"
-           " window; baseline RTT is the first step's median echo time minus actual send time (TCP/ws); no TLS"
-           " (ws:// only)."]
+           " of the window); sent pps counts messages accepted by the generator stack, not NIC transmissions;"
+           " received pps counts echoes arriving within the window, including warmup echoes; baseline RTT is the"
+           " first step's median echo time minus actual send time (TCP/ws); no TLS (ws:// only)."]
     results["incomplete"] = issues
     with open(os.path.join(directory, "report.md"), "w") as f:
         f.write("\n".join(md) + "\n")

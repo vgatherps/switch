@@ -10,7 +10,6 @@ pub struct DropQueue(Rc<RefCell<Dropped>>);
 #[derive(Debug, Default)]
 struct Dropped {
     tcp: Vec<SocketHandle>,
-    wake: Vec<SocketHandle>,
     /// Sockets whose send found the frame pool empty; each at most once.
     frame_wait: Vec<SocketHandle>,
     udp: Vec<UdpHandle>,
@@ -21,7 +20,6 @@ impl DropQueue {
     pub fn with_capacity(tcp: usize, udp: usize) -> Self {
         Self(Rc::new(RefCell::new(Dropped {
             tcp: Vec::with_capacity(tcp),
-            wake: Vec::with_capacity(tcp),
             frame_wait: Vec::with_capacity(tcp),
             udp: Vec::with_capacity(udp),
         })))
@@ -31,12 +29,6 @@ impl DropQueue {
         let mut dropped = self.0.borrow_mut();
         debug_assert!(dropped.tcp.len() < dropped.tcp.capacity());
         dropped.tcp.push(handle);
-    }
-
-    pub(crate) fn push_wake(&self, handle: SocketHandle) {
-        let mut dropped = self.0.borrow_mut();
-        debug_assert!(dropped.wake.len() < dropped.wake.capacity());
-        dropped.wake.push(handle);
     }
 
     pub(crate) fn push_frame_wait(&self, handle: SocketHandle) {
@@ -54,8 +46,7 @@ impl DropQueue {
     #[inline]
     pub fn state(&self) -> (bool, bool) {
         let dropped = self.0.borrow();
-        let empty = dropped.tcp.is_empty() && dropped.wake.is_empty();
-        let empty = empty && dropped.udp.is_empty();
+        let empty = dropped.tcp.is_empty() && dropped.udp.is_empty();
         (empty, !dropped.frame_wait.is_empty())
     }
 
@@ -70,25 +61,21 @@ impl DropQueue {
         dropped.udp.push(handle);
     }
 
-    /// True when no dropped handles or receive wakes are queued.
+    /// True when no dropped handles are queued.
     pub fn is_empty(&self) -> bool {
         let dropped = self.0.borrow();
-        let empty = dropped.tcp.is_empty() && dropped.wake.is_empty();
-        let empty = empty && dropped.udp.is_empty();
-        empty
+        dropped.tcp.is_empty() && dropped.udp.is_empty()
     }
 
-    /// Append queued handles and wakes to the supplied lists, retaining the queue's capacity.
+    /// Append queued handles to the supplied lists, retaining the queue's capacity.
     pub fn drain_into(
         &self,
         tcp: &mut Vec<SocketHandle>,
         udp: &mut Vec<UdpHandle>,
-        wake: &mut Vec<SocketHandle>,
     ) {
         let mut dropped = self.0.borrow_mut();
         tcp.append(&mut dropped.tcp);
         udp.append(&mut dropped.udp);
-        wake.append(&mut dropped.wake);
     }
 
     /// True when `self` and `other` are the same queue.
@@ -134,11 +121,11 @@ mod tests {
         queue.push_udp(udp_handles[2]);
         let mut tcp = Vec::from([tcp_handles[0]]);
         let mut udp = Vec::from([udp_handles[0]]);
-        queue.drain_into(&mut tcp, &mut udp, &mut Vec::new());
+        queue.drain_into(&mut tcp, &mut udp);
         assert_eq!(tcp, tcp_handles);
         assert_eq!(udp, udp_handles);
         assert!(queue.is_empty());
-        queue.drain_into(&mut tcp, &mut udp, &mut Vec::new());
+        queue.drain_into(&mut tcp, &mut udp);
         assert_eq!(tcp, tcp_handles);
         assert_eq!(udp, udp_handles);
         queue.push_udp(udp_handles[0]);
@@ -163,7 +150,7 @@ mod tests {
             for handle in udp_handles {
                 queue.push_udp(handle);
             }
-            queue.drain_into(&mut tcp, &mut udp, &mut Vec::new());
+            queue.drain_into(&mut tcp, &mut udp);
             assert_eq!(tcp, tcp_handles);
             assert_eq!(udp, udp_handles);
             let dropped = queue.0.borrow();
@@ -192,7 +179,7 @@ mod tests {
         assert!(!queue.is_empty());
         let mut tcp = Vec::new();
         let mut udp = Vec::new();
-        queue.drain_into(&mut tcp, &mut udp, &mut Vec::new());
+        queue.drain_into(&mut tcp, &mut udp);
         assert_eq!(tcp, [tcp_handles[0]]);
         assert_eq!(udp, [udp_handles[0]]);
         assert!(clone.is_empty());

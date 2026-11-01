@@ -45,7 +45,7 @@ Per-PMD setup:
   `/lib/firmware` (section 3).
 - ena on EC2: use a secondary ENI for DPDK; the primary ENI (device number 0) stays the management
   interface and carries SSH, IMDS and DNS. `zhida-netconf discover --aws` refuses the primary ENI and fills
-  in the ENI's private IPv4, subnet, gateway (subnet base + 1, the VPC router) and MTU rules from IMDS.
+  in the ENI's private IPv4, subnet, gateway (subnet base + 1, the VPC router) and VPC CIDRs from IMDS.
   Security groups must allow UDP/TCP 11111-11130 between DUT and peer. Without an IOMMU (every non-metal
   instance), bind with `--noiommu`. ENA forces TX MULTI_SEGS on; Zhida accepts that bit and refuses any
   other offload the driver forces on.
@@ -59,10 +59,12 @@ Per-PMD setup:
   `discover --aws` warns when `public-ipv4s` is empty.
 - Leave ENA Express off on the DPDK ENI. With it on, UDP needs a lower MTU for its SRD headers; add a path
   rule with that MTU for the affected prefix.
-- In-VPC traffic is MTU 9001; the internet gateway forwards 1500 only. `discover --aws` writes MTU 9001
-  plus a 9001 rule per VPC CIDR and `0.0.0.0/0 → 1500`; a TCP connect then advertises MSS 8961 inside the
-  VPC and 1460 to the internet. The peer's interface must be at 9001 for jumbo frames. UDP `--msg-size`
-  above path MTU - 28 needs fragmentation, which Zhida does not do.
+- Fresh discovery sets the port MTU to the smaller of the NIC MTU and 1500, with a 1500 rule per VPC
+  CIDR and `0.0.0.0/0 → 1500`; paths are clamped to the port MTU. The local subnet has an implicit
+  rule at the port MTU, which takes precedence over a broader VPC rule. To use jumbo frames, explicitly
+  set the port MTU and, where needed, add a path rule for the jumbo-capable prefix with a `why` other than
+  `vpc` or `default` so rediscovery retains it. Both ends and the path must support that MTU; the internet gateway
+  forwards 1500 only. UDP `--msg-size` above path MTU - 28 needs fragmentation, which Zhida does not do.
 
 On an Amazon Linux 2023 EC2 instance, `deploy/hft-host.sh apply` does sections 2 and 3 for `feed` in one
 command (build, discover, hugepages, isolated CPU, IRQs, vfio-pci bind); see
@@ -83,7 +85,8 @@ from the kernel (and with `--aws` the ENI facts from IMDSv2), writes the file an
 `wrote dut.json`; warnings start `zhida-netconf: warning:`. With several IPv4 addresses on the
 interface it asks for `--ipv4 ADDR`. With `--aws` on an interface without an IPv4 address, the address
 comes from IMDS `local-ipv4s`: the first, or `--ipv4 ADDR`, which must be in that list. Running it over an existing file keeps hand-added path rules and
-prints `changed: <key>` for each changed field. `--aws` replaces `owned_ipv4` with the IMDS list and
+any previous port MTU above 1500, including a jumbo MTU written by older discovery versions; it prints
+`changed: <key>` for each changed field. `--aws` replaces `owned_ipv4` with the IMDS list and
 prints `owned_ipv4 removed: <cidr>` / `owned_ipv4 added: <cidr>` for each entry dropped or added,
 hand-added ones included. Off EC2, if the interface has no default route in the main
 table, set `gateway` by hand (or null for on-link peers only). `--aws` inside docker needs
@@ -170,8 +173,8 @@ A vdev config for a local tap is:
 }
 ```
 
-For a real NIC use the `dut.json` that `discover` wrote (section 2). On EC2 it looks like this (ENA, MTU
-9001, VPC 10.0.0.0/16); the configured MAC must equal the device's. Put PMD devargs in `devargs`; EAL
+For a real NIC use the `dut.json` that `discover` wrote (section 2). On EC2 it looks like this (ENA, NIC
+MTU 9001, VPC 10.0.0.0/16); the configured MAC must equal the device's. Put PMD devargs in `devargs`; EAL
 options not supplied by `open` belong in `eal.extra`.
 ```
 {
@@ -187,8 +190,8 @@ options not supplied by `open` belong in `eal.extra`.
   "mac": "0a:12:34:56:78:9a",
   "ipv4": "10.0.1.23/24",
   "gateway": "10.0.1.1",
-  "mtu": 9001,
-  "paths": [{"prefix": "10.0.0.0/16", "mtu": 9001, "why": "vpc"},
+  "mtu": 1500,
+  "paths": [{"prefix": "10.0.0.0/16", "mtu": 1500, "why": "vpc"},
             {"prefix": "0.0.0.0/0", "mtu": 1500, "why": "default"}],
   "offloads": "auto",
   "rx_timestamps": false,
@@ -313,8 +316,8 @@ use `--reply-every 10` or a longer `-t` at low rates.
 ## 4. Timestamps
 With `rx_timestamps` enabled (only if bit 14 is set in `rx_offload_capa`), the report has
 `udp_timestamps: datagrams= stamped= first= last= decreases=` and `tcp_timestamps: segments= ...`. TCP
-counts receive-buffer segments, not wire packets. A small in-order arrival appended to the previous buffer
-keeps that buffer's earlier stamp, so `stamped == segments` does not mean every packet was stamped.
+counts received TCP frames delivered to the application, not all wire packets: duplicates and
+segments replaced during reassembly need not produce a frame.
 `decreases` counts stamps lower than the previous one on the same socket and is not an error. TCP
 decreases appear after wire reordering or loss recovery. UDP decreases appear with af_packet when two CPUs
 deliver frames at once (the kernel stamps before the ring slot is claimed). `first` and `last` are raw

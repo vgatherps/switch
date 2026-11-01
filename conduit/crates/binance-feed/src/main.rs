@@ -201,7 +201,7 @@ fn feed(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    let mut rt = Runtime::new(clock.ms());
+    let mut rt = Runtime::new(clock.ns());
     let (stop_feed, stop_rx) = oneshot::channel();
     let mut stop_feed = Some(stop_feed);
     let out = Rc::default();
@@ -226,7 +226,8 @@ fn feed(
         if let Some(outcome) = out.take() {
             break outcome;
         }
-        let moved = switchnet::round(net, &mut rt, clock.now(), clock.ms())
+        let (now, tick) = clock.sample();
+        let moved = switchnet::round(net, &mut rt, now, tick)
             .map_err(|error| format!("round: {error:?}"))?;
         if !moved {
             std::thread::sleep(IDLE_SLEEP);

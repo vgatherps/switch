@@ -436,11 +436,10 @@ fn frames_outlive_the_stack() {
     })
 }
 
-/// The app holds every frame it receives: the window shuts and the peer
-/// stalls. Releasing a middle and the last frame, the head still held,
-/// reopens it and data resumes in order; releasing all lets the rest in.
+/// Holding earlier frames must not prevent later in-order data from reaching
+/// the application, even beyond the configured receive window target.
 #[zhida_test_support::pinned_test]
-fn held_frames_shut_the_window_and_releasing_them_reopens_it() {
+fn held_frames_do_not_block_later_data() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["wina", "winb"]);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
@@ -460,35 +459,16 @@ fn held_frames_shut_the_window_and_releasing_them_reopens_it() {
                 stream
             }
         });
-        let mut received = 0;
-        loop {
-            mixed.rounds(50);
-            let now = got.borrow().len();
-            if now == received {
-                break;
-            }
-            received = now;
-        }
-        assert!(held.borrow().len() >= 3, "only {} frames held", held.borrow().len());
-        assert!(received < len, "the window never shut");
-        assert!(mixed.peer.tcp(&peer).send_queue() > 0, "the peer is not stalled");
-        assert_eq!(got.borrow()[..], data[..received]);
-        let head = held.borrow_mut().remove(0);
-        {
-            let mut held = held.borrow_mut();
-            let middle = held.len() / 2;
-            held.remove(middle);
-            held.pop();
-        }
-        mixed.until(|_| got.borrow().len() > received);
-        assert_eq!(got.borrow()[..], data[..got.borrow().len()], "data after the reopened window is out of order");
-        drop(head);
-        mixed.until(|_| {
-            held.borrow_mut().clear();
-            slot.is_full()
-        });
-        let stream = slot.take();
+        mixed.until(|m| slot.is_full() && m.peer.tcp(&peer).send_queue() == 0);
+        assert!(held.borrow().len() > 6);
+        assert!(len > support::RX_CAPACITY);
         assert_eq!(*got.borrow(), data);
+        assert_eq!(
+            held.borrow().iter().flat_map(|frame| frame.payload().iter().copied()).collect::<Vec<_>>(),
+            data
+        );
+        held.borrow_mut().clear();
+        let stream = slot.take();
         drop((stream, peer));
         mixed.close();
     })

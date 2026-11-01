@@ -12,8 +12,7 @@
 //! Each iteration has a new payload seed. Setup verifies full batches with
 //! checked, untimed copying reads. Both sockets use Cubic with the default
 //! 1 MiB initial window and space for three batches of 1448-byte segments.
-//! Draining returns every frame in order. A frame may contain several small
-//! in-order segments copied into its tailroom.
+//! Draining returns every frame in order, one per retained received segment.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};

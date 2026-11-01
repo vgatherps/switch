@@ -76,15 +76,7 @@ fn port_config(port_id: u16, mss_cap: Option<u16>) -> PortConfig<'static> {
         rx_burst: 32,
         tx_burst: 32,
         queue_socket: -1,
-        rx_pool: pool(
-            RX_POOL,
-            u32::try_from(
-                rx_reserve(16, 32, 32, 8)
-                    .checked_add(tcp::rx_mbuf_budget(&socket(mss_cap), 1500))
-                    .expect("RX pool count fits usize"),
-            )
-            .unwrap(),
-        ),
+        rx_pool: pool(RX_POOL, 8191),
         tx_pool: pool(TX_POOL, 127),
         frame_pool: pool(
             FRAME_POOL,
@@ -427,7 +419,8 @@ fn closed_target() -> Target {
 fn turn_until(net: &mut Net, clock: &Clock, rt: &mut Runtime, mut done: impl FnMut() -> bool) {
     while !done() {
         assert!(clock.ms() < LIMIT.as_millis() as u64, "test not done within {LIMIT:?}");
-        if !switchnet::round(net, rt, clock.now(), clock.ms()).expect("round") {
+        let (now, tick) = clock.sample();
+        if !switchnet::round(net, rt, now, tick).expect("round") {
             thread::sleep(IDLE_SLEEP);
         }
     }
@@ -503,7 +496,7 @@ async fn connect_refused(handle: &NetHandle, spawner: &Spawner, at_once: bool) {
             } if addr == target.addr => return,
             FeedError::Open(OpenError::Add(AddTcpError::SocketsFull(_))) if !at_once => {
                 spawner
-                    .sleep(1)
+                    .sleep(1_000_000)
                     .expect("open Runtime")
                     .await
                     .expect("sleep");
@@ -523,7 +516,7 @@ async fn refused_twice(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>
 #[zhida_test_support::pinned_test]
 fn refused_connect_releases_the_only_slot() {
     with_net(&[], None, |net, clock, _listener| {
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let done = Rc::new(Cell::new(false));
         rt.spawner().spawn(refused_twice(net.handle(), rt.spawner(), done.clone())).expect("spawn the client");
         turn_until(net, clock, &mut rt, || done.get());
@@ -548,8 +541,8 @@ async fn timed_out_then_refused(handle: NetHandle, spawner: Spawner, done: Rc<Ce
         matches!(error, FeedError::Timeout { limit: actual, .. } if actual == limit),
         "{error:?}",
     );
-    // Runtime ticks are whole milliseconds of `clock`, and `started` is read within
-    // the tick the sleep counts from: up to 1 ms of the limit may precede it.
+    // The Runtime tick is sampled before this task runs, so `started` can be later.
+    // Allow 1 ms for that gap.
     assert!(
         started.elapsed() + Duration::from_millis(1) >= limit,
         "timed out after {:?}",
@@ -564,7 +557,7 @@ async fn timed_out_then_refused(handle: NetHandle, spawner: Spawner, done: Rc<Ce
 #[zhida_test_support::pinned_test]
 fn timed_out_connect_releases_the_only_slot() {
     with_net(&[], None, |net, clock, _listener| {
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let done = Rc::new(Cell::new(false));
         let task = timed_out_then_refused(net.handle(), rt.spawner(), done.clone());
         rt.spawner().spawn(task).expect("spawn the client");
@@ -621,7 +614,7 @@ fn feed_reads_tickers_answers_ping_and_closes() {
         let flushed = Arc::new(AtomicBool::new(false));
         let plan = ServerPlan::Tickers(texts, flushed.clone());
         let server = thread::spawn(move || serve(listener, server_tls, plan));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let (stop, out) = spawn_feed(net, &rt, roots, Some(1360));
         turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
         let sent = clock.ms();
@@ -669,7 +662,7 @@ fn reset_after_last_clock_poll_suppresses_feed_histogram() {
         let plan = ServerPlan::Tickers(texts, flushed.clone());
         let server = thread::spawn(move || serve(listener, server_tls, plan));
         let resets = dpdk_smoltcp::port_resets();
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let (stop, out) = spawn_feed_with_reset_check(
             net, &rt, roots, None,
             move || dpdk_smoltcp::port_resets() != resets,
@@ -712,7 +705,7 @@ fn received_updates_come_before_a_finished_stop() {
         let flushed = Arc::new(AtomicBool::new(false));
         let plan = ServerPlan::Tickers(texts, flushed.clone());
         let server = thread::spawn(move || serve(listener, server_tls, plan));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let (stop, out) = spawn_feed(net, &rt, roots, None);
         turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
         let sent = clock.ms();
@@ -741,7 +734,7 @@ fn feed_closes_after_a_read_error() {
         texts.push("not a bookTicker".to_owned());
         let plan = ServerPlan::Tickers(texts, Arc::default());
         let server = thread::spawn(move || serve(listener, server_tls, plan));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let (_stop, out) = spawn_feed(net, &rt, roots, None);
         let (summary, result) = finish(net, clock, &mut rt, &out);
         match result {
@@ -768,7 +761,7 @@ fn server_close_reports_its_status_and_reason() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::CloseAway));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let (_stop, out) = spawn_feed(net, &rt, roots, None);
         let (summary, result) = finish(net, clock, &mut rt, &out);
         match result {
@@ -790,7 +783,7 @@ fn stop_during_connect_ends_it_and_drops_the_socket() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Silent));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let started = Instant::now();
         let (stop, out) = spawn_feed(net, &rt, roots, None);
         turn_until(net, clock, &mut rt, || started.elapsed() >= Duration::from_millis(200));
@@ -824,7 +817,7 @@ fn upgrade_refused_with_http_451_reports_the_status() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, roots) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::Refuse451));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let done = Rc::new(Cell::new(false));
         let task = refused_451_then_slot_free(net.handle(), rt.spawner(), roots, done.clone());
         rt.spawner().spawn(task).expect("spawn the client");
@@ -858,7 +851,7 @@ fn unknown_certificate_fails_tls_and_alerts_the_server() {
     with_net(&[], None, |net, clock, listener| {
         let (server_tls, _) = server_config();
         let server = thread::spawn(move || serve(listener, server_tls, ServerPlan::TlsOnly));
-        let mut rt = Runtime::new(clock.ms());
+        let mut rt = Runtime::new(clock.ns());
         let done = Rc::new(Cell::new(false));
         let task = unknown_issuer_then_slot_free(net.handle(), rt.spawner(), done.clone());
         rt.spawner().spawn(task).expect("spawn the client");

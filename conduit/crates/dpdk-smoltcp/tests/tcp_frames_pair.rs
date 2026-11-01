@@ -14,7 +14,7 @@ use zhida_test_kit::wire::Verdict;
 use zhida_test_kit::with_eal;
 
 /// Queue `data[*sent..]` on `handle` in frames of at most one MSS while the
-/// socket has frame room; returns whether anything was queued.
+/// socket has byte room and the shared pool has frames; returns whether anything was queued.
 fn send_frames(stack: &mut Stack, handle: &TcpHandle, data: &[u8], sent: &mut usize) -> bool {
     let start = *sent;
     while *sent < data.len() {
@@ -24,7 +24,9 @@ fn send_frames(stack: &mut Stack, handle: &TcpHandle, data: &[u8], sent: &mut us
         if room == 0 {
             break;
         }
-        let mut frame = stack.tx_frame().expect("the frame pool backs the socket's frame slots");
+        let Some(mut frame) = stack.tx_frame() else {
+            break;
+        };
         let len = (data.len() - *sent).min(mss).min(room);
         frame.room_mut()[..len].copy_from_slice(&data[*sent..*sent + len]);
         frame.set_len(len);
@@ -89,7 +91,7 @@ fn tcp_frames_1mib_byte_exact() {
     with_eal(|eal| {
         const BUFFER: usize = 65536;
         let configs = [pair::config(Side::A), pair::config(Side::B)];
-        let mut pair = Pair::with_ports(eal, ["mibfa", "mibfb"], configs, T0, 16, |side, port| {
+        let mut pair = Pair::with_ports(eal, ["mibfa", "mibfb"], configs, T0, 128, |side, port| {
             let stack = configs[side.index()];
             let full = pair::windows(port.mtu, [BUFFER]);
             port.rx_pool.count = pair::pool_count(
@@ -109,7 +111,7 @@ fn tcp_frames_1mib_byte_exact() {
                 let bytes = drain_bytes(b.tcp_mut(&server)).unwrap();
                 let moved = queued || !bytes.is_empty();
                 received.extend_from_slice(&bytes);
-                if received.len() == data.len() {
+                if received.len() == data.len() && a.tcp(&client).send_queue() == 0 {
                     App::Done
                 } else if moved {
                     App::Moved
@@ -119,6 +121,15 @@ fn tcp_frames_1mib_byte_exact() {
             },
         );
         assert!(received == data, "B read different bytes");
+        // The final ACK can still be in flight when the application reads the
+        // last bytes; process it and drain the links before checking teardown.
+        pair.drive_rounds(
+            |_, _| {},
+            |last, _, _| if last.moved() { App::Moved } else { App::Done },
+        );
+        for link in [&pair.a_to_b, &pair.b_to_a] {
+            assert_eq!((link.ring_full, link.pool_empty, link.dropped, link.held), (0, 0, 0, 0));
+        }
         assert_eq!(pair.close(), 0);
     });
 }

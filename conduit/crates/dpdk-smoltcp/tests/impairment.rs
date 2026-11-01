@@ -208,10 +208,9 @@ fn connect_with(pair: &mut Pair, socket: tcp::Config) -> ([TcpHandle; 2], TcpSeq
     (handles, ack.seq, ack.ack.unwrap())
 }
 
-/// A 4 KiB receive window, and a send buffer whose frame limit covers
-/// `MESSAGES` unacknowledged one-segment writes: each write sent alone
-/// occupies one frame (`tcp::tx_mbuf_budget`), and the message tests keep a
-/// full TX ring and pending queue (15 + 32) or more unacknowledged.
+/// A 4 KiB receive window, and a send buffer for `MESSAGES` unacknowledged
+/// one-segment writes. Each write sent alone occupies one frame; the message
+/// tests keep a full TX ring and pending queue (15 + 32) or more unacknowledged.
 const MESSAGE_SOCKET: tcp::Config =
     tcp::Config { rx_capacity: 4096, tx_capacity: MESSAGES * 1460, mss_cap: None };
 
@@ -1383,15 +1382,8 @@ fn rto_while_wire_paused_then_resume() {
         );
         // With the eight read before the pause, this is every message.
         assert!(received == data, "received bytes differ");
-        // Delivered data segments starting below the furthest byte already
-        // delivered, as (offset from the first data byte, length). The first
-        // is the go-back resend from SND.UNA, queued once A's pending queue
-        // had room. B's first turn after resume copies the in-order paused
-        // segments it receives into one RX mbuf, so no refusal ACK reaches A
-        // before the resend: it starts at the first byte after the eight
-        // messages read before the pause. Segments past the gap the ring
-        // overflow leaves are out of order, each holds its own RX mbuf, and B
-        // refuses some of them.
+        // Some data arrived before the paused link's ring overflowed. Confirm the sender
+        // retransmitted data, and the receiver recovered the complete stream above.
         let mut furthest = a_seq + 8 * MESSAGE;
         let mut retransmitted = Vec::new();
         for s in segs(&frames).into_iter().filter(|s| s.len > 0) {
@@ -1404,7 +1396,6 @@ fn rto_while_wire_paused_then_resume() {
         }
         let first = retransmitted.first().map(|&(offset, _)| offset);
         assert_eq!(first, Some(8 * MESSAGE), "{retransmitted:?}");
-        assert!(pair.b.tcp(&handles[1]).rx_refused_segments() > 0);
         // On resume B's RX ring overflows; TCP recovers the losses.
         assert_ring_overflowed(&[&pair.a_to_b]);
         assert_eq!(pair.close(), 0);
