@@ -395,6 +395,34 @@ impl Host {
     }
 }
 
+#[zhida_test_support::pinned_test]
+fn contiguous_burst_past_advertised_window_reaches_application() {
+    with_eal(|eal| {
+        let mut host = Host::new(eal, "rxpastwin", 1, None);
+        let config = tcp::Config { rx_capacity: 4, tx_capacity: 4096, mss_cap: None };
+        let conn = host.connect(LOCAL_PORT, config);
+        let data = b"abcdefghijklmnopqrst";
+        let packets: Vec<_> = data.chunks(2).enumerate().map(|(index, chunk)| {
+            let mut segment = peer_segment(&conn, TcpControl::Psh, conn.seq, 65535);
+            segment.seq_number = conn.peer_seq + index * 2;
+            segment.payload = chunk;
+            from_peer(&segment)
+        }).collect();
+        host.fixture.inject(&packets);
+
+        assert_eq!(host.turn().rx_processed, 8);
+        assert_eq!(host.stack.tcp(&conn.handle).recv_queue(), 16);
+        assert_eq!(host.turn().rx_processed, 2);
+        let mut received = Vec::new();
+        while let Some(frame) = host.stack.tcp_mut(&conn.handle).recv().unwrap() {
+            received.extend_from_slice(frame.payload());
+        }
+        assert_eq!(received, data);
+        drop(conn);
+        host.finish();
+    });
+}
+
 /// The TX ring consumer drops its reference first, then the ACK releases the
 /// socket's: the frame returns to the pool at the ACK.
 #[zhida_test_support::pinned_test]
