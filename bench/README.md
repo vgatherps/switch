@@ -133,6 +133,9 @@ counter resets, or affinity/RPS drift fail the run. `NET_RX` also includes manag
 its housekeeping deltas are reported, not falsely attributed to the data ENI. Compare this run's
 report with `run --region R` for the Zhida receiver; no performance numbers are implied here.
 
+An IRQ affinity failure saves each data-ENI IRQ's name, requested and effective CPU lists before
+and after the placement attempt, and any write error to `kernel-irq-affinity-error.json`.
+
 The laptop shows run start, hosts up (every host reachable over SSH), and code built (every host's
 setup verification and benchmark build succeeded). For each protocol, live coordinator stderr reports
 processes up only after every worker replies ready, then processes synced only after every initial clock

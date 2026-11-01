@@ -744,14 +744,33 @@ configure = configure == "True"
 irqs = sorted(int(p.name) for p in pathlib.Path("/sys/bus/pci/devices", pci, "msi_irqs").iterdir())
 if not irqs:
     raise RuntimeError("data ENI has no MSI IRQs")
-affinity = {}
+lines = pathlib.Path("/proc/interrupts").read_text().splitlines()
+cpus = [int(c.removeprefix("CPU")) for c in lines[0].split()]
+names = {}
+for line in lines[1:]:
+    name, _, values = line.partition(":")
+    if name.strip().isdigit() and int(name) in irqs:
+        names[name.strip()] = " ".join(values.split()[len(cpus):])
+affinity, details = {}, {}
 for irq in irqs:
     directory = pathlib.Path("/proc/irq", str(irq))
+    requested = directory / "smp_affinity_list"
+    effective = directory / "effective_affinity_list"
+    before = {"requested": requested.read_text().strip(), "effective": effective.read_text().strip()}
+    error = None
     if configure:
-        (directory / "smp_affinity_list").write_text(cpu)
-    affinity[str(irq)] = (directory / "effective_affinity_list").read_text().strip()
-    if affinity[str(irq)] != cpu:
-        raise RuntimeError(f"data IRQ {irq} is not exclusively on CPU {cpu}")
+        try:
+            requested.write_text(cpu)
+        except OSError as exc:
+            error = str(exc)
+    key = str(irq)
+    affinity[key] = effective.read_text().strip()
+    details[key] = {"name": names.get(key), "before": before,
+                    "requested": requested.read_text().strip(), "effective": affinity[key],
+                    "write_error": error}
+if any(info["write_error"] or info["effective"] != cpu for info in details.values()):
+    print(json.dumps({"affinity_error": {"target_cpu": cpu, "irqs": details}}))
+    sys.exit(0)
 queues = list(pathlib.Path("/sys/class/net", interface, "queues").glob("rx-*/rps_cpus"))
 if not queues:
     raise RuntimeError("data ENI has no RX queues")
@@ -763,7 +782,6 @@ for path in queues:
     if int(rps[str(path)].replace(",", ""), 16) != 0:
         raise RuntimeError(f"RPS enabled: {path}")
 lines = pathlib.Path("/proc/interrupts").read_text().splitlines()
-cpus = [int(c.removeprefix("CPU")) for c in lines[0].split()]
 counts = {}
 for line in lines[1:]:
     name, _, values = line.partition(":")
@@ -778,7 +796,13 @@ print(json.dumps({"cpus": cpus, "irqs": counts, "softirq_cpus": soft_cpus, "net_
                   "effective_affinity": affinity, "rps_cpus": rps}))
 '''
     command = ["python3", "-c", script, facts["DATA_PCI"], facts["DATA_IF"], facts["APP_CPU"], str(configure)]
-    return json.loads(receiver.root(shlex.join(command)).stdout)
+    snapshot = json.loads(receiver.root(shlex.join(command)).stdout)
+    if "affinity_error" in snapshot:
+        path = os.path.join(receiver.run_dir, "kernel-irq-affinity-error.json")
+        with open(path, "w") as f:
+            json.dump(snapshot["affinity_error"], f, indent=2)
+        raise RuntimeError(f"receiver data IRQ affinity differs from CPU {facts['APP_CPU']}; details: {path}")
+    return snapshot
 
 
 def kernel_counter_delta(before, after, app_cpu):
