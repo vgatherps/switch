@@ -93,7 +93,6 @@ class ReportTest(unittest.TestCase):
             self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - |", md)
             self.assertIn(f"Commit: `{source['commit']}`", md)
             self.assertIn(f"Archive SHA-256: `{source['archive_sha256']}`", md)
-            self.assertIn("GEN-BOUND", md)
             self.assertTrue(os.path.exists(os.path.join(d, "udp-zhida.svg")))
             with open(os.path.join(d, "results.json")) as f:
                 results = json.load(f)

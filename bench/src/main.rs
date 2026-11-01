@@ -19,8 +19,8 @@ usage:
                     (--rate-min PPS --rate-max PPS | --rates PPS,PPS,...)
                     [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200] [--budget-us W]
       The sweep coordinator: starts G generator workers (`sh -c CMD` with {i} = 0..G-1 and
-      {senders} = N/G) and runs each rate on all of them (rate split evenly), stopping early at a
-      generator-bound step. Supply a strictly increasing list with --rates, or use the default
+      {senders} = N/G) and runs each rate on all of them (rate split evenly), stopping early if
+      a sender falls behind schedule. Supply a strictly increasing list with --rates, or use the default
       log-spaced schedule PPS-min x sqrt(2)^k up to PPS-max. Prints one JSON line per step and
       always a summary line. --budget-us (tcp, ws): after the first step, each
       connection may have its rate share x (the first step's median round trip + W) in flight.

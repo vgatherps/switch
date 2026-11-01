@@ -8,8 +8,8 @@ RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and
 `host-setup.txt` (the host setup verification). Python stdlib only.
 
 Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
-summary, a sweep did not complete, or a sweep stopped at a generator-bound step (the generators,
-not the receiver, were the limit). The report is still written, headed INCOMPLETE.
+summary, a sweep did not complete, or a sender fell behind and stopped the sweep.
+The report is still written, headed INCOMPLETE.
 """
 import json
 import math
@@ -52,7 +52,7 @@ def problems(directory, sweeps):
         elif not summary.get("complete"):
             out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
         elif summary.get("generator_bound"):
-            out.append(f"{name}: stopped at a generator-bound step: not a receiver measurement")
+            out.append(f"{name}: sender fell behind schedule; receiver capacity is not isolated")
     return out
 
 
@@ -68,7 +68,7 @@ def lat(step, key):
 def flags(step):
     out = []
     if step.get("generator_bound"):
-        out.append("GEN-BOUND")
+        out.append("SENDER-LATE")
     if step.get("budget_bound"):
         out.append("BUDGET-BOUND")
     if step.get("latency_ns") is None:
@@ -181,8 +181,8 @@ def build(directory, title):
             f.write(svg_plot(steps, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
-            sections += ["GEN-BOUND: a generator fell behind its schedule; that step measured the generator, not the"
-                         " DUT, and the sweep stopped there.", ""]
+            sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
+                         " identify the cause; receiver backpressure can also delay sends.", ""]
         if any(s.get("budget_bound") for s in steps):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
                          " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"

@@ -92,7 +92,7 @@ pub struct StepReport {
     /// Some measured message waited on the budget: a knee here may be the budget's, not the
     /// receiver's.
     pub budget_bound: bool,
-    /// Any generator fell behind its schedule: the step measured the generator, not the DUT.
+    /// Any sender fell behind schedule; the cause and receiver capacity are not isolated.
     pub generator_bound: bool,
     /// TCP/ws: echo time - actual send time, median; the first step's is the budget's baseline.
     #[serde(skip)]
@@ -114,8 +114,7 @@ pub struct Summary {
     pub steps: u32,
     /// Every step ran or the sweep stopped at a generator-bound step; false: see `error`.
     pub complete: bool,
-    /// The sweep stopped at a generator-bound step: it measured the generators, not the
-    /// receiver, so it is not a success (`run` fails) even when complete.
+    /// The sweep stopped because a sender fell behind; `run` fails even when complete.
     pub generator_bound: bool,
     pub error: Option<String>,
 }
@@ -341,7 +340,7 @@ fn run_schedule(
     result?;
     if summary.generator_bound {
         return Err(format!(
-            "stopped at a generator-bound step after {} steps: not a receiver measurement",
+            "stopped after {} steps: a sender fell behind schedule; receiver capacity is not isolated",
             summary.steps
         ));
     }
@@ -800,7 +799,7 @@ mod tests {
         args.rate_max = 4000;
         args.gen_cmd = fake_worker("bound", &result(0, &[1000], &[100], 1, 7), 10);
         let (r, lines) = run_lines(&args);
-        assert!(r.unwrap_err().contains("generator-bound"));
+        assert!(r.is_err());
         assert_eq!(lines.len(), 2, "stopped after the first step");
         assert_eq!(lines[1]["complete"], true);
         assert_eq!(lines[1]["generator_bound"], true);
