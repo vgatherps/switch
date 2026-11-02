@@ -1,10 +1,12 @@
 //! Applies control operations and reports TCP transitions without control syscalls.
 //!
-//! Opens and aborts apply immediately. Shutdown and plain close validate immediately but
-//! wait for a subsequent FIFO poll to find every ring empty. A later abort cancels a held
-//! operation by removing its socket. Idle iterations skip held-operation scans when none
-//! are queued. Until packet records are defined, every non-end FIFO record is a session
-//! protocol error; an unknown session first drains all queued control messages.
+//! Opens, aborts and unread closes apply immediately. Shutdown and plain close validate
+//! immediately but wait for a subsequent FIFO poll to find every ring empty. Removing a
+//! socket discards all its held operations, including before same-generation reuse.
+//! Idle iterations skip held-operation scans when none are queued. A consumed FIFO end
+//! makes later session loss graceful unless the session has a protocol error. Until
+//! packet records are defined, every non-end FIFO record is a session protocol error;
+//! an unknown session first drains control through its queued Open, then handles its record.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -36,6 +38,7 @@ struct Session {
     slots: Vec<Slot>,
     held: VecDeque<Op>,
     errored: bool,
+    ended: bool,
 }
 
 /// Owns the Stack, session socket handles and FIFO on the network thread.
@@ -99,9 +102,19 @@ impl Network {
                 // FIFO registration can overtake the bounded control drain.
                 while let Ok(message) = self.from_control.try_recv() {
                     self.receive_control(message);
+                    if self.live(session).is_some() {
+                        // Handle this record before later ops or terminal control messages.
+                        break;
+                    }
                 }
             }
-            if !end && self.live(session).is_some_and(|session| !session.errored) {
+            if end {
+                if let Some(Some(entry)) = self.sessions.get_mut(slot(session) as usize)
+                    && entry.uid == uid(session)
+                {
+                    entry.ended = true;
+                }
+            } else if self.live(session).is_some_and(|session| !session.errored) {
                 self.protocol_error(session);
             }
         }
@@ -158,6 +171,7 @@ impl Network {
                     slots: (0..max_sockets).map(|_| Slot::default()).collect(),
                     held: VecDeque::new(),
                     errored: false,
+                    ended: false,
                 });
             }
             ToNetwork::Op { session, op } => self.receive_op(session, op),
@@ -200,7 +214,7 @@ impl Network {
             Op::ConnectTcp { .. } | Op::ListenTcp { .. } | Op::BindUdp { .. }
         );
         if open {
-            if entry_slot.host.is_some() || entry_slot.generation == Some(id.generation) {
+            if entry_slot.host.is_some() {
                 self.protocol_error(session);
                 return;
             }
@@ -255,7 +269,7 @@ impl Network {
             return;
         }
         if matches!(op, Op::ShutdownTcp { .. } | Op::Close { unread: false, .. }) {
-            // Validate now; a later abort may remove this socket before the FIFO is idle.
+            // Validate now; socket removal discards this operation before slot reuse.
             self.sessions[slot(session) as usize]
                 .as_mut()
                 .unwrap()
@@ -292,11 +306,11 @@ impl Network {
             }
             socket.socket.drop_handle();
             self.free.push(index);
-            self.sessions[slot(session) as usize]
-                .as_mut()
-                .unwrap()
-                .slots[id.slot as usize]
-                .host = None;
+            let entry = self.sessions[slot(session) as usize].as_mut().unwrap();
+            entry.slots[id.slot as usize].host = None;
+            let held_before = entry.held.len();
+            entry.held.retain(|held| held.id() != id);
+            self.held_count -= held_before - entry.held.len();
             if events {
                 sockets::event(&self.to_control, session, id, Event::Freed);
             }
@@ -321,11 +335,12 @@ impl Network {
         let Some(entry) = self.live(session) else {
             return;
         };
-        if how == EndHow::Graceful {
-            // We sent ProtocolError; control answers End{Lost} to perform teardown.
-            if entry.errored {
-                return;
-            }
+        // We sent ProtocolError; control answers End{Lost} to perform teardown.
+        if how == EndHow::Graceful && entry.errored {
+            return;
+        }
+        let graceful = !entry.errored && (how == EndHow::Graceful || entry.ended);
+        if graceful {
             self.release(session, false);
         }
         let entry = self.sessions[slot(session) as usize].take().unwrap();
@@ -333,14 +348,14 @@ impl Network {
         for slot in entry.slots {
             if let Some(index) = slot.host {
                 let socket = self.sockets[index as usize].take().unwrap();
-                if how == EndHow::Lost {
+                if !graceful {
                     socket.socket.abort(&mut self.stack);
                 }
                 socket.socket.drop_handle();
                 self.free.push(index);
             }
         }
-        if how == EndHow::Graceful {
+        if graceful {
             let _ = self.to_control.send(FromNetwork::Retired { session });
         }
     }

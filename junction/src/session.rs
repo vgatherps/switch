@@ -4,6 +4,8 @@
 //! cephalopod end record. Retry backpressure errors while polling events.
 //! Only the host's `EndReason::Finished` acknowledgement makes `Session::closed`
 //! true; a disconnect without that acknowledgement is session loss.
+//! After a successful `finish`, all socket operations panic. Repeated `finish`
+//! calls and polling for the host acknowledgement remain valid.
 
 use std::cell::Cell;
 use std::fmt;
@@ -234,12 +236,15 @@ impl Session {
         })
     }
 
+    /// # Panics
+    /// Panics if `finish()` has succeeded, before validating the configuration.
     pub fn connect_tcp(
         &mut self,
         config: TcpConfig,
         remote: SocketAddrV4,
         local: ListenEndpoint,
     ) -> Result<SocketId, OpenError> {
+        self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
         let id = self.allocate()?;
         self.queue(Op::ConnectTcp {
@@ -251,25 +256,34 @@ impl Session {
         Ok(id)
     }
 
+    /// # Panics
+    /// Panics if `finish()` has succeeded, before validating the configuration.
     pub fn listen_tcp(
         &mut self,
         config: TcpConfig,
         local: ListenEndpoint,
     ) -> Result<SocketId, OpenError> {
+        self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
         let id = self.allocate()?;
         self.queue(Op::ListenTcp { id, config, local });
         Ok(id)
     }
 
+    /// # Panics
+    /// Panics if `finish()` has succeeded, before validating the configuration.
     pub fn bind_udp(&mut self, config: UdpConfig) -> Result<SocketId, OpenError> {
+        self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
         let id = self.allocate()?;
         self.queue(Op::BindUdp { id, config });
         Ok(id)
     }
 
+    /// # Panics
+    /// Panics if `finish()` has succeeded, or the socket is not open.
     pub fn shutdown(&mut self, id: SocketId) {
+        self.assert_unfinished();
         let slot = self.slot_for(id);
         assert!(
             slot.state == State::Open,
@@ -278,16 +292,29 @@ impl Session {
         self.queue(Op::ShutdownTcp { id });
     }
 
+    /// # Panics
+    /// Panics if `finish()` has succeeded, or the socket ID is invalid or closing.
     pub fn close(&mut self, id: SocketId, unread: bool) {
+        self.assert_unfinished();
         if self.begin_close(id) {
             self.queue(Op::Close { id, unread });
         }
     }
 
+    /// # Panics
+    /// Panics if `finish()` has succeeded, or the socket ID is invalid or closing.
     pub fn abort(&mut self, id: SocketId) {
+        self.assert_unfinished();
         if self.begin_close(id) {
             self.queue(Op::AbortTcp { id });
         }
+    }
+
+    fn assert_unfinished(&self) {
+        assert!(
+            !self.finished,
+            "socket operation after successful Session::finish()"
+        );
     }
 
     fn slot_for(&mut self, id: SocketId) -> &mut Slot {
@@ -419,6 +446,8 @@ impl Session {
     /// Poll events and retry either error. A successful call is idempotent, but
     /// does not mean retirement is complete: keep polling until `closed()` is true.
     /// Control I/O failures are reported by `poll_events`.
+    /// After success, `connect_tcp`, `listen_tcp`, `bind_udp`, `shutdown`, `close`,
+    /// and `abort` panic before validating their arguments or changing socket state.
     pub fn finish(&mut self) -> Result<(), FinishError> {
         if self.finished {
             return Ok(());

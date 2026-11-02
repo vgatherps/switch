@@ -265,7 +265,7 @@ fn read_message(stream: &mut UnixStream) -> HostMessage {
     HostMessage::decode(&bytes).unwrap().unwrap().0
 }
 
-fn handshake(host: &Host, max_sockets: u16) -> (UnixStream, u64) {
+fn hello(host: &Host, max_sockets: u16) -> (UnixStream, u64) {
     let mut stream = raw(&host.path);
     write_message(
         &mut stream,
@@ -290,14 +290,19 @@ fn handshake(host: &Host, max_sockets: u16) -> (UnixStream, u64) {
         }
         other => panic!("expected Open, got {other:?}"),
     }
+    (stream, welcome.stream)
+}
+
+fn handshake(host: &Host, max_sockets: u16) -> (UnixStream, u64) {
+    let (stream, session) = hello(host, max_sockets);
     assert_eq!(
         host.control.as_ref().unwrap().try_recv().unwrap(),
         Control::Open {
-            slot: slot(welcome.stream),
-            uid: uid(welcome.stream)
+            slot: slot(session),
+            uid: uid(session)
         }
     );
-    (stream, welcome.stream)
+    (stream, session)
 }
 
 #[test]
@@ -478,8 +483,7 @@ fn incomplete_hello_does_not_block_and_expires() {
     assert_eq!(partial.read(&mut [0]).unwrap(), 0);
 }
 
-#[test]
-fn continuous_control_writer_does_not_starve_connect_or_events() {
+fn control_writer_does_not_starve_connect_or_events(finish: bool) {
     struct ControlWriter {
         stop: std::sync::Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
@@ -492,8 +496,12 @@ fn continuous_control_writer_does_not_starve_connect_or_events() {
         }
     }
 
-    let host = Host::new(2, 1);
-    let (mut writer, _) = handshake(&host, 1);
+    let mut host = Host::new(2, 1);
+    let (mut writer, stream) = if finish {
+        hello(&host, 1)
+    } else {
+        handshake(&host, 1)
+    };
     writer.set_nonblocking(true).unwrap();
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let writer_stop = stop.clone();
@@ -532,6 +540,30 @@ fn continuous_control_writer_does_not_starve_connect_or_events() {
         worker: Some(worker),
     };
     receive(&started_rx);
+    let ingress =
+        finish.then(|| ceph_ring::Writer::attach(host.reader.as_ref().unwrap().name()).unwrap());
+    let mut fifo = finish.then(|| {
+        Fifo::new(
+            host.reader.take().unwrap(),
+            2,
+            host.control.take().unwrap(),
+            host.retire.clone(),
+        )
+    });
+    if let Some(fifo) = &mut fifo {
+        let ingress = ingress.as_ref().unwrap();
+        ingress.try_finish(stream, 0).unwrap();
+        until(|| {
+            if let Some(message) = fifo.next_message() {
+                assert!(message.end());
+                assert_eq!(message.stream(), stream);
+                drop(message);
+                true
+            } else {
+                false
+            }
+        });
+    }
     let start = Instant::now();
     let mut client = connect(&host.path, 1).unwrap();
     // The flooding session's operations can surround Open in the channel.
@@ -549,6 +581,16 @@ fn continuous_control_writer_does_not_starve_connect_or_events() {
         elapsed < HELLO_TIMEOUT / 2,
         "busy client starved another client: {elapsed:?}"
     );
+}
+
+#[test]
+fn continuous_control_writer_does_not_starve_connect_or_events() {
+    control_writer_does_not_starve_connect_or_events(false);
+}
+
+#[test]
+fn writer_after_end_record_does_not_starve_connect_or_events() {
+    control_writer_does_not_starve_connect_or_events(true);
 }
 
 #[test]
@@ -1066,4 +1108,63 @@ fn client_reports_second_welcome_malformed_bytes_and_unfinished_eof() {
         server.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
+}
+
+#[test]
+fn finished_ack_waits_for_all_backpressured_events() {
+    const COUNT: usize = 50_000;
+    let host = Host::new(2, 1);
+    let (mut client, session) = host.open(1);
+    let id = client.listen_tcp(tcp(), local()).unwrap();
+    host.op(session);
+    let (mut observer, observer_session) = host.open(1);
+    let observer_id = observer.bind_udp(udp()).unwrap();
+    host.op(observer_session);
+    for index in 0..COUNT {
+        host.event(
+            session,
+            id,
+            if index % 2 == 0 {
+                Event::Connected
+            } else {
+                Event::PeerFin
+            },
+        );
+    }
+    client.finish().unwrap();
+    host.retire
+        .send(Retire::Finished {
+            slot: slot(session),
+            uid: uid(session),
+        })
+        .unwrap();
+    host.end(session, EndHow::Graceful);
+    host.send(FromNetwork::Retired { session });
+    // The next channel event is a barrier: Retired was handled before it is visible.
+    host.event(observer_session, observer_id, Event::Bound);
+    assert_eq!(events(&mut observer, 1), [(observer_id, Event::Bound)]);
+    assert!(
+        host.control.as_ref().unwrap().try_recv().is_err(),
+        "backpressured retirement freed its slot before writing End Finished"
+    );
+    let mut received = 0;
+    until(|| {
+        client
+            .poll_events(|actual, event| {
+                assert_eq!(actual, id);
+                assert_eq!(
+                    event,
+                    if received % 2 == 0 {
+                        Event::Connected
+                    } else {
+                        Event::PeerFin
+                    }
+                );
+                received += 1;
+            })
+            .unwrap();
+        client.closed()
+    });
+    assert_eq!(received, COUNT);
+    host.closed(session);
 }

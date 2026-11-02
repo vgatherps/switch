@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use ceph_ring::{Config, Reader};
 use junction::control::{
-    ClientMessage, EndReason, HostMessage, ListenEndpoint, TcpConfig, VERSION, Welcome,
-    WelcomeStatus,
+    ClientMessage, EndReason, HostMessage, ListenEndpoint, SocketId, TcpConfig, UdpConfig, VERSION,
+    Welcome, WelcomeStatus,
 };
 use junction::session::{FinishError, Lost, Session};
 
@@ -251,6 +251,95 @@ fn unsolicited_finished_is_invalid_host_data() {
     );
     assert!(!client.closed());
     assert_eq!(host.end_records(), 0);
+}
+
+#[test]
+#[should_panic(expected = "socket operation after successful Session::finish()")]
+fn connect_tcp_after_finish_panics_before_config_validation() {
+    let (_host, mut client) = RawHost::connect();
+    client.finish().unwrap();
+    let _ = client.connect_tcp(
+        TcpConfig {
+            rx_capacity: u32::MAX,
+            tx_capacity: 1024,
+            mss_cap: None,
+        },
+        "127.0.0.1:1234".parse().unwrap(),
+        ListenEndpoint {
+            addr: None,
+            port: 0,
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "socket operation after successful Session::finish()")]
+fn listen_tcp_after_finish_panics_before_config_validation() {
+    let (_host, mut client) = RawHost::connect();
+    client.finish().unwrap();
+    let _ = client.listen_tcp(
+        TcpConfig {
+            rx_capacity: u32::MAX,
+            tx_capacity: 1024,
+            mss_cap: None,
+        },
+        ListenEndpoint {
+            addr: None,
+            port: 1234,
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "socket operation after successful Session::finish()")]
+fn bind_udp_after_finish_panics_before_config_validation() {
+    let (_host, mut client) = RawHost::connect();
+    client.finish().unwrap();
+    let _ = client.bind_udp(UdpConfig {
+        local: ListenEndpoint {
+            addr: None,
+            port: 0,
+        },
+        rx_queue: 1024,
+        tx_checksum: true,
+        broadcast: false,
+    });
+}
+
+#[test]
+#[should_panic(expected = "socket operation after successful Session::finish()")]
+fn shutdown_after_finish_panics_before_id_validation() {
+    let (_host, mut client) = RawHost::connect();
+    client.finish().unwrap();
+    client.shutdown(SocketId {
+        slot: u32::MAX,
+        generation: 0,
+    });
+}
+
+#[test]
+#[should_panic(expected = "socket operation after successful Session::finish()")]
+fn close_after_finish_panics_before_id_validation() {
+    let (_host, mut client) = RawHost::connect();
+    client.finish().unwrap();
+    client.close(
+        SocketId {
+            slot: u32::MAX,
+            generation: 0,
+        },
+        false,
+    );
+}
+
+#[test]
+#[should_panic(expected = "socket operation after successful Session::finish()")]
+fn abort_after_finish_panics_before_id_validation() {
+    let (_host, mut client) = RawHost::connect();
+    client.finish().unwrap();
+    client.abort(SocketId {
+        slot: u32::MAX,
+        generation: 0,
+    });
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -1,8 +1,8 @@
 //! Unix control thread. The network thread owns sockets in the Stack, never these descriptors.
 //!
-//! Poll passes read one chunk per connection. FIFO completion drains the preceding control
-//! bytes before graceful retirement, which then survives control disconnects. Network
-//! retirement sends End(Finished) before closing.
+//! Poll passes read one chunk per connection. Terminal handling snapshots and drains only
+//! already-readable control bytes. FIFO completion survives control disconnects, and network
+//! retirement keeps flushing queued events and End(Finished) before closing.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -80,6 +80,9 @@ enum Phase {
         session: SessionId,
         max_sockets: u16,
         draining: bool,
+    },
+    Retiring {
+        session: SessionId,
     },
 }
 
@@ -163,7 +166,10 @@ impl HostControl {
             self.drain_retire()?;
             if self.shutdown {
                 for connection in &mut self.connections {
-                    if matches!(connection.phase, Phase::Live { .. }) {
+                    if matches!(
+                        connection.phase,
+                        Phase::Live { .. } | Phase::Retiring { .. }
+                    ) {
                         connection.end(EndReason::HostShutdown);
                     }
                 }
@@ -178,7 +184,10 @@ impl HostControl {
                 revents: 0,
             });
             for (index, connection) in self.connections.iter().enumerate() {
-                let draining = matches!(connection.phase, Phase::Live { draining: true, .. });
+                let draining = matches!(
+                    connection.phase,
+                    Phase::Live { draining: true, .. } | Phase::Retiring { .. }
+                );
                 let reading = !draining && !matches!(connection.phase, Phase::Rejected);
                 let output = connection.written < connection.output.len();
                 // A draining socket's HUP must not spin the loop while the network retires it.
@@ -219,12 +228,12 @@ impl HostControl {
                 let revents = pollfds[position + 1].revents;
                 let draining = matches!(
                     self.connections[index].phase,
-                    Phase::Live { draining: true, .. }
+                    Phase::Live { draining: true, .. } | Phase::Retiring { .. }
                 );
                 let reading =
                     !draining && !matches!(self.connections[index].phase, Phase::Rejected);
                 if !draining && revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                    self.remove(index, true);
+                    self.disconnect(index);
                     continue;
                 }
                 if reading && revents & libc::POLLIN != 0 && !self.read(index, false)? {
@@ -234,12 +243,7 @@ impl HostControl {
                 if self.shutdown {
                     break;
                 }
-                if self.connections[index].flush().is_err()
-                    || (matches!(self.connections[index].phase, Phase::Rejected)
-                        && self.connections[index].output.is_empty())
-                {
-                    self.remove(index, true);
-                }
+                self.flush(index);
             }
             for index in (0..self.connections.len()).rev() {
                 if matches!(self.connections[index].phase, Phase::Pending(since) if since.elapsed() >= self.config.hello_timeout)
@@ -277,14 +281,40 @@ impl HostControl {
         Ok(())
     }
 
-    // Normal poll passes read one chunk; only Finished drains through WouldBlock.
+    // Terminal handling snapshots readable bytes; later writes cannot prolong the drain.
     fn read(&mut self, index: usize, drain: bool) -> io::Result<bool> {
-        loop {
+        let mut remaining = if drain {
+            let mut available: libc::c_int = 0;
+            // SAFETY: the descriptor is owned and available is writable for one integer.
+            if unsafe {
+                libc::ioctl(
+                    self.connections[index].socket.as_raw_fd(),
+                    libc::FIONREAD,
+                    &mut available,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            usize::try_from(available).expect("FIONREAD returned a negative byte count")
+        } else {
+            4096
+        };
+        while remaining != 0 {
             let mut chunk = [0; 4096];
-            match self.connections[index].socket.read(&mut chunk) {
+            let length = remaining.min(chunk.len());
+            match self.connections[index].socket.read(&mut chunk[..length]) {
                 // Finished already committed the drain; losing control cannot abort it.
-                Ok(0) => return Ok(drain),
-                Ok(n) => self.connections[index].input.extend_from_slice(&chunk[..n]),
+                Ok(0) => {
+                    if !drain {
+                        self.read(index, true)?;
+                    }
+                    return Ok(drain);
+                }
+                Ok(n) => {
+                    remaining -= n;
+                    self.connections[index].input.extend_from_slice(&chunk[..n]);
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(true),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     if drain {
@@ -292,7 +322,12 @@ impl HostControl {
                     }
                     return Ok(true);
                 }
-                Err(_) => return Ok(drain),
+                Err(_) => {
+                    if !drain {
+                        self.read(index, true)?;
+                    }
+                    return Ok(drain);
+                }
             }
             loop {
                 let (message, used) = match ClientMessage::decode(&self.connections[index].input) {
@@ -349,6 +384,7 @@ impl HostControl {
                 return Ok(true);
             }
         }
+        Ok(true)
     }
 
     fn hello(&mut self, index: usize, version: u16, max_sockets: u16) -> io::Result<()> {
@@ -408,13 +444,13 @@ impl HostControl {
 
     fn find(&self, session: SessionId) -> Option<usize> {
         self.connections.iter().position(|connection| {
-            matches!(connection.phase, Phase::Live { session: current, .. } if current == session)
+            matches!(connection.phase, Phase::Live { session: current, .. } | Phase::Retiring { session: current } if current == session)
         })
     }
 
     fn remove(&mut self, index: usize, lost: bool) {
         let connection = self.connections.swap_remove(index);
-        if let Phase::Live { session, .. } = connection.phase {
+        if let Phase::Live { session, .. } | Phase::Retiring { session } = connection.phase {
             drop(connection.socket);
             let slot = slot(session);
             let uid = uid(session);
@@ -439,6 +475,32 @@ impl HostControl {
                 self.shutdown = true;
             }
             self.free.push(slot);
+        }
+    }
+
+    fn disconnect(&mut self, index: usize) {
+        if matches!(
+            self.connections[index].phase,
+            Phase::Live {
+                draining: false,
+                ..
+            }
+        ) {
+            // Preserve operations written before the control connection was lost.
+            let _ = self.read(index, true);
+        }
+        self.remove(index, true);
+    }
+
+    fn flush(&mut self, index: usize) {
+        let retiring = matches!(self.connections[index].phase, Phase::Retiring { .. });
+        if self.connections[index].flush().is_err()
+            || (matches!(
+                self.connections[index].phase,
+                Phase::Rejected | Phase::Retiring { .. }
+            ) && self.connections[index].output.is_empty())
+        {
+            self.remove(index, !retiring);
         }
     }
 
@@ -471,8 +533,9 @@ impl HostControl {
                             Phase::Live { draining: true, .. }
                         )
                     {
-                        self.connections[index].end(EndReason::Finished);
-                        self.remove(index, false);
+                        self.connections[index].queue(HostMessage::End(EndReason::Finished));
+                        self.connections[index].phase = Phase::Retiring { session };
+                        self.flush(index);
                     }
                 }
             }
@@ -740,5 +803,28 @@ mod tests {
         );
         assert!(fixture.host.read(0, false).unwrap());
         assert_eq!(first + fixture.network.try_iter().count(), count);
+    }
+
+    #[test]
+    fn hangup_forwards_readable_ops_before_lost_end() {
+        let mut fixture = Fixture::new();
+        let count = fixture.write_ops();
+        drop(fixture.client.take());
+        fixture.host.disconnect(0);
+        for generation in 0..count as u32 {
+            assert!(matches!(
+                fixture.network.try_recv().unwrap(),
+                ToNetwork::Op {
+                    session,
+                    op: Op::ShutdownTcp { id: SocketId { slot: 0, generation: actual } },
+                } if session == pack(0, 1) && actual == generation
+            ));
+        }
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+        ));
+        assert!(fixture.network.try_recv().is_err());
+        assert!(fixture.host.connections.is_empty());
     }
 }

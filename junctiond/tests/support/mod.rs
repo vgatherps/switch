@@ -266,6 +266,37 @@ impl Fixture {
         }
     }
 
+    /// Replace the host's real graceful notification with the EOF race's Lost.
+    /// The caller consumes the real FIFO end before forwarding this terminal message.
+    pub fn forward_graceful_as_lost(&mut self, session: u64) {
+        loop {
+            let message = self.control.recv_timeout(WAIT).unwrap();
+            if matches!(
+                message, ToNetwork::End { session: id, how: EndHow::Graceful } if id == session
+            ) {
+                self.forward
+                    .send(ToNetwork::End {
+                        session,
+                        how: EndHow::Lost,
+                    })
+                    .unwrap();
+                return;
+            }
+            self.forward_message(message);
+        }
+    }
+
+    /// Inject only the terminal control message to queue a disconnect behind a real Open.
+    /// FIFO registration and the consumed end record still come from the real client.
+    pub fn queue_lost(&self, session: u64) {
+        self.forward
+            .send(ToNetwork::End {
+                session,
+                how: EndHow::Lost,
+            })
+            .unwrap();
+    }
+
     fn turn_network(&mut self) {
         while let Ok(message) = self.control.try_recv() {
             self.forward_message(message);

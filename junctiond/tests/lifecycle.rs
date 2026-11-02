@@ -5,7 +5,7 @@ use std::time::Instant as WallInstant;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use junction::control::{
-    ClientMessage, EndReason, Event, HostMessage, Op, SocketId, VERSION, WelcomeStatus,
+    ClientMessage, EndReason, Event, HostMessage, Op, RejectCode, SocketId, VERSION, WelcomeStatus,
 };
 use zhida_test_kit::with_eal;
 
@@ -517,7 +517,28 @@ fn lost_after_forwarded_graceful_end_retires_without_stopping_other_sessions() {
     });
 }
 
-fn same_generation_reopen_after_abort(shutdown: bool) {
+#[zhida_test_support::pinned_test]
+fn lost_after_consumed_fifo_end_sends_fin_instead_of_reset() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::new(eal, ["lefa", "lefb"], 2, 0, 64);
+        let mut client = fixture.client(1);
+        let stream = fixture.streams[0];
+        let mut events = Vec::new();
+        let (_, peer) = connect(&mut fixture, &mut client, &mut events, LOCAL_PORT);
+        client.finish().unwrap();
+        // The FIFO consumes the real end before control reports a competing EOF.
+        fixture.network.iteration(fixture.now).unwrap();
+        fixture.forward_graceful_as_lost(stream);
+        fixture.until(&mut client, &mut events, |f, _| {
+            f.retired.contains(&stream) && f.peer.tcp(&peer).state() == State::CloseWait
+        });
+        assert!(!fixture.peer.tcp(&peer).reset_by_peer());
+        drop((client, peer));
+        fixture.close();
+    });
+}
+
+fn held_ops_do_not_touch_reopened_udp(shutdown: bool, wrap_generation: bool) {
     with_eal(|eal| {
         let mut fixture = Fixture::new(eal, ["lsga", "lsgb"], 2, 1, 64);
         let mut unaffected = fixture.client(1);
@@ -531,35 +552,101 @@ fn same_generation_reopen_after_abort(shutdown: bool) {
             id,
             config: support::udp_config(7001),
         };
-        client.send(&[held, Op::AbortTcp { id }, reopen]);
-        assert_eq!(fixture.wait_op(id), held);
-        assert_eq!(fixture.wait_op(id), Op::AbortTcp { id });
-        assert_eq!(fixture.wait_op(id), reopen);
+        // Multiple held operations must all disappear when their TCP socket is removed.
+        let mut ops = vec![held, held, Op::AbortTcp { id }];
+        if wrap_generation {
+            let intermediate = SocketId {
+                generation: id.generation + 1,
+                ..id
+            };
+            ops.extend([
+                Op::BindUdp {
+                    id: intermediate,
+                    config: support::udp_config(7001),
+                },
+                Op::Close {
+                    id: intermediate,
+                    unread: true,
+                },
+            ]);
+        }
+        ops.push(reopen);
+        client.send(&ops);
+        // Forward the entire sequence before one network iteration can release a held op.
+        for op in ops {
+            assert_eq!(fixture.wait_op(op.id()), op);
+        }
         client.until(&mut fixture, |f, client| {
-            client
-                .messages
-                .contains(&HostMessage::End(EndReason::ProtocolError))
-                && f.peer.tcp(&peer).reset_by_peer()
+            client.has(id, Event::Bound) && f.peer.tcp(&peer).reset_by_peer()
         });
-        assert!(!client.has(id, Event::Bound));
-        let bound = unaffected.bind_udp(support::udp_config(7002)).unwrap();
+        // The replacement must still own its port after the FIFO-idle release.
+        let collision = unaffected.bind_udp(support::udp_config(7001)).unwrap();
         let mut events = Vec::new();
         fixture.until(&mut unaffected, &mut events, |_, events| {
-            events.contains(&(bound, Event::Bound))
+            events.contains(&(collision, Event::Rejected(RejectCode::UdpPortInUse)))
         });
+        client.poll();
+        let mut expected = vec![
+            HostMessage::Event {
+                id,
+                event: Event::Connected,
+            },
+            HostMessage::Event {
+                id,
+                event: Event::Freed,
+            },
+        ];
+        if wrap_generation {
+            let intermediate = SocketId {
+                generation: id.generation + 1,
+                ..id
+            };
+            expected.extend([
+                HostMessage::Event {
+                    id: intermediate,
+                    event: Event::Bound,
+                },
+                HostMessage::Event {
+                    id: intermediate,
+                    event: Event::Freed,
+                },
+            ]);
+        }
+        expected.push(HostMessage::Event {
+            id,
+            event: Event::Bound,
+        });
+        assert_eq!(client.messages, expected);
+        assert!(!client.closed);
+        client.send(&[Op::Close { id, unread: false }]);
+        expected.push(HostMessage::Event {
+            id,
+            event: Event::Freed,
+        });
+        client.until(&mut fixture, |_, client| client.messages == expected);
         drop((client, unaffected, peer));
         fixture.close();
     });
 }
 
 #[zhida_test_support::pinned_test]
-fn same_generation_reopen_rejects_held_shutdown() {
-    same_generation_reopen_after_abort(true);
+fn same_generation_reopen_discards_held_shutdown() {
+    held_ops_do_not_touch_reopened_udp(true, false);
 }
 
 #[zhida_test_support::pinned_test]
-fn same_generation_reopen_rejects_held_close() {
-    same_generation_reopen_after_abort(false);
+fn same_generation_reopen_discards_held_close() {
+    held_ops_do_not_touch_reopened_udp(false, false);
+}
+
+#[zhida_test_support::pinned_test]
+fn generation_one_two_one_reopen_discards_held_shutdown() {
+    held_ops_do_not_touch_reopened_udp(true, true);
+}
+
+#[zhida_test_support::pinned_test]
+fn generation_one_two_one_reopen_discards_held_close() {
+    held_ops_do_not_touch_reopened_udp(false, true);
 }
 
 #[zhida_test_support::pinned_test]
@@ -592,6 +679,31 @@ fn unknown_fifo_session_drains_past_control_batch_to_queued_open() {
             events.contains(&(listener, Event::Freed))
         });
         drop((writer, client, other));
+        fixture.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn fifo_end_before_queued_open_precedes_later_lost() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::with_control_batch(eal, ["leqa", "leqb"], 2, 1, 64, 1);
+        let mut other = fixture.client(1);
+        let listener = other.listen_tcp(tcp_config(), local(LOCAL_PORT)).unwrap();
+        fixture.wait_op(listener);
+        fixture.network.iteration(fixture.now).unwrap();
+        fixture.network.iteration(fixture.now).unwrap();
+        other.shutdown(listener);
+        fixture.wait_op(listener);
+        let mut client = fixture.client(1);
+        let stream = *fixture.streams.last().unwrap();
+        client.finish().unwrap();
+        fixture.queue_lost(stream);
+        // Shutdown consumes step one's only message. The FIFO then yields this end;
+        // registration catch-up must stop at Open, before processing the queued Lost.
+        fixture.network.iteration(fixture.now).unwrap();
+        let mut events = Vec::new();
+        fixture.until(&mut other, &mut events, |f, _| f.retired.contains(&stream));
+        drop((client, other));
         fixture.close();
     });
 }
