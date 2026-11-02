@@ -15,7 +15,7 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
 
 use crate::tx::{OVERHEAD, plain_room};
-use crate::{CLOSE_NOTIFY_LEN, Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
+use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into, send_sealed};
 
 impl RxFrame for TcpFrame {
     fn payload(&self) -> &[u8] {
@@ -205,10 +205,7 @@ impl Tls {
     /// ended), so the connection may be dropped then; until then it stays pending, so the caller
     /// bounds it. Receiving goes on.
     pub async fn close(&mut self) -> Result<(), Error> {
-        let f = self.tx.alloc().await.map_err(Error::Send)?;
-        self.tx.room(CLOSE_NOTIFY_LEN).await.map_err(Error::Send)?;
-        let sealed = self.tx.close_notify(f).map_err(Error::Send)?;
-        send_sealed(&mut self.tx, sealed, CLOSE_NOTIFY_LEN).await.map_err(Error::Send)?;
+        self.tx.send_close_notify().await.map_err(Error::Send)?;
         self.tx.shutdown();
         self.tx.delivered().await;
         Ok(())
@@ -234,15 +231,6 @@ async fn abort(tx: &mut TlsTx<SwitchTx>) {
     }
     tx.shutdown();
     tx.delivered().await;
-}
-
-/// Sends `sealed`, waiting for room of `len` bytes each time it is refused.
-async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usize) -> Result<(), L::Error> {
-    while let Err(s) = lower.try_send(sealed) {
-        sealed = s;
-        lower.room(len).await?;
-    }
-    Ok(())
 }
 
 /// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert

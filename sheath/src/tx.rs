@@ -124,6 +124,15 @@ impl<L: FrameTx> TlsTx<L> {
         self.finish(f, n)
     }
 
+    /// Seals close_notify and sends it, waiting for room for it (and the KeyUpdates that may
+    /// precede it) only, not for a full frame. Later seals fail with [`TxError::Closed`].
+    pub async fn send_close_notify(&mut self) -> Result<(), TxError<L::Error>> {
+        let f = self.alloc().await?;
+        self.room(CLOSE_NOTIFY_LEN).await?;
+        let sealed = self.close_notify(f)?;
+        crate::send_sealed(self, sealed, CLOSE_NOTIFY_LEN).await
+    }
+
     /// Stops sending after a receive error.
     pub(crate) fn fail(&mut self, e: Error) {
         if matches!(self.state, State::Open | State::Closed) {
