@@ -251,6 +251,17 @@ cp "$root/etc/chrony.conf" "$tmp/chrony.conf"
 : >"$calls"
 HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
 check "boot without /dev/ptp_ena leaves chrony.conf alone" sh -c "cmp -s '$tmp/chrony.conf' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
+# A host whose earlier apply added the line without the device: boot removes exactly that line.
+printf '%s\n' 'refclock PHC /dev/ptp0 poll 2' >>"$root/etc/chrony.conf"
+cp "$root/etc/chrony.conf" "$tmp/chrony-other.conf"
+printf '%s\n' 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' >>"$root/etc/chrony.conf"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "boot without /dev/ptp_ena removes only the PHC refclock line and restarts chronyd" sh -c "cmp -s '$tmp/chrony-other.conf' '$root/etc/chrony.conf' && [ \$(grep -c '^systemctl restart chronyd.service' '$calls') = 1 ]"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "a second boot without /dev/ptp_ena changes nothing" sh -c "cmp -s '$tmp/chrony-other.conf' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
+cp "$tmp/chrony.conf" "$root/etc/chrony.conf"
 mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
 HFT_ROOT=$root sh "$script" boot >/dev/null 2>&1
 

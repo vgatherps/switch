@@ -367,10 +367,21 @@ WantedBy=multi-user.target"; then
 # The PHC refclock goes after AL2023's own chrony.conf (its Time Sync NTP server line stays), and
 # only once /dev/ptp_ena exists: chronyd exits at start on a PHC refclock it cannot open, leaving
 # the host with no time sync. The device appears after the reboot that applies ena.phc_enable=1,
-# and never outside a precision-time placement group, so boot adds the line.
+# and never outside a precision-time placement group, so boot adds the line; without the device
+# it removes that line (an earlier apply added it unconditionally), leaving the rest as it was.
 step_chrony() {
     if [ ! -e "$R/dev/ptp_ena" ]; then
-        report chrony ok "no /dev/ptp_ena; $CHRONY_CONF left on NTP"
+        if ! grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
+            report chrony ok "no /dev/ptp_ena; $CHRONY_CONF left on NTP"
+            return
+        fi
+        # Rewritten in place (cat >), keeping the file's owner and mode; grep -v exits 1 when
+        # the line was the only one.
+        { grep -vxF "$PHC_REFCLOCK" "$CHRONY_CONF" || [ $? = 1 ]; } >"$CHRONY_CONF.zhida" &&
+            cat "$CHRONY_CONF.zhida" >"$CHRONY_CONF" && rm -f "$CHRONY_CONF.zhida" ||
+            fatal chrony "cannot write $CHRONY_CONF"
+        systemctl restart chronyd.service || fatal chrony "systemctl restart chronyd failed"
+        report chrony changed "no /dev/ptp_ena: PHC refclock removed from $CHRONY_CONF; chronyd restarted"
     elif grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
         report chrony ok "$CHRONY_CONF has the PHC refclock"
     else
