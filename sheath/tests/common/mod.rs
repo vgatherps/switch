@@ -74,6 +74,8 @@ pub struct Wire {
     pub fail_seal: Rc<Cell<bool>>,
     /// `shutdown` was called (TCP FIN).
     pub shut: Rc<Cell<bool>>,
+    /// Socket bytes free for `room`; `None`: unlimited. A `room` for more pends.
+    pub free: Rc<Cell<Option<usize>>>,
 }
 
 impl Default for Wire {
@@ -84,6 +86,7 @@ impl Default for Wire {
             refuse: Rc::default(),
             fail_seal: Rc::default(),
             shut: Rc::default(),
+            free: Rc::default(),
         }
     }
 }
@@ -106,8 +109,13 @@ impl FrameTx for TestTx {
         })
     }
 
-    async fn room(&mut self, _: usize) -> Result<(), SealFailed> {
-        Ok(())
+    async fn room(&mut self, len: usize) -> Result<(), SealFailed> {
+        let free = self.0.free.clone();
+        std::future::poll_fn(|_| match free.get() {
+            Some(n) if n < len => std::task::Poll::Pending,
+            _ => std::task::Poll::Ready(Ok(())),
+        })
+        .await
     }
 
     fn plain(&self) -> (usize, usize) {

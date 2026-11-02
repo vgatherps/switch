@@ -233,6 +233,21 @@ fn set_rcvbuf(listener: &TcpListener, size: libc::c_int) {
     assert_eq!(rc, 0, "set SO_RCVBUF");
 }
 
+/// TCP_MAXSEG of `mss` on `listener`: accepted connections advertise it in their SYN-ACK.
+fn set_maxseg(listener: &TcpListener, mss: libc::c_int) {
+    // SAFETY: a valid socket and an int option of the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            (&mss as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "set TCP_MAXSEG");
+}
+
 /// One masked client frame off `r`: the first byte (FIN and opcode) and the unmasked payload.
 fn read_frame(r: &mut impl Read) -> (u8, Vec<u8>) {
     let mut head = [0; 2];
@@ -1041,6 +1056,47 @@ fn largest_control_frames_fit_a_131_byte_send_buffer() {
     assert_eq!(close, (0x80 | CLOSE, want_close));
 }
 
+/// The peer advertises an MSS of 88 B, below the largest control frame (131 B, 207 B with its
+/// TLS record): ws:// and wss:// still connect, a message of many segments echoes, and the
+/// close handshake completes. Frames are as large as the largest control frame; TCP cuts them.
+#[zhida_test_support::pinned_test]
+fn ws_and_wss_setup_succeed_with_a_small_peer_mss() {
+    let sent: Vec<u8> = (0..3000).map(|i| (i * 31 % 251) as u8).collect();
+    for tls in [false, true] {
+        let sent = sent.clone();
+        let echoed = run(
+            |listener| set_maxseg(listener, 88),
+            move |stream, config| {
+                if tls {
+                    echo(upgrade(StreamOwned::new(ServerConnection::new(config).unwrap(), stream)))
+                } else {
+                    echo(tungstenite::accept(stream).expect("server WebSocket handshake"))
+                }
+            },
+            move |handle, stream, config| async move {
+                if tls {
+                    let mut wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
+                    wss.send(Kind::Binary, &sent).await.expect("send");
+                    let m = wss.recv().await.expect("recv").expect("the echo");
+                    assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &sent[..]));
+                    close(&mut wss).await;
+                    (Some(wss), None)
+                } else {
+                    let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
+                    ws.send(Kind::Binary, &sent).await.expect("send");
+                    let m = ws.recv().await.expect("recv").expect("the echo");
+                    assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &sent[..]));
+                    ws.close(1000, "").await.expect("send close");
+                    assert!(ws.recv().await.expect("recv after close").is_none(), "data after close");
+                    (None, Some(ws))
+                }
+            },
+            || {},
+        );
+        assert_eq!(echoed, 1, "tls {tls}");
+    }
+}
+
 /// Every frame of the Net taken, so a frame wait cannot end by a frame returning.
 async fn take_every_frame(handle: &NetHandle) -> Vec<switchnet::TxFrame> {
     let mut held = Vec::new();
@@ -1207,36 +1263,25 @@ fn a_large_send_waits_for_frames_then_completes() {
     assert_eq!(read, [Message::Binary(vec![5; LEN].into())]);
 }
 
-/// The peer resets the connection; once the client saw it (its receive half reports the
-/// reset), a free frame is not handed to the dead socket: the setup probe is `Dead`, and an
-/// alloc on a sender set up before is refused (before the fix, the frame wait was polled
-/// first and won).
+/// The peer resets the connection while every frame of the pool is held: once the client saw
+/// the reset (its receive half reports it), an alloc on a sender set up before ends with
+/// `InvalidState` at once instead of waiting for a frame that a dead socket can never use.
 #[zhida_test_support::pinned_test]
-fn a_reset_socket_gets_no_frame_though_one_is_free() {
+fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
     use sheath::FrameTx;
-    use sheath::switchnet::{SetupError, SwitchTx};
-    for probe in [true, false] {
-        let (go_tx, go_rx) = mpsc::channel();
-        until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
-            let (mut rx, tcp) = stream.split();
-            let mut early = None;
-            let mut late = Some(tcp);
-            if !probe {
-                early = Some(SwitchTx::new(&handle, late.take().unwrap(), 1).await.expect("setup"));
-            }
-            go_tx.send(()).unwrap();
-            let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
-            assert!(seen.is_err(), "data instead of the reset");
-            if let Some(tcp) = late {
-                let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the probe waited");
-                assert!(matches!(got, Err(SetupError::Dead)), "probe: {:?}", got.map(drop));
-            }
-            if let Some(mut tx) = early {
-                let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
-                assert!(got.is_err(), "a frame for a reset socket");
-            }
-        });
-    }
+    use sheath::switchnet::SwitchTx;
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let (mut rx, tcp) = stream.split();
+        let mut tx = SwitchTx::new(&handle, tcp, 1).await.expect("setup");
+        let held = take_every_frame(&handle).await;
+        go_tx.send(()).unwrap();
+        let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+        assert!(seen.is_err(), "data instead of the reset");
+        let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
+        assert!(matches!(got, Err(switchnet::SendError::InvalidState)), "{:?}", got.map(drop));
+        drop(held);
+    });
 }
 
 /// `tls_connect`'s plaintext minimum: 0 counts as one byte (a record's floor), so a 76 B send
@@ -1383,10 +1428,9 @@ fn peer_fin_then_reset_without_a_close_is_dead() {
     }
 }
 
-/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB (within the
-/// default `max_frame`), followed by one byte, fails the connection with `MessageTooBig`
-/// (close code 1009) at the header, and FIN goes out. (Before, the limit could not be set:
-/// every connection took 64 MiB messages.)
+/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB, followed by
+/// one byte, fails the connection with `MessageTooBig` at the header, and FIN goes out with no
+/// close frame.
 #[zhida_test_support::pinned_test]
 fn a_message_over_the_configured_limit_fails_at_its_header() {
     let limits = Limits { max_message: 1 << 20, ..Limits::default() };
@@ -1405,8 +1449,10 @@ fn a_message_over_the_configured_limit_fails_at_its_header() {
         move |handle, stream| async move {
             let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, limits).await.expect("ws connect");
             let got = ws.recv().await.map(|m| m.is_some());
-            let Err(WssError::Failed(relay::switchnet::Failure::Protocol(e))) = got else { panic!("{got:?}") };
-            assert_eq!((e, e.close_code()), (relay::ProtocolError::MessageTooBig, 1009));
+            assert!(
+                matches!(got, Err(WssError::Failed(relay::switchnet::Failure::Protocol(relay::ProtocolError::MessageTooBig)))),
+                "{got:?}"
+            );
             ws
         },
     );

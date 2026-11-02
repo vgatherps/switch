@@ -146,7 +146,7 @@ fn client_frame(op: u8, payload: &[u8]) -> Vec<u8> {
     encode(fin(op), Some([1, 2, 3, 4]), payload)
 }
 
-type Recvd = Result<Option<(Kind, Vec<u8>)>, TxError>;
+type Recvd = Result<Option<(Kind, Vec<u8>)>, Failure>;
 
 /// `recv` once, polled with a no-op waker at most `n` times; the message copied out.
 fn recv_n<R, T, I>(s: &mut Session<R, T, I>, n: usize) -> Option<Recvd>
@@ -170,7 +170,7 @@ type Got = Rc<RefCell<Vec<Recvd>>>;
 /// Receives until the end (`None` or an error), recording every result; then lingers if
 /// asked, recording that too.
 #[switch::task]
-async fn receiving(mut s: RawSession, got: Got, lingered: Rc<RefCell<Option<Result<(), TxError>>>>, linger: bool) {
+async fn receiving(mut s: RawSession, got: Got, lingered: Rc<RefCell<Option<Result<(), Failure>>>>, linger: bool) {
     loop {
         let r = s.recv().await.map(|m| m.map(|m| (m.kind(), m.bytes().to_vec())));
         let done = !matches!(r, Ok(Some(_)));
@@ -187,7 +187,7 @@ async fn receiving(mut s: RawSession, got: Got, lingered: Rc<RefCell<Option<Resu
 struct Task {
     runtime: switch::Runtime,
     got: Got,
-    lingered: Rc<RefCell<Option<Result<(), TxError>>>>,
+    lingered: Rc<RefCell<Option<Result<(), Failure>>>>,
 }
 
 impl Task {
@@ -277,17 +277,25 @@ fn received_bytes_can_be_sent_with_the_borrowed_sender() {
     );
 }
 
+/// A borrowed send dropped while it waits: a one-frame message is accepted once it has a frame
+/// (with no TCP room it waits sealed), a longer one once copied in; the next receive and send go
+/// on either way.
 #[test]
 fn borrowed_send_cancellation_preserves_acceptance_and_next_receive() {
-    for (len, accepted) in [(10, false), (3000, true)] {
+    for (len, no_frame, accepted) in [(10, true, false), (10, false, true), (3000, false, true)] {
         let (mut s, log, input) = raw();
         assert!(poll_n(s.recv_with_sender(), 1).is_none());
         let payload = vec![7; len];
         feed(&input, &client_frame(BINARY, &payload), false);
         let (message, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
-        log.borrow_mut().room = Some(if accepted { ROOM } else { 0 });
+        if no_frame {
+            log.borrow_mut().frames = Some(0);
+        } else {
+            log.borrow_mut().room = Some(if len > ROOM { ROOM } else { 0 });
+        }
         assert!(poll_n(sender.send(message.kind(), message.bytes()), 1).is_none());
         log.borrow_mut().room = None;
+        log.borrow_mut().frames = None;
         feed(&input, &client_frame(TEXT, b"next"), false);
         let (next, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
         assert_eq!((next.kind(), next.bytes()), (Kind::Text, &b"next"[..]));
@@ -307,7 +315,7 @@ fn receive_with_sender_reports_protocol_failure() {
     feed(&input, &encode(fin(TEXT), None, b"unmasked"), false);
     assert!(matches!(
         poll_n(s.recv_with_sender(), 1),
-        Some(Err(TxError::Failed(Failure::Protocol(crate::ProtocolError::UnmaskedFrame))))
+        Some(Err(Failure::Protocol(crate::ProtocolError::UnmaskedFrame)))
     ));
 }
 
@@ -378,7 +386,7 @@ fn recv_is_woken_by_a_reset_alone() {
             end(&input, InputEnd::Reset);
         }
         assert_eq!(task.turn(), 1, "on input {on_input}");
-        assert_eq!(task.got(), [Err(TxError::Failed(Failure::Dead))], "on input {on_input}");
+        assert_eq!(task.got(), [Err(Failure::Dead)], "on input {on_input}");
         assert_eq!((sent(&log).len(), log.borrow().live_frames()), (1, 0));
     }
 }
@@ -503,9 +511,9 @@ fn the_peer_fin_then_reset_is_dead_and_a_fin_alone_is_not() {
             recv_n(&mut s, 2).map(|r| r.map(drop))
         };
         let want = match (reset, lingering) {
-            (true, _) => Err(TxError::Failed(Failure::Dead)),
+            (true, _) => Err(Failure::Dead),
             (false, true) => Ok(()),
-            (false, false) => Err(TxError::Failed(Failure::PeerEof)),
+            (false, false) => Err(Failure::PeerEof),
         };
         assert_eq!(got, Some(want), "{case}");
     }
@@ -521,7 +529,7 @@ fn linger_seeing_the_peer_fin_then_a_death_is_dead() {
     assert_eq!(poll_n(s.linger(), 2), None);
     assert_eq!(log.borrow().waited.last().copied(), Some("room"));
     log.borrow_mut().dead = true;
-    assert_eq!(poll_n(s.linger(), 2), Some(Err(TxError::Failed(Failure::Dead))));
+    assert_eq!(poll_n(s.linger(), 2), Some(Err(Failure::Dead)));
     assert_eq!(sent(&log).len(), 0);
 }
 
@@ -535,7 +543,7 @@ fn a_reset_before_the_peer_close_is_dead_even_after_our_fin() {
     assert!(poll_n(s.linger(), 2).is_none());
     assert_eq!((s.tx.end(), log.borrow().shutdowns), (crate::tx::End::Delivered, 1));
     end(&input, InputEnd::Reset);
-    assert_eq!(poll_n(s.linger(), 1), Some(Err(TxError::Failed(Failure::Dead))));
+    assert_eq!(poll_n(s.linger(), 1), Some(Err(Failure::Dead)));
 }
 
 /// The send job and a frame of input ready in the same poll: the job's frame goes out, and
@@ -668,7 +676,7 @@ fn raw_fin_while_reading_is_peer_eof() {
     feed(&input, &client_frame(TEXT, b"x"), false);
     end(&input, InputEnd::Fin);
     assert_eq!(recv_n(&mut s, 1), Some(msg(Kind::Text, b"x")));
-    assert_eq!(recv_n(&mut s, 1), Some(Err(TxError::Failed(Failure::PeerEof))));
+    assert_eq!(recv_n(&mut s, 1), Some(Err(Failure::PeerEof)));
     assert_eq!((sent(&log).len(), log.borrow().shutdowns), (0, 1));
     let (mut s, log, input) = raw();
     feed(&input, &client_frame(CLOSE, &[]), false);
@@ -687,7 +695,7 @@ fn tls_close_notify_without_a_close_is_peer_eof() {
     server.send_close_notify();
     feed(&input, &server_bytes(&mut server), false);
     assert_eq!(recv_n(&mut s, 1), Some(msg(Kind::Text, b"last")));
-    assert_eq!(recv_n(&mut s, 1), Some(Err(TxError::Failed(Failure::PeerEof))));
+    assert_eq!(recv_n(&mut s, 1), Some(Err(Failure::PeerEof)));
     assert!(input.borrow().end.is_none());
     assert!(wire.shut.get(), "no FIN");
     let mut tls = &wire.sent.borrow()[..];
@@ -704,7 +712,7 @@ fn tls_fin_without_close_notify_is_truncation() {
     let (mut s, mut server, wire, input) = tls();
     feed(&input, &server_bytes(&mut server), false);
     end(&input, InputEnd::Fin);
-    assert_eq!(recv_n(&mut s, 1), Some(Err(TxError::Failed(Failure::Tls(sheath::Error::Truncated)))));
+    assert_eq!(recv_n(&mut s, 1), Some(Err(Failure::Tls(sheath::Error::Truncated))));
     assert!(wire.shut.get(), "no FIN");
 }
 
@@ -750,10 +758,10 @@ fn linger_after_a_failure_drains_to_the_peer_fin_and_reports_a_reset() {
     for reset in [false, true] {
         let (mut s, log, input) = raw();
         feed(&input, &encode(fin(TEXT), None, b"unmasked"), false);
-        assert_eq!(recv_n(&mut s, 1), Some(Err(TxError::Failed(Failure::Protocol(crate::ProtocolError::UnmaskedFrame)))));
+        assert_eq!(recv_n(&mut s, 1), Some(Err(Failure::Protocol(crate::ProtocolError::UnmaskedFrame))));
         feed(&input, &[0xff; 10], false);
         end(&input, if reset { InputEnd::Reset } else { InputEnd::Fin });
-        let want = if reset { Err(TxError::Failed(Failure::Dead)) } else { Ok(()) };
+        let want = if reset { Err(Failure::Dead) } else { Ok(()) };
         assert_eq!(poll_n(s.linger(), 1), Some(want), "reset {reset}");
         assert_eq!((sent(&log).len(), log.borrow().shutdowns, input.borrow().live_frames()), (0, 1, 0));
     }
@@ -768,7 +776,7 @@ fn linger_reports_a_reset_before_our_fin() {
     assert!(poll_n(s.tx.send(Kind::Text, b"stuck"), 1).is_none());
     assert!(poll_n(s.linger(), 2).is_none());
     end(&input, InputEnd::Reset);
-    assert_eq!(poll_n(s.linger(), 1), Some(Err(TxError::Failed(Failure::Dead))));
+    assert_eq!(poll_n(s.linger(), 1), Some(Err(Failure::Dead)));
     assert_eq!((sent(&log).len(), log.borrow().shutdowns, log.borrow().live_frames()), (0, 0, 0));
 }
 

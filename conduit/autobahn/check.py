@@ -36,7 +36,25 @@ def reject_duplicates(path):
     return hook
 
 
-def load_cases(path):
+def check_case(path, case_id, case):
+    if not isinstance(case, dict):
+        raise Malformed("%s: case %s is not an object" % (path, case_id))
+    for field in COMPARED:
+        if field not in case:
+            raise Malformed("%s: case %s missing field %r" % (path, case_id, field))
+    for field in ("behavior", "behaviorClose"):
+        if not isinstance(case[field], str):
+            raise Malformed("%s: case %s field %r is %r, not a string" % (path, case_id, field, case[field]))
+    code = case["remoteCloseCode"]
+    if code is not None and (type(code) is not int):
+        raise Malformed("%s: case %s remoteCloseCode is %r, not an int or null" % (path, case_id, code))
+    if "reportfile" in case and not isinstance(case["reportfile"], str):
+        raise Malformed("%s: case %s reportfile is %r, not a string" % (path, case_id, case["reportfile"]))
+
+
+def load_cases(path, alternatives=False):
+    """Case id -> case. With `alternatives` (the expected file), case id -> list of the
+    accepted cases: a case given as a non-empty list accepts any of them."""
     try:
         with open(path) as f:
             data = json.load(f, object_pairs_hook=reject_duplicates(path))
@@ -50,19 +68,15 @@ def load_cases(path):
     if not isinstance(cases, dict):
         raise Malformed("%s: agent %r value is not an object" % (path, AGENT))
     for case_id, case in cases.items():
-        if not isinstance(case, dict):
-            raise Malformed("%s: case %s is not an object" % (path, case_id))
-        for field in COMPARED:
-            if field not in case:
-                raise Malformed("%s: case %s missing field %r" % (path, case_id, field))
-        for field in ("behavior", "behaviorClose"):
-            if not isinstance(case[field], str):
-                raise Malformed("%s: case %s field %r is %r, not a string" % (path, case_id, field, case[field]))
-        code = case["remoteCloseCode"]
-        if code is not None and (type(code) is not int):
-            raise Malformed("%s: case %s remoteCloseCode is %r, not an int or null" % (path, case_id, code))
-        if "reportfile" in case and not isinstance(case["reportfile"], str):
-            raise Malformed("%s: case %s reportfile is %r, not a string" % (path, case_id, case["reportfile"]))
+        if alternatives:
+            if not isinstance(case, list):
+                case = cases[case_id] = [case]
+            if not case:
+                raise Malformed("%s: case %s lists no alternatives" % (path, case_id))
+            for alternative in case:
+                check_case(path, case_id, alternative)
+        else:
+            check_case(path, case_id, case)
     return cases
 
 
@@ -76,7 +90,7 @@ def triple(case):
 
 def compare(report_path, expected_path):
     report = load_cases(report_path)
-    expected = load_cases(expected_path)
+    expected = load_cases(expected_path, alternatives=True)
     counts = collections.Counter((c["behavior"], c["behaviorClose"]) for c in report.values())
     print("report %s: %d cases" % (report_path, len(report)))
     for (behavior, behavior_close), n in sorted(counts.items()):
@@ -87,14 +101,15 @@ def compare(report_path, expected_path):
     extra = sorted(set(report) - set(expected), key=case_sort_key)
     diverging = []
     for case_id in sorted(set(expected) & set(report), key=case_sort_key):
-        if triple(expected[case_id]) != triple(report[case_id]):
+        if triple(report[case_id]) not in [triple(c) for c in expected[case_id]]:
             diverging.append(case_id)
 
     for case_id in diverging:
         reportfile = report[case_id].get("reportfile")
         location = os.path.join(report_dir, reportfile) if reportfile else "(no reportfile)"
-        print("DIVERGES %s expected=%r actual=%r report=%s"
-              % (case_id, triple(expected[case_id]), triple(report[case_id]), location))
+        accepted = " or ".join(repr(triple(c)) for c in expected[case_id])
+        print("DIVERGES %s expected=%s actual=%r report=%s"
+              % (case_id, accepted, triple(report[case_id]), location))
     for case_id in missing:
         print("MISSING %s" % case_id)
     for case_id in extra:
@@ -110,11 +125,24 @@ def compare(report_path, expected_path):
 
 def self_test(expected_path):
     with open(expected_path) as f:
-        base = json.load(f)
+        expected = json.load(f)
+    either = next(k for k, v in expected[AGENT].items() if isinstance(v, list))
+    alternatives = expected[AGENT][either]
+    # the report the expected file describes: the first alternative of a case that lists several
+    base = {AGENT: {k: v[0] if isinstance(v, list) else v for k, v in expected[AGENT].items()}}
     cases = base[AGENT]
     with_code = next(k for k, v in cases.items() if isinstance(v["remoteCloseCode"], int))
     with_null = next(k for k, v in cases.items() if v["remoteCloseCode"] is None)
     any_case = next(iter(cases))
+
+    def set_case(case_id, case):
+        def mutate(d):
+            d[AGENT][case_id] = copy.deepcopy(case)
+        return mutate
+
+    def none_of(options):
+        behaviors = {c["behavior"] for c in options}
+        return dict(options[0], behavior=next(b for b in ("OK", "FAILED", "NON-STRICT") if b not in behaviors))
 
     def set_field(case_id, field, value):
         def mutate(d):
@@ -156,6 +184,8 @@ def self_test(expected_path):
     # (name, dict mutation, text mutation, want exit, required output substring)
     scenarios = [
         ("expected vs itself", None, None, 0, "PASS: "),
+        ("another listed alternative", set_case(either, alternatives[-1]), None, 0, "PASS: "),
+        ("none of the listed alternatives", set_case(either, none_of(alternatives)), None, 1, diverges(either)),
         ("ignored duration and reportfile", ignored_metadata, None, 0, "PASS: "),
         ("changed behavior", set_field(any_case, "behavior", other_behavior("behavior")), None, 1,
          diverges(any_case)),

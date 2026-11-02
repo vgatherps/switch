@@ -75,7 +75,7 @@ where
     /// With a message in hand, queued output gets one bounded pass (`TxCore::service`) and
     /// the message returns without waiting on it. Without one, input and the next send job
     /// are awaited together; whichever is ready first is handled, both if both are.
-    pub(crate) async fn recv(&mut self) -> Result<Option<Message<'_>>, TxError> {
+    pub(crate) async fn recv(&mut self) -> Result<Option<Message<'_>>, Failure> {
         if self.message_ready().await? {
             Ok(self.rx.take_message())
         } else {
@@ -83,7 +83,7 @@ where
         }
     }
 
-    pub(crate) async fn recv_with_sender(&mut self) -> Result<Option<(Message<'_>, &mut TxCore<T>)>, TxError> {
+    pub(crate) async fn recv_with_sender(&mut self) -> Result<Option<(Message<'_>, &mut TxCore<T>)>, Failure> {
         if self.message_ready().await? {
             Ok(self.rx.take_message().map(|message| (message, &mut self.tx)))
         } else {
@@ -91,7 +91,7 @@ where
         }
     }
 
-    async fn message_ready(&mut self) -> Result<bool, TxError> {
+    async fn message_ready(&mut self) -> Result<bool, Failure> {
         // Parsing stops only where it needs input, so it runs again only once input came.
         let mut parse = true;
         loop {
@@ -108,7 +108,7 @@ where
                 End::Open | End::Notify | End::Fin => false,
             };
             if over {
-                return self.tx.result().map(|()| false);
+                return self.tx.failed().map_or(Ok(false), |f| Err(f.clone()));
             }
             parse = self.wait().await;
         }
@@ -124,9 +124,9 @@ where
 
     /// Sends no close frame (one already sealed still goes out), stops receiving, drains to
     /// FIN, and reads and drops input until the peer's FIN: dropping the connection then sends
-    /// no RST. `Err(Failed(Dead))` if the socket reset before the peer's close (after it, a
-    /// reset is a clean end); a failure before is not reported.
-    pub(crate) async fn linger(&mut self) -> Result<(), TxError> {
+    /// no RST. `Err(Dead)` if the socket reset before the peer's close (after it, a reset is a
+    /// clean end); a failure before is not reported.
+    pub(crate) async fn linger(&mut self) -> Result<(), Failure> {
         self.tx.abandon();
         if self.rx_in == RxIn::Reading {
             self.stop_rx();
@@ -136,7 +136,7 @@ where
         }
         self.settle();
         match (self.tx.end(), self.tx.failed()) {
-            (End::Dead, Some(_)) => Err(TxError::Failed(Failure::Dead)),
+            (End::Dead, Some(_)) => Err(Failure::Dead),
             (End::Dead, None) | (End::Open | End::Notify | End::Fin | End::Delivered, _) => Ok(()),
         }
     }

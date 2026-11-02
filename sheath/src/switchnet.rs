@@ -15,7 +15,7 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
 
 use crate::tx::{OVERHEAD, plain_room};
-use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
+use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into, send_sealed};
 
 impl RxFrame for TcpFrame {
     fn payload(&self) -> &[u8] {
@@ -42,8 +42,8 @@ impl TxFrame for switchnet::TxFrame {
 pub enum SetupError {
     /// The stream is not on `handle`'s Net: its frames would be refused as foreign.
     ForeignHandle,
-    /// One frame carries `room` bytes (the frame room, clamped to the send buffer), fewer than
-    /// the `need` bytes the caller's largest frame takes.
+    /// A frame holds `room` bytes (the Stack's frame capacity, clamped to the send buffer),
+    /// fewer than the `need` bytes the caller's largest frame takes.
     RoomTooSmall { room: usize, need: usize },
     /// The socket closed or reset before a frame could be taken.
     Dead,
@@ -63,17 +63,17 @@ impl fmt::Display for SetupError {
 pub struct SwitchTx {
     handle: NetHandle,
     tcp: TcpTx,
-    /// Bytes per frame: the Stack's frame capacity, the connection's MSS and the socket's send
-    /// buffer, whichever is least.
+    /// Bytes per frame: the connection's MSS, raised to the caller's largest frame, within the
+    /// Stack's frame capacity and the socket's send buffer.
     room: usize,
 }
 
 impl SwitchTx {
-    /// Sends on `tcp`, in frames from `handle`, sized by the Stack's frame capacity (one frame
-    /// is taken to read it), the connection's MSS (so each frame is one segment, sent without
-    /// a copy) and the socket's send buffer (so every `room` request can resolve). `min_room`
-    /// is the largest frame the caller will send; a smaller room is refused here, before any
-    /// byte goes out.
+    /// Sends on `tcp`, in frames from `handle`. A frame carries the connection's MSS (one
+    /// segment), or `min_room`, the largest frame the caller will send, if that is more: TCP
+    /// cuts such a frame into segments. Its storage, the Stack's frame capacity (one frame is
+    /// taken to read it) and the socket's send buffer (so every `room` request can resolve),
+    /// bounds it; storage below `min_room` is refused here, before any byte goes out.
     pub async fn new(handle: &NetHandle, tcp: TcpTx, min_room: usize) -> Result<SwitchTx, SetupError> {
         if !tcp.is_on(handle) {
             return Err(SetupError::ForeignHandle);
@@ -81,10 +81,11 @@ impl SwitchTx {
         let mut tx = SwitchTx { handle: handle.clone(), tcp, room: 0 };
         let capacity = tx.alloc().await.map_err(|_| SetupError::Dead)?.capacity();
         let mss = tx.tcp.max_segment_payload().ok_or(SetupError::Dead)?;
-        tx.room = capacity.min(mss).min(tx.tcp.send_capacity());
-        if tx.room < min_room {
-            return Err(SetupError::RoomTooSmall { room: tx.room, need: min_room });
+        let storage = capacity.min(tx.tcp.send_capacity());
+        if storage < min_room {
+            return Err(SetupError::RoomTooSmall { room: storage, need: min_room });
         }
+        tx.room = mss.max(min_room).min(storage);
         Ok(tx)
     }
 }
@@ -94,17 +95,17 @@ impl FrameTx for SwitchTx {
     type Sealed = switchnet::TxFrame;
     type Error = SendError;
 
-    /// A frame from the Net, or `InvalidState` if the socket has closed or reset (checked
-    /// first on every poll, so a dead socket never gets a frame). Called only before
-    /// `shutdown`, where the connection ending is the only way `delivered` resolves.
+    /// A frame from the Net; while none is free, `InvalidState` if the socket has closed or
+    /// reset. Called only before `shutdown`, where the connection ending is the only way
+    /// `delivered` resolves.
     async fn alloc(&mut self) -> Result<switchnet::TxFrame, SendError> {
-        let mut dead = pin!(self.tcp.delivered());
         let mut frame = pin!(self.handle.tx_frame());
+        let mut dead = pin!(self.tcp.delivered());
         poll_fn(|cx| {
-            if dead.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(SendError::InvalidState));
+            if let Poll::Ready(f) = frame.as_mut().poll(cx) {
+                return Poll::Ready(Ok(f));
             }
-            frame.as_mut().poll(cx).map(Ok)
+            dead.as_mut().poll(cx).map(|()| Err(SendError::InvalidState))
         })
         .await
     }
@@ -204,11 +205,7 @@ impl Tls {
     /// ended), so the connection may be dropped then; until then it stays pending, so the caller
     /// bounds it. Receiving goes on.
     pub async fn close(&mut self) -> Result<(), Error> {
-        let f = self.tx.alloc().await.map_err(Error::Send)?;
-        let (_, room) = self.tx.plain();
-        self.tx.room(room).await.map_err(Error::Send)?;
-        let sealed = self.tx.close_notify(f).map_err(Error::Send)?;
-        send_sealed(&mut self.tx, sealed, room).await.map_err(Error::Send)?;
+        self.tx.send_close_notify().await.map_err(Error::Send)?;
         self.tx.shutdown();
         self.tx.delivered().await;
         Ok(())
@@ -234,15 +231,6 @@ async fn abort(tx: &mut TlsTx<SwitchTx>) {
     }
     tx.shutdown();
     tx.delivered().await;
-}
-
-/// Sends `sealed`, waiting for room of `len` bytes each time it is refused.
-async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usize) -> Result<(), L::Error> {
-    while let Err(s) = lower.try_send(sealed) {
-        sealed = s;
-        lower.room(len).await?;
-    }
-    Ok(())
 }
 
 /// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert

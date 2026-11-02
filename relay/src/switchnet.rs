@@ -23,7 +23,7 @@ use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
 impl PlainTx for SwitchTx {
-    const HAS_CLOSE_RECORD: bool = false;
+    const CLOSE_RECORD_LEN: Option<usize> = None;
 
     fn has_pending(&self) -> bool {
         false
@@ -255,7 +255,7 @@ impl Wss {
     /// TLS alert, close_notify, FIN) is delivered. Bytes the server sends after its close are read
     /// and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
-        Ok(self.0.recv().await?)
+        self.0.recv().await.map_err(Error::Failed)
     }
 
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
@@ -286,7 +286,7 @@ impl Wss {
     /// dropping the `Wss` afterwards sends no RST (a socket dropped with data unread aborts).
     /// `Err(Failed(Dead))` if the socket reset before the peer's close. Waits for the server: bound it.
     pub async fn linger(&mut self) -> Result<(), Error> {
-        Ok(self.0.linger().await?)
+        self.0.linger().await.map_err(Error::Failed)
     }
 }
 
@@ -295,14 +295,14 @@ impl Ws {
     /// FIN delivered. After a failure, the first failure, once our FIN is delivered. Bytes the peer
     /// sends after its close are read and dropped.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
-        Ok(self.0.recv().await?)
+        self.0.recv().await.map_err(Error::Failed)
     }
 
     /// Receives as in [`Ws::recv`], also borrowing a sender so the message's bytes can be
     /// sent without first copying them into an application buffer. Sending still copies
     /// into the outgoing frame (or the send buffer for a fragmented outgoing message).
     pub async fn recv_with_sender(&mut self) -> Result<Option<(Message<'_>, WsSender<'_>)>, Error> {
-        Ok(self.0.recv_with_sender().await?.map(|(message, tx)| (message, WsSender(tx))))
+        Ok(self.0.recv_with_sender().await.map_err(Error::Failed)?.map(|(message, tx)| (message, WsSender(tx))))
     }
 
     /// Sends `payload` as one message, a TCP frame at a time, after what earlier calls left.
@@ -331,7 +331,7 @@ impl Ws {
     /// dropping the `Ws` afterwards sends no RST (a socket dropped with data unread aborts).
     /// `Err(Failed(Dead))` if the socket reset before the peer's close. Waits for the peer: bound it.
     pub async fn linger(&mut self) -> Result<(), Error> {
-        Ok(self.0.linger().await?)
+        self.0.linger().await.map_err(Error::Failed)
     }
 }
 

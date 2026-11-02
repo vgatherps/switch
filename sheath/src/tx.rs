@@ -15,6 +15,9 @@ const KEY_UPDATE_LEN: usize = RECORD_HEAD + 4 + 1 + RECORD_TAIL;
 const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
+/// close_notify's plaintext (an alert): `room(CLOSE_NOTIFY_LEN)` waits for the sealed
+/// close_notify and the KeyUpdates that may precede it, not for a full frame.
+pub const CLOSE_NOTIFY_LEN: usize = 2;
 
 /// Most plaintext rustls puts in one record without a client `max_fragment_size` (TLS's 2^14).
 const MAX_RECORD_PLAINTEXT: usize = 1 << 14;
@@ -119,6 +122,15 @@ impl<L: FrameTx> TlsTx<L> {
             .expect("a frame fits a close_notify record");
         self.state = State::Closed;
         self.finish(f, n)
+    }
+
+    /// Seals close_notify and sends it, waiting for room for it (and the KeyUpdates that may
+    /// precede it) only, not for a full frame. Later seals fail with [`TxError::Closed`].
+    pub async fn send_close_notify(&mut self) -> Result<(), TxError<L::Error>> {
+        let f = self.alloc().await?;
+        self.room(CLOSE_NOTIFY_LEN).await?;
+        let sealed = self.close_notify(f)?;
+        crate::send_sealed(self, sealed, CLOSE_NOTIFY_LEN).await
     }
 
     /// Stops sending after a receive error.

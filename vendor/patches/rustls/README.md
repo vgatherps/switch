@@ -15,10 +15,14 @@ Upstream-only hunks (skipped by `vendor/rustls.sh`, since the crate ships neithe
 
 Send side (`WriteTraffic::encrypt`) still copies; not patched.
 
+## 0002-tls13-oversized-record-gets-record-overflow.patch
+
+RFC 8446 §5.2: once TLS 1.3 is negotiated, a record whose ciphertext exceeds 2^14 + 256 B fails with `PeerSentOversizedRecord` and a record_overflow alert, checked before decryption (`process_more_input` in conn.rs). Upstream rejected it only after decrypting it (plaintext check); one that did not decrypt got bad_record_mac. Headers over 18431 B still fail at the header with decode_error (`MessageTooLarge`), as upstream. No upstream test in the patch; `sheath/tests/tx.rs` `oversized_record_gets_a_record_overflow_alert` covers it.
+
 ## Update to a new rustls version
 
 1. Add the version's crates.io checksum to `expected_sha256` in `vendor/rustls.sh` (from Cargo.lock or the crates.io index).
-2. Rebase the patch on the upstream tag: `git clone --branch v/<version> https://github.com/rustls/rustls && cd rustls && git am <this dir>/0001-*.patch`, fix conflicts, `cargo test -p rustls --features ring`, `git format-patch -1 -o <this dir>`.
+2. Rebase the patches on the upstream tag: `git clone --branch v/<version> https://github.com/rustls/rustls && cd rustls && git am <this dir>/*.patch`, fix conflicts, `cargo test -p rustls --features ring`, `git format-patch -<n> -o <this dir>`.
 3. `vendor/rustls.sh update <version>`; bump the `rustls = "=<version>"` requirements; `vendor/rustls.sh check`.
 
 `vendor/rustls.sh check` (or `make vendor-check`) fails on any difference between `vendor/rustls` and release + patches.

@@ -183,6 +183,28 @@ fn close_notify_ends_sending_only() {
     assert_eq!(received.got[0].plaintext, b"still");
 }
 
+/// `send_close_notify` (what `Tls::close` sends) waits for room for close_notify and the two
+/// KeyUpdates that may precede it, 2 + 22 + 54 = 78 B, not for a full frame: with 77 B free it
+/// waits and nothing goes out; with 78 B it sends, and the server reads the close.
+#[test]
+fn close_notify_waits_only_for_its_own_room() {
+    let mut peer = connect(None);
+    deliver_to_client(&mut peer).unwrap();
+    let need = sheath::CLOSE_NOTIFY_LEN + RECORD + 2 * KEY_UPDATE;
+    peer.wire.free.set(Some(need - 1));
+    {
+        let mut closing = std::pin::pin!(peer.tx.send_close_notify());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(closing.as_mut().poll(&mut cx).is_pending(), "sent with too little room");
+        assert!(peer.wire.sent.borrow().is_empty());
+        peer.wire.free.set(Some(need));
+        assert_eq!(closing.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(())));
+    }
+    assert_eq!(peer.wire.sent.borrow().len(), RECORD + 2);
+    assert_eq!(peer.deliver().unwrap(), b"");
+    assert!(peer.server.process_new_packets().unwrap().peer_has_closed());
+}
+
 /// After a bad record, rustls's bad_record_mac alert goes out through `take_pending`, behind a
 /// frame sealed before the error, and sealing stops.
 #[test]
@@ -219,6 +241,35 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
         peer.deliver(),
         Err(rustls::Error::AlertReceived(AlertDescription::BadRecordMac))
     );
+}
+
+/// A record over 2^14 + 256 B (16641 B here) fails the connection with a record_overflow alert
+/// to the server (RFC 8446 §5.2), whether the record arrives in one frame or across two.
+#[test]
+fn oversized_record_gets_a_record_overflow_alert() {
+    for straddle in [false, true] {
+        let mut peer = connect(None);
+        deliver_to_client(&mut peer).unwrap();
+        let mut stream = Stream::default();
+        peer.send(&mut stream, b"hello");
+        let at = stream.bytes.len();
+        let [hi, lo] = 16641u16.to_be_bytes();
+        stream.bytes.extend_from_slice(&[0x17, 0x03, 0x03, hi, lo]);
+        stream.bytes.resize(at + 5 + 16641, 0);
+        let cuts = if straddle { vec![at + 100] } else { vec![] };
+
+        let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
+        assert_eq!(received.got.len(), 1, "straddle {straddle}");
+        assert_eq!(received.error, Some(Error::Tls(rustls::Error::PeerSentOversizedRecord)), "straddle {straddle}");
+        let f = ready(peer.tx.alloc()).unwrap();
+        let alert = peer.tx.take_pending(f).unwrap().expect("the alert");
+        send(&mut peer, alert);
+        assert_eq!(
+            peer.deliver(),
+            Err(rustls::Error::AlertReceived(AlertDescription::RecordOverflow)),
+            "straddle {straddle}"
+        );
+    }
 }
 
 /// TCP FIN without the server's close_notify is truncation, which stops sending.
