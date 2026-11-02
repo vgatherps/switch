@@ -123,9 +123,9 @@ impl Pacer {
                 if self.is_blocked[i] {
                     self.visited_blocked += 1;
                 } else {
+                    // queued behind the blocked senders not yet retried this poll
                     self.is_blocked[i] = true;
                     self.blocked.push_back(sender);
-                    self.visited_blocked += 1;
                     self.cursor = k + 1;
                 }
             }
@@ -308,6 +308,29 @@ mod tests {
             }
         });
         assert_eq!(p.backlog_at_end(), 0);
+    }
+
+    /// Sender 0 is blocked from the first poll. In the second poll sender 1 blocks on a fresh
+    /// message; sender 0 must still get its one retry in that poll.
+    #[test]
+    fn a_new_block_does_not_skip_an_older_blocked_sender() {
+        let s = Schedule {
+            senders: 2,
+            interval_ns: 2000,
+            origin_ns: 0,
+        }; // one message per µs
+        let mut p = Pacer::new(s, 100, 32);
+        p.begin(0);
+        while let Some(k) = p.next_try() {
+            assert_eq!(k, 0);
+            p.result(k, Outcome::Blocked);
+        }
+        p.finish(0);
+
+        p.begin(1000);
+        assert_eq!(p.next_try(), Some(1));
+        p.result(1, Outcome::Blocked);
+        assert_eq!(p.next_try(), Some(0), "sender 0 skipped");
     }
 
     /// The send task stopped being polled at 10 µs (starved); the one poll at the cutoff tries
