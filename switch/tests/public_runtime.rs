@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use switch::{Capacity, Runtime, SleepError, Spawner};
+use switch::{Runtime, SleepError, Spawner};
 
 #[switch::task]
 async fn sleep_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
@@ -28,13 +28,7 @@ impl Interface {
 
 #[test]
 fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
-    let mut runtime = Runtime::with_capacity(
-        100,
-        Capacity {
-            tasks: 2,
-            timers: 2,
-        },
-    );
+    let mut runtime = Runtime::new(100);
     let spawner = runtime.spawner();
     let sleep_spawner = spawner.clone();
     let completed = Rc::new(Cell::new(false));

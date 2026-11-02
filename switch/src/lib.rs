@@ -169,7 +169,7 @@ pub fn boxed(future: std::pin::Pin<Box<dyn Future<Output = ()>>>) -> impl Future
 
 pub use remote::RemoteWaker;
 pub use executor::request_turn;
-pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
+pub use runtime::{PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;
 pub use task::SpawnToken;

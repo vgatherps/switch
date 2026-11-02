@@ -44,7 +44,7 @@ fn foreign_ops(ptr: *mut Executor) -> impl Future<Output = ()> {
         });
         unsafe {
             assert!((*ptr).incoming.is_empty());
-            assert_eq!(((*ptr).task_count, (*ptr).allocated), (1, 1));
+            assert_eq!(((*ptr).task_count, slots_in_use(ptr)), (1, 1));
             assert_eq!(TaskHeader::flags((*ptr).current).get() & !TAKEN, LIVE);
         }
         Poll::Ready(())
