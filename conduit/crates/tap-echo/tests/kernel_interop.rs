@@ -2345,12 +2345,12 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     let zhida_retransmissions = retransmitted_in_window(Direction::ToKernel);
     let zhida_timeouts = zhida_timeout_retransmissions(&zhida_retransmissions);
     let linux_retransmissions = retransmitted_in_window(Direction::ToZhida);
-    let stale_acks = stale_pure_acks(&captured, Direction::ToKernel);
-    let stale_acks_after = stale_acks
+    let stale_all = stale_pure_acks(&captured, Direction::ToKernel);
+    let stale_acks_after = stale_all
         .iter()
         .filter(|c| c.at > window.after_delete)
         .count();
-    let stale_acks: Vec<&Captured> = stale_acks.iter().filter(|c| in_window(c.at)).collect();
+    let stale_acks: Vec<&Captured> = stale_all.iter().filter(|c| in_window(c.at)).collect();
     // Every pure ACK Zhida sent while a filter could drop it; the capture
     // sees them before the ingress qdisc does.
     let pure_acks_to_kernel = captured
@@ -2408,6 +2408,12 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     );
     io::stdout().write_all(record.as_bytes()).unwrap();
 
+    // A pure ACK carries the highest sequence number sent, also after an RTO
+    // rewound the resend point, so none falls below the kernel's RCV.NXT.
+    assert!(
+        stale_all.is_empty(),
+        "Zhida sent pure ACKs below the kernel's RCV.NXT: {stale_all:?}"
+    );
     assert!(
         streaming.iter().all(|&bytes| bytes > 0),
         "data bytes sent in the first {ACK_LOSS_STREAMING:?} of the loss \
