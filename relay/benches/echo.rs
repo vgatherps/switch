@@ -2,8 +2,8 @@
 //! echoes 64 B of TCP payload as `bench/src/serve.rs`'s tcp echo does; `ws/64` echoes one 64 B
 //! binary message through relay (`accept_ws`, `recv_with_sender`), as serve.rs's ws echo does.
 //!
-//! Timed per echo: the Net's turn that takes the peer's segment in and wakes the echo task, the
-//! task's poll (receive, send) and the Net's turn that transmits the echo. Untimed: the peer's
+//! Timed per echo: the Net's receive that takes the peer's segment in and wakes the echo task, the
+//! task's poll (receive, send) and the Net's send that transmits the echo. Untimed: the peer's
 //! send, its turn and the links. The clock stays at `T0`: each request carries the ACK of the
 //! previous echo, so no timer runs.
 
@@ -78,7 +78,7 @@ impl Bench {
         bench
     }
 
-    /// Net turn, task poll, Net turn, Net→peer, peer turn, peer→Net.
+    /// Net receive, task poll, Net send, Net→peer, peer turn, peer→Net.
     fn round(&mut self) {
         self.net_side();
         self.to_peer.forward();
@@ -92,9 +92,9 @@ impl Bench {
     /// (`--toggle-collect='*net_side*'`).
     #[inline(never)]
     fn net_side(&mut self) {
-        self.net.turn(T0).unwrap();
+        self.net.receive(T0).unwrap();
         self.rt.poll(0).unwrap();
-        self.net.turn(T0).unwrap();
+        self.net.send().unwrap();
     }
 
     fn until(&mut self, mut done: impl FnMut(&mut Self) -> bool) {
