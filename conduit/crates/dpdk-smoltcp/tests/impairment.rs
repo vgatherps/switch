@@ -568,11 +568,10 @@ fn close_frees_held_and_ring_frames() {
         assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"c"), Ok(1));
         assert_eq!(pair.a.turn(pair.now(), 32).unwrap().tx_accepted, 1);
         // A: B's held segment in its RX pool. B: A's first segment on its RX
-        // ring, and the spare TX packet its handshake turn left (no reply was
-        // needed). Data leaves in frame-pool frames, so no data segment uses
-        // a TX packet: A holds "a" (unacknowledged) and "c" (also on its TX
-        // ring), B holds "b".
-        assert_eq!(pair.in_use(), [(1, 0), (1, 1)]);
+        // ring. Data leaves in frame-pool frames, so no data segment uses a TX
+        // packet: A holds "a" (unacknowledged) and "c" (also on its TX ring),
+        // B holds "b".
+        assert_eq!(pair.in_use(), [(1, 0), (1, 0)]);
         assert_eq!(pair.frame_in_use(), [2, 1]);
         // The held copy and one frame on each of two rings.
         assert_eq!(pair.close(), 3);
@@ -1209,9 +1208,7 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             },
         );
         assert_eq!(messages.sent, [32 * MESSAGE; 2]);
-        // B's last TX token went unused (no reply needed); its packet stays as
-        // B's spare.
-        assert_eq!(pair.in_use(), [(0, 0), (0, 1)]);
+        assert_eq!(pair.in_use(), [(0, 0), (0, 0)]);
 
         pair.a_to_b.paused = true;
         pair.b_to_a.paused = true;
@@ -1228,8 +1225,8 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             messages.step(&mut pair.a, &mut pair.b, MESSAGES);
         }
         // Each side: 15 frames on its TX ring, 32 pending and one unsent; the
-        // TX pool still holds only B's spare.
-        assert_eq!(pair.in_use(), [(0, 0), (0, 1)]);
+        // TX pool is idle.
+        assert_eq!(pair.in_use(), [(0, 0), (0, 0)]);
         assert_eq!(pair.frame_in_use(), [48; 2]);
 
         pair.a_to_b.paused = false;
@@ -1243,20 +1240,21 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             tx_accepted: 0,
             tx_pending: 32,
         };
-        // A's ring is still full when it turns; B gets A's 15 frames, stages a
-        // burst of 8 and cannot process them: its own ring and pending are full.
+        // A's ring is still full when it turns; B gets A's 15 frames and
+        // processes a burst of 8 although its own ring and pending are full: the
+        // data is delivered and the ACKs that find no TX room are dropped.
         let expected = Round {
             a: blocked,
             b: Turn {
                 rx_received: 8,
-                rx_staged: 8,
+                rx_processed: 8,
                 ..blocked
             },
             a_to_b: 15,
             b_to_a: 15,
         };
         assert_eq!(round, expected);
-        assert_eq!(pair.in_use(), [(15, 0), (15, 1)]);
+        assert_eq!(pair.in_use(), [(15, 0), (15, 0)]);
         assert_eq!(pair.frame_in_use(), [48; 2]);
 
         pair.drive(
@@ -1334,9 +1332,8 @@ fn rto_while_wire_paused_then_resume() {
             assert!(write(&mut pair.a, total));
             pair.round(|_, _| panic!("paused link delivered a frame"));
         }
-        // The 47 segments are frame-pool frames; A's TX pool holds the spare
-        // its last ACK-only turn left.
-        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 1), 47));
+        // The 47 segments are frame-pool frames; A's TX pool is idle.
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 47));
         assert!(matches!(pair.a.poll_at(), Some(p) if p > t && p <= ceil_ms(t + RTO)));
 
         let full = Turn {
@@ -1357,7 +1354,7 @@ fn rto_while_wire_paused_then_resume() {
         let expired = pair.round_at(ceil_ms(t + RTO), |_, _| panic!("paused link delivered a frame"));
         assert_eq!(expired.a, full);
         assert_eq!(pair.a.poll_at(), Some(pair.now()));
-        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 1), 47));
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 47));
 
         pair.a_to_b.paused = false;
         let mut frames = Vec::new();

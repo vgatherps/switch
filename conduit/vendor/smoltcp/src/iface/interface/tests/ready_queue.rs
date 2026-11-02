@@ -163,7 +163,7 @@ impl Device for RefusingDevice {
         self.inner.capabilities()
     }
 
-    fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, timestamp: Instant) -> Option<Self::RxToken<'_>> {
         self.inner.receive(timestamp)
     }
 

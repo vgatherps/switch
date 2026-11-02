@@ -145,9 +145,8 @@ pub struct Turn {
     pub rx_rejected: usize,
     /// Staged packets handed to smoltcp this turn.
     pub rx_processed: usize,
-    /// Packets still staged after ingress: the budget ran out, or no reply
-    /// capacity (pending slot and TX packet) was available. An empty TX pool
-    /// also blocks receive, because Device::receive takes a TX reservation first.
+    /// Packets still staged after ingress: the budget ran out. Receiving never
+    /// waits for TX room; a reply that finds none is dropped.
     pub rx_staged: usize,
     /// Packets the PMD accepted across this call's flushes.
     pub tx_accepted: usize,
@@ -563,9 +562,8 @@ impl Stack {
     /// the current time so the next turn processes or frees it.
     /// It does not cover frames staged or pending in the Stack. When the last
     /// `turn` or `receive` reported `rx_staged > 0`, call it again promptly:
-    /// either the ingress budget ran out, or no reply capacity was free. In the
-    /// latter case, as when a call reported `tx_pending > 0`, the next call
-    /// progresses only once the PMD accepts frames or frees TX packets: retry
+    /// the ingress budget ran out. When a call reported `tx_pending > 0`, the next
+    /// call progresses only once the PMD accepts frames or frees TX packets: retry
     /// on the caller's own bounded cadence, independent of this deadline. Pending frames leave through `flush`, or the flush inside
     /// `turn`, `receive` or `send`. When a call reported `tx_pending > 0`, call
     /// `flush` until nothing is pending, then `send`: `send` runs egress before
@@ -658,9 +656,8 @@ impl Stack {
     /// and size checks (`NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`),
     /// `WouldBlock` for an empty frame pool, the neighbor lookup (`NoRoute`,
     /// `NeighborPending`), then `WouldBlock` for a full pending queue: flush, then retry.
-    /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue
-    /// also blocks ingress (packets stay in `Turn::rx_staged`) if the PMD refuses its frames;
-    /// `receive` and `turn` flush first but can remain blocked if TX cannot progress.
+    /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue does
+    /// not block ingress; replies that find no room are dropped.
     /// A send loop must call `receive` or `turn` to take ARP replies and advance time.
     pub fn udp_send(
         &mut self,

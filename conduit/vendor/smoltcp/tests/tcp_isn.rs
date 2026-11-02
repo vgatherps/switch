@@ -61,7 +61,7 @@ fn add_socket(sockets: &mut TcpSet<'static>) -> SocketHandle {
 }
 
 fn take_syn(device: &mut Loopback) -> u32 {
-    let frame = device.receive(Instant::ZERO).unwrap().0.into_buf();
+    let frame = device.receive(Instant::ZERO).unwrap().into_buf();
     let ethernet = EthernetFrame::new_checked(frame.as_slice()).unwrap();
     assert_eq!(ethernet.ethertype(), EthernetProtocol::Ipv4);
     let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();

@@ -352,8 +352,9 @@ TCP socket visit while other sockets have frames ready; a socket alone keeps sen
 `neighbor_capacity`, `rx_staging`, and `tx_pending` must be positive.
 `rx_staging: usize` and `tx_pending: usize` set fixed-capacity device queues (`VecDeque::with_capacity`,
 so actual capacity can exceed the request). RX bursts fill available staging space. TCP-built
-frames and UDP sends share the pending TX FIFO. A full pending queue blocks ingress, so size it for
-both traffic directions. `Stack::new(port, config, now)` consumes the Port on success. On failure it
+frames and UDP sends share the pending TX FIFO. A full pending queue never blocks ingress: a reply
+(ACK, ARP, ICMP echo, RST) that finds no pending slot or TX packet is dropped, and a TCP socket
+whose ACK was dropped sends it on its next egress. Size the queue for both traffic directions. `Stack::new(port, config, now)` consumes the Port on success. On failure it
 returns `(Port, StackError)`. Invalid configuration or negative start time gives `InvalidConfig`;
 IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` from the path table,
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
@@ -445,8 +446,8 @@ after reporting acceptance. The Stack holds at most `tx_pending` more; built fra
 reservation, and one full-frame spare share those slots. No cache slack is needed because this
 lcore is the only allocator. `Stack::new` refuses a smaller pool with `TxPoolTooSmall`. Test PMDs
 such as `net_ring` ignore the descriptor count and queue sent mbufs into an attached ring, whose
-capacity bounds retention. Ingress needs a TX packet before processing each RX frame, even one that
-needs no reply, so an empty TX pool blocks receive too. Add room for PMD-specific allocations such
+capacity bounds retention. Ingress takes a TX packet only for a reply, so an empty TX pool drops
+replies but never blocks receive. Add room for PMD-specific allocations such
 as the `net_tap` checksum header copy.
 
 `Stack::tx_frame() -> Option<TxFrame>` takes an empty frame from the frame pool: its payload starts
@@ -569,9 +570,7 @@ staged RX frames, pending TX frames, or packet arrivals, so never wait on it ind
 binance-feed's tap demo caps its idle wait at 1 ms; a busy-poll application (`zhida-nic feed`)
 calls again immediately.
 
-If `rx_staged > 0`, call ingress again promptly: either the ingress budget ran out, or processing
-needs a pending slot and a TX packet, in which case flush and retry as the PMD accepts frames or
-returns TX buffers.
+If `rx_staged > 0`, call ingress again promptly: the ingress budget ran out.
 If a call reported `tx_pending > 0`, call `flush` until nothing is pending, then `send`,
 independently of `poll_at`. `send` runs egress before its flush, so with the pending queue full it
 only flushes. A TCP sender refused by the full queue stays due and is served first on retry; a
@@ -967,7 +966,7 @@ reports stamps when `rx_timestamps` is enabled in the config.
 | `rx_received` | `usize` | Packets accepted into staging by this call's RX burst. |
 | `rx_rejected` | `usize` | RX mbufs released by the Port: unsupported, or a BAD IPv4-header checksum verdict. |
 | `rx_processed` | `usize` | Staged packets handed to smoltcp in this call. |
-| `rx_staged` | `usize` | Packets left staged after ingress: budget ran out or no reply capacity. |
+| `rx_staged` | `usize` | Packets left staged after ingress: the budget ran out. |
 | `tx_accepted` | `usize` | Frames accepted by the PMD across this call's flushes. |
 | `tx_pending` | `usize` | Frames pending after this call. |
 

@@ -1009,8 +1009,7 @@ impl Port {
     /// for the negotiated TX descriptor count and its reservations. That
     /// descriptor bound holds for NIC PMDs. Test PMDs such as net_ring queue
     /// sent mbufs into an attached ring, ignore the descriptor count and are
-    /// bounded by the ring's capacity instead. An empty TX pool also blocks
-    /// receive, because Device::receive takes a TX reservation first.
+    /// bounded by the ring's capacity instead.
     /// A Port that is not ready (retained after a failed open or
     /// a refused close) allocates from its pool but never calls the cleanup:
     /// its queue may not exist.

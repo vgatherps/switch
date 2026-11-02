@@ -277,7 +277,7 @@ mod stale_neighbors {
             self.inner.capabilities()
         }
 
-        fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        fn receive(&mut self, now: Instant) -> Option<Self::RxToken<'_>> {
             self.inner.receive(now)
         }
 
@@ -1111,13 +1111,8 @@ fn ingress_takes_each_frame_once_via_into_buf() {
             self.inner.capabilities()
         }
 
-        fn receive(
-            &mut self,
-            timestamp: Instant,
-        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            let rx = self.queue.pop_front()?;
-            let tx = self.inner.transmit(timestamp).unwrap();
-            Some((rx, tx))
+        fn receive(&mut self, _timestamp: Instant) -> Option<Self::RxToken<'_>> {
+            self.queue.pop_front()
         }
 
         fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {

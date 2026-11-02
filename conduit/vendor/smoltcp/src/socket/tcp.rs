@@ -1690,30 +1690,14 @@ impl<'a> Socket<'a> {
         blocks
     }
 
-    /// Builds a pure-ACK (or SACK) reply to `repr` and advances the socket's
-    /// idea of what it has acknowledged.
-    ///
-    /// `remote_last_ack`/`remote_last_win_bytes` are only advanced when `cx` can
-    /// currently resolve a next hop for the reply's destination. Interface
-    /// dispatch for this synchronous ingress-triggered reply has no
-    /// confirmed-send callback (unlike the queued egress path, which updates
-    /// these fields only after `TxToken::consume` runs, see `dispatch`
-    /// below): without this check, dispatch_ip's neighbor-missing drop (an
-    /// immediate `Err` before any transmit, whenever the peer isn't already
-    /// in the neighbor cache: a connection's first reply before ARP
-    /// resolves, or any later reply after the entry was evicted for
-    /// capacity) still left the socket believing it ACKed data it never put
-    /// on the wire. A TxToken still failing after this check, or the
-    /// neighbor expiring in the race window between the check and the
-    /// actual send, isn't covered. Nor is retry: a dropped reply whose
-    /// ack_number/window_len don't move the needle (a challenge ACK or an
-    /// out-of-order FIN ack) leaves nothing for
-    /// `ack_to_transmit` to notice later, so it isn't resent until some
-    /// other segment arrives; that's unchanged from before this gate, since
-    /// smoltcp has no general pending-reply retry queue for this path.
+    /// Builds a pure-ACK (or SACK) reply to `repr`. The socket records what it acknowledged
+    /// only once the interface reports the reply sent (`reply_sent`), as egress dispatch does
+    /// after `TxToken::consume`; a reply dropped for lack of TX room or a neighbor
+    /// (`reply_dropped`) leaves the cumulative ACK owed, so the next egress sends it. A dropped
+    /// reply whose ack number and window don't move (a duplicate ACK, D-SACK or challenge ACK)
+    /// leaves nothing owed; the peer's next segment brings another.
     fn ack_reply(
         &mut self,
-        cx: &mut Context,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
         dsack: Option<(TcpSeqNumber, TcpSeqNumber)>,
@@ -1732,11 +1716,6 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
 
-        if cx.has_neighbor(&ip_reply_repr.dst_addr()) {
-            self.remote_last_ack = reply_repr.ack_number;
-            self.remote_last_ack_is_marker = false;
-            self.remote_last_win_bytes = u32::from(reply_repr.window_len) << self.remote_win_shift;
-        }
         // This reply carries our ACK but leaves the delayed-ACK timer alone; only egress
         // dispatch resets it. If the timer was Immediate, the next small in-order segment is
         // ACKed at once instead of after the delay: at most one early pure ACK. Accepted, since
@@ -1749,6 +1728,22 @@ impl<'a> Socket<'a> {
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
         (ip_reply_repr, reply_repr)
+    }
+
+    /// The interface sent `reply`, an ingress reply this socket returned from `process`. A
+    /// pure ACK records what it acknowledged and advertised; an RST records nothing.
+    pub(crate) fn reply_sent(&mut self, reply: &TcpRepr) {
+        if reply.control == TcpControl::None {
+            self.remote_last_ack = reply.ack_number;
+            self.remote_last_ack_is_marker = false;
+            self.remote_last_win_bytes = u32::from(reply.window_len) << self.remote_win_shift;
+        }
+    }
+
+    /// The interface dropped this socket's ingress reply (no TX room, or no neighbor yet).
+    /// The ACK stays owed and is due now, so the next egress sends it.
+    pub(crate) fn reply_dropped(&mut self) {
+        self.set_ack_delay_timer(AckDelayTimer::Immediate);
     }
 
     fn challenge_ack_allowed(&mut self, cx: &mut Context) -> bool {
@@ -1771,7 +1766,7 @@ impl<'a> Socket<'a> {
             return None;
         }
 
-        Some(self.ack_reply(cx, ip_repr, repr, None))
+        Some(self.ack_reply(ip_repr, repr, None))
     }
 
     fn out_of_window_reply(
@@ -1793,7 +1788,7 @@ impl<'a> Socket<'a> {
                 && self.state != State::TimeWait
                 && end <= self.next_receive_seq())
                 .then_some((repr.seq_number, end));
-            return Some(self.ack_reply(cx, ip_repr, repr, dsack));
+            return Some(self.ack_reply(ip_repr, repr, dsack));
         }
 
         self.challenge_ack_reply(cx, ip_repr, repr)
@@ -1910,7 +1905,7 @@ impl<'a> Socket<'a> {
 
         if matches!(repr.control, TcpControl::Syn | TcpControl::SynFin) {
             if self.time_wait_accepts_syn(repr) {
-                return Some(self.ack_reply(cx, ip_repr, repr, None));
+                return Some(self.ack_reply(ip_repr, repr, None));
             }
             match self.state {
                 State::TimeWait => {
@@ -2676,7 +2671,7 @@ impl<'a> Socket<'a> {
         if payload_len == 0 {
             self.truncate_at_fin(fin_offset);
             return if refused || out_of_order_fin {
-                Some(self.ack_reply(cx, ip_repr, repr, None))
+                Some(self.ack_reply(ip_repr, repr, None))
             } else {
                 None
             };
@@ -2759,7 +2754,7 @@ impl<'a> Socket<'a> {
             // This is fine because smoltcp assumes that it can always transmit zero or one
             // packets for every packet it receives.
             tcp_trace!("ACKing incoming segment");
-            Some(self.ack_reply(cx, ip_repr, repr, dsack))
+            Some(self.ack_reply(ip_repr, repr, dsack))
         } else {
             None
         }
@@ -3760,8 +3755,25 @@ mod test {
         )
     }
 
+    /// Delivers `repr` carrying `frame`'s bytes; the interface sent any reply.
     #[track_caller]
     fn send_frame(
+        socket: &mut TestSocket,
+        timestamp: Instant,
+        repr: &TcpRepr,
+        frame: RxBuf,
+    ) -> Option<TcpRepr<'static>> {
+        let reply = deliver(socket, timestamp, repr, frame);
+        if let Some(reply) = &reply {
+            socket.socket.reply_sent(reply);
+        }
+        reply
+    }
+
+    /// Delivers `repr` carrying `frame`'s bytes and returns the reply without reporting it
+    /// sent or dropped; the caller does, as the interface would.
+    #[track_caller]
+    fn deliver(
         socket: &mut TestSocket,
         timestamp: Instant,
         repr: &TcpRepr,
@@ -3788,13 +3800,10 @@ mod test {
         if let Some(pending) = pending {
             socket.socket.commit_rx(frame, pending);
         }
-        match reply {
-            Some((_ip_repr, repr)) => {
-                net_trace!("recv: {}", repr);
-                Some(repr)
-            }
-            None => None,
-        }
+        reply.map(|(_ip_repr, repr)| {
+            net_trace!("recv: {}", repr);
+            repr
+        })
     }
 
     #[track_caller]
@@ -3951,7 +3960,7 @@ mod test {
             }
         }
 
-        fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        fn receive(&mut self, now: Instant) -> Option<Self::RxToken<'_>> {
             self.0.receive(now)
         }
 
@@ -13507,43 +13516,30 @@ mod test {
         }
     }
 
-    /// `REMOTE_ADDR` is on-link but nothing resolved its hardware address
-    /// (the interface's neighbor cache starts empty), so an immediate reply
-    /// built by `ack_reply` can never actually be dispatched here.
+    /// An immediate ACK the interface could not send (no TX room, or no neighbor) leaves the
+    /// socket's record of what it acknowledged alone, and the next egress sends that ACK.
     #[test]
-    fn test_immediate_ack_reply_does_not_commit_state_without_a_resolvable_neighbor() {
+    fn dropped_ingress_ack_is_sent_by_next_egress() {
         let mut s = socket_established();
-        let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ethernet);
-        s.cx = iface.inner;
-
         // Open a hole so the next, gap-filling segment takes the immediate
-        // "ACKing incoming segment" path in `process` (store had
-        // out-of-order data), the same path a RFC 5961 challenge ACK or an
-        // out-of-order FIN uses.
+        // "ACKing incoming segment" path in `process`.
         send(
             &mut s,
-            Instant::from_millis(0),
+            Instant::ZERO,
             &SEND_TEMPL.seq(REMOTE_SEQ + 1 + 3).ack(LOCAL_SEQ + 1).data(&b"def"[..]),
         );
-
         let before_ack = s.remote_last_ack;
         let before_win = s.remote_last_win_bytes;
         assert_eq!(before_ack, Some(REMOTE_SEQ + 1));
 
-        let reply = send(
-            &mut s,
-            Instant::from_millis(0),
-            &SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..]),
-        );
-        // The would-be reply is still computed correctly...
-        assert_eq!(
-            reply,
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(64))
-        );
-        // ...but since it can't be dispatched (no resolved neighbor), the
-        // socket must not believe it already ACKed the 6 bytes.
+        let segment = SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..]);
+        let reply = deliver(&mut s, Instant::ZERO, &segment, RxBuf::from_vec(b"abcdef".to_vec()));
+        let ack = RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(64);
+        assert_eq!(reply, Some(ack));
+        s.socket.reply_dropped();
         assert_eq!(s.remote_last_ack, before_ack);
         assert_eq!(s.remote_last_win_bytes, before_win);
+        recv!(s, [ack]);
     }
 
     #[test]

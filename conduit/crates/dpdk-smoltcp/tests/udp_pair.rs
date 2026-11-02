@@ -255,7 +255,7 @@ fn first_send_arps_then_succeeds() {
 }
 
 #[zhida_test_support::pinned_test]
-fn pending_full_would_block_and_blocks_rx_until_flush() {
+fn pending_full_would_block_but_still_receives() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair_with_tx_pool(eal, ["udppfa", "udppfb"], 255);
         resolve(&mut pair, &handles[0]);
@@ -283,10 +283,11 @@ fn pending_full_would_block_and_blocks_rx_until_flush() {
         let turn = pair.a.receive(pair::T0, BURST).unwrap();
         assert_eq!(
             (turn.rx_received, turn.rx_processed, turn.rx_staged),
-            (1, 0, 1)
+            (1, 1, 0)
         );
         assert_eq!(turn.tx_accepted, 0);
         assert_eq!(turn.tx_pending, BURST);
+        recv(&mut pair.a, &handles[0], endpoint(Side::B), b"incoming");
         assert_eq!(pair.a.flush().unwrap().tx_accepted, 0);
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 127);
         assert_eq!(pair.a.flush().unwrap().tx_accepted, BURST);
@@ -294,12 +295,7 @@ fn pending_full_would_block_and_blocks_rx_until_flush() {
         pair.a
             .udp_send(&handles[0], Some(endpoint(Side::B)), b"retry")
             .unwrap();
-        let turn = pair.a.receive(pair::T0, BURST).unwrap();
-        assert_eq!(turn.rx_processed, 1);
-        assert_eq!(turn.tx_accepted, 1);
-        assert_eq!(turn.tx_pending, 0);
-        recv(&mut pair.a, &handles[0], endpoint(Side::B), b"incoming");
-        assert_eq!(pair.a.flush().unwrap().tx_accepted, 0);
+        assert_eq!(pair.a.flush().unwrap().tx_accepted, 1);
         assert_eq!(
             pair.drain_tx(Side::A, |frame| {
                 let packet = ip(frame);

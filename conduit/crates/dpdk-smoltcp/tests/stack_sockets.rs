@@ -840,17 +840,16 @@ fn reset_remove_unwind_return_once() {
                 assert!(fixture.take_tx().is_empty());
                 assert_eq!(stack.tcp(&handle).state(), State::Closed);
                 assert_eq!(stack.tcp(&handle).recv_queue(), 6);
-                // The RST needs no reply: its unused TX packet stays as the
-                // Device's spare until `into_port`.
-                assert_eq!(fixture.in_use(), (3, 1));
+                // The RST needs no reply, so it took no TX packet.
+                assert_eq!(fixture.in_use(), (3, 0));
                 let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
                 assert_eq!(bytes.len(), 6);
                 assert_eq!(&bytes, b"abcdef");
-                assert_eq!(fixture.in_use(), (1, 1));
+                assert_eq!(fixture.in_use(), (1, 0));
                 stack.remove_tcp(handle);
-                assert_eq!(fixture.in_use(), (0, 1));
+                assert_eq!(fixture.in_use(), (0, 0));
                 exhaust_and_reallocate_rx_pool(&fixture);
-                assert_eq!(fixture.in_use(), (0, 1));
+                assert_eq!(fixture.in_use(), (0, 0));
             }
             let port = stack.into_port();
             assert_eq!(fixture.in_use(), (0, 0));
