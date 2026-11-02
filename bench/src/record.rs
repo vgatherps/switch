@@ -27,6 +27,8 @@ pub struct Recorder {
     pub service_rtt: Histogram,
     /// Monotonic ns of this step's latest first echo of a message.
     pub last_echo_ns: Option<u64>,
+    /// This step's messages echoed (first echo, warmup included), whenever they arrived.
+    pub echoed: u64,
 }
 
 impl Recorder {
@@ -53,6 +55,7 @@ impl Recorder {
             window,
             service_rtt: Histogram::new(),
             last_echo_ns: None,
+            echoed: 0,
         }
     }
 
@@ -75,6 +78,7 @@ impl Recorder {
         }
         self.seen[word] |= mask;
         self.last_echo_ns = Some(now_ns);
+        self.echoed += 1;
         self.received_in_window += u64::from((self.window[0]..self.window[1]).contains(&now_ns));
         if k < self.measured_from {
             return;

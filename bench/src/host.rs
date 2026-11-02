@@ -115,6 +115,17 @@ impl Host {
         }
     }
 
+    /// The port's (transmitted, received) packet counts so far (`rte_eth_stats_get`).
+    pub(crate) fn packets(&self) -> Result<(u64, u64), String> {
+        // SAFETY: the port stays open while the Host lives; `stats` is a writable output.
+        let mut stats: zhida_dpdk_sys::rte_eth_stats = unsafe { std::mem::zeroed() };
+        let rc = unsafe { zhida_dpdk_sys::rte_eth_stats_get(self.port_id, &mut stats) };
+        if rc != 0 {
+            return Err(format!("rte_eth_stats_get: {rc}"));
+        }
+        Ok((stats.opackets, stats.ipackets))
+    }
+
     /// One busy-poll round: receive at microsecond resolution, poll tasks at the same sampled
     /// time in nanoseconds, then send what they wrote; never sleeps.
     #[inline]

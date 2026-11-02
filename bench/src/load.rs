@@ -137,6 +137,16 @@ pub struct StepResult {
     /// message of this step; `None`: none.
     pub last_send_ns: Option<u64>,
     pub last_echo_ns: Option<u64>,
+    /// Messages sent, and of those echoed (first echo, by the end of the drain), over the whole
+    /// step, warmup included.
+    pub sent: u64,
+    pub echoed: u64,
+    /// Packets this worker's port transmitted and received from receiving the step's command to
+    /// the end of its drain, the same span as `sent`/`echoed` (every packet on the port:
+    /// messages, echoes, ACKs, ARP, retransmits). Read outside the window: on ENA each read is
+    /// an admin command that sleeps at least 100 µs.
+    pub tx_packets: u64,
+    pub rx_packets: u64,
 }
 
 /// What the send task leaves for the loop once it has sent the whole step or been cut off.
@@ -148,6 +158,7 @@ struct Sent {
     stops: u64,
     /// Monotonic ns of the last send.
     last_ns: Option<u64>,
+    sent: u64,
 }
 
 /// The senders' send halves (ws: the upgraded connections' TCP halves).
@@ -512,6 +523,7 @@ impl Worker {
         let end = schedule.count_before(window[1]);
         *self.recorder.borrow_mut() =
             Some(Recorder::new(c.step, schedule, measured_from, end, window));
+        let (tx_before, rx_before) = host.packets()?;
         let sent: Rc<RefCell<Option<Sent>>> = Rc::default();
         let task = send_step(
             SendStep {
@@ -541,6 +553,12 @@ impl Worker {
                 break;
             }
         }
+        let (tx_after, rx_after) = host.packets()?;
+        let (Some(tx_packets), Some(rx_packets)) =
+            (tx_after.checked_sub(tx_before), rx_after.checked_sub(rx_before))
+        else {
+            return Err("port packet counters went backwards during the step".into());
+        };
         let r = self.recorder.borrow_mut().take().expect("set above");
         let s = sent.borrow_mut().take().expect("checked above");
         Ok(StepResult {
@@ -558,6 +576,10 @@ impl Worker {
             stops: s.stops,
             last_send_ns: s.last_ns.map(|t| t.saturating_sub(origin)),
             last_echo_ns: r.last_echo_ns.map(|t| t.saturating_sub(origin)),
+            sent: s.sent,
+            echoed: r.echoed,
+            tx_packets,
+            rx_packets,
         })
     }
 }
@@ -620,6 +642,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
         budget_waits: 0,
         stops: 0,
         last_ns: None,
+        sent: 0,
     };
     // per sender, the last message refused for its budget (each counts once however often
     // it is retried)
@@ -673,6 +696,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
                 let now = clock.now_ns();
                 out.in_window += u64::from((window[0]..window[1]).contains(&now));
                 out.last_ns = Some(now);
+                out.sent += 1;
                 if let Some(c) = conn {
                     c.in_flight.borrow_mut().push_back(now);
                 }

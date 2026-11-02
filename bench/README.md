@@ -12,8 +12,14 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   percentiles are never averaged). Prints one `step` JSON line per rate (`offered_pps`, `sent_pps` /
   `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`,
   `service_rtt_ns` (echo time - actual send time) and `send_lag_ns` (actual - scheduled send time of
-  fresh sends) with the same quantiles, and `workers`: per worker `backlog_at_end`, `stops`, and
-  `last_send_ns` / `last_echo_ns` after its step start).
+  fresh sends) with the same quantiles, `sent` / `echoed` (messages sent, and of those echoed by the end
+  of the drain, over the whole step, warmup included), `gen_tx_packets` / `gen_rx_packets` (packets the
+  generators' own NICs sent and received over the same span: read when a worker gets the step command and
+  after its drain, never inside the window, because on ENA each read is an admin command that sleeps at
+  least 100 µs; each worker owns its port and the counts are summed; generator-side, not the receiver's),
+  and `workers`: per worker `behind_schedule`, `backlog_at_end`, `stops`, and `last_send_ns` /
+  `last_echo_ns` after its step start). The report shows `gen_tx_packets / sent` and
+  `gen_rx_packets / echoed`.
   `sent_pps` counts messages accepted by the generator stack, not NIC transmissions; `received_pps` counts
   echoes arriving within the window, including warmup echoes. Always prints one
   `summary` line (`steps`, `complete`, `generator_bound`, `behind_workers`, `error`). No knee is computed:

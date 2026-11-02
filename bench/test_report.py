@@ -95,7 +95,8 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(issues, [])
             self.assertTrue(md.startswith("# T"))
             self.assertIn("| not echoed % |", md)
-            self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - | - | - | - | - |", md)
+            self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - | - | - | - | - | - | - |", md)
+            self.assertIn("Packet counts are the generator NICs'", md.split("\n## ")[0])
             self.assertIn(f"Commit: `{source['commit']}`", md)
             self.assertIn(f"Archive SHA-256: `{source['archive_sha256']}`", md)
             self.assertTrue(os.path.exists(os.path.join(d, "udp-zhida.svg")))
@@ -103,6 +104,15 @@ class ReportTest(unittest.TestCase):
                 results = json.load(f)
                 self.assertEqual(results["source"], source)
             self.assertEqual(results["sweeps"][0]["summary"]["steps"], 2)
+
+    def test_packet_ratios_are_generator_nic_packets_per_message(self):
+        s = step(1000, 10_000)
+        s.update(sent=4000, echoed=3000, gen_tx_packets=5000, gen_rx_packets=9000)
+        t = report.table([s])
+        self.assertIn("| gen tx packets per sent message | gen rx packets per echo |", t)
+        self.assertIn("| 1.25 | 3.00 | - |", t)
+        s.update(sent=0, echoed=0)
+        self.assertIn("| - | - | - | - | - | - | - |", report.table([s]))
 
     def test_the_step_table_shows_service_rtt_and_send_lag(self):
         t = report.table([step(1000, 10_000, rtt_p99=8_000, lag_p99=600)])

@@ -65,6 +65,12 @@ def lat(step, key, field="latency_ns"):
     return None if q is None else q[key]
 
 
+def ratio(step, num, den):
+    """step[num] / step[den] to two decimals; '-' if either is missing or the denominator is 0."""
+    n, d = step.get(num), step.get(den)
+    return "-" if n is None or not d else f"{n / d:.2f}"
+
+
 def flags(step):
     out = []
     if step.get("generator_bound"):
@@ -79,15 +85,18 @@ def flags(step):
 def table(steps):
     rows = [
         "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs"
-        " | service RTT p50 µs | service RTT p99 µs | send lag p50 µs | send lag p99 µs | flags |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        " | service RTT p50 µs | service RTT p99 µs | send lag p50 µs | send lag p99 µs"
+        " | gen tx packets per sent message | gen rx packets per echo | flags |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for s in sorted(steps, key=lambda s: s["offered_pps"]):
         rows.append(
             f"| {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} | {100 * s['drop_fraction']:.3f} |"
             f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
             f" {us(lat(s, 'p50', 'service_rtt_ns'))} | {us(lat(s, 'p99', 'service_rtt_ns'))} |"
-            f" {us(lat(s, 'p50', 'send_lag_ns'))} | {us(lat(s, 'p99', 'send_lag_ns'))} | {flags(s)} |"
+            f" {us(lat(s, 'p50', 'send_lag_ns'))} | {us(lat(s, 'p99', 'send_lag_ns'))} |"
+            f" {ratio(s, 'gen_tx_packets', 'sent')} | {ratio(s, 'gen_rx_packets', 'echoed')} |"
+            f" {flags(s)} |"
         )
     return "\n".join(rows)
 
@@ -195,7 +204,11 @@ def build(directory, title):
     if issues:
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
                 *[f"- {i}" for i in issues], ""]
-    md = head + md + sections
+    packets = ["Packet counts are the generator NICs' (each generator's own port, read when it gets the step and"
+               " after its drain, over the same span as messages sent and echoed), not the receiver's: gen tx"
+               " packets per sent message is packets put on the wire per message; gen rx packets per echo counts"
+               " echo and ACK packets per echoed message.", ""]
+    md = head + packets + md + sections
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); not echoed % is"
            " measured messages not echoed by the end of the drain, never-sent ones included (sending stops at the end"
            " of the window); sent pps counts messages accepted by the generator stack, not NIC transmissions;"

@@ -98,6 +98,15 @@ pub struct StepReport {
     pub service_rtt_ns: Option<Quantiles>,
     /// Actual - scheduled send time of measured messages sent fresh off the schedule.
     pub send_lag_ns: Option<Quantiles>,
+    /// Messages sent, and of those echoed by the end of the drain, over the whole step (warmup
+    /// included), all workers.
+    pub sent: u64,
+    pub echoed: u64,
+    /// Packets the generators' ports sent and received over the same span (each worker's step
+    /// command to the end of its drain): counted at the generators' NICs, not the receiver's.
+    /// Each worker owns its port, so they are summed.
+    pub gen_tx_packets: u64,
+    pub gen_rx_packets: u64,
     /// Per worker, in worker order.
     pub workers: Vec<WorkerStep>,
 }
@@ -183,6 +192,10 @@ pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepRepor
         generator_bound: workers.iter().any(|w| w.behind_schedule),
         service_rtt_ns: Quantiles::of(&rtt),
         send_lag_ns: Quantiles::of(&lag),
+        sent: sum(|r| r.sent),
+        echoed: sum(|r| r.echoed),
+        gen_tx_packets: sum(|r| r.tx_packets),
+        gen_rx_packets: sum(|r| r.rx_packets),
         workers,
     })
 }
@@ -577,6 +590,10 @@ mod tests {
             stops: 0,
             last_send_ns: None,
             last_echo_ns: None,
+            sent: measured,
+            echoed: latencies.len() as u64,
+            tx_packets: 0,
+            rx_packets: 0,
         }
     }
 
@@ -812,8 +829,9 @@ mod tests {
         assert_eq!(lines[1]["complete"], true);
     }
 
-    /// The step line carries the merged service round trip and send lag quantiles, and each
-    /// worker's backlog, Stop count and last send and echo times.
+    /// The step line carries the merged service round trip and send lag quantiles, each
+    /// worker's backlog, Stop count and last send and echo times, and the messages sent and
+    /// packets counted at the generators' NICs, summed over the workers.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn step_line_carries_service_rtt_and_send_lag() {
@@ -824,8 +842,12 @@ mod tests {
         sample.stops = 3;
         sample.last_send_ns = Some(5_000_000);
         sample.last_echo_ns = Some(5_040_000);
+        sample.sent = 40;
+        sample.echoed = 35;
+        sample.tx_packets = 50;
+        sample.rx_packets = 70;
         let mut args = args();
-        args.gens = 1;
+        args.gens = 2;
         args.gen_cmd = fake_worker("step-line", &sample, 1);
         let (r, lines) = run_lines(&args);
         assert_eq!(r, Ok(()));
@@ -834,16 +856,18 @@ mod tests {
         let (p50, max) = q(&step["service_rtt_ns"]);
         assert!((40_000 - 40_000 / 128..=40_000).contains(&p50) && max == 40_000, "{step}");
         assert_eq!(q(&step["send_lag_ns"]), (300, 300));
-        assert_eq!(
-            step["workers"],
-            serde_json::json!([{
-                "behind_schedule": false,
-                "backlog_at_end": 0,
-                "stops": 3,
-                "last_send_ns": 5_000_000,
-                "last_echo_ns": 5_040_000,
-            }])
-        );
+        let worker = serde_json::json!({
+            "behind_schedule": false,
+            "backlog_at_end": 0,
+            "stops": 3,
+            "last_send_ns": 5_000_000,
+            "last_echo_ns": 5_040_000,
+        });
+        assert_eq!(step["workers"], serde_json::json!([worker, worker]));
+        assert_eq!(step["sent"], 80);
+        assert_eq!(step["echoed"], 70);
+        assert_eq!(step["gen_tx_packets"], 100);
+        assert_eq!(step["gen_rx_packets"], 140);
     }
 
     /// TCP/ws with a budget: no echo in the first step leaves no baseline, and the sweep fails
