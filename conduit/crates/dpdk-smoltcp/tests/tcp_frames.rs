@@ -465,18 +465,19 @@ fn ack_before_tx_completion_frees_on_drain() {
     });
 }
 
-/// Three frames sent while the TX ring has one free slot: the PMD takes the
-/// first, the other two stay pending.
+/// Three frames, each sent before the next is queued, while the TX ring has
+/// one free slot: the PMD takes the first, the other two stay pending.
 fn frames_in_ring_and_pending(eal: &dpdk_smoltcp::Eal, name: &str) -> (Host, Conn) {
     let mut host = Host::new(eal, name, 1, None);
     let conn = host.connect(LOCAL_PORT, small_socket());
     // The ring holds RING − 1; leave one slot.
     host.occupy_tx_ring(RING as usize - 2);
+    let mut accepted = 0;
     for payload in [b"one", b"two", b"six"] {
         host.send_frame(&conn, payload);
+        accepted += host.stack.send().unwrap().tx_accepted;
     }
-    let sent = host.stack.send().unwrap();
-    assert_eq!((sent.tx_accepted, sent.tx_pending), (1, 2));
+    assert_eq!((accepted, host.stack.flush().unwrap().tx_pending), (1, 2));
     assert_eq!(host.frame_in_use(), 3);
     (host, conn)
 }

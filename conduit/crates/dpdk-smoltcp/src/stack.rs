@@ -725,8 +725,9 @@ impl Stack {
     /// untouched: `Foreign` when it came from another Stack's `tx_frame`,
     /// `InvalidState` unless the socket may send, `Empty` for a zero-length
     /// frame, and `Full` when it exceeds the socket's free bytes or it has no
-    /// free frame slot (`frame_send_room`). Each frame takes one slot; one longer
-    /// than the segment payload is copied at send.
+    /// free frame slot (`frame_send_room`). A frame that fits whole into the unsent
+    /// tail frame within one segment is copied there and freed; any other takes a
+    /// slot, and one longer than the segment payload is copied at send.
     pub fn tcp_send_frame(
         &mut self,
         handle: &TcpHandle,

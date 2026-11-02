@@ -1373,8 +1373,10 @@ impl<'a> Socket<'a> {
         self.tx_queue.byte_room()
     }
 
-    /// Enqueue one owned frame as one send-queue entry. A frame longer than the
-    /// current segment payload is sent by copying, like `send_slice` data.
+    /// Enqueue one owned frame. A frame that fits whole into the unsent tail frame without
+    /// making it longer than one segment is copied there, so small writes share a segment;
+    /// otherwise the frame is its own send-queue entry. A frame longer than the current
+    /// segment payload is sent by copying, like `send_slice` data.
     pub fn send_frame(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
         if frame.origin() != self.tx_queue.source().origin() {
             return Err((frame, SendFrameError::Foreign));
@@ -1389,7 +1391,13 @@ impl<'a> Socket<'a> {
         if frame.len() > self.tx_queue.byte_room() {
             return Err((frame, SendFrameError::Full));
         }
-        self.tx_queue.push(frame.into_buf());
+        let sent = self.sent_payload_bytes();
+        let segment = self.max_segment_payload().unwrap_or(0);
+        if frame.len() <= self.tx_queue.tail_room(sent, segment) {
+            self.tx_queue.append_tail(sent, frame.payload(), segment);
+        } else {
+            self.tx_queue.push(frame.into_buf());
+        }
         Ok(())
     }
 
@@ -4907,19 +4915,38 @@ mod test {
         assert_eq!(emit_frame_segment(&mut s).2, b"cd");
     }
 
+    /// A frame queued after the tail was sent is its own entry: the window that reopens
+    /// takes it whole.
     #[test]
     fn frame_window_reopens_across_frames() {
         let source = crate::tests::tx_test_source(8);
         let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
-        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
         s.remote_win_len = 2;
-        assert_eq!(emit_frame_segment(&mut s).2, b"ab");
+        assert_eq!(emit_frame_segment(&mut s), (TcpControl::Psh, LOCAL_SEQ + 1, b"ab".to_vec(), true));
+        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
         ack_frame_bytes(&mut s, 2);
         s.remote_win_len = 4;
         let (_, _, payload, whole) = emit_frame_segment(&mut s);
         assert_eq!(payload, b"cd");
         assert!(whole);
+    }
+
+    /// Small frames queued with nothing sent in between share one segment: each is copied into
+    /// the unsent tail while the tail stays within a segment, and its own frame is freed. A
+    /// frame that would make the tail longer than a segment starts a new entry.
+    #[test]
+    fn small_frames_coalesce_into_one_segment() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(16, 8, source.clone());
+        for bytes in [&b"one"[..], b"two", b"xy"] {
+            assert!(s.send_frame(owned_frame(&source, bytes)).is_ok());
+        }
+        assert!(s.send_frame(owned_frame(&source, b"six")).is_ok());
+        let (_, seq, payload, _) = emit_frame_segment(&mut s);
+        assert_eq!((seq, payload), (LOCAL_SEQ + 1, b"onetwoxy".to_vec()));
+        let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!((seq, payload, whole), (LOCAL_SEQ + 9, b"six".to_vec(), true));
     }
 
     #[test]
