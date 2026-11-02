@@ -223,8 +223,7 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();
-            net.turn(clock.now()).expect("turn the Net");
-            rt.poll(clock.ms()).expect("poll the client");
+            switchnet::round(net, &mut rt, clock.now(), clock.ms()).expect("round");
             thread::sleep(ROUND_SLEEP);
         }
         let saw = peer.join();

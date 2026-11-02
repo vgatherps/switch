@@ -153,7 +153,7 @@ fn until_client_on<T: Send + 'static, H: 'static, F: Future<Output = H> + 'stati
     until_client_watching(tap, listener_setup, serve, client, |_| {})
 }
 
-/// `until_client_on`, calling `each_turn` with the Net after every turn (before the client is
+/// `until_client_on`, calling `each_turn` with the Net after every receive (before the client is
 /// polled in that round).
 fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     tap: &TapConfig,
@@ -172,9 +172,10 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
             each_turn(net);
             rt.poll(clock.ms()).expect("poll the client");
+            net.send().expect("send");
             std::thread::sleep(ROUND_SLEEP);
         }
         let saw = peer.join();

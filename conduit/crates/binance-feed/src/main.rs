@@ -189,7 +189,8 @@ fn feed(
 ) -> Result<(), String> {
     let clock = Clock::new(start);
     loop {
-        net.turn(clock.now()).map_err(|error| format!("turn: {error}"))?;
+        net.receive(clock.now()).map_err(|error| format!("receive: {error}"))?;
+        net.send().map_err(|error| format!("send: {error}"))?;
         if stop() {
             return Err(format!("tester exited before {READY} existed"));
         }

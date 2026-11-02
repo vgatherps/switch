@@ -215,8 +215,7 @@ fn main() {
                 let task = bounded(rt.spawner(), handle.clone(), local_port, client_config(), slot);
                 rt.spawner().spawn(task).expect("spawn a connection");
             }
-            net.turn(clock.now()).expect("turn the Net");
-            rt.poll(clock.ms()).expect("poll the connections");
+            switchnet::round(net, &mut rt, clock.now(), clock.ms()).expect("round");
             if checked.elapsed() >= DONE_CHECK {
                 checked = Instant::now();
                 if dir.join("done").exists() {

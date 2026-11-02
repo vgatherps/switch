@@ -1,5 +1,5 @@
 //! Once a poll's tasks hand the Stack one `tx_burst` of frames, the poll ends before its next
-//! task (`switch::request_turn`); the Net turn then sends them, and the next poll goes on
+//! task (`switch::request_turn`); the Net's send then sends them, and the next poll goes on
 //! with the tasks left. Nothing to configure.
 
 use switchnet::{IpEndpoint, NetHandle, TxFrame};
@@ -19,7 +19,7 @@ async fn filled(handle: &NetHandle, data: &[u8]) -> TxFrame {
 }
 
 #[zhida_test_support::pinned_test]
-fn a_udp_burst_stops_the_poll_until_the_net_turns() {
+fn a_udp_burst_stops_the_poll_until_the_net_sends() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["urua", "urub"]);
         let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
@@ -41,8 +41,8 @@ fn a_udp_burst_stops_the_poll_until_the_net_turns() {
         let later = mixed.spawn(later);
         mixed.rt.poll(0).unwrap();
         assert!(writer.is_full());
-        assert_eq!(polls.get(), 0, "a task after the burst was polled before the Net turned");
-        mixed.net.turn(mixed.now).unwrap();
+        assert_eq!(polls.get(), 0, "a task after the burst was polled before the Net sent");
+        mixed.net.send().unwrap();
         assert_eq!(mixed.to_peer.forward(), TX_BURST);
         mixed.rt.poll(0).unwrap();
         assert_eq!(polls.get(), 1);
@@ -58,11 +58,11 @@ fn a_udp_burst_stops_the_poll_until_the_net_turns() {
 
 /// TCP frames count from `try_send`, before egress makes segments of them.
 #[zhida_test_support::pinned_test]
-fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
+fn a_tcp_burst_stops_the_poll_until_the_net_sends() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["urta", "urtb"]);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
-        mixed.net.turn(mixed.now).unwrap();
+        mixed.net.send().unwrap();
         let (rx, mut tx) = stream.split();
         let handle = mixed.handle();
         let writer = mixed.spawn(async move {
@@ -77,8 +77,8 @@ fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
         let later = mixed.spawn(later);
         mixed.rt.poll(0).unwrap();
         assert!(writer.is_full());
-        assert_eq!(polls.get(), 0, "a task after the burst was polled before the Net turned");
-        mixed.net.turn(mixed.now).unwrap();
+        assert_eq!(polls.get(), 0, "a task after the burst was polled before the Net sent");
+        mixed.net.send().unwrap();
         assert!(mixed.to_peer.forward() > 0);
         mixed.rt.poll(0).unwrap();
         assert_eq!(polls.get(), 1);
@@ -156,7 +156,7 @@ fn a_burst_sent_outside_any_task_does_not_stop_the_next_poll() {
         assert_eq!((first_polls.get(), second_polls.get()), (1, 1));
         first.take();
         second.take();
-        mixed.net.turn(mixed.now).unwrap();
+        mixed.net.send().unwrap();
         assert_eq!(mixed.to_peer.forward(), TX_BURST + 1);
         drop((ping, rx, tx, peer));
         mixed.close();

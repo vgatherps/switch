@@ -5,7 +5,7 @@
 Applications in this repo run on `switchnet`: a `Net` wraps the `Stack` and gives `switch` tasks
 async TCP and UDP sockets (`NetHandle::tcp_connect`, `tcp_accept`, `udp_bind`, `tx_frame`), and
 `relay` (WebSocket) and `sheath` (TLS 1.3) layer on its TCP streams. The loop that owns the
-thread calls `switchnet::round(net, rt, now, tick)`, one `Net::turn` and one `Runtime::poll`, and
+thread calls `switchnet::round(net, rt, now, tick)` (`Net::receive`, `Runtime::poll`, `Net::send`), and
 on a dedicated core calls it again at once: a sleep holds every packet that arrives during it
 (`zhida-nic feed` busy-polls through `binance_feed::run(.., None, ..)`). Sleep only when the core is
 shared, as the tap demos (binance-feed, relay-autobahn) do, 1 ms at most, with their tester

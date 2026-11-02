@@ -46,7 +46,7 @@ pub struct TapConfig {
 pub struct Clock(std::time::Instant);
 
 impl Clock {
-    /// For `Net::turn`.
+    /// For `Net::receive`.
     pub fn now(&self) -> Instant {
         Instant::from_micros(i64::try_from(self.0.elapsed().as_micros()).unwrap())
     }
@@ -255,8 +255,7 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
         while !(client_done() && peer.is_finished()) {
             assert!(clock.elapsed() < LIMIT, "client done {}, peer done {}", client_done(), peer.is_finished());
             peer.accept();
-            net.turn(clock.now()).expect("turn the Net");
-            rt.poll(clock.ms()).expect("poll the client");
+            crate::round(net, &mut rt, clock.now(), clock.ms()).expect("round");
             each_round();
             thread::sleep(ROUND_SLEEP);
         }

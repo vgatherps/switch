@@ -543,3 +543,35 @@ fn canceled_room_clears_its_parked_handle() {
         mixed.close();
     })
 }
+
+/// A task woken by a request replies in the round that polls it: the reply leaves in that
+/// round's send, not after the next round's receive.
+#[zhida_test_support::pinned_test]
+fn a_reply_queued_by_a_woken_task_leaves_in_the_same_round() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["rpla", "rplb"]);
+        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let handle = mixed.handle();
+        let replier = mixed.spawn(async move {
+            let (mut rx, mut tx) = stream.split();
+            let request = rx.recv().await.unwrap().payload().to_vec();
+            let reply = filled(&handle, &request).await;
+            tx.room(reply.len()).await.unwrap();
+            tx.try_send(reply).map_err(|(_, error)| error).unwrap();
+            (rx, tx)
+        });
+        mixed.rounds(4);
+        peer_send(&mut mixed, &peer, b"ping");
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        assert_eq!(mixed.to_net.forward(), 1);
+        mixed.turn();
+        assert!(replier.is_full());
+        mixed.to_peer.forward();
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        let mut got = Vec::new();
+        peer_drain(&mut mixed, &peer, &mut got);
+        assert_eq!(got, b"ping");
+        drop((replier.take(), peer));
+        mixed.close();
+    })
+}
