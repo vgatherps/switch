@@ -23,7 +23,7 @@ use crate::upgrade::{self, UpgradeError};
 
 /// Raw TCP sends nothing of its own and ends with FIN alone.
 impl PlainTx for SwitchTx {
-    const HAS_CLOSE_RECORD: bool = false;
+    const CLOSE_RECORD_LEN: Option<usize> = None;
 
     fn has_pending(&self) -> bool {
         false

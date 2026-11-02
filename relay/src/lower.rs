@@ -40,9 +40,9 @@ pub(crate) trait PlainRx {
 /// The send half below WebSocket: sheath's frame sender, plus the records the lower layer
 /// sends on its own.
 pub(crate) trait PlainTx: FrameTx {
-    /// `seal_close` makes a record (TLS close_notify); raw TCP ends with FIN alone, which
-    /// needs no frame.
-    const HAS_CLOSE_RECORD: bool;
+    /// The plaintext of the record `seal_close` makes (TLS close_notify), which its `room`
+    /// waits for; `None` for raw TCP, which ends with FIN alone and needs no frame.
+    const CLOSE_RECORD_LEN: Option<usize>;
     /// The lower layer has records to send on its own (TLS: an alert).
     fn has_pending(&self) -> bool;
     /// Write those records into `f`; `None`, dropping `f`, when there are none. Called only
@@ -88,7 +88,7 @@ impl<F: RxFrame, L: FrameTx> PlainRx for TlsRx<F, L> {
 }
 
 impl<L: FrameTx> PlainTx for TlsTx<L> {
-    const HAS_CLOSE_RECORD: bool = true;
+    const CLOSE_RECORD_LEN: Option<usize> = Some(sheath::CLOSE_NOTIFY_LEN);
 
     fn has_pending(&self) -> bool {
         TlsTx::has_pending(self)

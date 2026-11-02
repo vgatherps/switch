@@ -201,7 +201,7 @@ impl<const TLS: bool> FrameTx for MockTx<TLS> {
 }
 
 impl<const TLS: bool> PlainTx for MockTx<TLS> {
-    const HAS_CLOSE_RECORD: bool = TLS;
+    const CLOSE_RECORD_LEN: Option<usize> = if TLS { Some(CLOSE_RECORD.len()) } else { None };
 
     fn has_pending(&self) -> bool {
         TLS && !self.log.borrow().pending.is_empty()
@@ -630,10 +630,25 @@ fn refused_close_and_close_notify_complete_only_when_taken() {
     log.borrow_mut().refuse = 1;
     log.borrow_mut().room = Some(ROOM);
     assert!(ready(c.try_step()));
-    assert_eq!((c.end(), c.next_job()), (End::Notify, Job::Resend(ROOM)));
+    assert_eq!((c.end(), c.next_job()), (End::Notify, Job::Resend(CLOSE_RECORD.len())));
     assert_eq!(log.borrow().shutdowns, 0);
     log.borrow_mut().room = None;
     ready(c.finish());
+    assert_eq!(sent(&log).last().unwrap(), CLOSE_RECORD);
+    assert_eq!((c.end(), log.borrow().shutdowns), (End::Delivered, 1));
+}
+
+/// close_notify waits for room for itself, not for a full frame: once the echo of the peer's
+/// close took all room, exactly close_notify's bytes free let it go out, then FIN.
+#[test]
+fn close_notify_waits_only_for_its_own_length() {
+    let (mut c, log) = core(Role::Server, ROOM);
+    c.peer_close(&[0x03, 0xe8]);
+    log.borrow_mut().room = Some(4);
+    assert!(poll_n(c.finish(), 2).is_none());
+    assert_eq!((sent(&log).len(), c.end()), (1, End::Open));
+    log.borrow_mut().room = Some(CLOSE_RECORD.len());
+    assert!(poll_n(c.finish(), 2).is_some(), "close_notify waited for more room than its own");
     assert_eq!(sent(&log).last().unwrap(), CLOSE_RECORD);
     assert_eq!((c.end(), log.borrow().shutdowns), (End::Delivered, 1));
 }

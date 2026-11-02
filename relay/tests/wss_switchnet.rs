@@ -233,6 +233,21 @@ fn set_rcvbuf(listener: &TcpListener, size: libc::c_int) {
     assert_eq!(rc, 0, "set SO_RCVBUF");
 }
 
+/// TCP_MAXSEG of `mss` on `listener`: accepted connections advertise it in their SYN-ACK.
+fn set_maxseg(listener: &TcpListener, mss: libc::c_int) {
+    // SAFETY: a valid socket and an int option of the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            (&mss as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "set TCP_MAXSEG");
+}
+
 /// One masked client frame off `r`: the first byte (FIN and opcode) and the unmasked payload.
 fn read_frame(r: &mut impl Read) -> (u8, Vec<u8>) {
     let mut head = [0; 2];
@@ -1039,6 +1054,47 @@ fn largest_control_frames_fit_a_131_byte_send_buffer() {
     );
     assert_eq!(pong, (0x80 | 0xa, ping));
     assert_eq!(close, (0x80 | CLOSE, want_close));
+}
+
+/// The peer advertises an MSS of 88 B, below the largest control frame (131 B, 207 B with its
+/// TLS record): ws:// and wss:// still connect, a message of many segments echoes, and the
+/// close handshake completes. Frames are as large as the largest control frame; TCP cuts them.
+#[zhida_test_support::pinned_test]
+fn ws_and_wss_setup_succeed_with_a_small_peer_mss() {
+    let sent: Vec<u8> = (0..3000).map(|i| (i * 31 % 251) as u8).collect();
+    for tls in [false, true] {
+        let sent = sent.clone();
+        let echoed = run(
+            |listener| set_maxseg(listener, 88),
+            move |stream, config| {
+                if tls {
+                    echo(upgrade(StreamOwned::new(ServerConnection::new(config).unwrap(), stream)))
+                } else {
+                    echo(tungstenite::accept(stream).expect("server WebSocket handshake"))
+                }
+            },
+            move |handle, stream, config| async move {
+                if tls {
+                    let mut wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
+                    wss.send(Kind::Binary, &sent).await.expect("send");
+                    let m = wss.recv().await.expect("recv").expect("the echo");
+                    assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &sent[..]));
+                    close(&mut wss).await;
+                    (Some(wss), None)
+                } else {
+                    let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
+                    ws.send(Kind::Binary, &sent).await.expect("send");
+                    let m = ws.recv().await.expect("recv").expect("the echo");
+                    assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &sent[..]));
+                    ws.close(1000, "").await.expect("send close");
+                    assert!(ws.recv().await.expect("recv after close").is_none(), "data after close");
+                    (None, Some(ws))
+                }
+            },
+            || {},
+        );
+        assert_eq!(echoed, 1, "tls {tls}");
+    }
 }
 
 /// Every frame of the Net taken, so a frame wait cannot end by a frame returning.

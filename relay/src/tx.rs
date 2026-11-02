@@ -292,13 +292,13 @@ impl<L: PlainTx> TxCore<L> {
         }
     }
 
-    /// The transport ends with close_notify: TLS, unless a TLS failure (its alert ends it).
-    fn notify(&self) -> bool {
-        L::HAS_CLOSE_RECORD
-            && match &self.failed {
-                Some(Failure::Tls(_)) => false,
-                None | Some(Failure::Protocol(_) | Failure::PeerEof | Failure::Dead) => true,
-            }
+    /// The close_notify the transport ends with, as its plaintext length (what its room waits
+    /// for): TLS, unless a TLS failure (its alert ends it).
+    fn notify(&self) -> Option<usize> {
+        match &self.failed {
+            Some(Failure::Tls(_)) => None,
+            None | Some(Failure::Protocol(_) | Failure::PeerEof | Failure::Dead) => L::CLOSE_RECORD_LEN,
+        }
     }
 
     pub(crate) fn next_job(&self) -> Job {
@@ -324,13 +324,10 @@ impl<L: PlainTx> TxCore<L> {
             return Job::Frame(self.control_len(c), Work::Close);
         }
         match self.end {
-            End::Open if self.ending() => {
-                if self.notify() {
-                    Job::Frame(self.room(), Work::Notify)
-                } else {
-                    Job::Fin
-                }
-            }
+            End::Open if self.ending() => match self.notify() {
+                Some(len) => Job::Frame(len, Work::Notify),
+                None => Job::Fin,
+            },
             End::Open | End::Delivered | End::Dead => Job::Idle,
             End::Notify => Job::Fin,
             End::Fin => Job::Delivered,
