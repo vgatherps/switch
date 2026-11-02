@@ -271,6 +271,11 @@ check "verify accepts chrony with the PHC selected" has chrony "ok PHC selected"
 sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
 run verify
 check "chrony on NTP, PHC not selected, fails with the sources output" sh -c "grep -q '^chrony: FAIL the PHC is not the selected source' '$tmp/out' && grep -q '^\\^\\* 169.254.169.123' '$tmp/out'"
+# A host outside a precision-time placement group has no PHC device: NTP only is its normal state.
+mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
+run verify
+check "chrony on NTP without a PHC device verifies" sh -c "[ \$(cat '$tmp/status') = 0 ] && grep -q '^chrony: ok no PHC device' '$tmp/out'"
+mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
 cp "$tmp/sources-phc" "$root/sources"
 check "verify sees management on its kernel driver with the default route" has management "ok ens5 on ena with the default route"
 check "verify reports no run yet" has pools "ok no run logged yet"
@@ -293,6 +298,15 @@ check "the host config is left as discovered" grep -qx '  "rx_timestamps": false
 : >"$calls"
 FAKE_CHECK_LONG=1 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
 check "run-binance starts when check's summary outlives an early-exiting reader" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
+# The feed compares CLOCK_REALTIME with PHC stamps: without the PHC selected it refuses, although
+# verify passes (no PHC device).
+mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
+sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
+: >"$calls"
+HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "run-binance refuses without the PHC selected and says to use a precision-time placement group" sh -c "[ $? = 1 ] && grep -q 'precision-time placement group' '$tmp/out' && ! grep -q '^taskset' '$calls'"
+mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
+cp "$tmp/sources-phc" "$root/sources"
 # A config whose rx_timestamps line is not netconf's format cannot be turned on: refuse.
 cp "$root/etc/zhida/dut.json" "$tmp/dut"
 printf '{"version": 1, "rx_timestamps": false}\n' >"$root/etc/zhida/dut.json"

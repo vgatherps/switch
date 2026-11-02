@@ -601,9 +601,12 @@ verify() {
 
     # CLOCK_REALTIME, which the feed compares with NIC stamps, must follow the PHC refclock:
     # `chronyc sources` selects it (a `#*` PHC row).
+    # A host outside a precision-time placement group has no PHC device and runs on NTP only.
     sources=$(chronyc sources 2>&1)
     if printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
         report chrony ok "PHC selected"
+    elif [ ! -e "$R/dev/ptp_ena" ]; then
+        report chrony ok "no PHC device (/dev/ptp_ena): NTP only, not a precision-time host"
     else
         report chrony FAIL "the PHC is not the selected source; chronyc sources:"
         printf '%s\n' "$sources"

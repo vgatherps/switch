@@ -16,6 +16,11 @@ if ! "$here/hft-host.sh" verify; then
     echo "run-binance: hft-host.sh verify failed; fix the FAIL lines (sudo deploy/hft-host.sh apply)" >&2
     exit 1
 fi
+# The feed compares CLOCK_REALTIME with the NIC's PHC stamps: chrony must have the PHC selected.
+if ! sources=$(chronyc sources 2>&1) || ! grep -q '^#\* *PHC' <<<"$sources"; then
+    echo "run-binance: chrony does not have the PHC selected (chronyc sources); launch the instance in a precision-time placement group; not starting" >&2
+    exit 1
+fi
 # zhida-netconf writes pretty JSON, one field per line (its own test pins the format).
 sed 's/^  "rx_timestamps": false,$/  "rx_timestamps": true,/' "$dut" >"$config" || exit 1
 # Read the whole summary first: grep -q would close the pipe while check still writes.
