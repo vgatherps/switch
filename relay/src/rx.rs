@@ -13,13 +13,11 @@ pub enum Role {
     Server,
 }
 
-/// A connection's size limits. A received frame or message over its limit fails the connection
-/// (`MessageTooBig`/`FrameTooBig`, close code 1009); a send over `max_send` is refused. The
-/// receive buffer grows only with bytes received, up to `max_message`.
+/// A connection's size limits. A received message over its limit fails the connection
+/// (`MessageTooBig`, at the header of the frame that passes it); a send over `max_send` is
+/// refused. The receive buffer grows only with bytes received, up to `max_message`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// Largest frame payload accepted.
-    pub max_frame: usize,
     /// Largest message accepted.
     pub max_message: usize,
     /// Largest message sent.
@@ -27,9 +25,9 @@ pub struct Limits {
 }
 
 impl Default for Limits {
-    /// tungstenite's limits: frame 16 MiB, message 64 MiB (either way).
+    /// tungstenite's message limit, 64 MiB (either way).
     fn default() -> Limits {
-        Limits { max_frame: 16 << 20, max_message: 64 << 20, max_send: 64 << 20 }
+        Limits { max_message: 64 << 20, max_send: 64 << 20 }
     }
 }
 
@@ -51,7 +49,8 @@ pub enum Kind {
     Binary,
 }
 
-/// Why the connection failed. Each maps to the close code to send.
+/// Why the connection failed. No close frame is sent for it: the connection ends with FIN
+/// (after close_notify on TLS).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
     ReservedBits,
@@ -73,18 +72,7 @@ pub enum ProtocolError {
     /// A close payload of 1 byte.
     InvalidCloseLength,
     InvalidUtf8,
-    FrameTooBig,
     MessageTooBig,
-}
-
-impl ProtocolError {
-    pub fn close_code(self) -> u16 {
-        match self {
-            ProtocolError::InvalidUtf8 => 1007,
-            ProtocolError::FrameTooBig | ProtocolError::MessageTooBig => 1009,
-            _ => 1002,
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -249,7 +237,6 @@ pub(crate) fn grow(v: &mut Vec<u8>, additional: usize, max: usize) {
 
 struct Core {
     role: Role,
-    max_frame: usize,
     max_message: usize,
     stop: Option<Stop>,
     hdr: [u8; 14],
@@ -315,8 +302,8 @@ impl Core {
         if !h.minimal {
             return Err(ProtocolError::NonMinimalLength);
         }
-        if h.len > self.max_frame as u64 {
-            return Err(ProtocolError::FrameTooBig);
+        if h.len > self.max_message as u64 {
+            return Err(ProtocolError::MessageTooBig);
         }
         let len = h.len as usize;
         if self.role == Role::Server && h.mask.is_none() {
@@ -351,9 +338,6 @@ impl Core {
             Op::Text | Op::Binary => {
                 if self.msg.is_some() {
                     return Err(ProtocolError::ExpectedContinuation);
-                }
-                if len > self.max_message {
-                    return Err(ProtocolError::MessageTooBig);
                 }
                 Body::Undecided
             }
@@ -503,7 +487,6 @@ impl<R: PlainRx> WsRx<R> {
             lower,
             core: Core {
                 role: config.role,
-                max_frame: config.limits.max_frame,
                 max_message: config.limits.max_message,
                 stop: None,
                 hdr: [0; 14],
@@ -713,36 +696,5 @@ mod tests {
         assert!(rx.recv(&mut ()).unwrap().is_none());
         rx.push(F(frame(0x82, &[0xff])));
         assert_eq!(rx.recv(&mut ()).unwrap().unwrap().text(), None);
-    }
-
-    /// Doubling would pass `max_message`; capacity stops at it.
-    #[test]
-    fn scratch_capacity_never_exceeds_max_message() {
-        let cfg = Config::new(Role::Client, Limits { max_frame: 100, max_message: 1000, ..Limits::default() });
-        let mut rx = WsRx::new(Raw::new(), cfg);
-        // 10 fragments of 100 B: capacity 0 -> 100 -> 200 -> 400 -> 800 -> 1000 (doubling alone: 1600).
-        for i in 0..10 {
-            let b0 = match i {
-                0 => 2,
-                9 => 0x80,
-                _ => 0,
-            };
-            rx.push(F(frame(b0, &[i; 100])));
-            let got = rx.recv(&mut ()).unwrap().map(|m| m.bytes().len());
-            assert_eq!(got, (i == 9).then_some(1000));
-            assert!(rx.core.scratch.capacity() <= 1000, "{}", rx.core.scratch.capacity());
-        }
-
-        // One frame spanning two pushes: clamped too.
-        let cfg = Config::new(Role::Client, Limits { max_frame: 1000, max_message: 1000, ..Limits::default() });
-        let mut rx = WsRx::new(Raw::new(), cfg);
-        let mut wire = vec![0x82, 126];
-        wire.extend_from_slice(&1000u16.to_be_bytes());
-        wire.extend_from_slice(&[7; 1000]);
-        rx.push(F(wire[..10].to_vec()));
-        assert!(rx.recv(&mut ()).unwrap().is_none());
-        rx.push(F(wire[10..].to_vec()));
-        assert_eq!(rx.recv(&mut ()).unwrap().unwrap().bytes(), &[7; 1000][..]);
-        assert!(rx.core.scratch.capacity() <= 1000, "{}", rx.core.scratch.capacity());
     }
 }

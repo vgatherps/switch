@@ -1372,10 +1372,9 @@ fn peer_fin_then_reset_without_a_close_is_dead() {
     }
 }
 
-/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB (within the
-/// default `max_frame`), followed by one byte, fails the connection with `MessageTooBig`
-/// (close code 1009) at the header, and FIN goes out. (Before, the limit could not be set:
-/// every connection took 64 MiB messages.)
+/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB, followed by
+/// one byte, fails the connection with `MessageTooBig` at the header, and FIN goes out with no
+/// close frame.
 #[zhida_test_support::pinned_test]
 fn a_message_over_the_configured_limit_fails_at_its_header() {
     let limits = Limits { max_message: 1 << 20, ..Limits::default() };
@@ -1394,8 +1393,10 @@ fn a_message_over_the_configured_limit_fails_at_its_header() {
         move |handle, stream| async move {
             let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, limits).await.expect("ws connect");
             let got = ws.recv().await.map(|m| m.is_some());
-            let Err(WssError::Failed(relay::switchnet::Failure::Protocol(e))) = got else { panic!("{got:?}") };
-            assert_eq!((e, e.close_code()), (relay::ProtocolError::MessageTooBig, 1009));
+            assert!(
+                matches!(got, Err(WssError::Failed(relay::switchnet::Failure::Protocol(relay::ProtocolError::MessageTooBig)))),
+                "{got:?}"
+            );
             ws
         },
     );

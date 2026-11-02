@@ -63,22 +63,21 @@ fn header_rules_fail_at_the_header() {
 #[test]
 fn rules_check_in_tungstenite_order() {
     // Unknown opcode before size, size before mask, mask before reserved bits.
-    let small = Config::new(Role::Server, Limits { max_frame: 10, ..Limits::default() });
+    let small = Config::new(Role::Server, Limits { max_message: 10, ..Limits::default() });
     let run = feed(&mut WsRx::new(Raw::new(), small), &[header(0x70 | 3, None, 11)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::UnknownOpcode(3))));
     let run = feed(&mut WsRx::new(Raw::new(), small), &[header(0x70 | BINARY, None, 11)]);
-    assert_eq!(run.end, Some(WsError::Protocol(P::FrameTooBig)));
+    assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
     fails(Role::Server, &[header(0x70 | BINARY, None, 1)], P::UnmaskedFrame);
 }
 
+/// A message over `max_message` fails at the header that passes it: a single frame, or a
+/// continuation (8 + 4 fits exactly, 8 + 5 fails at the second header).
 #[test]
 fn size_limits() {
-    let cfg = Config::new(Role::Client, Limits { max_frame: 8, max_message: 12, ..Limits::default() });
-    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[header(fin(BINARY), None, 9)]);
-    assert_eq!(run.end, Some(WsError::Protocol(P::FrameTooBig)));
-    let run = feed(&mut WsRx::new(Raw::new(), Config::new(cfg.role, Limits { max_message: 7, ..cfg.limits })), &[header(fin(TEXT), None, 8)]);
+    let cfg = Config::new(Role::Client, Limits { max_message: 12, ..Limits::default() });
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[header(fin(TEXT), None, 13)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
-    // Fragments: 8 + 4 fits exactly, 8 + 5 fails at the second header.
     let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(BINARY, None, &[1; 8]), encode(fin(CONT), None, &[2; 4])]);
     assert_eq!(run.end, None);
     assert_eq!(run.msgs[0].payload.len(), 12);
@@ -87,12 +86,16 @@ fn size_limits() {
     assert_eq!(run.end_chunk, Some(1));
 }
 
+/// A message within `max_message` is delivered in a single frame of any size (20 MiB here).
 #[test]
-fn close_codes() {
-    assert_eq!(P::InvalidUtf8.close_code(), 1007);
-    assert_eq!(P::FrameTooBig.close_code(), 1009);
-    assert_eq!(P::MessageTooBig.close_code(), 1009);
-    assert_eq!(P::ReservedBits.close_code(), 1002);
+#[cfg_attr(miri, ignore)]
+fn one_frame_up_to_max_message_is_delivered() {
+    let len = 20 << 20;
+    let cfg = Config::new(Role::Client, Limits { max_message: len, ..Limits::default() });
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(fin(BINARY), None, &vec![7; len])]);
+    assert_eq!(run.end, None);
+    assert_eq!(run.msgs.len(), 1);
+    assert_eq!(run.msgs[0].payload.len(), len);
 }
 
 fn close(code: u16, reason: &[u8]) -> Vec<u8> {
