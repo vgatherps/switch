@@ -39,6 +39,7 @@ members = [
     "shared-memory",
     # junction (host control protocol and client session)
     "junction",
+    "junctiond",
     # vendored
     "vendor/slice_ringbuffer",
 ]
@@ -72,6 +73,7 @@ ceph-control = { path = "cephalopod/crates/control" }
 depot = { path = "depot" }
 dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
 junction = { path = "junction" }
+junctiond = { path = "junctiond" }
 relay = { path = "relay" }
 sheath = { path = "sheath" }
 shared-memory = { path = "shared-memory" }

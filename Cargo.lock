@@ -771,6 +771,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "junctiond"
+version = "0.1.0"
+dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
+ "dpdk-smoltcp",
+ "junction",
+ "zhida-test-kit",
+ "zhida-test-support",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
