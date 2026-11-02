@@ -322,7 +322,7 @@ impl Core {
                 if !h.fin {
                     return Err(ProtocolError::FragmentedControl);
                 }
-                if len > 125 {
+                if h.len > 125 {
                     return Err(ProtocolError::ControlTooBig);
                 }
                 self.ctrl.len = 0;
