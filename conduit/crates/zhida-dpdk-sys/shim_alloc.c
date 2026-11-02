@@ -135,9 +135,3 @@ zhida_pktmbuf_prepend_seg(struct rte_mbuf *head, uint16_t len) {
   h->next = head;
   return h;
 }
-
-// Compatibility wrapper
-__attribute__((nonnull(1))) struct rte_mbuf *
-zhida_pktmbuf_alloc(struct rte_mempool *mp) {
-  return rte_pktmbuf_alloc(mp);
-}

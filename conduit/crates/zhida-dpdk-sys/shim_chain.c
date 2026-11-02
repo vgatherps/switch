@@ -75,8 +75,3 @@ __attribute__((nonnull(1))) struct rte_mbuf *
 zhida_pktmbuf_lastseg(struct rte_mbuf *m) {
   return rte_pktmbuf_lastseg(m);
 }
-
-__attribute__((nonnull(1))) uint16_t
-zhida_mbuf_refcnt_update(struct rte_mbuf *m, int16_t delta) {
-  return rte_mbuf_refcnt_update(m, delta);
-}

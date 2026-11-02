@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use smoltcp::phy::{RxBuf, TxSource};
-use zhida_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
+use zhida_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError, PoolManager};
 use zhida_dpdk_sys::*;
 
-use crate::eal::{Eal, PoolResources};
+use crate::eal::Eal;
 use crate::rx_pool::rx_low_mark;
 
 /// Static properties and MAC address reported by a DPDK ethdev.
@@ -534,8 +534,8 @@ pub struct Port {
     descriptors: (u16, u16),
     /// Whether the RX pool is low; see `rx_pool_low`.
     rx_pressure: RxPressure,
-    rx: ManuallyDrop<PoolResources>,
-    tx: ManuallyDrop<PoolResources>,
+    rx: ManuallyDrop<PoolManager>,
+    tx: ManuallyDrop<PoolManager>,
     /// This Port's clone of the frame pool; other clones may outlive the Port.
     frame: ManuallyDrop<Rc<FramePool>>,
     /// The frame pool's mempool (every frame's `TxBuf::origin`), kept here so the publish
@@ -661,11 +661,11 @@ impl Port {
         if u64::from(config.frame_pool.data_room_size) < headroom + frame {
             return Err(PortError::InvalidSettings("frame pool room cannot hold the frame").into());
         }
-        let rx = PoolResources::new(config.rx_pool).map_err(|error| PortError::Pool {
+        let rx = PoolManager::new_production(config.rx_pool).map_err(|error| PortError::Pool {
             direction: "RX",
             error,
         })?;
-        let tx = PoolResources::new(config.tx_pool).map_err(|error| PortError::Pool {
+        let tx = PoolManager::new_production(config.tx_pool).map_err(|error| PortError::Pool {
             direction: "TX",
             error,
         })?;
@@ -794,7 +794,7 @@ impl Port {
                 rx_desc,
                 config.queue_socket as u32,
                 &rxconf,
-                self.rx.pool().pool(),
+                self.rx.pool(),
             ),
         )?;
         let mut rxq_info: rte_eth_rxq_info = std::mem::zeroed();
@@ -894,13 +894,13 @@ impl Port {
 
     pub(crate) fn rx_pool_count(&self) -> usize {
         // SAFETY: this Port owns the live RX pool; its object count is fixed.
-        usize::try_from(unsafe { (*self.rx.pool().pool()).size })
+        usize::try_from(unsafe { (*self.rx.pool()).size })
             .expect("RX pool count exceeds usize")
     }
 
     pub(crate) fn rx_pool_cache_size(&self) -> u32 {
         // SAFETY: this Port owns the live RX pool; its cache size is fixed.
-        unsafe { (*self.rx.pool().pool()).cache_size }
+        unsafe { (*self.rx.pool()).cache_size }
     }
 
     /// Packets requested from the PMD per RX burst at most: `PortConfig::rx_burst`.
@@ -923,12 +923,12 @@ impl Port {
     #[cold]
     #[inline(never)]
     fn read_rx_pool_low(&mut self) -> bool {
-        self.rx_pressure.read(self.rx.pool().free_count() as usize)
+        self.rx_pressure.read(self.rx.free_count() as usize)
     }
 
     pub(crate) fn tx_pool_count(&self) -> usize {
         // SAFETY: this Port owns the live TX pool; its object count is fixed.
-        usize::try_from(unsafe { (*self.tx.pool().pool()).size })
+        usize::try_from(unsafe { (*self.tx.pool()).size })
             .expect("TX pool count exceeds usize")
     }
 
@@ -1024,7 +1024,7 @@ impl Port {
         }
         // SAFETY (both allocations): a fresh production-pool mbuf: reset to one
         // direct segment, refcnt 1, `pkt_len == data_len == len`.
-        if let Some(mbuf) = self.tx.pool().alloc_with_len(len) {
+        if let Some(mbuf) = self.tx.alloc_with_len(len) {
             return Some(unsafe { Packet::from_restricted(mbuf) });
         }
         if !self.ready {
@@ -1040,7 +1040,7 @@ impl Port {
             "rte_eth_tx_done_cleanup(port {}, queue 0) failed: {code}",
             self.port_id
         );
-        let mbuf = self.tx.pool().alloc_with_len(len)?;
+        let mbuf = self.tx.alloc_with_len(len)?;
         Some(unsafe { Packet::from_restricted(mbuf) })
     }
 
@@ -1069,7 +1069,7 @@ impl Port {
         // `count` fits: the scratch length came from a u16.
         let received =
             unsafe { eth_rx_burst(self.port_id, 0, self.rx_scratch.as_mut_ptr(), count as u16) };
-        let pool = self.rx.pool().pool();
+        let pool = self.rx.pool();
         let mut rejected = 0;
         for &raw in &self.rx_scratch[..usize::from(received)] {
             if self.rx_checksum {
@@ -1167,8 +1167,8 @@ impl Port {
             }
         }
         let (rx, tx, frame) = (
-            self.rx.pool().in_use_count(),
-            self.tx.pool().in_use_count(),
+            self.rx.in_use_count(),
+            self.tx.in_use_count(),
             self.frame.in_use_count(),
         );
         if rx != 0 || tx != 0 || frame != 0 {

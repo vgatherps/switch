@@ -56,8 +56,6 @@ unsafe extern "C" {
         available: *mut std::ffi::c_uint,
     ) -> std::ffi::c_uint;
 
-    pub fn zhida_pktmbuf_alloc(mp: *mut rte_mempool) -> *mut rte_mbuf;
-
     /// Get the current thread's DPDK error number.
     pub fn zhida_errno() -> std::ffi::c_int;
 
@@ -126,9 +124,6 @@ unsafe extern "C" {
 
     /// Get last segment in chain.
     pub fn zhida_pktmbuf_lastseg(m: *mut rte_mbuf) -> *mut rte_mbuf;
-
-    /// Update refcount by delta. Returns new refcount.
-    pub fn zhida_mbuf_refcnt_update(m: *mut rte_mbuf, delta: i16) -> u16;
 
     /// Initialize all mbufs in pool with cache pointer.
     /// Call ONCE at pool creation to pre-set cache ptr in every mbuf's priv_data.
@@ -261,15 +256,6 @@ unsafe extern "C" {
     pub fn zhida_mempool_free_count(mp: *const rte_mempool, cache: *const rte_mempool_cache) -> u32;
 }
 
-/// Allocate an mbuf from a mempool.
-///
-/// # Safety
-/// `mp` must point to a live mempool; EAL must be initialized.
-#[inline]
-pub unsafe fn rte_pktmbuf_alloc(mp: *mut rte_mempool) -> *mut rte_mbuf {
-    zhida_pktmbuf_alloc(mp)
-}
-
 /// Free an mbuf back to its pool.
 ///
 /// # Safety
@@ -295,15 +281,6 @@ pub unsafe fn rte_pktmbuf_chain(head: *mut rte_mbuf, tail: *mut rte_mbuf) -> i32
 #[inline]
 pub unsafe fn rte_pktmbuf_lastseg(m: *mut rte_mbuf) -> *mut rte_mbuf {
     zhida_pktmbuf_lastseg(m)
-}
-
-/// Update refcount by delta. Returns new refcount.
-///
-/// # Safety
-/// `m` must point to a valid mbuf; the caller must account for the refcount change.
-#[inline]
-pub unsafe fn rte_mbuf_refcnt_update(m: *mut rte_mbuf, delta: i16) -> u16 {
-    zhida_mbuf_refcnt_update(m, delta)
 }
 
 /// Pure Rust inline methods for rte_mbuf.
