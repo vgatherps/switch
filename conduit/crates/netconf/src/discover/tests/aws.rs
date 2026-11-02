@@ -809,6 +809,41 @@ fn initial_discovery_refuses_a_config_that_appeared_since_load() {
     assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
 }
 
+/// Once the first discovery's config is linked into place, a temp name that cannot be removed
+/// (here an append-only directory: entries can be added, not removed) leaves the write a success
+/// with the config in place, not a failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn initial_discovery_succeeds_when_the_temp_name_cannot_be_removed() {
+    struct AppendOnly(std::ffi::CString);
+    impl AppendOnly {
+        fn set(dir: &std::path::Path, flags: libc::c_uint) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `dir` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::chflags(dir.as_ptr(), flags) }, 0);
+            Self(dir)
+        }
+    }
+    impl Drop for AppendOnly {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe { libc::chflags(self.0.as_ptr(), 0) };
+        }
+    }
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let dir = tree.dir.join("append-only");
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("config.json");
+    let _append_only = AppendOnly::set(&dir, libc::UF_APPEND);
+    crate::rediscover::write(&path, &discovered, None, &mut Vec::new()).unwrap();
+    assert_eq!(
+        crate::rediscover::load_existing(&path).unwrap(),
+        Some(discovered.config)
+    );
+}
+
 /// A rediscovery replaces the file whole (a new inode with the full new config and the old
 /// file's permissions), never truncates it in place, and leaves no temp file.
 #[test]
