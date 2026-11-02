@@ -99,6 +99,10 @@ impl Backing {
         Ok(())
     }
 
+    #[allow(
+        clippy::len_without_is_empty,
+        reason = "fallible size query; callers check exact sizes"
+    )]
     pub fn len(&self) -> io::Result<usize> {
         system::file_len(self.fd())
     }

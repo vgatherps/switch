@@ -51,6 +51,10 @@ impl Mapping {
     }
 
     #[inline]
+    #[allow(
+        clippy::len_without_is_empty,
+        reason = "construction rejects a zero length"
+    )]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -77,7 +81,7 @@ impl DoubleMapping {
     pub fn new(fd: BorrowedFd<'_>, offset: usize, len: usize, populate: bool) -> io::Result<Self> {
         let page = system::page_size(fd)?;
         let offset = checked_extent(fd, offset, len, page)?;
-        if len % page != 0 {
+        if !len.is_multiple_of(page) {
             return Err(system::invalid_input(
                 "double-mapping length is not page-aligned",
             ));
@@ -133,6 +137,10 @@ impl DoubleMapping {
     }
 
     #[inline]
+    #[allow(
+        clippy::len_without_is_empty,
+        reason = "construction rejects a zero length"
+    )]
     pub fn len(&self) -> usize {
         self.first.len
     }
@@ -211,7 +219,7 @@ fn checked_extent(
     len: usize,
     page: usize,
 ) -> io::Result<libc::off_t> {
-    if len == 0 || offset % page != 0 {
+    if len == 0 || !offset.is_multiple_of(page) {
         return Err(system::invalid_input(
             "mapping requires nonzero length and page-aligned offset",
         ));
