@@ -76,8 +76,9 @@ const ACK_LOSS_AFTER: usize = 256 * 1024;
 /// kernel's data with pure ACKs alone; 1.5 s is longer than Linux's minimum
 /// RTO, 200 ms (TCP_RTO_MIN), so Linux times out.
 const ACK_LOSS_PHASE: Duration = Duration::from_millis(1500);
-/// Zhida's smallest RTO: the 50 ms floor (`MIN_RTO`) of the RFC 6298 RTO smoltcp
-/// computes from RTT samples; RTTs over the tap are far below it. Before any
+/// Zhida's smallest RTO: SRTT plus the 50 ms floor (`MIN_RTO`) on the variance term
+/// of the RFC 6298 RTO smoltcp computes from RTT samples; RTTs over the tap are far
+/// below it. Before any
 /// sample the RTO is 300 ms. Each expiry doubles it, up to 60 s, until SND.UNA
 /// advances (`retransmission_timeout`); the measured base stays until the
 /// next sample. Zero-window probes

@@ -625,9 +625,10 @@ TCP timer scheduling has 1 ms granularity. Nonnegative deadlines are rounded up 
 millisecond boundary; expiry checks do not fire before the requested deadline. A late drive call
 makes the timer late.
 
-The retransmission timeout follows RFC 6298 from measured round trips: SRTT + 4 * RTTVAR, at least
-50 ms (above a peer's delayed ACK, so a delayed ACK does not draw a spurious retransmit) and at most
-60 seconds. Before the first sample it is 300 ms. Each expiry doubles it, capped at 60 seconds, until
+The retransmission timeout follows RFC 6298 from measured round trips, with Linux's floor on the
+variance term: SRTT + max(4 * RTTVAR, 50 ms), at most 60 seconds. A peer's delayed ACK (up to 40 ms
+on Linux) adds to the path RTT, and the 50 ms on top of SRTT keeps it from drawing a spurious
+retransmit even once a steady path has shrunk RTTVAR. Before the first sample it is 300 ms. Each expiry doubles it, capped at 60 seconds, until
 SND.UNA advances; the measured base stays until the next sample. Reset/reconnect discards the
 measurement. A new RTO applies the next time a retransmission or probe
 timer is armed; it does not rewrite an already armed timer.
