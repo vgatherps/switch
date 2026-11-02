@@ -111,8 +111,7 @@ the default. An invalid value or a second such line refuses the script unrun
   `scripts/handshake-no-options.pkt`, `handshake-small-mss.pkt`.
 - The RTO follows RFC 6298 from RTT samples (SRTT + 4 * RTTVAR), 300 ms before the first
   sample, with a 50 ms floor (`MIN_RTO`, above a peer's delayed ACK); each expiry doubles it,
-  up to 60 s, until SND.UNA advances, and a third expiry without a new sample drops the
-  measurement, back to 300 ms. RFC 6298 2.4 says it SHOULD be at least 1 s; Linux's minimum
+  up to 60 s, until SND.UNA advances; the measured base stays until the next sample. RFC 6298 2.4 says it SHOULD be at least 1 s; Linux's minimum
   is 200 ms (TCP_RTO_MIN). `scripts/rto-backoff.pkt`.
 - If the peer closes its window while data is in flight, an RTO sends a one-byte
   probe, and further probes follow the same RTO and backoff. Linux v6.12's

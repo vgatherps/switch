@@ -627,8 +627,8 @@ makes the timer late.
 The retransmission timeout follows RFC 6298 from measured round trips: SRTT + 4 * RTTVAR, at least
 50 ms (above a peer's delayed ACK, so a delayed ACK does not draw a spurious retransmit) and at most
 60 seconds. Before the first sample it is 300 ms. Each expiry doubles it, capped at 60 seconds, until
-SND.UNA advances; three expiries without a new sample discard the measurement, so the base returns to
-300 ms. Reset/reconnect discards it too. A new RTO applies the next time a retransmission or probe
+SND.UNA advances; the measured base stays until the next sample. Reset/reconnect discards the
+measurement. A new RTO applies the next time a retransmission or probe
 timer is armed; it does not rewrite an already armed timer.
 
 Delayed ACK defaults to 10 ms. `set_ack_delay(Some(duration))` changes the delay;
