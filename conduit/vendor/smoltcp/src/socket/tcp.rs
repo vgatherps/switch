@@ -2280,7 +2280,9 @@ impl<'a> Socket<'a> {
                 control = TcpControl::None;
             }
         } else if control == TcpControl::Fin {
-            if segment_end > window_end {
+            // In-order data past the advertised edge is accepted (see the overlap above), so its
+            // FIN is too; only an out-of-order FIN must fit the window.
+            if segment_end > window_end && window_start < segment_start {
                 control = TcpControl::None;
             } else if matches!(self.state, State::SynReceived | State::Established | State::FinWait1 | State::FinWait2) {
                 if window_start < segment_start {
@@ -9547,14 +9549,16 @@ mod test {
         check_data_after_fin_ack(State::Closing);
     }
 
+    /// An in-order FIN whose data ends past the advertised edge is taken with the data: the
+    /// reader sees all 65 bytes, then EOF, and the ACK covers the FIN.
     #[test]
-    fn test_fin_payload_past_right_edge_is_delivered() {
+    fn in_order_fin_beyond_advertised_edge_reports_eof() {
         let mut s = socket_established_with_buffer_sizes(64, 64);
-        send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[0; 65]));
-        assert_eq!(s.state, State::Established);
-        assert!(!s.rx_fin_received);
-        assert_eq!(s.recv_queue(), 65);
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 65).win(64)]);
+        send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[7; 65]));
+        assert_eq!(s.state, State::CloseWait);
+        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 66).win(64)]);
+        assert_eq!(drain_bytes(&mut s), [7; 65]);
+        assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
     }
 
     #[test]
