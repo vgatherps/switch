@@ -52,7 +52,7 @@ def problems(directory, sweeps):
         elif not summary.get("complete"):
             out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
         elif summary.get("generator_bound"):
-            out.append(f"{name}: sender fell behind schedule; receiver capacity is not isolated")
+            out.append(f"{name}: sender behind schedule: worker(s) {summary.get('behind_workers')}")
     return out
 
 
@@ -60,8 +60,8 @@ def us(ns):
     return "-" if ns is None else f"{ns / 1000:.1f}"
 
 
-def lat(step, key):
-    q = step.get("latency_ns")
+def lat(step, key, field="latency_ns"):
+    q = step.get(field)
     return None if q is None else q[key]
 
 
@@ -78,13 +78,16 @@ def flags(step):
 
 def table(steps):
     rows = [
-        "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs | flags |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs"
+        " | service RTT p50 µs | service RTT p99 µs | send lag p50 µs | send lag p99 µs | flags |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for s in sorted(steps, key=lambda s: s["offered_pps"]):
         rows.append(
             f"| {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} | {100 * s['drop_fraction']:.3f} |"
-            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} | {flags(s)} |"
+            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
+            f" {us(lat(s, 'p50', 'service_rtt_ns'))} | {us(lat(s, 'p99', 'service_rtt_ns'))} |"
+            f" {us(lat(s, 'p50', 'send_lag_ns'))} | {us(lat(s, 'p99', 'send_lag_ns'))} | {flags(s)} |"
         )
     return "\n".join(rows)
 
@@ -181,8 +184,8 @@ def build(directory, title):
             f.write(svg_plot(steps, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
-            sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
-                         " identify the cause; receiver backpressure can also delay sends.", ""]
+            sections += ["SENDER-LATE: a sender's fresh sends fell behind schedule (send lag p99 over 20 µs, not"
+                         " counting messages a full connection owed or a pool stop held back) and the sweep stopped.", ""]
         if any(s.get("budget_bound") for s in steps):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
                          " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"

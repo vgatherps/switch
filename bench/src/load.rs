@@ -130,6 +130,13 @@ pub struct StepResult {
     pub service_rtt: Sparse,
     /// Measured messages that waited at least once because their connection was at its budget.
     pub budget_waits: u64,
+    /// Polls of the send task ended by a transport-wide refusal (`Outcome::Stop`: no TX frame,
+    /// or UDP would block).
+    pub stops: u64,
+    /// Ns after this worker's step start of its last send and of its last first echo of a
+    /// message of this step; `None`: none.
+    pub last_send_ns: Option<u64>,
+    pub last_echo_ns: Option<u64>,
 }
 
 /// What the send task leaves for the loop once it has sent the whole step or been cut off.
@@ -138,6 +145,9 @@ struct Sent {
     backlog_at_end: u64,
     in_window: u64,
     budget_waits: u64,
+    stops: u64,
+    /// Monotonic ns of the last send.
+    last_ns: Option<u64>,
 }
 
 /// The senders' send halves (ws: the upgraded connections' TCP halves).
@@ -545,6 +555,9 @@ impl Worker {
             backlog_at_end: s.backlog_at_end,
             service_rtt: r.service_rtt.to_sparse(),
             budget_waits: s.budget_waits,
+            stops: s.stops,
+            last_send_ns: s.last_ns.map(|t| t.saturating_sub(origin)),
+            last_echo_ns: r.last_echo_ns.map(|t| t.saturating_sub(origin)),
         })
     }
 }
@@ -581,8 +594,9 @@ async fn try_tx_frame(handle: &NetHandle) -> Option<TxFrame> {
 
 /// Sends the step's messages on schedule through the pacer (at most its budget per poll),
 /// yielding to the loop between batches, until all are sent or the window ends. Send lag is
-/// recorded for measured messages only (the warmup absorbs ARP and connection start), and not for
-/// owed messages (a full connection, or one at its budget).
+/// recorded for measured messages only (the warmup absorbs ARP and connection start), and only
+/// for fresh ones (`Pacer::is_fresh`: not owed by a full connection or one at its budget, not
+/// held back by a transport-wide refusal).
 #[switch::task]
 async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let SendStep {
@@ -604,6 +618,8 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
         backlog_at_end: 0,
         in_window: 0,
         budget_waits: 0,
+        stops: 0,
+        last_ns: None,
     };
     // per sender, the last message refused for its budget (each counts once however often
     // it is retried)
@@ -632,6 +648,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
                 continue;
             }
             let Some(mut frame) = try_tx_frame(&handle).await else {
+                out.stops += 1;
                 pacer.result(k, Outcome::Stop);
                 continue;
             };
@@ -649,15 +666,17 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
                 size
             };
             frame.set_len(len);
-            let owed = pacer.is_owed(k);
+            let fresh = pacer.is_fresh(k);
             let outcome = senders.borrow_mut().send(sender, frame, target);
+            out.stops += u64::from(outcome == Outcome::Stop);
             if outcome == Outcome::Sent {
                 let now = clock.now_ns();
                 out.in_window += u64::from((window[0]..window[1]).contains(&now));
+                out.last_ns = Some(now);
                 if let Some(c) = conn {
                     c.in_flight.borrow_mut().push_back(now);
                 }
-                if k >= measured_from && !owed {
+                if k >= measured_from && fresh {
                     out.lag.record(now.saturating_sub(sched_ns));
                 }
             }
