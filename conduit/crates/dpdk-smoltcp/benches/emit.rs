@@ -3,9 +3,9 @@
 //! pure_ack times B's send after an untimed receive of 1448
 //! bytes. recv_data_ack times B's turn that receives 1448 bytes and sends its
 //! ACK. send_64 and send_1448 time A's send after the application write.
-//! In steady state, pure_ack, send_64 and send_1448 reuse the spare TX
-//! packet left by an untimed receive, so they time no mbuf allocation.
-//! recv_data_ack starts with no spare TX packet and times one mbuf allocation.
+//! send_64 and send_1448 send frame-pool frames and take no TX packet.
+//! pure_ack and recv_data_ack each time one TX packet allocation for their ACK:
+//! receiving takes no TX packet, so none is left over for the send.
 //! pure_ack, send_64 and send_1448 include the flush of their one frame.
 //! recv_data_ack includes receive and flush.
 //! Setup, forwarding, frame checks and application reads are untimed.
@@ -157,7 +157,7 @@ fn iteration(
                 Case::PureAck => {
                     assert_turn(pair.b.receive(now, BUDGET).unwrap(), 1, 0);
                     if steady_checks {
-                        assert_eq!(pair.in_use()[1].1, 1, "B TX pool before send");
+                        assert_eq!(pair.in_use()[1].1, 0, "B TX pool before send");
                     }
                     let start = Instant::now();
                     let sent = pair.b.send();
@@ -187,7 +187,7 @@ fn iteration(
         }
         Case::Send64 | Case::Send1448 => {
             if steady_checks {
-                assert_eq!(pair.in_use()[0].1, 1, "A TX pool before send");
+                assert_eq!(pair.in_use()[0].1, 0, "A TX pool before send");
             }
             let start = Instant::now();
             let sent = pair.a.send();
@@ -249,7 +249,7 @@ fn benches(c: &mut Criterion) {
                 let (mut pair, handles, fillers) = setup(eal, case, n);
                 let payload = pattern(case.payload_len(), 7);
                 let mut sink = vec![0; payload.len()];
-                // The first untimed receive establishes the spare TX packet.
+                // The first iteration settles the pool counts the warmup checks.
                 iteration(&mut pair, &handles, case, &payload, &mut sink, false);
                 for _ in 1..WARMUP {
                     iteration(&mut pair, &handles, case, &payload, &mut sink, true);
