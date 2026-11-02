@@ -605,23 +605,23 @@ mod stale_neighbors {
         iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(LOCAL.into(), 24)).unwrap());
         let mut sockets = TcpSet::new(64);
         let other = Ipv4Address::new(192, 168, 1, 3);
+        // One cache slot, two dead peers: the second peer evicts the first's pending entry, so
+        // each address ARPs once per second and a new destination once per second.
+        let mut requests = Vec::new();
         for millis in [0, 1, 2, 3, 998, 999, 1_000, 1_001, 1_002, 1_999, 2_000] {
             let peer = if millis % 2 == 0 { PEER } else { other };
             connect_unresolved_peer(&mut iface, &mut sockets, peer, 1234 + millis as u16);
             iface.poll_egress(Instant::from_millis(millis), &mut device, &mut sockets);
-            if millis % 1_000 == 0 {
-                assert_eq!(device.tx_queue.len(), 1);
-                let bytes = device.tx_queue.pop_front().unwrap();
+            while let Some(bytes) = device.tx_queue.pop_front() {
                 let eth = EthernetFrame::new_checked(&bytes).unwrap();
                 let arp = ArpPacket::new_checked(eth.payload()).unwrap();
                 let target =
                     Ipv4Address::from_octets(arp.target_protocol_addr().try_into().unwrap());
-                assert!(target == PEER || target == other);
                 assert_arp_request(&bytes, target);
-            } else {
-                assert!(device.tx_queue.is_empty());
+                requests.push((millis, target));
             }
         }
+        assert_eq!(requests, [(0, PEER), (1, other), (1_001, other), (1_002, PEER)]);
     }
 
     #[test]

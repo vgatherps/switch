@@ -382,8 +382,10 @@ fn send_to_many_peers() {
                     requests += arps;
                 }
             }
+            // At most one request per cached address, plus one new destination per
+            // second while the cache is full of unanswered ones.
             assert!(
-                requests <= capacity,
+                requests <= capacity + 1,
                 "second {second}: {requests} ARP requests"
             );
             total_requests += requests;

@@ -339,7 +339,10 @@ Stack sends no gratuitous ARP for it.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
 only in tests and benchmarks. `neighbor_capacity: usize` controls the ARP cache. `DEFAULT_NEIGHBOR_CAPACITY` is 256. A
 new neighbor in a full cache evicts the neighbor that expires first; only that eviction scans the
-cache, and a lookup is one hash probe. Only ARP updates an entry; received IP traffic does not
+cache, and a lookup is one hash probe. Each address is asked at most once per second. While the
+cache is full of addresses still waiting for a reply, one new destination per second may evict
+the oldest of them and send its request; others wait, which bounds the ARP requests sent to more
+dead peers than the cache holds. Only ARP updates an entry; received IP traffic does not
 refresh it. A resolved entry keeps forwarding indefinitely: the first send after its 60 s lifetime
 goes out with one broadcast ARP probe, and the probe extends the entry by another 60 s whether or
 not it is answered. An ARP reply or request to us with the same MAC extends the entry without

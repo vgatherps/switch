@@ -63,6 +63,10 @@ pub struct Cache {
     capacity: usize,
     changes: u64,
     next_expiry: Option<Instant>,
+    /// While the cache is full of pending entries still in their silence, a new destination
+    /// may ARP (evicting the oldest) only from this time on: one such request per `SILENT_TIME`
+    /// bounds the ARPs sent to more dead destinations than the cache holds.
+    new_destination_after: Instant,
 }
 
 impl Cache {
@@ -87,6 +91,7 @@ impl Cache {
             capacity,
             changes: 0,
             next_expiry: None,
+            new_destination_after: Instant::ZERO,
         }
     }
 
@@ -101,8 +106,11 @@ impl Cache {
             .0
     }
 
-    fn pending_eviction_is_silent(&self, timestamp: Instant) -> bool {
-        self.storage.len() == self.capacity
+    /// Whether a new destination must wait: the cache is full, its oldest entry is a pending
+    /// one still in its silence, and a new destination already took a request this interval.
+    fn new_destination_waits(&self, timestamp: Instant) -> bool {
+        timestamp < self.new_destination_after
+            && self.storage.len() == self.capacity
             && matches!(
                 self.storage[&self.earliest()],
                 Entry::Pending { silent_until } if timestamp < silent_until
@@ -232,7 +240,7 @@ impl Cache {
             }
             return Answer::NotFound;
         }
-        if self.pending_eviction_is_silent(timestamp) {
+        if self.new_destination_waits(timestamp) {
             return Answer::RateLimited;
         }
         Answer::NotFound
@@ -264,11 +272,15 @@ impl Cache {
                 *entry = Entry::Pending { silent_until };
             }
             None => {
-                if self.pending_eviction_is_silent(timestamp) {
-                    return;
-                }
                 if self.storage.len() == self.capacity {
-                    self.evict_earliest();
+                    if self.new_destination_waits(timestamp) {
+                        return;
+                    }
+                    if let (_, Entry::Pending { silent_until: evicted }) = self.evict_earliest()
+                        && timestamp < evicted
+                    {
+                        self.new_destination_after = silent_until;
+                    }
                 }
                 self.storage.insert(key, Entry::Pending { silent_until });
             }
@@ -764,26 +776,27 @@ mod test {
             assert_eq!(cache.next_expiry, None);
         }
 
+        /// A cache full of pending entries still in their silence lets a new destination ARP:
+        /// the lookup answers NotFound, and recording the request evicts the oldest pending
+        /// entry. Another new destination then waits one silence interval, which bounds the
+        /// requests to more dead destinations than the cache holds.
         #[test]
-        fn full_cache_of_silent_pending_answers_rate_limited() {
+        fn new_destination_gets_arp_while_cache_full_of_silent_pending() {
             let mut cache = Cache::new(1);
             cache.limit_rate(address(1), Instant::ZERO);
-            for millis in [0, 100, 999] {
-                let now = Instant::from_millis(millis);
-                assert_eq!(cache.lookup(&address(2), now), Answer::RateLimited);
-                cache.limit_rate(address(2), now);
-                assert_eq!(cache.lookup(&address(1), now), Answer::RateLimited);
-                assert!(!cache.storage.contains_key(&key(&address(2))));
-                assert_eq!(cache.storage.len(), 1);
-                assert_eq!(cache.changes(), 0);
-            }
-            let now = Instant::from_millis(1_000);
+            let now = Instant::from_millis(100);
+            assert_eq!(cache.lookup(&address(1), now), Answer::RateLimited);
             assert_eq!(cache.lookup(&address(2), now), Answer::NotFound);
             cache.limit_rate(address(2), now);
-            assert!(!cache.storage.contains_key(&key(&address(1))));
             assert_eq!(cache.lookup(&address(2), now), Answer::RateLimited);
             assert_eq!(cache.storage.len(), 1);
             assert_eq!(cache.changes(), 0);
+            for millis in [100, 1_099] {
+                assert_eq!(cache.lookup(&address(1), Instant::from_millis(millis)), Answer::RateLimited);
+            }
+            let later = Instant::from_millis(1_100);
+            assert_eq!(cache.lookup(&address(1), later), Answer::NotFound);
+            assert_eq!(cache.lookup(&address(2), later), Answer::NotFound);
         }
 
         #[test]
