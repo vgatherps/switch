@@ -5,7 +5,7 @@
 use core::fmt::Display;
 use core::fmt;
 
-use crate::phy::{HeldFrames, PacketMeta, RxBuf, TxBuf, TxFrame, TxSource, UniqueTxBuf};
+use crate::phy::{PacketMeta, RxBuf, TxBuf, TxFrame, TxSource, UniqueTxBuf};
 use crate::socket::{Context, PollAt};
 use crate::time::{Duration, Instant};
 use crate::wire::{
@@ -1415,8 +1415,6 @@ impl<'a> Socket<'a> {
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
-                // The shared frame pool is empty: wake this socket once frames return.
-                self.rx_buffer.shared.queue_frame_wait();
                 break;
             };
             let count = (data.len() - written)
@@ -1444,30 +1442,6 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    /// Register the socket for a wake when the TX frame pool recovers.
-    pub(crate) fn set_frame_wake(
-        &mut self,
-        queue: crate::iface::DropQueue,
-        handle: crate::iface::SocketHandle,
-    ) {
-        *self.rx_buffer.shared.wake.borrow_mut() = Some((queue, handle));
-    }
-
-    /// Remove the socket from the TX frame-pool wait list.
-    pub(crate) fn clear_frame_wake(&mut self) {
-        self.rx_buffer.shared.cancel_frame_wait();
-        *self.rx_buffer.shared.wake.borrow_mut() = None;
-    }
-
-    pub(crate) fn clear_frame_wait_queued(&mut self) {
-        self.rx_buffer.shared.frame_wait_queued.set(false);
-    }
-
-    /// Frames the app still holds; they keep their RX pool buffers until dropped.
-    pub fn held_frames(&self) -> HeldFrames {
-        HeldFrames::new(self.rx_buffer.shared.clone())
-    }
-
     /// Drain the next whole in-order frame, or return None when no data is queued.
     /// Frames retain their shared RX pool buffers until dropped.
     /// After a FIN, queued frames are drained before returning RecvError::Finished.
@@ -1479,8 +1453,7 @@ impl<'a> Socket<'a> {
             return Ok(None);
         };
         self.remote_seq_no = TcpSeqNumber(self.remote_seq_no.0.wrapping_add(frame.len() as i32));
-        self.rx_buffer.shared.hold();
-        Ok(Some(TcpFrame { frame, shared: self.rx_buffer.shared.clone() }))
+        Ok(Some(TcpFrame(frame)))
     }
 
     /// Return the amount of octets queued in the transmit buffer.
@@ -7872,32 +7845,6 @@ mod test {
             assert_eq!(bytes, b"abc");
             assert_eq!(bytes.as_ptr(), pointer);
         }
-    }
-
-    #[test]
-    fn dropping_received_frames_does_not_schedule_or_cancel_frame_wait() {
-        let mut handles = crate::iface::TcpSet::new(64);
-        let handle = handles.add(Socket::test_socket(0, 0));
-        let queue = crate::iface::DropQueue::with_capacity(1, 0);
-        let mut s = socket_established_with_buffer_sizes(64, 4096);
-        s.socket.set_frame_wake(queue.clone(), handle);
-
-        receive_window_segment(&mut s, 0, b"abc");
-        let first = s.recv().unwrap().unwrap();
-        receive_window_segment(&mut s, 3, b"def");
-        let second = s.recv().unwrap().unwrap();
-        let held = s.held_frames();
-        assert_eq!(held.count(), 2);
-        drop(first);
-        assert_eq!(held.count(), 1);
-        assert_eq!(queue.state(), (true, false));
-
-        s.rx_buffer.shared.queue_frame_wait();
-        drop(second);
-        assert_eq!(held.count(), 0);
-        assert_eq!(queue.state(), (true, true));
-        s.socket.clear_frame_wake();
-        assert_eq!(queue.state(), (true, false));
     }
 
     #[test]

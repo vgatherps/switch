@@ -564,7 +564,6 @@ fn socket_template_frames(
         &pair::tcp_socket_sized(4096),
         1500,
         device.frame_source(),
-        smoltcp::iface::DropQueue::with_capacity(1, 0),
     );
     sockets.get_mut(handle).set_ack_delay(None);
     let arp = ArpRepr::EthernetIpv4 {
@@ -2949,7 +2948,6 @@ fn retransmit_with_tx_checksum_offload() {
             &pair::tcp_socket_sized(4096),
             1500,
             device.frame_source(),
-            smoltcp::iface::DropQueue::with_capacity(1, 0),
         );
         sockets.get_mut(handle).set_ack_delay(None);
         let arp = ArpRepr::EthernetIpv4 {

@@ -199,7 +199,7 @@ impl fmt::Display for SocketHandle {
 /// socket for data and settings, which cannot change the key, and marks it dirty.
 ///
 /// Readiness tokens: [`arm`](Self::arm) stores a caller's `u32` for one half of a socket.
-/// Every change that marks the socket dirty (ingress, `get_mut`, a frame-pool wake, timer and
+/// Every change that marks the socket dirty (ingress, `get_mut`, timer and
 /// neighbor rescans) and every state change in egress fires each armed token of the socket:
 /// it moves to a list that [`pop_fired`](Self::pop_fired) drains, and is disarmed. A token
 /// fires at most once per arm; the list holds two per slot without growing while no token is
@@ -334,12 +334,8 @@ impl<'a> TcpSet<'a> {
         config: &tcp::Config,
         ip_mtu: usize,
         tx_source: crate::phy::TxSource,
-        wake: super::DropQueue,
     ) -> SocketHandle {
-        let socket = tcp::Socket::from_config(config, ip_mtu, tx_source);
-        let handle = self.add(socket);
-        self.item_mut(handle).socket.set_frame_wake(wake, handle);
-        handle
+        self.add(tcp::Socket::from_config(config, ip_mtu, tx_source))
     }
 
     /// Get a socket from the set by its handle.
@@ -487,18 +483,6 @@ impl<'a> TcpSet<'a> {
         }
     }
 
-    /// Complete a frame wait: the frame pool has a free frame again, so fire the socket's
-    /// readiness tokens and schedule its readiness check. Removal takes a socket off the
-    /// wait list, so `handle` names a live socket.
-    pub fn frame_woken(&mut self, handle: SocketHandle) {
-        let socket = &mut self.sockets.get_mut(handle.index)
-            .filter(|slot| slot.generation == handle.generation)
-            .and_then(|slot| slot.inner.as_mut())
-            .expect("frame wake does not name a live TCP socket").socket;
-        socket.clear_frame_wait_queued();
-        self.mark_dirty(handle.index);
-    }
-
     /// Close the socket after its application handle is dropped, keeping it in the set.
     pub fn orphan(&mut self, handle: SocketHandle, now: Instant) {
         self.item(handle);
@@ -525,6 +509,7 @@ impl<'a> TcpSet<'a> {
     }
 
     /// Whether an orphan has become CLOSED with no remote endpoint.
+    #[inline]
     pub fn has_reapable(&self) -> bool {
         !self.reapable.is_empty()
     }
@@ -568,15 +553,15 @@ impl<'a> TcpSet<'a> {
     }
 
     /// Removes a socket from the set without changing its state, discarding unread received
-    /// bytes and cancelling a frame-pool wait. Returns the frames the application still holds. The
-    /// socket itself is dropped, releasing its queued TX frames: handing it out would let a
-    /// caller write it over another socket through `get_mut`.
+    /// bytes. The socket itself is dropped, releasing its queued TX frames: handing it out would
+    /// let a caller write it over another socket through `get_mut`. Frames the application
+    /// still holds keep their RX buffers until dropped.
     ///
     /// # Panics
     /// This function may panic if the handle does not belong to this socket set,
     /// and panics if the socket it named was already removed.
-    pub fn remove(&mut self, handle: SocketHandle) -> crate::phy::HeldFrames {
-        self.take(handle).held_frames()
+    pub fn remove(&mut self, handle: SocketHandle) {
+        drop(self.take(handle));
     }
 
     /// `remove`, but returns the socket with an empty receive buffer.
@@ -614,7 +599,6 @@ impl<'a> TcpSet<'a> {
         self.set_occupied(handle.index, false);
         match self.sockets[handle.index].inner.take() {
             Some(mut item) => {
-                item.socket.clear_frame_wake();
                 item.socket.discard_received();
                 item.socket
             }
@@ -1718,7 +1702,6 @@ mod tests {
             &config,
             1500,
             crate::tests::tx_test_source(1460),
-            super::super::DropQueue::with_capacity(1, 0),
         );
         let (mut iface, _, _) = crate::tests::setup_eth();
         let socket = set.get_mut(handle);

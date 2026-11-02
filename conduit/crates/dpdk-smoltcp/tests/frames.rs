@@ -514,17 +514,21 @@ fn hold_every_frame(
     held
 }
 
-/// Retaining frames does not limit delivery of the next receive window.
+/// Retaining frames does not limit delivery of the next receive window; held frames keep their
+/// RX mbufs until dropped.
 #[zhida_test_support::pinned_test]
 fn receiving_continues_while_frames_are_held() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frza", "frzb"], [config(Side::A), config(Side::B)], T0);
         let trace = record(&mut pair);
         let handles = open(&mut pair, &trace, 4096);
+        let idle = pair.in_use()[1].0;
         let first = hold_every_frame(&mut pair, &trace, &handles);
         let second = hold_every_frame(&mut pair, &trace, &handles);
-        assert_eq!(pair.b.tcp(&handles[1]).held_frames().count(), first.len() + second.len());
+        let held = u32::try_from(first.len() + second.len()).unwrap();
+        assert_eq!(pair.in_use()[1].0, idle + held);
         drop((first, second));
+        assert_eq!(pair.in_use()[1].0, idle);
         finish(pair, &trace, 0);
     });
 }

@@ -196,8 +196,6 @@ pub struct Stack {
     dropped: DropQueue,
     dropped_tcp: Vec<SocketHandle>,
     dropped_udp: Vec<smoltcp::iface::UdpHandle>,
-    /// Sockets taken off the DropQueue's frame-wait list for waking; empty between turns.
-    frame_waiters: Vec<SocketHandle>,
     max_sockets: usize,
     max_udp_sockets: usize,
     ip_mtu: u16,
@@ -302,7 +300,6 @@ impl Stack {
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
             dropped_tcp: Vec::with_capacity(config.max_sockets),
             dropped_udp: Vec::with_capacity(config.max_udp_sockets),
-            frame_waiters: Vec::with_capacity(config.max_sockets),
             max_sockets: config.max_sockets,
             max_udp_sockets: config.max_udp_sockets,
             ip_mtu: mtu,
@@ -363,6 +360,7 @@ impl Stack {
     /// `rx_staged` in a later call.
     ///
     /// Panics as described in [Panics](Stack#panics).
+    #[inline]
     pub fn receive(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         let mut turn = self.ingress(now, ingress_budget)?;
         if turn.tx_pending != 0 {
@@ -384,6 +382,7 @@ impl Stack {
     /// sends nothing.
     ///
     /// Panics as described in [Panics](Stack#panics).
+    #[inline]
     pub fn send(&mut self) -> Result<Sent, StackError> {
         self.tidy();
         let tx_accepted = self.egress()?;
@@ -436,9 +435,9 @@ impl Stack {
     }
 
     /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
-    /// tidying (which wakes sockets waiting for a free frame if one is free), flush,
-    /// one RX burst, maintenance, then ingress. After a burst that returned packets, the
-    /// RX pool is checked against the low mark (one RX ring refill plus one burst); while
+    /// tidying, flush, one RX burst, maintenance, then ingress. After a burst that returned
+    /// packets, the RX pool is checked against the low mark (one RX ring refill plus one
+    /// burst); while
     /// it is below, the TCP sockets holding the most out-of-order frames release them,
     /// farthest from their in-order data first, until the pool is back at the mark
     /// (`TcpSet::prune_out_of_order`).
@@ -487,21 +486,6 @@ impl Stack {
             tx_accepted,
             tx_pending: self.device.pending(),
         })
-    }
-
-    /// A socket whose `send_slice` found the shared frame pool empty waits for a free frame:
-    /// once the pool has one, fire its readiness tokens and schedule its readiness check.
-    #[cold]
-    #[inline(never)]
-    fn wake_frame_waiters(&mut self) {
-        let pool = self.device.frame_pool();
-        if pool.in_use_count() as usize >= pool.count() {
-            return;
-        }
-        self.dropped.drain_frame_waiters(&mut self.frame_waiters);
-        for handle in self.frame_waiters.drain(..) {
-            self.sockets.frame_woken(handle);
-        }
     }
 
     /// Egress passes at the stored time, then flush; returns the frames the
@@ -602,7 +586,6 @@ impl Stack {
             &config,
             usize::from(self.ip_mtu),
             self.device.frame_source(),
-            self.dropped.clone(),
         );
         Ok(TcpHandle {
             raw: handle,
@@ -804,10 +787,8 @@ impl Stack {
 
     /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
     /// that can make the socket readable, writable or change its state fires it: a received
-    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), the start of the
-    /// first `turn`, `receive` or `send` that finds a free frame after the socket's `send_slice`
-    /// found the shared frame pool empty, or a state change in egress (close timers, TIME-WAIT
-    /// end). A fired
+    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), or a state
+    /// change in egress (close timers, TIME-WAIT end). A fired
     /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
     /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
     /// processes a dropped handle; `disarm_tcp` stops a token at once.
@@ -868,16 +849,20 @@ impl Stack {
         handle.raw
     }
 
-    /// Wake sockets waiting for a free frame if one is free, then process dropped handles
-    /// and reapable sockets.
+    /// Process dropped handles and reapable sockets; returns at once when there are none.
+    #[inline]
     fn tidy(&mut self) {
-        let (empty, frame_waiters) = self.dropped.state();
-        if frame_waiters {
-            self.wake_frame_waiters();
-        }
-        if empty && !self.sockets.has_reapable() {
+        if self.dropped.is_empty() && !self.sockets.has_reapable() {
             return;
         }
+        self.free_dropped_sockets();
+    }
+
+    /// Close dropped TCP sockets, remove dropped UDP sockets, then remove TCP sockets that
+    /// reached CLOSED after their handle was dropped.
+    #[cold]
+    #[inline(never)]
+    fn free_dropped_sockets(&mut self) {
         self.dropped
             .drain_into(&mut self.dropped_tcp, &mut self.dropped_udp);
         for &raw in &self.dropped_tcp {

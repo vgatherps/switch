@@ -1,4 +1,4 @@
-use smoltcp::iface::{Config, DropQueue, Interface, SocketHandle, TcpSet};
+use smoltcp::iface::{Config, Interface, SocketHandle, TcpSet};
 use smoltcp::phy::{Device, Loopback, Medium, RxToken, TxPool, TxSource, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
@@ -56,8 +56,7 @@ fn inject(
 
 fn add_socket(sockets: &mut TcpSet<'static>) -> SocketHandle {
     let config = tcp::Config { rx_capacity: 64, tx_capacity: 64, mss_cap: None };
-    let wake = DropQueue::with_capacity(1, 0);
-    sockets.add_admitted(&config, 1500, TxSource::new(TxPool::new(1460)), wake)
+    sockets.add_admitted(&config, 1500, TxSource::new(TxPool::new(1460)))
 }
 
 fn take_syn(device: &mut Loopback) -> u32 {

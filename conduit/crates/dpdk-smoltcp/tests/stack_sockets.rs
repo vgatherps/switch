@@ -213,7 +213,6 @@ fn held_tcp_frame_after_removal(reap: bool) {
         });
         let frame = pair.b.tcp_mut(&server).recv().unwrap().unwrap();
         assert_eq!(frame.payload(), b"held");
-        assert_eq!(pair.b.tcp(&server).held_frames().count(), 1);
         if reap {
             pair.a.close(&client);
             pair.drive(|_, _| {}, |_, b| {

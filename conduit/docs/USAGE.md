@@ -462,9 +462,8 @@ frames all TCP send queues and the application may hold at once; sockets share t
 in full-sized segment payloads (at least six), not a per-socket limit. Smaller writes
 can require more frames. With the pool empty, `send_slice` queues nothing and returns `Ok(0)`,
 `udp_send` returns `WouldBlock` and `tx_frame` returns `None`; frames return when the peer ACKs
-queued data and the PMD releases sent frames. A socket whose `send_slice` found the pool empty
-is woken (its armed readiness tokens fire) at the start of the first `turn`, `receive` or `send` that finds a free
-frame; `tx_frame` callers get no such wake. TCP egress, retransmissions included, takes no
+queued data and the PMD releases sent frames. Neither `send_slice` nor `tx_frame` callers get a
+wake when frames return. TCP egress, retransmissions included, takes no
 frame-pool frame. `net_ring` ports opened by the test kit use their TX ring size as the TX
 descriptor count.
 
@@ -562,7 +561,7 @@ If the PMD accepts nothing, retry on the application's cadence rather than in a 
 
 `poll_at(&mut self) -> Option<Instant>` evaluates cached TCP socket deadlines at the latest time
 supplied to `new`, `turn`, or `receive`. A ready socket or past deadline is reported at that latest
-time. Unprocessed dropped handles or frame-drop wakes, or a dropped TCP socket that reached Closed,
+time. Unprocessed dropped handles, or a dropped TCP socket that reached Closed,
 also report that time, so the next drive call cleans them up. `None` means no socket deadline. The
 timer wheel can report a boundary before the actual socket deadline. `poll_at` does not cover
 staged RX frames, pending TX frames, or packet arrivals, so never wait on it indefinitely.
@@ -588,7 +587,7 @@ only) arm a token without repeating that check; only debug builds check that the
 is still live, and a key used after its socket is removed misdirects tokens to whatever socket
 takes the slot. A change that can alter the socket's readiness
 fires every token armed on it: for TCP a received segment, `tcp_mut` (also through
-`tcp_send_frame`, `connect`, `listen`), recovery of the shared TX frame pool after exhaustion, or a
+`tcp_send_frame`, `connect`, `listen`), or a
 state change in egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and
 returned once by `pop_fired()`; drain it after each drive call and check those sockets. Changes
 that leave readiness as it was may fire tokens too, also in a turn with no received segment and
