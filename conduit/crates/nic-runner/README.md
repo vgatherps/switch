@@ -111,9 +111,9 @@ management route is never cut); every other device in the IOMMU group is unbound
 an IOMMU, `--noiommu` is given. Each refusal is one line naming the reason and writes nothing. It then
 prints each sysfs write (`write '<value>' > <path>`), runs `modprobe vfio-pci` if needed, the hugepages
 free per NUMA node, and `<BDF> bound to vfio-pci (<group>)`. A device already on vfio-pci prints
-`already bound` and exits 0. If a write fails while the device has no driver, or the vfio bind does not
-verify, it detaches the device from vfio-pci if needed, puts it back on its kernel driver and reports
-both errors. Running `bind` (or `unbind`) again finishes an interrupted bind.
+`already bound` and exits 0. If a write fails after it unbound the kernel driver, or the vfio bind does
+not verify, it detaches the device from vfio-pci if needed, puts it back on its kernel driver and reports
+both errors. A write failing on a device that had no driver is reported alone; no binding changed. Running `bind` (or `unbind`) again finishes an interrupted bind.
 
 Unbind (root), after the run:
 ```

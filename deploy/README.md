@@ -44,7 +44,9 @@ The AWS kernel comparison runs `apply --kernel-receiver` on a fresh receiver. It
 ENI on Linux `ena` at apply and every boot, skips the VFIO module setup, and verifies `ena`
 instead of `vfio-pci`. It otherwise uses the same build, CPU isolation, IRQ housekeeping and
 unmanaged-interface setup; the benchmark configures the data IP and source routes afterward.
-The mode is saved in `host.env` for boot and verify. Repeat the flag when reapplying on that host.
+The mode is saved in `host.env` for boot and verify. Repeat the flag when reapplying on that host. On a host
+whose data ENI is already on vfio-pci, `apply --kernel-receiver` refuses (`interfaces: FAIL`); run
+`zhida-netconf unbind /etc/zhida/dut.json` first.
 On the kernel receiver, `apply` also writes
 `/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf` with
 `ManageForeignRoutingPolicyRules=no`, so networkd does not remove the benchmark's source-routing

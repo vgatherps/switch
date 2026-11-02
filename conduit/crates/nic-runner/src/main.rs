@@ -157,7 +157,7 @@ fn run(args: Args) -> i32 {
             if let Err(error) = nic::print_eth_stats(port_id) {
                 line("error", error);
             }
-            return nic::close(port, 3);
+            return nic::close(*port, 3);
         }
         Err(OpenError::LinkDown {
             port_id,
@@ -168,15 +168,15 @@ fn run(args: Args) -> i32 {
             if let Err(error) = nic::print_eth_stats(port_id) {
                 line("error", error);
             }
-            return nic::close(port, 3);
+            return nic::close(*port, 3);
         }
         Err(OpenError::Stack { port, error }) => {
             line("error", format_args!("Stack::new: {error}"));
-            return nic::close(port, 3);
+            return nic::close(*port, 3);
         }
         Err(OpenError::Seed { port, error }) => {
             line("error", format_args!("OS random seed: {error}"));
-            return nic::close(port, 3);
+            return nic::close(*port, 3);
         }
         Err(OpenError::GatewayUnresolved {
             stack,

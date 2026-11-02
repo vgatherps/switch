@@ -18,7 +18,8 @@ if ! "$here/hft-host.sh" verify; then
 fi
 # zhida-netconf writes pretty JSON, one field per line (its own test pins the format).
 sed 's/^  "rx_timestamps": false,$/  "rx_timestamps": true,/' "$dut" >"$config" || exit 1
-if ! zhida-netconf check "$config" | grep -qx 'rx_timestamps: true'; then
+# Read the whole summary first: grep -q would close the pipe while check still writes.
+if ! summary=$(zhida-netconf check "$config") || ! grep -qx 'rx_timestamps: true' <<<"$summary"; then
     echo "run-binance: $config does not have rx_timestamps true (zhida-netconf check); not starting" >&2
     exit 1
 fi

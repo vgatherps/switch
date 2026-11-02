@@ -37,32 +37,33 @@ pub enum OpenError {
     },
     Descriptors(String),
     PortConfig(String),
-    PortOpen(PortOpenError),
+    // The Port, Stack and failed-open payloads are boxed: an error does not carry them inline.
+    PortOpen(Box<PortOpenError>),
     Link {
         port_id: u16,
-        port: Port,
+        port: Box<Port>,
         error: String,
     },
     LinkDown {
         port_id: u16,
-        port: Port,
+        port: Box<Port>,
         link: Link,
     },
     Seed {
-        port: Port,
+        port: Box<Port>,
         error: std::io::Error,
     },
     Stack {
-        port: Port,
+        port: Box<Port>,
         error: StackError,
     },
     GatewayUnresolved {
-        stack: Stack,
+        stack: Box<Stack>,
         gateway: Ipv4Address,
         waited: Duration,
     },
     Receive {
-        stack: Stack,
+        stack: Box<Stack>,
         error: StackError,
     },
 }
@@ -246,8 +247,6 @@ impl fmt::Display for OpenReport {
 /// Caller-owned attached rings must outlive device close and return queued
 /// packets before pool destruction. Vdevs are created by EAL from `config`
 /// and live as long as EAL.
-// Setup path; the error size does not matter.
-#[allow(clippy::result_large_err)]
 pub unsafe fn open(
     config: &Config,
     sizing: &Sizing,
@@ -298,13 +297,13 @@ pub unsafe fn open(
     let tx_pool_count = port_config.tx_pool.count;
     // SAFETY: the caller accepts this function's safety contract; EAL just
     // created the configured ethdev and remains alive in `Opened`.
-    let port = unsafe { Port::open(&eal, port_config) }.map_err(OpenError::PortOpen)?;
+    let port = unsafe { Port::open(&eal, port_config) }.map_err(|error| OpenError::PortOpen(Box::new(error)))?;
     let link = match wait_link(port_id) {
         Ok(link) => link,
         Err(error) => {
             return Err(OpenError::Link {
                 port_id,
-                port,
+                port: Box::new(port),
                 error,
             })
         }
@@ -312,13 +311,18 @@ pub unsafe fn open(
     if !link.up {
         return Err(OpenError::LinkDown {
             port_id,
-            port,
+            port: Box::new(port),
             link,
         });
     }
     let seed = match os_random_seed() {
         Ok(seed) => seed,
-        Err(error) => return Err(OpenError::Seed { port, error }),
+        Err(error) => {
+            return Err(OpenError::Seed {
+                port: Box::new(port),
+                error,
+            })
+        }
     };
     let paths: Vec<PathMtu> = config
         .paths
@@ -343,7 +347,10 @@ pub unsafe fn open(
     };
     let start = clock();
     let mut stack = Stack::new(port, stack_config, start)
-        .map_err(|(port, error)| OpenError::Stack { port, error })?;
+        .map_err(|(port, error)| OpenError::Stack {
+            port: Box::new(port),
+            error,
+        })?;
     let gateway = if let Some(gateway) = config.gateway {
         let mut now = start;
         loop {
@@ -357,13 +364,16 @@ pub unsafe fn open(
             let waited = now - start;
             if waited >= Duration::from_secs(3) {
                 return Err(OpenError::GatewayUnresolved {
-                    stack,
+                    stack: Box::new(stack),
                     gateway,
                     waited,
                 });
             }
             if let Err(error) = stack.receive(now, 32) {
-                return Err(OpenError::Receive { stack, error });
+                return Err(OpenError::Receive {
+                    stack: Box::new(stack),
+                    error,
+                });
             }
         }
     } else {
@@ -386,8 +396,6 @@ pub unsafe fn open(
     })
 }
 
-// Setup path; the error size does not matter.
-#[allow(clippy::result_large_err)]
 fn check_mac(config: &Config, device: [u8; 6]) -> Result<(), OpenError> {
     if matches!(&config.device, Device::Pci(_)) {
         if let Some(expected) = config.mac {
