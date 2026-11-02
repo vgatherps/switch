@@ -26,6 +26,8 @@ stub() { # name body
     chmod +x "$stubs/$1"
 }
 for c in pip3 curl rustup cargo install networkctl make taskset; do stub "$c" ""; done
+# dmesg reads the fake kernel log; a missing file is an unreadable dmesg.
+stub dmesg "cat '$root/kmsg'"
 stub dnf 'case "$*" in *kernel-devel*) exit 1 ;; esac'
 stub uname 'case "$1" in -r) echo "${FAKE_KERNEL:-6.1.0-test}" ;; *) echo "${FAKE_ARCH:-aarch64}" ;; esac'
 stub pkg-config 'echo 25.11.3'
@@ -105,6 +107,9 @@ host() {
     echo 0 >"$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
     echo STOCK >"$root/sys/module/vfio_pci_core/srcversion"
     echo arch_sys_counter >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
+    printf '%s\n' '[    0.000000] clocksource: Switched to clocksource kvm-clock' \
+        '[    1.200000] clocksource: Switched to clocksource tsc-early' \
+        '[    2.400000] clocksource: Switched to clocksource tsc' >"$root/kmsg"
     : >"$root/dev/hugepages/.mounted"
     # /opt/dpdk as this script builds it: 25.11.3 with the ENA read_clock patch.
     mkdir -p "$root/opt/dpdk/share"
@@ -246,20 +251,9 @@ check "run-binance refuses while verify fails" sh -c "[ $? = 1 ] && ! grep -q '^
 echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489' >>"$root/var/log/zhida/binance.log"
 run verify
 check "the last run's own report is what counts" has pools "ok last run took 23 of 512"
-# A missing or ordinary file cannot stand in for the real PHC device.
 : >"$calls"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "missing PHC refuses before launching feed" sh -c "[ $? = 1 ] && ! grep -q '^taskset' '$calls'"
-: >"$root/dev/ptp_ena"
-: >"$calls"
-HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "ordinary file PHC refuses before launching feed" sh -c "[ $? = 1 ] && ! grep -q '^taskset' '$calls'"
-rm "$root/dev/ptp_ena"
-# The fake tree uses an existing character device; the real feed validates clock reads.
-ln -s /dev/null "$root/dev/ptp_ena"
-: >"$calls"
-HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5 --phc /dev/ptp_ena"
+check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
 check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/binance.json"
 check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/zhida/binance.json' | cmp -s - '$root/etc/zhida/dut.json'"
 check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
@@ -338,6 +332,22 @@ check "x86_64 verify flags a clocksource other than tsc" has clocksource "FAIL k
 echo tsc >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
 FAKE_ARCH=x86_64 run verify
 check "x86_64 on tsc verifies clean" status_is 0
+check "a boot through kvm-clock and tsc-early to tsc is clean" has clocksource "ok tsc (x86_64); dmesg shows no TSC instability"
+cp "$root/kmsg" "$tmp/kmsg"
+for line in '[  812.000000] clocksource: timekeeping watchdog on CPU3: Marking clocksource '"'"'tsc'"'"' as unstable because the skew is too large:' \
+    '[  812.000001] tsc: Marking TSC unstable due to clocksource watchdog' \
+    '[  812.000002] clocksource: Marking clocksource '"'"'tsc'"'"' as unstable' \
+    '[  812.000003] clocksource: Switched to clocksource hpet'; do
+    { cat "$tmp/kmsg"; echo "$line"; } >"$root/kmsg"
+    FAKE_ARCH=x86_64 run verify
+    check "x86_64 verify fails on: $line" grep -qxF "clocksource: FAIL $line" "$tmp/out"
+done
+rm "$root/kmsg"
+FAKE_ARCH=x86_64 run verify
+check "x86_64 verify fails when dmesg cannot be read" has clocksource "FAIL cannot read dmesg"
+{ cat "$tmp/kmsg"; echo '[  812.000002] clocksource: Marking clocksource '"'"'tsc'"'"' as unstable'; } >"$root/kmsg"
+run verify
+check "a non-x86_64 host skips the dmesg check" has clocksource "ok tsc (aarch64)"
 
 # The DPDK build options must stay the Docker image's.
 dockerfile=$here/../conduit/docker/Dockerfile

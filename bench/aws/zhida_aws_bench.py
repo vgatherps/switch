@@ -228,7 +228,7 @@ systemctl enable --now zhida-deadman.timer
 
 def latency_text(value):
     """zhida-nic's feed_latency value (conduit/crates/binance-feed/src/lib.rs, Display for Latencies:
-    `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
+    `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N max_read_window_ns=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
     per nonempty log2 ns bucket, ascending) -> those counts and the buckets holding p50/p99/p99.9/max
     of the sampled messages. Anything else (`latency invalid: NIC clock jumped`) is the reason as is."""
     words = value.split()

@@ -2,7 +2,6 @@ mod args;
 mod feed;
 mod hugepages;
 mod nic;
-mod phc;
 mod server;
 
 use std::fmt;
@@ -237,14 +236,12 @@ fn run(args: Args) -> i32 {
         ),
         Mode::Feed(f) => {
             let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-            // The scope joins the clock thread before either the port or the owned PHC fd closes.
-            // A recovered data-device reset invalidates the run for either clock source.
-            // Keep the ENA gate: other drivers need not stamp in the selected PHC's domain.
+            // The scope joins the clock thread before the port closes. A recovered data-device
+            // reset invalidates the run. Keep the ENA gate: other drivers need not stamp RX in
+            // the domain of the clock `read_clock` returns.
             let clock_cpus = if report.device.driver_name != "net_ena" {
                 Err("the driver is not net_ena".to_owned())
-            } else if f.phc.is_none()
-                && dpdk_smoltcp::read_clock(port_id) == Err(-libc::ENOTSUP)
-            {
+            } else if dpdk_smoltcp::read_clock(port_id) == Err(-libc::ENOTSUP) {
                 Err("the driver cannot read this NIC's clock".to_owned())
             } else {
                 nic::housekeeping_cpus(report.cpu)
@@ -254,36 +251,16 @@ fn run(args: Args) -> i32 {
                 let _stop = SetOnDrop(&stop_clock);
                 match &clock_cpus {
                     Ok(cpus) => {
-                        let phc = f.phc.as_deref().map(|path| {
-                            phc::Phc::open(path)
-                                .map_err(|e| format!("--phc {}: {e}", path.display()))
-                        }).transpose()?;
                         let stop_clock = &stop_clock;
                         scope.spawn(move || {
                             let mut resets = dpdk_smoltcp::port_resets();
-                            let mut reported_read_error = false;
                             let read = || {
                                 let now = dpdk_smoltcp::port_resets();
                                 if now != resets {
                                     resets = now;
                                     nic_clock::mark_jumped();
                                 }
-                                match &phc {
-                                    Some(phc) => match phc.read() {
-                                        Ok(ns) => Some(ns),
-                                        Err(error) => {
-                                            if !reported_read_error {
-                                                line("nic_clock_error", format_args!(
-                                                    "--phc {}: {error}; failed samples are skipped",
-                                                    f.phc.as_ref().unwrap().display(),
-                                                ));
-                                                reported_read_error = true;
-                                            }
-                                            None
-                                        }
-                                    },
-                                    None => dpdk_smoltcp::read_clock(port_id).ok(),
-                                }
+                                dpdk_smoltcp::read_clock(port_id).ok()
                             };
                             let ran = nic::pin(cpus)
                                 .and_then(|()| Ok(nic_clock::run(read, stop_clock)?));
@@ -292,12 +269,7 @@ fn run(args: Args) -> i32 {
                             }
                         });
                     }
-                    Err(why) => {
-                        if f.phc.is_some() {
-                            return Err(format!("--phc cannot map RX timestamps: {why}"));
-                        }
-                        line("nic_clock", format_args!("none: {why}"));
-                    }
+                    Err(why) => line("nic_clock", format_args!("none: {why}")),
                 }
                 feed::run(
                     &mut net,

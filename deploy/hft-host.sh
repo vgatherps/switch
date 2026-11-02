@@ -544,11 +544,24 @@ verify() {
         esac
     fi
 
+    # x86_64: the TSC must be the clocksource now and never have been found unstable since boot.
+    # Only the last "Switched to clocksource" counts: boot passes through tsc-early (and on EC2
+    # kvm-clock) before tsc.
     cs=$(cat "$R/sys/devices/system/clocksource/clocksource0/current_clocksource" 2>/dev/null)
-    if [ "$(uname -m)" != x86_64 ] || [ "$cs" = tsc ]; then
+    if [ "$(uname -m)" != x86_64 ]; then
         report clocksource ok "${cs:-unknown} ($(uname -m))"
-    else
+    elif [ "$cs" != tsc ]; then
         report clocksource FAIL "$cs, want tsc on x86_64"
+    elif ! kmsg=$(dmesg 2>/dev/null); then
+        report clocksource FAIL "cannot read dmesg (run as root)"
+    elif bad=$(printf '%s\n' "$kmsg" | grep -m 1 -e 'clocksource: timekeeping watchdog' -e 'TSC unstable' \
+        -e "Marking clocksource 'tsc' as unstable"); then
+        report clocksource FAIL "$bad"
+    elif last=$(printf '%s\n' "$kmsg" | grep 'Switched to clocksource' | tail -n 1) \
+        && [ -n "$last" ] && [ "${last##*Switched to clocksource }" != tsc ]; then
+        report clocksource FAIL "$last"
+    else
+        report clocksource ok "tsc ($(uname -m)); dmesg shows no TSC instability"
     fi
 
     if systemctl is-enabled -q zhida-host.service 2>/dev/null; then

@@ -45,6 +45,7 @@ impl Latency {
 
 static MAPPING: Mapping = Mapping::new();
 static JUMPED: AtomicBool = AtomicBool::new(false);
+static MAX_READ_WINDOW_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a read ever contradicted a fit or went backwards (the NIC clock jumped). Samples
 /// taken up to one read (100 ms) before that may be wrong by more than their bound, so the
@@ -57,6 +58,12 @@ pub fn jumped() -> bool {
 /// may have jumped without a read showing it (the NIC was reset).
 pub fn mark_jumped() {
     JUMPED.store(true, Ordering::Relaxed);
+}
+
+/// The widest counter window (`after - before`, in PHC ns at the fit's rate) around one PHC read
+/// that entered a fit this run; 0 before the first fit.
+pub fn max_read_window_ns() -> u64 {
+    MAX_READ_WINDOW_NS.load(Ordering::Relaxed)
 }
 
 /// Latency from `stamp` (PHC ns) to now; `None` if `stamp` is 0 or the fit is not ready.
@@ -89,6 +96,7 @@ pub fn run(mut read_phc: impl FnMut() -> Option<u64>, stop: &AtomicBool) -> Resu
             if calibration.jumped {
                 JUMPED.store(true, Ordering::Relaxed);
             }
+            MAX_READ_WINDOW_NS.store(calibration.max_window_ns, Ordering::Relaxed);
         }
         std::thread::sleep(PERIOD);
     }
@@ -104,12 +112,14 @@ struct Read {
     after: u64,
 }
 
-/// Consistent reads, oldest first, the fit through the latest, and whether a fit was dropped.
+/// Consistent reads, oldest first, the fit through the latest, whether a fit was dropped, and
+/// the widest window of a read that entered a fit (PHC ns).
 #[derive(Default)]
 struct Calibration {
     reads: Vec<Read>,
     fit: Option<Fit>,
     jumped: bool,
+    max_window_ns: u64,
 }
 
 impl Calibration {
@@ -137,6 +147,9 @@ impl Calibration {
             .filter(|old| read.phc - old.phc >= BASELINE_NS)
             .min_by_key(|old| old.after - old.before);
         self.fit = base.and_then(|base| Fit::new(read, *base));
+        if let Some(fit) = self.fit {
+            self.max_window_ns = self.max_window_ns.max(fit.ns(read.after - read.before));
+        }
         self.fit
     }
 }

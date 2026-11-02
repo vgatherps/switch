@@ -74,6 +74,12 @@ impl Fit {
         phc < lo - slack || phc > hi + slack
     }
 
+    /// PHC ns in `ticks` counter ticks at the rate `r`, rounded up.
+    pub(crate) fn ns(&self, ticks: u64) -> u64 {
+        let ns = (u128::from(ticks) * u128::from(self.r)).div_ceil(1 << Q);
+        u64::try_from(ns).unwrap_or(u64::MAX)
+    }
+
     /// Ticks in `ns` PHC nanoseconds, rounded up.
     pub(crate) fn ticks(&self, ns: u64) -> u64 {
         let ticks = (u128::from(ns) << Q).div_ceil(u128::from(self.r.max(1)));

@@ -78,25 +78,27 @@ unmanaged file and reloads networkd. Write and reload failures stop setup before
 
 `verify` prints one `<step>: ok|FAIL <detail>` line for each of: cmdline, management (on its kernel
 driver, with the default route), data (on vfio-pci), cpus (`isolated` and `nohz_full` in sysfs), hugepages,
-pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed WC module), clocksource (the current
-one; anything but `tsc` fails on x86_64), unit, config.
+pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed WC module), clocksource (on x86_64 the
+current one must be `tsc`, and `dmesg`, read as root, must show no `clocksource: timekeeping watchdog`,
+`TSC unstable` or `Marking clocksource 'tsc' as unstable` line, and its last `Switched to clocksource`
+must name `tsc`; a failure prints the offending line; other architectures skip it), unit, config.
 `pools` reads zhida-nic's own `hugepages: hugepages-2048kB used=N free=M` line from the last run in
 `/var/log/zhida/binance.log` and fails if the run took more than the 512 reserved pages.
 
-`run-binance.sh` runs `hft-host.sh verify` first and refuses to start if `/dev/ptp_ena` is
-not a character device. It then writes `/etc/zhida/binance.json`: `dut.json` with
-`rx_timestamps: true`. It refuses to start unless `zhida-netconf check` reads that back, then runs
-`zhida-nic --config /etc/zhida/binance.json feed --phc /dev/ptp_ena` pinned to the app CPU,
-appending to `/var/log/zhida/binance.log`. The feed opens and reads the real Linux PHC for
-background mapper sampling; an unreadable or unsupported clock fails startup, with no wall-clock
-fallback or per-packet clock read. If the device is absent, check `ena.phc_enable=1` in the running
-kernel command line and reboot after `apply`.
+`run-binance.sh` runs `hft-host.sh verify` first and refuses to start if it fails. It then writes
+`/etc/zhida/binance.json`: `dut.json` with `rx_timestamps: true`. It refuses to start unless
+`zhida-netconf check` reads that back, then runs `zhida-nic --config /etc/zhida/binance.json feed`
+pinned to the app CPU, appending to `/var/log/zhida/binance.log`. The feed's mapper thread reads the
+data ENI's own PHC through DPDK (`dpdk_smoltcp::read_clock`, the patched ENA `rte_eth_read_clock`),
+the clock its RX timestamps are in; there is no wall-clock fallback or per-packet clock read. If the
+driver cannot read the clock, the feed prints `nic_clock: none: ...` and reports stamped messages as
+`not_ready`.
 
 AWS documents the packet timestamp reference as the
 [Amazon Time Sync PTP hardware clock](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping).
 The displayed `max_mapping_bound_ns` is mapper sampling uncertainty under the mapper's assumptions,
-not a measured bound on cross-interface skew or AWS clock error. No independent accuracy guarantee
-between the data ENI's timestamp clock and the management ENI's PHC has been established here.
+not a measured bound on AWS clock error; `max_read_window_ns` is the widest window of a single PHC
+read (the counter reads around it) that entered the mapping.
 
 The 512 x 2 MiB HugeTLB pages (1 GiB) are reserved for DPDK. `run-binance.sh` and the AWS benchmark's
 receiver and senders explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding any inherited value.

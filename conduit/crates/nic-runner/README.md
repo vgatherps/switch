@@ -221,8 +221,7 @@ it prints the requested bit and the reason. A refused offload fails Port open wi
 nic --config dut.json feed --seconds 30 --print 10 2>&1 | tee feed.log
 ```
 Options: `--host H` (default stream.binance.com), `--port P` (9443), `--path P`
-(/ws/btcusdt@bookTicker), `--print N` (10), `--seconds S` (30, counted from the WebSocket open),
-`--phc PATH` (optional, explicit Linux PTP hardware clock device, e.g. `/dev/ptp_ena`). The
+(/ws/btcusdt@bookTicker), `--print N` (10), `--seconds S` (30, counted from the WebSocket open). The
 kernel resolves the host name before the NIC is taken. The client is binance-feed's: relay's wss
 client over sheath (TLS 1.3 only), as a switch task on a switchnet Net. data-stream.binance.vision
 speaks TLS 1.2 only and is unreachable; stream.binance.com may answer HTTP 451 from restricted
@@ -235,31 +234,21 @@ messages can share a timestamp; TCP can append a later small packet to an earlie
 the earlier timestamp. These intervals can therefore start before the message's own packet.
 The output gives `no_stamp` (unstamped: `rx_timestamps` off or the PMD left no stamp), `not_ready`
 (no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the
-largest mapping uncertainty and a log2 histogram in ns. On ENA (with the DPDK patch in
-`docker/dpdk-ena-read-clock.patch`),
-the default source is `dpdk_smoltcp::read_clock`, which never runs during an ENA device reset
-(the reset frees and rebuilds the PHC). If the port reports -ENOTSUP, no mapping is available.
+largest mapping uncertainty (`max_mapping_bound_ns`), the widest single clock read that entered the
+mapping (`max_read_window_ns`: the CPU-counter window around one PHC read, in ns at the fitted rate)
+and a log2 histogram in ns. On ENA (with the DPDK patch in `docker/dpdk-ena-read-clock.patch`), the
+clock is the data ENI's own PHC, read with `dpdk_smoltcp::read_clock`, which never runs during an
+ENA device reset (the reset frees and rebuilds the PHC). If the port reports -ENOTSUP, no mapping is
+available: the feed prints `nic_clock: none: ...` and stamped messages are `not_ready`.
 A thread on the housekeeping CPUs (online CPUs not in /sys/devices/system/cpu/isolated, minus
 Zhida's) maps the clock onto the CPU counter; there are no per-packet clock syscalls.
 
-`feed --phc /dev/ptp_ena` explicitly uses that opened Linux PHC's dynamic clock ID and
-`clock_gettime` instead of the data port's `read_clock`, including when the port reports -ENOTSUP.
-The owning fd moves into the housekeeping thread and stays open until that thread exits.
-Opening and the first actual clock read validate the device once on the calling thread before
-the feed starts; periodic mapper sampling runs only on the housekeeping thread. An open/read
-error, non-ENA driver, or unavailable housekeeping CPU fails explicit selection with a clear error
-and unsuccessful exit; no latency
-metric is produced and there is no fallback to the port clock or wall clock. Later read failures
-are reported once and skipped, preserving the mapper's existing 300 ms stale timeout.
-Without `--phc`, unavailable mapping still prints `nic_clock: none` and stamped messages are
-`not_ready`. The ENA-only gate remains for both sources: other drivers' clocks need not match
-their RX timestamps (ice's `read_clock` returns CLOCK_MONOTONIC_RAW).
+A failed read is skipped (the mapping goes stale after 300 ms of them). Only net_ena gets a mapping:
+other drivers' clocks need not match their RX timestamps (ice's `read_clock` returns
+CLOCK_MONOTONIC_RAW); a non-ENA driver or no housekeeping CPU also prints `nic_clock: none: ...`.
 
-The reported bound covers the CPU-counter-to-selected-PHC mapping, not an independently established
-accuracy bound between two ENIs. The selected PHC must share the RX timestamp clock reference.
-[AWS documents the Amazon Time Sync PTP hardware clock as the packet timestamp reference](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping),
-but no independent inter-ENI skew guarantee is established here. Do not treat the mapper's bound
-alone as a comprehensive end-to-end accuracy guarantee.
+The reported bound covers the CPU-counter-to-PHC mapping under its assumptions; do not treat it alone
+as an end-to-end accuracy guarantee.
 If a NIC clock read ever contradicts the mapping (the clock jumped, e.g. stepped), samples taken in the up to 100 ms
 before that read may be wrong by more than their bound, and they are not removed. So the run's latency result is
 invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and histogram. A device

@@ -178,6 +178,24 @@ fn a_backward_read_restarts_the_fit() {
     assert!(f.calibration.jumped);
 }
 
+/// Each read that enters a fit has its counter window (`after - before`) recorded in PHC ns at
+/// the fit's rate; the widest stays.
+#[test]
+fn the_widest_fitted_read_window_is_kept() {
+    let mut f = Fixture::default();
+    let last = f.exact_reads(LINE, 1 << 40, 11);
+    assert_eq!(f.calibration.max_window_ns, 0, "exact reads have no window");
+    let at = last + LINE.ticks(100 * MS);
+    // 3 GHz: 3000 ticks either side of the sample, a 2 µs window.
+    let half = 3_000;
+    f.add(LINE.read(at, half, half));
+    assert!(f.latency(LINE.phc(at), at).is_some(), "the 2 µs read entered the fit");
+    assert_eq!(f.calibration.max_window_ns, 2_000);
+    let at = at + LINE.ticks(100 * MS);
+    f.add(LINE.read(at, 1, 1));
+    assert_eq!(f.calibration.max_window_ns, 2_000, "a narrower later read keeps the widest");
+}
+
 /// A writer publishes fits whose fields all equal one value; a reader on another thread must
 /// never see two fits mixed.
 #[test]

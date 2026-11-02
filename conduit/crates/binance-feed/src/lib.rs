@@ -302,8 +302,11 @@ pub struct Latencies {
     /// ns >= 2^30 (about 1.07 s).
     pub buckets: [u64; 32],
     /// Largest mapper sampling uncertainty under the mapper's assumptions, not a measured
-    /// bound on cross-interface skew or AWS clock error.
+    /// bound on AWS clock error.
     pub max_bound_ns: u64,
+    /// The widest single PHC read that entered the mapping (`nic_clock::max_read_window_ns`),
+    /// taken when the feed reports.
+    pub max_read_window_ns: u64,
 }
 
 impl Latencies {
@@ -324,14 +327,14 @@ impl Latencies {
     }
 }
 
-/// `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N`, then `<=0:N`, `<lo>..<hi>:N` and
+/// `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N max_read_window_ns=N`, then `<=0:N`, `<lo>..<hi>:N` and
 /// `1073741824..:N` (ns) for each nonempty bucket.
 impl fmt::Display for Latencies {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no_stamp={} not_ready={} impossible={} max_mapping_bound_ns={}",
-            self.no_stamp, self.not_ready, self.impossible, self.max_bound_ns
+            "no_stamp={} not_ready={} impossible={} max_mapping_bound_ns={} max_read_window_ns={}",
+            self.no_stamp, self.not_ready, self.impossible, self.max_bound_ns, self.max_read_window_ns
         )?;
         for (i, &count) in self.buckets.iter().enumerate().filter(|(_, &count)| count > 0) {
             match i {
@@ -388,6 +391,7 @@ pub async fn feed(
                 None => reading.await,
             };
             line(name, "feed_count", summary.count);
+            summary.latencies.max_read_window_ns = nic_clock::max_read_window_ns();
             let _ = write_latency(&mut io::stdout(), name, summary.latencies, clock_reset);
             match summary.update_ids {
                 Some((first, last)) => line(name, "feed_update_ids", format_args!("{first}..{last}")),
@@ -505,13 +509,14 @@ mod tests {
 
     #[test]
     fn latencies_print_nonempty_buckets() {
-        let mut latencies = Latencies { impossible: 1, max_bound_ns: 40, ..Latencies::default() };
+        let mut latencies =
+            Latencies { impossible: 1, max_bound_ns: 40, max_read_window_ns: 2_000, ..Latencies::default() };
         latencies.buckets[0] = 2;
         latencies.buckets[14] = 5;
         latencies.buckets[31] = 1;
         assert_eq!(
             latencies.to_string(),
-            "no_stamp=0 not_ready=0 impossible=1 max_mapping_bound_ns=40 <=0:2 8192..16384:5 1073741824..:1"
+            "no_stamp=0 not_ready=0 impossible=1 max_mapping_bound_ns=40 max_read_window_ns=2000 <=0:2 8192..16384:5 1073741824..:1"
         );
     }
 
@@ -524,7 +529,7 @@ mod tests {
         write_latency(&mut output, "test", latencies, || false).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "test: feed_latency: no_stamp=2 not_ready=0 impossible=0 max_mapping_bound_ns=0\n"
+            "test: feed_latency: no_stamp=2 not_ready=0 impossible=0 max_mapping_bound_ns=0 max_read_window_ns=0\n"
         );
     }
 }
