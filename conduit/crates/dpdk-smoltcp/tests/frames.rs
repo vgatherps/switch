@@ -666,7 +666,7 @@ fn peer_zero_window_probe_then_full_delivery() {
             .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
         {
             assert_eq!(tcp.seq_number, next, "data was retransmitted or skipped");
-            next = next + tcp.payload.len();
+            next += tcp.payload.len();
         }
         assert_eq!(next, a_seq + data.len());
         assert_eq!((pair.a.tcp(&handles[0]).retransmits(), pair.a.tcp(&handles[0]).loss_events()), (0, 0));
