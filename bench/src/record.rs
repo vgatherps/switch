@@ -25,6 +25,8 @@ pub struct Recorder {
     window: [u64; 2],
     /// Echo time - actual send time (TCP/ws; recorded by the connection's receive task).
     pub service_rtt: Histogram,
+    /// Monotonic ns of this step's latest first echo of a message.
+    pub last_echo_ns: Option<u64>,
 }
 
 impl Recorder {
@@ -50,6 +52,7 @@ impl Recorder {
             received_in_window: 0,
             window,
             service_rtt: Histogram::new(),
+            last_echo_ns: None,
         }
     }
 
@@ -71,6 +74,7 @@ impl Recorder {
             return;
         }
         self.seen[word] |= mask;
+        self.last_echo_ns = Some(now_ns);
         self.received_in_window += u64::from((self.window[0]..self.window[1]).contains(&now_ns));
         if k < self.measured_from {
             return;

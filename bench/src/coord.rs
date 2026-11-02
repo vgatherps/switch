@@ -94,9 +94,22 @@ pub struct StepReport {
     pub budget_bound: bool,
     /// Any sender fell behind schedule; the cause and receiver capacity are not isolated.
     pub generator_bound: bool,
-    /// TCP/ws: echo time - actual send time, median; the first step's is the budget's baseline.
-    #[serde(skip)]
-    pub service_rtt_p50_ns: Option<u64>,
+    /// TCP/ws: echo time - actual send time; the first step's p50 is the budget's baseline.
+    pub service_rtt_ns: Option<Quantiles>,
+    /// Actual - scheduled send time of measured messages sent fresh off the schedule.
+    pub send_lag_ns: Option<Quantiles>,
+    /// Per worker, in worker order.
+    pub workers: Vec<WorkerStep>,
+}
+
+/// One worker's send-side state at the end of a step.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WorkerStep {
+    pub backlog_at_end: u64,
+    pub stops: u64,
+    /// Ns after the worker's step start.
+    pub last_send_ns: Option<u64>,
+    pub last_echo_ns: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -126,6 +139,7 @@ const LAG_LIMIT_NS: u64 = 20_000;
 pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepReport, String> {
     let mut latency = Histogram::new();
     let mut rtt = Histogram::new();
+    let mut lag = Histogram::new();
     let mut generator_bound = false;
     for (g, r) in results.iter().enumerate() {
         if r.step != step {
@@ -136,7 +150,9 @@ pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepRepor
         }
         latency.merge(&Histogram::from_sparse(&r.latency)?);
         rtt.merge(&Histogram::from_sparse(&r.service_rtt)?);
-        let lag_p99 = Histogram::from_sparse(&r.send_lag)?.quantile(0.99);
+        let worker_lag = Histogram::from_sparse(&r.send_lag)?;
+        let lag_p99 = worker_lag.quantile(0.99);
+        lag.merge(&worker_lag);
         generator_bound |= r.backlog_at_end > 0 || lag_p99.is_some_and(|p| p > LAG_LIMIT_NS);
     }
     let sum = |f: fn(&StepResult) -> u64| results.iter().map(f).sum::<u64>();
@@ -155,7 +171,17 @@ pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepRepor
         latency_ns: Quantiles::of(&latency),
         budget_bound: sum(|r| r.budget_waits) > 0,
         generator_bound,
-        service_rtt_p50_ns: rtt.quantile(0.5),
+        service_rtt_ns: Quantiles::of(&rtt),
+        send_lag_ns: Quantiles::of(&lag),
+        workers: results
+            .iter()
+            .map(|r| WorkerStep {
+                backlog_at_end: r.backlog_at_end,
+                stops: r.stops,
+                last_send_ns: r.last_send_ns,
+                last_echo_ns: r.last_echo_ns,
+            })
+            .collect(),
     })
 }
 
@@ -473,7 +499,7 @@ fn sweep(
             budget_per_connection: budgets,
         }).expect("report serializes"));
         if id == 0 && window_ns.is_some() {
-            baseline_rtt_ns = report.service_rtt_p50_ns;
+            baseline_rtt_ns = report.service_rtt_ns.as_ref().map(|q| q.p50);
             if baseline_rtt_ns.is_none() {
                 return Err(
                     "no echo in the first step: no baseline round trip for the budget".into(),
@@ -540,6 +566,9 @@ mod tests {
             backlog_at_end: backlog,
             service_rtt: Histogram::new().to_sparse(),
             budget_waits: 0,
+            stops: 0,
+            last_send_ns: None,
+            last_echo_ns: None,
         }
     }
 
@@ -773,6 +802,39 @@ mod tests {
         assert_eq!(lines[0]["drop_fraction"], 1.0);
         assert!(lines[0]["latency_ns"].is_null());
         assert_eq!(lines[1]["complete"], true);
+    }
+
+    /// The step line carries the merged service round trip and send lag quantiles, and each
+    /// worker's backlog, Stop count and last send and echo times.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn step_line_carries_service_rtt_and_send_lag() {
+        let mut sample = result(0, &[1000], &[300], 1, 0);
+        let mut rtt = Histogram::new();
+        rtt.record(40_000);
+        sample.service_rtt = rtt.to_sparse();
+        sample.stops = 3;
+        sample.last_send_ns = Some(5_000_000);
+        sample.last_echo_ns = Some(5_040_000);
+        let mut args = args();
+        args.gens = 1;
+        args.gen_cmd = fake_worker("step-line", &sample, 1);
+        let (r, lines) = run_lines(&args);
+        assert_eq!(r, Ok(()));
+        let step = &lines[0];
+        let q = |v: &serde_json::Value| (v["p50"].as_u64().unwrap(), v["max"].as_u64().unwrap());
+        let (p50, max) = q(&step["service_rtt_ns"]);
+        assert!(p50 <= 40_000 && p50 >= 40_000 - 40_000 / 128 && max == 40_000, "{step}");
+        assert_eq!(q(&step["send_lag_ns"]), (300, 300));
+        assert_eq!(
+            step["workers"],
+            serde_json::json!([{
+                "backlog_at_end": 0,
+                "stops": 3,
+                "last_send_ns": 5_000_000,
+                "last_echo_ns": 5_040_000,
+            }])
+        );
     }
 
     /// TCP/ws with a budget: no echo in the first step leaves no baseline, and the sweep fails

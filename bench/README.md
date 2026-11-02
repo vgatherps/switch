@@ -10,7 +10,10 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   and senders split evenly. Worker g starts each step g / rate s after the common start, so the workers'
   schedules interleave instead of sending in phase. Results are merged (counts summed, histograms merged:
   percentiles are never averaged). Prints one `step` JSON line per rate (`offered_pps`, `sent_pps` /
-  `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`).
+  `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`,
+  `service_rtt_ns` (echo time - actual send time) and `send_lag_ns` (actual - scheduled send time of
+  fresh sends) with the same quantiles, and `workers`: per worker `backlog_at_end`, `stops`, and
+  `last_send_ns` / `last_echo_ns` after its step start).
   `sent_pps` counts messages accepted by the generator stack, not NIC transmissions; `received_pps` counts
   echoes arriving within the window, including warmup echoes. Always prints one
   `summary` line (`steps`, `complete`, `generator_bound`, `error`). No knee is computed: the table
