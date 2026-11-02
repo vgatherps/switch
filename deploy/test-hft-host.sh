@@ -75,7 +75,10 @@ esac'
 # vfio-pci.
 stub zhida-netconf "case \"\$1\" in
     discover) printf '{\\n  \"version\": 1,\\n  \"rx_timestamps\": false,\\n  \"descriptors\": 1024\\n}\\n' >\"\$6\" ;;
-    check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" ;;
+    check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" || exit 1
+        # The real summary has more lines after rx_timestamps; a long one fails its writes
+        # once a reader that stopped early (grep -q) has closed the pipe.
+        [ -z \"\${FAKE_CHECK_LONG:-}\" ] || yes '  summary line' | head -n 100000 ;;
     bind) ln -sfn ../../drivers/vfio-pci '$root/sys/bus/pci/devices/0000:00:06.0/driver' ;;
 esac"
 stub zhida-nic "echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489'"
@@ -287,6 +290,9 @@ check "run-binance pins zhida-nic feed to the app CPU with its own config" calle
 check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/binance.json"
 check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/zhida/binance.json' | cmp -s - '$root/etc/zhida/dut.json'"
 check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
+: >"$calls"
+FAKE_CHECK_LONG=1 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "run-binance starts when check's summary outlives an early-exiting reader" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
 # A config whose rx_timestamps line is not netconf's format cannot be turned on: refuse.
 cp "$root/etc/zhida/dut.json" "$tmp/dut"
 printf '{"version": 1, "rx_timestamps": false}\n' >"$root/etc/zhida/dut.json"

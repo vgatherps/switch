@@ -4,7 +4,7 @@ use zhida_netconf::{
     imds::Imds,
     rediscover, Config,
 };
-use std::{env, ffi::OsString, path::Path, process::ExitCode};
+use std::{env, ffi::OsString, io::Write, path::Path, process::ExitCode};
 
 const USAGE: &str = "usage: zhida-netconf check FILE | zhida-netconf discover --interface IF [--ipv4 ADDR] [--aws] [-o FILE] | zhida-netconf bind FILE [--noiommu] [--dry-run] | zhida-netconf unbind FILE";
 
@@ -33,10 +33,10 @@ fn main() -> ExitCode {
             }
             let path = Path::new(&file);
             match Config::load(path) {
-                Ok(config) => {
-                    print!("{config}");
-                    ExitCode::SUCCESS
-                }
+                Ok(config) => match write!(std::io::stdout().lock(), "{config}") {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => failure(format!("writing the summary: {error}")),
+                },
                 Err(error) => failure(format!("{}: {error}", path.display())),
             }
         }
