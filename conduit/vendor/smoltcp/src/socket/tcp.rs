@@ -1698,7 +1698,8 @@ impl<'a> Socket<'a> {
     /// after `TxToken::consume`; a reply dropped for lack of TX room or a neighbor
     /// (`reply_dropped`) leaves the cumulative ACK owed, so the next egress sends it. A dropped
     /// reply whose ack number and window don't move (a duplicate ACK, D-SACK or challenge ACK)
-    /// leaves nothing owed; the peer's next segment brings another.
+    /// leaves nothing owed: the peer's next segment brings another duplicate ACK or D-SACK, but
+    /// a dropped challenge ACK has used its rate limit, so the next waits out its 500 ms.
     fn ack_reply(
         &mut self,
         ip_repr: &IpRepr,
