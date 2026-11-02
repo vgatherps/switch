@@ -1290,6 +1290,23 @@ fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
     });
 }
 
+/// The peer resets the connection; once the client saw it (its receive half reports the reset),
+/// setting up a sender on the dead socket is `Dead` although a frame is free: the probe frame is
+/// taken, then the MSS read finds no connection.
+#[zhida_test_support::pinned_test]
+fn setup_on_a_reset_socket_with_a_free_frame_is_dead() {
+    use sheath::switchnet::{SetupError, SwitchTx};
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let (mut rx, tcp) = stream.split();
+        go_tx.send(()).unwrap();
+        let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+        assert!(seen.is_err(), "data instead of the reset");
+        let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the setup waited");
+        assert!(matches!(got, Err(SetupError::Dead)), "{:?}", got.map(drop));
+    });
+}
+
 /// `tls_connect`'s plaintext minimum: 0 counts as one byte (a record's floor), so a 76 B send
 /// buffer (one record's overhead, no byte of plaintext) is refused, where it once passed setup
 /// and panicked after the handshake; a minimum past `usize::MAX` once its overhead is added is
