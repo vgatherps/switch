@@ -20,7 +20,8 @@ def step(pps, p99, drop=0.0, bound=False, rtt_p99=None, lag_p99=None):
 
 
 def summary(steps=2, complete=True, error=None, bound=False):
-    return {"kind": "summary", "steps": steps, "complete": complete, "generator_bound": bound, "error": error}
+    return {"kind": "summary", "steps": steps, "complete": complete, "generator_bound": bound,
+            "behind_workers": [1] if bound else [], "error": error}
 
 
 def write_jsonl(path, lines):
@@ -75,6 +76,8 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(report.main(["report.py", d]), 0)
             write_jsonl(os.path.join(d, "udp-a.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
             self.assertEqual(report.main(["report.py", d]), 1)
+            with open(os.path.join(d, "report.md")) as f:
+                self.assertIn("- udp-a: sender behind schedule: worker(s) [1]", f.read())
 
     def test_an_empty_results_directory_is_incomplete(self):
         with tempfile.TemporaryDirectory() as d:

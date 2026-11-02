@@ -594,8 +594,9 @@ async fn try_tx_frame(handle: &NetHandle) -> Option<TxFrame> {
 
 /// Sends the step's messages on schedule through the pacer (at most its budget per poll),
 /// yielding to the loop between batches, until all are sent or the window ends. Send lag is
-/// recorded for measured messages only (the warmup absorbs ARP and connection start), and not for
-/// owed messages (a full connection, or one at its budget).
+/// recorded for measured messages only (the warmup absorbs ARP and connection start), and only
+/// for fresh ones (`Pacer::is_fresh`: not owed by a full connection or one at its budget, not
+/// held back by a transport-wide refusal).
 #[switch::task]
 async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let SendStep {
@@ -665,7 +666,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
                 size
             };
             frame.set_len(len);
-            let owed = pacer.is_owed(k);
+            let fresh = pacer.is_fresh(k);
             let outcome = senders.borrow_mut().send(sender, frame, target);
             out.stops += u64::from(outcome == Outcome::Stop);
             if outcome == Outcome::Sent {
@@ -675,7 +676,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
                 if let Some(c) = conn {
                     c.in_flight.borrow_mut().push_back(now);
                 }
-                if k >= measured_from && !owed {
+                if k >= measured_from && fresh {
                     out.lag.record(now.saturating_sub(sched_ns));
                 }
             }

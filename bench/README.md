@@ -16,10 +16,12 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   `last_send_ns` / `last_echo_ns` after its step start).
   `sent_pps` counts messages accepted by the generator stack, not NIC transmissions; `received_pps` counts
   echoes arriving within the window, including warmup echoes. Always prints one
-  `summary` line (`steps`, `complete`, `generator_bound`, `error`). No knee is computed: the table
-  and plot show it. A step where any sender fell behind (a backlog at the end of its send window, or
-  send-lag p99 over 20 µs) is `generator_bound`. The sweep stops and exits non-zero: this flag does not
-  identify the cause, and receiver backpressure can also delay sends. Exit 0 iff `complete` and not
+  `summary` line (`steps`, `complete`, `generator_bound`, `behind_workers`, `error`). No knee is computed:
+  the table and plot show it. A worker is `behind_schedule` when its fresh-send lag p99 is over 20 µs; fresh
+  sends exclude messages a full connection (or one at its budget) owed and messages already due when a
+  pool stop ended a poll, so receiver backpressure and pool stops show in `stops` / `backlog_at_end` and
+  never end the sweep. A step with any worker behind schedule is `generator_bound`: the sweep stops, names
+  the workers and exits non-zero. Exit 0 iff `complete` and not
   `generator_bound`. When a worker fails, the steps already printed stand and the
   summary says `complete: false`. A worker that does not answer within the step's time plus 10 s fails the
   sweep, and every worker's process group is killed. A shutdown failure also kills all workers still awaiting

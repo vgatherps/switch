@@ -52,7 +52,7 @@ def problems(directory, sweeps):
         elif not summary.get("complete"):
             out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
         elif summary.get("generator_bound"):
-            out.append(f"{name}: sender fell behind schedule; receiver capacity is not isolated")
+            out.append(f"{name}: sender behind schedule: worker(s) {summary.get('behind_workers')}")
     return out
 
 
@@ -184,8 +184,8 @@ def build(directory, title):
             f.write(svg_plot(steps, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
-            sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
-                         " identify the cause; receiver backpressure can also delay sends.", ""]
+            sections += ["SENDER-LATE: a sender's fresh sends fell behind schedule (send lag p99 over 20 µs, not"
+                         " counting messages a full connection owed or a pool stop held back) and the sweep stopped.", ""]
         if any(s.get("budget_bound") for s in steps):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
                          " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"

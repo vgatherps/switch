@@ -40,6 +40,9 @@ pub struct Pacer {
     left: u64,
     visited_blocked: usize,
     stopped: bool,
+    /// Messages below this were due when a transport-wide refusal ended a poll: held back by the
+    /// transport, not by the generator.
+    held_below: u64,
     /// At the end of the first poll after the last message's scheduled time: due and not yet
     /// reached by the cursor.
     at_end: Option<u64>,
@@ -62,6 +65,7 @@ impl Pacer {
             left: 0,
             visited_blocked: 0,
             stopped: false,
+            held_below: 0,
             at_end: None,
         }
     }
@@ -129,7 +133,10 @@ impl Pacer {
                     self.cursor = k + 1;
                 }
             }
-            Outcome::Stop => self.stopped = true,
+            Outcome::Stop => {
+                self.stopped = true;
+                self.held_below = self.due;
+            }
         }
     }
 
@@ -153,10 +160,11 @@ impl Pacer {
         self.at_end.unwrap_or(0)
     }
 
-    /// Whether message `k` goes out as a blocked sender's owed message (its wait includes the
-    /// connection's flow control) rather than fresh off the schedule.
-    pub fn is_owed(&self, k: u64) -> bool {
-        self.is_blocked[self.schedule.split(k).0 as usize]
+    /// Whether message `k` goes out fresh off the schedule, so its send lag is the generator's
+    /// own: not owed by a blocked sender (its wait includes the connection's flow control) and
+    /// not due when a transport-wide refusal ended a poll (its wait includes the transport's).
+    pub fn is_fresh(&self, k: u64) -> bool {
+        k >= self.held_below && !self.is_blocked[self.schedule.split(k).0 as usize]
     }
 
     /// Messages of sender `i` numbered below `k`.
@@ -331,6 +339,28 @@ mod tests {
         assert_eq!(p.next_try(), Some(1));
         p.result(1, Outcome::Blocked);
         assert_eq!(p.next_try(), Some(0), "sender 0 skipped");
+    }
+
+    /// A transport-wide refusal holds back every message already due in that poll, not only the
+    /// one refused: none of them is fresh; messages falling due later are.
+    #[test]
+    fn messages_due_at_a_stop_are_not_fresh() {
+        let s = Schedule {
+            senders: 1,
+            interval_ns: 1000,
+            origin_ns: 0,
+        };
+        let mut p = Pacer::new(s, 100, 32);
+        p.begin(3000); // messages 0..4 due
+        assert_eq!(p.next_try(), Some(0));
+        assert!(p.is_fresh(0));
+        p.result(0, Outcome::Sent);
+        assert_eq!(p.next_try(), Some(1));
+        p.result(1, Outcome::Stop);
+        p.finish(3000);
+        p.begin(10_000);
+        assert!((1..4).all(|k| !p.is_fresh(k)));
+        assert!((4..11).all(|k| p.is_fresh(k)));
     }
 
     /// The send task stopped being polled at 10 µs (starved); the one poll at the cutoff tries
