@@ -239,7 +239,6 @@ impl Executor {
         unsafe {
             if !(*this).deferred.is_empty() {
                 // DEFERRED stays set until the task's round clears it with QUEUED.
-                // Every slot has at most one queue entry: no reallocation.
                 (*this).incoming.append(&mut (*this).deferred);
             }
         }
