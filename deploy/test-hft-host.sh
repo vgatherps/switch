@@ -26,6 +26,26 @@ stub() { # name body
     chmod +x "$stubs/$1"
 }
 for c in pip3 curl rustup cargo install networkctl make taskset; do stub "$c" ""; done
+# chronyc tracking prints the fake tree's tracking file, or fails as with no chronyd running.
+stub chronyc "[ -f '$root/tracking' ] || { echo '506 Cannot talk to daemon'; exit 1; }
+case \"\$1\" in
+    tracking) cat '$root/tracking' ;;
+    sources) cat '$root/sources' ;;
+esac"
+# chronyc tracking and sources as AWS documents them. tracking REFID SECONDS SIDE SELECTED-ROW, the
+# last being the PHC row's mode/state (`#*` selected, `#-` not) or `none` for no PHC source.
+tracking() {
+    printf '%s\n' "Reference ID    : $1" 'Stratum         : 1' 'Ref time (UTC)  : Wed May 06 01:33:43 2026' \
+        "System time     : $2 seconds $3 of NTP time" 'Last offset     : +0.000000331 seconds' \
+        'Leap status     : Normal' >"$root/tracking"
+    {
+        echo 'MS Name/IP address         Stratum Poll Reach LastRx Last sample'
+        echo '==============================================================================='
+        [ "$4" = none ] || echo "$4 PHC0                          0   0   377     0   +184ns[ +198ns] +/- 5032ns"
+        if [ "$4" = '#*' ]; then ntp='^-'; else ntp='^*'; fi
+        echo "$ntp 169.254.169.123               1   4   377     8    -18us[  -18us] +/-  115us"
+    } >"$root/sources"
+}
 # dmesg reads the fake kernel log; a missing file is an unreadable dmesg.
 stub dmesg "cat '$root/kmsg'"
 stub dnf 'case "$*" in *kernel-devel*) exit 1 ;; esac'
@@ -111,6 +131,10 @@ host() {
         '[    1.200000] clocksource: Switched to clocksource tsc-early' \
         '[    2.400000] clocksource: Switched to clocksource tsc' >"$root/kmsg"
     : >"$root/dev/hugepages/.mounted"
+    # AL2023's chrony.conf: the Time Sync NTP server (abridged).
+    printf '%s\n' 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' 'driftfile /var/lib/chrony/drift' \
+        >"$root/etc/chrony.conf"
+    tracking '50484330 (PHC0)' 0.000000184 slow '#*'
     # /opt/dpdk as this script builds it: 25.11.3 with the ENA read_clock patch.
     mkdir -p "$root/opt/dpdk/share"
     echo "$dpdk_stamp" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
@@ -124,10 +148,12 @@ host() {
     printf '%s\n' 'default via 10.0.0.1 dev ens6 proto dhcp src 10.0.0.20 metric 513' \
         'default via 10.0.0.1 dev ens5 proto dhcp src 10.0.0.10 metric 512' >"$tmp/routes"
 }
-want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1,2,3,4,5,6 transparent_hugepage=madvise hugepagesz=2M hugepages=0:512"
+want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1,2,3,4,5,6 transparent_hugepage=madvise hugepagesz=2M hugepages=0:512 ena.phc_enable=1"
 # What the reboot changes: the kernel command line, the modules, and what the kernel then reports.
 reboot() {
     echo "ro console=ttyS0 $want_args" >"$root/proc/cmdline"
+    # ena.phc_enable=1 makes the ENA PHC appear as /dev/ptp_ena.
+    : >"$root/dev/ptp_ena"
     echo "${FAKE_SRCVERSION-PATCHED}" >"$root/sys/module/vfio_pci_core/srcversion"
     echo 512 >"$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
     echo 7 >"$root/sys/devices/system/cpu/isolated"
@@ -209,6 +235,9 @@ check "the config comes from zhida-netconf discover --aws on the data ENI" calle
 check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
 check "no interface is flushed or bound before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+check "apply adds AWS's PHC refclock line after AL2023's NTP server" sh -c "[ \"\$(tail -n 1 '$root/etc/chrony.conf')\" = 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' ] && grep -qx 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' '$root/etc/chrony.conf'"
+check "without /dev/ptp_ena yet, chronyd is left for the reboot" sh -c "! grep -q '^systemctl restart chronyd' '$calls'" 
+check "apply enables chronyd" called "systemctl enable -q chronyd.service"
 
 reboot
 HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
@@ -227,6 +256,11 @@ check "a second apply does not rerun grubby" sh -c "! grep -q '^grubby --update'
 check "a bound data ENI is not rediscovered" sh -c "! grep -q 'discover' '$calls'"
 check "apply reports the data ENI as already bound" has interfaces "ok management ens5; data 0000:00:06.0 (0a:00:00:00:00:06) already on vfio-pci"
 check "an unchanged unmanaged config does not reload networkd" sh -c "! grep -q '^networkctl reload' '$calls'"
+check "an unchanged chrony.conf keeps one refclock line and no restart" sh -c "[ \$(grep -c '^refclock PHC' '$root/etc/chrony.conf') = 1 ] && ! grep -q '^systemctl restart chronyd' '$calls'"
+sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
+: >"$calls"
+run apply
+check "a changed chrony.conf with /dev/ptp_ena present restarts chronyd" sh -c "grep -q '^systemctl restart chronyd.service' '$calls' && grep -qx 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' '$root/etc/chrony.conf'"
 
 rm "$root/etc/systemd/network/00-zhida-data.network"
 : >"$calls"
@@ -238,7 +272,23 @@ check "restoring unmanaged config does not request a reboot" sh -c "! grep -q '^
 
 run verify
 check "a finished host verifies clean" status_is 0
-check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 12 ]"
+check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 13 ]"
+check "verify accepts chrony synced to the PHC" has chrony "ok system time 184 ns slow; PHC selected"
+check "verify dumps chronyc tracking verbatim" sh -c "grep -qx 'chronyc tracking:' '$tmp/out' && grep -qxF 'Reference ID    : 50484330 (PHC0)' '$tmp/out'"
+check "verify dumps chronyc sources -v verbatim" sh -c "grep -qx 'chronyc sources -v:' '$tmp/out' && grep -q '^#\\* PHC0 ' '$tmp/out'"
+tracking 'A9FEA97B (169.254.169.123)' 0.000002191 fast '#-'
+run verify
+check "chrony synced to NTP, PHC not selected, fails" has chrony "FAIL the PHC is not the selected source"
+tracking '00000000 ()' 0.000000000 fast none
+run verify
+check "chrony without a PHC source fails" has chrony "FAIL the PHC is not the selected source"
+tracking '50484330 (PHC0)' 0.000011000 fast '#*'
+run verify
+check "chrony on the PHC but 11 us off fails" has chrony "FAIL system time 11000 ns fast, limit 10000"
+rm "$root/tracking"
+run verify
+check "no chronyd fails" has chrony "FAIL chronyc tracking: 506 Cannot talk to daemon"
+tracking '50484330 (PHC0)' 0.000000184 slow '#*'
 check "verify sees management on its kernel driver with the default route" has management "ok ens5 on ena with the default route"
 check "verify reports no run yet" has pools "ok no run logged yet"
 

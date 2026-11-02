@@ -36,6 +36,12 @@ NETWORK=$R/etc/systemd/network/00-zhida-data.network
 NETWORKD_POLICY=$R/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf
 UNMOVABLE=$R/run/zhida-unmovable-irqs
 HUGEPAGES=512
+CHRONY_CONF=$R/etc/chrony.conf
+# chrony disciplines CLOCK_REALTIME to the ENA PTP hardware clock (Amazon Time Sync), the line AWS
+# documents: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html#configure-chronyd-phc
+PHC_REFCLOCK='refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer'
+# verify: CLOCK_REALTIME within this many ns of the reference (chronyc tracking's System time).
+CHRONY_MAX_OFFSET_NS=10000
 
 DPDK_VERSION=25.11.3
 DPDK_SHA256=3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490
@@ -111,7 +117,7 @@ dpdk_env() {
 step_packages() {
     dnf install -y -q gcc gcc-c++ make pkgconf-pkg-config clang18 clang18-libs lld18 python3-pip numactl-devel \
         libpcap-devel git tar xz patch cpio dnf-utils elfutils-libelf-devel ethtool iproute procps-ng \
-        util-linux grubby >/dev/null \
+        util-linux grubby chrony >/dev/null \
         || fatal packages "dnf install failed"
     pip3 install -q meson ninja pyelftools || fatal packages "pip3 install meson ninja pyelftools failed"
     report packages ok "dnf toolchain, meson, ninja, pyelftools"
@@ -257,7 +263,7 @@ step_config() {
 
 cmdline_args() {
     args="isolcpus=managed_irq,domain,$ISOLATED nohz_full=$ISOLATED rcu_nocbs=$ISOLATED"
-    args="$args irqaffinity=$HOUSEKEEPING transparent_hugepage=madvise hugepagesz=2M hugepages=$NUMA_NODE:$HUGEPAGES"
+    args="$args irqaffinity=$HOUSEKEEPING transparent_hugepage=madvise hugepagesz=2M hugepages=$NUMA_NODE:$HUGEPAGES ena.phc_enable=1"
     [ "$(uname -m)" = x86_64 ] && args="$args clocksource=tsc"
     echo "$args"
 }
@@ -358,6 +364,26 @@ WantedBy=multi-user.target"; then
     report unit ok "zhida-host.service runs boot at every boot"
 }
 
+# The PHC refclock goes after AL2023's own chrony.conf (its Time Sync NTP server line stays). The
+# device appears only once ena.phc_enable=1 is in effect: chronyd is restarted now if it exists,
+# else the reboot starts it with the new config.
+step_chrony() {
+    changed=
+    if ! grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
+        printf '%s\n' "$PHC_REFCLOCK" >>"$CHRONY_CONF" || fatal chrony "cannot write $CHRONY_CONF"
+        changed=1
+    fi
+    systemctl enable -q chronyd.service || fatal chrony "systemctl enable chronyd failed"
+    if [ -z "$changed" ]; then
+        report chrony ok "$CHRONY_CONF has the PHC refclock"
+    elif [ -e "$R/dev/ptp_ena" ]; then
+        systemctl restart chronyd.service || fatal chrony "systemctl restart chronyd failed"
+        report chrony changed "PHC refclock added to $CHRONY_CONF; chronyd restarted"
+    else
+        report chrony changed "PHC refclock added to $CHRONY_CONF; chronyd picks it up at reboot"
+    fi
+}
+
 # ---------------------------------------------------------------- boot (also the end of apply)
 step_irqbalance() {
     systemctl disable --now -q irqbalance.service 2>/dev/null
@@ -428,6 +454,7 @@ apply() {
     step_cmdline
     [ "$DATA_DRIVER" = ena ] || step_vfio_wc
     step_unit
+    step_chrony
     if [ "$DATA_DRIVER" = ena ]; then
         policy_config="[Network]
 ManageForeignRoutingPolicyRules=no"
@@ -571,6 +598,29 @@ verify() {
     fi
 
     if zhida-netconf check "$DUT" >/dev/null 2>&1; then report config ok "$DUT"; else report config FAIL "zhida-netconf check $DUT"; fi
+
+    # CLOCK_REALTIME, which the feed compares with NIC stamps, must follow the PHC refclock:
+    # `chronyc sources` selects it (a `#*` PHC row) and tracking's System time is within the
+    # limit. Both chronyc outputs go into the report verbatim.
+    tracking=$(chronyc tracking 2>&1)
+    tracking_status=$?
+    sources=$(chronyc sources -v 2>&1)
+    echo "chronyc tracking:"
+    printf '%s\n' "$tracking"
+    echo "chronyc sources -v:"
+    printf '%s\n' "$sources"
+    # "System time     : 0.000000276 seconds fast of NTP time"
+    offset_ns=$(printf '%s\n' "$tracking" | awk '/^System time/ { printf "%d", $4 * 1e9 + 0.5 }')
+    side=$(printf '%s\n' "$tracking" | awk '/^System time/ { print $6 }')
+    if [ "$tracking_status" -ne 0 ]; then
+        report chrony FAIL "chronyc tracking: $(printf '%s\n' "$tracking" | head -n 1)"
+    elif ! printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
+        report chrony FAIL "the PHC is not the selected source (no '#* PHC' row in chronyc sources)"
+    elif [ -z "$offset_ns" ] || [ "$offset_ns" -ge "$CHRONY_MAX_OFFSET_NS" ]; then
+        report chrony FAIL "system time ${offset_ns:-unknown} ns $side, limit $CHRONY_MAX_OFFSET_NS"
+    else
+        report chrony ok "system time $offset_ns ns $side; PHC selected"
+    fi
     exit $failed
 }
 
