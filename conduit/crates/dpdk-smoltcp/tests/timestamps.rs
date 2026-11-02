@@ -17,9 +17,6 @@ use wire::Verdict;
 const BUDGET: usize = 32;
 /// Upstream `ACK_DELAY_DEFAULT`.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// The measured RTO: RTT samples on a Pair at one instant are 0 µs, so the RTO is
-/// smoltcp's 50 ms floor.
-const RTO: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -177,14 +174,18 @@ fn caller_time_controls_retransmission_and_delayed_ack() {
                 Verdict::Drop
             }
         });
+        // RTT samples 0 µs (handshake), then 10 ms (the delayed ACK): RTTVAR = 10000/4 =
+        // 2500 µs, SRTT = 10000/8 = 1250 µs, RTO = 1.25 + max(4 · 2.5, 50) = 51.25 ms,
+        // due at the next whole millisecond.
+        let rto = Duration::from_micros(51_250);
         let sent = w + ms(20);
         assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"world"), Ok(5));
         assert_eq!(round(&mut pair, [sent; 2]), []);
         assert_eq!(pair.a_to_b.dropped, 1);
-        assert!(matches!(pair.a.poll_at(), Some(p) if p > sent && p <= ceil_ms(sent + RTO)));
-        assert_eq!(round(&mut pair, [sent + RTO - ms(1); 2]), []);
+        assert!(matches!(pair.a.poll_at(), Some(p) if p > sent && p <= ceil_ms(sent + rto)));
+        assert_eq!(round(&mut pair, [ceil_ms(sent + rto) - ms(1); 2]), []);
         assert_eq!(
-            timer_segments(round(&mut pair, [sent + RTO; 2])),
+            timer_segments(round(&mut pair, [ceil_ms(sent + rto); 2])),
             [(Dir::AToB, TcpControl::Psh, 5)]
         );
         assert_eq!(pair.close(), 0);

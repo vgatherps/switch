@@ -201,8 +201,11 @@ impl fmt::Display for State {
 
 /// RTO before the first RTT sample.
 const DEFAULT_RTO: Duration = Duration::from_millis(300);
-/// Floor of the RTO computed from samples. It must sit above a peer's delayed ACK (ours is
-/// 10 ms, Linux's up to 40 ms), or each delayed ACK triggers a spurious retransmit.
+/// Floor of the variance term of the RTO computed from samples: RTO = SRTT + max(4 · RTTVAR,
+/// MIN_RTO), as Linux does. A peer's delayed ACK (ours 10 ms, Linux's up to 40 ms) adds to
+/// the path RTT; on a steady path RTTVAR shrinks, and a floor on the whole RTO would leave
+/// a 40 ms delay no room over a 70 ms RTT, so each delayed ACK would draw a spurious
+/// retransmit.
 const MIN_RTO: Duration = Duration::from_millis(50);
 const MAX_RTO: Duration = Duration::from_secs(60);
 
@@ -260,20 +263,22 @@ impl SmoothedRtt {
         if self.have_measurement { self.srtt } else { 0 }
     }
 
-    /// RFC 6298 (2.1)-(2.5) RTO, before backoff. The clock granularity G of (2.2)/(2.3) is
-    /// ignored: the clock counts microseconds and MIN_RTO is far above one tick.
+    /// RFC 6298 (2.1)-(2.5) RTO, before backoff, with `MIN_RTO` flooring the variance term
+    /// instead of the whole RTO. The clock granularity G of (2.2)/(2.3) is ignored: the clock
+    /// counts microseconds and MIN_RTO is far above one tick.
     fn retransmission_timeout(&self) -> Duration {
         if !self.have_measurement {
             return DEFAULT_RTO;
         }
-        let micros = u64::from(self.srtt) + 4 * u64::from(self.rttvar);
-        Duration::from_micros(micros.clamp(MIN_RTO.total_micros(), MAX_RTO.total_micros()))
+        let variance = (4 * u64::from(self.rttvar)).max(MIN_RTO.total_micros());
+        Duration::from_micros((u64::from(self.srtt) + variance).min(MAX_RTO.total_micros()))
     }
 
     /// Make the RTO `rto` (floored at MIN_RTO) until the next sample or reset.
     #[cfg(test)]
     fn seed(&mut self, rto: Duration) {
-        self.srtt = u32::try_from(rto.total_micros()).expect("seeded RTO must fit in u32 micros");
+        let srtt = rto.total_micros().saturating_sub(MIN_RTO.total_micros());
+        self.srtt = u32::try_from(srtt).expect("seeded RTO must fit in u32 micros");
         self.rttvar = 0;
         self.have_measurement = true;
     }
@@ -11557,15 +11562,15 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet: a 5 ms sample, SRTT + 4·RTTVAR = 5 + 4·2.5 = 15 ms,
-        // raised to the 50 ms floor.
+        // Acknowledge the first packet: a 5 ms sample, SRTT = 5 ms, 4·RTTVAR = 10 ms raised
+        // to the 50 ms floor, RTO = 55 ms.
         send!(s, time 5, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
-        recv_nothing!(s, time 54);
+        recv_nothing!(s, time 59);
         // The second packet should be re-sent.
-        recv!(s, time 55, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 60, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
 
-        recv_nothing!(s, time 154);
+        recv_nothing!(s, time 169);
     }
 
     #[test]
@@ -11691,15 +11696,15 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet: a 5 ms sample, SRTT + 4·RTTVAR = 5 + 4·2.5 = 15 ms,
-        // raised to the 50 ms floor.
+        // Acknowledge the first packet: a 5 ms sample, SRTT = 5 ms, 4·RTTVAR = 10 ms raised
+        // to the 50 ms floor, RTO = 55 ms.
         send!(s, time 5, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
-        recv_nothing!(s, time 54);
+        recv_nothing!(s, time 59);
         // The second packet should be re-sent.
-        recv!(s, time 55, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 60, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
 
-        recv_nothing!(s, time 154);
+        recv_nothing!(s, time 169);
     }
 
     /// Established with Cubic and a 6-byte MSS: "abcdef012345" goes out as two
@@ -13937,12 +13942,37 @@ mod test {
         assert!(!r.should_retransmit(Instant::from_millis(1350)));
     }
 
+    /// A steady 70 ms path shrinks RTTVAR toward zero; the 50 ms floor on the variance term
+    /// keeps the RTO above SRTT, so one ACK the peer delays by 40 ms draws no retransmit.
+    #[test]
+    fn delayed_ack_over_a_steady_path_draws_no_retransmit() {
+        let mut s = socket_established();
+        let mut acked = LOCAL_SEQ + 1;
+        let mut exchange = |s: &mut TestSocket, at: i64, delay: i64| {
+            s.send_slice(b"x").unwrap();
+            recv(s, Instant::from_millis(at), |result| {
+                assert_eq!(result.unwrap().payload, b"x");
+            });
+            recv_nothing(s, Instant::from_millis(at + delay - 1));
+            acked += 1;
+            send(s, Instant::from_millis(at + delay), &SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(acked));
+        };
+        // After 16 samples RTTVAR is 35 ms · (3/4)^15, about 0.47 ms.
+        for index in 0..16 {
+            exchange(&mut s, index * 200, 70);
+        }
+        assert!(4 * s.rtte.rttvar < 2_000, "RTTVAR {} µs", s.rtte.rttvar);
+        // RTO = about 70 ms + 50 ms: the ACK at 110 ms beats it.
+        exchange(&mut s, 16 * 200, 110);
+        recv_nothing(&mut s, Instant::from_millis(16 * 200 + 300));
+    }
+
     #[test]
     fn smoothed_rtt_follows_rfc6298() {
         let mut r = SmoothedRtt::default();
         assert!(!r.have_measurement);
         assert_eq!(r.retransmission_timeout(), DEFAULT_RTO);
-        // Microseconds; divisions round up.
+        // Microseconds; divisions round up. 4·RTTVAR stays above the 50 ms floor throughout.
         // 101 ms first: SRTT = 101000, RTTVAR = 50500, RTO = 101000 + 4·50500 = 303000.
         // 102 ms: RTTVAR = (3·50500 + 1000)/4 = 38125, SRTT = (7·101000 + 102000)/8 = 101125,
         //   RTO = 101125 + 152500 = 253625.
@@ -13968,10 +13998,10 @@ mod test {
             assert_eq!(r.retransmission_timeout(), Duration::from_micros(rto));
             assert_eq!(r.timestamp(), None);
         }
-        // 30 µs: SRTT + 4·RTTVAR = 30 + 60 = 90 µs, raised to the 50 ms floor.
+        // 30 µs: 4·RTTVAR = 60 µs is raised to the 50 ms floor, so SRTT + 50 ms = 50.03 ms.
         let mut r = SmoothedRtt::default();
         r.sample(30);
-        assert_eq!(r.retransmission_timeout(), Duration::from_millis(50));
+        assert_eq!(r.retransmission_timeout(), Duration::from_micros(50_030));
         // 30 s: 30 + 4·15 = 90 s, capped at 60 s.
         let mut r = SmoothedRtt::default();
         r.sample(30_000_000);

@@ -368,7 +368,7 @@ fn dropped_data_segment_retransmitted_deadline_only() {
 }
 
 /// On a 30 µs path the RTO follows the measured round trip: a lost segment is resent
-/// at the 50 ms floor, not after the initial 300 ms.
+/// after SRTT plus the 50 ms floor, not after the initial 300 ms.
 #[zhida_test_support::pinned_test]
 fn rto_follows_measured_round_trip() {
     with_eal(|eal| {
@@ -388,7 +388,7 @@ fn rto_follows_measured_round_trip() {
         assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
 
         // After the handshake's 0 µs sample, the 30 µs one gives RTTVAR = 30/4 -> 8 µs and
-        // SRTT = 30/8 -> 4 µs: SRTT + 4·RTTVAR = 36 µs, raised to the 50 ms floor.
+        // SRTT = 30/8 -> 4 µs: 4·RTTVAR = 32 µs is raised to the 50 ms floor, RTO = 50.004 ms.
         drop_first_data(&mut pair.a_to_b);
         let lost_at = pair.now();
         let data = pattern(1000, 5);
@@ -397,7 +397,7 @@ fn rto_follows_measured_round_trip() {
         assert_eq!(lost.a.tx_accepted, 1);
         assert_eq!(counts(&pair.a_to_b), (0, 0, 1, 0));
         // Stack timers fire on whole milliseconds.
-        let resend_at = ceil_ms(lost_at + Duration::from_millis(50));
+        let resend_at = ceil_ms(lost_at + Duration::from_micros(50_004));
         let early = pair.round_at(resend_at - Duration::from_micros(1), |dir, _| {
             panic!("{dir:?} frame before the retransmission deadline")
         });
@@ -1392,7 +1392,10 @@ fn rto_while_wire_paused_then_resume() {
         }
         // The 47 segments are frame-pool frames; A's TX pool is idle.
         assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 47));
-        assert!(matches!(pair.a.poll_at(), Some(p) if p > t && p <= ceil_ms(t + RTO)));
+        // RTT samples are 0 µs or B's 10 ms delayed ACK, so the RTO is SRTT plus the
+        // 50 ms floor: from RTO to RTO + ACK_DELAY.
+        let latest = ceil_ms(t + RTO + ACK_DELAY);
+        assert!(matches!(pair.a.poll_at(), Some(p) if p > t && p <= latest));
 
         let full = Turn {
             rx_received: 0,
@@ -1406,12 +1409,18 @@ fn rto_while_wire_paused_then_resume() {
             panic!("paused link delivered a frame")
         });
         assert_eq!(early.a, full);
-        assert!(matches!(pair.a.poll_at(), Some(p) if p > pair.now() && p <= ceil_ms(t + RTO)));
         // The RTO fires: the retransmission finds the pending queue full, so
-        // the turn queues nothing and A wants to send again now.
-        let expired = pair.round_at(ceil_ms(t + RTO), |_, _| panic!("paused link delivered a frame"));
-        assert_eq!(expired.a, full);
-        assert_eq!(pair.a.poll_at(), Some(pair.now()));
+        // the turn queues nothing and A wants to send again now. poll_at may
+        // name a timer-wheel boundary before the deadline first.
+        loop {
+            let at = pair.a.poll_at().expect("RTO deadline");
+            assert!(at > pair.now() && at <= latest, "{at}");
+            let turn = pair.round_at(at, |_, _| panic!("paused link delivered a frame"));
+            assert_eq!(turn.a, full);
+            if pair.a.poll_at() == Some(pair.now()) {
+                break;
+            }
+        }
         assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 47));
 
         pair.a_to_b.paused = false;

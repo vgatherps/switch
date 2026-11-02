@@ -29,8 +29,9 @@ use zhida_test_kit::with_eal;
 
 const BULK: usize = 256 * 1024;
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// The measured RTO: RTT samples here are 0 or 10 ms (delayed ACK), so the RTO is
-/// smoltcp's 50 ms floor.
+/// The measured RTO's least value: RTT samples here are 0 or 10 ms (delayed ACK), so
+/// 4 · RTTVAR stays below smoltcp's 50 ms floor and the RTO is SRTT + 50 ms, from `RTO`
+/// (no delayed sample yet) to `RTO` + `ACK_DELAY`.
 const RTO: Duration = Duration::from_millis(50);
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/frames");
@@ -973,8 +974,9 @@ fn bulk_frames_match_committed() {
         round(&mut pair, &trace, sent_at);
         assert_eq!(pair.a_to_b.dropped, 1);
         assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), 0);
+        // The bulk transfer's delayed-ACK samples put SRTT above zero.
         assert!(
-            matches!(pair.a.poll_at(), Some(at) if at > sent_at && at <= ceil_ms(sent_at + RTO))
+            matches!(pair.a.poll_at(), Some(at) if at > sent_at && at <= ceil_ms(sent_at + RTO + ACK_DELAY))
         );
         drive(&mut pair, &trace, |_, b| {
             if b.tcp(&handles[1]).recv_queue() == data.len() {
@@ -991,7 +993,8 @@ fn bulk_frames_match_committed() {
             assert_eq!(attempts.len(), 2);
             assert!(attempts[0].0.dropped);
             assert!(!attempts[1].0.dropped);
-            assert_eq!(attempts[1].0.at, ceil_ms(sent_at + RTO));
+            let resent = attempts[1].0.at;
+            assert!(resent > sent_at + RTO && resent <= ceil_ms(sent_at + RTO + ACK_DELAY), "{resent}");
             assert_eq!(attempts[0].1.seq_number, attempts[1].1.seq_number);
             assert_eq!(attempts[0].1.payload, &data[..]);
             assert_eq!(attempts[1].1.payload, &data[..]);
