@@ -161,6 +161,7 @@ fn host_messages() -> Vec<HostMessage> {
         EndReason::Kicked,
         EndReason::ProtocolError,
         EndReason::HostShutdown,
+        EndReason::Finished,
     ] {
         messages.push(HostMessage::End(reason));
     }
@@ -214,6 +215,17 @@ fn every_host_message_roundtrips_and_preserves_prefixes() {
         assert_eq!(&appended[..2], &[0xaa, 0xbb]);
         assert_eq!(&appended[2..], bytes);
     }
+}
+
+#[test]
+fn finished_end_has_wire_reason_four() {
+    let message = HostMessage::End(EndReason::Finished);
+    let bytes = [72, 0, 1, 0, 0, 0, 0, 0, 4];
+    assert_eq!(host_bytes(message.clone()), bytes);
+    assert_eq!(
+        HostMessage::decode(&bytes),
+        Ok(Some((message, bytes.len())))
+    );
 }
 
 #[test]
@@ -471,7 +483,7 @@ fn invalid_enum_codes_are_rejected() {
             Err(DecodeError::InvalidRejectCode(code))
         );
     }
-    for reason in [0, 4, 255] {
+    for reason in [0, 5, 255] {
         let mut bytes = host_bytes(HostMessage::End(EndReason::Kicked));
         bytes[8] = reason;
         assert_eq!(

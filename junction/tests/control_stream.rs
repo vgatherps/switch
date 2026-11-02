@@ -4,7 +4,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -21,6 +21,7 @@ use junction::session::{ConnectError, Lost, OpenError, Session};
 
 const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(30);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
 fn socket_path() -> PathBuf {
@@ -89,7 +90,7 @@ impl Host {
                 max_sessions,
                 max_sockets,
                 poll_ms: 1,
-                hello_timeout: Duration::from_millis(150),
+                hello_timeout: HELLO_TIMEOUT,
             },
             ControlChannels {
                 to_network,
@@ -470,11 +471,84 @@ fn incomplete_hello_does_not_block_and_expires() {
     let started = Instant::now();
     let (_client, _) = host.open(1);
     assert!(
-        started.elapsed() < Duration::from_millis(150),
+        started.elapsed() < HELLO_TIMEOUT / 2,
         "connect waited for pending Hello timeout"
     );
     assert_eq!(silent.read(&mut [0]).unwrap(), 0);
     assert_eq!(partial.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn continuous_control_writer_does_not_starve_connect_or_events() {
+    struct ControlWriter {
+        stop: std::sync::Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for ControlWriter {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    let host = Host::new(2, 1);
+    let (mut writer, _) = handshake(&host, 1);
+    writer.set_nonblocking(true).unwrap();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let (started_tx, started_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        for _ in 0..4096 {
+            ClientMessage::Op(Op::ShutdownTcp {
+                id: SocketId {
+                    slot: 0,
+                    generation: 1,
+                },
+            })
+            .encode(&mut bytes);
+        }
+        let mut offset = 0;
+        let mut started = Some(started_tx);
+        while !writer_stop.load(Ordering::Relaxed) {
+            match writer.write(&bytes[offset..]) {
+                Ok(0) => panic!("control writer stopped"),
+                Ok(n) => {
+                    offset = (offset + n) % bytes.len();
+                    if let Some(tx) = started.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::yield_now(),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("control writer failed: {error}"),
+            }
+        }
+    });
+    // Stop the producer before Host teardown, including when a bound assertion fails.
+    let writer = ControlWriter {
+        stop,
+        worker: Some(worker),
+    };
+    receive(&started_rx);
+    let start = Instant::now();
+    let mut client = connect(&host.path, 1).unwrap();
+    // The flooding session's operations can surround Open in the channel.
+    let session = loop {
+        if let ToNetwork::Open { session, .. } = receive(&host.network) {
+            break session;
+        }
+    };
+    let id = client.bind_udp(udp()).unwrap();
+    host.event(session, id, Event::Bound);
+    assert_eq!(events(&mut client, 1), vec![(id, Event::Bound)]);
+    let elapsed = start.elapsed();
+    drop(writer);
+    assert!(
+        elapsed < HELLO_TIMEOUT / 2,
+        "busy client starved another client: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -586,6 +660,26 @@ fn finish_waits_for_fifo_and_network_retirement() {
         fifo.next_message().is_none(),
         "finish must not enqueue twice"
     );
+}
+
+#[test]
+fn network_retirement_sends_finished_ack_before_eof() {
+    let host = Host::new(1, 1);
+    let (mut client, session) = handshake(&host, 1);
+    host.retire
+        .send(Retire::Finished {
+            slot: slot(session),
+            uid: uid(session),
+        })
+        .unwrap();
+    host.end(session, EndHow::Graceful);
+    host.send(FromNetwork::Retired { session });
+    assert_eq!(
+        read_message(&mut client),
+        HostMessage::End(EndReason::Finished)
+    );
+    assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    host.closed(session);
 }
 
 #[test]

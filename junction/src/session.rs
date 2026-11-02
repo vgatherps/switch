@@ -1,4 +1,9 @@
 //! Client-side control socket and socket-slot ownership for one producer thread.
+//!
+//! `Session::finish` first flushes queued control operations, then commits the
+//! cephalopod end record. Retry backpressure errors while polling events.
+//! Only the host's `EndReason::Finished` acknowledgement makes `Session::closed`
+//! true; a disconnect without that acknowledgement is session loss.
 
 use std::cell::Cell;
 use std::fmt;
@@ -28,6 +33,26 @@ pub enum OpenError {
     NoFreeSlot,
     Config(ConfigError),
 }
+
+/// Backpressure preventing the session's end record from being committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishError {
+    /// Control operations still await writing to the host. Poll events and retry.
+    ControlPending,
+    /// The cephalopod ingress has no room for the end record. Retry later.
+    StreamFull,
+}
+
+impl fmt::Display for FinishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ControlPending => "session control output is still pending",
+            Self::StreamFull => "session ingress stream is full",
+        })
+    }
+}
+
+impl std::error::Error for FinishError {}
 
 #[derive(Debug)]
 pub enum Lost {
@@ -316,6 +341,11 @@ impl Session {
         self.written = 0;
     }
 
+    /// Flushes control output and handles available host events without blocking.
+    ///
+    /// A successful finish acknowledgement sets `closed()` and returns `Ok(())`.
+    /// EOF without that acknowledgement returns `Lost::Disconnected`, even after
+    /// `finish()` succeeded. An unsolicited finish acknowledgement is invalid data.
     pub fn poll_events(&mut self, mut on_event: impl FnMut(SocketId, Event)) -> Result<(), Lost> {
         if self.closed {
             return Ok(());
@@ -334,6 +364,13 @@ impl Session {
                         self.event(id, event)?;
                         on_event(id, event);
                     }
+                    HostMessage::End(EndReason::Finished) => {
+                        if !self.finished {
+                            return Err(invalid_host("Finished before session finish"));
+                        }
+                        self.closed = true;
+                        return Ok(());
+                    }
                     HostMessage::End(reason) => return Err(Lost::Ended(reason)),
                     HostMessage::Welcome(_) => {
                         return Err(invalid_host("second Welcome on live session"));
@@ -342,10 +379,6 @@ impl Session {
             }
             let mut chunk = [0; 4096];
             match self.socket.read(&mut chunk) {
-                Ok(0) if self.finished => {
-                    self.closed = true;
-                    return Ok(());
-                }
                 Ok(0) => return Err(Lost::Disconnected),
                 Ok(n) => self.input.extend_from_slice(&chunk[..n]),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -379,14 +412,32 @@ impl Session {
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<(), ceph_ring::PushError> {
-        if !self.finished {
-            self.writer.try_finish(self.stream, self.next_seq)?;
-            self.finished = true;
+    /// Commits the session's end record after all queued control operations are written.
+    ///
+    /// `ControlPending` means control output is still unsent; no end record was
+    /// committed. `StreamFull` means ingress has no room for the end record.
+    /// Poll events and retry either error. A successful call is idempotent, but
+    /// does not mean retirement is complete: keep polling until `closed()` is true.
+    /// Control I/O failures are reported by `poll_events`.
+    pub fn finish(&mut self) -> Result<(), FinishError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.flush();
+        if self.written < self.output.len() {
+            return Err(FinishError::ControlPending);
+        }
+        match self.writer.try_finish(self.stream, self.next_seq) {
+            Ok(()) => self.finished = true,
+            Err(ceph_ring::PushError::Full) => return Err(FinishError::StreamFull),
+            Err(ceph_ring::PushError::TooLarge) => {
+                panic!("empty session end record exceeds ingress max_record");
+            }
         }
         Ok(())
     }
 
+    /// Whether the host acknowledged successful retirement with `EndReason::Finished`.
     pub fn closed(&self) -> bool {
         self.closed
     }

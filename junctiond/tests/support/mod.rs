@@ -13,7 +13,7 @@ use ceph_ring::{Config, Reader};
 use dpdk_smoltcp::smoltcp::{socket::tcp, time::Instant, wire::Ipv4Address};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
 use junction::control::{Event, ListenEndpoint, Op, SocketId, TcpConfig, UdpConfig};
-use junction::host::{ControlChannels, ControlConfig, HostControl, ToNetwork};
+use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
 use junction::session::Session;
 use junctiond::network::{Network, NetworkConfig};
 use zhida_test_kit::pair::{self, BUDGET, Side, T0, assert_lossless};
@@ -73,6 +73,9 @@ pub struct Fixture {
     pub socket_path: PathBuf,
     pub ingress: String,
     pub streams: Vec<u64>,
+    pub retired: Vec<u64>,
+    network_events: Receiver<FromNetwork>,
+    forward_events: Sender<FromNetwork>,
     control: Receiver<ToNetwork>,
     forward: Sender<ToNetwork>,
     host: JoinHandle<std::io::Result<()>>,
@@ -82,6 +85,17 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, fifo_batch: usize) -> Self {
+        Self::with_control_batch(eal, names, tcp, udp, fifo_batch, 64)
+    }
+
+    pub fn with_control_batch(
+        eal: &Eal,
+        names: [&str; 2],
+        tcp: usize,
+        udp: usize,
+        fifo_batch: usize,
+        control_batch: usize,
+    ) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [stack, peer] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
@@ -131,7 +145,8 @@ impl Fixture {
         let ingress = reader.name().to_owned();
         let (to_network, control) = mpsc::channel();
         let (forward, operations) = mpsc::channel();
-        let (events, from_network) = mpsc::channel();
+        let (events, network_events) = mpsc::channel();
+        let (forward_events, from_network) = mpsc::channel();
         let (to_fifo, fifo_control) = mpsc::channel();
         let (retire, retired) = mpsc::channel();
         let host = HostControl::bind(
@@ -160,7 +175,7 @@ impl Fixture {
             16,
             NetworkConfig {
                 ingress_budget: BUDGET,
-                control_batch: 64,
+                control_batch,
                 fifo_batch,
             },
             operations,
@@ -175,6 +190,9 @@ impl Fixture {
             socket_path,
             ingress,
             streams: Vec::new(),
+            retired: Vec::new(),
+            network_events,
+            forward_events,
             control,
             forward,
             host,
@@ -192,12 +210,20 @@ impl Fixture {
 
     pub fn client(&mut self, max_sockets: u16) -> Session {
         let client = Session::connect(&self.socket_path, max_sockets).unwrap();
+        self.wait_open();
+        client
+    }
+
+    pub fn wait_open(&mut self) -> u64 {
         loop {
             let message = self.control.recv_timeout(WAIT).unwrap();
-            let opened = matches!(message, ToNetwork::Open { .. });
+            let opened = match &message {
+                ToNetwork::Open { session, .. } => Some(*session),
+                _ => None,
+            };
             self.forward_message(message);
-            if opened {
-                return client;
+            if let Some(session) = opened {
+                return session;
             }
         }
     }
@@ -219,12 +245,38 @@ impl Fixture {
             }
         }
     }
+    /// Forward the real graceful terminal message, then reproduce the control EOF race.
+    /// Only the trailing Lost is injected; retirement and all opens/ops use the host.
+    pub fn forward_graceful_then_lost(&mut self, session: u64) {
+        loop {
+            let message = self.control.recv_timeout(WAIT).unwrap();
+            let graceful = matches!(
+                message, ToNetwork::End { session: id, how: EndHow::Graceful } if id == session
+            );
+            self.forward_message(message);
+            if graceful {
+                self.forward
+                    .send(ToNetwork::End {
+                        session,
+                        how: EndHow::Lost,
+                    })
+                    .unwrap();
+                return;
+            }
+        }
+    }
 
     fn turn_network(&mut self) {
         while let Ok(message) = self.control.try_recv() {
             self.forward_message(message);
         }
         self.network.iteration(self.now).unwrap();
+        while let Ok(message) = self.network_events.try_recv() {
+            if let FromNetwork::Retired { session } = &message {
+                self.retired.push(*session);
+            }
+            self.forward_events.send(message).unwrap();
+        }
     }
 
     fn forward_links(&mut self) -> bool {

@@ -136,6 +136,8 @@ pub enum EndReason {
     Kicked = 1,
     ProtocolError = 2,
     HostShutdown = 3,
+    /// The host took all committed records and completed graceful retirement.
+    Finished = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,6 +569,7 @@ impl HostMessage {
                 1 => EndReason::Kicked,
                 2 => EndReason::ProtocolError,
                 3 => EndReason::HostShutdown,
+                4 => EndReason::Finished,
                 value => return Err(DecodeError::InvalidEndReason(value)),
             }),
             _ => {

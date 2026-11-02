@@ -482,3 +482,116 @@ fn abort_after_held_close_in_same_control_batch_frees_once_without_protocol_erro
         fixture.close();
     });
 }
+
+#[zhida_test_support::pinned_test]
+fn lost_after_forwarded_graceful_end_retires_without_stopping_other_sessions() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::new(eal, ["ltea", "lteb"], 2, 1, 64);
+        let mut finished = fixture.client(1);
+        let stream = fixture.streams[0];
+        let mut unaffected = fixture.client(1);
+        finished.finish().unwrap();
+        // Consume the real FIFO end; its retire notification makes the host send Graceful.
+        fixture.network.iteration(fixture.now).unwrap();
+        fixture.forward_graceful_then_lost(stream);
+        let bound = unaffected.bind_udp(support::udp_config(7000)).unwrap();
+        let mut events = Vec::new();
+        fixture.until(&mut unaffected, &mut events, |f, events| {
+            events.contains(&(bound, Event::Bound)) && f.retired.contains(&stream)
+        });
+        let deadline = WallInstant::now() + WAIT;
+        while !finished.closed() {
+            assert!(
+                WallInstant::now() < deadline,
+                "finished session did not close"
+            );
+            fixture.round_links();
+            finished.poll_events(|_, _| {}).unwrap();
+        }
+        unaffected.close(bound, false);
+        fixture.until(&mut unaffected, &mut events, |_, events| {
+            events.contains(&(bound, Event::Freed))
+        });
+        drop((finished, unaffected));
+        fixture.close();
+    });
+}
+
+fn same_generation_reopen_after_abort(shutdown: bool) {
+    with_eal(|eal| {
+        let mut fixture = Fixture::new(eal, ["lsga", "lsgb"], 2, 1, 64);
+        let mut unaffected = fixture.client(1);
+        let (mut client, id, peer) = raw_connected(&mut fixture);
+        let held = if shutdown {
+            Op::ShutdownTcp { id }
+        } else {
+            Op::Close { id, unread: false }
+        };
+        let reopen = Op::BindUdp {
+            id,
+            config: support::udp_config(7001),
+        };
+        client.send(&[held, Op::AbortTcp { id }, reopen]);
+        assert_eq!(fixture.wait_op(id), held);
+        assert_eq!(fixture.wait_op(id), Op::AbortTcp { id });
+        assert_eq!(fixture.wait_op(id), reopen);
+        client.until(&mut fixture, |f, client| {
+            client
+                .messages
+                .contains(&HostMessage::End(EndReason::ProtocolError))
+                && f.peer.tcp(&peer).reset_by_peer()
+        });
+        assert!(!client.has(id, Event::Bound));
+        let bound = unaffected.bind_udp(support::udp_config(7002)).unwrap();
+        let mut events = Vec::new();
+        fixture.until(&mut unaffected, &mut events, |_, events| {
+            events.contains(&(bound, Event::Bound))
+        });
+        drop((client, unaffected, peer));
+        fixture.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn same_generation_reopen_rejects_held_shutdown() {
+    same_generation_reopen_after_abort(true);
+}
+
+#[zhida_test_support::pinned_test]
+fn same_generation_reopen_rejects_held_close() {
+    same_generation_reopen_after_abort(false);
+}
+
+#[zhida_test_support::pinned_test]
+fn unknown_fifo_session_drains_past_control_batch_to_queued_open() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::with_control_batch(eal, ["luqa", "luqb"], 2, 1, 64, 1);
+        let mut other = fixture.client(1);
+        let mut other_events = Vec::new();
+        let listener = other.listen_tcp(tcp_config(), local(LOCAL_PORT)).unwrap();
+        fixture.wait_op(listener);
+        fixture.network.iteration(fixture.now).unwrap();
+        fixture.network.iteration(fixture.now).unwrap();
+        other.shutdown(listener);
+        fixture.wait_op(listener);
+        other.close(listener, false);
+        fixture.wait_op(listener);
+        let mut client = RawClient::connect(&fixture);
+        let stream = fixture.wait_open();
+        let writer = ceph_ring::Writer::attach(&fixture.ingress).unwrap();
+        writer.try_push(b"undefined packet", stream, 0).unwrap();
+        // The bounded drain takes Shutdown; retry must drain both Close and Open,
+        // not another control_batch of one message.
+        fixture.network.iteration(fixture.now).unwrap();
+        client.until(&mut fixture, |_, client| {
+            client
+                .messages
+                .contains(&HostMessage::End(EndReason::ProtocolError))
+        });
+        fixture.until(&mut other, &mut other_events, |_, events| {
+            events.contains(&(listener, Event::Freed))
+        });
+        drop((writer, client, other));
+        fixture.close();
+    });
+}

@@ -2,8 +2,9 @@
 //!
 //! Opens and aborts apply immediately. Shutdown and plain close validate immediately but
 //! wait for a subsequent FIFO poll to find every ring empty. A later abort cancels a held
-//! operation by removing its socket. Until packet records are defined, every non-end
-//! FIFO record is a session protocol error.
+//! operation by removing its socket. Idle iterations skip held-operation scans when none
+//! are queued. Until packet records are defined, every non-end FIFO record is a session
+//! protocol error; an unknown session first drains all queued control messages.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -44,6 +45,7 @@ pub struct Network {
     sessions: Vec<Option<Session>>,
     sockets: Vec<Option<HostSocket>>,
     free: Vec<u32>,
+    held_count: usize,
     config: NetworkConfig,
     from_control: Receiver<ToNetwork>,
     to_control: Sender<FromNetwork>,
@@ -67,6 +69,7 @@ impl Network {
             sessions: (0..max_sessions).map(|_| None).collect(),
             sockets: (0..capacity).map(|_| None).collect(),
             free: (0..capacity).rev().collect(),
+            held_count: 0,
             config,
             from_control,
             to_control,
@@ -80,29 +83,7 @@ impl Network {
             let Ok(message) = self.from_control.try_recv() else {
                 break;
             };
-            match message {
-                ToNetwork::Open {
-                    session,
-                    max_sockets,
-                } => {
-                    let entry = self
-                        .sessions
-                        .get_mut(slot(session) as usize)
-                        .expect("control thread's max_sessions exceeds the network's");
-                    assert!(
-                        entry.is_none(),
-                        "opening an already registered session slot: {session}"
-                    );
-                    *entry = Some(Session {
-                        uid: uid(session),
-                        slots: (0..max_sockets).map(|_| Slot::default()).collect(),
-                        held: VecDeque::new(),
-                        errored: false,
-                    });
-                }
-                ToNetwork::Op { session, op } => self.receive_op(session, op),
-                ToNetwork::End { session, how } => self.end(session, how),
-            }
+            self.receive_control(message);
         }
 
         let mut idle = false;
@@ -114,11 +95,17 @@ impl Network {
             let session = message.stream();
             let end = message.end();
             drop(message);
+            if self.live(session).is_none() {
+                // FIFO registration can overtake the bounded control drain.
+                while let Ok(message) = self.from_control.try_recv() {
+                    self.receive_control(message);
+                }
+            }
             if !end && self.live(session).is_some_and(|session| !session.errored) {
                 self.protocol_error(session);
             }
         }
-        if idle {
+        if idle && self.held_count != 0 {
             for index in 0..self.sessions.len() {
                 if let Some(session) = &self.sessions[index]
                     && !session.errored
@@ -152,6 +139,31 @@ impl Network {
         drop(sockets);
         stack
     }
+    fn receive_control(&mut self, message: ToNetwork) {
+        match message {
+            ToNetwork::Open {
+                session,
+                max_sockets,
+            } => {
+                let entry = self
+                    .sessions
+                    .get_mut(slot(session) as usize)
+                    .expect("control thread's max_sessions exceeds the network's");
+                assert!(
+                    entry.is_none(),
+                    "opening an already registered session slot: {session}"
+                );
+                *entry = Some(Session {
+                    uid: uid(session),
+                    slots: (0..max_sockets).map(|_| Slot::default()).collect(),
+                    held: VecDeque::new(),
+                    errored: false,
+                });
+            }
+            ToNetwork::Op { session, op } => self.receive_op(session, op),
+            ToNetwork::End { session, how } => self.end(session, how),
+        }
+    }
 
     fn live(&self, session: SessionId) -> Option<&Session> {
         self.sessions
@@ -162,7 +174,7 @@ impl Network {
 
     fn registered(&self, session: SessionId) -> &Session {
         self.live(session)
-            .unwrap_or_else(|| panic!("operation or end for unregistered session: {session}"))
+            .unwrap_or_else(|| panic!("operation for unregistered session: {session}"))
     }
 
     fn protocol_error(&mut self, session: SessionId) {
@@ -188,7 +200,7 @@ impl Network {
             Op::ConnectTcp { .. } | Op::ListenTcp { .. } | Op::BindUdp { .. }
         );
         if open {
-            if entry_slot.host.is_some() {
+            if entry_slot.host.is_some() || entry_slot.generation == Some(id.generation) {
                 self.protocol_error(session);
                 return;
             }
@@ -249,6 +261,7 @@ impl Network {
                 .unwrap()
                 .held
                 .push_back(op);
+            self.held_count += 1;
         } else {
             self.apply(session, op, true);
         }
@@ -297,20 +310,26 @@ impl Network {
             .held
             .pop_front()
         {
+            self.held_count -= 1;
             self.apply(session, op, events);
         }
     }
 
+    /// Ignore stale terminal messages: control EOF can race an already-applied graceful
+    /// retirement, and the session slot may already belong to a different uid.
     fn end(&mut self, session: SessionId, how: EndHow) {
-        let entry = self.registered(session);
+        let Some(entry) = self.live(session) else {
+            return;
+        };
         if how == EndHow::Graceful {
-            // ProtocolError has already requested End{Lost}; it owns this teardown.
+            // We sent ProtocolError; control answers End{Lost} to perform teardown.
             if entry.errored {
                 return;
             }
             self.release(session, false);
         }
         let entry = self.sessions[slot(session) as usize].take().unwrap();
+        self.held_count -= entry.held.len();
         for slot in entry.slots {
             if let Some(index) = slot.host {
                 let socket = self.sockets[index as usize].take().unwrap();

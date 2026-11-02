@@ -1,4 +1,8 @@
 //! Unix control thread. The network thread owns sockets in the Stack, never these descriptors.
+//!
+//! Poll passes read one chunk per connection. FIFO completion drains the preceding control
+//! bytes before graceful retirement, which then survives control disconnects. Network
+//! retirement sends End(Finished) before closing.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -156,7 +160,7 @@ impl HostControl {
         let mut pollfds = Vec::new();
         loop {
             self.drain_network();
-            self.drain_retire();
+            self.drain_retire()?;
             if self.shutdown {
                 for connection in &mut self.connections {
                     if matches!(connection.phase, Phase::Live { .. }) {
@@ -212,11 +216,6 @@ impl HostControl {
                 if self.shutdown {
                     break;
                 }
-                if matches!(self.connections[index].phase, Phase::Pending(since) if since.elapsed() >= self.config.hello_timeout)
-                {
-                    self.remove(index, true);
-                    continue;
-                }
                 let revents = pollfds[position + 1].revents;
                 let draining = matches!(
                     self.connections[index].phase,
@@ -228,7 +227,7 @@ impl HostControl {
                     self.remove(index, true);
                     continue;
                 }
-                if reading && revents & libc::POLLIN != 0 && !self.read(index)? {
+                if reading && revents & libc::POLLIN != 0 && !self.read(index, false)? {
                     self.remove(index, true);
                     continue;
                 }
@@ -278,15 +277,22 @@ impl HostControl {
         Ok(())
     }
 
-    fn read(&mut self, index: usize) -> io::Result<bool> {
+    // Normal poll passes read one chunk; only Finished drains through WouldBlock.
+    fn read(&mut self, index: usize, drain: bool) -> io::Result<bool> {
         loop {
             let mut chunk = [0; 4096];
             match self.connections[index].socket.read(&mut chunk) {
-                Ok(0) => return Ok(false),
+                // Finished already committed the drain; losing control cannot abort it.
+                Ok(0) => return Ok(drain),
                 Ok(n) => self.connections[index].input.extend_from_slice(&chunk[..n]),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if drain {
+                        continue;
+                    }
+                    return Ok(true);
+                }
+                Err(_) => return Ok(drain),
             }
             loop {
                 let (message, used) = match ClientMessage::decode(&self.connections[index].input) {
@@ -338,6 +344,9 @@ impl HostControl {
                         return Ok(false);
                     }
                 }
+            }
+            if !drain {
+                return Ok(true);
             }
         }
     }
@@ -462,7 +471,7 @@ impl HostControl {
                             Phase::Live { draining: true, .. }
                         )
                     {
-                        let _ = self.connections[index].flush();
+                        self.connections[index].end(EndReason::Finished);
                         self.remove(index, false);
                     }
                 }
@@ -470,7 +479,7 @@ impl HostControl {
         }
     }
 
-    fn drain_retire(&mut self) {
+    fn drain_retire(&mut self) -> io::Result<()> {
         while !self.shutdown {
             let message = match self.channels.retire.try_recv() {
                 Ok(message) => message,
@@ -493,9 +502,27 @@ impl HostControl {
                     self.remove(index, true);
                 }
                 Retire::Finished { .. } => {
-                    if let Phase::Live { draining, .. } = &mut self.connections[index].phase
-                        && !*draining
-                    {
+                    if matches!(
+                        self.connections[index].phase,
+                        Phase::Live {
+                            draining: false,
+                            ..
+                        }
+                    ) {
+                        // The client wrote these bytes before pushing the end record, and
+                        // the network thread consumed that record before sending Finished.
+                        // Its preceding control bytes are therefore already readable.
+                        if !self.read(index, true)? {
+                            self.remove(index, true);
+                            continue;
+                        }
+                        if self.shutdown {
+                            break;
+                        }
+                        let Phase::Live { draining, .. } = &mut self.connections[index].phase
+                        else {
+                            unreachable!("Finished belongs to a live connection");
+                        };
                         *draining = true;
                         if self
                             .channels
@@ -512,5 +539,206 @@ impl HostControl {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture {
+        host: HostControl,
+        client: Option<UnixStream>,
+        network: Receiver<ToNetwork>,
+        retire: Sender<Retire>,
+        _events: Sender<FromNetwork>,
+        _fifo: Receiver<Control>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "jnct-unit-{}-{}.sock",
+                std::process::id(),
+                NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+            ));
+            let (to_network, network) = mpsc::channel();
+            let (events, from_network) = mpsc::channel();
+            let (to_fifo, fifo) = mpsc::channel();
+            let (retire, from_fifo) = mpsc::channel();
+            let mut host = HostControl::bind(
+                ControlConfig {
+                    socket_path: path,
+                    ingress: String::new(),
+                    max_record: 256,
+                    max_sessions: 1,
+                    max_sockets: 1,
+                    poll_ms: 1,
+                    hello_timeout: Duration::from_secs(2),
+                },
+                ControlChannels {
+                    to_network,
+                    to_fifo,
+                    from_network,
+                    retire: from_fifo,
+                },
+            )
+            .unwrap();
+            let (client, socket) = UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            host.free.clear();
+            host.connections.push(Connection {
+                socket,
+                phase: Phase::Live {
+                    session: pack(0, 1),
+                    max_sockets: 1,
+                    draining: false,
+                },
+                input: Vec::new(),
+                output: Vec::new(),
+                written: 0,
+            });
+            Self {
+                host,
+                client: Some(client),
+                network,
+                retire,
+                _events: events,
+                _fifo: fifo,
+            }
+        }
+
+        fn write_ops(&mut self) -> usize {
+            let mut bytes = Vec::new();
+            for generation in 0..300 {
+                ClientMessage::Op(Op::ShutdownTcp {
+                    id: SocketId {
+                        slot: 0,
+                        generation,
+                    },
+                })
+                .encode(&mut bytes);
+            }
+            assert!(bytes.len() > 4096);
+            self.client.as_mut().unwrap().write_all(&bytes).unwrap();
+            300
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.host.config.socket_path);
+        }
+    }
+
+    #[test]
+    fn finished_forwards_all_readable_ops_before_graceful_end() {
+        let mut fixture = Fixture::new();
+        let count = fixture.write_ops();
+        fixture
+            .retire
+            .send(Retire::Finished { slot: 0, uid: 1 })
+            .unwrap();
+        fixture.host.drain_retire().unwrap();
+        for generation in 0..count as u32 {
+            assert!(matches!(
+                fixture.network.try_recv().unwrap(),
+                ToNetwork::Op {
+                    session,
+                    op: Op::ShutdownTcp { id: SocketId { slot: 0, generation: actual } },
+                } if session == pack(0, 1) && actual == generation
+            ));
+        }
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Graceful } if session == pack(0, 1)
+        ));
+        assert!(fixture.network.try_recv().is_err());
+    }
+
+    #[test]
+    fn finished_after_control_eof_forwards_op_then_retires_gracefully() {
+        let mut fixture = Fixture::new();
+        let id = SocketId {
+            slot: 0,
+            generation: 1,
+        };
+        let mut bytes = Vec::new();
+        ClientMessage::Op(Op::ShutdownTcp { id }).encode(&mut bytes);
+        fixture.client.as_mut().unwrap().write_all(&bytes).unwrap();
+        drop(fixture.client.take());
+        fixture
+            .retire
+            .send(Retire::Finished { slot: 0, uid: 1 })
+            .unwrap();
+        fixture.host.drain_retire().unwrap();
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::Op { session, op: Op::ShutdownTcp { id: actual } }
+                if session == pack(0, 1) && actual == id
+        ));
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Graceful } if session == pack(0, 1)
+        ));
+        assert!(
+            fixture.network.try_recv().is_err(),
+            "must not send End Lost"
+        );
+        assert!(matches!(
+            fixture.host.connections[0].phase,
+            Phase::Live { draining: true, .. }
+        ));
+    }
+
+    #[test]
+    fn finished_with_readable_protocol_error_never_sends_graceful_end() {
+        let mut fixture = Fixture::new();
+        fixture
+            .client
+            .as_mut()
+            .unwrap()
+            .write_all(&[255; 8])
+            .unwrap();
+        fixture
+            .retire
+            .send(Retire::Finished { slot: 0, uid: 1 })
+            .unwrap();
+        fixture.host.drain_retire().unwrap();
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+        ));
+        assert!(fixture.host.connections.is_empty());
+        let mut bytes = [0; 9];
+        fixture
+            .client
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut bytes)
+            .unwrap();
+        assert!(matches!(
+            HostMessage::decode(&bytes).unwrap().unwrap().0,
+            HostMessage::End(EndReason::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn normal_read_handles_only_one_chunk() {
+        let mut fixture = Fixture::new();
+        let count = fixture.write_ops();
+        assert!(fixture.host.read(0, false).unwrap());
+        let first = fixture.network.try_iter().count();
+        assert!(
+            first > 0 && first < count,
+            "one pass must not drain the socket"
+        );
+        assert!(fixture.host.read(0, false).unwrap());
+        assert_eq!(first + fixture.network.try_iter().count(), count);
     }
 }
