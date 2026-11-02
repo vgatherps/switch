@@ -423,6 +423,11 @@ impl Stack {
         TxFrame::alloc(self.device.frame_pool())
     }
 
+    /// Frames this lcore can allocate from the frame pool now: the pool's ring plus this lcore's cache.
+    pub fn free_frames(&self) -> usize {
+        self.device.frame_pool().free_count()
+    }
+
     fn set_now(&mut self, now: Instant) -> Result<(), StackError> {
         if now < self.now {
             return Err(StackError::TimeWentBackwards {

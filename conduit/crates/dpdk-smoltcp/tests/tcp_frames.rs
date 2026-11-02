@@ -843,6 +843,21 @@ fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
     });
 }
 
+/// A `tx_frame` the application holds is one frame fewer for this lcore to allocate; dropping it
+/// gives it back.
+#[zhida_test_support::pinned_test]
+fn free_frames_counts_an_application_held_tx_frame() {
+    with_eal(|eal| {
+        let mut host = Host::new(eal, "freefrm", 1, None);
+        let free = host.stack.free_frames();
+        let frame = host.stack.tx_frame().unwrap();
+        assert_eq!(host.stack.free_frames(), free - 1);
+        drop(frame);
+        assert_eq!(host.stack.free_frames(), free);
+        host.finish();
+    });
+}
+
 /// Individually emitted small writes may occupy more frames than the full-sized
 /// estimate; the byte limit and the shared pool still bound queued data.
 #[zhida_test_support::pinned_test]

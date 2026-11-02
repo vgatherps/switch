@@ -451,7 +451,9 @@ as the `net_tap` checksum header copy.
 
 `Stack::tx_frame() -> Option<TxFrame>` takes an empty frame from the frame pool: its payload starts
 42 bytes after the mbuf headroom and holds up to IP MTU − 28 bytes. `None` means the pool is empty;
-dropping a frame returns it. Frame-pool mbufs may be shared (refcount above 1) but stay direct and
+dropping a frame returns it. `Stack::free_frames() -> usize` counts the frames this lcore can
+allocate now: the pool's ring plus this lcore's cache, not frames in other lcores' caches.
+Frame-pool mbufs may be shared (refcount above 1) but stay direct and
 single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame
 pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pending queue holds keeps
 at most one frame no socket or application counts, and the extra frame means those packets can never
