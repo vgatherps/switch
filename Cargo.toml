@@ -37,6 +37,8 @@ members = [
     # NIC hardware RX stamp → now latency on the CPU's invariant counter
     # shared-memory backing and single/double mappings
     "shared-memory",
+    # junction (host control protocol and client session)
+    "junction",
     # vendored
     "vendor/slice_ringbuffer",
 ]
@@ -69,6 +71,7 @@ ceph-proto = { path = "cephalopod/crates/proto" }
 ceph-control = { path = "cephalopod/crates/control" }
 depot = { path = "depot" }
 dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
+junction = { path = "junction" }
 relay = { path = "relay" }
 sheath = { path = "sheath" }
 shared-memory = { path = "shared-memory" }
