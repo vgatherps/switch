@@ -85,12 +85,15 @@ pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed
 current one must be `tsc`, and `dmesg`, read as root, must show no `clocksource: timekeeping watchdog`,
 `TSC unstable` or `Marking clocksource 'tsc' as unstable` line, and its last `Switched to clocksource`
 must name `tsc`; a failure prints the offending line; other architectures skip it), unit, config, chrony
-(`chronyc sources` has the PHC as the selected source, a `#*` PHC row; a failure prints the sources output). With chrony on the PHC, CLOCK_REALTIME
+(ok with the PHC as the selected source, a `#*` PHC row in `chronyc sources`; also ok with no
+`/dev/ptp_ena` at all, a host outside a precision-time placement group on NTP only; FAIL when the
+device exists but is not selected, printing the sources output). With chrony on the PHC, CLOCK_REALTIME
 is UTC from the Time Sync PHC, which does not smear leap seconds (the link-local NTP source does).
 `pools` reads zhida-nic's own `hugepages: hugepages-2048kB used=N free=M` line from the last run in
 `/var/log/zhida/binance.log` and fails if the run took more than the 512 reserved pages.
 
-`run-binance.sh` runs `hft-host.sh verify` first and refuses to start if it fails. It then writes
+`run-binance.sh` runs `hft-host.sh verify` first and refuses to start if it fails, or if chrony
+does not have the PHC selected (launch the instance in a precision-time placement group). It then writes
 `/etc/zhida/binance.json`: `dut.json` with `rx_timestamps: true`. It refuses to start unless
 `zhida-netconf check` reads that back, then runs `zhida-nic --config /etc/zhida/binance.json feed`
 pinned to the app CPU, appending to `/var/log/zhida/binance.log`. Each message's latency is
