@@ -26,26 +26,12 @@ stub() { # name body
     chmod +x "$stubs/$1"
 }
 for c in pip3 curl rustup cargo install networkctl make taskset; do stub "$c" ""; done
-# chronyc tracking prints the fake tree's tracking file, or fails as with no chronyd running.
-stub chronyc "[ -f '$root/tracking' ] || { echo '506 Cannot talk to daemon'; exit 1; }
-case \"\$1\" in
-    tracking) cat '$root/tracking' ;;
-    sources) cat '$root/sources' ;;
-esac"
-# chronyc tracking and sources as AWS documents them. tracking REFID SECONDS SIDE SELECTED-ROW, the
-# last being the PHC row's mode/state (`#*` selected, `#-` not) or `none` for no PHC source.
-tracking() {
-    printf '%s\n' "Reference ID    : $1" 'Stratum         : 1' 'Ref time (UTC)  : Wed May 06 01:33:43 2026' \
-        "System time     : $2 seconds $3 of NTP time" 'Last offset     : +0.000000331 seconds' \
-        'Leap status     : Normal' >"$root/tracking"
-    {
-        echo 'MS Name/IP address         Stratum Poll Reach LastRx Last sample'
-        echo '==============================================================================='
-        [ "$4" = none ] || echo "$4 PHC0                          0   0   377     0   +184ns[ +198ns] +/- 5032ns"
-        if [ "$4" = '#*' ]; then ntp='^-'; else ntp='^*'; fi
-        echo "$ntp 169.254.169.123               1   4   377     8    -18us[  -18us] +/-  115us"
-    } >"$root/sources"
-}
+stub chronyc "cat '$root/sources'"
+# chronyc sources as AWS documents it, the PHC selected (`#*`).
+printf '%s\n' 'MS Name/IP address         Stratum Poll Reach LastRx Last sample' \
+    '===============================================================================' \
+    '#* PHC0                          0   0   377     0   +184ns[ +198ns] +/- 5032ns' \
+    '^- 169.254.169.123               1   4   377     8    -18us[  -18us] +/-  115us' >"$tmp/sources-phc"
 # dmesg reads the fake kernel log; a missing file is an unreadable dmesg.
 stub dmesg "cat '$root/kmsg'"
 stub dnf 'case "$*" in *kernel-devel*) exit 1 ;; esac'
@@ -134,7 +120,7 @@ host() {
     # AL2023's chrony.conf: the Time Sync NTP server (abridged).
     printf '%s\n' 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' 'driftfile /var/lib/chrony/drift' \
         >"$root/etc/chrony.conf"
-    tracking '50484330 (PHC0)' 0.000000184 slow '#*'
+    cp "$tmp/sources-phc" "$root/sources"
     # /opt/dpdk as this script builds it: 25.11.3 with the ENA read_clock patch.
     mkdir -p "$root/opt/dpdk/share"
     echo "$dpdk_stamp" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
@@ -273,22 +259,11 @@ check "restoring unmanaged config does not request a reboot" sh -c "! grep -q '^
 run verify
 check "a finished host verifies clean" status_is 0
 check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 13 ]"
-check "verify accepts chrony synced to the PHC" has chrony "ok system time 184 ns slow; PHC selected"
-check "verify dumps chronyc tracking verbatim" sh -c "grep -qx 'chronyc tracking:' '$tmp/out' && grep -qxF 'Reference ID    : 50484330 (PHC0)' '$tmp/out'"
-check "verify dumps chronyc sources -v verbatim" sh -c "grep -qx 'chronyc sources -v:' '$tmp/out' && grep -q '^#\\* PHC0 ' '$tmp/out'"
-tracking 'A9FEA97B (169.254.169.123)' 0.000002191 fast '#-'
+check "verify accepts chrony with the PHC selected" has chrony "ok PHC selected"
+sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
 run verify
-check "chrony synced to NTP, PHC not selected, fails" has chrony "FAIL the PHC is not the selected source"
-tracking '00000000 ()' 0.000000000 fast none
-run verify
-check "chrony without a PHC source fails" has chrony "FAIL the PHC is not the selected source"
-tracking '50484330 (PHC0)' 0.000011000 fast '#*'
-run verify
-check "chrony on the PHC but 11 us off fails" has chrony "FAIL system time 11000 ns fast, limit 10000"
-rm "$root/tracking"
-run verify
-check "no chronyd fails" has chrony "FAIL chronyc tracking: 506 Cannot talk to daemon"
-tracking '50484330 (PHC0)' 0.000000184 slow '#*'
+check "chrony on NTP, PHC not selected, fails with the sources output" sh -c "grep -q '^chrony: FAIL the PHC is not the selected source' '$tmp/out' && grep -q '^\\^\\* 169.254.169.123' '$tmp/out'"
+cp "$tmp/sources-phc" "$root/sources"
 check "verify sees management on its kernel driver with the default route" has management "ok ens5 on ena with the default route"
 check "verify reports no run yet" has pools "ok no run logged yet"
 

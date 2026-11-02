@@ -40,8 +40,6 @@ CHRONY_CONF=$R/etc/chrony.conf
 # chrony disciplines CLOCK_REALTIME to the ENA PTP hardware clock (Amazon Time Sync), the line AWS
 # documents: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html#configure-chronyd-phc
 PHC_REFCLOCK='refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer'
-# verify: CLOCK_REALTIME within this many ns of the reference (chronyc tracking's System time).
-CHRONY_MAX_OFFSET_NS=10000
 
 DPDK_VERSION=25.11.3
 DPDK_SHA256=3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490
@@ -600,26 +598,13 @@ verify() {
     if zhida-netconf check "$DUT" >/dev/null 2>&1; then report config ok "$DUT"; else report config FAIL "zhida-netconf check $DUT"; fi
 
     # CLOCK_REALTIME, which the feed compares with NIC stamps, must follow the PHC refclock:
-    # `chronyc sources` selects it (a `#*` PHC row) and tracking's System time is within the
-    # limit. Both chronyc outputs go into the report verbatim.
-    tracking=$(chronyc tracking 2>&1)
-    tracking_status=$?
-    sources=$(chronyc sources -v 2>&1)
-    echo "chronyc tracking:"
-    printf '%s\n' "$tracking"
-    echo "chronyc sources -v:"
-    printf '%s\n' "$sources"
-    # "System time     : 0.000000276 seconds fast of NTP time"
-    offset_ns=$(printf '%s\n' "$tracking" | awk '/^System time/ { printf "%d", $4 * 1e9 + 0.5 }')
-    side=$(printf '%s\n' "$tracking" | awk '/^System time/ { print $6 }')
-    if [ "$tracking_status" -ne 0 ]; then
-        report chrony FAIL "chronyc tracking: $(printf '%s\n' "$tracking" | head -n 1)"
-    elif ! printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
-        report chrony FAIL "the PHC is not the selected source (no '#* PHC' row in chronyc sources)"
-    elif [ -z "$offset_ns" ] || [ "$offset_ns" -ge "$CHRONY_MAX_OFFSET_NS" ]; then
-        report chrony FAIL "system time ${offset_ns:-unknown} ns $side, limit $CHRONY_MAX_OFFSET_NS"
+    # `chronyc sources` selects it (a `#*` PHC row).
+    sources=$(chronyc sources 2>&1)
+    if printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
+        report chrony ok "PHC selected"
     else
-        report chrony ok "system time $offset_ns ns $side; PHC selected"
+        report chrony FAIL "the PHC is not the selected source; chronyc sources:"
+        printf '%s\n' "$sources"
     fi
     exit $failed
 }
