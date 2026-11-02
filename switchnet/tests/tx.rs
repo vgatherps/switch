@@ -53,6 +53,31 @@ async fn poll_once<F: Future>(future: F) -> Option<F::Output> {
     .await
 }
 
+/// Every free frame of the Net's pool, held, with no task left in its frame-wait queue.
+/// The hoarder's last `tx_frame` stays queued when it finds the pool empty; one frame
+/// returns so a receive wakes that entry off the queue, then a wait that succeeds at
+/// once takes the frame back.
+fn take_every_frame(mixed: &mut Mixed) -> Rc<RefCell<Vec<TxFrame>>> {
+    let handle = mixed.handle();
+    let held = Rc::new(RefCell::new(Vec::new()));
+    let hoarder = mixed.spawn({
+        let held = held.clone();
+        async move {
+            while let Some(frame) = poll_once(handle.tx_frame()).await {
+                held.borrow_mut().push(frame);
+            }
+        }
+    });
+    mixed.wait(&hoarder);
+    held.borrow_mut().pop();
+    mixed.turn();
+    let handle = mixed.handle();
+    let last = mixed.spawn(async move { poll_once(handle.tx_frame()).await.expect("the returned frame") });
+    let frame = mixed.wait(&last);
+    held.borrow_mut().push(frame);
+    held
+}
+
 /// Rounds, draining the peer, until it holds `len` bytes.
 fn peer_receive(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, len: usize) -> Vec<u8> {
     let mut got = Vec::new();
@@ -166,17 +191,7 @@ fn try_send_full_returns_the_same_frame() {
 fn tx_frame_waits_until_a_frame_returns() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["txwa", "txwb"]);
-        let handle = mixed.handle();
-        let held = Rc::new(RefCell::new(Vec::new()));
-        let slot = mixed.spawn({
-            let held = held.clone();
-            async move {
-                while let Some(frame) = poll_once(handle.tx_frame()).await {
-                    held.borrow_mut().push(frame);
-                }
-            }
-        });
-        mixed.wait(&slot);
+        let held = take_every_frame(&mut mixed);
         assert!(!held.borrow().is_empty());
         let handle = mixed.handle();
         let (task, polls) = counted(async move { handle.tx_frame().await });
@@ -189,6 +204,32 @@ fn tx_frame_waits_until_a_frame_returns() {
         assert!(slot.is_full(), "not woken by the turn after a frame returned");
         assert_eq!(polls.get(), 2);
         drop((slot.take(), held));
+        mixed.close();
+    })
+}
+
+/// With three tasks waiting for a frame, one frame returning wakes only the oldest
+/// waiter: it takes the frame and the other two are not polled.
+#[zhida_test_support::pinned_test]
+fn one_free_frame_wakes_one_of_many_waiters() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["txoa", "txob"]);
+        let held = take_every_frame(&mut mixed);
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let handle = mixed.handle();
+                let (task, polls) = counted(async move { handle.tx_frame().await });
+                (mixed.spawn(task), polls)
+            })
+            .collect();
+        mixed.rounds(10);
+        assert!(waiters.iter().all(|(slot, polls)| !slot.is_full() && polls.get() == 1));
+        held.borrow_mut().pop();
+        mixed.turn();
+        let polls: Vec<_> = waiters.iter().map(|(_, polls)| polls.get()).collect();
+        assert_eq!(polls, [2, 1, 1], "one free frame polled more than its one waiter");
+        assert!(waiters[0].0.is_full());
+        drop((waiters, held));
         mixed.close();
     })
 }
