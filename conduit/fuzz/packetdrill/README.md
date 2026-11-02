@@ -109,9 +109,11 @@ the default. An invalid value or a second such line refuses the script unrun
   segment size or data in flight. Linux's default Nagle (Minshall's variant) holds a short
   segment only while an earlier short segment is unacknowledged.
   `scripts/handshake-no-options.pkt`, `handshake-small-mss.pkt`.
-- The RTO is fixed per socket, 300 ms by default (`set_rto`), not derived from RTT
-  samples; each expiry doubles it, up to 60 s, until SND.UNA advances. RFC 6298 2.4 says it
-  SHOULD be at least 1 s; Linux's minimum is 200 ms (TCP_RTO_MIN). `scripts/rto-backoff.pkt`.
+- The RTO follows RFC 6298 from RTT samples (SRTT + 4 * RTTVAR), 300 ms before the first
+  sample, with a 50 ms floor (`MIN_RTO`, above a peer's delayed ACK); each expiry doubles it,
+  up to 60 s, until SND.UNA advances, and a third expiry without a new sample drops the
+  measurement, back to 300 ms. RFC 6298 2.4 says it SHOULD be at least 1 s; Linux's minimum
+  is 200 ms (TCP_RTO_MIN). `scripts/rto-backoff.pkt`.
 - If the peer closes its window while data is in flight, an RTO sends a one-byte
   probe, and further probes follow the same RTO and backoff. Linux v6.12's
   [tcp_retransmit_timer](https://github.com/torvalds/linux/blob/v6.12/net/ipv4/tcp_timer.c#L547-L585)
@@ -135,7 +137,7 @@ the default. An invalid value or a second such line refuses the script unrun
 - `peer-window-limit.pkt`: Zhida sends exactly the client's scaled window, the rest after
   the window slides.
 - `peer-zero-window.pkt`: a pure ACK after 10 ms, the first zero-window probe one RTO
-  (300 ms) after the data, then probes 600 ms and 1.2 s apart; data released by the window
+  (300 ms, from the handshake's 100 ms RTT sample) after the data, then probes 600 ms and 1.2 s apart; data released by the window
   update. It pins 4000 usecs because the 10 ms ACK is finer than the 25 ms default can
   distinguish from an immediate ACK.
 - `held-receive-frames.pkt` (`--buffer 1024`): when the peer's window is closed, Zhida
@@ -184,8 +186,8 @@ the default. An invalid value or a second such line refuses the script unrun
   to that value. Four 1024-byte echoes and 204 bytes of the fifth fit before another
   ACK. It pins 4000 usecs because its duplicate-ACK timing checks
   are finer than the 25 ms default can distinguish.
-- `rto-backoff.pkt`: unacknowledged data is retransmitted at 300 ms, then 600 ms and 1.2 s
-  after that; the client's ACK stops it and the connection continues.
+- `rto-backoff.pkt`: unacknowledged data is retransmitted at the 50 ms RTO floor, then
+  100 ms and 200 ms after that; the client's ACK stops it and the connection continues.
 - `seq-wrap.pkt`: the client's sequence numbers wrap past 2^32; Zhida ACKs, echoes and
   closes across the wrap.
 - `selftest/split-segment.pkt`: expects one 1072-byte segment where Zhida sends 536, 536

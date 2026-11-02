@@ -199,15 +199,20 @@ impl fmt::Display for State {
     }
 }
 
+/// RTO before the first RTT sample, and again after three expiries without one.
 const DEFAULT_RTO: Duration = Duration::from_millis(300);
+/// Floor of the RTO computed from samples. It must sit above a peer's delayed ACK (ours is
+/// 10 ms, Linux's up to 40 ms), or each delayed ACK triggers a spurious retransmit.
+const MIN_RTO: Duration = Duration::from_millis(50);
 const MAX_RTO: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 struct SmoothedRtt {
     sent_at: Instant,
-    // Using u32 instead of Duration to save space (Duration is i64)
-    /// Smoothed RTT
+    /// Smoothed RTT (SRTT) in microseconds.
     srtt: u32,
+    /// RTT variation (RTTVAR) in microseconds.
+    rttvar: u32,
     sent_seq: TcpSeqNumber,
     max_seq_sent: TcpSeqNumber,
     /// true if we have made at least one rtt measurement.
@@ -222,6 +227,7 @@ impl Default for SmoothedRtt {
         Self {
             sent_at: Instant::ZERO,
             srtt: 0, // ignored, will be overwritten on first measurement.
+            rttvar: 0,
             sent_seq: TcpSeqNumber(0),
             max_seq_sent: TcpSeqNumber(0),
             have_measurement: false,
@@ -251,22 +257,48 @@ impl SmoothedRtt {
         }
     }
 
+    /// Smoothed RTT in microseconds, or 0 before the first sample.
     fn smoothed_rtt(&self) -> u32 {
         if self.have_measurement { self.srtt } else { 0 }
     }
 
+    /// RFC 6298 (2.1)-(2.5) RTO, before backoff. The clock granularity G of (2.2)/(2.3) is
+    /// ignored: the clock counts microseconds and MIN_RTO is far above one tick.
+    fn retransmission_timeout(&self) -> Duration {
+        if !self.have_measurement {
+            return DEFAULT_RTO;
+        }
+        let micros = u64::from(self.srtt) + 4 * u64::from(self.rttvar);
+        Duration::from_micros(micros.clamp(MIN_RTO.total_micros(), MAX_RTO.total_micros()))
+    }
+
+    /// Make the RTO `rto` (floored at MIN_RTO) until the next sample, expiry clear or reset.
+    #[cfg(test)]
+    fn seed(&mut self, rto: Duration) {
+        self.srtt = u32::try_from(rto.total_micros()).expect("seeded RTO must fit in u32 micros");
+        self.rttvar = 0;
+        self.have_measurement = true;
+        self.rto_count = 0;
+    }
+
+    /// Integer divisions round up, so the RTO never comes out below the exact formula.
     fn sample(&mut self, new_rtt: u32) {
         if self.have_measurement {
-            // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
-            self.srtt = (self.srtt * 7 + new_rtt).div_ceil(8);
+            // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set
+            // RTTVAR <- 3/4 RTTVAR + 1/4 |SRTT - R'|, then SRTT <- 7/8 SRTT + 1/8 R'.
+            let delta = u64::from(self.srtt.abs_diff(new_rtt));
+            self.rttvar = (3 * u64::from(self.rttvar) + delta).div_ceil(4) as u32;
+            self.srtt = (7 * u64::from(self.srtt) + u64::from(new_rtt)).div_ceil(8) as u32;
         } else {
-            // RFC 6298 (2.2) When the first RTT measurement R is made, the host MUST set (...)
+            // RFC 6298 (2.2) When the first RTT measurement R is made, the host MUST set
+            // SRTT <- R, RTTVAR <- R/2.
             self.have_measurement = true;
             self.srtt = new_rtt;
+            self.rttvar = new_rtt.div_ceil(2);
         }
 
         self.rto_count = 0;
-        tcp_trace!("rtte: sample={:?} srtt={:?}", new_rtt, self.srtt);
+        tcp_trace!("rtte: sample={:?} srtt={:?} rttvar={:?}", new_rtt, self.srtt, self.rttvar);
     }
 
     fn on_send(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
@@ -284,7 +316,9 @@ impl SmoothedRtt {
 
     fn on_ack(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
         if self.sampling && seq >= self.sent_seq {
-            self.sample((timestamp - self.sent_at).total_millis() as u32);
+            // A sample beyond u32 micros (71 minutes) only matters through the 60 s RTO cap.
+            let micros = (timestamp - self.sent_at).total_micros();
+            self.sample(u32::try_from(micros).unwrap_or(u32::MAX));
             self.sampling = false;
         }
     }
@@ -545,7 +579,6 @@ pub struct Socket<'a> {
     /// The ACK number of the last packet received.
     local_rx_last_ack: TcpSeqNumber,
     recover: TcpSeqNumber,
-    rto_us: u32,
     rto_backoff: u32,
     tx_queue: TxQueue,
     tx_seg_bytes: u32,
@@ -616,7 +649,6 @@ impl<'a> Socket<'a> {
             state: State::Closed,
             timer: Timer::new(),
             rtte: SmoothedRtt::default(),
-            rto_us: DEFAULT_RTO.total_micros() as u32,
             rto_backoff: 0,
             tx_queue,
             tx_seg_bytes: u32::try_from(tx_seg_bytes).expect("TX segment bytes exceed u32"),
@@ -890,22 +922,18 @@ impl<'a> Socket<'a> {
         self.initial_window = bytes;
     }
 
-    /// Set the base retransmission timeout. The default is 300 milliseconds.
-    ///
-    /// The new value applies when the next retransmission or probe timer is armed
-    /// and survives reset and reconnect. Timeout backoff is capped at 60 seconds.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `rto` is zero or exceeds 60 seconds.
-    pub fn set_rto(&mut self, rto: Duration) {
-        assert!(rto > Duration::ZERO && rto <= MAX_RTO);
-        self.rto_us = rto.total_micros() as u32;
+    /// Fix this socket's base RTO for timer-ordering tests; see `SmoothedRtt::seed`.
+    #[cfg(test)]
+    pub(crate) fn seed_rto(&mut self, rto: Duration) {
+        self.rtte.seed(rto);
     }
 
     fn retransmission_timeout(&self) -> Duration {
-        // Even a one-microsecond RTO reaches the cap after 26 doublings.
-        let micros = u64::from(self.rto_us)
+        // The base is at most 60 s, so 26 doublings cannot overflow and always reach the cap.
+        let micros = self
+            .rtte
+            .retransmission_timeout()
+            .total_micros()
             .checked_mul(1u64 << self.rto_backoff.min(26))
             .expect("RTO duration overflow");
         Duration::from_micros(micros.min(MAX_RTO.total_micros()))
@@ -3401,7 +3429,7 @@ fn rtt_sampling_round_trips() {
     assert_eq!(rtte.timestamp(), Some((first_send, TcpSeqNumber(0))));
 
     rtte.on_ack(Instant::from_millis(60), TcpSeqNumber(0));
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     assert_eq!(rtte.timestamp(), None);
     assert_eq!(rtte.max_seq_sent(), Some(TcpSeqNumber(0)));
 
@@ -3414,7 +3442,7 @@ fn rtt_sampling_round_trips() {
     assert_eq!(rtte.timestamp(), None);
     assert_eq!(rtte.max_seq_sent(), Some(TcpSeqNumber(2)));
     rtte.on_ack(Instant::from_millis(160), TcpSeqNumber(2));
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     assert_eq!(rtte.timestamp(), None);
     rtte.on_send(Instant::from_millis(170), TcpSeqNumber(2));
     assert_eq!(rtte.timestamp(), None);
@@ -3424,13 +3452,13 @@ fn rtt_sampling_round_trips() {
     rtte.on_send(third_send, TcpSeqNumber(3));
     assert_eq!(rtte.timestamp(), Some((third_send, TcpSeqNumber(3))));
     rtte.on_ack(Instant::from_millis(250), TcpSeqNumber(4));
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     assert_eq!(rtte.timestamp(), None);
 
     rtte.on_rto();
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     rtte.on_rto();
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     rtte.on_rto();
     assert_eq!(rtte.smoothed_rtt(), 0);
     assert_eq!(rtte.timestamp(), None);
@@ -4641,6 +4669,20 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    /// Established through a handshake whose SYN-ACK was acknowledged `rtt` after it left,
+    /// at time 0. One sample R gives SRTT = R, RTTVAR = R/2, so RTO = max(50 ms, 3R).
+    fn socket_established_with_rtt(rtt: Duration) -> TestSocket {
+        let mut s = socket_syn_received();
+        let sent_at = Instant::ZERO - rtt;
+        recv(&mut s, sent_at, |result| {
+            assert_eq!(result.unwrap().control, TcpControl::Syn);
+        });
+        send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
+        assert_eq!(s.state, State::Established);
+        assert_eq!(u64::from(s.rtte.srtt), rtt.total_micros());
+        s
     }
 
     fn frame_socket(byte_cap: usize, mss: usize, source: TxSource) -> TestSocket {
@@ -6165,7 +6207,7 @@ mod test {
     fn test_syn_received_duplicate_syn_resends_identical_syn_ack() {
         for seq in [REMOTE_SEQ, TcpSeqNumber(-1)] {
             let mut s = socket_listen();
-            s.set_rto(Duration::from_millis(1000));
+            // No RTT sample is possible here, so the base RTO stays 300 ms.
             let syn = SEND_TEMPL.syn().seq(seq).no_ack().wscale(2).sack_perm(true);
             send!(s, syn);
             let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(seq + 1).mss(BASE_MSS).wscale(0)
@@ -6175,6 +6217,8 @@ mod test {
             recv!(s, [syn_ack.clone()]);
             send!(s, syn);
             recv_nothing!(s);
+            recv_nothing!(s, time 299);
+            recv!(s, time 300, [syn_ack.clone()]);
             send!(s, time 499, syn);
             recv_nothing!(s, time 499);
             send!(s, time 500, syn);
@@ -6200,7 +6244,7 @@ mod test {
     #[test]
     fn test_syn_received_duplicate_syn_restarts_timer_on_emission() {
         let mut s = socket_syn_received();
-        s.set_rto(Duration::from_millis(1000));
+        // The duplicate SYN cancels the RTT sample, so the base RTO stays 300 ms.
         let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS);
         recv!(s, [syn_ack.clone()]);
         send!(s, time 100, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack());
@@ -6213,13 +6257,13 @@ mod test {
         assert!(!s.timer.is_retransmit());
         recv!(s, time 300, [syn_ack]);
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(1300),
+            expires_at: Instant::from_millis(600),
         });
-        assert_eq!(s.retransmission_timeout(), Duration::from_millis(1000));
+        assert_eq!(s.retransmission_timeout(), Duration::from_millis(300));
         send!(s, time 400, SEND_TEMPL.seq(REMOTE_SEQ + 256).ack(LOCAL_SEQ + 1));
         recv_nothing!(s, time 400);
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(1300),
+            expires_at: Instant::from_millis(600),
         });
     }
 
@@ -6508,12 +6552,15 @@ mod test {
     fn google_fr_four_packet_initial_window_and_repair() {
         let mut s = socket_with_buffer_sizes(131072, 131072);
         s.socket.listen(LISTEN_END).unwrap();
-        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().win(32792).wscale(7).mss(BASE_MSS));
-        recv(&mut s, Instant::ZERO, |result| {
+        // A 100 ms handshake RTT gives RTO = 100 + 4·50 = 300 ms, past the 130 ms repair.
+        let syn = SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().win(32792).wscale(7).mss(BASE_MSS);
+        assert_eq!(send(&mut s, Instant::from_millis(-100), &syn), None);
+        recv(&mut s, Instant::from_millis(-100), |result| {
             assert_eq!(result.unwrap().control, TcpControl::Syn);
         });
         let ack = SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(257);
         send!(s, ack);
+        assert_eq!(s.retransmission_timeout(), Duration::from_millis(300));
         for index in 0..4 {
             let time = index * 10;
             send!(s, time time, ack.psh().seq(REMOTE_SEQ + 1 + index as usize * BASE_MSS as usize)
@@ -11522,13 +11569,15 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet
+        // Acknowledge the first packet: a 5 ms sample, SRTT + 4·RTTVAR = 5 + 4·2.5 = 15 ms,
+        // raised to the 50 ms floor.
         send!(s, time 5, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
+        recv_nothing!(s, time 54);
         // The second packet should be re-sent.
-        recv!(s, time 305, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 55, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
 
-        recv_nothing!(s, time 355);
+        recv_nothing!(s, time 154);
     }
 
     #[test]
@@ -11541,12 +11590,12 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet
+        // Acknowledge the first packet: a 600 ms sample, RTO = 600 + 4·300 = 1800 ms.
         send!(s, time 600, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
         // The ACK of the first packet should restart the retransmit timer and delay a retransmission.
-        recv_nothing!(s, time 899);
+        recv_nothing!(s, time 2399);
         // The second packet should be re-sent.
-        recv!(s, time 900, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 2400, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
     }
 
@@ -11654,13 +11703,15 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet
+        // Acknowledge the first packet: a 5 ms sample, SRTT + 4·RTTVAR = 5 + 4·2.5 = 15 ms,
+        // raised to the 50 ms floor.
         send!(s, time 5, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
+        recv_nothing!(s, time 54);
         // The second packet should be re-sent.
-        recv!(s, time 305, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 55, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
 
-        recv_nothing!(s, time 355);
+        recv_nothing!(s, time 154);
     }
 
     /// Established with Cubic and a 6-byte MSS: "abcdef012345" goes out as two
@@ -12023,7 +12074,7 @@ mod test {
 
     #[test]
     fn pure_acks_during_zero_window_probe_do_not_count_as_retransmits() {
-        let mut s = socket_zero_window(DEFAULT_RTO);
+        let mut s = socket_zero_window(socket_established());
         recv!(s, time 300, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"a")));
         assert_eq!(s.retransmits(), 0);
         for offset in 0..3 {
@@ -12213,7 +12264,7 @@ mod test {
                 assert_eq!(s.loss_events(), u64::from(time != 0));
             }
         }
-        let mut s = socket_zero_window(DEFAULT_RTO);
+        let mut s = socket_zero_window(socket_established());
         for (time, retransmits) in [(300, 0), (900, 1), (2100, 2)] {
             recv(&mut s, Instant::from_millis(time), |result| {
                 let repr = result.unwrap();
@@ -12863,78 +12914,75 @@ mod test {
         }
     }
 
-    fn socket_zero_window(rto: Duration) -> TestSocket {
-        let mut s = socket_established();
-        s.set_rto(rto);
+    fn socket_zero_window(mut s: TestSocket) -> TestSocket {
         s.send_slice(b"abc").unwrap();
         send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
         s
     }
 
     #[test]
-    fn set_rto_applies_to_syn_synack_data_fin_and_probe() {
-        for state in [State::SynSent, State::SynReceived, State::Established, State::FinWait1] {
-            let mut s = match state {
-                State::SynSent => socket_syn_sent(),
-                State::SynReceived => socket_syn_received(),
-                _ => socket_established(),
-            };
-            s.set_rto(Duration::from_millis(700));
-            if state == State::Established {
-                s.send_slice(b"abc").unwrap();
-            } else if state == State::FinWait1 {
+    fn measured_rto_applies_to_data_fin_and_probe() {
+        // RTT 200 ms: RTO = 200 + 4 · 100 = 600 ms.
+        for close in [false, true] {
+            let mut s = socket_established_with_rtt(Duration::from_millis(200));
+            if close {
                 s.close();
+            } else {
+                s.send_slice(b"abc").unwrap();
             }
             recv(&mut s, Instant::ZERO, |result| {
-                let repr = result.unwrap();
-                assert_eq!(repr.control, match state {
-                    State::SynSent | State::SynReceived => TcpControl::Syn,
-                    State::FinWait1 => TcpControl::Fin,
-                    _ => TcpControl::Psh,
-                });
+                let control = if close { TcpControl::Fin } else { TcpControl::Psh };
+                assert_eq!(result.unwrap().control, control);
             });
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
         }
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
-        s.set_rto(Duration::from_millis(400));
-        recv_nothing!(s, time 699);
-        recv(&mut s, Instant::from_millis(700), |result| {
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
+        recv_nothing!(s, time 599);
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1500)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1800)));
     }
 
     #[test]
     fn rto_backoff_caps_at_sixty_seconds() {
+        // RTT 10 s: RTO = 10 + 4 · 5 = 30 s; doubled it reaches the 60 s cap. Probes keep
+        // the measurement; the third retransmission expiry clears it, so the base falls
+        // back to 300 ms and the next deadline is 300 ms · 2^3 = 2.4 s away.
         for probe in [false, true] {
             let mut s = if probe {
-                socket_zero_window(Duration::from_secs(30))
+                socket_zero_window(socket_established_with_rtt(Duration::from_secs(10)))
             } else {
-                let mut s = socket_established();
-                s.set_rto(Duration::from_secs(30));
+                let mut s = socket_established_with_rtt(Duration::from_secs(10));
                 s.send_slice(b"abc").unwrap();
                 recv(&mut s, Instant::ZERO, |result| {
                     assert_eq!(result.unwrap().payload, b"abc");
                 });
                 s
             };
-            for (index, at) in [30_000, 90_000, 150_000, 210_000].into_iter().enumerate() {
+            let expiries: &[(i64, i64)] = if probe {
+                &[(30_000, 90_000), (90_000, 150_000), (150_000, 210_000), (210_000, 270_000)]
+            } else {
+                &[(30_000, 90_000), (90_000, 150_000), (150_000, 152_400)]
+            };
+            for (index, &(at, next)) in expiries.iter().enumerate() {
                 recv_nothing(&mut s, Instant::from_millis(at - 1));
                 recv(&mut s, Instant::from_millis(at), |result| {
                     assert_eq!(result.unwrap().payload, if probe { &b"a"[..] } else { &b"abc"[..] });
                 });
                 assert_eq!(s.rto_backoff, (index + 1) as u32);
-                assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 60_000)));
+                assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(next)));
             }
         }
     }
 
     #[test]
     fn probe_backoff_counts_expiry_once_even_if_emit_fails() {
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        for at in [700, 710] {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        for at in [600, 610] {
             s.cx.set_now(Instant::from_millis(at));
             assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 let repr = frame_payload(repr, &frame);
@@ -12943,14 +12991,14 @@ mod test {
             }), Err(()));
             assert_eq!(s.rto_backoff, 1);
             assert!(matches!(s.timer, Timer::ZeroWindowProbe { backoff_applied: true, .. }));
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
         }
-        recv(&mut s, Instant::from_millis(720), |result| {
+        recv(&mut s, Instant::from_millis(620), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2120)));
-        recv_nothing!(s, time 2119);
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1820)));
+        recv_nothing!(s, time 1819);
     }
 
     #[test]
@@ -12991,7 +13039,7 @@ mod test {
 
     #[test]
     fn probe_byte_resend_does_not_sample_rtt() {
-        let mut s = socket_zero_window(DEFAULT_RTO);
+        let mut s = socket_zero_window(socket_established());
         for at in [300, 900] {
             recv!(s, time at, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"a")));
         }
@@ -13003,67 +13051,69 @@ mod test {
         recv!(s, time 1100, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 1).data(b"b")));
         send!(s, time 1150, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 3).win(1));
         assert!(s.rtte.have_measurement);
-        assert_eq!(s.rtte.srtt, 50);
+        assert_eq!(s.rtte.srtt, 50_000);
     }
 
     #[test]
     fn duplicate_ack_does_not_reset_probe_backoff() {
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        recv(&mut s, Instant::from_millis(700), |result| {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
-        send!(s, time 710, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
+        send!(s, time 610, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
-        recv_nothing!(s, time 2099);
-        recv(&mut s, Instant::from_millis(2100), |result| {
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1800)));
+        recv_nothing!(s, time 1799);
+        recv(&mut s, Instant::from_millis(1800), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
-        send!(s, time 2110, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(0));
+        send!(s, time 1810, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(0));
         assert_eq!(s.rto_backoff, 0);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2810)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2410)));
     }
 
     #[test]
     fn accepted_window_reopening_resets_backoff() {
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        recv(&mut s, Instant::from_millis(700), |result| {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
-        send!(s, time 710, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ).win(6));
+        send!(s, time 610, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ).win(6));
         assert_eq!(s.remote_win_len, 0);
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
-        send!(s, time 720, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(6));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1800)));
+        send!(s, time 620, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(6));
         assert_eq!(s.remote_win_len, 6);
         assert_eq!(s.rto_backoff, 0);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1420)));
-        recv(&mut s, Instant::from_millis(720), |result| {
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1220)));
+        recv(&mut s, Instant::from_millis(620), |result| {
             assert_eq!(result.unwrap().payload, b"abc");
         });
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1420)));
-        recv(&mut s, Instant::from_millis(1420), |result| {
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1220)));
+        recv(&mut s, Instant::from_millis(1220), |result| {
             assert_eq!(result.unwrap().payload, b"abc");
         });
-        send!(s, time 1430, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(12));
+        send!(s, time 1230, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(12));
         assert_eq!(s.remote_win_len, 12);
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2820)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2420)));
     }
 
     #[test]
     fn rto_expiry_with_probe_counts_one_backoff() {
         for fail_emit in [false, true] {
-            let mut s = socket_established();
-            s.set_rto(Duration::from_millis(700));
+            // RTT 200 ms: RTO = 600 ms.
+            let mut s = socket_established_with_rtt(Duration::from_millis(200));
             s.send_slice(b"abc").unwrap();
             recv(&mut s, Instant::ZERO, |result| {
                 assert_eq!(result.unwrap().payload, b"abc");
             });
             send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
-            recv_nothing!(s, time 699);
+            recv_nothing!(s, time 599);
             if fail_emit {
-                for at in [700, 710] {
+                for at in [600, 610] {
                     s.cx.set_now(Instant::from_millis(at));
                     assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                         let repr = frame_payload(repr, &frame);
@@ -13071,20 +13121,20 @@ mod test {
                         (Err(()), frame.map(UniqueTxBuf::into_buf))
                     }), Err(()));
                     assert_eq!(s.rto_backoff, 1);
-                    assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
+                    assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
                 }
             }
-            let at = if fail_emit { 720 } else { 700 };
+            let at = if fail_emit { 620 } else { 600 };
             recv(&mut s, Instant::from_millis(at), |result| {
                 assert_eq!(result.unwrap().payload, b"a");
             });
             assert_eq!(s.rto_backoff, 1);
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 1400)));
-            recv(&mut s, Instant::from_millis(at + 1400), |result| {
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 1200)));
+            recv(&mut s, Instant::from_millis(at + 1200), |result| {
                 assert_eq!(result.unwrap().payload, b"a");
             });
             assert_eq!(s.rto_backoff, 2);
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 4200)));
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 3600)));
         }
     }
 
@@ -13094,9 +13144,13 @@ mod test {
         let mut s = socket_with_buffer_sizes(1024, rx_len);
         s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
         s.socket.listen(LISTEN_END).unwrap();
-        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
-        recv!(s, Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).win(rx_len as u16)
-            .mss(BASE_MSS)));
+        // A 100 ms handshake RTT gives RTO = 100 + 4·50 = 300 ms, after the delayed ACK.
+        let syn = SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS);
+        assert_eq!(send(&mut s, Instant::from_millis(-100), &syn), None);
+        recv(&mut s, Instant::from_millis(-100), |result| {
+            assert_eq!(result, Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1)
+                .win(rx_len as u16).mss(BASE_MSS)));
+        });
         send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
 
         let data_seq = s.remote_seq_no;
@@ -13295,7 +13349,6 @@ mod test {
         // Arm the probe timer. (Set directly because the ACK above carries no
         // new data; in real traffic this state is reached e.g. when the
         // controller shrinks cwnd below the flight size while probing.)
-        s.set_rto(Duration::from_millis(100));
         s.timer
             .set_for_zero_window_probe(Instant::from_millis(10), Duration::from_millis(100));
 
@@ -13305,7 +13358,8 @@ mod test {
         // if the remote's window update got lost.
         recv!(s, time 110, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + 2048).ack(REMOTE_SEQ + 1)
             .data(&data[..1])));
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(310)));
+        // No RTT sample yet, so the backed-off probe interval is 2 · 300 ms.
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(710)));
     }
 
     #[test]
@@ -13901,49 +13955,71 @@ mod test {
     }
 
     #[test]
-    fn smoothed_rtt_initializes_then_uses_existing_weight() {
+    fn smoothed_rtt_follows_rfc6298() {
         let mut r = SmoothedRtt::default();
         assert!(!r.have_measurement);
-        for (index, (sample, expected)) in [(101, 101), (102, 102), (109, 103), (9, 92)]
-            .into_iter()
-            .enumerate()
+        assert_eq!(r.retransmission_timeout(), DEFAULT_RTO);
+        // Microseconds; divisions round up.
+        // 101 ms first: SRTT = 101000, RTTVAR = 50500, RTO = 101000 + 4·50500 = 303000.
+        // 102 ms: RTTVAR = (3·50500 + 1000)/4 = 38125, SRTT = (7·101000 + 102000)/8 = 101125,
+        //   RTO = 101125 + 152500 = 253625.
+        // 109 ms: RTTVAR = (3·38125 + 7875)/4 = 30562.5 -> 30563,
+        //   SRTT = (7·101125 + 109000)/8 = 102109.375 -> 102110, RTO = 102110 + 122252 = 224362.
+        // 9 ms: RTTVAR = (3·30563 + 93110)/4 = 46199.75 -> 46200,
+        //   SRTT = (7·102110 + 9000)/8 = 90471.25 -> 90472, RTO = 90472 + 184800 = 275272.
+        for (index, (sample, srtt, rttvar, rto)) in [
+            (101, 101_000, 50_500, 303_000),
+            (102, 101_125, 38_125, 253_625),
+            (109, 102_110, 30_563, 224_362),
+            (9, 90_472, 46_200, 275_272),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let sent_at = Instant::from_millis(index as i64 * 1000);
             let seq = LOCAL_SEQ + index + 1;
             r.on_send(sent_at, seq);
             r.on_ack(sent_at + Duration::from_millis(sample), seq);
             assert!(r.have_measurement);
-            assert_eq!(r.srtt, expected);
+            assert_eq!((r.srtt, r.rttvar), (srtt, rttvar));
+            assert_eq!(r.retransmission_timeout(), Duration::from_micros(rto));
             assert_eq!(r.timestamp(), None);
         }
+        // 30 µs: SRTT + 4·RTTVAR = 30 + 60 = 90 µs, raised to the 50 ms floor.
+        let mut r = SmoothedRtt::default();
+        r.sample(30);
+        assert_eq!(r.retransmission_timeout(), Duration::from_millis(50));
+        // 30 s: 30 + 4·15 = 90 s, capped at 60 s.
+        let mut r = SmoothedRtt::default();
+        r.sample(30_000_000);
+        assert_eq!(r.retransmission_timeout(), Duration::from_secs(60));
     }
 
     #[test]
-    fn fixed_rto_ignores_slow_ack_samples() {
-        for (rto, deadline) in [
-            (Duration::from_millis(1000), 1600),
-            (Duration::from_millis(700), 1300),
-        ] {
-            let mut s = socket_established();
-            s.set_rto(rto);
-            s.remote_mss = 6;
-            s.send_slice(b"abcdef012345").unwrap();
-            for offset in [0, 6] {
-                recv(&mut s, Instant::ZERO, |result| {
-                    let repr = result.unwrap();
-                    assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
-                    assert_eq!(repr.payload, &b"abcdef012345"[offset..offset + 6]);
-                });
-            }
-            send!(s, time 600, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
-            assert_eq!(s.rtte.srtt, 600);
-            assert_eq!(s.timer, Timer::Retransmit {
-                expires_at: Instant::from_millis(deadline),
+    fn measured_rto_follows_slow_ack_sample() {
+        // RTT 300 ms: SRTT = 300000 µs, RTTVAR = 150000, RTO = 900 ms.
+        let mut s = socket_established_with_rtt(Duration::from_millis(300));
+        s.remote_mss = 6;
+        s.send_slice(b"abcdef012345").unwrap();
+        for offset in [0, 6] {
+            recv(&mut s, Instant::ZERO, |result| {
+                let repr = result.unwrap();
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                assert_eq!(repr.payload, &b"abcdef012345"[offset..offset + 6]);
             });
-            recv_nothing!(s, time deadline - 1);
-            recv!(s, time deadline, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 7).ack(REMOTE_SEQ + 1)
-                .data(b"012345")));
         }
+        // 600 ms sample: RTTVAR = (3·150000 + 300000)/4 = 187500,
+        // SRTT = (7·300000 + 600000)/8 = 337500, RTO = 337500 + 750000 = 1087500 µs.
+        send!(s, time 600, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
+        assert_eq!((s.rtte.srtt, s.rtte.rttvar), (337_500, 187_500));
+        let deadline = Instant::from_micros(1_687_500);
+        assert_eq!(s.timer, Timer::Retransmit { expires_at: deadline });
+        recv_nothing(&mut s, deadline - Duration::from_micros(1));
+        recv(&mut s, deadline, |result| {
+            let repr = result.unwrap();
+            assert_eq!(repr.seq_number, LOCAL_SEQ + 7);
+            assert_eq!(repr.payload, b"012345");
+        });
     }
 
     #[test]
@@ -13985,7 +14061,7 @@ mod test {
                 State::SynReceived => socket_syn_received(),
                 _ => socket_established(),
             };
-            s.set_rto(Duration::from_millis(1000));
+            // No RTT sample is taken (every ACK covers retransmitted data): base RTO 300 ms.
             if state == State::Established {
                 s.send_slice(b"abcdef").unwrap();
             } else if state == State::FinWait1 {
@@ -13999,35 +14075,35 @@ mod test {
                 });
             }
             assert_eq!(s.timer, Timer::Retransmit {
-                expires_at: Instant::from_millis(7000),
+                expires_at: Instant::from_millis(4200),
             });
             if state == State::Established {
                 for stale_ack in [LOCAL_SEQ, LOCAL_SEQ + 1] {
                     send!(s, time 3100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(stale_ack).win(256));
-                    assert_eq!(s.retransmission_timeout(), Duration::from_millis(4000));
+                    assert_eq!(s.retransmission_timeout(), Duration::from_millis(1200));
                     assert_eq!(s.timer, Timer::Retransmit {
-                        expires_at: Instant::from_millis(7000),
+                        expires_at: Instant::from_millis(4200),
                     });
                 }
                 send!(s, time 3150, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 4));
                 assert_eq!(s.local_seq_no, LOCAL_SEQ + 4);
                 assert_eq!(s.rto_backoff, 0);
                 assert_eq!(s.timer, Timer::Retransmit {
-                    expires_at: Instant::from_millis(4150),
+                    expires_at: Instant::from_millis(3450),
                 });
             }
             send!(s, time 3200, SEND_TEMPL
                 .ctl(if state == State::SynSent { TcpControl::Syn } else { TcpControl::None })
                 .seq(if state == State::SynSent { REMOTE_SEQ } else { REMOTE_SEQ + 1 }).ack(ack));
             assert_eq!(s.local_seq_no, ack);
-            assert_eq!(s.retransmission_timeout(), Duration::from_millis(1000), "{state}");
+            assert_eq!(s.retransmission_timeout(), Duration::from_millis(300), "{state}");
         }
     }
 
     #[test]
-    fn fixed_rto_emit_failure_does_not_backoff_twice() {
+    fn emit_failure_does_not_backoff_twice() {
+        // No RTT sample: base RTO 300 ms.
         let mut s = socket_established();
-        s.set_rto(Duration::from_millis(1000));
         s.send_slice(b"abcdef").unwrap();
         recv!(s, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
         for time in [1000, 1100] {
@@ -14040,16 +14116,16 @@ mod test {
             }), Err(()));
             assert!(!s.timer.is_retransmit());
             assert_eq!(s.rtte.timestamp(), None);
-            assert_eq!(s.retransmission_timeout(), Duration::from_millis(2000));
+            assert_eq!(s.retransmission_timeout(), Duration::from_millis(600));
         }
         recv!(s, time 1200, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(3200),
+            expires_at: Instant::from_millis(1800),
         });
-        recv_nothing!(s, time 3199);
-        recv!(s, time 3200, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
+        recv_nothing!(s, time 1799);
+        recv!(s, time 1800, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(7200),
+            expires_at: Instant::from_millis(3000),
         });
     }
 
@@ -14069,68 +14145,59 @@ mod test {
     }
 
     #[test]
-    fn rto_at_cap_backoff_matches() {
+    fn rto_backoff_caps_measured_base() {
         let mut s = socket();
-        s.set_rto(MAX_RTO);
+        // 20 s sample: RTO = 20 + 4·10 = 60 s.
+        s.rtte.sample(20_000_000);
         for backoff in [0, 1, 26, 40] {
             s.rto_backoff = backoff;
             assert_eq!(s.retransmission_timeout(), Duration::from_micros(60_000_000));
         }
-        s.set_rto(Duration::from_micros(1));
-        for (backoff, expected_us) in [(0, 1), (1, 2), (26, 60_000_000), (40, 60_000_000)] {
+        // 0 µs sample: RTO = 0, raised to the 50 ms floor.
+        s.rtte = SmoothedRtt::default();
+        s.rtte.sample(0);
+        for (backoff, expected_us) in [(0, 50_000), (1, 100_000), (26, 60_000_000), (40, 60_000_000)] {
             s.rto_backoff = backoff;
             assert_eq!(s.retransmission_timeout(), Duration::from_micros(expected_us));
         }
     }
 
     #[test]
-    fn set_rto_panics_outside_range() {
-        for rto in [Duration::ZERO, MAX_RTO + Duration::from_micros(1), Duration::MAX] {
-            assert!(std::panic::catch_unwind(|| socket().set_rto(rto)).is_err());
-        }
-        for rto in [Duration::from_micros(1), MAX_RTO] {
-            let mut s = socket();
-            s.set_rto(rto);
-            assert_eq!(Duration::from_micros(u64::from(s.rto_us)), rto);
-        }
-    }
-
-    #[test]
-    fn set_rto_applies_at_next_arm_and_survives_reconnect() {
-        let mut s = socket_established();
-        s.set_rto(Duration::from_millis(1000));
+    fn measured_rto_clears_on_reset_and_reconnect() {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_established_with_rtt(Duration::from_millis(200));
         s.send_slice(b"abcdef").unwrap();
         recv(&mut s, Instant::ZERO, |result| {
             assert_eq!(result.unwrap().payload, b"abcdef");
         });
-        s.set_rto(Duration::from_micros(300_001));
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(1000),
+            expires_at: Instant::from_millis(600),
         });
-        recv(&mut s, Instant::from_millis(1000), |result| {
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"abcdef");
         });
         assert_eq!(s.rto_backoff, 1);
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(1_600_002),
+            expires_at: Instant::from_millis(1800),
         });
-        send!(s, time 1100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
+        send!(s, time 700, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
         s.close();
-        recv(&mut s, Instant::from_millis(1200), |result| {
+        recv(&mut s, Instant::from_millis(800), |result| {
             assert_eq!(result.unwrap().control, TcpControl::Fin);
         });
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(1_500_001),
+            expires_at: Instant::from_millis(1400),
         });
         s.reset();
         assert_eq!(s.rto_backoff, 0);
+        assert!(!s.rtte.have_measurement);
         s.listen(LOCAL_PORT).unwrap();
         send!(s, time 2000, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack());
         recv(&mut s, Instant::from_millis(2000), |result| {
             assert_eq!(result.unwrap().control, TcpControl::Syn);
         });
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(2_300_001),
+            expires_at: Instant::from_millis(2300),
         });
         s.abort();
         s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END.port).unwrap();
@@ -14138,33 +14205,33 @@ mod test {
             assert_eq!(result.unwrap().control, TcpControl::Syn);
         });
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(3_300_001),
+            expires_at: Instant::from_millis(3300),
         });
-        assert_eq!(Duration::from_micros(u64::from(s.rto_us)), Duration::from_micros(300_001));
     }
 
     #[test]
-    fn fixed_rto_caps_and_discards_smoothed_rtt_after_three_expiries() {
+    fn measured_rto_backs_off_then_falls_back_after_three_expiries() {
         let mut s = socket_established();
         s.send_slice(b"abc").unwrap();
         recv(&mut s, Instant::ZERO, |result| {
             assert_eq!(result.unwrap().payload, b"abc");
         });
+        // 101 ms sample: SRTT = 101000 µs, RTTVAR = 50500, RTO = 303 ms.
         send!(s, time 101, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 4));
-        assert_eq!(s.rtte.srtt, 101);
-        s.set_rto(Duration::from_micros(1));
+        assert_eq!(s.rtte.srtt, 101_000);
         s.send_slice(b"def").unwrap();
         recv(&mut s, Instant::from_millis(200), |result| {
             assert_eq!(result.unwrap().payload, b"def");
         });
-        let mut expires_at = Instant::from_micros(200_001);
+        let mut expires_at = Instant::from_millis(503);
+        // 303 ms · 2, · 4; the third expiry clears the measurement, so 300 ms · 2^3, 2^4, ...
+        // until 300 ms · 2^8 = 76.8 s is capped at 60 s.
         let delays = [
-            2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-            65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608,
-            16777216, 33554432, 60_000_000,
+            606_000, 1_212_000, 2_400_000, 4_800_000, 9_600_000, 19_200_000, 38_400_000,
+            60_000_000,
         ];
         for (index, delay) in delays.into_iter()
-            .chain(core::iter::repeat_n(60_000_000, 54))
+            .chain(core::iter::repeat_n(60_000_000, 4))
             .enumerate()
         {
             recv_nothing(&mut s, expires_at - Duration::from_micros(1));
@@ -14177,7 +14244,7 @@ mod test {
             assert_eq!(s.timer, Timer::Retransmit { expires_at });
             assert_eq!(s.rto_backoff, (index + 1) as u32);
             assert_eq!(s.rtte.have_measurement, index < 2);
-            assert_eq!(s.rtte.srtt, 101);
+            assert_eq!(s.rtte.srtt, 101_000);
             assert_eq!(s.rtte.timestamp(), None);
         }
     }
@@ -14189,9 +14256,10 @@ mod test {
         recv(&mut s, Instant::ZERO, |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
+        // 100 ms sample: SRTT = 100000 µs, RTTVAR = 50000, RTO = 300 ms.
         send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2));
         assert!(s.rtte.have_measurement);
-        assert_eq!(s.rtte.srtt, 100);
+        assert_eq!(s.rtte.srtt, 100_000);
         s.send_slice(b"b").unwrap();
         for at in [200, 500, 1100] {
             recv(&mut s, Instant::from_millis(at), |result| {
@@ -14204,11 +14272,14 @@ mod test {
         recv(&mut s, Instant::from_millis(1200), |result| {
             assert_eq!(result.unwrap().payload, b"c");
         });
+        // 200 ms sample: RTTVAR = (3·50000 + 100000)/4 = 62500,
+        // SRTT = (7·100000 + 200000)/8 = 112500, RTO = 112500 + 250000 = 362.5 ms.
         send!(s, time 1400, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 4));
-        assert_eq!(s.rtte.srtt, 113);
+        assert_eq!((s.rtte.srtt, s.rtte.rttvar), (112_500, 62_500));
         s.send_slice(b"d").unwrap();
-        for (index, at) in [1500, 1800, 2400, 3600].into_iter().enumerate() {
-            recv(&mut s, Instant::from_millis(at), |result| {
+        // Sent at 1500 ms, resent after 362.5, 725 and 1450 ms.
+        for (index, at) in [1_500_000, 1_862_500, 2_587_500, 4_037_500].into_iter().enumerate() {
+            recv(&mut s, Instant::from_micros(at), |result| {
                 assert_eq!(result.unwrap().payload, b"d");
             });
             assert_eq!(s.rtte.have_measurement, index < 3);
@@ -14216,15 +14287,15 @@ mod test {
                 assert_eq!(s.rtte.timestamp(), None);
             }
         }
-        send!(s, time 3700, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 5));
+        send!(s, time 4100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 5));
         assert!(!s.rtte.have_measurement);
         s.send_slice(b"e").unwrap();
-        recv(&mut s, Instant::from_millis(3800), |result| {
+        recv(&mut s, Instant::from_millis(4200), |result| {
             assert_eq!(result.unwrap().payload, b"e");
         });
-        send!(s, time 3850, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 6));
+        send!(s, time 4250, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 6));
         assert!(s.rtte.have_measurement);
-        assert_eq!(s.rtte.srtt, 50);
+        assert_eq!(s.rtte.srtt, 50_000);
     }
 
     #[test]

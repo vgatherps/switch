@@ -624,10 +624,12 @@ TCP timer scheduling has 1 ms granularity. Nonnegative deadlines are rounded up 
 millisecond boundary; expiry checks do not fire before the requested deadline. A late drive call
 makes the timer late.
 
-The base retransmission timeout is fixed per socket at 300 ms by default. Backoff is capped at 60
-seconds. `set_rto(smoltcp::time::Duration)` changes the base used the next time a retransmission or
-probe timer is armed and survives reset/reconnect. It does not rewrite an already armed timer. Zero
-or more than 60 seconds panics.
+The retransmission timeout follows RFC 6298 from measured round trips: SRTT + 4 * RTTVAR, at least
+50 ms (above a peer's delayed ACK, so a delayed ACK does not draw a spurious retransmit) and at most
+60 seconds. Before the first sample it is 300 ms. Each expiry doubles it, capped at 60 seconds, until
+SND.UNA advances; three expiries without a new sample discard the measurement, so the base returns to
+300 ms. Reset/reconnect discards it too. A new RTO applies the next time a retransmission or probe
+timer is armed; it does not rewrite an already armed timer.
 
 Delayed ACK defaults to 10 ms. `set_ack_delay(Some(duration))` changes the delay;
 `set_ack_delay(None)` disables delayed ACK. Immediate ACK conditions apply either way. Disabling
@@ -689,8 +691,7 @@ The config's `mss_cap` limits the advertised MSS and outgoing segment payloads. 
 application cap; local MTU and peer MSS apply regardless. The cap survives reset/reconnect and
 cannot be changed after `add_tcp`. `set_initial_window(bytes)` sets Cubic's initial congestion
 window for the handshake and survives reset/reconnect. The default is 1048576 bytes. Set it before
-connect/listen. The peer's advertised window limits transmission. `set_rto` takes
-`smoltcp::time::Duration`; `set_ack_delay` takes `Option<smoltcp::time::Duration>` (see Time rules).
+connect/listen. The peer's advertised window limits transmission. `set_ack_delay` takes `Option<smoltcp::time::Duration>` (see Time rules).
 
 `add_tcp(config) -> Result<TcpHandle, AddTcpError>` returns the config unchanged if TCP slots are
 full; pool size never refuses a socket. Configure the added socket through `stack.tcp_mut(&handle)`,
@@ -1108,8 +1109,7 @@ These panic:
 
 - using a handle with a Stack that did not create it
 - adding a TCP socket with a receive window target above 1 GiB or `mss_cap: Some(0)`
-- `set_initial_window(0)`, `set_rto(Duration::ZERO)` or RTO above 60 seconds, `set_ack_delay` above
-  60 seconds, `set_hop_limit(Some(0))`
+- `set_initial_window(0)`, `set_ack_delay` above 60 seconds, `set_hop_limit(Some(0))`
 - `tx_mbuf_budget` below MTU 68
 - overflow in reserve arithmetic, frame-budget conversions, or timer arithmetic near the
   integer limit; excessive `neighbor_capacity` at startup

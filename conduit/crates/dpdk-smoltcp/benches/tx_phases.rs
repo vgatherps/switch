@@ -52,7 +52,9 @@
 //!   then A runs `receive` at its `poll_at` deadlines until a `send` emits the
 //!   retransmission. `retransmit` times that `send`; `send` calls at early
 //!   deadlines that emit nothing are untimed. `emit` times the original send,
-//!   reclaim both frees. Time advances by the RTO each iteration.
+//!   reclaim both frees. Time advances by the RTO each iteration, so about
+//!   once every 60 s of it A's retransmission comes with its ARP probe for B
+//!   (neighbor lifetime); reclaim checks it and B's reply refreshes A, untimed.
 //!
 //! A's send buffer is `depth` × 1460 bytes (1460: the segment payload at IP
 //! MTU 1500). It takes `depth` writes, each its own frame because an emit
@@ -73,8 +75,8 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as SmolInstant;
 use dpdk_smoltcp::smoltcp::wire::{
-    IpEndpoint, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, ETHERNET_HEADER_LEN,
-    IPV4_HEADER_LEN,
+    ArpOperation, ArpPacket, ArpRepr, IpEndpoint, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    ETHERNET_HEADER_LEN, IPV4_HEADER_LEN,
 };
 use dpdk_smoltcp::{
     frame_reserve, rx_reserve, Eal, Sent, TcpHandle, Turn,
@@ -84,7 +86,7 @@ use zhida_test_kit::pair::{
     self, establish_with, pattern, segment, tcp_frame, tcp_socket_sized, Dir, Pair, Side,
     BUDGET, CLIENT_PORT, IDLE_ROUNDS, MAX_ROUNDS, SERVER_PORT, T0,
 };
-use zhida_test_kit::with_eal;
+use zhida_test_kit::{ring_port, with_eal};
 
 const WARMUP: usize = 6;
 const RING: u32 = 512;
@@ -305,6 +307,26 @@ struct Bench {
     tx_in_use: Option<u32>,
     /// A's time: the Pair's until rto moves it past `Pair::now`.
     now: SmolInstant,
+    /// The last retransmit send also emitted A's ARP probe for B; the next
+    /// reclaim takes it and B's reply answers it.
+    arp_probe: bool,
+}
+
+fn is_arp(frame: &[u8]) -> bool {
+    frame[12..14] == [0x08, 0x06]
+}
+
+/// `frame` is A's ARP request for B's address.
+fn assert_arp_probe(frame: &[u8]) {
+    let arp = ArpRepr::parse(&ArpPacket::new_checked(&frame[ETHERNET_HEADER_LEN..]).unwrap())
+        .unwrap();
+    let ArpRepr::EthernetIpv4 { operation, source_hardware_addr, source_protocol_addr, target_protocol_addr, .. } = arp
+    else {
+        panic!("A sent a non-Ethernet/IPv4 ARP frame: {arp:?}")
+    };
+    assert_eq!(operation, ArpOperation::Request, "A ARP probe operation");
+    assert_eq!((source_hardware_addr, source_protocol_addr), (Side::A.mac(), Side::A.ip()));
+    assert_eq!(target_protocol_addr, Side::B.ip(), "A ARP probe target");
 }
 
 /// A's frame with its TCP checksum filled in, as a NIC with the TX TCP
@@ -426,6 +448,7 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
         b_shift: syn_ack.window_scale.unwrap_or(0),
         tx_in_use: None,
         now: pair.now(),
+        arp_probe: false,
         pair,
     };
     // A's view of B's window is B's SYN-ACK window, unscaled and at most
@@ -524,17 +547,26 @@ impl Bench {
 
     /// Phase 6: take A's sent frames off its TX ring and free them.
     /// `expected` holds each frame's sequence number, range of `stream` and
-    /// flags; with `checks`, every frame is parsed against it, untimed.
+    /// flags; with `checks`, every frame is parsed against it, untimed. After a
+    /// retransmit that also sent A's ARP probe, that frame is checked too and
+    /// B's reply is delivered to A, untimed.
     fn reclaim(
         &mut self,
         times: &mut Times,
         expected: &[(TcpSeqNumber, Range<usize>, TcpControl)],
         checks: bool,
     ) {
+        let probe = std::mem::take(&mut self.arp_probe);
+        let mut probes = 0usize;
         let count = if checks {
             let (stream, b_seq, offload) = (&self.stream, self.b_seq, self.case.offload);
             let mut frames = expected.iter();
             self.pair.drain_tx(Side::A, |frame| {
+                if is_arp(frame) {
+                    assert_arp_probe(frame);
+                    probes += 1;
+                    return;
+                }
                 let (seq, range, control) = frames.next().expect("extra A frame");
                 let filled = if offload { fill_tcp_checksum(frame) } else { frame.to_vec() };
                 let tcp = segment(&filled, Side::A);
@@ -545,11 +577,32 @@ impl Bench {
                 assert_eq!(tcp.ack_number, Some(b_seq));
                 assert_eq!(tcp.payload, &stream[range.clone()]);
             })
+        } else if probe {
+            let pair = &self.pair;
+            times.time(Phase::Reclaim, || pair.drain_tx(Side::A, |frame| {
+                if is_arp(frame) {
+                    assert_arp_probe(frame);
+                    probes += 1;
+                }
+            }))
         } else {
             let pair = &self.pair;
             times.time(Phase::Reclaim, || pair.drain_tx(Side::A, |_| {}))
         };
-        assert_eq!(count, expected.len(), "reclaimed frames");
+        assert_eq!(probes, usize::from(probe), "A ARP probes");
+        assert_eq!(count, expected.len() + probes, "reclaimed frames");
+        if probe {
+            times.pause();
+            let reply = ring_port::arp(
+                ArpOperation::Reply,
+                Side::A.mac(),
+                (Side::B.mac(), Side::B.ip()),
+                (Side::A.mac(), Side::A.ip()),
+            );
+            self.pair.inject(Side::A, &[reply]);
+            assert_receive(self.pair.a.receive(self.now, 1).unwrap(), 1, self.case, "ARP reply");
+            times.resume();
+        }
     }
 
     /// Phase 5: inject `acks` (untimed), then one receive that takes them all.
@@ -578,7 +631,10 @@ impl Bench {
                 assert_eq!(sent.tx_pending, 0);
                 continue;
             }
-            assert_sent(sent, 1, self.case, "retransmit");
+            // A second frame is A's once-per-lifetime ARP probe of its entry for B; it lands
+            // in this timed send about once every 60 s of virtual time.
+            self.arp_probe = sent.tx_accepted == 2;
+            assert_sent(sent, 1 + usize::from(self.arp_probe), self.case, "retransmit");
             if times.phases() {
                 times.add(Phase::Retransmit, elapsed);
             }

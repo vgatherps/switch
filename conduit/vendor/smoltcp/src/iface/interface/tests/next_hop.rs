@@ -1017,17 +1017,13 @@ mod invalidation {
             peer.send(2);
             peer.expect_frame(TcpControl::Psh, seq, TcpSeqNumber(101), &[0x5a]);
             assert!(peer.device.tx_queue.is_empty());
-            for millis in (3..302).step_by(100).chain([301]) {
+            // The handshake and warm-up RTT samples are 0 µs: the 50 ms RTO floor, so the
+            // resend is due at 2 + 50 ms.
+            for millis in 3..52 {
                 peer.egress(millis);
                 assert!(peer.device.tx_queue.is_empty());
             }
-            for millis in 302..=402 {
-                peer.egress(millis);
-                if !peer.device.tx_queue.is_empty() {
-                    break;
-                }
-                assert!(peer.device.tx_queue.is_empty());
-            }
+            peer.egress(52);
             peer.expect_frame(TcpControl::Psh, seq, TcpSeqNumber(101), &[0x5a]);
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).send_queue(), 1);
@@ -1092,17 +1088,13 @@ mod invalidation {
             ack.window_len = 0;
             peer.ingress(2, peer.frame(ack));
             assert_eq!(peer.sockets.get_mut(peer.handle).send_slice(b"abc"), Ok(3));
-            for millis in (2..302).step_by(100).chain([301]) {
+            // The handshake and warm-up RTT samples are 0 µs: the 50 ms RTO floor, so the
+            // probe is due at 2 + 50 ms.
+            for millis in 2..52 {
                 peer.egress(millis);
                 assert!(peer.device.tx_queue.is_empty());
             }
-            for millis in 302..=402 {
-                peer.egress(millis);
-                if !peer.device.tx_queue.is_empty() {
-                    break;
-                }
-                assert!(peer.device.tx_queue.is_empty());
-            }
+            peer.egress(52);
             peer.expect_frame(TcpControl::None, seq, TcpSeqNumber(101), b"a");
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).send_queue(), 3);

@@ -348,9 +348,7 @@ mod stale_neighbors {
             mut sockets: TcpSet<'static>,
             device: TestingDevice,
         ) -> Self {
-            let mut socket = tcp::Socket::test_socket(64, 64);
-            // The timelines retransmit at 1 s after the first unacknowledged send.
-            socket.set_rto(crate::time::Duration::from_millis(1_000));
+            let socket = tcp::Socket::test_socket(64, 64);
             let handle = sockets.add(socket);
             let mut conn = Self {
                 iface,
@@ -410,6 +408,9 @@ mod stale_neighbors {
             );
             conn.ingress(0, bytes);
             assert_eq!(conn.sockets.get(handle).state(), tcp::State::Established);
+            // The timelines retransmit at 1 s after the first unacknowledged send; seeded after
+            // the handshake, whose 0 µs RTT sample would otherwise set the 50 ms floor.
+            conn.sockets.get_mut(handle).seed_rto(crate::time::Duration::from_millis(1_000));
             conn.egress(0);
             conn.take_data(&[], 0);
             assert!(conn.device.inner.tx_queue.is_empty());

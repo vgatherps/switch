@@ -7,10 +7,12 @@
 //   FIN. Its payload is discarded: no new stream data, ACK of that data, or RST.
 // - The next ACK (seq 12, ack 12) closes LastAck; a new SYN gets a SYN-ACK.
 // packetdrill fills payloads with zero bytes; the check is on sequence numbers only.
+// The handshake ACK comes 100 ms after the SYN-ACK, so Zhida's RTO is 100 + 4 * 50 =
+// 300 ms (RFC 6298): its unacknowledged echo is not retransmitted during the script.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
-+0    < . 1:1(0) ack 1 win 502
++0.1  < . 1:1(0) ack 1 win 502
 +0    > . 1:1(0) ack 1 win 32768
 +0    < P. 1:11(10) ack 1 win 502
 +0    > P. 1:11(10) ack 11 win 32768

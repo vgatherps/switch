@@ -29,7 +29,9 @@ use zhida_test_kit::with_eal;
 
 const BULK: usize = 256 * 1024;
 const ACK_DELAY: Duration = Duration::from_millis(10);
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples here are 0 or 10 ms (delayed ACK), so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/frames");
 

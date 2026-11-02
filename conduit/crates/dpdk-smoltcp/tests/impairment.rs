@@ -19,8 +19,9 @@ use wire::{Link, Verdict};
 
 /// Upstream `ACK_DELAY_DEFAULT`.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// Default socket RTO.
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples on a Pair at one instant are 0 µs, so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 /// Upstream TIME-WAIT duration (`CLOSE_DELAY`).
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 
@@ -366,6 +367,61 @@ fn dropped_data_segment_retransmitted_deadline_only() {
     });
 }
 
+/// On a 30 µs path the RTO follows the measured round trip: a lost segment is resent
+/// at the 50 ms floor, not after the initial 300 ms.
+#[zhida_test_support::pinned_test]
+fn rto_follows_measured_round_trip() {
+    with_eal(|eal| {
+        let mut pair = new_pair(eal, ["rtomrta", "rtomrtb"]);
+        let (handles, a_seq, b_seq) = connect(&mut pair);
+        pair.b.tcp_mut(&handles[1]).set_ack_delay(None);
+
+        // A sends at t, B acknowledges in the same round, and A takes the ACK 30 µs later.
+        let t = pair.now();
+        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"ping"), Ok(4));
+        let sent = pair.round_at(t, |_, _| {});
+        assert_eq!((sent.a_to_b, sent.b_to_a), (1, 1));
+        let acked = pair.round_at(t + Duration::from_micros(30), |dir, _| {
+            panic!("{dir:?} frame after the ACK")
+        });
+        assert_eq!((acked.a_to_b, acked.b_to_a), (0, 0));
+        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
+
+        // After the handshake's 0 µs sample, the 30 µs one gives RTTVAR = 30/4 -> 8 µs and
+        // SRTT = 30/8 -> 4 µs: SRTT + 4·RTTVAR = 36 µs, raised to the 50 ms floor.
+        drop_first_data(&mut pair.a_to_b);
+        let lost_at = pair.now();
+        let data = pattern(1000, 5);
+        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(&data), Ok(data.len()));
+        let lost = pair.round(|dir, _| panic!("{dir:?} frame delivered"));
+        assert_eq!(lost.a.tx_accepted, 1);
+        assert_eq!(counts(&pair.a_to_b), (0, 0, 1, 0));
+        // Stack timers fire on whole milliseconds.
+        let resend_at = ceil_ms(lost_at + Duration::from_millis(50));
+        let early = pair.round_at(resend_at - Duration::from_micros(1), |dir, _| {
+            panic!("{dir:?} frame before the retransmission deadline")
+        });
+        assert_eq!(early.a.tx_accepted, 0);
+        let mut frames = Vec::new();
+        pair.round_at(resend_at, |dir, frame| frames.push((dir, frame.to_vec())));
+        assert_eq!(
+            segs(&frames),
+            [
+                seg(Dir::AToB, a_seq + 4, b_seq, TcpControl::Psh, 1000),
+                seg(Dir::BToA, b_seq, a_seq + 1004, TcpControl::None, 0),
+            ]
+        );
+        pair.round(|dir, _| panic!("{dir:?} frame after the repair"));
+        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
+        let mut expected = b"ping".to_vec();
+        expected.extend_from_slice(&data);
+        assert_b_reads(&mut pair, &handles, &expected);
+        assert_eq!(counts(&pair.a_to_b), (0, 0, 1, 0));
+        assert_eq!(counts(&pair.b_to_a), (0, 0, 0, 0));
+        assert_eq!(pair.close(), 0);
+    });
+}
+
 #[zhida_test_support::pinned_test]
 fn wan_tail_loss_delivers_exact_bytes() {
     with_eal(|eal| {
@@ -410,8 +466,10 @@ fn wan_tail_loss_delivers_exact_bytes() {
         assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 540);
 
         // The partial ACK restarted A's retransmission timer: the tail leaves
-        // one RTO after it.
-        let retransmit_at = ack_at + RTO;
+        // one RTO after it. The partial ACK's 50 ms sample (sent_at to ack_at), after the
+        // handshake's 0 µs one, gives RTTVAR = 50/4 = 12.5 ms and SRTT = 50/8 = 6.25 ms,
+        // so the RTO is 6.25 + 4·12.5 = 56.25 ms, fired on the next whole millisecond.
+        let retransmit_at = ceil_ms(ack_at + Duration::from_micros(56_250));
         let early = pair.round_at(retransmit_at - Duration::from_micros(1), |dir, _| {
             panic!("{dir:?} frame before the retransmission deadline")
         });
@@ -1846,8 +1904,6 @@ fn cubic_growth_and_recovery_across_rtts() {
             let handles = [a, b];
             let [a, b] = &handles;
             pair.a.tcp_mut(a).set_initial_window(10 * MSS);
-            pair.a.tcp_mut(a).set_rto(Duration::from_secs(10));
-            pair.b.tcp_mut(b).set_rto(Duration::from_secs(10));
             pair.b.tcp_mut(b).set_ack_delay(None);
             pair.b.listen(b, pair::SERVER_PORT).unwrap();
             pair.a.connect(a, IpEndpoint::new(Side::B.ip().into(), pair::SERVER_PORT), pair::CLIENT_PORT).unwrap();

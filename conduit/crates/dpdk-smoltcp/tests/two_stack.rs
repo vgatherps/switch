@@ -17,8 +17,9 @@ use pair::{
 use ring_port::arp;
 
 const ECHO_LEN: usize = 64 * 1024;
-/// Default socket RTO.
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples on a Pair at one instant are 0 µs, so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 
 fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
     use zhida_test_kit::wire::{in_use, pool_by_name};

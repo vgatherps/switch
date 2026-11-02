@@ -241,8 +241,8 @@ impl Cubic {
 
         // RFC 9438 §4.2: the congestion window target is W_cubic one RTT into the future.
         let w_cubic_target = {
-            // srtt is in millis so floor at 1ms to ensure sub-ms RTTs don't ruin the lookahead.
-            let srtt = (rtt.smoothed_rtt() as u64 * 1000).max(1000);
+            // srtt is in micros; floor at 1 ms so sub-ms RTTs don't ruin the lookahead.
+            let srtt = u64::from(rtt.smoothed_rtt()).max(1000);
 
             let t_ahead = (t as f64 + srtt as f64) / 1_000_000.0;
             let raw = c_as_bytes * (t_ahead - self.k).powi(3) + self.w_max as f64;
