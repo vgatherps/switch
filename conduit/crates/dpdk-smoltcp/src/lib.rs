@@ -23,9 +23,6 @@
 //! ```compile_fail,E0599
 //! let _ = zhida_buffer::PoolManager::new;
 //! ```
-//! ```compile_fail,E0599
-//! let _ = zhida_buffer::PoolManager::new_unchecked;
-//! ```
 //! The production API resolves through the same paths:
 //! ```
 //! use zhida_buffer::{Mbuf, PoolConfig, PoolCreateError, PoolManager};

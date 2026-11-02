@@ -30,6 +30,8 @@ fn test_share_creates_alias() {
     // Both see the same data
     assert!(mbuf.data().iter().all(|&b| b == 0xAA));
     assert!(clone.data().iter().all(|&b| b == 0xAA));
+    drop((mbuf, clone));
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -65,6 +67,8 @@ fn test_clone_trait_increments_refcount() {
     let clone = mbuf.clone();
     assert_eq!(mbuf.refcount(), 2);
     assert_eq!(clone.refcount(), 2);
+    drop((mbuf, clone));
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -83,6 +87,8 @@ fn test_multiple_shares() {
     assert!(clone1.data().iter().all(|&b| b == 0xFF));
     assert!(clone2.data().iter().all(|&b| b == 0xFF));
     assert!(clone3.data().iter().all(|&b| b == 0xFF));
+    drop((mbuf, clone1, clone2, clone3));
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -99,6 +105,8 @@ fn test_prepend_then_share() {
 
     let clone = mbuf.share();
     assert_eq!(mbuf.len(), clone.len());
+    drop((mbuf, clone));
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -114,6 +122,8 @@ fn test_drop_clones_safely() {
 
     assert_eq!(mbuf.refcount(), 1);
     assert!(mbuf.data().iter().all(|&b| b == 0xCC));
+    drop(mbuf);
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -141,6 +151,8 @@ fn test_headroom_available() {
     let pool = PoolManager::new(256);
     let mbuf = pool.alloc_with_len(100).unwrap();
     assert_eq!(mbuf.headroom(), DPDK_HEADROOM);
+    drop(mbuf);
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -158,4 +170,6 @@ fn test_adj_increases_headroom() {
     let hdr = mbuf.prepend(20).expect("Should prepend into consumed space");
     hdr.fill(0xAA);
     assert_eq!(mbuf.len(), 100);
+    drop(mbuf);
+    assert_eq!(pool.in_use_count(), 0);
 }
