@@ -124,15 +124,6 @@ impl<E: fmt::Display> fmt::Display for TxError<E> {
 
 impl<E: fmt::Debug + fmt::Display> std::error::Error for TxError<E> {}
 
-/// Sends `sealed` through `lower`, waiting for room of `len` bytes each time it is refused.
-async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usize) -> Result<(), L::Error> {
-    while let Err(s) = lower.try_send(sealed) {
-        sealed = s;
-        lower.room(len).await?;
-    }
-    Ok(())
-}
-
 /// Appends a record rustls queued itself (an alert, close_notify) to `pending`, for
 /// `take_pending` to send.
 fn encode_into<Data>(pending: &mut Vec<u8>, data: &mut EncodeTlsData<'_, Data>) {

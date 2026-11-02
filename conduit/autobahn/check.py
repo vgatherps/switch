@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare an Autobahn report index.json to relay's expected results.
 
-Exit 0: exact per-case match. Exit 1: mismatch. Exit 2: malformed input.
+Exit 0: every case matches (an expected case listing alternatives matches any of them).
+Exit 1: mismatch. Exit 2: malformed input.
 """
 import argparse
 import collections

@@ -1291,6 +1291,23 @@ fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
     });
 }
 
+/// The peer resets the connection; once the client saw it (its receive half reports the reset),
+/// setting up a sender on the dead socket is `Dead` although a frame is free: the probe frame is
+/// taken, then the MSS read finds no connection.
+#[zhida_test_support::pinned_test]
+fn setup_on_a_reset_socket_with_a_free_frame_is_dead() {
+    use sheath::switchnet::{SetupError, SwitchTx};
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let (mut rx, tcp) = stream.split();
+        go_tx.send(()).unwrap();
+        let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+        assert!(seen.is_err(), "data instead of the reset");
+        let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the setup waited");
+        assert!(matches!(got, Err(SetupError::Dead)), "{:?}", got.map(drop));
+    });
+}
+
 /// `tls_connect`'s plaintext minimum: 0 counts as one byte (a record's floor), so a 76 B send
 /// buffer (one record's overhead, no byte of plaintext) is refused, where it once passed setup
 /// and panicked after the handshake; a minimum past `usize::MAX` once its overhead is added is
@@ -1308,6 +1325,25 @@ fn tls_minimum_zero_or_overflowing_is_refused_before_any_byte() {
             );
         });
     }
+}
+
+/// The smallest send buffer `tls_connect` accepts, 77 B (one byte of plaintext per record): the
+/// handshake completes and `close` sends close_notify and FIN, which the server reads as a clean
+/// end.
+#[zhida_test_support::pinned_test]
+fn tls_close_works_with_the_smallest_send_buffer() {
+    use sheath::switchnet::tls_connect;
+    let (server_tls, client_tls) = tls_configs();
+    until_client_on(
+        &tap_with_send_buffer(77),
+        |_| {},
+        move |sock| assert_close_notify_then_fin(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), sock)),
+        move |handle, stream| async move {
+            let mut tls = tls_connect(&handle, stream, client_tls, HOST, 1).await.expect("handshake");
+            tls.close().await.expect("close");
+            tls
+        },
+    );
 }
 
 /// The TLS configs with the client's `max_fragment_size` set.

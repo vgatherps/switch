@@ -210,8 +210,8 @@ pub(crate) struct TxCore<L: PlainTx> {
     rng: Option<StdRng>,
     /// The largest message `send` accepts.
     max_send: usize,
-    /// A sealed frame TCP refused, and the room its job waited for (lower records and
-    /// close_notify wait for a whole frame's room; their length is not known before sealing).
+    /// A sealed frame TCP refused, and the room its job waited for (lower records wait for a
+    /// whole frame's room, their length not known before sealing; close_notify for its own).
     unsent: Option<(L::Sealed, usize)>,
     out: Out,
     buf: Vec<u8>,
