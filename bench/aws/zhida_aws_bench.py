@@ -228,7 +228,7 @@ systemctl enable --now zhida-deadman.timer
 
 def latency_text(value):
     """zhida-nic's feed_latency value (conduit/crates/binance-feed/src/lib.rs, Display for Latencies:
-    `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N max_read_window_ns=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
+    `no_stamp=N` then `<=0:N`, `lo..hi:N`, `1073741824..:N`
     per nonempty log2 ns bucket, ascending) -> those counts and the buckets holding p50/p99/p99.9/max
     of the sampled messages. Anything else (`latency invalid: NIC clock jumped`) is the reason as is."""
     words = value.split()
@@ -253,12 +253,15 @@ def latency_text(value):
 
 def feed_summary(text, code):
     """What the Binance run did, from run-binance.sh's exit code (None: it did not finish) and output
-    (None: not fetched): zhida-nic's `feed_count` and `feed_latency` lines, or why there are none."""
+    (None: not fetched): zhida-nic's `phc_check`, `feed_count` and `feed_latency` lines, or why there
+    are none."""
     out = ["run-binance.sh " + ("did not finish" if code is None else f"exit {code}")]
     if text is None:
         return out + ["no feed output fetched"]
     fields = dict(line[len("zhida-nic: "):].split(": ", 1) for line in text.splitlines()
                   if line.startswith("zhida-nic: ") and ": " in line[len("zhida-nic: "):])
+    if "phc_check" in fields:
+        out.append(f"phc_check: {fields['phc_check']}")
     if "feed_count" in fields:
         out.append(f"messages: {fields['feed_count']}")
     out.append(f"latency: {latency_text(fields['feed_latency'])}" if "feed_latency" in fields

@@ -30,15 +30,6 @@ pub fn stopped() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
-/// Sets the flag when dropped, so a panicking feed still stops the clock thread its scope joins.
-struct SetOnDrop<'a>(&'a AtomicBool);
-
-impl Drop for SetOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -236,49 +227,27 @@ fn run(args: Args) -> i32 {
         ),
         Mode::Feed(f) => {
             let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-            // The scope joins the clock thread before the port closes. A recovered data-device
-            // reset invalidates the run. Keep the ENA gate: other drivers need not stamp RX in
-            // the domain of the clock `read_clock` returns.
-            let clock_cpus = if report.device.driver_name != "net_ena" {
-                Err("the driver is not net_ena".to_owned())
-            } else if dpdk_smoltcp::read_clock(port_id) == Err(-libc::ENOTSUP) {
-                Err("the driver cannot read this NIC's clock".to_owned())
-            } else {
-                nic::housekeeping_cpus(report.cpu)
-            };
-            let stop_clock = AtomicBool::new(false);
-            let result = std::thread::scope(|scope| {
-                let _stop = SetOnDrop(&stop_clock);
-                match &clock_cpus {
-                    Ok(cpus) => {
-                        let stop_clock = &stop_clock;
-                        scope.spawn(move || {
-                            let mut resets = dpdk_smoltcp::port_resets();
-                            let read = || {
-                                let now = dpdk_smoltcp::port_resets();
-                                if now != resets {
-                                    resets = now;
-                                    nic_clock::mark_jumped();
-                                }
-                                dpdk_smoltcp::read_clock(port_id).ok()
-                            };
-                            let ran = nic::pin(cpus)
-                                .and_then(|()| Ok(nic_clock::run(read, stop_clock)?));
-                            if let Err(e) = ran {
-                                line("nic_clock_error", e);
-                            }
-                        });
-                    }
-                    Err(why) => line("nic_clock", format_args!("none: {why}")),
+            // One read of the data ENI's PHC (the clock of its RX stamps) between two
+            // CLOCK_REALTIME reads (the clock the feed compares stamps with; chrony keeps it
+            // on the PHC). A fact for the log, not a gate.
+            let before = binance_feed::realtime_ns();
+            let phc = dpdk_smoltcp::read_clock(port_id);
+            let after = binance_feed::realtime_ns();
+            match phc {
+                Ok(phc) => {
+                    let mid = (i128::from(before) + i128::from(after)) / 2;
+                    line("phc_check", format_args!("phc_minus_realtime_ns={}", i128::from(phc) - mid));
                 }
-                feed::run(
-                    &mut net,
-                    f,
-                    target.as_ref().unwrap(),
-                    tcp_socket.expect("feed mode has a socket"),
-                    &clock,
-                )
-            });
+                Err(code) if code == -libc::ENOTSUP => line("phc_check", "unsupported"),
+                Err(code) => line("phc_check", format_args!("read_clock failed: {code}")),
+            }
+            let result = feed::run(
+                &mut net,
+                f,
+                target.as_ref().unwrap(),
+                tcp_socket.expect("feed mode has a socket"),
+                &clock,
+            );
             stack = net.into_stack().ok().expect("the feed dropped every handle and socket");
             result
         }

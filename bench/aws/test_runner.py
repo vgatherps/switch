@@ -38,9 +38,10 @@ HOST_ENV = ("MGMT_IF=ens5\nDATA_IF=ens6\nDATA_PCI=0000:00:06.0\nDATA_MAC=0a:00:0
 # (latencies_print_nonempty_buckets in conduit/crates/binance-feed/src/lib.rs).
 FEED_OUT = """run-binance: 2026-11-01T12:00:00Z zhida-nic feed --seconds 30 on CPU 3 with /etc/zhida/binance.json
 zhida-nic: resolved: stream.binance.com -> 54.249.1.2:9443
+zhida-nic: phc_check: phc_minus_realtime_ns=-412
 zhida-nic: feed_connected: wss://stream.binance.com:9443/ws/btcusdt@bookTicker local_port=50000 TLS 1.3
 zhida-nic: feed_count: 8
-zhida-nic: feed_latency: no_stamp=0 not_ready=0 impossible=1 max_mapping_bound_ns=40 max_read_window_ns=2000 <=0:2 8192..16384:5 1073741824..:1
+zhida-nic: feed_latency: no_stamp=1 <=0:2 8192..16384:5 1073741824..:1
 zhida-nic: feed_update_ids: 100..107
 zhida-nic: feed_close: WebSocket close handshake, TLS close_notify, FIN
 zhida-nic: port_close: ok
@@ -346,28 +347,28 @@ class FeedSummaryTest(unittest.TestCase):
     def test_count_and_latency_buckets_from_the_feed_lines(self):
         # 8 samples: p50 is the 4th (8192..16384), p99 and p99.9 the 8th (the >= 2^30 ns bucket)
         self.assertEqual(z.feed_summary(FEED_OUT, 0), [
-            "run-binance.sh exit 0", "messages: 8",
-            "latency: 8 samples, no_stamp=0 not_ready=0 impossible=1 max_mapping_bound_ns=40 max_read_window_ns=2000, p50 8192..16384 ns,"
+            "run-binance.sh exit 0", "phc_check: phc_minus_realtime_ns=-412", "messages: 8",
+            "latency: 8 samples, no_stamp=1, p50 8192..16384 ns,"
             " p99 1073741824.. ns, p99.9 1073741824.. ns, max 1073741824.. ns"])
 
     def test_percentile_ranks(self):
         # 1000 samples: p50 = 500th, p99 = 990th, p99.9 = 999th
-        text = z.latency_text("no_stamp=3 not_ready=7 impossible=0 max_mapping_bound_ns=12 max_read_window_ns=900 4096..8192:500 8192..16384:490"
+        text = z.latency_text("no_stamp=3 4096..8192:500 8192..16384:490"
                               " 16384..32768:9 65536..131072:1")
-        self.assertEqual(text, "1000 samples, no_stamp=3 not_ready=7 impossible=0 max_mapping_bound_ns=12 max_read_window_ns=900, p50 4096..8192 ns,"
+        self.assertEqual(text, "1000 samples, no_stamp=3, p50 4096..8192 ns,"
                                " p99 8192..16384 ns, p99.9 16384..32768 ns, max 65536..131072 ns")
 
     def test_no_samples(self):
-        self.assertEqual(z.latency_text("no_stamp=8 not_ready=0 impossible=0 max_mapping_bound_ns=0 max_read_window_ns=0"),
-                         "0 samples, no_stamp=8 not_ready=0 impossible=0 max_mapping_bound_ns=0 max_read_window_ns=0")
+        self.assertEqual(z.latency_text("no_stamp=8"),
+                         "0 samples, no_stamp=8")
 
     def test_clock_jump_is_the_reason(self):
-        text = FEED_OUT.replace(FEED_OUT.splitlines()[4], "zhida-nic: feed_latency: latency invalid: NIC clock jumped")
-        self.assertEqual(z.feed_summary(text, 0)[2], "latency: latency invalid: NIC clock jumped")
+        text = FEED_OUT.replace(FEED_OUT.splitlines()[5], "zhida-nic: feed_latency: latency invalid: NIC clock jumped")
+        self.assertEqual(z.feed_summary(text, 0)[3], "latency: latency invalid: NIC clock jumped")
 
     def test_no_feed_latency_line(self):
         text = "".join(l + "\n" for l in FEED_OUT.splitlines() if "feed_latency" not in l)
-        self.assertEqual(z.feed_summary(text, 0), ["run-binance.sh exit 0", "messages: 8", "no feed_latency line"])
+        self.assertEqual(z.feed_summary(text, 0), ["run-binance.sh exit 0", "phc_check: phc_minus_realtime_ns=-412", "messages: 8", "no feed_latency line"])
 
     def test_a_failed_feed_shows_its_error(self):
         self.assertEqual(z.feed_summary(PORT_OPEN_FAILED, 3), [

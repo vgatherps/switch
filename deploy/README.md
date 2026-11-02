@@ -91,17 +91,13 @@ is UTC from the Time Sync PHC, which does not smear leap seconds (the link-local
 `run-binance.sh` runs `hft-host.sh verify` first and refuses to start if it fails. It then writes
 `/etc/zhida/binance.json`: `dut.json` with `rx_timestamps: true`. It refuses to start unless
 `zhida-netconf check` reads that back, then runs `zhida-nic --config /etc/zhida/binance.json feed`
-pinned to the app CPU, appending to `/var/log/zhida/binance.log`. The feed's mapper thread reads the
-data ENI's own PHC through DPDK (`dpdk_smoltcp::read_clock`, the patched ENA `rte_eth_read_clock`),
-the clock its RX timestamps are in; there is no wall-clock fallback or per-packet clock read. If the
-driver cannot read the clock, the feed prints `nic_clock: none: ...` and reports stamped messages as
-`not_ready`.
+pinned to the app CPU, appending to `/var/log/zhida/binance.log`. Each message's latency is
+CLOCK_REALTIME minus its ENA hardware RX stamp (the data ENI's PHC); chrony keeps CLOCK_REALTIME on
+the Time Sync PHC (the `chrony` verify line). At startup the feed logs
+`phc_check: phc_minus_realtime_ns=N` from one PHC read between two CLOCK_REALTIME reads.
 
 AWS documents the packet timestamp reference as the
 [Amazon Time Sync PTP hardware clock](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping).
-The displayed `max_mapping_bound_ns` is mapper sampling uncertainty under the mapper's assumptions,
-not a measured bound on AWS clock error; `max_read_window_ns` is the widest window of a single PHC
-read (the counter reads around it) that entered the mapping.
 
 The 512 x 2 MiB HugeTLB pages (1 GiB) are reserved for DPDK. `run-binance.sh` and the AWS benchmark's
 receiver and senders explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding any inherited value.

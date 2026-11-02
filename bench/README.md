@@ -188,9 +188,9 @@ Before the first paid run:
 The host is one m7g.xlarge (4 vCPU Graviton3; M7g is on deploy/README.md's list of families with ENA hardware RX timestamps and the PHC). Created for the run, tagged with the run id and recorded in `RUN_DIR/created.json`: VPC, subnet (in a zone offering the type), internet gateway, route table, security group (SSH from your public IP), a `precision-time` placement group, key pair, the instance (powers itself off at the TTL), its data ENI and an Elastic IP on the data ENI (the feed's route to the internet). The host runs `hft-host.sh apply`, `verify`, then `run-binance.sh --seconds N`. Into `RUN_DIR`: `verify.txt` (apply and verify output), `binance.log` and `feed.out` (the feed's output). It prints the message count and the latency counts with the histogram buckets holding p50/p99/p99.9/max, or why there are none. Teardown deletes everything (the Elastic IP disassociated, then released) on exit, errors, Ctrl-C and SIGTERM, and checks nothing is left; `cleanup --run-id ID` deletes a leftover run. Exit 0 only when the feed exited 0, both files were fetched and nothing is left.
 
 Progress reports SSH readiness, setup start and verified completion, then the remote feed request
-and its exit status; it does not infer completion of hidden build substages. The feed maps the data
-ENI's own PHC (read through DPDK) onto the CPU counter; there is no wall-clock fallback.
-`max_mapping_bound_ns` describes mapper sampling uncertainty under its assumptions, not a measured
-bound on AWS clock error; `max_read_window_ns` is the widest single PHC read that entered the mapping.
+and its exit status; it does not infer completion of hidden build substages. Host setup makes chrony
+discipline CLOCK_REALTIME to the Time Sync PHC; the feed's latency is CLOCK_REALTIME minus each
+message's ENA hardware RX stamp, and its startup `phc_check` line gives the data ENI's PHC minus
+CLOCK_REALTIME once.
 AWS identifies the packet timestamp reference as the
 [Amazon Time Sync PTP hardware clock](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping).

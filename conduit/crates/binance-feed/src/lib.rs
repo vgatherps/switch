@@ -10,7 +10,7 @@ use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant as WallInstant};
+use std::time::{Duration, Instant as WallInstant, SystemTime, UNIX_EPOCH};
 
 use relay::switchnet::{Error as WsError, Wss};
 use rustls::version::TLS13;
@@ -288,54 +288,39 @@ pub struct Summary {
     pub latencies: Latencies,
 }
 
-/// Per message: the retained RX-buffer stamp for its first WebSocket byte's TLS record
-/// to relay handing the complete message over (`nic_clock::since`).
+/// CLOCK_REALTIME in ns since the Unix epoch (`clock_gettime`, the vDSO on Linux).
+pub fn realtime_ns() -> u64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).expect("the clock is after 1970");
+    u64::try_from(since.as_nanos()).expect("realtime fits u64 ns")
+}
+
+/// Per message: CLOCK_REALTIME when relay handed the complete message over, minus the retained
+/// RX-buffer stamp (NIC PHC, ns since the epoch) of the TLS record holding its first WebSocket
+/// byte. The host's chrony disciplines CLOCK_REALTIME to that PHC (deploy/hft-host.sh).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Latencies {
     /// Messages without a NIC stamp.
     pub no_stamp: u64,
-    /// Stamped messages while the clock mapping was not ready.
-    pub not_ready: u64,
-    /// Latencies below minus their bound: the stamp is after now, a bug. Never samples.
-    pub impossible: u64,
-    /// Samples by ns: bucket 0 holds ns <= 0, bucket i holds [2^(i-1), 2^i), bucket 31 holds
-    /// ns >= 2^30 (about 1.07 s).
+    /// Samples by ns: bucket 0 holds ns <= 0 (a stamp at or after now), bucket i holds
+    /// [2^(i-1), 2^i), bucket 31 holds ns >= 2^30 (about 1.07 s).
     pub buckets: [u64; 32],
-    /// Largest mapper sampling uncertainty under the mapper's assumptions, not a measured
-    /// bound on AWS clock error.
-    pub max_bound_ns: u64,
-    /// The widest single PHC read that entered the mapping (`nic_clock::max_read_window_ns`),
-    /// taken when the feed reports.
-    pub max_read_window_ns: u64,
 }
 
 impl Latencies {
-    fn record(&mut self, stamp: u64) {
+    fn record(&mut self, stamp: u64, now_ns: u64) {
         if stamp == 0 {
             self.no_stamp += 1;
             return;
         }
-        match nic_clock::since(stamp) {
-            None => self.not_ready += 1,
-            Some(latency) if latency.impossible() => self.impossible += 1,
-            Some(latency) => {
-                let bits = 64 - u64::try_from(latency.ns).unwrap_or(0).leading_zeros();
-                self.buckets[bits.min(31) as usize] += 1;
-                self.max_bound_ns = self.max_bound_ns.max(latency.bound_ns);
-            }
-        }
+        let bits = 64 - now_ns.saturating_sub(stamp).leading_zeros();
+        self.buckets[bits.min(31) as usize] += 1;
     }
 }
 
-/// `no_stamp=N not_ready=N impossible=N max_mapping_bound_ns=N max_read_window_ns=N`, then `<=0:N`, `<lo>..<hi>:N` and
-/// `1073741824..:N` (ns) for each nonempty bucket.
+/// `no_stamp=N`, then `<=0:N`, `<lo>..<hi>:N` and `1073741824..:N` (ns) for each nonempty bucket.
 impl fmt::Display for Latencies {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "no_stamp={} not_ready={} impossible={} max_mapping_bound_ns={} max_read_window_ns={}",
-            self.no_stamp, self.not_ready, self.impossible, self.max_bound_ns, self.max_read_window_ns
-        )?;
+        write!(f, "no_stamp={}", self.no_stamp)?;
         for (i, &count) in self.buckets.iter().enumerate().filter(|(_, &count)| count > 0) {
             match i {
                 0 => write!(f, " <=0:{count}")?,
@@ -357,7 +342,7 @@ pub type Outcome = Rc<Cell<Option<(Summary, Result<(), FeedError>)>>>;
 /// feed_close or feed_close_error; feed_stopped if `stop` finished before the connect did. Puts
 /// what it read and the read error, else the connect or close error, into `out`.
 /// `clock_reset` is called once, immediately before reporting latency, to synchronously detect
-/// a device reset during the measurement. A reset or mapper jump suppresses the histogram.
+/// a device reset during the measurement. A reset suppresses the histogram.
 #[allow(clippy::too_many_arguments)]
 #[switch::task]
 pub async fn feed(
@@ -391,7 +376,6 @@ pub async fn feed(
                 None => reading.await,
             };
             line(name, "feed_count", summary.count);
-            summary.latencies.max_read_window_ns = nic_clock::max_read_window_ns();
             let _ = write_latency(&mut io::stdout(), name, summary.latencies, clock_reset);
             match summary.update_ids {
                 Some((first, last)) => line(name, "feed_update_ids", format_args!("{first}..{last}")),
@@ -419,7 +403,7 @@ fn write_latency(
     latencies: Latencies,
     clock_reset: impl FnOnce() -> bool,
 ) -> io::Result<()> {
-    if clock_reset() || nic_clock::jumped() {
+    if clock_reset() {
         writeln!(out, "{name}: feed_latency: latency invalid: NIC clock jumped")
     } else {
         writeln!(out, "{name}: feed_latency: {latencies}")
@@ -443,7 +427,7 @@ async fn read(
             let (code, reason) = wss.peer_close().expect("recv returned None after the server's close");
             return Err(FeedError::ServerClosed { code, reason: reason.to_owned() });
         };
-        summary.latencies.record(message.rx_timestamp());
+        summary.latencies.record(message.rx_timestamp(), realtime_ns());
         let text = message.text().ok_or(FeedError::Binary)?;
         let ticker: BookTicker = serde_json::from_str(text).map_err(|error| FeedError::Parse {
             text: text.to_owned(),
@@ -497,39 +481,29 @@ mod tests {
             .starts_with("DNS: resolving no-such-host.invalid: "));
     }
 
+    /// A sample is now minus the stamp; a stamp at or after now lands in `<=0`.
     #[test]
-    fn latencies_count_unstamped_and_not_ready() {
-        // No clock thread runs in this process: every stamped message is not ready.
+    fn latencies_bucket_realtime_minus_stamp() {
+        const STAMP: u64 = 1_700_000_000_000_000_000;
         let mut latencies = Latencies::default();
-        latencies.record(0);
-        latencies.record(0);
-        latencies.record(1_700_000_000_000_000_000);
-        assert_eq!(latencies, Latencies { no_stamp: 2, not_ready: 1, ..Latencies::default() });
-    }
-
-    #[test]
-    fn latencies_print_nonempty_buckets() {
-        let mut latencies =
-            Latencies { impossible: 1, max_bound_ns: 40, max_read_window_ns: 2_000, ..Latencies::default() };
-        latencies.buckets[0] = 2;
-        latencies.buckets[14] = 5;
-        latencies.buckets[31] = 1;
-        assert_eq!(
-            latencies.to_string(),
-            "no_stamp=0 not_ready=0 impossible=1 max_mapping_bound_ns=40 max_read_window_ns=2000 <=0:2 8192..16384:5 1073741824..:1"
-        );
+        latencies.record(0, STAMP);
+        latencies.record(STAMP, STAMP + 10_000);
+        latencies.record(STAMP, STAMP + 16_384);
+        latencies.record(STAMP, STAMP - 5);
+        latencies.record(STAMP, STAMP + 2_000_000_000);
+        assert_eq!(latencies.to_string(), "no_stamp=1 <=0:1 8192..16384:1 16384..32768:1 1073741824..:1");
     }
 
     #[test]
     fn local_tap_without_hardware_timestamps_keeps_no_stamp_report() {
         let mut latencies = Latencies::default();
-        latencies.record(0);
-        latencies.record(0);
+        latencies.record(0, 1);
+        latencies.record(0, 1);
         let mut output = Vec::new();
         write_latency(&mut output, "test", latencies, || false).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "test: feed_latency: no_stamp=2 not_ready=0 impossible=0 max_mapping_bound_ns=0 max_read_window_ns=0\n"
+            "test: feed_latency: no_stamp=2\n"
         );
     }
 }

@@ -88,7 +88,6 @@ name = "binance-feed"
 version = "0.1.0"
 dependencies = [
  "dpdk-smoltcp",
- "nic-clock",
  "rcgen",
  "relay",
  "rustls",
@@ -818,13 +817,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "nic-clock"
-version = "0.1.0"
-dependencies = [
- "proptest",
-]
-
-[[package]]
 name = "nic-runner"
 version = "0.1.0"
 dependencies = [
@@ -832,7 +824,6 @@ dependencies = [
  "dpdk-smoltcp",
  "libc",
  "mimalloc",
- "nic-clock",
  "sockperf-wire",
  "switch",
  "switchnet",
