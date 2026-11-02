@@ -161,11 +161,9 @@ impl Mixed {
         }
     }
 
-    /// Net receive, one poll of the woken tasks, then Net send.
+    /// One `switchnet::round`: Net receive, one poll of the woken tasks, then Net send.
     pub fn turn(&mut self) {
-        self.net.receive(self.now).unwrap();
-        self.rt.poll(0).unwrap();
-        self.net.send().unwrap();
+        switchnet::round(&mut self.net, &mut self.rt, self.now, 0).unwrap();
     }
 
     fn advance(&mut self) {

@@ -43,7 +43,7 @@ use switch::StoredWaker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetConfig {
-    /// Passed to `Stack::turn` each turn.
+    /// Passed to `Stack::receive` by each `Net::receive`.
     pub ingress_budget: usize,
 }
 
@@ -130,7 +130,7 @@ impl Inner {
 
     /// Drops one half: clears its parked handle and disarms its token; with the last half,
     /// removes the entry and returns its socket. The index is free at once; a token of the
-    /// half that already fired is popped by the next turn, which checks whatever socket then
+    /// half that already fired is popped by the next `Net::receive`, which checks whatever socket then
     /// holds the entry.
     fn release(&mut self, index: u32, side: usize) -> Option<Socket> {
         let entry = &mut self.entries[index as usize];
@@ -643,7 +643,7 @@ pub struct TcpTx(Half);
 impl TcpTx {
     /// `Future<Output = Result<(), SendError>>`: `Ok` once a frame of `len`
     /// bytes fits (free bytes and a free frame slot), so `try_send` of such a
-    /// frame succeeds until the next turn; `Err(InvalidState)` once the
+    /// frame succeeds until the next `Net::receive`; `Err(InvalidState)` once the
     /// socket can no longer send (reset, closed, or after `shutdown`);
     /// `Err(TooLarge)` on the first poll if `len` exceeds the socket's send capacity
     /// (or u32): it would never fit.
@@ -651,7 +651,7 @@ impl TcpTx {
         Room { tx: self, len }
     }
 
-    /// Queues `frame` (conduit `send_frame`); it leaves in a later turn. Every
+    /// Queues `frame` (conduit `send_frame`); it leaves at the next `Net::send`. Every
     /// error returns the same frame: `Full` when it does not fit now,
     /// `InvalidState` when the socket cannot send, `Empty`, `Foreign`.
     pub fn try_send(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
