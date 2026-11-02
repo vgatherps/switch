@@ -1,6 +1,8 @@
 use std::ffi::{CStr, CString};
 
-use zhida_buffer::{ensure_eal_init, PoolConfig, PoolCreateError, PoolManager};
+use zhida_buffer::{
+    ensure_eal_init, FramePool, PoolConfig, PoolCreateError, PoolManager, FRAME_DATA_OFF,
+};
 use zhida_dpdk_sys::{
     dpdk_raw_pktmbuf_free, zhida_get_pool_cache, zhida_mempool_ops_name, zhida_pktmbuf_free_seg,
     RTE_PKTMBUF_HEADROOM,
@@ -67,4 +69,30 @@ fn shared_pool_allows_share_and_frees_on_last_reference() {
     drop(pool);
     // A clean drop releases the name.
     drop(unsafe { PoolManager::new_shared(cfg) }.unwrap());
+}
+
+/// On the owner lcore, every frame not held by a caller is free: the count follows
+/// allocations and frees down to zero and back, with frees landing in this lcore's cache.
+#[zhida_test_support::pinned_test]
+fn frame_pool_free_count_follows_held_frames() {
+    ensure_eal_init();
+    let name = CString::new("frame_free_count").unwrap();
+    let cfg = PoolConfig {
+        data_room_size: FRAME_DATA_OFF + 64,
+        ..config(&name)
+    };
+    let frames = unsafe { FramePool::new(cfg, 64) }.unwrap();
+    assert_eq!(frames.free_count(), frames.count());
+
+    let mut held: Vec<_> = (0..frames.count()).map(|_| frames.alloc().unwrap()).collect();
+    assert_eq!(frames.free_count(), 0);
+    assert!(frames.alloc().is_none());
+    for (freed, frame) in held.drain(..5).enumerate() {
+        unsafe { zhida_pktmbuf_free_seg(frame.as_ptr()) };
+        assert_eq!(frames.free_count(), freed + 1);
+    }
+    for frame in held {
+        unsafe { zhida_pktmbuf_free_seg(frame.as_ptr()) };
+    }
+    assert_eq!(frames.free_count(), frames.count());
 }

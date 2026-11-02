@@ -74,6 +74,13 @@ impl FramePool {
     pub fn in_use_count(&self) -> u32 {
         self.pool.in_use_count()
     }
+
+    /// Frames this lcore can allocate now: the backing store plus this lcore's cache
+    /// (`PoolManager::free_count`). Frames sitting in other lcores' caches are not counted.
+    #[inline]
+    pub fn free_count(&self) -> usize {
+        self.pool.free_count() as usize
+    }
 }
 
 impl Drop for FramePool {
