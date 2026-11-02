@@ -126,7 +126,7 @@ impl Mixed {
         slot.take()
     }
 
-    /// Net turn, task poll, Net→peer, peer turn, peer→Net, at `now`.
+    /// Net receive, task poll, Net send, Net→peer, peer turn, peer→Net, at `now`.
     /// Returns whether a link moved a frame.
     pub fn round(&mut self) -> bool {
         self.turn();
@@ -161,10 +161,11 @@ impl Mixed {
         }
     }
 
-    /// Net turn, then one poll of the woken tasks.
+    /// Net receive, one poll of the woken tasks, then Net send.
     pub fn turn(&mut self) {
-        self.net.turn(self.now).unwrap();
+        self.net.receive(self.now).unwrap();
         self.rt.poll(0).unwrap();
+        self.net.send().unwrap();
     }
 
     fn advance(&mut self) {

@@ -2,7 +2,6 @@
 //! tokens, spawn unwinding and TLS teardown.
 
 use std::cell::{Cell, RefCell};
-use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -72,7 +71,7 @@ pub(super) fn header(waker: &Waker) -> *const TaskHeader {
     waker.data().cast()
 }
 
-pub(super) fn meta(waker: &Waker) -> *mut Meta {
+fn meta(waker: &Waker) -> *mut Meta {
     TaskHeader::meta(header(waker))
 }
 
@@ -123,7 +122,7 @@ pub(super) fn spawn_parked(runtime: &mut Runtime, n: usize) -> Vec<Rc<State>> {
     states
 }
 
-pub(super) fn finish(runtime: &mut Runtime, state: &State) {
+fn finish(runtime: &mut Runtime, state: &State) {
     state.done.set(true);
     waker(state).wake_by_ref();
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
@@ -455,8 +454,10 @@ fn will_wake_identifies_slots() {
 
 // ---- Foreign thread after owner exit ----
 
+/// After the owner thread dropped its runtime, waker operations from another thread do
+/// nothing: clone and drop touch nothing, and the closed mailbox discards the wake.
 #[test]
-fn foreign_thread_ops_panic_after_owner_thread_exits() {
+fn foreign_thread_ops_after_owner_thread_exits_do_nothing() {
     let wakers = std::thread::spawn(|| {
         let mut runtime = Runtime::new(0);
         let states = spawn_parked(&mut runtime, 1);
@@ -470,19 +471,14 @@ fn foreign_thread_ops_panic_after_owner_thread_exits() {
     .join()
     .unwrap();
     for (operation, waker) in wakers.into_iter().enumerate() {
-        // Never dropped here unless dropping is the operation under test.
-        let waker = ManuallyDrop::new(waker);
-        let payload = catch_unwind(AssertUnwindSafe(move || match operation {
+        let target = header(&waker);
+        match operation {
             0 => waker.wake_by_ref(),
             1 => drop(Waker::clone(&waker)),
-            2 => ManuallyDrop::into_inner(waker).wake(),
-            _ => drop(ManuallyDrop::into_inner(waker)),
-        }))
-        .unwrap_err();
-        assert_eq!(
-            payload.downcast_ref::<&str>().copied(),
-            Some("waker used on foreign thread")
-        );
+            2 => waker.wake(),
+            _ => drop(waker),
+        }
+        assert_eq!(unsafe { TaskHeader::flags(target).get() }, 0);
     }
 }
 

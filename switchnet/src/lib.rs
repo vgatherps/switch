@@ -1,8 +1,9 @@
 //! Async sockets over one conduit `Stack`, for the `switch` runtime.
 //!
-//! The loop owner holds the [`Net`] and calls `net.turn(now)` (a `Stack::turn`,
-//! then a wake of every task parked on a socket that became ready), then polls
-//! the switch runtime. Tasks hold a [`NetHandle`], which opens sockets and
+//! The loop owner holds the [`Net`] and runs rounds ([`round`]): `net.receive(now)`
+//! (a `Stack::receive`, then a wake of every task parked on a socket that became
+//! ready), a poll of the switch runtime, then `net.send()` (a `Stack::send`), so
+//! what the woken tasks wrote leaves in the same round. Tasks hold a [`NetHandle`], which opens sockets and
 //! hands out TX frames but cannot turn the stack. Futures here must be polled
 //! by switch tasks: parking stores a `switch::StoredWaker`.
 //! Everything is single-threaded (`Rc`), so no type here is `Send`.
@@ -23,6 +24,7 @@ pub mod testkit;
 pub use drive::{RoundError, first, round, within};
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -33,7 +35,8 @@ pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvErro
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
 pub use dpdk_smoltcp::{
-    AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError, UdpSocketStats,
+    AddTcpError, AddUdpError, Sent, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError,
+    UdpSocketStats,
 };
 use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
 use switch::StoredWaker;
@@ -94,20 +97,21 @@ struct Inner {
     stack: Stack,
     entries: Vec<Entry>,
     free: Vec<u32>,
-    /// Tasks waiting for a TX frame; each listed once. Sized for one per
-    /// socket slot; more simultaneous waiters than that grow it.
-    frame_waiters: Vec<StoredWaker>,
+    /// Tasks waiting for a TX frame, oldest first; each listed once. A wait
+    /// dropped while queued leaves its entry: a free frame's wake then goes to it,
+    /// and the waiters behind it are woken one `receive` later.
+    frame_waiters: VecDeque<StoredWaker>,
     ingress_budget: usize,
-    /// Frames handed to the Stack since the last successful turn.
+    /// Frames handed to the Stack since the last successful send.
     tx_handed: usize,
     /// `Stack::tx_burst`: from this many `tx_handed` on, each handed frame requests a turn.
     tx_burst: usize,
 }
 
 impl Inner {
-    /// One frame handed to the Stack: at one TX burst since the last turn, end the
+    /// One frame handed to the Stack: at one TX burst since the last send, end the
     /// running `Runtime::poll` after this task (`switch::request_turn`), so the loop
-    /// turns the Net and the frames leave sooner.
+    /// sends and the frames leave sooner.
     #[inline]
     fn handed_over(&mut self) {
         self.tx_handed += 1;
@@ -234,14 +238,13 @@ fn wake_fired(stack: &mut Stack, entries: &mut [Entry], mut token: u32) {
     }
 }
 
-/// Wakes every task waiting for a TX frame if the pool has one. The probe
-/// frame goes straight back to the pool.
+/// Wakes as many of the oldest tasks waiting for a TX frame as the pool has free
+/// frames. A woken task that finds none (another took it) queues again at the back.
 #[inline(never)]
-fn wake_frame_waiters(stack: &mut Stack, waiters: &mut Vec<StoredWaker>) {
-    if stack.tx_frame().is_some() {
-        for waker in waiters.drain(..) {
-            waker.wake();
-        }
+fn wake_frame_waiters(stack: &Stack, waiters: &mut VecDeque<StoredWaker>) {
+    let woken = stack.free_frames().min(waiters.len());
+    for waker in waiters.drain(..woken) {
+        waker.wake();
     }
 }
 
@@ -307,7 +310,7 @@ impl Net {
             stack,
             entries,
             free: (0..slots as u32).rev().collect(),
-            frame_waiters: Vec::with_capacity(slots),
+            frame_waiters: VecDeque::new(),
             ingress_budget: config.ingress_budget,
             tx_handed: 0,
             tx_burst,
@@ -319,21 +322,17 @@ impl Net {
         NetHandle { shared: self.shared.clone() }
     }
 
-    /// `Stack::turn` at `now`, then wakes every task parked on a socket that
-    /// became ready, and every task waiting for a TX frame if the pool has
-    /// one, also when the turn returns an error (egress can fail after
-    /// ingress queued data). Only sockets whose readiness tokens fired since
-    /// the last turn are checked, never every parked one. A successful turn
-    /// (which flushed) restarts the count of handed frames that requests a turn,
-    /// also with frames still pending. After a panic out of `turn`, drop the Net.
+    /// `Stack::receive` at `now`, then wakes every task parked on a socket that
+    /// became ready (since the last `receive`, so also through the last `send`),
+    /// and every task waiting for a TX frame if the pool has one, also when the
+    /// receive returns an error (it can fail after ingress queued data). Only
+    /// sockets whose readiness tokens fired are checked, never every parked one.
+    /// After a panic out of `receive`, drop the Net.
     #[inline]
-    pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
+    pub fn receive(&mut self, now: Instant) -> Result<Turn, StackError> {
         let mut inner = self.shared.borrow_mut();
-        let Inner { stack, entries, frame_waiters, ingress_budget, tx_handed, .. } = &mut *inner;
-        let turn = stack.turn(now, *ingress_budget);
-        if turn.is_ok() {
-            *tx_handed = 0;
-        }
+        let Inner { stack, entries, frame_waiters, ingress_budget, .. } = &mut *inner;
+        let turn = stack.receive(now, *ingress_budget);
         if let Some(token) = stack.pop_fired() {
             wake_fired(stack, entries, token);
         }
@@ -341,6 +340,19 @@ impl Net {
             wake_frame_waiters(stack, frame_waiters);
         }
         turn
+    }
+
+    /// `Stack::send`: what tasks wrote since `receive` leaves. A successful send
+    /// (which flushed) restarts the count of handed frames that requests a turn,
+    /// also with frames still pending. After a panic out of `send`, drop the Net.
+    #[inline]
+    pub fn send(&mut self) -> Result<Sent, StackError> {
+        let mut inner = self.shared.borrow_mut();
+        let sent = inner.stack.send();
+        if sent.is_ok() {
+            inner.tx_handed = 0;
+        }
+        sent
     }
 
     /// `Stack::poll_at`.
@@ -430,8 +442,9 @@ impl NetHandle {
 
     /// `Future<Output = TxFrame>`: an empty frame from the Stack's frame pool
     /// (`capacity()` is the IP MTU − 28). While the pool is empty the task
-    /// waits; it is woken by the first `Net::turn` that finds a free frame,
-    /// and may wait again if another task took it first.
+    /// waits in line; each `Net::receive` wakes as many waiting tasks, oldest
+    /// first, as the pool has free frames. One that finds the frame taken by
+    /// another task waits again at the back.
     pub fn tx_frame(&self) -> TxFrameWait<'_> {
         TxFrameWait { handle: self }
     }
@@ -456,7 +469,7 @@ impl Future for TxFrameWait<'_> {
         // switch task slot however many waits are dropped.
         let waker = StoredWaker::new(cx);
         if !inner.frame_waiters.contains(&waker) {
-            inner.frame_waiters.push(waker);
+            inner.frame_waiters.push_back(waker);
         }
         Poll::Pending
     }

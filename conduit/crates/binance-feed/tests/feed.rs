@@ -709,7 +709,8 @@ fn received_updates_come_before_a_finished_stop() {
         turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
         let sent = clock.ms();
         while clock.ms() < sent + 200 {
-            net.turn(clock.now()).expect("turn");
+            net.receive(clock.now()).expect("receive");
+            net.send().expect("send");
             thread::sleep(IDLE_SLEEP);
         }
         let _ = stop.send(());

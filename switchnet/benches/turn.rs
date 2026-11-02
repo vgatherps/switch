@@ -1,16 +1,16 @@
-//! `Net::turn` against the number of parked tasks, criterion groups
-//! "stack_turn", "net_turn_idle" and "net_turn_ready".
+//! A Net turn (`Net::receive` then `Net::send`) against the number of parked
+//! tasks, criterion groups "stack_turn", "net_turn_idle" and "net_turn_ready".
 //!
 //! A task parked on a socket arms that socket's readiness token; a Stack
-//! change that can make the socket ready fires it, and `Net::turn` checks only
-//! the sockets whose tokens fired since the last turn. A turn's cost should
+//! change that can make the socket ready fires it, and `Net::receive` checks only
+//! the sockets whose tokens fired since the last one. A turn's cost should
 //! therefore not depend on how many tasks are parked.
 //! - stack_turn/N: N UDP sockets bound directly on a Stack, nothing arriving;
 //!   one bare `Stack::turn`. The floor for the idle cases.
 //! - net_turn_idle/{udp,tcp}/N: N sockets on a Net, a switch task parked in
 //!   `recv` on each (UDP: bound sockets; TCP: connections established to a
 //!   raw conduit Stack peer). Nothing arrives, no token fires: one
-//!   `Net::turn`, which finds an empty fired list.
+//!   receive, which finds an empty fired list, and one send.
 //! - net_turn_ready/{udp,tcp}/N: the same, with one datagram (UDP) or one
 //!   1-byte segment (TCP) for the middle socket on the Net's RX ring before
 //!   each timed turn. The turn takes it in, fires that socket's token, checks
@@ -112,10 +112,11 @@ impl Bench {
         }
     }
 
-    /// Net turn, task poll, Net→peer, peer turn, peer→Net; whether a frame moved.
+    /// Net receive, task poll, Net send, Net→peer, peer turn, peer→Net; whether a frame moved.
     fn round(&mut self) -> bool {
-        self.net.turn(self.now).unwrap();
+        self.net.receive(self.now).unwrap();
         self.rt.poll(0).unwrap();
+        self.net.send().unwrap();
         let out = self.to_peer.forward();
         assert_lossless(&self.to_peer, "Net→peer");
         self.peer.turn(self.now, BUDGET).unwrap();
@@ -286,7 +287,7 @@ fn net_turn(c: &mut Criterion) {
                 let mut idle = c.benchmark_group("net_turn_idle");
                 idle.bench_function(format!("{kind}/{n}"), |b| {
                     let now = bench.now;
-                    b.iter(|| black_box(bench.net.turn(black_box(now)).unwrap()))
+                    b.iter(|| black_box((bench.net.receive(black_box(now)).unwrap(), bench.net.send().unwrap())))
                 });
                 idle.finish();
                 assert_eq!(bench.rt.poll(0).unwrap().tasks_polled, 0, "an idle turn woke a task");
@@ -301,7 +302,10 @@ fn net_turn(c: &mut Criterion) {
                             for _ in 0..iters {
                                 source.send(&mut bench, target);
                                 let start = Clock::now();
-                                black_box(bench.net.turn(black_box(bench.now)).unwrap());
+                                black_box((
+                                    bench.net.receive(black_box(bench.now)).unwrap(),
+                                    bench.net.send().unwrap(),
+                                ));
                                 timed += start.elapsed();
                                 assert_eq!(bench.rt.poll(0).unwrap().tasks_polled, 1, "exactly the ready task woke");
                                 bench.to_peer.forward();

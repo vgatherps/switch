@@ -28,7 +28,8 @@ fn run<T: Send + 'static>(role: Role, deadline: Duration, peer: impl FnOnce() ->
         let peer = thread::spawn(peer);
         let result = drive(net, &|| clock.elapsed(), &mut || peer.is_finished(), &role, deadline);
         while !peer.is_finished() {
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
+            net.send().expect("send");
             thread::sleep(Duration::from_micros(50));
         }
         match peer.join() {

@@ -1,103 +1,20 @@
-//! Cross-thread waker ops, pool registration,
+//! Waker ops after the owner thread exits, pool registration,
 //! TLS-destructor first use, factory reentry and panicked-runtime wakes.
 
 use std::cell::{Cell, RefCell};
-use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
 use super::TaskHeader;
 use super::header::{LIVE, QUEUED};
-use super::tests::{Parked, State, finish, header, meta, runtime_pool, spawn_parked, state, waker};
+use super::tests::{Parked, State, header, runtime_pool, spawn_parked, state, waker};
 use crate::runtime::{PollReport, Runtime, RuntimeError};
-
-fn expect_foreign_panic(op: impl FnOnce()) {
-    let payload = catch_unwind(AssertUnwindSafe(op)).unwrap_err();
-    assert_eq!(
-        payload.downcast_ref::<&str>().copied(),
-        Some("waker used on foreign thread")
-    );
-}
-
-/// All four waker operations from a non-owner thread; each must panic.
-fn foreign_round(borrowed: &Waker, woken: Waker, dropped: Waker) {
-    expect_foreign_panic(|| borrowed.wake_by_ref());
-    expect_foreign_panic(|| drop(borrowed.clone()));
-    expect_foreign_panic(move || woken.wake());
-    expect_foreign_panic(move || drop(dropped));
-}
-
-#[test]
-fn foreign_ops_overlap_completion_reuse_shutdown_and_a_later_runtime() {
-    const FOREIGN: usize = 2;
-    const PHASES: usize = 4;
-    const ROUNDS: usize = 5;
-    let mut runtime = Runtime::new(0);
-    let first = spawn_parked(&mut runtime, 1).remove(0);
-    let target = waker(&first);
-    let block = meta(&target);
-    // Cloned here on the owner thread; a foreign thread drops only the clones
-    // whose drop is the operation under test.
-    let kits: Vec<(ManuallyDrop<Waker>, Vec<ManuallyDrop<Waker>>)> = (0..FOREIGN)
-        .map(|_| {
-            let owned = (0..2 * PHASES * ROUNDS)
-                .map(|_| ManuallyDrop::new(target.clone()))
-                .collect();
-            (ManuallyDrop::new(target.clone()), owned)
-        })
-        .collect();
-    let barrier = Barrier::new(FOREIGN + 1);
-    thread::scope(|scope| {
-        for (borrowed, mut owned) in kits {
-            let barrier = &barrier;
-            scope.spawn(move || {
-                for _ in 0..PHASES {
-                    barrier.wait();
-                    for _ in 0..ROUNDS {
-                        let woken = ManuallyDrop::into_inner(owned.pop().unwrap());
-                        let dropped = ManuallyDrop::into_inner(owned.pop().unwrap());
-                        foreign_round(&borrowed, woken, dropped);
-                    }
-                    barrier.wait();
-                }
-                assert!(owned.is_empty());
-            });
-        }
-        // Each owner step runs between two barriers, alongside the foreign rounds.
-        barrier.wait();
-        finish(&mut runtime, &first);
-        assert_eq!((first.polls.get(), first.drops.get()), (2, 1));
-        barrier.wait();
-
-        barrier.wait();
-        let reused = spawn_parked(&mut runtime, 1).remove(0);
-        assert_eq!(header(&waker(&reused)), header(&target));
-        assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
-        assert_eq!(reused.polls.get(), 1);
-        barrier.wait();
-
-        barrier.wait();
-        runtime.shutdown();
-        assert_eq!((reused.polls.get(), reused.drops.get()), (1, 1));
-        barrier.wait();
-
-        barrier.wait();
-        let mut later = Runtime::new(0);
-        let fresh = spawn_parked(&mut later, 1).remove(0);
-        assert_ne!(meta(&waker(&fresh)), block);
-        assert_eq!(later.poll(0).unwrap().tasks_polled, 0);
-        drop(later);
-        assert_eq!((fresh.polls.get(), fresh.drops.get()), (1, 1));
-        barrier.wait();
-    });
-    assert_eq!((first.polls.get(), first.drops.get()), (2, 1));
-}
 
 struct Probe {
     polls: Arc<AtomicUsize>,
@@ -186,8 +103,11 @@ fn first_switch_use_inside_a_tls_destructor() {
 /// Keeps the deliberately forgotten runtime reachable for Miri's leak check.
 static FORGOTTEN: AtomicPtr<Runtime> = AtomicPtr::new(ptr::null_mut());
 
+/// After the owner thread exited, leaving its runtime alive, every waker operation from
+/// another thread leaves the task's slot as it was: clone and drop do nothing, a wake
+/// waits in the mailbox nobody empties.
 #[test]
-fn foreign_ops_panic_after_owner_exit_with_forgotten_runtime_and_live_slot() {
+fn foreign_ops_after_owner_exit_with_forgotten_runtime_leave_the_slot_alone() {
     let wakers = thread::spawn(|| {
         let mut runtime = Runtime::new(0);
         let states = spawn_parked(&mut runtime, 1);
@@ -202,15 +122,13 @@ fn foreign_ops_panic_after_owner_exit_with_forgotten_runtime_and_live_slot() {
     let flags = unsafe { TaskHeader::flags(header(&wakers[0])).get() };
     assert_eq!(flags & (LIVE | QUEUED), LIVE);
     for (operation, waker) in wakers.into_iter().enumerate() {
-        // Never dropped here unless dropping is the operation under test.
-        let waker = ManuallyDrop::new(waker);
         let target = header(&waker);
-        expect_foreign_panic(move || match operation {
+        match operation {
             0 => waker.wake_by_ref(),
             1 => drop(Waker::clone(&waker)),
-            2 => ManuallyDrop::into_inner(waker).wake(),
-            _ => drop(ManuallyDrop::into_inner(waker)),
-        });
+            2 => waker.wake(),
+            _ => drop(waker),
+        }
         assert_eq!(unsafe { TaskHeader::flags(target).get() }, flags);
     }
 }

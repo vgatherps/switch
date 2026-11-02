@@ -5,19 +5,11 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::__private::Task;
-use crate::executor::{DEFAULT_CAPACITY, Executor, Lifecycle};
+use crate::executor::{Executor, Lifecycle};
 use crate::oneshot::{self, Sender};
 use crate::remote::Mailbox;
 use crate::task::SpawnToken;
 use crate::task::join::JoinHandle;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Capacity {
-    /// Ready-queue reservation; task slots come from per-function task blocks.
-    pub tasks: usize,
-    /// Timer-registration and expiry-index reservation.
-    pub timers: usize,
-}
 
 /// Runtime state or supplied-clock error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,8 +67,8 @@ pub(crate) struct Control {
 }
 
 impl Control {
-    fn new(initial_tick: u64, capacity: Capacity) -> Rc<Self> {
-        let executor = Box::new(Executor::with_capacity(initial_tick, capacity.tasks, capacity.timers));
+    fn new(initial_tick: u64) -> Rc<Self> {
+        let executor = Box::new(Executor::new(initial_tick));
         let control = Rc::new(Self {
             core: UnsafeCell::new(Some(executor)),
             root: Cell::new(std::ptr::null_mut()),
@@ -144,19 +136,8 @@ pub struct Runtime {
 impl Runtime {
     /// Create a runtime whose accepted clock starts at `initial_tick`.
     pub fn new(initial_tick: u64) -> Self {
-        Self::with_capacity(
-            initial_tick,
-            Capacity {
-                tasks: DEFAULT_CAPACITY,
-                timers: 0,
-            },
-        )
-    }
-
-    /// Create a runtime with explicit task-queue and timer-store reservations.
-    pub fn with_capacity(initial_tick: u64, capacity: Capacity) -> Self {
         Self {
-            control: Control::new(initial_tick, capacity),
+            control: Control::new(initial_tick),
         }
     }
 
@@ -194,9 +175,7 @@ impl Runtime {
             }
             Executor::undefer(root);
             (*root).timers.advance_to(now);
-            while let Some(task) = (*root).timers.pop_expired() {
-                Executor::wake(task);
-            }
+            (*root).timers.wake_expired(|task| Executor::wake(task));
             let report = PollReport {
                 tasks_polled: Executor::poll_batch(&mut turn),
                 live_tasks: Executor::task_count(root),

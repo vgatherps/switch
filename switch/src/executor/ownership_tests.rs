@@ -1,6 +1,6 @@
 use super::*;
 use crate::StoredWaker;
-use crate::runtime::{Capacity, Runtime, RuntimeError, core};
+use crate::runtime::{Runtime, RuntimeError, core};
 use crate::task::header::{DEFERRED, DROP_STARTED, LIVE, QUEUED, TAKEN};
 use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
@@ -11,31 +11,18 @@ use std::task::{Context, Poll, Waker};
 #[path = "waker_tests.rs"]
 mod waker_tests;
 
+/// More tasks than a fresh wake queue holds, so the queues grow mid-round.
+const MANY: usize = 192;
+
 /// A runtime driven through `Runtime::poll`, and its executor for white-box checks.
 struct Owner(*mut Executor, RefCell<Runtime>);
 
 #[test]
 fn constructor_uses_initial_timer_tick() {
-    let owner = Owner::with(Runtime::with_capacity(
-        123,
-        Capacity {
-            tasks: 17,
-            timers: 23,
-        },
-    ));
+    let owner = Owner::with(Runtime::new(123));
     unsafe {
         assert_eq!((*owner.0).timers.current_tick(), 123);
     }
-}
-/// A wake queue at capacity: one more append panics rather than writing past the buffer.
-#[test]
-#[should_panic(expected = "wake queue full")]
-fn append_to_a_full_wake_queue_panics() {
-    let mut queue: Vec<*const TaskHeader> = Vec::with_capacity(1);
-    while queue.len() < queue.capacity() {
-        append_reserved(&mut queue, std::ptr::null());
-    }
-    append_reserved(&mut queue, std::ptr::null());
 }
 
 impl Owner {
@@ -56,14 +43,20 @@ impl Owner {
     fn poll(&self) -> Result<usize, RuntimeError> {
         self.1.borrow_mut().poll(0).map(|report| report.tasks_polled)
     }
+    /// Live tasks, and slots in use (a finished task's slot until its queue entry drains).
     fn counts(&self) -> (usize, usize) {
-        unsafe { ((*self.0).task_count, (*self.0).allocated) }
+        unsafe { ((*self.0).task_count, slots_in_use(self.0)) }
     }
     /// Cleanup without freeing the executor, so tests can inspect it; the
     /// runtime's own shutdown repeats it when the owner drops.
     fn cleanup(&self) {
         unsafe { Executor::cleanup(self.0) }
     }
+}
+
+/// Slots holding a future or a queue entry: flags are 0 exactly when a slot is free or reserved.
+unsafe fn slots_in_use(executor: *mut Executor) -> usize {
+    unsafe { Executor::slots(executor).filter(|&header| TaskHeader::flags(header).get() != 0).count() }
 }
 
 /// Task state flags, without the slot-in-use bit.
@@ -206,13 +199,13 @@ fn duplicate_wakes_make_one_next_batch_claim() {
 }
 
 #[test]
-fn nested_spawn_grows_both_vectors_without_repolling_current_round() {
+fn nested_spawns_run_in_the_next_round_not_the_current_one() {
     let owner = Owner::new();
     let ptr = owner.0;
     let inner = Rc::new(Cell::new(0));
     #[switch::task]
     async fn spawn_many(ptr: *mut Executor, inner: Rc<Cell<usize>>) {
-        for _ in 0..(DEFAULT_CAPACITY * 3) {
+        for _ in 0..(MANY) {
             unsafe {
                 Executor::spawn(ptr, count_task(inner.clone()), None);
             }
@@ -226,9 +219,9 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_round() {
     let seen = Rc::new(Cell::new(None));
     owner.spawn(spawn_many(ptr, inner.clone()));
     owner.spawn(observe(inner.clone(), seen.clone()));
-    assert_eq!(owner.poll(), Ok(2 + DEFAULT_CAPACITY * 3));
+    assert_eq!(owner.poll(), Ok(2 + MANY));
     assert_eq!(seen.get(), Some(0));
-    assert_eq!(inner.get(), DEFAULT_CAPACITY * 3);
+    assert_eq!(inner.get(), MANY);
     assert_eq!(owner.counts(), (0, 0));
 }
 
@@ -402,7 +395,7 @@ fn reentrant_turn_rejects_before_vector_mutation_and_keeps_remainder() {
         assert_eq!((*owner.0).run_queue.len(), 2);
         assert!((*owner.0).incoming.is_empty());
         assert_eq!((*owner.0).task_count, 1);
-        assert_eq!((*owner.0).allocated, 2);
+        assert_eq!(slots_in_use(owner.0), 2);
         assert!(!(*owner.0).active);
         assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
     }
@@ -482,7 +475,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
     impl Drop for SpawnDuringDrop {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
-            for _ in 0..(DEFAULT_CAPACITY * 3) {
+            for _ in 0..(MANY) {
                 unsafe {
                     Executor::spawn(self.owner, count_task(self.completed.clone()), None);
                 }
@@ -530,21 +523,21 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
     assert_eq!(
         owner.counts(),
         (
-            DEFAULT_CAPACITY * 3 + 1,
-            DEFAULT_CAPACITY * 3 + 1 + usize::from(self_wake)
+            MANY + 1,
+            MANY + 1 + usize::from(self_wake)
         )
     );
     unsafe {
         assert_eq!(
             (*owner.0).incoming.len(),
-            DEFAULT_CAPACITY * 3 + usize::from(target_idle) + usize::from(self_wake)
+            MANY + usize::from(target_idle) + usize::from(self_wake)
         );
     }
     assert_eq!(
         owner.poll(),
-        Ok(DEFAULT_CAPACITY * 3 + usize::from(target_idle))
+        Ok(MANY + usize::from(target_idle))
     );
-    assert_eq!(completed.get(), DEFAULT_CAPACITY * 3);
+    assert_eq!(completed.get(), MANY);
     assert_eq!(target_polls.get(), 1 + usize::from(target_idle));
     assert_eq!(owner.counts(), (1, 1));
     owner.cleanup();
@@ -1007,13 +1000,7 @@ fn stored_wakes_after_open(lifecycle: Lifecycle) {
 /// the self-wake of a finished task, whose slot stays in use until it drains.
 #[test]
 fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
-    let owner = Owner::with(Runtime::with_capacity(
-        0,
-        Capacity {
-            tasks: 0,
-            timers: 0,
-        },
-    ));
+    let owner = Owner::new();
     let parked: Vec<StoredPark> = (0..4).map(|_| StoredPark::new()).collect();
     let stored: Vec<_> = parked.iter().map(|task| task.stored.clone()).collect();
     for task in parked {
@@ -1044,7 +1031,7 @@ fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
     unsafe {
         let (incoming, deferred) = ((*owner.0).incoming.len(), (*owner.0).deferred.len());
         assert_eq!((incoming, deferred), (4, 2));
-        assert_eq!(incoming + deferred, (*owner.0).allocated);
+        assert_eq!(incoming + deferred, slots_in_use(owner.0));
     }
     // The stale entry drains and frees its slot; the new task completes.
     assert_eq!(owner.poll(), Ok(5));

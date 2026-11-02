@@ -115,15 +115,16 @@ impl Host {
         }
     }
 
-    /// One busy-poll round: turn the Net at microsecond resolution, poll tasks at the same
-    /// sampled time in nanoseconds; never sleeps.
+    /// One busy-poll round: receive at microsecond resolution, poll tasks at the same sampled
+    /// time in nanoseconds, then send what they wrote; never sleeps.
     #[inline]
     pub fn round(&mut self) -> Result<u64, String> {
         let now = self.clock.now_ns();
         self.net
-            .turn(self.clock.stack_now(now))
-            .map_err(|e| format!("turn: {e}"))?;
+            .receive(self.clock.stack_now(now))
+            .map_err(|e| format!("receive: {e}"))?;
         self.rt.poll(now).map_err(|e| format!("poll: {e:?}"))?;
+        self.net.send().map_err(|e| format!("send: {e}"))?;
         Ok(now)
     }
 

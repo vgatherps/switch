@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use switch::{Capacity, Runtime, StoredWaker};
+use switch::{Runtime, StoredWaker};
 
 struct Ready;
 impl Future for Ready {
@@ -279,13 +279,7 @@ fn wide_parked() -> impl Future<Output = ()> {
 /// for all its iterations (criterion's warm-up then needs only a few calls);
 /// after `NEW_BLOCKS` in total, a sample reports the mean of all earlier ones.
 fn bench_spawn_new_block(c: &mut Criterion) {
-    let runtime = Runtime::with_capacity(
-        0,
-        Capacity {
-            tasks: 2 * NEW_BLOCKS as usize,
-            timers: 0,
-        },
-    );
+    let runtime = Runtime::new(0);
     let spawner = runtime.spawner();
     let (mut measured, mut total) = (0u32, Duration::ZERO);
     c.bench_function("spawn_new_block", |b| {

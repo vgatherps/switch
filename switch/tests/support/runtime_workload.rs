@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
-use switch::{Capacity, PollReport, Runtime, Sleep, Spawner};
+use switch::{PollReport, Runtime, Sleep, Spawner};
 
 pub const TICKS: [u64; 6] = [100, 100, 101, 102, 1 << 60, u64::MAX];
 pub const EXPECTED: [(usize, usize); 6] = [(3, 2), (1, 1), (2, 1), (1, 0), (1, 1), (2, 0)];
@@ -79,13 +79,7 @@ pub struct Mixed {
 }
 impl Mixed {
     pub fn new() -> Self {
-        let runtime = Runtime::with_capacity(
-            100,
-            Capacity {
-                tasks: 40,
-                timers: 32,
-            },
-        );
+        let runtime = Runtime::new(100);
         let spawner = runtime.spawner();
         let audit = Rc::new(Audit {
             output: RefCell::new(Vec::with_capacity(7)),
@@ -190,13 +184,7 @@ fn repeated(
 }
 impl PendingSleep {
     pub fn new() -> Self {
-        let mut runtime = Runtime::with_capacity(
-            0,
-            Capacity {
-                tasks: 1,
-                timers: 1,
-            },
-        );
+        let mut runtime = Runtime::new(0);
         let spawner = runtime.spawner();
         let polls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
