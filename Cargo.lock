@@ -763,6 +763,12 @@ dependencies = [
 [[package]]
 name = "junction"
 version = "0.1.0"
+dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
+ "libc",
+]
 
 [[package]]
 name = "lazy_static"
