@@ -241,6 +241,11 @@ check "apply after the reboot needs no reboot and succeeds" status_is 0
 check "a second apply does not rerun grubby" sh -c "! grep -q '^grubby --update' '$calls'"
 check "a bound data ENI is not rediscovered" sh -c "! grep -q 'discover' '$calls'"
 check "apply reports the data ENI as already bound" has interfaces "ok management ens5; data 0000:00:06.0 (0a:00:00:00:00:06) already on vfio-pci"
+cp "$root/etc/zhida/host.env" "$tmp/host.env"
+: >"$calls"
+run apply --kernel-receiver
+check "kernel receiver apply refuses a vfio-bound data ENI" sh -c "[ \$(cat '$tmp/status') = 1 ] && grep -q '^interfaces: FAIL data 0000:00:06.0 is on vfio-pci' '$tmp/out'"
+check "the refused kernel receiver apply leaves host.env and the binding alone" sh -c "cmp -s '$tmp/host.env' '$root/etc/zhida/host.env' && ! grep -q '^zhida-netconf\\|^networkctl\\|^systemctl\\|^grubby' '$calls'"
 check "an unchanged unmanaged config does not reload networkd" sh -c "! grep -q '^networkctl reload' '$calls'"
 check "an unchanged chrony.conf keeps one refclock line and no restart" sh -c "[ \$(grep -c '^refclock PHC' '$root/etc/chrony.conf') = 1 ] && ! grep -q '^systemctl restart chronyd' '$calls'"
 sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"

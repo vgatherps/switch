@@ -191,7 +191,8 @@ build() {
 
 # ---------------------------------------------------------------- host settings
 # Fixes MGMT_IF, DATA_IF, DATA_PCI, DATA_MAC and NUMA_NODE in host.env. A data ENI already on vfio-pci
-# has no interface any more; its saved facts are kept.
+# has no interface any more; its saved facts are kept. --kernel-receiver refuses such a host: the
+# data ENI must be back on ena (zhida-netconf unbind) first.
 step_interfaces() {
     MGMT_IF=$(mgmt_if)
     [ -n "$MGMT_IF" ] || fatal interfaces "no IPv4 default route: cannot tell the management interface"
@@ -199,6 +200,7 @@ step_interfaces() {
         # shellcheck source=/dev/null
         . "$ENV"
         if [ "$(pci_driver "$DATA_PCI")" = vfio-pci ]; then
+            [ "$requested_driver" = vfio-pci ] || fatal interfaces "data $DATA_PCI is on vfio-pci; run zhida-netconf unbind $DUT, then apply --kernel-receiver"
             report interfaces ok "management $MGMT_IF; data $DATA_PCI ($DATA_MAC) already on vfio-pci"
             return 0
         fi
