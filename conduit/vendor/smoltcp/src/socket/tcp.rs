@@ -2303,16 +2303,19 @@ impl<'a> Socket<'a> {
             .checked_add(payload_offset)
             .expect("TCP receive offset overflow");
         // Each out-of-order view pins one frame of the shared RX pool; past the cap a socket
-        // takes no more out-of-order data, and the peer resends it once the gap fills.
-        let decision = if payload.is_empty() {
-            None
-        } else if payload_offset != 0
-            && self.rx_buffer.store.out_of_order_views() >= MAX_OUT_OF_ORDER_VIEWS
-        {
-            Some(Decision::Refused)
-        } else {
-            Some(self.rx_buffer.store.decide(offset, payload.len()))
-        };
+        // takes no new out-of-order view, and the peer resends the data once the gap fills.
+        // A duplicate of held data stays a duplicate.
+        let decision = (!payload.is_empty()).then(|| {
+            match self.rx_buffer.store.decide(offset, payload.len()) {
+                Decision::New(_)
+                    if payload_offset != 0
+                        && self.rx_buffer.store.out_of_order_views() >= MAX_OUT_OF_ORDER_VIEWS =>
+                {
+                    Decision::Refused
+                }
+                decision => decision,
+            }
+        });
         let refused = matches!(decision, Some(Decision::Refused));
         if refused {
             // A statistic the peer can drive; it must never panic the stack.
@@ -4520,13 +4523,19 @@ mod test {
 
     /// Past `MAX_OUT_OF_ORDER_VIEWS` frames held beyond its gap, a socket refuses another
     /// out-of-order segment with an ACK at the in-order edge, and still stores in-order data;
-    /// once the gap fills, out-of-order data is taken again.
+    /// once the gap fills, out-of-order data is taken again. A resend of held data at the cap
+    /// is a duplicate, answered with its D-SACK block, not refused.
     #[test]
     fn out_of_order_views_are_capped_per_socket() {
         let mut s = socket_established_with_buffer_sizes(64, 4096);
+        s.remote_has_sack = true;
         for index in 0..MAX_OUT_OF_ORDER_VIEWS {
             send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(REMOTE_SEQ + 3 + 2 * index).ack(LOCAL_SEQ + 1).data(b"x"));
         }
+        assert_eq!(s.rx_refused_segments(), 0);
+        let held = REMOTE_SEQ + 3;
+        let ack = send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(held).ack(LOCAL_SEQ + 1).data(b"x"));
+        assert_eq!(ack.unwrap().sack_ranges[0], Some((held.0 as u32, (held + 1).0 as u32)));
         assert_eq!(s.rx_refused_segments(), 0);
         let past = REMOTE_SEQ + 3 + 2 * MAX_OUT_OF_ORDER_VIEWS;
         let ack = send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(past).ack(LOCAL_SEQ + 1).data(b"y"));

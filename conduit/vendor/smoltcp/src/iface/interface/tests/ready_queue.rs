@@ -1804,8 +1804,11 @@ fn pool_low_prunes_the_largest_holder_only_as_far_as_needed() {
 
     // S1 holds 4 and gives 3, its farthest; S2 holds 2 and keeps them.
     assert_eq!(sockets.prune_out_of_order(3), 3);
+    let views = |sockets: &TcpSet<'_>| [s1, s2].map(|handle| sockets.get(handle).out_of_order_views());
+    assert_eq!(views(&sockets), [1, 2]);
     // Now S2 is the largest holder.
     assert_eq!(sockets.prune_out_of_order(2), 2);
+    assert_eq!(views(&sockets), [1, 0]);
     // Only S1's nearest frame is left.
     assert_eq!(sockets.prune_out_of_order(5), 1);
     assert_eq!(sockets.prune_out_of_order(1), 0);
