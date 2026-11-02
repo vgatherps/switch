@@ -406,16 +406,16 @@ Out-of-order segments are freed only when the gap before them fills, so sockets 
 could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. A socket
 holds at most `smoltcp::socket::tcp::MAX_OUT_OF_ORDER_VIEWS` (1024) frames past its first gap and
 refuses further out-of-order segments, counted by `rx_refused_segments()`, with an ACK at its
-in-order edge. Each `turn` and `receive` whose RX burst returned packets reads how many RX mbufs
-are free and compares it with one refill of the RX ring plus one burst: max(negotiated RX
-descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
-refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
+in-order edge. `turn` and `receive` read how many RX mbufs are free and compare it with one
+refill of the RX ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`.
+DPDK PMDs refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
 receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
 at once; while that fails ENA still returns completed packets, but stops receiving once the
 buffers already posted run out. So the check must fire while a refill can still succeed.
-When fewer are free, the sockets holding the most out-of-order frames release them before
-ingress, the farthest from their in-order data first (an out-of-order FIN goes with them), until
-that many are free again or no socket holds any; in-order data stays. `rx_reserve` counts the
+They read it after ingress of an RX burst that returned packets, and on every turn after a reading
+below the mark until one is not. When fewer are free, the sockets holding the most out-of-order
+frames release them, the ones this turn retained included, the farthest from their in-order data
+first (an out-of-order FIN goes with them), until that many are free again or no socket holds any; in-order data stays. `rx_reserve` counts the
 mark, so a pool of reserve plus share clears it while the sockets together hold at most the
 share. The peer resends what was dropped; RFC 2018 lets a receiver discard data it already
 reported in SACK blocks, and the sender must then resend it too.

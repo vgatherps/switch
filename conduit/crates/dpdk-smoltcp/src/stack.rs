@@ -204,6 +204,9 @@ pub struct Stack {
     now: Instant,
     /// The first turn at or after this time runs DPDK's timers.
     next_service: Instant,
+    /// The last RX pool reading was below the low mark: every turn reads it again, received
+    /// packets or not, until a reading is not.
+    rx_pool_low: bool,
 }
 
 impl Stack {
@@ -306,6 +309,7 @@ impl Stack {
             device,
             now,
             next_service: now,
+            rx_pool_low: false,
         })
     }
 
@@ -440,12 +444,12 @@ impl Stack {
     }
 
     /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
-    /// tidying, flush, one RX burst, maintenance, then ingress. After a burst that returned
-    /// packets, the RX pool is checked against the low mark (one RX ring refill plus one
-    /// burst); while
-    /// it is below, the TCP sockets holding the most out-of-order frames release them,
-    /// farthest from their in-order data first, until the pool is back at the mark
-    /// (`TcpSet::prune_out_of_order`).
+    /// tidying, flush, one RX burst, maintenance, then ingress. After ingress of a burst that
+    /// returned packets, and on every turn after a reading below it, the RX pool is checked
+    /// against the low mark (one RX ring refill plus one burst). While it is below, the TCP
+    /// sockets holding the most out-of-order frames release them, farthest from their in-order
+    /// data first, until the pool is back at the mark (`TcpSet::prune_out_of_order`), the
+    /// frames this turn's ingress retained included.
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
         if now >= self.next_service {
@@ -460,12 +464,6 @@ impl Stack {
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
         let received = burst.accepted + burst.rejected;
-        if received != 0 {
-            let shortfall = self.device.rx_pool_shortfall();
-            if shortfall != 0 {
-                self.sockets.prune_out_of_order(shortfall);
-            }
-        }
         self.iface.poll_maintenance(now);
 
         let mut rx_processed = 0;
@@ -481,6 +479,13 @@ impl Stack {
                 | PollIngressSingleResult::SocketStateChanged => {}
             }
             rx_processed += 1;
+        }
+        if received != 0 || self.rx_pool_low {
+            let shortfall = self.device.rx_pool_shortfall();
+            self.rx_pool_low = shortfall != 0;
+            if shortfall != 0 {
+                self.sockets.prune_out_of_order(shortfall);
+            }
         }
 
         Ok(Turn {

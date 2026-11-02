@@ -341,3 +341,46 @@ fn low_pool_takes_back_out_of_order_frames_one_for_one() {
         pair.close();
     });
 }
+
+/// B's RX pool sits exactly at its low mark under unread UDP datagrams when three of S1's
+/// segments arrive behind a lost one, and B takes one packet per turn. The turn that receives
+/// them retains one out of order and releases it in the same turn; the next turns receive no
+/// packets, ingest the staged rest and keep releasing until the pool is back at the mark.
+#[zhida_test_support::pinned_test]
+fn out_of_order_frames_retained_while_low_are_pruned_without_new_arrivals() {
+    with_eal(|eal| {
+        let mut pair = shared_pair(eal, ["shra", "shrb"], 1, 1);
+        let conns = many::open(&mut pair, 0..1, WINDOW);
+        let s1 = &conns[0];
+        let udp = udp_sockets(&mut pair);
+        let blocked = Rc::new(Cell::new(true));
+        block_gaps(&mut pair.a_to_b, vec![client_port(s1)], blocked.clone());
+
+        // Most mbufs in use while the pool is not below its low mark.
+        let top = b_rx_pool() - LOW_MARK;
+        let mut rounds = 0;
+        while (pair.in_use()[1].0 as usize) < top {
+            rounds += 1;
+            assert!(rounds < MAX_ROUNDS, "B's RX pool never reached the mark");
+            send_datagram(&mut pair, &udp);
+            pair.round(|_, _| {});
+        }
+        assert_eq!(pair.in_use()[1].0 as usize, top);
+
+        let now = pair.now();
+        let data = pattern(4 * 1460, 51);
+        assert_eq!(pair.a.tcp_mut(&s1.client).send_slice(&data), Ok(data.len()));
+        pair.a.turn(now, 32).unwrap();
+        let mut delivered = 0;
+        assert_eq!(pair.a_to_b.forward_with(|_| delivered += 1), 4);
+        assert_eq!(delivered, 3, "the first segment is lost");
+        let mut in_use = Vec::new();
+        for _ in 0..4 {
+            assert_eq!(pair.b.turn(now, 1).unwrap().rx_processed, usize::from(in_use.len() < 3));
+            pair.drain_tx(Side::B, |_| {});
+            in_use.push(pair.in_use()[1].0 as usize);
+        }
+        assert_eq!(in_use, [top + 2, top + 1, top, top]);
+        pair.close();
+    });
+}
