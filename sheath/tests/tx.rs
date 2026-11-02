@@ -221,6 +221,35 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
     );
 }
 
+/// A record over 2^14 + 256 B (16641 B here) fails the connection with a record_overflow alert
+/// to the server (RFC 8446 §5.2), whether the record arrives in one frame or across two.
+#[test]
+fn oversized_record_gets_a_record_overflow_alert() {
+    for straddle in [false, true] {
+        let mut peer = connect(None);
+        deliver_to_client(&mut peer).unwrap();
+        let mut stream = Stream::default();
+        peer.send(&mut stream, b"hello");
+        let at = stream.bytes.len();
+        let [hi, lo] = 16641u16.to_be_bytes();
+        stream.bytes.extend_from_slice(&[0x17, 0x03, 0x03, hi, lo]);
+        stream.bytes.resize(at + 5 + 16641, 0);
+        let cuts = if straddle { vec![at + 100] } else { vec![] };
+
+        let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
+        assert_eq!(received.got.len(), 1, "straddle {straddle}");
+        assert_eq!(received.error, Some(Error::Tls(rustls::Error::PeerSentOversizedRecord)), "straddle {straddle}");
+        let f = ready(peer.tx.alloc()).unwrap();
+        let alert = peer.tx.take_pending(f).unwrap().expect("the alert");
+        send(&mut peer, alert);
+        assert_eq!(
+            peer.deliver(),
+            Err(rustls::Error::AlertReceived(AlertDescription::RecordOverflow)),
+            "straddle {straddle}"
+        );
+    }
+}
+
 /// TCP FIN without the server's close_notify is truncation, which stops sending.
 #[test]
 fn truncation_stops_sending() {

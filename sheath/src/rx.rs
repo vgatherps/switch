@@ -467,17 +467,12 @@ fn process<L: FrameTx>(tx: &mut TlsTx<L>, buf: &mut [u8], held: usize) -> Step {
 }
 
 /// Checks the length in the complete header of the record at `start` in `buf`, before its body
-/// is gathered or decrypted. Returns the end state on rejection.
+/// is gathered: the bytes rustls would need kept. Returns the end state on rejection. A record
+/// over 2^14 + 256 B is rustls's to refuse, once whole, so that it sends record_overflow.
 fn check_bounds(buf: &[u8], start: usize) -> Option<State> {
-    let end = body_end(buf, start);
-    let error = if end - start - HEADER_LEN > MAX_CIPHERTEXT_LEN {
-        rustls::Error::PeerSentOversizedRecord
-    } else if end > MAX_RETAINED_LEN {
-        rustls::Error::InvalidMessage(rustls::InvalidMessage::MessageTooLarge)
-    } else {
-        return None;
-    };
-    Some(State::Failed(Error::Tls(error)))
+    (body_end(buf, start) > MAX_RETAINED_LEN).then(|| {
+        State::Failed(Error::Tls(rustls::Error::InvalidMessage(rustls::InvalidMessage::MessageTooLarge)))
+    })
 }
 
 /// Gives rustls `buf`, which ends with the header of a record whose body has not arrived, so

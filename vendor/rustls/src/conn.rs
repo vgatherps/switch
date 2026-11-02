@@ -14,6 +14,7 @@ use crate::log::trace;
 use crate::msgs::deframer::DeframerIter;
 use crate::msgs::deframer::buffers::{BufferProgress, DeframerVecBuffer, Delocator, Locator};
 use crate::msgs::deframer::handshake::HandshakeDeframer;
+use crate::msgs::fragmenter::MAX_FRAGMENT_LEN;
 use crate::msgs::handshake::Random;
 use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
 use crate::record_layer::Decrypted;
@@ -1024,6 +1025,12 @@ impl<Data> ConnectionCore<Data> {
 
                 if allowed_plaintext && !self.hs_deframer.is_active() {
                     break (message.into_plain_message(), iter.bytes_consumed());
+                }
+
+                // RFC 8446 §5.2: a TLS 1.3 record longer than 2^14 + 256 bytes is fatal, with
+                // a record_overflow alert, whether or not it would decrypt.
+                if version_is_tls13 && message.payload.len() > MAX_FRAGMENT_LEN + 256 {
+                    return Err(self.handle_deframe_error(Error::PeerSentOversizedRecord, state));
                 }
 
                 let message = match self

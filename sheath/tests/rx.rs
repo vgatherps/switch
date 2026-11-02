@@ -264,15 +264,18 @@ fn push_before_chunk_drained_panics() {
     rx.push(second);
 }
 
-/// The length in a record header is checked against the TLS 1.3 bound of 2^14 + 256 bytes as
-/// soon as the header is complete: inside a frame, split across frames at every offset, and
-/// before any of the body has arrived.
+/// Record length errors, inside a frame, split across frames at every header offset, with and
+/// without the body: a header over rustls's 18431 B bound fails as soon as the header is
+/// complete; a record over the TLS 1.3 bound of 2^14 + 256 B fails once whole (rustls checks
+/// the ciphertext, then sends record_overflow); one at the bound, of zeros, fails
+/// authentication once whole.
 #[test]
-fn record_length_is_bounded_at_its_header() {
-    for (len, error) in [
-        (16640, rustls::Error::DecryptError),
-        (16641, rustls::Error::PeerSentOversizedRecord),
-        (0xffff, rustls::Error::PeerSentOversizedRecord),
+fn record_length_errors() {
+    let too_large = rustls::Error::InvalidMessage(rustls::InvalidMessage::MessageTooLarge);
+    for (len, error, at_header) in [
+        (16640, rustls::Error::DecryptError, false),
+        (16641, rustls::Error::PeerSentOversizedRecord, false),
+        (0xffff, too_large, true),
     ] {
         for with_body in [true, false] {
             for header_cut in 0..=5 {
@@ -293,8 +296,7 @@ fn record_length_is_bounded_at_its_header() {
 
                 let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
                 assert_received(&received.got, &stream.records, &cuts);
-                // a body of zeros fails authentication once it is all there
-                let expected = (len > 16640 || with_body).then(|| Error::Tls(error.clone()));
+                let expected = (at_header || with_body).then(|| Error::Tls(error.clone()));
                 assert_eq!(received.error, expected, "len {len} cuts {cuts:?}");
             }
         }
