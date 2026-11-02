@@ -63,14 +63,19 @@ pub(crate) fn temp_path(path: &Path, n: u64) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
 }
 
-/// Replaces the file at `path` (through a symlink, its target) with `bytes` and its permissions:
-/// writes and fsyncs a new temp file in the same directory, then renames it over the file, so a
-/// failure or a kill leaves the old file whole. A temp file left by a killed run never blocks a
-/// later one: each run takes a fresh name.
-fn replace(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+/// Writes `bytes` to `path`: to a new temp file in the same directory, fsynced, then renamed over
+/// `path`, so a failure or a kill leaves no partial file: the old one whole (`previous`), or none.
+/// An existing file (through a symlink, its target) keeps its permissions. A temp file left by a
+/// killed run never blocks a later one: each run takes a fresh name.
+fn write_atomically(path: &Path, bytes: &[u8], previous: bool) -> Result<(), ConfigError> {
     let error = |at: &Path, e: std::io::Error| ConfigError(format!("{}: {e}", at.display()));
-    let path = fs::canonicalize(path).map_err(|e| error(path, e))?;
-    let permissions = fs::metadata(&path).map_err(|e| error(&path, e))?.permissions();
+    let (path, permissions) = if previous {
+        let path = fs::canonicalize(path).map_err(|e| error(path, e))?;
+        let permissions = fs::metadata(&path).map_err(|e| error(&path, e))?.permissions();
+        (path, Some(permissions))
+    } else {
+        (path.to_path_buf(), None)
+    };
     let mut tries = 0;
     let (temp, mut file) = loop {
         let temp = temp_path(&path, TEMP_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -86,7 +91,7 @@ fn replace(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     };
     let written = file
         .write_all(bytes)
-        .and_then(|()| file.set_permissions(permissions))
+        .and_then(|()| permissions.map_or(Ok(()), |p| file.set_permissions(p)))
         .and_then(|()| file.sync_all())
         .and_then(|()| fs::rename(&temp, &path));
     if let Err(e) = written {
@@ -133,17 +138,7 @@ pub fn write(
             }
         }
     }
-    if previous.is_some() {
-        replace(path, config.to_json().as_bytes())?;
-    } else {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
-        file.write_all(config.to_json().as_bytes())
-            .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
-    }
+    write_atomically(path, config.to_json().as_bytes(), previous.is_some())?;
     let report = |changes: &mut dyn Write, line: std::fmt::Arguments| {
         writeln!(changes, "{line}").map_err(|e| ConfigError(e.to_string()))
     };

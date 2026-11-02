@@ -753,6 +753,45 @@ fn temp_files(dir: &std::path::Path, name: &str) -> Vec<String> {
     names
 }
 
+/// A first discovery whose write fails part way (here the file size limit, as a full disk would)
+/// leaves no config at the path, whole or partial, and no temp file. Runs in a child process: the
+/// limit is per process.
+#[test]
+fn initial_discovery_failure_leaves_no_partial_config() {
+    const CHILD: &str = "ZHIDA_NETCONF_FSIZE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discover::tests::aws::initial_discovery_failure_leaves_no_partial_config",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let path = tree.dir.join("config.json");
+    // SAFETY: plain libc calls on this process's own limit and signal disposition.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit { rlim_cur: 16, rlim_max: libc::RLIM_INFINITY };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    let written = crate::rediscover::write(&path, &discovered, None, &mut Vec::new());
+    assert!(written.is_err(), "the write past the size limit succeeded");
+    assert!(!path.exists(), "a partial config was left at the path");
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
 /// A rediscovery replaces the file whole (a new inode with the full new config and the old
 /// file's permissions), never truncates it in place, and leaves no temp file.
 #[test]
