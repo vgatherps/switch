@@ -118,6 +118,18 @@ fn control_frames_are_not_held_to_max_message() {
     assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
 }
 
+/// A Ping, Pong or Close header declaring 2^32 bytes is `ControlTooBig` on every target width:
+/// the 125 B limit is checked on the declared 64-bit length, which on a 32-bit target would
+/// wrap to 0 as a `usize`.
+#[test]
+fn control_frame_declaring_2_pow_32_bytes_is_too_big() {
+    for op in [PING, PONG, CLOSE] {
+        let mut h = vec![fin(op), 127];
+        h.extend_from_slice(&(1u64 << 32).to_be_bytes());
+        fails(Role::Client, &[h], P::ControlTooBig);
+    }
+}
+
 #[test]
 fn close_frames() {
     for code in [1000, 1003, 1007, 1013, 1014, 3000, 4999] {
