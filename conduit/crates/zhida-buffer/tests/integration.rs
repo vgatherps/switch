@@ -32,6 +32,8 @@ fn test_tx_path_single_segment() {
     let data = mbuf.data();
     assert_eq!(data[0], 0x45);
     assert_eq!(&data[20..22], &80u16.to_be_bytes());
+    drop(mbuf);
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -52,6 +54,8 @@ fn test_tx_path_with_retransmit() {
 
     let retransmit_bytes: Vec<u8> = retransmit_copy.data().to_vec();
     assert_eq!(sent_bytes, retransmit_bytes);
+    drop(retransmit_copy);
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -74,6 +78,8 @@ fn test_rx_path_header_parsing() {
 
     assert_eq!(mbuf.len(), 500);
     assert!(mbuf.data().iter().all(|&b| b == 0xDD));
+    drop(mbuf);
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[zhida_test_support::pinned_test]
@@ -94,4 +100,6 @@ fn test_refcount_through_tx_flow() {
     assert_eq!(retransmit.refcount(), 1);
 
     assert!(!retransmit.is_empty());
+    drop(retransmit);
+    assert_eq!(pool.in_use_count(), 0);
 }
