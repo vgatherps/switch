@@ -364,23 +364,19 @@ WantedBy=multi-user.target"; then
     report unit ok "zhida-host.service runs boot at every boot"
 }
 
-# The PHC refclock goes after AL2023's own chrony.conf (its Time Sync NTP server line stays). The
-# device appears only once ena.phc_enable=1 is in effect: chronyd is restarted now if it exists,
-# else the reboot starts it with the new config.
+# The PHC refclock goes after AL2023's own chrony.conf (its Time Sync NTP server line stays), and
+# only once /dev/ptp_ena exists: chronyd exits at start on a PHC refclock it cannot open, leaving
+# the host with no time sync. The device appears after the reboot that applies ena.phc_enable=1,
+# and never outside a precision-time placement group, so boot adds the line.
 step_chrony() {
-    changed=
-    if ! grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
-        printf '%s\n' "$PHC_REFCLOCK" >>"$CHRONY_CONF" || fatal chrony "cannot write $CHRONY_CONF"
-        changed=1
-    fi
-    systemctl enable -q chronyd.service || fatal chrony "systemctl enable chronyd failed"
-    if [ -z "$changed" ]; then
+    if [ ! -e "$R/dev/ptp_ena" ]; then
+        report chrony ok "no /dev/ptp_ena; $CHRONY_CONF left on NTP"
+    elif grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
         report chrony ok "$CHRONY_CONF has the PHC refclock"
-    elif [ -e "$R/dev/ptp_ena" ]; then
+    else
+        printf '%s\n' "$PHC_REFCLOCK" >>"$CHRONY_CONF" || fatal chrony "cannot write $CHRONY_CONF"
         systemctl restart chronyd.service || fatal chrony "systemctl restart chronyd failed"
         report chrony changed "PHC refclock added to $CHRONY_CONF; chronyd restarted"
-    else
-        report chrony changed "PHC refclock added to $CHRONY_CONF; chronyd picks it up at reboot"
     fi
 }
 
@@ -438,6 +434,7 @@ step_bind() {
 
 boot() {
     load_env boot
+    step_chrony
     step_irqbalance
     step_irqs
     step_unmanaged
@@ -454,7 +451,7 @@ apply() {
     step_cmdline
     [ "$DATA_DRIVER" = ena ] || step_vfio_wc
     step_unit
-    step_chrony
+    systemctl enable -q chronyd.service || fatal chrony "systemctl enable chronyd failed"
     if [ "$DATA_DRIVER" = ena ]; then
         policy_config="[Network]
 ManageForeignRoutingPolicyRules=no"
@@ -603,7 +600,9 @@ verify() {
     # `chronyc sources` selects it (a `#*` PHC row).
     # A host outside a precision-time placement group has no PHC device and runs on NTP only.
     sources=$(chronyc sources 2>&1)
-    if printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
+    if ! systemctl is-active -q chronyd.service; then
+        report chrony FAIL "chronyd not running"
+    elif printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
         report chrony ok "PHC selected"
     elif [ ! -e "$R/dev/ptp_ena" ]; then
         report chrony ok "no PHC device (/dev/ptp_ena): NTP only, not a precision-time host"
