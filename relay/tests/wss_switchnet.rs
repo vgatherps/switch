@@ -570,8 +570,9 @@ fn recv_after_close_waits_for_the_echo() {
 
 /// A server that stops reading: the client's one-byte messages fill its window and then the
 /// send buffer or frame slots, so `close` waits for room; that wait is dropped. The next recv
-/// still sends the queued close, after every message sent before it (the one dropped in its
-/// wait is not sent); the server echoes it and sees FIN.
+/// still sends the queued close, after every message sent before it; the server echoes it and
+/// sees FIN. The send dropped in its wait went out too if it was accepted: it had a frame (so
+/// was sealed) and only TCP's room was missing; dropped waiting for a frame, it was not.
 #[zhida_test_support::pinned_test]
 fn close_dropped_while_waiting_for_room_is_sent_by_recv() {
     let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -608,7 +609,12 @@ fn close_dropped_while_waiting_for_room_is_sent_by_recv() {
         },
     );
     assert!(sent.get() > 0);
-    assert_eq!(frames, sent.get(), "the server read a message count other than the sends that finished");
+    // each message's payload is its index (checked as read), so none was lost or doubled
+    assert!(
+        frames == sent.get() || frames == sent.get() + 1,
+        "the server read {frames} messages, not the {} sends that finished (plus one if the dropped one was accepted)",
+        sent.get()
+    );
     assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "full")));
 }
 
