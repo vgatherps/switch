@@ -63,10 +63,12 @@ pub(crate) fn temp_path(path: &Path, n: u64) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()))
 }
 
-/// Writes `bytes` to `path`: to a new temp file in the same directory, fsynced, then renamed over
-/// `path`, so a failure or a kill leaves no partial file: the old one whole (`previous`), or none.
-/// An existing file (through a symlink, its target) keeps its permissions. A temp file left by a
-/// killed run never blocks a later one: each run takes a fresh name.
+/// Writes `bytes` to `path` through a new temp file in the same directory, fsynced, so a failure
+/// or a kill leaves no partial file. `previous`: renamed over the file (through a symlink, its
+/// target), which keeps its permissions. Otherwise hard-linked as `path`, which refuses a file
+/// that appeared there since it was found absent (as `create_new` did), then the temp name is
+/// removed. A temp file left by a killed run never blocks a later one: each run takes a fresh
+/// name.
 fn write_atomically(path: &Path, bytes: &[u8], previous: bool) -> Result<(), ConfigError> {
     let error = |at: &Path, e: std::io::Error| ConfigError(format!("{}: {e}", at.display()));
     let (path, permissions) = if previous {
@@ -92,11 +94,22 @@ fn write_atomically(path: &Path, bytes: &[u8], previous: bool) -> Result<(), Con
     let written = file
         .write_all(bytes)
         .and_then(|()| permissions.map_or(Ok(()), |p| file.set_permissions(p)))
-        .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&temp, &path));
+        .and_then(|()| file.sync_all());
     if let Err(e) = written {
         let _ = fs::remove_file(&temp);
         return Err(error(&temp, e));
+    }
+    let published = if previous {
+        fs::rename(&temp, &path)
+    } else {
+        fs::hard_link(&temp, &path)
+    };
+    if let Err(e) = published {
+        let _ = fs::remove_file(&temp);
+        return Err(error(&path, e));
+    }
+    if !previous {
+        fs::remove_file(&temp).map_err(|e| error(&temp, e))?;
     }
     Ok(())
 }

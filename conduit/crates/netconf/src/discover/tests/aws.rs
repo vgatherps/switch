@@ -792,6 +792,23 @@ fn initial_discovery_failure_leaves_no_partial_config() {
     assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
 }
 
+/// A first discovery (nothing loaded) never replaces a config that appeared at the path since:
+/// it is refused as before, the other config stays as it was and no temp file is left.
+#[test]
+fn initial_discovery_refuses_a_config_that_appeared_since_load() {
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let path = tree.dir.join("config.json");
+    assert!(crate::rediscover::load_existing(&path).unwrap().is_none());
+    fs::write(&path, "written by someone else").unwrap();
+    let error = crate::rediscover::write(&path, &discovered, None, &mut Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with(&format!("{}: ", path.display())), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "written by someone else");
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
 /// A rediscovery replaces the file whole (a new inode with the full new config and the old
 /// file's permissions), never truncates it in place, and leaves no temp file.
 #[test]
