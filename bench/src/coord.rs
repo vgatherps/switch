@@ -832,7 +832,7 @@ mod tests {
         let step = &lines[0];
         let q = |v: &serde_json::Value| (v["p50"].as_u64().unwrap(), v["max"].as_u64().unwrap());
         let (p50, max) = q(&step["service_rtt_ns"]);
-        assert!(p50 <= 40_000 && p50 >= 40_000 - 40_000 / 128 && max == 40_000, "{step}");
+        assert!((40_000 - 40_000 / 128..=40_000).contains(&p50) && max == 40_000, "{step}");
         assert_eq!(q(&step["send_lag_ns"]), (300, 300));
         assert_eq!(
             step["workers"],
