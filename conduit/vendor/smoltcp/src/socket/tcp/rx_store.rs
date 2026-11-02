@@ -352,16 +352,25 @@ impl RxStore {
         self.pending = false;
     }
 
-    /// Drop every view past the in-order data, releasing their frames; the in-order views stay
-    /// as they are. Visits only the dropped views. The in-order data ends at a view boundary:
-    /// a view that continues it would be in order itself.
-    pub(super) fn drop_out_of_order(&mut self) {
+    /// Views past the in-order data: one frame each.
+    pub(super) fn out_of_order_views(&self) -> usize {
+        let end = self.absolute(self.in_order_len());
+        self.views.len() - self.views.partition_point(|view| view.start < end)
+    }
+
+    /// Drop up to `limit` views past the in-order data, the farthest from it first, releasing
+    /// their frames; returns how many it dropped. The in-order views stay as they are. The
+    /// in-order data ends at a view boundary: a view that continues it would be in order itself.
+    pub(super) fn drop_out_of_order(&mut self, limit: usize) -> usize {
         self.assert_attached();
         let end = self.absolute(self.in_order_len());
-        while self.views.back().is_some_and(|view| view.start >= end) {
+        let mut dropped = 0;
+        while dropped < limit && self.views.back().is_some_and(|view| view.start >= end) {
             self.views.pop_back();
+            dropped += 1;
         }
-        debug_assert!(self.views.back().is_none_or(|view| view.end() == end));
+        debug_assert!(self.views.back().is_none_or(|view| view.start >= end || view.end() == end));
+        dropped
     }
 
     pub(super) fn truncate_from(&mut self, offset: usize) {

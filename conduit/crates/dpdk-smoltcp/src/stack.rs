@@ -190,7 +190,6 @@ pub struct Sent {
 /// call `into_port`, nothing else.
 pub struct Stack {
     iface: Interface,
-    rx_pool_low: bool,
     /// Exactly `max_sockets` slots, never grown.
     sockets: TcpSet<'static>,
     udp: UdpSet,
@@ -296,11 +295,8 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
-        let rx_pool_low = device.rx_pool_low(0);
-        iface.set_rx_pool_low(rx_pool_low);
         Ok(Self {
             iface,
-            rx_pool_low,
             sockets: TcpSet::new(config.max_sockets),
             udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
@@ -441,10 +437,11 @@ impl Stack {
 
     /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
     /// tidying (which wakes sockets waiting for a free frame if one is free), flush,
-    /// one RX burst, maintenance, then ingress. A burst that returned packets, a previously
-    /// low RX pool, or a recovered Port prompts a check against the low mark (one RX ring
-    /// refill plus one burst). While low, each TCP socket processing a segment keeps no
-    /// out-of-order data (`Interface::set_rx_pool_low`).
+    /// one RX burst, maintenance, then ingress. After a burst that returned packets, the
+    /// RX pool is checked against the low mark (one RX ring refill plus one burst); while
+    /// it is below, the TCP sockets holding the most out-of-order frames release them,
+    /// farthest from their in-order data first, until the pool is back at the mark
+    /// (`TcpSet::prune_out_of_order`).
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
         if now >= self.next_service {
@@ -452,19 +449,18 @@ impl Stack {
             unsafe { zhida_dpdk_sys::rte_timer_manage() };
             self.next_service = now + SERVICE_PERIOD;
         }
-        let recovered = if self.device.port_mut().reset_pending() {
+        if self.device.port_mut().reset_pending() {
             self.device.port_mut().recover().map_err(StackError::Port)?;
-            true
-        } else {
-            false
-        };
+        }
         self.tidy();
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
         let received = burst.accepted + burst.rejected;
-        if received != 0 || self.rx_pool_low || recovered {
-            self.rx_pool_low = self.device.rx_pool_low(if recovered { 0 } else { received });
-            self.iface.set_rx_pool_low(self.rx_pool_low);
+        if received != 0 {
+            let shortfall = self.device.rx_pool_shortfall();
+            if shortfall != 0 {
+                self.sockets.prune_out_of_order(shortfall);
+            }
         }
         self.iface.poll_maintenance(now);
 

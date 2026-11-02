@@ -45,68 +45,6 @@ thread_local! {
     static CLEANUP_RESULT: Cell<i32> = const { Cell::new(0) };
 }
 
-/// A driver over a pool of `total` mbufs, as `RxPressure` assumes: it posts at most `posted`
-/// buffers, returns received packets only from posted ones, and refills all or nothing once
-/// `threshold` buffers are missing (ENA waits for min(ring / 8, 256); 1 refills every time; the
-/// whole ring leaves up to a ring's worth unposted at a reading). The application releases
-/// some of what it holds at random. After every burst that returned packets, `RxPressure`'s
-/// answer equals an exact reading of the free count, and it reads the count far less often
-/// than once per burst when the pool is large.
-#[test]
-fn rx_pressure_answers_as_an_exact_reading_would() {
-    fn run(descriptors: u16, burst: u16, total: usize, threshold: usize, seed: u64) -> (usize, usize) {
-        let mut state = seed;
-        let mut next = move |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % (bound as u64 + 1)) as usize
-        };
-        let mut pressure = RxPressure::new(descriptors, burst);
-        let posted_max = rx_posted(descriptors);
-        let (mut free, mut posted, mut held) = (total, 0usize, 0usize);
-        let (mut bursts, mut reads) = (0, 0);
-        for _ in 0..20_000 {
-            // The application drops some frames, more often when it holds many.
-            let released = next(held / 4);
-            held -= released;
-            free += released;
-            // A burst: packets from posted buffers, then an all-or-nothing refill.
-            let received = next(posted.min(usize::from(burst)));
-            posted -= received;
-            held += received;
-            let refill = posted_max - posted;
-            if refill >= threshold && free >= refill {
-                free -= refill;
-                posted += refill;
-            }
-            if received == 0 {
-                continue;
-            }
-            bursts += 1;
-            let low = if pressure.covers(received) {
-                false
-            } else {
-                reads += 1;
-                pressure.read(free)
-            };
-            assert_eq!(low, free < pressure.low_mark, "free {free}, posted {posted}, held {held}");
-        }
-        (bursts, reads)
-    }
-    for seed in 1..40 {
-        // Pools around the mark, so both answers occur, for net_ring, memif and ENA shapes.
-        for (descriptors, burst, total) in [(16, 8, 120), (64, 32, 300), (1024, 32, 2400)] {
-            let posted = rx_posted(descriptors);
-            for threshold in [1, posted / 8, posted] {
-                run(descriptors, burst, total, threshold, seed);
-            }
-        }
-    }
-    let (bursts, reads) = run(16, 8, 4096, 1, 7);
-    assert!(reads * 50 < bursts, "{reads} reads in {bursts} bursts");
-}
-
 #[test]
 fn device_info_advertised_maps_bits() {
     let info = |rx_capa, tx_capa| DeviceInfo {

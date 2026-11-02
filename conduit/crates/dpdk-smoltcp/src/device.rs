@@ -122,8 +122,8 @@ impl Device {
         self.tx.len()
     }
 
-    pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
-        self.port.rx_pool_low(received)
+    pub(crate) fn rx_pool_shortfall(&self) -> usize {
+        self.port.rx_pool_shortfall()
     }
 
     pub(crate) fn port_mut(&mut self) -> &mut Port {

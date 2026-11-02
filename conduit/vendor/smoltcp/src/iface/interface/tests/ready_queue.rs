@@ -1747,3 +1747,73 @@ fn waiting_positions_follow_removal_and_release() {
     assert!(sockets.waiting.is_empty());
     sockets.check_list_positions();
 }
+
+/// Out-of-order `data` at offsets `starts` (past the first in-order byte, 101) for `port`.
+fn hold_out_of_order(
+    iface: &mut Interface,
+    sockets: &mut TcpSet<'static>,
+    device: &mut TestingDevice,
+    port: u16,
+    ack: TcpSeqNumber,
+    starts: &[i32],
+) {
+    for &start in starts {
+        let mut tcp = segment(port, TcpControl::None, 101 + start, ack);
+        tcp.max_seg_size = None;
+        tcp.payload = b"12345";
+        receive(iface, sockets, device, tcp);
+    }
+    device.tx_queue.clear();
+}
+
+/// The in-order bytes `handle` delivers once the 10-byte gap at 101 fills.
+fn fill_gap(
+    iface: &mut Interface,
+    sockets: &mut TcpSet<'static>,
+    device: &mut TestingDevice,
+    (handle, port, ack): (SocketHandle, u16, TcpSeqNumber),
+) -> usize {
+    let mut tcp = segment(port, TcpControl::None, 101, ack);
+    tcp.max_seg_size = None;
+    tcp.payload = b"0123456789";
+    receive(iface, sockets, device, tcp);
+    let mut delivered = 0;
+    while let Some(frame) = sockets.get_mut(handle).recv().unwrap() {
+        delivered += frame.payload().len();
+    }
+    delivered
+}
+
+/// A low receive pool takes frames from the socket holding the most out-of-order frames, the
+/// farthest from its in-order data first, and no more than asked; then from the next-largest.
+#[test]
+fn pool_low_prunes_the_largest_holder_only_as_far_as_needed() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    let (s1, ack1) = establish(&mut iface, &mut sockets, &mut device, 1234);
+    let (s2, ack2) = establish(&mut iface, &mut sockets, &mut device, 1235);
+    hold_out_of_order(&mut iface, &mut sockets, &mut device, 1234, ack1, &[10, 20, 30, 40]);
+    hold_out_of_order(&mut iface, &mut sockets, &mut device, 1235, ack2, &[10, 20]);
+
+    // S1 holds 4 and gives 3, its farthest; S2 holds 2 and keeps them.
+    assert_eq!(sockets.prune_out_of_order(3), 3);
+    // Now S2 is the largest holder.
+    assert_eq!(sockets.prune_out_of_order(2), 2);
+    // Only S1's nearest frame is left.
+    assert_eq!(sockets.prune_out_of_order(5), 1);
+    assert_eq!(sockets.prune_out_of_order(1), 0);
+
+    // S1 kept the frame next to its gap until the last round; S2's went in the second.
+    assert_eq!(fill_gap(&mut iface, &mut sockets, &mut device, (s2, 1235, ack2)), 10);
+    assert_eq!(fill_gap(&mut iface, &mut sockets, &mut device, (s1, 1234, ack1)), 10);
+}
+
+/// Pruning only as far as asked keeps the frames nearest the gap: after S1 gives 3 of its 4,
+/// filling its gap delivers the gap and the one frame that continues it.
+#[test]
+fn partial_prune_keeps_the_frame_nearest_the_gap() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    let (s1, ack1) = establish(&mut iface, &mut sockets, &mut device, 1234);
+    hold_out_of_order(&mut iface, &mut sockets, &mut device, 1234, ack1, &[10, 20, 30, 40]);
+    assert_eq!(sockets.prune_out_of_order(3), 3);
+    assert_eq!(fill_gap(&mut iface, &mut sockets, &mut device, (s1, 1234, ack1)), 15);
+}

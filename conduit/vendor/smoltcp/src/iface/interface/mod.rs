@@ -172,9 +172,6 @@ pub struct InterfaceInner {
     ipv4_gateway: Option<Ipv4Address>,
     path_mtus: Option<PathMtus>,
     pub(crate) owned_ipv4: OwnedIpv4,
-    /// The receive buffer pool is under pressure: a TCP socket processing a segment keeps no
-    /// out-of-order data. Set by the driver before ingress.
-    pub(crate) rx_pool_low: bool,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -257,7 +254,6 @@ impl Interface {
                 ipv4_gateway: None,
                 path_mtus: None,
                 owned_ipv4: config.owned_ipv4,
-                rx_pool_low: false,
                 neighbor_cache: NeighborCache::new(config.neighbor_capacity),
                 probe_owed: None,
                 tcp_isn_secret,
@@ -351,14 +347,6 @@ impl Interface {
     /// Path MTUs do not change next hops, so the neighbor cache stays valid.
     pub fn set_path_mtus(&mut self, paths: PathMtus) {
         self.inner.path_mtus = Some(paths);
-    }
-
-    /// Whether the receive buffer pool is under pressure for the ingress that follows. While
-    /// it is, a TCP socket that processes a segment drops its own out-of-order data and stores
-    /// only in-order data, as Linux prunes the receiving socket's out-of-order queue under
-    /// memory pressure; other sockets are untouched.
-    pub fn set_rx_pool_low(&mut self, low: bool) {
-        self.inner.rx_pool_low = low;
     }
 
     /// Replace the owned set of an interface that has no sockets yet: tests only; the set is

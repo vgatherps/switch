@@ -327,6 +327,9 @@ const ACK_DELAY_DEFAULT: Duration = Duration::from_millis(10);
 const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
 const ORPHAN_FIN_WAIT_2_TIMEOUT: Duration = Duration::from_secs(60);
 const ORPHAN_RETRIES: u32 = 8;
+/// Most frames one socket holds past its first gap; an out-of-order segment beyond them is
+/// refused. Each holds one frame of the shared RX pool, so this bounds what one peer pins.
+pub const MAX_OUT_OF_ORDER_VIEWS: usize = 1024;
 
 impl Timer {
     fn new() -> Timer {
@@ -1328,7 +1331,8 @@ impl<'a> Socket<'a> {
         self.rx_buffer.capacity
     }
 
-    /// Return the number of out-of-order segments refused while the shared RX pool is low.
+    /// Return the number of out-of-order segments refused because the socket already held
+    /// `MAX_OUT_OF_ORDER_VIEWS` frames past its first gap.
     pub fn rx_refused_segments(&self) -> u32 {
         self.rx_refused_segments
     }
@@ -1563,17 +1567,20 @@ impl<'a> Socket<'a> {
         self.rx_buffer.store.clear();
     }
 
-    /// Drop received data past the first gap, frames and a FIN alike; in-order data stays.
-    /// Called for every segment while the RX pool is low: with nothing out of order it only
-    /// clears a FIN past a gap, and otherwise visits only the dropped views. Kept out of line
-    /// so the segment path's code stays as it was.
-    #[cold]
-    #[inline(never)]
-    fn prune_out_of_order(&mut self) {
-        self.rx_fin_seq = None;
-        if self.rx_buffer.store.out_of_order_span() != 0 {
-            self.rx_buffer.store.drop_out_of_order();
+    /// Frames held past the first gap.
+    pub(crate) fn out_of_order_views(&self) -> usize {
+        self.rx_buffer.store.out_of_order_views()
+    }
+
+    /// Release up to `limit` frames held past the first gap, the farthest from the in-order
+    /// data first, and return how many; in-order data stays. A FIN past the gap lies beyond all
+    /// that data, so it goes with the first frame released. The peer resends what went.
+    pub(crate) fn prune_out_of_order(&mut self, limit: usize) -> usize {
+        let released = self.rx_buffer.store.drop_out_of_order(limit);
+        if released != 0 {
+            self.rx_fin_seq = None;
         }
+        released
     }
 
     fn set_state(&mut self, state: State) {
@@ -2252,15 +2259,6 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // While the shared RX pool is low, this socket keeps no out-of-order data, as Linux
-        // prunes the receiving socket's out-of-order queue under memory pressure: what it
-        // holds goes now, and an out-of-order segment or FIN is refused below. The peer
-        // resends it; in-order data is still stored, so the gap can fill.
-        let rx_pool_low = cx.rx_pool_low;
-        if rx_pool_low {
-            self.prune_out_of_order();
-        }
-
         // Disregard control flags we don't care about or shouldn't act on yet.
         let mut control = repr.control;
         control = control.quash_psh();
@@ -2308,14 +2306,18 @@ impl<'a> Socket<'a> {
             .in_order_len()
             .checked_add(payload_offset)
             .expect("TCP receive offset overflow");
+        // Each out-of-order view pins one frame of the shared RX pool; past the cap a socket
+        // takes no more out-of-order data, and the peer resends it once the gap fills.
         let decision = if payload.is_empty() {
             None
-        } else if rx_pool_low && payload_offset != 0 {
+        } else if payload_offset != 0
+            && self.rx_buffer.store.out_of_order_views() >= MAX_OUT_OF_ORDER_VIEWS
+        {
             Some(Decision::Refused)
         } else {
             Some(self.rx_buffer.store.decide(offset, payload.len()))
         };
-        let refused = matches!(decision, Some(Decision::Refused)) || (rx_pool_low && out_of_order_fin);
+        let refused = matches!(decision, Some(Decision::Refused));
         if refused {
             // A statistic the peer can drive; it must never panic the stack.
             self.rx_refused_segments = self.rx_refused_segments.saturating_add(1);
@@ -4523,66 +4525,51 @@ mod test {
     }
 
 
-    /// While the RX pool is low, the socket processing a segment drops its own out-of-order
-    /// frames and out-of-order FIN, refuses an out-of-order segment with an ACK at the in-order
-    /// edge, and still stores in-order data. Once the pool recovers it holds out-of-order data
-    /// again, and the resent gap delivers every byte in order.
+    /// Past `MAX_OUT_OF_ORDER_VIEWS` frames held beyond its gap, a socket refuses another
+    /// out-of-order segment with an ACK at the in-order edge, and still stores in-order data;
+    /// once the gap fills, out-of-order data is taken again.
     #[test]
-    fn low_rx_pool_prunes_and_refuses_out_of_order_data() {
-        let mut s = socket_with_scaled_window(2);
-        for index in 1..=3 {
-            receive_window_segment(&mut s, index * 1100, &[index as u8; 1100]);
+    fn out_of_order_views_are_capped_per_socket() {
+        let mut s = socket_established_with_buffer_sizes(64, 4096);
+        for index in 0..MAX_OUT_OF_ORDER_VIEWS {
+            send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(REMOTE_SEQ + 3 + 2 * index).ack(LOCAL_SEQ + 1).data(b"x"));
         }
-        send(&mut s, Instant::from_millis(0), &SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + 4400)
-            .ack(LOCAL_SEQ + 1).data(&[4; 100]));
-        assert_eq!(s.rx_buffer.store.held(), 4);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 3400);
-        assert_eq!(s.rx_fin_seq, Some(REMOTE_SEQ + 1 + 4500));
-
-        s.cx.rx_pool_low = true;
-        let ack = receive_window_segment(&mut s, 5500, &[5; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-        assert_eq!(s.rx_buffer.store.held(), 0);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 0);
-        assert_eq!(s.rx_fin_seq, None);
-        assert_eq!(s.rx_refused_segments(), 1);
-        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
-        assert_eq!(s.rx_buffer.store.held(), 1);
+        assert_eq!(s.rx_refused_segments(), 0);
+        let past = REMOTE_SEQ + 3 + 2 * MAX_OUT_OF_ORDER_VIEWS;
+        let ack = send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(past).ack(LOCAL_SEQ + 1).data(b"y"));
+        assert_eq!(ack.unwrap().ack_number, Some(REMOTE_SEQ + 1));
         assert_eq!(s.rx_refused_segments(), 1);
 
-        s.cx.rx_pool_low = false;
-        let ack = receive_window_segment(&mut s, 2200, &[2; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 1100);
-        let ack = receive_window_segment(&mut s, 1100, &[1; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 3300));
-        assert_eq!(drain_bytes(&mut s), [[0; 1100], [1; 1100], [2; 1100]].concat());
+        // In-order bytes join the first held frame; one frame fewer is out of order.
+        send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(b"ab"));
+        assert_eq!(drain_bytes(&mut s), b"abx");
+        send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(past).ack(LOCAL_SEQ + 1).data(b"y"));
         assert_eq!(s.rx_refused_segments(), 1);
     }
 
-    /// A FIN past a gap arriving while the RX pool is low is refused with its data. Once the
-    /// pool recovers, the gap and the resent FIN deliver every byte and then end of stream.
+    /// Pruning takes the frame farthest from the in-order data first; a FIN past the gap lies
+    /// beyond it and goes with it. Filling the gap then delivers what stayed, and the resent
+    /// FIN ends the stream.
     #[test]
-    fn low_rx_pool_refuses_out_of_order_fin_until_recovery() {
-        let fin = |offset: usize| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + offset).ack(LOCAL_SEQ + 1)
-            .data(&[1; 100]);
+    fn prune_takes_the_farthest_frame_and_the_fin_past_it() {
+        let fin = SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + 3300).ack(LOCAL_SEQ + 1).data(&[3; 100]);
         let mut s = socket_with_scaled_window(2);
-        s.cx.rx_pool_low = true;
-        send(&mut s, Instant::from_millis(0), &fin(1100));
-        assert_eq!(s.rx_fin_seq, None);
-        assert_eq!(s.rx_buffer.store.held(), 0);
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(s.state, State::Established);
+        for index in 1..=2 {
+            receive_window_segment(&mut s, index * 1100, &[index as u8; 1100]);
+        }
+        send(&mut s, Instant::ZERO, &fin);
+        assert_eq!(s.rx_fin_seq, Some(REMOTE_SEQ + 1 + 3400));
 
-        s.cx.rx_pool_low = false;
+        assert_eq!(s.prune_out_of_order(1), 1);
+        assert_eq!(s.rx_fin_seq, None);
         let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
-        send(&mut s, Instant::from_millis(0), &fin(1100));
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 3300));
+        assert_eq!(s.state, State::Established);
+        send(&mut s, Instant::ZERO, &fin);
         assert_eq!(s.state, State::CloseWait);
-        assert_eq!(drain_bytes(&mut s), [&[0; 1100][..], &[1; 100][..]].concat());
+        let expected = [[0; 1100], [1; 1100], [2; 1100]].concat();
+        assert_eq!(drain_bytes(&mut s), [&expected[..], &[3; 100][..]].concat());
         assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
-        assert_eq!(s.rx_refused_segments(), 1);
     }
 
     #[test]

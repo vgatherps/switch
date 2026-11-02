@@ -539,6 +539,34 @@ impl<'a> TcpSet<'a> {
         }
     }
 
+    /// Release `frames` received frames held past a gap, for a receive pool below its low mark:
+    /// the socket holding the most such frames releases them, the farthest from its in-order
+    /// data first, then the next-largest holder, until `frames` are released or no socket holds
+    /// any. Returns how many were released. Each round scans every slot; it runs only when the
+    /// pool is low.
+    #[cold]
+    #[inline(never)]
+    pub fn prune_out_of_order(&mut self, frames: usize) -> usize {
+        let mut released = 0;
+        while released < frames {
+            let largest = self
+                .sockets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, slot)| {
+                    let held = slot.inner.as_ref()?.socket.out_of_order_views();
+                    (held != 0).then_some((held, index))
+                })
+                .max_by_key(|&(held, index)| (held, core::cmp::Reverse(index)));
+            let Some((_, index)) = largest else {
+                break;
+            };
+            let socket = &mut self.sockets[index].inner.as_mut().expect("holder slot is empty").socket;
+            released += socket.prune_out_of_order(frames - released);
+        }
+        released
+    }
+
     /// Removes a socket from the set without changing its state, discarding unread received
     /// bytes and cancelling a frame-pool wait. Returns the frames the application still holds. The
     /// socket itself is dropped, releasing its queued TX frames: handing it out would let a
