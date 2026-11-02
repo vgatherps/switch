@@ -15,7 +15,7 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
 
 use crate::tx::{OVERHEAD, plain_room};
-use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into, send_sealed};
+use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
 
 impl RxFrame for TcpFrame {
     fn payload(&self) -> &[u8] {
@@ -231,6 +231,15 @@ async fn abort(tx: &mut TlsTx<SwitchTx>) {
     }
     tx.shutdown();
     tx.delivered().await;
+}
+
+/// Sends `sealed`, waiting for room of `len` bytes each time it is refused.
+async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usize) -> Result<(), L::Error> {
+    while let Err(s) = lower.try_send(sealed) {
+        sealed = s;
+        lower.room(len).await?;
+    }
+    Ok(())
 }
 
 /// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert

@@ -183,24 +183,25 @@ fn close_notify_ends_sending_only() {
     assert_eq!(received.got[0].plaintext, b"still");
 }
 
-/// `send_close_notify` (what `Tls::close` sends) waits for room for close_notify and the two
-/// KeyUpdates that may precede it, 2 + 22 + 54 = 78 B, not for a full frame: with 77 B free it
-/// waits and nothing goes out; with 78 B it sends, and the server reads the close.
+/// `send_close_notify` (what `Tls::close` sends) seals first and, refused by TCP, waits for room
+/// for the 24 B it sealed (no KeyUpdate due), not for a frame's or a record's worst case: with
+/// 23 B free it waits and nothing goes out; with 24 B it sends, and the server reads the close.
 #[test]
 fn close_notify_waits_only_for_its_own_room() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap();
-    let need = sheath::CLOSE_NOTIFY_LEN + RECORD + 2 * KEY_UPDATE;
-    peer.wire.free.set(Some(need - 1));
+    let sealed = RECORD + 2;
+    peer.wire.refuse.set(1);
+    peer.wire.free.set(Some(sealed - 1));
     {
         let mut closing = std::pin::pin!(peer.tx.send_close_notify());
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(closing.as_mut().poll(&mut cx).is_pending(), "sent with too little room");
         assert!(peer.wire.sent.borrow().is_empty());
-        peer.wire.free.set(Some(need));
+        peer.wire.free.set(Some(sealed));
         assert_eq!(closing.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(())));
     }
-    assert_eq!(peer.wire.sent.borrow().len(), RECORD + 2);
+    assert_eq!(peer.wire.sent.borrow().len(), sealed);
     assert_eq!(peer.deliver().unwrap(), b"");
     assert!(peer.server.process_new_packets().unwrap().peer_has_closed());
 }

@@ -110,10 +110,13 @@ impl<L: FrameTx> TlsTx<L> {
     }
 
     /// Seals close_notify into `f`. Later seals fail with [`TxError::Closed`]; receiving goes on.
-    pub fn close_notify(
-        &mut self,
-        mut f: L::Frame,
-    ) -> Result<Sealed<L::Sealed>, TxError<L::Error>> {
+    pub fn close_notify(&mut self, mut f: L::Frame) -> Result<Sealed<L::Sealed>, TxError<L::Error>> {
+        let n = self.write_close_notify(&mut f)?;
+        self.finish(f, n)
+    }
+
+    /// Encrypts close_notify (behind any KeyUpdates due) into `f`; the bytes written.
+    fn write_close_notify(&mut self, f: &mut L::Frame) -> Result<usize, TxError<L::Error>> {
         self.check_sent()?;
         let (head, room) = self.lower.plain();
         let mut traffic = self.write_traffic()?;
@@ -121,16 +124,21 @@ impl<L: FrameTx> TlsTx<L> {
             .queue_close_notify(&mut f.room_mut()[head..head + room])
             .expect("a frame fits a close_notify record");
         self.state = State::Closed;
-        self.finish(f, n)
+        Ok(n)
     }
 
-    /// Seals close_notify and sends it, waiting for room for it (and the KeyUpdates that may
-    /// precede it) only, not for a full frame. Later seals fail with [`TxError::Closed`].
+    /// Seals close_notify, then sends it, waiting while TCP refuses it for room for the bytes
+    /// sealed (24 B, more only with KeyUpdates in front), not for a full frame. Later seals fail
+    /// with [`TxError::Closed`].
     pub async fn send_close_notify(&mut self) -> Result<(), TxError<L::Error>> {
-        let f = self.alloc().await?;
-        self.room(CLOSE_NOTIFY_LEN).await?;
-        let sealed = self.close_notify(f)?;
-        crate::send_sealed(self, sealed, CLOSE_NOTIFY_LEN).await
+        let mut f = self.alloc().await?;
+        let n = self.write_close_notify(&mut f)?;
+        let mut sealed = self.finish(f, n)?;
+        while let Err(s) = self.try_send(sealed) {
+            sealed = s;
+            self.lower.room(n).await.map_err(TxError::Lower)?;
+        }
+        Ok(())
     }
 
     /// Stops sending after a receive error.

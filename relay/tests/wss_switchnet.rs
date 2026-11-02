@@ -1309,6 +1309,25 @@ fn tls_minimum_zero_or_overflowing_is_refused_before_any_byte() {
     }
 }
 
+/// The smallest send buffer `tls_connect` accepts, 77 B (one byte of plaintext per record): the
+/// handshake completes and `close` sends close_notify and FIN, which the server reads as a clean
+/// end.
+#[zhida_test_support::pinned_test]
+fn tls_close_works_with_the_smallest_send_buffer() {
+    use sheath::switchnet::tls_connect;
+    let (server_tls, client_tls) = tls_configs();
+    until_client_on(
+        &tap_with_send_buffer(77),
+        |_| {},
+        move |sock| assert_close_notify_then_fin(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), sock)),
+        move |handle, stream| async move {
+            let mut tls = tls_connect(&handle, stream, client_tls, HOST, 1).await.expect("handshake");
+            tls.close().await.expect("close");
+            tls
+        },
+    );
+}
+
 /// The TLS configs with the client's `max_fragment_size` set.
 fn tls_configs_with_fragment(max_fragment_size: usize) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let (server, client) = tls_configs();
