@@ -104,6 +104,20 @@ fn close(code: u16, reason: &[u8]) -> Vec<u8> {
     encode(fin(CLOSE), None, &p)
 }
 
+/// `max_message` limits data frames only: with a 1-byte limit a 2-byte Ping is answered, a
+/// Pong is taken, and a Close with status 1000 closes, while a 2-byte Binary fails.
+#[test]
+fn control_frames_are_not_held_to_max_message() {
+    let cfg = Config::new(Role::Client, Limits { max_message: 1, ..Limits::default() });
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(fin(PING), None, b"ab"), encode(fin(PONG), None, b"cd")]);
+    assert_eq!((run.end, run.pong), (None, Some(b"ab".to_vec())));
+    let mut r = WsRx::new(Raw::new(), cfg);
+    assert_eq!(feed(&mut r, &[close(1000, b"")]).end, Some(WsError::Closed));
+    assert_eq!(r.peer_close(), Some(&1000u16.to_be_bytes()[..]));
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(fin(BINARY), None, b"xy")]);
+    assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
+}
+
 #[test]
 fn close_frames() {
     for code in [1000, 1003, 1007, 1013, 1014, 3000, 4999] {

@@ -302,7 +302,9 @@ impl Core {
         if !h.minimal {
             return Err(ProtocolError::NonMinimalLength);
         }
-        if h.len > self.max_message as u64 {
+        // a data frame passing the message limit; control frames have their own 125 B limit
+        let data = matches!(op, Op::Cont | Op::Text | Op::Binary);
+        if data && h.len > self.max_message as u64 {
             return Err(ProtocolError::MessageTooBig);
         }
         let len = h.len as usize;
