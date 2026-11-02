@@ -13,7 +13,7 @@
 //!    the frame's room, then `set_len`.
 //! 3. enqueue: `send_slice` through `tcp_mut`, or `Stack::tcp_send_frame`.
 //! 4. emit: one `Stack::send` per write, including its flush; each must
-//!    send exactly one frame.
+//!    send exactly one frame (mss536: one send for all writes).
 //! 5. ack: one `Stack::receive` that takes all `depth / batch` injected ACKs,
 //!    each acknowledging `batch` more segments, the last all of them.
 //! 6. reclaim: the TX ring consumer takes every sent frame off A's TX ring
@@ -44,6 +44,10 @@
 //! - `cut/slice/1448`: B's window stays 724 bytes, so one 1448-byte write
 //!   leaves as two 724-byte segments, each a window-limited emit followed by
 //!   reclaim and an ACK reopening 724 bytes. Throughput element: 2 segments.
+//! - `mss536/frame/1460/d8`: both sockets cap the MSS at 536. 8 1460-byte
+//!   frames are queued, then one send cuts them into 22 segments: 536 bytes
+//!   each, some inside one frame and some spanning two, then 424; one ACK
+//!   takes them all. Throughput element: one segment.
 //! - `rto/slice/<write>`: depth 1; the emitted frame is freed unforwarded,
 //!   then A runs `receive` at its `poll_at` deadlines until a `send` emits the
 //!   retransmission. `retransmit` times that `send`; `send` calls at early
@@ -66,7 +70,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use dpdk_smoltcp::smoltcp::socket::tcp::State;
+use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::Instant as SmolInstant;
 use dpdk_smoltcp::smoltcp::wire::{
     IpEndpoint, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, ETHERNET_HEADER_LEN,
@@ -77,7 +81,7 @@ use dpdk_smoltcp::{
 };
 
 use zhida_test_kit::pair::{
-    self, establish_sized, pattern, segment, tcp_frame, tcp_socket_sized, Dir, Pair, Side,
+    self, establish_with, pattern, segment, tcp_frame, tcp_socket_sized, Dir, Pair, Side,
     BUDGET, CLIENT_PORT, IDLE_ROUNDS, MAX_ROUNDS, SERVER_PORT, T0,
 };
 use zhida_test_kit::with_eal;
@@ -91,6 +95,8 @@ const CUT_WINDOW: usize = 724;
 const CUT_BUFFER: usize = 4096;
 /// TCP payload per segment at IP MTU 1500: the socket's frame unit.
 const SEGMENT: usize = 1460;
+/// The MSS both sockets cap at in the mss536 cases.
+const PEER_MSS: usize = 536;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Api {
@@ -106,6 +112,8 @@ enum Path {
     Cut,
     /// One write, one RTO retransmission.
     Rto,
+    /// `depth` writes, one send cut at `PEER_MSS`, one ACK.
+    Mss { depth: usize },
 }
 
 #[derive(Clone, Copy)]
@@ -166,12 +174,13 @@ impl Case {
             }
             Path::Cut => format!("cut/{api}/{}", self.write),
             Path::Rto => format!("rto/{api}/{}", self.write),
+            Path::Mss { depth } => format!("mss{PEER_MSS}/{api}/{}/d{depth}", self.write),
         }
     }
 
     fn depth(self) -> usize {
         match self.path {
-            Path::Queue { depth, .. } => depth,
+            Path::Queue { depth, .. } | Path::Mss { depth } => depth,
             Path::Cut | Path::Rto => 1,
         }
     }
@@ -180,6 +189,7 @@ impl Case {
     fn segments(self) -> usize {
         match self.path {
             Path::Cut => 2,
+            Path::Mss { depth } => (self.write * depth).div_ceil(PEER_MSS),
             _ => self.depth(),
         }
     }
@@ -197,6 +207,13 @@ impl Case {
             Path::Cut => CUT_WINDOW,
             _ => self.buffer(),
         }
+    }
+
+    /// Both sockets' config.
+    fn socket(self) -> tcp::Config {
+        let mss_cap = matches!(self.path, Path::Mss { .. })
+            .then(|| u16::try_from(PEER_MSS).expect("MSS fits u16"));
+        tcp::Config { mss_cap, ..tcp_socket_sized(self.buffer()) }
     }
 
     fn phases(self) -> impl Iterator<Item = Phase> {
@@ -275,6 +292,8 @@ struct Bench {
     client: TcpHandle,
     case: Case,
     payload: Vec<u8>,
+    /// The bytes one iteration sends: `payload` once per write.
+    stream: Vec<u8>,
     app: Vec<u8>,
     /// A's next data sequence number.
     a_next: TcpSeqNumber,
@@ -299,16 +318,16 @@ fn fill_tcp_checksum(frame: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// `establish_sized` (A connects, `size`-byte buffers) for an A Port with
+/// `establish_with` (A connects, both sockets `socket`) for an A Port with
 /// the forced TX TCP checksum profile: net_ring leaves A's TCP checksums
 /// unfilled, so each A frame goes to B with `fill_tcp_checksum`. Rounds at
 /// the Pair's time until both sockets are Established and a round moves
 /// nothing. Returns the handles and every delivered frame, as
-/// `establish_sized` does.
-fn establish_filled(pair: &mut Pair, size: usize) -> ([TcpHandle; 2], Vec<(Dir, Vec<u8>)>) {
-    let server = pair.b.add_tcp(tcp_socket_sized(size)).unwrap();
+/// `establish_with` does.
+fn establish_filled(pair: &mut Pair, socket: tcp::Config) -> ([TcpHandle; 2], Vec<(Dir, Vec<u8>)>) {
+    let server = pair.b.add_tcp(socket).unwrap();
     pair.b.listen(&server, SERVER_PORT).unwrap();
-    let client = pair.a.add_tcp(tcp_socket_sized(size)).unwrap();
+    let client = pair.a.add_tcp(socket).unwrap();
     pair.a
         .connect(&client, IpEndpoint::new(Side::B.ip().into(), SERVER_PORT), CLIENT_PORT)
         .unwrap();
@@ -338,7 +357,7 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
         rx_staging: usize::from(BURST),
         ..pair::config(side)
     });
-    let buffer = case.buffer();
+    let socket = case.socket();
     let mut pair = Pair::with_opened_ports(
         eal,
         [&names[0], &names[1]],
@@ -349,16 +368,17 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
             port.rx_burst = BURST;
             port.tx_burst = BURST;
             port.tx_pool.count = TX_POOL;
-            // The frame reserve, the full-sized-segment estimate for the socket,
-            // and the one frame the application holds between allocate and enqueue.
-            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [buffer])) + 1;
+            let mtu = usize::from(port.mtu);
+            // The frame reserve, the socket's frame limit and the one frame
+            // the application holds between allocate and enqueue.
+            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), tcp::tx_mbuf_budget(&socket, mtu)) + 1;
             // A's RX pool also holds up to RING - 1 injected ACKs.
             port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
                 port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
-            ), zhida_test_kit::pair::windows(port.mtu, [buffer])) + RING;
+            ), zhida_test_kit::pair::windows(port.mtu, [case.buffer()])) + RING;
         },
         |side, port| {
             if side == Side::A && case.offload {
@@ -367,9 +387,9 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
         },
     );
     let (handles, frames) = if case.offload {
-        establish_filled(&mut pair, buffer)
+        establish_filled(&mut pair, socket)
     } else {
-        establish_sized(&mut pair, Side::A, buffer)
+        establish_with(&mut pair, Side::A, socket)
     };
     // establish can return with a B→A frame still on A's RX ring (seen with
     // 370688-byte buffers); deliver everything before priming the window.
@@ -399,6 +419,7 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
         client,
         case,
         payload: pattern(case.write, 7),
+        stream: pattern(case.write, 7).repeat(case.depth()),
         app: vec![0; case.write],
         a_next: handshake_ack.seq_number,
         b_seq,
@@ -431,11 +452,11 @@ fn assert_receive(turn: Turn, received: usize, case: Case, step: &str) {
     );
 }
 
-fn assert_one_sent(sent: Sent, case: Case, step: &str) {
+fn assert_sent(sent: Sent, count: usize, case: Case, step: &str) {
     assert_eq!(
         sent,
         Sent {
-            tx_accepted: 1,
+            tx_accepted: count,
             tx_pending: 0,
         },
         "{} {step}",
@@ -495,32 +516,34 @@ impl Bench {
         }
     }
 
-    /// Phase 4: one `Stack::send` that must send one frame.
-    fn emit(&mut self, times: &mut Times) {
+    /// Phase 4: one `Stack::send` that must send `count` frames.
+    fn emit(&mut self, times: &mut Times, count: usize) {
         let sent = times.time(Phase::Emit, || self.pair.a.send());
-        assert_one_sent(sent.unwrap(), self.case, "emit");
+        assert_sent(sent.unwrap(), count, self.case, "emit");
     }
 
     /// Phase 6: take A's sent frames off its TX ring and free them.
-    /// `expected` holds each frame's sequence number and payload range;
-    /// with `checks`, every frame is parsed against it, untimed.
-    fn reclaim(&mut self, times: &mut Times, expected: &[(TcpSeqNumber, Range<usize>)], checks: bool) {
+    /// `expected` holds each frame's sequence number, range of `stream` and
+    /// flags; with `checks`, every frame is parsed against it, untimed.
+    fn reclaim(
+        &mut self,
+        times: &mut Times,
+        expected: &[(TcpSeqNumber, Range<usize>, TcpControl)],
+        checks: bool,
+    ) {
         let count = if checks {
-            let (payload, b_seq, offload) = (&self.payload, self.b_seq, self.case.offload);
+            let (stream, b_seq, offload) = (&self.stream, self.b_seq, self.case.offload);
             let mut frames = expected.iter();
             self.pair.drain_tx(Side::A, |frame| {
-                let (seq, range) = frames.next().expect("extra A frame");
+                let (seq, range, control) = frames.next().expect("extra A frame");
                 let filled = if offload { fill_tcp_checksum(frame) } else { frame.to_vec() };
                 let tcp = segment(&filled, Side::A);
                 assert_eq!(frame.len(), DATA_HEADERS + range.len(), "A frame length");
                 assert_eq!((tcp.src_port, tcp.dst_port), (CLIENT_PORT, SERVER_PORT));
-                // PSH marks the segment that empties the send queue.
-                let control =
-                    if range.end == payload.len() { TcpControl::Psh } else { TcpControl::None };
-                assert_eq!(tcp.control, control, "A frame control");
+                assert_eq!(tcp.control, *control, "A frame control");
                 assert_eq!(tcp.seq_number, *seq);
                 assert_eq!(tcp.ack_number, Some(b_seq));
-                assert_eq!(tcp.payload, &payload[range.clone()]);
+                assert_eq!(tcp.payload, &stream[range.clone()]);
             })
         } else {
             let pair = &self.pair;
@@ -555,7 +578,7 @@ impl Bench {
                 assert_eq!(sent.tx_pending, 0);
                 continue;
             }
-            assert_one_sent(sent, self.case, "retransmit");
+            assert_sent(sent, 1, self.case, "retransmit");
             if times.phases() {
                 times.add(Phase::Retransmit, elapsed);
             }
@@ -577,13 +600,16 @@ impl Bench {
         let mut times = Times::new(timing);
         let write = self.case.write;
         let start = self.a_next;
+        // PSH marks the segment that empties the send queue.
         let last_acks = match self.case.path {
             Path::Queue { depth, batch } => {
                 for _ in 0..depth {
                     self.write(&mut times);
-                    self.emit(&mut times);
+                    self.emit(&mut times, 1);
                 }
-                let expected: Vec<_> = (0..depth).map(|i| (start + i * write, 0..write)).collect();
+                let expected: Vec<_> = (0..depth)
+                    .map(|i| (start + i * write, i * write..(i + 1) * write, TcpControl::Psh))
+                    .collect();
                 self.reclaim(&mut times, &expected, checks);
                 Self::build_acks(&mut times, || {
                     (1..=depth / batch)
@@ -594,21 +620,39 @@ impl Bench {
             Path::Cut => {
                 let half = start + CUT_WINDOW;
                 self.write(&mut times);
-                self.emit(&mut times);
-                self.reclaim(&mut times, &[(start, 0..CUT_WINDOW)], checks);
+                self.emit(&mut times, 1);
+                self.reclaim(&mut times, &[(start, 0..CUT_WINDOW, TcpControl::None)], checks);
                 let first = Self::build_acks(&mut times, || vec![self.ack_frame(half, self.case.window())]);
                 self.ack(&mut times, &first);
-                self.emit(&mut times);
-                self.reclaim(&mut times, &[(half, CUT_WINDOW..write)], checks);
+                self.emit(&mut times, 1);
+                self.reclaim(&mut times, &[(half, CUT_WINDOW..write, TcpControl::Psh)], checks);
                 Self::build_acks(&mut times, || vec![self.ack_frame(start + write, self.case.window())])
             }
             Path::Rto => {
                 self.write(&mut times);
-                self.emit(&mut times);
-                self.reclaim(&mut times, &[(start, 0..write)], checks);
+                self.emit(&mut times, 1);
+                self.reclaim(&mut times, &[(start, 0..write, TcpControl::Psh)], checks);
                 self.retransmit(&mut times);
-                self.reclaim(&mut times, &[(start, 0..write)], checks);
+                self.reclaim(&mut times, &[(start, 0..write, TcpControl::Psh)], checks);
                 vec![self.ack_frame(start + write, self.case.window())]
+            }
+            Path::Mss { depth } => {
+                for _ in 0..depth {
+                    self.write(&mut times);
+                }
+                let segments = self.case.segments();
+                self.emit(&mut times, segments);
+                let total = depth * write;
+                let expected: Vec<_> = (0..segments)
+                    .map(|k| {
+                        let range = k * PEER_MSS..total.min((k + 1) * PEER_MSS);
+                        let control =
+                            if range.end == total { TcpControl::Psh } else { TcpControl::None };
+                        (start + range.start, range, control)
+                    })
+                    .collect();
+                self.reclaim(&mut times, &expected, checks);
+                Self::build_acks(&mut times, || vec![self.ack_frame(start + total, self.case.window())])
             }
         };
         self.ack(&mut times, &last_acks);
@@ -661,6 +705,7 @@ fn cases() -> Vec<Case> {
     for write in [64, 1448] {
         cases.push(Case { api: Api::Slice, write, path: Path::Rto, offload: false });
     }
+    cases.push(Case { api: Api::Frame, write: SEGMENT, path: Path::Mss { depth: 8 }, offload: false });
     cases
 }
 

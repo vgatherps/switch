@@ -1410,8 +1410,8 @@ impl<'a> Socket<'a> {
         if !self.may_send() {
             return Err(SendError::InvalidState);
         }
-        debug_assert!(self.max_segment_payload().is_some(), "sendable TCP socket is not synchronized");
-        let frame_payload = self.tx_seg_bytes as usize;
+        // One segment per frame, so each goes out whole when the window allows.
+        let frame_payload = self.max_segment_payload().expect("sendable TCP socket is not synchronized");
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
@@ -3163,6 +3163,12 @@ impl<'a> Socket<'a> {
                     {
                         payload_len = frame.len();
                         whole_frame = Some((index, frame));
+                    } else if !self.tx_queue.segment_spans_frames(offset, segment_size)
+                        && let Seg::Cut(bytes) = self.tx_queue.segment(offset, segment_size)
+                    {
+                        // A cut inside one frame is borrowed, as fast retransmit does above.
+                        repr.payload = bytes;
+                        payload_len = bytes.len();
                     } else if segment_size != 0 {
                         self.tx_queue
                             .copy_segment(offset, segment_size, &mut coalesced_payload);
@@ -5037,8 +5043,11 @@ mod test {
         assert_eq!(s.tx_queue.frames(), 65536usize.div_ceil(1460));
     }
 
+    /// With a peer MSS below the local segment payload, `send_slice` still takes the whole
+    /// byte capacity, in frames of one peer segment each, so every segment leaves as its own
+    /// frame without a copy.
     #[test]
-    fn frame_peer_mss_below_local_payload_keeps_byte_capacity() {
+    fn frame_peer_mss_below_local_payload_sends_whole_frames() {
         let source = crate::tests::tx_test_source(1460);
         let mut s = frame_socket(8192, 1460, source);
         s.remote_mss = 536;
@@ -5051,12 +5060,12 @@ mod test {
             let end = offset.checked_add(536).unwrap().min(bytes.len());
             assert_eq!(actual_seq, LOCAL_SEQ + 1 + offset);
             assert_eq!(payload, bytes[offset..end]);
-            assert!(!whole);
+            assert!(whole);
         }
     }
 
     #[test]
-    fn frame_peer_mss_cuts_across_local_send_slice_frames_like_ring() {
+    fn frame_peer_mss_sizes_send_slice_frames() {
         let source = crate::tests::tx_test_source(1460);
         let mut s = frame_socket(4380, 1460, source);
         s.remote_mss = 1024;
@@ -5068,7 +5077,7 @@ mod test {
             let (_, seq, payload, whole) = emit_frame_segment(&mut s);
             assert_eq!(seq, LOCAL_SEQ + 1 + offset);
             assert_eq!(payload, bytes[offset..offset + len]);
-            assert!(!whole);
+            assert!(whole);
         }
     }
 
