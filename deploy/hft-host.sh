@@ -257,7 +257,7 @@ step_config() {
 
 cmdline_args() {
     args="isolcpus=managed_irq,domain,$ISOLATED nohz_full=$ISOLATED rcu_nocbs=$ISOLATED"
-    args="$args irqaffinity=$HOUSEKEEPING transparent_hugepage=madvise hugepagesz=2M hugepages=$NUMA_NODE:$HUGEPAGES ena.phc_enable=1"
+    args="$args irqaffinity=$HOUSEKEEPING transparent_hugepage=madvise hugepagesz=2M hugepages=$NUMA_NODE:$HUGEPAGES"
     [ "$(uname -m)" = x86_64 ] && args="$args clocksource=tsc"
     echo "$args"
 }
