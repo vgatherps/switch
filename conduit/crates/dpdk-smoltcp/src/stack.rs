@@ -514,9 +514,8 @@ impl Stack {
     fn egress(&mut self) -> Result<usize, StackError> {
         // Every pass that continues the loop queued a frame into the
         // fixed-capacity pending queue, so at most capacity + 1 passes run. A
-        // pass can report a change without queueing anything: smoltcp drops an
-        // IPv4 packet larger than the IP MTU without using the TX token, and a
-        // socket may then want the same send again at this time.
+        // pass can report a change without queueing anything, and a socket may
+        // then want the same send again at this time.
         // Stop after a send when the next pass would do nothing.
         loop {
             let pending = self.device.pending();
