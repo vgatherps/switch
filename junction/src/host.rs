@@ -3,6 +3,7 @@
 //! Poll passes read one chunk per connection. Terminal handling snapshots and drains only
 //! already-readable control bytes. FIFO completion survives control disconnects, and network
 //! retirement keeps flushing queued events and End(Finished) before closing.
+//! Protocol errors and kicks always abort, even after FIFO completion.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -39,6 +40,7 @@ pub enum ToNetwork {
 pub enum EndHow {
     Graceful,
     Lost,
+    Abort,
 }
 
 #[derive(Debug)]
@@ -163,7 +165,7 @@ impl HostControl {
         let mut pollfds = Vec::new();
         loop {
             self.drain_network();
-            self.drain_retire()?;
+            self.drain_retire();
             if self.shutdown {
                 for connection in &mut self.connections {
                     if matches!(
@@ -236,8 +238,11 @@ impl HostControl {
                     self.disconnect(index);
                     continue;
                 }
-                if reading && revents & libc::POLLIN != 0 && !self.read(index, false)? {
-                    self.remove(index, true);
+                if reading
+                    && revents & libc::POLLIN != 0
+                    && let Some(how) = self.read(index, false)?
+                {
+                    self.remove(index, Some(how));
                     continue;
                 }
                 if self.shutdown {
@@ -248,7 +253,7 @@ impl HostControl {
             for index in (0..self.connections.len()).rev() {
                 if matches!(self.connections[index].phase, Phase::Pending(since) if since.elapsed() >= self.config.hello_timeout)
                 {
-                    self.remove(index, true);
+                    self.remove(index, Some(EndHow::Lost));
                 }
             }
         }
@@ -282,7 +287,7 @@ impl HostControl {
     }
 
     // Terminal handling snapshots readable bytes; later writes cannot prolong the drain.
-    fn read(&mut self, index: usize, drain: bool) -> io::Result<bool> {
+    fn read(&mut self, index: usize, drain: bool) -> io::Result<Option<EndHow>> {
         let mut remaining = if drain {
             let mut available: libc::c_int = 0;
             // SAFETY: the descriptor is owned and available is writable for one integer.
@@ -305,29 +310,19 @@ impl HostControl {
             let length = remaining.min(chunk.len());
             match self.connections[index].socket.read(&mut chunk[..length]) {
                 // Finished already committed the drain; losing control cannot abort it.
-                Ok(0) => {
-                    if !drain {
-                        self.read(index, true)?;
-                    }
-                    return Ok(drain);
-                }
+                Ok(0) => return Ok(if drain { None } else { Some(EndHow::Lost) }),
                 Ok(n) => {
                     remaining -= n;
                     self.connections[index].input.extend_from_slice(&chunk[..n]);
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     if drain {
                         continue;
                     }
-                    return Ok(true);
+                    return Ok(None);
                 }
-                Err(_) => {
-                    if !drain {
-                        self.read(index, true)?;
-                    }
-                    return Ok(drain);
-                }
+                Err(_) => return Ok(Some(EndHow::Lost)),
             }
             loop {
                 let (message, used) = match ClientMessage::decode(&self.connections[index].input) {
@@ -335,7 +330,7 @@ impl HostControl {
                     Ok(None) => break,
                     Err(_) => {
                         self.connections[index].end(EndReason::ProtocolError);
-                        return Ok(false);
+                        return Ok(Some(EndHow::Abort));
                     }
                 };
                 self.connections[index].input.drain(..used);
@@ -350,7 +345,7 @@ impl HostControl {
                         self.hello(index, version, max_sockets)?;
                         if self.shutdown || matches!(self.connections[index].phase, Phase::Rejected)
                         {
-                            return Ok(true);
+                            return Ok(None);
                         }
                     }
                     (
@@ -371,20 +366,20 @@ impl HostControl {
                             .is_err()
                         {
                             self.shutdown = true;
-                            return Ok(true);
+                            return Ok(None);
                         }
                     }
                     _ => {
                         self.connections[index].end(EndReason::ProtocolError);
-                        return Ok(false);
+                        return Ok(Some(EndHow::Abort));
                     }
                 }
             }
             if !drain {
-                return Ok(true);
+                return Ok(None);
             }
         }
-        Ok(true)
+        Ok(None)
     }
 
     fn hello(&mut self, index: usize, version: u16, max_sockets: u16) -> io::Result<()> {
@@ -448,7 +443,7 @@ impl HostControl {
         })
     }
 
-    fn remove(&mut self, index: usize, lost: bool) {
+    fn remove(&mut self, index: usize, how: Option<EndHow>) {
         let connection = self.connections.swap_remove(index);
         if let Phase::Live { session, .. } | Phase::Retiring { session } = connection.phase {
             drop(connection.socket);
@@ -462,14 +457,11 @@ impl HostControl {
             {
                 self.shutdown = true;
             }
-            if lost
+            if let Some(how) = how
                 && self
                     .channels
                     .to_network
-                    .send(ToNetwork::End {
-                        session,
-                        how: EndHow::Lost,
-                    })
+                    .send(ToNetwork::End { session, how })
                     .is_err()
             {
                 self.shutdown = true;
@@ -479,6 +471,7 @@ impl HostControl {
     }
 
     fn disconnect(&mut self, index: usize) {
+        let mut how = EndHow::Lost;
         if matches!(
             self.connections[index].phase,
             Phase::Live {
@@ -486,10 +479,12 @@ impl HostControl {
                 ..
             }
         ) {
-            // Preserve operations written before the control connection was lost.
-            let _ = self.read(index, true);
+            // A decoded protocol error must abort even if FIFO completion raced this HUP.
+            if let Ok(Some(EndHow::Abort)) = self.read(index, true) {
+                how = EndHow::Abort;
+            }
         }
-        self.remove(index, true);
+        self.remove(index, Some(how));
     }
 
     fn flush(&mut self, index: usize) {
@@ -500,7 +495,7 @@ impl HostControl {
                 Phase::Rejected | Phase::Retiring { .. }
             ) && self.connections[index].output.is_empty())
         {
-            self.remove(index, !retiring);
+            self.remove(index, (!retiring).then_some(EndHow::Lost));
         }
     }
 
@@ -523,7 +518,7 @@ impl HostControl {
                 FromNetwork::ProtocolError { session } => {
                     if let Some(index) = self.find(session) {
                         self.connections[index].end(EndReason::ProtocolError);
-                        self.remove(index, true);
+                        self.remove(index, Some(EndHow::Abort));
                     }
                 }
                 FromNetwork::Retired { session } => {
@@ -542,7 +537,7 @@ impl HostControl {
         }
     }
 
-    fn drain_retire(&mut self) -> io::Result<()> {
+    fn drain_retire(&mut self) {
         while !self.shutdown {
             let message = match self.channels.retire.try_recv() {
                 Ok(message) => message,
@@ -562,7 +557,7 @@ impl HostControl {
             match message {
                 Retire::Kicked { .. } => {
                     self.connections[index].end(EndReason::Kicked);
-                    self.remove(index, true);
+                    self.remove(index, Some(EndHow::Abort));
                 }
                 Retire::Finished { .. } => {
                     if matches!(
@@ -575,9 +570,16 @@ impl HostControl {
                         // The client wrote these bytes before pushing the end record, and
                         // the network thread consumed that record before sending Finished.
                         // Its preceding control bytes are therefore already readable.
-                        if !self.read(index, true)? {
-                            self.remove(index, true);
-                            continue;
+                        match self.read(index, true) {
+                            Ok(None) => {}
+                            Ok(Some(how)) => {
+                                self.remove(index, Some(how));
+                                continue;
+                            }
+                            Err(_) => {
+                                self.remove(index, Some(EndHow::Lost));
+                                continue;
+                            }
                         }
                         if self.shutdown {
                             break;
@@ -602,7 +604,6 @@ impl HostControl {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -621,6 +622,7 @@ mod tests {
         retire: Sender<Retire>,
         _events: Sender<FromNetwork>,
         _fifo: Receiver<Control>,
+        _path: FixturePath,
     }
 
     impl Fixture {
@@ -666,6 +668,7 @@ mod tests {
                 output: Vec::new(),
                 written: 0,
             });
+            let path = FixturePath(host.config.socket_path.clone());
             Self {
                 host,
                 client: Some(client),
@@ -673,6 +676,7 @@ mod tests {
                 retire,
                 _events: events,
                 _fifo: fifo,
+                _path: path,
             }
         }
 
@@ -693,9 +697,11 @@ mod tests {
         }
     }
 
-    impl Drop for Fixture {
+    struct FixturePath(PathBuf);
+
+    impl Drop for FixturePath {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.host.config.socket_path);
+            let _ = std::fs::remove_file(&self.0);
         }
     }
 
@@ -707,7 +713,7 @@ mod tests {
             .retire
             .send(Retire::Finished { slot: 0, uid: 1 })
             .unwrap();
-        fixture.host.drain_retire().unwrap();
+        fixture.host.drain_retire();
         for generation in 0..count as u32 {
             assert!(matches!(
                 fixture.network.try_recv().unwrap(),
@@ -739,7 +745,7 @@ mod tests {
             .retire
             .send(Retire::Finished { slot: 0, uid: 1 })
             .unwrap();
-        fixture.host.drain_retire().unwrap();
+        fixture.host.drain_retire();
         assert!(matches!(
             fixture.network.try_recv().unwrap(),
             ToNetwork::Op { session, op: Op::ShutdownTcp { id: actual } }
@@ -772,10 +778,10 @@ mod tests {
             .retire
             .send(Retire::Finished { slot: 0, uid: 1 })
             .unwrap();
-        fixture.host.drain_retire().unwrap();
+        fixture.host.drain_retire();
         assert!(matches!(
             fixture.network.try_recv().unwrap(),
-            ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+            ToNetwork::End { session, how: EndHow::Abort } if session == pack(0, 1)
         ));
         assert!(fixture.host.connections.is_empty());
         let mut bytes = [0; 9];
@@ -795,13 +801,13 @@ mod tests {
     fn normal_read_handles_only_one_chunk() {
         let mut fixture = Fixture::new();
         let count = fixture.write_ops();
-        assert!(fixture.host.read(0, false).unwrap());
+        assert!(fixture.host.read(0, false).unwrap().is_none());
         let first = fixture.network.try_iter().count();
         assert!(
             first > 0 && first < count,
             "one pass must not drain the socket"
         );
-        assert!(fixture.host.read(0, false).unwrap());
+        assert!(fixture.host.read(0, false).unwrap().is_none());
         assert_eq!(first + fixture.network.try_iter().count(), count);
     }
 
@@ -826,5 +832,60 @@ mod tests {
         ));
         assert!(fixture.network.try_recv().is_err());
         assert!(fixture.host.connections.is_empty());
+    }
+
+    #[test]
+    fn terminal_ioctl_failure_loses_connection_without_stopping_host() {
+        let mut fixture = Fixture::new();
+        // An owned non-socket descriptor deterministically rejects FIONREAD.
+        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        fixture.host.connections[0].socket = fd.into();
+        fixture
+            .retire
+            .send(Retire::Finished { slot: 0, uid: 1 })
+            .unwrap();
+        let Fixture {
+            host,
+            network,
+            retire: _retire,
+            _events: events,
+            _fifo: fifo,
+            _path,
+            ..
+        } = fixture;
+        let (finished, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || finished.send(host.run()).unwrap());
+        assert!(matches!(
+            network.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+        ));
+        assert_eq!(
+            fifo.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Control::Close { slot: 0, uid: 1 }
+        );
+        assert!(
+            done.try_recv().is_err(),
+            "one failed ioctl must not stop the host"
+        );
+        drop(events);
+        done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn normal_eof_and_read_errors_do_not_retry_terminal_ioctl() {
+        for readable in [true, false] {
+            let mut fixture = Fixture::new();
+            // Read-only /dev/null returns EOF; write-only /dev/null rejects read.
+            // Neither supports FIONREAD, so an unnecessary terminal retry would fail.
+            let file = std::fs::OpenOptions::new()
+                .read(readable)
+                .write(!readable)
+                .open("/dev/null")
+                .unwrap();
+            let fd: std::os::fd::OwnedFd = file.into();
+            fixture.host.connections[0].socket = fd.into();
+            assert_eq!(fixture.host.read(0, false).unwrap(), Some(EndHow::Lost));
+        }
     }
 }

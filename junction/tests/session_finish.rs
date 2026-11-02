@@ -317,29 +317,85 @@ fn shutdown_after_finish_panics_before_id_validation() {
     });
 }
 
-#[test]
-#[should_panic(expected = "socket operation after successful Session::finish()")]
-fn close_after_finish_panics_before_id_validation() {
-    let (_host, mut client) = RawHost::connect();
+fn assert_cleanup_after_finish(cleanup: fn(&mut Session, SocketId)) {
+    let (mut host, mut client) = RawHost::connect();
     client.finish().unwrap();
-    client.close(
+    assert_eq!(host.end_records(), 1);
+    let ids = [
+        SocketId {
+            slot: 0,
+            generation: 0,
+        },
+        SocketId {
+            slot: 0,
+            generation: u32::MAX,
+        },
         SocketId {
             slot: u32::MAX,
             generation: 0,
         },
-        false,
+    ];
+    for id in ids {
+        cleanup(&mut client, id);
+    }
+
+    struct CleanupOnDrop<'a> {
+        client: &'a mut Session,
+        cleanup: fn(&mut Session, SocketId),
+        panicked: &'a std::cell::Cell<bool>,
+    }
+
+    impl Drop for CleanupOnDrop<'_> {
+        fn drop(&mut self) {
+            // Catch cleanup panics so a regression fails the test rather than
+            // aborting the process with a second panic during unwinding.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (self.cleanup)(
+                    self.client,
+                    SocketId {
+                        slot: u32::MAX,
+                        generation: 0,
+                    },
+                );
+            }));
+            self.panicked.set(result.is_err());
+        }
+    }
+
+    let cleanup_panicked = std::cell::Cell::new(true);
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cleanup = CleanupOnDrop {
+            client: &mut client,
+            cleanup,
+            panicked: &cleanup_panicked,
+        };
+        panic!("exercise socket cleanup during unwinding");
+    }));
+    assert!(unwind.is_err());
+    assert!(!cleanup_panicked.get(), "cleanup panicked during unwinding");
+
+    client.finish().unwrap();
+    assert_eq!(host.end_records(), 0, "cleanup emitted an end record");
+    host.socket.set_nonblocking(true).unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        host.socket.read(&mut byte).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock,
+        "cleanup emitted control bytes"
     );
 }
 
 #[test]
-#[should_panic(expected = "socket operation after successful Session::finish()")]
-fn abort_after_finish_panics_before_id_validation() {
-    let (_host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    client.abort(SocketId {
-        slot: u32::MAX,
-        generation: 0,
+fn close_after_finish_is_drop_safe_before_id_validation() {
+    assert_cleanup_after_finish(|client, id| {
+        client.close(id, false);
+        client.close(id, true);
     });
+}
+
+#[test]
+fn abort_after_finish_is_drop_safe_before_id_validation() {
+    assert_cleanup_after_finish(Session::abort);
 }
 
 #[cfg(not(target_os = "linux"))]

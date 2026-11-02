@@ -538,6 +538,37 @@ fn lost_after_consumed_fifo_end_sends_fin_instead_of_reset() {
     });
 }
 
+#[zhida_test_support::pinned_test]
+fn control_protocol_error_after_consumed_fifo_end_resets_established_tcp() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::with_held_retire(eal, ["lpra", "lprb"], 2, 0);
+        let (mut client, _, peer) = raw_connected(&mut fixture);
+        let stream = fixture.streams[0];
+        let writer = ceph_ring::Writer::attach(&fixture.ingress).unwrap();
+        writer.try_finish(stream, 0).unwrap();
+        fixture.network.iteration(fixture.now).unwrap();
+        let finished = fixture.wait_finished(stream);
+        assert_eq!(fixture.peer.tcp(&peer).state(), State::Established);
+
+        // The host unit test covers malformed bytes already readable at Finished.
+        // Here, hold the real Finished until the network has consumed the FIFO end,
+        // then write the bytes: either host read path must still abort, never finish.
+        client.socket.write_all(&[255; 8]).unwrap();
+        fixture.release_retire(finished);
+        fixture.forward_abort(stream);
+        client.until(&mut fixture, |f, client| {
+            client
+                .messages
+                .contains(&HostMessage::End(EndReason::ProtocolError))
+                && f.peer.tcp(&peer).state() == State::Closed
+        });
+        assert!(fixture.peer.tcp(&peer).reset_by_peer());
+        assert!(!fixture.retired.contains(&stream));
+        drop((writer, client, peer));
+        fixture.close();
+    });
+}
+
 fn held_ops_do_not_touch_reopened_udp(shutdown: bool, wrap_generation: bool) {
     with_eal(|eal| {
         let mut fixture = Fixture::new(eal, ["lsga", "lsgb"], 2, 1, 64);

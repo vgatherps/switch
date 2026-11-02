@@ -4,9 +4,10 @@
 //! immediately but wait for a subsequent FIFO poll to find every ring empty. Removing a
 //! socket discards all its held operations, including before same-generation reuse.
 //! Idle iterations skip held-operation scans when none are queued. A consumed FIFO end
-//! makes later session loss graceful unless the session has a protocol error. Until
-//! packet records are defined, every non-end FIFO record is a session protocol error;
-//! an unknown session first drains control through its queued Open, then handles its record.
+//! makes later session loss graceful unless the session has a protocol error. Explicit
+//! aborts always reset sockets, even after a FIFO end. Until packet records are defined,
+//! every non-end FIFO record is a session protocol error; an unknown session first drains
+//! control through its queued Open, then handles its record.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -335,11 +336,16 @@ impl Network {
         let Some(entry) = self.live(session) else {
             return;
         };
-        // We sent ProtocolError; control answers End{Lost} to perform teardown.
+        // We sent ProtocolError; control answers End{Abort} to perform teardown.
         if how == EndHow::Graceful && entry.errored {
             return;
         }
-        let graceful = !entry.errored && (how == EndHow::Graceful || entry.ended);
+        let graceful = !entry.errored
+            && match how {
+                EndHow::Graceful => true,
+                EndHow::Lost => entry.ended,
+                EndHow::Abort => false,
+            };
         if graceful {
             self.release(session, false);
         }

@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration as WallDuration, Instant as WallInstant};
 
 use ceph_fifo::Fifo;
+use ceph_proto::Retire;
 use ceph_ring::{Config, Reader};
 use dpdk_smoltcp::smoltcp::{socket::tcp, time::Instant, wire::Ipv4Address};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
@@ -78,6 +79,7 @@ pub struct Fixture {
     forward_events: Sender<FromNetwork>,
     control: Receiver<ToNetwork>,
     forward: Sender<ToNetwork>,
+    held_retire: Option<(Receiver<Retire>, Sender<Retire>)>,
     host: JoinHandle<std::io::Result<()>>,
     fixtures: [RingPort; 2],
     directory: PathBuf,
@@ -95,6 +97,22 @@ impl Fixture {
         udp: usize,
         fifo_batch: usize,
         control_batch: usize,
+    ) -> Self {
+        Self::configured(eal, names, tcp, udp, fifo_batch, control_batch, false)
+    }
+
+    pub fn with_held_retire(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
+        Self::configured(eal, names, tcp, udp, 64, 64, true)
+    }
+
+    fn configured(
+        eal: &Eal,
+        names: [&str; 2],
+        tcp: usize,
+        udp: usize,
+        fifo_batch: usize,
+        control_batch: usize,
+        hold_retire: bool,
     ) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [stack, peer] = [Side::A, Side::B].map(|side| {
@@ -149,6 +167,12 @@ impl Fixture {
         let (forward_events, from_network) = mpsc::channel();
         let (to_fifo, fifo_control) = mpsc::channel();
         let (retire, retired) = mpsc::channel();
+        let (retired, held_retire) = if hold_retire {
+            let (forward_retire, host_retired) = mpsc::channel();
+            (host_retired, Some((retired, forward_retire)))
+        } else {
+            (retired, None)
+        };
         let host = HostControl::bind(
             ControlConfig {
                 socket_path: socket_path.clone(),
@@ -195,6 +219,7 @@ impl Fixture {
             forward_events,
             control,
             forward,
+            held_retire,
             host,
             fixtures,
             directory,
@@ -297,6 +322,32 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Hold the real FIFO completion until the test has queued its control bytes.
+    pub fn wait_finished(&self, session: u64) -> Retire {
+        let (retired, _) = self.held_retire.as_ref().unwrap();
+        let message = retired.recv_timeout(WAIT).unwrap();
+        assert!(matches!(
+            message,
+            Retire::Finished { slot, uid }
+                if ceph_proto::pack(slot, uid) == session
+        ));
+        message
+    }
+
+    pub fn release_retire(&self, message: Retire) {
+        self.held_retire.as_ref().unwrap().1.send(message).unwrap();
+    }
+
+    /// Assert and forward the host's actual terminal decision, without substituting it.
+    pub fn forward_abort(&mut self, session: u64) {
+        let message = self.control.recv_timeout(WAIT).unwrap();
+        assert!(matches!(
+            message,
+            ToNetwork::End { session: id, how: EndHow::Abort } if id == session
+        ));
+        self.forward_message(message);
+    }
+
     fn turn_network(&mut self) {
         while let Ok(message) = self.control.try_recv() {
             self.forward_message(message);
@@ -375,12 +426,14 @@ impl Fixture {
             mut to_peer,
             mut to_net,
             host,
+            held_retire,
             fixtures,
             socket_path,
             directory,
             ..
         } = self;
         let stack = network.into_stack();
+        drop(held_retire);
         host.join().unwrap().unwrap();
         to_peer.free_held();
         to_net.free_held();

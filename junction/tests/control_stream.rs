@@ -623,7 +623,7 @@ fn malformed_messages_and_out_of_range_ops_end_only_the_offender() {
             HostMessage::End(EndReason::ProtocolError)
         );
         assert_eq!(stream.read(&mut [0]).unwrap(), 0);
-        host.end(session, EndHow::Lost);
+        host.end(session, EndHow::Abort);
         host.closed(session);
     }
     let id = survivor.bind_udp(udp()).unwrap();
@@ -633,17 +633,17 @@ fn malformed_messages_and_out_of_range_ops_end_only_the_offender() {
 }
 
 #[test]
-fn network_protocol_error_uses_lost_teardown() {
+fn network_protocol_error_uses_abort_teardown() {
     let host = Host::new(2, 2);
     let (mut client, session) = host.open(1);
     host.send(FromNetwork::ProtocolError { session });
     ended(&mut client, EndReason::ProtocolError);
-    host.end(session, EndHow::Lost);
+    host.end(session, EndHow::Abort);
     host.closed(session);
 }
 
 #[test]
-fn kick_uses_lost_teardown() {
+fn kick_uses_abort_teardown() {
     let host = Host::new(2, 2);
     let (mut client, session) = host.open(1);
     host.retire
@@ -653,7 +653,7 @@ fn kick_uses_lost_teardown() {
         })
         .unwrap();
     ended(&mut client, EndReason::Kicked);
-    host.end(session, EndHow::Lost);
+    host.end(session, EndHow::Abort);
     host.closed(session);
 }
 

@@ -4,8 +4,10 @@
 //! cephalopod end record. Retry backpressure errors while polling events.
 //! Only the host's `EndReason::Finished` acknowledgement makes `Session::closed`
 //! true; a disconnect without that acknowledgement is session loss.
-//! After a successful `finish`, all socket operations panic. Repeated `finish`
-//! calls and polling for the host acknowledgement remain valid.
+//! After a successful `finish`, opening sockets and shutting down TCP panic.
+//! `close` and `abort` become no-ops so Drop cleanup remains safe, even while
+//! unwinding. Repeated `finish` calls and polling for the host acknowledgement
+//! remain valid.
 
 use std::cell::Cell;
 use std::fmt;
@@ -292,19 +294,29 @@ impl Session {
         self.queue(Op::ShutdownTcp { id });
     }
 
+    /// After successful `finish()`, does nothing, without validating the ID.
+    /// This permits socket cleanup from Drop, including during unwinding.
+    ///
     /// # Panics
-    /// Panics if `finish()` has succeeded, or the socket ID is invalid or closing.
+    /// Before successful `finish()`, panics if the socket ID is invalid or closing.
     pub fn close(&mut self, id: SocketId, unread: bool) {
-        self.assert_unfinished();
+        if self.finished {
+            return;
+        }
         if self.begin_close(id) {
             self.queue(Op::Close { id, unread });
         }
     }
 
+    /// After successful `finish()`, does nothing, without validating the ID.
+    /// This permits socket cleanup from Drop, including during unwinding.
+    ///
     /// # Panics
-    /// Panics if `finish()` has succeeded, or the socket ID is invalid or closing.
+    /// Before successful `finish()`, panics if the socket ID is invalid or closing.
     pub fn abort(&mut self, id: SocketId) {
-        self.assert_unfinished();
+        if self.finished {
+            return;
+        }
         if self.begin_close(id) {
             self.queue(Op::AbortTcp { id });
         }
@@ -446,8 +458,10 @@ impl Session {
     /// Poll events and retry either error. A successful call is idempotent, but
     /// does not mean retirement is complete: keep polling until `closed()` is true.
     /// Control I/O failures are reported by `poll_events`.
-    /// After success, `connect_tcp`, `listen_tcp`, `bind_udp`, `shutdown`, `close`,
-    /// and `abort` panic before validating their arguments or changing socket state.
+    /// After success, `connect_tcp`, `listen_tcp`, `bind_udp`, and `shutdown`
+    /// panic before validating their arguments or changing socket state.
+    /// `close` and `abort` instead do nothing, even for invalid IDs, so Drop
+    /// cleanup remains safe during unwinding and sends no further operations.
     pub fn finish(&mut self) -> Result<(), FinishError> {
         if self.finished {
             return Ok(());
