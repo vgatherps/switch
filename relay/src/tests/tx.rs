@@ -176,6 +176,9 @@ impl<const TLS: bool> FrameTx for MockTx<TLS> {
             log.room = Some(0);
             return Err(s);
         }
+        if log.room.is_some_and(|room| room < s.len) {
+            return Err(s);
+        }
         assert_eq!(log.shutdowns, 0, "sent after FIN");
         assert_eq!(s.seq, log.taken, "sent out of seal order");
         log.taken += 1;
@@ -379,8 +382,9 @@ fn client_masks_every_frame_with_a_fresh_key() {
     assert_eq!(tungstenite_reads(Role::Client, &frames).len(), 8);
 }
 
-/// Waits come before the seal: room, then the frame. With no room nothing is sealed (no
-/// sequence number used); the send resumes once room comes, a fragment per frame of room.
+/// A fragment's waits come before its seal: room, then the frame. With no room nothing is
+/// sealed (no sequence number used); the send resumes once room comes, a fragment per frame of
+/// room.
 #[test]
 fn send_waits_for_room_then_a_frame_before_sealing() {
     let (mut c, log) = core(Role::Server, ROOM);
@@ -404,8 +408,8 @@ fn send_waits_for_room_then_a_frame_before_sealing() {
 
 /// A send dropped at each of its awaits, then a second send (same kind, and in another run the
 /// other kind): tungstenite reads exactly the messages accepted, whole and apart. Where the
-/// first send stopped decides: a one-frame message dropped at its room or frame wait was not
-/// accepted (it is accepted at its seal); a longer one is accepted on the first poll (copied
+/// first send stopped decides: a one-frame message dropped at its frame wait was not accepted
+/// (it is accepted at its seal); a longer one is accepted on the first poll (copied
 /// in), so from then on it goes out whole before the second. (The old send core left the
 /// message open: the next same-kind send continued it, the other kind panicked.)
 #[test]
@@ -423,12 +427,12 @@ fn a_dropped_send_never_merges_into_the_next_message() {
                     break;
                 }
                 let gate = log.borrow().waited.last().copied();
-                // Not polled: nothing. Otherwise it stopped at a room or frame wait: a fragment's
-                // (copied in already) or the one-frame message's own (before its seal).
+                // Not polled: nothing. Otherwise it stopped at a fragment's room or frame wait
+                // (copied in already) or at the one-frame message's frame wait (before its seal).
                 let accepted = match gate {
                     None => false,
                     Some(gate) => {
-                        assert!(gate == "room" || gate == "alloc", "len {first_len} cut {cut}: {gate}");
+                        assert!(gate == "alloc" || large && gate == "room", "len {first_len} cut {cut}: {gate}");
                         large
                     }
                 };
@@ -487,20 +491,14 @@ fn completion_waits_for_tcp_to_take_the_last_frame() {
     }
 }
 
-/// A refused frame kept through a dropped future goes out first on the next call.
+/// A one-frame message with a frame free but no TCP room is sealed and accepted on the first
+/// poll; only its send to TCP waits for room. Dropped then, it goes out first on the next call.
 #[test]
-fn refused_frame_survives_a_dropped_future() {
+fn a_small_send_without_room_is_accepted_and_goes_out_with_the_next_call() {
     let (mut c, log) = core(Role::Server, ROOM);
-    log.borrow_mut().refuse = 1;
     log.borrow_mut().room = Some(0);
-    {
-        let mut f = pin!(c.send(Kind::Text, b"first"));
-        // No room: nothing sealed. Then room: sealed, refused, and the resend waits.
-        assert!(poll(f.as_mut()).is_pending());
-        assert_eq!(log.borrow().seals, 0);
-        log.borrow_mut().room = Some(ROOM);
-        assert!(poll(f.as_mut()).is_pending());
-    }
+    assert!(poll_n(c.send(Kind::Text, b"first"), 1).is_none());
+    assert_eq!(log.borrow().seals, 1);
     assert_eq!(c.next_job(), Job::Resend(7));
     log.borrow_mut().room = None;
     send_all(&mut c, Kind::Text, b"second");

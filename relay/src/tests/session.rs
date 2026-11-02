@@ -277,17 +277,25 @@ fn received_bytes_can_be_sent_with_the_borrowed_sender() {
     );
 }
 
+/// A borrowed send dropped while it waits: a one-frame message is accepted once it has a frame
+/// (with no TCP room it waits sealed), a longer one once copied in; the next receive and send go
+/// on either way.
 #[test]
 fn borrowed_send_cancellation_preserves_acceptance_and_next_receive() {
-    for (len, accepted) in [(10, false), (3000, true)] {
+    for (len, no_frame, accepted) in [(10, true, false), (10, false, true), (3000, false, true)] {
         let (mut s, log, input) = raw();
         assert!(poll_n(s.recv_with_sender(), 1).is_none());
         let payload = vec![7; len];
         feed(&input, &client_frame(BINARY, &payload), false);
         let (message, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
-        log.borrow_mut().room = Some(if accepted { ROOM } else { 0 });
+        if no_frame {
+            log.borrow_mut().frames = Some(0);
+        } else {
+            log.borrow_mut().room = Some(if len > ROOM { ROOM } else { 0 });
+        }
         assert!(poll_n(sender.send(message.kind(), message.bytes()), 1).is_none());
         log.borrow_mut().room = None;
+        log.borrow_mut().frames = None;
         feed(&input, &client_frame(TEXT, b"next"), false);
         let (next, sender) = poll_n(s.recv_with_sender(), 1).unwrap().unwrap().unwrap();
         assert_eq!((next.kind(), next.bytes()), (Kind::Text, &b"next"[..]));

@@ -94,17 +94,17 @@ impl FrameTx for SwitchTx {
     type Sealed = switchnet::TxFrame;
     type Error = SendError;
 
-    /// A frame from the Net, or `InvalidState` if the socket has closed or reset (checked
-    /// first on every poll, so a dead socket never gets a frame). Called only before
-    /// `shutdown`, where the connection ending is the only way `delivered` resolves.
+    /// A frame from the Net; while none is free, `InvalidState` if the socket has closed or
+    /// reset. Called only before `shutdown`, where the connection ending is the only way
+    /// `delivered` resolves.
     async fn alloc(&mut self) -> Result<switchnet::TxFrame, SendError> {
-        let mut dead = pin!(self.tcp.delivered());
         let mut frame = pin!(self.handle.tx_frame());
+        let mut dead = pin!(self.tcp.delivered());
         poll_fn(|cx| {
-            if dead.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(SendError::InvalidState));
+            if let Poll::Ready(f) = frame.as_mut().poll(cx) {
+                return Poll::Ready(Ok(f));
             }
-            frame.as_mut().poll(cx).map(Ok)
+            dead.as_mut().poll(cx).map(|()| Err(SendError::InvalidState))
         })
         .await
     }

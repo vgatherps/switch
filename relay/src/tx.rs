@@ -9,8 +9,9 @@
 //! finishes it first. No other message's bytes ever enter it.
 //!
 //! Each frame is emitted as: wait for room, wait for a frame, then (sync) header, payload,
-//! mask, seal, `try_send`. A sealed frame TCP refuses waits in a one-frame slot and goes out
-//! before anything else, so a sealed frame (and its TLS sequence number) is never lost.
+//! mask, seal, `try_send`; a one-frame message skips the room wait, as TCP usually has room.
+//! A sealed frame TCP refuses waits in a one-frame slot for room and goes out before anything
+//! else, so a sealed frame (and its TLS sequence number) is never lost.
 
 // A new variant must be decided at every match.
 #![warn(clippy::wildcard_enum_match_arm)]
@@ -515,21 +516,22 @@ impl<L: PlainTx> TxCore<L> {
         Ok(())
     }
 
-    /// The room a message of `len` bytes needs if it fits one frame.
-    pub(crate) fn small(&self, len: usize) -> Option<usize> {
-        (len <= frame_cap(self.room(), self.masked())).then(|| header_len(len, self.masked()) + len)
+    /// Whether a message of `len` bytes fits one frame.
+    pub(crate) fn small(&self, len: usize) -> bool {
+        len <= frame_cap(self.room(), self.masked())
     }
 
-    /// Accepts a message that fits one frame, into `f` (after its room): sealed and sent now.
+    /// Accepts a message that fits one frame, into `f`: sealed and sent now (kept in `unsent`
+    /// if TCP has no room for it).
     pub(crate) fn accept_small(&mut self, kind: Kind, payload: &[u8], f: L::Frame) {
-        debug_assert!(self.next_job() == Job::Idle && self.small(payload.len()).is_some());
+        debug_assert!(self.next_job() == Job::Idle && self.small(payload.len()));
         let op = if kind == Kind::Text { TEXT } else { BINARY };
         self.frame(f, FIN | op, payload);
     }
 
     /// Accepts a message longer than one frame: copied, then sent a fragment per frame.
     pub(crate) fn accept_large(&mut self, kind: Kind, payload: &[u8]) {
-        debug_assert!(self.next_job() == Job::Idle && self.small(payload.len()).is_none());
+        debug_assert!(self.next_job() == Job::Idle && !self.small(payload.len()));
         self.buf.clear();
         grow(&mut self.buf, payload.len(), self.max_send);
         self.buf.extend_from_slice(payload);
@@ -683,12 +685,14 @@ impl<L: PlainTx> TxCore<L> {
         self.drive(|c| c.next_job() != Job::Idle).await;
         // The drain changes only whether we can send (Local stays Open while we can).
         self.alive()?;
-        match self.small(payload.len()) {
-            Some(len) => match self.frame_after_room(len).await {
-                Some(f) => self.accept_small(kind, payload, f),
-                None => self.stop(),
-            },
-            None => self.accept_large(kind, payload),
+        if self.small(payload.len()) {
+            // No room wait: a frame TCP refuses waits for room in `unsent`.
+            match self.lower.alloc().await {
+                Ok(f) => self.accept_small(kind, payload, f),
+                Err(_) => self.stop(),
+            }
+        } else {
+            self.accept_large(kind, payload);
         }
         self.drive(|c| !c.sent()).await;
         self.alive()

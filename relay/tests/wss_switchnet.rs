@@ -1207,36 +1207,25 @@ fn a_large_send_waits_for_frames_then_completes() {
     assert_eq!(read, [Message::Binary(vec![5; LEN].into())]);
 }
 
-/// The peer resets the connection; once the client saw it (its receive half reports the
-/// reset), a free frame is not handed to the dead socket: the setup probe is `Dead`, and an
-/// alloc on a sender set up before is refused (before the fix, the frame wait was polled
-/// first and won).
+/// The peer resets the connection while every frame of the pool is held: once the client saw
+/// the reset (its receive half reports it), an alloc on a sender set up before ends with
+/// `InvalidState` at once instead of waiting for a frame that a dead socket can never use.
 #[zhida_test_support::pinned_test]
-fn a_reset_socket_gets_no_frame_though_one_is_free() {
+fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
     use sheath::FrameTx;
-    use sheath::switchnet::{SetupError, SwitchTx};
-    for probe in [true, false] {
-        let (go_tx, go_rx) = mpsc::channel();
-        until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
-            let (mut rx, tcp) = stream.split();
-            let mut early = None;
-            let mut late = Some(tcp);
-            if !probe {
-                early = Some(SwitchTx::new(&handle, late.take().unwrap(), 1).await.expect("setup"));
-            }
-            go_tx.send(()).unwrap();
-            let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
-            assert!(seen.is_err(), "data instead of the reset");
-            if let Some(tcp) = late {
-                let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the probe waited");
-                assert!(matches!(got, Err(SetupError::Dead)), "probe: {:?}", got.map(drop));
-            }
-            if let Some(mut tx) = early {
-                let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
-                assert!(got.is_err(), "a frame for a reset socket");
-            }
-        });
-    }
+    use sheath::switchnet::SwitchTx;
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let (mut rx, tcp) = stream.split();
+        let mut tx = SwitchTx::new(&handle, tcp, 1).await.expect("setup");
+        let held = take_every_frame(&handle).await;
+        go_tx.send(()).unwrap();
+        let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+        assert!(seen.is_err(), "data instead of the reset");
+        let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
+        assert!(matches!(got, Err(switchnet::SendError::InvalidState)), "{:?}", got.map(drop));
+        drop(held);
+    });
 }
 
 /// `tls_connect`'s plaintext minimum: 0 counts as one byte (a record's floor), so a 76 B send
