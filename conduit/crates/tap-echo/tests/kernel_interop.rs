@@ -79,8 +79,8 @@ const ACK_LOSS_PHASE: Duration = Duration::from_millis(1500);
 /// Zhida's smallest RTO: the 50 ms floor (`MIN_RTO`) of the RFC 6298 RTO smoltcp
 /// computes from RTT samples; RTTs over the tap are far below it. Before any
 /// sample the RTO is 300 ms. Each expiry doubles it, up to 60 s, until SND.UNA
-/// advances (`retransmission_timeout`); a third expiry without a new sample
-/// drops the measurement, so the base returns to 300 ms. Zero-window probes
+/// advances (`retransmission_timeout`); the measured base stays until the
+/// next sample. Zero-window probes
 /// use the same RTO and backoff.
 const ZHIDA_RTO: Duration = Duration::from_millis(50);
 /// Allowance when comparing capture times against an RTO. smoltcp times the
@@ -98,13 +98,11 @@ const ACK_LOSS_STREAMING: Duration = Duration::from_millis(50);
 /// well under a second, and the loss window lasts 3.05 s. Zhida's RTO
 /// enters the window at its measured base b, at least `ZHIDA_RTO` (nothing
 /// expired before it), and doubles only on expiry, retransmission or
-/// zero-window probe alike: the first three expiries come b, 2b and 4b
-/// apart, and the third drops the RTT measurement, so the next waits
-/// 300 ms · 2^3 = 2.4 s and the one after 4.8 s. At b = 50 ms four expiries
-/// fit in the window (0.35 s, then 2.75 s); a fifth would need 7.55 s. The
-/// RTO is then at most 4.8 s when the filters go, so Zhida's next
-/// retransmission or probe, carrying its ACK, is due within 4.8 s of removal
-/// and is no longer dropped; Linux's RTO starts at 200 ms. In practice the window update the kernel sends once the
+/// zero-window probe alike: expiries come b, 2b, 4b, ... apart, so the RTO
+/// pending when the filters go is the time since the window opened plus b,
+/// at most 3.05 s + b. At b = 50 ms the fifth expiry comes at 1.55 s and the
+/// sixth is due 0.1 s after removal. Zhida's next retransmission or probe,
+/// carrying its ACK, is no longer dropped; Linux's RTO starts at 200 ms. In practice the window update the kernel sends once the
 /// client reads again ends the loss sooner. 10 s covers that and the rest of
 /// the echo with room for a shared CPU.
 const ACK_LOSS_RECOVERY: Duration = Duration::from_secs(10);
@@ -2347,12 +2345,12 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     let zhida_retransmissions = retransmitted_in_window(Direction::ToKernel);
     let zhida_timeouts = zhida_timeout_retransmissions(&zhida_retransmissions);
     let linux_retransmissions = retransmitted_in_window(Direction::ToZhida);
-    let stale_acks = stale_pure_acks(&captured, Direction::ToKernel);
-    let stale_acks_after = stale_acks
+    let stale_all = stale_pure_acks(&captured, Direction::ToKernel);
+    let stale_acks_after = stale_all
         .iter()
         .filter(|c| c.at > window.after_delete)
         .count();
-    let stale_acks: Vec<&Captured> = stale_acks.iter().filter(|c| in_window(c.at)).collect();
+    let stale_acks: Vec<&Captured> = stale_all.iter().filter(|c| in_window(c.at)).collect();
     // Every pure ACK Zhida sent while a filter could drop it; the capture
     // sees them before the ingress qdisc does.
     let pure_acks_to_kernel = captured
@@ -2410,6 +2408,12 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     );
     io::stdout().write_all(record.as_bytes()).unwrap();
 
+    // A pure ACK carries the highest sequence number sent, also after an RTO
+    // rewound the resend point, so none falls below the kernel's RCV.NXT.
+    assert!(
+        stale_all.is_empty(),
+        "Zhida sent pure ACKs below the kernel's RCV.NXT: {stale_all:?}"
+    );
     assert!(
         streaming.iter().all(|&bytes| bytes > 0),
         "data bytes sent in the first {ACK_LOSS_STREAMING:?} of the loss \

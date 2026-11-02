@@ -126,7 +126,8 @@ mod tests {
     /// reserve + share. ENA keeps its ring posted (1023 mbufs: it refills once min(ring / 8,
     /// 256) descriptors are empty), staging is full and the sockets hold their whole share, so
     /// what is free is the reserve minus those. The Port reads the pool as low while free <
-    /// `rx_low_mark`; it must not, or every TCP socket drops all out-of-order data for good.
+    /// `rx_low_mark`; it must not, or the Stack prunes out-of-order frames on every turn
+    /// although the sockets hold no more than the share.
     #[test]
     fn reserve_is_not_low_with_the_ring_posted_and_staging_full() {
         let (descriptors, burst, staging, cache) = (1024, 32, 32, 8);

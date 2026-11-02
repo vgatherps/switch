@@ -14,8 +14,7 @@ use crate::port::{eth_tx_prepare, Packet, Port, PortError, RxBurst, TxPacket};
 /// smoltcp device over one Port with bounded RX staging and TX pending queues.
 ///
 /// Tokens are issued only with a free pending slot and a full-frame TX packet
-/// in hand, so `TxToken::consume` never fails or allocates. Otherwise
-/// `receive` returns `None` and the RX packet stays staged. Frame tokens need
+/// in hand, so `TxToken::consume` never fails or allocates. Frame tokens need
 /// only the free pending slot: the frame is the caller's.
 pub(crate) struct Device {
     rx: VecDeque<Packet>,

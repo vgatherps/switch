@@ -356,8 +356,9 @@ TCP socket visit while other sockets have frames ready; a socket alone keeps sen
 `rx_staging: usize` and `tx_pending: usize` set fixed-capacity device queues (`VecDeque::with_capacity`,
 so actual capacity can exceed the request). RX bursts fill available staging space. TCP-built
 frames and UDP sends share the pending TX FIFO. A full pending queue never blocks ingress: a reply
-(ACK, ARP, ICMP echo, RST) that finds no pending slot or TX packet is dropped, and a TCP socket
-whose ACK was dropped sends it on its next egress. Size the queue for both traffic directions. `Stack::new(port, config, now)` consumes the Port on success. On failure it
+(ACK, ARP, ICMP echo, RST) that finds no pending slot or TX packet is dropped. A TCP socket whose
+cumulative ACK was dropped sends it on its next egress; a dropped duplicate ACK or D-SACK is not
+resent, and a dropped challenge ACK still counts against its one-per-500 ms limit. Size the queue for both traffic directions. `Stack::new(port, config, now)` consumes the Port on success. On failure it
 returns `(Port, StackError)`. Invalid configuration or negative start time gives `InvalidConfig`;
 IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` from the path table,
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
@@ -406,16 +407,16 @@ Out-of-order segments are freed only when the gap before them fills, so sockets 
 could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. A socket
 holds at most `smoltcp::socket::tcp::MAX_OUT_OF_ORDER_VIEWS` (1024) frames past its first gap and
 refuses further out-of-order segments, counted by `rx_refused_segments()`, with an ACK at its
-in-order edge. Each `turn` and `receive` whose RX burst returned packets reads how many RX mbufs
-are free and compares it with one refill of the RX ring plus one burst: max(negotiated RX
-descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
-refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
+in-order edge. `turn` and `receive` read how many RX mbufs are free and compare it with one
+refill of the RX ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`.
+DPDK PMDs refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
 receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
 at once; while that fails ENA still returns completed packets, but stops receiving once the
 buffers already posted run out. So the check must fire while a refill can still succeed.
-When fewer are free, the sockets holding the most out-of-order frames release them before
-ingress, the farthest from their in-order data first (an out-of-order FIN goes with them), until
-that many are free again or no socket holds any; in-order data stays. `rx_reserve` counts the
+They read it after ingress of an RX burst that returned packets, and on every turn after a reading
+below the mark until one is not. When fewer are free, the sockets holding the most out-of-order
+frames release them, the ones this turn retained included, the farthest from their in-order data
+first (an out-of-order FIN goes with them), until that many are free again or no socket holds any; in-order data stays. `rx_reserve` counts the
 mark, so a pool of reserve plus share clears it while the sockets together hold at most the
 share. The peer resends what was dropped; RFC 2018 lets a receiver discard data it already
 reported in SACK blocks, and the sender must then resend it too.
@@ -627,8 +628,8 @@ makes the timer late.
 The retransmission timeout follows RFC 6298 from measured round trips: SRTT + 4 * RTTVAR, at least
 50 ms (above a peer's delayed ACK, so a delayed ACK does not draw a spurious retransmit) and at most
 60 seconds. Before the first sample it is 300 ms. Each expiry doubles it, capped at 60 seconds, until
-SND.UNA advances; three expiries without a new sample discard the measurement, so the base returns to
-300 ms. Reset/reconnect discards it too. A new RTO applies the next time a retransmission or probe
+SND.UNA advances; the measured base stays until the next sample. Reset/reconnect discards the
+measurement. A new RTO applies the next time a retransmission or probe
 timer is armed; it does not rewrite an already armed timer.
 
 Delayed ACK defaults to 10 ms. `set_ack_delay(Some(duration))` changes the delay;
@@ -685,7 +686,8 @@ pool is shared by all sockets; small writes can consume more frames than the ful
 estimate `tcp::tx_mbuf_budget(&config, ip_mtu)` ("Pool sizing").
 
 Each retained received segment uses its own buffer. `rx_refused_segments()` counts out-of-order
-segments refused under RX pool pressure.
+segments refused because the socket already holds `MAX_OUT_OF_ORDER_VIEWS` frames past its first
+gap; under RX pool pressure the Stack prunes out-of-order frames instead ("Pool sizing").
 
 The config's `mss_cap` limits the advertised MSS and outgoing segment payloads. `None` applies no
 application cap; local MTU and peer MSS apply regardless. The cap survives reset/reconnect and
