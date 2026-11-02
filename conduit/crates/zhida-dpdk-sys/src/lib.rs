@@ -78,8 +78,14 @@ unsafe extern "C" {
     /// Uses tail calls to keep fast path tight.
     pub fn zhida_pktmbuf_free_seg(m: *mut rte_mbuf);
 
-    /// Full DPDK free - handles refcount, chains, indirect, external
-    /// Use this for chain free (walks entire chain).
+    /// Free a whole chain: drops each segment's refcount and returns the segments that
+    /// reach zero, including the direct buffer behind an indirect segment.
+    ///
+    /// Every segment, and every direct buffer an indirect segment points at, must come
+    /// from a pool whose mbufs carry Zhida's per-lcore cache pointer in the first 8
+    /// private bytes (`zhida_pool_init_cache_ptrs`), freed on that cache's lcore.
+    /// External-buffer mbufs are not handled: freeing one is undefined behaviour in
+    /// release builds (a debug build aborts). Use `dpdk_raw_pktmbuf_free` for those.
     pub fn zhida_pktmbuf_free(m: *mut rte_mbuf);
 
     /// Minimal free - ONLY for refcnt==1, no chain, direct buffer
@@ -256,10 +262,13 @@ unsafe extern "C" {
     pub fn zhida_mempool_free_count(mp: *const rte_mempool, cache: *const rte_mempool_cache) -> u32;
 }
 
-/// Free an mbuf back to its pool.
+/// Free an mbuf chain back to its pools through `zhida_pktmbuf_free`, not DPDK's
+/// `rte_pktmbuf_free`.
 ///
 /// # Safety
-/// `m` must be null or an mbuf the caller owns; it must not be used afterwards.
+/// `m` must be null or an mbuf chain the caller owns; it must not be used afterwards.
+/// `zhida_pktmbuf_free`'s requirements apply: Zhida cache-pointer pools, the cache's
+/// lcore, and no external-buffer segments.
 #[inline]
 pub unsafe fn rte_pktmbuf_free(m: *mut rte_mbuf) {
     zhida_pktmbuf_free(m)
