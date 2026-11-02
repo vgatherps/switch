@@ -75,15 +75,8 @@ impl Device for RecordingDevice {
     type TxToken<'a> = RecordingTx<'a>;
     type FrameToken<'a> = RecordingFrame<'a>;
 
-    fn receive(&mut self, _: Instant) -> Option<(FrameRx, RecordingTx<'_>)> {
-        let bytes = self.rx.pop_front()?;
-        Some((
-            FrameRx(bytes),
-            RecordingTx {
-                frames: &mut self.tx,
-                meta: PacketMeta::default(),
-            },
-        ))
+    fn receive(&mut self, _: Instant) -> Option<FrameRx> {
+        self.rx.pop_front().map(FrameRx)
     }
 
     fn transmit(&mut self, _: Instant) -> Option<RecordingTx<'_>> {

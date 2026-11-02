@@ -1172,10 +1172,9 @@ mod tests {
             let mut pending = None;
             assert_eq!(recv_pattern(socket, &mut pending, 7, 0, 17), (17, true));
             assert_eq!(socket.recv_queue(), 0);
-            assert_eq!(socket.held_frames().count(), 1);
+            assert_eq!(pending.as_ref().map(|(_, offset)| *offset), Some(17));
             assert_eq!(recv_pattern(socket, &mut pending, 7, 17, 64), (47, true));
             assert!(pending.is_none());
-            assert_eq!(socket.held_frames().count(), 0);
             assert_eq!(pair.close(), 0);
         });
     }
@@ -1198,7 +1197,7 @@ mod tests {
             assert_eq!(echo(socket, &mut pending), 4);
             assert_eq!(socket.send_queue(), 4096);
             assert_eq!(socket.recv_queue(), 0);
-            assert_eq!(socket.held_frames().count(), 1);
+            assert_eq!(pending.as_ref().map(|(_, offset)| *offset), Some(4));
             let mut received = Vec::new();
             let mut echoed = 4;
             pair.drive(|_, _| {}, |a, b| {
@@ -1213,7 +1212,6 @@ mod tests {
             assert_eq!(&received[..prefix.len()], prefix.as_slice());
             assert_eq!(&received[prefix.len()..], payload.as_slice());
             assert!(pending.is_none());
-            assert_eq!(pair.b.tcp(&server).held_frames().count(), 0);
             assert_eq!(pair.close(), 0);
         });
     }
@@ -1256,7 +1254,6 @@ mod tests {
             assert_eq!(&received[..prefix.len()], prefix.as_slice());
             assert_eq!(&received[prefix.len()..], payload.as_slice());
             assert!(pending.is_none());
-            assert_eq!(pair.b.tcp(&server).held_frames().count(), 0);
             assert_eq!(pair.close(), 0);
         });
     }

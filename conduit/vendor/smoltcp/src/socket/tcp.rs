@@ -5,7 +5,7 @@
 use core::fmt::Display;
 use core::fmt;
 
-use crate::phy::{HeldFrames, PacketMeta, RxBuf, TxBuf, TxFrame, TxSource, UniqueTxBuf};
+use crate::phy::{PacketMeta, RxBuf, TxBuf, TxFrame, TxSource, UniqueTxBuf};
 use crate::socket::{Context, PollAt};
 use crate::time::{Duration, Instant};
 use crate::wire::{
@@ -199,15 +199,20 @@ impl fmt::Display for State {
     }
 }
 
+/// RTO before the first RTT sample, and again after three expiries without one.
 const DEFAULT_RTO: Duration = Duration::from_millis(300);
+/// Floor of the RTO computed from samples. It must sit above a peer's delayed ACK (ours is
+/// 10 ms, Linux's up to 40 ms), or each delayed ACK triggers a spurious retransmit.
+const MIN_RTO: Duration = Duration::from_millis(50);
 const MAX_RTO: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy)]
 struct SmoothedRtt {
     sent_at: Instant,
-    // Using u32 instead of Duration to save space (Duration is i64)
-    /// Smoothed RTT
+    /// Smoothed RTT (SRTT) in microseconds.
     srtt: u32,
+    /// RTT variation (RTTVAR) in microseconds.
+    rttvar: u32,
     sent_seq: TcpSeqNumber,
     max_seq_sent: TcpSeqNumber,
     /// true if we have made at least one rtt measurement.
@@ -222,6 +227,7 @@ impl Default for SmoothedRtt {
         Self {
             sent_at: Instant::ZERO,
             srtt: 0, // ignored, will be overwritten on first measurement.
+            rttvar: 0,
             sent_seq: TcpSeqNumber(0),
             max_seq_sent: TcpSeqNumber(0),
             have_measurement: false,
@@ -251,22 +257,48 @@ impl SmoothedRtt {
         }
     }
 
+    /// Smoothed RTT in microseconds, or 0 before the first sample.
     fn smoothed_rtt(&self) -> u32 {
         if self.have_measurement { self.srtt } else { 0 }
     }
 
+    /// RFC 6298 (2.1)-(2.5) RTO, before backoff. The clock granularity G of (2.2)/(2.3) is
+    /// ignored: the clock counts microseconds and MIN_RTO is far above one tick.
+    fn retransmission_timeout(&self) -> Duration {
+        if !self.have_measurement {
+            return DEFAULT_RTO;
+        }
+        let micros = u64::from(self.srtt) + 4 * u64::from(self.rttvar);
+        Duration::from_micros(micros.clamp(MIN_RTO.total_micros(), MAX_RTO.total_micros()))
+    }
+
+    /// Make the RTO `rto` (floored at MIN_RTO) until the next sample, expiry clear or reset.
+    #[cfg(test)]
+    fn seed(&mut self, rto: Duration) {
+        self.srtt = u32::try_from(rto.total_micros()).expect("seeded RTO must fit in u32 micros");
+        self.rttvar = 0;
+        self.have_measurement = true;
+        self.rto_count = 0;
+    }
+
+    /// Integer divisions round up, so the RTO never comes out below the exact formula.
     fn sample(&mut self, new_rtt: u32) {
         if self.have_measurement {
-            // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set (...)
-            self.srtt = (self.srtt * 7 + new_rtt).div_ceil(8);
+            // RFC 6298 (2.3) When a subsequent RTT measurement R' is made, a host MUST set
+            // RTTVAR <- 3/4 RTTVAR + 1/4 |SRTT - R'|, then SRTT <- 7/8 SRTT + 1/8 R'.
+            let delta = u64::from(self.srtt.abs_diff(new_rtt));
+            self.rttvar = (3 * u64::from(self.rttvar) + delta).div_ceil(4) as u32;
+            self.srtt = (7 * u64::from(self.srtt) + u64::from(new_rtt)).div_ceil(8) as u32;
         } else {
-            // RFC 6298 (2.2) When the first RTT measurement R is made, the host MUST set (...)
+            // RFC 6298 (2.2) When the first RTT measurement R is made, the host MUST set
+            // SRTT <- R, RTTVAR <- R/2.
             self.have_measurement = true;
             self.srtt = new_rtt;
+            self.rttvar = new_rtt.div_ceil(2);
         }
 
         self.rto_count = 0;
-        tcp_trace!("rtte: sample={:?} srtt={:?}", new_rtt, self.srtt);
+        tcp_trace!("rtte: sample={:?} srtt={:?} rttvar={:?}", new_rtt, self.srtt, self.rttvar);
     }
 
     fn on_send(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
@@ -284,7 +316,9 @@ impl SmoothedRtt {
 
     fn on_ack(&mut self, timestamp: Instant, seq: TcpSeqNumber) {
         if self.sampling && seq >= self.sent_seq {
-            self.sample((timestamp - self.sent_at).total_millis() as u32);
+            // A sample beyond u32 micros (71 minutes) only matters through the 60 s RTO cap.
+            let micros = (timestamp - self.sent_at).total_micros();
+            self.sample(u32::try_from(micros).unwrap_or(u32::MAX));
             self.sampling = false;
         }
     }
@@ -327,6 +361,9 @@ const ACK_DELAY_DEFAULT: Duration = Duration::from_millis(10);
 const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
 const ORPHAN_FIN_WAIT_2_TIMEOUT: Duration = Duration::from_secs(60);
 const ORPHAN_RETRIES: u32 = 8;
+/// Most frames one socket holds past its first gap; an out-of-order segment beyond them is
+/// refused. Each holds one frame of the shared RX pool, so this bounds what one peer pins.
+pub const MAX_OUT_OF_ORDER_VIEWS: usize = 1024;
 
 impl Timer {
     fn new() -> Timer {
@@ -542,7 +579,6 @@ pub struct Socket<'a> {
     /// The ACK number of the last packet received.
     local_rx_last_ack: TcpSeqNumber,
     recover: TcpSeqNumber,
-    rto_us: u32,
     rto_backoff: u32,
     tx_queue: TxQueue,
     tx_seg_bytes: u32,
@@ -613,7 +649,6 @@ impl<'a> Socket<'a> {
             state: State::Closed,
             timer: Timer::new(),
             rtte: SmoothedRtt::default(),
-            rto_us: DEFAULT_RTO.total_micros() as u32,
             rto_backoff: 0,
             tx_queue,
             tx_seg_bytes: u32::try_from(tx_seg_bytes).expect("TX segment bytes exceed u32"),
@@ -887,22 +922,18 @@ impl<'a> Socket<'a> {
         self.initial_window = bytes;
     }
 
-    /// Set the base retransmission timeout. The default is 300 milliseconds.
-    ///
-    /// The new value applies when the next retransmission or probe timer is armed
-    /// and survives reset and reconnect. Timeout backoff is capped at 60 seconds.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `rto` is zero or exceeds 60 seconds.
-    pub fn set_rto(&mut self, rto: Duration) {
-        assert!(rto > Duration::ZERO && rto <= MAX_RTO);
-        self.rto_us = rto.total_micros() as u32;
+    /// Fix this socket's base RTO for timer-ordering tests; see `SmoothedRtt::seed`.
+    #[cfg(test)]
+    pub(crate) fn seed_rto(&mut self, rto: Duration) {
+        self.rtte.seed(rto);
     }
 
     fn retransmission_timeout(&self) -> Duration {
-        // Even a one-microsecond RTO reaches the cap after 26 doublings.
-        let micros = u64::from(self.rto_us)
+        // The base is at most 60 s, so 26 doublings cannot overflow and always reach the cap.
+        let micros = self
+            .rtte
+            .retransmission_timeout()
+            .total_micros()
             .checked_mul(1u64 << self.rto_backoff.min(26))
             .expect("RTO duration overflow");
         Duration::from_micros(micros.min(MAX_RTO.total_micros()))
@@ -1328,7 +1359,8 @@ impl<'a> Socket<'a> {
         self.rx_buffer.capacity
     }
 
-    /// Return the number of out-of-order segments refused while the shared RX pool is low.
+    /// Return the number of out-of-order segments refused because the socket already held
+    /// `MAX_OUT_OF_ORDER_VIEWS` frames past its first gap.
     pub fn rx_refused_segments(&self) -> u32 {
         self.rx_refused_segments
     }
@@ -1369,8 +1401,10 @@ impl<'a> Socket<'a> {
         self.tx_queue.byte_room()
     }
 
-    /// Enqueue one owned frame as one send-queue entry. A frame longer than the
-    /// current segment payload is sent by copying, like `send_slice` data.
+    /// Enqueue one owned frame. A frame that fits whole into the unsent tail frame without
+    /// making it longer than one segment is copied there, so small writes share a segment;
+    /// otherwise the frame is its own send-queue entry. A frame longer than the current
+    /// segment payload is sent by copying, like `send_slice` data.
     pub fn send_frame(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
         if frame.origin() != self.tx_queue.source().origin() {
             return Err((frame, SendFrameError::Foreign));
@@ -1385,7 +1419,13 @@ impl<'a> Socket<'a> {
         if frame.len() > self.tx_queue.byte_room() {
             return Err((frame, SendFrameError::Full));
         }
-        self.tx_queue.push(frame.into_buf());
+        let sent = self.sent_payload_bytes();
+        let segment = self.max_segment_payload().unwrap_or(0);
+        if frame.len() <= self.tx_queue.tail_room(sent, segment) {
+            self.tx_queue.append_tail(sent, frame.payload(), segment);
+        } else {
+            self.tx_queue.push(frame.into_buf());
+        }
         Ok(())
     }
 
@@ -1398,13 +1438,11 @@ impl<'a> Socket<'a> {
         if !self.may_send() {
             return Err(SendError::InvalidState);
         }
-        debug_assert!(self.max_segment_payload().is_some(), "sendable TCP socket is not synchronized");
-        let frame_payload = self.tx_seg_bytes as usize;
+        // One segment per frame, so each goes out whole when the window allows.
+        let frame_payload = self.max_segment_payload().expect("sendable TCP socket is not synchronized");
         let mut written = self.tx_queue.append_tail(self.sent_payload_bytes(), data, frame_payload);
         while written < data.len() && self.tx_queue.byte_room() != 0 {
             let Some(mut buf) = self.tx_queue.source().alloc_unique() else {
-                // The shared frame pool is empty: wake this socket once frames return.
-                self.rx_buffer.shared.queue_frame_wait();
                 break;
             };
             let count = (data.len() - written)
@@ -1432,30 +1470,6 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
-    /// Register the socket for a wake when the TX frame pool recovers.
-    pub(crate) fn set_frame_wake(
-        &mut self,
-        queue: crate::iface::DropQueue,
-        handle: crate::iface::SocketHandle,
-    ) {
-        *self.rx_buffer.shared.wake.borrow_mut() = Some((queue, handle));
-    }
-
-    /// Remove the socket from the TX frame-pool wait list.
-    pub(crate) fn clear_frame_wake(&mut self) {
-        self.rx_buffer.shared.cancel_frame_wait();
-        *self.rx_buffer.shared.wake.borrow_mut() = None;
-    }
-
-    pub(crate) fn clear_frame_wait_queued(&mut self) {
-        self.rx_buffer.shared.frame_wait_queued.set(false);
-    }
-
-    /// Frames the app still holds; they keep their RX pool buffers until dropped.
-    pub fn held_frames(&self) -> HeldFrames {
-        HeldFrames::new(self.rx_buffer.shared.clone())
-    }
-
     /// Drain the next whole in-order frame, or return None when no data is queued.
     /// Frames retain their shared RX pool buffers until dropped.
     /// After a FIN, queued frames are drained before returning RecvError::Finished.
@@ -1467,8 +1481,7 @@ impl<'a> Socket<'a> {
             return Ok(None);
         };
         self.remote_seq_no = TcpSeqNumber(self.remote_seq_no.0.wrapping_add(frame.len() as i32));
-        self.rx_buffer.shared.hold();
-        Ok(Some(TcpFrame { frame, shared: self.rx_buffer.shared.clone() }))
+        Ok(Some(TcpFrame(frame)))
     }
 
     /// Return the amount of octets queued in the transmit buffer.
@@ -1563,17 +1576,20 @@ impl<'a> Socket<'a> {
         self.rx_buffer.store.clear();
     }
 
-    /// Drop received data past the first gap, frames and a FIN alike; in-order data stays.
-    /// Called for every segment while the RX pool is low: with nothing out of order it only
-    /// clears a FIN past a gap, and otherwise visits only the dropped views. Kept out of line
-    /// so the segment path's code stays as it was.
-    #[cold]
-    #[inline(never)]
-    fn prune_out_of_order(&mut self) {
-        self.rx_fin_seq = None;
-        if self.rx_buffer.store.out_of_order_span() != 0 {
-            self.rx_buffer.store.drop_out_of_order();
+    /// Frames held past the first gap.
+    pub(crate) fn out_of_order_views(&self) -> usize {
+        self.rx_buffer.store.out_of_order_views()
+    }
+
+    /// Release up to `limit` frames held past the first gap, the farthest from the in-order
+    /// data first, and return how many; in-order data stays. A FIN past the gap lies beyond all
+    /// that data, so it goes with the first frame released. The peer resends what went.
+    pub(crate) fn prune_out_of_order(&mut self, limit: usize) -> usize {
+        let released = self.rx_buffer.store.drop_out_of_order(limit);
+        if released != 0 {
+            self.rx_fin_seq = None;
         }
+        released
     }
 
     fn set_state(&mut self, state: State) {
@@ -1690,30 +1706,14 @@ impl<'a> Socket<'a> {
         blocks
     }
 
-    /// Builds a pure-ACK (or SACK) reply to `repr` and advances the socket's
-    /// idea of what it has acknowledged.
-    ///
-    /// `remote_last_ack`/`remote_last_win_bytes` are only advanced when `cx` can
-    /// currently resolve a next hop for the reply's destination. Interface
-    /// dispatch for this synchronous ingress-triggered reply has no
-    /// confirmed-send callback (unlike the queued egress path, which updates
-    /// these fields only after `TxToken::consume` runs, see `dispatch`
-    /// below): without this check, dispatch_ip's neighbor-missing drop (an
-    /// immediate `Err` before any transmit, whenever the peer isn't already
-    /// in the neighbor cache: a connection's first reply before ARP
-    /// resolves, or any later reply after the entry was evicted for
-    /// capacity) still left the socket believing it ACKed data it never put
-    /// on the wire. A TxToken still failing after this check, or the
-    /// neighbor expiring in the race window between the check and the
-    /// actual send, isn't covered. Nor is retry: a dropped reply whose
-    /// ack_number/window_len don't move the needle (a challenge ACK or an
-    /// out-of-order FIN ack) leaves nothing for
-    /// `ack_to_transmit` to notice later, so it isn't resent until some
-    /// other segment arrives; that's unchanged from before this gate, since
-    /// smoltcp has no general pending-reply retry queue for this path.
+    /// Builds a pure-ACK (or SACK) reply to `repr`. The socket records what it acknowledged
+    /// only once the interface reports the reply sent (`reply_sent`), as egress dispatch does
+    /// after `TxToken::consume`; a reply dropped for lack of TX room or a neighbor
+    /// (`reply_dropped`) leaves the cumulative ACK owed, so the next egress sends it. A dropped
+    /// reply whose ack number and window don't move (a duplicate ACK, D-SACK or challenge ACK)
+    /// leaves nothing owed; the peer's next segment brings another.
     fn ack_reply(
         &mut self,
-        cx: &mut Context,
         ip_repr: &IpRepr,
         repr: &TcpRepr,
         dsack: Option<(TcpSeqNumber, TcpSeqNumber)>,
@@ -1732,11 +1732,6 @@ impl<'a> Socket<'a> {
         // segments, is right-shifted by [advertised scale value] bits[...]
         reply_repr.window_len = self.scaled_window();
 
-        if cx.has_neighbor(&ip_reply_repr.dst_addr()) {
-            self.remote_last_ack = reply_repr.ack_number;
-            self.remote_last_ack_is_marker = false;
-            self.remote_last_win_bytes = u32::from(reply_repr.window_len) << self.remote_win_shift;
-        }
         // This reply carries our ACK but leaves the delayed-ACK timer alone; only egress
         // dispatch resets it. If the timer was Immediate, the next small in-order segment is
         // ACKed at once instead of after the delay: at most one early pure ACK. Accepted, since
@@ -1749,6 +1744,22 @@ impl<'a> Socket<'a> {
         // Since the sACK option may have changed the length of the payload, update that.
         ip_reply_repr.set_payload_len(reply_repr.buffer_len());
         (ip_reply_repr, reply_repr)
+    }
+
+    /// The interface sent `reply`, an ingress reply this socket returned from `process`. A
+    /// pure ACK records what it acknowledged and advertised; an RST records nothing.
+    pub(crate) fn reply_sent(&mut self, reply: &TcpRepr) {
+        if reply.control == TcpControl::None {
+            self.remote_last_ack = reply.ack_number;
+            self.remote_last_ack_is_marker = false;
+            self.remote_last_win_bytes = u32::from(reply.window_len) << self.remote_win_shift;
+        }
+    }
+
+    /// The interface dropped this socket's ingress reply (no TX room, or no neighbor yet).
+    /// The ACK stays owed and is due now, so the next egress sends it.
+    pub(crate) fn reply_dropped(&mut self) {
+        self.set_ack_delay_timer(AckDelayTimer::Immediate);
     }
 
     fn challenge_ack_allowed(&mut self, cx: &mut Context) -> bool {
@@ -1771,7 +1782,7 @@ impl<'a> Socket<'a> {
             return None;
         }
 
-        Some(self.ack_reply(cx, ip_repr, repr, None))
+        Some(self.ack_reply(ip_repr, repr, None))
     }
 
     fn out_of_window_reply(
@@ -1793,7 +1804,7 @@ impl<'a> Socket<'a> {
                 && self.state != State::TimeWait
                 && end <= self.next_receive_seq())
                 .then_some((repr.seq_number, end));
-            return Some(self.ack_reply(cx, ip_repr, repr, dsack));
+            return Some(self.ack_reply(ip_repr, repr, dsack));
         }
 
         self.challenge_ack_reply(cx, ip_repr, repr)
@@ -1910,7 +1921,7 @@ impl<'a> Socket<'a> {
 
         if matches!(repr.control, TcpControl::Syn | TcpControl::SynFin) {
             if self.time_wait_accepts_syn(repr) {
-                return Some(self.ack_reply(cx, ip_repr, repr, None));
+                return Some(self.ack_reply(ip_repr, repr, None));
             }
             match self.state {
                 State::TimeWait => {
@@ -2257,15 +2268,6 @@ impl<'a> Socket<'a> {
             }
         }
 
-        // While the shared RX pool is low, this socket keeps no out-of-order data, as Linux
-        // prunes the receiving socket's out-of-order queue under memory pressure: what it
-        // holds goes now, and an out-of-order segment or FIN is refused below. The peer
-        // resends it; in-order data is still stored, so the gap can fill.
-        let rx_pool_low = cx.rx_pool_low;
-        if rx_pool_low {
-            self.prune_out_of_order();
-        }
-
         // Disregard control flags we don't care about or shouldn't act on yet.
         let mut control = repr.control;
         control = control.quash_psh();
@@ -2280,7 +2282,9 @@ impl<'a> Socket<'a> {
                 control = TcpControl::None;
             }
         } else if control == TcpControl::Fin {
-            if segment_end > window_end {
+            // In-order data past the advertised edge is accepted (see the overlap above), so its
+            // FIN is too; only an out-of-order FIN must fit the window.
+            if segment_end > window_end && window_start < segment_start {
                 control = TcpControl::None;
             } else if matches!(self.state, State::SynReceived | State::Established | State::FinWait1 | State::FinWait2) {
                 if window_start < segment_start {
@@ -2311,14 +2315,18 @@ impl<'a> Socket<'a> {
             .in_order_len()
             .checked_add(payload_offset)
             .expect("TCP receive offset overflow");
+        // Each out-of-order view pins one frame of the shared RX pool; past the cap a socket
+        // takes no more out-of-order data, and the peer resends it once the gap fills.
         let decision = if payload.is_empty() {
             None
-        } else if rx_pool_low && payload_offset != 0 {
+        } else if payload_offset != 0
+            && self.rx_buffer.store.out_of_order_views() >= MAX_OUT_OF_ORDER_VIEWS
+        {
             Some(Decision::Refused)
         } else {
             Some(self.rx_buffer.store.decide(offset, payload.len()))
         };
-        let refused = matches!(decision, Some(Decision::Refused)) || (rx_pool_low && out_of_order_fin);
+        let refused = matches!(decision, Some(Decision::Refused));
         if refused {
             // A statistic the peer can drive; it must never panic the stack.
             self.rx_refused_segments = self.rx_refused_segments.saturating_add(1);
@@ -2674,7 +2682,7 @@ impl<'a> Socket<'a> {
         if payload_len == 0 {
             self.truncate_at_fin(fin_offset);
             return if refused || out_of_order_fin {
-                Some(self.ack_reply(cx, ip_repr, repr, None))
+                Some(self.ack_reply(ip_repr, repr, None))
             } else {
                 None
             };
@@ -2757,7 +2765,7 @@ impl<'a> Socket<'a> {
             // This is fine because smoltcp assumes that it can always transmit zero or one
             // packets for every packet it receives.
             tcp_trace!("ACKing incoming segment");
-            Some(self.ack_reply(cx, ip_repr, repr, dsack))
+            Some(self.ack_reply(ip_repr, repr, dsack))
         } else {
             None
         }
@@ -3156,6 +3164,12 @@ impl<'a> Socket<'a> {
                     {
                         payload_len = frame.len();
                         whole_frame = Some((index, frame));
+                    } else if !self.tx_queue.segment_spans_frames(offset, segment_size)
+                        && let Seg::Cut(bytes) = self.tx_queue.segment(offset, segment_size)
+                    {
+                        // A cut inside one frame is borrowed, as fast retransmit does above.
+                        repr.payload = bytes;
+                        payload_len = bytes.len();
                     } else if segment_size != 0 {
                         self.tx_queue
                             .copy_segment(offset, segment_size, &mut coalesced_payload);
@@ -3415,7 +3429,7 @@ fn rtt_sampling_round_trips() {
     assert_eq!(rtte.timestamp(), Some((first_send, TcpSeqNumber(0))));
 
     rtte.on_ack(Instant::from_millis(60), TcpSeqNumber(0));
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     assert_eq!(rtte.timestamp(), None);
     assert_eq!(rtte.max_seq_sent(), Some(TcpSeqNumber(0)));
 
@@ -3428,7 +3442,7 @@ fn rtt_sampling_round_trips() {
     assert_eq!(rtte.timestamp(), None);
     assert_eq!(rtte.max_seq_sent(), Some(TcpSeqNumber(2)));
     rtte.on_ack(Instant::from_millis(160), TcpSeqNumber(2));
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     assert_eq!(rtte.timestamp(), None);
     rtte.on_send(Instant::from_millis(170), TcpSeqNumber(2));
     assert_eq!(rtte.timestamp(), None);
@@ -3438,13 +3452,13 @@ fn rtt_sampling_round_trips() {
     rtte.on_send(third_send, TcpSeqNumber(3));
     assert_eq!(rtte.timestamp(), Some((third_send, TcpSeqNumber(3))));
     rtte.on_ack(Instant::from_millis(250), TcpSeqNumber(4));
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     assert_eq!(rtte.timestamp(), None);
 
     rtte.on_rto();
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     rtte.on_rto();
-    assert_eq!(rtte.smoothed_rtt(), 50);
+    assert_eq!(rtte.smoothed_rtt(), 50_000);
     rtte.on_rto();
     assert_eq!(rtte.smoothed_rtt(), 0);
     assert_eq!(rtte.timestamp(), None);
@@ -3758,8 +3772,25 @@ mod test {
         )
     }
 
+    /// Delivers `repr` carrying `frame`'s bytes; the interface sent any reply.
     #[track_caller]
     fn send_frame(
+        socket: &mut TestSocket,
+        timestamp: Instant,
+        repr: &TcpRepr,
+        frame: RxBuf,
+    ) -> Option<TcpRepr<'static>> {
+        let reply = deliver(socket, timestamp, repr, frame);
+        if let Some(reply) = &reply {
+            socket.socket.reply_sent(reply);
+        }
+        reply
+    }
+
+    /// Delivers `repr` carrying `frame`'s bytes and returns the reply without reporting it
+    /// sent or dropped; the caller does, as the interface would.
+    #[track_caller]
+    fn deliver(
         socket: &mut TestSocket,
         timestamp: Instant,
         repr: &TcpRepr,
@@ -3786,13 +3817,10 @@ mod test {
         if let Some(pending) = pending {
             socket.socket.commit_rx(frame, pending);
         }
-        match reply {
-            Some((_ip_repr, repr)) => {
-                net_trace!("recv: {}", repr);
-                Some(repr)
-            }
-            None => None,
-        }
+        reply.map(|(_ip_repr, repr)| {
+            net_trace!("recv: {}", repr);
+            repr
+        })
     }
 
     #[track_caller]
@@ -3949,7 +3977,7 @@ mod test {
             }
         }
 
-        fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        fn receive(&mut self, now: Instant) -> Option<Self::RxToken<'_>> {
             self.0.receive(now)
         }
 
@@ -4512,66 +4540,51 @@ mod test {
     }
 
 
-    /// While the RX pool is low, the socket processing a segment drops its own out-of-order
-    /// frames and out-of-order FIN, refuses an out-of-order segment with an ACK at the in-order
-    /// edge, and still stores in-order data. Once the pool recovers it holds out-of-order data
-    /// again, and the resent gap delivers every byte in order.
+    /// Past `MAX_OUT_OF_ORDER_VIEWS` frames held beyond its gap, a socket refuses another
+    /// out-of-order segment with an ACK at the in-order edge, and still stores in-order data;
+    /// once the gap fills, out-of-order data is taken again.
     #[test]
-    fn low_rx_pool_prunes_and_refuses_out_of_order_data() {
-        let mut s = socket_with_scaled_window(2);
-        for index in 1..=3 {
-            receive_window_segment(&mut s, index * 1100, &[index as u8; 1100]);
+    fn out_of_order_views_are_capped_per_socket() {
+        let mut s = socket_established_with_buffer_sizes(64, 4096);
+        for index in 0..MAX_OUT_OF_ORDER_VIEWS {
+            send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(REMOTE_SEQ + 3 + 2 * index).ack(LOCAL_SEQ + 1).data(b"x"));
         }
-        send(&mut s, Instant::from_millis(0), &SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + 4400)
-            .ack(LOCAL_SEQ + 1).data(&[4; 100]));
-        assert_eq!(s.rx_buffer.store.held(), 4);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 3400);
-        assert_eq!(s.rx_fin_seq, Some(REMOTE_SEQ + 1 + 4500));
-
-        s.cx.rx_pool_low = true;
-        let ack = receive_window_segment(&mut s, 5500, &[5; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1));
-        assert_eq!(s.rx_buffer.store.held(), 0);
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 0);
-        assert_eq!(s.rx_fin_seq, None);
-        assert_eq!(s.rx_refused_segments(), 1);
-        let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
-        assert_eq!(s.rx_buffer.store.held(), 1);
+        assert_eq!(s.rx_refused_segments(), 0);
+        let past = REMOTE_SEQ + 3 + 2 * MAX_OUT_OF_ORDER_VIEWS;
+        let ack = send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(past).ack(LOCAL_SEQ + 1).data(b"y"));
+        assert_eq!(ack.unwrap().ack_number, Some(REMOTE_SEQ + 1));
         assert_eq!(s.rx_refused_segments(), 1);
 
-        s.cx.rx_pool_low = false;
-        let ack = receive_window_segment(&mut s, 2200, &[2; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
-        assert_eq!(s.rx_buffer.store.out_of_order_len(), 1100);
-        let ack = receive_window_segment(&mut s, 1100, &[1; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 3300));
-        assert_eq!(drain_bytes(&mut s), [[0; 1100], [1; 1100], [2; 1100]].concat());
+        // In-order bytes join the first held frame; one frame fewer is out of order.
+        send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(b"ab"));
+        assert_eq!(drain_bytes(&mut s), b"abx");
+        send(&mut s, Instant::ZERO, &SEND_TEMPL.seq(past).ack(LOCAL_SEQ + 1).data(b"y"));
         assert_eq!(s.rx_refused_segments(), 1);
     }
 
-    /// A FIN past a gap arriving while the RX pool is low is refused with its data. Once the
-    /// pool recovers, the gap and the resent FIN deliver every byte and then end of stream.
+    /// Pruning takes the frame farthest from the in-order data first; a FIN past the gap lies
+    /// beyond it and goes with it. Filling the gap then delivers what stayed, and the resent
+    /// FIN ends the stream.
     #[test]
-    fn low_rx_pool_refuses_out_of_order_fin_until_recovery() {
-        let fin = |offset: usize| SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + offset).ack(LOCAL_SEQ + 1)
-            .data(&[1; 100]);
+    fn prune_takes_the_farthest_frame_and_the_fin_past_it() {
+        let fin = SEND_TEMPL.fin().seq(REMOTE_SEQ + 1 + 3300).ack(LOCAL_SEQ + 1).data(&[3; 100]);
         let mut s = socket_with_scaled_window(2);
-        s.cx.rx_pool_low = true;
-        send(&mut s, Instant::from_millis(0), &fin(1100));
-        assert_eq!(s.rx_fin_seq, None);
-        assert_eq!(s.rx_buffer.store.held(), 0);
-        assert_eq!(s.rx_refused_segments(), 1);
-        assert_eq!(s.state, State::Established);
+        for index in 1..=2 {
+            receive_window_segment(&mut s, index * 1100, &[index as u8; 1100]);
+        }
+        send(&mut s, Instant::ZERO, &fin);
+        assert_eq!(s.rx_fin_seq, Some(REMOTE_SEQ + 1 + 3400));
 
-        s.cx.rx_pool_low = false;
+        assert_eq!(s.prune_out_of_order(1), 1);
+        assert_eq!(s.rx_fin_seq, None);
         let ack = receive_window_segment(&mut s, 0, &[0; 1100]);
-        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 1100));
-        send(&mut s, Instant::from_millis(0), &fin(1100));
+        assert_eq!(ack.ack_number, Some(REMOTE_SEQ + 1 + 3300));
+        assert_eq!(s.state, State::Established);
+        send(&mut s, Instant::ZERO, &fin);
         assert_eq!(s.state, State::CloseWait);
-        assert_eq!(drain_bytes(&mut s), [&[0; 1100][..], &[1; 100][..]].concat());
+        let expected = [[0; 1100], [1; 1100], [2; 1100]].concat();
+        assert_eq!(drain_bytes(&mut s), [&expected[..], &[3; 100][..]].concat());
         assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
-        assert_eq!(s.rx_refused_segments(), 1);
     }
 
     #[test]
@@ -4656,6 +4669,20 @@ mod test {
 
     fn socket_established() -> TestSocket {
         socket_established_with_buffer_sizes(64, 64)
+    }
+
+    /// Established through a handshake whose SYN-ACK was acknowledged `rtt` after it left,
+    /// at time 0. One sample R gives SRTT = R, RTTVAR = R/2, so RTO = max(50 ms, 3R).
+    fn socket_established_with_rtt(rtt: Duration) -> TestSocket {
+        let mut s = socket_syn_received();
+        let sent_at = Instant::ZERO - rtt;
+        recv(&mut s, sent_at, |result| {
+            assert_eq!(result.unwrap().control, TcpControl::Syn);
+        });
+        send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
+        assert_eq!(s.state, State::Established);
+        assert_eq!(u64::from(s.rtte.srtt), rtt.total_micros());
+        s
     }
 
     fn frame_socket(byte_cap: usize, mss: usize, source: TxSource) -> TestSocket {
@@ -4909,19 +4936,38 @@ mod test {
         assert_eq!(emit_frame_segment(&mut s).2, b"cd");
     }
 
+    /// A frame queued after the tail was sent is its own entry: the window that reopens
+    /// takes it whole.
     #[test]
     fn frame_window_reopens_across_frames() {
         let source = crate::tests::tx_test_source(8);
         let mut s = frame_socket(8, 4, source.clone());
         assert!(s.send_frame(owned_frame(&source, b"ab")).is_ok());
-        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
         s.remote_win_len = 2;
-        assert_eq!(emit_frame_segment(&mut s).2, b"ab");
+        assert_eq!(emit_frame_segment(&mut s), (TcpControl::Psh, LOCAL_SEQ + 1, b"ab".to_vec(), true));
+        assert!(s.send_frame(owned_frame(&source, b"cd")).is_ok());
         ack_frame_bytes(&mut s, 2);
         s.remote_win_len = 4;
         let (_, _, payload, whole) = emit_frame_segment(&mut s);
         assert_eq!(payload, b"cd");
         assert!(whole);
+    }
+
+    /// Small frames queued with nothing sent in between share one segment: each is copied into
+    /// the unsent tail while the tail stays within a segment, and its own frame is freed. A
+    /// frame that would make the tail longer than a segment starts a new entry.
+    #[test]
+    fn small_frames_coalesce_into_one_segment() {
+        let source = crate::tests::tx_test_source(8);
+        let mut s = frame_socket(16, 8, source.clone());
+        for bytes in [&b"one"[..], b"two", b"xy"] {
+            assert!(s.send_frame(owned_frame(&source, bytes)).is_ok());
+        }
+        assert!(s.send_frame(owned_frame(&source, b"six")).is_ok());
+        let (_, seq, payload, _) = emit_frame_segment(&mut s);
+        assert_eq!((seq, payload), (LOCAL_SEQ + 1, b"onetwoxy".to_vec()));
+        let (_, seq, payload, whole) = emit_frame_segment(&mut s);
+        assert_eq!((seq, payload, whole), (LOCAL_SEQ + 9, b"six".to_vec(), true));
     }
 
     #[test]
@@ -5012,8 +5058,11 @@ mod test {
         assert_eq!(s.tx_queue.frames(), 65536usize.div_ceil(1460));
     }
 
+    /// With a peer MSS below the local segment payload, `send_slice` still takes the whole
+    /// byte capacity, in frames of one peer segment each, so every segment leaves as its own
+    /// frame without a copy.
     #[test]
-    fn frame_peer_mss_below_local_payload_keeps_byte_capacity() {
+    fn frame_peer_mss_below_local_payload_sends_whole_frames() {
         let source = crate::tests::tx_test_source(1460);
         let mut s = frame_socket(8192, 1460, source);
         s.remote_mss = 536;
@@ -5026,12 +5075,12 @@ mod test {
             let end = offset.checked_add(536).unwrap().min(bytes.len());
             assert_eq!(actual_seq, LOCAL_SEQ + 1 + offset);
             assert_eq!(payload, bytes[offset..end]);
-            assert!(!whole);
+            assert!(whole);
         }
     }
 
     #[test]
-    fn frame_peer_mss_cuts_across_local_send_slice_frames_like_ring() {
+    fn frame_peer_mss_sizes_send_slice_frames() {
         let source = crate::tests::tx_test_source(1460);
         let mut s = frame_socket(4380, 1460, source);
         s.remote_mss = 1024;
@@ -5043,7 +5092,7 @@ mod test {
             let (_, seq, payload, whole) = emit_frame_segment(&mut s);
             assert_eq!(seq, LOCAL_SEQ + 1 + offset);
             assert_eq!(payload, bytes[offset..offset + len]);
-            assert!(!whole);
+            assert!(whole);
         }
     }
 
@@ -6158,7 +6207,7 @@ mod test {
     fn test_syn_received_duplicate_syn_resends_identical_syn_ack() {
         for seq in [REMOTE_SEQ, TcpSeqNumber(-1)] {
             let mut s = socket_listen();
-            s.set_rto(Duration::from_millis(1000));
+            // No RTT sample is possible here, so the base RTO stays 300 ms.
             let syn = SEND_TEMPL.syn().seq(seq).no_ack().wscale(2).sack_perm(true);
             send!(s, syn);
             let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(seq + 1).mss(BASE_MSS).wscale(0)
@@ -6168,6 +6217,8 @@ mod test {
             recv!(s, [syn_ack.clone()]);
             send!(s, syn);
             recv_nothing!(s);
+            recv_nothing!(s, time 299);
+            recv!(s, time 300, [syn_ack.clone()]);
             send!(s, time 499, syn);
             recv_nothing!(s, time 499);
             send!(s, time 500, syn);
@@ -6193,7 +6244,7 @@ mod test {
     #[test]
     fn test_syn_received_duplicate_syn_restarts_timer_on_emission() {
         let mut s = socket_syn_received();
-        s.set_rto(Duration::from_millis(1000));
+        // The duplicate SYN cancels the RTT sample, so the base RTO stays 300 ms.
         let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS);
         recv!(s, [syn_ack.clone()]);
         send!(s, time 100, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack());
@@ -6206,13 +6257,13 @@ mod test {
         assert!(!s.timer.is_retransmit());
         recv!(s, time 300, [syn_ack]);
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(1300),
+            expires_at: Instant::from_millis(600),
         });
-        assert_eq!(s.retransmission_timeout(), Duration::from_millis(1000));
+        assert_eq!(s.retransmission_timeout(), Duration::from_millis(300));
         send!(s, time 400, SEND_TEMPL.seq(REMOTE_SEQ + 256).ack(LOCAL_SEQ + 1));
         recv_nothing!(s, time 400);
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(1300),
+            expires_at: Instant::from_millis(600),
         });
     }
 
@@ -6501,12 +6552,15 @@ mod test {
     fn google_fr_four_packet_initial_window_and_repair() {
         let mut s = socket_with_buffer_sizes(131072, 131072);
         s.socket.listen(LISTEN_END).unwrap();
-        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().win(32792).wscale(7).mss(BASE_MSS));
-        recv(&mut s, Instant::ZERO, |result| {
+        // A 100 ms handshake RTT gives RTO = 100 + 4·50 = 300 ms, past the 130 ms repair.
+        let syn = SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().win(32792).wscale(7).mss(BASE_MSS);
+        assert_eq!(send(&mut s, Instant::from_millis(-100), &syn), None);
+        recv(&mut s, Instant::from_millis(-100), |result| {
             assert_eq!(result.unwrap().control, TcpControl::Syn);
         });
         let ack = SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(257);
         send!(s, ack);
+        assert_eq!(s.retransmission_timeout(), Duration::from_millis(300));
         for index in 0..4 {
             let time = index * 10;
             send!(s, time time, ack.psh().seq(REMOTE_SEQ + 1 + index as usize * BASE_MSS as usize)
@@ -7838,32 +7892,6 @@ mod test {
             assert_eq!(bytes, b"abc");
             assert_eq!(bytes.as_ptr(), pointer);
         }
-    }
-
-    #[test]
-    fn dropping_received_frames_does_not_schedule_or_cancel_frame_wait() {
-        let mut handles = crate::iface::TcpSet::new(64);
-        let handle = handles.add(Socket::test_socket(0, 0));
-        let queue = crate::iface::DropQueue::with_capacity(1, 0);
-        let mut s = socket_established_with_buffer_sizes(64, 4096);
-        s.socket.set_frame_wake(queue.clone(), handle);
-
-        receive_window_segment(&mut s, 0, b"abc");
-        let first = s.recv().unwrap().unwrap();
-        receive_window_segment(&mut s, 3, b"def");
-        let second = s.recv().unwrap().unwrap();
-        let held = s.held_frames();
-        assert_eq!(held.count(), 2);
-        drop(first);
-        assert_eq!(held.count(), 1);
-        assert_eq!(queue.state(), (true, false));
-
-        s.rx_buffer.shared.queue_frame_wait();
-        drop(second);
-        assert_eq!(held.count(), 0);
-        assert_eq!(queue.state(), (true, true));
-        s.socket.clear_frame_wake();
-        assert_eq!(queue.state(), (true, false));
     }
 
     #[test]
@@ -9547,14 +9575,16 @@ mod test {
         check_data_after_fin_ack(State::Closing);
     }
 
+    /// An in-order FIN whose data ends past the advertised edge is taken with the data: the
+    /// reader sees all 65 bytes, then EOF, and the ACK covers the FIN.
     #[test]
-    fn test_fin_payload_past_right_edge_is_delivered() {
+    fn in_order_fin_beyond_advertised_edge_reports_eof() {
         let mut s = socket_established_with_buffer_sizes(64, 64);
-        send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[0; 65]));
-        assert_eq!(s.state, State::Established);
-        assert!(!s.rx_fin_received);
-        assert_eq!(s.recv_queue(), 65);
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 65).win(64)]);
+        send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[7; 65]));
+        assert_eq!(s.state, State::CloseWait);
+        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 66).win(64)]);
+        assert_eq!(drain_bytes(&mut s), [7; 65]);
+        assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
     }
 
     #[test]
@@ -11539,13 +11569,15 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet
+        // Acknowledge the first packet: a 5 ms sample, SRTT + 4·RTTVAR = 5 + 4·2.5 = 15 ms,
+        // raised to the 50 ms floor.
         send!(s, time 5, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
+        recv_nothing!(s, time 54);
         // The second packet should be re-sent.
-        recv!(s, time 305, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 55, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
 
-        recv_nothing!(s, time 355);
+        recv_nothing!(s, time 154);
     }
 
     #[test]
@@ -11558,12 +11590,12 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet
+        // Acknowledge the first packet: a 600 ms sample, RTO = 600 + 4·300 = 1800 ms.
         send!(s, time 600, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
         // The ACK of the first packet should restart the retransmit timer and delay a retransmission.
-        recv_nothing!(s, time 899);
+        recv_nothing!(s, time 2399);
         // The second packet should be re-sent.
-        recv!(s, time 900, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 2400, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
     }
 
@@ -11671,13 +11703,15 @@ mod test {
             .data(&b"abcdef"[..])), exact);
         recv!(s, time 0, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
-        // Acknowledge the first packet
+        // Acknowledge the first packet: a 5 ms sample, SRTT + 4·RTTVAR = 5 + 4·2.5 = 15 ms,
+        // raised to the 50 ms floor.
         send!(s, time 5, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
+        recv_nothing!(s, time 54);
         // The second packet should be re-sent.
-        recv!(s, time 305, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
+        recv!(s, time 55, Ok(RECV_TEMPL.fin().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
             .data(&b"012345"[..])), exact);
 
-        recv_nothing!(s, time 355);
+        recv_nothing!(s, time 154);
     }
 
     /// Established with Cubic and a 6-byte MSS: "abcdef012345" goes out as two
@@ -12040,7 +12074,7 @@ mod test {
 
     #[test]
     fn pure_acks_during_zero_window_probe_do_not_count_as_retransmits() {
-        let mut s = socket_zero_window(DEFAULT_RTO);
+        let mut s = socket_zero_window(socket_established());
         recv!(s, time 300, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"a")));
         assert_eq!(s.retransmits(), 0);
         for offset in 0..3 {
@@ -12230,7 +12264,7 @@ mod test {
                 assert_eq!(s.loss_events(), u64::from(time != 0));
             }
         }
-        let mut s = socket_zero_window(DEFAULT_RTO);
+        let mut s = socket_zero_window(socket_established());
         for (time, retransmits) in [(300, 0), (900, 1), (2100, 2)] {
             recv(&mut s, Instant::from_millis(time), |result| {
                 let repr = result.unwrap();
@@ -12880,78 +12914,75 @@ mod test {
         }
     }
 
-    fn socket_zero_window(rto: Duration) -> TestSocket {
-        let mut s = socket_established();
-        s.set_rto(rto);
+    fn socket_zero_window(mut s: TestSocket) -> TestSocket {
         s.send_slice(b"abc").unwrap();
         send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
         s
     }
 
     #[test]
-    fn set_rto_applies_to_syn_synack_data_fin_and_probe() {
-        for state in [State::SynSent, State::SynReceived, State::Established, State::FinWait1] {
-            let mut s = match state {
-                State::SynSent => socket_syn_sent(),
-                State::SynReceived => socket_syn_received(),
-                _ => socket_established(),
-            };
-            s.set_rto(Duration::from_millis(700));
-            if state == State::Established {
-                s.send_slice(b"abc").unwrap();
-            } else if state == State::FinWait1 {
+    fn measured_rto_applies_to_data_fin_and_probe() {
+        // RTT 200 ms: RTO = 200 + 4 · 100 = 600 ms.
+        for close in [false, true] {
+            let mut s = socket_established_with_rtt(Duration::from_millis(200));
+            if close {
                 s.close();
+            } else {
+                s.send_slice(b"abc").unwrap();
             }
             recv(&mut s, Instant::ZERO, |result| {
-                let repr = result.unwrap();
-                assert_eq!(repr.control, match state {
-                    State::SynSent | State::SynReceived => TcpControl::Syn,
-                    State::FinWait1 => TcpControl::Fin,
-                    _ => TcpControl::Psh,
-                });
+                let control = if close { TcpControl::Fin } else { TcpControl::Psh };
+                assert_eq!(result.unwrap().control, control);
             });
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
         }
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
-        s.set_rto(Duration::from_millis(400));
-        recv_nothing!(s, time 699);
-        recv(&mut s, Instant::from_millis(700), |result| {
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
+        recv_nothing!(s, time 599);
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1500)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1800)));
     }
 
     #[test]
     fn rto_backoff_caps_at_sixty_seconds() {
+        // RTT 10 s: RTO = 10 + 4 · 5 = 30 s; doubled it reaches the 60 s cap. Probes keep
+        // the measurement; the third retransmission expiry clears it, so the base falls
+        // back to 300 ms and the next deadline is 300 ms · 2^3 = 2.4 s away.
         for probe in [false, true] {
             let mut s = if probe {
-                socket_zero_window(Duration::from_secs(30))
+                socket_zero_window(socket_established_with_rtt(Duration::from_secs(10)))
             } else {
-                let mut s = socket_established();
-                s.set_rto(Duration::from_secs(30));
+                let mut s = socket_established_with_rtt(Duration::from_secs(10));
                 s.send_slice(b"abc").unwrap();
                 recv(&mut s, Instant::ZERO, |result| {
                     assert_eq!(result.unwrap().payload, b"abc");
                 });
                 s
             };
-            for (index, at) in [30_000, 90_000, 150_000, 210_000].into_iter().enumerate() {
+            let expiries: &[(i64, i64)] = if probe {
+                &[(30_000, 90_000), (90_000, 150_000), (150_000, 210_000), (210_000, 270_000)]
+            } else {
+                &[(30_000, 90_000), (90_000, 150_000), (150_000, 152_400)]
+            };
+            for (index, &(at, next)) in expiries.iter().enumerate() {
                 recv_nothing(&mut s, Instant::from_millis(at - 1));
                 recv(&mut s, Instant::from_millis(at), |result| {
                     assert_eq!(result.unwrap().payload, if probe { &b"a"[..] } else { &b"abc"[..] });
                 });
                 assert_eq!(s.rto_backoff, (index + 1) as u32);
-                assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 60_000)));
+                assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(next)));
             }
         }
     }
 
     #[test]
     fn probe_backoff_counts_expiry_once_even_if_emit_fails() {
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        for at in [700, 710] {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        for at in [600, 610] {
             s.cx.set_now(Instant::from_millis(at));
             assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                 let repr = frame_payload(repr, &frame);
@@ -12960,14 +12991,14 @@ mod test {
             }), Err(()));
             assert_eq!(s.rto_backoff, 1);
             assert!(matches!(s.timer, Timer::ZeroWindowProbe { backoff_applied: true, .. }));
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
         }
-        recv(&mut s, Instant::from_millis(720), |result| {
+        recv(&mut s, Instant::from_millis(620), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2120)));
-        recv_nothing!(s, time 2119);
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1820)));
+        recv_nothing!(s, time 1819);
     }
 
     #[test]
@@ -13008,7 +13039,7 @@ mod test {
 
     #[test]
     fn probe_byte_resend_does_not_sample_rtt() {
-        let mut s = socket_zero_window(DEFAULT_RTO);
+        let mut s = socket_zero_window(socket_established());
         for at in [300, 900] {
             recv!(s, time at, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"a")));
         }
@@ -13020,67 +13051,69 @@ mod test {
         recv!(s, time 1100, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 1).data(b"b")));
         send!(s, time 1150, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 3).win(1));
         assert!(s.rtte.have_measurement);
-        assert_eq!(s.rtte.srtt, 50);
+        assert_eq!(s.rtte.srtt, 50_000);
     }
 
     #[test]
     fn duplicate_ack_does_not_reset_probe_backoff() {
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        recv(&mut s, Instant::from_millis(700), |result| {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
-        send!(s, time 710, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
+        send!(s, time 610, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
-        recv_nothing!(s, time 2099);
-        recv(&mut s, Instant::from_millis(2100), |result| {
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1800)));
+        recv_nothing!(s, time 1799);
+        recv(&mut s, Instant::from_millis(1800), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
-        send!(s, time 2110, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(0));
+        send!(s, time 1810, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2).win(0));
         assert_eq!(s.rto_backoff, 0);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2810)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2410)));
     }
 
     #[test]
     fn accepted_window_reopening_resets_backoff() {
-        let mut s = socket_zero_window(Duration::from_millis(700));
-        recv(&mut s, Instant::from_millis(700), |result| {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
-        send!(s, time 710, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ).win(6));
+        send!(s, time 610, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ).win(6));
         assert_eq!(s.remote_win_len, 0);
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
-        send!(s, time 720, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(6));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1800)));
+        send!(s, time 620, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(6));
         assert_eq!(s.remote_win_len, 6);
         assert_eq!(s.rto_backoff, 0);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1420)));
-        recv(&mut s, Instant::from_millis(720), |result| {
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1220)));
+        recv(&mut s, Instant::from_millis(620), |result| {
             assert_eq!(result.unwrap().payload, b"abc");
         });
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1420)));
-        recv(&mut s, Instant::from_millis(1420), |result| {
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1220)));
+        recv(&mut s, Instant::from_millis(1220), |result| {
             assert_eq!(result.unwrap().payload, b"abc");
         });
-        send!(s, time 1430, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(12));
+        send!(s, time 1230, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(12));
         assert_eq!(s.remote_win_len, 12);
         assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2820)));
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2420)));
     }
 
     #[test]
     fn rto_expiry_with_probe_counts_one_backoff() {
         for fail_emit in [false, true] {
-            let mut s = socket_established();
-            s.set_rto(Duration::from_millis(700));
+            // RTT 200 ms: RTO = 600 ms.
+            let mut s = socket_established_with_rtt(Duration::from_millis(200));
             s.send_slice(b"abc").unwrap();
             recv(&mut s, Instant::ZERO, |result| {
                 assert_eq!(result.unwrap().payload, b"abc");
             });
             send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
-            recv_nothing!(s, time 699);
+            recv_nothing!(s, time 599);
             if fail_emit {
-                for at in [700, 710] {
+                for at in [600, 610] {
                     s.cx.set_now(Instant::from_millis(at));
                     assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
                         let repr = frame_payload(repr, &frame);
@@ -13088,20 +13121,20 @@ mod test {
                         (Err(()), frame.map(UniqueTxBuf::into_buf))
                     }), Err(()));
                     assert_eq!(s.rto_backoff, 1);
-                    assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(700)));
+                    assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
                 }
             }
-            let at = if fail_emit { 720 } else { 700 };
+            let at = if fail_emit { 620 } else { 600 };
             recv(&mut s, Instant::from_millis(at), |result| {
                 assert_eq!(result.unwrap().payload, b"a");
             });
             assert_eq!(s.rto_backoff, 1);
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 1400)));
-            recv(&mut s, Instant::from_millis(at + 1400), |result| {
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 1200)));
+            recv(&mut s, Instant::from_millis(at + 1200), |result| {
                 assert_eq!(result.unwrap().payload, b"a");
             });
             assert_eq!(s.rto_backoff, 2);
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 4200)));
+            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(at + 3600)));
         }
     }
 
@@ -13111,9 +13144,13 @@ mod test {
         let mut s = socket_with_buffer_sizes(1024, rx_len);
         s.set_ack_delay(Some(ACK_DELAY_DEFAULT));
         s.socket.listen(LISTEN_END).unwrap();
-        send!(s, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS));
-        recv!(s, Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).win(rx_len as u16)
-            .mss(BASE_MSS)));
+        // A 100 ms handshake RTT gives RTO = 100 + 4·50 = 300 ms, after the delayed ACK.
+        let syn = SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().mss(BASE_MSS);
+        assert_eq!(send(&mut s, Instant::from_millis(-100), &syn), None);
+        recv(&mut s, Instant::from_millis(-100), |result| {
+            assert_eq!(result, Ok(RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1)
+                .win(rx_len as u16).mss(BASE_MSS)));
+        });
         send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
 
         let data_seq = s.remote_seq_no;
@@ -13312,7 +13349,6 @@ mod test {
         // Arm the probe timer. (Set directly because the ACK above carries no
         // new data; in real traffic this state is reached e.g. when the
         // controller shrinks cwnd below the flight size while probing.)
-        s.set_rto(Duration::from_millis(100));
         s.timer
             .set_for_zero_window_probe(Instant::from_millis(10), Duration::from_millis(100));
 
@@ -13322,7 +13358,8 @@ mod test {
         // if the remote's window update got lost.
         recv!(s, time 110, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + 2048).ack(REMOTE_SEQ + 1)
             .data(&data[..1])));
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(310)));
+        // No RTT sample yet, so the backed-off probe interval is 2 · 300 ms.
+        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(710)));
     }
 
     #[test]
@@ -13503,43 +13540,30 @@ mod test {
         }
     }
 
-    /// `REMOTE_ADDR` is on-link but nothing resolved its hardware address
-    /// (the interface's neighbor cache starts empty), so an immediate reply
-    /// built by `ack_reply` can never actually be dispatched here.
+    /// An immediate ACK the interface could not send (no TX room, or no neighbor) leaves the
+    /// socket's record of what it acknowledged alone, and the next egress sends that ACK.
     #[test]
-    fn test_immediate_ack_reply_does_not_commit_state_without_a_resolvable_neighbor() {
+    fn dropped_ingress_ack_is_sent_by_next_egress() {
         let mut s = socket_established();
-        let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ethernet);
-        s.cx = iface.inner;
-
         // Open a hole so the next, gap-filling segment takes the immediate
-        // "ACKing incoming segment" path in `process` (store had
-        // out-of-order data), the same path a RFC 5961 challenge ACK or an
-        // out-of-order FIN uses.
+        // "ACKing incoming segment" path in `process`.
         send(
             &mut s,
-            Instant::from_millis(0),
+            Instant::ZERO,
             &SEND_TEMPL.seq(REMOTE_SEQ + 1 + 3).ack(LOCAL_SEQ + 1).data(&b"def"[..]),
         );
-
         let before_ack = s.remote_last_ack;
         let before_win = s.remote_last_win_bytes;
         assert_eq!(before_ack, Some(REMOTE_SEQ + 1));
 
-        let reply = send(
-            &mut s,
-            Instant::from_millis(0),
-            &SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..]),
-        );
-        // The would-be reply is still computed correctly...
-        assert_eq!(
-            reply,
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(64))
-        );
-        // ...but since it can't be dispatched (no resolved neighbor), the
-        // socket must not believe it already ACKed the 6 bytes.
+        let segment = SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..]);
+        let reply = deliver(&mut s, Instant::ZERO, &segment, RxBuf::from_vec(b"abcdef".to_vec()));
+        let ack = RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(64);
+        assert_eq!(reply, Some(ack));
+        s.socket.reply_dropped();
         assert_eq!(s.remote_last_ack, before_ack);
         assert_eq!(s.remote_last_win_bytes, before_win);
+        recv!(s, [ack]);
     }
 
     #[test]
@@ -13931,49 +13955,71 @@ mod test {
     }
 
     #[test]
-    fn smoothed_rtt_initializes_then_uses_existing_weight() {
+    fn smoothed_rtt_follows_rfc6298() {
         let mut r = SmoothedRtt::default();
         assert!(!r.have_measurement);
-        for (index, (sample, expected)) in [(101, 101), (102, 102), (109, 103), (9, 92)]
-            .into_iter()
-            .enumerate()
+        assert_eq!(r.retransmission_timeout(), DEFAULT_RTO);
+        // Microseconds; divisions round up.
+        // 101 ms first: SRTT = 101000, RTTVAR = 50500, RTO = 101000 + 4·50500 = 303000.
+        // 102 ms: RTTVAR = (3·50500 + 1000)/4 = 38125, SRTT = (7·101000 + 102000)/8 = 101125,
+        //   RTO = 101125 + 152500 = 253625.
+        // 109 ms: RTTVAR = (3·38125 + 7875)/4 = 30562.5 -> 30563,
+        //   SRTT = (7·101125 + 109000)/8 = 102109.375 -> 102110, RTO = 102110 + 122252 = 224362.
+        // 9 ms: RTTVAR = (3·30563 + 93110)/4 = 46199.75 -> 46200,
+        //   SRTT = (7·102110 + 9000)/8 = 90471.25 -> 90472, RTO = 90472 + 184800 = 275272.
+        for (index, (sample, srtt, rttvar, rto)) in [
+            (101, 101_000, 50_500, 303_000),
+            (102, 101_125, 38_125, 253_625),
+            (109, 102_110, 30_563, 224_362),
+            (9, 90_472, 46_200, 275_272),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let sent_at = Instant::from_millis(index as i64 * 1000);
             let seq = LOCAL_SEQ + index + 1;
             r.on_send(sent_at, seq);
             r.on_ack(sent_at + Duration::from_millis(sample), seq);
             assert!(r.have_measurement);
-            assert_eq!(r.srtt, expected);
+            assert_eq!((r.srtt, r.rttvar), (srtt, rttvar));
+            assert_eq!(r.retransmission_timeout(), Duration::from_micros(rto));
             assert_eq!(r.timestamp(), None);
         }
+        // 30 µs: SRTT + 4·RTTVAR = 30 + 60 = 90 µs, raised to the 50 ms floor.
+        let mut r = SmoothedRtt::default();
+        r.sample(30);
+        assert_eq!(r.retransmission_timeout(), Duration::from_millis(50));
+        // 30 s: 30 + 4·15 = 90 s, capped at 60 s.
+        let mut r = SmoothedRtt::default();
+        r.sample(30_000_000);
+        assert_eq!(r.retransmission_timeout(), Duration::from_secs(60));
     }
 
     #[test]
-    fn fixed_rto_ignores_slow_ack_samples() {
-        for (rto, deadline) in [
-            (Duration::from_millis(1000), 1600),
-            (Duration::from_millis(700), 1300),
-        ] {
-            let mut s = socket_established();
-            s.set_rto(rto);
-            s.remote_mss = 6;
-            s.send_slice(b"abcdef012345").unwrap();
-            for offset in [0, 6] {
-                recv(&mut s, Instant::ZERO, |result| {
-                    let repr = result.unwrap();
-                    assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
-                    assert_eq!(repr.payload, &b"abcdef012345"[offset..offset + 6]);
-                });
-            }
-            send!(s, time 600, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
-            assert_eq!(s.rtte.srtt, 600);
-            assert_eq!(s.timer, Timer::Retransmit {
-                expires_at: Instant::from_millis(deadline),
+    fn measured_rto_follows_slow_ack_sample() {
+        // RTT 300 ms: SRTT = 300000 µs, RTTVAR = 150000, RTO = 900 ms.
+        let mut s = socket_established_with_rtt(Duration::from_millis(300));
+        s.remote_mss = 6;
+        s.send_slice(b"abcdef012345").unwrap();
+        for offset in [0, 6] {
+            recv(&mut s, Instant::ZERO, |result| {
+                let repr = result.unwrap();
+                assert_eq!(repr.seq_number, LOCAL_SEQ + 1 + offset);
+                assert_eq!(repr.payload, &b"abcdef012345"[offset..offset + 6]);
             });
-            recv_nothing!(s, time deadline - 1);
-            recv!(s, time deadline, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 7).ack(REMOTE_SEQ + 1)
-                .data(b"012345")));
         }
+        // 600 ms sample: RTTVAR = (3·150000 + 300000)/4 = 187500,
+        // SRTT = (7·300000 + 600000)/8 = 337500, RTO = 337500 + 750000 = 1087500 µs.
+        send!(s, time 600, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
+        assert_eq!((s.rtte.srtt, s.rtte.rttvar), (337_500, 187_500));
+        let deadline = Instant::from_micros(1_687_500);
+        assert_eq!(s.timer, Timer::Retransmit { expires_at: deadline });
+        recv_nothing(&mut s, deadline - Duration::from_micros(1));
+        recv(&mut s, deadline, |result| {
+            let repr = result.unwrap();
+            assert_eq!(repr.seq_number, LOCAL_SEQ + 7);
+            assert_eq!(repr.payload, b"012345");
+        });
     }
 
     #[test]
@@ -14015,7 +14061,7 @@ mod test {
                 State::SynReceived => socket_syn_received(),
                 _ => socket_established(),
             };
-            s.set_rto(Duration::from_millis(1000));
+            // No RTT sample is taken (every ACK covers retransmitted data): base RTO 300 ms.
             if state == State::Established {
                 s.send_slice(b"abcdef").unwrap();
             } else if state == State::FinWait1 {
@@ -14029,35 +14075,35 @@ mod test {
                 });
             }
             assert_eq!(s.timer, Timer::Retransmit {
-                expires_at: Instant::from_millis(7000),
+                expires_at: Instant::from_millis(4200),
             });
             if state == State::Established {
                 for stale_ack in [LOCAL_SEQ, LOCAL_SEQ + 1] {
                     send!(s, time 3100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(stale_ack).win(256));
-                    assert_eq!(s.retransmission_timeout(), Duration::from_millis(4000));
+                    assert_eq!(s.retransmission_timeout(), Duration::from_millis(1200));
                     assert_eq!(s.timer, Timer::Retransmit {
-                        expires_at: Instant::from_millis(7000),
+                        expires_at: Instant::from_millis(4200),
                     });
                 }
                 send!(s, time 3150, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 4));
                 assert_eq!(s.local_seq_no, LOCAL_SEQ + 4);
                 assert_eq!(s.rto_backoff, 0);
                 assert_eq!(s.timer, Timer::Retransmit {
-                    expires_at: Instant::from_millis(4150),
+                    expires_at: Instant::from_millis(3450),
                 });
             }
             send!(s, time 3200, SEND_TEMPL
                 .ctl(if state == State::SynSent { TcpControl::Syn } else { TcpControl::None })
                 .seq(if state == State::SynSent { REMOTE_SEQ } else { REMOTE_SEQ + 1 }).ack(ack));
             assert_eq!(s.local_seq_no, ack);
-            assert_eq!(s.retransmission_timeout(), Duration::from_millis(1000), "{state}");
+            assert_eq!(s.retransmission_timeout(), Duration::from_millis(300), "{state}");
         }
     }
 
     #[test]
-    fn fixed_rto_emit_failure_does_not_backoff_twice() {
+    fn emit_failure_does_not_backoff_twice() {
+        // No RTT sample: base RTO 300 ms.
         let mut s = socket_established();
-        s.set_rto(Duration::from_millis(1000));
         s.send_slice(b"abcdef").unwrap();
         recv!(s, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
         for time in [1000, 1100] {
@@ -14070,16 +14116,16 @@ mod test {
             }), Err(()));
             assert!(!s.timer.is_retransmit());
             assert_eq!(s.rtte.timestamp(), None);
-            assert_eq!(s.retransmission_timeout(), Duration::from_millis(2000));
+            assert_eq!(s.retransmission_timeout(), Duration::from_millis(600));
         }
         recv!(s, time 1200, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(3200),
+            expires_at: Instant::from_millis(1800),
         });
-        recv_nothing!(s, time 3199);
-        recv!(s, time 3200, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
+        recv_nothing!(s, time 1799);
+        recv!(s, time 1800, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"abcdef")));
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(7200),
+            expires_at: Instant::from_millis(3000),
         });
     }
 
@@ -14099,68 +14145,59 @@ mod test {
     }
 
     #[test]
-    fn rto_at_cap_backoff_matches() {
+    fn rto_backoff_caps_measured_base() {
         let mut s = socket();
-        s.set_rto(MAX_RTO);
+        // 20 s sample: RTO = 20 + 4·10 = 60 s.
+        s.rtte.sample(20_000_000);
         for backoff in [0, 1, 26, 40] {
             s.rto_backoff = backoff;
             assert_eq!(s.retransmission_timeout(), Duration::from_micros(60_000_000));
         }
-        s.set_rto(Duration::from_micros(1));
-        for (backoff, expected_us) in [(0, 1), (1, 2), (26, 60_000_000), (40, 60_000_000)] {
+        // 0 µs sample: RTO = 0, raised to the 50 ms floor.
+        s.rtte = SmoothedRtt::default();
+        s.rtte.sample(0);
+        for (backoff, expected_us) in [(0, 50_000), (1, 100_000), (26, 60_000_000), (40, 60_000_000)] {
             s.rto_backoff = backoff;
             assert_eq!(s.retransmission_timeout(), Duration::from_micros(expected_us));
         }
     }
 
     #[test]
-    fn set_rto_panics_outside_range() {
-        for rto in [Duration::ZERO, MAX_RTO + Duration::from_micros(1), Duration::MAX] {
-            assert!(std::panic::catch_unwind(|| socket().set_rto(rto)).is_err());
-        }
-        for rto in [Duration::from_micros(1), MAX_RTO] {
-            let mut s = socket();
-            s.set_rto(rto);
-            assert_eq!(Duration::from_micros(u64::from(s.rto_us)), rto);
-        }
-    }
-
-    #[test]
-    fn set_rto_applies_at_next_arm_and_survives_reconnect() {
-        let mut s = socket_established();
-        s.set_rto(Duration::from_millis(1000));
+    fn measured_rto_clears_on_reset_and_reconnect() {
+        // RTT 200 ms: RTO = 600 ms.
+        let mut s = socket_established_with_rtt(Duration::from_millis(200));
         s.send_slice(b"abcdef").unwrap();
         recv(&mut s, Instant::ZERO, |result| {
             assert_eq!(result.unwrap().payload, b"abcdef");
         });
-        s.set_rto(Duration::from_micros(300_001));
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_millis(1000),
+            expires_at: Instant::from_millis(600),
         });
-        recv(&mut s, Instant::from_millis(1000), |result| {
+        recv(&mut s, Instant::from_millis(600), |result| {
             assert_eq!(result.unwrap().payload, b"abcdef");
         });
         assert_eq!(s.rto_backoff, 1);
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(1_600_002),
+            expires_at: Instant::from_millis(1800),
         });
-        send!(s, time 1100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
+        send!(s, time 700, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 7));
         s.close();
-        recv(&mut s, Instant::from_millis(1200), |result| {
+        recv(&mut s, Instant::from_millis(800), |result| {
             assert_eq!(result.unwrap().control, TcpControl::Fin);
         });
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(1_500_001),
+            expires_at: Instant::from_millis(1400),
         });
         s.reset();
         assert_eq!(s.rto_backoff, 0);
+        assert!(!s.rtte.have_measurement);
         s.listen(LOCAL_PORT).unwrap();
         send!(s, time 2000, SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack());
         recv(&mut s, Instant::from_millis(2000), |result| {
             assert_eq!(result.unwrap().control, TcpControl::Syn);
         });
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(2_300_001),
+            expires_at: Instant::from_millis(2300),
         });
         s.abort();
         s.socket.connect(&mut s.cx, REMOTE_END, LOCAL_END.port).unwrap();
@@ -14168,33 +14205,33 @@ mod test {
             assert_eq!(result.unwrap().control, TcpControl::Syn);
         });
         assert_eq!(s.timer, Timer::Retransmit {
-            expires_at: Instant::from_micros(3_300_001),
+            expires_at: Instant::from_millis(3300),
         });
-        assert_eq!(Duration::from_micros(u64::from(s.rto_us)), Duration::from_micros(300_001));
     }
 
     #[test]
-    fn fixed_rto_caps_and_discards_smoothed_rtt_after_three_expiries() {
+    fn measured_rto_backs_off_then_falls_back_after_three_expiries() {
         let mut s = socket_established();
         s.send_slice(b"abc").unwrap();
         recv(&mut s, Instant::ZERO, |result| {
             assert_eq!(result.unwrap().payload, b"abc");
         });
+        // 101 ms sample: SRTT = 101000 µs, RTTVAR = 50500, RTO = 303 ms.
         send!(s, time 101, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 4));
-        assert_eq!(s.rtte.srtt, 101);
-        s.set_rto(Duration::from_micros(1));
+        assert_eq!(s.rtte.srtt, 101_000);
         s.send_slice(b"def").unwrap();
         recv(&mut s, Instant::from_millis(200), |result| {
             assert_eq!(result.unwrap().payload, b"def");
         });
-        let mut expires_at = Instant::from_micros(200_001);
+        let mut expires_at = Instant::from_millis(503);
+        // 303 ms · 2, · 4; the third expiry clears the measurement, so 300 ms · 2^3, 2^4, ...
+        // until 300 ms · 2^8 = 76.8 s is capped at 60 s.
         let delays = [
-            2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-            65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608,
-            16777216, 33554432, 60_000_000,
+            606_000, 1_212_000, 2_400_000, 4_800_000, 9_600_000, 19_200_000, 38_400_000,
+            60_000_000,
         ];
         for (index, delay) in delays.into_iter()
-            .chain(core::iter::repeat_n(60_000_000, 54))
+            .chain(core::iter::repeat_n(60_000_000, 4))
             .enumerate()
         {
             recv_nothing(&mut s, expires_at - Duration::from_micros(1));
@@ -14207,7 +14244,7 @@ mod test {
             assert_eq!(s.timer, Timer::Retransmit { expires_at });
             assert_eq!(s.rto_backoff, (index + 1) as u32);
             assert_eq!(s.rtte.have_measurement, index < 2);
-            assert_eq!(s.rtte.srtt, 101);
+            assert_eq!(s.rtte.srtt, 101_000);
             assert_eq!(s.rtte.timestamp(), None);
         }
     }
@@ -14219,9 +14256,10 @@ mod test {
         recv(&mut s, Instant::ZERO, |result| {
             assert_eq!(result.unwrap().payload, b"a");
         });
+        // 100 ms sample: SRTT = 100000 µs, RTTVAR = 50000, RTO = 300 ms.
         send!(s, time 100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 2));
         assert!(s.rtte.have_measurement);
-        assert_eq!(s.rtte.srtt, 100);
+        assert_eq!(s.rtte.srtt, 100_000);
         s.send_slice(b"b").unwrap();
         for at in [200, 500, 1100] {
             recv(&mut s, Instant::from_millis(at), |result| {
@@ -14234,11 +14272,14 @@ mod test {
         recv(&mut s, Instant::from_millis(1200), |result| {
             assert_eq!(result.unwrap().payload, b"c");
         });
+        // 200 ms sample: RTTVAR = (3·50000 + 100000)/4 = 62500,
+        // SRTT = (7·100000 + 200000)/8 = 112500, RTO = 112500 + 250000 = 362.5 ms.
         send!(s, time 1400, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 4));
-        assert_eq!(s.rtte.srtt, 113);
+        assert_eq!((s.rtte.srtt, s.rtte.rttvar), (112_500, 62_500));
         s.send_slice(b"d").unwrap();
-        for (index, at) in [1500, 1800, 2400, 3600].into_iter().enumerate() {
-            recv(&mut s, Instant::from_millis(at), |result| {
+        // Sent at 1500 ms, resent after 362.5, 725 and 1450 ms.
+        for (index, at) in [1_500_000, 1_862_500, 2_587_500, 4_037_500].into_iter().enumerate() {
+            recv(&mut s, Instant::from_micros(at), |result| {
                 assert_eq!(result.unwrap().payload, b"d");
             });
             assert_eq!(s.rtte.have_measurement, index < 3);
@@ -14246,15 +14287,15 @@ mod test {
                 assert_eq!(s.rtte.timestamp(), None);
             }
         }
-        send!(s, time 3700, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 5));
+        send!(s, time 4100, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 5));
         assert!(!s.rtte.have_measurement);
         s.send_slice(b"e").unwrap();
-        recv(&mut s, Instant::from_millis(3800), |result| {
+        recv(&mut s, Instant::from_millis(4200), |result| {
             assert_eq!(result.unwrap().payload, b"e");
         });
-        send!(s, time 3850, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 6));
+        send!(s, time 4250, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 6));
         assert!(s.rtte.have_measurement);
-        assert_eq!(s.rtte.srtt, 50);
+        assert_eq!(s.rtte.srtt, 50_000);
     }
 
     #[test]

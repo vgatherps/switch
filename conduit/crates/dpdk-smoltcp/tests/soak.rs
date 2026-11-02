@@ -425,8 +425,8 @@ fn two_stacks_soak() {
     with_eal(|eal| run(eal, seed, seconds));
 }
 
-/// No RX mbuf held and at most one TX mbuf per side: an unused TX token's packet
-/// stays as the Device's spare until `into_port`.
+/// No RX mbuf held and at most one TX mbuf per side: a TX token dropped without
+/// `consume` leaves its packet as the Device's spare until `into_port`.
 fn drained(pair: &Pair) -> bool {
     pair.in_use().iter().all(|&(rx, tx)| rx == 0 && tx <= 1)
 }

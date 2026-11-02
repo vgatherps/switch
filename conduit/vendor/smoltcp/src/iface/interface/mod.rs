@@ -172,9 +172,6 @@ pub struct InterfaceInner {
     ipv4_gateway: Option<Ipv4Address>,
     path_mtus: Option<PathMtus>,
     pub(crate) owned_ipv4: OwnedIpv4,
-    /// The receive buffer pool is under pressure: a TCP socket processing a segment keeps no
-    /// out-of-order data. Set by the driver before ingress.
-    pub(crate) rx_pool_low: bool,
 }
 
 /// Configuration structure used for creating a network interface.
@@ -257,7 +254,6 @@ impl Interface {
                 ipv4_gateway: None,
                 path_mtus: None,
                 owned_ipv4: config.owned_ipv4,
-                rx_pool_low: false,
                 neighbor_cache: NeighborCache::new(config.neighbor_capacity),
                 probe_owed: None,
                 tcp_isn_secret,
@@ -351,14 +347,6 @@ impl Interface {
     /// Path MTUs do not change next hops, so the neighbor cache stays valid.
     pub fn set_path_mtus(&mut self, paths: PathMtus) {
         self.inner.path_mtus = Some(paths);
-    }
-
-    /// Whether the receive buffer pool is under pressure for the ingress that follows. While
-    /// it is, a TCP socket that processes a segment drops its own out-of-order data and stores
-    /// only in-order data, as Linux prunes the receiving socket's out-of-order queue under
-    /// memory pressure; other sockets are untouched.
-    pub fn set_rx_pool_low(&mut self, low: bool) {
-        self.inner.rx_pool_low = low;
     }
 
     /// Replace the owned set of an interface that has no sockets yet: tests only; the set is
@@ -572,7 +560,7 @@ impl Interface {
         sockets: &mut TcpSet<'_>,
         mut udp: Option<&mut UdpSet>,
     ) -> PollIngressSingleResult {
-        let Some((rx_token, tx_token)) = device.receive(self.inner.now) else {
+        let Some(rx_token) = device.receive(self.inner.now) else {
             return PollIngressSingleResult::None;
         };
 
@@ -589,7 +577,11 @@ impl Interface {
             bytes,
             udp.as_deref_mut(),
         ) {
-            let result = if let Some(index) = sockets.pending_tcp_reply.take() {
+            // A reply takes its TX token only now. With no TX room it is dropped: a TCP
+            // socket keeps its ACK owed (see `reply_dropped`), and other replies (ARP, ICMP
+            // echo, RST) are the peer's to repeat.
+            let tx_token = device.transmit(self.inner.now);
+            if let Some(index) = sockets.pending_tcp_reply.take() {
                 // The socket's cached next hop is current only while the neighbor
                 // generation is; an entry that expired since the last egress pass
                 // must bump it, so the reply looks it up (and probes it) like egress does.
@@ -600,21 +592,29 @@ impl Interface {
                 let IpPayload::Tcp(tcp) = packet.payload() else {
                     unreachable!("TCP socket reply is not a TCP segment")
                 };
-                let meta = &mut sockets.item_at_mut(index)
-                    .expect("TCP reply socket is missing").meta;
-                self.inner.dispatch_tcp(
-                    tx_token,
-                    PacketMeta::default(),
-                    packet.ip_repr(),
-                    *tcp,
-                    &mut meta.next_hop,
-                    &mut meta.tcp_template,
-                )
-            } else {
-                self.inner.dispatch(tx_token, packet)
-            };
-            if let Err(err) = result {
-                net_debug!("Failed to send response: {:?}", err);
+                let item = sockets.item_at_mut(index).expect("TCP reply socket is missing");
+                let result = tx_token.map(|tx_token| {
+                    self.inner.dispatch_tcp(
+                        tx_token,
+                        PacketMeta::default(),
+                        packet.ip_repr(),
+                        *tcp,
+                        &mut item.meta.next_hop,
+                        &mut item.meta.tcp_template,
+                    )
+                });
+                match result {
+                    Some(Ok(())) => item.socket.reply_sent(tcp),
+                    Some(Err(err)) => {
+                        net_debug!("Failed to send response: {:?}", err);
+                        item.socket.reply_dropped();
+                    }
+                    None => item.socket.reply_dropped(),
+                }
+            } else if let Some(tx_token) = tx_token {
+                if let Err(err) = self.inner.dispatch(tx_token, packet) {
+                    net_debug!("Failed to send response: {:?}", err);
+                }
             }
         }
 
@@ -1295,7 +1295,7 @@ impl InterfaceInner {
                 // An ICMP echo reply is the size of the peer's request, so may be dropped. A TCP
                 // segment is sized to the path MTU, so an oversize one is a stack bug.
                 let should_fragment = total_ip_len > self.caps.ip_mtu();
-                debug_assert!(
+                assert!(
                     !should_fragment || !matches!(packet.payload(), IpPayload::Tcp(_)),
                     "TCP segment exceeds the IP MTU"
                 );

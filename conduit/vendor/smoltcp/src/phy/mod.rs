@@ -33,10 +33,9 @@ impl phy::Device for StmPhy {
     type TxToken<'a> = StmPhyTxToken<'a> where Self: 'a;
     type FrameToken<'a> = StmPhyFrameToken<'a> where Self: 'a;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, _timestamp: Instant) -> Option<Self::RxToken<'_>> {
         let buffer = core::mem::replace(&mut self.rx_buffer, vec![0; 1536]);
-        Some((StmPhyRxToken(buffer),
-              StmPhyTxToken(&mut self.tx_buffer[..])))
+        Some(StmPhyRxToken(buffer))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -293,16 +292,12 @@ pub trait Device {
     where
         Self: 'a;
 
-    /// Construct a token pair consisting of one receive token and one transmit token.
-    ///
-    /// The additional transmit token makes it possible to generate a reply packet based
-    /// on the contents of the received packet. For example, this makes it possible to
-    /// handle arbitrarily large ICMP echo ("ping") requests, where the all received bytes
-    /// need to be sent back, without heap allocation.
+    /// Construct a receive token for the next received packet. A reply to it takes its own
+    /// transmit token from `transmit` once the reply exists; receiving never waits for TX room.
     ///
     /// The timestamp must be a number of milliseconds, monotonically increasing since an
     /// arbitrary moment in time, such as system startup.
-    fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)>;
+    fn receive(&mut self, timestamp: Instant) -> Option<Self::RxToken<'_>>;
 
     /// Construct a transmit token.
     ///

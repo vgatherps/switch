@@ -339,7 +339,10 @@ Stack sends no gratuitous ARP for it.
 `os_random_seed() -> std::io::Result<u64>` reads eight bytes from `/dev/urandom`; use a fixed seed
 only in tests and benchmarks. `neighbor_capacity: usize` controls the ARP cache. `DEFAULT_NEIGHBOR_CAPACITY` is 256. A
 new neighbor in a full cache evicts the neighbor that expires first; only that eviction scans the
-cache, and a lookup is one hash probe. Only ARP updates an entry; received IP traffic does not
+cache, and a lookup is one hash probe. Each address is asked at most once per second. While the
+cache is full of addresses still waiting for a reply, one new destination per second may evict
+the oldest of them and send its request; others wait, which bounds the ARP requests sent to more
+dead peers than the cache holds. Only ARP updates an entry; received IP traffic does not
 refresh it. A resolved entry keeps forwarding indefinitely: the first send after its 60 s lifetime
 goes out with one broadcast ARP probe, and the probe extends the entry by another 60 s whether or
 not it is answered. An ARP reply or request to us with the same MAC extends the entry without
@@ -352,8 +355,9 @@ TCP socket visit while other sockets have frames ready; a socket alone keeps sen
 `neighbor_capacity`, `rx_staging`, and `tx_pending` must be positive.
 `rx_staging: usize` and `tx_pending: usize` set fixed-capacity device queues (`VecDeque::with_capacity`,
 so actual capacity can exceed the request). RX bursts fill available staging space. TCP-built
-frames and UDP sends share the pending TX FIFO. A full pending queue blocks ingress, so size it for
-both traffic directions. `Stack::new(port, config, now)` consumes the Port on success. On failure it
+frames and UDP sends share the pending TX FIFO. A full pending queue never blocks ingress: a reply
+(ACK, ARP, ICMP echo, RST) that finds no pending slot or TX packet is dropped, and a TCP socket
+whose ACK was dropped sends it on its next egress. Size the queue for both traffic directions. `Stack::new(port, config, now)` consumes the Port on success. On failure it
 returns `(Port, StackError)`. Invalid configuration or negative start time gives `InvalidConfig`;
 IP MTU below 68 gives `IpMtuBelowIpv4Minimum`, and 68-87 gives `InvalidConfig` from the path table,
 which needs 88; a TX pool smaller than `tx_reserve(negotiated TX descriptors, tx_pending)` gives
@@ -399,26 +403,22 @@ Reading data and dropping held frames returns mbufs. The Stack computes its rese
 negotiated RX descriptor count, which the PMD may raise; leave room for that.
 
 Out-of-order segments are freed only when the gap before them fills, so sockets holding them
-could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. As Linux
-prunes the receiving socket's out-of-order queue under memory pressure, each `turn` and `receive`
-whose RX burst returned packets checks whether fewer RX mbufs are free than one refill of the RX
-ring plus one burst: max(negotiated RX descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
+could keep the pool empty while every resent gap segment is dropped for lack of an mbuf. A socket
+holds at most `smoltcp::socket::tcp::MAX_OUT_OF_ORDER_VIEWS` (1024) frames past its first gap and
+refuses further out-of-order segments, counted by `rx_refused_segments()`, with an ACK at its
+in-order edge. Each `turn` and `receive` whose RX burst returned packets reads how many RX mbufs
+are free and compares it with one refill of the RX ring plus one burst: max(negotiated RX
+descriptors, 32) + `PortConfig::rx_burst`. DPDK PMDs
 refill in all-or-nothing chunks up to that size: memif copy mode needs 32 mbufs per receive and
 receives nothing without them, ixgbe vector RX rearms 64, and ENA allocates every free descriptor
 at once; while that fails ENA still returns completed packets, but stops receiving once the
 buffers already posted run out. So the check must fire while a refill can still succeed.
-Out-of-order data is kept only while at least that many mbufs are free; `rx_reserve` counts the
+When fewer are free, the sockets holding the most out-of-order frames release them before
+ingress, the farthest from their in-order data first (an out-of-order FIN goes with them), until
+that many are free again or no socket holds any; in-order data stays. `rx_reserve` counts the
 mark, so a pool of reserve plus share clears it while the sockets together hold at most the
-share. The free count is read only when the last reading no longer rules out "low": only the
-driver takes RX mbufs, at most max(negotiated RX descriptors, 32) posted plus one per packet it
-returns, so a reading of `free` covers the next `free - mark - max(RX descriptors, 32)` received
-packets. A test driver that allocates RX mbufs outside the PMD (the kit's `Link`, with an RX ring
-larger than 32) breaks that bound.
-While the pool is low, a TCP socket that processes a segment drops its own out-of-order data (and an
-out-of-order FIN) and refuses out-of-order segments, counted by `rx_refused_segments()`, with an
-ACK at its in-order edge; in-order data is still stored. Other sockets are untouched. The peer
-resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
-blocks, and the sender must then resend it too.
+share. The peer resends what was dropped; RFC 2018 lets a receiver discard data it already
+reported in SACK blocks, and the sender must then resend it too.
 
 `zhida-open::open` (used by `nic-runner` and the `netconf-open` examples) does not size from a share:
 its RX pool is a fixed 32767 mbufs (2^15 - 1), with RX bursts of 128. At 1024 descriptors,
@@ -445,13 +445,15 @@ after reporting acceptance. The Stack holds at most `tx_pending` more; built fra
 reservation, and one full-frame spare share those slots. No cache slack is needed because this
 lcore is the only allocator. `Stack::new` refuses a smaller pool with `TxPoolTooSmall`. Test PMDs
 such as `net_ring` ignore the descriptor count and queue sent mbufs into an attached ring, whose
-capacity bounds retention. Ingress needs a TX packet before processing each RX frame, even one that
-needs no reply, so an empty TX pool blocks receive too. Add room for PMD-specific allocations such
+capacity bounds retention. Ingress takes a TX packet only for a reply, so an empty TX pool drops
+replies but never blocks receive. Add room for PMD-specific allocations such
 as the `net_tap` checksum header copy.
 
 `Stack::tx_frame() -> Option<TxFrame>` takes an empty frame from the frame pool: its payload starts
 42 bytes after the mbuf headroom and holds up to IP MTU − 28 bytes. `None` means the pool is empty;
-dropping a frame returns it. Frame-pool mbufs may be shared (refcount above 1) but stay direct and
+dropping a frame returns it. `Stack::free_frames() -> usize` counts the frames this lcore can
+allocate now: the pool's ring plus this lcore's cache, not frames in other lcores' caches.
+Frame-pool mbufs may be shared (refcount above 1) but stay direct and
 single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame
 pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pending queue holds keeps
 at most one frame no socket or application counts, and the extra frame means those packets can never
@@ -462,9 +464,8 @@ frames all TCP send queues and the application may hold at once; sockets share t
 in full-sized segment payloads (at least six), not a per-socket limit. Smaller writes
 can require more frames. With the pool empty, `send_slice` queues nothing and returns `Ok(0)`,
 `udp_send` returns `WouldBlock` and `tx_frame` returns `None`; frames return when the peer ACKs
-queued data and the PMD releases sent frames. A socket whose `send_slice` found the pool empty
-is woken (its armed readiness tokens fire) at the start of the first `turn`, `receive` or `send` that finds a free
-frame; `tx_frame` callers get no such wake. TCP egress, retransmissions included, takes no
+queued data and the PMD releases sent frames. Neither `send_slice` nor `tx_frame` callers get a
+wake when frames return. TCP egress, retransmissions included, takes no
 frame-pool frame. `net_ring` ports opened by the test kit use their TX ring size as the TX
 descriptor count.
 
@@ -562,16 +563,14 @@ If the PMD accepts nothing, retry on the application's cadence rather than in a 
 
 `poll_at(&mut self) -> Option<Instant>` evaluates cached TCP socket deadlines at the latest time
 supplied to `new`, `turn`, or `receive`. A ready socket or past deadline is reported at that latest
-time. Unprocessed dropped handles or frame-drop wakes, or a dropped TCP socket that reached Closed,
+time. Unprocessed dropped handles, or a dropped TCP socket that reached Closed,
 also report that time, so the next drive call cleans them up. `None` means no socket deadline. The
 timer wheel can report a boundary before the actual socket deadline. `poll_at` does not cover
 staged RX frames, pending TX frames, or packet arrivals, so never wait on it indefinitely.
 binance-feed's tap demo caps its idle wait at 1 ms; a busy-poll application (`zhida-nic feed`)
 calls again immediately.
 
-If `rx_staged > 0`, call ingress again promptly: either the ingress budget ran out, or processing
-needs a pending slot and a TX packet, in which case flush and retry as the PMD accepts frames or
-returns TX buffers.
+If `rx_staged > 0`, call ingress again promptly: the ingress budget ran out.
 If a call reported `tx_pending > 0`, call `flush` until nothing is pending, then `send`,
 independently of `poll_at`. `send` runs egress before its flush, so with the pending queue full it
 only flushes. A TCP sender refused by the full queue stays due and is served first on retry; a
@@ -590,7 +589,7 @@ only) arm a token without repeating that check; only debug builds check that the
 is still live, and a key used after its socket is removed misdirects tokens to whatever socket
 takes the slot. A change that can alter the socket's readiness
 fires every token armed on it: for TCP a received segment, `tcp_mut` (also through
-`tcp_send_frame`, `connect`, `listen`), recovery of the shared TX frame pool after exhaustion, or a
+`tcp_send_frame`, `connect`, `listen`), or a
 state change in egress (close timers, TIME-WAIT end); for UDP a queued datagram. A fired token is disarmed and
 returned once by `pop_fired()`; drain it after each drive call and check those sockets. Changes
 that leave readiness as it was may fire tokens too, also in a turn with no received segment and
@@ -625,10 +624,12 @@ TCP timer scheduling has 1 ms granularity. Nonnegative deadlines are rounded up 
 millisecond boundary; expiry checks do not fire before the requested deadline. A late drive call
 makes the timer late.
 
-The base retransmission timeout is fixed per socket at 300 ms by default. Backoff is capped at 60
-seconds. `set_rto(smoltcp::time::Duration)` changes the base used the next time a retransmission or
-probe timer is armed and survives reset/reconnect. It does not rewrite an already armed timer. Zero
-or more than 60 seconds panics.
+The retransmission timeout follows RFC 6298 from measured round trips: SRTT + 4 * RTTVAR, at least
+50 ms (above a peer's delayed ACK, so a delayed ACK does not draw a spurious retransmit) and at most
+60 seconds. Before the first sample it is 300 ms. Each expiry doubles it, capped at 60 seconds, until
+SND.UNA advances; three expiries without a new sample discard the measurement, so the base returns to
+300 ms. Reset/reconnect discards it too. A new RTO applies the next time a retransmission or probe
+timer is armed; it does not rewrite an already armed timer.
 
 Delayed ACK defaults to 10 ms. `set_ack_delay(Some(duration))` changes the delay;
 `set_ack_delay(None)` disables delayed ACK. Immediate ACK conditions apply either way. Disabling
@@ -690,8 +691,7 @@ The config's `mss_cap` limits the advertised MSS and outgoing segment payloads. 
 application cap; local MTU and peer MSS apply regardless. The cap survives reset/reconnect and
 cannot be changed after `add_tcp`. `set_initial_window(bytes)` sets Cubic's initial congestion
 window for the handshake and survives reset/reconnect. The default is 1048576 bytes. Set it before
-connect/listen. The peer's advertised window limits transmission. `set_rto` takes
-`smoltcp::time::Duration`; `set_ack_delay` takes `Option<smoltcp::time::Duration>` (see Time rules).
+connect/listen. The peer's advertised window limits transmission. `set_ack_delay` takes `Option<smoltcp::time::Duration>` (see Time rules).
 
 `add_tcp(config) -> Result<TcpHandle, AddTcpError>` returns the config unchanged if TCP slots are
 full; pool size never refuses a socket. Configure the added socket through `stack.tcp_mut(&handle)`,
@@ -967,7 +967,7 @@ reports stamps when `rx_timestamps` is enabled in the config.
 | `rx_received` | `usize` | Packets accepted into staging by this call's RX burst. |
 | `rx_rejected` | `usize` | RX mbufs released by the Port: unsupported, or a BAD IPv4-header checksum verdict. |
 | `rx_processed` | `usize` | Staged packets handed to smoltcp in this call. |
-| `rx_staged` | `usize` | Packets left staged after ingress: budget ran out or no reply capacity. |
+| `rx_staged` | `usize` | Packets left staged after ingress: the budget ran out. |
 | `tx_accepted` | `usize` | Frames accepted by the PMD across this call's flushes. |
 | `tx_pending` | `usize` | Frames pending after this call. |
 
@@ -1109,8 +1109,7 @@ These panic:
 
 - using a handle with a Stack that did not create it
 - adding a TCP socket with a receive window target above 1 GiB or `mss_cap: Some(0)`
-- `set_initial_window(0)`, `set_rto(Duration::ZERO)` or RTO above 60 seconds, `set_ack_delay` above
-  60 seconds, `set_hop_limit(Some(0))`
+- `set_initial_window(0)`, `set_ack_delay` above 60 seconds, `set_hop_limit(Some(0))`
 - `tx_mbuf_budget` below MTU 68
 - overflow in reserve arithmetic, frame-budget conversions, or timer arithmetic near the
   integer limit; excessive `neighbor_capacity` at startup

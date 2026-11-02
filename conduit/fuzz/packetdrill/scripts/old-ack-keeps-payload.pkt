@@ -14,10 +14,12 @@
 //   receive buffers every advertised window here is capped at 65535. The peer's
 //   MSS of 1460 fits each echo in one segment; the peer window and Cubic's
 //   1 MiB initial window allow both echoes.
+// The handshake ACK comes 100 ms after the SYN-ACK, so Zhida's RTO is 100 + 4 * 50 =
+// 300 ms (RFC 6298): its unacknowledged echo is not retransmitted during the script.
 
 0     < S 0:0(0) win 65535 <mss 1460>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460>
-+0    < . 1:1(0) ack 1 win 65535
++0.1  < . 1:1(0) ack 1 win 65535
 +0    < P. 1:4(3) ack 1 win 65535
 +0    > P. 1:4(3) ack 4 win 65535
 +0.1  < P. 7:10(3) ack 4 win 65535

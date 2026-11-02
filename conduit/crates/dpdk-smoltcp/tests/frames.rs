@@ -29,7 +29,9 @@ use zhida_test_kit::with_eal;
 
 const BULK: usize = 256 * 1024;
 const ACK_DELAY: Duration = Duration::from_millis(10);
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples here are 0 or 10 ms (delayed ACK), so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/frames");
 
@@ -514,17 +516,21 @@ fn hold_every_frame(
     held
 }
 
-/// Retaining frames does not limit delivery of the next receive window.
+/// Retaining frames does not limit delivery of the next receive window; held frames keep their
+/// RX mbufs until dropped.
 #[zhida_test_support::pinned_test]
 fn receiving_continues_while_frames_are_held() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frza", "frzb"], [config(Side::A), config(Side::B)], T0);
         let trace = record(&mut pair);
         let handles = open(&mut pair, &trace, 4096);
+        let idle = pair.in_use()[1].0;
         let first = hold_every_frame(&mut pair, &trace, &handles);
         let second = hold_every_frame(&mut pair, &trace, &handles);
-        assert_eq!(pair.b.tcp(&handles[1]).held_frames().count(), first.len() + second.len());
+        let held = u32::try_from(first.len() + second.len()).unwrap();
+        assert_eq!(pair.in_use()[1].0, idle + held);
         drop((first, second));
+        assert_eq!(pair.in_use()[1].0, idle);
         finish(pair, &trace, 0);
     });
 }
@@ -666,7 +672,7 @@ fn peer_zero_window_probe_then_full_delivery() {
             .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
         {
             assert_eq!(tcp.seq_number, next, "data was retransmitted or skipped");
-            next = next + tcp.payload.len();
+            next += tcp.payload.len();
         }
         assert_eq!(next, a_seq + data.len());
         assert_eq!((pair.a.tcp(&handles[0]).retransmits(), pair.a.tcp(&handles[0]).loss_events()), (0, 0));

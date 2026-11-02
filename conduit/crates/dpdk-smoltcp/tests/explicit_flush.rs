@@ -322,7 +322,7 @@ fn send_backpressure_resumes_same_socket() {
 }
 
 #[zhida_test_support::pinned_test]
-fn receive_blocks_on_full_pending_queue() {
+fn full_pending_still_receives_data() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["eq4a", "eq4b"], 2);
         let ([a, b], handshake) = establish(&mut pair, Side::A);
@@ -339,27 +339,62 @@ fn receive_blocks_on_full_pending_queue() {
             pair.a.receive(now, BUDGET),
             Ok(Turn {
                 rx_received: 1,
-                rx_staged: 1,
+                rx_processed: 1,
                 tx_pending: 2,
                 ..IDLE
             })
         );
-        assert_eq!(pair.in_use()[0].0, 1);
-        assert_eq!(pair.a.tcp(&a).recv_queue(), 0);
+        assert_eq!(drain_bytes(pair.a.tcp_mut(&a)).unwrap(), b"request");
+        assert_eq!(pair.in_use()[0].0, 0);
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 15);
         assert_eq!(pair.a.flush(), Ok(Sent { tx_accepted: 2, tx_pending: 0 }));
         assert_eq!(pair.drain_tx(Side::A, |_| {}), 2);
-        assert_eq!(
-            pair.a.receive(now, BUDGET),
-            Ok(Turn { rx_processed: 1, ..IDLE })
-        );
-        assert_eq!(pair.in_use()[0].0, 1);
-        let received = drain_bytes(pair.a.tcp_mut(&a)).unwrap();
-        assert_eq!(received.len(), 7);
-        assert_eq!(&received, b"request");
-        assert_eq!(pair.in_use()[0].0, 0);
         assert_eq!(pair.close(), 0);
     });
+}
+
+/// With A's pending queue full, B's two segments arrive out of order: the second, then the
+/// first. A takes both, and the immediate ACK the gap fill earns finds no TX room; once the
+/// queue drains, A's next send emits that cumulative ACK without another segment from B.
+#[zhida_test_support::pinned_test]
+fn ack_progresses_with_full_tx_pending() {
+    with_eal(|eal| {
+        let mut pair = new_pair(eal, ["eq7a", "eq7b"], 2);
+        let ([a, b], handshake) = establish(&mut pair, Side::A);
+        let mss = data_mss(&handshake);
+        fill_tx_ring(&mut pair);
+        let data = pair::pattern(2 * mss, 4);
+        assert_eq!(pair.a.tcp_mut(&a).send_slice(&data), Ok(data.len()));
+        assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 0, tx_pending: 2 }));
+        let request = pair::pattern(2 * mss, 7);
+        assert_eq!(pair.b.tcp_mut(&b).send_slice(&request), Ok(request.len()));
+        assert_eq!(pair.b.send().unwrap().tx_accepted, 2);
+        let segments = forward_frames(&pair, Side::B);
+        assert_eq!(segments.len(), 2);
+        let now = pair.now();
+        for frame in [&segments[1], &segments[0]] {
+            pair.inject(Side::A, std::slice::from_ref(frame));
+            assert_eq!(pair.a.receive(now, BUDGET).unwrap().rx_processed, 1);
+        }
+        assert_eq!(drain_bytes(pair.a.tcp_mut(&a)).unwrap(), request);
+        assert_eq!(pair.drain_tx(Side::A, |_| {}), 15);
+        assert_eq!(pair.a.flush(), Ok(Sent { tx_accepted: 2, tx_pending: 0 }));
+        assert_eq!(pair.drain_tx(Side::A, |_| {}), 2);
+        let sent = pair.a.send().unwrap();
+        assert_eq!(sent.tx_accepted, 1);
+        let mut acks = Vec::new();
+        pair.drain_tx(Side::A, |frame| acks.push(segment(frame, Side::A).ack_number));
+        let first = segment(&segments[0], Side::B).seq_number;
+        assert_eq!(acks, [Some(first + request.len())]);
+        assert_eq!(pair.close(), 0);
+    });
+}
+
+/// Every frame on `side`'s TX ring, taken off it.
+fn forward_frames(pair: &Pair, side: Side) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    pair.drain_tx(side, |frame| frames.push(frame.to_vec()));
+    frames
 }
 
 #[zhida_test_support::pinned_test]

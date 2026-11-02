@@ -145,9 +145,8 @@ pub struct Turn {
     pub rx_rejected: usize,
     /// Staged packets handed to smoltcp this turn.
     pub rx_processed: usize,
-    /// Packets still staged after ingress: the budget ran out, or no reply
-    /// capacity (pending slot and TX packet) was available. An empty TX pool
-    /// also blocks receive, because Device::receive takes a TX reservation first.
+    /// Packets still staged after ingress: the budget ran out. Receiving never
+    /// waits for TX room; a reply that finds none is dropped.
     pub rx_staged: usize,
     /// Packets the PMD accepted across this call's flushes.
     pub tx_accepted: usize,
@@ -191,15 +190,12 @@ pub struct Sent {
 /// call `into_port`, nothing else.
 pub struct Stack {
     iface: Interface,
-    rx_pool_low: bool,
     /// Exactly `max_sockets` slots, never grown.
     sockets: TcpSet<'static>,
     udp: UdpSet,
     dropped: DropQueue,
     dropped_tcp: Vec<SocketHandle>,
     dropped_udp: Vec<smoltcp::iface::UdpHandle>,
-    /// Sockets taken off the DropQueue's frame-wait list for waking; empty between turns.
-    frame_waiters: Vec<SocketHandle>,
     max_sockets: usize,
     max_udp_sockets: usize,
     ip_mtu: u16,
@@ -297,17 +293,13 @@ impl Stack {
         });
         iface.set_ipv4_gateway(config.gateway);
         iface.set_path_mtus(paths);
-        let rx_pool_low = device.rx_pool_low(0);
-        iface.set_rx_pool_low(rx_pool_low);
         Ok(Self {
             iface,
-            rx_pool_low,
             sockets: TcpSet::new(config.max_sockets),
             udp: UdpSet::new(config.max_udp_sockets, device.frame_source()),
             dropped: DropQueue::with_capacity(config.max_sockets, config.max_udp_sockets),
             dropped_tcp: Vec::with_capacity(config.max_sockets),
             dropped_udp: Vec::with_capacity(config.max_udp_sockets),
-            frame_waiters: Vec::with_capacity(config.max_sockets),
             max_sockets: config.max_sockets,
             max_udp_sockets: config.max_udp_sockets,
             ip_mtu: mtu,
@@ -368,6 +360,7 @@ impl Stack {
     /// `rx_staged` in a later call.
     ///
     /// Panics as described in [Panics](Stack#panics).
+    #[inline]
     pub fn receive(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         let mut turn = self.ingress(now, ingress_budget)?;
         if turn.tx_pending != 0 {
@@ -389,6 +382,7 @@ impl Stack {
     /// sends nothing.
     ///
     /// Panics as described in [Panics](Stack#panics).
+    #[inline]
     pub fn send(&mut self) -> Result<Sent, StackError> {
         self.tidy();
         let tx_accepted = self.egress()?;
@@ -429,6 +423,11 @@ impl Stack {
         TxFrame::alloc(self.device.frame_pool())
     }
 
+    /// Frames this lcore can allocate from the frame pool now: the pool's ring plus this lcore's cache.
+    pub fn free_frames(&self) -> usize {
+        self.device.frame_pool().free_count()
+    }
+
     fn set_now(&mut self, now: Instant) -> Result<(), StackError> {
         if now < self.now {
             return Err(StackError::TimeWentBackwards {
@@ -441,11 +440,12 @@ impl Stack {
     }
 
     /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
-    /// tidying (which wakes sockets waiting for a free frame if one is free), flush,
-    /// one RX burst, maintenance, then ingress. A burst that returned packets, a previously
-    /// low RX pool, or a recovered Port prompts a check against the low mark (one RX ring
-    /// refill plus one burst). While low, each TCP socket processing a segment keeps no
-    /// out-of-order data (`Interface::set_rx_pool_low`).
+    /// tidying, flush, one RX burst, maintenance, then ingress. After a burst that returned
+    /// packets, the RX pool is checked against the low mark (one RX ring refill plus one
+    /// burst); while
+    /// it is below, the TCP sockets holding the most out-of-order frames release them,
+    /// farthest from their in-order data first, until the pool is back at the mark
+    /// (`TcpSet::prune_out_of_order`).
     fn ingress(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
         self.set_now(now)?;
         if now >= self.next_service {
@@ -453,19 +453,18 @@ impl Stack {
             unsafe { zhida_dpdk_sys::rte_timer_manage() };
             self.next_service = now + SERVICE_PERIOD;
         }
-        let recovered = if self.device.port_mut().reset_pending() {
+        if self.device.port_mut().reset_pending() {
             self.device.port_mut().recover().map_err(StackError::Port)?;
-            true
-        } else {
-            false
-        };
+        }
         self.tidy();
         let tx_accepted = self.device.flush().map_err(StackError::Port)?;
         let burst = self.device.rx_burst().map_err(StackError::Port)?;
         let received = burst.accepted + burst.rejected;
-        if received != 0 || self.rx_pool_low || recovered {
-            self.rx_pool_low = self.device.rx_pool_low(if recovered { 0 } else { received });
-            self.iface.set_rx_pool_low(self.rx_pool_low);
+        if received != 0 {
+            let shortfall = self.device.rx_pool_shortfall();
+            if shortfall != 0 {
+                self.sockets.prune_out_of_order(shortfall);
+            }
         }
         self.iface.poll_maintenance(now);
 
@@ -494,29 +493,13 @@ impl Stack {
         })
     }
 
-    /// A socket whose `send_slice` found the shared frame pool empty waits for a free frame:
-    /// once the pool has one, fire its readiness tokens and schedule its readiness check.
-    #[cold]
-    #[inline(never)]
-    fn wake_frame_waiters(&mut self) {
-        let pool = self.device.frame_pool();
-        if pool.in_use_count() as usize >= pool.count() {
-            return;
-        }
-        self.dropped.drain_frame_waiters(&mut self.frame_waiters);
-        for handle in self.frame_waiters.drain(..) {
-            self.sockets.frame_woken(handle);
-        }
-    }
-
     /// Egress passes at the stored time, then flush; returns the frames the
     /// PMD accepted.
     fn egress(&mut self) -> Result<usize, StackError> {
         // Every pass that continues the loop queued a frame into the
         // fixed-capacity pending queue, so at most capacity + 1 passes run. A
-        // pass can report a change without queueing anything: smoltcp drops an
-        // IPv4 packet larger than the IP MTU without using the TX token, and a
-        // socket may then want the same send again at this time.
+        // pass can report a change without queueing anything, and a socket may
+        // then want the same send again at this time.
         // Stop after a send when the next pass would do nothing.
         loop {
             let pending = self.device.pending();
@@ -564,9 +547,8 @@ impl Stack {
     /// the current time so the next turn processes or frees it.
     /// It does not cover frames staged or pending in the Stack. When the last
     /// `turn` or `receive` reported `rx_staged > 0`, call it again promptly:
-    /// either the ingress budget ran out, or no reply capacity was free. In the
-    /// latter case, as when a call reported `tx_pending > 0`, the next call
-    /// progresses only once the PMD accepts frames or frees TX packets: retry
+    /// the ingress budget ran out. When a call reported `tx_pending > 0`, the next
+    /// call progresses only once the PMD accepts frames or frees TX packets: retry
     /// on the caller's own bounded cadence, independent of this deadline. Pending frames leave through `flush`, or the flush inside
     /// `turn`, `receive` or `send`. When a call reported `tx_pending > 0`, call
     /// `flush` until nothing is pending, then `send`: `send` runs egress before
@@ -609,7 +591,6 @@ impl Stack {
             &config,
             usize::from(self.ip_mtu),
             self.device.frame_source(),
-            self.dropped.clone(),
         );
         Ok(TcpHandle {
             raw: handle,
@@ -659,9 +640,8 @@ impl Stack {
     /// and size checks (`NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`),
     /// `WouldBlock` for an empty frame pool, the neighbor lookup (`NoRoute`,
     /// `NeighborPending`), then `WouldBlock` for a full pending queue: flush, then retry.
-    /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue
-    /// also blocks ingress (packets stay in `Turn::rx_staged`) if the PMD refuses its frames;
-    /// `receive` and `turn` flush first but can remain blocked if TX cannot progress.
+    /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue does
+    /// not block ingress; replies that find no room are dropped.
     /// A send loop must call `receive` or `turn` to take ARP replies and advance time.
     pub fn udp_send(
         &mut self,
@@ -733,8 +713,9 @@ impl Stack {
     /// untouched: `Foreign` when it came from another Stack's `tx_frame`,
     /// `InvalidState` unless the socket may send, `Empty` for a zero-length
     /// frame, and `Full` when it exceeds the socket's free bytes or it has no
-    /// free frame slot (`frame_send_room`). Each frame takes one slot; one longer
-    /// than the segment payload is copied at send.
+    /// free frame slot (`frame_send_room`). A frame that fits whole into the unsent
+    /// tail frame within one segment is copied there and freed; any other takes a
+    /// slot, and one longer than the segment payload is copied at send.
     pub fn tcp_send_frame(
         &mut self,
         handle: &TcpHandle,
@@ -811,10 +792,8 @@ impl Stack {
 
     /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
     /// that can make the socket readable, writable or change its state fires it: a received
-    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), the start of the
-    /// first `turn`, `receive` or `send` that finds a free frame after the socket's `send_slice`
-    /// found the shared frame pool empty, or a state change in egress (close timers, TIME-WAIT
-    /// end). A fired
+    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), or a state
+    /// change in egress (close timers, TIME-WAIT end). A fired
     /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
     /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
     /// processes a dropped handle; `disarm_tcp` stops a token at once.
@@ -875,16 +854,20 @@ impl Stack {
         handle.raw
     }
 
-    /// Wake sockets waiting for a free frame if one is free, then process dropped handles
-    /// and reapable sockets.
+    /// Process dropped handles and reapable sockets; returns at once when there are none.
+    #[inline]
     fn tidy(&mut self) {
-        let (empty, frame_waiters) = self.dropped.state();
-        if frame_waiters {
-            self.wake_frame_waiters();
-        }
-        if empty && !self.sockets.has_reapable() {
+        if self.dropped.is_empty() && !self.sockets.has_reapable() {
             return;
         }
+        self.free_dropped_sockets();
+    }
+
+    /// Close dropped TCP sockets, remove dropped UDP sockets, then remove TCP sockets that
+    /// reached CLOSED after their handle was dropped.
+    #[cold]
+    #[inline(never)]
+    fn free_dropped_sockets(&mut self) {
         self.dropped
             .drain_into(&mut self.dropped_tcp, &mut self.dropped_udp);
         for &raw in &self.dropped_tcp {

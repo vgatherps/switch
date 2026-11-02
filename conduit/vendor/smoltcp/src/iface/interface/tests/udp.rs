@@ -83,9 +83,8 @@ impl Device for UdpDevice {
     type TxToken<'a> = ReplyToken<'a>;
     type FrameToken<'a> = ReplyFrameToken<'a>;
 
-    fn receive(&mut self, _: Instant) -> Option<(FrameToken, ReplyToken<'_>)> {
-        let rx = self.rx.pop_front()?;
-        Some((rx, ReplyToken(&mut self.tx)))
+    fn receive(&mut self, _: Instant) -> Option<FrameToken> {
+        self.rx.pop_front()
     }
 
     fn transmit(&mut self, _: Instant) -> Option<ReplyToken<'_>> {

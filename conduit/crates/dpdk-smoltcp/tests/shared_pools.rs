@@ -1,9 +1,10 @@
 //! Every socket of a Stack draws on one RX pool and one frame pool; nothing is reserved per
 //! socket. TCP's receive capacity is an advertised window target, not an in-order data limit;
 //! transmit capacity bounds queued and unacknowledged bytes. When the RX pool is empty the link
-//! drops arrivals and the peer retransmits. While
-//! it is low, a TCP socket that receives a segment keeps no out-of-order data, so out-of-order
-//! frames cannot hold the pool while the segments filling their gaps are dropped.
+//! drops arrivals and the peer retransmits. When it falls below its low mark, the sockets
+//! holding the most out-of-order frames release them, the farthest from their in-order data
+//! first, until the pool is back at the mark, so out-of-order frames cannot hold the pool while
+//! the segments filling their gaps are dropped.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -51,14 +52,6 @@ fn b_rx_pool() -> usize {
 /// The Stack's low mark on the kit's RingPort: its 16 RX descriptors floored at 32, plus the
 /// RX burst of 8. The pool is low while fewer mbufs are free.
 const LOW_MARK: usize = 32 + 8;
-
-/// Fill B's RX pool with unread UDP datagrams until it is low.
-fn hold_pool_low(pair: &mut Pair, udp: &[UdpHandle; 2]) {
-    while b_rx_pool() - pair.in_use()[1].0 as usize >= LOW_MARK {
-        send_datagram(pair, udp);
-        pair.round(|_, _| {});
-    }
-}
 
 /// Queue as much of `data[*sent..]` as the client socket takes.
 fn send_more(a: &mut Stack, conn: &Conn, data: &[u8], sent: &mut usize) -> bool {
@@ -198,13 +191,12 @@ fn drain_udp(b: &mut Stack, udp: &UdpHandle) -> bool {
     moved
 }
 
-/// The stall per-socket pruning prevents. Four connections each lose their first segment,
-/// and every resend of it, while the rest arrive and are held out of order: out-of-order
-/// frames fill B's RX pool until it is low. From then on each connection that receives a
-/// segment drops its own out-of-order frames and refuses out-of-order segments, so mbufs come
-/// back. Once the gap segments get through, every connection delivers its bytes in order.
-/// Without pruning the out-of-order frames keep the pool empty, every resent gap segment is
-/// dropped for lack of an mbuf, and no connection progresses.
+/// The stall pruning prevents. Four connections each lose their first segment, and every
+/// resend of it, while the rest arrive and are held out of order: out-of-order frames fill B's
+/// RX pool until it is low. From then on the largest holders release out-of-order frames
+/// after each burst, so mbufs come back. Once the gap segments get through, every connection
+/// delivers its bytes in order. Without pruning the out-of-order frames keep the pool empty,
+/// every resent gap segment is dropped for lack of an mbuf, and no connection progresses.
 #[zhida_test_support::pinned_test]
 fn out_of_order_frames_filling_the_pool_are_pruned_and_gaps_recover() {
     with_eal(|eal| {
@@ -238,104 +230,6 @@ fn out_of_order_frames_filling_the_pool_are_pruned_and_gaps_recover() {
                 App::Done
             } else if moved {
                 App::Moved
-            } else {
-                App::Idle
-            }
-        });
-        assert_eq!(received, data);
-        let refused: u32 = conns.iter().map(|conn| pair.b.tcp(&conn.server).rx_refused_segments()).sum();
-        assert!(refused > 0, "B's RX pool went low and out-of-order segments were refused");
-        pair.close();
-    });
-}
-
-/// UDP datagrams B's application has not read hold B's RX pool at its low mark. A segment
-/// arriving out of order behind a lost one is refused, not held. Once the application reads
-/// the datagrams the pool recovers, and the next out-of-order segment is held; when the lost
-/// segment gets through, every byte arrives in order.
-#[zhida_test_support::pinned_test]
-fn low_rx_pool_refuses_out_of_order_until_it_recovers() {
-    with_eal(|eal| {
-        let mut pair = shared_pair(eal, ["shla", "shlb"], 1, 1);
-        let conns = many::open(&mut pair, 0..1, WINDOW);
-        let conn = &conns[0];
-        pair.a.tcp_mut(&conn.client).set_ack_delay(None);
-        pair.b.tcp_mut(&conn.server).set_ack_delay(None);
-        let udp = udp_sockets(&mut pair);
-        let blocked = Rc::new(Cell::new(true));
-        block_gaps(&mut pair.a_to_b, vec![client_port(conn)], blocked.clone());
-        let idle = pair.in_use()[1].0 as usize;
-        hold_pool_low(&mut pair, &udp);
-        let data = pattern(3 * 1460, 21);
-        assert_eq!(pair.a.tcp_mut(&conn.client).send_slice(&data[..2 * 1460]), Ok(2 * 1460));
-        pair.round(|_, _| {});
-        assert_eq!(pair.a_to_b.dropped, 1, "the first segment is the gap");
-        assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1, "refused while low");
-
-        drain_udp(&mut pair.b, &udp[1]);
-        assert_eq!(pair.in_use()[1].0 as usize, idle);
-        assert_eq!(pair.a.tcp_mut(&conn.client).send_slice(&data[2 * 1460..]), Ok(1460));
-        pair.round(|_, _| {});
-        assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1, "held once the pool recovered");
-        assert_eq!(pair.in_use()[1].0 as usize, idle + 1);
-
-        blocked.set(false);
-        let mut received = Vec::new();
-        pair.drive(|_, _| {}, |_, b| {
-            if read_all(b, conn, &mut received) && received.len() == data.len() {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        assert_eq!(received, data);
-        pair.close();
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn empty_burst_rechecks_low_pool_before_processing_staged_segments() {
-    with_eal(|eal| {
-        let mut pair = shared_pair(eal, ["shea", "sheb"], 1, 1);
-        let conns = many::open(&mut pair, 0..1, WINDOW);
-        let conn = &conns[0];
-        pair.a.tcp_mut(&conn.client).set_ack_delay(None);
-        pair.b.tcp_mut(&conn.server).set_ack_delay(None);
-        let udp = udp_sockets(&mut pair);
-        let blocked = Rc::new(Cell::new(true));
-        block_gaps(&mut pair.a_to_b, vec![client_port(conn)], blocked.clone());
-        let idle = pair.in_use()[1].0 as usize;
-        hold_pool_low(&mut pair, &udp);
-
-        let data = pattern(3 * 1460, 21);
-        assert_eq!(pair.a.tcp_mut(&conn.client).send_slice(&data[..2 * 1460]), Ok(2 * 1460));
-        let now = pair.now();
-        pair.a.turn(now, 32).unwrap();
-        pair.a_to_b.forward();
-        assert_eq!(pair.a_to_b.dropped, 1);
-        let staged = pair.b.receive(now, 0).unwrap();
-        assert_eq!((staged.rx_received, staged.rx_processed, staged.rx_staged), (1, 0, 1));
-        let still_low = pair.b.receive(now, 32).unwrap();
-        assert_eq!((still_low.rx_received, still_low.rx_processed, still_low.rx_staged), (0, 1, 0));
-        assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1);
-
-        assert_eq!(pair.a.tcp_mut(&conn.client).send_slice(&data[2 * 1460..]), Ok(1460));
-        pair.a.turn(now, 32).unwrap();
-        pair.a_to_b.forward();
-        let staged = pair.b.receive(now, 0).unwrap();
-        assert_eq!((staged.rx_received, staged.rx_processed, staged.rx_staged), (1, 0, 1));
-        assert!(drain_udp(&mut pair.b, &udp[1]));
-        assert_eq!(pair.in_use()[1].0 as usize, idle + 1);
-        let recovered = pair.b.receive(now, 32).unwrap();
-        assert_eq!((recovered.rx_received, recovered.rx_processed, recovered.rx_staged), (0, 1, 0));
-        assert_eq!(pair.b.tcp(&conn.server).rx_refused_segments(), 1);
-        assert_eq!(pair.in_use()[1].0 as usize, idle + 1, "out-of-order segment retained");
-
-        blocked.set(false);
-        let mut received = Vec::new();
-        pair.drive(|_, _| {}, |_, b| {
-            if read_all(b, conn, &mut received) && received.len() == data.len() {
-                App::Done
             } else {
                 App::Idle
             }
@@ -399,34 +293,39 @@ fn pool_drained_by_other_sockets_recovers_once_apps_read() {
     });
 }
 
-/// Pruning is per socket. S1 holds three segments out of order; unread datagrams hold B's
-/// RX pool low. A segment for S2 processed under that pressure is stored in order and S1's
-/// out-of-order frames stay held: B's RX mbufs in use grow by S2's one frame. Once the pool
-/// recovers and S1's gap gets through, S1 delivers every byte.
+/// S1 holds three segments out of order behind a lost one. Unread UDP datagrams then take
+/// B's RX pool down. Once a datagram would put the pool below its low mark, S1 releases one
+/// out-of-order frame for it, no more: B's RX mbufs in use stay at the mark for three
+/// datagrams and grow again only once S1 holds none. When the gap gets through, S1 delivers
+/// every byte.
 #[zhida_test_support::pinned_test]
-fn pressure_prunes_only_the_receiving_socket() {
+fn low_pool_takes_back_out_of_order_frames_one_for_one() {
     with_eal(|eal| {
-        let mut pair = shared_pair(eal, ["shua", "shub"], 2, 1);
-        let conns = many::open(&mut pair, 0..2, WINDOW);
-        let (s1, s2) = (&conns[0], &conns[1]);
+        let mut pair = shared_pair(eal, ["shua", "shub"], 1, 1);
+        let conns = many::open(&mut pair, 0..1, WINDOW);
+        let s1 = &conns[0];
         let udp = udp_sockets(&mut pair);
         let blocked = Rc::new(Cell::new(true));
         block_gaps(&mut pair.a_to_b, vec![client_port(s1)], blocked.clone());
-        let idle = pair.in_use()[1].0;
+        let idle = pair.in_use()[1].0 as usize;
         let data = pattern(4 * 1460, 41);
         assert_eq!(pair.a.tcp_mut(&s1.client).send_slice(&data), Ok(data.len()));
         for _ in 0..4 {
             pair.round(|_, _| {});
         }
-        assert_eq!(pair.in_use()[1].0, idle + 3, "S1 holds three segments out of order");
+        assert_eq!(pair.in_use()[1].0 as usize, idle + 3, "S1 holds three segments out of order");
 
-        hold_pool_low(&mut pair, &udp);
-        let before = pair.in_use()[1].0;
-        assert_eq!(pair.a.tcp_mut(&s2.client).send_slice(&[0x77; 100]), Ok(100));
-        pair.round(|_, _| {});
-        assert_eq!(pair.b.tcp(&s2.server).recv_queue(), 100);
-        assert_eq!(pair.in_use()[1].0, before + 1, "S1's out-of-order frames are still held");
-        assert_eq!(pair.b.tcp(&s1.server).rx_refused_segments(), 0);
+        // Most mbufs in use while the pool is not below its low mark.
+        let top = b_rx_pool() - LOW_MARK;
+        let mut in_use = Vec::new();
+        while in_use.last().is_none_or(|&used| used <= top) {
+            send_datagram(&mut pair, &udp);
+            pair.round(|_, _| {});
+            in_use.push(pair.in_use()[1].0 as usize);
+            assert!(in_use.len() < MAX_ROUNDS as usize, "B's RX pool never went low");
+        }
+        let first_top = in_use.iter().position(|&used| used == top).unwrap();
+        assert_eq!(in_use[first_top..], [top, top, top, top, top + 1]);
 
         drain_udp(&mut pair.b, &udp[1]);
         blocked.set(false);

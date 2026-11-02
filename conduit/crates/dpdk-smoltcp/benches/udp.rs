@@ -15,7 +15,7 @@
 //! Every iteration checks k accepted frames, k received datagrams in order,
 //! an empty receive queue and rx_dropped_full == 0. Send cases check the
 //! received payloads in full; recv cases check the saved sequence bytes.
-//! The first warmup iteration settles spare TX packets. Five more warmup
+//! The first warmup iteration settles the pool counts. Five more warmup
 //! iterations check both RX and TX pool counts return to that idle state.
 //! Measured iterations skip pool checks because they walk mempool caches.
 //! One throughput element is a datagram. Timings include the timer read;

@@ -116,13 +116,10 @@ impl InterfaceInner {
                     self.neighbor_cache.changes(),
                 ));
             }
-            debug_assert!(
+            assert!(
                 20 + ip4.payload_len <= self.caps.ip_mtu(),
                 "TCP segment exceeds the IP MTU"
             );
-            if 20 + ip4.payload_len > self.caps.ip_mtu() {
-                return Ok(());
-            }
             meta.tx_checksum = self.tx_checksum(&ip, tcp.header_len());
             tx.set_meta(meta);
             tx.consume(14 + 20 + ip4.payload_len, |frame| {

@@ -1140,6 +1140,7 @@ fn echo_retains_frame_when_free_send_space_is_smaller_than_payload() {
                 server.step(b);
                 if a.tcp(&client).state() == State::Established { App::Done } else { App::Idle }
             });
+            let idle = pair.in_use()[1].0;
             let payload = pattern(48, 31);
             assert_eq!(pair.a.tcp_mut(&client).send_slice(&payload), Ok(payload.len()));
             pair.drive(|_, _| {}, |_, b| {
@@ -1151,7 +1152,7 @@ fn echo_retains_frame_when_free_send_space_is_smaller_than_payload() {
             let socket = pair.b.tcp(&server.handles()[0]);
             assert_eq!(socket.send_queue(), 64);
             assert_eq!(socket.recv_queue(), 0);
-            assert_eq!(socket.held_frames().count(), 1);
+            assert_eq!(pair.in_use()[1].0, idle + 1, "the server keeps the frame's RX mbuf");
             let echoed = limit.unwrap_or(payload.len());
             let mut received = Vec::new();
             pair.drive(|_, _| {}, |a, b| {
@@ -1162,7 +1163,7 @@ fn echo_retains_frame_when_free_send_space_is_smaller_than_payload() {
             });
             assert_eq!(&received[..prefix.len()], &prefix);
             assert_eq!(&received[prefix.len()..], &payload[..echoed]);
-            assert_eq!(pair.b.tcp(&server.handles()[0]).held_frames().count(), 0);
+            assert_eq!(pair.in_use()[1].0, idle);
             if limit.is_some() {
                 // The server closed first after the limit: it passes TIME-WAIT, the
                 // client ends Closed from LAST-ACK.

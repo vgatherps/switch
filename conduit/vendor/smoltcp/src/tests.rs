@@ -116,14 +116,8 @@ impl Device for TestingDevice {
         }
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.rx_queue.pop_front().map(move |buffer| {
-            let rx = RxToken { buffer };
-            let tx = TxToken {
-                queue: &mut self.tx_queue,
-            };
-            (rx, tx)
-        })
+    fn receive(&mut self, _timestamp: Instant) -> Option<Self::RxToken<'_>> {
+        self.rx_queue.pop_front().map(|buffer| RxToken { buffer })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {

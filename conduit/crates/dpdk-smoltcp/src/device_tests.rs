@@ -170,14 +170,13 @@ fn stage_checksum(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags: u
 fn checksum_meta(fixture: &Fixture, device: &mut Device, flags: u64, verified: (bool, bool)) {
     let bytes = checksum_syn();
     stage_checksum(fixture, device, &bytes, flags);
-    let (rx, tx) = device.receive(NOW).unwrap();
+    let rx = device.receive(NOW).unwrap();
     let mut expected = PacketMeta::default();
     expected.ipv4_checksum_verified = verified.0;
     expected.l4_checksum_verified = verified.1;
     assert_eq!(rx.meta(), expected);
     assert_eq!(rx.into_buf().as_slice(), bytes);
-    drop(tx);
-    assert_eq!(in_use(&device.port), (0, 1));
+    assert_eq!(in_use(&device.port), (0, 0));
 }
 
 fn checksum_ingress(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags: u64, reply: bool) {
@@ -565,7 +564,6 @@ fn socket_template_frames(
         &pair::tcp_socket_sized(4096),
         1500,
         device.frame_source(),
-        smoltcp::iface::DropQueue::with_capacity(1, 0),
     );
     sockets.get_mut(handle).set_ack_delay(None);
     let arp = ArpRepr::EthernetIpv4 {
@@ -1421,11 +1419,9 @@ fn check_pcap_rx_timestamp(eal: &crate::Eal, enabled: bool) {
         assert_ne!(unsafe { (*packet.as_ptr()).ol_flags } & flag, 0);
     }
     for (index, stamp) in [1_000_002, 3_000_004].into_iter().enumerate() {
-        let (rx, tx) = device.receive(NOW).unwrap();
-        let frame = rx.into_buf();
+        let frame = device.receive(NOW).unwrap().into_buf();
         assert_eq!(frame.rx_timestamp(), if enabled { stamp } else { 0 });
         assert_eq!(frame.as_slice(), bytes);
-        drop(tx);
         assert_eq!(in_use(&device.port).0, 2 - index as u32);
         drop(frame);
         assert_eq!(in_use(&device.port).0, 1 - index as u32);
@@ -1528,11 +1524,9 @@ fn check_rx_timestamp(
     write_rx_timestamp(raw, field, 0xfedc_ba98_7654_3210, flagged);
     produce(fixture, &[raw]);
     assert_eq!(device.rx_burst().unwrap().accepted, 1);
-    let (rx, tx) = device.receive(NOW).unwrap();
-    let frame = rx.into_buf();
+    let frame = device.receive(NOW).unwrap().into_buf();
     assert_eq!(frame.rx_timestamp(), expected);
     assert_eq!(frame.as_slice(), bytes);
-    drop(tx);
     assert_eq!(in_use(&device.port).0, 1);
     drop(frame);
     assert_eq!(in_use(&device.port).0, 0);
@@ -1608,12 +1602,10 @@ fn rx_token_owns_exact_bytes_and_returns_buffer() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
         stage(&fixture, &mut device, b"exact rx bytes");
-        let (rx, tx) = device.receive(NOW).unwrap();
-        assert_eq!(rx.into_buf().as_slice(), b"exact rx bytes");
-        drop(tx);
+        assert_eq!(device.receive(NOW).unwrap().into_buf().as_slice(), b"exact rx bytes");
         assert!(device.rx.is_empty() && device.tx.is_empty());
-        // The unused reply packet stays as the spare.
-        assert_eq!(in_use(&device.port), (0, 1));
+        // Receiving takes no TX packet.
+        assert_eq!(in_use(&device.port), (0, 0));
         finish(fixture, device);
     });
 }
@@ -1844,14 +1836,12 @@ fn rx_into_buf_releases_on_drop_without_copy() {
         let (fixture, mut device) = open(eal, 4, 4);
         stage(&fixture, &mut device, b"owned rx bytes");
         let data = device.rx.front().unwrap().data().as_ptr();
-        let (rx, tx) = device.receive(NOW).unwrap();
-        let frame = rx.into_buf();
+        let frame = device.receive(NOW).unwrap().into_buf();
         assert_eq!(frame.as_slice().as_ptr(), data);
         assert_eq!(frame.as_slice(), b"owned rx bytes");
-        drop(tx);
-        assert_eq!(in_use(&device.port), (1, 1));
+        assert_eq!(in_use(&device.port), (1, 0));
         drop(frame);
-        assert_eq!(in_use(&device.port), (0, 1));
+        assert_eq!(in_use(&device.port), (0, 0));
         finish(fixture, device);
     });
 }
@@ -1881,10 +1871,10 @@ fn unused_tokens_hold_one_tx_buffer() {
             assert_eq!(token_ptr(&token), spare);
             drop(token);
             stage(&fixture, &mut device, &[round; 60]);
-            let (rx, tx) = device.receive(NOW).unwrap();
+            assert_eq!(device.receive(NOW).unwrap().into_buf().as_slice(), [round; 60]);
+            let tx = device.transmit(NOW).unwrap();
             assert_eq!(token_ptr(&tx), spare);
             assert_eq!(tx.packet.as_ref().unwrap().data().len(), FRAME);
-            assert_eq!(rx.into_buf().as_slice(), [round; 60]);
             drop(tx);
             assert_eq!(spare_ptr(&device), spare);
             assert!(device.tx.is_empty());
@@ -2092,13 +2082,14 @@ fn callback_panic_queues_nothing_and_releases() {
         }));
         assert!(unwound.is_err());
         stage(&fixture, &mut device, b"reply panics");
-        let (rx, tx) = device.receive(NOW).unwrap();
+        let frame = device.receive(NOW).unwrap().into_buf();
+        assert_eq!(frame.as_slice(), b"reply panics");
+        let tx = device.transmit(NOW).unwrap();
         let unwound = catch_unwind(AssertUnwindSafe(|| {
-            let frame = rx.into_buf();
-            assert_eq!(frame.as_slice(), b"reply panics");
             tx.consume(60, |_| panic!("reply fails"));
         }));
         assert!(unwound.is_err());
+        drop(frame);
         assert!(device.tx.is_empty() && device.rx.is_empty());
         assert_eq!(in_use(&device.port), (0, 0));
         finish(fixture, device);
@@ -2149,21 +2140,21 @@ fn oversize_consume_panics_and_releases() {
 }
 
 #[zhida_test_support::pinned_test]
-fn tx_pool_exhausted_receive_none_rx_stays_staged_then_recovers() {
+fn tx_pool_exhausted_still_receives_then_transmit_recovers() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
-        stage(&fixture, &mut device, b"waits for reply buffer");
+        stage(&fixture, &mut device, b"received without a reply buffer");
         let held: Vec<Packet> =
             std::iter::from_fn(|| device.port.alloc_tx(device.port.frame_capacity())).collect();
         assert_eq!(held.len(), 63);
-        assert!(device.receive(NOW).is_none());
         assert!(device.transmit(NOW).is_none());
-        assert_eq!(device.rx.len(), 1);
-        assert_eq!(in_use(&device.port), (1, 63));
+        let rx = device.receive(NOW).unwrap();
+        assert_eq!(rx.into_buf().as_slice(), b"received without a reply buffer");
+        assert!(device.rx.is_empty());
         drop(held);
-        let (rx, tx) = device.receive(NOW).unwrap();
-        assert_eq!(rx.into_buf().as_slice(), b"waits for reply buffer");
-        drop(tx);
+        device.transmit(NOW).unwrap().consume(60, |buf| buf.fill(5));
+        assert_eq!(pending(&device), [vec![5; 60]]);
+        assert_eq!(device.flush().unwrap(), 1);
         finish(fixture, device);
     });
 }
@@ -2177,16 +2168,13 @@ fn spare_serves_one_token_then_exhausted_pool_refuses_and_recovers() {
             std::iter::from_fn(|| device.port.alloc_tx(device.port.frame_capacity())).collect();
         assert_eq!(held.len(), 62);
         send(&mut device, b"from the spare");
-        stage(&fixture, &mut device, b"waits for reply buffer");
-        assert!(device.receive(NOW).is_none());
+        stage(&fixture, &mut device, b"received while the pool is empty");
         assert!(device.transmit(NOW).is_none());
         assert!(device.spare.is_none());
-        assert_eq!(device.rx.len(), 1);
-        assert_eq!(in_use(&device.port), (1, 63));
+        let rx = device.receive(NOW).unwrap();
+        assert_eq!(rx.into_buf().as_slice(), b"received while the pool is empty");
         drop(held);
-        let (rx, tx) = device.receive(NOW).unwrap();
-        assert_eq!(rx.into_buf().as_slice(), b"waits for reply buffer");
-        tx.consume(60, |buf| buf.fill(3));
+        device.transmit(NOW).unwrap().consume(60, |buf| buf.fill(3));
         assert_eq!(pending(&device), [b"from the spare".to_vec(), vec![3; 60]]);
         assert_eq!(device.flush().unwrap(), 2);
         finish(fixture, device);
@@ -2194,7 +2182,7 @@ fn spare_serves_one_token_then_exhausted_pool_refuses_and_recovers() {
 }
 
 #[zhida_test_support::pinned_test]
-fn full_pending_refuses_tokens_until_flush() {
+fn full_pending_refuses_tx_tokens_until_flush_but_receives() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 2);
         let slots = device.tx.capacity();
@@ -2203,16 +2191,12 @@ fn full_pending_refuses_tokens_until_flush() {
         for value in 0..slots as u8 {
             send(&mut device, &[value; 60]);
         }
-        stage(&fixture, &mut device, b"needs a slot");
+        stage(&fixture, &mut device, b"needs no slot");
         assert!(device.transmit(NOW).is_none());
-        assert!(device.receive(NOW).is_none());
-        assert_eq!(device.rx.len(), 1);
+        assert_eq!(device.receive(NOW).unwrap().into_buf().as_slice(), b"needs no slot");
         assert_eq!(device.tx.capacity(), slots);
-        assert_eq!(in_use(&device.port), (1, slots as u32));
         assert_eq!(device.flush().unwrap(), slots);
-        let (rx, tx) = device.receive(NOW).unwrap();
-        drop(rx.into_buf());
-        tx.consume(60, |buf| buf.fill(9));
+        device.transmit(NOW).unwrap().consume(60, |buf| buf.fill(9));
         assert_eq!(pending(&device), [vec![9; 60]]);
         assert_eq!(device.flush().unwrap(), 1);
         finish(fixture, device);
@@ -2964,7 +2948,6 @@ fn retransmit_with_tx_checksum_offload() {
             &pair::tcp_socket_sized(4096),
             1500,
             device.frame_source(),
-            smoltcp::iface::DropQueue::with_capacity(1, 0),
         );
         sockets.get_mut(handle).set_ack_delay(None);
         let arp = ArpRepr::EthernetIpv4 {

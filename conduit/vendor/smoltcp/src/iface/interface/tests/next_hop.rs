@@ -918,9 +918,9 @@ mod invalidation {
         peer.data(3);
     }
 
-    #[test]
-    #[should_panic(expected = "TCP segment exceeds the IP MTU")]
-    fn oversize_segment_panics() {
+    /// Dispatches the warm connection's last segment, changed by `edit`, after shrinking the IP
+    /// MTU below it. An oversize TCP segment is a stack bug: dispatch must not report it sent.
+    fn dispatch_oversize_segment(edit: impl FnOnce(&mut TcpRepr)) {
         let mut peer = Peer::new(2, PEER, None);
         peer.warm();
         let frame = peer.frames.last().unwrap();
@@ -928,20 +928,17 @@ mod invalidation {
         let ip_packet = Ipv4Packet::new_checked(eth.payload()).unwrap();
         let caps = ChecksumCapabilities::default();
         let ip = Ipv4Repr::parse(&ip_packet, &caps).unwrap();
-        let tcp = TcpRepr::parse(
+        let mut tcp = TcpRepr::parse(
             &TcpPacket::new_checked(ip_packet.payload()).unwrap(),
             &ip.src_addr.into(),
             &ip.dst_addr.into(),
             &caps,
         )
         .unwrap();
-        assert!(crate::iface::header_template::TcpTemplate::is_eligible(
-            &tcp
-        ));
+        edit(&mut tcp);
         peer.iface.inner.caps.max_transmission_unit = 14 + 40;
         assert!(ip.buffer_len() + tcp.buffer_len() > peer.iface.inner.caps.ip_mtu());
         let meta = &mut peer.sockets.item_at_mut(0).unwrap().meta;
-        assert!(meta.tcp_template.is_some());
         let _ = peer.iface.inner.dispatch_tcp(
             peer.device.transmit(Instant::from_millis(2)).unwrap(),
             PacketMeta::default(),
@@ -950,6 +947,24 @@ mod invalidation {
             &mut meta.next_hop,
             &mut meta.tcp_template,
         );
+    }
+
+    #[test]
+    #[should_panic]
+    fn oversize_segment_panics() {
+        dispatch_oversize_segment(|tcp| {
+            assert!(crate::iface::header_template::TcpTemplate::is_eligible(tcp));
+        });
+    }
+
+    /// The same on the generic emitter: a segment without an ACK takes `dispatch_ip`.
+    #[test]
+    #[should_panic]
+    fn oversize_segment_without_ack_panics() {
+        dispatch_oversize_segment(|tcp| {
+            tcp.ack_number = None;
+            assert!(!crate::iface::header_template::TcpTemplate::is_eligible(tcp));
+        });
     }
 
     mod producers {
@@ -1002,17 +1017,13 @@ mod invalidation {
             peer.send(2);
             peer.expect_frame(TcpControl::Psh, seq, TcpSeqNumber(101), &[0x5a]);
             assert!(peer.device.tx_queue.is_empty());
-            for millis in (3..302).step_by(100).chain([301]) {
+            // The handshake and warm-up RTT samples are 0 µs: the 50 ms RTO floor, so the
+            // resend is due at 2 + 50 ms.
+            for millis in 3..52 {
                 peer.egress(millis);
                 assert!(peer.device.tx_queue.is_empty());
             }
-            for millis in 302..=402 {
-                peer.egress(millis);
-                if !peer.device.tx_queue.is_empty() {
-                    break;
-                }
-                assert!(peer.device.tx_queue.is_empty());
-            }
+            peer.egress(52);
             peer.expect_frame(TcpControl::Psh, seq, TcpSeqNumber(101), &[0x5a]);
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).send_queue(), 1);
@@ -1077,17 +1088,13 @@ mod invalidation {
             ack.window_len = 0;
             peer.ingress(2, peer.frame(ack));
             assert_eq!(peer.sockets.get_mut(peer.handle).send_slice(b"abc"), Ok(3));
-            for millis in (2..302).step_by(100).chain([301]) {
+            // The handshake and warm-up RTT samples are 0 µs: the 50 ms RTO floor, so the
+            // probe is due at 2 + 50 ms.
+            for millis in 2..52 {
                 peer.egress(millis);
                 assert!(peer.device.tx_queue.is_empty());
             }
-            for millis in 302..=402 {
-                peer.egress(millis);
-                if !peer.device.tx_queue.is_empty() {
-                    break;
-                }
-                assert!(peer.device.tx_queue.is_empty());
-            }
+            peer.egress(52);
             peer.expect_frame(TcpControl::None, seq, TcpSeqNumber(101), b"a");
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).send_queue(), 3);

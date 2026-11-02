@@ -3,8 +3,8 @@
 /// rx_staging + floor(3 * rx_cache_size / 2).
 /// A NIC keeps its RX descriptors posted (ENA refills once min(ring / 8, 256) are empty);
 /// memif copy mode needs 32 mbufs before it can receive. With those posted and staging full,
-/// the pool must still hold the low mark free: below it every TCP socket keeps no
-/// out-of-order data. A DPDK cache can hold up to its flush threshold of 1.5 times its
+/// the pool must still hold the low mark free: below it the TCP sockets holding the most
+/// out-of-order frames release them. A DPDK cache can hold up to its flush threshold of 1.5 times its
 /// configured size. `Stack::new` refuses a smaller RX pool. Size the RX pool as this plus the
 /// received mbufs all sockets together may hold (unread data, out-of-order segments, frames
 /// the application holds). Smaller segments can require more mbufs for the same byte volume.

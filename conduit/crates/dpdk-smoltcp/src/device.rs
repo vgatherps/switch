@@ -122,8 +122,8 @@ impl Device {
         self.tx.len()
     }
 
-    pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
-        self.port.rx_pool_low(received)
+    pub(crate) fn rx_pool_shortfall(&self) -> usize {
+        self.port.rx_pool_shortfall()
     }
 
     pub(crate) fn port_mut(&mut self) -> &mut Port {
@@ -183,13 +183,9 @@ impl phy::Device for Device {
     type TxToken<'a> = Tx<'a>;
     type FrameToken<'a> = FrameTx<'a>;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Rx<'_>, Tx<'_>)> {
-        if self.rx.is_empty() {
-            return None;
-        }
-        let tx = reserve(&self.port, &mut self.tx, &mut self.spare)?;
+    fn receive(&mut self, _timestamp: Instant) -> Option<Rx<'_>> {
         let rx = self.rx.pop_front()?;
-        Some((Rx(rx, &self.port), tx))
+        Some(Rx(rx, &self.port))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Tx<'_>> {

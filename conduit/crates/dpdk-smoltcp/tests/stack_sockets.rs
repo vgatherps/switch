@@ -213,7 +213,6 @@ fn held_tcp_frame_after_removal(reap: bool) {
         });
         let frame = pair.b.tcp_mut(&server).recv().unwrap().unwrap();
         assert_eq!(frame.payload(), b"held");
-        assert_eq!(pair.b.tcp(&server).held_frames().count(), 1);
         if reap {
             pair.a.close(&client);
             pair.drive(|_, _| {}, |_, b| {
@@ -556,40 +555,6 @@ fn peer_data(isn: TcpSeqNumber, peer_seq: TcpSeqNumber, payload: &[u8]) -> Vec<u
 }
 
 #[zhida_test_support::pinned_test]
-fn reused_port_refreshes_rx_pressure_at_stack_construction() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxreuse", 16, 16);
-        let mut previous = stack(fixture.open(eal), 1, 4);
-        fixture.inject(&[ring_port::frame(0)]);
-        assert_eq!(previous.receive(T0, 1).unwrap().rx_received, 1);
-        fixture.take_tx();
-        let mut port = previous.into_port();
-
-        // Retain packets received directly through the Port after the previous Stack's reading.
-        let mut held = std::collections::VecDeque::with_capacity(88);
-        for _ in 0..11 {
-            fixture.inject(&vec![ring_port::frame(0); 8]);
-            let burst = port.rx_burst(&mut held).unwrap();
-            assert_eq!((burst.accepted, burst.rejected), (8, 0));
-        }
-        assert_eq!(fixture.in_use().0, 88);
-
-        let mut stack = stack(port, 1, 4);
-        let handle = stack.add_tcp(tcp_socket()).unwrap();
-        stack.tcp_mut(&handle).set_ack_delay(None);
-        stack.connect(&handle, remote(), LOCAL_PORT).unwrap();
-        let (isn, peer_isn, _) = handshake(&fixture, &mut stack, &handle);
-        fixture.inject(&[peer_data(isn, peer_isn + 10, b"out of order")]);
-        let turn = stack.receive(T0, 8).unwrap();
-        assert_eq!((turn.rx_received, turn.rx_processed), (1, 1));
-        assert_eq!(stack.tcp(&handle).rx_refused_segments(), 1);
-        fixture.take_tx();
-        drop(held);
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn received_segment_stays_in_rx_mbuf_until_read() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxheld", 16, 16);
@@ -840,17 +805,16 @@ fn reset_remove_unwind_return_once() {
                 assert!(fixture.take_tx().is_empty());
                 assert_eq!(stack.tcp(&handle).state(), State::Closed);
                 assert_eq!(stack.tcp(&handle).recv_queue(), 6);
-                // The RST needs no reply: its unused TX packet stays as the
-                // Device's spare until `into_port`.
-                assert_eq!(fixture.in_use(), (3, 1));
+                // The RST needs no reply, so it took no TX packet.
+                assert_eq!(fixture.in_use(), (3, 0));
                 let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
                 assert_eq!(bytes.len(), 6);
                 assert_eq!(&bytes, b"abcdef");
-                assert_eq!(fixture.in_use(), (1, 1));
+                assert_eq!(fixture.in_use(), (1, 0));
                 stack.remove_tcp(handle);
-                assert_eq!(fixture.in_use(), (0, 1));
+                assert_eq!(fixture.in_use(), (0, 0));
                 exhaust_and_reallocate_rx_pool(&fixture);
-                assert_eq!(fixture.in_use(), (0, 1));
+                assert_eq!(fixture.in_use(), (0, 0));
             }
             let port = stack.into_port();
             assert_eq!(fixture.in_use(), (0, 0));

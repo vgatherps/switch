@@ -277,7 +277,7 @@ mod stale_neighbors {
             self.inner.capabilities()
         }
 
-        fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        fn receive(&mut self, now: Instant) -> Option<Self::RxToken<'_>> {
             self.inner.receive(now)
         }
 
@@ -348,9 +348,7 @@ mod stale_neighbors {
             mut sockets: TcpSet<'static>,
             device: TestingDevice,
         ) -> Self {
-            let mut socket = tcp::Socket::test_socket(64, 64);
-            // The timelines retransmit at 1 s after the first unacknowledged send.
-            socket.set_rto(crate::time::Duration::from_millis(1_000));
+            let socket = tcp::Socket::test_socket(64, 64);
             let handle = sockets.add(socket);
             let mut conn = Self {
                 iface,
@@ -410,6 +408,9 @@ mod stale_neighbors {
             );
             conn.ingress(0, bytes);
             assert_eq!(conn.sockets.get(handle).state(), tcp::State::Established);
+            // The timelines retransmit at 1 s after the first unacknowledged send; seeded after
+            // the handshake, whose 0 µs RTT sample would otherwise set the 50 ms floor.
+            conn.sockets.get_mut(handle).seed_rto(crate::time::Duration::from_millis(1_000));
             conn.egress(0);
             conn.take_data(&[], 0);
             assert!(conn.device.inner.tx_queue.is_empty());
@@ -605,23 +606,23 @@ mod stale_neighbors {
         iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(LOCAL.into(), 24)).unwrap());
         let mut sockets = TcpSet::new(64);
         let other = Ipv4Address::new(192, 168, 1, 3);
+        // One cache slot, two dead peers: the second peer evicts the first's pending entry, so
+        // each address ARPs once per second and a new destination once per second.
+        let mut requests = Vec::new();
         for millis in [0, 1, 2, 3, 998, 999, 1_000, 1_001, 1_002, 1_999, 2_000] {
             let peer = if millis % 2 == 0 { PEER } else { other };
             connect_unresolved_peer(&mut iface, &mut sockets, peer, 1234 + millis as u16);
             iface.poll_egress(Instant::from_millis(millis), &mut device, &mut sockets);
-            if millis % 1_000 == 0 {
-                assert_eq!(device.tx_queue.len(), 1);
-                let bytes = device.tx_queue.pop_front().unwrap();
+            while let Some(bytes) = device.tx_queue.pop_front() {
                 let eth = EthernetFrame::new_checked(&bytes).unwrap();
                 let arp = ArpPacket::new_checked(eth.payload()).unwrap();
                 let target =
                     Ipv4Address::from_octets(arp.target_protocol_addr().try_into().unwrap());
-                assert!(target == PEER || target == other);
                 assert_arp_request(&bytes, target);
-            } else {
-                assert!(device.tx_queue.is_empty());
+                requests.push((millis, target));
             }
         }
+        assert_eq!(requests, [(0, PEER), (1, other), (1_001, other), (1_002, PEER)]);
     }
 
     #[test]
@@ -1111,13 +1112,8 @@ fn ingress_takes_each_frame_once_via_into_buf() {
             self.inner.capabilities()
         }
 
-        fn receive(
-            &mut self,
-            timestamp: Instant,
-        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            let rx = self.queue.pop_front()?;
-            let tx = self.inner.transmit(timestamp).unwrap();
-            Some((rx, tx))
+        fn receive(&mut self, _timestamp: Instant) -> Option<Self::RxToken<'_>> {
+            self.queue.pop_front()
         }
 
         fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {

@@ -104,25 +104,34 @@ impl TxQueue {
         });
     }
 
-    pub(crate) fn append_tail(&mut self, sent: usize, data: &[u8], cap: usize) -> usize {
+    /// Bytes the tail frame can still take while it stays at most `cap` long: zero unless it
+    /// is unique and none of it has been sent.
+    pub(crate) fn tail_room(&self, sent: usize, cap: usize) -> usize {
         let first_never_sent = self.acked + sent as u64;
-        let byte_room = self.byte_room();
-        let Some(entry) = self.entries.back_mut() else {
+        let Some(entry) = self.entries.back() else {
             return 0;
         };
         if first_never_sent > entry.start() {
             return 0;
         }
-        let buf = entry.buf.as_mut().expect("TX queue tail is taken");
+        let buf = entry.buf.as_ref().expect("TX queue tail is taken");
         if !buf.unique() {
             return 0;
         }
-        let old_len = buf.len();
         // A frame the app filled past `cap` (up to its capacity) takes no more bytes.
-        let count = (buf.capacity() - old_len)
-            .min(byte_room)
-            .min(cap.saturating_sub(old_len))
-            .min(data.len());
+        (buf.capacity() - buf.len())
+            .min(self.byte_room())
+            .min(cap.saturating_sub(buf.len()))
+    }
+
+    pub(crate) fn append_tail(&mut self, sent: usize, data: &[u8], cap: usize) -> usize {
+        let count = self.tail_room(sent, cap).min(data.len());
+        if count == 0 {
+            return 0;
+        }
+        let entry = self.entries.back_mut().expect("TX queue tail has room");
+        let buf = entry.buf.as_mut().expect("TX queue tail is taken");
+        let old_len = buf.len();
         let new_len = old_len + count;
         buf.room_mut()[old_len..new_len].copy_from_slice(&data[..count]);
         buf.set_len(new_len);

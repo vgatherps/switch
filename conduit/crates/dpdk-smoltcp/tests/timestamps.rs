@@ -17,8 +17,9 @@ use wire::Verdict;
 const BUDGET: usize = 32;
 /// Upstream `ACK_DELAY_DEFAULT`.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// Default socket RTO.
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples on a Pair at one instant are 0 µs, so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {

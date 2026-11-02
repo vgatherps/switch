@@ -136,7 +136,7 @@ fn send_for_rto(
     handle: SocketHandle,
     rto: Duration,
 ) {
-    sockets.get_mut(handle).set_rto(rto);
+    sockets.get_mut(handle).seed_rto(rto);
     assert_eq!(sockets.get_mut(handle).send_slice(b"x"), Ok(1));
     iface.poll_egress(START, device, sockets);
     assert_eq!(take_tcp(device).3, b"x");
@@ -163,7 +163,7 @@ impl Device for RefusingDevice {
         self.inner.capabilities()
     }
 
-    fn receive(&mut self, timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(&mut self, timestamp: Instant) -> Option<Self::RxToken<'_>> {
         self.inner.receive(timestamp)
     }
 
@@ -208,7 +208,7 @@ fn egress_idle_means_next_pass_does_nothing() {
                 sockets.get_mut(handle).send_slice(&[1; 3 * 512]).unwrap();
             }
             "due" => {
-                send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(20));
+                send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(70));
             }
             "refused" => {
                 sockets.get_mut(handle).send_slice(&[1; 512]).unwrap();
@@ -220,7 +220,7 @@ fn egress_idle_means_next_pass_does_nothing() {
             remaining: if matches!(scenario, "refused" | "due") { 0 } else { usize::MAX },
         };
         let now = if scenario == "due" {
-            START + Duration::from_millis(20)
+            START + Duration::from_millis(70)
         } else {
             START
         };
@@ -363,7 +363,7 @@ fn waiting_socket_changed_by_app_keeps_arp_deadline() {
     assert_eq!(sockets.waiting, vec![0]);
     sockets
         .get_mut(handle)
-        .set_rto(Duration::from_secs(3));
+        .seed_rto(Duration::from_secs(3));
     assert_eq!(
         iface.poll_at(START, &mut sockets),
         Some(Instant::from_millis(1024))
@@ -469,9 +469,11 @@ fn due_timer_then_dirty_sockets_admitted_in_marking_order() {
     sockets.get_mut(handles[0]).send_slice(&[1; 64]).unwrap();
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).0, 1234);
+    // The handshake's 0 µs RTT sample gives the 50 ms RTO floor: due at 150 ms, which the
+    // wheel reports at its 128 ms slot boundary.
     assert_eq!(
         iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(384))
+        Some(Instant::from_millis(128))
     );
     for index in [2, 1] {
         sockets
@@ -479,7 +481,7 @@ fn due_timer_then_dirty_sockets_admitted_in_marking_order() {
             .send_slice(&[1; 64])
             .unwrap();
     }
-    iface.poll_egress(START + Duration::from_millis(300), &mut device, &mut sockets);
+    iface.poll_egress(START + Duration::from_millis(50), &mut device, &mut sockets);
     for port in [1234, 1236, 1235] {
         assert_eq!(take_tcp(&mut device).0, port);
     }
@@ -777,8 +779,8 @@ fn poll_at_after_advance_stays_between_now_and_rounded_earliest_deadline() {
     let (mut iface, mut sockets, mut device) = setup_eth();
     let first = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let second = establish(&mut iface, &mut sockets, &mut device, 1235).0;
-    let first_rto = Duration::from_micros(40_250);
-    let second_rto = Duration::from_micros(60_750);
+    let first_rto = Duration::from_micros(90_250);
+    let second_rto = Duration::from_micros(110_750);
     send_for_rto(&mut iface, &mut sockets, &mut device, first, first_rto);
     send_for_rto(&mut iface, &mut sockets, &mut device, second, second_rto);
     assert_eq!(
@@ -789,11 +791,11 @@ fn poll_at_after_advance_stays_between_now_and_rounded_earliest_deadline() {
         sockets.get(second).poll_at(),
         PollAt::Time(START + second_rto)
     );
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(128)));
-    let rounded_earliest = START + Duration::from_millis(41);
+    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(160)));
+    let rounded_earliest = START + Duration::from_millis(91);
     for now in [
-        START + Duration::from_micros(40_001),
-        START + Duration::from_micros(40_999),
+        START + Duration::from_micros(90_001),
+        START + Duration::from_micros(90_999),
     ] {
         let at = iface.poll_at(now, &mut sockets).unwrap();
         assert!(at >= now, "poll_at returned {at} before {now}");
@@ -816,7 +818,8 @@ fn timers_fire_among_idle_sockets() {
                 sockets.get_mut(handle).send_slice(b"abc").unwrap();
                 iface.poll_egress(START, &mut device, &mut sockets);
                 assert_eq!(take_tcp(&mut device).3, b"abc");
-                Duration::from_millis(300)
+                // The handshake's 0 µs RTT sample gives the 50 ms RTO floor.
+                Duration::from_millis(50)
             }
             "delayed ACK" => {
                 sockets
@@ -858,7 +861,7 @@ fn timers_fire_among_idle_sockets() {
         assert_eq!(
             iface.poll_at(START, &mut sockets),
             Some(Instant::from_millis(match timer {
-                "RTO" => 384,
+                "RTO" => 128,
                 "delayed ACK" => 120,
                 "configured RTO" => 384,
                 "TIME-WAIT" => 9216,
@@ -1007,15 +1010,16 @@ fn expired_timer_then_dirty_sockets_admitted_in_marking_order() {
     let (low, low_seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
     let timer = establish(&mut iface, &mut sockets, &mut device, 1235).0;
     let (high, high_seq) = establish(&mut iface, &mut sockets, &mut device, 1236);
-    send_for_rto(&mut iface, &mut sockets, &mut device, timer, Duration::from_millis(20));
+    send_for_rto(&mut iface, &mut sockets, &mut device, timer, Duration::from_millis(70));
+    // Due at 170 ms; the wheel reports its 160 ms slot boundary.
     assert_eq!(
         iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(120))
+        Some(Instant::from_millis(160))
     );
     sockets.get_mut(high).send_slice(b"high").unwrap();
     sockets.get_mut(low).send_slice(b"low").unwrap();
     assert_eq!(sockets.dirty_list, vec![2, 0]);
-    iface.poll_egress(Instant::from_millis(120), &mut device, &mut sockets);
+    iface.poll_egress(Instant::from_millis(170), &mut device, &mut sockets);
     let (port, control, _, payload) = take_tcp(&mut device);
     assert_eq!((port, control), (1235, TcpControl::Psh));
     assert_eq!(payload, b"x");
@@ -1059,7 +1063,7 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
     sockets
         .get_mut(handle)
         .set_ack_delay(Some(Duration::from_millis(20)));
-    send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(25));
+    send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(75));
     receive(
         &mut iface,
         &mut sockets,
@@ -1082,11 +1086,12 @@ fn dirty_socket_due_before_wheel_advances_admitted_once() {
     assert!(device.tx_queue.is_empty());
     assert_eq!(
         sockets.get(handle).poll_at(),
-        PollAt::Time(Instant::from_millis(125))
+        PollAt::Time(Instant::from_millis(175))
     );
+    // The wheel reports the 160 ms slot boundary of the 175 ms deadline.
     assert_eq!(
         iface.poll_at(now, &mut sockets),
-        Some(Instant::from_millis(125))
+        Some(Instant::from_millis(160))
     );
     iface.poll_egress(now, &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());
@@ -1123,9 +1128,11 @@ fn lone_socket_sends_its_window_in_one_visit() {
         PollResult::None
     );
     assert!(device.tx_queue.is_empty());
+    // The handshake's 0 µs RTT sample gives the 50 ms RTO floor: due at 150 ms, which the
+    // wheel reports at its 128 ms slot boundary.
     assert_eq!(
         iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(384))
+        Some(Instant::from_millis(128))
     );
 }
 
@@ -1529,13 +1536,13 @@ fn expired_timers_admitted_in_expiry_order() {
     let (mut iface, mut sockets, mut device) = setup_eth();
     let a = establish(&mut iface, &mut sockets, &mut device, 1234).0;
     let b = establish(&mut iface, &mut sockets, &mut device, 1235).0;
-    send_for_rto(&mut iface, &mut sockets, &mut device, a, Duration::from_millis(20));
-    send_for_rto(&mut iface, &mut sockets, &mut device, b, Duration::from_millis(10));
+    send_for_rto(&mut iface, &mut sockets, &mut device, a, Duration::from_millis(70));
+    send_for_rto(&mut iface, &mut sockets, &mut device, b, Duration::from_millis(60));
     assert_eq!(
         iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(110))
+        Some(Instant::from_millis(160))
     );
-    iface.poll_egress(Instant::from_millis(120), &mut device, &mut sockets);
+    iface.poll_egress(Instant::from_millis(170), &mut device, &mut sockets);
     for port in [1235, 1234] {
         let (sent_port, control, _, payload) = take_tcp(&mut device);
         assert_eq!((sent_port, control), (port, TcpControl::Psh));
@@ -1625,10 +1632,10 @@ fn simultaneous_rto_expiry_retransmits_in_arming_order() {
             &mut sockets,
             &mut device,
             handle,
-            Duration::from_millis(20),
+            Duration::from_millis(70),
         );
     }
-    iface.poll_egress(Instant::from_millis(120), &mut device, &mut sockets);
+    iface.poll_egress(Instant::from_millis(170), &mut device, &mut sockets);
     for (index, &(_, seq)) in connections.iter().enumerate() {
         let (port, control, sent_seq, payload) = take_tcp(&mut device);
         assert_eq!(
@@ -1652,10 +1659,10 @@ fn simultaneous_rto_expiry_polled_before_egress_keeps_arming_order() {
             &mut sockets,
             &mut device,
             handle,
-            Duration::from_millis(20),
+            Duration::from_millis(70),
         );
     }
-    let now = Instant::from_millis(120);
+    let now = Instant::from_millis(170);
     assert_eq!(iface.poll_at(now, &mut sockets), Some(now));
     iface.poll_egress(now, &mut device, &mut sockets);
     for (index, &(_, seq)) in connections.iter().enumerate() {
@@ -1677,10 +1684,10 @@ fn rto_deadlines_retransmit_in_expiry_order() {
         .collect();
     for index in [2, 0, 1] {
         send_for_rto(&mut iface, &mut sockets, &mut device, handles[index].0,
-            Duration::from_millis([30, 10, 20][index]));
+            Duration::from_millis([80, 60, 70][index]));
     }
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(110)));
-    iface.poll_egress(Instant::from_millis(130), &mut device, &mut sockets);
+    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(160)));
+    iface.poll_egress(Instant::from_millis(180), &mut device, &mut sockets);
     for index in [1, 2, 0] {
         let (port, control, sent_seq, payload) = take_tcp(&mut device);
         let seq = handles[index].1;
@@ -1695,8 +1702,9 @@ fn rto_deadlines_retransmit_in_expiry_order() {
 fn rto_deadline_cancellation_removes_idle_socket() {
     let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device, 1234);
-    send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(20));
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(120)));
+    send_for_rto(&mut iface, &mut sockets, &mut device, handle, Duration::from_millis(70));
+    // Due at 170 ms; the wheel reports its 160 ms slot boundary.
+    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(160)));
     receive_at(&mut iface, &mut sockets, &mut device, Instant::from_millis(110),
         segment(1234, TcpControl::None, 101, seq + 1));
     assert_eq!(sockets.get(handle).send_queue(), 0);
@@ -1746,4 +1754,74 @@ fn waiting_positions_follow_removal_and_release() {
     assert_eq!(syns, remaining);
     assert!(sockets.waiting.is_empty());
     sockets.check_list_positions();
+}
+
+/// Out-of-order `data` at offsets `starts` (past the first in-order byte, 101) for `port`.
+fn hold_out_of_order(
+    iface: &mut Interface,
+    sockets: &mut TcpSet<'static>,
+    device: &mut TestingDevice,
+    port: u16,
+    ack: TcpSeqNumber,
+    starts: &[i32],
+) {
+    for &start in starts {
+        let mut tcp = segment(port, TcpControl::None, 101 + start, ack);
+        tcp.max_seg_size = None;
+        tcp.payload = b"12345";
+        receive(iface, sockets, device, tcp);
+    }
+    device.tx_queue.clear();
+}
+
+/// The in-order bytes `handle` delivers once the 10-byte gap at 101 fills.
+fn fill_gap(
+    iface: &mut Interface,
+    sockets: &mut TcpSet<'static>,
+    device: &mut TestingDevice,
+    (handle, port, ack): (SocketHandle, u16, TcpSeqNumber),
+) -> usize {
+    let mut tcp = segment(port, TcpControl::None, 101, ack);
+    tcp.max_seg_size = None;
+    tcp.payload = b"0123456789";
+    receive(iface, sockets, device, tcp);
+    let mut delivered = 0;
+    while let Some(frame) = sockets.get_mut(handle).recv().unwrap() {
+        delivered += frame.payload().len();
+    }
+    delivered
+}
+
+/// A low receive pool takes frames from the socket holding the most out-of-order frames, the
+/// farthest from its in-order data first, and no more than asked; then from the next-largest.
+#[test]
+fn pool_low_prunes_the_largest_holder_only_as_far_as_needed() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    let (s1, ack1) = establish(&mut iface, &mut sockets, &mut device, 1234);
+    let (s2, ack2) = establish(&mut iface, &mut sockets, &mut device, 1235);
+    hold_out_of_order(&mut iface, &mut sockets, &mut device, 1234, ack1, &[10, 20, 30, 40]);
+    hold_out_of_order(&mut iface, &mut sockets, &mut device, 1235, ack2, &[10, 20]);
+
+    // S1 holds 4 and gives 3, its farthest; S2 holds 2 and keeps them.
+    assert_eq!(sockets.prune_out_of_order(3), 3);
+    // Now S2 is the largest holder.
+    assert_eq!(sockets.prune_out_of_order(2), 2);
+    // Only S1's nearest frame is left.
+    assert_eq!(sockets.prune_out_of_order(5), 1);
+    assert_eq!(sockets.prune_out_of_order(1), 0);
+
+    // S1 kept the frame next to its gap until the last round; S2's went in the second.
+    assert_eq!(fill_gap(&mut iface, &mut sockets, &mut device, (s2, 1235, ack2)), 10);
+    assert_eq!(fill_gap(&mut iface, &mut sockets, &mut device, (s1, 1234, ack1)), 10);
+}
+
+/// Pruning only as far as asked keeps the frames nearest the gap: after S1 gives 3 of its 4,
+/// filling its gap delivers the gap and the one frame that continues it.
+#[test]
+fn partial_prune_keeps_the_frame_nearest_the_gap() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    let (s1, ack1) = establish(&mut iface, &mut sockets, &mut device, 1234);
+    hold_out_of_order(&mut iface, &mut sockets, &mut device, 1234, ack1, &[10, 20, 30, 40]);
+    assert_eq!(sockets.prune_out_of_order(3), 3);
+    assert_eq!(fill_gap(&mut iface, &mut sockets, &mut device, (s1, 1234, ack1)), 15);
 }

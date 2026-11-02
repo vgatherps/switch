@@ -84,8 +84,9 @@ fn neighbor_capacity_bounds_the_cache() {
     with_eal(|eal| {
         let [first, second] = reconnect(eal, 5, 4);
         // Four requests fill the cache with unanswered addresses; the fifth peer
-        // waits for their silence to end instead of evicting one.
-        assert_eq!(first.0, 5);
+        // evicts the oldest pending entry instead of waiting, so one peer is asked
+        // twice.
+        assert_eq!(first.0, 6);
         assert!(second.0 >= 1);
     });
 }
