@@ -41,6 +41,7 @@ stub ip "[ \"\$*\" = '-4 route show default' ] && cat '$tmp/routes'; exit 0"
 stub grubby "case \"\$1\" in --info=*) echo \"args=\\\"\$(cat '$tmp/grubby')\\\"\" ;; --update-kernel=*) echo \"\${2#--args=}\" >>'$tmp/grubby' ;; esac"
 stub systemctl "case \"\$1\" in
     is-enabled) [ -e '$tmp/enabled' ] ;;
+    is-active) [ \"\${FAKE_CHRONYD_INACTIVE:-}\" != 1 ] ;;
     enable) touch '$tmp/enabled' ;;
     reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' && touch '$tmp/unmanaged-before-reboot'
         cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf' && touch '$tmp/policy-before-reboot'
@@ -224,8 +225,9 @@ check "the config comes from zhida-netconf discover --aws on the data ENI" calle
 check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
 check "no interface is flushed or bound before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
-check "apply adds AWS's PHC refclock line after AL2023's NTP server" sh -c "[ \"\$(tail -n 1 '$root/etc/chrony.conf')\" = 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' ] && grep -qx 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' '$root/etc/chrony.conf'"
-check "without /dev/ptp_ena yet, chronyd is left for the reboot" sh -c "! grep -q '^systemctl restart chronyd' '$calls'" 
+# chronyd exits at start on a PHC refclock it cannot open: before the reboot there is no
+# /dev/ptp_ena, so apply leaves chrony.conf alone.
+check "apply leaves chrony.conf alone" sh -c "! grep -q '^refclock' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
 check "apply enables chronyd" called "systemctl enable -q chronyd.service"
 
 reboot
@@ -237,6 +239,20 @@ check "boot flushes the data ENI and only it" sh -c "grep -q 'ip addr flush dev 
 check "boot binds with --noiommu (no IOMMU groups)" called "zhida-netconf bind $root/etc/zhida/dut.json --noiommu"
 check "boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5,6" "$root/proc/irq/10/smp_affinity_list"
 check "boot stops irqbalance" called "systemctl disable --now -q irqbalance.service"
+check "boot with /dev/ptp_ena adds AWS's PHC refclock line after AL2023's NTP server" sh -c "[ \"\$(tail -n 1 '$root/etc/chrony.conf')\" = 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' ] && grep -qx 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' '$root/etc/chrony.conf'"
+check "boot restarts chronyd for the added line" called "systemctl restart chronyd.service"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "a second boot keeps one refclock line and does not restart chronyd" sh -c "[ \$(grep -c '^refclock PHC' '$root/etc/chrony.conf') = 1 ] && ! grep -q '^systemctl restart chronyd' '$calls'"
+# A host outside a precision-time placement group: no device, so chrony stays on NTP.
+mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
+sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
+cp "$root/etc/chrony.conf" "$tmp/chrony.conf"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "boot without /dev/ptp_ena leaves chrony.conf alone" sh -c "cmp -s '$tmp/chrony.conf' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
+mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
+HFT_ROOT=$root sh "$script" boot >/dev/null 2>&1
 
 : >"$calls"
 run apply
@@ -254,7 +270,7 @@ check "an unchanged chrony.conf keeps one refclock line and no restart" sh -c "[
 sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
 : >"$calls"
 run apply
-check "a changed chrony.conf with /dev/ptp_ena present restarts chronyd" sh -c "grep -q '^systemctl restart chronyd.service' '$calls' && grep -qx 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' '$root/etc/chrony.conf'"
+check "apply's boot restores a removed refclock line with /dev/ptp_ena present and restarts chronyd" sh -c "grep -q '^systemctl restart chronyd.service' '$calls' && grep -qx 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' '$root/etc/chrony.conf'"
 
 rm "$root/etc/systemd/network/00-zhida-data.network"
 : >"$calls"
@@ -271,6 +287,8 @@ check "verify accepts chrony with the PHC selected" has chrony "ok PHC selected"
 sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
 run verify
 check "chrony on NTP, PHC not selected, fails with the sources output" sh -c "grep -q '^chrony: FAIL the PHC is not the selected source' '$tmp/out' && grep -q '^\\^\\* 169.254.169.123' '$tmp/out'"
+FAKE_CHRONYD_INACTIVE=1 run verify
+check "verify fails when chronyd is not running" sh -c "[ \$(cat '$tmp/status') = 1 ] && grep -q '^chrony: FAIL chronyd not running' '$tmp/out'"
 # A host outside a precision-time placement group has no PHC device: NTP only is its normal state.
 mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
 run verify

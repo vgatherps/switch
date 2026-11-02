@@ -67,10 +67,10 @@ activate the drop-in before proceeding.
 | vfio_wc | official AL2023 `kernel6.18` already supplies ENA write-combining (needed for LLQ); check package ownership/integrity and loaded module identity, without installing headers or rebuilding it. Legacy kernels retain amzn-drivers' `get-vfio-with-wc.sh`, pinned commit and sha256 |
 | cmdline (x86_64) | also `clocksource=tsc` (not `tsc=reliable`, which turns off the kernel's TSC stability checks). Graviton's `arch_sys_counter` needs nothing |
 | unit | `zhida-host.service` runs `hft-host.sh boot` at every boot |
-| chrony | append AWS's documented PHC refclock line, `refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer` ([Amazon Time Sync: configure chronyd to use the PHC](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html#configure-chronyd-phc)), to AL2023's `/etc/chrony.conf`, keeping its Time Sync NTP server line; enable chronyd; restart it only when the line was added and `/dev/ptp_ena` exists (else the reboot starts it with the line) |
+| chrony | enable chronyd. `boot`, once `/dev/ptp_ena` exists (after the reboot that applies `ena.phc_enable=1`; never outside a precision-time placement group), appends AWS's documented PHC refclock line, `refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer` ([Amazon Time Sync: configure chronyd to use the PHC](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html#configure-chronyd-phc)), to AL2023's `/etc/chrony.conf`, keeping its Time Sync NTP server line, and restarts chronyd. Without the device chrony.conf is left alone: chronyd exits at start on a PHC refclock it cannot open |
 | unmanaged config | before requesting a reboot, write `/etc/systemd/network/00-zhida-data.network` with the data ENI's MAC and `Unmanaged=yes`; reload networkd only when the file changes. No addresses or routes are flushed until `boot` |
 | reboot | when the command line or a module changed |
-| boot | irqbalance off; every movable IRQ on the housekeeping CPUs; the data ENI unmanaged by systemd-networkd (`/etc/systemd/network/00-zhida-data.network`, matched by MAC) with its addresses and routes flushed; `zhida-netconf bind` (`--noiommu` without IOMMU groups) |
+| boot | the PHC refclock once `/dev/ptp_ena` exists (chrony row); irqbalance off; every movable IRQ on the housekeeping CPUs; the data ENI unmanaged by systemd-networkd (`/etc/systemd/network/00-zhida-data.network`, matched by MAC) with its addresses and routes flushed; `zhida-netconf bind` (`--noiommu` without IOMMU groups) |
 
 The unmanaged file must exist before the first reboot: otherwise AL2023 can give the data ENI a DHCP
 default route before `zhida-host.service` starts, making it the lowest-metric default route instead
@@ -85,7 +85,7 @@ pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed
 current one must be `tsc`, and `dmesg`, read as root, must show no `clocksource: timekeeping watchdog`,
 `TSC unstable` or `Marking clocksource 'tsc' as unstable` line, and its last `Switched to clocksource`
 must name `tsc`; a failure prints the offending line; other architectures skip it), unit, config, chrony
-(ok with the PHC as the selected source, a `#*` PHC row in `chronyc sources`; also ok with no
+(FAIL when chronyd is not running; ok with the PHC as the selected source, a `#*` PHC row in `chronyc sources`; also ok with no
 `/dev/ptp_ena` at all, a host outside a precision-time placement group on NTP only; FAIL when the
 device exists but is not selected, printing the sources output). With chrony on the PHC, CLOCK_REALTIME
 is UTC from the Time Sync PHC, which does not smear leap seconds (the link-local NTP source does).

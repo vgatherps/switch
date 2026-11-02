@@ -67,7 +67,7 @@ pub(crate) fn temp_path(path: &Path, n: u64) -> PathBuf {
 /// or a kill leaves no partial file. `previous`: renamed over the file (through a symlink, its
 /// target), which keeps its permissions. Otherwise hard-linked as `path`, which refuses a file
 /// that appeared there since it was found absent (as `create_new` did), then the temp name is
-/// removed. A temp file left by a killed run never blocks a later one: each run takes a fresh
+/// removed; failing that, it is left with a warning. A temp file left by a killed run never blocks a later one: each run takes a fresh
 /// name.
 fn write_atomically(path: &Path, bytes: &[u8], previous: bool) -> Result<(), ConfigError> {
     let error = |at: &Path, e: std::io::Error| ConfigError(format!("{}: {e}", at.display()));
@@ -108,8 +108,11 @@ fn write_atomically(path: &Path, bytes: &[u8], previous: bool) -> Result<(), Con
         let _ = fs::remove_file(&temp);
         return Err(error(&path, e));
     }
+    // The config is in place: a temp name left behind is reported, not a failed write.
     if !previous {
-        fs::remove_file(&temp).map_err(|e| error(&temp, e))?;
+        if let Err(e) = fs::remove_file(&temp) {
+            eprintln!("zhida-netconf: warning: {}", error(&temp, e).0);
+        }
     }
     Ok(())
 }
