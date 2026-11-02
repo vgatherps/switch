@@ -27,7 +27,8 @@
 //! ## Waking
 //!
 //! A task's `Waker` points at its task header. Waking, cloning and dropping it do not
-//! allocate, but only on the runtime's thread: each of them panics on another thread.
+//! allocate. Cloning and dropping work on any thread; a wake from another thread
+//! goes through the runtime's mailbox, as a [`RemoteWaker`]'s does.
 //! Runtime primitives that park tasks can keep a [`StoredWaker`] instead: a copyable
 //! handle that wakes its task directly, without a call through the waker vtable.
 //! Another thread wakes a task through a [`RemoteWaker`]: `Send + Sync` and
