@@ -571,6 +571,7 @@ pub struct Socket<'a> {
     pub(crate) rx_refused_segments: u32,
     mss_cap: Option<core::num::NonZeroU16>,
     orphaned: bool,
+    retry_limited: bool,
     /// An acceptable peer RST closed this connection; cleared by reset().
     reset_by_peer: bool,
 }
@@ -625,6 +626,7 @@ impl<'a> Socket<'a> {
             hop_limit: None,
             mss_cap: None,
             orphaned: false,
+            retry_limited: false,
             reset_by_peer: false,
             connection_mss_cap: None,
             initial_window: 1_048_576,
@@ -983,6 +985,7 @@ impl<'a> Socket<'a> {
     fn reset_protocol(&mut self) {
         self.state = State::Closed;
         self.orphaned = false;
+        self.retry_limited = false;
         self.reset_by_peer = false;
         self.connection_mss_cap = self.mss_cap;
         self.timer = Timer::new();
@@ -1184,6 +1187,11 @@ impl<'a> Socket<'a> {
             | State::LastAck
             | State::Closed => (),
         }
+    }
+
+    /// The owner has closed but still queues data; give up after the orphan retry limit.
+    pub fn limit_retries(&mut self) {
+        self.retry_limited = true;
     }
 
     pub(crate) fn orphan(&mut self, now: Instant) {
@@ -2904,7 +2912,7 @@ impl<'a> Socket<'a> {
         // Check if any state needs to be changed because of a timer.
         if self.timer.should_retransmit(cx.now()) {
             if let Timer::Retransmit { .. } = self.timer {
-                if self.orphaned && self.rto_backoff >= ORPHAN_RETRIES {
+                if (self.orphaned || self.retry_limited) && self.rto_backoff >= ORPHAN_RETRIES {
                     self.reset();
                     return Ok(());
                 }
@@ -2964,7 +2972,7 @@ impl<'a> Socket<'a> {
         if let Timer::ZeroWindowProbe { expires_at, backoff_applied } = &mut self.timer
             && cx.now() >= *expires_at && !*backoff_applied
         {
-            if self.orphaned && self.rto_backoff >= ORPHAN_RETRIES {
+            if (self.orphaned || self.retry_limited) && self.rto_backoff >= ORPHAN_RETRIES {
                 self.reset();
                 return Ok(());
             }
@@ -5377,6 +5385,60 @@ mod test {
         assert_eq!(s.state(), State::Closed);
         assert_eq!(s.remote_endpoint(), None);
         recv_nothing(&mut s, expires_at);
+    }
+
+    #[test]
+    fn closed_owned_socket_rto_retry_limit() {
+        let mut s = socket_established();
+        assert_eq!(s.send_slice(b"abc"), Ok(3));
+        s.limit_retries();
+        assert!(!s.orphaned);
+        recv(&mut s, Instant::ZERO, |reply| {
+            assert_eq!(reply.unwrap().payload, b"abc");
+        });
+        for expiry in 1..=ORPHAN_RETRIES {
+            let Timer::Retransmit { expires_at } = s.timer else { panic!("expected RTO") };
+            recv_nothing(&mut s, expires_at - Duration::from_micros(1));
+            recv(&mut s, expires_at, |reply| {
+                let reply = reply.unwrap();
+                assert_eq!(reply.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(reply.payload, b"abc");
+            });
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.state(), State::Established);
+        }
+        let Timer::Retransmit { expires_at } = s.timer else { panic!("expected RTO") };
+        recv_nothing(&mut s, expires_at);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.remote_endpoint(), None);
+        assert!(!s.retry_limited, "reset must clear the retry limit");
+    }
+
+    #[test]
+    fn closed_owned_socket_zero_window_retry_limit() {
+        let mut s = socket_established();
+        send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
+        assert_eq!(s.send_slice(b"abc"), Ok(3));
+        s.limit_retries();
+        assert!(!s.orphaned);
+        recv_nothing(&mut s, Instant::ZERO);
+        for expiry in 1..=ORPHAN_RETRIES {
+            let Timer::ZeroWindowProbe { expires_at, .. } = s.timer else { panic!("expected probe timer") };
+            recv_nothing(&mut s, expires_at - Duration::from_micros(1));
+            recv(&mut s, expires_at, |reply| {
+                let reply = reply.unwrap();
+                assert_eq!(reply.seq_number, LOCAL_SEQ + 1);
+                assert_eq!(reply.payload, b"a");
+            });
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.send_queue(), 3);
+            assert_eq!(s.state(), State::Established);
+        }
+        let Timer::ZeroWindowProbe { expires_at, .. } = s.timer else { panic!("expected probe timer") };
+        recv_nothing(&mut s, expires_at);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.remote_endpoint(), None);
+        assert!(!s.retry_limited, "reset must clear the retry limit");
     }
 
     #[test]
