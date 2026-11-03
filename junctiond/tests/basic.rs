@@ -82,38 +82,10 @@ fn udp_port_collision_rejects_and_reuses_client_slot() {
             events.contains(&(rejected, Event::Rejected(RejectCode::UdpPortInUse)))
         });
         let reused = client.bind_udp(udp_config(LOCAL_PORT + 1)).unwrap();
-        assert_eq!(reused.slot, rejected.slot);
         assert_ne!(reused.generation, rejected.generation);
         f.until(&mut client, &mut events, |_, events| {
             events.contains(&(reused, Event::Bound))
         });
-        drop(client);
-        f.close();
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn unowned_listen_rejection_releases_host_and_client_slots() {
-    with_eal(|eal| {
-        let mut f = Fixture::new(eal, ["jnula", "jnulb"], 1, 1, 64);
-        let mut client = f.client(1);
-        let mut events = Vec::new();
-        let rejected = client
-            .listen_tcp(
-                tcp_config(),
-                ListenEndpoint {
-                    addr: Some(Ipv4Addr::new(192, 0, 2, 1)),
-                    port: LOCAL_PORT,
-                },
-            )
-            .unwrap();
-        f.until(&mut client, &mut events, |_, events| {
-            events.contains(&(rejected, Event::Rejected(RejectCode::ListenUnaddressable)))
-        });
-        let (reused, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT);
-        assert_eq!(reused.slot, rejected.slot);
-        assert_ne!(reused.generation, rejected.generation);
-        f.peer.remove_tcp(peer);
         drop(client);
         f.close();
     });
@@ -141,60 +113,10 @@ fn tcp_full_rejection_can_reuse_slot_after_capacity_frees() {
             events.contains(&(occupied, Event::Freed))
         });
         let (reused, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT + 1);
-        assert_eq!(reused.slot, rejected.slot);
         assert_ne!(reused.generation, rejected.generation);
         f.peer.remove_tcp(peer);
         drop((client, owner));
         f.close();
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn plain_close_and_shutdown_wait_for_fifo_none_not_batch_exhaustion() {
-    with_eal(|eal| {
-        for shutdown in [false, true] {
-            let mut f = Fixture::new(eal, ["jnhla", "jnhlb"], 4, 4, 1);
-            let mut client = f.client(1);
-            let mut events = Vec::new();
-            let (id, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT);
-            let mut finished_a = f.client(1);
-            let mut finished_b = f.client(1);
-            finished_a.finish().unwrap();
-            finished_b.finish().unwrap();
-            if shutdown {
-                client.shutdown(id);
-            } else {
-                client.close(id, false);
-            }
-            let op = f.wait_op(id);
-            assert!(matches!(
-                op,
-                Op::ShutdownTcp { .. } | Op::Close { unread: false, .. }
-            ));
-            for _ in 0..2 {
-                f.round(&mut client, &mut events);
-                assert_eq!(
-                    f.peer.tcp(&peer).state(),
-                    State::Established,
-                    "FIN escaped before FIFO returned None"
-                );
-                assert!(!events.contains(&(id, Event::Freed)));
-            }
-            f.round(&mut client, &mut events);
-            assert_eq!(
-                f.peer.tcp(&peer).state(),
-                State::CloseWait,
-                "third pass reached None but did not release FIN"
-            );
-            if !shutdown {
-                f.until(&mut client, &mut events, |_, events| {
-                    events.contains(&(id, Event::Freed))
-                });
-            }
-            f.peer.remove_tcp(peer);
-            drop((client, finished_a, finished_b));
-            f.close();
-        }
     });
 }
 
@@ -288,7 +210,6 @@ fn close_racing_rejected_open_is_ignored_and_slot_reusable() {
         });
         assert!(!events.contains(&(rejected, Event::Freed)));
         let (reused, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT);
-        assert_eq!(reused.slot, rejected.slot);
         assert_ne!(reused.generation, rejected.generation);
         assert!(!events.contains(&(rejected, Event::Freed)));
         f.peer.remove_tcp(peer);

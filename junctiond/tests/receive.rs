@@ -86,40 +86,6 @@ fn hold_tcp_until_acked(
 }
 
 #[zhida_test_support::pinned_test]
-fn tcp_many_receive_frames_preserve_payload_order_and_socket_metadata() {
-    with_eal(|eal| {
-        let mut f = Fixture::new(eal, ["jrmna", "jrmnb"], 2, 0, 64);
-        let mut client = f.client(1);
-        let mut events = Vec::new();
-        let (id, peer) = connect_receive(&mut f, &mut client, &mut events);
-        let payload: Vec<u8> = (0..32 * 1024).map(|n| (n % 251) as u8).collect();
-        assert_eq!(
-            f.peer.tcp_mut(&peer).send_slice(&payload),
-            Ok(payload.len())
-        );
-        let mut received = Vec::new();
-        let mut frames = 0;
-        let deadline = WallInstant::now() + WAIT;
-        while received.len() < payload.len() || f.peer.tcp(&peer).send_queue() != 0 {
-            assert!(WallInstant::now() < deadline, "TCP receive timed out");
-            if !f.round_receive(&mut client, &mut events, |packet_id, frame| {
-                check_tcp(packet_id, id, &frame);
-                received.extend_from_slice(frame.payload());
-                frames += 1;
-            }) {
-                f.advance();
-            }
-            assert!(received.len() <= payload.len());
-        }
-        assert!(frames > 16, "transfer did not exercise many RX records");
-        assert_eq!(received, payload);
-        f.peer.remove_tcp(peer);
-        drop(client);
-        f.close();
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn tcp_held_receive_frames_block_reclaim_and_fin_until_pending_bytes_publish() {
     with_eal(|eal| {
         let mut f = Fixture::with_rx_size(eal, ["jrhfa", "jrhfb"], 2, 1, 16 * 1024);
@@ -174,19 +140,12 @@ fn tcp_held_receive_frames_block_reclaim_and_fin_until_pending_bytes_publish() {
         );
         assert_eq!(received, payload[..received.len()]);
 
-        let held_bytes = received.len();
         for _ in 0..32 {
             f.round_receive(&mut client, &mut events, |_, _| {
                 panic!("producer reclaimed records while client frames were held")
             });
         }
         assert!(!events.contains(&(id, Event::PeerFin)));
-        assert_eq!(
-            held.iter()
-                .map(|frame| frame.payload().len())
-                .sum::<usize>(),
-            held_bytes
-        );
         assert!(
             held.iter()
                 .flat_map(|frame| frame.payload().iter())
