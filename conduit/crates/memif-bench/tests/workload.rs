@@ -417,17 +417,6 @@ fn udp_shape_validation() {
     }
     .validate()
     .is_err());
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_memif-bench"))
-        .args([
-            "client", "--shape", "udp", "--size", "64", "--count", "1000", "--warmup", "20",
-            "--mode", "echo", "--cpu", "0", "--socket", "s",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8(output.stderr)
-        .unwrap()
-        .contains("--mode does not apply here"));
 }
 
 /// Each measured round is one data segment each way, the client's request

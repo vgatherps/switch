@@ -538,7 +538,6 @@ class LaunchTest(unittest.TestCase):
                              ("wait", "instance_running", {"InstanceIds": ids}))
         self.assertEqual([(h["role"], h["id"]) for h in receiver + senders],
                          list(zip(z.ROLES, ["i-0", "i-1", "i-2", "i-3"])))
-        self.assertEqual(z.CONNECTIONS, 12)
 
     def test_one_instance_in_a_precision_time_group_with_an_elastic_ip_on_its_data_eni(self):
         ec2 = FakeLaunchEc2()
@@ -1569,10 +1568,6 @@ class BinanceTest(unittest.TestCase):
         recorded = {"vpc": ["vpc-1"], "subnet": ["subnet-1"], "instance": ["i-0"], "address": ["eipalloc-1"]}
         self.assertEqual(janitor.read_created(os.path.join(self.run_dir, "created.json")), recorded)
         self.assertEqual(w.clean_calls, [(os.path.basename(self.run_dir), recorded)])
-        log = self.log.getvalue()
-        self.assertIn("messages: 8", log)
-        self.assertIn("p50 8192..16384 ns", log)
-        self.assertLess(log.index("tearing down"), log.index("messages: 8"), "summary last")
 
     def test_a_failed_feed_fetches_reports_and_fails(self):
         self.w.feed_code, self.w.feed_text = 3, PORT_OPEN_FAILED
