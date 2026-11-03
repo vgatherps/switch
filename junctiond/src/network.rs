@@ -7,7 +7,8 @@
 //! makes later session loss graceful unless the session has a protocol error. Explicit
 //! aborts always reset sockets, even after a FIFO end. SEND records borrow their FIFO
 //! message through dispatch; an unknown session first drains control through its queued
-//! Open. TCP backlogs delay shutdown and close, and outlive graceful session retirement.
+//! Open. Sends from older socket generations are dropped; unopened or future generations
+//! are protocol errors. TCP backlogs delay shutdown and close, and outlive graceful retirement.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -236,8 +237,14 @@ impl NetworkState {
             self.protocol_error(session);
             return;
         };
-        if entry_slot.generation != Some(id.generation) {
+        let Some(current) = entry_slot.generation else {
             self.protocol_error(session);
+            return;
+        };
+        if current != id.generation {
+            if (current.wrapping_sub(id.generation) as i32) <= 0 {
+                self.protocol_error(session);
+            }
             return;
         }
         let Some(index) = entry_slot.host else {
@@ -270,6 +277,15 @@ impl NetworkState {
         while position < self.backlogged.len() {
             let index = self.backlogged[position];
             let socket = self.sockets[index as usize].as_mut().unwrap();
+            if let Some(session) = socket.session
+                && self.sessions[slot(session) as usize]
+                    .as_ref()
+                    .unwrap()
+                    .errored
+            {
+                position += 1;
+                continue;
+            }
             socket.drain_backlog(&mut self.stack);
             if !socket.backlog.is_empty() {
                 position += 1;
@@ -415,7 +431,9 @@ impl NetworkState {
 
     fn remove_socket(&mut self, index: u32, abort: bool) {
         let socket = self.sockets[index as usize].take().unwrap();
-        self.backlogged.retain(|pending| *pending != index);
+        if !socket.backlog.is_empty() {
+            self.backlogged.retain(|pending| *pending != index);
+        }
         if abort {
             socket.socket.abort(&mut self.stack);
         }
@@ -461,10 +479,6 @@ impl NetworkState {
                 let socket = self.sockets[index as usize].as_mut().unwrap();
                 if graceful && !socket.backlog.is_empty() {
                     socket.session = None;
-                    socket.deferred = Some(Op::Close {
-                        id: socket.id,
-                        unread: false,
-                    });
                 } else {
                     self.remove_socket(index, !graceful);
                 }

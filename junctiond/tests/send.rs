@@ -185,6 +185,111 @@ fn tcp_send_in_flight_after_abort_drops_without_ending_session() {
 }
 
 #[zhida_test_support::pinned_test]
+fn stale_send_after_abort_and_slot_reuse_does_not_end_session() {
+    with_eal(|eal| {
+        let mut f = Fixture::new(eal, ["jsgna", "jsgnb"], 2, 0, 1);
+        let mut client = f.client(1);
+        let mut events = Vec::new();
+        let (id, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT);
+        let mut record = [0; TCP_SEND_HEADER + 3];
+        record[TCP_SEND_HEADER..].copy_from_slice(b"old");
+        client.send_tcp(id, &mut record).unwrap();
+        client.send_tcp(id, &mut record).unwrap();
+        client.abort(id);
+        assert_eq!(f.wait_op(id), Op::AbortTcp { id });
+        // Apply abort and consume only the first SEND. Wait for Freed without
+        // another network iteration, leaving the second SEND behind the new open.
+        f.round(&mut client, &mut events);
+        let deadline = WallInstant::now() + WAIT;
+        while !events.contains(&(id, Event::Freed)) {
+            assert!(WallInstant::now() < deadline, "Freed did not arrive");
+            client
+                .poll_events(|id, event| events.push((id, event)))
+                .unwrap();
+            std::thread::yield_now();
+        }
+        let next_peer = f.peer.add_tcp(peer_tcp_config()).unwrap();
+        f.peer.listen(&next_peer, PEER_PORT + 1).unwrap();
+        let next = client
+            .connect_tcp(
+                tcp_config(),
+                peer_endpoint(PEER_PORT + 1),
+                local(LOCAL_PORT + 1),
+            )
+            .unwrap();
+        assert_eq!(next.slot, id.slot);
+        assert_eq!(next.generation, id.generation.wrapping_add(1));
+        assert!(matches!(f.wait_op(next), Op::ConnectTcp { .. }));
+        f.until(&mut client, &mut events, |f, events| {
+            events.contains(&(next, Event::Connected))
+                && f.peer.tcp(&next_peer).state() == State::Established
+        });
+        record[TCP_SEND_HEADER..].copy_from_slice(b"new");
+        client.send_tcp(next, &mut record).unwrap();
+        f.until(&mut client, &mut events, |f, _| {
+            f.peer.tcp(&next_peer).can_recv()
+        });
+        let frame = f.peer.tcp_mut(&next_peer).recv().unwrap().unwrap();
+        assert_eq!(frame.payload(), b"new");
+        drop(frame);
+        assert!(f.protocol_errors.is_empty());
+        f.peer.remove_tcp(peer);
+        f.peer.remove_tcp(next_peer);
+        drop(client);
+        f.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn abort_discards_backlog_resets_peer_and_reuses_host_index() {
+    with_eal(|eal| {
+        let mut f = Fixture::new(eal, ["jsbga", "jsbgb"], 2, 0, 256);
+        let mut client = f.client(1);
+        let mut events = Vec::new();
+        let (id, peer, payload) = queued_send(&mut f, &mut client, &mut events);
+        // Fill smoltcp's one-byte TX queue and create the host backlog.
+        f.round(&mut client, &mut events);
+        client.abort(id);
+        assert_eq!(f.wait_op(id), Op::AbortTcp { id });
+        let mut received = Vec::new();
+        f.until(&mut client, &mut events, |f, events| {
+            while f.peer.tcp(&peer).can_recv() {
+                let frame = f.peer.tcp_mut(&peer).recv().unwrap().unwrap();
+                received.extend_from_slice(frame.payload());
+            }
+            f.peer.tcp(&peer).reset_by_peer() && events.contains(&(id, Event::Freed))
+        });
+        assert!(received.len() < payload.len());
+        assert_eq!(received, payload[..received.len()]);
+        assert_eq!(f.peer.tcp(&peer).state(), State::Closed);
+        for _ in 0..4 {
+            f.round(&mut client, &mut events);
+            assert_eq!(
+                f.peer.tcp(&peer).recv_queue(),
+                0,
+                "bytes arrived after reset"
+            );
+        }
+        f.peer.remove_tcp(peer);
+        let (next, next_peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT + 1);
+        assert_eq!(next.slot, id.slot);
+        let mut record = [0; TCP_SEND_HEADER + 5];
+        record[TCP_SEND_HEADER..].copy_from_slice(b"alive");
+        client.send_tcp(next, &mut record).unwrap();
+        f.until(&mut client, &mut events, |f, _| {
+            f.peer.tcp(&next_peer).can_recv()
+        });
+        let frame = f.peer.tcp_mut(&next_peer).recv().unwrap().unwrap();
+        assert_eq!(frame.payload(), b"alive");
+        drop(frame);
+        assert!(f.protocol_errors.is_empty());
+        f.peer.remove_tcp(next_peer);
+        drop(client);
+        f.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn finish_acknowledges_before_backlog_drains_then_fin() {
     with_eal(|eal| {
         let mut f = Fixture::new(eal, ["jsfna", "jsfnb"], 2, 0, 256);
