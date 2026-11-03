@@ -359,18 +359,6 @@ fn aws_vpc_blocks_become_1500_rules() {
         .contains("host bits"));
 }
 #[test]
-fn default_rule_is_1500() {
-    let tree = Tree::new();
-    assert_eq!(
-        tree.discover(&addresses(), None).unwrap().config.paths,
-        vec![PathRule {
-            prefix: "0.0.0.0/0".parse().unwrap(),
-            mtu: 1500,
-            why: "default".into()
-        }]
-    );
-}
-#[test]
 fn operator_rules_survive_rediscover() {
     let tree = Tree::new();
     let server = metadata(

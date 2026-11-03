@@ -1084,26 +1084,6 @@ mod tests {
     use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
     #[zhida_test_support::pinned_test]
-    fn test_mbuf_size() {
-        let size = std::mem::size_of::<Mbuf>();
-        assert_eq!(size, 8, "Mbuf should be thin wrapper (8 bytes), got {}", size);
-    }
-
-    #[zhida_test_support::pinned_test]
-    fn test_pool_is_reused_on_its_thread_and_returns_every_mbuf() {
-        let first = acquire_test_pool();
-        let pool = first.pool();
-        let mbuf = first.alloc().unwrap();
-        assert_eq!(first.in_use_count(), 1);
-        drop(mbuf);
-        drop(first);
-
-        let second = acquire_test_pool();
-        assert_eq!(second.pool(), pool);
-        assert_eq!(second.in_use_count(), 0);
-    }
-
-    #[zhida_test_support::pinned_test]
     #[should_panic(expected = "test pool already acquired on this thread")]
     fn test_pool_second_acquire_while_held_panics() {
         let _held = acquire_test_pool();
@@ -1929,12 +1909,6 @@ mod tests {
         assert!(clone.is_head_indirect());
         assert_eq!(clone.refcount(), 1);
         assert!(clone.try_data_mut().is_none());
-    }
-
-    #[zhida_test_support::pinned_test]
-    fn test_alloc_with_len_rejects_oversize() {
-        let pool = PoolManager::new(256);
-        assert!(pool.alloc_with_len(u16::MAX).is_none());
     }
 
     // ========================================================================

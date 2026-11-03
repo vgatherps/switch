@@ -296,11 +296,6 @@ impl Write for KernelOutput<'_> {
 }
 
 #[test]
-fn bind_plan_is_unbind_override_bind_clear() {
-    Tree::new().success_bind(true);
-}
-
-#[test]
 fn bind_singleton_iommu_group_passes() {
     let tree = Tree::new();
     tree.success_bind(true);

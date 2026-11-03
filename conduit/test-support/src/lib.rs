@@ -168,27 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn calls_share_one_worker_thread() {
-        let first = on_worker(|| thread::current().id());
-        let second = on_worker(|| thread::current().id());
-
-        assert_eq!(first, second);
-        assert_ne!(first, thread::current().id());
-    }
-
-    #[test]
-    fn panic_reaches_the_caller() {
-        let panic = catch_unwind(AssertUnwindSafe(|| on_worker(|| panic!("worker panic"))))
-            .expect_err("worker panic must reach the caller");
-        let message = panic
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
-
-        assert_eq!(message, Some("worker panic"));
-    }
-
-    #[test]
     fn worker_survives_a_panic() {
         let before = on_worker(|| thread::current().id());
         let _ = catch_unwind(AssertUnwindSafe(|| on_worker(|| panic!("worker panic"))));

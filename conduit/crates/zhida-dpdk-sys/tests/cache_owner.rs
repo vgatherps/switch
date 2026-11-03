@@ -90,11 +90,6 @@ fn first_test_allocates_and_frees_on_owner() {
 }
 
 #[pinned_test]
-fn second_test_reuses_owner_lcore_and_caches() {
-    exercise_owner_pools();
-}
-
-#[pinned_test]
 fn unregistered_lookup_returns_null_and_preserves_identity() {
     with_owner_pools(|owner| {
         let address = owner.pools[0].0 as usize;

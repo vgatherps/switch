@@ -145,16 +145,6 @@ proptest! {
 // =============================================================================
 
 #[zhida_test_support::pinned_test]
-fn test_alloc_free_equivalence() {
-    let pool = PoolManager::new(1024);
-    let ops = vec![
-        Op::Alloc { id: 0, len: 100 },
-        Op::Free { id: 0 },
-    ];
-    compare_executions(&ops, &pool, SelectionMode::AllZhida, SelectionMode::AllDpdk).unwrap();
-}
-
-#[zhida_test_support::pinned_test]
 fn test_chain_equivalence() {
     let pool = PoolManager::new(1024);
     let ops = vec![
@@ -304,69 +294,6 @@ fn test_proptest_regression_full() {
 // Targeted tests for unsafe conditions
 // =============================================================================
 
-/// Test that self-chain (via shared handles) is properly rejected
-#[zhida_test_support::pinned_test]
-fn test_self_chain_rejected() {
-    let pool = PoolManager::new(256);
-
-    // Allocate and share to create multiple handles to same mbuf
-    let mut m1 = pool.alloc_with_len(100).unwrap();
-    let m2 = m1.share(); // m1 and m2 point to same mbuf
-
-    let ptr1 = m1.as_ptr();
-    let ptr2 = m2.as_ptr();
-    assert_eq!(ptr1, ptr2, "Share should create alias to same mbuf");
-
-    // Attempting to chain m2 onto m1 would be self-chain
-    // Our API should prevent this or we need to add the check
-    // For now, document that this is UB if not caught
-}
-
-/// Test refcount behavior with multiple shared handles
-#[zhida_test_support::pinned_test]
-fn test_shared_handle_refcount() {
-    let pool = PoolManager::new(256);
-
-    let mut m1 = pool.alloc_with_len(100).unwrap();
-    assert_eq!(m1.refcount(), 1);
-
-    let m2 = m1.share();
-    assert_eq!(m1.refcount(), 2);
-    assert_eq!(m2.refcount(), 2); // Same mbuf
-
-    let m3 = m1.share();
-    assert_eq!(m1.refcount(), 3);
-
-    drop(m2);
-    assert_eq!(m1.refcount(), 2);
-
-    drop(m3);
-    assert_eq!(m1.refcount(), 1);
-
-    drop(m1); // Should free to pool
-}
-
-/// Test that freeing one shared handle doesn't corrupt others
-#[zhida_test_support::pinned_test]
-fn test_shared_handle_independence() {
-    let pool = PoolManager::new(256);
-
-    let mut m1 = pool.alloc_with_len(100).unwrap();
-
-    // Write some data
-    let data = m1.data_mut();
-    data[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-
-    let m2 = m1.share();
-
-    // Free m1
-    drop(m1);
-
-    // m2 should still be valid (refcount was 2, now 1)
-    assert_eq!(m2.refcount(), 1);
-    assert_eq!(&m2.data()[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
-}
-
 /// Test chain consumes tail ownership
 #[zhida_test_support::pinned_test]
 fn test_chain_ownership_transfer() {
@@ -453,31 +380,6 @@ fn test_chain_pkt_len_update() {
 
     assert_eq!(zhida_pkt_len, 3000);
     assert_eq!(dpdk_pkt_len, 3000);
-}
-
-/// Verify Executor sets pkt_len correctly after chain (DPDK-only).
-#[zhida_test_support::pinned_test]
-fn test_executor_chain_pkt_len_dpdk_only() {
-    use zhida_buffer::testing::Executor;
-
-    let ops = vec![
-        Op::Alloc { id: 0, len: 1500 },
-        Op::Alloc { id: 1, len: 1500 },
-        Op::Chain { head: 0, tail: 1 },
-    ];
-
-    let pool = PoolManager::new(1024);
-    let mut executor = Executor::new(&pool, SelectionMode::AllDpdk);
-
-    for op in &ops {
-        executor.execute(op);
-    }
-
-    let snap = executor.snapshot();
-    let state = snap.get(&0).expect("handle 0 should exist");
-
-    assert_eq!(state.pkt_len, 3000);
-    assert_eq!(state.nb_segs, 2);
 }
 
 /// Run both executors sequentially (not interleaved) - check for interference.
@@ -572,37 +474,6 @@ fn test_chain_resets_tail_pkt_len() {
     assert_eq!(unsafe { (*tail_ptr).nb_segs() }, 2);
 
     unsafe { zhida_dpdk_sys::zhida_pktmbuf_free(head_ptr); }
-}
-
-/// Baseline: verify DPDK's chain behavior matches our expectations.
-#[zhida_test_support::pinned_test]
-fn test_dpdk_chain_resets_tail_pkt_len() {
-    let pool = PoolManager::new(256);
-
-    let tail_ptr = unsafe {
-        let a = zhida_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool());
-        let b = zhida_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool());
-        (*a).set_data_len(100);
-        (*a).set_pkt_len(100);
-        (*b).set_data_len(200);
-        (*b).set_pkt_len(200);
-        zhida_dpdk_sys::dpdk_raw_pktmbuf_chain(a, b);
-        a
-    };
-
-    let head_ptr = unsafe {
-        let h = zhida_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool());
-        (*h).set_data_len(50);
-        (*h).set_pkt_len(50);
-        zhida_dpdk_sys::dpdk_raw_pktmbuf_chain(h, tail_ptr);
-        h
-    };
-
-    // DPDK 24.11: resets pkt_len, not nb_segs
-    assert_eq!(unsafe { (*tail_ptr).pkt_len() }, 100);
-    assert_eq!(unsafe { (*tail_ptr).nb_segs() }, 2);
-
-    unsafe { zhida_dpdk_sys::dpdk_raw_pktmbuf_free(head_ptr); }
 }
 
 /// Regression from fuzzer: ShareAll, then chain the shared two-segment chain

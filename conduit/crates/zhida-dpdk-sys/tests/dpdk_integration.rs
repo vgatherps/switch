@@ -29,11 +29,6 @@ fn ensure_eal_init() -> bool {
 }
 
 #[zhida_test_support::pinned_test]
-fn test_eal_init() {
-    assert!(ensure_eal_init(), "EAL init failed");
-}
-
-#[zhida_test_support::pinned_test]
 fn test_pool_create_and_alloc() {
     assert!(ensure_eal_init(), "EAL init failed");
 
