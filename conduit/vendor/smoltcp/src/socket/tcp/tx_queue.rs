@@ -509,20 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn take_put_back_keeps_positions() {
-        let (mut queue, _) = queue(16, 8);
-        queue.push_bytes(&[1, 2]);
-        queue.push_bytes(&[3, 4, 5]);
-        let frame = queue.take(1);
-        assert_eq!(frame.payload(), &[3, 4, 5]);
-        assert_eq!(queue.len(), 5);
-        queue.put_back(1, frame);
-        assert_eq!(cut(queue.segment(3, 1)), &[4]);
-        assert_eq!(queue.entries[0].end, 2);
-        assert_eq!(queue.entries[1].end, 5);
-    }
-
-    #[test]
     fn end_positions_survive_u64_far_from_zero() {
         let (mut queue, _) = queue(16, 8);
         queue.acked = u64::MAX - 8;

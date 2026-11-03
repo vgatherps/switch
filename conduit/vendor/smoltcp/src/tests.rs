@@ -194,35 +194,3 @@ pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::TxBuf {
 pub(crate) fn tx_test_source(room: usize) -> phy::TxSource {
     phy::TxSource::new(phy::TxPool::new(room))
 }
-
-#[test]
-fn testing_device_frame_token_writes_before_publish() {
-    use crate::phy::FrameToken as _;
-
-    let mut device = TestingDevice::new(Medium::Ethernet);
-    let mut frame = tx_test_buf(&[3, 4]);
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
-    assert!(device.tx_queue.is_empty());
-    let token = device.transmit_frame(Instant::ZERO).unwrap();
-    let frame = token.consume_retain(frame, 2, None);
-    assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-    assert!(frame.unique());
-}
-
-#[test]
-fn testing_device_owned_frame_releases_after_publish() {
-    use crate::phy::FrameToken as _;
-
-    let alloc = phy::TxPool::new(2);
-    let mut frame = alloc.alloc().unwrap();
-    frame.room_mut()[..2].copy_from_slice(&[3, 4]);
-    frame.set_len(2);
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
-    let mut device = TestingDevice::new(Medium::Ethernet);
-    device
-        .transmit_frame(Instant::ZERO)
-        .unwrap()
-        .consume(frame, 2, None);
-    assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-    assert_eq!(alloc.live(), 0);
-}

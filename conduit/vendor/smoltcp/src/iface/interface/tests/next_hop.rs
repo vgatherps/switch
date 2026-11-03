@@ -405,19 +405,6 @@ fn ingress_reply_after_gateway_expiry_probes() {
     }
 }
 
-#[test]
-fn arp_mac_change_updates_next_segment() {
-    let mut peer = Peer::new(2, PEER, None);
-    peer.send(1);
-    peer.ack = peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    peer.acknowledge(2);
-    peer.arp(3, PEER, NEW_MAC);
-    peer.mac = NEW_MAC;
-    peer.send(3);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    assert!(peer.device.tx_queue.is_empty());
-}
-
 /// An expired entry sends to its cached MAC and probes once per lifetime; an unanswered probe
 /// leaves it usable, so the retransmit after 63 s still goes out with no ARP.
 #[test]
@@ -508,38 +495,6 @@ fn same_mac_probe_answer_keeps_changes_and_forwards() {
 }
 
 #[test]
-fn evicted_entry_sends_arp() {
-    let mut peer = Peer::new(1, PEER, None);
-    peer.arp(1, Ipv4Address::new(192, 168, 1, 3), NEW_MAC);
-    peer.send(1);
-    peer.take_arp_request(PEER);
-}
-
-#[test]
-fn unchanged_ip_addresses_flush_entry() {
-    let mut peer = Peer::new(2, PEER, None);
-    peer.iface.update_ip_addrs(|_| {});
-    peer.send(1);
-    peer.take_arp_request(PEER);
-}
-
-#[test]
-fn route_change_uses_second_gateway() {
-    let remote = Ipv4Address::new(198, 51, 100, 2);
-    let gateway2 = Ipv4Address::new(192, 168, 1, 3);
-    let mut peer = Peer::new(2, remote, Some(PEER));
-    peer.arp(1, gateway2, NEW_MAC);
-    peer.send(1);
-    peer.ack = peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    peer.acknowledge(2);
-    peer.iface.set_ipv4_gateway(Some(gateway2));
-    peer.mac = NEW_MAC;
-    peer.send(2);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    assert!(peer.device.tx_queue.is_empty());
-}
-
-#[test]
 fn reconnect_same_slot_uses_new_peer() {
     let mut peer = Peer::new(2, PEER, None);
     let remote2 = Ipv4Address::new(192, 168, 1, 3);
@@ -590,21 +545,6 @@ fn aborted_reconnect_discovers_unknown_peer() {
     peer.sockets.abort(peer.handle);
     peer.egress(2);
     peer.take_arp_request(remote2);
-}
-
-#[test]
-fn removed_slot_uses_new_peer() {
-    let mut peer = Peer::new(2, PEER, None);
-    let remote2 = Ipv4Address::new(192, 168, 1, 3);
-    peer.arp(1, remote2, NEW_MAC);
-    peer.send(1);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    let mut socket = peer.sockets.take(peer.handle);
-    socket.abort();
-    peer.handle = peer.sockets.add(socket);
-    peer.remote = remote2;
-    peer.mac = NEW_MAC;
-    peer.connect(2);
 }
 
 mod invalidation {

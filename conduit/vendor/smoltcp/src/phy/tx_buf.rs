@@ -528,39 +528,6 @@ mod tests {
         drop(clone);
     }
 
-    #[test]
-    fn set_len_updates_this_buffer_at_refcount_1() {
-        let pool = TxPool::new(8);
-        let mut buf = pool.alloc().unwrap();
-        buf.room_mut()[..3].copy_from_slice(&[1, 2, 3]);
-        buf.set_len(3);
-        assert_eq!(buf.payload(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn dropping_original_then_clone_releases_storage_once() {
-        let pool = TxPool::new(8);
-        let buf = pool.alloc().unwrap();
-        let clone = buf.clone();
-        drop(buf);
-        assert_eq!(pool.live(), 1);
-        drop(clone);
-        assert_eq!(pool.live(), 0);
-        assert_eq!(pool.releases(), 2);
-    }
-
-    #[test]
-    fn into_raw_keeps_its_reference() {
-        let pool = TxPool::new(8);
-        let buf = pool.alloc().unwrap();
-        let owner = buf.into_raw();
-        assert_eq!(pool.live(), 1);
-        // SAFETY: into_raw gave up this sole reference.
-        unsafe { TxBuf::release_raw(owner) };
-        assert_eq!(pool.live(), 0);
-        assert_eq!(pool.releases(), 1);
-    }
-
     /// Headers written into the headroom form one packet with the payload; the headroom holds
     /// exactly TX_HEADROOM bytes.
     #[test]

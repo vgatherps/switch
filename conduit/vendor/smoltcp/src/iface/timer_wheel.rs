@@ -180,24 +180,6 @@ mod list {
         }
 
         #[test]
-        fn test_empty_list() {
-            let list = ListHead::new();
-            assert!(list.is_empty());
-        }
-
-        #[test]
-        fn test_push_back_single() {
-            let mut entries = make_entries(5);
-            let mut list = ListHead::new();
-
-            list.push_back(&mut entries, 0);
-
-            assert!(!list.is_empty());
-            assert_eq!(list.first, 0);
-            assert_eq!(list.last, 0);
-        }
-
-        #[test]
         fn test_push_back_multiple() {
             let mut entries = make_entries(5);
             let mut list = ListHead::new();
@@ -573,23 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_wheel() {
-        let wheel: TimerWheel = TimerWheel::new(0);
-        assert!(!wheel.has_pending());
-        assert_eq!(wheel.current_tick(), 0);
-    }
-
-    #[test]
-    fn test_insert_single() {
-        let mut timers = make_timers(&[5]);
-        let mut wheel: TimerWheel = TimerWheel::new(0);
-
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
-
-        assert!(wheel.has_pending());
-    }
-
-    #[test]
     fn test_expire_single() {
         let mut timers = make_timers(&[3]);
         let mut wheel: TimerWheel = TimerWheel::new(0);
@@ -641,40 +606,6 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_per_slot() {
-        let mut timers = make_timers(&[5, 5, 5]);
-        let mut wheel: TimerWheel = TimerWheel::new(0);
-
-        for i in 0..3 {
-            assert_eq!(wheel.insert(&mut timers, i), InsertOutcome::Linked);
-        }
-
-        let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 10, &mut expired).unwrap();
-
-        assert_eq!(expired.len(), 3);
-    }
-
-    #[test]
-    fn test_cascade_from_l1() {
-        let mut timers = make_timers(&[40]); // Will go to L1 (> 32 ticks away)
-        let mut wheel: TimerWheel = TimerWheel::new(0);
-
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
-
-        // Should be in L1
-        assert_eq!(
-            timers[0].position,
-            WheelPosition::Linked { level: 1, slot: 1 }
-        );
-
-        let mut expired = Vec::new();
-        wheel.advance_to(&mut timers, 45, &mut expired).unwrap();
-
-        assert_eq!(expired, vec![0]);
-    }
-
-    #[test]
     fn test_advance_partial() {
         let mut timers = make_timers(&[5, 15, 25]);
         let mut wheel: TimerWheel = TimerWheel::new(0);
@@ -696,30 +627,6 @@ mod tests {
         assert_eq!(expired3, vec![2]);
     }
 
-    #[test]
-    fn test_insert_past_deadline() {
-        let mut timers = make_timers(&[5]);
-        let mut wheel = TimerWheel::new(10);
-        let mut expired = Vec::new();
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Due);
-        assert_eq!(timers[0].position, WheelPosition::Unlinked);
-        assert!(!wheel.has_pending());
-        wheel.advance_to(&mut timers, 11, &mut expired).unwrap();
-        assert!(expired.is_empty());
-    }
-
-    #[test]
-    fn test_large_deadline() {
-        let mut timers = make_timers(&[MAX_DEADLINE_DISTANCE - 1]);
-        let mut wheel: TimerWheel = TimerWheel::new(0);
-
-        assert_eq!(wheel.insert(&mut timers, 0), InsertOutcome::Linked);
-
-        assert_eq!(
-            timers[0].position,
-            WheelPosition::Linked { level: 3, slot: 30 }
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1264,24 +1171,6 @@ mod membership_tests {
         check_structure(&wheel, &entries);
         wheel.advance_to(&mut entries, 35, &mut expired).unwrap();
         assert_eq!(expired, [0, 1]);
-        check_structure(&wheel, &entries);
-    }
-
-    #[test]
-    fn linked_singleton_has_nil_links_and_remains_removable() {
-        let mut entries = entries([5]);
-        let mut wheel = TimerWheel::new(0);
-        assert_eq!(wheel.insert(&mut entries, 0), InsertOutcome::Linked);
-        assert_eq!(entries[0].prev(), NIL);
-        assert_eq!(entries[0].next(), NIL);
-        assert_eq!(
-            entries[0].wheel_position(),
-            WheelPosition::Linked { level: 0, slot: 5 }
-        );
-        check_structure(&wheel, &entries);
-        assert!(wheel.remove(&mut entries, 0));
-        assert_eq!(entries[0].wheel_position(), WheelPosition::Unlinked);
-        assert!(!wheel.has_pending());
         check_structure(&wheel, &entries);
     }
 

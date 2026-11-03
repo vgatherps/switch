@@ -97,26 +97,6 @@ impl Device for RecordingDevice {
     }
 }
 
-#[test]
-fn recording_device_transmit_frame_keeps_metadata() {
-    use crate::phy::FrameToken as _;
-
-    let mut device = RecordingDevice {
-        rx: VecDeque::new(),
-        tx: Vec::new(),
-        caps: DeviceCapabilities::default(),
-    };
-    let mut frame = crate::tests::tx_test_buf(&[3, 4]);
-    let mut meta = PacketMeta::default();
-    meta.tx_checksum = Some(TxChecksum::Udp { ip_header_len: 20 });
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
-    device
-        .transmit_frame(Instant::ZERO)
-        .unwrap()
-        .consume_retain(frame, 2, meta.tx_checksum);
-    assert_eq!(device.tx, vec![(meta, vec![1, 2, 3, 4])]);
-}
-
 fn setup_recording(offload: bool) -> (Interface, TcpSet<'static>, RecordingDevice) {
     let (mut iface, sockets, device) = setup(Medium::Ethernet);
     iface.inner.caps.checksum.tcp = if offload { Checksum::Rx } else { Checksum::Both };

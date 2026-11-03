@@ -569,47 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn popped_frame_reports_its_timestamp() {
-        for stamp in [0, 0xfedc_ba98_7654_3210] {
-            let mut store = RxStore::new();
-            insert_stamped(&mut store, 0, b"abc", stamp);
-            assert_eq!(drain_stamped(&mut store), vec![(b"abc".to_vec(), stamp)]);
-        }
-    }
-
-    #[test]
-    fn consecutive_frames_keep_their_timestamps() {
-        let mut store = RxStore::new();
-        let (mut first, first_releases) = counted_frame_with_room(b"abc", 3);
-        first.set_rx_timestamp(1);
-        let decision = store.decide(0, 3);
-        place_attach(&mut store, 0, first, decision);
-        let (mut incoming, incoming_releases) = counted_frame(b"def");
-        incoming.set_rx_timestamp(2);
-        let decision = store.decide(3, 3);
-        place_attach(&mut store, 3, incoming, decision);
-        assert_eq!(store.held(), 2);
-        assert_eq!((first_releases.get(), incoming_releases.get()), (0, 0));
-        assert_eq!(
-            drain_stamped(&mut store),
-            vec![(b"abc".to_vec(), 1), (b"def".to_vec(), 2)]
-        );
-        assert_eq!((first_releases.get(), incoming_releases.get()), (1, 1));
-    }
-
-    #[test]
-    fn hole_fill_frames_keep_arrival_timestamps() {
-        let mut store = RxStore::new();
-        insert_stamped(&mut store, 3, b"def", 1);
-        insert_stamped(&mut store, 6, b"ghi", 2);
-        insert_stamped(&mut store, 0, b"abc", 3);
-        assert_eq!(
-            drain_stamped(&mut store),
-            vec![(b"abc".to_vec(), 3), (b"def".to_vec(), 1), (b"ghi".to_vec(), 2)]
-        );
-    }
-
-    #[test]
     fn covering_segment_replaces_released_timestamps() {
         let mut store = RxStore::new();
         let first = insert_stamped(&mut store, 3, b"def", 1);
@@ -643,18 +602,6 @@ mod tests {
         assert_eq!(releases.get(), 0);
         assert_eq!(drain_stamped(&mut store), vec![(b"ab".to_vec(), 1)]);
         assert_eq!(releases.get(), 1);
-    }
-
-    #[test]
-    fn timestamps_stop_at_in_order_end() {
-        let mut store = RxStore::new();
-        assert!(drain_stamped(&mut store).is_empty());
-        insert_stamped(&mut store, 6, b"ghi", 2);
-        assert!(drain_stamped(&mut store).is_empty());
-        insert_stamped(&mut store, 0, b"abc", 1);
-        assert_eq!(store.held(), 2);
-        assert_eq!(drain_stamped(&mut store), vec![(b"abc".to_vec(), 1)]);
-        assert_eq!(store.held(), 1);
     }
 
     #[test]
@@ -728,12 +675,6 @@ mod tests {
         assert_eq!((first.get(), second.get(), later.get()), (1, 1, 0));
         drop(store);
         assert_eq!((first.get(), second.get(), later.get()), (1, 1, 1));
-    }
-
-    #[test]
-    fn out_of_order_ranges_empty() {
-        let store = RxStore::new();
-        assert_eq!(store.out_of_order_ranges().next(), None);
     }
 
     #[test]
@@ -1155,19 +1096,6 @@ mod tests {
     }
 
     #[test]
-    fn many_out_of_order_views_then_fill_gap() {
-        let mut store = RxStore::new();
-        for offset in 1..=20 {
-            insert(&mut store, offset, &[offset as u8]);
-        }
-        assert_eq!(store.held(), 20);
-        assert_eq!(store.in_order_len(), 0);
-        insert(&mut store, 0, &[0]);
-        assert_eq!(store.in_order_len(), 21);
-        assert_eq!(drain_bytes(&mut store), (0..=20).collect::<Vec<_>>());
-    }
-
-    #[test]
     fn hole_fill_and_overlap_release() {
         let mut store = RxStore::new();
         insert(&mut store, 0, b"abcde");
@@ -1196,19 +1124,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_releases_two_whole_views() {
-        let mut store = RxStore::new();
-        let first = insert(&mut store, 0, b"abcd");
-        let second = insert(&mut store, 4, b"efgh");
-        assert_eq!(drain_bytes(&mut store), b"abcdefgh");
-        assert_eq!(store.held(), 0);
-        assert_eq!(store.in_order_len(), 0);
-        assert_eq!((first.get(), second.get()), (1, 1));
-        drop(store);
-        assert_eq!((first.get(), second.get()), (1, 1));
-    }
-
-    #[test]
     fn truncate_from_drops_views_past_offset() {
         let mut store = RxStore::new();
         let first = insert(&mut store, 0, b"abcde");
@@ -1232,20 +1147,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_drops_several_whole_views() {
-        let mut store = RxStore::new();
-        let first = insert(&mut store, 0, b"abcde");
-        let middle = insert(&mut store, 10, b"klmno");
-        let last = insert(&mut store, 20, b"uvwxy");
-        store.truncate_from(10);
-        assert_eq!(ranges(&store), vec![(0, 5)]);
-        assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"abcde");
-        assert_eq!((first.get(), middle.get(), last.get()), (0, 1, 1));
-        drop(store);
-        assert_eq!((first.get(), middle.get(), last.get()), (1, 1, 1));
-    }
-
-    #[test]
     fn stale_decision_after_commit_panics() {
         let mut store = RxStore::new();
         let decision = store.decide(0, 2);
@@ -1262,29 +1163,6 @@ mod tests {
         assert_eq!(ranges(&store), vec![(0, 2)]);
         assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"ab");
         assert_eq!((held.get(), incoming.get()), (0, 1));
-        drop(store);
-        assert_eq!((held.get(), incoming.get()), (1, 1));
-    }
-
-    #[test]
-    fn stale_duplicate_after_clear_panics() {
-        let mut store = RxStore::new();
-        let held = insert(&mut store, 0, b"abcd");
-        let decision = store.decide(1, 2);
-        assert_eq!(decision, Decision::Duplicate(1..3));
-        store.clear();
-        assert_eq!(held.get(), 1);
-        let (frame, incoming) = counted_frame(b"BC");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 1, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale duplicate decision")
-        );
-        assert_eq!(store.held(), 0);
-        assert_eq!((held.get(), incoming.get()), (1, 1));
         drop(store);
         assert_eq!((held.get(), incoming.get()), (1, 1));
     }

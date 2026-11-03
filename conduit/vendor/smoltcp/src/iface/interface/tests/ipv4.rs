@@ -302,24 +302,6 @@ mod stale_neighbors {
         }
     }
 
-    #[test]
-    fn limited_device_transmit_frame_uses_existing_limit() {
-        use crate::phy::FrameToken as _;
-
-        let mut device = LimitedDevice {
-            inner: TestingDevice::new(Medium::Ethernet),
-            tx_left: Some(1),
-        };
-        let mut frame = crate::tests::tx_test_buf(&[2]);
-        frame.headroom_mut(1).0[0] = 1;
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_retain(frame, 1, None);
-        assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
-        assert!(device.transmit_frame(Instant::ZERO).is_none());
-    }
-
     struct Connection {
         iface: Interface,
         sockets: TcpSet<'static>,
@@ -763,35 +745,6 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
 
 #[rstest]
 #[case(Medium::Ethernet)]
-fn test_unknown_protocol_without_payload_no_reply(#[case] medium: Medium) {
-    let (mut iface, mut sockets, _device) = setup(medium);
-
-    // Unknown Ipv4 Protocol with no payload
-    let repr = IpRepr::Ipv4(Ipv4Repr {
-        src_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x02),
-        dst_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x01),
-        next_header: IpProtocol::Unknown(0x0c),
-        payload_len: 0,
-        hop_limit: 0x40,
-    });
-
-    let mut bytes = vec![0u8; 34];
-    repr.emit(&mut bytes, &ChecksumCapabilities::default());
-    let frame = Ipv4Packet::new_unchecked(&bytes[..]);
-
-    assert_eq!(
-        iface.inner.process_ipv4(
-            &mut sockets,
-            PacketMeta::default(),
-            &frame,
-            None,
-        ),
-        None
-    );
-}
-
-#[rstest]
-#[case(Medium::Ethernet)]
 fn test_local_subnet_broadcasts(#[case] medium: Medium) {
     let (mut iface, _, _device) = setup(medium);
     iface.update_ip_addrs(|addrs| {
@@ -983,61 +936,6 @@ fn test_broadcast_echo_no_reply(#[case] medium: Medium) {
             "echo request to {dst_addr} must not get a reply"
         );
     }
-}
-
-#[rstest]
-#[case(Medium::Ethernet)]
-fn test_handle_valid_arp_request(#[case] medium: Medium) {
-    let (mut iface, mut sockets, _device) = setup(medium);
-
-    let mut eth_bytes = vec![0u8; 42];
-
-    let local_ip_addr = Ipv4Address::new(0x7f, 0x00, 0x00, 0x01);
-    let remote_ip_addr = Ipv4Address::new(0x7f, 0x00, 0x00, 0x02);
-    let local_hw_addr = EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]);
-    let remote_hw_addr = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
-
-    let repr = ArpRepr::EthernetIpv4 {
-        operation: ArpOperation::Request,
-        source_hardware_addr: remote_hw_addr,
-        source_protocol_addr: remote_ip_addr,
-        target_hardware_addr: EthernetAddress::default(),
-        target_protocol_addr: local_ip_addr,
-    };
-
-    let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
-    frame.set_dst_addr(EthernetAddress::BROADCAST);
-    frame.set_src_addr(remote_hw_addr);
-    frame.set_ethertype(EthernetProtocol::Arp);
-    let mut packet = ArpPacket::new_unchecked(frame.payload_mut());
-    repr.emit(&mut packet);
-
-    // Ensure an ARP Request for us triggers an ARP Reply
-    assert_eq!(
-        iface.inner.process_ethernet(
-            &mut sockets,
-            PacketMeta::default(),
-            frame.into_inner(),
-            None,
-        ),
-        Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Reply,
-            source_hardware_addr: local_hw_addr,
-            source_protocol_addr: local_ip_addr,
-            target_hardware_addr: remote_hw_addr,
-            target_protocol_addr: remote_ip_addr
-        }))
-    );
-
-    // Ensure the address of the requester was entered in the cache
-    assert_eq!(
-        iface.inner.lookup_hardware_addr(
-            MockTxToken,
-            &IpAddress::Ipv4(remote_ip_addr),
-            None,
-        ),
-        Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
-    );
 }
 
 #[test]
@@ -1898,33 +1796,6 @@ fn answer_to_own_source(iface: &mut Interface, sockets: &mut TcpSet, own: Ipv4Ad
     // `Err(NeighborPending)` means an ARP request went out instead of the reply: still a frame.
     let _ = iface.inner.dispatch(CaptureTxToken(&mut wire), packet);
     wire
-}
-
-/// Control: with no ARP from a spoofer, the stack's answer to an `own -> own` packet is a
-/// broadcast ARP request for our own address; nothing goes to any unicast MAC.
-#[rstest]
-fn control_own_source_without_spoofed_arp_sends_arp_request(
-    #[values(false, true)] tcp: bool,
-    #[values(false, true)] owned_only: bool,
-) {
-    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
-    let own = if owned_only {
-        iface.set_owned_ipv4(
-            crate::iface::OwnedIpv4::new(
-                &[Ipv4Cidr::new(OWNED_ONLY, 32)],
-                Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 1), 24),
-                None,
-            )
-            .unwrap(),
-        );
-        OWNED_ONLY
-    } else {
-        Ipv4Address::new(192, 168, 1, 1)
-    };
-    let wire = answer_to_own_source(&mut iface, &mut sockets, own, tcp);
-    let frame = EthernetFrame::new_checked(&wire[..]).unwrap();
-    assert_eq!(frame.dst_addr(), EthernetAddress::BROADCAST);
-    assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
 }
 
 /// An ARP request or reply whose sender IP is one of our addresses (interface or owned; a

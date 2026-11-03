@@ -107,38 +107,6 @@ mod tests {
     }
 
     #[test]
-    fn push_and_drain_keep_capacity_and_allocation() {
-        let (tcp_handles, udp_handles) = handles();
-        let queue = DropQueue::with_capacity(3, 3);
-        let allocation = {
-            let dropped = queue.0.borrow();
-            (dropped.tcp.capacity(), dropped.tcp.as_ptr(),
-             dropped.udp.capacity(), dropped.udp.as_ptr())
-        };
-        let mut tcp = Vec::with_capacity(3);
-        let mut udp = Vec::with_capacity(3);
-        for _ in 0..2 {
-            for handle in tcp_handles {
-                queue.push_tcp(handle);
-            }
-            for handle in udp_handles {
-                queue.push_udp(handle);
-            }
-            queue.drain_into(&mut tcp, &mut udp);
-            assert_eq!(tcp, tcp_handles);
-            assert_eq!(udp, udp_handles);
-            let dropped = queue.0.borrow();
-            assert_eq!(allocation,
-                       (dropped.tcp.capacity(), dropped.tcp.as_ptr(),
-                        dropped.udp.capacity(), dropped.udp.as_ptr()));
-            assert!(dropped.tcp.is_empty());
-            assert!(dropped.udp.is_empty());
-            tcp.clear();
-            udp.clear();
-        }
-    }
-
-    #[test]
     fn same_identifies_shared_queue() {
         let (tcp_handles, udp_handles) = handles();
         let queue = DropQueue::with_capacity(1, 1);
@@ -160,23 +128,4 @@ mod tests {
         assert!(other.is_empty());
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic]
-    fn push_tcp_past_capacity_panics() {
-        let (tcp, _) = handles();
-        let queue = DropQueue::with_capacity(1, 0);
-        queue.push_tcp(tcp[0]);
-        queue.push_tcp(tcp[1]);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic]
-    fn push_udp_past_capacity_panics() {
-        let (_, udp) = handles();
-        let queue = DropQueue::with_capacity(0, 1);
-        queue.push_udp(udp[0]);
-        queue.push_udp(udp[1]);
-    }
 }

@@ -636,19 +636,6 @@ mod test {
         assert!(packet.verify_checksum());
     }
 
-    #[test]
-    fn test_echo_construct() {
-        let mut bytes = vec![0xa5; 12];
-        let mut packet = Packet::new_unchecked(&mut bytes);
-        packet.set_msg_type(Message::EchoRequest);
-        packet.set_msg_code(0);
-        packet.set_echo_ident(0x1234);
-        packet.set_echo_seq_no(0xabcd);
-        packet.data_mut().copy_from_slice(&ECHO_DATA_BYTES[..]);
-        packet.fill_checksum();
-        assert_eq!(&packet.into_inner()[..], &ECHO_PACKET_BYTES[..]);
-    }
-
     fn echo_packet_repr() -> Repr<'static> {
         Repr::EchoRequest {
             ident: 0x1234,

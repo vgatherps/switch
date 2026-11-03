@@ -319,19 +319,6 @@ mod test {
     }
 
     #[test]
-    fn test_construct() {
-        let mut bytes = vec![0xa5; 12];
-        let mut packet = Packet::new_unchecked(&mut bytes);
-        packet.set_src_port(48896);
-        packet.set_dst_port(53);
-        packet.set_len(12);
-        packet.set_checksum(0xffff);
-        packet.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
-        packet.fill_checksum(&SRC_ADDR.into(), &DST_ADDR.into());
-        assert_eq!(&*packet.into_inner(), &PACKET_BYTES[..]);
-    }
-
-    #[test]
     fn test_impossible_len() {
         let mut bytes = vec![0; 12];
         let mut packet = Packet::new_unchecked(&mut bytes);

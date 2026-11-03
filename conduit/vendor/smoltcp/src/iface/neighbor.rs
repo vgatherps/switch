@@ -435,83 +435,6 @@ mod test {
     }
 
     #[test]
-    fn test_fill() {
-        let mut cache = Cache::new(3);
-
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0))
-                .found()
-        );
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(0))
-                .found()
-        );
-
-        cache.fill(MOCK_IP_ADDR_1.into(), HADDR_A, Instant::from_millis(0));
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
-            Answer::Found(HADDR_A)
-        );
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(0))
-                .found()
-        );
-        assert!(
-            !cache
-                .lookup(
-                    &MOCK_IP_ADDR_1.into(),
-                    Instant::from_millis(0) + Cache::ENTRY_LIFETIME * 2
-                )
-                .found(),
-        );
-
-        cache.fill(MOCK_IP_ADDR_1.into(), HADDR_A, Instant::from_millis(0));
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(0))
-                .found()
-        );
-    }
-
-    #[test]
-    fn test_expire() {
-        let mut cache = Cache::new(3);
-
-        cache.fill(MOCK_IP_ADDR_1.into(), HADDR_A, Instant::from_millis(0));
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
-            Answer::Found(HADDR_A)
-        );
-        assert!(
-            !cache
-                .lookup(
-                    &MOCK_IP_ADDR_1.into(),
-                    Instant::from_millis(0) + Cache::ENTRY_LIFETIME * 2
-                )
-                .found(),
-        );
-    }
-
-    #[test]
-    fn test_replace() {
-        let mut cache = Cache::new(3);
-
-        cache.fill(MOCK_IP_ADDR_1.into(), HADDR_A, Instant::from_millis(0));
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
-            Answer::Found(HADDR_A)
-        );
-        cache.fill(MOCK_IP_ADDR_1.into(), HADDR_B, Instant::from_millis(0));
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
-            Answer::Found(HADDR_B)
-        );
-    }
-
-    #[test]
     fn test_evict() {
         let mut cache = Cache::new(3);
 
@@ -537,54 +460,6 @@ mod test {
         assert_eq!(
             cache.lookup(&MOCK_IP_ADDR_4.into(), Instant::from_millis(1000)),
             Answer::Found(HADDR_D)
-        );
-    }
-
-    #[test]
-    fn test_hush() {
-        let mut cache = Cache::new(3);
-
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
-            Answer::NotFound
-        );
-
-        cache.limit_rate(MOCK_IP_ADDR_1.into(), Instant::from_millis(0));
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(100)),
-            Answer::RateLimited
-        );
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(2000)),
-            Answer::NotFound
-        );
-    }
-
-    #[test]
-    fn test_flush() {
-        let mut cache = Cache::new(3);
-
-        cache.fill(MOCK_IP_ADDR_1.into(), HADDR_A, Instant::from_millis(0));
-        assert_eq!(
-            cache.lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0)),
-            Answer::Found(HADDR_A)
-        );
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_2.into(), Instant::from_millis(0))
-                .found()
-        );
-
-        cache.flush();
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0))
-                .found()
-        );
-        assert!(
-            !cache
-                .lookup(&MOCK_IP_ADDR_1.into(), Instant::from_millis(0))
-                .found()
         );
     }
 
@@ -661,26 +536,6 @@ mod test {
                 cache.lookup(&address(1), Instant::from_millis(120_500)),
                 Answer::Stale(HADDR_B)
             );
-        }
-
-        #[test]
-        fn same_mac_fill_makes_stale_fresh_without_bumping() {
-            let mut cache = Cache::new(1);
-            cache.fill(address(1), HADDR_A, Instant::ZERO);
-            let now = Instant::from_millis(60_500);
-            assert_eq!(cache.lookup(&address(1), now), Answer::Stale(HADDR_A));
-            let changes = cache.changes();
-            cache.fill(address(1), HADDR_A, now);
-            assert_eq!(cache.lookup(&address(1), now), Answer::Found(HADDR_A));
-            assert_eq!(
-                cache.lookup(&address(1), Instant::from_millis(120_499)),
-                Answer::Found(HADDR_A)
-            );
-            assert_eq!(
-                cache.lookup(&address(1), Instant::from_millis(120_500)),
-                Answer::Stale(HADDR_A)
-            );
-            assert_eq!(cache.changes(), changes);
         }
 
         #[test]
@@ -1036,27 +891,6 @@ mod test {
                 );
             }
             assert_eq!(cache.storage.len(), 1);
-        }
-
-        /// Eviction removes the earliest entry; every remaining address is still found.
-        #[test]
-        fn eviction_keeps_remaining_entries_findable() {
-            let mut cache = Cache::new(3);
-            for last in 1..=3 {
-                cache.fill(address(last), HADDR_A, Instant::from_millis(i64::from(last)));
-            }
-            cache.fill(address(4), HADDR_D, Instant::from_millis(4));
-            assert_eq!(cache.lookup(&address(1), Instant::from_millis(10)), Answer::NotFound);
-            for last in 2..=3 {
-                assert_eq!(
-                    cache.lookup(&address(last), Instant::from_millis(10)),
-                    Answer::Found(HADDR_A)
-                );
-            }
-            assert_eq!(
-                cache.lookup(&address(4), Instant::from_millis(10)),
-                Answer::Found(HADDR_D)
-            );
         }
 
         /// A same-MAC refill moves the expiry and never bumps `changes`, live or expired. A

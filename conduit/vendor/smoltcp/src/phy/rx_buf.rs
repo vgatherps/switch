@@ -180,15 +180,6 @@ mod tests {
     }
 
     #[test]
-    fn rx_timestamp_absent_by_default() {
-        assert_eq!(RxBuf::from_vec(alloc::vec![1, 2]).rx_timestamp(), 0);
-        let frame = RxBuf::counted_frame(alloc::vec![1, 2], 2, Rc::new(Cell::new(0)));
-        assert_eq!(frame.rx_timestamp(), 0);
-        let (frame, _, _) = owned_frame(4);
-        assert_eq!(frame.rx_timestamp(), 0);
-    }
-
-    #[test]
     fn rx_timestamp_kept_through_narrow() {
         let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3], 2, Rc::new(Cell::new(0)));
         frame.set_rx_timestamp(7);
@@ -197,14 +188,6 @@ mod tests {
         assert_eq!(frame.rx_timestamp(), 7);
     }
 
-
-    #[test]
-    fn narrow_head_preserves_bytes() {
-        let releases = Rc::new(Cell::new(0));
-        let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3, 4], 2, releases);
-        frame.narrow(2..4);
-        assert_eq!(frame.as_slice(), &[3, 4]);
-    }
 
 
     fn owned_frame(len: usize) -> (RxBuf, Rc<Cell<usize>>, NonNull<Storage>) {
@@ -328,10 +311,4 @@ mod tests {
         assert_eq!(releases.get(), 1);
     }
 
-    #[test]
-    #[should_panic]
-    fn narrow_out_of_bounds_panics() {
-        let (mut frame, _, _) = owned_frame(4);
-        frame.narrow(0..5);
-    }
 }

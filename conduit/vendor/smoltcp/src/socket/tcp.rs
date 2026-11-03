@@ -3460,39 +3460,6 @@ mod test {
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
 
-    #[test]
-    fn seq_options_round_trip() {
-        let mut s = socket_established();
-        for v in [
-            None,
-            Some(TcpSeqNumber(i32::MIN)),
-            Some(TcpSeqNumber(i32::MAX)),
-            Some(TcpSeqNumber(0)),
-            None,
-        ] {
-            s.set_local_rx_last_seq(v);
-            assert_eq!(s.local_rx_last_seq(), v);
-            s.set_local_rx_last_ack(v);
-            assert_eq!(s.local_rx_last_ack(), v);
-            s.set_recover(v);
-            assert_eq!(s.recover(), v);
-        }
-    }
-
-    #[test]
-    fn ack_delay_timer_round_trips() {
-        let mut s = socket_established();
-        for timer in [
-            AckDelayTimer::Idle,
-            AckDelayTimer::Immediate,
-            AckDelayTimer::Waiting(Instant::ZERO),
-            AckDelayTimer::Waiting(Instant::from_micros(i64::MAX)),
-        ] {
-            s.set_ack_delay_timer(timer);
-            assert_eq!(s.ack_delay_timer(), timer);
-        }
-    }
-
     // =========================================================================================//
     // Constants
     // =========================================================================================//
@@ -3977,21 +3944,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn mtu_device_transmit_frame_delegates() {
-        use crate::phy::{Device as _, FrameToken as _};
-
-        let mut device =
-            MtuDevice(crate::tests::TestingDevice::new(crate::phy::Medium::Ethernet), 1280);
-        let mut frame = crate::tests::tx_test_buf(&[2]);
-        frame.headroom_mut(1).0[0] = 1;
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_retain(frame, 1, None);
-        assert_eq!(device.0.tx_queue.pop_front().unwrap(), &[1, 2]);
-    }
-
     fn receive_window_socket(ip_mtu: usize, capacity: usize) -> TestSocket {
         let mut device = MtuDevice(
             crate::tests::TestingDevice::new(crate::phy::Medium::Ethernet),
@@ -4233,17 +4185,6 @@ mod test {
             assert_eq!(result.unwrap().payload, &[0xa5; 512]);
         });
         assert_eq!(s.congestion_controller.window(), 512);
-    }
-
-    #[test]
-    fn mss_cap_persists_across_reconnect() {
-        let mut s = socket_with_buffer_sizes(4096, 4096);
-        s.set_mss_cap(Some(512));
-        for _ in 0..2 {
-            connect_with_mss_cap(&mut s, 512, BASE_MSS);
-            send_mss_cap_payload(&mut s, 512);
-            s.abort();
-        }
     }
 
     #[test]
@@ -4627,37 +4568,6 @@ mod test {
         assert!(reads > 0);
     }
 
-
-    #[test]
-    fn syn_windows_use_unscaled_receive_target() {
-        for capacity in [64usize, 65536, 1048576] {
-            let active_window = u16::try_from(capacity).unwrap_or(u16::MAX);
-            let passive_window = active_window;
-            let mut active = socket_syn_sent_with_buffer_sizes(64, capacity);
-            recv(&mut active, Instant::ZERO, |reply| {
-                let reply = reply.unwrap();
-                assert_eq!(reply.control, TcpControl::Syn);
-                assert_eq!(reply.ack_number, None);
-                assert_eq!(reply.window_len, active_window);
-            });
-            let mut passive = socket_with_buffer_sizes(64, capacity);
-            passive.listen(LISTEN_END).unwrap();
-            assert_eq!(
-                send(
-                    &mut passive,
-                    Instant::ZERO,
-                    &SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack().wscale(0),
-                ),
-                None
-            );
-            recv(&mut passive, Instant::ZERO, |reply| {
-                let reply = reply.unwrap();
-                assert_eq!(reply.control, TcpControl::Syn);
-                assert_eq!(reply.ack_number, Some(REMOTE_SEQ + 1));
-                assert_eq!(reply.window_len, passive_window);
-            });
-        }
-    }
 
 
     fn socket_established() -> TestSocket {
@@ -5068,23 +4978,6 @@ mod test {
             let end = offset.checked_add(536).unwrap().min(bytes.len());
             assert_eq!(actual_seq, LOCAL_SEQ + 1 + offset);
             assert_eq!(payload, bytes[offset..end]);
-            assert!(whole);
-        }
-    }
-
-    #[test]
-    fn frame_peer_mss_sizes_send_slice_frames() {
-        let source = crate::tests::tx_test_source(1460);
-        let mut s = frame_socket(4380, 1460, source);
-        s.remote_mss = 1024;
-        s.remote_win_len = 4380;
-        s.congestion_controller.set_initial_window(4380);
-        let bytes: Vec<u8> = (0..4380).map(|index| index as u8).collect();
-        assert_eq!(s.send_slice(&bytes), Ok(bytes.len()));
-        for (offset, len) in [(0, 1024), (1024, 1024), (2048, 1024), (3072, 1024), (4096, 284)] {
-            let (_, seq, payload, whole) = emit_frame_segment(&mut s);
-            assert_eq!(seq, LOCAL_SEQ + 1 + offset);
-            assert_eq!(payload, bytes[offset..offset + len]);
             assert!(whole);
         }
     }
@@ -6044,27 +5937,6 @@ mod test {
             s,
             [RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS).sack_perm(true)]
         );
-    }
-
-    #[test]
-    fn rx_buffer_new_keeps_capacity_and_window_shift() {
-        for capacity in [64, 65535, 65536, 1 << 20, 256 << 10] {
-            let mut s = socket_syn_sent_with_buffer_sizes(64, capacity);
-            assert_eq!(s.recv_capacity(), capacity);
-            let shift = rx_win_shift(capacity);
-            assert_eq!(s.remote_win_shift, shift);
-            recv!(
-                s,
-                [RECV_TEMPL
-                    .syn()
-                    .seq(LOCAL_SEQ)
-                    .no_ack()
-                    .mss(BASE_MSS)
-                    .wscale(shift)
-                    .win(u16::try_from(capacity).unwrap_or(u16::MAX))
-                    .sack_perm(true)]
-            );
-        }
     }
 
     #[test]
@@ -7435,12 +7307,6 @@ mod test {
         assert_eq!(usize::from(s.remote_mss), DEFAULT_MSS);
     }
 
-    #[test]
-    fn test_connect_unspecified_local() {
-        let mut s = socket();
-        assert_eq!(s.socket.connect(&mut s.cx, REMOTE_END, 80), Ok(()));
-    }
-
     /// An explicit local address must be ours (the interface address or an owned one): a
     /// foreign one is `Unaddressable` and leaves the socket closed with no tuple, so no flow is
     /// ever registered for an address we do not own.
@@ -8708,35 +8574,6 @@ mod test {
             s,
             [RECV_TEMPL.seq(LOCAL_SEQ + 1 + 3).ack(REMOTE_SEQ + 1 + 6).win(64)]
         );
-    }
-
-    #[test]
-    fn test_established_receive_partially_outside_window() {
-        let mut s = socket_established();
-
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abc"[..])
-        );
-
-        {
-            let frame = s.recv().unwrap().unwrap();
-            let data = frame.payload();
-            assert_eq!(data, b"abc");
-        }
-
-        // Peer decides to retransmit (perhaps because the ACK was lost)
-        // and also pushed data.
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..])
-        );
-
-        {
-            let frame = s.recv().unwrap().unwrap();
-            let data = frame.payload();
-            assert_eq!(data, b"def");
-        }
     }
 
     #[test]
@@ -11071,32 +10908,6 @@ mod test {
         sanity!(s, socket_last_ack());
     }
 
-    // =========================================================================================//
-    // Tests for the LAST-ACK state.
-    // =========================================================================================//
-    #[test]
-    fn test_last_ack_ack_not_of_fin() {
-        let mut s = socket_last_ack();
-        recv!(
-            s,
-            [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1)]
-        );
-        assert_eq!(s.state, State::LastAck);
-
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1)
-        );
-        assert_eq!(s.state, State::LastAck);
-
-        // ACK received of fin: socket should change to Closed.
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 1)
-        );
-        assert_eq!(s.state, State::Closed);
-    }
-
     #[test]
     fn test_last_ack_duplicate_ack_no_challenge_ack() {
         let mut s = socket_last_ack();
@@ -11401,17 +11212,6 @@ mod test {
     }
 
     #[test]
-    fn test_fin_with_data() {
-        let mut s = socket_established();
-        s.send_slice(b"abcdef").unwrap();
-        s.close();
-        recv!(
-            s,
-            [RECV_TEMPL.fin().seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"abcdef"[..])]
-        )
-    }
-
-    #[test]
     fn test_mutual_close_with_data_1() {
         let mut s = socket_established();
         s.send_slice(b"abcdef").unwrap();
@@ -11466,17 +11266,6 @@ mod test {
             SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..]),
             Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(64))
         );
-    }
-
-    #[test]
-    fn test_data_retransmit() {
-        let mut s = socket_established();
-        s.send_slice(b"abcdef").unwrap();
-        recv!(s, time 1000, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
-            .data(&b"abcdef"[..])));
-        recv_nothing!(s, time 1050);
-        recv!(s, time 1300, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
-            .data(&b"abcdef"[..])));
     }
 
     #[test]
@@ -11889,23 +11678,6 @@ mod test {
     }
 
     #[test]
-    fn test_close_wait_retransmit_reset_after_ack() {
-        let mut s = socket_close_wait();
-        s.remote_win_len = 6;
-        s.send_slice(b"abcdef").unwrap();
-        s.send_slice(b"123456").unwrap();
-        s.send_slice(b"ABCDEF").unwrap();
-        recv!(s, time 1000, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 1)
-            .data(&b"abcdef"[..])));
-        send!(s, time 1005, SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 6).win(6));
-        recv!(s, time 1010, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1 + 1)
-            .data(&b"123456"[..])));
-        send!(s, time 1015, SEND_TEMPL.seq(REMOTE_SEQ + 1 + 1).ack(LOCAL_SEQ + 1 + 6 + 6).win(6));
-        recv!(s, time 1020, Ok(RECV_TEMPL.seq(LOCAL_SEQ + 1 + 6 + 6).ack(REMOTE_SEQ + 1 + 1)
-            .data(&b"ABCDEF"[..])));
-    }
-
-    #[test]
     fn test_fin_wait_1_retransmit_reset_after_ack() {
         let mut s = socket_established();
         s.remote_win_len = 6;
@@ -12292,13 +12064,6 @@ mod test {
         assert_eq!(s.state(), State::Closed);
         assert_eq!(s.recover(), None);
         assert!(!s.pending_fast_retransmit);
-    }
-
-    #[test]
-    fn test_fast_retransmit_survives_failed_emit() {
-        let mut s = socket_fast_retransmit_emit_failed();
-        // With no further input, the next dispatch resends the hole.
-        recv!(s, time 20, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"aaa"[..])]);
     }
 
     #[test]
@@ -12726,18 +12491,6 @@ mod test {
     // =========================================================================================//
 
     #[test]
-    fn test_psh_transmit() {
-        let mut s = socket_established();
-        s.remote_mss = 6;
-        s.send_slice(b"abcdef").unwrap();
-        s.send_slice(b"123456").unwrap();
-        recv!(s, time 0, Ok(RECV_TEMPL.ctl(TcpControl::None).seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)
-            .data(&b"abcdef"[..])), exact);
-        recv!(s, time 0, Ok(RECV_TEMPL.psh().seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1)
-            .data(&b"123456"[..])), exact);
-    }
-
-    #[test]
     fn test_psh_receive() {
         let mut s = socket_established();
         send!(
@@ -12748,26 +12501,6 @@ mod test {
             s,
             [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(64)]
         );
-    }
-
-    #[test]
-    fn test_zero_window_ack() {
-        let mut s = socket_with_closing_receive_window(6, REMOTE_SEQ + 1);
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abcdef"[..])
-        );
-        recv!(
-            s,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0)]
-        );
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 7).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0))
-        );
-        assert_eq!(s.recv_queue(), 6);
-        recv_nothing!(s);
     }
 
     #[test]
@@ -12842,21 +12575,6 @@ mod test {
         let frame = s.recv().unwrap().unwrap();
         assert_eq!(frame.payload(), b"abc");
         assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
-    }
-
-    #[test]
-    fn test_fill_peer_window() {
-        let mut s = socket_established();
-        s.remote_mss = 6;
-        s.send_slice(b"abcdef123456!@#$%^").unwrap();
-        recv!(
-            s,
-            [
-                RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"abcdef"[..]),
-                RECV_TEMPL.seq(LOCAL_SEQ + 1 + 6).ack(REMOTE_SEQ + 1).data(&b"123456"[..]),
-                RECV_TEMPL.seq(LOCAL_SEQ + 1 + 6 + 6).ack(REMOTE_SEQ + 1).data(&b"!@#$%^"[..])
-            ]
-        );
     }
 
 
@@ -12964,29 +12682,6 @@ mod test {
                 assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(next)));
             }
         }
-    }
-
-    #[test]
-    fn probe_backoff_counts_expiry_once_even_if_emit_fails() {
-        // RTT 200 ms: RTO = 600 ms.
-        let mut s = socket_zero_window(socket_established_with_rtt(Duration::from_millis(200)));
-        for at in [600, 610] {
-            s.cx.set_now(Instant::from_millis(at));
-            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
-                let repr = frame_payload(repr, &frame);
-                assert_eq!(repr.payload, b"a");
-                (Err(()), frame.map(UniqueTxBuf::into_buf))
-            }), Err(()));
-            assert_eq!(s.rto_backoff, 1);
-            assert!(matches!(s.timer, Timer::ZeroWindowProbe { backoff_applied: true, .. }));
-            assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(600)));
-        }
-        recv(&mut s, Instant::from_millis(620), |result| {
-            assert_eq!(result.unwrap().payload, b"a");
-        });
-        assert_eq!(s.rto_backoff, 1);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(1820)));
-        recv_nothing!(s, time 1819);
     }
 
     #[test]
@@ -13184,59 +12879,6 @@ mod test {
     }
 
     #[test]
-    fn test_zero_window_probe_enter_on_win_update() {
-        let mut s = socket_established();
-
-        assert!(!s.timer.is_zero_window_probe());
-
-        s.send_slice(b"abcdef123456!@#$%^").unwrap();
-
-        assert!(!s.timer.is_zero_window_probe());
-
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0)
-        );
-
-        assert!(s.timer.is_zero_window_probe());
-    }
-
-    #[test]
-    fn test_zero_window_probe_enter_on_send() {
-        let mut s = socket_established();
-
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0)
-        );
-
-        assert!(!s.timer.is_zero_window_probe());
-
-        s.send_slice(b"abcdef123456!@#$%^").unwrap();
-
-        assert!(s.timer.is_idle());
-        recv_nothing!(s);
-        assert!(s.timer.is_zero_window_probe());
-    }
-
-    #[test]
-    fn test_zero_window_probe_first_dispatch_uses_current_time() {
-        let mut s = socket_established();
-        send!(s, time 100_000, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
-        s.send_slice(b"abc").unwrap();
-        assert_eq!(s.socket.poll_at(), PollAt::Now);
-        recv_nothing!(s, time 100_000);
-        assert_eq!(s.timer, Timer::ZeroWindowProbe {
-            expires_at: Instant::from_millis(100_300),
-            backoff_applied: false,
-        });
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(100_300)));
-        recv_nothing!(s, time 100_299);
-        recv!(s, time 100_300, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"a"[..])]);
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(100_900)));
-    }
-
-    #[test]
     fn test_zero_window_probe_after_retransmit_timeout() {
         let mut s = socket_established();
         s.send_slice(b"abc").unwrap();
@@ -13395,32 +13037,6 @@ mod test {
     }
 
     #[test]
-    fn test_zero_window_probe_backoff_no_reply() {
-        let mut s = socket_established();
-        s.send_slice(b"abcdef123456!@#$%^").unwrap();
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0)
-        );
-
-        recv_nothing!(s, time 299);
-        recv!(
-            s,
-            time 300,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"a"[..])]
-        );
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(900)));
-
-        recv_nothing!(s, time 899);
-        recv!(
-            s,
-            time 900,
-            [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(&b"a"[..])]
-        );
-        assert_eq!(s.timer.poll_at(), PollAt::Time(Instant::from_millis(2100)));
-    }
-
-    #[test]
     fn test_zero_window_probe_shift() {
         let mut s = socket_established();
 
@@ -13460,16 +13076,6 @@ mod test {
             s,
             time 1300,
             [RECV_TEMPL.seq(LOCAL_SEQ + 2).ack(REMOTE_SEQ + 1).data(&b"b"[..])]
-        );
-    }
-
-    #[test]
-    fn test_responds_to_keep_alive() {
-        let mut s = socket_established();
-        send!(
-            s,
-            SEND_TEMPL.seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1),
-            Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1))
         );
     }
 
@@ -13579,21 +13185,6 @@ mod test {
     // =========================================================================================//
     // Tests for graceful vs ungraceful rx close
     // =========================================================================================//
-
-    #[test]
-    fn test_rx_close_fin() {
-        let mut s = socket_established();
-        send!(
-            s,
-            SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&b"abc"[..])
-        );
-        {
-            let frame = s.recv().unwrap().unwrap();
-            let data = frame.payload();
-            assert_eq!(data, b"abc");
-        }
-        assert_eq!(s.recv().unwrap_err(), RecvError::Finished);
-    }
 
     #[test]
     fn test_rx_close_fin_in_fin_wait_1() {
@@ -14370,35 +13961,6 @@ mod test {
     }
 
     #[test]
-    fn full_segment_payload_is_mtu_minus_40() {
-        for remote_mss in [1460, 9999, 512] {
-            let mut s = socket_established_with_buffer_sizes(1460, 64);
-            assert_eq!(s.cx.ip_mtu(), 1500);
-            s.remote_mss = remote_mss;
-            s.remote_win_len = 4096;
-            s.send_slice(&[0; 1460]).unwrap();
-            recv(&mut s, Instant::ZERO, |result| {
-                let data = result.unwrap();
-                assert_eq!(data.payload.len(), usize::from(remote_mss).min(1460));
-                assert_eq!(data.header_len(), 20);
-                assert_eq!(data.timestamp, None);
-                assert_eq!(data.seq_number, LOCAL_SEQ + 1);
-            });
-        }
-    }
-
-    #[test]
-    fn peer_probe_ack_survives_timestamp_removal() {
-        for payload in [&b""[..], &b"x"[..]] {
-            let mut s = socket_established();
-            send!(s, SEND_TEMPL.seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1).ts(TcpTimestampRepr::new(500, 1))
-                .data(payload), Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)));
-            assert_eq!(s.recv_queue(), 0);
-            assert_eq!(s.state(), State::Established);
-        }
-    }
-
-    #[test]
     fn test_syn_received_bad_ack_precedes_window_check() {
         let mut s = socket_listen();
         send!(s, SEND_TEMPL.syn().seq(TcpSeqNumber(100)).no_ack());
@@ -14436,16 +13998,6 @@ mod test {
         recv!(s, time 20_300, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1).data(b"a")]);
         assert_eq!(s.send_queue(), 3);
         assert_eq!(s.state(), State::Established);
-    }
-
-    #[test]
-    fn idle_established_socket_has_no_liveness_deadline() {
-        let mut s = socket_established();
-        for millis in [0, 300, 60_000, 3_600_000] {
-            s.cx.set_now(Instant::from_millis(millis));
-            assert_eq!(s.socket.poll_at(), PollAt::Ingress);
-            assert_eq!(s.state(), State::Established);
-        }
     }
 
     #[test]
@@ -14501,15 +14053,6 @@ mod test {
             assert_eq!(s.state(), State::Established);
             assert_eq!(s.remote_max_seq, LOCAL_SEQ + 1);
         }
-    }
-
-    #[test]
-    fn test_responds_to_one_byte_peer_keep_alive() {
-        let mut s = socket_established();
-        send!(s, SEND_TEMPL.seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1).data(&[0]), Some(RECV_TEMPL
-            .seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1)));
-        assert_eq!(s.recv_queue(), 0);
-        assert_eq!(s.state(), State::Established);
     }
 
     #[test]

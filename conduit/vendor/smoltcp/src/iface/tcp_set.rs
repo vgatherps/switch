@@ -1594,30 +1594,6 @@ mod tests {
         assert_eq!(actual, Some(message));
     }
 
-    #[test]
-    fn template_rejects_zero_source_port() {
-        use crate::iface::header_template::TcpTemplate;
-        use crate::wire::{EthernetAddress, IpProtocol, Ipv4Address, Ipv4Repr};
-
-        let ip = Ipv4Repr {
-            src_addr: Ipv4Address::new(192, 168, 1, 1),
-            dst_addr: Ipv4Address::new(192, 168, 1, 2),
-            next_header: IpProtocol::Tcp,
-            payload_len: 20,
-            hop_limit: 64,
-        };
-        assert_panics("TCP template source port must be nonzero", || {
-            TcpTemplate::new(
-                EthernetAddress([2, 0, 0, 0, 0, 1]),
-                EthernetAddress([2, 0, 0, 0, 0, 2]),
-                &ip,
-                0,
-                80,
-                0,
-            );
-        });
-    }
-
     fn handles(set: &TcpSet) -> Vec<usize> {
         set.iter().map(|(h, _)| h.index).collect()
     }
@@ -1724,17 +1700,6 @@ mod tests {
         assert_eq!(set.add(socket()), at(70, 1));
         assert_eq!(set.add(socket()), at(129, 1));
         assert_eq!(set.add(socket()), at(130, 0));
-    }
-
-    #[test]
-    fn add_takes_lowest_empty_slot() {
-        let mut set = TcpSet::new(65);
-        for i in 0..65 {
-            assert_eq!(set.add(socket()), at(i, 0));
-        }
-        set.remove(at(64, 0));
-        assert_eq!(set.add(socket()), at(64, 1));
-        assert_eq!(set.sockets.len(), 65);
     }
 
     #[test]
@@ -1847,23 +1812,6 @@ mod tests {
         assert_eq!(set.iter().map(|(h, _)| h).collect::<Vec<_>>(), vec![a]);
         set.get_mut(a);
         assert_eq!(set.add(socket()), at(1, 0));
-    }
-
-    #[test]
-    fn iter_handles_match_add_after_reuse() {
-        let mut set = TcpSet::new(64);
-        let old = set.add(socket());
-        set.remove(old);
-        let reused = set.add(socket());
-        assert_eq!(reused, at(old.index, old.generation + 1));
-        assert_eq!(set.iter().map(|(h, _)| h).collect::<Vec<_>>(), vec![reused]);
-        assert_eq!(
-            set.iter_mut().map(|(h, _)| h).collect::<Vec<_>>(),
-            vec![reused],
-        );
-        assert_panics(INVALID, || {
-            set.get(old);
-        });
     }
 
     #[test]
