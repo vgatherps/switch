@@ -82,6 +82,22 @@ pub struct Fixture {
     directory: PathBuf,
 }
 
+struct ControlOptions {
+    batch: usize,
+    max_sessions: u32,
+    hold_retire: bool,
+}
+
+impl Default for ControlOptions {
+    fn default() -> Self {
+        Self {
+            batch: 64,
+            max_sessions: 16,
+            hold_retire: false,
+        }
+    }
+}
+
 impl Fixture {
     pub fn new(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, fifo_batch: usize) -> Self {
         Self::with_control_batch(eal, names, tcp, udp, fifo_batch, 64)
@@ -95,11 +111,45 @@ impl Fixture {
         fifo_batch: usize,
         control_batch: usize,
     ) -> Self {
-        Self::configured(eal, names, tcp, udp, fifo_batch, control_batch, false)
+        Self::configured(
+            eal,
+            names,
+            tcp,
+            udp,
+            fifo_batch,
+            ControlOptions {
+                batch: control_batch,
+                ..ControlOptions::default()
+            },
+        )
     }
 
     pub fn with_held_retire(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
-        Self::configured(eal, names, tcp, udp, 64, 64, true)
+        Self::configured(
+            eal,
+            names,
+            tcp,
+            udp,
+            64,
+            ControlOptions {
+                hold_retire: true,
+                ..ControlOptions::default()
+            },
+        )
+    }
+
+    pub fn with_one_session(eal: &Eal, names: [&str; 2], tcp: usize) -> Self {
+        Self::configured(
+            eal,
+            names,
+            tcp,
+            0,
+            64,
+            ControlOptions {
+                max_sessions: 1,
+                ..ControlOptions::default()
+            },
+        )
     }
 
     fn configured(
@@ -108,8 +158,7 @@ impl Fixture {
         tcp: usize,
         udp: usize,
         fifo_batch: usize,
-        control_batch: usize,
-        hold_retire: bool,
+        options: ControlOptions,
     ) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [stack, peer] = [Side::A, Side::B].map(|side| {
@@ -164,7 +213,7 @@ impl Fixture {
         let (forward_events, from_network) = mpsc::channel();
         let (to_fifo, fifo_control) = mpsc::channel();
         let (retire, retired) = mpsc::channel();
-        let (retired, held_retire) = if hold_retire {
+        let (retired, held_retire) = if options.hold_retire {
             let (forward_retire, host_retired) = mpsc::channel();
             (host_retired, Some((retired, forward_retire)))
         } else {
@@ -175,7 +224,7 @@ impl Fixture {
                 socket_path: socket_path.clone(),
                 ingress: ingress.clone(),
                 max_record: 256,
-                max_sessions: 16,
+                max_sessions: options.max_sessions,
                 max_sockets: 64,
                 poll_ms: 1,
                 hello_timeout: WAIT,
@@ -189,14 +238,14 @@ impl Fixture {
         )
         .unwrap();
         let host = thread::spawn(move || host.run());
-        let fifo = Fifo::new(reader, 16, fifo_control, retire);
+        let fifo = Fifo::new(reader, options.max_sessions, fifo_control, retire);
         let network = Network::new(
             stack,
             fifo,
-            16,
+            options.max_sessions,
             NetworkConfig {
                 ingress_budget: BUDGET,
-                control_batch,
+                control_batch: options.batch,
                 fifo_batch,
             },
             operations,
@@ -317,6 +366,20 @@ impl Fixture {
                 how: EndHow::Lost,
             })
             .unwrap();
+    }
+
+    /// Inject a delayed terminal message from a previous occupant of a session slot.
+    pub fn queue_stale_end(&self, session: u64, how: EndHow) {
+        self.forward.send(ToNetwork::End { session, how }).unwrap();
+    }
+
+    /// Forward the host's real loss before opening the next session.
+    pub fn forward_lost(&mut self, session: u64) {
+        let message = self.control.recv_timeout(WAIT).unwrap();
+        assert!(matches!(
+            message, ToNetwork::End { session: id, how: EndHow::Lost } if id == session
+        ));
+        self.forward_message(message);
     }
 
     /// Hold the real FIFO completion until the test has queued its control bytes.

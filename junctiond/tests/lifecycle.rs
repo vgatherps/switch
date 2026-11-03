@@ -4,9 +4,11 @@ use std::time::Instant as WallInstant;
 
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
+use dpdk_smoltcp::smoltcp::wire::IpEndpoint;
 use junction::control::{
     ClientMessage, EndReason, Event, HostMessage, Op, RejectCode, SocketId, VERSION, WelcomeStatus,
 };
+use junction::host::EndHow;
 use zhida_test_kit::with_eal;
 
 mod support;
@@ -239,6 +241,130 @@ fn dropped_session_resets_established_tcp() {
         }
         assert!(fixture.peer.tcp(&peer).reset_by_peer());
         drop(peer);
+        fixture.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn stale_session_end_after_slot_reuse_does_not_touch_new_connection() {
+    with_eal(|eal| {
+        for how in [EndHow::Lost, EndHow::Abort] {
+            let mut fixture = Fixture::with_one_session(eal, ["lsea", "lseb"], 2);
+            let old = fixture.client(1);
+            let old_session = fixture.streams[0];
+            drop(old);
+            fixture.forward_lost(old_session);
+            fixture.network.iteration(fixture.now).unwrap();
+
+            let mut client = fixture.client(1);
+            let new_session = fixture.streams[1];
+            assert_eq!(ceph_proto::slot(old_session), ceph_proto::slot(new_session));
+            assert_ne!(ceph_proto::uid(old_session), ceph_proto::uid(new_session));
+            let mut events = Vec::new();
+            let (id, peer) = connect(&mut fixture, &mut client, &mut events, LOCAL_PORT);
+            // Only this late terminal message is injected; both sessions and the
+            // original Lost use the real control thread.
+            fixture.queue_stale_end(old_session, how);
+            fixture.round(&mut client, &mut events);
+            assert_eq!(
+                fixture.peer.tcp(&peer).state(),
+                State::Established,
+                "{how:?}"
+            );
+            assert!(!fixture.peer.tcp(&peer).reset_by_peer());
+            assert_eq!(events, [(id, Event::Connected)]);
+
+            client.close(id, false);
+            fixture.until(&mut client, &mut events, |f, events| {
+                events.contains(&(id, Event::Freed))
+                    && f.peer.tcp(&peer).state() == State::CloseWait
+            });
+            assert_eq!(events, [(id, Event::Connected), (id, Event::Freed)]);
+            assert!(!fixture.peer.tcp(&peer).reset_by_peer(), "{how:?}");
+            drop((client, peer));
+            fixture.close();
+        }
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn incoming_handshake_reset_keeps_listener_waiting_for_real_connection() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::new(eal, ["lhra", "lhrb"], 2, 1, 64);
+        let mut client = fixture.client(2);
+        let mut events = Vec::new();
+        // Resolve ARP with a refused connect, as in switchnet's accept reset test.
+        let probe = fixture.peer.add_tcp(support::peer_tcp_config()).unwrap();
+        fixture
+            .peer
+            .connect(
+                &probe,
+                IpEndpoint::new(support::net_ip().into(), 1),
+                PEER_PORT + 1,
+            )
+            .unwrap();
+        fixture.until(&mut client, &mut events, |f, _| {
+            f.peer.tcp(&probe).state() == State::Closed
+        });
+        fixture.peer.remove_tcp(probe);
+
+        let id = client.listen_tcp(tcp_config(), local(LOCAL_PORT)).unwrap();
+        assert!(matches!(fixture.wait_op(id), Op::ListenTcp { .. }));
+        fixture.round(&mut client, &mut events);
+        let endpoint = IpEndpoint::new(support::net_ip().into(), LOCAL_PORT);
+        let gone = fixture.peer.add_tcp(support::peer_tcp_config()).unwrap();
+        fixture.peer.connect(&gone, endpoint, PEER_PORT).unwrap();
+        fixture
+            .peer
+            .turn(fixture.now, zhida_test_kit::pair::BUDGET)
+            .unwrap();
+        assert_eq!(fixture.to_net.forward(), 1, "SYN");
+        zhida_test_kit::pair::assert_lossless(&fixture.to_net, "SYN");
+        fixture.network.iteration(fixture.now).unwrap();
+        assert_eq!(fixture.to_peer.forward(), 1, "SYN-ACK");
+        zhida_test_kit::pair::assert_lossless(&fixture.to_peer, "SYN-ACK");
+        // Forget the initiating socket before delivering SYN-ACK. The peer stack
+        // then generates a real RST, returning the host's SynReceived to Listen.
+        fixture.peer.remove_tcp(gone);
+        fixture
+            .peer
+            .turn(fixture.now, zhida_test_kit::pair::BUDGET)
+            .unwrap();
+        assert_eq!(fixture.to_net.forward(), 1, "RST");
+        zhida_test_kit::pair::assert_lossless(&fixture.to_net, "RST");
+        fixture.round(&mut client, &mut events);
+
+        // Bound is an ordered control-event fence, not a timed absence assertion.
+        let fence = client.bind_udp(support::udp_config(7000)).unwrap();
+        fixture.until(&mut client, &mut events, |_, events| {
+            events.contains(&(fence, Event::Bound))
+        });
+        assert_eq!(
+            events,
+            [(fence, Event::Bound)],
+            "reset handshake emitted an event"
+        );
+        client.close(fence, false);
+        fixture.until(&mut client, &mut events, |_, events| {
+            events.contains(&(fence, Event::Freed))
+        });
+        events.clear();
+
+        let peer = fixture.peer.add_tcp(support::peer_tcp_config()).unwrap();
+        fixture
+            .peer
+            .connect(&peer, endpoint, PEER_PORT + 2)
+            .unwrap();
+        fixture.until(&mut client, &mut events, |f, events| {
+            events.contains(&(id, Event::Connected))
+                && f.peer.tcp(&peer).state() == State::Established
+        });
+        assert_eq!(events, [(id, Event::Connected)]);
+        client.abort(id);
+        fixture.until(&mut client, &mut events, |f, events| {
+            events.contains(&(id, Event::Freed)) && f.peer.tcp(&peer).reset_by_peer()
+        });
+        drop((client, peer));
         fixture.close();
     });
 }
