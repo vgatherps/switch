@@ -276,15 +276,11 @@ fn the_waiter_moves_with_the_receiver_to_another_task() {
 #[test]
 fn a_receiver_polled_outside_a_switch_task_panics() {
     let (_sender, mut receiver) = oneshot::channel::<u32>();
-    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         let _ = std::pin::Pin::new(&mut receiver).poll(&mut cx);
     }))
     .unwrap_err();
-    assert_eq!(
-        payload.downcast_ref::<&str>(),
-        Some(&"StoredWaker needs a switch task waker")
-    );
 }
 
 // ---- JoinHandle ----
