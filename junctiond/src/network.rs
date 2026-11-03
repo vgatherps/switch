@@ -9,6 +9,7 @@
 //! message through dispatch; an unknown session first drains control through its queued
 //! Open. Sends from older socket generations are dropped; unopened or future generations
 //! are protocol errors. TCP backlogs delay shutdown and close, and outlive graceful retirement.
+//! Closed sockets with backlogs use the Stack's orphan retry limit even while held here.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -404,6 +405,11 @@ impl NetworkState {
         if !socket.backlog.is_empty()
             && matches!(op, Op::ShutdownTcp { .. } | Op::Close { unread: false, .. })
         {
+            if matches!(op, Op::Close { unread: false, .. })
+                && let Socket::Tcp { handle, .. } = &socket.socket
+            {
+                self.stack.tcp_mut(handle).limit_retries();
+            }
             if socket.deferred.is_none() || matches!(op, Op::Close { .. }) {
                 socket.deferred = Some(op);
             }
@@ -478,6 +484,9 @@ impl NetworkState {
             if let Some(index) = slot.host {
                 let socket = self.sockets[index as usize].as_mut().unwrap();
                 if graceful && !socket.backlog.is_empty() {
+                    if let Socket::Tcp { handle, .. } = &socket.socket {
+                        self.stack.tcp_mut(handle).limit_retries();
+                    }
                     socket.session = None;
                 } else {
                     self.remove_socket(index, !graceful);

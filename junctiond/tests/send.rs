@@ -185,6 +185,41 @@ fn tcp_send_in_flight_after_abort_drops_without_ending_session() {
 }
 
 #[zhida_test_support::pinned_test]
+fn plain_close_with_silent_peer_frees_backlogged_socket() {
+    with_eal(|eal| {
+        let mut f = Fixture::new(eal, ["jsrla", "jsrlb"], 2, 0, 256);
+        let mut client = f.client(1);
+        let mut events = Vec::new();
+        let (id, peer, _) = queued_send(&mut f, &mut client, &mut events);
+        client.close(id, false);
+        assert_eq!(f.wait_op(id), Op::Close { id, unread: false });
+        // Apply the close and start the data RTO, without turning the peer again.
+        f.network.iteration(f.now).unwrap();
+        for _ in 0..12 {
+            f.now += dpdk_smoltcp::smoltcp::time::Duration::from_secs(120);
+            f.network.iteration(f.now).unwrap();
+        }
+        // Forward the queued Freed event once, then poll only the control socket.
+        // Further network rounds would let ACKs drain an unlimited-retry backlog.
+        f.round(&mut client, &mut events);
+        let deadline = WallInstant::now() + WAIT;
+        while !events.contains(&(id, Event::Freed)) {
+            assert!(
+                WallInstant::now() < deadline,
+                "closed backlog kept retrying"
+            );
+            client
+                .poll_events(|id, event| events.push((id, event)))
+                .unwrap();
+            std::thread::yield_now();
+        }
+        f.peer.remove_tcp(peer);
+        drop(client);
+        f.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn stale_send_after_abort_and_slot_reuse_does_not_end_session() {
     with_eal(|eal| {
         let mut f = Fixture::new(eal, ["jsgna", "jsgnb"], 2, 0, 1);
