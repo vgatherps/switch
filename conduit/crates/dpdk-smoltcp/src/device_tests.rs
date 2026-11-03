@@ -1863,7 +1863,7 @@ fn tx_pool_exhausted_still_receives_then_transmit_recovers() {
         stage(&fixture, &mut device, b"received without a reply buffer");
         let held: Vec<Packet> =
             std::iter::from_fn(|| device.port.alloc_tx(device.port.frame_capacity())).collect();
-        assert_eq!(held.len(), 63);
+        assert_eq!(held.len(), device.port.tx_pool_count());
         assert!(device.transmit(NOW).is_none());
         let rx = device.receive(NOW).unwrap();
         assert_eq!(rx.into_buf().as_slice(), b"received without a reply buffer");
@@ -1883,7 +1883,7 @@ fn spare_serves_one_token_then_exhausted_pool_refuses_and_recovers() {
         drop(device.transmit(NOW).unwrap());
         let held: Vec<Packet> =
             std::iter::from_fn(|| device.port.alloc_tx(device.port.frame_capacity())).collect();
-        assert_eq!(held.len(), 62);
+        assert_eq!(held.len(), device.port.tx_pool_count() - 1);
         send(&mut device, b"from the spare");
         stage(&fixture, &mut device, b"received while the pool is empty");
         assert!(device.transmit(NOW).is_none());

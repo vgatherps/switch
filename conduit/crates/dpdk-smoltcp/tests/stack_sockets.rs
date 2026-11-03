@@ -296,7 +296,23 @@ fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
 fn arp_request_from_off_subnet_sender_is_answered_not_learned() {
     with_eal(|eal| {
         let fixture = RingPort::new("arpoff", 16, 16);
-        let mut stack = stack(fixture.open(eal), 1, 8);
+        let config = StackConfig {
+            max_udp_sockets: 0,
+            ethernet: OURS,
+            ipv4: Ipv4Cidr::new(OUR_IP, 24),
+            gateway: None,
+            paths: &[],
+            owned_ipv4: &[],
+            random_seed: 1,
+            neighbor_capacity: 8,
+            max_sockets: 1,
+            rx_staging: 8,
+            tx_pending: 8,
+        };
+        let mut stack = match Stack::new(fixture.open(eal), config, T0) {
+            Ok(stack) => stack,
+            Err((_, error)) => panic!("{error}"),
+        };
         fixture.inject(&[arp(
             ArpOperation::Request,
             EthernetAddress::BROADCAST,
