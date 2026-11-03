@@ -2,14 +2,15 @@
 //! `run` launching peer and client, and the peer/client stdin/stdout protocol
 //! driven by hand.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use memif_bench::matrix::{self, Outcome};
+use memif_bench::matrix::{self, Outcome, CONFIGS};
+use memif_bench::workload::Shape;
 
 const BIN: &str = env!("CARGO_BIN_EXE_memif-bench");
 /// Every child's run deadline, so the launcher's own bounds (ready 30 s +
@@ -338,7 +339,8 @@ fn matrix_dry_run_lists_balanced_order() {
     ];
     let cpu = cpu();
     let mut matrix = Proc::spawn(&args(&format!(
-        "matrix --reps 2 --dry-run --peer-cpu {cpu} --client-cpu {cpu} --control-cpu {cpu}"
+        "matrix --reps 2 --dry-run --peer-cpu {cpu} --client-cpu {cpu} --control-cpu {cpu} \
+         {RUN_TIMEOUT}"
     )));
     assert!(matrix.exit().success());
     let lines = drain(&matrix.lines);
@@ -356,11 +358,36 @@ fn matrix_dry_run_lists_balanced_order() {
         .chain(configs.iter().rev().map(|&config| ("1", config)))
         .collect();
     assert_eq!(planned, expected);
-    assert!(lines[0].ends_with(&format!(
-        "--shape pingpong --conns 1 --message 64 --rounds 100000 --warmup 10000 \
-         --peer-cpu {cpu} --client-cpu {cpu} --control-cpu {cpu} --run-timeout-s 120"
-    )));
-    assert!(lines[5].contains("--shape bulk --bytes 1073741824 --warmup 67108864"));
+    for line in &lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let flags: BTreeMap<&str, &str> = words[3..]
+            .chunks(2)
+            .map(|pair| (pair[0].strip_prefix("--").unwrap(), pair[1]))
+            .collect();
+        let get = |key: &str| flags[key].parse::<usize>().unwrap();
+        let shape = match flags["shape"] {
+            "pingpong" => Shape::PingPong {
+                conns: get("conns"),
+                message: get("message"),
+                rounds: get("rounds"),
+                warmup: get("warmup"),
+            },
+            "bulk" => Shape::Bulk {
+                bytes: get("bytes"),
+                warmup: get("warmup"),
+            },
+            other => panic!("shape {other} in {line}"),
+        };
+        let config = CONFIGS.iter().find(|(name, _)| *name == words[2]).unwrap();
+        assert_eq!(shape, config.1, "{line}");
+        for cpu_flag in ["peer-cpu", "client-cpu", "control-cpu"] {
+            assert_eq!(flags[cpu_flag], cpu, "{line}");
+        }
+        assert_eq!(
+            format!("--run-timeout-s {}", flags["run-timeout-s"]),
+            RUN_TIMEOUT
+        );
+    }
 }
 
 /// Socket inodes `pid` holds open: its `socket:[N]` links in /proc/<pid>/fd,
