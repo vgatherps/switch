@@ -99,6 +99,7 @@ impl Backing {
         Ok(())
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> io::Result<usize> {
         system::file_len(self.fd())
     }
