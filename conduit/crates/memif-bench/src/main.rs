@@ -1080,8 +1080,9 @@ mod tests {
         let Ok(Cmd::Run { socket, .. }) = parse(args(line)) else {
             panic!("{line}")
         };
-        assert_eq!(socket, format!("memif-bench-{}", process::id()));
-        assert!(socket.len() <= 100);
+        assert!(socket.contains(&process::id().to_string()), "{socket}");
+        assert!(!socket.contains([',', '=']), "{socket}");
+        assert!(socket.len() <= memif_bench::memif::MAX_SOCKET_NAME);
     }
 
     #[test]
