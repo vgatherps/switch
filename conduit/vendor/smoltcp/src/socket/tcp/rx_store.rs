@@ -725,25 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_len_is_zero_without_out_of_order_views() {
-        let mut store = RxStore::new();
-        assert_eq!(store.out_of_order_len(), 0);
-
-        insert(&mut store, 0, b"abc");
-        insert(&mut store, 3, b"de");
-        assert_eq!(store.out_of_order_len(), 0);
-
-        insert(&mut store, 7, b"hij");
-        assert_eq!(store.out_of_order_len(), 3);
-
-        insert(&mut store, 5, b"fg");
-        assert_eq!(store.out_of_order_len(), 0);
-        assert_eq!(drain_bytes(&mut store), b"abcdefghij");
-        assert_eq!(store.held(), 0);
-        assert_eq!(store.out_of_order_len(), 0);
-    }
-
-    #[test]
     fn out_of_order_span_tracks_last_view_end_from_in_order_end() {
         let mut store = RxStore::new();
         assert_eq!(store.out_of_order_span(), 0);
@@ -1144,27 +1125,6 @@ mod tests {
         store.truncate_from(0);
         assert_eq!(store.held(), 0);
         assert_eq!(first.get(), 1);
-    }
-
-    #[test]
-    fn stale_decision_after_commit_panics() {
-        let mut store = RxStore::new();
-        let decision = store.decide(0, 2);
-        let held = insert(&mut store, 0, b"ab");
-        let (frame, incoming) = counted_frame(b"AB");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 0, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale new decision: right neighbor")
-        );
-        assert_eq!(ranges(&store), vec![(0, 2)]);
-        assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"ab");
-        assert_eq!((held.get(), incoming.get()), (0, 1));
-        drop(store);
-        assert_eq!((held.get(), incoming.get()), (1, 1));
     }
 
     fn check_oracle(

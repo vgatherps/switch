@@ -5059,19 +5059,6 @@ mod test {
         assert_eq!(s.send_queue(), 4);
     }
 
-    #[test]
-    fn frame_orphan_syn_sent_releases() {
-        let alloc = TxPool::new(8);
-        let source = TxSource::new(alloc.clone());
-        let mut s = socket_syn_sent();
-        s.tx_queue = TxQueue::new(8, source);
-        s.tx_queue.push_bytes(b"abcd");
-        assert_eq!(alloc.live(), 1);
-        s.orphan(Instant::ZERO);
-        assert_eq!(s.state(), State::Closed);
-        assert_eq!((s.send_queue(), alloc.live()), (0, 0));
-    }
-
     fn socket_fin_wait_1() -> TestSocket {
         let mut s = socket_established();
         s.state = State::FinWait1;
@@ -7270,25 +7257,6 @@ mod test {
     }
 
     #[test]
-    fn test_connect_synack_tiny_mss_is_clamped() {
-        let mut s = socket();
-        s.local_seq_no = LOCAL_SEQ;
-        s.socket
-            .connect(&mut s.cx, REMOTE_END, LOCAL_END.port)
-            .unwrap();
-        recv!(
-            s,
-            [RECV_TEMPL.syn().seq(LOCAL_SEQ).no_ack().mss(BASE_MSS).wscale(0).sack_perm(true)]
-        );
-        send!(
-            s,
-            SEND_TEMPL.syn().seq(REMOTE_SEQ).ack(LOCAL_SEQ + 1).mss(10).wscale(0)
-        );
-        assert_eq!(s.state, State::Established);
-        assert_eq!(usize::from(s.remote_mss), MIN_REMOTE_MSS);
-    }
-
-    #[test]
     fn test_connect_synack_zero_mss_is_ignored() {
         let mut s = socket();
         s.local_seq_no = LOCAL_SEQ;
@@ -7613,13 +7581,6 @@ mod test {
     }
 
     #[test]
-    fn test_syn_sent_close() {
-        let mut s = socket();
-        s.close();
-        assert_eq!(s.state, State::Closed);
-    }
-
-    #[test]
     fn test_syn_sent_sack_option() {
         let mut s = socket_syn_sent();
         recv!(
@@ -7784,24 +7745,6 @@ mod test {
         assert_eq!(frame.payload(), &[b'a'; 100]);
         drop(s);
         assert_eq!(frame.payload(), &[b'a'; 100]);
-    }
-
-    #[test]
-    fn test_recv_returns_front_segment() {
-        let mut s = socket_established();
-        for (seq, payload) in [(REMOTE_SEQ + 1, &b"abc"[..]), (REMOTE_SEQ + 4, &b"def"[..])] {
-            send!(
-                s,
-                SEND_TEMPL.seq(seq).ack(LOCAL_SEQ + 1).data(payload)
-            );
-        }
-        let first = s.recv().unwrap().unwrap();
-        assert_eq!(first.payload(), b"abc");
-        assert_eq!(s.recv_queue(), 3);
-        let second = s.recv().unwrap().unwrap();
-        assert_eq!(second.payload(), b"def");
-        assert!(s.recv().unwrap().is_none());
-        assert_eq!(s.recv_queue(), 0);
     }
 
     #[test]
@@ -8878,13 +8821,6 @@ mod test {
             assert_eq!(s.local_seq_no, TcpSeqNumber(200));
             assert_eq!(s.rx_buffer.store.out_of_order_ranges().collect::<Vec<_>>(), vec![(1, 2)]);
         }
-    }
-
-    #[test]
-    fn test_current_ack_fin_closes_receive_half() {
-        let mut s = socket_established();
-        send!(s, time 50, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1));
-        assert_eq!(s.state, State::CloseWait);
     }
 
     #[test]

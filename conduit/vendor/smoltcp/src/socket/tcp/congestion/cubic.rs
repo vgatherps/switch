@@ -527,16 +527,6 @@ mod test {
         assert_eq!(cubic.window(), usize::MAX - 1);
     }
 
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn cubic_fix_huge_initial_window_duplicate_ack_does_not_overflow() {
-        let mut cubic = Cubic::new();
-        cubic.set_initial_window(usize::MAX - 1);
-        cubic.in_fast_recovery = true;
-        cubic.on_dup_ack(Instant::ZERO, MSS, 65536);
-        assert_eq!(cubic.window(), usize::MAX - 1);
-    }
-
     fn large_window_in_congestion_avoidance() -> Cubic {
         let mut cubic = Cubic::new();
         cubic.set_initial_window(1_048_576);

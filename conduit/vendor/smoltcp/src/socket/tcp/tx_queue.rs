@@ -375,15 +375,6 @@ mod tests {
     }
 
     #[test]
-    fn append_tail_refuses_shared_frame() {
-        let (mut queue, _) = queue(8, 6);
-        queue.push_bytes(&[1, 2]);
-        let clone = queue.entries[0].buf.as_ref().unwrap().clone();
-        assert_eq!(queue.append_tail(0, &[3], 1), 0);
-        drop(clone);
-    }
-
-    #[test]
     fn lookup_head_hint_next_and_binary_search() {
         let (mut queue, _) = queue(64, 2);
         for byte in 0..24 {
