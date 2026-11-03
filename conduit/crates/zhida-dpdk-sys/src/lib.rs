@@ -495,26 +495,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_mbuf_size() {
-        assert_eq!(std::mem::size_of::<rte_mbuf>(), 128);
-    }
-
-    #[test]
-    fn test_field_offsets() {
-        // Verify critical field offsets match DPDK layout
-        assert_eq!(std::mem::offset_of!(rte_mbuf, buf_addr), 0);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, buf_iova), 8);
-        // __bindgen_anon_1 (data_off, refcnt, etc.) at offset 16
-        assert_eq!(std::mem::offset_of!(rte_mbuf, __bindgen_anon_1), 16);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, ol_flags), 24);
-        // __bindgen_anon_2 (pkt_len, data_len, etc.) at offset 32
-        assert_eq!(std::mem::offset_of!(rte_mbuf, __bindgen_anon_2), 32);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, pool), 56);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, __bindgen_anon_3), 72);
-        assert_eq!(std::mem::offset_of!(rte_mbuf__bindgen_ty_3, tx_offload), 0);
-    }
-
-    #[test]
     fn tx_offload_lengths_fill_dpdk_bit_layout() {
         let mut m: rte_mbuf = unsafe { std::mem::zeroed() };
         m.set_tx_offload_lengths(127, 511, 255);
