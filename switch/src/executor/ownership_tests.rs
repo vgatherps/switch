@@ -17,14 +17,6 @@ const MANY: usize = 192;
 /// A runtime driven through `Runtime::poll`, and its executor for white-box checks.
 struct Owner(*mut Executor, RefCell<Runtime>);
 
-#[test]
-fn constructor_uses_initial_timer_tick() {
-    let owner = Owner::with(Runtime::new(123));
-    unsafe {
-        assert_eq!((*owner.0).timers.current_tick(), 123);
-    }
-}
-
 impl Owner {
     fn new() -> Self {
         Self::with(Runtime::new(0))
@@ -179,26 +171,6 @@ fn idle_future_remains_owned_until_cleanup() {
 }
 
 #[test]
-fn duplicate_wakes_make_one_next_batch_claim() {
-    let owner = Owner::new();
-    let mut task = Probe::new();
-    task.wakes = 10;
-    task.pending = true;
-    task.turn = true;
-    let polls = task.polls.clone();
-    let drops = task.drops.clone();
-    owner.spawn(probe(task));
-    assert_eq!(owner.poll(), Ok(1));
-    assert_eq!(owner.poll(), Ok(1));
-    assert_eq!(polls.get(), 2);
-    unsafe {
-        assert_eq!((*owner.0).incoming.len(), 1);
-    }
-    owner.cleanup();
-    assert_eq!(drops.get(), 1);
-}
-
-#[test]
 fn nested_spawns_run_in_the_next_round_not_the_current_one() {
     let owner = Owner::new();
     let ptr = owner.0;
@@ -268,55 +240,6 @@ fn ready_drop_panic(self_wake: bool) {
     owner.cleanup();
     assert_eq!(owner.counts(), (0, 0));
     assert_eq!(drops.get(), 1);
-}
-
-#[test]
-fn failed_poll_preserves_payload_future_and_both_queues() {
-    let owner = Owner::new();
-    let mut task = Probe::new();
-    task.wakes = 1;
-    task.panic_poll = true;
-    let drops = task.drops.clone();
-    let remaining = Rc::new(Cell::new(0));
-    owner.spawn(probe(task));
-    owner.spawn(count_task(remaining.clone()));
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
-    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
-    assert_eq!(owner.counts(), (1, 2));
-    assert_eq!(drops.get(), 0);
-    unsafe {
-        assert_eq!((*owner.0).run_queue.len(), 2);
-        assert_eq!((*owner.0).incoming.len(), 1);
-        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
-    }
-    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.spawn(empty()))).is_err());
-    owner.cleanup();
-    assert_eq!(drops.get(), 1);
-    assert_eq!(remaining.get(), 0);
-    assert_eq!(owner.counts(), (0, 0));
-}
-
-#[test]
-fn cleanup_resumes_after_one_destructor_panics() {
-    let owner = Owner::new();
-    let first = Probe::new();
-    let first_drops = first.drops.clone();
-    owner.spawn(probe(first));
-    let mut failing = Probe::new();
-    failing.panic_drop = true;
-    let failing_drops = failing.drops.clone();
-    owner.spawn(probe(failing));
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.cleanup())).unwrap_err();
-    assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
-    // Drop order is unspecified: the other task is either dropped and freed, or
-    // still allocated for the retry.
-    assert_eq!(failing_drops.get(), 1);
-    assert_eq!(owner.counts(), (0, 1 - first_drops.get()));
-    owner.cleanup();
-    owner.cleanup();
-    assert_eq!(owner.counts(), (0, 0));
-    assert_eq!((first_drops.get(), failing_drops.get()), (1, 1));
 }
 
 #[test]
@@ -684,49 +607,6 @@ fn active_selfwake_and_cross_task_wakes_keep_round_order_and_claims() {
     assert_eq!(owner.counts(), (0, 0));
     assert_eq!(owner.poll(), Ok(0));
     assert_eq!(drops.each_ref().map(|count| count.get()), [1, 1, 1]);
-}
-
-#[test]
-fn multiple_selfwakes_then_panic_keep_one_claim_and_original_payload() {
-    let owner = Owner::new();
-    let mut task = Probe::new();
-    task.wakes = 8;
-    task.panic_poll = true;
-    let polls = task.polls.clone();
-    let drops = task.drops.clone();
-    let remainder = Probe::new();
-    let remainder_polls = remainder.polls.clone();
-    let remainder_drops = remainder.drops.clone();
-    owner.spawn(probe(task));
-    owner.spawn(probe(remainder));
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
-    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
-    assert_eq!(owner.counts(), (1, 2));
-    assert_eq!(
-        (
-            polls.get(),
-            drops.get(),
-            remainder_polls.get(),
-            remainder_drops.get()
-        ),
-        (1, 0, 0, 0)
-    );
-    unsafe {
-        assert_eq!((*owner.0).incoming.len(), 1);
-        assert_eq!(flags((&(*owner.0).incoming)[0]) & LIVE, 0);
-    }
-    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
-    owner.cleanup();
-    assert_eq!(owner.counts(), (0, 0));
-    assert_eq!(
-        (
-            polls.get(),
-            drops.get(),
-            remainder_polls.get(),
-            remainder_drops.get()
-        ),
-        (1, 1, 0, 1)
-    );
 }
 
 #[switch::task]

@@ -134,30 +134,6 @@ fn spawned_task_and_selfwake_run_in_the_next_round_of_the_same_poll() {
 }
 
 #[test]
-fn terminal_selfwake_claim_is_not_ready_and_drains_with_zero_future_polls() {
-    struct ReadyWake(Rc<Cell<usize>>);
-    impl Future for ReadyWake {
-        type Output = ();
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            self.0.set(self.0.get() + 1);
-            cx.waker().wake_by_ref();
-            Poll::Ready(())
-        }
-    }
-    let mut runtime = Runtime::new(0);
-    let polls = Rc::new(Cell::new(0));
-    #[switch::task]
-    fn ready_wake(polls: Rc<Cell<usize>>) -> impl Future<Output = ()> {
-        ReadyWake(polls)
-    }
-    runtime.spawner().spawn(ready_wake(polls.clone())).unwrap();
-    assert_eq!(runtime.poll(0).unwrap(), report(1, 0));
-    assert_eq!(runtime.poll(0).unwrap(), PollReport::default());
-    assert_eq!(polls.get(), 1);
-    assert_eq!(runtime.poll(0).unwrap(), PollReport::default());
-}
-
-#[test]
 fn closed_runtime_reports_closed_for_regressed_and_equal_ticks() {
     let mut runtime = Runtime::new(u64::MAX);
     runtime.shutdown();

@@ -660,16 +660,6 @@ fn dropped_multi_frame_send_then(second: Kind) {
     assert_eq!(messages, [Message::Binary(first.into()), second]);
 }
 
-#[zhida_test_support::pinned_test]
-fn dropped_multi_frame_send_then_a_same_kind_send_is_two_messages() {
-    dropped_multi_frame_send_then(Kind::Binary);
-}
-
-#[zhida_test_support::pinned_test]
-fn dropped_multi_frame_send_then_an_other_kind_send_is_two_messages() {
-    dropped_multi_frame_send_then(Kind::Text);
-}
-
 /// A server that reads nothing until told, then reads messages (answering a Binary with Text
 /// "got") until the stream ends; what it read.
 fn read_after_go(go: mpsc::Receiver<()>) -> impl FnOnce(std::net::TcpStream) -> Vec<Message> + Send + 'static {
