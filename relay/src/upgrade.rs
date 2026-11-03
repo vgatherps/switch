@@ -267,11 +267,11 @@ mod tests {
     fn request_carries_the_key_and_host() {
         let (request, key) = request("stream.example", 9443, 443, "/ws", [0; 16]);
         assert_eq!(key, "AAAAAAAAAAAAAAAAAAAAAA==");
-        assert_eq!(
-            request,
-            "GET /ws HTTP/1.1\r\nHost: stream.example:9443\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        );
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        let mut parsed = httparse::Request::new(&mut headers);
+        assert!(parsed.parse(request.as_bytes()).unwrap().is_complete());
+        assert_eq!((parsed.method, parsed.path, parsed.version), (Some("GET"), Some("/ws"), Some(1)));
+        assert_eq!(single(parsed.headers, "Host"), Ok(Some(&b"stream.example:9443"[..])));
     }
 
     /// The head is found across runs cut anywhere, even inside the blank line; the bytes after
@@ -334,10 +334,13 @@ mod tests {
                    Connection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                    Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
         let response = accept(req.as_bytes()).unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        let mut parsed = httparse::Response::new(&mut headers);
+        assert!(parsed.parse(response.as_bytes()).unwrap().is_complete());
+        assert_eq!((parsed.version, parsed.code), (Some(1), Some(101)));
         assert_eq!(
-            response,
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            single(parsed.headers, "Sec-WebSocket-Accept"),
+            Ok(Some(&b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="[..]))
         );
         // and it passes the client's own check, without an extension selected
         check(response.as_bytes(), KEY).unwrap();

@@ -535,11 +535,6 @@ impl<L: PlainTx> TxCore<L> {
         self.out = Out::Large { kind, offset: 0 };
     }
 
-    #[cfg(test)]
-    pub(crate) fn buf_capacity(&self) -> usize {
-        self.buf.capacity()
-    }
-
     /// The accepted message is out: all of it sealed and taken by TCP.
     pub(crate) fn sent(&self) -> bool {
         self.out == Out::Idle && self.unsent.is_none()

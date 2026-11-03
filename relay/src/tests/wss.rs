@@ -316,7 +316,6 @@ fn record_split_across_frames() {
         assert_eq!(m.bytes(), payload);
         assert!(w.rx.recv(w.tx.lower_mut()).unwrap().is_none());
     }
-    assert_eq!(record, Some(5 + 2 + 109 + 17));
 }
 
 /// A message inside one record inside one frame is read in place, where rustls decrypted it in

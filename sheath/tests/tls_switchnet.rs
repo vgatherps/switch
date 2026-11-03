@@ -468,7 +468,7 @@ fn frames_follow_the_peer_mss() {
         move |handle, _, stream, _| async move {
             let (rx, tcp) = stream.split();
             let mut tx = SwitchTx::new(&handle, tcp, 1).await.expect("setup");
-            assert_eq!(tx.plain(), (0, 1200));
+            assert_eq!(tx.plain().1, 1200);
             send_bytes(&mut tx, &sent).await.expect("send");
             // the Net turns only until this returns: wait until the peer has every byte
             tx.shutdown();

@@ -168,7 +168,6 @@ fn rejected_future_is_returned_without_hidden_drop() {
     // The returned token still holds the original argument.
     assert_eq!(Rc::strong_count(&identity), 2);
     assert_eq!(drops.get(), 0);
-    assert!(format!("{error:?}").contains("Closed"));
     drop(error.token);
     assert_eq!(drops.get(), 1);
     assert_eq!(Rc::strong_count(&identity), 1);

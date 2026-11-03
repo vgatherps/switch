@@ -155,10 +155,10 @@ fn the_budget_is_checked_between_rounds() {
     for _ in 0..3 {
         runtime.spawner().spawn(spins(polls.clone())).unwrap();
     }
-    // 342 rounds of three reach 1026: the round that crosses 1024 completes.
+    // Rounds of three: the round that crosses the budget completes.
     let report = runtime.poll(0).unwrap();
-    assert_eq!(report.tasks_polled, 1026);
-    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1026);
+    assert_eq!(report.tasks_polled, POLL_BUDGET.div_ceil(3) * 3);
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, POLL_BUDGET.div_ceil(3) * 3);
 }
 
 // ---- Upgrading a deferred task ----
