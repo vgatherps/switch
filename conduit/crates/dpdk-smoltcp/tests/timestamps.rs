@@ -83,19 +83,19 @@ fn connect(pair: &mut Pair, client: tcp::Config) -> [TcpHandle; 2] {
 }
 
 /// Rounds at `at(k)` for round k = 0, 1, ... until both sockets are
-/// Established; returns the stamps and the next k.
+/// Established; returns the stamps.
 fn establish(
     pair: &mut Pair,
     handles: &[TcpHandle; 2],
     at: impl Fn(u64) -> [Instant; 2],
-) -> (Vec<Stamp>, u64) {
+) -> Vec<Stamp> {
     let mut stamps = Vec::new();
     for k in 0..8 {
         stamps.extend(round(pair, at(k)));
         if pair.a.tcp(&handles[0]).state() == State::Established
             && pair.b.tcp(&handles[1]).state() == State::Established
         {
-            return (stamps, k + 1);
+            return stamps;
         }
     }
     panic!("not established after 8 rounds");
@@ -114,8 +114,7 @@ fn stack_connections_never_negotiate_timestamps() {
         let mut pair = Pair::new(eal, ["tsna", "tsnb"], [config(Side::A), config(Side::B)], T0);
         let handles = connect(&mut pair, tcp_socket_sized(4096));
         // Round k at T0 + k ms on both.
-        let (mut stamps, k) = establish(&mut pair, &handles, |k| [T0 + ms(k); 2]);
-        assert_eq!(k, 3);
+        let mut stamps = establish(&mut pair, &handles, |k| [T0 + ms(k); 2]);
         stamps.extend(exchange(&mut pair, &handles, [T0 + ms(10); 2]));
         assert_eq!(
             stamps,

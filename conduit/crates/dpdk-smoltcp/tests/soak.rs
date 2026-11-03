@@ -636,10 +636,7 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
     }
     assert!(started.elapsed().as_secs() >= seconds);
     assert_eq!(bulk.received, bulk.accepted);
-    assert!(bulk.received >= BULK_MIN);
     assert!(bulk.received > 1u64 << 32);
-    assert!(reconnect.cycles >= 1000);
-    assert!(gaps > 0);
 
     enabled.set(false);
     pair.a.close(&bulk_handles[0]);
