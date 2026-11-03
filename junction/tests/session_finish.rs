@@ -198,6 +198,36 @@ fn finish_waits_for_control_output_then_flushes_before_end_record() {
     assert_eq!(host.end_records(), 0, "successful finish is idempotent");
 }
 
+// Linux rejects writes after the peer shuts down reading; macOS still accepts them.
+#[cfg(target_os = "linux")]
+#[test]
+fn control_write_failure_is_reported_without_read_eof() {
+    let (host, mut client) = RawHost::connect();
+    host.socket.shutdown(std::net::Shutdown::Read).unwrap();
+    // The host's write half remains open and has sent no further messages.
+    client
+        .poll_events(|_, _| panic!("unexpected event"))
+        .unwrap();
+    client
+        .listen_tcp(
+            TcpConfig {
+                rx_capacity: 1024,
+                tx_capacity: 1024,
+                mss_cap: None,
+            },
+            ListenEndpoint {
+                addr: None,
+                port: 1234,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        client.poll_events(|_, _| panic!("unexpected event")),
+        Err(Lost::Disconnected)
+    ));
+    assert!(!client.closed());
+}
+
 #[test]
 fn eof_after_finish_without_acknowledgement_is_lost() {
     let (host, mut client) = RawHost::connect();

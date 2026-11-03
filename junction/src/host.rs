@@ -794,6 +794,28 @@ mod tests {
     }
 
     #[test]
+    fn hangup_with_readable_protocol_error_aborts_instead_of_lost() {
+        let mut fixture = Fixture::new();
+        fixture
+            .client
+            .as_mut()
+            .unwrap()
+            .write_all(&[255; 8])
+            .unwrap();
+        drop(fixture.client.take());
+        fixture.host.disconnect(0);
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Abort } if session == pack(0, 1)
+        ));
+        assert!(
+            fixture.network.try_recv().is_err(),
+            "must not also send Lost"
+        );
+        assert!(fixture.host.connections.is_empty());
+    }
+
+    #[test]
     fn hangup_forwards_readable_ops_before_lost_end() {
         let mut fixture = Fixture::new();
         let count = fixture.write_ops();
