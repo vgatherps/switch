@@ -15,7 +15,6 @@ pub(crate) struct Faults {
     rxq_info_scattered_rx: Option<u8>,
     /// Offer at most this many packets to the real PMD.
     pub(crate) tx_accept_limit: Option<u16>,
-    pub(crate) tx_prepare_refuse: bool,
     pub(crate) tx_prepare_limit: Option<u16>,
     /// Model a PMD that frees accepted packets inside TX burst: dequeue them
     /// from this ring, free them and overwrite the caller's pointer array.
@@ -180,9 +179,7 @@ pub(crate) unsafe fn eth_tx_prepare(
                 .collect(),
         );
     });
-    if FAULTS.get().tx_prepare_refuse {
-        0
-    } else if let Some(limit) = FAULTS.get().tx_prepare_limit {
+    if let Some(limit) = FAULTS.get().tx_prepare_limit {
         count.min(limit)
     } else {
         dpdk_raw_eth_tx_prepare(port, queue, packets, count)

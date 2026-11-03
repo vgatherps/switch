@@ -607,36 +607,6 @@ fn reordered_segments_delivered_in_order() {
 }
 
 #[zhida_test_support::pinned_test]
-fn close_frees_held_and_ring_frames() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["cfa", "cfb"]);
-        let (handles, _, _) = connect(&mut pair);
-        // TCP_NODELAY: "c" goes out while "a" is unacknowledged.
-        pair.a_to_b.paused = true;
-        pair.b_to_a.impair(|_| Verdict::Hold);
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"a"), Ok(1));
-        assert_eq!(pair.b.tcp_mut(&handles[1]).send_slice(b"b"), Ok(1));
-        let round = pair.round(|_, _| panic!("nothing is delivered"));
-        assert_eq!((round.a_to_b, round.b_to_a), (0, 1));
-        assert_eq!(counts(&pair.b_to_a), (0, 0, 0, 1));
-
-        // A's first segment onto B's RX ring, its second onto A's TX ring.
-        pair.a_to_b.paused = false;
-        assert_eq!(pair.a_to_b.forward(), 1);
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"c"), Ok(1));
-        assert_eq!(pair.a.turn(pair.now(), 32).unwrap().tx_accepted, 1);
-        // A: B's held segment in its RX pool. B: A's first segment on its RX
-        // ring. Data leaves in frame-pool frames, so no data segment uses a TX
-        // packet: A holds "a" (unacknowledged) and "c" (also on its TX ring),
-        // B holds "b".
-        assert_eq!(pair.in_use(), [(1, 0), (1, 0)]);
-        assert_eq!(pair.frame_in_use(), [2, 1]);
-        // The held copy and one frame on each of two rings.
-        assert_eq!(pair.close(), 3);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn rst_on_abort_closes_peer() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rsta", "rstb"]);

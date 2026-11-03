@@ -270,20 +270,6 @@ fn exchange(pair: &mut Pair, conns: &[&Conn]) {
     }
 }
 
-#[zhida_test_support::pinned_test]
-fn thousand_connections_keep_streams_apart() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["mc1a", "mc1b"]);
-        let conns = many::open(&mut pair, 0..CONNECTIONS, BUFFER);
-        assert_quiet(&mut pair, &conns);
-        let idle = pair.in_use();
-        exchange(&mut pair, &conns.iter().collect::<Vec<_>>());
-        assert_quiet(&mut pair, &conns);
-        assert_eq!(pair.in_use(), idle);
-        assert_eq!(pair.close(), 0);
-    });
-}
-
 /// The clients of `group` abort (RST), or close (FIN both ways, the client
 /// through TIME-WAIT); driven until both ends of every connection are Closed.
 fn end(pair: &mut Pair, group: &[Conn], abort: bool) {

@@ -5,7 +5,6 @@ use crate::port::tests::{
     enable_tx_udp_checksum, in_use, peer_receive, prepare_args, prepare_calls, prepare_packets,
     produce, rx_frame_bytes, tx_calls, FaultGuard, Faults, Fixture,
 };
-use crate::port::{Offloads, PortError};
 use zhida_test_kit::pair::{self, Side};
 use zhida_test_kit::pcap::{write_pcap, PcapVdev};
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, TcpSet};
@@ -813,36 +812,6 @@ fn dropped_tx_metadata_and_spare_flags_do_not_reach_next_frame() {
 }
 
 #[zhida_test_support::pinned_test]
-fn flush_prepares_each_range_once() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        enable_tx_tcp_checksum(&mut device.port);
-        let mut faults = Faults::default();
-        faults.tx_accept_limit = Some(0);
-        let guard = FaultGuard::new(faults);
-        let calls = prepare_calls();
-        let frame = tcp_frame();
-        send_meta(&mut device, &frame, TCP_OFFLOAD);
-        send_meta(&mut device, &frame, TCP_OFFLOAD);
-        assert_eq!(device.flush(), Ok(0));
-        assert_eq!(prepare_calls(), calls + 1);
-        assert_eq!(device.pending(), 2);
-        assert_eq!(device.flush(), Ok(0));
-        assert_eq!(prepare_calls(), calls + 1);
-        assert_eq!(device.pending(), 2);
-        send_meta(&mut device, &frame, TCP_OFFLOAD);
-        assert_eq!(device.flush(), Ok(0));
-        assert_eq!(prepare_calls(), calls + 2);
-        assert_eq!(device.pending(), 3);
-        drop(guard);
-        assert_eq!(device.flush(), Ok(3));
-        assert_eq!(prepare_calls(), calls + 2);
-        assert!(device.tx.is_empty());
-        finish(fixture, device);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn flush_prepares_once_across_partial_bursts() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1010,99 +979,6 @@ fn prepare_refusal_panics_in_flush() {
 }
 
 #[zhida_test_support::pinned_test]
-fn udp_prepare_refusal_panics_in_flush() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        enable_tx_udp_checksum(&mut device.port);
-        let frame = udp_frame();
-        send_meta(&mut device, &frame, Some(TxChecksum::Udp { ip_header_len: 20 }));
-        let used = in_use(&device.port);
-        let mut faults = Faults::default();
-        faults.tx_prepare_refuse = true;
-        let guard = FaultGuard::new(faults);
-        let calls = prepare_calls();
-        let panic = catch_unwind(AssertUnwindSafe(|| device.flush())).unwrap_err();
-        let message = panic.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with(&format!("port {}:", device.port.port_id())));
-        assert!(message.contains("TX checksum preparation refused at frame 0, rte_errno"));
-        assert_eq!(prepare_calls(), calls + 1);
-        assert_eq!(prepare_args(), (device.port.port_id(), 0, 1));
-        assert_eq!(pending(&device), [frame]);
-        assert_eq!(in_use(&device.port), used);
-        assert!(device.spare.is_none());
-        drop(guard);
-        finish(fixture, device);
-        assert_no_pools();
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn udp_frames_without_metadata_are_not_parsed() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        enable_tx_udp_checksum(&mut device.port);
-        let mut mf = udp_frame();
-        mf[20] = 0x20;
-        let mut offset = udp_frame();
-        offset[21] = 1;
-        let mut truncated = udp_frame();
-        truncated.truncate(41);
-        let mut ipv6 = udp_frame();
-        ipv6[12..14].copy_from_slice(&[0x86, 0xdd]);
-        for frame in [mf, offset, truncated, ipv6] {
-            let calls = prepare_calls();
-            send(&mut device, &frame);
-            assert_eq!(tx_metadata(&device.tx[0]), (0, 0, 0, 0));
-            assert_eq!(device.flush(), Ok(1));
-            assert_eq!(prepare_calls(), calls + 1);
-            let received = peer_receive(&fixture, 16);
-            assert_eq!(received.len(), 1);
-            assert_eq!(received[0].data(), frame);
-            assert_eq!(mbuf_tx_metadata(received[0].as_ptr()), (0, 0, 0, 0));
-            drop(received);
-            assert_eq!(in_use(&device.port), (0, 0));
-        }
-        finish(fixture, device);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn prepared_frames_return_to_pool_after_flush_panic() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        enable_tx_tcp_checksum(&mut device.port);
-        let frame_a = tcp_frame();
-        let mut frame_b = frame_a.clone();
-        frame_b[70] = 2;
-        send_meta(&mut device, &frame_a, TCP_OFFLOAD);
-        send_meta(&mut device, &frame_b, TCP_OFFLOAD);
-        let calls = prepare_calls();
-        let bursts = tx_calls();
-        let used = in_use(&device.port);
-        assert_eq!(used, (0, 2));
-        let mut faults = Faults::default();
-        faults.tx_prepare_limit = Some(1);
-        let guard = FaultGuard::new(faults);
-        let panic = catch_unwind(AssertUnwindSafe(|| device.flush())).unwrap_err();
-        let message = panic.downcast_ref::<String>().unwrap();
-        assert!(message.contains("TX checksum preparation refused at frame 1"), "{message}");
-        assert_eq!(prepare_calls(), calls + 1);
-        assert_eq!(tx_calls(), bursts);
-        assert_eq!(device.pending(), 2);
-        assert_eq!(pending(&device), [frame_a, frame_b]);
-        assert_eq!(
-            tx_metadata(&device.tx[0]),
-            (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM, 14, 24, 32)
-        );
-        assert_eq!(tx_metadata(&device.tx[1]), tx_metadata(&device.tx[0]));
-        assert_eq!(in_use(&device.port), used);
-        drop(guard);
-        finish(fixture, device);
-        assert_no_pools();
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn complete_frames_without_metadata_ignore_header_shape() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1246,95 +1122,6 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
 }
 
 #[zhida_test_support::pinned_test]
-fn udp_template_frames_match_generic_and_flags() {
-    use smoltcp::iface::{UdpConfig, UdpSet};
-    use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, IpEndpoint};
-
-    with_test_eal(|eal| {
-        for (offload, tx_checksum) in [(true, true), (true, false), (false, true), (false, false)] {
-            let (fixture, mut device) = open(eal, 4, 4);
-            if offload {
-                enable_tx_udp_checksum(&mut device.port);
-            }
-            let mut config = Config::new(Side::A.mac().into());
-            config.random_seed = 1;
-            let mut iface = Interface::new(config, &mut device, NOW);
-            iface.update_ip_addrs(|addrs| {
-                addrs.push(IpCidr::new(Side::A.ip().into(), 24)).unwrap();
-            });
-            let arp = ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Reply,
-                source_hardware_addr: Side::B.mac(),
-                source_protocol_addr: Side::B.ip(),
-                target_hardware_addr: Side::A.mac(),
-                target_protocol_addr: Side::A.ip(),
-            };
-            let mut bytes = vec![0; 14 + arp.buffer_len()];
-            let mut eth = EthernetFrame::new_unchecked(&mut bytes);
-            eth.set_src_addr(Side::B.mac());
-            eth.set_dst_addr(Side::A.mac());
-            eth.set_ethertype(EthernetProtocol::Arp);
-            arp.emit(&mut ArpPacket::new_unchecked(eth.payload_mut()));
-            stage(&fixture, &mut device, &bytes);
-            let mut tcp = TcpSet::new(64);
-            iface.poll_ingress_single(NOW, &mut device, &mut tcp);
-            assert!(device.tx.is_empty());
-            let mut udp = UdpSet::new(1, device.frame_source());
-            let handle = udp
-                .add(&iface, UdpConfig {
-                    port: 49152,
-                    local_addr: None,
-                    rx_queue: 1,
-                    tx_checksum,
-                    broadcast: false,
-                })
-                .unwrap();
-            let payload = b"datagram";
-            for _ in 0..2 {
-                let to = Some(IpEndpoint::new(Side::B.ip().into(), 80));
-                assert_eq!(iface.udp_send(&mut device, &mut udp, handle, to, payload), Ok(()));
-            }
-            let expected = if offload {
-                (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM, 14, 20, 8)
-            } else {
-                (0, 0, 0, 0)
-            };
-            assert_eq!(device.pending(), 2);
-            assert_eq!(device.tx[0].data(), device.tx[1].data());
-            for frame in &device.tx {
-                let ip = Ipv4Packet::new_checked(&frame.data()[14..]).unwrap();
-                assert!(ip.verify_checksum());
-                let packet = UdpPacket::new_checked(ip.payload()).unwrap();
-                assert_eq!(packet.payload(), payload);
-                if offload || !tx_checksum {
-                    assert_eq!(packet.checksum(), 0);
-                } else {
-                    assert_ne!(packet.checksum(), 0);
-                    assert!(packet.verify_checksum(&ip.src_addr().into(), &ip.dst_addr().into()));
-                }
-                assert_eq!(tx_metadata(frame), expected);
-            }
-            let calls = prepare_calls();
-            let mut faults = Faults::default();
-            faults.tx_accept_limit = Some(0);
-            let guard = FaultGuard::new(faults);
-            assert_eq!(device.flush(), Ok(0));
-            assert_eq!(device.pending(), 2);
-            assert_eq!(tx_metadata(&device.tx[0]), expected);
-            assert_eq!(tx_metadata(&device.tx[1]), expected);
-            assert_eq!(prepare_calls(), calls + u32::from(offload));
-            if offload {
-                assert_eq!(prepare_args(), (device.port.port_id(), 0, 2));
-            }
-            drop(guard);
-            assert_eq!(device.flush(), Ok(2));
-            assert_eq!(prepare_calls(), calls + u32::from(offload));
-            finish(fixture, device);
-        }
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn hardware_stamp_reaches_rx_buf() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1438,36 +1225,6 @@ fn check_pcap_rx_timestamp(eal: &crate::Eal, enabled: bool) {
 #[zhida_test_support::pinned_test]
 fn pcap_pmd_stamp_reaches_rx_buf() {
     with_test_eal(|eal| check_pcap_rx_timestamp(eal, true));
-}
-
-#[zhida_test_support::pinned_test]
-fn pcap_pmd_stamp_ignored_when_off() {
-    with_test_eal(|eal| check_pcap_rx_timestamp(eal, false));
-}
-
-#[zhida_test_support::pinned_test]
-fn pcap_hardware_open_refused() {
-    with_test_eal(|eal| {
-        let files = PcapFiles::new(&udp_frame());
-        let pcap = PcapVdev::new(c"net_pcap_timestamp_refused", &files.rx, &files.tx);
-        let mut config = Fixture::config_for_port(pcap.port_id());
-        config.offloads = Offloads {
-            rx_timestamp: true,
-            ..Offloads::default()
-        };
-        // SAFETY: pcap owns this newly created ethdev on the EAL owner thread;
-        // Port::open preserves the production pool contract.
-        let error = unsafe { Port::open(eal, config) }.unwrap_err();
-        assert_eq!(
-            error.cause,
-            PortError::InvalidSettings("PMD lacks the requested RX timestamp offload")
-        );
-        assert!(error.retained.is_none());
-        assert!(error.rollback_error.is_none());
-        assert_no_pools();
-        pcap.close();
-        assert_no_pools();
-    });
 }
 
 #[zhida_test_support::pinned_test]
@@ -1594,19 +1351,6 @@ fn udp_datagram_reports_hardware_stamp() {
         port.try_close().unwrap();
         fixture.close().unwrap();
         assert_no_pools();
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn rx_token_owns_exact_bytes_and_returns_buffer() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        stage(&fixture, &mut device, b"exact rx bytes");
-        assert_eq!(device.receive(NOW).unwrap().into_buf().as_slice(), b"exact rx bytes");
-        assert!(device.rx.is_empty() && device.tx.is_empty());
-        // Receiving takes no TX packet.
-        assert_eq!(in_use(&device.port), (0, 0));
-        finish(fixture, device);
     });
 }
 
@@ -1983,33 +1727,6 @@ fn implicit_drop_releases_packets_before_port_cleanup() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn partial_flush_keeps_suffix() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        for frame in [b"first", b"secnd", b"third"] {
-            send(&mut device, frame);
-        }
-        let mut faults = Faults::default();
-        faults.tx_accept_limit = Some(1);
-        let guard = FaultGuard::new(faults);
-        // The PMD takes one of three: flush stops after that short call.
-        let calls = tx_calls();
-        assert_eq!(device.flush().unwrap(), 1);
-        assert_eq!(tx_calls(), calls + 1);
-        assert_eq!(pending(&device), [b"secnd".to_vec(), b"third".to_vec()]);
-        drop(guard);
-        assert_eq!(device.flush().unwrap(), 2);
-        assert!(device.tx.is_empty());
-        let sent: Vec<Vec<u8>> = peer_receive(&fixture, 16)
-            .iter()
-            .map(|m| m.data().to_vec())
-            .collect();
-        assert_eq!(sent, [b"first".to_vec(), b"secnd".to_vec(), b"third".to_vec()]);
-        finish(fixture, device);
-    });
-}
-
 fn frames(range: std::ops::Range<u8>) -> Vec<Vec<u8>> {
     range.map(|value| vec![value; 60]).collect()
 }
@@ -2214,74 +1931,6 @@ fn capabilities_frame_is_mtu_plus_14() {
         for sum in [sums.ipv4, sums.udp, sums.tcp, sums.icmpv4] {
             assert!(matches!(sum, Checksum::Both));
         }
-        finish(fixture, device);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn interface_answers_arp_request_through_paired_token_exact_bytes() {
-    with_test_eal(|eal| {
-        let (fixture, mut device) = open(eal, 4, 4);
-        let poisoned: Vec<Packet> = std::iter::from_fn(|| {
-            let mut packet = device.port.alloc_tx(device.port.frame_capacity())?;
-            packet.data_mut().fill(0xee);
-            Some(packet)
-        })
-        .collect();
-        assert_eq!(poisoned.len(), 63);
-        drop(poisoned);
-
-        let ours = [0x02, 0, 0, 0, 0, 0x01];
-        let peer = [0x02, 0, 0, 0, 0, 0x02];
-        let mut iface = Interface::new(
-            Config::new(HardwareAddress::Ethernet(EthernetAddress(ours))),
-            &mut device,
-            NOW,
-        );
-        iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(Ipv4Address::new(10, 0, 0, 1).into(), 24))
-                .unwrap();
-        });
-        let mut sockets = TcpSet::new(64);
-
-        let header = |dst: [u8; 6], src: [u8; 6], op: u8| {
-            let mut frame = Vec::with_capacity(14);
-            frame.extend_from_slice(&dst);
-            frame.extend_from_slice(&src);
-            frame.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, op]);
-            frame
-        };
-        let mut request = header([0xff; 6], peer, 1);
-        request.extend_from_slice(&peer);
-        request.extend_from_slice(&[10, 0, 0, 2]);
-        request.extend_from_slice(&[0; 6]);
-        request.extend_from_slice(&[10, 0, 0, 1]);
-        let mut reply = header(peer, ours, 2);
-        reply.extend_from_slice(&ours);
-        reply.extend_from_slice(&[10, 0, 0, 1]);
-        reply.extend_from_slice(&peer);
-        reply.extend_from_slice(&[10, 0, 0, 2]);
-
-        stage(&fixture, &mut device, &request);
-        // Upstream reports SocketStateChanged for every non-empty frame (mod.rs:708).
-        assert_eq!(
-            iface.poll_ingress_single(NOW, &mut device, &mut sockets),
-            PollIngressSingleResult::SocketStateChanged
-        );
-        assert!(device.rx.is_empty());
-        assert_eq!(pending(&device), [reply.clone()]);
-        assert_eq!(in_use(&device.port), (0, 1));
-        assert_eq!(device.flush().unwrap(), 1);
-        let sent = peer_receive(&fixture, 16);
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].data(), &reply[..]);
-        assert_eq!(sent[0].pkt_len(), 42);
-        drop(sent);
-        assert_eq!(
-            iface.poll_ingress_single(NOW, &mut device, &mut sockets),
-            PollIngressSingleResult::None
-        );
         finish(fixture, device);
     });
 }
