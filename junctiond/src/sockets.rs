@@ -10,7 +10,7 @@ use dpdk_smoltcp::{
 use junction::control::{Event, ListenEndpoint, Op, RejectCode, SocketId, TcpConfig};
 use junction::host::{FromNetwork, SessionId};
 use junction::rx::{TCP, UDP};
-use slice_ringbuffer::RingWriter;
+use slice_ringbuffer::{PacketMeta, RingWriter};
 
 pub(crate) enum Socket {
     Tcp {
@@ -243,29 +243,35 @@ impl HostSocket {
                     frame.payload()
                 }
             };
-            let Some(mut reserved) = rx.reserve(payload.len()) else {
+            let meta = match &frame {
+                HeldRx::Tcp { frame, .. } => PacketMeta::new(
+                    self.id.slot,
+                    self.id.generation,
+                    TCP,
+                    [0; 4],
+                    0,
+                    [0; 4],
+                    frame.rx_timestamp(),
+                ),
+                HeldRx::Udp(frame) => {
+                    let dpdk_smoltcp::smoltcp::wire::IpAddress::Ipv4(src) = frame.src().addr;
+                    PacketMeta::new(
+                        self.id.slot,
+                        self.id.generation,
+                        UDP,
+                        src.octets(),
+                        frame.src().port,
+                        frame.dst_addr().octets(),
+                        frame.rx_timestamp(),
+                    )
+                }
+            };
+            let Some(mut reserved) = rx.reserve(payload.len(), meta) else {
                 self.held_rx = Some(frame);
                 break;
             };
             let len = payload.len();
             reserved.payload().copy_from_slice(payload);
-            let meta = reserved.meta();
-            meta.slot = self.id.slot;
-            meta.generation = self.id.generation;
-            match &frame {
-                HeldRx::Tcp { frame, .. } => {
-                    meta.kind = TCP;
-                    meta.rx_timestamp = frame.rx_timestamp();
-                }
-                HeldRx::Udp(frame) => {
-                    meta.kind = UDP;
-                    meta.rx_timestamp = frame.rx_timestamp();
-                    let dpdk_smoltcp::smoltcp::wire::IpAddress::Ipv4(src) = frame.src().addr;
-                    meta.src_addr = src.octets();
-                    meta.src_port = frame.src().port;
-                    meta.dst_addr = frame.dst_addr().octets();
-                }
-            }
             reserved.commit();
             if let HeldRx::Tcp { frame: tcp, offset } = &mut frame {
                 *offset += len;

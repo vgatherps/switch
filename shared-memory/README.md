@@ -8,6 +8,9 @@ Unix backing ownership and single/double mappings used by `ceph-ring` and
 - `resize`, `len`, `page_size`, `fd`, `name`: backing operations. `unlink` removes
   an owned name once; drop removes it if still owned. Openers cannot unlink it.
   Closing descriptors or unlinking names does not invalidate existing mappings.
+  `allocate(len)` reserves `[0, len)` with checked `posix_fallocate` on Linux;
+  macOS uses `resize`. RX rings allocate before mapping so filesystem exhaustion
+  is returned as an error rather than a later mapping fault.
 - `Mapping::new` / `read_only`: map a nonzero file extent at a page-aligned offset.
   `len` is the requested usable length; ownership covers the page-rounded mapping.
 - `DoubleMapping::new(fd, offset, len, populate)`: map the same extent twice at

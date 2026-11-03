@@ -1291,10 +1291,20 @@ fn poll_discards_packets_for_aborted_socket_generation_after_reopen() {
     let mut writers = host.rx.borrow_mut();
     let (_, writer) = writers.iter_mut().find(|(id, _)| *id == session).unwrap();
     for (id, payload) in [(old, b"old".as_slice()), (current, b"current".as_slice())] {
-        let mut record = writer.reserve(payload.len()).unwrap();
-        record.meta().slot = id.slot;
-        record.meta().generation = id.generation;
-        record.meta().kind = junction::rx::TCP;
+        let mut record = writer
+            .reserve(
+                payload.len(),
+                junction::rx::PacketMeta::new(
+                    id.slot,
+                    id.generation,
+                    junction::rx::TCP,
+                    [0; 4],
+                    0,
+                    [0; 4],
+                    0,
+                ),
+            )
+            .unwrap();
         record.payload().copy_from_slice(payload);
         record.commit();
     }

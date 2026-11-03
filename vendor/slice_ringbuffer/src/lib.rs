@@ -55,6 +55,30 @@ pub struct PacketMeta {
     pub rx_timestamp: u64,
 }
 
+impl PacketMeta {
+    pub fn new(
+        slot: u32,
+        generation: u32,
+        kind: u8,
+        src_addr: [u8; 4],
+        src_port: u16,
+        dst_addr: [u8; 4],
+        rx_timestamp: u64,
+    ) -> Self {
+        Self {
+            slot,
+            generation,
+            kind,
+            _pad0: [0; 3],
+            src_addr,
+            src_port,
+            _pad1: 0,
+            dst_addr,
+            rx_timestamp,
+        }
+    }
+}
+
 const _: () = {
     assert!(size_of::<RingHeader>() <= 4096);
     assert!(offset_of!(RingHeader, magic) == 0);
@@ -117,7 +141,7 @@ impl RingWriter {
         let file_len = page.checked_add(size).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "ring file length overflows")
         })?;
-        backing.resize(file_len)?;
+        backing.allocate(file_len)?;
         let header = Mapping::new(backing.fd(), 0, page)?;
         let data = DoubleMapping::new(backing.fd(), page, size, true)?;
         // SAFETY: a fresh, page-aligned mapping has room for RingHeader; no reader
@@ -147,7 +171,7 @@ impl RingWriter {
 
     /// Returns an unpublished record, or None when the ring is full.
     /// Panics if len exceeds max_payload().
-    pub fn reserve(&mut self, len: usize) -> Option<Reserved<'_>> {
+    pub fn reserve(&mut self, len: usize, meta: PacketMeta) -> Option<Reserved<'_>> {
         assert!(len <= self.max_payload(), "payload exceeds ring capacity");
         let required = stride(len) as u64;
         if self.size as u64 - self.head.wrapping_sub(self.cached_tail) < required {
@@ -176,17 +200,7 @@ impl RingWriter {
             ptr.write(RecordHeader {
                 refs: AtomicU32::new(1),
                 len: len as u32,
-                meta: PacketMeta {
-                    slot: 0,
-                    generation: 0,
-                    kind: 0,
-                    _pad0: [0; 3],
-                    src_addr: [0; 4],
-                    src_port: 0,
-                    _pad1: 0,
-                    dst_addr: [0; 4],
-                    rx_timestamp: 0,
-                },
+                meta,
             });
             NonNull::new_unchecked(ptr)
         };
@@ -206,11 +220,6 @@ pub struct Reserved<'a> {
 }
 
 impl Reserved<'_> {
-    pub fn meta(&mut self) -> &mut PacketMeta {
-        // SAFETY: the exclusive writer borrow owns this unpublished record.
-        unsafe { &mut self.record.as_mut().meta }
-    }
-
     pub fn payload(&mut self) -> &mut [u8] {
         // SAFETY: the reserved stride owns exactly len payload bytes contiguously;
         // the exclusive borrow prevents simultaneous header/payload access.

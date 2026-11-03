@@ -99,6 +99,26 @@ impl Backing {
         Ok(())
     }
 
+    /// Reserves storage for [0, len) before a mapping can fault in its pages.
+    /// macOS POSIX shared memory supports resizing only.
+    pub fn allocate(&self, len: usize) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let len = libc::off_t::try_from(len)
+                .map_err(|_| system::invalid_input("backing length is out of range"))?;
+            // SAFETY: fd is open and the requested extent is representable.
+            let error = unsafe { libc::posix_fallocate(self.fd.as_raw_fd(), 0, len) };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.resize(len)
+        }
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> io::Result<usize> {
         system::file_len(self.fd())

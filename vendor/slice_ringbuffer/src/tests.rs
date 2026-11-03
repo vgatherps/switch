@@ -13,8 +13,12 @@ fn ring() -> (Backing, Backing, RingWriter, RingReader) {
     (producer, consumer, writer, reader)
 }
 
+fn meta(slot: u32) -> PacketMeta {
+    PacketMeta::new(slot, 0, 0, [0; 4], 0, [0; 4], 0)
+}
+
 fn publish(writer: &mut RingWriter, len: usize, value: u8) {
-    let mut record = writer.reserve(len).unwrap();
+    let mut record = writer.reserve(len, meta(0)).unwrap();
     record.payload().fill(value);
     record.commit();
 }
@@ -26,7 +30,7 @@ fn record_crosses_physical_end_as_one_slice() {
     drop(reader.next().unwrap());
     reader.reclaim();
     let expected: Vec<_> = (0..160).map(|i| i as u8).collect();
-    let mut record = writer.reserve(expected.len()).unwrap();
+    let mut record = writer.reserve(expected.len(), meta(0)).unwrap();
     record.payload().copy_from_slice(&expected);
     record.commit();
     let frame = reader.next().unwrap();
@@ -46,10 +50,10 @@ fn reclaim_only_releases_contiguous_prefix() {
     drop(b);
     drop(c);
     reader.reclaim();
-    assert!(writer.reserve(0).is_none(), "held A must block all reuse");
+    assert!(writer.reserve(0, meta(0)).is_none(), "held A must block all reuse");
     drop(a);
     reader.reclaim();
-    assert!(writer.reserve(writer.max_payload()).is_some());
+    assert!(writer.reserve(writer.max_payload(), meta(0)).is_some());
 }
 
 #[test]
@@ -62,19 +66,19 @@ fn dropping_frame_after_wrap_frees_exact_stride() {
     publish(&mut writer, 128 - HEADER_SIZE, 1);
     let held = reader.next().unwrap();
     publish(&mut writer, size - 128 - HEADER_SIZE, 2);
-    assert!(writer.reserve(0).is_none());
+    assert!(writer.reserve(0, meta(0)).is_none());
     drop(held);
     reader.reclaim();
     assert!(
-        writer.reserve(128 + 8 - HEADER_SIZE).is_none(),
+        writer.reserve(128 + 8 - HEADER_SIZE, meta(0)).is_none(),
         "not eight bytes more"
     );
     let reservation = writer
-        .reserve(128 - HEADER_SIZE)
+        .reserve(128 - HEADER_SIZE, meta(0))
         .expect("exact stride is free");
     reservation.commit();
     assert!(
-        writer.reserve(0).is_none(),
+        writer.reserve(0, meta(0)).is_none(),
         "only the held frame's stride was freed"
     );
 }
@@ -183,8 +187,7 @@ fn cross_thread_stress_preserves_held_frames() {
         for sequence in 0..COUNT {
             let len = sequence as usize * 73 % 600 + 1;
             loop {
-                if let Some(mut record) = writer.reserve(len) {
-                    record.meta().slot = sequence;
+                if let Some(mut record) = writer.reserve(len, meta(sequence)) {
                     for (offset, byte) in record.payload().iter_mut().enumerate() {
                         *byte = payload_byte(sequence, offset);
                     }
@@ -227,4 +230,42 @@ fn cross_thread_stress_preserves_held_frames() {
     producer.join().unwrap();
     drop(release_tx);
     releaser.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_tmpfs_returns_allocation_error_before_mapping() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    struct Tmpfs(PathBuf);
+    impl Drop for Tmpfs {
+        fn drop(&mut self) {
+            assert!(Command::new("umount").arg(&self.0).status().unwrap().success());
+            std::fs::remove_dir(&self.0).unwrap();
+        }
+    }
+
+    let dir = std::env::temp_dir().join(unique_name("junction-full-tmpfs-").unwrap());
+    std::fs::create_dir(&dir).unwrap();
+    let mount = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=4096", "none"])
+        .arg(&dir)
+        .output();
+    match mount {
+        Ok(output) if output.status.success() => {}
+        result => {
+            std::fs::remove_dir(&dir).unwrap();
+            eprintln!("skipping: private tmpfs mount unavailable: {result:?}");
+            return;
+        }
+    }
+    let mounted = Tmpfs(dir);
+    let mut backing = Backing::create_file(&mounted.0.join("ring")).unwrap();
+    let page = backing.page_size().unwrap();
+    let error = match RingWriter::create(&mut backing, page) {
+        Ok(_) => panic!("ring allocation exceeded the tmpfs capacity"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
 }
