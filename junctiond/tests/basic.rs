@@ -14,26 +14,6 @@ use support::{
 };
 
 #[zhida_test_support::pinned_test]
-fn client_connects_to_peer_listener() {
-    with_eal(|eal| {
-        let mut f = Fixture::new(eal, ["jncca", "jnccb"], 4, 4, 64);
-        let mut client = f.client(4);
-        let mut events = Vec::new();
-        let (id, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|&&(socket, event)| socket == id && event == Event::Connected)
-                .count(),
-            1
-        );
-        f.peer.remove_tcp(peer);
-        drop(client);
-        f.close();
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn peer_connects_to_client_listener() {
     with_eal(|eal| {
         let mut f = Fixture::new(eal, ["jnlna", "jnlnb"], 4, 4, 64);

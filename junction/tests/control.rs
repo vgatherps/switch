@@ -218,41 +218,51 @@ fn every_host_message_roundtrips_and_preserves_prefixes() {
 }
 
 #[test]
-fn finished_end_has_wire_reason_four() {
-    let message = HostMessage::End(EndReason::Finished);
-    let bytes = [72, 0, 1, 0, 0, 0, 0, 0, 4];
-    assert_eq!(host_bytes(message.clone()), bytes);
-    assert_eq!(
-        HostMessage::decode(&bytes),
-        Ok(Some((message, bytes.len())))
-    );
-}
+fn golden_bytes() {
+    enum Message {
+        Client(ClientMessage),
+        Host(HostMessage),
+    }
 
-#[test]
-fn connect_tcp_golden_bytes() {
-    let expected = [
-        2, 0, 36, 0, 0, 0, 0, 0, 0x04, 0x03, 0x02, 0x01, 0xa4, 0xa3, 0xa2, 0xa1, 0x30, 0x20, 0x10,
-        0x00, 0x44, 0x33, 0x22, 0x11, 0xb4, 0x05, 0, 0, 192, 0, 2, 1, 0xbb, 0x01, 0, 0, 0, 0, 0, 0,
-        0x34, 0x12, 0, 0,
+    let cases: [(Message, &[u8]); 3] = [
+        (
+            Message::Host(HostMessage::End(EndReason::Finished)),
+            &[72, 0, 1, 0, 0, 0, 0, 0, 4],
+        ),
+        (
+            Message::Client(connect()),
+            &[
+                2, 0, 36, 0, 0, 0, 0, 0, 0x04, 0x03, 0x02, 0x01, 0xa4, 0xa3, 0xa2, 0xa1, 0x30,
+                0x20, 0x10, 0x00, 0x44, 0x33, 0x22, 0x11, 0xb4, 0x05, 0, 0, 192, 0, 2, 1, 0xbb,
+                0x01, 0, 0, 0, 0, 0, 0, 0x34, 0x12, 0, 0,
+            ],
+        ),
+        (
+            Message::Host(welcome()),
+            &[
+                64, 0, 28, 0, 0, 0, 0, 0, b'J', b'N', b'C', b'T', 1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2,
+                1, 0x44, 0x33, 0x22, 0x11, 6, 0, b'/', b't', b'm', b'p', b'/', b'j',
+            ],
+        ),
     ];
-    assert_eq!(client_bytes(connect()), expected);
-    assert_eq!(
-        ClientMessage::decode(&expected),
-        Ok(Some((connect(), expected.len())))
-    );
-}
-
-#[test]
-fn welcome_golden_bytes() {
-    let expected = [
-        64, 0, 28, 0, 0, 0, 0, 0, b'J', b'N', b'C', b'T', 1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x44,
-        0x33, 0x22, 0x11, 6, 0, b'/', b't', b'm', b'p', b'/', b'j',
-    ];
-    assert_eq!(host_bytes(welcome()), expected);
-    assert_eq!(
-        HostMessage::decode(&expected),
-        Ok(Some((welcome(), expected.len())))
-    );
+    for (message, expected) in cases {
+        match message {
+            Message::Client(message) => {
+                assert_eq!(client_bytes(message), expected);
+                assert_eq!(
+                    ClientMessage::decode(expected),
+                    Ok(Some((message, expected.len())))
+                );
+            }
+            Message::Host(message) => {
+                assert_eq!(host_bytes(message.clone()), expected);
+                assert_eq!(
+                    HostMessage::decode(expected),
+                    Ok(Some((message, expected.len())))
+                );
+            }
+        }
+    }
 }
 
 #[test]

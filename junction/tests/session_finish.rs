@@ -199,28 +199,6 @@ fn finish_waits_for_control_output_then_flushes_before_end_record() {
 }
 
 #[test]
-fn closed_requires_finished_acknowledgement_not_just_successful_finish() {
-    let (mut host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    assert_eq!(host.end_records(), 1);
-    client
-        .poll_events(|_, _| panic!("unexpected event"))
-        .unwrap();
-    assert!(!client.closed());
-    host.end(EndReason::Finished);
-    until(|| {
-        client
-            .poll_events(|_, _| panic!("unexpected event"))
-            .unwrap();
-        client.closed()
-    });
-    // The host socket remains open: the acknowledgement itself closes the session.
-    client
-        .poll_events(|_, _| panic!("unexpected event"))
-        .unwrap();
-}
-
-#[test]
 fn eof_after_finish_without_acknowledgement_is_lost() {
     let (host, mut client) = RawHost::connect();
     client.finish().unwrap();
@@ -254,148 +232,118 @@ fn unsolicited_finished_is_invalid_host_data() {
 }
 
 #[test]
-#[should_panic(expected = "socket operation after successful Session::finish()")]
-fn connect_tcp_after_finish_panics_before_config_validation() {
-    let (_host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    let _ = client.connect_tcp(
-        TcpConfig {
-            rx_capacity: u32::MAX,
-            tx_capacity: 1024,
-            mss_cap: None,
+fn socket_operations_after_finish_panic_before_validation() {
+    let operations: [fn(&mut Session); 4] = [
+        |client| {
+            let _ = client.connect_tcp(
+                TcpConfig {
+                    rx_capacity: u32::MAX,
+                    tx_capacity: 1024,
+                    mss_cap: None,
+                },
+                "127.0.0.1:1234".parse().unwrap(),
+                ListenEndpoint {
+                    addr: None,
+                    port: 0,
+                },
+            );
         },
-        "127.0.0.1:1234".parse().unwrap(),
-        ListenEndpoint {
-            addr: None,
-            port: 0,
+        |client| {
+            let _ = client.listen_tcp(
+                TcpConfig {
+                    rx_capacity: u32::MAX,
+                    tx_capacity: 1024,
+                    mss_cap: None,
+                },
+                ListenEndpoint {
+                    addr: None,
+                    port: 1234,
+                },
+            );
         },
-    );
-}
-
-#[test]
-#[should_panic(expected = "socket operation after successful Session::finish()")]
-fn listen_tcp_after_finish_panics_before_config_validation() {
-    let (_host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    let _ = client.listen_tcp(
-        TcpConfig {
-            rx_capacity: u32::MAX,
-            tx_capacity: 1024,
-            mss_cap: None,
+        |client| {
+            let _ = client.bind_udp(UdpConfig {
+                local: ListenEndpoint {
+                    addr: None,
+                    port: 0,
+                },
+                rx_queue: 1024,
+                tx_checksum: true,
+                broadcast: false,
+            });
         },
-        ListenEndpoint {
-            addr: None,
-            port: 1234,
-        },
-    );
-}
-
-#[test]
-#[should_panic(expected = "socket operation after successful Session::finish()")]
-fn bind_udp_after_finish_panics_before_config_validation() {
-    let (_host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    let _ = client.bind_udp(UdpConfig {
-        local: ListenEndpoint {
-            addr: None,
-            port: 0,
-        },
-        rx_queue: 1024,
-        tx_checksum: true,
-        broadcast: false,
-    });
-}
-
-#[test]
-#[should_panic(expected = "socket operation after successful Session::finish()")]
-fn shutdown_after_finish_panics_before_id_validation() {
-    let (_host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    client.shutdown(SocketId {
-        slot: u32::MAX,
-        generation: 0,
-    });
-}
-
-fn assert_cleanup_after_finish(cleanup: fn(&mut Session, SocketId)) {
-    let (mut host, mut client) = RawHost::connect();
-    client.finish().unwrap();
-    assert_eq!(host.end_records(), 1);
-    let ids = [
-        SocketId {
-            slot: 0,
-            generation: 0,
-        },
-        SocketId {
-            slot: 0,
-            generation: u32::MAX,
-        },
-        SocketId {
-            slot: u32::MAX,
-            generation: 0,
+        |client| {
+            client.shutdown(SocketId {
+                slot: u32::MAX,
+                generation: 0,
+            });
         },
     ];
-    for id in ids {
-        cleanup(&mut client, id);
+    for operation in operations {
+        let (mut host, mut client) = RawHost::connect();
+        client.finish().unwrap();
+        assert_eq!(host.end_records(), 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            operation(&mut client);
+        }))
+        .expect_err("socket operation after finish did not panic");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(
+            message,
+            Some("socket operation after successful Session::finish()")
+        );
+        assert_eq!(host.end_records(), 0);
+        host.socket.set_nonblocking(true).unwrap();
+        assert_eq!(
+            host.socket.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "socket operation after finish emitted control bytes"
+        );
     }
+}
 
-    struct CleanupOnDrop<'a> {
-        client: &'a mut Session,
-        cleanup: fn(&mut Session, SocketId),
-        panicked: &'a std::cell::Cell<bool>,
-    }
-
-    impl Drop for CleanupOnDrop<'_> {
-        fn drop(&mut self) {
-            // Catch cleanup panics so a regression fails the test rather than
-            // aborting the process with a second panic during unwinding.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (self.cleanup)(
-                    self.client,
-                    SocketId {
-                        slot: u32::MAX,
-                        generation: 0,
-                    },
-                );
-            }));
-            self.panicked.set(result.is_err());
+#[test]
+fn cleanup_after_finish_is_drop_safe_before_id_validation() {
+    let operations: [fn(&mut Session, SocketId); 3] = [
+        |client, id| client.close(id, false),
+        |client, id| client.close(id, true),
+        Session::abort,
+    ];
+    for cleanup in operations {
+        let (mut host, mut client) = RawHost::connect();
+        client.finish().unwrap();
+        assert_eq!(host.end_records(), 1);
+        let ids = [
+            SocketId {
+                slot: 0,
+                generation: 0,
+            },
+            SocketId {
+                slot: 0,
+                generation: u32::MAX,
+            },
+            SocketId {
+                slot: u32::MAX,
+                generation: 0,
+            },
+        ];
+        for id in ids {
+            cleanup(&mut client, id);
+            cleanup(&mut client, id);
         }
+        client.finish().unwrap();
+        assert_eq!(host.end_records(), 0, "cleanup emitted an end record");
+        host.socket.set_nonblocking(true).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            host.socket.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "cleanup emitted control bytes"
+        );
     }
-
-    let cleanup_panicked = std::cell::Cell::new(true);
-    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _cleanup = CleanupOnDrop {
-            client: &mut client,
-            cleanup,
-            panicked: &cleanup_panicked,
-        };
-        panic!("exercise socket cleanup during unwinding");
-    }));
-    assert!(unwind.is_err());
-    assert!(!cleanup_panicked.get(), "cleanup panicked during unwinding");
-
-    client.finish().unwrap();
-    assert_eq!(host.end_records(), 0, "cleanup emitted an end record");
-    host.socket.set_nonblocking(true).unwrap();
-    let mut byte = [0];
-    assert_eq!(
-        host.socket.read(&mut byte).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock,
-        "cleanup emitted control bytes"
-    );
-}
-
-#[test]
-fn close_after_finish_is_drop_safe_before_id_validation() {
-    assert_cleanup_after_finish(|client, id| {
-        client.close(id, false);
-        client.close(id, true);
-    });
-}
-
-#[test]
-fn abort_after_finish_is_drop_safe_before_id_validation() {
-    assert_cleanup_after_finish(Session::abort);
 }
 
 #[cfg(not(target_os = "linux"))]

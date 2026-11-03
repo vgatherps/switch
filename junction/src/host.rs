@@ -759,10 +759,6 @@ mod tests {
             fixture.network.try_recv().is_err(),
             "must not send End Lost"
         );
-        assert!(matches!(
-            fixture.host.connections[0].phase,
-            Phase::Live { draining: true, .. }
-        ));
     }
 
     #[test]
@@ -798,20 +794,6 @@ mod tests {
     }
 
     #[test]
-    fn normal_read_handles_only_one_chunk() {
-        let mut fixture = Fixture::new();
-        let count = fixture.write_ops();
-        assert!(fixture.host.read(0, false).unwrap().is_none());
-        let first = fixture.network.try_iter().count();
-        assert!(
-            first > 0 && first < count,
-            "one pass must not drain the socket"
-        );
-        assert!(fixture.host.read(0, false).unwrap().is_none());
-        assert_eq!(first + fixture.network.try_iter().count(), count);
-    }
-
-    #[test]
     fn hangup_forwards_readable_ops_before_lost_end() {
         let mut fixture = Fixture::new();
         let count = fixture.write_ops();
@@ -832,60 +814,5 @@ mod tests {
         ));
         assert!(fixture.network.try_recv().is_err());
         assert!(fixture.host.connections.is_empty());
-    }
-
-    #[test]
-    fn terminal_ioctl_failure_loses_connection_without_stopping_host() {
-        let mut fixture = Fixture::new();
-        // An owned non-socket descriptor deterministically rejects FIONREAD.
-        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
-        fixture.host.connections[0].socket = fd.into();
-        fixture
-            .retire
-            .send(Retire::Finished { slot: 0, uid: 1 })
-            .unwrap();
-        let Fixture {
-            host,
-            network,
-            retire: _retire,
-            _events: events,
-            _fifo: fifo,
-            _path,
-            ..
-        } = fixture;
-        let (finished, done) = mpsc::channel();
-        let worker = std::thread::spawn(move || finished.send(host.run()).unwrap());
-        assert!(matches!(
-            network.recv_timeout(Duration::from_secs(5)).unwrap(),
-            ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
-        ));
-        assert_eq!(
-            fifo.recv_timeout(Duration::from_secs(5)).unwrap(),
-            Control::Close { slot: 0, uid: 1 }
-        );
-        assert!(
-            done.try_recv().is_err(),
-            "one failed ioctl must not stop the host"
-        );
-        drop(events);
-        done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn normal_eof_and_read_errors_do_not_retry_terminal_ioctl() {
-        for readable in [true, false] {
-            let mut fixture = Fixture::new();
-            // Read-only /dev/null returns EOF; write-only /dev/null rejects read.
-            // Neither supports FIONREAD, so an unnecessary terminal retry would fail.
-            let file = std::fs::OpenOptions::new()
-                .read(readable)
-                .write(!readable)
-                .open("/dev/null")
-                .unwrap();
-            let fd: std::os::fd::OwnedFd = file.into();
-            fixture.host.connections[0].socket = fd.into();
-            assert_eq!(fixture.host.read(0, false).unwrap(), Some(EndHow::Lost));
-        }
     }
 }

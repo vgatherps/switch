@@ -661,23 +661,11 @@ fn held_ops_do_not_touch_reopened_udp(shutdown: bool, wrap_generation: bool) {
 }
 
 #[zhida_test_support::pinned_test]
-fn same_generation_reopen_discards_held_shutdown() {
-    held_ops_do_not_touch_reopened_udp(true, false);
-}
-
-#[zhida_test_support::pinned_test]
-fn same_generation_reopen_discards_held_close() {
-    held_ops_do_not_touch_reopened_udp(false, false);
-}
-
-#[zhida_test_support::pinned_test]
-fn generation_one_two_one_reopen_discards_held_shutdown() {
-    held_ops_do_not_touch_reopened_udp(true, true);
-}
-
-#[zhida_test_support::pinned_test]
-fn generation_one_two_one_reopen_discards_held_close() {
-    held_ops_do_not_touch_reopened_udp(false, true);
+fn reopened_udp_discards_held_tcp_operations() {
+    for (shutdown, wrap_generation) in [(true, false), (false, false), (true, true), (false, true)]
+    {
+        held_ops_do_not_touch_reopened_udp(shutdown, wrap_generation);
+    }
 }
 
 #[zhida_test_support::pinned_test]

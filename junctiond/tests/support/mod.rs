@@ -58,9 +58,6 @@ pub fn udp_config(port: u16) -> UdpConfig {
 pub fn net_ip() -> Ipv4Address {
     Side::A.ip()
 }
-pub fn peer_ip() -> Ipv4Address {
-    Side::B.ip()
-}
 pub fn peer_endpoint(port: u16) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), port)
 }
