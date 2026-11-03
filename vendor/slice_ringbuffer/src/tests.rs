@@ -256,8 +256,7 @@ fn full_tmpfs_returns_allocation_error_before_mapping() {
         Ok(output) if output.status.success() => {}
         result => {
             std::fs::remove_dir(&dir).unwrap();
-            eprintln!("skipping: private tmpfs mount unavailable: {result:?}");
-            return;
+            panic!("private tmpfs mount unavailable: {:?}", result);
         }
     }
     let mounted = Tmpfs(dir);
