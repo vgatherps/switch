@@ -371,7 +371,9 @@ mod tests {
         assert_eq!(queue.append_tail(0, &[3, 4, 5], 4), 2);
         assert_eq!(queue.len(), 4);
         assert_eq!(queue.entries[0].buf.as_ref().unwrap().payload(), &[1, 2, 3, 4]);
-        assert_eq!(queue.append_tail(1, &[5], 1), 0);
+        assert_eq!(queue.append_tail(1, &[5], 6), 0);
+        assert_eq!(queue.len(), 4);
+        assert_eq!(queue.entries[0].buf.as_ref().unwrap().payload(), &[1, 2, 3, 4]);
     }
 
     #[test]

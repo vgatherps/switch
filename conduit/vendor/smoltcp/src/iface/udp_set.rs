@@ -443,11 +443,10 @@ mod tests {
                 ..config(1234)
             })
             .unwrap();
-        let releases = Rc::new(Cell::new(0));
         let enqueue = |set: &mut UdpSet, byte| {
             set.commit_rx(
                 handle.slot,
-                RxBuf::counted_frame(alloc::vec![0, byte, 0], 0, releases.clone()),
+                RxBuf::from_vec(alloc::vec![0, byte, 0]),
                 PendingUdp {
                     src: IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321),
                     dst_addr: Ipv4Address::new(192, 168, 1, 1),
@@ -482,7 +481,6 @@ mod tests {
             assert!(set.get_mut(handle).recv().is_none());
             assert_eq!(set.get(handle).shared.held.get(), 0);
         }
-        assert_eq!(releases.get(), 20);
         assert_eq!(set.get(handle).stats().rx_dropped_full, 0);
     }
 

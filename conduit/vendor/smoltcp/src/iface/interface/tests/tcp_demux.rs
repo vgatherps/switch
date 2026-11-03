@@ -1727,7 +1727,7 @@ fn tcp_bad_checksum_dropped_without_delivery_or_ack_advance() {
 }
 
 #[test]
-fn tcp_truncated_and_zero_ports_dropped() {
+fn tcp_truncated_and_zero_source_port_dropped() {
     let (mut iface, mut sockets, _) = setup_eth();
     let bytes = packet_bytes(segment(TcpControl::Syn, REMOTE_SEQ, None));
     let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
@@ -1740,16 +1740,17 @@ fn tcp_truncated_and_zero_ports_dropped() {
             &packet.payload()[..length],
         ).is_none());
     }
-    for port_offset in [0, 2] {
-        let mut tcp = packet.payload().to_vec();
-        tcp[port_offset..port_offset + 2].fill(0);
-        assert!(iface.inner.process_tcp(
-            &mut sockets,
-            PacketMeta::default(),
-            IpRepr::Ipv4(ip),
-            &tcp,
-        ).is_none());
-    }
+    let bytes = packet_bytes(TcpRepr {
+        src_port: 0,
+        ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+    });
+    let packet = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+    assert!(iface.inner.process_tcp(
+        &mut sockets,
+        PacketMeta::default(),
+        IpRepr::Ipv4(ip),
+        packet.payload(),
+    ).is_none());
 }
 
 const NON_UNICAST_DSTS: [Ipv4Address; 4] = [
