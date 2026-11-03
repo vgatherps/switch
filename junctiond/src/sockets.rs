@@ -202,6 +202,10 @@ fn add_tcp(stack: &mut Stack, config: TcpConfig) -> Result<TcpHandle, RejectCode
 }
 
 impl HostSocket {
+    pub fn has_unread_rx(&self) -> bool {
+        matches!(self.held_rx, Some(HeldRx::Tcp { .. }))
+    }
+
     /// Retains an owned frame and TCP offset while the session RX ring is full.
     pub fn receive(&mut self, stack: &mut Stack, rx: &mut RingWriter, udp_dropped: &mut u64) {
         if let Socket::Tcp { handle, .. } = &self.socket
@@ -282,23 +286,26 @@ impl HostSocket {
         }
     }
 
-    pub fn send_tcp(&mut self, stack: &mut Stack, payload: &[u8]) {
+    pub fn send_tcp(&mut self, stack: &mut Stack, token: u32, payload: &[u8]) {
         let Socket::Tcp { handle, .. } = &self.socket else {
             unreachable!("validated TCP send must name a TCP socket")
         };
         if self.backlog.is_empty() {
+            self.socket.disarm(stack);
             if let Ok(sent) = stack.tcp_mut(handle).send_slice(payload) {
                 self.backlog.extend(&payload[sent..]);
             }
+            self.socket.arm(stack, token);
         } else {
             self.backlog.extend(payload);
         }
     }
 
-    pub fn drain_backlog(&mut self, stack: &mut Stack) {
+    pub fn drain_backlog(&mut self, stack: &mut Stack, token: u32) {
         let Socket::Tcp { handle, .. } = &self.socket else {
             unreachable!("only TCP sockets have a send backlog")
         };
+        self.socket.disarm(stack);
         while !self.backlog.is_empty() {
             let (front, _) = self.backlog.as_slices();
             let len = front.len();
@@ -315,6 +322,7 @@ impl HostSocket {
                 }
             }
         }
+        self.socket.arm(stack, token);
     }
 
     pub fn fired(&mut self, stack: &mut Stack, to_control: &Sender<FromNetwork>) {
@@ -365,11 +373,14 @@ impl HostSocket {
                 | tcp::State::Closing
                 | tcp::State::TimeWait
         );
-        if !*peer_fin && *fin_seen && drained {
+        if !reset_by_peer && !*peer_fin && *fin_seen && drained {
             *peer_fin = true;
             event(to_control, session, self.id, Event::PeerFin);
         }
-        if *shutdown && !*delivered && matches!(state, tcp::State::FinWait2 | tcp::State::TimeWait)
+        if *shutdown
+            && !*delivered
+            && !reset_by_peer
+            && matches!(state, tcp::State::FinWait2 | tcp::State::TimeWait | tcp::State::Closed)
         {
             *delivered = true;
             event(to_control, session, self.id, Event::Delivered);

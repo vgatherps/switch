@@ -12,7 +12,8 @@
 //! Closed sockets with backlogs use the Stack's orphan retry limit even while held here.
 //! TCP receive frames split at the session ring's payload limit; oversized UDP datagrams
 //! are dropped and counted. A full ring retains one owned frame and TCP offset per socket,
-//! retrying before the next Stack turn and delaying receive EOF.
+//! retrying before the next Stack turn and delaying receive EOF. Close and graceful
+//! retirement reset TCP sockets with held receive bytes the application never received.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -274,7 +275,7 @@ impl NetworkState {
         match (record, &socket.socket) {
             (SendRecord::Tcp { payload, .. }, Socket::Tcp { .. }) => {
                 let empty = socket.backlog.is_empty();
-                socket.send_tcp(&mut self.stack, payload);
+                socket.send_tcp(&mut self.stack, index, payload);
                 if empty && !socket.backlog.is_empty() {
                     self.backlogged.push(index);
                 }
@@ -357,7 +358,7 @@ impl NetworkState {
                 position += 1;
                 continue;
             }
-            socket.drain_backlog(&mut self.stack);
+            socket.drain_backlog(&mut self.stack, index);
             if !socket.backlog.is_empty() {
                 position += 1;
                 continue;
@@ -474,6 +475,7 @@ impl NetworkState {
         };
         let socket = self.sockets[index as usize].as_mut().unwrap();
         if !socket.backlog.is_empty()
+            && !(matches!(op, Op::Close { .. }) && socket.has_unread_rx())
             && matches!(op, Op::ShutdownTcp { .. } | Op::Close { unread: false, .. })
         {
             if matches!(op, Op::Close { unread: false, .. })
@@ -512,7 +514,7 @@ impl NetworkState {
         if !socket.backlog.is_empty() {
             self.backlogged.retain(|pending| *pending != index);
         }
-        if abort {
+        if abort || socket.has_unread_rx() {
             socket.socket.abort(&mut self.stack);
         }
         socket.socket.drop_handle();
@@ -555,7 +557,7 @@ impl NetworkState {
         for slot in entry.slots {
             if let Some(index) = slot.host {
                 let socket = self.sockets[index as usize].as_mut().unwrap();
-                if graceful && !socket.backlog.is_empty() {
+                if graceful && !socket.backlog.is_empty() && !socket.has_unread_rx() {
                     if let Socket::Tcp { handle, .. } = &socket.socket {
                         self.stack.tcp_mut(handle).limit_retries();
                     }

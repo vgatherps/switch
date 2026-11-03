@@ -476,7 +476,7 @@ impl Fixture {
         self.forward_message(message);
     }
 
-    fn turn_network(&mut self) {
+    pub fn turn_network(&mut self) {
         while let Ok(message) = self.control.try_recv() {
             self.forward_message(message);
         }
