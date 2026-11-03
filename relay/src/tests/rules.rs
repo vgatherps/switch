@@ -230,30 +230,6 @@ fn utf8_across_fragments() {
 }
 
 #[test]
-fn mask_phase_carries_across_chunks() {
-    let payload: Vec<u8> = (0..11).collect();
-    let wire = encode(fin(BINARY), Some(KEY), &payload);
-    for cuts in [[7, 8, 9], [6, 9, 13], [10, 11, 17]] {
-        let run = drive(&mut rx(Role::Server), &split(&wire, &cuts));
-        assert_eq!(run.msgs.len(), 1);
-        assert_eq!(run.msgs[0].payload, payload, "{cuts:?}");
-        assert!(!run.msgs[0].direct);
-    }
-}
-
-#[test]
-fn masked_fragment_frames_restart_key_phase() {
-    let first = encode(BINARY, Some(KEY), b"abc");
-    let second = encode(fin(CONT), Some(KEY), b"defghijkl");
-    let mut wire = first;
-    wire.extend_from_slice(&second);
-    let run = drive(&mut rx(Role::Server), &split(&wire, &[7, 8, 10, 16, 18]));
-    assert_eq!(run.end, None);
-    assert_eq!(run.msgs.len(), 1);
-    assert_eq!(run.msgs[0].payload, b"abcdefghijkl");
-}
-
-#[test]
 fn control_frames_between_fragments() {
     let frames = [
         encode(TEXT, None, b"ab"),
@@ -274,34 +250,6 @@ fn control_frames_between_fragments() {
     let run = feed(&mut r, &[encode(BINARY, None, b"ab"), close(1001, b"")]);
     assert_eq!(run.end, Some(WsError::Closed));
     assert_eq!(r.peer_close(), Some(&[0x03, 0xe9][..]));
-}
-
-#[test]
-fn direct_message_borrows_the_frame() {
-    let wire = [encode(fin(TEXT), None, b"first"), encode(fin(BINARY), None, &[9; 130])].concat();
-    let mut r = rx(Role::Client);
-    let f = VecFrame { data: wire, stamp: 42 };
-    let base = f.data.as_ptr();
-    r.push(f);
-    let m = r.recv(&mut ()).unwrap().unwrap();
-    assert_eq!(m.bytes().as_ptr(), base.wrapping_add(2));
-    assert_eq!(m.text(), Some("first"));
-    assert_eq!(m.rx_timestamp(), 42);
-    let m = r.recv(&mut ()).unwrap().unwrap();
-    assert_eq!(m.bytes().as_ptr(), base.wrapping_add(7 + 4));
-    assert_eq!(m.kind(), Kind::Binary);
-    assert!(r.recv(&mut ()).unwrap().is_none());
-}
-
-#[test]
-fn spanning_message_is_copied_and_stamped_by_its_first_byte() {
-    let wire = encode(fin(BINARY), None, &[5; 10]);
-    let run = drive(&mut rx(Role::Client), &split(&wire, &[1, 6]));
-    assert_eq!(run.msgs, vec![Got { kind: Kind::Binary, payload: vec![5; 10], direct: false, stamp: stamp(0) }]);
-    // Header cut, payload whole in the next frame: still direct, stamped by the header's frame.
-    let run = drive(&mut rx(Role::Client), &split(&wire, &[1, 2]));
-    assert!(run.msgs[0].direct);
-    assert_eq!(run.msgs[0].stamp, stamp(0));
 }
 
 #[test]

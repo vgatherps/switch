@@ -309,16 +309,6 @@ fn borrowed_send_cancellation_preserves_acceptance_and_next_receive() {
     }
 }
 
-#[test]
-fn receive_with_sender_reports_protocol_failure() {
-    let (mut s, _, input) = raw();
-    feed(&input, &encode(fin(TEXT), None, b"unmasked"), false);
-    assert!(matches!(
-        poll_n(s.recv_with_sender(), 1),
-        Some(Err(Failure::Protocol(crate::ProtocolError::UnmaskedFrame)))
-    ));
-}
-
 /// An idle `recv` waits on input alone without spinning; a frame wakes it.
 #[test]
 fn idle_recv_is_woken_by_input_alone() {

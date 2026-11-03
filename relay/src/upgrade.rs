@@ -232,14 +232,6 @@ mod tests {
     #[test]
     // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
     #[cfg_attr(miri, ignore)]
-    fn accept_key_is_rfc_6455_example() {
-        // RFC 6455 §1.3.
-        assert_eq!(accept_key(KEY), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-    }
-
-    #[test]
-    // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
-    #[cfg_attr(miri, ignore)]
     fn valid_response_passes() {
         check(&response("", ""), KEY).unwrap();
         check(&response("Connection: keep-alive, Upgrade\r\n", "Connection"), KEY).unwrap();

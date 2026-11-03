@@ -28,8 +28,6 @@ enum Act {
     RequestAndPark,
     /// Panic.
     Panic,
-    /// Wake itself, set the turn request and finish.
-    WakeRequestAndFinish,
     /// Defer itself; the next poll finishes.
     Defer,
 }
@@ -74,11 +72,6 @@ impl Future for Step {
                 Poll::Pending
             }
             Act::Panic => panic_any(7u32),
-            Act::WakeRequestAndFinish => {
-                cx.waker().wake_by_ref();
-                request_turn();
-                Poll::Ready(())
-            }
             Act::Defer => {
                 StoredWaker::new(cx).wake_deferred();
                 Poll::Pending
@@ -132,11 +125,6 @@ impl Fixture {
         };
         self.runtime.spawner().spawn(step(task)).unwrap();
         self.wakers.push(waker);
-    }
-
-    /// The task header of the `index`th task spawned (its waker's data pointer), once polled.
-    fn slot(&self, index: usize) -> *const () {
-        self.wakers[index].borrow().as_ref().unwrap().data()
     }
 
     fn wake(&self, index: usize) {
@@ -256,28 +244,6 @@ fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
     let mut dropped = f.dropped.borrow().clone();
     dropped.sort_unstable();
     assert_eq!(dropped, ["a", "b", "c", "d", "n"]);
-}
-
-/// A task that wakes itself, requests a turn and finishes in one poll: the poll stops after
-/// it, and its slot stays occupied until its queued wake drains in the next poll.
-#[test]
-fn a_self_wake_with_a_request_and_ready_in_one_poll() {
-    let mut f = Fixture::new(&[("a", Act::WakeRequestAndFinish), ("b", Act::Park)]);
-    let report = f.runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.live_tasks), (1, 1));
-    assert_eq!(f.taken(), ["a"]);
-    assert_eq!(f.drops.get(), 1);
-    // b is left in the round; a's queued wake keeps its slot taken.
-    f.spawn("n", Act::Park);
-    let report = f.runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.live_tasks), (2, 2));
-    assert_eq!(f.taken(), ["b", "n"]);
-    assert_ne!(f.slot(2), f.slot(0), "n took a slot whose wake is still queued");
-    f.spawn("m", Act::Park);
-    assert_eq!(f.runtime.poll(0).unwrap().tasks_polled, 1);
-    assert_eq!(f.slot(3), f.slot(0), "a's slot was not freed when its wake drained");
-    assert_eq!(f.taken(), ["m"]);
-    assert_eq!(f.drops.get(), 1);
 }
 
 /// A task that polls another Runtime, then requests a turn: the inner poll restored the

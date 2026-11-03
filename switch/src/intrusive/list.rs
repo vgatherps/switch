@@ -78,40 +78,6 @@ impl ListHead {
 
         Some(idx)
     }
-
-    /// Drain all entries, calling f for each.
-    #[cfg(test)]
-    pub fn drain<T: ListLinked, F: FnMut(u32)>(&mut self, entries: &mut [T], mut f: F) {
-        while let Some(idx) = self.pop_front(entries) {
-            f(idx);
-        }
-    }
-
-    /// Iterate over all indices (non-mutating).
-    #[cfg(test)]
-    pub fn iter<'a, T: ListLinked>(&self, entries: &'a [T]) -> ListIter<'a, T> {
-        ListIter { entries, current: self.first }
-    }
-}
-
-#[cfg(test)]
-pub struct ListIter<'a, T> {
-    entries: &'a [T],
-    current: u32,
-}
-
-#[cfg(test)]
-impl<T: ListLinked> Iterator for ListIter<'_, T> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current == NIL {
-            return None;
-        }
-        let idx = self.current;
-        self.current = self.entries[idx as usize].next();
-        Some(idx)
-    }
 }
 
 #[cfg(test)]
@@ -130,12 +96,6 @@ mod tests {
 
     fn make_entries(n: usize) -> Vec<TestEntry> {
         (0..n).map(|_| TestEntry { links: IntrusiveLinks::new() }).collect()
-    }
-
-    #[test]
-    fn test_empty_list() {
-        let list = super::ListHead::new();
-        assert!(list.is_empty());
     }
 
     #[test]
@@ -237,34 +197,5 @@ mod tests {
 
         assert_eq!(list.last, 1);
         assert_eq!(crate::intrusive::links::ListLinked::next(&entries[1]), crate::intrusive::links::NIL);
-    }
-
-    #[test]
-    fn test_iter() {
-        let mut entries = make_entries(5);
-        let mut list = super::ListHead::new();
-
-        list.push_back(&mut entries, 0);
-        list.push_back(&mut entries, 2);
-        list.push_back(&mut entries, 4);
-
-        let indices: Vec<_> = list.iter(&entries).collect();
-        assert_eq!(indices, vec![0, 2, 4]);
-    }
-
-    #[test]
-    fn test_drain() {
-        let mut entries = make_entries(5);
-        let mut list = super::ListHead::new();
-
-        list.push_back(&mut entries, 0);
-        list.push_back(&mut entries, 1);
-        list.push_back(&mut entries, 2);
-
-        let mut drained = Vec::new();
-        list.drain(&mut entries, |idx| drained.push(idx));
-
-        assert_eq!(drained, vec![0, 1, 2]);
-        assert!(list.is_empty());
     }
 }

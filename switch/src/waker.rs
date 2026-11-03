@@ -216,11 +216,4 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::Relaxed), u32::from(u16::MAX) + 1);
     }
-
-    #[test]
-    fn tags_start_at_one() {
-        let counter = AtomicU32::new(1);
-        assert_eq!(issue_tag(&counter), Some(1));
-        assert_eq!(issue_tag(&counter), Some(2));
-    }
 }

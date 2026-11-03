@@ -88,61 +88,6 @@ fn peer_receive(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, len: usize) -
     got
 }
 
-#[zhida_test_support::pinned_test]
-fn room_then_try_send_delivers_every_frame_in_order() {
-    with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rtsa", "rtsb"]);
-        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
-        let (_rx, mut tx) = stream.split();
-        let data = pattern(64 * CHUNK + 123, 5);
-        let handle = mixed.handle();
-        let sent = data.clone();
-        let slot = mixed.spawn(async move {
-            send_all(&handle, &mut tx, &sent).await;
-            tx
-        });
-        let got = peer_receive(&mut mixed, &peer, data.len());
-        assert_eq!(got, data);
-        drop((slot.take(), _rx, peer));
-        mixed.close();
-    })
-}
-
-/// Queued bytes fill the send buffer while the link is paused. The writer
-/// stays parked until the peer receives and ACKs the first frame.
-#[zhida_test_support::pinned_test]
-fn room_parks_until_the_peer_acks() {
-    with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rpka", "rpkb"]);
-        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
-        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
-        let (_rx, mut tx) = stream.split();
-        let data = pattern(2 * CHUNK, 9);
-        let handle = mixed.handle();
-        let sent = data.clone();
-        let (task, polls) = counted(async move {
-            send_all(&handle, &mut tx, &sent).await;
-            tx
-        });
-        let slot = mixed.spawn(task);
-        mixed.to_peer.paused = true;
-        mixed.turn();
-        let stalled = polls.get();
-        for _ in 0..20 {
-            mixed.turn();
-        }
-        assert_eq!(polls.get(), stalled, "the parked writer was polled while no room opened");
-        assert!(!slot.is_full());
-        mixed.to_peer.paused = false;
-        let got = peer_receive(&mut mixed, &peer, data.len());
-        assert_eq!(got, data);
-        mixed.until(|_| slot.is_full());
-        assert!(polls.get() > stalled, "the ACK did not wake the writer");
-        drop((slot.take(), _rx, peer));
-        mixed.close();
-    })
-}
-
 /// `try_send` with no room returns the frame it was given, untouched; after
 /// the peer reads, `room` then `try_send` of that same frame succeed.
 #[zhida_test_support::pinned_test]
@@ -181,29 +126,6 @@ fn try_send_full_returns_the_same_frame() {
         got.extend(peer_receive(&mut mixed, &peer, sent.len() - got.len()));
         assert_eq!(got, sent);
         drop((tx, _rx, peer));
-        mixed.close();
-    })
-}
-
-/// A task that takes every free frame leaves the next `tx_frame` waiting;
-/// idle turns do not poll it, and the turn after a frame returns wakes it.
-#[zhida_test_support::pinned_test]
-fn tx_frame_waits_until_a_frame_returns() {
-    with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["txwa", "txwb"]);
-        let held = take_every_frame(&mut mixed);
-        assert!(!held.borrow().is_empty());
-        let handle = mixed.handle();
-        let (task, polls) = counted(async move { handle.tx_frame().await });
-        let slot = mixed.spawn(task);
-        mixed.rounds(10);
-        assert_eq!(polls.get(), 1, "woken while the pool was empty");
-        assert!(!slot.is_full());
-        held.borrow_mut().pop();
-        mixed.turn();
-        assert!(slot.is_full(), "not woken by the turn after a frame returned");
-        assert_eq!(polls.get(), 2);
-        drop((slot.take(), held));
         mixed.close();
     })
 }

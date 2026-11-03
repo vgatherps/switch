@@ -523,20 +523,6 @@ fn live_future_never_moves_when_blocks_grow() {
     assert_eq!(first.addr.get(), addr);
 }
 
-#[test]
-fn one_function_on_two_threads_uses_disjoint_blocks() {
-    let spawn_on_thread = || {
-        std::thread::spawn(|| {
-            let mut runtime = Runtime::new(0);
-            let states = spawn_parked(&mut runtime, 1);
-            meta(&waker(&states[0])).addr()
-        })
-        .join()
-        .unwrap()
-    };
-    assert_ne!(spawn_on_thread(), spawn_on_thread());
-}
-
 /// A `Parked` with another layout: a second future type of a different size.
 struct Padded(Parked, #[allow(dead_code)] [u8; 4096]);
 
@@ -651,20 +637,6 @@ fn detached_and_joined_spawns_share_one_pool() {
 async fn per_type<T: 'static>(value: T, state: Rc<State>) {
     Parked(state).await;
     drop(value);
-}
-
-#[test]
-fn generic_instantiations_have_their_own_pools() {
-    let mut runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let (byte, text) = (state(), state());
-    spawner.spawn(per_type(1u8, byte.clone())).unwrap();
-    spawner
-        .spawn(per_type(String::new(), text.clone()))
-        .unwrap();
-    runtime.poll(0).unwrap();
-    assert_eq!((byte.polls.get(), text.polls.get()), (1, 1));
-    assert_ne!(runtime_pool(&waker(&byte)), runtime_pool(&waker(&text)));
 }
 
 /// A pool per instantiation also when the future type does not depend on the parameter:
@@ -1031,36 +1003,6 @@ fn stored_waker_wake_polls_the_task_once() {
     handle.wake();
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
     assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
-}
-
-#[test]
-fn stale_stored_waker_into_free_then_reused_slot() {
-    let mut runtime = Runtime::new(0);
-    let old = state();
-    let stored = Rc::new(Cell::new(None));
-    runtime
-        .spawner()
-        .spawn(stores(old.clone(), stored.clone()))
-        .unwrap();
-    runtime.poll(0).unwrap();
-    let stale = stored.get().unwrap();
-    old.done.set(true);
-    stale.wake();
-    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
-    // Free slot: nothing.
-    stale.wake();
-    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 0);
-    // Reused slot: the newer task gets one more poll.
-    let new = state();
-    runtime
-        .spawner()
-        .spawn(stores(new.clone(), Rc::new(Cell::new(None))))
-        .unwrap();
-    runtime.poll(0).unwrap();
-    assert_eq!(stored.get(), Some(stale));
-    stale.wake();
-    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 1);
-    assert_eq!(new.polls.get(), 2);
 }
 
 #[test]

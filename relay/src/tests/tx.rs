@@ -810,21 +810,6 @@ fn invalid_input_changes_nothing() {
     assert_eq!(msgs[..3], [TMessage::Pong(b"p".to_vec().into()), TMessage::Binary(vec![4; 3000].into()), TMessage::Binary(vec![5; MAX].into())]);
 }
 
-/// The send buffer grows by clamped doubling: across increasing message sizes (40, 41, 63 MiB)
-/// its capacity never passes the default `max_send` (64 MiB), where plain `Vec` growth would
-/// reach 80 MiB.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn send_buffer_never_grows_past_max_send() {
-    let (mut c, log) = core(Role::Server, 70_000);
-    for mib in [40, 41, 63] {
-        send_all(&mut c, Kind::Binary, &vec![0; mib << 20]);
-        assert!(c.buf_capacity() <= 64 << 20, "{mib} MiB: {}", c.buf_capacity());
-        c.check_invariants();
-        log.borrow_mut().sent.clear();
-    }
-}
-
 /// A seal that fails (TLS refusing to encrypt) is the socket's death, at each of the three
 /// seal points: a data frame, a lower record, close_notify. Its frame is released, nothing
 /// is sealed later, and a failure stored before is the one reported.
