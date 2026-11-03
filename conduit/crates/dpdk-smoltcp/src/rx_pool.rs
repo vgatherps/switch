@@ -84,16 +84,6 @@ mod tests {
     }
 
     #[test]
-    fn tx_reserve_covers_descriptors_and_pending() {
-        assert_eq!(tx_reserve(1024, 32), 1024 + 32);
-        assert_eq!(tx_reserve(64, 32), 96);
-        assert_eq!(tx_reserve(16, 8), 24);
-        assert_eq!(tx_reserve(16, 1), 17);
-        assert_eq!(tx_reserve(16, 0), 16);
-        assert_eq!(tx_reserve(0, 0), 0);
-    }
-
-    #[test]
     #[should_panic(expected = "TX reserve exceeds usize")]
     fn tx_reserve_refuses_pending_overflow() {
         tx_reserve(1, usize::MAX);

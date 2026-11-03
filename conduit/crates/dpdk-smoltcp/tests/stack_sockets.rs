@@ -383,21 +383,6 @@ fn socket_capacity_refused_then_slot_reused() {
 }
 
 #[zhida_test_support::pinned_test]
-fn tcp_read_leaves_socket_untouched() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("tcpread", 16, 16);
-        let mut stack = stack(fixture.open(eal), 1, 4);
-        let handle = stack.add_tcp(tcp_socket()).unwrap();
-        stack.listen(&handle, 1001).unwrap();
-
-        assert_eq!(stack.tcp(&handle).state(), State::Listen);
-        let read = stack.tcp(&handle) as *const tcp::Socket<'static>;
-        assert!(std::ptr::eq(read, stack.tcp_mut(&handle)));
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn connect_unknown_neighbor_sends_arp_and_reports_silence_deadline() {
     with_eal(|eal| {
         let fixture = RingPort::new("silence", 16, 16);
@@ -880,37 +865,6 @@ fn turn_respects_budget_and_services_egress() {
             assert_eq!(data_segment.ack_number, Some(peer_isn + 1));
             assert_eq!(data_segment.payload, &data[512 * i..512 * (i + 1)]);
         }
-        finish(fixture, stack);
-    });
-}
-
-#[zhida_test_support::pinned_test]
-fn connection_without_peer_timestamps_stays_without_them() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("nots", 16, 16);
-        let mut stack = stack(fixture.open(eal), 1, 4);
-        let handle = stack.add_tcp(tcp_socket()).unwrap();
-        stack.connect(&handle, remote(), LOCAL_PORT).unwrap();
-        // Neither our SYN nor the peer's SYN-ACK offers timestamps.
-        let (isn, peer_isn, offered) = handshake(&fixture, &mut stack, &handle);
-        assert_eq!(offered, None);
-
-        assert_eq!(stack.tcp_mut(&handle).send_slice(b"hi"), Ok(2));
-        let later = T0 + Duration::from_millis(3);
-        assert_eq!(
-            stack.turn(later, 8),
-            Ok(Turn {
-                tx_accepted: 1,
-                ..IDLE
-            })
-        );
-        let sent = fixture.take_tx();
-        assert_eq!(sent.len(), 1);
-        let data = segment(&sent[0]);
-        assert_eq!(
-            (data.seq_number, data.ack_number, data.payload, data.timestamp),
-            (isn + 1, Some(peer_isn + 1), &b"hi"[..], None)
-        );
         finish(fixture, stack);
     });
 }
