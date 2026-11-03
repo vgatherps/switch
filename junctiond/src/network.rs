@@ -14,6 +14,8 @@
 //! are dropped and counted. A full ring retains one owned frame and TCP offset per socket,
 //! retrying before the next Stack turn and delaying receive EOF. Close and graceful
 //! retirement reset TCP sockets with held receive bytes the application never received.
+//! Control loss waits for a FIFO end or global FIFO idle before deciding graceful/reset.
+//! Lost sessions without an end are reset before other sessions' held ops are released.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -49,6 +51,7 @@ struct Session {
     held: VecDeque<Op>,
     errored: bool,
     ended: bool,
+    lost: bool,
 }
 
 /// Owns the Stack, session socket handles and FIFO on the network thread.
@@ -70,6 +73,7 @@ struct NetworkState {
     rx_pending: Vec<u32>,
     rx_cursor: usize,
     held_count: usize,
+    lost_count: usize,
     udp_dropped: u64,
     udp_rx_dropped: u64,
     to_control: Sender<FromNetwork>,
@@ -98,6 +102,7 @@ impl Network {
                 rx_pending: Vec::new(),
                 rx_cursor: 0,
                 held_count: 0,
+                lost_count: 0,
                 udp_dropped: 0,
                 udp_rx_dropped: 0,
                 to_control,
@@ -140,9 +145,22 @@ impl Network {
                     && entry.uid == uid(session)
                 {
                     entry.ended = true;
+                    if entry.lost {
+                        state.end(session, EndHow::Lost);
+                    }
                 }
             } else if state.live(session).is_some_and(|entry| !entry.errored) {
                 state.receive_send(session, message.payload());
+            }
+        }
+        if idle && state.lost_count != 0 {
+            for index in 0..state.sessions.len() {
+                if let Some(session) = &state.sessions[index]
+                    && session.lost
+                {
+                    let id = ceph_proto::pack(index as u32, session.uid);
+                    state.end(id, EndHow::Abort);
+                }
             }
         }
         if idle && state.held_count != 0 {
@@ -209,6 +227,7 @@ impl NetworkState {
                     held: VecDeque::new(),
                     errored: false,
                     ended: false,
+                    lost: false,
                 });
             }
             ToNetwork::Op { session, op } => self.receive_op(session, op),
@@ -543,6 +562,14 @@ impl NetworkState {
         if how == EndHow::Graceful && entry.errored {
             return;
         }
+        if how == EndHow::Lost && !entry.errored && !entry.ended {
+            let entry = self.sessions[slot(session) as usize].as_mut().unwrap();
+            if !entry.lost {
+                entry.lost = true;
+                self.lost_count += 1;
+            }
+            return;
+        }
         let graceful = !entry.errored
             && match how {
                 EndHow::Graceful => true,
@@ -553,6 +580,7 @@ impl NetworkState {
             self.release(session, false);
         }
         let entry = self.sessions[slot(session) as usize].take().unwrap();
+        self.lost_count -= usize::from(entry.lost);
         self.held_count -= entry.held.len();
         for slot in entry.slots {
             if let Some(index) = slot.host {

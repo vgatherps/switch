@@ -9,6 +9,7 @@ use junction::control::{
     ClientMessage, EndReason, Event, HostMessage, Op, RejectCode, SocketId, VERSION, WelcomeStatus,
 };
 use junction::host::EndHow;
+use junction::session::{ConnectError, Session};
 use zhida_test_kit::with_eal;
 
 mod support;
@@ -226,6 +227,83 @@ fn dropped_session_resets_established_tcp() {
 }
 
 #[zhida_test_support::pinned_test]
+fn finish_then_drop_with_control_loss_before_fifo_end_delivers_bytes_then_fin() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::new(eal, ["lfda", "lfdb"], 2, 0, 1);
+        let mut client = fixture.client(1);
+        let mut events = Vec::new();
+        let (id, peer) = connect(&mut fixture, &mut client, &mut events, LOCAL_PORT);
+        let session = fixture.streams[0];
+        let payload = b"bytes committed before finish";
+        let mut record = vec![0; junction::send::TCP_SEND_HEADER + payload.len()];
+        record[junction::send::TCP_SEND_HEADER..].copy_from_slice(payload);
+        client.send_tcp(id, &mut record).unwrap();
+        client.finish().unwrap();
+        drop(client);
+        fixture.forward_lost(session);
+        // A one-record FIFO batch consumes only SEND. The real Lost is handled
+        // before it, and the real FIFO end cannot be consumed until the next turn.
+        fixture.turn_network();
+        assert!(fixture.retired.is_empty());
+        assert!(fixture.released.is_empty());
+        assert!(fixture.protocol_errors.is_empty());
+        let mut received = Vec::new();
+        let deadline = WallInstant::now() + WAIT;
+        while fixture.peer.tcp(&peer).state() != State::CloseWait
+            || received.len() != payload.len()
+            || !fixture.retired.contains(&session)
+        {
+            assert!(WallInstant::now() < deadline, "finish then drop did not deliver bytes and FIN");
+            fixture.round_links();
+            while fixture.peer.tcp(&peer).can_recv() {
+                let frame = fixture.peer.tcp_mut(&peer).recv().unwrap().unwrap();
+                received.extend_from_slice(frame.payload());
+            }
+            assert!(!fixture.peer.tcp(&peer).reset_by_peer());
+        }
+        assert_eq!(received, payload);
+        assert_eq!(fixture.retired, [session]);
+        assert!(fixture.released.is_empty());
+        drop(peer);
+        fixture.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn lost_session_rejects_hello_until_network_writer_handback() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::with_one_session(eal, ["lhba", "lhbb"], 2);
+        let mut client = fixture.client(1);
+        let mut events = Vec::new();
+        let (_, peer) = connect(&mut fixture, &mut client, &mut events, LOCAL_PORT);
+        let old_session = fixture.streams[0];
+        drop(client);
+        fixture.forward_lost(old_session);
+        // The control socket is gone, but the network still owns this session.
+        assert!(matches!(
+            Session::connect(&fixture.socket_path, 1),
+            Err(ConnectError::Rejected(WelcomeStatus::SessionsFull))
+        ));
+        fixture.network.iteration(fixture.now).unwrap();
+        // Keep Released in the fixture's channel: teardown alone must not free
+        // the control-owned slot before writer handback.
+        assert!(matches!(
+            Session::connect(&fixture.socket_path, 1),
+            Err(ConnectError::Rejected(WelcomeStatus::SessionsFull))
+        ));
+        fixture.wait_handback(old_session);
+        assert_eq!(fixture.released, [old_session]);
+        assert!(fixture.retired.is_empty());
+        let admitted = fixture.client(1);
+        let new_session = fixture.streams[1];
+        assert_eq!(ceph_proto::slot(old_session), ceph_proto::slot(new_session));
+        assert_ne!(ceph_proto::uid(old_session), ceph_proto::uid(new_session));
+        drop((admitted, peer));
+        fixture.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn stale_session_end_after_slot_reuse_does_not_touch_new_connection() {
     with_eal(|eal| {
         for how in [EndHow::Lost, EndHow::Abort] {
@@ -235,6 +313,7 @@ fn stale_session_end_after_slot_reuse_does_not_touch_new_connection() {
             drop(old);
             fixture.forward_lost(old_session);
             fixture.network.iteration(fixture.now).unwrap();
+            fixture.wait_handback(old_session);
 
             let mut client = fixture.client(1);
             let new_session = fixture.streams[1];

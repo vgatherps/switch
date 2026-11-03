@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration as WallDuration, Instant as WallInstant};
 
 use ceph_fifo::Fifo;
-use ceph_proto::Retire;
+use ceph_proto::{Control, Retire};
 use ceph_ring::{Config, Reader, Writer};
 use dpdk_smoltcp::smoltcp::{socket::tcp, time::Instant, wire::Ipv4Address};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
@@ -75,10 +75,13 @@ pub struct Fixture {
     pub streams: Vec<u64>,
     pub retired: Vec<u64>,
     pub protocol_errors: Vec<u64>,
+    pub released: Vec<u64>,
     network_events: Receiver<FromNetwork>,
     forward_events: Sender<FromNetwork>,
     control: Receiver<ToNetwork>,
     forward: Sender<ToNetwork>,
+    fifo_control: Receiver<Control>,
+    forward_fifo: Sender<Control>,
     held_retire: Option<(Receiver<Retire>, Sender<Retire>)>,
     host: JoinHandle<std::io::Result<()>>,
     fixtures: [RingPort; 2],
@@ -263,6 +266,7 @@ impl Fixture {
         let (events, network_events) = mpsc::channel();
         let (forward_events, from_network) = mpsc::channel();
         let (to_fifo, fifo_control) = mpsc::channel();
+        let (forward_fifo, network_fifo_control) = mpsc::channel();
         let (retire, retired) = mpsc::channel();
         let (retired, held_retire) = if options.hold_retire {
             let (forward_retire, host_retired) = mpsc::channel();
@@ -291,7 +295,7 @@ impl Fixture {
         )
         .unwrap();
         let host = thread::spawn(move || host.run());
-        let fifo = Fifo::new(reader, options.max_sessions, fifo_control, retire);
+        let fifo = Fifo::new(reader, options.max_sessions, network_fifo_control, retire);
         let network = Network::new(
             stack,
             fifo,
@@ -314,11 +318,14 @@ impl Fixture {
             ingress,
             streams: Vec::new(),
             retired: Vec::new(),
+            released: Vec::new(),
             network_events,
             protocol_errors: Vec::new(),
             forward_events,
             control,
             forward,
+            fifo_control,
+            forward_fifo,
             held_retire,
             host,
             fixtures,
@@ -329,6 +336,15 @@ impl Fixture {
     fn forward_message(&mut self, message: ToNetwork) {
         if let ToNetwork::Open { session, .. } = &message {
             self.streams.push(*session);
+            loop {
+                let control = self.fifo_control.recv_timeout(WAIT).unwrap();
+                let opened = matches!(control, Control::Open { slot, uid }
+                    if ceph_proto::pack(slot, uid) == *session);
+                self.forward_fifo.send(control).unwrap();
+                if opened {
+                    break;
+                }
+            }
         }
         self.forward.send(message).unwrap();
     }
@@ -450,6 +466,21 @@ impl Fixture {
         self.forward_message(message);
     }
 
+    /// Writer handback is not complete until the host sends the real FIFO Close.
+    /// Call after direct Network::iteration, before turn_network forwards queued FIFO controls.
+    pub fn wait_handback(&mut self, session: u64) {
+        self.forward_network_events();
+        loop {
+            let control = self.fifo_control.recv_timeout(WAIT).unwrap();
+            let closed = matches!(control, Control::Close { slot, uid }
+                if ceph_proto::pack(slot, uid) == session);
+            self.forward_fifo.send(control).unwrap();
+            if closed {
+                return;
+            }
+        }
+    }
+
     /// Hold the real FIFO completion until the test has queued its control bytes.
     pub fn wait_finished(&self, session: u64) -> Retire {
         let (retired, _) = self.held_retire.as_ref().unwrap();
@@ -480,10 +511,20 @@ impl Fixture {
         while let Ok(message) = self.control.try_recv() {
             self.forward_message(message);
         }
+        while let Ok(control) = self.fifo_control.try_recv() {
+            self.forward_fifo.send(control).unwrap();
+        }
         self.network.iteration(self.now).unwrap();
+        self.forward_network_events();
+    }
+
+    fn forward_network_events(&mut self) {
         while let Ok(message) = self.network_events.try_recv() {
             if let FromNetwork::Retired { session, .. } = &message {
                 self.retired.push(*session);
+            }
+            if let FromNetwork::Released { session, .. } = &message {
+                self.released.push(*session);
             }
             if let FromNetwork::ProtocolError { session } = &message {
                 self.protocol_errors.push(*session);

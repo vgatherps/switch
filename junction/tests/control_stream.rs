@@ -1113,10 +1113,8 @@ fn finished_ack_waits_for_all_backpressured_events() {
     // The next channel event is a barrier: Retired was handled before it is visible.
     host.event(observer_session, observer_id, Event::Bound);
     assert_eq!(events(&mut observer, 1), [(observer_id, Event::Bound)]);
-    assert!(
-        host.control.as_ref().unwrap().try_recv().is_err(),
-        "backpressured retirement freed its slot before writing End Finished"
-    );
+    // Writer handback frees the slot independently of backpressured control output.
+    host.closed(session);
     let mut received = 0;
     until(|| {
         client
@@ -1136,7 +1134,6 @@ fn finished_ack_waits_for_all_backpressured_events() {
         client.closed()
     });
     assert_eq!(received, COUNT);
-    host.closed(session);
 }
 
 #[test]

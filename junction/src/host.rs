@@ -7,6 +7,8 @@
 //! Protocol errors and kicks always abort, even after FIFO completion.
 //! The control thread creates each session's receive ring and owns its backing until the
 //! connection is removed. The network thread returns the writer here for destruction.
+//! Session slots and FIFO registrations remain owned until writer handback, even after
+//! control disconnect. A new Hello can report SessionsFull until that handback arrives.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -144,6 +146,7 @@ pub struct HostControl {
     channels: ControlChannels,
     connections: Vec<Connection>,
     free: Vec<u32>,
+    sessions: Vec<Option<u32>>,
     next_uid: u32,
     shutdown: bool,
 }
@@ -187,12 +190,14 @@ impl HostControl {
         let listener = UnixListener::bind(&config.socket_path)?;
         listener.set_nonblocking(true)?;
         let free = (0..config.max_sessions).rev().collect();
+        let sessions = vec![None; config.max_sessions as usize];
         Ok(Self {
             listener,
             config,
             channels,
             connections: Vec::new(),
             free,
+            sessions,
             next_uid: 1,
             shutdown: false,
         })
@@ -443,6 +448,7 @@ impl HostControl {
                     let slot = self.free.pop().expect("free slot checked above");
                     let uid = self.next_uid;
                     self.next_uid = next_uid;
+                    self.sessions[slot as usize] = Some(uid);
                     stream = pack(slot, uid);
                     rx_name = rx_backing.name().to_owned();
                     self.connections[index].phase = Phase::Live {
@@ -517,16 +523,6 @@ impl HostControl {
         {
             drop(connection.socket);
             drop(rx_backing);
-            let slot = slot(session);
-            let uid = uid(session);
-            if self
-                .channels
-                .to_fifo
-                .send(Control::Close { slot, uid })
-                .is_err()
-            {
-                self.shutdown = true;
-            }
             if let Some(how) = how
                 && self
                     .channels
@@ -536,7 +532,23 @@ impl HostControl {
             {
                 self.shutdown = true;
             }
-            self.free.push(slot);
+        }
+    }
+
+    fn handback(&mut self, session: SessionId, rx: RingWriter) {
+        drop(rx);
+        let slot = slot(session);
+        let uid = uid(session);
+        let Some(entry) = self.sessions.get_mut(slot as usize) else {
+            return;
+        };
+        if *entry != Some(uid) {
+            return;
+        }
+        *entry = None;
+        self.free.push(slot);
+        if self.channels.to_fifo.send(Control::Close { slot, uid }).is_err() {
+            self.shutdown = true;
         }
     }
 
@@ -603,7 +615,7 @@ impl HostControl {
                     }
                 }
                 FromNetwork::Retired { session, rx } => {
-                    drop(rx);
+                    self.handback(session, rx);
                     if let Some(index) = self.find(session)
                         && matches!(
                             self.connections[index].phase,
@@ -624,7 +636,7 @@ impl HostControl {
                         self.flush(index);
                     }
                 }
-                FromNetwork::Released { rx, .. } => drop(rx),
+                FromNetwork::Released { session, rx } => self.handback(session, rx),
             }
         }
     }
@@ -730,7 +742,7 @@ mod tests {
         retire: Sender<Retire>,
         events: Sender<FromNetwork>,
         rx: Option<RingWriter>,
-        _fifo: Receiver<Control>,
+        fifo: Receiver<Control>,
         _path: FixturePath,
     }
 
@@ -786,7 +798,7 @@ mod tests {
                 retire,
                 events,
                 rx: Some(rx),
-                _fifo: fifo,
+                fifo,
                 _path: path,
             }
         }
@@ -810,13 +822,78 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            self.events
-                .send(FromNetwork::Released {
-                    session: pack(0, 1),
-                    rx: self.rx.take().expect("fixture owns the network writer"),
-                })
-                .unwrap_or_else(|_| panic!("control event channel closed"));
-            self.host.drain_network();
+            if let Some(rx) = self.rx.take() {
+                self.events
+                    .send(FromNetwork::Released {
+                        session: pack(0, 1),
+                        rx,
+                    })
+                    .unwrap_or_else(|_| panic!("control event channel closed"));
+                self.host.drain_network();
+            }
+        }
+    }
+
+    #[test]
+    fn lost_session_slot_stays_full_until_writer_handback() {
+        for graceful in [false, true] {
+            let mut fixture = Fixture::new();
+            assert_eq!(fixture.fifo.try_recv().unwrap(), Control::Open { slot: 0, uid: 1 });
+            drop(fixture.client.take());
+            fixture.host.disconnect(0);
+            assert!(matches!(
+                fixture.network.try_recv().unwrap(),
+                ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+            ));
+            assert!(fixture.fifo.try_recv().is_err());
+
+            let (_client, socket) = UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            fixture.host.connections.push(Connection {
+                socket,
+                phase: Phase::Pending(Instant::now()),
+                input: Vec::new(),
+                output: Vec::new(),
+                written: 0,
+            });
+            fixture.host.hello(0, VERSION, 1).unwrap();
+            assert!(matches!(
+                HostMessage::decode(&fixture.host.connections[0].output).unwrap().unwrap().0,
+                HostMessage::Welcome(Welcome { status: WelcomeStatus::SessionsFull, .. })
+            ));
+            assert!(fixture.network.try_recv().is_err());
+
+            let rx = fixture.rx.take().unwrap();
+            let session = pack(0, 1);
+            fixture.events.send(if graceful {
+                FromNetwork::Retired { session, rx }
+            } else {
+                FromNetwork::Released { session, rx }
+            }).unwrap();
+            fixture.host.drain_network();
+            assert_eq!(fixture.fifo.try_recv().unwrap(), Control::Close { slot: 0, uid: 1 });
+            assert!(fixture.fifo.try_recv().is_err());
+            fixture.host.remove(0, None);
+            let (_next_client, socket) = UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            fixture.host.connections.push(Connection {
+                socket,
+                phase: Phase::Pending(Instant::now()),
+                input: Vec::new(),
+                output: Vec::new(),
+                written: 0,
+            });
+            fixture.host.hello(0, VERSION, 1).unwrap();
+            assert!(matches!(
+                HostMessage::decode(&fixture.host.connections[0].output).unwrap().unwrap().0,
+                HostMessage::Welcome(Welcome { status: WelcomeStatus::Ok, .. })
+            ));
+            assert!(matches!(
+                fixture.network.try_recv().unwrap(),
+                ToNetwork::Open { session, .. } if session == pack(0, 2)
+            ));
+            assert_eq!(fixture.fifo.try_recv().unwrap(), Control::Open { slot: 0, uid: 2 });
+            assert!(fixture.fifo.try_recv().is_err());
         }
     }
 
