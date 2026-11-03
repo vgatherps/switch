@@ -263,7 +263,7 @@ fn unsolicited_finished_is_invalid_host_data() {
 
 #[test]
 fn socket_operations_after_finish_panic_before_validation() {
-    let operations: [fn(&mut Session); 4] = [
+    let operations: [fn(&mut Session); 6] = [
         |client| {
             let _ = client.connect_tcp(
                 TcpConfig {
@@ -307,6 +307,25 @@ fn socket_operations_after_finish_panic_before_validation() {
                 slot: u32::MAX,
                 generation: 0,
             });
+        },
+        |client| {
+            let _ = client.send_tcp(
+                SocketId {
+                    slot: u32::MAX,
+                    generation: 0,
+                },
+                &mut [],
+            );
+        },
+        |client| {
+            let _ = client.send_udp(
+                SocketId {
+                    slot: u32::MAX,
+                    generation: 0,
+                },
+                std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234),
+                &mut [],
+            );
         },
     ];
     for operation in operations {

@@ -4,7 +4,7 @@
 //! cephalopod end record. Retry backpressure errors while polling events.
 //! Only the host's `EndReason::Finished` acknowledgement makes `Session::closed`
 //! true; a disconnect without that acknowledgement is session loss.
-//! After a successful `finish`, opening sockets and shutting down TCP panic.
+//! After a successful `finish`, opening sockets, sending and shutting down TCP panic.
 //! `close` and `abort` become no-ops so Drop cleanup remains safe, even while
 //! unwinding. Repeated `finish` calls and polling for the host acknowledgement
 //! remain valid.
@@ -23,6 +23,7 @@ use crate::control::{
     ClientMessage, ConfigError, DecodeError, EndReason, Event, HostMessage, ListenEndpoint, Op,
     SocketId, TcpConfig, UdpConfig, VERSION, WelcomeStatus,
 };
+use crate::send::{self, TCP_SEND_HEADER, UDP_SEND_HEADER};
 
 #[derive(Debug)]
 pub enum ConnectError {
@@ -57,6 +58,26 @@ impl fmt::Display for FinishError {
 }
 
 impl std::error::Error for FinishError {}
+
+/// A send record could not be committed to the session stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    Full,
+    TooLarge,
+    NotOpen,
+}
+
+impl fmt::Display for SendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Full => "session ingress stream is full",
+            Self::TooLarge => "send record exceeds ingress max_record",
+            Self::NotOpen => "socket is not open for sending",
+        })
+    }
+}
+
+impl std::error::Error for SendError {}
 
 #[derive(Debug)]
 pub enum Lost {
@@ -136,6 +157,8 @@ enum State {
 struct Slot {
     state: State,
     generation: u32,
+    tcp: bool,
+    shut: bool,
 }
 
 pub struct Session {
@@ -211,6 +234,8 @@ impl Session {
                 .map(|_| Slot {
                     state: State::Free,
                     generation: 0,
+                    tcp: false,
+                    shut: false,
                 })
                 .collect(),
             input: bytes,
@@ -223,7 +248,7 @@ impl Session {
         })
     }
 
-    fn allocate(&mut self) -> Result<SocketId, OpenError> {
+    fn allocate(&mut self, tcp: bool) -> Result<SocketId, OpenError> {
         let (index, slot) = self
             .slots
             .iter_mut()
@@ -232,6 +257,8 @@ impl Session {
             .ok_or(OpenError::NoFreeSlot)?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.state = State::Open;
+        slot.tcp = tcp;
+        slot.shut = false;
         Ok(SocketId {
             slot: index as u32,
             generation: slot.generation,
@@ -248,7 +275,7 @@ impl Session {
     ) -> Result<SocketId, OpenError> {
         self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
-        let id = self.allocate()?;
+        let id = self.allocate(true)?;
         self.queue(Op::ConnectTcp {
             id,
             config,
@@ -267,7 +294,7 @@ impl Session {
     ) -> Result<SocketId, OpenError> {
         self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
-        let id = self.allocate()?;
+        let id = self.allocate(true)?;
         self.queue(Op::ListenTcp { id, config, local });
         Ok(id)
     }
@@ -277,9 +304,75 @@ impl Session {
     pub fn bind_udp(&mut self, config: UdpConfig) -> Result<SocketId, OpenError> {
         self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
-        let id = self.allocate()?;
+        let id = self.allocate(false)?;
         self.queue(Op::BindUdp { id, config });
         Ok(id)
+    }
+
+    /// Overwrites `record[..TCP_SEND_HEADER]` with the header and commits one record.
+    /// `Full` consumes no sequence number; retry after space becomes available.
+    ///
+    /// Valid only after this socket's `Connected` event. An earlier send can reach
+    /// the host before the open because the stream and control socket are unordered,
+    /// ending the session as a protocol error. Session does not enforce this ordering.
+    ///
+    /// # Panics
+    /// Panics after successful `finish()`, for insufficient header headroom, an
+    /// invalid or stale socket ID, or a UDP socket.
+    pub fn send_tcp(&mut self, id: SocketId, record: &mut [u8]) -> Result<(), SendError> {
+        self.assert_unfinished();
+        assert!(
+            record.len() >= TCP_SEND_HEADER,
+            "TCP send requires header headroom"
+        );
+        let slot = self.slot_for(id);
+        assert!(slot.tcp, "TCP send requires a TCP socket: {id:?}");
+        if slot.state != State::Open || slot.shut {
+            return Err(SendError::NotOpen);
+        }
+        send::write_tcp(record, id);
+        self.push(record)
+    }
+
+    /// Overwrites `record[..UDP_SEND_HEADER]` with the header and commits one record.
+    /// `Full` consumes no sequence number; retry after space becomes available.
+    ///
+    /// Valid only after this socket's `Bound` event. An earlier send can reach
+    /// the host before the open because the stream and control socket are unordered,
+    /// ending the session as a protocol error. Session does not enforce this ordering.
+    ///
+    /// # Panics
+    /// Panics after successful `finish()`, for insufficient header headroom, an
+    /// invalid or stale socket ID, or a TCP socket.
+    pub fn send_udp(
+        &mut self,
+        id: SocketId,
+        to: SocketAddrV4,
+        record: &mut [u8],
+    ) -> Result<(), SendError> {
+        self.assert_unfinished();
+        assert!(
+            record.len() >= UDP_SEND_HEADER,
+            "UDP send requires header headroom"
+        );
+        let slot = self.slot_for(id);
+        assert!(!slot.tcp, "UDP send requires a UDP socket: {id:?}");
+        if slot.state != State::Open {
+            return Err(SendError::NotOpen);
+        }
+        send::write_udp(record, id, to);
+        self.push(record)
+    }
+
+    fn push(&mut self, record: &[u8]) -> Result<(), SendError> {
+        match self.writer.try_push(record, self.stream, self.next_seq) {
+            Ok(()) => {
+                self.next_seq += 1;
+                Ok(())
+            }
+            Err(ceph_ring::PushError::Full) => Err(SendError::Full),
+            Err(ceph_ring::PushError::TooLarge) => Err(SendError::TooLarge),
+        }
     }
 
     /// # Panics
@@ -291,6 +384,7 @@ impl Session {
             slot.state == State::Open,
             "shutdown requires an open socket: {id:?}"
         );
+        slot.shut = true;
         self.queue(Op::ShutdownTcp { id });
     }
 
@@ -458,8 +552,8 @@ impl Session {
     /// Poll events and retry either error. A successful call is idempotent, but
     /// does not mean retirement is complete: keep polling until `closed()` is true.
     /// Control I/O failures are reported by `poll_events`.
-    /// After success, `connect_tcp`, `listen_tcp`, `bind_udp`, and `shutdown`
-    /// panic before validating their arguments or changing socket state.
+    /// After success, `connect_tcp`, `listen_tcp`, `bind_udp`, `send_tcp`,
+    /// `send_udp`, and `shutdown` panic before validating arguments or changing state.
     /// `close` and `abort` instead do nothing, even for invalid IDs, so Drop
     /// cleanup remains safe during unwinding and sends no further operations.
     pub fn finish(&mut self) -> Result<(), FinishError> {

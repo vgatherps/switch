@@ -17,7 +17,8 @@ use junction::control::{
     SocketId, TcpConfig, UdpConfig, VERSION, Welcome, WelcomeStatus,
 };
 use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
-use junction::session::{ConnectError, Lost, OpenError, Session};
+use junction::send::{self, SendRecord, TCP_SEND_HEADER, UDP_SEND_HEADER};
+use junction::session::{ConnectError, Lost, OpenError, SendError, Session};
 
 const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(30);
@@ -702,6 +703,143 @@ fn finish_waits_for_fifo_and_network_retirement() {
         fifo.next_message().is_none(),
         "finish must not enqueue twice"
     );
+}
+
+#[test]
+fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
+    let mut host = Host::new(2, 2);
+    let mut client = connect(&host.path, 2).unwrap();
+    let ToNetwork::Open { session, .. } = host.network.try_recv().unwrap() else {
+        panic!("expected Open before Welcome");
+    };
+    let mut fifo = Fifo::new(
+        host.reader.take().unwrap(),
+        2,
+        host.control.take().unwrap(),
+        host.retire.clone(),
+    );
+    let tcp_id = client.listen_tcp(tcp(), local()).unwrap();
+    assert!(matches!(host.op(session), Op::ListenTcp { .. }));
+    host.event(session, tcp_id, Event::Connected);
+    until(|| {
+        let mut connected = false;
+        client
+            .poll_events(|id, event| {
+                assert_eq!(id, tcp_id);
+                assert_eq!(event, Event::Connected);
+                connected = true;
+            })
+            .unwrap();
+        connected
+    });
+
+    let mut record = [0xa5; 256];
+    let mut sent = 0u64;
+    loop {
+        record[TCP_SEND_HEADER..TCP_SEND_HEADER + 8].copy_from_slice(&sent.to_le_bytes());
+        match client.send_tcp(tcp_id, &mut record) {
+            Ok(()) => sent += 1,
+            Err(SendError::Full) => break,
+            other => panic!("unexpected send result: {other:?}"),
+        }
+    }
+    assert!(sent > 0);
+    let mut received = 0u64;
+    until(|| {
+        if let Some(message) = fifo.next_message() {
+            assert_eq!(message.stream(), session);
+            assert_eq!(message.seq(), received);
+            assert!(!message.end());
+            let SendRecord::Tcp { id, payload } = send::decode(message.payload()).unwrap() else {
+                panic!("expected TCP record");
+            };
+            assert_eq!(id, tcp_id);
+            assert_eq!(&payload[..8], &received.to_le_bytes());
+            assert!(payload[8..].iter().all(|byte| *byte == 0xa5));
+            received += 1;
+        }
+        received == sent
+    });
+    assert!(fifo.next_message().is_none());
+
+    // A rejected push must not leave a sequence gap: the FIFO would kick the stream.
+    let mut empty_tcp = [0xa5; TCP_SEND_HEADER];
+    client.send_tcp(tcp_id, &mut empty_tcp).unwrap();
+    let udp_id = client.bind_udp(udp()).unwrap();
+    assert!(matches!(host.op(session), Op::BindUdp { .. }));
+    host.event(session, udp_id, Event::Bound);
+    until(|| {
+        let mut bound = false;
+        client
+            .poll_events(|id, event| {
+                assert_eq!(id, udp_id);
+                assert_eq!(event, Event::Bound);
+                bound = true;
+            })
+            .unwrap();
+        bound
+    });
+    let to = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 9), 0x1234);
+    let mut datagram = [0xa5; UDP_SEND_HEADER + 3];
+    datagram[UDP_SEND_HEADER..].copy_from_slice(b"udp");
+    client.send_udp(udp_id, to, &mut datagram).unwrap();
+    client.finish().unwrap();
+    let mut tail = 0;
+    until(|| {
+        if let Some(message) = fifo.next_message() {
+            assert_eq!(message.stream(), session);
+            assert_eq!(message.seq(), sent + tail);
+            match tail {
+                0 => assert_eq!(
+                    send::decode(message.payload()),
+                    Some(SendRecord::Tcp {
+                        id: tcp_id,
+                        payload: b"",
+                    })
+                ),
+                1 => assert_eq!(
+                    send::decode(message.payload()),
+                    Some(SendRecord::Udp {
+                        id: udp_id,
+                        to,
+                        payload: b"udp",
+                    })
+                ),
+                2 => assert!(message.end(), "expected clean stream end"),
+                _ => panic!("unexpected extra record"),
+            }
+            tail += 1;
+        }
+        // A kicked stream is reported by the control thread rather than timing out.
+        client.poll_events(|_, _| {}).unwrap();
+        tail == 3
+    });
+    host.end(session, EndHow::Graceful);
+    host.send(FromNetwork::Retired { session });
+    until(|| {
+        client.poll_events(|_, _| {}).unwrap();
+        client.closed()
+    });
+}
+
+#[test]
+fn tcp_send_after_shutdown_is_not_open() {
+    let host = Host::new(1, 1);
+    let (mut client, session) = host.open(1);
+    let id = client.listen_tcp(tcp(), local()).unwrap();
+    assert!(matches!(host.op(session), Op::ListenTcp { .. }));
+    host.event(session, id, Event::Connected);
+    until(|| {
+        let mut connected = false;
+        client
+            .poll_events(|_, event| connected |= event == Event::Connected)
+            .unwrap();
+        connected
+    });
+    let mut record = [0; TCP_SEND_HEADER + 1];
+    client.send_tcp(id, &mut record).unwrap();
+    client.shutdown(id);
+    assert_eq!(client.send_tcp(id, &mut record), Err(SendError::NotOpen));
 }
 
 #[test]
