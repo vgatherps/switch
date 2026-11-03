@@ -10,8 +10,9 @@
 //! Open. Sends from older socket generations are dropped; unopened or future generations
 //! are protocol errors. TCP backlogs delay shutdown and close, and outlive graceful retirement.
 //! Closed sockets with backlogs use the Stack's orphan retry limit even while held here.
-//! Receive frames publish whole into the session ring. A full ring retains one owned
-//! frame per socket and retries it before the next Stack turn, delaying receive EOF.
+//! TCP receive frames split at the session ring's payload limit; oversized UDP datagrams
+//! are dropped and counted. A full ring retains one owned frame and TCP offset per socket,
+//! retrying before the next Stack turn and delaying receive EOF.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -66,8 +67,10 @@ struct NetworkState {
     free: Vec<u32>,
     backlogged: Vec<u32>,
     rx_pending: Vec<u32>,
+    rx_cursor: usize,
     held_count: usize,
     udp_dropped: u64,
+    udp_rx_dropped: u64,
     to_control: Sender<FromNetwork>,
 }
 
@@ -92,8 +95,10 @@ impl Network {
                 free: (0..capacity).rev().collect(),
                 backlogged: Vec::new(),
                 rx_pending: Vec::new(),
+                rx_cursor: 0,
                 held_count: 0,
                 udp_dropped: 0,
+                udp_rx_dropped: 0,
                 to_control,
             },
             config,
@@ -167,6 +172,11 @@ impl Network {
         self.state.udp_dropped
     }
 
+    /// Received datagrams exceeding their session ring's maximum payload.
+    pub fn udp_rx_dropped(&self) -> u64 {
+        self.state.udp_rx_dropped
+    }
+
     /// Drops every remaining socket handle and returns the Stack (test teardown).
     pub fn into_stack(self) -> Stack {
         let NetworkState { stack, sockets, .. } = self.state;
@@ -183,7 +193,6 @@ impl NetworkState {
                 max_sockets,
                 rx,
             } => {
-                assert!(rx.max_payload() >= usize::from(self.stack.ip_mtu()));
                 let entry = self
                     .sessions
                     .get_mut(slot(session) as usize)
@@ -300,7 +309,7 @@ impl NetworkState {
         let was_pending = socket.held_rx.is_some();
         // A pending retry may run while armed; tcp_mut would fire another token.
         socket.socket.disarm(&mut self.stack);
-        socket.receive(&mut self.stack, &mut entry.rx);
+        socket.receive(&mut self.stack, &mut entry.rx, &mut self.udp_rx_dropped);
         socket.fired(&mut self.stack, &self.to_control);
         socket.socket.arm(&mut self.stack, index);
         if socket.held_rx.is_some() {
@@ -313,13 +322,24 @@ impl NetworkState {
     }
 
     fn retry_rx(&mut self) {
-        let mut position = 0;
-        while position < self.rx_pending.len() {
+        let count = self.rx_pending.len();
+        if count == 0 {
+            return;
+        }
+        let mut position = self.rx_cursor % count;
+        self.rx_cursor = position + 1;
+        // Removal preserves order, so the next unvisited entry shifts into this position.
+        // Visit the original count exactly once, wrapping after the original tail.
+        for _ in 0..count {
             let index = self.rx_pending[position];
             self.service_rx(index);
             if self.rx_pending.get(position) == Some(&index) {
                 position += 1;
             }
+            if self.rx_pending.is_empty() {
+                break;
+            }
+            position %= self.rx_pending.len();
         }
     }
 

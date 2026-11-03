@@ -1,4 +1,4 @@
-//! Owned packets received through a session's shared-memory ring.
+//! Owned receive records: TCP byte-stream chunks and whole UDP datagrams.
 //!
 //! Retaining an `RxFrame` prevents reuse of its ring storage. Drop frames and
 //! continue polling the session to reclaim that storage for the host.

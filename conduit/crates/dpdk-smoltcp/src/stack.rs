@@ -547,11 +547,6 @@ impl Stack {
         self.max_udp_sockets
     }
 
-    /// The IP MTU, excluding the Ethernet header.
-    pub fn ip_mtu(&self) -> u16 {
-        self.ip_mtu
-    }
-
     /// The port's `PortConfig::tx_burst`: the most frames one flush burst offers the PMD.
     pub fn tx_burst(&self) -> usize {
         self.device.tx_burst_size()

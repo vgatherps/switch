@@ -17,6 +17,7 @@ pub(crate) enum Socket {
         handle: TcpHandle,
         key: TcpReadyKey,
         connected: bool,
+        fin_seen: bool,
         peer_fin: bool,
         shutdown: bool,
         delivered: bool,
@@ -29,7 +30,7 @@ pub(crate) enum Socket {
 }
 
 pub(crate) enum HeldRx {
-    Tcp(TcpFrame),
+    Tcp { frame: TcpFrame, offset: usize },
     Udp(UdpDatagram),
 }
 
@@ -132,6 +133,7 @@ impl Socket {
             handle,
             key,
             connected: false,
+            fin_seen: false,
             peer_fin: false,
             shutdown: false,
             delivered: false,
@@ -200,8 +202,8 @@ fn add_tcp(stack: &mut Stack, config: TcpConfig) -> Result<TcpHandle, RejectCode
 }
 
 impl HostSocket {
-    /// Keeps ownership of the first frame that cannot fit in the session RX ring.
-    pub fn receive(&mut self, stack: &mut Stack, rx: &mut RingWriter) {
+    /// Retains an owned frame and TCP offset while the session RX ring is full.
+    pub fn receive(&mut self, stack: &mut Stack, rx: &mut RingWriter, udp_dropped: &mut u64) {
         if let Socket::Tcp { handle, .. } = &self.socket
             && stack.tcp(handle).reset_by_peer()
         {
@@ -209,14 +211,18 @@ impl HostSocket {
             return;
         }
         loop {
-            let frame = match self.held_rx.take() {
+            let mut frame = match self.held_rx.take() {
                 Some(frame) => frame,
-                None => match &self.socket {
-                    Socket::Tcp { handle, .. } => match stack.tcp_mut(handle).recv() {
-                        Ok(Some(frame)) => HeldRx::Tcp(frame),
-                        Ok(None) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => {
+                None => match &mut self.socket {
+                    Socket::Tcp {
+                        handle, fin_seen, ..
+                    } => match stack.tcp_mut(handle).recv() {
+                        Ok(Some(frame)) => HeldRx::Tcp { frame, offset: 0 },
+                        Err(tcp::RecvError::Finished) => {
+                            *fin_seen = true;
                             break;
                         }
+                        Ok(None) | Err(tcp::RecvError::InvalidState) => break,
                     },
                     Socket::Udp { handle, .. } => match stack.udp_mut(handle).recv() {
                         Some(frame) => HeldRx::Udp(frame),
@@ -225,19 +231,29 @@ impl HostSocket {
                 },
             };
             let payload = match &frame {
-                HeldRx::Tcp(frame) => frame.payload(),
-                HeldRx::Udp(frame) => frame.payload(),
+                HeldRx::Tcp { frame, offset } => {
+                    let remaining = &frame.payload()[*offset..];
+                    &remaining[..remaining.len().min(rx.max_payload())]
+                }
+                HeldRx::Udp(frame) => {
+                    if frame.payload().len() > rx.max_payload() {
+                        *udp_dropped += 1;
+                        continue;
+                    }
+                    frame.payload()
+                }
             };
             let Some(mut reserved) = rx.reserve(payload.len()) else {
                 self.held_rx = Some(frame);
                 break;
             };
+            let len = payload.len();
             reserved.payload().copy_from_slice(payload);
             let meta = reserved.meta();
             meta.slot = self.id.slot;
             meta.generation = self.id.generation;
             match &frame {
-                HeldRx::Tcp(frame) => {
+                HeldRx::Tcp { frame, .. } => {
                     meta.kind = TCP;
                     meta.rx_timestamp = frame.rx_timestamp();
                 }
@@ -251,6 +267,12 @@ impl HostSocket {
                 }
             }
             reserved.commit();
+            if let HeldRx::Tcp { frame: tcp, offset } = &mut frame {
+                *offset += len;
+                if *offset < tcp.payload().len() {
+                    self.held_rx = Some(frame);
+                }
+            }
         }
     }
 
@@ -296,6 +318,7 @@ impl HostSocket {
         let Socket::Tcp {
             handle,
             connected,
+            fin_seen,
             peer_fin,
             shutdown,
             delivered,
@@ -329,16 +352,14 @@ impl HostSocket {
             *connected = true;
             event(to_control, session, self.id, Event::Connected);
         }
-        if !*peer_fin
-            && drained
-            && matches!(
-                state,
-                tcp::State::CloseWait
-                    | tcp::State::LastAck
-                    | tcp::State::Closing
-                    | tcp::State::TimeWait
-            )
-        {
+        *fin_seen |= matches!(
+            state,
+            tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait
+        );
+        if !*peer_fin && *fin_seen && drained {
             *peer_fin = true;
             event(to_control, session, self.id, Event::PeerFin);
         }

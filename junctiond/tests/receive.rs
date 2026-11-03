@@ -2,7 +2,7 @@ use std::time::Instant as WallInstant;
 
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::{socket::tcp::State, wire::IpEndpoint};
-use junction::control::{Event, SocketId};
+use junction::control::{Event, Op, SocketId};
 use junction::rx::{RxFrame, TCP, UDP};
 use junction::session::Session;
 use zhida_test_kit::with_eal;
@@ -38,6 +38,51 @@ fn check_tcp(id: SocketId, expected_id: SocketId, frame: &RxFrame) {
     assert_eq!(frame.meta().generation, expected_id.generation);
     assert_eq!(frame.meta().kind, TCP);
     assert!(!frame.payload().is_empty());
+}
+
+fn hold_tcp_until_acked(
+    f: &mut Fixture,
+    client: &mut Session,
+    events: &mut Vec<(SocketId, Event)>,
+    id: SocketId,
+    peer: &TcpHandle,
+    payload: &[u8],
+) -> Vec<RxFrame> {
+    assert_eq!(f.peer.tcp_mut(peer).send_slice(payload), Ok(payload.len()));
+    let mut held = Vec::new();
+    let deadline = WallInstant::now() + WAIT;
+    while f.peer.tcp(peer).send_queue() != 0 {
+        assert!(
+            WallInstant::now() < deadline,
+            "peer data was not acknowledged"
+        );
+        if !f.round_receive(client, events, |packet_id, frame| {
+            check_tcp(packet_id, id, &frame);
+            held.push(frame);
+        }) {
+            f.advance();
+        }
+    }
+    let marker = client.bind_udp(udp_config(LOCAL_PORT + 1)).unwrap();
+    while !events.contains(&(marker, Event::Bound)) {
+        assert!(WallInstant::now() < deadline, "full-ring barrier timed out");
+        f.round_receive(client, events, |packet_id, frame| {
+            check_tcp(packet_id, id, &frame);
+            held.push(frame);
+        });
+    }
+    let prefix: Vec<u8> = held
+        .iter()
+        .flat_map(|frame| frame.payload().iter().copied())
+        .collect();
+    assert!(!prefix.is_empty());
+    assert!(prefix.len() < payload.len(), "RX ring did not fill");
+    assert_eq!(prefix, payload[..prefix.len()]);
+    client.close(marker, false);
+    f.until(client, events, |_, events| {
+        events.contains(&(marker, Event::Freed))
+    });
+    held
 }
 
 #[zhida_test_support::pinned_test]
@@ -163,10 +208,170 @@ fn tcp_held_receive_frames_block_reclaim_and_fin_until_pending_bytes_publish() {
                 f.advance();
             }
             assert!(received.len() <= payload.len());
+            if events.contains(&(id, Event::PeerFin)) {
+                assert_eq!(
+                    received.len(),
+                    payload.len(),
+                    "first poll reporting FIN did not deliver every pending byte"
+                );
+            }
         }
         assert_eq!(
             received, payload,
             "reserve-failed host frame was not retained"
+        );
+        f.peer.remove_tcp(peer);
+        drop(client);
+        f.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn tcp_last_ack_closes_while_rx_is_held_then_publishes_bytes_before_fin_and_closed() {
+    with_eal(|eal| {
+        let mut f = Fixture::with_rx_size(eal, ["jrlaa", "jrlab"], 1, 1, 16 * 1024);
+        let mut client = f.client(2);
+        let mut events = Vec::new();
+        let (id, peer) = connect_receive(&mut f, &mut client, &mut events);
+        let payload: Vec<u8> = (0..32 * 1024).map(|n| (n % 233) as u8).collect();
+        let held = hold_tcp_until_acked(&mut f, &mut client, &mut events, id, &peer, &payload);
+        f.peer.close(&peer);
+        let deadline = WallInstant::now() + WAIT;
+        while f.peer.tcp(&peer).state() != State::FinWait2 {
+            assert!(
+                WallInstant::now() < deadline,
+                "peer FIN was not acknowledged"
+            );
+            if !f.round_receive(&mut client, &mut events, |_, _| {
+                panic!("full ring published another frame")
+            }) {
+                f.advance();
+            }
+        }
+        assert!(!events.contains(&(id, Event::PeerFin)));
+        client.shutdown(id);
+        assert_eq!(f.wait_op(id), Op::ShutdownTcp { id });
+        while f.peer.tcp(&peer).state() != State::TimeWait {
+            assert!(WallInstant::now() < deadline, "peer did not ACK local FIN");
+            if !f.round_receive(&mut client, &mut events, |_, _| {
+                panic!("full ring published another frame")
+            }) {
+                f.advance();
+            }
+        }
+        // TimeWait proves the peer received our FIN and forwarded its ACK. The
+        // next network turn consumes that ACK before this ordered event fence.
+        f.round_receive(&mut client, &mut events, |_, _| {
+            panic!("full ring published another frame")
+        });
+        let marker = client.bind_udp(udp_config(LOCAL_PORT + 1)).unwrap();
+        while !events.contains(&(marker, Event::Bound)) {
+            assert!(WallInstant::now() < deadline, "ACK event barrier timed out");
+            f.round_receive(&mut client, &mut events, |_, _| {
+                panic!("full ring published another frame")
+            });
+        }
+        assert!(!events.iter().any(|(socket, event)| {
+            *socket == id && matches!(event, Event::PeerFin | Event::Closed { .. })
+        }));
+        let mut received: Vec<u8> = held
+            .iter()
+            .flat_map(|frame| frame.payload().iter().copied())
+            .collect();
+        drop(held);
+        let closed = Event::Closed {
+            reset_by_peer: false,
+        };
+        let deadline = WallInstant::now() + WAIT;
+        while !events.contains(&(id, closed)) {
+            assert!(
+                WallInstant::now() < deadline,
+                "closed TCP lost pending RX or EOF"
+            );
+            f.round_receive(&mut client, &mut events, |packet_id, frame| {
+                check_tcp(packet_id, id, &frame);
+                received.extend_from_slice(frame.payload());
+            });
+            if events.contains(&(id, Event::PeerFin)) || events.contains(&(id, closed)) {
+                assert_eq!(received, payload, "EOF preceded the last byte");
+            }
+        }
+        assert_eq!(received, payload);
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|(socket, event)| {
+                    (*socket == id && matches!(event, Event::PeerFin | Event::Closed { .. }))
+                        .then_some(*event)
+                })
+                .collect::<Vec<_>>(),
+            [Event::PeerFin, closed]
+        );
+        f.peer.remove_tcp(peer);
+        drop(client);
+        f.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn tcp_peer_reset_closes_without_releasing_full_rx_ring_and_discards_pending_bytes() {
+    with_eal(|eal| {
+        let mut f = Fixture::with_rx_size(eal, ["jrrsa", "jrrsb"], 1, 1, 16 * 1024);
+        let mut client = f.client(2);
+        let mut events = Vec::new();
+        let (id, peer) = connect_receive(&mut f, &mut client, &mut events);
+        let payload: Vec<u8> = (0..32 * 1024).map(|n| (n % 229) as u8).collect();
+        let held = hold_tcp_until_acked(&mut f, &mut client, &mut events, id, &peer, &payload);
+        let held_bytes = held
+            .iter()
+            .map(|frame| frame.payload().len())
+            .sum::<usize>();
+        f.peer.abort(&peer);
+        let closed = Event::Closed {
+            reset_by_peer: true,
+        };
+        let deadline = WallInstant::now() + WAIT;
+        while !events.contains(&(id, closed)) {
+            assert!(
+                WallInstant::now() < deadline,
+                "reset waited for client RX release"
+            );
+            if !f.round_receive(&mut client, &mut events, |_, _| {
+                panic!("pending bytes published after peer reset")
+            }) {
+                f.advance();
+            }
+        }
+        assert_eq!(
+            held.iter()
+                .flat_map(|frame| frame.payload().iter().copied())
+                .collect::<Vec<_>>(),
+            payload[..held_bytes]
+        );
+        assert!(!events.contains(&(id, Event::PeerFin)));
+        drop(held);
+        client
+            .poll(
+                |socket, event| events.push((socket, event)),
+                |_, _| panic!("packet delivered after reset Closed"),
+            )
+            .unwrap();
+        let marker = client.bind_udp(udp_config(LOCAL_PORT + 1)).unwrap();
+        while !events.contains(&(marker, Event::Bound)) {
+            assert!(
+                WallInstant::now() < deadline,
+                "post-reset event barrier timed out"
+            );
+            f.round_receive(&mut client, &mut events, |_, _| {
+                panic!("released ring received stale bytes after reset Closed")
+            });
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == (id, closed))
+                .count(),
+            1
         );
         f.peer.remove_tcp(peer);
         drop(client);

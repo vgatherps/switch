@@ -90,6 +90,7 @@ struct ControlOptions {
     max_sessions: u32,
     hold_retire: bool,
     rx_size: usize,
+    jumbo: bool,
 }
 
 impl Default for ControlOptions {
@@ -99,6 +100,7 @@ impl Default for ControlOptions {
             max_sessions: 16,
             hold_retire: false,
             rx_size: 64 * 1024,
+            jumbo: false,
         }
     }
 }
@@ -149,6 +151,27 @@ impl Fixture {
         )
     }
 
+    pub fn with_jumbo_rx(
+        eal: &Eal,
+        names: [&str; 2],
+        tcp: usize,
+        udp: usize,
+        rx_size: usize,
+    ) -> Self {
+        Self::configured(
+            eal,
+            names,
+            tcp,
+            udp,
+            64,
+            ControlOptions {
+                rx_size,
+                jumbo: true,
+                ..ControlOptions::default()
+            },
+        )
+    }
+
     pub fn with_held_retire(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
         Self::configured(
             eal,
@@ -194,6 +217,9 @@ impl Fixture {
                 ..pair::config(side)
             };
             let mut config = fixture.config();
+            if options.jumbo {
+                zhida_test_kit::ring_port::resize(&mut config, 9000, 9216);
+            }
             config.rx_pool.count = u32::try_from(
                 rx_reserve(
                     config.rx_descriptors,

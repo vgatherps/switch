@@ -536,6 +536,9 @@ impl Session {
     /// Dispatches available control events before draining received packets.
     ///
     /// All event callbacks in this poll happen before its packet callbacks.
+    /// The ring and control socket are unordered: a socket's packets may arrive
+    /// before its `Connected` event. Callers needing that event first must queue
+    /// packets per socket until it arrives.
     /// Packets for freed sockets or earlier socket generations are discarded.
     /// A callback may retain its owned frame; that storage becomes reusable only
     /// after the frame is dropped and a poll reclaims it.
