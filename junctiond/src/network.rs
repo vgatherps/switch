@@ -5,9 +5,9 @@
 //! socket discards all its held operations, including before same-generation reuse.
 //! Idle iterations skip held-operation scans when none are queued. A consumed FIFO end
 //! makes later session loss graceful unless the session has a protocol error. Explicit
-//! aborts always reset sockets, even after a FIFO end. Until packet records are defined,
-//! every non-end FIFO record is a session protocol error; an unknown session first drains
-//! control through its queued Open, then handles its record.
+//! aborts always reset sockets, even after a FIFO end. SEND records borrow their FIFO
+//! message through dispatch; an unknown session first drains control through its queued
+//! Open. TCP backlogs delay shutdown and close, and outlive graceful session retirement.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -18,6 +18,7 @@ use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::{Stack, StackError, Turn};
 use junction::control::{Event, Op};
 use junction::host::{EndHow, FromNetwork, SessionId, ToNetwork};
+use junction::send::{self, SendRecord};
 
 use crate::sockets::{self, HostSocket, Socket};
 
@@ -44,14 +45,22 @@ struct Session {
 
 /// Owns the Stack, session socket handles and FIFO on the network thread.
 pub struct Network {
-    stack: Stack,
     fifo: Fifo,
+    state: NetworkState,
+    config: NetworkConfig,
+    from_control: Receiver<ToNetwork>,
+}
+
+// Kept separate from the FIFO so control catch-up and SEND dispatch can run while
+// a Message holds the FIFO's reader borrow.
+struct NetworkState {
+    stack: Stack,
     sessions: Vec<Option<Session>>,
     sockets: Vec<Option<HostSocket>>,
     free: Vec<u32>,
+    backlogged: Vec<u32>,
     held_count: usize,
-    config: NetworkConfig,
-    from_control: Receiver<ToNetwork>,
+    udp_dropped: u64,
     to_control: Sender<FromNetwork>,
 }
 
@@ -68,26 +77,31 @@ impl Network {
         let capacity = stack.max_sockets() + stack.max_udp_sockets();
         let capacity = u32::try_from(capacity).expect("host socket slots exceed readiness tokens");
         Network {
-            stack,
             fifo,
-            sessions: (0..max_sessions).map(|_| None).collect(),
-            sockets: (0..capacity).map(|_| None).collect(),
-            free: (0..capacity).rev().collect(),
-            held_count: 0,
+            state: NetworkState {
+                stack,
+                sessions: (0..max_sessions).map(|_| None).collect(),
+                sockets: (0..capacity).map(|_| None).collect(),
+                free: (0..capacity).rev().collect(),
+                backlogged: Vec::new(),
+                held_count: 0,
+                udp_dropped: 0,
+                to_control,
+            },
             config,
             from_control,
-            to_control,
         }
     }
 
     /// Drains bounded control and FIFO work, releases held operations on FIFO idle, then
     /// turns the Stack and reports every fired TCP transition, even if the turn failed.
     pub fn iteration(&mut self, now: Instant) -> Result<Turn, StackError> {
+        let state = &mut self.state;
         for _ in 0..self.config.control_batch {
             let Ok(message) = self.from_control.try_recv() else {
                 break;
             };
-            self.receive_control(message);
+            state.receive_control(message);
         }
 
         let mut idle = false;
@@ -97,46 +111,47 @@ impl Network {
                 break;
             };
             let session = message.stream();
-            let end = message.end();
-            drop(message);
-            if self.live(session).is_none() {
+            if state.live(session).is_none() {
                 // FIFO registration can overtake the bounded control drain.
-                while let Ok(message) = self.from_control.try_recv() {
-                    self.receive_control(message);
-                    if self.live(session).is_some() {
+                while let Ok(control) = self.from_control.try_recv() {
+                    state.receive_control(control);
+                    if state.live(session).is_some() {
                         // Handle this record before later ops or terminal control messages.
                         break;
                     }
                 }
             }
-            if end {
-                if let Some(Some(entry)) = self.sessions.get_mut(slot(session) as usize)
+            if message.end() {
+                if let Some(Some(entry)) = state.sessions.get_mut(slot(session) as usize)
                     && entry.uid == uid(session)
                 {
                     entry.ended = true;
                 }
-            } else if self.live(session).is_some_and(|session| !session.errored) {
-                self.protocol_error(session);
+            } else if state.live(session).is_some_and(|entry| !entry.errored) {
+                state.receive_send(session, message.payload());
             }
         }
-        if idle && self.held_count != 0 {
-            for index in 0..self.sessions.len() {
-                if let Some(session) = &self.sessions[index]
+        if idle && state.held_count != 0 {
+            for index in 0..state.sessions.len() {
+                if let Some(session) = &state.sessions[index]
                     && !session.errored
                 {
                     let id = ceph_proto::pack(index as u32, session.uid);
-                    self.release(id, true);
+                    state.release(id, true);
                 }
             }
         }
-        let turn = self.stack.turn(now, self.config.ingress_budget);
-        while let Some(token) = self.stack.pop_fired() {
-            if let Some(socket) = &mut self.sockets[token as usize] {
-                let session = self.sessions[slot(socket.session) as usize]
+        state.drain_backlogs();
+        let turn = state.stack.turn(now, self.config.ingress_budget);
+        while let Some(token) = state.stack.pop_fired() {
+            if let Some(socket) = &mut state.sockets[token as usize]
+                && let Some(session) = socket.session
+            {
+                let session = state.sessions[slot(session) as usize]
                     .as_ref()
                     .expect("host socket belongs to an unregistered session");
                 if !session.errored {
-                    socket.fired(&mut self.stack, &self.to_control, token);
+                    socket.fired(&mut state.stack, &state.to_control, token);
                 }
             }
         }
@@ -144,15 +159,23 @@ impl Network {
     }
 
     pub fn poll_at(&mut self) -> Option<Instant> {
-        self.stack.poll_at()
+        self.state.stack.poll_at()
+    }
+
+    /// Datagrams rejected by the Stack after their SEND records were committed.
+    pub fn udp_dropped(&self) -> u64 {
+        self.state.udp_dropped
     }
 
     /// Drops every remaining socket handle and returns the Stack (test teardown).
     pub fn into_stack(self) -> Stack {
-        let Self { stack, sockets, .. } = self;
+        let NetworkState { stack, sockets, .. } = self.state;
         drop(sockets);
         stack
     }
+}
+
+impl NetworkState {
     fn receive_control(&mut self, message: ToNetwork) {
         match message {
             ToNetwork::Open {
@@ -200,6 +223,71 @@ impl Network {
         }
     }
 
+    fn receive_send(&mut self, session: SessionId, payload: &[u8]) {
+        let Some(record) = send::decode(payload) else {
+            self.protocol_error(session);
+            return;
+        };
+        let id = match &record {
+            SendRecord::Tcp { id, .. } | SendRecord::Udp { id, .. } => *id,
+        };
+        let entry = self.registered(session);
+        let Some(entry_slot) = entry.slots.get(id.slot as usize) else {
+            self.protocol_error(session);
+            return;
+        };
+        if entry_slot.generation != Some(id.generation) {
+            self.protocol_error(session);
+            return;
+        }
+        let Some(index) = entry_slot.host else {
+            return;
+        };
+        let socket = self.sockets[index as usize].as_mut().unwrap();
+        match (record, &socket.socket) {
+            (SendRecord::Tcp { payload, .. }, Socket::Tcp { .. }) => {
+                let empty = socket.backlog.is_empty();
+                socket.send_tcp(&mut self.stack, payload);
+                if empty && !socket.backlog.is_empty() {
+                    self.backlogged.push(index);
+                }
+            }
+            (SendRecord::Udp { to, payload, .. }, Socket::Udp(handle)) => {
+                if self
+                    .stack
+                    .udp_send(handle, Some(to.into()), payload)
+                    .is_err()
+                {
+                    self.udp_dropped += 1;
+                }
+            }
+            _ => self.protocol_error(session),
+        }
+    }
+
+    fn drain_backlogs(&mut self) {
+        let mut position = 0;
+        while position < self.backlogged.len() {
+            let index = self.backlogged[position];
+            let socket = self.sockets[index as usize].as_mut().unwrap();
+            socket.drain_backlog(&mut self.stack);
+            if !socket.backlog.is_empty() {
+                position += 1;
+                continue;
+            }
+            self.backlogged.swap_remove(position);
+            let deferred = socket.deferred.take();
+            let session = socket.session;
+            if let Some(session) = session {
+                if let Some(op) = deferred {
+                    self.apply(session, op, true);
+                }
+            } else {
+                self.remove_socket(index, false);
+            }
+        }
+    }
+
     fn receive_op(&mut self, session: SessionId, op: Op) {
         let entry = self.registered(session);
         if entry.errored {
@@ -233,9 +321,11 @@ impl Network {
                         .expect("Stack admitted more sockets than the host table holds");
                     socket.arm(&mut self.stack, index);
                     self.sockets[index as usize] = Some(HostSocket {
-                        session,
+                        session: Some(session),
                         id,
                         socket,
+                        backlog: VecDeque::new(),
+                        deferred: None,
                     });
                     self.sessions[slot(session) as usize]
                         .as_mut()
@@ -294,6 +384,15 @@ impl Network {
         let Some(index) = entry_slot.host else {
             return;
         };
+        let socket = self.sockets[index as usize].as_mut().unwrap();
+        if !socket.backlog.is_empty()
+            && matches!(op, Op::ShutdownTcp { .. } | Op::Close { unread: false, .. })
+        {
+            if socket.deferred.is_none() || matches!(op, Op::Close { .. }) {
+                socket.deferred = Some(op);
+            }
+            return;
+        }
         if matches!(op, Op::ShutdownTcp { .. }) {
             self.sockets[index as usize]
                 .as_mut()
@@ -301,12 +400,8 @@ impl Network {
                 .socket
                 .shutdown(&mut self.stack);
         } else {
-            let socket = self.sockets[index as usize].take().unwrap();
-            if matches!(op, Op::AbortTcp { .. } | Op::Close { unread: true, .. }) {
-                socket.socket.abort(&mut self.stack);
-            }
-            socket.socket.drop_handle();
-            self.free.push(index);
+            let abort = matches!(op, Op::AbortTcp { .. } | Op::Close { unread: true, .. });
+            self.remove_socket(index, abort);
             let entry = self.sessions[slot(session) as usize].as_mut().unwrap();
             entry.slots[id.slot as usize].host = None;
             let held_before = entry.held.len();
@@ -316,6 +411,16 @@ impl Network {
                 sockets::event(&self.to_control, session, id, Event::Freed);
             }
         }
+    }
+
+    fn remove_socket(&mut self, index: u32, abort: bool) {
+        let socket = self.sockets[index as usize].take().unwrap();
+        self.backlogged.retain(|pending| *pending != index);
+        if abort {
+            socket.socket.abort(&mut self.stack);
+        }
+        socket.socket.drop_handle();
+        self.free.push(index);
     }
 
     fn release(&mut self, session: SessionId, events: bool) {
@@ -353,12 +458,16 @@ impl Network {
         self.held_count -= entry.held.len();
         for slot in entry.slots {
             if let Some(index) = slot.host {
-                let socket = self.sockets[index as usize].take().unwrap();
-                if !graceful {
-                    socket.socket.abort(&mut self.stack);
+                let socket = self.sockets[index as usize].as_mut().unwrap();
+                if graceful && !socket.backlog.is_empty() {
+                    socket.session = None;
+                    socket.deferred = Some(Op::Close {
+                        id: socket.id,
+                        unread: false,
+                    });
+                } else {
+                    self.remove_socket(index, !graceful);
                 }
-                socket.socket.drop_handle();
-                self.free.push(index);
             }
         }
         if graceful {

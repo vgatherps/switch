@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
 
 use dpdk_smoltcp::smoltcp::socket::tcp;
@@ -20,9 +21,11 @@ pub(crate) enum Socket {
 }
 
 pub(crate) struct HostSocket {
-    pub session: SessionId,
+    pub session: Option<SessionId>,
     pub id: SocketId,
     pub socket: Socket,
+    pub backlog: VecDeque<u8>,
+    pub deferred: Option<Op>,
 }
 
 pub(crate) fn event(
@@ -166,7 +169,45 @@ fn add_tcp(stack: &mut Stack, config: TcpConfig) -> Result<TcpHandle, RejectCode
 }
 
 impl HostSocket {
+    pub fn send_tcp(&mut self, stack: &mut Stack, payload: &[u8]) {
+        let Socket::Tcp { handle, .. } = &self.socket else {
+            unreachable!("validated TCP send must name a TCP socket")
+        };
+        if self.backlog.is_empty() {
+            if let Ok(sent) = stack.tcp_mut(handle).send_slice(payload) {
+                self.backlog.extend(&payload[sent..]);
+            }
+        } else {
+            self.backlog.extend(payload);
+        }
+    }
+
+    pub fn drain_backlog(&mut self, stack: &mut Stack) {
+        let Socket::Tcp { handle, .. } = &self.socket else {
+            unreachable!("only TCP sockets have a send backlog")
+        };
+        while !self.backlog.is_empty() {
+            let (front, _) = self.backlog.as_slices();
+            let len = front.len();
+            match stack.tcp_mut(handle).send_slice(front) {
+                Ok(sent) => {
+                    self.backlog.drain(..sent);
+                    if sent < len {
+                        break;
+                    }
+                }
+                Err(tcp::SendError::InvalidState) => {
+                    self.backlog.clear();
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn fired(&mut self, stack: &mut Stack, to_control: &Sender<FromNetwork>, token: u32) {
+        let Some(session) = self.session else {
+            return;
+        };
         let Socket::Tcp {
             handle,
             connected,
@@ -197,7 +238,7 @@ impl HostSocket {
         );
         if !*connected && synchronized {
             *connected = true;
-            event(to_control, self.session, self.id, Event::Connected);
+            event(to_control, session, self.id, Event::Connected);
         }
         if !*peer_fin
             && matches!(
@@ -209,18 +250,18 @@ impl HostSocket {
             )
         {
             *peer_fin = true;
-            event(to_control, self.session, self.id, Event::PeerFin);
+            event(to_control, session, self.id, Event::PeerFin);
         }
         if *shutdown && !*delivered && matches!(state, tcp::State::FinWait2 | tcp::State::TimeWait)
         {
             *delivered = true;
-            event(to_control, self.session, self.id, Event::Delivered);
+            event(to_control, session, self.id, Event::Delivered);
         }
         if state == tcp::State::Closed {
             *closed = true;
             event(
                 to_control,
-                self.session,
+                session,
                 self.id,
                 Event::Closed { reset_by_peer },
             );

@@ -10,11 +10,12 @@ use std::time::{Duration as WallDuration, Instant as WallInstant};
 
 use ceph_fifo::Fifo;
 use ceph_proto::Retire;
-use ceph_ring::{Config, Reader};
+use ceph_ring::{Config, Reader, Writer};
 use dpdk_smoltcp::smoltcp::{socket::tcp, time::Instant, wire::Ipv4Address};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
 use junction::control::{Event, ListenEndpoint, Op, SocketId, TcpConfig, UdpConfig};
 use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
+use junction::send::TCP_SEND_HEADER;
 use junction::session::Session;
 use junctiond::network::{Network, NetworkConfig};
 use zhida_test_kit::pair::{self, BUDGET, Side, T0, assert_lossless};
@@ -72,6 +73,7 @@ pub struct Fixture {
     pub ingress: String,
     pub streams: Vec<u64>,
     pub retired: Vec<u64>,
+    pub protocol_errors: Vec<u64>,
     network_events: Receiver<FromNetwork>,
     forward_events: Sender<FromNetwork>,
     control: Receiver<ToNetwork>,
@@ -262,6 +264,7 @@ impl Fixture {
             streams: Vec::new(),
             retired: Vec::new(),
             network_events,
+            protocol_errors: Vec::new(),
             forward_events,
             control,
             forward,
@@ -315,6 +318,20 @@ impl Fixture {
                 return op;
             }
         }
+    }
+
+    /// Commit a send already in flight when a control operation removes its socket.
+    /// The caller owns sequence accounting and must not also send through Session.
+    pub fn raw_tcp_send(&self, session: u64, id: SocketId, seq: u64, payload: &[u8]) {
+        let mut record = vec![0; TCP_SEND_HEADER + payload.len()];
+        record[0] = 16;
+        record[4..8].copy_from_slice(&id.slot.to_le_bytes());
+        record[8..12].copy_from_slice(&id.generation.to_le_bytes());
+        record[TCP_SEND_HEADER..].copy_from_slice(payload);
+        Writer::attach(&self.ingress)
+            .unwrap()
+            .try_push(&record, session, seq)
+            .unwrap();
     }
     /// Forward the real graceful terminal message, then reproduce the control EOF race.
     /// Only the trailing Lost is injected; retirement and all opens/ops use the host.
@@ -416,6 +433,9 @@ impl Fixture {
         while let Ok(message) = self.network_events.try_recv() {
             if let FromNetwork::Retired { session } = &message {
                 self.retired.push(*session);
+            }
+            if let FromNetwork::ProtocolError { session } = &message {
+                self.protocol_errors.push(*session);
             }
             self.forward_events.send(message).unwrap();
         }
