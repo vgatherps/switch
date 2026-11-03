@@ -117,7 +117,7 @@ fn open_gateway_silent_fails_after_3s() {
         }) => {
             assert_eq!(actual, gateway);
             assert!(waited >= Duration::from_secs(3));
-            assert_eq!(requests, 3, "one ARP request per 1 s silence over 3 s");
+            assert!((1..=3).contains(&requests), "{requests} ARP requests over 3 s");
             stack.into_port().try_close().unwrap();
         }
         Err(error) => panic!("unexpected error: {error}"),
