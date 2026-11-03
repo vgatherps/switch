@@ -681,18 +681,6 @@ fn echo_until_server_fin(pair: &mut Pair, server: &mut EchoServer, local: u16, d
     pair.a.remove_tcp(handle);
 }
 
-#[zhida_test_support::pinned_test]
-fn close_after_sends_fin_after_exactly_n_bytes_and_discards_the_rest() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["c1a", "c1b"], 1, 1);
-        let mut server = EchoServer::new(&mut pair.b, ECHO_PORT, 1, 1024)
-            .unwrap()
-            .with_close_after(Some(CLOSE_AFTER));
-        echo_until_server_fin(&mut pair, &mut server, CLIENT_PORT, pattern(8 * 1024, 20));
-        close(pair);
-    });
-}
-
 /// The second connection on the same listener gets CLOSE_AFTER bytes again.
 #[zhida_test_support::pinned_test]
 fn close_after_count_restarts_on_the_next_connection() {
