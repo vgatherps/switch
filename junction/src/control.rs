@@ -145,6 +145,7 @@ pub enum EndReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
     TcpRxCapacityTooLarge,
+    TcpTxCapacityZero,
     UdpPortZero,
     UdpRxQueueZero,
 }
@@ -153,6 +154,9 @@ impl TcpConfig {
     pub fn check(&self) -> Result<(), ConfigError> {
         if self.rx_capacity > 1 << 30 {
             return Err(ConfigError::TcpRxCapacityTooLarge);
+        }
+        if self.tx_capacity == 0 {
+            return Err(ConfigError::TcpTxCapacityZero);
         }
         Ok(())
     }
@@ -174,6 +178,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::TcpRxCapacityTooLarge => "TCP receive capacity exceeds 1 GiB",
+            Self::TcpTxCapacityZero => "TCP transmit capacity is zero",
             Self::UdpPortZero => "UDP local port is zero",
             Self::UdpRxQueueZero => "UDP receive queue is zero",
         })

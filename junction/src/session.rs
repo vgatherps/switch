@@ -388,10 +388,11 @@ impl Session {
     }
 
     /// # Panics
-    /// Panics if `finish()` has succeeded, or the socket is not open.
+    /// Panics if `finish()` has succeeded, or the socket is not open or not TCP.
     pub fn shutdown(&mut self, id: SocketId) {
         self.assert_unfinished();
         let slot = self.slot_for(id);
+        assert!(slot.tcp, "shutdown requires a TCP socket: {id:?}");
         assert!(
             slot.state == State::Open,
             "shutdown requires an open socket: {id:?}"
@@ -418,11 +419,13 @@ impl Session {
     /// This permits socket cleanup from Drop, including during unwinding.
     ///
     /// # Panics
-    /// Before successful `finish()`, panics if the socket ID is invalid or closing.
+    /// Before successful `finish()`, panics if the socket ID is invalid, closing,
+    /// or not TCP.
     pub fn abort(&mut self, id: SocketId) {
         if self.finished {
             return;
         }
+        assert!(self.slot_for(id).tcp, "abort requires a TCP socket: {id:?}");
         if self.begin_close(id) {
             self.queue(Op::AbortTcp { id });
         }

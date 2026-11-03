@@ -1,8 +1,9 @@
 //! Unix control thread. The network thread owns sockets in the Stack, never these descriptors.
 //!
 //! Poll passes read one chunk per connection. Terminal handling snapshots and drains only
-//! already-readable control bytes. FIFO completion survives control disconnects, and network
-//! retirement keeps flushing queued events and End(Finished) before closing.
+//! already-readable control bytes, including after write failures. FIFO completion survives
+//! control disconnects, and network retirement keeps flushing queued events and End(Finished)
+//! before closing.
 //! Protocol errors and kicks always abort, even after FIFO completion.
 //! The control thread creates each session's receive ring and owns its backing until the
 //! connection is removed. The network thread returns the writer here for destruction.
@@ -558,11 +559,22 @@ impl HostControl {
 
     fn flush(&mut self, index: usize) {
         let retiring = matches!(self.connections[index].phase, Phase::Retiring { .. });
-        if self.connections[index].flush().is_err()
-            || (matches!(
+        if self.connections[index].flush().is_err() {
+            if matches!(
                 self.connections[index].phase,
-                Phase::Rejected | Phase::Retiring { .. }
-            ) && self.connections[index].output.is_empty())
+                Phase::Live {
+                    draining: false,
+                    ..
+                }
+            ) {
+                self.disconnect(index);
+            } else {
+                self.remove(index, (!retiring).then_some(EndHow::Lost));
+            }
+        } else if matches!(
+            self.connections[index].phase,
+            Phase::Rejected | Phase::Retiring { .. }
+        ) && self.connections[index].output.is_empty()
         {
             self.remove(index, (!retiring).then_some(EndHow::Lost));
         }
@@ -982,6 +994,70 @@ mod tests {
         assert!(matches!(
             fixture.network.try_recv().unwrap(),
             ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+        ));
+        assert!(fixture.network.try_recv().is_err());
+        assert!(fixture.host.connections.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_failure_forwards_readable_ops_before_lost_end() {
+        let mut fixture = Fixture::new();
+        let count = fixture.write_ops();
+        fixture.host.connections[0]
+            .socket
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        fixture.host.connections[0].queue(HostMessage::Event {
+            id: SocketId {
+                slot: 0,
+                generation: 0,
+            },
+            event: Event::Connected,
+        });
+        fixture.host.flush(0);
+        for generation in 0..count as u32 {
+            assert!(matches!(
+                fixture.network.try_recv().unwrap(),
+                ToNetwork::Op {
+                    session,
+                    op: Op::ShutdownTcp { id: SocketId { slot: 0, generation: actual } },
+                } if session == pack(0, 1) && actual == generation
+            ));
+        }
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Lost } if session == pack(0, 1)
+        ));
+        assert!(fixture.network.try_recv().is_err());
+        assert!(fixture.host.connections.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_failure_with_readable_protocol_error_aborts_instead_of_lost() {
+        let mut fixture = Fixture::new();
+        fixture
+            .client
+            .as_mut()
+            .unwrap()
+            .write_all(&[255; 8])
+            .unwrap();
+        fixture.host.connections[0]
+            .socket
+            .shutdown(std::net::Shutdown::Write)
+            .unwrap();
+        fixture.host.connections[0].queue(HostMessage::Event {
+            id: SocketId {
+                slot: 0,
+                generation: 0,
+            },
+            event: Event::Connected,
+        });
+        fixture.host.flush(0);
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::End { session, how: EndHow::Abort } if session == pack(0, 1)
         ));
         assert!(fixture.network.try_recv().is_err());
         assert!(fixture.host.connections.is_empty());

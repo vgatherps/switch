@@ -958,7 +958,6 @@ fn slot_rules_validate_config_and_handle_rejection_racing_close() {
     host.event(session, first, Event::Rejected(RejectCode::UdpPortInUse));
     events(&mut client, 1);
     client.close(first, false);
-    client.abort(first);
     assert!(host.network.recv_timeout(QUIET).is_err());
     let second = client.bind_udp(udp()).unwrap();
     assert_eq!(
@@ -1318,4 +1317,52 @@ fn poll_discards_packets_for_aborted_socket_generation_after_reopen() {
         )
         .unwrap();
     assert_eq!(packets, [(current, b"current".to_vec())]);
+}
+
+#[test]
+fn connect_tcp_rejects_zero_tx_capacity_before_allocating_slot() {
+    let host = Host::new(1, 1);
+    let (mut client, session) = host.open(1);
+    let remote = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+    assert!(matches!(
+        client.connect_tcp(
+            TcpConfig {
+                tx_capacity: 0,
+                ..tcp()
+            },
+            remote,
+            local(),
+        ),
+        Err(OpenError::Config(ConfigError::TcpTxCapacityZero))
+    ));
+    let id = client.connect_tcp(tcp(), remote, local()).unwrap();
+    assert_eq!(
+        host.op(session),
+        Op::ConnectTcp {
+            id,
+            config: tcp(),
+            remote,
+            local: local(),
+        }
+    );
+    assert_eq!(id.slot, 0);
+    assert_eq!(id.generation, 1);
+}
+
+#[test]
+#[should_panic(expected = "shutdown requires a TCP socket")]
+fn udp_shutdown_panics() {
+    let host = Host::new(1, 1);
+    let (mut client, _) = host.open(1);
+    let id = client.bind_udp(udp()).unwrap();
+    client.shutdown(id);
+}
+
+#[test]
+#[should_panic(expected = "abort requires a TCP socket")]
+fn udp_abort_panics() {
+    let host = Host::new(1, 1);
+    let (mut client, _) = host.open(1);
+    let id = client.bind_udp(udp()).unwrap();
+    client.abort(id);
 }
