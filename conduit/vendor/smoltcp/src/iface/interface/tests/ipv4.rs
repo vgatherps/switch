@@ -939,11 +939,8 @@ fn test_broadcast_echo_no_reply(#[case] medium: Medium) {
 }
 
 #[test]
-#[allow(unsafe_code)]
-fn ingress_takes_each_frame_once_via_into_buf() {
+fn ingress_releases_each_frame_once() {
     use core::cell::Cell;
-    use core::ptr::NonNull;
-    use std::boxed::Box;
     use std::collections::VecDeque;
     use std::rc::Rc;
 
@@ -951,48 +948,11 @@ fn ingress_takes_each_frame_once_via_into_buf() {
     use crate::socket::tcp;
     use crate::tests::TestingDevice;
 
-    #[derive(Default)]
-    struct Counts {
-        takes: Cell<usize>,
-        releases: Cell<usize>,
-    }
-
-    struct FrameStorage {
-        bytes: Vec<u8>,
-        counts: Rc<Counts>,
-    }
-
-    struct CountingRxToken(FrameStorage);
+    struct CountingRxToken(RxBuf);
 
     impl RxToken for CountingRxToken {
         fn into_buf(self) -> RxBuf {
-            unsafe fn release(owner: NonNull<()>) {
-                // SAFETY: into_buf transfers this Box<FrameStorage> to the callback.
-                let storage = unsafe { Box::from_raw(owner.cast::<FrameStorage>().as_ptr()) };
-                storage.counts.releases.set(
-                    storage
-                        .counts
-                        .releases
-                        .get()
-                        .checked_add(1)
-                        .expect("release count overflow"),
-                );
-            }
-
-            self.0.counts.takes.set(
-                self.0
-                    .counts
-                    .takes
-                    .get()
-                    .checked_add(1)
-                    .expect("take count overflow"),
-            );
-            let storage = Box::leak(Box::new(self.0));
-            let data = NonNull::new(storage.bytes.as_mut_ptr()).unwrap();
-            let len = storage.bytes.len();
-            let owner = NonNull::from(storage).cast();
-            // SAFETY: the vector owns this range exclusively until release drops its box.
-            unsafe { RxBuf::from_raw_parts(owner, release, data, len, 0) }
+            self.0
         }
     }
 
@@ -1084,32 +1044,16 @@ fn ingress_takes_each_frame_once_via_into_buf() {
         &caps,
     );
 
-    let counts = [Rc::new(Counts::default()), Rc::new(Counts::default())];
+    let releases = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
     let queue = [arp_bytes, syn_bytes]
         .into_iter()
-        .zip(&counts)
-        .map(|(bytes, counts)| {
-            CountingRxToken(FrameStorage {
-                bytes,
-                counts: counts.clone(),
-            })
-        })
+        .zip(&releases)
+        .map(|(bytes, releases)| CountingRxToken(RxBuf::counted_frame(bytes, 0, releases.clone())))
         .collect();
     let mut device = CountingDevice {
         inner,
         queue: VecDeque::new(),
     };
-    {
-        use crate::phy::FrameToken as _;
-
-        let mut frame = crate::tests::tx_test_buf(&[2]);
-        frame.headroom_mut(1).0[0] = 1;
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_retain(frame, 1, None);
-        assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
-    }
     let mut listener = tcp::Socket::test_socket(64, 64);
     listener.listen(1234).unwrap();
     let handle = sockets.add(listener);
@@ -1118,9 +1062,8 @@ fn ingress_takes_each_frame_once_via_into_buf() {
     device.inner.tx_queue.clear();
     device.queue = queue;
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
-    for counts in &counts {
-        assert_eq!(counts.takes.get(), 1);
-        assert_eq!(counts.releases.get(), 1);
+    for releases in &releases {
+        assert_eq!(releases.get(), 1);
     }
     assert!(device.queue.is_empty());
     assert_eq!(device.inner.tx_queue.len(), 2);

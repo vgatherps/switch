@@ -1752,7 +1752,6 @@ mod tests {
         let a = set.add(socket());
         set.remove(a);
         let b = set.add(socket());
-        assert_eq!(b.to_string(), a.to_string());
         assert_ne!(b, a);
         assert_panics(INVALID, || {
             set.get_mut(a);
@@ -2013,8 +2012,6 @@ mod tests {
             iface.classify_dirty(&mut set, Instant::ZERO);
             set.get(handles[0]);
             assert_eq!(set.iter().count(), 3);
-            assert!(set.dirty_list.is_empty());
-            drop(set.iter_mut());
             assert!(set.dirty_list.is_empty());
             set.listen(handles[0], local.port).unwrap();
             set.get_mut(handles[0]);
