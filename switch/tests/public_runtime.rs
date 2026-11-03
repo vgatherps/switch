@@ -16,7 +16,7 @@ async fn sleep_until_then_set(spawner: Spawner, completed: Rc<Cell<bool>>) {
 }
 
 #[test]
-fn public_runtime_drives_sleep_with_caller_ticks_and_prepolled_events() {
+fn public_runtime_drives_sleeps_with_caller_ticks_and_rejects_overflow() {
     let mut runtime = Runtime::new(100);
     let spawner = runtime.spawner();
     let sleep_spawner = spawner.clone();

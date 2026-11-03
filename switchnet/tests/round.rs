@@ -1,5 +1,4 @@
-//! `round`: one Net turn and one Runtime poll, reporting whether anything moved; it never
-//! sleeps, so an idle loop turns as fast as it can.
+//! `round`: one Net turn and one Runtime poll, reporting whether anything moved.
 
 use switchnet::{IpEndpoint, round};
 use zhida_test_kit::pair::BUDGET;
@@ -9,7 +8,7 @@ mod support;
 use support::{Mixed, counted, net_ip, peer_udp_send, udp_config};
 
 #[zhida_test_support::pinned_test]
-fn idle_rounds_report_nothing_moved_and_do_not_sleep() {
+fn idle_rounds_report_nothing_moved() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["rdia", "rdib"]);
         assert_eq!(mixed.net.poll_at(), None, "the Stack has a timer");
