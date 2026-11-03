@@ -227,6 +227,39 @@ fn dropped_session_resets_established_tcp() {
 }
 
 #[zhida_test_support::pinned_test]
+fn crashed_session_resets_tcp_before_releasing_held_plain_close() {
+    with_eal(|eal| {
+        let mut fixture = Fixture::new(eal, ["lcrsha", "lcrshb"], 1, 0, 64);
+        let mut client = fixture.client(1);
+        let mut events = Vec::new();
+        let (id, peer) = connect(&mut fixture, &mut client, &mut events, LOCAL_PORT);
+        let session = fixture.streams[0];
+        client.close(id, false);
+        assert_eq!(fixture.wait_op(id), Op::Close { id, unread: false });
+        drop(client);
+        fixture.forward_lost(session);
+        // Both control messages precede this turn. Close is held until FIFO idle,
+        // where the unended lost session must abort before that close is released.
+        fixture.turn_network();
+        let deadline = WallInstant::now() + WAIT;
+        while !fixture.released.contains(&session)
+            || !matches!(fixture.peer.tcp(&peer).state(), State::Closed | State::CloseWait)
+        {
+            assert!(WallInstant::now() < deadline, "crashed session did not close its peer");
+            fixture.round_links();
+        }
+        assert!(
+            fixture.peer.tcp(&peer).reset_by_peer(),
+            "crashed session sent FIN instead of resetting its held plain close"
+        );
+        assert_eq!(fixture.released, [session]);
+        assert!(fixture.retired.is_empty());
+        drop(peer);
+        fixture.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn finish_then_drop_with_control_loss_before_fifo_end_delivers_bytes_then_fin() {
     with_eal(|eal| {
         let mut fixture = Fixture::new(eal, ["lfda", "lfdb"], 2, 0, 1);
