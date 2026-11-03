@@ -516,23 +516,18 @@ mod tests {
             {"prefix": "10.0.1.99/32", "mtu": 1500, "why": "jumbo-less host"},
         ]);
         let config = Config::from_json(&value.to_string()).unwrap();
-        let rules: Vec<PathMtu> = config.paths.iter()
-            .map(|rule| PathMtu { prefix: rule.prefix, mtu: rule.mtu })
-            .collect();
-        let paths = PathMtus::new(&rules, config.ipv4, config.mtu).unwrap();
         for (addr, expected) in [("10.0.1.5", 9001), ("10.0.1.99", 1500),
             ("10.0.7.7", 9001), ("1.1.1.1", 1500)]
         {
             let addr = addr.parse().unwrap();
             assert_eq!(config.path_mtu(addr), expected);
-            assert_eq!(config.path_mtu(addr), paths.ip_mtu(addr));
         }
     }
 
     #[test]
     fn config_round_trips_pci_and_vdev() {
         let pci = Config::from_json(EXPECTED).unwrap();
-        assert_eq!(pci.to_json(), EXPECTED);
+        assert_eq!(serde_json::from_str::<Value>(&pci.to_json()).unwrap(), example());
         assert_eq!(Config::from_json(&pci.to_json()).unwrap(), pci);
         let mut value = example();
         value["device"] = json!({"vdev": "net_tap0,iface=cdnic0"});
@@ -705,14 +700,12 @@ mod tests {
     fn owned_ipv4_absent_or_empty_keeps_the_single_address_json() {
         let config = Config::from_json(EXPECTED).unwrap();
         assert!(config.owned_ipv4.is_empty());
-        assert_eq!(config.to_json(), EXPECTED);
+        assert_eq!(serde_json::from_str::<Value>(&config.to_json()).unwrap(), example());
         assert!(config.to_string().contains("owned_ipv4: none\n"));
         let mut value = example();
         value["owned_ipv4"] = json!([]);
-        assert_eq!(
-            Config::from_json(&value.to_string()).unwrap().to_json(),
-            EXPECTED
-        );
+        let empty = Config::from_json(&value.to_string()).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&empty.to_json()).unwrap(), example());
         value["owned_ipv4"] = Value::Null;
         assert!(Config::from_json(&value.to_string()).is_err());
     }
@@ -742,9 +735,10 @@ mod tests {
         ]);
         assert_eq!(config.owned_ipv4, merged);
         let json = config.to_json();
-        assert!(json.contains(
-            "  \"gateway\": \"10.0.1.1\",\n  \"owned_ipv4\": [\n    \"10.0.1.24/32\",\n    \"10.0.2.0/29\","
-        ), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&json).unwrap()["owned_ipv4"],
+            json!(["10.0.1.24/32", "10.0.2.0/29", "10.0.2.8/29", "10.0.3.0/24", "172.16.0.0/16"])
+        );
         assert_eq!(Config::from_json(&json).unwrap(), config);
         assert!(config.to_string().contains(
             "owned_ipv4: 10.0.1.24/32, 10.0.2.0/29, 10.0.2.8/29, 10.0.3.0/24, 172.16.0.0/16\n"

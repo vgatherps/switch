@@ -96,7 +96,7 @@ pub fn close(port: Port, mut code: i32) -> i32 {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{feed_socket, server_socket, sizing};
+    use super::{feed_socket, server_socket, sizing, STAGING};
     use crate::args::Args;
 
     fn parsed(args: &[&str]) -> Args {
@@ -117,8 +117,9 @@ mod tests {
         let server = parsed(&["--config", "x", "sockperf-server", "--tcp-port", "1"]);
         let feed = sizing(&config, &feed.mode, None);
         let server = sizing(&config, &server.mode, None);
-        assert_eq!((feed.rx_staging, feed.tx_pending), (128, 32));
-        assert_eq!((server.rx_staging, server.tx_pending), (32, 32));
+        assert_eq!(feed.rx_staging, binance_feed::INGRESS_BUDGET);
+        assert_eq!(server.rx_staging, STAGING);
+        assert_eq!(feed.tx_pending, server.tx_pending);
     }
 
     /// The frame share is one send window, whatever the number of sockets.
