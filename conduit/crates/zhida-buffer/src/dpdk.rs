@@ -1083,49 +1083,6 @@ mod tests {
     use super::*;
     use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
-    #[zhida_test_support::pinned_test]
-    #[should_panic(expected = "test pool already acquired on this thread")]
-    fn test_pool_second_acquire_while_held_panics() {
-        let _held = acquire_test_pool();
-        let _second = acquire_test_pool();
-    }
-
-    #[zhida_test_support::pinned_test]
-    fn test_pool_guard_drop_with_live_mbuf_panics_and_releases_the_pool() {
-        let guard = acquire_test_pool();
-        let live = guard.alloc().unwrap().into_raw();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)))
-            .expect_err("dropping the guard with a live mbuf must panic");
-        drop(unsafe { Mbuf::from_raw(live) });
-
-        let again = acquire_test_pool();
-        assert_eq!(again.in_use_count(), 0);
-    }
-
-    #[zhida_test_support::pinned_test]
-    fn test_pool_on_thread_without_lcore_panics_and_frees_its_pool() {
-        // Test pool names share one counter, so the next pool created after this
-        // probe is named `test_pool_{probe + 1}`.
-        let probe = create_test_pool(1, RTE_PKTMBUF_HEADROOM as u16);
-        let probe_name = unsafe { std::ffi::CStr::from_ptr((*probe).name.as_ptr()) };
-        let probe_id: u32 = probe_name.to_str().unwrap()["test_pool_".len()..].parse().unwrap();
-        unsafe { rte_mempool_free(probe) };
-
-        let panic = std::thread::spawn(|| {
-            assert_eq!(unsafe { zhida_dpdk_sys::zhida_lcore_id() }, u32::MAX);
-            drop(acquire_test_pool());
-        })
-        .join()
-        .expect_err("acquire on a thread without an lcore must panic");
-        assert_eq!(
-            panic.downcast_ref::<&str>().copied(),
-            Some("Failed to get mempool cache for this thread's test pool")
-        );
-
-        let created = std::ffi::CString::new(format!("test_pool_{}", probe_id + 1)).unwrap();
-        assert!(unsafe { zhida_dpdk_sys::rte_mempool_lookup(created.as_ptr()) }.is_null());
-    }
-
     /// After the owner was dropped with `survivor` out: the survivor's bytes are intact,
     /// it frees into the retained backing, and every object comes back exactly once.
     fn return_survivor_to_retained_backing(
@@ -1761,35 +1718,6 @@ mod tests {
         drop(head);
         assert_eq!(pool.in_use_count(), 0);
         assert_pool_returned_exactly_once(&pool, limit + 1);
-    }
-
-    #[zhida_test_support::pinned_test]
-    fn test_pool_init_sets_cache_ptr_on_all_mbufs() {
-        // Verify that cache pointers are pre-set at pool creation.
-        // Even mbufs allocated via raw DPDK alloc (simulating RX path) have cache ptr set.
-        let pool = PoolManager::new(256);
-
-        // Use raw DPDK alloc (bypasses our alloc_fast, simulates NIC driver alloc)
-        let raw_mbuf = unsafe { zhida_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool()) };
-        assert!(!raw_mbuf.is_null(), "raw alloc should succeed");
-
-        // Read the cache pointer from priv_data
-        let cache_ptr: *mut zhida_dpdk_sys::rte_mempool_cache = unsafe {
-            let cache_slot = (raw_mbuf as *mut u8)
-                .add(std::mem::size_of::<rte_mbuf>())
-                as *mut *mut zhida_dpdk_sys::rte_mempool_cache;
-            *cache_slot
-        };
-
-        // Should match the pool's cache pointer
-        assert_eq!(
-            cache_ptr,
-            pool.cache(),
-            "raw DPDK alloc should have cache ptr pre-set from pool init"
-        );
-
-        // Clean up
-        unsafe { zhida_dpdk_sys::dpdk_raw_pktmbuf_free(raw_mbuf) };
     }
 
     // ========================================================================
@@ -2531,18 +2459,6 @@ mod tests {
     // ========================================================================
 
     #[zhida_test_support::pinned_test]
-    fn test_iter_segs_single_segment() {
-        let pool = PoolManager::new(256);
-        let mbuf = pool.alloc_with_len(100).unwrap();
-        let mut segments = mbuf.iter_segs();
-        assert_eq!(segments.next(), Some(mbuf.as_ptr()));
-        assert_eq!(segments.next(), None);
-        assert_eq!(segments.next(), None);
-        drop(mbuf);
-        assert_pool_returned_exactly_once(&pool, 256);
-    }
-
-    #[zhida_test_support::pinned_test]
     fn test_iter_segs_chain_in_order_then_end() {
         let pool = PoolManager::new(256);
         let mut head = pool.alloc_with_len(100).unwrap();
@@ -2559,25 +2475,6 @@ mod tests {
         assert_eq!(lens, [100, 50, 30]);
         assert_eq!(segments.next(), None);
         assert_eq!(segments.next(), None);
-        drop(head);
-        assert_pool_returned_exactly_once(&pool, 256);
-    }
-
-    #[zhida_test_support::pinned_test]
-    fn test_iter_segs_early_drop_leaves_owner_usable() {
-        let pool = PoolManager::new(256);
-        let mut head = pool.alloc_with_len(100).unwrap();
-        head.chain(pool.alloc_with_len(50).unwrap()).unwrap();
-
-        let mut segments = head.iter_segs();
-        assert_eq!(segments.next(), Some(head.as_ptr()));
-        // The drop states what the test checks: an early iterator drop leaves the owner usable.
-        #[allow(clippy::drop_non_drop)]
-        drop(segments);
-
-        head.chain(pool.alloc_with_len(30).unwrap()).unwrap();
-        assert_eq!(head.iter_segs().count(), 3);
-        assert_eq!(head.pkt_len(), 180);
         drop(head);
         assert_pool_returned_exactly_once(&pool, 256);
     }

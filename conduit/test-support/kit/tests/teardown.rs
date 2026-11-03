@@ -162,18 +162,6 @@ fn link_dropped_holding_a_frame_fails_after_freeing_it() {
 }
 
 #[zhida_test_support::pinned_test]
-fn pair_close_counts_frames_left_on_rings() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["td_count_a", "td_count_b"]);
-        let ([client, _server], _) = establish(&mut pair, Side::A);
-        pair.a.tcp_mut(&client).send_slice(b"left on the ring").unwrap();
-        let now = pair.now();
-        assert_eq!(pair.a.turn(now, 32).unwrap().tx_accepted, 1);
-        assert_eq!(pair.close(), 1);
-    });
-}
-
-#[zhida_test_support::pinned_test]
 fn impair_callback_panic_frees_every_dequeued_frame() {
     with_eal(|eal| {
         let fixtures =

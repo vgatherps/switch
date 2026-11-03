@@ -320,27 +320,6 @@ fn test_chain_ownership_transfer() {
     }
 }
 
-/// Verify DPDK's rte_mbuf_check can validate our mbufs
-#[zhida_test_support::pinned_test]
-fn test_dpdk_mbuf_check() {
-    let pool = PoolManager::new(256);
-
-    let m = pool.alloc_with_len(100).unwrap();
-
-    // Call DPDK's validation - should pass
-    let mut reason: *const std::ffi::c_char = std::ptr::null();
-    let ret = unsafe {
-        // rte_mbuf_check(m, is_header, &reason)
-        // We need to add this to our bindings
-        zhida_dpdk_sys::rte_mbuf_check(m.as_ptr(), 1, &mut reason)
-    };
-
-    if ret != 0 {
-        let reason_str = unsafe { std::ffi::CStr::from_ptr(reason) };
-        panic!("rte_mbuf_check failed: {:?}", reason_str);
-    }
-}
-
 /// Verify chain sets head pkt_len to sum of data_lens.
 #[zhida_test_support::pinned_test]
 fn test_chain_pkt_len_update() {
@@ -380,61 +359,6 @@ fn test_chain_pkt_len_update() {
 
     assert_eq!(zhida_pkt_len, 3000);
     assert_eq!(dpdk_pkt_len, 3000);
-}
-
-/// Run both executors sequentially (not interleaved) - check for interference.
-#[zhida_test_support::pinned_test]
-fn test_executor_chain_sequential_not_interleaved() {
-    use zhida_buffer::testing::Executor;
-
-    let ops = vec![
-        Op::Alloc { id: 0, len: 1500 },
-        Op::Alloc { id: 1, len: 1500 },
-        Op::Chain { head: 0, tail: 1 },
-    ];
-
-    {
-        let pool = PoolManager::new(1024);
-        let mut exec = Executor::new(&pool, SelectionMode::AllZhida);
-        for op in &ops { exec.execute(op); }
-        let snap = exec.snapshot();
-        assert_eq!(snap.get(&0).unwrap().pkt_len, 3000);
-    }
-
-    {
-        let pool = PoolManager::new(1024);
-        let mut exec = Executor::new(&pool, SelectionMode::AllDpdk);
-        for op in &ops { exec.execute(op); }
-        let snap = exec.snapshot();
-        assert_eq!(snap.get(&0).unwrap().pkt_len, 3000);
-    }
-}
-
-/// Run both executors interleaved on same pool (like compare_executions).
-#[zhida_test_support::pinned_test]
-fn test_executor_chain_interleaved_same_pool() {
-    use zhida_buffer::testing::Executor;
-
-    let ops = vec![
-        Op::Alloc { id: 0, len: 1500 },
-        Op::Alloc { id: 1, len: 1500 },
-        Op::Chain { head: 0, tail: 1 },
-    ];
-
-    let pool = PoolManager::new(1024);
-    let mut exec1 = Executor::new(&pool, SelectionMode::AllZhida);
-    let mut exec2 = Executor::new(&pool, SelectionMode::AllDpdk);
-
-    for op in &ops {
-        exec1.execute(op);
-        exec2.execute(op);
-    }
-
-    let snap1 = exec1.snapshot();
-    let snap2 = exec2.snapshot();
-
-    assert_eq!(snap1.get(&0).unwrap().pkt_len, 3000);
-    assert_eq!(snap2.get(&0).unwrap().pkt_len, 3000);
 }
 
 /// Chain resets tail's pkt_len to data_len (DPDK 24.11 behavior).

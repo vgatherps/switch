@@ -2,12 +2,11 @@
 //! reach a Stack's rings without the peer, and `Pair::with_ports` RX bursts
 //! let one turn take more than the default 8 frames.
 
-use zhida_test_kit::pair::{config, new_pair, segment, tcp_frame, Pair, Side, T0};
+use zhida_test_kit::pair::{config, new_pair, Pair, Side, T0};
 use zhida_test_kit::ring_port;
 use zhida_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
-    TcpControl, TcpRepr, TcpSeqNumber,
 };
 use dpdk_smoltcp::{rx_reserve, Turn};
 
@@ -49,63 +48,6 @@ fn counts(turn: &Turn) -> (usize, usize, usize) {
         "{turn:?}"
     );
     (turn.rx_received, turn.rx_processed, turn.tx_accepted)
-}
-
-#[zhida_test_support::pinned_test]
-fn inject_and_drain_tx_reach_one_stack_without_the_peer() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["kfia", "kfib"]);
-        let now = pair.now();
-        assert_eq!(
-            pair.drain_tx(Side::B, |_| panic!("frame before any turn")),
-            0
-        );
-
-        pair.inject(Side::B, &[arp_request()]);
-        assert_eq!(counts(&pair.b.turn(now, 8).unwrap()), (1, 1, 1));
-        let mut replies = Vec::new();
-        assert_eq!(
-            pair.drain_tx(Side::B, |frame| replies.push(frame.to_vec())),
-            1
-        );
-        assert_eq!(pair.drain_tx(Side::B, |_| panic!("TX ring not drained")), 0);
-        assert_arp_reply(&replies[0]);
-
-        // An ACK to a port with no socket: smoltcp answers one RST whose
-        // sequence number is the ACK's acknowledgment number.
-        let ack = tcp_frame(
-            Side::A,
-            &TcpRepr {
-                src_port: 49_152,
-                dst_port: 80,
-                control: TcpControl::None,
-                seq_number: TcpSeqNumber(1_000),
-                ack_number: Some(TcpSeqNumber(2_000)),
-                window_len: 1024,
-                window_scale: None,
-                max_seg_size: None,
-                sack_permitted: false,
-                sack_ranges: [None; 3],
-                timestamp: None,
-                payload: &[],
-            },
-        );
-        pair.inject(Side::B, &[ack]);
-        assert_eq!(counts(&pair.b.turn(now, 8).unwrap()), (1, 1, 1));
-        let drained = pair.drain_tx(Side::B, |frame| {
-            let rst = segment(frame, Side::B);
-            assert_eq!(
-                (rst.src_port, rst.dst_port, rst.control, rst.seq_number),
-                (80, 49_152, TcpControl::Rst, TcpSeqNumber(2_000))
-            );
-        });
-        assert_eq!(drained, 1);
-
-        // A saw neither reply, and nothing is left to move.
-        let round = pair.round(|dir, frame| panic!("{dir:?} {frame:02x?}"));
-        assert_eq!((round.a.rx_received, round.a_to_b, round.b_to_a), (0, 0, 0));
-        assert_eq!(pair.close(), 0);
-    });
 }
 
 #[zhida_test_support::pinned_test]

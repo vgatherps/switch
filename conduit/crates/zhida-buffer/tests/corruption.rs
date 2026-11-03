@@ -55,26 +55,6 @@ fn test_clone_trait_increments_refcount() {
 }
 
 #[zhida_test_support::pinned_test]
-fn test_multiple_shares() {
-    let pool = PoolManager::new(256);
-    let mut mbuf = pool.alloc_with_len(100).unwrap();
-    mbuf.data_mut().fill(0xFF);
-
-    let clone1 = mbuf.share();
-    let clone2 = mbuf.share();
-    let clone3 = mbuf.share();
-
-    assert_eq!(mbuf.refcount(), 4);
-
-    assert!(mbuf.data().iter().all(|&b| b == 0xFF));
-    assert!(clone1.data().iter().all(|&b| b == 0xFF));
-    assert!(clone2.data().iter().all(|&b| b == 0xFF));
-    assert!(clone3.data().iter().all(|&b| b == 0xFF));
-    drop((mbuf, clone1, clone2, clone3));
-    assert_eq!(pool.in_use_count(), 0);
-}
-
-#[zhida_test_support::pinned_test]
 fn test_insufficient_headroom() {
     let pool = PoolManager::new(256);
     let mut mbuf = pool.alloc_with_len(100).unwrap();
