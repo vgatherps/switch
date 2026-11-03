@@ -1169,9 +1169,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn a_worker_that_does_not_exit_is_killed() {
         let w = Worker::spawn("exec sleep 30").unwrap();
+        let pid = w.child.id() as libc::pid_t;
         let started = Instant::now();
         assert!(w.exit(Duration::from_millis(200)).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
         let w = Worker::spawn("read line; exit 3").unwrap();
         assert_eq!(w.exit(Duration::from_secs(5)).unwrap().code(), Some(3));
     }

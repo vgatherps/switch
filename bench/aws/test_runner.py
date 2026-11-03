@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pwd
+import re
 import shlex
 import select
 import shutil
@@ -72,7 +73,17 @@ class PureTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(z.main(["plan", "--shape", "intel", "--region", "ap-northeast-1"]), 0)
-        self.assertIn("1 x c6in.8xlarge receiver, 3 x c6in.2xlarge senders", out.getvalue())
+        output = out.getvalue()
+        receiver_type, sender_type, _, _ = z.SHAPES["intel"]
+        self.assertIn(f"1 x {receiver_type} receiver, {z.SENDERS} x {sender_type} senders", output)
+        self.assertEqual(int(re.search(r"(\d+)\s+vCPUs\b", output)[1]), z.SHAPES["intel"][3])
+        self.assertEqual(int(re.search(r"(\d+)\s+senders\s*\(", output)[1]), z.CONNECTIONS)
+        self.assertEqual(int(re.search(r"(\d+)\s+per sender host", output)[1]),
+                         z.CONNECTIONS // z.SENDERS)
+        self.assertEqual([int(n) for n in re.search(r"rates\s+([0-9,]+)", output)[1].split(",")],
+                         list(z.RATES))
+        for tag in z.sweep_tags():
+            self.assertRegex(output, rf"(?m)^\s*{re.escape(tag)}(?:\s|$)")
 
     def test_sweep_timeout_exceeds_scheduled_time(self):
         scheduled = len(z.RATES) * (50 + z.WARMUP_MS + z.STEP_MS + z.DRAIN_MS) / 1000
@@ -231,12 +242,14 @@ class KernelRoutingTest(unittest.TestCase):
         snapshots = [json.dumps([{"dev": "ens5", "metric": i % 2}])
                      for i in range(z.KERNEL_ROUTE_SETTLE_MAX_SAMPLES + 1)]
         receiver.root.side_effect = self.setup_calls(snapshots)
-        with self.assertRaisesRegex(RuntimeError,
-                                    f"main routes did not settle after {z.KERNEL_ROUTE_SETTLE_MAX_SAMPLES} checks"):
+        with self.assertRaises(RuntimeError) as failure:
             z.configure_kernel_receiver(receiver, z.parse_host_env(HOST_ENV),
                                         RECEIVER_DATA_IP, ["10.80.1.111"])
+        self.assertIn("routes", str(failure.exception))
+        self.assertIn("settle", str(failure.exception))
         self.assertEqual(receiver._sleep.call_count, z.KERNEL_ROUTE_SETTLE_MAX_SAMPLES)
         self.assertEqual(receiver.root.call_count, 5 + len(snapshots))
+        self.assertFalse(any("ip -4 rule add" in call.args[0] for call in receiver.root.call_args_list))
 
     def test_main_route_change_reports_before_and_after(self):
         receiver = mock.Mock()
@@ -1310,20 +1323,24 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(sweeps), len(z.SWEEPS))
         self.assertEqual(w.sweep_timeouts, [z.SWEEP_WORST_S] * len(z.SWEEPS))
         self.assertTrue(all(r == "sender0" for r, c in w.calls if "zhida-bench sweep" in c))
-        self.assertEqual(z.sweep_tags(), [
-            "udp-n12-s64-uncapped", "tcp-n12-s64-b50", "tcp-n12-s64-uncapped",
-            "ws-n12-s64-b50", "ws-n12-s64-uncapped"])
+        tags = z.sweep_tags()
+        self.assertEqual(len(tags), len(z.SWEEPS))
+        self.assertEqual(len(set(tags)), len(tags))
+        for tag, (proto, budget) in zip(tags, z.SWEEPS):
+            self.assertEqual(tag.split("-"), [
+                proto, f"n{z.CONNECTIONS}", f"s{z.SIZE}",
+                "uncapped" if budget is None else f"b{budget}",
+            ])
         for cmd, t, (proto, budget) in zip(sweeps, z.sweep_tags(), z.SWEEPS):
             inner = shlex.split(cmd)[2]
             argv = shlex.split(inner.split(" > ")[0])
             self.assertEqual(argv[:3], ["taskset", "-c", "0-6"], "coordinator on HOUSEKEEPING")
             self.assertEqual(argv[argv.index("--gens") + 1], str(z.SENDERS))
             self.assertEqual(argv[argv.index("--proto") + 1], proto)
-            self.assertEqual(argv[argv.index("--rates") + 1],
-                             "10000,100000,400000,800000,900000,1000000,1100000,1200000,1400000,1800000,2500000")
-            self.assertEqual(argv[argv.index("--step-ms") + 1], "10000")
-            self.assertEqual(argv[argv.index("--warmup-ms") + 1], "250")
-            self.assertEqual(argv[argv.index("--drain-ms") + 1], "200")
+            self.assertEqual(argv[argv.index("--rates") + 1], ",".join(map(str, z.RATES)))
+            self.assertEqual(argv[argv.index("--step-ms") + 1], str(z.STEP_MS))
+            self.assertEqual(argv[argv.index("--warmup-ms") + 1], str(z.WARMUP_MS))
+            self.assertEqual(argv[argv.index("--drain-ms") + 1], str(z.DRAIN_MS))
             self.assertNotIn("--rate-min", argv)
             self.assertNotIn("--rate-max", argv)
             if budget is None:
@@ -1385,15 +1402,6 @@ class RunTest(unittest.TestCase):
         self.assertIsNone(self.run_dir)
         self.assertEqual(self.w.clean_calls, [])
 
-    def test_kernel_route_failure_never_measures_and_still_cleans_up(self):
-        with mock.patch.object(z, "configure_kernel_receiver",
-                               side_effect=RuntimeError("kernel receiver route mismatch")):
-            self.run_bench(kernel=True)
-        self.assertIn(("receiver", "setup b'TAR' kernel_receiver"), self.w.calls)
-        for i in range(z.SENDERS):
-            self.assertIn((f"sender{i}", "setup b'TAR'"), self.w.calls)
-        self.assertFalse(os.path.exists(os.path.join(self.run_dir, "expected.json")))
-
     def test_kernel_mtu_mismatch_never_measures_and_still_cleans_up(self):
         self.w.dut_mtu = 9001
         self.w.actual_mtu = 1500
@@ -1406,6 +1414,10 @@ class RunTest(unittest.TestCase):
         self.assertFalse(any("ip -4 rule add" in command for command in commands))
         self.assertEqual(self.sweeps_run(), [])
         self.assertTrue(self.w.teardown_done)
+        self.assertIn(("receiver", "setup b'TAR' kernel_receiver"), self.w.calls)
+        for i in range(z.SENDERS):
+            self.assertIn((f"sender{i}", "setup b'TAR'"), self.w.calls)
+        self.assertFalse(os.path.exists(os.path.join(self.run_dir, "expected.json")))
 
     def test_failed_host_setup_never_claims_code_built_or_starts_a_sweep(self):
         self.w.verify_fail.add("sender1")

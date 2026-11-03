@@ -272,6 +272,10 @@ mod tests {
         assert!(parsed.parse(request.as_bytes()).unwrap().is_complete());
         assert_eq!((parsed.method, parsed.path, parsed.version), (Some("GET"), Some("/ws"), Some(1)));
         assert_eq!(single(parsed.headers, "Host"), Ok(Some(&b"stream.example:9443"[..])));
+        assert_eq!(single(parsed.headers, "Sec-WebSocket-Key"), Ok(Some(key.as_bytes())));
+        assert!(single(parsed.headers, "Upgrade").unwrap().unwrap().eq_ignore_ascii_case(b"websocket"));
+        assert!(connection_upgrade(parsed.headers));
+        assert_eq!(single(parsed.headers, "Sec-WebSocket-Version"), Ok(Some(&b"13"[..])));
     }
 
     /// The head is found across runs cut anywhere, even inside the blank line; the bytes after

@@ -279,15 +279,12 @@ mod tests {
     fn table_summarizes_runs() {
         assert_eq!(valid(300).status(), "valid");
         let json = valid(300).json("pingpong-m64", 0);
-        for field in [
-            r#""config":"pingpong-m64""#,
-            r#""rep":0"#,
-            r#""status":"valid""#,
-            r#""exit_ok":true"#,
-            r#""client":{"side":"client""#,
-        ] {
-            assert!(json.contains(field), "{field} in {json}");
-        }
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["config"], "pingpong-m64");
+        assert_eq!(value["rep"], 0);
+        assert_eq!(value["status"], "valid");
+        assert_eq!(value["exit_ok"], true);
+        assert_eq!(value["client"]["side"], "client");
         let table = table("pingpong-m64", &[pair(300), pair(100), pair(200)]);
         let rows: std::collections::BTreeMap<String, Vec<f64>> = table
             .lines()

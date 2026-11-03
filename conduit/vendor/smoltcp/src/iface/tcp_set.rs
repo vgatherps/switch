@@ -1752,6 +1752,7 @@ mod tests {
         let a = set.add(socket());
         set.remove(a);
         let b = set.add(socket());
+        assert_eq!(b.index, a.index);
         assert_ne!(b, a);
         assert_panics(INVALID, || {
             set.get_mut(a);

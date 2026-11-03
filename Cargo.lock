@@ -795,6 +795,7 @@ version = "0.1.0"
 dependencies = [
  "dpdk-smoltcp",
  "libc",
+ "serde_json",
  "zhida-buffer",
  "zhida-dpdk-sys",
  "zhida-test-kit",

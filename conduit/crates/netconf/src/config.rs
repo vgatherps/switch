@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn config_path_mtu_matches_stack_lookup() {
+    fn config_path_mtu_picks_the_longest_prefix_rule() {
         let mut value = example();
         value["paths"] = json!([
             {"prefix": "10.0.0.0/16", "mtu": 9001, "why": "vpc"},

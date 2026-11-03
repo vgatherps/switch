@@ -11,5 +11,6 @@ zhida-buffer.workspace = true
 zhida-dpdk-sys.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 zhida-test-kit.workspace = true
 zhida-test-support.workspace = true

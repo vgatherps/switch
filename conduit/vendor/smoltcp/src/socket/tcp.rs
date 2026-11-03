@@ -13670,8 +13670,21 @@ mod test {
     }
 
     #[test]
-    fn ack_delay_accepts_max_rto() {
-        socket().set_ack_delay(Some(MAX_RTO));
+    fn max_ack_delay_defers_ack_until_its_deadline() {
+        let mut s = socket_established();
+        s.set_ack_delay(Some(MAX_RTO));
+        let seq = s.remote_seq_no;
+        let ack = s.local_seq_no;
+        let at = Instant::from_millis(1);
+        assert_eq!(send(&mut s, at, &SEND_TEMPL.seq(seq).ack(ack).data(b"a")), None);
+        let due = at + MAX_RTO;
+        recv_nothing(&mut s, at);
+        recv_nothing(&mut s, due - Duration::from_micros(1));
+        recv(&mut s, due, |reply| {
+            let reply = reply.unwrap();
+            assert_eq!(reply.ack_number, Some(seq + 1));
+            assert!(reply.payload.is_empty());
+        });
     }
 
     #[test]

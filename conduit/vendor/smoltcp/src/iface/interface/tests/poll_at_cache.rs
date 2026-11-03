@@ -106,10 +106,10 @@ fn establish(
     let handle = connect(iface, sockets, 1234);
     assert_eq!(iface.poll_at(START, sockets), Some(Instant::ZERO));
     iface.poll_egress(START, device, sockets);
-    assert_eq!(
-        iface.poll_at(START, sockets),
-        Some(Instant::from_millis(384))
-    );
+    let PollAt::Time(deadline) = sockets.get(handle).poll_at() else {
+        panic!("SYN has no retransmit timer");
+    };
+    assert_wake_by(iface, sockets, START, deadline);
     let (port, control, seq, payload) = take_tcp(device);
     assert_eq!((port, control), (1234, TcpControl::Syn));
     assert!(payload.is_empty());
@@ -146,9 +146,12 @@ fn deadline_follows_app_change_without_ingress() {
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::ZERO));
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_wake_by(&mut iface, &mut sockets, START, START + Duration::from_millis(100));
+    let armed = sockets.get(handle).poll_at();
+    assert_eq!(armed, PollAt::Time(START + Duration::from_millis(100)));
     assert_eq!(take_tcp(&mut device).3, b"abc");
     sockets.get_mut(handle).seed_rto(Duration::from_millis(300));
     assert_wake_by(&mut iface, &mut sockets, START, START + Duration::from_millis(100));
+    assert_eq!(sockets.get(handle).poll_at(), armed);
     receive(&mut iface, &mut sockets, &mut device, START,
         segment(1234, TcpControl::None, 101, Some(seq + 3)));
     assert_eq!(iface.poll_at(START, &mut sockets), None);
@@ -158,6 +161,10 @@ fn deadline_follows_app_change_without_ingress() {
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).3, b"def");
     assert_wake_by(&mut iface, &mut sockets, START, START + Duration::from_millis(300));
+    assert_eq!(
+        sockets.get(handle).poll_at(),
+        PollAt::Time(START + Duration::from_millis(300))
+    );
     assert!(device.rx_queue.is_empty());
 }
 
@@ -169,12 +176,14 @@ fn remove_and_reuse_resets_deadline() {
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_wake_by(&mut iface, &mut sockets, START, START + Meta::DISCOVERY_SILENT_TIME);
     assert_eq!(sockets.waiting, vec![0]);
+    let slot = sockets.waiting[0];
     sockets.remove(handle);
     assert!(sockets.waiting.is_empty());
     assert_eq!(iface.poll_at(START, &mut sockets), None);
     let mut listener = socket();
     listener.listen(1234).unwrap();
     let reused = sockets.add(listener);
+    assert_eq!(reused, sockets.handle_at(slot));
     assert_ne!(reused, handle);
     assert_eq!(iface.poll_at(START, &mut sockets), None);
     sockets.remove(reused);
