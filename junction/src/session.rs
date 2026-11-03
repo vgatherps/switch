@@ -13,9 +13,12 @@ use std::cell::Cell;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
-use std::net::SocketAddrV4;
+use std::net::{Shutdown, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
 use ceph_ring::Writer;
 use shared_memory::Backing;
@@ -172,7 +175,9 @@ pub struct Session {
     stream: u64,
     next_seq: u64,
     slots: Vec<Slot>,
-    input: Vec<u8>,
+    messages: Receiver<Result<HostMessage, Lost>>,
+    reader: Option<JoinHandle<()>>,
+    read_error: Option<Lost>,
     output: Vec<u8>,
     written: usize,
     write_error: Option<io::Error>,
@@ -182,6 +187,8 @@ pub struct Session {
 }
 
 impl Session {
+    /// Performs the Hello/Welcome handshake on the caller's thread, then starts
+    /// one `junction-ctl` reader thread with the caller's inherited CPU affinity.
     pub fn connect(path: &Path, max_sockets: u16) -> Result<Self, ConnectError> {
         let mut socket = UnixStream::connect(path).map_err(ConnectError::Io)?;
         let mut bytes = Vec::new();
@@ -236,6 +243,12 @@ impl Session {
         let rx = RingReader::open(&backing).map_err(ConnectError::Io)?;
         drop(backing);
         socket.set_nonblocking(true).map_err(ConnectError::Io)?;
+        let read_socket = socket.try_clone().map_err(ConnectError::Io)?;
+        let (sender, messages) = mpsc::channel();
+        let reader = thread::Builder::new()
+            .name("junction-ctl".into())
+            .spawn(move || read_control(read_socket, bytes, sender))
+            .map_err(ConnectError::Io)?;
         Ok(Self {
             socket,
             writer,
@@ -250,7 +263,9 @@ impl Session {
                     shut: false,
                 })
                 .collect(),
-            input: bytes,
+            messages,
+            reader: Some(reader),
+            read_error: None,
             output: Vec::new(),
             written: 0,
             write_error: None,
@@ -489,7 +504,9 @@ impl Session {
         self.written = 0;
     }
 
-    /// Flushes control output and handles available host events without blocking.
+    /// Flushes pending control output and handles queued host events without blocking.
+    /// The reader thread owns socket reads and decoding; this method never reads
+    /// the control socket.
     ///
     /// A successful finish acknowledgement sets `closed()` and returns `Ok(())`.
     /// EOF without that acknowledgement returns `Lost::Disconnected`, even after
@@ -498,40 +515,38 @@ impl Session {
         if self.closed {
             return Ok(());
         }
-        self.flush();
+        if self.written < self.output.len() {
+            self.flush();
+        }
         if let Some(error) = self.write_error.take() {
             return Err(lost_io(error));
         }
+        if let Some(error) = &self.read_error {
+            return Err(repeat_lost(error));
+        }
         loop {
-            while let Some((message, used)) =
-                HostMessage::decode(&self.input).map_err(Lost::Protocol)?
-            {
-                self.input.drain(..used);
-                match message {
-                    HostMessage::Event { id, event } => {
-                        self.event(id, event)?;
-                        on_event(id, event);
-                    }
-                    HostMessage::End(EndReason::Finished) => {
-                        if !self.finished {
-                            return Err(invalid_host("Finished before session finish"));
-                        }
-                        self.closed = true;
-                        return Ok(());
-                    }
-                    HostMessage::End(reason) => return Err(Lost::Ended(reason)),
-                    HostMessage::Welcome(_) => {
-                        return Err(invalid_host("second Welcome on live session"));
-                    }
+            match self.messages.try_recv() {
+                Ok(Ok(HostMessage::Event { id, event })) => {
+                    self.event(id, event)?;
+                    on_event(id, event);
                 }
-            }
-            let mut chunk = [0; 4096];
-            match self.socket.read(&mut chunk) {
-                Ok(0) => return Err(Lost::Disconnected),
-                Ok(n) => self.input.extend_from_slice(&chunk[..n]),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(lost_io(error)),
+                Ok(Ok(HostMessage::End(EndReason::Finished))) => {
+                    if !self.finished {
+                        return Err(invalid_host("Finished before session finish"));
+                    }
+                    self.closed = true;
+                    return Ok(());
+                }
+                Ok(Ok(HostMessage::End(reason))) => return Err(Lost::Ended(reason)),
+                Ok(Ok(HostMessage::Welcome(_))) => {
+                    return Err(invalid_host("second Welcome on live session"));
+                }
+                Ok(Err(error)) => {
+                    self.read_error = Some(error);
+                    return Err(repeat_lost(self.read_error.as_ref().unwrap()));
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Err(Lost::Disconnected),
             }
         }
     }
@@ -542,6 +557,9 @@ impl Session {
     /// The ring and control socket are unordered: a socket's packets may arrive
     /// before its `Connected` event. Callers needing that event first must queue
     /// packets per socket until it arrives.
+    /// The host publishes received bytes to the ring before sending `PeerFin`.
+    /// The reader's channel handoff preserves happens-before, so the subsequent
+    /// ring drain sees every byte preceding a `PeerFin` handled in this poll.
     /// Packets for freed sockets or earlier socket generations are discarded.
     /// A callback may retain its owned frame; that storage becomes reusable only
     /// after the frame is dropped and a poll reclaims it.
@@ -625,6 +643,75 @@ impl Session {
     /// Whether the host acknowledged successful retirement with `EndReason::Finished`.
     pub fn closed(&self) -> bool {
         self.closed
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn read_control(
+    mut socket: UnixStream,
+    mut input: Vec<u8>,
+    messages: Sender<Result<HostMessage, Lost>>,
+) {
+    // The cloned descriptors share O_NONBLOCK. Wait for readability rather than
+    // changing the reader to blocking mode and blocking application writes too.
+    let mut readable = false;
+    let error = loop {
+        match HostMessage::decode(&input) {
+            Ok(Some((message, used))) => {
+                input.drain(..used);
+                if messages.send(Ok(message)).is_err() {
+                    return;
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => break Lost::Protocol(error),
+        }
+        if !readable {
+            let mut descriptor = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor is one initialized pollfd, valid for this call.
+            if unsafe { libc::poll(&mut descriptor, 1, -1) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break lost_io(error);
+            }
+            readable = true;
+        }
+        let mut chunk = [0; 4096];
+        match socket.read(&mut chunk) {
+            Ok(0) => break Lost::Disconnected,
+            Ok(n) => input.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => readable = false,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => break lost_io(error),
+        }
+    };
+    let _ = messages.send(Err(error));
+}
+
+fn repeat_lost(error: &Lost) -> Lost {
+    match error {
+        Lost::Ended(reason) => Lost::Ended(*reason),
+        Lost::Disconnected => Lost::Disconnected,
+        Lost::Io(error) => Lost::Io(match error.raw_os_error() {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(error.kind(), error.to_string()),
+        }),
+        Lost::Protocol(error) => Lost::Protocol(*error),
     }
 }
 
