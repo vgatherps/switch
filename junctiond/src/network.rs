@@ -21,6 +21,7 @@ use dpdk_smoltcp::{Stack, StackError, Turn};
 use junction::control::{Event, Op};
 use junction::host::{EndHow, FromNetwork, SessionId, ToNetwork};
 use junction::send::{self, SendRecord};
+use slice_ringbuffer::RingWriter;
 
 use crate::sockets::{self, HostSocket, Socket};
 
@@ -39,6 +40,7 @@ struct Slot {
 
 struct Session {
     uid: u32,
+    rx: RingWriter,
     slots: Vec<Slot>,
     held: VecDeque<Op>,
     errored: bool,
@@ -183,7 +185,9 @@ impl NetworkState {
             ToNetwork::Open {
                 session,
                 max_sockets,
+                rx,
             } => {
+                assert!(rx.max_payload() >= usize::from(self.stack.ip_mtu()));
                 let entry = self
                     .sessions
                     .get_mut(slot(session) as usize)
@@ -194,6 +198,7 @@ impl NetworkState {
                 );
                 *entry = Some(Session {
                     uid: uid(session),
+                    rx,
                     slots: (0..max_sockets).map(|_| Slot::default()).collect(),
                     held: VecDeque::new(),
                     errored: false,
@@ -493,8 +498,17 @@ impl NetworkState {
                 }
             }
         }
-        if graceful {
-            let _ = self.to_control.send(FromNetwork::Retired { session });
-        }
+        let message = if graceful {
+            FromNetwork::Retired {
+                session,
+                rx: entry.rx,
+            }
+        } else {
+            FromNetwork::Released {
+                session,
+                rx: entry.rx,
+            }
+        };
+        let _ = self.to_control.send(message);
     }
 }

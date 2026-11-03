@@ -18,6 +18,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use ceph_ring::Writer;
+use shared_memory::Backing;
+use slice_ringbuffer::RingReader;
 
 use crate::control::{
     ClientMessage, ConfigError, DecodeError, EndReason, Event, HostMessage, ListenEndpoint, Op,
@@ -164,6 +166,7 @@ struct Slot {
 pub struct Session {
     socket: UnixStream,
     writer: Writer,
+    _rx: RingReader,
     stream: u64,
     next_seq: u64,
     slots: Vec<Slot>,
@@ -224,10 +227,17 @@ impl Session {
             return Err(ConnectError::Rejected(welcome.status));
         }
         let writer = Writer::attach(&welcome.ingress).map_err(ConnectError::Io)?;
+        #[cfg(target_os = "linux")]
+        let backing = Backing::open_file(Path::new(&welcome.rx)).map_err(ConnectError::Io)?;
+        #[cfg(target_os = "macos")]
+        let backing = Backing::open_shm(&welcome.rx).map_err(ConnectError::Io)?;
+        let rx = RingReader::open(&backing).map_err(ConnectError::Io)?;
+        drop(backing);
         socket.set_nonblocking(true).map_err(ConnectError::Io)?;
         Ok(Self {
             socket,
             writer,
+            _rx: rx,
             stream: welcome.stream,
             next_seq: 0,
             slots: (0..max_sockets)

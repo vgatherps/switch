@@ -749,6 +749,8 @@ dependencies = [
  "ceph-proto",
  "ceph-ring",
  "libc",
+ "shared-memory",
+ "slice_ringbuffer",
 ]
 
 [[package]]
@@ -760,6 +762,7 @@ dependencies = [
  "ceph-ring",
  "dpdk-smoltcp",
  "junction",
+ "slice_ringbuffer",
  "zhida-test-kit",
  "zhida-test-support",
 ]

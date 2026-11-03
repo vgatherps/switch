@@ -4,6 +4,8 @@
 //! already-readable control bytes. FIFO completion survives control disconnects, and network
 //! retirement keeps flushing queued events and End(Finished) before closing.
 //! Protocol errors and kicks always abort, even after FIFO completion.
+//! The control thread creates each session's receive ring and owns its backing until the
+//! connection is removed. The network thread returns the writer here for destruction.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -13,6 +15,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ceph_proto::{Control, Retire, pack, slot, uid};
+use shared_memory::{Backing, page_size_in, unique_name};
+use slice_ringbuffer::RingWriter;
 
 use crate::control::{
     ClientMessage, EndReason, Event, HostMessage, Op, SocketId, VERSION, Welcome, WelcomeStatus,
@@ -20,11 +24,13 @@ use crate::control::{
 
 pub type SessionId = u64;
 
-#[derive(Debug)]
+const RX_NAME_PREFIX: &str = "jnctrx";
+
 pub enum ToNetwork {
     Open {
         session: SessionId,
         max_sockets: u16,
+        rx: RingWriter,
     },
     Op {
         session: SessionId,
@@ -43,7 +49,6 @@ pub enum EndHow {
     Abort,
 }
 
-#[derive(Debug)]
 pub enum FromNetwork {
     Event {
         session: SessionId,
@@ -52,6 +57,11 @@ pub enum FromNetwork {
     },
     Retired {
         session: SessionId,
+        rx: RingWriter,
+    },
+    Released {
+        session: SessionId,
+        rx: RingWriter,
     },
     ProtocolError {
         session: SessionId,
@@ -61,6 +71,8 @@ pub enum FromNetwork {
 pub struct ControlConfig {
     pub socket_path: PathBuf,
     pub ingress: String,
+    pub rx_dir: PathBuf,
+    pub rx_size: usize,
     pub max_record: u32,
     pub max_sessions: u32,
     pub max_sockets: u16,
@@ -82,9 +94,11 @@ enum Phase {
         session: SessionId,
         max_sockets: u16,
         draining: bool,
+        rx_backing: Backing,
     },
     Retiring {
         session: SessionId,
+        rx_backing: Backing,
     },
 }
 
@@ -135,10 +149,33 @@ pub struct HostControl {
 
 impl HostControl {
     pub fn bind(config: ControlConfig, channels: ControlChannels) -> io::Result<Self> {
-        if config.poll_ms == 0 || config.ingress.len() > usize::from(u16::MAX) - 22 {
+        #[cfg(target_os = "linux")]
+        let rx_name_len = config
+            .rx_dir
+            .join(RX_NAME_PREFIX)
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rx_dir is not UTF-8"))?
+            .len();
+        #[cfg(target_os = "macos")]
+        let rx_name_len = RX_NAME_PREFIX.len();
+        let welcome_len = 24usize
+            .checked_add(config.ingress.len())
+            .and_then(|len| len.checked_add(rx_name_len))
+            .and_then(|len| len.checked_add(16));
+        if config.poll_ms == 0 || welcome_len.is_none_or(|len| len > usize::from(u16::MAX)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "poll_ms must be at least 1 and ingress must fit in Welcome",
+                "poll_ms must be at least 1 and ingress plus rx must fit in Welcome",
+            ));
+        }
+        let page = page_size_in(&config.rx_dir)?;
+        if !config.rx_size.is_power_of_two()
+            || config.rx_size > (1usize << 31)
+            || !config.rx_size.is_multiple_of(page)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rx_size must be a power of two, at most 2 GiB, and a backing-page multiple",
             ));
         }
         match std::fs::remove_file(&config.socket_path) {
@@ -353,6 +390,7 @@ impl HostControl {
                             session,
                             max_sockets,
                             draining: false,
+                            ..
                         },
                         ClientMessage::Op(op),
                     ) if op.id().slot < u32::from(*max_sockets) => {
@@ -383,7 +421,7 @@ impl HostControl {
     }
 
     fn hello(&mut self, index: usize, version: u16, max_sockets: u16) -> io::Result<()> {
-        let status = if version != VERSION {
+        let mut status = if version != VERSION {
             WelcomeStatus::BadVersion
         } else if max_sockets == 0 || max_sockets > self.config.max_sockets {
             WelcomeStatus::BadMaxSockets
@@ -393,38 +431,48 @@ impl HostControl {
             WelcomeStatus::Ok
         };
         let mut stream = 0;
+        let mut rx_name = String::new();
         if status == WelcomeStatus::Ok {
-            let next_uid = self
-                .next_uid
-                .checked_add(1)
-                .ok_or_else(|| io::Error::other("stream uid space exhausted"))?;
-            let slot = self.free.pop().expect("free slot checked above");
-            let uid = self.next_uid;
-            self.next_uid = next_uid;
-            stream = pack(slot, uid);
-            self.connections[index].phase = Phase::Live {
-                session: stream,
-                max_sockets,
-                draining: false,
-            };
-            if self
-                .channels
-                .to_network
-                .send(ToNetwork::Open {
-                    session: stream,
-                    max_sockets,
-                })
-                .is_err()
-                || self
-                    .channels
-                    .to_fifo
-                    .send(Control::Open { slot, uid })
-                    .is_err()
-            {
-                self.shutdown = true;
-                return Ok(());
+            match self.create_rx() {
+                Ok((rx_backing, rx)) => {
+                    let next_uid = self
+                        .next_uid
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("stream uid space exhausted"))?;
+                    let slot = self.free.pop().expect("free slot checked above");
+                    let uid = self.next_uid;
+                    self.next_uid = next_uid;
+                    stream = pack(slot, uid);
+                    rx_name = rx_backing.name().to_owned();
+                    self.connections[index].phase = Phase::Live {
+                        session: stream,
+                        max_sockets,
+                        draining: false,
+                        rx_backing,
+                    };
+                    if self
+                        .channels
+                        .to_network
+                        .send(ToNetwork::Open {
+                            session: stream,
+                            max_sockets,
+                            rx,
+                        })
+                        .is_err()
+                        || self
+                            .channels
+                            .to_fifo
+                            .send(Control::Open { slot, uid })
+                            .is_err()
+                    {
+                        self.shutdown = true;
+                        return Ok(());
+                    }
+                }
+                Err(_) => status = WelcomeStatus::HostResources,
             }
-        } else {
+        }
+        if status != WelcomeStatus::Ok {
             self.connections[index].phase = Phase::Rejected;
         }
         self.connections[index].queue(HostMessage::Welcome(Welcome {
@@ -433,20 +481,41 @@ impl HostControl {
             stream,
             max_record: self.config.max_record,
             ingress: self.config.ingress.clone(),
+            rx: rx_name,
         }));
         Ok(())
     }
 
+    fn create_rx(&self) -> io::Result<(Backing, RingWriter)> {
+        let name = unique_name(RX_NAME_PREFIX)?;
+        #[cfg(target_os = "linux")]
+        let mut backing = Backing::create_file(&self.config.rx_dir.join(name))?;
+        #[cfg(target_os = "macos")]
+        let mut backing = Backing::create_shm(&name)?;
+        let rx = RingWriter::create(&mut backing, self.config.rx_size)?;
+        Ok((backing, rx))
+    }
+
     fn find(&self, session: SessionId) -> Option<usize> {
         self.connections.iter().position(|connection| {
-            matches!(connection.phase, Phase::Live { session: current, .. } | Phase::Retiring { session: current } if current == session)
+            matches!(connection.phase, Phase::Live { session: current, .. } | Phase::Retiring { session: current, .. } if current == session)
         })
     }
 
     fn remove(&mut self, index: usize, how: Option<EndHow>) {
         let connection = self.connections.swap_remove(index);
-        if let Phase::Live { session, .. } | Phase::Retiring { session } = connection.phase {
+        if let Phase::Live {
+            session,
+            rx_backing,
+            ..
+        }
+        | Phase::Retiring {
+            session,
+            rx_backing,
+        } = connection.phase
+        {
             drop(connection.socket);
+            drop(rx_backing);
             let slot = slot(session);
             let uid = uid(session);
             if self
@@ -521,18 +590,29 @@ impl HostControl {
                         self.remove(index, Some(EndHow::Abort));
                     }
                 }
-                FromNetwork::Retired { session } => {
+                FromNetwork::Retired { session, rx } => {
+                    drop(rx);
                     if let Some(index) = self.find(session)
                         && matches!(
                             self.connections[index].phase,
                             Phase::Live { draining: true, .. }
                         )
                     {
-                        self.connections[index].queue(HostMessage::End(EndReason::Finished));
-                        self.connections[index].phase = Phase::Retiring { session };
+                        let connection = &mut self.connections[index];
+                        let Phase::Live { rx_backing, .. } =
+                            std::mem::replace(&mut connection.phase, Phase::Rejected)
+                        else {
+                            unreachable!("Retired belongs to a draining live connection");
+                        };
+                        connection.queue(HostMessage::End(EndReason::Finished));
+                        connection.phase = Phase::Retiring {
+                            session,
+                            rx_backing,
+                        };
                         self.flush(index);
                     }
                 }
+                FromNetwork::Released { rx, .. } => drop(rx),
             }
         }
     }
@@ -615,37 +695,42 @@ mod tests {
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
+    fn config(socket_path: PathBuf) -> ControlConfig {
+        let rx_dir = std::env::temp_dir();
+        let rx_size = page_size_in(&rx_dir).unwrap();
+        ControlConfig {
+            socket_path,
+            ingress: String::new(),
+            rx_dir,
+            rx_size,
+            max_record: 256,
+            max_sessions: 1,
+            max_sockets: 1,
+            poll_ms: 1,
+            hello_timeout: Duration::from_secs(2),
+        }
+    }
+
     struct Fixture {
         host: HostControl,
         client: Option<UnixStream>,
         network: Receiver<ToNetwork>,
         retire: Sender<Retire>,
-        _events: Sender<FromNetwork>,
+        events: Sender<FromNetwork>,
+        rx: Option<RingWriter>,
         _fifo: Receiver<Control>,
         _path: FixturePath,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "jnct-unit-{}-{}.sock",
-                std::process::id(),
-                NEXT_PATH.fetch_add(1, Ordering::Relaxed)
-            ));
+            let path = FixturePath::new();
             let (to_network, network) = mpsc::channel();
             let (events, from_network) = mpsc::channel();
             let (to_fifo, fifo) = mpsc::channel();
             let (retire, from_fifo) = mpsc::channel();
             let mut host = HostControl::bind(
-                ControlConfig {
-                    socket_path: path,
-                    ingress: String::new(),
-                    max_record: 256,
-                    max_sessions: 1,
-                    max_sockets: 1,
-                    poll_ms: 1,
-                    hello_timeout: Duration::from_secs(2),
-                },
+                config(path.0.clone()),
                 ControlChannels {
                     to_network,
                     to_fifo,
@@ -654,27 +739,41 @@ mod tests {
                 },
             )
             .unwrap();
-            let (client, socket) = UnixStream::pair().unwrap();
+            let (mut client, socket) = UnixStream::pair().unwrap();
             socket.set_nonblocking(true).unwrap();
-            host.free.clear();
             host.connections.push(Connection {
                 socket,
-                phase: Phase::Live {
-                    session: pack(0, 1),
-                    max_sockets: 1,
-                    draining: false,
-                },
+                phase: Phase::Pending(Instant::now()),
                 input: Vec::new(),
                 output: Vec::new(),
                 written: 0,
             });
-            let path = FixturePath(host.config.socket_path.clone());
+            host.hello(0, VERSION, 1).unwrap();
+            let rx = match network.try_recv().unwrap() {
+                ToNetwork::Open {
+                    session,
+                    max_sockets: 1,
+                    rx,
+                } if session == pack(0, 1) => rx,
+                _ => panic!("expected network Open"),
+            };
+            let mut welcome = vec![0; host.connections[0].output.len()];
+            host.flush(0);
+            client.read_exact(&mut welcome).unwrap();
+            assert!(matches!(
+                HostMessage::decode(&welcome).unwrap().unwrap().0,
+                HostMessage::Welcome(Welcome {
+                    status: WelcomeStatus::Ok,
+                    ..
+                })
+            ));
             Self {
                 host,
                 client: Some(client),
                 network,
                 retire,
-                _events: events,
+                events,
+                rx: Some(rx),
                 _fifo: fifo,
                 _path: path,
             }
@@ -697,11 +796,61 @@ mod tests {
         }
     }
 
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.events
+                .send(FromNetwork::Released {
+                    session: pack(0, 1),
+                    rx: self.rx.take().expect("fixture owns the network writer"),
+                })
+                .unwrap_or_else(|_| panic!("control event channel closed"));
+            self.host.drain_network();
+        }
+    }
+
     struct FixturePath(PathBuf);
+
+    impl FixturePath {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "jnct-unit-{}-{}.sock",
+                std::process::id(),
+                NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+            )))
+        }
+    }
 
     impl Drop for FixturePath {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn bind_rejects_invalid_rx_sizes_before_touching_socket_path() {
+        let path = FixturePath::new();
+        std::fs::write(&path.0, b"unchanged").unwrap();
+        let page = page_size_in(&std::env::temp_dir()).unwrap();
+        for rx_size in [0, page + 1, page / 2, 1usize << 32] {
+            let mut config = config(path.0.clone());
+            config.rx_size = rx_size;
+            let (to_network, _network) = mpsc::channel();
+            let (_events, from_network) = mpsc::channel();
+            let (to_fifo, _fifo) = mpsc::channel();
+            let (_retire, retire) = mpsc::channel();
+            match HostControl::bind(
+                config,
+                ControlChannels {
+                    to_network,
+                    to_fifo,
+                    from_network,
+                    retire,
+                },
+            ) {
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("accepted invalid rx_size {rx_size}"),
+            }
+            assert_eq!(std::fs::read(&path.0).unwrap(), b"unchanged");
         }
     }
 

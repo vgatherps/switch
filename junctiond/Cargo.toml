@@ -10,6 +10,7 @@ junction.workspace = true
 dpdk-smoltcp.workspace = true
 ceph-fifo.workspace = true
 ceph-proto.workspace = true
+slice_ringbuffer.workspace = true
 
 [dev-dependencies]
 ceph-ring.workspace = true

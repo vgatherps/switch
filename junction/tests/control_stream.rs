@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -19,6 +20,8 @@ use junction::control::{
 use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
 use junction::send::{self, SendRecord, TCP_SEND_HEADER, UDP_SEND_HEADER};
 use junction::session::{ConnectError, Lost, OpenError, SendError, Session};
+use shared_memory::{Backing, unique_name};
+use slice_ringbuffer::RingWriter;
 
 const WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(30);
@@ -59,6 +62,16 @@ fn connect(path: &Path, max_sockets: u16) -> Result<Session, ConnectError> {
     receive(&rx)
 }
 
+fn rx_ring() -> (Backing, RingWriter) {
+    let name = unique_name("jnct-rx-test").unwrap();
+    #[cfg(target_os = "linux")]
+    let mut backing = Backing::create_file(&Path::new("/dev/shm").join(name)).unwrap();
+    #[cfg(target_os = "macos")]
+    let mut backing = Backing::create_shm(&name).unwrap();
+    let writer = RingWriter::create(&mut backing, 64 * 1024).unwrap();
+    (backing, writer)
+}
+
 struct Host {
     path: PathBuf,
     reader: Option<Reader>,
@@ -68,6 +81,7 @@ struct Host {
     retire: Sender<Retire>,
     done: Receiver<io::Result<()>>,
     thread: Option<JoinHandle<()>>,
+    rx: RefCell<Vec<(u64, RingWriter)>>,
 }
 
 impl Host {
@@ -87,6 +101,8 @@ impl Host {
             ControlConfig {
                 socket_path: path.clone(),
                 ingress: reader.name().into(),
+                rx_dir: "/dev/shm".into(),
+                rx_size: 64 * 1024,
                 max_record: 256,
                 max_sessions,
                 max_sockets,
@@ -114,19 +130,15 @@ impl Host {
             retire,
             done,
             thread: Some(thread),
+            rx: RefCell::new(Vec::new()),
         }
     }
 
     fn open(&self, max_sockets: u16) -> (Session, u64) {
         let session = connect(&self.path, max_sockets).unwrap();
         // Welcome must not be visible until both Open messages have been sent.
-        let ToNetwork::Open {
-            session: stream,
-            max_sockets: actual,
-        } = self.network.try_recv().expect("Open must precede Welcome")
-        else {
-            panic!("expected Open")
-        };
+        let (stream, actual) =
+            self.opened(self.network.try_recv().expect("Open must precede Welcome"));
         assert_eq!(actual, max_sockets);
         assert_eq!(
             self.control.as_ref().unwrap().try_recv().unwrap(),
@@ -136,6 +148,32 @@ impl Host {
             }
         );
         (session, stream)
+    }
+
+    fn opened(&self, message: ToNetwork) -> (u64, u16) {
+        let ToNetwork::Open {
+            session,
+            max_sockets,
+            rx,
+        } = message
+        else {
+            panic!("expected Open");
+        };
+        self.rx.borrow_mut().push((session, rx));
+        (session, max_sockets)
+    }
+
+    fn take_rx(&self, session: u64) -> RingWriter {
+        let mut writers = self.rx.borrow_mut();
+        let index = writers.iter().position(|(id, _)| *id == session).unwrap();
+        writers.swap_remove(index).1
+    }
+
+    fn retired(&self, session: u64) {
+        self.send(FromNetwork::Retired {
+            session,
+            rx: self.take_rx(session),
+        });
     }
 
     fn event(&self, stream: u64, id: SocketId, event: Event) {
@@ -156,7 +194,7 @@ impl Host {
                 assert_eq!(session, stream);
                 op
             }
-            other => panic!("expected Op, got {other:?}"),
+            _ => panic!("expected Op"),
         }
     }
 
@@ -166,7 +204,13 @@ impl Host {
                 assert_eq!(session, stream);
                 assert_eq!(how, expected);
             }
-            other => panic!("expected End, got {other:?}"),
+            _ => panic!("expected End"),
+        }
+        if expected != EndHow::Graceful {
+            self.send(FromNetwork::Released {
+                session: stream,
+                rx: self.take_rx(stream),
+            });
         }
     }
 
@@ -281,16 +325,9 @@ fn hello(host: &Host, max_sockets: u16) -> (UnixStream, u64) {
     assert_eq!(welcome.status, WelcomeStatus::Ok);
     assert_eq!(welcome.max_record, 256);
     assert_eq!(welcome.ingress, host.reader.as_ref().unwrap().name());
-    match host.network.try_recv().unwrap() {
-        ToNetwork::Open {
-            session,
-            max_sockets: actual,
-        } => {
-            assert_eq!(session, welcome.stream);
-            assert_eq!(actual, max_sockets);
-        }
-        other => panic!("expected Open, got {other:?}"),
-    }
+    let (session, actual) = host.opened(host.network.try_recv().unwrap());
+    assert_eq!(session, welcome.stream);
+    assert_eq!(actual, max_sockets);
     (stream, welcome.stream)
 }
 
@@ -324,7 +361,7 @@ fn clients_have_distinct_streams_and_ordered_ops() {
         match receive(&host.network) {
             ToNetwork::Op { session, op } if session == sa => a_ops.push(op),
             ToNetwork::Op { session, op } if session == sb => b_ops.push(op),
-            other => panic!("unexpected message {other:?}"),
+            _ => panic!("unexpected network message"),
         }
     }
     assert_eq!(
@@ -430,12 +467,7 @@ fn killed_client_releases_session_without_affecting_survivor() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    let ToNetwork::Open {
-        session: killed, ..
-    } = receive(&host.network)
-    else {
-        panic!("expected child Open")
-    };
+    let (killed, _) = host.opened(receive(&host.network));
     assert_eq!(
         receive(host.control.as_ref().unwrap()),
         Control::Open {
@@ -569,8 +601,9 @@ fn control_writer_does_not_starve_connect_or_events(finish: bool) {
     let mut client = connect(&host.path, 1).unwrap();
     // The flooding session's operations can surround Open in the channel.
     let session = loop {
-        if let ToNetwork::Open { session, .. } = receive(&host.network) {
-            break session;
+        let message = receive(&host.network);
+        if matches!(message, ToNetwork::Open { .. }) {
+            break host.opened(message).0;
         }
     };
     let id = client.bind_udp(udp()).unwrap();
@@ -662,9 +695,7 @@ fn kick_uses_abort_teardown() {
 fn finish_waits_for_fifo_and_network_retirement() {
     let mut host = Host::new(2, 2);
     let mut client = connect(&host.path, 1).unwrap();
-    let ToNetwork::Open { session, .. } = host.network.try_recv().unwrap() else {
-        panic!("expected Open before Welcome");
-    };
+    let (session, _) = host.opened(host.network.try_recv().unwrap());
     let mut fifo = Fifo::new(
         host.reader.take().unwrap(),
         2,
@@ -691,7 +722,7 @@ fn finish_waits_for_fifo_and_network_retirement() {
     host.end(session, EndHow::Graceful);
     client.poll_events(|_, _| {}).unwrap();
     assert!(!client.closed());
-    host.send(FromNetwork::Retired { session });
+    host.retired(session);
     until(|| {
         client.poll_events(|_, _| {}).unwrap();
         client.closed()
@@ -709,9 +740,7 @@ fn finish_waits_for_fifo_and_network_retirement() {
 fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
     let mut host = Host::new(2, 2);
     let mut client = connect(&host.path, 2).unwrap();
-    let ToNetwork::Open { session, .. } = host.network.try_recv().unwrap() else {
-        panic!("expected Open before Welcome");
-    };
+    let (session, _) = host.opened(host.network.try_recv().unwrap());
     let mut fifo = Fifo::new(
         host.reader.take().unwrap(),
         2,
@@ -815,7 +844,7 @@ fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
         tail == 3
     });
     host.end(session, EndHow::Graceful);
-    host.send(FromNetwork::Retired { session });
+    host.retired(session);
     until(|| {
         client.poll_events(|_, _| {}).unwrap();
         client.closed()
@@ -1005,7 +1034,8 @@ fn stale_and_unknown_channel_messages_do_not_end_reused_session() {
             event: Event::Bound,
         });
         host.send(FromNetwork::ProtocolError { session: stale });
-        host.send(FromNetwork::Retired { session: stale });
+        let (_backing, rx) = rx_ring();
+        host.send(FromNetwork::Retired { session: stale, rx });
         host.retire
             .send(Retire::Kicked {
                 slot: slot(stale),
@@ -1040,6 +1070,7 @@ fn client_reports_host_version_mismatch_before_attaching() {
             stream: 0,
             max_record: 0,
             ingress: String::new(),
+            rx: String::new(),
         })
         .encode(&mut bytes);
         socket.write_all(&bytes).unwrap();
@@ -1092,7 +1123,7 @@ fn draining_session_ignores_ops_and_hup_until_retired() {
     socket.shutdown(std::net::Shutdown::Both).unwrap();
     assert!(host.network.recv_timeout(QUIET).is_err());
     assert!(host.control.as_ref().unwrap().try_recv().is_err());
-    host.send(FromNetwork::Retired { session });
+    host.retired(session);
     host.closed(session);
     assert!(host.network.recv_timeout(QUIET).is_err());
 }
@@ -1139,6 +1170,8 @@ fn client_reports_second_welcome_malformed_bytes_and_unfinished_eof() {
         let path = socket_path();
         let listener = UnixListener::bind(&path).unwrap();
         let ingress = reader.name().to_owned();
+        let (rx_backing, _rx_writer) = rx_ring();
+        let rx = rx_backing.name().to_owned();
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             socket.set_read_timeout(Some(WAIT)).unwrap();
@@ -1151,6 +1184,7 @@ fn client_reports_second_welcome_malformed_bytes_and_unfinished_eof() {
                 stream: pack(0, 1),
                 max_record: 256,
                 ingress,
+                rx,
             });
             let mut bytes = Vec::new();
             welcome.encode(&mut bytes);
@@ -1209,7 +1243,7 @@ fn finished_ack_waits_for_all_backpressured_events() {
         })
         .unwrap();
     host.end(session, EndHow::Graceful);
-    host.send(FromNetwork::Retired { session });
+    host.retired(session);
     // The next channel event is a barrier: Retired was handled before it is visible.
     host.event(observer_session, observer_id, Event::Bound);
     assert_eq!(events(&mut observer, 1), [(observer_id, Event::Bound)]);

@@ -11,6 +11,8 @@ use junction::control::{
     Welcome, WelcomeStatus,
 };
 use junction::session::{FinishError, Lost, Session};
+use shared_memory::{Backing, unique_name};
+use slice_ringbuffer::RingWriter;
 
 const WAIT: Duration = Duration::from_secs(5);
 const STREAM: u64 = 1;
@@ -20,6 +22,8 @@ struct RawHost {
     path: PathBuf,
     socket: UnixStream,
     reader: Reader,
+    _rx_backing: Backing,
+    _rx_writer: RingWriter,
 }
 
 impl RawHost {
@@ -30,6 +34,13 @@ impl RawHost {
             dir: "/dev/shm".into(),
         })
         .unwrap();
+        let name = unique_name("jnct-finish-rx").unwrap();
+        #[cfg(target_os = "linux")]
+        let mut rx_backing =
+            Backing::create_file(&std::path::Path::new("/dev/shm").join(name)).unwrap();
+        #[cfg(target_os = "macos")]
+        let mut rx_backing = Backing::create_shm(&name).unwrap();
+        let rx_writer = RingWriter::create(&mut rx_backing, 64 * 1024).unwrap();
         let path = std::env::temp_dir().join(format!(
             "jnct-finish-{}-{}.sock",
             std::process::id(),
@@ -60,6 +71,7 @@ impl RawHost {
             stream: STREAM,
             max_record: 256,
             ingress: reader.name().to_owned(),
+            rx: rx_backing.name().to_owned(),
         })
         .encode(&mut bytes);
         socket.write_all(&bytes).unwrap();
@@ -69,6 +81,8 @@ impl RawHost {
                 path,
                 socket,
                 reader,
+                _rx_backing: rx_backing,
+                _rx_writer: rx_writer,
             },
             session,
         )

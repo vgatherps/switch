@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroU16;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"JNCT");
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,6 +97,7 @@ pub struct Welcome {
     pub stream: u64,
     pub max_record: u32,
     pub ingress: String,
+    pub rx: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub enum WelcomeStatus {
     BadVersion = 1,
     SessionsFull = 2,
     BadMaxSockets = 3,
+    HostResources = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,22 +313,27 @@ impl ClientMessage {
 impl HostMessage {
     /// Appends one complete control message to `out`.
     ///
-    /// Panics if the ingress path plus its 22-byte prefix exceeds a `u16` body length.
+    /// Panics if the ingress and RX paths plus their 24-byte prefix exceed a `u16` body length.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::Welcome(welcome) => {
-                let len = u16::try_from(welcome.ingress.len())
-                    .ok()
-                    .and_then(|len| len.checked_add(22))
-                    .expect("Welcome ingress path exceeds the control body length");
+                let len = welcome
+                    .ingress
+                    .len()
+                    .checked_add(welcome.rx.len())
+                    .and_then(|len| len.checked_add(24))
+                    .and_then(|len| u16::try_from(len).ok())
+                    .expect("Welcome paths exceed the control body length");
                 put_header(out, 64, 0, len);
                 out.extend_from_slice(&MAGIC.to_le_bytes());
                 out.extend_from_slice(&welcome.version.to_le_bytes());
                 out.extend_from_slice(&[welcome.status as u8, 0]);
                 out.extend_from_slice(&welcome.stream.to_le_bytes());
                 out.extend_from_slice(&welcome.max_record.to_le_bytes());
-                out.extend_from_slice(&(len - 22).to_le_bytes());
+                out.extend_from_slice(&(welcome.ingress.len() as u16).to_le_bytes());
                 out.extend_from_slice(welcome.ingress.as_bytes());
+                out.extend_from_slice(&(welcome.rx.len() as u16).to_le_bytes());
+                out.extend_from_slice(welcome.rx.as_bytes());
             }
             Self::Event { id, event } => {
                 let (kind, flags, len) = match *event {
@@ -369,7 +376,7 @@ fn header(buf: &[u8], client: bool) -> Result<Option<(u8, u8, usize)>, DecodeErr
         (false, 72) => Some(1),
         _ => return Err(DecodeError::UnknownKind(kind)),
     };
-    if expected.is_some_and(|expected| len != expected) || (kind == 64 && len < 22) {
+    if expected.is_some_and(|expected| len != expected) || (kind == 64 && len < 24) {
         return Err(DecodeError::WrongLength { kind, len });
     }
     if buf[4..8] != [0; 4] {
@@ -542,19 +549,32 @@ impl HostMessage {
                     1 => WelcomeStatus::BadVersion,
                     2 => WelcomeStatus::SessionsFull,
                     3 => WelcomeStatus::BadMaxSockets,
+                    4 => WelcomeStatus::HostResources,
                     value => return Err(DecodeError::InvalidWelcomeStatus(value)),
                 };
                 body.pad::<1>()?;
                 let stream = u64::from_le_bytes(body.take());
                 let max_record = body.u32();
                 let ingress_len = usize::from(body.u16());
-                if body.0.len() != ingress_len {
+                if ingress_len > body.0.len() - 2 {
                     return Err(DecodeError::WrongLength {
                         kind,
                         len: (total - HEADER_LEN) as u16,
                     });
                 }
-                let ingress = std::str::from_utf8(body.0)
+                let (ingress, rest) = body.0.split_at(ingress_len);
+                let ingress = std::str::from_utf8(ingress)
+                    .map_err(DecodeError::InvalidUtf8)?
+                    .to_owned();
+                body.0 = rest;
+                let rx_len = usize::from(body.u16());
+                if body.0.len() != rx_len {
+                    return Err(DecodeError::WrongLength {
+                        kind,
+                        len: (total - HEADER_LEN) as u16,
+                    });
+                }
+                let rx = std::str::from_utf8(body.0)
                     .map_err(DecodeError::InvalidUtf8)?
                     .to_owned();
                 Self::Welcome(Welcome {
@@ -563,6 +583,7 @@ impl HostMessage {
                     stream,
                     max_record,
                     ingress,
+                    rx,
                 })
             }
             72 => Self::End(match body.byte() {

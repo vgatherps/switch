@@ -225,6 +225,8 @@ impl Fixture {
             ControlConfig {
                 socket_path: socket_path.clone(),
                 ingress: ingress.clone(),
+                rx_dir: directory.clone(),
+                rx_size: 64 * 1024,
                 max_record: 256,
                 max_sessions: options.max_sessions,
                 max_sockets: 64,
@@ -431,7 +433,7 @@ impl Fixture {
         }
         self.network.iteration(self.now).unwrap();
         while let Ok(message) = self.network_events.try_recv() {
-            if let FromNetwork::Retired { session } = &message {
+            if let FromNetwork::Retired { session, .. } = &message {
                 self.retired.push(*session);
             }
             if let FromNetwork::ProtocolError { session } = &message {

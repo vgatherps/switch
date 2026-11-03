@@ -38,6 +38,7 @@ fn welcome() -> HostMessage {
         stream: 0x0102_0304_0506_0708,
         max_record: 0x1122_3344,
         ingress: "/tmp/j".into(),
+        rx: "/rx".into(),
     })
 }
 
@@ -115,6 +116,7 @@ fn host_messages() -> Vec<HostMessage> {
         WelcomeStatus::BadVersion,
         WelcomeStatus::SessionsFull,
         WelcomeStatus::BadMaxSockets,
+        WelcomeStatus::HostResources,
     ] {
         for version in [VERSION, 17] {
             messages.push(HostMessage::Welcome(Welcome {
@@ -123,6 +125,7 @@ fn host_messages() -> Vec<HostMessage> {
                 stream: 7,
                 max_record: 4096,
                 ingress: "/tmp/入口".into(),
+                rx: "/tmp/受信".into(),
             }));
         }
     }
@@ -240,8 +243,9 @@ fn golden_bytes() {
         (
             Message::Host(welcome()),
             &[
-                64, 0, 28, 0, 0, 0, 0, 0, b'J', b'N', b'C', b'T', 1, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2,
-                1, 0x44, 0x33, 0x22, 0x11, 6, 0, b'/', b't', b'm', b'p', b'/', b'j',
+                64, 0, 33, 0, 0, 0, 0, 0, b'J', b'N', b'C', b'T', 2, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2,
+                1, 0x44, 0x33, 0x22, 0x11, 6, 0, b'/', b't', b'm', b'p', b'/', b'j', 3, 0, b'/',
+                b'r', b'x',
             ],
         ),
     ];
@@ -477,10 +481,10 @@ fn magic_is_checked_in_both_handshakes() {
 #[test]
 fn invalid_enum_codes_are_rejected() {
     let mut bytes = host_bytes(welcome());
-    bytes[14] = 4;
+    bytes[14] = 5;
     assert_eq!(
         HostMessage::decode(&bytes),
-        Err(DecodeError::InvalidWelcomeStatus(4))
+        Err(DecodeError::InvalidWelcomeStatus(5))
     );
     for code in [0, 10, 255] {
         let mut bytes = host_bytes(HostMessage::Event {
@@ -505,13 +509,15 @@ fn invalid_enum_codes_are_rejected() {
 
 #[test]
 fn welcome_path_must_be_utf8() {
-    let mut bytes = host_bytes(welcome());
-    bytes[30] = 255;
-    let error = std::str::from_utf8(&bytes[30..]).unwrap_err();
-    assert_eq!(
-        HostMessage::decode(&bytes),
-        Err(DecodeError::InvalidUtf8(error))
-    );
+    for offset in [30, 38] {
+        let mut bytes = host_bytes(welcome());
+        bytes[offset] = 255;
+        let error = std::str::from_utf8(&bytes[offset..]).unwrap_err();
+        assert_eq!(
+            HostMessage::decode(&bytes),
+            Err(DecodeError::InvalidUtf8(error))
+        );
+    }
 }
 
 #[test]
@@ -521,7 +527,15 @@ fn welcome_length_must_match_path_length() {
         bytes[28..30].copy_from_slice(&ingress_len.to_le_bytes());
         assert_eq!(
             HostMessage::decode(&bytes),
-            Err(DecodeError::WrongLength { kind: 64, len: 28 })
+            Err(DecodeError::WrongLength { kind: 64, len: 33 })
+        );
+    }
+    for rx_len in [0u16, 2, 4, u16::MAX] {
+        let mut bytes = host_bytes(welcome());
+        bytes[36..38].copy_from_slice(&rx_len.to_le_bytes());
+        assert_eq!(
+            HostMessage::decode(&bytes),
+            Err(DecodeError::WrongLength { kind: 64, len: 33 })
         );
     }
 }
@@ -610,13 +624,19 @@ fn config_checks_do_not_add_stack_rejections() {
 
 #[test]
 fn welcome_accepts_largest_encodable_path_and_empty_path() {
-    for len in [0, usize::from(u16::MAX) - 22] {
+    for (ingress_len, rx_len) in [
+        (0, 0),
+        (usize::from(u16::MAX) - 24, 0),
+        (0, usize::from(u16::MAX) - 24),
+        (3, usize::from(u16::MAX) - 27),
+    ] {
         let message = HostMessage::Welcome(Welcome {
             version: VERSION,
             status: WelcomeStatus::Ok,
             stream: 1,
             max_record: 1,
-            ingress: "a".repeat(len),
+            ingress: "a".repeat(ingress_len),
+            rx: "b".repeat(rx_len),
         });
         let bytes = host_bytes(message.clone());
         assert_eq!(
@@ -627,13 +647,14 @@ fn welcome_accepts_largest_encodable_path_and_empty_path() {
 }
 
 #[test]
-#[should_panic(expected = "Welcome ingress path exceeds the control body length")]
+#[should_panic(expected = "Welcome paths exceed the control body length")]
 fn welcome_panics_when_body_length_would_overflow() {
     host_bytes(HostMessage::Welcome(Welcome {
         version: VERSION,
         status: WelcomeStatus::Ok,
         stream: 1,
         max_record: 1,
-        ingress: "a".repeat(usize::from(u16::MAX) - 21),
+        ingress: "a".repeat(usize::from(u16::MAX) - 23),
+        rx: String::new(),
     }));
 }
