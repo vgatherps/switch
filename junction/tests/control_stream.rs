@@ -1272,3 +1272,40 @@ fn finished_ack_waits_for_all_backpressured_events() {
     assert_eq!(received, COUNT);
     host.closed(session);
 }
+
+#[test]
+fn poll_discards_packets_for_aborted_socket_generation_after_reopen() {
+    let host = Host::new(1, 1);
+    let (mut client, session) = host.open(1);
+    let old = client.listen_tcp(tcp(), local()).unwrap();
+    assert!(matches!(host.op(session), Op::ListenTcp { .. }));
+    client.abort(old);
+    assert_eq!(host.op(session), Op::AbortTcp { id: old });
+    host.event(session, old, Event::Freed);
+    assert_eq!(events(&mut client, 1), [(old, Event::Freed)]);
+    let current = client.listen_tcp(tcp(), local()).unwrap();
+    assert!(matches!(host.op(session), Op::ListenTcp { .. }));
+    assert_eq!(old.slot, current.slot);
+    assert_ne!(old.generation, current.generation);
+
+    let mut writers = host.rx.borrow_mut();
+    let (_, writer) = writers.iter_mut().find(|(id, _)| *id == session).unwrap();
+    for (id, payload) in [(old, b"old".as_slice()), (current, b"current".as_slice())] {
+        let mut record = writer.reserve(payload.len()).unwrap();
+        record.meta().slot = id.slot;
+        record.meta().generation = id.generation;
+        record.meta().kind = junction::rx::TCP;
+        record.payload().copy_from_slice(payload);
+        record.commit();
+    }
+    drop(writers);
+
+    let mut packets = Vec::new();
+    client
+        .poll(
+            |_, _| panic!("unexpected control event"),
+            |id, frame| packets.push((id, frame.payload().to_vec())),
+        )
+        .unwrap();
+    assert_eq!(packets, [(current, b"current".to_vec())]);
+}

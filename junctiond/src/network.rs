@@ -10,6 +10,8 @@
 //! Open. Sends from older socket generations are dropped; unopened or future generations
 //! are protocol errors. TCP backlogs delay shutdown and close, and outlive graceful retirement.
 //! Closed sockets with backlogs use the Stack's orphan retry limit even while held here.
+//! Receive frames publish whole into the session ring. A full ring retains one owned
+//! frame per socket and retries it before the next Stack turn, delaying receive EOF.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
@@ -63,6 +65,7 @@ struct NetworkState {
     sockets: Vec<Option<HostSocket>>,
     free: Vec<u32>,
     backlogged: Vec<u32>,
+    rx_pending: Vec<u32>,
     held_count: usize,
     udp_dropped: u64,
     to_control: Sender<FromNetwork>,
@@ -88,6 +91,7 @@ impl Network {
                 sockets: (0..capacity).map(|_| None).collect(),
                 free: (0..capacity).rev().collect(),
                 backlogged: Vec::new(),
+                rx_pending: Vec::new(),
                 held_count: 0,
                 udp_dropped: 0,
                 to_control,
@@ -146,18 +150,10 @@ impl Network {
             }
         }
         state.drain_backlogs();
+        state.retry_rx();
         let turn = state.stack.turn(now, self.config.ingress_budget);
         while let Some(token) = state.stack.pop_fired() {
-            if let Some(socket) = &mut state.sockets[token as usize]
-                && let Some(session) = socket.session
-            {
-                let session = state.sessions[slot(session) as usize]
-                    .as_ref()
-                    .expect("host socket belongs to an unregistered session");
-                if !session.errored {
-                    socket.fired(&mut state.stack, &state.to_control, token);
-                }
-            }
+            state.service_rx(token);
         }
         turn
     }
@@ -223,6 +219,15 @@ impl NetworkState {
     }
 
     fn protocol_error(&mut self, session: SessionId) {
+        self.rx_pending.retain(|index| {
+            let socket = self.sockets[*index as usize].as_mut().unwrap();
+            if socket.session == Some(session) {
+                socket.held_rx = None;
+                false
+            } else {
+                true
+            }
+        });
         let entry = self.sessions[slot(session) as usize].as_mut().unwrap();
         if !entry.errored {
             entry.errored = true;
@@ -265,7 +270,7 @@ impl NetworkState {
                     self.backlogged.push(index);
                 }
             }
-            (SendRecord::Udp { to, payload, .. }, Socket::Udp(handle)) => {
+            (SendRecord::Udp { to, payload, .. }, Socket::Udp { handle, .. }) => {
                 if self
                     .stack
                     .udp_send(handle, Some(to.into()), payload)
@@ -275,6 +280,46 @@ impl NetworkState {
                 }
             }
             _ => self.protocol_error(session),
+        }
+    }
+
+    /// Services only attached, non-errored sessions; pending entries exactly name held frames.
+    fn service_rx(&mut self, index: u32) {
+        let Some(socket) = self.sockets[index as usize].as_mut() else {
+            return;
+        };
+        let Some(session) = socket.session else {
+            return;
+        };
+        let entry = self.sessions[slot(session) as usize]
+            .as_mut()
+            .expect("host socket belongs to an unregistered session");
+        if entry.errored {
+            return;
+        }
+        let was_pending = socket.held_rx.is_some();
+        // A pending retry may run while armed; tcp_mut would fire another token.
+        socket.socket.disarm(&mut self.stack);
+        socket.receive(&mut self.stack, &mut entry.rx);
+        socket.fired(&mut self.stack, &self.to_control);
+        socket.socket.arm(&mut self.stack, index);
+        if socket.held_rx.is_some() {
+            if !was_pending {
+                self.rx_pending.push(index);
+            }
+        } else if was_pending {
+            self.rx_pending.retain(|pending| *pending != index);
+        }
+    }
+
+    fn retry_rx(&mut self) {
+        let mut position = 0;
+        while position < self.rx_pending.len() {
+            let index = self.rx_pending[position];
+            self.service_rx(index);
+            if self.rx_pending.get(position) == Some(&index) {
+                position += 1;
+            }
         }
     }
 
@@ -348,6 +393,7 @@ impl NetworkState {
                         socket,
                         backlog: VecDeque::new(),
                         deferred: None,
+                        held_rx: None,
                     });
                     self.sessions[slot(session) as usize]
                         .as_mut()
@@ -442,6 +488,7 @@ impl NetworkState {
 
     fn remove_socket(&mut self, index: u32, abort: bool) {
         let socket = self.sockets[index as usize].take().unwrap();
+        self.rx_pending.retain(|pending| *pending != index);
         if !socket.backlog.is_empty() {
             self.backlogged.retain(|pending| *pending != index);
         }
@@ -493,6 +540,8 @@ impl NetworkState {
                         self.stack.tcp_mut(handle).limit_retries();
                     }
                     socket.session = None;
+                    socket.held_rx = None;
+                    self.rx_pending.retain(|pending| *pending != index);
                 } else {
                     self.remove_socket(index, !graceful);
                 }

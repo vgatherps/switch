@@ -21,6 +21,8 @@ use ceph_ring::Writer;
 use shared_memory::Backing;
 use slice_ringbuffer::RingReader;
 
+use crate::rx::RxFrame;
+
 use crate::control::{
     ClientMessage, ConfigError, DecodeError, EndReason, Event, HostMessage, ListenEndpoint, Op,
     SocketId, TcpConfig, UdpConfig, VERSION, WelcomeStatus,
@@ -166,7 +168,7 @@ struct Slot {
 pub struct Session {
     socket: UnixStream,
     writer: Writer,
-    _rx: RingReader,
+    rx: RingReader,
     stream: u64,
     next_seq: u64,
     slots: Vec<Slot>,
@@ -237,7 +239,7 @@ impl Session {
         Ok(Self {
             socket,
             writer,
-            _rx: rx,
+            rx,
             stream: welcome.stream,
             next_seq: 0,
             slots: (0..max_sockets)
@@ -529,6 +531,36 @@ impl Session {
                 Err(error) => return Err(lost_io(error)),
             }
         }
+    }
+
+    /// Dispatches available control events before draining received packets.
+    ///
+    /// All event callbacks in this poll happen before its packet callbacks.
+    /// Packets for freed sockets or earlier socket generations are discarded.
+    /// A callback may retain its owned frame; that storage becomes reusable only
+    /// after the frame is dropped and a poll reclaims it.
+    pub fn poll(
+        &mut self,
+        on_event: impl FnMut(SocketId, Event),
+        mut on_packet: impl FnMut(SocketId, RxFrame),
+    ) -> Result<(), Lost> {
+        self.poll_events(on_event)?;
+        while let Some(frame) = self.rx.next() {
+            let meta = frame.meta();
+            let id = SocketId {
+                slot: meta.slot,
+                generation: meta.generation,
+            };
+            if self
+                .slots
+                .get(id.slot as usize)
+                .is_some_and(|slot| slot.state != State::Free && slot.generation == id.generation)
+            {
+                on_packet(id, frame);
+            }
+        }
+        self.rx.reclaim();
+        Ok(())
     }
 
     fn event(&mut self, id: SocketId, event: Event) -> Result<(), Lost> {

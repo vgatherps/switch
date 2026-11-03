@@ -15,6 +15,7 @@ use dpdk_smoltcp::smoltcp::{socket::tcp, time::Instant, wire::Ipv4Address};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
 use junction::control::{Event, ListenEndpoint, Op, SocketId, TcpConfig, UdpConfig};
 use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
+use junction::rx::RxFrame;
 use junction::send::TCP_SEND_HEADER;
 use junction::session::Session;
 use junctiond::network::{Network, NetworkConfig};
@@ -88,6 +89,7 @@ struct ControlOptions {
     batch: usize,
     max_sessions: u32,
     hold_retire: bool,
+    rx_size: usize,
 }
 
 impl Default for ControlOptions {
@@ -96,6 +98,7 @@ impl Default for ControlOptions {
             batch: 64,
             max_sessions: 16,
             hold_retire: false,
+            rx_size: 64 * 1024,
         }
     }
 }
@@ -121,6 +124,26 @@ impl Fixture {
             fifo_batch,
             ControlOptions {
                 batch: control_batch,
+                ..ControlOptions::default()
+            },
+        )
+    }
+
+    pub fn with_rx_size(
+        eal: &Eal,
+        names: [&str; 2],
+        tcp: usize,
+        udp: usize,
+        rx_size: usize,
+    ) -> Self {
+        Self::configured(
+            eal,
+            names,
+            tcp,
+            udp,
+            64,
+            ControlOptions {
+                rx_size,
                 ..ControlOptions::default()
             },
         )
@@ -226,7 +249,7 @@ impl Fixture {
                 socket_path: socket_path.clone(),
                 ingress: ingress.clone(),
                 rx_dir: directory.clone(),
-                rx_size: 64 * 1024,
+                rx_size: options.rx_size,
                 max_record: 256,
                 max_sessions: options.max_sessions,
                 max_sockets: 64,
@@ -462,6 +485,20 @@ impl Fixture {
         self.turn_network();
         client
             .poll_events(|id, event| events.push((id, event)))
+            .unwrap();
+        self.forward_links()
+    }
+
+    /// Receive tests choose whether to retain or drop every published frame.
+    pub fn round_receive(
+        &mut self,
+        client: &mut Session,
+        events: &mut Vec<(SocketId, Event)>,
+        on_packet: impl FnMut(SocketId, RxFrame),
+    ) -> bool {
+        self.turn_network();
+        client
+            .poll(|id, event| events.push((id, event)), on_packet)
             .unwrap();
         self.forward_links()
     }

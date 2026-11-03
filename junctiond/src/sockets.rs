@@ -3,9 +3,14 @@ use std::sync::mpsc::Sender;
 
 use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint};
-use dpdk_smoltcp::{AddTcpError, AddUdpError, ReadySide, Stack, TcpHandle, TcpReadyKey, UdpHandle};
+use dpdk_smoltcp::{
+    AddTcpError, AddUdpError, ReadySide, Stack, TcpFrame, TcpHandle, TcpReadyKey, UdpDatagram,
+    UdpHandle, UdpReadyKey,
+};
 use junction::control::{Event, ListenEndpoint, Op, RejectCode, SocketId, TcpConfig};
 use junction::host::{FromNetwork, SessionId};
+use junction::rx::{TCP, UDP};
+use slice_ringbuffer::RingWriter;
 
 pub(crate) enum Socket {
     Tcp {
@@ -17,7 +22,15 @@ pub(crate) enum Socket {
         delivered: bool,
         closed: bool,
     },
-    Udp(UdpHandle),
+    Udp {
+        handle: UdpHandle,
+        key: UdpReadyKey,
+    },
+}
+
+pub(crate) enum HeldRx {
+    Tcp(TcpFrame),
+    Udp(UdpDatagram),
 }
 
 pub(crate) struct HostSocket {
@@ -26,6 +39,7 @@ pub(crate) struct HostSocket {
     pub socket: Socket,
     pub backlog: VecDeque<u8>,
     pub deferred: Option<Op>,
+    pub held_rx: Option<HeldRx>,
 }
 
 pub(crate) fn event(
@@ -98,7 +112,10 @@ impl Socket {
                 };
                 return stack
                     .add_udp(config)
-                    .map(Self::Udp)
+                    .map(|handle| {
+                        let key = stack.udp_ready_key(&handle);
+                        Self::Udp { handle, key }
+                    })
                     .map_err(|error| match error {
                         AddUdpError::Full => RejectCode::UdpSocketsFull,
                         AddUdpError::PortInUse => RejectCode::UdpPortInUse,
@@ -127,11 +144,25 @@ impl Socket {
     }
 
     pub fn arm(&self, stack: &mut Stack, token: u32) {
-        if let Self::Tcp {
-            key, closed: false, ..
-        } = self
-        {
-            stack.arm_tcp(*key, ReadySide::Rx, token);
+        match self {
+            Self::Tcp {
+                key, closed: false, ..
+            } => {
+                stack.arm_tcp(*key, ReadySide::Rx, token);
+            }
+            Self::Udp { key, .. } => stack.arm_udp(*key, token),
+            Self::Tcp { .. } => {}
+        }
+    }
+
+    pub fn disarm(&self, stack: &mut Stack) {
+        match self {
+            Self::Tcp { key, .. } => {
+                stack.disarm_tcp(*key, ReadySide::Rx);
+            }
+            Self::Udp { key, .. } => {
+                stack.disarm_udp(*key);
+            }
         }
     }
 
@@ -155,7 +186,7 @@ impl Socket {
     pub fn drop_handle(self) {
         match self {
             Self::Tcp { handle, .. } => drop(handle),
-            Self::Udp(handle) => drop(handle),
+            Self::Udp { handle, .. } => drop(handle),
         }
     }
 }
@@ -169,6 +200,60 @@ fn add_tcp(stack: &mut Stack, config: TcpConfig) -> Result<TcpHandle, RejectCode
 }
 
 impl HostSocket {
+    /// Keeps ownership of the first frame that cannot fit in the session RX ring.
+    pub fn receive(&mut self, stack: &mut Stack, rx: &mut RingWriter) {
+        if let Socket::Tcp { handle, .. } = &self.socket
+            && stack.tcp(handle).reset_by_peer()
+        {
+            self.held_rx = None;
+            return;
+        }
+        loop {
+            let frame = match self.held_rx.take() {
+                Some(frame) => frame,
+                None => match &self.socket {
+                    Socket::Tcp { handle, .. } => match stack.tcp_mut(handle).recv() {
+                        Ok(Some(frame)) => HeldRx::Tcp(frame),
+                        Ok(None) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => {
+                            break;
+                        }
+                    },
+                    Socket::Udp { handle, .. } => match stack.udp_mut(handle).recv() {
+                        Some(frame) => HeldRx::Udp(frame),
+                        None => break,
+                    },
+                },
+            };
+            let payload = match &frame {
+                HeldRx::Tcp(frame) => frame.payload(),
+                HeldRx::Udp(frame) => frame.payload(),
+            };
+            let Some(mut reserved) = rx.reserve(payload.len()) else {
+                self.held_rx = Some(frame);
+                break;
+            };
+            reserved.payload().copy_from_slice(payload);
+            let meta = reserved.meta();
+            meta.slot = self.id.slot;
+            meta.generation = self.id.generation;
+            match &frame {
+                HeldRx::Tcp(frame) => {
+                    meta.kind = TCP;
+                    meta.rx_timestamp = frame.rx_timestamp();
+                }
+                HeldRx::Udp(frame) => {
+                    meta.kind = UDP;
+                    meta.rx_timestamp = frame.rx_timestamp();
+                    let dpdk_smoltcp::smoltcp::wire::IpAddress::Ipv4(src) = frame.src().addr;
+                    meta.src_addr = src.octets();
+                    meta.src_port = frame.src().port;
+                    meta.dst_addr = frame.dst_addr().octets();
+                }
+            }
+            reserved.commit();
+        }
+    }
+
     pub fn send_tcp(&mut self, stack: &mut Stack, payload: &[u8]) {
         let Socket::Tcp { handle, .. } = &self.socket else {
             unreachable!("validated TCP send must name a TCP socket")
@@ -204,7 +289,7 @@ impl HostSocket {
         }
     }
 
-    pub fn fired(&mut self, stack: &mut Stack, to_control: &Sender<FromNetwork>, token: u32) {
+    pub fn fired(&mut self, stack: &mut Stack, to_control: &Sender<FromNetwork>) {
         let Some(session) = self.session else {
             return;
         };
@@ -226,6 +311,10 @@ impl HostSocket {
         let socket = stack.tcp(handle);
         let state = socket.state();
         let reset_by_peer = socket.reset_by_peer();
+        let drained = self.held_rx.is_none() && socket.recv_queue() == 0;
+        if reset_by_peer {
+            self.held_rx = None;
+        }
         let synchronized = matches!(
             state,
             tcp::State::Established
@@ -241,6 +330,7 @@ impl HostSocket {
             event(to_control, session, self.id, Event::Connected);
         }
         if !*peer_fin
+            && drained
             && matches!(
                 state,
                 tcp::State::CloseWait
@@ -257,7 +347,7 @@ impl HostSocket {
             *delivered = true;
             event(to_control, session, self.id, Event::Delivered);
         }
-        if state == tcp::State::Closed {
+        if state == tcp::State::Closed && (reset_by_peer || drained) {
             *closed = true;
             event(
                 to_control,
@@ -266,6 +356,5 @@ impl HostSocket {
                 Event::Closed { reset_by_peer },
             );
         }
-        self.socket.arm(stack, token);
     }
 }
