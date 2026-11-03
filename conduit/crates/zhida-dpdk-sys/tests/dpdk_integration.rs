@@ -107,7 +107,7 @@ fn test_pool_create_and_alloc() {
 }
 
 /// rte_eth_read_clock (an experimental symbol) links, and a PMD without a clock (net_ring, like
-/// net_tap) refuses it: the app then starts no clock thread.
+/// net_tap) refuses it: zhida-nic then logs `phc_check: unsupported`.
 #[zhida_test_support::pinned_test]
 fn read_clock_without_a_clock() {
     assert!(ensure_eal_init(), "EAL init failed");

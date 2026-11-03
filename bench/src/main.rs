@@ -16,11 +16,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const USAGE: &str = "\
 usage:
   zhida-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N
-                    --rate-min PPS --rate-max PPS [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200]
-                    [--budget-us W]
+                    (--rate-min PPS --rate-max PPS | --rates PPS,PPS,...)
+                    [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200] [--budget-us W]
       The sweep coordinator: starts G generator workers (`sh -c CMD` with {i} = 0..G-1 and
-      {senders} = N/G) and runs each rate PPS-min x sqrt(2)^k up to PPS-max on all of them (rate
-      split evenly), stopping early at a generator-bound step. Prints one JSON line per step and
+      {senders} = N/G) and runs each rate on all of them (rate split evenly), stopping early if
+      a sender falls behind schedule. Supply a strictly increasing list with --rates, or use the default
+      log-spaced schedule PPS-min x sqrt(2)^k up to PPS-max. Prints one JSON line per step and
       always a summary line. --budget-us (tcp, ws): after the first step, each
       connection may have its rate share x (the first step's median round trip + W) in flight.
   zhida-bench gen --config F --proto udp|tcp|ws --target IP:PORT --senders N --size S
@@ -93,6 +94,29 @@ fn proto(flags: &mut Flags) -> Result<Proto, String> {
     }
 }
 
+fn sweep_rates(flags: &mut Flags) -> Result<(u64, u64, Option<Vec<u64>>), String> {
+    if let Some(value) = flags.take::<String>("rates")? {
+        if flags.0.contains_key("rate-min") || flags.0.contains_key("rate-max") {
+            return Err("--rates cannot be combined with --rate-min or --rate-max".into());
+        }
+        let schedule: Vec<u64> = value
+            .split(',')
+            .map(|rate| rate.parse().map_err(|_| format!("--rates: invalid value {rate:?}")))
+            .collect::<Result<_, _>>()?;
+        if schedule[0] == 0 || schedule.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("--rates must be positive and strictly increasing".into());
+        }
+        Ok((schedule[0], *schedule.last().unwrap(), Some(schedule)))
+    } else {
+        let min = flags.need("rate-min")?;
+        let max = flags.need("rate-max")?;
+        if min == 0 || min > max {
+            return Err("need 0 < --rate-min <= --rate-max".into());
+        }
+        Ok((min, max, None))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn kernel_args(flags: &mut Flags) -> Result<(Proto, std::net::Ipv4Addr, u16), String> {
     let proto = proto(flags)?;
@@ -114,12 +138,13 @@ fn main_inner() -> Result<(), String> {
     match command.as_str() {
         "sweep" => {
             let proto = proto(&mut flags)?;
+            let (rate_min, rate_max, schedule) = sweep_rates(&mut flags)?;
             let args = coord::Args {
                 gens: flags.need("gens")?,
                 gen_cmd: flags.need("gen-cmd")?,
                 senders: flags.need("senders")?,
-                rate_min: flags.need("rate-min")?,
-                rate_max: flags.need("rate-max")?,
+                rate_min,
+                rate_max,
                 step_ms: flags.or("step-ms", 2000)?,
                 warmup_ms: flags.or("warmup-ms", 500)?,
                 drain_ms: flags.or("drain-ms", 200)?,
@@ -129,12 +154,13 @@ fn main_inner() -> Result<(), String> {
                 return Err("--budget-us is for tcp and ws".into());
             }
             flags.done()?;
-            if args.rate_min == 0 || args.rate_min > args.rate_max {
-                return Err("need 0 < --rate-min <= --rate-max".into());
+            let mut progress = |stage: &str| eprintln!("zhida-bench {proto:?}: {stage}");
+            match schedule {
+                Some(schedule) => {
+                    coord::run_with_rates(&args, &schedule, &mut print_line, &mut progress)
+                }
+                None => coord::run(&args, &mut print_line, &mut progress),
             }
-            coord::run(&args, &mut print_line, &mut |stage| {
-                eprintln!("zhida-bench {proto:?}: {stage}");
-            })
         }
         "gen" => {
             let proto = proto(&mut flags)?;
@@ -188,10 +214,55 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    fn parse_rates(args: &[&str]) -> Result<(u64, u64, Option<Vec<u64>>), String> {
+        let mut flags = Flags::parse(args.iter().map(|arg| OsString::from(*arg)))?;
+        let rates = sweep_rates(&mut flags)?;
+        flags.done()?;
+        Ok(rates)
+    }
+
+    #[test]
+    fn explicit_rates_preserve_the_list_and_range_still_uses_log_schedule() {
+        let rates = [
+            10_000, 100_000, 400_000, 800_000, 900_000, 1_000_000, 1_100_000, 1_200_000,
+            1_400_000, 1_800_000, 2_500_000,
+        ];
+        let parsed = parse_rates(&[
+            "--rates",
+            "10000,100000,400000,800000,900000,1000000,1100000,1200000,1400000,1800000,2500000",
+        ]).unwrap();
+        assert_eq!(parsed, (10_000, 2_500_000, Some(rates.to_vec())));
+        assert_eq!(parse_rates(&["--rates", "7"]).unwrap(), (7, 7, Some(vec![7])));
+        assert_eq!(
+            parse_rates(&["--rate-min", "10000", "--rate-max", "5000000"]).unwrap(),
+            (10_000, 5_000_000, None)
+        );
+    }
+
+    #[test]
+    fn rates_reject_malformed_zero_unordered_and_conflicting_flags() {
+        for value in ["", ",", "1,", ",1", "1,,2", "abc", "1,2x", "-1", "18446744073709551616", "0", "1,0", "2,1", "1,1"] {
+            assert!(parse_rates(&["--rates", value]).is_err(), "{value:?}");
+        }
+        for flags in [
+            vec!["--rates", "1,2", "--rate-min", "1"],
+            vec!["--rates", "1,2", "--rate-max", "2"],
+            vec!["--rate-min", "1", "--rate-max", "2", "--rates", "1,2"],
+            vec!["--rate-min", "0", "--rate-max", "2"],
+            vec!["--rate-min", "2", "--rate-max", "1"],
+            vec!["--rate-min", "1"],
+            vec!["--rate-max", "2"],
+            vec![],
+        ] {
+            assert!(parse_rates(&flags).is_err(), "{flags:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn parse_kernel(args: &[&str]) -> Result<(Proto, std::net::Ipv4Addr, u16), String> {
         let mut flags = Flags::parse(args.iter().map(|arg| OsString::from(*arg)))?;
         let args = kernel_args(&mut flags)?;
@@ -200,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn kernel_requires_explicit_ipv4_protocol_and_nonzero_port() {
         for proto in ["udp", "tcp", "ws"] {
             let args = parse_kernel(&["--proto", proto, "--bind", "10.80.1.23", "--port", "7000"])

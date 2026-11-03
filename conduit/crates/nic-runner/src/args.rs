@@ -19,11 +19,10 @@ MODES:
     Defaults: UDP 11111, no TCP, 8 TCP connections, S=0 (until SIGINT/SIGTERM), R=5.
     Socket buffers support messages through 65507 bytes. UDP above MTU - 28
     (1472 at MTU 1500) requires IP fragment reassembly; Zhida does not do it.
-  feed [--host H] [--port P] [--path P] [--print N] [--seconds S] [--phc PATH]
+  feed [--host H] [--port P] [--path P] [--print N] [--seconds S]
     Defaults: {DEFAULT_HOST}, {DEFAULT_PORT}, {DEFAULT_PATH}, N={DEFAULT_PRINT}, S={DEFAULT_FEED_SECONDS}. TLS 1.3 only:
     data-stream.binance.vision (TLS 1.2 only) is unreachable; stream.binance.com may answer
     HTTP 451 from restricted locations. S counts from the WebSocket open.
-    --phc selects a Linux PTP hardware clock for ENA RX timestamp mapping.
 Exit codes: 0 success; 2 buffers in use at close; 3 args/setup/run error; 101 panic."
     )
 }
@@ -53,7 +52,6 @@ pub struct Feed {
     pub path: String,
     pub print: usize,
     pub seconds: u64,
-    pub phc: Option<PathBuf>,
 }
 
 fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
@@ -109,7 +107,6 @@ pub fn parse(args: impl Iterator<Item = OsString>) -> Result<Args, String> {
         path: DEFAULT_PATH.into(),
         print: DEFAULT_PRINT,
         seconds: DEFAULT_FEED_SECONDS,
-        phc: None,
     };
     while let Some(flag) = args.next() {
         let flag = flag?;
@@ -124,7 +121,7 @@ pub fn parse(args: impl Iterator<Item = OsString>) -> Result<Args, String> {
             ),
             "feed" => matches!(
                 flag.as_str(),
-                "--host" | "--port" | "--path" | "--print" | "--seconds" | "--phc"
+                "--host" | "--port" | "--path" | "--print" | "--seconds"
             ),
             _ => false,
         };
@@ -172,7 +169,6 @@ pub fn parse(args: impl Iterator<Item = OsString>) -> Result<Args, String> {
                 "--path" => feed.path = value,
                 "--print" => feed.print = number(&flag, &value)?,
                 "--seconds" => feed.seconds = number(&flag, &value)?,
-                "--phc" => feed.phc = Some(PathBuf::from(value)),
                 _ => unreachable!(),
             }
         }
@@ -264,42 +260,11 @@ mod tests {
             ("stream.binance.com", 9443, "/ws/btcusdt@bookTicker")
         );
         assert_eq!((feed.print, feed.seconds), (10, 30));
-        assert_eq!(feed.phc, None);
     }
 
     #[test]
     fn feed_host_override() {
         let feed = feed(&["--config", "x", "feed", "--host", "testnet.binance.vision"]);
         assert_eq!(feed.host, "testnet.binance.vision");
-    }
-
-    #[test]
-    fn feed_accepts_explicit_phc() {
-        let feed = feed(&["--config", "x", "feed", "--phc", "/dev/ptp_ena"]);
-        assert_eq!(feed.phc, Some(PathBuf::from("/dev/ptp_ena")));
-    }
-
-    #[test]
-    fn phc_rejects_missing_duplicate_and_non_feed_usage() {
-        for (args, expected) in [
-            (vec!["--config", "x", "feed", "--phc"], "--phc needs a value"),
-            (
-                vec!["--config", "x", "feed", "--phc", "/dev/ptp0", "--phc", "/dev/ptp1"],
-                "--phc given twice",
-            ),
-            (
-                vec!["--config", "x", "info", "--phc", "/dev/ptp0"],
-                "unexpected info option: --phc",
-            ),
-            (
-                vec!["--config", "x", "sockperf-server", "--phc", "/dev/ptp0"],
-                "unexpected sockperf-server option: --phc",
-            ),
-        ] {
-            assert_eq!(
-                parse(args.into_iter().map(OsString::from)).err().unwrap(),
-                expected,
-            );
-        }
     }
 }

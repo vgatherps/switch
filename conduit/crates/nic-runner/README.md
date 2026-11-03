@@ -19,7 +19,7 @@ from [crates/netconf-open/examples/tcp_client.rs](../netconf-open/examples/tcp_c
 [docs/USAGE.md](../../docs/USAGE.md).
 
 The package is `nic-runner` and the binary is `zhida-nic`. It depends on `zhida-open`, `zhida-netconf`,
-`dpdk-smoltcp`, `zhida-dpdk-sys`, `switchnet`, `binance-feed`, `nic-clock` and `sockperf-wire`; nothing depends on it. The modes live
+`dpdk-smoltcp`, `zhida-dpdk-sys`, `switchnet`, `binance-feed` and `sockperf-wire`; nothing depends on it. The modes live
 in `src/server.rs` (sockperf-server), `src/feed.rs` and `src/nic.rs` (info), with argument parsing in
 `src/args.rs`. `make test-nic-runner` runs `tests/run.sh` in the Docker image: the `zhida-nic` and
 sockperf-wire unit tests, `sockperf_merge.py --self-test`, then `zhida-nic` against kernel `sockperf`
@@ -111,9 +111,9 @@ management route is never cut); every other device in the IOMMU group is unbound
 an IOMMU, `--noiommu` is given. Each refusal is one line naming the reason and writes nothing. It then
 prints each sysfs write (`write '<value>' > <path>`), runs `modprobe vfio-pci` if needed, the hugepages
 free per NUMA node, and `<BDF> bound to vfio-pci (<group>)`. A device already on vfio-pci prints
-`already bound` and exits 0. If a write fails while the device has no driver, or the vfio bind does not
-verify, it detaches the device from vfio-pci if needed, puts it back on its kernel driver and reports
-both errors. Running `bind` (or `unbind`) again finishes an interrupted bind.
+`already bound` and exits 0. If a write fails after it unbound the kernel driver, or the vfio bind does
+not verify, it detaches the device from vfio-pci if needed, puts it back on its kernel driver and reports
+both errors. A write failing on a device that had no driver is reported alone; no binding changed. Running `bind` (or `unbind`) again finishes an interrupted bind.
 
 Unbind (root), after the run:
 ```
@@ -132,12 +132,11 @@ the same Dockerfile):
 ```
 make docker-image DOCKER_IMAGE=zhida-dpdk-test:local
 ```
-Run (the cargo volumes keep the build between runs; the first run compiles for a few minutes). The container gets
-Zhida's core plus a housekeeping core for `feed`'s clock thread (section 3b); `taskset` keeps Zhida on its own:
+Run (the cargo volumes keep the build between runs; the first run compiles for a few minutes):
 ```
 nic() {
   docker run --rm -it --privileged --network host \
-    --cpuset-cpus="${ZHIDA_CPU:-2},${HOUSEKEEPING_CPU:-0}" \
+    --cpuset-cpus="${ZHIDA_CPU:-2}" \
     -v /dev/hugepages:/dev/hugepages -v /dev/vfio:/dev/vfio -v /lib/firmware:/lib/firmware:ro \
     -v "$PWD/..:/work" -w /work/conduit \
     -v zhida-cargo-registry:/usr/local/cargo/registry -v zhida-nic-target:/work/target \
@@ -221,52 +220,32 @@ it prints the requested bit and the reason. A refused offload fails Port open wi
 nic --config dut.json feed --seconds 30 --print 10 2>&1 | tee feed.log
 ```
 Options: `--host H` (default stream.binance.com), `--port P` (9443), `--path P`
-(/ws/btcusdt@bookTicker), `--print N` (10), `--seconds S` (30, counted from the WebSocket open),
-`--phc PATH` (optional, explicit Linux PTP hardware clock device, e.g. `/dev/ptp_ena`). The
+(/ws/btcusdt@bookTicker), `--print N` (10), `--seconds S` (30, counted from the WebSocket open). The
 kernel resolves the host name before the NIC is taken. The client is binance-feed's: relay's wss
 client over sheath (TLS 1.3 only), as a switch task on a switchnet Net. data-stream.binance.vision
 speaks TLS 1.2 only and is unreachable; stream.binance.com may answer HTTP 451 from restricted
 locations. Output is up to N bookTicker messages, a message count and the update-id range. Success
 requires at least one message and successful read/close.
 
-`feed_latency` measures from the retained RX-buffer timestamp of the TLS record containing a
-message's first WebSocket byte until relay hands over the complete message (`nic-clock`). Multiple
-messages can share a timestamp; TCP can append a later small packet to an earlier buffer and retain
-the earlier timestamp. These intervals can therefore start before the message's own packet.
-The output gives `no_stamp` (unstamped: `rx_timestamps` off or the PMD left no stamp), `not_ready`
-(no clock mapping yet: first second, or no NIC clock), `impossible` (stamp after now: a bug), the
-largest mapping uncertainty and a log2 histogram in ns. On ENA (with the DPDK patch in
-`docker/dpdk-ena-read-clock.patch`),
-the default source is `dpdk_smoltcp::read_clock`, which never runs during an ENA device reset
-(the reset frees and rebuilds the PHC). If the port reports -ENOTSUP, no mapping is available.
-A thread on the housekeeping CPUs (online CPUs not in /sys/devices/system/cpu/isolated, minus
-Zhida's) maps the clock onto the CPU counter; there are no per-packet clock syscalls.
+`feed_latency` is CLOCK_REALTIME when relay hands over a complete message minus the retained
+RX-buffer timestamp of the TLS record containing its first WebSocket byte. Multiple messages can
+share a timestamp; TCP can append a later small packet to an earlier buffer and retain the earlier
+timestamp, so these intervals can start before the message's own packet. On ENA the stamps are the
+data ENI's PHC (ns since the epoch); the host's chrony disciplines CLOCK_REALTIME to the Time Sync PHC
+(deploy/README.md), so the two are compared directly. The output gives `no_stamp` (unstamped:
+`rx_timestamps` off or the PMD left no stamp) and a log2 histogram in ns (`<=0`: a stamp at or after
+now).
 
-`feed --phc /dev/ptp_ena` explicitly uses that opened Linux PHC's dynamic clock ID and
-`clock_gettime` instead of the data port's `read_clock`, including when the port reports -ENOTSUP.
-The owning fd moves into the housekeeping thread and stays open until that thread exits.
-Opening and the first actual clock read validate the device once on the calling thread before
-the feed starts; periodic mapper sampling runs only on the housekeeping thread. An open/read
-error, non-ENA driver, or unavailable housekeeping CPU fails explicit selection with a clear error
-and unsuccessful exit; no latency
-metric is produced and there is no fallback to the port clock or wall clock. Later read failures
-are reported once and skipped, preserving the mapper's existing 300 ms stale timeout.
-Without `--phc`, unavailable mapping still prints `nic_clock: none` and stamped messages are
-`not_ready`. The ENA-only gate remains for both sources: other drivers' clocks need not match
-their RX timestamps (ice's `read_clock` returns CLOCK_MONOTONIC_RAW).
+At startup, after the port opens, `feed` logs `phc_check: phc_minus_realtime_ns=N`: one read of the
+data ENI's PHC (`dpdk_smoltcp::read_clock`) minus the midpoint of the CLOCK_REALTIME reads around it.
+A value near 37 000 000 000 would mean the PHC counts TAI and CLOCK_REALTIME UTC. It is logged, not
+checked. `phc_check: unsupported` means the driver cannot read the NIC's clock (-ENOTSUP).
 
-The reported bound covers the CPU-counter-to-selected-PHC mapping, not an independently established
-accuracy bound between two ENIs. The selected PHC must share the RX timestamp clock reference.
-[AWS documents the Amazon Time Sync PTP hardware clock as the packet timestamp reference](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping),
-but no independent inter-ENI skew guarantee is established here. Do not treat the mapper's bound
-alone as a comprehensive end-to-end accuracy guarantee.
-If a NIC clock read ever contradicts the mapping (the clock jumped, e.g. stepped), samples taken in the up to 100 ms
-before that read may be wrong by more than their bound, and they are not removed. So the run's latency result is
-invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and histogram. A device
-reset the Stack recovered from (`dpdk_smoltcp::port_resets()` changed) marks the run the same way: nothing says
-the PHC continues across the reset. The feed snapshots this counter before running and checks it synchronously
-immediately before reporting, so even a reset after the clock thread's last poll suppresses the histogram.
-This adds no per-packet or per-turn reset check.
+A device reset the Stack recovered from (`dpdk_smoltcp::port_resets()` changed) makes the run's
+latency invalid: `feed_latency` prints `latency invalid: NIC clock jumped` instead of the counts and
+histogram, since nothing says the PHC continues across the reset. The feed snapshots this counter
+before running and checks it once, immediately before reporting; there is no per-packet or
+per-turn reset check.
 
 ### 3c. sockperf-server
 ```

@@ -586,7 +586,8 @@ impl Stack {
 
     /// Build a TCP socket from `config` and add it. Returns the config when all
     /// `max_sockets` slots are occupied. `rx_capacity` is the advertised receive window
-    /// target, not a limit on received data; received data uses the shared RX pool.
+    /// target, not a limit on received data. Contiguous payload is accepted even beyond its
+    /// advertised edge; out-of-order data remains window-bounded. RX data uses the shared pool.
     /// Queued data uses the shared frame pool and is limited by `config.tx_capacity`
     /// bytes, including unacknowledged data. With the RX pool empty the driver
     /// drops arrivals and the peer retransmits; with the frame pool empty

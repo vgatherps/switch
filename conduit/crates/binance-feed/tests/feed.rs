@@ -673,7 +673,6 @@ fn reset_after_last_clock_poll_suppresses_feed_histogram() {
         turn_until(net, clock, &mut rt, || clock.ms() >= sent + 200);
         assert!(out.take().is_none(), "the feed must not have reported yet");
         assert_eq!(dpdk_smoltcp::port_resets(), resets, "last clock poll sees no reset");
-        assert!(!nic_clock::jumped(), "the clock mapper has not observed a jump");
 
         with_eal(|eal| {
             let mut pair = zhida_test_kit::pair::new_pair(eal, ["bncra", "bncrb"]);

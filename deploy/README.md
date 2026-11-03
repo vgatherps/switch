@@ -44,7 +44,9 @@ The AWS kernel comparison runs `apply --kernel-receiver` on a fresh receiver. It
 ENI on Linux `ena` at apply and every boot, skips the VFIO module setup, and verifies `ena`
 instead of `vfio-pci`. It otherwise uses the same build, CPU isolation, IRQ housekeeping and
 unmanaged-interface setup; the benchmark configures the data IP and source routes afterward.
-The mode is saved in `host.env` for boot and verify. Repeat the flag when reapplying on that host.
+The mode is saved in `host.env` for boot and verify. Repeat the flag when reapplying on that host. On a host
+whose data ENI is already on vfio-pci, `apply --kernel-receiver` refuses (`interfaces: FAIL`); run
+`zhida-netconf unbind /etc/zhida/dut.json` first.
 On the kernel receiver, `apply` also writes
 `/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf` with
 `ManageForeignRoutingPolicyRules=no`, so networkd does not remove the benchmark's source-routing
@@ -61,13 +63,14 @@ activate the drop-in before proceeding.
 | interfaces | management = the interface of the lowest-metric IPv4 default route; data = the one other `ena` interface. Never the same interface; every step that touches the data ENI checks again first |
 | cpus | app CPU = highest-numbered CPU on the data ENI's NUMA node; it and its SMT siblings are isolated, every other CPU is housekeeping. Written to `/etc/zhida/host.env` |
 | config | `zhida-netconf discover --interface <data> --aws -o /etc/zhida/dut.json`, then `check`. `rx_timestamps` stays as discovered (false); run-binance.sh turns it on in its own copy |
-| cmdline | via grubby: `isolcpus=managed_irq,domain,<iso> nohz_full=<iso> rcu_nocbs=<iso> irqaffinity=<housekeeping> transparent_hugepage=madvise hugepagesz=2M hugepages=<node>:512 ena.phc_enable=1` (1 GiB of 2 MiB pages on the data ENI's node; enable the management ENI's Time Sync PHC after reboot) |
+| cmdline | via grubby: `isolcpus=managed_irq,domain,<iso> nohz_full=<iso> rcu_nocbs=<iso> irqaffinity=<housekeeping> transparent_hugepage=madvise hugepagesz=2M hugepages=<node>:512 ena.phc_enable=1` (1 GiB of 2 MiB pages on the data ENI's node; `ena.phc_enable=1` makes the ENA PTP hardware clock appear as `/dev/ptp_ena` after reboot, chrony's reference) |
 | vfio_wc | official AL2023 `kernel6.18` already supplies ENA write-combining (needed for LLQ); check package ownership/integrity and loaded module identity, without installing headers or rebuilding it. Legacy kernels retain amzn-drivers' `get-vfio-with-wc.sh`, pinned commit and sha256 |
 | cmdline (x86_64) | also `clocksource=tsc` (not `tsc=reliable`, which turns off the kernel's TSC stability checks). Graviton's `arch_sys_counter` needs nothing |
 | unit | `zhida-host.service` runs `hft-host.sh boot` at every boot |
+| chrony | enable chronyd. `boot`, once `/dev/ptp_ena` exists (after the reboot that applies `ena.phc_enable=1`; never outside a precision-time placement group), appends AWS's documented PHC refclock line, `refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer` ([Amazon Time Sync: configure chronyd to use the PHC](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html#configure-chronyd-phc)), to AL2023's `/etc/chrony.conf`, keeping its Time Sync NTP server line, and restarts chronyd. Without the device `boot` removes exactly that line if present (restarting chronyd) and leaves the rest: chronyd exits at start on a PHC refclock it cannot open |
 | unmanaged config | before requesting a reboot, write `/etc/systemd/network/00-zhida-data.network` with the data ENI's MAC and `Unmanaged=yes`; reload networkd only when the file changes. No addresses or routes are flushed until `boot` |
 | reboot | when the command line or a module changed |
-| boot | irqbalance off; every movable IRQ on the housekeeping CPUs; the data ENI unmanaged by systemd-networkd (`/etc/systemd/network/00-zhida-data.network`, matched by MAC) with its addresses and routes flushed; `zhida-netconf bind` (`--noiommu` without IOMMU groups) |
+| boot | the PHC refclock once `/dev/ptp_ena` exists (chrony row); irqbalance off; every movable IRQ on the housekeeping CPUs; the data ENI unmanaged by systemd-networkd (`/etc/systemd/network/00-zhida-data.network`, matched by MAC) with its addresses and routes flushed; `zhida-netconf bind` (`--noiommu` without IOMMU groups) |
 
 The unmanaged file must exist before the first reboot: otherwise AL2023 can give the data ENI a DHCP
 default route before `zhida-host.service` starts, making it the lowest-metric default route instead
@@ -78,25 +81,28 @@ unmanaged file and reloads networkd. Write and reload failures stop setup before
 
 `verify` prints one `<step>: ok|FAIL <detail>` line for each of: cmdline, management (on its kernel
 driver, with the default route), data (on vfio-pci), cpus (`isolated` and `nohz_full` in sysfs), hugepages,
-pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed WC module), clocksource (the current
-one; anything but `tsc` fails on x86_64), unit, config.
+pools, irqbalance, irqs, vfio_wc (the loaded vfio-pci-core matches the installed WC module), clocksource (on x86_64 the
+current one must be `tsc`, and `dmesg`, read as root, must show no `clocksource: timekeeping watchdog`,
+`TSC unstable` or `Marking clocksource 'tsc' as unstable` line, and its last `Switched to clocksource`
+must name `tsc`; a failure prints the offending line; other architectures skip it), unit, config, chrony
+(FAIL when chronyd is not running; ok with the PHC as the selected source, a `#*` PHC row in `chronyc sources`; also ok with no
+`/dev/ptp_ena` at all, a host outside a precision-time placement group on NTP only; FAIL when the
+device exists but is not selected, printing the sources output). With chrony on the PHC, CLOCK_REALTIME
+is UTC from the Time Sync PHC, which does not smear leap seconds (the link-local NTP source does).
 `pools` reads zhida-nic's own `hugepages: hugepages-2048kB used=N free=M` line from the last run in
 `/var/log/zhida/binance.log` and fails if the run took more than the 512 reserved pages.
 
-`run-binance.sh` runs `hft-host.sh verify` first and refuses to start if `/dev/ptp_ena` is
-not a character device. It then writes `/etc/zhida/binance.json`: `dut.json` with
-`rx_timestamps: true`. It refuses to start unless `zhida-netconf check` reads that back, then runs
-`zhida-nic --config /etc/zhida/binance.json feed --phc /dev/ptp_ena` pinned to the app CPU,
-appending to `/var/log/zhida/binance.log`. The feed opens and reads the real Linux PHC for
-background mapper sampling; an unreadable or unsupported clock fails startup, with no wall-clock
-fallback or per-packet clock read. If the device is absent, check `ena.phc_enable=1` in the running
-kernel command line and reboot after `apply`.
+`run-binance.sh` runs `hft-host.sh verify` first and refuses to start if it fails, or if chrony
+does not have the PHC selected (launch the instance in a precision-time placement group). It then writes
+`/etc/zhida/binance.json`: `dut.json` with `rx_timestamps: true`. It refuses to start unless
+`zhida-netconf check` reads that back, then runs `zhida-nic --config /etc/zhida/binance.json feed`
+pinned to the app CPU, appending to `/var/log/zhida/binance.log`. Each message's latency is
+CLOCK_REALTIME minus its ENA hardware RX stamp (the data ENI's PHC); chrony keeps CLOCK_REALTIME on
+the Time Sync PHC (the `chrony` verify line). At startup the feed logs
+`phc_check: phc_minus_realtime_ns=N` from one PHC read between two CLOCK_REALTIME reads.
 
 AWS documents the packet timestamp reference as the
 [Amazon Time Sync PTP hardware clock](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping).
-The displayed `max_mapping_bound_ns` is mapper sampling uncertainty under the mapper's assumptions,
-not a measured bound on cross-interface skew or AWS clock error. No independent accuracy guarantee
-between the data ENI's timestamp clock and the management ENI's PHC has been established here.
 
 The 512 x 2 MiB HugeTLB pages (1 GiB) are reserved for DPDK. `run-binance.sh` and the AWS benchmark's
 receiver and senders explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding any inherited value.

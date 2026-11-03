@@ -26,6 +26,14 @@ stub() { # name body
     chmod +x "$stubs/$1"
 }
 for c in pip3 curl rustup cargo install networkctl make taskset; do stub "$c" ""; done
+stub chronyc "cat '$root/sources'"
+# chronyc sources as AWS documents it, the PHC selected (`#*`).
+printf '%s\n' 'MS Name/IP address         Stratum Poll Reach LastRx Last sample' \
+    '===============================================================================' \
+    '#* PHC0                          0   0   377     0   +184ns[ +198ns] +/- 5032ns' \
+    '^- 169.254.169.123               1   4   377     8    -18us[  -18us] +/-  115us' >"$tmp/sources-phc"
+# dmesg reads the fake kernel log; a missing file is an unreadable dmesg.
+stub dmesg "cat '$root/kmsg'"
 stub dnf 'case "$*" in *kernel-devel*) exit 1 ;; esac'
 stub uname 'case "$1" in -r) echo "${FAKE_KERNEL:-6.1.0-test}" ;; *) echo "${FAKE_ARCH:-aarch64}" ;; esac'
 stub pkg-config 'echo 25.11.3'
@@ -33,6 +41,7 @@ stub ip "[ \"\$*\" = '-4 route show default' ] && cat '$tmp/routes'; exit 0"
 stub grubby "case \"\$1\" in --info=*) echo \"args=\\\"\$(cat '$tmp/grubby')\\\"\" ;; --update-kernel=*) echo \"\${2#--args=}\" >>'$tmp/grubby' ;; esac"
 stub systemctl "case \"\$1\" in
     is-enabled) [ -e '$tmp/enabled' ] ;;
+    is-active) [ \"\${FAKE_CHRONYD_INACTIVE:-}\" != 1 ] ;;
     enable) touch '$tmp/enabled' ;;
     reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' && touch '$tmp/unmanaged-before-reboot'
         cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf' && touch '$tmp/policy-before-reboot'
@@ -67,7 +76,10 @@ esac'
 # vfio-pci.
 stub zhida-netconf "case \"\$1\" in
     discover) printf '{\\n  \"version\": 1,\\n  \"rx_timestamps\": false,\\n  \"descriptors\": 1024\\n}\\n' >\"\$6\" ;;
-    check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" ;;
+    check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" || exit 1
+        # The real summary has more lines after rx_timestamps; a long one fails its writes
+        # once a reader that stopped early (grep -q) has closed the pipe.
+        [ -z \"\${FAKE_CHECK_LONG:-}\" ] || yes '  summary line' | head -n 100000 ;;
     bind) ln -sfn ../../drivers/vfio-pci '$root/sys/bus/pci/devices/0000:00:06.0/driver' ;;
 esac"
 stub zhida-nic "echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489'"
@@ -105,7 +117,14 @@ host() {
     echo 0 >"$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
     echo STOCK >"$root/sys/module/vfio_pci_core/srcversion"
     echo arch_sys_counter >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
+    printf '%s\n' '[    0.000000] clocksource: Switched to clocksource kvm-clock' \
+        '[    1.200000] clocksource: Switched to clocksource tsc-early' \
+        '[    2.400000] clocksource: Switched to clocksource tsc' >"$root/kmsg"
     : >"$root/dev/hugepages/.mounted"
+    # AL2023's chrony.conf: the Time Sync NTP server (abridged).
+    printf '%s\n' 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' 'driftfile /var/lib/chrony/drift' \
+        >"$root/etc/chrony.conf"
+    cp "$tmp/sources-phc" "$root/sources"
     # /opt/dpdk as this script builds it: 25.11.3 with the ENA read_clock patch.
     mkdir -p "$root/opt/dpdk/share"
     echo "$dpdk_stamp" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
@@ -123,6 +142,8 @@ want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1
 # What the reboot changes: the kernel command line, the modules, and what the kernel then reports.
 reboot() {
     echo "ro console=ttyS0 $want_args" >"$root/proc/cmdline"
+    # ena.phc_enable=1 makes the ENA PHC appear as /dev/ptp_ena.
+    : >"$root/dev/ptp_ena"
     echo "${FAKE_SRCVERSION-PATCHED}" >"$root/sys/module/vfio_pci_core/srcversion"
     echo 512 >"$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
     echo 7 >"$root/sys/devices/system/cpu/isolated"
@@ -204,6 +225,10 @@ check "the config comes from zhida-netconf discover --aws on the data ENI" calle
 check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
 check "no interface is flushed or bound before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+# chronyd exits at start on a PHC refclock it cannot open: before the reboot there is no
+# /dev/ptp_ena, so apply leaves chrony.conf alone.
+check "apply leaves chrony.conf alone" sh -c "! grep -q '^refclock' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
+check "apply enables chronyd" called "systemctl enable -q chronyd.service"
 
 reboot
 HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
@@ -214,6 +239,31 @@ check "boot flushes the data ENI and only it" sh -c "grep -q 'ip addr flush dev 
 check "boot binds with --noiommu (no IOMMU groups)" called "zhida-netconf bind $root/etc/zhida/dut.json --noiommu"
 check "boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5,6" "$root/proc/irq/10/smp_affinity_list"
 check "boot stops irqbalance" called "systemctl disable --now -q irqbalance.service"
+check "boot with /dev/ptp_ena adds AWS's PHC refclock line after AL2023's NTP server" sh -c "[ \"\$(tail -n 1 '$root/etc/chrony.conf')\" = 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' ] && grep -qx 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' '$root/etc/chrony.conf'"
+check "boot restarts chronyd for the added line" called "systemctl restart chronyd.service"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "a second boot keeps one refclock line and does not restart chronyd" sh -c "[ \$(grep -c '^refclock PHC' '$root/etc/chrony.conf') = 1 ] && ! grep -q '^systemctl restart chronyd' '$calls'"
+# A host outside a precision-time placement group: no device, so chrony stays on NTP.
+mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
+sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
+cp "$root/etc/chrony.conf" "$tmp/chrony.conf"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "boot without /dev/ptp_ena leaves chrony.conf alone" sh -c "cmp -s '$tmp/chrony.conf' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
+# A host whose earlier apply added the line without the device: boot removes exactly that line.
+printf '%s\n' 'refclock PHC /dev/ptp0 poll 2' >>"$root/etc/chrony.conf"
+cp "$root/etc/chrony.conf" "$tmp/chrony-other.conf"
+printf '%s\n' 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' >>"$root/etc/chrony.conf"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "boot without /dev/ptp_ena removes only the PHC refclock line and restarts chronyd" sh -c "cmp -s '$tmp/chrony-other.conf' '$root/etc/chrony.conf' && [ \$(grep -c '^systemctl restart chronyd.service' '$calls') = 1 ]"
+: >"$calls"
+HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
+check "a second boot without /dev/ptp_ena changes nothing" sh -c "cmp -s '$tmp/chrony-other.conf' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
+cp "$tmp/chrony.conf" "$root/etc/chrony.conf"
+mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
+HFT_ROOT=$root sh "$script" boot >/dev/null 2>&1
 
 : >"$calls"
 run apply
@@ -221,7 +271,17 @@ check "apply after the reboot needs no reboot and succeeds" status_is 0
 check "a second apply does not rerun grubby" sh -c "! grep -q '^grubby --update' '$calls'"
 check "a bound data ENI is not rediscovered" sh -c "! grep -q 'discover' '$calls'"
 check "apply reports the data ENI as already bound" has interfaces "ok management ens5; data 0000:00:06.0 (0a:00:00:00:00:06) already on vfio-pci"
+cp "$root/etc/zhida/host.env" "$tmp/host.env"
+: >"$calls"
+run apply --kernel-receiver
+check "kernel receiver apply refuses a vfio-bound data ENI" sh -c "[ \$(cat '$tmp/status') = 1 ] && grep -q '^interfaces: FAIL data 0000:00:06.0 is on vfio-pci' '$tmp/out'"
+check "the refused kernel receiver apply leaves host.env and the binding alone" sh -c "cmp -s '$tmp/host.env' '$root/etc/zhida/host.env' && ! grep -q '^zhida-netconf\\|^networkctl\\|^systemctl\\|^grubby' '$calls'"
 check "an unchanged unmanaged config does not reload networkd" sh -c "! grep -q '^networkctl reload' '$calls'"
+check "an unchanged chrony.conf keeps one refclock line and no restart" sh -c "[ \$(grep -c '^refclock PHC' '$root/etc/chrony.conf') = 1 ] && ! grep -q '^systemctl restart chronyd' '$calls'"
+sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
+: >"$calls"
+run apply
+check "apply's boot restores a removed refclock line with /dev/ptp_ena present and restarts chronyd" sh -c "grep -q '^systemctl restart chronyd.service' '$calls' && grep -qx 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' '$root/etc/chrony.conf'"
 
 rm "$root/etc/systemd/network/00-zhida-data.network"
 : >"$calls"
@@ -233,7 +293,19 @@ check "restoring unmanaged config does not request a reboot" sh -c "! grep -q '^
 
 run verify
 check "a finished host verifies clean" status_is 0
-check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 12 ]"
+check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 13 ]"
+check "verify accepts chrony with the PHC selected" has chrony "ok PHC selected"
+sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
+run verify
+check "chrony on NTP, PHC not selected, fails with the sources output" sh -c "grep -q '^chrony: FAIL the PHC is not the selected source' '$tmp/out' && grep -q '^\\^\\* 169.254.169.123' '$tmp/out'"
+FAKE_CHRONYD_INACTIVE=1 run verify
+check "verify fails when chronyd is not running" sh -c "[ \$(cat '$tmp/status') = 1 ] && grep -q '^chrony: FAIL chronyd not running' '$tmp/out'"
+# A host outside a precision-time placement group has no PHC device: NTP only is its normal state.
+mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
+run verify
+check "chrony on NTP without a PHC device verifies" sh -c "[ \$(cat '$tmp/status') = 0 ] && grep -q '^chrony: ok no PHC device' '$tmp/out'"
+mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
+cp "$tmp/sources-phc" "$root/sources"
 check "verify sees management on its kernel driver with the default route" has management "ok ens5 on ena with the default route"
 check "verify reports no run yet" has pools "ok no run logged yet"
 
@@ -246,23 +318,24 @@ check "run-binance refuses while verify fails" sh -c "[ $? = 1 ] && ! grep -q '^
 echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489' >>"$root/var/log/zhida/binance.log"
 run verify
 check "the last run's own report is what counts" has pools "ok last run took 23 of 512"
-# A missing or ordinary file cannot stand in for the real PHC device.
 : >"$calls"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "missing PHC refuses before launching feed" sh -c "[ $? = 1 ] && ! grep -q '^taskset' '$calls'"
-: >"$root/dev/ptp_ena"
-: >"$calls"
-HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "ordinary file PHC refuses before launching feed" sh -c "[ $? = 1 ] && ! grep -q '^taskset' '$calls'"
-rm "$root/dev/ptp_ena"
-# The fake tree uses an existing character device; the real feed validates clock reads.
-ln -s /dev/null "$root/dev/ptp_ena"
-: >"$calls"
-HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5 --phc /dev/ptp_ena"
+check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
 check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/binance.json"
 check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/zhida/binance.json' | cmp -s - '$root/etc/zhida/dut.json'"
 check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
+: >"$calls"
+FAKE_CHECK_LONG=1 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "run-binance starts when check's summary outlives an early-exiting reader" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
+# The feed compares CLOCK_REALTIME with PHC stamps: without the PHC selected it refuses, although
+# verify passes (no PHC device).
+mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
+sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
+: >"$calls"
+HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
+check "run-binance refuses without the PHC selected and says to use a precision-time placement group" sh -c "[ $? = 1 ] && grep -q 'precision-time placement group' '$tmp/out' && ! grep -q '^taskset' '$calls'"
+mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
+cp "$tmp/sources-phc" "$root/sources"
 # A config whose rx_timestamps line is not netconf's format cannot be turned on: refuse.
 cp "$root/etc/zhida/dut.json" "$tmp/dut"
 printf '{"version": 1, "rx_timestamps": false}\n' >"$root/etc/zhida/dut.json"
@@ -338,6 +411,22 @@ check "x86_64 verify flags a clocksource other than tsc" has clocksource "FAIL k
 echo tsc >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
 FAKE_ARCH=x86_64 run verify
 check "x86_64 on tsc verifies clean" status_is 0
+check "a boot through kvm-clock and tsc-early to tsc is clean" has clocksource "ok tsc (x86_64); dmesg shows no TSC instability"
+cp "$root/kmsg" "$tmp/kmsg"
+for line in '[  812.000000] clocksource: timekeeping watchdog on CPU3: Marking clocksource '"'"'tsc'"'"' as unstable because the skew is too large:' \
+    '[  812.000001] tsc: Marking TSC unstable due to clocksource watchdog' \
+    '[  812.000002] clocksource: Marking clocksource '"'"'tsc'"'"' as unstable' \
+    '[  812.000003] clocksource: Switched to clocksource hpet'; do
+    { cat "$tmp/kmsg"; echo "$line"; } >"$root/kmsg"
+    FAKE_ARCH=x86_64 run verify
+    check "x86_64 verify fails on: $line" grep -qxF "clocksource: FAIL $line" "$tmp/out"
+done
+rm "$root/kmsg"
+FAKE_ARCH=x86_64 run verify
+check "x86_64 verify fails when dmesg cannot be read" has clocksource "FAIL cannot read dmesg"
+{ cat "$tmp/kmsg"; echo '[  812.000002] clocksource: Marking clocksource '"'"'tsc'"'"' as unstable'; } >"$root/kmsg"
+run verify
+check "a non-x86_64 host skips the dmesg check" has clocksource "ok tsc (aarch64)"
 
 # The DPDK build options must stay the Docker image's.
 dockerfile=$here/../conduit/docker/Dockerfile

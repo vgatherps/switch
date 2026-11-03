@@ -8,8 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100 \
     && update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
 
-# ENA: read_clock (the device PHC, initialized when the device has one) and a missing read barrier
-# in the PHC read.
+# ENA: device PHC reads, datapath reset notifications, and metrics error propagation.
 COPY dpdk-ena-read-clock.patch /tmp/dpdk-ena-read-clock.patch
 RUN curl --fail --location --retry 2 -o /tmp/dpdk.tar.xz \
         https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz \

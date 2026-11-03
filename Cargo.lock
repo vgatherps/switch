@@ -94,7 +94,6 @@ name = "binance-feed"
 version = "0.1.0"
 dependencies = [
  "dpdk-smoltcp",
- "nic-clock",
  "rcgen",
  "relay",
  "rustls",
@@ -762,6 +761,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "junction"
+version = "0.1.0"
+dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
+ "libc",
+]
+
+[[package]]
+name = "junctiond"
+version = "0.1.0"
+dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
+ "dpdk-smoltcp",
+ "junction",
+ "zhida-test-kit",
+ "zhida-test-support",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -860,13 +882,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "nic-clock"
-version = "0.1.0"
-dependencies = [
- "proptest",
-]
-
-[[package]]
 name = "nic-runner"
 version = "0.1.0"
 dependencies = [
@@ -874,7 +889,6 @@ dependencies = [
  "dpdk-smoltcp",
  "libc",
  "mimalloc",
- "nic-clock",
  "sockperf-wire",
  "switch",
  "switchnet",
@@ -2202,6 +2216,7 @@ dependencies = [
  "switch",
  "switchnet",
  "tungstenite",
+ "zhida-dpdk-sys",
  "zhida-netconf",
  "zhida-open",
  "zhida-test-support",

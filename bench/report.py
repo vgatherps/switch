@@ -8,8 +8,8 @@ RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and
 `host-setup.txt` (the host setup verification). Python stdlib only.
 
 Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
-summary, a sweep did not complete, or a sweep stopped at a generator-bound step (the generators,
-not the receiver, were the limit). The report is still written, headed INCOMPLETE.
+summary, a sweep did not complete, or a sender fell behind and stopped the sweep.
+The report is still written, headed INCOMPLETE.
 """
 import json
 import math
@@ -52,7 +52,7 @@ def problems(directory, sweeps):
         elif not summary.get("complete"):
             out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
         elif summary.get("generator_bound"):
-            out.append(f"{name}: stopped at a generator-bound step: not a receiver measurement")
+            out.append(f"{name}: sender fell behind schedule; receiver capacity is not isolated")
     return out
 
 
@@ -68,7 +68,7 @@ def lat(step, key):
 def flags(step):
     out = []
     if step.get("generator_bound"):
-        out.append("GEN-BOUND")
+        out.append("SENDER-LATE")
     if step.get("budget_bound"):
         out.append("BUDGET-BOUND")
     if step.get("latency_ns") is None:
@@ -78,7 +78,7 @@ def flags(step):
 
 def table(steps):
     rows = [
-        "| offered pps | sent pps | received pps | drop % | p50 µs | p99 µs | p99.9 µs | max µs | flags |",
+        "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs | flags |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for s in sorted(steps, key=lambda s: s["offered_pps"]):
@@ -90,9 +90,9 @@ def table(steps):
 
 
 def svg_plot(steps, title):
-    """p50/p99/p99.9/max latency (log y, left) and drop % (linear, right) vs offered pps (log x).
+    """p50/p99/p99.9/max latency (log y, left) and not echoed % (linear, right) vs offered pps (log x).
     A step where nothing came back has no latency: it is drawn as an x at the top of the latency
-    axis, and its 100% drop is on the drop line like every other step's."""
+    axis, and its 100% not echoed is on the loss line like every other step's."""
     W, H, L, R, T, B = 760, 420, 70, 70, 40, 50
     steps = sorted(steps, key=lambda s: s["offered_pps"])
     pts = [s for s in steps if s.get("latency_ns")]
@@ -142,7 +142,7 @@ def svg_plot(steps, title):
         out.append(f'<text x="{L + 8 + 70 * i}" y="{T + 14}" fill="{color}">{key}</text>')
     path = " ".join(f"{px(s['offered_pps']):.1f},{pd(100 * s['drop_fraction']):.1f}" for s in steps)
     out.append(f'<polyline points="{path}" fill="none" stroke="#9467bd" stroke-dasharray="4 3"/>')
-    out.append(f'<text x="{L + 8 + 280}" y="{T + 14}" fill="#9467bd">drop %</text>')
+    out.append(f'<text x="{L + 8 + 280}" y="{T + 14}" fill="#9467bd">not echoed %</text>')
     for s in steps:
         if not s.get("latency_ns"):
             x = px(s["offered_pps"])
@@ -156,11 +156,20 @@ def svg_plot(steps, title):
 def build(directory, title):
     """Writes report.md, results.json and the plots; returns (markdown lines, problems)."""
     md = []
+    source_path = os.path.join(directory, "source.json")
+    source = None
+    if os.path.exists(source_path):
+        with open(source_path) as f:
+            source = json.load(f)
+        md += ["## Source", "", f"Commit: `{source['commit']}`  ",
+               f"Archive SHA-256: `{source['archive_sha256']}`", ""]
     setup = os.path.join(directory, "host-setup.txt")
     if os.path.exists(setup):
         with open(setup) as f:
             md += ["## Host setup", "", "```", f.read().rstrip(), "```", ""]
     results = {"title": title, "sweeps": []}
+    if source is not None:
+        results["source"] = source
     sections = []
     summaries = {}
     for name, path in sweep_files(directory):
@@ -172,8 +181,8 @@ def build(directory, title):
             f.write(svg_plot(steps, stem))
         sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
-            sections += ["GEN-BOUND: a generator fell behind its schedule; that step measured the generator, not the"
-                         " DUT, and the sweep stopped there.", ""]
+            sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
+                         " identify the cause; receiver backpressure can also delay sends.", ""]
         if any(s.get("budget_bound") for s in steps):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
                          " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"
@@ -184,7 +193,7 @@ def build(directory, title):
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
                 *[f"- {i}" for i in issues], ""]
     md = head + md + sections
-    md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); drop % is"
+    md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); not echoed % is"
            " measured messages not echoed by the end of the drain, never-sent ones included (sending stops at the end"
            " of the window); sent pps counts messages accepted by the generator stack, not NIC transmissions;"
            " received pps counts echoes arriving within the window, including warmup echoes; baseline RTT is the"

@@ -473,6 +473,29 @@ fn bind_resumes_with_no_driver_bound() {
     tree.success_bind(false);
 }
 
+/// A driverless device whose first write fails was never touched: no recovery binds it to its
+/// kernel driver, and nothing else changes.
+#[test]
+fn bind_driverless_override_write_failure_changes_nothing() {
+    let tree = Tree::new();
+    tree.driver(None);
+    fs::remove_dir_all(tree.roots.sys.join(DEVICE).join("net")).unwrap();
+    tree.routes("eth1 00000000 0101000A 0003 0 0 0 00000000\n");
+    fs::remove_file(tree.roots.sys.join(DEVICE).join("driver_override")).unwrap();
+    let before = tree.snapshot();
+    let mut output = Vec::new();
+    let err = devbind::bind(&tree.roots, &tree.config, 0, false, false, &mut output)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        tree.log(&[("bus/pci/devices/0000:00:06.0/driver_override", "vfio-pci")], false)
+    );
+    assert!(err.contains("driver_override: "), "{err}");
+    assert!(!err.contains("rebind"), "{err}");
+    assert_eq!(tree.snapshot(), before);
+}
+
 #[test]
 fn bind_already_bound_exits_zero() {
     let tree = Tree::new();

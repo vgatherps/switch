@@ -5,6 +5,8 @@ DPDK 25.11.3 ENA PMD changes for conduit (applied by docker/Dockerfile).
   req_id, malformed RX descriptor, TX prepare-context error), raise RTE_ETH_EVENT_INTR_RESET
   instead of returning early, so the application learns of it and calls rte_eth_dev_reset.
   Stock code returns early and never reports those faults.
+- xstats: propagate customer and legacy metrics query failures and reject incomplete customer
+  metrics support rather than exposing unsupported counters as valid values.
 
 diff --git a/drivers/net/ena/base/ena_com.c b/drivers/net/ena/base/ena_com.c
 index f0936a6..72cb95f 100644
@@ -64,6 +66,15 @@ index ea4afbc..aa5d87f 100644
  static int ena_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *stats,
  			  struct eth_queue_stats *qstats);
  static void ena_rx_queue_release_all(struct rte_eth_dev *dev);
+@@ -326,7 +327,7 @@ static int ena_process_bool_devarg(const char *key,
+ 				   void *opaque);
+ static int ena_parse_devargs(struct ena_adapter *adapter,
+ 			     struct rte_devargs *devargs);
+-static void ena_copy_customer_metrics(struct ena_adapter *adapter,
++static int ena_copy_customer_metrics(struct ena_adapter *adapter,
+ 					uint64_t *buf,
+ 					size_t buf_size);
+ static void ena_copy_ena_srd_info(struct ena_adapter *adapter,
 @@ -366,6 +367,7 @@ static const struct eth_dev_ops ena_dev_ops = {
  	.rss_hash_update        = ena_rss_hash_update,
  	.rss_hash_conf_get      = ena_rss_hash_conf_get,
@@ -178,3 +189,101 @@ index ea4afbc..aa5d87f 100644
  	ena_com_delete_host_info(ena_dev);
  	ena_com_admin_destroy(ena_dev);
  err_metrics_delete:
+@@ -3454,7 +3499,7 @@ static uint16_t eth_ena_xmit_pkts(void *tx_queue, struct rte_mbuf **tx_pkts,
+ 	return sent_idx;
+ }
+ 
+-static void ena_copy_customer_metrics(struct ena_adapter *adapter, uint64_t *buf,
++static int ena_copy_customer_metrics(struct ena_adapter *adapter, uint64_t *buf,
+ 					     size_t num_metrics)
+ {
+ 	struct ena_com_dev *ena_dev = &adapter->ena_dev;
+@@ -3463,7 +3508,13 @@ static void ena_copy_customer_metrics(struct ena_adapter *adapter, uint64_t *buf,
+ 	if (ena_com_get_cap(ena_dev, ENA_ADMIN_CUSTOMER_METRICS)) {
+ 		if (num_metrics != ENA_STATS_ARRAY_METRICS) {
+ 			PMD_DRV_LOG_LINE(ERR, "Detected discrepancy in the number of customer metrics");
+-			return;
++			return -EINVAL;
++		}
++		if ((ena_dev->customer_metrics.supported_metrics &
++		     ENA_ADMIN_CUSTOMER_METRICS_SUPPORT_MASK) !=
++		    ENA_ADMIN_CUSTOMER_METRICS_SUPPORT_MASK) {
++			PMD_DRV_LOG_LINE(ERR, "Not all advertised customer metrics are supported");
++			return -ENOTSUP;
+ 		}
+ 		rte_spinlock_lock(&adapter->admin_lock);
+ 		rc = ENA_PROXY(adapter,
+@@ -3474,13 +3525,13 @@ static void ena_copy_customer_metrics(struct ena_adapter *adapter, uint64_t *buf,
+ 		rte_spinlock_unlock(&adapter->admin_lock);
+ 		if (rc != 0) {
+ 			PMD_DRV_LOG_LINE(WARNING, "Failed to get customer metrics, rc: %d", rc);
+-			return;
++			return rc;
+ 		}
+ 
+ 	} else if (ena_com_get_cap(ena_dev, ENA_ADMIN_ENI_STATS)) {
+ 		if (num_metrics != ENA_STATS_ARRAY_METRICS_LEGACY) {
+ 			PMD_DRV_LOG_LINE(ERR, "Detected discrepancy in the number of legacy metrics");
+-			return;
++			return -EINVAL;
+ 		}
+ 
+ 		rte_spinlock_lock(&adapter->admin_lock);
+@@ -3492,9 +3543,12 @@ static void ena_copy_customer_metrics(struct ena_adapter *adapter, uint64_t *buf,
+ 		if (rc != 0) {
+ 			PMD_DRV_LOG_LINE(WARNING,
+ 				"Failed to get ENI metrics, rc: %d", rc);
+-			return;
++			return rc;
+ 		}
++	} else if (num_metrics != 0) {
++		return -EINVAL;
+ 	}
++	return 0;
+ }
+ 
+ static void ena_copy_ena_srd_info(struct ena_adapter *adapter,
+@@ -3682,7 +3736,7 @@ static int ena_xstats_get(struct rte_eth_dev *dev,
+ 	struct ena_adapter *adapter = dev->data->dev_private;
+ 	unsigned int xstats_count = ena_xstats_calc_num(dev->data);
+ 	unsigned int stat, i, count = 0;
+-	int stat_offset;
++	int stat_offset, rc;
+ 	void *stats_begin;
+ 	uint64_t metrics_stats[ENA_MAX_CUSTOMER_METRICS];
+ 	struct ena_stats_srd srd_info = {0};
+@@ -3702,7 +3756,9 @@ static int ena_xstats_get(struct rte_eth_dev *dev,
+ 			((char *)stats_begin + stat_offset));
+ 	}
+ 
+-	ena_copy_customer_metrics(adapter, metrics_stats, adapter->metrics_num);
++	rc = ena_copy_customer_metrics(adapter, metrics_stats, adapter->metrics_num);
++	if (rc != 0)
++		return rc;
+ 	stats_begin = metrics_stats;
+ 	for (stat = 0; stat < adapter->metrics_num; stat++, count++) {
+ 		stat_offset = ena_stats_metrics_strings[stat].stat_offset;
+@@ -3755,7 +3811,7 @@ static int ena_xstats_get_by_id(struct rte_eth_dev *dev,
+ 	uint64_t id;
+ 	uint64_t rx_entries, tx_entries;
+ 	unsigned int i;
+-	int qid;
++	int qid, rc;
+ 	int valid = 0;
+ 	bool were_metrics_copied = false;
+ 	bool was_srd_info_copied = false;
+@@ -3779,10 +3835,12 @@ static int ena_xstats_get_by_id(struct rte_eth_dev *dev,
+ 			 * admin queue.
+ 			 */
+ 			if (!were_metrics_copied) {
+-				were_metrics_copied = true;
+-				ena_copy_customer_metrics(adapter,
++				rc = ena_copy_customer_metrics(adapter,
+ 						metrics_stats,
+ 						adapter->metrics_num);
++				if (rc != 0)
++					return rc;
++				were_metrics_copied = true;
+ 			}
+ 
+ 			values[i] = *((uint64_t *)&metrics_stats + id);

@@ -753,6 +753,97 @@ fn temp_files(dir: &std::path::Path, name: &str) -> Vec<String> {
     names
 }
 
+/// A first discovery whose write fails part way (here the file size limit, as a full disk would)
+/// leaves no config at the path, whole or partial, and no temp file. Runs in a child process: the
+/// limit is per process.
+#[test]
+fn initial_discovery_failure_leaves_no_partial_config() {
+    const CHILD: &str = "ZHIDA_NETCONF_FSIZE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discover::tests::aws::initial_discovery_failure_leaves_no_partial_config",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let path = tree.dir.join("config.json");
+    // SAFETY: plain libc calls on this process's own limit and signal disposition.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit { rlim_cur: 16, rlim_max: libc::RLIM_INFINITY };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    let written = crate::rediscover::write(&path, &discovered, None, &mut Vec::new());
+    assert!(written.is_err(), "the write past the size limit succeeded");
+    assert!(!path.exists(), "a partial config was left at the path");
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
+/// A first discovery (nothing loaded) never replaces a config that appeared at the path since:
+/// it is refused as before, the other config stays as it was and no temp file is left.
+#[test]
+fn initial_discovery_refuses_a_config_that_appeared_since_load() {
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let path = tree.dir.join("config.json");
+    assert!(crate::rediscover::load_existing(&path).unwrap().is_none());
+    fs::write(&path, "written by someone else").unwrap();
+    let error = crate::rediscover::write(&path, &discovered, None, &mut Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with(&format!("{}: ", path.display())), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "written by someone else");
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
+/// Once the first discovery's config is linked into place, a temp name that cannot be removed
+/// (here an append-only directory: entries can be added, not removed) leaves the write a success
+/// with the config in place, not a failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn initial_discovery_succeeds_when_the_temp_name_cannot_be_removed() {
+    struct AppendOnly(std::ffi::CString);
+    impl AppendOnly {
+        fn set(dir: &std::path::Path, flags: libc::c_uint) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `dir` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::chflags(dir.as_ptr(), flags) }, 0);
+            Self(dir)
+        }
+    }
+    impl Drop for AppendOnly {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe { libc::chflags(self.0.as_ptr(), 0) };
+        }
+    }
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let dir = tree.dir.join("append-only");
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("config.json");
+    let _append_only = AppendOnly::set(&dir, libc::UF_APPEND);
+    crate::rediscover::write(&path, &discovered, None, &mut Vec::new()).unwrap();
+    assert_eq!(
+        crate::rediscover::load_existing(&path).unwrap(),
+        Some(discovered.config)
+    );
+}
+
 /// A rediscovery replaces the file whole (a new inode with the full new config and the old
 /// file's permissions), never truncates it in place, and leaves no temp file.
 #[test]

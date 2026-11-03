@@ -393,8 +393,9 @@ pub fn bind(
     }
     let unbind_path = state.device.join("driver/unbind");
     let bind_path = vfio.join("bind");
-    // a failure while the device has no driver puts it back on its kernel driver
-    let mut unbound = state.driver.is_none();
+    // a failure after this run unbound the kernel driver puts the device back on it; a write
+    // failing on a device that had no driver changed no binding, so nothing is recovered
+    let mut unbound = false;
     for write in &plan {
         if let Err(e) = write_sysfs(write, dry_run, output) {
             return Err(if unbound && !dry_run {

@@ -139,7 +139,7 @@ mod tests {
         ));
         assert_eq!(unsafe { libc::CPU_COUNT(&affinity(0)) }, 1);
         assert!(unsafe { libc::CPU_ISSET(cpu, &affinity(0)) });
-        let eal = init_with_housekeeping(
+        let _eal = init_with_housekeeping(
             cpu,
             &[
                 "test",
@@ -177,6 +177,5 @@ mod tests {
             }
         }
         assert!(helpers > 0, "EAL created no observable helper thread");
-        drop(eal);
     }
 }

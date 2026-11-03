@@ -21,9 +21,9 @@ pub use open::{open, OpenError, OpenReport, Opened};
 
 const CACHE: u32 = 8;
 const RX_BURST: u16 = 128;
-/// RX pool mbufs: 2^15 - 1 as DPDK prefers. The pool reads low below its low mark, and
-/// then TCP sockets keep no out-of-order data; this many mbufs keeps it from reading low in
-/// practice. 82 MiB of 2 MiB hugepages at MTU 1500, 306 MiB at MTU 9001.
+/// RX pool mbufs: 2^15 - 1 as DPDK prefers. Below the pool's low mark the stack frees
+/// frames TCP sockets hold past a gap (out-of-order data); this many mbufs keeps the pool
+/// above that mark in practice. 82 MiB of 2 MiB hugepages at MTU 1500, 306 MiB at MTU 9001.
 const RX_POOL: u32 = 32767;
 
 /// What the application needs from the Port and Stack.

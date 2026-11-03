@@ -71,3 +71,35 @@ fn check_prints_summary_and_exit_codes() {
         );
     }
 }
+
+/// `check FILE | grep -q ...`: grep can exit before check writes. The write error is reported as
+/// one line and exit 1, not a panic (101).
+#[test]
+fn check_with_closed_stdout_does_not_panic() {
+    let path = std::env::temp_dir().join(format!(
+        "zhida-netconf-closed-{}-{}.json",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    fs::write(
+        &path,
+        r#"{"version": 1, "device": {"vdev": "net_tap0,iface=cdnic0"}, "mac": null,
+        "ipv4": "10.0.1.23/24", "gateway": null, "mtu": 1500, "paths": [],
+        "offloads": "auto", "rx_timestamps": false, "descriptors": 1024,
+        "eal": {"file_prefix": "zhida", "extra": []}}"#,
+    )
+    .unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_zhida-netconf"))
+        .arg("check")
+        .arg(&path)
+        .stdout(writer)
+        .output()
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("zhida-netconf: "), "{stderr}");
+}

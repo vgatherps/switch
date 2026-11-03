@@ -703,7 +703,7 @@ binance-feed: feed_message: #8 u=102142966982 BTCUSDT bid 77506.56000000 x 1.209
 binance-feed: feed_message: #9 u=102142966983 BTCUSDT bid 77506.56000000 x 1.20962000 ask 77506.57000000 x 2.01645000
 binance-feed: feed_message: #10 u=102142967031 BTCUSDT bid 77506.56000000 x 1.30112000 ask 77506.57000000 x 2.01645000
 binance-feed: feed_count: 145
-binance-feed: feed_latency: no_stamp=145 not_ready=0 impossible=0 max_mapping_bound_ns=0
+binance-feed: feed_latency: no_stamp=145
 binance-feed: feed_update_ids: 102142966886..102142968048
 binance-feed: feed_close: WebSocket close handshake, TLS close_notify, FIN
 ```
@@ -730,8 +730,11 @@ A Linux machine runs the same targets without Docker. It needs what docker/Docke
   the rest). `make doctor` refuses any other DPDK version. `docker/dpdk-ena-read-clock.patch` is
   applied first: ENA gets `rte_eth_read_clock` (the device PHC, initialized whenever the device
   has one) and the read barrier the kernel driver has in its PHC read, and its watchdog reports
-  datapath faults as `RTE_ETH_EVENT_INTR_RESET` (stock ENA never reports them). Hosts that build
-  DPDK themselves must apply it too.
+  datapath faults as `RTE_ETH_EVENT_INTR_RESET` (stock ENA never reports them). Customer and legacy
+  metrics reads return query errors; customer metrics reads fail if any advertised counter is
+  unsupported. Hosts that build DPDK themselves must apply the patch too. The offline fault-path
+  test is `python3 docker/test-ena-metrics.py /path/to/unmodified/dpdk-25.11.3`; it needs a C
+  compiler and `patch`, but no NIC or DPDK build.
 - packetdrill at the Dockerfile's commit with `docker/packetdrill-relearn-isn.patch` applied, the
   binary on `PATH` and `packetdrill.h` in `/opt/packetdrill/include`.
 - python3-scapy.

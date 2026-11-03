@@ -1,0 +1,20 @@
+[package]
+name = "junctiond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+junction.workspace = true
+dpdk-smoltcp.workspace = true
+ceph-fifo.workspace = true
+ceph-proto.workspace = true
+
+[dev-dependencies]
+ceph-ring.workspace = true
+zhida-test-kit.workspace = true
+zhida-test-support.workspace = true
+
+[lints]
+workspace = true

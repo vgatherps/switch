@@ -7,7 +7,7 @@ vendor-check:
 
 # Crates that build and test without DPDK. sheath without features (its
 # `switchnet` feature needs DPDK).
-HOST_PACKAGES = switch switch-macros depot relay sheath nic-clock \
+HOST_PACKAGES = switch switch-macros depot relay sheath \
 	ceph-rseq ceph-ring ceph-fifo ceph-proto ceph-control
 
 # Then the vendored smoltcp tests (TIMEOUT is cleared: GNU timeout is not on macOS) and the EC2

@@ -36,6 +36,10 @@ NETWORK=$R/etc/systemd/network/00-zhida-data.network
 NETWORKD_POLICY=$R/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf
 UNMOVABLE=$R/run/zhida-unmovable-irqs
 HUGEPAGES=512
+CHRONY_CONF=$R/etc/chrony.conf
+# chrony disciplines CLOCK_REALTIME to the ENA PTP hardware clock (Amazon Time Sync), the line AWS
+# documents: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html#configure-chronyd-phc
+PHC_REFCLOCK='refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer'
 
 DPDK_VERSION=25.11.3
 DPDK_SHA256=3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490
@@ -111,7 +115,7 @@ dpdk_env() {
 step_packages() {
     dnf install -y -q gcc gcc-c++ make pkgconf-pkg-config clang18 clang18-libs lld18 python3-pip numactl-devel \
         libpcap-devel git tar xz patch cpio dnf-utils elfutils-libelf-devel ethtool iproute procps-ng \
-        util-linux grubby >/dev/null \
+        util-linux grubby chrony >/dev/null \
         || fatal packages "dnf install failed"
     pip3 install -q meson ninja pyelftools || fatal packages "pip3 install meson ninja pyelftools failed"
     report packages ok "dnf toolchain, meson, ninja, pyelftools"
@@ -187,7 +191,8 @@ build() {
 
 # ---------------------------------------------------------------- host settings
 # Fixes MGMT_IF, DATA_IF, DATA_PCI, DATA_MAC and NUMA_NODE in host.env. A data ENI already on vfio-pci
-# has no interface any more; its saved facts are kept.
+# has no interface any more; its saved facts are kept. --kernel-receiver refuses such a host: the
+# data ENI must be back on ena (zhida-netconf unbind) first.
 step_interfaces() {
     MGMT_IF=$(mgmt_if)
     [ -n "$MGMT_IF" ] || fatal interfaces "no IPv4 default route: cannot tell the management interface"
@@ -195,6 +200,7 @@ step_interfaces() {
         # shellcheck source=/dev/null
         . "$ENV"
         if [ "$(pci_driver "$DATA_PCI")" = vfio-pci ]; then
+            [ "$requested_driver" = vfio-pci ] || fatal interfaces "data $DATA_PCI is on vfio-pci; run zhida-netconf unbind $DUT, then apply --kernel-receiver"
             report interfaces ok "management $MGMT_IF; data $DATA_PCI ($DATA_MAC) already on vfio-pci"
             return 0
         fi
@@ -358,6 +364,33 @@ WantedBy=multi-user.target"; then
     report unit ok "zhida-host.service runs boot at every boot"
 }
 
+# The PHC refclock goes after AL2023's own chrony.conf (its Time Sync NTP server line stays), and
+# only once /dev/ptp_ena exists: chronyd exits at start on a PHC refclock it cannot open, leaving
+# the host with no time sync. The device appears after the reboot that applies ena.phc_enable=1,
+# and never outside a precision-time placement group, so boot adds the line; without the device
+# it removes that line (an earlier apply added it unconditionally), leaving the rest as it was.
+step_chrony() {
+    if [ ! -e "$R/dev/ptp_ena" ]; then
+        if ! grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
+            report chrony ok "no /dev/ptp_ena; $CHRONY_CONF left on NTP"
+            return
+        fi
+        # Rewritten in place (cat >), keeping the file's owner and mode; grep -v exits 1 when
+        # the line was the only one.
+        { grep -vxF "$PHC_REFCLOCK" "$CHRONY_CONF" || [ $? = 1 ]; } >"$CHRONY_CONF.zhida" &&
+            cat "$CHRONY_CONF.zhida" >"$CHRONY_CONF" && rm -f "$CHRONY_CONF.zhida" ||
+            fatal chrony "cannot write $CHRONY_CONF"
+        systemctl restart chronyd.service || fatal chrony "systemctl restart chronyd failed"
+        report chrony changed "no /dev/ptp_ena: PHC refclock removed from $CHRONY_CONF; chronyd restarted"
+    elif grep -qxF "$PHC_REFCLOCK" "$CHRONY_CONF" 2>/dev/null; then
+        report chrony ok "$CHRONY_CONF has the PHC refclock"
+    else
+        printf '%s\n' "$PHC_REFCLOCK" >>"$CHRONY_CONF" || fatal chrony "cannot write $CHRONY_CONF"
+        systemctl restart chronyd.service || fatal chrony "systemctl restart chronyd failed"
+        report chrony changed "PHC refclock added to $CHRONY_CONF; chronyd restarted"
+    fi
+}
+
 # ---------------------------------------------------------------- boot (also the end of apply)
 step_irqbalance() {
     systemctl disable --now -q irqbalance.service 2>/dev/null
@@ -412,6 +445,7 @@ step_bind() {
 
 boot() {
     load_env boot
+    step_chrony
     step_irqbalance
     step_irqs
     step_unmanaged
@@ -428,6 +462,7 @@ apply() {
     step_cmdline
     [ "$DATA_DRIVER" = ena ] || step_vfio_wc
     step_unit
+    systemctl enable -q chronyd.service || fatal chrony "systemctl enable chronyd failed"
     if [ "$DATA_DRIVER" = ena ]; then
         policy_config="[Network]
 ManageForeignRoutingPolicyRules=no"
@@ -544,11 +579,24 @@ verify() {
         esac
     fi
 
+    # x86_64: the TSC must be the clocksource now and never have been found unstable since boot.
+    # Only the last "Switched to clocksource" counts: boot passes through tsc-early (and on EC2
+    # kvm-clock) before tsc.
     cs=$(cat "$R/sys/devices/system/clocksource/clocksource0/current_clocksource" 2>/dev/null)
-    if [ "$(uname -m)" != x86_64 ] || [ "$cs" = tsc ]; then
+    if [ "$(uname -m)" != x86_64 ]; then
         report clocksource ok "${cs:-unknown} ($(uname -m))"
-    else
+    elif [ "$cs" != tsc ]; then
         report clocksource FAIL "$cs, want tsc on x86_64"
+    elif ! kmsg=$(dmesg 2>/dev/null); then
+        report clocksource FAIL "cannot read dmesg (run as root)"
+    elif bad=$(printf '%s\n' "$kmsg" | grep -m 1 -e 'clocksource: timekeeping watchdog' -e 'TSC unstable' \
+        -e "Marking clocksource 'tsc' as unstable"); then
+        report clocksource FAIL "$bad"
+    elif last=$(printf '%s\n' "$kmsg" | grep 'Switched to clocksource' | tail -n 1) \
+        && [ -n "$last" ] && [ "${last##*Switched to clocksource }" != tsc ]; then
+        report clocksource FAIL "$last"
+    else
+        report clocksource ok "tsc ($(uname -m)); dmesg shows no TSC instability"
     fi
 
     if systemctl is-enabled -q zhida-host.service 2>/dev/null; then
@@ -558,6 +606,21 @@ verify() {
     fi
 
     if zhida-netconf check "$DUT" >/dev/null 2>&1; then report config ok "$DUT"; else report config FAIL "zhida-netconf check $DUT"; fi
+
+    # CLOCK_REALTIME, which the feed compares with NIC stamps, must follow the PHC refclock:
+    # `chronyc sources` selects it (a `#*` PHC row).
+    # A host outside a precision-time placement group has no PHC device and runs on NTP only.
+    sources=$(chronyc sources 2>&1)
+    if ! systemctl is-active -q chronyd.service; then
+        report chrony FAIL "chronyd not running"
+    elif printf '%s\n' "$sources" | grep -q '^#\* *PHC'; then
+        report chrony ok "PHC selected"
+    elif [ ! -e "$R/dev/ptp_ena" ]; then
+        report chrony ok "no PHC device (/dev/ptp_ena): NTP only, not a precision-time host"
+    else
+        report chrony FAIL "the PHC is not the selected source; chronyc sources:"
+        printf '%s\n' "$sources"
+    fi
     exit $failed
 }
 

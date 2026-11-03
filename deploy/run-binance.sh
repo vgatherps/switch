@@ -16,14 +16,15 @@ if ! "$here/hft-host.sh" verify; then
     echo "run-binance: hft-host.sh verify failed; fix the FAIL lines (sudo deploy/hft-host.sh apply)" >&2
     exit 1
 fi
-# The management ENI's real Time Sync PHC is required; never substitute a wall clock.
-if [ ! -c "$R/dev/ptp_ena" ]; then
-    echo "run-binance: /dev/ptp_ena is not a PHC character device; enable ena.phc_enable=1 and reboot; not starting" >&2
+# The feed compares CLOCK_REALTIME with the NIC's PHC stamps: chrony must have the PHC selected.
+if ! sources=$(chronyc sources 2>&1) || ! grep -q '^#\* *PHC' <<<"$sources"; then
+    echo "run-binance: chrony does not have the PHC selected (chronyc sources); launch the instance in a precision-time placement group; not starting" >&2
     exit 1
 fi
 # zhida-netconf writes pretty JSON, one field per line (its own test pins the format).
 sed 's/^  "rx_timestamps": false,$/  "rx_timestamps": true,/' "$dut" >"$config" || exit 1
-if ! zhida-netconf check "$config" | grep -qx 'rx_timestamps: true'; then
+# Read the whole summary first: grep -q would close the pipe while check still writes.
+if ! summary=$(zhida-netconf check "$config") || ! grep -qx 'rx_timestamps: true' <<<"$summary"; then
     echo "run-binance: $config does not have rx_timestamps true (zhida-netconf check); not starting" >&2
     exit 1
 fi
@@ -32,4 +33,4 @@ fi
 mkdir -p "$(dirname "$log")"
 echo "run-binance: $(date -u +%FT%TZ) zhida-nic feed $* on CPU $APP_CPU with $config" | tee -a "$log"
 MIMALLOC_ALLOW_LARGE_OS_PAGES=0 taskset -c "$APP_CPU" \
-    zhida-nic --config "$config" feed "$@" --phc /dev/ptp_ena 2>&1 | tee -a "$log"
+    zhida-nic --config "$config" feed "$@" 2>&1 | tee -a "$log"

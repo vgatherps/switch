@@ -30,8 +30,9 @@ use tx_queue::{Seg, TxQueue};
 /// builds them with [`crate::iface::TcpSet::add_admitted`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
-    /// Target advertised receive window in bytes, at most 1 GiB. RX frames are drawn from the
-    /// shared pool; this is not a limit on buffered or application-held data.
+    /// Target advertised receive window in bytes, at most 1 GiB. Contiguous payload is accepted
+    /// even past the advertised edge; out-of-order data remains window-bounded. RX frames use the
+    /// shared pool, so this is not a limit on buffered or application-held data.
     pub rx_capacity: usize,
     /// Queued and unacknowledged transmit bytes.
     pub tx_capacity: usize,
@@ -2027,13 +2028,11 @@ impl<'a> Socket<'a> {
             // all of the control flags we sent.
             _ => (false, false),
         };
-
         if !matches!(self.state, State::Listen | State::SynSent) {
             if repr.ack_number.is_none() && repr.control != TcpControl::Rst {
                 net_debug!("expecting an ACK");
                 return None;
             }
-            // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
             let segment_in_window = match (
                 segment_start == segment_end,
                 window_start == window_end,
@@ -2087,7 +2086,7 @@ impl<'a> Socket<'a> {
                 }
             };
 
-            if !segment_in_window {
+            if !segment_in_window && !(segment_start <= window_start && window_start < segment_end) {
                 // Out-of-window RSTs are silently dropped, per RFC 9293
                 // (3.10.7.4) and RFC 5961 (3.2): no reply is sent, and the
                 // TIME-WAIT timer is not refreshed. RST senders don't
@@ -2213,7 +2212,10 @@ impl<'a> Socket<'a> {
             State::Listen | State::SynSent => (&[][..], 0),
             _ => {
                 let overlap_start = window_start.max(segment_start);
-                let overlap_end = window_end.min(segment_end);
+                let mut overlap_end = window_end.min(segment_end);
+                if overlap_end < segment_end && segment_start <= window_start {
+                    overlap_end = segment_end;
+                }
 
                 // the checks done above imply this.
                 debug_assert!(overlap_start <= overlap_end);
@@ -4017,6 +4019,44 @@ mod test {
         }
         assert_eq!(s.state(), State::Established);
         window.unwrap()
+    }
+
+    #[test]
+    fn contiguous_payload_survives_advertised_window_edge() {
+        for (ack_behind, advertised) in [(0, 0), (6, 6), (0, 2)] {
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            let next = s.next_receive_seq();
+            s.remote_last_ack = Some(next - ack_behind);
+            s.remote_last_win_bytes = advertised;
+
+            let contiguous = SEND_TEMPL.seq(next).ack(LOCAL_SEQ + 1).data(b"abcdef");
+            let _ = send(&mut s, Instant::ZERO, &contiguous);
+            assert_eq!(drain_bytes(&mut s), b"abcdef", "ack behind {ack_behind}, window {advertised}");
+        }
+    }
+
+    #[test]
+    fn duplicate_prefix_does_not_discard_new_contiguous_bytes() {
+        let mut s = socket_established_with_buffer_sizes(64, 4096);
+        let next = s.next_receive_seq();
+        s.remote_last_ack = Some(next);
+        s.remote_last_win_bytes = 0;
+        let segment = SEND_TEMPL.seq(next - 2).ack(LOCAL_SEQ + 1).data(b"xxabc");
+        let _ = send(&mut s, Instant::ZERO, &segment);
+        assert_eq!(drain_bytes(&mut s), b"abc");
+    }
+
+    #[test]
+    fn future_payload_beyond_advertised_window_is_still_rejected() {
+        for (ack_behind, advertised) in [(0, 0), (6, 6), (0, 2)] {
+            let mut s = socket_established_with_buffer_sizes(64, 4096);
+            let next = s.next_receive_seq();
+            s.remote_last_ack = Some(next - ack_behind);
+            s.remote_last_win_bytes = advertised;
+            let segment = SEND_TEMPL.seq(next + 10).ack(LOCAL_SEQ + 1).data(b"future");
+            let _ = send(&mut s, Instant::ZERO, &segment);
+            assert_eq!(s.recv_queue(), 0);
+        }
     }
 
     #[test]
@@ -7109,13 +7149,13 @@ mod test {
     }
 
     #[test]
-    fn rcv_mss_measure_before_window_clip_and_cap() {
+    fn rcv_mss_measure_caps_to_local_mss() {
         let mut s = accept_delayed_ack_with_rx_size(BASE_MSS, 512);
         send!(
             s,
             SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[0; 1600])
         );
-        assert_eq!(s.recv_queue(), 512);
+        assert_eq!(s.recv_queue(), 1600);
         assert_eq!(s.rcv_mss, BASE_MSS as usize);
     }
 
@@ -9508,13 +9548,13 @@ mod test {
     }
 
     #[test]
-    fn test_fin_payload_truncated_at_right_edge() {
+    fn test_fin_payload_past_right_edge_is_delivered() {
         let mut s = socket_established_with_buffer_sizes(64, 64);
         send!(s, SEND_TEMPL.fin().seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(&[0; 65]));
         assert_eq!(s.state, State::Established);
         assert!(!s.rx_fin_received);
-        assert_eq!(s.recv_queue(), 64);
-        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 64).win(64)]);
+        assert_eq!(s.recv_queue(), 65);
+        recv!(s, [RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 65).win(64)]);
     }
 
     #[test]
@@ -12696,7 +12736,7 @@ mod test {
         );
         send!(
             s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 6).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
+            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 7).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
             Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0))
         );
         assert_eq!(s.recv_queue(), 6);
@@ -12716,7 +12756,7 @@ mod test {
         );
         send!(
             s,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 6).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
+            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 7).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
             Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0))
         );
         assert_eq!(s.recv_queue(), 6);
@@ -12725,7 +12765,7 @@ mod test {
         send!(
             s,
             time 100,
-            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 6).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
+            SEND_TEMPL.seq(REMOTE_SEQ + 1 + 7).ack(LOCAL_SEQ + 1).data(&b"123456"[..]),
             Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(REMOTE_SEQ + 1 + 6).win(0))
         );
     }
@@ -14485,7 +14525,7 @@ mod test {
             let window_len = if zero_window { 0 } else { 64 };
             let probes: &[&[u8]] = if zero_window { &[b"\x00"] } else { &[b"", b"\x00"] };
             for &payload in probes {
-                send!(s, time 100, SEND_TEMPL.seq(if zero_window { next } else { next - 1 })
+                send!(s, time 100, SEND_TEMPL.seq(next - 1)
                     .ack(LOCAL_SEQ + 1).data(payload), Some(RECV_TEMPL.seq(LOCAL_SEQ + 1).ack(next)
                         .win(window_len)));
                 assert_eq!(s.recv_queue(), if zero_window { 64 } else { 0 });

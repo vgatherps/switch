@@ -1,11 +1,11 @@
 //! The sweep coordinator: spawns G generator workers (`zhida-bench gen`, each its own Stack, Port
-//! and core), runs every rate of a fixed log-spaced list (`rates`) on all of them at a common
-//! start time and merges their results. No DPDK here.
+//! and core), runs each selected rate on all of them at a common start time and merges their
+//! results. No DPDK here.
 //!
 //! Output: one JSON line per step, then always one `summary` line, also when a worker fails
 //! (`complete: false` with the error; the steps already printed stand).
 //!
-//! TCP/ws outstanding budget (`budget_window_us`): the first step (at `rate_min`) runs without
+//! TCP/ws outstanding budget (`budget_window_us`): the first step runs without
 //! one and its median service round trip (echo time - actual send time) is the baseline; every
 //! later step lets each connection have `budget_per_connection` messages in flight, so the
 //! normal round trip is allowed and only backlog beyond it waits. A step in which any measured
@@ -92,11 +92,19 @@ pub struct StepReport {
     /// Some measured message waited on the budget: a knee here may be the budget's, not the
     /// receiver's.
     pub budget_bound: bool,
-    /// Any generator fell behind its schedule: the step measured the generator, not the DUT.
+    /// Any sender fell behind schedule; the cause and receiver capacity are not isolated.
     pub generator_bound: bool,
     /// TCP/ws: echo time - actual send time, median; the first step's is the budget's baseline.
     #[serde(skip)]
     pub service_rtt_p50_ns: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StepOutput<'a> {
+    #[serde(flatten)]
+    report: &'a StepReport,
+    baseline_rtt_ns: Option<u64>,
+    budget_per_connection: Option<Vec<u32>>,
 }
 
 /// The last line of every sweep.
@@ -104,10 +112,9 @@ pub struct StepReport {
 pub struct Summary {
     pub kind: &'static str,
     pub steps: u32,
-    /// Every step ran or the sweep stopped at a generator-bound step; false: see `error`.
+    /// Every step ran or the sweep stopped because a sender fell behind; false: see `error`.
     pub complete: bool,
-    /// The sweep stopped at a generator-bound step: it measured the generators, not the
-    /// receiver, so it is not a success (`run` fails) even when complete.
+    /// The sweep stopped because a sender fell behind; `run` fails even when complete.
     pub generator_bound: bool,
     pub error: Option<String>,
 }
@@ -288,6 +295,30 @@ pub fn run(
     out: &mut dyn FnMut(&str),
     progress: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
+    run_schedule(args, &rates(args.rate_min, args.rate_max), out, progress)
+}
+
+/// Runs a sweep at the given positive, strictly increasing rates.
+pub fn run_with_rates(
+    args: &Args,
+    schedule: &[u64],
+    out: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    if schedule.first().is_none_or(|&rate| rate == 0)
+        || schedule.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err("rates must be positive and strictly increasing".into());
+    }
+    run_schedule(args, schedule, out, progress)
+}
+
+fn run_schedule(
+    args: &Args,
+    schedule: &[u64],
+    out: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     if args.gens == 0 || !args.senders.is_multiple_of(args.gens) {
         return Err("--senders must be a positive multiple of --gens".into());
     }
@@ -298,7 +329,7 @@ pub fn run(
         generator_bound: false,
         error: None,
     };
-    let result = sweep(args, &mut summary, out, progress);
+    let result = sweep(args, schedule, &mut summary, out, progress);
     summary.complete = result.is_ok();
     summary.error = result.as_ref().err().cloned();
     out(&serde_json::to_string(&summary).expect("summary serializes"));
@@ -309,7 +340,7 @@ pub fn run(
     result?;
     if summary.generator_bound {
         return Err(format!(
-            "stopped at a generator-bound step after {} steps: not a receiver measurement",
+            "stopped after {} steps: a sender fell behind schedule; receiver capacity is not isolated",
             summary.steps
         ));
     }
@@ -363,6 +394,7 @@ fn check_clocks(workers: &mut [Worker]) -> Result<(), String> {
 
 fn sweep(
     args: &Args,
+    schedule: &[u64],
     summary: &mut Summary,
     out: &mut dyn FnMut(&str),
     progress: &mut dyn FnMut(&str),
@@ -387,17 +419,23 @@ fn sweep(
     let window_ns = args.budget_window_us.map(|us| us * 1000);
     // the first step's median service round trip (TCP/ws): the budget's baseline
     let mut baseline_rtt_ns = None;
-    for (id, rate) in (0u32..).zip(rates(args.rate_min, args.rate_max)) {
+    for (id, &rate) in (0u32..).zip(schedule) {
         check_clocks(&mut workers.0)?;
         if id == 0 {
             progress("processes synced: all worker clocks checked");
             progress("sweep start: dispatching first rate");
         }
         let start_unix_ns = unix_now_ns() + LEAD_MS * 1_000_000;
+        let mut budgets = window_ns
+            .zip(baseline_rtt_ns)
+            .map(|_| Vec::with_capacity(workers.0.len()));
         for (g, (w, share)) in (0u32..).zip(workers.0.iter_mut().zip(split_rate(rate, args.gens))) {
             let budget = window_ns
                 .zip(baseline_rtt_ns)
                 .map(|(w, b)| budget_per_connection(share, per, b, w));
+            if let (Some(budgets), Some(budget)) = (&mut budgets, budget) {
+                budgets.push(budget);
+            }
             send(
                 w,
                 &Request::Step(load::Command {
@@ -429,7 +467,11 @@ fn sweep(
         }
         let report = merge(args, id, &results)?;
         summary.steps = id + 1;
-        out(&serde_json::to_string(&report).expect("report serializes"));
+        out(&serde_json::to_string(&StepOutput {
+            report: &report,
+            baseline_rtt_ns,
+            budget_per_connection: budgets,
+        }).expect("report serializes"));
         if id == 0 && window_ns.is_some() {
             baseline_rtt_ns = report.service_rtt_p50_ns;
             if baseline_rtt_ns.is_none() {
@@ -757,7 +799,7 @@ mod tests {
         args.rate_max = 4000;
         args.gen_cmd = fake_worker("bound", &result(0, &[1000], &[100], 1, 7), 10);
         let (r, lines) = run_lines(&args);
-        assert!(r.unwrap_err().contains("generator-bound"));
+        assert!(r.is_err());
         assert_eq!(lines.len(), 2, "stopped after the first step");
         assert_eq!(lines[1]["complete"], true);
         assert_eq!(lines[1]["generator_bound"], true);
@@ -810,6 +852,139 @@ mod tests {
         assert_eq!(&r[..4], [10_000, 14_142, 20_000, 28_284]);
         assert_eq!(r[17], 3_620_387);
         assert_eq!(rates(64_000, 64_000), [64_000]);
+    }
+
+    #[test]
+    fn explicit_schedule_rejects_invalid_rates_before_starting_workers() {
+        for schedule in [&[][..], &[0][..], &[1, 0][..], &[2, 1][..], &[1, 1][..]] {
+            assert!(
+                run_with_rates(&args(), schedule, &mut |_| {}, &mut |_| {}).is_err(),
+                "{schedule:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn explicit_schedule_dispatches_each_rate_and_uses_first_rtt_for_budget() {
+        let schedule = [
+            10_000, 100_000, 400_000, 800_000, 900_000, 1_000_000, 1_100_000, 1_200_000,
+            1_400_000, 1_800_000, 2_500_000,
+        ];
+        let path = std::env::temp_dir().join(format!(
+            "zhida-bench-explicit-rates-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(&path, "").unwrap();
+        let mut sample = result(0, &[1000], &[100], 1, 0);
+        let mut rtt = Histogram::new();
+        rtt.record(100_000);
+        sample.service_rtt = rtt.to_sparse();
+        let mut args = args();
+        args.gens = 1;
+        args.budget_window_us = Some(50);
+        args.gen_cmd = fake_worker("explicit-rates", &sample, schedule.len() as u32).replace(
+            "while read line; do",
+            &format!("while read line; do printf '%s\\n' \"$line\" >> '{}';", path.display()),
+        );
+        let mut lines = Vec::new();
+        let status = run_with_rates(
+            &args,
+            &schedule,
+            &mut |line| lines.push(serde_json::from_str::<serde_json::Value>(line).unwrap()),
+            &mut |_| {},
+        );
+        let requests = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(status, Ok(()));
+        let commands: Vec<_> = requests
+            .lines()
+            .filter_map(|line| match serde_json::from_str::<Request>(line).unwrap() {
+                Request::Step(command) => Some(command),
+                Request::Clock => None,
+            })
+            .collect();
+        assert_eq!(commands.len(), schedule.len());
+        for (i, (command, &rate)) in commands.iter().zip(&schedule).enumerate() {
+            assert_eq!(command.step, i as u32);
+            assert_eq!(command.rate_pps, rate);
+            let expected = if i == 0 {
+                None
+            } else {
+                Some(budget_per_connection(rate, args.senders, rtt.quantile(0.5).unwrap(), 50_000))
+            };
+            assert_eq!(command.budget, expected);
+        }
+        assert_eq!(lines.len(), schedule.len() + 1);
+        assert_eq!(lines.last().unwrap()["complete"], true);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn step_json_reports_the_dispatched_worker_budgets() {
+        let schedule = [10_001, 10_003];
+        let base = std::env::temp_dir().join(format!(
+            "zhida-bench-reported-budgets-{}",
+            std::process::id()
+        ));
+        let paths: Vec<_> = (0..2)
+            .map(|i| std::path::PathBuf::from(format!("{}-{i}", base.display())))
+            .collect();
+        let mut sample = result(0, &[1000], &[100], 1, 0);
+        let mut rtt = Histogram::new();
+        rtt.record(100_000);
+        sample.service_rtt = rtt.to_sparse();
+        let mut args = args();
+        args.gens = 2;
+        args.senders = 2;
+        args.gen_cmd = fake_worker("reported-budgets", &sample, schedule.len() as u32).replace(
+            "while read line; do",
+            &format!("while read line; do printf '%s\\n' \"$line\" >> '{}-{{i}}';", base.display()),
+        );
+        for budgeted in [true, false] {
+            for path in &paths {
+                std::fs::write(path, "").unwrap();
+            }
+            args.budget_window_us = budgeted.then_some(1_000_000);
+            let mut lines = Vec::new();
+            let status = run_with_rates(
+                &args,
+                &schedule,
+                &mut |line| lines.push(serde_json::from_str::<serde_json::Value>(line).unwrap()),
+                &mut |_| {},
+            );
+            assert_eq!(status, Ok(()));
+            let commands: Vec<Vec<load::Command>> = paths.iter().map(|path| {
+                let requests = std::fs::read_to_string(path).unwrap();
+                requests.lines().filter_map(|line| {
+                    match serde_json::from_str::<Request>(line).unwrap() {
+                        Request::Step(command) => Some(command),
+                        Request::Clock => None,
+                    }
+                }).collect()
+            }).collect();
+            assert_eq!(lines.len(), schedule.len() + 1);
+            for step in 0..schedule.len() {
+                let reported = &lines[step];
+                if budgeted && step > 0 {
+                    assert_eq!(reported["baseline_rtt_ns"], rtt.quantile(0.5).unwrap());
+                    for worker in 0..2 {
+                        assert_eq!(
+                            reported["budget_per_connection"][worker],
+                            serde_json::to_value(commands[worker][step].budget).unwrap()
+                        );
+                    }
+                    assert_ne!(commands[0][step].budget, commands[1][step].budget);
+                } else {
+                    assert!(reported["baseline_rtt_ns"].is_null());
+                    assert!(reported["budget_per_connection"].is_null());
+                    assert!(commands.iter().all(|worker| worker[step].budget.is_none()));
+                }
+            }
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     /// Five workers at 10k pps in total: worker g starts g x 100 µs late, and all their messages

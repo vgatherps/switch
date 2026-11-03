@@ -48,6 +48,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     };
     host::catch_stop()?;
     let mut host = Host::open(&config, &sizing)?;
+    host.start_xstats("serve");
     let handle = host.net.handle();
     match args.proto {
         Proto::Udp => udp_echo(&host, &handle, args.port)?,

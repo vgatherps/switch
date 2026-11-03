@@ -75,6 +75,8 @@ pub struct Host {
     pub net: Net,
     pub rt: Runtime,
     pub clock: Clock,
+    port_id: u16,
+    xstats: Option<crate::xstats::Snapshots>,
     _eal: Eal,
 }
 
@@ -101,8 +103,16 @@ impl Host {
             net,
             rt: Runtime::new(clock.now_ns()),
             clock,
+            port_id: opened.report.port_id,
+            xstats: None,
             _eal: opened.eal,
         })
+    }
+
+    pub(crate) fn start_xstats(&mut self, role: &'static str) {
+        if std::env::var("ZHIDA_BENCH_XSTATS").as_deref() == Ok("1") {
+            self.xstats = Some(crate::xstats::Snapshots::start(role, self.port_id));
+        }
     }
 
     /// One busy-poll round: turn the Net at microsecond resolution, poll tasks at the same
@@ -120,6 +130,9 @@ impl Host {
     /// Drops every task, then closes the Port; fails if a socket or frame outlived them.
     pub fn close(mut self) -> Result<(), String> {
         self.rt.shutdown();
+        if let Some(xstats) = self.xstats.take() {
+            xstats.finish();
+        }
         let stack = self
             .net
             .into_stack()

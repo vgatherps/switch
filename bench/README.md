@@ -14,10 +14,10 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   `sent_pps` counts messages accepted by the generator stack, not NIC transmissions; `received_pps` counts
   echoes arriving within the window, including warmup echoes. Always prints one
   `summary` line (`steps`, `complete`, `generator_bound`, `error`). No knee is computed: the table
-  and plot show it. A step where any generator fell behind (a backlog at the end of its send window, or
-  send-lag p99 over 20 µs) is `generator_bound`:
-  it measured the generator, so the sweep stops there with `generator_bound: true` and exits non-zero. Exit 0
-  iff `complete` and not `generator_bound`. When a worker fails, the steps already printed stand and the
+  and plot show it. A step where any sender fell behind (a backlog at the end of its send window, or
+  send-lag p99 over 20 µs) is `generator_bound`. The sweep stops and exits non-zero: this flag does not
+  identify the cause, and receiver backpressure can also delay sends. Exit 0 iff `complete` and not
+  `generator_bound`. When a worker fails, the steps already printed stand and the
   summary says `complete: false`. A worker that does not answer within the step's time plus 10 s fails the
   sweep, and every worker's process group is killed. A shutdown failure also kills all workers still awaiting
   shutdown, including their child processes, before returning the incomplete summary.
@@ -36,17 +36,17 @@ rate sweep, and a report. Design: `plans/bench/design.md`.
   per poll, then the loop turns the Net; a message that waits keeps its scheduled time. A full TCP connection
   (or one at its budget) blocks only its own sender: its messages are owed and go out in order later, and
   their wait is the receiver's doing, not send lag. Latency = receive time - scheduled time (no coordinated
-  omission); drops = measured messages not echoed by the end of the drain. Sending stops at the end of the
-  window: what is still owed or behind is never sent (part of the loss), so a step past the knee ends on time.
+  omission); not echoed = measured messages not echoed by the end of the drain. Sending stops at the end of the
+  window: what is still owed or behind is never sent, so a step past the knee ends on time.
 - `zhida-bench serve`: the Zhida echo receiver (UDP, or TCP/ws with 64 pre-armed accepts; ws through
   relay's `accept_ws` and `Ws`). Its loop makes no syscall while serving; it runs until SIGINT/SIGTERM.
 - `zhida-bench kernel-serve --proto udp|tcp|ws --bind IP --port P`: Linux-only kernel-socket echo
   receiver. The generator remains Zhida; TCP uses the same fixed-size byte stream and WS is plain
   `ws://`, not TLS.
 - `report.py DIR`: `report.md` (one step table per sweep), `results.json` and one SVG per sweep
-  (latency quantiles and drop % against offered rate; a step with no echo stays on the plot). Exit 1 when
-  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or any sweep
-  generator-bound. Python stdlib only; tests: `python3 bench/test_report.py`.
+  (latency quantiles and not echoed % against offered rate; a step with no echo stays on the plot). Exit 1 when
+  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or a sweep
+  stopped because a sender fell behind. Python stdlib only; tests: `python3 bench/test_report.py`.
 
 Protocols: UDP, TCP, ws:// (no TLS). The binary's global allocator is mimalloc. AWS receiver and sender
 launches explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding an inherited value so mimalloc
@@ -66,9 +66,9 @@ routing between them (its side of each tap is the gateway). Runs, per protocol, 
 (TCP/ws with `--budget-us 50`), then the bounded-overload check (a TCP sweep against a listener that never
 reads must end within seconds with 100% loss reported and a complete summary), then writes
 `bench/out/smoke/report.md`; the make target fails if the report is incomplete. Every process's stderr is
-kept in `bench/out/smoke/*.log`. It validates the tooling; net_tap numbers are not measurements (the
-generators hit the per-packet tap syscall early, so sweeps often end generator-bound, which the smoke
-accepts). A bridge does not work here: net_tap gives the kernel side of a tap the Zhida MAC, which a bridge
+kept in `bench/out/smoke/*.log`. It validates the tooling; net_tap numbers are not measurements.
+The smoke accepts a sweep that stops because a sender fell behind. A bridge does not work here: net_tap gives
+the kernel side of a tap the Zhida MAC, which a bridge
 takes as its own and keeps the frames.
 
 ## Tests
@@ -77,10 +77,10 @@ takes as its own and keeps the frames.
 under overload, a blocked sender not holding back the others, flow control kept apart from backlog, the
 backlog at the cutoff), receive accounting (latency, warmup, loss, ignored duplicates/stale/malformed echoes,
 in-window receives), the histogram, the rate list, the worker start offsets, merging of worker results
-(achieved rates, loss, budget, generator-bound), the outstanding-budget rule, the coordinator's reply and exit
+(achieved rates, loss, budget, sender delays), the outstanding-budget rule, the coordinator's reply and exit
 timeouts (silent workers and their process groups killed), cleanup of remaining process groups after a worker
 fails shutdown, its clock and late-start checks, its summary after a worker dies, after total loss and after
-a generator-bound step (fake workers), the TCP stream cutter and the
+a sender-late step (fake workers), the TCP stream cutter and the
 ws client framing. With `--features e2e` (`make -C conduit test-bench`, in `make test`; needs NET_ADMIN and
 /dev/net/tun) it also runs the TCP echo receiver on net_tap against a kernel peer whose small segments conduit
 appends into one received frame larger than a TX frame: every byte must come back.
@@ -94,7 +94,16 @@ key. Missing OpenSSH executables skip that test; an installed but unusable serve
 
 `--region` defaults to the AWS profile's region (`aws configure`, or `AWS_REGION`); without either the runner stops before touching AWS. AWS project accounts (the "new AWS experience") are locked to one region, so leave it at the profile's. Binance's servers are in Tokyo: from another region the `binance` command's NIC-to-receive latency is still valid, only the wire path to Binance is longer.
 
-`python3 bench/aws/zhida_aws_bench.py run [--region R] [--ttl 2h] [--out DIR]` runs the whole thing. Preflight first, before anything is created: clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, on-demand Standard vCPU quota L-1216C47A with 16 free. Then it creates, for this run only and tagged with the run id: a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; four c7gn.xlarge on-demand instances (1 receiver, 3 senders; 4 vCPUs each: hft-host.sh isolates CPU 3 for the app, CPUs 0-2 housekeep and run the coordinator on sender0) in one run_instances, one DPDK data ENI each. The shape is two constants in `zhida_aws_bench.py`, `SENDERS` and `HOST_TYPE`; 1 + 5 x c7gn.2xlarge needs 48 vCPUs of quota. Every ID is recorded as its create succeeds (in memory and `RUN_DIR/created.json`). Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (one `cargo build --release -p zhida-bench` with hft-host.sh's build env). Then the fixed matrix (udp uncapped, tcp and ws `--budget-us 50`; 12 connections (4 per sender host), 64 B, 10k..5M msg/s in 18 x sqrt(2) steps) with the coordinator on sender0 driving one worker per sender host over SSH; a failed sweep is logged and the next one runs; every sweep's files are fetched. Teardown runs on normal exit, errors, Ctrl-C and SIGTERM; once it starts, Ctrl-C/SIGTERM are ignored, and every ssh/scp before it has a timeout. It deletes everything the run created by recorded ID and by tag (instances, data ENIs, key pair, placement group, security group, subnet, route table, internet gateway, VPC, in that dependency order), checks nothing is left, and exits non-zero if anything remains. Then `bench/report.py RUN_DIR`. Each instance also powers itself off (terminates) at the TTL as a backstop. Exit 0 only if report.py passed, every fetch succeeded and nothing remains.
+`python3 bench/aws/zhida_aws_bench.py run [--shape arm|intel] [--region R] [--ttl 2h] [--out DIR]` runs the whole thing. The default `arm` shape uses four c7gn.xlarge instances (one receiver, three senders; 16 vCPUs total) and an arm64 Amazon Linux 2023 image. `--shape intel` uses one c6in.8xlarge receiver and three c6in.2xlarge senders (56 vCPUs total) and an x86_64 Amazon Linux 2023 image. For the Intel run in Tokyo, use `--shape intel --region ap-northeast-1`. The same shape option works with `plan`, `preflight` and `kernel`.
+
+Before creating anything, preflight checks for a clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, enough free on-demand Standard vCPU quota L-1216C47A, and an availability zone offering every selected instance type. The subnet and cluster placement group use that common zone. An offering does not guarantee capacity; either instance launch can still fail.
+Use `--zone Z` with `run`, `kernel` or `preflight` to select a common availability zone explicitly
+when the default zone lacks capacity.
+Each benchmark run records the exact commit and SHA-256 of its source archive in `source.json`, `report.md`, and `results.json`.
+
+The run creates and tags a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; each on-demand instance has one DPDK data ENI. The ARM hosts launch in one request; Intel receiver and senders launch in separate requests. Every returned instance ID is recorded before waiting or making the next launch, in memory and `RUN_DIR/created.json`. Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (one `cargo build --release -p zhida-bench` with hft-host.sh's build env).
+
+The fixed matrix has five sweeps: UDP uncapped, TCP with `--budget-us 50` and uncapped, and WS with `--budget-us 50` and uncapped. Comparing the capped and uncapped sweeps shows whether the backlog cap shifts the knee. Each sweep uses 12 connections (4 per sender host), 64 B messages, and rates of 10k, 100k, 400k, 800k, 900k, 1M, 1.1M, 1.2M, 1.4M, 1.8M and 2.5M msg/s. The coordinator on sender0 drives one worker per sender host over SSH; a failed sweep is logged and the next one runs; every sweep's files are fetched. Teardown runs on normal exit, errors, Ctrl-C and SIGTERM; once it starts, Ctrl-C/SIGTERM are ignored, and every ssh/scp before it has a timeout. It deletes everything the run created by recorded ID and by tag (instances, data ENIs, key pair, placement group, security group, subnet, route table, internet gateway, VPC, in that dependency order), checks nothing is left, and exits non-zero if anything remains. Then `bench/report.py RUN_DIR`. Each instance also powers itself off (terminates) at the TTL as a backstop. Exit 0 only if report.py passed, every fetch succeeded and nothing remains.
 
 For the Linux-kernel receiver comparison, run one command:
 
@@ -126,6 +135,12 @@ counter resets, or affinity/RPS drift fail the run. `NET_RX` also includes manag
 its housekeeping deltas are reported, not falsely attributed to the data ENI. Compare this run's
 report with `run --region R` for the Zhida receiver; no performance numbers are implied here.
 
+If IRQ placement is deferred, a sender sends a brief UDP burst to the receiver before measurement;
+the runner then waits up to five seconds for actual IRQ affinities to converge without rewriting them. On failure,
+`kernel-irq-affinity-error.json` saves each data-ENI IRQ's name, requested and effective CPU lists,
+any write error, and available kernel IRQ debug state. A failed post-traffic check also retains the
+original placement attempt under `initial`.
+
 The laptop shows run start, hosts up (every host reachable over SSH), and code built (every host's
 setup verification and benchmark build succeeded). For each protocol, live coordinator stderr reports
 processes up only after every worker replies ready, then processes synced only after every initial clock
@@ -143,10 +158,11 @@ failed service or verification timeout includes the last verify output (when ava
 status and current-boot journal, and loaded/on-disk `vfio_pci_core` source versions in the setup
 error. If SSH prevents collecting those diagnostics, the error reports that failure too.
 
-The AWS runner measures each rate for 5 seconds, after 250 ms warmup and a 50 ms lead, then waits
-200 ms for replies. The 18 rates take 90 seconds of measurement and 99 seconds of scheduled time
-per protocol. Setup, worker startup, clock probes, result collection and teardown take additional
-time. Manual `zhida-bench sweep` defaults remain 2 seconds measurement / 500 ms warmup /
+The AWS runner measures each rate for 10 seconds, after 250 ms warmup and a 50 ms lead, then waits
+200 ms for replies. All 11 rates take 110 seconds of measurement and 115.5 seconds of scheduled time
+per sweep. The coordinator's 15-minute timeout is a backstop, not a bound on every possible
+sequence of per-worker timeouts. Setup, worker startup, clock probes, result collection and
+teardown take additional time. Manual `zhida-bench sweep` defaults remain 2 seconds measurement / 500 ms warmup /
 200 ms drain.
 
 `plan` prints the hosts, sweeps and what gets created, with no AWS calls; `preflight` runs only the checks; `cleanup --run-id ID [--region R] [--out DIR]` deletes a leftover run using `DIR/ID/created.json` plus a tag lookup (tag lookup only if the file is gone). Needs python3 with boto3, ssh, scp, git; the IAM permissions are listed in the runner's `-h`. Tests (no AWS): `python3 -m unittest discover -s bench/aws`, `sh deploy/test-hft-host.sh`.
@@ -172,10 +188,9 @@ Before the first paid run:
 The host is one m7g.xlarge (4 vCPU Graviton3; M7g is on deploy/README.md's list of families with ENA hardware RX timestamps and the PHC). Created for the run, tagged with the run id and recorded in `RUN_DIR/created.json`: VPC, subnet (in a zone offering the type), internet gateway, route table, security group (SSH from your public IP), a `precision-time` placement group, key pair, the instance (powers itself off at the TTL), its data ENI and an Elastic IP on the data ENI (the feed's route to the internet). The host runs `hft-host.sh apply`, `verify`, then `run-binance.sh --seconds N`. Into `RUN_DIR`: `verify.txt` (apply and verify output), `binance.log` and `feed.out` (the feed's output). It prints the message count and the latency counts with the histogram buckets holding p50/p99/p99.9/max, or why there are none. Teardown deletes everything (the Elastic IP disassociated, then released) on exit, errors, Ctrl-C and SIGTERM, and checks nothing is left; `cleanup --run-id ID` deletes a leftover run. Exit 0 only when the feed exited 0, both files were fetched and nothing is left.
 
 Progress reports SSH readiness, setup start and verified completion, then the remote feed request
-and its exit status; it does not infer completion of hidden build substages. Host setup enables
-`ena.phc_enable=1` through its existing reboot path. The feed explicitly uses `--phc /dev/ptp_ena`;
-an absent PHC refuses startup rather than falling back to wall time.
-`max_mapping_bound_ns` describes mapper sampling uncertainty under its assumptions, not a measured
-bound on cross-interface or AWS clock error. AWS identifies the packet timestamp reference as the
-[Amazon Time Sync PTP hardware clock](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping);
-this run does not independently measure skew between the data and management ENIs.
+and its exit status; it does not infer completion of hidden build substages. Host setup makes chrony
+discipline CLOCK_REALTIME to the Time Sync PHC; the feed's latency is CLOCK_REALTIME minus each
+message's ENA hardware RX stamp, and its startup `phc_check` line gives the data ENI's PHC minus
+CLOCK_REALTIME once.
+AWS identifies the packet timestamp reference as the
+[Amazon Time Sync PTP hardware clock](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html#hardware-packet-timestamping).
