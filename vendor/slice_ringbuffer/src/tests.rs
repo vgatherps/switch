@@ -1,12 +1,13 @@
 use super::*;
 use shared_memory::unique_name;
+use std::sync::mpsc;
 use std::thread;
 
 fn ring() -> (Backing, Backing, RingWriter, RingReader) {
     let name = unique_name("/junction-ring-").unwrap();
-    let producer = Backing::create_shm(&name).unwrap();
+    let mut producer = Backing::create_shm(&name).unwrap();
     let size = producer.page_size().unwrap();
-    let writer = RingWriter::create(&producer, size).unwrap();
+    let writer = RingWriter::create(&mut producer, size).unwrap();
     let consumer = Backing::open_shm(&name).unwrap();
     let reader = RingReader::open(&consumer).unwrap();
     (producer, consumer, writer, reader)
@@ -48,7 +49,7 @@ fn reclaim_only_releases_contiguous_prefix() {
     assert!(writer.reserve(0).is_none(), "held A must block all reuse");
     drop(a);
     reader.reclaim();
-    assert!(writer.reserve(quarter - HEADER_SIZE).is_some());
+    assert!(writer.reserve(writer.max_payload()).is_some());
 }
 
 #[test]
@@ -105,12 +106,55 @@ fn open_rejects_wrong_magic() {
     );
 }
 
+#[test]
+fn reader_claim_is_permanent() {
+    let (_producer, consumer, _writer, reader) = ring();
+    assert!(
+        matches!(RingReader::open(&consumer), Err(error) if error.kind() == io::ErrorKind::AlreadyExists)
+    );
+    drop(reader);
+    assert!(
+        matches!(RingReader::open(&consumer), Err(error) if error.kind() == io::ErrorKind::AlreadyExists)
+    );
+}
+
+#[test]
+fn open_rejects_misaligned_tail() {
+    let name = unique_name("/junction-ring-").unwrap();
+    let mut producer = Backing::create_shm(&name).unwrap();
+    let page = producer.page_size().unwrap();
+    let _writer = RingWriter::create(&mut producer, page).unwrap();
+    let consumer = Backing::open_shm(&name).unwrap();
+    let header = Mapping::new(producer.fd(), 0, page).unwrap();
+    // SAFETY: the separate mapping covers an initialized RingHeader; the
+    // atomic cursor stores occur before any reader is opened.
+    unsafe {
+        let header = &*header.as_ptr().cast::<RingHeader>();
+        header.tail.0.store(9, Ordering::Relaxed);
+        header.head.0.store(9, Ordering::Relaxed);
+    }
+    assert!(
+        matches!(RingReader::open(&consumer), Err(error) if error.kind() == io::ErrorKind::InvalidData)
+    );
+}
+
+#[test]
+fn recreate_rejects_active_backing_without_resetting_records() {
+    let (mut producer, _consumer, mut writer, mut reader) = ring();
+    publish(&mut writer, 128, 0x5a);
+    let size = producer.page_size().unwrap();
+    assert!(
+        matches!(RingWriter::create(&mut producer, size), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
+    );
+    assert_eq!(reader.next().unwrap().payload(), &[0x5a; 128]);
+}
+
 fn payload_byte(sequence: u32, offset: usize) -> u8 {
     (sequence.wrapping_mul(37).wrapping_add(offset as u32 * 13) >> (offset % 4)) as u8
 }
 
 fn validate(frame: &RxFrame, sequence: u32) {
-    assert_eq!(frame.header().slot, sequence, "receive order");
+    assert_eq!(frame.meta().slot, sequence, "receive order");
     assert_eq!(frame.payload().len(), sequence as usize * 73 % 600 + 1);
     for (offset, &byte) in frame.payload().iter().enumerate() {
         assert_eq!(
@@ -125,12 +169,22 @@ fn validate(frame: &RxFrame, sequence: u32) {
 fn cross_thread_stress_preserves_held_frames() {
     const COUNT: u32 = 100_000;
     let (_producer, _consumer, mut writer, mut reader) = ring();
+    let (release_tx, release_rx) = mpsc::sync_channel::<(u32, RxFrame)>(32);
+    let releaser = thread::spawn(move || {
+        let mut released = 0;
+        while let Ok((sequence, frame)) = release_rx.recv() {
+            validate(&frame, sequence);
+            drop(frame);
+            released += 1;
+        }
+        assert!(released > 0);
+    });
     let producer = thread::spawn(move || {
         for sequence in 0..COUNT {
             let len = sequence as usize * 73 % 600 + 1;
             loop {
                 if let Some(mut record) = writer.reserve(len) {
-                    record.header().slot = sequence;
+                    record.meta().slot = sequence;
                     for (offset, byte) in record.payload().iter_mut().enumerate() {
                         *byte = payload_byte(sequence, offset);
                     }
@@ -161,10 +215,16 @@ fn cross_thread_stress_preserves_held_frames() {
             let index = random as usize % held.len();
             let (sequence, frame) = held.swap_remove(index);
             validate(&frame, sequence);
-            drop(frame);
+            if random & 1 == 0 {
+                release_tx.send((sequence, frame)).unwrap();
+            } else {
+                drop(frame);
+            }
         }
         reader.reclaim();
         std::hint::spin_loop();
     }
     producer.join().unwrap();
+    drop(release_tx);
+    releaser.join().unwrap();
 }

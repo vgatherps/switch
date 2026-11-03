@@ -8,7 +8,8 @@
 //! Header/payload writes -> head Release -> reader head Acquire. Frame reads ->
 //! refs fetch_sub Release -> reclaim refs Acquire -> tail Release -> writer tail
 //! Acquire -> overwrite. Nothing else is shared. Create on a fresh backing before
-//! opening it, and use exactly one writer and one reader per ring.
+//! opening it; each ring supports exactly one writer and one reader, ever.
+//! Concurrent initialization through other backing handles or processes is outside the contract.
 
 use shared_memory::{Backing, DoubleMapping, Mapping};
 use std::convert::TryFrom;
@@ -28,15 +29,21 @@ struct CacheLine<T>(T);
 struct RingHeader {
     magic: u64,
     size: u64,
+    reader: AtomicU32,
     head: CacheLine<AtomicU64>,
     tail: CacheLine<AtomicU64>,
 }
 
-/// Metadata stored immediately before a record's payload.
 #[repr(C)]
-pub struct RecordHeader {
+struct RecordHeader {
     refs: AtomicU32,
     len: u32,
+    meta: PacketMeta,
+}
+
+/// Packet metadata stored immediately before a record's payload.
+#[repr(C)]
+pub struct PacketMeta {
     pub slot: u32,
     pub generation: u32,
     pub kind: u8,
@@ -52,32 +59,26 @@ const _: () = {
     assert!(size_of::<RingHeader>() <= 4096);
     assert!(offset_of!(RingHeader, magic) == 0);
     assert!(offset_of!(RingHeader, size) == 8);
+    assert!(offset_of!(RingHeader, reader) == 16);
     assert!(offset_of!(RingHeader, head) == 128);
     assert!(offset_of!(RingHeader, tail) == 256);
     assert!(size_of::<RecordHeader>() == 40);
     assert!(align_of::<RecordHeader>() == 8);
     assert!(offset_of!(RecordHeader, refs) == 0);
     assert!(offset_of!(RecordHeader, len) == 4);
-    assert!(offset_of!(RecordHeader, slot) == 8);
-    assert!(offset_of!(RecordHeader, generation) == 12);
-    assert!(offset_of!(RecordHeader, kind) == 16);
-    assert!(offset_of!(RecordHeader, _pad0) == 17);
-    assert!(offset_of!(RecordHeader, src_addr) == 20);
-    assert!(offset_of!(RecordHeader, src_port) == 24);
-    assert!(offset_of!(RecordHeader, _pad1) == 26);
-    assert!(offset_of!(RecordHeader, dst_addr) == 28);
-    assert!(offset_of!(RecordHeader, rx_timestamp) == 32);
+    assert!(offset_of!(RecordHeader, meta) == 8);
+    assert!(size_of::<PacketMeta>() == 32);
+    assert!(align_of::<PacketMeta>() == 8);
+    assert!(offset_of!(PacketMeta, slot) == 0);
+    assert!(offset_of!(PacketMeta, generation) == 4);
+    assert!(offset_of!(PacketMeta, kind) == 8);
+    assert!(offset_of!(PacketMeta, _pad0) == 9);
+    assert!(offset_of!(PacketMeta, src_addr) == 12);
+    assert!(offset_of!(PacketMeta, src_port) == 16);
+    assert!(offset_of!(PacketMeta, _pad1) == 18);
+    assert!(offset_of!(PacketMeta, dst_addr) == 20);
+    assert!(offset_of!(PacketMeta, rx_timestamp) == 24);
 };
-
-impl RecordHeader {
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
 
 fn stride(len: usize) -> usize {
     (HEADER_SIZE + len + 7) & !7
@@ -99,7 +100,13 @@ impl RingWriter {
     /// Initializes a fresh backing. The caller retains ownership of its name/unlink.
     /// Size must be a power of two, a backing-page multiple, and at most 2 GiB
     /// so every payload length is representable in the record header.
-    pub fn create(backing: &Backing, size: usize) -> io::Result<RingWriter> {
+    pub fn create(backing: &mut Backing, size: usize) -> io::Result<RingWriter> {
+        if backing.len()? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "backing is not fresh",
+            ));
+        }
         let page = backing.page_size()?;
         if !size.is_power_of_two() || !size.is_multiple_of(page) || size > (1usize << 31) {
             return Err(io::Error::new(
@@ -118,12 +125,12 @@ impl RingWriter {
         unsafe {
             let ptr = header.as_ptr().cast::<RingHeader>();
             ptr.write(RingHeader {
-                magic: 0,
+                magic: MAGIC,
                 size: size as u64,
+                reader: AtomicU32::new(0),
                 head: CacheLine(AtomicU64::new(0)),
                 tail: CacheLine(AtomicU64::new(0)),
             });
-            (*ptr).magic = MAGIC;
         }
         Ok(Self {
             header,
@@ -143,13 +150,18 @@ impl RingWriter {
     pub fn reserve(&mut self, len: usize) -> Option<Reserved<'_>> {
         assert!(len <= self.max_payload(), "payload exceeds ring capacity");
         let required = stride(len) as u64;
-        if self.size as u64 - (self.head - self.cached_tail) < required {
+        if self.size as u64 - self.head.wrapping_sub(self.cached_tail) < required {
             // SAFETY: header is initialized and remains mapped; tail is atomic.
-            self.cached_tail = unsafe { &*self.header.as_ptr().cast::<RingHeader>() }
+            let tail = unsafe { &*self.header.as_ptr().cast::<RingHeader>() }
                 .tail
                 .0
                 .load(Ordering::Acquire);
-            if self.size as u64 - (self.head - self.cached_tail) < required {
+            let used = self.head.wrapping_sub(tail);
+            if used > self.size as u64 {
+                return None;
+            }
+            self.cached_tail = tail;
+            if self.size as u64 - used < required {
                 return None;
             }
         }
@@ -164,15 +176,17 @@ impl RingWriter {
             ptr.write(RecordHeader {
                 refs: AtomicU32::new(1),
                 len: len as u32,
-                slot: 0,
-                generation: 0,
-                kind: 0,
-                _pad0: [0; 3],
-                src_addr: [0; 4],
-                src_port: 0,
-                _pad1: 0,
-                dst_addr: [0; 4],
-                rx_timestamp: 0,
+                meta: PacketMeta {
+                    slot: 0,
+                    generation: 0,
+                    kind: 0,
+                    _pad0: [0; 3],
+                    src_addr: [0; 4],
+                    src_port: 0,
+                    _pad1: 0,
+                    dst_addr: [0; 4],
+                    rx_timestamp: 0,
+                },
             });
             NonNull::new_unchecked(ptr)
         };
@@ -192,9 +206,9 @@ pub struct Reserved<'a> {
 }
 
 impl Reserved<'_> {
-    pub fn header(&mut self) -> &mut RecordHeader {
+    pub fn meta(&mut self) -> &mut PacketMeta {
         // SAFETY: the exclusive writer borrow owns this unpublished record.
-        unsafe { self.record.as_mut() }
+        unsafe { &mut self.record.as_mut().meta }
     }
 
     pub fn payload(&mut self) -> &mut [u8] {
@@ -209,7 +223,7 @@ impl Reserved<'_> {
     }
 
     pub fn commit(self) {
-        self.writer.head += stride(self.len) as u64;
+        self.writer.head = self.writer.head.wrapping_add(stride(self.len) as u64);
         // SAFETY: the header remains mapped and head is an initialized atomic.
         unsafe { &*self.writer.header.as_ptr().cast::<RingHeader>() }
             .head
@@ -259,7 +273,7 @@ pub struct RingReader {
 }
 
 impl RingReader {
-    /// Opens an initialized ring without retaining the backing. Use one reader per ring.
+    /// Opens an initialized ring without retaining the backing. One reader per ring, ever.
     pub fn open(backing: &Backing) -> io::Result<RingReader> {
         let page = backing.page_size()?;
         let header = Mapping::new(backing.fd(), 0, page)?;
@@ -281,6 +295,23 @@ impl RingReader {
         }
         let data = DoubleMapping::new(backing.fd(), page, size, true)?;
         let tail = raw.tail.0.load(Ordering::Acquire);
+        let head = raw.head.0.load(Ordering::Acquire);
+        if !tail.is_multiple_of(8) || head.wrapping_sub(tail) > size as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid ring cursors",
+            ));
+        }
+        if raw
+            .reader
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "reader already claimed",
+            ));
+        }
         Ok(Self {
             shared: Arc::new(Shared { header, data, size }),
             read: tail,
@@ -298,21 +329,22 @@ impl RingReader {
                 return None;
             }
         }
+        let avail = self.cached_head.wrapping_sub(self.read);
+        assert!(avail <= self.shared.size as u64, "corrupt published cursor");
+        assert!(avail >= HEADER_SIZE as u64, "unpublished record header");
         let record = self.shared.record(self.read);
         // SAFETY: head Acquire published this header; tail has not reclaimed it.
-        let len = unsafe { record.as_ref() }.len();
+        let len = unsafe { record.as_ref() }.len;
         assert!(
-            len <= self.shared.size - HEADER_SIZE,
+            len as usize <= self.shared.size - HEADER_SIZE,
             "corrupt record length"
         );
-        let stride = stride(len) as u64;
-        assert!(
-            stride <= self.cached_head - self.read,
-            "unpublished record bytes"
-        );
-        self.read += stride;
+        let stride = stride(len as usize) as u64;
+        assert!(stride <= avail, "unpublished record bytes");
+        self.read = self.read.wrapping_add(stride);
         Some(RxFrame {
-            shared: Arc::clone(&self.shared),
+            _shared: Arc::clone(&self.shared),
+            len,
             record,
         })
     }
@@ -327,7 +359,12 @@ impl RingReader {
             if record.refs.load(Ordering::Acquire) != 0 {
                 break;
             }
-            self.tail += stride(record.len()) as u64;
+            let stride = stride(record.len as usize) as u64;
+            assert!(
+                stride <= self.read.wrapping_sub(self.tail),
+                "corrupt reclaim stride"
+            );
+            self.tail = self.tail.wrapping_add(stride);
         }
         if self.tail != old_tail {
             self.shared
@@ -341,7 +378,8 @@ impl RingReader {
 
 /// An owned, immutable record that keeps its mappings alive. Not Clone or Sync.
 pub struct RxFrame {
-    shared: Arc<Shared>,
+    _shared: Arc<Shared>,
+    len: u32,
     record: NonNull<RecordHeader>,
 }
 
@@ -350,9 +388,9 @@ pub struct RxFrame {
 unsafe impl Send for RxFrame {}
 
 impl RxFrame {
-    pub fn header(&self) -> &RecordHeader {
-        // SAFETY: the frame's live ref prevents reclaim, and shared owns the mapping.
-        unsafe { self.record.as_ref() }
+    pub fn meta(&self) -> &PacketMeta {
+        // SAFETY: the frame's live ref prevents reclaim, and _shared owns the mapping.
+        unsafe { &self.record.as_ref().meta }
     }
 
     pub fn payload(&self) -> &[u8] {
@@ -361,7 +399,7 @@ impl RxFrame {
         unsafe {
             std::slice::from_raw_parts(
                 self.record.as_ptr().cast::<u8>().add(HEADER_SIZE),
-                self.header().len(),
+                self.len as usize,
             )
         }
     }
@@ -369,9 +407,10 @@ impl RxFrame {
 
 impl Drop for RxFrame {
     fn drop(&mut self) {
-        // Keep the owning Arc live through the final access to the record.
-        let _ = &self.shared;
-        self.header().refs.fetch_sub(1, Ordering::Release);
+        // SAFETY: the frame's owning Arc remains live through this final access.
+        unsafe { self.record.as_ref() }
+            .refs
+            .fetch_sub(1, Ordering::Release);
     }
 }
 
