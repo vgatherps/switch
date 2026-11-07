@@ -243,9 +243,15 @@ fn crashed_session_resets_tcp_before_releasing_held_plain_close() {
         fixture.turn_network();
         let deadline = WallInstant::now() + WAIT;
         while !fixture.released.contains(&session)
-            || !matches!(fixture.peer.tcp(&peer).state(), State::Closed | State::CloseWait)
+            || !matches!(
+                fixture.peer.tcp(&peer).state(),
+                State::Closed | State::CloseWait
+            )
         {
-            assert!(WallInstant::now() < deadline, "crashed session did not close its peer");
+            assert!(
+                WallInstant::now() < deadline,
+                "crashed session did not close its peer"
+            );
             fixture.round_links();
         }
         assert!(
@@ -268,9 +274,7 @@ fn finish_then_drop_with_control_loss_before_fifo_end_delivers_bytes_then_fin() 
         let (id, peer) = connect(&mut fixture, &mut client, &mut events, LOCAL_PORT);
         let session = fixture.streams[0];
         let payload = b"bytes committed before finish";
-        let mut record = vec![0; junction::send::TCP_SEND_HEADER + payload.len()];
-        record[junction::send::TCP_SEND_HEADER..].copy_from_slice(payload);
-        client.send_tcp(id, &mut record).unwrap();
+        client.send_tcp(id, payload).unwrap();
         client.finish().unwrap();
         drop(client);
         fixture.forward_lost(session);
@@ -286,7 +290,10 @@ fn finish_then_drop_with_control_loss_before_fifo_end_delivers_bytes_then_fin() 
             || received.len() != payload.len()
             || !fixture.retired.contains(&session)
         {
-            assert!(WallInstant::now() < deadline, "finish then drop did not deliver bytes and FIN");
+            assert!(
+                WallInstant::now() < deadline,
+                "finish then drop did not deliver bytes and FIN"
+            );
             fixture.round_links();
             while fixture.peer.tcp(&peer).can_recv() {
                 let frame = fixture.peer.tcp_mut(&peer).recv().unwrap().unwrap();

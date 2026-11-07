@@ -18,7 +18,7 @@ use junction::control::{
     SocketId, TcpConfig, UdpConfig, VERSION, Welcome, WelcomeStatus,
 };
 use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
-use junction::send::{self, SendRecord, TCP_SEND_HEADER, UDP_SEND_HEADER};
+use junction::send::{self, SendRecord};
 use junction::session::{ConnectError, Lost, OpenError, SendError, Session};
 use shared_memory::{Backing, unique_name};
 use slice_ringbuffer::RingWriter;
@@ -620,11 +620,11 @@ fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
         connected
     });
 
-    let mut record = [0xa5; 256];
+    let mut payload = [0xa5; 240];
     let mut sent = 0u64;
     loop {
-        record[TCP_SEND_HEADER..TCP_SEND_HEADER + 8].copy_from_slice(&sent.to_le_bytes());
-        match client.send_tcp(tcp_id, &mut record) {
+        payload[..8].copy_from_slice(&sent.to_le_bytes());
+        match client.send_tcp(tcp_id, &payload) {
             Ok(()) => sent += 1,
             Err(SendError::Full) => break,
             other => panic!("unexpected send result: {other:?}"),
@@ -650,8 +650,7 @@ fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
     assert!(fifo.next_message().is_none());
 
     // A rejected push must not leave a sequence gap: the FIFO would kick the stream.
-    let mut empty_tcp = [0xa5; TCP_SEND_HEADER];
-    client.send_tcp(tcp_id, &mut empty_tcp).unwrap();
+    client.send_tcp(tcp_id, &[]).unwrap();
     let udp_id = client.bind_udp(udp()).unwrap();
     assert!(matches!(host.op(session), Op::BindUdp { .. }));
     host.event(session, udp_id, Event::Bound);
@@ -667,9 +666,7 @@ fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
         bound
     });
     let to = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 9), 0x1234);
-    let mut datagram = [0xa5; UDP_SEND_HEADER + 3];
-    datagram[UDP_SEND_HEADER..].copy_from_slice(b"udp");
-    client.send_udp(udp_id, to, &mut datagram).unwrap();
+    client.send_udp(udp_id, to, b"udp").unwrap();
     client.finish().unwrap();
     let mut tail = 0;
     until(|| {
@@ -723,10 +720,9 @@ fn tcp_send_after_shutdown_is_not_open() {
             .unwrap();
         connected
     });
-    let mut record = [0; TCP_SEND_HEADER + 1];
-    client.send_tcp(id, &mut record).unwrap();
+    client.send_tcp(id, &[0]).unwrap();
     client.shutdown(id);
-    assert_eq!(client.send_tcp(id, &mut record), Err(SendError::NotOpen));
+    assert_eq!(client.send_tcp(id, &[0]), Err(SendError::NotOpen));
 }
 
 #[test]

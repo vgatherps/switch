@@ -332,7 +332,7 @@ fn socket_operations_after_finish_panic_before_validation() {
                     slot: u32::MAX,
                     generation: 0,
                 },
-                &mut [],
+                &[],
             );
         },
         |client| {
@@ -342,7 +342,7 @@ fn socket_operations_after_finish_panic_before_validation() {
                     generation: 0,
                 },
                 std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 1234),
-                &mut [],
+                &[],
             );
         },
     ];

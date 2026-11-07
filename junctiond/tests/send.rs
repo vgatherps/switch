@@ -4,7 +4,6 @@ use std::time::Instant as WallInstant;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::{socket::tcp::State, wire::IpEndpoint};
 use junction::control::{Event, Op, SocketId};
-use junction::send::{TCP_SEND_HEADER, UDP_SEND_HEADER};
 use junction::session::Session;
 use zhida_test_kit::with_eal;
 
@@ -33,12 +32,8 @@ fn queued_send(
     // The first iteration can accept one byte; all remaining bytes must backlog.
     // Queue the terminal operation before that iteration, so ACKs cannot drain it first.
     let payload: Vec<u8> = (0..4096).map(|n| (n % 251) as u8).collect();
-    let mut record = [0; TCP_SEND_HEADER + 240];
     for chunk in payload.chunks(240) {
-        record[TCP_SEND_HEADER..TCP_SEND_HEADER + chunk.len()].copy_from_slice(chunk);
-        client
-            .send_tcp(id, &mut record[..TCP_SEND_HEADER + chunk.len()])
-            .unwrap();
+        client.send_tcp(id, chunk).unwrap();
     }
     (id, peer, payload)
 }
@@ -148,9 +143,7 @@ fn tcp_send_after_peer_reset_drops_without_ending_session() {
                 },
             ))
         });
-        let mut record = [0; TCP_SEND_HEADER + 5];
-        record[TCP_SEND_HEADER..].copy_from_slice(b"reset");
-        client.send_tcp(id, &mut record).unwrap();
+        client.send_tcp(id, b"reset").unwrap();
         f.round(&mut client, &mut events);
         assert_another_bind_works(&mut f, &mut client, &mut events);
         f.peer.remove_tcp(peer);
@@ -225,10 +218,8 @@ fn stale_send_after_abort_and_slot_reuse_does_not_end_session() {
         let mut client = f.client(1);
         let mut events = Vec::new();
         let (id, peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT);
-        let mut record = [0; TCP_SEND_HEADER + 3];
-        record[TCP_SEND_HEADER..].copy_from_slice(b"old");
-        client.send_tcp(id, &mut record).unwrap();
-        client.send_tcp(id, &mut record).unwrap();
+        client.send_tcp(id, b"old").unwrap();
+        client.send_tcp(id, b"old").unwrap();
         client.abort(id);
         assert_eq!(f.wait_op(id), Op::AbortTcp { id });
         // Apply abort and consume only the first SEND. Wait for Freed without
@@ -257,8 +248,7 @@ fn stale_send_after_abort_and_slot_reuse_does_not_end_session() {
             events.contains(&(next, Event::Connected))
                 && f.peer.tcp(&next_peer).state() == State::Established
         });
-        record[TCP_SEND_HEADER..].copy_from_slice(b"new");
-        client.send_tcp(next, &mut record).unwrap();
+        client.send_tcp(next, b"new").unwrap();
         f.until(&mut client, &mut events, |f, _| {
             f.peer.tcp(&next_peer).can_recv()
         });
@@ -297,9 +287,7 @@ fn abort_discards_backlog_resets_peer_and_reuses_host_index() {
         assert_eq!(f.peer.tcp(&peer).state(), State::Closed);
         f.peer.remove_tcp(peer);
         let (next, next_peer) = connect(&mut f, &mut client, &mut events, LOCAL_PORT + 1);
-        let mut record = [0; TCP_SEND_HEADER + 5];
-        record[TCP_SEND_HEADER..].copy_from_slice(b"alive");
-        client.send_tcp(next, &mut record).unwrap();
+        client.send_tcp(next, b"alive").unwrap();
         f.until(&mut client, &mut events, |f, _| {
             f.peer.tcp(&next_peer).can_recv()
         });
@@ -367,10 +355,8 @@ fn udp_send_delivers_destination_and_payload_and_counts_unresolved_arp_drop() {
         f.until(&mut client, &mut events, |_, events| {
             events.contains(&(id, Event::Bound))
         });
-        let mut record = [0; UDP_SEND_HEADER + 8];
-        record[UDP_SEND_HEADER..].copy_from_slice(b"datagram");
         client
-            .send_udp(id, peer_endpoint(PEER_PORT + 1), &mut record)
+            .send_udp(id, peer_endpoint(PEER_PORT + 1), b"datagram")
             .unwrap();
         f.until(&mut client, &mut events, |f, _| {
             f.peer.udp(&peer).rx_queued() == 1
@@ -390,7 +376,7 @@ fn udp_send_delivers_destination_and_payload_and_counts_unresolved_arp_drop() {
             .send_udp(
                 id,
                 SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 99), PEER_PORT + 1),
-                &mut record,
+                b"datagram",
             )
             .unwrap();
         f.round(&mut client, &mut events);

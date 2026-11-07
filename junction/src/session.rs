@@ -336,7 +336,7 @@ impl Session {
         Ok(id)
     }
 
-    /// Overwrites `record[..TCP_SEND_HEADER]` with the header and commits one record.
+    /// Commits the payload with a TCP send header as one record; no headroom is needed.
     /// `Full` consumes no sequence number; retry after space becomes available.
     ///
     /// Valid only after this socket's `Connected` event. An earlier send can reach
@@ -344,24 +344,20 @@ impl Session {
     /// ending the session as a protocol error. Session does not enforce this ordering.
     ///
     /// # Panics
-    /// Panics after successful `finish()`, for insufficient header headroom, an
-    /// invalid or stale socket ID, or a UDP socket.
-    pub fn send_tcp(&mut self, id: SocketId, record: &mut [u8]) -> Result<(), SendError> {
+    /// Panics after successful `finish()`, for an invalid or stale socket ID, or a UDP socket.
+    pub fn send_tcp(&mut self, id: SocketId, payload: &[u8]) -> Result<(), SendError> {
         self.assert_unfinished();
-        assert!(
-            record.len() >= TCP_SEND_HEADER,
-            "TCP send requires header headroom"
-        );
         let slot = self.slot_for(id);
         assert!(slot.tcp, "TCP send requires a TCP socket: {id:?}");
         if slot.state != State::Open || slot.shut {
             return Err(SendError::NotOpen);
         }
-        send::write_tcp(record, id);
-        self.push(record)
+        let mut header = [0; TCP_SEND_HEADER];
+        send::write_tcp(&mut header, id);
+        self.push(&header, payload)
     }
 
-    /// Overwrites `record[..UDP_SEND_HEADER]` with the header and commits one record.
+    /// Commits the payload with a UDP send header as one record; no headroom is needed.
     /// `Full` consumes no sequence number; retry after space becomes available.
     ///
     /// Valid only after this socket's `Bound` event. An earlier send can reach
@@ -369,30 +365,29 @@ impl Session {
     /// ending the session as a protocol error. Session does not enforce this ordering.
     ///
     /// # Panics
-    /// Panics after successful `finish()`, for insufficient header headroom, an
-    /// invalid or stale socket ID, or a TCP socket.
+    /// Panics after successful `finish()`, for an invalid or stale socket ID, or a TCP socket.
     pub fn send_udp(
         &mut self,
         id: SocketId,
         to: SocketAddrV4,
-        record: &mut [u8],
+        payload: &[u8],
     ) -> Result<(), SendError> {
         self.assert_unfinished();
-        assert!(
-            record.len() >= UDP_SEND_HEADER,
-            "UDP send requires header headroom"
-        );
         let slot = self.slot_for(id);
         assert!(!slot.tcp, "UDP send requires a UDP socket: {id:?}");
         if slot.state != State::Open {
             return Err(SendError::NotOpen);
         }
-        send::write_udp(record, id, to);
-        self.push(record)
+        let mut header = [0; UDP_SEND_HEADER];
+        send::write_udp(&mut header, id, to);
+        self.push(&header, payload)
     }
 
-    fn push(&mut self, record: &[u8]) -> Result<(), SendError> {
-        match self.writer.try_push(record, self.stream, self.next_seq) {
+    fn push(&mut self, header: &[u8], payload: &[u8]) -> Result<(), SendError> {
+        match self
+            .writer
+            .try_push_with_header(header, payload, self.stream, self.next_seq)
+        {
             Ok(()) => {
                 self.next_seq += 1;
                 Ok(())
