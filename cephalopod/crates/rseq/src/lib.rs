@@ -172,8 +172,8 @@ pub enum Push {
 /// 5. It checks that the record and following tag word fit below the cached tail plus the ring
 ///    size. On failure it refreshes the cached tail from `shared_tail` with Acquire and checks once
 ///    more. It stores the record position to the private head.
-/// 6. It writes the length, stream, sequence number, and payload, clears the following tag word,
-///    then stores the position tag.
+/// 6. It writes the length, stream, sequence number, header words, and payload, clears the following
+///    tag word, then stores the position tag.
 ///    The tag store is the commit and the last instruction of the section: before it the consumer
 ///    sees no record at this position, after it the consumer sees the whole record.
 /// 7. The kernel only jumps to an abort handler preceded by the 4-byte signature glibc registered
@@ -193,6 +193,8 @@ pub enum Push {
 /// | 54 | aarch64 optional 16-byte remainder |
 /// | 55 | aarch64 trailing overlapping copy |
 /// | 56 | aarch64 setup for payloads of at least 16 bytes |
+/// | 57 | header-word copy loop |
+/// | 58 | header copy done |
 /// | 59 | room is available |
 /// | 60 | abort handler: result 2, `Aborted` |
 /// | 70 | ring full: result 1, `Full` |
@@ -653,7 +655,12 @@ mod tests {
             seq: 11,
             src: payload.as_ptr(),
             header_len: 24,
-            header: [0x1234_5678_9abc_def0; 4],
+            header: [
+                0x0101_0101_0101_0101,
+                0x0202_0202_0202_0202,
+                0x0303_0303_0303_0303,
+                0x0404_0404_0404_0404,
+            ],
         };
         let needed = total(record.len as usize) as u64;
         let head0 = RING_SIZE as u64 + 64;
@@ -751,7 +758,12 @@ mod tests {
                     seq,
                     src: src.as_ptr(),
                     header_len: header_len as u64,
-                    header: [0x0123_4567_89ab_cdef; 4],
+                    header: [
+                        0x0101_0101_0101_0101,
+                        0x0202_0202_0202_0202,
+                        0x0303_0303_0303_0303,
+                        0x0404_0404_0404_0404,
+                    ],
                 };
 
                 let check = |buffer: &[u64], pos: u64| {

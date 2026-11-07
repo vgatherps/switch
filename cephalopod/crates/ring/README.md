@@ -8,7 +8,7 @@ Used by `ceph-fifo`. Depends on [`ceph-rseq`](../rseq/README.md) for publication
 
 - `Reader::create(Config { ring_size, max_record, dir })`: creates the shared file in `dir` (`/dev/shm`, or a hugetlbfs mount such as `/dev/hugepages`; ignored on macOS). `name()` gives the path writers attach to; `nr_rings()`.
 - Consumer sweep: `poll(&mut Vec<usize>)` lists rings with committed records; `front(ring)`, `committed(ring)`, `view(ring)` read them; `advance(ring)` consumes one; `publish()` makes the consumer's positions visible to writers. The consumer never writes into a ring.
-- `Writer::attach(path)`, `try_push(payload, stream, seq)`, `try_finish(stream, seq)`, returning `Result<(), PushError>` where `PushError` is `Full` or `TooLarge`. On Linux `attach` fails unless the thread has an rseq registration.
+- `Writer::attach(path)`, `try_push(payload, stream, seq)`, `try_push_with_header(header, payload, stream, seq)`, `try_finish(stream, seq)`, returning `Result<(), PushError>` where `PushError` is `Full` or `TooLarge`. On Linux `attach` fails unless the thread has an rseq registration.
 - `END_OF_STREAM` (bit 63 of `seq`) marks a stream's last record; `Header { stream, seq, len }`.
 
 Feature `test-util` adds `Reader::write_unchecked`, used by `ceph-fifo`'s tests.
