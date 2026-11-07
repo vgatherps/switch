@@ -134,7 +134,11 @@ impl Map {
         for i in 0..nr_rings {
             let offset = meta_bytes + i * ring_size;
             let mapping = DoubleMapping::new(fd, offset, ring_size, true)?;
-            let tail = map.meta.as_ptr().wrapping_add(TAILS_OFFSET).cast::<AtomicU64>();
+            let tail = map
+                .meta
+                .as_ptr()
+                .wrapping_add(TAILS_OFFSET)
+                .cast::<AtomicU64>();
             let private = map
                 .meta
                 .as_ptr()
@@ -353,7 +357,14 @@ impl Reader {
         seq: u64,
         payload: &[u8],
     ) -> Result<(), PushError> {
-        write_record(&self.map.rings[ring], self.max_record, stream, seq, payload)
+        write_record(
+            &self.map.rings[ring],
+            self.max_record,
+            stream,
+            seq,
+            &[],
+            payload,
+        )
     }
 }
 
@@ -415,10 +426,26 @@ impl Writer {
     }
 
     pub fn try_push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
-        if payload.len() > self.max_record {
+        self.try_push_with_header(&[], payload, stream, seq)
+    }
+
+    /// Pushes `header` followed by `payload` as one record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the header exceeds 32 bytes or is not a multiple of 8 bytes.
+    pub fn try_push_with_header(
+        &self,
+        header: &[u8],
+        payload: &[u8],
+        stream: u64,
+        seq: u64,
+    ) -> Result<(), PushError> {
+        assert!(header.len() <= 32 && header.len().is_multiple_of(8));
+        if header.len() > self.max_record || payload.len() > self.max_record - header.len() {
             return Err(PushError::TooLarge);
         }
-        self.push(payload, stream, seq)
+        self.push(header, payload, stream, seq)
     }
 
     /// Pushes the stream's last record with an empty payload. The player must keep its socket
@@ -428,7 +455,7 @@ impl Writer {
     }
 
     #[cfg(target_os = "linux")]
-    fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
+    fn push(&self, header: &[u8], payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         let area = ThreadArea::current().expect("attach checked that rseq is registered");
         if area.cpu_id() < 0 {
             panic!("rseq is not registered for this thread");
@@ -440,12 +467,17 @@ impl Writer {
         } else {
             payload.as_ptr()
         };
-        let record = RecordArgs {
-            len: payload.len() as u64,
+        let mut record = RecordArgs {
+            len: (header.len() + payload.len()) as u64,
             stream,
             seq,
             src,
+            header_len: header.len() as u64,
+            header: [0; 4],
         };
+        for (word, bytes) in record.header.iter_mut().zip(header.as_chunks::<8>().0) {
+            *word = u64::from_ne_bytes(*bytes);
+        }
         loop {
             // SAFETY: `table` has one live entry per possible CPU, the source has the required
             // readable span, and create's size check reserves the record and following tag word.
@@ -458,7 +490,7 @@ impl Writer {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
+    fn push(&self, header: &[u8], payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         use std::sync::atomic::Ordering::Relaxed;
 
         static WARN: std::sync::Once = std::sync::Once::new();
@@ -473,7 +505,14 @@ impl Writer {
         while lock.compare_exchange(0, 1, Acquire, Relaxed).is_err() {
             std::hint::spin_loop();
         }
-        let result = write_record(&self.map.rings[0], self.max_record, stream, seq, payload);
+        let result = write_record(
+            &self.map.rings[0],
+            self.max_record,
+            stream,
+            seq,
+            header,
+            payload,
+        );
         lock.store(0, Release);
         result
     }
@@ -485,18 +524,20 @@ fn write_record(
     max_record: usize,
     stream: u64,
     seq: u64,
+    header: &[u8],
     payload: &[u8],
 ) -> Result<(), PushError> {
-    if payload.len() > max_record {
+    if header.len() > max_record || payload.len() > max_record - header.len() {
         return Err(PushError::TooLarge);
     }
+    let len = header.len() + payload.len();
     let ring_size = ring.mapping.len() as u64;
     let private = ring.private();
     let mut at = private.head.load(Relaxed);
     if let Some(header) = ring.header(at, max_record) {
         at += record_total(header.len as u64);
     }
-    let total = record_total(payload.len() as u64);
+    let total = record_total(len as u64);
     if at + total + 8 > ring.shared_tail().load(Acquire) + ring_size {
         return Err(PushError::Full);
     }
@@ -506,15 +547,17 @@ fn write_record(
     unsafe {
         let start = ring.at(at);
         (&*start.add(total as usize).cast::<AtomicU64>()).store(0, Relaxed);
-        start
-            .add(LEN_OFFSET)
-            .cast::<u64>()
-            .write(payload.len() as u64);
+        start.add(LEN_OFFSET).cast::<u64>().write(len as u64);
         start.add(STREAM_OFFSET).cast::<u64>().write(stream);
         start.add(SEQ_OFFSET).cast::<u64>().write(seq);
         ptr::copy_nonoverlapping(
-            payload.as_ptr(),
+            header.as_ptr(),
             start.add(ceph_rseq::HEADER_LEN as usize),
+            header.len(),
+        );
+        ptr::copy_nonoverlapping(
+            payload.as_ptr(),
+            start.add(ceph_rseq::HEADER_LEN as usize + header.len()),
             payload.len(),
         );
         (&*start.add(TAG_OFFSET).cast::<AtomicU64>()).store(tag_for(at), Release);
@@ -540,4 +583,3 @@ fn possible_cpus() -> io::Result<usize> {
     }
     Ok(max + 1)
 }
-

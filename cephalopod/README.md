@@ -52,6 +52,10 @@ loop {
 `session.closed()` turns true once the consumer has handled the last message. On the consumer
 side, dropping a message consumes it.
 
+`try_push_with_header(header, payload, stream, seq)` writes `header ++ payload` into one
+record and publishes it once. The header must be a multiple of 8 bytes and at most 32 bytes
+(otherwise it panics); `max_record` limits the combined length. Neither slice needs headroom.
+
 Runnable versions: `crates/fifo/examples/sequencer.rs` and `crates/fifo/examples/player.rs`.
 
 ## Performance

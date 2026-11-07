@@ -81,3 +81,60 @@ fn reader_owns_name_and_attached_writer_survives_unlink() {
     assert_eq!(error.kind(), ErrorKind::NotFound);
     writer.try_push(b"after unlink", 7, 1).unwrap();
 }
+
+#[test]
+fn header_and_payload_round_trip_across_wrap() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: both affinity sets are initialized before the syscalls read them.
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        assert_eq!(
+            libc::sched_getaffinity(0, size_of_val(&allowed), &mut allowed),
+            0
+        );
+        let cpu = (0..libc::CPU_SETSIZE as usize)
+            .find(|&cpu| libc::CPU_ISSET(cpu, &allowed))
+            .unwrap();
+        let mut pinned: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut pinned);
+        assert_eq!(libc::sched_setaffinity(0, size_of_val(&pinned), &pinned), 0);
+    }
+    let mut reader = Reader::create(Config {
+        ring_size: 64 * 1024,
+        max_record: 100,
+        dir: "/dev/shm".into(),
+    })
+    .unwrap();
+    let writer = Writer::attach(reader.name()).unwrap();
+    let header = [0x37; 24];
+    let payload = [0x91; 73];
+    let expected = [header.as_slice(), payload.as_slice()].concat();
+    for seq in 0..1000 {
+        writer
+            .try_push_with_header(&header, &payload, 11, seq)
+            .unwrap();
+        let mut ready = Vec::new();
+        reader.poll(&mut ready);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(drain(&mut reader, ready[0]), [(11, seq, expected.clone())]);
+    }
+}
+
+#[test]
+fn too_large_counts_header() {
+    let reader = Reader::create(Config {
+        ring_size: 64 * 1024,
+        max_record: 24,
+        dir: "/dev/shm".into(),
+    })
+    .unwrap();
+    let writer = Writer::attach(reader.name()).unwrap();
+    assert_eq!(
+        writer.try_push_with_header(&[0; 24], &[1], 11, 0),
+        Err(ceph_ring::PushError::TooLarge),
+    );
+    assert_eq!(
+        writer.try_push_with_header(&[0; 32], &[], 11, 0),
+        Err(ceph_ring::PushError::TooLarge),
+    );
+}
