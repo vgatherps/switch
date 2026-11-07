@@ -1,6 +1,7 @@
 use super::*;
+use netframe::OwnedFrame;
 use shared_memory::unique_name;
-use std::sync::mpsc;
+use std::rc::Rc;
 use std::thread;
 
 fn ring() -> (Backing, Backing, RingWriter, RingReader) {
@@ -33,8 +34,8 @@ fn record_crosses_physical_end_as_one_slice() {
     let mut record = writer.reserve(expected.len(), meta(0)).unwrap();
     record.payload().copy_from_slice(&expected);
     record.commit();
-    let frame = reader.next().unwrap();
-    assert_eq!(frame.payload(), expected.as_slice());
+    let (_, frame) = reader.next().unwrap();
+    assert_eq!(&*frame, expected.as_slice());
 }
 
 #[test]
@@ -44,9 +45,9 @@ fn reclaim_only_releases_contiguous_prefix() {
     publish(&mut writer, quarter - HEADER_SIZE, 1);
     publish(&mut writer, quarter - HEADER_SIZE, 2);
     publish(&mut writer, 2 * quarter - HEADER_SIZE, 3);
-    let a = reader.next().unwrap();
-    let b = reader.next().unwrap();
-    let c = reader.next().unwrap();
+    let (_, a) = reader.next().unwrap();
+    let (_, b) = reader.next().unwrap();
+    let (_, c) = reader.next().unwrap();
     drop(b);
     drop(c);
     reader.reclaim();
@@ -64,7 +65,7 @@ fn dropping_frame_after_wrap_frees_exact_stride() {
     drop(reader.next().unwrap());
     reader.reclaim();
     publish(&mut writer, 128 - HEADER_SIZE, 1);
-    let held = reader.next().unwrap();
+    let (_, held) = reader.next().unwrap();
     publish(&mut writer, size - 128 - HEADER_SIZE, 2);
     assert!(writer.reserve(0, meta(0)).is_none());
     drop(held);
@@ -85,17 +86,22 @@ fn dropping_frame_after_wrap_frees_exact_stride() {
 
 #[test]
 fn frame_outlives_reader_writer_and_backings() {
-    let frame = {
+    let (frame, shared) = {
         let (producer, consumer, mut writer, mut reader) = ring();
+        let shared = Rc::downgrade(&reader.shared);
         publish(&mut writer, 256, 0xa5);
-        let frame = reader.next().unwrap();
+        let (_, frame) = reader.next().unwrap();
+        assert_eq!(shared.strong_count(), 2, "reader and frame retain the mappings");
         drop(reader);
         drop(writer);
         drop(consumer);
         drop(producer);
-        frame
+        (frame, shared)
     };
-    assert_eq!(frame.payload(), &[0xa5; 256]);
+    assert_eq!(shared.strong_count(), 1, "frame retains the mappings");
+    assert_eq!(&*frame, &[0xa5; 256]);
+    drop(frame);
+    assert!(shared.upgrade().is_none(), "frame releases the mappings");
 }
 
 #[test]
@@ -150,17 +156,18 @@ fn recreate_rejects_active_backing_without_resetting_records() {
     assert!(
         matches!(RingWriter::create(&mut producer, size), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
     );
-    assert_eq!(reader.next().unwrap().payload(), &[0x5a; 128]);
+    let (_, frame) = reader.next().unwrap();
+    assert_eq!(&*frame, &[0x5a; 128]);
 }
 
 fn payload_byte(sequence: u32, offset: usize) -> u8 {
     (sequence.wrapping_mul(37).wrapping_add(offset as u32 * 13) >> (offset % 4)) as u8
 }
 
-fn validate(frame: &RxFrame, sequence: u32) {
-    assert_eq!(frame.meta().slot, sequence, "receive order");
-    assert_eq!(frame.payload().len(), sequence as usize * 73 % 600 + 1);
-    for (offset, &byte) in frame.payload().iter().enumerate() {
+fn validate(meta: &PacketMeta, frame: &OwnedFrame, sequence: u32) {
+    assert_eq!(meta.slot, sequence, "receive order");
+    assert_eq!(frame.len(), sequence as usize * 73 % 600 + 1);
+    for (offset, &byte) in frame.iter().enumerate() {
         assert_eq!(
             byte,
             payload_byte(sequence, offset),
@@ -172,17 +179,10 @@ fn validate(frame: &RxFrame, sequence: u32) {
 #[test]
 fn cross_thread_stress_preserves_held_frames() {
     const COUNT: u32 = 100_000;
-    let (_producer, _consumer, mut writer, mut reader) = ring();
-    let (release_tx, release_rx) = mpsc::sync_channel::<(u32, RxFrame)>(32);
-    let releaser = thread::spawn(move || {
-        let mut released = 0;
-        while let Ok((sequence, frame)) = release_rx.recv() {
-            validate(&frame, sequence);
-            drop(frame);
-            released += 1;
-        }
-        assert!(released > 0);
-    });
+    let name = unique_name("/junction-ring-").unwrap();
+    let mut backing = Backing::create_shm(&name).unwrap();
+    let size = backing.page_size().unwrap();
+    let mut writer = RingWriter::create(&mut backing, size).unwrap();
     let producer = thread::spawn(move || {
         for sequence in 0..COUNT {
             let len = sequence as usize * 73 % 600 + 1;
@@ -198,38 +198,37 @@ fn cross_thread_stress_preserves_held_frames() {
             }
         }
     });
-    let mut held = Vec::with_capacity(32);
-    let mut received = 0;
-    let mut random = 0x1234_5678_u32;
-    while received != COUNT || !held.is_empty() {
-        let mut got_frame = false;
-        if received != COUNT && held.len() < 32 {
-            if let Some(frame) = reader.next() {
-                validate(&frame, received);
-                held.push((received, frame));
-                received += 1;
-                got_frame = true;
+    let consumer = thread::spawn(move || {
+        let backing = Backing::open_shm(&name).unwrap();
+        let mut reader = RingReader::open(&backing).unwrap();
+        let mut held = Vec::with_capacity(32);
+        let mut received = 0;
+        let mut random = 0x1234_5678_u32;
+        while received != COUNT || !held.is_empty() {
+            let mut got_frame = false;
+            if received != COUNT && held.len() < 32 {
+                if let Some((meta, frame)) = reader.next() {
+                    validate(&meta, &frame, received);
+                    held.push((received, meta, frame));
+                    received += 1;
+                    got_frame = true;
+                }
             }
-        }
-        random ^= random << 13;
-        random ^= random >> 17;
-        random ^= random << 5;
-        if !held.is_empty() && (!got_frame || held.len() == 32 || random & 3 == 0) {
-            let index = random as usize % held.len();
-            let (sequence, frame) = held.swap_remove(index);
-            validate(&frame, sequence);
-            if random & 1 == 0 {
-                release_tx.send((sequence, frame)).unwrap();
-            } else {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            if !held.is_empty() && (!got_frame || held.len() == 32 || random & 3 == 0) {
+                let index = random as usize % held.len();
+                let (sequence, meta, frame) = held.swap_remove(index);
+                validate(&meta, &frame, sequence);
                 drop(frame);
             }
+            reader.reclaim();
+            std::hint::spin_loop();
         }
-        reader.reclaim();
-        std::hint::spin_loop();
-    }
+    });
     producer.join().unwrap();
-    drop(release_tx);
-    releaser.join().unwrap();
+    consumer.join().unwrap();
 }
 
 #[cfg(target_os = "linux")]

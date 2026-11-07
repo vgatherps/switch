@@ -54,12 +54,7 @@ fn receive<T>(receiver: &Receiver<T>) -> T {
 }
 
 fn connect(path: &Path, max_sockets: u16) -> Result<Session, ConnectError> {
-    let path = path.to_owned();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(Session::connect(&path, max_sockets));
-    });
-    receive(&rx)
+    Session::connect(path, max_sockets)
 }
 
 fn rx_ring() -> (Backing, RingWriter) {
@@ -1177,7 +1172,7 @@ fn poll_discards_packets_for_aborted_socket_generation_after_reopen() {
     client
         .poll(
             |_, _| panic!("unexpected control event"),
-            |id, frame| packets.push((id, frame.payload().to_vec())),
+            |id, _, frame| packets.push((id, frame.to_vec())),
         )
         .unwrap();
     assert_eq!(packets, [(current, b"current".to_vec())]);

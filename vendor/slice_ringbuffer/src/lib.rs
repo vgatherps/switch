@@ -5,19 +5,21 @@
 //! byte positions in `head`; the consumer publishes reclaimed positions in `tail`.
 //! Records have a 40-byte header and an eight-byte-aligned stride.
 //!
-//! Header/payload writes -> head Release -> reader head Acquire. Frame reads ->
-//! refs fetch_sub Release -> reclaim refs Acquire -> tail Release -> writer tail
-//! Acquire -> overwrite. Nothing else is shared. Create on a fresh backing before
-//! opening it; each ring supports exactly one writer and one reader, ever.
-//! Concurrent initialization through other backing handles or processes is outside the contract.
+//! Header/payload writes -> head Release -> reader head Acquire. After publication,
+//! each plain reference count is accessed only on the client thread; the writer
+//! never reads it. Frame release -> reclaim -> tail Release -> writer tail Acquire
+//! orders those accesses before reuse. Create on a fresh backing before opening
+//! it; each ring supports exactly one writer and one reader, ever. Concurrent
+//! initialization through other backing handles or processes is outside the contract.
 
+use netframe::OwnedFrame;
 use shared_memory::{Backing, DoubleMapping, Mapping};
 use std::convert::TryFrom;
 use std::io;
 use std::mem::{align_of, offset_of, size_of};
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
 
 const MAGIC: u64 = u64::from_le_bytes(*b"JNCTRING");
 const HEADER_SIZE: usize = size_of::<RecordHeader>();
@@ -36,13 +38,15 @@ struct RingHeader {
 
 #[repr(C)]
 struct RecordHeader {
-    refs: AtomicU32,
+    refs: u16,
+    _pad: u16,
     len: u32,
     meta: PacketMeta,
 }
 
 /// Packet metadata stored immediately before a record's payload.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct PacketMeta {
     pub slot: u32,
     pub generation: u32,
@@ -89,6 +93,7 @@ const _: () = {
     assert!(size_of::<RecordHeader>() == 40);
     assert!(align_of::<RecordHeader>() == 8);
     assert!(offset_of!(RecordHeader, refs) == 0);
+    assert!(offset_of!(RecordHeader, _pad) == 2);
     assert!(offset_of!(RecordHeader, len) == 4);
     assert!(offset_of!(RecordHeader, meta) == 8);
     assert!(size_of::<PacketMeta>() == 32);
@@ -198,7 +203,8 @@ impl RingWriter {
                 .add(self.head as usize & (self.size - 1))
                 .cast::<RecordHeader>();
             ptr.write(RecordHeader {
-                refs: AtomicU32::new(1),
+                refs: 1,
+                _pad: 0,
                 len: len as u32,
                 meta,
             });
@@ -247,12 +253,6 @@ struct Shared {
     size: usize,
 }
 
-// SAFETY: mappings are process-wide; record access follows the publication and
-// reclamation contract, and shared mutable fields are accessed only atomically.
-unsafe impl Send for Shared {}
-// SAFETY: frames only read their records; the sole reader updates atomic tail.
-unsafe impl Sync for Shared {}
-
 impl Shared {
     fn header(&self) -> &RingHeader {
         // SAFETY: open validated this page and initialization precedes open.
@@ -275,7 +275,7 @@ impl Shared {
 
 /// The sole consumer; held frames may be released in any order.
 pub struct RingReader {
-    shared: Arc<Shared>,
+    shared: Rc<Shared>,
     read: u64,
     tail: u64,
     cached_head: u64,
@@ -322,7 +322,7 @@ impl RingReader {
             ));
         }
         Ok(Self {
-            shared: Arc::new(Shared { header, data, size }),
+            shared: Rc::new(Shared { header, data, size }),
             read: tail,
             tail,
             cached_head: tail,
@@ -331,7 +331,7 @@ impl RingReader {
 
     /// Takes the next published record, or None if none is available.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<RxFrame> {
+    pub fn next(&mut self) -> Option<(PacketMeta, OwnedFrame)> {
         if self.read == self.cached_head {
             self.cached_head = self.shared.header().head.0.load(Ordering::Acquire);
             if self.read == self.cached_head {
@@ -351,21 +351,29 @@ impl RingReader {
         let stride = stride(len as usize) as u64;
         assert!(stride <= avail, "unpublished record bytes");
         self.read = self.read.wrapping_add(stride);
-        Some(RxFrame {
-            _shared: Arc::clone(&self.shared),
-            len,
-            record,
-        })
+        // SAFETY: publication validated the payload, its count starts at one,
+        // and the retained Rc keeps the mapping alive through the last release.
+        let frame = unsafe {
+            OwnedFrame::from_raw_parts(
+                NonNull::new_unchecked(record.as_ptr().cast::<u8>().add(HEADER_SIZE)),
+                len,
+                NonNull::new_unchecked(std::ptr::addr_of_mut!((*record.as_ptr()).refs)),
+                ring_release,
+                Rc::into_raw(Rc::clone(&self.shared)).cast_mut().cast(),
+            )
+        };
+        // SAFETY: the live frame prevents reuse of this published metadata.
+        Some((unsafe { record.as_ref() }.meta, frame))
     }
 
     /// Publishes only the contiguous released prefix of records already read.
     pub fn reclaim(&mut self) {
         let old_tail = self.tail;
         while self.tail != self.read {
-            // SAFETY: this record was read and has not yet been reclaimed; its
-            // length is immutable, and refs Acquire observes the frame's last read.
+            // SAFETY: this record was read and has not yet been reclaimed. Its
+            // length is immutable; only this thread accesses the published count.
             let record = unsafe { self.shared.record(self.tail).as_ref() };
-            if record.refs.load(Ordering::Acquire) != 0 {
+            if record.refs != 0 {
                 break;
             }
             let stride = stride(record.len as usize) as u64;
@@ -385,41 +393,12 @@ impl RingReader {
     }
 }
 
-/// An owned, immutable record that keeps its mappings alive. Not Clone or Sync.
-pub struct RxFrame {
-    _shared: Arc<Shared>,
-    len: u32,
-    record: NonNull<RecordHeader>,
-}
-
-// SAFETY: the owned record remains published until this sole frame releases it;
-// the Arc keeps both mappings alive on whichever thread receives the frame.
-unsafe impl Send for RxFrame {}
-
-impl RxFrame {
-    pub fn meta(&self) -> &PacketMeta {
-        // SAFETY: the frame's live ref prevents reclaim, and _shared owns the mapping.
-        unsafe { &self.record.as_ref().meta }
-    }
-
-    pub fn payload(&self) -> &[u8] {
-        // SAFETY: publication validated the length, the record is contiguous, and
-        // its live ref prevents the producer from overwriting any payload byte.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.record.as_ptr().cast::<u8>().add(HEADER_SIZE),
-                self.len as usize,
-            )
-        }
-    }
-}
-
-impl Drop for RxFrame {
-    fn drop(&mut self) {
-        // SAFETY: the frame's owning Arc remains live through this final access.
-        unsafe { self.record.as_ref() }
-            .refs
-            .fetch_sub(1, Ordering::Release);
+unsafe extern "C" fn ring_release(rc: NonNull<u16>, ctx: *mut ()) {
+    // SAFETY: the last frame owns this count and the Rc retained by next().
+    // Zero is visible to reclaim on this thread before its tail Release store.
+    unsafe {
+        rc.as_ptr().write(0);
+        drop(Rc::from_raw(ctx.cast::<Shared>()));
     }
 }
 

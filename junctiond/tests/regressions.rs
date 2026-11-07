@@ -3,7 +3,7 @@ use std::time::Instant as WallInstant;
 use dpdk_smoltcp::smoltcp::{socket::tcp::State, time::Duration};
 use dpdk_smoltcp::TcpHandle;
 use junction::control::{Event, SocketId};
-use junction::rx::RxFrame;
+use junction::rx::OwnedFrame;
 use junction::send::TCP_SEND_HEADER;
 use junction::session::Session;
 use zhida_test_kit::with_eal;
@@ -19,20 +19,20 @@ fn hold_partial_tcp_frame(
     events: &mut Vec<(SocketId, Event)>,
     id: SocketId,
     peer: &TcpHandle,
-) -> Vec<RxFrame> {
+) -> Vec<OwnedFrame> {
     assert_eq!(f.peer.tcp_mut(peer).send_slice(&[0x5a; 8000]), Ok(8000));
     let mut held = Vec::new();
     let deadline = WallInstant::now() + WAIT;
     while held.is_empty() || f.peer.tcp(peer).send_queue() != 0 {
         assert!(WallInstant::now() < deadline, "jumbo data was not acknowledged");
-        f.round_receive(client, events, |received_id, frame| {
+        f.round_receive(client, events, |received_id, _, frame| {
             assert_eq!(received_id, id);
             held.push(frame);
         });
     }
-    assert!(held.iter().map(|frame| frame.payload().len()).sum::<usize>() < 8000);
+    assert!(held.iter().map(|frame| frame.len()).sum::<usize>() < 8000);
     for _ in 0..4 {
-        f.round_receive(client, events, |_, _| panic!("held ring was reclaimed"));
+        f.round_receive(client, events, |_, _, _| panic!("held ring was reclaimed"));
     }
     held
 }

@@ -24,7 +24,7 @@ use ceph_ring::Writer;
 use shared_memory::Backing;
 use slice_ringbuffer::RingReader;
 
-use crate::rx::RxFrame;
+use crate::rx::{OwnedFrame, PacketMeta};
 
 use crate::control::{
     ClientMessage, ConfigError, DecodeError, EndReason, Event, HostMessage, ListenEndpoint, Op,
@@ -566,11 +566,10 @@ impl Session {
     pub fn poll(
         &mut self,
         on_event: impl FnMut(SocketId, Event),
-        mut on_packet: impl FnMut(SocketId, RxFrame),
+        mut on_packet: impl FnMut(SocketId, PacketMeta, OwnedFrame),
     ) -> Result<(), Lost> {
         self.poll_events(on_event)?;
-        while let Some(frame) = self.rx.next() {
-            let meta = frame.meta();
+        while let Some((meta, frame)) = self.rx.next() {
             let id = SocketId {
                 slot: meta.slot,
                 generation: meta.generation,
@@ -580,7 +579,7 @@ impl Session {
                 .get(id.slot as usize)
                 .is_some_and(|slot| slot.state != State::Free && slot.generation == id.generation)
             {
-                on_packet(id, frame);
+                on_packet(id, meta, frame);
             }
         }
         self.rx.reclaim();

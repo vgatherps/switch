@@ -43,30 +43,30 @@ fn pending_udp_sockets_rotate_before_a_flood_can_refill_the_ring() {
         let deadline = Instant::now() + WAIT;
         while held.len() < 3 {
             assert!(Instant::now() < deadline, "A did not fill the ring");
-            f.round_receive(&mut client, &mut events, |id, frame| {
+            f.round_receive(&mut client, &mut events, |id, _, frame| {
                 assert_eq!(id, a);
                 held.push(frame);
             });
         }
         f.peer.udp_send(&peer, Some(to_b), &[0xbb; 1200]).unwrap();
         for _ in 0..4 {
-            f.round_receive(&mut client, &mut events, |_, _| {
+            f.round_receive(&mut client, &mut events, |_, _, _| {
                 panic!("held ring was reclaimed")
             });
         }
         drop(held);
         client
-            .poll(|id, event| events.push((id, event)), |_, _| {})
+            .poll(|id, event| events.push((id, event)), |_, _, _| {})
             .unwrap();
         let mut received_b = false;
         for _ in 0..4 {
             for _ in 0..6 {
                 f.peer.udp_send(&peer, Some(to_a), &flood).unwrap();
             }
-            f.round_receive(&mut client, &mut events, |id, frame| {
-                assert_eq!(frame.meta().kind, UDP);
+            f.round_receive(&mut client, &mut events, |id, meta, frame| {
+                assert_eq!(meta.kind, UDP);
                 if id == b {
-                    assert_eq!(frame.payload(), &[0xbb; 1200]);
+                    assert_eq!(&*frame, &[0xbb; 1200]);
                     received_b = true;
                 } else {
                     assert_eq!(id, a);
@@ -106,26 +106,26 @@ fn jumbo_tcp_frame_resumes_at_its_offset_and_oversized_udp_is_counted() {
                 Instant::now() < deadline,
                 "first jumbo chunk was not published"
             );
-            f.round_receive(&mut client, &mut events, |id, frame| {
+            f.round_receive(&mut client, &mut events, |id, meta, frame| {
                 assert_eq!(id, tcp_id);
-                assert_eq!(frame.meta().kind, TCP);
+                assert_eq!(meta.kind, TCP);
                 assert!(held.is_none());
-                assert!(frame.payload().len() < payload.len());
+                assert!(frame.len() < payload.len());
                 held = Some(frame);
             });
         }
         for _ in 0..4 {
-            f.round_receive(&mut client, &mut events, |_, _| {
+            f.round_receive(&mut client, &mut events, |_, _, _| {
                 panic!("held jumbo chunk was reclaimed")
             });
         }
-        let mut received = held.take().unwrap().payload().to_vec();
+        let mut received = held.take().unwrap().to_vec();
         while received.len() < payload.len() {
             assert!(Instant::now() < deadline, "remaining jumbo chunk was lost");
-            f.round_receive(&mut client, &mut events, |id, frame| {
+            f.round_receive(&mut client, &mut events, |id, meta, frame| {
                 assert_eq!(id, tcp_id);
-                assert_eq!(frame.meta().kind, TCP);
-                received.extend_from_slice(frame.payload());
+                assert_eq!(meta.kind, TCP);
+                received.extend_from_slice(&frame);
             });
         }
         assert_eq!(
@@ -150,7 +150,7 @@ fn jumbo_tcp_frame_resumes_at_its_offset_and_oversized_udp_is_counted() {
         let to = IpEndpoint::new(net_ip().into(), LOCAL_PORT + 1);
         f.peer.udp_send(&peer, Some(to), &payload).unwrap();
         for _ in 0..4 {
-            f.round_receive(&mut client, &mut events, |_, _| {
+            f.round_receive(&mut client, &mut events, |_, _, _| {
                 panic!("oversized UDP was published")
             });
         }
@@ -167,9 +167,9 @@ fn jumbo_tcp_frame_resumes_at_its_offset_and_oversized_udp_is_counted() {
                 Instant::now() < deadline,
                 "UDP socket did not survive oversized datagram"
             );
-            f.round_receive(&mut client, &mut events, |packet_id, frame| {
+            f.round_receive(&mut client, &mut events, |packet_id, _, frame| {
                 assert_eq!(packet_id, id);
-                assert_eq!(frame.payload(), b"still live");
+                assert_eq!(&*frame, b"still live");
                 live = true;
             });
         }

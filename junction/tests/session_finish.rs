@@ -47,35 +47,39 @@ impl RawHost {
             NEXT_PATH.fetch_add(1, Ordering::Relaxed)
         ));
         let listener = UnixListener::bind(&path).unwrap();
-        let client_path = path.clone();
-        let client = thread::spawn(move || Session::connect(&client_path, 1).unwrap());
-        let (mut socket, _) = listener.accept().unwrap();
-        socket.set_read_timeout(Some(WAIT)).unwrap();
-        socket.set_write_timeout(Some(WAIT)).unwrap();
-        let mut hello = [0; 16];
-        socket.read_exact(&mut hello).unwrap();
-        assert_eq!(
-            ClientMessage::decode(&hello),
-            Ok(Some((
-                ClientMessage::Hello {
-                    version: VERSION,
-                    max_sockets: 1
-                },
-                16
-            )))
-        );
-        let mut bytes = Vec::new();
-        HostMessage::Welcome(Welcome {
-            version: VERSION,
-            status: WelcomeStatus::Ok,
-            stream: STREAM,
-            max_record: 256,
-            ingress: reader.name().to_owned(),
-            rx: rx_backing.name().to_owned(),
-        })
-        .encode(&mut bytes);
-        socket.write_all(&bytes).unwrap();
-        let session = client.join().unwrap();
+        let ingress = reader.name().to_owned();
+        let rx = rx_backing.name().to_owned();
+        let host = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(WAIT)).unwrap();
+            socket.set_write_timeout(Some(WAIT)).unwrap();
+            let mut hello = [0; 16];
+            socket.read_exact(&mut hello).unwrap();
+            assert_eq!(
+                ClientMessage::decode(&hello),
+                Ok(Some((
+                    ClientMessage::Hello {
+                        version: VERSION,
+                        max_sockets: 1
+                    },
+                    16
+                )))
+            );
+            let mut bytes = Vec::new();
+            HostMessage::Welcome(Welcome {
+                version: VERSION,
+                status: WelcomeStatus::Ok,
+                stream: STREAM,
+                max_record: 256,
+                ingress,
+                rx,
+            })
+            .encode(&mut bytes);
+            socket.write_all(&bytes).unwrap();
+            socket
+        });
+        let session = Session::connect(&path, 1).unwrap();
+        let socket = host.join().unwrap();
         (
             Self {
                 path,

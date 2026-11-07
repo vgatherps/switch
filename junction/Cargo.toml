@@ -9,6 +9,7 @@ description = "Junction host control protocol"
 ceph-ring.workspace = true
 ceph-proto.workspace = true
 libc.workspace = true
+netframe.workspace = true
 shared-memory.workspace = true
 slice_ringbuffer.workspace = true
 

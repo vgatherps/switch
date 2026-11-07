@@ -15,7 +15,7 @@ use dpdk_smoltcp::smoltcp::{socket::tcp, time::Instant, wire::Ipv4Address};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
 use junction::control::{Event, ListenEndpoint, Op, SocketId, TcpConfig, UdpConfig};
 use junction::host::{ControlChannels, ControlConfig, EndHow, FromNetwork, HostControl, ToNetwork};
-use junction::rx::RxFrame;
+use junction::rx::{OwnedFrame, PacketMeta};
 use junction::send::TCP_SEND_HEADER;
 use junction::session::Session;
 use junctiond::network::{Network, NetworkConfig};
@@ -561,7 +561,7 @@ impl Fixture {
         &mut self,
         client: &mut Session,
         events: &mut Vec<(SocketId, Event)>,
-        on_packet: impl FnMut(SocketId, RxFrame),
+        on_packet: impl FnMut(SocketId, PacketMeta, OwnedFrame),
     ) -> bool {
         self.turn_network();
         client
