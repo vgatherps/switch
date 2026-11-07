@@ -37,6 +37,8 @@ members = [
     # NIC hardware RX stamp → now latency on the CPU's invariant counter
     # shared-memory backing and single/double mappings
     "shared-memory",
+    # shared packet frames
+    "netframe",
     # junction (host control protocol and client session)
     "junction",
     "junctiond",
@@ -74,6 +76,7 @@ depot = { path = "depot" }
 dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
 junction = { path = "junction" }
 junctiond = { path = "junctiond" }
+netframe = { path = "netframe" }
 relay = { path = "relay" }
 sheath = { path = "sheath" }
 shared-memory = { path = "shared-memory" }
