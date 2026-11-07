@@ -58,6 +58,24 @@ fn reclaim_only_releases_contiguous_prefix() {
 }
 
 #[test]
+fn cloned_frame_blocks_reclaim_until_the_last_drop() {
+    let (_producer, _consumer, mut writer, mut reader) = ring();
+    let len = writer.max_payload();
+    publish(&mut writer, len, 0x5a);
+    let (_, frame) = reader.next().unwrap();
+    let frame = frame.freeze();
+    let first = frame.clone();
+    let last = frame.clone();
+    drop(frame);
+    drop(first);
+    reader.reclaim();
+    assert!(writer.reserve(len, meta(0)).is_none(), "last clone must block reuse");
+    drop(last);
+    reader.reclaim();
+    assert!(writer.reserve(len, meta(0)).is_some(), "last drop must free the ring");
+}
+
+#[test]
 fn dropping_frame_after_wrap_frees_exact_stride() {
     let (_producer, _consumer, mut writer, mut reader) = ring();
     let size = reader.shared.size;

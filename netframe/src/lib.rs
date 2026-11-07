@@ -73,8 +73,11 @@ impl OwnedFrame {
     /// Takes ownership of a producer's packet storage.
     ///
     /// # Safety
-    /// `*rc == 1` and the count is owned by this frame. `rc` is at a lower address
-    /// than `data` in the same allocation, with `(data - rc) + len <= u32::MAX`.
+    /// `*rc == 1` and the count is owned by this frame. `rc` must be aligned for
+    /// `u16`, and the whole count must precede the payload:
+    /// `rc.as_ptr().cast::<u8>().add(2) <= data.as_ptr()`. Both pointers must be
+    /// derived from the same allocation pointer, so subtracting the stored offset
+    /// from `data` can reach the count, with `(data - rc) + len <= u32::MAX`.
     /// `data..data+len` is valid for reads and writes while the count is nonzero.
     /// Nothing else touches the count. `release(rc, ctx)` releases the storage
     /// and runs once, on this thread.
@@ -186,7 +189,7 @@ extern crate std;
 mod tests {
     use super::*;
     use std::boxed::Box;
-    use std::cell::{Cell, RefCell};
+    use std::cell::Cell;
 
     #[repr(C)]
     struct Storage {
@@ -198,17 +201,18 @@ mod tests {
     struct Producer {
         releases: Cell<usize>,
         released_count: Cell<u16>,
-        storage: RefCell<Option<Box<Storage>>>,
+        storage: Cell<Option<NonNull<Storage>>>,
     }
 
     impl Producer {
         fn frame(&self) -> OwnedFrame {
-            let mut storage = Box::new(Storage { refs: 1, bytes: *b"abcdefgh" });
-            let rc = NonNull::from(&mut storage.refs);
-            let data = NonNull::from(&mut storage.bytes).cast();
-            *self.storage.borrow_mut() = Some(storage);
-            // SAFETY: storage is stable, exclusively owned, and retained until release.
+            let storage = Box::into_raw(Box::new(Storage { refs: 1, bytes: *b"abcdefgh" }));
+            self.storage.set(NonNull::new(storage));
+            // SAFETY: both field pointers derive from the same live allocation.
+            // The producer retains its raw pointer until the last release.
             unsafe {
+                let rc = NonNull::new_unchecked(core::ptr::addr_of_mut!((*storage).refs));
+                let data = NonNull::new_unchecked(core::ptr::addr_of_mut!((*storage).bytes).cast());
                 OwnedFrame::from_raw_parts(data, 8, rc, release, (self as *const Self).cast_mut().cast())
             }
         }
@@ -220,7 +224,8 @@ mod tests {
         // SAFETY: the last frame still owns the storage during this callback.
         producer.released_count.set(unsafe { rc.as_ptr().read() });
         producer.releases.set(producer.releases.get() + 1);
-        producer.storage.borrow_mut().take();
+        // SAFETY: this is the pointer returned by Box::into_raw, released once.
+        drop(unsafe { Box::from_raw(producer.storage.take().unwrap().as_ptr()) });
     }
 
     #[test]

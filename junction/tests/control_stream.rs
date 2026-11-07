@@ -53,10 +53,6 @@ fn receive<T>(receiver: &Receiver<T>) -> T {
         .expect("channel timed out or disconnected")
 }
 
-fn connect(path: &Path, max_sockets: u16) -> Result<Session, ConnectError> {
-    Session::connect(path, max_sockets)
-}
-
 fn rx_ring() -> (Backing, RingWriter) {
     let name = unique_name("jnct-rx-test").unwrap();
     #[cfg(target_os = "linux")]
@@ -130,7 +126,7 @@ impl Host {
     }
 
     fn open(&self, max_sockets: u16) -> (Session, u64) {
-        let session = connect(&self.path, max_sockets).unwrap();
+        let session = Session::connect(&self.path, max_sockets).unwrap();
         // Welcome must not be visible until both Open messages have been sent.
         let (stream, actual) =
             self.opened(self.network.try_recv().expect("Open must precede Welcome"));
@@ -556,7 +552,7 @@ fn kick_uses_abort_teardown() {
 #[test]
 fn finish_waits_for_fifo_and_network_retirement() {
     let mut host = Host::new(2, 2);
-    let mut client = connect(&host.path, 1).unwrap();
+    let mut client = Session::connect(&host.path, 1).unwrap();
     let (session, _) = host.opened(host.network.try_recv().unwrap());
     let mut fifo = Fifo::new(
         host.reader.take().unwrap(),
@@ -601,7 +597,7 @@ fn finish_waits_for_fifo_and_network_retirement() {
 #[test]
 fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
     let mut host = Host::new(2, 2);
-    let mut client = connect(&host.path, 2).unwrap();
+    let mut client = Session::connect(&host.path, 2).unwrap();
     let (session, _) = host.opened(host.network.try_recv().unwrap());
     let mut fifo = Fifo::new(
         host.reader.take().unwrap(),
@@ -751,13 +747,13 @@ fn welcomes_reject_invalid_version_limits_and_full_host() {
     assert_eq!(stream.read(&mut [0]).unwrap(), 0);
     for max in [0, 3] {
         assert!(matches!(
-            connect(&host.path, max),
+            Session::connect(&host.path, max),
             Err(ConnectError::Rejected(WelcomeStatus::BadMaxSockets))
         ));
     }
     let (_client, _) = handshake(&host, 2);
     assert!(matches!(
-        connect(&host.path, 1),
+        Session::connect(&host.path, 1),
         Err(ConnectError::Rejected(WelcomeStatus::SessionsFull))
     ));
     assert!(host.network.try_recv().is_err());
@@ -937,7 +933,7 @@ fn client_reports_host_version_mismatch_before_attaching() {
         socket.write_all(&bytes).unwrap();
     });
     assert!(
-        matches!(connect(&path, 1), Err(ConnectError::Version { host }) if host == VERSION + 1)
+        matches!(Session::connect(&path, 1), Err(ConnectError::Version { host }) if host == VERSION + 1)
     );
     worker.join().unwrap();
     std::fs::remove_file(path).unwrap();
@@ -1056,7 +1052,7 @@ fn client_reports_second_welcome_malformed_bytes_and_unfinished_eof() {
             }
             socket.write_all(&bytes).unwrap();
         });
-        let mut client = connect(&path, 1).unwrap();
+        let mut client = Session::connect(&path, 1).unwrap();
         until(
             || match (case, client.poll_events(|_, _| panic!("unexpected event"))) {
                 (_, Ok(())) => false,
