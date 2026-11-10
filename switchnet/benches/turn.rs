@@ -16,9 +16,9 @@
 //!   each timed turn. The turn takes it in, fires that socket's token, checks
 //!   that one socket and wakes its task. Untimed per iteration: the peer's
 //!   send and turn, the link to the Net, the woken task's poll, and the link
-//!   back; for TCP, whenever the peer has no free send frame slot (its bytes
-//!   wait for the Net's delayed ACK), rounds with the clock past the 10 ms
-//!   delayed ACK until nothing moves.
+//!   back; for TCP, whenever the peer's send is refused for lack of frames
+//!   (its bytes wait for the Net's delayed ACK), rounds with the clock past
+//!   the 10 ms delayed ACK until nothing moves.
 //!
 //! Two net_ring ports, 16-slot rings; the clock stays at `T0` except for the
 //! TCP flushes. UDP keeps the clock still, so the peer's neighbor entry for
@@ -179,10 +179,12 @@ impl Source {
     fn send(&self, bench: &mut Bench, target: usize) {
         match self {
             Source::Tcp(peers) => {
-                if bench.peer.tcp(&peers[target]).frame_send_room() == 0 {
+                let mut sent = bench.peer.tcp_mut(&peers[target]).send_slice(b"x");
+                if sent == Ok(0) {
                     bench.flush();
+                    sent = bench.peer.tcp_mut(&peers[target]).send_slice(b"x");
                 }
-                assert_eq!(bench.peer.tcp_mut(&peers[target]).send_slice(b"x"), Ok(1));
+                assert_eq!(sent, Ok(1));
             }
             Source::Udp(handle) => {
                 let to = Some(IpEndpoint::new(Side::A.ip().into(), UDP_BASE + target as u16));
