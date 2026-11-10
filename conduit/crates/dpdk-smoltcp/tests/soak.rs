@@ -165,10 +165,11 @@ impl Stream {
             };
             let count = mss
                 .min(room)
-                .min(frame.capacity())
+                .min(frame.len())
                 .min(usize::try_from(end.checked_sub(self.accepted).unwrap()).unwrap());
-            fill(&mut frame.room_mut()[..count], self.accepted, self.seed);
-            frame.set_len(count);
+            fill(&mut frame.as_mut()[..count], self.accepted, self.seed);
+            frame.truncate(count);
+            let frame = frame.freeze();
             if let Err((_, error)) = stack.tcp_send_frame(handle, frame) {
                 panic!("frame of {count} bytes within frame_send_room refused: {error}");
             }
@@ -208,10 +209,11 @@ impl Datagrams {
             let seed = self.seeds[index];
             let Some(mut frame) = stack.tx_frame() else { break };
             let len = udp_length(sequence, seed);
-            let bytes = &mut frame.room_mut()[..len];
+            let bytes = &mut frame.as_mut()[..len];
             bytes[..8].copy_from_slice(&sequence.to_le_bytes());
             fill(&mut bytes[8..], 0, mix(sequence ^ seed));
-            frame.set_len(len);
+            frame.truncate(len);
+            let frame = frame.freeze();
             let to = Some(IpEndpoint::new(side.other().ip().into(), UDP_PORT));
             match stack.udp_send_frame(&self.handles[index], to, frame) {
                 Ok(()) => self.sent[index] = sequence.checked_add(1).unwrap(),

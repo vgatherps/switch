@@ -48,32 +48,32 @@ fn finish(fixture: RingPort, port: Port) {
 }
 
 #[zhida_test_support::pinned_test]
-fn tx_frame_allocates_empty_frames_until_the_pool_is_empty() {
+fn tx_frame_allocates_full_capacity_frames_until_the_pool_is_empty() {
     with_eal(|eal| {
         let fixture = RingPort::new("frame_alloc", 16, 16);
         let mut stack = stack(fixture.open(eal), 8);
         let mut frames = Vec::new();
         while let Some(frame) = stack.tx_frame() {
-            assert_eq!(frame.len(), 0);
             // IP MTU 1500 − 28: the largest UDP payload.
-            assert_eq!(frame.capacity(), 1472);
+            assert_eq!(frame.len(), 1472);
             frames.push(frame);
         }
         // The kit's frame pool holds 63.
         assert_eq!(frames.len(), 63);
         assert_eq!(fixture.frame_in_use(), 63);
-        let origin = frames[0].origin();
-        assert!(frames.iter().all(|frame| frame.origin() == origin));
+        let origin = frames[0].ctx();
+        assert!(frames.iter().all(|frame| frame.ctx() == origin));
 
         let mut frame = frames.pop().unwrap();
         let payload = b"frame payload";
-        frame.room_mut()[..payload.len()].copy_from_slice(payload);
-        frame.set_len(payload.len());
-        assert_eq!(frame.payload(), payload);
+        frame.as_mut()[..payload.len()].copy_from_slice(payload);
+        frame.truncate(payload.len());
+        let frame = frame.freeze();
+        assert_eq!(frame.as_ref(), payload);
         drop(frame);
         assert_eq!(fixture.frame_in_use(), 62);
         let again = stack.tx_frame().expect("a dropped frame returns to the pool");
-        assert_eq!(again.len(), 0);
+        assert_eq!(again.len(), 1472);
         assert!(stack.tx_frame().is_none());
         drop((again, frames));
         assert_eq!(fixture.frame_in_use(), 0);
@@ -186,9 +186,10 @@ fn frames_outlive_stack_via_into_port() {
         let (port, error) = port.try_close().unwrap_err();
         assert_eq!(error, PortError::OutstandingBuffers { rx: 0, tx: 0, frame: 1 });
         // The Port is closed; the frame is still the application's.
-        frame.room_mut()[..4].copy_from_slice(b"live");
-        frame.set_len(4);
-        assert_eq!(frame.payload(), b"live");
+        frame.as_mut()[..4].copy_from_slice(b"live");
+        frame.truncate(4);
+        let frame = frame.freeze();
+        assert_eq!(frame.as_ref(), b"live");
         drop(frame);
         assert_eq!(fixture.frame_in_use(), 0);
         port.try_close().unwrap();
@@ -239,9 +240,10 @@ fn port_drop_child() {
         // Cleanup refused (one frame out) and retained every pool.
         assert!(fixture.pools_exist());
         assert_eq!(fixture.frame_in_use(), 1);
-        frame.room_mut()[..4].copy_from_slice(b"kept");
-        frame.set_len(4);
-        assert_eq!(frame.payload(), b"kept");
+        frame.as_mut()[..4].copy_from_slice(b"kept");
+        frame.truncate(4);
+        let frame = frame.freeze();
+        assert_eq!(frame.as_ref(), b"kept");
         drop(frame);
         assert_eq!(fixture.frame_in_use(), 0);
         fixture.assert_returned_exactly_once();

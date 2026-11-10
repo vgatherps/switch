@@ -28,8 +28,9 @@ fn send_frames(stack: &mut Stack, handle: &TcpHandle, data: &[u8], sent: &mut us
             break;
         };
         let len = (data.len() - *sent).min(mss).min(room);
-        frame.room_mut()[..len].copy_from_slice(&data[*sent..*sent + len]);
-        frame.set_len(len);
+        frame.as_mut()[..len].copy_from_slice(&data[*sent..*sent + len]);
+        frame.truncate(len);
+        let frame = frame.freeze();
         if let Err((_, error)) = stack.tcp_send_frame(handle, frame) {
             panic!("frame within frame_send_room refused: {error}");
         }
@@ -179,8 +180,9 @@ fn lost_broadcast_segment_retransmits_by_copy() {
         let conns = many::open(&mut pair, 0..2, 4096);
         let payload = pattern(500, 8);
         let mut frame = pair.a.tx_frame().unwrap();
-        frame.room_mut()[..payload.len()].copy_from_slice(&payload);
-        frame.set_len(payload.len());
+        frame.as_mut()[..payload.len()].copy_from_slice(&payload);
+        frame.truncate(payload.len());
+        let frame = frame.freeze();
         let lost_port = many::CLIENT_BASE + conns[0].id;
         let mut dropped = false;
         pair.a_to_b.impair(move |bytes| {
@@ -228,7 +230,7 @@ fn lost_broadcast_segment_retransmits_by_copy() {
         assert_eq!(pair.a_to_b.dropped, 1);
         assert_eq!(retransmitted, std::slice::from_ref(&payload));
         assert!(received.iter().all(|r| *r == payload));
-        assert_eq!(frame.payload(), payload);
+        assert_eq!(frame.as_ref(), payload);
         drop(frame);
         assert_eq!(pair.close(), 0);
     });

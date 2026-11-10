@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use switchnet::tcp::{self, State};
-use switchnet::{IpEndpoint, NetHandle, RecvError, SendError, SendFrameError, TcpTx, TxFrame};
+use switchnet::{IpEndpoint, NetHandle, RecvError, SendError, SendFrameError, TcpTx, ImmutableFrame};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
@@ -27,11 +27,11 @@ fn stalling_config() -> tcp::Config {
 }
 
 /// `data` in a fresh frame from `handle`.
-async fn filled(handle: &NetHandle, data: &[u8]) -> TxFrame {
+async fn filled(handle: &NetHandle, data: &[u8]) -> ImmutableFrame {
     let mut frame = handle.tx_frame().await;
-    frame.room_mut()[..data.len()].copy_from_slice(data);
-    frame.set_len(data.len());
-    frame
+    frame.as_mut()[..data.len()].copy_from_slice(data);
+    frame.truncate(data.len());
+    frame.freeze()
 }
 
 /// `data` in frames of `CHUNK` bytes, each sent after `room` resolves.
@@ -132,13 +132,13 @@ fn try_send_full_returns_the_same_frame() {
             loop {
                 let chunk = pattern(CHUNK, sent.len() as u32);
                 let frame = filled(&handle, &chunk).await;
-                let at = frame.payload().as_ptr();
+                let at = frame.as_ref().as_ptr();
                 match tx.try_send(frame) {
                     Ok(()) => sent.extend_from_slice(&chunk),
                     Err((frame, error)) => {
                         assert_eq!(error, SendFrameError::Full);
-                        assert_eq!(frame.payload().as_ptr(), at, "a different frame came back");
-                        assert_eq!(frame.payload(), &chunk[..]);
+                        assert_eq!(frame.as_ref().as_ptr(), at, "a different frame came back");
+                        assert_eq!(frame.as_ref(), &chunk[..]);
                         tx.room(frame.len()).await.unwrap();
                         tx.try_send(frame).map_err(|(_, error)| error).unwrap();
                         sent.extend_from_slice(&chunk);

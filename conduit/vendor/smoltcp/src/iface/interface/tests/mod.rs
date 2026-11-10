@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 mod ipv4;
 mod next_hop;
 mod poll_at_cache;
@@ -28,21 +30,21 @@ struct CountingFrameToken<'a>(&'a mut usize);
 impl crate::phy::FrameToken for CountingFrameToken<'_> {
     fn consume(
         self,
-        frame: crate::phy::TxBuf,
+        frame: crate::phy::ImmutableFrame,
         header_len: usize,
         _: Option<crate::phy::TxChecksum>,
     ) {
-        let _ = frame.packet(header_len);
+        let _ = unsafe { crate::phy::frame_packet(&frame, header_len) };
         *self.0 += 1;
     }
 
     fn consume_retain(
         self,
-        frame: crate::phy::TxBuf,
+        frame: crate::phy::ImmutableFrame,
         header_len: usize,
         _: Option<crate::phy::TxChecksum>,
-    ) -> crate::phy::TxBuf {
-        let _ = frame.packet(header_len);
+    ) -> crate::phy::ImmutableFrame {
+        let _ = unsafe { crate::phy::frame_packet(&frame, header_len) };
         *self.0 += 1;
         frame
     }
@@ -163,7 +165,7 @@ fn capacity_from_config() {
     let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0, 0, 0, 0, 0, 1]));
     let mut config = Config::new(hardware_addr);
     config.neighbor_capacity = 2;
-    let mut device = Loopback::new(Medium::Ethernet);
+    let mut device = Loopback::new(Medium::Ethernet, crate::phy::TxSource::new(crate::phy::TxPool::new(65535)));
     let mut iface = Interface::new(config, &mut device, Instant::ZERO);
     let addresses = [
         Ipv4Address::new(192, 0, 2, 1).into(),
@@ -208,7 +210,7 @@ fn zero_neighbor_capacity_panics() {
     let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0, 0, 0, 0, 0, 1]));
     let mut config = Config::new(hardware_addr);
     config.neighbor_capacity = 0;
-    let mut device = Loopback::new(Medium::Ethernet);
+    let mut device = Loopback::new(Medium::Ethernet, crate::phy::TxSource::new(crate::phy::TxPool::new(65535)));
     Interface::new(config, &mut device, Instant::ZERO);
 }
 
@@ -216,14 +218,14 @@ fn zero_neighbor_capacity_panics() {
 #[should_panic(expected = "is not unicast and nonzero")]
 fn zero_mac_panics() {
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress([0; 6])));
-    Interface::new(config, &mut Loopback::new(Medium::Ethernet), Instant::ZERO);
+    Interface::new(config, &mut Loopback::new(Medium::Ethernet, crate::phy::TxSource::new(crate::phy::TxPool::new(65535))), Instant::ZERO);
 }
 
 #[test]
 #[should_panic(expected = "is not unicast and nonzero")]
 fn multicast_mac_panics() {
     let config = Config::new(HardwareAddress::Ethernet(EthernetAddress([1, 0, 0x5e, 0, 0, 1])));
-    Interface::new(config, &mut Loopback::new(Medium::Ethernet), Instant::ZERO);
+    Interface::new(config, &mut Loopback::new(Medium::Ethernet, crate::phy::TxSource::new(crate::phy::TxPool::new(65535))), Instant::ZERO);
 }
 
 #[test]

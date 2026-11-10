@@ -287,9 +287,10 @@ fn send_pattern(stack: &mut Stack, handle: &TcpHandle, key: u64, from: usize, to
         let Some(mut frame) = stack.tx_frame() else {
             break;
         };
-        let n = (to - at).min(SEGMENT_PAYLOAD).min(room).min(frame.capacity());
-        fill_pattern(&mut frame.room_mut()[..n], key, at as u64);
-        frame.set_len(n);
+        let n = (to - at).min(SEGMENT_PAYLOAD).min(room).min(frame.len());
+        fill_pattern(&mut frame.as_mut()[..n], key, at as u64);
+        frame.truncate(n);
+        let frame = frame.freeze();
         if let Err((_, error)) = stack.tcp_send_frame(handle, frame) {
             panic!("frame of {n} bytes within frame_send_room refused: {error}");
         }
@@ -641,10 +642,11 @@ impl Client {
             // The first measured datagram's write starts the clock, counted only if it is sent.
             let written = (sequence >= warmup && self.start.is_none()).then(Instant::now);
             let Some(mut frame) = self.stack.tx_frame() else { break };
-            let buf = &mut frame.room_mut()[..size];
+            let buf = &mut frame.as_mut()[..size];
             buf[..8].copy_from_slice(&sequence.to_le_bytes());
             fill_pattern(&mut buf[8..], 0, 8);
-            frame.set_len(size);
+            frame.truncate(size);
+            let frame = frame.freeze();
             match self.stack.udp_send_frame(handle, Some(remote), frame) {
                 Ok(()) => {
                     if let Some(written) = written {

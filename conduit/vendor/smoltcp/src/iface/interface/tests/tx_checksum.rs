@@ -32,26 +32,26 @@ struct RecordingFrame<'a> {
 }
 
 impl RecordingFrame<'_> {
-    fn record(self, frame: &crate::phy::TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
+    fn record(self, frame: &crate::phy::ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>) {
         let meta = PacketMeta {
             tx_checksum,
             ..PacketMeta::default()
         };
-        self.frames.push((meta, frame.packet(header_len).to_vec()));
+        self.frames.push((meta, unsafe { crate::phy::frame_packet(frame, header_len) }.to_vec()));
     }
 }
 
 impl crate::phy::FrameToken for RecordingFrame<'_> {
-    fn consume(self, frame: crate::phy::TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
+    fn consume(self, frame: crate::phy::ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>) {
         self.record(&frame, header_len, tx_checksum);
     }
 
     fn consume_retain(
         self,
-        frame: crate::phy::TxBuf,
+        frame: crate::phy::ImmutableFrame,
         header_len: usize,
         tx_checksum: Option<TxChecksum>,
-    ) -> crate::phy::TxBuf {
+    ) -> crate::phy::ImmutableFrame {
         self.record(&frame, header_len, tx_checksum);
         frame
     }
@@ -113,14 +113,14 @@ fn recording_device_transmit_frame_keeps_metadata() {
         tx: Vec::new(),
         caps: DeviceCapabilities::default(),
     };
-    let mut frame = crate::tests::tx_test_buf(&[3, 4]);
+    let mut frame = crate::tests::tx_test_buf(&[3, 4]).try_own().unwrap();
     let mut meta = PacketMeta::default();
     meta.tx_checksum = Some(TxChecksum::Udp { ip_header_len: 20 });
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
+    unsafe { crate::phy::frame_headroom(&mut frame, 2) }.0.copy_from_slice(&[1, 2]);
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume_retain(frame, 2, meta.tx_checksum);
+        .consume_retain(frame.freeze(), 2, meta.tx_checksum);
     assert_eq!(device.tx, vec![(meta, vec![1, 2, 3, 4])]);
 }
 
@@ -300,11 +300,12 @@ fn udp_frame_carries_copy_path_checksum_metadata() {
                     broadcast: false,
                 })
                 .unwrap();
+            udp.source = crate::phy::TxSource::new(alloc.clone());
             for _ in 0..2 {
-                let mut frame = crate::phy::TxFrame::alloc(&alloc).unwrap();
-                frame.room_mut().copy_from_slice(b"data");
-                frame.set_len(4);
-                assert!(iface.udp_send_frame(&mut device, &mut udp, handle, to, frame).is_ok());
+                let mut frame = crate::phy::alloc_frame(&alloc).unwrap();
+                frame.as_mut().copy_from_slice(b"data");
+                frame.truncate(4);
+                assert!(iface.udp_send_frame(&mut device, &mut udp, handle, to, frame.freeze()).is_ok());
             }
             assert_eq!(device.tx, copies);
             assert_eq!(

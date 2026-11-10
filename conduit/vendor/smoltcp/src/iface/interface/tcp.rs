@@ -64,18 +64,20 @@ impl InterfaceInner {
         frame_token: Frame,
         ip: IpRepr,
         tcp: TcpRepr,
-        mut frame: UniqueTxBuf,
+        mut frame: OwnedFrame,
         template: &crate::iface::header_template::TcpTemplate,
-    ) -> TxBuf {
+    ) -> ImmutableFrame {
         let IpRepr::Ipv4(ip4) = ip;
         // dispatch puts options only on segments without payload, and sends no timestamps.
         debug_assert!(tcp.payload.is_empty(), "TCP frame header has inline payload");
         debug_assert_eq!(tcp.header_len(), TCP_HEADER_LEN, "TCP frame header carries options");
         let header_len = 14 + ip4.buffer_len() + TCP_HEADER_LEN;
         let tx_checksum = self.tx_checksum(&ip, TCP_HEADER_LEN);
-        let (headers, payload) = frame.headroom_mut(header_len);
+        // SAFETY: the queue returned exclusive ownership of its producer's frame.
+        #[allow(unsafe_code)]
+        let (headers, payload) = unsafe { crate::phy::frame_headroom(&mut frame, header_len) };
         template.emit_header(headers, &ip4, &tcp, payload, &self.caps.checksum);
-        frame_token.consume_retain(frame.into_buf(), header_len, tx_checksum)
+        frame_token.consume_retain(frame.freeze(), header_len, tx_checksum)
     }
 
     pub(super) fn dispatch_tcp<Tx: TxToken>(

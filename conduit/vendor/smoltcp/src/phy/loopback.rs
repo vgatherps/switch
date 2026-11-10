@@ -10,6 +10,7 @@ use crate::time::Instant;
 pub struct Loopback {
     pub(crate) queue: VecDeque<Vec<u8>>,
     medium: Medium,
+    source: phy::TxSource,
 }
 
 #[allow(clippy::new_without_default)]
@@ -18,10 +19,11 @@ impl Loopback {
     ///
     /// Every packet transmitted through this device will be received through it
     /// in FIFO order.
-    pub fn new(medium: Medium) -> Loopback {
+    pub fn new(medium: Medium, source: phy::TxSource) -> Loopback {
         Loopback {
             queue: VecDeque::new(),
             medium,
+            source,
         }
     }
 }
@@ -59,6 +61,7 @@ impl Device for Loopback {
     fn transmit_frame(&mut self, _timestamp: Instant) -> Option<Self::FrameToken<'_>> {
         Some(FrameToken {
             queue: &mut self.queue,
+            origin: self.source.origin(),
         })
     }
 }
@@ -96,39 +99,69 @@ impl<'a> phy::TxToken for TxToken<'a> {
 #[derive(Debug)]
 pub struct FrameToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
+    origin: *mut (),
 }
 
 impl phy::FrameToken for FrameToken<'_> {
-    fn consume(self, frame: phy::TxBuf, header_len: usize, _: Option<phy::TxChecksum>) {
-        self.queue.push_back(frame.packet(header_len).to_vec());
+    fn consume(self, frame: phy::ImmutableFrame, header_len: usize, _: Option<phy::TxChecksum>) {
+        assert_eq!(frame.ctx(), self.origin, "foreign TX frame producer");
+        #[allow(unsafe_code)]
+        self.queue.push_back(unsafe { crate::phy::frame_packet(&frame, header_len) }.to_vec());
     }
 
     fn consume_retain(
         self,
-        frame: phy::TxBuf,
+        frame: phy::ImmutableFrame,
         header_len: usize,
         _: Option<phy::TxChecksum>,
-    ) -> phy::TxBuf {
-        self.queue.push_back(frame.packet(header_len).to_vec());
+    ) -> phy::ImmutableFrame {
+        assert_eq!(frame.ctx(), self.origin, "foreign TX frame producer");
+        #[allow(unsafe_code)]
+        self.queue.push_back(unsafe { crate::phy::frame_packet(&frame, header_len) }.to_vec());
         frame
     }
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::phy::FrameToken as _;
 
     #[test]
     fn transmit_frame_copies_headers_and_payload() {
-        let mut device = Loopback::new(Medium::Ethernet);
-        let mut frame = crate::tests::tx_test_buf(&[3, 4]);
-        frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
+        let source = phy::TxSource::new(phy::TxPool::new(2));
+        let mut device = Loopback::new(Medium::Ethernet, source.clone());
+        let mut frame = source.alloc().unwrap();
+        frame.copy_from_slice(&[3, 4]);
+        // SAFETY: the source allocated this frame at its original start.
+        unsafe { phy::frame_headroom(&mut frame, 2) }.0.copy_from_slice(&[1, 2]);
+        let frame = frame.freeze();
         let frame = device
             .transmit_frame(Instant::ZERO)
             .unwrap()
             .consume_retain(frame, 2, None);
         assert_eq!(device.queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-        assert!(frame.unique());
+        assert_eq!(crate::phy::frame_refcount(&frame), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign TX frame producer")]
+    fn transmit_frame_rejects_foreign_producer() {
+        let source = phy::TxSource::new(phy::TxPool::new(2));
+        let mut device = Loopback::new(Medium::Ethernet, source);
+        let foreign = phy::TxPool::new(2);
+        let frame = phy::alloc_frame(&foreign).unwrap().freeze();
+        device.transmit_frame(Instant::ZERO).unwrap().consume(frame, 0, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign TX frame producer")]
+    fn transmit_frame_retain_rejects_foreign_producer() {
+        let source = phy::TxSource::new(phy::TxPool::new(2));
+        let mut device = Loopback::new(Medium::Ethernet, source);
+        let foreign = phy::TxPool::new(2);
+        let frame = phy::alloc_frame(&foreign).unwrap().freeze();
+        device.transmit_frame(Instant::ZERO).unwrap().consume_retain(frame, 0, None);
     }
 }

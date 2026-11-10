@@ -245,8 +245,9 @@ fn first_send_arps_then_succeeds() {
         );
         pair.a.receive(pair::T0, BURST).unwrap();
         let mut frame = pair.a.tx_frame().unwrap();
-        frame.room_mut()[..5].copy_from_slice(b"hello");
-        frame.set_len(5);
+        frame.as_mut()[..5].copy_from_slice(b"hello");
+        frame.truncate(5);
+        let frame = frame.freeze();
         assert!(pair.a.udp_send_frame(&handles[0], Some(endpoint(Side::B)), frame).is_ok());
         pair.round(|_, _| {});
         recv(&mut pair.b, &handles[1], endpoint(Side::A), b"hello");

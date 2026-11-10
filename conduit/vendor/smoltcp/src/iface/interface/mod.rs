@@ -25,7 +25,7 @@ use crate::config::{
 };
 use crate::phy::{PacketMeta, TxChecksum};
 use crate::phy::{
-    Device, DeviceCapabilities, FrameToken as PhyFrameToken, RxToken, TxBuf, TxToken, UniqueTxBuf,
+    Device, DeviceCapabilities, FrameToken as PhyFrameToken, RxToken, ImmutableFrame, TxToken, OwnedFrame,
 };
 use crate::rand::Rand;
 use crate::socket::*;
@@ -81,17 +81,17 @@ struct TrackedFrameToken<'a, T> {
 }
 
 impl<T: PhyFrameToken> PhyFrameToken for TrackedFrameToken<'_, T> {
-    fn consume(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
+    fn consume(self, frame: ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>) {
         self.inner.consume(frame, header_len, tx_checksum);
         *self.consumed = true;
     }
 
     fn consume_retain(
         self,
-        frame: TxBuf,
+        frame: ImmutableFrame,
         header_len: usize,
         tx_checksum: Option<TxChecksum>,
-    ) -> TxBuf {
+    ) -> ImmutableFrame {
         let frame = self.inner.consume_retain(frame, header_len, tx_checksum);
         *self.consumed = true;
         frame
@@ -677,7 +677,7 @@ impl Interface {
                                    meta: PacketMeta,
                                    ip: IpRepr,
                                    tcp: TcpRepr,
-                                   frame: Option<UniqueTxBuf>| {
+                                   frame: Option<OwnedFrame>| {
                     neighbor_addr = Some(ip.dst_addr());
                     if let Some(frame) = frame {
                         if !inner.tcp_frame_template_ready(&ip, &tcp, next_hop, template) {
@@ -694,12 +694,12 @@ impl Interface {
                                     })
                                 },
                             ) {
-                                return (Err(error), Some(frame.into_buf()));
+                                return (Err(error), Some(frame.freeze()));
                             }
                         }
                         let Some(t) = device.transmit_frame(inner.now) else {
                             net_debug!("failed to transmit frame: device exhausted");
-                            return (Err(EgressError::Exhausted), Some(frame.into_buf()));
+                            return (Err(EgressError::Exhausted), Some(frame.freeze()));
                         };
                         let t = TrackedFrameToken {
                             inner: t,

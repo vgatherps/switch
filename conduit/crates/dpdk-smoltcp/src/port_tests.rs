@@ -752,48 +752,52 @@ fn frame_pool_layout_share_and_exhaustion() {
         let pool = port.frame_pool();
         let source = port.frame_source();
         assert_eq!(pool.count(), 63);
-        let mut frame = source.alloc().unwrap();
-        assert_eq!(frame.origin().as_ptr().cast::<rte_mempool>(), pool.mempool());
-        assert_eq!((frame.len(), frame.capacity()), (0, 1500 - 28));
-        assert!(frame.unique());
-        let raw = frame.mbuf().as_ptr();
+        let frame = source.alloc().unwrap();
+        assert_eq!(frame.ctx().cast::<rte_mempool>(), pool.mempool());
+        assert_eq!(frame.len(), 1500 - 28);
+        let frame = frame.freeze();
+        // SAFETY: this frame came from the port's producer.
+        let raw = unsafe { smoltcp::phy::frame_mbuf(&frame) }.as_ptr();
+        assert_eq!(unsafe { (*raw).refcnt() }, 1);
+        let mut frame = frame.try_own().unwrap();
         unsafe {
             assert_eq!((*raw).data_off(), RTE_PKTMBUF_HEADROOM as u16 + 42);
             assert_eq!(((*raw).data_len(), (*raw).pkt_len()), (0, 0));
-            assert_eq!(frame.room_mut().as_ptr(), (*raw).data_ptr());
+            assert_eq!(frame.as_ptr(), (*raw).data_ptr());
             // The fixture's frame data room is exactly headroom + 1514, so the
             // payload room ends at the buffer's end.
             assert_eq!(
-                usize::from((*raw).data_off()) + frame.capacity(),
+                usize::from((*raw).data_off()) + frame.len(),
                 usize::from((*raw).buf_len())
             );
         }
-        frame.room_mut().fill(0xa5);
-        frame.set_len(frame.capacity());
+        frame.as_mut().fill(0xa5);
+        let frame = frame.freeze();
 
         let shared = frame.clone();
         assert_eq!(unsafe { (*raw).refcnt() }, 2);
-        assert!(!frame.unique() && !shared.unique());
+        let frame = frame.try_own().expect_err("shared frame stays immutable");
+        let shared = shared.try_own().expect_err("shared clone stays immutable");
         drop(frame);
         assert_eq!(unsafe { (*raw).refcnt() }, 1);
-        assert!(shared.unique());
-        assert!(shared.payload().iter().all(|&byte| byte == 0xa5));
+        let shared = shared.try_own().expect("the remaining reference is exclusive");
+        assert!(shared.iter().all(|&byte| byte == 0xa5));
         assert_eq!(pool.in_use_count(), 1);
         drop(shared);
         assert_eq!(pool.in_use_count(), 0);
 
-        let all: Vec<_> = std::iter::from_fn(|| source.alloc()).collect();
+        let all: Vec<_> = std::iter::from_fn(|| source.alloc().map(|frame| frame.freeze())).collect();
         assert_eq!(all.len(), 63);
         assert_eq!(pool.in_use_count(), 63);
-        let mut owners: Vec<_> = all.iter().map(|frame| frame.mbuf()).collect();
+        let mut owners: Vec<_> = all.iter().map(|frame| unsafe { smoltcp::phy::frame_mbuf(frame) }).collect();
         owners.sort();
         owners.dedup();
         assert_eq!(owners.len(), 63);
         drop(all);
         assert_eq!(pool.in_use_count(), 0);
         // Every object came back exactly once.
-        let again: Vec<_> = std::iter::from_fn(|| source.alloc()).collect();
-        let mut again_owners: Vec<_> = again.iter().map(|frame| frame.mbuf()).collect();
+        let again: Vec<_> = std::iter::from_fn(|| source.alloc().map(|frame| frame.freeze())).collect();
+        let mut again_owners: Vec<_> = again.iter().map(|frame| unsafe { smoltcp::phy::frame_mbuf(frame) }).collect();
         again_owners.sort();
         assert_eq!(again_owners, owners);
         drop((again, source));

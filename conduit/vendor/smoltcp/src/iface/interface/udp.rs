@@ -2,7 +2,7 @@ use super::*;
 use crate::iface::header_template::UdpTemplate;
 use crate::iface::udp_set::PendingUdp;
 use crate::iface::{UdpHandle, UdpSendError, UdpSocket};
-use crate::phy::{ChecksumCapabilities, TxFrame, UniqueTxBuf};
+use crate::phy::{ChecksumCapabilities, ImmutableFrame, OwnedFrame};
 
 impl Interface {
     /// The destination of one UDP send of `len` payload bytes, checked before any device work.
@@ -85,16 +85,17 @@ impl Interface {
         udp: &mut UdpSet,
         handle: UdpHandle,
         to: Option<IpEndpoint>,
-        frame: TxFrame,
-    ) -> Result<(), (TxFrame, UdpSendError)> {
+        frame: ImmutableFrame,
+    ) -> Result<(), (ImmutableFrame, UdpSendError)> {
+        assert_eq!(frame.ctx(), udp.source.origin(), "foreign TX frame producer");
         let to = match self.udp_destination(udp, handle, to, frame.len()) {
             Ok(to) => to,
             Err(error) => return Err((frame, error)),
         };
-        match frame.into_unique() {
+        match frame.try_own() {
             Ok(unique) => self
                 .udp_send_unique(device, udp, handle, to, unique)
-                .map_err(|(unique, error)| (unique.into_frame(), error)),
+                .map_err(|(unique, error)| (unique.freeze(), error)),
             Err(shared) => self.udp_send_shared(device, udp, handle, to, shared),
         }
     }
@@ -109,9 +110,9 @@ impl Interface {
         udp: &mut UdpSet,
         handle: UdpHandle,
         to: IpEndpoint,
-        shared: TxFrame,
-    ) -> Result<(), (TxFrame, UdpSendError)> {
-        let copy = match udp_copy(udp, shared.payload()) {
+        shared: ImmutableFrame,
+    ) -> Result<(), (ImmutableFrame, UdpSendError)> {
+        let copy = match udp_copy(udp, &shared) {
             Ok(copy) => copy,
             Err(error) => return Err((shared, error)),
         };
@@ -127,8 +128,8 @@ impl Interface {
         udp: &mut UdpSet,
         handle: UdpHandle,
         to: IpEndpoint,
-        mut frame: UniqueTxBuf,
-    ) -> Result<(), (UniqueTxBuf, UdpSendError)> {
+        mut frame: OwnedFrame,
+    ) -> Result<(), (OwnedFrame, UdpSendError)> {
         let IpAddress::Ipv4(dst_addr) = to.addr;
         let len = frame.len();
         let socket = udp.get_mut(handle);
@@ -149,9 +150,11 @@ impl Interface {
                 return Err((frame, UdpSendError::WouldBlock));
             };
             let tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(*ip_repr), 0);
-            let (headers, payload) = frame.headroom_mut(UDP_FRAME_HEADER_LEN);
+            // SAFETY: a unique frame from this UDP set's producer, at its original start.
+            #[allow(unsafe_code)]
+            let (headers, payload) = unsafe { crate::phy::frame_headroom(&mut frame, UDP_FRAME_HEADER_LEN) };
             template.emit_header(headers, ip_repr, payload, &checksum_caps);
-            token.consume(frame.into_buf(), UDP_FRAME_HEADER_LEN, tx_checksum);
+            token.consume(frame.freeze(), UDP_FRAME_HEADER_LEN, tx_checksum);
             self.inner.dispatch_neighbor_probe(device);
             return Ok(());
         }
@@ -177,7 +180,9 @@ impl Interface {
             return Err((frame, UdpSendError::WouldBlock));
         };
         let tx_checksum = self.inner.tx_checksum(&IpRepr::Ipv4(ip_repr), 0);
-        let (headers, payload) = frame.headroom_mut(UDP_FRAME_HEADER_LEN);
+        // SAFETY: a unique frame from this UDP set's producer, at its original start.
+        #[allow(unsafe_code)]
+        let (headers, payload) = unsafe { crate::phy::frame_headroom(&mut frame, UDP_FRAME_HEADER_LEN) };
         emit_udp_header(
             headers,
             src_mac,
@@ -187,7 +192,7 @@ impl Interface {
             payload,
             &checksum_caps,
         );
-        token.consume(frame.into_buf(), UDP_FRAME_HEADER_LEN, tx_checksum);
+        token.consume(frame.freeze(), UDP_FRAME_HEADER_LEN, tx_checksum);
         if let Some((changes, mac)) = next_hop {
             socket.template = Some(UdpTemplate::new(
                 src_mac,
@@ -206,10 +211,10 @@ impl Interface {
 /// A unique frame from `udp`'s frame source holding `payload`. `WouldBlock` when the source is
 /// empty.
 #[inline]
-fn udp_copy(udp: &UdpSet, payload: &[u8]) -> Result<UniqueTxBuf, UdpSendError> {
-    let mut frame = udp.source.alloc_unique().ok_or(UdpSendError::WouldBlock)?;
-    frame.room_mut()[..payload.len()].copy_from_slice(payload);
-    frame.set_len(payload.len());
+fn udp_copy(udp: &UdpSet, payload: &[u8]) -> Result<OwnedFrame, UdpSendError> {
+    let mut frame = udp.source.alloc().ok_or(UdpSendError::WouldBlock)?;
+    frame.as_mut()[..payload.len()].copy_from_slice(payload);
+    frame.truncate(payload.len());
     Ok(frame)
 }
 

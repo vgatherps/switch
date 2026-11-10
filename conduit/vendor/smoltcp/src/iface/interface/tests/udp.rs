@@ -52,20 +52,20 @@ struct ReplyFrameToken<'a>(&'a mut Vec<Vec<u8>>);
 impl crate::phy::FrameToken for ReplyFrameToken<'_> {
     fn consume(
         self,
-        frame: crate::phy::TxBuf,
+        frame: crate::phy::ImmutableFrame,
         header_len: usize,
         _: Option<crate::phy::TxChecksum>,
     ) {
-        self.0.push(frame.packet(header_len).to_vec());
+        self.0.push(unsafe { crate::phy::frame_packet(&frame, header_len) }.to_vec());
     }
 
     fn consume_retain(
         self,
-        frame: crate::phy::TxBuf,
+        frame: crate::phy::ImmutableFrame,
         header_len: usize,
         _: Option<crate::phy::TxChecksum>,
-    ) -> crate::phy::TxBuf {
-        self.0.push(frame.packet(header_len).to_vec());
+    ) -> crate::phy::ImmutableFrame {
+        self.0.push(unsafe { crate::phy::frame_packet(&frame, header_len) }.to_vec());
         frame
     }
 }
@@ -1698,24 +1698,37 @@ fn removing_gateway_invalidates_cached_udp_next_hop() {
     assert_send_error(&mut test, Some(off_subnet), 4, UdpSendError::NoRoute);
 }
 
-fn tx_frame(alloc: &crate::phy::TxPool, payload: &[u8]) -> crate::phy::TxFrame {
-    let mut frame = crate::phy::TxFrame::alloc(alloc).unwrap();
-    frame.room_mut()[..payload.len()].copy_from_slice(payload);
-    frame.set_len(payload.len());
-    frame
+fn tx_frame(alloc: &crate::phy::TxPool, payload: &[u8]) -> crate::phy::ImmutableFrame {
+    let mut frame = crate::phy::alloc_frame(alloc).unwrap();
+    frame.as_mut()[..payload.len()].copy_from_slice(payload);
+    frame.truncate(payload.len());
+    frame.freeze()
+}
+
+#[test]
+#[should_panic(expected = "foreign TX frame producer")]
+fn udp_send_frame_rejects_foreign_producer() {
+    let mut test = Test::new(1);
+    let foreign = crate::phy::TxPool::new(64);
+    let frame = tx_frame(&foreign, b"foreign");
+    let _ = send_tx_frame(
+        &mut test,
+        Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)),
+        frame,
+    );
 }
 
 fn send_tx_frame(
     test: &mut Test,
     to: Option<IpEndpoint>,
-    frame: crate::phy::TxFrame,
-) -> Result<(), (crate::phy::TxFrame, UdpSendError)> {
+    frame: crate::phy::ImmutableFrame,
+) -> Result<(), (crate::phy::ImmutableFrame, UdpSendError)> {
     test.iface
         .udp_send_frame(&mut test.device, &mut test.udp, test.handle, to, frame)
 }
 
 #[track_caller]
-fn assert_frame_sent(result: Result<(), (crate::phy::TxFrame, UdpSendError)>) {
+fn assert_frame_sent(result: Result<(), (crate::phy::ImmutableFrame, UdpSendError)>) {
     if let Err((_, error)) = result {
         panic!("frame send failed: {error:?}");
     }
@@ -1723,8 +1736,8 @@ fn assert_frame_sent(result: Result<(), (crate::phy::TxFrame, UdpSendError)>) {
 
 #[track_caller]
 fn frame_refused(
-    result: Result<(), (crate::phy::TxFrame, UdpSendError)>,
-) -> (crate::phy::TxFrame, UdpSendError) {
+    result: Result<(), (crate::phy::ImmutableFrame, UdpSendError)>,
+) -> (crate::phy::ImmutableFrame, UdpSendError) {
     match result {
         Ok(()) => panic!("frame send succeeded"),
         Err(refused) => refused,
@@ -1749,6 +1762,7 @@ fn udp_frame_template_and_generic_match_wire_emitter() {
                         tx_checksum,
                         broadcast: false,
                     });
+                    test.udp.source = crate::phy::TxSource::new(alloc.clone());
                     test.iface.inner.caps.checksum.ipv4 = ipv4_checksum;
                     test.iface.inner.caps.checksum.udp = udp_checksum;
                     resolve(&mut test, REMOTE, REMOTE_MAC);
@@ -1785,6 +1799,7 @@ fn udp_frame_template_and_generic_match_wire_emitter() {
 fn udp_frame_checksums_match_generic_random() {
     let alloc = crate::phy::TxPool::new(1472);
     let mut test = Test::new(1);
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     resolve(&mut test, REMOTE, REMOTE_MAC);
     let mut rng = ChaCha8Rng::seed_from_u64(0x5eed_f4f4_0000_0001);
     let mut payload = [0; 1472];
@@ -1810,6 +1825,7 @@ fn udp_frame_checksums_match_generic_random() {
 fn udp_frame_computed_zero_checksum_is_ffff() {
     let alloc = crate::phy::TxPool::new(2);
     let mut test = Test::new(1);
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     resolve(&mut test, REMOTE, REMOTE_MAC);
     let mut payload = [0; 2];
     let bytes = send_frame(REMOTE, REMOTE_MAC, &payload, true);
@@ -1842,6 +1858,7 @@ fn udp_frame_broadcast_uses_generic_header() {
         tx_checksum: true,
         broadcast: true,
     });
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     for dst in [Ipv4Address::new(192, 168, 1, 255), Ipv4Address::BROADCAST] {
         for _ in 0..2 {
             assert_frame_sent(send_tx_frame(
@@ -1866,16 +1883,17 @@ fn udp_frame_broadcast_uses_generic_header() {
 fn udp_shared_frame_copies_and_releases_its_reference() {
     let alloc = crate::phy::TxPool::new(64);
     let mut test = Test::new(1);
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     resolve(&mut test, REMOTE, REMOTE_MAC);
     let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
     let kept = tx_frame(&alloc, b"shared");
     for _ in 0..2 {
         assert_frame_sent(send_tx_frame(&mut test, peer, kept.clone()));
         assert_eq!(alloc.live(), 1);
-        assert!(kept.unique());
-        assert_eq!(kept.payload(), b"shared");
+        assert_eq!(crate::phy::frame_refcount(&kept), 1);
+        assert_eq!(kept.as_ref(), b"shared");
     }
-    assert_eq!((alloc.shares(), alloc.releases()), (2, 2));
+    assert_eq!(alloc.releases(), 2);
     let expected = send_frame(REMOTE, REMOTE_MAC, b"shared", true);
     assert_eq!(test.device.tx, vec![expected.clone(), expected]);
     drop(kept);
@@ -1893,12 +1911,13 @@ fn udp_frame_refusals_return_frame_and_reserve_only_for_arp() {
     let refused = |test: &mut Test, to, error, tokens_left| {
         let (frame, got) = frame_refused(send_tx_frame(test, to, tx_frame(&alloc, b"kept")));
         assert_eq!(got, error);
-        assert!(frame.unique());
-        assert_eq!(frame.payload(), b"kept");
+        assert_eq!(crate::phy::frame_refcount(&frame), 1);
+        assert_eq!(frame.as_ref(), b"kept");
         assert_eq!(test.device.tx_left, tokens_left);
     };
 
     let mut test = Test::new(1);
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     test.device.tx_left = Some(0);
     refused(&mut test, peer, UdpSendError::WouldBlock, Some(0));
     assert!(test.device.tx.is_empty());
@@ -1912,6 +1931,7 @@ fn udp_frame_refusals_return_frame_and_reserve_only_for_arp() {
     assert!(test.device.tx.is_empty());
 
     let mut test = Test::new(1);
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     resolve(&mut test, REMOTE, REMOTE_MAC);
     test.device.tx_left = Some(0);
     refused(&mut test, peer, UdpSendError::WouldBlock, Some(0));
@@ -1936,6 +1956,7 @@ fn udp_shared_frame_looks_up_neighbor_before_token() {
     let off_subnet = Some(IpEndpoint::new(IpAddress::v4(10, 0, 0, 1), PEER_PORT));
     let kept = tx_frame(&alloc, b"kept");
     let mut test = Test::new(1);
+    test.udp.source = crate::phy::TxSource::new(alloc.clone());
     test.device.tx_left = Some(1);
     let (frame, error) = frame_refused(send_tx_frame(&mut test, peer, kept.clone()));
     assert_eq!(error, UdpSendError::NeighborPending);
@@ -1948,11 +1969,11 @@ fn udp_shared_frame_looks_up_neighbor_before_token() {
     ] {
         let (frame, error) = frame_refused(send_tx_frame(&mut test, to, kept.clone()));
         assert_eq!(error, expected);
-        assert_eq!(frame.payload(), b"kept");
+        assert_eq!(frame.as_ref(), b"kept");
     }
     resolve(&mut test, REMOTE, REMOTE_MAC);
     let (frame, error) = frame_refused(send_tx_frame(&mut test, peer, kept.clone()));
-    assert_eq!((error, frame.payload()), (UdpSendError::WouldBlock, &b"kept"[..]));
+    assert_eq!((error, frame.as_ref()), (UdpSendError::WouldBlock, &b"kept"[..]));
     drop(frame);
     assert_eq!(test.device.tx, vec![arp_request(REMOTE)]);
     test.device.tx_left = Some(1);
@@ -1961,7 +1982,7 @@ fn udp_shared_frame_looks_up_neighbor_before_token() {
         test.device.tx[1..],
         [send_frame(REMOTE, REMOTE_MAC, b"kept", true)]
     );
-    assert!(kept.unique());
+    assert_eq!(crate::phy::frame_refcount(&kept), 1);
     drop(kept);
     assert_eq!(alloc.live(), 0);
 }
@@ -2083,6 +2104,7 @@ fn bound_socket_sends_from_its_address_on_every_path() {
     for src in [SECOND, ELSEWHERE, LOCAL] {
         let local_addr = (src != LOCAL).then_some(src);
         let (mut test, _) = Test::bound(&[SECOND, ELSEWHERE], &[udp_config(local_addr)], 0);
+        test.udp.source = crate::phy::TxSource::new(alloc.clone());
         resolve(&mut test, REMOTE, REMOTE_MAC);
         let expected = send_frame_from(src, REMOTE, REMOTE_MAC, PEER_PORT, b"from", &ChecksumCapabilities::default());
         for _ in 0..2 {

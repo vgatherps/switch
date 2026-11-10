@@ -31,9 +31,9 @@ impl RxFrame for TcpFrame {
     }
 }
 
-impl TxFrame for switchnet::TxFrame {
+impl TxFrame for switchnet::OwnedFrame {
     fn room_mut(&mut self) -> &mut [u8] {
-        switchnet::TxFrame::room_mut(self)
+        self
     }
 }
 
@@ -79,7 +79,7 @@ impl SwitchTx {
             return Err(SetupError::ForeignHandle);
         }
         let mut tx = SwitchTx { handle: handle.clone(), tcp, room: 0 };
-        let capacity = tx.alloc().await.map_err(|_| SetupError::Dead)?.capacity();
+        let capacity = tx.alloc().await.map_err(|_| SetupError::Dead)?.len();
         let mss = tx.tcp.max_segment_payload().ok_or(SetupError::Dead)?;
         tx.room = capacity.min(mss).min(tx.tcp.send_capacity());
         if tx.room < min_room {
@@ -90,14 +90,14 @@ impl SwitchTx {
 }
 
 impl FrameTx for SwitchTx {
-    type Frame = switchnet::TxFrame;
-    type Sealed = switchnet::TxFrame;
+    type Frame = switchnet::OwnedFrame;
+    type Sealed = switchnet::ImmutableFrame;
     type Error = SendError;
 
     /// A frame from the Net, or `InvalidState` if the socket has closed or reset (checked
     /// first on every poll, so a dead socket never gets a frame). Called only before
     /// `shutdown`, where the connection ending is the only way `delivered` resolves.
-    async fn alloc(&mut self) -> Result<switchnet::TxFrame, SendError> {
+    async fn alloc(&mut self) -> Result<switchnet::OwnedFrame, SendError> {
         let mut dead = pin!(self.tcp.delivered());
         let mut frame = pin!(self.handle.tx_frame());
         poll_fn(|cx| {
@@ -117,12 +117,12 @@ impl FrameTx for SwitchTx {
         (0, self.room)
     }
 
-    fn seal(&mut self, mut f: switchnet::TxFrame, len: usize) -> Result<switchnet::TxFrame, SendError> {
-        f.set_len(len);
-        Ok(f)
+    fn seal(&mut self, mut f: switchnet::OwnedFrame, len: usize) -> Result<switchnet::ImmutableFrame, SendError> {
+        f.truncate(len);
+        Ok(f.freeze())
     }
 
-    fn try_send(&mut self, f: switchnet::TxFrame) -> Result<(), switchnet::TxFrame> {
+    fn try_send(&mut self, f: switchnet::ImmutableFrame) -> Result<(), switchnet::ImmutableFrame> {
         self.tcp.try_send(f).map_err(|(f, _)| f)
     }
 

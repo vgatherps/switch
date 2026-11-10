@@ -15,7 +15,7 @@ const REMOTE_MAC: EthernetAddress = EthernetAddress([2, 0, 0, 0, 0, 2]);
 /// An interface that has learned `REMOTE` from an ARP reply, so its first frame to the peer is
 /// TCP, not an ARP request.
 fn interface(seed: u64) -> (Interface, Loopback) {
-    let mut device = Loopback::new(Medium::Ethernet);
+    let mut device = Loopback::new(Medium::Ethernet, smoltcp::phy::TxSource::new(smoltcp::phy::TxPool::new(65535)));
     let mut config = Config::new(HardwareAddress::Ethernet(LOCAL_MAC));
     config.random_seed = seed;
     let mut iface = Interface::new(config, &mut device, Instant::ZERO);

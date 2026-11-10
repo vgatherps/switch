@@ -119,8 +119,9 @@ fn halves_of_one_stream_wake_independently() {
         let (writer, writes) = counted(async move {
             for chunk in sent.chunks(1000) {
                 let mut frame = handle.tx_frame().await;
-                frame.room_mut()[..chunk.len()].copy_from_slice(chunk);
-                frame.set_len(chunk.len());
+                frame.as_mut()[..chunk.len()].copy_from_slice(chunk);
+                frame.truncate(chunk.len());
+                let frame = frame.freeze();
                 tx.room(chunk.len()).await.unwrap();
                 tx.try_send(frame).map_err(|(_, error)| error).unwrap();
             }
@@ -307,8 +308,9 @@ fn token_fired_by_the_other_half_rearms_without_a_wake() {
         let handle = mixed.handle();
         let writer = mixed.spawn(async move {
             let mut frame = handle.tx_frame().await;
-            frame.room_mut()[..3].copy_from_slice(b"out");
-            frame.set_len(3);
+            frame.as_mut()[..3].copy_from_slice(b"out");
+            frame.truncate(3);
+            let frame = frame.freeze();
             tx.try_send(frame).map_err(|(_, error)| error).unwrap();
             tx
         });

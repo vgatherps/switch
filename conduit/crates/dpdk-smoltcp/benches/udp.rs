@@ -107,11 +107,11 @@ fn send_frames(
     let start = Instant::now();
     for (ok, &sequence) in sent_ok.iter_mut().zip(sequences) {
         let mut frame = pair.a.tx_frame().expect("frame pool empty");
-        let payload = &mut frame.room_mut()[..size];
+        let payload = &mut frame.as_mut()[..size];
         payload.fill(PATTERN);
         payload[0] = sequence;
-        frame.set_len(size);
-        *ok = pair.a.udp_send_frame(handle, to, frame).is_ok();
+        frame.truncate(size);
+        *ok = pair.a.udp_send_frame(handle, to, frame.freeze()).is_ok();
     }
     let sent = pair.a.flush();
     let send_elapsed = start.elapsed();

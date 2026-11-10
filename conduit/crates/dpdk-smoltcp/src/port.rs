@@ -538,7 +538,7 @@ pub struct Port {
     tx: ManuallyDrop<PoolResources>,
     /// This Port's clone of the frame pool; other clones may outlive the Port.
     frame: ManuallyDrop<Rc<FramePool>>,
-    /// The frame pool's mempool (every frame's `TxBuf::origin`), kept here so the publish
+    /// The frame pool's mempool (every frame's `ImmutableFrame::ctx`), kept here so the publish
     /// check reads one field.
     frame_origin: NonNull<()>,
     rx_scratch: Box<[*mut rte_mbuf]>,
@@ -936,7 +936,7 @@ impl Port {
         &self.frame
     }
 
-    /// The frame pool's mempool: every frame's `TxBuf::origin`.
+    /// The frame pool's mempool: every frame's `ImmutableFrame::ctx`.
     pub(crate) fn frame_origin(&self) -> NonNull<()> {
         self.frame_origin
     }

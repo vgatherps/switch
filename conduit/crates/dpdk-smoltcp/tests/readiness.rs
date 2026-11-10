@@ -61,8 +61,9 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         drop(frame);
         pair.a.arm_tcp(key, ReadySide::Tx, 4);
         let mut out = pair.a.tx_frame().unwrap();
-        out.room_mut()[..1000].fill(7);
-        out.set_len(1000);
+        out.as_mut()[..1000].fill(7);
+        out.truncate(1000);
+        let out = out.freeze();
         assert!(pair.a.tcp_send_frame(&h[0], out).is_ok());
         assert_eq!(popped(&mut pair.a), [4]);
 

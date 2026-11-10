@@ -8,7 +8,7 @@
 use std::ffi::CString;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use dpdk_smoltcp::smoltcp::phy::{ChecksumCapabilities, TxFrame};
+use dpdk_smoltcp::smoltcp::phy::{ChecksumCapabilities, ImmutableFrame};
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, SendFrameError, State};
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -132,9 +132,9 @@ fn metadata(m: &rte_mbuf) -> (u64, u64, u64, u64) {
 /// The mbuf behind a frame-pool frame: its buffer starts FRAME_DATA_OFF bytes
 /// before the payload, after the mbuf header and the pool's 8-byte private
 /// area (zhida pools keep a per-object cache slot there).
-fn frame_mbuf(frame: &TxFrame, frame_pool: *mut rte_mempool) -> *const rte_mbuf {
+fn frame_mbuf(frame: &ImmutableFrame, frame_pool: *mut rte_mempool) -> *const rte_mbuf {
     const PRIV_SIZE: usize = 8;
-    let buf = frame.payload().as_ptr().wrapping_sub(usize::from(FRAME_DATA_OFF));
+    let buf = frame.as_ref().as_ptr().wrapping_sub(usize::from(FRAME_DATA_OFF));
     let mbuf = buf
         .wrapping_sub(std::mem::size_of::<rte_mbuf>() + PRIV_SIZE)
         .cast::<rte_mbuf>();
@@ -150,7 +150,7 @@ fn frame_mbuf(frame: &TxFrame, frame_pool: *mut rte_mempool) -> *const rte_mbuf 
 }
 
 /// (refcnt, data_off, data_len, ol_flags) of the frame's mbuf.
-fn frame_state(frame: &TxFrame, frame_pool: *mut rte_mempool) -> (u16, u16, u16, u64) {
+fn frame_state(frame: &ImmutableFrame, frame_pool: *mut rte_mempool) -> (u16, u16, u16, u64) {
     // SAFETY: the frame's reference keeps its mbuf alive.
     let m = unsafe { &*frame_mbuf(frame, frame_pool) };
     (m.refcnt(), m.data_off(), m.data_len(), m.ol_flags())
@@ -319,11 +319,11 @@ impl Host {
         }
     }
 
-    fn frame(&mut self, payload: &[u8]) -> TxFrame {
+    fn frame(&mut self, payload: &[u8]) -> ImmutableFrame {
         let mut frame = self.stack.tx_frame().expect("frame pool has a frame");
-        frame.room_mut()[..payload.len()].copy_from_slice(payload);
-        frame.set_len(payload.len());
-        frame
+        frame.as_mut()[..payload.len()].copy_from_slice(payload);
+        frame.truncate(payload.len());
+        frame.freeze()
     }
 
     fn send_frame(&mut self, conn: &Conn, payload: &[u8]) {
@@ -661,7 +661,7 @@ fn shared_frame_send_copies() {
         drop(sent);
         host.ack(&conn, conn.seq + 14);
         assert_eq!(frame_state(&frame, host.frame_pool), (1, FRAME_DATA_OFF, 0, 0));
-        assert_eq!(frame.payload(), b"shared payload");
+        assert_eq!(frame.as_ref(), b"shared payload");
         drop(frame);
         host.finish();
     });
@@ -787,7 +787,7 @@ fn tcp_frame_from_other_stack_is_foreign() {
         let frame = a.frame(b"from A");
         let (frame, error) = b.stack.tcp_send_frame(&conn.handle, frame).unwrap_err();
         assert_eq!(error, SendFrameError::Foreign);
-        assert_eq!(frame.payload(), b"from A");
+        assert_eq!(frame.as_ref(), b"from A");
         assert_eq!((a.frame_in_use(), b.frame_in_use()), (1, 0));
         assert_eq!(b.stack.tcp(&conn.handle).send_queue(), 0);
         drop(frame);

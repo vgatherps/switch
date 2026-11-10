@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use std::collections::VecDeque;
 
 use crate::iface::*;
@@ -175,26 +177,26 @@ pub struct FrameToken<'a> {
 }
 
 impl phy::FrameToken for FrameToken<'_> {
-    fn consume(self, frame: phy::TxBuf, header_len: usize, _: Option<phy::TxChecksum>) {
-        self.queue.push_back(frame.packet(header_len).to_vec());
+    fn consume(self, frame: phy::ImmutableFrame, header_len: usize, _: Option<phy::TxChecksum>) {
+        self.queue.push_back(unsafe { crate::phy::frame_packet(&frame, header_len) }.to_vec());
     }
 
     fn consume_retain(
         self,
-        frame: phy::TxBuf,
+        frame: phy::ImmutableFrame,
         header_len: usize,
         _: Option<phy::TxChecksum>,
-    ) -> phy::TxBuf {
-        self.queue.push_back(frame.packet(header_len).to_vec());
+    ) -> phy::ImmutableFrame {
+        self.queue.push_back(unsafe { crate::phy::frame_packet(&frame, header_len) }.to_vec());
         frame
     }
 }
 
-pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::TxBuf {
+pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::ImmutableFrame {
     let mut buf = phy::TxPool::new(bytes.len().max(1)).alloc().unwrap();
-    buf.room_mut()[..bytes.len()].copy_from_slice(bytes);
-    buf.set_len(bytes.len());
-    buf
+    buf.as_mut()[..bytes.len()].copy_from_slice(bytes);
+    buf.truncate(bytes.len());
+    buf.freeze()
 }
 
 pub(crate) fn tx_test_source(room: usize) -> phy::TxSource {
@@ -206,13 +208,14 @@ fn testing_device_frame_token_writes_before_publish() {
     use crate::phy::FrameToken as _;
 
     let mut device = TestingDevice::new(Medium::Ethernet);
-    let mut frame = tx_test_buf(&[3, 4]);
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
+    let mut frame = tx_test_buf(&[3, 4]).try_own().unwrap();
+    // SAFETY: the test producer allocated this exclusive frame.
+    unsafe { phy::frame_headroom(&mut frame, 2) }.0.copy_from_slice(&[1, 2]);
     assert!(device.tx_queue.is_empty());
     let token = device.transmit_frame(Instant::ZERO).unwrap();
-    let frame = token.consume_retain(frame, 2, None);
+    let frame = token.consume_retain(frame.freeze(), 2, None);
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-    assert!(frame.unique());
+    assert_eq!(phy::frame_refcount(&frame), 1);
 }
 
 #[test]
@@ -221,14 +224,15 @@ fn testing_device_owned_frame_releases_after_publish() {
 
     let alloc = phy::TxPool::new(2);
     let mut frame = alloc.alloc().unwrap();
-    frame.room_mut()[..2].copy_from_slice(&[3, 4]);
-    frame.set_len(2);
-    frame.headroom_mut(2).0.copy_from_slice(&[1, 2]);
+    frame.as_mut()[..2].copy_from_slice(&[3, 4]);
+    frame.truncate(2);
+    // SAFETY: the test producer allocated this exclusive frame.
+    unsafe { phy::frame_headroom(&mut frame, 2) }.0.copy_from_slice(&[1, 2]);
     let mut device = TestingDevice::new(Medium::Ethernet);
     device
         .transmit_frame(Instant::ZERO)
         .unwrap()
-        .consume(frame, 2, None);
+        .consume(frame.freeze(), 2, None);
     assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
     assert_eq!(alloc.live(), 0);
 }

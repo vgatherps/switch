@@ -39,8 +39,9 @@ async fn echo_once(handle: NetHandle, socket: UdpSocket) -> (UdpRx, UdpTx, Datag
     let (mut rx, mut tx) = socket.split();
     let datagram = rx.recv().await;
     let mut frame = handle.tx_frame().await;
-    frame.room_mut()[..datagram.payload().len()].copy_from_slice(datagram.payload());
-    frame.set_len(datagram.payload().len());
+    frame.as_mut()[..datagram.payload().len()].copy_from_slice(datagram.payload());
+    frame.truncate(datagram.payload().len());
+    let frame = frame.freeze();
     tx.send(Some(datagram.src()), frame).map_err(|(_, error)| error).unwrap();
     (rx, tx, datagram)
 }

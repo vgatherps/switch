@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use switch::SpawnError;
 use switchnet::{
-    Connecting, IpEndpoint, IpListenEndpoint, NetHandle, SendFrameError, TcpTx, TxFrame, UdpConfig,
+    Connecting, IpEndpoint, IpListenEndpoint, NetHandle, SendFrameError, TcpTx, ImmutableFrame, OwnedFrame, UdpConfig,
     UdpRx, UdpSendError, UdpSendFrameError, UdpTx, tcp,
 };
 use zhida_open::Sizing;
@@ -150,7 +150,7 @@ enum Senders {
 impl Senders {
     /// Sends `frame` as message `k` from `sender`.
     #[inline]
-    fn send(&mut self, sender: u32, frame: TxFrame, target: IpEndpoint) -> Outcome {
+    fn send(&mut self, sender: u32, frame: ImmutableFrame, target: IpEndpoint) -> Outcome {
         match self {
             Senders::Udp(txs) => match txs[sender as usize].send(Some(target), frame) {
                 Ok(()) => Outcome::Sent,
@@ -412,8 +412,9 @@ async fn tcp_receive(
     if ws {
         let request = wsclient::request(&peer.ip().to_string(), peer.port());
         let mut frame = handle.tx_frame().await;
-        frame.room_mut()[..request.len()].copy_from_slice(request.as_bytes());
-        frame.set_len(request.len());
+        frame.as_mut()[..request.len()].copy_from_slice(request.as_bytes());
+        frame.truncate(request.len());
+        let frame = frame.freeze();
         if let Err((_, e)) = tx.try_send(frame) {
             panic!("ws upgrade request {i}: {e:?}");
         }
@@ -568,7 +569,7 @@ struct SendStep {
 
 /// An empty frame if the pool has one now; never waits (a cut-off send task must not be left
 /// parked on the pool).
-async fn try_tx_frame(handle: &NetHandle) -> Option<TxFrame> {
+async fn try_tx_frame(handle: &NetHandle) -> Option<OwnedFrame> {
     let mut wait = handle.tx_frame();
     std::future::poll_fn(|cx| {
         Poll::Ready(match Pin::new(&mut wait).poll(cx) {
@@ -643,12 +644,13 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
                 sched_ns,
             };
             let len = if ws {
-                wsclient::encode(frame.room_mut(), size, |m| header.write(m))
+                wsclient::encode(frame.as_mut(), size, |m| header.write(m))
             } else {
-                header.write(&mut frame.room_mut()[..size]);
+                header.write(&mut frame.as_mut()[..size]);
                 size
             };
-            frame.set_len(len);
+            frame.truncate(len);
+            let frame = frame.freeze();
             let owed = pacer.is_owed(k);
             let outcome = senders.borrow_mut().send(sender, frame, target);
             if outcome == Outcome::Sent {

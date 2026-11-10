@@ -117,8 +117,9 @@ async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
         let src = datagram.src();
         let mut frame = handle.tx_frame().await;
         let len = datagram.payload().len();
-        frame.room_mut()[..len].copy_from_slice(datagram.payload());
-        frame.set_len(len);
+        frame.as_mut()[..len].copy_from_slice(datagram.payload());
+        frame.truncate(len);
+        let mut frame = frame.freeze();
         drop(datagram);
         while let Err((
             back,
@@ -191,9 +192,10 @@ async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
         let mut rest = payload;
         while !rest.is_empty() {
             let mut frame = handle.tx_frame().await;
-            let len = rest.len().min(frame.room_mut().len());
-            frame.room_mut()[..len].copy_from_slice(&rest[..len]);
-            frame.set_len(len);
+            let len = rest.len().min(frame.as_mut().len());
+            frame.as_mut()[..len].copy_from_slice(&rest[..len]);
+            frame.truncate(len);
+            let mut frame = frame.freeze();
             rest = &rest[len..];
             loop {
                 match tx.try_send(frame) {

@@ -2,7 +2,7 @@
 //! task (`switch::request_turn`); the Net turn then sends them, and the next poll goes on
 //! with the tasks left. Nothing to configure.
 
-use switchnet::{IpEndpoint, NetHandle, TxFrame};
+use switchnet::{IpEndpoint, NetHandle, ImmutableFrame};
 use zhida_test_kit::with_eal;
 
 mod support;
@@ -11,11 +11,11 @@ use support::{Mixed, LOCAL_PORT, connect, counted, peer_drain, peer_ip, peer_udp
 /// The fixture ports' `tx_burst`.
 const TX_BURST: usize = 8;
 
-async fn filled(handle: &NetHandle, data: &[u8]) -> TxFrame {
+async fn filled(handle: &NetHandle, data: &[u8]) -> ImmutableFrame {
     let mut frame = handle.tx_frame().await;
-    frame.room_mut()[..data.len()].copy_from_slice(data);
-    frame.set_len(data.len());
-    frame
+    frame.as_mut()[..data.len()].copy_from_slice(data);
+    frame.truncate(data.len());
+    frame.freeze()
 }
 
 #[zhida_test_support::pinned_test]

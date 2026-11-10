@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
+use std::ptr::NonNull;
 
-use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium, TxBuf, TxChecksum, TxSource};
+use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium, ImmutableFrame, TxChecksum, TxSource};
 use smoltcp::time::Instant;
 use zhida_dpdk_sys::{
     rte_mbuf, zhida_errno, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
@@ -79,8 +80,7 @@ impl Device {
                 // invariant: header bytes in front of the payload and mbuf
                 // metadata of a published frame may be written by the device
                 // and by the PMD's tx_prepare; the payload region is written
-                // only while the frame is unique, which TxBuf's safe API
-                // enforces (room_mut and set_len assert unique). A TCP send
+                // only through OwnedFrame's exclusive mutable access. A TCP send
                 // queue holding a retained frame reads only its payload, so
                 // this write to the L4 checksum races nothing.
                 let ready = unsafe { eth_tx_prepare(port_id, 0, packets.as_mut_ptr().cast(), count) };
@@ -338,7 +338,7 @@ fn tx_offload(tx_checksum: Option<TxChecksum>) -> TxOffload {
     TxOffload { flags, l3, l4 }
 }
 
-/// A free pending slot for one frame-pool TxBuf, held by the exclusive borrow.
+/// A free pending slot for one frame-pool ImmutableFrame, held by the exclusive borrow.
 /// It takes no reference and allocates nothing; dropped without a consume, it
 /// does nothing.
 pub(crate) struct FrameTx<'a> {
@@ -352,18 +352,20 @@ impl FrameTx<'_> {
     /// payload. Panics, before writing, unless the frame is from this Stack's
     /// frame pool.
     #[inline(always)]
-    fn write(&self, frame: &TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
-        let raw = frame.mbuf().as_ptr();
+    fn write(&self, frame: &ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>) -> NonNull<rte_mbuf> {
         assert!(
-            frame.origin() == self.port.frame_origin(),
+            frame.ctx() == self.port.frame_origin().as_ptr(),
             "port {}: TX frame is not from this Stack's frame pool (TCP socket moved between Stacks)",
             self.port.port_id()
         );
+        // SAFETY: the identity check establishes this frame's DPDK producer.
+        let mbuf = unsafe { phy::frame_mbuf(frame) };
+        let raw = mbuf.as_ptr();
         let offload = tx_offload(tx_checksum);
         // SAFETY: the origin check makes `raw` a live, direct, single-segment
         // mbuf of this Stack's frame pool, its payload FRAME_DATA_OFF bytes into
         // its buffer and at most TX_HEADROOM (64) header bytes in front of it
-        // (TxBuf::headroom_mut). Metadata of a frame may be written by the
+        // (frame_headroom). Metadata of a frame may be written by the
         // device at publish; no Rust reference covers it. The packet length
         // fits u16: the payload fits the frame room, sized from a u16 MTU.
         unsafe {
@@ -373,30 +375,31 @@ impl FrameTx<'_> {
             (*raw).set_pkt_len(len as u32);
             offload.write(raw);
         }
+        mbuf
     }
 }
 
 impl phy::FrameToken for FrameTx<'_> {
-    #[inline]
-    fn consume(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>) {
-        self.write(&frame, header_len, tx_checksum);
-        // SAFETY: into_mbuf gives the frame's reference to this packet. The
-        // slot checked at transmit_frame is still free: this borrow was exclusive.
-        self.pending
-            .push_back(unsafe { TxPacket::from_raw(frame.into_mbuf()) });
+    #[inline(always)]
+    fn consume(self, frame: ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>) {
+        let raw = self.write(&frame, header_len, tx_checksum);
+        // Transfer this reference without changing the count.
+        let _ = frame.into_raw_parts();
+        // SAFETY: the transferred frame reference now belongs to this packet.
+        self.pending.push_back(unsafe { TxPacket::from_raw(raw) });
     }
 
     #[inline]
     fn consume_retain(
         self,
-        frame: TxBuf,
+        frame: ImmutableFrame,
         header_len: usize,
         tx_checksum: Option<TxChecksum>,
-    ) -> TxBuf {
-        self.write(&frame, header_len, tx_checksum);
+    ) -> ImmutableFrame {
+        let raw = self.write(&frame, header_len, tx_checksum);
+        let _ = frame.clone().into_raw_parts();
         // SAFETY: the clone's reference moves to this packet.
-        self.pending
-            .push_back(unsafe { TxPacket::from_raw(frame.clone().into_mbuf()) });
+        self.pending.push_back(unsafe { TxPacket::from_raw(raw) });
         frame
     }
 }

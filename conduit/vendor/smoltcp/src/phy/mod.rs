@@ -11,19 +11,21 @@ An implementation of the [Device](trait.Device.html) trait for a simple hardware
 Ethernet controller could look as follows:
 
 ```rust
-use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, TxBuf, TxChecksum};
+use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, ImmutableFrame, TxChecksum};
 use smoltcp::time::Instant;
 
 struct StmPhy {
     rx_buffer: Vec<u8>,
     tx_buffer: [u8; 1536],
+    source: phy::TxSource,
 }
 
 impl<'a> StmPhy {
-    fn new() -> StmPhy {
+    fn new(source: phy::TxSource) -> StmPhy {
         StmPhy {
             rx_buffer: vec![0; 1536],
             tx_buffer: [0; 1536],
+            source,
         }
     }
 }
@@ -44,7 +46,7 @@ impl phy::Device for StmPhy {
     }
 
     fn transmit_frame(&mut self, _timestamp: Instant) -> Option<Self::FrameToken<'_>> {
-        Some(StmPhyFrameToken(&mut self.tx_buffer[..]))
+        Some(StmPhyFrameToken(&mut self.tx_buffer[..], self.source.origin()))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -76,18 +78,20 @@ impl<'a> phy::TxToken for StmPhyTxToken<'a> {
     }
 }
 
-struct StmPhyFrameToken<'a>(&'a mut [u8]);
+struct StmPhyFrameToken<'a>(&'a mut [u8], *mut ());
 
 impl phy::FrameToken for StmPhyFrameToken<'_> {
-    fn consume(self, frame: TxBuf, header_len: usize, _: Option<TxChecksum>) {
-        let packet = frame.packet(header_len);
+    fn consume(self, frame: ImmutableFrame, header_len: usize, _: Option<TxChecksum>) {
+        assert_eq!(frame.ctx(), self.1, "foreign TX frame producer");
+        let packet = unsafe { phy::frame_packet(&frame, header_len) };
         self.0[..packet.len()].copy_from_slice(packet);
         println!("tx called {}", packet.len());
         // TODO: send packet out
     }
 
-    fn consume_retain(self, frame: TxBuf, header_len: usize, _: Option<TxChecksum>) -> TxBuf {
-        let packet = frame.packet(header_len);
+    fn consume_retain(self, frame: ImmutableFrame, header_len: usize, _: Option<TxChecksum>) -> ImmutableFrame {
+        assert_eq!(frame.ctx(), self.1, "foreign TX frame producer");
+        let packet = unsafe { phy::frame_packet(&frame, header_len) };
         self.0[..packet.len()].copy_from_slice(packet);
         println!("tx called {}", packet.len());
         // TODO: send packet out
@@ -107,8 +111,13 @@ mod held_frames;
 
 pub use self::loopback::Loopback;
 pub use self::rx_buf::RxBuf;
-pub use self::tx_buf::{TxBuf, TxFrame, TxPool, TxSource, TX_HEADROOM};
-pub(crate) use self::tx_buf::UniqueTxBuf;
+pub use netframe::{ImmutableFrame, OwnedFrame};
+pub use self::tx_buf::{alloc_frame, frame_headroom, frame_packet, TxPool, TxSource, TX_HEADROOM};
+#[cfg(feature = "dpdk")]
+pub use self::tx_buf::frame_mbuf;
+pub(crate) use self::tx_buf::append_frame;
+#[cfg(test)]
+pub(crate) use self::tx_buf::frame_refcount;
 pub use self::held_frames::HeldFrames;
 pub(crate) use self::held_frames::RxShared;
 
@@ -310,7 +319,7 @@ pub trait Device {
     /// arbitrary moment in time, such as system startup.
     fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>>;
 
-    /// One free publish slot for an existing TxBuf; takes no reference and allocates nothing.
+    /// One free publish slot for an existing ImmutableFrame; takes no reference and allocates nothing.
     fn transmit_frame(&mut self, timestamp: Instant) -> Option<Self::FrameToken<'_>>;
 
     /// Get a description of device capabilities.
@@ -347,14 +356,15 @@ pub trait TxToken {
     fn set_meta(&mut self, meta: PacketMeta) {}
 }
 
-/// Publishes one packet, `frame.packet(header_len)`: the stack wrote `header_len` header bytes
+/// Publishes one packet, [`frame_packet(frame, header_len)`](frame_packet): the stack wrote `header_len` header bytes
 /// in front of the payload while the frame was unique. `tx_checksum` is the checksum the device
 /// completes. Dropping the token unconsumed does nothing.
+/// A device must check `frame.ctx()` against its producer before interpreting producer metadata.
 pub trait FrameToken {
     /// The frame's reference moves to the device.
-    fn consume(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>);
+    fn consume(self, frame: ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>);
 
     /// The device takes another reference; the caller's comes back.
-    fn consume_retain(self, frame: TxBuf, header_len: usize, tx_checksum: Option<TxChecksum>)
-    -> TxBuf;
+    fn consume_retain(self, frame: ImmutableFrame, header_len: usize, tx_checksum: Option<TxChecksum>)
+    -> ImmutableFrame;
 }

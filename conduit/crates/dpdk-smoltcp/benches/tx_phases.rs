@@ -484,10 +484,10 @@ impl Bench {
                 let frame = times.time(Phase::Allocate, || pair.a.tx_frame());
                 let mut frame = frame.expect("frame pool holds the benchmark's writes");
                 times.time(Phase::Fill, || {
-                    frame.room_mut()[..len].copy_from_slice(payload);
-                    frame.set_len(len);
+                    frame.as_mut()[..len].copy_from_slice(payload);
+                    frame.truncate(len);
                 });
-                let queued = times.time(Phase::Enqueue, || pair.a.tcp_send_frame(client, frame));
+                let queued = times.time(Phase::Enqueue, || pair.a.tcp_send_frame(client, frame.freeze()));
                 if let Err((_, error)) = queued {
                     panic!("{} enqueue: {error}", case.name());
                 }

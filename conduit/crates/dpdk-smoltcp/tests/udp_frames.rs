@@ -4,7 +4,7 @@
 //! (src/device_tests.rs, `udp_*frame*`).
 
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
-use dpdk_smoltcp::smoltcp::phy::TxFrame;
+use dpdk_smoltcp::smoltcp::phy::ImmutableFrame;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, EthernetFrame, EthernetProtocol, IpEndpoint, Ipv4Address,
@@ -73,11 +73,11 @@ fn resolve_peer(fixture: &RingPort, stack: &mut Stack) {
     assert_eq!((turn.rx_processed, turn.tx_accepted), (1, 0));
 }
 
-fn frame(stack: &mut Stack, payload: &[u8]) -> TxFrame {
+fn frame(stack: &mut Stack, payload: &[u8]) -> ImmutableFrame {
     let mut frame = stack.tx_frame().unwrap();
-    frame.room_mut()[..payload.len()].copy_from_slice(payload);
-    frame.set_len(payload.len());
-    frame
+    frame.as_mut()[..payload.len()].copy_from_slice(payload);
+    frame.truncate(payload.len());
+    frame.freeze()
 }
 
 fn peer(port: u16) -> Option<IpEndpoint> {
@@ -147,7 +147,7 @@ fn udp_send_frame_reaches_wire_like_udp_send() {
             assert_eq!(sent(&mut stack), 1);
             assert_eq!(fixture.take_tx(), copied);
             assert_eq!(fixture.frame_in_use(), 1);
-            assert_eq!(kept.payload(), payload);
+            assert_eq!(kept.as_ref(), payload);
             drop(kept);
             assert_eq!(fixture.frame_in_use(), 0);
         }
@@ -160,15 +160,15 @@ fn refused(
     stack: &mut Stack,
     handle: &UdpHandle,
     to: Option<IpEndpoint>,
-    frame: TxFrame,
+    frame: ImmutableFrame,
     error: UdpSendFrameError,
-) -> TxFrame {
-    let payload = frame.payload().to_vec();
+) -> ImmutableFrame {
+    let payload = frame.as_ref().to_vec();
     match stack.udp_send_frame(handle, to, frame) {
         Ok(()) => panic!("send succeeded"),
         Err((frame, got)) => {
             assert_eq!(got, error);
-            assert_eq!(frame.payload(), payload);
+            assert_eq!(frame.as_ref(), payload);
             frame
         }
     }
@@ -228,7 +228,10 @@ fn udp_copy_with_frame_pool_empty_would_block() {
         let mut stack = stack(fixture.open(eal), 1);
         let handle = add_udp(&mut stack, PORT);
         resolve_peer(&fixture, &mut stack);
-        let mut held: Vec<_> = std::iter::from_fn(|| stack.tx_frame()).collect();
+        let mut held: Vec<_> = std::iter::from_fn(|| stack.tx_frame()).map(|mut frame| {
+            frame.truncate(0);
+            frame.freeze()
+        }).collect();
         assert!(!held.is_empty());
         assert_eq!(fixture.frame_in_use(), held.len() as u32);
         let off_subnet = Some(IpEndpoint::new(Ipv4Address::new(192, 0, 2, 1).into(), PEER_PORT));
@@ -290,7 +293,7 @@ fn udp_broadcast_one_frame_to_eight_sockets() {
         }
         assert_eq!(fixture.frame_in_use(), 1);
         assert_eq!(fixture.in_use(), (0, tx_before));
-        assert_eq!(frame.payload(), payload);
+        assert_eq!(frame.as_ref(), payload);
         drop(frame);
         finish(fixture, stack);
     });

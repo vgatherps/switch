@@ -13,7 +13,7 @@ Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md) and [`swit
 - `UdpSocket`: `recv()` yields a `Datagram` (`payload`, `src`, `dst_addr`, `rx_timestamp`); `split()` gives `UdpRx` (`recv`) and `UdpTx` (`send(to, frame)`, synchronous; errors return the frame; `WouldBlock` clears after a turn).
 - `Connecting`, `Accepting` and `Closed` are the connection-setup futures and error.
 - Running tasks: `round(net, rt, now, tick)` is the loop owner's step (turn, poll; returns whether anything moved, and never sleeps: a loop that may sleep when idle does so itself); `first(a, b)` races two futures; `within(spawner, limit, f)` bounds one by a Runtime sleep. For `within`, Runtime initialization and polling ticks and all relative sleeps on that Runtime must use monotonic nanoseconds; the Stack's `Instant` remains in microseconds. Used by binance-feed, nic-runner and relay-autobahn.
-- Re-exports from `dpdk-smoltcp`: `Stack`, `Turn`, `StackError`, `UdpConfig`, `TxFrame`, `UdpSendError`, `UdpSendFrameError`, `Instant`, the `tcp` module (with smoltcp's `SendError`, `SendFrameError`), `SendFrameError` and address types.
+- Re-exports: `Stack`, `Turn`, `StackError`, `UdpConfig`, netframe's `OwnedFrame` and `ImmutableFrame`, `UdpSendError`, `UdpSendFrameError`, `Instant`, the `tcp` module (with smoltcp's `SendError`, `SendFrameError`), `SendFrameError` and address types. `tx_frame().await` yields an `OwnedFrame` covering the full payload room; fill it through its mutable slice, `truncate(n)`, then `freeze()` for `TcpTx::try_send` or `UdpTx::send`.
 
 ## Constraints
 

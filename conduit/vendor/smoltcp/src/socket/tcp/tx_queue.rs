@@ -3,7 +3,7 @@
 use alloc::{collections::VecDeque, vec::Vec};
 use core::cell::Cell;
 
-use crate::phy::{TxBuf, TxSource, UniqueTxBuf};
+use crate::phy::{ImmutableFrame, TxSource, OwnedFrame};
 
 pub(crate) struct TxQueue {
     entries: VecDeque<Entry>,
@@ -27,7 +27,7 @@ impl core::fmt::Debug for TxQueue {
 }
 
 struct Entry {
-    buf: Option<TxBuf>,
+    buf: Option<ImmutableFrame>,
     end: u64,
 }
 
@@ -39,14 +39,13 @@ impl Entry {
     }
 
     #[inline]
-    fn buf(&self) -> &TxBuf {
+    fn buf(&self) -> &ImmutableFrame {
         self.buf.as_ref().expect("TX queue frame is taken")
     }
 }
 
 pub(crate) enum Seg<'a> {
     Empty,
-    Whole { index: u32 },
     Cut(&'a [u8]),
 }
 
@@ -94,8 +93,8 @@ impl TxQueue {
 
     /// Append a frame. The caller checked it is not empty and fits the byte room.
     #[inline]
-    pub(crate) fn push(&mut self, buf: TxBuf) {
-        debug_assert!(buf.len() != 0, "cannot queue an empty TX buffer");
+    pub(crate) fn push(&mut self, buf: ImmutableFrame) {
+        debug_assert!(!buf.is_empty(), "cannot queue an empty TX buffer");
         debug_assert!(buf.len() <= self.byte_room(), "TX buffer exceeds byte room");
         self.end += buf.len() as u64;
         self.entries.push_back(Entry {
@@ -113,19 +112,21 @@ impl TxQueue {
         if first_never_sent > entry.start() {
             return 0;
         }
-        let buf = entry.buf.as_mut().expect("TX queue tail is taken");
-        if !buf.unique() {
-            return 0;
-        }
-        let old_len = buf.len();
-        // A frame the app filled past `cap` (up to its capacity) takes no more bytes.
-        let count = (buf.capacity() - old_len)
-            .min(byte_room)
-            .min(cap.saturating_sub(old_len))
-            .min(data.len());
-        let new_len = old_len + count;
-        buf.room_mut()[old_len..new_len].copy_from_slice(&data[..count]);
-        buf.set_len(new_len);
+        let shared = entry.buf.take().expect("TX queue tail is taken");
+        let mut buf = match shared.try_own() {
+            Ok(buf) => buf,
+            Err(shared) => {
+                entry.buf = Some(shared);
+                return 0;
+            }
+        };
+        // SAFETY: queued frames came from this queue's source. Only an unsent unique
+        // tail can grow into the producer's remaining room.
+        #[allow(unsafe_code)]
+        let count = unsafe {
+            crate::phy::append_frame(&mut buf, &data[..data.len().min(byte_room)], cap)
+        };
+        entry.buf = Some(buf.freeze());
         entry.end += count as u64;
         self.end = entry.end;
         count
@@ -162,22 +163,17 @@ impl TxQueue {
         let index = self.locate(position);
         self.hint.set(index as u32);
         let entry = &self.entries[index];
-        let buf = entry.buf();
         let start = entry.start();
-        if position == start && size >= buf.len() && buf.unique() {
-            return Seg::Whole {
-                index: index as u32,
-            };
-        }
+        let buf = entry.buf();
         let within = (position - start) as usize;
         let end = within + size.min(buf.len() - within);
-        Seg::Cut(&buf.payload()[within..end])
+        Seg::Cut(&buf[within..end])
     }
 
     /// Take the frame `segment(offset, size)` would send whole: one that starts at `offset`,
     /// fits `size` and holds its only reference, read once. `None` leaves the queue unchanged.
     #[inline(always)]
-    pub(crate) fn take_whole(&mut self, offset: usize, size: usize) -> Option<(u32, UniqueTxBuf)> {
+    pub(crate) fn take_whole(&mut self, offset: usize, size: usize) -> Option<(u32, OwnedFrame)> {
         if size == 0 || offset >= self.len() {
             return None;
         }
@@ -189,7 +185,7 @@ impl TxQueue {
             return None;
         }
         let buf = entry.buf.take().expect("TX queue frame is taken");
-        match buf.into_unique() {
+        match buf.try_own() {
             Ok(frame) => Some((index as u32, frame)),
             Err(shared) => {
                 entry.buf = Some(shared);
@@ -225,14 +221,14 @@ impl TxQueue {
             let buf = entry.buf();
             let within = (position + copied as u64 - entry.start()) as usize;
             let count = (size - copied).min(buf.len() - within);
-            output.extend_from_slice(&buf.payload()[within..within + count]);
+            output.extend_from_slice(&buf.as_ref()[within..within + count]);
             copied += count;
             index += 1;
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn take(&mut self, index: u32) -> TxBuf {
+    pub(crate) fn take(&mut self, index: u32) -> ImmutableFrame {
         self.entries[index as usize]
             .buf
             .take()
@@ -241,9 +237,9 @@ impl TxQueue {
 
     /// Return the frame `take_whole` took from `index`.
     #[inline]
-    pub(crate) fn put_back(&mut self, index: u32, buf: TxBuf) {
+    pub(crate) fn put_back(&mut self, index: u32, buf: ImmutableFrame) {
         let index = index as usize;
-        debug_assert_eq!(buf.origin(), self.source.origin(), "TX queue frame has wrong origin");
+        debug_assert_eq!(buf.ctx(), self.source.origin(), "TX queue frame has wrong origin");
         debug_assert!(
             index == 0 || self.entries[index - 1].end == self.entries[index].end - buf.len() as u64,
             "TX queue frame has wrong length"
@@ -295,9 +291,9 @@ impl TxQueue {
     #[cfg(test)]
     pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
         let mut buf = self.source.alloc().expect("test TX allocator is empty");
-        buf.room_mut()[..bytes.len()].copy_from_slice(bytes);
-        buf.set_len(bytes.len());
-        self.push(buf);
+        buf.as_mut()[..bytes.len()].copy_from_slice(bytes);
+        buf.truncate(bytes.len());
+        self.push(buf.freeze());
     }
 }
 
@@ -318,6 +314,12 @@ mod tests {
             Seg::Cut(bytes) => bytes,
             _ => panic!("expected cut segment"),
         }
+    }
+
+    fn assert_whole(queue: &mut TxQueue, offset: usize, size: usize, expected: u32) {
+        let (index, frame) = queue.take_whole(offset, size).expect("expected whole frame");
+        assert_eq!(index, expected);
+        queue.put_back(index, frame.freeze());
     }
 
     #[test]
@@ -361,7 +363,7 @@ mod tests {
         queue.push_bytes(&[1, 2]);
         assert_eq!(queue.append_tail(0, &[3, 4, 5], 4), 2);
         assert_eq!(queue.len(), 4);
-        assert_eq!(queue.entries[0].buf.as_ref().unwrap().payload(), &[1, 2, 3, 4]);
+        assert_eq!(queue.entries[0].buf.as_ref().unwrap().as_ref(), &[1, 2, 3, 4]);
         assert_eq!(queue.append_tail(1, &[5], 1), 0);
     }
 
@@ -380,12 +382,12 @@ mod tests {
         for byte in 0..24 {
             queue.push_bytes(&[byte]);
         }
-        assert!(matches!(queue.segment(0, 1), Seg::Whole { index: 0 }));
+        assert_whole(&mut queue, 0, 1, 0);
         assert_eq!(queue.hint.get(), 0);
-        assert!(matches!(queue.segment(20, 1), Seg::Whole { index: 20 }));
+        assert_whole(&mut queue, 20, 1, 20);
         assert_eq!(queue.hint.get(), 20);
-        assert!(matches!(queue.segment(20, 1), Seg::Whole { index: 20 }));
-        assert!(matches!(queue.segment(21, 1), Seg::Whole { index: 21 }));
+        assert_whole(&mut queue, 20, 1, 20);
+        assert_whole(&mut queue, 21, 1, 21);
     }
 
     #[test]
@@ -406,10 +408,10 @@ mod tests {
         for byte in 0..8 {
             queue.push_bytes(&[byte]);
         }
-        assert!(matches!(queue.segment(5, 1), Seg::Whole { index: 5 }));
+        assert_whole(&mut queue, 5, 1, 5);
         for (acked, expected_index) in (1usize..=5).zip((0..5).rev()) {
             queue.ack(1);
-            assert!(matches!(queue.segment(5 - acked, 1), Seg::Whole { index } if index == expected_index));
+            assert_whole(&mut queue, 5 - acked, 1, expected_index);
             assert_eq!(queue.hint.get(), expected_index);
             assert_eq!(queue.locate(5), usize::try_from(expected_index).unwrap());
         }
@@ -435,7 +437,7 @@ mod tests {
     fn segment_whole_when_frame_start_and_fits() {
         let (mut queue, _) = queue(8, 8);
         queue.push_bytes(&[1, 2, 3]);
-        assert!(matches!(queue.segment(0, 3), Seg::Whole { index: 0 }));
+        assert_whole(&mut queue, 0, 3, 0);
         assert_eq!(cut(queue.segment(0, 2)), &[1, 2]);
         let clone = queue.entries[0].buf.as_ref().unwrap().clone();
         assert_eq!(cut(queue.segment(0, 3)), &[1, 2, 3]);
@@ -489,14 +491,14 @@ mod tests {
         assert!(queue.entries[1].buf.is_some());
         drop(clone);
         let (index, frame) = queue.take_whole(2, 8).unwrap();
-        assert_eq!((index, frame.payload()), (1, &[3, 4, 5][..]));
+        assert_eq!((index, frame.as_ref()), (1, &[3, 4, 5][..]));
         assert!(queue.entries[1].buf.is_none());
         assert_eq!(queue.len(), 5);
-        queue.put_back(index, frame.into_buf());
+        queue.put_back(index, frame.freeze());
         assert_eq!(cut(queue.segment(3, 2)), &[4, 5]);
         let (index, frame) = queue.take_whole(0, 2).unwrap();
-        assert_eq!((index, frame.payload()), (0, &[1, 2][..]));
-        queue.put_back(index, frame.into_buf());
+        assert_eq!((index, frame.as_ref()), (0, &[1, 2][..]));
+        queue.put_back(index, frame.freeze());
     }
 
     #[test]
@@ -505,7 +507,7 @@ mod tests {
         queue.push_bytes(&[1, 2]);
         queue.push_bytes(&[3, 4, 5]);
         let frame = queue.take(1);
-        assert_eq!(frame.payload(), &[3, 4, 5]);
+        assert_eq!(frame.as_ref(), &[3, 4, 5]);
         assert_eq!(queue.len(), 5);
         queue.put_back(1, frame);
         assert_eq!(cut(queue.segment(3, 1)), &[4]);

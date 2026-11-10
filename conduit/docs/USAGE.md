@@ -449,9 +449,13 @@ capacity bounds retention. Ingress needs a TX packet before processing each RX f
 needs no reply, so an empty TX pool blocks receive too. Add room for PMD-specific allocations such
 as the `net_tap` checksum header copy.
 
-`Stack::tx_frame() -> Option<TxFrame>` takes an empty frame from the frame pool: its payload starts
-42 bytes after the mbuf headroom and holds up to IP MTU − 28 bytes. `None` means the pool is empty;
-dropping a frame returns it. Frame-pool mbufs may be shared (refcount above 1) but stay direct and
+`Stack::tx_frame() -> Option<OwnedFrame>` takes exclusive `netframe` storage covering the frame
+pool's full payload room, IP MTU − 28 bytes, starting 42 bytes after the mbuf headroom.
+Write through the mutable slice, `truncate(n)` to the payload length, then `freeze()` to obtain
+the `ImmutableFrame` accepted by TCP and UDP sends. Only immutable frames can be cloned;
+`try_own()` recovers mutable access once the last other holder has released its reference.
+`None` means the pool is empty; dropping the last reference returns the frame. Frame-pool mbufs
+may be shared (refcount above 1) but stay direct and
 single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame
 pool count, `tx_descriptors + tx_pending + 1`: every packet the PMD or the pending queue holds keeps
 at most one frame no socket or application counts, and the extra frame means those packets can never
@@ -884,16 +888,16 @@ purged. `peer()` reads the optional peer, and `config()` reads the socket config
 
 ### Send datagrams
 
-`udp_send_frame(&handle, to: Option<IpEndpoint>, frame: TxFrame)` sends a frame from
+`udp_send_frame(&handle, to: Option<IpEndpoint>, frame: ImmutableFrame)` sends a frame from
 `Stack::tx_frame` whose payload the application wrote in place. `udp_send(&handle, to, payload: &[u8])`
 copies a payload the application already holds into a frame. Both run at the interface's stored time,
 without reading a clock.
 
 ```rust
 let mut frame = stack.tx_frame().ok_or(Error::NoFrame)?;
-frame.room_mut()[..5].copy_from_slice(b"hello");
-frame.set_len(5);
-stack.udp_send_frame(&handle, Some(peer), frame).map_err(|(_frame, error)| error)?;
+frame[..5].copy_from_slice(b"hello");
+frame.truncate(5);
+stack.udp_send_frame(&handle, Some(peer), frame.freeze()).map_err(|(_frame, error)| error)?;
 let sent = stack.flush()?;
 ```
 

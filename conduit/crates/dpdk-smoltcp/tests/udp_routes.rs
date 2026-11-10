@@ -211,11 +211,12 @@ fn off_subnet_without_gateway_no_route() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, None, PEERS);
         let mut frame = pair.a.tx_frame().unwrap();
-        frame.room_mut()[..6].copy_from_slice(b"remote");
-        frame.set_len(6);
+        frame.as_mut()[..6].copy_from_slice(b"remote");
+        frame.truncate(6);
+        let frame = frame.freeze();
         let (frame, error) = pair.a.udp_send_frame(&handle, Some(endpoint(PEER)), frame).unwrap_err();
         assert_eq!(error, UdpSendFrameError::Udp(UdpSendError::NoRoute));
-        assert_eq!(frame.payload(), b"remote");
+        assert_eq!(frame.as_ref(), b"remote");
         drop(frame);
         assert_eq!(
             pair.a.udp_send(&handle, Some(endpoint(PEER)), b"remote"),

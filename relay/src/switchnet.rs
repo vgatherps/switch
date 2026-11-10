@@ -29,11 +29,11 @@ impl PlainTx for SwitchTx {
         false
     }
 
-    fn take_pending(&mut self, _: switchnet::TxFrame) -> Result<Option<switchnet::TxFrame>, SendError> {
+    fn take_pending(&mut self, _: switchnet::OwnedFrame) -> Result<Option<switchnet::ImmutableFrame>, SendError> {
         Ok(None)
     }
 
-    fn seal_close(&mut self, _: switchnet::TxFrame) -> Result<Option<switchnet::TxFrame>, SendError> {
+    fn seal_close(&mut self, _: switchnet::OwnedFrame) -> Result<Option<switchnet::ImmutableFrame>, SendError> {
         Ok(None)
     }
 }

@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-pub use dpdk_smoltcp::smoltcp::phy::TxFrame;
+pub use dpdk_smoltcp::smoltcp::phy::{ImmutableFrame, OwnedFrame};
 pub use dpdk_smoltcp::smoltcp::socket::tcp;
 pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendFrameError};
 pub use dpdk_smoltcp::smoltcp::time::Instant;
@@ -428,8 +428,8 @@ impl NetHandle {
         })
     }
 
-    /// `Future<Output = TxFrame>`: an empty frame from the Stack's frame pool
-    /// (`capacity()` is the IP MTU − 28). While the pool is empty the task
+    /// `Future<Output = OwnedFrame>`: exclusive storage from the Stack's frame pool
+    /// (`len()` is the IP MTU − 28). While the pool is empty the task
     /// waits; it is woken by the first `Net::turn` that finds a free frame,
     /// and may wait again if another task took it first.
     pub fn tx_frame(&self) -> TxFrameWait<'_> {
@@ -442,9 +442,9 @@ pub struct TxFrameWait<'a> {
 }
 
 impl Future for TxFrameWait<'_> {
-    type Output = TxFrame;
+    type Output = OwnedFrame;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TxFrame> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedFrame> {
         let mut inner = self.handle.shared.borrow_mut();
         if let Some(frame) = inner.stack.tx_frame() {
             return Poll::Ready(frame);
@@ -641,7 +641,7 @@ impl TcpTx {
     /// Queues `frame` (conduit `send_frame`); it leaves in a later turn. Every
     /// error returns the same frame: `Full` when it does not fit now,
     /// `InvalidState` when the socket cannot send, `Empty`, `Foreign`.
-    pub fn try_send(&mut self, frame: TxFrame) -> Result<(), (TxFrame, SendFrameError)> {
+    pub fn try_send(&mut self, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, SendFrameError)> {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.tcp(self.0.index);
         stack.tcp_send_frame(handle, frame)?;
@@ -819,7 +819,7 @@ impl UdpTx {
     /// Sends `frame` as one datagram (conduit `udp_send_frame`); `to` may be
     /// `None` for a connected socket. Every error returns the same frame;
     /// `WouldBlock` (TX queue full) clears after a turn.
-    pub fn send(&mut self, to: Option<IpEndpoint>, frame: TxFrame) -> Result<(), (TxFrame, UdpSendFrameError)> {
+    pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, UdpSendFrameError)> {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.udp(self.0.index);
         stack.udp_send_frame(handle, to, frame)?;

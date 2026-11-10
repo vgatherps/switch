@@ -1042,7 +1042,7 @@ fn largest_control_frames_fit_a_131_byte_send_buffer() {
 }
 
 /// Every frame of the Net taken, so a frame wait cannot end by a frame returning.
-async fn take_every_frame(handle: &NetHandle) -> Vec<switchnet::TxFrame> {
+async fn take_every_frame(handle: &NetHandle) -> Vec<switchnet::OwnedFrame> {
     let mut held = Vec::new();
     while let Some(frame) = within_rounds(1, handle.tx_frame()).await {
         held.push(frame);

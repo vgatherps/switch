@@ -7,7 +7,7 @@ use smoltcp::iface::{
     SocketHandle, TcpSet, UdpAddError, UdpConfig, UdpSendError, UdpSet,
     UdpSocket,
 };
-use smoltcp::phy::TxFrame;
+use smoltcp::phy::{ImmutableFrame, OwnedFrame};
 use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
@@ -422,11 +422,13 @@ impl Stack {
         self.iface.resolve_gateway(&mut self.device)
     }
 
-    /// An empty TX frame from this Stack's frame pool: `capacity()` is the IP
+    /// Exclusive storage covering this Stack's full payload room: `len()` is the IP
     /// MTU − 28, the largest UDP payload. `None` when the pool is empty.
+    /// Fill the payload, `truncate` to its length, then `freeze` to send.
     /// Dropping the frame returns it to the pool.
-    pub fn tx_frame(&mut self) -> Option<TxFrame> {
-        TxFrame::alloc(self.device.frame_pool())
+    #[inline]
+    pub fn tx_frame(&mut self) -> Option<OwnedFrame> {
+        smoltcp::phy::alloc_frame(self.device.frame_pool())
     }
 
     fn set_now(&mut self, now: Instant) -> Result<(), StackError> {
@@ -686,13 +688,14 @@ impl Stack {
     /// another Stack's pool. Then `udp_send`'s errors in its order, except that
     /// a unique frame needs no frame-pool copy and so cannot report the empty
     /// pool; `WouldBlock` means flush, then retry.
+    #[inline]
     pub fn udp_send_frame(
         &mut self,
         handle: &UdpHandle,
         to: Option<IpEndpoint>,
-        frame: TxFrame,
-    ) -> Result<(), (TxFrame, UdpSendFrameError)> {
-        if frame.origin().as_ptr() != self.device.frame_pool().mempool().cast() {
+        frame: ImmutableFrame,
+    ) -> Result<(), (ImmutableFrame, UdpSendFrameError)> {
+        if frame.ctx() != self.device.frame_pool().mempool().cast() {
             return Err((frame, UdpSendFrameError::Foreign));
         }
         let raw = self.udp_raw(handle);
@@ -738,8 +741,8 @@ impl Stack {
     pub fn tcp_send_frame(
         &mut self,
         handle: &TcpHandle,
-        frame: TxFrame,
-    ) -> Result<(), (TxFrame, tcp::SendFrameError)> {
+        frame: ImmutableFrame,
+    ) -> Result<(), (ImmutableFrame, tcp::SendFrameError)> {
         self.tcp_mut(handle).send_frame(frame)
     }
 
