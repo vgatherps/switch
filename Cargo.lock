@@ -764,6 +764,8 @@ dependencies = [
  "dpdk-smoltcp",
  "junction",
  "slice_ringbuffer",
+ "switch",
+ "switchnet",
  "zhida-test-kit",
  "zhida-test-support",
 ]

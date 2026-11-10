@@ -16,6 +16,8 @@ slice_ringbuffer.workspace = true
 ceph-ring.workspace = true
 zhida-test-kit.workspace = true
 zhida-test-support.workspace = true
+switchnet.workspace = true
+switch.workspace = true
 
 [lints]
 workspace = true

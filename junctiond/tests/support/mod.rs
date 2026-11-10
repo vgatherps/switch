@@ -76,6 +76,9 @@ pub struct Fixture {
     pub retired: Vec<u64>,
     pub protocol_errors: Vec<u64>,
     pub released: Vec<u64>,
+    hold_connected: bool,
+    held_connected: Vec<FromNetwork>,
+    pub closed_events: usize,
     network_events: Receiver<FromNetwork>,
     forward_events: Sender<FromNetwork>,
     control: Receiver<ToNetwork>,
@@ -320,6 +323,9 @@ impl Fixture {
             streams: Vec::new(),
             retired: Vec::new(),
             released: Vec::new(),
+            hold_connected: false,
+            held_connected: Vec::new(),
+            closed_events: 0,
             network_events,
             protocol_errors: Vec::new(),
             forward_events,
@@ -530,8 +536,38 @@ impl Fixture {
             if let FromNetwork::ProtocolError { session } = &message {
                 self.protocol_errors.push(*session);
             }
+            if matches!(&message, FromNetwork::Event { event: Event::Closed { .. }, .. }) {
+                self.closed_events += 1;
+            }
+            if self.hold_connected
+                && matches!(&message, FromNetwork::Event { event: Event::Connected { .. }, .. })
+            {
+                self.held_connected.push(message);
+                continue;
+            }
             self.forward_events.send(message).unwrap();
         }
+    }
+
+    /// Delay only real Connected events; packet publication proceeds independently.
+    pub fn hold_connected(&mut self) {
+        self.hold_connected = true;
+    }
+
+    pub fn release_connected(&mut self) {
+        self.hold_connected = false;
+        for message in self.held_connected.drain(..) {
+            self.forward_events.send(message).unwrap();
+        }
+    }
+
+    pub fn connected_is_held(&self) -> bool {
+        !self.held_connected.is_empty()
+    }
+
+    /// Exercise the host's real terminal End and connection removal path.
+    pub fn terminate_session(&self, session: u64) {
+        self.forward_events.send(FromNetwork::ProtocolError { session }).unwrap();
     }
 
     fn forward_links(&mut self) -> bool {
