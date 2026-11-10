@@ -155,6 +155,27 @@ fn udp_send_frame_reaches_wire_like_udp_send() {
     });
 }
 
+#[zhida_test_support::pinned_test]
+fn sliced_unique_udp_frame_reaches_wire() {
+    with_eal(|eal| {
+        let fixture = RingPort::new("udpfr_slice", 16, 16);
+        let mut stack = stack(fixture.open(eal), 1);
+        let handle = add_udp(&mut stack, PORT);
+        resolve_peer(&fixture, &mut stack);
+        // Exercise both the initial header build and the cached template.
+        for _ in 0..2 {
+            let sliced = frame(&mut stack, b"!slice").slice(1..6);
+            assert!(stack.udp_send_frame(&handle, peer(PEER_PORT), sliced).is_ok());
+            assert_eq!(sent(&mut stack), 1);
+            let datagrams = fixture.take_tx();
+            assert_eq!(datagrams.len(), 1);
+            assert_datagram(&datagrams[0], PORT, b"slice");
+            assert_eq!(fixture.frame_in_use(), 0);
+        }
+        finish(fixture, stack);
+    });
+}
+
 #[track_caller]
 fn refused(
     stack: &mut Stack,

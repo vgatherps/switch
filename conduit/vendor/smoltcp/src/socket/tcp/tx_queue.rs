@@ -171,7 +171,8 @@ impl TxQueue {
     }
 
     /// Take the frame `segment(offset, size)` would send whole: one that starts at `offset`,
-    /// fits `size` and holds its only reference, read once. `None` leaves the queue unchanged.
+    /// fits `size`, holds its only reference and is at its original payload start.
+    /// `None` leaves the queue unchanged.
     #[inline(always)]
     pub(crate) fn take_whole(&mut self, offset: usize, size: usize) -> Option<(u32, OwnedFrame)> {
         if size == 0 || offset >= self.len() {
@@ -186,7 +187,16 @@ impl TxQueue {
         }
         let buf = entry.buf.take().expect("TX queue frame is taken");
         match buf.try_own() {
-            Ok(frame) => Some((index as u32, frame)),
+            Ok(frame) => {
+                // SAFETY: queued frames came from this queue's source.
+                #[allow(unsafe_code)]
+                let at_start = unsafe { crate::phy::frame_at_start(&frame) };
+                if !at_start {
+                    entry.buf = Some(frame.freeze());
+                    return None;
+                }
+                Some((index as u32, frame))
+            }
             Err(shared) => {
                 entry.buf = Some(shared);
                 None

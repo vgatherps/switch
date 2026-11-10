@@ -667,6 +667,25 @@ fn shared_frame_send_copies() {
     });
 }
 
+#[zhida_test_support::pinned_test]
+fn sliced_unique_tcp_frame_reaches_wire() {
+    with_eal(|eal| {
+        let mut host = Host::new(eal, "slice_cp", 1, None);
+        let conn = host.connect(LOCAL_PORT, small_socket());
+        let sliced = host.frame(b"!slice").slice(1..6);
+        assert!(host.stack.tcp_send_frame(&conn.handle, sliced).is_ok());
+        assert_eq!(host.turn().tx_accepted, 1);
+        let sent = host.take();
+        assert_eq!(sent.len(), 1);
+        sent[0].assert_copied(host.tx_pool, b"slice");
+        assert_eq!(sent[0].tcp().seq_number, conn.seq);
+        drop(sent);
+        host.ack(&conn, conn.seq + 5);
+        assert_eq!(host.frame_in_use(), 0);
+        host.finish();
+    });
+}
+
 /// Case (c): a 1448-byte frame against a 724-byte window leaves as two
 /// TX-pool copies of 724 bytes; the frame is never published.
 #[zhida_test_support::pinned_test]

@@ -34,6 +34,17 @@ pub(crate) fn frame_refcount(frame: &ImmutableFrame) -> u16 {
     unsafe { shared_parts(frame).rc.as_ptr().read() }
 }
 
+/// Whether this producer-owned frame is at its original payload start.
+///
+/// # Safety
+/// `frame` was allocated by this module.
+#[inline]
+pub(crate) unsafe fn frame_at_start(frame: &OwnedFrame) -> bool {
+    let parts = owned_parts(frame);
+    // SAFETY: the producer contract identifies the count's containing allocation.
+    frame.data_ptr() == unsafe { owner::start(parts.rc) }
+}
+
 /// Write headers before an exclusively owned frame's original payload start.
 ///
 /// # Safety
@@ -44,7 +55,7 @@ pub unsafe fn frame_headroom(frame: &mut OwnedFrame, header_len: usize) -> (&mut
     let parts = owned_parts(frame);
     let data = frame.data_ptr();
     // SAFETY: the producer contract gives this allocation's original payload start.
-    assert_eq!(data, unsafe { owner::start(parts.rc) }, "TX frame start was sliced");
+    assert!(unsafe { frame_at_start(frame) }, "TX frame start was sliced");
     // SAFETY: exclusive ownership covers this producer's headroom and payload, which do not overlap.
     unsafe {
         (

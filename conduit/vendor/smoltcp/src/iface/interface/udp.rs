@@ -93,18 +93,26 @@ impl Interface {
             Err(error) => return Err((frame, error)),
         };
         match frame.try_own() {
-            Ok(unique) => self
-                .udp_send_unique(device, udp, handle, to, unique)
-                .map_err(|(unique, error)| (unique.freeze(), error)),
-            Err(shared) => self.udp_send_shared(device, udp, handle, to, shared),
+            Ok(unique) => {
+                // SAFETY: the entry check identifies this UDP set's producer.
+                #[allow(unsafe_code)]
+                let at_start = unsafe { crate::phy::frame_at_start(&unique) };
+                if at_start {
+                    self.udp_send_unique(device, udp, handle, to, unique)
+                        .map_err(|(unique, error)| (unique.freeze(), error))
+                } else {
+                    self.udp_send_copy(device, udp, handle, to, unique.freeze())
+                }
+            }
+            Err(shared) => self.udp_send_copy(device, udp, handle, to, shared),
         }
     }
 
-    /// `udp_send_frame` for a shared frame: send a copy; errors give the shared frame back.
+    /// Copy a shared or off-start frame; errors give the original frame back.
     /// Out of line so the unique path stays small.
     #[cold]
     #[inline(never)]
-    fn udp_send_shared(
+    fn udp_send_copy(
         &mut self,
         device: &mut (impl Device + ?Sized),
         udp: &mut UdpSet,

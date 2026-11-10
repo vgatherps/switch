@@ -454,6 +454,8 @@ pool's full payload room, IP MTU − 28 bytes, starting 42 bytes after the mbuf 
 Write through the mutable slice, `truncate(n)` to the payload length, then `freeze()` to obtain
 the `ImmutableFrame` accepted by TCP and UDP sends. Only immutable frames can be cloned;
 `try_own()` recovers mutable access once the last other holder has released its reference.
+Only unique frames at their original payload start can be published in place. If `slice` moves a
+frame's start, TCP and UDP copy its sliced bytes into another packet instead.
 `None` means the pool is empty; dropping the last reference returns the frame. Frame-pool mbufs
 may be shared (refcount above 1) but stay direct and
 single-segment. `frame_reserve(tx_descriptors, tx_pending) -> usize` computes the minimum frame

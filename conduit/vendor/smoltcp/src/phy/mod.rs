@@ -115,7 +115,7 @@ pub use netframe::{ImmutableFrame, OwnedFrame};
 pub use self::tx_buf::{alloc_frame, frame_headroom, frame_packet, TxPool, TxSource, TX_HEADROOM};
 #[cfg(feature = "dpdk")]
 pub use self::tx_buf::frame_mbuf;
-pub(crate) use self::tx_buf::append_frame;
+pub(crate) use self::tx_buf::{append_frame, frame_at_start};
 #[cfg(test)]
 pub(crate) use self::tx_buf::frame_refcount;
 pub use self::held_frames::HeldFrames;
