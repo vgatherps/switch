@@ -106,6 +106,73 @@ fn nonzero_offset_aliases_wrap_without_touching_metadata_or_following_bytes() {
 }
 
 #[test]
+fn both_aliases_share_writes_across_the_wrap() {
+    for kind in KINDS {
+        let backing = create(kind);
+        let len = backing.page_size().unwrap();
+        backing.resize(3 * len).unwrap();
+        for populate in [false, true] {
+            let aliases = DoubleMapping::new(backing.fd(), len, len, populate).unwrap();
+            let base = aliases.as_ptr();
+            // SAFETY: all offsets lie in the two live aliases, accessed only through raw pointers.
+            unsafe {
+                base.write_volatile(11);
+                base.add(len - 1).write_volatile(22);
+                assert_eq!(base.add(len).read_volatile(), 11);
+                assert_eq!(base.add(2 * len - 1).read_volatile(), 22);
+                for (i, byte) in [33, 44].into_iter().enumerate() {
+                    base.add(len - 1 + i).write_volatile(byte);
+                }
+                assert_eq!(base.add(len - 1).read_volatile(), 33);
+                assert_eq!(base.add(2 * len - 1).read_volatile(), 33);
+                assert_eq!(base.read_volatile(), 44);
+                assert_eq!(base.add(len).read_volatile(), 44);
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_double_mappings_survive_anonymous_mapping_churn() {
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 2_000;
+    let backing = create(Kind::Shm);
+    let page = backing.page_size().unwrap();
+    backing.resize(page).unwrap();
+    let start = std::sync::Barrier::new(2 * THREADS);
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                start.wait();
+                for _ in 0..ITERATIONS {
+                    drop(DoubleMapping::new(backing.fd(), 0, page, false).unwrap());
+                }
+            });
+            scope.spawn(|| {
+                start.wait();
+                for i in 0..ITERATIONS * 4 {
+                    let len = page * (1 + i % 4);
+                    // SAFETY: anonymous mmap chooses its own address and replaces no mapping.
+                    let ptr = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            len,
+                            libc::PROT_NONE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    assert_ne!(ptr, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+                    // SAFETY: this thread owns precisely the interval just mapped.
+                    assert_eq!(unsafe { libc::munmap(ptr, len) }, 0);
+                }
+            });
+        }
+    });
+}
+
+#[test]
 fn opened_handles_cannot_unlink_and_creation_is_exclusive() {
     for kind in KINDS {
         let backing = create(kind);

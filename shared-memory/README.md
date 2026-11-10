@@ -21,9 +21,11 @@ Unix backing ownership and single/double mappings used by `ceph-ring` and
   valid access lengths, and references' lifetimes. Do not truncate a live backing.
   `lock` requests `mlock`; the double-mapping version locks both aliases.
 
-Double mapping uses non-destructive address hints, never `MAP_FIXED`. Placement
-collisions have bounded retries, then return `AddrNotAvailable`; other mapping
-errors propagate immediately. Cleanup releases only mappings this crate owns.
+Double mapping reserves one contiguous address range, then replaces its two halves
+with `MAP_FIXED` aliases of the file extent. Alignment slack is released; drop
+releases exactly the two aliases. On a failed replacement, cleanup leaves that
+half alone because its address ownership is unknown, potentially leaking at most
+one view's address space. Other ranges still owned by the constructor are released.
 
 Linux hugetlbfs files use the mount's page size for offsets, lengths and virtual
 alignment. Provision the huge-page pool and pass a file on that mount; this crate

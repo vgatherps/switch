@@ -70,8 +70,8 @@ impl Drop for Mapping {
 
 /// Two adjacent aliases of the same file extent.
 pub struct DoubleMapping {
-    first: Region,
-    _second: Region,
+    region: Region,
+    len: usize,
 }
 
 impl DoubleMapping {
@@ -97,51 +97,67 @@ impl DoubleMapping {
             .checked_add(page - native_page)
             .filter(|&len| len <= isize::MAX as usize)
             .ok_or_else(|| system::invalid_input("reservation length is out of range"))?;
-        // Address hints can collide with concurrent allocations; retry placement, not mmap errors.
-        for _ in 0..16 {
-            let reservation = Region::reserve(reservation_len)?;
-            let aligned = round_up(reservation.ptr as usize, page)?;
-            let ptr = reservation
-                .ptr
-                .wrapping_add(aligned - reservation.ptr as usize);
-            // MAP_FIXED failure can remove its target before returning an error. Release the
-            // address-finding reservation and own each non-destructive mapping independently.
-            drop(reservation);
-            let first = match Region::map_at(ptr, len, populate, fd, offset) {
-                Ok(region) => region,
-                Err(err) if err.kind() == io::ErrorKind::AddrNotAvailable => continue,
-                Err(err) => return Err(err),
-            };
-            let second = match Region::map_at(ptr.wrapping_add(len), len, populate, fd, offset) {
-                Ok(region) => region,
-                Err(err) if err.kind() == io::ErrorKind::AddrNotAvailable => continue,
-                Err(err) => return Err(err),
-            };
-            return Ok(Self {
-                first,
-                _second: second,
-            });
+        let mut reservation = Region::reserve(reservation_len)?;
+        let aligned = round_up(reservation.ptr as usize, page)?;
+        let prefix = aligned - reservation.ptr as usize;
+        let base = reservation.ptr.wrapping_add(prefix);
+        let suffix = reservation_len - prefix - aliases_len;
+        // SAFETY: both slack intervals are native-page-aligned and owned by the reservation.
+        unsafe {
+            if prefix != 0 {
+                libc::munmap(reservation.ptr.cast(), prefix);
+            }
+            if suffix != 0 {
+                libc::munmap(base.wrapping_add(aliases_len).cast(), suffix);
+            }
         }
-        Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "could not place adjacent double mappings",
-        ))
+        reservation.ptr = base;
+        reservation.len = aliases_len;
+        let flags = libc::MAP_FIXED | libc::MAP_SHARED;
+        #[cfg(target_os = "linux")]
+        let flags = flags | if populate { libc::MAP_POPULATE } else { 0 };
+        #[cfg(not(target_os = "linux"))]
+        let _ = populate;
+        for half in 0..2 {
+            // SAFETY: this target is an untouched half of our live reservation.
+            let result = unsafe {
+                mmap(
+                    base.wrapping_add(half * len),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    flags,
+                    fd.as_raw_fd(),
+                    offset,
+                )
+            };
+            if let Err(err) = result {
+                // Failed MAP_FIXED may remove its target, allowing another thread to claim it.
+                // Leave that half alone (at most len bytes leaked); only the other half is ours.
+                reservation.ptr = base.wrapping_add((1 - half) * len);
+                reservation.len = len;
+                return Err(err);
+            }
+        }
+        Ok(Self {
+            region: reservation,
+            len,
+        })
     }
 
     #[inline]
     pub fn as_ptr(&self) -> *mut u8 {
-        self.first.ptr
+        self.region.ptr
     }
 
     #[inline]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.first.len
+        self.len
     }
 
     /// Locks both virtual aliases, not only the first view of the backing pages.
     pub fn lock(&self) -> io::Result<()> {
-        lock(self.first.ptr, self.first.len * 2)
+        lock(self.region.ptr, self.region.len)
     }
 }
 
@@ -152,51 +168,12 @@ struct Region {
 
 impl Region {
     fn reserve(len: usize) -> io::Result<Self> {
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let flags = flags | libc::MAP_NORESERVE;
         // SAFETY: anonymous mapping without an address hint cannot replace existing mappings.
-        let ptr = unsafe {
-            mmap(
-                ptr::null_mut(),
-                len,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )?
-        };
+        let ptr = unsafe { mmap(ptr::null_mut(), len, libc::PROT_NONE, flags, -1, 0)? };
         Ok(Self { ptr, len })
-    }
-
-    fn map_at(
-        hint: *mut u8,
-        len: usize,
-        populate: bool,
-        fd: BorrowedFd<'_>,
-        offset: libc::off_t,
-    ) -> io::Result<Self> {
-        let flags = libc::MAP_SHARED;
-        #[cfg(target_os = "linux")]
-        let flags = flags | if populate { libc::MAP_POPULATE } else { 0 };
-        #[cfg(not(target_os = "linux"))]
-        let _ = populate;
-        // SAFETY: an address hint without MAP_FIXED never replaces an existing mapping.
-        let ptr = unsafe {
-            mmap(
-                hint,
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                flags,
-                fd.as_raw_fd(),
-                offset,
-            )?
-        };
-        let region = Self { ptr, len };
-        if ptr != hint {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "double-mapping address is no longer available",
-            ));
-        }
-        Ok(region)
     }
 }
 
@@ -250,7 +227,7 @@ fn lock(ptr: *mut u8, len: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// The address is a hint only; callers must not pass MAP_FIXED.
+/// Callers validate the extent; MAP_FIXED targets must lie inside their own live reservation.
 unsafe fn mmap(
     addr: *mut u8,
     len: usize,
@@ -259,40 +236,11 @@ unsafe fn mmap(
     fd: libc::c_int,
     offset: libc::off_t,
 ) -> io::Result<*mut u8> {
-    // SAFETY: address selection is non-destructive, and callers validate the other arguments.
+    // SAFETY: callers validate the arguments and own any interval replaced with MAP_FIXED.
     let ptr = unsafe { libc::mmap(addr.cast(), len, prot, flags, fd, offset) };
     if ptr == libc::MAP_FAILED {
         Err(io::Error::last_os_error())
     } else {
         Ok(ptr.cast())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Backing, unique_name};
-
-    #[test]
-    fn occupied_alias_address_is_not_replaced() {
-        let page = system::native_page_size().unwrap();
-        let occupied_backing = Backing::create_shm(&unique_name("/occupied").unwrap()).unwrap();
-        occupied_backing.resize(page).unwrap();
-        let occupied = Mapping::new(occupied_backing.fd(), 0, page).unwrap();
-        // SAFETY: this test exclusively owns and accesses the occupied mapping.
-        unsafe { occupied.as_ptr().write_volatile(0xa5) };
-        let alias_backing = Backing::create_shm(&unique_name("/alias").unwrap()).unwrap();
-        alias_backing.resize(page).unwrap();
-
-        let result = Region::map_at(occupied.as_ptr(), page, true, alias_backing.fd(), 0);
-        assert_eq!(
-            result.err().unwrap().kind(),
-            io::ErrorKind::AddrNotAvailable
-        );
-        // SAFETY: a failed alias mapping must leave the existing mapping live and unchanged.
-        assert_eq!(unsafe { occupied.as_ptr().read_volatile() }, 0xa5);
-        let alias = Mapping::new(alias_backing.fd(), 0, page).unwrap();
-        // SAFETY: this separate, freshly sized backing contains zero bytes.
-        assert_eq!(unsafe { alias.as_ptr().read_volatile() }, 0);
     }
 }
