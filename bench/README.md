@@ -221,6 +221,32 @@ Before the first paid run:
 - [ ] Ctrl-C trial: start `run`, press Ctrl-C after the instances launch, and check that teardown logs `nothing left` and `cleanup --run-id ID` also reports `nothing left`
 - [ ] leftovers from the old shared-resource version (VPC/SG/key pair named `zhida-bench`, S3 bucket `zhida-bench-cache-*`, IAM role/profile `zhida-bench-host`, `~/.zhida-bench/*.pem`) are not deleted by this tool anymore; delete them once by hand if they exist.
 
+## Native tests on AWS
+
+```sh
+python3 bench/aws/zhida_aws_bench.py test --region R [--zone Z] [--ttl 2h] [--out DIR]
+```
+
+This provisions one `c6in.2xlarge` with the x86_64 AL2023 image (8 free Standard vCPUs required),
+installs and verifies the host, then runs native tests as root in `/opt/zhida-src` with bootstrap's
+DPDK/clang/Rust environment. It executes the x86 rseq assembly, not just a cross-compile.
+`--shape arm` instead selects one `c7gn.xlarge` with arm64 AL2023 (4 free vCPUs).
+Source is the pinned committed HEAD; `source.json` records its revision and archive SHA-256.
+
+The three independent suites are:
+
+```sh
+cargo test --locked -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer
+cargo test --locked -p junctiond -- --test-threads=1
+cargo test --locked -p switchnet -p sheath --features switchnet/testkit,sheath/e2e -- --test-threads=1
+```
+
+Each suite has a one-hour SSH timeout and its own `.log` and `.exit` file (`rings`, `junctiond`,
+`switchnet-sheath`). A failure does not skip the later suites. Outputs are fetched before teardown,
+including on test errors; `tests.json` records each exit code and any transport/fetch errors.
+The command exits zero only when all suites and fetches succeeded and teardown verified every
+resource absent. The TTL includes provisioning/build/test time; raise it if needed.
+
 ## Binance listener on AWS
 
 `python3 bench/aws/zhida_aws_bench.py binance [--region R] [--seconds 600] [--out DIR] [--ttl 2h]` runs `deploy/run-binance.sh` on one EC2 host and tears it down. Needs the same as `run` (python3 with boto3, ssh, scp, git, a clean committed tree, credentials; IAM list in `-h`, plus Elastic IP allocate/associate/disassociate/release/describe), and on-demand Standard vCPU quota L-1216C47A with 4 free. Preflight also checks that the region offers m7g.xlarge, before anything is created.

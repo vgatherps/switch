@@ -1827,6 +1827,126 @@ class BinanceTest(unittest.TestCase):
         self.assertEqual(self.w.clean_calls, [])
 
 
+class NativeTestCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.w = World()
+        self.out = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.out)
+        self.suite_codes = [0, 0, 0]
+        self.test_calls = []
+
+    def run_native(self, *extra):
+        owner, w = self, self.w
+
+        class TestHost(FakeHost):
+            def wait_ssh(self):
+                w.calls.append((self.role, "wait_ssh"))
+
+            def root(self, command, **kwargs):
+                owner.test_calls.append((command, kwargs))
+                code = owner.suite_codes[len(owner.test_calls) - 1]
+                if isinstance(code, BaseException):
+                    raise code
+                return Proc(code)
+
+            def fetch(self, remote, local):
+                owner.assertFalse(w.teardown_done, "outputs must be fetched before verified teardown")
+                return super().fetch(remote, local)
+
+        def local(argv, **kwargs):
+            w.local_calls.append(argv)
+            self.assertEqual(argv[0], "git")
+            return Proc(0, b"TAR" if "archive" in argv else "a" * 40 if "rev-parse" in argv else "")
+
+        def clean_run(ec2, run_id, recorded, **kwargs):
+            w.teardown_done = True
+            return list(w.left_after_teardown)
+
+        env = z.Env(profile_region=lambda: "ap-northeast-1", aws=lambda region: FakeAws(w),
+                    host=lambda info, key, rd: TestHost(w, info, rd), local=local,
+                    my_ip=lambda: "203.0.113.9", now=lambda: NOW, sleep=lambda _: None)
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        self.log = io.StringIO()
+        with mock.patch.object(z.janitor, "clean_run", clean_run), contextlib.redirect_stdout(self.log):
+            try:
+                code = z.main(["test", "--out", self.out, *extra], env)
+            except BaseException as error:
+                code = error
+            finally:
+                for signum, handler in handlers.items():
+                    signal.signal(signum, handler)
+        runs = os.listdir(self.out)
+        self.run_dir = os.path.join(self.out, runs[0]) if runs else None
+        return code
+
+    def test_intel_host_pins_source_runs_all_commands_and_fetches_before_teardown(self):
+        self.assertEqual(self.run_native("--zone", "zone-a"), 0)
+        self.assertEqual(self.w.calls[:4], [
+            ("aws", "create_network 203.0.113.9 zone-a cluster"),
+            ("aws", "launch_hosts c6in.2xlarge test"), ("test", "wait_ssh"), ("test", "install b'TAR'")])
+        self.assertEqual(self.w.launch_amis, [z.INTEL_AMI_PARAM])
+        expected = [
+            "cargo test --locked -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer",
+            "cargo test --locked -p junctiond -- --test-threads=1",
+            "cargo test --locked -p switchnet -p sheath --features switchnet/testkit,sheath/e2e -- --test-threads=1",
+        ]
+        self.assertEqual(len(self.test_calls), 3)
+        for (command, kwargs), cargo, name in zip(self.test_calls, expected, ("rings", "junctiond", "switchnet-sheath")):
+            self.assertIn(f"cd {z.SRC_DIR} && export ", command)
+            for setting in ("PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig",
+                            "RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld'",
+                            "LIBCLANG_PATH=/usr/lib64/llvm18/lib",
+                            "PATH=/usr/lib64/llvm18/bin:/root/.cargo/bin:$PATH"):
+                self.assertIn(setting, command)
+            self.assertIn(f"{cargo} > {z.REMOTE}/{name}.log 2>&1", command)
+            self.assertIn(f'"$status" > {z.REMOTE}/{name}.exit', command)
+            self.assertEqual(kwargs, {"check": False, "timeout": 3600})
+        self.assertIn(["git", "-C", z.REPO, "archive", "--format=tar", "a" * 40], self.w.local_calls)
+        with open(os.path.join(self.run_dir, "source.json")) as file:
+            self.assertEqual(json.load(file)["commit"], "a" * 40)
+        with open(os.path.join(self.run_dir, "tests.json")) as file:
+            self.assertEqual([result["exit_code"] for result in json.load(file)["suites"].values()], [0, 0, 0])
+        self.assertEqual(len(self.w.fetched), 6)
+        self.assertTrue(self.w.teardown_done)
+        self.assertIn("need 8", self.log.getvalue())
+
+    def test_failed_suite_does_not_skip_later_suites_or_output_fetch(self):
+        self.suite_codes = [3, 0, 7]
+        self.assertEqual(self.run_native(), 1)
+        self.assertEqual(len(self.test_calls), 3)
+        self.assertEqual(len(self.w.fetched), 6)
+        with open(os.path.join(self.run_dir, "tests.json")) as file:
+            self.assertEqual([result["exit_code"] for result in json.load(file)["suites"].values()], [3, 0, 7])
+
+    def test_timeout_still_runs_remaining_suites_fetches_and_tears_down(self):
+        self.suite_codes[0] = subprocess.TimeoutExpired("cargo test", 3600)
+        self.assertEqual(self.run_native(), 1)
+        self.assertEqual(len(self.test_calls), 3)
+        self.assertEqual(len(self.w.fetched), 6)
+        self.assertTrue(self.w.teardown_done)
+
+    def test_fetch_failure_fails_run(self):
+        self.w.fetch_fail.add(("test", f"{z.REMOTE}/rings.log"))
+        self.assertEqual(self.run_native(), 1)
+        self.assertEqual(len(self.w.fetched), 6)
+
+    def test_unverified_teardown_fails_run(self):
+        self.w.left_after_teardown = ["instance i-0"]
+        self.assertEqual(self.run_native(), 1)
+
+    def test_failed_install_never_runs_suites_and_still_tears_down(self):
+        self.w.verify_fail.add("test")
+        self.assertIsInstance(self.run_native(), RuntimeError)
+        self.assertEqual(self.test_calls, [])
+        self.assertTrue(self.w.teardown_done)
+
+    def test_arm_uses_one_small_arm_host(self):
+        self.assertEqual(self.run_native("--shape", "arm"), 0)
+        self.assertIn(("aws", "launch_hosts c7gn.xlarge test"), self.w.calls)
+        self.assertEqual(self.w.launch_amis, [z.AMI_PARAM])
+        self.assertIn("need 4", self.log.getvalue())
+
+
 class BootstrapTest(unittest.TestCase):
     def test_shell_syntax(self):
         subprocess.run(["sh", "-n", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bootstrap.sh")],

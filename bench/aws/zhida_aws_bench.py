@@ -7,6 +7,7 @@
   zhida_aws_bench.py kernel [--shape arm|intel] [--region R] [--ttl 2h] [--out DIR]   Linux receiver
   zhida_aws_bench.py cleanup --run-id ID [--region R] [--out DIR]   delete a leftover run's resources
   zhida_aws_bench.py binance [--region R] [--seconds 600] [--out DIR] [--ttl 2h]   the Binance listener
+  zhida_aws_bench.py test [--shape intel|arm] [--region R] [--zone Z] [--ttl 2h] [--out DIR]
 
 Needs python3 with boto3, ssh, scp, git, a clean committed tree (the hosts build `git archive HEAD`)
 and AWS credentials; --region defaults to the AWS profile's region. Design: plans/bench/design.md.
@@ -104,6 +105,14 @@ BINANCE_LOG = "/var/log/zhida/binance.log"
 FEED_OUT = f"{REMOTE}/feed.out"
 # run-binance.sh beyond the feed's --seconds: verify, DNS, port open, the connect (20 s limit), the close.
 FEED_MARGIN_S = 300
+
+TEST_SUITE_S = 3600
+TEST_SUITES = (
+    ("rings", "cargo test --locked -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer"),
+    ("junctiond", "cargo test --locked -p junctiond -- --test-threads=1"),
+    ("switchnet-sheath", "cargo test --locked -p switchnet -p sheath"
+     " --features switchnet/testkit,sheath/e2e -- --test-threads=1"),
+)
 
 
 def log(msg):
@@ -1235,6 +1244,74 @@ def binance(args, env=None):
     return 0 if code == 0 and not fetch_errors and torn else 1
 
 
+def test_command(name, command):
+    """Root test invocation with bootstrap's build environment and separate output/status artifacts."""
+    return (f"mkdir -p {REMOTE} && cd {SRC_DIR} && "
+            "export PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig "
+            "RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld' "
+            "LIBCLANG_PATH=/usr/lib64/llvm18/lib "
+            "PATH=/usr/lib64/llvm18/bin:/root/.cargo/bin:$PATH && "
+            f"{command} > {REMOTE}/{name}.log 2>&1; status=$?; "
+            f"printf '%s\\n' \"$status\" > {REMOTE}/{name}.exit; exit \"$status\"")
+
+
+def run_tests(args, env=None):
+    """Native tests on one host; each suite runs even if an earlier suite fails."""
+    env = env or Env()
+    now = env.now()
+    expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
+    run_id = new_run_id(now)
+    host_type, ami_param, vcpus = (HOST_TYPE, AMI_PARAM, HOST_VCPUS) if args.shape == "arm" else ("c6in.2xlarge", INTEL_AMI_PARAM, 8)
+    aws, zone = checked_preflight(env, args.region, (host_type,), vcpus, args.zone)
+    revision = env.local(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    archive = source_archive(env.local, revision)
+    run_dir = os.path.join(args.out, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "source.json"), "w") as f:
+        json.dump({"commit": revision, "archive_sha256": hashlib.sha256(archive).hexdigest()}, f, indent=2)
+    created = janitor.Created(os.path.join(run_dir, "created.json"))
+    key_path = os.path.join(run_dir, "key.pem")
+    results = {name: {"exit_code": None} for name, _ in TEST_SUITES}
+    fetch_errors = []
+    on_signals(exit_on_signal)
+    try:
+        log(f"test run {run_id}: 1 x {host_type}, expires {expires.isoformat()}")
+        net = aws.create_network(run_id, expires, env.my_ip(), created.add, key_path, zone, "cluster")
+        [info] = aws.launch_hosts(net, run_id, expires, created.add, host_type, ["test"], ami_param)
+        with open(os.path.join(run_dir, "hosts.json"), "w") as f:
+            json.dump([info], f, indent=1)
+        host = env.host(info, key_path, run_dir)
+        host.wait_ssh()
+        ok, text = host.install(archive)
+        with open(os.path.join(run_dir, "verify.txt"), "w") as f:
+            f.write(text + "\n")
+        if not ok:
+            raise RuntimeError(f"host setup failed:\n{text}")
+        try:
+            for name, command in TEST_SUITES:
+                try:
+                    code = host.root(test_command(name, command), check=False, timeout=TEST_SUITE_S).returncode
+                    results[name]["exit_code"] = code
+                    log(f"{name}: exit {code}")
+                except (RuntimeError, subprocess.TimeoutExpired) as error:
+                    results[name]["error"] = str(error)
+                    log(f"{name}: failed: {error}")
+        finally:
+            for name, _ in TEST_SUITES:
+                for suffix in ("log", "exit"):
+                    error = host.fetch(f"{REMOTE}/{name}.{suffix}", run_dir)
+                    if error:
+                        fetch_errors.append(error)
+                        log(f"fetch failed: {error}")
+            with open(os.path.join(run_dir, "tests.json"), "w") as f:
+                json.dump({"suites": results, "fetch_errors": fetch_errors}, f, indent=2)
+    finally:
+        on_signals(signal.SIG_IGN)
+        log(f"tearing down run {run_id}")
+        torn = teardown(aws.ec2, run_id, created.ids, created.path)
+    return 0 if all(result["exit_code"] == 0 for result in results.values()) and not fetch_errors and torn else 1
+
+
 def cleanup(args, env=None):
     """A leftover run: the IDs its run_dir/created.json recorded, plus a tag lookup."""
     aws = (env or Env()).aws(args.region)
@@ -1268,6 +1345,12 @@ def parser():
     b.add_argument("--seconds", type=int, default=600, help="the feed's --seconds (from the WebSocket open)")
     b.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
     b.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
+    t = sub.add_parser("test", help="run native ring, junction and both-backend network tests on one EC2 host")
+    t.add_argument("--region", help="default: the AWS profile's region")
+    t.add_argument("--zone", help="availability zone offering the test instance type")
+    t.add_argument("--shape", choices=SHAPES, default="intel", help="one test host: intel c6in.2xlarge (default), arm c7gn.xlarge")
+    t.add_argument("--out", default=os.path.join(REPO, "bench", "out", "aws"))
+    t.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
     return p
 
 
@@ -1291,6 +1374,8 @@ def main(argv, env=None):
         return run(args, env, kernel=args.cmd == "kernel")
     if args.cmd == "binance":
         return binance(args, env)
+    if args.cmd == "test":
+        return run_tests(args, env)
     return cleanup(args, env)
 
 
