@@ -3,7 +3,6 @@
 set -u
 mode=$1 network=$2 app=$3
 shift 3
-run=autobahn/run/$mode
 ipc=$(mktemp -d /tmp/autobahn-junction.XXXXXX) || exit 1
 daemon= child=
 say() { echo "autobahn-junction: $*" >&2; }

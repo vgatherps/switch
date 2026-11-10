@@ -35,7 +35,8 @@ missing case, extra case, extra mixed ids (`99.9.9`, `extra`), wrong agent key, 
 
 ## Junction backend
 
-`make docker-autobahn-junction` runs both roles through a separate `junctiond` process.
+`make docker-autobahn-junction` runs both roles through a separate `junctiond` process,
+including the client when the server fails; the target succeeds only if both roles pass.
 `docker-autobahn-junction-server` and `docker-autobahn-junction-client` run one role.
 `docker-autobahn` remains the conduit gate, unchanged. All use the same 517 cases,
 agent, `run/<role>/` markers, peer container/network namespace, and expected checker.
@@ -49,7 +50,8 @@ Overlapping role/peer CPU sets are rejected. Docker must provide those CPUs.
 
 `junction-netconf.json` uses the conduit driver's tap name, MACs, IPv4 subnet,
 MTU, descriptors and disabled checksum offloads. The daemon uses its normal
-Stack/pool sizing. The app opens no EAL or Stack. After the same checker completes,
+Stack/pool sizing. The app opens no EAL or Stack, and sizes its TX frame pool with
+`tcp::tx_mbuf_budget`, as the socket test fixture does. After the same checker completes,
 the app recovers `Net::into_session`, finishes it and waits for retirement before
 exiting. `junction-role.sh` then sends SIGTERM to `junctiond`, reaps it and checks
 both exit statuses. The outer role timeout bounds startup, run and shutdown.

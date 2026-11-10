@@ -55,4 +55,19 @@ for app, host, success in [(0, 0, True), (7, 0, False), (0, 9, False)]:
         assert (root / "stopped").exists(), result
         assert f"relay-autobahn exit {app}" in result.stderr, result
         assert f"junctiond exit {host}" in result.stderr, result
+
+# Exercise make's actual expanded dispatch, including a failing server.
+dry = subprocess.run(
+    ["make", "--no-print-directory", "-n", "docker-autobahn-junction"], cwd=ROLE.parent.parent,
+    capture_output=True, text=True, check=True,
+).stdout
+dispatch = dry[dry.rindex('case "docker-autobahn-junction" in'):]
+for failure in ["none", "server", "client", "both"]:
+    result = subprocess.run(
+        ["sh", "-c", 'role() { echo "$1"; [ "$FAILURE" != "$1" ] && [ "$FAILURE" != both ]; }; ' + dispatch],
+        env={**os.environ, "FAILURE": failure}, capture_output=True, text=True, timeout=10,
+    )
+    assert result.stdout.splitlines() == ["server", "client"], result
+    assert (result.returncode == 0) == (failure == "none"), result
+
 print("junction-role: self-test PASS")

@@ -231,7 +231,28 @@ fn external_backend_reuses_tester_environment_and_status_without_eal() {
 #[test]
 fn external_backend_app_failure_kills_and_reaps_tester() {
     use tap_echo::driver::{EXIT_ERROR, run_tester};
-    let tester = ["sh", "-c", "exec sleep 60"].map(Into::into);
-    let code = run_tester("remote-driver-test", &tester, |_, _| Err("application failed".to_owned()));
+    let _serial = serial();
+    let pid_file = std::env::temp_dir().join(format!("zhida-remote-tester-{}", std::process::id()));
+    let path = pid_file.to_str().unwrap();
+    let tester = ["sh", "-c", r#"echo $$ > "$1"; exec sleep 60"#, "sh", path].map(Into::into);
+    let start = Instant::now();
+    let mut pid = None;
+    let code = run_tester("remote-driver-test", &tester, |_, _| {
+        loop {
+            if let Some(value) = fs::read_to_string(&pid_file).ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                pid = Some(value);
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(3), "tester did not publish its PID");
+            thread::sleep(Duration::from_millis(1));
+        }
+        Err("application failed".to_owned())
+    });
+    fs::remove_file(&pid_file).unwrap();
     assert_eq!(code, EXIT_ERROR);
+    assert!(start.elapsed() < Duration::from_secs(3), "driver waited for the sleeping tester");
+    let pid = pid.unwrap();
+    assert!(!Path::new(&format!("/proc/{pid}")).exists(), "tester was not killed and reaped");
 }

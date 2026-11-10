@@ -628,7 +628,9 @@ docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junctio
 	case "$@" in \
 		*-server) role server --expect-connections $(AUTOBAHN_CASES);; \
 		*-client) role client --expect-cases $(AUTOBAHN_CASES);; \
-		*) role server --expect-connections $(AUTOBAHN_CASES) && role client --expect-cases $(AUTOBAHN_CASES);; \
+		*) role server --expect-connections $(AUTOBAHN_CASES); server=$$?; \
+			role client --expect-cases $(AUTOBAHN_CASES); client=$$?; \
+			[ $$server = 0 ] && [ $$client = 0 ];; \
 	esac
 
 # TLS-Anvil's client tests against sheath (TLS 1.3 over switchnet on net_tap), not part of make

@@ -49,6 +49,8 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// expire first by that gap, and expiry only fails the run.
 const SERVER_READY_LIMIT: Duration = Duration::from_secs(60);
 const SERVER_READY_POLL: Duration = Duration::from_millis(10);
+/// Maximum wait for the host to acknowledge session retirement.
+const FINISH_LIMIT: Duration = Duration::from_secs(60);
 
 fn usage() -> String {
     format!(
@@ -176,7 +178,9 @@ fn main() {
         Backend::Junction(socket) => driver::run_tester(NAME, &tester, |start, stop| {
             let max_sockets = u16::try_from(role.max_sockets()).map_err(|_| "junction socket count exceeds 65535")?;
             let session = Session::connect(&socket, max_sockets).map_err(|e| format!("connect junction: {e}"))?;
-            let mut net = Net::remote(session, RemoteConfig { tx_frames: driver::POOL_COUNT as usize });
+            let mut net = Net::remote(session, RemoteConfig {
+                tx_frames: tcp::tx_mbuf_budget(&SOCKET, usize::from(driver::MTU)),
+            });
             let driven = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE).map_err(|e| e.to_string());
             let mut session = net.into_session().ok().expect("drive dropped every handle and socket");
             let finished = finish_session(&mut session);
@@ -191,7 +195,7 @@ fn finish_session(session: &mut Session) -> Result<(), String> {
     while !session.closed() {
         let _ = session.finish();
         session.poll(|_, _| {}, |_, _, _| {}).map_err(|e| format!("finish junction session: {e}"))?;
-        if start.elapsed() >= SERVER_READY_LIMIT {
+        if start.elapsed() >= FINISH_LIMIT {
             return Err("junction session retirement timed out".to_owned());
         }
         std::thread::sleep(Duration::from_millis(1));
