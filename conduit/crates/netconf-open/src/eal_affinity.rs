@@ -38,12 +38,14 @@ pub(crate) fn init(cpu: usize, args: &[&str], helper_cpus: Option<&[usize]>) -> 
                 "EAL helper CPUs must be nonempty and below CPU_SETSIZE",
             )));
         }
-        let mut expanded = unsafe { std::mem::zeroed() };
-        unsafe { libc::CPU_SET(cpu, &mut expanded) };
-        for &helper in cpus {
-            unsafe { libc::CPU_SET(helper, &mut expanded) };
+        if cpus.iter().any(|helper| *helper != cpu) {
+            let mut expanded = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(cpu, &mut expanded) };
+            for &helper in cpus {
+                unsafe { libc::CPU_SET(helper, &mut expanded) };
+            }
+            return init_with_affinity(cpu, args, &expanded, true);
         }
-        return init_with_affinity(cpu, args, &expanded);
     }
     let isolated = match fs::read_to_string("/sys/devices/system/cpu/isolated") {
         Ok(text) => cpu_list(&text).map_err(OpenError::HelperAffinity)?,
@@ -76,13 +78,38 @@ fn init_with_housekeeping(
         }
     }
     // Include the polling CPU, so a one-CPU cgroup still has a valid mask.
-    init_with_affinity(cpu, args, &expanded)
+    init_with_affinity(cpu, args, &expanded, false)
 }
 
-fn init_with_affinity(cpu: usize, args: &[&str], expanded: &libc::cpu_set_t) -> Result<Eal, OpenError> {
+fn init_with_affinity(
+    cpu: usize,
+    args: &[&str],
+    expanded: &libc::cpu_set_t,
+    require_exact: bool,
+) -> Result<Eal, OpenError> {
     let mut polling = unsafe { std::mem::zeroed() };
     unsafe { libc::CPU_SET(cpu, &mut polling) };
     set_affinity(expanded).map_err(OpenError::HelperAffinity)?;
+    if require_exact {
+        let mut actual = unsafe { std::mem::zeroed() };
+        let validation = if unsafe {
+            libc::sched_getaffinity(0, std::mem::size_of_val(&actual), &mut actual)
+        } != 0 {
+            Err(io::Error::last_os_error())
+        } else if (0..libc::CPU_SETSIZE as usize).any(|candidate| unsafe {
+            libc::CPU_ISSET(candidate, &actual) != libc::CPU_ISSET(candidate, expanded)
+        }) {
+            Err(io::Error::other("EAL helper CPUs are outside the effective cpuset"))
+        } else {
+            Ok(())
+        };
+        if let Err(error) = validation {
+            set_affinity(&polling).map_err(|restore| OpenError::HelperAffinity(io::Error::other(
+                format!("{error}; restoring network CPU affinity: {restore}"),
+            )))?;
+            return Err(OpenError::HelperAffinity(error));
+        }
+    }
     let result = Eal::init(args);
     // EAL pins its main lcore on success; also restore on every error path.
     match (result, set_affinity(&polling)) {
@@ -105,6 +132,40 @@ mod tests {
             0
         );
         set
+    }
+
+    fn assert_polling_cpu(cpu: usize) {
+        let actual = affinity(0);
+        assert_eq!(unsafe { libc::CPU_COUNT(&actual) }, 1);
+        assert!(unsafe { libc::CPU_ISSET(cpu, &actual) });
+    }
+
+    #[zhida_test_support::pinned_test]
+    fn empty_helper_set_is_rejected_without_changing_affinity() {
+        let cpu = zhida_dpdk_sys::only_allowed_cpu().unwrap();
+        assert!(matches!(init(cpu, &["test", "invalid\0argument"], Some(&[])),
+            Err(OpenError::HelperAffinity(_))));
+        assert_polling_cpu(cpu);
+    }
+
+    #[zhida_test_support::pinned_test]
+    fn out_of_range_helper_is_rejected_without_changing_affinity() {
+        let cpu = zhida_dpdk_sys::only_allowed_cpu().unwrap();
+        assert!(matches!(init(cpu, &["test", "invalid\0argument"], Some(&[libc::CPU_SETSIZE as usize])),
+            Err(OpenError::HelperAffinity(_))));
+        assert_polling_cpu(cpu);
+    }
+
+    #[zhida_test_support::pinned_test]
+    fn unavailable_helper_is_rejected_and_restores_polling_affinity() {
+        let cpu = zhida_dpdk_sys::only_allowed_cpu().unwrap();
+        let allowed = cpu_list(&fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective").unwrap()).unwrap();
+        let helper = (0..libc::CPU_SETSIZE as usize)
+            .find(|candidate| !unsafe { libc::CPU_ISSET(*candidate, &allowed) })
+            .expect("test needs a CPU outside the effective cgroup cpuset");
+        assert!(matches!(init(cpu, &["test", "invalid\0argument"], Some(&[helper])),
+            Err(OpenError::HelperAffinity(_))));
+        assert_polling_cpu(cpu);
     }
 
     #[test]

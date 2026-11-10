@@ -194,6 +194,11 @@ def self_test(expected_path):
         ("behavior null", set_field(any_case, "behavior", None), None, 2, "not a string"),
         ("remoteCloseCode 1000.0", set_field(with_code, "remoteCloseCode", 1000.0), None, 2,
          "not an int or null"),
+        ("mixed case 2.11 outcome fields", set_case("2.11", {
+            "behavior": "FAILED", "behaviorClose": "OK", "remoteCloseCode": 1000,
+        }), None, 1, diverges("2.11")),
+        ("report-side outcome list", set_case("2.11", [cases["2.11"]]), None, 2,
+         "case 2.11 is not an object"),
     ]
     for case_id, outcomes in listed:
         for i, outcome in enumerate(outcomes):

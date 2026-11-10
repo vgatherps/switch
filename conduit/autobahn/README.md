@@ -29,13 +29,13 @@ a `remoteCloseCode` that is not an int or null (`1000.0` is rejected). Prints
 per-(behavior, behaviorClose) counts of the report, then every diverging case (expected vs
 actual, plus the case report file), missing and extra case ids (numeric id parts sort before
 non-numeric ones). Exit 0 full match, 1 mismatch (including agent keys), 2 malformed input.
-`--self-test` runs 18 scenarios, each checking the exit code, a scenario-specific output line
+`--self-test` runs 20 scenarios, each checking the exit code, a scenario-specific output line
 (`DIVERGES <id>`, `MISSING`, `EXTRA`, the agent-key or malformed reason) and the absence of a
 traceback: the expected file against itself and with changed `duration`/`reportfile` (exit 0);
 changed behavior, behaviorClose, close code number->number, null->number, number->null,
 missing case, extra case, extra mixed ids (`99.9.9`, `extra`), wrong agent key, extra agent key
 (exit 1); duplicate case key, null behavior, close code `1000.0` (exit 2).
-Both accepted case 2.11 outcomes pass; a third outcome fails.
+Both accepted case 2.11 outcomes pass; a third outcome and a mixture of fields from accepted outcomes fail. A report-side outcome list is malformed (exit 2); lists are permitted only in the expected file.
 
 ## Junction backend
 

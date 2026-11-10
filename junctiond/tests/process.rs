@@ -291,6 +291,23 @@ fn explicit_control_cpu_keeps_every_helper_off_the_network_cpu() {
     daemon.cpu = "0".into();
     daemon.control_cpus = "2".into();
     let mut session = daemon.start();
+    let id = session.bind_udp(UdpConfig {
+        local: ListenEndpoint { addr: None, port: 30000 },
+        rx_queue: 8,
+        tx_checksum: true,
+        broadcast: false,
+    }).unwrap();
+    let deadline = Instant::now() + WAIT;
+    let mut bound = false;
+    while !bound {
+        session.poll_events(|socket, event| {
+            assert_eq!(socket, id);
+            assert!(matches!(event, Event::Bound));
+            bound = true;
+        }).unwrap();
+        assert!(Instant::now() < deadline, "network loop did not complete UDP bind");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let pid = daemon.child.as_ref().unwrap().id();
     let mut helpers = Vec::new();
     for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {

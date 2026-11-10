@@ -20,6 +20,10 @@ available in the container/host cpuset. Setup temporarily includes those CPUs
 in the initial EAL affinity; DPDK excludes the main lcore from helper affinity
 when other CPUs are available. The opening thread returns to its original
 single CPU. `Some` is unsupported outside Linux.
+If the explicit set contains only the polling CPU, automatic housekeeping
+selection remains enabled as with `None`. Otherwise setup reads back the
+effective widened mask before EAL starts and rejects any cpuset truncation,
+restoring the original single CPU first.
 
 With `None`, behavior is unchanged: if the polling CPU appears in
 `/sys/devices/system/cpu/isolated`, setup temporarily includes online non-isolated CPUs in the calling thread's
