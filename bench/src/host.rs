@@ -2,17 +2,25 @@
 //! the busy-poll round and the stop signal.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant as WallInstant, SystemTime, UNIX_EPOCH};
 
 use dpdk_smoltcp::Eal;
+use junction::session::Session;
 use switch::Runtime;
-use switchnet::{Instant, Net, NetConfig};
+use switchnet::{Instant, Net, NetConfig, RemoteConfig};
 use zhida_netconf::Config;
 use zhida_open::{Sizing, open};
 
 pub const INGRESS_BUDGET: usize = 128;
+
+/// The app either owns the NIC configuration or connects to its daemon owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backend {
+    Conduit(PathBuf),
+    Junction(PathBuf),
+}
 
 /// Monotonic ns since the process's origin, with the wall-clock time of that origin for joining
 /// samples across hosts and starting steps at a common wall-clock time (see `resync`).
@@ -75,12 +83,44 @@ pub struct Host {
     pub net: Net,
     pub rt: Runtime,
     pub clock: Clock,
-    port_id: u16,
+    local: Option<Local>,
     xstats: Option<crate::xstats::Snapshots>,
+}
+
+struct Local {
+    port_id: u16,
     _eal: Eal,
 }
 
 impl Host {
+    pub fn connect(
+        backend: &Backend,
+        max_sockets: usize,
+        sizing: impl FnOnce(usize) -> Sizing,
+    ) -> Result<Host, String> {
+        match backend {
+            Backend::Conduit(path) => {
+                let config = Self::config(path)?;
+                Self::open(&config, &sizing(usize::from(config.mtu)))
+            }
+            Backend::Junction(path) => {
+                let max_sockets = max_sockets.try_into()
+                    .map_err(|_| "junction socket count exceeds 65535")?;
+                let session = Session::connect(path, max_sockets)
+                    .map_err(|e| format!("connect junction {}: {e}", path.display()))?;
+                let mtu = remote_mtu(session.frame_capacity(), session.max_record())?;
+                let clock = Clock::new();
+                Ok(Host {
+                    net: Net::remote(session, RemoteConfig { tx_frames: sizing(mtu).frame_share }),
+                    rt: Runtime::new(clock.now_ns()),
+                    clock,
+                    local: None,
+                    xstats: None,
+                })
+            }
+        }
+    }
+
     /// The netconf config at `path`.
     pub fn config(path: &Path) -> Result<Config, String> {
         Config::load(path).map_err(|e| format!("{}: {e}", path.display()))
@@ -103,15 +143,17 @@ impl Host {
             net,
             rt: Runtime::new(clock.now_ns()),
             clock,
-            port_id: opened.report.port_id,
+            local: Some(Local { port_id: opened.report.port_id, _eal: opened.eal }),
             xstats: None,
-            _eal: opened.eal,
         })
     }
 
     pub(crate) fn start_xstats(&mut self, role: &'static str) {
         if std::env::var("ZHIDA_BENCH_XSTATS").as_deref() == Ok("1") {
-            self.xstats = Some(crate::xstats::Snapshots::start(role, self.port_id));
+            match &self.local {
+                Some(local) => self.xstats = Some(crate::xstats::Snapshots::start(role, local.port_id)),
+                None => eprintln!("zhida-bench {role}: port xstats absent (backend junction)"),
+            }
         }
     }
 
@@ -133,6 +175,21 @@ impl Host {
         if let Some(xstats) = self.xstats.take() {
             xstats.finish();
         }
+        if self.local.is_none() {
+            let mut session = self.net.into_session()
+                .map_err(|_| "a socket outlived the tasks".to_owned())?;
+            let deadline = WallInstant::now() + std::time::Duration::from_secs(10);
+            while !session.closed() {
+                let _ = session.finish();
+                session.poll(|_, _| {}, |_, _, _| {})
+                    .map_err(|e| format!("finish junction session: {e}"))?;
+                if WallInstant::now() >= deadline {
+                    return Err("junction session retirement timed out".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            return Ok(());
+        }
         let stack = self
             .net
             .into_stack()
@@ -142,6 +199,14 @@ impl Host {
             .try_close()
             .map_err(|(_, e)| format!("port close: {e}"))
     }
+}
+
+/// Welcome advertises UDP payload storage; netconf's MTU includes IPv4/UDP headers.
+fn remote_mtu(frame_capacity: u32, max_record: usize) -> Result<usize, String> {
+    let record_payload = max_record.checked_sub(junction::send::UDP_SEND_HEADER)
+        .filter(|&size| size > 0)
+        .ok_or("junction max_record cannot hold a UDP payload")?;
+    Ok((frame_capacity as usize).min(record_payload) + 28)
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -172,6 +237,25 @@ pub fn stopped() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_selection_opens_config_or_connects_socket() {
+        let missing = std::env::temp_dir().join(format!("zhida-bench-missing-{}", std::process::id()))
+            .join("nic-or-socket");
+        let no_sizing = |_| -> Sizing { panic!("unopened backend must not size a device") };
+        let local = Host::connect(&Backend::Conduit(missing.clone()), 1, no_sizing).err().unwrap();
+        assert!(local.starts_with(&format!("{}:", missing.display())), "{local}");
+        let remote = Host::connect(&Backend::Junction(missing), 1, no_sizing).err().unwrap();
+        assert!(remote.starts_with("connect junction "), "{remote}");
+    }
+
+    #[test]
+    fn junction_sizing_uses_both_advertised_limits() {
+        assert_eq!(remote_mtu(1472, 1496).unwrap(), 1500);
+        assert_eq!(remote_mtu(1200, 4096).unwrap(), 1228);
+        assert_eq!(remote_mtu(1472, 1024).unwrap(), 1028);
+        assert!(remote_mtu(1472, junction::send::UDP_SEND_HEADER).is_err());
+    }
 
     /// A mapping that has drifted 5 ms from the wall clock is put back by `resync`, without
     /// moving the monotonic time.

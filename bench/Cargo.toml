@@ -13,6 +13,7 @@ path = "src/main.rs"
 mimalloc.workspace = true
 dpdk-smoltcp.workspace = true
 libc.workspace = true
+junction.workspace = true
 relay = { workspace = true, features = ["switchnet"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

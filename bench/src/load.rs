@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};
 use std::net::SocketAddrV4;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::Poll;
@@ -23,7 +22,7 @@ use switchnet::{
 use zhida_open::Sizing;
 
 use crate::hist::{Histogram, Sparse};
-use crate::host::{self, Clock, Host};
+use crate::host::{self, Backend, Clock, Host};
 use crate::pace::{Outcome, Pacer};
 use crate::record::Recorder;
 use crate::schedule::Schedule;
@@ -49,7 +48,7 @@ impl Proto {
 
 #[derive(Debug, Clone)]
 pub struct Args {
-    pub config: PathBuf,
+    pub backend: Backend,
     pub proto: Proto,
     pub target: SocketAddrV4,
     pub senders: u32,
@@ -195,14 +194,13 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     if args.proto == Proto::Ws {
         wsclient::check_size(args.size)?;
     }
-    let config = Host::config(&args.config)?;
     let tcp_config = tcp::Config {
         rx_capacity: TCP_BUFFER,
         tx_capacity: TCP_BUFFER,
         mss_cap: None,
     };
-    let mtu = usize::from(config.mtu);
-    let sizing = match args.proto {
+    host::catch_stop()?;
+    let mut host = Host::connect(&args.backend, n, |mtu| match args.proto {
         Proto::Udp => Sizing {
             frame_share: 64,
             max_sockets: 1,
@@ -219,9 +217,7 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
             tx_pending: 64,
             neighbor_capacity: 256,
         },
-    };
-    host::catch_stop()?;
-    let mut host = Host::open(&config, &sizing)?;
+    })?;
     host.start_xstats("gen");
     let handle = host.net.handle();
     let clock = host.clock;

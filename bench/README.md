@@ -8,6 +8,20 @@ generator reports ready or the UDP server starts serving. TCP connect and accept
 opening failures when polled. Send backpressure uses `switchnet::Error::Full`; UDP also pauses for
 `NeighborPending`.
 
+`gen` and `serve` accept `--backend conduit|junction` (default `conduit`). Conduit still requires
+`--config F` and owns the NIC in the app process. Junction requires `--junction-socket PATH` instead:
+start `junctiond --config F --dir DIR` on its own isolated CPU, then point the app at `DIR/control.sock`
+on another isolated CPU. Both receiver and generator support either backend, for every protocol.
+Junction uses the session's advertised frame capacity and maximum record size for device-dependent
+sizing; it never opens EAL or reads a NIC config. With `ZHIDA_BENCH_XSTATS=1`, junction labels port
+xstats absent rather than reporting synthetic counters.
+
+```sh
+taskset -c 2 junctiond --config nic.json --dir /run/junctiond --control-cpus 0
+taskset -c 3 zhida-bench serve --backend junction --junction-socket /run/junctiond/control.sock \
+    --proto udp --port 9000
+```
+
 ## Pieces
 
 - `zhida-bench sweep`: the coordinator (no DPDK). Starts G `gen` workers and runs every rate
@@ -76,6 +90,12 @@ The smoke accepts a sweep that stops because a sender fell behind. A bridge does
 the kernel side of a tap the Zhida MAC, which a bridge
 takes as its own and keeps the frames.
 
+For junction (build `cargo build --locked -p junctiond -p zhida-bench --bins` first), run
+`sh bench/local/junction-smoke.sh` inside the DPDK container with two CPUs and NET_ADMIN plus
+`/dev/net/tun`. `JUNCTION_CPU=0 APP_CPU=2` are defaults. It runs the daemon on a tap vdev, checks
+kernel-client UDP and TCP echoes through `serve --backend junction`, then runs a short UDP
+`gen --backend junction` against a kernel echo peer. All processes must retire cleanly.
+
 ## Tests
 
 `cargo test -p zhida-bench` (Docker image: the crate links DPDK) covers the schedule, the pacer (per-poll budget
@@ -101,12 +121,21 @@ key. Missing OpenSSH executables skip that test; an installed but unusable serve
 
 `python3 bench/aws/zhida_aws_bench.py run [--shape arm|intel] [--region R] [--ttl 2h] [--out DIR]` runs the whole thing. The default `arm` shape uses four c7gn.xlarge instances (one receiver, three senders; 16 vCPUs total) and an arm64 Amazon Linux 2023 image. `--shape intel` uses one c6in.8xlarge receiver and three c6in.2xlarge senders (56 vCPUs total) and an x86_64 Amazon Linux 2023 image. For the Intel run in Tokyo, use `--shape intel --region ap-northeast-1`. The same shape option works with `plan`, `preflight` and `kernel`.
 
+`--backend conduit junction` runs the same five sweeps on each backend; the default is `conduit`.
+Every sweep artifact is prefixed with its backend (`conduit-…` or `junction-…`).
+Junction starts a separate `junctiond` on every receiver and generator host before each sweep, pinned
+to `JUNCTION_CPU` with its control thread on `HOUSEKEEPING`; benchmark apps stay on `APP_CPU`.
+The runner waits for the control socket before launching the app and stops the daemon afterward.
+Host setup reserves both physical cores and their SMT siblings on the data ENI's NUMA node;
+conduit continues to use only `APP_CPU`. In the `kernel` comparison, the receiver stays on the
+kernel and `--backend` selects the generator backend.
+
 Before creating anything, preflight checks for a clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, enough free on-demand Standard vCPU quota L-1216C47A, and an availability zone offering every selected instance type. The subnet and cluster placement group use that common zone. An offering does not guarantee capacity; either instance launch can still fail.
 Use `--zone Z` with `run`, `kernel` or `preflight` to select a common availability zone explicitly
 when the default zone lacks capacity.
 Each benchmark run records the exact commit and SHA-256 of its source archive in `source.json`, `report.md`, and `results.json`.
 
-The run creates and tags a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; each on-demand instance has one DPDK data ENI. The ARM hosts launch in one request; Intel receiver and senders launch in separate requests. Every returned instance ID is recorded before waiting or making the next launch, in memory and `RUN_DIR/created.json`. Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (one `cargo build --release -p zhida-bench` with hft-host.sh's build env).
+The run creates and tags a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; each on-demand instance has one DPDK data ENI. The ARM hosts launch in one request; Intel receiver and senders launch in separate requests. Every returned instance ID is recorded before waiting or making the next launch, in memory and `RUN_DIR/created.json`. Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (`cargo build --release --locked -p zhida-bench -p junctiond --bins` with hft-host.sh's build env).
 
 The fixed matrix has five sweeps: UDP uncapped, TCP with `--budget-us 50` and uncapped, and WS with `--budget-us 50` and uncapped. Comparing the capped and uncapped sweeps shows whether the backlog cap shifts the knee. Each sweep uses 12 connections (4 per sender host), 64 B messages, and rates of 10k, 100k, 400k, 800k, 900k, 1M, 1.1M, 1.2M, 1.4M, 1.8M and 2.5M msg/s. The coordinator on sender0 drives one worker per sender host over SSH; a failed sweep is logged and the next one runs; every sweep's files are fetched. Teardown runs on normal exit, errors, Ctrl-C and SIGTERM; once it starts, Ctrl-C/SIGTERM are ignored, and every ssh/scp before it has a timeout. It deletes everything the run created by recorded ID and by tag (instances, data ENIs, key pair, placement group, security group, subnet, route table, internet gateway, VPC, in that dependency order), checks nothing is left, and exits non-zero if anything remains. Then `bench/report.py RUN_DIR`. Each instance also powers itself off (terminates) at the TTL as a backstop. Exit 0 only if report.py passed, every fetch succeeded and nothing remains.
 

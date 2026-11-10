@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use zhida_bench::load::Proto;
+use zhida_bench::host::Backend;
 use zhida_bench::{coord, load, serve};
 
 #[global_allocator]
@@ -24,12 +25,13 @@ usage:
       log-spaced schedule PPS-min x sqrt(2)^k up to PPS-max. Prints one JSON line per step and
       always a summary line. --budget-us (tcp, ws): after the first step, each
       connection may have its rate share x (the first step's median round trip + W) in flight.
-  zhida-bench gen --config F --proto udp|tcp|ws --target IP:PORT --senders N --size S
-                  [--local-port 40000]
-      One generator worker (a Zhida Stack on its own Port and core); takes steps on stdin.
+  zhida-bench gen [--backend conduit --config F | --backend junction --junction-socket PATH]
+                  --proto udp|tcp|ws --target IP:PORT --senders N --size S [--local-port 40000]
+      One generator worker (default conduit); takes steps on stdin.
       udp: N sockets; tcp: N connections, S-byte messages on each (S at most the MSS);
       ws: N ws:// connections, S-byte binary messages (S at most 1400: one TCP frame).
-  zhida-bench serve --config F --proto udp|tcp|ws --port P
+  zhida-bench serve [--backend conduit --config F | --backend junction --junction-socket PATH]
+                    --proto udp|tcp|ws --port P
       Zhida echo server; runs until SIGINT/SIGTERM.
   zhida-bench kernel-serve --proto udp|tcp|ws --bind IP --port P
       Linux kernel-socket echo server; runs until SIGINT/SIGTERM.";
@@ -91,6 +93,24 @@ fn proto(flags: &mut Flags) -> Result<Proto, String> {
         "tcp" => Ok(Proto::Tcp),
         "ws" => Ok(Proto::Ws),
         other => Err(format!("--proto {other}: udp, tcp or ws")),
+    }
+}
+
+fn backend(flags: &mut Flags) -> Result<Backend, String> {
+    match flags.or::<String>("backend", "conduit".into())?.as_str() {
+        "conduit" => {
+            if flags.0.contains_key("junction-socket") {
+                return Err("--junction-socket requires --backend junction".into());
+            }
+            Ok(Backend::Conduit(flags.need::<PathBuf>("config")?))
+        }
+        "junction" => {
+            if flags.0.contains_key("config") {
+                return Err("--backend junction does not take --config; junctiond owns the NIC".into());
+            }
+            Ok(Backend::Junction(flags.need::<PathBuf>("junction-socket")?))
+        }
+        other => Err(format!("--backend {other}: conduit or junction")),
     }
 }
 
@@ -165,7 +185,7 @@ fn main_inner() -> Result<(), String> {
         "gen" => {
             let proto = proto(&mut flags)?;
             let args = load::Args {
-                config: flags.need::<PathBuf>("config")?,
+                backend: backend(&mut flags)?,
                 proto,
                 target: flags.need("target")?,
                 senders: flags.need("senders")?,
@@ -181,7 +201,7 @@ fn main_inner() -> Result<(), String> {
         "serve" => {
             let proto = proto(&mut flags)?;
             let args = serve::Args {
-                config: flags.need("config")?,
+                backend: backend(&mut flags)?,
                 proto,
                 port: flags.need("port")?,
             };
@@ -217,6 +237,32 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_backend(args: &[&str]) -> Result<Backend, String> {
+        let mut flags = Flags::parse(args.iter().map(|arg| OsString::from(*arg)))?;
+        let backend = backend(&mut flags)?;
+        flags.done()?;
+        Ok(backend)
+    }
+
+    #[test]
+    fn backend_defaults_to_conduit_and_junction_requires_only_its_socket() {
+        assert_eq!(parse_backend(&["--config", "nic.json"]).unwrap(),
+            Backend::Conduit("nic.json".into()));
+        assert_eq!(parse_backend(&["--backend", "conduit", "--config", "nic.json"]).unwrap(),
+            Backend::Conduit("nic.json".into()));
+        assert_eq!(parse_backend(&["--backend", "junction", "--junction-socket", "/run/junctiond/control.sock"]).unwrap(),
+            Backend::Junction("/run/junctiond/control.sock".into()));
+        for args in [
+            vec![],
+            vec!["--backend", "junction"],
+            vec!["--backend", "other", "--config", "nic.json"],
+            vec!["--config", "nic.json", "--junction-socket", "sock"],
+            vec!["--backend", "junction", "--config", "nic.json", "--junction-socket", "sock"],
+        ] {
+            assert!(parse_backend(&args).is_err(), "{args:?}");
+        }
+    }
 
     fn parse_rates(args: &[&str]) -> Result<(u64, u64, Option<Vec<u64>>), String> {
         let mut flags = Flags::parse(args.iter().map(|arg| OsString::from(*arg)))?;

@@ -1,7 +1,5 @@
 //! The Zhida echo DUT (UDP, TCP, ws). The busy-poll loop does no syscall while serving.
 
-use std::path::PathBuf;
-
 use switch::{SpawnError, Spawner};
 use switchnet::{
     Accepting, Error, IpListenEndpoint, NetHandle, TcpStream, UdpConfig, UdpRx,
@@ -9,14 +7,14 @@ use switchnet::{
 };
 use zhida_open::Sizing;
 
-use crate::host::{self, Host};
+use crate::host::{self, Backend, Host};
 use crate::load::{Proto, TCP_BUFFER};
 use relay::Limits;
 use relay::switchnet::{Ws, accept_ws};
 
 #[derive(Debug, Clone)]
 pub struct Args {
-    pub config: PathBuf,
+    pub backend: Backend,
     pub proto: Proto,
     pub port: u16,
 }
@@ -27,15 +25,14 @@ const MAX_CONNS: usize = 256;
 const ACCEPTS: usize = 64;
 
 pub fn run(args: &Args) -> Result<(), String> {
-    let config = Host::config(&args.config)?;
     let tcp_config = tcp::Config {
         rx_capacity: TCP_BUFFER,
         tx_capacity: TCP_BUFFER,
         mss_cap: None,
     };
-    let mtu = usize::from(config.mtu);
     let sockets = MAX_CONNS + ACCEPTS;
-    let sizing = match args.proto {
+    host::catch_stop()?;
+    let mut host = Host::connect(&args.backend, sockets, |mtu| match args.proto {
         Proto::Udp => Sizing {
             frame_share: 64,
             max_sockets: 1,
@@ -45,9 +42,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             neighbor_capacity: 256,
         },
         Proto::Tcp | Proto::Ws => tcp_sizing(sockets, &tcp_config, mtu),
-    };
-    host::catch_stop()?;
-    let mut host = Host::open(&config, &sizing)?;
+    })?;
     host.start_xstats("serve");
     let handle = host.net.handle();
     match args.proto {
@@ -313,7 +308,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(5));
             unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
         });
-        let result = run(&Args { config: path, proto, port: 0 });
+        let result = run(&Args { backend: Backend::Conduit(path), proto, port: 0 });
         std::fs::remove_dir_all(dir).unwrap();
         assert!(
             matches!(&result, Err(error) if error.starts_with("tcp accept:")),
