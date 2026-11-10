@@ -17,8 +17,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use switch::SpawnError;
 use switchnet::{
-    Connecting, IpEndpoint, IpListenEndpoint, NetHandle, SendFrameError, TcpTx, ImmutableFrame, OwnedFrame, UdpConfig,
-    UdpRx, UdpSendError, UdpSendFrameError, UdpTx, tcp,
+    Connecting, Error, IpEndpoint, IpListenEndpoint, NetHandle, TcpTx, ImmutableFrame, OwnedFrame,
+    UdpConfig, UdpRx, UdpTx, tcp,
 };
 use zhida_open::Sizing;
 
@@ -65,6 +65,8 @@ const UDP_QUEUE: usize = 256;
 /// Receive and send buffer of each generator TCP connection.
 pub const TCP_BUFFER: usize = 64 * 1024;
 const CONNECT_LIMIT: Duration = Duration::from_secs(10);
+
+type ConnectResults = Rc<RefCell<Vec<Option<Result<TcpTx, String>>>>>;
 
 /// A line from the coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -154,17 +156,12 @@ impl Senders {
         match self {
             Senders::Udp(txs) => match txs[sender as usize].send(Some(target), frame) {
                 Ok(()) => Outcome::Sent,
-                Err((
-                    _,
-                    UdpSendFrameError::Udp(
-                        UdpSendError::WouldBlock | UdpSendError::NeighborPending,
-                    ),
-                )) => Outcome::Stop,
+                Err((_, Error::Full | Error::NeighborPending)) => Outcome::Stop,
                 Err((_, e)) => panic!("udp send: {e:?}"),
             },
             Senders::Tcp(txs) | Senders::Ws(txs) => match txs[sender as usize].try_send(frame) {
                 Ok(()) => Outcome::Sent,
-                Err((_, SendFrameError::Full)) => Outcome::Blocked,
+                Err((_, Error::Full)) => Outcome::Blocked,
                 Err((_, e)) => panic!("tcp send on connection {sender}: {e:?}"),
             },
         }
@@ -252,8 +249,18 @@ pub fn run(args: &Args, out: &mut dyn FnMut(&str)) -> Result<(), String> {
                     tx_checksum: true,
                     broadcast: false,
                 };
-                let (rx, tx) = handle
-                    .udp_bind(config)
+                let bound = Rc::new(RefCell::new(None));
+                host.rt
+                    .spawner()
+                    .spawn(bind_udp(handle.clone(), config, bound.clone()))
+                    .map_err(spawn_error)?;
+                while bound.borrow().is_none() {
+                    host.round()?;
+                }
+                let (rx, tx) = bound
+                    .borrow_mut()
+                    .take()
+                    .expect("binding completed")
                     .map_err(|e| format!("udp bind {port}: {e:?}"))?
                     .split();
                 txs.push(tx);
@@ -332,6 +339,15 @@ fn spawn_error<T>(e: SpawnError<T>) -> String {
     format!("spawn: {:?}", e.reason)
 }
 
+#[switch::task]
+async fn bind_udp(
+    handle: NetHandle,
+    config: UdpConfig,
+    bound: Rc<RefCell<Option<Result<switchnet::UdpSocket, Error>>>>,
+) {
+    *bound.borrow_mut() = Some(handle.udp_bind(config).await);
+}
+
 /// Connects the N TCP senders (ws: and upgrades each), turning the Net until all are ready, and
 /// starts a receive task on each that cuts the echoed byte stream into messages (ws: frames).
 fn connect_all(
@@ -344,7 +360,7 @@ fn connect_all(
     conns: &Rc<Vec<Conn>>,
 ) -> Result<Vec<TcpTx>, String> {
     let n = args.senders as usize;
-    let connected: Rc<RefCell<Vec<Option<TcpTx>>>> =
+    let connected: ConnectResults =
         Rc::new(RefCell::new((0..n).map(|_| None).collect()));
     let clock = host.clock;
     for i in 0..args.senders {
@@ -352,9 +368,7 @@ fn connect_all(
             addr: None,
             port: local_port(args, i)?,
         };
-        let connecting = handle
-            .tcp_connect(config, target, local)
-            .map_err(|e| format!("tcp connect: {e:?}"))?;
+        let connecting = handle.tcp_connect(config, target, local);
         let (connected, recorder, size) = (connected.clone(), recorder.clone(), args.size);
         let (ws, handle, peer) = (args.proto == Proto::Ws, handle.clone(), args.target);
         let conns = conns.clone();
@@ -367,6 +381,12 @@ fn connect_all(
     }
     let deadline = host.clock.now_ns() + CONNECT_LIMIT.as_nanos() as u64;
     while connected.borrow().iter().any(Option::is_none) {
+        if let Some(error) = connected.borrow().iter().find_map(|slot| match slot {
+            Some(Err(error)) => Some(error.clone()),
+            _ => None,
+        }) {
+            return Err(error);
+        }
         if host.round()? > deadline {
             return Err(format!(
                 "{} connections not established within {CONNECT_LIMIT:?}",
@@ -374,11 +394,11 @@ fn connect_all(
             ));
         }
     }
-    Ok(connected
+    connected
         .borrow_mut()
         .iter_mut()
         .map(|tx| tx.take().expect("checked above"))
-        .collect())
+        .collect()
 }
 
 /// Connection `i`'s receive task: waits for the connection (ws: upgrades it), hands its sending
@@ -393,14 +413,18 @@ async fn tcp_receive(
     peer: SocketAddrV4,
     size: usize,
     handle: NetHandle,
-    connected: Rc<RefCell<Vec<Option<TcpTx>>>>,
+    connected: ConnectResults,
     recorder: Rc<RefCell<Option<Recorder>>>,
     conns: Rc<Vec<Conn>>,
     clock: Clock,
 ) {
     let stream = match connecting.await {
         Ok(stream) => stream,
-        Err(closed) => panic!("tcp connect {i}: {closed:?}"),
+        Err(error @ (Error::Refused | Error::Closed)) => panic!("tcp connect {i}: {error:?}"),
+        Err(error) => {
+            connected.borrow_mut()[i as usize] = Some(Err(format!("tcp connect: {error:?}")));
+            return;
+        }
     };
     let (mut rx, mut tx) = stream.split();
     let mut partial = Vec::with_capacity(size);
@@ -433,7 +457,7 @@ async fn tcp_receive(
         }
         partial.extend_from_slice(&head[n..]);
     }
-    connected.borrow_mut()[i as usize] = Some(tx);
+    connected.borrow_mut()[i as usize] = Some(Ok(tx));
     let conn = &conns[i as usize];
     while let Ok(frame) = rx.recv().await {
         let now = clock.now_ns();

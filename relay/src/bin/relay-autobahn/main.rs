@@ -17,7 +17,7 @@ use relay::{Kind, Limits};
 use relay::switchnet::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
 use switch::{Runtime, Spawner};
 use switchnet::{
-    Closed, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, OpenError, RoundError, round,
+    Error as NetError, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, RoundError, round,
     tcp, within,
 };
 use tap_echo::driver::{self, ECHO_PORT, EXIT_ERROR, IFACE, TESTER_IP, ZHIDA_IP};
@@ -160,7 +160,7 @@ enum Failure {
     Spawn,
     Round(RoundError),
     /// The server role's next listener.
-    Listen(OpenError),
+    Listen(NetError),
     /// The tester's server-ready marker did not appear within `SERVER_READY_LIMIT`.
     NoServerReady,
     /// Writing the client-done marker.
@@ -176,8 +176,7 @@ enum Failure {
 /// Why one connection failed.
 #[derive(Debug)]
 enum Why {
-    Open(OpenError),
-    NotEstablished(Closed),
+    Open(NetError),
     Upgrade(Error),
     /// Still open after this per-connection deadline.
     Deadline(Duration),
@@ -213,7 +212,6 @@ impl fmt::Display for Why {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Open(e) => write!(f, "open: {e:?}"),
-            Self::NotEstablished(e) => write!(f, "not established: {e:?}"),
             Self::Upgrade(e) => write!(f, "upgrade: {e}"),
             Self::Deadline(limit) => write!(f, "still open after {limit:?}"),
             Self::CaseCount(n) => write!(f, "case count {n:?}"),
@@ -296,12 +294,12 @@ async fn run_role(
 /// previous connection still closes.
 async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally: &RefCell<Tally>) -> Result<(), Failure> {
     let local = IpListenEndpoint { addr: None, port: ECHO_PORT };
-    let listen = || handle.tcp_accept(SOCKET, local).map_err(Failure::Listen);
-    let mut next = listen()?;
+    let listen = || handle.tcp_accept(SOCKET, local);
+    let mut next = listen();
     let mut buf = Vec::new();
     loop {
-        let stream = next.await;
-        next = listen()?;
+        let stream = next.await.map_err(Failure::Listen)?;
+        next = listen();
         let n = tally.borrow().connections;
         tally.borrow_mut().connections += 1;
         let session = async {
@@ -356,8 +354,7 @@ async fn connection(handle: &NetHandle, n: usize, path: &str, cases: usize, buf:
     let remote = IpEndpoint::new(TESTER_IP.into(), FUZZINGSERVER_PORT);
     let port = FIRST_LOCAL_PORT + u16::try_from(n).expect("parse bounded the cases");
     let local = IpListenEndpoint { addr: None, port };
-    let connecting = handle.tcp_connect(SOCKET, remote, local).map_err(Why::Open)?;
-    let stream = connecting.await.map_err(Why::NotEstablished)?;
+    let stream = handle.tcp_connect(SOCKET, remote, local).await.map_err(Why::Open)?;
     let mut ws = connect_ws(handle, stream, &TESTER_IP.to_string(), FUZZINGSERVER_PORT, path, Limits::default()).await.map_err(Why::Upgrade)?;
     if (1..=cases).contains(&n) {
         return Ok(echo(&mut ws, buf).await);

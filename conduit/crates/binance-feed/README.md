@@ -10,6 +10,10 @@ Depends on `relay` (feature `switchnet`), `switchnet`, `switch`, [`tap-echo`](..
 - `feed_latency` is `no_stamp=N` and a log2 ns histogram of CLOCK_REALTIME at message hand-over minus the message's NIC RX stamp (`<=0` for a stamp at or after now); the host's chrony disciplines CLOCK_REALTIME to the NIC's PHC. `clock_reset` is a one-shot callback checked immediately before it: a reset prints `latency invalid: NIC clock jumped`, not the histogram. The NIC runner compares the synchronous port reset count against its pre-feed value; the local tap passes `|| false`, retaining `no_stamp` counts without hardware timestamps. No reset check runs per packet or turn.
 - `resolve(host, port, path)`, `random_local_port()` (`FIRST_LOCAL_PORT`..65535), `CONNECT_LIMIT`, `CLOSE_LIMIT` and `DEFAULT_{HOST,PORT,PATH,PRINT}`: the setup both binaries share.
 - `connect(handle, spawner, target, socket, tls, local_port, limit)`: opens TCP, TLS and WebSocket within one time limit and returns relay's `Wss`; on an error or timeout the socket is dropped.
+  TCP opening errors are `switchnet::Error` codes carried by `FeedError::Open`. A refused connect
+  remains `FeedError::Closed { reset_by_peer: true, .. }`; a connect closed without reset uses
+  `reset_by_peer: false`. Socket allocation and connect failures are delivered by awaiting the
+  TCP connect future, within the same overall connection deadline.
 - `Target { addr, host, path }`, `BookTicker<'a>` (`update_id`, `symbol`, bid and ask price and quantity as Binance's decimal strings, borrowing the received message; a JSON-escaped field is unescaped into an owned copy), `Clock`, `FeedError`.
 - `Clock::sample()` returns the Stack's microsecond time and the Runtime's nanosecond tick from one monotonic clock sample; `Clock::ns()` supplies Runtime initialization. Relative sleeps count from the most recent tick supplied to the Runtime and run once a later poll reaches their deadline.
 - `socket(mss_cap)`: the `tcp::Config` (256 KiB RX and TX buffers). `client_config(roots)` (TLS 1.3 only) and `webpki_client_config()` build the rustls config.

@@ -16,7 +16,7 @@ use relay::switchnet::{Error as WsError, Wss};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
 use switch::{oneshot, Spawner};
-use switchnet::{first, tcp, Instant, IpEndpoint, IpListenEndpoint, NetHandle, OpenError};
+use switchnet::{first, tcp, Error, Instant, IpEndpoint, IpListenEndpoint, NetHandle};
 
 pub const INGRESS_BUDGET: usize = 128;
 /// The feed's defaults, shared by binance-feed and `zhida-nic feed`. The host speaks TLS 1.3;
@@ -173,7 +173,7 @@ pub fn socket(mss_cap: Option<u16>) -> tcp::Config {
 #[derive(Debug)]
 pub enum FeedError {
     /// The Stack refused the socket (no free slot, pools too small) or the connect.
-    Open(OpenError),
+    Open(Error),
     /// TCP closed before it was established.
     Closed {
         addr: SocketAddrV4,
@@ -194,6 +194,16 @@ pub enum FeedError {
     Binary,
     /// The server closed the WebSocket with this status and reason (its close was echoed).
     ServerClosed { code: u16, reason: String },
+}
+
+fn connect_error(addr: SocketAddrV4, error: Error) -> FeedError {
+    match error {
+        Error::Refused | Error::Closed => FeedError::Closed {
+            addr,
+            reset_by_peer: error == Error::Refused,
+        },
+        error => FeedError::Open(error),
+    }
 }
 
 impl fmt::Display for FeedError {
@@ -257,12 +267,8 @@ pub async fn connect(
         };
         let stream = handle
             .tcp_connect(socket, remote, local)
-            .map_err(FeedError::Open)?
             .await
-            .map_err(|closed| FeedError::Closed {
-                addr: target.addr,
-                reset_by_peer: closed.reset_by_peer,
-            })?;
+            .map_err(|error| connect_error(target.addr, error))?;
         let wss = relay::switchnet::connect(
             handle,
             stream,
@@ -457,6 +463,23 @@ async fn close(mut wss: Wss, spawner: &Spawner) -> Result<(), FeedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_connect_errors_preserve_failure_meaning() {
+        let addr = SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 443);
+        for (error, reset) in [(Error::Refused, true), (Error::Closed, false)] {
+            assert!(matches!(
+                connect_error(addr, error),
+                FeedError::Closed { addr: actual, reset_by_peer }
+                    if actual == addr && reset_by_peer == reset
+            ));
+        }
+        for error in [Error::SocketsFull, Error::PortInUse, Error::InvalidConfig, Error::Unaddressable] {
+            assert!(matches!(connect_error(addr, error), FeedError::Open(actual) if actual == error));
+        }
+        assert!(connect_error(addr, Error::Refused).to_string().contains("reset by the peer"));
+        assert!(connect_error(addr, Error::Closed).to_string().contains("closed before it was established"));
+    }
 
     #[test]
     fn clock_sample_uses_one_nanosecond_clock_for_both_times() {

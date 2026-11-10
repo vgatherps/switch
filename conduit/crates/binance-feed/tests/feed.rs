@@ -25,7 +25,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{
-    frame_reserve, rx_reserve, AddTcpError, Offloads, Port, PortConfig, Stack,
+    frame_reserve, rx_reserve, Offloads, Port, PortConfig, Stack,
     StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use relay::UpgradeError;
@@ -33,7 +33,7 @@ use relay::switchnet::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use switch::{oneshot, Runtime, Spawner};
-use switchnet::{Net, NetConfig, NetHandle, OpenError};
+use switchnet::{Error as NetError, Net, NetConfig, NetHandle};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -494,7 +494,7 @@ async fn connect_refused(handle: &NetHandle, spawner: &Spawner, at_once: bool) {
                 addr,
                 reset_by_peer: true,
             } if addr == target.addr => return,
-            FeedError::Open(OpenError::Add(AddTcpError::SocketsFull(_))) if !at_once => {
+            FeedError::Open(NetError::SocketsFull) if !at_once => {
                 spawner
                     .sleep(1_000_000)
                     .expect("open Runtime")

@@ -8,7 +8,7 @@ use zhida_test_kit::pair::BUDGET;
 use zhida_test_kit::with_eal;
 
 mod support;
-use support::{Mixed, counted, net_ip, peer_udp_send, udp_config};
+use support::{Mixed, bind, counted, net_ip, peer_udp_send, udp_config};
 
 #[zhida_test_support::pinned_test]
 fn idle_rounds_report_nothing_moved_and_do_not_sleep() {
@@ -34,7 +34,7 @@ fn a_round_that_wakes_a_task_reports_it_moved() {
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         mixed.rounds(5);
-        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut socket = bind(&mut mixed, udp_config(7000));
         let (task, polls) = counted(async move {
             let datagram = socket.recv().await;
             (socket, datagram)

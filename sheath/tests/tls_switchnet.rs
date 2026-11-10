@@ -21,7 +21,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use sheath::switchnet::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
 use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
-use switchnet::{AddTcpError, Closed, IpEndpoint, IpListenEndpoint, NetHandle, OpenError, TcpStream, tcp};
+use switchnet::{Error as NetError, IpEndpoint, IpListenEndpoint, NetHandle, TcpStream, tcp};
 
 const SERVER_PORT: u16 = 8443;
 const HOST: &str = "tls.test";
@@ -198,7 +198,7 @@ async fn connect_client<
 ) {
     let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
     let local = IpListenEndpoint { addr: None, port: next_local_port() };
-    let stream = handle.tcp_connect(TAP.socket, remote, local).expect("open TCP").await.expect("TCP connect");
+    let stream = handle.tcp_connect(TAP.socket, remote, local).await.expect("TCP connect");
     *held.borrow_mut() = Some(client(handle, spawner, stream, tls).await);
 }
 
@@ -418,17 +418,16 @@ fn receive_error_waits_for_a_server_that_never_reads_until_the_caller_gives_up()
             let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT + 1);
             let local = IpListenEndpoint { addr: None, port: next_local_port() };
             let started = Instant::now();
-            let connecting = loop {
-                match handle.tcp_connect(TAP.socket, remote, local) {
-                    Ok(connecting) => break connecting,
-                    Err(OpenError::Add(AddTcpError::SocketsFull(_))) => {
+            let result = loop {
+                match handle.tcp_connect(TAP.socket, remote, local).await {
+                    Err(NetError::SocketsFull) => {
                         assert!(started.elapsed() < Duration::from_secs(5), "the dropped connection kept its slot");
                         spawner.sleep(1).expect("the runtime is open").await.expect("sleep");
                     }
-                    Err(e) => panic!("open TCP: {e:?}"),
+                    result => break result,
                 }
             };
-            assert_eq!(connecting.await.err(), Some(Closed { reset_by_peer: true }));
+            assert_eq!(result.err(), Some(NetError::Refused));
             done.store(true, Ordering::Release);
         },
     );

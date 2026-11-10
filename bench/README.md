@@ -3,6 +3,11 @@
 Latency/load benchmark of the Zhida stack: open-loop generators (Zhida apps), a Zhida echo receiver, a fixed
 rate sweep, and a report. Design: `plans/bench/design.md`.
 
+Socket opening runs in switch tasks: UDP binding finishes while the host turns the Net before the
+generator reports ready or the UDP server starts serving. TCP connect and accept futures report
+opening failures when polled. Send backpressure uses `switchnet::Error::Full`; UDP also pauses for
+`NeighborPending`.
+
 ## Pieces
 
 - `zhida-bench sweep`: the coordinator (no DPDK). Starts G `gen` workers and runs every rate

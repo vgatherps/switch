@@ -2,6 +2,9 @@
 //! [`connect_ws`] for a plain ws:// client and [`accept_ws`] for a plain ws:// server. Each runs
 //! the WebSocket upgrade (a rare path, which allocates), then [`Wss`]/[`Ws`] receive and send
 //! messages. Their futures run as switch tasks.
+//!
+//! TCP failures during setup carry [`switchnet::Error`] inside [`Error`]. During a session,
+//! TCP `Finished` is FIN; other receive failures remain a reset.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -11,7 +14,7 @@ use rustls::ClientConfig;
 pub use sheath::switchnet::SetupError;
 use sheath::switchnet::{SwitchTx, send_bytes, tls_connect};
 use sheath::{TlsRx, TlsTx, TxError as TlsTxError};
-use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream};
+use switchnet::{Error as NetError, NetHandle, TcpFrame, TcpRx, TcpStream};
 
 use crate::lower::{PlainRx, PlainTx};
 use crate::raw::Raw;
@@ -29,11 +32,11 @@ impl PlainTx for SwitchTx {
         false
     }
 
-    fn take_pending(&mut self, _: switchnet::OwnedFrame) -> Result<Option<switchnet::ImmutableFrame>, SendError> {
+    fn take_pending(&mut self, _: switchnet::OwnedFrame) -> Result<Option<switchnet::ImmutableFrame>, NetError> {
         Ok(None)
     }
 
-    fn seal_close(&mut self, _: switchnet::OwnedFrame) -> Result<Option<switchnet::ImmutableFrame>, SendError> {
+    fn seal_close(&mut self, _: switchnet::OwnedFrame) -> Result<Option<switchnet::ImmutableFrame>, NetError> {
         Ok(None)
     }
 }
@@ -41,11 +44,11 @@ impl PlainTx for SwitchTx {
 #[derive(Debug)]
 pub enum Error {
     /// TCP receive failed during setup (the upgrade).
-    Recv(RecvError),
+    Recv(NetError),
     /// The TLS handshake failed.
     Tls(sheath::Error),
     /// Sending the upgrade failed below WebSocket (TLS or TCP).
-    Send(TlsTxError<SendError>),
+    Send(TlsTxError<NetError>),
     /// The TLS handshake could not start or ended in a state other than application traffic.
     Handshake(String),
     /// The server refused or botched the WebSocket upgrade.
@@ -120,14 +123,14 @@ impl From<SetupError> for Error {
 }
 
 /// The upgrade's sends.
-impl From<TlsTxError<SendError>> for Error {
-    fn from(e: TlsTxError<SendError>) -> Self {
+impl From<TlsTxError<NetError>> for Error {
+    fn from(e: TlsTxError<NetError>) -> Self {
         Self::Send(e)
     }
 }
 
-impl From<SendError> for Error {
-    fn from(e: SendError) -> Self {
+impl From<NetError> for Error {
+    fn from(e: NetError) -> Self {
         Self::Send(TlsTxError::Lower(e))
     }
 }
@@ -363,7 +366,7 @@ impl Input for TcpRx {
     async fn recv(&mut self) -> Result<TcpFrame, InputEnd> {
         // switchnet reports a reset after the peer's FIN as the reset, not `Finished`
         TcpRx::recv(self).await.map_err(|e| match e {
-            RecvError::Finished => InputEnd::Fin,
+            NetError::Finished => InputEnd::Fin,
             _ => InputEnd::Reset,
         })
     }

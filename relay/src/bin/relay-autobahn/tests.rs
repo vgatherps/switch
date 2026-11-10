@@ -425,7 +425,7 @@ fn client_connect_and_upgrade_failures_are_errors() {
         write_marker(&marker.join("server-ready")).unwrap();
         thread::sleep(Duration::from_secs(2));
     });
-    assert!(matches!(result, Err(Failure::Connection { n: 0, why: Why::NotEstablished(_) })), "{result:?}");
+    assert!(matches!(result, Err(Failure::Connection { n: 0, why: Why::Open(NetError::Refused) })), "{result:?}");
 
     let dir = run_dir("404");
     let marker = dir.clone();

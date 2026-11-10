@@ -7,11 +7,12 @@
 
 use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
 use switchnet::tcp::State;
-use switchnet::{ConnectError, Datagram, IpEndpoint, Ipv4Address, NetHandle, OpenError, UdpRx, UdpSocket, UdpTx};
+use switchnet::{Error, Datagram, IpEndpoint, Ipv4Address, NetHandle, UdpRx, UdpSocket, UdpTx};
 use zhida_test_kit::with_eal;
 
 mod support;
 use support::{
+    bind,
     counted, local, local_at, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send_to, tcp_config,
     udp_config, udp_config_at, Mixed, LOCAL_PORT, PEER_PORT,
 };
@@ -52,10 +53,11 @@ fn connect_from_a_secondary_address_uses_it() {
         let mut mixed = Mixed::with_owned(eal, ["mcna", "mcnb"], OWNED);
         let unowned = Ipv4Address::new(10, 0, 0, 99);
         let refused = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local_at(unowned, LOCAL_PORT));
-        assert!(matches!(refused, Err(OpenError::Connect(ConnectError::Unaddressable))));
+        let refused = mixed.spawn(refused);
+        assert!(matches!(mixed.wait(&refused), Err(Error::Unaddressable)));
         let peer = peer_listen(&mut mixed);
         let connecting =
-            mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local_at(SECOND, LOCAL_PORT)).unwrap();
+            mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local_at(SECOND, LOCAL_PORT));
         let slot = mixed.spawn(async move {
             let mut stream = connecting.await.expect("connect");
             let frame = stream.recv().await.unwrap();
@@ -77,9 +79,9 @@ fn connect_from_a_secondary_address_uses_it() {
 fn accept_on_a_secondary_address_takes_only_its_connections() {
     with_eal(|eal| {
         let mut mixed = Mixed::with_owned(eal, ["maca", "macb"], OWNED);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT)).unwrap();
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let slot = mixed.spawn(async move {
-            let mut stream = accepting.await;
+            let mut stream = accepting.await.unwrap();
             let frame = stream.recv().await.unwrap();
             (stream, frame)
         });
@@ -105,8 +107,8 @@ fn accept_on_a_secondary_address_takes_only_its_connections() {
 fn listener_bound_to_an_address_beats_the_all_ip_listener() {
     with_eal(|eal| {
         let mut mixed = Mixed::with_owned(eal, ["mlpa", "mlpb"], OWNED);
-        let (all, all_polls) = counted(mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)).unwrap());
-        let exact = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT)).unwrap();
+        let (all, all_polls) = counted(mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)));
+        let exact = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let all = mixed.spawn(all);
         let exact = mixed.spawn(exact);
         mixed.turn();
@@ -115,7 +117,7 @@ fn listener_bound_to_an_address_beats_the_all_ip_listener() {
         assert!(!all.is_full(), "the all-IP listener took the connection to the bound address");
         assert_eq!(all_polls.get(), 1, "the all-IP listener's task was woken");
         let to_third = peer_connect(&mut mixed, at(THIRD, LOCAL_PORT), PEER_PORT + 1);
-        let streams = [mixed.wait(&exact), mixed.wait(&all)];
+        let streams = [mixed.wait(&exact).unwrap(), mixed.wait(&all).unwrap()];
         drop((streams, to_second, to_third));
         mixed.close();
     })
@@ -129,7 +131,7 @@ fn udp_sockets_bound_per_address_receive_and_reply_from_it() {
         let mut mixed = Mixed::with_owned(eal, ["mupa", "mupb"], OWNED);
         let handle = mixed.handle();
         let [second, third] = [SECOND, THIRD].map(|addr| {
-            let socket = handle.udp_bind(udp_config_at(addr, UDP_PORT)).unwrap();
+            let socket = bind(&mut mixed, udp_config_at(addr, UDP_PORT));
             let (task, polls) = counted(echo_once(handle.clone(), socket));
             (mixed.spawn(task), polls)
         });
@@ -165,8 +167,8 @@ fn udp_sockets_bound_per_address_receive_and_reply_from_it() {
 fn udp_socket_bound_to_an_address_beats_the_all_ip_socket() {
     with_eal(|eal| {
         let mut mixed = Mixed::with_owned(eal, ["mupra", "muprb"], OWNED);
-        let mut all = mixed.handle().udp_bind(udp_config(UDP_PORT)).unwrap();
-        let mut exact = mixed.handle().udp_bind(udp_config_at(SECOND, UDP_PORT)).unwrap();
+        let mut all = bind(&mut mixed, udp_config(UDP_PORT));
+        let mut exact = bind(&mut mixed, udp_config_at(SECOND, UDP_PORT));
         let (all_task, all_polls) = counted(async move {
             let first = all.recv().await;
             let second = all.recv().await;
@@ -203,21 +205,21 @@ fn udp_socket_bound_to_an_address_beats_the_all_ip_socket() {
 fn parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic() {
     with_eal(|eal| {
         let mut mixed = Mixed::with_owned(eal, ["mtka", "mtkb"], OWNED);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT)).unwrap();
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let accepted = mixed.spawn(accepting);
         mixed.turn();
         let tcp_peer = peer_connect(&mut mixed, at(SECOND, LOCAL_PORT), PEER_PORT);
-        let mut stream = mixed.wait(&accepted);
+        let mut stream = mixed.wait(&accepted).unwrap();
         let (tcp_task, tcp_polls) = counted(async move {
             let frame = stream.recv().await.unwrap();
             (stream, frame)
         });
-        let mut exact = mixed.handle().udp_bind(udp_config_at(SECOND, UDP_PORT)).unwrap();
+        let mut exact = bind(&mut mixed, udp_config_at(SECOND, UDP_PORT));
         let (exact_task, exact_polls) = counted(async move {
             let datagram = exact.recv().await;
             (exact, datagram)
         });
-        let mut all = mixed.handle().udp_bind(udp_config(UDP_PORT)).unwrap();
+        let mut all = bind(&mut mixed, udp_config(UDP_PORT));
         let (all_task, all_polls) = counted(async move {
             let datagram = all.recv().await;
             (all, datagram)

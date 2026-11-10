@@ -139,7 +139,7 @@ async fn connect_client<H: 'static, F: Future<Output = H> + 'static, C: FnOnce(N
 ) {
     let remote = IpEndpoint::new(KERNEL_ADDR.into(), SERVER_PORT);
     let local = IpListenEndpoint { addr: None, port: next_local_port() };
-    let stream = handle.tcp_connect(socket, remote, local).expect("open TCP").await.expect("TCP connect");
+    let stream = handle.tcp_connect(socket, remote, local).await.expect("TCP connect");
     *held.borrow_mut() = Some(client(handle, stream).await);
 }
 

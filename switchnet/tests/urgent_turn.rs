@@ -6,7 +6,7 @@ use switchnet::{IpEndpoint, NetHandle, ImmutableFrame};
 use zhida_test_kit::with_eal;
 
 mod support;
-use support::{Mixed, LOCAL_PORT, connect, counted, peer_drain, peer_ip, peer_udp_send, udp_config};
+use support::{Mixed, LOCAL_PORT, bind, connect, counted, peer_drain, peer_ip, peer_udp_send, udp_config};
 
 /// The fixture ports' `tx_burst`.
 const TX_BURST: usize = 8;
@@ -22,7 +22,7 @@ async fn filled(handle: &NetHandle, data: &[u8]) -> ImmutableFrame {
 fn a_udp_burst_stops_the_poll_until_the_net_turns() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["urua", "urub"]);
-        let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let reader = mixed.spawn(async move { (rx.recv().await, rx) });
@@ -100,7 +100,7 @@ fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
 fn fewer_frames_than_a_burst_do_not_stop_the_poll() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["urfa", "urfb"]);
-        let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let reader = mixed.spawn(async move { (rx.recv().await, rx) });
@@ -130,7 +130,7 @@ fn fewer_frames_than_a_burst_do_not_stop_the_poll() {
 fn a_burst_sent_outside_any_task_does_not_stop_the_next_poll() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["uroa", "urob"]);
-        let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let reader = mixed.spawn(async move { (rx.recv().await, rx) });

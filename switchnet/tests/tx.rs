@@ -8,12 +8,13 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use switchnet::tcp::{self, State};
-use switchnet::{IpEndpoint, NetHandle, RecvError, SendError, SendFrameError, TcpTx, ImmutableFrame};
+use switchnet::{Error, IpEndpoint, NetHandle, TcpTx, ImmutableFrame};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
 mod support;
 use support::{
+    bind,
     cancel_after_one_poll, connect, connect_with, counted, net_ip, peer_drain, peer_ip, peer_send, peer_udp_send,
     tcp_config, udp_config, Mixed, LOCAL_PORT,
 };
@@ -136,7 +137,7 @@ fn try_send_full_returns_the_same_frame() {
                 match tx.try_send(frame) {
                     Ok(()) => sent.extend_from_slice(&chunk),
                     Err((frame, error)) => {
-                        assert_eq!(error, SendFrameError::Full);
+                        assert_eq!(error, Error::Full);
                         assert_eq!(frame.as_ref().as_ptr(), at, "a different frame came back");
                         assert_eq!(frame.as_ref(), &chunk[..]);
                         tx.room(frame.len()).await.unwrap();
@@ -263,7 +264,7 @@ fn parked_room_resolves_with_an_error_on_reset() {
         assert!(mixed.to_net.forward() >= 1, "the reset did not leave the peer");
         mixed.turn();
         let (tx, error) = slot.take();
-        assert_eq!(error, SendError::InvalidState);
+        assert_eq!(error, Error::InvalidState);
         assert_eq!(polls.get(), parked + 1, "woken more than once by the reset");
         drop((tx, _rx, peer));
         mixed.close();
@@ -298,7 +299,7 @@ fn delivered_waits_until_the_peer_acks_the_fin() {
         assert!(!slot.is_full(), "delivered before the peer's ACK was forwarded");
         let got = peer_receive(&mut mixed, &peer, data.len());
         assert_eq!(got, data);
-        assert_eq!(mixed.peer.tcp_mut(&peer).recv().map(|f| f.is_some()), Err(RecvError::Finished));
+        assert_eq!(mixed.peer.tcp_mut(&peer).recv().map(|f| f.is_some()), Err(tcp::RecvError::Finished));
         mixed.to_net.paused = false;
         mixed.until(|_| slot.is_full());
         assert!(polls.get() > parked, "the ACK did not wake the waiter");
@@ -329,7 +330,7 @@ fn shutdown_sends_fin_after_the_data() {
                 Ok(Some(frame)) => got.extend_from_slice(frame.payload()),
                 Ok(None) => break false,
                 Err(error) => {
-                    assert_eq!(error, RecvError::Finished);
+                    assert_eq!(error, tcp::RecvError::Finished);
                     break true;
                 }
             }
@@ -351,7 +352,7 @@ fn shutdown_sends_fin_after_the_data() {
 fn udp_halves_receive_and_send_a_frame() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["udsa", "udsb"]);
-        let socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let reader = mixed.spawn(async move { (rx.recv().await, rx) });
@@ -402,8 +403,9 @@ fn room_beyond_the_send_capacity_fails() {
         let slot = mixed.spawn(task);
         mixed.turn();
         let (tx, over, huge, fits) = slot.take();
-        assert_eq!(over, Some(Err(SendError::TooLarge { len: 1501, capacity: 1500 })));
-        assert_eq!(huge, Some(Err(SendError::TooLarge { len: usize::MAX, capacity: 1500 })));
+        assert_eq!(tx.send_capacity(), 1500);
+        assert_eq!(over, Some(Err(Error::TooLarge)));
+        assert_eq!(huge, Some(Err(Error::TooLarge)));
         assert_eq!(fits, Some(Ok(())));
         assert_eq!(peer_receive(&mut mixed, &peer, CHUNK), [3; CHUNK]);
         drop((tx, _rx, peer));
@@ -521,7 +523,7 @@ fn canceled_room_clears_its_parked_handle() {
                     match tx.try_send(frame) {
                         Ok(()) => queued.set(queued.get() + CHUNK),
                         Err((frame, error)) => {
-                            assert_eq!(error, SendFrameError::Full);
+                            assert_eq!(error, Error::Full);
                             cancel_after_one_poll(tx.room(frame.len())).await;
                             break;
                         }

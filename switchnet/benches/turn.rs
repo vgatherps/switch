@@ -33,7 +33,7 @@ use dpdk_smoltcp::{
     frame_reserve, rx_reserve, Eal, Port, Stack, StackConfig, TcpHandle, UdpHandle,
 };
 use switch::Runtime;
-use switchnet::{tcp, Connecting, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig, UdpSocket};
+use switchnet::{tcp, Binding, Connecting, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig};
 use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
@@ -210,7 +210,7 @@ fn setup_tcp(eal: &Eal, n: usize) -> (Bench, Source) {
             peers.push(peer);
             let remote = IpEndpoint::new(Side::B.ip().into(), SERVER_BASE + id);
             let local = IpListenEndpoint { addr: None, port: CLIENT_BASE + id };
-            let connecting = handle.tcp_connect(tcp_config(), remote, local).unwrap();
+            let connecting = handle.tcp_connect(tcp_config(), remote, local);
             bench.rt.spawner().spawn(tcp_reader(connecting)).expect("spawn");
         }
         bench.until(|b| peers[start..].iter().all(|p| b.peer.tcp(p).state() == tcp::State::Established));
@@ -230,7 +230,8 @@ async fn tcp_reader(connecting: Connecting) {
 
 /// Reads `socket` forever.
 #[switch::task]
-async fn udp_reader(mut socket: UdpSocket) {
+async fn udp_reader(binding: Binding) {
+    let mut socket = binding.await.expect("bind UDP");
     loop {
         drop(black_box(socket.recv().await));
     }
@@ -241,7 +242,7 @@ fn setup_udp(eal: &Eal, n: usize) -> (Bench, Source) {
     let mut bench = Bench::new(eal, "bu", n, false);
     let handle = bench.net.handle();
     for id in 0..n {
-        let socket = handle.udp_bind(udp_config(UDP_BASE + u16::try_from(id).unwrap())).unwrap();
+        let socket = handle.udp_bind(udp_config(UDP_BASE + u16::try_from(id).unwrap()));
         bench.rt.spawner().spawn(udp_reader(socket)).expect("spawn");
     }
     let peer = bench.peer.add_udp(udp_config(PEER_UDP)).unwrap();

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use switch::{SpawnError, Spawner};
 use switchnet::{
-    Accepting, IpListenEndpoint, NetHandle, SendFrameError, TcpStream, UdpConfig, UdpRx,
-    UdpSendError, UdpSendFrameError, UdpTx, tcp,
+    Accepting, Error, IpListenEndpoint, NetHandle, TcpStream, UdpConfig, UdpRx,
+    UdpTx, tcp,
 };
 use zhida_open::Sizing;
 
@@ -51,7 +51,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     host.start_xstats("serve");
     let handle = host.net.handle();
     match args.proto {
-        Proto::Udp => udp_echo(&host, &handle, args.port)?,
+        Proto::Udp => udp_echo(&mut host, &handle, args.port)?,
         Proto::Tcp | Proto::Ws => {
             for _ in 0..ACCEPTS {
                 arm_accept(
@@ -92,7 +92,7 @@ fn spawn_error<T>(e: SpawnError<T>) -> String {
 }
 
 /// Binds `port` and echoes every datagram to its source.
-fn udp_echo(host: &Host, handle: &NetHandle, port: u16) -> Result<(), String> {
+fn udp_echo(host: &mut Host, handle: &NetHandle, port: u16) -> Result<(), String> {
     let config = UdpConfig {
         port,
         local_addr: None,
@@ -100,14 +100,29 @@ fn udp_echo(host: &Host, handle: &NetHandle, port: u16) -> Result<(), String> {
         tx_checksum: true,
         broadcast: false,
     };
-    let (rx, tx) = handle
-        .udp_bind(config)
-        .map_err(|e| format!("udp bind: {e:?}"))?
-        .split();
+    let bound = std::rc::Rc::new(std::cell::RefCell::new(None));
+    host.rt
+        .spawner()
+        .spawn(bind_echo(handle.clone(), config, bound.clone()))
+        .map_err(spawn_error)?;
+    while bound.borrow().is_none() {
+        host.round()?;
+    }
+    let result = bound.borrow_mut().take().expect("binding completed");
+    let (rx, tx) = result.map_err(|e| format!("udp bind: {e:?}"))?.split();
     host.rt
         .spawner()
         .spawn(echo_datagrams(handle.clone(), rx, tx))
         .map_err(spawn_error)
+}
+
+#[switch::task]
+async fn bind_echo(
+    handle: NetHandle,
+    config: UdpConfig,
+    bound: std::rc::Rc<std::cell::RefCell<Option<Result<switchnet::UdpSocket, Error>>>>,
+) {
+    *bound.borrow_mut() = Some(handle.udp_bind(config).await);
 }
 
 #[switch::task]
@@ -123,7 +138,7 @@ async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
         drop(datagram);
         while let Err((
             back,
-            UdpSendFrameError::Udp(UdpSendError::WouldBlock | UdpSendError::NeighborPending),
+            Error::Full | Error::NeighborPending,
         )) = tx.send(Some(src), frame)
         {
             frame = back;
@@ -141,9 +156,7 @@ fn arm_accept(
     config: tcp::Config,
     ws: bool,
 ) -> Result<(), String> {
-    let accepting = handle
-        .tcp_accept(config, IpListenEndpoint { addr: None, port })
-        .map_err(|e| format!("tcp accept on {port}: {e:?}"))?;
+    let accepting = handle.tcp_accept(config, IpListenEndpoint { addr: None, port });
     spawner
         .spawn(serve_accepted(
             accepting,
@@ -166,7 +179,13 @@ async fn serve_accepted(
     config: tcp::Config,
     ws: bool,
 ) {
-    let stream = accepting.await;
+    let stream = match accepting.await {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("zhida-bench serve: tcp accept on {port}: {error:?}");
+            return;
+        }
+    };
     if let Err(e) = arm_accept(&spawner, handle.clone(), port, config, ws) {
         eprintln!("zhida-bench serve: {e}");
     }
@@ -200,7 +219,7 @@ async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
             loop {
                 match tx.try_send(frame) {
                     Ok(()) => break,
-                    Err((back, SendFrameError::Full)) => {
+                    Err((back, Error::Full)) => {
                         frame = back;
                         if tx.room(len).await.is_err() {
                             return;

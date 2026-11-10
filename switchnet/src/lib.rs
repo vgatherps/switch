@@ -29,13 +29,10 @@ use std::task::{Context, Poll};
 
 pub use dpdk_smoltcp::smoltcp::phy::{ImmutableFrame, OwnedFrame};
 pub use dpdk_smoltcp::smoltcp::socket::tcp;
-pub use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, ListenError, RecvError, SendFrameError};
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
-pub use dpdk_smoltcp::{
-    AddTcpError, AddUdpError, Stack, StackError, Turn, UdpConfig, UdpSendError, UdpSendFrameError, UdpSocketStats,
-};
-use dpdk_smoltcp::{ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey};
+pub use dpdk_smoltcp::{Stack, StackError, Turn, UdpConfig, UdpSocketStats};
+use dpdk_smoltcp::{AddTcpError, AddUdpError, ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey, UdpSendError, UdpSendFrameError};
 use switch::StoredWaker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,27 +361,153 @@ pub struct NetHandle {
     shared: Shared,
 }
 
+/// A socket operation failed, independent of the Net's backend.
+#[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenError {
-    Add(AddTcpError),
-    Connect(ConnectError),
-    Listen(ListenError),
+pub enum Error {
+    SocketsFull,
+    PortInUse,
+    InvalidConfig,
+    Unaddressable,
+    Refused,
+    Closed,
+    Reset,
+    Finished,
+    InvalidState,
+    TooLarge,
+    Full,
+    Empty,
+    Foreign,
+    NoDestination,
+    PeerMismatch,
+    NoRoute,
+    NeighborPending,
+    HostLost,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::SocketsFull => "no free socket slot",
+            Self::PortInUse => "port in use",
+            Self::InvalidConfig => "invalid socket configuration",
+            Self::Unaddressable => "unaddressable endpoint",
+            Self::Refused => "connection refused",
+            Self::Closed => "connection closed",
+            Self::Reset => "connection reset",
+            Self::Finished => "receive finished",
+            Self::InvalidState => "invalid socket state",
+            Self::TooLarge => "payload too large",
+            Self::Full => "send queue full",
+            Self::Empty => "empty frame",
+            Self::Foreign => "frame belongs to another Net",
+            Self::NoDestination => "no destination",
+            Self::PeerMismatch => "destination differs from connected peer",
+            Self::NoRoute => "no route",
+            Self::NeighborPending => "neighbor resolution pending",
+            Self::HostLost => "network host lost",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<AddTcpError> for Error {
+    fn from(error: AddTcpError) -> Self {
+        match error {
+            AddTcpError::SocketsFull(_) => Self::SocketsFull,
+        }
+    }
+}
+
+impl From<AddUdpError> for Error {
+    fn from(error: AddUdpError) -> Self {
+        match error {
+            AddUdpError::Full => Self::SocketsFull,
+            AddUdpError::PortInUse => Self::PortInUse,
+            AddUdpError::InvalidConfig(_) => Self::InvalidConfig,
+            AddUdpError::Unaddressable => Self::Unaddressable,
+        }
+    }
+}
+
+impl From<tcp::ConnectError> for Error {
+    fn from(error: tcp::ConnectError) -> Self {
+        match error {
+            tcp::ConnectError::InvalidState => Self::InvalidState,
+            tcp::ConnectError::Unaddressable => Self::Unaddressable,
+            tcp::ConnectError::AddressInUse => Self::PortInUse,
+        }
+    }
+}
+
+impl From<tcp::ListenError> for Error {
+    fn from(error: tcp::ListenError) -> Self {
+        match error {
+            tcp::ListenError::InvalidState => Self::InvalidState,
+            tcp::ListenError::Unaddressable => Self::Unaddressable,
+        }
+    }
+}
+
+impl From<tcp::RecvError> for Error {
+    fn from(error: tcp::RecvError) -> Self {
+        match error {
+            tcp::RecvError::InvalidState => Self::InvalidState,
+            tcp::RecvError::Finished => Self::Finished,
+        }
+    }
+}
+
+impl From<tcp::SendFrameError> for Error {
+    fn from(error: tcp::SendFrameError) -> Self {
+        match error {
+            tcp::SendFrameError::InvalidState => Self::InvalidState,
+            tcp::SendFrameError::Foreign => Self::Foreign,
+            tcp::SendFrameError::Empty => Self::Empty,
+            tcp::SendFrameError::Full => Self::Full,
+        }
+    }
+}
+
+impl From<UdpSendError> for Error {
+    fn from(error: UdpSendError) -> Self {
+        match error {
+            UdpSendError::NoDestination => Self::NoDestination,
+            UdpSendError::PeerMismatch => Self::PeerMismatch,
+            UdpSendError::Unaddressable => Self::Unaddressable,
+            UdpSendError::TooLarge => Self::TooLarge,
+            UdpSendError::NoRoute => Self::NoRoute,
+            UdpSendError::NeighborPending => Self::NeighborPending,
+            UdpSendError::WouldBlock => Self::Full,
+        }
+    }
+}
+
+impl From<UdpSendFrameError> for Error {
+    fn from(error: UdpSendFrameError) -> Self {
+        match error {
+            UdpSendFrameError::Udp(error) => error.into(),
+            UdpSendFrameError::Foreign => Self::Foreign,
+        }
+    }
 }
 
 impl NetHandle {
     /// Adds a TCP socket and connects it from `local`, whose port must be
     /// nonzero (conduit has no ephemeral ports). A refused add or connect
-    /// removes the socket and returns the error.
+    /// removes the socket; the future returns the error on its first poll.
     pub fn tcp_connect(
         &self,
         config: tcp::Config,
         remote: IpEndpoint,
         local: IpListenEndpoint,
-    ) -> Result<Connecting, OpenError> {
-        let stream = self.open_tcp(config, |stack, handle| {
-            stack.connect(handle, remote, local).map_err(OpenError::Connect)
-        })?;
-        Ok(Connecting { stream: Some(stream) })
+    ) -> Connecting {
+        Connecting {
+            opening: Some(self.open_tcp(config, |stack, handle| {
+                stack.connect(handle, remote, local).map_err(Error::from)
+            })),
+        }
     }
 
     /// Adds a TCP socket listening on `local`; it becomes the one accepted
@@ -393,33 +516,40 @@ impl NetHandle {
     /// exists, whatever the slots; otherwise to an all-IP listener (`addr:
     /// None`) on the port. Among several listeners in the chosen group, the
     /// lowest slot takes it.
-    pub fn tcp_accept(&self, config: tcp::Config, local: IpListenEndpoint) -> Result<Accepting, OpenError> {
-        let stream = self.open_tcp(config, |stack, handle| stack.listen(handle, local).map_err(OpenError::Listen))?;
-        Ok(Accepting { stream: Some(stream) })
+    pub fn tcp_accept(&self, config: tcp::Config, local: IpListenEndpoint) -> Accepting {
+        Accepting {
+            opening: Some(self.open_tcp(config, |stack, handle| {
+                stack.listen(handle, local).map_err(Error::from)
+            })),
+        }
     }
 
     fn open_tcp(
         &self,
         config: tcp::Config,
-        start: impl FnOnce(&mut Stack, &TcpHandle) -> Result<(), OpenError>,
-    ) -> Result<TcpStream, OpenError> {
+        start: impl FnOnce(&mut Stack, &TcpHandle) -> Result<(), Error>,
+    ) -> Result<Opening, Error> {
         let mut inner = self.shared.borrow_mut();
-        let handle = inner.stack.add_tcp(config).map_err(OpenError::Add)?;
+        let handle = inner.stack.add_tcp(config).map_err(Error::from)?;
         if let Err(error) = start(&mut inner.stack, &handle) {
             inner.stack.remove_tcp(handle);
             return Err(error);
         }
         let key = inner.stack.tcp_ready_key(&handle);
         let index = inner.insert(Socket::Tcp(handle, key));
-        Ok(TcpStream {
+        Ok(Opening {
             rx: TcpRx(Half { shared: self.shared.clone(), index, side: RX }),
-            tx: TcpTx(Half { shared: self.shared.clone(), index, side: TX }),
+            tx: Half { shared: self.shared.clone(), index, side: TX },
         })
     }
 
-    pub fn udp_bind(&self, config: UdpConfig) -> Result<UdpSocket, AddUdpError> {
+    pub fn udp_bind(&self, config: UdpConfig) -> Binding {
+        Binding { socket: Some(self.open_udp(config)) }
+    }
+
+    fn open_udp(&self, config: UdpConfig) -> Result<UdpSocket, Error> {
         let mut inner = self.shared.borrow_mut();
-        let handle = inner.stack.add_udp(config)?;
+        let handle = inner.stack.add_udp(config).map_err(Error::from)?;
         let key = inner.stack.udp_ready_key(&handle);
         let index = inner.insert(Socket::Udp(handle, key));
         Ok(UdpSocket {
@@ -498,61 +628,99 @@ impl Drop for Half {
     }
 }
 
-/// The connection closed before it was established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Closed {
-    pub reset_by_peer: bool,
+/// A TCP socket not yet handed to its task.
+struct Opening {
+    rx: TcpRx,
+    tx: Half,
 }
 
-/// `Future<Output = Result<TcpStream, Closed>>`: waits while the socket is in
+impl Opening {
+    fn finish(self, mss: Option<usize>) -> TcpStream {
+        TcpStream { rx: self.rx, tx: TcpTx(self.tx, mss) }
+    }
+}
+
+/// `Future<Output = Result<TcpStream, Error>>`: waits while the socket is in
 /// SynSent or SynReceived. Dropping it drops the socket (Linux `close()`).
 pub struct Connecting {
-    stream: Option<TcpStream>,
+    opening: Option<Result<Opening, Error>>,
 }
 
 impl Future for Connecting {
-    type Output = Result<TcpStream, Closed>;
+    type Output = Result<TcpStream, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let half = &this.stream.as_ref().expect("Connecting polled after completion").rx.0;
+        let opening = match this.opening.as_ref().expect("Connecting polled after completion") {
+            Ok(opening) => opening,
+            Err(error) => {
+                let error = *error;
+                this.opening.take();
+                return Poll::Ready(Err(error));
+            }
+        };
+        let half = &opening.rx.0;
         let index = half.index;
         let state = poll_op(&half.shared, index, Interest::Connect, cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
             match socket.state() {
                 state if connecting(state) => None,
-                tcp::State::Closed => Some(Err(Closed { reset_by_peer: socket.reset_by_peer() })),
-                _ => Some(Ok(())),
+                tcp::State::Closed => Some(Err(if socket.reset_by_peer() { Error::Refused } else { Error::Closed })),
+                _ => Some(Ok(socket.max_segment_payload())),
             }
         });
         state.map(|result| {
-            let stream = this.stream.take().expect("stream present until completion");
-            result.map(|()| stream)
+            let opening = this.opening.take().expect("opening present until completion");
+            result.map(|mss| opening.expect("socket opened").finish(mss))
         })
     }
 }
 
-/// `Future<Output = TcpStream>`: waits while the socket is in Listen or
-/// SynReceived; an RST in SynReceived keeps it waiting. If the connection
-/// already closed, `recv` on the stream reports it. Dropping it drops the
-/// socket.
+/// `Future<Output = Result<TcpStream, Error>>`: waits while the socket is in
+/// Listen or SynReceived; an RST in SynReceived keeps it waiting. If the connection
+/// already closed, `recv` on the stream reports it. Dropping it drops the socket.
 pub struct Accepting {
-    stream: Option<TcpStream>,
+    opening: Option<Result<Opening, Error>>,
 }
 
 impl Future for Accepting {
-    type Output = TcpStream;
+    type Output = Result<TcpStream, Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<TcpStream> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let half = &this.stream.as_ref().expect("Accepting polled after completion").rx.0;
+        let opening = match this.opening.as_ref().expect("Accepting polled after completion") {
+            Ok(opening) => opening,
+            Err(error) => {
+                let error = *error;
+                this.opening.take();
+                return Poll::Ready(Err(error));
+            }
+        };
+        let half = &opening.rx.0;
         let index = half.index;
         let state = poll_op(&half.shared, index, Interest::Accept, cx, |inner| {
             let (stack, handle) = inner.tcp(index);
-            (!accepting(stack.tcp(handle).state())).then_some(())
+            let socket = stack.tcp(handle);
+            (!accepting(socket.state())).then(|| socket.max_segment_payload())
         });
-        state.map(|()| this.stream.take().expect("stream present until completion"))
+        state.map(|mss| {
+            this.opening.take().expect("opening present until completion").map(|opening| opening.finish(mss))
+        })
+    }
+}
+
+/// `Future<Output = Result<UdpSocket, Error>>`: a local bind resolves on its first poll.
+/// Dropping it before polling drops any socket it opened.
+pub struct Binding {
+    socket: Option<Result<UdpSocket, Error>>,
+}
+
+impl Future for Binding {
+    type Output = Result<UdpSocket, Error>;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(self.get_mut().socket.take().expect("Binding polled after completion"))
     }
 }
 
@@ -579,11 +747,11 @@ impl TcpStream {
 pub struct TcpRx(Half);
 
 impl TcpRx {
-    /// `Future<Output = Result<TcpFrame, RecvError>>`: the next in-order frame.
+    /// `Future<Output = Result<TcpFrame, Error>>`: the next in-order frame.
     /// In-order data already received is delivered first, also after a reset.
     /// Then: after the peer's reset (with or without an accepted FIN before it),
-    /// or in a state without receive, `RecvError::InvalidState`; after an
-    /// accepted FIN and no reset, conduit's `RecvError::Finished`.
+    /// or in a state without receive, `Error::InvalidState`; after an
+    /// accepted FIN and no reset, `Error::Finished`.
     pub fn recv(&mut self) -> Recv<'_> {
         Recv { rx: self }
     }
@@ -594,7 +762,7 @@ pub struct Recv<'a> {
 }
 
 impl Future for Recv<'_> {
-    type Output = Result<TcpFrame, RecvError>;
+    type Output = Result<TcpFrame, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let half = &self.rx.0;
@@ -611,8 +779,8 @@ impl Future for Recv<'_> {
                 Ok(Some(frame)) => Some(Ok(TcpFrame(frame))),
                 // a FIN followed by the peer's reset ends in the reset: every caller sees the
                 // connection's death, not a clean end of the stream
-                Err(RecvError::Finished) if socket.reset_by_peer() => Some(Err(RecvError::InvalidState)),
-                Err(error) => Some(Err(error)),
+                Err(tcp::RecvError::Finished) if socket.reset_by_peer() => Some(Err(Error::InvalidState)),
+                Err(error) => Some(Err(error.into())),
             }
         })
     }
@@ -625,10 +793,10 @@ impl Drop for Recv<'_> {
 }
 
 /// The send half of a TCP stream.
-pub struct TcpTx(Half);
+pub struct TcpTx(Half, Option<usize>);
 
 impl TcpTx {
-    /// `Future<Output = Result<(), SendError>>`: `Ok` once a frame of `len`
+    /// `Future<Output = Result<(), Error>>`: `Ok` once a frame of `len`
     /// bytes fits (free bytes and a free frame slot), so `try_send` of such a
     /// frame succeeds until the next turn; `Err(InvalidState)` once the
     /// socket can no longer send (reset, closed, or after `shutdown`);
@@ -641,10 +809,10 @@ impl TcpTx {
     /// Queues `frame` (conduit `send_frame`); it leaves in a later turn. Every
     /// error returns the same frame: `Full` when it does not fit now,
     /// `InvalidState` when the socket cannot send, `Empty`, `Foreign`.
-    pub fn try_send(&mut self, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, SendFrameError)> {
+    pub fn try_send(&mut self, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.tcp(self.0.index);
-        stack.tcp_send_frame(handle, frame)?;
+        stack.tcp_send_frame(handle, frame).map_err(|(frame, error)| (frame, error.into()))?;
         inner.handed_over();
         Ok(())
     }
@@ -656,13 +824,11 @@ impl TcpTx {
         stack.tcp(handle).send_capacity()
     }
 
-    /// The most TCP payload one segment carries (the connection's effective MSS); `None` once
-    /// the connection is not synchronized (closed or reset). A frame larger than this is cut
-    /// and copied on the way out.
+    /// The effective MSS cached when this stream was handed to the task.
+    /// `None` if an accepted connection was already closed at completion; otherwise
+    /// it stays `Some` even after close or reset. Larger frames are cut and copied on send.
     pub fn max_segment_payload(&self) -> Option<usize> {
-        let mut inner = self.0.shared.borrow_mut();
-        let (stack, handle) = inner.tcp(self.0.index);
-        stack.tcp(handle).max_segment_payload()
+        self.1
     }
 
     /// Whether this stream is on `handle`'s Net, so frames from `handle` are its own.
@@ -713,44 +879,23 @@ pub struct Room<'a> {
     len: usize,
 }
 
-/// Why a [`TcpTx::room`] failed.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SendError {
-    /// The socket can no longer send: reset, closed, or after `shutdown`.
-    InvalidState,
-    /// `len` exceeds the socket's send buffer, `capacity` bytes (or u32): it would never fit.
-    TooLarge { len: usize, capacity: usize },
-}
-
-impl std::fmt::Display for SendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::InvalidState => f.write_str("invalid state"),
-            Self::TooLarge { len, capacity } => write!(f, "{len} B exceeds the {capacity} B send buffer"),
-        }
-    }
-}
-
-impl std::error::Error for SendError {}
-
 impl Future for Room<'_> {
-    type Output = Result<(), SendError>;
+    type Output = Result<(), Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (half, len) = (&self.tx.0, self.len);
         let index = half.index;
         let Ok(interest) = u32::try_from(len) else {
-            let capacity = self.tx.send_capacity();
-            return Poll::Ready(Err(SendError::TooLarge { len, capacity }));
+            return Poll::Ready(Err(Error::TooLarge));
         };
         poll_op(&half.shared, index, Interest::TcpRoom(interest), cx, |inner| {
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
             let capacity = socket.send_capacity();
             if len > capacity {
-                Some(Err(SendError::TooLarge { len, capacity }))
+                Some(Err(Error::TooLarge))
             } else if !socket.may_send() {
-                Some(Err(SendError::InvalidState))
+                Some(Err(Error::InvalidState))
             } else {
                 tcp_room_ready(socket, len).then_some(Ok(()))
             }
@@ -823,11 +968,11 @@ pub struct UdpTx(Half);
 impl UdpTx {
     /// Sends `frame` as one datagram (conduit `udp_send_frame`); `to` may be
     /// `None` for a connected socket. Every error returns the same frame;
-    /// `WouldBlock` (TX queue full) clears after a turn.
-    pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, UdpSendFrameError)> {
+    /// `Full` (TX queue full) clears after a turn.
+    pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
         let (stack, handle) = inner.udp(self.0.index);
-        stack.udp_send_frame(handle, to, frame)?;
+        stack.udp_send_frame(handle, to, frame).map_err(|(frame, error)| (frame, error.into()))?;
         inner.handed_over();
         Ok(())
     }

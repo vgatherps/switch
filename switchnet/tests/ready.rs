@@ -14,6 +14,7 @@ use zhida_test_kit::with_eal;
 
 mod support;
 use support::{
+    bind,
     cancel_after_one_poll, connect, connect_with, counted, local, net_ip, peer_drain, peer_endpoint, peer_listen,
     peer_send, peer_udp_send, tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT,
 };
@@ -68,7 +69,7 @@ fn one_of_a_thousand_parked_receivers_wakes() {
         mixed.rounds(2);
         let tasks: Vec<_> = (0..SOCKETS)
             .map(|i| {
-                let mut socket = mixed.handle().udp_bind(udp_config(BASE + i as u16)).unwrap();
+                let mut socket = bind(&mut mixed, udp_config(BASE + i as u16));
                 let (task, polls) = counted(async move {
                     let datagram = socket.recv().await;
                     (socket, datagram)
@@ -193,7 +194,7 @@ fn token_fired_then_canceled_then_entry_reused_before_the_turn() {
         canceled.take();
         drop(tx);
 
-        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut socket = bind(&mut mixed, udp_config(7000));
         let (task, polls) = counted(async move {
             let datagram = socket.recv().await;
             (socket, datagram)
@@ -238,7 +239,7 @@ fn token_fired_then_socket_dropped_then_turn() {
         drop(tx);
         mixed.turn();
 
-        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut socket = bind(&mut mixed, udp_config(7000));
         let (task, polls) = counted(async move {
             let datagram = socket.recv().await;
             (socket, datagram)
@@ -359,7 +360,7 @@ fn udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half() {
         let mut mixed = Mixed::new(eal, ["xkua", "xkub"]);
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
         fire_send_token_and_drop(&mut mixed, stream);
-        let (mut rx, tx) = mixed.handle().udp_bind(udp_config(7000)).unwrap().split();
+        let (mut rx, tx) = bind(&mut mixed, udp_config(7000)).split();
         let (task, polls) = counted(async move {
             let datagram = rx.recv().await;
             (rx, datagram)
@@ -389,7 +390,7 @@ fn tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes() {
         fire_send_token_and_drop(&mut mixed, stream);
         let peer = peer_listen(&mut mixed);
         let connecting =
-            mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT + 1)).unwrap();
+            mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT + 1));
         let (task, polls) = counted(async move {
             let (rx, mut tx) = connecting.await.expect("connect").split();
             drop(rx);

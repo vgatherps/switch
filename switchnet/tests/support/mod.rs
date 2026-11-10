@@ -239,6 +239,11 @@ pub fn udp_config_at(addr: switchnet::Ipv4Address, port: u16) -> UdpConfig {
     UdpConfig { local_addr: Some(addr), ..udp_config(port) }
 }
 
+pub fn bind(mixed: &mut Mixed, config: UdpConfig) -> switchnet::UdpSocket {
+    let slot = mixed.spawn(mixed.handle().udp_bind(config));
+    mixed.wait(&slot).expect("bind UDP")
+}
+
 /// Net connects from `port` to the peer's listener in a task; drives until
 /// both ends are established.
 pub fn connect(mixed: &mut Mixed, port: u16) -> (TcpStream, dpdk_smoltcp::TcpHandle) {
@@ -248,7 +253,7 @@ pub fn connect(mixed: &mut Mixed, port: u16) -> (TcpStream, dpdk_smoltcp::TcpHan
 /// `connect` with the Net socket's `config`.
 pub fn connect_with(mixed: &mut Mixed, port: u16, config: tcp::Config) -> (TcpStream, dpdk_smoltcp::TcpHandle) {
     let peer = peer_listen(mixed);
-    let connecting = mixed.handle().tcp_connect(config, peer_endpoint(PEER_PORT), local(port)).unwrap();
+    let connecting = mixed.handle().tcp_connect(config, peer_endpoint(PEER_PORT), local(port));
     let slot = mixed.spawn(connecting);
     let stream = mixed.wait(&slot).unwrap();
     mixed.until(|m| m.peer.tcp(&peer).state() == tcp::State::Established);

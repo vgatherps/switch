@@ -116,11 +116,7 @@ fn client_config() -> Arc<ClientConfig> {
 async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfig>) -> String {
     let remote = IpEndpoint::new(ANVIL_ADDR.into(), ANVIL_PORT);
     let local = IpListenEndpoint { addr: None, port: local_port };
-    let connecting = match handle.tcp_connect(TAP.socket, remote, local) {
-        Ok(connecting) => connecting,
-        Err(e) => return format!("open TCP: {e:?}"),
-    };
-    let stream = match connecting.await {
+    let stream = match handle.tcp_connect(TAP.socket, remote, local).await {
         Ok(stream) => stream,
         Err(e) => return format!("TCP connect: {e:?}"),
     };

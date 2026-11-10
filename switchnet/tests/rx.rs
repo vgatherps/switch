@@ -8,12 +8,13 @@ use std::rc::Rc;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use switchnet::tcp::State;
-use switchnet::{IpEndpoint, RecvError, StackError, TcpStream};
+use switchnet::{Error, IpEndpoint, StackError, TcpStream};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
 mod support;
 use support::{
+    bind,
     cancel_after_one_poll, connect, counted, local, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send,
     tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT,
 };
@@ -29,7 +30,7 @@ fn peer_resets_after(mixed: &mut Mixed, peer: &TcpHandle) {
 }
 
 /// Two `recv`s in one task.
-fn recv_twice(mixed: &mut Mixed, mut stream: TcpStream) -> (Result<switchnet::TcpFrame, RecvError>, RecvError) {
+fn recv_twice(mixed: &mut Mixed, mut stream: TcpStream) -> (Result<switchnet::TcpFrame, Error>, Error) {
     let slot = mixed.spawn(async move {
         let first = stream.recv().await;
         let second = stream.recv().await.unwrap_err();
@@ -52,7 +53,7 @@ fn connect_resolves_and_wakes_the_task_once() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["cona", "conb"]);
         let peer = peer_listen(&mut mixed);
-        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap();
+        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (connecting, polls) = counted(connecting);
         let slot = mixed.spawn(connecting);
         let stream = mixed.wait(&slot).unwrap();
@@ -67,10 +68,10 @@ fn connect_resolves_and_wakes_the_task_once() {
 fn refused_connect_reports_reset_by_peer() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["refa", "refb"]);
-        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap();
+        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let slot = mixed.spawn(connecting);
-        let Err(closed) = mixed.wait(&slot) else { panic!("expected Closed") };
-        assert!(closed.reset_by_peer);
+        let Err(error) = mixed.wait(&slot) else { panic!("expected Refused") };
+        assert_eq!(error, Error::Refused);
         mixed.close();
     })
 }
@@ -143,7 +144,7 @@ fn queued_data_then_reset_gives_the_data_then_invalid_state() {
         peer_resets_after(&mut mixed, &peer);
         let (frame, error) = recv_twice(&mut mixed, stream);
         assert_eq!(frame.unwrap().payload(), b"before reset");
-        assert_eq!(error, RecvError::InvalidState);
+        assert_eq!(error, Error::InvalidState);
         drop(peer);
         mixed.close();
     })
@@ -160,7 +161,7 @@ fn accepted_fin_gives_finished() {
         mixed.until(|m| m.peer.tcp(&peer).state() == State::FinWait2);
         let (frame, error) = recv_twice(&mut mixed, stream);
         assert_eq!(frame.unwrap().payload(), b"last");
-        assert_eq!(error, RecvError::Finished);
+        assert_eq!(error, Error::Finished);
         drop(peer);
         mixed.close();
     })
@@ -181,7 +182,7 @@ fn accepted_fin_then_reset_gives_the_reset() {
         assert_eq!(mixed.peer.tcp(&peer).state(), State::Closed);
         let (frame, error) = recv_twice(&mut mixed, stream);
         assert_eq!(frame.unwrap().payload(), b"last");
-        assert_eq!(error, RecvError::InvalidState);
+        assert_eq!(error, Error::InvalidState);
         drop(peer);
         mixed.close();
     })
@@ -191,7 +192,7 @@ fn accepted_fin_then_reset_gives_the_reset() {
 fn udp_datagrams_arrive_with_source_address() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["udpa", "udpb"]);
-        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let slot = mixed.spawn(async move {
             let first = socket.recv().await;
@@ -220,7 +221,7 @@ fn udp_datagrams_arrive_with_source_address() {
 fn udp_stats_count_datagrams_dropped_on_a_full_queue() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["udsa", "udsb"]);
-        let (rx, tx) = mixed.handle().udp_bind(udp_config(7000)).unwrap().split();
+        let (rx, tx) = bind(&mut mixed, udp_config(7000)).split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         assert_eq!(tx.stats().rx_dropped_full, 0);
         peer_udp_send(&mut mixed, &peer, 7000, b"first");
@@ -265,7 +266,7 @@ fn canceled_recv_clears_its_parked_handle() {
 fn canceled_udp_recv_clears_its_parked_handle() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["cura", "curb"]);
-        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let (task, polls) = counted(async move {
             cancel_after_one_poll(socket.recv()).await;
@@ -289,7 +290,7 @@ fn canceled_connect_drops_the_socket_without_waking() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["ccna", "ccnb"]);
         let peer = peer_listen(&mut mixed);
-        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap();
+        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (task, polls) = counted(async move {
             cancel_after_one_poll(connecting).await;
             pending::<()>().await;
@@ -309,7 +310,7 @@ fn canceled_connect_drops_the_socket_without_waking() {
 fn canceled_accept_drops_the_listener_without_waking() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["ccaa", "ccab"]);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)).unwrap();
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (task, polls) = counted(async move {
             cancel_after_one_poll(accepting).await;
             pending::<()>().await;
@@ -331,10 +332,10 @@ fn canceled_accept_drops_the_listener_without_waking() {
 fn connect_and_accept_resolve_established() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["acca", "accb"]);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)).unwrap();
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (accepting, polls) = counted(accepting);
         let slot = mixed.spawn(async move {
-            let mut stream = accepting.await;
+            let mut stream = accepting.await.unwrap();
             let frame = stream.recv().await.unwrap();
             (stream, frame)
         });
@@ -359,7 +360,7 @@ fn accept_survives_rst_in_syn_received() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["arsa", "arsb"]);
         resolve_neighbors(&mut mixed);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)).unwrap();
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (accepting, polls) = counted(accepting);
         let slot = mixed.spawn(accepting);
         mixed.turn();
@@ -379,7 +380,7 @@ fn accept_survives_rst_in_syn_received() {
         assert_eq!(polls.get(), 1, "woken by the reset in SynReceived");
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, net_end, PEER_PORT + 2).unwrap();
-        let stream = mixed.wait(&slot);
+        let stream = mixed.wait(&slot).unwrap();
         mixed.until(|m| m.peer.tcp(&peer).state() == State::Established);
         assert_eq!(polls.get(), 2);
         drop((stream, peer));
@@ -393,7 +394,7 @@ fn two_accepts_on_one_port_serve_two_connections() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["a2pa", "a2pb"]);
         let slots = [0, 1].map(|_| {
-            let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)).unwrap();
+            let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
             mixed.spawn(accepting)
         });
         mixed.turn();
@@ -403,7 +404,7 @@ fn two_accepts_on_one_port_serve_two_connections() {
             mixed.peer.connect(&peer, net_end, port).unwrap();
             peer
         });
-        let streams = slots.map(|slot| mixed.wait(&slot));
+        let streams = slots.map(|slot| mixed.wait(&slot).unwrap());
         mixed.until(|m| peers.iter().all(|peer| m.peer.tcp(peer).state() == State::Established));
         drop((streams, peers));
         mixed.close();
@@ -415,7 +416,7 @@ fn frames_outlive_the_stack() {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["outa", "outb"]);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
-        let mut udp = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut udp = bind(&mut mixed, udp_config(7000));
         let udp_peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_send(&mut mixed, &peer, b"tcp bytes");
         let slot = mixed.spawn(async move { stream.recv().await.unwrap() });
@@ -491,7 +492,7 @@ fn simultaneous_open_waits_through_syn_received() {
         resolve_neighbors(&mut mixed);
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
-        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap();
+        let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (connecting, polls) = counted(connecting);
         let slot = mixed.spawn(connecting);
         mixed.rt.poll(0).unwrap();
@@ -519,7 +520,7 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
         let mut mixed = Mixed::new(eal, ["erra", "errb"]);
         let earlier = mixed.now;
         mixed.now = earlier + Duration::from_millis(1);
-        let mut socket = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7000, b"warm");
         let (task, polls) = counted(async move {
@@ -559,11 +560,11 @@ fn socket_reusing_a_just_freed_index_is_woken() {
         let mut mixed = Mixed::new(eal, ["reua", "reub"]);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
-        let mut first = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut first = bind(&mut mixed, udp_config(7000));
         let slot = mixed.spawn(async move { cancel_after_one_poll(first.recv()).await });
         mixed.rt.poll(0).unwrap();
         mixed.wait(&slot);
-        let mut second = mixed.handle().udp_bind(udp_config(7000)).unwrap();
+        let mut second = bind(&mut mixed, udp_config(7000));
         let slot = mixed.spawn(async move {
             let datagram = second.recv().await;
             (second, datagram)

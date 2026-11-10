@@ -1,6 +1,9 @@
 //! TLS 1.3 over switchnet TCP: [`tls_connect`] runs the handshake (a rare path, which
 //! allocates), then [`Tls`] holds the two halves and the TCP receive half feeding them. Its
 //! futures run as switch tasks. switchnet's frames are this crate's [`RxFrame`]/[`TxFrame`].
+//!
+//! TCP receive and send failures carry [`switchnet::Error`]; [`Error`] retains their TLS
+//! context. Frame sizing uses the stream's cached negotiated MSS.
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -12,7 +15,7 @@ use rustls::ClientConfig;
 use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::ServerName;
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
-use switchnet::{NetHandle, RecvError, SendError, TcpFrame, TcpRx, TcpStream, TcpTx};
+use switchnet::{Error as NetError, NetHandle, TcpFrame, TcpRx, TcpStream, TcpTx};
 
 use crate::tx::{OVERHEAD, plain_room};
 use crate::{Error as TlsError, FrameTx, RxFrame, TlsRx, TlsTx, TxError, TxFrame, encode_into};
@@ -42,8 +45,8 @@ impl TxFrame for switchnet::OwnedFrame {
 pub enum SetupError {
     /// The stream is not on `handle`'s Net: its frames would be refused as foreign.
     ForeignHandle,
-    /// One frame carries `room` bytes (the frame room, clamped to the send buffer), fewer than
-    /// the `need` bytes the caller's largest frame takes.
+    /// One frame carries `room` bytes (the frame room, clamped to the negotiated MSS and send
+    /// buffer), fewer than the `need` bytes the caller's largest frame takes.
     RoomTooSmall { room: usize, need: usize },
     /// The socket closed or reset before a frame could be taken.
     Dead,
@@ -92,24 +95,24 @@ impl SwitchTx {
 impl FrameTx for SwitchTx {
     type Frame = switchnet::OwnedFrame;
     type Sealed = switchnet::ImmutableFrame;
-    type Error = SendError;
+    type Error = NetError;
 
     /// A frame from the Net, or `InvalidState` if the socket has closed or reset (checked
     /// first on every poll, so a dead socket never gets a frame). Called only before
     /// `shutdown`, where the connection ending is the only way `delivered` resolves.
-    async fn alloc(&mut self) -> Result<switchnet::OwnedFrame, SendError> {
+    async fn alloc(&mut self) -> Result<switchnet::OwnedFrame, NetError> {
         let mut dead = pin!(self.tcp.delivered());
         let mut frame = pin!(self.handle.tx_frame());
         poll_fn(|cx| {
             if dead.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(SendError::InvalidState));
+                return Poll::Ready(Err(NetError::InvalidState));
             }
             frame.as_mut().poll(cx).map(Ok)
         })
         .await
     }
 
-    async fn room(&mut self, len: usize) -> Result<(), SendError> {
+    async fn room(&mut self, len: usize) -> Result<(), NetError> {
         self.tcp.room(len).await
     }
 
@@ -117,7 +120,7 @@ impl FrameTx for SwitchTx {
         (0, self.room)
     }
 
-    fn seal(&mut self, mut f: switchnet::OwnedFrame, len: usize) -> Result<switchnet::ImmutableFrame, SendError> {
+    fn seal(&mut self, mut f: switchnet::OwnedFrame, len: usize) -> Result<switchnet::ImmutableFrame, NetError> {
         f.truncate(len);
         Ok(f.freeze())
     }
@@ -138,11 +141,11 @@ impl FrameTx for SwitchTx {
 #[derive(Debug)]
 pub enum Error {
     /// TCP receive failed.
-    Recv(RecvError),
+    Recv(NetError),
     /// The TLS handshake or a received record failed.
     Tls(TlsError),
     /// Sending failed (TLS or TCP).
-    Send(TxError<SendError>),
+    Send(TxError<NetError>),
     /// The handshake could not start (a bad server name) or ended in a state other than
     /// application traffic.
     Handshake(String),
@@ -188,7 +191,7 @@ impl Tls {
                         self.rx.push(frame);
                         None
                     }
-                    Err(RecvError::Finished) => self.rx.fin(&mut self.tx).err(),
+                    Err(NetError::Finished) => self.rx.fin(&mut self.tx).err(),
                     Err(e) => return Err(Error::Recv(e)),
                 },
                 Err(e) => Some(e),
@@ -228,7 +231,7 @@ async fn abort(tx: &mut TlsTx<SwitchTx>) {
             if let Some(sealed) = tx.take_pending(f)? {
                 send_sealed(tx, sealed, room).await?;
             }
-            Ok::<(), TxError<SendError>>(())
+            Ok::<(), TxError<NetError>>(())
         };
         let _ = sent.await;
     }
