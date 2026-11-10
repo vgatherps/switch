@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "device": {"vdev": "net_tap_echo,iface=cdtap_echo,mac=02:00:00:00:00:fe"},
+  "mac": "02:00:00:00:00:01",
+  "ipv4": "192.0.2.2/24",
+  "gateway": null,
+  "mtu": 1500,
+  "paths": [],
+  "offloads": {"rx_checksum": false, "tx_tcp_checksum": false, "tx_udp_checksum": false},
+  "rx_timestamps": false,
+  "descriptors": 16,
+  "eal": {"file_prefix": "autobahn-junction", "extra": ["--no-huge", "-m", "512", "--no-shconf"]}
+}

@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
 .PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
+.PHONY: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -159,6 +160,7 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 help:
 	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench memif-bench fuzz binance test-smoltcp bench-stack soak' \
 		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
+		'Junction Autobahn: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
 
@@ -235,6 +237,8 @@ test-memif: doctor
 test-autobahn-check:
 	$(TIMEOUT) python3 autobahn/check.py --self-test
 	$(TIMEOUT) sh autobahn/peer-self-test.sh
+	$(TIMEOUT) python3 autobahn/junction-cpus.py --self-test
+	$(TIMEOUT) python3 autobahn/junction-role-self-test.py
 
 # smoltcp's own lib unit test gate uses Zhida's smoltcp features (crates/dpdk-smoltcp/Cargo.toml).
 # vendor/smoltcp is outside the workspace, so it has its own lockfile and target dir. Include the
@@ -545,6 +549,87 @@ docker-autobahn: docker-autobahn-image
 	role server --expect-connections $(AUTOBAHN_CASES); server=$$?; \
 	role client --expect-cases $(AUTOBAHN_CASES); client=$$?; \
 	[ $$server = 0 ] && [ $$client = 0 ]
+
+# Same peers, markers, 517 cases and checker as conduit; only the role container differs.
+docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client: docker-autobahn-image
+	@set -u; \
+	cpus=$$(python3 autobahn/junction-cpus.py "$(DOCKER_CPUSET)" "$(AUTOBAHN_CPUSET)") || exit 1; \
+	set -- $$cpus; network=$$1; app=$$2; cpuset=$$3; \
+	echo "$@: junctiond CPU $$network, app/control CPU $$app, role cpuset $$cpuset (DOCKER_CPUSET=$(DOCKER_CPUSET))"; \
+	lock=autobahn/run.lock; \
+	if ! mkdir $$lock 2>/dev/null; then \
+		echo "$@: lock $(CURDIR)/$$lock exists: another run in this checkout, or a stale lock (remove it by hand)" >&2; \
+		exit 1; \
+	fi; \
+	c=; a=; mode=; \
+	say() { echo "$@: $$*" >&2; }; \
+	remove() { \
+		removed=0; \
+		for name in $$c $$a; do \
+			if ! st=$$($(DOCKER) inspect -f '{{.State.Running}}' $$name 2>&1); then \
+				say "$$mode: inspecting $$name for removal failed: $$st"; removed=1; \
+			elif [ "$$st" = true ] && [ "$$1" = 0 ]; then \
+				say "$$mode: container $$name still running at removal"; removed=1; \
+			fi; \
+			if ! $(DOCKER) rm -f $$name >/dev/null; then \
+				say "$$mode: failed to remove container $$name"; removed=1; \
+			fi; \
+		done; \
+		c=; a=; \
+		return $$removed; \
+	}; \
+	cleanup() { \
+		rc=$$?; \
+		remove $$rc || rc=1; \
+		rmdir $$lock || rc=1; \
+		exit $$rc; \
+	}; \
+	trap cleanup EXIT; trap 'exit 130' INT TERM HUP; \
+	watch() { \
+		while :; do \
+			if ! st=$$($(DOCKER) inspect -f '{{.State.Running}}' $$1 2>&1); then \
+				say "$$mode: inspecting $$1 failed: $$st"; failed="$$failed inspect"; return; \
+			fi; \
+			[ "$$st" = true ] || return; \
+			if [ "$$(date +%s)" -ge "$$2" ]; then \
+				say "$$mode: $$4 container still running $$3; killing $$5"; \
+				$(DOCKER) kill $$5 >/dev/null 2>&1; failed="$$failed killed-$$4"; return; \
+			fi; \
+			sleep 1; \
+		done; \
+	}; \
+	role() { \
+		mode=$$1; shift; \
+		run=autobahn/run/$$mode; \
+		rm -rf $$run && mkdir -p $$run || return 1; \
+		start=$$(date +%s); failed=; \
+		c=zhida-autobahn-junction-c-$$mode-$$$$; \
+		$(DOCKER) run -d --init --name $$c --cpuset-cpus=$$cpuset $(DOCKER_ACCESS) -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
+			$(DOCKER_IMAGE) timeout --kill-after=10 $(AUTOBAHN_TIMEOUT) \
+			sh autobahn/junction-role.sh $$mode $$network $$app "$$@" >/dev/null || { remove 1; return 1; }; \
+		a=zhida-autobahn-junction-a-$$mode-$$$$; \
+		$(DOCKER) run -d --name $$a --network container:$$c --cpuset-cpus=$(AUTOBAHN_CPUSET) \
+			-v "$(CURDIR)/autobahn:/work/autobahn" -w /work -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
+			$(AUTOBAHN_IMAGE) sh autobahn/peer.sh $$mode >/dev/null || { remove 1; return 1; }; \
+		watch $$c $$(( start + $(AUTOBAHN_TIMEOUT) + 60 )) "$(AUTOBAHN_TIMEOUT) + 60 s after start" zhida "$$c $$a"; \
+		driver=$$($(DOCKER) inspect -f '{{.State.ExitCode}}' $$c 2>/dev/null || echo unknown); \
+		watch $$a $$(( $$(date +%s) + 30 )) "30 s after the driver" autobahn $$a; \
+		$(DOCKER) logs $$c > $$run/zhida.log 2>&1 || failed="$$failed logs"; \
+		$(DOCKER) logs $$a > $$run/autobahn.log 2>&1 || failed="$$failed logs"; \
+		peer=$$(cat $$run/done 2>/dev/null || echo missing); \
+		cat $$run/zhida.log; \
+		[ "$$driver" = 0 ] && [ "$$peer" = 0 ] && [ -z "$$failed" ]; verdict=$$?; \
+		remove $$verdict || { verdict=1; failed="$$failed remove"; }; \
+		[ $$verdict = 0 ] && result=PASS || result=FAIL; \
+		echo "$@: $$mode $$result: $$(( $$(date +%s) - start )) s, driver exit $$driver, wstest $$peer, failures:$${failed:- none} (logs in $$run/)"; \
+		return $$verdict; \
+	}; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p relay --features e2e --bin relay-autobahn -p junctiond --bin junctiond || exit 1; \
+	case "$@" in \
+		*-server) role server --expect-connections $(AUTOBAHN_CASES);; \
+		*-client) role client --expect-cases $(AUTOBAHN_CASES);; \
+		*) role server --expect-connections $(AUTOBAHN_CASES) && role client --expect-cases $(AUTOBAHN_CASES);; \
+	esac
 
 # TLS-Anvil's client tests against sheath (TLS 1.3 over switchnet on net_tap), not part of make
 # test. Container C runs the driver (sheath example tls_anvil): it takes TLS-Anvil's address

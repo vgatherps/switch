@@ -32,3 +32,29 @@ traceback: the expected file against itself and with changed `duration`/`reportf
 changed behavior, behaviorClose, close code number->number, null->number, number->null,
 missing case, extra case, extra mixed ids (`99.9.9`, `extra`), wrong agent key, extra agent key
 (exit 1); duplicate case key, null behavior, close code `1000.0` (exit 2).
+
+## Junction backend
+
+`make docker-autobahn-junction` runs both roles through a separate `junctiond` process.
+`docker-autobahn-junction-server` and `docker-autobahn-junction-client` run one role.
+`docker-autobahn` remains the conduit gate, unchanged. All use the same 517 cases,
+agent, `run/<role>/` markers, peer container/network namespace, and expected checker.
+Each role replaces its previous reports; preserve `run/` before comparing backends.
+
+The junction role container starts `junctiond` on the first CPU in `DOCKER_CPUSET`
+and the app on the second. If the set has only one CPU, it adds exactly one: the
+lowest CPU not in `DOCKER_CPUSET` or `AUTOBAHN_CPUSET`. Defaults therefore extend
+`0` to `0,2`; the Autobahn peer stays on `1`. The control thread shares the app CPU.
+Overlapping role/peer CPU sets are rejected. Docker must provide those CPUs.
+
+`junction-netconf.json` uses the conduit driver's tap name, MACs, IPv4 subnet,
+MTU, descriptors and disabled checksum offloads. The daemon uses its normal
+Stack/pool sizing. The app opens no EAL or Stack. After the same checker completes,
+the app recovers `Net::into_session`, finishes it and waits for retirement before
+exiting. `junction-role.sh` then sends SIGTERM to `junctiond`, reaps it and checks
+both exit statuses. The outer role timeout bounds startup, run and shutdown.
+
+`make test-autobahn-check` also checks CPU selection and the junction role wrapper:
+socket readiness, separate CPU pins, app-before-daemon teardown, and failure of
+either process. Those wrapper tests use fake processes; the junction make targets
+exercise the real daemon and app.
