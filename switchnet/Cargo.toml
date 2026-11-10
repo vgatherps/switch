@@ -12,6 +12,7 @@ testkit = ["dep:zhida-test-kit", "dep:zhida-buffer", "dep:zhida-dpdk-sys"]
 [dependencies]
 dpdk-smoltcp.workspace = true
 switch.workspace = true
+junction.workspace = true
 zhida-test-kit = { workspace = true, optional = true }
 zhida-buffer = { workspace = true, optional = true }
 zhida-dpdk-sys = { workspace = true, optional = true }

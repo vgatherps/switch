@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use switch::{Runtime, RuntimeError, Spawner};
 
-use crate::{Instant, Net, StackError};
+use crate::{Instant, Net, TurnError};
 
 #[derive(Debug)]
 pub enum RoundError {
-    Stack(StackError),
+    Turn(TurnError),
     Runtime(RuntimeError),
 }
 
@@ -20,7 +20,7 @@ pub enum RoundError {
 /// something received, processed, sent, staged or still pending, or a task polled. A loop that
 /// may sleep when nothing moved does so itself, until `net.poll_at()` at the latest.
 pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result<bool, RoundError> {
-    let turn = net.turn(now).map_err(RoundError::Stack)?;
+    let turn = net.turn(now).map_err(RoundError::Turn)?;
     let polled = rt.poll(tick).map_err(RoundError::Runtime)?;
     Ok(turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0)
 }

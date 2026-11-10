@@ -139,6 +139,10 @@ impl Net {
     /// Test inspection: whether the peer reset any TCP socket open on this Net.
     pub fn tcp_reset_by_peer(&self) -> bool {
         let inner = self.shared.borrow();
+        let crate::Inner::Local(inner) = &*inner else {
+            let crate::Inner::Remote(remote) = &*inner else { unreachable!() };
+            return remote.reset_by_peer();
+        };
         inner.entries.iter().any(|entry| match &entry.socket {
             Some(crate::Socket::Tcp(handle, _)) => inner.stack.tcp(handle).reset_by_peer(),
             _ => false,

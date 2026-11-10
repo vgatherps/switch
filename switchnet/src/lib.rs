@@ -17,6 +17,7 @@
 //! are gone. Each frame occupies its socket's receive budget until its last clone drops.
 
 mod drive;
+mod remote;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
@@ -34,6 +35,38 @@ pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address}
 pub use dpdk_smoltcp::{Stack, StackError, Turn, UdpConfig, UdpSocketStats};
 use dpdk_smoltcp::{AddTcpError, AddUdpError, ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey, UdpSendError, UdpSendFrameError};
 use switch::StoredWaker;
+use remote::Remote;
+
+/// Client-side transmit storage for a junction-backed Net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteConfig {
+    pub tx_frames: usize,
+}
+
+/// A local stack failure or loss of the junction host session.
+#[derive(Debug)]
+pub enum TurnError {
+    Stack(StackError),
+    HostLost(junction::session::Lost),
+}
+
+impl std::fmt::Display for TurnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stack(error) => error.fmt(f),
+            Self::HostLost(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TurnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match self {
+            Self::Stack(error) => error,
+            Self::HostLost(error) => error,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetConfig {
@@ -58,6 +91,7 @@ const TX: usize = 1;
 enum Interest {
     Connect,
     Accept,
+    Bind,
     TcpRecv,
     UdpRecv,
     /// Room for one frame of this many bytes.
@@ -87,7 +121,7 @@ struct Entry {
     token_out: [bool; 2],
 }
 
-struct Inner {
+struct Local {
     stack: Stack,
     entries: Vec<Entry>,
     free: Vec<u32>,
@@ -101,7 +135,7 @@ struct Inner {
     tx_burst: usize,
 }
 
-impl Inner {
+impl Local {
     /// One frame handed to the Stack: at one TX burst since the last turn, end the
     /// running `Runtime::poll` after this task (`switch::request_turn`), so the loop
     /// turns the Net and the frames leave sooner.
@@ -172,6 +206,39 @@ impl Inner {
 
     fn unpark(&mut self, index: u32, side: usize) {
         self.entries[index as usize].parked[side] = None;
+    }
+}
+
+// One Inner per Net; boxing adds a pointer chase to every local socket operation.
+#[allow(clippy::large_enum_variant)]
+enum Inner {
+    Local(Local),
+    Remote(Remote),
+}
+
+impl Inner {
+    fn park(&mut self, index: u32, interest: Interest, cx: &Context<'_>) {
+        match self {
+            Self::Local(local) => local.park(index, interest, cx),
+            Self::Remote(remote) => remote.park(index, interest, cx),
+        }
+    }
+
+    fn unpark(&mut self, index: u32, side: usize) {
+        match self {
+            Self::Local(local) => local.unpark(index, side),
+            Self::Remote(remote) => remote.unpark(index, side),
+        }
+    }
+
+    fn release(&mut self, index: u32, side: usize) -> Option<Socket> {
+        match self {
+            Self::Local(local) => local.release(index, side),
+            Self::Remote(remote) => {
+                remote.release(index, side);
+                None
+            }
+        }
     }
 }
 
@@ -300,7 +367,7 @@ impl Net {
         let entries =
             (0..slots).map(|_| Entry { socket: None, parked: [None; 2], halves: 0, token_out: [false; 2] }).collect();
         let tx_burst = stack.tx_burst();
-        let inner = Inner {
+        let inner = Local {
             stack,
             entries,
             free: (0..slots as u32).rev().collect(),
@@ -309,7 +376,12 @@ impl Net {
             tx_handed: 0,
             tx_burst,
         };
-        Net { shared: Rc::new(RefCell::new(inner)) }
+        Net { shared: Rc::new(RefCell::new(Inner::Local(inner))) }
+    }
+
+    /// Uses the session for control and packet transport; never owns a local Stack.
+    pub fn remote(session: junction::session::Session, config: RemoteConfig) -> Net {
+        Net { shared: Rc::new(RefCell::new(Inner::Remote(Remote::new(session, config)))) }
     }
 
     pub fn handle(&self) -> NetHandle {
@@ -324,9 +396,12 @@ impl Net {
     /// (which flushed) restarts the count of handed frames that requests a turn,
     /// also with frames still pending. After a panic out of `turn`, drop the Net.
     #[inline]
-    pub fn turn(&mut self, now: Instant) -> Result<Turn, StackError> {
+    pub fn turn(&mut self, now: Instant) -> Result<Turn, TurnError> {
         let mut inner = self.shared.borrow_mut();
-        let Inner { stack, entries, frame_waiters, ingress_budget, tx_handed, .. } = &mut *inner;
+        let Inner::Local(Local { stack, entries, frame_waiters, ingress_budget, tx_handed, .. }) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            return remote.turn().map_err(TurnError::HostLost);
+        };
         let turn = stack.turn(now, *ingress_budget);
         if turn.is_ok() {
             *tx_handed = 0;
@@ -337,19 +412,36 @@ impl Net {
         if !frame_waiters.is_empty() {
             wake_frame_waiters(stack, frame_waiters);
         }
-        turn
+        turn.map_err(TurnError::Stack)
     }
 
     /// `Stack::poll_at`.
     pub fn poll_at(&mut self) -> Option<Instant> {
-        self.shared.borrow_mut().stack.poll_at()
+        match &mut *self.shared.borrow_mut() {
+            Inner::Local(local) => local.stack.poll_at(),
+            Inner::Remote(_) => None,
+        }
     }
 
     /// The Stack back, for teardown. `Err(self)` while any `NetHandle` or
     /// socket half is alive. Frames may still be held: they outlive the Stack.
     pub fn into_stack(self) -> Result<Stack, Net> {
         match Rc::try_unwrap(self.shared) {
-            Ok(cell) => Ok(cell.into_inner().stack),
+            Ok(cell) => match cell.into_inner() {
+                Inner::Local(local) => Ok(local.stack),
+                inner => Err(Net { shared: Rc::new(RefCell::new(inner)) }),
+            },
+            Err(shared) => Err(Net { shared }),
+        }
+    }
+
+    /// The session back once all handles are gone. The caller finishes it.
+    pub fn into_session(self) -> Result<junction::session::Session, Net> {
+        match Rc::try_unwrap(self.shared) {
+            Ok(cell) => match cell.into_inner() {
+                Inner::Remote(remote) => Ok(remote.session),
+                inner => Err(Net { shared: Rc::new(RefCell::new(inner)) }),
+            },
             Err(shared) => Err(Net { shared }),
         }
     }
@@ -381,6 +473,7 @@ pub enum Error {
     PeerMismatch = 14,
     NoRoute = 15,
     NeighborPending = 16,
+    HostLost = 17,
 }
 
 impl std::fmt::Display for Error {
@@ -402,6 +495,7 @@ impl std::fmt::Display for Error {
             Self::PeerMismatch => "destination differs from connected peer",
             Self::NoRoute => "no route",
             Self::NeighborPending => "neighbor resolution pending",
+            Self::HostLost => "junction host session lost",
         })
     }
 }
@@ -499,6 +593,16 @@ impl NetHandle {
         remote: IpEndpoint,
         local: IpListenEndpoint,
     ) -> Connecting {
+        let index = {
+            let mut inner = self.shared.borrow_mut();
+            match &mut *inner {
+                Inner::Remote(backend) => Some(backend.connect(config, remote, local)),
+                Inner::Local(_) => None,
+            }
+        };
+        if let Some(index) = index {
+            return Connecting { opening: Some(index.map(|index| self.opening(index))) };
+        }
         Connecting {
             opening: Some(self.open_tcp(config, |stack, handle| {
                 stack.connect(handle, remote, local).map_err(Error::from)
@@ -513,6 +617,16 @@ impl NetHandle {
     /// None`) on the port. Among several listeners in the chosen group, the
     /// lowest slot takes it.
     pub fn tcp_accept(&self, config: tcp::Config, local: IpListenEndpoint) -> Accepting {
+        let index = {
+            let mut inner = self.shared.borrow_mut();
+            match &mut *inner {
+                Inner::Remote(remote) => Some(remote.accept(config, local)),
+                Inner::Local(_) => None,
+            }
+        };
+        if let Some(index) = index {
+            return Accepting { opening: Some(index.map(|index| self.opening(index))) };
+        }
         Accepting {
             opening: Some(self.open_tcp(config, |stack, handle| {
                 stack.listen(handle, local).map_err(Error::from)
@@ -526,6 +640,7 @@ impl NetHandle {
         start: impl FnOnce(&mut Stack, &TcpHandle) -> Result<(), Error>,
     ) -> Result<Opening, Error> {
         let mut inner = self.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else { unreachable!() };
         let handle = inner.stack.add_tcp(config).map_err(Error::from)?;
         if let Err(error) = start(&mut inner.stack, &handle) {
             inner.stack.remove_tcp(handle);
@@ -533,10 +648,14 @@ impl NetHandle {
         }
         let key = inner.stack.tcp_ready_key(&handle);
         let index = inner.insert(Socket::Tcp(handle, key));
-        Ok(Opening {
+        Ok(self.opening(index))
+    }
+
+    fn opening(&self, index: u32) -> Opening {
+        Opening {
             rx: TcpRx(Half { shared: self.shared.clone(), index, side: RX }),
             tx: Half { shared: self.shared.clone(), index, side: TX },
-        })
+        }
     }
 
     pub fn udp_bind(&self, config: UdpConfig) -> Binding {
@@ -545,9 +664,14 @@ impl NetHandle {
 
     fn open_udp(&self, config: UdpConfig) -> Result<UdpSocket, Error> {
         let mut inner = self.shared.borrow_mut();
-        let handle = inner.stack.add_udp(config).map_err(Error::from)?;
-        let key = inner.stack.udp_ready_key(&handle);
-        let index = inner.insert(Socket::Udp(handle, key));
+        let index = match &mut *inner {
+            Inner::Remote(remote) => remote.bind(config)?,
+            Inner::Local(inner) => {
+                let handle = inner.stack.add_udp(config).map_err(Error::from)?;
+                let key = inner.stack.udp_ready_key(&handle);
+                inner.insert(Socket::Udp(handle, key))
+            }
+        };
         Ok(UdpSocket {
             rx: UdpRx(Half { shared: self.shared.clone(), index, side: RX }),
             tx: UdpTx(Half { shared: self.shared.clone(), index, side: TX }),
@@ -572,6 +696,10 @@ impl Future for TxFrameWait<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<OwnedFrame> {
         let mut inner = self.handle.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            return remote.tx_frame(cx);
+        };
         if let Some(frame) = inner.stack.tx_frame() {
             return Poll::Ready(frame);
         }
@@ -658,6 +786,10 @@ impl Future for Connecting {
         let half = &opening.rx.0;
         let index = half.index;
         let state = poll_op(&half.shared, index, Interest::Connect, cx, |inner| {
+            let Inner::Local(inner) = inner else {
+                let Inner::Remote(remote) = inner else { unreachable!() };
+                return remote.opened(index);
+            };
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
             match socket.state() {
@@ -696,12 +828,17 @@ impl Future for Accepting {
         let half = &opening.rx.0;
         let index = half.index;
         let state = poll_op(&half.shared, index, Interest::Accept, cx, |inner| {
+            let Inner::Local(inner) = inner else {
+                let Inner::Remote(remote) = inner else { unreachable!() };
+                return remote.opened(index);
+            };
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
-            (!accepting(socket.state())).then(|| socket.max_segment_payload())
+            (!accepting(socket.state())).then(|| Ok(socket.max_segment_payload()))
         });
-        state.map(|mss| {
-            this.opening.take().expect("opening present until completion").map(|opening| opening.finish(mss))
+        state.map(|result| {
+            let opening = this.opening.take().expect("opening present until completion");
+            result.map(|mss| opening.expect("socket opened").finish(mss))
         })
     }
 }
@@ -715,8 +852,23 @@ pub struct Binding {
 impl Future for Binding {
     type Output = Result<UdpSocket, Error>;
 
-    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(self.get_mut().socket.take().expect("Binding polled after completion"))
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(Ok(socket)) = &this.socket {
+            let half = &socket.rx.0;
+            let index = half.index;
+            let bound = poll_op(&half.shared, index, Interest::Bind, cx, |inner| {
+                match inner {
+                    Inner::Local(_) => Some(Ok(())),
+                    Inner::Remote(remote) => remote.bound(index),
+                }
+            });
+            return bound.map(|result| {
+                let socket = this.socket.take().expect("binding present until completion");
+                result.and(socket)
+            });
+        }
+        Poll::Ready(this.socket.take().expect("Binding polled after completion"))
     }
 }
 
@@ -764,6 +916,10 @@ impl Future for Recv<'_> {
         let half = &self.rx.0;
         let index = half.index;
         poll_op(&half.shared, index, Interest::TcpRecv, cx, |inner| {
+            let Inner::Local(inner) = inner else {
+                let Inner::Remote(remote) = inner else { unreachable!() };
+                return remote.recv(index);
+            };
             let (stack, handle) = inner.tcp(index);
             // `tcp_mut` marks the socket for egress; take it only to pop.
             if !tcp_recv_ready(stack.tcp(handle)) {
@@ -772,7 +928,7 @@ impl Future for Recv<'_> {
             let socket = stack.tcp_mut(handle);
             match socket.recv() {
                 Ok(None) => None,
-                Ok(Some(frame)) => Some(Ok(TcpFrame(frame))),
+                Ok(Some(frame)) => Some(Ok(TcpFrame::local(frame))),
                 // a FIN followed by the peer's reset ends in the reset: every caller sees the
                 // connection's death, not a clean end of the stream
                 Err(tcp::RecvError::Finished) if socket.reset_by_peer() => Some(Err(Error::InvalidState)),
@@ -807,6 +963,10 @@ impl TcpTx {
     /// `InvalidState` when the socket cannot send, `Empty`, `Foreign`.
     pub fn try_send(&mut self, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            return remote.send_tcp(self.0.index, frame);
+        };
         let (stack, handle) = inner.tcp(self.0.index);
         stack.tcp_send_frame(handle, frame).map_err(|(frame, error)| (frame, error.into()))?;
         inner.handed_over();
@@ -816,6 +976,10 @@ impl TcpTx {
     /// The socket's send buffer size: the largest `room` that can ever resolve.
     pub fn send_capacity(&self) -> usize {
         let mut inner = self.0.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            return remote.send_capacity();
+        };
         let (stack, handle) = inner.tcp(self.0.index);
         stack.tcp(handle).send_capacity()
     }
@@ -835,6 +999,11 @@ impl TcpTx {
     /// Half-close: a FIN after the queued data. Receiving continues.
     pub fn shutdown(&mut self) {
         let mut inner = self.0.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            remote.shutdown(self.0.index);
+            return;
+        };
         let (stack, handle) = inner.tcp(self.0.index);
         stack.close(handle);
     }
@@ -858,6 +1027,10 @@ impl Future for Delivered<'_> {
         let half = &self.tx.0;
         let index = half.index;
         poll_op(&half.shared, index, Interest::TcpDelivered, cx, |inner| {
+            let Inner::Local(inner) = inner else {
+                let Inner::Remote(remote) = inner else { unreachable!() };
+                return remote.delivered(index);
+            };
             let (stack, handle) = inner.tcp(index);
             delivered(stack.tcp(handle).state()).then_some(())
         })
@@ -885,6 +1058,10 @@ impl Future for Room<'_> {
             return Poll::Ready(Err(Error::TooLarge));
         };
         poll_op(&half.shared, index, Interest::TcpRoom(interest), cx, |inner| {
+            let Inner::Local(inner) = inner else {
+                let Inner::Remote(remote) = inner else { unreachable!() };
+                return remote.room(index, len);
+            };
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
             let capacity = socket.send_capacity();
@@ -907,25 +1084,32 @@ impl Drop for Room<'_> {
 
 /// An owned in-order TCP frame.
 #[derive(Debug)]
-pub struct TcpFrame(dpdk_smoltcp::TcpFrame);
+pub struct TcpFrame {
+    frame: OwnedFrame,
+    rx_timestamp: u64,
+}
 
 impl TcpFrame {
+    fn local(frame: dpdk_smoltcp::TcpFrame) -> Self {
+        Self { rx_timestamp: frame.rx_timestamp(), frame: frame.into_frame() }
+    }
+
     pub fn payload(&self) -> &[u8] {
-        self.0.payload()
+        &self.frame
     }
 
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        self.0.payload_mut()
+        &mut self.frame
     }
 
     /// Raw NIC stamp of the segment that created the frame; 0 = none.
     pub fn rx_timestamp(&self) -> u64 {
-        self.0.rx_timestamp()
+        self.rx_timestamp
     }
 
     /// Transfer the payload storage, retaining its receive accounting until final release.
     pub fn into_frame(self) -> OwnedFrame {
-        self.0.into_frame()
+        self.frame
     }
 }
 
@@ -967,17 +1151,24 @@ impl UdpTx {
     /// `Full` (TX queue full) clears after a turn.
     pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            return remote.send_udp(self.0.index, to, frame);
+        };
         let (stack, handle) = inner.udp(self.0.index);
         stack.udp_send_frame(handle, to, frame).map_err(|(frame, error)| (frame, error.into()))?;
         inner.handed_over();
         Ok(())
     }
 
-    /// The socket's counters, receive side included (datagrams dropped on a full receive
-    /// queue): on this half because a task keeps the receive half parked in `recv`. Not for a
-    /// hot path: it borrows the Net's shared state.
+    /// The socket's receive-drop counters. Remotely, only client-visible counters are
+    /// reported; host drops are not in the protocol. Not for a hot path: borrows the Net.
     pub fn stats(&self) -> UdpSocketStats {
         let mut inner = self.0.shared.borrow_mut();
+        let Inner::Local(inner) = &mut *inner else {
+            let Inner::Remote(remote) = &mut *inner else { unreachable!() };
+            return remote.stats(self.0.index);
+        };
         let (stack, handle) = inner.udp(self.0.index);
         stack.udp(handle).stats()
     }
@@ -994,8 +1185,12 @@ impl Future for UdpRecv<'_> {
         let half = &self.rx.0;
         let index = half.index;
         poll_op(&half.shared, index, Interest::UdpRecv, cx, |inner| {
+            let Inner::Local(inner) = inner else {
+                let Inner::Remote(remote) = inner else { unreachable!() };
+                return remote.recv_udp(index);
+            };
             let (stack, handle) = inner.udp(index);
-            stack.udp_mut(handle).recv().map(Datagram)
+            stack.udp_mut(handle).recv().map(Datagram::local)
         })
     }
 }
@@ -1008,32 +1203,41 @@ impl Drop for UdpRecv<'_> {
 
 /// An owned received UDP datagram.
 #[derive(Debug)]
-pub struct Datagram(dpdk_smoltcp::UdpDatagram);
+pub struct Datagram {
+    frame: OwnedFrame,
+    src: IpEndpoint,
+    dst_addr: Ipv4Address,
+    rx_timestamp: u64,
+}
 
 impl Datagram {
+    fn local(frame: dpdk_smoltcp::UdpDatagram) -> Self {
+        Self { src: frame.src(), dst_addr: frame.dst_addr(), rx_timestamp: frame.rx_timestamp(), frame: frame.into_frame() }
+    }
+
     pub fn payload(&self) -> &[u8] {
-        self.0.payload()
+        &self.frame
     }
 
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        self.0.payload_mut()
+        &mut self.frame
     }
 
     pub fn src(&self) -> IpEndpoint {
-        self.0.src()
+        self.src
     }
 
     pub fn dst_addr(&self) -> Ipv4Address {
-        self.0.dst_addr()
+        self.dst_addr
     }
 
     /// Raw NIC stamp; 0 = none.
     pub fn rx_timestamp(&self) -> u64 {
-        self.0.rx_timestamp()
+        self.rx_timestamp
     }
 
     /// Transfer the payload storage, retaining its receive credit until final release.
     pub fn into_frame(self) -> OwnedFrame {
-        self.0.into_frame()
+        self.frame
     }
 }

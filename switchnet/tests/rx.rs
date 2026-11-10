@@ -8,7 +8,7 @@ use std::rc::Rc;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use switchnet::tcp::State;
-use switchnet::{Error, IpEndpoint, StackError, TcpStream};
+use switchnet::{Error, IpEndpoint, StackError, TcpStream, TurnError};
 use zhida_test_kit::pair::{BUDGET, pattern};
 use zhida_test_kit::with_eal;
 
@@ -537,7 +537,7 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
         mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7000)), b"after error").unwrap();
         mixed.peer.turn(mixed.now, BUDGET).unwrap();
         assert_eq!(mixed.to_net.forward(), 1);
-        let Err(StackError::TimeWentBackwards { .. }) = mixed.net.turn(earlier) else {
+        let Err(TurnError::Stack(StackError::TimeWentBackwards { .. })) = mixed.net.turn(earlier) else {
             panic!("turn at an earlier time did not fail")
         };
         mixed.rt.poll(0).unwrap();
