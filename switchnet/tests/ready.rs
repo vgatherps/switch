@@ -1,3 +1,5 @@
+//! Conduit-only: readiness-token internals, not the socket API.
+
 //! Which parked tasks a `Net::turn` wakes: only those whose socket's readiness
 //! token fired and whose socket is ready, also after their entry was
 //! canceled, freed or reused. Every future runs as a switch task.

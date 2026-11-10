@@ -56,8 +56,9 @@ pub trait FrameTx {
 
     /// A new, empty frame, once one is free.
     fn alloc(&mut self) -> impl Future<Output = Result<Self::Frame, Self::Error>>;
-    /// Resolves once a sealed frame carrying `len` plaintext bytes can be sent: `try_send` of
-    /// it then succeeds until the transport runs again. `Err` once it can no longer send.
+    /// Waits until retrying a sealed frame carrying `len` plaintext bytes may succeed.
+    /// `try_send` can still return the frame when full; wait for room and retry it.
+    /// `Err` once the transport can no longer send.
     fn room(&mut self, len: usize) -> impl Future<Output = Result<(), Self::Error>>;
     /// `(head, room)`: plaintext starts at `room_mut()[head]`, and one frame carries at most
     /// `room` plaintext bytes.

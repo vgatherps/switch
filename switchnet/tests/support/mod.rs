@@ -164,15 +164,15 @@ impl Mixed {
     }
 
     /// Net turn, task poll, Net→peer, peer turn, peer→Net, at `now`.
-    /// Returns whether a link moved a frame.
+    /// Returns whether the host, Net, runtime, peer or links made progress.
     pub fn round(&mut self) -> bool {
-        self.turn();
+        let moved = self.turn();
         let out = self.to_peer.forward();
         assert_lossless(&self.to_peer, "Net→peer");
-        self.peer.turn(self.now, BUDGET).unwrap();
+        let peer = self.peer.turn(self.now, BUDGET).unwrap();
         let back = self.to_net.forward();
         assert_lossless(&self.to_net, "peer→Net");
-        out + back > 0
+        moved || peer.moved() || peer.tx_pending > 0 || peer.rx_staged > 0 || out + back > 0
     }
 
     /// Rounds until `done`; a round that moves nothing advances the clock to
@@ -199,16 +199,20 @@ impl Mixed {
     }
 
     /// Net turn, then one poll of the woken tasks.
-    pub fn turn(&mut self) {
-        if let Some(host) = &mut self.host {
-            host.iteration(self.now);
-        }
-        self.net.turn(self.now).unwrap();
-        self.rt.poll(0).unwrap();
+    pub fn turn(&mut self) -> bool {
+        let mut moved = false;
         if self.host.is_some() {
-            // Control replies run on the host thread even though packet processing is local.
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            // Let the control thread deliver operations and replies around the Network turn.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            moved = self.host_turn();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        switchnet::round(&mut self.net, &mut self.rt, self.now, 0).unwrap() || moved
+    }
+
+    /// Drive only the host, for tests of `switchnet::round` itself.
+    pub fn host_turn(&mut self) -> bool {
+        self.host.as_mut().is_some_and(|host| host.iteration(self.now))
     }
 
     fn advance(&mut self) {

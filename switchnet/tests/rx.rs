@@ -48,10 +48,9 @@ fn resolve_neighbors(mixed: &mut Mixed) {
     mixed.peer.remove_tcp(socket);
 }
 
-#[zhida_test_support::pinned_test]
-fn connect_resolves_and_wakes_the_task_once() {
+support::both_backends!(connect_resolves_and_wakes_the_task_once_conduit, connect_resolves_and_wakes_the_task_once_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["cona", "conb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["cona", "conb"], backend);
         let peer = peer_listen(&mut mixed);
         let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (connecting, polls) = counted(connecting);
@@ -62,24 +61,22 @@ fn connect_resolves_and_wakes_the_task_once() {
         drop((stream, peer));
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn refused_connect_reports_reset_by_peer() {
+support::both_backends!(refused_connect_reports_reset_by_peer_conduit, refused_connect_reports_reset_by_peer_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["refa", "refb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["refa", "refb"], backend);
         let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let slot = mixed.spawn(connecting);
         let Err(error) = mixed.wait(&slot) else { panic!("expected Refused") };
         assert_eq!(error, Error::Refused);
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn data_arrives_in_order_as_frames() {
+support::both_backends!(data_arrives_in_order_as_frames_conduit, data_arrives_in_order_as_frames_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["orda", "ordb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["orda", "ordb"], backend);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let data = pattern(256 * 1024, 7);
         let len = data.len();
@@ -110,12 +107,11 @@ fn data_arrives_in_order_as_frames() {
         drop((stream, peer));
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn parked_task_is_woken_once_by_data_and_not_polled_on_idle_turns() {
+support::both_backends!(parked_task_is_woken_once_by_data_and_not_polled_on_idle_turns_conduit, parked_task_is_woken_once_by_data_and_not_polled_on_idle_turns_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["onca", "oncb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["onca", "oncb"], backend);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (task, polls) = counted(async move {
             let frame = stream.recv().await.unwrap();
@@ -133,12 +129,11 @@ fn parked_task_is_woken_once_by_data_and_not_polled_on_idle_turns() {
         drop((stream, frame, peer));
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn queued_data_then_reset_gives_the_data_then_invalid_state() {
+support::both_backends!(queued_data_then_reset_gives_the_data_then_invalid_state_conduit, queued_data_then_reset_gives_the_data_then_invalid_state_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["qrsa", "qrsb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["qrsa", "qrsb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"before reset");
         peer_resets_after(&mut mixed, &peer);
@@ -148,13 +143,12 @@ fn queued_data_then_reset_gives_the_data_then_invalid_state() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-/// The peer's FIN alone: the data before it is delivered, then `Finished`.
-#[zhida_test_support::pinned_test]
-fn accepted_fin_gives_finished() {
+// The peer's FIN alone: the data before it is delivered, then `Finished`.
+support::both_backends!(accepted_fin_gives_finished_conduit, accepted_fin_gives_finished_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["fina", "finb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["fina", "finb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"last");
         mixed.peer.close(&peer);
@@ -165,15 +159,14 @@ fn accepted_fin_gives_finished() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-/// The peer's FIN, then its reset: the data before them is delivered, then the reset
-/// (`InvalidState`), not a clean end. (Before, `Finished`: a caller could not tell it from a
-/// FIN alone.)
-#[zhida_test_support::pinned_test]
-fn accepted_fin_then_reset_gives_the_reset() {
+// The peer's FIN, then its reset: the data before them is delivered, then the reset
+// (`InvalidState`), not a clean end. (Before, `Finished`: a caller could not tell it from a
+// FIN alone.)
+support::both_backends!(accepted_fin_then_reset_gives_the_reset_conduit, accepted_fin_then_reset_gives_the_reset_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["frsa", "frsb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["frsa", "frsb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"last");
         mixed.peer.close(&peer);
@@ -186,12 +179,11 @@ fn accepted_fin_then_reset_gives_the_reset() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn udp_datagrams_arrive_with_source_address() {
+support::both_backends!(udp_datagrams_arrive_with_source_address_conduit, udp_datagrams_arrive_with_source_address_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["udpa", "udpb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["udpa", "udpb"], backend);
         let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let slot = mixed.spawn(async move {
@@ -213,10 +205,11 @@ fn udp_datagrams_arrive_with_source_address() {
         drop((datagrams, socket, peer));
         mixed.close();
     })
-}
+});
 
 /// Datagrams beyond the socket's receive queue are dropped by the Stack and counted;
 /// `UdpTx::stats` reports that count.
+// Conduit-only: Host-side UDP drop counter is not exported by junction.
 #[zhida_test_support::pinned_test]
 fn udp_stats_count_datagrams_dropped_on_a_full_queue() {
     with_eal(|eal| {
@@ -237,12 +230,11 @@ fn udp_stats_count_datagrams_dropped_on_a_full_queue() {
     })
 }
 
-/// A task drops its parked `recv` and waits on nothing; data then arriving
-/// must not poll it.
-#[zhida_test_support::pinned_test]
-fn canceled_recv_clears_its_parked_handle() {
+// A task drops its parked `recv` and waits on nothing; data then arriving
+// must not poll it.
+support::both_backends!(canceled_recv_clears_its_parked_handle_conduit, canceled_recv_clears_its_parked_handle_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["crca", "crcb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["crca", "crcb"], backend);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (task, polls) = counted(async move {
             cancel_after_one_poll(stream.recv()).await;
@@ -260,12 +252,11 @@ fn canceled_recv_clears_its_parked_handle() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn canceled_udp_recv_clears_its_parked_handle() {
+support::both_backends!(canceled_udp_recv_clears_its_parked_handle_conduit, canceled_udp_recv_clears_its_parked_handle_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["cura", "curb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["cura", "curb"], backend);
         let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let (task, polls) = counted(async move {
@@ -282,13 +273,12 @@ fn canceled_udp_recv_clears_its_parked_handle() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-/// Dropping `Connecting` drops its socket: nothing connects, nothing wakes.
-#[zhida_test_support::pinned_test]
-fn canceled_connect_drops_the_socket_without_waking() {
+// Dropping `Connecting` drops its socket: nothing connects, nothing wakes.
+support::both_backends!(canceled_connect_drops_the_socket_without_waking_conduit, canceled_connect_drops_the_socket_without_waking_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["ccna", "ccnb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["ccna", "ccnb"], backend);
         let peer = peer_listen(&mut mixed);
         let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (task, polls) = counted(async move {
@@ -303,13 +293,12 @@ fn canceled_connect_drops_the_socket_without_waking() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-/// Dropping `Accepting` drops its listener: a later SYN is refused.
-#[zhida_test_support::pinned_test]
-fn canceled_accept_drops_the_listener_without_waking() {
+// Dropping `Accepting` drops its listener: a later SYN is refused.
+support::both_backends!(canceled_accept_drops_the_listener_without_waking_conduit, canceled_accept_drops_the_listener_without_waking_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["ccaa", "ccab"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["ccaa", "ccab"], backend);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (task, polls) = counted(async move {
             cancel_after_one_poll(accepting).await;
@@ -326,12 +315,11 @@ fn canceled_accept_drops_the_listener_without_waking() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn connect_and_accept_resolve_established() {
+support::both_backends!(connect_and_accept_resolve_established_conduit, connect_and_accept_resolve_established_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["acca", "accb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["acca", "accb"], backend);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (accepting, polls) = counted(accepting);
         let slot = mixed.spawn(async move {
@@ -350,15 +338,14 @@ fn connect_and_accept_resolve_established() {
         drop((stream, frame, peer));
         mixed.close();
     })
-}
+});
 
-/// The Net's listener gets a SYN (SynReceived); the peer forgets its socket,
-/// so the Net's SYN-ACK draws an RST that returns the listener to Listen. The
-/// accept keeps waiting and resolves on the next connection.
-#[zhida_test_support::pinned_test]
-fn accept_survives_rst_in_syn_received() {
+// The Net's listener gets a SYN (SynReceived); the peer forgets its socket,
+// so the Net's SYN-ACK draws an RST that returns the listener to Listen. The
+// accept keeps waiting and resolves on the next connection.
+support::both_backends!(accept_survives_rst_in_syn_received_conduit, accept_survives_rst_in_syn_received_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["arsa", "arsb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["arsa", "arsb"], backend);
         resolve_neighbors(&mut mixed);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (accepting, polls) = counted(accepting);
@@ -386,13 +373,12 @@ fn accept_survives_rst_in_syn_received() {
         drop((stream, peer));
         mixed.close();
     })
-}
+});
 
-/// Two accepts on one port serve two connections.
-#[zhida_test_support::pinned_test]
-fn two_accepts_on_one_port_serve_two_connections() {
+// Two accepts on one port serve two connections.
+support::both_backends!(two_accepts_on_one_port_serve_two_connections_conduit, two_accepts_on_one_port_serve_two_connections_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["a2pa", "a2pb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["a2pa", "a2pb"], backend);
         let slots = [0, 1].map(|_| {
             let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
             mixed.spawn(accepting)
@@ -409,12 +395,11 @@ fn two_accepts_on_one_port_serve_two_connections() {
         drop((streams, peers));
         mixed.close();
     })
-}
+});
 
-#[zhida_test_support::pinned_test]
-fn frames_outlive_the_stack() {
+support::both_backends!(frames_outlive_the_stack_conduit, frames_outlive_the_stack_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["outa", "outb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["outa", "outb"], backend);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let mut udp = bind(&mut mixed, udp_config(7000));
         let udp_peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -443,14 +428,13 @@ fn frames_outlive_the_stack() {
             assert_eq!(&clones.1[..], b"Udp bytes");
         });
     })
-}
+});
 
-/// Holding earlier frames must not prevent later in-order data from reaching
-/// the application, even beyond the configured receive window target.
-#[zhida_test_support::pinned_test]
-fn held_frames_do_not_block_later_data() {
+// Holding earlier frames must not prevent later in-order data from reaching
+// the application, even beyond the configured receive window target.
+support::both_backends!(held_frames_do_not_block_later_data_conduit, held_frames_do_not_block_later_data_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["wina", "winb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["wina", "winb"], backend);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let data = pattern(64 * 1024, 3);
         let len = data.len();
@@ -481,14 +465,13 @@ fn held_frames_do_not_block_later_data() {
         drop((stream, peer));
         mixed.close();
     })
-}
+});
 
-/// Both ends send a SYN. The Net's turn that takes the peer's SYN moves it
-/// to SynReceived, which must not wake the connecting task.
-#[zhida_test_support::pinned_test]
-fn simultaneous_open_waits_through_syn_received() {
+// Both ends send a SYN. The Net's turn that takes the peer's SYN moves it
+// to SynReceived, which must not wake the connecting task.
+support::both_backends!(simultaneous_open_waits_through_syn_received_conduit, simultaneous_open_waits_through_syn_received_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["sima", "simb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["sima", "simb"], backend);
         resolve_neighbors(&mut mixed);
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
@@ -510,10 +493,11 @@ fn simultaneous_open_waits_through_syn_received() {
         drop((stream, peer));
         mixed.close();
     })
-}
+});
 
 /// A turn that fails before ingress (time went backwards) wakes nothing and
 /// keeps the parked task; the next turn takes in the datagram and wakes it.
+// Conduit-only: Conduit Stack time validation; remote Net has no Stack clock.
 #[zhida_test_support::pinned_test]
 fn error_turn_keeps_the_parked_task_for_the_next_turn() {
     with_eal(|eal| {
@@ -551,13 +535,15 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
     })
 }
 
-/// A socket dropped while its receive token is still armed (no turn in
-/// between) frees the index at once; a new socket that reuses it and parks is
-/// woken by its own data.
+// A socket dropped while its receive token is still armed (no turn in
+// between) frees the index at once; a new socket that reuses it and parks is
+// woken by its own data.
+// Conduit-only: immediate same-port rebind races junction's asynchronous host close.
 #[zhida_test_support::pinned_test]
 fn socket_reusing_a_just_freed_index_is_woken() {
+    let backend = support::Backend::Conduit;
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["reua", "reub"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["reua", "reub"], backend);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         let mut first = bind(&mut mixed, udp_config(7000));

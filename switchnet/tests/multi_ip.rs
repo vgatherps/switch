@@ -47,10 +47,9 @@ async fn echo_once(handle: NetHandle, socket: UdpSocket) -> (UdpRx, UdpTx, Datag
     (rx, tx, datagram)
 }
 
-#[zhida_test_support::pinned_test]
-fn connect_from_a_secondary_address_uses_it() {
+support::both_backends!(connect_from_a_secondary_address_uses_it_conduit, connect_from_a_secondary_address_uses_it_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mcna", "mcnb"], OWNED, support::Backend::Conduit);
+        let mut mixed = Mixed::with_owned(eal, ["mcna", "mcnb"], OWNED, backend);
         let unowned = Ipv4Address::new(10, 0, 0, 99);
         let refused = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local_at(unowned, LOCAL_PORT));
         let refused = mixed.spawn(refused);
@@ -71,14 +70,13 @@ fn connect_from_a_secondary_address_uses_it() {
         drop((stream, frame, peer));
         mixed.close();
     })
-}
+});
 
-/// A listener bound to the second address refuses a connection to the
-/// primary address on its port and accepts one to its own.
-#[zhida_test_support::pinned_test]
-fn accept_on_a_secondary_address_takes_only_its_connections() {
+// A listener bound to the second address refuses a connection to the
+// primary address on its port and accepts one to its own.
+support::both_backends!(accept_on_a_secondary_address_takes_only_its_connections_conduit, accept_on_a_secondary_address_takes_only_its_connections_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["maca", "macb"], OWNED, support::Backend::Conduit);
+        let mut mixed = Mixed::with_owned(eal, ["maca", "macb"], OWNED, backend);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let slot = mixed.spawn(async move {
             let mut stream = accepting.await.unwrap();
@@ -98,15 +96,14 @@ fn accept_on_a_secondary_address_takes_only_its_connections() {
         drop((stream, frame, peer, refused));
         mixed.close();
     })
-}
+});
 
-/// The all-IP listener has the lower slot, yet a SYN to the second address
-/// goes to the listener bound there; a SYN to the third address, which has no
-/// listener of its own, goes to the all-IP one.
-#[zhida_test_support::pinned_test]
-fn listener_bound_to_an_address_beats_the_all_ip_listener() {
+// The all-IP listener has the lower slot, yet a SYN to the second address
+// goes to the listener bound there; a SYN to the third address, which has no
+// listener of its own, goes to the all-IP one.
+support::both_backends!(listener_bound_to_an_address_beats_the_all_ip_listener_conduit, listener_bound_to_an_address_beats_the_all_ip_listener_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mlpa", "mlpb"], OWNED, support::Backend::Conduit);
+        let mut mixed = Mixed::with_owned(eal, ["mlpa", "mlpb"], OWNED, backend);
         let (all, all_polls) = counted(mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)));
         let exact = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let all = mixed.spawn(all);
@@ -121,14 +118,13 @@ fn listener_bound_to_an_address_beats_the_all_ip_listener() {
         drop((streams, to_second, to_third));
         mixed.close();
     })
-}
+});
 
-/// Two sockets on one port, each bound to its own address: a datagram reaches
-/// the socket bound to its destination, which replies from that address.
-#[zhida_test_support::pinned_test]
-fn udp_sockets_bound_per_address_receive_and_reply_from_it() {
+// Two sockets on one port, each bound to its own address: a datagram reaches
+// the socket bound to its destination, which replies from that address.
+support::both_backends!(udp_sockets_bound_per_address_receive_and_reply_from_it_conduit, udp_sockets_bound_per_address_receive_and_reply_from_it_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mupa", "mupb"], OWNED, support::Backend::Conduit);
+        let mut mixed = Mixed::with_owned(eal, ["mupa", "mupb"], OWNED, backend);
         let handle = mixed.handle();
         let [second, third] = [SECOND, THIRD].map(|addr| {
             let socket = bind(&mut mixed, udp_config_at(addr, UDP_PORT));
@@ -158,15 +154,14 @@ fn udp_sockets_bound_per_address_receive_and_reply_from_it() {
         drop((peer, handle));
         mixed.close();
     })
-}
+});
 
-/// The all-IP socket was bound first. A datagram to the second address goes
-/// to the socket bound there without waking the all-IP socket's task;
-/// datagrams to the third and the primary address go to the all-IP socket.
-#[zhida_test_support::pinned_test]
-fn udp_socket_bound_to_an_address_beats_the_all_ip_socket() {
+// The all-IP socket was bound first. A datagram to the second address goes
+// to the socket bound there without waking the all-IP socket's task;
+// datagrams to the third and the primary address go to the all-IP socket.
+support::both_backends!(udp_socket_bound_to_an_address_beats_the_all_ip_socket_conduit, udp_socket_bound_to_an_address_beats_the_all_ip_socket_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mupra", "muprb"], OWNED, support::Backend::Conduit);
+        let mut mixed = Mixed::with_owned(eal, ["mupra", "muprb"], OWNED, backend);
         let mut all = bind(&mut mixed, udp_config(UDP_PORT));
         let mut exact = bind(&mut mixed, udp_config_at(SECOND, UDP_PORT));
         let (all_task, all_polls) = counted(async move {
@@ -195,16 +190,15 @@ fn udp_socket_bound_to_an_address_beats_the_all_ip_socket() {
         drop((all, exact, datagram, first, second, peer));
         mixed.close();
     })
-}
+});
 
-/// Readiness tokens on secondary address sockets: a TCP reader on a
-/// connection accepted on the second address, a UDP reader bound there and an
-/// all-IP UDP reader on the same port all park; idle turns poll none, and each
-/// arrival wakes exactly its own reader once.
-#[zhida_test_support::pinned_test]
-fn parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic() {
+// Readiness tokens on secondary address sockets: a TCP reader on a
+// connection accepted on the second address, a UDP reader bound there and an
+// all-IP UDP reader on the same port all park; idle turns poll none, and each
+// arrival wakes exactly its own reader once.
+support::both_backends!(parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic_conduit, parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mtka", "mtkb"], OWNED, support::Backend::Conduit);
+        let mut mixed = Mixed::with_owned(eal, ["mtka", "mtkb"], OWNED, backend);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let accepted = mixed.spawn(accepting);
         mixed.turn();
@@ -247,4 +241,4 @@ fn parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic() {
         drop((stream, frame, exact, bound, all, any, tcp_peer, udp_peer));
         mixed.close();
     })
-}
+});

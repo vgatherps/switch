@@ -28,6 +28,8 @@ Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md), the DPDK-
 - Received frames stay valid after the socket, `Net` and `Stack` are gone. `TcpFrame::into_frame()` and `Datagram::into_frame()` transfer their payload to `netframe::OwnedFrame`; save metadata first if needed. Freeze to clone without copying. The RX mbuf and held count (UDP: one `rx_queue` credit) remain held until the last clone drops; TCP's receive window is unchanged.
 - Remote UDP receive limits are enforced per socket on the host and bounded by the session ring on the client; the client has no per-socket receive credit.
 - Remote host-side UDP send errors after commit (`NoRoute`, `NeighborPending`, `Unaddressable`) are dropped by the host, not returned to the sender.
+- Remote closes are applied asynchronously by the host: immediately rebinding the same port after dropping its socket or unpolled binding can race the close and return `PortInUse` (accepted backend difference).
+- Junction `room` does not guarantee the next `try_send` fits; on `Full`, wait for room and retry the returned frame.
 
 ## Build and test
 
@@ -39,3 +41,5 @@ cargo bench -p switchnet --bench turn
 Needs DPDK 25.11.3 and a one-CPU process (Docker image on macOS; `make docker-test` includes it). Tests are in `tests/rx.rs` (receive, connect, accept), `tests/tx.rs` (send), `tests/open.rs` (first-poll opening failures, cleanup, cached negotiated MSS), `tests/ready.rs` (which parked tasks a turn wakes) and `tests/multi_ip.rs` (secondary addresses, per-address binds, bound-over-all-IP precedence).
 
 The `Mixed` net_ring fixture and feature-gated `testkit::with_tap_net` select `Backend::Conduit` or `Backend::Junction`. Junction tests drive an in-process `Network` on the test thread and a directly wired `HostControl` thread; teardown recovers its Stack and retains the same pool-return checks. Tap users turn the returned `TapNet` so the host is driven too.
+
+Socket/TLS contract tests use shared bodies for conduit and junction. Readiness-token and urgent-turn internals, local pool exhaustion, host UDP drop counters, ACK-gated TCP send-buffer tests and immediate same-port rebinds stay conduit-only. Junction backpressure is on the ingress stream, not ACK credit; capacity-boundary checks use `send_capacity()`, retaining the TCP-config equality assertion only for conduit. Opening-error tests retain conduit's first-poll assertion but allow a host control round trip on junction.

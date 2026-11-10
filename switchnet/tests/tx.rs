@@ -64,10 +64,9 @@ fn peer_receive(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, len: usize) -
     got
 }
 
-#[zhida_test_support::pinned_test]
-fn room_then_try_send_delivers_every_frame_in_order() {
+support::both_backends!(room_then_try_send_delivers_every_frame_in_order_conduit, room_then_try_send_delivers_every_frame_in_order_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rtsa", "rtsb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["rtsa", "rtsb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (_rx, mut tx) = stream.split();
         let data = pattern(64 * CHUNK + 123, 5);
@@ -82,10 +81,11 @@ fn room_then_try_send_delivers_every_frame_in_order() {
         drop((slot.take(), _rx, peer));
         mixed.close();
     })
-}
+});
 
 /// Queued bytes fill the send buffer while the link is paused. The writer
 /// stays parked until the peer receives and ACKs the first frame.
+// Conduit-only: ACK-gated send buffer; junction has no send credit by design.
 #[zhida_test_support::pinned_test]
 fn room_parks_until_the_peer_acks() {
     with_eal(|eal| {
@@ -119,12 +119,11 @@ fn room_parks_until_the_peer_acks() {
     })
 }
 
-/// `try_send` with no room returns the frame it was given, untouched; after
-/// the peer reads, `room` then `try_send` of that same frame succeed.
-#[zhida_test_support::pinned_test]
-fn try_send_full_returns_the_same_frame() {
+// `try_send` with no room returns the frame it was given, untouched; after
+// the peer reads, `room` then `try_send` of that same frame succeed.
+support::both_backends!(try_send_full_returns_the_same_frame_conduit, try_send_full_returns_the_same_frame_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["tsfa", "tsfb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["tsfa", "tsfb"], backend);
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();
@@ -140,8 +139,20 @@ fn try_send_full_returns_the_same_frame() {
                         assert_eq!(error, Error::Full);
                         assert_eq!(frame.as_ref().as_ptr(), at, "a different frame came back");
                         assert_eq!(frame.as_ref(), &chunk[..]);
-                        tx.room(frame.len()).await.unwrap();
-                        tx.try_send(frame).map_err(|(_, error)| error).unwrap();
+                        let mut frame = frame;
+                        loop {
+                            tx.room(frame.len()).await.unwrap();
+                            match tx.try_send(frame) {
+                                Ok(()) => break,
+                                Err((returned, error)) => {
+                                    assert!(matches!(backend, support::Backend::Junction), "send after room: {error:?}");
+                                    assert_eq!(error, Error::Full);
+                                    assert_eq!(returned.as_ref().as_ptr(), at, "a different frame came back");
+                                    assert_eq!(returned.as_ref(), &chunk[..]);
+                                    frame = returned;
+                                }
+                            }
+                        }
                         sent.extend_from_slice(&chunk);
                         return (tx, sent);
                     }
@@ -159,10 +170,11 @@ fn try_send_full_returns_the_same_frame() {
         drop((tx, _rx, peer));
         mixed.close();
     })
-}
+});
 
 /// A task that takes every free frame leaves the next `tx_frame` waiting;
 /// idle turns do not poll it, and the turn after a frame returns wakes it.
+// Conduit-only: Conduit frame-pool exhaustion; junction pool wake has its own backend test.
 #[zhida_test_support::pinned_test]
 fn tx_frame_waits_until_a_frame_returns() {
     with_eal(|eal| {
@@ -194,12 +206,11 @@ fn tx_frame_waits_until_a_frame_returns() {
     })
 }
 
-/// A reader task and a writer task on the two halves of one stream; the peer
-/// echoes every byte back.
-#[zhida_test_support::pinned_test]
-fn split_halves_echo_through_the_peer() {
+// A reader task and a writer task on the two halves of one stream; the peer
+// echoes every byte back.
+support::both_backends!(split_halves_echo_through_the_peer_conduit, split_halves_echo_through_the_peer_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["echa", "echb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["echa", "echb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, mut tx) = stream.split();
         let data = pattern(200 * 1024, 11);
@@ -230,24 +241,32 @@ fn split_halves_echo_through_the_peer() {
         drop((writer.take(), rx, peer));
         mixed.close();
     })
-}
+});
 
-/// A writer parked on the full send buffer resolves with an error on reset.
-#[zhida_test_support::pinned_test]
-fn parked_room_resolves_with_an_error_on_reset() {
+// A writer parked on the full send buffer resolves with an error on reset.
+support::both_backends!(parked_room_resolves_with_an_error_on_reset_conduit, parked_room_resolves_with_an_error_on_reset_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rrsa", "rrsb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["rrsa", "rrsb"], backend);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();
         let (task, polls) = counted(async move {
             loop {
-                let frame = filled(&handle, &[7; CHUNK]).await;
-                if let Err(error) = tx.room(frame.len()).await {
-                    return (tx, error);
+                let mut frame = filled(&handle, &[7; CHUNK]).await;
+                loop {
+                    if let Err(error) = tx.room(frame.len()).await {
+                        return (tx, error);
+                    }
+                    match tx.try_send(frame) {
+                        Ok(()) => break,
+                        Err((returned, error)) => {
+                            assert!(matches!(backend, support::Backend::Junction), "send after room: {error:?}");
+                            assert_eq!(error, Error::Full);
+                            frame = returned;
+                        }
+                    }
                 }
-                tx.try_send(frame).map_err(|(_, error)| error).unwrap();
             }
         });
         let slot = mixed.spawn(task);
@@ -257,7 +276,9 @@ fn parked_room_resolves_with_an_error_on_reset() {
         for _ in 0..20 {
             mixed.turn();
         }
-        assert_eq!(polls.get(), parked, "the writer is not parked");
+        if matches!(backend, support::Backend::Conduit) {
+            assert_eq!(polls.get(), parked, "the writer is not parked");
+        }
         assert!(!slot.is_full());
         mixed.peer.abort(&peer);
         mixed.peer.turn(mixed.now, BUDGET).unwrap();
@@ -265,18 +286,19 @@ fn parked_room_resolves_with_an_error_on_reset() {
         mixed.turn();
         let (tx, error) = slot.take();
         assert_eq!(error, Error::InvalidState);
-        assert_eq!(polls.get(), parked + 1, "woken more than once by the reset");
+        if matches!(backend, support::Backend::Conduit) {
+            assert_eq!(polls.get(), parked + 1, "woken more than once by the reset");
+        }
         drop((tx, _rx, peer));
         mixed.close();
     })
-}
+});
 
-/// `delivered` remains parked after the peer receives data and FIN until its
-/// ACK is forwarded to the sender.
-#[zhida_test_support::pinned_test]
-fn delivered_waits_until_the_peer_acks_the_fin() {
+// `delivered` remains parked after the peer receives data and FIN until its
+// ACK is forwarded to the sender.
+support::both_backends!(delivered_waits_until_the_peer_acks_the_fin_conduit, delivered_waits_until_the_peer_acks_the_fin_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["dlva", "dlvb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["dlva", "dlvb"], backend);
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
         let (_rx, mut tx) = stream.split();
         let data = pattern(2 * CHUNK, 21);
@@ -306,14 +328,13 @@ fn delivered_waits_until_the_peer_acks_the_fin() {
         drop((slot.take(), _rx, peer));
         mixed.close();
     })
-}
+});
 
-/// After `shutdown` the peer reads every byte, then end of stream; the Net
-/// side can still receive.
-#[zhida_test_support::pinned_test]
-fn shutdown_sends_fin_after_the_data() {
+// After `shutdown` the peer reads every byte, then end of stream; the Net
+// side can still receive.
+support::both_backends!(shutdown_sends_fin_after_the_data_conduit, shutdown_sends_fin_after_the_data_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["shda", "shdb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["shda", "shdb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, mut tx) = stream.split();
         let data = pattern(20 * CHUNK + 7, 13);
@@ -344,14 +365,13 @@ fn shutdown_sends_fin_after_the_data() {
         drop((slot.take(), rx, peer));
         mixed.close();
     })
-}
+});
 
-/// A UDP socket's receive half gets the peer's datagram in one task; its
-/// send half answers with a frame from another.
-#[zhida_test_support::pinned_test]
-fn udp_halves_receive_and_send_a_frame() {
+// A UDP socket's receive half gets the peer's datagram in one task; its
+// send half answers with a frame from another.
+support::both_backends!(udp_halves_receive_and_send_a_frame_conduit, udp_halves_receive_and_send_a_frame_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["udsa", "udsb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["udsa", "udsb"], backend);
         let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -378,21 +398,22 @@ fn udp_halves_receive_and_send_a_frame() {
         drop((ping, pong, rx, tx, peer));
         mixed.close();
     })
-}
+});
 
-/// A `room` longer than the send buffer, or than u32, could never resolve: it fails at once with
-/// `TooLarge`, and the socket still sends.
-#[zhida_test_support::pinned_test]
-fn room_beyond_the_send_capacity_fails() {
+// A `room` longer than the send buffer, or than u32, could never resolve: it fails at once with
+// `TooLarge`, and the socket still sends.
+support::both_backends!(room_beyond_the_send_capacity_fails_conduit, room_beyond_the_send_capacity_fails_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rbga", "rbgb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["rbga", "rbgb"], backend);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();
         let (task, _polls) = counted(async move {
             let capacity = tx.send_capacity();
-            assert_eq!(capacity, 1500);
+            if matches!(backend, support::Backend::Conduit) {
+                assert_eq!(capacity, 1500);
+            }
             let over = poll_once(tx.room(capacity + 1)).await;
             let huge = poll_once(tx.room(usize::MAX)).await;
             let fits = poll_once(tx.room(capacity)).await;
@@ -403,7 +424,9 @@ fn room_beyond_the_send_capacity_fails() {
         let slot = mixed.spawn(task);
         mixed.turn();
         let (tx, over, huge, fits) = slot.take();
-        assert_eq!(tx.send_capacity(), 1500);
+        if matches!(backend, support::Backend::Conduit) {
+            assert_eq!(tx.send_capacity(), 1500);
+        }
         assert_eq!(over, Some(Err(Error::TooLarge)));
         assert_eq!(huge, Some(Err(Error::TooLarge)));
         assert_eq!(fits, Some(Ok(())));
@@ -411,11 +434,12 @@ fn room_beyond_the_send_capacity_fails() {
         drop((tx, _rx, peer));
         mixed.close();
     })
-}
+});
 
 /// With `tx_capacity` 1500, one 1000-byte frame leaves 500 bytes, so
 /// `room(400)` resolves and `room(1000)` parks. The peer's ACK frees the
 /// bytes, and `try_send` of a 1000-byte frame then succeeds at once.
+// Conduit-only: ACK-gated send buffer; junction has no send credit by design.
 #[zhida_test_support::pinned_test]
 fn room_waits_for_queued_bytes_to_be_acked() {
     with_eal(|eal| {
@@ -447,12 +471,11 @@ fn room_waits_for_queued_bytes_to_be_acked() {
     })
 }
 
-/// Dropping the send half sends no FIN: the receive half keeps receiving
-/// and the peer stays Established.
-#[zhida_test_support::pinned_test]
-fn dropping_the_send_half_keeps_receiving() {
+// Dropping the send half sends no FIN: the receive half keeps receiving
+// and the peer stays Established.
+support::both_backends!(dropping_the_send_half_keeps_receiving_conduit, dropping_the_send_half_keeps_receiving_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["dtxa", "dtxb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["dtxa", "dtxb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, tx) = stream.split();
         let reader = mixed.spawn(async move { (rx.recv().await.unwrap().payload().to_vec(), rx) });
@@ -467,14 +490,16 @@ fn dropping_the_send_half_keeps_receiving() {
         drop((rx, peer));
         mixed.close();
     })
-}
+});
 
-/// Dropping the receive half leaves a writer parked in `room` working: once
-/// the peer ACKs the queued bytes, everything arrives.
+// Dropping the receive half leaves a writer parked in `room` working: once
+// the peer ACKs the queued bytes, everything arrives.
+// Conduit-only: ACK-gated send buffer; junction has no send credit by design.
 #[zhida_test_support::pinned_test]
 fn dropping_the_receive_half_keeps_a_parked_writer() {
+    let backend = support::Backend::Conduit;
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["drxa", "drxb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["drxa", "drxb"], backend);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (rx, mut tx) = stream.split();
@@ -505,12 +530,11 @@ fn dropping_the_receive_half_keeps_a_parked_writer() {
     })
 }
 
-/// A `room` polled once with the send buffer full and then dropped leaves no
-/// parked task: the ACKs that free room do not poll it.
-#[zhida_test_support::pinned_test]
-fn canceled_room_clears_its_parked_handle() {
+// A `room` polled once with the send buffer full and then dropped leaves no
+// parked task: the ACKs that free room do not poll it.
+support::both_backends!(canceled_room_clears_its_parked_handle_conduit, canceled_room_clears_its_parked_handle_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["crma", "crmb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["crma", "crmb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();
@@ -544,4 +568,4 @@ fn canceled_room_clears_its_parked_handle() {
         drop((_rx, peer));
         mixed.close();
     })
-}
+});
