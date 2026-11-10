@@ -2,7 +2,7 @@
 
 use core::{fmt, mem::ManuallyDrop, ops::Range, ptr::NonNull, slice};
 
-use alloc::{alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout}, rc::Rc, vec::Vec};
+use alloc::{alloc::{alloc, dealloc, handle_alloc_error, Layout}, rc::Rc, vec::Vec};
 use netframe::{OwnedFrame, Release};
 
 use super::RxShared;
@@ -188,11 +188,12 @@ fn heap_frame(
     let layout = heap_layout(size);
     // SAFETY: one allocation covers its header, count, initialized data and room.
     unsafe {
-        let raw = alloc_zeroed(layout).cast::<HeapStorage>();
+        let raw = alloc(layout).cast::<HeapStorage>();
         if raw.is_null() { handle_alloc_error(layout); }
         raw.write(HeapStorage { size, #[cfg(test)] releases, refs: 1 });
         let data = NonNull::new_unchecked(raw.cast::<u8>().add(core::mem::size_of::<HeapStorage>()));
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_ptr(), bytes.len());
+        core::ptr::write_bytes(data.as_ptr().add(bytes.len()), 0, room);
         let rc = NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).refs));
         RxBuf::from_raw_parts(rc, release_heap, data, bytes.len(), room)
     }
@@ -314,10 +315,9 @@ mod tests {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&[1, 2, 3, 4]);
         assert!(bytes.capacity() > bytes.len());
-        let frame = RxBuf::from_vec(bytes);
-        let data = frame.as_slice().as_ptr();
-        let mut frame = core::hint::black_box(frame);
-        assert_eq!(frame.as_slice().as_ptr(), data);
+        let data = bytes.as_ptr();
+        let mut frame = RxBuf::from_vec(bytes);
+        assert_ne!(frame.as_slice().as_ptr(), data);
         assert_eq!(frame.as_slice(), &[1, 2, 3, 4]);
         frame.as_mut_slice()[2] = 9;
         assert_eq!(frame.as_slice(), &[1, 2, 9, 4]);

@@ -14,7 +14,7 @@
 //!
 //! Received frames ([`TcpFrame`], [`Datagram`]) do not hold the Net: like
 //! conduit's frames they stay valid after their socket, the Net and the Stack
-//! are gone. Each held frame occupies its socket's receive budget until it drops.
+//! are gone. Each frame occupies its socket's receive budget until its last clone drops.
 
 mod drive;
 #[cfg(feature = "testkit")]
