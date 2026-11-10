@@ -10,7 +10,7 @@ publish = false
 # a ws:// server.
 switchnet = ["dep:switchnet", "dep:rustls", "sheath/switchnet"]
 # Test-only: the Docker end-to-end tests (DPDK net_tap, Linux), on switchnet's testkit.
-e2e = ["switchnet", "switchnet/testkit", "dep:switch", "dep:zhida-test-support", "dep:tap-echo"]
+e2e = ["switchnet", "switchnet/testkit", "dep:switch", "dep:zhida-test-support", "dep:tap-echo", "dep:junction"]
 
 [dependencies]
 # Client-role frame masks (RFC 6455 §5.3) and Sec-WebSocket-Key: per-connection CSPRNG.
@@ -28,6 +28,7 @@ switch = { workspace = true, optional = true }
 zhida-test-support = { workspace = true, optional = true }
 # The Autobahn driver (bin relay-autobahn): tester process, EAL and net_tap Port.
 tap-echo = { workspace = true, optional = true }
+junction = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The send core's wake tests run in a switch Runtime.

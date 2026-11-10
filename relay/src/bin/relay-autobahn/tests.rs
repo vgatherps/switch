@@ -456,9 +456,10 @@ fn client_tester_exit_before_server_ready_is_an_error() {
 #[test]
 fn parse_reads_both_roles_and_bounds_the_cases() {
     let args = |s: &str| s.split(' ').map(OsString::from).collect::<Vec<_>>();
-    let (role, tester) = parse(&args("server --expect-connections 517 -- t a")).unwrap();
+    let (role, backend, tester) = parse(&args("server --expect-connections 517 -- t a")).unwrap();
+    assert_eq!(backend, super::Backend::Conduit);
     assert_eq!((role, tester), (Role::Server { connections: 517 }, args("t a")));
-    let (role, _) = parse(&args("client --expect-cases 16382 -- t")).unwrap();
+    let (role, _, _) = parse(&args("client --expect-cases 16382 -- t")).unwrap();
     assert_eq!(role, Role::Client { cases: 16382, run: PathBuf::from(CLIENT_RUN) });
     assert_eq!(role.max_sockets(), 16384);
     for bad in [
@@ -468,7 +469,25 @@ fn parse_reads_both_roles_and_bounds_the_cases() {
         "server --expect-connections 1 t",
         "server --expect-connections 1 --",
         "both --expect-cases 1 -- t",
+        "server --expect-connections 1 --backend other -- t",
+        "server --expect-connections 1 --backend junction -- t",
+        "server --expect-connections 1 --junction-socket /tmp/control.sock -- t",
+        "server --expect-connections 1 --backend conduit --junction-socket /tmp/control.sock -- t",
+        "server --expect-connections 1 --backend conduit --backend conduit -- t",
     ] {
         assert!(parse(&args(bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn parse_selects_remote_backend_without_consuming_tester_arguments() {
+    let args = |s: &str| s.split(' ').map(OsString::from).collect::<Vec<_>>();
+    for role in ["server --expect-connections", "client --expect-cases"] {
+        let (parsed, backend, tester) = parse(&args(&format!(
+            "{role} 517 --junction-socket /tmp/control.sock --backend junction -- tester --backend conduit"
+        ))).unwrap();
+        assert_eq!(backend, super::Backend::Junction(PathBuf::from("/tmp/control.sock")));
+        assert_eq!(tester, args("tester --backend conduit"));
+        assert_eq!(parsed.max_sockets(), if role.starts_with("server") { 518 } else { 519 });
     }
 }

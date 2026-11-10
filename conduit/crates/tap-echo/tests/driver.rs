@@ -206,3 +206,32 @@ fn deadline_kills_tester() {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn external_backend_reuses_tester_environment_and_status_without_eal() {
+    use tap_echo::driver::{EXIT_OK, EXIT_TESTER_FAILED, run_tester};
+    let _serial = serial();
+    for (command, expected) in [
+        ("test \"$ZHIDA_IFACE $ZHIDA_IP $TESTER_IP $ECHO_PORT\" = 'cdtap_echo 192.0.2.2 192.0.2.1 8080'", EXIT_OK),
+        ("exit 7", EXIT_TESTER_FAILED),
+    ] {
+        let tester = ["sh", "-c", command].map(Into::into);
+        let code = run_tester("remote-driver-test", &tester, |_, stop| {
+            let start = Instant::now();
+            while !stop() {
+                assert!(start.elapsed() < DEADLINE);
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        });
+        assert_eq!(code, expected);
+    }
+}
+
+#[test]
+fn external_backend_app_failure_kills_and_reaps_tester() {
+    use tap_echo::driver::{EXIT_ERROR, run_tester};
+    let tester = ["sh", "-c", "exec sleep 60"].map(Into::into);
+    let code = run_tester("remote-driver-test", &tester, |_, _| Err("application failed".to_owned()));
+    assert_eq!(code, EXIT_ERROR);
+}

@@ -13,12 +13,13 @@ use std::process;
 use std::rc::Rc;
 use std::time::Duration;
 
+use junction::session::Session;
 use relay::{Kind, Limits};
 use relay::switchnet::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
 use switch::{Runtime, Spawner};
 use switchnet::{
-    Error as NetError, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, RoundError, round,
-    tcp, within,
+    Error as NetError, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, RemoteConfig,
+    RoundError, round, tcp, within,
 };
 use tap_echo::driver::{self, ECHO_PORT, EXIT_ERROR, IFACE, TESTER_IP, ZHIDA_IP};
 
@@ -52,8 +53,8 @@ const SERVER_READY_POLL: Duration = Duration::from_millis(10);
 fn usage() -> String {
     format!(
         "\
-usage: {NAME} server --expect-connections N -- <tester> [args...]
-       {NAME} client --expect-cases N -- <tester> [args...]
+usage: {NAME} server --expect-connections N [--backend conduit|junction] [--junction-socket PATH] -- <tester> [args...]
+       {NAME} client --expect-cases N [--backend conduit|junction] [--junction-socket PATH] -- <tester> [args...]
 
 server: runs relay's WebSocket echo server on Zhida at ws://{ZHIDA_IP}:{ECHO_PORT} until
 <tester> exits: one connection at a time, Text and Binary echoed, max_sockets N + 1.
@@ -70,6 +71,8 @@ a control connection misbehaves, or the sequence did not complete.
 
 Both print the connection count and how the connections ended on stdout, on netdev {IFACE},
 otherwise with the tap-echo driver's configuration and exit statuses (see tap-echo's usage).
+The backend defaults to conduit. Junction requires --junction-socket and a running junctiond;
+the app opens no EAL, tap device or Stack, and finishes its session before exiting.
 "
     )
 }
@@ -93,9 +96,15 @@ impl Role {
     }
 }
 
-fn parse(args: &[OsString]) -> Result<(Role, Vec<OsString>), String> {
-    let [mode, flag, count, separator, tester @ ..] = args else {
-        return Err("expected: server|client --expect-... N -- <tester> [args...]".to_owned());
+#[derive(Debug, PartialEq, Eq)]
+enum Backend {
+    Conduit,
+    Junction(PathBuf),
+}
+
+fn parse(args: &[OsString]) -> Result<(Role, Backend, Vec<OsString>), String> {
+    let [mode, flag, count, rest @ ..] = args else {
+        return Err("expected: server|client --expect-... N [options] -- <tester> [args...]".to_owned());
     };
     let expected_flag = match mode.to_str() {
         Some("server") => "--expect-connections",
@@ -110,12 +119,31 @@ fn parse(args: &[OsString]) -> Result<(Role, Vec<OsString>), String> {
         .and_then(|text| text.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .ok_or_else(|| format!("{expected_flag} needs a positive integer, got {count:?}"))?;
-    if separator != "--" {
-        return Err(format!("expected --, got {separator:?}"));
+    let mut rest = rest;
+    let mut backend = None;
+    let mut socket = None;
+    while rest.first().is_some_and(|arg| arg != "--") {
+        let [flag, value, tail @ ..] = rest else {
+            return Err("backend options need a value".to_owned());
+        };
+        match flag.to_str() {
+            Some("--backend") if backend.is_none() => backend = Some(value),
+            Some("--junction-socket") if socket.is_none() && !value.is_empty() => socket = Some(PathBuf::from(value)),
+            _ => return Err(format!("unknown or repeated option {flag:?}")),
+        }
+        rest = tail;
     }
+    let [_, tester @ ..] = rest else {
+        return Err("missing -- before tester command".to_owned());
+    };
     if tester.is_empty() {
         return Err("missing tester command after --".to_owned());
     }
+    let backend = match backend.map(|value| value.to_str().ok_or("backend must be UTF-8")).transpose()?.unwrap_or("conduit") {
+        "conduit" if socket.is_none() => Backend::Conduit,
+        "junction" => Backend::Junction(socket.ok_or("--backend junction requires --junction-socket PATH")?),
+        other => return Err(format!("invalid backend or socket for backend {other:?}")),
+    };
     let role = if mode == "server" {
         Role::Server { connections: n }
     } else {
@@ -126,25 +154,49 @@ fn parse(args: &[OsString]) -> Result<(Role, Vec<OsString>), String> {
         }
         Role::Client { cases: n, run: PathBuf::from(CLIENT_RUN) }
     };
-    Ok((role, tester.to_vec()))
+    Ok((role, backend, tester.to_vec()))
 }
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let (role, tester) = match parse(&args) {
+    let (role, backend, tester) = match parse(&args) {
         Ok(parsed) => parsed,
         Err(message) => {
             driver::report(NAME, format_args!("{message}\n\n{}", usage()));
             process::exit(EXIT_ERROR);
         }
     };
-    let code = driver::run(NAME, &tester, role.max_sockets(), BUFFER, None, |stack, start, stop| {
-        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-        let result = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE).map_err(|e| e.to_string());
-        let stack = net.into_stack().ok().expect("drive dropped every handle and socket");
-        (stack, result)
-    });
+    let code = match backend {
+        Backend::Conduit => driver::run(NAME, &tester, role.max_sockets(), BUFFER, None, |stack, start, stop| {
+            let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+            let result = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE).map_err(|e| e.to_string());
+            let stack = net.into_stack().ok().expect("drive dropped every handle and socket");
+            (stack, result)
+        }),
+        Backend::Junction(socket) => driver::run_tester(NAME, &tester, |start, stop| {
+            let max_sockets = u16::try_from(role.max_sockets()).map_err(|_| "junction socket count exceeds 65535")?;
+            let session = Session::connect(&socket, max_sockets).map_err(|e| format!("connect junction: {e}"))?;
+            let mut net = Net::remote(session, RemoteConfig { tx_frames: driver::POOL_COUNT as usize });
+            let driven = drive(&mut net, &|| start.elapsed(), stop, &role, DEADLINE).map_err(|e| e.to_string());
+            let mut session = net.into_session().ok().expect("drive dropped every handle and socket");
+            let finished = finish_session(&mut session);
+            driven.and(finished)
+        }),
+    };
     process::exit(code);
+}
+
+fn finish_session(session: &mut Session) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    while !session.closed() {
+        let _ = session.finish();
+        session.poll(|_, _| {}, |_, _, _| {}).map_err(|e| format!("finish junction session: {e}"))?;
+        if start.elapsed() >= SERVER_READY_LIMIT {
+            return Err("junction session retirement timed out".to_owned());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
 /// How the connections went.

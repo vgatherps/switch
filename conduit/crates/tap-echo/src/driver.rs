@@ -94,6 +94,33 @@ struct Tester {
 }
 
 impl Tester {
+    fn spawn(name: &'static str, tester: &[OsString]) -> io::Result<Self> {
+        Command::new(&tester[0])
+            .args(&tester[1..])
+            .envs(tester_env())
+            .spawn()
+            .map(|child| Self { child, name })
+    }
+
+    fn run<T>(
+        &mut self,
+        app: impl FnOnce(&mut dyn FnMut() -> bool) -> (T, Result<(), String>),
+    ) -> Result<(T, ExitStatus), i32> {
+        let mut waited = Ok(None);
+        let (value, served) = app(&mut || {
+            waited = self.child.try_wait();
+            !matches!(waited, Ok(None))
+        });
+        if let Err(error) = served {
+            return Err(self.fail(error));
+        }
+        match waited {
+            Ok(Some(status)) => Ok((value, status)),
+            Ok(None) => unreachable!("the app returned while the tester runs"),
+            Err(error) => Err(self.fail(format_args!("waiting for the tester: {error}"))),
+        }
+    }
+
     /// SIGKILL (a no-op once reaped), then reap.
     fn kill(&mut self) {
         if let Err(error) = self.child.kill() {
@@ -117,6 +144,36 @@ impl Drop for Tester {
         if thread::panicking() {
             self.kill();
         }
+    }
+}
+
+/// Reuses the tester environment, stop callback and exit statuses without opening EAL,
+/// a tap device or a Stack. The external backend owns those resources.
+/// `app` must return `Ok` only after `stop` returned true.
+pub fn run_tester(
+    name: &'static str,
+    tester: &[OsString],
+    app: impl FnOnce(Instant, &mut dyn FnMut() -> bool) -> Result<(), String>,
+) -> i32 {
+    let mut tester = match Tester::spawn(name, tester) {
+        Ok(tester) => tester,
+        Err(error) => {
+            report(name, format_args!("starting tester: {error}"));
+            return EXIT_ERROR;
+        }
+    };
+    match tester.run(|stop| ((), app(Instant::now(), stop))) {
+        Ok(((), status)) => tester_status(name, status),
+        Err(code) => code,
+    }
+}
+
+fn tester_status(name: &str, status: ExitStatus) -> i32 {
+    if status.success() {
+        EXIT_OK
+    } else {
+        report(name, format_args!("tester {status}"));
+        EXIT_TESTER_FAILED
     }
 }
 
@@ -156,12 +213,8 @@ pub fn run(
     // Before EAL: net_tap opens its /dev/net/tun queue fds without
     // O_CLOEXEC (rte_eth_tap.c tun_alloc), and a child forked later would
     // inherit them and keep the netdev alive.
-    let child = Command::new(&tester[0])
-        .args(&tester[1..])
-        .envs(tester_env())
-        .spawn();
-    let mut tester_process = match child {
-        Ok(child) => Tester { child, name },
+    let mut tester_process = match Tester::spawn(name, tester) {
+        Ok(tester) => tester,
         Err(error) => {
             report(name, format_args!("starting tester {:?}: {error}", tester[0]));
             return EXIT_ERROR;
@@ -326,18 +379,9 @@ fn serve(
         Err((_, error)) => return tester.fail(format_args!("Stack::new: {error}")),
     };
 
-    let mut waited: io::Result<Option<ExitStatus>> = Ok(None);
-    let (stack, served) = app(stack, start, &mut || {
-        waited = tester.child.try_wait();
-        !matches!(waited, Ok(None))
-    });
-    if let Err(error) = served {
-        return tester.fail(error);
-    }
-    let status = match waited {
-        Ok(Some(status)) => status,
-        Ok(None) => unreachable!("the app returned while the tester runs"),
-        Err(error) => return tester.fail(format_args!("waiting for the tester: {error}")),
+    let (stack, status) = match tester.run(|stop| app(stack, start, stop)) {
+        Ok(result) => result,
+        Err(code) => return code,
     };
 
     let name = tester.name;
@@ -364,12 +408,6 @@ fn serve(
             Some(EXIT_ERROR)
         }
     };
-    if !status.success() {
-        report(name, format_args!("tester {status}"));
-    }
-    teardown.unwrap_or(if status.success() {
-        EXIT_OK
-    } else {
-        EXIT_TESTER_FAILED
-    })
+    let status = tester_status(name, status);
+    teardown.unwrap_or(status)
 }
