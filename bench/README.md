@@ -136,6 +136,18 @@ Daemon startup failures fail that sweep without skipping the remaining matrix. E
 gets an invocation-scoped `TAG.ROLE.junctiond.log`, ending with its exit status; nonzero or unavailable
 statuses are also logged as warnings.
 
+Before the coordinator starts, each host launches a housekeeping-pinned placement waiter. It waits
+up to 30 seconds for that host's app, daemon (junction only), and coordinator (sender0 only), then
+settles for one second and records every thread's TID, name, allowed CPU list and current/last CPU.
+`TAG.ROLE.placement.txt` includes the configured app/daemon/housekeeping assignments and the kernel's
+isolated CPU list. Network/app main threads must be pinned to their assigned single CPU; other
+daemon/app/EAL threads and coordinator descendants must stay off isolated CPUs. Only the junction
+app's `junction-ctl` reader may share `APP_CPU`.
+The snapshot is checked after the sweep; a violation or missing snapshot fails that sweep and marks
+its measurements INVALID in the report, without skipping later sweeps. Per-backend report tables
+show each host's CPU IDs and process core count: conduit uses one isolated app core, junction uses
+two (the kernel receiver comparison still uses one receiver core).
+
 Before creating anything, preflight checks for a clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, enough free on-demand Standard vCPU quota L-1216C47A, and an availability zone offering every selected instance type. The subnet and cluster placement group use that common zone. An offering does not guarantee capacity; either instance launch can still fail.
 Use `--zone Z` with `run`, `kernel` or `preflight` to select a common availability zone explicitly
 when the default zone lacks capacity.

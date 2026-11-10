@@ -4,12 +4,14 @@
 Usage: report.py RESULTS_DIR [--title T]
 
 RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and optionally
-`expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce) and
-`host-setup.txt` (the host setup verification). Python stdlib only.
+`expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce),
+`host-setup.txt` (the host setup verification), and `<sweep>.placement.json` (backend,
+per-host CPU placement, and placement errors). Raw placement snapshots are linked as
+`<sweep>.<role>.placement.txt`.
 
 Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
-summary, a sweep did not complete, or a sender fell behind and stopped the sweep.
-The report is still written, headed INCOMPLETE.
+summary, a sweep did not complete, a sender fell behind, or placement errors invalidate a sweep.
+The report is still written, headed INCOMPLETE; invalid placement does not hide measurements.
 """
 import json
 import math
@@ -85,6 +87,26 @@ def table(steps):
         rows.append(
             f"| {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} | {100 * s['drop_fraction']:.3f} |"
             f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} | {flags(s)} |"
+        )
+    return "\n".join(rows)
+
+
+def placement_table(stem, placement):
+    rows = [
+        "### Thread placement", "",
+        "| backend | host | app CPU | junction CPU | process CPUs | process core count | housekeeping CPUs | isolated CPUs | snapshot |",
+        "|---|---|---|---|---|---:|---|---|---|",
+    ]
+    for role, host in sorted(placement["hosts"].items()):
+        cpus = [host["app_cpu"]]
+        if host["junction_cpu"] is not None:
+            cpus.append(host["junction_cpu"])
+        process_cpus = ", ".join(dict.fromkeys(cpus))
+        snapshot = f"{stem}.{role}.placement.txt"
+        rows.append(
+            f"| {placement['backend']} | {role} | {host['app_cpu']} | {host['junction_cpu'] or '-'} |"
+            f" {process_cpus} | {len(set(cpus))} | {host['housekeeping']} | {host['isolated']} |"
+            f" [raw]({snapshot}) |"
         )
     return "\n".join(rows)
 
@@ -172,14 +194,30 @@ def build(directory, title):
         results["source"] = source
     sections = []
     summaries = {}
+    placement_issues = []
     for name, path in sweep_files(directory):
         steps, summary = split_sweep(load_jsonl(path))
         stem = name[: -len(".jsonl")]
         summaries[stem] = summary
-        results["sweeps"].append({"name": stem, "summary": summary, "steps": steps})
+        result = {"name": stem, "summary": summary, "steps": steps}
+        placement_path = os.path.join(directory, stem + ".placement.json")
+        placement = None
+        if os.path.exists(placement_path):
+            with open(placement_path) as f:
+                placement = json.load(f)
+            result["placement"] = placement
+            placement_issues += [f"{stem}: placement: {error}" for error in placement["errors"]]
+        results["sweeps"].append(result)
         with open(os.path.join(directory, stem + ".svg"), "w") as f:
             f.write(svg_plot(steps, stem))
-        sections += [f"## {stem}", "", f"![{stem}]({stem}.svg)", "", table(steps), ""]
+        invalid = placement is not None and bool(placement["errors"])
+        sections += [f"## {stem}" + (" — INVALID" if invalid else ""), ""]
+        if placement is not None:
+            sections += [placement_table(stem, placement), ""]
+        if invalid:
+            sections += [f"- INVALID placement: {error}" for error in placement["errors"]]
+            sections.append("")
+        sections += [f"![{stem}]({stem}.svg)", "", table(steps), ""]
         if any(s["generator_bound"] for s in steps):
             sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
                          " identify the cause; receiver backpressure can also delay sends.", ""]
@@ -187,7 +225,7 @@ def build(directory, title):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
                          " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"
                          " receiver saturation.", ""]
-    issues = problems(directory, summaries)
+    issues = problems(directory, summaries) + placement_issues
     head = [f"# {title}", ""]
     if issues:
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",

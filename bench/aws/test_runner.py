@@ -33,6 +33,25 @@ HOST_ENV = ("MGMT_IF=ens5\nDATA_IF=ens6\nDATA_PCI=0000:00:06.0\nDATA_MAC=0a:00:0
             "APP_CPU=7\nJUNCTION_CPU=6\nISOLATED=6,7\nHOUSEKEEPING=0-5\n")
 
 
+def placement_snapshot(role, backend="conduit", kernel=False):
+    kinds = ["kernel-serve" if kernel else "serve"] if role == "receiver" else ["gen"]
+    if role == "sender0":
+        kinds.append("sweep")
+    if backend == "junction" and not kernel:
+        kinds.append("junctiond")
+    processes = []
+    for pid, kind in enumerate(kinds, 100):
+        cpu = 6 if kind == "junctiond" else 0 if kind == "sweep" else 7
+        threads = [{"tid": pid, "comm": kind, "Cpus_allowed_list": str(cpu), "psr": cpu},
+                   {"tid": pid + 1000, "comm": "dpdk-intr", "Cpus_allowed_list": "0-5", "psr": 0}]
+        if kind in ("serve", "gen") and backend == "junction":
+            threads.append({"tid": pid + 2000, "comm": "junction-ctl", "Cpus_allowed_list": "7", "psr": 7})
+        processes.append({"pid": pid, "kind": kind, "threads": threads})
+    return {"assignment": {key: value for key, value in z.parse_host_env(HOST_ENV).items()
+                           if key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")},
+            "isolated": "6-7", "processes": processes, "errors": []}
+
+
 # zhida-nic's lines (conduit/crates/nic-runner/src/main.rs `line`: "zhida-nic: {key}: {value}"); the
 # feed_latency value is binance-feed's Latencies Display, its own test's example
 # (latencies_print_nonempty_buckets in conduit/crates/binance-feed/src/lib.rs).
@@ -203,6 +222,8 @@ class JunctionRunnerTest(unittest.TestCase):
                 mock.patch.object(z, "start_junction", side_effect=start), \
                 mock.patch.object(z, "stop_junction", side_effect=stop), \
                 mock.patch.object(z, "save_receiver_journal"), \
+                mock.patch.object(z, "start_placement"), \
+                mock.patch.object(z, "collect_placement", return_value=True), \
                 mock.patch.object(z, "kernel_snapshot", return_value={}), \
                 mock.patch.object(z, "kernel_ena_snapshot", return_value={}), \
                 mock.patch.object(z, "kernel_ena_result", return_value={}), \
@@ -274,6 +295,7 @@ class JunctionRunnerTest(unittest.TestCase):
                                   side_effect=[RuntimeError("daemon failed")] + [None] * len(z.ROLES)), \
                 mock.patch.object(z, "stop_junction") as stop, \
                 mock.patch.object(z, "save_receiver_journal"), \
+                mock.patch.object(z, "collect_placement", return_value=True), \
                 mock.patch.object(z, "fetch_sweep", return_value=[]) as fetch, \
                 mock.patch.object(z, "SWEEPS", [("udp", None), ("tcp", None)]):
             errors, failed = z.measure(hosts, facts, RECEIVER_DATA_IP, directory, mock.Mock(),
@@ -303,6 +325,7 @@ class JunctionRunnerTest(unittest.TestCase):
         hosts[1].ssh.return_value = Proc()
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(z, "start_junction"), \
+                mock.patch.object(z, "collect_placement", return_value=True), \
                 mock.patch.object(z, "log") as log:
             self.assertEqual(z.run_sweep("udp", None, hosts, facts, RECEIVER_DATA_IP, mock.Mock(),
                                          run_dir=directory, backend="junction"), 0)
@@ -324,6 +347,125 @@ class JunctionRunnerTest(unittest.TestCase):
         self.assertIn("cargo build -q --release --locked -p zhida-bench -p junctiond", bootstrap)
         self.assertIn("install -m 0755 target/release/zhida-bench target/release/junctiond /usr/local/bin/",
                       bootstrap)
+
+class PlacementTest(unittest.TestCase):
+    def test_passing_backends_roles_and_kernel_receiver(self):
+        for backend in ("conduit", "junction"):
+            for role in z.ROLES:
+                with self.subTest(backend=backend, role=role):
+                    snapshot = placement_snapshot(role, backend)
+                    self.assertEqual(z.placement.check(snapshot, z.placement.expected_processes(role, backend), backend), [])
+            snapshot = placement_snapshot("receiver", backend, kernel=True)
+            self.assertEqual(z.placement.check(snapshot, ["kernel-serve"], backend), [])
+
+    def test_each_thread_placement_violation_is_rejected(self):
+        cases = [
+            ("junction", "sender0", "junctiond", 0, "0,6", 6),
+            ("junction", "sender0", "junctiond", 1, "6", 6),
+            ("junction", "sender0", "junctiond", 1, "7", 7),
+            ("junction", "sender0", "gen", 0, "0-7", 7),
+            ("junction", "sender0", "gen", 0, "7", 0),
+            ("junction", "sender0", "gen", 1, "7", 7),
+            ("conduit", "sender0", "gen", 1, "7", 7),
+            ("junction", "sender0", "gen", 2, "6", 6),
+            ("junction", "sender0", "sweep", 0, "0-7", 0),
+            ("conduit", "sender0", "sweep", 1, "6", 6),
+        ]
+        for backend, role, kind, thread_index, allowed, psr in cases:
+            with self.subTest(backend=backend, kind=kind, thread=thread_index, allowed=allowed, psr=psr):
+                snapshot = placement_snapshot(role, backend)
+                process = next(process for process in snapshot["processes"] if process["kind"] == kind)
+                process["threads"][thread_index].update(Cpus_allowed_list=allowed, psr=psr)
+                errors = z.placement.check(snapshot, z.placement.expected_processes(role, backend), backend)
+                self.assertTrue(any(kind in error for error in errors), errors)
+
+    def test_other_own_processes_and_actual_kernel_isolation_are_checked(self):
+        snapshot = placement_snapshot("receiver")
+        snapshot["processes"].append({"pid": 500, "kind": "other", "threads": [
+            {"tid": 500, "comm": "ssh", "Cpus_allowed_list": "0-7", "psr": 0}]})
+        self.assertTrue(any("other" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+        for kind, cpu in [("gen", 7), ("junctiond", 6)]:
+            with self.subTest(unexpected_process=kind):
+                snapshot = placement_snapshot("receiver")
+                snapshot["processes"].append({"pid": 501, "kind": kind, "threads": [
+                    {"tid": 501, "comm": kind, "Cpus_allowed_list": str(cpu), "psr": cpu}]})
+                self.assertTrue(any(kind in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+        snapshot = placement_snapshot("receiver")
+        snapshot["isolated"] = "6"
+        self.assertTrue(any("not isolated" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+        snapshot["isolated"] = "0,6,7"
+        self.assertTrue(any("housekeeping" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+
+    def test_missing_process_main_thread_and_waiter_timeout_fail(self):
+        snapshot = placement_snapshot("sender0", "junction")
+        snapshot["processes"].pop()
+        self.assertTrue(any("junctiond" in error for error in z.placement.check(
+            snapshot, ["gen", "sweep", "junctiond"], "junction")))
+        snapshot = placement_snapshot("receiver")
+        snapshot["processes"][0]["threads"].pop(0)
+        self.assertTrue(any("main thread missing" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+        with mock.patch.object(z.placement, "processes", return_value=[]), \
+                mock.patch.object(z.placement.time, "monotonic", side_effect=[0, 31]), \
+                mock.patch.object(z.placement.Path, "read_text", return_value="6-7"):
+            captured = z.placement.capture(snapshot["assignment"], ["serve"])
+        self.assertIn("timed out", captured["errors"][0])
+
+    def test_waiter_requires_every_process_and_settles_one_second(self):
+        snapshot = placement_snapshot("sender0", "junction")
+        with mock.patch.object(z.placement, "processes", return_value=snapshot["processes"]), \
+                mock.patch.object(z.placement.time, "sleep") as sleep, \
+                mock.patch.object(z.placement.Path, "read_text", return_value="6-7"):
+            captured = z.placement.capture(snapshot["assignment"], ["gen", "sweep", "junctiond"])
+        sleep.assert_called_once_with(1)
+        self.assertEqual(captured["errors"], [])
+        host = mock.Mock(role="sender0")
+        z.start_placement(host, z.parse_host_env(HOST_ENV), "tag", "junction")
+        command = host.root.call_args.args[0]
+        self.assertIn("--property=RuntimeMaxSec=35 taskset -c 0-5 python3", command)
+        for kind in ("gen", "sweep", "junctiond"):
+            self.assertIn("--expect " + kind, command)
+        self.assertIn("--out /var/tmp/zhida/tag.sender0.placement.txt", command)
+
+    def test_snapshot_fetch_validation_and_metadata(self):
+        host = mock.Mock(role="receiver")
+        facts = {"receiver": z.parse_host_env(HOST_ENV)}
+        snapshot = placement_snapshot("receiver", "junction")
+        with tempfile.TemporaryDirectory() as directory:
+            def fetch(remote, local):
+                with open(os.path.join(local, os.path.basename(remote)), "w") as file:
+                    json.dump(snapshot, file)
+            host.fetch.side_effect = fetch
+            self.assertTrue(z.collect_placement([host], facts, "tag", "junction", False, directory))
+            with open(os.path.join(directory, "tag.placement.json")) as file:
+                result = json.load(file)
+            self.assertEqual(result["hosts"]["receiver"],
+                             {"app_cpu": "7", "junction_cpu": "6", "housekeeping": "0-5", "isolated": "6-7"})
+            host.fetch.side_effect = None
+            host.fetch.return_value = "scp missing file"
+            self.assertFalse(z.collect_placement([host], facts, "missing", "junction", False, directory))
+            with open(os.path.join(directory, "missing.placement.json")) as file:
+                self.assertIn("missing placement snapshot", json.load(file)["errors"][0])
+
+    def test_invalid_placement_fails_only_its_sweep_and_next_sweep_runs(self):
+        hosts = [mock.Mock(role=role) for role in z.ROLES]
+        facts = {role: z.parse_host_env(HOST_ENV) for role in z.ROLES}
+        events = []
+        for host in hosts:
+            host.root.return_value = Proc(0, "active\n")
+        hosts[1].ssh.side_effect = lambda *args, **kwargs: events.append("coordinator") or Proc()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(z, "start_placement", side_effect=lambda host, *args: events.append(host.role)) as start, \
+                mock.patch.object(z, "collect_placement", side_effect=[False, True]) as collect, \
+                mock.patch.object(z, "save_receiver_journal"), \
+                mock.patch.object(z, "fetch_sweep", return_value=[]), \
+                mock.patch.object(z, "SWEEPS", [("udp", None), ("tcp", None)]):
+            _, failed = z.measure(hosts, facts, RECEIVER_DATA_IP, directory, mock.Mock())
+        self.assertEqual(failed, [z.tag("udp", None)])
+        self.assertEqual(events[:len(hosts) + 1], list(z.ROLES) + ["coordinator"])
+        self.assertEqual(start.call_count, 2 * len(hosts))
+        self.assertEqual(collect.call_count, 2)
+        self.assertEqual(hosts[1].ssh.call_count, 2)
+
 
 class KernelRoutingTest(unittest.TestCase):
     @staticmethod
@@ -1229,7 +1371,12 @@ class FakeHost:
         if self.w.hang:
             return f"{self.role}:{remote}: scp timed out after {z.SSH_S} s"
         with open(os.path.join(local, os.path.basename(remote)), "w") as f:
-            f.write(self.w.feed_text if remote == z.FEED_OUT else "{}\n")
+            if remote.endswith(".placement.txt"):
+                backend = "junction" if os.path.basename(remote).startswith("junction-") else "conduit"
+                kernel = self.role == "receiver" and any(r == "receiver" and "kernel_receiver" in c for r, c in self.w.calls)
+                json.dump(placement_snapshot(self.role, backend, kernel), f)
+            else:
+                f.write(self.w.feed_text if remote == z.FEED_OUT else "{}\n")
         return None
 
 
@@ -1559,6 +1706,7 @@ class RunTest(unittest.TestCase):
         for t in z.sweep_tags():
             want = {("sender0", f"{z.REMOTE}/{t}.jsonl"), ("sender0", f"{z.REMOTE}/{t}.coord.log")}
             want |= {(f"sender{i}", f"{z.REMOTE}/gen-{t}.log") for i in range(z.SENDERS)}
+            want |= {(role, f"{z.REMOTE}/{t}.{role}.placement.txt") for role in z.ROLES}
             self.assertEqual(want, {f for f in w.fetched if t in f[1]})
             self.assertTrue(os.path.exists(os.path.join(self.run_dir, f"sender{z.SENDERS - 1}", f"gen-{t}.log")))
             with open(os.path.join(self.run_dir, f"{t}.receiver.log")) as f:

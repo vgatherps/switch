@@ -98,6 +98,96 @@ class ReportTest(unittest.TestCase):
                 results = json.load(f)
                 self.assertEqual(results["source"], source)
             self.assertEqual(results["sweeps"][0]["summary"]["steps"], 2)
+            self.assertNotIn("Thread placement", md)
+            self.assertNotIn("INVALID", md)
+            self.assertNotIn("placement", results["sweeps"][0])
+
+    def test_placement_tables_show_backend_host_cpu_ids_and_core_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            placements = {
+                "udp-conduit": {
+                    "backend": "conduit",
+                    "hosts": {
+                        "receiver": {"app_cpu": "7", "junction_cpu": None, "housekeeping": "0-5", "isolated": "6-7"},
+                        "sender0": {"app_cpu": "7", "junction_cpu": None, "housekeeping": "0-5", "isolated": "6-7"},
+                    },
+                    "errors": [],
+                },
+                "udp-junction": {
+                    "backend": "junction",
+                    "hosts": {
+                        "receiver": {"app_cpu": "7", "junction_cpu": "6", "housekeeping": "0-5", "isolated": "6-7"},
+                        "sender0": {"app_cpu": "9", "junction_cpu": "8", "housekeeping": "0-7", "isolated": "8-9"},
+                    },
+                    "errors": [],
+                },
+                "udp-junction-kernel": {
+                    "backend": "junction",
+                    "hosts": {
+                        "receiver": {"app_cpu": "7", "junction_cpu": None, "housekeeping": "0-5", "isolated": "6-7"},
+                        "sender0": {"app_cpu": "7", "junction_cpu": "6", "housekeeping": "0-5", "isolated": "6-7"},
+                    },
+                    "errors": [],
+                },
+            }
+            for stem, placement in placements.items():
+                write_jsonl(os.path.join(d, stem + ".jsonl"), [step(1000, 10_000), summary(1)])
+                with open(os.path.join(d, stem + ".placement.json"), "w") as f:
+                    json.dump(placement, f)
+            md, issues = report.build(d, "T")
+            md = "\n".join(md)
+            self.assertEqual(issues, [])
+            self.assertNotIn("INVALID", md)
+            self.assertEqual(md.count("### Thread placement"), 3)
+            self.assertIn("| conduit | receiver | 7 | - | 7 | 1 | 0-5 | 6-7 |", md)
+            self.assertIn("| conduit | sender0 | 7 | - | 7 | 1 | 0-5 | 6-7 |", md)
+            self.assertIn("| junction | receiver | 7 | 6 | 7, 6 | 2 | 0-5 | 6-7 |", md)
+            self.assertIn("| junction | sender0 | 9 | 8 | 9, 8 | 2 | 0-7 | 8-9 |", md)
+            self.assertIn("| junction | receiver | 7 | - | 7 | 1 | 0-5 | 6-7 |", md)
+            self.assertIn("| junction | sender0 | 7 | 6 | 7, 6 | 2 | 0-5 | 6-7 |", md)
+            for stem, placement in placements.items():
+                for role in placement["hosts"]:
+                    self.assertIn(f"[raw]({stem}.{role}.placement.txt)", md)
+            with open(os.path.join(d, "results.json")) as f:
+                results = json.load(f)
+            self.assertEqual({s["name"]: s["placement"] for s in results["sweeps"]}, placements)
+
+    def test_placement_errors_invalidate_complete_sweep_without_hiding_data(self):
+        with tempfile.TemporaryDirectory() as d:
+            measured = step(1000, 10_000)
+            complete = summary(1)
+            write_jsonl(os.path.join(d, "udp-junction.jsonl"), [measured, complete])
+            write_jsonl(os.path.join(d, "udp-conduit.jsonl"), [measured, complete])
+            placement = {
+                "backend": "junction",
+                "hosts": {
+                    "receiver": {"app_cpu": "7", "junction_cpu": "6", "housekeeping": "0-5", "isolated": "6-7"},
+                },
+                "errors": ["receiver: app thread allowed on CPU 0", "receiver: daemon missing on CPU 6"],
+            }
+            with open(os.path.join(d, "udp-junction.placement.json"), "w") as f:
+                json.dump(placement, f)
+            self.assertEqual(report.main(["report.py", d]), 1)
+            with open(os.path.join(d, "report.md")) as f:
+                md = f.read()
+            self.assertTrue(md.startswith("# INCOMPLETE:"))
+            self.assertIn("## udp-junction — INVALID", md)
+            self.assertIn("## udp-conduit\n", md)
+            self.assertNotIn("## udp-conduit — INVALID", md)
+            for error in placement["errors"]:
+                self.assertIn(f"- INVALID placement: {error}", md)
+            self.assertIn("![udp-junction](udp-junction.svg)", md)
+            self.assertIn("| 1000 | 990 | 980 |", md)
+            with open(os.path.join(d, "udp-junction.svg")) as f:
+                root = ET.fromstring(f.read())
+            self.assertEqual(len(root.findall(f"{SVG}polyline")), 5)
+            with open(os.path.join(d, "results.json")) as f:
+                results = json.load(f)
+            invalid = next(s for s in results["sweeps"] if s["name"] == "udp-junction")
+            self.assertEqual(invalid, {"name": "udp-junction", "summary": complete,
+                                       "steps": [measured], "placement": placement})
+            self.assertEqual(results["incomplete"],
+                             [f"udp-junction: placement: {error}" for error in placement["errors"]])
 
 
 if __name__ == "__main__":

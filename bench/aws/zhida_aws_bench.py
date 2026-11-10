@@ -56,6 +56,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import janitor  # noqa: E402
+import placement  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -97,6 +98,7 @@ SETUP_REBOOT_S = 900
 # The bound of every ssh/scp without its own: the receiver stop (systemd SIGKILLs after 90 s), the
 # fetches while unwinding to teardown.
 SSH_S = 120
+PLACEMENT_UNIT = "zhida-bench-placement"
 QUOTA_CODE = "L-1216C47A"
 # The Binance listener host: the smallest 4-vCPU arm64 type of a family that gives ENA hardware RX
 # timestamps and the PHC in a precision-time placement group (deploy/README.md; not c7gn).
@@ -980,9 +982,53 @@ def fetch_sweep(t, hosts, run_dir):
     return [e for e in (h.fetch(remote, local) for h, remote, local in wanted) if e]
 
 
+def start_placement(host, facts, t, backend, kernel=False):
+    assignment = {key: facts[key] for key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")}
+    expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
+    command = (f"systemd-run --unit {PLACEMENT_UNIT} --collect --property=RuntimeMaxSec=35"
+               f" taskset -c {shlex.quote(facts['HOUSEKEEPING'])}"
+               f" python3 {SRC_DIR}/bench/aws/placement.py"
+               f" --assignment {shlex.quote(json.dumps(assignment))}"
+               + "".join(f" --expect {kind}" for kind in expected)
+               + f" --out {REMOTE}/{t}.{host.role}.placement.txt")
+    host.root(f"systemctl stop {PLACEMENT_UNIT} 2>/dev/null; "
+              f"systemctl reset-failed {PLACEMENT_UNIT} 2>/dev/null; {command}")
+
+
+def collect_placement(hosts, facts, t, backend, kernel, run_dir):
+    result = {"backend": backend, "hosts": {}, "errors": []}
+    for host in hosts:
+        name = f"{t}.{host.role}.placement.txt"
+        error = host.fetch(f"{REMOTE}/{name}", run_dir)
+        if error:
+            result["errors"].append(f"{host.role}: missing placement snapshot: {error}")
+            continue
+        try:
+            with open(os.path.join(run_dir, name)) as file:
+                snapshot = json.load(file)
+            assignment = snapshot["assignment"]
+            if any(assignment[key] != facts[host.role][key]
+                   for key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")):
+                result["errors"].append(f"{host.role}: snapshot CPU assignment differs from host.env")
+            expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
+            result["errors"] += [f"{host.role}: {error}" for error in placement.check(snapshot, expected, backend)]
+            result["hosts"][host.role] = {
+                "app_cpu": assignment["APP_CPU"],
+                "junction_cpu": assignment["JUNCTION_CPU"] if "junctiond" in expected else None,
+                "housekeeping": assignment["HOUSEKEEPING"], "isolated": snapshot["isolated"],
+            }
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result["errors"].append(f"{host.role}: invalid placement snapshot: {error}")
+    with open(os.path.join(run_dir, f"{t}.placement.json"), "w") as file:
+        json.dump(result, file, indent=2)
+    for error in result["errors"]:
+        log(f"{t}: placement: {error}")
+    return not result["errors"]
+
+
 def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_dir=None, backend="conduit"):
     """One sweep: receiver unit up, coordinator on sender0, receiver stopped. Returns the coordinator's
-    exit code, or None when it did not run or timed out."""
+    exit code, or None on startup failure, timeout, or invalid/missing thread placement."""
     receiver, sender0 = hosts[0], hosts[1]
     t = tag(proto, budget, backend)
     before = kernel_snapshot(receiver, facts["receiver"]) if kernel else None
@@ -990,6 +1036,7 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
     invocation = None
     daemons = []
     daemon_invocations = {}
+    placement_hosts = []
     try:
         if backend == "junction":
             for host in (hosts[1:] if kernel else hosts):
@@ -1021,17 +1068,31 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
         if receiver.root(f"systemctl is-active {RECEIVER_UNIT}", check=False).stdout.strip() != "active":
             log(f"{t}: receiver did not start")
             return None
+        for host in hosts:
+            placement_hosts.append(host)
+            try:
+                start_placement(host, facts[host.role], t, backend, kernel)
+            except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                log(f"{t}: {host.role}: placement waiter failed: {error}")
+                return None
         try:
-            return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"], backend),
+            code = sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"], backend),
                                check=False, timeout=SWEEP_WORST_S, stream=True).returncode
         except subprocess.TimeoutExpired:
             log(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
             sender0.ssh("pkill -f 'zhida-bench sweep'", check=False, timeout=60)
-            return None
+            code = None
+        valid = collect_placement(hosts, facts, t, backend, kernel, run_dir)
+        return code if valid else None
     finally:
         try:
             receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
         finally:
+            for host in placement_hosts:
+                try:
+                    host.root(f"systemctl stop {PLACEMENT_UNIT}", check=False)
+                except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    log(f"{t}: {host.role}: placement waiter stop failed: {error}")
             for host in reversed(daemons):
                 try:
                     stop_junction(host)
