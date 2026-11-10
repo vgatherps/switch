@@ -23,6 +23,43 @@ use zhida_test_kit::{tap::TapVdev, with_eal};
 
 use crate::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, tcp};
 
+mod host;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Conduit,
+    Junction,
+}
+
+/// A client Net plus the optional junction host driven on the same test thread.
+pub struct TapNet {
+    net: Net,
+    host: Option<host::Host>,
+}
+
+impl std::ops::Deref for TapNet {
+    type Target = Net;
+
+    fn deref(&self) -> &Net {
+        &self.net
+    }
+}
+
+impl std::ops::DerefMut for TapNet {
+    fn deref_mut(&mut self) -> &mut Net {
+        &mut self.net
+    }
+}
+
+impl TapNet {
+    pub fn turn(&mut self, now: Instant) -> Result<crate::Turn, crate::TurnError> {
+        if let Some(host) = &mut self.host {
+            host.iteration(now);
+        }
+        self.net.turn(now)
+    }
+}
+
 pub const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 pub const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const MTU: u16 = 1500;
@@ -61,10 +98,10 @@ impl Clock {
     }
 }
 
-/// Runs `body` on a Net over a fresh net_tap Port. `body` must drop every handle and socket
-/// it made; then the Net gives its Stack back, the Port closes with every buffer returned and
-/// the vdev is removed.
-pub fn with_tap_net<T>(config: &TapConfig, body: impl FnOnce(&mut Net, &Clock) -> T) -> T {
+/// Runs `body` on a Net over a fresh net_tap Port, locally or through junction.
+/// `body` must drop every handle, socket and frame it made; then the host gives its Stack
+/// back, the Port closes with every buffer returned and the vdev is removed.
+pub fn with_tap_net<T>(backend: Backend, config: &TapConfig, body: impl FnOnce(&mut TapNet, &Clock) -> T) -> T {
     let name = |format: &str| CString::new(format.replace("{}", config.name)).unwrap();
     let (vdev, iface) = (name("net_tap_{}"), name("cdtap_{}"));
     let pools = [name("{}_rx"), name("{}_tx"), name("{}_frame")];
@@ -91,9 +128,24 @@ pub fn with_tap_net<T>(config: &TapConfig, body: impl FnOnce(&mut Net, &Clock) -
         };
         let clock = Clock(std::time::Instant::now());
         let stack = Stack::new(port, stack_config, clock.now()).map_err(|(_, e)| e).expect("create Zhida Stack");
-        let mut net = Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET });
-        let out = body(&mut net, &clock);
-        let stack = net.into_stack().ok().expect("a handle or socket outlived the body");
+        let (net, host) = match backend {
+            Backend::Conduit => (Net::new(stack, NetConfig { ingress_budget: INGRESS_BUDGET }), None),
+            Backend::Junction => {
+                let (host, session) = host::Host::new(stack, clock.now(), INGRESS_BUDGET, config.max_sockets);
+                let tx_frames = tcp::tx_mbuf_budget(&config.socket, MTU.into());
+                (Net::remote(session, crate::RemoteConfig { tx_frames }), Some(host))
+            }
+        };
+        let mut tap_net = TapNet { net, host };
+        let out = body(&mut tap_net, &clock);
+        let TapNet { net, host } = tap_net;
+        let stack = match host {
+            None => net.into_stack().ok().expect("a handle or socket outlived the body"),
+            Some(host) => {
+                drop(net.into_session().ok().expect("a handle or socket outlived the body"));
+                host.finish(clock.now())
+            }
+        };
         stack.into_port().try_close().expect("close the Port with every buffer returned");
         tap.close();
         out
@@ -241,6 +293,7 @@ async fn connect_client<H: 'static, F: Future<Output = H> + 'static, C: FnOnce(N
 /// is dropped only then, so what the peer saw came from the client, not from its sockets
 /// closing. Returns what `serve` returned.
 pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
+    backend: Backend,
     tap: &TapConfig,
     port: u16,
     listener_setup: impl FnOnce(&TcpListener),
@@ -248,7 +301,7 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
     client: impl FnOnce(NetHandle, TcpStream) -> F + 'static,
     mut each_round: impl FnMut(),
 ) -> T {
-    with_tap_net(tap, |net, clock| {
+    with_tap_net(backend, tap, |net, clock| {
         let mut peer = KernelPeer::listen(port, listener_setup, serve);
         let mut rt = Runtime::new(0);
         let handle = net.handle();

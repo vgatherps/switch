@@ -18,6 +18,33 @@ use zhida_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use zhida_test_kit::ring_port::RingPort;
 use zhida_test_kit::wire::Link;
 
+#[path = "../../src/testkit/host.rs"]
+mod host;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Backend {
+    Conduit,
+    Junction,
+}
+
+#[allow(unused_macros)]
+macro_rules! both_backends {
+    ($conduit:ident, $junction:ident, |$backend:ident| $body:block) => {
+        #[zhida_test_support::pinned_test]
+        fn $conduit() {
+            let $backend = support::Backend::Conduit;
+            $body
+        }
+        #[zhida_test_support::pinned_test]
+        fn $junction() {
+            let $backend = support::Backend::Junction;
+            $body
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use both_backends;
+
 pub const MAX_TCP: usize = 4;
 pub const MAX_UDP: usize = 4;
 pub const UDP_QUEUE: usize = 8;
@@ -54,26 +81,27 @@ pub struct Mixed {
     pub net: Net,
     pub peer: Stack,
     pub now: Instant,
+    host: Option<host::Host>,
     fixtures: [RingPort; 2],
 }
 
 impl Mixed {
     /// `names` are short and unique among live fixtures.
-    pub fn new(eal: &Eal, names: [&str; 2]) -> Self {
-        Self::with_sockets(eal, names, MAX_TCP, MAX_UDP)
+    pub fn new(eal: &Eal, names: [&str; 2], backend: Backend) -> Self {
+        Self::with_sockets(eal, names, MAX_TCP, MAX_UDP, backend)
     }
 
     /// `new` with `tcp` TCP and `udp` UDP socket slots on each side.
-    pub fn with_sockets(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize) -> Self {
-        Self::build(eal, names, tcp, udp, &[])
+    pub fn with_sockets(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, backend: Backend) -> Self {
+        Self::build(eal, names, tcp, udp, &[], backend)
     }
 
     /// `new` with the Net also owning `owned`; the peer owns only its own address.
-    pub fn with_owned(eal: &Eal, names: [&str; 2], owned: &'static [Ipv4Cidr]) -> Self {
-        Self::build(eal, names, MAX_TCP, MAX_UDP, owned)
+    pub fn with_owned(eal: &Eal, names: [&str; 2], owned: &'static [Ipv4Cidr], backend: Backend) -> Self {
+        Self::build(eal, names, MAX_TCP, MAX_UDP, owned, backend)
     }
 
-    fn build(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, owned: &'static [Ipv4Cidr]) -> Self {
+    fn build(eal: &Eal, names: [&str; 2], tcp: usize, udp: usize, owned: &'static [Ipv4Cidr], backend: Backend) -> Self {
         let fixtures = names.map(|name| RingPort::new(name, 16, 16));
         let [net_stack, peer] = [Side::A, Side::B].map(|side| {
             let fixture = &fixtures[side.index()];
@@ -98,14 +126,23 @@ impl Mixed {
             }
         });
         let [a, b] = &fixtures;
+        let (net, host) = match backend {
+            Backend::Conduit => (Net::new(net_stack, NetConfig { ingress_budget: BUDGET }), None),
+            Backend::Junction => {
+                let (host, session) = host::Host::new(net_stack, T0, BUDGET, tcp + udp);
+                let net = Net::remote(session, switchnet::RemoteConfig { tx_frames: 256 });
+                (net, Some(host))
+            }
+        };
         Self {
             rt: Runtime::new(0),
             to_peer: a.link_to(b),
             to_net: b.link_to(a),
-            net: Net::new(net_stack, NetConfig { ingress_budget: BUDGET }),
+            net,
             peer,
             now: T0,
             fixtures,
+            host,
         }
     }
 
@@ -163,12 +200,20 @@ impl Mixed {
 
     /// Net turn, then one poll of the woken tasks.
     pub fn turn(&mut self) {
+        if let Some(host) = &mut self.host {
+            host.iteration(self.now);
+        }
         self.net.turn(self.now).unwrap();
         self.rt.poll(0).unwrap();
+        if self.host.is_some() {
+            // Control replies run on the host thread even though packet processing is local.
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
     }
 
     fn advance(&mut self) {
-        let deadline = [self.net.poll_at(), self.peer.poll_at()].into_iter().flatten().min();
+        let deadline = [self.net.poll_at(), self.host.as_mut().and_then(|host| host.network.poll_at()), self.peer.poll_at()]
+            .into_iter().flatten().min();
         if let Some(at) = deadline {
             self.now = self.now.max(at);
         }
@@ -176,12 +221,12 @@ impl Mixed {
 
     /// Asserts `Net::into_stack` refuses, and keeps the Net it hands back.
     pub fn into_stack_refused(self) -> Self {
-        let Self { rt, to_peer, to_net, net, peer, now, fixtures } = self;
+        let Self { rt, to_peer, to_net, net, peer, now, fixtures, host } = self;
         let net = match net.into_stack() {
             Ok(_) => panic!("into_stack succeeded while a handle or socket lives"),
             Err(net) => net,
         };
-        Self { rt, to_peer, to_net, net, peer, now, fixtures }
+        Self { rt, to_peer, to_net, net, peer, now, fixtures, host }
     }
 
     /// Every socket and frame the test made must already be dropped. The Net
@@ -193,9 +238,16 @@ impl Mixed {
     /// `close`, running `held` once both Stacks are torn down and before the
     /// mbuf checks: it gets frames still held and must drop them.
     pub fn close_after_stacks(self, held: impl FnOnce()) {
-        let Self { mut rt, mut to_peer, mut to_net, net, peer, fixtures, .. } = self;
+        let Self { mut rt, mut to_peer, mut to_net, net, peer, fixtures, host, now } = self;
         rt.shutdown();
-        let stack = net.into_stack().ok().expect("a Net handle or socket is still alive");
+        let stack = match host {
+            None => net.into_stack().ok().expect("a Net handle or socket is still alive"),
+            Some(host) => {
+                let session = net.into_session().ok().expect("a Net handle or socket is still alive");
+                drop(session);
+                host.finish(now)
+            }
+        };
         to_peer.free_held();
         to_net.free_held();
         let ports = [stack.into_port(), peer.into_port()];
@@ -241,8 +293,7 @@ pub fn udp_config_at(addr: switchnet::Ipv4Address, port: u16) -> UdpConfig {
 
 pub fn bind(mixed: &mut Mixed, config: UdpConfig) -> switchnet::UdpSocket {
     let slot = mixed.spawn(mixed.handle().udp_bind(config));
-    mixed.rt.poll(0).expect("poll local binding");
-    slot.take().expect("bind UDP")
+    mixed.wait(&slot).expect("bind UDP")
 }
 
 /// Net connects from `port` to the peer's listener in a task; drives until

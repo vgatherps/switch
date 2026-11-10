@@ -37,3 +37,5 @@ cargo bench -p switchnet --bench turn
 ```
 
 Needs DPDK 25.11.3 and a one-CPU process (Docker image on macOS; `make docker-test` includes it). Tests are in `tests/rx.rs` (receive, connect, accept), `tests/tx.rs` (send), `tests/open.rs` (first-poll opening failures, cleanup, cached negotiated MSS), `tests/ready.rs` (which parked tasks a turn wakes) and `tests/multi_ip.rs` (secondary addresses, per-address binds, bound-over-all-IP precedence).
+
+The `Mixed` net_ring fixture and feature-gated `testkit::with_tap_net` select `Backend::Conduit` or `Backend::Junction`. Junction tests drive an in-process `Network` on the test thread and a directly wired `HostControl` thread; teardown recovers its Stack and retains the same pool-return checks. Tap users turn the returned `TapNet` so the host is driven too.

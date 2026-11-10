@@ -13,7 +13,7 @@ use support::{Mixed, bind, counted, net_ip, peer_udp_send, udp_config};
 #[zhida_test_support::pinned_test]
 fn idle_rounds_report_nothing_moved_and_do_not_sleep() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rdia", "rdib"]);
+        let mut mixed = Mixed::new(eal, ["rdia", "rdib"], support::Backend::Conduit);
         assert_eq!(mixed.net.poll_at(), None, "the Stack has a timer");
         let start = Wall::now();
         for _ in 0..1000 {
@@ -30,7 +30,7 @@ fn idle_rounds_report_nothing_moved_and_do_not_sleep() {
 #[zhida_test_support::pinned_test]
 fn a_round_that_wakes_a_task_reports_it_moved() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rdwa", "rdwb"]);
+        let mut mixed = Mixed::new(eal, ["rdwa", "rdwb"], support::Backend::Conduit);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         mixed.rounds(5);

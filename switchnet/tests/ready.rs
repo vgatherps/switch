@@ -63,7 +63,7 @@ const BASE: u16 = 20_000;
 #[zhida_test_support::pinned_test]
 fn one_of_a_thousand_parked_receivers_wakes() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["tha", "thb"], 1, SOCKETS + 1);
+        let mut mixed = Mixed::with_sockets(eal, ["tha", "thb"], 1, SOCKETS + 1, support::Backend::Conduit);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         mixed.rounds(2);
@@ -105,7 +105,7 @@ fn one_of_a_thousand_parked_receivers_wakes() {
 #[zhida_test_support::pinned_test]
 fn halves_of_one_stream_wake_independently() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["hlva", "hlvb"]);
+        let mut mixed = Mixed::new(eal, ["hlva", "hlvb"], support::Backend::Conduit);
         let stalling = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling);
         let (mut rx, mut tx) = stream.split();
@@ -174,7 +174,7 @@ fn halves_of_one_stream_wake_independently() {
 #[zhida_test_support::pinned_test]
 fn token_fired_then_canceled_then_entry_reused_before_the_turn() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["fcra", "fcrb"]);
+        let mut mixed = Mixed::new(eal, ["fcra", "fcrb"], support::Backend::Conduit);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
@@ -218,7 +218,7 @@ fn token_fired_then_canceled_then_entry_reused_before_the_turn() {
 #[zhida_test_support::pinned_test]
 fn token_fired_then_socket_dropped_then_turn() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["fsda", "fsdb"]);
+        let mut mixed = Mixed::new(eal, ["fsda", "fsdb"], support::Backend::Conduit);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
@@ -261,7 +261,7 @@ fn token_fired_then_socket_dropped_then_turn() {
 #[zhida_test_support::pinned_test]
 fn recv_canceled_and_parked_again_between_turns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["crpa", "crpb"]);
+        let mut mixed = Mixed::new(eal, ["crpa", "crpb"], support::Backend::Conduit);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let gate = Gate::default();
         let (task, polls) = counted({
@@ -296,7 +296,7 @@ fn recv_canceled_and_parked_again_between_turns() {
 #[zhida_test_support::pinned_test]
 fn token_fired_by_the_other_half_rearms_without_a_wake() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["oha", "ohb"]);
+        let mut mixed = Mixed::new(eal, ["oha", "ohb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, mut tx) = stream.split();
         let (task, polls) = counted(async move {
@@ -357,7 +357,7 @@ fn fire_send_token_and_drop(mixed: &mut Mixed, stream: TcpStream) {
 #[zhida_test_support::pinned_test]
 fn udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["xkua", "xkub"]);
+        let mut mixed = Mixed::new(eal, ["xkua", "xkub"], support::Backend::Conduit);
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
         fire_send_token_and_drop(&mut mixed, stream);
         let (mut rx, tx) = bind(&mut mixed, udp_config(7000)).split();
@@ -385,7 +385,7 @@ fn udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half() {
 #[zhida_test_support::pinned_test]
 fn tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["xkta", "xktb"]);
+        let mut mixed = Mixed::new(eal, ["xkta", "xktb"], support::Backend::Conduit);
         let (stream, old_peer) = connect(&mut mixed, LOCAL_PORT);
         fire_send_token_and_drop(&mut mixed, stream);
         let peer = peer_listen(&mut mixed);

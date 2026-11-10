@@ -16,7 +16,7 @@ use relay::switchnet::{Error as WssError, Ws, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use switchnet::testkit::{KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
+use switchnet::testkit::{Backend, KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint};
 use switchnet::{Net, NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
@@ -89,6 +89,7 @@ fn run<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
 ) -> T {
     let (server_tls, client_tls) = tls_configs();
     client_server(
+        Backend::Conduit,
         &TAP,
         SERVER_PORT,
         listener_setup,
@@ -163,7 +164,7 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
     mut each_turn: impl FnMut(&Net),
 ) -> T {
     let socket = tap.socket;
-    with_tap_net(tap, |net, clock| {
+    with_tap_net(Backend::Conduit, tap, |net, clock| {
         let mut peer = KernelPeer::listen(SERVER_PORT, listener_setup, serve);
         let mut rt = switch::Runtime::new(0);
         let handle = net.handle();
@@ -965,7 +966,7 @@ fn ws_connect_with_another_nets_handle_is_refused() {
         sees_nothing,
         |_, stream| async move {
             const OTHER: TapConfig = TapConfig { name: "wsso", ..TAP };
-            with_tap_net(&OTHER, |other, _| {
+            with_tap_net(Backend::Conduit, &OTHER, |other, _| {
                 // the other tap only lends a handle: take its address off so routes stay on ours
                 let status = std::process::Command::new("ip")
                     .args(["address", "del", &format!("{KERNEL_ADDR}/24"), "dev", "cdtap_wsso"])

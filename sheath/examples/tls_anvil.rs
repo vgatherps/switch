@@ -33,7 +33,7 @@ use rustls::version::TLS13;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use sheath::switchnet::{send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
-use switchnet::testkit::{KERNEL_ADDR, ROUND_SLEEP, TapConfig, with_tap_net};
+use switchnet::testkit::{Backend, KERNEL_ADDR, ROUND_SLEEP, TapConfig, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};
 
 /// TLS-Anvil's address: the kernel side of the tap netdev.
@@ -174,7 +174,7 @@ fn marker(dir: &Path, name: &str) {
 fn main() {
     let dir = PathBuf::from(std::env::args_os().nth(1).expect("usage: tls_anvil <run-dir>"));
     let tap = TapConfig { random_seed: u64::from(std::process::id()), ..TAP };
-    let summary = with_tap_net(&tap, |net, clock| {
+    let summary = with_tap_net(Backend::Conduit, &tap, |net, clock| {
         let triggers = TcpListener::bind(TRIGGER).expect("bind the trigger port");
         triggers.set_nonblocking(true).expect("non-blocking trigger port");
         let mut rt = Runtime::new(0);

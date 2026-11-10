@@ -50,7 +50,7 @@ async fn echo_once(handle: NetHandle, socket: UdpSocket) -> (UdpRx, UdpTx, Datag
 #[zhida_test_support::pinned_test]
 fn connect_from_a_secondary_address_uses_it() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mcna", "mcnb"], OWNED);
+        let mut mixed = Mixed::with_owned(eal, ["mcna", "mcnb"], OWNED, support::Backend::Conduit);
         let unowned = Ipv4Address::new(10, 0, 0, 99);
         let refused = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local_at(unowned, LOCAL_PORT));
         let refused = mixed.spawn(refused);
@@ -78,7 +78,7 @@ fn connect_from_a_secondary_address_uses_it() {
 #[zhida_test_support::pinned_test]
 fn accept_on_a_secondary_address_takes_only_its_connections() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["maca", "macb"], OWNED);
+        let mut mixed = Mixed::with_owned(eal, ["maca", "macb"], OWNED, support::Backend::Conduit);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let slot = mixed.spawn(async move {
             let mut stream = accepting.await.unwrap();
@@ -106,7 +106,7 @@ fn accept_on_a_secondary_address_takes_only_its_connections() {
 #[zhida_test_support::pinned_test]
 fn listener_bound_to_an_address_beats_the_all_ip_listener() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mlpa", "mlpb"], OWNED);
+        let mut mixed = Mixed::with_owned(eal, ["mlpa", "mlpb"], OWNED, support::Backend::Conduit);
         let (all, all_polls) = counted(mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)));
         let exact = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let all = mixed.spawn(all);
@@ -128,7 +128,7 @@ fn listener_bound_to_an_address_beats_the_all_ip_listener() {
 #[zhida_test_support::pinned_test]
 fn udp_sockets_bound_per_address_receive_and_reply_from_it() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mupa", "mupb"], OWNED);
+        let mut mixed = Mixed::with_owned(eal, ["mupa", "mupb"], OWNED, support::Backend::Conduit);
         let handle = mixed.handle();
         let [second, third] = [SECOND, THIRD].map(|addr| {
             let socket = bind(&mut mixed, udp_config_at(addr, UDP_PORT));
@@ -166,7 +166,7 @@ fn udp_sockets_bound_per_address_receive_and_reply_from_it() {
 #[zhida_test_support::pinned_test]
 fn udp_socket_bound_to_an_address_beats_the_all_ip_socket() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mupra", "muprb"], OWNED);
+        let mut mixed = Mixed::with_owned(eal, ["mupra", "muprb"], OWNED, support::Backend::Conduit);
         let mut all = bind(&mut mixed, udp_config(UDP_PORT));
         let mut exact = bind(&mut mixed, udp_config_at(SECOND, UDP_PORT));
         let (all_task, all_polls) = counted(async move {
@@ -204,7 +204,7 @@ fn udp_socket_bound_to_an_address_beats_the_all_ip_socket() {
 #[zhida_test_support::pinned_test]
 fn parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mtka", "mtkb"], OWNED);
+        let mut mixed = Mixed::with_owned(eal, ["mtka", "mtkb"], OWNED, support::Backend::Conduit);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
         let accepted = mixed.spawn(accepting);
         mixed.turn();

@@ -67,7 +67,7 @@ fn peer_receive(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, len: usize) -
 #[zhida_test_support::pinned_test]
 fn room_then_try_send_delivers_every_frame_in_order() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rtsa", "rtsb"]);
+        let mut mixed = Mixed::new(eal, ["rtsa", "rtsb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (_rx, mut tx) = stream.split();
         let data = pattern(64 * CHUNK + 123, 5);
@@ -89,7 +89,7 @@ fn room_then_try_send_delivers_every_frame_in_order() {
 #[zhida_test_support::pinned_test]
 fn room_parks_until_the_peer_acks() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rpka", "rpkb"]);
+        let mut mixed = Mixed::new(eal, ["rpka", "rpkb"], support::Backend::Conduit);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
@@ -124,7 +124,7 @@ fn room_parks_until_the_peer_acks() {
 #[zhida_test_support::pinned_test]
 fn try_send_full_returns_the_same_frame() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["tsfa", "tsfb"]);
+        let mut mixed = Mixed::new(eal, ["tsfa", "tsfb"], support::Backend::Conduit);
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();
@@ -166,7 +166,7 @@ fn try_send_full_returns_the_same_frame() {
 #[zhida_test_support::pinned_test]
 fn tx_frame_waits_until_a_frame_returns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["txwa", "txwb"]);
+        let mut mixed = Mixed::new(eal, ["txwa", "txwb"], support::Backend::Conduit);
         let handle = mixed.handle();
         let held = Rc::new(RefCell::new(Vec::new()));
         let slot = mixed.spawn({
@@ -199,7 +199,7 @@ fn tx_frame_waits_until_a_frame_returns() {
 #[zhida_test_support::pinned_test]
 fn split_halves_echo_through_the_peer() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["echa", "echb"]);
+        let mut mixed = Mixed::new(eal, ["echa", "echb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, mut tx) = stream.split();
         let data = pattern(200 * 1024, 11);
@@ -236,7 +236,7 @@ fn split_halves_echo_through_the_peer() {
 #[zhida_test_support::pinned_test]
 fn parked_room_resolves_with_an_error_on_reset() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rrsa", "rrsb"]);
+        let mut mixed = Mixed::new(eal, ["rrsa", "rrsb"], support::Backend::Conduit);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
@@ -276,7 +276,7 @@ fn parked_room_resolves_with_an_error_on_reset() {
 #[zhida_test_support::pinned_test]
 fn delivered_waits_until_the_peer_acks_the_fin() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["dlva", "dlvb"]);
+        let mut mixed = Mixed::new(eal, ["dlva", "dlvb"], support::Backend::Conduit);
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, stalling_config());
         let (_rx, mut tx) = stream.split();
         let data = pattern(2 * CHUNK, 21);
@@ -313,7 +313,7 @@ fn delivered_waits_until_the_peer_acks_the_fin() {
 #[zhida_test_support::pinned_test]
 fn shutdown_sends_fin_after_the_data() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["shda", "shdb"]);
+        let mut mixed = Mixed::new(eal, ["shda", "shdb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, mut tx) = stream.split();
         let data = pattern(20 * CHUNK + 7, 13);
@@ -351,7 +351,7 @@ fn shutdown_sends_fin_after_the_data() {
 #[zhida_test_support::pinned_test]
 fn udp_halves_receive_and_send_a_frame() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["udsa", "udsb"]);
+        let mut mixed = Mixed::new(eal, ["udsa", "udsb"], support::Backend::Conduit);
         let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -385,7 +385,7 @@ fn udp_halves_receive_and_send_a_frame() {
 #[zhida_test_support::pinned_test]
 fn room_beyond_the_send_capacity_fails() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rbga", "rbgb"]);
+        let mut mixed = Mixed::new(eal, ["rbga", "rbgb"], support::Backend::Conduit);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
@@ -419,7 +419,7 @@ fn room_beyond_the_send_capacity_fails() {
 #[zhida_test_support::pinned_test]
 fn room_waits_for_queued_bytes_to_be_acked() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rbya", "rbyb"]);
+        let mut mixed = Mixed::new(eal, ["rbya", "rbyb"], support::Backend::Conduit);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (_rx, mut tx) = stream.split();
@@ -452,7 +452,7 @@ fn room_waits_for_queued_bytes_to_be_acked() {
 #[zhida_test_support::pinned_test]
 fn dropping_the_send_half_keeps_receiving() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["dtxa", "dtxb"]);
+        let mut mixed = Mixed::new(eal, ["dtxa", "dtxb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, tx) = stream.split();
         let reader = mixed.spawn(async move { (rx.recv().await.unwrap().payload().to_vec(), rx) });
@@ -474,7 +474,7 @@ fn dropping_the_send_half_keeps_receiving() {
 #[zhida_test_support::pinned_test]
 fn dropping_the_receive_half_keeps_a_parked_writer() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["drxa", "drxb"]);
+        let mut mixed = Mixed::new(eal, ["drxa", "drxb"], support::Backend::Conduit);
         let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
         let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
         let (rx, mut tx) = stream.split();
@@ -510,7 +510,7 @@ fn dropping_the_receive_half_keeps_a_parked_writer() {
 #[zhida_test_support::pinned_test]
 fn canceled_room_clears_its_parked_handle() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["crma", "crmb"]);
+        let mut mixed = Mixed::new(eal, ["crma", "crmb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (_rx, mut tx) = stream.split();
         let handle = mixed.handle();

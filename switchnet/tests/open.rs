@@ -20,7 +20,7 @@ async fn first_poll<F: Future>(future: F) -> F::Output {
 #[zhida_test_support::pinned_test]
 fn tcp_slots_full_on_first_poll_and_drop_releases_slot() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["ofsa", "ofsb"], 1, 1);
+        let mut mixed = Mixed::with_sockets(eal, ["ofsa", "ofsb"], 1, 1, support::Backend::Conduit);
         let held = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let failed = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT + 1));
         let slot = mixed.spawn(first_poll(failed));
@@ -41,7 +41,7 @@ fn tcp_slots_full_on_first_poll_and_drop_releases_slot() {
 #[zhida_test_support::pinned_test]
 fn udp_port_in_use_on_first_poll_and_release_reopens_port() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["ofua", "ofub"], 1, 2);
+        let mut mixed = Mixed::with_sockets(eal, ["ofua", "ofub"], 1, 2, support::Backend::Conduit);
         let held = support::bind(&mut mixed, udp_config(7000));
         let failed = mixed.handle().udp_bind(udp_config(7000));
         let slot = mixed.spawn(first_poll(failed));
@@ -58,7 +58,7 @@ fn udp_port_in_use_on_first_poll_and_release_reopens_port() {
 #[zhida_test_support::pinned_test]
 fn failed_connect_start_releases_only_socket_slot() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["ofca", "ofcb"], 1, 1);
+        let mut mixed = Mixed::with_sockets(eal, ["ofca", "ofcb"], 1, 1, support::Backend::Conduit);
         let unowned = switchnet::Ipv4Address::new(10, 0, 0, 99);
         let failed = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local_at(unowned, LOCAL_PORT));
         let slot = mixed.spawn(first_poll(failed));
@@ -77,7 +77,7 @@ fn failed_connect_start_releases_only_socket_slot() {
 #[zhida_test_support::pinned_test]
 fn accepting_error_is_ready_on_first_poll_and_releases_socket() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["oaea", "oaeb"], 1, 1);
+        let mut mixed = Mixed::with_sockets(eal, ["oaea", "oaeb"], 1, 1, support::Backend::Conduit);
         let failed = mixed.handle().tcp_accept(tcp_config(), local(0));
         let slot = mixed.spawn(first_poll(failed));
         mixed.rt.poll(0).unwrap();
@@ -95,7 +95,7 @@ fn accepting_error_is_ready_on_first_poll_and_releases_socket() {
 #[zhida_test_support::pinned_test]
 fn dropping_unpolled_binding_releases_udp_port() {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["odba", "odbb"], 1, 2);
+        let mut mixed = Mixed::with_sockets(eal, ["odba", "odbb"], 1, 2, support::Backend::Conduit);
         let binding = mixed.handle().udp_bind(udp_config(7000));
         drop(binding);
         let socket = support::bind(&mut mixed, udp_config(7000));
@@ -124,7 +124,7 @@ fn assert_cached_mss_after_reset(mixed: &mut Mixed, stream: switchnet::TcpStream
 #[zhida_test_support::pinned_test]
 fn connecting_caches_peer_negotiated_mss_across_reset() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["omca", "omcb"]);
+        let mut mixed = Mixed::new(eal, ["omca", "omcb"], support::Backend::Conduit);
         let peer = mixed.peer.add_tcp(tcp::Config { mss_cap: Some(700), ..tcp_config() }).unwrap();
         mixed.peer.listen(&peer, PEER_PORT).unwrap();
         let opening = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
@@ -138,7 +138,7 @@ fn connecting_caches_peer_negotiated_mss_across_reset() {
 #[zhida_test_support::pinned_test]
 fn accepting_caches_peer_negotiated_mss_across_reset() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["omaa", "omab"]);
+        let mut mixed = Mixed::new(eal, ["omaa", "omab"], support::Backend::Conduit);
         let opening = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let slot = mixed.spawn(opening);
         let peer = mixed.peer.add_tcp(tcp::Config { mss_cap: Some(700), ..tcp_config() }).unwrap();
@@ -152,7 +152,7 @@ fn accepting_caches_peer_negotiated_mss_across_reset() {
 #[zhida_test_support::pinned_test]
 fn accepting_already_closed_preserves_queued_data_without_mss() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["ocaa", "ocab"]);
+        let mut mixed = Mixed::new(eal, ["ocaa", "ocab"], support::Backend::Conduit);
         let opening = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();

@@ -21,7 +21,7 @@ async fn filled(handle: &NetHandle, data: &[u8]) -> ImmutableFrame {
 #[zhida_test_support::pinned_test]
 fn a_udp_burst_stops_the_poll_until_the_net_turns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["urua", "urub"]);
+        let mut mixed = Mixed::new(eal, ["urua", "urub"], support::Backend::Conduit);
         let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -60,7 +60,7 @@ fn a_udp_burst_stops_the_poll_until_the_net_turns() {
 #[zhida_test_support::pinned_test]
 fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["urta", "urtb"]);
+        let mut mixed = Mixed::new(eal, ["urta", "urtb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         mixed.net.turn(mixed.now).unwrap();
         let (rx, mut tx) = stream.split();
@@ -99,7 +99,7 @@ fn a_tcp_burst_stops_the_poll_until_the_net_turns() {
 #[zhida_test_support::pinned_test]
 fn fewer_frames_than_a_burst_do_not_stop_the_poll() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["urfa", "urfb"]);
+        let mut mixed = Mixed::new(eal, ["urfa", "urfb"], support::Backend::Conduit);
         let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -129,7 +129,7 @@ fn fewer_frames_than_a_burst_do_not_stop_the_poll() {
 #[zhida_test_support::pinned_test]
 fn a_burst_sent_outside_any_task_does_not_stop_the_next_poll() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["uroa", "urob"]);
+        let mut mixed = Mixed::new(eal, ["uroa", "urob"], support::Backend::Conduit);
         let socket = bind(&mut mixed, udp_config(7000));
         let (mut rx, mut tx) = socket.split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();

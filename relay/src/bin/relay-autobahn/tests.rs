@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::panic::resume_unwind;
 use std::thread;
 
-use switchnet::testkit::{KERNEL_ADDR, TapConfig, ZHIDA_ADDR, with_tap_net};
+use switchnet::testkit::{Backend, KERNEL_ADDR, TapConfig, ZHIDA_ADDR, with_tap_net};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::{Error as TError, Message, WebSocket};
 
@@ -24,7 +24,7 @@ const SHORT: Duration = Duration::from_secs(1);
 /// FIN or RST of the connections it dropped.
 fn run<T: Send + 'static>(role: Role, deadline: Duration, peer: impl FnOnce() -> T + Send + 'static) -> (Result<(), Failure>, T) {
     let tap = TapConfig { name: "autobahn", socket: SOCKET, max_sockets: role.max_sockets(), random_seed: 1 };
-    with_tap_net(&tap, |net, clock| {
+    with_tap_net(Backend::Conduit, &tap, |net, clock| {
         let peer = thread::spawn(peer);
         let result = drive(net, &|| clock.elapsed(), &mut || peer.is_finished(), &role, deadline);
         while !peer.is_finished() {

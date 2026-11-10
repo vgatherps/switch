@@ -1485,9 +1485,13 @@ dependencies = [
 name = "switchnet"
 version = "0.1.0"
 dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
  "criterion",
  "dpdk-smoltcp",
  "junction",
+ "junctiond",
  "switch",
  "zhida-buffer",
  "zhida-dpdk-sys",

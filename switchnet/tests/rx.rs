@@ -51,7 +51,7 @@ fn resolve_neighbors(mixed: &mut Mixed) {
 #[zhida_test_support::pinned_test]
 fn connect_resolves_and_wakes_the_task_once() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["cona", "conb"]);
+        let mut mixed = Mixed::new(eal, ["cona", "conb"], support::Backend::Conduit);
         let peer = peer_listen(&mut mixed);
         let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (connecting, polls) = counted(connecting);
@@ -67,7 +67,7 @@ fn connect_resolves_and_wakes_the_task_once() {
 #[zhida_test_support::pinned_test]
 fn refused_connect_reports_reset_by_peer() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["refa", "refb"]);
+        let mut mixed = Mixed::new(eal, ["refa", "refb"], support::Backend::Conduit);
         let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let slot = mixed.spawn(connecting);
         let Err(error) = mixed.wait(&slot) else { panic!("expected Refused") };
@@ -79,7 +79,7 @@ fn refused_connect_reports_reset_by_peer() {
 #[zhida_test_support::pinned_test]
 fn data_arrives_in_order_as_frames() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["orda", "ordb"]);
+        let mut mixed = Mixed::new(eal, ["orda", "ordb"], support::Backend::Conduit);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let data = pattern(256 * 1024, 7);
         let len = data.len();
@@ -115,7 +115,7 @@ fn data_arrives_in_order_as_frames() {
 #[zhida_test_support::pinned_test]
 fn parked_task_is_woken_once_by_data_and_not_polled_on_idle_turns() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["onca", "oncb"]);
+        let mut mixed = Mixed::new(eal, ["onca", "oncb"], support::Backend::Conduit);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (task, polls) = counted(async move {
             let frame = stream.recv().await.unwrap();
@@ -138,7 +138,7 @@ fn parked_task_is_woken_once_by_data_and_not_polled_on_idle_turns() {
 #[zhida_test_support::pinned_test]
 fn queued_data_then_reset_gives_the_data_then_invalid_state() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["qrsa", "qrsb"]);
+        let mut mixed = Mixed::new(eal, ["qrsa", "qrsb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"before reset");
         peer_resets_after(&mut mixed, &peer);
@@ -154,7 +154,7 @@ fn queued_data_then_reset_gives_the_data_then_invalid_state() {
 #[zhida_test_support::pinned_test]
 fn accepted_fin_gives_finished() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["fina", "finb"]);
+        let mut mixed = Mixed::new(eal, ["fina", "finb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"last");
         mixed.peer.close(&peer);
@@ -173,7 +173,7 @@ fn accepted_fin_gives_finished() {
 #[zhida_test_support::pinned_test]
 fn accepted_fin_then_reset_gives_the_reset() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["frsa", "frsb"]);
+        let mut mixed = Mixed::new(eal, ["frsa", "frsb"], support::Backend::Conduit);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         peer_send(&mut mixed, &peer, b"last");
         mixed.peer.close(&peer);
@@ -191,7 +191,7 @@ fn accepted_fin_then_reset_gives_the_reset() {
 #[zhida_test_support::pinned_test]
 fn udp_datagrams_arrive_with_source_address() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["udpa", "udpb"]);
+        let mut mixed = Mixed::new(eal, ["udpa", "udpb"], support::Backend::Conduit);
         let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let slot = mixed.spawn(async move {
@@ -220,7 +220,7 @@ fn udp_datagrams_arrive_with_source_address() {
 #[zhida_test_support::pinned_test]
 fn udp_stats_count_datagrams_dropped_on_a_full_queue() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["udsa", "udsb"]);
+        let mut mixed = Mixed::new(eal, ["udsa", "udsb"], support::Backend::Conduit);
         let (rx, tx) = bind(&mut mixed, udp_config(7000)).split();
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         assert_eq!(tx.stats().rx_dropped_full, 0);
@@ -242,7 +242,7 @@ fn udp_stats_count_datagrams_dropped_on_a_full_queue() {
 #[zhida_test_support::pinned_test]
 fn canceled_recv_clears_its_parked_handle() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["crca", "crcb"]);
+        let mut mixed = Mixed::new(eal, ["crca", "crcb"], support::Backend::Conduit);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (task, polls) = counted(async move {
             cancel_after_one_poll(stream.recv()).await;
@@ -265,7 +265,7 @@ fn canceled_recv_clears_its_parked_handle() {
 #[zhida_test_support::pinned_test]
 fn canceled_udp_recv_clears_its_parked_handle() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["cura", "curb"]);
+        let mut mixed = Mixed::new(eal, ["cura", "curb"], support::Backend::Conduit);
         let mut socket = bind(&mut mixed, udp_config(7000));
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         let (task, polls) = counted(async move {
@@ -288,7 +288,7 @@ fn canceled_udp_recv_clears_its_parked_handle() {
 #[zhida_test_support::pinned_test]
 fn canceled_connect_drops_the_socket_without_waking() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["ccna", "ccnb"]);
+        let mut mixed = Mixed::new(eal, ["ccna", "ccnb"], support::Backend::Conduit);
         let peer = peer_listen(&mut mixed);
         let connecting = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT));
         let (task, polls) = counted(async move {
@@ -309,7 +309,7 @@ fn canceled_connect_drops_the_socket_without_waking() {
 #[zhida_test_support::pinned_test]
 fn canceled_accept_drops_the_listener_without_waking() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["ccaa", "ccab"]);
+        let mut mixed = Mixed::new(eal, ["ccaa", "ccab"], support::Backend::Conduit);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (task, polls) = counted(async move {
             cancel_after_one_poll(accepting).await;
@@ -331,7 +331,7 @@ fn canceled_accept_drops_the_listener_without_waking() {
 #[zhida_test_support::pinned_test]
 fn connect_and_accept_resolve_established() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["acca", "accb"]);
+        let mut mixed = Mixed::new(eal, ["acca", "accb"], support::Backend::Conduit);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (accepting, polls) = counted(accepting);
         let slot = mixed.spawn(async move {
@@ -358,7 +358,7 @@ fn connect_and_accept_resolve_established() {
 #[zhida_test_support::pinned_test]
 fn accept_survives_rst_in_syn_received() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["arsa", "arsb"]);
+        let mut mixed = Mixed::new(eal, ["arsa", "arsb"], support::Backend::Conduit);
         resolve_neighbors(&mut mixed);
         let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
         let (accepting, polls) = counted(accepting);
@@ -392,7 +392,7 @@ fn accept_survives_rst_in_syn_received() {
 #[zhida_test_support::pinned_test]
 fn two_accepts_on_one_port_serve_two_connections() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["a2pa", "a2pb"]);
+        let mut mixed = Mixed::new(eal, ["a2pa", "a2pb"], support::Backend::Conduit);
         let slots = [0, 1].map(|_| {
             let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
             mixed.spawn(accepting)
@@ -414,7 +414,7 @@ fn two_accepts_on_one_port_serve_two_connections() {
 #[zhida_test_support::pinned_test]
 fn frames_outlive_the_stack() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["outa", "outb"]);
+        let mut mixed = Mixed::new(eal, ["outa", "outb"], support::Backend::Conduit);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let mut udp = bind(&mut mixed, udp_config(7000));
         let udp_peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -450,7 +450,7 @@ fn frames_outlive_the_stack() {
 #[zhida_test_support::pinned_test]
 fn held_frames_do_not_block_later_data() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["wina", "winb"]);
+        let mut mixed = Mixed::new(eal, ["wina", "winb"], support::Backend::Conduit);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let data = pattern(64 * 1024, 3);
         let len = data.len();
@@ -488,7 +488,7 @@ fn held_frames_do_not_block_later_data() {
 #[zhida_test_support::pinned_test]
 fn simultaneous_open_waits_through_syn_received() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["sima", "simb"]);
+        let mut mixed = Mixed::new(eal, ["sima", "simb"], support::Backend::Conduit);
         resolve_neighbors(&mut mixed);
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
@@ -517,7 +517,7 @@ fn simultaneous_open_waits_through_syn_received() {
 #[zhida_test_support::pinned_test]
 fn error_turn_keeps_the_parked_task_for_the_next_turn() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["erra", "errb"]);
+        let mut mixed = Mixed::new(eal, ["erra", "errb"], support::Backend::Conduit);
         let earlier = mixed.now;
         mixed.now = earlier + Duration::from_millis(1);
         let mut socket = bind(&mut mixed, udp_config(7000));
@@ -557,7 +557,7 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
 #[zhida_test_support::pinned_test]
 fn socket_reusing_a_just_freed_index_is_woken() {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["reua", "reub"]);
+        let mut mixed = Mixed::new(eal, ["reua", "reub"], support::Backend::Conduit);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         let mut first = bind(&mut mixed, udp_config(7000));
