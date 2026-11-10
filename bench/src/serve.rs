@@ -53,6 +53,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     match args.proto {
         Proto::Udp => udp_echo(&mut host, &handle, args.port)?,
         Proto::Tcp | Proto::Ws => {
+            let startup_error = std::rc::Rc::new(std::cell::RefCell::new(None));
             for _ in 0..ACCEPTS {
                 arm_accept(
                     &host.rt.spawner(),
@@ -60,7 +61,13 @@ pub fn run(args: &Args) -> Result<(), String> {
                     args.port,
                     tcp_config,
                     args.proto == Proto::Ws,
+                    Some(startup_error.clone()),
                 )?;
+            }
+            host.round()?;
+            let error = startup_error.borrow_mut().take();
+            if let Some(error) = error {
+                return Err(format!("tcp accept: {error:?}"));
             }
         }
     }
@@ -155,6 +162,7 @@ fn arm_accept(
     port: u16,
     config: tcp::Config,
     ws: bool,
+    startup_error: Option<std::rc::Rc<std::cell::RefCell<Option<Error>>>>,
 ) -> Result<(), String> {
     let accepting = handle.tcp_accept(config, IpListenEndpoint { addr: None, port });
     spawner
@@ -165,6 +173,7 @@ fn arm_accept(
             port,
             config,
             ws,
+            startup_error,
         ))
         .map_err(spawn_error)
 }
@@ -178,15 +187,20 @@ async fn serve_accepted(
     port: u16,
     config: tcp::Config,
     ws: bool,
+    startup_error: Option<std::rc::Rc<std::cell::RefCell<Option<Error>>>>,
 ) {
     let stream = match accepting.await {
         Ok(stream) => stream,
         Err(error) => {
+            if let Some(startup_error) = startup_error {
+                *startup_error.borrow_mut() = Some(error);
+            }
             eprintln!("zhida-bench serve: tcp accept on {port}: {error:?}");
             return;
         }
     };
-    if let Err(e) = arm_accept(&spawner, handle.clone(), port, config, ws) {
+    drop(startup_error);
+    if let Err(e) = arm_accept(&spawner, handle.clone(), port, config, ws, None) {
         eprintln!("zhida-bench serve: {e}");
     }
     if ws {
@@ -249,6 +263,64 @@ async fn ws_echo(mut ws: Ws) {
 #[cfg(all(test, feature = "e2e"))]
 mod tests {
     use super::*;
+    #[test]
+    fn tcp_and_websocket_startup_failure_precedes_ready_banner() {
+        for proto in ["tcp", "ws"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "serve::tests::listen_startup_failure_child",
+                    "--ignored",
+                ])
+                .env("ZHIDA_BENCH_STARTUP_PROTO", proto)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{proto} startup child failed: {}\n{}\n{stderr}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+            );
+            assert!(
+                !stderr.contains("echo on port"),
+                "{proto} printed readiness after startup failure:\n{stderr}",
+            );
+        }
+    }
+
+    #[zhida_test_support::pinned_test]
+    #[ignore = "run in a separate process by tcp_and_websocket_startup_failure_precedes_ready_banner"]
+    fn listen_startup_failure_child() {
+        let proto = match std::env::var("ZHIDA_BENCH_STARTUP_PROTO").unwrap().as_str() {
+            "tcp" => Proto::Tcp,
+            "ws" => Proto::Ws,
+            other => panic!("unexpected protocol {other}"),
+        };
+        let dir = std::env::temp_dir().join(format!("zhida-bench-startup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dut.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "device": {"vdev": "net_tap_benchstart,iface=cdbenchstart"}, "mac": null,
+             "ipv4": "10.79.0.2/24", "gateway": null, "mtu": 1500, "paths": [], "offloads": "auto",
+             "rx_timestamps": false, "descriptors": 512,
+             "eal": {"file_prefix": "benchstart", "extra": ["--no-huge", "-m", "512", "--no-shconf"]}}"#,
+        ).unwrap();
+        host::catch_stop().unwrap();
+        // Bound the mutated path that ignores the error and enters the serving loop.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+        });
+        let result = run(&Args { config: path, proto, port: 0 });
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            matches!(&result, Err(error) if error.starts_with("tcp accept:")),
+            "invalid initial listen must return its error, got {result:?}",
+        );
+    }
+
 
     // Host::open initializes EAL once per process, so keep this host separate from the TCP test.
     #[test]
@@ -295,7 +367,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        arm_accept(&spawner, handle.clone(), PORT, tcp_config, true).unwrap();
+        arm_accept(&spawner, handle.clone(), PORT, tcp_config, true, None).unwrap();
         let peer = std::thread::spawn(|| {
             let stream = std::net::TcpStream::connect(("10.78.0.2", PORT)).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
@@ -363,7 +435,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        arm_accept(&spawner, handle.clone(), PORT, tcp_config, false).unwrap();
+        arm_accept(&spawner, handle.clone(), PORT, tcp_config, false, None).unwrap();
 
         let sent: Vec<u8> = (0..ROUNDS * (1460 + SMALL * 64))
             .map(|i| (i % 251) as u8)

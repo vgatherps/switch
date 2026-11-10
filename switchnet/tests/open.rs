@@ -74,6 +74,36 @@ fn failed_connect_start_releases_only_socket_slot() {
     });
 }
 
+#[zhida_test_support::pinned_test]
+fn accepting_error_is_ready_on_first_poll_and_releases_socket() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::with_sockets(eal, ["oaea", "oaeb"], 1, 1);
+        let failed = mixed.handle().tcp_accept(tcp_config(), local(0));
+        let slot = mixed.spawn(first_poll(failed));
+        mixed.rt.poll(0).unwrap();
+        assert!(matches!(slot.take(), Err(Error::Unaddressable)));
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+        let slot = mixed.spawn(accepting);
+        let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
+        mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
+        let stream = mixed.wait(&slot).expect("failed accept kept the only TCP slot");
+        drop((stream, peer));
+        mixed.close();
+    });
+}
+
+#[zhida_test_support::pinned_test]
+fn dropping_unpolled_binding_releases_udp_port() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::with_sockets(eal, ["odba", "odbb"], 1, 2);
+        let binding = mixed.handle().udp_bind(udp_config(7000));
+        drop(binding);
+        let socket = support::bind(&mut mixed, udp_config(7000));
+        drop(socket);
+        mixed.close();
+    });
+}
+
 fn assert_cached_mss_after_reset(mixed: &mut Mixed, stream: switchnet::TcpStream, peer: dpdk_smoltcp::TcpHandle) {
     let (mut rx, tx) = stream.split();
     assert_eq!(tx.max_segment_payload(), Some(700));

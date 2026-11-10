@@ -241,7 +241,8 @@ pub fn udp_config_at(addr: switchnet::Ipv4Address, port: u16) -> UdpConfig {
 
 pub fn bind(mixed: &mut Mixed, config: UdpConfig) -> switchnet::UdpSocket {
     let slot = mixed.spawn(mixed.handle().udp_bind(config));
-    mixed.wait(&slot).expect("bind UDP")
+    mixed.rt.poll(0).expect("poll local binding");
+    slot.take().expect("bind UDP")
 }
 
 /// Net connects from `port` to the peer's listener in a task; drives until

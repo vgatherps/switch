@@ -365,24 +365,22 @@ pub struct NetHandle {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    SocketsFull,
-    PortInUse,
-    InvalidConfig,
-    Unaddressable,
-    Refused,
-    Closed,
-    Reset,
-    Finished,
-    InvalidState,
-    TooLarge,
-    Full,
-    Empty,
-    Foreign,
-    NoDestination,
-    PeerMismatch,
-    NoRoute,
-    NeighborPending,
-    HostLost,
+    SocketsFull = 1,
+    PortInUse = 2,
+    InvalidConfig = 3,
+    Unaddressable = 4,
+    Refused = 5,
+    Closed = 6,
+    Finished = 7,
+    InvalidState = 8,
+    TooLarge = 9,
+    Full = 10,
+    Empty = 11,
+    Foreign = 12,
+    NoDestination = 13,
+    PeerMismatch = 14,
+    NoRoute = 15,
+    NeighborPending = 16,
 }
 
 impl std::fmt::Display for Error {
@@ -394,7 +392,6 @@ impl std::fmt::Display for Error {
             Self::Unaddressable => "unaddressable endpoint",
             Self::Refused => "connection refused",
             Self::Closed => "connection closed",
-            Self::Reset => "connection reset",
             Self::Finished => "receive finished",
             Self::InvalidState => "invalid socket state",
             Self::TooLarge => "payload too large",
@@ -405,7 +402,6 @@ impl std::fmt::Display for Error {
             Self::PeerMismatch => "destination differs from connected peer",
             Self::NoRoute => "no route",
             Self::NeighborPending => "neighbor resolution pending",
-            Self::HostLost => "network host lost",
         })
     }
 }
