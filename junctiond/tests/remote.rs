@@ -30,6 +30,18 @@ impl<T> Slot<T> {
     fn take(&self) -> T { self.0.borrow_mut().take().expect("task did not finish") }
 }
 
+struct CompletionGate {
+    allow: Rc<Cell<bool>>,
+    waker: Rc<RefCell<Option<Waker>>>,
+}
+
+impl CompletionGate {
+    fn release(self) {
+        self.allow.set(true);
+        self.waker.borrow().as_ref().unwrap().wake_by_ref();
+    }
+}
+
 fn local(port: u16) -> IpListenEndpoint { IpListenEndpoint { addr: None, port } }
 fn peer_endpoint(port: u16) -> IpEndpoint {
     IpEndpoint::new(switchnet::Ipv4Address::new(10, 0, 0, 2).into(), port)
@@ -53,6 +65,49 @@ impl Remote {
         let out = Rc::new(RefCell::new(None));
         self.rt.spawner().spawn(collect(future, out.clone())).unwrap();
         Slot(out)
+    }
+
+    fn spawn_gated<T: 'static>(
+        &self,
+        future: impl Future<Output = T> + Unpin + 'static,
+    ) -> (Slot<T>, CompletionGate) {
+        let gate = CompletionGate {
+            allow: Rc::new(Cell::new(false)),
+            waker: Rc::new(RefCell::new(None)),
+        };
+        let allow = gate.allow.clone();
+        let waker = gate.waker.clone();
+        let mut future = future;
+        let mut started = false;
+        let slot = self.spawn(std::future::poll_fn(move |cx| {
+            *waker.borrow_mut() = Some(cx.waker().clone());
+            if started && !allow.get() {
+                return Poll::Pending;
+            }
+            started = true;
+            std::pin::Pin::new(&mut future).poll(cx)
+        }));
+        (slot, gate)
+    }
+
+    fn fixture_until(&mut self, mut done: impl FnMut(&mut Fixture) -> bool) {
+        let deadline = WallInstant::now() + WAIT;
+        while !done(&mut self.fixture) {
+            assert!(WallInstant::now() < deadline, "fixture condition timed out");
+            if !self.fixture.round_links() { self.fixture.advance(); }
+        }
+    }
+
+    fn publish_without_net_turn(&mut self, peer: &TcpHandle, bytes: &[u8]) {
+        assert_eq!(self.fixture.peer.tcp_mut(peer).send_slice(bytes), Ok(bytes.len()));
+        // The ACK reaches the peer only after Network has serviced RX and published
+        // the payload. Deliberately do not turn Net or poll Runtime along this path.
+        self.fixture_until(|f| f.peer.tcp(peer).send_queue() == 0);
+    }
+
+    fn control_barrier(&mut self, port: u16) -> switchnet::UdpSocket {
+        let barrier = self.spawn(self.handle().udp_bind(udp_config(port)));
+        self.wait(&barrier).unwrap()
     }
 
     fn round(&mut self) {
@@ -535,6 +590,264 @@ fn remote_last_half_drop_resets_unread_data_without_losing_session() {
         let still_alive = m.spawn(m.handle().udp_bind(udp_config(7002)));
         let still_alive = m.wait(&still_alive).unwrap();
         drop((barrier, after_rx_drop, still_alive, peer));
+        m.close();
+    });
+}
+
+// Mutations loss_skips_ring_drain / loss_discards_published_tcp: return the
+// control failure before importing packets published since the last Net turn.
+#[zhida_test_support::pinned_test]
+fn remote_ring_data_published_before_session_loss_is_received_first() {
+    with_eal(|eal| {
+        let mut m = Remote::new(eal, ["rlqa", "rlqb"], 2);
+        let (stream, peer) = m.connect();
+        let (mut rx, mut tx) = stream.split();
+        m.publish_without_net_turn(&peer, b"before loss");
+        let session = m.fixture.streams[0];
+        m.fixture.terminate_session(session);
+        m.fixture.forward_abort(session);
+        // Host has dropped the Unix socket. A real control write records loss
+        // synchronously, without a successful Net turn draining the ring first.
+        tx.shutdown();
+        assert!(matches!(m.net.turn(m.fixture.now), Err(switchnet::TurnError::HostLost(_))));
+        let receiving = m.spawn(async move {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.payload(), b"before loss");
+            drop(frame);
+            rx.recv().await.unwrap_err()
+        });
+        m.rt.poll(0).unwrap();
+        assert_eq!(receiving.take(), Error::InvalidState);
+        drop((tx, peer));
+        m.close();
+    });
+}
+
+// Mutations last_drop_skips_ring_drain / close_only_checks_local_queue:
+// decide unread=false without collecting data published after the last turn.
+#[zhida_test_support::pinned_test]
+fn remote_last_half_drop_resets_bytes_still_in_host_ring() {
+    with_eal(|eal| {
+        let mut m = Remote::new(eal, ["rdqa", "rdqb"], 2);
+        let (stream, peer) = m.connect();
+        let (rx, tx) = stream.split();
+        m.publish_without_net_turn(&peer, b"unread ring");
+        drop(rx);
+        // One half must not close the connection, even with unread ring bytes.
+        for _ in 0..32 { m.fixture.round_links(); }
+        assert_eq!(m.fixture.peer.tcp(&peer).state(), tcp::State::Established);
+        assert!(!m.fixture.peer.tcp(&peer).reset_by_peer());
+        drop(tx);
+        // The last-half drop must detect the ring bytes without a Net turn.
+        m.fixture_until(|f| f.peer.tcp(&peer).reset_by_peer());
+        let still_alive = m.control_barrier(7000);
+        drop((still_alive, peer));
+        m.close();
+    });
+}
+
+fn closed_before_open_completion(eal: &Eal, accepting: bool, reset: bool, connected_first: bool) {
+    let mut m = Remote::new(eal, ["roca", "rocb"], 2);
+    m.fixture.hold_connected();
+    m.fixture.hold_closed();
+    let (opening, gate, peer) = if accepting {
+        let (opening, gate) = m.spawn_gated(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT)));
+        m.rt.poll(0).unwrap();
+        let peer = m.fixture.peer.add_tcp(peer_tcp_config()).unwrap();
+        m.fixture.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
+        (opening, gate, peer)
+    } else {
+        let peer = support::peer_listen(&mut m.fixture);
+        let (opening, gate) = m.spawn_gated(m.handle().tcp_connect(
+            peer_tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT),
+        ));
+        (opening, gate, peer)
+    };
+    m.until(|m| m.fixture.connected_is_held()
+        && m.fixture.peer.tcp(&peer).state() == tcp::State::Established);
+    assert!(!opening.ready());
+    m.publish_without_net_turn(&peer, b"before close");
+    if reset {
+        m.fixture.peer.abort(&peer);
+    } else {
+        // Peer FIN first puts the host in CloseWait, so its real shutdown
+        // completes via LastAck rather than waiting out TimeWait.
+        m.fixture.peer.close(&peer);
+        m.fixture_until(|f| f.peer.tcp(&peer).state() == tcp::State::FinWait2);
+        m.fixture.shutdown_held_tcp();
+    }
+    m.until(|m| m.fixture.closed_is_held());
+    assert_eq!(m.fixture.held_closed_reset(), reset);
+    assert!(!opening.ready());
+    if connected_first {
+        m.fixture.release_connected();
+    } else {
+        m.fixture.release_closed();
+    }
+    let first = m.control_barrier(7000);
+    assert!(!opening.ready(), "open completion must stay gated after the first event");
+    if connected_first {
+        m.fixture.release_closed();
+    } else {
+        m.fixture.release_connected();
+    }
+    let second = m.control_barrier(7001);
+    assert!(!opening.ready(), "both events must precede the final future poll");
+    gate.release();
+    let result = m.wait(&opening);
+    if accepting {
+        let (mut rx, tx) = result.expect("an accepted, already-closed stream is still returned").split();
+        assert_eq!(tx.max_segment_payload(), None);
+        let receiving = m.spawn(async move {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.payload(), b"before close");
+            drop(frame);
+            rx.recv().await.unwrap_err()
+        });
+        assert_eq!(m.wait(&receiving), if reset { Error::InvalidState } else { Error::Finished });
+        drop(tx);
+    } else {
+        assert!(matches!(result, Err(error) if error == if reset { Error::Refused } else { Error::Closed }));
+    }
+    drop((first, second, peer));
+    m.close();
+}
+
+// Mutations connect_uses_latched_connected / closed_before_connected_is_ignored:
+// complete an opening connect successfully after either terminal-event order.
+// Mutation connect_clean_closed_is_refused: lose the reset flag at completion.
+#[zhida_test_support::pinned_test]
+fn remote_connect_closed_before_completion_rechecks_both_event_orders() {
+    with_eal(|eal| {
+        for reset in [false, true] {
+            for connected_first in [false, true] {
+                closed_before_open_completion(eal, false, reset, connected_first);
+            }
+        }
+    });
+}
+
+// Mutations accept_closed_is_error / accept_closed_caches_mss / accept_closed_drops_rx:
+// reject the accepted stream, retain its MSS, or discard its queued bytes when
+// Closed and Connected both arrive before the opening future can complete.
+#[zhida_test_support::pinned_test]
+fn remote_accept_closed_before_completion_returns_readable_stream_without_mss() {
+    with_eal(|eal| {
+        for reset in [false, true] {
+            for connected_first in [false, true] {
+                closed_before_open_completion(eal, true, reset, connected_first);
+            }
+        }
+    });
+}
+
+// Mutations tcp_foreign_pool_accepted / udp_foreign_pool_accepted /
+// foreign_replaces_frame: accept another producer or return replacement storage.
+#[zhida_test_support::pinned_test]
+fn remote_tcp_and_udp_reject_other_remote_and_local_pool_frames_unchanged() {
+    with_eal(|eal| {
+        let mut m = Remote::new(eal, ["rfoa", "rfob"], 2);
+        let mut producer = Remote::new(eal, ["rfpa", "rfpb"], 2);
+        let (stream, peer) = m.connect();
+        let (rx, mut tx) = stream.split();
+        let bound = m.spawn(m.handle().udp_bind(udp_config(7000)));
+        let (udp_rx, mut udp_tx) = m.wait(&bound).unwrap().split();
+        let remote = producer.frame(b"foreign");
+        let mut local = m.fixture.peer.tx_frame().unwrap();
+        local[..7].copy_from_slice(b"foreign");
+        local.truncate(7);
+        for frame in [remote, local.freeze()] {
+            let ptr = frame.data_ptr();
+            let ctx = frame.ctx();
+            let (frame, error) = tx.try_send(frame).unwrap_err();
+            assert_eq!(error, Error::Foreign);
+            assert_eq!(frame.data_ptr(), ptr);
+            assert_eq!(frame.ctx(), ctx);
+            assert_eq!(&*frame, b"foreign");
+            let (frame, error) = udp_tx.send(Some(peer_endpoint(7001)), frame).unwrap_err();
+            assert_eq!(error, Error::Foreign);
+            assert_eq!(frame.data_ptr(), ptr);
+            assert_eq!(frame.ctx(), ctx);
+            assert_eq!(&*frame, b"foreign");
+        }
+        drop((rx, tx, udp_rx, udp_tx, peer));
+        producer.close();
+        m.close();
+    });
+}
+
+// Mutations tcp_empty_accepted / tcp_empty_commits_record / empty_replaces_frame:
+// allow an empty TCP write, commit it despite rejecting it, or replace its frame.
+// Mutation udp_empty_rejected: apply TCP's empty restriction to UDP datagrams.
+#[zhida_test_support::pinned_test]
+fn remote_empty_tcp_keeps_frame_and_fifo_room_while_empty_udp_is_delivered() {
+    with_eal(|eal| {
+        let mut m = Remote::new(eal, ["rema", "remb"], 2);
+        let (stream, peer) = m.connect();
+        let (rx, mut tx) = stream.split();
+        let mut empty = m.frame(b"");
+        let frame = m.frame(b"after empty");
+        let ptr = empty.data_ptr();
+        let ctx = empty.ctx();
+        // More zero-payload records than the ingress ring can hold, without
+        // any host turns: rejecting Empty must never consume FIFO space.
+        for _ in 0..4096 {
+            let (returned, error) = tx.try_send(empty).unwrap_err();
+            assert_eq!(error, Error::Empty);
+            assert_eq!(returned.data_ptr(), ptr);
+            assert_eq!(returned.ctx(), ctx);
+            assert!(returned.is_empty());
+            empty = returned;
+        }
+        tx.try_send(frame).expect("empty TCP attempts must not fill the FIFO");
+        let mut received = Vec::new();
+        m.until(|m| {
+            while let Ok(Some(frame)) = m.fixture.peer.tcp_mut(&peer).recv() {
+                received.extend_from_slice(frame.payload());
+            }
+            received.len() == 11
+        });
+        assert_eq!(received, b"after empty");
+        let bound = m.spawn(m.handle().udp_bind(udp_config(7000)));
+        let (udp_rx, mut udp_tx) = m.wait(&bound).unwrap().split();
+        let udp_peer = m.fixture.peer.add_udp(udp_config(7001)).unwrap();
+        udp_tx.send(Some(peer_endpoint(7001)), empty).unwrap();
+        let mut datagram = None;
+        m.until(|m| { datagram = m.fixture.peer.udp_mut(&udp_peer).recv(); datagram.is_some() });
+        let datagram = datagram.unwrap();
+        assert!(datagram.payload().is_empty());
+        assert_eq!(datagram.src(), IpEndpoint::new(net_ip().into(), 7000));
+        drop((datagram, rx, tx, udp_rx, udp_tx, udp_peer, peer));
+        m.close();
+    });
+}
+
+// Mutations connect_reset_is_closed / tcp_slots_full_wrong_error: erase the
+// actual RST/refusal distinction or mistranslate the host TCP rejection.
+#[zhida_test_support::pinned_test]
+fn remote_real_refusal_and_tcp_slot_exhaustion_map_to_distinct_errors() {
+    with_eal(|eal| {
+        let mut m = Remote::new(eal, ["rrea", "rreb"], 2);
+        // No listener exists at the peer: its real TCP stack answers SYN with RST.
+        let refused = m.spawn(m.handle().tcp_connect(
+            peer_tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT),
+        ));
+        assert!(matches!(m.wait(&refused), Err(Error::Refused)));
+        m.close();
+        let mut m = Remote::new(eal, ["rtea", "rteb"], 2);
+        let mut occupied = Vec::new();
+        for port in 0..4 {
+            let accepting = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT + port)));
+            m.rt.poll(0).unwrap();
+            occupied.push(accepting);
+        }
+        // Bound is generated after the four accepts, proving the host has
+        // processed them; Session still has ample free client-side slots.
+        let barrier = m.control_barrier(7000);
+        assert!(occupied.iter().all(|slot| !slot.ready()));
+        let rejected = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT + 4)));
+        assert!(matches!(m.wait(&rejected), Err(Error::SocketsFull)));
+        drop((barrier, occupied));
         m.close();
     });
 }

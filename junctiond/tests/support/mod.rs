@@ -78,6 +78,8 @@ pub struct Fixture {
     pub released: Vec<u64>,
     hold_connected: bool,
     held_connected: Vec<FromNetwork>,
+    hold_closed: bool,
+    held_closed: Vec<FromNetwork>,
     pub closed_events: usize,
     network_events: Receiver<FromNetwork>,
     forward_events: Sender<FromNetwork>,
@@ -325,6 +327,8 @@ impl Fixture {
             released: Vec::new(),
             hold_connected: false,
             held_connected: Vec::new(),
+            hold_closed: false,
+            held_closed: Vec::new(),
             closed_events: 0,
             network_events,
             protocol_errors: Vec::new(),
@@ -545,6 +549,12 @@ impl Fixture {
                 self.held_connected.push(message);
                 continue;
             }
+            if self.hold_closed
+                && matches!(&message, FromNetwork::Event { event: Event::Closed { .. }, .. })
+            {
+                self.held_closed.push(message);
+                continue;
+            }
             self.forward_events.send(message).unwrap();
         }
     }
@@ -563,6 +573,44 @@ impl Fixture {
 
     pub fn connected_is_held(&self) -> bool {
         !self.held_connected.is_empty()
+    }
+
+    /// Delay real terminal events without delaying packet publication.
+    pub fn hold_closed(&mut self) {
+        self.hold_closed = true;
+    }
+
+    pub fn closed_is_held(&self) -> bool {
+        !self.held_closed.is_empty()
+    }
+
+    pub fn held_closed_reset(&self) -> bool {
+        let FromNetwork::Event { event: Event::Closed { reset_by_peer }, .. } =
+            self.held_closed.first().expect("no held Closed event")
+        else {
+            unreachable!()
+        };
+        *reset_by_peer
+    }
+
+    pub fn release_closed(&mut self) {
+        self.hold_closed = false;
+        for message in self.held_closed.drain(..) {
+            self.forward_events.send(message).unwrap();
+        }
+    }
+
+    /// Half-close the real host socket while its opening future remains parked.
+    pub fn shutdown_held_tcp(&self) {
+        let FromNetwork::Event { session, id, event: Event::Connected { .. } } =
+            self.held_connected.first().expect("no held Connected event")
+        else {
+            unreachable!()
+        };
+        self.forward.send(ToNetwork::Op {
+            session: *session,
+            op: Op::ShutdownTcp { id: *id },
+        }).unwrap();
     }
 
     /// Exercise the host's real terminal End and connection removal path.

@@ -17,6 +17,8 @@ Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md), the DPDK-
 - Re-exports: `Stack`, `Turn`, `StackError`, `UdpConfig`, `UdpSocketStats`, netframe's `OwnedFrame` and `ImmutableFrame`, `Instant`, the `tcp` module and address types. Socket operations use `Error`, not conduit's error types; `RoundError`, `StackError` and `Turn` remain loop-owner types. `tx_frame().await` yields an `OwnedFrame` covering the full payload room; fill it through its mutable slice, `truncate(n)`, then `freeze()` for `TcpTx::try_send` or `UdpTx::send`.
 - Remote sends copy once into the session stream. `send_capacity` is `max_record - 16`; `room(len)` rejects larger lengths, otherwise resolves unless the stream last returned `Full`, in which case the next turn wakes it for a retry. `Full`/`TooLarge`/`InvalidState` return the original frame; UDP requires a destination (`NoDestination`). The client pool has `tx_frames` buffers of the host's advertised frame capacity. Remote UDP stats exclude host-side drops (currently no client-visible drops).
 - `Error::HostLost = 17` reports session loss to pending and later opens. Established TCP receive drains queued data then returns `InvalidState`; TCP room and TCP/UDP send return `InvalidState`. `tx_frame` remains usable because its storage is local; UDP receive remains parked without new datagrams. `Net::turn` returns `TurnError::{Stack(StackError), HostLost(junction::session::Lost)}`; `round` wraps that in `RoundError::Turn`.
+- Remote TCP/UDP sends reject frames from another pool with `Foreign` before socket-state checks. Empty TCP frames return `Empty`; empty UDP datagrams remain valid.
+- Remote receive drains already-published ring records before reporting session loss or deciding whether the last socket half closes with unread data. Receive-queue storage is retained across socket reuse.
 
 ## Constraints
 
@@ -24,6 +26,8 @@ Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md), the DPDK-
 - One task may wait per socket half (`recv` and `room` take `&mut`).
 - Futures must be polled by `switch` tasks: parking stores a `switch::StoredWaker`.
 - Received frames stay valid after the socket, `Net` and `Stack` are gone. `TcpFrame::into_frame()` and `Datagram::into_frame()` transfer their payload to `netframe::OwnedFrame`; save metadata first if needed. Freeze to clone without copying. The RX mbuf and held count (UDP: one `rx_queue` credit) remain held until the last clone drops; TCP's receive window is unchanged.
+- Remote UDP receive limits are enforced per socket on the host and bounded by the session ring on the client; the client has no per-socket receive credit.
+- Remote host-side UDP send errors after commit (`NoRoute`, `NeighborPending`, `Unaddressable`) are dropped by the host, not returned to the sender.
 
 ## Build and test
 

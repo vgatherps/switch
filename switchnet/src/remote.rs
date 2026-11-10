@@ -28,10 +28,20 @@ struct Entry {
     shut: bool,
     delivered: bool,
 }
+impl Entry {
+    fn new(id: SocketId) -> Self {
+        Self {
+            id, halves: 0, parked: [None; 2], opened: None,
+            packets: VecDeque::new(), fin: false, closed: false, reset: false,
+            shut: false, delivered: false,
+        }
+    }
+}
+
 
 pub(super) struct Remote {
     pub session: Session,
-    entries: Vec<Option<Entry>>,
+    entries: Vec<Entry>,
     by_slot: Vec<Option<u32>>,
     free: Vec<u32>,
     pool: Rc<FramePool>,
@@ -47,7 +57,7 @@ impl Remote {
         let pool = FramePool::new(config.tx_frames, session.frame_capacity());
         Self {
             session,
-            entries: (0..slots).map(|_| None).collect(),
+            entries: (0..slots).map(|_| Entry::new(SocketId { slot: 0, generation: 0 })).collect(),
             by_slot: vec![None; slots],
             free: (0..slots as u32).rev().collect(),
             pool,
@@ -60,24 +70,24 @@ impl Remote {
 
     fn insert(&mut self, id: SocketId) -> u32 {
         let index = self.free.pop().unwrap_or_else(|| {
-            self.entries.push(None);
+            self.entries.push(Entry::new(id));
             (self.entries.len() - 1) as u32
         });
         self.by_slot[id.slot as usize] = Some(index);
-        self.entries[index as usize] = Some(Entry {
-            id, halves: 2, parked: [None; 2], opened: None,
-            packets: VecDeque::new(), fin: false, closed: false, reset: false,
-            shut: false, delivered: false,
-        });
+        let entry = &mut self.entries[index as usize];
+        let packets = std::mem::take(&mut entry.packets);
+        *entry = Entry::new(id);
+        entry.packets = packets;
+        entry.halves = 2;
         index
     }
 
     fn entry(&self, index: u32) -> &Entry {
-        self.entries[index as usize].as_ref().expect("live socket entry")
+        &self.entries[index as usize]
     }
 
     fn entry_mut(&mut self, index: u32) -> &mut Entry {
-        self.entries[index as usize].as_mut().expect("live socket entry")
+        &mut self.entries[index as usize]
     }
 
     pub fn connect(&mut self, config: tcp::Config, remote: IpEndpoint, local: IpListenEndpoint) -> Result<u32, Error> {
@@ -104,12 +114,19 @@ impl Remote {
         Ok(self.insert(id))
     }
 
-    pub fn opened(&self, index: u32) -> Option<Result<Option<usize>, Error>> {
-        if self.lost { Some(Err(Error::HostLost)) } else { self.entry(index).opened }
+    pub fn opened(&self, index: u32, accepting: bool) -> Option<Result<Option<usize>, Error>> {
+        if self.lost { return Some(Err(Error::HostLost)); }
+        let entry = self.entry(index);
+        if let Some(Err(error)) = entry.opened { return Some(Err(error)); }
+        if entry.closed {
+            Some(if accepting { Ok(None) } else {
+                Err(if entry.reset { Error::Refused } else { Error::Closed })
+            })
+        } else { entry.opened }
     }
 
     pub fn bound(&self, index: u32) -> Option<Result<(), Error>> {
-        self.opened(index).map(|result| result.map(|_| ()))
+        self.opened(index, false).map(|result| result.map(|_| ()))
     }
 
     pub fn park(&mut self, index: u32, interest: Interest, cx: &Context<'_>) {
@@ -125,16 +142,25 @@ impl Remote {
         entry.parked[side] = None;
         entry.halves -= 1;
         if entry.halves == 0 {
-            let entry = self.entries[index as usize].take().expect("last half owns entry");
+            self.drain_packets();
+            let entry = &self.entries[index as usize];
             self.free.push(index);
             let registered = self.by_slot[entry.id.slot as usize] == Some(index);
             if registered {
                 self.by_slot[entry.id.slot as usize] = None;
             }
             if !self.lost && registered {
+                // Data published after this drain can still race the host applying Close.
                 self.session.close(entry.id, !entry.packets.is_empty());
             }
+            self.entries[index as usize].packets.clear();
         }
+    }
+
+    fn drain_packets(&mut self) {
+        let entries = &mut self.entries;
+        let by_slot = &self.by_slot;
+        self.session.poll_packets(|id, meta, frame| { route_packet(entries, by_slot, id, meta, frame); });
     }
 
     pub fn turn(&mut self) -> Result<Turn, Lost> {
@@ -148,7 +174,7 @@ impl Remote {
                 let mut entries = entries.borrow_mut();
                 let mut by_slot = by_slot.borrow_mut();
                 let Some(index) = by_slot[id.slot as usize] else { return };
-                let Some(entry) = &mut entries[index as usize] else { return };
+                let entry = &mut entries[index as usize];
                 if entry.id != id { return; }
                 match event {
                     Event::Connected { mss } => entry.opened = Some(Ok(Some(usize::from(mss)))),
@@ -163,31 +189,21 @@ impl Remote {
                     Event::Closed { reset_by_peer } => {
                         entry.closed = true;
                         entry.reset |= reset_by_peer;
-                        if entry.opened.is_none() {
-                            entry.opened = Some(Err(if reset_by_peer { Error::Refused } else { Error::Closed }));
-                        }
                     }
                     Event::Freed => {}
                 }
             },
             |id, meta, frame| {
-                let mut entries = entries.borrow_mut();
-                let Some(index) = by_slot.borrow()[id.slot as usize] else { return };
-                if let Some(entry) = &mut entries[index as usize]
-                    && entry.id == id
-                {
-                    packets += 1;
-                    entry.packets.push_back((meta, frame));
-                }
+                packets += usize::from(route_packet(&mut entries.borrow_mut(), &by_slot.borrow(), id, meta, frame));
             },
         ) };
         self.lost |= result.is_err();
         self.full = false;
-        for entry in self.entries.iter_mut().flatten() {
+        for entry in self.entries.iter_mut().filter(|entry| entry.halves != 0) {
             for side in 0..2 {
                 let Some((waker, interest)) = entry.parked[side] else { continue };
                 let ready = match interest {
-                    Interest::Connect | Interest::Accept | Interest::Bind => self.lost || entry.opened.is_some(),
+                    Interest::Connect | Interest::Accept | Interest::Bind => self.lost || entry.closed || entry.opened.is_some(),
                     Interest::TcpRecv => self.lost || !entry.packets.is_empty() || entry.fin || entry.closed,
                     Interest::UdpRecv => !entry.packets.is_empty(),
                     Interest::TcpRoom(_) => true,
@@ -234,13 +250,16 @@ impl Remote {
     }
 
     pub fn send_tcp(&mut self, index: u32, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
+        if frame.ctx() != Rc::as_ptr(&self.pool).cast_mut().cast() { return Err((frame, Error::Foreign)); }
         let entry = self.entry(index);
         if self.lost || entry.closed || entry.shut { return Err((frame, Error::InvalidState)); }
+        if frame.is_empty() { return Err((frame, Error::Empty)); }
         let result = self.session.send_tcp(entry.id, &frame);
         self.sent(result, frame)
     }
 
     pub fn send_udp(&mut self, index: u32, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
+        if frame.ctx() != Rc::as_ptr(&self.pool).cast_mut().cast() { return Err((frame, Error::Foreign)); }
         let entry = self.entry(index);
         if self.lost || entry.closed { return Err((frame, Error::InvalidState)); }
         let Some(to) = to else { return Err((frame, Error::NoDestination)); };
@@ -278,7 +297,7 @@ impl Remote {
 
     #[cfg(feature = "testkit")]
     pub fn reset_by_peer(&self) -> bool {
-        self.entries.iter().flatten().any(|entry| entry.reset)
+        self.entries.iter().any(|entry| entry.halves != 0 && entry.reset)
     }
 
     pub fn tx_frame(&mut self, cx: &Context<'_>) -> Poll<OwnedFrame> {
@@ -287,6 +306,14 @@ impl Remote {
         if !self.frame_waiters.contains(&waker) { self.frame_waiters.push(waker); }
         Poll::Pending
     }
+}
+
+fn route_packet(entries: &mut [Entry], by_slot: &[Option<u32>], id: SocketId, meta: PacketMeta, frame: OwnedFrame) -> bool {
+    let Some(index) = by_slot[id.slot as usize] else { return false };
+    let entry = &mut entries[index as usize];
+    if entry.id != id { return false; }
+    entry.packets.push_back((meta, frame));
+    true
 }
 
 fn tcp_config(config: tcp::Config) -> Result<control::TcpConfig, Error> {

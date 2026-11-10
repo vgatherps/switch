@@ -1178,6 +1178,72 @@ fn poll_discards_packets_for_aborted_socket_generation_after_reopen() {
 }
 
 #[test]
+fn poll_drains_all_packets_before_returning_disconnected() {
+    let mut host = Host::new(1, 1);
+    let (mut client, session) = host.open(1);
+    let id = client.listen_tcp(tcp(), local()).unwrap();
+    assert!(matches!(host.op(session), Op::ListenTcp { .. }));
+    let mut writer = host.take_rx(session);
+    let payloads = [b"first".as_slice(), b"second".as_slice()];
+    for payload in payloads {
+        let mut record = writer
+            .reserve(
+                payload.len(),
+                junction::rx::PacketMeta::new(
+                    id.slot,
+                    id.generation,
+                    junction::rx::TCP,
+                    [0; 4],
+                    0,
+                    [0; 4],
+                    0,
+                ),
+            )
+            .unwrap();
+        record.payload().copy_from_slice(payload);
+        record.commit();
+    }
+    host.stop();
+    // Observe EOF without touching RX so the next poll deterministically sees loss.
+    until(|| match client.poll_events(|_, _| panic!("unexpected control event")) {
+        Ok(()) | Err(Lost::Ended(EndReason::HostShutdown)) => false,
+        Err(Lost::Disconnected) => true,
+        other => panic!("unexpected session result: {other:?}"),
+    });
+
+    let mut packets = Vec::new();
+    let result = client.poll(
+        |_, _| panic!("unexpected control event"),
+        |actual, _, frame| packets.push((actual, frame.to_vec())),
+    );
+    // Mutation `poll_returns_early_on_control_loss`: neither callback runs.
+    assert!(matches!(result, Err(Lost::Disconnected)));
+    assert_eq!(packets, payloads.map(|payload| (id, payload.to_vec())));
+    client.poll_packets(|_, _, _| panic!("packet was delivered twice"));
+
+    // Packet-only polling remains usable after control loss.
+    let mut record = writer
+        .reserve(
+            5,
+            junction::rx::PacketMeta::new(
+                id.slot,
+                id.generation,
+                junction::rx::TCP,
+                [0; 4],
+                0,
+                [0; 4],
+                0,
+            ),
+        )
+        .unwrap();
+    record.payload().copy_from_slice(b"third");
+    record.commit();
+    packets.clear();
+    client.poll_packets(|actual, _, frame| packets.push((actual, frame.to_vec())));
+    assert_eq!(packets, [(id, b"third".to_vec())]);
+}
+
+#[test]
 fn connect_tcp_rejects_zero_tx_capacity_before_allocating_slot() {
     let host = Host::new(1, 1);
     let (mut client, session) = host.open(1);

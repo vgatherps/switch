@@ -575,12 +575,24 @@ impl Session {
     /// Packets for freed sockets or earlier socket generations are discarded.
     /// A callback may retain its owned frame; that storage becomes reusable only
     /// after the frame is dropped and a poll reclaims it.
+    /// Even when control polling reports session loss, all available packets are
+    /// drained and reclaimed before that error is returned.
     pub fn poll(
         &mut self,
         on_event: impl FnMut(SocketId, Event),
-        mut on_packet: impl FnMut(SocketId, PacketMeta, OwnedFrame),
+        on_packet: impl FnMut(SocketId, PacketMeta, OwnedFrame),
     ) -> Result<(), Lost> {
-        self.poll_events(on_event)?;
+        let result = self.poll_events(on_event);
+        self.poll_packets(on_packet);
+        result
+    }
+
+    /// Drains available received packets without polling control events or
+    /// flushing pending control output, including after session loss.
+    ///
+    /// Packets for freed sockets or earlier generations are discarded. Retained
+    /// frames become reusable after they are dropped and a later drain reclaims them.
+    pub fn poll_packets(&mut self, mut on_packet: impl FnMut(SocketId, PacketMeta, OwnedFrame)) {
         while let Some((meta, frame)) = self.rx.next() {
             let id = SocketId {
                 slot: meta.slot,
@@ -595,7 +607,6 @@ impl Session {
             }
         }
         self.rx.reclaim();
-        Ok(())
     }
 
     fn event(&mut self, id: SocketId, event: Event) -> Result<(), Lost> {

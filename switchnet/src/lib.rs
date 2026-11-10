@@ -788,7 +788,7 @@ impl Future for Connecting {
         let state = poll_op(&half.shared, index, Interest::Connect, cx, |inner| {
             let Inner::Local(inner) = inner else {
                 let Inner::Remote(remote) = inner else { unreachable!() };
-                return remote.opened(index);
+                return remote.opened(index, false);
             };
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
@@ -830,7 +830,7 @@ impl Future for Accepting {
         let state = poll_op(&half.shared, index, Interest::Accept, cx, |inner| {
             let Inner::Local(inner) = inner else {
                 let Inner::Remote(remote) = inner else { unreachable!() };
-                return remote.opened(index);
+                return remote.opened(index, true);
             };
             let (stack, handle) = inner.tcp(index);
             let socket = stack.tcp(handle);
