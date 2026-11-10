@@ -105,7 +105,7 @@ fn open_gateway_silent_fails_after_3s() {
     let mut clock = || {
         Instant::from_micros(i64::try_from(started.elapsed().as_micros()).unwrap())
     };
-    let result = unsafe { open(&config, &common::sizing(), &mut clock) };
+    let result = unsafe { open(&config, &common::sizing(), None, &mut clock) };
     thread::sleep(WallDuration::from_millis(200));
     stop.store(true, Ordering::Release);
     let requests = counter.join().unwrap();

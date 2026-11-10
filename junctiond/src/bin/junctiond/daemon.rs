@@ -164,8 +164,10 @@ pub fn run(args: Args) -> Result<(), String> {
     };
     let origin = WallInstant::now();
     let mut now = || Instant::from_micros(origin.elapsed().as_micros() as i64);
+    let helper_cpus: Vec<_> = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &args.control_cpus) }).collect();
     // SAFETY: the main thread alone owns the port, Stack and packets; EAL outlives them.
-    let opened = unsafe { zhida_open::open(&config, &sizing, &mut now) }
+    let opened = unsafe { zhida_open::open(&config, &sizing, Some(&helper_cpus), &mut now) }
         .map_err(|error| format!("open: {error}"))?;
     let _eal = opened.eal;
     let fifo = Fifo::new(reader, args.max_sessions, fifo_control, retire);

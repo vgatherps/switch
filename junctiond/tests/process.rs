@@ -21,6 +21,7 @@ struct Daemon {
     log: PathBuf,
     iface: String,
     cpu: String,
+    control_cpus: String,
     child: Option<Child>,
 }
 
@@ -41,7 +42,8 @@ impl Daemon {
         }}"#)).unwrap();
         let cpu = unsafe { libc::sched_getcpu() };
         assert!(cpu >= 0);
-        Self { log: root.join("daemon.log"), root, dir, config, iface, cpu: cpu.to_string(), child: None }
+        Self { log: root.join("daemon.log"), root, dir, config, iface,
+            cpu: cpu.to_string(), control_cpus: cpu.to_string(), child: None }
     }
 
     fn command(&self) -> Command {
@@ -49,7 +51,7 @@ impl Daemon {
         command.args(["-c", &self.cpu, env!("CARGO_BIN_EXE_junctiond"), "--config"])
             .arg(&self.config).arg("--dir").arg(&self.dir)
             .args(["--rx-size", "65536", "--max-sessions", "4", "--max-sockets", "8",
-                "--tcp-sockets", "8", "--udp-sockets", "8", "--control-cpus", &self.cpu]);
+                "--tcp-sockets", "8", "--udp-sockets", "8", "--control-cpus", &self.control_cpus]);
         command
     }
 
@@ -270,4 +272,40 @@ fn usage_is_printed_for_parse_errors_but_not_runtime_failures() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("nic.json"), "{stderr}");
     assert!(!stderr.contains("usage: junctiond"), "{stderr}");
+}
+
+#[test]
+fn explicit_control_cpu_keeps_every_helper_off_the_network_cpu() {
+    let allowed = fs::read_to_string("/proc/self/status").unwrap();
+    let allowed = allowed.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:")).unwrap();
+    let mut cpus = Vec::new();
+    for item in allowed.trim().split(',') {
+        let (first, last) = item.split_once('-').unwrap_or((item, item));
+        cpus.extend(first.parse::<usize>().unwrap()..=last.parse::<usize>().unwrap());
+    }
+    if !cpus.contains(&0) || !cpus.contains(&2) {
+        eprintln!("SKIP: helper affinity process test needs allowed CPUs 0 and 2");
+        return;
+    }
+    let mut daemon = Daemon::new();
+    daemon.cpu = "0".into();
+    daemon.control_cpus = "2".into();
+    let mut session = daemon.start();
+    let pid = daemon.child.as_ref().unwrap().id();
+    let mut helpers = Vec::new();
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let task = task.unwrap();
+        let tid = task.file_name().to_str().unwrap().parse::<u32>().unwrap();
+        let comm = fs::read_to_string(task.path().join("comm")).unwrap();
+        let status = fs::read_to_string(task.path().join("status")).unwrap();
+        let cpus = status.lines().find_map(|line| line.strip_prefix("Cpus_allowed_list:")).unwrap().trim();
+        let expected = if tid == pid { "0" } else { "2" };
+        assert_eq!(cpus, expected, "thread {tid} ({}) affinity", comm.trim());
+        if tid != pid {
+            helpers.push(comm.trim().to_owned());
+        }
+    }
+    assert!(helpers.iter().any(|name| name == "dpdk-intr"), "missing DPDK interrupt thread: {helpers:?}");
+    assert!(helpers.iter().any(|name| name == "junction-contro"), "missing control thread: {helpers:?}");
+    daemon.shutdown(&mut session);
 }

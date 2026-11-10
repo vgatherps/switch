@@ -10,7 +10,7 @@ fn stack_new_failure_returns_port() {
     let config = common::config("net_tap_o3_stack_fail", "cdo3_sfail", common::EXPLICIT_NONE, false);
     let mut sizing = common::sizing();
     sizing.max_sockets = 0;
-    let error = match unsafe { open(&config, &sizing, &mut || Instant::ZERO) } {
+    let error = match unsafe { open(&config, &sizing, None, &mut || Instant::ZERO) } {
         Err(error) => error,
         Ok(_) => panic!("open unexpectedly accepted zero max_sockets"),
     };

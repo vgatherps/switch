@@ -138,7 +138,7 @@ fn run(args: Args) -> i32 {
     // owns its queue pair and all packets. The selected PMD must honor Port's
     // mbuf contract and return its DMA/packet ownership at close. EAL never
     // deinitializes, so it outlives the Port.
-    let opened = match unsafe { open(&config, &sizing, &mut || clock.now()) } {
+    let opened = match unsafe { open(&config, &sizing, None, &mut || clock.now()) } {
         Ok(opened) => opened,
         Err(OpenError::PortOpen(error)) => {
             line("port_open_error", error.cause);

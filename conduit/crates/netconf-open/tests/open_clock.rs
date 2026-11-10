@@ -15,7 +15,7 @@ fn turn_after_open_continues_caller_clock() {
         tick.set(tick.get() + 1);
         Instant::from_millis(tick.get())
     };
-    let mut opened = unsafe { open(&config, &common::sizing(), &mut clock) }.unwrap();
+    let mut opened = unsafe { open(&config, &common::sizing(), None, &mut clock) }.unwrap();
     let opened_at = Instant::from_millis(tick.get());
     match opened.stack.turn(Instant::from_millis(500), 32) {
         Err(StackError::TimeWentBackwards { last, now }) => {

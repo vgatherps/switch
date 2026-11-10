@@ -30,7 +30,21 @@ fn set_affinity(set: &libc::cpu_set_t) -> io::Result<()> {
     }
 }
 
-pub(crate) fn init(cpu: usize, args: &[&str]) -> Result<Eal, OpenError> {
+pub(crate) fn init(cpu: usize, args: &[&str], helper_cpus: Option<&[usize]>) -> Result<Eal, OpenError> {
+    if let Some(cpus) = helper_cpus {
+        if cpus.is_empty() || cpus.iter().any(|cpu| *cpu >= libc::CPU_SETSIZE as usize) {
+            return Err(OpenError::HelperAffinity(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EAL helper CPUs must be nonempty and below CPU_SETSIZE",
+            )));
+        }
+        let mut expanded = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_SET(cpu, &mut expanded) };
+        for &helper in cpus {
+            unsafe { libc::CPU_SET(helper, &mut expanded) };
+        }
+        return init_with_affinity(cpu, args, &expanded);
+    }
     let isolated = match fs::read_to_string("/sys/devices/system/cpu/isolated") {
         Ok(text) => cpu_list(&text).map_err(OpenError::HelperAffinity)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -62,7 +76,13 @@ fn init_with_housekeeping(
         }
     }
     // Include the polling CPU, so a one-CPU cgroup still has a valid mask.
-    set_affinity(&expanded).map_err(OpenError::HelperAffinity)?;
+    init_with_affinity(cpu, args, &expanded)
+}
+
+fn init_with_affinity(cpu: usize, args: &[&str], expanded: &libc::cpu_set_t) -> Result<Eal, OpenError> {
+    let mut polling = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_SET(cpu, &mut polling) };
+    set_affinity(expanded).map_err(OpenError::HelperAffinity)?;
     let result = Eal::init(args);
     // EAL pins its main lcore on success; also restore on every error path.
     match (result, set_affinity(&polling)) {

@@ -8,7 +8,7 @@ use dpdk_smoltcp::Offloads;
 #[zhida_test_support::pinned_test]
 fn open_auto_on_net_tap_requests_none_and_reports_why() {
     let config = common::config("net_tap_o3_auto", "cdo3_auto", r#""auto""#, false);
-    let opened = unsafe { open(&config, &common::sizing(), &mut || Instant::ZERO) }.unwrap();
+    let opened = unsafe { open(&config, &common::sizing(), None, &mut || Instant::ZERO) }.unwrap();
     assert_eq!(opened.report.offloads.offloads, Offloads::default());
     assert!(opened
         .report

@@ -23,7 +23,7 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
     };
     let start = std::time::Instant::now();
     let mut clock = || Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
-    let opened = unsafe { zhida_open::open(&config, &sizing, &mut clock) }?;
+    let opened = unsafe { zhida_open::open(&config, &sizing, None, &mut clock) }?;
     println!("{}", opened.report);
     let (mut stack, _eal) = (opened.stack, opened.eal);
     let handle = stack.add_tcp(tcp_config)?;

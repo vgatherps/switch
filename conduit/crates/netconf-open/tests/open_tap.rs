@@ -124,7 +124,7 @@ fn open_vdev_tap_config_reaches_running_stack() {
     // SAFETY: EAL creates this private net_tap vdev; this worker owns it and its
     // packets, and the vdev lives for the process lifetime.
     let mut opened = unsafe {
-        open(&config, &common::sizing(), &mut || {
+        open(&config, &common::sizing(), None, &mut || {
             now += 1;
             Instant::from_millis(now)
         })

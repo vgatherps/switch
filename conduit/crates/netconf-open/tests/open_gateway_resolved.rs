@@ -60,7 +60,7 @@ fn open_resolves_tap_kernel_gateway() {
     let mut clock = || {
         Instant::from_micros(i64::try_from(started.elapsed().as_micros()).unwrap())
     };
-    let opened = unsafe { open(&config, &common::sizing(), &mut clock) }.unwrap();
+    let opened = unsafe { open(&config, &common::sizing(), None, &mut clock) }.unwrap();
     setup.join().unwrap();
     let kernel_mac = kernel_mac(iface);
     let Some((gateway, mac, waited)) = opened.report.gateway else {

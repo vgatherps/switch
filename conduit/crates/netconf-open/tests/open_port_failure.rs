@@ -16,7 +16,7 @@ fn port_open_failure_keeps_retained_port() {
         common::EXPLICIT_NONE,
         true,
     );
-    let error = match unsafe { open(&config, &common::sizing(), &mut || Instant::ZERO) } {
+    let error = match unsafe { open(&config, &common::sizing(), None, &mut || Instant::ZERO) } {
         Err(error) => error,
         Ok(_) => panic!("open unexpectedly accepted RX timestamps"),
     };

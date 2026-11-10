@@ -58,7 +58,7 @@ fn open_owns_the_configured_owned_ipv4() {
     });
     // SAFETY: EAL creates this private net_tap vdev; this worker owns it and its packets, and the
     // vdev lives for the process lifetime.
-    let mut opened = unsafe { open(&config, &common::sizing(), &mut || clock()) }.unwrap();
+    let mut opened = unsafe { open(&config, &common::sizing(), None, &mut || clock()) }.unwrap();
     setup.join().unwrap();
     // A datagram to each address makes the kernel ARP for it; the Stack is turned meanwhile.
     let socket = UdpSocket::bind("192.0.2.1:0").unwrap();

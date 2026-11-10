@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // every packet, and EAL (`_eal` below) lives until the process exits.
     // An error drops the Port it carries; crates/nic-runner/src/main.rs shows how
     // to close it instead.
-    let opened = unsafe { open(&config, &sizing, &mut clock) }?;
+    let opened = unsafe { open(&config, &sizing, None, &mut clock) }?;
     println!("{}", opened.report);
     let _eal = opened.eal;
     let mut stack = opened.stack;

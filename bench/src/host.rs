@@ -131,7 +131,7 @@ impl Host {
         let clock = Clock::new();
         // SAFETY: EAL creates the configured device; this thread alone uses the Port and its
         // packets; EAL is kept in the Host and outlives the Port, which `close` closes first.
-        let opened = unsafe { open(config, sizing, &mut || clock.stack_now(clock.now_ns())) }
+        let opened = unsafe { open(config, sizing, None, &mut || clock.stack_now(clock.now_ns())) }
             .map_err(|e| format!("open: {e}"))?;
         let net = Net::new(
             opened.stack,

@@ -36,7 +36,7 @@ fn open_rejects_unpinned_process() {
     );
 
     let config = common::config("net_tap_o3_unpinned", "cdo3_unpin", common::EXPLICIT_NONE, false);
-    let error = match unsafe { open(&config, &common::sizing(), &mut || Instant::ZERO) } {
+    let error = match unsafe { open(&config, &common::sizing(), None, &mut || Instant::ZERO) } {
         Err(error) => error,
         Ok(_) => panic!("open unexpectedly accepted two allowed CPUs"),
     };

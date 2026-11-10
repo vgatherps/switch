@@ -1,20 +1,28 @@
 # zhida-open
 
-`open(config, sizing, clock)`: one call from a `zhida-netconf` `Config` to a running `Stack`. The package is `zhida-open`; the directory is `crates/netconf-open`.
+`open(config, sizing, helper_cpus, clock)`: one call from a `zhida-netconf` `Config` to a running `Stack`. The package is `zhida-open`; the directory is `crates/netconf-open`.
 
 Used by `nic-runner`. Depends on [`zhida-netconf`](../netconf/README.md), [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `zhida-buffer` and `zhida-dpdk-sys`.
 
 ## API
 
-- `unsafe fn open(&Config, &Sizing, &mut impl FnMut() -> Instant) -> Result<Opened, OpenError>`: builds the EAL arguments from the config (main lcore on the one allowed CPU, `--file-prefix`, `-a <pci>,<devargs>` or `--vdev`), initializes EAL, sizes the pools, picks offloads, opens the `Port` and `Stack` (with the config's `owned_ipv4`), waits for link, and resolves the gateway if one is configured. The safety contract is in the doc comment.
+- `unsafe fn open(&Config, &Sizing, Option<&[usize]>, &mut impl FnMut() -> Instant) -> Result<Opened, OpenError>`: builds the EAL arguments from the config (main lcore on the one allowed CPU, `--file-prefix`, `-a <pci>,<devargs>` or `--vdev`), initializes EAL, sizes the pools, picks offloads, opens the `Port` and `Stack` (with the config's `owned_ipv4`), waits for link, and resolves the gateway if one is configured. The safety contract is in the doc comment.
 - `Opened { stack, eal, report }` and `OpenReport` (its `Display` prints the lines `zhida-nic` shows: link status, `gateway: <ip> at <mac> after <n> ms`, ...). `OpenError` names the failing step.
 - `Sizing`: required fields `frame_share` (frames all sockets together may hold beyond the frame reserve; nothing is reserved per socket), `max_sockets` and `max_udp_sockets` (zero disables UDP). The RX pool is a fixed 32767 mbufs (`docs/USAGE.md`, "Pool sizing").
 - `offloads`: resolves `Offloads::Auto` and explicit settings against what the PMD advertises.
 
 `open` fails with `OpenError::NotPinned` unless the process may run on exactly one CPU, so run under `taskset -c N` or `docker --cpuset-cpus=N`. The setup code in [docs/USAGE.md](../../docs/USAGE.md) is `examples/setup.rs`, and a test fails if they differ.
 
-On Linux, if that polling CPU appears in `/sys/devices/system/cpu/isolated`,
-setup temporarily includes online non-isolated CPUs in the calling thread's
+On Linux, `Some(helper_cpus)` explicitly selects EAL helper CPUs, including
+when the polling CPU is not kernel-isolated (for example, in Docker). The set
+must be nonempty with CPU indices below `CPU_SETSIZE`, and its CPUs must be
+available in the container/host cpuset. Setup temporarily includes those CPUs
+in the initial EAL affinity; DPDK excludes the main lcore from helper affinity
+when other CPUs are available. The opening thread returns to its original
+single CPU. `Some` is unsupported outside Linux.
+
+With `None`, behavior is unchanged: if the polling CPU appears in
+`/sys/devices/system/cpu/isolated`, setup temporarily includes online non-isolated CPUs in the calling thread's
 affinity before EAL starts. The kernel applies the effective cgroup cpuset;
 DPDK can place interrupt/control helpers on the available housekeeping CPUs
 while its main lcore stays on the original polling CPU. No other isolated CPU
@@ -22,7 +30,7 @@ is included. With no usable housekeeping CPU (including a one-CPU Docker
 cpuset), helpers retain the existing single-CPU behavior. Non-isolated polling
 CPUs keep the existing startup behavior. Affinity is restored after failed EAL
 initialization too; an EAL error and any restoration error are both reported.
-This affects setup only and adds no polling-loop work or configuration.
+This affects setup only and adds no polling-loop work or netconf JSON fields.
 
 ## Example
 

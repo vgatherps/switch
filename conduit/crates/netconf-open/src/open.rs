@@ -234,6 +234,11 @@ impl fmt::Display for OpenReport {
 
 /// Initialize EAL and open the configured device as a running Stack.
 ///
+/// `helper_cpus` optionally supplies Linux EAL helper CPUs. The opener remains
+/// pinned to its original single CPU after initialization (also on EAL failure).
+/// `None` keeps the existing isolated-CPU housekeeping selection. An explicit
+/// set is unsupported on other platforms.
+///
 /// # Safety
 /// The ethdev must be newly created, never configured or started, and under
 /// exclusive control. EAL, packet operations and cleanup stay on its owner
@@ -250,6 +255,7 @@ impl fmt::Display for OpenReport {
 pub unsafe fn open(
     config: &Config,
     sizing: &Sizing,
+    helper_cpus: Option<&[usize]>,
     clock: &mut impl FnMut() -> Instant,
 ) -> Result<Opened, OpenError> {
     let cpu = only_allowed_cpu().map_err(OpenError::NotPinned)?;
@@ -281,7 +287,14 @@ pub unsafe fn open(
     argv.extend(config.eal.extra.iter().cloned());
     let args: Vec<_> = argv.iter().map(String::as_str).collect();
     #[cfg(target_os = "linux")]
-    let eal = crate::eal_affinity::init(cpu, &args)?;
+    let eal = crate::eal_affinity::init(cpu, &args, helper_cpus)?;
+    #[cfg(not(target_os = "linux"))]
+    if helper_cpus.is_some() {
+        return Err(OpenError::HelperAffinity(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "explicit EAL helper CPUs require Linux",
+        )));
+    }
     #[cfg(not(target_os = "linux"))]
     let eal = Eal::init(&args).map_err(OpenError::Eal)?;
     let port_id = port_by_name(&eal, &device_name)
