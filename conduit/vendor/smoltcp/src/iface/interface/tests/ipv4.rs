@@ -1040,11 +1040,8 @@ fn test_handle_valid_arp_request(#[case] medium: Medium) {
 }
 
 #[test]
-#[allow(unsafe_code)]
 fn ingress_takes_each_frame_once_via_into_buf() {
     use core::cell::Cell;
-    use core::ptr::NonNull;
-    use std::boxed::Box;
     use std::collections::VecDeque;
     use std::rc::Rc;
 
@@ -1055,7 +1052,7 @@ fn ingress_takes_each_frame_once_via_into_buf() {
     #[derive(Default)]
     struct Counts {
         takes: Cell<usize>,
-        releases: Cell<usize>,
+        releases: Rc<Cell<usize>>,
     }
 
     struct FrameStorage {
@@ -1067,19 +1064,6 @@ fn ingress_takes_each_frame_once_via_into_buf() {
 
     impl RxToken for CountingRxToken {
         fn into_buf(self) -> RxBuf {
-            unsafe fn release(owner: NonNull<()>) {
-                // SAFETY: into_buf transfers this Box<FrameStorage> to the callback.
-                let storage = unsafe { Box::from_raw(owner.cast::<FrameStorage>().as_ptr()) };
-                storage.counts.releases.set(
-                    storage
-                        .counts
-                        .releases
-                        .get()
-                        .checked_add(1)
-                        .expect("release count overflow"),
-                );
-            }
-
             self.0.counts.takes.set(
                 self.0
                     .counts
@@ -1088,12 +1072,7 @@ fn ingress_takes_each_frame_once_via_into_buf() {
                     .checked_add(1)
                     .expect("take count overflow"),
             );
-            let storage = Box::leak(Box::new(self.0));
-            let data = NonNull::new(storage.bytes.as_mut_ptr()).unwrap();
-            let len = storage.bytes.len();
-            let owner = NonNull::from(storage).cast();
-            // SAFETY: the vector owns this range exclusively until release drops its box.
-            unsafe { RxBuf::from_raw_parts(owner, release, data, len, 0) }
+            RxBuf::counted_frame(self.0.bytes, 0, self.0.counts.releases.clone())
         }
     }
 

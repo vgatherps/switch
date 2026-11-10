@@ -1,34 +1,33 @@
 use alloc::rc::Rc;
+use netframe::OwnedFrame;
 
-use crate::phy::{RxBuf, RxShared};
+use crate::phy::RxShared;
 use super::rx_store::RxStore;
 
 /// An owned in-order TCP frame from one received segment.
 #[derive(Debug)]
 pub struct TcpFrame {
-    pub(super) frame: RxBuf,
-    pub(super) shared: Rc<RxShared>,
+    pub(super) frame: OwnedFrame,
+    pub(super) rx_timestamp: u64,
 }
 
 impl TcpFrame {
     pub fn payload(&self) -> &[u8] {
-        self.frame.as_slice()
+        &self.frame
     }
 
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        self.frame.as_mut_slice()
+        &mut self.frame
     }
 
     /// Raw NIC stamp of the segment that created this frame; 0 means none.
     pub fn rx_timestamp(&self) -> u64 {
-        self.frame.rx_timestamp()
+        self.rx_timestamp
     }
-}
 
-impl Drop for TcpFrame {
-    #[inline]
-    fn drop(&mut self) {
-        self.shared.release();
+    /// Transfer the payload storage; socket accounting lasts through its final clone.
+    pub fn into_frame(self) -> OwnedFrame {
+        self.frame
     }
 }
 

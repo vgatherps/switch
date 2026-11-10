@@ -320,16 +320,22 @@ impl Packet {
     pub(crate) fn into_rx_buf(self) -> RxBuf {
         let len = usize::from(self.0.len());
         let room = usize::from(self.0.tailroom());
-        // SAFETY: Packet owns this live mbuf. The pointer comes from buf_addr, not
-        // from a data_len slice, so it is valid for the tailroom as well.
-        let data = NonNull::new(unsafe { (*self.0.as_ptr()).data_ptr() }).unwrap();
-        let owner = NonNull::new(self.0.as_ptr()).unwrap().cast();
+        let raw = self.0.as_ptr();
+        // SAFETY: the restricted direct mbuf owns both its header and data in one
+        // pool allocation. Derive data from that allocation, as the TX producer does.
+        let (rc, data) = unsafe {
+            let payload = (*raw).data_ptr();
+            (
+                NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).__bindgen_anon_1.__bindgen_anon_1.refcnt)),
+                NonNull::new_unchecked(raw.cast::<u8>().add(payload as usize - raw as usize)),
+            )
+        };
         std::mem::forget(self);
         // SAFETY: the restricted invariant (direct, single-segment, refcnt 1,
         // no external buffer) gives Packet exclusive ownership of the bytes and
         // tailroom. Forgetting Packet transfers its storage to RxBuf, whose
         // callback returns it to the pool once on the owner thread.
-        unsafe { RxBuf::from_raw_parts(owner, release_packet, data, len, room) }
+        unsafe { RxBuf::from_raw_parts(rc, release_rx_packet, data, len, room) }
     }
 
     /// Shrink to exactly `len` bytes: `data_len == pkt_len == len`, still one
@@ -405,6 +411,17 @@ impl Drop for TxPacket {
         // SAFETY: this value owns one reference to a direct, single-segment
         // mbuf whose pool's cache slot is set; it returns with its last reference.
         unsafe { zhida_pktmbuf_free_seg(self.as_ptr()) };
+    }
+}
+
+unsafe extern "C" fn release_rx_packet(rc: NonNull<u16>, ctx: *mut ()) {
+    // SAFETY: into_rx_buf identifies this live mbuf by its embedded count;
+    // netframe leaves that count at 1 on the last release.
+    unsafe {
+        RxBuf::release_context(ctx);
+        let raw = rc.as_ptr().cast::<u8>()
+            .sub(core::mem::offset_of!(rte_mbuf, __bindgen_anon_1.__bindgen_anon_1.refcnt));
+        release_packet(NonNull::new_unchecked(raw.cast()));
     }
 }
 

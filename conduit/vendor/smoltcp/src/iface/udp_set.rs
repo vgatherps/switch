@@ -1,5 +1,6 @@
 use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use core::ops::Range;
+use netframe::OwnedFrame;
 
 use super::Interface;
 use super::{bind_word, slot_map, SlotMap};
@@ -60,23 +61,23 @@ pub struct UdpSocketStats {
 
 #[derive(Debug)]
 pub struct UdpDatagram {
-    frame: RxBuf,
+    frame: OwnedFrame,
     src: IpEndpoint,
     dst_addr: Ipv4Address,
-    shared: Rc<RxShared>,
+    rx_timestamp: u64,
 }
 
 impl UdpDatagram {
     pub fn rx_timestamp(&self) -> u64 {
-        self.frame.rx_timestamp()
+        self.rx_timestamp
     }
 
     pub fn payload(&self) -> &[u8] {
-        self.frame.as_slice()
+        &self.frame
     }
 
     pub fn payload_mut(&mut self) -> &mut [u8] {
-        self.frame.as_mut_slice()
+        &mut self.frame
     }
 
     pub fn src(&self) -> IpEndpoint {
@@ -86,9 +87,22 @@ impl UdpDatagram {
     pub fn dst_addr(&self) -> Ipv4Address {
         self.dst_addr
     }
+
+    /// Transfer the payload storage; receive credit lasts through its final clone.
+    pub fn into_frame(self) -> OwnedFrame {
+        self.frame
+    }
 }
 
-impl Drop for UdpDatagram {
+#[derive(Debug)]
+struct QueuedDatagram {
+    frame: RxBuf,
+    src: IpEndpoint,
+    dst_addr: Ipv4Address,
+    shared: Rc<RxShared>,
+}
+
+impl Drop for QueuedDatagram {
     fn drop(&mut self) {
         self.shared.release();
     }
@@ -98,7 +112,7 @@ impl Drop for UdpDatagram {
 pub struct UdpSocket {
     config: UdpConfig,
     peer: Option<IpEndpoint>,
-    queue: VecDeque<UdpDatagram>,
+    queue: VecDeque<QueuedDatagram>,
     shared: Rc<RxShared>,
     pub(crate) stats: UdpSocketStats,
     pub(crate) template: Option<super::header_template::UdpTemplate>,
@@ -121,8 +135,17 @@ impl UdpSocket {
         self.peer
     }
 
+    #[allow(unsafe_code)]
     pub fn recv(&mut self) -> Option<UdpDatagram> {
-        self.queue.pop_front()
+        // Keep the unique RxBuf and queue credit unchanged until hand-out.
+        let queued = core::mem::ManuallyDrop::new(self.queue.pop_front()?);
+        let rx_timestamp = queued.frame.rx_timestamp();
+        // SAFETY: transfer the unique buffer and its single accounting reference
+        // together, suppressing the queued datagram's release.
+        let frame = unsafe {
+            core::ptr::read(&queued.frame).into_frame(core::ptr::read(&queued.shared))
+        };
+        Some(UdpDatagram { frame, src: queued.src, dst_addr: queued.dst_addr, rx_timestamp })
     }
 
     pub fn rx_queued(&self) -> usize {
@@ -315,7 +338,7 @@ impl UdpSet {
         assert!(!socket.at_limit(), "UDP receive credit is exhausted");
         frame.narrow(pending.payload);
         socket.shared.hold();
-        socket.queue.push_back(UdpDatagram {
+        socket.queue.push_back(QueuedDatagram {
             frame,
             src: pending.src,
             dst_addr: pending.dst_addr,

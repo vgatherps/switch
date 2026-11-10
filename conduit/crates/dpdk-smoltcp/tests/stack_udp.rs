@@ -324,6 +324,33 @@ fn removed_socket_held_datagrams_keep_rx_mbufs_until_dropped() {
     });
 }
 
+#[zhida_test_support::pinned_test]
+fn cloned_received_udp_datagram_keeps_mbuf_and_queue_credit() {
+    with_eal(|eal| {
+        let fixture = RingPort::new("udpclone", 16, 16);
+        let mut stack = new_stack(fixture.open(eal), 1);
+        let handle = stack.add_udp(udp_config(PORT, 1)).unwrap();
+        fixture.inject(&[from_peer(PEER_PORT, b"held")]);
+        stack.turn(T0, 8).unwrap();
+        let frame = stack.udp_mut(&handle).recv().unwrap().into_frame().freeze();
+        let clone = std::mem::ManuallyDrop::new(frame.clone());
+        drop(frame);
+        assert_eq!(fixture.in_use().0, 1);
+        fixture.inject(&[from_peer(PEER_PORT, b"blocked")]);
+        stack.turn(T0, 8).unwrap();
+        assert!(stack.udp_mut(&handle).recv().is_none());
+        assert_eq!(stack.udp(&handle).stats().rx_dropped_full, 1);
+        assert_eq!(fixture.in_use().0, 1);
+        assert_eq!(&clone[..], b"held");
+        drop(std::mem::ManuallyDrop::into_inner(clone));
+        assert_eq!(fixture.in_use().0, 0);
+        fixture.inject(&[from_peer(PEER_PORT, b"next")]);
+        stack.turn(T0, 8).unwrap();
+        assert_eq!(stack.udp_mut(&handle).recv().unwrap().payload(), b"next");
+        finish(fixture, stack);
+    });
+}
+
 /// A local address the Stack does not own is refused with nothing changed: no slot taken, so a
 /// socket needing the only slot then fits on an owned address (also outside the subnet).
 #[zhida_test_support::pinned_test]

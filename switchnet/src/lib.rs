@@ -781,6 +781,11 @@ impl TcpFrame {
     pub fn rx_timestamp(&self) -> u64 {
         self.0.rx_timestamp()
     }
+
+    /// Transfer the payload storage, retaining its receive accounting until final release.
+    pub fn into_frame(self) -> OwnedFrame {
+        self.0.into_frame()
+    }
 }
 
 /// A bound UDP socket: a receive and a send half. Dropping both unbinds the
@@ -884,5 +889,10 @@ impl Datagram {
     /// Raw NIC stamp; 0 = none.
     pub fn rx_timestamp(&self) -> u64 {
         self.0.rx_timestamp()
+    }
+
+    /// Transfer the payload storage, retaining its receive credit until final release.
+    pub fn into_frame(self) -> OwnedFrame {
+        self.0.into_frame()
     }
 }

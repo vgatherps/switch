@@ -249,6 +249,38 @@ fn held_tcp_frame_after_removal(reap: bool) {
 }
 
 #[zhida_test_support::pinned_test]
+fn cloned_received_tcp_frame_keeps_mbuf_and_held_count() {
+    with_eal(|eal| {
+        let configs = [Side::A, Side::B].map(pair::config);
+        let mut pair = Pair::new(eal, ["rxclonea", "rxcloneb"], configs, pair::T0);
+        let ([client, server], _) = pair::establish(&mut pair, Side::A);
+        let idle = pair.in_use()[1].0;
+        pair.b.tcp_mut(&server).set_ack_delay(None);
+        assert_eq!(pair.a.tcp_mut(&client).send_slice(b"held"), Ok(4));
+        pair.drive(|_, _| {}, |a, b| {
+            if b.tcp(&server).recv_queue() == 4 && a.tcp(&client).send_queue() == 0 {
+                App::Done
+            } else {
+                App::Idle
+            }
+        });
+        let held = pair.b.tcp(&server).held_frames();
+        let frame = pair.b.tcp_mut(&server).recv().unwrap().unwrap().into_frame().freeze();
+        let clone = std::mem::ManuallyDrop::new(frame.clone().slice(1..4));
+        drop(frame);
+        assert_eq!(pair.in_use()[1].0, idle + 1);
+        assert_eq!(held.count(), 1);
+        pair.b.remove_tcp(server);
+        assert_eq!(&clone[..], b"eld");
+        assert_eq!(held.count(), 1);
+        drop(std::mem::ManuallyDrop::into_inner(clone));
+        assert_eq!(pair.in_use()[1].0, idle);
+        assert_eq!(held.count(), 0);
+        assert_eq!(pair.close(), 0);
+    });
+}
+
+#[zhida_test_support::pinned_test]
 fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(|side| StackConfig {

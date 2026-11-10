@@ -1,8 +1,11 @@
 #![allow(unsafe_code)]
 
-use core::{fmt, ops::Range, ptr::NonNull, slice};
+use core::{fmt, mem::ManuallyDrop, ops::Range, ptr::NonNull, slice};
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout}, rc::Rc, vec::Vec};
+use netframe::{OwnedFrame, Release};
+
+use super::RxShared;
 
 /// An owned receive frame with a storage release callback.
 pub struct RxBuf {
@@ -10,23 +13,24 @@ pub struct RxBuf {
     len: usize,
     room: usize,
     rx_timestamp: u64,
-    owner: NonNull<()>,
-    release: unsafe fn(NonNull<()>),
+    rc: NonNull<u16>,
+    release: Release,
 }
 
 impl RxBuf {
     /// Take ownership of a frame and its storage.
     ///
     /// # Safety
-    /// `data..data + len + room` must be valid for reads and writes and owned exclusively
-    /// by this value until `release(owner)` runs. The range must fit within one
-    /// allocation and `len + room` must not exceed `isize::MAX`.
-    /// `owner` must be valid for `release`, which must release the storage.
-    /// `release` is called exactly once, from `Drop`, on the thread that owns
-    /// this value.
+    /// `data..data + len + room` must be readable, writable and exclusively owned.
+    /// `rc` is an aligned u16 initialized to 1, preceding data in the same allocation.
+    /// Both pointers derive from that allocation pointer, with
+    /// `(data - rc) + len + room <= u32::MAX` and `len + room <= isize::MAX`.
+    /// `release` must call [`Self::release_context`] with its context, then free the
+    /// storage identified by `rc`. It runs once on the owning thread, with a null
+    /// context for an undelivered buffer or socket accounting after hand-out.
     pub unsafe fn from_raw_parts(
-        owner: NonNull<()>,
-        release: unsafe fn(NonNull<()>),
+        rc: NonNull<u16>,
+        release: Release,
         data: NonNull<u8>,
         len: usize,
         room: usize,
@@ -36,25 +40,41 @@ impl RxBuf {
             len,
             room,
             rx_timestamp: 0,
-            owner,
+            rc,
             release,
         }
     }
 
-    /// Take ownership of a vector without copying its bytes.
+    /// Copy a vector into storage with an embedded receive-frame count.
     pub fn from_vec(bytes: Vec<u8>) -> Self {
-        unsafe fn release_vec(owner: NonNull<()>) {
-            // SAFETY: from_vec transfers a Box<Vec<u8>> to this callback.
-            unsafe { drop(Box::from_raw(owner.cast::<Vec<u8>>().as_ptr())) };
-        }
+        heap_frame(&bytes, 0, #[cfg(test)] None)
+    }
 
-        let bytes = Box::leak(Box::new(bytes));
-        let len = bytes.len();
-        let data = NonNull::new(bytes.as_mut_ptr()).unwrap();
-        let owner = NonNull::from(bytes).cast();
-        // SAFETY: the vector owns these bytes exclusively, including when empty.
-        // The callback drops its box and vector once on this value's owner thread.
-        unsafe { Self::from_raw_parts(owner, release_vec, data, len, 0) }
+    /// Release the socket accounting passed to a receive producer's callback.
+    ///
+    /// # Safety
+    /// `ctx` is the unmodified context supplied to the callback by this module,
+    /// used exactly once, before freeing the receive storage.
+    #[inline]
+    pub unsafe fn release_context(ctx: *mut ()) {
+        if !ctx.is_null() {
+            // SAFETY: into_frame transferred exactly one Rc to this context.
+            let shared = unsafe { Rc::from_raw(ctx.cast::<RxShared>()) };
+            shared.release();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn into_frame(self, shared: Rc<RxShared>) -> OwnedFrame {
+        let this = ManuallyDrop::new(self);
+        // SAFETY: the producer contract supplies unique storage, an embedded count
+        // and its final release. This reference keeps the accounting alive.
+        unsafe {
+            OwnedFrame::from_raw_parts(
+                this.data, this.len as u32, this.rc, this.release,
+                Rc::into_raw(shared).cast_mut().cast(),
+            )
+        }
     }
 
     /// Raw value from the NIC driver; 0 means no hardware stamp.
@@ -96,37 +116,11 @@ impl RxBuf {
 
     #[cfg(test)]
     pub(crate) fn counted_frame(
-        mut bytes: Vec<u8>,
+        bytes: Vec<u8>,
         room: usize,
-        releases: alloc::rc::Rc<core::cell::Cell<usize>>,
+        releases: Rc<core::cell::Cell<usize>>,
     ) -> Self {
-        struct Storage {
-            bytes: Vec<u8>,
-            releases: alloc::rc::Rc<core::cell::Cell<usize>>,
-        }
-
-        unsafe fn release_storage(owner: NonNull<()>) {
-            // SAFETY: counted_frame transfers a Box<Storage> to this callback.
-            let storage = unsafe { Box::from_raw(owner.cast::<Storage>().as_ptr()) };
-            storage.releases.set(
-                storage
-                    .releases
-                    .get()
-                    .checked_add(1)
-                    .expect("release count exceeds usize"),
-            );
-        }
-
-        let len = bytes.len();
-        bytes.resize(
-            len.checked_add(room).expect("frame storage exceeds usize"),
-            0,
-        );
-        let storage = Box::leak(Box::new(Storage { bytes, releases }));
-        let data = NonNull::new(storage.bytes.as_mut_ptr()).unwrap();
-        let owner = NonNull::from(storage).cast();
-        // SAFETY: the box owns the bytes exclusively and the callback drops it once.
-        unsafe { Self::from_raw_parts(owner, release_storage, data, len, room) }
+        heap_frame(&bytes, room, Some(releases))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -141,9 +135,8 @@ impl RxBuf {
 
 impl Drop for RxBuf {
     fn drop(&mut self) {
-        // SAFETY: the constructor transfers ownership to this value and requires
-        // owner to be valid for release. This is the only call to release.
-        unsafe { (self.release)(self.owner) };
+        // SAFETY: no hand-out occurred, so no socket accounting was transferred.
+        unsafe { (self.release)(self.rc, core::ptr::null_mut()) };
     }
 }
 
@@ -156,13 +149,64 @@ impl fmt::Debug for RxBuf {
     }
 }
 
+#[repr(C)]
+struct HeapStorage {
+    size: usize,
+    #[cfg(test)]
+    releases: Option<Rc<core::cell::Cell<usize>>>,
+    refs: u16,
+}
+
+fn heap_layout(size: usize) -> Layout {
+    Layout::from_size_align(size, core::mem::align_of::<HeapStorage>()).unwrap()
+}
+
+unsafe extern "C" fn release_heap(rc: NonNull<u16>, ctx: *mut ()) {
+    // SAFETY: heap_frame embeds the count in this initialized allocation header.
+    unsafe {
+        RxBuf::release_context(ctx);
+        let raw = rc.as_ptr().cast::<u8>()
+            .sub(core::mem::offset_of!(HeapStorage, refs)).cast::<HeapStorage>();
+        let header = raw.read();
+        #[cfg(test)]
+        if let Some(releases) = header.releases {
+            releases.set(releases.get().checked_add(1).expect("release count overflow"));
+        }
+        dealloc(raw.cast(), heap_layout(header.size));
+    }
+}
+
+fn heap_frame(
+    bytes: &[u8],
+    room: usize,
+    #[cfg(test)] releases: Option<Rc<core::cell::Cell<usize>>>,
+) -> RxBuf {
+    let size = core::mem::size_of::<HeapStorage>()
+        .checked_add(bytes.len()).and_then(|size| size.checked_add(room))
+        .expect("receive storage exceeds usize");
+    assert!(size <= u32::MAX as usize, "receive storage exceeds frame offset range");
+    let layout = heap_layout(size);
+    // SAFETY: one allocation covers its header, count, initialized data and room.
+    unsafe {
+        let raw = alloc_zeroed(layout).cast::<HeapStorage>();
+        if raw.is_null() { handle_alloc_error(layout); }
+        raw.write(HeapStorage { size, #[cfg(test)] releases, refs: 1 });
+        let data = NonNull::new_unchecked(raw.cast::<u8>().add(core::mem::size_of::<HeapStorage>()));
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_ptr(), bytes.len());
+        let rc = NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).refs));
+        RxBuf::from_raw_parts(rc, release_heap, data, bytes.len(), room)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::rc::Rc;
+    use alloc::{boxed::Box, rc::Rc};
     use core::cell::Cell;
 
+    #[repr(C)]
     struct Storage {
+        refs: u16,
         bytes: [u8; 6],
         releases: Rc<Cell<usize>>,
     }
@@ -174,9 +218,12 @@ mod tests {
         }
     }
 
-    unsafe fn release_storage(owner: NonNull<()>) {
-        // SAFETY: owned_frame transfers a Box<Storage> to this callback.
-        unsafe { drop(Box::from_raw(owner.cast::<Storage>().as_ptr())) };
+    unsafe extern "C" fn release_storage(rc: NonNull<u16>, ctx: *mut ()) {
+        // SAFETY: owned_frame puts the count first in its repr(C) Storage.
+        unsafe {
+            RxBuf::release_context(ctx);
+            drop(Box::from_raw(rc.cast::<Storage>().as_ptr()));
+        }
     }
 
     #[test]
@@ -211,6 +258,7 @@ mod tests {
         assert!(len <= 4);
         let releases = Rc::new(Cell::new(0));
         let storage = Storage {
+            refs: 1,
             bytes: [10, 20, 30, 40, 50, 60],
             releases: releases.clone(),
         };
@@ -266,8 +314,9 @@ mod tests {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&[1, 2, 3, 4]);
         assert!(bytes.capacity() > bytes.len());
-        let data = bytes.as_ptr();
-        let mut frame = RxBuf::from_vec(bytes);
+        let frame = RxBuf::from_vec(bytes);
+        let data = frame.as_slice().as_ptr();
+        let mut frame = core::hint::black_box(frame);
         assert_eq!(frame.as_slice().as_ptr(), data);
         assert_eq!(frame.as_slice(), &[1, 2, 3, 4]);
         frame.as_mut_slice()[2] = 9;

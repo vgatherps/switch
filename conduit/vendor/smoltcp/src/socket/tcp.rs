@@ -1476,7 +1476,9 @@ impl<'a> Socket<'a> {
         };
         self.remote_seq_no = TcpSeqNumber(self.remote_seq_no.0.wrapping_add(frame.len() as i32));
         self.rx_buffer.shared.hold();
-        Ok(Some(TcpFrame { frame, shared: self.rx_buffer.shared.clone() }))
+        let rx_timestamp = frame.rx_timestamp();
+        let frame = frame.into_frame(self.rx_buffer.shared.clone());
+        Ok(Some(TcpFrame { frame, rx_timestamp }))
     }
 
     /// Return the amount of octets queued in the transmit buffer.
@@ -7902,6 +7904,30 @@ mod test {
             assert_eq!(bytes, b"abc");
             assert_eq!(bytes.as_ptr(), pointer);
         }
+    }
+
+    #[test]
+    fn cloned_received_frame_keeps_storage_and_held_count() {
+        let mut s = socket_established();
+        let releases = alloc::rc::Rc::new(core::cell::Cell::new(0));
+        let frame = RxBuf::counted_frame(b"abc".to_vec(), 0, releases.clone());
+        send_frame(
+            &mut s, Instant::ZERO,
+            &SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).data(b"abc"), frame,
+        );
+        let held = s.held_frames();
+        let frame = s.recv().unwrap().unwrap().into_frame().freeze();
+        // Keep the survivor out of unwinding drops when testing an early-free mutation.
+        let clone = core::mem::ManuallyDrop::new(frame.clone().slice(1..3));
+        assert_eq!(held.count(), 1);
+        drop(frame);
+        assert_eq!(releases.get(), 0);
+        assert_eq!(held.count(), 1);
+        drop(s);
+        assert_eq!(&clone[..], b"bc");
+        drop(core::mem::ManuallyDrop::into_inner(clone));
+        assert_eq!(releases.get(), 1);
+        assert_eq!(held.count(), 0);
     }
 
     #[test]

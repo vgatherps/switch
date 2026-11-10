@@ -176,9 +176,10 @@ impl Test {
     }
 
     fn receive(&mut self, bytes: Vec<u8>, verified: bool) -> usize {
-        let ptr = bytes.as_ptr() as usize;
+        let frame = RxBuf::counted_frame(bytes, 0, self.device.releases.clone());
+        let ptr = frame.as_slice().as_ptr() as usize;
         self.device.rx.push_back(FrameToken {
-            frame: RxBuf::counted_frame(bytes, 0, self.device.releases.clone()),
+            frame,
             meta: PacketMeta {
                 l4_checksum_verified: verified,
                 ..PacketMeta::default()
@@ -450,6 +451,25 @@ fn held_datagram_keeps_credit() {
     assert_eq!(test.udp.get(test.handle).stats().rx_dropped_full, 1);
     assert_eq!(test.device.releases.get(), 1);
     drop(held);
+    assert_eq!(test.device.releases.get(), 2);
+    test.receive(datagram(b"next", LOCAL, PEER_PORT), false);
+    assert_eq!(test.recv().unwrap().payload(), b"next");
+}
+
+#[test]
+fn cloned_received_datagram_keeps_storage_and_queue_credit() {
+    let mut test = Test::new(1);
+    test.receive(datagram(b"held", LOCAL, PEER_PORT), false);
+    let frame = test.recv().unwrap().into_frame().freeze();
+    let clone = core::mem::ManuallyDrop::new(frame.clone());
+    drop(frame);
+    assert_eq!(test.device.releases.get(), 0);
+    test.receive(datagram(b"blocked", LOCAL, PEER_PORT), false);
+    assert!(test.recv().is_none());
+    assert_eq!(test.udp.get(test.handle).stats().rx_dropped_full, 1);
+    assert_eq!(test.device.releases.get(), 1);
+    assert_eq!(&clone[..], b"held");
+    drop(core::mem::ManuallyDrop::into_inner(clone));
     assert_eq!(test.device.releases.get(), 2);
     test.receive(datagram(b"next", LOCAL, PEER_PORT), false);
     assert_eq!(test.recv().unwrap().payload(), b"next");

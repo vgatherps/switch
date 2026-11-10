@@ -20,7 +20,7 @@ Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md) and [`swit
 - Everything is `Rc` based, so no type is `Send`.
 - One task may wait per socket half (`recv` and `room` take `&mut`).
 - Futures must be polled by `switch` tasks: parking stores a `switch::StoredWaker`.
-- A received frame holds its socket's receive budget until dropped, and stays valid after the socket, `Net` and `Stack` are gone.
+- Received frames stay valid after the socket, `Net` and `Stack` are gone. `TcpFrame::into_frame()` and `Datagram::into_frame()` transfer their payload to `netframe::OwnedFrame`; save metadata first if needed. Freeze to clone without copying. The RX mbuf and held count (UDP: one `rx_queue` credit) remain held until the last clone drops; TCP's receive window is unchanged.
 
 ## Build and test
 

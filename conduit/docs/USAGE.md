@@ -389,9 +389,9 @@ once (unread in-order data, out-of-order segments, queued UDP datagrams, frames 
 application holds). Every TCP and UDP socket draws on the same share; none is reserved per socket.
 Choose the share for the expected workload and concurrency. The TCP receive window does not limit
 retained data; smaller segments can consume more mbufs for the same amount of data.
-A UDP socket holds at most `UdpConfig::rx_queue` datagrams, queued or held. A `UdpDatagram` taken
-from the queue keeps its slot in `rx_queue` until dropped; frames and datagrams held after their
-socket is removed keep their mbufs until dropped.
+A UDP socket holds at most `UdpConfig::rx_queue` datagrams, queued or held. A received datagram
+keeps its slot until its payload storage's last reference drops, including clones made through
+`into_frame().freeze()`. Frames and datagrams keep their mbufs after socket removal.
 
 When the share runs out, the driver has no mbuf for new arrivals and drops them (the test kit's
 `Link` counts them in `pool_empty`); the stack never sees those packets and TCP peers retransmit.
@@ -798,9 +798,11 @@ loop {
 ```
 
 `TcpFrame` owns its RX mbuf. `payload()` gives `&[u8]`, `payload_mut()` gives `&mut [u8]`, and
-`rx_timestamp()` gives the raw hardware stamp (see Hardware RX timestamps). A frame stays valid after
-socket removal, handle drop, or Stack teardown, and retains its RX mbuf until dropped. Copy bytes
-out if a parser needs them longer.
+`rx_timestamp()` gives the raw hardware stamp (see Hardware RX timestamps).
+`into_frame()` transfers the payload to a `netframe::OwnedFrame`; save the timestamp first if needed.
+Freeze it to share immutable clones, or slice it without copying. The mbuf and
+`held_frames().count()` remain held until the last clone drops, even after socket removal,
+handle drop, or Stack teardown. The wrapper itself is not cloneable.
 
 A frame contains bytes from one received segment, possibly trimmed during reassembly.
 Neither frame boundaries nor wire segments delimit application messages. `recv_queue()` counts all queued
@@ -934,8 +936,10 @@ drop(datagram);
 
 `src()` returns `IpEndpoint`, including source port; `dst_addr()` returns `Ipv4Address`;
 `rx_timestamp()` returns the raw hardware stamp, 0 for none. `payload()` gives `&[u8]`, and
-`payload_mut()` gives `&mut [u8]`. A held datagram consumes receive credit even when
-`rx_queued() == 0`. Datagrams arriving at the credit limit are dropped and counted; UDP does not
+`payload_mut()` gives `&mut [u8]`. `into_frame()` transfers the payload to a
+`netframe::OwnedFrame`; save the addresses and timestamp first if needed. The wrapper is not
+cloneable, but its frozen payload is. A held datagram consumes one receive credit even when
+`rx_queued() == 0`, until its last payload clone drops. Datagrams arriving at the credit limit are dropped and counted; UDP does not
 backpressure the sender. `udp(&handle).stats()` reads the socket's `rx_dropped_full` count. `remove_udp(handle)` consumes the handle, frees queued datagrams, unbinds the
 port immediately; dropping the handle does the same at the next cleanup
 call (see Handles). Held datagrams keep their RX mbufs until dropped. Do not replace a socket through

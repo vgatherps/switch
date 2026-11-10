@@ -432,6 +432,14 @@ fn frames_outlive_the_stack() {
             datagram.payload_mut()[0] = b'U';
             assert_eq!(frame.payload(), b"Tcp bytes");
             assert_eq!(datagram.payload(), b"Udp bytes");
+            let pointers = (frame.payload().as_ptr(), datagram.payload().as_ptr());
+            let frame = frame.into_frame().freeze();
+            let datagram = datagram.into_frame().freeze();
+            assert_eq!((frame.as_ptr(), datagram.as_ptr()), pointers);
+            let clones = (frame.clone(), datagram.clone());
+            drop((frame, datagram));
+            assert_eq!(&clones.0[..], b"Tcp bytes");
+            assert_eq!(&clones.1[..], b"Udp bytes");
         });
     })
 }
