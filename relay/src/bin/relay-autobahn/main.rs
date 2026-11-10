@@ -286,19 +286,33 @@ fn drive(
     role: &Role,
     deadline: Duration,
 ) -> Result<(), Failure> {
+    drive_with(net.handle(), |rt, now, tick| {
+        let moved = round(net, rt, now, tick)?;
+        Ok((moved, net.poll_at()))
+    }, elapsed, stop, role, deadline)
+}
+
+fn drive_with(
+    handle: NetHandle,
+    mut round: impl FnMut(&mut Runtime, Instant, u64) -> Result<(bool, Option<Instant>), RoundError>,
+    elapsed: &dyn Fn() -> Duration,
+    stop: &mut dyn FnMut() -> bool,
+    role: &Role,
+    deadline: Duration,
+) -> Result<(), Failure> {
     let mut rt = Runtime::new(u64::try_from(elapsed().as_nanos()).expect("elapsed fits u64 ns"));
     let tally: Rc<RefCell<Tally>> = Rc::default();
     let outcome: Rc<RefCell<Option<Result<(), Failure>>>> = Rc::default();
-    let task = run_role(net.handle(), rt.spawner(), role.clone(), deadline, tally.clone(), outcome.clone());
+    let task = run_role(handle, rt.spawner(), role.clone(), deadline, tally.clone(), outcome.clone());
     rt.spawner().spawn(task).map_err(|_| Failure::Spawn)?;
     let turned = loop {
         let since = elapsed();
         let now = Instant::from_micros(i64::try_from(since.as_micros()).expect("elapsed fits i64 microseconds"));
         let tick = u64::try_from(since.as_nanos()).expect("elapsed fits u64 ns");
-        match round(net, &mut rt, now, tick) {
-            Ok(true) => {}
+        match round(&mut rt, now, tick) {
+            Ok((true, _)) => {}
             // Nothing moved: sleep until the Stack's next timer, at most 1 ms (wstest shares the CPU).
-            Ok(false) => match net.poll_at() {
+            Ok((false, at)) => match at {
                 Some(at) if at <= now => {}
                 at => std::thread::sleep(at.map_or(IDLE_SLEEP, |at| {
                     Duration::from_micros((at - now).total_micros()).min(IDLE_SLEEP)

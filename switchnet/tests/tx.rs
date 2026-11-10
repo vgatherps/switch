@@ -284,7 +284,7 @@ support::both_backends!(parked_room_resolves_with_an_error_on_reset_conduit, par
         mixed.peer.turn(mixed.now, BUDGET).unwrap();
         assert!(mixed.to_net.forward() >= 1, "the reset did not leave the peer");
         mixed.turn();
-        let (tx, error) = slot.take();
+        let (tx, error) = mixed.wait(&slot);
         assert_eq!(error, Error::InvalidState);
         if matches!(backend, support::Backend::Conduit) {
             assert_eq!(polls.get(), parked + 1, "woken more than once by the reset");

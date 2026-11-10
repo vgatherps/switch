@@ -27,6 +27,7 @@ fn peer_resets_after(mixed: &mut Mixed, peer: &TcpHandle) {
     mixed.peer.turn(mixed.now, BUDGET).unwrap();
     assert!(mixed.to_net.forward() >= 1, "the reset did not leave the peer");
     mixed.turn();
+    mixed.until(|m| m.net.tcp_reset_by_peer());
 }
 
 /// Two `recv`s in one task.
@@ -538,10 +539,7 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
 // A socket dropped while its receive token is still armed (no turn in
 // between) frees the index at once; a new socket that reuses it and parks is
 // woken by its own data.
-// Conduit-only: immediate same-port rebind races junction's asynchronous host close.
-#[zhida_test_support::pinned_test]
-fn socket_reusing_a_just_freed_index_is_woken() {
-    let backend = support::Backend::Conduit;
+support::both_backends!(socket_reusing_a_just_freed_index_is_woken_conduit, socket_reusing_a_just_freed_index_is_woken_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["reua", "reub"], backend);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
@@ -550,16 +548,16 @@ fn socket_reusing_a_just_freed_index_is_woken() {
         let slot = mixed.spawn(async move { cancel_after_one_poll(first.recv()).await });
         mixed.rt.poll(0).unwrap();
         mixed.wait(&slot);
-        let mut second = bind(&mut mixed, udp_config(7000));
+        let mut second = bind(&mut mixed, udp_config(7002));
         let slot = mixed.spawn(async move {
             let datagram = second.recv().await;
             (second, datagram)
         });
         mixed.rt.poll(0).unwrap();
-        mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7000)), b"second").unwrap();
+        mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7002)), b"second").unwrap();
         let (second, datagram) = mixed.wait(&slot);
         assert_eq!(datagram.payload(), b"second");
         drop((second, datagram, peer));
         mixed.close();
     })
-}
+});

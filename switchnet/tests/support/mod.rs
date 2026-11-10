@@ -235,12 +235,15 @@ impl Mixed {
 
     /// Every socket and frame the test made must already be dropped. The Net
     /// gives its Stack back, both Ports close with every mbuf returned.
-    pub fn close(self) {
+    pub fn close(mut self) {
+        self.rt.shutdown();
+        self.net.assert_remote_frames_returned();
         self.close_after_stacks(|| {});
     }
 
     /// `close`, running `held` once both Stacks are torn down and before the
     /// mbuf checks: it gets frames still held and must drop them.
+    /// Skips the remote leak check because this path intentionally keeps RX frames past teardown.
     pub fn close_after_stacks(self, held: impl FnOnce()) {
         let Self { mut rt, mut to_peer, mut to_net, net, peer, fixtures, host, now } = self;
         rt.shutdown();
@@ -297,6 +300,7 @@ pub fn udp_config_at(addr: switchnet::Ipv4Address, port: u16) -> UdpConfig {
 
 pub fn bind(mixed: &mut Mixed, config: UdpConfig) -> switchnet::UdpSocket {
     let slot = mixed.spawn(mixed.handle().udp_bind(config));
+    mixed.rt.poll(0).expect("poll binding once before turning the Net");
     mixed.wait(&slot).expect("bind UDP")
 }
 

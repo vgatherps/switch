@@ -1,4 +1,4 @@
-//! Conduit-only: readiness-token internals, not the socket API.
+//! Readiness and entry-reuse contracts on both backends; ACK-credit parking is conduit-only.
 
 //! Which parked tasks a `Net::turn` wakes: only those whose socket's readiness
 //! token fired and whose socket is ready, also after their entry was
@@ -60,12 +60,11 @@ fn datagram_to(mixed: &mut Mixed, peer: &dpdk_smoltcp::UdpHandle, port: u16, pay
 const SOCKETS: usize = 1000;
 const BASE: u16 = 20_000;
 
-/// 1000 tasks parked on UDP receive: idle turns poll none of them, and one
-/// datagram wakes exactly its receiver.
-#[zhida_test_support::pinned_test]
-fn one_of_a_thousand_parked_receivers_wakes() {
+// 1000 tasks parked on UDP receive: idle turns poll none of them, and one
+// datagram wakes exactly its receiver.
+support::both_backends!(one_of_a_thousand_parked_receivers_wakes_conduit, one_of_a_thousand_parked_receivers_wakes_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::with_sockets(eal, ["tha", "thb"], 1, SOCKETS + 1, support::Backend::Conduit);
+        let mut mixed = Mixed::with_sockets(eal, ["tha", "thb"], 1, SOCKETS + 1, backend);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         mixed.rounds(2);
@@ -100,10 +99,11 @@ fn one_of_a_thousand_parked_receivers_wakes() {
         drop(peer);
         mixed.close();
     })
-}
+});
 
 /// A reader and a writer parked on the two halves of one stream: data wakes
 /// only the reader, the peer's ACKs only the writer.
+// Conduit-only: ACK-gated send credit parks the writer.
 #[zhida_test_support::pinned_test]
 fn halves_of_one_stream_wake_independently() {
     with_eal(|eal| {
@@ -168,15 +168,14 @@ fn halves_of_one_stream_wake_independently() {
     })
 }
 
-/// A recv parked, its token fired by the send half (`shutdown` changes the
-/// socket between turns), then the recv canceled and the whole stream dropped
-/// before any turn. The freed entry is reused by a UDP socket whose task
-/// parks: the next turn's check of the old token arms the new socket, and its
-/// datagram wakes it once.
-#[zhida_test_support::pinned_test]
-fn token_fired_then_canceled_then_entry_reused_before_the_turn() {
+// A recv parked, its token fired by the send half (`shutdown` changes the
+// socket between turns), then the recv canceled and the whole stream dropped
+// before any turn. The freed entry is reused by a UDP socket whose task
+// parks: the next turn's check of the old token arms the new socket, and its
+// datagram wakes it once.
+support::both_backends!(token_fired_then_canceled_then_entry_reused_before_the_turn_conduit, token_fired_then_canceled_then_entry_reused_before_the_turn_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["fcra", "fcrb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["fcra", "fcrb"], backend);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
@@ -213,14 +212,13 @@ fn token_fired_then_canceled_then_entry_reused_before_the_turn() {
         drop((socket, datagram, peer, tcp_peer));
         mixed.close();
     })
-}
+});
 
-/// As above, but the turn checks the fired token while its entry is free; a
-/// socket opened afterwards in that entry arms its own token.
-#[zhida_test_support::pinned_test]
-fn token_fired_then_socket_dropped_then_turn() {
+// As above, but the turn checks the fired token while its entry is free; a
+// socket opened afterwards in that entry arms its own token.
+support::both_backends!(token_fired_then_socket_dropped_then_turn_conduit, token_fired_then_socket_dropped_then_turn_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["fsda", "fsdb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["fsda", "fsdb"], backend);
         let peer = mixed.peer.add_udp(udp_config(7001)).unwrap();
         peer_udp_send(&mut mixed, &peer, 7009, b"resolve");
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
@@ -256,14 +254,13 @@ fn token_fired_then_socket_dropped_then_turn() {
         drop((socket, datagram, peer, tcp_peer));
         mixed.close();
     })
-}
+});
 
-/// A recv canceled and a new recv parked on the same half between two turns:
-/// the token armed by the first serves the second, which data wakes once.
-#[zhida_test_support::pinned_test]
-fn recv_canceled_and_parked_again_between_turns() {
+// A recv canceled and a new recv parked on the same half between two turns:
+// the token armed by the first serves the second, which data wakes once.
+support::both_backends!(recv_canceled_and_parked_again_between_turns_conduit, recv_canceled_and_parked_again_between_turns_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["crpa", "crpb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["crpa", "crpb"], backend);
         let (mut stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let gate = Gate::default();
         let (task, polls) = counted({
@@ -289,16 +286,15 @@ fn recv_canceled_and_parked_again_between_turns() {
         drop((stream, frame, peer));
         mixed.close();
     })
-}
+});
 
-/// A parked reader's token fires on a send-half change between turns (a
-/// writer task's `try_send` changes the socket): the next turn checks it,
-/// finds no data and re-arms without polling the reader; data later wakes it
-/// once.
-#[zhida_test_support::pinned_test]
-fn token_fired_by_the_other_half_rearms_without_a_wake() {
+// A parked reader's token fires on a send-half change between turns (a
+// writer task's `try_send` changes the socket): the next turn checks it,
+// finds no data and re-arms without polling the reader; data later wakes it
+// once.
+support::both_backends!(token_fired_by_the_other_half_rearms_without_a_wake_conduit, token_fired_by_the_other_half_rearms_without_a_wake_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["oha", "ohb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["oha", "ohb"], backend);
         let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
         let (mut rx, mut tx) = stream.split();
         let (task, polls) = counted(async move {
@@ -334,7 +330,7 @@ fn token_fired_by_the_other_half_rearms_without_a_wake() {
         drop((rx, frame, tx, peer));
         mixed.close();
     })
-}
+});
 
 /// Parks `delivered` on the stream's send side and cancels it, then changes the
 /// socket (`shutdown` again), which fires the still armed send token; drops the
@@ -352,14 +348,13 @@ fn fire_send_token_and_drop(mixed: &mut Mixed, stream: TcpStream) {
     drop((rx, slot.take()));
 }
 
-/// A UDP socket takes the entry while the previous TCP socket's fired send
-/// token is still out. Dropping the UDP send half, which never arms a token,
-/// must leave the UDP receive token alone: the parked receiver is woken by
-/// its datagram.
-#[zhida_test_support::pinned_test]
-fn udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half() {
+// A UDP socket takes the entry while the previous TCP socket's fired send
+// token is still out. Dropping the UDP send half, which never arms a token,
+// must leave the UDP receive token alone: the parked receiver is woken by
+// its datagram.
+support::both_backends!(udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half_conduit, udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["xkua", "xkub"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["xkua", "xkub"], backend);
         let (stream, tcp_peer) = connect(&mut mixed, LOCAL_PORT);
         fire_send_token_and_drop(&mut mixed, stream);
         let (mut rx, tx) = bind(&mut mixed, udp_config(7000)).split();
@@ -379,15 +374,14 @@ fn udp_socket_reusing_an_entry_with_a_tcp_send_token_out_drops_its_send_half() {
         drop((rx, datagram, peer, tcp_peer));
         mixed.close();
     })
-}
+});
 
-/// A TCP socket takes the entry while the previous TCP socket's fired send
-/// token is still out; it connects and, after `shutdown`, waits in
-/// `delivered` until the peer acks the FIN.
-#[zhida_test_support::pinned_test]
-fn tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes() {
+// A TCP socket takes the entry while the previous TCP socket's fired send
+// token is still out; it connects and, after `shutdown`, waits in
+// `delivered` until the peer acks the FIN.
+support::both_backends!(tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes_conduit, tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["xkta", "xktb"], support::Backend::Conduit);
+        let mut mixed = Mixed::new(eal, ["xkta", "xktb"], backend);
         let (stream, old_peer) = connect(&mut mixed, LOCAL_PORT);
         fire_send_token_and_drop(&mut mixed, stream);
         let peer = peer_listen(&mut mixed);
@@ -408,4 +402,4 @@ fn tcp_socket_reusing_an_entry_with_a_send_token_out_waits_and_wakes() {
         drop((tx, peer, old_peer));
         mixed.close();
     })
-}
+});

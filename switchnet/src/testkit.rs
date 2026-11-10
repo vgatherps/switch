@@ -37,21 +37,19 @@ pub struct TapNet {
     host: Option<host::Host>,
 }
 
-impl std::ops::Deref for TapNet {
-    type Target = Net;
-
-    fn deref(&self) -> &Net {
-        &self.net
-    }
-}
-
-impl std::ops::DerefMut for TapNet {
-    fn deref_mut(&mut self) -> &mut Net {
-        &mut self.net
-    }
-}
-
 impl TapNet {
+    pub fn handle(&self) -> NetHandle {
+        self.net.handle()
+    }
+
+    pub fn poll_at(&mut self) -> Option<Instant> {
+        self.net.poll_at()
+    }
+
+    pub fn tcp_reset_by_peer(&self) -> bool {
+        self.net.tcp_reset_by_peer()
+    }
+
     pub fn turn(&mut self, now: Instant) -> Result<crate::Turn, crate::TurnError> {
         if let Some(host) = &mut self.host {
             host.iteration(now);
@@ -138,10 +136,11 @@ pub fn with_tap_net<T>(backend: Backend, config: &TapConfig, body: impl FnOnce(&
         };
         let mut tap_net = TapNet { net, host };
         let out = body(&mut tap_net, &clock);
-        let TapNet { net, host } = tap_net;
+        let TapNet { mut net, host } = tap_net;
         let stack = match host {
             None => net.into_stack().ok().expect("a handle or socket outlived the body"),
             Some(host) => {
+                net.assert_remote_frames_returned();
                 drop(net.into_session().ok().expect("a handle or socket outlived the body"));
                 host.finish(clock.now())
             }
@@ -188,6 +187,13 @@ fn add_address(iface: &CString, addr: Ipv4Addr, prefix: u8) {
 }
 
 impl Net {
+    /// Drains internally queued RX and checks that no remote frame outlived the body.
+    pub fn assert_remote_frames_returned(&mut self) {
+        if let crate::Inner::Remote(remote) = &mut *self.shared.borrow_mut() {
+            remote.assert_frames_returned();
+        }
+    }
+
     /// Test inspection: whether the peer reset any TCP socket open on this Net.
     pub fn tcp_reset_by_peer(&self) -> bool {
         let inner = self.shared.borrow();

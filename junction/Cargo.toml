@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Junction host control protocol"
 
+[features]
+testkit = ["slice_ringbuffer/testkit"]
+
 [dependencies]
 ceph-ring.workspace = true
 ceph-proto.workspace = true

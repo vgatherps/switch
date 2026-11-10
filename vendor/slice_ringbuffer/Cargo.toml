@@ -3,6 +3,9 @@ name = "slice_ringbuffer"
 version = "0.1.0"
 edition = "2018"
 
+[features]
+testkit = []
+
 [dependencies]
 netframe.workspace = true
 shared-memory.workspace = true

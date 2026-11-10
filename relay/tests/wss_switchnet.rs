@@ -16,9 +16,9 @@ use relay::switchnet::{Error as WssError, Ws, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use switchnet::testkit::{Backend, KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
+use switchnet::testkit::{Backend, KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, TapNet, client_server, next_local_port, with_tap_net};
 use switchnet::{IpEndpoint, IpListenEndpoint};
-use switchnet::{Net, NetHandle, TcpStream, tcp};
+use switchnet::{NetHandle, TcpStream, tcp};
 use tungstenite::protocol::CloseFrame;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Error as WsError, Message};
@@ -161,7 +161,7 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
     listener_setup: impl FnOnce(&TcpListener),
     serve: impl FnOnce(std::net::TcpStream) -> T + Send + 'static,
     client: impl FnOnce(NetHandle, TcpStream) -> F + 'static,
-    mut each_turn: impl FnMut(&Net),
+    mut each_turn: impl FnMut(&TapNet),
 ) -> T {
     let socket = tap.socket;
     with_tap_net(Backend::Conduit, tap, |net, clock| {

@@ -27,21 +27,21 @@ support::both_backends!(tcp_slots_full_on_first_poll_and_drop_releases_slot_cond
         mixed.rt.poll(0).unwrap();
         assert!(matches!(mixed.wait(&slot), Err(Error::SocketsFull)));
         drop(held);
-        let replacement = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let slot = mixed.spawn(async move {
-            let mut replacement = pin!(replacement);
-            poll_fn(|cx| Poll::Ready(matches!(replacement.as_mut().poll(cx), Poll::Pending))).await
-        });
-        mixed.rt.poll(0).unwrap();
-        assert!(slot.take(), "failed add leaked or drop retained the only TCP slot");
+        // Junction applies the drop asynchronously; a pending replacement proves no release.
+        if matches!(backend, support::Backend::Conduit) {
+            let replacement = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+            let slot = mixed.spawn(async move {
+                let mut replacement = pin!(replacement);
+                poll_fn(|cx| Poll::Ready(matches!(replacement.as_mut().poll(cx), Poll::Pending))).await
+            });
+            mixed.rt.poll(0).unwrap();
+            assert!(slot.take(), "failed add leaked or drop retained the only TCP slot");
+        }
         mixed.close();
     });
 });
 
-// Conduit-only: immediate same-port rebind races junction's asynchronous host close.
-#[zhida_test_support::pinned_test]
-fn udp_port_in_use_on_first_poll_and_release_reopens_port() {
-    let backend = support::Backend::Conduit;
+support::both_backends!(udp_port_in_use_on_first_poll_and_release_reopens_port_conduit, udp_port_in_use_on_first_poll_and_release_reopens_port_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::with_sockets(eal, ["ofua", "ofub"], 1, 2, backend);
         let held = support::bind(&mut mixed, udp_config(7000));
@@ -50,12 +50,15 @@ fn udp_port_in_use_on_first_poll_and_release_reopens_port() {
         mixed.rt.poll(0).unwrap();
         assert!(matches!(mixed.wait(&slot), Err(Error::PortInUse)));
         drop(held);
-        let first = support::bind(&mut mixed, udp_config(7000));
-        let second = support::bind(&mut mixed, udp_config(7001));
-        drop((first, second));
+        // Immediate same-port rebind races the host's asynchronous close on junction.
+        if matches!(backend, support::Backend::Conduit) {
+            let first = support::bind(&mut mixed, udp_config(7000));
+            let second = support::bind(&mut mixed, udp_config(7001));
+            drop((first, second));
+        }
         mixed.close();
     });
-}
+});
 
 support::both_backends!(failed_connect_start_releases_only_socket_slot_conduit, failed_connect_start_releases_only_socket_slot_junction, |backend| {
     with_eal(|eal| {
@@ -163,6 +166,9 @@ support::both_backends!(accepting_already_closed_preserves_queued_data_without_m
         mixed.peer.turn(mixed.now, BUDGET).unwrap();
         assert!(mixed.to_net.forward() >= 1, "reset did not leave the peer");
         mixed.turn();
+        if matches!(backend, support::Backend::Junction) {
+            mixed.until(|m| m.net.tcp_reset_by_peer());
+        }
         let slot = mixed.spawn(first_poll(opening, backend));
         mixed.rt.poll(0).unwrap();
         let stream = mixed.wait(&slot).expect("accept must preserve an already closed stream");
@@ -179,3 +185,33 @@ support::both_backends!(accepting_already_closed_preserves_queued_data_without_m
         mixed.close();
     });
 });
+
+#[zhida_test_support::pinned_test]
+fn remote_teardown_rejects_retained_tx_and_rx_frames() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["olka", "olkb"], support::Backend::Junction);
+        let handle = mixed.handle();
+        let slot = mixed.spawn(async move { handle.tx_frame().await });
+        let frame = mixed.wait(&slot);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mixed.net.assert_remote_frames_returned();
+        })).is_err(), "a retained TX frame escaped the teardown check");
+        drop(frame);
+        mixed.net.assert_remote_frames_returned();
+
+        let (mut stream, peer) = support::connect(&mut mixed, LOCAL_PORT);
+        support::peer_send(&mut mixed, &peer, b"retained");
+        let slot = mixed.spawn(async move {
+            let frame = stream.recv().await.unwrap();
+            (stream, frame)
+        });
+        let (stream, frame) = mixed.wait(&slot);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mixed.net.assert_remote_frames_returned();
+        })).is_err(), "a retained RX frame escaped the teardown check");
+        drop(frame);
+        mixed.net.assert_remote_frames_returned();
+        drop((stream, peer));
+        mixed.close();
+    });
+}

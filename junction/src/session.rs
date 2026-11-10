@@ -292,6 +292,12 @@ impl Session {
         self.slots.len()
     }
 
+    /// Received records still retained by frames, excluding unread ring records.
+    #[cfg(feature = "testkit")]
+    pub fn outstanding_rx_frames(&self) -> usize {
+        self.rx.outstanding_frames()
+    }
+
     fn allocate(&mut self, tcp: bool) -> Result<SocketId, OpenError> {
         let (index, slot) = self
             .slots

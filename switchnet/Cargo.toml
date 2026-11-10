@@ -7,7 +7,7 @@ publish = false
 
 [features]
 # Module `testkit`: a Net on a net_tap Port for Docker tests and drivers against kernel peers.
-testkit = ["dep:zhida-test-kit", "dep:zhida-buffer", "dep:zhida-dpdk-sys", "dep:junctiond", "dep:ceph-fifo", "dep:ceph-ring", "dep:ceph-proto"]
+testkit = ["dep:zhida-test-kit", "dep:zhida-buffer", "dep:zhida-dpdk-sys", "dep:junctiond", "dep:ceph-fifo", "dep:ceph-ring", "junction/testkit"]
 
 [dependencies]
 dpdk-smoltcp.workspace = true
@@ -19,16 +19,15 @@ zhida-dpdk-sys = { workspace = true, optional = true }
 junctiond = { workspace = true, optional = true }
 ceph-fifo = { workspace = true, optional = true }
 ceph-ring = { workspace = true, optional = true }
-ceph-proto = { workspace = true, optional = true }
 
 [dev-dependencies]
+switchnet = { workspace = true, features = ["testkit"] }
 zhida-test-kit.workspace = true
 zhida-test-support.workspace = true
 criterion.workspace = true
 junctiond.workspace = true
 ceph-fifo.workspace = true
 ceph-ring.workspace = true
-ceph-proto.workspace = true
 
 [[bench]]
 name = "turn"

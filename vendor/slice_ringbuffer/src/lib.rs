@@ -329,6 +329,12 @@ impl RingReader {
         })
     }
 
+    /// Number of records still retained by frames, including leaked clones.
+    #[cfg(feature = "testkit")]
+    pub fn outstanding_frames(&self) -> usize {
+        Rc::strong_count(&self.shared) - 1
+    }
+
     /// Takes the next published record, or None if none is available.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(PacketMeta, OwnedFrame)> {

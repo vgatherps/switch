@@ -75,6 +75,24 @@ fn cloned_frame_blocks_reclaim_until_the_last_drop() {
     assert!(writer.reserve(len, meta(0)).is_some(), "last drop must free the ring");
 }
 
+#[cfg(feature = "testkit")]
+#[test]
+fn outstanding_frames_detects_a_retained_clone_without_reclaiming() {
+    let (_producer, _consumer, mut writer, mut reader) = ring();
+    publish(&mut writer, 8, 0x5a);
+    assert_eq!(reader.outstanding_frames(), 0, "unread records are not held frames");
+    let (_, frame) = reader.next().unwrap();
+    let frame = frame.freeze();
+    let retained = frame.clone();
+    drop(frame);
+    assert_eq!(reader.outstanding_frames(), 1);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eq!(reader.outstanding_frames(), 0, "RX frame outlived the body");
+    })).is_err());
+    drop(retained);
+    assert_eq!(reader.outstanding_frames(), 0, "last drop is visible before reclaim");
+}
+
 #[test]
 fn dropping_frame_after_wrap_frees_exact_stride() {
     let (_producer, _consumer, mut writer, mut reader) = ring();

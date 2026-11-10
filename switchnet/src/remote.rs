@@ -300,6 +300,16 @@ impl Remote {
         self.entries.iter().any(|entry| entry.halves != 0 && entry.reset)
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn assert_frames_returned(&mut self) {
+        self.session.poll_packets(|_, _, _| {});
+        for entry in &mut self.entries {
+            entry.packets.clear();
+        }
+        assert_eq!(self.pool.free.borrow().len(), self.pool.count, "remote TX frames outlived the body");
+        assert_eq!(self.session.outstanding_rx_frames(), 0, "remote RX frames outlived the body");
+    }
+
     pub fn tx_frame(&mut self, cx: &Context<'_>) -> Poll<OwnedFrame> {
         if let Some(frame) = self.pool.take() { return Poll::Ready(frame); }
         let waker = StoredWaker::new(cx);
@@ -353,13 +363,20 @@ fn reject(code: RejectCode) -> Error {
 struct FramePool {
     free: RefCell<Vec<Box<[u16]>>>,
     capacity: u32,
+    #[cfg(feature = "testkit")]
+    count: usize,
 }
 
 impl FramePool {
     fn new(count: usize, capacity: u32) -> Rc<Self> {
         assert!(capacity <= u32::MAX - 2, "frame capacity exceeds netframe's count offset range");
         let words = 1 + (capacity as usize).div_ceil(2);
-        Rc::new(Self { free: RefCell::new((0..count).map(|_| vec![0; words].into_boxed_slice()).collect()), capacity })
+        Rc::new(Self {
+            free: RefCell::new((0..count).map(|_| vec![0; words].into_boxed_slice()).collect()),
+            capacity,
+            #[cfg(feature = "testkit")]
+            count,
+        })
     }
 
     fn take(self: &Rc<Self>) -> Option<OwnedFrame> {
