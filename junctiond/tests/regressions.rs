@@ -135,7 +135,7 @@ fn shutdown_after_peer_fin_reports_delivered_before_closed() {
         assert_eq!(
             events,
             [
-                (id, Event::Connected),
+                (id, Event::Connected { mss: 1460 }),
                 (id, Event::PeerFin),
                 (id, Event::Delivered),
                 (
@@ -166,7 +166,7 @@ fn graceful_finish_limits_retries_and_frees_silent_backlogged_socket() {
             .connect_tcp(config, peer_endpoint(PEER_PORT), local(LOCAL_PORT))
             .unwrap();
         f.until(&mut client, &mut events, |f, events| {
-            events.contains(&(id, Event::Connected))
+            events.contains(&(id, Event::Connected { mss: 1460 }))
                 && f.peer.tcp(&peer).state() == State::Established
         });
         for _ in 0..16 {

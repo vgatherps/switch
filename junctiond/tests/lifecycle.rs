@@ -29,7 +29,7 @@ fn shutdown_ack_reports_delivered_then_peer_fin_before_clean_closed() {
             events.contains(&(id, Event::Delivered))
                 && f.peer.tcp(&peer).state() == State::CloseWait
         });
-        assert_eq!(events, [(id, Event::Connected), (id, Event::Delivered)]);
+        assert_eq!(events, [(id, Event::Connected { mss: 1460 }), (id, Event::Delivered)]);
         assert!(!fixture.peer.tcp(&peer).reset_by_peer());
 
         fixture.peer.close(&peer);
@@ -48,7 +48,7 @@ fn shutdown_ack_reports_delivered_then_peer_fin_before_clean_closed() {
         assert_eq!(
             events,
             [
-                (id, Event::Connected),
+                (id, Event::Connected { mss: 1460 }),
                 (id, Event::Delivered),
                 (id, Event::PeerFin),
                 (
@@ -79,7 +79,7 @@ fn peer_fin_first_reports_peer_fin_without_closing_local_send_half() {
         fixture.until(&mut client, &mut events, |f, events| {
             events.contains(&(id, Event::PeerFin)) && f.peer.tcp(&peer).state() == State::FinWait2
         });
-        assert_eq!(events, [(id, Event::Connected), (id, Event::PeerFin)]);
+        assert_eq!(events, [(id, Event::Connected { mss: 1460 }), (id, Event::PeerFin)]);
         assert!(!fixture.peer.tcp(&peer).reset_by_peer());
         client.shutdown(id);
         fixture.until(&mut client, &mut events, |_, events| {
@@ -118,7 +118,7 @@ fn peer_reset_reports_closed_with_reset_flag() {
         assert_eq!(
             events,
             [
-                (id, Event::Connected),
+                (id, Event::Connected { mss: 1460 }),
                 (
                     id,
                     Event::Closed {
@@ -191,10 +191,10 @@ fn close_during_syn_sent_frees_slot_and_next_generation_connects() {
             .unwrap();
         assert_ne!(new.generation, old.generation);
         fixture.until(&mut client, &mut events, |f, events| {
-            events.contains(&(new, Event::Connected))
+            events.contains(&(new, Event::Connected { mss: 1460 }))
                 && f.peer.tcp(&peer).state() == State::Established
         });
-        assert_eq!(events, [(old, Event::Freed), (new, Event::Connected)]);
+        assert_eq!(events, [(old, Event::Freed), (new, Event::Connected { mss: 1460 })]);
         client.abort(new);
         fixture.until(&mut client, &mut events, |f, events| {
             events.contains(&(new, Event::Freed)) && f.peer.tcp(&peer).reset_by_peer()
@@ -371,14 +371,14 @@ fn stale_session_end_after_slot_reuse_does_not_touch_new_connection() {
                 "{how:?}"
             );
             assert!(!fixture.peer.tcp(&peer).reset_by_peer());
-            assert_eq!(events, [(id, Event::Connected)]);
+            assert_eq!(events, [(id, Event::Connected { mss: 1460 })]);
 
             client.close(id, false);
             fixture.until(&mut client, &mut events, |f, events| {
                 events.contains(&(id, Event::Freed))
                     && f.peer.tcp(&peer).state() == State::CloseWait
             });
-            assert_eq!(events, [(id, Event::Connected), (id, Event::Freed)]);
+            assert_eq!(events, [(id, Event::Connected { mss: 1460 }), (id, Event::Freed)]);
             assert!(!fixture.peer.tcp(&peer).reset_by_peer(), "{how:?}");
             drop((client, peer));
             fixture.close();
@@ -455,10 +455,10 @@ fn incoming_handshake_reset_keeps_listener_waiting_for_real_connection() {
             .connect(&peer, endpoint, PEER_PORT + 2)
             .unwrap();
         fixture.until(&mut client, &mut events, |f, events| {
-            events.contains(&(id, Event::Connected))
+            events.contains(&(id, Event::Connected { mss: 1460 }))
                 && f.peer.tcp(&peer).state() == State::Established
         });
-        assert_eq!(events, [(id, Event::Connected)]);
+        assert_eq!(events, [(id, Event::Connected { mss: 1460 })]);
         client.abort(id);
         fixture.until(&mut client, &mut events, |f, events| {
             events.contains(&(id, Event::Freed)) && f.peer.tcp(&peer).reset_by_peer()
@@ -595,7 +595,7 @@ fn raw_connected(fixture: &mut Fixture) -> (RawClient, SocketId, TcpHandle) {
         local: local(LOCAL_PORT),
     }]);
     client.until(fixture, |f, client| {
-        client.has(id, Event::Connected) && f.peer.tcp(&peer).state() == State::Established
+        client.has(id, Event::Connected { mss: 1460 }) && f.peer.tcp(&peer).state() == State::Established
     });
     (client, id, peer)
 }
@@ -845,7 +845,7 @@ fn held_ops_do_not_touch_reopened_udp(shutdown: bool, wrap_generation: bool) {
         let mut expected = vec![
             HostMessage::Event {
                 id,
-                event: Event::Connected,
+                event: Event::Connected { mss: 1460 },
             },
             HostMessage::Event {
                 id,

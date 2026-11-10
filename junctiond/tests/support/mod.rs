@@ -281,6 +281,7 @@ impl Fixture {
                 rx_dir: directory.clone(),
                 rx_size: options.rx_size,
                 max_record: 256,
+                frame_capacity: 232,
                 max_sessions: options.max_sessions,
                 max_sockets: 64,
                 poll_ms: 1,
@@ -657,7 +658,7 @@ pub fn connect(
         .connect_tcp(tcp_config(), peer_endpoint(PEER_PORT), local(port))
         .unwrap();
     fixture.until(client, events, |f, events| {
-        events.contains(&(id, Event::Connected))
+        events.iter().any(|(received, event)| *received == id && matches!(event, Event::Connected { .. }))
             && f.peer.tcp(&peer).state() == tcp::State::Established
     });
     (id, peer)

@@ -26,7 +26,7 @@ fn queued_send(
         .connect_tcp(config, peer_endpoint(PEER_PORT), local(LOCAL_PORT))
         .unwrap();
     f.until(client, events, |f, events| {
-        events.contains(&(id, Event::Connected)) && f.peer.tcp(&peer).state() == State::Established
+        events.contains(&(id, Event::Connected { mss: 1460 })) && f.peer.tcp(&peer).state() == State::Established
     });
 
     // The first iteration can accept one byte; all remaining bytes must backlog.
@@ -245,7 +245,7 @@ fn stale_send_after_abort_and_slot_reuse_does_not_end_session() {
         assert_eq!(next.generation, id.generation.wrapping_add(1));
         assert!(matches!(f.wait_op(next), Op::ConnectTcp { .. }));
         f.until(&mut client, &mut events, |f, events| {
-            events.contains(&(next, Event::Connected))
+            events.contains(&(next, Event::Connected { mss: 1460 }))
                 && f.peer.tcp(&next_peer).state() == State::Established
         });
         client.send_tcp(next, b"new").unwrap();

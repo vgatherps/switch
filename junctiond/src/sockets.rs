@@ -364,7 +364,10 @@ impl HostSocket {
         );
         if !*connected && synchronized {
             *connected = true;
-            event(to_control, session, self.id, Event::Connected);
+            let mss = socket.max_segment_payload().expect("synchronized TCP socket has an MSS");
+            event(to_control, session, self.id, Event::Connected {
+                mss: u16::try_from(mss).expect("TCP MSS fits u16"),
+            });
         }
         *fin_seen |= matches!(
             state,

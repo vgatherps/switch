@@ -14,6 +14,70 @@ use support::{
 };
 
 #[zhida_test_support::pinned_test]
+fn connected_reports_peer_negotiated_mss() {
+    with_eal(|eal| {
+        for accept in [false, true] {
+            let mut f = Fixture::new(eal, ["jnmsa", "jnmsb"], 4, 4, 64);
+            let mut client = f.client(4);
+            assert_eq!(client.frame_capacity(), 232);
+            let mut config = peer_tcp_config();
+            config.mss_cap = Some(536);
+            let peer = f.peer.add_tcp(config).unwrap();
+            let id = if accept {
+                let id = client.listen_tcp(tcp_config(), local(LOCAL_PORT)).unwrap();
+                f.wait_op(id);
+                f.network.iteration(f.now).unwrap();
+                f.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
+                id
+            } else {
+                f.peer.listen(&peer, PEER_PORT).unwrap();
+                client.connect_tcp(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT)).unwrap()
+            };
+            let mut events = Vec::new();
+            f.until(&mut client, &mut events, |_, events| {
+                events.iter().any(|(socket, event)| *socket == id && matches!(event, Event::Connected { .. }))
+            });
+            assert!(events.contains(&(id, Event::Connected { mss: 536 })), "{events:?}");
+            f.peer.remove_tcp(peer);
+            drop(client);
+            f.close();
+        }
+    });
+}
+
+#[test]
+fn bind_requires_room_for_frame_and_udp_header() {
+    use std::{io, sync::mpsc, time::Duration};
+    use junction::host::{ControlChannels, ControlConfig, HostControl};
+    let path = std::env::temp_dir().join(format!("junction-bound-{}.sock", std::process::id()));
+    std::fs::write(&path, b"unchanged").unwrap();
+    for (frame_capacity, max_record) in [(232, 255), (u32::MAX, u32::MAX), (u32::MAX - 23, u32::MAX)] {
+        let (to_network, _network) = mpsc::channel();
+        let (to_fifo, _fifo) = mpsc::channel();
+        let (_events, from_network) = mpsc::channel();
+        let (_retire, retire) = mpsc::channel();
+        let result = HostControl::bind(ControlConfig {
+            socket_path: path.clone(),
+            ingress: String::new(),
+            rx_dir: std::env::temp_dir(),
+            rx_size: 64 * 1024,
+            frame_capacity,
+            max_record,
+            max_sessions: 1,
+            max_sockets: 1,
+            poll_ms: 1,
+            hello_timeout: Duration::from_secs(1),
+        }, ControlChannels { to_network, to_fifo, from_network, retire });
+        match result {
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+            Ok(_) => panic!("accepted frame_capacity={frame_capacity}, max_record={max_record}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[zhida_test_support::pinned_test]
 fn peer_connects_to_client_listener() {
     with_eal(|eal| {
         let mut f = Fixture::new(eal, ["jnlna", "jnlnb"], 4, 4, 64);
@@ -31,7 +95,7 @@ fn peer_connects_to_client_listener() {
             )
             .unwrap();
         f.until(&mut client, &mut events, |f, events| {
-            events.contains(&(id, Event::Connected))
+            events.contains(&(id, Event::Connected { mss: 1460 }))
                 && f.peer.tcp(&peer).state() == State::Established
         });
         f.peer.remove_tcp(peer);
@@ -57,7 +121,7 @@ fn refused_connect_reports_peer_reset() {
                 },
             ))
         });
-        assert!(!events.contains(&(id, Event::Connected)));
+        assert!(!events.iter().any(|(_, event)| matches!(event, Event::Connected { .. })));
         client.close(id, false);
         f.until(&mut client, &mut events, |_, events| {
             events.contains(&(id, Event::Freed))

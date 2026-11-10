@@ -71,6 +71,7 @@ impl RawHost {
                 status: WelcomeStatus::Ok,
                 stream: STREAM,
                 max_record: 256,
+                frame_capacity: 232,
                 ingress,
                 rx,
             })

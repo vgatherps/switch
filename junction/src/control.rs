@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroU16;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"JNCT");
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,6 +96,8 @@ pub struct Welcome {
     pub status: WelcomeStatus,
     pub stream: u64,
     pub max_record: u32,
+    /// Host TX frame payload capacity (IP MTU minus 28), advertised since protocol v3.
+    pub frame_capacity: u32,
     pub ingress: String,
     pub rx: String,
 }
@@ -111,7 +113,8 @@ pub enum WelcomeStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    Connected,
+    /// TCP is synchronized; `mss` is the effective, peer-negotiated segment payload limit.
+    Connected { mss: u16 },
     Bound,
     Rejected(RejectCode),
     PeerFin,
@@ -318,7 +321,7 @@ impl ClientMessage {
 impl HostMessage {
     /// Appends one complete control message to `out`.
     ///
-    /// Panics if the ingress and RX paths plus their 24-byte prefix exceed a `u16` body length.
+    /// Panics if the ingress and RX paths plus their 28-byte prefix exceed a `u16` body length.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::Welcome(welcome) => {
@@ -326,7 +329,7 @@ impl HostMessage {
                     .ingress
                     .len()
                     .checked_add(welcome.rx.len())
-                    .and_then(|len| len.checked_add(24))
+                    .and_then(|len| len.checked_add(28))
                     .and_then(|len| u16::try_from(len).ok())
                     .expect("Welcome paths exceed the control body length");
                 put_header(out, 64, 0, len);
@@ -335,6 +338,7 @@ impl HostMessage {
                 out.extend_from_slice(&[welcome.status as u8, 0]);
                 out.extend_from_slice(&welcome.stream.to_le_bytes());
                 out.extend_from_slice(&welcome.max_record.to_le_bytes());
+                out.extend_from_slice(&welcome.frame_capacity.to_le_bytes());
                 out.extend_from_slice(&(welcome.ingress.len() as u16).to_le_bytes());
                 out.extend_from_slice(welcome.ingress.as_bytes());
                 out.extend_from_slice(&(welcome.rx.len() as u16).to_le_bytes());
@@ -342,7 +346,7 @@ impl HostMessage {
             }
             Self::Event { id, event } => {
                 let (kind, flags, len) = match *event {
-                    Event::Connected => (65, 0, 8),
+                    Event::Connected { .. } => (65, 0, 10),
                     Event::Bound => (66, 0, 8),
                     Event::Rejected(_) => (67, 0, 9),
                     Event::PeerFin => (68, 0, 8),
@@ -352,6 +356,9 @@ impl HostMessage {
                 };
                 put_header(out, kind, flags, len);
                 put_id(out, *id);
+                if let Event::Connected { mss } = event {
+                    out.extend_from_slice(&mss.to_le_bytes());
+                }
                 if let Event::Rejected(code) = event {
                     out.push(*code as u8);
                 }
@@ -372,7 +379,8 @@ fn header(buf: &[u8], client: bool) -> Result<Option<(u8, u8, usize)>, DecodeErr
     let flags = buf[1];
     let len = u16::from_le_bytes([buf[2], buf[3]]);
     let expected = match (client, kind) {
-        (true, 1 | 5..=7) | (false, 65 | 66 | 68..=71) => Some(8),
+        (true, 1 | 5..=7) | (false, 66 | 68..=71) => Some(8),
+        (false, 65) => Some(10),
         (true, 2) => Some(36),
         (true, 3) => Some(28),
         (true, 4) => Some(24),
@@ -381,7 +389,7 @@ fn header(buf: &[u8], client: bool) -> Result<Option<(u8, u8, usize)>, DecodeErr
         (false, 72) => Some(1),
         _ => return Err(DecodeError::UnknownKind(kind)),
     };
-    if expected.is_some_and(|expected| len != expected) || (kind == 64 && len < 24) {
+    if expected.is_some_and(|expected| len != expected) || (kind == 64 && len < 28) {
         return Err(DecodeError::WrongLength { kind, len });
     }
     if buf[4..8] != [0; 4] {
@@ -560,6 +568,7 @@ impl HostMessage {
                 body.pad::<1>()?;
                 let stream = u64::from_le_bytes(body.take());
                 let max_record = body.u32();
+                let frame_capacity = body.u32();
                 let ingress_len = usize::from(body.u16());
                 if ingress_len > body.0.len() - 2 {
                     return Err(DecodeError::WrongLength {
@@ -587,6 +596,7 @@ impl HostMessage {
                     status,
                     stream,
                     max_record,
+                    frame_capacity,
                     ingress,
                     rx,
                 })
@@ -601,7 +611,7 @@ impl HostMessage {
             _ => {
                 let id = body.id();
                 let event = match kind {
-                    65 => Event::Connected,
+                    65 => Event::Connected { mss: body.u16() },
                     66 => Event::Bound,
                     67 => Event::Rejected(match body.byte() {
                         1 => RejectCode::TcpSocketsFull,

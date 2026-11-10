@@ -173,6 +173,8 @@ pub struct Session {
     writer: Writer,
     rx: RingReader,
     stream: u64,
+    frame_capacity: u32,
+    max_record: u32,
     next_seq: u64,
     slots: Vec<Slot>,
     messages: Receiver<Result<HostMessage, Lost>>,
@@ -254,6 +256,8 @@ impl Session {
             writer,
             rx,
             stream: welcome.stream,
+            frame_capacity: welcome.frame_capacity,
+            max_record: welcome.max_record,
             next_seq: 0,
             slots: (0..max_sockets)
                 .map(|_| Slot {
@@ -273,6 +277,19 @@ impl Session {
             closed: false,
             not_sync: PhantomData,
         })
+    }
+
+    /// Host TX frame payload capacity advertised in Welcome.
+    pub fn frame_capacity(&self) -> u32 {
+        self.frame_capacity
+    }
+
+    pub fn max_record(&self) -> usize {
+        self.max_record as usize
+    }
+
+    pub fn max_sockets(&self) -> usize {
+        self.slots.len()
     }
 
     fn allocate(&mut self, tcp: bool) -> Result<SocketId, OpenError> {

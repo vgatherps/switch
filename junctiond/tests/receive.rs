@@ -27,7 +27,7 @@ fn connect_receive(
         .connect_tcp(config, peer_endpoint(PEER_PORT), local(LOCAL_PORT))
         .unwrap();
     f.until(client, events, |f, events| {
-        events.contains(&(id, Event::Connected)) && f.peer.tcp(&peer).state() == State::Established
+        events.contains(&(id, Event::Connected { mss: 1460 })) && f.peer.tcp(&peer).state() == State::Established
     });
     (id, peer)
 }

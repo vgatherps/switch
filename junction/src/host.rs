@@ -77,6 +77,8 @@ pub struct ControlConfig {
     pub rx_dir: PathBuf,
     pub rx_size: usize,
     pub max_record: u32,
+    /// Host TX frame payload capacity (IP MTU minus 28).
+    pub frame_capacity: u32,
     pub max_sessions: u32,
     pub max_sockets: u16,
     pub poll_ms: u16,
@@ -153,6 +155,12 @@ pub struct HostControl {
 
 impl HostControl {
     pub fn bind(config: ControlConfig, channels: ControlChannels) -> io::Result<Self> {
+        if config.frame_capacity.checked_add(24).is_none_or(|minimum| config.max_record < minimum) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_record must fit frame_capacity plus the 24-byte UDP send header",
+            ));
+        }
         #[cfg(target_os = "linux")]
         let rx_name_len = config
             .rx_dir
@@ -162,7 +170,7 @@ impl HostControl {
             .len();
         #[cfg(target_os = "macos")]
         let rx_name_len = RX_NAME_PREFIX.len();
-        let welcome_len = 24usize
+        let welcome_len = 28usize
             .checked_add(config.ingress.len())
             .and_then(|len| len.checked_add(rx_name_len))
             .and_then(|len| len.checked_add(16));
@@ -487,6 +495,7 @@ impl HostControl {
             status,
             stream,
             max_record: self.config.max_record,
+            frame_capacity: self.config.frame_capacity,
             ingress: self.config.ingress.clone(),
             rx: rx_name,
         }));
@@ -728,6 +737,7 @@ mod tests {
             rx_dir,
             rx_size,
             max_record: 256,
+            frame_capacity: 232,
             max_sessions: 1,
             max_sockets: 1,
             poll_ms: 1,
@@ -1090,7 +1100,7 @@ mod tests {
                 slot: 0,
                 generation: 0,
             },
-            event: Event::Connected,
+            event: Event::Connected { mss: 1460 },
         });
         fixture.host.flush(0);
         for generation in 0..count as u32 {
@@ -1129,7 +1139,7 @@ mod tests {
                 slot: 0,
                 generation: 0,
             },
-            event: Event::Connected,
+            event: Event::Connected { mss: 1460 },
         });
         fixture.host.flush(0);
         assert!(matches!(

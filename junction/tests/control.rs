@@ -37,6 +37,7 @@ fn welcome() -> HostMessage {
         status: WelcomeStatus::Ok,
         stream: 0x0102_0304_0506_0708,
         max_record: 0x1122_3344,
+        frame_capacity: 232,
         ingress: "/tmp/j".into(),
         rx: "/rx".into(),
     })
@@ -124,13 +125,16 @@ fn host_messages() -> Vec<HostMessage> {
                 status,
                 stream: 7,
                 max_record: 4096,
+                frame_capacity: 232,
                 ingress: "/tmp/入口".into(),
                 rx: "/tmp/受信".into(),
             }));
         }
     }
     for event in [
-        Event::Connected,
+        Event::Connected { mss: 1460 },
+        Event::Connected { mss: 0 },
+        Event::Connected { mss: u16::MAX },
         Event::Bound,
         Event::PeerFin,
         Event::Delivered,
@@ -243,8 +247,8 @@ fn golden_bytes() {
         (
             Message::Host(welcome()),
             &[
-                64, 0, 33, 0, 0, 0, 0, 0, b'J', b'N', b'C', b'T', 2, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2,
-                1, 0x44, 0x33, 0x22, 0x11, 6, 0, b'/', b't', b'm', b'p', b'/', b'j', 3, 0, b'/',
+                64, 0, 37, 0, 0, 0, 0, 0, b'J', b'N', b'C', b'T', 3, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2,
+                1, 0x44, 0x33, 0x22, 0x11, 232, 0, 0, 0, 6, 0, b'/', b't', b'm', b'p', b'/', b'j', 3, 0, b'/',
                 b'r', b'x',
             ],
         ),
@@ -323,7 +327,7 @@ fn fixed_lengths_reject_from_header_alone() {
         }
     }
     for (kind, len) in [
-        (65, 8),
+        (65, 10),
         (66, 8),
         (67, 9),
         (68, 8),
@@ -509,7 +513,7 @@ fn invalid_enum_codes_are_rejected() {
 
 #[test]
 fn welcome_path_must_be_utf8() {
-    for offset in [30, 38] {
+    for offset in [34, 42] {
         let mut bytes = host_bytes(welcome());
         bytes[offset] = 255;
         let error = std::str::from_utf8(&bytes[offset..]).unwrap_err();
@@ -524,18 +528,18 @@ fn welcome_path_must_be_utf8() {
 fn welcome_length_must_match_path_length() {
     let mut bytes = host_bytes(welcome());
     for ingress_len in [0u16, 5, 7, u16::MAX] {
-        bytes[28..30].copy_from_slice(&ingress_len.to_le_bytes());
+        bytes[32..34].copy_from_slice(&ingress_len.to_le_bytes());
         assert_eq!(
             HostMessage::decode(&bytes),
-            Err(DecodeError::WrongLength { kind: 64, len: 33 })
+            Err(DecodeError::WrongLength { kind: 64, len: 37 })
         );
     }
     for rx_len in [0u16, 2, 4, u16::MAX] {
         let mut bytes = host_bytes(welcome());
-        bytes[36..38].copy_from_slice(&rx_len.to_le_bytes());
+        bytes[40..42].copy_from_slice(&rx_len.to_le_bytes());
         assert_eq!(
             HostMessage::decode(&bytes),
-            Err(DecodeError::WrongLength { kind: 64, len: 33 })
+            Err(DecodeError::WrongLength { kind: 64, len: 37 })
         );
     }
 }
@@ -626,15 +630,16 @@ fn config_checks_do_not_add_stack_rejections() {
 fn welcome_accepts_largest_encodable_path_and_empty_path() {
     for (ingress_len, rx_len) in [
         (0, 0),
-        (usize::from(u16::MAX) - 24, 0),
-        (0, usize::from(u16::MAX) - 24),
-        (3, usize::from(u16::MAX) - 27),
+        (usize::from(u16::MAX) - 28, 0),
+        (0, usize::from(u16::MAX) - 28),
+        (3, usize::from(u16::MAX) - 31),
     ] {
         let message = HostMessage::Welcome(Welcome {
             version: VERSION,
             status: WelcomeStatus::Ok,
             stream: 1,
             max_record: 1,
+            frame_capacity: 232,
             ingress: "a".repeat(ingress_len),
             rx: "b".repeat(rx_len),
         });
@@ -654,7 +659,8 @@ fn welcome_panics_when_body_length_would_overflow() {
         status: WelcomeStatus::Ok,
         stream: 1,
         max_record: 1,
-        ingress: "a".repeat(usize::from(u16::MAX) - 23),
+        frame_capacity: 232,
+        ingress: "a".repeat(usize::from(u16::MAX) - 27),
         rx: String::new(),
     }));
 }

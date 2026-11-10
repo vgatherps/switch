@@ -95,6 +95,7 @@ impl Host {
                 rx_dir: "/dev/shm".into(),
                 rx_size: 64 * 1024,
                 max_record: 256,
+                frame_capacity: 232,
                 max_sessions,
                 max_sockets,
                 poll_ms: 1,
@@ -127,6 +128,9 @@ impl Host {
 
     fn open(&self, max_sockets: u16) -> (Session, u64) {
         let session = Session::connect(&self.path, max_sockets).unwrap();
+        assert_eq!(session.frame_capacity(), 232);
+        assert_eq!(session.max_record(), 256);
+        assert_eq!(session.max_sockets(), usize::from(max_sockets));
         // Welcome must not be visible until both Open messages have been sent.
         let (stream, actual) =
             self.opened(self.network.try_recv().expect("Open must precede Welcome"));
@@ -315,6 +319,7 @@ fn hello(host: &Host, max_sockets: u16) -> (UnixStream, u64) {
     };
     assert_eq!(welcome.status, WelcomeStatus::Ok);
     assert_eq!(welcome.max_record, 256);
+    assert_eq!(welcome.frame_capacity, 232);
     assert_eq!(welcome.ingress, host.reader.as_ref().unwrap().name());
     let (session, actual) = host.opened(host.network.try_recv().unwrap());
     assert_eq!(session, welcome.stream);
@@ -393,11 +398,11 @@ fn events_are_isolated_ordered_and_release_slots() {
     for _ in 0..2 {
         receive(&host.network);
     }
-    host.event(sa, first, Event::Connected);
+    host.event(sa, first, Event::Connected { mss: 1460 });
     host.event(sa, first, Event::PeerFin);
     assert_eq!(
         events(&mut a, 2),
-        [(first, Event::Connected), (first, Event::PeerFin)]
+        [(first, Event::Connected { mss: 1460 }), (first, Event::PeerFin)]
     );
     b.poll_events(|_, _| panic!("event leaked across sessions"))
         .unwrap();
@@ -607,13 +612,13 @@ fn full_send_preserves_sequence_and_round_trips_tcp_and_udp() {
     );
     let tcp_id = client.listen_tcp(tcp(), local()).unwrap();
     assert!(matches!(host.op(session), Op::ListenTcp { .. }));
-    host.event(session, tcp_id, Event::Connected);
+    host.event(session, tcp_id, Event::Connected { mss: 1460 });
     until(|| {
         let mut connected = false;
         client
             .poll_events(|id, event| {
                 assert_eq!(id, tcp_id);
-                assert_eq!(event, Event::Connected);
+                assert_eq!(event, Event::Connected { mss: 1460 });
                 connected = true;
             })
             .unwrap();
@@ -712,11 +717,11 @@ fn tcp_send_after_shutdown_is_not_open() {
     let (mut client, session) = host.open(1);
     let id = client.listen_tcp(tcp(), local()).unwrap();
     assert!(matches!(host.op(session), Op::ListenTcp { .. }));
-    host.event(session, id, Event::Connected);
+    host.event(session, id, Event::Connected { mss: 1460 });
     until(|| {
         let mut connected = false;
         client
-            .poll_events(|_, event| connected |= event == Event::Connected)
+            .poll_events(|_, event| connected |= event == Event::Connected { mss: 1460 })
             .unwrap();
         connected
     });
@@ -922,6 +927,7 @@ fn client_reports_host_version_mismatch_before_attaching() {
             status: WelcomeStatus::BadVersion,
             stream: 0,
             max_record: 0,
+            frame_capacity: 232,
             ingress: String::new(),
             rx: String::new(),
         })
@@ -1036,6 +1042,7 @@ fn client_reports_second_welcome_malformed_bytes_and_unfinished_eof() {
                 status: WelcomeStatus::Ok,
                 stream: pack(0, 1),
                 max_record: 256,
+                frame_capacity: 232,
                 ingress,
                 rx,
             });
@@ -1082,7 +1089,7 @@ fn finished_ack_waits_for_all_backpressured_events() {
             session,
             id,
             if index % 2 == 0 {
-                Event::Connected
+                Event::Connected { mss: 1460 }
             } else {
                 Event::PeerFin
             },
@@ -1110,7 +1117,7 @@ fn finished_ack_waits_for_all_backpressured_events() {
                 assert_eq!(
                     event,
                     if received % 2 == 0 {
-                        Event::Connected
+                        Event::Connected { mss: 1460 }
                     } else {
                         Event::PeerFin
                     }
