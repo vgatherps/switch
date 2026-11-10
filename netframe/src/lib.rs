@@ -14,12 +14,21 @@
 #![no_std]
 
 use core::fmt;
-use core::mem::{align_of, size_of};
+use core::mem::{ManuallyDrop, align_of, size_of};
 use core::ops::{Deref, DerefMut, Range};
 use core::ptr::NonNull;
 
 /// Called once, on the last release. `rc` points at the frame's refcount (still 1).
 pub type Release = unsafe extern "C" fn(rc: NonNull<u16>, ctx: *mut ());
+
+/// One transferred reference to producer-owned frame storage.
+pub struct RawParts {
+    pub data: NonNull<u8>,
+    pub len: u32,
+    pub rc: NonNull<u16>,
+    pub release: Release,
+    pub ctx: *mut (),
+}
 
 #[repr(C)]
 struct RawFrame {
@@ -47,6 +56,17 @@ impl RawFrame {
         self.data = unsafe { NonNull::new_unchecked(self.data.as_ptr().add(range.start)) };
         self.len = (range.end - range.start) as u32;
         self.rc_off += range.start as u32;
+    }
+
+    fn into_raw_parts(self) -> RawParts {
+        let frame = ManuallyDrop::new(self);
+        RawParts {
+            data: frame.data,
+            len: frame.len,
+            rc: frame.rc(),
+            release: frame.release,
+            ctx: frame.ctx,
+        }
     }
 }
 
@@ -79,8 +99,9 @@ impl OwnedFrame {
     /// derived from the same allocation pointer, so subtracting the stored offset
     /// from `data` can reach the count, with `(data - rc) + len <= u32::MAX`.
     /// `data..data+len` is valid for reads and writes while the count is nonzero.
-    /// Nothing else touches the count. `release(rc, ctx)` releases the storage
-    /// and runs once, on this thread.
+    /// Other holders may share the count if they use the same plain increment/decrement
+    /// protocol on this thread and the last holder calls `release(rc, ctx)` exactly once.
+    /// Mutable access requires exclusive ownership of the storage.
     pub unsafe fn from_raw_parts(
         data: NonNull<u8>,
         len: u32,
@@ -106,6 +127,35 @@ impl OwnedFrame {
     pub fn slice(mut self, range: Range<usize>) -> Self {
         self.0.slice(range);
         self
+    }
+
+    /// Sets the length of producer-owned storage.
+    ///
+    /// # Safety
+    /// `data..data+len` is storage this frame owns; the producer knows its room.
+    pub unsafe fn set_len(&mut self, len: u32) {
+        self.0.len = len;
+    }
+
+    /// Narrows the payload in place, keeping its start. Panics past the current length.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.0.len as usize);
+        self.0.len = len as u32;
+    }
+
+    /// The stored data pointer, retaining its allocation provenance.
+    pub fn data_ptr(&self) -> NonNull<u8> {
+        self.0.data
+    }
+
+    /// The producer's context.
+    pub fn ctx(&self) -> *mut () {
+        self.0.ctx
+    }
+
+    /// Transfers this reference without changing the count.
+    pub fn into_raw_parts(self) -> RawParts {
+        self.0.into_raw_parts()
     }
 }
 
@@ -136,6 +186,44 @@ impl fmt::Debug for OwnedFrame {
 pub struct ImmutableFrame(RawFrame);
 
 impl ImmutableFrame {
+    /// Takes a transferred reference to producer-owned storage.
+    ///
+    /// # Safety
+    /// The pointer, storage, count protocol and release requirements of
+    /// `OwnedFrame::from_raw_parts` apply, except the count may exceed one.
+    /// `parts` transfers one live reference, and the payload remains immutable
+    /// until exclusive ownership is recovered.
+    pub unsafe fn from_raw_parts(parts: RawParts) -> Self {
+        Self(RawFrame {
+            data: parts.data,
+            len: parts.len,
+            rc_off: (parts.data.as_ptr() as usize - parts.rc.as_ptr() as usize) as u32,
+            release: parts.release,
+            ctx: parts.ctx,
+        })
+    }
+
+    /// Narrows the payload in place, keeping its start. Panics past the current length.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.0.len as usize);
+        self.0.len = len as u32;
+    }
+
+    /// The stored data pointer, retaining its allocation provenance.
+    pub fn data_ptr(&self) -> NonNull<u8> {
+        self.0.data
+    }
+
+    /// The producer's context.
+    pub fn ctx(&self) -> *mut () {
+        self.0.ctx
+    }
+
+    /// Transfers this reference without changing the count.
+    pub fn into_raw_parts(self) -> RawParts {
+        self.0.into_raw_parts()
+    }
+
     /// Recovers exclusive ownership only if this is the sole reference.
     pub fn try_own(self) -> Result<OwnedFrame, Self> {
         // SAFETY: the frame keeps the count alive and only this thread accesses it.
@@ -288,6 +376,86 @@ mod tests {
         drop(clones);
         assert_eq!(producer.releases.get(), 0);
         drop(frame);
+        assert_eq!(producer.releases.get(), 1);
+        assert_eq!(producer.released_count.get(), 1);
+    }
+
+    #[test]
+    fn truncate_keeps_the_start_on_both_types() {
+        let producer = Producer::default();
+        let mut owned = producer.frame();
+        let start = owned.as_ptr();
+        owned.truncate(5);
+        assert_eq!(&*owned, b"abcde");
+        assert_eq!(owned.as_ptr(), start);
+        let mut shared = owned.freeze();
+        shared.truncate(3);
+        assert_eq!(&*shared, b"abc");
+        assert_eq!(shared.as_ptr(), start);
+    }
+
+    #[test]
+    fn truncate_past_owned_length_panics() {
+        let producer = Producer::default();
+        let mut frame = producer.frame();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frame.truncate(9);
+        }));
+        assert!(result.is_err());
+        assert_eq!(frame.len(), 8);
+    }
+
+    #[test]
+    fn truncate_past_immutable_length_panics() {
+        let producer = Producer::default();
+        let mut frame = producer.frame().freeze();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            frame.truncate(9);
+        }));
+        assert!(result.is_err());
+        assert_eq!(frame.len(), 8);
+    }
+
+    #[test]
+    fn owned_raw_parts_round_trip_releases_once() {
+        let producer = Producer::default();
+        let parts = producer.frame().into_raw_parts();
+        assert_eq!(producer.releases.get(), 0);
+        // SAFETY: parts transfers the original live reference.
+        let frame = unsafe { ImmutableFrame::from_raw_parts(parts) };
+        assert_eq!(&*frame, b"abcdefgh");
+        drop(frame);
+        assert_eq!(producer.releases.get(), 1);
+        assert_eq!(producer.released_count.get(), 1);
+    }
+
+    #[test]
+    fn immutable_raw_parts_round_trip_releases_once() {
+        let producer = Producer::default();
+        let parts = producer.frame().freeze().into_raw_parts();
+        assert_eq!(producer.releases.get(), 0);
+        // SAFETY: parts transfers the original live reference.
+        let frame = unsafe { ImmutableFrame::from_raw_parts(parts) };
+        assert_eq!(&*frame, b"abcdefgh");
+        drop(frame);
+        assert_eq!(producer.releases.get(), 1);
+        assert_eq!(producer.released_count.get(), 1);
+    }
+
+    #[test]
+    fn immutable_raw_parts_round_trip_preserves_shared_count() {
+        let producer = Producer::default();
+        let frame = producer.frame().freeze();
+        let kept = frame.clone();
+        let parts = frame.into_raw_parts();
+        assert_eq!(producer.releases.get(), 0);
+        // SAFETY: kept holds the storage live, independently of the transferred reference.
+        assert_eq!(unsafe { parts.rc.as_ptr().read() }, 2);
+        // SAFETY: parts transfers one of the two live references.
+        let frame = unsafe { ImmutableFrame::from_raw_parts(parts) };
+        assert!(frame.try_own().is_err());
+        assert_eq!(producer.releases.get(), 0);
+        drop(kept);
         assert_eq!(producer.releases.get(), 1);
         assert_eq!(producer.released_count.get(), 1);
     }
