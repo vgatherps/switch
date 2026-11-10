@@ -6,7 +6,8 @@
 
 ## Before you start (AWS console or CLI)
 
-- Instance: AL2023 (`al2023-ami-kernel-default`), at least 2 CPUs. hft-host.sh itself works on any
+- Instance: AL2023 (`al2023-ami-kernel-default`), two physical cores on the data ENI's NUMA node
+  plus at least one housekeeping CPU. hft-host.sh itself works on any
   ENA instance (the bench uses it on c7gn in a cluster placement group).
 - For the Binance listener, the instance must give ENA hardware RX timestamps and the PTP hardware
   clock (PHC): `run-binance.sh` runs with `rx_timestamps: true`, so elsewhere Port open fails
@@ -59,9 +60,9 @@ activate the drop-in before proceeding.
 | step | what |
 |---|---|
 | packages, rust, dpdk | dnf toolchain with clang/lld 18; rustup with `rust-toolchain.toml`'s channel; DPDK 25.11.3 under `/opt/dpdk` with `conduit/docker/dpdk-ena-read-clock.patch` (ENA `rte_eth_read_clock` from the device PHC) and `conduit/docker/Dockerfile`'s meson options. `/opt/dpdk/share/zhida-dpdk.stamp` records the tarball and patch sha256; a missing or different stamp (a stock 25.11.3, an older patch) means a clean rebuild |
-| binaries | `cargo build --release --locked -p nic-runner -p zhida-netconf`; `zhida-nic` (mimalloc global allocator) and `zhida-netconf` go into `/usr/local/bin` |
+| binaries | `cargo build --release --locked -p nic-runner -p zhida-netconf -p junctiond`; `zhida-nic` (mimalloc global allocator), `zhida-netconf`, and `junctiond` go into `/usr/local/bin` |
 | interfaces | management = the interface of the lowest-metric IPv4 default route; data = the one other `ena` interface. Never the same interface; every step that touches the data ENI checks again first |
-| cpus | app CPU = highest-numbered CPU on the data ENI's NUMA node; it and its SMT siblings are isolated, every other CPU is housekeeping. Written to `/etc/zhida/host.env` |
+| cpus | `APP_CPU` = highest-numbered CPU on the data ENI's NUMA node; `JUNCTION_CPU` = highest CPU there outside the app's SMT siblings. Both physical cores, including SMT siblings, are isolated. Every other CPU is housekeeping; setup refuses if none remain. Both CPU assignments and lists are saved in `/etc/zhida/host.env`. Conduit apps keep using `APP_CPU` only |
 | config | `zhida-netconf discover --interface <data> --aws -o /etc/zhida/dut.json`, then `check`. `rx_timestamps` stays as discovered (false); run-binance.sh turns it on in its own copy |
 | cmdline | via grubby: `isolcpus=managed_irq,domain,<iso> nohz_full=<iso> rcu_nocbs=<iso> irqaffinity=<housekeeping> transparent_hugepage=madvise hugepagesz=2M hugepages=<node>:512 ena.phc_enable=1` (1 GiB of 2 MiB pages on the data ENI's node; `ena.phc_enable=1` makes the ENA PTP hardware clock appear as `/dev/ptp_ena` after reboot, chrony's reference) |
 | vfio_wc | official AL2023 `kernel6.18` already supplies ENA write-combining (needed for LLQ); check package ownership/integrity and loaded module identity, without installing headers or rebuilding it. Legacy kernels retain amzn-drivers' `get-vfio-with-wc.sh`, pinned commit and sha256 |
@@ -109,6 +110,15 @@ receiver and senders explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overridin
 The binaries still use mimalloc; its default transparent hugepage support stays enabled, and the host
 keeps `transparent_hugepage=madvise`. THP uses ordinary memory rather than the reserved HugeTLB pool;
 THP backing is possible, not guaranteed.
+
+The AWS runner accepts `--backend conduit junction` for side-by-side sweeps (default `conduit`).
+`bench/aws/bootstrap.sh` installs both `zhida-bench` and `junctiond`. Junction sweeps start
+`junctiond` on `JUNCTION_CPU` with `--control-cpus HOUSEKEEPING`, wait for its control socket,
+then run each benchmark app on `APP_CPU`. Each receiver and sender gets its own daemon, stopped
+after the sweep even on failure. With the `kernel` command, the receiver stays on kernel sockets;
+only senders use the selected backend. Artifact filenames include `conduit-` or `junction-`.
+`python3 bench/aws/zhida_aws_bench.py plan --backend conduit junction` prints the offline plan.
+
 
 An AWS diagnostic run with `MIMALLOC_ALLOW_LARGE_OS_PAGES=1` showed mimalloc reserving its default
 1 GiB arena before EAL: 2 HugeTLB pages used and 510 still reserved left none available for DPDK.

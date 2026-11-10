@@ -5,7 +5,8 @@
 # Usage: hft-host.sh build|apply|boot|verify [--interface IF] [--kernel-receiver]
 #
 #   build   dnf toolchain, rustup (rust-toolchain.toml), DPDK 25.11.3 under /opt/dpdk with
-#           conduit/docker/Dockerfile's meson options, release zhida-nic (mimalloc) and zhida-netconf
+#           conduit/docker/Dockerfile's meson options, release zhida-nic (mimalloc), zhida-netconf,
+#           and junctiond
 #           into /usr/local/bin.
 #   apply   build, then every setting below. Reboots once when the kernel command line or the ENA
 #           module changed; zhida-host.service runs `boot` at every boot, after which verify passes.
@@ -17,8 +18,9 @@
 # here changes it, and every step that touches the data ENI first checks that the two differ. The data
 # ENI is the one other interface on the ena driver (--interface IF when there are several). Its config
 # (/etc/zhida/dut.json) comes from `zhida-netconf discover --aws`.
-# CPUs: the app CPU is the highest-numbered CPU on the data ENI's NUMA node; it and its SMT siblings
-# are isolated (isolcpus, nohz_full, rcu_nocbs); every other CPU is housekeeping (irqaffinity, IRQs).
+# CPUs: APP_CPU is the highest-numbered CPU on the data ENI's NUMA node; JUNCTION_CPU is the
+# highest CPU on a different physical core there. Both and their SMT siblings are isolated.
+# Every other CPU is housekeeping (irqaffinity, IRQs); at least one must remain.
 # Hugepages: 512 x 2 MiB on the data ENI's NUMA node, reserved on the kernel command line.
 # x86_64 also gets clocksource=tsc (not tsc=reliable: that turns off the kernel's TSC stability
 # checks); Graviton's arch_sys_counter needs nothing.
@@ -174,11 +176,11 @@ step_dpdk() {
 }
 
 step_binaries() {
-    (cd "$REPO" && cargo build -q --release --locked -p nic-runner -p zhida-netconf) \
+    (cd "$REPO" && cargo build -q --release --locked -p nic-runner -p zhida-netconf -p junctiond) \
         || fatal binaries "cargo build failed"
-    install -m 0755 "$REPO/target/release/zhida-nic" "$REPO/target/release/zhida-netconf" /usr/local/bin/ \
+    install -m 0755 "$REPO/target/release/zhida-nic" "$REPO/target/release/zhida-netconf" "$REPO/target/release/junctiond" /usr/local/bin/ \
         || fatal binaries "install failed"
-    report binaries ok "/usr/local/bin/zhida-nic /usr/local/bin/zhida-netconf (release)"
+    report binaries ok "/usr/local/bin/zhida-nic /usr/local/bin/zhida-netconf /usr/local/bin/junctiond (release)"
 }
 
 build() {
@@ -233,12 +235,18 @@ step_cpus() {
         || cat "$R/sys/devices/system/cpu/online")
     APP_CPU=$(expand "$node_cpus" | tail -n 1)
     [ "$APP_CPU" != 0 ] || fatal cpus "only CPU 0 on node $NUMA_NODE: nothing to isolate"
-    ISOLATED=$(cat "$R/sys/devices/system/cpu/cpu$APP_CPU/topology/thread_siblings_list" 2>/dev/null || echo "$APP_CPU")
+    app_siblings=$(cat "$R/sys/devices/system/cpu/cpu$APP_CPU/topology/thread_siblings_list" 2>/dev/null || echo "$APP_CPU")
+    JUNCTION_CPU=$(expand "$node_cpus" | while read -r c; do
+        expand "$app_siblings" | grep -qx "$c" || echo "$c"
+    done | tail -n 1)
+    [ -n "$JUNCTION_CPU" ] || fatal cpus "node $NUMA_NODE needs two distinct physical cores"
+    junction_siblings=$(cat "$R/sys/devices/system/cpu/cpu$JUNCTION_CPU/topology/thread_siblings_list" 2>/dev/null || echo "$JUNCTION_CPU")
+    ISOLATED=$({ expand "$app_siblings"; expand "$junction_siblings"; } | sort -nu | join)
     HOUSEKEEPING=$(expand "$(cat "$R/sys/devices/system/cpu/online")" | while read -r c; do
         expand "$ISOLATED" | grep -qx "$c" || echo "$c"
     done | join)
     [ -n "$HOUSEKEEPING" ] || fatal cpus "no housekeeping CPU left"
-    report cpus ok "app CPU $APP_CPU; isolated $ISOLATED; housekeeping $HOUSEKEEPING"
+    report cpus ok "app CPU $APP_CPU; junction CPU $JUNCTION_CPU; isolated $ISOLATED; housekeeping $HOUSEKEEPING"
 }
 
 save_env() {
@@ -248,6 +256,7 @@ DATA_PCI=$DATA_PCI
 DATA_MAC=$DATA_MAC
 NUMA_NODE=$NUMA_NODE
 APP_CPU=$APP_CPU
+JUNCTION_CPU=$JUNCTION_CPU
 ISOLATED=$ISOLATED
 DATA_DRIVER=$DATA_DRIVER
 HOUSEKEEPING=$HOUSEKEEPING" || true

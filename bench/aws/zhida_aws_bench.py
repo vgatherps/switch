@@ -66,7 +66,7 @@ TTL = "2h"
 
 # The fixed shape: 1 receiver + SENDERS sender hosts, all HOST_TYPE. 1 + 3 x c7gn.xlarge = 16 vCPUs
 # (the account's quota); 1 + 5 x c7gn.2xlarge (48 vCPUs) is SENDERS = 5, HOST_TYPE = "c7gn.2xlarge".
-# Each host: hft-host.sh isolates its highest CPU for the app, the rest (at least 3) housekeep.
+# Each host: hft-host.sh isolates APP_CPU and a distinct-core JUNCTION_CPU, retaining housekeeping.
 SENDERS, HOST_TYPE = 3, "c7gn.xlarge"
 HOST_VCPUS = {"c7gn.xlarge": 4, "c7gn.2xlarge": 8}[HOST_TYPE]
 SHAPES = {
@@ -130,42 +130,72 @@ def run_tags(run_id, expires):
             {"Key": "Name", "Value": f"{NAME}-{run_id}"}]
 
 
-def tag(proto, budget):
-    return f"{proto}-n{CONNECTIONS}-s{SIZE}-{'uncapped' if budget is None else f'b{budget}'}"
+def tag(proto, budget, backend="conduit"):
+    return f"{backend}-{proto}-n{CONNECTIONS}-s{SIZE}-{'uncapped' if budget is None else f'b{budget}'}"
 
 
-def sweep_tags():
-    return [tag(p, b) for p, b in SWEEPS]
+def sweep_tags(backends=("conduit",)):
+    return [tag(p, b, backend) for backend in backends for p, b in SWEEPS]
 
 
-def gen_template(proto, receiver_ip, t):
+def gen_template(proto, receiver_ip, t, backend="conduit"):
     """--gen-cmd: the coordinator runs it with `sh -c` on sender0 for {i} = 0..4; it starts worker
     {i} on sender{i} through the run's ssh_config, pinned to that host's APP_CPU."""
+    network = ("--config /etc/zhida/dut.json" if backend == "conduit"
+               else "--backend junction --junction-socket /run/junctiond/control.sock")
     inner = (f". /etc/zhida/host.env; exec env {MIMALLOC_ENV} {XSTATS_ENV} taskset -c $APP_CPU zhida-bench gen"
-             f" --config /etc/zhida/dut.json --proto {proto} --target {receiver_ip}:{PORT} --senders {{senders}}"
+             f" {network} --proto {proto} --target {receiver_ip}:{PORT} --senders {{senders}}"
              f" --size {SIZE} --local-port 40000 2>>{REMOTE}/gen-{t}.log")
     return f"ssh -F {REMOTE}/ssh_config sender{{i}} {shlex.quote('sudo sh -c ' + shlex.quote(inner))}"
 
 
-def sweep_command(proto, budget, receiver_ip, housekeeping):
+def sweep_command(proto, budget, receiver_ip, housekeeping, backend="conduit"):
     """The coordinator, run as ec2-user on sender0's housekeeping CPUs."""
-    t = tag(proto, budget)
+    t = tag(proto, budget, backend)
     budget_arg = "" if budget is None else f" --budget-us {budget}"
     command = (f"taskset -c {shlex.quote(housekeeping)} zhida-bench sweep --proto {proto} --gens {SENDERS}"
                f" --senders {CONNECTIONS} --rates {','.join(map(str, RATES))}{budget_arg}"
                f" --step-ms {STEP_MS} --warmup-ms {WARMUP_MS} --drain-ms {DRAIN_MS}"
-               f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t))}"
+               f" --gen-cmd {shlex.quote(gen_template(proto, receiver_ip, t, backend))}"
                f" > {REMOTE}/{t}.jsonl 2> >(tee {REMOTE}/{t}.coord.log >&2)")
     return f"bash -c {shlex.quote(command)}"
 
 
-def serve_command(proto, app_cpu, kernel_ip=None):
-    """The receiver as a transient systemd unit; generators never change."""
-    command = (f"serve --config /etc/zhida/dut.json" if kernel_ip is None
+def serve_command(proto, app_cpu, kernel_ip=None, backend="conduit"):
+    """The receiver as a transient systemd unit; kernel selection is independent of backend."""
+    network = ("--config /etc/zhida/dut.json" if backend == "conduit"
+               else "--backend junction --junction-socket /run/junctiond/control.sock")
+    command = (f"serve {network}" if kernel_ip is None
                else f"kernel-serve --bind {shlex.quote(kernel_ip)}")
     return (f"systemd-run --unit {RECEIVER_UNIT} --setenv={MIMALLOC_ENV} --setenv={XSTATS_ENV} taskset -c {shlex.quote(app_cpu)}"
             f" zhida-bench {command} --proto {proto} --port {PORT}")
 
+
+
+JUNCTION_UNIT = "zhida-bench-junction"
+
+
+def junction_command(facts):
+    return (f"systemd-run --unit {JUNCTION_UNIT} taskset -c {shlex.quote(facts['JUNCTION_CPU'])}"
+            f" junctiond --config /etc/zhida/dut.json --dir /run/junctiond"
+            f" --control-cpus {shlex.quote(facts['HOUSEKEEPING'])}")
+
+
+def start_junction(host, facts, env):
+    host.root(f"systemctl stop {JUNCTION_UNIT} 2>/dev/null; "
+              f"systemctl reset-failed {JUNCTION_UNIT} 2>/dev/null; "
+              f"rm -f /run/junctiond/control.sock; {junction_command(facts)}")
+    for _ in range(100):
+        ready = host.root(f"systemctl is-active --quiet {JUNCTION_UNIT} && "
+                          "test -S /run/junctiond/control.sock", check=False)
+        if ready.returncode == 0:
+            return
+        env.sleep(0.1)
+    raise RuntimeError(f"{host.role}: junctiond control socket not ready")
+
+
+def stop_junction(host):
+    host.root(f"systemctl stop {JUNCTION_UNIT}", check=False)
 
 def ssh_config(sender_ips):
     """sender0's ssh_config: the senders by their primary private IPs, the run's key."""
@@ -179,7 +209,7 @@ def ssh_config(sender_ips):
     return "\n".join(lines) + "\n"
 
 
-HOST_ENV_KEYS = ("MGMT_IF", "DATA_IF", "DATA_PCI", "DATA_MAC", "NUMA_NODE", "APP_CPU", "ISOLATED", "HOUSEKEEPING")
+HOST_ENV_KEYS = ("MGMT_IF", "DATA_IF", "DATA_PCI", "DATA_MAC", "NUMA_NODE", "APP_CPU", "JUNCTION_CPU", "ISOLATED", "HOUSEKEEPING")
 
 
 def parse_host_env(text):
@@ -271,7 +301,7 @@ def feed_summary(text, code):
     return out
 
 
-def plan_text(region, ttl, run_id, expires, kernel=False, shape="arm"):
+def plan_text(region, ttl, run_id, expires, kernel=False, shape="arm", backends=("conduit",)):
     receiver_type, sender_type, _, vcpus = SHAPES[shape]
     hosts = (f"{len(ROLES)} x {receiver_type}" if receiver_type == sender_type
              else f"1 x {receiver_type} receiver, {SENDERS} x {sender_type} senders")
@@ -280,7 +310,7 @@ def plan_text(region, ttl, run_id, expires, kernel=False, shape="arm"):
         f"hosts: {hosts} on-demand, in a cluster placement group, one subnet/AZ;"
         f" each: primary ENI (SSH, public IPv4) + 1 data ENI"
         f" ({'receiver on Linux ena, senders on vfio-pci' if kernel else 'vfio-pci'}, DeleteOnTermination);"
-        " CPUs from hft-host.sh: one isolated APP_CPU, the rest HOUSEKEEPING",
+        " CPUs from hft-host.sh: isolated APP_CPU and distinct-core JUNCTION_CPU; the rest HOUSEKEEPING",
         f"  {'receiver':9} zhida-bench {'kernel-serve' if kernel else 'serve'} on APP_CPU"
         f" (systemd unit {RECEIVER_UNIT})",
         f"  {'sender0':9} zhida-bench sweep (coordinator) on HOUSEKEEPING; worker 0 (zhida-bench gen) on APP_CPU",
@@ -293,7 +323,11 @@ def plan_text(region, ttl, run_id, expires, kernel=False, shape="arm"):
         f"timing per rate: {STEP_MS} ms measurement + {WARMUP_MS} ms warmup + {DRAIN_MS} ms drain"
         " + 50 ms lead; host setup/builds, worker startup and clock probes are additional",
     ]
-    lines += [f"  {t}" + ("" if b is None else f"  (--budget-us {b})") for t, (p, b) in zip(sweep_tags(), SWEEPS)]
+    for backend in backends:
+        lines.append(f"backend {backend}: " + (
+            "junctiond on JUNCTION_CPU, control threads on HOUSEKEEPING; control socket readiness before apps"
+            if backend == "junction" else "apps own the NIC on APP_CPU"))
+        lines += [f"  {tag(p, b, backend)}" + ("" if b is None else f"  (--budget-us {b})") for p, b in SWEEPS]
     lines += [
         f"needs: on-demand Standard vCPU quota L-1216C47A with {vcpus} vCPUs free in {region};"
         " permissions: see `zhida_aws_bench.py -h`",
@@ -937,18 +971,23 @@ def fetch_sweep(t, hosts, run_dir):
     return [e for e in (h.fetch(remote, local) for h, remote, local in wanted) if e]
 
 
-def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_dir=None):
+def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_dir=None, backend="conduit"):
     """One sweep: receiver unit up, coordinator on sender0, receiver stopped. Returns the coordinator's
     exit code, or None when it did not run or timed out."""
     receiver, sender0 = hosts[0], hosts[1]
-    t = tag(proto, budget)
+    t = tag(proto, budget, backend)
     before = kernel_snapshot(receiver, facts["receiver"]) if kernel else None
     ena_before = kernel_ena_snapshot(receiver, facts["receiver"]["DATA_IF"]) if kernel else None
     invocation = None
+    daemons = []
     try:
+        if backend == "junction":
+            for host in (hosts[1:] if kernel else hosts):
+                daemons.append(host)
+                start_junction(host, facts[host.role], env)
         launched = receiver.root(
             f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
-            f" {serve_command(proto, facts['receiver']['APP_CPU'], receiver_ip if kernel else None)}",
+            f" {serve_command(proto, facts['receiver']['APP_CPU'], receiver_ip if kernel else None, backend)}",
             check=False)
         invocation_result = receiver.root(f"systemctl show {RECEIVER_UNIT} --property=InvocationID --value", check=False)
         if invocation_result.returncode == 0:
@@ -961,7 +1000,7 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
             log(f"{t}: receiver did not start")
             return None
         try:
-            return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"]),
+            return sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"], backend),
                                check=False, timeout=SWEEP_WORST_S, stream=True).returncode
         except subprocess.TimeoutExpired:
             log(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
@@ -971,6 +1010,11 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
         try:
             receiver.root(f"systemctl stop {RECEIVER_UNIT}", check=False)
         finally:
+            for host in reversed(daemons):
+                try:
+                    stop_junction(host)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    log(f"{t}: {host.role}: junctiond stop failed: {error}")
             save_receiver_journal(receiver, invocation, os.path.join(run_dir, f"{t}.receiver.log"))
             if kernel:
                 ena_after = kernel_ena_snapshot(receiver, facts["receiver"]["DATA_IF"])
@@ -991,16 +1035,16 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
                     json.dump(artifact, f, indent=2)
 
 
-def measure(hosts, facts, receiver_ip, run_dir, env, kernel=False):
+def measure(hosts, facts, receiver_ip, run_dir, env, kernel=False, backends=("conduit",)):
     """The fixed matrix. A failed sweep is logged and the next one runs; every sweep started is
     fetched. Returns (fetch failures, sweeps whose coordinator did not exit 0)."""
     with open(os.path.join(run_dir, "expected.json"), "w") as f:
-        json.dump({"sweeps": sweep_tags()}, f)
+        json.dump({"sweeps": sweep_tags(backends)}, f)
     fetch_errors, failed = [], []
-    for proto, budget in SWEEPS:
-        t = tag(proto, budget)
+    for backend, proto, budget in ((backend, p, b) for backend in backends for p, b in SWEEPS):
+        t = tag(proto, budget, backend)
         try:
-            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel, run_dir)
+            code = run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel, run_dir, backend)
             log(f"{t}: coordinator exit {code}")
             if code != 0:
                 failed.append(t)
@@ -1024,9 +1068,10 @@ def run(args, env=None, kernel=False):
     expires = now + datetime.timedelta(seconds=parse_duration(args.ttl))
     run_id = new_run_id(now)
     receiver_type, sender_type, ami_param, vcpus = SHAPES[args.shape]
-    print(plan_text(args.region, args.ttl, run_id, expires, kernel, args.shape))
+    backends = getattr(args, "backend", ["conduit"])
+    print(plan_text(args.region, args.ttl, run_id, expires, kernel, args.shape, backends))
     if kernel:
-        print("receiver: Linux kernel sockets on the same data ENI; generators: unchanged Zhida/DPDK")
+        print(f"receiver: Linux kernel sockets on the same data ENI; generator backends: {', '.join(backends)}")
     aws, zone = checked_preflight(env, args.region, (receiver_type, sender_type), vcpus,
                                   getattr(args, "zone", None))
     revision = env.local(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
@@ -1070,7 +1115,7 @@ def run(args, env=None, kernel=False):
         with open(os.path.join(run_dir, "host-setup.txt"), "w") as f:
             f.write("\n".join(setup) + "\n")
         connect_senders(hosts, key_path)
-        fetch_errors, failed = measure(hosts, facts, receiver_ip, run_dir, env, kernel)
+        fetch_errors, failed = measure(hosts, facts, receiver_ip, run_dir, env, kernel, backends)
     finally:
         # Nothing interrupts teardown; it goes first because the report is local.
         on_signals(signal.SIG_IGN)
@@ -1184,6 +1229,8 @@ def parser():
         else:
             r.add_argument("--ttl", default=TTL, help="hard expiry of everything billable (e.g. 90m, 2h)")
             r.add_argument("--shape", choices=SHAPES, default="arm", help="benchmark host shape (default: arm)")
+            r.add_argument("--backend", choices=("conduit", "junction"), nargs="+", default=["conduit"],
+                           help="backend sweep dimension (default: conduit); select both side by side")
             if name in ("run", "kernel", "preflight"):
                 r.add_argument("--zone", help="availability zone offering both instance types")
     b = sub.add_parser("binance", help="run the Binance listener (deploy/run-binance.sh) on one EC2 host")
@@ -1207,7 +1254,8 @@ def main(argv, env=None):
     if args.cmd == "plan":
         now = datetime.datetime.now(datetime.timezone.utc)
         print(plan_text(args.region or "(the AWS profile's)", args.ttl, new_run_id(now),
-                        now + datetime.timedelta(seconds=parse_duration(args.ttl)), shape=args.shape))
+                        now + datetime.timedelta(seconds=parse_duration(args.ttl)), shape=args.shape,
+                        backends=args.backend))
         return 0
     if args.cmd in ("run", "kernel"):
         return run(args, env, kernel=args.cmd == "kernel")

@@ -30,7 +30,7 @@ UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 RECEIVER_DATA_IP = "10.80.1.100"
 HOST_ENV = ("MGMT_IF=ens5\nDATA_IF=ens6\nDATA_PCI=0000:00:06.0\nDATA_MAC=0a:00:00:00:00:01\nNUMA_NODE=0\n"
-            "APP_CPU=7\nISOLATED=7\nHOUSEKEEPING=0-6\n")
+            "APP_CPU=7\nJUNCTION_CPU=6\nISOLATED=6,7\nHOUSEKEEPING=0-5\n")
 
 
 # zhida-nic's lines (conduit/crates/nic-runner/src/main.rs `line`: "zhida-nic: {key}: {value}"); the
@@ -103,10 +103,12 @@ class PureTest(unittest.TestCase):
 
     def test_host_env_needs_every_key(self):
         env = z.parse_host_env(HOST_ENV + "# comment\n")
-        self.assertEqual((env["APP_CPU"], env["HOUSEKEEPING"]), ("7", "0-6"))
+        self.assertEqual((env["APP_CPU"], env["JUNCTION_CPU"], env["HOUSEKEEPING"]), ("7", "6", "0-5"))
         self.assertEqual(z.parse_host_env("APP_CPU='3'\n" + HOST_ENV.replace("APP_CPU=7\n", ""))["APP_CPU"], "3")
         with self.assertRaisesRegex(ValueError, "HOUSEKEEPING"):
-            z.parse_host_env(HOST_ENV.replace("HOUSEKEEPING=0-6\n", ""))
+            z.parse_host_env(HOST_ENV.replace("HOUSEKEEPING=0-5\n", ""))
+        with self.assertRaisesRegex(ValueError, "JUNCTION_CPU"):
+            z.parse_host_env(HOST_ENV.replace("JUNCTION_CPU=6\n", ""))
 
     def test_data_ip_from_dut_json(self):
         self.assertEqual(z.data_ip('{"version": 1, "ipv4": "10.80.1.23/24"}'), "10.80.1.23")
@@ -119,6 +121,153 @@ class PureTest(unittest.TestCase):
                      f"UserKnownHostsFile {z.REMOTE}/known_hosts"):
             self.assertIn(line, cfg)
 
+
+
+class JunctionRunnerTest(unittest.TestCase):
+    def test_backend_cli_and_plan_side_by_side(self):
+        # Kill mutations: default-junction, ignore-second-backend, omit-backend-label.
+        for command in ("run", "kernel", "plan"):
+            self.assertEqual(z.parser().parse_args([command]).backend, ["conduit"])
+            self.assertEqual(z.parser().parse_args([command, "--backend", "conduit", "junction"]).backend,
+                             ["conduit", "junction"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            z.main(["plan", "--backend", "conduit", "junction"])
+        for backend in ("conduit", "junction"):
+            for label in z.sweep_tags([backend]):
+                self.assertIn(label, out.getvalue())
+        self.assertIn("JUNCTION_CPU", out.getvalue())
+
+    def test_commands_pin_daemon_and_apps_separately_without_app_config(self):
+        # Kill mutations: daemon-on-APP_CPU, control-on-isolated, app-opens-NIC, kernel-becomes-junction.
+        facts = z.parse_host_env(HOST_ENV)
+        daemon = shlex.split(z.junction_command(facts))
+        self.assertEqual(daemon[daemon.index("-c") + 1], "6")
+        self.assertEqual(daemon[daemon.index("--control-cpus") + 1], "0-5")
+        self.assertIn("--config", daemon)
+        receiver = shlex.split(z.serve_command("udp", "7", backend="junction"))
+        self.assertEqual(receiver[receiver.index("-c") + 1], "7")
+        self.assertNotIn("--config", receiver)
+        self.assertEqual(receiver[receiver.index("--backend") + 1], "junction")
+        self.assertEqual(receiver[receiver.index("--junction-socket") + 1], "/run/junctiond/control.sock")
+        template = z.gen_template("udp", RECEIVER_DATA_IP, "junction-test", "junction")
+        ssh = shlex.split(template.replace("{i}", "2"))
+        sudo = shlex.split(ssh[-1])
+        worker = sudo[-1]
+        self.assertIn("taskset -c $APP_CPU zhida-bench gen", worker)
+        self.assertIn("--backend junction --junction-socket /run/junctiond/control.sock", worker)
+        self.assertNotIn("--config", worker)
+        kernel = z.serve_command("udp", "7", RECEIVER_DATA_IP, "junction")
+        self.assertIn("kernel-serve --bind " + RECEIVER_DATA_IP, kernel)
+        self.assertNotIn("--junction-socket", kernel)
+        conduit = z.serve_command("udp", "7")
+        self.assertIn("serve --config /etc/zhida/dut.json", conduit)
+
+    def test_readiness_requires_live_unit_and_socket_and_times_out(self):
+        # Kill mutations: skip-readiness, check-file-not-socket, skip-unit-check, unbounded-wait.
+        host = mock.Mock(role="sender0")
+        host.root.side_effect = [Proc(), Proc(1), Proc()]
+        env = mock.Mock()
+        z.start_junction(host, z.parse_host_env(HOST_ENV), env)
+        probe = host.root.call_args_list[1].args[0]
+        self.assertIn("systemctl is-active --quiet " + z.JUNCTION_UNIT, probe)
+        self.assertIn("test -S /run/junctiond/control.sock", probe)
+        env.sleep.assert_called_once_with(0.1)
+        host.root.side_effect = None
+        host.root.return_value = Proc(1)
+        with self.assertRaisesRegex(RuntimeError, "control socket not ready"):
+            z.start_junction(host, z.parse_host_env(HOST_ENV), mock.Mock())
+
+    def lifecycle(self, kernel=False, failed_host=None, coordinator_error=None, backend="junction"):
+        events = []
+        hosts = [mock.Mock(role=role) for role in z.ROLES]
+        facts = {role: z.parse_host_env(HOST_ENV) for role in z.ROLES}
+        for host in hosts:
+            def root(command, host=host, **kwargs):
+                events.append((host.role, command))
+                return Proc(0, "active\n")
+            host.root.side_effect = root
+        def ssh(command, **kwargs):
+            events.append(("sender0", "coordinator" if kwargs.get("stream") else command))
+            if coordinator_error and kwargs.get("stream"):
+                raise coordinator_error
+            return Proc()
+        hosts[1].ssh.side_effect = ssh
+        def start(host, facts, env):
+            events.append((host.role, "ready"))
+            if host.role == failed_host:
+                raise RuntimeError("daemon failed")
+        def stop(host):
+            events.append((host.role, "daemon-stop"))
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(z, "start_junction", side_effect=start), \
+                mock.patch.object(z, "stop_junction", side_effect=stop), \
+                mock.patch.object(z, "save_receiver_journal"), \
+                mock.patch.object(z, "kernel_snapshot", return_value={}), \
+                mock.patch.object(z, "kernel_ena_snapshot", return_value={}), \
+                mock.patch.object(z, "kernel_ena_result", return_value={}), \
+                mock.patch.object(z, "kernel_counter_delta", return_value={}):
+            try:
+                z.run_sweep("udp", None, hosts, facts, RECEIVER_DATA_IP, mock.Mock(),
+                            kernel=kernel, run_dir=directory, backend=backend)
+            except (RuntimeError, KeyboardInterrupt):
+                if not (failed_host or coordinator_error):
+                    raise
+        return events
+
+    def test_conduit_never_starts_or_stops_daemons(self):
+        # Kill mutation: unconditional-daemon-lifecycle.
+        events = self.lifecycle(backend="conduit")
+        self.assertFalse(any(command in ("ready", "daemon-stop") for _, command in events))
+        self.assertIn(("sender0", "coordinator"), events)
+
+    def test_daemons_ready_on_every_host_before_apps_and_stop_after_receiver(self):
+        # Kill mutations: sender0-only-daemon, missing-receiver-daemon, launch-before-ready, omit-stop.
+        events = self.lifecycle()
+        self.assertEqual([role for role, command in events if command == "ready"], list(z.ROLES))
+        launch = next(i for i, (_, command) in enumerate(events) if "zhida-bench serve" in command)
+        self.assertTrue(all(i < launch for i, (_, command) in enumerate(events) if command == "ready"))
+        receiver_stop = events.index(("receiver", "systemctl stop " + z.RECEIVER_UNIT))
+        stops = [(i, role) for i, (role, command) in enumerate(events) if command == "daemon-stop"]
+        self.assertEqual([role for _, role in stops], list(reversed(z.ROLES)))
+        self.assertTrue(all(i > receiver_stop for i, _ in stops))
+
+    def test_partial_start_timeout_and_interrupt_always_stop_started_daemons(self):
+        # Kill mutations: cleanup-success-only, leak-failing-daemon, swallow-start-failure-and-measure.
+        events = self.lifecycle(failed_host="sender1")
+        self.assertNotIn(("sender0", "coordinator"), events)
+        self.assertEqual([role for role, command in events if command == "daemon-stop"],
+                         ["sender1", "sender0", "receiver"])
+        for error in (subprocess.TimeoutExpired("sweep", 900), KeyboardInterrupt()):
+            events = self.lifecycle(coordinator_error=error)
+            self.assertEqual({role for role, command in events if command == "daemon-stop"}, set(z.ROLES))
+
+    def test_kernel_receiver_only_starts_sender_daemons(self):
+        events = self.lifecycle(kernel=True)
+        self.assertEqual([role for role, command in events if command == "ready"], list(z.ROLES[1:]))
+        self.assertTrue(any("zhida-bench kernel-serve" in command for _, command in events))
+
+    def test_measure_fetches_both_backend_artifacts(self):
+        # Kill mutations: ignore-backend-in-measure, artifact-overwrite, skip-junction-fetch.
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(z, "run_sweep", return_value=0) as run, \
+                mock.patch.object(z, "fetch_sweep", return_value=[]) as fetch:
+            self.assertEqual(z.measure([], {}, RECEIVER_DATA_IP, directory, mock.Mock(),
+                                       backends=["conduit", "junction"]), ([], []))
+            self.assertEqual([call.args[-1] for call in run.call_args_list],
+                             ["conduit"] * len(z.SWEEPS) + ["junction"] * len(z.SWEEPS))
+            labels = z.sweep_tags(["conduit", "junction"])
+            self.assertEqual([call.args[0] for call in fetch.call_args_list], labels)
+            with open(os.path.join(directory, "expected.json")) as file:
+                self.assertEqual(json.load(file)["sweeps"], labels)
+
+    def test_bootstrap_builds_and_installs_daemon(self):
+        # Kill mutations: build-app-only, omit-daemon-install.
+        with open(os.path.join(os.path.dirname(__file__), "bootstrap.sh")) as file:
+            bootstrap = file.read()
+        self.assertIn("cargo build -q --release --locked -p zhida-bench -p junctiond", bootstrap)
+        self.assertIn("install -m 0755 target/release/zhida-bench target/release/junctiond /usr/local/bin/",
+                      bootstrap)
 
 class KernelRoutingTest(unittest.TestCase):
     @staticmethod
@@ -1320,12 +1469,12 @@ class RunTest(unittest.TestCase):
         self.assertEqual(w.sweep_timeouts, [900] * 5)
         self.assertTrue(all(r == "sender0" for r, c in w.calls if "zhida-bench sweep" in c))
         self.assertEqual(z.sweep_tags(), [
-            "udp-n12-s64-uncapped", "tcp-n12-s64-b50", "tcp-n12-s64-uncapped",
-            "ws-n12-s64-b50", "ws-n12-s64-uncapped"])
+            "conduit-udp-n12-s64-uncapped", "conduit-tcp-n12-s64-b50", "conduit-tcp-n12-s64-uncapped",
+            "conduit-ws-n12-s64-b50", "conduit-ws-n12-s64-uncapped"])
         for cmd, t, (proto, budget) in zip(sweeps, z.sweep_tags(), z.SWEEPS):
             inner = shlex.split(cmd)[2]
             argv = shlex.split(inner.split(" > ")[0])
-            self.assertEqual(argv[:3], ["taskset", "-c", "0-6"], "coordinator on HOUSEKEEPING")
+            self.assertEqual(argv[:3], ["taskset", "-c", "0-5"], "coordinator on HOUSEKEEPING")
             self.assertEqual(argv[argv.index("--gens") + 1], str(z.SENDERS))
             self.assertEqual(argv[argv.index("--proto") + 1], proto)
             self.assertEqual(argv[argv.index("--rates") + 1],

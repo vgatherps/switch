@@ -12,7 +12,13 @@ fails=0
 check() { # description, command...
     desc=$1
     shift
-    if "$@"; then echo "ok: $desc"; else echo "FAIL: $desc"; fails=$((fails + 1)); fi
+    if "$@"; then
+        echo "ok: $desc"
+    else
+        echo "FAIL: $desc"
+        [ ! -f "$tmp/out" ] || cat "$tmp/out"
+        fails=$((fails + 1))
+    fi
 }
 
 root=$tmp/root
@@ -138,7 +144,7 @@ host() {
     printf '%s\n' 'default via 10.0.0.1 dev ens6 proto dhcp src 10.0.0.20 metric 513' \
         'default via 10.0.0.1 dev ens5 proto dhcp src 10.0.0.10 metric 512' >"$tmp/routes"
 }
-want_args="isolcpus=managed_irq,domain,7 nohz_full=7 rcu_nocbs=7 irqaffinity=0,1,2,3,4,5,6 transparent_hugepage=madvise hugepagesz=2M hugepages=0:512 ena.phc_enable=1"
+want_args="isolcpus=managed_irq,domain,6,7 nohz_full=6,7 rcu_nocbs=6,7 irqaffinity=0,1,2,3,4,5 transparent_hugepage=madvise hugepagesz=2M hugepages=0:512 ena.phc_enable=1"
 # What the reboot changes: the kernel command line, the modules, and what the kernel then reports.
 reboot() {
     echo "ro console=ttyS0 $want_args" >"$root/proc/cmdline"
@@ -146,11 +152,11 @@ reboot() {
     : >"$root/dev/ptp_ena"
     echo "${FAKE_SRCVERSION-PATCHED}" >"$root/sys/module/vfio_pci_core/srcversion"
     echo 512 >"$root/sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"
-    echo 7 >"$root/sys/devices/system/cpu/isolated"
-    echo 7 >"$root/sys/devices/system/cpu/nohz_full"
+    echo 6,7 >"$root/sys/devices/system/cpu/isolated"
+    echo 6,7 >"$root/sys/devices/system/cpu/nohz_full"
     : >"$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci/vfio-pci-core.ko.xz_no_wc"
     # irqaffinity= puts the IRQs on the housekeeping CPUs at boot.
-    for irq in 10 11 12; do echo 0-6 >"$root/proc/irq/$irq/effective_affinity_list"; done
+    for irq in 10 11 12; do echo 0-5 >"$root/proc/irq/$irq/effective_affinity_list"; done
     # Model networkd's next boot: without the MAC-matched unmanaged file, data DHCP wins.
     if cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-zhida-data.network"; then
         echo 'default via 10.0.0.1 dev ens5 proto dhcp metric 512' >"$tmp/routes"
@@ -189,7 +195,7 @@ run boot
 check "kernel receiver boot succeeds" status_is 0
 check "kernel receiver boot keeps data ENI on ena" test "$(basename "$(readlink "$root/sys/bus/pci/devices/0000:00:06.0/driver")")" = ena
 check "kernel receiver boot leaves NIC binding alone" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
-check "kernel receiver boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5,6" "$root/proc/irq/10/smp_affinity_list"
+check "kernel receiver boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5" "$root/proc/irq/10/smp_affinity_list"
 run verify
 check "kernel receiver verifies on ena without VFIO" status_is 0
 check "kernel receiver verify reports its actual driver" has data "ok 0000:00:06.0 (0a:00:00:00:00:06) on ena"
@@ -202,10 +208,12 @@ check "no-reboot apply installs policy before restarting networkd" test -e "$tmp
 check "no-reboot apply restarts networkd to activate policy" called "systemctl restart systemd-networkd.service"
 check "no-reboot apply does not bind or unbind" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
 : >"$calls"
-FAKE_NETWORKD_FAIL=1 run apply --kernel-receiver
+# POSIX shells may retain assignments preceding function calls; scope one-shot faults explicitly.
+(FAKE_NETWORKD_FAIL=1 run apply --kernel-receiver)
 check "networkd restart failure stops kernel receiver setup" status_is 1
 check "networkd restart failure is reported" has networkd_policy "FAIL cannot restart systemd-networkd"
 check "networkd restart failure does not flush or bind" sh -c "! grep -q 'flush\\|zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+check "networkd failure injection does not escape its scenario" test -z "${FAKE_NETWORKD_FAIL:-}"
 ln -sfn ../../drivers/vfio-pci "$root/sys/bus/pci/devices/0000:00:06.0/driver"
 run verify
 check "kernel receiver verify rejects a non-ena data driver" has data "FAIL 0000:00:06.0 on 'vfio-pci', want ena"
@@ -220,7 +228,9 @@ check "staging reloads networkd before reboot" called "networkctl reload"
 check "grubby gets every argument" grep -qx "$want_args" "$tmp/grubby"
 check "management is the lowest-metric default route" env_has MGMT_IF=ens5
 check "data is the other ena interface" sh -c "grep -qx DATA_IF=ens6 '$root/etc/zhida/host.env' && grep -qx DATA_PCI=0000:00:06.0 '$root/etc/zhida/host.env'"
-check "the app CPU is the node's highest, alone isolated" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx ISOLATED=7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3,4,5,6 '$root/etc/zhida/host.env'"
+check "two distinct CPUs are saved and isolated, highest remains app" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx JUNCTION_CPU=6 '$root/etc/zhida/host.env' && grep -qx ISOLATED=6,7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3,4,5 '$root/etc/zhida/host.env'"
+check "deployment builds the daemon crate" called "cargo build -q --release --locked -p nic-runner -p zhida-netconf -p junctiond"
+check "deployment installs the daemon binary" called "target/release/junctiond /usr/local/bin/"
 check "the config comes from zhida-netconf discover --aws on the data ENI" called "zhida-netconf discover --interface ens6 --aws -o $root/etc/zhida/dut.json"
 check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
 check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
@@ -237,7 +247,7 @@ check "boot (zhida-host.service) succeeds" status_is 0
 check "boot makes the data ENI unmanaged by MAC" grep -qx "MACAddress=0a:00:00:00:00:06" "$root/etc/systemd/network/00-zhida-data.network"
 check "boot flushes the data ENI and only it" sh -c "grep -q 'ip addr flush dev ens6' '$calls' && ! grep -q 'dev ens5' '$calls'"
 check "boot binds with --noiommu (no IOMMU groups)" called "zhida-netconf bind $root/etc/zhida/dut.json --noiommu"
-check "boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5,6" "$root/proc/irq/10/smp_affinity_list"
+check "boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5" "$root/proc/irq/10/smp_affinity_list"
 check "boot stops irqbalance" called "systemctl disable --now -q irqbalance.service"
 check "boot with /dev/ptp_ena adds AWS's PHC refclock line after AL2023's NTP server" sh -c "[ \"\$(tail -n 1 '$root/etc/chrony.conf')\" = 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' ] && grep -qx 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' '$root/etc/chrony.conf'"
 check "boot restarts chronyd for the added line" called "systemctl restart chronyd.service"
@@ -298,8 +308,9 @@ check "verify accepts chrony with the PHC selected" has chrony "ok PHC selected"
 sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
 run verify
 check "chrony on NTP, PHC not selected, fails with the sources output" sh -c "grep -q '^chrony: FAIL the PHC is not the selected source' '$tmp/out' && grep -q '^\\^\\* 169.254.169.123' '$tmp/out'"
-FAKE_CHRONYD_INACTIVE=1 run verify
+(FAKE_CHRONYD_INACTIVE=1 run verify)
 check "verify fails when chronyd is not running" sh -c "[ \$(cat '$tmp/status') = 1 ] && grep -q '^chrony: FAIL chronyd not running' '$tmp/out'"
+check "chronyd failure injection does not escape its scenario" test -z "${FAKE_CHRONYD_INACTIVE:-}"
 # A host outside a precision-time placement group has no PHC device: NTP only is its normal state.
 mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
 run verify
@@ -392,24 +403,44 @@ check "the config write failure is reported" has unmanaged "FAIL cannot write"
 check "a failed config write neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|zhida-netconf bind' '$calls'"
 
 host
-echo 3,7 >"$root/sys/devices/system/cpu/cpu7/topology/thread_siblings_list"
+echo 6,7 >"$root/sys/devices/system/cpu/cpu7/topology/thread_siblings_list"
+echo 6,7 >"$root/sys/devices/system/cpu/cpu6/topology/thread_siblings_list"
+echo 4,5 >"$root/sys/devices/system/cpu/cpu5/topology/thread_siblings_list"
+echo 4,5 >"$root/sys/devices/system/cpu/cpu4/topology/thread_siblings_list"
 : >"$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci/vfio-pci-core.ko.xz_no_wc"
 run apply
-check "an SMT sibling is isolated with the app CPU" sh -c "grep -qx ISOLATED=3,7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,4,5,6 '$root/etc/zhida/host.env'"
+check "junction skips app SMT sibling and isolates both cores" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx JUNCTION_CPU=5 '$root/etc/zhida/host.env' && grep -qx ISOLATED=4,5,6,7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3 '$root/etc/zhida/host.env'"
+
+host
+echo 6,7 >"$root/sys/devices/system/node/node0/cpulist"
+echo 6,7 >"$root/sys/devices/system/cpu/cpu7/topology/thread_siblings_list"
+run apply
+check "one physical core on data NUMA node is refused" has cpus "FAIL node 0 needs two distinct physical cores"
+
+host
+echo 0-1 >"$root/sys/devices/system/cpu/online"
+echo 0-1 >"$root/sys/devices/system/node/node0/cpulist"
+run apply
+check "two cores without housekeeping are refused" has cpus "FAIL no housekeeping CPU left"
+
+host
+echo 2-3 >"$root/sys/devices/system/node/node0/cpulist"
+run apply
+check "both selected CPUs stay on the data NUMA node" sh -c "grep -qx APP_CPU=3 '$root/etc/zhida/host.env' && grep -qx JUNCTION_CPU=2 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,4,5,6,7 '$root/etc/zhida/host.env'"
 
 host
 : >"$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci/vfio-pci-core.ko.xz_no_wc"
 echo PATCHED >"$root/sys/module/vfio_pci_core/srcversion"
-FAKE_ARCH=x86_64 run apply
+(FAKE_ARCH=x86_64 run apply)
 check "x86_64 adds clocksource=tsc and nothing else for the TSC" sh -c "grep -qx '$want_args clocksource=tsc' '$tmp/grubby'"
 reboot
 echo "ro $want_args clocksource=tsc" >"$root/proc/cmdline"
 FAKE_ARCH=x86_64 HFT_ROOT=$root sh "$script" boot >/dev/null 2>&1
 echo kvm-clock >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
-FAKE_ARCH=x86_64 run verify
+(FAKE_ARCH=x86_64 run verify)
 check "x86_64 verify flags a clocksource other than tsc" has clocksource "FAIL kvm-clock, want tsc on x86_64"
 echo tsc >"$root/sys/devices/system/clocksource/clocksource0/current_clocksource"
-FAKE_ARCH=x86_64 run verify
+(FAKE_ARCH=x86_64 run verify)
 check "x86_64 on tsc verifies clean" status_is 0
 check "a boot through kvm-clock and tsc-early to tsc is clean" has clocksource "ok tsc (x86_64); dmesg shows no TSC instability"
 cp "$root/kmsg" "$tmp/kmsg"
@@ -418,12 +449,13 @@ for line in '[  812.000000] clocksource: timekeeping watchdog on CPU3: Marking c
     '[  812.000002] clocksource: Marking clocksource '"'"'tsc'"'"' as unstable' \
     '[  812.000003] clocksource: Switched to clocksource hpet'; do
     { cat "$tmp/kmsg"; echo "$line"; } >"$root/kmsg"
-    FAKE_ARCH=x86_64 run verify
+    (FAKE_ARCH=x86_64 run verify)
     check "x86_64 verify fails on: $line" grep -qxF "clocksource: FAIL $line" "$tmp/out"
 done
 rm "$root/kmsg"
-FAKE_ARCH=x86_64 run verify
+(FAKE_ARCH=x86_64 run verify)
 check "x86_64 verify fails when dmesg cannot be read" has clocksource "FAIL cannot read dmesg"
+check "x86_64 injection does not escape its scenario" test -z "${FAKE_ARCH:-}"
 { cat "$tmp/kmsg"; echo '[  812.000002] clocksource: Marking clocksource '"'"'tsc'"'"' as unstable'; } >"$root/kmsg"
 run verify
 check "a non-x86_64 host skips the dmesg check" has clocksource "ok tsc (aarch64)"
@@ -540,7 +572,7 @@ run verify
 check "empty loaded and disk source versions cannot verify WC" has vfio_wc "FAIL loaded vfio-pci-core differs from the verified on-disk module"
 
 native_host 6.18.56-125.164.amzn2023.x86_64
-FAKE_ARCH=x86_64 run apply
+(FAKE_ARCH=x86_64 run apply)
 check "official x86_64 6.18 also uses vendor-native WC" status_is 100
 check "native x86_64 WC needs no external rebuild" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
 
