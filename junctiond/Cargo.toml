@@ -11,9 +11,12 @@ dpdk-smoltcp.workspace = true
 ceph-fifo.workspace = true
 ceph-proto.workspace = true
 slice_ringbuffer.workspace = true
+ceph-ring.workspace = true
+libc.workspace = true
+zhida-netconf.workspace = true
+zhida-open.workspace = true
 
 [dev-dependencies]
-ceph-ring.workspace = true
 zhida-test-kit.workspace = true
 zhida-test-support.workspace = true
 switchnet.workspace = true

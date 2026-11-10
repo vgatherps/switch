@@ -763,9 +763,12 @@ dependencies = [
  "ceph-ring",
  "dpdk-smoltcp",
  "junction",
+ "libc",
  "slice_ringbuffer",
  "switch",
  "switchnet",
+ "zhida-netconf",
+ "zhida-open",
  "zhida-test-kit",
  "zhida-test-support",
 ]
