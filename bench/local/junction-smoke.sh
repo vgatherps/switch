@@ -43,6 +43,39 @@ with tempfile.TemporaryDirectory(prefix="bench-junction-") as root:
         base = ["taskset", "-c", os.environ["APP_CPU"], os.environ["BENCH_BIN"]]
         backend = ["--backend", "junction", "--junction-socket", str(ipc / "control.sock")]
         app_log = (root / "app.log").open("w+")
+        for proto in ("tcp", "ws"):
+            # Delay real daemon replies so rejection cannot be consumed in the first Net round.
+            # Without this, scheduler timing can hide the asynchronous startup-error regression.
+            proxy_path = str(root / f"delayed-{proto}.sock")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(proxy_path)
+                listener.listen(1)
+                def proxy():
+                    downstream, _ = listener.accept()
+                    with downstream, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
+                        upstream.connect(str(ipc / "control.sock"))
+                        try:
+                            while True:
+                                for source in select.select([downstream, upstream], [], [], 20)[0]:
+                                    data = source.recv(65536)
+                                    if not data:
+                                        return
+                                    if source is upstream:
+                                        time.sleep(0.1)
+                                    (upstream if source is downstream else downstream).sendall(data)
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                proxy_thread = threading.Thread(target=proxy, daemon=True)
+                proxy_thread.start()
+                app = subprocess.Popen(base + ["serve", "--backend", "junction", "--junction-socket",
+                    proxy_path, "--proto", proto, "--port", "0"], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                _, rejected = app.communicate(timeout=15)
+                assert app.returncode != 0 and "tcp accept:" in rejected, (app.returncode, rejected)
+                proxy_thread.join(timeout=5)
+                assert not proxy_thread.is_alive(), "control proxy did not close"
+            print(f"serve --backend junction {proto}: delayed invalid listener rejected", flush=True)
+            app = None
         for proto in ("udp", "tcp"):
             app = subprocess.Popen(base + ["serve"] + backend + ["--proto", proto, "--port", "9000"],
                                    stdout=app_log, stderr=app_log, env={**os.environ, "ZHIDA_BENCH_XSTATS": "1"})

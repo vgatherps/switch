@@ -7,6 +7,9 @@ Socket opening runs in switch tasks: UDP binding finishes while the host turns t
 generator reports ready or the UDP server starts serving. TCP connect and accept futures report
 opening failures when polled. Send backpressure uses `switchnet::Error::Full`; UDP also pauses for
 `NeighborPending`.
+Conduit TCP/WS `Full` means one connection is flow-controlled. Junction TCP/WS `Full` means the
+shared session ingress ring is full, so the generator stops that poll's send batch and counts
+the unsent schedule as generator backlog rather than connection flow control.
 
 `gen` and `serve` accept `--backend conduit|junction` (default `conduit`). Conduit still requires
 `--config F` and owns the NIC in the app process. Junction requires `--junction-socket PATH` instead:
@@ -129,13 +132,16 @@ The runner waits for the control socket before launching the app and stops the d
 Host setup reserves both physical cores and their SMT siblings on the data ENI's NUMA node;
 conduit continues to use only `APP_CPU`. In the `kernel` comparison, the receiver stays on the
 kernel and `--backend` selects the generator backend.
+Daemon startup failures fail that sweep without skipping the remaining matrix. Each attempted daemon
+gets an invocation-scoped `TAG.ROLE.junctiond.log`, ending with its exit status; nonzero or unavailable
+statuses are also logged as warnings.
 
 Before creating anything, preflight checks for a clean committed tree containing `deploy/hft-host.sh` (the hosts build `git archive HEAD`), AWS credentials, enough free on-demand Standard vCPU quota L-1216C47A, and an availability zone offering every selected instance type. The subnet and cluster placement group use that common zone. An offering does not guarantee capacity; either instance launch can still fail.
 Use `--zone Z` with `run`, `kernel` or `preflight` to select a common availability zone explicitly
 when the default zone lacks capacity.
 Each benchmark run records the exact commit and SHA-256 of its source archive in `source.json`, `report.md`, and `results.json`.
 
-The run creates and tags a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; each on-demand instance has one DPDK data ENI. The ARM hosts launch in one request; Intel receiver and senders launch in separate requests. Every returned instance ID is recorded before waiting or making the next launch, in memory and `RUN_DIR/created.json`. Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (`cargo build --release --locked -p zhida-bench -p junctiond --bins` with hft-host.sh's build env).
+The run creates and tags a VPC, subnet, internet gateway, route table, security group (SSH from your public IP), cluster placement group and key pair; each on-demand instance has one DPDK data ENI. The ARM hosts launch in one request; Intel receiver and senders launch in separate requests. Every returned instance ID is recorded before waiting or making the next launch, in memory and `RUN_DIR/created.json`. Each host runs `deploy/hft-host.sh apply` (builds DPDK and the toolchain, reboots), then `verify`, then `bench/aws/bootstrap.sh` (`cargo build --release --locked -p zhida-bench -p junctiond` with hft-host.sh's build env).
 
 The fixed matrix has five sweeps: UDP uncapped, TCP with `--budget-us 50` and uncapped, and WS with `--budget-us 50` and uncapped. Comparing the capped and uncapped sweeps shows whether the backlog cap shifts the knee. Each sweep uses 12 connections (4 per sender host), 64 B messages, and rates of 10k, 100k, 400k, 800k, 900k, 1M, 1.1M, 1.2M, 1.4M, 1.8M and 2.5M msg/s. The coordinator on sender0 drives one worker per sender host over SSH; a failed sweep is logged and the next one runs; every sweep's files are fetched. Teardown runs on normal exit, errors, Ctrl-C and SIGTERM; once it starts, Ctrl-C/SIGTERM are ignored, and every ssh/scp before it has a timeout. It deletes everything the run created by recorded ID and by tag (instances, data ENIs, key pair, placement group, security group, subnet, route table, internet gateway, VPC, in that dependency order), checks nothing is left, and exits non-zero if anything remains. Then `bench/report.py RUN_DIR`. Each instance also powers itself off (terminates) at the TTL as a backstop. Exit 0 only if report.py passed, every fetch succeeded and nothing remains.
 

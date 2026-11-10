@@ -45,8 +45,11 @@ pub fn run(args: &Args) -> Result<(), String> {
     })?;
     host.start_xstats("serve");
     let handle = host.net.handle();
-    match args.proto {
-        Proto::Udp => udp_echo(&mut host, &handle, args.port)?,
+    let startup_error = match args.proto {
+        Proto::Udp => {
+            udp_echo(&mut host, &handle, args.port)?;
+            None
+        }
         Proto::Tcp | Proto::Ws => {
             let startup_error = std::rc::Rc::new(std::cell::RefCell::new(None));
             for _ in 0..ACCEPTS {
@@ -64,8 +67,9 @@ pub fn run(args: &Args) -> Result<(), String> {
             if let Some(error) = error {
                 return Err(format!("tcp accept: {error:?}"));
             }
+            Some(startup_error)
         }
-    }
+    };
     eprintln!(
         "zhida-bench serve: {} echo on port {}",
         args.proto.name(),
@@ -73,6 +77,9 @@ pub fn run(args: &Args) -> Result<(), String> {
     );
     while !host::stopped() {
         host.round()?;
+        if let Some(error) = startup_error.as_ref().and_then(|error| error.borrow_mut().take()) {
+            return Err(format!("tcp accept: {error:?}"));
+        }
     }
     drop(handle);
     host.close()

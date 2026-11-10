@@ -151,19 +151,34 @@ enum Senders {
 impl Senders {
     /// Sends `frame` as message `k` from `sender`.
     #[inline]
-    fn send(&mut self, sender: u32, frame: ImmutableFrame, target: IpEndpoint) -> Outcome {
+    fn send(&mut self, sender: u32, frame: ImmutableFrame, target: IpEndpoint, tcp_full: Outcome) -> Outcome {
         match self {
             Senders::Udp(txs) => match txs[sender as usize].send(Some(target), frame) {
                 Ok(()) => Outcome::Sent,
                 Err((_, Error::Full | Error::NeighborPending)) => Outcome::Stop,
                 Err((_, e)) => panic!("udp send: {e:?}"),
             },
-            Senders::Tcp(txs) | Senders::Ws(txs) => match txs[sender as usize].try_send(frame) {
-                Ok(()) => Outcome::Sent,
-                Err((_, Error::Full)) => Outcome::Blocked,
-                Err((_, e)) => panic!("tcp send on connection {sender}: {e:?}"),
-            },
+            Senders::Tcp(txs) | Senders::Ws(txs) => tcp_send_outcome(
+                txs[sender as usize].try_send(frame).map_err(|(_, error)| error),
+                tcp_full,
+                sender,
+            ),
         }
+    }
+}
+
+fn tcp_full_outcome(backend: &Backend) -> Outcome {
+    match backend {
+        Backend::Conduit(_) => Outcome::Blocked,
+        Backend::Junction(_) => Outcome::Stop,
+    }
+}
+
+fn tcp_send_outcome(result: Result<(), Error>, tcp_full: Outcome, sender: u32) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Sent,
+        Err(Error::Full) => tcp_full,
+        Err(error) => panic!("tcp send on connection {sender}: {error:?}"),
     }
 }
 
@@ -538,6 +553,7 @@ impl Worker {
                 step: c.step,
                 size: self.args.size,
                 target: self.target,
+                tcp_full: tcp_full_outcome(&self.args.backend),
             },
             sent.clone(),
         );
@@ -585,6 +601,7 @@ struct SendStep {
     step: u32,
     size: usize,
     target: IpEndpoint,
+    tcp_full: Outcome,
 }
 
 /// An empty frame if the pool has one now; never waits (a cut-off send task must not be left
@@ -619,6 +636,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
         step,
         size,
         target,
+        tcp_full,
     } = s;
     let mut out = Sent {
         lag: Histogram::new(),
@@ -672,7 +690,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
             frame.truncate(len);
             let frame = frame.freeze();
             let owed = pacer.is_owed(k);
-            let outcome = senders.borrow_mut().send(sender, frame, target);
+            let outcome = senders.borrow_mut().send(sender, frame, target, tcp_full);
             if outcome == Outcome::Sent {
                 let now = clock.now_ns();
                 out.in_window += u64::from((window[0]..window[1]).contains(&now));
@@ -743,6 +761,18 @@ impl Stdin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_full_distinguishes_shared_transport_from_connection_backpressure() {
+        for (backend, expected) in [
+            (Backend::Junction("sock".into()), Outcome::Stop),
+            (Backend::Conduit("nic.json".into()), Outcome::Blocked),
+        ] {
+            let tcp_full = tcp_full_outcome(&backend);
+            assert_eq!(tcp_send_outcome(Err(Error::Full), tcp_full, 0), expected);
+            assert_eq!(tcp_send_outcome(Ok(()), tcp_full, 0), Outcome::Sent);
+        }
+    }
 
     /// A byte stream cut anywhere comes out as the same messages, whole and in order.
     #[test]

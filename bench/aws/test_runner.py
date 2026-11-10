@@ -208,10 +208,12 @@ class JunctionRunnerTest(unittest.TestCase):
                 mock.patch.object(z, "kernel_ena_result", return_value={}), \
                 mock.patch.object(z, "kernel_counter_delta", return_value={}):
             try:
-                z.run_sweep("udp", None, hosts, facts, RECEIVER_DATA_IP, mock.Mock(),
-                            kernel=kernel, run_dir=directory, backend=backend)
-            except (RuntimeError, KeyboardInterrupt):
-                if not (failed_host or coordinator_error):
+                code = z.run_sweep("udp", None, hosts, facts, RECEIVER_DATA_IP, mock.Mock(),
+                                   kernel=kernel, run_dir=directory, backend=backend)
+                if failed_host:
+                    self.assertIsNone(code)
+            except KeyboardInterrupt:
+                if not isinstance(coordinator_error, KeyboardInterrupt):
                     raise
         return events
 
@@ -260,6 +262,60 @@ class JunctionRunnerTest(unittest.TestCase):
             self.assertEqual([call.args[0] for call in fetch.call_args_list], labels)
             with open(os.path.join(directory, "expected.json")) as file:
                 self.assertEqual(json.load(file)["sweeps"], labels)
+
+    def test_start_failure_continues_matrix_and_fetches_failed_sweep(self):
+        hosts = [mock.Mock(role=role) for role in z.ROLES]
+        facts = {role: z.parse_host_env(HOST_ENV) for role in z.ROLES}
+        for host in hosts:
+            host.root.return_value = Proc(0, "active\n")
+        hosts[1].ssh.return_value = Proc()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(z, "start_junction",
+                                  side_effect=[RuntimeError("daemon failed")] + [None] * len(z.ROLES)), \
+                mock.patch.object(z, "stop_junction") as stop, \
+                mock.patch.object(z, "save_receiver_journal"), \
+                mock.patch.object(z, "fetch_sweep", return_value=[]) as fetch, \
+                mock.patch.object(z, "SWEEPS", [("udp", None), ("tcp", None)]):
+            errors, failed = z.measure(hosts, facts, RECEIVER_DATA_IP, directory, mock.Mock(),
+                                       backends=["junction"])
+        self.assertEqual(errors, [])
+        self.assertEqual(failed, [z.tag("udp", None, "junction")])
+        self.assertEqual(fetch.call_count, 2)
+        hosts[1].ssh.assert_called_once()
+        self.assertEqual(stop.call_count, 1 + len(z.ROLES))
+
+    def test_daemon_journals_use_each_invocation_after_stop_and_include_exit_status(self):
+        events = []
+        hosts = [mock.Mock(role=role) for role in z.ROLES]
+        facts = {role: z.parse_host_env(HOST_ENV) for role in z.ROLES}
+        invocations = {role: f"{index + 1:032x}" for index, role in enumerate(z.ROLES)}
+        for host in hosts:
+            def root(command, host=host, **kwargs):
+                events.append((host.role, command))
+                if "--property=InvocationID" in command:
+                    return Proc(0, invocations[host.role] + "\n")
+                if "--property=ExecMainStatus" in command:
+                    return Proc(0, "ExecMainCode=1\nExecMainStatus=7\n")
+                if "journalctl" in command:
+                    return Proc(0, host.role + " daemon output\n")
+                return Proc(0, "active\n")
+            host.root.side_effect = root
+        hosts[1].ssh.return_value = Proc()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(z, "start_junction"), \
+                mock.patch.object(z, "log") as log:
+            self.assertEqual(z.run_sweep("udp", None, hosts, facts, RECEIVER_DATA_IP, mock.Mock(),
+                                         run_dir=directory, backend="junction"), 0)
+            for host in hosts:
+                journal = ("journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID="
+                           + invocations[host.role])
+                self.assertGreater(events.index((host.role, journal)),
+                                   events.index((host.role, "systemctl stop " + z.JUNCTION_UNIT)))
+                path = os.path.join(directory, f"{z.tag('udp', None, 'junction')}.{host.role}.junctiond.log")
+                with open(path) as file:
+                    self.assertEqual(file.read(), host.role + " daemon output\n\njunctiond exit: 7 (1)\n")
+            self.assertEqual(sum("junctiond exit: 7 (1)" in call.args[0]
+                                 for call in log.call_args_list), len(hosts))
 
     def test_bootstrap_builds_and_installs_daemon(self):
         # Kill mutations: build-app-only, omit-daemon-install.

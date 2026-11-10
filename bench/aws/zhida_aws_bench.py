@@ -980,11 +980,24 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
     ena_before = kernel_ena_snapshot(receiver, facts["receiver"]["DATA_IF"]) if kernel else None
     invocation = None
     daemons = []
+    daemon_invocations = {}
     try:
         if backend == "junction":
             for host in (hosts[1:] if kernel else hosts):
                 daemons.append(host)
-                start_junction(host, facts[host.role], env)
+                try:
+                    start_junction(host, facts[host.role], env)
+                except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    log(f"{t}: {host.role}: junctiond startup failed: {error}")
+                    return None
+                finally:
+                    try:
+                        result = host.root(f"systemctl show {JUNCTION_UNIT} --property=InvocationID --value",
+                                           check=False)
+                        if result.returncode == 0:
+                            daemon_invocations[host.role] = result.stdout.strip()
+                    except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                        log(f"{t}: {host.role}: junctiond invocation unavailable: {error}")
         launched = receiver.root(
             f"systemctl stop {RECEIVER_UNIT} 2>/dev/null; systemctl reset-failed {RECEIVER_UNIT} 2>/dev/null;"
             f" {serve_command(proto, facts['receiver']['APP_CPU'], receiver_ip if kernel else None, backend)}",
@@ -1013,8 +1026,25 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
             for host in reversed(daemons):
                 try:
                     stop_junction(host)
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                     log(f"{t}: {host.role}: junctiond stop failed: {error}")
+                path = os.path.join(run_dir, f"{t}.{host.role}.junctiond.log")
+                save_receiver_journal(host, daemon_invocations.get(host.role), path)
+                status = {}
+                try:
+                    result = host.root(
+                        f"systemctl show {JUNCTION_UNIT} --property=ExecMainStatus --property=ExecMainCode",
+                        check=False)
+                    if result.returncode == 0:
+                        status = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+                except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    log(f"{t}: {host.role}: junctiond exit status unavailable: {error}")
+                exit_status = status.get("ExecMainStatus", "unavailable")
+                exit_code = status.get("ExecMainCode", "unavailable")
+                with open(path, "a") as f:
+                    f.write(f"\njunctiond exit: {exit_status} ({exit_code})\n")
+                if exit_status != "0":
+                    log(f"{t}: {host.role}: junctiond exit: {exit_status} ({exit_code})")
             save_receiver_journal(receiver, invocation, os.path.join(run_dir, f"{t}.receiver.log"))
             if kernel:
                 ena_after = kernel_ena_snapshot(receiver, facts["receiver"]["DATA_IF"])
