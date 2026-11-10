@@ -18,6 +18,14 @@ use super::flags::Args;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+struct StopOnExit<'a>(&'a AtomicBool);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -43,10 +51,15 @@ fn affinity() -> io::Result<libc::cpu_set_t> {
     Ok(set)
 }
 
-fn pin_control(set: &libc::cpu_set_t) -> io::Result<()> {
+fn set_affinity(set: &libc::cpu_set_t) -> io::Result<()> {
     if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(set), set) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(())
+}
+
+fn pin_control(set: &libc::cpu_set_t) -> io::Result<()> {
+    set_affinity(set)?;
     // Linux silently intersects with the cgroup cpuset; do not silently omit requested CPUs.
     let actual = affinity()?;
     for cpu in 0..libc::CPU_SETSIZE as usize {
@@ -140,6 +153,7 @@ pub fn run(args: Args) -> Result<(), String> {
         hello_timeout: Duration::from_secs(5),
     };
     let channels = ControlChannels { to_network, to_fifo, from_network, retire: retired };
+    let host = HostControl::bind(control_config, channels).map_err(|error| format!("control: {error}"))?;
     let sizing = Sizing {
         frame_share: 4096,
         max_sockets: args.tcp_sockets,
@@ -154,26 +168,35 @@ pub fn run(args: Args) -> Result<(), String> {
     let opened = unsafe { zhida_open::open(&config, &sizing, &mut now) }
         .map_err(|error| format!("open: {error}"))?;
     let _eal = opened.eal;
-    let host = HostControl::bind(control_config, channels).map_err(|error| format!("control: {error}"))?;
     let fifo = Fifo::new(reader, args.max_sessions, fifo_control, retire);
     let mut network = Network::new(opened.stack, fifo, args.max_sessions,
         NetworkConfig { ingress_budget: 128, control_batch: 64, fifo_batch: 64 }, operations, events);
-    let control = std::thread::Builder::new().name("junction-control".into()).spawn(move || {
-        let result = pin_control(&args.control_cpus).and_then(|()| host.run());
-        STOP.store(true, Ordering::Relaxed);
-        result
-    }).map_err(|error| format!("control thread: {error}"))?;
-    let mut result = Ok(());
-    while !STOP.load(Ordering::Relaxed) {
-        if let Err(error) = network.iteration(now()) {
-            result = Err(format!("network: {error}"));
-            break;
+    // The child inherits housekeeping affinity before its first instruction.
+    let spawned = pin_control(&args.control_cpus).and_then(|()| {
+        std::thread::Builder::new().name("junction-control".into()).spawn(move || {
+            let _stop = StopOnExit(&STOP);
+            host.run()
+        })
+    });
+    let restored = set_affinity(&mask).map_err(|error| format!("restore network CPU affinity: {error}"));
+    let (control, mut result) = match spawned {
+        Ok(control) => (Some(control), restored),
+        Err(error) => (None, Err(format!("control thread: {error}"))),
+    };
+    if result.is_ok() {
+        while !STOP.load(Ordering::Relaxed) {
+            if let Err(error) = network.iteration(now()) {
+                result = Err(format!("network: {error}"));
+                break;
+            }
         }
     }
     // Disconnecting both network channels makes HostControl send End(HostShutdown).
     let stack = network.into_stack();
-    let control_result = control.join().map_err(|_| "control thread panicked".to_owned())
-        .and_then(|result| result.map_err(|error| format!("control thread: {error}")));
+    let control_result = control.map_or(Ok(()), |control| {
+        control.join().map_err(|_| "control thread panicked".to_owned())
+            .and_then(|result| result.map_err(|error| format!("control thread: {error}")))
+    });
     let close_result = stack.into_port().try_close().map_err(|(_, error)| format!("port close: {error}"));
     let cleanup_result = directory.cleanup().map_err(|error| format!("directory cleanup: {error}"));
     result.and(control_result).and(close_result).and(cleanup_result)
@@ -182,6 +205,19 @@ pub fn run(args: Args) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_exit_sets_stop_on_return_and_panic() {
+        for panic in [false, true] {
+            let stopped = AtomicBool::new(false);
+            let result = std::panic::catch_unwind(|| {
+                let _stop = StopOnExit(&stopped);
+                assert!(!panic, "injected control-thread panic");
+            });
+            assert_eq!(result.is_err(), panic);
+            assert!(stopped.load(Ordering::Relaxed), "control exit did not stop the network loop");
+        }
+    }
 
     #[test]
     fn cleanup_names_match_only_the_reserved_backing_namespace() {

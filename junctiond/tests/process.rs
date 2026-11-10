@@ -204,6 +204,8 @@ fn udp_exchange_and_sigterm_reports_host_shutdown() {
 fn directory_lock_rejects_a_second_daemon_without_disturbing_the_first() {
     let mut daemon = Daemon::new();
     let mut session = daemon.start();
+    let before: std::collections::BTreeSet<_> = fs::read_dir(&daemon.dir).unwrap()
+        .map(|entry| entry.unwrap().file_name()).collect();
     let log = File::create(daemon.root.join("second.log")).unwrap();
     let mut second = daemon.command().stdout(Stdio::null()).stderr(Stdio::from(log)).spawn().unwrap();
     let deadline = Instant::now() + WAIT;
@@ -219,6 +221,9 @@ fn directory_lock_rejects_a_second_daemon_without_disturbing_the_first() {
     assert!(!status.success());
     let stderr = fs::read_to_string(daemon.root.join("second.log")).unwrap();
     assert!(stderr.contains("owned by another junctiond"), "must fail at flock, not DPDK: {stderr}");
+    let after: std::collections::BTreeSet<_> = fs::read_dir(&daemon.dir).unwrap()
+        .map(|entry| entry.unwrap().file_name()).collect();
+    assert_eq!(after, before, "second daemon changed the first daemon's IPC directory");
     let peer = daemon.kernel_peer();
     exchange(&mut session, &peer);
     daemon.shutdown(&mut session);
@@ -251,4 +256,18 @@ fn sigkill_restart_removes_stale_backings_and_socket_but_nothing_else() {
     let peer = daemon.kernel_peer();
     exchange(&mut session, &peer);
     daemon.shutdown(&mut session);
+}
+
+#[test]
+fn usage_is_printed_for_parse_errors_but_not_runtime_failures() {
+    let output = Command::new(env!("CARGO_BIN_EXE_junctiond")).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("usage: junctiond"));
+    let daemon = Daemon::new();
+    fs::remove_file(&daemon.config).unwrap();
+    let output = daemon.command().output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nic.json"), "{stderr}");
+    assert!(!stderr.contains("usage: junctiond"), "{stderr}");
 }
