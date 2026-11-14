@@ -160,6 +160,18 @@ class JunctionRunnerTest(unittest.TestCase):
                 self.assertIn(label, out.getvalue())
         self.assertIn("JUNCTION_CPU", out.getvalue())
 
+    def test_sweep_tags_and_plan_interleave_backends_for_each_protocol_budget_pair(self):
+        pairs = [("udp", None), ("tcp", 50), ("tcp", None), ("ws", 50), ("ws", None)]
+        for backends in (["conduit", "junction"], ["junction", "conduit"]):
+            with self.subTest(backends=backends):
+                expected = [z.tag(proto, budget, backend) for proto, budget in pairs for backend in backends]
+                self.assertEqual(z.sweep_tags(backends), expected)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    z.main(["plan", "--backend", *backends])
+                positions = [out.getvalue().index(label) for label in expected]
+                self.assertEqual(positions, sorted(positions))
+
     def test_commands_pin_daemon_and_apps_separately_without_app_config(self):
         # Kill mutations: daemon-on-APP_CPU, control-on-isolated, app-opens-NIC, kernel-becomes-junction.
         facts = z.parse_host_env(HOST_ENV)
@@ -280,8 +292,10 @@ class JunctionRunnerTest(unittest.TestCase):
                 mock.patch.object(z, "fetch_sweep", return_value=[]) as fetch:
             self.assertEqual(z.measure([], {}, RECEIVER_DATA_IP, directory, mock.Mock(),
                                        backends=["conduit", "junction"]), ([], []))
-            self.assertEqual([call.args[-1] for call in run.call_args_list],
-                             ["conduit"] * len(z.SWEEPS) + ["junction"] * len(z.SWEEPS))
+            self.assertEqual([(call.args[0], call.args[1], call.args[-1]) for call in run.call_args_list],
+                             [(proto, budget, backend) for proto, budget in
+                              [("udp", None), ("tcp", 50), ("tcp", None), ("ws", 50), ("ws", None)]
+                              for backend in ("conduit", "junction")])
             labels = z.sweep_tags(["conduit", "junction"])
             self.assertEqual([call.args[0] for call in fetch.call_args_list], labels)
             with open(os.path.join(directory, "expected.json")) as file:

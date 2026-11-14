@@ -146,7 +146,7 @@ def tag(proto, budget, backend="conduit"):
 
 
 def sweep_tags(backends=("conduit",)):
-    return [tag(p, b, backend) for backend in backends for p, b in SWEEPS]
+    return [tag(p, b, backend) for p, b in SWEEPS for backend in backends]
 
 
 def gen_template(proto, receiver_ip, t, backend="conduit"):
@@ -338,7 +338,8 @@ def plan_text(region, ttl, run_id, expires, kernel=False, shape="arm", backends=
         lines.append(f"backend {backend}: " + (
             "junctiond on JUNCTION_CPU, control threads on HOUSEKEEPING; control socket readiness before apps"
             if backend == "junction" else "apps own the NIC on APP_CPU"))
-        lines += [f"  {tag(p, b, backend)}" + ("" if b is None else f"  (--budget-us {b})") for p, b in SWEEPS]
+    lines += [f"  {tag(p, b, backend)}" + ("" if b is None else f"  (--budget-us {b})")
+              for p, b in SWEEPS for backend in backends]
     lines += [
         f"needs: on-demand Standard vCPU quota L-1216C47A with {vcpus} vCPUs free in {region};"
         " permissions: see `zhida_aws_bench.py -h`",
@@ -1214,7 +1215,7 @@ def measure(hosts, facts, receiver_ip, run_dir, env, kernel=False, backends=("co
     with open(os.path.join(run_dir, "expected.json"), "w") as f:
         json.dump({"sweeps": sweep_tags(backends)}, f)
     fetch_errors, failed = [], []
-    for backend, proto, budget in ((backend, p, b) for backend in backends for p, b in SWEEPS):
+    for backend, proto, budget in ((backend, p, b) for p, b in SWEEPS for backend in backends):
         t = tag(proto, budget, backend)
         try:
             code = run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel, run_dir, backend)

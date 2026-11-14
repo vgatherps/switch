@@ -125,6 +125,10 @@ key. Missing OpenSSH executables skip that test; an installed but unusable serve
 `python3 bench/aws/zhida_aws_bench.py run [--shape arm|intel] [--region R] [--ttl 2h] [--out DIR]` runs the whole thing. The default `arm` shape uses four c7gn.xlarge instances (one receiver, three senders; 16 vCPUs total) and an arm64 Amazon Linux 2023 image. `--shape intel` uses one c6in.8xlarge receiver and three c6in.2xlarge senders (56 vCPUs total) and an x86_64 Amazon Linux 2023 image. For the Intel run in Tokyo, use `--shape intel --region ap-northeast-1`. The same shape option works with `plan`, `preflight` and `kernel`.
 
 `--backend conduit junction` runs the same five sweeps on each backend; the default is `conduit`.
+For each protocol/budget pair, backends run back to back in the selected order before the next pair.
+Junction's uncapped TCP/WS steps after the first loss or SENDER-LATE step are labeled CARRYOVER:
+unbounded daemon queues can retain earlier work, so those later measurements are not comparable.
+Budgeted sweeps remain unchanged.
 Every sweep artifact is prefixed with its backend (`conduit-…` or `junction-…`).
 Junction starts a separate `junctiond` on every receiver and generator host before each sweep, pinned
 to `JUNCTION_CPU` with its control thread on `HOUSEKEEPING`; benchmark apps stay on `APP_CPU`.
