@@ -130,7 +130,7 @@ def placement_table(stem, placement):
                  "| IRQ | name |" + "".join(f" CPU {cpu} |" for cpu in cpus),
                  "|---|---|" + "---:|" * len(cpus)]
         for row in deltas:
-            if row["irq"].isdigit() and not any(row["cpus"].values()):
+            if row["irq"].isdigit() and row["name"].split()[-1:] != ["arch_timer"] and not any(row["cpus"].values()):
                 continue
             rows.append(f"| {row['irq']} | {row['name']} |"
                         + "".join(f" {row['cpus'].get(cpu, 0)} |" for cpu in cpus))

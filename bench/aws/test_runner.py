@@ -386,7 +386,7 @@ class PlacementTest(unittest.TestCase):
             ("conduit", "sender0", "gen", 1, "7", 7),
             ("junction", "sender0", "gen", 2, "6", 6),
             ("junction", "sender0", "sweep", 0, "0-7", 0),
-            ("conduit", "sender0", "sweep", 1, "6", 6),
+            ("conduit", "sender0", "sweep", 1, "7", 7),
         ]
         for backend, role, kind, thread_index, allowed, psr in cases:
             with self.subTest(backend=backend, kind=kind, thread=thread_index, allowed=allowed, psr=psr):
@@ -406,11 +406,12 @@ class PlacementTest(unittest.TestCase):
                 snapshot = placement_snapshot("receiver")
                 snapshot["processes"].append({"pid": 501, "kind": kind, "threads": [
                     {"tid": 501, "comm": kind, "Cpus_allowed_list": str(cpu), "psr": cpu}]})
-                self.assertTrue(any(kind in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+                self.assertEqual(any(kind in error for error in z.placement.check(snapshot, ["serve"], "conduit")), cpu == 7)
         snapshot = placement_snapshot("receiver")
         snapshot["isolated"] = "6"
         self.assertTrue(any("not isolated" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
         snapshot["isolated"] = "0,6,7"
+        snapshot["assignment"]["HOUSEKEEPING"] = "0-5,7"
         self.assertTrue(any("housekeeping" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
 
     def test_missing_process_main_thread_and_waiter_timeout_fail(self):
@@ -502,18 +503,103 @@ class PlacementTest(unittest.TestCase):
         last["interrupts"] = last["interrupts"].replace(
             "45: 0 0 0 0 0 0 0 0", "45: 9 0 0 0 0 0 0 0").replace(
             "LOC: 0 0 0 0 0 0 0 0", "LOC: 0 0 0 0 0 0 2 3")
-        rows, errors = z.placement.interrupt_deltas(first, last)
+        rows, errors = z.placement.interrupt_deltas(first, last, {6, 7})
         self.assertEqual(errors, [])
         self.assertEqual(rows[1]["cpus"], {"6": 2, "7": 3})
         last["interrupts"] = last["interrupts"].replace(
             "45: 9 0 0 0 0 0 0 0", "45: 9 0 0 0 0 0 0 1")
-        rows, errors = z.placement.interrupt_deltas(first, last)
+        rows, errors = z.placement.interrupt_deltas(first, last, {6, 7})
         self.assertEqual(rows[0]["cpus"], {"6": 0, "7": 1})
         self.assertTrue(any("device IRQ 45" in error for error in errors))
 
+    def test_numeric_arch_timer_action_is_reported_as_a_local_interrupt(self):
+        first, last = placement_snapshot("receiver"), placement_snapshot("receiver", end=True)
+        first["interrupts"] += "10: 0 0 0 0 0 0 0 0 GICv3 27 Level arch_timer\n"
+        last["interrupts"] += "10: 0 0 0 0 0 0 3 9 GICv3 27 Level arch_timer\n"
+        rows, errors = z.placement.interrupt_deltas(first, last, {6, 7})
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[-1]["cpus"], {"6": 3, "7": 9})
+        last["interrupts"] = last["interrupts"].replace("Level arch_timer", "Level ena-arch_timer")
+        self.assertTrue(z.placement.interrupt_deltas(first, last, {6, 7})[1])
+
+    def test_new_interrupt_rows_start_at_zero_and_follow_normal_device_rules(self):
+        first, last = placement_snapshot("receiver"), placement_snapshot("receiver", end=True)
+        last["interrupts"] += "60: 3 0 0 0 0 0 2 0 ITS-PCI-MSIX 0 Edge ena\n"
+        rows, errors = z.placement.interrupt_deltas(first, last, {7})
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[-1]["cpus"], {"6": 2, "7": 0})
+        last["interrupts"] = last["interrupts"].replace("60: 3 0 0 0 0 0 2 0", "60: 3 0 0 0 0 0 2 1")
+        rows, errors = z.placement.interrupt_deltas(first, last, {7})
+        self.assertEqual(rows[-1]["cpus"], {"6": 2, "7": 1})
+        self.assertTrue(any("device IRQ 60" in error for error in errors))
+
+    def test_only_the_backend_used_isolated_cpus_reject_task_and_device_interference(self):
+        for backend in ("conduit", "junction"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as directory:
+                host = mock.Mock(role="receiver")
+                def fetch(remote, local):
+                    snapshot = placement_snapshot("receiver", backend, end=".end.txt" in remote)
+                    snapshot["processes"][0]["threads"].append(
+                        {"tid": 888, "comm": "helper", "Cpus_allowed_list": "6", "psr": 6})
+                    snapshot["processes"].append({"pid": 999, "kind": "external", "threads": [
+                        {"tid": 999, "comm": "stress", "Cpus_allowed_list": "6", "psr": 6}]})
+                    if ".end.txt" in remote:
+                        snapshot["interrupts"] = snapshot["interrupts"].replace(
+                            "45: 0 0 0 0 0 0 0 0", "45: 0 0 0 0 0 0 5 0")
+                    with open(os.path.join(local, os.path.basename(remote)), "w") as file:
+                        json.dump(snapshot, file)
+                host.fetch.side_effect = fetch
+                self.assertEqual(z.collect_placement([host], {"receiver": z.parse_host_env(HOST_ENV)},
+                    "tag", backend, False, directory), backend == "conduit")
+                with open(os.path.join(directory, "tag.placement.json")) as file:
+                    result = json.load(file)
+                self.assertEqual(result["hosts"]["receiver"]["interrupt_deltas"][0]["cpus"], {"6": 5, "7": 0})
+
+    def test_early_coordinator_failure_skips_end_noise_but_keeps_initial_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = mock.Mock(role="receiver")
+            facts = {"receiver": z.parse_host_env(HOST_ENV)}
+            bad_initial = False
+            def fetch(remote, local):
+                if ".end.txt" in remote:
+                    return "end snapshot missing after workers stopped"
+                snapshot = placement_snapshot("receiver")
+                if bad_initial:
+                    snapshot["processes"][0]["threads"][0]["Cpus_allowed_list"] = "0-7"
+                with open(os.path.join(local, os.path.basename(remote)), "w") as file:
+                    json.dump(snapshot, file)
+            host.fetch.side_effect = fetch
+            noise = ["end snapshot: sweep ended", "sender0: end snapshot failed"]
+            self.assertTrue(z.collect_placement([host], facts, "early", "conduit", False, directory,
+                                               noise, coordinator_failed=True))
+            self.assertEqual(host.fetch.call_count, 1)
+            with open(os.path.join(directory, "early.placement.json")) as file:
+                result = json.load(file)
+            self.assertEqual(result["errors"], [])
+            self.assertIn("coordinator stopped early", result["end_snapshot_skipped"])
+            self.assertEqual(result["hosts"]["receiver"]["snapshots"], ["early.receiver.placement.txt"])
+            bad_initial = True
+            self.assertFalse(z.collect_placement([host], facts, "bad", "conduit", False, directory,
+                                                noise, coordinator_failed=True))
+            bad_initial = False
+            self.assertFalse(z.collect_placement([host], facts, "complete", "conduit", False, directory, noise))
+
+    def test_run_sweep_passes_the_actual_coordinator_failure_to_placement(self):
+        hosts = [mock.Mock(role=role) for role in z.ROLES]
+        for host in hosts:
+            host.root.return_value = Proc(0, "active\n")
+        hosts[1].ssh.return_value = Proc(1)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(z, "start_placement"), \
+                mock.patch.object(z, "capture_end_placement"), \
+                mock.patch.object(z, "collect_placement", return_value=True) as collect:
+            self.assertEqual(z.run_sweep("udp", None, hosts,
+                {role: z.parse_host_env(HOST_ENV) for role in z.ROLES}, RECEIVER_DATA_IP, mock.Mock(),
+                run_dir=directory), 1)
+        self.assertTrue(collect.call_args.kwargs["coordinator_failed"])
+
     def test_kernel_irq_exception_is_only_verified_receiver_data_irqs_on_app_cpu(self):
         cases = [("receiver", True, "45", 7, True), ("receiver", False, "45", 7, False),
-                 ("sender0", True, "45", 7, False), ("receiver", True, "45", 6, False),
+                 ("sender0", True, "45", 7, False), ("receiver", True, "45", 6, True),
                  ("receiver", True, "46", 7, False)]
         for role, kernel, irq, cpu, valid in cases:
             with self.subTest(role=role, kernel=kernel, irq=irq, cpu=cpu), tempfile.TemporaryDirectory() as directory:

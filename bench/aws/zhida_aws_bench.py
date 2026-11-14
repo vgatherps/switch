@@ -1034,10 +1034,14 @@ def capture_end_placement(hosts, facts, t, backend, kernel, errors):
         thread.join()
 
 
-def collect_placement(hosts, facts, t, backend, kernel, run_dir, extra_errors=(), allowed_receiver_irqs=()):
-    result = {"backend": backend, "hosts": {}, "errors": list(extra_errors)}
+def collect_placement(hosts, facts, t, backend, kernel, run_dir, extra_errors=(), allowed_receiver_irqs=(),
+                      coordinator_failed=False):
+    result = {"backend": backend, "hosts": {}, "errors": [] if coordinator_failed else list(extra_errors)}
+    if coordinator_failed:
+        result["end_snapshot_skipped"] = "coordinator stopped early; see sweep summary"
     for host in hosts:
-        names = [f"{t}.{host.role}.placement{suffix}.txt" for suffix in ("", ".end")]
+        names = [f"{t}.{host.role}.placement{suffix}.txt"
+                 for suffix in (("",) if coordinator_failed else ("", ".end"))]
         snapshots = []
         expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
         for name in names:
@@ -1074,7 +1078,8 @@ def collect_placement(hosts, facts, t, backend, kernel, run_dir, extra_errors=()
                 allowed = ({irq: {int(assignment["APP_CPU"])} for irq in allowed_receiver_irqs}
                            if kernel and host.role == "receiver" else {})
                 host_result["allowed_device_irqs"] = {irq: sorted(cpus) for irq, cpus in allowed.items()}
-                deltas, errors = placement.interrupt_deltas(*snapshots, allowed)
+                used = {int(assignment["APP_CPU"])} | ({int(assignment["JUNCTION_CPU"])} if "junctiond" in expected else set())
+                deltas, errors = placement.interrupt_deltas(*snapshots, used, allowed)
                 host_result["interrupt_deltas"] = deltas
                 result["errors"] += [f"{host.role}: {error}" for error in errors]
             except (ValueError, KeyError, IndexError, TypeError) as error:
@@ -1156,7 +1161,8 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
             if end_thread.is_alive():
                 end_errors.append("end snapshot collector did not finish")
         valid = collect_placement(hosts, facts, t, backend, kernel, run_dir, end_errors,
-                                  allowed_receiver_irqs=before["irqs"] if kernel else ())
+                                  allowed_receiver_irqs=before["irqs"] if kernel else (),
+                                  coordinator_failed=code != 0)
         return code if valid else None
     finally:
         try:

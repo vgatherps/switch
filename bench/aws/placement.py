@@ -34,7 +34,7 @@ def check(snapshot, expected, backend):
     required = {app} | ({junction} if "junctiond" in expected else set())
     if not required <= isolated:
         errors.append(f"assigned process CPUs {sorted(required)} are not isolated ({snapshot['isolated']})")
-    if cpus(assignment["HOUSEKEEPING"]) & isolated:
+    if cpus(assignment["HOUSEKEEPING"]) & required:
         errors.append("housekeeping CPUs overlap isolated CPUs")
     processes = snapshot["processes"]
     for kind in expected:
@@ -54,9 +54,9 @@ def check(snapshot, expected, backend):
                 if allowed != {cpu} or psr != cpu:
                     errors.append(f"{prefix}: must be pinned to CPU {cpu}, allowed {sorted(allowed)}, psr {psr}")
             else:
-                forbidden = isolated
+                forbidden = required
                 if kind in expected and kind in ("serve", "gen") and backend == "junction" and comm == "junction-ctl":
-                    forbidden = isolated - {app}
+                    forbidden = required - {app}
                 if allowed & forbidden or (kind != "external" and psr in forbidden):
                     errors.append(f"{prefix}: may run on isolated CPU(s), allowed {sorted(allowed)}, psr {psr}")
     return errors
@@ -135,7 +135,7 @@ def capture(assignment, expected, timeout=60, before_ns=None):
     return snapshot
 
 
-def interrupt_deltas(first, last, allowed_device_irqs=None):
+def interrupt_deltas(first, last, used_cpus, allowed_device_irqs=None):
     def parse(text):
         lines = text.splitlines()
         columns = [column.removeprefix("CPU") for column in lines[0].split()]
@@ -151,15 +151,15 @@ def interrupt_deltas(first, last, allowed_device_irqs=None):
     isolated = cpus(first["isolated"])
     rows, errors = [], []
     for irq, (name, counts) in after.items():
-        if irq not in before:
-            errors.append(f"interrupt {irq}: appeared after the initial snapshot")
-            continue
-        deltas = {str(cpu): counts[str(cpu)] - before[irq][1][str(cpu)] for cpu in sorted(isolated)}
+        previous = before.get(irq, ("", {}))[1]
+        deltas = {str(cpu): counts[str(cpu)] - previous.get(str(cpu), 0) for cpu in sorted(isolated)}
         rows.append({"irq": irq, "name": name, "cpus": deltas})
-        if any(delta < 0 for delta in deltas.values()):
+        if any(delta < 0 and int(cpu) in used_cpus for cpu, delta in deltas.items()):
             errors.append(f"interrupt {irq}: counters decreased")
         allowed = (allowed_device_irqs or {}).get(irq, ())
-        if irq.isdigit() and any(delta > 0 and int(cpu) not in allowed for cpu, delta in deltas.items()):
+        local_timer = name.split()[-1:] == ["arch_timer"]
+        if irq.isdigit() and not local_timer and any(
+                delta > 0 and int(cpu) in used_cpus and int(cpu) not in allowed for cpu, delta in deltas.items()):
             errors.append(f"device IRQ {irq} {name} fired on isolated CPUs: {deltas}")
     return rows, errors
 

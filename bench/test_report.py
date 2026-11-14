@@ -258,6 +258,28 @@ class ReportTest(unittest.TestCase):
                 self.assertNotIn("CARRYOVER", data_rows[0])
                 self.assertIn("CARRYOVER", data_rows[1])
 
+    def test_numeric_arch_timer_zero_counts_remain_visible(self):
+        host = {"app_cpu": "7", "junction_cpu": None, "housekeeping": "0-5", "isolated": "6-7",
+                "interrupt_deltas": [
+                    {"irq": "10", "name": "GICv3 27 Level arch_timer", "cpus": {"6": 0, "7": 0}},
+                    {"irq": "11", "name": "GICv3 28 Level ena-arch_timer", "cpus": {"6": 0, "7": 0}}]}
+        rendered = report.placement_table("tag", {"backend": "conduit", "hosts": {"receiver": host}})
+        self.assertIn("| 10 | GICv3 27 Level arch_timer | 0 | 0 |", rendered)
+        self.assertNotIn("| 11 |", rendered)
+
+    def test_early_stop_reports_the_coordinator_reason_without_end_snapshot_noise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stem = "conduit-tcp-n12-s64-uncapped"
+            write_jsonl(os.path.join(directory, stem + ".jsonl"),
+                        [step(1000, 10_000, bound=True), summary(1, bound=True)])
+            with open(os.path.join(directory, stem + ".placement.json"), "w") as file:
+                json.dump({"backend": "conduit", "hosts": {}, "errors": [],
+                           "end_snapshot_skipped": "coordinator stopped early; see sweep summary"}, file)
+            markdown, issues = report.build(directory, "early stop")
+            self.assertEqual(issues, [stem + ": sender fell behind schedule; receiver capacity is not isolated"])
+            self.assertNotIn("INVALID", "\n".join(markdown))
+            self.assertNotIn("end snapshot", "\n".join(markdown))
+
     def test_kernel_receiver_data_irq_exemption_is_explicit(self):
         host = {"app_cpu": "7", "junction_cpu": None, "housekeeping": "0-5", "isolated": "6-7",
                 "allowed_device_irqs": {"45": [7]},
