@@ -17,7 +17,8 @@ start `junctiond --config F --dir DIR` on its own isolated CPU, then point the a
 on another isolated CPU. Both receiver and generator support either backend, for every protocol.
 Junction uses the session's advertised frame capacity and maximum record size for device-dependent
 sizing; it never opens EAL or reads a NIC config. With `ZHIDA_BENCH_XSTATS=1`, junction labels port
-xstats absent rather than reporting synthetic counters.
+xstats absent rather than reporting synthetic counters. Conduit's ENA allowance/reset counters do not
+establish whether junction was shaped or reset; that requires counters from junction's own run.
 
 ```sh
 taskset -c 2 junctiond --config nic.json --dir /run/junctiond --control-cpus 0

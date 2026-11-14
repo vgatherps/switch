@@ -251,8 +251,8 @@ def build(directory, title):
         carryover = stem.startswith(("junction-tcp-", "junction-ws-")) and stem.endswith("-uncapped")
         sections += [f"![{stem}]({stem}.svg)", "", table(steps, carryover), ""]
         if stem.startswith("junction-") or (placement is not None and placement["backend"] == "junction"):
-            sections += ["ENA allowance/reset counters are recorded for conduit sweeps only; the wire traffic per"
-                         " rate is the same on both backends, so conduit's counters at the same rate are the reference.", ""]
+            sections += ["ENA allowance/reset counters are recorded for conduit sweeps only. They do not establish"
+                         " whether junction was shaped or reset; that is not established for junction in this run.", ""]
         if any(s["generator_bound"] for s in steps):
             sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
                          " identify the cause; receiver backpressure can also delay sends.", ""]

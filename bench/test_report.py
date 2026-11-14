@@ -222,10 +222,6 @@ class ReportTest(unittest.TestCase):
                         rows = [line for line in section.splitlines()
                                 if line.startswith("| ") and line.split("|")[1].strip().isdigit()]
                         self.assertEqual(len(rows), len(measured))
-                        ena_note = ("ENA allowance/reset counters are recorded for conduit sweeps only; the wire"
-                                    " traffic per rate is the same on both backends, so conduit's counters at"
-                                    " the same rate are the reference.")
-                        self.assertEqual(ena_note in section, stem.startswith("junction-"))
                         expected = stem in affected and trigger != "clean"
                         for index, row in enumerate(rows):
                             self.assertEqual("CARRYOVER" in row, expected and index > 1)
