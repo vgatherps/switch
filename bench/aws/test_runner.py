@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import shlex
+from pathlib import Path
 import select
 import shutil
 import signal
@@ -33,7 +34,7 @@ HOST_ENV = ("MGMT_IF=ens5\nDATA_IF=ens6\nDATA_PCI=0000:00:06.0\nDATA_MAC=0a:00:0
             "APP_CPU=7\nJUNCTION_CPU=6\nISOLATED=6,7\nHOUSEKEEPING=0-5\n")
 
 
-def placement_snapshot(role, backend="conduit", kernel=False):
+def placement_snapshot(role, backend="conduit", kernel=False, end=False):
     kinds = ["kernel-serve" if kernel else "serve"] if role == "receiver" else ["gen"]
     if role == "sender0":
         kinds.append("sweep")
@@ -49,7 +50,9 @@ def placement_snapshot(role, backend="conduit", kernel=False):
         processes.append({"pid": pid, "kind": kind, "threads": threads})
     return {"assignment": {key: value for key, value in z.parse_host_env(HOST_ENV).items()
                            if key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")},
-            "isolated": "6-7", "processes": processes, "errors": []}
+            "isolated": "6-7", "processes": processes, "errors": [], "unix_ns": 2 if end else 1,
+            "interrupts": "CPU0 CPU1 CPU2 CPU3 CPU4 CPU5 CPU6 CPU7\n"
+                          "45: 0 0 0 0 0 0 0 0 vfio-msix\nLOC: 0 0 0 0 0 0 0 0 Local timer\n"}
 
 
 # zhida-nic's lines (conduit/crates/nic-runner/src/main.rs `line`: "zhida-nic: {key}: {value}"); the
@@ -224,7 +227,7 @@ class JunctionRunnerTest(unittest.TestCase):
                 mock.patch.object(z, "save_receiver_journal"), \
                 mock.patch.object(z, "start_placement"), \
                 mock.patch.object(z, "collect_placement", return_value=True), \
-                mock.patch.object(z, "kernel_snapshot", return_value={}), \
+                mock.patch.object(z, "kernel_snapshot", return_value={"irqs": {}}), \
                 mock.patch.object(z, "kernel_ena_snapshot", return_value={}), \
                 mock.patch.object(z, "kernel_ena_result", return_value={}), \
                 mock.patch.object(z, "kernel_counter_delta", return_value={}):
@@ -405,23 +408,26 @@ class PlacementTest(unittest.TestCase):
         snapshot["processes"][0]["threads"].pop(0)
         self.assertTrue(any("main thread missing" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
         with mock.patch.object(z.placement, "processes", return_value=[]), \
-                mock.patch.object(z.placement.time, "monotonic", side_effect=[0, 31]), \
+                mock.patch.object(z.placement.time, "monotonic", side_effect=[0, 61]), \
                 mock.patch.object(z.placement.Path, "read_text", return_value="6-7"):
             captured = z.placement.capture(snapshot["assignment"], ["serve"])
         self.assertIn("timed out", captured["errors"][0])
 
-    def test_waiter_requires_every_process_and_settles_one_second(self):
+    def test_waiter_ignores_temporary_eal_mask_until_main_is_pinned(self):
         snapshot = placement_snapshot("sender0", "junction")
-        with mock.patch.object(z.placement, "processes", return_value=snapshot["processes"]), \
+        initializing = placement_snapshot("sender0", "junction")
+        initializing["processes"][0]["threads"][0]["Cpus_allowed_list"] = "0-5,7"
+        with mock.patch.object(z.placement, "processes", side_effect=[initializing["processes"], snapshot["processes"]]), \
                 mock.patch.object(z.placement.time, "sleep") as sleep, \
                 mock.patch.object(z.placement.Path, "read_text", return_value="6-7"):
             captured = z.placement.capture(snapshot["assignment"], ["gen", "sweep", "junctiond"])
-        sleep.assert_called_once_with(1)
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(captured["processes"], snapshot["processes"])
         self.assertEqual(captured["errors"], [])
         host = mock.Mock(role="sender0")
         z.start_placement(host, z.parse_host_env(HOST_ENV), "tag", "junction")
         command = host.root.call_args.args[0]
-        self.assertIn("--property=RuntimeMaxSec=35 taskset -c 0-5 python3", command)
+        self.assertIn("--property=RuntimeMaxSec=65 taskset -c 0-5 python3", command)
         for kind in ("gen", "sweep", "junctiond"):
             self.assertIn("--expect " + kind, command)
         self.assertIn("--out /var/tmp/zhida/tag.sender0.placement.txt", command)
@@ -433,18 +439,160 @@ class PlacementTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             def fetch(remote, local):
                 with open(os.path.join(local, os.path.basename(remote)), "w") as file:
-                    json.dump(snapshot, file)
+                    json.dump(dict(snapshot, unix_ns=2 if ".end.txt" in remote else 1), file)
             host.fetch.side_effect = fetch
             self.assertTrue(z.collect_placement([host], facts, "tag", "junction", False, directory))
             with open(os.path.join(directory, "tag.placement.json")) as file:
                 result = json.load(file)
-            self.assertEqual(result["hosts"]["receiver"],
+            receiver = result["hosts"]["receiver"]
+            self.assertEqual({key: receiver[key] for key in ("app_cpu", "junction_cpu", "housekeeping", "isolated")},
                              {"app_cpu": "7", "junction_cpu": "6", "housekeeping": "0-5", "isolated": "6-7"})
+            self.assertEqual(receiver["snapshots"], ["tag.receiver.placement.txt", "tag.receiver.placement.end.txt"])
+            self.assertEqual(receiver["interrupt_deltas"][0]["cpus"], {"6": 0, "7": 0})
             host.fetch.side_effect = None
             host.fetch.return_value = "scp missing file"
             self.assertFalse(z.collect_placement([host], facts, "missing", "junction", False, directory))
             with open(os.path.join(directory, "missing.placement.json")) as file:
                 self.assertIn("missing placement snapshot", json.load(file)["errors"][0])
+
+    def test_proc_collector_keeps_external_userspace_and_skips_kernel_tasks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            user = root / "123"
+            task = user / "task" / "123"
+            task.mkdir(parents=True)
+            (user / "cmdline").write_bytes(b"/usr/bin/stress\0")
+            fields = ["0"] * 37
+            fields[0], fields[1], fields[36] = "S", "1", "7"
+            stat = "123 (stress) " + " ".join(fields)
+            (user / "stat").write_text(stat)
+            (task / "stat").write_text(stat)
+            (task / "status").write_text("Cpus_allowed_list:\t0-7\n")
+            (task / "comm").write_text("stress\n")
+            kernel = root / "124"
+            kernel.mkdir()
+            (kernel / "cmdline").write_bytes(b"")
+            with mock.patch.object(z.placement, "Path", side_effect=lambda path: root if str(path) == "/proc" else Path(path)):
+                found = z.placement.processes()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["kind"], "external")
+        snapshot = placement_snapshot("receiver")
+        snapshot["processes"] += found
+        self.assertTrue(any("external" in error for error in z.placement.check(snapshot, ["serve"], "conduit")))
+        found[0]["threads"][0].update(tid=124, Cpus_allowed_list="0-5")
+        self.assertEqual(z.placement.check(snapshot, ["serve"], "conduit"), [])
+
+    def test_interrupt_deltas_flag_device_irqs_but_only_report_local_interrupts(self):
+        first = placement_snapshot("receiver")
+        last = placement_snapshot("receiver", end=True)
+        last["interrupts"] = last["interrupts"].replace(
+            "45: 0 0 0 0 0 0 0 0", "45: 9 0 0 0 0 0 0 0").replace(
+            "LOC: 0 0 0 0 0 0 0 0", "LOC: 0 0 0 0 0 0 2 3")
+        rows, errors = z.placement.interrupt_deltas(first, last)
+        self.assertEqual(errors, [])
+        self.assertEqual(rows[1]["cpus"], {"6": 2, "7": 3})
+        last["interrupts"] = last["interrupts"].replace(
+            "45: 9 0 0 0 0 0 0 0", "45: 9 0 0 0 0 0 0 1")
+        rows, errors = z.placement.interrupt_deltas(first, last)
+        self.assertEqual(rows[0]["cpus"], {"6": 0, "7": 1})
+        self.assertTrue(any("device IRQ 45" in error for error in errors))
+
+    def test_kernel_irq_exception_is_only_verified_receiver_data_irqs_on_app_cpu(self):
+        cases = [("receiver", True, "45", 7, True), ("receiver", False, "45", 7, False),
+                 ("sender0", True, "45", 7, False), ("receiver", True, "45", 6, False),
+                 ("receiver", True, "46", 7, False)]
+        for role, kernel, irq, cpu, valid in cases:
+            with self.subTest(role=role, kernel=kernel, irq=irq, cpu=cpu), tempfile.TemporaryDirectory() as directory:
+                host = mock.Mock(role=role)
+                def fetch(remote, local):
+                    snapshot = placement_snapshot(role, kernel=kernel, end=".end.txt" in remote)
+                    snapshot["interrupts"] += "46: 0 0 0 0 0 0 0 0 management-ena\n"
+                    if ".end.txt" in remote:
+                        counts = ["0"] * 8
+                        counts[cpu] = "1"
+                        snapshot["interrupts"] = snapshot["interrupts"].replace(
+                            f"{irq}: 0 0 0 0 0 0 0 0", f"{irq}: " + " ".join(counts))
+                    with open(os.path.join(local, os.path.basename(remote)), "w") as file:
+                        json.dump(snapshot, file)
+                host.fetch.side_effect = fetch
+                self.assertEqual(z.collect_placement([host], {role: z.parse_host_env(HOST_ENV)},
+                    "tag", "conduit", kernel, directory, allowed_receiver_irqs=["45"]), valid)
+                with open(os.path.join(directory, "tag.placement.json")) as file:
+                    metadata = json.load(file)["hosts"][role]
+                self.assertEqual(metadata["allowed_device_irqs"],
+                                 {"45": [7]} if kernel and role == "receiver" else {})
+
+    def test_end_snapshot_waits_for_penultimate_result_and_rejects_finished_sweeps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "steps.jsonl"
+            path.write_text('{"kind":"step"}\n')
+            with mock.patch.object(z.placement.time, "sleep",
+                                   side_effect=lambda _: path.write_text('{"kind":"step"}\n' * 2)) as sleep:
+                before_ns = z.placement.wait_steps(path, 2, 10)
+            sleep.assert_called_once_with(0.1)
+            self.assertEqual(before_ns, path.stat().st_mtime_ns + 10_000_000)
+            with path.open("a") as file:
+                file.write('{"kind":"summary"}\n')
+            with self.assertRaisesRegex(RuntimeError, "ended"):
+                z.placement.wait_steps(path, 2, 10)
+            path.write_text("")
+            done = Path(directory) / "done"
+            done.touch()
+            with self.assertRaisesRegex(RuntimeError, "coordinator exited"):
+                z.placement.wait_steps(path, 2, 10, done=done)
+            with mock.patch.object(z.placement.time, "monotonic", side_effect=[0, 61]):
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    z.placement.wait_steps(path, 2, 10)
+
+    def test_end_snapshot_fails_closed_when_capture_misses_measurement_window(self):
+        snapshot = placement_snapshot("receiver")
+        with mock.patch.object(z.placement, "processes", return_value=snapshot["processes"]), \
+                mock.patch.object(z.placement.Path, "read_text", return_value="6-7"), \
+                mock.patch.object(z.placement.time, "time_ns", return_value=100):
+            self.assertTrue(any("missed" in error for error in
+                                z.placement.capture(snapshot["assignment"], ["serve"], before_ns=100)["errors"]))
+            self.assertEqual(z.placement.capture(snapshot["assignment"], ["serve"], before_ns=101)["errors"], [])
+
+    def test_end_capture_pins_collectors_and_propagates_trigger_failure(self):
+        hosts = [mock.Mock(role=role) for role in z.ROLES]
+        facts = {role: z.parse_host_env(HOST_ENV) for role in z.ROLES}
+        for host in hosts:
+            host.root.return_value = Proc(0, "10000000000\n")
+        errors = []
+        z.capture_end_placement(hosts, facts, "tag", "junction", False, errors)
+        self.assertEqual(errors, [])
+        for host in hosts:
+            command = host.root.call_args.args[0]
+            self.assertIn("taskset -c 0-5 python3", command)
+            self.assertIn("--timeout 0 --before-ns 10000000000", command)
+            self.assertIn(f"--out {z.REMOTE}/tag.{host.role}.placement.end.txt", command)
+        trigger = hosts[1].root.call_args_list[0].args[0]
+        self.assertIn(f"--count {len(z.RATES) - 1} --step-ms {z.STEP_MS}", trigger)
+        self.assertIn("--done /var/tmp/zhida/tag.placement.done", trigger)
+        hosts[1].root.return_value = Proc(1, "sweep ended")
+        z.capture_end_placement(hosts, facts, "tag", "junction", False, errors)
+        self.assertIn("sweep ended", errors[0])
+
+    def test_late_helpers_and_external_interference_fail_the_sweep(self):
+        for kind in ("serve", "external"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                host = mock.Mock(role="receiver")
+                def fetch(remote, local):
+                    snapshot = placement_snapshot("receiver", end=".end.txt" in remote)
+                    if ".end.txt" in remote:
+                        if kind == "serve":
+                            snapshot["processes"][0]["threads"].append(
+                                {"tid": 999, "comm": "late-helper", "Cpus_allowed_list": "7", "psr": 7})
+                        else:
+                            snapshot["processes"].append({"pid": 999, "kind": "external", "threads": [
+                                {"tid": 999, "comm": "stress", "Cpus_allowed_list": "0-7", "psr": 0}]})
+                    with open(os.path.join(local, os.path.basename(remote)), "w") as file:
+                        json.dump(snapshot, file)
+                host.fetch.side_effect = fetch
+                self.assertFalse(z.collect_placement([host], {"receiver": z.parse_host_env(HOST_ENV)},
+                                                     "tag", "conduit", False, directory))
+                with open(os.path.join(directory, "tag.placement.json")) as file:
+                    self.assertTrue(any("isolated" in error for error in json.load(file)["errors"]))
 
     def test_invalid_placement_fails_only_its_sweep_and_next_sweep_runs(self):
         hosts = [mock.Mock(role=role) for role in z.ROLES]
@@ -456,6 +604,7 @@ class PlacementTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(z, "start_placement", side_effect=lambda host, *args: events.append(host.role)) as start, \
                 mock.patch.object(z, "collect_placement", side_effect=[False, True]) as collect, \
+                mock.patch.object(z, "capture_end_placement"), \
                 mock.patch.object(z, "save_receiver_journal"), \
                 mock.patch.object(z, "fetch_sweep", return_value=[]), \
                 mock.patch.object(z, "SWEEPS", [("udp", None), ("tcp", None)]):
@@ -1329,6 +1478,8 @@ class FakeHost:
         self.w.calls.append((self.role, "root " + command))
         if command == "cat /etc/zhida/host.env":
             return Proc(0, HOST_ENV)
+        if "--wait-steps" in command:
+            return Proc(0, "9999999999999999999\n")
         if command == "cat /etc/zhida/dut.json":
             return Proc(0, json.dumps({"ipv4": RECEIVER_DATA_IP + "/24", "mtu": self.w.dut_mtu}))
         if command in ("ip -j -4 rule show", "ip -j -4 route show table all"):
@@ -1371,10 +1522,10 @@ class FakeHost:
         if self.w.hang:
             return f"{self.role}:{remote}: scp timed out after {z.SSH_S} s"
         with open(os.path.join(local, os.path.basename(remote)), "w") as f:
-            if remote.endswith(".placement.txt"):
+            if ".placement" in remote and remote.endswith(".txt"):
                 backend = "junction" if os.path.basename(remote).startswith("junction-") else "conduit"
                 kernel = self.role == "receiver" and any(r == "receiver" and "kernel_receiver" in c for r, c in self.w.calls)
-                json.dump(placement_snapshot(self.role, backend, kernel), f)
+                json.dump(placement_snapshot(self.role, backend, kernel, end=".end.txt" in remote), f)
             else:
                 f.write(self.w.feed_text if remote == z.FEED_OUT else "{}\n")
         return None
@@ -1706,7 +1857,8 @@ class RunTest(unittest.TestCase):
         for t in z.sweep_tags():
             want = {("sender0", f"{z.REMOTE}/{t}.jsonl"), ("sender0", f"{z.REMOTE}/{t}.coord.log")}
             want |= {(f"sender{i}", f"{z.REMOTE}/gen-{t}.log") for i in range(z.SENDERS)}
-            want |= {(role, f"{z.REMOTE}/{t}.{role}.placement.txt") for role in z.ROLES}
+            want |= {(role, f"{z.REMOTE}/{t}.{role}.placement{suffix}.txt")
+                     for role in z.ROLES for suffix in ("", ".end")}
             self.assertEqual(want, {f for f in w.fetched if t in f[1]})
             self.assertTrue(os.path.exists(os.path.join(self.run_dir, f"sender{z.SENDERS - 1}", f"gen-{t}.log")))
             with open(os.path.join(self.run_dir, f"{t}.receiver.log")) as f:

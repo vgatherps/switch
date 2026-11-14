@@ -134,6 +134,11 @@ def placement_table(stem, placement):
                 continue
             rows.append(f"| {row['irq']} | {row['name']} |"
                         + "".join(f" {row['cpus'].get(cpu, 0)} |" for cpu in cpus))
+        exemptions = ", ".join(f"{irq} on CPU {cpu}"
+                               for irq, allowed in host.get("allowed_device_irqs", {}).items()
+                               for cpu in allowed)
+        if exemptions:
+            rows += ["", f"Kernel receiver measured data-ENI IRQs exempt from device-IRQ invalidation: {exemptions}."]
     return "\n".join(rows)
 
 

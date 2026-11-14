@@ -258,6 +258,14 @@ class ReportTest(unittest.TestCase):
                 self.assertNotIn("CARRYOVER", data_rows[0])
                 self.assertIn("CARRYOVER", data_rows[1])
 
+    def test_kernel_receiver_data_irq_exemption_is_explicit(self):
+        host = {"app_cpu": "7", "junction_cpu": None, "housekeeping": "0-5", "isolated": "6-7",
+                "allowed_device_irqs": {"45": [7]},
+                "interrupt_deltas": [{"irq": "45", "name": "ena", "cpus": {"6": 0, "7": 5}}]}
+        rendered = report.placement_table("tag", {"backend": "conduit", "hosts": {"receiver": host}})
+        self.assertIn("| 45 | ena | 0 | 5 |", rendered)
+        self.assertIn("Kernel receiver measured data-ENI IRQs exempt from device-IRQ invalidation: 45 on CPU 7.", rendered)
+
     def test_interrupt_deltas_show_each_host_cpu_and_both_snapshots_without_hiding_invalid_data(self):
         with tempfile.TemporaryDirectory() as d:
             stem = "junction-tcp-n1-s64-uncapped"

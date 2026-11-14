@@ -137,14 +137,23 @@ gets an invocation-scoped `TAG.ROLE.junctiond.log`, ending with its exit status;
 statuses are also logged as warnings.
 
 Before the coordinator starts, each host launches a housekeeping-pinned placement waiter. It waits
-up to 30 seconds for that host's app, daemon (junction only), and coordinator (sender0 only), then
-settles for one second and records every thread's TID, name, allowed CPU list and current/last CPU.
-`TAG.ROLE.placement.txt` includes the configured app/daemon/housekeeping assignments and the kernel's
-isolated CPU list. Network/app main threads must be pinned to their assigned single CPU; other
+up to 60 seconds for that host's expected processes and their main threads' final single-CPU pinning,
+so conduit EAL's temporary startup mask is not mistaken for measurement affinity.
+`TAG.ROLE.placement.txt` records every userspace thread's TID, name, allowed CPU list and current/last
+CPU, the configured assignments, the kernel's isolated CPU list, and `/proc/interrupts`.
+After the penultimate rate result is flushed, all hosts capture `TAG.ROLE.placement.end.txt`
+concurrently. Its timestamp must precede a conservative final-measurement deadline derived from
+that result's file mtime; an early-ended sweep or missed deadline is INVALID.
+Network/app main threads must be pinned to their assigned single CPU; other
 daemon/app/EAL threads and coordinator descendants must stay off isolated CPUs. Only the junction
 app's `junction-ctl` reader may share `APP_CPU`.
-The snapshot is checked after the sweep; a violation or missing snapshot fails that sweep and marks
-its measurements INVALID in the report, without skipping later sweeps. Per-backend report tables
+Both snapshots are checked after the sweep. Unrelated userspace tasks whose masks include isolated
+CPUs also invalidate the sweep. Interrupt deltas on isolated CPUs are reported per host: numeric
+device IRQs must not fire there; local interrupts such as LOC/RES are reported without invalidation.
+The kernel receiver comparison exempts only its already-verified data-ENI IRQs on `APP_CPU`;
+those same IRQs on another isolated CPU, and every other device IRQ, still invalidate the sweep.
+A violation, readiness timeout, or missing snapshot marks the sweep INVALID without skipping later
+sweeps. Per-backend report tables
 show each host's CPU IDs and process core count: conduit uses one isolated app core, junction uses
 two (the kernel receiver comparison still uses one receiver core).
 

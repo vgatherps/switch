@@ -43,7 +43,7 @@ def check(snapshot, expected, backend):
             errors.append(f"expected one {kind} process, found {count}")
     for process in processes:
         kind, pid = process["kind"], process["pid"]
-        if not any(thread["tid"] == pid for thread in process["threads"]):
+        if kind != "external" and not any(thread["tid"] == pid for thread in process["threads"]):
             errors.append(f"{kind} {pid}: main thread missing")
         for thread in process["threads"]:
             tid, comm = thread["tid"], thread["comm"]
@@ -57,13 +57,13 @@ def check(snapshot, expected, backend):
                 forbidden = isolated
                 if kind in expected and kind in ("serve", "gen") and backend == "junction" and comm == "junction-ctl":
                     forbidden = isolated - {app}
-                if allowed & forbidden or psr in forbidden:
+                if allowed & forbidden or (kind != "external" and psr in forbidden):
                     errors.append(f"{prefix}: may run on isolated CPU(s), allowed {sorted(allowed)}, psr {psr}")
     return errors
 
 
 def processes():
-    """All benchmark processes, this housekeeping collector, and benchmark child processes."""
+    """All userspace tasks, marking benchmark processes and their descendants separately."""
     entries = {}
     for path in Path("/proc").iterdir():
         if not path.name.isdigit():
@@ -86,7 +86,7 @@ def processes():
             break
         selected |= children
     result = []
-    for pid in sorted(selected):
+    for pid in sorted(entries):
         threads = []
         try:
             for task in (Path("/proc") / str(pid) / "task").iterdir():
@@ -95,36 +95,119 @@ def processes():
                 stat = (task / "stat").read_text().rsplit(")", 1)[1].split()
                 threads.append({"tid": int(task.name), "comm": (task / "comm").read_text().strip(),
                                 "Cpus_allowed_list": allowed, "psr": int(stat[36])})
-            result.append({"pid": pid, "kind": entries[pid][1], "threads": threads})
+            result.append({"pid": pid, "kind": entries[pid][1] if pid in selected else "external",
+                           "threads": threads})
         except (FileNotFoundError, ProcessLookupError):
             continue
     return result
 
 
-def capture(assignment, expected, timeout=30):
+def ready(found, assignment, expected):
+    for kind in expected:
+        matches = [process for process in found if process["kind"] == kind]
+        if len(matches) != 1:
+            return False
+        if kind in ("serve", "kernel-serve", "gen", "junctiond"):
+            cpu = int(assignment["JUNCTION_CPU" if kind == "junctiond" else "APP_CPU"])
+            main = next((thread for thread in matches[0]["threads"] if thread["tid"] == matches[0]["pid"]), None)
+            if main is None or cpus(main["Cpus_allowed_list"]) != {cpu}:
+                return False
+    return True
+
+
+def capture(assignment, expected, timeout=60, before_ns=None):
     deadline = time.monotonic() + timeout
     while True:
         found = processes()
-        if set(expected) <= {process["kind"] for process in found}:
-            time.sleep(1)  # Let control and EAL helper threads start before observing their masks.
-            found = processes()
+        if ready(found, assignment, expected):
             errors = []
             break
         if time.monotonic() >= deadline:
-            errors = [f"timed out waiting for processes: {', '.join(expected)}"]
+            errors = [f"timed out waiting for processes and pinned main threads: {', '.join(expected)}"]
             break
         time.sleep(0.1)
-    return {"assignment": assignment, "isolated": Path("/sys/devices/system/cpu/isolated").read_text().strip(),
-            "processes": found, "errors": errors}
+    snapshot = {"assignment": assignment,
+                "isolated": Path("/sys/devices/system/cpu/isolated").read_text().strip(),
+                "processes": found, "errors": errors,
+                "interrupts": Path("/proc/interrupts").read_text(), "unix_ns": time.time_ns()}
+    if before_ns is not None and snapshot["unix_ns"] >= before_ns:
+        snapshot["errors"].append("end snapshot missed the final measurement window")
+    return snapshot
+
+
+def interrupt_deltas(first, last, allowed_device_irqs=None):
+    def parse(text):
+        lines = text.splitlines()
+        columns = [column.removeprefix("CPU") for column in lines[0].split()]
+        result = {}
+        for line in lines[1:]:
+            irq, separator, rest = line.partition(":")
+            values = rest.split()
+            if separator and len(values) >= len(columns) and all(value.isdigit() for value in values[:len(columns)]):
+                result[irq.strip()] = (" ".join(values[len(columns):]),
+                                       dict(zip(columns, map(int, values[:len(columns)]))))
+        return result
+    before, after = parse(first["interrupts"]), parse(last["interrupts"])
+    isolated = cpus(first["isolated"])
+    rows, errors = [], []
+    for irq, (name, counts) in after.items():
+        if irq not in before:
+            errors.append(f"interrupt {irq}: appeared after the initial snapshot")
+            continue
+        deltas = {str(cpu): counts[str(cpu)] - before[irq][1][str(cpu)] for cpu in sorted(isolated)}
+        rows.append({"irq": irq, "name": name, "cpus": deltas})
+        if any(delta < 0 for delta in deltas.values()):
+            errors.append(f"interrupt {irq}: counters decreased")
+        allowed = (allowed_device_irqs or {}).get(irq, ())
+        if irq.isdigit() and any(delta > 0 and int(cpu) not in allowed for cpu, delta in deltas.items()):
+            errors.append(f"device IRQ {irq} {name} fired on isolated CPUs: {deltas}")
+    return rows, errors
+
+
+def wait_steps(path, count, step_ms, timeout=60, done=None):
+    """Observe the penultimate flushed result; its mtime bounds the final measurement."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with path.open() as file:
+                stamp = os.fstat(file.fileno()).st_mtime_ns
+                rows = [json.loads(line) for line in file if line.endswith("\n")]
+            steps = sum(row.get("kind") == "step" for row in rows)
+            if any(row.get("kind") == "summary" for row in rows) or steps > count:
+                raise RuntimeError("sweep ended before the end snapshot was triggered")
+            if steps == count:
+                return stamp + step_ms * 1_000_000
+        except FileNotFoundError:
+            pass
+        if done is not None and done.exists():
+            raise RuntimeError("coordinator exited before the end snapshot was triggered")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("timed out waiting for the penultimate step")
+        time.sleep(0.1)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--assignment", type=json.loads, required=True)
-    parser.add_argument("--expect", action="append", required=True)
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--assignment", type=json.loads)
+    parser.add_argument("--expect", action="append")
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--before-ns", type=int)
+    parser.add_argument("--wait-steps", type=Path)
+    parser.add_argument("--count", type=int)
+    parser.add_argument("--step-ms", type=int)
+    parser.add_argument("--done", type=Path)
     args = parser.parse_args()
-    snapshot = capture(args.assignment, args.expect)
+    if args.wait_steps:
+        try:
+            print(wait_steps(args.wait_steps, args.count, args.step_ms, args.timeout, args.done))
+            return 0
+        except (RuntimeError, ValueError) as error:
+            print(error)
+            return 1
+    if args.assignment is None or args.expect is None or args.out is None:
+        parser.error("--assignment, --expect and --out are required for snapshots")
+    snapshot = capture(args.assignment, args.expect, args.timeout, args.before_ns)
     temporary = args.out.with_suffix(args.out.suffix + ".tmp")
     temporary.write_text(json.dumps(snapshot, indent=2) + "\n")
     temporary.replace(args.out)

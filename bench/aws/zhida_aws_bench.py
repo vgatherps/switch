@@ -985,7 +985,7 @@ def fetch_sweep(t, hosts, run_dir):
 def start_placement(host, facts, t, backend, kernel=False):
     assignment = {key: facts[key] for key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")}
     expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
-    command = (f"systemd-run --unit {PLACEMENT_UNIT} --collect --property=RuntimeMaxSec=35"
+    command = (f"systemd-run --unit {PLACEMENT_UNIT} --collect --property=RuntimeMaxSec=65"
                f" taskset -c {shlex.quote(facts['HOUSEKEEPING'])}"
                f" python3 {SRC_DIR}/bench/aws/placement.py"
                f" --assignment {shlex.quote(json.dumps(assignment))}"
@@ -995,30 +995,90 @@ def start_placement(host, facts, t, backend, kernel=False):
               f"systemctl reset-failed {PLACEMENT_UNIT} 2>/dev/null; {command}")
 
 
-def collect_placement(hosts, facts, t, backend, kernel, run_dir):
-    result = {"backend": backend, "hosts": {}, "errors": []}
-    for host in hosts:
-        name = f"{t}.{host.role}.placement.txt"
-        error = host.fetch(f"{REMOTE}/{name}", run_dir)
-        if error:
-            result["errors"].append(f"{host.role}: missing placement snapshot: {error}")
-            continue
+def capture_end_placement(hosts, facts, t, backend, kernel, errors):
+    """Wait for the penultimate result, then snapshot all hosts concurrently during the last rate."""
+    sender0 = hosts[1]
+    command = (f"taskset -c {shlex.quote(facts['sender0']['HOUSEKEEPING'])}"
+               f" python3 {SRC_DIR}/bench/aws/placement.py --wait-steps {REMOTE}/{t}.jsonl"
+               f" --count {len(RATES) - 1} --step-ms {STEP_MS} --timeout {SWEEP_WORST_S}"
+               f" --done {REMOTE}/{t}.placement.done")
+    try:
+        trigger = sender0.root(command, check=False, timeout=SWEEP_WORST_S)
+        if trigger.returncode:
+            errors.append(f"end snapshot: {trigger.stdout.strip()}")
+            return
+        before_ns = int(trigger.stdout.strip())
+    except (RuntimeError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        errors.append(f"end snapshot trigger failed: {error}")
+        return
+
+    def capture(host):
+        assignment = {key: facts[host.role][key] for key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")}
+        expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
+        command = (f"taskset -c {shlex.quote(assignment['HOUSEKEEPING'])}"
+                   f" python3 {SRC_DIR}/bench/aws/placement.py --assignment {shlex.quote(json.dumps(assignment))}"
+                   + "".join(f" --expect {kind}" for kind in expected)
+                   + f" --timeout 0 --before-ns {before_ns} --out {REMOTE}/{t}.{host.role}.placement.end.txt")
         try:
-            with open(os.path.join(run_dir, name)) as file:
-                snapshot = json.load(file)
-            assignment = snapshot["assignment"]
-            if any(assignment[key] != facts[host.role][key]
-                   for key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")):
-                result["errors"].append(f"{host.role}: snapshot CPU assignment differs from host.env")
-            expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
-            result["errors"] += [f"{host.role}: {error}" for error in placement.check(snapshot, expected, backend)]
-            result["hosts"][host.role] = {
-                "app_cpu": assignment["APP_CPU"],
-                "junction_cpu": assignment["JUNCTION_CPU"] if "junctiond" in expected else None,
-                "housekeeping": assignment["HOUSEKEEPING"], "isolated": snapshot["isolated"],
-            }
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            result["errors"].append(f"{host.role}: invalid placement snapshot: {error}")
+            result = host.root(command, check=False, timeout=SSH_S)
+            if result.returncode:
+                errors.append(f"{host.role}: end snapshot failed (exit {result.returncode})")
+        except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            errors.append(f"{host.role}: end snapshot failed: {error}")
+
+    threads = [threading.Thread(target=capture, args=(host,)) for host in hosts]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def collect_placement(hosts, facts, t, backend, kernel, run_dir, extra_errors=(), allowed_receiver_irqs=()):
+    result = {"backend": backend, "hosts": {}, "errors": list(extra_errors)}
+    for host in hosts:
+        names = [f"{t}.{host.role}.placement{suffix}.txt" for suffix in ("", ".end")]
+        snapshots = []
+        expected = placement.expected_processes(host.role, backend, kernel and host.role == "receiver")
+        for name in names:
+            error = host.fetch(f"{REMOTE}/{name}", run_dir)
+            if error:
+                result["errors"].append(f"{host.role}: missing placement snapshot: {error}")
+                continue
+            try:
+                with open(os.path.join(run_dir, name)) as file:
+                    snapshot = json.load(file)
+                assignment = snapshot["assignment"]
+                if any(assignment[key] != facts[host.role][key]
+                       for key in ("APP_CPU", "JUNCTION_CPU", "HOUSEKEEPING", "ISOLATED")):
+                    result["errors"].append(f"{host.role}: snapshot CPU assignment differs from host.env")
+                result["errors"] += [f"{name}: {error}" for error in placement.check(snapshot, expected, backend)]
+                snapshots.append(snapshot)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                result["errors"].append(f"{name}: invalid placement snapshot: {error}")
+        if not snapshots:
+            continue
+        assignment = snapshots[0]["assignment"]
+        host_result = {
+            "app_cpu": assignment["APP_CPU"],
+            "junction_cpu": assignment["JUNCTION_CPU"] if "junctiond" in expected else None,
+            "housekeeping": assignment["HOUSEKEEPING"], "isolated": snapshots[0]["isolated"],
+            "snapshots": names,
+        }
+        if len(snapshots) == 2:
+            try:
+                if snapshots[0]["unix_ns"] >= snapshots[1]["unix_ns"]:
+                    result["errors"].append(f"{host.role}: end snapshot did not follow initial snapshot")
+                if snapshots[0]["isolated"] != snapshots[1]["isolated"]:
+                    result["errors"].append(f"{host.role}: isolated CPU list changed during sweep")
+                allowed = ({irq: {int(assignment["APP_CPU"])} for irq in allowed_receiver_irqs}
+                           if kernel and host.role == "receiver" else {})
+                host_result["allowed_device_irqs"] = {irq: sorted(cpus) for irq, cpus in allowed.items()}
+                deltas, errors = placement.interrupt_deltas(*snapshots, allowed)
+                host_result["interrupt_deltas"] = deltas
+                result["errors"] += [f"{host.role}: {error}" for error in errors]
+            except (ValueError, KeyError, IndexError, TypeError) as error:
+                result["errors"].append(f"{host.role}: invalid interrupt snapshots: {error}")
+        result["hosts"][host.role] = host_result
     with open(os.path.join(run_dir, f"{t}.placement.json"), "w") as file:
         json.dump(result, file, indent=2)
     for error in result["errors"]:
@@ -1075,6 +1135,10 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
             except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
                 log(f"{t}: {host.role}: placement waiter failed: {error}")
                 return None
+        end_errors = []
+        end_thread = threading.Thread(target=capture_end_placement,
+                                      args=(hosts, facts, t, backend, kernel, end_errors), daemon=True)
+        end_thread.start()
         try:
             code = sender0.ssh(sweep_command(proto, budget, receiver_ip, facts["sender0"]["HOUSEKEEPING"], backend),
                                check=False, timeout=SWEEP_WORST_S, stream=True).returncode
@@ -1082,7 +1146,16 @@ def run_sweep(proto, budget, hosts, facts, receiver_ip, env, kernel=False, run_d
             log(f"{t}: coordinator still running after {SWEEP_WORST_S} s; killed")
             sender0.ssh("pkill -f 'zhida-bench sweep'", check=False, timeout=60)
             code = None
-        valid = collect_placement(hosts, facts, t, backend, kernel, run_dir)
+        finally:
+            try:
+                sender0.root(f"touch {REMOTE}/{t}.placement.done")
+            except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                end_errors.append(f"could not signal coordinator exit: {error}")
+            end_thread.join(SSH_S + 5)
+            if end_thread.is_alive():
+                end_errors.append("end snapshot collector did not finish")
+        valid = collect_placement(hosts, facts, t, backend, kernel, run_dir, end_errors,
+                                  allowed_receiver_irqs=before["irqs"] if kernel else ())
         return code if valid else None
     finally:
         try:
