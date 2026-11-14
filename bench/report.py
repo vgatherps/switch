@@ -6,12 +6,14 @@ Usage: report.py RESULTS_DIR [--title T]
 RESULTS_DIR holds `<sweep>.jsonl` sweep outputs (`zhida-bench sweep` lines), and optionally
 `expected.json` ({"sweeps": [<sweep>, ...]}: every sweep the run meant to produce),
 `host-setup.txt` (the host setup verification), and `<sweep>.placement.json` (backend,
-per-host CPU placement, and placement errors). Raw placement snapshots are linked as
-`<sweep>.<role>.placement.txt`.
+per-host CPU placement, interrupt deltas, and placement errors). Raw placement snapshots are
+linked as `<sweep>.<role>.placement.txt` and, when present, `<sweep>.<role>.placement.end.txt`.
 
 Exit status 1 when the results are incomplete: an expected sweep is missing, a sweep has no
 summary, a sweep did not complete, a sender fell behind, or placement errors invalidate a sweep.
 The report is still written, headed INCOMPLETE; invalid placement does not hide measurements.
+Junction uncapped TCP/ws steps after the first loss or sender-late step are marked CARRYOVER
+(not comparable); all measurements remain in the report, plots, and results.json.
 """
 import json
 import math
@@ -67,8 +69,8 @@ def lat(step, key):
     return None if q is None else q[key]
 
 
-def flags(step):
-    out = []
+def flags(step, carryover=False):
+    out = ["CARRYOVER"] if carryover else []
     if step.get("generator_bound"):
         out.append("SENDER-LATE")
     if step.get("budget_bound"):
@@ -78,16 +80,23 @@ def flags(step):
     return " ".join(out) or "-"
 
 
-def table(steps):
+def table(steps, carryover=False):
     rows = [
         "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs | flags |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
+    contaminated = False
+    marked = False
     for s in sorted(steps, key=lambda s: s["offered_pps"]):
+        marked |= carryover and contaminated
         rows.append(
             f"| {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} | {100 * s['drop_fraction']:.3f} |"
-            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} | {flags(s)} |"
+            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} | {flags(s, carryover and contaminated)} |"
         )
+        contaminated |= s["drop_fraction"] > 0 or s.get("generator_bound", False)
+    if marked:
+        rows += ["", "CARRYOVER: steps after the first loss or SENDER-LATE step in a junction uncapped TCP/ws"
+                 " sweep may include earlier queued work and are not comparable."]
     return "\n".join(rows)
 
 
@@ -103,11 +112,28 @@ def placement_table(stem, placement):
             cpus.append(host["junction_cpu"])
         process_cpus = ", ".join(dict.fromkeys(cpus))
         snapshot = f"{stem}.{role}.placement.txt"
+        snapshots = host.get("snapshots", [snapshot])
+        links = f"[raw]({snapshots[0]})"
+        if len(snapshots) > 1:
+            links += f" [end]({snapshots[1]})"
         rows.append(
             f"| {placement['backend']} | {role} | {host['app_cpu']} | {host['junction_cpu'] or '-'} |"
             f" {process_cpus} | {len(set(cpus))} | {host['housekeeping']} | {host['isolated']} |"
-            f" [raw]({snapshot}) |"
+            f" {links} |"
         )
+    for role, host in sorted(placement["hosts"].items()):
+        if "interrupt_deltas" not in host:
+            continue
+        deltas = host["interrupt_deltas"]
+        cpus = sorted({cpu for row in deltas for cpu in row["cpus"]}, key=int)
+        rows += ["", f"### Interrupt deltas — {role}", "",
+                 "| IRQ | name |" + "".join(f" CPU {cpu} |" for cpu in cpus),
+                 "|---|---|" + "---:|" * len(cpus)]
+        for row in deltas:
+            if row["irq"].isdigit() and not any(row["cpus"].values()):
+                continue
+            rows.append(f"| {row['irq']} | {row['name']} |"
+                        + "".join(f" {row['cpus'].get(cpu, 0)} |" for cpu in cpus))
     return "\n".join(rows)
 
 
@@ -217,7 +243,11 @@ def build(directory, title):
         if invalid:
             sections += [f"- INVALID placement: {error}" for error in placement["errors"]]
             sections.append("")
-        sections += [f"![{stem}]({stem}.svg)", "", table(steps), ""]
+        carryover = stem.startswith(("junction-tcp-", "junction-ws-")) and stem.endswith("-uncapped")
+        sections += [f"![{stem}]({stem}.svg)", "", table(steps, carryover), ""]
+        if stem.startswith("junction-") or (placement is not None and placement["backend"] == "junction"):
+            sections += ["ENA allowance/reset counters are recorded for conduit sweeps only; the wire traffic per"
+                         " rate is the same on both backends, so conduit's counters at the same rate are the reference.", ""]
         if any(s["generator_bound"] for s in steps):
             sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
                          " identify the cause; receiver backpressure can also delay sends.", ""]

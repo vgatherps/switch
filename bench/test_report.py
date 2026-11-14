@@ -151,6 +151,8 @@ class ReportTest(unittest.TestCase):
             with open(os.path.join(d, "results.json")) as f:
                 results = json.load(f)
             self.assertEqual({s["name"]: s["placement"] for s in results["sweeps"]}, placements)
+            self.assertNotIn("Interrupt deltas", md)
+            self.assertNotIn("[end]", md)
 
     def test_placement_errors_invalidate_complete_sweep_without_hiding_data(self):
         with tempfile.TemporaryDirectory() as d:
@@ -188,6 +190,118 @@ class ReportTest(unittest.TestCase):
                                        "steps": [measured], "placement": placement})
             self.assertEqual(results["incomplete"],
                              [f"udp-junction: placement: {error}" for error in placement["errors"]])
+
+    def test_carryover_starts_after_loss_or_sender_late_only_for_junction_uncapped_streams(self):
+        for trigger in ("loss", "sender-late", "clean"):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as d:
+                measured = [
+                    step(1000, 10_000),
+                    step(2000, 10_000, drop=0.01 if trigger == "loss" else 0,
+                         bound=trigger == "sender-late"),
+                    step(3000, 10_000),
+                    step(4000, None if trigger != "clean" else 10_000,
+                         drop=1.0 if trigger != "clean" else 0),
+                    step(5000, 10_000, bound=trigger != "clean"),
+                ]
+                complete = summary(5, bound=trigger != "clean")
+                names = []
+                affected = set()
+                for backend in ("junction", "conduit"):
+                    for proto in ("tcp", "ws", "udp"):
+                        for budget in ("uncapped", "b100"):
+                            stem = f"{backend}-{proto}-n1-s64-{budget}"
+                            names.append(stem)
+                            if backend == "junction" and proto in ("tcp", "ws") and budget == "uncapped":
+                                affected.add(stem)
+                            write_jsonl(os.path.join(d, stem + ".jsonl"), [*measured, complete])
+                md, _ = report.build(d, "T")
+                md = "\n".join(md)
+                for stem in names:
+                    with self.subTest(stem=stem):
+                        section = md.split(f"## {stem}\n", 1)[1].split("\n## ", 1)[0]
+                        rows = [line for line in section.splitlines()
+                                if line.startswith("| ") and line.split("|")[1].strip().isdigit()]
+                        self.assertEqual(len(rows), len(measured))
+                        ena_note = ("ENA allowance/reset counters are recorded for conduit sweeps only; the wire"
+                                    " traffic per rate is the same on both backends, so conduit's counters at"
+                                    " the same rate are the reference.")
+                        self.assertEqual(ena_note in section, stem.startswith("junction-"))
+                        expected = stem in affected and trigger != "clean"
+                        for index, row in enumerate(rows):
+                            self.assertEqual("CARRYOVER" in row, expected and index > 1)
+                        self.assertEqual("not comparable" in section, expected)
+                        if trigger != "clean":
+                            self.assertIn("NO ECHO", rows[3])
+                            self.assertIn("SENDER-LATE", rows[4])
+                        if trigger == "sender-late":
+                            self.assertIn("SENDER-LATE", rows[1])
+                        with open(os.path.join(d, stem + ".svg")) as f:
+                            root = ET.fromstring(f.read())
+                        drop_line = root.findall(f"{SVG}polyline")[-1].get("points").split()
+                        self.assertEqual(len(drop_line), len(measured))
+                with open(os.path.join(d, "results.json")) as f:
+                    results = json.load(f)
+                self.assertEqual(len(results["sweeps"]), len(names))
+                for sweep in results["sweeps"]:
+                    self.assertEqual(sweep["steps"], measured)
+                    self.assertEqual(sweep["summary"], complete)
+
+    def test_first_problematic_step_without_later_steps_is_not_carryover(self):
+        for problematic in (step(1000, None, drop=1), step(1000, 10_000, bound=True)):
+            with self.subTest(problematic=problematic):
+                text = report.table([problematic], carryover=True)
+                self.assertNotIn("CARRYOVER", text)
+                self.assertNotIn("not comparable", text)
+                later = report.table([problematic, step(2000, 10_000)], carryover=True)
+                data_rows = [line for line in later.splitlines() if line.startswith("| 1000")
+                             or line.startswith("| 2000")]
+                self.assertNotIn("CARRYOVER", data_rows[0])
+                self.assertIn("CARRYOVER", data_rows[1])
+
+    def test_interrupt_deltas_show_each_host_cpu_and_both_snapshots_without_hiding_invalid_data(self):
+        with tempfile.TemporaryDirectory() as d:
+            stem = "junction-tcp-n1-s64-uncapped"
+            measured = step(1000, 10_000)
+            write_jsonl(os.path.join(d, stem + ".jsonl"), [measured, summary(1)])
+            placement = {"backend": "junction", "hosts": {}, "errors": [
+                "receiver: IRQ 24 increased on isolated CPU 7 by 3"]}
+            for role, app, daemon in (("receiver", "7", "6"), ("sender0", "11", "10")):
+                placement["hosts"][role] = {
+                    "app_cpu": app, "junction_cpu": daemon,
+                    "housekeeping": "0-5" if role == "receiver" else "0-9",
+                    "isolated": f"{daemon}-{app}",
+                    "snapshots": [f"{stem}.{role}.placement.txt", f"{stem}.{role}.placement.end.txt"],
+                    "interrupt_deltas": [
+                        {"irq": "24", "name": "ena-Tx-Rx-0", "cpus": {app: 3, daemon: 0}},
+                        {"irq": "25", "name": "ena-Tx-Rx-1", "cpus": {app: 0, daemon: 0}},
+                        {"irq": "LOC", "name": "Local timer interrupts", "cpus": {app: 0, daemon: 0}},
+                        {"irq": "RES", "name": "Rescheduling interrupts", "cpus": {app: 0, daemon: 2}},
+                        {"irq": "NMI", "name": "Non-maskable interrupts", "cpus": {app: 0, daemon: 0}},
+                    ],
+                }
+            with open(os.path.join(d, stem + ".placement.json"), "w") as f:
+                json.dump(placement, f)
+            md, issues = report.build(d, "T")
+            md = "\n".join(md)
+            self.assertEqual(issues, [f"{stem}: placement: {placement['errors'][0]}"])
+            self.assertIn(f"## {stem} — INVALID", md)
+            self.assertIn("| 1000 | 990 | 980 |", md)
+            for role, cpus in (("receiver", ("6", "7")), ("sender0", ("10", "11"))):
+                self.assertIn(f"[raw]({stem}.{role}.placement.txt)", md)
+                self.assertIn(f"[end]({stem}.{role}.placement.end.txt)", md)
+                section = md.split(f"### Interrupt deltas — {role}\n", 1)[1].split("\n### ", 1)[0]
+                self.assertIn(f"| IRQ | name | CPU {cpus[0]} | CPU {cpus[1]} |", section)
+                self.assertIn("| 24 | ena-Tx-Rx-0 | 0 | 3 |", section)
+                self.assertNotIn("| 25 |", section)
+                self.assertIn("| LOC | Local timer interrupts | 0 | 0 |", section)
+                self.assertIn("| RES | Rescheduling interrupts | 2 | 0 |", section)
+                self.assertIn("| NMI | Non-maskable interrupts | 0 | 0 |", section)
+            self.assertIn("| junction | receiver | 7 | 6 | 7, 6 | 2 |", md)
+            self.assertIn("| junction | sender0 | 11 | 10 | 11, 10 | 2 |", md)
+            with open(os.path.join(d, "results.json")) as f:
+                sweep = json.load(f)["sweeps"][0]
+            self.assertEqual(sweep["placement"], placement)
+            self.assertEqual(sweep["steps"], [measured])
 
 
 if __name__ == "__main__":
