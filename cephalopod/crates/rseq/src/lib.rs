@@ -1117,8 +1117,14 @@ mod tests {
 
             let counts: Vec<_> = results.iter().map(|&(count, _)| count).collect();
             assert_eq!(consumed, counts);
-            assert!(counts.iter().all(|&count| count >= 1000));
-            assert!(results.iter().map(|&(_, aborts)| aborts).sum::<u64>() > 0);
+            assert!(
+                counts.iter().all(|&count| count >= 1000),
+                "per-writer (records, aborts): {results:?}"
+            );
+            assert!(
+                results.iter().map(|&(_, aborts)| aborts).sum::<u64>() > 0,
+                "per-writer (records, aborts): {results:?}"
+            );
         });
     }
 

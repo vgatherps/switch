@@ -110,10 +110,10 @@ FEED_MARGIN_S = 300
 
 TEST_SUITE_S = 3600
 TEST_SUITES = (
-    ("rings", "cargo test --locked -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer"),
-    ("junctiond", "cargo test --locked -p junctiond -- --test-threads=1"),
-    ("switchnet-sheath", "cargo test --locked -p switchnet -p sheath"
-     " --features switchnet/testkit,sheath/e2e -- --test-threads=1"),
+    ("rings", "cargo test --locked --no-fail-fast -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer"),
+    ("junctiond", "cargo test --locked --no-fail-fast -p junctiond"),
+    ("switchnet-sheath", "cargo test --locked --no-fail-fast -p switchnet -p sheath"
+     " --features switchnet/testkit,sheath/e2e"),
 )
 
 
@@ -1307,6 +1307,10 @@ def binance(args, env=None):
 
 def test_command(name, command):
     """Root test invocation with bootstrap's build environment and separate output/status artifacts."""
+    if name != "rings":
+        command = ("{ . /etc/zhida/host.env && test_cpu=${HOUSEKEEPING%%,*} && "
+                   f"test_cpu=${{test_cpu%%-*}} && {command} --no-run && "
+                   f'taskset -c "$test_cpu" {command} -- --test-threads=1; }}')
     return (f"mkdir -p {REMOTE} && cd {SRC_DIR} && "
             "export PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig "
             "RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld' "

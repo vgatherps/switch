@@ -248,10 +248,18 @@ Source is the pinned committed HEAD; `source.json` records its revision and arch
 The three independent suites are:
 
 ```sh
-cargo test --locked -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer
-cargo test --locked -p junctiond -- --test-threads=1
-cargo test --locked -p switchnet -p sheath --features switchnet/testkit,sheath/e2e -- --test-threads=1
+cargo test --locked --no-fail-fast -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer
+. /etc/zhida/host.env
+test_cpu=${HOUSEKEEPING%%,*}; test_cpu=${test_cpu%%-*}
+cargo test --locked --no-fail-fast -p junctiond --no-run
+taskset -c "$test_cpu" cargo test --locked --no-fail-fast -p junctiond -- --test-threads=1
+cargo test --locked --no-fail-fast -p switchnet -p sheath --features switchnet/testkit,sheath/e2e --no-run
+taskset -c "$test_cpu" cargo test --locked --no-fail-fast -p switchnet -p sheath --features switchnet/testkit,sheath/e2e -- --test-threads=1
 ```
+
+DPDK-linked suites build unpinned, then execute on one housekeeping CPU with one test thread.
+The rings suite stays unpinned because its rseq tests need at least two CPUs. `--no-fail-fast`
+lets every test binary in a suite run even when an earlier binary fails.
 
 Each suite has a one-hour SSH timeout and its own `.log` and `.exit` file (`rings`, `junctiond`,
 `switchnet-sheath`). A failure does not skip the later suites. Outputs are fetched before teardown,

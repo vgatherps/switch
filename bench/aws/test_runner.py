@@ -2034,9 +2034,9 @@ class NativeTestCommandTest(unittest.TestCase):
             ("aws", "launch_hosts c6in.2xlarge test"), ("test", "wait_ssh"), ("test", "install b'TAR'")])
         self.assertEqual(self.w.launch_amis, [z.INTEL_AMI_PARAM])
         expected = [
-            "cargo test --locked -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer",
-            "cargo test --locked -p junctiond -- --test-threads=1",
-            "cargo test --locked -p switchnet -p sheath --features switchnet/testkit,sheath/e2e -- --test-threads=1",
+            "cargo test --locked --no-fail-fast -p ceph-rseq -p ceph-ring -p ceph-fifo -p junction -p slice_ringbuffer",
+            "cargo test --locked --no-fail-fast -p junctiond",
+            "cargo test --locked --no-fail-fast -p switchnet -p sheath --features switchnet/testkit,sheath/e2e",
         ]
         self.assertEqual(len(self.test_calls), 3)
         for (command, kwargs), cargo, name in zip(self.test_calls, expected, ("rings", "junctiond", "switchnet-sheath")):
@@ -2046,7 +2046,15 @@ class NativeTestCommandTest(unittest.TestCase):
                             "LIBCLANG_PATH=/usr/lib64/llvm18/lib",
                             "PATH=/usr/lib64/llvm18/bin:/root/.cargo/bin:$PATH"):
                 self.assertIn(setting, command)
-            self.assertIn(f"{cargo} > {z.REMOTE}/{name}.log 2>&1", command)
+            if name == "rings":
+                self.assertIn(f"{cargo} > {z.REMOTE}/{name}.log 2>&1", command)
+                self.assertNotIn("taskset", command)
+                self.assertNotIn("--no-run", command)
+            else:
+                self.assertIn(". /etc/zhida/host.env && test_cpu=${HOUSEKEEPING%%,*}", command)
+                self.assertIn(f"test_cpu=${{test_cpu%%-*}} && {cargo} --no-run && "
+                              f'taskset -c "$test_cpu" {cargo} -- --test-threads=1; }} '
+                              f"> {z.REMOTE}/{name}.log 2>&1", command)
             self.assertIn(f'"$status" > {z.REMOTE}/{name}.exit', command)
             self.assertEqual(kwargs, {"check": False, "timeout": 3600})
         self.assertIn(["git", "-C", z.REPO, "archive", "--format=tar", "a" * 40], self.w.local_calls)
