@@ -323,9 +323,16 @@ impl HostControl {
                 {
                     continue;
                 }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                    ) => break,
                 Err(error) => return Err(error),
             };
-            socket.set_nonblocking(true)?;
+            if socket.set_nonblocking(true).is_err() {
+                continue;
+            }
             self.connections.push(Connection {
                 socket,
                 phase: Phase::Pending(Instant::now()),
@@ -842,6 +849,78 @@ mod tests {
                 self.host.drain_network();
             }
         }
+    }
+
+    #[test]
+    fn accept_fd_exhaustion_preserves_sessions_and_recovers() {
+        const CHILD: &str = "JUNCTION_ACCEPT_FD_EXHAUSTION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "host::tests::accept_fd_exhaustion_preserves_sessions_and_recovers",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "descriptor-exhaustion child failed");
+            return;
+        }
+
+        let mut fixture = Fixture::new();
+        let mut pending = UnixStream::connect(&fixture._path.0).unwrap();
+        pending.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut original = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: getrlimit writes to a valid local rlimit.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) }, 0);
+        let limit = libc::rlimit {
+            rlim_cur: original.rlim_cur.min(128),
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: the limit is valid and affects only this isolated child process.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut descriptors = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => descriptors.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+
+        fixture.host.accept().unwrap();
+        let mut request = Vec::new();
+        ClientMessage::Op(Op::ShutdownTcp {
+            id: SocketId { slot: 0, generation: 0 },
+        }).encode(&mut request);
+        fixture.client.as_mut().unwrap().write_all(&request).unwrap();
+        assert!(fixture.host.read(0, false).unwrap().is_none());
+        assert!(matches!(
+            fixture.network.try_recv().unwrap(),
+            ToNetwork::Op {
+                session,
+                op: Op::ShutdownTcp { id: SocketId { slot: 0, generation: 0 } },
+            } if session == pack(0, 1)
+        ));
+
+        drop(descriptors);
+        // SAFETY: restore this child's previously valid limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original) }, 0);
+        fixture.host.accept().unwrap();
+        let mut hello = Vec::new();
+        ClientMessage::Hello { version: VERSION, max_sockets: 1 }.encode(&mut hello);
+        pending.write_all(&hello).unwrap();
+        assert!(fixture.host.read(1, false).unwrap().is_none());
+        let mut reply = vec![0; fixture.host.connections[1].output.len()];
+        fixture.host.flush(1);
+        pending.read_exact(&mut reply).unwrap();
+        assert!(matches!(
+            HostMessage::decode(&reply).unwrap().unwrap().0,
+            HostMessage::Welcome(Welcome { status: WelcomeStatus::SessionsFull, .. })
+        ));
     }
 
     #[test]
