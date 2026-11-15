@@ -735,7 +735,9 @@ out-of-order FIN makes an orphan reply RST and close. An orphan in FinWait2 clos
 orphan that receives the peer FIN waits the usual 10 s in TimeWait. An orphan closes silently at an
 RTO or zero-window-probe expiry once its backoff count reaches 8 (Linux `tcp_orphan_retries`);
 zero-window ACKs that neither advance nor reopen the window do not reset that count. A socket whose
-handle is owned retries without limit.
+handle is owned retries without limit unless `tcp_mut(&handle).limit_retries()` is set.
+Both orphans and explicitly retry-limited sockets rearm the timer after failed data or
+zero-window-probe emission, so persistent egress failure still consumes the retry limit.
 
 ### Connect and listen
 

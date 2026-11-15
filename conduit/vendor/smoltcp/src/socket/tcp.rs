@@ -1189,7 +1189,8 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// The owner has closed but still queues data; give up after the orphan retry limit.
+    /// Applies the orphan retry limit without changing socket ownership.
+    /// Failed emission rearms the retry timer, so persistent egress failure also reaches the limit.
     pub fn limit_retries(&mut self) {
         self.retry_limited = true;
     }
@@ -3267,7 +3268,7 @@ impl<'a> Socket<'a> {
         if self.orphaned && self.state == State::Closed {
             self.tuple = None;
         }
-        if result.is_err() && self.orphaned && segment_len > 0 {
+        if result.is_err() && (self.orphaned || self.retry_limited) && segment_len > 0 {
             let delay = self.retransmission_timeout();
             if is_zero_window_probe {
                 self.timer.set_for_zero_window_probe(cx.now(), delay);
@@ -5214,7 +5215,7 @@ mod test {
         recv_nothing(&mut s, expires_at);
     }
 
-    fn check_failed_orphan_emit(mut s: TestSocket, orphaned: bool, probe: bool) {
+    fn check_failed_emit(mut s: TestSocket, orphaned: bool, probe: bool) {
         if probe {
             send!(s, SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(0));
             s.send_slice(b"abc").unwrap();
@@ -5222,6 +5223,7 @@ mod test {
         if orphaned {
             s.orphan(Instant::ZERO);
         }
+        let limited = orphaned || s.retry_limited;
         let state = s.state();
         let mut now = Instant::ZERO;
         for expiry in 0..=ORPHAN_RETRIES {
@@ -5238,7 +5240,7 @@ mod test {
             }
             assert_eq!(s.state(), state);
             assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
-            if !orphaned && !probe {
+            if !limited && !probe {
                 assert!(s.timer.is_idle());
                 now += Duration::from_secs(300);
                 continue;
@@ -5246,16 +5248,17 @@ mod test {
             now = match s.timer {
                 Timer::Retransmit { expires_at } if !probe => expires_at,
                 Timer::ZeroWindowProbe { expires_at, .. } if probe => expires_at,
-                _ => panic!("failed emit did not arm the orphan timer"),
+                _ => panic!("failed emit did not arm the retry timer"),
             };
-            assert!(now > s.cx.now(), "failed emit did not re-arm the orphan timer");
+            assert!(now > s.cx.now(), "failed emit did not re-arm the retry timer");
         }
         s.cx.set_now(now);
         let result = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| (Err::<(), _>(()), frame.map(OwnedFrame::freeze)));
-        if orphaned {
+        if limited {
             assert_eq!(result, Ok(()));
             assert_eq!(s.state(), State::Closed);
             assert_eq!(s.remote_endpoint(), None);
+            assert!(!s.retry_limited, "reset must clear the retry limit");
         } else {
             assert_eq!(s.state(), state);
             assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
@@ -5265,14 +5268,14 @@ mod test {
     #[test]
     fn orphan_failed_emit_fin_wait_1() {
         for orphaned in [true, false] {
-            check_failed_orphan_emit(socket_fin_wait_1(), orphaned, false);
+            check_failed_emit(socket_fin_wait_1(), orphaned, false);
         }
     }
 
     #[test]
     fn orphan_failed_emit_last_ack() {
         for orphaned in [true, false] {
-            check_failed_orphan_emit(socket_last_ack(), orphaned, false);
+            check_failed_emit(socket_last_ack(), orphaned, false);
         }
     }
 
@@ -5306,7 +5309,7 @@ mod test {
             let mut s = socket_established();
             s.send_slice(b"abc").unwrap();
             s.close();
-            check_failed_orphan_emit(s, orphaned, false);
+            check_failed_emit(s, orphaned, false);
         }
     }
 
@@ -5333,7 +5336,7 @@ mod test {
 
     #[test]
     fn orphan_failed_emit_zero_window_probe() {
-        check_failed_orphan_emit(socket_established(), true, true);
+        check_failed_emit(socket_established(), true, true);
     }
 
     #[test]
@@ -5443,6 +5446,50 @@ mod test {
         assert_eq!(s.state(), State::Closed);
         assert_eq!(s.remote_endpoint(), None);
         assert!(!s.retry_limited, "reset must clear the retry limit");
+    }
+
+    #[test]
+    fn retry_limited_failed_initial_data_emit() {
+        let mut s = socket_established();
+        s.send_slice(b"abc").unwrap();
+        s.limit_retries();
+        check_failed_emit(s, false, false);
+    }
+
+    #[test]
+    fn retry_limited_failed_retransmit_after_sent_data() {
+        let mut s = socket_established();
+        s.send_slice(b"abc").unwrap();
+        s.limit_retries();
+        recv(&mut s, Instant::ZERO, |reply| {
+            assert_eq!(reply.unwrap().payload, b"abc");
+        });
+        for expiry in 1..=ORPHAN_RETRIES {
+            let Timer::Retransmit { expires_at } = s.timer else { panic!("expected RTO") };
+            s.cx.set_now(expires_at);
+            assert_eq!(s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                let repr = frame_payload(repr, &frame);
+                assert_eq!(repr.payload, b"abc");
+                (Err::<(), _>(()), frame.map(OwnedFrame::freeze))
+            }), Err(()));
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.state(), State::Established);
+            assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
+            let Timer::Retransmit { expires_at: next } = s.timer else { panic!("expected rearmed RTO") };
+            assert!(next > expires_at);
+        }
+        let Timer::Retransmit { expires_at } = s.timer else { panic!("expected final RTO") };
+        recv_nothing(&mut s, expires_at);
+        assert_eq!(s.state(), State::Closed);
+        assert_eq!(s.remote_endpoint(), None);
+        assert!(!s.retry_limited);
+    }
+
+    #[test]
+    fn retry_limited_failed_zero_window_probe() {
+        let mut s = socket_established();
+        s.limit_retries();
+        check_failed_emit(s, false, true);
     }
 
     #[test]
