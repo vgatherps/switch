@@ -11,6 +11,8 @@ Used by `ceph-fifo`. Depends on [`ceph-rseq`](../rseq/README.md) for publication
 - `Writer::attach(path)`, `try_push(payload, stream, seq)`, `try_push_with_header(header, payload, stream, seq)`, `try_finish(stream, seq)`, returning `Result<(), PushError>` where `PushError` is `Full` or `TooLarge`. On Linux `attach` fails unless the thread has an rseq registration.
 - `END_OF_STREAM` (bit 63 of `seq`) marks a stream's last record; `Header { stream, seq, len }`.
 
+`Writer::attach` validates the platform's ring count, page-aligned power-of-two ring size, record capacity, checked offsets, and full backing extent before mapping the rings. Invalid geometry returns `io::ErrorKind::InvalidData`. Peers must still be trusted not to modify the layout or truncate the backing while it is in use.
+
 Feature `test-util` adds `Reader::write_unchecked`, used by `ceph-fifo`'s tests.
 
 ## Platforms

@@ -125,7 +125,8 @@ struct Map {
 
 impl Map {
     fn new(fd: BorrowedFd<'_>, nr_rings: usize, ring_size: usize, page: usize) -> io::Result<Map> {
-        let meta_bytes = meta_bytes(nr_rings, page);
+        let meta_bytes = meta_bytes(nr_rings, page)?;
+        let private_offset = private_offset(nr_rings)?;
         let meta = Mapping::new(fd, 0, meta_bytes)?;
         let mut map = Map {
             meta,
@@ -142,7 +143,7 @@ impl Map {
             let private = map
                 .meta
                 .as_ptr()
-                .wrapping_add(private_offset(nr_rings))
+                .wrapping_add(private_offset)
                 .cast::<Private>();
             // SAFETY: this cell is inside the non-null metadata mapping for index `i`.
             let private = unsafe { NonNull::new_unchecked(private.add(i)) };
@@ -214,19 +215,14 @@ impl Reader {
             max_record <= ring_size - ceph_rseq::HEADER_LEN as usize - 8,
             "max_record {max_record} does not fit in ring_size {ring_size}"
         );
-        #[cfg(target_os = "linux")]
-        let nr_rings = possible_cpus()?;
-        #[cfg(all(not(target_os = "linux"), not(feature = "test-util")))]
-        let nr_rings = 1;
-        #[cfg(all(not(target_os = "linux"), feature = "test-util"))]
-        let nr_rings = 2;
+        let nr_rings = expected_rings()?;
         // From here on, an error or panic drops `backing`, which unlinks the object.
         let name = unique_name("cph")?;
         #[cfg(target_os = "linux")]
         let backing = Backing::create_file(&dir.join(name))?;
         #[cfg(target_os = "macos")]
         let backing = Backing::create_shm(&name)?;
-        let len = meta_bytes(nr_rings, page) + nr_rings * ring_size;
+        let len = backing_len(nr_rings, ring_size, page)?;
         backing.resize(len)?;
         let map = Map::new(backing.fd(), nr_rings, ring_size, page)?;
         let mut cursors = Vec::with_capacity(nr_rings);
@@ -396,6 +392,10 @@ impl Writer {
         #[cfg(target_os = "macos")]
         let backing = Backing::open_shm(path)?;
         let page = backing.page_size()?;
+        let len = backing.len()?;
+        if len < page {
+            return Err(invalid_geometry());
+        }
         let (nr_rings, ring_size, max_record) = {
             let mapping = Mapping::read_only(backing.fd(), 0, page)?;
             let header = mapping.as_ptr().cast::<ShmHeader>();
@@ -410,12 +410,22 @@ impl Writer {
             // SAFETY: seeing `magic` with Acquire synchronizes with `create` publishing the layout.
             unsafe {
                 (
-                    (*header).nr_rings as usize,
-                    (*header).ring_size as usize,
-                    (*header).max_record as usize,
+                    usize::try_from((*header).nr_rings).map_err(|_| invalid_geometry())?,
+                    usize::try_from((*header).ring_size).map_err(|_| invalid_geometry())?,
+                    usize::try_from((*header).max_record).map_err(|_| invalid_geometry())?,
                 )
             }
         };
+        if nr_rings != expected_rings()?
+            || !ring_size.is_power_of_two()
+            || ring_size % page != 0
+            || ring_size > isize::MAX as usize / 2
+            || ring_size.checked_sub(ceph_rseq::HEADER_LEN as usize + 8)
+                .is_none_or(|capacity| max_record > capacity)
+            || backing_len(nr_rings, ring_size, page)? > len
+        {
+            return Err(invalid_geometry());
+        }
         let map = Map::new(backing.fd(), nr_rings, ring_size, page)?;
         let table = map.rings.iter().map(Ring::args).collect();
         Ok(Writer {
@@ -565,12 +575,37 @@ fn write_record(
     Ok(())
 }
 
-fn meta_bytes(nr_rings: usize, page: usize) -> usize {
-    (private_offset(nr_rings) + nr_rings * size_of::<Private>()).next_multiple_of(page)
+fn invalid_geometry() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid shared-memory ring geometry")
 }
 
-fn private_offset(nr_rings: usize) -> usize {
-    (TAILS_OFFSET + nr_rings * size_of::<AtomicU64>()).next_multiple_of(align_of::<Private>())
+fn backing_len(nr_rings: usize, ring_size: usize, page: usize) -> io::Result<usize> {
+    let rings = nr_rings.checked_mul(ring_size).ok_or_else(invalid_geometry)?;
+    meta_bytes(nr_rings, page)?.checked_add(rings).ok_or_else(invalid_geometry)
+}
+
+fn meta_bytes(nr_rings: usize, page: usize) -> io::Result<usize> {
+    let private = nr_rings.checked_mul(size_of::<Private>()).ok_or_else(invalid_geometry)?;
+    private_offset(nr_rings)?
+        .checked_add(private)
+        .and_then(|len| len.checked_next_multiple_of(page))
+        .ok_or_else(invalid_geometry)
+}
+
+fn private_offset(nr_rings: usize) -> io::Result<usize> {
+    nr_rings.checked_mul(size_of::<AtomicU64>())
+        .and_then(|len| len.checked_add(TAILS_OFFSET))
+        .and_then(|len| len.checked_next_multiple_of(align_of::<Private>()))
+        .ok_or_else(invalid_geometry)
+}
+
+fn expected_rings() -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    { possible_cpus() }
+    #[cfg(all(not(target_os = "linux"), not(feature = "test-util")))]
+    { Ok(1) }
+    #[cfg(all(not(target_os = "linux"), feature = "test-util"))]
+    { Ok(2) }
 }
 
 /// Max id in the possible-CPU list, plus one.
@@ -581,5 +616,101 @@ fn possible_cpus() -> io::Result<usize> {
     for id in list.trim().split([',', '-']) {
         max = max.max(id.parse::<usize>().map_err(io::Error::other)?);
     }
-    Ok(max + 1)
+    max.checked_add(1).ok_or_else(invalid_geometry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader(max_record: usize) -> Reader {
+        Reader::create(Config {
+            ring_size: 64 * 1024,
+            max_record,
+            dir: "/dev/shm".into(),
+        }).unwrap()
+    }
+
+    #[test]
+    fn attach_rejects_corrupt_geometry() {
+        let reader = reader(100);
+        let page = reader.backing.page_size().unwrap() as u64;
+        let rings = reader.nr_rings() as u64;
+        let size = 64 * 1024;
+        let cases = [
+            ("zero rings", 0, size, 100),
+            ("wrong CPU count", rings + 1, size, 100),
+            ("zero size", rings, 0, 100),
+            ("non-power-of-two size", rings, 3 * page, 100),
+            ("unaligned size", rings, page / 2, 100),
+            ("unrepresentable aliases", rings, 1 << 63, 100),
+            ("overflowing extent", rings, 1 << 61, 100),
+            ("record exceeds capacity", rings, size, size - ceph_rseq::HEADER_LEN - 7),
+        ];
+        for (case, nr_rings, ring_size, max_record) in cases {
+            let header = reader.map.meta.as_ptr().cast::<ShmHeader>();
+            // SAFETY: this test exclusively owns the quiescent backing and does not read records.
+            unsafe {
+                (*header).nr_rings = nr_rings;
+                (*header).ring_size = ring_size;
+                (*header).max_record = max_record;
+            }
+            let error = match Writer::attach(reader.name()) {
+                Ok(_) => panic!("accepted {case}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn attach_rejects_truncated_backing() {
+        let reader = reader(100);
+        let page = reader.backing.page_size().unwrap();
+        for length in [0, reader.map.meta.len(), reader.backing.len().unwrap() - page] {
+            let name = unique_name("cphbad").unwrap();
+            #[cfg(target_os = "linux")]
+            let backing = Backing::create_file(&Path::new("/dev/shm").join(name)).unwrap();
+            #[cfg(target_os = "macos")]
+            let backing = Backing::create_shm(&name).unwrap();
+            if length != 0 {
+                backing.resize(length).unwrap();
+            }
+            assert_eq!(backing.len().unwrap(), length);
+            if length >= page {
+                let mapping = Mapping::new(backing.fd(), 0, page).unwrap();
+                let header = mapping.as_ptr().cast::<ShmHeader>();
+                // SAFETY: this test exclusively owns this new, writable header mapping.
+                unsafe {
+                    header.write(ShmHeader {
+                        magic: AtomicU64::new(0),
+                        nr_rings: reader.nr_rings() as u64,
+                        ring_size: 64 * 1024,
+                        max_record: 100,
+                        lock: AtomicU32::new(0),
+                    });
+                    (*header).magic.store(MAGIC, Release);
+                }
+            }
+            assert!(Writer::attach(backing.name()).is_err(), "accepted {length}-byte backing");
+        }
+    }
+
+    #[test]
+    fn attach_round_trips_empty_and_maximum_records() {
+        for max_record in [0, 64 * 1024 - ceph_rseq::HEADER_LEN as usize - 8] {
+            let mut reader = reader(max_record);
+            let writer = Writer::attach(reader.name()).unwrap();
+            let payload = vec![0x5a; max_record];
+            writer.try_push(&payload, 7, 11).unwrap();
+            let mut ready = Vec::new();
+            reader.poll(&mut ready);
+            assert_eq!(ready.len(), 1);
+            let record = reader.view(ready[0]);
+            assert_eq!((record.stream, record.seq), (7, 11));
+            assert_eq!(record.payload, payload);
+            reader.advance(ready[0]);
+            reader.publish();
+        }
+    }
 }
