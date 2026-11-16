@@ -10,12 +10,12 @@ From the repository root, on macOS or Linux, with no DPDK installed:
 make test
 ```
 
-This runs `cargo test` for `switch`, `switch-macros`, `switch-depot`, `switch-ws`, `switch-tls` and the `ceph-*` crates, then the vendored smoltcp tests, then `sh deploy/test-hft-host.sh`, which runs the EC2 setup script from [Running on EC2](../nic/ec2.md) against a fake `/proc`, `/sys` and `/etc` with no root. `switch-ws` and `switch-tls` are tested here without their `switch-net` support, which needs DPDK.
+This runs `cargo test` for `switch`, `switch-macros`, `switch-depot`, `switch-frame`, `shared-memory`, `slice_ringbuffer`, `switch-ws`, `switch-tls` and the `ceph-*` crates, then the vendored smoltcp tests, then `sh deploy/test-hft-host.sh`, which runs the EC2 setup script from [Running on EC2](../nic/ec2.md) against a fake `/proc`, `/sys` and `/etc` with no root. `switch-ws` and `switch-tls` are tested here without their `switch-net` support, which needs DPDK.
 
 More crates test without DPDK when you name them:
 
 ```sh
-cargo test --locked -p switch-frame -p shared-memory -p slice_ringbuffer -p switch-sockperf-wire
+cargo test --locked -p switch-sockperf-wire
 cargo test --locked -p switch-test-support -p switch-test-support-macros
 ```
 
@@ -53,16 +53,17 @@ The in-container `make test` runs these targets, in this order:
 | `test-netconf` | `switch-netconf` and `switch-open` |
 | `test-packetdrill` | packetdrill scripts against `switch-tap-echo`: scripted TCP conversations with exact timing |
 | `test-switch-net` | `switch-net`, and a build of its benchmarks |
+| `test-junction` | `switch-junction`, then `switch-junctiond` pinned to one CPU with one test thread |
 | `test-wss` | `switch-ws` and `switch-tls` with their `switch-net` support, against kernel servers over a tap device |
 | `test-binance` | `switch-binance-feed`, offline |
 | `test-memif` | `switch-memif-bench` |
 | `test-autobahn-check`, `test-scapy` | Self-tests of the Autobahn tooling and of the TCP fuzzer built on Scapy, a Python packet library |
 | `test-smoltcp` | The vendored smoltcp |
 
-`make docker-test` does not run the `switch-junctiond` tests. Run them in the container on their own, pinned to the container's CPU:
+`test-junction` runs the `switch-junctiond` tests on `DOCKER_CPUSET` with one test thread. The helper-affinity process test also runs separately with an unpinned runner in a container allowed on CPUs 0 and 2:
 
 ```sh
-taskset -c 3 cargo test --locked -p switch-junctiond -- --test-threads=1
+cargo test --locked -p switch-junctiond --test process explicit_control_cpu_keeps_every_helper_off_the_network_cpu -- --exact --test-threads=1
 ```
 
 ## One suite at a time

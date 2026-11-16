@@ -2,6 +2,7 @@
 .NOTPARALLEL:
 .PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-switch-net test-wss test-binance test-memif test-autobahn-check test bench switch-memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
 .PHONY: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client
+.PHONY: test-junction
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -219,6 +220,10 @@ test-switch-net: doctor
 	$(TIMEOUT) cargo test --locked -p switch-net -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p switch-net --benches --no-run
 
+test-junction: doctor
+	$(TIMEOUT) cargo test --locked -p switch-junction
+	$(TIMEOUT) taskset -c $(DOCKER_CPUSET) cargo test --locked -p switch-junctiond -- --test-threads=1
+
 # switch-ws (WebSocket) and switch-tls (TLS), including their Docker tests over net_tap: switch-ws's ws://
 # and wss:// clients (switch-ws's switch-net feature) against kernel tungstenite servers, switch-tls's
 # TLS client (switch-tls's switch-net feature) against a kernel rustls server. `e2e` is each crate's
@@ -262,7 +267,7 @@ test-packetdrill: packetdrill-build
 test-scapy:
 	$(TIMEOUT) python3 -B -m unittest discover -s fuzz/scapy
 
-test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-packetdrill test-switch-net test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
+test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-packetdrill test-switch-net test-junction test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
 
 bench: doctor
 	cargo bench --locked -p switch-buffer --bench buffer

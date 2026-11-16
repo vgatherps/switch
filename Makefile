@@ -7,7 +7,7 @@ vendor-check:
 
 # Crates that build and test without DPDK. switch-tls without features (its
 # `switch-net` feature needs DPDK).
-HOST_PACKAGES = switch switch-macros switch-depot switch-ws switch-tls \
+HOST_PACKAGES = switch switch-macros switch-depot switch-frame shared-memory slice_ringbuffer switch-ws switch-tls \
 	ceph-rseq ceph-ring ceph-fifo ceph-proto ceph-control
 
 # Then the vendored smoltcp tests (TIMEOUT is cleared: GNU timeout is not on macOS) and the EC2
