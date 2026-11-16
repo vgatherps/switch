@@ -35,7 +35,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant as WallInstant, SystemTime, UNIX_EPOCH};
 
-use switch_ws::switch_net::{Error as WsError, Wss};
+use switch_ws::net::{Error as WsError, Wss};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
 use switch_runtime::{oneshot, Spawner};
@@ -301,7 +301,7 @@ pub async fn connect(
             .tcp_connect(socket, remote, local)
             .await
             .map_err(|error| connect_error(target.addr, error))?;
-        let wss = switch_ws::switch_net::connect(
+        let wss = switch_ws::net::connect(
             handle,
             stream,
             tls,

@@ -548,7 +548,7 @@ make DOCKER_TARGET_VOLUME=switch-target-websocket docker-autobahn [AUTOBAHN_TIME
 
 Two roles, all 517 cases each, checked against the same pinned expected file. Server role:
 `wstest -m fuzzingclient` (`autobahn/fuzzingclient.json`, agent `switch-ws`) against
-`switch-ws-autobahn server`, switch-ws's echo server on switch at ws://192.0.2.2:8080 (`switch_ws::switch_net::accept_ws`,
+`switch-ws-autobahn server`, switch-ws's echo server on switch at ws://192.0.2.2:8080 (`switch_ws::net::accept_ws`,
 no extensions). Client role: `switch-ws-autobahn client`, switch-ws's client on switch (192.0.2.2, local
 ports 49152..49670, `connect_ws`), drives
 `wstest -m fuzzingserver` (`autobahn/fuzzingserver.json`, kernel TCP at ws://192.0.2.1:9001,

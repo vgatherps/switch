@@ -28,7 +28,7 @@ use dpdk_smoltcp::{
     StackConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
 use switch_ws::UpgradeError;
-use switch_ws::switch_net::Error as WsError;
+use switch_ws::net::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
 use switch_runtime::{oneshot, Runtime, Spawner};

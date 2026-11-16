@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [features]
-# WebSocket over switch-net TCP (module `switch-net`): ws:// and wss:// (through switch-tls) clients,
+# WebSocket over switch-net TCP (module `net`): ws:// and wss:// (through switch-tls) clients,
 # a ws:// server.
 switch-net = ["dep:switch-net", "dep:rustls", "switch-tls/switch-net"]
 # Test-only: the Docker end-to-end tests (DPDK net_tap, Linux), on switch-net's testkit.

@@ -88,7 +88,7 @@ Its error type is `switch_tls::TxError<switch_net::Error>`:
 
 ## Errors
 
-`tls_connect`, `ready` and `close` return `switch_tls::switch_net::Error`:
+`tls_connect`, `ready` and `close` return `switch_tls::net::Error`:
 
 | Error | Meaning |
 |---|---|

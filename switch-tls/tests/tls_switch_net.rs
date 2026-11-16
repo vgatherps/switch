@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::{TLS12, TLS13};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
-use switch_tls::switch_net::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
+use switch_tls::net::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
 use switch_runtime::{Runtime, Spawner};
 use switch_net::testkit::{Backend, KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
 use switch_net::{Error as NetError, IpEndpoint, IpListenEndpoint, NetHandle, TcpStream, tcp};
@@ -493,7 +493,7 @@ fn set_maxseg(listener: &TcpListener, mss: libc::c_int) {
 /// (Before, frames were sized by a fixed 1460 B whatever the peer's MSS.)
 fn frames_follow_the_peer_mss(backend: Backend) {
     use switch_tls::FrameTx;
-    use switch_tls::switch_net::SwitchTx;
+    use switch_tls::net::SwitchTx;
     const LEN: usize = 64 * 1024;
     let data: Vec<u8> = (0..LEN).map(|i| (i * 7) as u8).collect();
     let sent = data.clone();

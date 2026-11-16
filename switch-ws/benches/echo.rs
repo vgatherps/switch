@@ -14,7 +14,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve};
 use switch_ws::Limits;
 use switch_runtime::{Runtime, Spawner};
-use switch_ws::switch_net::accept_ws;
+use switch_ws::net::accept_ws;
 use switch_net::{Accepting, Error, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp};
 use switch_test_kit::pair::{self, BUDGET, Side, T0, assert_lossless};
 use switch_test_kit::ring_port::RingPort;

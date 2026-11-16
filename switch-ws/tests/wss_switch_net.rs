@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use switch_ws::{Kind, Limits};
-use switch_ws::switch_net::{Error as WssError, Ws, Wss, connect, connect_ws};
+use switch_ws::net::{Error as WssError, Ws, Wss, connect, connect_ws};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
@@ -825,7 +825,7 @@ fn wss_receive_error_sends_the_alert_and_fin() {
         |handle, stream| async move {
             let mut wss = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
             match wss.recv().await {
-                Err(WssError::Failed(switch_ws::switch_net::Failure::Tls(switch_tls::Error::Tls(rustls::Error::DecryptError)))) => {}
+                Err(WssError::Failed(switch_ws::net::Failure::Tls(switch_tls::Error::Tls(rustls::Error::DecryptError)))) => {}
                 Err(e) => panic!("unexpected error {e}"),
                 Ok(_) => panic!("a message from a corrupted record"),
             }
@@ -951,7 +951,7 @@ fn ws_connect_with_another_nets_handle_is_refused() {
                 let mut connecting = std::pin::pin!(connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()));
                 let polled = connecting.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
                 assert!(
-                    matches!(polled, std::task::Poll::Ready(Err(WssError::Config(switch_ws::switch_net::SetupError::ForeignHandle)))),
+                    matches!(polled, std::task::Poll::Ready(Err(WssError::Config(switch_ws::net::SetupError::ForeignHandle)))),
                     "{:?}",
                     polled.map(|r| r.map(drop))
                 );
@@ -974,7 +974,7 @@ fn send_buffer_below_the_largest_control_frame_is_refused() {
             } else {
                 connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.map(drop)
             };
-            let want = switch_ws::switch_net::SetupError::RoomTooSmall { room: tx, need };
+            let want = switch_ws::net::SetupError::RoomTooSmall { room: tx, need };
             assert!(matches!(got, Err(WssError::Config(e)) if e == want), "tls {tls}: {got:?}");
         });
     }
@@ -1100,7 +1100,7 @@ fn reset_while_setup_waits_for_a_frame_is_dead() {
         assert!(within_rounds(50, connecting.as_mut()).await.is_none(), "setup without a frame");
         go_tx.send(()).unwrap();
         let got = within_rounds(20_000, connecting).await.expect("setup still waiting after the reset");
-        assert!(matches!(got, Err(WssError::Failed(switch_ws::switch_net::Failure::Dead))), "{:?}", got.map(drop));
+        assert!(matches!(got, Err(WssError::Failed(switch_ws::net::Failure::Dead))), "{:?}", got.map(drop));
         drop(held);
     });
 }
@@ -1124,7 +1124,7 @@ fn reset_while_send_waits_for_a_frame_fails_the_send() {
                 assert!(within_rounds(50, sending.as_mut()).await.is_none(), "sent without a frame");
                 go_tx.send(()).unwrap();
                 let got = within_rounds(20_000, sending).await.expect("send still waiting after the reset");
-                assert!(matches!(got, Err(WssError::Failed(switch_ws::switch_net::Failure::Dead))), "{got:?}");
+                assert!(matches!(got, Err(WssError::Failed(switch_ws::net::Failure::Dead))), "{got:?}");
             }
             drop(held);
             ws
@@ -1177,7 +1177,7 @@ fn close_notify_without_a_close_is_peer_eof() {
         |mut wss| async move {
             let got = within_rounds(20_000, wss.recv()).await.expect("recv waited for a FIN");
             let got = got.map(|m| m.is_some());
-            assert!(matches!(got, Err(WssError::Failed(switch_ws::switch_net::Failure::PeerEof))), "{got:?}");
+            assert!(matches!(got, Err(WssError::Failed(switch_ws::net::Failure::PeerEof))), "{got:?}");
             wss
         },
     );
@@ -1229,7 +1229,7 @@ fn a_large_send_waits_for_frames_then_completes() {
 #[switch_test_support::pinned_test]
 fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
     use switch_tls::FrameTx;
-    use switch_tls::switch_net::SwitchTx;
+    use switch_tls::net::SwitchTx;
     let (go_tx, go_rx) = mpsc::channel();
     until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
         let (mut rx, tcp) = stream.split();
@@ -1249,7 +1249,7 @@ fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
 /// taken, then the delivered check detects the closed connection despite its cached MSS.
 #[switch_test_support::pinned_test]
 fn setup_on_a_reset_socket_with_a_free_frame_is_dead() {
-    use switch_tls::switch_net::{SetupError, SwitchTx};
+    use switch_tls::net::{SetupError, SwitchTx};
     let (go_tx, go_rx) = mpsc::channel();
     until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
         let (mut rx, tcp) = stream.split();
@@ -1267,7 +1267,7 @@ fn setup_on_a_reset_socket_with_a_free_frame_is_dead() {
 /// refused too. Nothing reaches the server in either case.
 #[switch_test_support::pinned_test]
 fn tls_minimum_zero_or_overflowing_is_refused_before_any_byte() {
-    use switch_tls::switch_net::{Error as TlsError, SetupError, tls_connect};
+    use switch_tls::net::{Error as TlsError, SetupError, tls_connect};
     for (min_plain, tx, need) in [(0, 76, 77), (usize::MAX, 64 * 1024, usize::MAX)] {
         let (_, client_tls) = tls_configs();
         until_client_on(&tap_with_send_buffer(tx), |_| {}, sees_nothing, move |handle, stream| async move {
@@ -1285,7 +1285,7 @@ fn tls_minimum_zero_or_overflowing_is_refused_before_any_byte() {
 /// end.
 #[switch_test_support::pinned_test]
 fn tls_close_works_with_the_smallest_send_buffer() {
-    use switch_tls::switch_net::tls_connect;
+    use switch_tls::net::tls_connect;
     let (server_tls, client_tls) = tls_configs();
     until_client_on(
         &tap_with_send_buffer(77),
@@ -1337,7 +1337,7 @@ fn wss_with_a_fragment_limit_below_a_control_frame_is_refused() {
     let (_, client_tls) = tls_configs_with_fragment(64);
     until_client(|_| {}, sees_nothing, move |handle, stream| async move {
         let got = connect(&handle, stream, client_tls, HOST, SERVER_PORT, PATH, Limits::default()).await.map(drop);
-        let want = switch_ws::switch_net::SetupError::RoomTooSmall { room: 59 + 76, need: 131 + 76 };
+        let want = switch_ws::net::SetupError::RoomTooSmall { room: 59 + 76, need: 131 + 76 };
         assert!(matches!(got, Err(WssError::Config(e)) if e == want), "{got:?}");
     });
 }
@@ -1409,7 +1409,7 @@ fn fin_then(reset: bool, lingering: bool) -> Result<(), WssError> {
 /// clean. (Unchanged.)
 #[switch_test_support::pinned_test]
 fn peer_fin_without_a_close() {
-    assert!(matches!(fin_then(false, false), Err(WssError::Failed(switch_ws::switch_net::Failure::PeerEof))));
+    assert!(matches!(fin_then(false, false), Err(WssError::Failed(switch_ws::net::Failure::PeerEof))));
     assert!(matches!(fin_then(false, true), Ok(())));
 }
 
@@ -1420,7 +1420,7 @@ fn peer_fin_without_a_close() {
 fn peer_fin_then_reset_without_a_close_is_dead() {
     for lingering in [false, true] {
         let got = fin_then(true, lingering);
-        assert!(matches!(got, Err(WssError::Failed(switch_ws::switch_net::Failure::Dead))), "lingering {lingering}: {got:?}");
+        assert!(matches!(got, Err(WssError::Failed(switch_ws::net::Failure::Dead))), "lingering {lingering}: {got:?}");
     }
 }
 
@@ -1446,7 +1446,7 @@ fn a_message_over_the_configured_limit_fails_at_its_header() {
             let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, limits).await.expect("ws connect");
             let got = ws.recv().await.map(|m| m.is_some());
             assert!(
-                matches!(got, Err(WssError::Failed(switch_ws::switch_net::Failure::Protocol(switch_ws::ProtocolError::MessageTooBig)))),
+                matches!(got, Err(WssError::Failed(switch_ws::net::Failure::Protocol(switch_ws::ProtocolError::MessageTooBig)))),
                 "{got:?}"
             );
             ws

@@ -10,7 +10,7 @@ use switch_open::Sizing;
 use crate::host::{self, Backend, Host};
 use crate::load::{Proto, TCP_BUFFER};
 use switch_ws::Limits;
-use switch_ws::switch_net::{Ws, accept_ws};
+use switch_ws::net::{Ws, accept_ws};
 
 #[derive(Debug, Clone)]
 pub struct Args {

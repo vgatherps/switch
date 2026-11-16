@@ -31,7 +31,7 @@ use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms, verify_tls12_sig
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use switch_tls::switch_net::{send_bytes, tls_connect};
+use switch_tls::net::{send_bytes, tls_connect};
 use switch_runtime::{Runtime, Spawner};
 use switch_net::testkit::{Backend, KERNEL_ADDR, ROUND_SLEEP, TapConfig, with_tap_net};
 use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};

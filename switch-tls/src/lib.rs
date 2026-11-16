@@ -2,10 +2,10 @@
 //! over a switch-net TCP stream with your own protocol on top; for `wss://`, use switch-ws,
 //! which runs this crate underneath.
 //!
-//! Feature `switch-net`: module `switch_net`, TLS over switch-net TCP.
-//! `switch_net::tls_connect` runs the handshake on a connected `TcpStream` and returns a `Tls`
+//! Feature `switch-net`: module `net`, TLS over switch-net TCP.
+//! `net::tls_connect` runs the handshake on a connected `TcpStream` and returns a `Tls`
 //! holding the two halves and the TCP receive half; `Tls::ready` waits for plaintext,
-//! `switch_net::send_bytes` sends, `Tls::close` sends close_notify and FIN and waits for their
+//! `net::send_bytes` sends, `Tls::close` sends close_notify and FIN and waits for their
 //! delivery. The `rustls::ClientConfig` must allow TLS 1.3 only. Every wait that depends on the
 //! server can last as long as the server stays silent, so bound the exchange with
 //! `switch_net::within`. Without the feature only the TLS layer over the frame traits builds; it
@@ -19,7 +19,7 @@
 //! use rustls::ClientConfig;
 //! use switch_runtime::Spawner;
 //! use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp, within};
-//! use switch_tls::switch_net::{send_bytes, tls_connect};
+//! use switch_tls::net::{send_bytes, tls_connect};
 //!
 //! async fn get(
 //!     handle: &NetHandle,
@@ -64,7 +64,7 @@ mod rx;
 mod tx;
 
 #[cfg(feature = "switch-net")]
-pub mod switch_net;
+pub mod net;
 
 pub use rx::TlsRx;
 pub use tx::{CLOSE_NOTIFY_LEN, Sealed, TlsTx};

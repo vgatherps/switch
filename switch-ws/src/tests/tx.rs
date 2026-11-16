@@ -814,7 +814,7 @@ fn invalid_input_changes_nothing() {
 #[test]
 #[cfg(feature = "switch-net")]
 fn oversized_send_reports_the_configured_limit() {
-    use crate::switch_net::Error;
+    use crate::net::Error;
 
     for max_send in [0, 7, 4000] {
         let config = Config::new(Role::Server, Limits { max_send, ..Limits::default() });

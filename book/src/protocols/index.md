@@ -45,10 +45,10 @@ All entry points take a `TcpStream` that is already connected (or accepted), plu
 
 | You want | Call | You get |
 |---|---|---|
-| a `wss://` client | `switch_ws::switch_net::connect(handle, stream, tls_config, host, port, path, limits)` | `Wss` |
-| a `ws://` client | `switch_ws::switch_net::connect_ws(handle, stream, host, port, path, limits)` | `Ws` |
-| a `ws://` server | `switch_ws::switch_net::accept_ws(handle, stream, limits)` | `Ws` |
-| TLS with your own protocol on top | `switch_tls::switch_net::tls_connect(handle, stream, tls_config, host, min_plain)` | `Tls` |
+| a `wss://` client | `switch_ws::net::connect(handle, stream, tls_config, host, port, path, limits)` | `Wss` |
+| a `ws://` client | `switch_ws::net::connect_ws(handle, stream, host, port, path, limits)` | `Ws` |
+| a `ws://` server | `switch_ws::net::accept_ws(handle, stream, limits)` | `Ws` |
+| TLS with your own protocol on top | `switch_tls::net::tls_connect(handle, stream, tls_config, host, min_plain)` | `Tls` |
 
 `Wss` and `Ws` have the same methods: `recv`, `send`, `close`, `linger` and `peer_close`. `Ws` also has `recv_with_sender` for echo-style servers.
 

@@ -11,8 +11,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use rustls::ClientConfig;
-pub use switch_tls::switch_net::SetupError;
-use switch_tls::switch_net::{SwitchTx, send_bytes, tls_connect};
+pub use switch_tls::net::SetupError;
+use switch_tls::net::{SwitchTx, send_bytes, tls_connect};
 use switch_tls::{TlsRx, TlsTx, TxError as TlsTxError};
 use switch_net::{Error as NetError, NetHandle, TcpFrame, TcpRx, TcpStream};
 
@@ -101,14 +101,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<switch_tls::switch_net::Error> for Error {
-    fn from(e: switch_tls::switch_net::Error) -> Self {
+impl From<switch_tls::net::Error> for Error {
+    fn from(e: switch_tls::net::Error) -> Self {
         match e {
-            switch_tls::switch_net::Error::Recv(e) => Self::Recv(e),
-            switch_tls::switch_net::Error::Tls(e) => Self::Tls(e),
-            switch_tls::switch_net::Error::Send(e) => Self::Send(e),
-            switch_tls::switch_net::Error::Handshake(e) => Self::Handshake(e),
-            switch_tls::switch_net::Error::Setup(e) => e.into(),
+            switch_tls::net::Error::Recv(e) => Self::Recv(e),
+            switch_tls::net::Error::Tls(e) => Self::Tls(e),
+            switch_tls::net::Error::Send(e) => Self::Send(e),
+            switch_tls::net::Error::Handshake(e) => Self::Handshake(e),
+            switch_tls::net::Error::Setup(e) => e.into(),
         }
     }
 }

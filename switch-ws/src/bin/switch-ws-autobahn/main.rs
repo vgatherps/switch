@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use switch_junction::session::Session;
 use switch_ws::{Kind, Limits};
-use switch_ws::switch_net::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
+use switch_ws::net::{Error, Failure as WsFailure, Ws, accept_ws, connect_ws};
 use switch_runtime::{Runtime, Spawner};
 use switch_net::{
     Error as NetError, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, RemoteConfig,

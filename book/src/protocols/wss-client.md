@@ -10,7 +10,7 @@ Opening a connection takes three round trips with the server: TCP, TLS, then the
   |  ---- SYN ------------------------------------> |       |
   |  <--- SYN-ACK ---------------------------------  |       |
   |                                     TcpStream    |       |
-  |  switch_ws::switch_net::connect(...).await       |       |
+  |  switch_ws::net::connect(...).await       |       |
   |  ---- ClientHello ----------------------------> |       |  within(&spawner,
   |  <--- ServerHello ... Finished ----------------  |       |    limit, ...)
   |  ---- Finished, GET /path Upgrade ------------> |       |
@@ -83,7 +83,7 @@ When the limit passes, `within` drops the connect future, and with it the socket
 
 ## When it fails
 
-The errors that can come out of `connect` are all variants of `switch_ws::switch_net::Error`:
+The errors that can come out of `connect` are all variants of `switch_ws::net::Error`:
 
 | Error | Meaning | What to do |
 |---|---|---|
