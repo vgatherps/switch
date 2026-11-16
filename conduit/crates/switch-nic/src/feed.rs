@@ -2,7 +2,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use switch_binance_feed::{random_local_port, webpki_client_config, Clock, Target};
-use switch::{oneshot, Runtime};
+use switch_runtime::{oneshot, Runtime};
 use switch_net::{tcp, Net};
 
 use crate::args::Feed;

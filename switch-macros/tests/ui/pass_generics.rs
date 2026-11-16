@@ -8,22 +8,22 @@ use std::rc::Rc;
 
 type Log = Rc<RefCell<Vec<String>>>;
 
-#[switch::task]
+#[switch_runtime::task]
 async fn show<T: Display + 'static>(value: T, log: Log) {
     log.borrow_mut().push(value.to_string());
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn anonymous(value: impl Display + 'static, log: Log) {
     log.borrow_mut().push(value.to_string());
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn nested(value: Option<impl Display + 'static>, log: Log) {
     log.borrow_mut().push(value.unwrap().to_string());
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn constant<const N: usize>(log: Log) {
     log.borrow_mut().push(N.to_string());
 }
@@ -36,7 +36,7 @@ impl Tag for Two {}
 struct Three;
 impl Tag for Three {}
 
-#[switch::task]
+#[switch_runtime::task]
 async fn bounded<L>()
 where
     L: Tag + 'static,
@@ -44,16 +44,16 @@ where
 }
 
 /// The future type is the same for every `L`.
-#[switch::task]
+#[switch_runtime::task]
 fn plain<L: Tag + 'static>(_unused: L) -> impl Future<Output = ()> {
     std::future::ready(())
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn async_plain<L: Tag + 'static>(_unused: L) {}
 
 /// `T` need not be `'static` when the future does not hold it.
-#[switch::task]
+#[switch_runtime::task]
 fn borrowed<T: Tag>(_unused: T) -> impl Future<Output = ()> {
     std::future::ready(())
 }
@@ -61,18 +61,18 @@ fn borrowed<T: Tag>(_unused: T) -> impl Future<Output = ()> {
 impl Tag for &Two {}
 
 /// The future type is the same for every `N`.
-#[switch::task]
+#[switch_runtime::task]
 fn const_plain<const N: u32>() -> impl Future<Output = ()> {
     std::future::ready(())
 }
 
-#[switch::task]
+#[switch_runtime::task]
 fn anonymous_plain(_unused: impl Tag + 'static) -> impl Future<Output = ()> {
     std::future::ready(())
 }
 
 fn main() {
-    let mut runtime = switch::Runtime::new(0);
+    let mut runtime = switch_runtime::Runtime::new(0);
     let spawner = runtime.spawner();
     let log = Log::default();
     spawner.spawn(show(1u8, log.clone())).unwrap();

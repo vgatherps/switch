@@ -5,7 +5,7 @@ use std::task::{Poll, Waker};
 use std::time::Instant as WallInstant;
 
 use dpdk_smoltcp::{Eal, TcpHandle};
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_net::{Error, IpEndpoint, IpListenEndpoint, Net, NetHandle, RemoteConfig, TcpStream, tcp};
 use switch_test_kit::with_eal;
 
@@ -20,7 +20,7 @@ struct Remote {
 
 struct Slot<T>(Rc<RefCell<Option<T>>>);
 
-#[switch::task]
+#[switch_runtime::task]
 async fn collect<T: 'static, F: Future<Output = T> + 'static>(future: F, out: Rc<RefCell<Option<T>>>) {
     *out.borrow_mut() = Some(future.await);
 }

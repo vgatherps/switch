@@ -22,7 +22,7 @@ members = [
     "cephalopod/crates/proto",
     "cephalopod/crates/control",
     # switch
-    "switch",
+    "switch-runtime",
     "switch-macros",
     # switch-depot (task slot numbers for switch)
     "switch-depot",
@@ -83,7 +83,7 @@ shared-memory = { path = "shared-memory" }
 slice_ringbuffer = { path = "vendor/slice_ringbuffer" }
 smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-features = false }
 switch-sockperf-wire = { path = "conduit/crates/switch-sockperf-wire" }
-switch = { path = "switch" }
+switch-runtime = { path = "switch-runtime" }
 switch-macros = { path = "switch-macros" }
 switch-net = { path = "switch-net" }
 switch-tap-echo = { path = "conduit/crates/switch-tap-echo" }

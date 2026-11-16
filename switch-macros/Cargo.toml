@@ -3,7 +3,7 @@ name = "switch-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The #[switch::task] attribute; use it through switch::task"
+description = "The #[switch_runtime::task] attribute; use it through switch_runtime::task"
 
 [lib]
 proc-macro = true
@@ -14,5 +14,5 @@ quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
 
 [dev-dependencies]
-switch.workspace = true
+switch-runtime.workspace = true
 trybuild = "1.0"

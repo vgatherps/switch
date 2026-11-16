@@ -32,7 +32,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use switch_tls::switch_net::{send_bytes, tls_connect};
-use switch::{Runtime, Spawner};
+use switch_runtime::{Runtime, Spawner};
 use switch_net::testkit::{Backend, KERNEL_ADDR, ROUND_SLEEP, TapConfig, with_tap_net};
 use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};
 
@@ -146,7 +146,7 @@ async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfi
 // ANCHOR_END: connection
 
 /// `connection`, abandoned after `CONNECTION_LIMIT_NS`; how it ended goes to `ended`.
-#[switch::task]
+#[switch_runtime::task]
 async fn bounded(
     spawner: Spawner,
     handle: NetHandle,

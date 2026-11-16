@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
 use dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY;
-use switch::{Runtime, Spawner};
+use switch_runtime::{Runtime, Spawner};
 use switch_net::{tcp, Error, Instant, IpListenEndpoint, Net, NetConfig, NetHandle, TcpStream};
 use switch_netconf::Config;
 use switch_open::{open, Sizing};
@@ -36,7 +36,7 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 type Failure = Rc<RefCell<Option<String>>>;
 
 // ANCHOR: accept_loop
-#[switch::task]
+#[switch_runtime::task]
 async fn accept_loop(
     spawner: Spawner,
     handle: NetHandle,
@@ -64,7 +64,7 @@ async fn accept_loop(
 }
 // ANCHOR_END: accept_loop
 
-#[switch::task]
+#[switch_runtime::task]
 async fn serve(handle: NetHandle, stream: TcpStream, failure: Failure) {
     if let Err(error) = echo(&handle, stream).await {
         *failure.borrow_mut() = Some(format!("echo: {error}"));

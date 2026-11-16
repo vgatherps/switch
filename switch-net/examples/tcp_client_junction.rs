@@ -15,7 +15,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_junction::session::Session;
 use switch_net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetHandle, RemoteConfig};
 
@@ -47,7 +47,7 @@ impl Clock {
 const LOCAL_PORT: u16 = 40000;
 
 /// Runs the conversation and leaves its result in `done` for the drive loop.
-#[switch::task]
+#[switch_runtime::task]
 async fn hello(
     handle: NetHandle,
     server: IpEndpoint,

@@ -8,7 +8,7 @@ use std::time::{Instant as WallInstant, SystemTime, UNIX_EPOCH};
 
 use dpdk_smoltcp::Eal;
 use switch_junction::session::Session;
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_net::{Instant, Net, NetConfig, RemoteConfig};
 use switch_netconf::Config;
 use switch_open::{Sizing, open};

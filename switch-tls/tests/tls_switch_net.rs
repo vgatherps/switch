@@ -19,7 +19,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::version::{TLS12, TLS13};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use switch_tls::switch_net::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
-use switch::{Runtime, Spawner};
+use switch_runtime::{Runtime, Spawner};
 use switch_net::testkit::{Backend, KERNEL_ADDR, KernelPeer, ROUND_SLEEP, TapConfig, client_server, next_local_port, with_tap_net};
 use switch_net::{Error as NetError, IpEndpoint, IpListenEndpoint, NetHandle, TcpStream, tcp};
 
@@ -222,7 +222,7 @@ const STALL: Duration = Duration::from_secs(5);
 
 /// Connects to the kernel peer from a fresh local port, runs `client` on the stream, and puts
 /// what it hands back in `held`.
-#[switch::task]
+#[switch_runtime::task]
 async fn connect_client<
     H: 'static,
     F: Future<Output = H> + 'static,

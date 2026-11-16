@@ -2,12 +2,12 @@
 
 use std::fmt::Debug;
 
-#[switch::task]
+#[switch_runtime::task]
 async fn bytes() -> &'static [u8] {
     &[1, 2]
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn boxed(flag: bool) -> Box<dyn Debug> {
     if flag {
         // A `return` gets no coercion context: it needs the cast.
@@ -16,7 +16,7 @@ async fn boxed(flag: bool) -> Box<dyn Debug> {
     Box::new(1u8)
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn early(flag: bool) -> u32 {
     if flag {
         return 3;
@@ -24,13 +24,13 @@ async fn early(flag: bool) -> u32 {
     4
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn opaque() -> impl Debug {
     5u8
 }
 
 fn main() {
-    let mut runtime = switch::Runtime::new(0);
+    let mut runtime = switch_runtime::Runtime::new(0);
     let spawner = runtime.spawner();
     let handles = (
         spawner.spawn_join(bytes()).unwrap(),
@@ -41,15 +41,15 @@ fn main() {
         spawner.spawn_join(opaque()).unwrap(),
     );
     let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
-    #[switch::task]
+    #[switch_runtime::task]
     async fn collect(
         handles: (
-            switch::JoinHandle<&'static [u8]>,
-            switch::JoinHandle<Box<dyn Debug>>,
-            switch::JoinHandle<Box<dyn Debug>>,
-            switch::JoinHandle<u32>,
-            switch::JoinHandle<u32>,
-            switch::JoinHandle<impl Debug + 'static>,
+            switch_runtime::JoinHandle<&'static [u8]>,
+            switch_runtime::JoinHandle<Box<dyn Debug>>,
+            switch_runtime::JoinHandle<Box<dyn Debug>>,
+            switch_runtime::JoinHandle<u32>,
+            switch_runtime::JoinHandle<u32>,
+            switch_runtime::JoinHandle<impl Debug + 'static>,
         ),
         out: std::rc::Rc<std::cell::RefCell<String>>,
     ) {

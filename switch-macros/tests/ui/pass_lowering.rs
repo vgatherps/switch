@@ -10,7 +10,7 @@ fn bump(count: &Cell<u32>, by: u32) {
     count.set(count.get() + by);
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn early(skip: bool, count: Rc<Cell<u32>>) {
     if skip {
         return;
@@ -31,7 +31,7 @@ impl Future for Bump {
     }
 }
 
-#[switch::task]
+#[switch_runtime::task]
 fn early_plain(skip: bool, count: Rc<Cell<u32>>) -> impl Future<Output = ()> {
     if skip {
         return Bump(None);
@@ -40,8 +40,8 @@ fn early_plain(skip: bool, count: Rc<Cell<u32>>) -> impl Future<Output = ()> {
 }
 
 /// The task's own name in its body is the task function.
-#[switch::task]
-async fn countdown(spawner: switch::Spawner, left: u32, count: Rc<Cell<u32>>) {
+#[switch_runtime::task]
+async fn countdown(spawner: switch_runtime::Spawner, left: u32, count: Rc<Cell<u32>>) {
     bump(&count, 1);
     if left > 0 {
         spawner
@@ -60,18 +60,18 @@ impl Drop for Dropped {
 }
 
 /// An `async fn` keeps every argument in its future, used or not.
-#[switch::task]
+#[switch_runtime::task]
 async fn holds(_unused: Dropped) {
     std::future::pending::<()>().await;
 }
 
 /// A plain `fn` drops the arguments its future does not keep when it returns.
-#[switch::task]
+#[switch_runtime::task]
 fn drops_unused(_unused: Dropped) -> impl Future<Output = ()> {
     std::future::pending()
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn configured(
     #[cfg(any())] removed: u8,
     #[cfg(all())] kept: u32,
@@ -82,7 +82,7 @@ async fn configured(
     bump(&count, kept + tagged);
 }
 
-#[switch::task]
+#[switch_runtime::task]
 fn configured_plain(
     #[cfg(any())] removed: u8,
     #[cfg(all())] kept: u32,
@@ -93,7 +93,7 @@ fn configured_plain(
 }
 
 fn main() {
-    let mut runtime = switch::Runtime::new(0);
+    let mut runtime = switch_runtime::Runtime::new(0);
     let spawner = runtime.spawner();
     let returns = Rc::new(Cell::new(0));
     spawner.spawn(early(true, returns.clone())).unwrap();

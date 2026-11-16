@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use dpdk_smoltcp::smoltcp::wire::{EthernetAddress, Ipv4Cidr};
 use dpdk_smoltcp::{DEFAULT_NEIGHBOR_CAPACITY, Offloads, Port, PortConfig, StackConfig, frame_reserve, rx_reserve};
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_buffer::PoolConfig;
 use switch_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 use switch_test_kit::{tap::TapVdev, with_eal};
@@ -281,7 +281,7 @@ impl<T: Send + 'static> KernelPeer<T> {
 
 /// Connects to the kernel peer on `port` from a fresh local port, runs `client` on the stream,
 /// and puts what it hands back in `held`.
-#[switch::task]
+#[switch_runtime::task]
 async fn connect_client<H: 'static, F: Future<Output = H> + 'static, C: FnOnce(NetHandle, TcpStream) -> F + 'static>(
     handle: NetHandle,
     socket: tcp::Config,

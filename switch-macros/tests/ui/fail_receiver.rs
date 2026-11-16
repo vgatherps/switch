@@ -1,7 +1,7 @@
 struct Server;
 
 impl Server {
-    #[switch::task]
+    #[switch_runtime::task]
     async fn run(&self) {}
 }
 

@@ -7,7 +7,7 @@ vendor-check:
 
 # Crates that build and test without DPDK. switch-tls without features (its
 # `switch-net` feature needs DPDK).
-HOST_PACKAGES = switch switch-macros switch-depot switch-frame shared-memory slice_ringbuffer switch-ws switch-tls \
+HOST_PACKAGES = switch-runtime switch-macros switch-depot switch-frame shared-memory slice_ringbuffer switch-ws switch-tls \
 	ceph-rseq ceph-ring ceph-fifo ceph-proto ceph-control
 
 # Then the vendored smoltcp tests (TIMEOUT is cleared: GNU timeout is not on macOS) and the EC2
@@ -39,6 +39,6 @@ api-docs:
 
 # switch's unsafe code under Miri, Stacked and Tree Borrows; switch-ws's core and its one unsafe (Message::text).
 miri:
-	cargo +nightly miri test -p switch --lib --test oneshot_join
-	MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p switch --lib --test oneshot_join
+	cargo +nightly miri test -p switch-runtime --lib --test oneshot_join
+	MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p switch-runtime --lib --test oneshot_join
 	cargo +nightly miri test -p switch-ws --lib

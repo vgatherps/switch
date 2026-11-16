@@ -1,10 +1,10 @@
-error: `#[switch::task]` arguments must be plain identifiers
+error: `#[switch_runtime::task]` arguments must be plain identifiers
  --> tests/ui/fail_arguments.rs:2:23
   |
 2 | async fn destructured((left, right): (u8, u8)) {
   |                       ^^^^^^^^^^^^^
 
-error: `#[switch::task]` arguments must be plain identifiers
+error: `#[switch_runtime::task]` arguments must be plain identifiers
  --> tests/ui/fail_arguments.rs:7:17
   |
 7 | async fn by_ref(ref value: u8) {

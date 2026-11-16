@@ -169,7 +169,7 @@ type Got = Rc<RefCell<Vec<Recvd>>>;
 
 /// Receives until the end (`None` or an error), recording every result; then lingers if
 /// asked, recording that too.
-#[switch::task]
+#[switch_runtime::task]
 async fn receiving(mut s: RawSession, got: Got, lingered: Rc<RefCell<Option<Result<(), Failure>>>>, linger: bool) {
     loop {
         let r = s.recv().await.map(|m| m.map(|m| (m.kind(), m.bytes().to_vec())));
@@ -185,14 +185,14 @@ async fn receiving(mut s: RawSession, got: Got, lingered: Rc<RefCell<Option<Resu
 }
 
 struct Task {
-    runtime: switch::Runtime,
+    runtime: switch_runtime::Runtime,
     got: Got,
     lingered: Rc<RefCell<Option<Result<(), Failure>>>>,
 }
 
 impl Task {
     fn spawn(s: RawSession, linger: bool) -> Task {
-        let runtime = switch::Runtime::new(0);
+        let runtime = switch_runtime::Runtime::new(0);
         let got = Got::default();
         let lingered = Rc::default();
         assert!(runtime.spawner().spawn(receiving(s, got.clone(), Rc::clone(&lingered), linger)).is_ok());

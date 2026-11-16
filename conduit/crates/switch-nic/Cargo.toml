@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 switch-binance-feed.workspace = true
-switch.workspace = true
+switch-runtime.workspace = true
 switch-net.workspace = true
 switch-open.workspace = true
 switch-netconf.workspace = true

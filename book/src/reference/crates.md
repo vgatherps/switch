@@ -7,7 +7,7 @@ An application depends on `switch` and `switch-net`, and optionally on `switch-w
 Each library's API reference is its rustdoc. Use the package name from the first column. Packages that need DPDK document only where DPDK is installed, as in the Docker container; `switch` documents anywhere:
 
 ```sh
-cargo doc --no-deps -p switch --open
+cargo doc --no-deps -p switch-runtime --open
 ```
 
 ## Writing applications

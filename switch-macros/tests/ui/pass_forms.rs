@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 // ANCHOR: countdown
 /// Documented, public, async, with a `'static` reference argument.
-#[switch::task]
-pub async fn countdown(spawner: switch::Spawner, left: u32, label: &'static str) {
+#[switch_runtime::task]
+pub async fn countdown(spawner: switch_runtime::Spawner, left: u32, label: &'static str) {
     if left > 0 {
         spawner.spawn(countdown(spawner.clone(), left - 1, label)).unwrap();
     }
@@ -15,7 +15,7 @@ pub async fn countdown(spawner: switch::Spawner, left: u32, label: &'static str)
 
 // ANCHOR: plain_fn
 /// A `!Send` future returned by a plain function.
-#[switch::task]
+#[switch_runtime::task]
 fn local(count: Rc<Cell<u32>>) -> impl Future<Output = ()> {
     async move { count.set(count.get() + 1) }
 }
@@ -26,14 +26,14 @@ struct Holder<T>(PhantomData<T>);
 /// In a generic impl whose parameter the task does not use. The future type
 /// still differs per `Holder<T>`, so each instantiation has its own pool.
 impl<T> Holder<T> {
-    #[switch::task]
+    #[switch_runtime::task]
     async fn bump(count: Rc<Cell<u32>>) {
         count.set(count.get() + 1);
     }
 }
 
 fn main() {
-    let mut runtime = switch::Runtime::new(0);
+    let mut runtime = switch_runtime::Runtime::new(0);
     let spawner = runtime.spawner();
     spawner.spawn(countdown(spawner.clone(), 3, "x")).unwrap();
     let count = Rc::new(Cell::new(0));

@@ -11,7 +11,7 @@ testkit = ["dep:switch-test-kit", "dep:switch-buffer", "dep:switch-dpdk-sys", "d
 
 [dependencies]
 dpdk-smoltcp.workspace = true
-switch.workspace = true
+switch-runtime.workspace = true
 switch-junction.workspace = true
 switch-test-kit = { workspace = true, optional = true }
 switch-buffer = { workspace = true, optional = true }

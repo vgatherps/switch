@@ -8,14 +8,14 @@ use std::rc::Rc;
 struct Holder<T>(PhantomData<T>);
 
 impl<T: Into<u32> + 'static> Holder<T> {
-    #[switch::task]
+    #[switch_runtime::task]
     async fn add(value: T, count: Rc<Cell<u32>>) {
         count.set(count.get() + value.into());
     }
 }
 
 fn main() {
-    let mut runtime = switch::Runtime::new(0);
+    let mut runtime = switch_runtime::Runtime::new(0);
     let spawner = runtime.spawner();
     let count = Rc::new(Cell::new(0));
     spawner.spawn(Holder::<u8>::add(1, count.clone())).unwrap();

@@ -26,7 +26,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
 use dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY;
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle};
 use switch_netconf::Config;
 use switch_open::{open, Sizing};
@@ -68,7 +68,7 @@ impl Clock {
 const LOCAL_PORT: u16 = 40000;
 
 /// Runs the conversation and leaves its result in `done` for the drive loop.
-#[switch::task]
+#[switch_runtime::task]
 async fn hello(
     handle: NetHandle,
     server: IpEndpoint,

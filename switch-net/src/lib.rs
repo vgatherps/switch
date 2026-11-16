@@ -1,4 +1,4 @@
-//! Async TCP and UDP sockets for tasks on the [`switch`] runtime, over a NIC your process owns
+//! Async TCP and UDP sockets for tasks on the [`switch_runtime`] runtime, over a NIC your process owns
 //! or one shared through the junction daemon.
 //!
 //! The loop owner holds the [`Net`] and runs rounds ([`round`]): `net.receive(now)`,
@@ -42,7 +42,7 @@
 //! A busy-polling drive loop around it, on the pinned CPU:
 //!
 //! ```rust,no_run
-//! use switch::Runtime;
+//! use switch_runtime::Runtime;
 //! use switch_net::{Instant, Net, RoundError};
 //!
 //! fn drive(
@@ -78,7 +78,7 @@ pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
 pub use dpdk_smoltcp::{Sent, Stack, StackError, Turn, UdpConfig, UdpSocketStats};
 use dpdk_smoltcp::{AddTcpError, AddUdpError, ReadySide, TcpHandle, TcpReadyKey, UdpHandle, UdpReadyKey, UdpSendError, UdpSendFrameError};
-use switch::StoredWaker;
+use switch_runtime::StoredWaker;
 use remote::Remote;
 
 /// Client-side transmit storage for a junction-backed Net.
@@ -182,13 +182,13 @@ struct Local {
 
 impl Local {
     /// One frame handed to the Stack: at one TX burst since the last send, end the
-    /// running `Runtime::poll` after this task (`switch::request_turn`), so the loop
+    /// running `Runtime::poll` after this task (`switch_runtime::request_turn`), so the loop
     /// sends and the frames leave sooner.
     #[inline]
     fn handed_over(&mut self) {
         self.tx_handed += 1;
         if self.tx_handed >= self.tx_burst {
-            switch::request_turn();
+            switch_runtime::request_turn();
         }
     }
 

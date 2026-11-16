@@ -32,7 +32,7 @@ use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::{
     frame_reserve, rx_reserve, Eal, Port, Stack, StackConfig, TcpHandle, UdpHandle,
 };
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_net::{tcp, Binding, Connecting, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, UdpConfig};
 use switch_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use switch_test_kit::ring_port::RingPort;
@@ -221,7 +221,7 @@ fn setup_tcp(eal: &Eal, n: usize) -> (Bench, Source) {
 }
 
 /// Reads `connecting`'s stream forever.
-#[switch::task]
+#[switch_runtime::task]
 async fn tcp_reader(connecting: Connecting) {
     let mut stream = connecting.await.expect("connect");
     loop {
@@ -230,7 +230,7 @@ async fn tcp_reader(connecting: Connecting) {
 }
 
 /// Reads `socket` forever.
-#[switch::task]
+#[switch_runtime::task]
 async fn udp_reader(binding: Binding) {
     let mut socket = binding.await.expect("bind UDP");
     loop {

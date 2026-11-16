@@ -17,7 +17,7 @@ mod types {
 
 use types::{Key, Marker, POOL};
 
-#[switch::task]
+#[switch_runtime::task]
 async fn typed(key: Key, pool: POOL, marker: Marker, count: Rc<Cell<u32>>) {
     count.set(count.get() + key.0 + pool.0 + marker.0);
 }
@@ -27,7 +27,7 @@ mod arguments {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    #[switch::task]
+    #[switch_runtime::task]
     #[allow(clippy::too_many_arguments)]
     pub async fn named(
         Key: u32,
@@ -69,7 +69,7 @@ mod helpers {
         count.set(count.get() + 100_000);
     }
 
-    #[switch::task]
+    #[switch_runtime::task]
     pub async fn calls(count: Rc<Cell<u32>>) {
         __task(&count);
         __switch_task(&count);
@@ -79,7 +79,7 @@ mod helpers {
         Marker(&count);
     }
 
-    #[switch::task]
+    #[switch_runtime::task]
     pub fn calls_plain(count: Rc<Cell<u32>>) -> impl Future<Output = ()> {
         __task(&count);
         build(&count);
@@ -90,12 +90,12 @@ mod helpers {
 struct Limits;
 
 impl Limits {
-    #[switch::task]
+    #[switch_runtime::task]
     async fn limited() {}
 }
 
 fn main() {
-    let mut runtime = switch::Runtime::new(0);
+    let mut runtime = switch_runtime::Runtime::new(0);
     let spawner = runtime.spawner();
     let counts: Vec<_> = (0..4).map(|_| Rc::new(Cell::new(0))).collect();
     for _ in 0..Marker::N {

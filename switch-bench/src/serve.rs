@@ -1,6 +1,6 @@
 //! The switch echo DUT (UDP, TCP, ws). The busy-poll loop does no syscall while serving.
 
-use switch::{SpawnError, Spawner};
+use switch_runtime::{SpawnError, Spawner};
 use switch_net::{
     Accepting, Error, IpListenEndpoint, NetHandle, TcpStream, UdpConfig, UdpRx,
     UdpTx, tcp,
@@ -126,7 +126,7 @@ fn udp_echo(host: &mut Host, handle: &NetHandle, port: u16) -> Result<(), String
         .map_err(spawn_error)
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn bind_echo(
     handle: NetHandle,
     config: UdpConfig,
@@ -136,7 +136,7 @@ async fn bind_echo(
 }
 
 // ANCHOR: echo_datagrams
-#[switch::task]
+#[switch_runtime::task]
 async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
     loop {
         let datagram = rx.recv().await;
@@ -153,7 +153,7 @@ async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
         )) = tx.send(Some(src), frame)
         {
             frame = back;
-            switch::yield_now().await;
+            switch_runtime::yield_now().await;
         }
     }
 }
@@ -183,7 +183,7 @@ fn spawn_accepts(
 /// One persistent accept: waits for `accepting`'s connection, hands it to its own echo task and
 /// listens again. While every socket slot is in use it retries each round, so it listens again
 /// once a connection closes.
-#[switch::task]
+#[switch_runtime::task]
 async fn accept_loop(
     mut accepting: Accepting,
     spawner: Spawner,
@@ -197,7 +197,7 @@ async fn accept_loop(
         let stream = match accepting.await {
             Ok(stream) => stream,
             Err(Error::SocketsFull) => {
-                switch::yield_now().await;
+                switch_runtime::yield_now().await;
                 accepting = handle.tcp_accept(config, local);
                 continue;
             }
@@ -217,7 +217,7 @@ async fn accept_loop(
 }
 
 /// Echoes one accepted connection.
-#[switch::task]
+#[switch_runtime::task]
 async fn serve_conn(handle: NetHandle, stream: TcpStream, ws: bool) {
     if ws {
         match accept_ws(&handle, stream, Limits::default()).await {

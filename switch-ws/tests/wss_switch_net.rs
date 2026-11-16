@@ -131,7 +131,7 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
 
 /// Connects to the kernel peer from a fresh local port, runs `client` on the stream, and puts
 /// what it hands back in `held`.
-#[switch::task]
+#[switch_runtime::task]
 async fn connect_client<H: 'static, F: Future<Output = H> + 'static, C: FnOnce(NetHandle, TcpStream) -> F + 'static>(
     handle: NetHandle,
     socket: tcp::Config,
@@ -166,7 +166,7 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
     let socket = tap.socket;
     with_tap_net(Backend::Conduit, tap, |net, clock| {
         let mut peer = KernelPeer::listen(SERVER_PORT, listener_setup, serve);
-        let mut rt = switch::Runtime::new(0);
+        let mut rt = switch_runtime::Runtime::new(0);
         let handle = net.handle();
         let held: Rc<RefCell<Option<H>>> = Rc::default();
         rt.spawner().spawn(connect_client(handle, socket, client, held.clone())).expect("spawn the client");
@@ -309,7 +309,7 @@ async fn within_rounds<F: Future>(rounds: usize, f: F) -> Option<F::Output> {
         if let std::task::Poll::Ready(out) = std::future::poll_fn(|cx| std::task::Poll::Ready(f.as_mut().poll(cx))).await {
             return Some(out);
         }
-        switch::yield_now().await;
+        switch_runtime::yield_now().await;
     }
     None
 }

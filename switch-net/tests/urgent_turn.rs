@@ -1,7 +1,7 @@
 //! Conduit-only: local TX burst threshold and urgent Runtime turns.
 
 //! Once a poll's tasks hand the Stack one `tx_burst` of frames, the poll ends before its next
-//! task (`switch::request_turn`); the Net's send then sends them, and the next poll goes on
+//! task (`switch_runtime::request_turn`); the Net's send then sends them, and the next poll goes on
 //! with the tasks left. Nothing to configure.
 
 use switch_net::{IpEndpoint, NetHandle, ImmutableFrame};

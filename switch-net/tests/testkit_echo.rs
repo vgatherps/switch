@@ -68,8 +68,8 @@ fn echo_junction_backend() {
 }
 // ANCHOR_END: run
 
-#[switch::task]
-async fn timeout(spawner: switch::Spawner, done: std::rc::Rc<std::cell::Cell<bool>>) {
+#[switch_runtime::task]
+async fn timeout(spawner: switch_runtime::Spawner, done: std::rc::Rc<std::cell::Cell<bool>>) {
     assert!(switch_net::within(
         &spawner,
         std::time::Duration::from_millis(10),
@@ -80,7 +80,7 @@ async fn timeout(spawner: switch::Spawner, done: std::rc::Rc<std::cell::Cell<boo
 
 fn written_timeout(backend: Backend) {
     switch_net::testkit::with_tap_net(backend, &TAP, |net, clock| {
-        let mut runtime = switch::Runtime::new(clock.ns());
+        let mut runtime = switch_runtime::Runtime::new(clock.ns());
         let spawner = runtime.spawner();
         let done = std::rc::Rc::new(std::cell::Cell::new(false));
         spawner.spawn(timeout(spawner.clone(), done.clone())).unwrap();

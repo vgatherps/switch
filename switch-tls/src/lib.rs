@@ -17,7 +17,7 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //! use rustls::ClientConfig;
-//! use switch::Spawner;
+//! use switch_runtime::Spawner;
 //! use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp, within};
 //! use switch_tls::switch_net::{send_bytes, tls_connect};
 //!

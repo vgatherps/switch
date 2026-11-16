@@ -6,7 +6,7 @@ use std::pin::pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use switch::{Runtime, RuntimeError, Spawner};
+use switch_runtime::{Runtime, RuntimeError, Spawner};
 
 use crate::{Instant, Net, TurnError};
 
@@ -63,7 +63,7 @@ mod tests {
     use super::*;
 
     // ANCHOR: exact_deadline
-    #[switch::task]
+    #[switch_runtime::task]
     async fn timeout(spawner: Spawner, completed: Rc<Cell<Option<bool>>>) {
         let result = within(&spawner, Duration::from_nanos(123_456), pending::<()>()).await;
         completed.set(Some(result.is_none()));

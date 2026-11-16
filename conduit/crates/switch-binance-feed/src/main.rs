@@ -14,7 +14,7 @@ use switch_binance_feed::{
     DEFAULT_PRINT, FIRST_LOCAL_PORT, INGRESS_BUDGET, SOCKET_BUFFER,
 };
 use rustls::ClientConfig;
-use switch::{oneshot, Runtime};
+use switch_runtime::{oneshot, Runtime};
 use switch_net::{Net, NetConfig};
 use switch_tap_echo::driver::{self, SWITCH_IP, EXIT_ERROR, IFACE, PREFIX_LEN, TESTER_IP};
 

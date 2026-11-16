@@ -2,7 +2,7 @@
 //! switch-tls) on one switch-net TCP socket, run as a switch task. It is a worked example of the
 //! protocol crates and the market-data feed behind `switch-nic feed`.
 //!
-//! [`feed`] is the whole client as one `#[switch::task]`: it connects within
+//! [`feed`] is the whole client as one `#[switch_runtime::task]`: it connects within
 //! [`CONNECT_LIMIT`], reads updates until its `stop` oneshot fires, then runs the WebSocket close
 //! within [`CLOSE_LIMIT`], printing `{name}: {key}: {value}` lines and storing a [`Summary`]
 //! with a latency histogram (wall clock at hand-over minus the message's hardware timestamp).
@@ -38,7 +38,7 @@ use std::time::{Duration, Instant as WallInstant, SystemTime, UNIX_EPOCH};
 use switch_ws::switch_net::{Error as WsError, Wss};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore};
-use switch::{oneshot, Spawner};
+use switch_runtime::{oneshot, Spawner};
 use switch_net::{first, tcp, Error, Instant, IpEndpoint, IpListenEndpoint, NetHandle};
 
 pub const INGRESS_BUDGET: usize = 128;
@@ -384,7 +384,7 @@ pub type Outcome = Rc<Cell<Option<(Summary, Result<(), FeedError>)>>>;
 /// `clock_reset` is called once, immediately before reporting latency, to synchronously detect
 /// a device reset during the measurement. A reset suppresses the histogram.
 #[allow(clippy::too_many_arguments)]
-#[switch::task]
+#[switch_runtime::task]
 pub async fn feed(
     handle: NetHandle,
     spawner: Spawner,

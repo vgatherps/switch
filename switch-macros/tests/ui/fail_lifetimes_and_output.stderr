@@ -1,4 +1,4 @@
-error: `#[switch::task]` functions must be `async fn` or return `impl Future<Output = T>`
+error: `#[switch_runtime::task]` functions must be `async fn` or return `impl Future<Output = T>`
  --> tests/ui/fail_lifetimes_and_output.rs:7:19
   |
 7 | fn not_a_future() -> u8 {

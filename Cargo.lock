@@ -1336,15 +1336,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
-name = "switch"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "switch-depot",
- "switch-macros",
-]
-
-[[package]]
 name = "switch-bench"
 version = "0.1.0"
 dependencies = [
@@ -1353,12 +1344,12 @@ dependencies = [
  "mimalloc",
  "serde",
  "serde_json",
- "switch",
  "switch-dpdk-sys",
  "switch-junction",
  "switch-net",
  "switch-netconf",
  "switch-open",
+ "switch-runtime",
  "switch-test-support",
  "switch-ws",
  "tungstenite",
@@ -1373,10 +1364,10 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "switch",
  "switch-buffer",
  "switch-dpdk-sys",
  "switch-net",
+ "switch-runtime",
  "switch-tap-echo",
  "switch-test-kit",
  "switch-test-support",
@@ -1442,11 +1433,11 @@ dependencies = [
  "dpdk-smoltcp",
  "libc",
  "slice_ringbuffer",
- "switch",
  "switch-junction",
  "switch-net",
  "switch-netconf",
  "switch-open",
+ "switch-runtime",
  "switch-test-kit",
  "switch-test-support",
 ]
@@ -1457,7 +1448,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "switch",
+ "switch-runtime",
  "syn 2.0.119",
  "trybuild",
 ]
@@ -1483,7 +1474,6 @@ dependencies = [
  "ceph-ring",
  "criterion",
  "dpdk-smoltcp",
- "switch",
  "switch-buffer",
  "switch-dpdk-sys",
  "switch-junction",
@@ -1491,6 +1481,7 @@ dependencies = [
  "switch-net",
  "switch-netconf",
  "switch-open",
+ "switch-runtime",
  "switch-test-kit",
  "switch-test-support",
 ]
@@ -1512,12 +1503,12 @@ dependencies = [
  "dpdk-smoltcp",
  "libc",
  "mimalloc",
- "switch",
  "switch-binance-feed",
  "switch-dpdk-sys",
  "switch-net",
  "switch-netconf",
  "switch-open",
+ "switch-runtime",
  "switch-sockperf-wire",
 ]
 
@@ -1531,6 +1522,15 @@ dependencies = [
  "switch-dpdk-sys",
  "switch-netconf",
  "switch-test-support",
+]
+
+[[package]]
+name = "switch-runtime"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "switch-depot",
+ "switch-macros",
 ]
 
 [[package]]
@@ -1585,8 +1585,8 @@ dependencies = [
  "libc",
  "rcgen",
  "rustls",
- "switch",
  "switch-net",
+ "switch-runtime",
  "switch-test-support",
 ]
 
@@ -1603,9 +1603,9 @@ dependencies = [
  "rcgen",
  "rustls",
  "sha1",
- "switch",
  "switch-junction",
  "switch-net",
+ "switch-runtime",
  "switch-tap-echo",
  "switch-test-kit",
  "switch-test-support",

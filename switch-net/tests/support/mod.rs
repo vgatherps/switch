@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
 use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, StackConfig};
-use switch::Runtime;
+use switch_runtime::Runtime;
 use switch_net::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
 use switch_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
 use switch_test_kit::ring_port::RingPort;
@@ -355,7 +355,7 @@ pub fn peer_drain(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, into: &mut 
 }
 
 /// Runs `future` and puts its output in `out`.
-#[switch::task]
+#[switch_runtime::task]
 async fn fill<T: 'static, F: Future<Output = T> + 'static>(future: F, out: Slot<T>) {
     *out.0.borrow_mut() = Some(future.await);
 }

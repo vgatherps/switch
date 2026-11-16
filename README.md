@@ -33,7 +33,7 @@ switch-net = { path = "<clone>/switch-net" }
 The runtime builds on macOS or Linux with only a Rust toolchain. From the clone:
 
 ```sh
-cargo run -p switch --example first_task
+cargo run -p switch-runtime --example first_task
 ```
 
 This runs three short examples on the switch runtime with no network, and is explained in [Your first task](book/src/getting-started/first-task.md).

@@ -17,7 +17,7 @@ switch-junction.workspace = true
 switch-ws = { workspace = true, features = ["switch-net"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-switch.workspace = true
+switch-runtime.workspace = true
 switch-net.workspace = true
 tungstenite.workspace = true
 switch-dpdk-sys.workspace = true

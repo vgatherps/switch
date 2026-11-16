@@ -20,7 +20,7 @@ switch-open.workspace = true
 switch-test-kit.workspace = true
 switch-test-support.workspace = true
 switch-net.workspace = true
-switch.workspace = true
+switch-runtime.workspace = true
 
 [lints]
 workspace = true

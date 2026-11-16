@@ -880,13 +880,13 @@ fn raw_close_handshake_ends_with_fin_alone() {
 type Out = Rc<RefCell<Option<Result<(), TxError>>>>;
 
 /// `send` in a task; its result into `out`.
-#[switch::task]
+#[switch_runtime::task]
 async fn sending(mut c: Core, out: Out) {
     *out.borrow_mut() = Some(c.send(Kind::Binary, &[3; 3000]).await);
 }
 
 /// `close` in a task; its result into `out`.
-#[switch::task]
+#[switch_runtime::task]
 async fn closing(mut c: Core, out: Out) {
     *out.borrow_mut() = Some(c.close(1000, "").await);
 }
@@ -904,7 +904,7 @@ fn room_or_death_alone_wakes_a_pending_send_or_close() {
             } else {
                 log.borrow_mut().room = Some(0);
             }
-            let mut runtime = switch::Runtime::new(0);
+            let mut runtime = switch_runtime::Runtime::new(0);
             let out: Out = Rc::default();
             let spawner = runtime.spawner();
             let spawned = if close { spawner.spawn(closing(c, out.clone())).is_ok() } else { spawner.spawn(sending(c, out.clone())).is_ok() };

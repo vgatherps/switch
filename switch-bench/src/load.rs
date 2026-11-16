@@ -14,7 +14,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use switch::SpawnError;
+use switch_runtime::SpawnError;
 use switch_net::{
     Connecting, Error, IpEndpoint, IpListenEndpoint, NetHandle, TcpTx, ImmutableFrame, OwnedFrame,
     UdpConfig, UdpRx, UdpTx, tcp,
@@ -371,7 +371,7 @@ fn spawn_error<T>(e: SpawnError<T>) -> String {
     format!("spawn: {:?}", e.reason)
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn bind_udp(
     handle: NetHandle,
     config: UdpConfig,
@@ -444,7 +444,7 @@ async fn send_upgrade<F>(
             Ok(()) => return Ok(()),
             Err((back, Error::Full)) => {
                 frame = back;
-                switch::yield_now().await;
+                switch_runtime::yield_now().await;
             }
             Err((_, error)) => return Err(error),
         }
@@ -454,7 +454,7 @@ async fn send_upgrade<F>(
 /// Connection `i`'s receive task: waits for the connection (ws: upgrades it), hands its sending
 /// half to `connected`, then cuts the echoed byte stream into messages (ws: frames) and records
 /// them.
-#[switch::task]
+#[switch_runtime::task]
 #[allow(clippy::too_many_arguments)]
 async fn tcp_receive(
     i: u32,
@@ -531,7 +531,7 @@ async fn tcp_receive(
 }
 
 /// Records every datagram `rx` receives.
-#[switch::task]
+#[switch_runtime::task]
 async fn udp_receive(mut rx: UdpRx, clock: Clock, recorder: Rc<RefCell<Option<Recorder>>>) {
     loop {
         let datagram = rx.recv().await;
@@ -680,7 +680,7 @@ async fn try_tx_frame(handle: &NetHandle) -> Option<OwnedFrame> {
 /// recorded for measured messages only (the warmup absorbs ARP and connection start), and only
 /// for fresh ones (`Pacer::is_fresh`: not owed by a full connection or one at its budget, not
 /// held back by a transport-wide refusal).
-#[switch::task]
+#[switch_runtime::task]
 async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
     let SendStep {
         handle,
@@ -773,7 +773,7 @@ async fn send_step(s: SendStep, done: Rc<RefCell<Option<Sent>>>) {
         if last {
             break;
         }
-        switch::yield_now().await;
+        switch_runtime::yield_now().await;
     }
     out.backlog_at_end = pacer.backlog_at_end();
     *done.borrow_mut() = Some(out);
@@ -832,9 +832,9 @@ mod tests {
     fn ws_upgrade_retains_frame_and_yields_between_full_retries() {
         let attempts = Rc::new(std::cell::Cell::new(0));
         let completed = Rc::new(std::cell::Cell::new(false));
-        let mut runtime = switch::Runtime::new(0);
+        let mut runtime = switch_runtime::Runtime::new(0);
         let (tries, done) = (attempts.clone(), completed.clone());
-        runtime.spawner().spawn(switch::boxed(Box::pin(async move {
+        runtime.spawner().spawn(switch_runtime::boxed(Box::pin(async move {
             let frame = Box::new(*b"upgrade request");
             let original = (&*frame) as *const _;
             let result = send_upgrade(frame, |frame| {
@@ -861,8 +861,8 @@ mod tests {
     fn ws_upgrade_propagates_non_full_errors_without_retrying() {
         let completed = Rc::new(std::cell::Cell::new(false));
         let done = completed.clone();
-        let mut runtime = switch::Runtime::new(0);
-        runtime.spawner().spawn(switch::boxed(Box::pin(async move {
+        let mut runtime = switch_runtime::Runtime::new(0);
+        runtime.spawner().spawn(switch_runtime::boxed(Box::pin(async move {
             let result = send_upgrade((), |frame| Err((frame, Error::Closed))).await;
             assert!(matches!(result, Err(Error::Closed)));
             done.set(true);

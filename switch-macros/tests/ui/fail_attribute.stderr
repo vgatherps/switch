@@ -1,11 +1,11 @@
-error: `#[switch::task]` takes no arguments
- --> tests/ui/fail_attribute.rs:1:16
+error: `#[switch_runtime::task]` takes no arguments
+ --> tests/ui/fail_attribute.rs:1:24
   |
-1 | #[switch::task(name = "x")]
-  |                ^^^^^^^^^^
+1 | #[switch_runtime::task(name = "x")]
+  |                        ^^^^^^^^^^
 
-error: `#[switch::task]` takes no arguments
- --> tests/ui/fail_attribute.rs:4:16
+error: `#[switch_runtime::task]` takes no arguments
+ --> tests/ui/fail_attribute.rs:4:24
   |
-4 | #[switch::task(capacity = 1)]
-  |                ^^^^^^^^^^^^
+4 | #[switch_runtime::task(capacity = 1)]
+  |                        ^^^^^^^^^^^^

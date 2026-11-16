@@ -1,11 +1,11 @@
 use std::future::Future;
 
-#[switch::task]
+#[switch_runtime::task]
 fn sendable() -> impl Future<Output = ()> + Send {
     async {}
 }
 
-#[switch::task]
+#[switch_runtime::task]
 fn boxed() -> std::pin::Pin<Box<dyn Future<Output = ()>>> {
     Box::pin(async {})
 }

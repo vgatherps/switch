@@ -1,4 +1,4 @@
-//! `#[switch::task]` accepts the supported forms and rejects the rest with a
+//! `#[switch_runtime::task]` accepts the supported forms and rejects the rest with a
 //! compile error.
 
 #[test]

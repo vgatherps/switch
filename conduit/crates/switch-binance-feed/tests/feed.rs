@@ -31,7 +31,7 @@ use switch_ws::UpgradeError;
 use switch_ws::switch_net::Error as WsError;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use switch::{oneshot, Runtime, Spawner};
+use switch_runtime::{oneshot, Runtime, Spawner};
 use switch_net::{Error as NetError, Net, NetConfig, NetHandle};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::CloseFrame;
@@ -505,7 +505,7 @@ async fn connect_refused(handle: &NetHandle, spawner: &Spawner, at_once: bool) {
     }
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn refused_twice(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>) {
     connect_refused(&handle, &spawner, true).await;
     connect_refused(&handle, &spawner, true).await;
@@ -522,7 +522,7 @@ fn refused_connect_releases_the_only_slot() {
     });
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn timed_out_then_refused(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>) {
     // 192.0.2.3 is unassigned in this TAP fixture; connect waits for ARP.
     let target = Target {
@@ -796,7 +796,7 @@ fn stop_during_connect_ends_it_and_drops_the_socket() {
     });
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn refused_451_then_slot_free(handle: NetHandle, spawner: Spawner, roots: RootCertStore, done: Rc<Cell<bool>>) {
     let error = match connect(&handle, &spawner, &target(), socket(None), client_config(roots), LOCAL_PORT, CONNECT_LIMIT).await {
         Ok(_) => panic!("HTTP 451 opened a WebSocket"),
@@ -826,7 +826,7 @@ fn upgrade_refused_with_http_451_reports_the_status() {
     });
 }
 
-#[switch::task]
+#[switch_runtime::task]
 async fn unknown_issuer_then_slot_free(handle: NetHandle, spawner: Spawner, done: Rc<Cell<bool>>) {
     let error = match connect(&handle, &spawner, &target(), socket(None), webpki_client_config(), LOCAL_PORT, CONNECT_LIMIT).await {
         Ok(_) => panic!("Mozilla roots trusted the self-signed certificate"),

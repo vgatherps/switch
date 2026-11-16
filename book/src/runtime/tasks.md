@@ -7,16 +7,16 @@ A task is one call of a function marked `#[switch::task]`, started on the runtim
 The attribute goes on an `async fn`. This one, from `switch/examples/tasks.rs`, takes a spawner and uses it to start a second task that prints:
 
 ```rust,ignore
-{{#include ../../../switch/examples/tasks.rs:async_task}}
+{{#include ../../../switch-runtime/examples/tasks.rs:async_task}}
 ```
 
 It also goes on a plain `fn` that returns `impl Future<Output = T>`. The body of such a function runs when the task is spawned and builds the future, so it can do some work first; here it prints before returning its `async move` block:
 
 ```rust,ignore
-{{#include ../../../switch/examples/tasks.rs:plain_fn}}
+{{#include ../../../switch-runtime/examples/tasks.rs:plain_fn}}
 ```
 
-`main` spawns `parent`, polls until no task is left, then spawns `plain("hello")`, prints a line, and polls again. Run it with `cargo run -p switch --example tasks`:
+`main` spawns `parent`, polls until no task is left, then spawns `plain("hello")`, prints a line, and polls again. Run it with `cargo run -p switch-runtime --example tasks`:
 
 ```text
 parent polled
@@ -103,11 +103,11 @@ There are two ways to spawn a token.
 `spawner.spawn_join(token)` starts the same task and also returns a `JoinHandle<T>`, a future that resolves to `Result<T, Canceled>`. It costs one small heap allocation per spawn (a oneshot channel, see [Tasks working together](cooperating.md#oneshot-channels)).
 
 ```rust,ignore
-{{#include ../../../switch/examples/first_task.rs:join_tasks}}
+{{#include ../../../switch-runtime/examples/first_task.rs:join_tasks}}
 ```
 
 ```rust,ignore
-{{#include ../../../switch/examples/first_task.rs:run_join}}
+{{#include ../../../switch-runtime/examples/first_task.rs:run_join}}
 ```
 
 A `JoinHandle` resolves to `Ok(value)` when the task returns, at once if it had already finished. It resolves to `Err(Canceled)` when the task ended without a value: the runtime was shut down or dropped before the task finished, or the task panicked. A handle must be awaited by a switch task; polled anywhere else while the task is still running, it panics.

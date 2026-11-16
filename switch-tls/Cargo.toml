@@ -20,7 +20,7 @@ switch-test-support = { workspace = true, optional = true }
 [dev-dependencies]
 rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
-switch.workspace = true
+switch-runtime.workspace = true
 libc.workspace = true
 
 [[test]]
