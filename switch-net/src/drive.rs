@@ -40,10 +40,10 @@ pub async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
 /// The Runtime's initial and poll ticks, and all relative sleeps on it, must use monotonic
 /// nanoseconds. Called from a task of `spawner`'s Runtime, which is therefore open.
 ///
-/// Panics if `limit` does not fit in `u64` nanoseconds.
+/// Panics if `limit` does not fit in `u64` nanoseconds or the sleep deadline overflows.
 pub async fn within<F: Future>(spawner: &Spawner, limit: Duration, work: F) -> Option<F::Output> {
     let ticks = u64::try_from(limit.as_nanos()).expect("limit fits u64 nanoseconds");
-    let sleep = spawner.sleep(ticks).expect("the Runtime polling this task is open");
+    let sleep = spawner.sleep(ticks).expect("within deadline overflowed");
     let expired = async { sleep.await.expect("a sleep in the task's own open Runtime") };
     first(work, expired).await
 }
@@ -89,6 +89,16 @@ mod tests {
         let runtime = Runtime::new(0);
         let spawner = runtime.spawner();
         let mut future = pin!(within(&spawner, Duration::from_secs(u64::MAX), pending::<()>()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let _ = future.as_mut().poll(&mut context);
+    }
+
+    #[test]
+    #[should_panic(expected = "within deadline overflowed")]
+    fn timeout_reports_deadline_overflow() {
+        let runtime = Runtime::new(u64::MAX);
+        let spawner = runtime.spawner();
+        let mut future = pin!(within(&spawner, Duration::from_nanos(1), pending::<()>()));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let _ = future.as_mut().poll(&mut context);
     }
