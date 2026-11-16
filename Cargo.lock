@@ -1488,6 +1488,8 @@ dependencies = [
  "switch-junction",
  "switch-junctiond",
  "switch-net",
+ "switch-netconf",
+ "switch-open",
  "switch-test-kit",
  "switch-test-support",
 ]

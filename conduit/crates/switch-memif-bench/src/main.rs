@@ -1,7 +1,12 @@
-//! The v1 memif benchmark as two processes, each with its own EAL on its own
-//! CPU: `peer` (memif server; echo or sink) and the measuring `client` (memif
-//! client); `run`, which launches both and orders their shutdown; and
-//! `matrix`, which runs every v1 configuration through `run`.
+//! Measures two `dpdk-smoltcp` Stacks exchanging TCP and UDP traffic over a DPDK memif link, with no NIC and no kernel in between. Each Stack runs in its own process with its own EAL on its own CPU; `run` launches the memif server (peer) and the measuring client and orders their shutdown, and `matrix` runs a fixed set of configurations several times and prints min/median/max per configuration.
+//!
+//! ```text
+//! switch-memif-bench run --shape pingpong --conns 1 --message 64 --rounds 100000 --warmup 10000 \
+//!     --peer-cpu 4 --client-cpu 5 --control-cpu 3
+//! switch-memif-bench matrix --peer-cpu 4 --client-cpu 5 --control-cpu 3
+//! ```
+//!
+//! See the switch book, chapter "Stack-to-stack throughput with switch-memif-bench".
 //!
 //! Protocol on stdout/stdin: the peer prints `ready` once its memif server
 //! listens; each side prints `report <json>` once done and polls no more;

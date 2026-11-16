@@ -1,9 +1,11 @@
 //! The bench message: a fixed header, then padding up to the message size. The echo side
 //! returns the bytes unchanged.
 
+// ANCHOR: header
 /// Bytes of the header: step u32, sender u32, seq u64, scheduled send time u64 (ns since the
 /// generator's origin), little endian.
 pub const HEADER: usize = 24;
+// ANCHOR_END: header
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {

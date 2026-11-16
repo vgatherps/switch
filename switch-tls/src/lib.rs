@@ -1,16 +1,34 @@
-//! TLS 1.3 client over TCP frames, on rustls's unbuffered client.
+//! TLS 1.3 client over TCP frames, on rustls's unbuffered client. Use it for a TLS connection over a switch-net TCP stream with your own protocol on top; for `wss://`, use switch-ws, which runs this crate underneath.
 //!
-//! [`TlsRx`] hands each received frame's bytes to rustls, which decrypts records in place: a
-//! record lying wholly inside one frame is returned as a slice of that frame. Only a record
-//! straddling frames is copied, into one reusable scratch buffer, and decrypted there.
-//! Decryption is lazy: one record per run.
+//! [`TlsRx`] hands each received frame's bytes to rustls, which decrypts records in place: a record lying wholly inside one frame is returned as a slice of that frame. Only a record straddling frames is copied, into one reusable scratch buffer, and decrypted there. Decryption is lazy: one record per run.
 //!
-//! [`TlsTx`] owns the rustls connection and seals each frame's plaintext into one record in
-//! that frame, on top of a lower [`FrameTx`] that sends frames as they are; it is a
-//! [`FrameTx`] itself.
+//! [`TlsTx`] owns the rustls connection and seals each frame's plaintext into one record in that frame, on top of a lower [`FrameTx`] that sends frames as they are; it is a [`FrameTx`] itself.
 //!
-//! Feature `switch-net`: module `switch-net`, TLS over switch-net TCP (handshake, then the two
-//! halves), with switch-net's frames as [`RxFrame`]/[`TxFrame`].
+//! Feature `switch-net`: module `switch_net`, TLS over switch-net TCP. `switch_net::tls_connect` runs the handshake on a connected `TcpStream` and returns a `Tls` holding the two halves and the TCP receive half; `Tls::ready` waits for plaintext, `switch_net::send_bytes` sends, `Tls::close` sends close_notify and FIN and waits for their delivery. The `rustls::ClientConfig` must allow TLS 1.3 only. Without the feature only the TLS layer over the frame traits builds; it needs no DPDK.
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "switch-net")]
+//! # mod example {
+//! use std::sync::Arc;
+//! use rustls::ClientConfig;
+//! use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};
+//! use switch_tls::switch_net::{send_bytes, tls_connect};
+//!
+//! async fn get(handle: &NetHandle, config: Arc<ClientConfig>, server: IpEndpoint, socket: tcp::Config) -> Result<(), String> {
+//!     let local = IpListenEndpoint { addr: None, port: 49152 };
+//!     let stream = handle.tcp_connect(socket, server, local).await.map_err(|e| format!("{e:?}"))?;
+//!     let mut tls = tls_connect(handle, stream, config, "example.com", 1).await.map_err(|e| e.to_string())?;
+//!     send_bytes(&mut tls.tx, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await.map_err(|e| e.to_string())?;
+//!     while tls.ready().await.map_err(|e| e.to_string())? {
+//!         let n = tls.rx.current().len();
+//!         tls.rx.consume(n);
+//!     }
+//!     tls.close().await.map_err(|e| e.to_string())
+//! }
+//! # }
+//! ```
+//!
+//! Book: See the switch book, chapter "TLS without WebSocket".
 
 use std::fmt;
 

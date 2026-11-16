@@ -24,6 +24,8 @@ ceph-ring = { workspace = true, optional = true }
 switch-net = { workspace = true, features = ["testkit"] }
 switch-test-kit.workspace = true
 switch-test-support.workspace = true
+switch-open.workspace = true
+switch-netconf.workspace = true
 criterion.workspace = true
 switch-junctiond.workspace = true
 ceph-fifo.workspace = true

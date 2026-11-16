@@ -1,5 +1,8 @@
 # cephalopod
 
+See [cephalopod: many writers, one reader](../book/src/blocks/cephalopod.md)
+in the switch book. Generate the API reference with `cargo doc -p ceph-fifo --no-deps`.
+
 FIFO messaging from many processes to one consumer over shared memory.
 
 Each producer gets its own stream. The consumer receives every stream in order. Producers

@@ -1,5 +1,8 @@
 # deploy: EC2 host for the Binance listener
 
+See [Running on EC2](../book/src/nic/ec2.md) in the switch book for the setup walkthrough.
+The deployment reference and incident notes remain below.
+
 `hft-host.sh` turns a fresh Amazon Linux 2023 instance (x86_64 or arm64) into a host that runs
 `switch-nic feed` on a DPDK-bound ENA. `run-binance.sh` starts the listener and refuses to start unless
 `hft-host.sh verify` passes.

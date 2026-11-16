@@ -1,5 +1,8 @@
 # switch-net
 
+See [Sockets with switch-net](../book/src/net/index.md) in the switch book.
+Generate the API reference with `cargo doc -p switch-net --no-deps`.
+
 Async sockets over a local switch `Stack` or a junction `Session`, for the `switch` runtime. Tasks use the same socket/frame types on either backend; one loop owner turns the Net and then polls the runtime. Not published.
 
 Depends on [`dpdk-smoltcp`](../conduit/crates/dpdk-smoltcp/README.md), the DPDK-free `junction` client, and [`switch`](../switch/README.md).

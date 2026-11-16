@@ -1,5 +1,9 @@
 # switch-nic: real-NIC runbook
 
+See [switch-nic](../../../book/src/nic/switch-nic.md),
+[Linux host setup](../../../book/src/nic/host-setup.md), and
+[EC2 setup](../../../book/src/nic/ec2.md) in the switch book.
+
 `switch-nic` runs one switch Stack on one NIC port, one core, one process. It has three modes:
 `info` prints what the NIC offers and exits; `sockperf-server` answers kernel `sockperf` 3.10 clients over
 UDP and TCP the way `sockperf server` does; `feed` connects to the Binance TLS feed through the gateway.
@@ -34,7 +38,7 @@ stays bound (no vfio-pci).
 RX hardware timestamps (`rx_timestamps` in the config, DPDK RX offload bit 14) in DPDK 25.11.3:
 - ice (E810): offered. Values are ns on the NIC's PTP clock.
 - ena: offered when the device reports timestamp support (newer instance types); `info` shows it.
-  Values are ns on the device's clock, with an undocumented epoch (see [section 4](#4-timestamps)).
+  Values are ns on the Amazon Time Sync PHC clock (see [hardware timestamps](../../../book/src/nic/offloads.md)).
 - ixgbe, i40e: not offered (their PMDs have IEEE 1588 PTP packet stamping only); Port open refuses
   `rx_timestamps: true`.
 - af_packet: offered, ns of kernel CLOCK_REALTIME at socket receive (software time, not the NIC).
@@ -49,16 +53,12 @@ Per-PMD setup:
   Security groups must allow UDP/TCP 11111-11130 between DUT and peer. Without an IOMMU (every non-metal
   instance), bind with `--noiommu`. ENA forces TX MULTI_SEGS on; switch accepts that bit and refuses any
   other offload the driver forces on.
-- ENA LLQ needs write combining on the device BAR, which mainline vfio-pci does not provide (required on
-  6th-generation Nitro and later). Install the patched module from
-  https://github.com/amzn/amzn-drivers/tree/master/userspace/dpdk/README.md before binding. The tool cannot
-  detect it; the ENA PMD's stderr lines about LLQ show it, and a warning that LLQ is disabled means the
-  module lacks write combining.
+- ENA LLQ setup is covered in [Running on EC2](../../../book/src/nic/ec2.md#by-hand),
+  including the write-combining module requirement.
 - AWS does not auto-assign a public IPv4 when an instance has more than one network interface. Internet
   destinations (the Binance feed) need an Elastic IP on the DPDK ENI or a NAT gateway route;
   `discover --aws` warns when `public-ipv4s` is empty.
-- Leave ENA Express off on the DPDK ENI. With it on, UDP needs a lower MTU for its SRD headers; add a path
-  rule with that MTU for the affected prefix.
+- Leave ENA Express off on the DPDK ENI; see [EC2 setup](../../../book/src/nic/ec2.md).
 - Fresh discovery sets the port MTU to the smaller of the NIC MTU and 1500, with a 1500 rule per VPC
   CIDR and `0.0.0.0/0 → 1500`; paths are clamped to the port MTU. The local subnet has an implicit
   rule at the port MTU, which takes precedence over a broader VPC rule. To use jumbo frames, explicitly

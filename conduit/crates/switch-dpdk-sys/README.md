@@ -1,5 +1,8 @@
 # switch-dpdk-sys
 
+See [Setting up a build environment](../../../book/src/getting-started/environment.md)
+in the switch book. Generate the API reference with `cargo doc -p switch-dpdk-sys --no-deps`.
+
 Raw bindings to DPDK 25.11.3 plus a small C shim for the mbuf, mempool and ethdev paths that DPDK only provides as inline functions.
 
 Used by `switch-buffer`, `dpdk-smoltcp`, `switch-open`, `switch-tap-echo`, `switch-memif-bench`, `switch-nic` and `switch-test-kit`. `switch-binance-feed` uses it in tests.

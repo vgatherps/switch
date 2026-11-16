@@ -718,6 +718,7 @@ fn recv_sends_a_dropped_close_behind_a_dropped_send() {
     assert!(matches!(&read[1..], [Message::Close(Some(c))] if c.reason == "bye"), "{:?}", &read[1..]);
 }
 
+// ANCHOR: server_close
 /// The server closes: the client's recv returns the end, after echoing the close and ending
 /// TLS and TCP.
 #[switch_test_support::pinned_test]
@@ -745,6 +746,7 @@ fn server_close_ends_recv_cleanly() {
     let echo = echo.expect("the echoed close payload");
     assert_eq!((echo.code, echo.reason.as_str()), (CloseCode::Away, "bye"));
 }
+// ANCHOR_END: server_close
 
 /// The server stops reading: with its small receive buffer full, the client's sends stop in
 /// the wait for room; once the server reads again every message arrives byte-exact.

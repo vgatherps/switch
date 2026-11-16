@@ -398,6 +398,7 @@ support::both_backends!(two_accepts_on_one_port_serve_two_connections_conduit, t
     })
 });
 
+// ANCHOR: frame_outlives
 support::both_backends!(frames_outlive_the_stack_conduit, frames_outlive_the_stack_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["outa", "outb"], backend);
@@ -430,7 +431,9 @@ support::both_backends!(frames_outlive_the_stack_conduit, frames_outlive_the_sta
         });
     })
 });
+// ANCHOR_END: frame_outlives
 
+// ANCHOR: held_frames
 // Holding earlier frames must not prevent later in-order data from reaching
 // the application, even beyond the configured receive window target.
 support::both_backends!(held_frames_do_not_block_later_data_conduit, held_frames_do_not_block_later_data_junction, |backend| {
@@ -467,6 +470,7 @@ support::both_backends!(held_frames_do_not_block_later_data_conduit, held_frames
         mixed.close();
     })
 });
+// ANCHOR_END: held_frames
 
 // Both ends send a SYN. The Net's turn that takes the peer's SYN moves it
 // to SynReceived, which must not wake the connecting task.

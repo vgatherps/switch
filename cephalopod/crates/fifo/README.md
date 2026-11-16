@@ -2,7 +2,7 @@
 
 The sequencer side: `Fifo` merges the per-CPU rings into one ordered stream of messages per producer, with end-of-stream and stall handling.
 
-Depends on [`ceph-ring`](../ring/README.md) and [`ceph-proto`](../proto/README.md). `ceph-control` is a dev-dependency (for the end-to-end test). Nothing in the workspace depends on `ceph-fifo`.
+Depends on [`ceph-ring`](../ring/README.md) and [`ceph-proto`](../proto/README.md). `ceph-control` is a dev-dependency (for the end-to-end test). `switch-junctiond` uses `ceph-fifo`; `switch-junction` uses it in tests, and `switch-net` uses it for its testkit and tests.
 
 ## API
 

@@ -1,5 +1,8 @@
 # switch-buffer
 
+See [Packet-buffer pools](../../../book/src/nic/pools.md) in the switch book.
+Generate the API reference with `cargo doc -p switch-buffer --no-deps`.
+
 Thin wrapper over DPDK mbufs with ownership-checked chain operations (refuse shared heads, shared tails whose metadata would change, and cycles).
 
 ## Architecture

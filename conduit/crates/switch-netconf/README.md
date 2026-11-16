@@ -1,5 +1,9 @@
 # switch-netconf
 
+See [The network config file](../../../book/src/nic/config.md) and
+[the config tool](../../../book/src/nic/netconf-tool.md) in the switch book.
+Generate the API reference with `cargo doc -p switch-netconf --no-deps`.
+
 The switch network config file (`dut.json`): a typed `Config`, discovery of it from a Linux interface, and binding the NIC to vfio-pci. It does not need DPDK.
 
 Used by `switch-open` (which turns a `Config` into a running `Stack`) and `switch-nic`. Depends on `serde`, `serde_json`, `libc` and the vendored `smoltcp` (for address and MTU types).

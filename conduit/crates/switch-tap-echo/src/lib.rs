@@ -1,7 +1,10 @@
-//! Passive TCP echo application over a `Stack`: every byte a peer sends comes
-//! back on the same connection, and the server closes once the peer has closed
-//! and every byte is queued back, or (`with_close_after`) once it has queued
-//! back a set number of bytes.
+//! A TCP echo server on a Stack over a tap device, and the tap driver that other test programs reuse. It is test infrastructure: the target of the packetdrill scripts and the TCP fuzzer, and the harness that `switch-ws`'s Autobahn runner and the `switch-binance-feed` binary run on. It does not read a network config file; addresses, pool sizes and the device are fixed constants in [`driver`].
+//!
+//! [`EchoServer`] adds listening sockets to a Stack and sends every received byte back on the same connection; [`serve`] runs it in a drive loop until a stop callback says to end. [`driver::run`] spawns a tester process, starts EAL on the one allowed CPU, creates the tap device (Linux interface `cdtap_echo`, Stack address 192.0.2.2/24, kernel side 192.0.2.1), opens the NIC port and Stack by hand, runs an application until the tester exits, closes everything in order and composes an exit status. [`driver::run_tester`] runs the same tester contract without EAL or a Stack, for applications that reach the network through the junction daemon instead. [`driver::tester_env`] lists the environment variables the tester receives.
+//!
+//! `driver.rs` is also the repository's worked example of opening a NIC port without `switch_open::open`: EAL arguments, pools, `Port::open`, `Stack::new` and teardown.
+//!
+//! See the switch book, chapter "Starting DPDK and opening a NIC port by hand".
 
 pub mod driver;
 
@@ -53,6 +56,7 @@ impl EchoServer {
         listeners: usize,
         buffer: usize,
     ) -> Result<Self, EchoError> {
+        // ANCHOR: listeners
         let mut handles = Vec::with_capacity(listeners);
         for _ in 0..listeners {
             let added = stack
@@ -75,6 +79,7 @@ impl EchoServer {
                 }
             }
         }
+        // ANCHOR_END: listeners
         Ok(Self {
             port,
             echoed: vec![0; handles.len()],
@@ -99,6 +104,7 @@ impl EchoServer {
     pub fn step(&mut self, stack: &mut Stack) -> bool {
         let mut changed = false;
         for ((handle, echoed), pending) in self.handles.iter().zip(&mut self.echoed).zip(&mut self.pending) {
+            // ANCHOR: relisten
             if stack.tcp(handle).state() == State::Closed {
                 stack
                     .listen(handle, self.port)
@@ -107,6 +113,8 @@ impl EchoServer {
                 *echoed = 0;
                 changed = true;
             }
+            // ANCHOR_END: relisten
+            // ANCHOR: echo
             let socket = stack.tcp_mut(handle);
             // send_slice fails outside Established and CloseWait. In LastAck
             // smoltcp still enqueues payload from an in-window segment that
@@ -144,6 +152,7 @@ impl EchoServer {
                 }
                 changed = true;
             }
+            // ANCHOR_END: echo
             if self.close_after == Some(*echoed) {
                 if socket.may_send() {
                     stack.close(handle);
@@ -187,6 +196,7 @@ pub fn serve(
     start: std::time::Instant,
     mut stop: impl FnMut(&mut Stack, &EchoServer) -> bool,
 ) -> Result<(), StackError> {
+    // ANCHOR: serve_loop
     loop {
         let micros = i64::try_from(start.elapsed().as_micros())
             .expect("elapsed wall time fits i64 microseconds");
@@ -206,4 +216,5 @@ pub fn serve(
         };
         std::thread::sleep(sleep);
     }
+    // ANCHOR_END: serve_loop
 }

@@ -1,6 +1,10 @@
-//! Unix-socket control plane for assigning stream ids and tracking player sessions.
+//! Unix-socket control plane for cephalopod stream ids.
 //!
-//! Players send no data after the connection handshake.
+//! A standalone cephalopod consumer runs a [`Listener`] on a thread. Each producer that calls [`connect`] gets a [`Session`] holding its stream id (slot in the high 32 bits, unique id in the low 32 bits) and the path of the shared ring file to pass to `ceph_ring::Writer::attach`. The listener tells the `ceph_fifo::Fifo` about opened and closed streams through a `ceph_proto::Control` channel, and closes a producer's connection when the `Fifo` reports its stream finished or kicked (`ceph_proto::Retire`). The junction daemon assigns sessions over its own control socket and does not use this crate.
+//!
+//! [`Listener::bind`] removes a stale socket file and takes the maximum number of streams, which must match `Fifo::new`; [`Listener::run`] blocks, so run it on its own thread. A producer that connects while every stream is in use has its connection closed without a reply, so `connect` fails. Producers send no data after the connection handshake. A producer keeps its `Session` until [`Session::closed`] is true, which happens after its end record is delivered or its stream is kicked; a connection that closes earlier closes the stream, and its undelivered records are discarded.
+//!
+//! See the switch book, chapter "cephalopod: many writers, one reader".
 
 use ceph_proto::{Control, Retire, pack};
 use std::io::{self, Read, Write};

@@ -1,3 +1,8 @@
+//! The `#[pinned_test]` attribute, re-exported by `switch-test-support`; use it from there.
+//!
+//! `#[pinned_test]` turns a function into a `#[test]` whose body runs through `switch_test_support::run` on the pinned worker thread, labelled `<module path>::<function name>`, with the bound `switch_test_support::PINNED_TEST_BOUND`. `#[pinned_test(bound_ms = N)]` sets the bound to N milliseconds; any other argument is a compile error. A `#[test]` already on the function is removed; other attributes, such as `#[ignore]`, are kept.
+//!
+//! See the switch book, chapter "Writing tests that use DPDK".
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, ItemFn, LitInt};

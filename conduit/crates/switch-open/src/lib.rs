@@ -1,7 +1,46 @@
-//! Opens a switch `Stack` from a `switch-netconf` config file with one call to [`open`].
+//! One call from a network config file to a running Stack on a NIC the process owns. Programs that drive a card themselves (directly or through `switch_net::Net::new`) and the junction daemon open it with [`open`].
 //!
-//! `docs/USAGE.md` in the repository explains setup, sizing and the drive loop.
-//! `examples/tcp_client.rs` is a complete program built on this crate.
+//! [`open`] takes the loaded [`switch_netconf::Config`], a [`Sizing`] (socket slots and packet-buffer shares), optional helper CPUs for DPDK's own threads, and the clock the caller will drive the Stack with. In order it checks that the calling thread may run on exactly one CPU, starts DPDK's EAL with that CPU for its main thread, finds the device, checks a PCI card's MAC against the config, chooses offloads (module [`offloads`]), opens the NIC port with its pools, waits up to ten seconds for link, builds the Stack, and, if the config has a gateway, resolves it by ARP for up to three seconds. It returns [`Opened`]: the `stack`, the `eal` handle (keep it until the port is closed) and an [`OpenReport`] whose `Display` prints one `key: value` line per fact. [`OpenError`] names the failing step; errors after the port exists carry the port or the Stack so the caller can close it with `try_close`.
+//!
+//! `open` is `unsafe` because DPDK and the card write to memory the compiler cannot see. In practice the contract is: call it once per process, from the thread that will drive the Stack, for a device that EAL creates or finds from the config and nothing else has configured; keep every Stack, socket and packet buffer on that thread; keep `eal` alive until the port is closed. The `# Safety` section of [`open`] states the full contract.
+//!
+//! ```rust,no_run
+//! use std::path::Path;
+//!
+//! use dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY;
+//! use dpdk_smoltcp::smoltcp::socket::tcp;
+//! use dpdk_smoltcp::smoltcp::time::Instant;
+//! use dpdk_smoltcp::smoltcp::wire::Ipv4Address;
+//!
+//! fn setup() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = switch_netconf::Config::load(Path::new("dut.json"))?;
+//!     let server = Ipv4Address::new(192, 0, 2, 1);
+//!     let tcp_config = tcp::Config {
+//!         rx_capacity: 65536,
+//!         tx_capacity: 65536,
+//!         mss_cap: Some(config.path_mtu(server) - 40),
+//!     };
+//!     let sizing = switch_open::Sizing {
+//!         frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
+//!         max_sockets: 1,
+//!         max_udp_sockets: 0,
+//!         rx_staging: 32,
+//!         tx_pending: 32,
+//!         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
+//!     };
+//!     let start = std::time::Instant::now();
+//!     let mut clock = || Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
+//!     let opened = unsafe { switch_open::open(&config, &sizing, None, &mut clock) }?;
+//!     println!("{}", opened.report);
+//!     let (mut stack, _eal) = (opened.stack, opened.eal);
+//!     let handle = stack.add_tcp(tcp_config)?;
+//!     stack.connect(&handle, (server, 7000), 40000)?;
+//!     // then the drive loop; keep `_eal` alive until the Port is closed
+//!     Ok(())
+//! }
+//! ```
+//!
+//! See the switch book, chapter "Opening the NIC from code".
 
 use std::thread;
 use std::time::{Duration, Instant};

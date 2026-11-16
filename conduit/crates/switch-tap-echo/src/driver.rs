@@ -201,6 +201,7 @@ pub fn run(
             return EXIT_ERROR;
         }
     };
+    // ANCHOR: only_allowed_cpu
     // EAL's main lcore 7 runs on the one CPU this process may use; checked
     // before a tester exists.
     let cpu = match only_allowed_cpu() {
@@ -210,6 +211,7 @@ pub fn run(
             return EXIT_ERROR;
         }
     };
+    // ANCHOR_END: only_allowed_cpu
     // Before EAL: net_tap opens its /dev/net/tun queue fds without
     // O_CLOEXEC (rte_eth_tap.c tun_alloc), and a child forked later would
     // inherit them and keep the netdev alive.
@@ -231,6 +233,7 @@ pub fn run(
     )
 }
 
+// ANCHOR: port_config
 /// Beyond their reserves, the RX pool has space for one window of full-sized
 /// segments, shared by all sockets; smaller segments can consume more mbufs.
 /// The frame pool includes a full-sized-segment estimate for one `buffer`-byte socket.
@@ -275,7 +278,9 @@ fn port_config(port_id: u16, buffer: usize) -> PortConfig<'static> {
         offloads: Offloads::default(),
     }
 }
+// ANCHOR_END: port_config
 
+// ANCHOR: stack_config
 fn stack_config(max_sockets: usize, gateway: Option<Ipv4Addr>, random_seed: u64) -> StackConfig<'static> {
     StackConfig {
         max_udp_sockets: 0,
@@ -291,6 +296,7 @@ fn stack_config(max_sockets: usize, gateway: Option<Ipv4Addr>, random_seed: u64)
         tx_pending: TX_PENDING,
     }
 }
+// ANCHOR_END: stack_config
 
 /// Run `app` until the tester exits, tear down, and compose the exit status.
 /// EAL's main lcore 7 runs on `cpu`.
@@ -303,6 +309,7 @@ fn serve(
     random_seed: u64,
     app: impl FnOnce(Stack, Instant, &mut dyn FnMut() -> bool) -> (Stack, Result<(), String>),
 ) -> i32 {
+    // ANCHOR: eal_init
     let mut config = port_config(u16::MAX, buffer);
     let pool_memory_bytes = u64::from(config.rx_pool.count)
         .checked_add(u64::from(config.tx_pool.count))
@@ -334,6 +341,8 @@ fn serve(
             return tester.fail(format_args!("EAL init: {error}; requested {memory_mb} MB"))
         }
     };
+    // ANCHOR_END: eal_init
+    // ANCHOR: vdev
     // SAFETY: both arguments are NUL-terminated strings valid for the call.
     let rc = unsafe { rte_vdev_init(VDEV.as_ptr(), DEVARGS.as_ptr()) };
     if rc != 0 {
@@ -344,6 +353,8 @@ fn serve(
         Some(port_id) => port_id,
         None => return tester.fail(format_args!("port_by_name: {name} not found")),
     };
+    // ANCHOR_END: vdev
+    // ANCHOR: port_open
     // SAFETY: the net_tap ethdev was just created by rte_vdev_init and nothing
     // else configures or uses it; this thread is the EAL main lcore and the
     // only one touching EAL, the Port and its packets. net_tap honors the
@@ -369,6 +380,8 @@ fn serve(
         }
         Err(error) => return tester.fail(error),
     };
+    // ANCHOR_END: port_open
+    // ANCHOR: stack_new
     let start = Instant::now();
     let stack = match Stack::new(
         port,
@@ -378,12 +391,14 @@ fn serve(
         Ok(stack) => stack,
         Err((_, error)) => return tester.fail(format_args!("Stack::new: {error}")),
     };
+    // ANCHOR_END: stack_new
 
     let (stack, status) = match tester.run(|stop| app(stack, start, stop)) {
         Ok(result) => result,
         Err(code) => return code,
     };
 
+    // ANCHOR: teardown
     let name = tester.name;
     let teardown = match stack.into_port().try_close() {
         Ok(()) => {
@@ -408,6 +423,7 @@ fn serve(
             Some(EXIT_ERROR)
         }
     };
+    // ANCHOR_END: teardown
     let status = tester_status(name, status);
     teardown.unwrap_or(status)
 }

@@ -1,3 +1,20 @@
+//! Runs DPDK tests on one long-lived thread.
+//!
+//! DPDK's EAL starts once per process and belongs to the thread that started it, while the standard test harness runs each test on a new thread. [`pinned_test`] replaces `#[test]` and sends the test body to one worker thread per test binary, so every body in the binary runs on the thread that owns EAL. A panic in the body fails that test with its original payload. A body that runs longer than its bound, [`PINNED_TEST_BOUND`] (180 s) unless `#[pinned_test(bound_ms = N)]` sets another, prints the test's name to stderr and ends the whole test process with exit status 1, because the stuck worker still owns EAL. [`run`] is the function the attribute expands to. Run test binaries with `--test-threads=1`, in a process allowed on exactly one CPU.
+//!
+//! ```no_run
+//! use switch_test_support::pinned_test;
+//!
+//! #[pinned_test]
+//! fn opens_a_port() {
+//!     // start EAL (for example with switch_test_kit::with_eal) and use it here
+//! }
+//!
+//! #[pinned_test(bound_ms = 5000)]
+//! fn must_finish_quickly() {}
+//! ```
+//!
+//! See the switch book, chapter "Writing tests that use DPDK".
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};

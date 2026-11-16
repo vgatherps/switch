@@ -1,5 +1,8 @@
 # shared-memory
 
+See [Shared memory and the receive ring](../book/src/blocks/rings.md) in the switch book.
+Generate the API reference with `cargo doc -p shared-memory --no-deps`.
+
 Unix backing ownership and single/double mappings used by `ceph-ring` and
 `slice_ringbuffer`. Depends only on `libc`; no queue protocol or synchronization.
 
@@ -31,9 +34,6 @@ Linux hugetlbfs files use the mount's page size for offsets, lengths and virtual
 alignment. Provision the huge-page pool and pass a file on that mount; this crate
 does not configure the system or silently fall back to ordinary pages. POSIX shm
 uses native pages. `page_size_in(dir)` supports sizing before file creation.
-
-`ceph-ring` retains its hugetlbfs directory configuration. `slice_ringbuffer` still
-uses POSIX shm and does not yet expose a huge-page backing choice.
 
 ```sh
 cargo test -p shared-memory

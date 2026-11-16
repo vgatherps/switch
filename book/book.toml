@@ -1,0 +1,7 @@
+[book]
+title = "The switch book"
+description = "Userspace TCP/UDP, TLS and WebSocket for Rust: the switch runtime, switch-net sockets, the DPDK Stack and the junction daemon."
+language = "en"
+src = "src"
+
+[output.html]

@@ -1,5 +1,9 @@
 # switch-open
 
+See [Opening the NIC from code](../../../book/src/nic/open.md) and
+[CPU pinning](../../../book/src/nic/cpus.md) in the switch book.
+Generate the API reference with `cargo doc -p switch-open --no-deps`.
+
 `open(config, sizing, helper_cpus, clock)`: one call from a `switch-netconf` `Config` to a running `Stack`. The package is `switch-open`; the directory is `crates/switch-open`.
 
 Used by `switch-nic`. Depends on [`switch-netconf`](../switch-netconf/README.md), [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `switch-buffer` and `switch-dpdk-sys`.
@@ -8,10 +12,10 @@ Used by `switch-nic`. Depends on [`switch-netconf`](../switch-netconf/README.md)
 
 - `unsafe fn open(&Config, &Sizing, Option<&[usize]>, &mut impl FnMut() -> Instant) -> Result<Opened, OpenError>`: builds the EAL arguments from the config (main lcore on the one allowed CPU, `--file-prefix`, `-a <pci>,<devargs>` or `--vdev`), initializes EAL, sizes the pools, picks offloads, opens the `Port` and `Stack` (with the config's `owned_ipv4`), waits for link, and resolves the gateway if one is configured. The safety contract is in the doc comment.
 - `Opened { stack, eal, report }` and `OpenReport` (its `Display` prints the lines `switch-nic` shows: link status, `gateway: <ip> at <mac> after <n> ms`, ...). `OpenError` names the failing step.
-- `Sizing`: required fields `frame_share` (frames all sockets together may hold beyond the frame reserve; nothing is reserved per socket), `max_sockets` and `max_udp_sockets` (zero disables UDP). The RX pool is a fixed 32767 mbufs (`docs/USAGE.md`, "Pool sizing").
+- `Sizing`: required fields `frame_share` (frames all sockets together may hold beyond the frame reserve; nothing is reserved per socket), `max_sockets` and `max_udp_sockets` (zero disables UDP). See [Packet-buffer pools](../../../book/src/nic/pools.md) for pool sizing.
 - `offloads`: resolves `Offloads::Auto` and explicit settings against what the PMD advertises.
 
-`open` fails with `OpenError::NotPinned` unless the process may run on exactly one CPU, so run under `taskset -c N` or `docker --cpuset-cpus=N`. The setup code in [docs/USAGE.md](../../docs/USAGE.md) is `examples/setup.rs`, and a test fails if they differ.
+`open` fails with `OpenError::NotPinned` unless the process may run on exactly one CPU, so run under `taskset -c N` or `docker --cpuset-cpus=N`. [Opening the NIC from code](../../../book/src/nic/open.md) includes `examples/setup.rs` directly.
 
 On Linux, `Some(helper_cpus)` explicitly selects EAL helper CPUs, including
 when the polling CPU is not kernel-isolated (for example, in Docker). The set

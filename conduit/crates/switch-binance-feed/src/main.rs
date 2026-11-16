@@ -201,6 +201,7 @@ fn feed(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    // ANCHOR: drive
     let mut rt = Runtime::new(clock.ns());
     let (stop_feed, stop_rx) = oneshot::channel();
     let mut stop_feed = Some(stop_feed);
@@ -236,6 +237,7 @@ fn feed(
             let _ = stop_feed.send(());
         }
     };
+    // ANCHOR_END: drive
     result.map_err(|error| error.to_string())?;
     if summary.count == 0 {
         return Err("no bookTicker message received".to_owned());

@@ -17,6 +17,7 @@ fn assert_worker_identity() {
     assert_eq!(thread::current().name(), Some("switch-test-worker"));
 }
 
+// ANCHOR: pinned
 #[pinned_test]
 fn first_test_uses_worker() {
     assert_worker_identity();
@@ -26,6 +27,7 @@ fn first_test_uses_worker() {
 fn second_test_uses_same_worker() {
     assert_worker_identity();
 }
+// ANCHOR_END: pinned
 
 #[test]
 fn parallel_submissions_serialize_and_return_values() {

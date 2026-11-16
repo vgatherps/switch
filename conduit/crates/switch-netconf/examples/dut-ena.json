@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "device": {
+    "pci": "0000:00:06.0",
+    "pci_id": "1d0f:ec20",
+    "devargs": "llq_policy=1",
+    "kernel_driver": "ena",
+    "kernel_interface": "eth1",
+    "numa_node": 0
+  },
+  "mac": "0a:12:34:56:78:9a",
+  "ipv4": "10.0.1.23/24",
+  "gateway": "10.0.1.1",
+  "mtu": 1500,
+  "paths": [
+    {"prefix": "10.0.0.0/16", "mtu": 1500, "why": "vpc"},
+    {"prefix": "0.0.0.0/0", "mtu": 1500, "why": "default"}
+  ],
+  "offloads": "auto",
+  "rx_timestamps": false,
+  "descriptors": 1024,
+  "eal": {"file_prefix": "switch", "extra": []}
+}

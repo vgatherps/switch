@@ -1,7 +1,8 @@
-//! Definitions shared by the sequencer's polling thread (`ceph-fifo`) and its control thread
-//! (`ceph-control`).
+//! Definitions shared by cephalopod's consumer (`ceph-fifo`) and its control thread (`ceph-control`).
 //!
-//! Stream ids keep the slot in the high 32 bits and the unique id in the low 32 bits.
+//! [`Control`] goes from the control thread to the consumer when a stream opens or closes; [`Retire`] goes back when the consumer has delivered a stream's end record or kicked the stream. A program wiring `ceph_control::Listener` to `ceph_fifo::Fifo` creates one `std::sync::mpsc` channel of each. Stream ids keep the slot in the high 32 bits and the unique id in the low 32 bits; [`pack`], [`slot`] and [`uid`] convert between them. switch-junction and switch-junctiond also use these types.
+//!
+//! See the switch book, chapter "cephalopod: many writers, one reader".
 
 /// A stream id as carried in every record: the slot index in the high 32 bits, the unique id
 /// in the low 32 bits.

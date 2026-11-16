@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("server has no IPv4 address".into());
     };
 
+    // ANCHOR: sizing
     // One socket: room for its full send window, with the path MSS cap.
     let socket = tcp::Config {
         rx_capacity: BUFFER, tx_capacity: BUFFER,
@@ -65,10 +66,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         tx_pending: 32,
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     };
+    // ANCHOR_END: sizing
 
+    // ANCHOR: clock
     // Every drive call must get time from this one clock. It never goes backwards.
     let start = WallInstant::now();
     let mut clock = || Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
+    // ANCHOR_END: clock
+    // ANCHOR: open
     // SAFETY: EAL creates the device named in the config, this thread owns it and
     // every packet, and EAL (`_eal` below) lives until the process exits.
     // An error drops the Port it carries; crates/switch-nic/src/main.rs shows how
@@ -77,12 +82,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{}", opened.report);
     let _eal = opened.eal;
     let mut stack = opened.stack;
+    // ANCHOR_END: open
 
+    // ANCHOR: connect
     let handle = stack.add_tcp(socket)?;
     stack.connect(&handle, server, LOCAL_PORT)?;
+    // ANCHOR_END: connect
     let mut said_hello = false;
     let mut server_closed = false;
     let mut out = io::stdout().lock();
+    // ANCHOR: loop
     // This loop spins on its core. That is the intended deployment: one core per Stack.
     loop {
         if start.elapsed() > LIMIT {
@@ -108,6 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         stack.send()?;
     }
+    // ANCHOR_END: loop
     out.flush()?;
     if stack.tcp(&handle).reset_by_peer() {
         return Err("the server reset the connection".into());
@@ -116,6 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("the connection closed before the server finished".into());
     }
 
+    // ANCHOR: close
     // Received frames are all dropped, so the Port can return every buffer.
     match stack.into_port().try_close() {
         Ok(()) => {
@@ -124,4 +135,5 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Err((_port, error)) => Err(format!("port close: {error}").into()),
     }
+    // ANCHOR_END: close
 }

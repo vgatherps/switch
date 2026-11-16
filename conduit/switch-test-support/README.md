@@ -4,11 +4,11 @@ Test harness that runs DPDK tests on one long-lived thread. Not published (`publ
 
 EAL is claimed by the thread that initializes it, and libtest runs each test on a fresh thread. `switch-test-support` runs every `#[pinned_test]` body on a single worker thread, so all tests in a binary share one EAL owner.
 
-Dev-dependency of `switch-dpdk-sys`, `switch-buffer`, `dpdk-smoltcp`, `switch-open`, `switch-tap-echo`, `switch-binance-feed`, `switch-memif-bench`, `switch-test-kit` and `switch-net`.
+Dev-dependency of `switch-dpdk-sys`, `switch-buffer`, `dpdk-smoltcp`, `switch-open`, `switch-tap-echo`, `switch-binance-feed`, `switch-memif-bench` and `switch-test-kit`.
 
 ## API
 
-- `#[pinned_test]`, re-exported from [`switch-test-support-macros`](macros/README.md). Replaces `#[test]`.
+- `#[pinned_test]`, re-exported from [`switch-test-support-macros`](switch-test-support-macros/README.md). Replaces `#[test]`.
 - `run(test_name, bound, f)`: runs `f` on the worker and returns its result. A panic in `f` is printed in the calling test's output and resumed with the original payload.
 - `PINNED_TEST_BOUND`: 180 s, the default time limit for a body.
 

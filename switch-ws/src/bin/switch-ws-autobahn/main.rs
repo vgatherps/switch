@@ -1,6 +1,8 @@
-//! switch-ws's ws:// on switch for Autobahn (make docker-autobahn), as switch tasks on a switch-net
-//! Net over the tap_echo driver: an echo server for fuzzingclient, or a client of
-//! fuzzingserver. See `usage`.
+//! Autobahn testsuite driver for switch-ws (test tool, built with feature `e2e`). In the `server` role it runs a ws:// echo server for `wstest -m fuzzingclient`; in the `client` role it runs switch-ws's ws:// client against `wstest -m fuzzingserver`. Either role runs on a tap device with the local backend, or through `switch-junctiond` with `--backend junction`. Normally started by `make -C conduit docker-autobahn` (or `docker-autobahn-junction`), which then checks the report with `conduit/autobahn/check.py`.
+//!
+//! Usage: `switch-ws-autobahn server --expect-connections N | client --expect-cases N [--backend conduit|junction] [--junction-socket PATH] -- <tester> [args...]`
+//!
+//! Book: See the switch book, chapter "Protocol conformance: Autobahn and TLS-Anvil".
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -359,6 +361,7 @@ async fn run_role(
     *outcome.borrow_mut() = Some(result);
 }
 
+// ANCHOR: server
 /// The echo server on `ECHO_PORT`, one connection at a time, forever. The next connection's
 /// listener opens as soon as one is accepted, so a client's next SYN finds it even while the
 /// previous connection still closes.
@@ -381,6 +384,7 @@ async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally
         *tally.borrow_mut().endings.entry(ending).or_default() += 1;
     }
 }
+// ANCHOR_END: server
 
 /// fuzzingserver's client: once `run`/server-ready exists, getCaseCount (which must say
 /// `cases`), runCase 1..=cases and updateReports, then writes `run`/client-done.
@@ -447,6 +451,7 @@ async fn connection(handle: &NetHandle, n: usize, path: &str, cases: usize, buf:
     }
 }
 
+// ANCHOR: echo
 /// Echoes every Text and Binary message until the connection ends; returns how it ended. A
 /// protocol error fails the connection with FIN and no close frame, and the peer's later bytes
 /// are read and dropped until its FIN, so the socket closes without RST.
@@ -474,6 +479,7 @@ async fn echo(ws: &mut Ws, buf: &mut Vec<u8>) -> &'static str {
         }
     }
 }
+// ANCHOR_END: echo
 
 /// Creates the empty file `path` atomically (write, then rename).
 fn write_marker(path: &Path) -> std::io::Result<()> {

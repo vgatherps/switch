@@ -1,20 +1,64 @@
-//! Async sockets over one conduit `Stack`, for the `switch` runtime.
+//! Async TCP and UDP sockets for tasks on the [`switch`] runtime, over a NIC your process owns
+//! or one shared through the junction daemon.
 //!
-//! The loop owner holds the [`Net`] and calls `net.turn(now)` (a `Stack::turn`,
-//! then a wake of every task parked on a socket that became ready), then polls
-//! the switch runtime. Tasks hold a [`NetHandle`], which opens sockets and
-//! hands out TX frames but cannot turn the stack. Futures here must be polled
-//! by switch tasks: parking stores a `switch::StoredWaker`.
-//! Everything is single-threaded (`Rc`), so no type here is `Send`.
+//! Your drive loop holds the [`Net`] and turns it: [`Net::turn`] takes in packets, runs TCP
+//! timers, sends what tasks queued, and wakes the tasks whose sockets changed. [`round`] does one
+//! turn and one runtime poll from the same clock sample. Tasks hold a [`NetHandle`], which opens
+//! sockets ([`NetHandle::tcp_connect`], [`NetHandle::tcp_accept`], [`NetHandle::udp_bind`]) and
+//! hands out empty frames to send ([`NetHandle::tx_frame`]); it cannot turn the network. With the
+//! local backend, [`Net::new`] wraps a [`Stack`] running in your process; with the junction
+//! backend, [`Net::remote`] wraps a session with `switch-junctiond`. Task code is the same for both.
 //!
-//! Each socket splits into a receive half and a send half; each half has at
-//! most one waiting task (its futures take `&mut`). Sending never hands a
-//! frame to a future: [`TcpTx::room`] waits until a frame of a given length
-//! fits, then [`TcpTx::try_send`] queues it synchronously or returns it.
+//! Sending never hands a frame to a future: [`TcpTx::room`] waits until a frame of a given length
+//! fits, then [`TcpTx::try_send`] queues it at once or returns it with the error. Received frames
+//! ([`TcpFrame`], [`Datagram`]) stay valid after their socket, the `Net` and the Stack are gone.
+//! Everything is single-threaded: no type here is `Send`, and every future must be polled by a
+//! switch task. Runtime ticks must be monotonic nanoseconds when tasks use [`within`].
 //!
-//! Received frames ([`TcpFrame`], [`Datagram`]) do not hold the Net: like
-//! conduit's frames they stay valid after their socket, the Net and the Stack
-//! are gone. Each frame occupies its socket's receive budget until its last clone drops.
+//! ```rust,no_run
+//! use switch_net::{tcp, Error, IpEndpoint, IpListenEndpoint, NetHandle};
+//!
+//! async fn hello(handle: &NetHandle, server: IpEndpoint, socket: tcp::Config) -> Result<(), Error> {
+//!     // There is no ephemeral port allocator: name a nonzero local port.
+//!     let local = IpListenEndpoint { addr: None, port: 40000 };
+//!     let (mut rx, mut tx) = handle.tcp_connect(socket, server, local).await?.split();
+//!
+//!     let line = b"hello\n";
+//!     let mut frame = handle.tx_frame().await;
+//!     frame.as_mut()[..line.len()].copy_from_slice(line);
+//!     frame.truncate(line.len());
+//!     tx.room(line.len()).await?;
+//!     tx.try_send(frame.freeze()).map_err(|(_frame, error)| error)?;
+//!
+//!     loop {
+//!         match rx.recv().await {
+//!             Ok(frame) => print!("{}", String::from_utf8_lossy(frame.payload())),
+//!             Err(Error::Finished) => return Ok(()),
+//!             Err(error) => return Err(error),
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! A busy-polling drive loop around it, on the pinned CPU:
+//!
+//! ```rust,no_run
+//! use switch::Runtime;
+//! use switch_net::{Instant, Net, RoundError};
+//!
+//! fn drive(
+//!     net: &mut Net,
+//!     runtime: &mut Runtime,
+//!     mut sample: impl FnMut() -> (Instant, u64),
+//! ) -> Result<(), RoundError> {
+//!     loop {
+//!         let (now, tick) = sample(); // Stack time in µs, runtime tick in ns, one reading
+//!         switch_net::round(net, runtime, now, tick)?;
+//!     }
+//! }
+//! ```
+//!
+//! Book: see the switch book, chapters "Your first network program" and "Sockets with switch-net".
 
 mod drive;
 mod remote;

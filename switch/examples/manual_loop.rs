@@ -8,11 +8,13 @@ async fn print_event(event: &'static str) {
     println!("{event}");
 }
 
+// ANCHOR: sleep_task
 #[switch::task]
 async fn print_after_sleep(spawner: Spawner) {
     spawner.sleep(10).unwrap().await.unwrap();
     println!("deadline reached");
 }
+// ANCHOR_END: sleep_task
 
 struct EventQueue {
     pending: VecDeque<&'static str>,
@@ -30,6 +32,7 @@ impl EventQueue {
 }
 
 #[cfg(test)]
+// ANCHOR: events_before_poll
 mod tests {
     use super::*;
 
@@ -48,8 +51,10 @@ mod tests {
         assert_eq!(second, switch::PollReport::default());
     }
 }
+// ANCHOR_END: events_before_poll
 
 fn main() {
+    // ANCHOR: tick_loop
     let mut runtime = Runtime::new(100);
     let spawner = runtime.spawner();
     let task_spawner = spawner.clone();
@@ -66,4 +71,5 @@ fn main() {
         let report = runtime.poll(now).unwrap();
         println!("tick {now}: {report:?}");
     }
+    // ANCHOR_END: tick_loop
 }

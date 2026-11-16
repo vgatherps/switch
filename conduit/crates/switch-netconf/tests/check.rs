@@ -5,6 +5,19 @@ use std::{
 };
 
 #[test]
+fn book_configurations_load() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "../../../switch-net/examples/tap.json",
+        "examples/dut-ena.json",
+    ] {
+        let path = crate_dir.join(relative);
+        switch_netconf::Config::load(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    }
+}
+
+#[test]
 fn check_prints_summary_and_exit_codes() {
     let path = std::env::temp_dir().join(format!(
         "switch-netconf-{}-{}.json",

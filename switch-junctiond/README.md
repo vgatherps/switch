@@ -1,5 +1,7 @@
 # switch-junctiond
 
+See [Running switch-junctiond](../book/src/junction/running.md) in the switch book.
+
 One Linux process owns one DPDK port and serves junction TCP/UDP sessions over shared memory and a Unix control socket. It uses the same `switch_netconf::Config` JSON file as `switch-bench`; no junction configuration section is needed.
 
 ```sh

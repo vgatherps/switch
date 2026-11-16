@@ -69,6 +69,7 @@ impl Daemon {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         });
+        // ANCHOR: wait_ready
         loop {
             let exited = self.child.as_mut().unwrap().try_wait().unwrap();
             assert!(exited.is_none(), "daemon exited {exited:?}: {}", self.diagnostics());
@@ -80,6 +81,7 @@ impl Daemon {
             assert!(Instant::now() < deadline, "daemon did not serve: {}", self.diagnostics());
             std::thread::sleep(Duration::from_millis(1));
         }
+        // ANCHOR_END: wait_ready
     }
 
     fn diagnostics(&self) -> String {
@@ -141,6 +143,7 @@ impl Drop for Daemon {
     }
 }
 
+// ANCHOR: exchange
 fn exchange(session: &mut Session, peer: &UdpSocket) {
     let id = session.bind_udp(UdpConfig {
         local: ListenEndpoint { addr: None, port: 30000 },
@@ -191,6 +194,7 @@ fn exchange(session: &mut Session, peer: &UdpSocket) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+// ANCHOR_END: exchange
 
 #[test]
 fn udp_exchange_and_sigterm_reports_host_shutdown() {

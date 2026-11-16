@@ -19,7 +19,7 @@ The commit is one release store of the tag, so a reader never sees a partly writ
 
 ## Build and test
 
-`ceph-rseq` has no tests of its own (only a `libc` dev-dependency). The `ceph-ring` and `ceph-fifo` tests exercise it. From `cephalopod/`:
+`ceph-rseq` has unit tests in `src/lib.rs` for publication boundaries, payload copying, stale tags, and interrupted writers. The `ceph-ring` and `ceph-fifo` tests also exercise it. From `cephalopod/`:
 
 ```sh
 make test      # Linux tests in Docker, all five ceph crates

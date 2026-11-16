@@ -1,6 +1,30 @@
-//! Shared-memory ring layout plus its single consumer and per-CPU writers.
+//! Per-CPU shared-memory rings: many writers, one reader.
 //!
-//! The consumer advances metadata but never writes into a ring.
+//! `ceph-ring` carries messages from many threads and processes to one consumer. One shared file holds a ring for every possible CPU; a [`Writer`] always pushes into the ring of the CPU its thread is running on, so writers never contend, and the single [`Reader`] reads every ring. Each record carries a stream id and a sequence number, which `ceph-fifo` uses to restore each producer's order. junction's send path is built on this crate: every `Session` holds a `Writer`, and the daemon holds the `Reader`.
+//!
+//! [`Reader::create`] makes the file in [`Config::dir`] (on macOS, a POSIX shared-memory object instead) and owns its name, which it removes on drop. It panics if `ring_size` is not a power of two and a multiple of the directory's page size, or if `max_record` exceeds `ring_size - 40`. [`Writer::attach`] maps the file at the path from [`Reader::name`] and checks its layout, including the number of rings. [`Writer::try_push`] returns [`PushError::Full`] when the current CPU's ring has no room and [`PushError::TooLarge`] when the payload exceeds `max_record`; [`Writer::try_push_with_header`] prefixes up to 32 bytes (a multiple of 8) of header without copying the payload. [`Writer::try_finish`] pushes the stream's end record ([`END_OF_STREAM`]). `Writer` is `Send + Sync`.
+//!
+//! On Linux, a push runs in a restartable-sequence (rseq) critical section: if the thread is preempted or moved to another CPU mid-push, the push is abandoned and retried on the new CPU's ring. This needs glibc on x86_64 or aarch64, and `attach` returns `Unsupported` when glibc has not registered rseq for the calling thread. On macOS every push takes a spinlock on a single ring; that mode is for development and prints a warning. The consumer advances metadata but never writes into a ring.
+//!
+//! ```no_run
+//! use ceph_ring::{PushError, Writer};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! # let (path, stream) = (String::new(), 0u64);
+//! // `path` and `stream` come from the consumer, for example through `ceph_control::connect`.
+//! let writer = Writer::attach(&path)?;
+//! loop {
+//!     match writer.try_push(b"hello", stream, 0) {
+//!         Ok(()) => break,
+//!         Err(PushError::Full) => std::hint::spin_loop(),
+//!         Err(PushError::TooLarge) => panic!("payload too large"),
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! See the switch book, chapter "cephalopod: many writers, one reader".
 
 use std::io;
 use std::os::fd::BorrowedFd;

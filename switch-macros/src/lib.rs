@@ -1,5 +1,10 @@
-//! `#[switch::task]`: turns a task function into a function returning a
-//! `switch::SpawnToken`. Use it through `switch::task`.
+//! # switch-macros
+//!
+//! The `#[switch::task]` attribute, which marks a function as a task of the `switch` runtime. `switch` re-exports it: depend on `switch` and write `#[switch::task]`, not on this crate.
+//!
+//! The attribute goes on an `async fn`, or on a `fn` returning `impl Future<Output = T>` (optionally `+ 'static`). The function keeps its name, visibility, generics and attributes, but calling it returns a `switch::SpawnToken` that holds the arguments; `Spawner::spawn` or `Spawner::spawn_join` starts the task. Arguments must be plain identifiers (`mut` is allowed), and the future and its value must be `'static`. A `self` receiver, `const`, `unsafe` or `extern` functions, other argument patterns, other return types (including `+ Send` bounds) and arguments to the attribute are compile errors. Generic task functions are allowed.
+//!
+//! Book: see the switch book, chapter "Writing and spawning tasks".
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};

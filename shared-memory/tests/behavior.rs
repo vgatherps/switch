@@ -105,6 +105,7 @@ fn nonzero_offset_aliases_wrap_without_touching_metadata_or_following_bytes() {
     }
 }
 
+// ANCHOR: wrap
 #[test]
 fn both_aliases_share_writes_across_the_wrap() {
     for kind in KINDS {
@@ -131,6 +132,7 @@ fn both_aliases_share_writes_across_the_wrap() {
         }
     }
 }
+// ANCHOR_END: wrap
 
 #[test]
 fn concurrent_double_mappings_survive_anonymous_mapping_churn() {

@@ -1,6 +1,35 @@
-//! Sequencer-side ordering, stall handling, and end-of-stream delivery.
+//! Ordered per-stream delivery over `ceph-ring`.
 //!
-//! Dropping a [`Message`] consumes its record.
+//! [`Fifo`] is the consumer side of cephalopod. It sweeps every per-CPU ring of a `ceph_ring::Reader` and delivers each stream's messages in sequence-number order, starting at 0, whichever rings they landed in. The junction daemon runs one `Fifo` for the send rings of all sessions.
+//!
+//! [`Fifo::next_message`] returns the next deliverable [`Message`], or `None` if nothing is ready now. Dropping the message consumes its record. For each ring's oldest record: the expected sequence number is delivered; a lower one, or a record of an unknown or closed stream, is discarded; a higher one stalls that ring until the missing record turns up elsewhere. When a sweep makes no progress while rings are stalled, the `Fifo` kicks a stream whose expected record is in none of them and sends `Retire::Kicked`. A delivered end record ([`Message::end`], empty payload) sends `Retire::Finished` when dropped. At most 64 messages in a row come from one ring.
+//!
+//! Streams open and close through `ceph_proto::Control` messages, normally from `ceph_control::Listener`. `max_streams` in [`Fifo::new`] must equal the value passed to `Listener::bind`.
+//!
+//! ```no_run
+//! use std::path::Path;
+//! use std::sync::mpsc;
+//!
+//! use ceph_control::Listener;
+//! use ceph_fifo::Fifo;
+//! use ceph_ring::{Config, Reader};
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let reader = Reader::create(Config { ring_size: 2 << 20, max_record: 4096, dir: "/dev/shm".into() })?;
+//! let (control_tx, control_rx) = mpsc::channel();
+//! let (retire_tx, retire_rx) = mpsc::channel();
+//! let listener = Listener::bind(Path::new("/tmp/ceph.sock"), reader.name(), 1024, control_tx, retire_rx)?;
+//! std::thread::spawn(move || listener.run());
+//! let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
+//! loop {
+//!     if let Some(message) = fifo.next_message() {
+//!         println!("stream={} seq={} end={}", message.stream(), message.seq(), message.end());
+//!     }
+//! }
+//! # }
+//! ```
+//!
+//! See the switch book, chapter "cephalopod: many writers, one reader".
 
 use std::sync::mpsc::{Receiver, Sender};
 

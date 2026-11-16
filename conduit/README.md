@@ -1,5 +1,8 @@
 # switch
 
+Start with [How the pieces fit together](../book/src/overview/architecture.md)
+in the switch book. The directory table and contributor reference remain below.
+
 switch is a userspace TCP/UDP stack for low-latency market feeds. It runs a modified smoltcp on one
 DPDK port: packets go from the NIC to your process with no kernel in the path, and received data
 stays in DPDK buffers instead of being copied into a socket buffer (a small in-order segment can be
@@ -13,7 +16,7 @@ Ethernet.
 |---|---|---|
 | `crates/dpdk-smoltcp` | `dpdk-smoltcp` | The stack: `Eal`, `Port`, `Stack`, TCP and UDP sockets |
 | `crates/switch-open` | `switch-open` | `open()`: config file to running `Stack` in one call |
-| `crates/netconf` | `switch-netconf` | Config file format, and the `switch-netconf` tool that writes it and binds the NIC |
+| `crates/switch-netconf` | `switch-netconf` | Config file format, and the `switch-netconf` tool that writes it and binds the NIC |
 | `crates/switch-buffer` | `switch-buffer` | DPDK mbufs and pools with ownership-checked chaining |
 | `crates/switch-dpdk-sys` | `switch-dpdk-sys` | Bindings to DPDK 25.11.3 |
 | `crates/switch-nic` | `switch-nic` | `switch-nic`: runs a Stack on a real NIC (link info, sockperf server, feed client) |
@@ -22,7 +25,7 @@ Ethernet.
 | `crates/switch-memif-bench` | `switch-memif-bench` | Benchmarks over DPDK memif |
 | `crates/switch-sockperf-wire` | `switch-sockperf-wire` | sockperf's message format, used by `switch-nic` |
 | `vendor/smoltcp` | `smoltcp` | smoltcp 0.14.0, cut down to IPv4 TCP and UDP over Ethernet, with mbuf-native receive |
-| `test-support` | `switch-test-support`, `switch-test-kit`, `switch-test-support-macros` | Test helpers |
+| `switch-test-support` | `switch-test-support`, `switch-test-kit`, `switch-test-support-macros` | Test helpers |
 
 `fuzz/` has the packetdrill scripts and the Scapy fuzzers, `autobahn/` the WebSocket conformance
 setup, `docker/` the test image.
@@ -56,9 +59,9 @@ with `switch-netconf discover`, hugepages, binding the NIC to vfio-pci, and `swi
 ## Writing a program
 
 Applications run on switch-net (async sockets for `switch` tasks), with switch-ws (WebSocket) and
-switch-tls (TLS 1.3) on top; [docs/USAGE.md](docs/USAGE.md) starts with which layer to use, then is the
-guide to the Stack underneath: setup, pool sizing, the drive loop, time, TCP, UDP, errors and
-shutdown. [crates/switch-open/examples/tcp_client.rs](crates/switch-open/examples/tcp_client.rs)
+switch-tls (TLS 1.3) on top. Start with [your first network program](../book/src/getting-started/first-connection.md)
+or [the Stack guide](../book/src/stack/index.md) for synchronous setup, sizing, TCP, UDP and shutdown.
+[crates/switch-open/examples/tcp_client.rs](crates/switch-open/examples/tcp_client.rs)
 loads a config, opens the stack, connects to a TCP server, prints what it sends and closes the port.
 
 ```sh

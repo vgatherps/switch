@@ -1,5 +1,7 @@
 # switch-bench
 
+See [Measuring latency under load](../book/src/measuring/index.md) in the switch book.
+
 Latency/load benchmark of the switch stack: open-loop generators (switch apps), a switch echo receiver, a fixed
 rate sweep, and a report. Design: `plans/bench/design.md`.
 

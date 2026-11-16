@@ -402,8 +402,8 @@ docker-gate-self-test:
 docker-bench:
 	$(DOCKER_RUN) make bench
 
-# Timed numbers need MEMIF_CPUSET to itself (cpuset_free). The cpuset is
-# MEMIF_CPUSET only, never DOCKER_CPUSET.
+# Timed numbers need BENCH_CPUSET to itself (cpuset_free). The cpuset is
+# BENCH_CPUSET only, never DOCKER_CPUSET.
 docker-bench-smoke:
 	@$(call cpuset_free,$(BENCH_CPUSET),BENCH_CPUSET)
 	$(DOCKER) run --rm --init --cpuset-cpus=$(BENCH_CPUSET) --sysctl net.ipv4.ip_forward=1 $(DOCKER_ACCESS) \

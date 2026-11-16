@@ -1,6 +1,8 @@
-//! Test-only DPDK fixtures shared by the workspace's integration tests and
-//! benches: one EAL argv, net_ring Ports, net_tap and net_pcap vdevs, a copying wire, a
-//! two-Stack driver and many connections over it.
+//! DPDK fixtures shared by the workspace's integration tests and benches.
+//!
+//! [`with_eal`] starts EAL on the calling thread the first time and passes it to the closure: no PCI devices, no hugepages, 1 GiB of ordinary memory, the main thread pinned to the one CPU the process may use ([`eal_args`] panics if it may use more). Call it from a `#[switch_test_support::pinned_test]` body. The modules build fake NICs and wires on top: [`ring_port::RingPort`] is a NIC port on two in-memory rings where the test is the peer; [`pair::Pair`] is two real `Stack`s on ring ports, joined by copying [`wire::Link`]s on one test-driven clock, with [`wire::Verdict`] per frame to drop, duplicate or hold traffic; [`many`] opens many connections over a `Pair`; [`peers`] answers for on-link neighbors; [`tap::TapVdev`] and [`pcap::PcapVdev`] are net_tap and net_pcap devices. Declare fixtures that own a device or ring before the port they back, and `close` them: one dropped without `close` cleans up and then, outside a panic, fails the test. Fixture names must be unique among live fixtures.
+//!
+//! See the switch book, chapter "Writing tests that use DPDK".
 
 use std::cell::OnceCell;
 

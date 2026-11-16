@@ -1,15 +1,14 @@
 //! Single-threaded packet frames with producer-owned storage.
 //!
-//! Each frame is 32 bytes, aligned to eight bytes: a data pointer, a u32 length,
-//! a u32 offset back to its u16 reference count, a release function, and context.
-//! The count must precede the data in the same allocation; slicing advances the
-//! data pointer and the offset together. The count is plain, not atomic: frames
-//! and their storage management stay on one thread. Neither frame type is Send
-//! or Sync.
+//! A frame is a handle to a run of packet bytes that some producer owns: a DPDK packet buffer, a record in a shared-memory ring, a buffer in a pool. Every layer of switch hands received data and send buffers to application code as frames, so bytes are not copied between the network and your task. Application code uses the two frame types; only libraries that manage packet memory create frames.
 //!
-//! The last release calls the producer's function with its context. Both conduit
-//! and junction produce frames, so this crate cannot name either producer or
-//! choose how their storage is released.
+//! [`OwnedFrame`] is the only handle to its bytes and dereferences to `&mut [u8]`. [`OwnedFrame::freeze`] turns it into an [`ImmutableFrame`], a shared, read-only handle whose `clone` copies no bytes. [`ImmutableFrame::try_own`] turns a shared frame back into an `OwnedFrame` when it is the last handle. `slice` (on both types) and [`OwnedFrame::truncate`] narrow a frame without copying. When the last handle is dropped, the producer's [`Release`] function runs on the dropping thread and the memory goes back to the producer.
+//!
+//! Each frame is 32 bytes, aligned to eight bytes: a data pointer, a u32 length, a u32 offset back to its u16 reference count, a release function, and context. The count must precede the data in the same allocation; slicing advances the data pointer and the offset together. The count is plain, not atomic: frames and their storage management stay on one thread. Neither frame type is `Send` or `Sync`. Cloning a frame that already has 65,535 live handles panics. Out-of-range `slice` and `truncate` panic; a frame consumed by a failed `slice` is still released.
+//!
+//! Producers create the first handle with the unsafe [`OwnedFrame::from_raw_parts`] and can take a reference back without releasing it through `into_raw_parts`. Several producers exist (the Stack, switch-net's junction-backend send pool, junction's receive ring), so this crate names none of them and leaves storage release to the producer's function.
+//!
+//! See the switch book, chapter "switch-frame: packet-buffer handles".
 
 #![no_std]
 
@@ -258,6 +257,7 @@ mod tests {
     use std::boxed::Box;
     use std::cell::Cell;
 
+    // ANCHOR: producer
     #[repr(C)]
     struct Storage {
         refs: u16,
@@ -294,7 +294,9 @@ mod tests {
         // SAFETY: this is the pointer returned by Box::into_raw, released once.
         drop(unsafe { Box::from_raw(producer.storage.take().unwrap().as_ptr()) });
     }
+    // ANCHOR_END: producer
 
+    // ANCHOR: clones
     #[test]
     fn clones_share_bytes_and_release_only_after_last_drop() {
         let producer = Producer::default();
@@ -313,6 +315,7 @@ mod tests {
         assert_eq!(producer.releases.get(), 1);
         assert_eq!(producer.released_count.get(), 1);
     }
+    // ANCHOR_END: clones
 
     #[test]
     fn try_own_requires_the_sole_reference() {

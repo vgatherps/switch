@@ -1,5 +1,8 @@
 # dpdk-smoltcp
 
+See [Programming the Stack directly](../../../book/src/stack/index.md) in the switch book.
+Generate the API reference with `cargo doc -p dpdk-smoltcp --no-deps`.
+
 The switch stack: the vendored smoltcp (`vendor/smoltcp`) running on one DPDK port, IPv4 TCP and UDP over Ethernet, driven from one thread. Received data stays in DPDK mbufs.
 
 Most applications open it through `switch-open` rather than calling `Eal::init` and `Port::open` directly. The API guide is [docs/USAGE.md](../../docs/USAGE.md).

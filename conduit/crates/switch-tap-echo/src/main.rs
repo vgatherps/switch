@@ -1,5 +1,4 @@
-//! Switch echo server on a net_tap netdev, supervising one tester process.
-//! See `usage` for the fixed configuration and exit statuses.
+//! The binary is `switch-tap-echo [--listeners N] [--buffer BYTES] [--close-after BYTES] -- <tester> [args...]`. It serves echo on port 8080 until the tester exits, and exits 0 when the tester succeeded, 1 when it failed, 2 when packet buffers were still held at port close, 3 on an argument, setup, serve or teardown error, and 101 on a panic. It needs DPDK, `CAP_NET_ADMIN` and `/dev/net/tun`.
 
 use std::ffi::OsString;
 use std::process;

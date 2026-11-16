@@ -8,7 +8,7 @@ Types shared by the sequencer's polling thread (`ceph-fifo`) and its control thr
 - `Control`, control thread to polling thread: `Open { slot, uid }` and `Close { slot, uid }`.
 - `Retire`, polling thread to control thread: `Kicked { slot, uid }` (the polling thread dropped a stalled stream) and `Finished { slot, uid }` (the stream delivered its last record). In both cases the control thread closes the socket and frees the slot.
 
-Used by `ceph-fifo` and `ceph-control`. The two sides pass these over `std::sync::mpsc` channels.
+Used by `ceph-fifo`, `ceph-control`, `switch-junction`, and `switch-junctiond`. The control and polling threads pass these types over `std::sync::mpsc` channels.
 
 ## Test
 

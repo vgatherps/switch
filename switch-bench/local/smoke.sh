@@ -24,6 +24,7 @@ mkdir -p "$out"
 dut_addr=10.10.0.2
 kernel_addr=10.10.0.1
 
+# ANCHOR: node
 # switch node NAME with net_tap iface cdNAME on 10.NET.0.0/24: switch .2, the kernel side .1 (its gateway).
 node() { # name net
     cat >"$out/$1.json" <<EOF
@@ -39,12 +40,14 @@ ip address add 10.$2.0.1/24 dev cd$1
 ip link set cd$1 up
 EOF
 }
+# ANCHOR_END: node
 node dut 10
 i=0
 while [ $i -lt "$gens" ]; do
     node gen$i $((20 + i))
     i=$((i + 1))
 done
+# ANCHOR: gen
 gen_cpu=$((first + 2))
 cat >"$out/gen.sh" <<EOF
 #!/bin/sh
@@ -55,6 +58,7 @@ sh $out/up-gen\$1.sh &
 exec taskset -c \$(($gen_cpu + \$1)) $bench gen --config $out/gen\$1.json --proto \$2 --target \$3 \
     --senders \$4 --size \$5 --local-port 40000
 EOF
+# ANCHOR_END: gen
 
 dut=
 sink=

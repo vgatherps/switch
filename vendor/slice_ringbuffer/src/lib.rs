@@ -1,16 +1,39 @@
-//! Single-producer, single-consumer shared-memory RX record ring.
+//! Single-producer, single-consumer shared-memory record ring.
 //!
-//! One backing contains a header page followed by a power-of-two data region,
-//! mapped twice contiguously. The producer publishes monotonically increasing
-//! byte positions in `head`; the consumer publishes reclaimed positions in `tail`.
-//! Records have a 40-byte header and an eight-byte-aligned stride.
+//! This is junction's receive ring: the daemon writes each received TCP chunk or UDP datagram as one record, and the application's session reads it back as a `switch_frame::OwnedFrame` that points straight into shared memory. Each record carries a [`PacketMeta`] and a payload, and the data region is a mirrored mapping (`shared_memory::DoubleMapping`), so every payload is one contiguous slice. Applications see only `PacketMeta`, re-exported by `switch-junction`.
 //!
-//! Header/payload writes -> head Release -> reader head Acquire. After publication,
-//! each plain reference count is accessed only on the client thread; the writer
-//! never reads it. Frame release -> reclaim -> tail Release -> writer tail Acquire
-//! orders those accesses before reuse. Create on a fresh backing before opening
-//! it; each ring supports exactly one writer and one reader, ever. Concurrent
-//! initialization through other backing handles or processes is outside the contract.
+//! [`RingWriter::create`] lays the ring out on a fresh backing (length zero); the size must be a power of two, a multiple of the backing's page size, and at most 2 GiB, and the largest payload is `size - 40` bytes ([`RingWriter::max_payload`]). [`RingWriter::reserve`] returns a record to fill, or `None` when the ring is full; [`Reserved::commit`] publishes it, and dropping it uncommitted publishes nothing. [`RingReader::open`] claims the ring's only reader place, permanently: any later open fails with `AlreadyExists`. [`RingReader::next`] returns the next record and its frame.
+//!
+//! Dropping a frame does not return its space. [`RingReader::reclaim`] returns released records in order and stops at the first one still held, so one long-held frame keeps every later record from being reused. Frames may be dropped in any order and stay valid after the reader, writer and backings are dropped. `RingWriter` is `Send`; `RingReader` and its frames stay on the thread that opened the reader. The reader trusts the writer: corrupt cursors or lengths make `next` and `reclaim` panic.
+//!
+//! ```
+//! use shared_memory::{unique_name, Backing};
+//! use slice_ringbuffer::{PacketMeta, RingReader, RingWriter};
+//!
+//! let name = unique_name("/junction-ring-")?;
+//! let mut producer = Backing::create_shm(&name)?;
+//! let size = producer.page_size()?;
+//! let mut writer = RingWriter::create(&mut producer, size)?;
+//!
+//! // Normally the other process.
+//! let consumer = Backing::open_shm(&name)?;
+//! let mut reader = RingReader::open(&consumer)?;
+//!
+//! let meta = PacketMeta::new(0, 0, 0, [0; 4], 0, [0; 4], 0);
+//! let mut record = writer.reserve(5, meta).expect("ring has room");
+//! record.payload().copy_from_slice(b"hello");
+//! record.commit();
+//!
+//! let (_meta, frame) = reader.next().expect("one record");
+//! assert_eq!(&*frame, b"hello");
+//! drop(frame);
+//! reader.reclaim();
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! Memory ordering: header and payload writes, then head Release, then reader head Acquire. After publication, each plain reference count is accessed only on the reader's thread; the writer never reads it. Frame release, then reclaim, then tail Release, then writer tail Acquire orders those accesses before reuse. Concurrent initialization through other backing handles or processes is outside the contract.
+//!
+//! See the switch book, chapter "Shared memory and the receive ring".
 
 use switch_frame::OwnedFrame;
 use shared_memory::{Backing, DoubleMapping, Mapping};

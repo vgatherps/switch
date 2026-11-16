@@ -5,6 +5,7 @@ use dpdk_smoltcp::smoltcp::socket::tcp;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::Ipv4Address;
 
+// ANCHOR: setup
 fn setup() -> Result<(), Box<dyn std::error::Error>> {
     let config = switch_netconf::Config::load(Path::new("dut.json"))?;
     let server = Ipv4Address::new(192, 0, 2, 1);
@@ -31,6 +32,7 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
     // then the drive loop; keep `_eal` alive until the Port is closed
     Ok(())
 }
+// ANCHOR_END: setup
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup()

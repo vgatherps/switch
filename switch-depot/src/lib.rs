@@ -1,9 +1,22 @@
 //! # switch-depot
 //!
-//! [`DynDepot`]: slot numbers with no capacity. A bitmap of free slots (bit `s % 64` of word
-//! `s / 64` set = slot `s` free) and a summary above it (bit `w % 64` of word `w / 64` set =
-//! bitmap word `w` has a free slot). Both grow by a word when every slot is taken. `alloc` hands
-//! out the lowest free slot, so never-used slots go out in increasing order.
+//! A growable allocator of slot numbers, used inside `switch` to number the task slots of each task function's pool. Application code does not use it directly.
+//!
+//! [`DynDepot`] hands out `u32` slot numbers starting at 0, always the lowest free one, so slots that were never used go out in increasing order. It has no capacity: when every slot is taken, it grows by 64. `free` returns a slot for reuse. It keeps no handles or generations, so the caller must free each slot exactly once; a double free is caught only by a debug assertion. Internally, a bitmap of free slots and a summary bitmap above it find the lowest free slot quickly.
+//!
+//! ```rust
+//! use switch_depot::DynDepot;
+//!
+//! let mut depot = DynDepot::new();
+//! assert_eq!(depot.alloc(), 0);
+//! assert_eq!(depot.alloc(), 1);
+//! assert_eq!(depot.alloc(), 2);
+//! depot.free(1);
+//! assert_eq!(depot.alloc(), 1); // the lowest free slot comes back first
+//! assert_eq!(depot.alloc(), 3);
+//! ```
+//!
+//! Book: see the switch book, chapter "Panics, errors and shutdown", section "How task storage works".
 
 /// Slot numbers from 0, lowest free first, growing on demand; no handles or generations.
 #[derive(Debug, Default)]

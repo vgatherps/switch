@@ -1,5 +1,8 @@
 # switch
 
+See [The switch runtime](../book/src/runtime/index.md) in the switch book.
+Generate the API reference with `cargo doc -p switch --no-deps`.
+
 A caller-driven, single-threaded async runtime. Nothing blocks or reads a clock: the caller supplies a `u64` tick on every poll, in units it chooses.
 
 Depends on [`switch-depot`](../switch-depot/README.md) (`DynDepot` hands out task slots) and [`switch-macros`](../switch-macros/README.md) (the `#[switch::task]` attribute). `switch-net` depends on it. It needs no DPDK or Docker.

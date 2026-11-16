@@ -1,5 +1,4 @@
-//! Latency/load bench: an open-loop switch generator with a rate sweep and a switch echo server.
-//! See plans/bench/design.md and README.md.
+//! Benchmark library modules; see `src/main.rs` for the command.
 
 pub mod coord;
 pub mod hist;

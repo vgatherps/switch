@@ -1,6 +1,8 @@
 //! Record layout and the rseq critical section that writes a per-CPU ring.
 //!
-//! Absolute ring positions and their additions must never wrap.
+//! Internal to `ceph-ring`; use `ceph_ring::Writer` instead. A record is a [`HEADER_LEN`]-byte header followed by its payload, and a tag word written last by a single release store commits it. On Linux, [`push_record`] runs as a restartable sequence (rseq): if the kernel preempts the thread or moves it to another CPU mid-push, the call returns [`Push::Aborted`] and the caller retries on the new CPU's ring. Linux builds require glibc on x86_64 or aarch64. Absolute ring positions and their additions must never wrap.
+//!
+//! See the switch book, chapter "cephalopod: many writers, one reader".
 
 #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
 compile_error!("ceph-rseq requires the GNU libc environment");

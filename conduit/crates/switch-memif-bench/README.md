@@ -1,5 +1,7 @@
 # switch-memif-bench
 
+See [Stack-to-stack throughput](../../../book/src/measuring/memif.md) in the switch book.
+
 Throughput and latency benchmarks between two switch `Stack`s connected by a DPDK net_memif link, each in its own process with its own EAL and CPU.
 
 Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `switch-buffer` and `switch-dpdk-sys`. Nothing depends on it.

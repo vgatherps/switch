@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "device": {"vdev": "net_tap0,iface=cdnic0"},
+  "mac": null,
+  "ipv4": "192.0.2.2/24",
+  "gateway": null,
+  "mtu": 1500,
+  "paths": [],
+  "offloads": {"rx_checksum": false, "tx_tcp_checksum": false, "tx_udp_checksum": false},
+  "rx_timestamps": false,
+  "descriptors": 1024,
+  "eal": {"file_prefix": "switch-tap", "extra": ["--no-huge", "-m", "256", "--no-shconf"]}
+}

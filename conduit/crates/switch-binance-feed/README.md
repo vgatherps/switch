@@ -1,5 +1,8 @@
 # switch-binance-feed
 
+See [Walkthrough: a market-data feed](../../../book/src/protocols/binance-feed.md)
+in the switch book. Generate the API reference with `cargo doc -p switch-binance-feed --no-deps`.
+
 Client for Binance's bookTicker stream: TLS 1.3 and WebSocket on one switch TCP socket, run as a switch task on a switch-net `Net`. WebSocket and TLS are switch-ws's wss client (`switch_ws::switch_net::connect`) over switch-tls.
 
 Depends on `switch-ws` (feature `switch-net`), `switch-net`, `switch`, [`switch-tap-echo`](../switch-tap-echo/README.md) (its `driver`), rustls (ring provider) and webpki-roots. `switch-nic` depends on it for the `feed` subcommand.
