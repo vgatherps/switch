@@ -21,6 +21,9 @@ Junction uses the session's advertised frame capacity and maximum record size fo
 sizing; it never opens EAL or reads a NIC config. With `SWITCH_BENCH_XSTATS=1`, junction labels port
 xstats absent rather than reporting synthetic counters. Conduit's ENA allowance/reset counters do not
 establish whether junction was shaped or reset; that requires counters from junction's own run.
+UDP `serve` requests one junction session slot; TCP and WebSocket still request 320.
+WebSocket upgrade requests retain their frame and retry a full send ring between Net turns,
+within the existing 10-second connection deadline.
 
 ```sh
 taskset -c 2 switch-junctiond --config nic.json --dir /run/switch-junctiond --control-cpus 0
@@ -54,9 +57,9 @@ taskset -c 3 switch-bench serve --backend junction --junction-socket /run/switch
   still charged from its scheduled time; a step where any measured message waited is `budget_bound`.
 - `switch-bench gen`: one generator worker, a switch Stack on its own Port and core, driven over stdin/stdout by
   the coordinator. N senders send on a fixed schedule: message k is due at `t0 + k*interval/N`, regardless of
-  replies. UDP: N sockets. TCP: N connections carrying S-byte messages (S at most the MSS), the echoed byte
-  stream cut back into messages. ws: N ws:// connections (a bench-only client over the same TCP halves:
-  fixed-key upgrade, one masked binary frame per message, S at most 1400 B so it is one TCP segment; the echo
+  replies. UDP: N sockets. TCP: N connections carrying S-byte messages, the echoed byte
+  stream cut back into messages. S must be at least 24 B. ws: N ws:// connections (a bench-only client over the same TCP halves:
+  fixed-key upgrade, one masked binary frame per message, S at most 1400 B; the echo
   stream is cut into equal-size frames, and any other frame fails the worker). At most 32 tries
   per poll, then the loop turns the Net; a message that waits keeps its scheduled time. A full TCP connection
   (or one at its budget) blocks only its own sender: its messages are owed and go out in order later, and

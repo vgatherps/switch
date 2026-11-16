@@ -139,7 +139,7 @@ switch-bench gen [--backend conduit --config F | --backend junction --junction-s
 
 One generator worker. The coordinator starts it; you normally do not run it by hand. It opens its NIC (or connects to the daemon), binds or connects its N senders, reports ready, and then runs the steps it receives on standard input. UDP uses N sockets, TCP N connections, WebSocket N `ws://` connections. Sender i uses local port `--local-port` + i.
 
-`--size` is the message size in bytes and must be at least 24, the header. WebSocket messages may be at most 1400 bytes, so each fits in one TCP segment.
+`--size` is the message size in bytes and must be at least 24, the header. WebSocket messages may be at most 1400 bytes.
 
 ### sweep
 

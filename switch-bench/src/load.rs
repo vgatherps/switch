@@ -412,6 +412,24 @@ fn connect_all(
         .collect()
 }
 
+/// Keep the upgrade frame across ingress backpressure. The caller's connect loop turns the Net
+/// between yields and enforces the same deadline as connection establishment.
+async fn send_upgrade<F>(
+    mut frame: F,
+    mut send: impl FnMut(F) -> Result<(), (F, Error)>,
+) -> Result<(), Error> {
+    loop {
+        match send(frame) {
+            Ok(()) => return Ok(()),
+            Err((back, Error::Full)) => {
+                frame = back;
+                switch::yield_now().await;
+            }
+            Err((_, error)) => return Err(error),
+        }
+    }
+}
+
 /// Connection `i`'s receive task: waits for the connection (ws: upgrades it), hands its sending
 /// half to `connected`, then cuts the echoed byte stream into messages (ws: frames) and records
 /// them.
@@ -450,7 +468,7 @@ async fn tcp_receive(
         frame.as_mut()[..request.len()].copy_from_slice(request.as_bytes());
         frame.truncate(request.len());
         let frame = frame.freeze();
-        if let Err((_, e)) = tx.try_send(frame) {
+        if let Err(e) = send_upgrade(frame, |frame| tx.try_send(frame)).await {
             panic!("ws upgrade request {i}: {e:?}");
         }
         let mut head = Vec::new();
@@ -761,6 +779,49 @@ impl Stdin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ws_upgrade_retains_frame_and_yields_between_full_retries() {
+        let attempts = Rc::new(std::cell::Cell::new(0));
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let mut runtime = switch::Runtime::new(0);
+        let (tries, done) = (attempts.clone(), completed.clone());
+        runtime.spawner().spawn(switch::boxed(Box::pin(async move {
+            let frame = Box::new(*b"upgrade request");
+            let original = (&*frame) as *const _;
+            let result = send_upgrade(frame, |frame| {
+                assert_eq!((&*frame) as *const _, original);
+                assert_eq!(&*frame, b"upgrade request");
+                tries.set(tries.get() + 1);
+                if tries.get() <= 2 {
+                    Err((frame, Error::Full))
+                } else {
+                    Ok(())
+                }
+            }).await;
+            assert!(result.is_ok());
+            done.set(true);
+        }))).unwrap();
+        for round in 1..=3 {
+            runtime.poll(round).unwrap();
+            assert_eq!(attempts.get(), round);
+            assert_eq!(completed.get(), round == 3);
+        }
+    }
+
+    #[test]
+    fn ws_upgrade_propagates_non_full_errors_without_retrying() {
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let done = completed.clone();
+        let mut runtime = switch::Runtime::new(0);
+        runtime.spawner().spawn(switch::boxed(Box::pin(async move {
+            let result = send_upgrade((), |frame| Err((frame, Error::Closed))).await;
+            assert!(matches!(result, Err(Error::Closed)));
+            done.set(true);
+        }))).unwrap();
+        runtime.poll(0).unwrap();
+        assert!(completed.get());
+    }
 
     #[test]
     fn tcp_full_distinguishes_shared_transport_from_connection_backpressure() {

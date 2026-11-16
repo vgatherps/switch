@@ -30,7 +30,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         tx_capacity: TCP_BUFFER,
         mss_cap: None,
     };
-    let sockets = MAX_CONNS + ACCEPTS;
+    let sockets = socket_slots(args.proto);
     host::catch_stop()?;
     let mut host = Host::connect(&args.backend, sockets, |mtu| match args.proto {
         Proto::Udp => Sizing {
@@ -83,6 +83,13 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
     drop(handle);
     host.close()
+}
+
+fn socket_slots(proto: Proto) -> usize {
+    match proto {
+        Proto::Udp => 1,
+        Proto::Tcp | Proto::Ws => MAX_CONNS + ACCEPTS,
+    }
 }
 
 fn tcp_sizing(sockets: usize, tcp_config: &tcp::Config, mtu: usize) -> Sizing {
@@ -269,6 +276,18 @@ async fn ws_echo(mut ws: Ws) {
     }
 }
 // ANCHOR_END: ws_echo
+
+#[cfg(test)]
+mod sizing_tests {
+    use super::*;
+
+    #[test]
+    fn udp_requests_one_session_slot_without_changing_tcp_or_ws() {
+        assert_eq!(socket_slots(Proto::Udp), 1);
+        assert_eq!(socket_slots(Proto::Tcp), 320);
+        assert_eq!(socket_slots(Proto::Ws), 320);
+    }
+}
 
 #[cfg(all(test, feature = "e2e"))]
 mod tests {

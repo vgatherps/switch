@@ -7,7 +7,7 @@
 
 use crate::wire::HEADER;
 
-/// Largest bench ws message: client header (8 B) and payload in one TCP frame at the 1460 B MSS.
+/// Largest payload accepted by the bench WebSocket client.
 pub const MAX_SIZE: usize = 1400;
 /// The upgrade request's Sec-WebSocket-Key (any 16 bytes, base64).
 pub const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -21,7 +21,7 @@ pub fn check_size(size: usize) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "--size: ws messages are {HEADER}..={MAX_SIZE} B (one frame, one TCP segment)"
+            "--size: ws messages are {HEADER}..={MAX_SIZE} B"
         ))
     }
 }
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_must_fit_one_segment() {
+    fn sizes_must_be_within_checked_limits() {
         assert!(check_size(HEADER).is_ok() && check_size(MAX_SIZE).is_ok());
         assert!(check_size(HEADER - 1).is_err() && check_size(MAX_SIZE + 1).is_err());
     }

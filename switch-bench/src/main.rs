@@ -28,8 +28,8 @@ usage:
   switch-bench gen [--backend conduit --config F | --backend junction --junction-socket PATH]
                   --proto udp|tcp|ws --target IP:PORT --senders N --size S [--local-port 40000]
       One generator worker (default conduit); takes steps on stdin.
-      udp: N sockets; tcp: N connections, S-byte messages on each (S at most the MSS);
-      ws: N ws:// connections, S-byte binary messages (S at most 1400: one TCP frame).
+      udp: N sockets; tcp: N connections, S-byte messages on each; S must be at least 24.
+      ws: N ws:// connections, S-byte binary messages (24 <= S <= 1400).
   switch-bench serve [--backend conduit --config F | --backend junction --junction-socket PATH]
                     --proto udp|tcp|ws --port P
       Switch echo server; runs until SIGINT/SIGTERM.
