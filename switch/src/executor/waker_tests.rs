@@ -1,7 +1,6 @@
 use super::*;
-use crate::waker::this_thread_tag;
 use std::sync::{
-    Arc, Barrier,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -9,54 +8,67 @@ fn block_owner(task: *const TaskHeader) -> u16 {
     unsafe { Meta::owner(TaskHeader::meta(task)) }
 }
 
+/// Parks once; another thread clones, drops and wakes its waker.
 #[switch::task]
-fn foreign_ops(ptr: *mut Executor) -> impl Future<Output = ()> {
+fn woken_from_another_thread(ptr: *mut Executor, polls: Rc<Cell<usize>>) -> impl Future<Output = ()> {
     std::future::poll_fn(move |cx| {
-        let owner_tag = this_thread_tag();
-        let barrier = Barrier::new(4);
-        let waker = cx.waker();
-        std::thread::scope(|scope| {
-            let mut joins = Vec::new();
-            for operation in 0..4 {
-                let barrier = &barrier;
-                // Made on the owner thread; only its use crosses.
-                let owned = (operation >= 2).then(|| waker.clone());
-                joins.push(scope.spawn(move || {
-                    assert_ne!(this_thread_tag(), 0);
-                    assert_ne!(this_thread_tag(), owner_tag);
-                    barrier.wait();
-                    let rejected = catch_unwind(AssertUnwindSafe(move || match operation {
-                        0 => waker.wake_by_ref(),
-                        1 => drop(waker.clone()),
-                        2 => owned.unwrap().wake(),
-                        _ => drop(owned.unwrap()),
-                    }))
-                    .unwrap_err();
-                    assert_eq!(
-                        rejected.downcast_ref::<&str>().copied(),
-                        Some("waker used on foreign thread")
-                    );
-                }));
-            }
-            for join in joins {
-                join.join().unwrap();
-            }
-        });
-        unsafe {
-            assert!((*ptr).incoming.is_empty());
-            assert_eq!(((*ptr).task_count, (*ptr).allocated), (1, 1));
-            assert_eq!(TaskHeader::flags((*ptr).current).get() & !TAKEN, LIVE);
+        polls.set(polls.get() + 1);
+        if polls.get() > 1 {
+            return Poll::Ready(());
         }
-        Poll::Ready(())
+        let waker = cx.waker();
+        let owned = waker.clone();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    drop(waker.clone());
+                    drop(owned);
+                    waker.wake_by_ref();
+                })
+                .join()
+                .unwrap();
+        });
+        // The foreign wake waits in the mailbox: nothing queued here yet.
+        unsafe { assert!((*ptr).incoming.is_empty()) };
+        Poll::Pending
     })
 }
 
+/// Cloning and dropping a task waker on another thread does not panic, and a wake
+/// from there reaches the task at the runtime's next poll.
 #[test]
-fn foreign_wake_clone_and_drop_reject_without_scheduling() {
+fn a_task_waker_cloned_and_dropped_on_another_thread_does_not_panic() {
     let owner = Owner::new();
-    owner.spawn(foreign_ops(owner.0));
+    let polls = Rc::new(Cell::new(0));
+    owner.spawn(woken_from_another_thread(owner.0, polls.clone()));
     assert_eq!(owner.poll(), Ok(1));
+    assert_eq!(owner.poll(), Ok(1));
+    assert_eq!(polls.get(), 2);
     assert_eq!(owner.counts(), (0, 0));
+}
+
+/// A wake through a task `Waker` on another thread, while the task is parked,
+/// polls it once at the next poll.
+#[test]
+fn a_foreign_wake_through_a_task_waker_reaches_the_task() {
+    #[switch::task]
+    fn parks(slot: Rc<RefCell<Option<std::task::Waker>>>, polls: Rc<Cell<usize>>) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |cx| {
+            polls.set(polls.get() + 1);
+            *slot.borrow_mut() = Some(cx.waker().clone());
+            Poll::<()>::Pending
+        })
+    }
+    let owner = Owner::new();
+    let (slot, polls) = (Rc::new(RefCell::new(None)), Rc::new(Cell::new(0)));
+    owner.spawn(parks(slot.clone(), polls.clone()));
+    assert_eq!(owner.poll(), Ok(1));
+    assert_eq!(owner.poll(), Ok(0));
+    let waker = slot.borrow_mut().take().unwrap();
+    std::thread::spawn(move || waker.wake()).join().unwrap();
+    assert_eq!(owner.poll(), Ok(1));
+    assert_eq!(polls.get(), 2);
+    assert_eq!(owner.poll(), Ok(0));
 }
 
 #[test]
@@ -139,8 +151,8 @@ fn borrowed_waker_survives_scoped_join_during_poll_unwind() {
                 let observed = &observed;
                 scope.spawn(move || {
                     receive.recv().unwrap();
-                    assert!(catch_unwind(AssertUnwindSafe(|| waker.wake_by_ref())).is_err());
-                    assert!(catch_unwind(AssertUnwindSafe(|| waker.clone())).is_err());
+                    waker.wake_by_ref();
+                    drop(waker.clone());
                     observed.fetch_add(1, Ordering::SeqCst);
                 });
                 let _signal = SignalOnUnwind(send);

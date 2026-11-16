@@ -2,9 +2,11 @@
 // Cubic starts at 1 MiB; the peer advertises 502 << 7 = 64256 bytes.
 // All ten 1024-byte echoes leave before the first ACK. The four advancing
 // ACKs leave six segments (6144 bytes) in flight. They send no new data.
-// The third duplicate ACK triggers fast retransmit, before the 300 ms RTO.
-// The duplicate ACKs arrive 50 ms apart, so a premature retransmission
-// would fall outside the 4 ms tolerance. Received SACK blocks are ignored.
+// The third duplicate ACK triggers fast retransmit, before the RTO: the
+// handshake and the first ACK sample a near-zero RTT, so the RTO is its
+// 50 ms floor, restarted by the last advancing ACK. The duplicate ACKs
+// arrive 10 ms apart, so a premature retransmission would fall outside the
+// 4 ms tolerance. Received SACK blocks are ignored.
 // Cubic sets ssthresh to floor(6144 * 0.7) = 4300 bytes, then adds three
 // MSS during recovery. The full ACK deflates cwnd to 4300. Four more
 // 1024-byte echoes fit (4096 bytes). A fifth 1024-byte client segment
@@ -44,8 +46,8 @@
 +0    < . 10241:10241(0) ack 4097 win 502
 
 +0    < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:6145>
-+0.05 < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:7169>
-+0.05 < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:8193>
++0.01 < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:7169>
++0.01 < . 10241:10241(0) ack 4097 win 502 <nop,nop,sack 5121:8193>
 +0    > . 4097:5121(1024) ack 10241 win 32768
 
 +0    < . 10241:10241(0) ack 10241 win 502

@@ -14,7 +14,7 @@ use switch_junction::session::{Lost, OpenError, SendError, Session};
 use dpdk_smoltcp::smoltcp::wire::IpAddress;
 
 use crate::{Datagram, Error, ImmutableFrame, Interest, IpEndpoint, IpListenEndpoint, OwnedFrame,
-    RemoteConfig, StoredWaker, TcpFrame, Turn, UdpConfig, UdpSocketStats, tcp};
+    RemoteConfig, Sent, StoredWaker, TcpFrame, Turn, UdpConfig, UdpSocketStats, tcp};
 
 struct Entry {
     id: SocketId,
@@ -45,7 +45,7 @@ pub(super) struct Remote {
     by_slot: Vec<Option<u32>>,
     free: Vec<u32>,
     pool: Rc<FramePool>,
-    frame_waiters: Vec<StoredWaker>,
+    frame_waiters: VecDeque<StoredWaker>,
     lost: bool,
     full: bool,
     sent: usize,
@@ -61,7 +61,7 @@ impl Remote {
             by_slot: vec![None; slots],
             free: (0..slots as u32).rev().collect(),
             pool,
-            frame_waiters: Vec::with_capacity(slots),
+            frame_waiters: VecDeque::with_capacity(slots),
             lost: false,
             full: false,
             sent: 0,
@@ -163,7 +163,7 @@ impl Remote {
         self.session.poll_packets(|id, meta, frame| { route_packet(entries, by_slot, id, meta, frame); });
     }
 
-    pub fn turn(&mut self) -> Result<Turn, Lost> {
+    pub fn receive(&mut self) -> Result<Turn, Lost> {
         let mut events = 0;
         let mut packets = 0;
         let entries = RefCell::new(&mut self.entries);
@@ -215,12 +215,15 @@ impl Remote {
                 }
             }
         }
-        if !self.pool.free.borrow().is_empty() {
-            for waker in self.frame_waiters.drain(..) { waker.wake(); }
-        }
-        let sent = std::mem::take(&mut self.sent);
+        let free = self.pool.free.borrow().len().min(self.frame_waiters.len());
+        for waker in self.frame_waiters.drain(..free) { waker.wake(); }
         result.map(|()| Turn { rx_received: packets, rx_rejected: 0, rx_processed: events + packets,
-            rx_staged: 0, tx_accepted: sent, tx_pending: 0 })
+            rx_staged: 0, tx_accepted: 0, tx_pending: 0 })
+    }
+
+    pub fn send(&mut self) -> Result<Sent, Lost> {
+        if self.lost { return Err(Lost::Disconnected); }
+        Ok(Sent { tx_accepted: std::mem::take(&mut self.sent), tx_pending: 0 })
     }
 
     pub fn recv(&mut self, index: u32) -> Option<Result<TcpFrame, Error>> {
@@ -313,7 +316,7 @@ impl Remote {
     pub fn tx_frame(&mut self, cx: &Context<'_>) -> Poll<OwnedFrame> {
         if let Some(frame) = self.pool.take() { return Poll::Ready(frame); }
         let waker = StoredWaker::new(cx);
-        if !self.frame_waiters.contains(&waker) { self.frame_waiters.push(waker); }
+        if !self.frame_waiters.contains(&waker) { self.frame_waiters.push_back(waker); }
         Poll::Pending
     }
 }

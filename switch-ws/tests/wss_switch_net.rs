@@ -154,7 +154,7 @@ fn until_client_on<T: Send + 'static, H: 'static, F: Future<Output = H> + 'stati
     until_client_watching(tap, listener_setup, serve, client, |_| {})
 }
 
-/// `until_client_on`, calling `each_turn` with the Net after every turn (before the client is
+/// `until_client_on`, calling `each_turn` with the Net after every receive (before the client is
 /// polled in that round).
 fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
     tap: &TapConfig,
@@ -173,9 +173,10 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
             each_turn(net);
             rt.poll(clock.ns()).expect("poll the client");
+            net.send().expect("send");
             std::thread::sleep(ROUND_SLEEP);
         }
         let saw = peer.join();
@@ -232,6 +233,21 @@ fn set_rcvbuf(listener: &TcpListener, size: libc::c_int) {
         )
     };
     assert_eq!(rc, 0, "set SO_RCVBUF");
+}
+
+/// TCP_MAXSEG of `mss` on `listener`: accepted connections advertise it in their SYN-ACK.
+fn set_maxseg(listener: &TcpListener, mss: libc::c_int) {
+    // SAFETY: a valid socket and an int option of the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            (&mss as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(rc, 0, "set TCP_MAXSEG");
 }
 
 /// One masked client frame off `r`: the first byte (FIN and opcode) and the unmasked payload.
@@ -555,8 +571,9 @@ fn recv_after_close_waits_for_the_echo() {
 
 /// A server that stops reading: the client's one-byte messages fill its window and then the
 /// send buffer or frame slots, so `close` waits for room; that wait is dropped. The next recv
-/// still sends the queued close, after every message sent before it (the one dropped in its
-/// wait is not sent); the server echoes it and sees FIN.
+/// still sends the queued close, after every message sent before it; the server echoes it and
+/// sees FIN. The send dropped in its wait went out too if it was accepted: it had a frame (so
+/// was sealed) and only TCP's room was missing; dropped waiting for a frame, it was not.
 #[switch_test_support::pinned_test]
 fn close_dropped_while_waiting_for_room_is_sent_by_recv() {
     let (go_tx, go_rx) = mpsc::channel::<()>();
@@ -593,60 +610,13 @@ fn close_dropped_while_waiting_for_room_is_sent_by_recv() {
         },
     );
     assert!(sent.get() > 0);
-    assert_eq!(frames, sent.get(), "the server read a message count other than the sends that finished");
-    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "full")));
-}
-
-
-/// A server that stops reading until told: a 1 MiB send fills its window and the send buffer
-/// mid-message and is dropped there (the message was accepted whole when copied in). Then a
-/// `second`-kind send: the server reads the first message whole, then the second, apart. On
-/// the old send path the dropped message stayed open: a same-kind send continued it (one
-/// merged message) and the other kind panicked.
-fn dropped_multi_frame_send_then(second: Kind) {
-    let (go_tx, go_rx) = mpsc::channel::<()>();
-    let first = vec![7u8; 1 << 20];
-    let messages = ws_until_client(
-        |listener| set_rcvbuf(listener, 4096),
-        move |sock| {
-            go_rx.recv_timeout(LIMIT).expect("the client's go");
-            let mut ws = tungstenite::WebSocket::from_raw_socket(sock, tungstenite::protocol::Role::Server, None);
-            let mut messages = Vec::new();
-            loop {
-                match ws.read() {
-                    Ok(Message::Close(_)) => {}
-                    Ok(m) => messages.push(m),
-                    Err(WsError::ConnectionClosed) => return messages,
-                    Err(WsError::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => panic!("server read: {e}"),
-                }
-            }
-        },
-        move |mut ws| async move {
-            assert!(within_rounds(2000, ws.send(Kind::Binary, &[7; 1 << 20])).await.is_none(), "1 MiB found room");
-            go_tx.send(()).unwrap();
-            ws.send(second, b"second").await.expect("second send");
-            ws.close(1000, "").await.expect("close");
-            assert!(ws.recv().await.expect("recv after close").is_none());
-            ws
-        },
+    // each message's payload is its index (checked as read), so none was lost or doubled
+    assert!(
+        frames == sent.get() || frames == sent.get() + 1,
+        "the server read {frames} messages, not the {} sends that finished (plus one if the dropped one was accepted)",
+        sent.get()
     );
-    let second = match second {
-        Kind::Binary => Message::Binary(b"second".to_vec().into()),
-        Kind::Text => Message::Text("second".into()),
-    };
-    assert_eq!(messages.len(), 2, "the server read {} messages", messages.len());
-    assert_eq!(messages, [Message::Binary(first.into()), second]);
-}
-
-#[switch_test_support::pinned_test]
-fn dropped_multi_frame_send_then_a_same_kind_send_is_two_messages() {
-    dropped_multi_frame_send_then(Kind::Binary);
-}
-
-#[switch_test_support::pinned_test]
-fn dropped_multi_frame_send_then_an_other_kind_send_is_two_messages() {
-    dropped_multi_frame_send_then(Kind::Text);
+    assert_eq!(close, (0x80 | CLOSE, close_payload(1000, "full")));
 }
 
 /// A server that reads nothing until told, then reads messages (answering a Binary with Text
@@ -1046,6 +1016,47 @@ fn largest_control_frames_fit_a_131_byte_send_buffer() {
     assert_eq!(close, (0x80 | CLOSE, want_close));
 }
 
+/// The peer advertises an MSS of 88 B, below the largest control frame (131 B, 207 B with its
+/// TLS record): ws:// and wss:// still connect, a message of many segments echoes, and the
+/// close handshake completes. Frames are as large as the largest control frame; TCP cuts them.
+#[switch_test_support::pinned_test]
+fn ws_and_wss_setup_succeed_with_a_small_peer_mss() {
+    let sent: Vec<u8> = (0..3000).map(|i| (i * 31 % 251) as u8).collect();
+    for tls in [false, true] {
+        let sent = sent.clone();
+        let echoed = run(
+            |listener| set_maxseg(listener, 88),
+            move |stream, config| {
+                if tls {
+                    echo(upgrade(StreamOwned::new(ServerConnection::new(config).unwrap(), stream)))
+                } else {
+                    echo(tungstenite::accept(stream).expect("server WebSocket handshake"))
+                }
+            },
+            move |handle, stream, config| async move {
+                if tls {
+                    let mut wss = connect(&handle, stream, config, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("wss connect");
+                    wss.send(Kind::Binary, &sent).await.expect("send");
+                    let m = wss.recv().await.expect("recv").expect("the echo");
+                    assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &sent[..]));
+                    close(&mut wss).await;
+                    (Some(wss), None)
+                } else {
+                    let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
+                    ws.send(Kind::Binary, &sent).await.expect("send");
+                    let m = ws.recv().await.expect("recv").expect("the echo");
+                    assert_eq!((m.kind(), m.bytes()), (Kind::Binary, &sent[..]));
+                    ws.close(1000, "").await.expect("send close");
+                    assert!(ws.recv().await.expect("recv after close").is_none(), "data after close");
+                    (None, Some(ws))
+                }
+            },
+            || {},
+        );
+        assert_eq!(echoed, 1, "tls {tls}");
+    }
+}
+
 /// Every frame of the Net taken, so a frame wait cannot end by a frame returning.
 async fn take_every_frame(handle: &NetHandle) -> Vec<switch_net::OwnedFrame> {
     let mut held = Vec::new();
@@ -1212,36 +1223,42 @@ fn a_large_send_waits_for_frames_then_completes() {
     assert_eq!(read, [Message::Binary(vec![5; LEN].into())]);
 }
 
-/// The peer resets the connection; once the client saw it (its receive half reports the
-/// reset), a free frame is not handed to the dead socket: the setup probe is `Dead`, and an
-/// alloc on a sender set up before is refused (before the fix, the frame wait was polled
-/// first and won).
+/// The peer resets the connection while every frame of the pool is held: once the client saw
+/// the reset (its receive half reports it), an alloc on a sender set up before ends with
+/// `InvalidState` at once instead of waiting for a frame that a dead socket can never use.
 #[switch_test_support::pinned_test]
-fn a_reset_socket_gets_no_frame_though_one_is_free() {
+fn alloc_on_a_reset_socket_with_an_empty_pool_returns_invalid_state() {
     use switch_tls::FrameTx;
+    use switch_tls::switch_net::SwitchTx;
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let (mut rx, tcp) = stream.split();
+        let mut tx = SwitchTx::new(&handle, tcp, 1).await.expect("setup");
+        let held = take_every_frame(&handle).await;
+        go_tx.send(()).unwrap();
+        let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+        assert!(seen.is_err(), "data instead of the reset");
+        let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
+        assert!(matches!(got, Err(switch_net::Error::InvalidState)), "{:?}", got.map(drop));
+        drop(held);
+    });
+}
+
+/// The peer resets the connection; once the client saw it (its receive half reports the reset),
+/// setting up a sender on the dead socket is `Dead` although a frame is free: the probe frame is
+/// taken, then the delivered check detects the closed connection despite its cached MSS.
+#[switch_test_support::pinned_test]
+fn setup_on_a_reset_socket_with_a_free_frame_is_dead() {
     use switch_tls::switch_net::{SetupError, SwitchTx};
-    for probe in [true, false] {
-        let (go_tx, go_rx) = mpsc::channel();
-        until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
-            let (mut rx, tcp) = stream.split();
-            let mut early = None;
-            let mut late = Some(tcp);
-            if !probe {
-                early = Some(SwitchTx::new(&handle, late.take().unwrap(), 1).await.expect("setup"));
-            }
-            go_tx.send(()).unwrap();
-            let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
-            assert!(seen.is_err(), "data instead of the reset");
-            if let Some(tcp) = late {
-                let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the probe waited");
-                assert!(matches!(got, Err(SetupError::Dead)), "probe: {:?}", got.map(drop));
-            }
-            if let Some(mut tx) = early {
-                let got = within_rounds(1, tx.alloc()).await.expect("alloc waited");
-                assert!(got.is_err(), "a frame for a reset socket");
-            }
-        });
-    }
+    let (go_tx, go_rx) = mpsc::channel();
+    until_client(|_| {}, reset_when_told(go_rx), move |handle, stream| async move {
+        let (mut rx, tcp) = stream.split();
+        go_tx.send(()).unwrap();
+        let seen = within_rounds(20_000, rx.recv()).await.expect("the reset never arrived");
+        assert!(seen.is_err(), "data instead of the reset");
+        let got = within_rounds(1, SwitchTx::new(&handle, tcp, 1)).await.expect("the setup waited");
+        assert!(matches!(got, Err(SetupError::Dead)), "{:?}", got.map(drop));
+    });
 }
 
 /// `tls_connect`'s plaintext minimum: 0 counts as one byte (a record's floor), so a 76 B send
@@ -1261,6 +1278,25 @@ fn tls_minimum_zero_or_overflowing_is_refused_before_any_byte() {
             );
         });
     }
+}
+
+/// The smallest send buffer `tls_connect` accepts, 77 B (one byte of plaintext per record): the
+/// handshake completes and `close` sends close_notify and FIN, which the server reads as a clean
+/// end.
+#[switch_test_support::pinned_test]
+fn tls_close_works_with_the_smallest_send_buffer() {
+    use switch_tls::switch_net::tls_connect;
+    let (server_tls, client_tls) = tls_configs();
+    until_client_on(
+        &tap_with_send_buffer(77),
+        |_| {},
+        move |sock| assert_close_notify_then_fin(StreamOwned::new(ServerConnection::new(server_tls).unwrap(), sock)),
+        move |handle, stream| async move {
+            let mut tls = tls_connect(&handle, stream, client_tls, HOST, 1).await.expect("handshake");
+            tls.close().await.expect("close");
+            tls
+        },
+    );
 }
 
 /// The TLS configs with the client's `max_fragment_size` set.
@@ -1388,10 +1424,9 @@ fn peer_fin_then_reset_without_a_close_is_dead() {
     }
 }
 
-/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB (within the
-/// default `max_frame`), followed by one byte, fails the connection with `MessageTooBig`
-/// (close code 1009) at the header, and FIN goes out. (Before, the limit could not be set:
-/// every connection took 64 MiB messages.)
+/// A ws:// client whose `max_message` is 1 MiB: a frame header advertising 16 MiB, followed by
+/// one byte, fails the connection with `MessageTooBig` at the header, and FIN goes out with no
+/// close frame.
 #[switch_test_support::pinned_test]
 fn a_message_over_the_configured_limit_fails_at_its_header() {
     let limits = Limits { max_message: 1 << 20, ..Limits::default() };
@@ -1410,8 +1445,10 @@ fn a_message_over_the_configured_limit_fails_at_its_header() {
         move |handle, stream| async move {
             let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, limits).await.expect("ws connect");
             let got = ws.recv().await.map(|m| m.is_some());
-            let Err(WssError::Failed(switch_ws::switch_net::Failure::Protocol(e))) = got else { panic!("{got:?}") };
-            assert_eq!((e, e.close_code()), (switch_ws::ProtocolError::MessageTooBig, 1009));
+            assert!(
+                matches!(got, Err(WssError::Failed(switch_ws::switch_net::Failure::Protocol(switch_ws::ProtocolError::MessageTooBig)))),
+                "{got:?}"
+            );
             ws
         },
     );

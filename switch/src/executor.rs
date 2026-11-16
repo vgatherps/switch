@@ -21,9 +21,6 @@ use crate::task::header::{DEFERRED, DROP_STARTED, LIVE, QUEUED, TAKEN};
 use crate::task::pool::RuntimePool;
 use crate::timer_registration::TimerStore;
 
-/// Initial ready-queue reservation.
-pub const DEFAULT_CAPACITY: usize = 64;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lifecycle {
     Open,
@@ -35,27 +32,6 @@ pub(crate) enum Lifecycle {
 #[cold]
 #[inline]
 fn unlikely() {}
-
-/// Append to a wake queue whose room is reserved (see `allocated`); never reallocates.
-/// A full queue means that reservation broke: it panics, out of line.
-#[inline]
-fn append_reserved(queue: &mut Vec<*const TaskHeader>, header: *const TaskHeader) {
-    let len = queue.len();
-    if len == queue.capacity() {
-        wake_queue_full();
-    }
-    // SAFETY: `len < capacity`, checked above.
-    unsafe {
-        queue.as_mut_ptr().add(len).write(header);
-        queue.set_len(len + 1);
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn wake_queue_full() -> ! {
-    panic!("wake queue full: a queued task was not counted in `allocated`")
-}
 
 /// `Runtime::poll` starts another round only while fewer task polls than this
 /// were made. The check runs between rounds and a started round always
@@ -82,14 +58,6 @@ pub struct Executor {
     deferred: Vec<*const TaskHeader>,
     /// Number of live tasks.
     task_count: usize,
-    /// Slots in use, including a finished task's slot until its queue entry
-    /// drains. `reserve` grows all three queues to at least this capacity before
-    /// counting a slot; capacities never shrink (rounds only trade buffers
-    /// between the queues). Each entry in `incoming`, `deferred` and
-    /// `run_queue[cursor..]` belongs to a distinct QUEUED slot, and a QUEUED slot
-    /// is not reclaimed until its entry drains, so `incoming.len() +
-    /// deferred.len() + run_queue.len() - cursor <= allocated`.
-    allocated: usize,
     /// One pool per task function this executor has spawned.
     pools: Vec<*mut RuntimePool>,
     /// Spawns between slot reservation and commit (user factory code runs between).
@@ -107,21 +75,20 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub(crate) fn with_capacity(initial_tick: u64, tasks: usize, timers: usize) -> Self {
+    pub(crate) fn new(initial_tick: u64) -> Self {
         Self {
-            run_queue: Vec::with_capacity(tasks),
+            run_queue: Vec::new(),
             cursor: 0,
-            incoming: Vec::with_capacity(tasks),
-            deferred: Vec::with_capacity(tasks),
+            incoming: Vec::new(),
+            deferred: Vec::new(),
             task_count: 0,
-            allocated: 0,
             pools: Vec::new(),
             spawning: 0,
             active: false,
             lifecycle: Lifecycle::Open,
             current: std::ptr::null(),
             turn_requested: false,
-            timers: TimerStore::new(initial_tick, timers),
+            timers: TimerStore::new(initial_tick),
             mailbox: Mailbox::create(),
         }
     }
@@ -162,26 +129,13 @@ impl Executor {
         }
     }
 
-    /// Reserve queue capacity and a slot for one spawn. The slot stays free of
-    /// LIVE until [`Reservation::commit`], so stale wakes of it do nothing.
+    /// Reserve a slot for one spawn. The slot stays free of LIVE until
+    /// [`Reservation::commit`], so stale wakes of it do nothing.
     ///
     /// # Safety
     /// Owner thread; open executor; `spec` is the shape of `key`'s future type.
     pub(crate) unsafe fn reserve(this: *mut Self, key: TypeId, spec: &BlockSpec) -> Reservation {
         unsafe {
-            let needed = (*this)
-                .allocated
-                .checked_add(1)
-                .expect("task count overflow");
-            for queue in [
-                &mut (*this).run_queue,
-                &mut (*this).incoming,
-                &mut (*this).deferred,
-            ] {
-                if queue.capacity() < needed {
-                    queue.reserve(needed - queue.len());
-                }
-            }
             let pool = match (*this)
                 .pools
                 .iter()
@@ -196,7 +150,6 @@ impl Executor {
                 }
             };
             let header = RuntimePool::reserve(pool, spec);
-            (*this).allocated = needed;
             (*this).spawning += 1;
             Reservation {
                 executor: this,
@@ -228,10 +181,7 @@ impl Executor {
             // never polled again and are freed with it.
             let this = Meta::executor(TaskHeader::meta(header));
             flags.set(current | QUEUED);
-            // The slot is LIVE without QUEUED, so it is counted in `allocated`
-            // and has no entry: `incoming.len() < allocated <=
-            // incoming.capacity()` (see `allocated`).
-            append_reserved(&mut (*this).incoming, header);
+            (*this).incoming.push(header);
         }
     }
 
@@ -255,8 +205,7 @@ impl Executor {
             deferred.remove(position);
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() & !DEFERRED);
-            // The entry moved: queue lengths sum to at most `allocated`.
-            append_reserved(&mut (*this).incoming, header);
+            (*this).incoming.push(header);
         }
     }
 
@@ -276,8 +225,7 @@ impl Executor {
             // Alive, and any lifecycle takes the wake, as in `wake`.
             let this = Meta::executor(TaskHeader::meta(header));
             flags.set(current | QUEUED | DEFERRED);
-            // As in `wake`, `deferred.len() < allocated <= deferred.capacity()`.
-            append_reserved(&mut (*this).deferred, header);
+            (*this).deferred.push(header);
         }
     }
 
@@ -291,7 +239,6 @@ impl Executor {
         unsafe {
             if !(*this).deferred.is_empty() {
                 // DEFERRED stays set until the task's round clears it with QUEUED.
-                // Every slot has at most one queue entry: no reallocation.
                 (*this).incoming.append(&mut (*this).deferred);
             }
         }
@@ -357,14 +304,14 @@ impl Executor {
             while cursor < batch_len {
                 let index = cursor;
                 cursor += 1;
-                // Spawn may reserve this Vec, but cannot change this batch's length.
-                // Reload its buffer each iteration; no buffer pointer spans user code.
+                // Wakes and spawns go to `incoming`, never to this Vec; still, no
+                // buffer pointer spans user code.
                 let header = *(*this).run_queue.as_ptr().add(index);
                 let flags = TaskHeader::flags(header);
                 let current = flags.get() & !(QUEUED | DEFERRED);
                 flags.set(current);
                 if current & LIVE == 0 {
-                    Self::reclaim(this, header);
+                    RuntimePool::release(header);
                     continue;
                 }
                 polled += 1;
@@ -394,10 +341,7 @@ impl Executor {
         unsafe {
             Self::terminal(this, header);
             // A self-wake during the final poll keeps the slot until its entry drains.
-            let _slot = SlotGuard {
-                owner: this,
-                header,
-            };
+            let _slot = SlotGuard { header };
             let flags = TaskHeader::flags(header);
             flags.set(flags.get() | DROP_STARTED);
             Meta::drop_fn(TaskHeader::meta(header))(header);
@@ -413,13 +357,6 @@ impl Executor {
                 flags.set(current & !LIVE);
                 (*this).task_count -= 1;
             }
-        }
-    }
-
-    unsafe fn reclaim(this: *mut Self, header: *const TaskHeader) {
-        unsafe {
-            (*this).allocated -= 1;
-            RuntimePool::release(header);
         }
     }
 
@@ -453,10 +390,7 @@ impl Executor {
                 if current & TAKEN == 0 {
                     continue;
                 }
-                let _slot = SlotGuard {
-                    owner: this,
-                    header,
-                };
+                let _slot = SlotGuard { header };
                 if current & DROP_STARTED == 0 {
                     flags.set(current | DROP_STARTED);
                     Meta::drop_fn(TaskHeader::meta(header))(header);
@@ -559,8 +493,7 @@ impl Reservation {
             let executor = this.executor;
             (*executor).spawning -= 1;
             (*executor).task_count += 1;
-            // The reservation counted this slot in `allocated` (see `reserve`).
-            append_reserved(&mut (*executor).incoming, this.header);
+            (*executor).incoming.push(this.header);
         }
     }
 }
@@ -569,7 +502,7 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         unsafe {
             (*self.executor).spawning -= 1;
-            Executor::reclaim(self.executor, self.header);
+            RuntimePool::release(self.header);
         }
     }
 }
@@ -577,7 +510,6 @@ impl Drop for Reservation {
 /// Frees a slot after its future's drop (or unwind), unless a queue entry still
 /// refers to it; that entry reclaims it when drained.
 struct SlotGuard {
-    owner: *mut Executor,
     header: *const TaskHeader,
 }
 
@@ -585,7 +517,7 @@ impl Drop for SlotGuard {
     fn drop(&mut self) {
         unsafe {
             if TaskHeader::flags(self.header).get() & QUEUED == 0 {
-                Executor::reclaim(self.owner, self.header);
+                RuntimePool::release(self.header);
             }
         }
     }

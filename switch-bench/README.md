@@ -38,13 +38,25 @@ taskset -c 3 switch-bench serve --backend junction --junction-socket /run/switch
   and senders split evenly. Worker g starts each step g / rate s after the common start, so the workers'
   schedules interleave instead of sending in phase. Results are merged (counts summed, histograms merged:
   percentiles are never averaged). Prints one `step` JSON line per rate (`offered_pps`, `sent_pps` /
-  `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`).
+  `received_pps`, `drop_fraction`, `latency_ns` p50/p99/p99.9/max, `budget_bound`, `generator_bound`,
+  `service_rtt_ns` (echo time - actual send time) and `send_lag_ns` (actual - scheduled send time of
+  fresh sends) with the same quantiles, `sent` / `echoed` (messages sent, and of those echoed by the end
+  of the drain, over the whole step, warmup included), `gen_tx_packets` / `gen_rx_packets` (packets the
+  generators' own NICs sent and received over the same span: read when a worker gets the step command and
+  after its drain, never inside the window, because on ENA each read is an admin command that sleeps at
+  least 100 µs; each worker owns its port and the counts are summed; generator-side, not the receiver's),
+  and `workers`: per worker `behind_schedule`, `backlog_at_end`, `stops`, and `last_send_ns` /
+  `last_echo_ns` after its step start). The report shows `gen_tx_packets / sent` and
+  `gen_rx_packets / echoed`. Junction has no generator-local port counters: these JSON fields are
+  `null`, and the report renders their ratios as `-`, never using conduit counters for junction.
   `sent_pps` counts messages accepted by the generator stack, not NIC transmissions; `received_pps` counts
   echoes arriving within the window, including warmup echoes. Always prints one
-  `summary` line (`steps`, `complete`, `generator_bound`, `error`). No knee is computed: the table
-  and plot show it. A step where any sender fell behind (a backlog at the end of its send window, or
-  send-lag p99 over 20 µs) is `generator_bound`. The sweep stops and exits non-zero: this flag does not
-  identify the cause, and receiver backpressure can also delay sends. Exit 0 iff `complete` and not
+  `summary` line (`steps`, `complete`, `generator_bound`, `behind_workers`, `error`). No knee is computed:
+  the table and plot show it. A worker is `behind_schedule` when its fresh-send lag p99 is over 20 µs; fresh
+  sends exclude messages a full connection (or one at its budget) owed and messages already due when a
+  pool stop ended a poll, so receiver backpressure and pool stops show in `stops` / `backlog_at_end` and
+  never end the sweep. A step with any worker behind schedule is `generator_bound`: the sweep stops, names
+  the workers and exits non-zero. Exit 0 iff `complete` and not
   `generator_bound`. When a worker fails, the steps already printed stand and the
   summary says `complete: false`. A worker that does not answer within the step's time plus 10 s fails the
   sweep, and every worker's process group is killed. A shutdown failure also kills all workers still awaiting
@@ -66,8 +78,9 @@ taskset -c 3 switch-bench serve --backend junction --junction-socket /run/switch
   their wait is the receiver's doing, not send lag. Latency = receive time - scheduled time (no coordinated
   omission); not echoed = measured messages not echoed by the end of the drain. Sending stops at the end of the
   window: what is still owed or behind is never sent, so a step past the knee ends on time.
-- `switch-bench serve`: the switch echo receiver (UDP, or TCP/ws with 64 pre-armed accepts; ws through
-  switch-ws's `accept_ws` and `Ws`). Its loop makes no syscall while serving; it runs until SIGINT/SIGTERM.
+- `switch-bench serve`: the switch echo receiver (UDP, or TCP/ws with 64 persistent accept tasks; ws through
+  switch-ws's `accept_ws` and `Ws`). Accepts retry after socket exhaustion so listening resumes as slots free.
+  Its loop makes no syscall while serving; it runs until SIGINT/SIGTERM.
 - `switch-bench kernel-serve --proto udp|tcp|ws --bind IP --port P`: Linux-only kernel-socket echo
   receiver. The generator remains switch; TCP uses the same fixed-size byte stream and WS is plain
   `ws://`, not TLS.

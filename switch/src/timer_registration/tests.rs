@@ -12,7 +12,7 @@ impl Fixture {
         let block = TestBlock::new();
         let tasks = (0..3).map(|position| block.task(position)).collect();
         Self {
-            store: TimerStore::new(0, 0),
+            store: TimerStore::new(0),
             tasks,
             _block: block,
         }
@@ -28,6 +28,12 @@ impl Fixture {
     }
     fn cancel(&mut self, token: Token) -> bool {
         self.store.cancel(token)
+    }
+    /// The tasks `wake_expired` hands over, in its order.
+    fn expired(&mut self) -> Vec<*const TaskHeader> {
+        let mut woken = Vec::new();
+        self.store.wake_expired(|task| woken.push(task));
+        woken
     }
 }
 
@@ -64,8 +70,7 @@ fn refresh_moves_the_woken_task_and_keeps_the_deadline() {
     assert!(f.refresh(token, 1));
     assert_eq!(f.store.entries[token.index as usize].deadline, 10);
     f.store.advance_to(10);
-    assert_eq!(f.store.pop_expired(), Some(f.task(1)));
-    assert_eq!(f.store.pop_expired(), None);
+    assert_eq!(f.expired(), [f.task(1)]);
     assert!(f.cancel(token));
     assert!(!f.refresh(token, 2));
 }
@@ -76,9 +81,7 @@ fn expired_stays_valid_until_cancel() {
     let a = f.register(0, 10);
     let b = f.register(0, 10);
     f.store.advance_to(10);
-    assert_eq!(f.store.pop_expired(), Some(f.task(0)));
-    assert_eq!(f.store.pop_expired(), Some(f.task(0)));
-    assert_eq!(f.store.pop_expired(), None);
+    assert_eq!(f.expired(), [f.task(0), f.task(0)]);
     for t in [a, b] {
         assert_eq!(f.store.entries[t.index as usize].state, State::Expired);
     }
@@ -100,7 +103,7 @@ fn staged_handoff_blocks_reuse_before_any_mutation() {
     assert!(catch_unwind(AssertUnwindSafe(|| f.register(1, 20))).is_err());
     assert!(catch_unwind(AssertUnwindSafe(|| f.refresh(token, 1))).is_err());
     assert_eq!(f.store.entries.len(), entry_len);
-    assert_eq!(f.store.pop_expired(), Some(f.task(0)));
+    assert_eq!(f.expired(), [f.task(0)]);
     assert!(f.cancel(token));
 }
 
@@ -112,12 +115,11 @@ fn full_range_and_equal_time_preserve_identity() {
     f.store.advance_to(0);
     assert!(f.store.expired.is_empty());
     f.store.advance_to(1);
-    assert_eq!(f.store.pop_expired(), Some(f.task(0)));
+    assert_eq!(f.expired(), [f.task(0)]);
     assert!(f.store.valid(first));
     assert!(f.store.valid(last));
     f.store.advance_to(u64::MAX);
-    assert_eq!(f.store.pop_expired(), Some(f.task(1)));
-    assert_eq!(f.store.pop_expired(), None);
+    assert_eq!(f.expired(), [f.task(1)]);
     f.store.advance_to(u64::MAX);
     assert!(f.store.expired.is_empty());
 }

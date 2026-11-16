@@ -278,21 +278,38 @@ mod tests {
     #[test]
     fn table_summarizes_runs() {
         assert_eq!(valid(300).status(), "valid");
-        assert!(valid(300).json("pingpong-m64", 0).starts_with(r#"{"config":"pingpong-m64","rep":0,"status":"valid","exit_ok":true,"client":{"side":"client""#));
-        assert_eq!(
-            table("pingpong-m64", &[pair(300), pair(100), pair(200)]),
-            "pingpong-m64: 3 runs\n\
-             \x20 metric                               min       median          max\n\
-             \x20 ns/round trip                        100          200          300\n\
-             \x20 rtt p50 ns                         5.000        5.000        5.000\n\
-             \x20 rtt p99 ns                         6.000        6.000        6.000\n\
-             \x20 rtt max ns                         7.000        7.000        7.000\n\
-             \x20 turns/round trip                   4.000        4.000        4.000\n\
-             \x20 ns/frame                           2.500        2.500        2.500\n\
-             \x20 frames/s                       400000000    400000000    400000000\n\
-             \x20 client idle turns                  0.250        0.250        0.250\n\
-             \x20 peer idle turns (whole run)        0.500        0.500        0.500\n"
-        );
+        let json = valid(300).json("pingpong-m64", 0);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["config"], "pingpong-m64");
+        assert_eq!(value["rep"], 0);
+        assert_eq!(value["status"], "valid");
+        assert_eq!(value["exit_ok"], true);
+        assert_eq!(value["client"]["side"], "client");
+        let table = table("pingpong-m64", &[pair(300), pair(100), pair(200)]);
+        let rows: std::collections::BTreeMap<String, Vec<f64>> = table
+            .lines()
+            .filter_map(|row| {
+                let words: Vec<&str> = row.split_whitespace().collect();
+                let (name, cells) = words.split_at(words.len().checked_sub(3)?);
+                let cells = cells.iter().map(|c| c.parse().ok()).collect::<Option<_>>()?;
+                Some((name.join(" "), cells))
+            })
+            .collect();
+        let expected: std::collections::BTreeMap<String, Vec<f64>> = [
+            ("ns/round trip", [100.0, 200.0, 300.0]),
+            ("rtt p50 ns", [5.0; 3]),
+            ("rtt p99 ns", [6.0; 3]),
+            ("rtt max ns", [7.0; 3]),
+            ("turns/round trip", [4.0; 3]),
+            ("ns/frame", [2.5; 3]),
+            ("frames/s", [4e8; 3]),
+            ("client idle turns", [0.25; 3]),
+            ("peer idle turns (whole run)", [0.5; 3]),
+        ]
+        .into_iter()
+        .map(|(name, cells)| (name.to_owned(), cells.to_vec()))
+        .collect();
+        assert_eq!(rows, expected, "{table}");
     }
 
     #[test]

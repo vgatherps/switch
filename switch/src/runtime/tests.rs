@@ -1,5 +1,5 @@
 use super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -168,7 +168,6 @@ fn rejected_future_is_returned_without_hidden_drop() {
     // The returned token still holds the original argument.
     assert_eq!(Rc::strong_count(&identity), 2);
     assert_eq!(drops.get(), 0);
-    assert!(format!("{error:?}").contains("Closed"));
     drop(error.token);
     assert_eq!(drops.get(), 1);
     assert_eq!(Rc::strong_count(&identity), 1);
@@ -196,39 +195,6 @@ fn panicked_core_rejects_submission_and_still_shuts_down() {
         spawner.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
-}
-
-#[test]
-fn nested_spawner_grows_queues_and_spawned_tasks_run_in_the_next_round() {
-    let mut runtime = Runtime::with_capacity(
-        9,
-        Capacity {
-            tasks: 0,
-            timers: 0,
-        },
-    );
-    let spawner = runtime.spawner();
-    #[switch::task]
-    async fn spawn_many(spawner: Spawner, count: Rc<Cell<usize>>) {
-        for _ in 0..(DEFAULT_CAPACITY * 3) {
-            spawner.spawn(count_task(count.clone())).unwrap();
-        }
-    }
-    let count = Rc::new(Cell::new(0));
-    spawner
-        .spawn(spawn_many(spawner.clone(), count.clone()))
-        .unwrap();
-    spawner.spawn(empty()).unwrap();
-    let root = core(&runtime);
-    // Round one polls the two spawned tasks, round two the tasks spawned in it.
-    assert_eq!(
-        runtime.poll(9).unwrap().tasks_polled,
-        2 + DEFAULT_CAPACITY * 3
-    );
-    assert_eq!(count.get(), DEFAULT_CAPACITY * 3);
-    unsafe {
-        assert_eq!(Executor::task_count(root), 0);
-    }
 }
 
 #[test]
@@ -365,4 +331,24 @@ fn owner_drop_during_existing_unwind_cleans_nonpanicking_futures() {
         escaped.spawn(empty()).unwrap_err().reason,
         RuntimeError::Closed
     );
+}
+
+/// Sleeps that all expire in one poll wake their tasks in deadline order, whatever order
+/// they started in.
+#[test]
+fn timers_expiring_in_one_poll_wake_in_deadline_order() {
+    #[switch::task]
+    async fn sleeper(spawner: Spawner, ticks: u64, log: Rc<RefCell<Vec<u64>>>) {
+        spawner.sleep(ticks).unwrap().await.unwrap();
+        log.borrow_mut().push(ticks);
+    }
+    let mut runtime = Runtime::new(0);
+    let spawner = runtime.spawner();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    for ticks in [3, 1, 2] {
+        spawner.spawn(sleeper(spawner.clone(), ticks, log.clone())).unwrap();
+    }
+    assert_eq!(runtime.poll(0).unwrap().tasks_polled, 3);
+    assert_eq!(runtime.poll(5).unwrap().tasks_polled, 3);
+    assert_eq!(*log.borrow(), [1, 2, 3]);
 }

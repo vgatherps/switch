@@ -66,11 +66,11 @@ impl TimerStore {
         self.wheel.current_tick()
     }
 
-    pub(crate) fn new(tick: u64, capacity: usize) -> Self {
+    pub(crate) fn new(tick: u64) -> Self {
         Self {
             wheel: TimerWheel::new(tick),
-            entries: Vec::with_capacity(capacity),
-            expired: Vec::with_capacity(capacity),
+            entries: Vec::new(),
+            expired: Vec::new(),
             free_head: NIL,
         }
     }
@@ -171,13 +171,20 @@ impl TimerStore {
             .advance_to(&mut self.entries, tick, &mut self.expired);
     }
 
-    /// Normalize before returning the owner to wake; no entry borrow escapes.
-    pub(crate) fn pop_expired(&mut self) -> Option<*const TaskHeader> {
-        let index = self.expired.pop()?;
-        let entry = &mut self.entries[index as usize];
-        debug_assert_eq!(entry.state, State::Pending);
-        entry.state = State::Expired;
-        Some(entry.owner)
+    /// Marks every timer `advance_to` staged Expired and hands its task to `wake`, in
+    /// deadline order. `wake` must not touch this store.
+    #[inline]
+    pub(crate) fn wake_expired(&mut self, mut wake: impl FnMut(*const TaskHeader)) {
+        if self.expired.is_empty() {
+            return;
+        }
+        for &index in &self.expired {
+            let entry = &mut self.entries[index as usize];
+            debug_assert_eq!(entry.state, State::Pending);
+            entry.state = State::Expired;
+            wake(entry.owner);
+        }
+        self.expired.clear();
     }
 
     fn release(&mut self, index: u32) {

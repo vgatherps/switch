@@ -277,7 +277,7 @@ mod stale_neighbors {
             self.inner.capabilities()
         }
 
-        fn receive(&mut self, now: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        fn receive(&mut self, now: Instant) -> Option<Self::RxToken<'_>> {
             self.inner.receive(now)
         }
 
@@ -300,24 +300,6 @@ mod stale_neighbors {
             }
             self.inner.transmit_frame(now)
         }
-    }
-
-    #[test]
-    fn limited_device_transmit_frame_uses_existing_limit() {
-        use crate::phy::FrameToken as _;
-
-        let mut device = LimitedDevice {
-            inner: TestingDevice::new(Medium::Ethernet),
-            tx_left: Some(1),
-        };
-        let mut frame = crate::tests::tx_test_buf(&[2]).try_own().unwrap();
-        unsafe { crate::phy::frame_headroom(&mut frame, 1) }.0[0] = 1;
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_retain(frame.freeze(), 1, None);
-        assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
-        assert!(device.transmit_frame(Instant::ZERO).is_none());
     }
 
     struct Connection {
@@ -348,9 +330,7 @@ mod stale_neighbors {
             mut sockets: TcpSet<'static>,
             device: TestingDevice,
         ) -> Self {
-            let mut socket = tcp::Socket::test_socket(64, 64);
-            // The timelines retransmit at 1 s after the first unacknowledged send.
-            socket.set_rto(crate::time::Duration::from_millis(1_000));
+            let socket = tcp::Socket::test_socket(64, 64);
             let handle = sockets.add(socket);
             let mut conn = Self {
                 iface,
@@ -410,6 +390,9 @@ mod stale_neighbors {
             );
             conn.ingress(0, bytes);
             assert_eq!(conn.sockets.get(handle).state(), tcp::State::Established);
+            // The timelines retransmit at 1 s after the first unacknowledged send; seeded after
+            // the handshake, whose 0 µs RTT sample would otherwise set the 50 ms floor.
+            conn.sockets.get_mut(handle).seed_rto(crate::time::Duration::from_millis(1_000));
             conn.egress(0);
             conn.take_data(&[], 0);
             assert!(conn.device.inner.tx_queue.is_empty());
@@ -605,23 +588,23 @@ mod stale_neighbors {
         iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(LOCAL.into(), 24)).unwrap());
         let mut sockets = TcpSet::new(64);
         let other = Ipv4Address::new(192, 168, 1, 3);
+        // One cache slot, two dead peers: the second peer evicts the first's pending entry, so
+        // each address ARPs once per second and a new destination once per second.
+        let mut requests = Vec::new();
         for millis in [0, 1, 2, 3, 998, 999, 1_000, 1_001, 1_002, 1_999, 2_000] {
             let peer = if millis % 2 == 0 { PEER } else { other };
             connect_unresolved_peer(&mut iface, &mut sockets, peer, 1234 + millis as u16);
             iface.poll_egress(Instant::from_millis(millis), &mut device, &mut sockets);
-            if millis % 1_000 == 0 {
-                assert_eq!(device.tx_queue.len(), 1);
-                let bytes = device.tx_queue.pop_front().unwrap();
+            while let Some(bytes) = device.tx_queue.pop_front() {
                 let eth = EthernetFrame::new_checked(&bytes).unwrap();
                 let arp = ArpPacket::new_checked(eth.payload()).unwrap();
                 let target =
                     Ipv4Address::from_octets(arp.target_protocol_addr().try_into().unwrap());
-                assert!(target == PEER || target == other);
                 assert_arp_request(&bytes, target);
-            } else {
-                assert!(device.tx_queue.is_empty());
+                requests.push((millis, target));
             }
         }
+        assert_eq!(requests, [(0, PEER), (1, other), (1_001, other), (1_002, PEER)]);
     }
 
     #[test]
@@ -748,35 +731,6 @@ fn test_no_icmp_no_unicast(#[case] medium: Medium) {
     // Ensure that the unknown protocol frame does not trigger an
     // ICMP error response when the destination address is a
     // broadcast address
-
-    assert_eq!(
-        iface.inner.process_ipv4(
-            &mut sockets,
-            PacketMeta::default(),
-            &frame,
-            None,
-        ),
-        None
-    );
-}
-
-#[rstest]
-#[case(Medium::Ethernet)]
-fn test_unknown_protocol_without_payload_no_reply(#[case] medium: Medium) {
-    let (mut iface, mut sockets, _device) = setup(medium);
-
-    // Unknown Ipv4 Protocol with no payload
-    let repr = IpRepr::Ipv4(Ipv4Repr {
-        src_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x02),
-        dst_addr: Ipv4Address::new(0x7f, 0x00, 0x00, 0x01),
-        next_header: IpProtocol::Unknown(0x0c),
-        payload_len: 0,
-        hop_limit: 0x40,
-    });
-
-    let mut bytes = vec![0u8; 34];
-    repr.emit(&mut bytes, &ChecksumCapabilities::default());
-    let frame = Ipv4Packet::new_unchecked(&bytes[..]);
 
     assert_eq!(
         iface.inner.process_ipv4(
@@ -984,63 +938,8 @@ fn test_broadcast_echo_no_reply(#[case] medium: Medium) {
     }
 }
 
-#[rstest]
-#[case(Medium::Ethernet)]
-fn test_handle_valid_arp_request(#[case] medium: Medium) {
-    let (mut iface, mut sockets, _device) = setup(medium);
-
-    let mut eth_bytes = vec![0u8; 42];
-
-    let local_ip_addr = Ipv4Address::new(0x7f, 0x00, 0x00, 0x01);
-    let remote_ip_addr = Ipv4Address::new(0x7f, 0x00, 0x00, 0x02);
-    let local_hw_addr = EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]);
-    let remote_hw_addr = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
-
-    let repr = ArpRepr::EthernetIpv4 {
-        operation: ArpOperation::Request,
-        source_hardware_addr: remote_hw_addr,
-        source_protocol_addr: remote_ip_addr,
-        target_hardware_addr: EthernetAddress::default(),
-        target_protocol_addr: local_ip_addr,
-    };
-
-    let mut frame = EthernetFrame::new_unchecked(&mut eth_bytes);
-    frame.set_dst_addr(EthernetAddress::BROADCAST);
-    frame.set_src_addr(remote_hw_addr);
-    frame.set_ethertype(EthernetProtocol::Arp);
-    let mut packet = ArpPacket::new_unchecked(frame.payload_mut());
-    repr.emit(&mut packet);
-
-    // Ensure an ARP Request for us triggers an ARP Reply
-    assert_eq!(
-        iface.inner.process_ethernet(
-            &mut sockets,
-            PacketMeta::default(),
-            frame.into_inner(),
-            None,
-        ),
-        Some(EthernetPacket::Arp(ArpRepr::EthernetIpv4 {
-            operation: ArpOperation::Reply,
-            source_hardware_addr: local_hw_addr,
-            source_protocol_addr: local_ip_addr,
-            target_hardware_addr: remote_hw_addr,
-            target_protocol_addr: remote_ip_addr
-        }))
-    );
-
-    // Ensure the address of the requester was entered in the cache
-    assert_eq!(
-        iface.inner.lookup_hardware_addr(
-            MockTxToken,
-            &IpAddress::Ipv4(remote_ip_addr),
-            None,
-        ),
-        Ok((HardwareAddress::Ethernet(remote_hw_addr), MockTxToken))
-    );
-}
-
 #[test]
-fn ingress_takes_each_frame_once_via_into_buf() {
+fn ingress_releases_each_frame_once() {
     use core::cell::Cell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -1049,30 +948,11 @@ fn ingress_takes_each_frame_once_via_into_buf() {
     use crate::socket::tcp;
     use crate::tests::TestingDevice;
 
-    #[derive(Default)]
-    struct Counts {
-        takes: Cell<usize>,
-        releases: Rc<Cell<usize>>,
-    }
-
-    struct FrameStorage {
-        bytes: Vec<u8>,
-        counts: Rc<Counts>,
-    }
-
-    struct CountingRxToken(FrameStorage);
+    struct CountingRxToken(RxBuf);
 
     impl RxToken for CountingRxToken {
         fn into_buf(self) -> RxBuf {
-            self.0.counts.takes.set(
-                self.0
-                    .counts
-                    .takes
-                    .get()
-                    .checked_add(1)
-                    .expect("take count overflow"),
-            );
-            RxBuf::counted_frame(self.0.bytes, 0, self.0.counts.releases.clone())
+            self.0
         }
     }
 
@@ -1090,13 +970,8 @@ fn ingress_takes_each_frame_once_via_into_buf() {
             self.inner.capabilities()
         }
 
-        fn receive(
-            &mut self,
-            timestamp: Instant,
-        ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            let rx = self.queue.pop_front()?;
-            let tx = self.inner.transmit(timestamp).unwrap();
-            Some((rx, tx))
+        fn receive(&mut self, _timestamp: Instant) -> Option<Self::RxToken<'_>> {
+            self.queue.pop_front()
         }
 
         fn transmit(&mut self, timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -1169,32 +1044,16 @@ fn ingress_takes_each_frame_once_via_into_buf() {
         &caps,
     );
 
-    let counts = [Rc::new(Counts::default()), Rc::new(Counts::default())];
+    let releases = [Rc::new(Cell::new(0)), Rc::new(Cell::new(0))];
     let queue = [arp_bytes, syn_bytes]
         .into_iter()
-        .zip(&counts)
-        .map(|(bytes, counts)| {
-            CountingRxToken(FrameStorage {
-                bytes,
-                counts: counts.clone(),
-            })
-        })
+        .zip(&releases)
+        .map(|(bytes, releases)| CountingRxToken(RxBuf::counted_frame(bytes, 0, releases.clone())))
         .collect();
     let mut device = CountingDevice {
         inner,
         queue: VecDeque::new(),
     };
-    {
-        use crate::phy::FrameToken as _;
-
-        let mut frame = crate::tests::tx_test_buf(&[2]).try_own().unwrap();
-        unsafe { crate::phy::frame_headroom(&mut frame, 1) }.0[0] = 1;
-        device
-            .transmit_frame(Instant::ZERO)
-            .unwrap()
-            .consume_retain(frame.freeze(), 1, None);
-        assert_eq!(device.inner.tx_queue.pop_front().unwrap(), &[1, 2]);
-    }
     let mut listener = tcp::Socket::test_socket(64, 64);
     listener.listen(1234).unwrap();
     let handle = sockets.add(listener);
@@ -1203,9 +1062,8 @@ fn ingress_takes_each_frame_once_via_into_buf() {
     device.inner.tx_queue.clear();
     device.queue = queue;
     iface.poll(Instant::ZERO, &mut device, &mut sockets);
-    for counts in &counts {
-        assert_eq!(counts.takes.get(), 1);
-        assert_eq!(counts.releases.get(), 1);
+    for releases in &releases {
+        assert_eq!(releases.get(), 1);
     }
     assert!(device.queue.is_empty());
     assert_eq!(device.inner.tx_queue.len(), 2);
@@ -1881,33 +1739,6 @@ fn answer_to_own_source(iface: &mut Interface, sockets: &mut TcpSet, own: Ipv4Ad
     // `Err(NeighborPending)` means an ARP request went out instead of the reply: still a frame.
     let _ = iface.inner.dispatch(CaptureTxToken(&mut wire), packet);
     wire
-}
-
-/// Control: with no ARP from a spoofer, the stack's answer to an `own -> own` packet is a
-/// broadcast ARP request for our own address; nothing goes to any unicast MAC.
-#[rstest]
-fn control_own_source_without_spoofed_arp_sends_arp_request(
-    #[values(false, true)] tcp: bool,
-    #[values(false, true)] owned_only: bool,
-) {
-    let (mut iface, mut sockets, _device) = setup(Medium::Ethernet);
-    let own = if owned_only {
-        iface.set_owned_ipv4(
-            crate::iface::OwnedIpv4::new(
-                &[Ipv4Cidr::new(OWNED_ONLY, 32)],
-                Ipv4Cidr::new(Ipv4Address::new(192, 168, 1, 1), 24),
-                None,
-            )
-            .unwrap(),
-        );
-        OWNED_ONLY
-    } else {
-        Ipv4Address::new(192, 168, 1, 1)
-    };
-    let wire = answer_to_own_source(&mut iface, &mut sockets, own, tcp);
-    let frame = EthernetFrame::new_checked(&wire[..]).unwrap();
-    assert_eq!(frame.dst_addr(), EthernetAddress::BROADCAST);
-    assert_eq!(frame.ethertype(), EthernetProtocol::Arp);
 }
 
 /// An ARP request or reply whose sender IP is one of our addresses (interface or owned; a

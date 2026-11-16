@@ -98,7 +98,6 @@ A dropped `send` depends on how far it got. A message is *accepted* once it is c
 
 ```rust,ignore
 pub struct Limits {
-    pub max_frame: usize,   // largest received WebSocket frame payload
     pub max_message: usize, // largest received message
     pub max_send: usize,    // largest message you may send
 }

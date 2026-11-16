@@ -11,5 +11,6 @@ switch-buffer.workspace = true
 switch-dpdk-sys.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 switch-test-kit.workspace = true
 switch-test-support.workspace = true

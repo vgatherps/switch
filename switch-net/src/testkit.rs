@@ -50,11 +50,15 @@ impl TapNet {
         self.net.tcp_reset_by_peer()
     }
 
-    pub fn turn(&mut self, now: Instant) -> Result<crate::Turn, crate::TurnError> {
+    pub fn receive(&mut self, now: Instant) -> Result<crate::Turn, crate::TurnError> {
         if let Some(host) = &mut self.host {
             host.iteration(now);
         }
-        self.net.turn(now)
+        self.net.receive(now)
+    }
+
+    pub fn send(&mut self) -> Result<crate::Sent, crate::TurnError> {
+        self.net.send()
     }
 }
 
@@ -81,7 +85,7 @@ pub struct TapConfig {
 pub struct Clock(std::time::Instant);
 
 impl Clock {
-    /// For `Net::turn`.
+    /// For `Net::receive`.
     pub fn now(&self) -> Instant {
         Instant::from_micros(i64::try_from(self.0.elapsed().as_micros()).unwrap())
     }
@@ -318,8 +322,9 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
         while !(client_done() && peer.is_finished()) {
             assert!(clock.elapsed() < LIMIT, "client done {}, peer done {}", client_done(), peer.is_finished());
             peer.accept();
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
             rt.poll(clock.ns()).expect("poll the client");
+            net.send().expect("send");
             each_round();
             thread::sleep(ROUND_SLEEP);
         }

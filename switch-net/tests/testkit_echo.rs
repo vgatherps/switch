@@ -87,8 +87,9 @@ fn written_timeout(backend: Backend) {
         let start = clock.elapsed();
         while !done.get() {
             assert!(clock.elapsed() - start < std::time::Duration::from_secs(1), "10 ms timeout did not expire");
-            net.turn(clock.now()).unwrap();
+            net.receive(clock.now()).unwrap();
             runtime.poll(clock.ns()).unwrap();
+            net.send().unwrap();
             std::thread::sleep(switch_net::testkit::ROUND_SLEEP);
         }
         assert!(clock.elapsed() - start >= std::time::Duration::from_millis(10));

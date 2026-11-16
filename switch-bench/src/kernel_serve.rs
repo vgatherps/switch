@@ -1,5 +1,4 @@
 //! Single-core Linux socket echo receiver; no generator or worker threads.
-#![cfg(target_os = "linux")]
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
@@ -45,14 +44,14 @@ fn descriptor(fd: RawFd, events: i16) -> libc::pollfd {
 }
 
 enum Receiver {
-    Udp(UdpEcho),
+    Udp(Box<UdpEcho>),
     Streams(StreamEcho),
 }
 
 impl Receiver {
     fn bind(proto: Proto, bind: Ipv4Addr, port: u16) -> io::Result<Self> {
         match proto {
-            Proto::Udp => Ok(Self::Udp(UdpEcho::new(UdpSocket::bind((bind, port))?)?)),
+            Proto::Udp => Ok(Self::Udp(Box::new(UdpEcho::new(UdpSocket::bind((bind, port))?)?))),
             Proto::Tcp | Proto::Ws => {
                 let listener = TcpListener::bind((bind, port))?;
                 listener.set_nonblocking(true)?;
@@ -180,7 +179,7 @@ impl StreamEcho {
                         stream.set_nonblocking(true)?;
                         stream.set_nodelay(true)?;
                         self.conns.push(if self.ws {
-                            Connection::Ws(WsEcho::new(stream))
+                            Connection::Ws(Box::new(WsEcho::new(stream)))
                         } else {
                             Connection::Tcp(TcpEcho { stream, buffer: vec![0; TCP_BUFFER].into_boxed_slice(), next: 0, end: 0 })
                         });
@@ -194,7 +193,7 @@ impl StreamEcho {
     }
 }
 
-enum Connection { Tcp(TcpEcho), Ws(WsEcho) }
+enum Connection { Tcp(TcpEcho), Ws(Box<WsEcho>) }
 impl Connection {
     fn fd(&self) -> RawFd {
         match self {

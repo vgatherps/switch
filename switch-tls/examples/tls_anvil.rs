@@ -213,8 +213,9 @@ fn main() {
                 let task = bounded(rt.spawner(), handle.clone(), local_port, client_config(), slot);
                 rt.spawner().spawn(task).expect("spawn a connection");
             }
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
             rt.poll(clock.ns()).expect("poll the connections");
+            net.send().expect("send");
             if checked.elapsed() >= DONE_CHECK {
                 checked = Instant::now();
                 if dir.join("done").exists() {

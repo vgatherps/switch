@@ -20,6 +20,7 @@ mod tests {
     use super::apply;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn matches_scalar_for_phases_lengths_offsets_and_pieces() {
         let key = [0x19, 0xa4, 0x63, 0xfe];
         for phase in 0..4 {

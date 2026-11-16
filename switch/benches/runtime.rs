@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::rc::Rc;
-use switch::{Capacity, PollReport, Runtime, Sleep, Spawner};
+use switch::{PollReport, Runtime, Sleep, Spawner};
 
 #[switch::task]
 fn mixed(
@@ -39,13 +39,7 @@ impl Rolling {
     const STEPS: [u64; 6] = [0, 0, 1, 2, 3, 4];
 
     fn new() -> Self {
-        let runtime = Runtime::with_capacity(
-            0,
-            Capacity {
-                tasks: 40,
-                timers: 32,
-            },
-        );
+        let runtime = Runtime::new(0);
         Self {
             spawner: runtime.spawner(),
             runtime,
@@ -167,13 +161,7 @@ fn runtime_benches(c: &mut Criterion) {
 
     // 32 sleeps expire in one turn and complete their task. One long-lived
     // runtime; each iteration's untimed setup spawns the task and polls it once.
-    let expiry = RefCell::new(Runtime::with_capacity(
-        0,
-        Capacity {
-            tasks: 2,
-            timers: 32,
-        },
-    ));
+    let expiry = RefCell::new(Runtime::new(0));
     let audit = Rc::new(workload::Audit::default());
     let tick = Cell::new(0u64);
     c.bench_function("runtime_expiry_32", |b| {
@@ -205,13 +193,7 @@ fn runtime_benches(c: &mut Criterion) {
     bench_rolling(c, "runtime_mixed_six_turns_64rt", 64);
     c.bench_function("runtime_cold_create_drop", |b| {
         b.iter(|| {
-            let runtime = Runtime::with_capacity(
-                100,
-                Capacity {
-                    tasks: 40,
-                    timers: 32,
-                },
-            );
+            let runtime = Runtime::new(100);
             black_box(&runtime);
             drop(runtime);
         })

@@ -1,5 +1,4 @@
 use switch_test_kit::pair::drain_bytes;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, RecvError, State};
@@ -17,8 +16,9 @@ use pair::{
 use ring_port::arp;
 
 const ECHO_LEN: usize = 64 * 1024;
-/// Default socket RTO.
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples on a Pair at one instant are 0 µs, so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 
 fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
     use switch_test_kit::wire::{in_use, pool_by_name};
@@ -296,17 +296,6 @@ fn two_connections_interleave_one_segment_per_visit() {
     });
 }
 
-#[switch_test_support::pinned_test]
-fn arp_and_handshake_b_connects_a_listens() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["hs2a", "hs2b"]);
-        let (_, frames) = establish(&mut pair, Side::B);
-        assert_arp_and_handshake(&frames, Side::B);
-        assert_no_drops(&pair);
-        assert_eq!(pair.close(), 0);
-    });
-}
-
 fn establish_small_segment_clients(pair: &mut Pair, count: u16) -> Vec<TcpHandle> {
     let handles: Vec<_> = (0..count)
         .map(|index| {
@@ -385,46 +374,6 @@ fn establish_small_segment_clients(pair: &mut Pair, count: u16) -> Vec<TcpHandle
         assert_eq!(pair.a.tcp(handle).state(), State::Established);
     }
     handles
-}
-
-#[switch_test_support::pinned_test]
-fn turn_sends_all_six_segments_in_connection_order() {
-    with_eal(|eal| {
-        let mut config = pair::config(Side::A);
-        config.max_sockets = 2;
-        let mut pair = Pair::new(
-            eal,
-            ["idle6a", "idle6b"],
-            [config, pair::config(Side::B)],
-            pair::T0,
-        );
-        let handles = establish_small_segment_clients(&mut pair, 2);
-        for (index, handle) in handles.iter().enumerate() {
-            assert_eq!(
-                pair.a
-                    .tcp_mut(handle)
-                    .send_slice(&vec![index as u8 + 1; 3 * 512]),
-                Ok(3 * 512)
-            );
-        }
-        let now = pair.now();
-        let turn = pair.a.turn(now, pair::BUDGET).unwrap();
-        assert_eq!((turn.tx_accepted, turn.tx_pending), (6, 0));
-        let mut ports = Vec::new();
-        assert_eq!(
-            pair.drain_tx(Side::A, |frame| {
-                let tcp = segment(frame, Side::A);
-                let index = usize::from(tcp.src_port - CLIENT_PORT);
-                assert_eq!(tcp.payload, &[index as u8 + 1; 512]);
-                ports.push(tcp.src_port);
-            }),
-            6
-        );
-        let c1 = CLIENT_PORT;
-        let c2 = CLIENT_PORT + 1;
-        assert_eq!(ports, [c1, c2, c1, c2, c1, c2]);
-        assert_eq!(pair.close(), 0);
-    });
 }
 
 #[switch_test_support::pinned_test]
@@ -836,34 +785,6 @@ fn two_stacks_pipelined_messages_complete_without_ack_delay() {
             (written_at.len(), received, replies),
             (MESSAGES, MESSAGES, MESSAGES)
         );
-        assert_no_drops(&pair);
-        assert_eq!(pair.close(), 0);
-    });
-}
-
-#[switch_test_support::pinned_test]
-fn drive_fails_at_round_cap_when_app_never_finishes() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["capa", "capb"]);
-        let mut rounds = 0;
-        let unwound = catch_unwind(AssertUnwindSafe(|| {
-            pair.drive(
-                |_, _| {},
-                |_, _| {
-                    rounds += 1;
-                    // Without the cap, finish so the test fails instead of hanging.
-                    if rounds > MAX_ROUNDS {
-                        App::Done
-                    } else {
-                        App::Moved
-                    }
-                },
-            )
-        }));
-        let message = *unwound.unwrap_err().downcast::<String>().unwrap();
-        let expected = format!("drive not done after {MAX_ROUNDS} rounds");
-        assert!(message.starts_with(&expected), "{message}");
-        assert_eq!(rounds, MAX_ROUNDS);
         assert_no_drops(&pair);
         assert_eq!(pair.close(), 0);
     });

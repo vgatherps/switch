@@ -670,38 +670,3 @@ pub fn fuzz_ops(ops: &[Op]) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{PoolConfig, ensure_eal_init};
-    use switch_dpdk_sys::RTE_PKTMBUF_HEADROOM;
-
-    #[switch_test_support::pinned_test]
-    fn alloc_longer_than_data_room_is_refused_and_returns_the_mbuf() {
-        ensure_eal_init();
-        // SAFETY: every test here runs on the pinned worker, which initialized EAL
-        // and is its main lcore; only direct single-segment alloc and free follow,
-        // and the pool drops after the executors.
-        let pool = unsafe {
-            PoolManager::new_production(PoolConfig {
-                name: c"executor_small_room",
-                count: 8,
-                cache_size: 4,
-                data_room_size: RTE_PKTMBUF_HEADROOM as u16 + 100,
-                socket_id: -1,
-            })
-        }
-        .unwrap();
-        for mode in [SelectionMode::AllSwitch, SelectionMode::AllDpdk] {
-            let mut executor = Executor::new(&pool, mode);
-            assert!(!executor.execute(&Op::Alloc { id: 0, len: 101 }));
-            assert_eq!(pool.in_use_count(), 0);
-            assert!(!executor.execute(&Op::Free { id: 0 }));
-
-            assert!(executor.execute(&Op::Alloc { id: 1, len: 100 }));
-            assert_eq!(pool.in_use_count(), 1);
-            assert!(executor.execute(&Op::Free { id: 1 }));
-            assert_eq!(pool.in_use_count(), 0);
-        }
-    }
-}

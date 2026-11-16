@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use smoltcp::phy::{RxBuf, TxSource};
-use switch_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
+use switch_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError, PoolManager};
 use switch_dpdk_sys::*;
 
-use crate::eal::{Eal, PoolResources};
+use crate::eal::Eal;
 use crate::rx_pool::rx_low_mark;
 
 /// Static properties and MAC address reported by a DPDK ethdev.
@@ -549,10 +549,10 @@ pub struct Port {
     /// TX data room after headroom: the largest `alloc_tx` length.
     tx_room: u16,
     descriptors: (u16, u16),
-    /// Whether the RX pool is low; see `rx_pool_low`.
-    rx_pressure: RxPressure,
-    rx: ManuallyDrop<PoolResources>,
-    tx: ManuallyDrop<PoolResources>,
+    /// The RX pool is low below this many free mbufs: `rx_low_mark`.
+    rx_low_mark: usize,
+    rx: ManuallyDrop<PoolManager>,
+    tx: ManuallyDrop<PoolManager>,
     /// This Port's clone of the frame pool; other clones may outlive the Port.
     frame: ManuallyDrop<Rc<FramePool>>,
     /// The frame pool's mempool (every frame's `ImmutableFrame::ctx`), kept here so the publish
@@ -678,11 +678,11 @@ impl Port {
         if u64::from(config.frame_pool.data_room_size) < headroom + frame {
             return Err(PortError::InvalidSettings("frame pool room cannot hold the frame").into());
         }
-        let rx = PoolResources::new(config.rx_pool).map_err(|error| PortError::Pool {
+        let rx = PoolManager::new_production(config.rx_pool).map_err(|error| PortError::Pool {
             direction: "RX",
             error,
         })?;
-        let tx = PoolResources::new(config.tx_pool).map_err(|error| PortError::Pool {
+        let tx = PoolManager::new_production(config.tx_pool).map_err(|error| PortError::Pool {
             direction: "TX",
             error,
         })?;
@@ -704,7 +704,7 @@ impl Port {
             // `data_room_size` >= headroom + frame was checked above.
             tx_room: config.tx_pool.data_room_size - RTE_PKTMBUF_HEADROOM as u16,
             descriptors: (config.rx_descriptors, config.tx_descriptors),
-            rx_pressure: RxPressure::new(config.rx_descriptors, config.rx_burst),
+            rx_low_mark: rx_low_mark(config.rx_descriptors, config.rx_burst),
             rx: ManuallyDrop::new(rx),
             tx: ManuallyDrop::new(tx),
             frame_origin: NonNull::new(frame_pool.mempool()).expect("a frame pool has a mempool").cast(),
@@ -791,7 +791,7 @@ impl Port {
             }
         }
         self.descriptors = (rx_desc, tx_desc);
-        self.rx_pressure = RxPressure::new(rx_desc, self.rx_burst_size());
+        self.rx_low_mark = rx_low_mark(rx_desc, self.rx_burst_size());
         let mut rxconf = info.default_rxconf;
         rxconf.offloads = 0;
         rxconf.rx_deferred_start = 0;
@@ -811,7 +811,7 @@ impl Port {
                 rx_desc,
                 config.queue_socket as u32,
                 &rxconf,
-                self.rx.pool().pool(),
+                self.rx.pool(),
             ),
         )?;
         let mut rxq_info: rte_eth_rxq_info = std::mem::zeroed();
@@ -911,13 +911,13 @@ impl Port {
 
     pub(crate) fn rx_pool_count(&self) -> usize {
         // SAFETY: this Port owns the live RX pool; its object count is fixed.
-        usize::try_from(unsafe { (*self.rx.pool().pool()).size })
+        usize::try_from(unsafe { (*self.rx.pool()).size })
             .expect("RX pool count exceeds usize")
     }
 
     pub(crate) fn rx_pool_cache_size(&self) -> u32 {
         // SAFETY: this Port owns the live RX pool; its cache size is fixed.
-        unsafe { (*self.rx.pool().pool()).cache_size }
+        unsafe { (*self.rx.pool()).cache_size }
     }
 
     /// Packets requested from the PMD per RX burst at most: `PortConfig::rx_burst`.
@@ -925,27 +925,17 @@ impl Port {
         u16::try_from(self.rx_scratch.len()).expect("rx_burst is a u16")
     }
 
-    /// After an RX burst, whether the RX mbufs this lcore can allocate (the RX pool's backing
-    /// store plus this lcore's cache, which the PMD refills from) fall short of the low mark
-    /// (`rx_low_mark`). A zero `received` count forces a fresh reading; otherwise the last reading
-    /// may already rule out a low pool (`RxPressure`).
+    /// How many RX mbufs this lcore can allocate (the RX pool's backing store plus this
+    /// lcore's cache, which the PMD refills from) fall short of the low mark (`rx_low_mark`):
+    /// zero while the pool is not low.
     #[inline]
-    pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
-        if received != 0 && self.rx_pressure.covers(received) {
-            return false;
-        }
-        self.read_rx_pool_low()
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn read_rx_pool_low(&mut self) -> bool {
-        self.rx_pressure.read(self.rx.pool().free_count() as usize)
+    pub(crate) fn rx_pool_shortfall(&self) -> usize {
+        self.rx_low_mark.saturating_sub(self.rx.free_count() as usize)
     }
 
     pub(crate) fn tx_pool_count(&self) -> usize {
         // SAFETY: this Port owns the live TX pool; its object count is fixed.
-        usize::try_from(unsafe { (*self.tx.pool().pool()).size })
+        usize::try_from(unsafe { (*self.tx.pool()).size })
             .expect("TX pool count exceeds usize")
     }
 
@@ -1026,8 +1016,7 @@ impl Port {
     /// for the negotiated TX descriptor count and its reservations. That
     /// descriptor bound holds for NIC PMDs. Test PMDs such as net_ring queue
     /// sent mbufs into an attached ring, ignore the descriptor count and are
-    /// bounded by the ring's capacity instead. An empty TX pool also blocks
-    /// receive, because Device::receive takes a TX reservation first.
+    /// bounded by the ring's capacity instead.
     /// A Port that is not ready (retained after a failed open or
     /// a refused close) allocates from its pool but never calls the cleanup:
     /// its queue may not exist.
@@ -1041,7 +1030,7 @@ impl Port {
         }
         // SAFETY (both allocations): a fresh production-pool mbuf: reset to one
         // direct segment, refcnt 1, `pkt_len == data_len == len`.
-        if let Some(mbuf) = self.tx.pool().alloc_with_len(len) {
+        if let Some(mbuf) = self.tx.alloc_with_len(len) {
             return Some(unsafe { Packet::from_restricted(mbuf) });
         }
         if !self.ready {
@@ -1057,7 +1046,7 @@ impl Port {
             "rte_eth_tx_done_cleanup(port {}, queue 0) failed: {code}",
             self.port_id
         );
-        let mbuf = self.tx.pool().alloc_with_len(len)?;
+        let mbuf = self.tx.alloc_with_len(len)?;
         Some(unsafe { Packet::from_restricted(mbuf) })
     }
 
@@ -1086,7 +1075,7 @@ impl Port {
         // `count` fits: the scratch length came from a u16.
         let received =
             unsafe { eth_rx_burst(self.port_id, 0, self.rx_scratch.as_mut_ptr(), count as u16) };
-        let pool = self.rx.pool().pool();
+        let pool = self.rx.pool();
         let mut rejected = 0;
         for &raw in &self.rx_scratch[..usize::from(received)] {
             if self.rx_checksum {
@@ -1184,8 +1173,8 @@ impl Port {
             }
         }
         let (rx, tx, frame) = (
-            self.rx.pool().in_use_count(),
-            self.tx.pool().in_use_count(),
+            self.rx.in_use_count(),
+            self.tx.in_use_count(),
             self.frame.in_use_count(),
         );
         if rx != 0 || tx != 0 || frame != 0 {
@@ -1247,50 +1236,6 @@ fn check_configuration(mtu: u16, offloads: Offloads, conf: &rte_eth_conf) -> Res
         }
     }
     Ok(())
-}
-
-/// The most RX mbufs a driver holds posted for receive: max(RX descriptors, 32). A NIC posts
-/// at most one per descriptor; memif copy mode posts none between receives.
-fn rx_posted(rx_descriptors: u16) -> usize {
-    usize::from(rx_descriptors.max(32))
-}
-
-/// Whether the RX pool is below its low mark, reading its free count only when needed.
-///
-/// Only the driver takes RX mbufs from the pool, inside its RX burst: buffers it posts, at most
-/// `rx_posted`, and one per packet it returns. So the free count can fall by at most `posted`
-/// plus the packets received since a reading. A reading of `free` therefore rules out "below
-/// the mark" for the next `free - low_mark - posted` received packets, and no reading is needed
-/// until they are used up: the answer is the one an exact reading would give.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RxPressure {
-    low_mark: usize,
-    posted: usize,
-    /// Packets that may still be received before the pool could fall below the low mark.
-    unchecked: usize,
-}
-
-impl RxPressure {
-    fn new(rx_descriptors: u16, rx_burst: u16) -> Self {
-        Self { low_mark: rx_low_mark(rx_descriptors, rx_burst), posted: rx_posted(rx_descriptors), unchecked: 0 }
-    }
-
-    /// Count `received` packets against the last reading; `true` while it still rules out low.
-    #[inline]
-    fn covers(&mut self, received: usize) -> bool {
-        if received <= self.unchecked {
-            self.unchecked -= received;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Take a reading of `free` mbufs: whether the pool is low now.
-    fn read(&mut self, free: usize) -> bool {
-        self.unchecked = free.saturating_sub(self.low_mark + self.posted);
-        free < self.low_mark
-    }
 }
 
 fn importable(m: &rte_mbuf, rx_pool: *mut rte_mempool) -> bool {

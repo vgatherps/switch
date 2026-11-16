@@ -249,75 +249,32 @@ fn rx_flood_each_turn_finite() {
 }
 
 #[switch_test_support::pinned_test]
-fn undrained_tx_ring_blocks_ingress_keeps_rx_staged_then_recovers() {
+fn undrained_tx_ring_drops_replies_and_never_blocks_ingress() {
     with_eal(|eal| {
-        // TX ring holds 3, pending holds 2: replies back up into staging.
+        // TX ring holds 3, pending holds 2: replies past that are dropped, and every
+        // request is still processed in the turn it arrives.
         let fixture = RingPort::new("blocked", 16, 4);
         let mut stack = stack(fixture.open(eal), config(8, 2));
         fixture.inject(&requests(0..8));
-        assert_eq!(
-            stack.turn(T, 8),
-            Ok(Turn {
-                rx_received: 8,
-                rx_processed: 2,
-                rx_staged: 6,
-                tx_accepted: 2,
-                ..IDLE
-            })
-        );
-        assert_eq!(
-            stack.turn(T, 8),
-            Ok(Turn {
-                rx_processed: 2,
-                rx_staged: 4,
-                tx_accepted: 1,
-                tx_pending: 1,
-                ..IDLE
-            })
-        );
-        assert_eq!(
-            stack.turn(T, 8),
-            Ok(Turn {
-                rx_processed: 1,
-                rx_staged: 3,
-                tx_pending: 2,
-                ..IDLE
-            })
-        );
-        // The peer is not draining: every further turn is finite and idle.
+        let turn = stack.turn(T, 8).unwrap();
+        assert_eq!((turn.rx_received, turn.rx_processed, turn.rx_staged), (8, 8, 0));
+        assert_eq!(fixture.in_use().0, 0);
+        // The peer is not draining: further turns receive nothing and send nothing.
         for _ in 0..3 {
-            assert_eq!(
-                stack.turn(T, 8),
-                Ok(Turn {
-                    rx_staged: 3,
-                    tx_pending: 2,
-                    ..IDLE
-                })
-            );
+            let turn = stack.turn(T, 8).unwrap();
+            assert_eq!((turn.rx_processed, turn.rx_staged, turn.tx_accepted), (0, 0, 0));
         }
-        assert_eq!(fixture.in_use(), (3, 5));
-
-        assert_eq!(fixture.take_tx(), replies(0..3));
-        assert_eq!(
-            stack.turn(T, 8),
-            Ok(Turn {
-                rx_processed: 2,
-                rx_staged: 1,
-                tx_accepted: 3,
-                tx_pending: 1,
-                ..IDLE
-            })
-        );
-        assert_eq!(fixture.take_tx(), replies(3..6));
-        assert_eq!(
-            stack.turn(T, 8),
-            Ok(Turn {
-                rx_processed: 1,
-                tx_accepted: 2,
-                ..IDLE
-            })
-        );
-        assert_eq!(fixture.take_tx(), replies(6..8));
+        let mut sent = fixture.take_tx();
+        loop {
+            let turn = stack.turn(T, 8).unwrap();
+            let more = fixture.take_tx();
+            if more.is_empty() && turn.tx_pending == 0 {
+                break;
+            }
+            sent.extend(more);
+        }
+        assert!((2..8).contains(&sent.len()), "{} replies sent", sent.len());
+        assert_eq!(sent, replies(0..sent.len() as u8));
         finish(fixture, stack);
     });
 }

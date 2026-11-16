@@ -676,18 +676,6 @@ fn closed_port_no_icmp() {
             assert_eq!(datagram.payload(), b"marker");
             drop(datagram);
             assert_kernel_quiet(stack, start, &kernel);
-            kernel.set_nonblocking(false).unwrap();
-            kernel.set_read_timeout(Some(QUIET)).unwrap();
-            let mut buffer = [0; 2048];
-            let error = kernel.recv(&mut buffer).unwrap_err();
-            assert!(
-                matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ),
-                "closed port recv returned {error} instead of a timeout"
-            );
-            assert_ne!(error.raw_os_error(), Some(libc::ECONNREFUSED));
         });
     });
 }

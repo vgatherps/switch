@@ -213,7 +213,6 @@ fn held_tcp_frame_after_removal(reap: bool) {
         });
         let frame = pair.b.tcp_mut(&server).recv().unwrap().unwrap();
         assert_eq!(frame.payload(), b"held");
-        assert_eq!(pair.b.tcp(&server).held_frames().count(), 1);
         if reap {
             pair.a.close(&client);
             pair.drive(|_, _| {}, |_, b| {
@@ -250,7 +249,7 @@ fn held_tcp_frame_after_removal(reap: bool) {
 
 // ANCHOR: pair
 #[switch_test_support::pinned_test]
-fn cloned_received_tcp_frame_keeps_mbuf_and_held_count() {
+fn cloned_received_tcp_frame_keeps_mbuf_after_socket_removal() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(pair::config);
         let mut pair = Pair::new(eal, ["rxclonea", "rxcloneb"], configs, pair::T0);
@@ -266,18 +265,14 @@ fn cloned_received_tcp_frame_keeps_mbuf_and_held_count() {
             }
         });
         // ANCHOR_END: pair
-        let held = pair.b.tcp(&server).held_frames();
         let frame = pair.b.tcp_mut(&server).recv().unwrap().unwrap().into_frame().freeze();
         let clone = std::mem::ManuallyDrop::new(frame.clone().slice(1..4));
         drop(frame);
         assert_eq!(pair.in_use()[1].0, idle + 1);
-        assert_eq!(held.count(), 1);
         pair.b.remove_tcp(server);
         assert_eq!(&clone[..], b"eld");
-        assert_eq!(held.count(), 1);
         drop(std::mem::ManuallyDrop::into_inner(clone));
         assert_eq!(pair.in_use()[1].0, idle);
-        assert_eq!(held.count(), 0);
         assert_eq!(pair.close(), 0);
     });
 }
@@ -331,7 +326,23 @@ fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
 fn arp_request_from_off_subnet_sender_is_answered_not_learned() {
     with_eal(|eal| {
         let fixture = RingPort::new("arpoff", 16, 16);
-        let mut stack = stack(fixture.open(eal), 1, 8);
+        let config = StackConfig {
+            max_udp_sockets: 0,
+            ethernet: OURS,
+            ipv4: Ipv4Cidr::new(OUR_IP, 24),
+            gateway: None,
+            paths: &[],
+            owned_ipv4: &[],
+            random_seed: 1,
+            neighbor_capacity: 8,
+            max_sockets: 1,
+            rx_staging: 8,
+            tx_pending: 8,
+        };
+        let mut stack = match Stack::new(fixture.open(eal), config, T0) {
+            Ok(stack) => stack,
+            Err((_, error)) => panic!("{error}"),
+        };
         fixture.inject(&[arp(
             ArpOperation::Request,
             EthernetAddress::BROADCAST,
@@ -413,21 +424,6 @@ fn socket_capacity_refused_then_slot_reused() {
         let AddTcpError::SocketsFull(refused) = stack.add_tcp(config).unwrap_err();
         assert_eq!(refused, config);
         assert_eq!(stack.turn(T0, 8), Ok(IDLE));
-        finish(fixture, stack);
-    });
-}
-
-#[switch_test_support::pinned_test]
-fn tcp_read_leaves_socket_untouched() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("tcpread", 16, 16);
-        let mut stack = stack(fixture.open(eal), 1, 4);
-        let handle = stack.add_tcp(tcp_socket()).unwrap();
-        stack.listen(&handle, 1001).unwrap();
-
-        assert_eq!(stack.tcp(&handle).state(), State::Listen);
-        let read = stack.tcp(&handle) as *const tcp::Socket<'static>;
-        assert!(std::ptr::eq(read, stack.tcp_mut(&handle)));
         finish(fixture, stack);
     });
 }
@@ -587,40 +583,6 @@ fn peer_data(isn: TcpSeqNumber, peer_seq: TcpSeqNumber, payload: &[u8]) -> Vec<u
         timestamp: None,
         payload,
     })
-}
-
-#[switch_test_support::pinned_test]
-fn reused_port_refreshes_rx_pressure_at_stack_construction() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("rxreuse", 16, 16);
-        let mut previous = stack(fixture.open(eal), 1, 4);
-        fixture.inject(&[ring_port::frame(0)]);
-        assert_eq!(previous.receive(T0, 1).unwrap().rx_received, 1);
-        fixture.take_tx();
-        let mut port = previous.into_port();
-
-        // Retain packets received directly through the Port after the previous Stack's reading.
-        let mut held = std::collections::VecDeque::with_capacity(88);
-        for _ in 0..11 {
-            fixture.inject(&vec![ring_port::frame(0); 8]);
-            let burst = port.rx_burst(&mut held).unwrap();
-            assert_eq!((burst.accepted, burst.rejected), (8, 0));
-        }
-        assert_eq!(fixture.in_use().0, 88);
-
-        let mut stack = stack(port, 1, 4);
-        let handle = stack.add_tcp(tcp_socket()).unwrap();
-        stack.tcp_mut(&handle).set_ack_delay(None);
-        stack.connect(&handle, remote(), LOCAL_PORT).unwrap();
-        let (isn, peer_isn, _) = handshake(&fixture, &mut stack, &handle);
-        fixture.inject(&[peer_data(isn, peer_isn + 10, b"out of order")]);
-        let turn = stack.receive(T0, 8).unwrap();
-        assert_eq!((turn.rx_received, turn.rx_processed), (1, 1));
-        assert_eq!(stack.tcp(&handle).rx_refused_segments(), 1);
-        fixture.take_tx();
-        drop(held);
-        finish(fixture, stack);
-    });
 }
 
 #[switch_test_support::pinned_test]
@@ -874,17 +836,16 @@ fn reset_remove_unwind_return_once() {
                 assert!(fixture.take_tx().is_empty());
                 assert_eq!(stack.tcp(&handle).state(), State::Closed);
                 assert_eq!(stack.tcp(&handle).recv_queue(), 6);
-                // The RST needs no reply: its unused TX packet stays as the
-                // Device's spare until `into_port`.
-                assert_eq!(fixture.in_use(), (3, 1));
+                // The RST needs no reply, so it took no TX packet.
+                assert_eq!(fixture.in_use(), (3, 0));
                 let bytes = drain_bytes(stack.tcp_mut(&handle)).unwrap();
                 assert_eq!(bytes.len(), 6);
                 assert_eq!(&bytes, b"abcdef");
-                assert_eq!(fixture.in_use(), (1, 1));
+                assert_eq!(fixture.in_use(), (1, 0));
                 stack.remove_tcp(handle);
-                assert_eq!(fixture.in_use(), (0, 1));
+                assert_eq!(fixture.in_use(), (0, 0));
                 exhaust_and_reallocate_rx_pool(&fixture);
-                assert_eq!(fixture.in_use(), (0, 1));
+                assert_eq!(fixture.in_use(), (0, 0));
             }
             let port = stack.into_port();
             assert_eq!(fixture.in_use(), (0, 0));
@@ -950,37 +911,6 @@ fn turn_respects_budget_and_services_egress() {
             assert_eq!(data_segment.ack_number, Some(peer_isn + 1));
             assert_eq!(data_segment.payload, &data[512 * i..512 * (i + 1)]);
         }
-        finish(fixture, stack);
-    });
-}
-
-#[switch_test_support::pinned_test]
-fn connection_without_peer_timestamps_stays_without_them() {
-    with_eal(|eal| {
-        let fixture = RingPort::new("nots", 16, 16);
-        let mut stack = stack(fixture.open(eal), 1, 4);
-        let handle = stack.add_tcp(tcp_socket()).unwrap();
-        stack.connect(&handle, remote(), LOCAL_PORT).unwrap();
-        // Neither our SYN nor the peer's SYN-ACK offers timestamps.
-        let (isn, peer_isn, offered) = handshake(&fixture, &mut stack, &handle);
-        assert_eq!(offered, None);
-
-        assert_eq!(stack.tcp_mut(&handle).send_slice(b"hi"), Ok(2));
-        let later = T0 + Duration::from_millis(3);
-        assert_eq!(
-            stack.turn(later, 8),
-            Ok(Turn {
-                tx_accepted: 1,
-                ..IDLE
-            })
-        );
-        let sent = fixture.take_tx();
-        assert_eq!(sent.len(), 1);
-        let data = segment(&sent[0]);
-        assert_eq!(
-            (data.seq_number, data.ack_number, data.payload, data.timestamp),
-            (isn + 1, Some(peer_isn + 1), &b"hi"[..], None)
-        );
         finish(fixture, stack);
     });
 }

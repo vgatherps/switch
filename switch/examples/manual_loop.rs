@@ -31,27 +31,6 @@ impl EventQueue {
     }
 }
 
-#[cfg(test)]
-// ANCHOR: events_before_poll
-mod tests {
-    use super::*;
-
-    #[test]
-    fn queued_events_schedule_once_in_the_current_turn() {
-        let mut runtime = Runtime::new(0);
-        let spawner = runtime.spawner();
-        let mut events = EventQueue {
-            pending: VecDeque::from(["one", "two"]),
-        };
-        assert_eq!(events.poll_nonblocking(&spawner), 2);
-        let first = runtime.poll(0).unwrap();
-        assert_eq!((first.tasks_polled, first.live_tasks), (2, 0));
-        assert_eq!(events.poll_nonblocking(&spawner), 0);
-        let second = runtime.poll(0).unwrap();
-        assert_eq!(second, switch::PollReport::default());
-    }
-}
-// ANCHOR_END: events_before_poll
 
 fn main() {
     // ANCHOR: tick_loop

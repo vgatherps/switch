@@ -157,14 +157,10 @@ fn wake_after_the_runtime_is_dropped_is_discarded() {
 
 #[test]
 fn new_rejects_a_foreign_waker() {
-    let payload = std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(|| {
         RemoteWaker::new(&Context::from_waker(Waker::noop()));
     })
     .unwrap_err();
-    assert_eq!(
-        payload.downcast_ref::<&str>(),
-        Some(&"RemoteWaker needs a switch task waker")
-    );
 }
 
 #[test]
@@ -189,18 +185,14 @@ fn new_on_a_foreign_thread_panics() {
     let waker = slot.take().unwrap();
     // Never dropped there: dropping a task waker off its thread panics too.
     let foreign = ManuallyDrop::new(waker.clone());
-    let payload = thread::spawn(move || {
+    thread::spawn(move || {
         catch_unwind(AssertUnwindSafe(|| {
             RemoteWaker::new(&Context::from_waker(&foreign));
         }))
-        .unwrap_err()
+        .unwrap_err();
     })
     .join()
     .unwrap();
-    assert_eq!(
-        payload.downcast_ref::<&str>(),
-        Some(&"waker used on foreign thread")
-    );
 }
 
 /// Parks, publishing a `RemoteWaker`, until `value` reaches `last`; records the

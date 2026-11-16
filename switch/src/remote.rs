@@ -166,17 +166,36 @@ impl RemoteWaker {
     /// Wake the task: at once on its own thread, at the start of its runtime's
     /// next turn from any other thread.
     pub fn wake(&self) {
-        let header = self.header.as_ptr().cast_const();
-        // SAFETY: blocks are never freed, so the metadata stays readable.
-        unsafe {
-            let meta = TaskHeader::meta(header);
-            if Meta::owner(meta) == THREAD_TAG.with(Cell::get) {
-                Executor::wake(header);
-            } else {
-                (*Meta::mailbox(meta)).push(header);
-            }
+        // SAFETY: the handle came from a switch task waker.
+        unsafe { wake_on_any_thread(self.header.as_ptr()) }
+    }
+}
+
+/// Wake the task headed by `header`: at once on its block's thread, through its
+/// runtime's mailbox from any other thread (dropped once the runtime shut down).
+///
+/// # Safety
+/// `header` heads a slot of a block. Blocks are never freed, so its metadata stays
+/// readable; a foreign thread reads only the owner tag and mailbox, both written
+/// before the block's first task existed.
+#[inline]
+pub(crate) unsafe fn wake_on_any_thread(header: *const TaskHeader) {
+    unsafe {
+        let meta = TaskHeader::meta(header);
+        if Meta::owner(meta) == THREAD_TAG.with(Cell::get) {
+            Executor::wake(header);
+        } else {
+            foreign_wake(meta, header);
         }
     }
+}
+
+/// # Safety
+/// As for [`wake_on_any_thread`]; `meta` is `header`'s block metadata.
+#[cold]
+#[inline(never)]
+unsafe fn foreign_wake(meta: *mut Meta, header: *const TaskHeader) {
+    unsafe { (*Meta::mailbox(meta)).push(header) }
 }
 
 #[cfg(test)]

@@ -275,7 +275,6 @@ fn add_udp_admits_queues_beyond_the_shared_rx_pool() {
         let big = stack.add_udp(udp_config(PORT + 1, 64)).unwrap();
         assert_eq!(stack.udp(&udp).config(), &udp_config(PORT, 5));
         assert_eq!(stack.udp(&big).config(), &udp_config(PORT + 1, 64));
-        assert_eq!(stack.tcp(&tcp).recv_capacity(), 4096);
         stack.remove_udp(big);
         stack.remove_udp(udp);
         stack.remove_tcp(tcp);

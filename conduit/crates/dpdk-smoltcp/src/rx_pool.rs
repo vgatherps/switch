@@ -3,8 +3,8 @@
 /// rx_staging + floor(3 * rx_cache_size / 2).
 /// A NIC keeps its RX descriptors posted (ENA refills once min(ring / 8, 256) are empty);
 /// memif copy mode needs 32 mbufs before it can receive. With those posted and staging full,
-/// the pool must still hold the low mark free: below it every TCP socket keeps no
-/// out-of-order data. A DPDK cache can hold up to its flush threshold of 1.5 times its
+/// the pool must still hold the low mark free: below it the TCP sockets holding the most
+/// out-of-order frames release them. A DPDK cache can hold up to its flush threshold of 1.5 times its
 /// configured size. `Stack::new` refuses a smaller RX pool. Size the RX pool as this plus the
 /// received mbufs all sockets together may hold (unread data, out-of-order segments, frames
 /// the application holds). Smaller segments can require more mbufs for the same byte volume.
@@ -84,16 +84,6 @@ mod tests {
     }
 
     #[test]
-    fn tx_reserve_covers_descriptors_and_pending() {
-        assert_eq!(tx_reserve(1024, 32), 1024 + 32);
-        assert_eq!(tx_reserve(64, 32), 96);
-        assert_eq!(tx_reserve(16, 8), 24);
-        assert_eq!(tx_reserve(16, 1), 17);
-        assert_eq!(tx_reserve(16, 0), 16);
-        assert_eq!(tx_reserve(0, 0), 0);
-    }
-
-    #[test]
     #[should_panic(expected = "TX reserve exceeds usize")]
     fn tx_reserve_refuses_pending_overflow() {
         tx_reserve(1, usize::MAX);
@@ -126,7 +116,8 @@ mod tests {
     /// reserve + share. ENA keeps its ring posted (1023 mbufs: it refills once min(ring / 8,
     /// 256) descriptors are empty), staging is full and the sockets hold their whole share, so
     /// what is free is the reserve minus those. The Port reads the pool as low while free <
-    /// `rx_low_mark`; it must not, or every TCP socket drops all out-of-order data for good.
+    /// `rx_low_mark`; it must not, or the Stack prunes out-of-order frames on every turn
+    /// although the sockets hold no more than the share.
     #[test]
     fn reserve_is_not_low_with_the_ring_posted_and_staging_full() {
         let (descriptors, burst, staging, cache) = (1024, 32, 32, 8);

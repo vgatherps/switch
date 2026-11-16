@@ -92,11 +92,36 @@ pub struct StepReport {
     /// Some measured message waited on the budget: a knee here may be the budget's, not the
     /// receiver's.
     pub budget_bound: bool,
-    /// Any sender fell behind schedule; the cause and receiver capacity are not isolated.
+    /// Some worker is behind schedule (`WorkerStep::behind_schedule`); the sweep stops here.
     pub generator_bound: bool,
-    /// TCP/ws: echo time - actual send time, median; the first step's is the budget's baseline.
-    #[serde(skip)]
-    pub service_rtt_p50_ns: Option<u64>,
+    /// TCP/ws: echo time - actual send time; the first step's p50 is the budget's baseline.
+    pub service_rtt_ns: Option<Quantiles>,
+    /// Actual - scheduled send time of measured messages sent fresh off the schedule.
+    pub send_lag_ns: Option<Quantiles>,
+    /// Messages sent, and of those echoed by the end of the drain, over the whole step (warmup
+    /// included), all workers.
+    pub sent: u64,
+    pub echoed: u64,
+    /// Packets the generators' ports sent and received over the same span (each worker's step
+    /// command to the end of its drain): counted at the generators' NICs, not the receiver's.
+    /// Summed over workers; absent if any worker uses junction, which has no local port counters.
+    pub gen_tx_packets: Option<u64>,
+    pub gen_rx_packets: Option<u64>,
+    /// Per worker, in worker order.
+    pub workers: Vec<WorkerStep>,
+}
+
+/// One worker's send-side state at the end of a step.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WorkerStep {
+    /// Its fresh-send lag p99 is over `LAG_LIMIT_NS`: the generator itself is late, not the
+    /// transport (`stops`) or the receiver (owed messages are not fresh).
+    pub behind_schedule: bool,
+    pub backlog_at_end: u64,
+    pub stops: u64,
+    /// Ns after the worker's step start.
+    pub last_send_ns: Option<u64>,
+    pub last_echo_ns: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -116,17 +141,20 @@ pub struct Summary {
     pub complete: bool,
     /// The sweep stopped because a sender fell behind; `run` fails even when complete.
     pub generator_bound: bool,
+    /// The workers behind schedule at the step that stopped the sweep.
+    pub behind_workers: Vec<u32>,
     pub error: Option<String>,
 }
 
-/// A generator whose send lag (actual - scheduled send time) p99 is above this fell behind.
+/// A generator whose fresh-send lag (actual - scheduled send time) p99 is above this fell behind.
 const LAG_LIMIT_NS: u64 = 20_000;
 
 /// Merges the workers' results of one step (`results[g]` from worker g).
 pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepReport, String> {
     let mut latency = Histogram::new();
     let mut rtt = Histogram::new();
-    let mut generator_bound = false;
+    let mut lag = Histogram::new();
+    let mut workers = Vec::with_capacity(results.len());
     for (g, r) in results.iter().enumerate() {
         if r.step != step {
             return Err(format!(
@@ -136,8 +164,15 @@ pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepRepor
         }
         latency.merge(&Histogram::from_sparse(&r.latency)?);
         rtt.merge(&Histogram::from_sparse(&r.service_rtt)?);
-        let lag_p99 = Histogram::from_sparse(&r.send_lag)?.quantile(0.99);
-        generator_bound |= r.backlog_at_end > 0 || lag_p99.is_some_and(|p| p > LAG_LIMIT_NS);
+        let worker_lag = Histogram::from_sparse(&r.send_lag)?;
+        lag.merge(&worker_lag);
+        workers.push(WorkerStep {
+            behind_schedule: worker_lag.quantile(0.99).is_some_and(|p| p > LAG_LIMIT_NS),
+            backlog_at_end: r.backlog_at_end,
+            stops: r.stops,
+            last_send_ns: r.last_send_ns,
+            last_echo_ns: r.last_echo_ns,
+        });
     }
     let sum = |f: fn(&StepResult) -> u64| results.iter().map(f).sum::<u64>();
     let (measured, received) = (sum(|r| r.measured), sum(|r| r.received));
@@ -154,8 +189,14 @@ pub fn merge(args: &Args, step: u32, results: &[StepResult]) -> Result<StepRepor
         },
         latency_ns: Quantiles::of(&latency),
         budget_bound: sum(|r| r.budget_waits) > 0,
-        generator_bound,
-        service_rtt_p50_ns: rtt.quantile(0.5),
+        generator_bound: workers.iter().any(|w| w.behind_schedule),
+        service_rtt_ns: Quantiles::of(&rtt),
+        send_lag_ns: Quantiles::of(&lag),
+        sent: sum(|r| r.sent),
+        echoed: sum(|r| r.echoed),
+        gen_tx_packets: results.iter().map(|r| r.tx_packets).sum(),
+        gen_rx_packets: results.iter().map(|r| r.rx_packets).sum(),
+        workers,
     })
 }
 
@@ -327,6 +368,7 @@ fn run_schedule(
         steps: 0,
         complete: false,
         generator_bound: false,
+        behind_workers: Vec::new(),
         error: None,
     };
     let result = sweep(args, schedule, &mut summary, out, progress);
@@ -340,8 +382,8 @@ fn run_schedule(
     result?;
     if summary.generator_bound {
         return Err(format!(
-            "stopped after {} steps: a sender fell behind schedule; receiver capacity is not isolated",
-            summary.steps
+            "stopped after {} steps: sender behind schedule: worker(s) {:?}",
+            summary.steps, summary.behind_workers
         ));
     }
     Ok(())
@@ -473,7 +515,7 @@ fn sweep(
             budget_per_connection: budgets,
         }).expect("report serializes"));
         if id == 0 && window_ns.is_some() {
-            baseline_rtt_ns = report.service_rtt_p50_ns;
+            baseline_rtt_ns = report.service_rtt_ns.as_ref().map(|q| q.p50);
             if baseline_rtt_ns.is_none() {
                 return Err(
                     "no echo in the first step: no baseline round trip for the budget".into(),
@@ -482,6 +524,11 @@ fn sweep(
         }
         if report.generator_bound {
             summary.generator_bound = true;
+            summary.behind_workers = (0u32..)
+                .zip(&report.workers)
+                .filter(|(_, w)| w.behind_schedule)
+                .map(|(g, _)| g)
+                .collect();
             break;
         }
     }
@@ -540,6 +587,13 @@ mod tests {
             backlog_at_end: backlog,
             service_rtt: Histogram::new().to_sparse(),
             budget_waits: 0,
+            stops: 0,
+            last_send_ns: None,
+            last_echo_ns: None,
+            sent: measured,
+            echoed: latencies.len() as u64,
+            tx_packets: Some(0),
+            rx_packets: Some(0),
         }
     }
 
@@ -659,14 +713,13 @@ mod tests {
                 &mut |stage| stages.push(stage.to_owned()),
             );
             assert_eq!(status.is_ok(), name == "on-time", "{name}");
-            let milestones = &stages[..stages.len() - 1];
+            let milestones: Vec<&str> = stages[..stages.len() - 1]
+                .iter()
+                .map(|s| s.split(':').next().unwrap())
+                .collect();
             assert_eq!(
                 milestones,
-                &[
-                    "processes up: all workers replied ready",
-                    "processes synced: all worker clocks checked",
-                    "sweep start: dispatching first rate",
-                ][..expected],
+                &["processes up", "processes synced", "sweep start"][..expected],
                 "{name}"
             );
             assert!(stages.last().unwrap().starts_with("sweep end:"), "{name}");
@@ -775,6 +828,53 @@ mod tests {
         assert_eq!(lines[1]["complete"], true);
     }
 
+    /// The step line carries the merged service round trip and send lag quantiles, each
+    /// worker's backlog, Stop count and last send and echo times, and the messages sent and
+    /// packets counted at the generators' NICs, summed over the workers.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn step_line_carries_service_rtt_and_send_lag() {
+        let mut sample = result(0, &[1000], &[300], 1, 0);
+        let mut rtt = Histogram::new();
+        rtt.record(40_000);
+        sample.service_rtt = rtt.to_sparse();
+        sample.stops = 3;
+        sample.last_send_ns = Some(5_000_000);
+        sample.last_echo_ns = Some(5_040_000);
+        sample.sent = 40;
+        sample.echoed = 35;
+        sample.tx_packets = Some(50);
+        sample.rx_packets = Some(70);
+        let mut args = args();
+        args.gens = 2;
+        args.gen_cmd = fake_worker("step-line", &sample, 1);
+        let (r, lines) = run_lines(&args);
+        assert_eq!(r, Ok(()));
+        let step = &lines[0];
+        let q = |v: &serde_json::Value| (v["p50"].as_u64().unwrap(), v["max"].as_u64().unwrap());
+        let (p50, max) = q(&step["service_rtt_ns"]);
+        assert!((40_000 - 40_000 / 128..=40_000).contains(&p50) && max == 40_000, "{step}");
+        assert_eq!(q(&step["send_lag_ns"]), (300, 300));
+        let worker = serde_json::json!({
+            "behind_schedule": false,
+            "backlog_at_end": 0,
+            "stops": 3,
+            "last_send_ns": 5_000_000,
+            "last_echo_ns": 5_040_000,
+        });
+        assert_eq!(step["workers"], serde_json::json!([worker, worker]));
+        assert_eq!(step["sent"], 80);
+        assert_eq!(step["echoed"], 70);
+        assert_eq!(step["gen_tx_packets"], 100);
+        assert_eq!(step["gen_rx_packets"], 140);
+
+        sample.tx_packets = None;
+        sample.rx_packets = None;
+        let report = merge(&args, sample.step, &[sample]).unwrap();
+        assert_eq!(report.gen_tx_packets, None);
+        assert_eq!(report.gen_rx_packets, None);
+    }
+
     /// TCP/ws with a budget: no echo in the first step leaves no baseline, and the sweep fails
     /// instead of running the later steps uncapped.
     #[test]
@@ -790,19 +890,39 @@ mod tests {
         assert_eq!(lines[1]["complete"], false);
     }
 
-    /// A sweep that stops at a generator-bound step ends with a complete summary that says so,
-    /// and is not a success.
+    /// A sweep that stops at a step where a sender is behind schedule ends with a complete
+    /// summary naming the workers, and is not a success.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn a_generator_bound_sweep_is_not_a_success() {
         let mut args = args();
         args.rate_max = 4000;
-        args.gen_cmd = fake_worker("bound", &result(0, &[1000], &[100], 1, 7), 10);
+        args.gen_cmd = fake_worker("bound", &result(0, &[1000], &[25_000; 100], 1, 0), 10);
         let (r, lines) = run_lines(&args);
         assert!(r.is_err());
         assert_eq!(lines.len(), 2, "stopped after the first step");
         assert_eq!(lines[1]["complete"], true);
         assert_eq!(lines[1]["generator_bound"], true);
+        assert_eq!(lines[1]["behind_workers"], serde_json::json!([0, 1]));
+    }
+
+    /// A step whose only problems are the receiver's (echoes missing, a backlog at the end, the
+    /// pool refusing sends) while fresh sends are on time does not end the sweep.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn receiver_backlog_does_not_end_the_sweep() {
+        let mut slow = result(0, &[1000], &[1000], 10, 7);
+        slow.stops = 40;
+        let mut args = args();
+        args.rate_max = 4000;
+        args.gen_cmd = fake_worker("receiver-backlog", &slow, 10);
+        let (r, lines) = run_lines(&args);
+        assert_eq!(r, Ok(()));
+        assert_eq!(lines.len(), rates(1000, 4000).len() + 1, "every step ran");
+        let summary = lines.last().unwrap();
+        assert_eq!(summary["generator_bound"], false);
+        assert_eq!(lines[0]["workers"][0]["backlog_at_end"], 7);
+        assert_eq!(lines[0]["workers"][0]["stops"], 40);
     }
 
     /// Latency quantiles are those of all echoes together, and loss is measured minus received
@@ -820,17 +940,21 @@ mod tests {
         assert!(!m.generator_bound);
     }
 
-    /// One generator falling behind (a backlog at the end, or send-lag p99 over the limit)
-    /// flags the merged step.
+    /// One generator whose fresh-send lag p99 is over the limit flags the merged step; a backlog
+    /// at the end or pool stops do not.
     #[test]
     fn one_overloaded_generator_flags_the_step() {
         let fine = result(0, &[1000], &[1000], 1, 0);
-        let backlogged = result(0, &[1000], &[1000], 1, 7);
+        let mut backlogged = result(0, &[1000], &[1000], 1, 7);
+        backlogged.stops = 5;
         let lagging = result(0, &[1000], &[25_000; 100], 1, 0);
-        let bound = |r: &[StepResult]| merge(&args(), 0, r).unwrap().generator_bound;
-        assert!(!bound(&[fine.clone(), fine.clone()]));
-        assert!(bound(&[fine.clone(), backlogged]));
-        assert!(bound(&[lagging, fine]));
+        let m = |r: &[StepResult]| merge(&args(), 0, r).unwrap();
+        assert!(!m(&[fine.clone(), fine.clone()]).generator_bound);
+        assert!(!m(&[fine.clone(), backlogged]).generator_bound);
+        let lag = m(&[fine, lagging]);
+        assert!(lag.generator_bound);
+        let behind: Vec<bool> = lag.workers.iter().map(|w| w.behind_schedule).collect();
+        assert_eq!(behind, [false, true]);
     }
 
     #[test]
@@ -1027,7 +1151,7 @@ mod tests {
         );
         let started = Instant::now();
         let e = replies(&mut workers, Duration::from_millis(300)).unwrap_err();
-        assert_eq!(e, "generator 1: generator silent for 300ms");
+        assert!(e.starts_with("generator 1:") && e.contains("silent"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
         for w in &mut workers {
             assert!(w.child.try_wait().unwrap().is_some(), "worker left running");
@@ -1051,12 +1175,14 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn a_worker_that_does_not_exit_is_killed() {
         let w = Worker::spawn("exec sleep 30").unwrap();
+        let pid = w.child.id() as libc::pid_t;
         let started = Instant::now();
-        assert_eq!(
-            w.exit(Duration::from_millis(200)).unwrap_err(),
-            "did not exit within 200ms; killed"
-        );
+        assert!(w.exit(Duration::from_millis(200)).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
         let w = Worker::spawn("read line; exit 3").unwrap();
         assert_eq!(w.exit(Duration::from_secs(5)).unwrap().code(), Some(3));
     }

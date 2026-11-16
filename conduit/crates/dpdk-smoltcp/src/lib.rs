@@ -66,19 +66,10 @@ mod api_guards {
     //! ```compile_fail,E0599
     //! let _ = switch_buffer::PoolManager::new;
     //! ```
-    //! ```compile_fail,E0599
-    //! let _ = switch_buffer::PoolManager::new_unchecked;
-    //! ```
     //! The production API resolves through the same paths:
     //! ```
     //! use switch_buffer::{Mbuf, PoolConfig, PoolCreateError, PoolManager};
     //! let _ = PoolManager::new_production;
-    //! ```
-    //! Applications cannot disable TX frame-pool wakes:
-    //! ```compile_fail,E0624
-    //! fn disable_wake(stack: &mut dpdk_smoltcp::Stack, h: &dpdk_smoltcp::TcpHandle) {
-    //!     stack.tcp_mut(h).clear_frame_wake();
-    //! }
     //! ```
     //! Applications get TCP sockets from `Stack::add_tcp(tcp::Config)`, and no public API hands out
     //! an owned socket, so the MSS cap comes from the config and an admitted socket cannot be

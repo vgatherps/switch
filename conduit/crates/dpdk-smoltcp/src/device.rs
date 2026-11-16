@@ -15,8 +15,7 @@ use crate::port::{eth_tx_prepare, Packet, Port, PortError, RxBurst, TxPacket};
 /// smoltcp device over one Port with bounded RX staging and TX pending queues.
 ///
 /// Tokens are issued only with a free pending slot and a full-frame TX packet
-/// in hand, so `TxToken::consume` never fails or allocates. Otherwise
-/// `receive` returns `None` and the RX packet stays staged. Frame tokens need
+/// in hand, so `TxToken::consume` never fails or allocates. Frame tokens need
 /// only the free pending slot: the frame is the caller's.
 pub(crate) struct Device {
     rx: VecDeque<Packet>,
@@ -122,8 +121,8 @@ impl Device {
         self.tx.len()
     }
 
-    pub(crate) fn rx_pool_low(&mut self, received: usize) -> bool {
-        self.port.rx_pool_low(received)
+    pub(crate) fn rx_pool_shortfall(&self) -> usize {
+        self.port.rx_pool_shortfall()
     }
 
     pub(crate) fn port_mut(&mut self) -> &mut Port {
@@ -183,13 +182,9 @@ impl phy::Device for Device {
     type TxToken<'a> = Tx<'a>;
     type FrameToken<'a> = FrameTx<'a>;
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Rx<'_>, Tx<'_>)> {
-        if self.rx.is_empty() {
-            return None;
-        }
-        let tx = reserve(&self.port, &mut self.tx, &mut self.spare)?;
+    fn receive(&mut self, _timestamp: Instant) -> Option<Rx<'_>> {
         let rx = self.rx.pop_front()?;
-        Some((Rx(rx, &self.port), tx))
+        Some(Rx(rx, &self.port))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Tx<'_>> {

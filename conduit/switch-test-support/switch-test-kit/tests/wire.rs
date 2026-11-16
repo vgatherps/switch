@@ -93,44 +93,6 @@ fn link_duplicates_each_frame_in_order_without_leak() {
 }
 
 #[switch_test_support::pinned_test]
-fn link_copies_exact_bytes_each_way_into_the_receivers_pool() {
-    with_eal(|eal| {
-        let fixtures = [RingPort::new("wire_a", 16, 16), RingPort::new("wire_b", 16, 16)];
-        let [a, b] = &fixtures;
-        let mut ports = fixtures.each_ref().map(|fixture| fixture.open(eal));
-
-        // A → B: in order, exact bytes, each pool holding only its own packets.
-        let sent: Vec<_> = (0..5).map(sized).collect();
-        send(&mut ports[0], &sent);
-        assert_eq!(a.in_use(), (0, 5));
-        let mut a_to_b = a.link_to(b);
-        assert_eq!(a_to_b.forward(), 5);
-        assert_eq!((a_to_b.pool_empty, a_to_b.ring_full), (0, 0));
-        assert_eq!((a.in_use(), b.in_use()), ((0, 0), (5, 0)));
-        assert_eq!(receive(&mut ports[1]), sent);
-        assert_eq!(b.in_use(), (0, 0));
-
-        // B → A.
-        let sent = vec![sized(7), sized(8)];
-        send(&mut ports[1], &sent);
-        let mut b_to_a = b.link_to(a);
-        assert_eq!(b_to_a.forward(), 2);
-        assert_eq!((b_to_a.pool_empty, b_to_a.ring_full), (0, 0));
-        assert_eq!((b.in_use(), a.in_use()), ((0, 0), (2, 0)));
-        assert_eq!(receive(&mut ports[0]), sent);
-        assert_eq!(a.in_use(), (0, 0));
-
-        drop((a_to_b, b_to_a));
-        for port in ports {
-            port.try_close().unwrap();
-        }
-        for fixture in fixtures {
-            fixture.close();
-        }
-    });
-}
-
-#[switch_test_support::pinned_test]
 fn link_drop_hold_pause_counted_without_leak() {
     with_eal(|eal| {
         let sender = RingPort::new("lis", 16, 16);

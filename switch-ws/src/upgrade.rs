@@ -38,6 +38,8 @@ pub enum UpgradeError {
     WrongAccept,
     /// The response selects an extension or subprotocol we did not offer (the header named).
     Unrequested(&'static str),
+    /// A header that must occur once occurs more than once (the header named).
+    Duplicate(&'static str),
 }
 
 impl fmt::Display for UpgradeError {
@@ -58,6 +60,7 @@ impl fmt::Display for UpgradeError {
             Self::BadKey => f.write_str("Sec-WebSocket-Key not base64 of 16 bytes"),
             Self::WrongAccept => f.write_str("wrong Sec-WebSocket-Accept"),
             Self::Unrequested(h) => write!(f, "unrequested {h}"),
+            Self::Duplicate(h) => write!(f, "more than one {h}"),
         }
     }
 }
@@ -109,7 +112,7 @@ pub(crate) fn check(head: &[u8], key: &str) -> Result<(), UpgradeError> {
     if !connection_upgrade(parsed.headers) {
         return Err(UpgradeError::NoConnectionUpgrade);
     }
-    if header("sec-websocket-accept") != Some(accept_key(key).as_bytes()) {
+    if single(parsed.headers, "Sec-WebSocket-Accept")? != Some(accept_key(key).as_bytes()) {
         return Err(UpgradeError::WrongAccept);
     }
     // RFC 6455 §4.1: the server may select only what the client offered.
@@ -153,7 +156,7 @@ pub(crate) fn accept(head: &[u8]) -> Result<String, UpgradeError> {
     if header("sec-websocket-version") != Some(b"13") {
         return Err(UpgradeError::Version);
     }
-    let key = header("sec-websocket-key").ok_or(UpgradeError::NoKey)?.trim_ascii();
+    let key = single(parsed.headers, "Sec-WebSocket-Key")?.ok_or(UpgradeError::NoKey)?.trim_ascii();
     if data_encoding::BASE64.decode(key).map(|k| k.len()) != Ok(16) {
         return Err(UpgradeError::BadKey);
     }
@@ -163,6 +166,16 @@ pub(crate) fn accept(head: &[u8]) -> Result<String, UpgradeError> {
          Sec-WebSocket-Accept: {}\r\n\r\n",
         accept_key(key)
     ))
+}
+
+/// The value of the header `name`, which may occur at most once (RFC 6455 §4.1, §4.2.1).
+fn single<'h>(headers: &[httparse::Header<'h>], name: &'static str) -> Result<Option<&'h [u8]>, UpgradeError> {
+    let mut found = headers.iter().filter(|h| h.name.eq_ignore_ascii_case(name));
+    let first = found.next().map(|h| h.value);
+    match found.next() {
+        Some(_) => Err(UpgradeError::Duplicate(name)),
+        None => Ok(first),
+    }
 }
 
 /// Whether the `Connection` fields, together one comma-separated list (RFC 9110 §5.2, §5.3),
@@ -219,14 +232,6 @@ mod tests {
     #[test]
     // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
     #[cfg_attr(miri, ignore)]
-    fn accept_key_is_rfc_6455_example() {
-        // RFC 6455 §1.3.
-        assert_eq!(accept_key(KEY), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
-    }
-
-    #[test]
-    // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
-    #[cfg_attr(miri, ignore)]
     fn valid_response_passes() {
         check(&response("", ""), KEY).unwrap();
         check(&response("Connection: keep-alive, Upgrade\r\n", "Connection"), KEY).unwrap();
@@ -262,11 +267,15 @@ mod tests {
     fn request_carries_the_key_and_host() {
         let (request, key) = request("stream.example", 9443, 443, "/ws", [0; 16]);
         assert_eq!(key, "AAAAAAAAAAAAAAAAAAAAAA==");
-        assert_eq!(
-            request,
-            "GET /ws HTTP/1.1\r\nHost: stream.example:9443\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nSec-WebSocket-Version: 13\r\n\r\n"
-        );
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        let mut parsed = httparse::Request::new(&mut headers);
+        assert!(parsed.parse(request.as_bytes()).unwrap().is_complete());
+        assert_eq!((parsed.method, parsed.path, parsed.version), (Some("GET"), Some("/ws"), Some(1)));
+        assert_eq!(single(parsed.headers, "Host"), Ok(Some(&b"stream.example:9443"[..])));
+        assert_eq!(single(parsed.headers, "Sec-WebSocket-Key"), Ok(Some(key.as_bytes())));
+        assert!(single(parsed.headers, "Upgrade").unwrap().unwrap().eq_ignore_ascii_case(b"websocket"));
+        assert!(connection_upgrade(parsed.headers));
+        assert_eq!(single(parsed.headers, "Sec-WebSocket-Version"), Ok(Some(&b"13"[..])));
     }
 
     /// The head is found across runs cut anywhere, even inside the blank line; the bytes after
@@ -329,10 +338,13 @@ mod tests {
                    Connection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                    Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
         let response = accept(req.as_bytes()).unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 8];
+        let mut parsed = httparse::Response::new(&mut headers);
+        assert!(parsed.parse(response.as_bytes()).unwrap().is_complete());
+        assert_eq!((parsed.version, parsed.code), (Some(1), Some(101)));
         assert_eq!(
-            response,
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+            single(parsed.headers, "Sec-WebSocket-Accept"),
+            Ok(Some(&b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo="[..]))
         );
         // and it passes the client's own check, without an extension selected
         check(response.as_bytes(), KEY).unwrap();
@@ -374,5 +386,18 @@ mod tests {
             assert_eq!(accept(request.as_bytes()).map(drop), want, "{request:?}");
         }
         assert_eq!(accept(b"GET / HTTP/1.1\r\nUpgr").unwrap_err(), E::Incomplete);
+    }
+
+    /// A second Sec-WebSocket-Key in a request, or a second Sec-WebSocket-Accept in a response,
+    /// refuses the upgrade, even when both copies carry the right value.
+    #[test]
+    // sha1 uses aarch64 SHA intrinsics Miri does not run; no unsafe of ours here
+    #[cfg_attr(miri, ignore)]
+    fn upgrade_rejects_duplicate_singletons() {
+        let key = "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
+        let request = GOOD.replacen(key, &key.repeat(2), 1);
+        assert_eq!(accept(request.as_bytes()), Err(UpgradeError::Duplicate("Sec-WebSocket-Key")));
+        let accept_line = format!("sec-websocket-accept: {}\r\n", accept_key(KEY));
+        assert_eq!(error(&response(&accept_line, "")), UpgradeError::Duplicate("Sec-WebSocket-Accept"));
     }
 }

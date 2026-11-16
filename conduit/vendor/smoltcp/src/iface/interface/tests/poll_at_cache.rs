@@ -1,5 +1,6 @@
 use super::*;
 use crate::iface::SocketHandle;
+use crate::iface::socket_meta::Meta;
 use crate::socket::tcp;
 use crate::tests::{setup_eth, strip_eth, wrap_eth, TestingDevice};
 use crate::time::Duration;
@@ -105,10 +106,10 @@ fn establish(
     let handle = connect(iface, sockets, 1234);
     assert_eq!(iface.poll_at(START, sockets), Some(Instant::ZERO));
     iface.poll_egress(START, device, sockets);
-    assert_eq!(
-        iface.poll_at(START, sockets),
-        Some(Instant::from_millis(384))
-    );
+    let PollAt::Time(deadline) = sockets.get(handle).poll_at() else {
+        panic!("SYN has no retransmit timer");
+    };
+    assert_wake_by(iface, sockets, START, deadline);
     let (port, control, seq, payload) = take_tcp(device);
     assert_eq!((port, control), (1234, TcpControl::Syn));
     assert!(payload.is_empty());
@@ -129,26 +130,41 @@ fn establish(
     (handle, seq + 1)
 }
 
+/// The cached wake is in the future and no later than `deadline`.
+fn assert_wake_by(iface: &mut Interface, sockets: &mut TcpSet, now: Instant, deadline: Instant) {
+    let wake = iface.poll_at(now, sockets).expect("no wake scheduled");
+    assert!(now < wake && wake <= deadline, "wake {wake:?} not in ({now:?}, {deadline:?}]");
+}
+
 #[test]
 fn deadline_follows_app_change_without_ingress() {
     let (mut iface, mut sockets, mut device) = setup_eth();
     let (handle, seq) = establish(&mut iface, &mut sockets, &mut device);
-    sockets.get_mut(handle).set_rto(Duration::from_millis(100));
+    sockets.get_mut(handle).seed_rto(Duration::from_millis(100));
     assert_eq!(iface.poll_at(START, &mut sockets), None);
     assert_eq!(sockets.get_mut(handle).send_slice(b"abc"), Ok(3));
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::ZERO));
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(192)));
+    assert_wake_by(&mut iface, &mut sockets, START, START + Duration::from_millis(100));
+    let armed = sockets.get(handle).poll_at();
+    assert_eq!(armed, PollAt::Time(START + Duration::from_millis(100)));
     assert_eq!(take_tcp(&mut device).3, b"abc");
-    sockets.get_mut(handle).set_rto(Duration::from_millis(300));
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(192)));
+    sockets.get_mut(handle).seed_rto(Duration::from_millis(300));
+    assert_wake_by(&mut iface, &mut sockets, START, START + Duration::from_millis(100));
+    assert_eq!(sockets.get(handle).poll_at(), armed);
     receive(&mut iface, &mut sockets, &mut device, START,
         segment(1234, TcpControl::None, 101, Some(seq + 3)));
     assert_eq!(iface.poll_at(START, &mut sockets), None);
+    // The ACK's 0 µs RTT sample moved the estimate off the seed; fix it again.
+    sockets.get_mut(handle).seed_rto(Duration::from_millis(300));
     assert_eq!(sockets.get_mut(handle).send_slice(b"def"), Ok(3));
     iface.poll_egress(START, &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).3, b"def");
-    assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::from_millis(384)));
+    assert_wake_by(&mut iface, &mut sockets, START, START + Duration::from_millis(300));
+    assert_eq!(
+        sockets.get(handle).poll_at(),
+        PollAt::Time(START + Duration::from_millis(300))
+    );
     assert!(device.rx_queue.is_empty());
 }
 
@@ -158,19 +174,17 @@ fn remove_and_reuse_resets_deadline() {
     let handle = connect(&mut iface, &mut sockets, 1234);
     assert_eq!(iface.poll_at(START, &mut sockets), Some(Instant::ZERO));
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(
-        iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(1024))
-    );
+    assert_wake_by(&mut iface, &mut sockets, START, START + Meta::DISCOVERY_SILENT_TIME);
     assert_eq!(sockets.waiting, vec![0]);
+    let slot = sockets.waiting[0];
     sockets.remove(handle);
     assert!(sockets.waiting.is_empty());
     assert_eq!(iface.poll_at(START, &mut sockets), None);
     let mut listener = socket();
     listener.listen(1234).unwrap();
     let reused = sockets.add(listener);
+    assert_eq!(reused, sockets.handle_at(slot));
     assert_ne!(reused, handle);
-    assert_eq!(reused.to_string(), handle.to_string());
     assert_eq!(iface.poll_at(START, &mut sockets), None);
     sockets.remove(reused);
     connect(&mut iface, &mut sockets, 1234);
@@ -183,17 +197,14 @@ fn waiting_socket_switches_when_silence_ends() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
     let handle = connect(&mut iface, &mut sockets, 1234);
     iface.poll_egress(START, &mut device, &mut sockets);
-    let silent_until = START + Duration::from_secs(1);
-    for (now, expected) in [
-        (START, Instant::from_millis(1024)),
-        (silent_until - Duration::from_millis(1), silent_until),
-    ] {
-        assert_eq!(
-            iface.poll_at(now, &mut sockets),
-            Some(expected)
-        );
-        assert_eq!(sockets.waiting, vec![0]);
-    }
+    let silent_until = START + Meta::DISCOVERY_SILENT_TIME;
+    assert_wake_by(&mut iface, &mut sockets, START, silent_until);
+    assert_eq!(sockets.waiting, vec![0]);
+    assert_eq!(
+        iface.poll_at(silent_until - Duration::from_millis(1), &mut sockets),
+        Some(silent_until)
+    );
+    assert_eq!(sockets.waiting, vec![0]);
     assert_eq!(sockets.get(handle).poll_at(), PollAt::Now);
     assert_eq!(
         iface.poll_at(silent_until, &mut sockets),
@@ -210,10 +221,7 @@ fn neighbor_learned_releases_waiting_deadline() {
     let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
     let handle = connect(&mut iface, &mut sockets, 1234);
     iface.poll_egress(START, &mut device, &mut sockets);
-    assert_eq!(
-        iface.poll_at(START, &mut sockets),
-        Some(Instant::from_millis(1024))
-    );
+    assert_wake_by(&mut iface, &mut sockets, START, START + Meta::DISCOVERY_SILENT_TIME);
     let learned = START + Duration::from_millis(1);
     iface.inner.neighbor_cache.fill(
         REMOTE.into(),
@@ -224,10 +232,10 @@ fn neighbor_learned_releases_waiting_deadline() {
     assert_eq!(iface.poll_at(learned, &mut sockets), Some(Instant::ZERO));
     iface.poll_egress(learned, &mut device, &mut sockets);
     assert!(sockets.waiting.is_empty());
-    assert_eq!(
-        iface.poll_at(learned, &mut sockets),
-        Some(Instant::from_millis(384))
-    );
+    let PollAt::Time(retransmit) = sockets.get(handle).poll_at() else {
+        panic!("SYN has no retransmit timer");
+    };
+    assert_wake_by(&mut iface, &mut sockets, learned, retransmit);
 }
 
 #[test]
@@ -303,7 +311,7 @@ fn cached_poll_at_matches_full_scan_under_churn() {
         let now = Instant::from_millis(150 + index as i64);
         let port = 1234 + index as u16;
         let handle = handles[index];
-        sockets.get_mut(handle).set_rto(Duration::from_millis(100));
+        sockets.get_mut(handle).seed_rto(Duration::from_millis(100));
         assert_eq!(iface.poll_at(now, &mut sockets), None);
         receive(
             &mut iface,
@@ -352,7 +360,7 @@ fn cached_poll_at_matches_full_scan_under_churn() {
     let now = Instant::from_millis(200);
     for (index, &handle) in handles.iter().enumerate() {
         if index < 8 {
-            sockets.get_mut(handle).set_rto(Duration::from_millis(25));
+            sockets.get_mut(handle).seed_rto(Duration::from_millis(25));
             sockets.close(handle);
         } else {
             sockets.abort(handle);
@@ -432,7 +440,8 @@ fn poll_at_matches_full_scan_with_wheel() {
         handles.push(handle);
     }
     let delays = [
-        Duration::from_millis(1),
+        // The 50 ms RTO floor.
+        Duration::from_millis(50),
         Duration::from_micros(105_500),
         Duration::from_millis(140),
         Duration::from_secs(1),
@@ -441,17 +450,17 @@ fn poll_at_matches_full_scan_with_wheel() {
     ];
     let mut sequences = Vec::new();
     for (index, &handle) in handles.iter().enumerate() {
-        sockets.get_mut(handle).set_rto(delays.get(index).copied().unwrap_or(Duration::from_secs(60)));
+        sockets.get_mut(handle).seed_rto(delays.get(index).copied().unwrap_or(Duration::from_secs(60)));
         assert_eq!(sockets.get_mut(handle).send_slice(b"x"), Ok(1));
         iface.poll_egress(start, &mut device, &mut sockets);
         let (_, _, seq, payload) = take_tcp(&mut device);
         assert_eq!(payload, b"x");
         sequences.push(seq);
     }
-    assert_eq!(iface.poll_at(start, &mut sockets), Some(Instant::from_millis(-99)));
-    iface.poll_egress(Instant::from_micros(-99_001), &mut device, &mut sockets);
+    assert_eq!(iface.poll_at(start, &mut sockets), Some(Instant::from_millis(-50)));
+    iface.poll_egress(Instant::from_micros(-50_001), &mut device, &mut sockets);
     assert!(device.tx_queue.is_empty());
-    iface.poll_egress(Instant::from_millis(-99), &mut device, &mut sockets);
+    iface.poll_egress(Instant::from_millis(-50), &mut device, &mut sockets);
     assert_eq!(take_tcp(&mut device).0, 1234);
     assert_eq!(sockets.get(handles[0]).state(), tcp::State::Established);
     sockets.remove(handles[0]);
@@ -468,7 +477,7 @@ fn poll_at_matches_full_scan_with_wheel() {
                     segment(1234 + index as u16, TcpControl::None, 101, Some(sequences[index] + 1)));
                 sequences[index] += 1;
             }
-            sockets.get_mut(handle).set_rto(churn_delays[(index + turn) % 4]);
+            sockets.get_mut(handle).seed_rto(churn_delays[(index + turn) % 4]);
             assert_eq!(sockets.get_mut(handle).send_slice(b"x"), Ok(1));
             iface.poll_egress(start, &mut device, &mut sockets);
             assert_eq!(take_tcp(&mut device).3, b"x");

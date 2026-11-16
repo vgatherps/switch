@@ -103,29 +103,35 @@ impl TxQueue {
         });
     }
 
-    pub(crate) fn append_tail(&mut self, sent: usize, data: &[u8], cap: usize) -> usize {
+    /// Bytes the tail frame can still take while it stays at most `cap` long: zero unless it
+    /// is unique and none of it has been sent.
+    pub(crate) fn tail_room(&self, sent: usize, cap: usize) -> usize {
         let first_never_sent = self.acked + sent as u64;
-        let byte_room = self.byte_room();
-        let Some(entry) = self.entries.back_mut() else {
+        let Some(entry) = self.entries.back() else {
             return 0;
         };
         if first_never_sent > entry.start() {
             return 0;
         }
+        let buf = entry.buf.as_ref().expect("TX queue tail is taken");
+        // SAFETY: queued frames came from this queue's source.
+        #[allow(unsafe_code)]
+        let room = unsafe { crate::phy::frame_tail_room(buf) };
+        room.min(self.byte_room()).min(cap.saturating_sub(buf.len()))
+    }
+
+    pub(crate) fn append_tail(&mut self, sent: usize, data: &[u8], cap: usize) -> usize {
+        let count = self.tail_room(sent, cap).min(data.len());
+        if count == 0 {
+            return 0;
+        }
+        let entry = self.entries.back_mut().expect("TX queue tail has room");
         let shared = entry.buf.take().expect("TX queue tail is taken");
-        let mut buf = match shared.try_own() {
-            Ok(buf) => buf,
-            Err(shared) => {
-                entry.buf = Some(shared);
-                return 0;
-            }
-        };
+        let mut buf = shared.try_own().expect("TX queue tail is unique");
         // SAFETY: queued frames came from this queue's source. Only an unsent unique
         // tail can grow into the producer's remaining room.
         #[allow(unsafe_code)]
-        let count = unsafe {
-            crate::phy::append_frame(&mut buf, &data[..data.len().min(byte_room)], cap)
-        };
+        unsafe { crate::phy::append_frame(&mut buf, &data[..count], cap) };
         entry.buf = Some(buf.freeze());
         entry.end += count as u64;
         self.end = entry.end;
@@ -374,16 +380,9 @@ mod tests {
         assert_eq!(queue.append_tail(0, &[3, 4, 5], 4), 2);
         assert_eq!(queue.len(), 4);
         assert_eq!(queue.entries[0].buf.as_ref().unwrap().as_ref(), &[1, 2, 3, 4]);
-        assert_eq!(queue.append_tail(1, &[5], 1), 0);
-    }
-
-    #[test]
-    fn append_tail_refuses_shared_frame() {
-        let (mut queue, _) = queue(8, 6);
-        queue.push_bytes(&[1, 2]);
-        let clone = queue.entries[0].buf.as_ref().unwrap().clone();
-        assert_eq!(queue.append_tail(0, &[3], 1), 0);
-        drop(clone);
+        assert_eq!(queue.append_tail(1, &[5], 6), 0);
+        assert_eq!(queue.len(), 4);
+        assert_eq!(queue.entries[0].buf.as_ref().unwrap().as_ref(), &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -509,20 +508,6 @@ mod tests {
         let (index, frame) = queue.take_whole(0, 2).unwrap();
         assert_eq!((index, frame.as_ref()), (0, &[1, 2][..]));
         queue.put_back(index, frame.freeze());
-    }
-
-    #[test]
-    fn take_put_back_keeps_positions() {
-        let (mut queue, _) = queue(16, 8);
-        queue.push_bytes(&[1, 2]);
-        queue.push_bytes(&[3, 4, 5]);
-        let frame = queue.take(1);
-        assert_eq!(frame.as_ref(), &[3, 4, 5]);
-        assert_eq!(queue.len(), 5);
-        queue.put_back(1, frame);
-        assert_eq!(cut(queue.segment(3, 1)), &[4]);
-        assert_eq!(queue.entries[0].end, 2);
-        assert_eq!(queue.entries[1].end, 5);
     }
 
     #[test]

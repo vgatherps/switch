@@ -11,14 +11,17 @@ import report
 SVG = "{http://www.w3.org/2000/svg}"
 
 
-def step(pps, p99, drop=0.0, bound=False):
+def step(pps, p99, drop=0.0, bound=False, rtt_p99=None, lag_p99=None):
+    def q(p):
+        return None if p is None else {"p50": p // 2, "p99": p, "p999": p * 2, "max": p * 3}
     return {"kind": "step", "offered_pps": pps, "sent_pps": pps * 0.99, "received_pps": pps * 0.98,
             "drop_fraction": drop, "budget_bound": False, "generator_bound": bound,
-            "latency_ns": None if p99 is None else {"p50": p99 // 2, "p99": p99, "p999": p99 * 2, "max": p99 * 3}}
+            "latency_ns": q(p99), "service_rtt_ns": q(rtt_p99), "send_lag_ns": q(lag_p99)}
 
 
 def summary(steps=2, complete=True, error=None, bound=False):
-    return {"kind": "summary", "steps": steps, "complete": complete, "generator_bound": bound, "error": error}
+    return {"kind": "summary", "steps": steps, "complete": complete, "generator_bound": bound,
+            "behind_workers": [1] if bound else [], "error": error}
 
 
 def write_jsonl(path, lines):
@@ -73,6 +76,8 @@ class ReportTest(unittest.TestCase):
             self.assertEqual(report.main(["report.py", d]), 0)
             write_jsonl(os.path.join(d, "udp-a.jsonl"), [step(1000, 10_000, bound=True), summary(1, bound=True)])
             self.assertEqual(report.main(["report.py", d]), 1)
+            with open(os.path.join(d, "report.md")) as f:
+                self.assertIn("- udp-a: sender behind schedule: worker(s) [1]", f.read())
 
     def test_an_empty_results_directory_is_incomplete(self):
         with tempfile.TemporaryDirectory() as d:
@@ -89,8 +94,7 @@ class ReportTest(unittest.TestCase):
             md = "\n".join(md)
             self.assertEqual(issues, [])
             self.assertTrue(md.startswith("# T"))
-            self.assertIn("| not echoed % |", md)
-            self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - |", md)
+            self.assertIn("| 1000 | 990 | 980 | 0.000 | 5.0 | 10.0 | 20.0 | 30.0 | - | - | - | - | - | - | - |", md)
             self.assertIn(f"Commit: `{source['commit']}`", md)
             self.assertIn(f"Archive SHA-256: `{source['archive_sha256']}`", md)
             self.assertTrue(os.path.exists(os.path.join(d, "udp-switch.svg")))
@@ -101,6 +105,22 @@ class ReportTest(unittest.TestCase):
             self.assertNotIn("Thread placement", md)
             self.assertNotIn("INVALID", md)
             self.assertNotIn("placement", results["sweeps"][0])
+
+    def test_packet_ratios_are_generator_nic_packets_per_message(self):
+        s = step(1000, 10_000)
+        s.update(sent=4000, echoed=3000, gen_tx_packets=5000, gen_rx_packets=9000)
+        t = report.table([s])
+        self.assertIn("| gen tx packets per sent message | gen rx packets per echo |", t)
+        self.assertIn("| 1.25 | 3.00 | - |", t)
+        s.update(sent=0, echoed=0)
+        self.assertIn("| - | - | - | - | - | - | - |", report.table([s]))
+        s.update(sent=4000, echoed=3000, gen_tx_packets=None, gen_rx_packets=None)
+        self.assertIn("| - | - | - | - | - | - | - |", report.table([s]))
+
+    def test_the_step_table_shows_service_rtt_and_send_lag(self):
+        t = report.table([step(1000, 10_000, rtt_p99=8_000, lag_p99=600)])
+        self.assertIn("| service RTT p50 µs | service RTT p99 µs | send lag p50 µs | send lag p99 µs |", t)
+        self.assertIn("| 30.0 | 4.0 | 8.0 | 0.3 | 0.6 | - | - | - |", t)
 
     def test_placement_tables_show_backend_host_cpu_ids_and_core_counts(self):
         with tempfile.TemporaryDirectory() as d:

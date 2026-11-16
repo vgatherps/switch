@@ -17,7 +17,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     TcpRepr, TcpSeqNumber,
 };
 use dpdk_smoltcp::{
-    frame_reserve, rx_reserve, ReadySide, Stack, StackConfig, TcpHandle, Turn,
+    frame_reserve, rx_reserve, Stack, StackConfig, TcpHandle, Turn,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
 use switch_dpdk_sys::{
@@ -465,18 +465,19 @@ fn ack_before_tx_completion_frees_on_drain() {
     });
 }
 
-/// Three frames sent while the TX ring has one free slot: the PMD takes the
-/// first, the other two stay pending.
+/// Three frames, each sent before the next is queued, while the TX ring has
+/// one free slot: the PMD takes the first, the other two stay pending.
 fn frames_in_ring_and_pending(eal: &dpdk_smoltcp::Eal, name: &str) -> (Host, Conn) {
     let mut host = Host::new(eal, name, 1, None);
     let conn = host.connect(LOCAL_PORT, small_socket());
     // The ring holds RING − 1; leave one slot.
     host.occupy_tx_ring(RING as usize - 2);
+    let mut accepted = 0;
     for payload in [b"one", b"two", b"six"] {
         host.send_frame(&conn, payload);
+        accepted += host.stack.send().unwrap().tx_accepted;
     }
-    let sent = host.stack.send().unwrap();
-    assert_eq!((sent.tx_accepted, sent.tx_pending), (1, 2));
+    assert_eq!((accepted, host.stack.flush().unwrap().tx_pending), (1, 2));
     assert_eq!(host.frame_in_use(), 3);
     (host, conn)
 }
@@ -861,6 +862,21 @@ fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
     });
 }
 
+/// A `tx_frame` the application holds is one frame fewer for this lcore to allocate; dropping it
+/// gives it back.
+#[switch_test_support::pinned_test]
+fn free_frames_counts_an_application_held_tx_frame() {
+    with_eal(|eal| {
+        let mut host = Host::new(eal, "freefrm", 1, None);
+        let free = host.stack.free_frames();
+        let frame = host.stack.tx_frame().unwrap();
+        assert_eq!(host.stack.free_frames(), free - 1);
+        drop(frame);
+        assert_eq!(host.stack.free_frames(), free);
+        host.finish();
+    });
+}
+
 /// Individually emitted small writes may occupy more frames than the full-sized
 /// estimate; the byte limit and the shared pool still bound queued data.
 #[switch_test_support::pinned_test]
@@ -892,57 +908,6 @@ fn small_writes_exceed_frame_estimate_but_respect_byte_capacity() {
         assert_eq!(sent[0].tcp().payload, b"x");
         drop(sent);
         host.ack(&conn, conn.seq + 9);
-        host.finish();
-    });
-}
-
-/// With the application holding the rest, sockets A and C take the shared frame pool's last
-/// frames. B's `send_slice` returns `Ok(0)` and
-/// B's application arms B's TX token; D is in the same wait and is removed. When the peer ACKs
-/// A's data, the next turn finds free frames and fires B's token, with no retry from B; B's send
-/// then goes out. Removing D took it off the wait.
-#[switch_test_support::pinned_test]
-fn frame_pool_wait_fires_the_tx_token_when_frames_return() {
-    with_eal(|eal| {
-        let pool = frame_reserve(RING as u16, PENDING);
-        let mut host = Host::new(eal, "framwake", 4, Some(pool as u32));
-        let a = host.connect(LOCAL_PORT, small_socket());
-        let c = host.connect(LOCAL_PORT + 1, small_socket());
-        let b = host.connect(LOCAL_PORT + 2, small_socket());
-        let d = host.connect(LOCAL_PORT + 3, small_socket());
-        // The app holds all but 2 * 3 frames; A's and C's 4096-byte sends take those.
-        let mut held = Vec::new();
-        while let Some(frame) = host.stack.tx_frame() {
-            held.push(frame);
-        }
-        held.truncate(pool - 6);
-        let fill = pair::pattern(4096, 13);
-        assert_eq!(host.stack.tcp_mut(&a.handle).send_slice(&fill), Ok(4096));
-        assert_eq!(host.stack.tcp_mut(&c.handle).send_slice(&fill), Ok(4096));
-        assert!(host.stack.tx_frame().is_none());
-        assert_eq!(host.stack.tcp_mut(&b.handle).send_slice(b"b waits"), Ok(0));
-        assert_eq!(host.stack.tcp_mut(&d.handle).send_slice(b"d waits"), Ok(0));
-        let key = host.stack.tcp_ready_key(&b.handle);
-        host.stack.arm_tcp(key, ReadySide::Tx, 7);
-        host.stack.remove_tcp(d.handle);
-        host.turn();
-        drop(host.take());
-        assert_eq!(host.stack.pop_fired(), None, "A's and C's frames are not acknowledged yet");
-
-        host.ack(&a, a.seq + 4096);
-        // The ACK freed A's frames; the next turn finds one and fires B's token.
-        host.turn();
-        assert_eq!(host.stack.pop_fired(), Some(7));
-        assert_eq!(host.stack.pop_fired(), None);
-        assert_eq!(host.stack.tcp_mut(&b.handle).send_slice(b"b waits"), Ok(7));
-        host.turn();
-        let sent = host.take();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].tcp().payload, b"b waits");
-        drop(sent);
-        host.ack(&b, b.seq + 7);
-        host.ack(&c, c.seq + 4096);
-        drop(held);
         host.finish();
     });
 }

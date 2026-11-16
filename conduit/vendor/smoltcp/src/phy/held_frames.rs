@@ -1,28 +1,18 @@
 use alloc::rc::Rc;
-use core::cell::{Cell, RefCell};
-
-use crate::iface::{DropQueue, SocketHandle};
+use core::cell::Cell;
 
 #[derive(Debug)]
 pub(crate) struct RxShared {
     pub(crate) held: Cell<usize>,
-    pub(crate) wake: RefCell<Option<(DropQueue, SocketHandle)>>,
-    /// The socket is on its DropQueue's frame-wait list: a send found the shared frame pool
-    /// empty, and the driver wakes the socket once the pool has a frame again.
-    pub(crate) frame_wait_queued: Cell<bool>,
 }
 
 impl RxShared {
-    /// Create an empty held-frame count with no frame-pool wake.
+    /// Create an empty held-frame count.
     pub(crate) fn new() -> Rc<RxShared> {
-        Rc::new(RxShared {
-            held: Cell::new(0),
-            wake: RefCell::new(None),
-            frame_wait_queued: Cell::new(false),
-        })
+        Rc::new(RxShared { held: Cell::new(0) })
     }
 
-    /// Count one more frame: drained TCP frames, and UDP datagrams from the moment they are queued.
+    /// Count one more UDP datagram, from the moment it is queued.
     #[inline]
     pub(crate) fn hold(&self) {
         self.held.set(self.held.get().checked_add(1).expect("held frame count overflow"));
@@ -32,25 +22,6 @@ impl RxShared {
     #[inline]
     pub(crate) fn release(&self) {
         self.held.set(self.held.get().checked_sub(1).expect("held frame count underflow"));
-    }
-
-    /// Queue the socket's wake for when the frame pool has a free frame again, once per wait.
-    #[cold]
-    pub(crate) fn queue_frame_wait(&self) {
-        if let Some((queue, handle)) = self.wake.borrow().as_ref() {
-            if !self.frame_wait_queued.replace(true) {
-                queue.push_frame_wait(*handle);
-            }
-        }
-    }
-
-    /// Take the socket off the frame-wait list, as when it is removed.
-    pub(crate) fn cancel_frame_wait(&self) {
-        if self.frame_wait_queued.replace(false) {
-            if let Some((queue, handle)) = self.wake.borrow().as_ref() {
-                queue.remove_frame_wait(*handle);
-            }
-        }
     }
 }
 

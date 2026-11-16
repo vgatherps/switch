@@ -1,5 +1,5 @@
-//! Running a Net's tasks: the loop owner's round (turn, poll) and the races tasks bound their
-//! waits with.
+//! Running a Net's tasks: the loop owner's round (receive, poll, send) and the races tasks
+//! bound their waits with.
 
 use std::future::{Future, poll_fn};
 use std::pin::pin;
@@ -16,13 +16,19 @@ pub enum RoundError {
     Runtime(RuntimeError),
 }
 
-/// One `net.turn(now)` and one `rt.poll(tick)`; never sleeps. Returns whether anything moved:
-/// something received, processed, sent, staged or still pending, or a task polled. A loop that
-/// may sleep when nothing moved does so itself, until `net.poll_at()` at the latest.
+/// `net.receive(now)`, `rt.poll(tick)`, then `net.send()`, so a reply a woken task queued
+/// leaves in this round; never sleeps. Returns whether anything moved: something received,
+/// processed, sent, staged or still pending, or a task polled. A loop that may sleep when
+/// nothing moved does so itself, until `net.poll_at()` at the latest.
 pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result<bool, RoundError> {
-    let turn = net.turn(now).map_err(RoundError::Turn)?;
+    let received = net.receive(now).map_err(RoundError::Turn)?;
     let polled = rt.poll(tick).map_err(RoundError::Runtime)?;
-    Ok(turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0)
+    let sent = net.send().map_err(RoundError::Turn)?;
+    Ok(received.moved()
+        || received.rx_staged > 0
+        || polled.tasks_polled > 0
+        || sent.tx_accepted > 0
+        || sent.tx_pending > 0)
 }
 
 /// `a`'s output, or `None` if `b` finishes first; `a` is polled first. Dropping `a` drops what

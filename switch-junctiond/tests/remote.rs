@@ -112,8 +112,9 @@ impl Remote {
 
     fn round(&mut self) {
         let progressed = self.fixture.round_links();
-        self.net.turn(self.fixture.now).unwrap();
+        self.net.receive(self.fixture.now).unwrap();
         self.rt.poll(0).unwrap();
+        self.net.send().unwrap();
         if !progressed { self.fixture.advance(); }
     }
 
@@ -420,13 +421,14 @@ fn remote_session_loss_wakes_operations_and_turn_reports_host_lost() {
             assert!(WallInstant::now() < deadline, "host loss did not reach Net");
             // Do not advance Network: Binding must stay pending until host loss,
             // rather than racing a real Bound event against the host's EOF.
-            match m.net.turn(m.fixture.now) {
+            match m.net.receive(m.fixture.now) {
                 Ok(_) => std::thread::yield_now(),
                 Err(switch_net::TurnError::HostLost(_)) => break,
-                Err(other) => panic!("wrong turn failure: {other:?}"),
+                Err(other) => panic!("wrong receive failure: {other:?}"),
             }
         }
-        assert!(matches!(m.net.turn(m.fixture.now), Err(switch_net::TurnError::HostLost(_))));
+        assert!(matches!(m.net.receive(m.fixture.now), Err(switch_net::TurnError::HostLost(_))));
+        assert!(matches!(m.net.send(), Err(switch_net::TurnError::HostLost(_))));
         m.rt.poll(0).unwrap();
         assert_eq!(receiving.take(), Error::InvalidState);
         assert!(matches!(accepting.take(), Err(Error::HostLost)));
@@ -609,7 +611,7 @@ fn remote_ring_data_published_before_session_loss_is_received_first() {
         // Host has dropped the Unix socket. A real control write records loss
         // synchronously, without a successful Net turn draining the ring first.
         tx.shutdown();
-        assert!(matches!(m.net.turn(m.fixture.now), Err(switch_net::TurnError::HostLost(_))));
+        assert!(matches!(m.net.receive(m.fixture.now), Err(switch_net::TurnError::HostLost(_))));
         let receiving = m.spawn(async move {
             let frame = rx.recv().await.unwrap();
             assert_eq!(frame.payload(), b"before loss");

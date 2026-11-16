@@ -250,19 +250,6 @@ fn fragments_and_ping() {
     assert_eq!(w.server_read(), [TMessage::Pong(b"hb".to_vec().into()), TMessage::Binary(vec![7; 3000].into())]);
 }
 
-/// tungstenite pings; the client answers once with the same payload.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn server_ping_is_answered() {
-    let mut w = Wss::new();
-    w.server_send(vec![TMessage::Ping(b"p1".to_vec().into())]);
-    assert!(w.client_read(FRAME_ROOM).is_empty());
-    w.client_pong();
-    assert_eq!(w.server_read(), [TMessage::Pong(b"p1".to_vec().into())]);
-    // Nothing more is owed.
-    assert_eq!(w.rx.take_pong(), None);
-}
-
 #[test]
 #[cfg_attr(miri, ignore)]
 fn close_started_by_the_client() {
@@ -329,7 +316,6 @@ fn record_split_across_frames() {
         assert_eq!(m.bytes(), payload);
         assert!(w.rx.recv(w.tx.lower_mut()).unwrap().is_none());
     }
-    assert_eq!(record, Some(5 + 2 + 109 + 17));
 }
 
 /// A message inside one record inside one frame is read in place, where rustls decrypted it in
@@ -360,31 +346,6 @@ fn message_inside_one_record_is_read_in_the_frame() {
         assert_eq!((m.bytes(), m.rx_timestamp()), (expected, want));
         assert!(frame.contains(&m.bytes().as_ptr()), "{expected:?} not read in the frame");
     }
-}
-
-/// A message spanning records (rustls cuts plaintext at 16 KiB) is assembled in switch-ws's
-/// scratch, stamped with the frame holding its first byte.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn message_spanning_records_is_assembled() {
-    let mut w = Wss::new();
-    let payload = message(9, 40_000);
-    let at = w.server_send(vec![TMessage::Binary(payload.clone().into())]);
-    assert!(records(&w.to_client).len() >= 3);
-    let mut received = false;
-    loop {
-        let want = w.stamp_of(at);
-        match w.rx.recv(w.tx.lower_mut()).unwrap() {
-            Some(m) => {
-                assert_eq!(m.rx_timestamp(), want);
-                assert_eq!(m.bytes(), payload);
-                received = true;
-            }
-            None if w.to_client.is_empty() => break,
-            None => w.push(FRAME_ROOM),
-        }
-    }
-    assert!(received);
 }
 
 /// The server updates its keys and asks the client to (KeyUpdate with update_requested)

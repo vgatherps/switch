@@ -8,7 +8,6 @@ use super::*;
 use tungstenite::protocol::{Role as TRole, WebSocket, WebSocketConfig};
 use tungstenite::{Error as TError, Message as TMessage};
 
-const MAX_FRAME: usize = 300;
 const MAX_MESSAGE: usize = 600;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -16,8 +15,15 @@ enum End {
     /// The bytes ran out between frames.
     Eof,
     Close(Option<u16>),
-    /// Close code of the failure: 1002, 1007, 1009.
-    Fail(u16),
+    Fail(Class),
+}
+
+/// tungstenite's failure classes.
+#[derive(Debug, PartialEq, Eq)]
+enum Class {
+    Protocol,
+    Utf8,
+    Capacity,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28,7 +34,8 @@ struct Outcome {
 }
 
 fn tungstenite(role: Role, wire: &[u8]) -> Outcome {
-    let cfg = WebSocketConfig::default().max_frame_size(Some(MAX_FRAME)).max_message_size(Some(MAX_MESSAGE));
+    // switch-ws limits a frame only by `max_message`.
+    let cfg = WebSocketConfig::default().max_frame_size(Some(MAX_MESSAGE)).max_message_size(Some(MAX_MESSAGE));
     let trole = if role == Role::Server { TRole::Server } else { TRole::Client };
     let mut ws = WebSocket::from_raw_socket(Duplex(Cursor::new(wire.to_vec())), trole, Some(cfg));
     let mut out = Outcome { msgs: Vec::new(), ping: None, end: End::Eof };
@@ -45,15 +52,15 @@ fn tungstenite(role: Role, wire: &[u8]) -> Outcome {
             Ok(TMessage::Frame(_)) => unreachable!(),
             Err(TError::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake)) => return out,
             Err(TError::Protocol(_)) => {
-                out.end = End::Fail(1002);
+                out.end = End::Fail(Class::Protocol);
                 return out;
             }
             Err(TError::Utf8(_)) => {
-                out.end = End::Fail(1007);
+                out.end = End::Fail(Class::Utf8);
                 return out;
             }
             Err(TError::Capacity(_)) => {
-                out.end = End::Fail(1009);
+                out.end = End::Fail(Class::Capacity);
                 return out;
             }
             Err(e) => panic!("unexpected tungstenite error {e:?}"),
@@ -62,7 +69,7 @@ fn tungstenite(role: Role, wire: &[u8]) -> Outcome {
 }
 
 fn switch_ws(role: Role, wire: &[u8], cuts: &[usize]) -> Outcome {
-    let cfg = Config::new(role, Limits { max_frame: MAX_FRAME, max_message: MAX_MESSAGE, ..Limits::default() });
+    let cfg = Config::new(role, Limits { max_message: MAX_MESSAGE, ..Limits::default() });
     let mut rx = WsRx::new(Raw::new(), cfg);
     let run = drive(&mut rx, &split(wire, cuts));
     let end = match run.end {
@@ -71,7 +78,9 @@ fn switch_ws(role: Role, wire: &[u8], cuts: &[usize]) -> Outcome {
             let p = rx.peer_close().unwrap();
             End::Close((p.len() >= 2).then(|| u16::from_be_bytes([p[0], p[1]])))
         }
-        Some(WsError::Protocol(e)) => End::Fail(e.close_code()),
+        Some(WsError::Protocol(crate::ProtocolError::InvalidUtf8)) => End::Fail(Class::Utf8),
+        Some(WsError::Protocol(crate::ProtocolError::MessageTooBig)) => End::Fail(Class::Capacity),
+        Some(WsError::Protocol(_)) => End::Fail(Class::Protocol),
         Some(WsError::Lower(e)) => match e {},
     };
     Outcome { msgs: run.msgs.into_iter().map(|g| (g.kind, g.payload)).collect(), ping: run.pong, end }
@@ -138,7 +147,7 @@ fn stream(rng: &mut Rng, role: Role) -> Vec<u8> {
                 5 => (PING, Vec::new()),
                 6 => (fin(PING), rng.bytes(126)),
                 7 => {
-                    let n = MAX_FRAME + 1 + rng.below(50);
+                    let n = MAX_MESSAGE + 1 + rng.below(50);
                     (fin(BINARY), rng.bytes(n))
                 }
                 8 => {
@@ -176,7 +185,7 @@ fn same_outcome_as_tungstenite() {
         *ends.entry(format!("{:?}", want.end)).or_default() += 1;
     }
     // Every ending class shows up, so the comparison is not vacuous.
-    for key in ["Eof", "Fail(1002)", "Fail(1007)", "Fail(1009)", "Close(None)", "Close(Some(1000))", "Close(Some(1002))"] {
+    for key in ["Eof", "Fail(Protocol)", "Fail(Utf8)", "Fail(Capacity)", "Close(None)", "Close(Some(1000))", "Close(Some(1002))"] {
         assert!(ends.get(key).copied().unwrap_or(0) > 10, "{key}: {ends:?}");
     }
 }

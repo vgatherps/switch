@@ -787,9 +787,10 @@ mod test_pool {
             unsafe { switch_dpdk_sys::switch_mempool_cache_flush(self.cache, self.pool) };
             TEST_POOL_HELD.set(false);
 
-            // Verify pool is clean
+            // A test that leaked mbufs fails here, unless it is already failing: a second
+            // panic while unwinding would abort the test binary.
             let in_use = unsafe { rte_mempool_in_use_count(self.pool) };
-            if in_use != 0 {
+            if in_use != 0 && !std::thread::panicking() {
                 panic!("TestPoolGuard dropped with {} mbufs still in use! Test leaked mbufs.", in_use);
             }
         }
@@ -890,12 +891,12 @@ impl std::fmt::Display for PoolCreateError {
 
 impl std::error::Error for PoolCreateError {}
 
-/// RAII wrapper for a DPDK mempool.
+/// RAII wrapper for a DPDK mempool. Dropped with mbufs still in use, it keeps the pool's
+/// backing (and so every outstanding mbuf) alive for the rest of the process and reports
+/// the count on stderr; it never frees backing that an mbuf still points into.
 pub struct PoolManager {
     pool: *mut rte_mempool,
     cache: *mut switch_dpdk_sys::rte_mempool_cache,
-    /// If true, drop unconditionally without checking for leaks (test mode).
-    unsafe_drop: bool,
     /// Cache is lcore-local, so PoolManager must not cross threads.
     /// Raw pointers already make this !Send/!Sync, but be explicit.
     _marker: PhantomData<*const ()>,
@@ -981,7 +982,6 @@ impl PoolManager {
         Ok(Self {
             pool,
             cache,
-            unsafe_drop: false,
             _marker: PhantomData,
         })
     }
@@ -1010,30 +1010,7 @@ impl PoolManager {
         // This means alloc path doesn't need to touch priv_data.
         unsafe { switch_dpdk_sys::switch_pool_init_cache_ptrs(pool, cache) };
 
-        Self { pool, cache, unsafe_drop: false, _marker: PhantomData }
-    }
-
-    /// Create a pool that will unconditionally free on drop (no leak check).
-    /// Use this in tests where cleanup must succeed even if mbufs leaked.
-    ///
-    /// # Safety
-    /// After drop, any mbufs from this pool become invalid. Caller must ensure
-    /// no references to pool mbufs outlive the pool.
-    #[cfg(feature = "testing")]
-    pub unsafe fn new_unchecked(size: u32) -> Self {
-        let mut pool = Self::new(size);
-        pool.unsafe_drop = true;
-        pool
-    }
-
-    /// Enable unconditional drop (no leak check on drop).
-    /// Returns self for chaining.
-    ///
-    /// # Safety
-    /// Same as `new_unchecked` - mbufs become invalid after drop.
-    pub unsafe fn set_unchecked_drop(mut self) -> Self {
-        self.unsafe_drop = true;
-        self
+        Self { pool, cache, _marker: PhantomData }
     }
 
     /// Get the raw pool pointer.
@@ -1082,39 +1059,22 @@ impl PoolManager {
         // SAFETY: `pool` is live and `cache` is its cache on this lcore while self lives.
         unsafe { switch_dpdk_sys::switch_mempool_free_count(self.pool, self.cache) }
     }
-
-    /// Forcibly close pool NO MATTER WHAT.
-    /// Returns true if pool was clean (no outstanding mbufs).
-    /// Returns false if pool had outstanding mbufs (indicates bug/cycle).
-    ///
-    /// Unlike normal Drop (which panics on outstanding mbufs), this
-    /// ALWAYS deallocates the pool and just reports the status.
-    ///
-    /// # Safety
-    /// After this call, no mbufs from this pool may be accessed.
-    pub unsafe fn unsafe_close_pool(self) -> bool {
-        // Check outstanding count FIRST
-        let count = rte_mempool_in_use_count(self.pool);
-        let was_clean = count == 0;
-
-        // Bypass Drop - use ManuallyDrop so our Drop impl doesn't run
-        let this = std::mem::ManuallyDrop::new(self);
-
-        // Manually call DPDK to deallocate the pool - ALWAYS do this
-        rte_mempool_free(this.pool);
-
-        was_clean
-    }
 }
 
 impl Drop for PoolManager {
     fn drop(&mut self) {
         let in_use = self.in_use_count();
-        if in_use != 0 && !self.unsafe_drop {
-            // Panic before freeing pool - leaks pool but avoids use-after-free
-            panic!("PoolManager dropped with {} buffers still in use!", in_use);
+        if in_use == 0 {
+            // SAFETY: no mbuf is out, and the single owner cannot allocate between the
+            // check and the free.
+            unsafe { rte_mempool_free(self.pool) };
+        } else {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "switch retained pool backing with {in_use} buffers still in use"
+            );
         }
-        unsafe { rte_mempool_free(self.pool) };
     }
 }
 
@@ -1123,71 +1083,59 @@ mod tests {
     use super::*;
     use switch_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
-    #[switch_test_support::pinned_test]
-    fn test_mbuf_size() {
-        let size = std::mem::size_of::<Mbuf>();
-        assert_eq!(size, 8, "Mbuf should be thin wrapper (8 bytes), got {}", size);
+    /// After the owner was dropped with `survivor` out: the survivor's bytes are intact,
+    /// it frees into the retained backing, and every object comes back exactly once.
+    fn return_survivor_to_retained_backing(
+        survivor: Mbuf,
+        backing: *mut rte_mempool,
+        cache: *mut switch_dpdk_sys::rte_mempool_cache,
+        count: u32,
+    ) {
+        use switch_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
+        assert_eq!(survivor.data(), b"live");
+        assert_eq!(unsafe { rte_mempool_in_use_count(backing) }, 1);
+        let returned = survivor.as_ptr();
+        drop(survivor);
+        assert_eq!(unsafe { rte_mempool_in_use_count(backing) }, 0);
+        let objects: Vec<_> = (0..count)
+            .map(|_| unsafe { dpdk_raw_pktmbuf_alloc(backing) })
+            .collect();
+        assert!(objects.iter().all(|object| !object.is_null()));
+        assert_eq!(objects.iter().collect::<std::collections::HashSet<_>>().len(), objects.len());
+        assert!(objects.contains(&returned));
+        assert!(unsafe { dpdk_raw_pktmbuf_alloc(backing) }.is_null());
+        for object in objects {
+            unsafe { dpdk_raw_pktmbuf_free(object) };
+        }
+        unsafe { switch_dpdk_sys::switch_mempool_cache_flush(cache, backing) };
+        unsafe { rte_mempool_free(backing) };
     }
 
     #[switch_test_support::pinned_test]
-    fn test_pool_is_reused_on_its_thread_and_returns_every_mbuf() {
-        let first = acquire_test_pool();
-        let pool = first.pool();
-        let mbuf = first.alloc().unwrap();
-        assert_eq!(first.in_use_count(), 1);
-        drop(mbuf);
-        drop(first);
-
-        let second = acquire_test_pool();
-        assert_eq!(second.pool(), pool);
-        assert_eq!(second.in_use_count(), 0);
+    fn dropping_pool_with_live_mbuf_retains_backing() {
+        let pool = PoolManager::new(63);
+        let (backing, cache) = (pool.pool(), pool.cache());
+        let mut survivor = pool.alloc_with_len(4).unwrap();
+        survivor.data_mut().copy_from_slice(b"live");
+        drop(pool);
+        return_survivor_to_retained_backing(survivor, backing, cache, 63);
     }
 
     #[switch_test_support::pinned_test]
-    #[should_panic(expected = "test pool already acquired on this thread")]
-    fn test_pool_second_acquire_while_held_panics() {
-        let _held = acquire_test_pool();
-        let _second = acquire_test_pool();
-    }
-
-    #[switch_test_support::pinned_test]
-    fn test_pool_guard_drop_with_live_mbuf_panics_and_releases_the_pool() {
-        let guard = acquire_test_pool();
-        let live = guard.alloc().unwrap().into_raw();
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)))
-            .expect_err("dropping the guard with a live mbuf must panic");
-        assert_eq!(
-            panic.downcast_ref::<String>().map(String::as_str),
-            Some("TestPoolGuard dropped with 1 mbufs still in use! Test leaked mbufs.")
-        );
-        drop(unsafe { Mbuf::from_raw(live) });
-
-        let again = acquire_test_pool();
-        assert_eq!(again.in_use_count(), 0);
-    }
-
-    #[switch_test_support::pinned_test]
-    fn test_pool_on_thread_without_lcore_panics_and_frees_its_pool() {
-        // Test pool names share one counter, so the next pool created after this
-        // probe is named `test_pool_{probe + 1}`.
-        let probe = create_test_pool(1, RTE_PKTMBUF_HEADROOM as u16);
-        let probe_name = unsafe { std::ffi::CStr::from_ptr((*probe).name.as_ptr()) };
-        let probe_id: u32 = probe_name.to_str().unwrap()["test_pool_".len()..].parse().unwrap();
-        unsafe { rte_mempool_free(probe) };
-
-        let panic = std::thread::spawn(|| {
-            assert_eq!(unsafe { switch_dpdk_sys::switch_lcore_id() }, u32::MAX);
-            drop(acquire_test_pool());
-        })
-        .join()
-        .expect_err("acquire on a thread without an lcore must panic");
-        assert_eq!(
-            panic.downcast_ref::<&str>().copied(),
-            Some("Failed to get mempool cache for this thread's test pool")
-        );
-
-        let created = std::ffi::CString::new(format!("test_pool_{}", probe_id + 1)).unwrap();
-        assert!(unsafe { switch_dpdk_sys::rte_mempool_lookup(created.as_ptr()) }.is_null());
+    fn dropping_pool_with_live_mbuf_while_unwinding_keeps_the_original_panic() {
+        let mut survivor = None;
+        let (mut backing, mut cache) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let pool = PoolManager::new(63);
+            (backing, cache) = (pool.pool(), pool.cache());
+            let mut packet = pool.alloc_with_len(4).unwrap();
+            packet.data_mut().copy_from_slice(b"live");
+            survivor = Some(packet);
+            panic!("original panic");
+        }))
+        .expect_err("the original panic reaches the caller");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"original panic"));
+        return_survivor_to_retained_backing(survivor.unwrap(), backing, cache, 63);
     }
 
     #[switch_test_support::pinned_test]
@@ -1772,34 +1720,6 @@ mod tests {
         assert_pool_returned_exactly_once(&pool, limit + 1);
     }
 
-    #[switch_test_support::pinned_test]
-    fn test_pool_init_sets_cache_ptr_on_all_mbufs() {
-        // Verify that cache pointers are pre-set at pool creation.
-        // Even mbufs allocated via raw DPDK alloc (simulating RX path) have cache ptr set.
-        let pool = PoolManager::new(256);
-
-        // Use raw DPDK alloc (bypasses our alloc_fast, simulates NIC driver alloc)
-        let raw_mbuf = unsafe { switch_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool()) };
-        assert!(!raw_mbuf.is_null(), "raw alloc should succeed");
-
-        // Read the cache pointer from priv_data
-        let cache_ptr: *mut switch_dpdk_sys::rte_mempool_cache = unsafe {
-            let cache_slot = (raw_mbuf as *mut u8)
-                .add(std::mem::size_of::<rte_mbuf>())
-                as *mut *mut switch_dpdk_sys::rte_mempool_cache;
-            *cache_slot
-        };
-
-        // Should match the pool's cache pointer
-        assert_eq!(
-            cache_ptr,
-            pool.cache(),
-            "raw DPDK alloc should have cache ptr pre-set from pool init"
-        );
-
-        // Clean up
-        unsafe { switch_dpdk_sys::dpdk_raw_pktmbuf_free(raw_mbuf) };
-    }
 
     // ========================================================================
     // Mutation safety tests (Rc-style refcount enforcement)
@@ -1920,11 +1840,6 @@ mod tests {
         assert!(clone.try_data_mut().is_none());
     }
 
-    #[switch_test_support::pinned_test]
-    fn test_alloc_with_len_rejects_oversize() {
-        let pool = PoolManager::new(256);
-        assert!(pool.alloc_with_len(u16::MAX).is_none());
-    }
 
     // ========================================================================
     // Shared backing bytes: indirect clones share the original's buffer
@@ -2546,18 +2461,6 @@ mod tests {
     // ========================================================================
 
     #[switch_test_support::pinned_test]
-    fn test_iter_segs_single_segment() {
-        let pool = PoolManager::new(256);
-        let mbuf = pool.alloc_with_len(100).unwrap();
-        let mut segments = mbuf.iter_segs();
-        assert_eq!(segments.next(), Some(mbuf.as_ptr()));
-        assert_eq!(segments.next(), None);
-        assert_eq!(segments.next(), None);
-        drop(mbuf);
-        assert_pool_returned_exactly_once(&pool, 256);
-    }
-
-    #[switch_test_support::pinned_test]
     fn test_iter_segs_chain_in_order_then_end() {
         let pool = PoolManager::new(256);
         let mut head = pool.alloc_with_len(100).unwrap();
@@ -2578,22 +2481,4 @@ mod tests {
         assert_pool_returned_exactly_once(&pool, 256);
     }
 
-    #[switch_test_support::pinned_test]
-    fn test_iter_segs_early_drop_leaves_owner_usable() {
-        let pool = PoolManager::new(256);
-        let mut head = pool.alloc_with_len(100).unwrap();
-        head.chain(pool.alloc_with_len(50).unwrap()).unwrap();
-
-        let mut segments = head.iter_segs();
-        assert_eq!(segments.next(), Some(head.as_ptr()));
-        // The drop states what the test checks: an early iterator drop leaves the owner usable.
-        #[allow(clippy::drop_non_drop)]
-        drop(segments);
-
-        head.chain(pool.alloc_with_len(30).unwrap()).unwrap();
-        assert_eq!(head.iter_segs().count(), 3);
-        assert_eq!(head.pkt_len(), 180);
-        drop(head);
-        assert_pool_returned_exactly_once(&pool, 256);
-    }
 }

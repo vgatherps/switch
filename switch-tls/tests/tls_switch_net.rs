@@ -262,8 +262,9 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
         while held.borrow().is_none() {
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
             rt.poll(clock.ns()).expect("poll the client");
+            net.send().expect("send");
             thread::sleep(ROUND_SLEEP);
         }
         let saw = peer.join();
@@ -507,7 +508,7 @@ fn frames_follow_the_peer_mss(backend: Backend) {
         move |handle, _, stream, _| async move {
             let (rx, tcp) = stream.split();
             let mut tx = SwitchTx::new(&handle, tcp, 1).await.expect("setup");
-            assert_eq!(tx.plain(), (0, 1200));
+            assert_eq!(tx.plain().1, 1200);
             send_bytes(&mut tx, &sent).await.expect("send");
             // the Net turns only until this returns: wait until the peer has every byte
             tx.shutdown();

@@ -526,11 +526,11 @@ fn error_turn_keeps_the_parked_task_for_the_next_turn() {
         mixed.peer.udp_send(&peer, Some(IpEndpoint::new(net_ip().into(), 7000)), b"after error").unwrap();
         mixed.peer.turn(mixed.now, BUDGET).unwrap();
         assert_eq!(mixed.to_net.forward(), 1);
-        let Err(TurnError::Stack(StackError::TimeWentBackwards { .. })) = mixed.net.turn(earlier) else {
-            panic!("turn at an earlier time did not fail")
+        let Err(TurnError::Stack(StackError::TimeWentBackwards { .. })) = mixed.net.receive(earlier) else {
+            panic!("receive at an earlier time did not fail")
         };
         mixed.rt.poll(0).unwrap();
-        assert_eq!(polls.get(), parked, "the failed turn woke the task");
+        assert_eq!(polls.get(), parked, "the failed receive woke the task");
         mixed.turn();
         assert_eq!(polls.get(), parked + 1);
         let (socket, warm, datagram) = slot.take();

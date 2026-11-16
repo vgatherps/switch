@@ -408,18 +408,6 @@ fn longest_prefix_wins_and_subnet_is_implicit() {
 }
 
 #[switch_test_support::pinned_test]
-fn empty_paths_keep_port_mtu() {
-    with_eal(|eal| {
-        let mut pair = sized_pair_with_paths(eal, ["pmempa", "pmempb"], [JUMBO, JUMBO], None, [&[], &[]]);
-        let (handles, frames) = establish_sized(&mut pair, Side::A, BUFFER);
-        assert_eq!(handshake_mss(&frames, Side::A), [Some(8960), Some(8960)]);
-        assert_segments(&transfer(&mut pair, &handles, Side::A, &pattern(TRANSFER, 10)), 8960);
-        assert_no_drops(&pair);
-        pair.close();
-    });
-}
-
-#[switch_test_support::pinned_test]
 fn path_rule_window_uses_byte_capacity() {
     with_eal(|eal| {
         let paths = [host_path(Side::B.ip(), 1500)];

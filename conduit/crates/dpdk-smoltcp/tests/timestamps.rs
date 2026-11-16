@@ -17,8 +17,6 @@ use wire::Verdict;
 const BUDGET: usize = 32;
 /// Upstream `ACK_DELAY_DEFAULT`.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// Default socket RTO.
-const RTO: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -85,19 +83,19 @@ fn connect(pair: &mut Pair, client: tcp::Config) -> [TcpHandle; 2] {
 }
 
 /// Rounds at `at(k)` for round k = 0, 1, ... until both sockets are
-/// Established; returns the stamps and the next k.
+/// Established; returns the stamps.
 fn establish(
     pair: &mut Pair,
     handles: &[TcpHandle; 2],
     at: impl Fn(u64) -> [Instant; 2],
-) -> (Vec<Stamp>, u64) {
+) -> Vec<Stamp> {
     let mut stamps = Vec::new();
     for k in 0..8 {
         stamps.extend(round(pair, at(k)));
         if pair.a.tcp(&handles[0]).state() == State::Established
             && pair.b.tcp(&handles[1]).state() == State::Established
         {
-            return (stamps, k + 1);
+            return stamps;
         }
     }
     panic!("not established after 8 rounds");
@@ -116,8 +114,7 @@ fn stack_connections_never_negotiate_timestamps() {
         let mut pair = Pair::new(eal, ["tsna", "tsnb"], [config(Side::A), config(Side::B)], T0);
         let handles = connect(&mut pair, tcp_socket_sized(4096));
         // Round k at T0 + k ms on both.
-        let (mut stamps, k) = establish(&mut pair, &handles, |k| [T0 + ms(k); 2]);
-        assert_eq!(k, 3);
+        let mut stamps = establish(&mut pair, &handles, |k| [T0 + ms(k); 2]);
         stamps.extend(exchange(&mut pair, &handles, [T0 + ms(10); 2]));
         assert_eq!(
             stamps,
@@ -176,14 +173,18 @@ fn caller_time_controls_retransmission_and_delayed_ack() {
                 Verdict::Drop
             }
         });
+        // RTT samples 0 µs (handshake), then 10 ms (the delayed ACK): RTTVAR = 10000/4 =
+        // 2500 µs, SRTT = 10000/8 = 1250 µs, RTO = 1.25 + max(4 · 2.5, 50) = 51.25 ms,
+        // due at the next whole millisecond.
+        let rto = Duration::from_micros(51_250);
         let sent = w + ms(20);
         assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"world"), Ok(5));
         assert_eq!(round(&mut pair, [sent; 2]), []);
         assert_eq!(pair.a_to_b.dropped, 1);
-        assert!(matches!(pair.a.poll_at(), Some(p) if p > sent && p <= ceil_ms(sent + RTO)));
-        assert_eq!(round(&mut pair, [sent + RTO - ms(1); 2]), []);
+        assert!(matches!(pair.a.poll_at(), Some(p) if p > sent && p <= ceil_ms(sent + rto)));
+        assert_eq!(round(&mut pair, [ceil_ms(sent + rto) - ms(1); 2]), []);
         assert_eq!(
-            timer_segments(round(&mut pair, [sent + RTO; 2])),
+            timer_segments(round(&mut pair, [ceil_ms(sent + rto); 2])),
             [(Dir::AToB, TcpControl::Psh, 5)]
         );
         assert_eq!(pair.close(), 0);

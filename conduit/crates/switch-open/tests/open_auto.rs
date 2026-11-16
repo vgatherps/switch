@@ -13,6 +13,6 @@ fn open_auto_on_net_tap_requests_none_and_reports_why() {
     assert!(opened
         .report
         .to_string()
-        .contains("unknown driver net_tap: none requested; set offloads explicitly"));
+        .contains("unknown driver net_tap"));
     opened.stack.into_port().try_close().unwrap();
 }

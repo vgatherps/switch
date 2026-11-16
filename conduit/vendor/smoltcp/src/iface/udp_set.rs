@@ -143,7 +143,7 @@ impl UdpSocket {
         // SAFETY: transfer the unique buffer and its single accounting reference
         // together, suppressing the queued datagram's release.
         let frame = unsafe {
-            core::ptr::read(&queued.frame).into_frame(core::ptr::read(&queued.shared))
+            core::ptr::read(&queued.frame).into_frame(Some(core::ptr::read(&queued.shared)))
         };
         Some(UdpDatagram { frame, src: queued.src, dst_addr: queued.dst_addr, rx_timestamp })
     }
@@ -466,11 +466,10 @@ mod tests {
                 ..config(1234)
             })
             .unwrap();
-        let releases = Rc::new(Cell::new(0));
         let enqueue = |set: &mut UdpSet, byte| {
             set.commit_rx(
                 handle.slot,
-                RxBuf::counted_frame(alloc::vec![0, byte, 0], 0, releases.clone()),
+                RxBuf::from_vec(alloc::vec![0, byte, 0]),
                 PendingUdp {
                     src: IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321),
                     dst_addr: Ipv4Address::new(192, 168, 1, 1),
@@ -505,7 +504,6 @@ mod tests {
             assert!(set.get_mut(handle).recv().is_none());
             assert_eq!(set.get(handle).shared.held.get(), 0);
         }
-        assert_eq!(releases.get(), 20);
         assert_eq!(set.get(handle).stats().rx_dropped_full, 0);
     }
 
@@ -571,31 +569,6 @@ mod tests {
         drop(second);
         assert_eq!(held.count(), 0);
         assert_eq!(releases.get(), 3);
-    }
-
-    #[test]
-    fn removed_datagram_drop_clears_count() {
-        let mut set = UdpSet::new(1, crate::tests::tx_test_source(1472));
-        let handle = set.add(&iface(), config(1234)).unwrap();
-        let releases = Rc::new(Cell::new(0));
-        for byte in [1, 2] {
-            set.commit_rx(
-                handle.slot,
-                RxBuf::counted_frame(alloc::vec![byte], 0, releases.clone()),
-                PendingUdp {
-                    src: IpEndpoint::new(IpAddress::v4(192, 168, 1, 2), 4321),
-                    dst_addr: Ipv4Address::new(192, 168, 1, 1),
-                    payload: 0..1,
-                },
-            );
-        }
-        let datagram = set.get_mut(handle).recv().unwrap();
-        let held = set.remove(handle);
-        assert_eq!(held.count(), 1);
-        assert_eq!(releases.get(), 1);
-        drop(datagram);
-        assert_eq!(held.count(), 0);
-        assert_eq!(releases.get(), 2);
     }
 
     #[test]

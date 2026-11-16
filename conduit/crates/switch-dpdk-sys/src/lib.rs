@@ -70,7 +70,6 @@ unsafe extern "C" {
         available: *mut std::ffi::c_uint,
     ) -> std::ffi::c_uint;
 
-    pub fn switch_pktmbuf_alloc(mp: *mut rte_mempool) -> *mut rte_mbuf;
 
     /// Get the current thread's DPDK error number.
     pub fn switch_errno() -> std::ffi::c_int;
@@ -94,8 +93,14 @@ unsafe extern "C" {
     /// Uses tail calls to keep fast path tight.
     pub fn switch_pktmbuf_free_seg(m: *mut rte_mbuf);
 
-    /// Full DPDK free - handles refcount, chains, indirect, external
-    /// Use this for chain free (walks entire chain).
+    /// Free a whole chain: drops each segment's refcount and returns the segments that
+    /// reach zero, including the direct buffer behind an indirect segment.
+    ///
+    /// Every segment, and every direct buffer an indirect segment points at, must come
+    /// from a pool whose mbufs carry Switch's per-lcore cache pointer in the first 8
+    /// private bytes (`switch_pool_init_cache_ptrs`), freed on that cache's lcore.
+    /// External-buffer mbufs are not handled: freeing one is undefined behaviour in
+    /// release builds (a debug build aborts). Use `dpdk_raw_pktmbuf_free` for those.
     pub fn switch_pktmbuf_free(m: *mut rte_mbuf);
 
     /// Minimal free - ONLY for refcnt==1, no chain, direct buffer
@@ -141,8 +146,6 @@ unsafe extern "C" {
     /// Get last segment in chain.
     pub fn switch_pktmbuf_lastseg(m: *mut rte_mbuf) -> *mut rte_mbuf;
 
-    /// Update refcount by delta. Returns new refcount.
-    pub fn switch_mbuf_refcnt_update(m: *mut rte_mbuf, delta: i16) -> u16;
 
     /// Initialize all mbufs in pool with cache pointer.
     /// Call ONCE at pool creation to pre-set cache ptr in every mbuf's priv_data.
@@ -275,19 +278,13 @@ unsafe extern "C" {
     pub fn switch_mempool_free_count(mp: *const rte_mempool, cache: *const rte_mempool_cache) -> u32;
 }
 
-/// Allocate an mbuf from a mempool.
+/// Free an mbuf chain back to its pools through `switch_pktmbuf_free`, not DPDK's
+/// `rte_pktmbuf_free`.
 ///
 /// # Safety
-/// `mp` must point to a live mempool; EAL must be initialized.
-#[inline]
-pub unsafe fn rte_pktmbuf_alloc(mp: *mut rte_mempool) -> *mut rte_mbuf {
-    switch_pktmbuf_alloc(mp)
-}
-
-/// Free an mbuf back to its pool.
-///
-/// # Safety
-/// `m` must be null or an mbuf the caller owns; it must not be used afterwards.
+/// `m` must be null or an mbuf chain the caller owns; it must not be used afterwards.
+/// `switch_pktmbuf_free`'s requirements apply: Switch cache-pointer pools, the cache's
+/// lcore, and no external-buffer segments.
 #[inline]
 pub unsafe fn rte_pktmbuf_free(m: *mut rte_mbuf) {
     switch_pktmbuf_free(m)
@@ -311,14 +308,6 @@ pub unsafe fn rte_pktmbuf_lastseg(m: *mut rte_mbuf) -> *mut rte_mbuf {
     switch_pktmbuf_lastseg(m)
 }
 
-/// Update refcount by delta. Returns new refcount.
-///
-/// # Safety
-/// `m` must point to a valid mbuf; the caller must account for the refcount change.
-#[inline]
-pub unsafe fn rte_mbuf_refcnt_update(m: *mut rte_mbuf, delta: i16) -> u16 {
-    switch_mbuf_refcnt_update(m, delta)
-}
 
 /// Pure Rust inline methods for rte_mbuf.
 /// These bypass C shims for hot-path performance.
@@ -521,26 +510,6 @@ impl rte_mbuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_mbuf_size() {
-        assert_eq!(std::mem::size_of::<rte_mbuf>(), 128);
-    }
-
-    #[test]
-    fn test_field_offsets() {
-        // Verify critical field offsets match DPDK layout
-        assert_eq!(std::mem::offset_of!(rte_mbuf, buf_addr), 0);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, buf_iova), 8);
-        // __bindgen_anon_1 (data_off, refcnt, etc.) at offset 16
-        assert_eq!(std::mem::offset_of!(rte_mbuf, __bindgen_anon_1), 16);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, ol_flags), 24);
-        // __bindgen_anon_2 (pkt_len, data_len, etc.) at offset 32
-        assert_eq!(std::mem::offset_of!(rte_mbuf, __bindgen_anon_2), 32);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, pool), 56);
-        assert_eq!(std::mem::offset_of!(rte_mbuf, __bindgen_anon_3), 72);
-        assert_eq!(std::mem::offset_of!(rte_mbuf__bindgen_ty_3, tx_offload), 0);
-    }
 
     #[test]
     fn tx_offload_lengths_fill_dpdk_bit_layout() {

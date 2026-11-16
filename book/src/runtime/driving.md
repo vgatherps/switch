@@ -74,7 +74,7 @@ Anything that wakes or spawns a task between two polls is picked up by the next 
 In `switch/examples/manual_loop.rs`, `EventQueue` stands in for the network: `poll_nonblocking` spawns one task for each event waiting in it.
 
 ```rust,ignore
-{{#include ../../../switch/examples/manual_loop.rs:events_before_poll}}
+{{#include ../../../switch/examples/manual_loop.rs:tick_loop}}
 ```
 
 Two events are dispatched before the first poll, and that poll runs both tasks once. With no new events, the second poll has nothing to do and returns an empty report.

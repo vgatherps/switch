@@ -67,7 +67,7 @@ mod tx;
 pub mod switch_net;
 
 pub use rx::TlsRx;
-pub use tx::{Sealed, TlsTx};
+pub use tx::{CLOSE_NOTIFY_LEN, Sealed, TlsTx};
 
 /// A received TCP segment's payload with its hardware RX timestamp.
 pub trait RxFrame {

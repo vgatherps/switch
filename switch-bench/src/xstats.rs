@@ -41,7 +41,8 @@ fn query(port: u16) -> Result<Counters, String> {
         return Err(format!("rte_eth_xstats_get_names: expected {count}, got {got}"));
     }
     let names: Vec<String> = names.iter().map(|entry| {
-        let bytes: Vec<u8> = entry.name.iter().map(|&c| c as u8).take_while(|&c| c != 0).collect();
+        // c_char is u8 on aarch64 Linux and i8 on x86_64: reinterpret the byte on both
+        let bytes: Vec<u8> = entry.name.iter().map(|&c| u8::from_ne_bytes(c.to_ne_bytes())).take_while(|&c| c != 0).collect();
         String::from_utf8(bytes).map_err(|e| format!("invalid xstat name: {e}"))
     }).collect::<Result<_, _>>()?;
     let mut values: Vec<rte_eth_xstat> = (0..n).map(|_| unsafe { std::mem::zeroed() }).collect();

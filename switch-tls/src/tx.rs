@@ -15,6 +15,9 @@ const KEY_UPDATE_LEN: usize = RECORD_HEAD + 4 + 1 + RECORD_TAIL;
 const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
+/// close_notify's plaintext (an alert): `room(CLOSE_NOTIFY_LEN)` waits for the sealed
+/// close_notify and the KeyUpdates that may precede it, not for a full frame.
+pub const CLOSE_NOTIFY_LEN: usize = 2;
 
 /// Most plaintext rustls puts in one record without a client `max_fragment_size` (TLS's 2^14).
 const MAX_RECORD_PLAINTEXT: usize = 1 << 14;
@@ -107,10 +110,13 @@ impl<L: FrameTx> TlsTx<L> {
     }
 
     /// Seals close_notify into `f`. Later seals fail with [`TxError::Closed`]; receiving goes on.
-    pub fn close_notify(
-        &mut self,
-        mut f: L::Frame,
-    ) -> Result<Sealed<L::Sealed>, TxError<L::Error>> {
+    pub fn close_notify(&mut self, mut f: L::Frame) -> Result<Sealed<L::Sealed>, TxError<L::Error>> {
+        let n = self.write_close_notify(&mut f)?;
+        self.finish(f, n)
+    }
+
+    /// Encrypts close_notify (behind any KeyUpdates due) into `f`; the bytes written.
+    fn write_close_notify(&mut self, f: &mut L::Frame) -> Result<usize, TxError<L::Error>> {
         self.check_sent()?;
         let (head, room) = self.lower.plain();
         let mut traffic = self.write_traffic()?;
@@ -118,7 +124,21 @@ impl<L: FrameTx> TlsTx<L> {
             .queue_close_notify(&mut f.room_mut()[head..head + room])
             .expect("a frame fits a close_notify record");
         self.state = State::Closed;
-        self.finish(f, n)
+        Ok(n)
+    }
+
+    /// Seals close_notify, then sends it, waiting while TCP refuses it for room for the bytes
+    /// sealed (24 B, more only with KeyUpdates in front), not for a full frame. Later seals fail
+    /// with [`TxError::Closed`].
+    pub async fn send_close_notify(&mut self) -> Result<(), TxError<L::Error>> {
+        let mut f = self.alloc().await?;
+        let n = self.write_close_notify(&mut f)?;
+        let mut sealed = self.finish(f, n)?;
+        while let Err(s) = self.try_send(sealed) {
+            sealed = s;
+            self.lower.room(n).await.map_err(TxError::Lower)?;
+        }
+        Ok(())
     }
 
     /// Stops sending after a receive error.

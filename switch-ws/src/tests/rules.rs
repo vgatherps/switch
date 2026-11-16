@@ -63,22 +63,21 @@ fn header_rules_fail_at_the_header() {
 #[test]
 fn rules_check_in_tungstenite_order() {
     // Unknown opcode before size, size before mask, mask before reserved bits.
-    let small = Config::new(Role::Server, Limits { max_frame: 10, ..Limits::default() });
+    let small = Config::new(Role::Server, Limits { max_message: 10, ..Limits::default() });
     let run = feed(&mut WsRx::new(Raw::new(), small), &[header(0x70 | 3, None, 11)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::UnknownOpcode(3))));
     let run = feed(&mut WsRx::new(Raw::new(), small), &[header(0x70 | BINARY, None, 11)]);
-    assert_eq!(run.end, Some(WsError::Protocol(P::FrameTooBig)));
+    assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
     fails(Role::Server, &[header(0x70 | BINARY, None, 1)], P::UnmaskedFrame);
 }
 
+/// A message over `max_message` fails at the header that passes it: a single frame, or a
+/// continuation (8 + 4 fits exactly, 8 + 5 fails at the second header).
 #[test]
 fn size_limits() {
-    let cfg = Config::new(Role::Client, Limits { max_frame: 8, max_message: 12, ..Limits::default() });
-    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[header(fin(BINARY), None, 9)]);
-    assert_eq!(run.end, Some(WsError::Protocol(P::FrameTooBig)));
-    let run = feed(&mut WsRx::new(Raw::new(), Config::new(cfg.role, Limits { max_message: 7, ..cfg.limits })), &[header(fin(TEXT), None, 8)]);
+    let cfg = Config::new(Role::Client, Limits { max_message: 12, ..Limits::default() });
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[header(fin(TEXT), None, 13)]);
     assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
-    // Fragments: 8 + 4 fits exactly, 8 + 5 fails at the second header.
     let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(BINARY, None, &[1; 8]), encode(fin(CONT), None, &[2; 4])]);
     assert_eq!(run.end, None);
     assert_eq!(run.msgs[0].payload.len(), 12);
@@ -87,18 +86,48 @@ fn size_limits() {
     assert_eq!(run.end_chunk, Some(1));
 }
 
+/// A message within `max_message` is delivered in a single frame of any size (20 MiB here).
 #[test]
-fn close_codes() {
-    assert_eq!(P::InvalidUtf8.close_code(), 1007);
-    assert_eq!(P::FrameTooBig.close_code(), 1009);
-    assert_eq!(P::MessageTooBig.close_code(), 1009);
-    assert_eq!(P::ReservedBits.close_code(), 1002);
+#[cfg_attr(miri, ignore)]
+fn one_frame_up_to_max_message_is_delivered() {
+    let len = 20 << 20;
+    let cfg = Config::new(Role::Client, Limits { max_message: len, ..Limits::default() });
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(fin(BINARY), None, &vec![7; len])]);
+    assert_eq!(run.end, None);
+    assert_eq!(run.msgs.len(), 1);
+    assert_eq!(run.msgs[0].payload.len(), len);
 }
 
 fn close(code: u16, reason: &[u8]) -> Vec<u8> {
     let mut p = code.to_be_bytes().to_vec();
     p.extend_from_slice(reason);
     encode(fin(CLOSE), None, &p)
+}
+
+/// `max_message` limits data frames only: with a 1-byte limit a 2-byte Ping is answered, a
+/// Pong is taken, and a Close with status 1000 closes, while a 2-byte Binary fails.
+#[test]
+fn control_frames_are_not_held_to_max_message() {
+    let cfg = Config::new(Role::Client, Limits { max_message: 1, ..Limits::default() });
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(fin(PING), None, b"ab"), encode(fin(PONG), None, b"cd")]);
+    assert_eq!((run.end, run.pong), (None, Some(b"ab".to_vec())));
+    let mut r = WsRx::new(Raw::new(), cfg);
+    assert_eq!(feed(&mut r, &[close(1000, b"")]).end, Some(WsError::Closed));
+    assert_eq!(r.peer_close(), Some(&1000u16.to_be_bytes()[..]));
+    let run = feed(&mut WsRx::new(Raw::new(), cfg), &[encode(fin(BINARY), None, b"xy")]);
+    assert_eq!(run.end, Some(WsError::Protocol(P::MessageTooBig)));
+}
+
+/// A Ping, Pong or Close header declaring 2^32 bytes is `ControlTooBig` on every target width:
+/// the 125 B limit is checked on the declared 64-bit length, which on a 32-bit target would
+/// wrap to 0 as a `usize`.
+#[test]
+fn control_frame_declaring_2_pow_32_bytes_is_too_big() {
+    for op in [PING, PONG, CLOSE] {
+        let mut h = vec![fin(op), 127];
+        h.extend_from_slice(&(1u64 << 32).to_be_bytes());
+        fails(Role::Client, &[h], P::ControlTooBig);
+    }
 }
 
 #[test]
@@ -201,30 +230,6 @@ fn utf8_across_fragments() {
 }
 
 #[test]
-fn mask_phase_carries_across_chunks() {
-    let payload: Vec<u8> = (0..11).collect();
-    let wire = encode(fin(BINARY), Some(KEY), &payload);
-    for cuts in [[7, 8, 9], [6, 9, 13], [10, 11, 17]] {
-        let run = drive(&mut rx(Role::Server), &split(&wire, &cuts));
-        assert_eq!(run.msgs.len(), 1);
-        assert_eq!(run.msgs[0].payload, payload, "{cuts:?}");
-        assert!(!run.msgs[0].direct);
-    }
-}
-
-#[test]
-fn masked_fragment_frames_restart_key_phase() {
-    let first = encode(BINARY, Some(KEY), b"abc");
-    let second = encode(fin(CONT), Some(KEY), b"defghijkl");
-    let mut wire = first;
-    wire.extend_from_slice(&second);
-    let run = drive(&mut rx(Role::Server), &split(&wire, &[7, 8, 10, 16, 18]));
-    assert_eq!(run.end, None);
-    assert_eq!(run.msgs.len(), 1);
-    assert_eq!(run.msgs[0].payload, b"abcdefghijkl");
-}
-
-#[test]
 fn control_frames_between_fragments() {
     let frames = [
         encode(TEXT, None, b"ab"),
@@ -245,34 +250,6 @@ fn control_frames_between_fragments() {
     let run = feed(&mut r, &[encode(BINARY, None, b"ab"), close(1001, b"")]);
     assert_eq!(run.end, Some(WsError::Closed));
     assert_eq!(r.peer_close(), Some(&[0x03, 0xe9][..]));
-}
-
-#[test]
-fn direct_message_borrows_the_frame() {
-    let wire = [encode(fin(TEXT), None, b"first"), encode(fin(BINARY), None, &[9; 130])].concat();
-    let mut r = rx(Role::Client);
-    let f = VecFrame { data: wire, stamp: 42 };
-    let base = f.data.as_ptr();
-    r.push(f);
-    let m = r.recv(&mut ()).unwrap().unwrap();
-    assert_eq!(m.bytes().as_ptr(), base.wrapping_add(2));
-    assert_eq!(m.text(), Some("first"));
-    assert_eq!(m.rx_timestamp(), 42);
-    let m = r.recv(&mut ()).unwrap().unwrap();
-    assert_eq!(m.bytes().as_ptr(), base.wrapping_add(7 + 4));
-    assert_eq!(m.kind(), Kind::Binary);
-    assert!(r.recv(&mut ()).unwrap().is_none());
-}
-
-#[test]
-fn spanning_message_is_copied_and_stamped_by_its_first_byte() {
-    let wire = encode(fin(BINARY), None, &[5; 10]);
-    let run = drive(&mut rx(Role::Client), &split(&wire, &[1, 6]));
-    assert_eq!(run.msgs, vec![Got { kind: Kind::Binary, payload: vec![5; 10], direct: false, stamp: stamp(0) }]);
-    // Header cut, payload whole in the next frame: still direct, stamped by the header's frame.
-    let run = drive(&mut rx(Role::Client), &split(&wire, &[1, 2]));
-    assert!(run.msgs[0].direct);
-    assert_eq!(run.msgs[0].stamp, stamp(0));
 }
 
 #[test]

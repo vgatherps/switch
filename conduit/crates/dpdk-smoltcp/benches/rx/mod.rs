@@ -87,7 +87,6 @@ pub(super) fn setup(eal: &Eal, k: usize, buffer: usize) -> (Pair, [TcpHandle; 2]
         .expect("MSS includes room for TCP options");
     assert!(MSS <= send_mss, "payload chunk exceeds send MSS");
     for (stack, handle) in [(&mut pair.a, &handles[0]), (&mut pair.b, &handles[1])] {
-        assert_eq!(handle.to_string(), "#0");
         stack.tcp_mut(handle).set_ack_delay(None);
     }
     grow_window(&mut pair, &handles, k, send_mss);

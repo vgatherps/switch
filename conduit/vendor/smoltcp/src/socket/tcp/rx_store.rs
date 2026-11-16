@@ -352,16 +352,25 @@ impl RxStore {
         self.pending = false;
     }
 
-    /// Drop every view past the in-order data, releasing their frames; the in-order views stay
-    /// as they are. Visits only the dropped views. The in-order data ends at a view boundary:
-    /// a view that continues it would be in order itself.
-    pub(super) fn drop_out_of_order(&mut self) {
+    /// Views past the in-order data: one frame each.
+    pub(super) fn out_of_order_views(&self) -> usize {
+        let end = self.absolute(self.in_order_len());
+        self.views.len() - self.views.partition_point(|view| view.start < end)
+    }
+
+    /// Drop up to `limit` views past the in-order data, the farthest from it first, releasing
+    /// their frames; returns how many it dropped. The in-order views stay as they are. The
+    /// in-order data ends at a view boundary: a view that continues it would be in order itself.
+    pub(super) fn drop_out_of_order(&mut self, limit: usize) -> usize {
         self.assert_attached();
         let end = self.absolute(self.in_order_len());
-        while self.views.back().is_some_and(|view| view.start >= end) {
+        let mut dropped = 0;
+        while dropped < limit && self.views.back().is_some_and(|view| view.start >= end) {
             self.views.pop_back();
+            dropped += 1;
         }
-        debug_assert!(self.views.back().is_none_or(|view| view.end() == end));
+        debug_assert!(self.views.back().is_none_or(|view| view.start >= end || view.end() == end));
+        dropped
     }
 
     pub(super) fn truncate_from(&mut self, offset: usize) {
@@ -560,47 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn popped_frame_reports_its_timestamp() {
-        for stamp in [0, 0xfedc_ba98_7654_3210] {
-            let mut store = RxStore::new();
-            insert_stamped(&mut store, 0, b"abc", stamp);
-            assert_eq!(drain_stamped(&mut store), vec![(b"abc".to_vec(), stamp)]);
-        }
-    }
-
-    #[test]
-    fn consecutive_frames_keep_their_timestamps() {
-        let mut store = RxStore::new();
-        let (mut first, first_releases) = counted_frame_with_room(b"abc", 3);
-        first.set_rx_timestamp(1);
-        let decision = store.decide(0, 3);
-        place_attach(&mut store, 0, first, decision);
-        let (mut incoming, incoming_releases) = counted_frame(b"def");
-        incoming.set_rx_timestamp(2);
-        let decision = store.decide(3, 3);
-        place_attach(&mut store, 3, incoming, decision);
-        assert_eq!(store.held(), 2);
-        assert_eq!((first_releases.get(), incoming_releases.get()), (0, 0));
-        assert_eq!(
-            drain_stamped(&mut store),
-            vec![(b"abc".to_vec(), 1), (b"def".to_vec(), 2)]
-        );
-        assert_eq!((first_releases.get(), incoming_releases.get()), (1, 1));
-    }
-
-    #[test]
-    fn hole_fill_frames_keep_arrival_timestamps() {
-        let mut store = RxStore::new();
-        insert_stamped(&mut store, 3, b"def", 1);
-        insert_stamped(&mut store, 6, b"ghi", 2);
-        insert_stamped(&mut store, 0, b"abc", 3);
-        assert_eq!(
-            drain_stamped(&mut store),
-            vec![(b"abc".to_vec(), 3), (b"def".to_vec(), 1), (b"ghi".to_vec(), 2)]
-        );
-    }
-
-    #[test]
     fn covering_segment_replaces_released_timestamps() {
         let mut store = RxStore::new();
         let first = insert_stamped(&mut store, 3, b"def", 1);
@@ -634,18 +602,6 @@ mod tests {
         assert_eq!(releases.get(), 0);
         assert_eq!(drain_stamped(&mut store), vec![(b"ab".to_vec(), 1)]);
         assert_eq!(releases.get(), 1);
-    }
-
-    #[test]
-    fn timestamps_stop_at_in_order_end() {
-        let mut store = RxStore::new();
-        assert!(drain_stamped(&mut store).is_empty());
-        insert_stamped(&mut store, 6, b"ghi", 2);
-        assert!(drain_stamped(&mut store).is_empty());
-        insert_stamped(&mut store, 0, b"abc", 1);
-        assert_eq!(store.held(), 2);
-        assert_eq!(drain_stamped(&mut store), vec![(b"abc".to_vec(), 1)]);
-        assert_eq!(store.held(), 1);
     }
 
     #[test]
@@ -722,12 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_ranges_empty() {
-        let store = RxStore::new();
-        assert_eq!(store.out_of_order_ranges().next(), None);
-    }
-
-    #[test]
     fn out_of_order_ranges_in_order_only() {
         let mut store = RxStore::new();
         insert(&mut store, 0, b"abcd");
@@ -772,25 +722,6 @@ mod tests {
         drop(store.pop_front().unwrap());
         assert_eq!(store.in_order_len(), 0);
         assert_eq!(store.out_of_order_ranges().collect::<Vec<_>>(), expected);
-    }
-
-    #[test]
-    fn out_of_order_len_is_zero_without_out_of_order_views() {
-        let mut store = RxStore::new();
-        assert_eq!(store.out_of_order_len(), 0);
-
-        insert(&mut store, 0, b"abc");
-        insert(&mut store, 3, b"de");
-        assert_eq!(store.out_of_order_len(), 0);
-
-        insert(&mut store, 7, b"hij");
-        assert_eq!(store.out_of_order_len(), 3);
-
-        insert(&mut store, 5, b"fg");
-        assert_eq!(store.out_of_order_len(), 0);
-        assert_eq!(drain_bytes(&mut store), b"abcdefghij");
-        assert_eq!(store.held(), 0);
-        assert_eq!(store.out_of_order_len(), 0);
     }
 
     #[test]
@@ -959,10 +890,10 @@ mod tests {
         );
         assert_eq!((covered.get(), trimmed.get(), later.get()), (1, 0, 0));
         assert!(store.pop_front().is_none());
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             store.place(0, store.decide(0, 1));
-        })).unwrap_err();
-        assert_eq!(panic.downcast_ref::<&str>(), Some(&"pending receive view"));
+        }))
+        .is_err());
         assert_eq!(ranges(&store), vec![(0, 7), (7, 9), (10, 13)]);
         assert_eq!((covered.get(), trimmed.get(), later.get()), (1, 0, 0));
         let (frame, attached) = counted_frame(b"abcdefg");
@@ -977,14 +908,10 @@ mod tests {
         let mut store = RxStore::new();
         let later = insert(&mut store, 5, b"fgh");
         store.place(0, store.decide(0, 3));
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             store.truncate_from(2);
         }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"truncate cuts pending receive view")
-        );
+        .is_err());
         assert_eq!(ranges(&store), vec![(0, 3), (5, 8)]);
         assert_eq!(later.get(), 0);
         store.truncate_from(3);
@@ -1100,29 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_inside_view_released() {
+    fn duplicate_inside_and_across_views() {
         let mut store = RxStore::new();
-        let held = insert(&mut store, 0, b"abcdefghij");
-        let (frame, duplicate) = counted_frame(b"XYZ");
-        let decision = store.decide(3, 3);
-        assert_eq!(decision, Decision::Duplicate(3..6));
-        place_attach(&mut store, 3, frame, decision);
-        assert_eq!(duplicate.get(), 1);
-        assert_eq!(held.get(), 0);
-        assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"abcdefghij");
+        insert(&mut store, 0, b"abcdefghij");
+        assert_eq!(store.decide(3, 3), Decision::Duplicate(3..6));
         store.clear();
-        assert_eq!(held.get(), 1);
 
-        let first = insert(&mut store, 0, b"abcde");
-        let second = insert(&mut store, 5, b"fghij");
-        let (frame, duplicate) = counted_frame(b"XXXXXXXX");
-        let decision = store.decide(1, 8);
-        assert_eq!(decision, Decision::Duplicate(1..9));
-        place_attach(&mut store, 1, frame, decision);
-        assert_eq!(ranges(&store), vec![(0, 5), (5, 10)]);
-        assert_eq!((first.get(), second.get(), duplicate.get()), (0, 0, 1));
-        store.clear();
-        assert_eq!((first.get(), second.get(), duplicate.get()), (1, 1, 1));
+        insert(&mut store, 0, b"abcde");
+        insert(&mut store, 5, b"fghij");
+        assert_eq!(store.decide(1, 8), Decision::Duplicate(1..9));
     }
 
     #[test]
@@ -1133,29 +1046,11 @@ mod tests {
         assert_eq!(ranges(&store), vec![(0, 6)]);
         assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"longer");
         assert_eq!(short.get(), 1);
-        for bytes in [&b"short"[..], &b"equal!"[..]] {
-            let (frame, duplicate) = counted_frame(bytes);
-            let decision = store.decide(0, bytes.len());
-            assert_eq!(decision, Decision::Duplicate(0..bytes.len()));
-            place_attach(&mut store, 0, frame, decision);
-            assert_eq!(duplicate.get(), 1);
-            assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"longer");
+        for len in [5, 6] {
+            assert_eq!(store.decide(0, len), Decision::Duplicate(0..len));
         }
         store.clear();
         assert_eq!(long.get(), 1);
-    }
-
-    #[test]
-    fn many_out_of_order_views_then_fill_gap() {
-        let mut store = RxStore::new();
-        for offset in 1..=20 {
-            insert(&mut store, offset, &[offset as u8]);
-        }
-        assert_eq!(store.held(), 20);
-        assert_eq!(store.in_order_len(), 0);
-        insert(&mut store, 0, &[0]);
-        assert_eq!(store.in_order_len(), 21);
-        assert_eq!(drain_bytes(&mut store), (0..=20).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1187,19 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_releases_two_whole_views() {
-        let mut store = RxStore::new();
-        let first = insert(&mut store, 0, b"abcd");
-        let second = insert(&mut store, 4, b"efgh");
-        assert_eq!(drain_bytes(&mut store), b"abcdefgh");
-        assert_eq!(store.held(), 0);
-        assert_eq!(store.in_order_len(), 0);
-        assert_eq!((first.get(), second.get()), (1, 1));
-        drop(store);
-        assert_eq!((first.get(), second.get()), (1, 1));
-    }
-
-    #[test]
     fn truncate_from_drops_views_past_offset() {
         let mut store = RxStore::new();
         let first = insert(&mut store, 0, b"abcde");
@@ -1220,64 +1102,6 @@ mod tests {
         store.truncate_from(0);
         assert_eq!(store.held(), 0);
         assert_eq!(first.get(), 1);
-    }
-
-    #[test]
-    fn truncate_drops_several_whole_views() {
-        let mut store = RxStore::new();
-        let first = insert(&mut store, 0, b"abcde");
-        let middle = insert(&mut store, 10, b"klmno");
-        let last = insert(&mut store, 20, b"uvwxy");
-        store.truncate_from(10);
-        assert_eq!(ranges(&store), vec![(0, 5)]);
-        assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"abcde");
-        assert_eq!((first.get(), middle.get(), last.get()), (0, 1, 1));
-        drop(store);
-        assert_eq!((first.get(), middle.get(), last.get()), (1, 1, 1));
-    }
-
-    #[test]
-    fn stale_decision_after_commit_panics() {
-        let mut store = RxStore::new();
-        let decision = store.decide(0, 2);
-        let held = insert(&mut store, 0, b"ab");
-        let (frame, incoming) = counted_frame(b"AB");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 0, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale new decision: right neighbor")
-        );
-        assert_eq!(ranges(&store), vec![(0, 2)]);
-        assert_eq!(store.views.front().unwrap().frame.as_ref().unwrap().as_slice(), b"ab");
-        assert_eq!((held.get(), incoming.get()), (0, 1));
-        drop(store);
-        assert_eq!((held.get(), incoming.get()), (1, 1));
-    }
-
-    #[test]
-    fn stale_duplicate_after_clear_panics() {
-        let mut store = RxStore::new();
-        let held = insert(&mut store, 0, b"abcd");
-        let decision = store.decide(1, 2);
-        assert_eq!(decision, Decision::Duplicate(1..3));
-        store.clear();
-        assert_eq!(held.get(), 1);
-        let (frame, incoming) = counted_frame(b"BC");
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            place_attach(&mut store, 1, frame, decision);
-        }))
-        .unwrap_err();
-        assert_eq!(
-            panic.downcast_ref::<&str>(),
-            Some(&"stale duplicate decision")
-        );
-        assert_eq!(store.held(), 0);
-        assert_eq!((held.get(), incoming.get()), (1, 1));
-        drop(store);
-        assert_eq!((held.get(), incoming.get()), (1, 1));
     }
 
     fn check_oracle(

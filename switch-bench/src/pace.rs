@@ -40,6 +40,9 @@ pub struct Pacer {
     left: u64,
     visited_blocked: usize,
     stopped: bool,
+    /// Messages below this were due when a transport-wide refusal ended a poll: held back by the
+    /// transport, not by the generator.
+    held_below: u64,
     /// At the end of the first poll after the last message's scheduled time: due and not yet
     /// reached by the cursor.
     at_end: Option<u64>,
@@ -62,6 +65,7 @@ impl Pacer {
             left: 0,
             visited_blocked: 0,
             stopped: false,
+            held_below: 0,
             at_end: None,
         }
     }
@@ -123,13 +127,16 @@ impl Pacer {
                 if self.is_blocked[i] {
                     self.visited_blocked += 1;
                 } else {
+                    // queued behind the blocked senders not yet retried this poll
                     self.is_blocked[i] = true;
                     self.blocked.push_back(sender);
-                    self.visited_blocked += 1;
                     self.cursor = k + 1;
                 }
             }
-            Outcome::Stop => self.stopped = true,
+            Outcome::Stop => {
+                self.stopped = true;
+                self.held_below = self.due;
+            }
         }
     }
 
@@ -153,10 +160,11 @@ impl Pacer {
         self.at_end.unwrap_or(0)
     }
 
-    /// Whether message `k` goes out as a blocked sender's owed message (its wait includes the
-    /// connection's flow control) rather than fresh off the schedule.
-    pub fn is_owed(&self, k: u64) -> bool {
-        self.is_blocked[self.schedule.split(k).0 as usize]
+    /// Whether message `k` goes out fresh off the schedule, so its send lag is the generator's
+    /// own: not owed by a blocked sender (its wait includes the connection's flow control) and
+    /// not due when a transport-wide refusal ended a poll (its wait includes the transport's).
+    pub fn is_fresh(&self, k: u64) -> bool {
+        k >= self.held_below && !self.is_blocked[self.schedule.split(k).0 as usize]
     }
 
     /// Messages of sender `i` numbered below `k`.
@@ -308,6 +316,51 @@ mod tests {
             }
         });
         assert_eq!(p.backlog_at_end(), 0);
+    }
+
+    /// Sender 0 is blocked from the first poll. In the second poll sender 1 blocks on a fresh
+    /// message; sender 0 must still get its one retry in that poll.
+    #[test]
+    fn a_new_block_does_not_skip_an_older_blocked_sender() {
+        let s = Schedule {
+            senders: 2,
+            interval_ns: 2000,
+            origin_ns: 0,
+        }; // one message per µs
+        let mut p = Pacer::new(s, 100, 32);
+        p.begin(0);
+        while let Some(k) = p.next_try() {
+            assert_eq!(k, 0);
+            p.result(k, Outcome::Blocked);
+        }
+        p.finish(0);
+
+        p.begin(1000);
+        assert_eq!(p.next_try(), Some(1));
+        p.result(1, Outcome::Blocked);
+        assert_eq!(p.next_try(), Some(0), "sender 0 skipped");
+    }
+
+    /// A transport-wide refusal holds back every message already due in that poll, not only the
+    /// one refused: none of them is fresh; messages falling due later are.
+    #[test]
+    fn messages_due_at_a_stop_are_not_fresh() {
+        let s = Schedule {
+            senders: 1,
+            interval_ns: 1000,
+            origin_ns: 0,
+        };
+        let mut p = Pacer::new(s, 100, 32);
+        p.begin(3000); // messages 0..4 due
+        assert_eq!(p.next_try(), Some(0));
+        assert!(p.is_fresh(0));
+        p.result(0, Outcome::Sent);
+        assert_eq!(p.next_try(), Some(1));
+        p.result(1, Outcome::Stop);
+        p.finish(3000);
+        p.begin(10_000);
+        assert!((1..4).all(|k| !p.is_fresh(k)));
+        assert!((4..11).all(|k| p.is_fresh(k)));
     }
 
     /// The send task stopped being polled at 10 µs (starved); the one poll at the cutoff tries

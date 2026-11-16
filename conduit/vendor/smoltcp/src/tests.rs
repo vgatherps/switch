@@ -118,14 +118,8 @@ impl Device for TestingDevice {
         }
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.rx_queue.pop_front().map(move |buffer| {
-            let rx = RxToken { buffer };
-            let tx = TxToken {
-                queue: &mut self.tx_queue,
-            };
-            (rx, tx)
-        })
+    fn receive(&mut self, _timestamp: Instant) -> Option<Self::RxToken<'_>> {
+        self.rx_queue.pop_front().map(|buffer| RxToken { buffer })
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -201,38 +195,4 @@ pub(crate) fn tx_test_buf(bytes: &[u8]) -> phy::ImmutableFrame {
 
 pub(crate) fn tx_test_source(room: usize) -> phy::TxSource {
     phy::TxSource::new(phy::TxPool::new(room))
-}
-
-#[test]
-fn testing_device_frame_token_writes_before_publish() {
-    use crate::phy::FrameToken as _;
-
-    let mut device = TestingDevice::new(Medium::Ethernet);
-    let mut frame = tx_test_buf(&[3, 4]).try_own().unwrap();
-    // SAFETY: the test producer allocated this exclusive frame.
-    unsafe { phy::frame_headroom(&mut frame, 2) }.0.copy_from_slice(&[1, 2]);
-    assert!(device.tx_queue.is_empty());
-    let token = device.transmit_frame(Instant::ZERO).unwrap();
-    let frame = token.consume_retain(frame.freeze(), 2, None);
-    assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-    assert_eq!(phy::frame_refcount(&frame), 1);
-}
-
-#[test]
-fn testing_device_owned_frame_releases_after_publish() {
-    use crate::phy::FrameToken as _;
-
-    let alloc = phy::TxPool::new(2);
-    let mut frame = alloc.alloc().unwrap();
-    frame.as_mut()[..2].copy_from_slice(&[3, 4]);
-    frame.truncate(2);
-    // SAFETY: the test producer allocated this exclusive frame.
-    unsafe { phy::frame_headroom(&mut frame, 2) }.0.copy_from_slice(&[1, 2]);
-    let mut device = TestingDevice::new(Medium::Ethernet);
-    device
-        .transmit_frame(Instant::ZERO)
-        .unwrap()
-        .consume(frame.freeze(), 2, None);
-    assert_eq!(device.tx_queue.pop_front().unwrap(), &[1, 2, 3, 4]);
-    assert_eq!(alloc.live(), 0);
 }

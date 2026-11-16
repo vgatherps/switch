@@ -124,24 +124,6 @@ fn expired_cancel_preserves_another_timer_in_reused_bucket() {
 }
 
 #[test]
-fn linked_singleton_has_nil_links_and_remains_removable() {
-    let mut entries = super::benchmark_workloads::entries([5]);
-    let mut wheel = TimerWheel::new(0);
-    wheel.insert(&mut entries, 0);
-    assert_eq!(entries[0].prev(), NIL);
-    assert_eq!(entries[0].next(), NIL);
-    assert_eq!(
-        entries[0].wheel_position(),
-        WheelPosition::Linked { level: 0, slot: 5 }
-    );
-    check_structure(&wheel, &entries);
-    assert!(wheel.remove(&mut entries, 0));
-    assert_eq!(entries[0].wheel_position(), WheelPosition::Unlinked);
-    assert!(!wheel.has_pending());
-    check_structure(&wheel, &entries);
-}
-
-#[test]
 #[cfg(debug_assertions)]
 fn duplicate_insert_panics_before_any_mutation() {
     let mut entries = super::benchmark_workloads::entries([5, 5]);

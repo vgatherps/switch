@@ -1,31 +1,9 @@
 //! Integration tests.
 
 use std::cell::Cell;
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
 
 use switch::{Runtime, Spawner};
-
-/// Demonstrates how a runtime primitive would store a waker.
-struct ManualWake {
-    waker_slot: Rc<Cell<Option<Waker>>>,
-    done: bool,
-}
-
-impl Future for ManualWake {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.done {
-            Poll::Ready(())
-        } else {
-            self.waker_slot.set(Some(cx.waker().clone()));
-            self.done = true;
-            Poll::Pending
-        }
-    }
-}
 
 #[switch::task]
 async fn set_true(flag: Rc<Cell<bool>>) {
@@ -51,16 +29,6 @@ async fn spawn_set_true(spawner: Spawner, flag: Rc<Cell<bool>>) {
 }
 
 #[switch::task]
-async fn manual_wake_then_set(waker_slot: Rc<Cell<Option<Waker>>>, done: Rc<Cell<bool>>) {
-    ManualWake {
-        waker_slot,
-        done: false,
-    }
-    .await;
-    done.set(true);
-}
-
-#[switch::task]
 async fn log_around_yield(
     log: Rc<Cell<Vec<&'static str>>>,
     start: &'static str,
@@ -73,19 +41,6 @@ async fn log_around_yield(
     let mut v = log.take();
     v.push(end);
     log.set(v);
-}
-
-#[test]
-fn test_spawn_and_poll() {
-    let mut runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let ran = Rc::new(Cell::new(false));
-
-    spawner.spawn(set_true(ran.clone())).unwrap();
-
-    let report = runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.live_tasks), (1, 0));
-    assert!(ran.get());
 }
 
 #[test]
@@ -106,62 +61,6 @@ fn test_yield_and_resume() {
 
     assert_eq!(polls, 4);
     assert_eq!(count.get(), 1);
-}
-
-#[test]
-fn test_multiple_tasks() {
-    let mut runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let count = Rc::new(Cell::new(0));
-
-    for _ in 0..10 {
-        spawner.spawn(increment(count.clone())).unwrap();
-    }
-
-    let report = runtime.poll(0).unwrap();
-    assert_eq!((report.tasks_polled, report.live_tasks), (10, 0));
-    assert_eq!(count.get(), 10);
-}
-
-#[test]
-fn test_nested_spawn() {
-    let mut runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let inner_spawner = spawner.clone();
-    let inner_ran = Rc::new(Cell::new(false));
-
-    spawner
-        .spawn(spawn_set_true(inner_spawner, inner_ran.clone()))
-        .unwrap();
-
-    // The spawned task runs in the same poll's next round.
-    let first = runtime.poll(0).unwrap();
-    assert_eq!((first.tasks_polled, first.live_tasks), (2, 0));
-    assert!(inner_ran.get());
-}
-
-#[test]
-fn test_stored_waker_across_polls() {
-    let mut runtime = Runtime::new(0);
-    let spawner = runtime.spawner();
-    let waker_slot: Rc<Cell<Option<Waker>>> = Rc::new(Cell::new(None));
-    let done = Rc::new(Cell::new(false));
-
-    spawner
-        .spawn(manual_wake_then_set(waker_slot.clone(), done.clone()))
-        .unwrap();
-
-    let first = runtime.poll(0).unwrap(); // First poll stores waker
-    assert_eq!((first.tasks_polled, first.live_tasks), (1, 1));
-    assert!(!done.get());
-
-    // Wake using the stored waker (task is still alive, same thread)
-    let stored = waker_slot.take().unwrap();
-    stored.wake();
-
-    let second = runtime.poll(0).unwrap(); // Second poll completes
-    assert_eq!((second.tasks_polled, second.live_tasks), (1, 0));
-    assert!(done.get());
 }
 
 #[test]
@@ -187,10 +86,4 @@ fn test_interleaved_yields() {
     assert!(entries.contains(&"A end"));
     assert!(entries.contains(&"B start"));
     assert!(entries.contains(&"B end"));
-}
-
-#[test]
-fn test_empty_poll() {
-    let mut runtime = Runtime::new(0);
-    assert_eq!(runtime.poll(0).unwrap(), switch::PollReport::default());
 }

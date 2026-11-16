@@ -5,12 +5,14 @@
 // its 1024-byte receive window target throughout, independent of those held frames.
 // Each full-window segment triggers an immediate window-update ACK. The peer's
 // probe gets an ACK, then opening its window lets every queued echo drain.
-// The peer opens at 1.46 s, before switch's 1.5 s zero-window probe.
+// The handshake ACK comes 100 ms after the SYN-ACK: that RTT sample makes
+// switch's RTO 100 + 4 * 50 = 300 ms, so the zero-window probe the first echo
+// arms at 1.2 s is due at 1.5 s. The peer opens at 1.46 s, before it.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 1024 <mss 1460,wscale 0,sackOK,eol,eol,eol>
-+0    < . 1:1(0) ack 1 win 0
-+1.2  < P. 1:1025(1024) ack 1 win 0
++0.1  < . 1:1(0) ack 1 win 0
++1.1  < P. 1:1025(1024) ack 1 win 0
 +0    > . 1:1(0) ack 1025 win 1024
 +0    < . 1025:1025(0) ack 1 win 0
 1.3   < P. 1025:2049(1024) ack 1 win 0

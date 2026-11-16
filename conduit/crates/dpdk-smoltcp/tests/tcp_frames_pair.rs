@@ -135,9 +135,9 @@ fn tcp_frames_1mib_byte_exact() {
     });
 }
 
-/// Two frames queued together leave as two whole segments; both are lost.
-/// The RTO retransmission is one copied segment carrying both, as the byte
-/// ring would send, and B reads the bytes once.
+/// Two frames sent in successive rounds leave as two whole segments; both are
+/// lost. The RTO retransmission is one copied segment carrying both, as the
+/// byte ring would send, and B reads the bytes once.
 #[switch_test_support::pinned_test]
 fn lost_segment_retransmits_by_coalesced_copy() {
     with_eal(|eal| {
@@ -157,10 +157,10 @@ fn lost_segment_retransmits_by_coalesced_copy() {
         let mut sent = 0;
         let both = [one.as_slice(), two.as_slice()].concat();
         assert!(send_frames(&mut pair.a, &client, &one, &mut sent));
+        assert_eq!(pair.round(|_, _| {}).a.tx_accepted, 1);
         let mut sent = 0;
         assert!(send_frames(&mut pair.a, &client, &two, &mut sent));
-        let first = pair.round(|_, _| {});
-        assert_eq!(first.a.tx_accepted, 2);
+        assert_eq!(pair.round(|_, _| {}).a.tx_accepted, 1);
         assert_eq!(pair.a_to_b.dropped, 2);
         let frames = deliver(&mut pair, &server, &both);
         assert_eq!(a_data(&frames), [(a_seq, both.clone())]);

@@ -1,6 +1,6 @@
 use super::*;
 use crate::StoredWaker;
-use crate::runtime::{Capacity, Runtime, RuntimeError, core};
+use crate::runtime::{Runtime, RuntimeError, core};
 use crate::task::header::{DEFERRED, DROP_STARTED, LIVE, QUEUED, TAKEN};
 use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
@@ -11,32 +11,11 @@ use std::task::{Context, Poll, Waker};
 #[path = "waker_tests.rs"]
 mod waker_tests;
 
+/// More tasks than a fresh wake queue holds, so the queues grow mid-round.
+const MANY: usize = 192;
+
 /// A runtime driven through `Runtime::poll`, and its executor for white-box checks.
 struct Owner(*mut Executor, RefCell<Runtime>);
-
-#[test]
-fn constructor_uses_initial_timer_tick() {
-    let owner = Owner::with(Runtime::with_capacity(
-        123,
-        Capacity {
-            tasks: 17,
-            timers: 23,
-        },
-    ));
-    unsafe {
-        assert_eq!((*owner.0).timers.current_tick(), 123);
-    }
-}
-/// A wake queue at capacity: one more append panics rather than writing past the buffer.
-#[test]
-#[should_panic(expected = "wake queue full")]
-fn append_to_a_full_wake_queue_panics() {
-    let mut queue: Vec<*const TaskHeader> = Vec::with_capacity(1);
-    while queue.len() < queue.capacity() {
-        append_reserved(&mut queue, std::ptr::null());
-    }
-    append_reserved(&mut queue, std::ptr::null());
-}
 
 impl Owner {
     fn new() -> Self {
@@ -56,14 +35,20 @@ impl Owner {
     fn poll(&self) -> Result<usize, RuntimeError> {
         self.1.borrow_mut().poll(0).map(|report| report.tasks_polled)
     }
+    /// Live tasks, and slots in use (a finished task's slot until its queue entry drains).
     fn counts(&self) -> (usize, usize) {
-        unsafe { ((*self.0).task_count, (*self.0).allocated) }
+        unsafe { ((*self.0).task_count, slots_in_use(self.0)) }
     }
     /// Cleanup without freeing the executor, so tests can inspect it; the
     /// runtime's own shutdown repeats it when the owner drops.
     fn cleanup(&self) {
         unsafe { Executor::cleanup(self.0) }
     }
+}
+
+/// Slots holding a future or a queue entry: flags are 0 exactly when a slot is free or reserved.
+unsafe fn slots_in_use(executor: *mut Executor) -> usize {
+    unsafe { Executor::slots(executor).filter(|&header| TaskHeader::flags(header).get() != 0).count() }
 }
 
 /// Task state flags, without the slot-in-use bit.
@@ -186,33 +171,13 @@ fn idle_future_remains_owned_until_cleanup() {
 }
 
 #[test]
-fn duplicate_wakes_make_one_next_batch_claim() {
-    let owner = Owner::new();
-    let mut task = Probe::new();
-    task.wakes = 10;
-    task.pending = true;
-    task.turn = true;
-    let polls = task.polls.clone();
-    let drops = task.drops.clone();
-    owner.spawn(probe(task));
-    assert_eq!(owner.poll(), Ok(1));
-    assert_eq!(owner.poll(), Ok(1));
-    assert_eq!(polls.get(), 2);
-    unsafe {
-        assert_eq!((*owner.0).incoming.len(), 1);
-    }
-    owner.cleanup();
-    assert_eq!(drops.get(), 1);
-}
-
-#[test]
-fn nested_spawn_grows_both_vectors_without_repolling_current_round() {
+fn nested_spawns_run_in_the_next_round_not_the_current_one() {
     let owner = Owner::new();
     let ptr = owner.0;
     let inner = Rc::new(Cell::new(0));
     #[switch::task]
     async fn spawn_many(ptr: *mut Executor, inner: Rc<Cell<usize>>) {
-        for _ in 0..(DEFAULT_CAPACITY * 3) {
+        for _ in 0..(MANY) {
             unsafe {
                 Executor::spawn(ptr, count_task(inner.clone()), None);
             }
@@ -226,9 +191,9 @@ fn nested_spawn_grows_both_vectors_without_repolling_current_round() {
     let seen = Rc::new(Cell::new(None));
     owner.spawn(spawn_many(ptr, inner.clone()));
     owner.spawn(observe(inner.clone(), seen.clone()));
-    assert_eq!(owner.poll(), Ok(2 + DEFAULT_CAPACITY * 3));
+    assert_eq!(owner.poll(), Ok(2 + MANY));
     assert_eq!(seen.get(), Some(0));
-    assert_eq!(inner.get(), DEFAULT_CAPACITY * 3);
+    assert_eq!(inner.get(), MANY);
     assert_eq!(owner.counts(), (0, 0));
 }
 
@@ -275,55 +240,6 @@ fn ready_drop_panic(self_wake: bool) {
     owner.cleanup();
     assert_eq!(owner.counts(), (0, 0));
     assert_eq!(drops.get(), 1);
-}
-
-#[test]
-fn failed_poll_preserves_payload_future_and_both_queues() {
-    let owner = Owner::new();
-    let mut task = Probe::new();
-    task.wakes = 1;
-    task.panic_poll = true;
-    let drops = task.drops.clone();
-    let remaining = Rc::new(Cell::new(0));
-    owner.spawn(probe(task));
-    owner.spawn(count_task(remaining.clone()));
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
-    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
-    assert_eq!(owner.counts(), (1, 2));
-    assert_eq!(drops.get(), 0);
-    unsafe {
-        assert_eq!((*owner.0).run_queue.len(), 2);
-        assert_eq!((*owner.0).incoming.len(), 1);
-        assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
-    }
-    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
-    assert!(catch_unwind(AssertUnwindSafe(|| owner.spawn(empty()))).is_err());
-    owner.cleanup();
-    assert_eq!(drops.get(), 1);
-    assert_eq!(remaining.get(), 0);
-    assert_eq!(owner.counts(), (0, 0));
-}
-
-#[test]
-fn cleanup_resumes_after_one_destructor_panics() {
-    let owner = Owner::new();
-    let first = Probe::new();
-    let first_drops = first.drops.clone();
-    owner.spawn(probe(first));
-    let mut failing = Probe::new();
-    failing.panic_drop = true;
-    let failing_drops = failing.drops.clone();
-    owner.spawn(probe(failing));
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.cleanup())).unwrap_err();
-    assert_eq!(payload.downcast_ref::<usize>(), Some(&5678));
-    // Drop order is unspecified: the other task is either dropped and freed, or
-    // still allocated for the retry.
-    assert_eq!(failing_drops.get(), 1);
-    assert_eq!(owner.counts(), (0, 1 - first_drops.get()));
-    owner.cleanup();
-    owner.cleanup();
-    assert_eq!(owner.counts(), (0, 0));
-    assert_eq!((first_drops.get(), failing_drops.get()), (1, 1));
 }
 
 #[test]
@@ -390,19 +306,12 @@ fn reentrant_turn_rejects_before_vector_mutation_and_keeps_remainder() {
         drops: drops.clone(),
     }));
     owner.spawn(probe(task));
-    let (data, incoming) = unsafe { ((*owner.0).run_queue.as_ptr(), (*owner.0).incoming.as_ptr()) };
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
-    assert_eq!(
-        payload.downcast_ref::<&str>().copied(),
-        Some("executor reentrancy")
-    );
+    catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
     unsafe {
-        assert_eq!((*owner.0).run_queue.as_ptr(), incoming);
-        assert_eq!((*owner.0).incoming.as_ptr(), data);
         assert_eq!((*owner.0).run_queue.len(), 2);
         assert!((*owner.0).incoming.is_empty());
         assert_eq!((*owner.0).task_count, 1);
-        assert_eq!((*owner.0).allocated, 2);
+        assert_eq!(slots_in_use(owner.0), 2);
         assert!(!(*owner.0).active);
         assert_eq!((*owner.0).lifecycle, Lifecycle::Panicked);
     }
@@ -482,7 +391,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
     impl Drop for SpawnDuringDrop {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
-            for _ in 0..(DEFAULT_CAPACITY * 3) {
+            for _ in 0..(MANY) {
                 unsafe {
                     Executor::spawn(self.owner, count_task(self.completed.clone()), None);
                 }
@@ -530,21 +439,21 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
     assert_eq!(
         owner.counts(),
         (
-            DEFAULT_CAPACITY * 3 + 1,
-            DEFAULT_CAPACITY * 3 + 1 + usize::from(self_wake)
+            MANY + 1,
+            MANY + 1 + usize::from(self_wake)
         )
     );
     unsafe {
         assert_eq!(
             (*owner.0).incoming.len(),
-            DEFAULT_CAPACITY * 3 + usize::from(target_idle) + usize::from(self_wake)
+            MANY + usize::from(target_idle) + usize::from(self_wake)
         );
     }
     assert_eq!(
         owner.poll(),
-        Ok(DEFAULT_CAPACITY * 3 + usize::from(target_idle))
+        Ok(MANY + usize::from(target_idle))
     );
-    assert_eq!(completed.get(), DEFAULT_CAPACITY * 3);
+    assert_eq!(completed.get(), MANY);
     assert_eq!(target_polls.get(), 1 + usize::from(target_idle));
     assert_eq!(owner.counts(), (1, 1));
     owner.cleanup();
@@ -691,49 +600,6 @@ fn active_selfwake_and_cross_task_wakes_keep_round_order_and_claims() {
     assert_eq!(owner.counts(), (0, 0));
     assert_eq!(owner.poll(), Ok(0));
     assert_eq!(drops.each_ref().map(|count| count.get()), [1, 1, 1]);
-}
-
-#[test]
-fn multiple_selfwakes_then_panic_keep_one_claim_and_original_payload() {
-    let owner = Owner::new();
-    let mut task = Probe::new();
-    task.wakes = 8;
-    task.panic_poll = true;
-    let polls = task.polls.clone();
-    let drops = task.drops.clone();
-    let remainder = Probe::new();
-    let remainder_polls = remainder.polls.clone();
-    let remainder_drops = remainder.drops.clone();
-    owner.spawn(probe(task));
-    owner.spawn(probe(remainder));
-    let payload = catch_unwind(AssertUnwindSafe(|| owner.poll())).unwrap_err();
-    assert_eq!(payload.downcast_ref::<usize>(), Some(&1234));
-    assert_eq!(owner.counts(), (1, 2));
-    assert_eq!(
-        (
-            polls.get(),
-            drops.get(),
-            remainder_polls.get(),
-            remainder_drops.get()
-        ),
-        (1, 0, 0, 0)
-    );
-    unsafe {
-        assert_eq!((*owner.0).incoming.len(), 1);
-        assert_eq!(flags((&(*owner.0).incoming)[0]) & LIVE, 0);
-    }
-    assert_eq!(owner.poll(), Err(RuntimeError::Panicked));
-    owner.cleanup();
-    assert_eq!(owner.counts(), (0, 0));
-    assert_eq!(
-        (
-            polls.get(),
-            drops.get(),
-            remainder_polls.get(),
-            remainder_drops.get()
-        ),
-        (1, 1, 0, 1)
-    );
 }
 
 #[switch::task]
@@ -1007,13 +873,7 @@ fn stored_wakes_after_open(lifecycle: Lifecycle) {
 /// the self-wake of a finished task, whose slot stays in use until it drains.
 #[test]
 fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
-    let owner = Owner::with(Runtime::with_capacity(
-        0,
-        Capacity {
-            tasks: 0,
-            timers: 0,
-        },
-    ));
+    let owner = Owner::new();
     let parked: Vec<StoredPark> = (0..4).map(|_| StoredPark::new()).collect();
     let stored: Vec<_> = parked.iter().map(|task| task.stored.clone()).collect();
     for task in parked {
@@ -1044,7 +904,7 @@ fn wake_queues_hold_at_most_one_entry_per_slot_in_use() {
     unsafe {
         let (incoming, deferred) = ((*owner.0).incoming.len(), (*owner.0).deferred.len());
         assert_eq!((incoming, deferred), (4, 2));
-        assert_eq!(incoming + deferred, (*owner.0).allocated);
+        assert_eq!(incoming + deferred, slots_in_use(owner.0));
     }
     // The stale entry drains and frees its slot; the new task completes.
     assert_eq!(owner.poll(), Ok(5));

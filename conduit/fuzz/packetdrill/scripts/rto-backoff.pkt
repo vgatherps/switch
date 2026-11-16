@@ -1,7 +1,8 @@
-// Unacknowledged data is retransmitted after 300, 600 and 1200 ms gaps.
-// The fixed socket RTO backs off once per expiry, capped at 60 seconds.
-// The ACK at 2.2 s stops retransmission. New data arrives at 4.7 s, past
-// the 4.5 s deadline that would have fired without that ACK.
+// Unacknowledged data is retransmitted after 50, 100 and 200 ms gaps: the
+// handshake's near-zero RTT sample sets the RFC 6298 RTO to its 50 ms floor,
+// and each expiry doubles it from that measured base: the next retransmission
+// would come 400 ms later, at 0.75 s. The ACK at 0.45 s stops retransmission;
+// nothing is resent before new data arrives at 2.95 s.
 // The 100-byte echo remains below one MSS and repeats the original segment.
 // Cubic's RTO window is one effective MSS, 1460 bytes. The 100-byte
 // retransmissions and later echo fit it without changing these packets.
@@ -12,9 +13,9 @@
 +0    > . 1:1(0) ack 1 win 32768
 +0    < P. 1:101(100) ack 1 win 502
 +0    > P. 1:101(100) ack 101 win 32768
-+0.3  > P. 1:101(100) ack 101 win 32768
-+0.6  > P. 1:101(100) ack 101 win 32768
-+1.2  > P. 1:101(100) ack 101 win 32768
++0.05 > P. 1:101(100) ack 101 win 32768
++0.1  > P. 1:101(100) ack 101 win 32768
++0.2  > P. 1:101(100) ack 101 win 32768
 +0.1  < . 101:101(0) ack 101 win 502
 +2.5  < P. 101:201(100) ack 101 win 502
 +0    > P. 101:201(100) ack 201 win 32768

@@ -52,16 +52,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
         Proto::Tcp | Proto::Ws => {
             let startup_error = std::rc::Rc::new(std::cell::RefCell::new(None));
-            for _ in 0..ACCEPTS {
-                arm_accept(
-                    &host.rt.spawner(),
-                    handle.clone(),
-                    args.port,
-                    tcp_config,
-                    args.proto == Proto::Ws,
-                    Some(startup_error.clone()),
-                )?;
-            }
+            spawn_accepts(
+                &host.rt.spawner(), &handle, args.port, tcp_config,
+                args.proto == Proto::Ws, ACCEPTS, Some(startup_error.clone()),
+            )?;
             host.round()?;
             let error = startup_error.borrow_mut().take();
             if let Some(error) = error {
@@ -166,55 +160,65 @@ async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
 // ANCHOR_END: echo_datagrams
 
 // ANCHOR: arm_accept
-/// One pre-armed accept on `port` (conduit has no accept queue: each accept is a listening
-/// socket); the connection it takes is echoed, and it arms the next accept first.
-fn arm_accept(
+/// Keeps `count` accept tasks alive, retrying when socket slots are full.
+fn spawn_accepts(
     spawner: &Spawner,
-    handle: NetHandle,
+    handle: &NetHandle,
     port: u16,
     config: tcp::Config,
     ws: bool,
+    count: usize,
     startup_error: Option<std::rc::Rc<std::cell::RefCell<Option<Error>>>>,
 ) -> Result<(), String> {
-    let accepting = handle.tcp_accept(config, IpListenEndpoint { addr: None, port });
-    spawner
-        .spawn(serve_accepted(
-            accepting,
-            spawner.clone(),
-            handle,
-            port,
-            config,
-            ws,
-            startup_error,
-        ))
-        .map_err(spawn_error)
+    let local = IpListenEndpoint { addr: None, port };
+    for _ in 0..count {
+        let first = handle.tcp_accept(config, local);
+        spawner
+            .spawn(accept_loop(first, spawner.clone(), handle.clone(), local, config, ws, startup_error.clone()))
+            .map_err(spawn_error)?;
+    }
+    Ok(())
 }
 
-/// Waits for `accepting`'s connection, arms the next accept, and echoes the connection.
+/// One persistent accept: waits for `accepting`'s connection, hands it to its own echo task and
+/// listens again. While every socket slot is in use it retries each round, so it listens again
+/// once a connection closes.
 #[switch::task]
-async fn serve_accepted(
-    accepting: Accepting,
+async fn accept_loop(
+    mut accepting: Accepting,
     spawner: Spawner,
     handle: NetHandle,
-    port: u16,
+    local: IpListenEndpoint,
     config: tcp::Config,
     ws: bool,
     startup_error: Option<std::rc::Rc<std::cell::RefCell<Option<Error>>>>,
 ) {
-    let stream = match accepting.await {
-        Ok(stream) => stream,
-        Err(error) => {
-            if let Some(startup_error) = startup_error {
-                *startup_error.borrow_mut() = Some(error);
+    loop {
+        let stream = match accepting.await {
+            Ok(stream) => stream,
+            Err(Error::SocketsFull) => {
+                switch::yield_now().await;
+                accepting = handle.tcp_accept(config, local);
+                continue;
             }
-            eprintln!("switch-bench serve: tcp accept on {port}: {error:?}");
-            return;
+            Err(error) => {
+                if let Some(startup_error) = startup_error.as_ref() {
+                    *startup_error.borrow_mut() = Some(error);
+                }
+                eprintln!("switch-bench serve: tcp accept on {}: {error:?}", local.port);
+                return;
+            }
+        };
+        if let Err(e) = spawner.spawn(serve_conn(handle.clone(), stream, ws)) {
+            eprintln!("switch-bench serve: {}", spawn_error(e));
         }
-    };
-    drop(startup_error);
-    if let Err(e) = arm_accept(&spawner, handle.clone(), port, config, ws, None) {
-        eprintln!("switch-bench serve: {e}");
+        accepting = handle.tcp_accept(config, local);
     }
+}
+
+/// Echoes one accepted connection.
+#[switch::task]
+async fn serve_conn(handle: NetHandle, stream: TcpStream, ws: bool) {
     if ws {
         match accept_ws(&handle, stream, Limits::default()).await {
             Ok(ws) => ws_echo(ws).await,
@@ -396,7 +400,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        arm_accept(&spawner, handle.clone(), PORT, tcp_config, true, None).unwrap();
+        spawn_accepts(&spawner, &handle, PORT, tcp_config, true, 1, None).unwrap();
         let peer = std::thread::spawn(|| {
             let stream = std::net::TcpStream::connect(("10.78.0.2", PORT)).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
@@ -416,6 +420,91 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !peer.is_finished() {
             assert!(Instant::now() < deadline, "WebSocket echo did not finish within 30 s");
+            host.round().unwrap();
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        peer.join().unwrap();
+        drop((handle, spawner));
+        host.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepts_resume_after_socket_exhaustion() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "serve::tests::accepts_resume_after_socket_exhaustion_child", "--ignored"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "accept child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Two socket slots, one accept. Connections A and B open together take both slots, so the
+    /// accept cannot listen again; once both close, a third connection is still echoed.
+    #[switch_test_support::pinned_test]
+    #[ignore = "run in a separate process by accepts_resume_after_socket_exhaustion"]
+    fn accepts_resume_after_socket_exhaustion_child() {
+        use std::io::{Read, Write as _};
+        use std::time::{Duration, Instant};
+
+        const PORT: u16 = 7102;
+        let dir = std::env::temp_dir().join(format!("switch-bench-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dut.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "device": {"vdev": "net_tap_benchacc,iface=cdbenchacc"}, "mac": null,
+             "ipv4": "10.79.0.2/24", "gateway": null, "mtu": 1500, "paths": [], "offloads": "auto",
+             "rx_timestamps": false, "descriptors": 512,
+             "eal": {"file_prefix": "benchacc", "extra": ["--no-huge", "-m", "512", "--no-shconf"]}}"#,
+        ).unwrap();
+        let config = Host::config(&path).unwrap();
+        let tcp_config = tcp::Config { rx_capacity: TCP_BUFFER, tx_capacity: TCP_BUFFER, mss_cap: None };
+        let mut host = Host::open(&config, &tcp_sizing(2, &tcp_config, 1500)).unwrap();
+        for args in [
+            &["address", "add", "10.79.0.1/24", "dev", "cdbenchacc"][..],
+            &["link", "set", "cdbenchacc", "up"],
+        ] {
+            assert!(std::process::Command::new("ip").args(args).status().unwrap().success(), "ip {args:?}");
+        }
+        let handle = host.net.handle();
+        let spawner = host.rt.spawner();
+        spawn_accepts(&spawner, &handle, PORT, tcp_config, false, 1, None).unwrap();
+        let peer = std::thread::spawn(|| {
+            let echo = |s: &mut std::net::TcpStream| {
+                s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                s.write_all(b"ping").unwrap();
+                let mut back = [0; 4];
+                s.read_exact(&mut back).unwrap();
+                assert_eq!(&back, b"ping");
+            };
+            let mut a = std::net::TcpStream::connect(("10.79.0.2", PORT)).unwrap();
+            echo(&mut a);
+            let mut b = std::net::TcpStream::connect(("10.79.0.2", PORT)).unwrap();
+            echo(&mut b);
+            drop((a, b));
+            // the slots free once the closes complete; until the accept listens again a connect
+            // is refused
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut c = loop {
+                match std::net::TcpStream::connect(("10.79.0.2", PORT)) {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        assert!(Instant::now() < deadline, "no accept after the slots freed: {e}");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            };
+            echo(&mut c);
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !peer.is_finished() {
+            assert!(Instant::now() < deadline, "peer did not finish within 30 s");
             host.round().unwrap();
             std::thread::sleep(Duration::from_micros(50));
         }
@@ -464,7 +553,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        arm_accept(&spawner, handle.clone(), PORT, tcp_config, false, None).unwrap();
+        spawn_accepts(&spawner, &handle, PORT, tcp_config, false, 1, None).unwrap();
 
         let sent: Vec<u8> = (0..ROUNDS * (1460 + SMALL * 64))
             .map(|i| (i % 251) as u8)

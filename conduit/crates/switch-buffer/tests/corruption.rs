@@ -18,21 +18,6 @@ use switch_buffer::PoolManager;
 const DPDK_HEADROOM: u16 = 128;
 
 #[switch_test_support::pinned_test]
-fn test_share_creates_alias() {
-    let pool = PoolManager::new(256);
-    let mut mbuf = pool.alloc_with_len(100).unwrap();
-    mbuf.data_mut().fill(0xAA);
-
-    let clone = mbuf.share();
-    assert_eq!(mbuf.refcount(), 2);
-    assert_eq!(clone.refcount(), 2);
-
-    // Both see the same data
-    assert!(mbuf.data().iter().all(|&b| b == 0xAA));
-    assert!(clone.data().iter().all(|&b| b == 0xAA));
-}
-
-#[switch_test_support::pinned_test]
 fn test_shared_prepend_adds_header_segment() {
     let pool = PoolManager::new(256);
     let mut mbuf = pool.alloc_with_len(100).unwrap();
@@ -65,55 +50,8 @@ fn test_clone_trait_increments_refcount() {
     let clone = mbuf.clone();
     assert_eq!(mbuf.refcount(), 2);
     assert_eq!(clone.refcount(), 2);
-}
-
-#[switch_test_support::pinned_test]
-fn test_multiple_shares() {
-    let pool = PoolManager::new(256);
-    let mut mbuf = pool.alloc_with_len(100).unwrap();
-    mbuf.data_mut().fill(0xFF);
-
-    let clone1 = mbuf.share();
-    let clone2 = mbuf.share();
-    let clone3 = mbuf.share();
-
-    assert_eq!(mbuf.refcount(), 4);
-
-    assert!(mbuf.data().iter().all(|&b| b == 0xFF));
-    assert!(clone1.data().iter().all(|&b| b == 0xFF));
-    assert!(clone2.data().iter().all(|&b| b == 0xFF));
-    assert!(clone3.data().iter().all(|&b| b == 0xFF));
-}
-
-#[switch_test_support::pinned_test]
-fn test_prepend_then_share() {
-    let pool = PoolManager::new(256);
-    let mut mbuf = pool.alloc_with_len(100).unwrap();
-    mbuf.data_mut().fill(0xDD);
-
-    mbuf.prepend(20).unwrap().fill(0xAA);
-
-    let data = mbuf.data();
-    assert!(data[0..20].iter().all(|&b| b == 0xAA));
-    assert!(data[20..120].iter().all(|&b| b == 0xDD));
-
-    let clone = mbuf.share();
-    assert_eq!(mbuf.len(), clone.len());
-}
-
-#[switch_test_support::pinned_test]
-fn test_drop_clones_safely() {
-    let pool = PoolManager::new(256);
-    let mut mbuf = pool.alloc_with_len(100).unwrap();
-    mbuf.data_mut().fill(0xCC);
-
-    {
-        let _clone1 = mbuf.share();
-        let _clone2 = mbuf.share();
-    }
-
-    assert_eq!(mbuf.refcount(), 1);
-    assert!(mbuf.data().iter().all(|&b| b == 0xCC));
+    drop((mbuf, clone));
+    assert_eq!(pool.in_use_count(), 0);
 }
 
 #[switch_test_support::pinned_test]
@@ -136,26 +74,3 @@ fn test_insufficient_headroom() {
     assert_returned_exactly_once(&pool, 256);
 }
 
-#[switch_test_support::pinned_test]
-fn test_headroom_available() {
-    let pool = PoolManager::new(256);
-    let mbuf = pool.alloc_with_len(100).unwrap();
-    assert_eq!(mbuf.headroom(), DPDK_HEADROOM);
-}
-
-#[switch_test_support::pinned_test]
-fn test_adj_increases_headroom() {
-    let pool = PoolManager::new(256);
-    let mut mbuf = pool.alloc_with_len(100).unwrap();
-    let initial_headroom = mbuf.headroom();
-
-    // Consume 20 bytes from front
-    assert!(mbuf.adj(20));
-    assert_eq!(mbuf.len(), 80);
-    assert_eq!(mbuf.headroom(), initial_headroom + 20);
-
-    // Can now prepend into the consumed space
-    let hdr = mbuf.prepend(20).expect("Should prepend into consumed space");
-    hdr.fill(0xAA);
-    assert_eq!(mbuf.len(), 100);
-}

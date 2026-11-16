@@ -3,7 +3,6 @@
 //! Switch's IPv4 gateway, as in the live run. These tests need CAP_NET_ADMIN and /dev/net/tun,
 //! and no internet.
 
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::ffi::CStr;
 use std::io::{ErrorKind, Read};
@@ -709,7 +708,8 @@ fn received_updates_come_before_a_finished_stop() {
         turn_until(net, clock, &mut rt, || flushed.load(Ordering::Relaxed) || server.is_finished());
         let sent = clock.ms();
         while clock.ms() < sent + 200 {
-            net.turn(clock.now()).expect("turn");
+            net.receive(clock.now()).expect("receive");
+            net.send().expect("send");
             thread::sleep(IDLE_SLEEP);
         }
         let _ = stop.send(());
@@ -861,18 +861,12 @@ fn unknown_certificate_fails_tls_and_alerts_the_server() {
     });
 }
 
-/// Fields borrow from the message text; a JSON-escaped field (Binance does not escape, but the
-/// text may) still parses, into an owned string.
+/// A JSON-escaped field (Binance does not escape, but the text may) still parses.
 #[test]
-fn book_ticker_borrows_the_text_and_owns_only_escaped_fields() {
+fn book_ticker_decodes_escaped_fields() {
     let text = r#"{"u":7,"s":"BTC\u0055SDT","b":"1.5","B":"2","a":"1.6","A":"3"}"#;
     let ticker = serde_json::from_str::<BookTicker>(text).expect("parse an escaped symbol");
     assert_eq!(ticker.symbol, "BTCUSDT");
-    assert!(matches!(ticker.symbol, Cow::Owned(_)), "escaped symbol must be owned");
-    for field in [&ticker.bid_price, &ticker.bid_qty, &ticker.ask_price, &ticker.ask_qty] {
-        let Cow::Borrowed(field) = field else { panic!("{field} copied, not borrowed") };
-        assert!(text.as_bytes().as_ptr_range().contains(&field.as_ptr()), "{field} not in the text");
-    }
 }
 
 #[test]

@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::mem;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::panic::{self, panic_any, resume_unwind};
+use std::panic::resume_unwind;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -58,8 +58,7 @@ const ACK_LOSS_TRANSFER: usize = 4 << 20;
 /// After filter installation the client may write all but the last 2 MiB;
 /// those bytes stay held until the loss thread releases the full transfer.
 /// This exceeds the kernel's doubled 256 KiB receive buffer plus switch's
-/// echo in flight, so data remains for the second phase and writing has not
-/// finished while the keepalive test holds its writer, however fast switch
+/// echo in flight, so data remains for the second phase, however fast switch
 /// echoes.
 const ACK_LOSS_RESERVE: usize = 2 << 20;
 /// Initial write limit and echo count that triggers filter installation.
@@ -77,12 +76,14 @@ const ACK_LOSS_AFTER: usize = 256 * 1024;
 /// kernel's data with pure ACKs alone; 1.5 s is longer than Linux's minimum
 /// RTO, 200 ms (TCP_RTO_MIN), so Linux times out.
 const ACK_LOSS_PHASE: Duration = Duration::from_millis(1500);
-/// The base RTO of switch's sockets unless a test sets another
-/// (`tcp::Socket::set_rto`; default 300 ms). RTT samples do not change it;
-/// each expiry doubles it, up to 60 s, until SND.UNA advances
-/// (`retransmission_timeout`). Zero-window probes use the same RTO and
-/// backoff.
-const SWITCH_RTO: Duration = Duration::from_millis(300);
+/// switch's smallest RTO: SRTT plus the 50 ms floor (`MIN_RTO`) on the variance term
+/// of the RFC 6298 RTO smoltcp computes from RTT samples; RTTs over the tap are far
+/// below it. Before any
+/// sample the RTO is 300 ms. Each expiry doubles it, up to 60 s, until SND.UNA
+/// advances (`retransmission_timeout`); the measured base stays until the
+/// next sample. Zero-window probes
+/// use the same RTO and backoff.
+const SWITCH_RTO: Duration = Duration::from_millis(50);
 /// Allowance when comparing capture times against an RTO. smoltcp times the
 /// RTO on turn time, the capture stamps each frame when the PMD writes it,
 /// and the delay between the two varies per turn on a shared CPU, so a resend
@@ -90,20 +91,19 @@ const SWITCH_RTO: Duration = Duration::from_millis(300);
 /// original. The elapsed-time check is therefore supporting evidence, not an
 /// exact minimum; see `switch_timeout_retransmissions` for why fast
 /// retransmit cannot fire in the loss window at all.
-const CAPTURE_SLACK: Duration = Duration::from_millis(100);
+const CAPTURE_SLACK: Duration = Duration::from_millis(25);
 /// Long enough for both directions to send data on a single shared CPU once
 /// the `tc` processes that added the filters are done.
 const ACK_LOSS_STREAMING: Duration = Duration::from_millis(50);
 /// Filters removed to the last echoed byte read. Lossless, 4 MiB echoes in
-/// well under a second, and the loss window lasts 3.05 s. Switch's RTO
-/// enters the window at `SWITCH_RTO`, 300 ms (nothing expired before it),
-/// and doubles only on expiry, retransmission or zero-window probe alike: the
-/// first three expiries are at least 0.3, 0.6 and 1.2 s apart, 2.1 s
-/// together, and a fourth would come at least 2.4 s after the third, so at
-/// most three fall inside the window and the RTO is at most 2.4 s when the
-/// filters go. Switch's next retransmission or probe, carrying its ACK, is
-/// then due within 2.4 s of removal and is no longer dropped; Linux's RTO
-/// starts at 200 ms. In practice the window update the kernel sends once the
+/// well under a second, and the loss window lasts 3.05 s. switch's RTO
+/// enters the window at its measured base b, at least `SWITCH_RTO` (nothing
+/// expired before it), and doubles only on expiry, retransmission or
+/// zero-window probe alike: expiries come b, 2b, 4b, ... apart, so the RTO
+/// pending when the filters go is the time since the window opened plus b,
+/// at most 3.05 s + b. At b = 50 ms the fifth expiry comes at 1.55 s and the
+/// sixth is due 0.1 s after removal. switch's next retransmission or probe,
+/// carrying its ACK, is no longer dropped; Linux's RTO starts at 200 ms. In practice the window update the kernel sends once the
 /// client reads again ends the loss sooner. 10 s covers that and the rest of
 /// the echo with room for a shared CPU.
 const ACK_LOSS_RECOVERY: Duration = Duration::from_secs(10);
@@ -336,7 +336,6 @@ enum Direction {
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
-const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
 
 /// Header fields of one TCP segment between `KERNEL_ADDR` and
@@ -785,21 +784,19 @@ fn assert_no_receive_steering() {
     assert_ne!(rx_queues, 0, "no RX queue under {queues}");
 }
 
-/// `serve_client_configured` with `STANDARD` Port size, no offloads and the
-/// default RTO.
+/// `serve_client_configured` with `STANDARD` Port size and no offloads.
 fn serve_client<T: Send + 'static>(
     deadline: Duration,
     client: impl FnOnce() -> T + Send + 'static,
 ) -> (T, Vec<Captured>) {
-    serve_client_configured(deadline, STANDARD, Offloads::default(), None, client)
+    serve_client_configured(deadline, STANDARD, Offloads::default(), client)
 }
 
 /// Runs EchoServer on a fresh net_tap Port of `size` with `offloads`, the
 /// kernel side at the same MTU, while `client` runs on its own thread, until
 /// the client has returned and every listener is back in Listen (switch's
 /// socket reached Closed and EchoServer listened again), failing after
-/// `deadline`. `rto`, if any, is set on every listener before the client
-/// starts; it survives each relisten. Returns the client's result and every
+/// `deadline`. Returns the client's result and every
 /// segment between the kernel and the echo port captured meanwhile, in
 /// capture order. Tears down the Port with pools at 0; on a failure,
 /// unwinding drops the Port and then removes the vdev.
@@ -807,7 +804,6 @@ fn serve_client_configured<T: Send + 'static>(
     deadline: Duration,
     size: PortSize,
     offloads: Offloads,
-    rto: Option<Duration>,
     client: impl FnOnce() -> T + Send + 'static,
 ) -> (T, Vec<Captured>) {
     with_eal(|eal| {
@@ -831,11 +827,6 @@ fn serve_client_configured<T: Send + 'static>(
         // smoltcp fork.
         let mut echo = EchoServer::new(&mut stack, ECHO_PORT, 2, ECHO_BUFFER).unwrap();
         let listener_count = echo.handles().len();
-        if let Some(rto) = rto {
-            for handle in echo.handles() {
-                stack.tcp_mut(handle).set_rto(rto.into());
-            }
-        }
 
         let mut captured = Vec::new();
         let client = thread::spawn(client);
@@ -1321,20 +1312,6 @@ fn filter_drops(parent: &str) -> u64 {
 /// in Linux v6.12) and tcp_syn_ack_timeout each SYN-ACK timeout (736); a
 /// tail loss probe does not count.
 const TCP_TIMEOUTS: &str = "TCPTimeouts";
-/// TcpExt counter: data segments the kernel received although it already held
-/// all of their data, as a retransmission of data it acknowledged delivers.
-/// tcp_send_dupack counts one when tcp_sequence rejects it as old
-/// (net/ipv4/tcp_input.c:5096 in Linux v7.0) and tcp_data_queue when it
-/// passes that check (5720).
-const DELAYED_ACK_LOST: &str = "DelayedACKLost";
-/// TcpExt counter: keepalive probes the kernel sent (tcp_keepalive_timer ->
-/// tcp_write_wakeup -> tcp_xmit_probe_skb, net/ipv4/tcp_timer.c:841 and
-/// tcp_output.c:4537-4538 in Linux v7.0).
-const TCP_KEEPALIVE: &str = "TCPKeepAlive";
-/// TcpExt counter: answers to out-of-window ACKs the kernel skipped for its
-/// rate limit, one per net.ipv4.tcp_invalid_ratelimit (tcp_validate_incoming,
-/// net/ipv4/tcp_input.c:6394-6397 in Linux v7.0).
-const TCP_ACK_SKIPPED_SEQ: &str = "TCPACKSkippedSeq";
 
 /// TcpExt `counter` from /proc/net/netstat, so far in this network namespace.
 fn tcp_ext(counter: &str) -> u64 {
@@ -1963,37 +1940,15 @@ const ACK_LOSS_SNDBUF: libc::c_int = 32 * 1024;
 /// stops reading, so the kernel's window then closes.
 const ACK_LOSS_RCVBUF: libc::c_int = 256 * 1024;
 
-/// What the echo client reads from its loss thread's report.
-trait LossReport: Send {
-    /// How the failure message labels `dropped`.
-    const DROPPED: &'static str;
-    /// The pure ACKs the filters dropped.
-    fn dropped(&self) -> String;
-    /// Taken just after the last filter was deleted.
-    fn removed(&self) -> Instant;
-}
-
-impl LossReport for LossWindow {
-    const DROPPED: &'static str = "[to switch, to the kernel]";
-
-    fn dropped(&self) -> String {
-        format!("{:?}", self.dropped)
-    }
-
-    fn removed(&self) -> Instant {
-        self.removed
-    }
-}
-
-struct AckLossEcho<W> {
+struct AckLossEcho {
     kernel_port: u16,
-    window: W,
+    window: LossWindow,
     /// Filters removed to the last echoed byte read.
     recovery: Duration,
 }
 
 /// Write `ACK_LOSS_TRANSFER` bytes on one thread while reading the echo on
-/// this one, through a stream `configure` sets up after its buffer sizes.
+/// this one.
 /// Initially write only `ACK_LOSS_AFTER` bytes. Once that many have echoed,
 /// `loss` runs on a third thread: it installs pure-ACK `tc` filters, then allows
 /// writing up to `ACK_LOSS_TRANSFER - ACK_LOSS_RESERVE`. The remaining bytes
@@ -2007,10 +1962,9 @@ struct AckLossEcho<W> {
 /// While the client reads and writes, every ACK switch sends rides on data:
 /// EchoServer echoes whatever arrives. Pausing one side at a time leaves the
 /// other's data to be acknowledged by pure ACKs alone.
-fn echo_through_pure_ack_loss<W: LossReport>(
-    configure: impl FnOnce(&TcpStream),
-    loss: impl FnOnce(u16, Receiver<()>, &Paused, &AtomicUsize) -> Option<W> + Send,
-) -> AckLossEcho<W> {
+fn echo_through_pure_ack_loss(
+    loss: impl FnOnce(u16, Receiver<()>, &Paused, &AtomicUsize) -> Option<LossWindow> + Send,
+) -> AckLossEcho {
     let deadline = Instant::now() + ACK_LOSS_ECHO_DEADLINE;
     let mut stream = connect();
     set_socket_option(
@@ -2027,7 +1981,6 @@ fn echo_through_pure_ack_loss<W: LossReport>(
         "SO_SNDBUF",
         &ACK_LOSS_SNDBUF,
     );
-    configure(&stream);
     stream.set_read_timeout(Some(POLL)).unwrap();
     stream.set_write_timeout(Some(POLL)).unwrap();
     let kernel_port = local_port(&stream);
@@ -2087,17 +2040,16 @@ fn echo_through_pure_ack_loss<W: LossReport>(
         drop(stream);
         panic!(
             "within {ACK_LOSS_ECHO_DEADLINE:?}: wrote {written} of {ACK_LOSS_TRANSFER} bytes, \
-             echoed {}, EOF {eof}; pure ACKs dropped {}: {}",
+             echoed {}, EOF {eof}; pure ACKs dropped [to switch, to the kernel]: {}",
             echoed.len(),
-            W::DROPPED,
-            window.map_or("loss never started".to_owned(), |w| w.dropped()),
+            window.map_or("loss never started".to_owned(), |w| format!("{:?}", w.dropped)),
         );
     }
     assert_echoed(&echoed, &data);
     let window = window.expect("loss started once ACK_LOSS_AFTER bytes echoed");
     let recovery = delivered
         .unwrap()
-        .checked_duration_since(window.removed())
+        .checked_duration_since(window.removed)
         .expect("the echo completed while pure ACKs were dropped");
     AckLossEcho {
         kernel_port,
@@ -2177,7 +2129,7 @@ fn retransmissions(captured: &[Captured], direction: Direction) -> Vec<Retransmi
 /// leaves data outstanding (2180-2182); either way the byte at SND.UNA is then
 /// in flight or in the segment being sent, so the timer runs from no earlier
 /// than that byte's first transmission. It runs at least `SWITCH_RTO`, the
-/// smallest base RTO any test here gives switch, which only backoff raises,
+/// RTO floor, which only backoff and larger RTT samples raise,
 /// so the first segment of the resend comes at least that long after its
 /// first byte was first sent, measured on capture times less `CAPTURE_SLACK`.
 fn switch_timeout_retransmissions(found: &[Retransmission]) -> Vec<Retransmission> {
@@ -2243,7 +2195,7 @@ fn tap_kernel_echo_with_tx_checksum_offload() {
         ..Offloads::default()
     };
     let (transfer, captured) =
-        serve_client_configured(DEADLINE, STANDARD, offloads, None, echo_one_mebibyte);
+        serve_client_configured(DEADLINE, STANDARD, offloads, echo_one_mebibyte);
     let segments = segments(&captured);
     assert_one_connection(&segments, transfer.kernel_port);
     assert_eq!(close_kind(&segments), Close::Clean);
@@ -2317,7 +2269,7 @@ fn assert_timestamps_only_on_kernel_syn(segments: &[Segment]) {
 #[switch_test_support::pinned_test]
 fn kernel_jumbo_echo() {
     assert_linux_offers_tcp_options();
-    let (transfer, captured) = serve_client_configured(DEADLINE, JUMBO, Offloads::default(), None, || {
+    let (transfer, captured) = serve_client_configured(DEADLINE, JUMBO, Offloads::default(), || {
         // Bound before connect. The kernel's SYN reaches packet taps as it is
         // sent and switch's SYN-ACK before the kernel's TCP takes it in, so
         // both are queued here once connect returns. Closed after the check.
@@ -2379,7 +2331,7 @@ fn linux_client_reset_is_seen_and_server_relistens() {
 #[switch_test_support::pinned_test]
 fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     let (echo, captured) = serve_client(ACK_LOSS_DEADLINE, || {
-        echo_through_pure_ack_loss(|_| {}, pure_ack_loss)
+        echo_through_pure_ack_loss(pure_ack_loss)
     });
     let window = &echo.window;
     let in_window = |at: SystemTime| window.from <= at && at <= window.until;
@@ -2393,12 +2345,12 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     let switch_retransmissions = retransmitted_in_window(Direction::ToKernel);
     let switch_timeouts = switch_timeout_retransmissions(&switch_retransmissions);
     let linux_retransmissions = retransmitted_in_window(Direction::ToSwitch);
-    let stale_acks = stale_pure_acks(&captured, Direction::ToKernel);
-    let stale_acks_after = stale_acks
+    let stale_all = stale_pure_acks(&captured, Direction::ToKernel);
+    let stale_acks_after = stale_all
         .iter()
         .filter(|c| c.at > window.after_delete)
         .count();
-    let stale_acks: Vec<&Captured> = stale_acks.iter().filter(|c| in_window(c.at)).collect();
+    let stale_acks: Vec<&Captured> = stale_all.iter().filter(|c| in_window(c.at)).collect();
     // Every pure ACK switch sent while a filter could drop it; the capture
     // sees them before the ingress qdisc does.
     let pure_acks_to_kernel = captured
@@ -2456,6 +2408,12 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     );
     io::stdout().write_all(record.as_bytes()).unwrap();
 
+    // A pure ACK carries the highest sequence number sent, also after an RTO
+    // rewound the resend point, so none falls below the kernel's RCV.NXT.
+    assert!(
+        stale_all.is_empty(),
+        "switch sent pure ACKs below the kernel's RCV.NXT: {stale_all:?}"
+    );
     assert!(
         streaming.iter().all(|&bytes| bytes > 0),
         "data bytes sent in the first {ACK_LOSS_STREAMING:?} of the loss \
@@ -2502,493 +2460,6 @@ fn linux_bidirectional_bulk_recovers_from_pure_ack_loss() {
     let segments = segments(&captured);
     assert_one_connection(&segments, echo.kernel_port);
     assert_eq!(close_kind(&segments), Close::Clean);
-}
-
-/// TCP_KEEPIDLE and TCP_KEEPINTVL of the stale-ACK test's client, in seconds.
-/// The kernel's first keepalive comes this long after the last segment it
-/// accepted from switch, and the next ones this long apart
-/// (tcp_keepalive_timer, net/ipv4/tcp_timer.c:820-843 in Linux v7.0).
-const STALE_ACK_KEEPALIVE_SECS: libc::c_int = 2;
-/// TCP_KEEPCNT of that client: the kernel resets the connection once this many
-/// keepalives in a row go unanswered, checking before each next one
-/// (tcp_keepalive_timer), so at the earliest 2 + 25 * 2 = 52 s after the last
-/// segment it accepted, past `ACK_LOSS_ECHO_DEADLINE`: a failing run ends on
-/// that deadline with the bytes echoed. Set, not left to
-/// net.ipv4.tcp_keepalive_probes, also because the keepalives the filter
-/// drops count as unanswered.
-const STALE_ACK_KEEPALIVE_PROBES: libc::c_int = 25;
-/// Switch's base RTO in the stale-ACK test, set on its listeners: its
-/// timeouts after the last new data then come 1 s and 3 s later (backoff
-/// doubles it), so the kernel's keepalive, 2 s after that data
-/// (`STALE_ACK_KEEPALIVE_SECS`), falls 1 s from each. With the 300 ms default
-/// they would come 0.3, 0.9 and 2.1 s after that data: the keepalive would
-/// follow two timeouts and lead the third by 0.1 s.
-const STALE_ACK_RTO: Duration = Duration::from_secs(1);
-/// Bound on waiting for switch's first timeout retransmission to reach the
-/// kernel once the client stops writing. It is due `STALE_ACK_RTO` after
-/// Switch's timer last started (nothing expired before, so no backoff),
-/// which is about when the client stopped.
-const STALE_ACK_RTO_WAIT: Duration = Duration::from_secs(5);
-/// Bound on waiting for the kernel's two keepalives after the filter is
-/// removed, due within 2 * `STALE_ACK_KEEPALIVE_SECS` = 4 s.
-const STALE_ACK_KEEPALIVE_WAIT: Duration = Duration::from_secs(8);
-/// From the second keepalive to the client writing again: switch answers a
-/// keepalive in the turn that reads it, so its answer precedes the client's
-/// next data.
-const STALE_ACK_ANSWER: Duration = Duration::from_millis(100);
-/// Filter removed to the last echoed byte read. The client writes again with
-/// its reserve released only after the second keepalive following removal,
-/// at most 4 s plus `STALE_ACK_ANSWER` later; lossless, the rest of
-/// `ACK_LOSS_TRANSFER` then echoes in well under a second. 10 s leaves room
-/// for a shared CPU.
-const STALE_ACK_RECOVERY: Duration = Duration::from_secs(10);
-
-/// SO_KEEPALIVE on, with `STALE_ACK_KEEPALIVE_SECS` and
-/// `STALE_ACK_KEEPALIVE_PROBES`.
-fn stale_ack_keepalive(stream: &TcpStream) {
-    let on: libc::c_int = 1;
-    set_socket_option(
-        stream,
-        libc::SOL_SOCKET,
-        libc::SO_KEEPALIVE,
-        "SO_KEEPALIVE",
-        &on,
-    );
-    let tcp = libc::IPPROTO_TCP;
-    let secs = &STALE_ACK_KEEPALIVE_SECS;
-    set_socket_option(stream, tcp, libc::TCP_KEEPIDLE, "TCP_KEEPIDLE", secs);
-    set_socket_option(stream, tcp, libc::TCP_KEEPINTVL, "TCP_KEEPINTVL", secs);
-    let probes = &STALE_ACK_KEEPALIVE_PROBES;
-    set_socket_option(stream, tcp, libc::TCP_KEEPCNT, "TCP_KEEPCNT", probes);
-}
-
-/// Whether TcpExt `counter` reaches `target` by `deadline`, polled every
-/// `PAUSED_POLL`; a reading taken after the deadline does not count.
-fn tcp_ext_reaches(counter: &str, target: u64, deadline: Instant) -> bool {
-    loop {
-        let reached = tcp_ext(counter) >= target;
-        let in_time = Instant::now() <= deadline;
-        if reached || !in_time {
-            return reached && in_time;
-        }
-        thread::sleep(PAUSED_POLL);
-    }
-}
-
-/// Holds the client's writer off until dropped, also when the loss thread
-/// panics, so the client runs on and the panic surfaces when it finishes
-/// instead of at `ACK_LOSS_ECHO_DEADLINE`.
-struct WriterHeld<'a>(&'a AtomicBool);
-
-impl<'a> WriterHeld<'a> {
-    fn new(writing: &'a AtomicBool) -> Self {
-        writing.store(true, Ordering::SeqCst);
-        Self(writing)
-    }
-}
-
-impl Drop for WriterHeld<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
-struct StaleAckWindow {
-    /// The filter in place from `from` to `until`.
-    from: SystemTime,
-    until: SystemTime,
-    /// Pure ACKs to switch dropped, read just after `until`.
-    dropped: u64,
-    /// Every filter under both parents before the filter was added and with it
-    /// in place.
-    filters_before: [String; 2],
-    filters_installed: [String; 2],
-    removed: Instant,
-    /// The client stopping writing to the kernel taking in switch's timeout
-    /// retransmission; None if not within `STALE_ACK_RTO_WAIT`.
-    retransmission_received: Option<Duration>,
-    /// Whether the kernel sent two keepalives within `STALE_ACK_KEEPALIVE_WAIT`
-    /// of the filter being removed.
-    keepalives_after_removal: bool,
-    /// TCPACKSkippedSeq over the whole loss.
-    acks_skipped: u64,
-}
-
-impl LossReport for StaleAckWindow {
-    const DROPPED: &'static str = "to switch";
-
-    fn dropped(&self) -> String {
-        self.dropped.to_string()
-    }
-
-    fn removed(&self) -> Instant {
-        self.removed
-    }
-}
-
-/// The writer starts limited to `ACK_LOSS_AFTER`. Once `start` receives,
-/// install the filter, then allow all but `ACK_LOSS_RESERVE` bytes to be written.
-/// Drop the kernel's pure ACKs to switch (that
-/// direction only) for `ACK_LOSS_STREAMING` with the client reading and
-/// writing, then with the client not writing until the kernel has taken in
-/// Switch's first timeout retransmission, then remove the filter. The client
-/// writes again with its reserve released only once the kernel has sent two
-/// keepalives after that, and `STALE_ACK_ANSWER` later. None if `start`
-/// disconnected without receiving.
-fn stale_ack_loss(
-    kernel_port: u16,
-    start: Receiver<()>,
-    paused: &Paused,
-    _written: &AtomicUsize,
-) -> Option<StaleAckWindow> {
-    let write_limit_held = WriteLimitHeld {
-        write_limit: &paused.write_limit,
-        full: ACK_LOSS_TRANSFER,
-    };
-    start.recv().ok()?;
-    let filters_before = tc_filters();
-    let skipped = tcp_ext(TCP_ACK_SKIPPED_SEQ);
-    let filter = DropFilters::install(kernel_port, &[Direction::ToSwitch]);
-    let from = SystemTime::now();
-    paused
-        .write_limit
-        .store(ACK_LOSS_TRANSFER - ACK_LOSS_RESERVE, Ordering::SeqCst);
-    let filters_installed = tc_filters();
-    thread::sleep(ACK_LOSS_STREAMING);
-    let retransmissions = tcp_ext(DELAYED_ACK_LOST);
-    let writer_held = WriterHeld::new(&paused.writing);
-    let stopped = Instant::now();
-    // The kernel counts DelayedACKLost and queues its duplicate ACK, which the
-    // filter drops, in the same softirq, microseconds apart; this thread polls
-    // every millisecond and then runs `tc`, which takes milliseconds, to
-    // delete the filter. Were that ACK ever let through, switch would catch
-    // up before the kernel's keepalive, which `keepalive_answer` rejects,
-    // failing the test, not passing it.
-    let retransmission_received = tcp_ext_reaches(
-        DELAYED_ACK_LOST,
-        retransmissions + 1,
-        stopped + STALE_ACK_RTO_WAIT,
-    )
-    .then(|| stopped.elapsed());
-    let until = SystemTime::now();
-    // The kernel's packets to switch meet the root qdisc.
-    let dropped = filter_drops(TC_PARENTS[0].1);
-    filter.remove();
-    let removed = Instant::now();
-    // Right after removal, before any other `tc` run. A keepalive sent between
-    // the deletion and this read is not counted: the client then waits for
-    // one more, a keepalive interval later.
-    let keepalives = tcp_ext(TCP_KEEPALIVE);
-    assert_eq!(tc_filters(), filters_before, "net_tap's filters changed");
-    let keepalives_after_removal = tcp_ext_reaches(
-        TCP_KEEPALIVE,
-        keepalives + 2,
-        removed + STALE_ACK_KEEPALIVE_WAIT,
-    );
-    thread::sleep(STALE_ACK_ANSWER);
-    drop(write_limit_held);
-    drop(writer_held);
-    Some(StaleAckWindow {
-        from,
-        until,
-        dropped,
-        filters_before,
-        filters_installed,
-        removed,
-        retransmission_received,
-        keepalives_after_removal,
-        acks_skipped: tcp_ext(TCP_ACK_SKIPPED_SEQ) - skipped,
-    })
-}
-
-/// The kernel's first keepalive captured at or after a time, switch's answer
-/// to it, and switch's timeout retransmission before it.
-#[derive(Debug, Clone, Copy)]
-struct KeepaliveAnswer {
-    /// Switch's last data segment before the keepalive.
-    resend: Captured,
-    keepalive: Captured,
-    answer: Captured,
-}
-
-/// The `KeepaliveAnswer` in `captured`, if it shows switch answering the
-/// kernel's keepalive at or after the kernel's RCV.NXT while a retransmission
-/// timeout had left switch's resend point below it:
-/// - the keepalive is the kernel's first pure ACK captured at or after `from`
-///   one below the end of everything the kernel had sent (Linux sends a
-///   keepalive at SND.UNA - 1 with nothing unacknowledged,
-///   tcp_xmit_probe_skb); its ACK number is the kernel's RCV.NXT;
-/// - switch's last data segment before it is one of `timeouts`: the resend
-///   point is that segment's end;
-/// - no kernel segment is captured between that resend and the keepalive, so
-///   no ACK of the kernel's reached switch in between;
-/// - the resend ends below the keepalive's ACK number;
-/// - switch's next segment after the keepalive is a pure ACK at or after
-///   that ACK number.
-///
-/// Otherwise the first check that fails.
-fn keepalive_answer(
-    captured: &[Captured],
-    from: SystemTime,
-    timeouts: &[Retransmission],
-) -> Result<KeepaliveAnswer, String> {
-    let from_kernel = |c: &Captured| c.segment.direction == Direction::ToSwitch;
-    let mut kernel_snd_nxt: Option<u32> = None;
-    let mut keepalive_at = None;
-    for (i, c) in captured.iter().enumerate().filter(|(_, c)| from_kernel(c)) {
-        let s = c.segment;
-        if c.at >= from
-            && s.flags == ACK
-            && s.len == 0
-            && kernel_snd_nxt == Some(s.seq.wrapping_add(1))
-        {
-            keepalive_at = Some(i);
-            break;
-        }
-        let control = u32::from(s.flags & SYN != 0) + u32::from(s.flags & FIN != 0);
-        let end = s.seq.wrapping_add(s.len).wrapping_add(control);
-        if kernel_snd_nxt.is_none_or(|next| after(end, next)) {
-            kernel_snd_nxt = Some(end);
-        }
-    }
-    let at = keepalive_at.ok_or("the kernel sent no keepalive")?;
-    let keepalive = captured[at];
-    let k = keepalive.segment;
-    let resend_at = captured[..at]
-        .iter()
-        .rposition(|c| !from_kernel(c) && c.segment.len > 0)
-        .ok_or("switch sent no data before the keepalive")?;
-    let resend = captured[resend_at];
-    let r = resend.segment;
-    if !timeouts
-        .iter()
-        .any(|t| t.captured.at == resend.at && t.captured.segment == r)
-    {
-        return Err(format!(
-            "switch's last data segment before the keepalive {k:?} is not a timeout \
-             retransmission: {r:?}"
-        ));
-    }
-    if let Some(between) = captured[resend_at + 1..at].iter().find(|c| from_kernel(c)) {
-        return Err(format!(
-            "the kernel sent {:?} between switch's timeout retransmission {r:?} and its \
-             keepalive {k:?}",
-            between.segment
-        ));
-    }
-    if !after(k.ack, r.seq.wrapping_add(r.len)) {
-        return Err(format!(
-            "switch's timeout retransmission {r:?} reaches the keepalive's ACK number {k:?}"
-        ));
-    }
-    let answer_at = captured[at + 1..]
-        .iter()
-        .position(|c| !from_kernel(c))
-        .map(|i| at + 1 + i)
-        .ok_or("switch did not answer the keepalive")?;
-    if let Some(between) = captured[at + 1..answer_at].iter().find(|c| from_kernel(c)) {
-        return Err(format!(
-            "the kernel sent {:?} between its keepalive {k:?} and switch's answer",
-            between.segment
-        ));
-    }
-    let answer = captured[answer_at];
-    let a = answer.segment;
-    if !(a.flags == ACK && a.len == 0 && !after(k.ack, a.seq)) {
-        return Err(format!(
-            "switch's answer to the keepalive {k:?} is not a pure ACK at or after its ACK \
-             number: {a:?}"
-        ));
-    }
-    Ok(KeepaliveAnswer {
-        resend,
-        keepalive,
-        answer,
-    })
-}
-
-/// After smoltcp's retransmission timeout rewinds switch's resend point
-/// (remote_last_seq) to SND.UNA, below data Linux already holds, switch's
-/// pure ACKs still carry a sequence number at or after Linux's RCV.NXT: the
-/// highest sequence number sent, clamped to Linux's window, as Linux's own
-/// tcp_acceptable_seq does. Linux checks the sequence number before the ACK
-/// field (tcp_rcv_established -> tcp_validate_incoming -> tcp_sequence), so a
-/// pure ACK below RCV.NXT would be discarded as old, its ACK unread.
-///
-/// Only a segment switch answers without processing its ACK can draw a pure
-/// ACK while the resend point is behind: any in-window segment from Linux
-/// carries Linux's RCV.NXT, and smoltcp processes that ACK, which moves the
-/// resend point up to it, before it acknowledges anything. Linux's
-/// keepalives are pure ACKs at SND.UNA - 1 (tcp_xmit_probe_skb), one byte
-/// below switch's receive window, which smoltcp answers with an ACK without
-/// processing theirs, at most one a second.
-///
-/// So the client turns the kernel's keepalive on. Pure ACKs to switch are
-/// dropped while both sides stream for `ACK_LOSS_STREAMING`; then the client
-/// stops writing, so the kernel acknowledges switch's echo with pure ACKs
-/// alone and switch times out, `STALE_ACK_RTO` after its last new data,
-/// retransmitting from SND.UNA. Once the kernel has that retransmission, the
-/// filter goes. Switch's next timeout is two RTOs, 2 s, later (backoff
-/// doubles it, `retransmission_timeout`), and nothing else of the kernel's
-/// reaches switch before the kernel's next keepalive: the client still does
-/// not write, and the kernel sends a keepalive only with nothing
-/// unacknowledged and nothing queued, `STALE_ACK_KEEPALIVE_SECS` (2 s) after
-/// the last segment it accepted from switch, that same last new data
-/// (tcp_timer.c:820-843). So it comes about 1 s after removal and 1 s before
-/// Switch's next timeout, with switch's resend point still below the
-/// kernel's RCV.NXT, and switch answers it at or after that RCV.NXT
-/// (`keepalive_answer`). No pure ACK of switch's is ever below the kernel's
-/// RCV.NXT. After the kernel's next keepalive the client writes again and the
-/// echo completes.
-#[switch_test_support::pinned_test]
-fn switch_pure_ack_after_its_retransmission_timeout_is_not_below_linux_rcv_nxt() {
-    let (echo, captured) = serve_client_configured(
-        ACK_LOSS_DEADLINE,
-        STANDARD,
-        Offloads::default(),
-        Some(STALE_ACK_RTO),
-        || echo_through_pure_ack_loss(stale_ack_keepalive, stale_ack_loss),
-    );
-    let window = &echo.window;
-    let since_start = |at: SystemTime| at.duration_since(window.from).unwrap();
-    let switch_timeouts =
-        switch_timeout_retransmissions(&retransmissions(&captured, Direction::ToKernel));
-    let stale_acks = stale_pure_acks(&captured, Direction::ToKernel);
-    let answer = keepalive_answer(&captured, window.until, &switch_timeouts);
-    let streaming = [Direction::ToSwitch, Direction::ToKernel].map(|direction| {
-        data_sent_between(
-            &captured,
-            direction,
-            window.from,
-            window.from + ACK_LOSS_STREAMING,
-        )
-    });
-    let shown = |c: Captured| {
-        let s = c.segment;
-        format!(
-            "{:?} flags {:#04x} seq {} ack {} len {}",
-            since_start(c.at),
-            s.flags,
-            s.seq,
-            s.ack,
-            s.len
-        )
-    };
-    let shown_answer = match &answer {
-        Ok(a) => format!(
-            "resend [{}], keepalive [{}], answer [{}]",
-            shown(a.resend),
-            shown(a.keepalive),
-            shown(a.answer)
-        ),
-        Err(error) => format!("keepalive answer not shown: {error}"),
-    };
-    // Uncaptured, as for the options record.
-    let record = format!(
-        "pure ACK after timeout: data bytes sent in the first {ACK_LOSS_STREAMING:?} [to \
-         Switch, to the kernel] {streaming:?}; pure ACKs to switch dropped {}; kernel took in \
-         Switch's timeout retransmission {:?} after the client stopped writing; filter in place \
-         {:?}; switch timeout retransmissions {} (first {:?} after loss start, {:?} after its \
-         first byte); switch pure ACKs below the kernel's RCV.NXT {} (first {:?}); \
-         {shown_answer}; two keepalives after removal {}; TCPACKSkippedSeq +{}; filter \
-         removed to full echo {:?}; {} segments captured\n",
-        window.dropped,
-        window.retransmission_received,
-        window.until.duration_since(window.from).unwrap(),
-        switch_timeouts.len(),
-        switch_timeouts.first().map(|r| since_start(r.captured.at)),
-        switch_timeouts
-            .first()
-            .map(Retransmission::since_first_sent),
-        stale_acks.len(),
-        stale_acks.first().map(|c| since_start(c.at)),
-        window.keepalives_after_removal,
-        window.acks_skipped,
-        echo.recovery,
-        captured.len(),
-    );
-    io::stdout().write_all(record.as_bytes()).unwrap();
-
-    assert!(
-        streaming.iter().all(|&bytes| bytes > 0),
-        "data bytes sent in the first {ACK_LOSS_STREAMING:?} of the loss \
-         [to switch, to the kernel]: {streaming:?}"
-    );
-    assert!(window.dropped > 0, "no pure ACK to switch dropped");
-    // Switch's packets meet the ingress qdisc, which kept net_tap's filters
-    // alone, so nothing of switch's was dropped.
-    assert_eq!(
-        window.filters_installed[1], window.filters_before[1],
-        "a filter was added toward the kernel"
-    );
-    assert_ne!(
-        window.filters_installed[0], window.filters_before[0],
-        "no filter was added toward switch"
-    );
-    assert!(
-        window.retransmission_received.is_some(),
-        "the kernel took in no retransmission within {STALE_ACK_RTO_WAIT:?} of the client \
-         stopping writing (TcpExt {DELAYED_ACK_LOST} unchanged)"
-    );
-    assert!(
-        window.keepalives_after_removal,
-        "the kernel did not send two keepalives within {STALE_ACK_KEEPALIVE_WAIT:?} of the \
-         filter being removed (TcpExt {TCP_KEEPALIVE})"
-    );
-    assert_eq!(
-        window.acks_skipped, 0,
-        "the kernel withheld answers to out-of-window ACKs for its rate limit \
-         (TcpExt {TCP_ACK_SKIPPED_SEQ})"
-    );
-    if let Err(error) = answer {
-        panic!("{error}");
-    }
-    assert!(
-        stale_acks.is_empty(),
-        "switch sent pure ACKs below the kernel's RCV.NXT: {stale_acks:?}"
-    );
-    assert!(
-        echo.recovery < STALE_ACK_RECOVERY,
-        "filter removed to full echo {:?}, over {STALE_ACK_RECOVERY:?}",
-        echo.recovery
-    );
-    let segments = segments(&captured);
-    assert_one_connection(&segments, echo.kernel_port);
-    assert_eq!(close_kind(&segments), Close::Clean);
-}
-
-/// What the client in `failed_run_cleans_up_for_the_next` panics with.
-struct ClientFailed;
-
-/// A client panicking with the pure-ACK filters installed deletes them while
-/// it unwinds; serve_client then fails with that panic, dropping the Port and
-/// removing the vdev, so the next run in this binary opens it again.
-#[switch_test_support::pinned_test]
-fn failed_run_cleans_up_for_the_next() {
-    let failed = panic::catch_unwind(|| {
-        serve_client(DEADLINE, || {
-            let before = tc_filters();
-            let unwound = panic::catch_unwind(|| {
-                let _filters =
-                    DropFilters::install(ECHO_PORT, &[Direction::ToSwitch, Direction::ToKernel]);
-                panic_any(ClientFailed)
-            });
-            assert!(unwound.is_err_and(|panic| panic.is::<ClientFailed>()));
-            assert_eq!(tc_filters(), before, "filters left after the panic");
-            panic_any(ClientFailed)
-        })
-    })
-    .unwrap_err();
-    assert!(
-        failed.is::<ClientFailed>(),
-        "serve_client failed with something other than the client's panic"
-    );
-    assert_eq!(ifindex(IFACE), 0, "{IFACE:?} left after the failure");
-
-    let (kernel_port, captured) = serve_client(DEADLINE, exchange_then_abort);
-    let segments = segments(&captured);
-    assert_one_connection(&segments, kernel_port);
-    assert_eq!(close_kind(&segments), Close::Reset(Direction::ToSwitch));
 }
 
 /// Outside switch's /24. The kernel owns it as a /32 on `IFACE` beside
@@ -3400,529 +2871,6 @@ fn switch_without_gateway_sends_nothing_off_subnet() {
     assert!(sent.is_empty(), "switch sent over {turns} turns: {sent:?}");
 }
 
-fn hand_built(direction: Direction, flags: u8, seq: u32, ack: u32, len: u32) -> Segment {
-    Segment {
-        direction,
-        kernel_port: 40000,
-        flags,
-        seq,
-        ack,
-        len,
-        mss: None,
-        timestamps: false,
-    }
-}
-
-#[test]
-fn close_kind_classifies_hand_built_captures() {
-    use Direction::{ToSwitch as K, ToKernel as C};
-    let incomplete = |kernel_fin, switch_fin, switch_fin_acked| Close::Incomplete {
-        kernel_fin,
-        switch_fin,
-        switch_fin_acked,
-    };
-    // The kernel's FIN is at 1000, switch's at 5000.
-    let kernel_fin = hand_built(K, FIN | ACK, 1000, 5000, 0);
-    let switch_fin = hand_built(C, FIN | ACK, 5000, 1001, 0);
-    let fin_acked = hand_built(K, ACK, 1001, 5001, 0);
-    let cases = [
-        (
-            "clean",
-            vec![kernel_fin, switch_fin, fin_acked],
-            Close::Clean,
-        ),
-        (
-            "switch closes first",
-            vec![
-                hand_built(C, FIN | ACK, 5000, 1000, 0),
-                hand_built(K, FIN | ACK, 1000, 5001, 0),
-            ],
-            Close::Clean,
-        ),
-        (
-            "no kernel FIN",
-            vec![switch_fin, fin_acked],
-            incomplete(false, true, true),
-        ),
-        (
-            "no switch FIN",
-            vec![kernel_fin, hand_built(C, ACK, 5000, 1001, 0)],
-            incomplete(true, false, false),
-        ),
-        (
-            "no ACK of switch's FIN",
-            vec![kernel_fin, switch_fin],
-            incomplete(true, true, false),
-        ),
-        (
-            "matching ACK only before switch's FIN",
-            vec![hand_built(K, FIN | ACK, 1000, 5001, 0), switch_fin],
-            incomplete(true, true, false),
-        ),
-        (
-            "ACK of the FIN's sequence number, not past it",
-            vec![kernel_fin, switch_fin, hand_built(K, ACK, 1001, 5000, 0)],
-            incomplete(true, true, false),
-        ),
-        (
-            "matching ack field without the ACK flag",
-            vec![kernel_fin, switch_fin, hand_built(K, 0, 1001, 5001, 0)],
-            incomplete(true, true, false),
-        ),
-        (
-            "matching ack field from switch",
-            vec![kernel_fin, switch_fin, hand_built(C, ACK, 5001, 5001, 0)],
-            incomplete(true, true, false),
-        ),
-        (
-            "switch's FIN carries 100 bytes",
-            vec![
-                kernel_fin,
-                hand_built(C, FIN | ACK, 5000, 1001, 100),
-                hand_built(K, ACK, 1001, 5101, 0),
-            ],
-            Close::Clean,
-        ),
-        (
-            "data-carrying FIN, only the data acknowledged",
-            vec![
-                kernel_fin,
-                hand_built(C, FIN | ACK, 5000, 1001, 100),
-                hand_built(K, ACK, 1001, 5100, 0),
-            ],
-            incomplete(true, true, false),
-        ),
-        (
-            "FIN past the sequence wrap",
-            vec![
-                kernel_fin,
-                hand_built(C, FIN | ACK, 0xffff_fff0, 1001, 0x20),
-                hand_built(K, ACK, 1001, 0x11, 0),
-            ],
-            Close::Clean,
-        ),
-        (
-            "FIN at the last sequence number",
-            vec![
-                kernel_fin,
-                hand_built(C, FIN | ACK, u32::MAX, 1001, 0),
-                hand_built(K, ACK, 1001, 0, 0),
-            ],
-            Close::Clean,
-        ),
-        (
-            "kernel resets",
-            vec![
-                hand_built(K, ACK, 1000, 5000, 100),
-                hand_built(K, RST | ACK, 1100, 5000, 0),
-            ],
-            Close::Reset(K),
-        ),
-        (
-            "switch resets",
-            vec![hand_built(C, RST | ACK, 5000, 1000, 0)],
-            Close::Reset(C),
-        ),
-        (
-            "RST after both FINs and the ACK",
-            vec![
-                kernel_fin,
-                switch_fin,
-                fin_acked,
-                hand_built(C, RST, 5001, 0, 0),
-            ],
-            Close::Reset(C),
-        ),
-        (
-            "kernel RST after its FIN",
-            vec![kernel_fin, hand_built(K, RST, 1001, 0, 0)],
-            Close::Reset(K),
-        ),
-        (
-            "first RST decides the direction",
-            vec![
-                hand_built(C, RST, 5000, 0, 0),
-                hand_built(K, RST, 1000, 0, 0),
-            ],
-            Close::Reset(C),
-        ),
-    ];
-    for (name, segments, expected) in cases {
-        assert_eq!(close_kind(&segments), expected, "{name}");
-    }
-}
-
-#[test]
-fn segment_reads_headers_with_options() {
-    // Kernel 192.0.2.1:40000 -> switch 192.0.2.2:8080, FIN|ACK, 10 payload
-    // bytes not captured. IHL 6 (router alert option), TCP data offset 8 (NOP,
-    // NOP, timestamps).
-    #[rustfmt::skip]
-    let sent: [u8; 56] = [
-        0x46, 0x00, 0x00, 66, // version 4, IHL 6; total length 24 + 32 + 10
-        0x00, 0x00, 0x40, 0x00, // id; DF
-        64, 6, 0x00, 0x00, // TTL; TCP; checksum
-        192, 0, 2, 1,
-        192, 0, 2, 2,
-        0x94, 0x04, 0x00, 0x00, // router alert
-        0x9c, 0x40, 0x1f, 0x90, // ports 40000 -> 8080
-        0x01, 0x02, 0x03, 0x04, // seq
-        0xff, 0xff, 0xff, 0xfe, // ack
-        0x80, 0x11, 0x01, 0xf5, // data offset 8; FIN|ACK; window
-        0x00, 0x00, 0x00, 0x00, // checksum; urgent pointer
-        0x01, 0x01, 0x08, 0x0a, // NOP, NOP, timestamps
-        0x00, 0x00, 0x00, 0x01,
-        0x00, 0x00, 0x00, 0x02,
-    ];
-    assert_eq!(
-        segment(libc::PACKET_OUTGOING, &sent),
-        Some(Segment {
-            direction: Direction::ToSwitch,
-            kernel_port: 40000,
-            flags: FIN | ACK,
-            seq: 0x0102_0304,
-            ack: 0xffff_fffe,
-            len: 10,
-            mss: None,
-            timestamps: true,
-        })
-    );
-
-    // Switch 192.0.2.2:8080 -> kernel 192.0.2.1:40000, RST|ACK, no options.
-    #[rustfmt::skip]
-    let received: [u8; 40] = [
-        0x45, 0x00, 0x00, 40,
-        0x00, 0x00, 0x00, 0x00,
-        64, 6, 0x00, 0x00,
-        192, 0, 2, 2,
-        192, 0, 2, 1,
-        0x1f, 0x90, 0x9c, 0x40,
-        0x00, 0x00, 0x00, 0x07,
-        0x00, 0x00, 0x00, 0x09,
-        0x50, 0x14, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-    ];
-    assert_eq!(
-        segment(libc::PACKET_HOST, &received),
-        Some(Segment {
-            direction: Direction::ToKernel,
-            kernel_port: 40000,
-            flags: RST | ACK,
-            seq: 7,
-            ack: 9,
-            len: 0,
-            mss: None,
-            timestamps: false,
-        })
-    );
-    assert_eq!(segment(libc::PACKET_BROADCAST, &received), None);
-    let mut other_port = received;
-    other_port[21] = 0x91;
-    assert_eq!(segment(libc::PACKET_HOST, &other_port), None);
-}
-
-#[test]
-fn segment_reads_the_mss_option_of_a_syn_ack() {
-    // Switch 192.0.2.2:8080 -> kernel 192.0.2.1:40000, SYN|ACK, with
-    // Switch's options as fuzz/packetdrill/scripts/handshake-linux-options.pkt
-    // 60 records them: mss 1460, wscale 2, sackOK, TS val 100 ecr 1000, eol.
-    #[rustfmt::skip]
-    let syn_ack: [u8; 60] = [
-        0x45, 0x00, 0x00, 60,
-        0x00, 0x00, 0x00, 0x00,
-        64, 6, 0x00, 0x00,
-        192, 0, 2, 2,
-        192, 0, 2, 1,
-        0x1f, 0x90, 0x9c, 0x40,
-        0x00, 0x00, 0x00, 0x07,
-        0x00, 0x00, 0x00, 0x01,
-        0xa0, 0x12, 0xff, 0xff, // data offset 10; SYN|ACK; window
-        0x00, 0x00, 0x00, 0x00,
-        0x02, 0x04, 0x05, 0xb4, // mss 1460
-        0x03, 0x03, 0x02, // wscale 2
-        0x04, 0x02, // sackOK
-        0x08, 0x0a, 0x00, 0x00, 0x00, 100, 0x00, 0x00, 0x03, 0xe8, // TS
-        0x00, // eol
-    ];
-    let expected = Segment {
-        direction: Direction::ToKernel,
-        kernel_port: 40000,
-        flags: SYN | ACK,
-        seq: 7,
-        ack: 1,
-        len: 0,
-        mss: Some(1460),
-        timestamps: true,
-    };
-    assert_eq!(segment(libc::PACKET_HOST, &syn_ack), Some(expected));
-    let without_timestamps = Segment { timestamps: false, ..expected };
-    let without_mss = Segment { mss: None, ..without_timestamps };
-
-    // The capture cut off inside the MSS option, or after only its kind:
-    // the header fields still parse.
-    for captured in [42, 41] {
-        assert_eq!(segment(libc::PACKET_HOST, &syn_ack[..captured]), Some(without_mss));
-    }
-    // Cut off after it: later options are not needed for the MSS.
-    assert_eq!(segment(libc::PACKET_HOST, &syn_ack[..44]), Some(without_timestamps));
-    // Cut off inside the timestamp option.
-    assert_eq!(segment(libc::PACKET_HOST, &syn_ack[..58]), Some(without_timestamps));
-
-    // The 20 option bytes start with `options`, NOPs after.
-    let with_options = |options: &[u8]| {
-        let mut packet = syn_ack;
-        packet[40..].fill(0x01);
-        packet[40..40 + options.len()].copy_from_slice(options);
-        packet
-    };
-    // MSS after a NOP and another option.
-    let later = with_options(&[0x01, 0x03, 0x03, 0x02, 0x02, 0x04, 0x05, 0xb4]);
-    assert_eq!(segment(libc::PACKET_HOST, &later), Some(without_timestamps));
-
-    let past_header = [[0x01; 19].as_slice(), &[0x08]].concat();
-    for options in [
-        // An MSS option of length 3.
-        &[0x02, 0x03, 0x05, 0xb4][..],
-        // An option length below 2 before the MSS option.
-        &[0x03, 0x01, 0x02, 0x04, 0x05, 0xb4],
-        // End of options before it.
-        &[0x00, 0x02, 0x04, 0x05, 0xb4],
-        // An option running past the TCP header.
-        &past_header,
-    ] {
-        assert_eq!(
-            segment(libc::PACKET_HOST, &with_options(options)),
-            Some(without_mss),
-            "options {options:02x?}"
-        );
-    }
-
-    // Data offset 6: 4 option bytes, then 4 captured payload bytes that look
-    // like an MSS option. Options end at the TCP header, not the capture.
-    for options in [[0x01, 0x01, 0x01, 0x01], [0x01, 0x01, 0x01, 0x02]] {
-        #[rustfmt::skip]
-        let mut packet: [u8; 48] = [
-            0x45, 0x00, 0x00, 48,
-            0x00, 0x00, 0x00, 0x00,
-            64, 6, 0x00, 0x00,
-            192, 0, 2, 2,
-            192, 0, 2, 1,
-            0x1f, 0x90, 0x9c, 0x40,
-            0x00, 0x00, 0x00, 0x07,
-            0x00, 0x00, 0x00, 0x01,
-            0x60, 0x10, 0xff, 0xff, // data offset 6; ACK
-            0x00, 0x00, 0x00, 0x00,
-            0, 0, 0, 0, // options
-            0x02, 0x04, 0x05, 0xb4, // payload
-        ];
-        packet[40..44].copy_from_slice(&options);
-        let parsed = segment(libc::PACKET_HOST, &packet);
-        assert_eq!(
-            parsed.map(|s| (s.flags, s.len, s.mss)),
-            Some((ACK, 4, None)),
-            "options {options:02x?}"
-        );
-    }
-
-    // IHL 6 (router alert): the options start after the longer IP header.
-    let mut ihl_6 = [0u8; 64];
-    ihl_6[..20].copy_from_slice(&syn_ack[..20]);
-    ihl_6[0] = 0x46;
-    ihl_6[3] = 64;
-    ihl_6[20..24].copy_from_slice(&[0x94, 0x04, 0x00, 0x00]);
-    ihl_6[24..].copy_from_slice(&syn_ack[20..]);
-    assert_eq!(segment(libc::PACKET_HOST, &ihl_6), Some(expected));
-}
-
-fn at_ms(ms: u64, segment: Segment) -> Captured {
-    Captured {
-        at: SystemTime::UNIX_EPOCH + Duration::from_millis(ms),
-        segment,
-    }
-}
-
-#[test]
-fn retransmissions_and_stale_pure_acks_are_found_from_the_capture() {
-    use Direction::{ToSwitch as K, ToKernel as C};
-    let captured = [
-        at_ms(0, hand_built(C, ACK, 1000, 1, 100)),
-        at_ms(1, hand_built(K, ACK, 1, 1100, 100)),
-        at_ms(2, hand_built(C, ACK, 1100, 101, 100)),
-        // The kernel's RCV.NXT is 1200.
-        at_ms(3, hand_built(K, ACK, 101, 1200, 0)),
-        // RTO: 1000 resent, SND.NXT rewound to 1100.
-        at_ms(4, hand_built(C, ACK, 1000, 101, 100)),
-        at_ms(5, hand_built(C, ACK, 1100, 101, 0)),
-        // Not pure ACKs, though below 1200.
-        at_ms(6, hand_built(C, ACK | FIN, 1100, 101, 0)),
-        at_ms(7, hand_built(C, ACK | PSH, 1100, 101, 0)),
-        // The kernel resends; its own pure ACK above was at switch's RCV.NXT.
-        at_ms(8, hand_built(K, ACK, 1, 1200, 100)),
-        at_ms(9, hand_built(C, ACK, 1200, 101, 50)),
-        at_ms(10, hand_built(C, ACK, 1250, 101, 0)),
-    ];
-    let at = |found: Vec<Captured>| -> Vec<SystemTime> { found.iter().map(|c| c.at).collect() };
-    let resent = |found: Vec<Retransmission>| -> Vec<(SystemTime, SystemTime)> {
-        found
-            .iter()
-            .map(|r| (r.captured.at, r.first_sent))
-            .collect()
-    };
-    let ms = |ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
-    assert_eq!(resent(retransmissions(&captured, C)), [(ms(4), ms(0))]);
-    assert_eq!(at(stale_pure_acks(&captured, C)), [ms(5)]);
-    assert_eq!(resent(retransmissions(&captured, K)), [(ms(8), ms(1))]);
-    assert!(stale_pure_acks(&captured, K).is_empty());
-
-    // Across the sequence wrap.
-    let wrapped = [
-        at_ms(0, hand_built(C, ACK, 0xffff_ff00, 1, 0x100)),
-        at_ms(1, hand_built(K, ACK, 1, 0, 0)),
-        at_ms(2, hand_built(C, ACK, 0, 1, 10)),
-        at_ms(3, hand_built(C, ACK, 0xffff_ff80, 1, 0x80)),
-        at_ms(4, hand_built(K, ACK, 1, 10, 0)),
-        at_ms(5, hand_built(C, ACK, 0, 1, 0)),
-        at_ms(6, hand_built(C, ACK, 10, 1, 0)),
-    ];
-    assert_eq!(resent(retransmissions(&wrapped, C)), [(ms(3), ms(0))]);
-    assert_eq!(at(stale_pure_acks(&wrapped, C)), [ms(5)]);
-}
-
-#[test]
-fn switch_timeout_retransmissions_need_the_minimum_rto_and_more_than_a_byte() {
-    use Direction::ToKernel as C;
-    let captured = [
-        at_ms(0, hand_built(C, ACK, 1000, 1, 100)),
-        at_ms(150, hand_built(C, ACK, 1100, 1, 100)),
-        // A timeout resends from SND.UNA, first sent at 0; captured within
-        // CAPTURE_SLACK of SWITCH_RTO.
-        at_ms(285, hand_built(C, ACK, 1000, 1, 100)),
-        // The rest of that resend: first sent at 150, too recently.
-        at_ms(301, hand_built(C, ACK, 1100, 1, 100)),
-        at_ms(340, hand_built(C, ACK, 1150, 1, 50)),
-        // Zero-window probes: the same byte, the second over SWITCH_RTO later.
-        at_ms(400, hand_built(C, ACK, 1200, 1, 1)),
-        at_ms(750, hand_built(C, ACK, 1200, 1, 1)),
-    ];
-    let ms = |ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
-    let found = retransmissions(&captured, C);
-    let resent: Vec<_> = found
-        .iter()
-        .map(|r| (r.captured.at, r.first_sent))
-        .collect();
-    assert_eq!(
-        resent,
-        [
-            (ms(285), ms(0)),
-            (ms(301), ms(150)),
-            (ms(340), ms(150)),
-            (ms(750), ms(400)),
-        ]
-    );
-    let timeouts: Vec<_> = switch_timeout_retransmissions(&found)
-        .iter()
-        .map(|r| r.captured.at)
-        .collect();
-    assert_eq!(timeouts, [ms(285)]);
-}
-
-#[test]
-fn data_sent_between_counts_payload_one_way_in_a_half_open_interval() {
-    use Direction::{ToSwitch as K, ToKernel as C};
-    let captured = [
-        at_ms(0, hand_built(K, ACK, 1, 1000, 100)),
-        at_ms(5, hand_built(K, ACK, 101, 1000, 200)),
-        at_ms(5, hand_built(C, ACK, 1000, 301, 400)),
-        at_ms(6, hand_built(K, ACK, 301, 1400, 0)),
-        at_ms(10, hand_built(K, ACK, 301, 1400, 800)),
-    ];
-    let ms = |ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
-    assert_eq!(data_sent_between(&captured, K, ms(0), ms(10)), 300);
-    assert_eq!(data_sent_between(&captured, C, ms(0), ms(10)), 400);
-    assert_eq!(data_sent_between(&captured, K, ms(1), ms(11)), 1000);
-}
-
-#[test]
-fn keepalive_answer_needs_a_timeout_resend_below_the_keepalives_ack() {
-    use Direction::{ToSwitch as K, ToKernel as C};
-    let ms = |ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms);
-    // The kernel writes 300 bytes (1..301). Switch echoes 200 (1000..1200);
-    // the kernel's pure ACKs of them are dropped. Its SND.NXT is 301, so its
-    // keepalives are at 300, acknowledging 1200.
-    let start = [
-        at_ms(0, hand_built(K, ACK | PSH, 1, 1000, 300)),
-        at_ms(1, hand_built(C, ACK, 1000, 301, 100)),
-        at_ms(2, hand_built(C, ACK, 1100, 301, 100)),
-    ];
-    // Timeout: 1000 resent alone.
-    let resend = at_ms(1002, hand_built(C, ACK, 1000, 301, 100));
-    let keepalive = at_ms(2000, hand_built(K, ACK, 300, 1200, 0));
-    let answer = at_ms(2001, hand_built(C, ACK, 1200, 301, 0));
-    let trace = |parts: &[&[Captured]]| parts.concat();
-    let found_in = |captured: Vec<Captured>| {
-        let timeouts = switch_timeout_retransmissions(&retransmissions(&captured, C));
-        keepalive_answer(&captured, ms(1500), &timeouts)
-    };
-    let rejected = |captured: Vec<Captured>, expected: &str| {
-        let error = found_in(captured).unwrap_err();
-        assert!(
-            error.contains(expected),
-            "expected {expected:?}, got {error:?}"
-        );
-    };
-
-    let found = found_in(trace(&[&start, &[resend, keepalive, answer]])).unwrap();
-    assert_eq!(
-        [found.resend, found.keepalive, found.answer].map(|c| c.at),
-        [ms(1002), ms(2000), ms(2001)]
-    );
-
-    // An answer at the resend point, below the kernel's RCV.NXT.
-    let stale = at_ms(2001, hand_built(C, ACK, 1100, 301, 0));
-    rejected(
-        trace(&[&start, &[resend, keepalive, stale]]),
-        "is not a pure ACK at or after",
-    );
-    rejected(
-        trace(&[&start, &[resend, keepalive]]),
-        "did not answer the keepalive",
-    );
-    // The kernel's pure ACK at its SND.NXT is not a keepalive, nor is a
-    // keepalive before `from`.
-    let at_snd_nxt = at_ms(2000, hand_built(K, ACK, 301, 1200, 0));
-    rejected(
-        trace(&[&start, &[resend, at_snd_nxt, answer]]),
-        "no keepalive",
-    );
-    let early = at_ms(1400, hand_built(K, ACK, 300, 1200, 0));
-    rejected(trace(&[&start, &[resend, early, answer]]), "no keepalive");
-    // The kernel's duplicate ACK of the resend reached switch first.
-    let dupack = at_ms(1003, hand_built(K, ACK, 301, 1200, 0));
-    rejected(
-        trace(&[&start, &[resend, dupack, keepalive, answer]]),
-        "between switch's timeout retransmission",
-    );
-    // A kernel segment between the keepalive and switch's answer: the answer
-    // may be to that segment instead.
-    let ordinary = at_ms(2000, hand_built(K, ACK, 301, 1200, 0));
-    let second = at_ms(2000, hand_built(K, ACK, 300, 1200, 0));
-    rejected(
-        trace(&[&start, &[resend, keepalive, ordinary, second, answer]]),
-        "between its keepalive",
-    );
-    // Switch's last data before the keepalive is new data, not a resend.
-    let new_data = at_ms(1500, hand_built(C, ACK | PSH, 1200, 301, 50));
-    rejected(
-        trace(&[&start, &[resend, new_data, keepalive, answer]]),
-        "is not a timeout retransmission",
-    );
-    // The resend covers everything the kernel holds.
-    let whole = at_ms(1002, hand_built(C, ACK, 1000, 301, 200));
-    rejected(
-        trace(&[&start, &[whole, keepalive, answer]]),
-        "reaches the keepalive's ACK number",
-    );
-}
 
 #[test]
 fn timed_out_retries_poll_timeouts_and_interrupts_only() {

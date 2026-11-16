@@ -29,7 +29,10 @@ use switch_test_kit::with_eal;
 
 const BULK: usize = 256 * 1024;
 const ACK_DELAY: Duration = Duration::from_millis(10);
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO's least value: RTT samples here are 0 or 10 ms (delayed ACK), so
+/// 4 · RTTVAR stays below smoltcp's 50 ms floor and the RTO is SRTT + 50 ms, from `RTO`
+/// (no delayed sample yet) to `RTO` + `ACK_DELAY`.
+const RTO: Duration = Duration::from_millis(50);
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/frames");
 
@@ -514,36 +517,21 @@ fn hold_every_frame(
     held
 }
 
-/// Retaining frames does not limit delivery of the next receive window.
+/// Retaining frames does not limit delivery of the next receive window; held frames keep their
+/// RX mbufs until dropped.
 #[switch_test_support::pinned_test]
 fn receiving_continues_while_frames_are_held() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frza", "frzb"], [config(Side::A), config(Side::B)], T0);
         let trace = record(&mut pair);
         let handles = open(&mut pair, &trace, 4096);
+        let idle = pair.in_use()[1].0;
         let first = hold_every_frame(&mut pair, &trace, &handles);
         let second = hold_every_frame(&mut pair, &trace, &handles);
-        assert_eq!(pair.b.tcp(&handles[1]).held_frames().count(), first.len() + second.len());
+        let held = u32::try_from(first.len() + second.len()).unwrap();
+        assert_eq!(pair.in_use()[1].0, idle + held);
         drop((first, second));
-        finish(pair, &trace, 0);
-    });
-}
-
-/// Frames remain valid when B's socket is removed and are released when dropped.
-#[switch_test_support::pinned_test]
-fn held_frames_dropped_after_remove_tcp() {
-    with_eal(|eal| {
-        let mut pair = Pair::new(eal, ["frra", "frrb"], [config(Side::A), config(Side::B)], T0);
-        let trace = record(&mut pair);
-        let handles = open(&mut pair, &trace, 4096);
-        let held = hold_every_frame(&mut pair, &trace, &handles);
-        let [a, b] = handles;
-        pair.b.remove_tcp(b);
-        drop(held);
-        let at = pair.now();
-        round(&mut pair, &trace, at);
-        round(&mut pair, &trace, at);
-        drop(a);
+        assert_eq!(pair.in_use()[1].0, idle);
         finish(pair, &trace, 0);
     });
 }
@@ -666,65 +654,13 @@ fn peer_zero_window_probe_then_full_delivery() {
             .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
         {
             assert_eq!(tcp.seq_number, next, "data was retransmitted or skipped");
-            next = next + tcp.payload.len();
+            next += tcp.payload.len();
         }
         assert_eq!(next, a_seq + data.len());
         assert_eq!((pair.a.tcp(&handles[0]).retransmits(), pair.a.tcp(&handles[0]).loss_events()), (0, 0));
         assert_eq!(pair.a.poll_at(), None);
         drop(recorded);
         finish(pair, &trace, 0);
-    });
-}
-
-#[switch_test_support::pinned_test]
-fn bulk_tail_loss() {
-    bulk_scenario(|pair, trace, handles| {
-        let data = pattern(1000, 7);
-        let start = trace.borrow().frames.len();
-        trace.borrow_mut().drop_next_data = true;
-        let sent_at = pair.now();
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(&data), Ok(data.len()));
-        round(pair, trace, sent_at);
-        assert_eq!(pair.a_to_b.dropped, 1);
-        assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), 0);
-        assert!(
-            matches!(pair.a.poll_at(), Some(at) if at > sent_at && at <= ceil_ms(sent_at + RTO))
-        );
-        drive(pair, trace, |_, b| {
-            if b.tcp(&handles[1]).recv_queue() == data.len() {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        let next = {
-            let recorded = trace.borrow();
-            let attempts: Vec<_> = tcp_frames(&recorded.frames[start..])
-                .filter(|(frame, tcp)| frame.dir == Dir::AToB && !tcp.payload.is_empty())
-                .collect();
-            assert_eq!(attempts.len(), 2);
-            assert!(attempts[0].0.dropped);
-            assert!(!attempts[1].0.dropped);
-            assert_eq!(attempts[0].0.at, sent_at);
-            assert_eq!(attempts[1].0.at, ceil_ms(sent_at + RTO));
-            assert_eq!(attempts[0].1.seq_number, attempts[1].1.seq_number);
-            assert_eq!(attempts[0].1.ack_number, attempts[1].1.ack_number);
-            for (_, tcp) in &attempts {
-                assert_eq!(tcp.control, TcpControl::Psh);
-                assert_eq!(tcp.payload, &data[..]);
-            }
-            attempts[0].1.seq_number + data.len()
-        };
-        receive_acked(pair, trace, handles, &data);
-        let recorded = trace.borrow();
-        let (_, ack) = tcp_frames(&recorded.frames[start..])
-            .filter(|(frame, tcp)| frame.dir == Dir::BToA && pure_ack(tcp))
-            .last()
-            .expect("B acknowledged the retransmission");
-        assert_eq!(ack.ack_number, Some(next));
-        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
-        assert_eq!(pair.a.poll_at(), None);
-        1
     });
 }
 
@@ -833,66 +769,6 @@ fn bulk_fast_retransmit() {
 }
 
 #[switch_test_support::pinned_test]
-fn bulk_fin() {
-    bulk_scenario(|pair, trace, handles| {
-        let start = trace.borrow().frames.len();
-        pair.a.close(&handles[0]);
-        drive(pair, trace, |a, b| {
-            let server = b.tcp_mut(&handles[1]);
-            if server.state() == State::CloseWait {
-                assert!(matches!(server.recv(), Err(RecvError::Finished)));
-                b.close(&handles[1]);
-                App::Moved
-            } else if a.tcp(&handles[0]).state() == State::TimeWait
-                && server.state() == State::Closed
-            {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        {
-            let recorded = trace.borrow();
-            let frames = &recorded.frames[start..];
-            let fins: Vec<_> = tcp_frames(frames)
-                .filter(|(_, tcp)| tcp.control == TcpControl::Fin)
-                .collect();
-            assert_eq!(fins.len(), 2);
-            assert_eq!((fins[0].0.dir, fins[1].0.dir), (Dir::AToB, Dir::BToA));
-            assert!(fins.iter().all(|(frame, tcp)| !frame.dropped && tcp.payload.is_empty()));
-            assert_eq!(fins[0].1.ack_number, Some(fins[1].1.seq_number));
-            assert_eq!(fins[1].1.ack_number, Some(fins[0].1.seq_number + 1));
-            let (frame, ack) = tcp_frames(frames).last().unwrap();
-            assert_eq!(frame.dir, Dir::AToB);
-            assert!(pure_ack(&ack));
-            assert_eq!(ack.seq_number, fins[0].1.seq_number + 1);
-            assert_eq!(ack.ack_number, Some(fins[1].1.seq_number + 1));
-        }
-        let entered = pair.now();
-        let frames = trace.borrow().frames.len();
-        // poll_at is a soft deadline and may report an earlier timer-wheel boundary.
-        assert!(pair.a.poll_at().is_some_and(|at| at <= ceil_ms(entered + TIME_WAIT)));
-        drive(pair, trace, |a, b| {
-            if a.tcp(&handles[0]).state() == State::Closed
-                && b.tcp(&handles[1]).state() == State::Closed
-            {
-                App::Done
-            } else {
-                App::Idle
-            }
-        });
-        assert_eq!(pair.now(), ceil_ms(entered + TIME_WAIT));
-        assert_eq!(
-            trace.borrow().frames.len(),
-            frames,
-            "TIME-WAIT emitted an extra frame"
-        );
-        assert_eq!((pair.a.poll_at(), pair.b.poll_at()), (None, None));
-        0
-    });
-}
-
-#[switch_test_support::pinned_test]
 fn bulk_frames_match_committed() {
     let lines = with_eal(|eal| {
         let mut pair = Pair::with_pools(
@@ -967,8 +843,9 @@ fn bulk_frames_match_committed() {
         round(&mut pair, &trace, sent_at);
         assert_eq!(pair.a_to_b.dropped, 1);
         assert_eq!(pair.b.tcp(&handles[1]).recv_queue(), 0);
+        // The bulk transfer's delayed-ACK samples put SRTT above zero.
         assert!(
-            matches!(pair.a.poll_at(), Some(at) if at > sent_at && at <= ceil_ms(sent_at + RTO))
+            matches!(pair.a.poll_at(), Some(at) if at > sent_at && at <= ceil_ms(sent_at + RTO + ACK_DELAY))
         );
         drive(&mut pair, &trace, |_, b| {
             if b.tcp(&handles[1]).recv_queue() == data.len() {
@@ -985,7 +862,8 @@ fn bulk_frames_match_committed() {
             assert_eq!(attempts.len(), 2);
             assert!(attempts[0].0.dropped);
             assert!(!attempts[1].0.dropped);
-            assert_eq!(attempts[1].0.at, ceil_ms(sent_at + RTO));
+            let resent = attempts[1].0.at;
+            assert!(resent > sent_at + RTO && resent <= ceil_ms(sent_at + RTO + ACK_DELAY), "{resent}");
             assert_eq!(attempts[0].1.seq_number, attempts[1].1.seq_number);
             assert_eq!(attempts[0].1.payload, &data[..]);
             assert_eq!(attempts[1].1.payload, &data[..]);

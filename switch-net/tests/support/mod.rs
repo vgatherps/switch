@@ -163,7 +163,7 @@ impl Mixed {
         slot.take()
     }
 
-    /// Net turn, task poll, Net→peer, peer turn, peer→Net, at `now`.
+    /// Net receive, task poll, Net send, Net→peer, peer turn, peer→Net, at `now`.
     /// Returns whether the host, Net, runtime, peer or links made progress.
     pub fn round(&mut self) -> bool {
         let moved = self.turn();
@@ -198,7 +198,7 @@ impl Mixed {
         }
     }
 
-    /// Net turn, then one poll of the woken tasks.
+    /// Net receive, one poll of the woken tasks, then Net send.
     pub fn turn(&mut self) -> bool {
         let mut moved = false;
         if self.host.is_some() {

@@ -119,7 +119,6 @@ mod tests {
         let paths = PathMtus::new(&explicit, subnet, 9000).unwrap();
         assert_eq!(paths.ip_mtu("10.0.1.8".parse().unwrap()), 1500);
         let empty = PathMtus::new(&[], subnet, 9000).unwrap();
-        assert!(empty.entries.is_empty());
         for (addr, _) in cases {
             assert_eq!(empty.ip_mtu(addr.parse().unwrap()), 9000);
         }

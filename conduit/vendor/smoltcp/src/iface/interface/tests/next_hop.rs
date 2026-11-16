@@ -405,19 +405,6 @@ fn ingress_reply_after_gateway_expiry_probes() {
     }
 }
 
-#[test]
-fn arp_mac_change_updates_next_segment() {
-    let mut peer = Peer::new(2, PEER, None);
-    peer.send(1);
-    peer.ack = peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    peer.acknowledge(2);
-    peer.arp(3, PEER, NEW_MAC);
-    peer.mac = NEW_MAC;
-    peer.send(3);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    assert!(peer.device.tx_queue.is_empty());
-}
-
 /// An expired entry sends to its cached MAC and probes once per lifetime; an unanswered probe
 /// leaves it usable, so the retransmit after 63 s still goes out with no ARP.
 #[test]
@@ -508,38 +495,6 @@ fn same_mac_probe_answer_keeps_changes_and_forwards() {
 }
 
 #[test]
-fn evicted_entry_sends_arp() {
-    let mut peer = Peer::new(1, PEER, None);
-    peer.arp(1, Ipv4Address::new(192, 168, 1, 3), NEW_MAC);
-    peer.send(1);
-    peer.take_arp_request(PEER);
-}
-
-#[test]
-fn unchanged_ip_addresses_flush_entry() {
-    let mut peer = Peer::new(2, PEER, None);
-    peer.iface.update_ip_addrs(|_| {});
-    peer.send(1);
-    peer.take_arp_request(PEER);
-}
-
-#[test]
-fn route_change_uses_second_gateway() {
-    let remote = Ipv4Address::new(198, 51, 100, 2);
-    let gateway2 = Ipv4Address::new(192, 168, 1, 3);
-    let mut peer = Peer::new(2, remote, Some(PEER));
-    peer.arp(1, gateway2, NEW_MAC);
-    peer.send(1);
-    peer.ack = peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    peer.acknowledge(2);
-    peer.iface.set_ipv4_gateway(Some(gateway2));
-    peer.mac = NEW_MAC;
-    peer.send(2);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    assert!(peer.device.tx_queue.is_empty());
-}
-
-#[test]
 fn reconnect_same_slot_uses_new_peer() {
     let mut peer = Peer::new(2, PEER, None);
     let remote2 = Ipv4Address::new(192, 168, 1, 3);
@@ -590,21 +545,6 @@ fn aborted_reconnect_discovers_unknown_peer() {
     peer.sockets.abort(peer.handle);
     peer.egress(2);
     peer.take_arp_request(remote2);
-}
-
-#[test]
-fn removed_slot_uses_new_peer() {
-    let mut peer = Peer::new(2, PEER, None);
-    let remote2 = Ipv4Address::new(192, 168, 1, 3);
-    peer.arp(1, remote2, NEW_MAC);
-    peer.send(1);
-    peer.take_tcp(TcpControl::Psh, &[0x5a]);
-    let mut socket = peer.sockets.take(peer.handle);
-    socket.abort();
-    peer.handle = peer.sockets.add(socket);
-    peer.remote = remote2;
-    peer.mac = NEW_MAC;
-    peer.connect(2);
 }
 
 mod invalidation {
@@ -918,9 +858,9 @@ mod invalidation {
         peer.data(3);
     }
 
-    #[test]
-    #[should_panic(expected = "TCP segment exceeds the IP MTU")]
-    fn oversize_segment_panics() {
+    /// Dispatches the warm connection's last segment, changed by `edit`, after shrinking the IP
+    /// MTU below it. An oversize TCP segment is a stack bug: only the dispatch itself may panic.
+    fn dispatch_oversize_segment(edit: impl FnOnce(&mut TcpRepr)) {
         let mut peer = Peer::new(2, PEER, None);
         peer.warm();
         let frame = peer.frames.last().unwrap();
@@ -928,28 +868,46 @@ mod invalidation {
         let ip_packet = Ipv4Packet::new_checked(eth.payload()).unwrap();
         let caps = ChecksumCapabilities::default();
         let ip = Ipv4Repr::parse(&ip_packet, &caps).unwrap();
-        let tcp = TcpRepr::parse(
+        let mut tcp = TcpRepr::parse(
             &TcpPacket::new_checked(ip_packet.payload()).unwrap(),
             &ip.src_addr.into(),
             &ip.dst_addr.into(),
             &caps,
         )
         .unwrap();
-        assert!(crate::iface::header_template::TcpTemplate::is_eligible(
-            &tcp
-        ));
+        edit(&mut tcp);
         peer.iface.inner.caps.max_transmission_unit = 14 + 40;
         assert!(ip.buffer_len() + tcp.buffer_len() > peer.iface.inner.caps.ip_mtu());
         let meta = &mut peer.sockets.item_at_mut(0).unwrap().meta;
-        assert!(meta.tcp_template.is_some());
-        let _ = peer.iface.inner.dispatch_tcp(
-            peer.device.transmit(Instant::from_millis(2)).unwrap(),
-            PacketMeta::default(),
-            IpRepr::Ipv4(ip),
-            tcp,
-            &mut meta.next_hop,
-            &mut meta.tcp_template,
-        );
+        let token = peer.device.transmit(Instant::from_millis(2)).unwrap();
+        let inner = &mut peer.iface.inner;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.dispatch_tcp(
+                token,
+                PacketMeta::default(),
+                IpRepr::Ipv4(ip),
+                tcp,
+                &mut meta.next_hop,
+                &mut meta.tcp_template,
+            )
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn oversize_segment_panics() {
+        dispatch_oversize_segment(|tcp| {
+            assert!(crate::iface::header_template::TcpTemplate::is_eligible(tcp));
+        });
+    }
+
+    /// The same on the generic emitter: a segment without an ACK takes `dispatch_ip`.
+    #[test]
+    fn oversize_segment_without_ack_panics() {
+        dispatch_oversize_segment(|tcp| {
+            tcp.ack_number = None;
+            assert!(!crate::iface::header_template::TcpTemplate::is_eligible(tcp));
+        });
     }
 
     mod producers {
@@ -992,6 +950,14 @@ mod invalidation {
                 assert_eq!(tcp.payload(), payload);
                 self.frames.push(bytes);
             }
+
+            /// The socket's own next timer, in milliseconds.
+            fn socket_deadline_millis(&self) -> i64 {
+                match self.sockets.get(self.handle).poll_at() {
+                    PollAt::Time(deadline) => deadline.total_millis(),
+                    other => panic!("expected a socket timer, got {other:?}"),
+                }
+            }
         }
 
         #[test]
@@ -1002,17 +968,13 @@ mod invalidation {
             peer.send(2);
             peer.expect_frame(TcpControl::Psh, seq, TcpSeqNumber(101), &[0x5a]);
             assert!(peer.device.tx_queue.is_empty());
-            for millis in (3..302).step_by(100).chain([301]) {
+            let due = peer.socket_deadline_millis();
+            assert!(due > 2);
+            for millis in 3..due {
                 peer.egress(millis);
                 assert!(peer.device.tx_queue.is_empty());
             }
-            for millis in 302..=402 {
-                peer.egress(millis);
-                if !peer.device.tx_queue.is_empty() {
-                    break;
-                }
-                assert!(peer.device.tx_queue.is_empty());
-            }
+            peer.egress(due);
             peer.expect_frame(TcpControl::Psh, seq, TcpSeqNumber(101), &[0x5a]);
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).send_queue(), 1);
@@ -1077,17 +1039,15 @@ mod invalidation {
             ack.window_len = 0;
             peer.ingress(2, peer.frame(ack));
             assert_eq!(peer.sockets.get_mut(peer.handle).send_slice(b"abc"), Ok(3));
-            for millis in (2..302).step_by(100).chain([301]) {
+            peer.egress(2);
+            assert!(peer.device.tx_queue.is_empty());
+            let due = peer.socket_deadline_millis();
+            assert!(due > 2);
+            for millis in 3..due {
                 peer.egress(millis);
                 assert!(peer.device.tx_queue.is_empty());
             }
-            for millis in 302..=402 {
-                peer.egress(millis);
-                if !peer.device.tx_queue.is_empty() {
-                    break;
-                }
-                assert!(peer.device.tx_queue.is_empty());
-            }
+            peer.egress(due);
             peer.expect_frame(TcpControl::None, seq, TcpSeqNumber(101), b"a");
             assert!(peer.device.tx_queue.is_empty());
             assert_eq!(peer.sockets.get(peer.handle).send_queue(), 3);

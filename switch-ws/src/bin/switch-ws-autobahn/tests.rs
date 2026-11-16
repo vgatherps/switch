@@ -27,13 +27,16 @@ fn run<T: Send + 'static>(role: Role, deadline: Duration, peer: impl FnOnce() ->
     with_tap_net(Backend::Conduit, &tap, |net, clock| {
         let peer = thread::spawn(peer);
         let result = drive_with(net.handle(), |rt, now, tick| {
-            let turn = net.turn(now).map_err(RoundError::Turn)?;
+            let received = net.receive(now).map_err(RoundError::Turn)?;
             let polled = rt.poll(tick).map_err(RoundError::Runtime)?;
-            let moved = turn.moved() || turn.tx_pending > 0 || turn.rx_staged > 0 || polled.tasks_polled > 0;
+            let sent = net.send().map_err(RoundError::Turn)?;
+            let moved = received.moved() || received.rx_staged > 0 || polled.tasks_polled > 0
+                || sent.tx_accepted > 0 || sent.tx_pending > 0;
             Ok((moved, net.poll_at()))
         }, &|| clock.elapsed(), &mut || peer.is_finished(), &role, deadline);
         while !peer.is_finished() {
-            net.turn(clock.now()).expect("turn the Net");
+            net.receive(clock.now()).expect("receive");
+            net.send().expect("send");
             thread::sleep(Duration::from_micros(50));
         }
         match peer.join() {

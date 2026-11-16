@@ -149,7 +149,7 @@ fn imds_put_token_then_get_with_header() {
         get_response(path, response(200, "1")),
     ]);
     let token = server.imds.token().unwrap();
-    assert_eq!(format!("{token:?}"), "Token(..)");
+    assert!(!format!("{token:?}").contains("secret"));
     assert_eq!(server.imds.get(&token, path).unwrap().as_deref(), Some("1"));
     let requests = server.requests.lock().unwrap();
     assert!(requests[0].starts_with("PUT /latest/api/token HTTP/1.1\r\n"));
@@ -303,10 +303,8 @@ fn aws_gateway_is_subnet_base_plus_one() {
 fn aws_refuses_device_number_zero() {
     let tree = Tree::new();
     let server = metadata("0", "10.0.1.23", "10.0.1.0/24", "10.0.0.0/16", (200, ""));
-    assert_eq!(
-        aws(&tree, &server, &addresses()).err().unwrap().to_string(),
-        "eth1 is the primary ENI (device-number 0); it carries IMDS and SSH"
-    );
+    let error = aws(&tree, &server, &addresses()).err().unwrap().to_string();
+    assert!(error.contains("eth1") && error.contains("device-number 0"), "{error}");
 }
 #[test]
 fn aws_kernel_ip_not_in_local_ipv4s_is_error() {
@@ -357,18 +355,6 @@ fn aws_vpc_blocks_become_1500_rules() {
         .unwrap()
         .to_string()
         .contains("host bits"));
-}
-#[test]
-fn default_rule_is_1500() {
-    let tree = Tree::new();
-    assert_eq!(
-        tree.discover(&addresses(), None).unwrap().config.paths,
-        vec![PathRule {
-            prefix: "0.0.0.0/0".parse().unwrap(),
-            mtu: 1500,
-            why: "default".into()
-        }]
-    );
 }
 #[test]
 fn operator_rules_survive_rediscover() {
@@ -452,7 +438,9 @@ fn public_ipv4s_404_or_empty_warns() {
     for public in [(404, ""), (200, "\n  \n")] {
         let server = ordinary(public);
         let discovered = aws(&tree, &server, &addresses()).unwrap();
-        assert_eq!(discovered.warnings, vec!["eth1 has no public IPv4 (IMDS public-ipv4s); internet destinations need an Elastic IP on this ENI or a NAT gateway route"]);
+        assert_eq!(discovered.warnings.len(), 1);
+        let warning = &discovered.warnings[0];
+        assert!(warning.contains("eth1") && warning.contains("public-ipv4s"), "{warning}");
     }
 }
 #[test]

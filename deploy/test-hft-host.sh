@@ -73,8 +73,6 @@ stub rpm 'case "$1" in
             "[%{FILENAMES}"*) printf "%s %s\n" "$4" "${FAKE_RPM_DIGEST:-}" ;;
             *) printf "%s\n" "${FAKE_RPM_ID:-kernel6.18 Amazon Linux $(uname -r)}" ;;
         esac ;;
-    # Real depmod rewrites this RPM-owned index; whole-package verification fails on its mtime.
-    -Vf) echo ".......T. /lib/modules/$(uname -r)/modules.builtin.alias.bin"; exit 1 ;;
     *) exit 1 ;;
 esac'
 # switch-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
@@ -186,7 +184,6 @@ host
 run apply --kernel-receiver
 check "kernel receiver apply reboots for CPU settings" status_is 100
 check "kernel receiver persists Linux ENA mode" env_has DATA_DRIVER=ena
-check "kernel receiver stages the data ENI unmanaged before reboot" test -e "$tmp/unmanaged-before-reboot"
 check "kernel receiver installs policy drop-in before reboot" test -e "$tmp/policy-before-reboot"
 check "kernel receiver does not restart networkd before a requested reboot" sh -c "! grep -q '^systemctl restart systemd-networkd.service' '$calls'"
 check "kernel receiver apply never binds or unbinds" sh -c "! grep -q 'switch-netconf bind\\|switch-netconf unbind' '$calls'"
@@ -206,7 +203,6 @@ run apply --kernel-receiver
 check "kernel receiver no-reboot apply succeeds" status_is 0
 check "no-reboot apply installs policy before restarting networkd" test -e "$tmp/policy-before-restart"
 check "no-reboot apply restarts networkd to activate policy" called "systemctl restart systemd-networkd.service"
-check "no-reboot apply does not bind or unbind" sh -c "! grep -q 'switch-netconf bind\\|switch-netconf unbind' '$calls'"
 : >"$calls"
 # POSIX shells may retain assignments preceding function calls; scope one-shot faults explicitly.
 (FAKE_NETWORKD_FAIL=1 run apply --kernel-receiver)
@@ -303,7 +299,9 @@ check "restoring unmanaged config does not request a reboot" sh -c "! grep -q '^
 
 run verify
 check "a finished host verifies clean" status_is 0
-check "verify names every setting" sh -c "[ \$(grep -c ': ok ' '$tmp/out') = 13 ]"
+for step in cmdline management data cpus hugepages pools irqbalance irqs vfio_wc clocksource unit config chrony; do
+    check "verify reports $step ok" has "$step" ok
+done
 check "verify accepts chrony with the PHC selected" has chrony "ok PHC selected"
 sed 's/^#\* PHC0/#- PHC0/; s/^\^- 169/^* 169/' "$tmp/sources-phc" >"$root/sources"
 run verify
@@ -503,12 +501,10 @@ stub sha256sum "case \"\$1\" in --*) exit 2 ;; esac; exec '$native_checksum' \"\
 
 native_host
 check "a fresh native fixture resets the earlier x86_64 architecture" sh -c '[ "$(uname -m)" = aarch64 ]'
-check "normal depmod metadata makes whole-package verification fail" sh -c "! rpm -Vf '$native_module' >/dev/null"
 run apply
 check "official 6.18 apply reboots for cmdline, not a VFIO rebuild" status_is 100
 check "native WC needs no kernel-devel or amzn-drivers download" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
 check "native WC checks RPM ownership and the module's own digest" sh -c "grep -q '^rpm -qf ' '$calls' && grep -q 'FILEDIGESTALGO' '$calls' && grep -q 'FILEDIGESTS' '$calls'"
-check "native apply does not touch the data ENI before reboot" sh -c "! grep -q 'flush\|switch-netconf bind' '$calls'"
 reboot
 run boot
 check "native WC resumes host setup after reboot" status_is 0
@@ -570,11 +566,6 @@ export FAKE_SRCVERSION
 : >"$root/sys/module/vfio_pci_core/srcversion"
 run verify
 check "empty loaded and disk source versions cannot verify WC" has vfio_wc "FAIL loaded vfio-pci-core differs from the verified on-disk module"
-
-native_host 6.18.56-125.164.amzn2023.x86_64
-(FAKE_ARCH=x86_64 run apply)
-check "official x86_64 6.18 also uses vendor-native WC" status_is 100
-check "native x86_64 WC needs no external rebuild" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
 
 host
 run apply

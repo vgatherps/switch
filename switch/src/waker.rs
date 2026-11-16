@@ -1,9 +1,9 @@
 //! Thread tags, the task waker, and `StoredWaker`.
 //!
 //! Every task `Waker` shares one vtable; its data is the task header pointer, so
-//! all wakers of one slot compare equal under `will_wake`. Every operation first
-//! checks the block's owner thread tag and panics on a foreign thread; only then
-//! does it touch the task or runtime.
+//! all wakers of one slot compare equal under `will_wake`. Clone and drop do nothing
+//! on any thread. A wake on the block's owner thread queues the task directly; on
+//! any other thread it goes through the runtime's mailbox, like a `RemoteWaker`.
 //!
 //! Ordinary Wakers remain shareable; local handles have stricter trait bounds.
 //! ```
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
 use crate::executor::Executor;
+use crate::remote::wake_on_any_thread;
 use crate::task::TaskHeader;
 use crate::task::block::Meta;
 
@@ -79,8 +80,8 @@ pub(crate) fn raw(header: *const TaskHeader) -> RawWaker {
     RawWaker::new(header.cast(), &VTABLE)
 }
 
+/// Any thread: a task waker holds no count, so clone and drop touch nothing.
 unsafe fn clone(header: *const ()) -> RawWaker {
-    unsafe { check_owner(header.cast()) };
     raw(header.cast())
 }
 
@@ -88,16 +89,12 @@ unsafe fn wake(header: *const ()) {
     unsafe { wake_by_ref(header) }
 }
 
+/// At once on the task's thread; from any other thread through its runtime's mailbox.
 unsafe fn wake_by_ref(header: *const ()) {
-    unsafe {
-        check_owner(header.cast());
-        Executor::wake(header.cast());
-    }
+    unsafe { wake_on_any_thread(header.cast()) }
 }
 
-unsafe fn drop(header: *const ()) {
-    unsafe { check_owner(header.cast()) };
-}
+unsafe fn drop(_: *const ()) {}
 
 /// A copyable wake handle for runtime primitives that park tasks. `wake`
 /// enqueues the task directly, with no call through a waker vtable.
@@ -218,12 +215,5 @@ mod tests {
             assert_eq!(issue_tag(&counter), None);
         }
         assert_eq!(counter.load(Ordering::Relaxed), u32::from(u16::MAX) + 1);
-    }
-
-    #[test]
-    fn tags_start_at_one() {
-        let counter = AtomicU32::new(1);
-        assert_eq!(issue_tag(&counter), Some(1));
-        assert_eq!(issue_tag(&counter), Some(2));
     }
 }

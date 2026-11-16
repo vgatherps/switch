@@ -157,15 +157,30 @@ impl Host {
         }
     }
 
-    /// One busy-poll round: turn the Net at microsecond resolution, poll tasks at the same
-    /// sampled time in nanoseconds; never sleeps.
+    /// The port's (transmitted, received) packet counts so far (`rte_eth_stats_get`).
+    pub(crate) fn packets(&self) -> Result<Option<(u64, u64)>, String> {
+        let Some(local) = self.local.as_ref() else {
+            return Ok(None);
+        };
+        // SAFETY: the local port stays open while Host lives; stats is writable.
+        let mut stats: switch_dpdk_sys::rte_eth_stats = unsafe { std::mem::zeroed() };
+        let rc = unsafe { switch_dpdk_sys::rte_eth_stats_get(local.port_id, &mut stats) };
+        if rc != 0 {
+            return Err(format!("rte_eth_stats_get: {rc}"));
+        }
+        Ok(Some((stats.opackets, stats.ipackets)))
+    }
+
+    /// One busy-poll round: receive at microsecond resolution, poll tasks at the same sampled
+    /// time in nanoseconds, then send what they wrote; never sleeps.
     #[inline]
     pub fn round(&mut self) -> Result<u64, String> {
         let now = self.clock.now_ns();
         self.net
-            .turn(self.clock.stack_now(now))
-            .map_err(|e| format!("turn: {e}"))?;
+            .receive(self.clock.stack_now(now))
+            .map_err(|e| format!("receive: {e}"))?;
         self.rt.poll(now).map_err(|e| format!("poll: {e:?}"))?;
+        self.net.send().map_err(|e| format!("send: {e}"))?;
         Ok(now)
     }
 

@@ -20,28 +20,30 @@
 //   not anchored (run.c 313-343).
 //   1. 10 ms delay: the ACK of the first 100 bytes. An immediate ACK would be 10 ms
 //      early, 6 ms outside the tolerance.
-//   2. Not restarted: 100 bytes at 0.100 s and 100 more at 0.106 s, one ACK at 0.110 s,
+//   2. Not restarted: 100 bytes at 0.200 s and 100 more at 0.206 s, one ACK at 0.210 s,
 //      all three absolute, so no packetdrill pause can move the expectation. A timer
-//      restarted by the second segment would fire at or after 0.116 s, at least 6 ms
+//      restarted by the second segment would fire at or after 0.216 s, at least 6 ms
 //      late, 2 ms outside the tolerance. The second segment must reach switch before the
 //      first one's timer fires: 4 ms of slack for its processing lagging the first's.
 //      The 6 ms between them is the whole budget: the restart's lateness and the slack
 //      add up to the 10 ms timer, and the tolerance takes 4 ms of the lateness.
 //   3. At once: a segment arriving while the timer waits forces it to expire when more
 //      than the receive MSS estimate (the largest segment received, 1024) is
-//      unacknowledged: 100 bytes at 0.210 s and 1024 at 0.211 s, 1124 bytes, ACK
-//      expected at 0.211 s, all absolute. Without the forced expiry the ACK would come
-//      at 0.220 s or later, at least 9 ms late, 5 ms outside the tolerance, whatever
+//      unacknowledged: 100 bytes at 0.310 s and 1024 at 0.311 s, 1124 bytes, ACK
+//      expected at 0.311 s, all absolute. Without the forced expiry the ACK would come
+//      at 0.320 s or later, at least 9 ms late, 5 ms outside the tolerance, whatever
 //      packetdrill's pauses. Whether both segments are processed in one turn does not
 //      matter (Waiting, then Immediate).
 // - The receive window remains at the 128 KiB target, including while data is unread.
 // - The RST ends the run with data still queued (1895-1900).
 // The 128 KiB receive window is advertised as 32768 units at scale 2.
 // After the unscaled 65535-byte SYN-ACK, a pure ACK advertises the larger window.
+// The handshake ACK comes 100 ms after the SYN-ACK, so switch's RTO is 100 + 4 * 50 =
+// 300 ms (RFC 6298): its echoes, unacknowledged until the RST, are not retransmitted during the script.
 
 0      < S 0:0(0) win 64240 <mss 1024,nop,nop,sackOK,nop,wscale 7>
 +0     > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>
-+0     < . 1:1(0) ack 1 win 16
++0.1   < . 1:1(0) ack 1 win 16
 +0     > . 1:1(0) ack 1 win 32768
 +0     < P. 1:1025(1024) ack 1 win 16
 +0     > P. 1:1025(1024) ack 1025 win 32768
@@ -51,11 +53,11 @@
 +0     < P. 2049:2149(100) ack 1 win 16
 +0.01  > . 2049:2049(0) ack 2149 win 32768
 
-0.100  < P. 2149:2249(100) ack 1 win 16
-0.106  < P. 2249:2349(100) ack 1 win 16
-0.110  > . 2049:2049(0) ack 2349 win 32768
+0.200  < P. 2149:2249(100) ack 1 win 16
+0.206  < P. 2249:2349(100) ack 1 win 16
+0.210  > . 2049:2049(0) ack 2349 win 32768
 
-0.210  < P. 2349:2449(100) ack 1 win 16
-0.211  < P. 2449:3473(1024) ack 1 win 16
-0.211  > . 2049:2049(0) ack 3473 win 32768
+0.310  < P. 2349:2449(100) ack 1 win 16
+0.311  < P. 2449:3473(1024) ack 1 win 16
+0.311  > . 2049:2049(0) ack 3473 win 32768
 +0     < R. 3473:3473(0) ack 2049 win 0

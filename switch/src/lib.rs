@@ -1,6 +1,63 @@
 //! # switch
 //!
-//! A caller-driven, single-threaded async runtime. Your program owns the loop: the runtime runs tasks only inside [`Runtime::poll`], never sleeps, never reads a clock and never starts a thread. It is the task runtime under `switch-net`, whose drive loop alternates turning the network and polling this runtime.
+//! A caller-driven, single-threaded async runtime.
+//!
+//! ## Runtime
+//!
+//! `Runtime` owns its tasks and timers. It is `!Send + !Sync`; cloned `Spawner`s submit
+//! tasks and create `Sleep` futures for that same runtime. Nothing blocks or reads a clock
+//! for you: each call to [`Runtime::poll`] supplies the current `u64` tick. Tick units are
+//! caller-defined, and absolute deadlines may use the full `u64` range. A relative sleep
+//! captures the latest accepted tick when it is created.
+//!
+//! A poll accepts an equal or later tick, advances timers (expired sleeps wake in deadline
+//! order), then polls ready tasks in rounds:
+//! each round polls a snapshot of the woken tasks, and tasks woken or spawned during a
+//! round run in the next one, until none are left or 1024 tasks were polled (checked
+//! between rounds). [`StoredWaker::wake_deferred`] and [`yield_now`] instead move a task
+//! to the next poll, unless an ordinary wake already queued it; it runs after the tasks
+//! woken or spawned between the polls. [`request_turn`] from a task ends the poll after
+//! that task; the next poll first finishes the stopped round.
+//! Wake queues are plain vectors, growing as tasks queue rather than reserving per task.
+//! Work that wakes or spawns tasks must run before [`Runtime::poll`]; those tasks are polled by
+//! that call. The runtime never waits, though future code can block. A regressed tick returns
+//! [`RuntimeError::TimeRegressed`] without changing runtime state.
+//! If a task panics, the original panic payload unwinds to the caller; the
+//! runtime rejects new work and later turns, while [`Runtime::shutdown`] remains available
+//! for cleanup.
+//!
+//! ## Waking
+//!
+//! A task's `Waker` points at its task header. Waking, cloning and dropping it do not
+//! allocate. Cloning and dropping work on any thread; a wake from another thread
+//! goes through the runtime's mailbox, as a [`RemoteWaker`]'s does.
+//! Runtime primitives that park tasks can keep a [`StoredWaker`] instead: a copyable
+//! handle that wakes its task directly, without a call through the waker vtable.
+//! Another thread wakes a task through a [`RemoteWaker`]: `Send + Sync` and
+//! copyable, it queues the task in its runtime's mailbox, which the runtime
+//! empties at the start of its next `poll` (on the task's own thread it wakes at
+//! once). A wake after the runtime shut down is dropped.
+//!
+//! ## Tasks
+//!
+//! A task is one call of a function marked `#[switch::task]`: an `async fn`, or a
+//! `fn` returning `impl Future<Output = T>`, with arguments bound to plain
+//! identifiers. Calling it packages the arguments into a [`SpawnToken`];
+//! `Spawner::spawn` builds the future in a slot of a 64 KiB task block.
+//! The future and its value must be `'static`. `spawn` detaches the task: its
+//! value is dropped when it completes. `Spawner::spawn_join` also returns a
+//! [`JoinHandle`] that resolves to the value, or to [`oneshot::Canceled`] if the
+//! task ends without one (its runtime shut down or dropped, or its poll
+//! panicked); it allocates one [`oneshot`] channel. Both kinds of spawn share the function's
+//! pool. Each task function, and each instantiation of a generic one, has its own
+//! task blocks; a pool adds a block when every slot of its blocks is occupied, so
+//! the number of live tasks has no limit.
+//!
+//! A runtime allocates its own task blocks and keeps them for its whole life;
+//! blocks are never shared between runtimes. Shutdown drops the tasks, and a
+//! dropped runtime's blocks are leaked by design, so a stale waker still points
+//! at valid memory and waking it does nothing. Runtimes are meant to live as long
+//! as the process.
 //!
 //! ```rust
 //! use switch::Runtime;
@@ -76,7 +133,7 @@ pub fn boxed(future: std::pin::Pin<Box<dyn Future<Output = ()>>>) -> impl Future
 
 pub use remote::RemoteWaker;
 pub use executor::request_turn;
-pub use runtime::{Capacity, PollReport, Runtime, RuntimeError, SpawnError, Spawner};
+pub use runtime::{PollReport, Runtime, RuntimeError, SpawnError, Spawner};
 pub use sleep::{Sleep, SleepError};
 pub use switch_macros::task;
 pub use task::SpawnToken;

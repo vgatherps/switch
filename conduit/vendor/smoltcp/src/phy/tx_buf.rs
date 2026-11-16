@@ -80,6 +80,24 @@ pub unsafe fn frame_packet(frame: &ImmutableFrame, header_len: usize) -> &[u8] {
     unsafe { slice::from_raw_parts(data.as_ptr().sub(header_len), header_len + frame.len()) }
 }
 
+/// Remaining payload room of a unique frame, or zero while it is shared.
+///
+/// # Safety
+/// `frame` was allocated by this module.
+#[inline]
+pub(crate) unsafe fn frame_tail_room(frame: &ImmutableFrame) -> usize {
+    let parts = shared_parts(frame);
+    // SAFETY: the producer's live count is accessed only on this thread.
+    if unsafe { parts.rc.as_ptr().read() } != 1 {
+        return 0;
+    }
+    // SAFETY: the producer contract identifies this allocation and its payload room.
+    unsafe {
+        let offset = frame.data_ptr().as_ptr() as usize - owner::start(parts.rc).as_ptr() as usize;
+        owner::room(parts.rc) - offset - frame.len()
+    }
+}
+
 /// Extend an unsent, unique frame within its producer's room and append bytes.
 ///
 /// # Safety
@@ -300,36 +318,21 @@ mod tests {
     }
 
     #[test]
-    fn set_len_updates_this_buffer_at_refcount_1() {
+    fn shared_frame_cannot_be_owned_until_its_clone_is_dropped() {
         let pool = TxPool::new(8);
-        let mut buf = pool.alloc().unwrap();
-        buf[..3].copy_from_slice(&[1, 2, 3]);
-        buf.truncate(3);
-        assert_eq!(&*buf, &[1, 2, 3]);
-    }
-
-    #[test]
-    fn dropping_original_then_clone_releases_storage_once() {
-        let pool = TxPool::new(8);
-        let buf = pool.alloc().unwrap().freeze();
-        let clone = buf.clone();
-        drop(buf);
-        assert_eq!(frame_refcount(&clone), 1);
-        assert_eq!(pool.live(), 1);
+        let frame = pool.alloc().unwrap().freeze();
+        let clone = frame.clone();
+        let frame = frame.try_own().unwrap_err();
+        assert_eq!(frame_refcount(&frame), 2);
         drop(clone);
+        let mut frame = frame.try_own().unwrap();
+        unsafe { frame_headroom(&mut frame, 1) }.0[0] = 1;
+        frame[..2].copy_from_slice(&[2, 3]);
+        frame.truncate(2);
+        let frame = frame.freeze();
+        assert_eq!(unsafe { frame_packet(&frame, 1) }, &[1, 2, 3]);
+        drop(frame);
         assert_eq!(pool.live(), 0);
-        assert_eq!(pool.releases(), 1);
-    }
-
-    #[test]
-    fn into_raw_keeps_its_reference() {
-        let pool = TxPool::new(8);
-        let parts = pool.alloc().unwrap().into_raw_parts();
-        assert_eq!(pool.live(), 1);
-        // SAFETY: into_raw_parts transferred this sole reference.
-        unsafe { (parts.release)(parts.rc, parts.ctx) };
-        assert_eq!(pool.live(), 0);
-        assert_eq!(pool.releases(), 1);
     }
 
     #[test]

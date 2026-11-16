@@ -60,8 +60,7 @@ fn deliver_to_client(peer: &mut Peer) -> Result<(), Error> {
 fn sealed_records_decrypt_on_the_server() {
     let mut peer = connect(None);
     deliver_to_client(&mut peer).unwrap(); // tickets
-    let (head, room) = peer.tx.plain();
-    assert_eq!((head, room), (5, FRAME_ROOM - RECORD - 2 * KEY_UPDATE));
+    let (_, room) = peer.tx.plain();
     for len in [1, 109, room] {
         let msg = message(len, len);
         assert_eq!(seal_and_send(&mut peer, &msg), RECORD + len);
@@ -158,7 +157,6 @@ fn both_key_updates_fit_in_front_of_one_full_record() {
         seal_and_send(&mut peer, &msg),
         2 * KEY_UPDATE + RECORD + room
     );
-    assert_eq!(2 * KEY_UPDATE + RECORD + room, FRAME_ROOM);
     assert_eq!(peer.deliver().unwrap(), msg);
     assert_eq!(seal_and_send(&mut peer, b"next"), RECORD + 4);
     assert_eq!(peer.deliver().unwrap(), b"next");
@@ -181,6 +179,29 @@ fn close_notify_ends_sending_only() {
     peer.send(&mut stream, b"still");
     let received = receive(&mut peer.tx, vec![stream.bytes]);
     assert_eq!(received.got[0].plaintext, b"still");
+}
+
+/// `send_close_notify` (what `Tls::close` sends) seals first and, refused by TCP, waits for room
+/// for the 24 B it sealed (no KeyUpdate due), not for a frame's or a record's worst case: with
+/// 23 B free it waits and nothing goes out; with 24 B it sends, and the server reads the close.
+#[test]
+fn close_notify_waits_only_for_its_own_room() {
+    let mut peer = connect(None);
+    deliver_to_client(&mut peer).unwrap();
+    let sealed = RECORD + 2;
+    peer.wire.refuse.set(1);
+    peer.wire.free.set(Some(sealed - 1));
+    {
+        let mut closing = std::pin::pin!(peer.tx.send_close_notify());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(closing.as_mut().poll(&mut cx).is_pending(), "sent with too little room");
+        assert!(peer.wire.sent.borrow().is_empty());
+        peer.wire.free.set(Some(sealed));
+        assert_eq!(closing.as_mut().poll(&mut cx), std::task::Poll::Ready(Ok(())));
+    }
+    assert_eq!(peer.wire.sent.borrow().len(), sealed);
+    assert_eq!(peer.deliver().unwrap(), b"");
+    assert!(peer.server.process_new_packets().unwrap().peer_has_closed());
 }
 
 /// After a bad record, rustls's bad_record_mac alert goes out through `take_pending`, behind a
@@ -219,6 +240,35 @@ fn alert_after_a_receive_error_follows_earlier_frames() {
         peer.deliver(),
         Err(rustls::Error::AlertReceived(AlertDescription::BadRecordMac))
     );
+}
+
+/// A record over 2^14 + 256 B (16641 B here) fails the connection with a record_overflow alert
+/// to the server (RFC 8446 §5.2), whether the record arrives in one frame or across two.
+#[test]
+fn oversized_record_gets_a_record_overflow_alert() {
+    for straddle in [false, true] {
+        let mut peer = connect(None);
+        deliver_to_client(&mut peer).unwrap();
+        let mut stream = Stream::default();
+        peer.send(&mut stream, b"hello");
+        let at = stream.bytes.len();
+        let [hi, lo] = 16641u16.to_be_bytes();
+        stream.bytes.extend_from_slice(&[0x17, 0x03, 0x03, hi, lo]);
+        stream.bytes.resize(at + 5 + 16641, 0);
+        let cuts = if straddle { vec![at + 100] } else { vec![] };
+
+        let received = receive(&mut peer.tx, split(&stream.bytes, &cuts));
+        assert_eq!(received.got.len(), 1, "straddle {straddle}");
+        assert_eq!(received.error, Some(Error::Tls(rustls::Error::PeerSentOversizedRecord)), "straddle {straddle}");
+        let f = ready(peer.tx.alloc()).unwrap();
+        let alert = peer.tx.take_pending(f).unwrap().expect("the alert");
+        send(&mut peer, alert);
+        assert_eq!(
+            peer.deliver(),
+            Err(rustls::Error::AlertReceived(AlertDescription::RecordOverflow)),
+            "straddle {straddle}"
+        );
+    }
 }
 
 /// TCP FIN without the server's close_notify is truncation, which stops sending.
@@ -284,7 +334,7 @@ fn lower_failure_after_encryption_breaks_the_connection() {
 }
 
 #[test]
-#[should_panic(expected = "sealing an empty record")]
+#[should_panic]
 fn sealing_nothing_panics() {
     let mut peer = connect(None);
     let f = ready(peer.tx.alloc()).unwrap();

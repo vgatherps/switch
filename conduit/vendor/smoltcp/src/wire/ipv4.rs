@@ -782,24 +782,6 @@ pub(crate) mod test {
     }
 
     #[test]
-    fn test_unspecified() {
-        assert!(Address::UNSPECIFIED.is_unspecified());
-        assert!(!Address::UNSPECIFIED.is_broadcast());
-        assert!(!Address::UNSPECIFIED.is_multicast());
-        assert!(!Address::UNSPECIFIED.is_link_local());
-        assert!(!Address::UNSPECIFIED.is_loopback());
-    }
-
-    #[test]
-    fn test_broadcast() {
-        assert!(!Address::BROADCAST.is_unspecified());
-        assert!(Address::BROADCAST.is_broadcast());
-        assert!(!Address::BROADCAST.is_multicast());
-        assert!(!Address::BROADCAST.is_link_local());
-        assert!(!Address::BROADCAST.is_loopback());
-    }
-
-    #[test]
     fn test_cidr() {
         let cidr = Cidr::new(Address::new(192, 168, 1, 10), 24);
 

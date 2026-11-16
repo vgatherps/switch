@@ -10,8 +10,6 @@ pub struct DropQueue(Rc<RefCell<Dropped>>);
 #[derive(Debug, Default)]
 struct Dropped {
     tcp: Vec<SocketHandle>,
-    /// Sockets whose send found the frame pool empty; each at most once.
-    frame_wait: Vec<SocketHandle>,
     udp: Vec<UdpHandle>,
 }
 
@@ -20,7 +18,6 @@ impl DropQueue {
     pub fn with_capacity(tcp: usize, udp: usize) -> Self {
         Self(Rc::new(RefCell::new(Dropped {
             tcp: Vec::with_capacity(tcp),
-            frame_wait: Vec::with_capacity(tcp),
             udp: Vec::with_capacity(udp),
         })))
     }
@@ -31,30 +28,6 @@ impl DropQueue {
         dropped.tcp.push(handle);
     }
 
-    pub(crate) fn push_frame_wait(&self, handle: SocketHandle) {
-        let mut dropped = self.0.borrow_mut();
-        debug_assert!(dropped.frame_wait.len() < dropped.frame_wait.capacity());
-        dropped.frame_wait.push(handle);
-    }
-
-    pub(crate) fn remove_frame_wait(&self, handle: SocketHandle) {
-        self.0.borrow_mut().frame_wait.retain(|&queued| queued != handle);
-    }
-
-    /// `(is_empty(), whether a socket waits for a free frame)` in one look. A frame waiter does
-    /// not count against `is_empty`: it waits on the frame pool, not on the next turn.
-    #[inline]
-    pub fn state(&self) -> (bool, bool) {
-        let dropped = self.0.borrow();
-        let empty = dropped.tcp.is_empty() && dropped.udp.is_empty();
-        (empty, !dropped.frame_wait.is_empty())
-    }
-
-    /// Move the sockets waiting for a free frame to `waiters`, retaining the queue's capacity.
-    pub fn drain_frame_waiters(&self, waiters: &mut Vec<SocketHandle>) {
-        waiters.append(&mut self.0.borrow_mut().frame_wait);
-    }
-
     pub fn push_udp(&self, handle: UdpHandle) {
         let mut dropped = self.0.borrow_mut();
         debug_assert!(dropped.udp.len() < dropped.udp.capacity());
@@ -62,6 +35,7 @@ impl DropQueue {
     }
 
     /// True when no dropped handles are queued.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         let dropped = self.0.borrow();
         dropped.tcp.is_empty() && dropped.udp.is_empty()
@@ -133,38 +107,6 @@ mod tests {
     }
 
     #[test]
-    fn push_and_drain_keep_capacity_and_allocation() {
-        let (tcp_handles, udp_handles) = handles();
-        let queue = DropQueue::with_capacity(3, 3);
-        let allocation = {
-            let dropped = queue.0.borrow();
-            (dropped.tcp.capacity(), dropped.tcp.as_ptr(),
-             dropped.udp.capacity(), dropped.udp.as_ptr())
-        };
-        let mut tcp = Vec::with_capacity(3);
-        let mut udp = Vec::with_capacity(3);
-        for _ in 0..2 {
-            for handle in tcp_handles {
-                queue.push_tcp(handle);
-            }
-            for handle in udp_handles {
-                queue.push_udp(handle);
-            }
-            queue.drain_into(&mut tcp, &mut udp);
-            assert_eq!(tcp, tcp_handles);
-            assert_eq!(udp, udp_handles);
-            let dropped = queue.0.borrow();
-            assert_eq!(allocation,
-                       (dropped.tcp.capacity(), dropped.tcp.as_ptr(),
-                        dropped.udp.capacity(), dropped.udp.as_ptr()));
-            assert!(dropped.tcp.is_empty());
-            assert!(dropped.udp.is_empty());
-            tcp.clear();
-            udp.clear();
-        }
-    }
-
-    #[test]
     fn same_identifies_shared_queue() {
         let (tcp_handles, udp_handles) = handles();
         let queue = DropQueue::with_capacity(1, 1);
@@ -186,23 +128,4 @@ mod tests {
         assert!(other.is_empty());
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic]
-    fn push_tcp_past_capacity_panics() {
-        let (tcp, _) = handles();
-        let queue = DropQueue::with_capacity(1, 0);
-        queue.push_tcp(tcp[0]);
-        queue.push_tcp(tcp[1]);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic]
-    fn push_udp_past_capacity_panics() {
-        let (_, udp) = handles();
-        let queue = DropQueue::with_capacity(0, 1);
-        queue.push_udp(udp[0]);
-        queue.push_udp(udp[1]);
-    }
 }

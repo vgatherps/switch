@@ -19,8 +19,9 @@ use wire::{Link, Verdict};
 
 /// Upstream `ACK_DELAY_DEFAULT`.
 const ACK_DELAY: Duration = Duration::from_millis(10);
-/// Default socket RTO.
-const RTO: Duration = Duration::from_millis(300);
+/// The measured RTO: RTT samples on a Pair at one instant are 0 µs, so the RTO is
+/// smoltcp's 50 ms floor.
+const RTO: Duration = Duration::from_millis(50);
 /// Upstream TIME-WAIT duration (`CLOSE_DELAY`).
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 
@@ -366,6 +367,61 @@ fn dropped_data_segment_retransmitted_deadline_only() {
     });
 }
 
+/// On a 30 µs path the RTO follows the measured round trip: a lost segment is resent
+/// after SRTT plus the 50 ms floor, not after the initial 300 ms.
+#[switch_test_support::pinned_test]
+fn rto_follows_measured_round_trip() {
+    with_eal(|eal| {
+        let mut pair = new_pair(eal, ["rtomrta", "rtomrtb"]);
+        let (handles, a_seq, b_seq) = connect(&mut pair);
+        pair.b.tcp_mut(&handles[1]).set_ack_delay(None);
+
+        // A sends at t, B acknowledges in the same round, and A takes the ACK 30 µs later.
+        let t = pair.now();
+        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"ping"), Ok(4));
+        let sent = pair.round_at(t, |_, _| {});
+        assert_eq!((sent.a_to_b, sent.b_to_a), (1, 1));
+        let acked = pair.round_at(t + Duration::from_micros(30), |dir, _| {
+            panic!("{dir:?} frame after the ACK")
+        });
+        assert_eq!((acked.a_to_b, acked.b_to_a), (0, 0));
+        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
+
+        // After the handshake's 0 µs sample, the 30 µs one gives RTTVAR = 30/4 -> 8 µs and
+        // SRTT = 30/8 -> 4 µs: 4·RTTVAR = 32 µs is raised to the 50 ms floor, RTO = 50.004 ms.
+        drop_first_data(&mut pair.a_to_b);
+        let lost_at = pair.now();
+        let data = pattern(1000, 5);
+        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(&data), Ok(data.len()));
+        let lost = pair.round(|dir, _| panic!("{dir:?} frame delivered"));
+        assert_eq!(lost.a.tx_accepted, 1);
+        assert_eq!(counts(&pair.a_to_b), (0, 0, 1, 0));
+        // Stack timers fire on whole milliseconds.
+        let resend_at = ceil_ms(lost_at + Duration::from_micros(50_004));
+        let early = pair.round_at(resend_at - Duration::from_micros(1), |dir, _| {
+            panic!("{dir:?} frame before the retransmission deadline")
+        });
+        assert_eq!(early.a.tx_accepted, 0);
+        let mut frames = Vec::new();
+        pair.round_at(resend_at, |dir, frame| frames.push((dir, frame.to_vec())));
+        assert_eq!(
+            segs(&frames),
+            [
+                seg(Dir::AToB, a_seq + 4, b_seq, TcpControl::Psh, 1000),
+                seg(Dir::BToA, b_seq, a_seq + 1004, TcpControl::None, 0),
+            ]
+        );
+        pair.round(|dir, _| panic!("{dir:?} frame after the repair"));
+        assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 0);
+        let mut expected = b"ping".to_vec();
+        expected.extend_from_slice(&data);
+        assert_b_reads(&mut pair, &handles, &expected);
+        assert_eq!(counts(&pair.a_to_b), (0, 0, 1, 0));
+        assert_eq!(counts(&pair.b_to_a), (0, 0, 0, 0));
+        assert_eq!(pair.close(), 0);
+    });
+}
+
 #[switch_test_support::pinned_test]
 fn wan_tail_loss_delivers_exact_bytes() {
     with_eal(|eal| {
@@ -410,8 +466,10 @@ fn wan_tail_loss_delivers_exact_bytes() {
         assert_eq!(pair.a.tcp(&handles[0]).send_queue(), 540);
 
         // The partial ACK restarted A's retransmission timer: the tail leaves
-        // one RTO after it.
-        let retransmit_at = ack_at + RTO;
+        // one RTO after it. The partial ACK's 50 ms sample (sent_at to ack_at), after the
+        // handshake's 0 µs one, gives RTTVAR = 50/4 = 12.5 ms and SRTT = 50/8 = 6.25 ms,
+        // so the RTO is 6.25 + 4·12.5 = 56.25 ms, fired on the next whole millisecond.
+        let retransmit_at = ceil_ms(ack_at + Duration::from_micros(56_250));
         let early = pair.round_at(retransmit_at - Duration::from_micros(1), |dir, _| {
             panic!("{dir:?} frame before the retransmission deadline")
         });
@@ -545,37 +603,6 @@ fn reordered_segments_delivered_in_order() {
         assert_eq!(counts(&pair.b_to_a), (0, 0, 0, 0));
         assert_b_reads(&mut pair, &handles, &data);
         assert_eq!(pair.close(), 0);
-    });
-}
-
-#[switch_test_support::pinned_test]
-fn close_frees_held_and_ring_frames() {
-    with_eal(|eal| {
-        let mut pair = new_pair(eal, ["cfa", "cfb"]);
-        let (handles, _, _) = connect(&mut pair);
-        // TCP_NODELAY: "c" goes out while "a" is unacknowledged.
-        pair.a_to_b.paused = true;
-        pair.b_to_a.impair(|_| Verdict::Hold);
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"a"), Ok(1));
-        assert_eq!(pair.b.tcp_mut(&handles[1]).send_slice(b"b"), Ok(1));
-        let round = pair.round(|_, _| panic!("nothing is delivered"));
-        assert_eq!((round.a_to_b, round.b_to_a), (0, 1));
-        assert_eq!(counts(&pair.b_to_a), (0, 0, 0, 1));
-
-        // A's first segment onto B's RX ring, its second onto A's TX ring.
-        pair.a_to_b.paused = false;
-        assert_eq!(pair.a_to_b.forward(), 1);
-        assert_eq!(pair.a.tcp_mut(&handles[0]).send_slice(b"c"), Ok(1));
-        assert_eq!(pair.a.turn(pair.now(), 32).unwrap().tx_accepted, 1);
-        // A: B's held segment in its RX pool. B: A's first segment on its RX
-        // ring, and the spare TX packet its handshake turn left (no reply was
-        // needed). Data leaves in frame-pool frames, so no data segment uses
-        // a TX packet: A holds "a" (unacknowledged) and "c" (also on its TX
-        // ring), B holds "b".
-        assert_eq!(pair.in_use(), [(1, 0), (1, 1)]);
-        assert_eq!(pair.frame_in_use(), [2, 1]);
-        // The held copy and one frame on each of two rings.
-        assert_eq!(pair.close(), 3);
     });
 }
 
@@ -1209,9 +1236,7 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             },
         );
         assert_eq!(messages.sent, [32 * MESSAGE; 2]);
-        // B's last TX token went unused (no reply needed); its packet stays as
-        // B's spare.
-        assert_eq!(pair.in_use(), [(0, 0), (0, 1)]);
+        assert_eq!(pair.in_use(), [(0, 0), (0, 0)]);
 
         pair.a_to_b.paused = true;
         pair.b_to_a.paused = true;
@@ -1228,8 +1253,8 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             messages.step(&mut pair.a, &mut pair.b, MESSAGES);
         }
         // Each side: 15 frames on its TX ring, 32 pending and one unsent; the
-        // TX pool still holds only B's spare.
-        assert_eq!(pair.in_use(), [(0, 0), (0, 1)]);
+        // TX pool is idle.
+        assert_eq!(pair.in_use(), [(0, 0), (0, 0)]);
         assert_eq!(pair.frame_in_use(), [48; 2]);
 
         pair.a_to_b.paused = false;
@@ -1243,20 +1268,21 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
             tx_accepted: 0,
             tx_pending: 32,
         };
-        // A's ring is still full when it turns; B gets A's 15 frames, stages a
-        // burst of 8 and cannot process them: its own ring and pending are full.
+        // A's ring is still full when it turns; B gets A's 15 frames and
+        // processes a burst of 8 although its own ring and pending are full: the
+        // data is delivered and the ACKs that find no TX room are dropped.
         let expected = Round {
             a: blocked,
             b: Turn {
                 rx_received: 8,
-                rx_staged: 8,
+                rx_processed: 8,
                 ..blocked
             },
             a_to_b: 15,
             b_to_a: 15,
         };
         assert_eq!(round, expected);
-        assert_eq!(pair.in_use(), [(15, 0), (15, 1)]);
+        assert_eq!(pair.in_use(), [(15, 0), (15, 0)]);
         assert_eq!(pair.frame_in_use(), [48; 2]);
 
         pair.drive(
@@ -1334,10 +1360,12 @@ fn rto_while_wire_paused_then_resume() {
             assert!(write(&mut pair.a, total));
             pair.round(|_, _| panic!("paused link delivered a frame"));
         }
-        // The 47 segments are frame-pool frames; A's TX pool holds the spare
-        // its last ACK-only turn left.
-        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 1), 47));
-        assert!(matches!(pair.a.poll_at(), Some(p) if p > t && p <= ceil_ms(t + RTO)));
+        // The 47 segments are frame-pool frames; A's TX pool is idle.
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 47));
+        // RTT samples are 0 µs or B's 10 ms delayed ACK, so the RTO is SRTT plus the
+        // 50 ms floor: from RTO to RTO + ACK_DELAY.
+        let latest = ceil_ms(t + RTO + ACK_DELAY);
+        assert!(matches!(pair.a.poll_at(), Some(p) if p > t && p <= latest));
 
         let full = Turn {
             rx_received: 0,
@@ -1351,13 +1379,19 @@ fn rto_while_wire_paused_then_resume() {
             panic!("paused link delivered a frame")
         });
         assert_eq!(early.a, full);
-        assert!(matches!(pair.a.poll_at(), Some(p) if p > pair.now() && p <= ceil_ms(t + RTO)));
         // The RTO fires: the retransmission finds the pending queue full, so
-        // the turn queues nothing and A wants to send again now.
-        let expired = pair.round_at(ceil_ms(t + RTO), |_, _| panic!("paused link delivered a frame"));
-        assert_eq!(expired.a, full);
-        assert_eq!(pair.a.poll_at(), Some(pair.now()));
-        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 1), 47));
+        // the turn queues nothing and A wants to send again now. poll_at may
+        // name a timer-wheel boundary before the deadline first.
+        loop {
+            let at = pair.a.poll_at().expect("RTO deadline");
+            assert!(at > pair.now() && at <= latest, "{at}");
+            let turn = pair.round_at(at, |_, _| panic!("paused link delivered a frame"));
+            assert_eq!(turn.a, full);
+            if pair.a.poll_at() == Some(pair.now()) {
+                break;
+            }
+        }
+        assert_eq!((pair.in_use()[0], pair.frame_in_use()[0]), ((0, 0), 47));
 
         pair.a_to_b.paused = false;
         let mut frames = Vec::new();
@@ -1849,8 +1883,6 @@ fn cubic_growth_and_recovery_across_rtts() {
             let handles = [a, b];
             let [a, b] = &handles;
             pair.a.tcp_mut(a).set_initial_window(10 * MSS);
-            pair.a.tcp_mut(a).set_rto(Duration::from_secs(10));
-            pair.b.tcp_mut(b).set_rto(Duration::from_secs(10));
             pair.b.tcp_mut(b).set_ack_delay(None);
             pair.b.listen(b, pair::SERVER_PORT).unwrap();
             pair.a.connect(a, IpEndpoint::new(Side::B.ip().into(), pair::SERVER_PORT), pair::CLIENT_PORT).unwrap();

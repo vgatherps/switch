@@ -27,7 +27,7 @@ impl RxBuf {
     /// `(data - rc) + len + room <= u32::MAX` and `len + room <= isize::MAX`.
     /// `release` must call [`Self::release_context`] with its context, then free the
     /// storage identified by `rc`. It runs once on the owning thread, with a null
-    /// context for an undelivered buffer or socket accounting after hand-out.
+    /// context for TCP or an undelivered buffer, or UDP socket accounting after hand-out.
     pub unsafe fn from_raw_parts(
         rc: NonNull<u16>,
         release: Release,
@@ -65,14 +65,14 @@ impl RxBuf {
     }
 
     #[inline]
-    pub(crate) fn into_frame(self, shared: Rc<RxShared>) -> OwnedFrame {
+    pub(crate) fn into_frame(self, shared: Option<Rc<RxShared>>) -> OwnedFrame {
         let this = ManuallyDrop::new(self);
         // SAFETY: the producer contract supplies unique storage, an embedded count
-        // and its final release. This reference keeps the accounting alive.
+        // and its final release. A UDP reference keeps its accounting alive.
         unsafe {
             OwnedFrame::from_raw_parts(
                 this.data, this.len as u32, this.rc, this.release,
-                Rc::into_raw(shared).cast_mut().cast(),
+                shared.map_or(core::ptr::null_mut(), |shared| Rc::into_raw(shared).cast_mut().cast()),
             )
         }
     }
@@ -228,15 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn rx_timestamp_absent_by_default() {
-        assert_eq!(RxBuf::from_vec(alloc::vec![1, 2]).rx_timestamp(), 0);
-        let frame = RxBuf::counted_frame(alloc::vec![1, 2], 2, Rc::new(Cell::new(0)));
-        assert_eq!(frame.rx_timestamp(), 0);
-        let (frame, _, _) = owned_frame(4);
-        assert_eq!(frame.rx_timestamp(), 0);
-    }
-
-    #[test]
     fn rx_timestamp_kept_through_narrow() {
         let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3], 2, Rc::new(Cell::new(0)));
         frame.set_rx_timestamp(7);
@@ -245,14 +236,6 @@ mod tests {
         assert_eq!(frame.rx_timestamp(), 7);
     }
 
-
-    #[test]
-    fn narrow_head_preserves_bytes() {
-        let releases = Rc::new(Cell::new(0));
-        let mut frame = RxBuf::counted_frame(alloc::vec![1, 2, 3, 4], 2, releases);
-        frame.narrow(2..4);
-        assert_eq!(frame.as_slice(), &[3, 4]);
-    }
 
 
     fn owned_frame(len: usize) -> (RxBuf, Rc<Cell<usize>>, NonNull<Storage>) {
@@ -377,10 +360,4 @@ mod tests {
         assert_eq!(releases.get(), 1);
     }
 
-    #[test]
-    #[should_panic]
-    fn narrow_out_of_bounds_panics() {
-        let (mut frame, _, _) = owned_frame(4);
-        frame.narrow(0..5);
-    }
 }

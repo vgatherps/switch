@@ -134,7 +134,7 @@ A clean run exits 0. LeakSanitizer is on, so a leak at exit fails the run.
 
 `make fuzz` fuzzes the TCP stack through switch-tap-echo and does not touch this crate.
 
-The test helpers `ensure_eal_init`, `acquire_test_pool`/`TestPoolGuard`, `PoolManager::new`, `PoolManager::new_unchecked` and the `testing` module exist only with the `testing` feature, because `ensure_eal_init` claims EAL with test arguments and would make `dpdk-smoltcp`'s `Eal::init` fail. A self dev-dependency enables `testing` for this crate's tests, benches and doctests; `src/bin/profile.rs` requires it. Applications create pools with `PoolManager::new_production`. `acquire_test_pool` gives each thread its own pool and lcore cache, and `TestPoolGuard` is neither `Send` nor `Sync`.
+The test helpers `ensure_eal_init`, `acquire_test_pool`/`TestPoolGuard`, `PoolManager::new` and the `testing` module exist only with the `testing` feature, because `ensure_eal_init` claims EAL with test arguments and would make `dpdk-smoltcp`'s `Eal::init` fail. A self dev-dependency enables `testing` for this crate's tests, benches and doctests; `src/bin/profile.rs` requires it. Applications create pools with `PoolManager::new_production`. `acquire_test_pool` gives each thread its own pool and lcore cache, and `TestPoolGuard` is neither `Send` nor `Sync`.
 
 Chain ownership tests (shared-head and shared-tail refusal, cycle prevention):
 - `test_assumption_share_all_increments_all_segments`

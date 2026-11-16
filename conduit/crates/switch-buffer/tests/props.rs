@@ -145,16 +145,6 @@ proptest! {
 // =============================================================================
 
 #[switch_test_support::pinned_test]
-fn test_alloc_free_equivalence() {
-    let pool = PoolManager::new(1024);
-    let ops = vec![
-        Op::Alloc { id: 0, len: 100 },
-        Op::Free { id: 0 },
-    ];
-    compare_executions(&ops, &pool, SelectionMode::AllSwitch, SelectionMode::AllDpdk).unwrap();
-}
-
-#[switch_test_support::pinned_test]
 fn test_chain_equivalence() {
     let pool = PoolManager::new(1024);
     let ops = vec![
@@ -304,68 +294,6 @@ fn test_proptest_regression_full() {
 // Targeted tests for unsafe conditions
 // =============================================================================
 
-/// Test that self-chain (via shared handles) is properly rejected
-#[switch_test_support::pinned_test]
-fn test_self_chain_rejected() {
-    let pool = PoolManager::new(256);
-
-    // Allocate and share to create multiple handles to same mbuf
-    let mut m1 = pool.alloc_with_len(100).unwrap();
-    let m2 = m1.share(); // m1 and m2 point to same mbuf
-
-    let ptr1 = m1.as_ptr();
-    let ptr2 = m2.as_ptr();
-    assert_eq!(ptr1, ptr2, "Share should create alias to same mbuf");
-
-    // Attempting to chain m2 onto m1 would be self-chain
-    // Our API should prevent this or we need to add the check
-    // For now, document that this is UB if not caught
-}
-
-/// Test refcount behavior with multiple shared handles
-#[switch_test_support::pinned_test]
-fn test_shared_handle_refcount() {
-    let pool = PoolManager::new(256);
-
-    let mut m1 = pool.alloc_with_len(100).unwrap();
-    assert_eq!(m1.refcount(), 1);
-
-    let m2 = m1.share();
-    assert_eq!(m1.refcount(), 2);
-    assert_eq!(m2.refcount(), 2); // Same mbuf
-
-    let m3 = m1.share();
-    assert_eq!(m1.refcount(), 3);
-
-    drop(m2);
-    assert_eq!(m1.refcount(), 2);
-
-    drop(m3);
-    assert_eq!(m1.refcount(), 1);
-
-    drop(m1); // Should free to pool
-}
-
-/// Test that freeing one shared handle doesn't corrupt others
-#[switch_test_support::pinned_test]
-fn test_shared_handle_independence() {
-    let pool = PoolManager::new(256);
-
-    let mut m1 = pool.alloc_with_len(100).unwrap();
-
-    // Write some data
-    let data = m1.data_mut();
-    data[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-
-    let m2 = m1.share();
-
-    // Free m1
-    drop(m1);
-
-    // m2 should still be valid (refcount was 2, now 1)
-    assert_eq!(m2.refcount(), 1);
-    assert_eq!(&m2.data()[0..4], &[0xDE, 0xAD, 0xBE, 0xEF]);
-}
 
 /// Test chain consumes tail ownership
 #[switch_test_support::pinned_test]
@@ -393,26 +321,6 @@ fn test_chain_ownership_transfer() {
     }
 }
 
-/// Verify DPDK's rte_mbuf_check can validate our mbufs
-#[switch_test_support::pinned_test]
-fn test_dpdk_mbuf_check() {
-    let pool = PoolManager::new(256);
-
-    let m = pool.alloc_with_len(100).unwrap();
-
-    // Call DPDK's validation - should pass
-    let mut reason: *const std::ffi::c_char = std::ptr::null();
-    let ret = unsafe {
-        // rte_mbuf_check(m, is_header, &reason)
-        // We need to add this to our bindings
-        switch_dpdk_sys::rte_mbuf_check(m.as_ptr(), 1, &mut reason)
-    };
-
-    if ret != 0 {
-        let reason_str = unsafe { std::ffi::CStr::from_ptr(reason) };
-        panic!("rte_mbuf_check failed: {:?}", reason_str);
-    }
-}
 
 /// Verify chain sets head pkt_len to sum of data_lens.
 #[switch_test_support::pinned_test]
@@ -455,85 +363,6 @@ fn test_chain_pkt_len_update() {
     assert_eq!(dpdk_pkt_len, 3000);
 }
 
-/// Verify Executor sets pkt_len correctly after chain (DPDK-only).
-#[switch_test_support::pinned_test]
-fn test_executor_chain_pkt_len_dpdk_only() {
-    use switch_buffer::testing::Executor;
-
-    let ops = vec![
-        Op::Alloc { id: 0, len: 1500 },
-        Op::Alloc { id: 1, len: 1500 },
-        Op::Chain { head: 0, tail: 1 },
-    ];
-
-    let pool = PoolManager::new(1024);
-    let mut executor = Executor::new(&pool, SelectionMode::AllDpdk);
-
-    for op in &ops {
-        executor.execute(op);
-    }
-
-    let snap = executor.snapshot();
-    let state = snap.get(&0).expect("handle 0 should exist");
-
-    assert_eq!(state.pkt_len, 3000);
-    assert_eq!(state.nb_segs, 2);
-}
-
-/// Run both executors sequentially (not interleaved) - check for interference.
-#[switch_test_support::pinned_test]
-fn test_executor_chain_sequential_not_interleaved() {
-    use switch_buffer::testing::Executor;
-
-    let ops = vec![
-        Op::Alloc { id: 0, len: 1500 },
-        Op::Alloc { id: 1, len: 1500 },
-        Op::Chain { head: 0, tail: 1 },
-    ];
-
-    {
-        let pool = PoolManager::new(1024);
-        let mut exec = Executor::new(&pool, SelectionMode::AllSwitch);
-        for op in &ops { exec.execute(op); }
-        let snap = exec.snapshot();
-        assert_eq!(snap.get(&0).unwrap().pkt_len, 3000);
-    }
-
-    {
-        let pool = PoolManager::new(1024);
-        let mut exec = Executor::new(&pool, SelectionMode::AllDpdk);
-        for op in &ops { exec.execute(op); }
-        let snap = exec.snapshot();
-        assert_eq!(snap.get(&0).unwrap().pkt_len, 3000);
-    }
-}
-
-/// Run both executors interleaved on same pool (like compare_executions).
-#[switch_test_support::pinned_test]
-fn test_executor_chain_interleaved_same_pool() {
-    use switch_buffer::testing::Executor;
-
-    let ops = vec![
-        Op::Alloc { id: 0, len: 1500 },
-        Op::Alloc { id: 1, len: 1500 },
-        Op::Chain { head: 0, tail: 1 },
-    ];
-
-    let pool = PoolManager::new(1024);
-    let mut exec1 = Executor::new(&pool, SelectionMode::AllSwitch);
-    let mut exec2 = Executor::new(&pool, SelectionMode::AllDpdk);
-
-    for op in &ops {
-        exec1.execute(op);
-        exec2.execute(op);
-    }
-
-    let snap1 = exec1.snapshot();
-    let snap2 = exec2.snapshot();
-
-    assert_eq!(snap1.get(&0).unwrap().pkt_len, 3000);
-    assert_eq!(snap2.get(&0).unwrap().pkt_len, 3000);
-}
 
 /// Chain resets tail's pkt_len to data_len (DPDK 24.11 behavior).
 /// Root cause of the fuzzer-found bug: switch wasn't doing this reset.
@@ -574,36 +403,6 @@ fn test_chain_resets_tail_pkt_len() {
     unsafe { switch_dpdk_sys::switch_pktmbuf_free(head_ptr); }
 }
 
-/// Baseline: verify DPDK's chain behavior matches our expectations.
-#[switch_test_support::pinned_test]
-fn test_dpdk_chain_resets_tail_pkt_len() {
-    let pool = PoolManager::new(256);
-
-    let tail_ptr = unsafe {
-        let a = switch_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool());
-        let b = switch_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool());
-        (*a).set_data_len(100);
-        (*a).set_pkt_len(100);
-        (*b).set_data_len(200);
-        (*b).set_pkt_len(200);
-        switch_dpdk_sys::dpdk_raw_pktmbuf_chain(a, b);
-        a
-    };
-
-    let head_ptr = unsafe {
-        let h = switch_dpdk_sys::dpdk_raw_pktmbuf_alloc(pool.pool());
-        (*h).set_data_len(50);
-        (*h).set_pkt_len(50);
-        switch_dpdk_sys::dpdk_raw_pktmbuf_chain(h, tail_ptr);
-        h
-    };
-
-    // DPDK 24.11: resets pkt_len, not nb_segs
-    assert_eq!(unsafe { (*tail_ptr).pkt_len() }, 100);
-    assert_eq!(unsafe { (*tail_ptr).nb_segs() }, 2);
-
-    unsafe { switch_dpdk_sys::dpdk_raw_pktmbuf_free(head_ptr); }
-}
 
 /// Regression from fuzzer: ShareAll, then chain the shared two-segment chain
 /// onto another head. Raw DPDK resets the shared head's pkt_len, so alias

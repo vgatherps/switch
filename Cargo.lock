@@ -1468,6 +1468,7 @@ version = "0.1.0"
 dependencies = [
  "dpdk-smoltcp",
  "libc",
+ "serde_json",
  "switch-buffer",
  "switch-dpdk-sys",
  "switch-test-kit",
@@ -1593,7 +1594,9 @@ dependencies = [
 name = "switch-ws"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "data-encoding",
+ "dpdk-smoltcp",
  "httparse",
  "libc",
  "rand 0.10.3",
@@ -1604,6 +1607,7 @@ dependencies = [
  "switch-junction",
  "switch-net",
  "switch-tap-echo",
+ "switch-test-kit",
  "switch-test-support",
  "switch-tls",
  "trybuild",

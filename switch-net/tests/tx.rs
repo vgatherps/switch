@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use switch_net::tcp::{self, State};
-use switch_net::{Error, IpEndpoint, NetHandle, TcpTx, ImmutableFrame};
+use switch_net::{Error, IpEndpoint, NetHandle, TcpTx, ImmutableFrame, OwnedFrame};
 use switch_test_kit::pair::{BUDGET, pattern};
 use switch_test_kit::with_eal;
 
@@ -58,6 +58,31 @@ async fn poll_once<F: Future>(future: F) -> Option<F::Output> {
     .await
 }
 
+/// Every free frame of the Net's pool, held, with no task left in its frame-wait queue.
+/// The hoarder's last `tx_frame` stays queued when it finds the pool empty; one frame
+/// returns so a receive wakes that entry off the queue, then a wait that succeeds at
+/// once takes the frame back.
+fn take_every_frame(mixed: &mut Mixed) -> Rc<RefCell<Vec<OwnedFrame>>> {
+    let handle = mixed.handle();
+    let held = Rc::new(RefCell::new(Vec::new()));
+    let hoarder = mixed.spawn({
+        let held = held.clone();
+        async move {
+            while let Some(frame) = poll_once(handle.tx_frame()).await {
+                held.borrow_mut().push(frame);
+            }
+        }
+    });
+    mixed.wait(&hoarder);
+    held.borrow_mut().pop();
+    mixed.turn();
+    let handle = mixed.handle();
+    let last = mixed.spawn(async move { poll_once(handle.tx_frame()).await.expect("the returned frame") });
+    let frame = mixed.wait(&last);
+    held.borrow_mut().push(frame);
+    held
+}
+
 /// Rounds, draining the peer, until it holds `len` bytes.
 fn peer_receive(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, len: usize) -> Vec<u8> {
     let mut got = Vec::new();
@@ -66,61 +91,6 @@ fn peer_receive(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, len: usize) -
         got.len() >= len
     });
     got
-}
-
-support::both_backends!(room_then_try_send_delivers_every_frame_in_order_conduit, room_then_try_send_delivers_every_frame_in_order_junction, |backend| {
-    with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rtsa", "rtsb"], backend);
-        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
-        let (_rx, mut tx) = stream.split();
-        let data = pattern(64 * CHUNK + 123, 5);
-        let handle = mixed.handle();
-        let sent = data.clone();
-        let slot = mixed.spawn(async move {
-            send_all(&handle, &mut tx, &sent).await;
-            tx
-        });
-        let got = peer_receive(&mut mixed, &peer, data.len());
-        assert_eq!(got, data);
-        drop((slot.take(), _rx, peer));
-        mixed.close();
-    })
-});
-
-/// Queued bytes fill the send buffer while the link is paused. The writer
-/// stays parked until the peer receives and ACKs the first frame.
-// Conduit-only: ACK-gated send buffer; junction has no send credit by design.
-#[switch_test_support::pinned_test]
-fn room_parks_until_the_peer_acks() {
-    with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["rpka", "rpkb"], support::Backend::Conduit);
-        let config = tcp::Config { tx_capacity: 1500, ..tcp_config() };
-        let (stream, peer) = connect_with(&mut mixed, LOCAL_PORT, config);
-        let (_rx, mut tx) = stream.split();
-        let data = pattern(2 * CHUNK, 9);
-        let handle = mixed.handle();
-        let sent = data.clone();
-        let (task, polls) = counted(async move {
-            send_all(&handle, &mut tx, &sent).await;
-            tx
-        });
-        let slot = mixed.spawn(task);
-        mixed.to_peer.paused = true;
-        mixed.turn();
-        let stalled = polls.get();
-        for _ in 0..20 {
-            mixed.turn();
-        }
-        assert_eq!(polls.get(), stalled, "the parked writer was polled while no room opened");
-        assert!(!slot.is_full());
-        mixed.to_peer.paused = false;
-        let got = peer_receive(&mut mixed, &peer, data.len());
-        assert_eq!(got, data);
-        mixed.until(|_| slot.is_full());
-        assert!(polls.get() > stalled, "the ACK did not wake the writer");
-        drop((slot.take(), _rx, peer));
-        mixed.close();
-    })
 }
 
 // `try_send` with no room returns the frame it was given, untouched; after
@@ -176,39 +146,30 @@ support::both_backends!(try_send_full_returns_the_same_frame_conduit, try_send_f
     })
 });
 
-/// A task that takes every free frame leaves the next `tx_frame` waiting;
-/// idle turns do not poll it, and the turn after a frame returns wakes it.
-// Conduit-only: Conduit frame-pool exhaustion; junction pool wake has its own backend test.
-#[switch_test_support::pinned_test]
-fn tx_frame_waits_until_a_frame_returns() {
+// With three tasks waiting for a frame, one frame returning wakes only the oldest
+// waiter: it takes the frame and the other two are not polled.
+support::both_backends!(one_free_frame_wakes_one_of_many_waiters_conduit, one_free_frame_wakes_one_of_many_waiters_junction, |backend| {
     with_eal(|eal| {
-        let mut mixed = Mixed::new(eal, ["txwa", "txwb"], support::Backend::Conduit);
-        let handle = mixed.handle();
-        let held = Rc::new(RefCell::new(Vec::new()));
-        let slot = mixed.spawn({
-            let held = held.clone();
-            async move {
-                while let Some(frame) = poll_once(handle.tx_frame()).await {
-                    held.borrow_mut().push(frame);
-                }
-            }
-        });
-        mixed.wait(&slot);
-        assert!(!held.borrow().is_empty());
-        let handle = mixed.handle();
-        let (task, polls) = counted(async move { handle.tx_frame().await });
-        let slot = mixed.spawn(task);
+        let mut mixed = Mixed::new(eal, ["txoa", "txob"], backend);
+        let held = take_every_frame(&mut mixed);
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let handle = mixed.handle();
+                let (task, polls) = counted(async move { handle.tx_frame().await });
+                (mixed.spawn(task), polls)
+            })
+            .collect();
         mixed.rounds(10);
-        assert_eq!(polls.get(), 1, "woken while the pool was empty");
-        assert!(!slot.is_full());
+        assert!(waiters.iter().all(|(slot, polls)| !slot.is_full() && polls.get() == 1));
         held.borrow_mut().pop();
         mixed.turn();
-        assert!(slot.is_full(), "not woken by the turn after a frame returned");
-        assert_eq!(polls.get(), 2);
-        drop((slot.take(), held));
+        let polls: Vec<_> = waiters.iter().map(|(_, polls)| polls.get()).collect();
+        assert_eq!(polls, [2, 1, 1], "one free frame polled more than its one waiter");
+        assert!(waiters[0].0.is_full());
+        drop((waiters, held));
         mixed.close();
     })
-}
+});
 
 // A reader task and a writer task on the two halves of one stream; the peer
 // echoes every byte back.
@@ -573,3 +534,35 @@ support::both_backends!(canceled_room_clears_its_parked_handle_conduit, canceled
         mixed.close();
     })
 });
+
+/// A task woken by a request replies in the round that polls it: the reply leaves in that
+/// round's send, not after the next round's receive.
+#[switch_test_support::pinned_test]
+fn a_reply_queued_by_a_woken_task_leaves_in_the_same_round() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["rpla", "rplb"], support::Backend::Conduit);
+        let (stream, peer) = connect(&mut mixed, LOCAL_PORT);
+        let handle = mixed.handle();
+        let replier = mixed.spawn(async move {
+            let (mut rx, mut tx) = stream.split();
+            let request = rx.recv().await.unwrap().payload().to_vec();
+            let reply = filled(&handle, &request).await;
+            tx.room(reply.len()).await.unwrap();
+            tx.try_send(reply).map_err(|(_, error)| error).unwrap();
+            (rx, tx)
+        });
+        mixed.rounds(4);
+        peer_send(&mut mixed, &peer, b"ping");
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        assert_eq!(mixed.to_net.forward(), 1);
+        mixed.turn();
+        assert!(replier.is_full());
+        mixed.to_peer.forward();
+        mixed.peer.turn(mixed.now, BUDGET).unwrap();
+        let mut got = Vec::new();
+        peer_drain(&mut mixed, &peer, &mut got);
+        assert_eq!(got, b"ping");
+        drop((replier.take(), peer));
+        mixed.close();
+    })
+}

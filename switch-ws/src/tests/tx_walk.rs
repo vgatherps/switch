@@ -95,12 +95,11 @@ impl<const TLS: bool> Walk<TLS> {
             assert_eq!(state(&self.c), before, "a refused send changed the core");
             return;
         }
-        let accepted = match self.c.small(payload.len()) {
-            Some(_) => {
-                let last = &self.log.borrow().last_sealed;
-                matches!(done, Poll::Ready(Ok(()))) || last.len() > 2 && last[2..] == payload[..]
-            }
-            None => self.c.snapshot().buf == payload,
+        let accepted = if self.c.small(payload.len()) {
+            let last = &self.log.borrow().last_sealed;
+            matches!(done, Poll::Ready(Ok(()))) || last.len() > 2 && last[2..] == payload[..]
+        } else {
+            self.c.snapshot().buf == payload
         };
         if accepted {
             self.accepted.push((kind, payload));
@@ -276,14 +275,4 @@ fn random_walks_of_twelve_events() {
         probes::<true>(&seq);
         probes::<false>(&seq);
     }
-}
-
-/// A failure with a refused frame retained, then the socket's death (the combination that once
-/// never ended): it ends Dead.
-#[test]
-fn fail_refuse_die_ends() {
-    let seq = [Ev::SendSmall, Ev::RefuseNext, Ev::SendSmall, Ev::FailProtocol, Ev::KillSocket, Ev::Step];
-    let w = Walk::<true>::replay(&seq);
-    assert_eq!(w.c.end(), End::Dead);
-    probe_death::<true>(&seq[..4]);
 }

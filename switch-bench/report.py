@@ -56,7 +56,7 @@ def problems(directory, sweeps):
         elif not summary.get("complete"):
             out.append(f"{name}: incomplete after {summary.get('steps')} steps: {summary.get('error')}")
         elif summary.get("generator_bound"):
-            out.append(f"{name}: sender fell behind schedule; receiver capacity is not isolated")
+            out.append(f"{name}: sender behind schedule: worker(s) {summary.get('behind_workers')}")
     return out
 
 
@@ -64,9 +64,15 @@ def us(ns):
     return "-" if ns is None else f"{ns / 1000:.1f}"
 
 
-def lat(step, key):
-    q = step.get("latency_ns")
+def lat(step, key, field="latency_ns"):
+    q = step.get(field)
     return None if q is None else q[key]
+
+
+def ratio(step, num, den):
+    """step[num] / step[den] to two decimals; '-' if either is missing or the denominator is 0."""
+    n, d = step.get(num), step.get(den)
+    return "-" if n is None or not d else f"{n / d:.2f}"
 
 
 def flags(step, carryover=False):
@@ -82,8 +88,10 @@ def flags(step, carryover=False):
 
 def table(steps, carryover=False):
     rows = [
-        "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs | flags |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs"
+        " | service RTT p50 µs | service RTT p99 µs | send lag p50 µs | send lag p99 µs"
+        " | gen tx packets per sent message | gen rx packets per echo | flags |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     contaminated = False
     marked = False
@@ -91,7 +99,11 @@ def table(steps, carryover=False):
         marked |= carryover and contaminated
         rows.append(
             f"| {s['offered_pps']:.0f} | {s['sent_pps']:.0f} | {s['received_pps']:.0f} | {100 * s['drop_fraction']:.3f} |"
-            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} | {flags(s, carryover and contaminated)} |"
+            f" {us(lat(s, 'p50'))} | {us(lat(s, 'p99'))} | {us(lat(s, 'p999'))} | {us(lat(s, 'max'))} |"
+            f" {us(lat(s, 'p50', 'service_rtt_ns'))} | {us(lat(s, 'p99', 'service_rtt_ns'))} |"
+            f" {us(lat(s, 'p50', 'send_lag_ns'))} | {us(lat(s, 'p99', 'send_lag_ns'))} |"
+            f" {ratio(s, 'gen_tx_packets', 'sent')} | {ratio(s, 'gen_rx_packets', 'echoed')} |"
+            f" {flags(s, carryover and contaminated)} |"
         )
         contaminated |= s["drop_fraction"] > 0 or s.get("generator_bound", False)
     if marked:
@@ -254,8 +266,8 @@ def build(directory, title):
             sections += ["ENA allowance/reset counters are recorded for conduit sweeps only. They do not establish"
                          " whether junction was shaped or reset; that is not established for junction in this run.", ""]
         if any(s["generator_bound"] for s in steps):
-            sections += ["SENDER-LATE: a sender fell behind schedule and the sweep stopped. This does not"
-                         " identify the cause; receiver backpressure can also delay sends.", ""]
+            sections += ["SENDER-LATE: a sender's fresh sends fell behind schedule (send lag p99 over 20 µs, not"
+                         " counting messages a full connection owed or a pool stop held back) and the sweep stopped.", ""]
         if any(s.get("budget_bound") for s in steps):
             sections += ["BUDGET-BOUND: some messages waited because their connection already had its budget in"
                          " flight (rate share x (baseline RTT + window)): the latency there may be the budget's, not"
@@ -265,7 +277,12 @@ def build(directory, title):
     if issues:
         head = [f"# INCOMPLETE: {title}", "", "These results are incomplete; what ran is below.", "",
                 *[f"- {i}" for i in issues], ""]
-    md = head + md + sections
+    packets = ["Packet counts are the generator NICs' (each generator's own port, read when it gets the step and"
+               " after its drain, over the same span as messages sent and echoed), not the receiver's: gen tx"
+               " packets per sent message is packets put on the wire per message; gen rx packets per echo counts"
+               " echo and ACK packets per echoed message. Junction packet counts are unavailable (-);"
+               " conduit counters do not describe junction traffic.", ""]
+    md = head + packets + md + sections
     md += ["Notes: latency is receive time minus scheduled send time (open loop, no coordinated omission); not echoed % is"
            " measured messages not echoed by the end of the drain, never-sent ones included (sending stops at the end"
            " of the window); sent pps counts messages accepted by the generator stack, not NIC transmissions;"

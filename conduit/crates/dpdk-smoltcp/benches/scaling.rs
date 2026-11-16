@@ -20,13 +20,20 @@
 //!
 //! scaling_poll_at idle/N, deadlines/N, spread/N: one `Stack::poll_at` on B
 //! of the round_low Pair after its round bench, first with no deadline.
-//! deadlines sends one byte per server with a 60 s RTO, drains those frames
-//! without forwarding to A, and leaves them unacknowledged. This replaces the
-//! old one-hour inactivity timeout workload; RTO is capped at 60 s.
-//! Untimed ACKs cancel all timers before spread sends another byte per server
-//! with RTO 60 s - slot ms. Each socket's deadline is read while only its
-//! timer is armed, then all timers are armed and the earliest must match.
-//! These eight deadline/spread cases need a new benchmark baseline.
+//! deadlines sends one byte per server at the Pair's time, drains those frames
+//! without forwarding to A, and leaves them unacknowledged. Each server's RTO
+//! is the one smoltcp measured: every RTT sample on this Pair is 0 µs, so the
+//! RTO is the 50 ms floor and all deadlines fall 50 ms ahead, in one
+//! timer-wheel slot. Untimed ACKs (again 0 µs samples) cancel all timers
+//! before spread sends another byte per server, server `slot` at the Pair's
+//! time plus slot·40 ms/N, each in a B turn alone (A keeps the round bench's
+//! queued write unsent, as in deadlines), so the
+//! deadlines spread over 40 ms of near slots, all ahead of the last send.
+//! Once all are armed, `poll_at` must fall after the last send and no later
+//! than slot 0's deadline, the earliest. Neither case reaches the far wheel levels
+//! (deadlines seconds out) any more: sockets no longer take a configured RTO,
+//! and on this Pair no RTT sample lifts the RTO past 50 ms. These eight
+//! deadline/spread cases need a new benchmark baseline.
 //!
 //! scaling_ingress miss/N, syn_rst/N: B of a Pair with N-1 fillers in slots
 //! 0..N-2, checked quiet as for round_*, and told A's MAC by an untimed ARP
@@ -114,7 +121,7 @@ use std::slice;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
-use dpdk_smoltcp::smoltcp::time::Duration;
+use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, EthernetAddress, TcpControl, TcpRepr, TcpSeqNumber,
 };
@@ -135,8 +142,10 @@ mod established;
 const COUNTS: [usize; 4] = [1, 64, 1024, 10_240];
 /// Filler socket buffers each way; fillers carry no data.
 const FILLER_BUFFER: usize = 256;
-/// The poll_at deadlines case's RTO.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// smoltcp's RTO floor; every B server's measured RTO here (0 µs samples).
+const MIN_RTO: Duration = Duration::from_millis(50);
+/// The poll_at spread case arms its servers across this span, under `MIN_RTO`.
+const SPREAD: Duration = Duration::from_millis(40);
 /// scaling_active round/A/N connection counts.
 const ACTIVE_COUNTS: [usize; 2] = [1024, 10_240];
 /// scaling_active rto/N connection counts; a superset of `ACTIVE_COUNTS`.
@@ -283,13 +292,12 @@ fn scaling_benches(c: &mut Criterion, eal: &Eal) {
     }
 }
 
-/// Send one byte on B, keeping its peer out of the turn so the RTO stays armed.
-/// Return the peer ACK that cancels this byte's timer.
-fn arm_deadline(pair: &mut Pair, server: &TcpHandle, rto: Duration) -> Vec<u8> {
-    pair.b.tcp_mut(server).set_rto(rto);
+/// Send one byte on B in a B turn at `at`, keeping its peer out of the turn so
+/// the measured RTO stays armed. Return the peer ACK that cancels this byte's
+/// timer.
+fn arm_deadline(pair: &mut Pair, server: &TcpHandle, at: Instant) -> Vec<u8> {
     assert_eq!(pair.b.tcp_mut(server).send_slice(b"x"), Ok(1));
-    let now = pair.now();
-    let turn = pair.b.turn(now, BUDGET).unwrap();
+    let turn = pair.b.turn(at, BUDGET).unwrap();
     assert_eq!(turn_counts(&turn), expected_turn(0, 1));
     let mut ack = None;
     assert_eq!(pair.drain_tx(Side::B, |frame| {
@@ -322,10 +330,11 @@ fn poll_at_benches(c: &mut Criterion, pair: &mut Pair, mut servers: Vec<&TcpHand
     });
     let mut acks = Vec::new();
     for &server in &servers {
-        acks.push(arm_deadline(pair, server, DEADLINE));
+        acks.push(arm_deadline(pair, server, pair.now()));
     }
     let deadline = pair.b.poll_at().expect("socket deadlines");
     assert!(deadline > pair.now(), "{deadline} is not a future deadline");
+    assert!(deadline <= pair.now() + MIN_RTO, "{deadline} is past the measured RTO");
     group.bench_function(BenchmarkId::new("deadlines", n), |b| {
         b.iter(|| black_box(pair.b.poll_at()));
     });
@@ -336,20 +345,23 @@ fn poll_at_benches(c: &mut Criterion, pair: &mut Pair, mut servers: Vec<&TcpHand
     servers.sort_by_key(|handle| {
         handle.to_string().strip_prefix('#').unwrap().parse::<usize>().unwrap()
     });
-    let spread = |slot: usize| DEADLINE - Duration::from_millis(slot as u64);
-    let earliest = servers.iter().enumerate().map(|(slot, &server)| {
-        assert_slot(server, slot);
-        let ack = arm_deadline(pair, server, spread(slot));
-        let own = pair.b.poll_at().expect("socket deadline");
-        b_takes(pair, slice::from_ref(&ack), 0, |_| {});
-        assert_eq!(pair.b.poll_at(), None);
-        own
-    }).min().unwrap();
+    // Server `slot` arms in a B turn alone at start + slot·SPREAD/len, so the
+    // deadlines spread over SPREAD and all stay ahead of the last arming time.
+    // A takes no turn: its active client still holds the round bench's queued
+    // write, which a Pair round would send.
+    let start = pair.now();
+    let len = servers.len() as u64;
+    let mut last = start;
     for (slot, &server) in servers.iter().enumerate() {
-        arm_deadline(pair, server, spread(slot));
+        assert_slot(server, slot);
+        last = start + Duration::from_micros(SPREAD.total_micros() * slot as u64 / len);
+        arm_deadline(pair, server, last);
     }
-    assert_eq!(pair.b.poll_at(), Some(earliest));
-    assert!(earliest > pair.now(), "{earliest} is not a future deadline");
+    // Slot 0's deadline, start + its measured RTO, is the earliest. poll_at may
+    // report a wheel boundary before it, but never one at or before the last send.
+    let earliest = pair.b.poll_at().expect("socket deadlines");
+    assert!(earliest > last, "{earliest} is not a future deadline");
+    assert!(earliest <= start + MIN_RTO, "{earliest} is past slot 0's deadline");
     group.bench_function(BenchmarkId::new("spread", n), |b| {
         b.iter(|| black_box(pair.b.poll_at()));
     });

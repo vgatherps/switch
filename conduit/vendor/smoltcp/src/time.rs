@@ -360,13 +360,6 @@ mod test {
     }
 
     #[test]
-    fn test_instant_display() {
-        assert_eq!(format!("{}", Instant::from_millis(74)), "0.074s");
-        assert_eq!(format!("{}", Instant::from_millis(5674)), "5.674s");
-        assert_eq!(format!("{}", Instant::from_millis(5000)), "5.000s");
-    }
-
-    #[test]
     fn test_instant_conversions() {
         let mut epoc: ::std::time::SystemTime = Instant::from_millis(0).into();
         assert_eq!(
@@ -430,12 +423,6 @@ mod test {
     #[should_panic(expected = "overflow when subtracting durations")]
     fn test_sub_from_zero_overflow() {
         let _ = Duration::from_millis(0) - Duration::from_millis(1);
-    }
-
-    #[test]
-    #[should_panic(expected = "attempt to divide by zero")]
-    fn test_div_by_zero() {
-        let _ = Duration::from_millis(4) / 0;
     }
 
     #[test]

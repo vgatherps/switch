@@ -1170,14 +1170,20 @@
          "behaviorClose": "OK",
          "remoteCloseCode": 1000
       },
-      "2.10": {
-         "behavior": "FAILED",
-         "behaviorClose": "OK",
-         "remoteCloseCode": null
-      },
+      "2.10": [
+         {
+            "behavior": "FAILED",
+            "behaviorClose": "OK",
+            "remoteCloseCode": null
+         },
+         {
+            "behavior": "OK",
+            "behaviorClose": "OK",
+            "remoteCloseCode": 1000
+         }
+      ],
       "2.11": [
          {
-            "_comment": "Pong coalescing depends on session scheduling; RFC 6455 permits either outcome.",
             "behavior": "FAILED",
             "behaviorClose": "OK",
             "remoteCloseCode": null

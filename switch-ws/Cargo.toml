@@ -40,6 +40,12 @@ trybuild = "1.0"
 # setsockopt in the Docker end-to-end tests.
 libc.workspace = true
 
+# The echo bench (DPDK, so Linux): a Net and a raw Stack peer over net_ring links.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+criterion.workspace = true
+dpdk-smoltcp.workspace = true
+switch-test-kit.workspace = true
+
 [[bin]]
 name = "switch-ws-autobahn"
 required-features = ["e2e"]
@@ -50,6 +56,11 @@ required-features = ["e2e"]
 
 [[test]]
 name = "compile_fail"
+required-features = ["switch-net"]
+
+[[bench]]
+name = "echo"
+harness = false
 required-features = ["switch-net"]
 
 [lints]

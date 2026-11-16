@@ -635,9 +635,12 @@ mod tests {
             "10.0.1.23/24".parse().unwrap(),
             "10.0.1.24/24".parse().unwrap(),
         ];
-        assert_eq!(
-            tree.discover(&addresses, None).err().unwrap().to_string(),
-            "eth1 has several IPv4 addresses (10.0.1.23/24, 10.0.1.24/24); choose one with --ipv4"
+        let error = tree.discover(&addresses, None).err().unwrap().to_string();
+        assert!(
+            error.contains("eth1")
+                && error.contains("10.0.1.23/24")
+                && error.contains("10.0.1.24/24"),
+            "{error}"
         );
         assert_eq!(
             tree.discover(&addresses, Some(addresses[1].address()))

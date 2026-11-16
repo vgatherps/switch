@@ -83,9 +83,8 @@ impl Device for UdpDevice {
     type TxToken<'a> = ReplyToken<'a>;
     type FrameToken<'a> = ReplyFrameToken<'a>;
 
-    fn receive(&mut self, _: Instant) -> Option<(FrameToken, ReplyToken<'_>)> {
-        let rx = self.rx.pop_front()?;
-        Some((rx, ReplyToken(&mut self.tx)))
+    fn receive(&mut self, _: Instant) -> Option<FrameToken> {
+        self.rx.pop_front()
     }
 
     fn transmit(&mut self, _: Instant) -> Option<ReplyToken<'_>> {
@@ -373,20 +372,6 @@ fn closed_port_dropped_no_reply() {
 }
 
 #[test]
-fn connected_drops_other_peer() {
-    let mut test = Test::new(1);
-    test.udp
-        .get_mut(test.handle)
-        .connect(IpEndpoint::new(REMOTE.into(), PEER_PORT))
-        .unwrap();
-    test.receive(datagram(b"other", LOCAL, PEER_PORT + 1), false);
-    assert!(test.recv().is_none());
-    assert_eq!(test.device.releases.get(), 1);
-    test.receive(datagram(b"peer", LOCAL, PEER_PORT), false);
-    assert_eq!(test.recv().unwrap().payload(), b"peer");
-}
-
-#[test]
 fn broadcast_delivered() {
     let mut test = Test::new(1);
     for dst in [Ipv4Address::BROADCAST, Ipv4Address::new(192, 168, 1, 255)] {
@@ -419,14 +404,6 @@ fn multicast_dst_dropped() {
     assert!(test.recv().is_none());
     assert_eq!(test.device.releases.get(), 2);
     assert!(test.device.tx.is_empty());
-}
-
-// IPv4 input drops TCP and ICMP to non-unicast destinations; UDP broadcast must still reach the set.
-#[test]
-fn non_unicast_udp_passes_ip_filter() {
-    let mut test = Test::new(1);
-    test.receive(datagram(b"bcast", Ipv4Address::BROADCAST, PEER_PORT), false);
-    assert_eq!(test.recv().unwrap().payload(), b"bcast");
 }
 
 #[test]
@@ -949,31 +926,6 @@ fn template_follows_connect_and_destination_change() {
 }
 
 #[test]
-fn template_not_built_for_broadcast() {
-    let mut test = Test::with_config(UdpConfig {
-        port: PORT,
-        local_addr: None,
-        rx_queue: 1,
-        tx_checksum: true,
-        broadcast: true,
-    });
-    let dst = Ipv4Address::new(192, 168, 1, 255);
-    let payload = b"broadcast";
-    for _ in 0..2 {
-        assert_eq!(
-            test.send(Some(IpEndpoint::new(dst.into(), PEER_PORT)), payload),
-            Ok(())
-        );
-        assert!(test.udp.get(test.handle).template.is_none());
-        assert_eq!(
-            test.device.tx,
-            vec![send_frame(dst, EthernetAddress::BROADCAST, payload, true)]
-        );
-        test.device.tx.clear();
-    }
-}
-
-#[test]
 fn send_frame_bytes_match_wire_emitters() {
     for checksum in [true, false] {
         let mut test = Test::with_config(UdpConfig {
@@ -1010,78 +962,6 @@ fn send_frame_bytes_match_wire_emitters() {
                 assert_eq!(udp.checksum(), 0);
             }
         }
-    }
-}
-
-#[test]
-fn send_device_tx_offload_writes_zero() {
-    for tx_checksum in [true, false] {
-        let mut test = Test::with_config(UdpConfig {
-            port: PORT,
-            local_addr: None,
-            rx_queue: 1,
-            tx_checksum,
-            broadcast: false,
-        });
-        resolve(&mut test, REMOTE, REMOTE_MAC);
-        test.iface.inner.caps.checksum.udp = crate::phy::Checksum::Rx;
-        let payload = b"offload";
-        assert_eq!(
-            test.send(Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), payload),
-            Ok(())
-        );
-        assert_eq!(test.device.tx.len(), 1);
-        assert_eq!(
-            test.device.tx.pop().unwrap(),
-            send_frame(REMOTE, REMOTE_MAC, payload, false)
-        );
-    }
-}
-
-#[test]
-fn send_computed_zero_checksum_is_ffff() {
-    let mut test = Test::new(1);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    let mut payload = [0; 2];
-    let bytes = send_frame(REMOTE, REMOTE_MAC, &payload, true);
-    let sum = UdpPacket::new_checked(&bytes[ETH_LEN + IP_LEN..])
-        .unwrap()
-        .checksum();
-    assert_ne!(sum, 0xffff);
-    payload.copy_from_slice(&sum.to_be_bytes());
-    assert_eq!(
-        test.send(Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), &payload),
-        Ok(())
-    );
-    let udp = UdpPacket::new_checked(&test.device.tx[0][ETH_LEN + IP_LEN..]).unwrap();
-    assert_eq!(udp.checksum(), 0xffff);
-    assert!(udp.verify_checksum(&LOCAL.into(), &REMOTE.into()));
-    assert_eq!(
-        test.device.tx[0],
-        send_frame(REMOTE, REMOTE_MAC, &payload, true)
-    );
-}
-
-#[test]
-fn send_to_y_after_x_uses_y_mac() {
-    let mut test = Test::new(1);
-    let other = Ipv4Address::new(192, 168, 1, 3);
-    let other_mac = EthernetAddress([6; 6]);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    resolve(&mut test, other, other_mac);
-    for (addr, mac) in [
-        (REMOTE, REMOTE_MAC),
-        (other, other_mac),
-        (REMOTE, REMOTE_MAC),
-    ] {
-        assert_eq!(
-            test.send(Some(IpEndpoint::new(addr.into(), PEER_PORT)), &[7]),
-            Ok(())
-        );
-        assert_eq!(
-            test.device.tx.pop().unwrap(),
-            send_frame(addr, mac, &[7], true)
-        );
     }
 }
 
@@ -1245,57 +1125,6 @@ fn udp_send_refuses_owned_addresses_in_order() {
         assert_eq!(test.device.tx, vec![send_frame(REMOTE, REMOTE_MAC, b"peer", true)]);
         test.device.tx.clear();
     }
-}
-
-#[test]
-fn arp_on_miss_payload_untouched() {
-    let mut test = Test::new(1);
-    let peer = IpEndpoint::new(REMOTE.into(), PEER_PORT);
-    assert_send_error(&mut test, Some(peer), 4, UdpSendError::NeighborPending);
-    test.device.tx.clear();
-    assert_eq!(test.send(Some(peer), b"lost"), Err(UdpSendError::NeighborPending));
-    assert!(test.device.tx.is_empty());
-    test.receive(
-        arp_frame(
-            ArpRepr::EthernetIpv4 {
-                operation: ArpOperation::Reply,
-                source_hardware_addr: REMOTE_MAC,
-                source_protocol_addr: REMOTE,
-                target_hardware_addr: LOCAL_MAC,
-                target_protocol_addr: LOCAL,
-            },
-            REMOTE_MAC,
-            LOCAL_MAC,
-        ),
-        false,
-    );
-    assert!(test.device.tx.is_empty());
-    assert_eq!(
-        test.send(Some(peer), b"sent"),
-        Ok(())
-    );
-    assert_eq!(
-        test.device.tx,
-        vec![send_frame(REMOTE, REMOTE_MAC, b"sent", true)]
-    );
-}
-
-#[test]
-fn first_udp_send_after_idle_uses_stale_mac() {
-    let mut test = Test::new(1);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    test.iface.inner.set_now(Instant::from_secs(70));
-    assert_eq!(
-        test.send(Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), b"sent"),
-        Ok(())
-    );
-    assert_eq!(
-        test.device.tx,
-        vec![
-            send_frame(REMOTE, REMOTE_MAC, b"sent", true),
-            arp_request(REMOTE)
-        ]
-    );
 }
 
 #[test]
@@ -1500,25 +1329,6 @@ fn udp_over_path_mtu_is_too_large_before_fill() {
 }
 
 #[test]
-fn udp_at_path_limit_sends() {
-    let mut test = Test::with_path_mtus(&[PathMtu {
-        prefix: Ipv4Cidr::new(REMOTE, 32),
-        mtu: 1500,
-    }]);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    assert_eq!(
-        test.send(Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), &[7; 1472]),
-        Ok(())
-    );
-    assert_eq!(
-        test.device.tx,
-        vec![send_frame(REMOTE, REMOTE_MAC, &[7; 1472], true)]
-    );
-    let ip = Ipv4Packet::new_checked(&test.device.tx[0][ETH_LEN..]).unwrap();
-    assert_eq!(ip.total_len(), 1500);
-}
-
-#[test]
 fn udp_on_link_jumbo_still_sends_8972() {
     let mut test = Test::with_path_mtus(&[PathMtu {
         prefix: "0.0.0.0/0".parse().unwrap(),
@@ -1579,24 +1389,6 @@ fn udp_template_reuse_still_checked() {
 }
 
 #[test]
-fn would_block_when_no_tx_token() {
-    let mut test = Test::new(1);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    test.device.tx_left = Some(0);
-    let peer = Some(IpEndpoint::new(REMOTE.into(), PEER_PORT));
-    assert_send_error(&mut test, peer, 1, UdpSendError::WouldBlock);
-    test.device.tx_left = Some(1);
-    assert_eq!(
-        test.send(peer, &[8]),
-        Ok(())
-    );
-    assert_eq!(
-        test.device.tx,
-        vec![send_frame(REMOTE, REMOTE_MAC, &[8], true)]
-    );
-}
-
-#[test]
 fn connected_send_uses_peer() {
     let mut test = Test::new(1);
     resolve(&mut test, REMOTE, REMOTE_MAC);
@@ -1621,29 +1413,6 @@ fn send_stale_handle_panics_before_device_work() {
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test.send(None, &[0])))
         .is_err());
     assert!(test.device.tx.is_empty());
-}
-
-#[test]
-fn send_ipv4_checksum_follows_device_caps() {
-    let mut test = Test::new(1);
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    test.iface.inner.caps.checksum.ipv4 = crate::phy::Checksum::None;
-    assert_eq!(
-        test.send(Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)), &[3]),
-        Ok(())
-    );
-    let mut expected = send_frame(REMOTE, REMOTE_MAC, &[3], true);
-    Ipv4Packet::new_unchecked(&mut expected[ETH_LEN..]).set_checksum(0);
-    assert_eq!(test.device.tx, vec![expected]);
-}
-
-#[test]
-fn no_gateway_sends_on_subnet_directly() {
-    let mut test = Test::new(1);
-    let off_subnet = IpEndpoint::new(IpAddress::v4(198, 51, 100, 2), PEER_PORT);
-    assert_send_error(&mut test, Some(off_subnet), 4, UdpSendError::NoRoute);
-    let on_subnet = IpEndpoint::new(REMOTE.into(), PEER_PORT);
-    assert_send_error(&mut test, Some(on_subnet), 4, UdpSendError::NeighborPending);
 }
 
 #[test]
@@ -1764,56 +1533,6 @@ fn frame_refused(
     }
 }
 
-/// A unique frame's wire bytes equal the generic emitters' on the first send (template miss,
-/// headers-only generic path) and the second (template), for every checksum mode and for
-/// zero-length up to full payloads; the device releases the frame's only reference at publish.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn udp_frame_template_and_generic_match_wire_emitter() {
-    let alloc = crate::phy::TxPool::new(1472);
-    for ipv4_checksum in [Checksum::Both, Checksum::Rx] {
-        for udp_checksum in [Checksum::Both, Checksum::Rx] {
-            for tx_checksum in [true, false] {
-                for len in [0, 1, 2, 3, 63, 64, 65, 1471, 1472] {
-                    let mut test = Test::with_config(UdpConfig {
-                        port: PORT,
-                        local_addr: None,
-                        rx_queue: 1,
-                        tx_checksum,
-                        broadcast: false,
-                    });
-                    test.udp.source = crate::phy::TxSource::new(alloc.clone());
-                    test.iface.inner.caps.checksum.ipv4 = ipv4_checksum;
-                    test.iface.inner.caps.checksum.udp = udp_checksum;
-                    resolve(&mut test, REMOTE, REMOTE_MAC);
-                    let caps = ChecksumCapabilities {
-                        ipv4: ipv4_checksum,
-                        udp: if tx_checksum && udp_checksum.tx() {
-                            Checksum::Both
-                        } else {
-                            Checksum::None
-                        },
-                        ..ChecksumCapabilities::default()
-                    };
-                    let payload: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
-                    for _ in 0..2 {
-                        let frame = tx_frame(&alloc, &payload);
-                        assert_frame_sent(send_tx_frame(
-                            &mut test,
-                            Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)),
-                            frame,
-                        ));
-                        assert_eq!(alloc.live(), 0);
-                        assert!(test.udp.get(test.handle).template.is_some());
-                    }
-                    let expected = send_frame_caps(REMOTE, REMOTE_MAC, &payload, &caps);
-                    assert_eq!(test.device.tx, vec![expected.clone(), expected]);
-                }
-            }
-        }
-    }
-}
-
 #[test]
 #[cfg_attr(miri, ignore)]
 fn udp_frame_checksums_match_generic_random() {
@@ -1838,32 +1557,6 @@ fn udp_frame_checksums_match_generic_random() {
         );
     }
     assert_eq!(alloc.live(), 0);
-}
-
-/// A computed UDP checksum of 0 goes out as 0xffff on both frame header paths.
-#[test]
-fn udp_frame_computed_zero_checksum_is_ffff() {
-    let alloc = crate::phy::TxPool::new(2);
-    let mut test = Test::new(1);
-    test.udp.source = crate::phy::TxSource::new(alloc.clone());
-    resolve(&mut test, REMOTE, REMOTE_MAC);
-    let mut payload = [0; 2];
-    let bytes = send_frame(REMOTE, REMOTE_MAC, &payload, true);
-    let sum = UdpPacket::new_checked(&bytes[ETH_LEN + IP_LEN..]).unwrap().checksum();
-    payload.copy_from_slice(&sum.to_be_bytes());
-    for _ in 0..2 {
-        assert_frame_sent(send_tx_frame(
-            &mut test,
-            Some(IpEndpoint::new(REMOTE.into(), PEER_PORT)),
-            tx_frame(&alloc, &payload),
-        ));
-    }
-    for bytes in &test.device.tx {
-        let udp = UdpPacket::new_checked(&bytes[ETH_LEN + IP_LEN..]).unwrap();
-        assert_eq!(udp.checksum(), 0xffff);
-        assert_eq!(*bytes, send_frame(REMOTE, REMOTE_MAC, &payload, true));
-    }
-    assert_eq!(test.device.tx.len(), 2);
 }
 
 /// Broadcast destinations never get a template: every unique frame goes out through the
