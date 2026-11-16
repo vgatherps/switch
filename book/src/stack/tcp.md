@@ -57,7 +57,7 @@ There is no accept queue. A listening socket becomes the connection when a peer 
 
 Data comes frame by frame, exactly as the peer's segments arrived. Frame boundaries are not message boundaries: a message your peer wrote with one call can be split over several frames, and several messages can share one. There is no byte-oriented read and no peek. `can_recv()` says whether in-order data is queued; `recv_queue()` gives the byte count.
 
-A `TcpFrame` gives access to `payload()`, `payload_mut()` and `rx_timestamp()` (the [hardware timestamp](../nic/offloads.md), 0 when there is none). It owns its packet buffer from the RX pool until you drop it. It stays valid after the socket is removed, the handle dropped, or even the Stack turned back into a port. `into_frame()` turns it into an `OwnedFrame` you can keep, `freeze()` and clone; read `rx_timestamp()` first, because the timestamp does not travel with the frame. `held_frames().count()` on the socket tells you how many of its frames your code still holds.
+A `TcpFrame` gives access to `payload()`, `payload_mut()` and `rx_timestamp()` (the [hardware timestamp](../nic/offloads.md), 0 when there is none). It owns its packet buffer from the RX pool until you drop it. It stays valid after the socket is removed, the handle dropped, or even the Stack turned back into a port. `into_frame()` turns it into an `OwnedFrame` you can keep, `freeze()` and clone; read `rx_timestamp()` first, because the timestamp does not travel with the frame.
 
 Holding received frames does not shrink the window the socket advertises. It does use the shared RX pool, so a program that holds many frames for a long time can run that pool dry.
 
@@ -67,7 +67,7 @@ There are two ways to send: copy bytes in, or hand over a frame you filled.
 
 ### Copying bytes: `send_slice`
 
-`stack.tcp_mut(&handle).send_slice(data)` copies as much of `data` as fits and returns how many bytes it took. Two limits apply: the socket's free transmit bytes (`tx_capacity` minus what it holds), and free frames in the shared frame pool. When neither has room it returns `Ok(0)`; that is not an error. It returns `Err(SendError::InvalidState)` only when the socket's transmit side is not open.
+`stack.tcp_mut(&handle).send_slice(data)` copies as much of `data` as fits and returns how many bytes it took. It fills the frame at the end of the send queue first, then takes new frames from the shared frame pool, each holding at most one segment. Two limits apply: the socket's free transmit bytes (`tx_capacity` minus what it holds), and free frames in the frame pool. When neither has room it returns `Ok(0)`; that is not an error. It returns `Err(SendError::InvalidState)` only when the socket's transmit side is not open.
 
 The echo step in the tap echo harness shows the usual pattern: read a frame, copy as much of it as fits, keep the rest for the next time through the loop.
 
@@ -75,7 +75,7 @@ The echo step in the tap echo harness shows the usual pattern: read a frame, cop
 {{#include ../../../conduit/crates/switch-tap-echo/src/lib.rs:echo}}
 ```
 
-When `send_slice` stops short because the frame pool is empty, the socket is woken (its [readiness tokens](readiness.md) fire) at the first `turn`, `receive` or `send` that finds a free frame.
+When `send_slice` stops short because the frame pool is empty, nothing tells the socket when frames come back. Call it again on a later time through the loop; `stack.free_frames()` says how many frames the pool has now.
 
 ### Handing over a frame: `tcp_send_frame`
 
@@ -89,7 +89,7 @@ let out = out.freeze();
 assert!(pair.a.tcp_send_frame(&h[0], out).is_ok());
 ```
 
-`stack.tx_frame()` returns an `OwnedFrame` whose length is the largest UDP payload, IP MTU − 28 bytes, or `None` when the frame pool is empty. `stack.tcp_send_frame(&handle, frame)` queues the frozen frame as one entry of the send queue. On success the socket holds the frame until the peer acknowledges its last byte. Every error gives the frame back, untouched:
+`stack.tx_frame()` returns an `OwnedFrame` whose length is the largest UDP payload, IP MTU − 28 bytes, or `None` when the frame pool is empty. `stack.tcp_send_frame(&handle, frame)` queues the frozen frame. A small frame that fits whole into the unsent frame at the end of the send queue, without making that frame longer than one segment, is copied there and freed at once, so several small writes share one segment. Any other frame becomes its own entry in the send queue, and the socket holds it until the peer acknowledges its last byte. Every error gives the frame back, untouched:
 
 | Error | Meaning |
 |---|---|
@@ -98,7 +98,7 @@ assert!(pair.a.tcp_send_frame(&h[0], out).is_ok());
 | `SendFrameError::Empty` | The frame has zero length. |
 | `SendFrameError::Full` | The frame is longer than the socket's free transmit bytes (`frame_send_room()`). |
 
-A frame goes out in place when it is sent as one whole segment. The Stack sends a segment by copying it into a packet from the TX pool instead when that is not possible: the frame is longer than the connection's segment size, the frame is shared or sliced, the segment spans several frames, or part of a frame is retransmitted. `max_segment_payload()` returns the segment size once the connection is established.
+A queued frame goes out in place when it is sent as one whole segment. When that is not possible, the Stack builds the segment in a packet from the TX pool and copies the bytes there: the frame is longer than the connection's segment size, the frame is shared or sliced, the segment spans several frames, or only part of a frame is retransmitted. `max_segment_payload()` returns the segment size once the connection is established.
 
 ## Closing
 
@@ -154,7 +154,7 @@ A `TcpHandle` may outlive its Stack; dropping it afterwards does nothing.
 | `reset_by_peer()` | whether the peer's reset closed the connection |
 | `retransmits()`, `loss_events()` | retransmitted segments, and loss episodes |
 | `congestion_window()`, `ssthresh()` | Cubic's window and slow-start threshold, in bytes |
-| `rx_refused_segments()` | out-of-order segments dropped while the RX pool was low |
+| `rx_refused_segments()` | out-of-order segments refused because the socket already held 1024 frames past its first gap |
 
 And the settings, on `tcp_mut`:
 
@@ -162,7 +162,6 @@ And the settings, on `tcp_mut`:
 |---|---|
 | `set_ack_delay(Option<Duration>)` | delayed-ACK time, 10 ms by default; `None` turns it off; over 60 s panics |
 | `ack_now()` | send an owed ACK at the next egress |
-| `set_rto(Duration)` | base retransmission timeout, 300 ms by default; zero or over 60 s panics |
 | `set_initial_window(usize)` | Cubic's initial window, 1 MiB by default; zero panics; set before connect or listen |
 | `set_hop_limit(Option<u8>)` | IPv4 TTL, 64 by default; `Some(0)` panics |
 | `limit_retries()` | give up after 8 retransmission backoffs, as an orphaned socket does |

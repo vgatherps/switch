@@ -1,6 +1,6 @@
 # Writing tests that use DPDK
 
-Mark a test that uses DPDK `#[switch_test_support::pinned_test]` instead of `#[test]`, and start DPDK in it with `switch_test_kit::with_eal`. A test that opens a NIC port, builds a Stack or turns a `Net` needs both, because DPDK has rules that the standard Rust test harness breaks. This page explains the rule and the attribute, the fixtures in `switch-test-kit` that give tests fake NICs and a simulated wire, and the `testkit` module of `switch-net` for testing code against the Linux kernel as the peer.
+Mark a test that uses DPDK `#[switch_test_support::pinned_test]` instead of `#[test]`, and start DPDK in it with `switch_test_kit::with_eal`. A test that opens a NIC port, builds a Stack or drives a `Net` needs both, because DPDK has rules that the standard Rust test harness breaks. This page explains the rule and the attribute, the fixtures in `switch-test-kit` that give tests fake NICs and a simulated wire, and the `testkit` module of `switch-net` for testing code against the Linux kernel as the peer.
 
 These tests build and run where any DPDK code does: in the Docker image, or on Linux with DPDK installed ([Setting up a build environment](../getting-started/environment.md)). [Running the test suite](suite.md) shows how to run them. A crate outside this repository uses them as path dependencies of a clone:
 
@@ -71,10 +71,10 @@ Most Stack tests need two endpoints talking to each other. `pair::Pair` holds tw
                  <--rx ring-- Link b_to_a <--tx ring--
                                   |
                      one clock, advanced by the test
-     a Pair round: turn a, forward a_to_b, turn b, forward b_to_a
+     a Pair round: a receives and sends, forward a_to_b, b receives and sends, forward b_to_a
 ```
 
-A Pair round (`Pair::round`; not the same thing as switch-net's [`round`](../net/drive-loop.md), which turns a `Net` and polls the runtime) turns `a`, forwards what it sent to `b`, turns `b`, and forwards what it sent back to `a`. `pair.drive(observe, app)` repeats Pair rounds and calls `app` with both Stacks after each, until `app` returns `App::Done`. When a Pair round moves nothing and `app` returns `App::Idle`, it advances the clock to the earliest timer of either Stack, so retransmissions and delayed ACKs happen without real waiting. Sixteen idle Pair rounds in a row, or 100,000 in all, fail the test.
+A Pair round (`Pair::round`; not the same thing as switch-net's [`round`](../net/drive-loop.md), which drives a `Net` and the runtime) runs Stack `a`'s receive and send steps in one call (`Stack::turn`), forwards what `a` sent to `b`, does the same for `b`, and forwards what `b` sent back to `a`. `pair.drive(observe, app)` repeats Pair rounds and calls `app` with both Stacks after each, until `app` returns `App::Done`. When a Pair round moves nothing and `app` returns `App::Idle`, it advances the clock to the earliest timer of either Stack, so retransmissions and delayed ACKs happen without real waiting. Sixteen idle Pair rounds in a row, or 100,000 in all, fail the test.
 
 This test establishes a TCP connection from `a` to `b`, sends four bytes from `a`, drives until `b` has them, and closes the pair:
 
@@ -119,7 +119,7 @@ The name must be short and unique among taps alive at once: the device is `net_t
 6. `client`: a function (an `async fn` works) that takes the `NetHandle` and the connected `TcpStream` and returns the future `client_server` runs as a switch task; `client_server` opens the stream from a fresh local port, and drops what the future returns only after the peer has finished,
 7. `each_round`: a closure called each time through `client_server`'s loop (`|| {}` for none).
 
-It turns the `Net` and polls the runtime until both sides are done. Here the peer reads one line and echoes it:
+Each time through its loop it runs one round by hand: the `Net`'s receive step, a poll of the runtime, the `Net`'s send step, then `each_round`. It stops when both sides are done. Here the peer reads one line and echoes it:
 
 ```rust,ignore
 {{#include ../../../switch-net/tests/testkit_echo.rs:serve}}
@@ -133,7 +133,7 @@ and the client sends the line and reads until it is back:
 
 The client returns its two stream halves. `client_server` drops what the client returns only after the peer has finished, so what the peer saw came from the client's sends, not from its socket closing early.
 
-`with_tap_net(backend, &config, body)` is the lower-level form: it gives `body` a `TapNet`, which you turn yourself, and a `Clock`, and leaves the peer to you. Either way the body must drop every handle, socket and frame it made before it returns. Then `with_tap_net` takes the Stack back, closes the port with every packet buffer returned, and removes the tap device; anything still alive fails the test.
+`with_tap_net(backend, &config, body)` is the lower-level form: it gives `body` a `TapNet`, whose `receive(now)` and `send()` you call yourself around your own runtime polls, and a `Clock`, and leaves the peer to you. Either way the body must drop every handle, socket and frame it made before it returns. Then `with_tap_net` takes the Stack back, closes the port with every packet buffer returned, and removes the tap device; anything still alive fails the test.
 
 `Clock::now()` supplies the Stack's microsecond `Instant`; `Clock::ns()` supplies monotonic nanosecond ticks for `Runtime::poll` and relative sleeps. `client_server` polls its runtime in nanoseconds, so `within` limits use their written durations. It sleeps 50 µs each time through its loop, so the peer thread gets the CPU.
 

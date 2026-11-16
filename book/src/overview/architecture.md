@@ -1,6 +1,6 @@
 # How the pieces fit together
 
-The [Introduction](../introduction.md) described switch in layers: your tasks on top, the NIC at the bottom, and a drive loop that moves everything. This page turns that picture into something you can check a running program against. It names the crate behind each layer, shows which thread runs on which CPU for each backend, and follows one received packet and one sent frame through each. Every term here is explained again, in more depth, in the chapter the tables point to.
+The [Introduction](../introduction.md) described switch in layers: your tasks on top, the NIC at the bottom, and a drive loop that moves everything. This page makes that picture into something you can check a running program against. It names the crate behind each layer, shows which thread runs on which CPU for each backend, and follows one received packet and one sent frame through each. Every term here is explained again, in more depth, in the chapter the tables point to.
 
 ## Layers and crates
 
@@ -10,9 +10,9 @@ Tasks use the top four rows. The program's setup code also opens the NIC with `s
 |---|---|---|---|
 | WebSocket | `switch-ws` | WebSocket client (`ws://`, `wss://`) and `ws://` server over a TCP stream | [TLS and WebSocket](../protocols/index.md) |
 | TLS | `switch-tls` | TLS 1.3 client over a TCP stream | [TLS without WebSocket](../protocols/tls.md) |
-| Sockets | `switch-net` | Async TCP and UDP sockets for tasks: a `Net` that the drive loop turns, and `NetHandle`s that tasks use to open sockets | [Sockets with switch-net](../net/index.md) |
+| Sockets | `switch-net` | Async TCP and UDP sockets for tasks: a `Net` that the drive loop runs rounds on, and `NetHandle`s that tasks use to open sockets | [Sockets with switch-net](../net/index.md) |
 | Runtime | `switch` | Single-threaded async runtime that runs tasks when the drive loop polls it | [The switch runtime](../runtime/index.md) |
-| Opening a NIC | `switch-open`, `switch-netconf` | Turn a network config file into a running Stack; write, check and apply that file | [Owning a NIC](../nic/index.md) |
+| Opening a NIC | `switch-open`, `switch-netconf` | Start a running Stack from a network config file; write, check and apply that file | [Owning a NIC](../nic/index.md) |
 | The Stack | `dpdk-smoltcp` | TCP/IP over one NIC port on one thread | [Programming the Stack directly](../stack/index.md) |
 | Junction | `switch-junction`, `switch-junctiond` | Client session and the daemon that shares one NIC between processes | [Sharing a NIC](../junction/index.md) |
 | Shared memory | `switch-frame`, `shared-memory`, `slice_ringbuffer`, `ceph-*` | Frames, shared-memory files and the rings the junction backend uses | [Under the hood](../blocks/index.md) |
@@ -22,7 +22,7 @@ The [crate map](../reference/crates.md) lists every package in the repository, i
 
 ## The local backend: one process, one pinned CPU
 
-With the local backend, the whole network path lives in your process. `switch_open::open` starts DPDK, opens the NIC port and builds the Stack; `Net::new` wraps the Stack, and your drive loop turns it.
+With the local backend, the whole network path lives in your process. `switch_open::open` starts DPDK, opens the NIC port and builds the Stack; `Net::new` wraps the Stack, and your drive loop runs one round after another on it: receive, poll the runtime, send.
 
 ```text
  one Linux machine
@@ -30,12 +30,12 @@ With the local backend, the whole network path lives in your process. `switch_op
  |  housekeeping CPUs                        pinned CPU                  |
  |  +-----------------------------+          +-------------------------+ |
  |  | OS, interrupts, SSH         |          | your drive loop thread: | |
- |  | DPDK helper threads (here   |          |   Net::turn             | |
- |  |   when the pinned CPU is    |          |     the Stack           | |
- |  |   isolated or helper CPUs   |          |     DPDK NIC driver     | |
- |  |   are given)                |          |                         | |
- |  +-----------------------------+          |   Runtime::poll         | |
- |                                           |     your tasks          | |
+ |  | DPDK helper threads (here   |          |   Net::receive          | |
+ |  |   when the pinned CPU is    |          |     the Stack, driver   | |
+ |  |   isolated or helper CPUs   |          |   Runtime::poll         | |
+ |  |   are given)                |          |     your tasks          | |
+ |  +-----------------------------+          |   Net::send             | |
+ |                                           |     the Stack, driver   | |
  |  management NIC (Linux)                   +-----------+-------------+ |
  +-----------------------------------------------------------+-----------+
                                                              |
@@ -53,7 +53,7 @@ With the junction backend, `switch-junctiond` owns the NIC and runs the Stack, a
  +-----------------------------------+            +-----------------------------------+
  | pinned CPU (app):                 |            | pinned CPU (daemon):              |
  |   drive loop thread               |            |   network thread                  |
- |     Net::turn  -> Session         |  send ring |     reads the send rings,         |
+ |     Net::receive -> Session       |  send ring |     reads the send rings,         |
  |       try_send copies bytes ------+-(one per --+---> applies sends to the Stack    |
  |                                   |  CPU, all  |     Stack, DPDK NIC driver ---+---+--> NIC
  |       recv gets frames <----------+- sessions) |     writes received data  <---+   |
@@ -70,7 +70,7 @@ With the junction backend, `switch-junctiond` owns the NIC and runs the Stack, a
 
 The daemon's network thread runs on its own pinned CPU and does what your drive loop does in the local backend: it busy-polls the NIC and the Stack. Its control thread, `junction-control`, and DPDK's helper threads run on the housekeeping CPUs given by `--control-cpus`. [Running switch-junctiond](../junction/running.md) shows a typical layout.
 
-The application runs no Stack and no DPDK. Its drive loop turns a `Net` built with `Net::remote(session, ..)`, and `Session::connect` starts one extra thread, `junction-ctl`, which reads control messages from the daemon and otherwise sleeps. That thread starts with the affinity of the thread that connected, so pin the process before connecting and it shares the application's pinned CPU. [Connecting an application through switch-net](../junction/apps.md) covers the setup.
+The application runs no Stack and no DPDK. Its drive loop runs rounds on a `Net` built with `Net::remote(session, ..)`. The receive step polls the session for events and received packets. `try_send` has already copied each send into the send ring, so the send step only counts the sends committed since the last round and reports it if the daemon is gone. `Session::connect` starts one extra thread, `junction-ctl`, which reads control messages from the daemon and otherwise sleeps. That thread starts with the affinity of the thread that connected, so pin the process before connecting and it shares the application's pinned CPU. [Connecting an application through switch-net](../junction/apps.md) covers the setup.
 
 In both backends your tasks use the same `NetHandle` and the same socket types. Only the `Net` underneath differs: with the local backend it holds the Stack, and with the junction backend it holds a session and exchanges records with the daemon over shared memory.
 
@@ -99,7 +99,7 @@ The two backends differ most in where bytes are copied and where outgoing data w
 
 With the local backend, a received TCP chunk or UDP datagram reaches your task as a frame over the packet buffer the NIC wrote into. A frame you send goes to the NIC without a copy when only you hold it, it starts at its original start and it fits in one TCP segment or one datagram; other sends are copied. A sent TCP frame stays with its socket until the peer acknowledges it, so backpressure comes from the socket's send buffer and the frame pool. [Frames](../net/frames.md) has the details.
 
-With the junction backend, the daemon copies each received chunk or datagram into your session's receive ring, and your task reads it there in place; its ring space comes back once the frame is dropped and the next turn reclaims it. A send is copied into the send ring of the CPU your thread runs on. `Ok` means the bytes are in that ring, and `Full` means it has no room right now. TCP bytes the peer cannot take yet wait in the daemon. [Local and junction backends compared](../net/backends.md) and [What applications share](../junction/sharing.md) explain what this means for your program.
+With the junction backend, the daemon copies each received chunk or datagram into your session's receive ring, and your task reads it there in place; its ring space comes back once the frame is dropped and the next receive step reclaims it. A send is copied into the send ring of the CPU your thread runs on. `Ok` means the bytes are in that ring, and `Full` means it has no room right now. TCP bytes the peer cannot take yet wait in the daemon. [Local and junction backends compared](../net/backends.md) and [What applications share](../junction/sharing.md) explain what this means for your program.
 
 ## Where to go next
 

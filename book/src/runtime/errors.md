@@ -39,7 +39,7 @@ When a task is dropped, its future is dropped, and everything the future owns is
 - every `Spawner` reports `Closed`: `spawn` returns `SpawnError` with reason `Closed`, and `sleep` returns `Err(SleepError::Closed)`,
 - every `Sleep` still held somewhere completes with `Err(SleepError::Closed)` when awaited,
 - `poll` returns `Err(RuntimeError::Closed)`,
-- a `RemoteWaker` wake from another thread is dropped.
+- a wake from another thread, through a task's `Waker` or a `RemoteWaker`, is dropped.
 
 A task's destructor may run code, and that code runs during shutdown. It must not drop the `Runtime` itself (for example by owning the last reference to a structure that holds it): dropping the runtime from a destructor that its own shutdown is running aborts the process.
 

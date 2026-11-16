@@ -72,6 +72,6 @@ Data that reached the receive ring before the loss is not lost with it. `poll` d
 
 `send_tcp` and `send_udp` do not check for loss and may still return `Ok` or `Full`. Only polling tells you the session is gone.
 
-Through switch-net, loss shows up as `TurnError::HostLost` from `Net::turn`, and the sockets fail as described in [Errors](../net/errors.md#when-the-daemon-goes-away). There is no way to resume a lost session: connect a new one and open new sockets.
+Through switch-net, the receive step of a round polls the session, so that is where loss first shows up: `net.receive` returns `TurnError::HostLost` carrying the `Lost` value, and `switch_net::round` returns it as `RoundError::Turn`. Later receive and send steps return `TurnError::HostLost(Lost::Disconnected)`. Pending opens then fail with `Error::HostLost` and established sockets fail as described in [Errors](../net/errors.md#when-the-daemon-goes-away). There is no way to resume a lost session: connect a new one and open new sockets.
 
 This ends the junction part. The wire format of the control socket, for people writing another client, is in [The junction control protocol](../reference/junction-protocol.md). The book continues with [Programming the Stack directly](../stack/index.md).

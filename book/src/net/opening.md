@@ -1,6 +1,6 @@
 # Opening sockets
 
-Tasks open sockets through their `NetHandle`. There are three calls: `tcp_connect` for an outgoing TCP connection, `tcp_accept` for an incoming one, and `udp_bind` for a UDP socket. Each returns a future that resolves to the socket or to an `Error`. Handshakes and the daemon's answers travel only when [the drive loop](drive-loop.md) turns the network, so most outcomes arrive in a later turn.
+Tasks open sockets through their `NetHandle`. There are three calls: `tcp_connect` for an outgoing TCP connection, `tcp_accept` for an incoming one, and `udp_bind` for a UDP socket. Each returns a future that resolves to the socket or to an `Error`. Handshakes and the daemon's answers travel only in the receive and send steps of [the drive loop](drive-loop.md), so most outcomes arrive in a later round.
 
 One rule holds for all three: the socket is opened when you call the function, not when you first await the future. The future only waits for the outcome. If you drop the future before it resolves, the socket is dropped with it, the same as closing it.
 
@@ -59,7 +59,7 @@ UdpConfig { port, local_addr: None, rx_queue: UDP_QUEUE, tx_checksum: true, broa
 
 On the local backend every opening error resolves on the first poll of the future, and no socket is left behind. `SocketsFull`, `PortInUse` and `Unaddressable` all come back at once.
 
-On the junction backend the daemon decides whether to accept the socket. Errors the client can see on its own still come on the first poll: `SocketsFull` when the session has no free socket slot, `InvalidConfig`, and `HostLost` when the session is already gone. A rejection by the daemon arrives only after a round trip to it, so the first poll returns `Pending` and a later turn delivers the error.
+On the junction backend the daemon decides whether to accept the socket. Errors the client can see on its own still come on the first poll: `SocketsFull` when the session has no free socket slot, `InvalidConfig`, and `HostLost` when the session is already gone. A rejection by the daemon arrives only after a round trip to it, so the first poll returns `Pending` and a later receive step delivers the error.
 
 On the local backend a connection you dropped keeps its slot in the Stack until it has finished closing. A program that closes and reconnects quickly can therefore see `SocketsFull` even though it holds fewer sockets than the limit.
 

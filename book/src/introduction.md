@@ -16,22 +16,27 @@ A switch program takes the NIC away from the kernel. It uses DPDK, a userspace N
 
 ## You own the loop, the CPU and the clock
 
-Nothing in switch runs by itself. There is no background thread that receives packets and no executor that decides when tasks run. Your program has one loop, the drive loop, and each time through it does two things:
+Nothing in switch runs by itself. There is no background thread that receives packets and no executor that decides when tasks run. Your program has one loop, the drive loop. Each time through, it reads the clock once and runs one round, which has three steps:
 
-1. Turn the network: take in the packets that arrived, run TCP's timers, send what tasks queued, and wake the tasks whose sockets changed.
-2. Poll the switch runtime: run every task that is ready until it waits again.
+1. Receive: take in the packets that arrived and wake the tasks whose sockets became ready.
+2. Poll the switch runtime: run every woken task until it waits again.
+3. Send: push out what those tasks wrote, together with what TCP itself owes, such as ACKs and retransmissions.
 
 ```text
    drive loop, on one pinned CPU
    +-----------------------------------------------+
    |  read the clock once                          |
-   |  turn the network   (receive, timers, send)   |
-   |  poll the runtime   (run woken tasks)         |
+   |  one round:                                   |
+   |    receive   take in packets, wake tasks      |
+   |    poll      run the woken tasks              |
+   |    send      push out what they wrote         |
    |  start again at once, or sleep briefly        |
    +-----------------------------------------------+
 ```
 
-One thread drives both the network and the tasks, and it does so on one CPU that it is pinned to: the thread that drives the network is allowed to run on that CPU only. Between two trips through the loop nothing happens at all. A task that called `try_send` has only queued its data; the packet leaves on the next turn. A task waiting on `recv` runs again only after a turn has found data for it and a poll has run it.
+`switch_net::round` does all three steps in one call, so a reply that a woken task writes leaves in the same round as the request that woke it.
+
+One thread drives both the network and the tasks, and it does so on one CPU that it is pinned to: the thread that drives the network is allowed to run on that CPU only. Between two trips through the loop nothing happens at all. A task that called `try_send` has only queued its data, and a task waiting on `recv` runs again only after a receive step has found data for it and a poll has run it.
 
 The program also supplies time. The runtime and the Stack have no clock of their own. The drive loop reads one clock once each time through and hands the same reading to both. A loop that wants the lowest latency starts again at once without sleeping, which keeps its CPU busy all the time.
 

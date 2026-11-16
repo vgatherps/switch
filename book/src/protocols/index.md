@@ -62,7 +62,7 @@ webpki-roots = "=1.0.9"
 
 `<clone>` is the directory where you cloned this repository. Turning on switch-ws's `switch-net` feature turns on switch-tls's as well. For TLS without WebSocket, depend on `switch-tls` with the same feature.
 
-The TLS client speaks TLS 1.3 only; the `rustls::ClientConfig` you pass must allow only TLS 1.3. The WebSocket server is `ws://`. switch-ws asks for no extensions or subprotocols and fails the upgrade (`UpgradeError::Unrequested`) if a server picks one.
+The TLS client speaks TLS 1.3 only: give it a `rustls::ClientConfig` that allows TLS 1.3, and a connection that negotiates an older version fails. The WebSocket server is `ws://`. switch-ws asks for no extensions or subprotocols and fails the upgrade (`UpgradeError::Unrequested`) if a server picks one.
 
 ## Copies and timestamps
 

@@ -28,7 +28,7 @@ The RX pool holds arriving packets. The NIC driver takes an empty buffer from it
 
 The TX pool holds packets the Stack builds on its own (acknowledgements, ARP requests and replies, resets) and TCP segments it sends by copy. A TCP segment goes out as a copy when it cannot be sent as one whole frame: a frame longer than the segment, a shared or sliced frame, a segment that spans frames, or part of a frame being retransmitted. [TCP sockets on the Stack](../stack/tcp.md#handing-over-a-frame-tcp_send_frame) says more about when that happens.
 
-The frame pool holds the data your program sends. On the Stack, `send_slice` copies bytes into frames from this pool, and `Stack::tx_frame` hands you an empty one to fill. In switch-net, `NetHandle::tx_frame` does the same on the local backend. A TCP socket keeps each frame it queued until the peer acknowledges the frame's last byte. A UDP frame returns to the pool once the NIC has sent it.
+The frame pool holds the data your program sends. On the Stack, `send_slice` copies bytes into frames from this pool, and `Stack::tx_frame` hands you an empty one to fill. In switch-net, `NetHandle::tx_frame` does the same on the local backend. A TCP socket keeps each frame in its send queue until the peer acknowledges the frame's last byte; a small frame you hand over may instead be copied into the frame already at the end of the queue and freed at once. A UDP frame returns to the pool once the NIC has sent it.
 
 ## Reserve and share
 
@@ -81,9 +81,9 @@ A program with many connections adds the budgets of the sockets that may be send
 
 Two `Sizing` fields size queues inside the Stack rather than pools, and both appear in the reserves.
 
-`rx_staging` is how many received packets the Stack may hold between taking them from the NIC and processing them. Each turn processes at most `ingress_budget` packets (an argument to `Stack::turn` and `Stack::receive`, a field of switch-net's `NetConfig`). Packets beyond that wait in staging for the next turn, and the turn reports them in `Turn::rx_staged`. See [the Stack's drive loop](../stack/drive-loop.md).
+`rx_staging` is how many received packets the Stack may hold between taking them from the NIC and processing them. Each receive step processes at most `ingress_budget` packets (an argument to `Stack::receive` and `Stack::turn`, a field of switch-net's `NetConfig`). Packets beyond that wait in staging for the next receive step, which reports them in `Turn::rx_staged`. See [the Stack's drive loop](../stack/drive-loop.md).
 
-`tx_pending` is how many built packets may wait for the NIC driver to accept them. When it is full, the Stack can only flush; UDP sends return `WouldBlock`, and received packets stay staged until the driver takes packets again.
+`tx_pending` is how many built packets may wait for the NIC driver to accept them. When it is full, the send step can only flush and UDP sends return `WouldBlock`. Receiving goes on: a reply built while receiving (an ACK, a reset, an ARP reply) that finds no room is dropped.
 
 ## Running dry
 
@@ -92,12 +92,12 @@ When a pool has no free buffer, nothing fails loudly. Each pool produces a diffe
 | Pool runs dry | What happens | What frees it |
 |---|---|---|
 | RX pool | The NIC driver has no buffer for arrivals and drops them. TCP peers retransmit; UDP senders are not told. | Read queued data and drop received frames you hold. |
-| TX pool | The Stack cannot build packets. It also stops taking in received packets, because processing a packet first reserves room for a reply. | The driver finishing earlier sends. |
+| TX pool | The Stack cannot build packets. Sockets that want to send wait for a later send step; replies built while receiving are dropped. Receiving itself goes on. | The driver finishing earlier sends. |
 | frame pool | `send_slice` queues what fits and may return `Ok(0)`; `Stack::tx_frame` returns `None`; `udp_send` returns `WouldBlock`; in switch-net `tx_frame().await` waits. | Peers acknowledging TCP data; dropping frames your code holds; the driver finishing UDP sends. |
 
-A TCP socket whose `send_slice` found the frame pool empty is woken (its [readiness tokens](../stack/readiness.md) fire) at the first `turn`, `receive` or `send` that finds a free frame again. A caller of `Stack::tx_frame` gets no such wake; it tries again later.
+On the Stack nothing tells you when frames come back. A program that got `Ok(0)` from `send_slice` or `None` from `tx_frame` tries again on a later time through its loop; `Stack::free_frames()` says how many frames it could take now.
 
-The RX pool also has a low mark: one full refill of the receive ring plus one receive burst. While fewer buffers than that are free, every TCP socket stops storing out-of-order segments (data that arrived after a gap). It still stores in-order data. The peer retransmits the dropped segments, and each socket counts them in `rx_refused_segments()`. This keeps the driver supplied with buffers.
+The RX pool also has a low mark: one full refill of the receive ring plus one receive burst. After each receive step that took in packets, and after every receive step while the pool is below the mark, the Stack checks the pool. While it is below, the TCP sockets holding the most out-of-order frames (data that arrived after a gap) release them, starting with the data farthest past the gap, until the pool is back at the mark. In-order data is never released this way. The peer retransmits what was released. This keeps the driver supplied with buffers. Separately, one socket never holds more than 1024 out-of-order frames: it refuses further out-of-order segments and counts them in `rx_refused_segments()`.
 
 Two consequences follow for TCP. `tcp::Config::rx_capacity` is the receive window the socket advertises, not a cap on received data: a socket accepts contiguous data even past its advertised edge, and frames you hold after reading them still come from the shared RX pool. And `tx_capacity` together with the frame pool bounds unacknowledged data, because a queued frame is held until the peer acknowledges its last byte.
 

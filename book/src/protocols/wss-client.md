@@ -41,7 +41,7 @@ The socket needs buffers big enough for the traffic you expect. The feed uses 25
 {{#include ../../../conduit/crates/switch-binance-feed/src/lib.rs:socket}}
 ```
 
-Each frame must be able to carry the largest WebSocket control frame inside one TLS record. How much one frame carries is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the TLS `max_fragment_size` caps it further. If that is too small, `connect` fails with `Config(RoomTooSmall)` before anything is sent. The feed's buffers are far above that bound.
+Each frame switch-ws sends carries one TLS record. Frames are sized to the connection's MSS, so that each is one TCP segment, but never below the largest WebSocket control frame inside one TLS record; a frame larger than the MSS is cut into segments by TCP. That minimum must fit in a frame and in the socket's send buffer. If it does not, `connect` fails with `Config(RoomTooSmall)` before anything is sent. The feed's buffers are far above that bound.
 
 Then open the connection as on [Opening sockets](../net/opening.md). There is no ephemeral port, so pick a nonzero local port yourself.
 
@@ -91,13 +91,13 @@ The errors that can come out of `connect` are all variants of `switch_ws::switch
 | `Handshake(msg)` | The handshake could not start (the host is not a valid server name), negotiated a version other than TLS 1.3, or ended in an unexpected state. | Check the host name and use a TLS 1.3 server. |
 | `Upgrade(e)` | The server refused or garbled the WebSocket upgrade. `UpgradeError::Status(Some(code))` carries the HTTP status when it is not 101. | Check the path and the server; see below. |
 | `Recv(e)`, `Send(e)` | TCP failed under the handshake or the upgrade. | Treat as a lost connection. |
-| `Config(SetupError::RoomTooSmall { room, need })` | One frame cannot carry the largest control frame or TLS record. The room is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the TLS `max_fragment_size` caps it further; `room` and `need` are byte counts. | Raise whichever is too small: `tx_capacity` on the local backend, `mss_cap` or the path MTU, or `max_fragment_size`. |
+| `Config(SetupError::RoomTooSmall { room, need })` | A frame or the socket's send buffer is smaller than the largest control frame inside one TLS record; `room` and `need` are byte counts. The TLS config's `max_fragment_size` can also cap a record below `need`. | Raise whichever is too small: `tx_capacity` or the path MTU on the local backend, the daemon's frame and record sizes on the junction backend, or `max_fragment_size`. |
 | `Config(SetupError::ForeignHandle)` | The stream belongs to another `Net`. | Pass the stream's own handle. |
 | `Failed(Failure::Dead)` | The socket was already closed or reset. | Treat as a lost connection. |
 
-switch-tls supports TLS 1.3 only. If the supplied rustls config also permits TLS 1.2 and the server negotiates it, `connect` returns `Handshake(msg)` rather than panicking. A TLS 1.3-only config rejects a TLS 1.2-only server during the rustls handshake instead, returning `Tls(e)`.
+switch-tls speaks TLS 1.3 only. A rustls config that allows only TLS 1.3 fails against a server without it during the handshake, with `Tls(e)`. If the config also allows an older version and the server picks it, `connect` fails with `Handshake(msg)`.
 
-A few upgrade failures are worth knowing by name. The upgrade response head may be at most 16 KiB; a longer one is `UpgradeError::HeadTooBig`. A server that selects an extension or a subprotocol fails with `UpgradeError::Unrequested`, since switch-ws asks for none. A response with the wrong `Sec-WebSocket-Accept` is `UpgradeError::WrongAccept`. Binance's servers answer HTTP 451 from restricted locations, which arrives as `Upgrade(UpgradeError::Status(Some(451)))`.
+A few upgrade failures are worth knowing by name. The upgrade response head may be at most 16 KiB; a longer one is `UpgradeError::HeadTooBig`. A server that selects an extension or a subprotocol fails with `UpgradeError::Unrequested`, since switch-ws asks for none. A response with the wrong `Sec-WebSocket-Accept` is `UpgradeError::WrongAccept`, and one that sends that header more than once is `UpgradeError::Duplicate`. Binance's servers answer HTTP 451 from restricted locations, which arrives as `Upgrade(UpgradeError::Status(Some(451)))`.
 
 `Error` implements `Display`, so `"{e}"` prints a readable line.
 

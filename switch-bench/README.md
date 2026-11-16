@@ -3,15 +3,16 @@
 See [Measuring latency under load](../book/src/measuring/index.md) in the switch book.
 
 Latency/load benchmark of the switch stack: open-loop generators (switch apps), a switch echo receiver, a fixed
-rate sweep, and a report. Design: `plans/bench/design.md`.
+rate sweep, and a report.
 
-Socket opening runs in switch tasks: UDP binding finishes while the host turns the Net before the
+Socket opening runs in switch tasks: UDP binding finishes while the host runs rounds (receive, poll, send) before the
 generator reports ready or the UDP server starts serving. TCP connect and accept futures report
 opening failures when polled. Send backpressure uses `switch_net::Error::Full`; UDP also pauses for
 `NeighborPending`.
-Conduit TCP/WS `Full` means one connection is flow-controlled. Junction TCP/WS `Full` means the
-shared session ingress ring is full, so the generator stops that poll's send batch and counts
-the unsent schedule as generator backlog rather than connection flow control.
+Conduit TCP/WS `Full` means one connection is flow-controlled: that sender's messages are owed.
+Junction TCP/WS `Full` means the shared send ring is full, so the generator stops that poll's send
+batch and counts a stop (`stops`), like a missing TX frame or a UDP `Full`/`NeighborPending`; the
+messages due then are not fresh sends and do not count toward `behind_schedule`.
 
 `gen` and `serve` accept `--backend conduit|junction` (default `conduit`). Conduit still requires
 `--config F` and owns the NIC in the app process. Junction requires `--junction-socket PATH` instead:
@@ -22,7 +23,7 @@ sizing; it never opens EAL or reads a NIC config. With `SWITCH_BENCH_XSTATS=1`, 
 xstats absent rather than reporting synthetic counters. Conduit's ENA allowance/reset counters do not
 establish whether junction was shaped or reset; that requires counters from junction's own run.
 UDP `serve` requests one junction session slot; TCP and WebSocket still request 320.
-WebSocket upgrade requests retain their frame and retry a full send ring between Net turns,
+WebSocket upgrade requests retain their frame and retry a full send ring between rounds,
 within the existing 10-second connection deadline.
 
 ```sh
@@ -62,7 +63,7 @@ taskset -c 3 switch-bench serve --backend junction --junction-socket /run/switch
   sweep, and every worker's process group is killed. A shutdown failure also kills all workers still awaiting
   shutdown, including their child processes, before returning the incomplete summary.
   Before each step every worker's wall clock is probed: one
-  more than 1 ms off the coordinator's fails the sweep, and so does a worker that gets a step after its start
+  more than 1 ms plus half the probe's round trip off the coordinator's fails the sweep, and so does a worker that gets a step after its start
   time (50 ms ahead). `--budget-us W` (TCP, ws): the first step runs without a budget and its median
   service round trip (echo time - actual send time) is the baseline; from then on each connection may have its
   rate share x (baseline + W) messages sent and not yet echoed. A message due beyond that waits, its latency
@@ -73,7 +74,7 @@ taskset -c 3 switch-bench serve --backend junction --junction-socket /run/switch
   stream cut back into messages. S must be at least 24 B. ws: N ws:// connections (a bench-only client over the same TCP halves:
   fixed-key upgrade, one masked binary frame per message, S at most 1400 B; the echo
   stream is cut into equal-size frames, and any other frame fails the worker). At most 32 tries
-  per poll, then the loop turns the Net; a message that waits keeps its scheduled time. A full TCP connection
+  per poll, then the loop runs the rest of the round (send, then the next receive); a message that waits keeps its scheduled time. A full TCP connection
   (or one at its budget) blocks only its own sender: its messages are owed and go out in order later, and
   their wait is the receiver's doing, not send lag. Latency = receive time - scheduled time (no coordinated
   omission); not echoed = measured messages not echoed by the end of the drain. Sending stops at the end of the
@@ -86,8 +87,9 @@ taskset -c 3 switch-bench serve --backend junction --junction-socket /run/switch
   `ws://`, not TLS.
 - `report.py DIR`: `report.md` (one step table per sweep), `results.json` and one SVG per sweep
   (latency quantiles and not echoed % against offered rate; a step with no echo stays on the plot). Exit 1 when
-  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, or a sweep
-  stopped because a sender fell behind. Python stdlib only; tests: `python3 switch-bench/test_report.py`.
+  incomplete: an expected sweep missing, a sweep without summary or with `complete: false`, a sweep
+  stopped because a worker was behind schedule (`<sweep>: sender behind schedule: worker(s) [..]`), or
+  placement errors. Each table also shows service RTT and send-lag p50/p99 and the generator packet ratios. Python stdlib only; tests: `python3 switch-bench/test_report.py`.
 
 Protocols: UDP, TCP, ws:// (no TLS). The binary's global allocator is mimalloc. AWS receiver and sender
 launches explicitly set `MIMALLOC_ALLOW_LARGE_OS_PAGES=0`, overriding an inherited value so mimalloc
@@ -108,7 +110,8 @@ routing between them (its side of each tap is the gateway). Runs, per protocol, 
 reads must end within seconds with 100% loss reported and a complete summary), then writes
 `switch-bench/out/smoke/report.md`; the make target fails if the report is incomplete. Every process's stderr is
 kept in `switch-bench/out/smoke/*.log`. It validates the tooling; net_tap numbers are not measurements.
-The smoke accepts a sweep that stops because a sender fell behind. A bridge does not work here: net_tap gives
+smoke.sh accepts a sweep that stops because a worker fell behind schedule and runs the remaining checks;
+report.py then marks that sweep incomplete and exits 1, so the make target fails. A bridge does not work here: net_tap gives
 the kernel side of a tap the switch MAC, which a bridge
 takes as its own and keeps the frames.
 

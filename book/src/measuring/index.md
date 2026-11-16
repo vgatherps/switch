@@ -49,7 +49,7 @@ A step holds one offered rate for a fixed time. A sweep is a list of steps at ri
 
 Messages scheduled during the warmup are sent but not measured. Messages scheduled in the measurement window are measured. When the window ends, sending stops, even for messages that are still owed: a step past the receiver's limit ends on time instead of running on. Echoes keep counting until the drain ends.
 
-Two numbers come out of each step. The latency percentiles (p50, p99, p99.9 and the maximum) cover every measured message that was echoed. The drop fraction is the share of measured messages that were not echoed by the end of the drain, and a message that was never sent counts as lost.
+Two numbers come out of each step. The latency percentiles (p50, p99, p99.9 and the maximum) cover every measured message that was echoed. The drop fraction is the share of measured messages that were not echoed by the end of the drain, and a message that was never sent counts as lost. Each step also reports the round trip measured from the actual send time, how late sends left, what each generator still owed when the step ended, and packet counts at the generators' NICs; [Reading a benchmark report](reports.md) shows them.
 
 By default a sweep's rates are `--rate-min` × (√2)^k for k = 0, 1, 2, ... up to `--rate-max`: each rate is about 1.41 times the last; `--rates` gives an explicit list instead.
 
@@ -73,11 +73,16 @@ All workers start a step at a common wall-clock time, worker g offset by g / rat
 
 ## When the generator is the limit
 
-A benchmark has to be sure the generator kept up; otherwise it measures the generator. After each step every generator reports whether it fell behind: whether it still had messages due that it had not sent (not counting those a blocked connection was holding), or whether the 99th percentile of its senders' send lag (actual send time minus scheduled time) was above 20 µs. If any generator fell behind, the step is marked sender-late (the `generator_bound` field in the output).
+A benchmark has to be sure the generator kept up; otherwise it measures the generator. The test is the send lag of fresh sends: the actual send time minus the scheduled time, for measured messages that went out straight off the timetable. A worker whose fresh-send lag has a 99th percentile above 20 µs is behind schedule, and the step is marked sender-late (the `generator_bound` field in the output).
 
-A sender-late step ends the sweep. The sweep exits with a nonzero status, and the report marks the step `SENDER-LATE`. The flag does not say whether the generator or receiver backpressure was the limit.
+Two kinds of message are not fresh, because their wait is not the generator's doing:
 
-How pushback shows up differs between the backends. On the local backend, a TCP connection whose send buffer is full blocks only its own sender; the messages it owes go out in order later, and their delay shows as latency and loss, not as sender lateness. On the junction backend, a full [send ring](../junction/index.md) (the shared memory the daemon reads sends from) stops every sender until the generator's next runtime poll, and the unsent messages count as the generator falling behind. Junction saturation can therefore show up as `SENDER-LATE`.
+- A message owed by a TCP or WebSocket connection that could not take it (its send buffer was full, or it was at its [budget](#budgeted-tcp-and-websocket-sweeps)). That connection's messages go out in order later; their delay shows as latency and loss.
+- A message that was already due when the transport refused a send for everyone: no frame was free to send in, a UDP send could not be queued, or, on the junction backend, the shared [send ring](../junction/index.md) was full. Such a refusal ends that batch of sends until the next round, and the generator counts it as a stop.
+
+So pushback from the receiver or the transport shows as latency, loss, stops and messages still owed at the end of the step, and it does not end the sweep.
+
+A sender-late step ends the sweep. The sweep's summary line names the workers that were behind, the sweep exits with a nonzero status, and the report marks the step `SENDER-LATE`.
 
 ## Budgeted TCP and WebSocket sweeps
 

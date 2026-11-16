@@ -42,7 +42,8 @@ The `PollReport` that `poll` returns has two fields. `tasks_polled` counts how m
    |
    |-- finish the pass that request_turn() cut short last time, if any
    |   pass 1: tasks woken or spawned since the last poll, then the yielded
-   |           tasks, then the tasks whose sleep just expired
+   |           tasks, then the tasks whose sleep just expired, earliest
+   |           deadline first
    |   pass 2: tasks woken or spawned during pass 1
    |   pass 3: ...
    |   (stop when no task is ready, when 1024 task polls were made,
@@ -69,17 +70,15 @@ The unit is yours. Tests often use small numbers, as on this page. Real programs
 
 ## Tasks woken before a poll run in it
 
-Anything that wakes or spawns a task between two polls is picked up by the next poll. This is how the network fits in: the loop first moves packets, which wakes the tasks waiting on them, and then polls, which runs those tasks.
+Anything that wakes or spawns a task between two polls is picked up by the next poll. This is how the network fits in: the loop's receive step takes in packets, which wakes the tasks waiting on them, and then the loop polls, which runs those tasks.
 
-In `switch/examples/manual_loop.rs`, `EventQueue` stands in for the network: `poll_nonblocking` spawns one task for each event waiting in it.
+In `switch/examples/manual_loop.rs`, `EventQueue` stands in for the network: `poll_nonblocking` spawns one task for each event waiting in it. `main` starts the runtime at tick 100 with one task that sleeps for 10 ticks (shown on [Time and sleeping](time.md)) and one event waiting, then polls at ticks 100, 100 and 110, pushing a second event just before the last poll:
 
 ```rust,ignore
 {{#include ../../../switch/examples/manual_loop.rs:tick_loop}}
 ```
 
-Two events are dispatched before the first poll, and that poll runs both tasks once. With no new events, the second poll has nothing to do and returns an empty report.
-
-The example's `main` drives the same queue together with a sleeping task (shown on [Time and sleeping](time.md)). Run it with `cargo run -p switch --example manual_loop`:
+Run it with `cargo run -p switch --example manual_loop`:
 
 ```text
 first event
@@ -90,7 +89,7 @@ deadline reached
 tick 110: PollReport { tasks_polled: 2, live_tasks: 0 }
 ```
 
-The event pushed before the third poll runs in that poll, together with the task whose sleep reached its deadline.
+The first poll runs the task for the first event and the sleeping task, which parks. The second poll has nothing new to run. Before the third poll the loop dispatches the second event, so that poll runs its task, and also the sleeping task, whose deadline it reached. The event's task comes first, because tasks spawned before the poll go ahead of tasks whose sleep expired.
 
 The opposite is also true. Work your loop does *after* a poll is not seen by any task until the following poll.
 
@@ -112,7 +111,7 @@ Sometimes a task knows that the loop should get control back now, before the res
 
 The request lasts for that one poll. Outside a poll, `request_turn()` does nothing.
 
-Application code rarely calls it. switch-net calls it for you: on the local backend, once tasks have handed the network stack a full burst of frames to send, it ends the poll so that the loop sends them sooner. [The drive loop](../net/drive-loop.md) describes when that happens.
+Application code rarely calls it. switch-net calls it for you: on the local backend, once tasks have handed the network stack a full burst of frames, it ends the poll so that the round's send step pushes them out sooner. [The drive loop](../net/drive-loop.md) describes when that happens.
 
 ## Writing the loop
 
@@ -133,7 +132,7 @@ In this run, the sum's ten slices, one per poll, finished before the other task'
 
 The tick is the time since `start` in nanoseconds, read once each time through the loop. After each poll the loop sleeps for 100 µs. That sleep is the loop's *idle strategy*, and it is up to you. There are two shapes in this repository.
 
-*Busy polling* goes straight back to the top of the loop. The thread never sleeps, so a woken task runs usually the next time through the loop, and a timer fires on the first poll at or after its deadline. This is what latency-sensitive programs do, on a CPU set aside for the loop (see [The pinned CPU and helper threads](../nic/cpus.md)). The benchmark tool `switch-bench` ([Measuring](../measuring/index.md)) works this way: each time through its loop it turns the network and polls the runtime, with no sleep.
+*Busy polling* goes straight back to the top of the loop. The thread never sleeps, so a woken task runs usually the next time through the loop, and a timer fires on the first poll at or after its deadline. This is what latency-sensitive programs do, on a CPU set aside for the loop (see [The pinned CPU and helper threads](../nic/cpus.md)). The benchmark tool `switch-bench` ([Measuring](../measuring/index.md)) works this way: each time through its loop it receives, polls the runtime and sends, with no sleep.
 
 *Sleeping when idle* checks whether the last time through the loop did anything and, if not, sleeps the thread for a short fixed time. `switch-binance-feed`, the market-data feed walked through in [Walkthrough: a market-data feed](../protocols/binance-feed.md), sleeps 1 ms after a time through its loop where nothing moved:
 
@@ -147,6 +146,6 @@ The runtime has no call that tells you when its next timer is due. A sleeping lo
 
 ## Where the network comes in
 
-A network program's loop does one more thing each time through: before polling the runtime, it turns the network, which receives packets, sends queued frames and wakes the tasks that were waiting on them. switch-net packages "turn, then poll" as one call, `switch_net::round`, and the loop that calls it is the [drive loop](../net/drive-loop.md). Everything on this page applies to it unchanged.
+A network program's loop polls the runtime in the middle of a *round* of three steps. The receive step takes in packets and wakes the tasks whose sockets became ready. The poll runs those tasks. The send step pushes out what they wrote, so a reply that a woken task queued leaves in the same round. switch-net packages the three steps as one call, `switch_net::round`, and the loop that calls it is the [drive loop](../net/drive-loop.md). Everything on this page applies to its poll step unchanged.
 
 Next: [Time and sleeping](time.md) explains timers in detail.

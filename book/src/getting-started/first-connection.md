@@ -50,7 +50,7 @@ A few values in this block deserve a word each:
 - `frame_share`, `rx_staging`, `tx_pending` and the two socket counts size the packet-buffer pools ([Packet-buffer pools](../nic/pools.md)). This program reserves one TCP socket and no UDP sockets.
 - The `None` passed to `open` means no helper CPUs: unless the pinned CPU is isolated, DPDK's helper threads share it ([The pinned CPU and helper threads](../nic/cpus.md)).
 - The closure passed to `open` is the clock it uses for the Stack's start time and while it waits for the gateway's ARP reply. It reads the same clock the drive loop uses.
-- `ingress_budget` in `NetConfig` is the most received packets one turn processes ([The drive loop](../net/drive-loop.md)).
+- `ingress_budget` in `NetConfig` is the most received packets one receive step processes ([The drive loop](../net/drive-loop.md)).
 
 The clock comes next. Everything in this program takes its time from one `std::time::Instant` taken at startup:
 
@@ -94,7 +94,7 @@ Nothing in the task touches the network directly. `try_send` only queues; packet
 {{#include ../../../switch-net/examples/tcp_client_local.rs:drive}}
 ```
 
-Each time through the loop, it calls `switch_net::round`, which does two things with one clock sample. First a **turn**: the Net takes in received packets, runs TCP's timers, sends what tasks queued, and wakes the tasks whose sockets changed. Then one poll of the runtime, which runs those tasks until they wait again.
+Each time through the loop, it calls `switch_net::round`, which runs one **round** with one clock sample. A round has three steps. The **receive** step takes in received packets and wakes the tasks whose sockets changed. The **poll** step runs the runtime, which runs those tasks until they wait again. The **send** step pushes out what the tasks wrote. Because send comes last, the line our task queues after waking leaves in the same round.
 
 ```text
         +---------------------------+
@@ -103,12 +103,16 @@ Each time through the loop, it calls `switch_net::round`, which does two things 
         +-------------+-------------+
                       v
         +---------------------------+
-        | Net::turn(now)            |   receive, timers, send,
+        | net.receive(now)          |   take in packets,
         |                           |   wake tasks whose sockets changed
         +-------------+-------------+
                       v
         +---------------------------+
-        | Runtime::poll(tick)       |   run woken tasks until they wait
+        | rt.poll(tick)             |   run woken tasks until they wait
+        +-------------+-------------+
+                      v
+        +---------------------------+
+        | net.send()                |   send what the tasks wrote
         +-------------+-------------+
                       v
              moved anything?
@@ -116,7 +120,7 @@ Each time through the loop, it calls `switch_net::round`, which does two things 
     loop again          sleep 1 ms, then loop again
 ```
 
-`round` returns whether anything moved. Here the loop sleeps for a millisecond when nothing did, because in this setup the kernel-side server shares the CPU. A latency-sensitive program calls `round` again at once instead, which is called **busy polling**. [The drive loop](../net/drive-loop.md) covers both, and what a turn does in detail.
+`round` returns whether anything moved. Here the loop sleeps for a millisecond when nothing did, because in this setup the kernel-side server shares the CPU. A latency-sensitive program calls `round` again at once instead, which is called **busy polling**. [The drive loop](../net/drive-loop.md) covers both, and what each step does in detail.
 
 ## Teardown
 
@@ -150,7 +154,7 @@ wait
 |---|---|
 | `tap.json`, the config file | [The network config file](../nic/config.md) |
 | `switch_open::open`, `Sizing` | [Opening the NIC from code](../nic/open.md), [Packet-buffer pools](../nic/pools.md) |
-| `round`, turns, the clock, busy polling | [The drive loop](../net/drive-loop.md) |
+| `round` and its receive, poll and send steps, the clock, busy polling | [The drive loop](../net/drive-loop.md) |
 | `tcp_connect`, the local port | [Opening sockets](../net/opening.md) |
 | `tx_frame`, `truncate`, `freeze`, received frames | [Frames](../net/frames.md) |
 | `room`, `try_send`, `recv`, `shutdown`, `delivered` | [TCP streams](../net/tcp.md) |

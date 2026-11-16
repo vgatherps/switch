@@ -45,7 +45,7 @@ sum = 49995000
 
 ## When a sleep fires
 
-A sleep completes during the first poll whose tick is at or past its deadline. That poll wakes the task. It runs in the same poll unless the poll ends first, after 1024 task polls or because a task asked for a turn; then it runs in the next one.
+A sleep completes during the first poll whose tick is at or past its deadline. That poll wakes the task. It runs in the same poll unless the poll ends first, after 1024 task polls or because a task called `request_turn`; then it runs in the next one. When several sleeps reach their deadlines in the same poll, their tasks are woken earliest deadline first, and run in that order after the tasks that were already ready.
 
 A sleep whose deadline is already at or before the runtime's tick completes the first time it is awaited, without parking. For example, a task that awaits `sleep_until(110)` on a runtime already at tick 110 runs to the end in a single poll.
 
@@ -83,9 +83,5 @@ assert_eq!(
 ```
 
 `sleep_until` never returns `DeadlineOverflow`, since its deadline is given directly.
-
-## Reserving timer space
-
-`Runtime::with_capacity(initial_tick, Capacity { tasks, timers })` creates a runtime with room reserved up front for `timers` timers and a ready queue of `tasks` entries. It is only a reservation: the runtime grows past it as needed, and behaves the same either way. `Runtime::new(tick)` reserves 64 queue entries and no timers.
 
 Next: [Tasks working together, and other threads](cooperating.md).

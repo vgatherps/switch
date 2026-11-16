@@ -10,7 +10,7 @@ Three properties shape every program that uses the Stack directly.
 
 It runs on one thread. The thread that starts DPDK owns the `Eal`, the `Port`, the `Stack`, every socket handle, and every frame and datagram the Stack hands out. All of them must be used and dropped on that thread. `Eal`, `TcpHandle` and `UdpHandle` are not `Send`, so the compiler enforces most of this.
 
-It reads no clock. Each call that does network work takes the current time as an argument, in microseconds, and the time must never go backwards. You choose the clock; the [drive loop page](drive-loop.md) shows the pattern.
+It reads no clock. `Stack::new`, `receive` and `turn` take the current time as an argument, in microseconds, and the time must never go backwards. `send` and `flush` reuse the latest accepted time. You choose the clock; the [drive loop page](drive-loop.md) shows the pattern.
 
 It never waits. No call blocks or sleeps. A call does the work that is possible now and returns. Your loop calls it again, either at once (busy polling on a pinned CPU) or after a short sleep.
 

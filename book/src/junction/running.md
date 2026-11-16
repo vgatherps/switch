@@ -115,7 +115,7 @@ The daemon prints no ready message. Startup goes in this order:
 
 SIGINT or SIGTERM stops the daemon. It stops polling, tells each connected session that the daemon is shutting down, drops all sockets, closes the NIC port, removes `control.sock` and the ring files, and exits with status 0. Only `lock` stays in the directory.
 
-An application sees the shutdown as session loss: switch-net's `Net::turn` returns `TurnError::HostLost`, and a raw `Session` poll returns `Lost::Ended(EndReason::HostShutdown)`. The shutdown notice is sent on a best-effort basis, so an application can see `Lost::Disconnected` instead. Treat both the same way. [Closing sockets and ending a session](closing.md) describes what to do on loss.
+An application sees the shutdown as session loss: in switch-net, the receive step of the next round returns `TurnError::HostLost` (from `switch_net::round`, as `RoundError::Turn`), and a raw `Session` poll returns `Lost::Ended(EndReason::HostShutdown)`. The shutdown notice is sent on a best-effort basis, so an application can see `Lost::Disconnected` instead. Treat both the same way. [Closing sockets and ending a session](closing.md#handling-loss) describes what to do on loss.
 
 If the daemon is killed with SIGKILL or crashes, it cannot notify anyone or clean up. Applications see `Lost::Disconnected`, and the ring files stay in the directory until the next daemon started there removes them.
 

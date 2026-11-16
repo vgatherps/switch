@@ -68,11 +68,11 @@ The main use is after the peer broke the protocol, as in the [echo server](ws-se
 
 ## Failures
 
-Once a connection is up, a failure is reported as `Error::Failed(failure)`. The first failure is kept: every later `send`, `close` and `recv` returns the same one. Before `recv` returns it, the connection delivers whatever it still owes the peer (a TLS alert, close_notify, FIN), so you may drop the connection as soon as you have the error. If the peer may still be sending, call `linger` first so the drop sends no reset ([Ending without a close frame](#ending-without-a-close-frame)).
+Once a connection is up, a failure is reported as `Error::Failed(failure)`; `recv`, `recv_with_sender` and `linger` report no other error. The first failure is kept: every later `send`, `close` and `recv` returns the same one. Before `recv` returns it, the connection delivers whatever it still owes the peer (a TLS alert, close_notify, FIN), so you may drop the connection as soon as you have the error. If the peer may still be sending, call `linger` first so the drop sends no reset ([Ending without a close frame](#ending-without-a-close-frame)).
 
 | Failure | What happened | What the connection sent before reporting it |
 |---|---|---|
-| `Failure::Protocol(e)` | The peer broke the WebSocket protocol; `e` is a `ProtocolError` naming what (bad reserved bits, an unmasked client frame, invalid UTF-8 in a text message, a frame or message over your `Limits`, ...). | No close frame. close_notify (on `wss://`) and FIN. |
+| `Failure::Protocol(e)` | The peer broke the WebSocket protocol; `e` is a `ProtocolError` naming what (bad reserved bits, an unmasked client frame, invalid UTF-8 in a text message, a message over your `max_message`, a control frame over 125 bytes, ...). | No close frame. close_notify (on `wss://`) and FIN. |
 | `Failure::PeerEof` | The peer ended the stream (FIN, or close_notify on `wss://`) before sending a WebSocket close. | close_notify (on `wss://`) and FIN. |
 | `Failure::Tls(switch_tls::Error::Truncated)` | On `wss://`: TCP ended without close_notify. | FIN; no close_notify. |
 | `Failure::Tls(switch_tls::Error::Tls(e))` | On `wss://`: a TLS record from the peer failed. | The TLS alert and FIN; no close_notify. |

@@ -27,12 +27,13 @@ A task asks its handle for an empty frame with `handle.tx_frame().await`, writes
                                          tx.try_send(frame) / tx.send(to, frame)
                                          error: you get the same frame back
                                          local TCP:   the socket holds it until the peer ACKs it
+                                                      (a small frame may be copied and freed)
                                          junction:    bytes copied into the send ring, frame freed
 ```
 
-The frame comes from a fixed pool. On the local backend it is the Stack's frame pool, shared by every socket, and each frame's `len()` is the IP MTU minus 28 (the IP and UDP headers). That length suits a UDP datagram. A TCP segment is shorter, so for TCP fill at most `tx.max_segment_payload()` bytes; a full-size frame is always copied when sent ([TCP streams](tcp.md#sending)). On the junction backend it is a pool inside switch-net with `RemoteConfig::tx_frames` buffers, each as large as the daemon's frame capacity (`Session::frame_capacity`).
+The frame comes from a fixed pool. On the local backend it is the Stack's frame pool, shared by every socket, and each frame's `len()` is the IP MTU minus 28 (the IP and UDP headers). That length suits a UDP datagram. A TCP segment is shorter, so a full-size frame goes out as more than one segment; filling at most `tx.max_segment_payload()` bytes keeps each frame to one segment ([TCP streams](tcp.md#sending)). On the junction backend it is a pool inside switch-net with `RemoteConfig::tx_frames` buffers, each as large as the daemon's frame capacity (`Session::frame_capacity`).
 
-When the pool is empty, `tx_frame().await` waits. The first turn that finds a free frame wakes every waiting task, and a task may find the pool empty again if another took the frame first; it then waits again. [Packet-buffer pools](../nic/pools.md) explains how big the local pool is.
+When the pool is empty, `tx_frame().await` waits in line. Each receive step wakes as many of the waiting tasks, longest-waiting first, as the pool has free frames. A woken task that finds the frame already taken by another task waits again, at the back of the line. [Packet-buffer pools](../nic/pools.md) explains how big the local pool is.
 
 Sending never hands a frame to a future. You queue it with the synchronous `try_send` (TCP) or `send` (UDP), and on any error you get the same frame back to retry later. A cancelled task never loses a filled frame.
 
@@ -54,7 +55,7 @@ A frame you keep holds its packet buffer until the last clone drops, and the buf
 
 On the local backend, a received TCP or UDP frame holds a packet buffer from the Stack's RX pool, the buffers the NIC receives into. Holding many of them leaves fewer for arriving packets. A UDP frame also holds one place in its socket's receive queue (`UdpConfig::rx_queue`) until it is dropped. Holding TCP frames does not shrink the window the socket advertises, and later data on the connection still arrives. The test `held_frames_do_not_block_later_data` in the same file shows it on both backends: a task keeps every frame of 64 KiB of data, more than the socket's `rx_capacity`, and still receives all of it.
 
-On the junction backend, received frames live in the session's receive ring, the shared memory the daemon writes received packets into. Ring space is reused only after the frames in it are dropped and a later turn reclaims it. That space is shared by every socket of the session, so one task holding frames for a long time can fill the ring for all of them. [What applications share](../junction/sharing.md) describes the effect.
+On the junction backend, received frames live in the session's receive ring, the shared memory the daemon writes received packets into. Ring space is reused only after the frames in it are dropped and a later receive step reclaims it. That space is shared by every socket of the session, so one task holding frames for a long time can fill the ring for all of them. [What applications share](../junction/sharing.md) describes the effect.
 
 ## Hardware receive timestamps
 

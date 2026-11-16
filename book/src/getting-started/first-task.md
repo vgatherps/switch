@@ -105,11 +105,11 @@ Every switch program has this shape:
    poll(tick)  ------------------->  wake timers whose deadline <= tick
                                      run every ready task until it awaits
                <-------------------  return PollReport
-   (do other work: turn the network,
-    sleep a little, or go straight
-    back to the top)
+   (do other work: receive and send
+    packets, sleep a little, or go
+    straight back to the top)
 ```
 
-The runtime does not sleep, read a clock or start threads. Nothing happens between two calls to `poll`. You decide how often to call it, what tick to pass, and what else the loop does between calls. In a network program, the other thing the loop does is move packets, and [Your first network program](first-connection.md) adds exactly that.
+The runtime does not sleep, read a clock or start threads. Nothing happens between two calls to `poll`. You decide how often to call it, what tick to pass, and what else the loop does between calls. In a network program, the other thing the loop does is receive and send packets, and [Your first network program](first-connection.md) adds exactly that.
 
 Next: [Setting up a build environment](environment.md) prepares the Linux environment that network programs need. For the full story of the runtime, read [The switch runtime](../runtime/index.md); for timers in depth, [Time and sleeping](../runtime/time.md).

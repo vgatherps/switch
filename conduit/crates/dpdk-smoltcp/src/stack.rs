@@ -336,8 +336,7 @@ impl Stack {
     /// ingress and egress when frames are pending. Without TX backpressure both
     /// put the same frames on the wire with the same combined counters. When
     /// the pending queue or the TX ring is full, that flush can let more frames
-    /// through in the same loop iteration: `tx_accepted` and `tx_pending`
-    /// differ, and so can a later call's `rx_staged`.
+    /// through in the same loop iteration: `tx_accepted` and `tx_pending` differ.
     ///
     /// Panics as described in [Panics](Stack#panics).
     pub fn turn(&mut self, now: Instant, ingress_budget: usize) -> Result<Turn, StackError> {
@@ -360,8 +359,8 @@ impl Stack {
     /// one difference from `turn`, which runs egress before its final flush:
     /// under TX backpressure (pending queue or TX ring full) `receive` then
     /// `send` can let more frames through in this loop iteration than `turn`,
-    /// with different `tx_accepted` and `tx_pending`, and so a different
-    /// `rx_staged` in a later call.
+    /// with different `tx_accepted` and `tx_pending`. Ingress never waits for TX
+    /// room: a reply built while receiving that finds none is dropped.
     ///
     /// Panics as described in [Panics](Stack#panics).
     #[inline]
@@ -716,13 +715,13 @@ impl Stack {
     }
 
     /// Queue `frame` on the socket by value (`tcp::Socket::send_frame`); it
-    /// leaves in a later egress (`send` or `turn`). On success the socket holds
-    /// the frame until the peer ACKs its last byte. Errors return the frame
+    /// leaves in a later egress (`send` or `turn`). A frame that fits whole into the
+    /// unsent tail frame within one segment is copied there and freed at once; any
+    /// other becomes its own send-queue entry, held until the peer ACKs its last byte,
+    /// and one longer than the segment payload is cut at send. Errors return the frame
     /// untouched: `Foreign` when it came from another Stack's `tx_frame`,
     /// `InvalidState` unless the socket may send, `Empty` for a zero-length
-    /// frame, and `Full` when it exceeds the socket's free bytes. A frame that fits whole into the unsent
-    /// tail frame within one segment is copied there and freed; any other takes a
-    /// queue entry, and one longer than the segment payload is cut at send.
+    /// frame, and `Full` when it exceeds the socket's free bytes.
     pub fn tcp_send_frame(
         &mut self,
         handle: &TcpHandle,

@@ -1002,7 +1002,7 @@ pub struct TcpTx(Half, Option<usize>);
 
 impl TcpTx {
     /// `Future<Output = Result<(), Error>>`: `Ok` once a frame of `len`
-    /// bytes fits (free bytes and a free frame slot), so `try_send` of such a
+    /// bytes fits in the socket's free send bytes, so `try_send` of such a
     /// frame succeeds until the next `Net::receive`; `Err(InvalidState)` once the
     /// socket can no longer send (reset, closed, or after `shutdown`);
     /// `Err(TooLarge)` on the first poll if `len` exceeds the socket's send capacity
@@ -1039,7 +1039,9 @@ impl TcpTx {
 
     /// The effective MSS cached when this stream was handed to the task.
     /// `None` if an accepted connection was already closed at completion; otherwise
-    /// it stays `Some` even after close or reset. Larger frames are cut and copied on send.
+    /// it stays `Some` even after close or reset. Larger frames are split into segments:
+    /// cuts within one queued frame need no intermediate copy, but are copied into outgoing
+    /// packets. Segments spanning queued frames also need a copy to join their bytes first.
     pub fn max_segment_payload(&self) -> Option<usize> {
         self.1
     }
@@ -1201,7 +1203,7 @@ pub struct UdpTx(Half);
 impl UdpTx {
     /// Sends `frame` as one datagram to `to`. `None` returns `NoDestination`:
     /// switch-net UDP sockets have no default destination. Every error returns
-    /// the same frame; `Full` (TX queue full) clears after a turn.
+    /// the same frame; retry `Full` (send queue full) after a round.
     pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
         let Inner::Local(inner) = &mut *inner else {

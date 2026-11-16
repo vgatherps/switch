@@ -2,33 +2,43 @@
 
 The Stack does nothing on its own. Packets arrive in the NIC's receive ring and wait there; timers come due and nothing notices; data you queued sits in the socket. All of that happens only when your loop calls the Stack. This page explains the calls that do the work, what they report, how time is passed in, and how a loop can sleep without missing anything.
 
-If you use switch-net, `Net::turn` makes these calls for you and [the drive loop](../net/drive-loop.md) in the switch-net chapter is the page to read. This page is for programs that call the Stack directly, such as one whose Stack was built on the [previous page](by-hand.md), and for readers who want to know what a turn does underneath.
+If you use switch-net, `switch_net::round` makes these calls for you and [the drive loop](../net/drive-loop.md) in the switch-net chapter is the page to read. This page is for programs that call the Stack directly, such as one whose Stack was built on the [previous page](by-hand.md), and for readers who want to know what switch-net's receive and send steps do underneath.
 
-## `turn`: the network work of one call
+## Receive, your work, then send
 
-`stack.turn(now, ingress_budget)` does a bounded amount of everything the Stack has to do, in this order:
+Each time through the loop, a program that drives the Stack does three things in order:
+
+1. `stack.receive(now, ingress_budget)` takes in arriving packets.
+2. Your code reads and writes its sockets.
+3. `stack.send()` builds and sends what the sockets want to send, including what your code just wrote.
+
+The receive step does, in order:
 
 1. Once a second, run DPDK's timers.
-2. Check for a pending device reset and recover the NIC port (every call).
+2. Check for a pending device reset and recover the NIC port.
 3. Hand packets waiting in the pending queue to the NIC driver (a flush).
 4. Take one burst of arriving packets from the NIC.
 5. Ingress: process up to `ingress_budget` received packets. TCP segments go to their sockets, ARP requests get replies, and so on.
-6. Egress: build the packets sockets want to send (data, ACKs, retransmissions, SYNs, FINs).
-7. Flush again.
+6. If the RX pool is below its low mark, release out-of-order TCP data until it is back (see [packet-buffer pools](../nic/pools.md#running-dry)).
+7. Flush again if packets are pending, so resets, immediate ACKs and ARP replies built while processing received packets go to the NIC before your code runs.
 
-`now` is the current time. `ingress_budget` caps how many received packets this call processes; packets beyond it wait in the Stack's staging queue for the next call. The programs in this repository use 32 (the tap echo harness and the first Stack client) or 128 (the benchmark and the daemon).
+The send step does egress, building the packets sockets want to send (data, ACKs, retransmissions, SYNs, FINs), and then a flush.
 
-A loop that only calls `turn` looks like this, from the tap echo harness:
+`now` is the current time. `ingress_budget` caps how many received packets the receive step processes; packets beyond it wait in the Stack's staging queue for the next one. The programs in this repository use 32 (the tap echo harness and the Stack client) or 128 (the benchmark and the daemon). Receiving never waits for room to send: a reply built while receiving that finds no room in the pending queue or the TX pool is dropped, and TCP recovers it the usual way.
+
+The [complete client](index.md#a-complete-client) from the start of this part uses this shape:
 
 ```rust,ignore
-{{#include ../../../conduit/crates/switch-tap-echo/src/lib.rs:serve_loop}}
+{{#include ../../../conduit/crates/switch-open/examples/tcp_client.rs:loop}}
 ```
 
-Each time through the loop it takes the time, turns, lets the application read and write its sockets (`echo.step`), and then either goes round again at once or sleeps. Sleeping is covered [below](#sleeping-safely).
+Because your code runs between the two steps, a reply to data that just arrived leaves before the loop comes round again. There is one cost. Everything egress builds leaves only in `send`, and that includes SYN-ACKs, retransmissions, delayed ACKs and window updates. Keep the work between `receive` and `send` short, or connection setup and retransmissions wait for it.
 
-## `receive`, your work, then `send`
+`send` runs at the time given to the last `receive` (or `turn`, or `Stack::new`). It needs no `receive` before it, and calling it with nothing to send does nothing.
 
-`turn` builds outgoing packets before your code runs. Whatever your code writes after `turn` returns waits for the next time through the loop. A server that wants its reply to leave before the loop comes round again splits the turn in two:
+## `turn`: both steps in one call
+
+`stack.turn(now, ingress_budget)` does the receive step and the send step together, with egress taking the place of the receive step's last flush. Your code then runs after both, so whatever it writes waits for the next time through the loop:
 
 ```text
  turn(now)                            receive(now) ... your code ... send()
@@ -44,17 +54,13 @@ Each time through the loop it takes the time, turns, lets the application read a
  (leaves next time through)           flush       code just wrote
 ```
 
-`receive(now, ingress_budget)` does the first half: timers, the reset check, a flush, the receive burst and ingress, then one more flush if packets are pending. So resets, immediate ACKs and ARP replies built while processing received packets go to the NIC before your code runs. `send()` does the second half: egress and a flush. Whatever your code wrote since `receive` leaves here.
-
-The [complete client](index.md#a-complete-client) from the start of this part uses this shape:
+A loop that calls `turn` looks like this, from the tap echo harness:
 
 ```rust,ignore
-{{#include ../../../conduit/crates/switch-open/examples/tcp_client.rs:loop}}
+{{#include ../../../conduit/crates/switch-tap-echo/src/lib.rs:serve_loop}}
 ```
 
-There is one cost. Everything egress builds leaves only in `send`, and that includes SYN-ACKs, retransmissions, delayed ACKs and window updates. Keep the work between `receive` and `send` short, or connection setup and retransmissions wait for it.
-
-`send` runs at the time given to the last `turn` or `receive` (or `Stack::new`). It needs no `receive` before it, and calling it with nothing to send does nothing.
+Each time through the loop it takes the time, calls `turn`, lets the application read and write its sockets (`echo.step`), and then either goes round again at once or sleeps. Sleeping is covered [below](#sleeping-safely).
 
 ## `flush`
 
@@ -62,7 +68,7 @@ There is one cost. Everything egress builds leaves only in `send`, and that incl
 
 ## Budget and counters
 
-`turn` and `receive` return a `Turn`; `send` and `flush` return a `Sent`:
+`receive` and `turn` return a `Turn`; `send` and `flush` return a `Sent`:
 
 | Field | Meaning |
 |---|---|
@@ -75,7 +81,7 @@ There is one cost. Everything egress builds leaves only in `send`, and that incl
 
 `Turn::moved()` is true when the call received, rejected, processed or sent anything. A call where it is false was idle.
 
-`rx_staged > 0` after a call means either the budget ran out, or there was no room to build a reply (the pending queue or the TX pool was full). Call again promptly. `tx_pending > 0` means the driver did not take everything; call `flush` until nothing is pending, then `send`.
+`rx_staged > 0` after a call means the budget ran out; call again promptly. `tx_pending > 0` means the driver did not take everything; call `flush` until nothing is pending, then `send`.
 
 ## Sleeping safely
 
@@ -87,9 +93,9 @@ On a pinned CPU the simplest loop never sleeps: it calls the Stack again at once
 
 ## Time
 
-Every call that does network work takes the time as a `smoltcp::time::Instant`, re-exported as `dpdk_smoltcp::smoltcp::time::Instant`. It counts microseconds as an `i64`.
+`Stack::new`, `receive` and `turn` take time as a `smoltcp::time::Instant`, re-exported as `dpdk_smoltcp::smoltcp::time::Instant`. It counts microseconds as an `i64`.
 
-The rules are simple and strict. The start time passed to `Stack::new` must be zero or more. After that, the time given to `turn` and `receive` must never go backwards; the same time twice is fine. An earlier time returns `StackError::TimeWentBackwards { last, now }` before doing any work. `send` and `flush` take no time argument and reuse the last one.
+The rules are simple and strict. The start time passed to `Stack::new` must be zero or more. After that, the time given to `receive` and `turn` must never go backwards; the same time twice is fine. An earlier time returns `StackError::TimeWentBackwards { last, now }` before doing any work. `send` and `flush` take no time argument and reuse the last one.
 
 Use one clock for every call. The repository's pattern takes a `std::time::Instant` once, just before creating the Stack at `Instant::ZERO` (or before calling `open`), and reports the microseconds elapsed since:
 
@@ -101,9 +107,9 @@ Take time from your one clock, not from `smoltcp::time::Instant::now()`, which r
 
 ## When a drive call fails or panics
 
-`turn`, `receive`, `send` and `flush` return `StackError` on failure. `TimeWentBackwards` changes nothing; fix the clock and continue. `StackError::Port` means the NIC driver failed, or the port could not be recovered after a reset. The port is then not ready and later calls fail too: close the Stack.
+`receive`, `turn`, `send` and `flush` return `StackError` on failure. `TimeWentBackwards` changes nothing; fix the clock and continue. `StackError::Port` means the NIC driver failed, or the port could not be recovered after a reset. The port is then not ready and later calls fail too: close the Stack.
 
-A device reset is something a NIC driver can ask for after a fault. ENA, the AWS NIC driver, does so from a health watchdog that runs among DPDK's timers, which the Stack runs once a second. Every `turn` and `receive` checks whether a reset is pending, and if so resets and restarts the port before the receive burst. Packets the device held return to their pools, sockets and the ARP cache are untouched, and TCP retransmits whatever the device dropped. `dpdk_smoltcp::port_resets()` counts recoveries in the process.
+A device reset is something a NIC driver can ask for after a fault. ENA, the AWS NIC driver, does so from a health watchdog that runs among DPDK's timers, which the Stack runs once a second. Every `receive` and `turn` checks whether a reset is pending, and if so resets and restarts the port before the receive burst. Packets the device held return to their pools, sockets and the ARP cache are untouched, and TCP retransmits whatever the device dropped. `dpdk_smoltcp::port_resets()` counts recoveries in the process.
 
 A panic that unwinds out of a drive call leaves the Stack unusable. The only things you may still do are drop it or call `into_port`. The [errors page](errors.md) lists the panics.
 
@@ -113,7 +119,7 @@ A few TCP behaviours follow from the drive loop and the Stack's TCP settings:
 
 | Behaviour | Value |
 |---|---|
-| Retransmission timeout | 300 ms base (`set_rto`), backing off to at most 60 s |
+| Retransmission timeout | 300 ms until the connection has measured its round-trip time; then the smoothed round-trip time plus the larger of four times its variation and 50 ms. Each timeout doubles it, up to 60 s. |
 | Delayed ACK | 10 ms by default; `set_ack_delay(None)` turns it off, `ack_now()` sends an owed ACK at the next egress |
 | TIME-WAIT | 10 s |
 | Keepalive | none; an idle connection sends nothing |

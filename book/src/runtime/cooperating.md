@@ -1,12 +1,12 @@
 # Tasks working together, and other threads
 
-Tasks on one runtime share a thread, so they cooperate rather than compete: a task runs until it awaits, and then another gets the thread. [Time and sleeping](time.md) showed one thing a task can wait for. This page covers the tools tasks use with each other (yielding, oneshot channels and join handles), the one tool for waking a task from another thread, and the rules about threads that the runtime enforces.
+Tasks on one runtime share a thread, so they cooperate rather than compete: a task runs until it awaits, and then another gets the thread. [Time and sleeping](time.md) showed one thing a task can wait for. This page covers the tools tasks use with each other (yielding, oneshot channels and join handles), how another thread wakes a task, and the rules about threads.
 
 ## Yielding
 
 `switch::yield_now().await` gives the thread back without waiting for anything. The task stays ready, but it runs again in the *next* poll of the runtime, not in a later pass of the current one.
 
-That is deliberate. Between the current poll and the next one, your loop gets control back and can do its other work, such as moving packets. A task that yields therefore lets the network make progress, not only the other tasks. [Driving the runtime](driving.md#fairness-no-task-is-interrupted) shows a task that splits long work into slices this way.
+That is deliberate. Between the current poll and the next one, your loop gets control back and can do its other work, such as receiving and sending packets. A task that yields therefore lets the network make progress, not only the other tasks. [Driving the runtime](driving.md#fairness-no-task-is-interrupted) shows a task that splits long work into slices this way.
 
 If something else wakes the yielded task during the same poll (a oneshot send, a socket becoming ready), that wake takes priority and the task runs again in the current poll's next pass.
 
@@ -56,9 +56,11 @@ A stored waker may outlive the task it points to. Waking it is still safe. If no
 
 ## Waking a task from another thread
 
-Sometimes a task waits for something another thread produces: a value computed off the network CPU, or a signal from a control thread. The only way to wake a switch task from another thread is a `switch::RemoteWaker`.
+Sometimes a task waits for something another thread produces: a value computed off the network CPU, or a signal from a control thread. There are two ways to wake a switch task from another thread, and both behave the same.
 
-`RemoteWaker::new(cx)`, like `StoredWaker::new`, takes the `Context` of a running switch task. The resulting handle is `Copy`, `Send` and `Sync`, so it can go to any thread. To reach the `Context` from inside an `async fn`, wrap the waiting step in `std::future::poll_fn`:
+The first is the task's standard `Waker`, the one in the `Context` its futures are polled with. It may be cloned, dropped and woken on any thread. Code written for other async runtimes, which hands its waker to a background thread and wakes it from there, works unchanged.
+
+The second is a `switch::RemoteWaker`, a small handle that is `Copy`, `Send` and `Sync`. `RemoteWaker::new(cx)`, like `StoredWaker::new`, takes the `Context` of a running switch task. To reach the `Context` from inside an `async fn`, wrap the waiting step in `std::future::poll_fn`:
 
 ```rust,ignore
 {{#include ../../../switch/examples/remote_wake.rs:task}}
@@ -103,7 +105,7 @@ A wake from another thread does not run anything on that thread, and it does not
 
 So the delay before the task runs is however long your loop takes to reach its next poll. A busy-polling loop picks the wake up the next time through the loop; a loop that sleeps when idle picks it up after its sleep.
 
-On the task's own thread, `RemoteWaker::wake` is an ordinary wake. After the runtime has shut down, a wake from any thread is dropped. As with `StoredWaker`, a stale handle at most gives whichever task took the old task's place one extra poll.
+A wake through the standard `Waker` from another thread takes the same path. On the task's own thread, both kinds of wake are ordinary wakes. After the runtime has shut down, a wake from any thread is dropped. As with `StoredWaker`, a stale handle at most gives whichever task took the old task's place one extra poll.
 
 Every way of waking a task ends in the same set of ready tasks. Wakes from the runtime's own thread take effect at once; wakes from other threads wait in the mailbox until the next poll:
 
@@ -115,17 +117,15 @@ Every way of waking a task ends in the same set of ready tasks. Wakes from the r
  a Sleep reaching its deadline  ----+--> ready tasks --> run by a poll
  a oneshot send or drop  ----------'          ^
                                               |
- RemoteWaker::wake() on another thread --> mailbox, emptied at the
-                                           start of the next poll
+ std Waker or RemoteWaker woken   --> mailbox, emptied at the
+ on another thread                    start of the next poll
 ```
 
 ## The thread rules
 
-The runtime checks the thread rules at run time where the compiler cannot.
+The runtime's types (`Runtime`, `Spawner`, `Sleep`, `SpawnToken`, `JoinHandle`, `StoredWaker`, and both oneshot halves) are not `Send`, so the compiler keeps them on their thread. Only the standard `Waker` and `RemoteWaker` cross threads.
 
-Each task's standard `Waker`, the one in its `Context`, belongs to the runtime's thread. Waking it, cloning it or dropping it on another thread panics with "waker used on foreign thread". This matters when you combine switch tasks with code written for other runtimes: a future that sends its waker to a background thread, as many channel and I/O libraries do, will panic. Futures that keep their waker on the same thread work. Use `RemoteWaker` for anything that crosses threads.
-
-The runtime's types themselves (`Runtime`, `Spawner`, `Sleep`, `SpawnToken`, `JoinHandle`, `StoredWaker`, and both oneshot halves) are not `Send`, so the compiler keeps them on their thread.
+`StoredWaker::new` and `RemoteWaker::new` must be called on the runtime's thread, as they are when a future calls them from its `poll`. Called with a task's `Context` on another thread, they panic.
 
 Over the life of a process, at most 65,535 distinct threads can spawn switch tasks; the next thread that tries panics. A program that starts short-lived threads, each spawning tasks, counts every one of them against this limit.
 

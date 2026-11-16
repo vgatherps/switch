@@ -16,7 +16,7 @@ Connections are accepted as on [Accepting](../net/opening.md#accepting): each `t
 pub async fn accept_ws(handle: &NetHandle, stream: TcpStream, limits: Limits) -> Result<Ws, Error>
 ```
 
-`accept_ws` reads the client's HTTP request and, if it is a valid WebSocket upgrade, answers `101 Switching Protocols` and returns a `Ws`. It accepts any valid upgrade, whatever the path, and selects no extension and no subprotocol. A request that is not a valid WebSocket upgrade (not a GET, not HTTP/1.1, no `Sec-WebSocket-Key`, a version other than 13, a head over 16 KiB, ...) returns `Error::Upgrade` with the reason, and nothing is sent back. The setup errors from [the client page](wss-client.md#when-it-fails) (`Config(RoomTooSmall)`, `Config(ForeignHandle)`, `Failed(Dead)`) apply here too.
+`accept_ws` reads the client's HTTP request and, if it is a valid WebSocket upgrade, answers `101 Switching Protocols` and returns a `Ws`. It accepts any valid upgrade, whatever the path, and selects no extension and no subprotocol. A request that is not a valid WebSocket upgrade (not a GET, not HTTP/1.1, no `Sec-WebSocket-Key` or more than one, a version other than 13, a head over 16 KiB, ...) returns `Error::Upgrade` with the reason, and nothing is sent back. The setup errors from [the client page](wss-client.md#when-it-fails) (`Config(RoomTooSmall)`, `Config(ForeignHandle)`, `Failed(Dead)`) apply here too.
 
 For a WebSocket server, the task that serves an accepted stream first passes it to `accept_ws`, where the TCP example's `serve` task starts its byte echo. In switch-bench's server that line is:
 

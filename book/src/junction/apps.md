@@ -91,8 +91,11 @@ until [ -S /tmp/jn/control.sock ] && ip link show jn0 >/dev/null 2>&1; do sleep 
 ip addr add 10.77.0.1/24 dev jn0 && ip link set jn0 up
 
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
+until [ -n "$(ss -H -ltn 'sport = :7000')" ]; do sleep 0.1; done
 taskset -c 3 target/release/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7000
 ```
+
+The `ss` check waits until the kernel server is listening before the client connects.
 
 The client prints the server's reply and then `session finished`:
 
@@ -101,15 +104,16 @@ tick
 session finished
 ```
 
-Running the client again within about 10 seconds against the same server fails with `PortInUse`. The client closed the connection first, so the daemon's Stack keeps it, with local port 40000, in TCP's TIME-WAIT state for 10 seconds, and the new connection would use the same addresses and ports.
+The Python server exits after one exchange. Start it again before running the client again; without a listening server, the client reports `connection refused`. Here the server closes first, and the client closes its side after receiving the server's end-of-stream.
 
 ## Two applications at once
 
-The daemon exists so that several programs can use one NIC. With the daemon still running, and at least 10 seconds after the first run (for the reason just given), start two one-shot servers and two clients, the second on CPU 1:
+The daemon exists so that several programs can use one NIC. With the daemon still running, start two one-shot servers and two clients, the second on CPU 1:
 
 ```sh
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7001)); c, _ = s.accept(); c.recv(100); c.sendall(b"tock\n"); c.close()' &
+until [ -n "$(ss -H -ltn 'sport = :7000')" ] && [ -n "$(ss -H -ltn 'sport = :7001')" ]; do sleep 0.1; done
 taskset -c 3 target/release/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7000 &
 first=$!
 taskset -c 1 target/release/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7001

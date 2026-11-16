@@ -15,8 +15,10 @@ const KEY_UPDATE_LEN: usize = RECORD_HEAD + 4 + 1 + RECORD_TAIL;
 const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
-/// close_notify's plaintext (an alert): `room(CLOSE_NOTIFY_LEN)` waits for the sealed
-/// close_notify and the KeyUpdates that may precede it, not for a full frame.
+/// close_notify's plaintext length (an alert). Through [`FrameTx::room`],
+/// `room(CLOSE_NOTIFY_LEN)` waits for room for a sealed close_notify with the most KeyUpdates
+/// that may precede it, not for a full frame. [`TlsTx::send_close_notify`] seals first and waits
+/// for room for the bytes it actually sealed instead.
 pub const CLOSE_NOTIFY_LEN: usize = 2;
 
 /// Most plaintext rustls puts in one record without a client `max_fragment_size` (TLS's 2^14).

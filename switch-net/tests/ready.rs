@@ -1,6 +1,6 @@
 //! Readiness and entry-reuse contracts on both backends; ACK-credit parking is conduit-only.
 
-//! Which parked tasks a `Net::turn` wakes: only those whose socket's readiness
+//! Which parked tasks a `Net::receive` wakes: only those whose socket's readiness
 //! token fired and whose socket is ready, also after their entry was
 //! canceled, freed or reused. Every future runs as a switch task.
 

@@ -90,11 +90,11 @@ You may drop a `send` or `recv` future, for example when it loses a race in `fir
 
 A dropped `recv` loses nothing, as described above.
 
-A dropped `send` depends on how far it got. A message is *accepted* once it is committed to the connection: sealed whole into one frame, or copied into the send buffer if it needs several frames. If the `send` future is dropped before that, nothing of the message is sent. Once it has been accepted, it goes out whole, and the next `send`, `close` or `recv` finishes it. A later `send` is always a separate message.
+A dropped `send` depends on how far it got. A message is *accepted* once it is committed to the connection. A message that fits in one frame is accepted as soon as a frame is free: it is sealed into that frame at once, and if TCP has no room the sealed frame waits inside the connection. A longer message is accepted when it is copied into the send buffer. If the `send` future is dropped before that, nothing of the message is sent. Once it has been accepted, it goes out whole, and the next `send`, `close` or `recv` finishes it. A later `send` is always a separate message.
 
 ## Limits
 
-`Limits` sets three sizes for a connection:
+`Limits` sets two sizes for a connection:
 
 ```rust,ignore
 pub struct Limits {
@@ -103,7 +103,7 @@ pub struct Limits {
 }
 ```
 
-`Limits::default()` is 16 MiB per WebSocket frame, 64 MiB per received message and 64 MiB per sent message. A received WebSocket frame or message over its limit fails the connection with `Failed(Failure::Protocol(ProtocolError::FrameTooBig))` or `MessageTooBig`. A send over `max_send` is refused with `TooBig { max_send }` and nothing is sent. Its `Display` text reports the configured limit in bytes, for example `message over 4096 B`.
+`Limits::default()` is 64 MiB for a received message and 64 MiB for a sent message. The receive limit applies to the data in a message, Text or Binary, however many WebSocket frames carry it. The connection fails with `Failed(Failure::Protocol(ProtocolError::MessageTooBig))` as soon as a WebSocket frame header announces a length that would take the message past `max_message`, before any of that frame's data is read. Control frames (ping, pong, close) are not counted against `max_message`; they have their own limit of 125 bytes, and a larger one fails the connection with `ProtocolError::ControlTooBig`. A send over `max_send` is refused with `TooBig { max_send }` and nothing is sent. Its `Display` text reports the configured limit in bytes, for example `message over 4096 B`.
 
 The receive buffer for messages that straddle frames grows only as bytes arrive, so a large `max_message` costs memory only when a large message actually comes.
 

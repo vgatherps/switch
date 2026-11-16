@@ -12,8 +12,8 @@ A `UdpSocket` sends and receives datagrams on one local port. It is bound with `
 
 Two errors are temporary:
 
-- `Full`: the Stack cannot take the datagram right now, because its queue of outgoing packets is full or no frame is free for a copy. It clears after a turn.
-- `NeighborPending`: the Stack has not yet learned the destination's hardware address (by ARP). It clears once a later turn receives the ARP reply.
+- `Full`: the Stack cannot take the datagram right now, because its queue of outgoing packets is full or no frame is free for a copy. Retry in a later round, after a send step has flushed queued packets to the NIC.
+- `NeighborPending`: the Stack has not yet learned the destination's hardware address (by ARP). It clears once a later receive step takes in the ARP reply.
 
 The others mean the send cannot succeed as it stands: `NoRoute`, `Unaddressable`, `TooLarge`, `InvalidState`, `Foreign`. switch-bench's UDP echo copies each datagram into a fresh frame, drops the datagram, and retries the two temporary errors, yielding to the drive loop between tries:
 
@@ -21,7 +21,7 @@ The others mean the send cannot succeed as it stands: `NoRoute`, `Unaddressable`
 {{#include ../../../switch-bench/src/serve.rs:echo_datagrams}}
 ```
 
-`switch::yield_now()` lets the task run again in the next poll, after the drive loop has turned the network. A client that starts the conversation does the same with a destination it knows: `tx.send(Some(IpEndpoint::new(addr.into(), port)), frame)`.
+`switch::yield_now()` lets the task run again in the next poll, after the drive loop's send and receive steps have run. A client that starts the conversation does the same with a destination it knows: `tx.send(Some(IpEndpoint::new(addr.into(), port)), frame)`.
 
 ## When a send copies
 
@@ -41,6 +41,6 @@ The daemon runs the Stack, and a few things look different from the application:
 
 - The daemon applies `rx_queue` to datagrams waiting in its own socket. Datagrams your code holds count against the session's receive ring instead ([Frames](frames.md#what-holding-a-frame-costs)). `stats()` returns zeros.
 - A datagram is handed to the daemon as soon as `send` copies it into the send ring. If the daemon then cannot route it, or the neighbor is not resolved, or the destination is not addressable, it drops the datagram; `send` never returns `NoRoute`, `NeighborPending` or `Unaddressable` on this backend. `Full` means the send ring is full.
-- After the session with the daemon is lost, `recv` keeps waiting; it does not return an error. Watch the drive loop's turn error instead ([When the daemon goes away](errors.md#when-the-daemon-goes-away)).
+- After the session with the daemon is lost, `recv` keeps waiting; it does not return an error. Watch the error from the drive loop's round instead ([When the daemon goes away](errors.md#when-the-daemon-goes-away)).
 
 Next: [Timeouts and racing futures](timeouts.md).

@@ -16,13 +16,13 @@ loop {
 }
 ```
 
-Each call to `poll` is one *poll* of the runtime. During a poll, the tasks that are ready run until each waits again. A poll also stops after 1024 task polls, or when a task asks the loop for a turn ([Driving the runtime](driving.md#one-poll-step-by-step)). Between two polls, no task runs at all.
+Each call to `poll` is one *poll* of the runtime. During a poll, the tasks that are ready run until each waits again. A poll also stops after 1024 task polls, or when a task calls `request_turn` to hand control back to the loop early ([Driving the runtime](driving.md#one-poll-step-by-step)). Between two polls, no task runs at all.
 
 ## Why the program drives
 
 A program built on switch runs its own network stack in userspace. Packets do not arrive through the kernel; the program has to fetch them from the NIC, and send its own, by calling into the stack over and over on one CPU. Something has to make those calls, and it has to make them often and at predictable times. If the runtime owned the thread, it would decide when the network ran.
 
-With switch, your loop owns the thread. It alternates two things: move packets, then poll the runtime so tasks can react to them. The tasks are ordinary `async fn`s that await socket operations. The [switch-net](../net/index.md) chapter adds the network half of that loop, called [the drive loop](../net/drive-loop.md).
+With switch, your loop owns the thread. Each time through, it runs a *round*: receive packets, which wakes the tasks waiting on them; poll the runtime, so those tasks react; send what the tasks wrote. The tasks are ordinary `async fn`s that await socket operations. The [switch-net](../net/index.md) chapter adds the network steps of that loop, called [the drive loop](../net/drive-loop.md).
 
 Because the runtime has no clock, time is whatever your loop says it is. That makes the runtime easy to test (a test can pass any tick it likes) and keeps the loop in charge of when timers fire.
 
@@ -40,7 +40,7 @@ A *tick* is the `u64` clock value you pass to `poll`. Ticks must never go backwa
 
 ## Waking
 
-A parked task runs again only after something wakes it: a socket becoming ready, a sleep reaching its deadline, a value arriving on a channel. Waking a task from another thread takes a special handle, covered in [Tasks working together](cooperating.md#waking-a-task-from-another-thread).
+A parked task runs again only after something wakes it: a socket becoming ready, a sleep reaching its deadline, a value arriving on a channel. Another thread can wake a task too; the wake then takes effect at the runtime's next poll ([Tasks working together](cooperating.md#waking-a-task-from-another-thread)).
 
 ## One thread
 

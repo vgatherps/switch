@@ -28,7 +28,7 @@ The words this book uses, each with a short definition and a link to the page th
 
 **EAL.** DPDK's one-time setup per process (memory, devices, helper threads); type `Eal`. `switch_open::open` starts it for you. See [Owning a NIC](../nic/index.md).
 
-**egress.** The step of a Stack turn that builds the packets sockets want to send: data, ACKs, retransmissions, SYNs and FINs. Data written after egress waits for the next one. See [The Stack's drive loop](../stack/drive-loop.md).
+**egress.** The part of the Stack's send step (`Stack::send`) that builds the packets sockets want to send: data, ACKs, retransmissions, SYNs and FINs. Data a task writes after a send step waits for the next one. See [The Stack's drive loop](../stack/drive-loop.md).
 
 **event.** A control message from the daemon about one socket of a session: `Connected`, `Bound`, `Rejected`, `PeerFin`, `Delivered`, `Closed` or `Freed`. See [Using a Session directly](../junction/session.md).
 
@@ -48,7 +48,7 @@ The words this book uses, each with a short definition and a link to the page th
 
 **hugepages.** Large memory pages the machine reserves ahead of time; real NICs take their packet memory from them. Tap devices run without them. See [Owning a NIC](../nic/index.md).
 
-**ingress; ingress budget.** Ingress is the step of a Stack turn that processes received packets: TCP segments go to their sockets, ARP requests get replies. The ingress budget is the most received packets one turn processes; the rest wait for the next turn. It is passed as `NetConfig::ingress_budget` or to `Stack::turn`. See [The Stack's drive loop](../stack/drive-loop.md). The daemon's code also calls the send ring "ingress".
+**ingress; ingress budget.** Ingress is the part of the Stack's receive step (`Stack::receive`) that processes received packets: TCP segments go to their sockets, ARP requests get replies. The ingress budget is the most received packets one receive step processes; the rest wait for the next one. It is passed as `NetConfig::ingress_budget` or to `Stack::receive`. See [The Stack's drive loop](../stack/drive-loop.md). The daemon's code also calls the send ring "ingress".
 
 **isolated CPU.** A CPU the kernel keeps other work off, set with boot options. The pinned CPU is usually one. See [The pinned CPU and helper threads](../nic/cpus.md).
 
@@ -60,7 +60,7 @@ The words this book uses, each with a short definition and a link to the page th
 
 **MTU; path MTU; MSS.** The MTU is the largest IP packet the NIC port sends. A path MTU is a smaller limit the network config file sets for some destinations. The MSS is the largest TCP payload in one segment: the path MTU minus 40. See [The network config file](../nic/config.md).
 
-**Net; NetHandle.** `Net` owns one local Stack or one junction session and belongs to its drive loop, which is the only place the network is turned; it is not `Clone`. `NetHandle` is what tasks hold to open sockets and get frames; it is cheap to clone. See [Sockets with switch-net](../net/index.md).
+**Net; NetHandle.** `Net` owns one local Stack or one junction session and belongs to its drive loop, the only place where packets are received and sent; it is not `Clone`. `NetHandle` is what tasks hold to open sockets and get frames; it is cheap to clone. See [Sockets with switch-net](../net/index.md).
 
 **network config file.** The JSON file that describes one NIC port: device, addresses, gateway, MTU, offloads and DPDK options. The examples call it `dut.json` or `tap.json`. See [The network config file](../nic/config.md).
 
@@ -92,17 +92,19 @@ The words this book uses, each with a short definition and a link to the page th
 
 **receive ring.** The shared-memory ring, one per session, that the daemon writes received packets into. Code calls it the RX ring. See [Sharing a NIC with the junction daemon](../junction/index.md).
 
+**receive step; send step.** The first and last steps of a round. The receive step, `Net::receive(now)`, takes in packets and wakes the tasks whose sockets became ready; on the local backend it runs `Stack::receive`, and on the junction backend it polls the session once for events and received packets. The send step, `Net::send()`, pushes out what tasks wrote since the receive step; on the local backend it runs `Stack::send`, and on the junction backend sends are already in the send ring, so it counts them and reports a lost daemon. `Net::receive` returns its counters as a `Turn`, `Net::send` returns a `Sent`, and both report failures as a `TurnError`. See [The drive loop](../net/drive-loop.md).
+
 **reclaim.** Returning receive-ring space after the frames in it are dropped. It happens on the next poll of the session, in ring order. See [Using a Session directly](../junction/session.md).
 
 **record.** One message in a ring: a received chunk or datagram in a receive ring, or one send in a send ring. See [Using a Session directly](../junction/session.md).
 
 **room.** Space in a socket to queue a frame of a given length; a task waits for it with `TcpTx::room`. See [TCP streams](../net/tcp.md).
 
-**round.** One turn followed by one poll of the runtime, both with the same clock sample: `switch_net::round`. See [The drive loop](../net/drive-loop.md).
+**round.** The work of one trip through the drive loop, done by `switch_net::round(net, rt, now, tick)` with one clock sample: the receive step, one poll of the runtime, then the send step. A reply that a woken task writes leaves in the same round. `round` never sleeps and returns whether anything moved; a loop that sleeps when nothing moved does so itself, no later than `net.poll_at()`. See [The drive loop](../net/drive-loop.md).
 
 **send ring.** The shared-memory rings, one per CPU and shared by every session, that carry sends from applications to the daemon. Code calls them ingress. See [Sharing a NIC with the junction daemon](../junction/index.md).
 
-**sender-late.** A benchmark step in which a generator fell behind its timetable. The flag does not say whether the generator or receiver backpressure was the limit. See [Measuring latency under load](../measuring/index.md).
+**sender-late.** A benchmark step in which any generator worker's fresh-send lag exceeds 20 µs at the 99th percentile. Sends delayed by a full connection, its in-flight budget, or a transport-wide refusal are excluded from that sample. See [Measuring latency under load](../measuring/index.md).
 
 **session.** One application's connection to the daemon, type `Session` from `switch-junction`. See [Sharing a NIC with the junction daemon](../junction/index.md).
 
@@ -125,8 +127,6 @@ The words this book uses, each with a short definition and a link to the page th
 **task.** One call of a `#[switch::task]` function, spawned on the runtime. See [Your first task](../getting-started/first-task.md).
 
 **tick.** The `u64` clock value your code passes to `poll`. The unit is yours, but it must be nanoseconds once you use `within` or `Duration`-based sleeps, and ticks never go backwards. See [Your first task](../getting-started/first-task.md).
-
-**turn.** One call that does the network's work, `Net::turn` or `Stack::turn`: take in packets, run timers, send what was queued, and wake tasks whose sockets changed. See [The drive loop](../net/drive-loop.md).
 
 **vfio-pci.** The Linux kernel driver that lets one userspace process control a PCI device. Binding a NIC attaches it to `vfio-pci`. See [Owning a NIC](../nic/index.md).
 

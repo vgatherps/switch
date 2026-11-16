@@ -26,15 +26,21 @@ The target builds a release `switch-bench` in the image and starts one container
 
 For each protocol (UDP, TCP, WebSocket) it starts the receiver and runs one sweep against it; the TCP and WebSocket sweeps use `--budget-us 50`. A last check runs a TCP sweep against a kernel listener that accepts connections and never reads: that step must still end within seconds, report its loss and finish with a complete summary.
 
-The results land in `switch-bench/out/smoke/`: one `.jsonl` file per sweep (`udp-switch.jsonl`, `tcp-switch.jsonl`, `ws-switch.jsonl`, and `overload-check.jsonl` from the last check), and the stderr of each process (`dut.log` for the receiver, `sweep.log` for the coordinator, `gen<i>.log` for each generator). When every step of the script succeeds, the make target then runs `report.py`, which writes the [report](reports.md) (`report.md`, `results.json` and one plot per sweep) into the same directory and fails the target if the report is incomplete.
+The results land in `switch-bench/out/smoke/`: one `.jsonl` file per sweep (`udp-switch.jsonl`, `tcp-switch.jsonl`, `ws-switch.jsonl`, and `overload-check.jsonl` from the last check), and the stderr of each process (`dut.log` for the receiver, `sweep.log` for the coordinator, `gen<i>.log` for each generator). The script prints one `smoke:` line per protocol with that sweep's summary, and one for the overload check:
 
-Over tap devices the generators often fall behind, and the script treats that differently for the sweeps and for the last check. A protocol sweep that ends complete but sender-late is accepted, and the script goes on. The bounded-overload check is not: the coordinator exits nonzero for its sender-late step, the script prints `smoke: bounded overload: the sweep against a sink failed: ...` and exits 1, and make reports the target failed (exit 2) before `report.py` has run. The `.jsonl` files are all there by then, so make the report yourself and read it:
-
-```sh
-python3 switch-bench/report.py switch-bench/out/smoke --title 'Local smoke (tooling validation over net_tap; not a measurement)'
+```text
+smoke: bounded overload: 1s, drop 1.0, sent 0 of 64000 pps, summary complete=True
 ```
 
-`report.py` lists each sender-late sweep as a reason the results are incomplete and exits 1; [Reading a benchmark report](reports.md) shows a report from such a run.
+Then the make target runs `report.py`, which writes the [report](reports.md) (`report.md`, `results.json` and one plot per sweep) into the same directory, prints `wrote ../switch-bench/out/smoke/report.md`, and fails the target if the report is incomplete.
+
+Over tap devices a generator often falls behind schedule at the higher rates. `smoke.sh` accepts a protocol sweep that stopped that way and goes on, so the other protocols and the overload check still run. `report.py` then counts that sweep as incomplete and exits 1, and make reports the target failed (exit 2). In one run with the default settings, the UDP sweep stopped at 128000 messages per second with both workers behind schedule, the TCP and WebSocket sweeps ran all 17 steps, and the target ended with:
+
+```text
+incomplete: udp-switch: sender behind schedule: worker(s) [0, 1]
+```
+
+Read `report.md` to see which sweep stopped and at which step; [Reading a benchmark report](reports.md) walks through that run's report. Any other failure stops `smoke.sh` itself with a `smoke: ... FAILED` line before `report.py` runs. That includes an overload check whose sweep exits nonzero, as it does when its step is sender-late: the script prints `smoke: bounded overload: the sweep against a sink failed: ...` and exits 1.
 
 The smoke run's settings are make variables:
 
@@ -115,9 +121,9 @@ The generators can use either backend, independently of the receiver. On the jun
 
 `switch-bench/local/junction-smoke.sh` checks this path end to end inside the DPDK container. Build the binaries first (`cargo build --locked -p switch-junctiond -p switch-bench --bins`), then run it in a container that may use two CPUs, with the tap capabilities. It writes its own tap config, starts the daemon, echoes UDP and TCP messages from kernel clients through `serve --backend junction`, runs a short UDP step with `gen --backend junction`, and requires every process to exit cleanly. The daemon's network CPU and the application's CPU are the environment variables `JUNCTION_CPU` (default 0) and `APP_CPU` (default 2); the script puts the daemon's control thread on `APP_CPU` too.
 
-A TCP peer closing before a complete echo fails the smoke run immediately. The echo reader's split-receive and EOF regressions run without DPDK: `python3 -m unittest discover -s switch-bench/local`.
+In that check, a kernel TCP client whose connection closes before its echo is complete fails the script at once. The client's echo reader has tests of its own that need no DPDK: `python3 -m unittest discover -s switch-bench/local`.
 
-The two backends report pushback differently, as [Measuring latency under load](index.md#when-the-generator-is-the-limit) explains: on the local backend a full TCP connection shows up as latency and loss, on the junction backend a full send ring shows up as a sender-late step.
+The two backends report pushback differently, as [Measuring latency under load](index.md#when-the-generator-is-the-limit) explains: on the local backend a full TCP connection holds its own messages, which show up as latency and loss; on the junction backend a full send ring stops every sender for that round and is counted in the step's stops. Neither ends the sweep.
 
 ## Command reference
 
@@ -130,7 +136,7 @@ switch-bench serve [--backend conduit --config F | --backend junction --junction
                    --proto udp|tcp|ws --port P
 ```
 
-The echo receiver. UDP echoes each datagram to its sender. TCP and WebSocket keep 64 accepts armed and serve up to 256 connections at once, sending every byte or message back. The WebSocket side is a `ws://` server built on [switch-ws](../protocols/ws-server.md). While serving, its loop makes no system calls. It prints `switch-bench serve: <proto> echo on port <P>` on stderr once it is ready; a TCP or WebSocket listener that fails to start fails before that line. It runs until SIGINT or SIGTERM.
+The echo receiver. UDP echoes each datagram to its sender. For TCP and WebSocket it keeps 64 accept tasks listening, with socket slots for 256 connections besides. Each accept task hands the connection it takes to an echo task of its own and listens again at once; while every socket slot is in use it retries each round, so listening resumes as connections close. Every byte or message is sent back. The WebSocket side is a `ws://` server built on [switch-ws](../protocols/ws-server.md). While serving, its loop makes no system calls. It prints `switch-bench serve: <proto> echo on port <P>` on stderr once it is ready; a TCP or WebSocket listener that fails to start fails before that line. It runs until SIGINT or SIGTERM.
 
 ### gen
 
@@ -163,7 +169,9 @@ switch-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N
 | `--drain-ms` | Time after the window during which echoes still count (default 200) |
 | `--budget-us W` | TCP and WebSocket only: the in-flight budget described on [Measuring latency under load](index.md#budgeted-tcp-and-websocket-sweeps) |
 
-The sweep exits 0 only when every step ran and no sender fell behind. A worker that does not answer within a step's time plus 10 seconds, that exits, or that reports a step it started late fails the sweep; the coordinator then kills every worker's process group. Steps already printed stay valid, and the summary line says `"complete": false` with the error.
+Each step line holds the offered, sent and received rates, the drop fraction, latency, service round-trip and fresh-send-lag percentiles, the messages sent and echoed, the generators' NIC packet counts, and one entry per worker; [Reading a benchmark report](reports.md#step-lines-and-the-summary) lists the fields. The summary line holds `steps`, `complete`, `generator_bound`, `behind_workers` (the workers behind schedule at the step that stopped the sweep) and `error`.
+
+The sweep exits 0 only when every step ran and no worker fell behind schedule. A worker that does not answer within a step's time plus 10 seconds, that exits, or that reports a step it started late fails the sweep; the coordinator then kills every worker's process group. Steps already printed stay valid, and the summary line says `"complete": false` with the error.
 
 ### kernel-serve
 

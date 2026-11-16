@@ -43,7 +43,7 @@ This is the [drive loop](../net/drive-loop.md) from the first network program: o
 ```text
  drive loop                         feed task                     helper process
  ----------                         ---------                     --------------
- turn Net until ready file exists                                  set up NAT, create ready file
+ receive, send until ready file exists                            set up NAT, create ready file
  spawn feed task
  round ...                          connect (TCP, TLS, upgrade)
  round ...                          read: recv, recv, recv ...

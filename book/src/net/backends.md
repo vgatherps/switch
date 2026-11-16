@@ -24,7 +24,7 @@ The biggest difference is where outgoing data waits, and so where backpressure c
                      Stack -> NIC                             per socket -> NIC
 ```
 
-Locally, a frame stays with the socket until the peer acknowledges it, so the socket's send buffer and the frame pool slow the sender down. Through the daemon, `try_send` copies the bytes into the send ring and returns the frame at once; `Full` means the ring is full, and the peer's window does not slow you down.
+Locally, a queued frame stays with the socket until the peer acknowledges it, so the socket's send buffer and the frame pool slow the sender down. Through the daemon, `try_send` copies the bytes into the send ring and returns the frame at once; `Full` means the ring is full, and the peer's window does not slow you down.
 
 ## The differences
 
@@ -34,15 +34,16 @@ Locally, a frame stays with the socket until the peer acknowledges it, so the so
 | Create the `Net` | `Net::new(stack, NetConfig)` | `Net::remote(session, RemoteConfig)` |
 | Tear down | `into_stack`, then close the port | `into_session`, then finish the session |
 | `Net::poll_at()` | the Stack's next timer | always `None` (timers run in the daemon) |
-| `rx_staged`, `tx_pending`, `rx_rejected` in a turn | real counts | always 0 |
+| `rx_staged`, `rx_rejected` and `tx_pending` in the `Turn` and `Sent` counters | real counts | always 0 |
+| What the send step does | sends what sockets queued since the receive step | reports the records `try_send` already put in the send ring |
 | Opening errors | all on the first poll | client-side ones on the first poll; daemon rejections after a round trip |
 | Invalid `tcp::Config` | the Stack panics when adding the socket | `Error::InvalidConfig` |
 | Frames from `tx_frame` | the Stack's frame pool, shared by all sockets; length IP MTU − 28 | `RemoteConfig::tx_frames` buffers of the daemon's frame capacity |
-| A sent TCP frame | held by the socket until acknowledged | copied into the send ring, returned at once |
+| A sent TCP frame | held by the socket until acknowledged, unless small enough to be copied into the previous unsent frame | copied into the send ring, returned at once |
 | `send_capacity()` | the socket's send buffer | the largest record (one message in the send ring) the session allows, minus 16 bytes |
-| What `room` promises | a fitting `try_send` succeeds until the next turn | a hint; `try_send` can still return `Full` |
-| After one `Full` | only that socket waits | `room` on every socket of the `Net` waits until the next turn |
-| Many sends in one poll | the poll ends early so the loop turns sooner | no equivalent |
+| What `room` promises | a fitting `try_send` succeeds until the next receive step | a hint; `try_send` can still return `Full` |
+| After one `Full` | only that socket waits | `room` on every socket of the `Net` waits until the next receive step |
+| Many sends in one poll | the poll ends early so the send step comes sooner | no equivalent |
 | UDP `NoRoute`, `NeighborPending`, `Unaddressable` | returned by `send` | the daemon drops the datagram |
 | `UdpTx::stats()` | real drop counts | always zeros |
 | Received frames held | hold RX pool buffers | hold receive ring space shared by the session |

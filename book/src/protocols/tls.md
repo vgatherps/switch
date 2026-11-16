@@ -16,9 +16,9 @@ pub async fn tls_connect(
 ) -> Result<Tls, Error>
 ```
 
-`tls_connect` takes a connected TCP stream and runs the TLS 1.3 handshake for `host`, which is the server name sent in the handshake and checked against the certificate. `min_plain` is the size of the largest piece of plaintext you will send as one TLS record; 0 counts as 1. Each frame must be able to carry one record of that size. How much one frame carries is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the config's `max_fragment_size` caps it further. If that is too small, `tls_connect` returns `Setup(SetupError::RoomTooSmall { room, need })` before it sends the ClientHello. Passing 1 is fine if you send through `send_bytes` (below), which splits data to fit.
+`tls_connect` takes a connected TCP stream and runs the TLS 1.3 handshake for `host`, which is the server name sent in the handshake and checked against the certificate. `min_plain` is the size of the largest piece of plaintext you will send as one TLS record; 0 counts as 1. Frames are sized to the connection's MSS, so that each is one TCP segment, but never below one record of `min_plain` bytes; TCP cuts a larger frame into segments. That record must fit in a frame and in the socket's send buffer, and the config's `max_fragment_size` must allow it. Otherwise `tls_connect` returns `Setup(SetupError::RoomTooSmall { room, need })` before it sends the ClientHello. Passing 1 is fine if you send through `send_bytes` (below), which splits data to fit.
 
-As with `wss://`, a failing handshake sends the TLS alert and a FIN, best effort, and returns only after the server acknowledged them or the connection ended. Bound the connect with [`within`](../net/timeouts.md).
+As with `wss://`, a failing handshake sends the TLS alert and a FIN, best effort, and returns only after the server acknowledged them or the connection ended. Bound the connect with [`within`](../net/timeouts.md). A server that negotiates a version older than TLS 1.3, which the config can allow, is refused with `Handshake`.
 
 The result is a `Tls` with three public fields:
 
@@ -84,7 +84,7 @@ Its error type is `switch_tls::TxError<switch_net::Error>`:
 
 ## Closing
 
-`Tls::close().await` sends close_notify, then FIN, and returns once the server has acknowledged them or the connection has ended. After that the `Tls` can be dropped. `close` does not read; data the server sends meanwhile stays queued in TCP. A server that never acknowledges keeps `close` waiting, so bound it.
+`Tls::close().await` sends close_notify, then FIN, and returns once the server has acknowledged them or the connection has ended. After that the `Tls` can be dropped. close_notify is sealed as soon as a frame is free; if TCP has no room for it, `close` waits for room for those few sealed bytes, not for a whole frame. `close` does not read; data the server sends meanwhile stays queued in TCP. A server that never acknowledges keeps `close` waiting, so bound it.
 
 ## Errors
 
@@ -96,10 +96,10 @@ Its error type is `switch_tls::TxError<switch_net::Error>`:
 | `Tls(switch_tls::Error::Truncated)` | The TCP stream ended without the server's close_notify. |
 | `Recv(e)` | TCP receive failed (for example, a reset). |
 | `Send(e)` | Sending failed; `e` is a `TxError` as above. |
-| `Handshake(msg)` | The handshake could not start (an invalid server name) or ended in an unexpected state. |
-| `Setup(e)` | The connection could not be set up and nothing was sent: `RoomTooSmall`, `ForeignHandle` (the stream belongs to another `Net`), or `Dead` (the socket was already closed). |
+| `Handshake(msg)` | The handshake could not start (an invalid server name), negotiated a version other than TLS 1.3, or ended in an unexpected state. |
+| `Setup(e)` | The connection could not be set up and nothing was sent: `RoomTooSmall`, `ForeignHandle` (the stream belongs to another `Net`), or `Dead` (the socket had already closed or reset). |
 
-Like a failing handshake, a TLS error in `ready` sends the alert and FIN and waits for them to be delivered before returning, so `ready` too can wait on a silent server.
+Like a failing handshake, a TLS error in `ready` sends the alert and FIN and waits for them to be delivered before returning, so `ready` too can wait on a silent server. A record whose header announces more than rustls accepts fails as soon as the header is complete. A record over the TLS 1.3 limit of 2^14 + 256 bytes but within that bound fails once all of it has arrived, and the alert sent is `record_overflow`.
 
 ## Embedding on other frames
 

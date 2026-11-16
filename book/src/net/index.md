@@ -6,15 +6,15 @@ switch-net gives switch tasks async TCP and UDP sockets. A task connects, accept
 
 switch-net splits the work between two types.
 
-The `Net` belongs to the drive loop. It owns the connection to the NIC and is the only thing that turns the network: `Net::turn` takes in packets, runs timers, sends what tasks queued and wakes tasks. Each drive loop owns its `Net`; it is not `Clone`.
+The `Net` belongs to the drive loop. It owns the connection to the NIC and is the only thing that moves packets: `Net::receive` takes in packets and wakes tasks, and `Net::send` sends what the tasks queued. `switch_net::round` runs both, with a runtime poll in between. Each drive loop owns its `Net`; it is not `Clone`.
 
-A `NetHandle` belongs to tasks. You get one from `net.handle()` and clone it freely. With a handle a task opens sockets (`tcp_connect`, `tcp_accept`, `udp_bind`) and gets empty frames to send (`tx_frame`). A handle cannot turn the network.
+A `NetHandle` belongs to tasks. You get one from `net.handle()` and clone it freely. With a handle a task opens sockets (`tcp_connect`, `tcp_accept`, `udp_bind`) and gets empty frames to send (`tx_frame`). A handle cannot receive or send for the network; only the drive loop does that.
 
 ```text
   drive loop (pinned CPU)                      tasks (same thread)
   +-------------------------+                +--------------------------+
   | Net                     |   handle()     | NetHandle (Clone)        |
-  |   turn(now)             | -------------> |   tcp_connect / accept   |
+  |   receive(now), send()  | -------------> |   tcp_connect / accept   |
   |   poll_at()             |                |   udp_bind, tx_frame     |
   |   into_stack/_session   |                | TcpStream, UdpSocket     |
   +-----------+-------------+                +-------------+------------+
@@ -56,7 +56,7 @@ The backends do differ in a handful of behaviors: when errors arrive, what a suc
 
 The pages follow the order a program meets things:
 
-1. [The drive loop](drive-loop.md): turns, rounds, the clock and busy polling.
+1. [The drive loop](drive-loop.md): rounds and their receive, poll and send steps, the clock and busy polling.
 2. [Opening sockets](opening.md): connecting, accepting, binding, and when errors appear.
 3. [Frames](frames.md): the buffers you send and receive.
 4. [TCP streams](tcp.md) and [UDP sockets](udp.md).

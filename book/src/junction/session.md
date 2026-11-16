@@ -98,7 +98,8 @@ A complete TCP client is the crate's example `tcp_session.rs`. It connects to a 
 
 ```sh
 cargo build --locked --release -p switch-junction --example tcp_session
-python3 -c 'import socket; s=socket.socket(); s.bind(("10.77.0.1",7000)); s.listen(); c,_=s.accept(); print(c.makefile("rb").read()); c.close()' &
+python3 -c 'import socket; s=socket.create_server(("10.77.0.1",7000)); c,_=s.accept(); print(c.makefile("rb").read()); c.close()' &
+until [ -n "$(ss -H -ltn 'sport = :7000')" ]; do sleep 0.1; done
 taskset -c 3 target/release/examples/tcp_session /tmp/jn/control.sock 10.77.0.1:7000
 ```
 

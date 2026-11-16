@@ -49,7 +49,7 @@ Some DPDK argument errors, and `--help`, exit the process inside `Eal::init` ins
 
 ## Building and driving the Stack
 
-`Stack::new` gives back the `Port` with the error, so you can close it. The drive calls (`turn`, `receive`, `send`, `flush`) return the error alone.
+`Stack::new` gives back the `Port` with the error, so you can close it. The drive calls (`receive`, `send`, `turn`, `flush`) return the error alone.
 
 | `StackError` | From | Meaning | What to do |
 |---|---|---|---|
@@ -58,7 +58,7 @@ Some DPDK argument errors, and `--help`, exit the process inside `Eal::init` ins
 | `RxPoolTooSmall { count, required }` | `new` | The RX pool is below its reserve. | Make the pool at least `required`. |
 | `TxPoolTooSmall { count, required }` | `new` | The TX pool is below its reserve. | Make the pool at least `required`. |
 | `TxFramePoolTooSmall { count, required }` | `new` | The frame pool is below its reserve. | Make the pool at least `required`. |
-| `TimeWentBackwards { last, now }` | `turn`, `receive` | `now` is earlier than the last time. Nothing was done. | Use one clock that never goes back. |
+| `TimeWentBackwards { last, now }` | `receive`, `turn` | `now` is earlier than the last time. Nothing was done. | Use one clock that never goes back. |
 | `Port(PortError)` | drive calls | The NIC driver failed, or the port could not be recovered after a reset. The Stack is unusable. | Close it: `into_port`, then `try_close`. |
 
 [Packet-buffer pools](../nic/pools.md) explains the reserves.
@@ -94,7 +94,7 @@ These are documented panics. Each one points to a bug in the calling code, not t
 - Using a `TcpHandle` or `UdpHandle` on a Stack other than the one that made it: "TCP handle belongs to another Stack" (or UDP).
 - `add_tcp` with `rx_capacity` over 1 GiB, or `mss_cap: Some(0)`.
 - `tcp::tx_mbuf_budget` with an IP MTU below 68, or `mss_cap: Some(0)`.
-- `set_initial_window(0)`; `set_rto` with zero or more than 60 s; `set_ack_delay` with more than 60 s; `set_hop_limit(Some(0))`.
+- `set_initial_window(0)`; `set_ack_delay` with more than 60 s; `set_hop_limit(Some(0))`.
 - A readiness key used after its socket was removed, when its slot no longer exists (release builds; debug builds check every key).
 - `turn`, `receive` and `send`, when the NIC driver's cleanup of sent packets fails with an error other than "not supported".
 - `turn`, `receive`, `send` and `flush`, with TX checksum offload on, when the driver refuses to prepare a queued packet.
