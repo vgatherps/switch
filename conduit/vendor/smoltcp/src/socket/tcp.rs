@@ -2264,7 +2264,9 @@ impl<'a> Socket<'a> {
                     ack_of_fin = true;
                 }
 
-                ack_all = self.remote_max_seq <= ack_number;
+                // An ACK that advances nothing acknowledges nothing: with no data sent yet,
+                // it must not cancel the retry armed after a failed emission.
+                ack_all = self.local_seq_no < ack_number && self.remote_max_seq <= ack_number;
             }
         }
 
@@ -5454,6 +5456,41 @@ mod test {
         s.send_slice(b"abc").unwrap();
         s.limit_retries();
         check_failed_emit(s, false, false);
+    }
+
+    #[test]
+    fn retry_limited_failed_emit_survives_acks_that_acknowledge_nothing() {
+        // Nothing leaves this host while the peer keeps sending ACKs that cover nothing new.
+        // Those ACKs must not cancel the retry, so the limit still resets the connection,
+        // whether the peer's window stays open or closes.
+        for window in [64, 0] {
+            let mut s = socket_established();
+            s.send_slice(b"abc").unwrap();
+            s.limit_retries();
+            let ack = SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1).win(window);
+            let mut now = Instant::ZERO;
+            let mut failed = 0;
+            loop {
+                s.cx.set_now(now);
+                let _ = s.socket.dispatch(&mut s.cx, |_, _, (_, _, frame)| {
+                    (Err::<(), _>(()), frame.map(OwnedFrame::freeze))
+                });
+                if s.state() == State::Closed {
+                    break;
+                }
+                failed += 1;
+                assert!(failed <= ORPHAN_RETRIES + 1, "retry limit never reached");
+                let timer = s.timer;
+                assert_eq!(send(&mut s, now, &ack), None);
+                assert_eq!(s.timer, timer, "an ACK of nothing changed the retry deadline");
+                now = match timer {
+                    Timer::Retransmit { expires_at } | Timer::ZeroWindowProbe { expires_at, .. } => expires_at,
+                    other => panic!("failed emit left no retry deadline: {other:?}"),
+                };
+            }
+            assert_eq!(failed, ORPHAN_RETRIES + 1);
+            assert_eq!(s.remote_endpoint(), None);
+        }
     }
 
     #[test]
