@@ -1,0 +1,5 @@
+error: `#[switch::task]` takes no arguments
+ --> tests/ui/fail_facade_attribute.rs:1:16
+  |
+1 | #[switch::task(name = "x")]
+  |                ^^^^^^^^^^

@@ -15,4 +15,5 @@ syn = { version = "2", features = ["full", "visit"] }
 
 [dev-dependencies]
 switch-runtime.workspace = true
+switch.workspace = true
 trybuild = "1.0"

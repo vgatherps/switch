@@ -22,7 +22,7 @@ The program no longer needs a network config file, hugepages or DPDK setup at ru
 ## Connecting
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client_junction.rs:connect}}
+{{#include ../../../examples/tcp_client_junction.rs:connect}}
 ```
 
 `Session::connect` takes the path of the daemon's `control.sock` and the number of sockets this application wants. It connects to the daemon, introduces itself, and returns once the daemon accepts the session. If the daemon is still opening its NIC, the call waits until it is done (see [Knowing it is ready](running.md#knowing-it-is-ready)).
@@ -57,7 +57,7 @@ A `Session`, like everything in switch-net, belongs to the thread that created i
 ## Teardown
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client_junction.rs:teardown}}
+{{#include ../../../examples/tcp_client_junction.rs:teardown}}
 ```
 
 The order matches the local program. Shut the runtime down first so every task, socket and frame is dropped. Then `net.into_session()` hands back the session; it returns `Err(net)` while any `NetHandle`, socket half or frame-holding future is still alive.
@@ -84,7 +84,7 @@ The container's shell runs as root, which the daemon and the tap device need. Sa
 
 ```sh
 cargo build --locked --release -p switch-junctiond --bins
-cargo build --locked --release -p switch-net --example tcp_client_junction
+cargo build --locked --release -p switch-examples --features net --example tcp_client_junction
 
 taskset -c 2 target/release/switch-junctiond --config jn0.json --dir /tmp/jn --control-cpus 0 &
 until [ -S /tmp/jn/control.sock ] && ip link show jn0 >/dev/null 2>&1; do sleep 0.1; done

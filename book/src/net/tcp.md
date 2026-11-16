@@ -32,7 +32,7 @@ A `TcpStream` is an open TCP connection, from `tcp_connect` or `tcp_accept` ([Op
 The first network program reads until `Finished`:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client_local.rs:recv}}
+{{#include ../../../examples/tcp_client_local.rs:recv}}
 ```
 
 Dropping a `recv` future before it completes loses nothing; data stays queued for the next call.

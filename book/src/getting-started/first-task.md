@@ -20,7 +20,7 @@ A program outside this repository depends on a clone of it: `switch = { path = "
 The code on this page is one program, `switch/examples/first_task.rs`. Run it with:
 
 ```sh
-cargo run -p switch-runtime --example first_task
+cargo run -p switch-examples --example first_task
 ```
 
 ## Hello, task
@@ -28,13 +28,13 @@ cargo run -p switch-runtime --example first_task
 A *task* is one call of a function marked `#[switch::task]`, started on the runtime. Here is the function:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/first_task.rs:hello}}
+{{#include ../../../examples/first_task.rs:hello}}
 ```
 
 To run it, `main` creates a runtime, gets a *spawner* from it, spawns the task and then polls the runtime until no task is left:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/first_task.rs:run_hello}}
+{{#include ../../../examples/first_task.rs:run_hello}}
 ```
 
 Line by line:
@@ -53,11 +53,11 @@ Nothing ran when `spawn` was called. The task ran inside `poll`, because `main` 
 A task can return a value. `spawn` throws the value away; `spawn_join` keeps it and gives you a `JoinHandle` that resolves to it.
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/first_task.rs:join_tasks}}
+{{#include ../../../examples/first_task.rs:join_tasks}}
 ```
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/first_task.rs:run_join}}
+{{#include ../../../examples/first_task.rs:run_join}}
 ```
 
 The handle is awaited inside `report`, which is itself a task. A `JoinHandle` must be awaited by a switch task: `main` cannot block on it, because nothing would run the task it is waiting for. The handle resolves to `Ok(value)`, or to `Err(Canceled)` if the task ended without producing a value (for example because the runtime was shut down first). [Writing and spawning tasks](../runtime/tasks.md) covers both cases.
@@ -69,13 +69,13 @@ The runtime has no clock of its own. Each call to `poll` passes in a tick, a `u6
 A task waits for time to pass with a sleep created by the spawner:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/first_task.rs:timer_task}}
+{{#include ../../../examples/first_task.rs:timer_task}}
 ```
 
 `spawner.sleep(10)` makes a timer whose deadline is ten ticks after the latest tick the runtime has accepted. The sleep finishes during the first poll whose tick reaches that deadline:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/first_task.rs:run_timer}}
+{{#include ../../../examples/first_task.rs:run_timer}}
 ```
 
 The latest tick the runtime has seen is 0, so the deadline is 10. The output is:

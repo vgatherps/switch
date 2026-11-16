@@ -182,9 +182,9 @@ doctor:
 build: doctor
 	cargo build --locked --workspace --all-targets --features proptest,dpdk-smoltcp/bench-offload
 
-# API reference for every workspace crate, with the switch-net modules of switch-tls and switch-ws.
+# API reference for every workspace crate, including every switch facade module.
 doc: doctor
-	cargo doc --locked --no-deps --workspace --features switch-tls/switch-net,switch-ws/switch-net
+	cargo doc --locked --no-deps --workspace --features switch/ws
 
 test-support:
 	$(TIMEOUT) cargo test --locked -p switch-test-support -p switch-test-support-macros
@@ -223,6 +223,7 @@ test-netconf: doctor
 test-switch-net: doctor
 	$(TIMEOUT) cargo test --locked -p switch-net -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p switch-net --benches --no-run
+	$(TIMEOUT) cargo build --locked -p switch-examples --examples --features net
 
 test-junction: doctor
 	$(TIMEOUT) cargo test --locked -p switch-junction

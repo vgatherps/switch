@@ -9,7 +9,7 @@ One rule holds for all three: the socket is opened when you call the function, n
 `tcp_connect` takes the socket configuration, the remote endpoint and the local endpoint:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client_local.rs:connect}}
+{{#include ../../../examples/tcp_client_local.rs:connect}}
 ```
 
 This is the connect from [the first network program](../getting-started/first-connection.md); the `tcp::Config` is explained under [Socket configuration](#socket-configuration) below.
@@ -35,7 +35,7 @@ Each `tcp_accept` call creates one listening socket, which becomes one connectio
 The echo server example `switch-net/examples/tcp_echo_server.rs` does exactly this. Each time an accept completes, it arms the next accept before serving this connection, which it hands to a new task:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_echo_server.rs:accept_loop}}
+{{#include ../../../examples/tcp_echo_server.rs:accept_loop}}
 ```
 
 A few rules govern listeners:

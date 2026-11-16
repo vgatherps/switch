@@ -7,10 +7,10 @@ Your loop drives the runtime by calling `Runtime::poll(tick)`. The previous page
 `switch/examples/basic.rs` spawns two tasks and polls until both finish, printing what each poll reports:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/basic.rs}}
+{{#include ../../../examples/basic.rs}}
 ```
 
-Run it with `cargo run -p switch-runtime --example basic`. It prints:
+Run it with `cargo run -p switch-examples --example basic`. It prints:
 
 ```text
 === switch runtime example ===
@@ -75,10 +75,10 @@ Anything that wakes or spawns a task between two polls is picked up by the next 
 In `switch/examples/manual_loop.rs`, `EventQueue` stands in for the network: `poll_nonblocking` spawns one task for each event waiting in it. `main` starts the runtime at tick 100 with one task that sleeps for 10 ticks (shown on [Time and sleeping](time.md)) and one event waiting, then polls at ticks 100, 100 and 110, pushing a second event just before the last poll:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/manual_loop.rs:tick_loop}}
+{{#include ../../../examples/manual_loop.rs:tick_loop}}
 ```
 
-Run it with `cargo run -p switch-runtime --example manual_loop`:
+Run it with `cargo run -p switch-examples --example manual_loop`:
 
 ```text
 first event
@@ -100,7 +100,7 @@ Tasks are never interrupted. Once the runtime calls into a task, that task keeps
 So a task that computes for a long time without awaiting holds up every other task and the whole loop, including the network. Nothing moves packets until it returns. A task with a long piece of work should split it into slices and call `switch::yield_now().await` between them, as this task from `switch/examples/clock_loop.rs` does:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/clock_loop.rs:sliced_work}}
+{{#include ../../../examples/clock_loop.rs:sliced_work}}
 ```
 
 `yield_now` makes the task ready again for the *next* poll, not for a later pass of the current one. So between two slices, the current poll finishes, your loop does its other work, and the next poll resumes the task. [Tasks working together](cooperating.md#yielding) has more on yielding.
@@ -118,10 +118,10 @@ Application code rarely calls it. switch-net calls it for you: on the local back
 Here is a complete loop that runs tasks against a real clock, from `switch/examples/clock_loop.rs`:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/clock_loop.rs:loop}}
+{{#include ../../../examples/clock_loop.rs:loop}}
 ```
 
-Run it with `cargo run -p switch-runtime --example clock_loop`. It prints:
+Run it with `cargo run -p switch-examples --example clock_loop`. It prints:
 
 ```text
 sum = 49995000

@@ -1,0 +1,27 @@
+[package]
+name = "switch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Caller-driven tasks and networking for applications"
+
+[features]
+default = []
+net = ["dep:switch-net", "dep:switch-junction", "dep:switch-open", "dep:switch-netconf", "dep:dpdk-smoltcp"]
+tls = ["net", "dep:switch-tls"]
+ws = ["tls", "dep:switch-ws"]
+
+[dependencies]
+switch-runtime.workspace = true
+switch-macros.workspace = true
+switch-net = { workspace = true, optional = true }
+switch-junction = { workspace = true, optional = true }
+switch-open = { workspace = true, optional = true }
+switch-netconf = { workspace = true, optional = true }
+dpdk-smoltcp = { workspace = true, optional = true }
+switch-tls = { workspace = true, optional = true, features = ["switch-net"] }
+switch-ws = { workspace = true, optional = true, features = ["switch-net"] }
+
+[lints]
+workspace = true

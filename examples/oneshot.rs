@@ -1,10 +1,10 @@
 //! Handing one value from one task to another with a oneshot channel.
 
-use switch_runtime::oneshot::{self, Receiver, Sender};
-use switch_runtime::{Runtime, Spawner};
+use switch::oneshot::{self, Receiver, Sender};
+use switch::{Runtime, Spawner};
 
 // ANCHOR: tasks
-#[switch_runtime::task]
+#[switch::task]
 async fn producer(spawner: Spawner, sender: Sender<u32>) {
     spawner.sleep(5).unwrap().await.unwrap();
     if sender.send(42).is_err() {
@@ -12,7 +12,7 @@ async fn producer(spawner: Spawner, sender: Sender<u32>) {
     }
 }
 
-#[switch_runtime::task]
+#[switch::task]
 async fn consumer(receiver: Receiver<u32>) {
     match receiver.await {
         Ok(value) => println!("received {value}"),

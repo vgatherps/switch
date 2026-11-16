@@ -2,7 +2,7 @@
 //! `switch-junctiond` instead of owning the NIC.
 //!
 //! ```text
-//! cargo build -p switch-net --example tcp_client_junction
+//! cargo build -p switch-examples --features net --example tcp_client_junction
 //! taskset -c 3 target/debug/examples/tcp_client_junction /run/switch-junctiond/control.sock 10.77.0.1:7000
 //! ```
 //!
@@ -15,9 +15,9 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
-use switch_runtime::Runtime;
-use switch_junction::session::Session;
-use switch_net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetHandle, RemoteConfig};
+use switch::Runtime;
+use switch::junction::session::Session;
+use switch::net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetHandle, RemoteConfig};
 
 const BUFFER: usize = 64 * 1024;
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -47,7 +47,7 @@ impl Clock {
 const LOCAL_PORT: u16 = 40000;
 
 /// Runs the conversation and leaves its result in `done` for the drive loop.
-#[switch_runtime::task]
+#[switch::task]
 async fn hello(
     handle: NetHandle,
     server: IpEndpoint,
@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("not finished after {LIMIT:?}").into());
         }
         let (now, tick) = clock.sample();
-        let moved = switch_net::round(&mut net, &mut rt, now, tick)
+        let moved = switch::net::round(&mut net, &mut rt, now, tick)
             .map_err(|error| format!("round: {error:?}"))?;
         if !moved {
             std::thread::sleep(IDLE_SLEEP);

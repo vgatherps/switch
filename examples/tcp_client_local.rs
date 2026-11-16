@@ -2,11 +2,11 @@
 //! prints what the server sends back, and shuts down once the server closes its side.
 //!
 //! ```text
-//! cargo build -p switch-net --example tcp_client_local
+//! cargo build -p switch-examples --features net --example tcp_client_local
 //! taskset -c 3 target/debug/examples/tcp_client_local tap.json 192.0.2.1:7000
 //! ```
 //!
-//! `switch_open::open` needs a calling thread allowed on exactly one CPU, hence `taskset`.
+//! `switch::nic::open` needs a calling thread allowed on exactly one CPU, hence `taskset`.
 //! To try it without a NIC (Linux with `CAP_NET_ADMIN` and `/dev/net/tun`, or the
 //! Docker image), use `tap.json` next to this file, start a kernel-side server, start
 //! the client, and give the tap device its kernel address once the client created it:
@@ -25,11 +25,11 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
-use dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY;
-use switch_runtime::Runtime;
-use switch_net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle};
-use switch_netconf::Config;
-use switch_open::{open, Sizing};
+use switch::nic::DEFAULT_NEIGHBOR_CAPACITY;
+use switch::Runtime;
+use switch::net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle};
+use switch::nic::Config;
+use switch::nic::{open, Sizing};
 
 const BUFFER: usize = 64 * 1024;
 const INGRESS_BUDGET: usize = 32;
@@ -68,7 +68,7 @@ impl Clock {
 const LOCAL_PORT: u16 = 40000;
 
 /// Runs the conversation and leaves its result in `done` for the drive loop.
-#[switch_runtime::task]
+#[switch::task]
 async fn hello(
     handle: NetHandle,
     server: IpEndpoint,
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("not finished after {LIMIT:?}").into());
         }
         let (now, tick) = clock.sample();
-        let moved = switch_net::round(&mut net, &mut rt, now, tick)
+        let moved = switch::net::round(&mut net, &mut rt, now, tick)
             .map_err(|error| format!("round: {error:?}"))?;
         if !moved {
             std::thread::sleep(IDLE_SLEEP);

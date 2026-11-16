@@ -1,0 +1,59 @@
+[package]
+name = "switch-examples"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+net = ["switch/net"]
+ws = ["net", "switch/ws"]
+
+[dependencies]
+switch.workspace = true
+
+[[example]]
+name = "first_task"
+path = "first_task.rs"
+
+[[example]]
+name = "basic"
+path = "basic.rs"
+
+[[example]]
+name = "tasks"
+path = "tasks.rs"
+
+[[example]]
+name = "manual_loop"
+path = "manual_loop.rs"
+
+[[example]]
+name = "oneshot"
+path = "oneshot.rs"
+
+[[example]]
+name = "remote_wake"
+path = "remote_wake.rs"
+
+[[example]]
+name = "clock_loop"
+path = "clock_loop.rs"
+
+[[example]]
+name = "tcp_client_local"
+path = "tcp_client_local.rs"
+required-features = ["net"]
+
+[[example]]
+name = "tcp_echo_server"
+path = "tcp_echo_server.rs"
+required-features = ["net"]
+
+[[example]]
+name = "tcp_client_junction"
+path = "tcp_client_junction.rs"
+required-features = ["net"]
+
+[lints]
+workspace = true

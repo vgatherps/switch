@@ -109,7 +109,7 @@ cd <repository root>
 export PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig LD_LIBRARY_PATH=/opt/dpdk/lib \
     RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld' \
     LIBCLANG_PATH=/usr/lib64/llvm18/lib PATH=/usr/lib64/llvm18/bin:/root/.cargo/bin:$PATH
-cargo build --locked --release -p switch-net --example tcp_client_local
+cargo build --locked --release -p switch-examples --features net --example tcp_client_local
 . /etc/switch/host.env
 taskset -c "$APP_CPU" target/release/examples/tcp_client_local /etc/switch/dut.json <peer>:7000
 ```

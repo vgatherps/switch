@@ -1,15 +1,15 @@
 //! Manual event and timer driving with caller-supplied ticks.
 
 use std::collections::VecDeque;
-use switch_runtime::{Runtime, Spawner};
+use switch::{Runtime, Spawner};
 
-#[switch_runtime::task]
+#[switch::task]
 async fn print_event(event: &'static str) {
     println!("{event}");
 }
 
 // ANCHOR: sleep_task
-#[switch_runtime::task]
+#[switch::task]
 async fn print_after_sleep(spawner: Spawner) {
     spawner.sleep(10).unwrap().await.unwrap();
     println!("deadline reached");

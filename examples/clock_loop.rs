@@ -3,23 +3,23 @@
 
 use std::time::{Duration, Instant};
 
-use switch_runtime::{Runtime, Spawner};
+use switch::{Runtime, Spawner};
 
 // ANCHOR: sliced_work
-#[switch_runtime::task]
+#[switch::task]
 async fn sum_in_slices(values: Vec<u64>) {
     let mut total = 0;
     for chunk in values.chunks(1024) {
         total += chunk.iter().sum::<u64>();
         // Let the loop and the other tasks run before the next slice.
-        switch_runtime::yield_now().await;
+        switch::yield_now().await;
     }
     println!("sum = {total}");
 }
 // ANCHOR_END: sliced_work
 
 // ANCHOR: sleep_duration
-#[switch_runtime::task]
+#[switch::task]
 async fn wait_two_ms(spawner: Spawner) {
     let ticks = u64::try_from(Duration::from_millis(2).as_nanos()).unwrap();
     spawner.sleep(ticks).unwrap().await.unwrap();

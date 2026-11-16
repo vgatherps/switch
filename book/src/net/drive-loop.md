@@ -21,7 +21,7 @@ Because send comes after poll, a reply that a woken task queues leaves in the sa
 `round` never sleeps. It returns `true` if anything moved: the receive step took in or processed packets, packets are still waiting to be processed, the poll ran at least one task, or the send step put packets out or left some pending. A drive loop is a loop around it:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client_local.rs:drive}}
+{{#include ../../../examples/tcp_client_local.rs:drive}}
 ```
 
 ```text
@@ -63,7 +63,7 @@ On the junction backend `rx_staged`, `rx_rejected` and both `tx_pending` counter
 `net.receive` takes the Stack's time, a `switch_net::Instant` in microseconds. `rt.poll` takes a tick, a `u64`. The two must come from one clock reading so the network and the tasks agree on what time it is. `net.send` takes no time; it runs at the time of the last receive. The repository's programs take one `std::time::Instant` at startup and, every round, read the elapsed time once: the Stack gets it in microseconds and the runtime gets it in nanoseconds.
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client_local.rs:clock}}
+{{#include ../../../examples/tcp_client_local.rs:clock}}
 ```
 
 Ticks in nanoseconds are required as soon as any task uses `switch_net::within` or a `Duration`-based sleep, because those convert durations to nanoseconds; see [Ticks](../runtime/driving.md#ticks) and [Timeouts and racing futures](timeouts.md). Use this one clock for everything, including the clock you pass to `switch_open::open`. Do not use `Instant::now()` from smoltcp, the TCP/IP library the Stack is built on: it reads the wall clock, which can jump.

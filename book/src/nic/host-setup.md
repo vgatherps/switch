@@ -155,7 +155,7 @@ DPDK writes its own messages to stderr and `switch-nic` writes its result lines,
 The program from [Your first network program](../getting-started/first-connection.md) runs unchanged on the real NIC; only the config file and the peer change. Build it natively:
 
 ```sh
-cargo build --locked --release -p switch-net --example tcp_client_local
+cargo build --locked --release -p switch-examples --features net --example tcp_client_local
 ```
 
 On a second machine on the data NIC's subnet, start the same one-shot server as on that page:

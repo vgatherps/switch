@@ -3,7 +3,7 @@
 switch is a set of Rust crates for writing network programs that send and receive with low, predictable latency: market-data feeds, order gateways, echo servers, load generators. Your program is written as async Rust tasks that open TCP and UDP sockets, and optionally TLS and WebSocket connections on top of them. Here is the core of the TCP client this book builds in [Your first network program](getting-started/first-connection.md). It connects, splits the connection into a receive half and a send half, puts one line into a frame (a buffer the network can send without copying), sends it, then prints what the server sends back until the server closes the connection:
 
 ```rust,ignore
-{{#include ../../switch-net/examples/tcp_client_local.rs:core}}
+{{#include ../../examples/tcp_client_local.rs:core}}
 ```
 
 What is different is everything underneath that code. This page explains it in plain terms, then shows how the rest of the book is laid out.

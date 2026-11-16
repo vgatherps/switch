@@ -6,11 +6,11 @@ use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 use std::time::Duration;
 
-use switch_runtime::{RemoteWaker, Runtime};
+use switch::{RemoteWaker, Runtime};
 
 // ANCHOR: task
 /// Waits until another thread stores a nonzero value, then prints it.
-#[switch_runtime::task]
+#[switch::task]
 async fn wait_for_value(value: Arc<AtomicU32>, waker: Arc<OnceLock<RemoteWaker>>) {
     let seen = poll_fn(|cx| {
         let _ = waker.set(RemoteWaker::new(cx));

@@ -17,14 +17,14 @@ If something else wakes the yielded task during the same poll (a oneshot send, a
 A oneshot channel carries exactly one value from one place to one task. `switch::oneshot::channel()` returns a `Sender<T>` and a `Receiver<T>`:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/oneshot.rs:tasks}}
+{{#include ../../../examples/oneshot.rs:tasks}}
 ```
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/oneshot.rs:run}}
+{{#include ../../../examples/oneshot.rs:run}}
 ```
 
-Run it with `cargo run -p switch-runtime --example oneshot`. It prints:
+Run it with `cargo run -p switch-examples --example oneshot`. It prints:
 
 ```text
 received 42
@@ -63,28 +63,28 @@ The first is the task's standard `Waker`, the one in the `Context` its futures a
 The second is a `switch::RemoteWaker`, a small handle that is `Copy`, `Send` and `Sync`. `RemoteWaker::new(cx)`, like `StoredWaker::new`, takes the `Context` of a running switch task. To reach the `Context` from inside an `async fn`, wrap the waiting step in `std::future::poll_fn`:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/remote_wake.rs:task}}
+{{#include ../../../examples/remote_wake.rs:task}}
 ```
 
 On its first poll the task publishes a `RemoteWaker`, then parks until the shared value is set. `main` creates the runtime and the shared values, spawns the task and polls once, so the waker exists:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/remote_wake.rs:setup}}
+{{#include ../../../examples/remote_wake.rs:setup}}
 ```
 
 Then another thread sets the value and wakes the task:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/remote_wake.rs:thread}}
+{{#include ../../../examples/remote_wake.rs:thread}}
 ```
 
 The loop keeps polling until the task has finished:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/remote_wake.rs:loop}}
+{{#include ../../../examples/remote_wake.rs:loop}}
 ```
 
-Run it with `cargo run -p switch-runtime --example remote_wake`. It prints:
+Run it with `cargo run -p switch-examples --example remote_wake`. It prints:
 
 ```text
 woken with 7

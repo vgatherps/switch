@@ -1336,6 +1336,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "switch"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "switch-junction",
+ "switch-macros",
+ "switch-net",
+ "switch-netconf",
+ "switch-open",
+ "switch-runtime",
+ "switch-tls",
+ "switch-ws",
+]
+
+[[package]]
 name = "switch-bench"
 version = "0.1.0"
 dependencies = [
@@ -1407,6 +1422,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "switch-examples"
+version = "0.1.0"
+dependencies = [
+ "switch",
+]
+
+[[package]]
 name = "switch-frame"
 version = "0.1.0"
 
@@ -1448,6 +1470,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "switch",
  "switch-runtime",
  "syn 2.0.119",
  "trybuild",

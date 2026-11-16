@@ -21,13 +21,31 @@ use syn::{
 /// instantiation of a generic task function has its own pool. Takes no arguments.
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
+    task_attribute(attr, item, quote!(::switch_runtime), "switch_runtime::task")
+}
+
+#[doc(hidden)]
+#[proc_macro_attribute]
+pub fn facade_task(attr: TokenStream, item: TokenStream) -> TokenStream {
+    task_attribute(attr, item, quote!(::switch), "switch::task")
+}
+
+fn task_attribute(
+    attr: TokenStream,
+    item: TokenStream,
+    crate_path: TokenStream2,
+    attribute: &str,
+) -> TokenStream {
     if !attr.is_empty() {
-        return Error::new_spanned(TokenStream2::from(attr), "`#[switch_runtime::task]` takes no arguments")
-            .into_compile_error()
-            .into();
+        return Error::new_spanned(
+            TokenStream2::from(attr),
+            format!("`#[{attribute}]` takes no arguments"),
+        )
+        .into_compile_error()
+        .into();
     }
     let function = parse_macro_input!(item as ItemFn);
-    expand(function).unwrap_or_else(Error::into_compile_error).into()
+    expand(function, &crate_path, attribute).unwrap_or_else(Error::into_compile_error).into()
 }
 
 /// The task function becomes a function, with the same generics, building a token
@@ -35,7 +53,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async block for an `async fn`), with every argument rebound inside it. `token`
 /// keys the pool by a marker closure's type and the future type. The expansion
 /// declares no name the signature or body can see.
-fn expand(function: ItemFn) -> syn::Result<TokenStream2> {
+fn expand(function: ItemFn, crate_path: &TokenStream2, attribute: &str) -> syn::Result<TokenStream2> {
     let ItemFn {
         attrs,
         vis,
@@ -50,7 +68,7 @@ fn expand(function: ItemFn) -> syn::Result<TokenStream2> {
     {
         return Err(Error::new(
             span,
-            "`#[switch_runtime::task]` functions cannot be const, unsafe or extern",
+            format!("`#[{attribute}]` functions cannot be const, unsafe or extern"),
         ));
     }
     let mut bindings = Vec::new();
@@ -58,19 +76,19 @@ fn expand(function: ItemFn) -> syn::Result<TokenStream2> {
         let FnArg::Typed(input) = input else {
             return Err(Error::new(
                 input.span(),
-                "`#[switch_runtime::task]` functions cannot take `self`",
+                format!("`#[{attribute}]` functions cannot take `self`"),
             ));
         };
         let Pat::Ident(pattern) = input.pat.as_mut() else {
             return Err(Error::new(
                 input.pat.span(),
-                "`#[switch_runtime::task]` arguments must be plain identifiers",
+                format!("`#[{attribute}]` arguments must be plain identifiers"),
             ));
         };
         if pattern.by_ref.is_some() || pattern.subpat.is_some() {
             return Err(Error::new(
                 pattern.span(),
-                "`#[switch_runtime::task]` arguments must be plain identifiers",
+                format!("`#[{attribute}]` arguments must be plain identifiers"),
             ));
         }
         let cfgs = input
@@ -113,7 +131,7 @@ fn expand(function: ItemFn) -> syn::Result<TokenStream2> {
         let Some((bounds, output)) = future_bounds(&sig.output) else {
             return Err(Error::new_spanned(
                 &sig.output,
-                "`#[switch_runtime::task]` functions must be `async fn` or return `impl Future<Output = T>`",
+                format!("`#[{attribute}]` functions must be `async fn` or return `impl Future<Output = T>`"),
             ));
         };
         // The closure cannot name its return type, so `token` checks the future.
@@ -133,13 +151,13 @@ fn expand(function: ItemFn) -> syn::Result<TokenStream2> {
     let build = quote::format_ident!("build", span = Span::mixed_site());
     // Spanned at the function name, so a future that is not `'static` or does not
     // resolve to the declared output is reported there.
-    let token = quote_spanned!(name.span()=> ::switch_runtime::SpawnToken<impl ::switch_runtime::__private::Task<Output = #output>>);
+    let token = quote_spanned!(name.span()=> #crate_path::SpawnToken<impl #crate_path::__private::Task<Output = #output>>);
     let closure = quote_spanned!(name.span()=> let #build = move || #future;);
     // The marker is a closure: its type is unique to this function and carries every
     // generic parameter of it, `impl Trait` arguments included, so each instantiation
     // has its own pool even when its future type does not depend on a parameter.
     let spawn = quote_spanned! {name.span()=>
-        ::switch_runtime::__private::token(|| {}, #build)
+        #crate_path::__private::token(|| {}, #build)
     };
     Ok(quote! {
         #(#attrs)*
@@ -229,7 +247,7 @@ mod tests {
                 }
             ),
         ] {
-            let expanded = super::expand(function).unwrap();
+            let expanded = super::expand(function, &quote::quote!(::switch_runtime), "switch_runtime::task").unwrap();
             assert!(!has_unsafe(expanded));
         }
     }

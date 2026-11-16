@@ -1,22 +1,22 @@
 //! Your first task: spawn a task, get a value back, and wait on a timer, all on a
 //! runtime that only runs when `main` polls it.
 
-use switch_runtime::{JoinHandle, Runtime, Spawner};
+use switch::{JoinHandle, Runtime, Spawner};
 
 // ANCHOR: hello
-#[switch_runtime::task]
+#[switch::task]
 async fn hello(name: &'static str) {
     println!("Hello, {name}!");
 }
 // ANCHOR_END: hello
 
 // ANCHOR: join_tasks
-#[switch_runtime::task]
+#[switch::task]
 async fn double(value: u32) -> u32 {
     value * 2
 }
 
-#[switch_runtime::task]
+#[switch::task]
 async fn report(handle: JoinHandle<u32>) {
     let value = handle.await.unwrap();
     println!("double(21) = {value}");
@@ -24,7 +24,7 @@ async fn report(handle: JoinHandle<u32>) {
 // ANCHOR_END: join_tasks
 
 // ANCHOR: timer_task
-#[switch_runtime::task]
+#[switch::task]
 async fn wake_at_ten(spawner: Spawner) {
     spawner.sleep(10).unwrap().await.unwrap();
     println!("ten ticks passed");

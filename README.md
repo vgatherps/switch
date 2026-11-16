@@ -18,22 +18,21 @@ The API reference builds in the repository's Docker image (see [Try it](#try-it)
 
 ## Using the crates
 
-The crates are used from a clone of this repository. Clone it, then depend on the crates by path from your own `Cargo.toml`:
+Applications depend on `switch` from a clone of this repository:
 
 ```toml
 [dependencies]
 switch = { path = "<clone>/switch" }
-switch-net = { path = "<clone>/switch-net" }
 ```
 
-`<clone>` is where you cloned the repository. The [crate map](book/src/reference/crates.md) says which other crates an application may need.
+`<clone>` is where you cloned the repository. Enable `net` for networking, `tls` for TLS, or `ws` for WebSocket.
 
 ## Try it
 
 The runtime builds on macOS or Linux with only a Rust toolchain. From the clone:
 
 ```sh
-cargo run -p switch-runtime --example first_task
+cargo run -p switch-examples --example first_task
 ```
 
 This runs three short examples on the switch runtime with no network, and is explained in [Your first task](book/src/getting-started/first-task.md).

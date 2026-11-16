@@ -3,8 +3,8 @@
 //! Build from the repository root, then run as root on an allowed CPU (3 below):
 //!
 //! ```text
-//! cargo build -p switch-net --example tcp_echo_server
-//! taskset -c 3 target/debug/examples/tcp_echo_server switch-net/examples/tap.json 7000 &
+//! cargo build -p switch-examples --features net --example tcp_echo_server
+//! taskset -c 3 target/debug/examples/tcp_echo_server examples/tap.json 7000 &
 //! server=$!
 //! until ip link show cdnic0 >/dev/null 2>&1; do kill -0 "$server" || exit 1; sleep 0.1; done
 //! ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! This needs `CAP_NET_ADMIN` and `/dev/net/tun`, as provided by the Docker image.
-//! `switch_open::open` requires the calling thread to be allowed on exactly one CPU.
+//! `switch::nic::open` requires the calling thread to be allowed on exactly one CPU.
 //! The server runs until stopped or a network, runtime or task-spawn error occurs.
 
 use std::cell::RefCell;
@@ -22,11 +22,11 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
-use dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY;
-use switch_runtime::{Runtime, Spawner};
-use switch_net::{tcp, Error, Instant, IpListenEndpoint, Net, NetConfig, NetHandle, TcpStream};
-use switch_netconf::Config;
-use switch_open::{open, Sizing};
+use switch::nic::DEFAULT_NEIGHBOR_CAPACITY;
+use switch::{Runtime, Spawner};
+use switch::net::{tcp, Error, Instant, IpListenEndpoint, Net, NetConfig, NetHandle, TcpStream};
+use switch::nic::Config;
+use switch::nic::{open, Sizing};
 
 const BUFFER: usize = 64 * 1024;
 // One slot is for the next listener; the others are for active connections.
@@ -36,7 +36,7 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 type Failure = Rc<RefCell<Option<String>>>;
 
 // ANCHOR: accept_loop
-#[switch_runtime::task]
+#[switch::task]
 async fn accept_loop(
     spawner: Spawner,
     handle: NetHandle,
@@ -64,7 +64,7 @@ async fn accept_loop(
 }
 // ANCHOR_END: accept_loop
 
-#[switch_runtime::task]
+#[switch::task]
 async fn serve(handle: NetHandle, stream: TcpStream, failure: Failure) {
     if let Err(error) = echo(&handle, stream).await {
         *failure.borrow_mut() = Some(format!("echo: {error}"));
@@ -152,7 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break Err(error);
         }
         let (now, tick) = clock.sample();
-        match switch_net::round(&mut net, &mut rt, now, tick) {
+        match switch::net::round(&mut net, &mut rt, now, tick) {
             Ok(false) => std::thread::sleep(IDLE_SLEEP),
             Ok(true) => {}
             Err(error) => break Err(format!("round: {error:?}")),

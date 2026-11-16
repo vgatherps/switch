@@ -9,7 +9,7 @@ This page goes through the file key by key. The loader is strict: it rejects a f
 This is the tap device configuration the [first network program](../getting-started/first-connection.md) uses:
 
 ```json
-{{#include ../../../switch-net/examples/tap.json}}
+{{#include ../../../examples/tap.json}}
 ```
 
 And this is a config for an ENA card on EC2, the shape `switch-netconf discover --aws` writes:

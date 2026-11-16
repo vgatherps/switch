@@ -100,7 +100,7 @@ To run it, work in the DPDK environment from [Setting up a build environment](..
 cargo build -p switch-open --example tcp_client
 
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-taskset -c 3 target/debug/examples/tcp_client switch-net/examples/tap.json 192.0.2.1:7000 &
+taskset -c 3 target/debug/examples/tcp_client examples/tap.json 192.0.2.1:7000 &
 until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 wait

@@ -8,7 +8,7 @@ use std::{
 fn book_configurations_load() {
     let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [
-        "../../../switch-net/examples/tap.json",
+        "../../../examples/tap.json",
         "examples/dut-ena.json",
     ] {
         let path = crate_dir.join(relative);

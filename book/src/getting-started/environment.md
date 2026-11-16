@@ -64,7 +64,7 @@ These are the same capabilities and cache volumes the Makefile's own targets use
 Inside the container, build as usual:
 
 ```text
-root@container:/work# cargo build -p switch-net --example tcp_client_local
+root@container:/work# cargo build -p switch-examples --features net --example tcp_client_local
 ```
 
 The first build compiles DPDK's bindings and the workspace and takes a few minutes; the volumes keep the result for the next container.

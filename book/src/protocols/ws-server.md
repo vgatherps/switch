@@ -7,7 +7,7 @@ A switch-ws server takes an accepted TCP connection, answers the client's `ws://
 Connections are accepted as on [Accepting](../net/opening.md#accepting): each `tcp_accept` is one listening socket that becomes one connection, so the next accept is armed before this connection is served. The accept loop from the TCP echo example:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_echo_server.rs:accept_loop}}
+{{#include ../../../examples/tcp_echo_server.rs:accept_loop}}
 ```
 
 ## Upgrading

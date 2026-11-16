@@ -1,20 +1,20 @@
-use switch_runtime::{Runtime, Spawner};
+use switch::{Runtime, Spawner};
 
 // ANCHOR: async_task
-#[switch_runtime::task]
+#[switch::task]
 async fn parent(spawner: Spawner) {
     println!("parent polled");
     spawner.spawn(child()).unwrap();
 }
 
-#[switch_runtime::task]
+#[switch::task]
 async fn child() {
     println!("child polled");
 }
 // ANCHOR_END: async_task
 
 // ANCHOR: plain_fn
-#[switch_runtime::task]
+#[switch::task]
 fn plain(message: &'static str) -> impl Future<Output = ()> {
     println!("plain function called at spawn time");
     async move {

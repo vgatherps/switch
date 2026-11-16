@@ -33,7 +33,7 @@ Wake queues are plain `Vec`s: they grow as tasks queue, without pre-reservation 
 ```sh
 cargo test -p switch-runtime
 cargo bench -p switch-runtime    # executor, timer_wheel, runtime (Criterion)
-cargo run -p switch-runtime --example manual_loop
+cargo run -p switch-examples --example manual_loop
 ```
 
 Examples are `basic` and `manual_loop`.

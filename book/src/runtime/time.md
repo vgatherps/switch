@@ -7,7 +7,7 @@ The runtime knows only the ticks your loop passes to `poll`, as described in [Dr
 A task waits for time with a `Sleep`, a future created by its spawner:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/manual_loop.rs:sleep_task}}
+{{#include ../../../examples/manual_loop.rs:sleep_task}}
 ```
 
 Creating the sleep returns a `Result`, and awaiting it returns another; both errors are covered [below](#errors). The `Sleep` belongs to the runtime whose spawner created it.
@@ -15,7 +15,7 @@ Creating the sleep returns a `Result`, and awaiting it returns another; both err
 `switch/examples/manual_loop.rs` drives this task with hand-picked ticks:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/manual_loop.rs:tick_loop}}
+{{#include ../../../examples/manual_loop.rs:tick_loop}}
 ```
 
 The runtime starts at tick 100. In the first poll the task creates `sleep(10)`, whose deadline is 110, and parks. The second poll passes 100 again; the deadline is not reached and the task stays parked. The third poll passes 110, the timer fires, and the task prints `deadline reached`.
@@ -31,10 +31,10 @@ There are two ways to state the deadline.
 When your ticks are nanoseconds, convert a `Duration` by counting nanoseconds:
 
 ```rust,ignore
-{{#include ../../../switch-runtime/examples/clock_loop.rs:sleep_duration}}
+{{#include ../../../examples/clock_loop.rs:sleep_duration}}
 ```
 
-`cargo run -p switch-runtime --example clock_loop` runs this task next to the sliced sum from [Driving the runtime](driving.md#fairness-no-task-is-interrupted); the sleep finishes after the sum:
+`cargo run -p switch-examples --example clock_loop` runs this task next to the sliced sum from [Driving the runtime](driving.md#fairness-no-task-is-interrupted); the sleep finishes after the sum:
 
 ```text
 sum = 49995000
