@@ -58,7 +58,16 @@ With `"rx_timestamps": true`, the card records when each packet arrived, by its 
 port open: port setup failed: InvalidSettings("PMD lacks the requested RX timestamp offload")
 ```
 
-On EC2, timestamps need the instance family and placement group described in [Running on EC2](ec2.md#before-you-log-in).
+Which drivers offer receive timestamps, in the DPDK the repository builds:
+
+| Driver | Timestamps |
+|---|---|
+| `net_ena` | when the instance's ENA supports them: nanoseconds of the card's clock. On EC2 that needs the instance family and placement group described in [Running on EC2](ec2.md#before-you-log-in). |
+| `net_ice` | yes, from the card's clock |
+| `net_i40e`, `net_ixgbe`, `net_tap` | no |
+| `net_af_packet` | yes, but they are the Linux kernel's receive time in nanoseconds, taken in software, not by the card |
+
+`switch-nic info` shows whether a card offers them: bit 14 (`0x4000`) of `rx_offload_capa` is set.
 
 Two drivers add a line to the report when timestamps are on:
 

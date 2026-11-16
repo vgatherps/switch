@@ -12,54 +12,57 @@ It reads the same [network config file](config.md) as a program that owns the ca
 
 ## Try it on a tap device
 
-The daemon needs a CPU for its network thread and another for its other threads, and an application needs a CPU of its own, so use a container with four CPUs.
+The daemon needs a CPU for its network thread and another for its other threads, and an application needs a CPU of its own, so use a container with three CPUs. These steps use the tap config `examples/tap.json` (shown in [The network config file](config.md#two-examples)) and the same CPUs and directory as the guide chapter Sharing a network card.
 
 1. From the repository root, start a container from the Docker image:
 
    ```sh
    docker run --rm -it --init \
        --cap-add NET_ADMIN --device /dev/net/tun \
-       --cpuset-cpus=0-3 \
+       --cpuset-cpus=0-2 \
        -v "$PWD:/work" -w /work \
        -v switch-cargo-registry:/usr/local/cargo/registry \
        -v switch-linux-target:/work/target \
        switch-dpdk-test:local bash
    ```
 
-2. Inside it, build the daemon as above, and save this config as `jn0.json`. It gives the daemon a tap interface `jn0` with the address 10.77.0.2:
-
-   ```json
-   {
-     "version": 1,
-     "device": {"vdev": "net_tap_jn0,iface=jn0"},
-     "mac": null,
-     "ipv4": "10.77.0.2/24",
-     "gateway": null,
-     "mtu": 1500,
-     "paths": [],
-     "offloads": {"rx_checksum": false, "tx_tcp_checksum": false, "tx_udp_checksum": false},
-     "rx_timestamps": false,
-     "descriptors": 512,
-     "eal": {"file_prefix": "jn0", "extra": ["--no-huge", "-m", "512", "--no-shconf"]}
-   }
-   ```
-
-3. Start the daemon with its network thread on CPU 2 and its other threads on CPU 0, wait until it is serving, and give the Linux side of `jn0` its address:
+2. Inside it, build the daemon and the example client:
 
    ```sh
-   taskset -c 2 target/release/switch-junctiond --config jn0.json --control-cpus 0 &
-   until [ -S /run/switch-junctiond/control.sock ] && ip link show jn0 >/dev/null 2>&1; do sleep 0.1; done
-   ip addr add 10.77.0.1/24 dev jn0 && ip link set jn0 up
+   cargo build --locked --release -p switch-junctiond --bins
+   cargo build --locked --release -p switch-examples --features net --example tcp_client_junction
+   ```
+
+3. Start the daemon with its network thread on CPU 0 and its other threads on CPU 1, wait until it is serving, and give the Linux side of the tap device, `cdnic0`, its address:
+
+   ```sh
+   taskset -c 0 target/release/switch-junctiond --config examples/tap.json --dir /tmp/example-junction --control-cpus 1 &
+   until [ -S /tmp/example-junction/control.sock ] && ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
+   ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
    ```
 
    The daemon prints DPDK's `EAL:` lines and nothing else. Its directory now holds the socket applications connect to:
 
    ```text
-   $ ls /run/switch-junctiond
-   control.sock  cph1858708a122c804e  lock
+   $ ls /tmp/example-junction
+   control.sock
+   cphc4be34a27a7d0f93
+   lock
    ```
 
-4. Run an application against it on CPU 3, as the guide chapter Sharing a network card shows with the `tcp_client_junction` example.
+4. Start a one-shot server on the Linux side and run the client on CPU 2:
+
+   ```sh
+   python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
+   taskset -c 2 target/release/examples/tcp_client_junction /tmp/example-junction/control.sock 192.0.2.1:7000
+   ```
+
+   It prints the server's reply and `session finished`:
+
+   ```text
+   tick
+   session finished
+   ```
 
 5. Stop the daemon:
 

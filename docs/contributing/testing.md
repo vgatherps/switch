@@ -64,7 +64,7 @@ Inside the container, `make test` from `conduit/Makefile` runs these targets in 
 | `test-bench` | `switch-bench`, including an end-to-end test over a tap device |
 | `test-netconf` | `switch-netconf` and `switch-open` |
 | `test-packetdrill` | packetdrill scripts, scripted TCP conversations with exact timing, against `switch-tap-echo` |
-| `test-switch-net` | `switch-net`, a build of its benchmarks, and a build of the network examples in `switch-examples` |
+| `test-switch-net` | `switch-net`, a build of its benchmarks, and a build of the `switch-examples` programs that need only feature `net` |
 | `test-junction` | `switch-junction`, then `switch-junctiond` |
 | `test-wss` | `switch-ws` and `switch-tls` with their network support, against kernel servers over a tap device |
 | `test-binance` | `switch-binance-feed`, offline |
@@ -115,6 +115,18 @@ taskset -c 3 make -C conduit test DOCKER_CPUSET=3 PACKETDRILL_CPUSET=4 PACKETDRI
 
 Natively, the tests that create tap devices and veth pairs need root or `CAP_NET_ADMIN` and `CAP_NET_RAW`, and `/dev/net/tun`; they create the devices in your network namespace.
 
+## Tests that need two CPUs
+
+Two tests check where DPDK's helper threads run, so they need more than the one CPU every other DPDK test requires. Inside `make test` they print `SKIP: ...` and pass. Run them by hand when you change how `switch-open` or `switch-junctiond` place helper threads. Start the container above with `--cpuset-cpus=0,2` instead of `--cpuset-cpus=3`, and run each test on its own with `--exact`, because the tests around it need exactly one CPU:
+
+```sh
+cargo test --locked -p switch-open --lib eal_affinity::tests::eal_helpers_avoid_polling_cpu -- --exact
+cargo test --locked -p switch-junctiond --test process \
+    explicit_control_cpu_keeps_every_helper_off_the_network_cpu -- --exact --test-threads=1
+```
+
+The first starts DPDK in a child process with one CPU treated as isolated and checks that the helper threads stay off it; it needs two allowed CPUs, one of them not isolated by the kernel. The second starts the daemon with `--control-cpus 2` on CPU 0 and checks that its main thread may run only on CPU 0 and every other thread only on CPU 2; it needs CPUs 0 and 2 among the allowed CPUs.
+
 ## CPUs, timeouts and parallel runs
 
 Each Docker target runs on CPUs of its own:
@@ -149,8 +161,9 @@ The packetdrill tests check timing, so a lock shared by every checkout lets one 
 
 These are not part of `docker-test`:
 
-| Target | What |
+| Command | What |
 |---|---|
+| `cargo bench -p switch-runtime` | The runtime's Criterion benchmarks (executor, timer wheel, whole runtime). No DPDK; runs on macOS. Run them before and after a change to the runtime |
 | `make -C conduit docker-soak` | A two-stack soak test with an impaired link for `SOAK_SECONDS` (default 600), seeded by `SOAK_SEED` |
 | `make -C conduit docker-fuzz` | The Scapy mutation fuzzer against `switch-tap-echo` (`FUZZ_SEED`, `FUZZ_CONNECTIONS`) |
 | `make -C conduit docker-bench-stack` | The stack's Criterion benchmarks; `BENCH_FILTER` picks benchmarks by name |

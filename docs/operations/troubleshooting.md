@@ -14,6 +14,7 @@ When something fails inside DPDK, its driver usually writes the details to stder
 | `EAL helper CPU affinity: explicit EAL helper CPUs require Linux`, `EAL helper CPU affinity: EAL helper CPUs must be nonempty and below CPU_SETSIZE` | The program passed helper CPUs on another operating system, or an empty or out-of-range list. |
 | `EAL initialization: ...; restoring polling CPU affinity: ...` | DPDK failed, and the thread could not be put back on its one CPU. Fix the first error; the process should exit. |
 | `device lookup: "0000:00:06.0" was not found` | DPDK has no device by that name. A PCI card must be bound to `vfio-pci` (`switch-netconf bind`), and `pci` must match. For a `vdev`, the name is the part of the string before the first comma. |
+| stderr: `Failed to load the DDP package,Use safe-mode-support=1 to enter Safe Mode` | An E810 without its DDP package `ice.pkg`. Install it under `/lib/firmware/intel/ice/ddp/` ([Preparing a Linux machine](host-setup.md)); in Docker, mount the host's `/lib/firmware`. |
 | `device information: ...` | DPDK could not read the device's details; stderr has the reason. |
 | `device MAC: config 0a-12-34-56-78-9a differs from device 0a-12-34-56-78-9b` | The card at `pci` is not the one the config was written for. Fix `pci`, or rewrite the config with `switch-netconf discover -o` before binding. |
 | `descriptor adjustment: ...` | The driver refused the ring sizes. Change `descriptors`. |

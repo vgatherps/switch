@@ -1,59 +1,43 @@
 # switch
 
-switch is a set of Rust crates for network programs that need low, predictable latency. Your program runs its own TCP/IP stack in userspace, talks to the NIC directly through [DPDK](https://www.dpdk.org/), and drives the network and its async tasks from one loop on one CPU. Tasks are ordinary async Rust: they open TCP and UDP sockets, and TLS 1.3 and WebSocket connections on top of them.
+switch is a Rust library for network programs that need low, predictable latency, such as market-data feeds and order gateways. It is a userspace network stack: your program sends and receives packets through the network card directly, without going through the Linux kernel.
 
-A program gets its NIC in one of two ways. It can own the NIC itself, with the network stack inside its process. Or it can share the NIC with other programs through `switch-junctiond`, a daemon that owns the NIC and serves sockets over shared memory. The socket code is the same either way.
+You write the program as async tasks. A task opens TCP or UDP sockets and awaits them. TLS 1.3 and WebSocket run on top of TCP.
 
-## The book
+## Using it
 
-The documentation is an mdBook in [`book/`](book/src/SUMMARY.md) plus each crate's API reference (rustdoc). Start with the [Introduction](book/src/introduction.md), then [How the pieces fit together](book/src/overview/architecture.md). To read both rendered in a browser:
-
-```sh
-make docs        # builds the book and the API reference, and opens both
-make book        # the book only (needs mdbook: cargo install mdbook)
-make api-docs    # the API reference only
-```
-
-The API reference builds in the repository's Docker image (see [Try it](#try-it)), because most of the crates need DPDK; build the image once with `make -C conduit docker-image`. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
-
-## Using the crates
-
-Applications depend on `switch` from a clone of this repository:
+Programs depend on one crate, `switch`, from a clone of this repository:
 
 ```toml
 [dependencies]
 switch = { path = "<clone>/switch" }
 ```
 
-`<clone>` is where you cloned the repository. Enable `net` for networking, `tls` for TLS, or `ws` for WebSocket.
+That gives tasks and timers. The features `net`, `tls` and `ws` add sockets, TLS and WebSocket.
+
+## Documentation
+
+```sh
+make docs
+```
+
+builds the documentation of the `switch` crate and opens it in a browser. Its front page leads to the guide, which goes from a first task to a complete WebSocket client, and to the API reference.
 
 ## Try it
 
-The runtime builds on macOS or Linux with only a Rust toolchain. From the clone:
+This runs on any machine with cargo:
 
 ```sh
 cargo run -p switch-examples --example first_task
 ```
 
-This runs three short examples on the switch runtime with no network, and is explained in [Your first task](book/src/getting-started/first-task.md).
+The first chapter of the guide explains what it prints. The network examples need Linux with DPDK 25.11.3; the second chapter sets that up, in a container or on a Linux machine.
 
-Anything that touches the NIC needs Linux with DPDK 25.11.3. The repository ships a Docker image with everything installed, which also works on macOS:
+## Other documents
 
-```sh
-make -C conduit docker-image
-docker run --rm -it --init \
-    --cap-add NET_ADMIN --device /dev/net/tun --cpuset-cpus=3 \
-    -v "$PWD:/work" -w /work \
-    -v switch-cargo-registry:/usr/local/cargo/registry \
-    -v switch-linux-target:/work/target \
-    switch-dpdk-test:local bash
-```
-
-Inside the container, [Your first network program](book/src/getting-started/first-connection.md) builds a TCP client that runs over a tap device, a virtual NIC with the Linux kernel as the peer, so no spare network card is needed. [Setting up a build environment](book/src/getting-started/environment.md) explains the container and what builds where.
-
-## Tests
-
-`make test` at the repository root runs the tests that need no DPDK, on macOS or Linux. `make docker-test` runs the full suite in the Docker image. [Running the test suite](book/src/testing/suite.md) has the details.
+- [`docs/operations/`](docs/operations/README.md): preparing a machine and a network card, the config file, and the tools.
+- [`docs/benchmarks/`](docs/benchmarks/README.md): what is measured and how to run it.
+- [`docs/contributing/`](docs/contributing/): tests, conformance, and the map of the crates.
 
 ## License
 

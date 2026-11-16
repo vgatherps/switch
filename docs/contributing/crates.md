@@ -9,7 +9,7 @@ The workspace has 30 packages. Applications depend on one of them, `switch`, whi
 | Package | Directory | Needs DPDK | What it is |
 |---|---|---|---|
 | `switch` | `switch/` | only with feature `net` | The crate applications depend on. By default it re-exports the runtime: `Runtime`, `Spawner`, `#[switch::task]` and the rest. Feature `net` adds `switch::net`, `switch::nic` and `switch::junction`; `tls` adds `switch::tls`; `ws` adds `switch::ws` |
-| `switch-examples` | `examples/` | only with feature `net` | The runnable programs the guide uses, depending only on `switch`: `cargo run -p switch-examples --example first_task`, and network ones with `--features net` |
+| `switch-examples` | `examples/` | only with feature `net`, `tls` or `ws` | The runnable programs the guide uses, depending only on `switch`: `cargo run -p switch-examples --example first_task`; network ones need `--features net`, and the TLS and WebSocket ones `--features tls` or `--features ws` |
 
 ## The runtime
 

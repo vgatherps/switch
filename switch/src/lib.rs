@@ -1,8 +1,6 @@
-//! Application access to the caller-driven runtime and network crates.
-//! The default features expose tasks, timers and runtime primitives without networking.
-//! The `net` feature adds sockets, NIC setup and junction sessions.
-//! The `tls` feature adds TLS over those sockets and enables `net`.
-//! The `ws` feature adds WebSocket connections and enables `tls`.
+#![doc = include_str!("../docs/index.md")]
+
+pub mod guide;
 
 pub use switch_runtime::{
     JoinHandle, PollReport, RemoteWaker, Runtime, RuntimeError, Sleep, SleepError, SpawnError,
@@ -15,24 +13,33 @@ pub use switch_macros::facade_task as task;
 pub use switch_runtime::__private;
 
 #[cfg(feature = "net")]
-#[doc(inline)]
-pub use switch_net as net;
+pub mod net {
+    #![doc = include_str!("../docs/net.md")]
+    pub use switch_net::*;
+}
 
 #[cfg(feature = "net")]
-#[doc(inline)]
-pub use switch_junction as junction;
+pub mod junction {
+    #![doc = include_str!("../docs/junction.md")]
+    pub use switch_junction::{control, rx, session};
+}
 
 #[cfg(feature = "net")]
 pub mod nic {
+    #![doc = include_str!("../docs/nic.md")]
     pub use dpdk_smoltcp::{DEFAULT_NEIGHBOR_CAPACITY, Eal};
     pub use switch_netconf::{Config, ConfigError, Device, EalConfig, Offloads, PathRule, PciDevice};
     pub use switch_open::{Link, OpenError, OpenReport, Opened, Sizing, offloads, open};
 }
 
 #[cfg(feature = "tls")]
-#[doc(inline)]
-pub use switch_tls as tls;
+pub mod tls {
+    #![doc = include_str!("../docs/tls.md")]
+    pub use switch_tls::*;
+}
 
 #[cfg(feature = "ws")]
-#[doc(inline)]
-pub use switch_ws as ws;
+pub mod ws {
+    #![doc = include_str!("../docs/ws.md")]
+    pub use switch_ws::*;
+}

@@ -6,7 +6,7 @@ Every key is required except `owned_ipv4`, and unknown keys are rejected.
 
 ## Two examples
 
-A tap device, a virtual card that DPDK creates and that Linux sees as the interface `cdnic0`, so programs on the Linux side can be the peer:
+A tap device, a virtual card that DPDK creates and that Linux sees as the interface `cdnic0`, so programs on the Linux side can be the peer. This is `examples/tap.json` in the repository:
 
 ```json
 {

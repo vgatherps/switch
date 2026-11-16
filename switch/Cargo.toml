@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 description = "Caller-driven tasks and networking for applications"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 net = ["dep:switch-net", "dep:switch-junction", "dep:switch-open", "dep:switch-netconf", "dep:dpdk-smoltcp"]
@@ -22,6 +25,9 @@ switch-netconf = { workspace = true, optional = true }
 dpdk-smoltcp = { workspace = true, optional = true }
 switch-tls = { workspace = true, optional = true, features = ["switch-net"] }
 switch-ws = { workspace = true, optional = true, features = ["switch-net"] }
+
+[dev-dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
 
 [lints]
 workspace = true

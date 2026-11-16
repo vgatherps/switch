@@ -1340,6 +1340,7 @@ name = "switch"
 version = "0.1.0"
 dependencies = [
  "dpdk-smoltcp",
+ "rustls",
  "switch-junction",
  "switch-macros",
  "switch-net",

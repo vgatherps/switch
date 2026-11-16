@@ -1,6 +1,10 @@
 # Preparing a Linux machine
 
-These steps take a Linux machine with a spare network card to the point where a switch program owns that card. They are written for Ubuntu 24.04 and an Intel card (E810, X710, 82599 and relatives); on EC2, follow [Running on EC2](ec2.md) instead.
+These steps take a Linux machine with a spare network card to the point where a switch program owns that card. They are written for Ubuntu 24.04 and an Intel card; on EC2, follow [Running on EC2](ec2.md) instead.
+
+DPDK as the repository builds it (the Docker image, and `deploy/hft-host.sh`) has drivers for Intel E810 (`net_ice`), X710 and relatives (`net_i40e`), 82599 and X5xx (`net_ixgbe`) and Amazon ENA (`net_ena`), plus the virtual `net_tap`, `net_af_packet`, `net_memif`, `net_pcap` and `net_ring`. Other cards, such as Mellanox ConnectX, need a DPDK built with their driver.
+
+An E810 also needs its DDP package, `ice.pkg`. DPDK's driver loads it from `/lib/firmware/updates/intel/ice/ddp/` or `/lib/firmware/intel/ice/ddp/` when the card opens; without it the card does not start, and stderr contains `Failed to load the DDP package`.
 
 When a program owns a card, Linux no longer sees it: the interface disappears from `ip link`, and SSH, DNS and package updates cannot use it. The machine therefore needs two interfaces. The management interface stays with Linux and keeps the default route. The data interface is the one your program takes.
 
@@ -79,7 +83,7 @@ cargo build --locked --release -p switch-nic
 
 The commands below assume both binaries from `target/release` are on your `PATH`.
 
-Without a native DPDK, build the Docker image (`make -C conduit docker-image`) and use this shell function, defined in the `conduit/` directory. It builds `switch-nic` in the image and runs it pinned to `SWITCH_CPU` (default 2), with the host's network, hugepages, VFIO devices and firmware (the E810 loads `ice.pkg` from `/lib/firmware`):
+Without a native DPDK, build the Docker image (`make -C conduit docker-image`) and use this shell function, defined in the `conduit/` directory. It builds `switch-nic` in the image and runs it pinned to `SWITCH_CPU` (default 2), with the host's network, hugepages, VFIO devices and `/lib/firmware`, for the E810's DDP package:
 
 ```sh
 nic() {

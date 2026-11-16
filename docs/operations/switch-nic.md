@@ -101,18 +101,57 @@ sudo taskset -c 3 switch-nic --config dut.json sockperf-server --udp-ports 11111
     --tcp-connections 16 2>&1 | tee server.log
 ```
 
-On the client machine:
+On the client machine, with sockperf 3.10:
 
 ```sh
-sockperf ping-pong -i 10.0.1.23 -p 11111 -t 10 --msg-size 64
-sockperf ping-pong -i 10.0.1.23 -p 11112 --tcp -t 10 --msg-size 64
+sockperf ping-pong -i 10.0.1.23 -p 11111 -t 10 --msg-size 64 --data-integrity
+sockperf ping-pong -i 10.0.1.23 -p 11112 --tcp -t 10 --msg-size 64 --data-integrity
+sockperf under-load -i 10.0.1.23 -p 11111 -t 10 --msg-size 64 --mps 10000
 ```
 
-Once listening, the server prints `udp_listen` and `tcp_listen` lines and `switch-nic: server: ready`. Each report starts with `report: periodic`, or `report: final` at the end, followed by message counts per protocol (`udp:` and `tcp:` lines with `received`, `replies` and `malformed`, plus `accepted` and `closed` for TCP), one `udp_socket` line per port, one `tcp_socket` line per connection slot with its state and retransmissions, `stack_totals` and `eth_stats`. With `rx_timestamps` on, `udp_timestamps` and `tcp_timestamps` lines count the packets that carried a hardware timestamp.
+A clean client run ends with `# dropped messages = 0; # duplicated messages = 0; # out-of-order messages = 0`.
 
-Replies keep their order per socket, not across sockets, so give each sockperf client its own UDP port, and allow at least as many TCP connections as clients. Keep `--msg-size` at or below the path MTU minus 28 (1472 at MTU 1500): larger UDP messages need IP fragmentation, which switch does not do. A malformed TCP message resets that connection.
+Replies keep their order per socket, not across sockets, so point each sockperf client at one port; several clients may share a port. Allow at least as many TCP connections as TCP clients. Keep `--msg-size` at or below the path MTU minus 28 (1472 at MTU 1500): larger UDP messages need IP fragmentation, which switch does not do. A malformed TCP message resets that connection.
+
+### The server's output
+
+Once listening, the server prints `udp_listen` and `tcp_listen` lines and `switch-nic: server: ready`. Every `--report-seconds`, and once more at the end, it prints a report:
+
+| Line | Meaning |
+|---|---|
+| `report: periodic`, `report: final` | start of a report |
+| `udp: received= replies= malformed=` | UDP messages received, answered, and rejected as malformed |
+| `tcp: received= replies= malformed= accepted= closed=` | the same for TCP, plus connections accepted and closed |
+| `udp_timestamps: datagrams= stamped= first= last= decreases=`, `tcp_timestamps: segments= ...` | only with `rx_timestamps` on; see below |
+| `udp_socket: port= pending= UdpSocketStats { rx_dropped_full: }` | per UDP port: `pending=1` while a reply waits for room to send or for ARP; `rx_dropped_full` counts datagrams dropped because the socket's receive queue was full |
+| `tcp_socket: slot= state= retransmits= loss_events= rx_refused_segments=` | per TCP connection slot: its state (`LISTEN`, `ESTABLISHED`, ...), segments sent again, loss episodes, and out-of-order segments refused because too many were already held |
+| `stack_totals` | packets received, rejected and processed, packets sent, and what is still queued |
+| `eth_stats` | the card's counters, as in `info` |
+
+The timestamp lines count the UDP datagrams, or the TCP frames handed to the server, that arrived (`datagrams`, `segments`) and how many carried a hardware timestamp (`stamped`). `first` and `last` are the first and latest stamp, in the driver's raw units ([Offloads](offloads.md#hardware-receive-timestamps)). `decreases` counts stamps lower than the previous one on the same socket; that is not an error. A nonzero stamp while `rx_timestamps` is off stops the server with `nonzero RX timestamp <n> with rx_timestamps disabled`.
 
 On SIGINT, SIGTERM or the end of `--seconds`, the server closes its TCP connections, waiting up to five seconds, prints the final report and closes the card. It exits 3 if the connections did not close in time or a UDP reply was still unsent.
+
+### Merging client logs
+
+`conduit/crates/switch-nic/sockperf_merge.py` combines the latency logs of several `under-load` clients into one summary. Run each client with `--full-rtt --full-log <file>`, then merge the files:
+
+```sh
+sockperf under-load -i 10.0.1.23 -p 11111 -t 10 --mps 10000 --full-rtt --full-log client1.full
+python3 conduit/crates/switch-nic/sockperf_merge.py client1.full client2.full
+```
+
+It prints one `key: value` line each:
+
+| Key | Meaning |
+|---|---|
+| `unit` | `rtt usec` for full round trips, `latency usec` for clients run without `--full-rtt` (half round trips); mixing the two is refused |
+| `samples` | latency samples across all files; sockperf logs one per message it asked a reply for |
+| `p50`, `p99`, `p99.9`, `max` | percentiles (nearest rank) and maximum, in microseconds |
+| `offered_mps` | the sum of the clients' `--mps` |
+| `achieved_mps` | messages sent per second over each client's valid run time, summed |
+
+A file that is not a sockperf 3.10 `--full-log`, or whose sample rows do not match its received-message count, fails with `sockperf_merge.py: <file>: <reason>` and exit status 1. `--self-test` checks the script itself.
 
 ## feed
 
@@ -126,6 +165,6 @@ On SIGINT, SIGTERM or the end of `--seconds`, the server closes its TCP connecti
 | `--print N` | 10 | messages to print |
 | `--seconds S` | 30 | how long to read, counted from when the WebSocket opens |
 
-The config needs a `gateway`; without one `feed` stops with `feed requires a gateway in the config`. Before opening the card it resolves the host name through Linux and prints `resolved: <host> -> <address>` and `feed_mss_cap: <n>`, the largest TCP segment it will send toward that address. After opening it prints `phc_check`: how far the card's clock is from the system clock (`phc_minus_realtime_ns=<n>`), or `unsupported` when the driver cannot read its clock.
+The config needs a `gateway`; without one `feed` stops with `feed requires a gateway in the config`. Before opening the card it resolves the host name through Linux and prints `resolved: <host> -> <address>` and `feed_mss_cap: <n>`, the largest TCP segment it will send toward that address. After opening it prints `phc_check`: how far the card's clock is from the system clock (`phc_minus_realtime_ns=<n>`), `unsupported` when the driver cannot read its clock, or `read_clock failed: <code>` with DPDK's negative error number when reading it failed. The feed runs either way.
 
 Then it prints `feed_connected`, one `feed_message` line for each of the first N messages, `feed_count`, `feed_latency`, `feed_update_ids` and `feed_close`. `feed_latency` is a histogram of the system clock at each message minus the card's receive timestamp, in nanoseconds with power-of-two buckets, plus `no_stamp`, the count of messages without a timestamp; it is only meaningful with `rx_timestamps` on and the system clock synchronised to the card's ([Running on EC2](ec2.md#running-the-market-data-feed)). If the card was reset during the run, the line reads `latency invalid: NIC clock jumped`. SIGINT or SIGTERM ends the feed early. It exits 3 if no message arrived.
