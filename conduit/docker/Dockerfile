@@ -1,4 +1,4 @@
-FROM rust:1.93.0-bookworm@sha256:d0a4aa3ca2e1088ac0c81690914a0d810f2eee188197034edf366ed010a2b382 AS rust
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS rust
 
 FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
 
 # ENA: device PHC reads, datapath reset notifications, and metrics error propagation.
+# ANCHOR: dpdk
 COPY dpdk-ena-read-clock.patch /tmp/dpdk-ena-read-clock.patch
 RUN curl --fail --location --retry 2 -o /tmp/dpdk.tar.xz \
         https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz \
@@ -22,6 +23,7 @@ RUN curl --fail --location --retry 2 -o /tmp/dpdk.tar.xz \
         -Denable_drivers=net/ring,net/pcap,net/tap,net/memif,net/af_packet,net/ena,net/intel/ixgbe,net/intel/i40e,net/intel/ice \
     && ninja -C /tmp/dpdk/build && meson install -C /tmp/dpdk/build \
     && rm -rf /tmp/dpdk /tmp/dpdk.tar.xz /tmp/dpdk-ena-read-clock.patch
+# ANCHOR_END: dpdk
 
 COPY packetdrill-relearn-isn.patch /tmp/packetdrill-relearn-isn.patch
 RUN apt-get update && apt-get install -y --no-install-recommends flex bison patch \

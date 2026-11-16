@@ -205,7 +205,7 @@ impl Tls {
 
     /// Sends close_notify, then FIN, and returns once the server acked them (or the connection
     /// ended), so the connection may be dropped then; until then it stays pending, so the caller
-    /// bounds it. Receiving goes on.
+    /// bounds it. This call does not receive application data.
     pub async fn close(&mut self) -> Result<(), Error> {
         let f = self.tx.alloc().await.map_err(Error::Send)?;
         let (_, room) = self.tx.plain();

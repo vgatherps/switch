@@ -1,6 +1,6 @@
 //! Single-threaded packet frames with producer-owned storage.
 //!
-//! A frame is a handle to a run of packet bytes that some producer owns: a DPDK packet buffer, a record in a shared-memory ring, a buffer in a pool. Every layer of switch hands received data and send buffers to application code as frames, so bytes are not copied between the network and your task. Application code uses the two frame types; only libraries that manage packet memory create frames.
+//! A frame is a handle to a run of packet bytes that some producer owns: a DPDK packet buffer, a record in a shared-memory ring, a buffer in a pool. Every layer of switch hands received data and send buffers to application code as frames. Frames let each layer pass packet bytes on without copying them; a transport may still copy once when it sends or receives. Application code uses the two frame types; only libraries that manage packet memory create frames.
 //!
 //! [`OwnedFrame`] is the only handle to its bytes and dereferences to `&mut [u8]`. [`OwnedFrame::freeze`] turns it into an [`ImmutableFrame`], a shared, read-only handle whose `clone` copies no bytes. [`ImmutableFrame::try_own`] turns a shared frame back into an `OwnedFrame` when it is the last handle. `slice` (on both types) and [`OwnedFrame::truncate`] narrow a frame without copying. When the last handle is dropped, the producer's [`Release`] function runs on the dropping thread and the memory goes back to the producer.
 //!

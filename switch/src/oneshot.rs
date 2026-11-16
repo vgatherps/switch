@@ -4,15 +4,6 @@
 //! waiting task. Neither side is `Send` or `Sync`, so both stay on the
 //! thread that made them. The [`Receiver`] must be polled by a switch task,
 //! whose [`StoredWaker`] it keeps.
-//!
-//! ```compile_fail
-//! fn require_send<T: Send>() {}
-//! require_send::<switch::oneshot::Sender<u8>>();
-//! ```
-//! ```compile_fail
-//! fn require_send<T: Send>() {}
-//! require_send::<switch::oneshot::Receiver<u8>>();
-//! ```
 
 use std::cell::Cell;
 use std::fmt;
@@ -22,6 +13,18 @@ use std::ptr::NonNull;
 use std::task::{Context, Poll};
 
 use crate::StoredWaker;
+
+#[cfg(doctest)]
+mod thread_checks {
+    //! ```compile_fail
+    //! fn require_send<T: Send>() {}
+    //! require_send::<switch::oneshot::Sender<u8>>();
+    //! ```
+    //! ```compile_fail
+    //! fn require_send<T: Send>() {}
+    //! require_send::<switch::oneshot::Receiver<u8>>();
+    //! ```
+}
 
 /// The sender was dropped without sending a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

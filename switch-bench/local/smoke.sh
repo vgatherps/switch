@@ -10,6 +10,7 @@
 # time with its loss reported and a complete summary.
 # Usage: [GENS=2] [SENDERS=2*GENS] [PROTOS="udp tcp ws"] smoke.sh OUT_DIR [extra sweep flags...]
 set -eu
+# ANCHOR: vars
 out=$1
 shift
 gens=${GENS:-2}
@@ -19,6 +20,7 @@ bench=${BENCH:-../target/release/switch-bench}
 cpus=$(taskset -pc $$ | sed 's/.*: //')
 case "$cpus" in *-*) first=${cpus%-*}; last=${cpus#*-} ;; *) echo "need a CPU range, got $cpus" >&2; exit 2 ;; esac
 [ $((last - first + 1)) -ge $((gens + 2)) ] || { echo "need $((gens + 2)) CPUs, have $cpus" >&2; exit 2; }
+# ANCHOR_END: vars
 [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "needs net.ipv4.ip_forward=1" >&2; exit 2; }
 mkdir -p "$out"
 dut_addr=10.10.0.2

@@ -5,7 +5,6 @@
 /// Bytes of the header: step u32, sender u32, seq u64, scheduled send time u64 (ns since the
 /// generator's origin), little endian.
 pub const HEADER: usize = 24;
-// ANCHOR_END: header
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -14,6 +13,7 @@ pub struct Header {
     pub seq: u64,
     pub sched_ns: u64,
 }
+// ANCHOR_END: header
 
 impl Header {
     /// Writes the header at the start of `buf` (at least `HEADER` bytes); the rest is left as is.

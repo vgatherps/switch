@@ -226,11 +226,11 @@ async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mu
 /// acked them, so the connection (and the Net) may be dropped at once. A server that never
 /// acks keeps `recv` waiting: bound it.
 ///
-/// Progress needs a call: there is no background task. Output queued by one call (the rest of
-/// a message, a pong, a close echo) goes out during the next `send`, `close`, `recv` or
-/// `linger`. `send` and `recv` cannot run at once: if both peers send past each other's
-/// windows before reading, both wait; keep sends within the window or alternate them with
-/// reads.
+/// Progress needs a call: there is no background task. Control output queued while reading
+/// (a pong or a close echo) goes out during the next `send`, `close`, `recv` or `linger`.
+/// `send` and `recv` cannot run at once. On the local backend, if both peers send past each
+/// other's windows before reading, both wait; keep sends within the window or alternate
+/// them with reads. The junction backend queues sends in the daemon without a byte limit.
 pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>, TcpRx>);
 
 /// An open ws:// connection, client or server, used from one task. A ping is answered within

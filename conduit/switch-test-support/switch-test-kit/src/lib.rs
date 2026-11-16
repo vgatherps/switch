@@ -1,6 +1,43 @@
 //! DPDK fixtures shared by the workspace's integration tests and benches.
 //!
-//! [`with_eal`] starts EAL on the calling thread the first time and passes it to the closure: no PCI devices, no hugepages, 1 GiB of ordinary memory, the main thread pinned to the one CPU the process may use ([`eal_args`] panics if it may use more). Call it from a `#[switch_test_support::pinned_test]` body. The modules build fake NICs and wires on top: [`ring_port::RingPort`] is a NIC port on two in-memory rings where the test is the peer; [`pair::Pair`] is two real `Stack`s on ring ports, joined by copying [`wire::Link`]s on one test-driven clock, with [`wire::Verdict`] per frame to drop, duplicate or hold traffic; [`many`] opens many connections over a `Pair`; [`peers`] answers for on-link neighbors; [`tap::TapVdev`] and [`pcap::PcapVdev`] are net_tap and net_pcap devices. Declare fixtures that own a device or ring before the port they back, and `close` them: one dropped without `close` cleans up and then, outside a panic, fails the test. Fixture names must be unique among live fixtures.
+//! With these fixtures a test starts DPDK, opens NIC ports that need no hardware, and runs two real
+//! `Stack`s against each other on a simulated wire, driven by a clock the test advances itself, so
+//! nothing sleeps and every run is the same. Run each test body with
+//! `#[switch_test_support::pinned_test]`, so it runs on the one thread that owns EAL.
+//!
+//! This test establishes a TCP connection, sends four bytes from side A, drives until side B has
+//! them, and checks that every packet buffer came back:
+//!
+//! ```no_run
+//! use switch_test_kit::pair::{App, Pair, Side, T0, config, establish};
+//! use switch_test_kit::with_eal;
+//!
+//! with_eal(|eal| {
+//!     let mut pair = Pair::new(eal, ["book_a", "book_b"], [config(Side::A), config(Side::B)], T0);
+//!     let ([client, server], _) = establish(&mut pair, Side::A);
+//!     pair.a.tcp_mut(&client).send_slice(b"book").unwrap();
+//!     pair.drive(
+//!         |_, _| {},
+//!         |_, b| if b.tcp(&server).recv_queue() == 4 { App::Done } else { App::Idle },
+//!     );
+//!     pair.round(|_, _| {});
+//!     assert_eq!(pair.close(), 0);
+//! });
+//! ```
+//!
+//! [`with_eal`] starts EAL on the calling thread the first time and passes it to the closure: no
+//! PCI devices, no hugepages, 1 GiB of ordinary memory, the main thread pinned to the one CPU the
+//! process may use ([`eal_args`] panics if it may use more).
+//! [`ring_port::RingPort`] is a NIC port on two in-memory rings where the test is the peer.
+//! [`pair::Pair`] is two `Stack`s on ring ports joined by copying [`wire::Link`]s, with a
+//! [`wire::Verdict`] per frame to deliver, duplicate, drop or hold traffic.
+//! [`many`] opens many connections over a `Pair`, and [`peers`] answers for on-link neighbors.
+//! [`tap::TapVdev`] is a net_tap device with the Linux kernel as the peer, and [`pcap::PcapVdev`]
+//! reads and writes pcap files.
+//!
+//! Declare fixtures that own a device or ring before the port they back, so the port drops first,
+//! and `close` them. A fixture dropped without `close` cleans up and then, unless the test is
+//! already panicking, fails the test. Fixture names must be unique among live fixtures.
 //!
 //! See the switch book, chapter "Writing tests that use DPDK".
 

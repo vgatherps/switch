@@ -2,10 +2,15 @@
 //! the testkit example of the book's "Writing tests that use DPDK" page.
 //! Needs CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 
+// ANCHOR: setup
 use std::io::{Read, Write};
 
 use switch_net::testkit::{client_server, Backend, TapConfig};
 use switch_net::{tcp, NetHandle, TcpStream};
+
+const PORT: u16 = 7000;
+const LINE: &[u8] = b"hello";
+// ANCHOR_END: setup
 
 // ANCHOR: tap
 const TAP: TapConfig = TapConfig {
@@ -15,9 +20,6 @@ const TAP: TapConfig = TapConfig {
     random_seed: 1,
 };
 // ANCHOR_END: tap
-
-const PORT: u16 = 7000;
-const LINE: &[u8] = b"hello";
 
 // ANCHOR: serve
 /// The kernel side: reads one line and writes it back.

@@ -1,6 +1,27 @@
-//! Client of Binance's bookTicker stream: TLS 1.3 and WebSocket (switch-ws's wss client over switch-tls) on one switch-net TCP socket, run as a switch task. It is a worked example of the protocol crates and the market-data feed behind `switch-nic feed`.
+//! Client of Binance's bookTicker stream: TLS 1.3 and WebSocket (switch-ws's wss client over
+//! switch-tls) on one switch-net TCP socket, run as a switch task. It is a worked example of the
+//! protocol crates and the market-data feed behind `switch-nic feed`.
 //!
-//! [`feed`] is the whole client as one `#[switch::task]`: it connects within [`CONNECT_LIMIT`], reads updates until its `stop` oneshot fires, then runs the WebSocket close within [`CLOSE_LIMIT`], printing `{name}: {key}: {value}` lines and storing a [`Summary`] with a latency histogram (wall clock at hand-over minus the message's hardware timestamp). [`connect`] alone opens TCP, TLS and WebSocket under one time limit; [`resolve`], [`client_config`], [`socket`] and [`Clock`] are the setup pieces. Runtime ticks are monotonic nanoseconds ([`Clock::ns`]). The `switch-binance-feed` binary runs the feed on a tap device behind a NAT helper process.
+//! [`feed`] is the whole client as one `#[switch::task]`: it connects within
+//! [`CONNECT_LIMIT`], reads updates until its `stop` oneshot fires, then runs the WebSocket close
+//! within [`CLOSE_LIMIT`], printing `{name}: {key}: {value}` lines and storing a [`Summary`]
+//! with a latency histogram (wall clock at hand-over minus the message's hardware timestamp).
+//! [`connect`] alone opens TCP, TLS and WebSocket under one time limit; [`resolve`],
+//! [`client_config`], [`socket`] and [`Clock`] are the setup pieces. Runtime ticks are monotonic
+//! nanoseconds ([`Clock::ns`]).
+//!
+//! The `switch-binance-feed` binary runs the feed on a tap device behind a helper process (the
+//! tester) that gives the tap's kernel side its address and NATs the feed's traffic out:
+//!
+//! ```text
+//! switch-binance-feed [--host HOST] [--port PORT] [--path PATH] [--print N] -- <tester> [args...]
+//! ```
+//!
+//! Defaults: host `stream.binance.com`, port 9443, path `/ws/btcusdt@bookTicker`, 10 updates
+//! printed; each option at most once. Exit status: 0 the tester exited 0; 1 the tester failed;
+//! 2 packet buffers still in use at port close; 3 bad arguments, setup, feed or teardown error;
+//! 101 panic. Statuses 2 and 3 take precedence over the tester's. Run it with no arguments for
+//! the full usage, or through `make -C conduit docker-binance BINANCE_SECONDS=30`.
 //!
 //! Book: See the switch book, chapter "Walkthrough: a market-data feed".
 
@@ -156,7 +177,6 @@ pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
             .with_no_client_auth(),
     )
 }
-// ANCHOR_END: client_config
 
 /// `client_config` with the Mozilla roots from webpki-roots.
 pub fn webpki_client_config() -> Arc<ClientConfig> {
@@ -164,6 +184,7 @@ pub fn webpki_client_config() -> Arc<ClientConfig> {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     })
 }
+// ANCHOR_END: client_config
 
 // ANCHOR: socket
 /// Configures feed RX and TX buffers and an optional MSS cap.

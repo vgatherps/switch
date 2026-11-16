@@ -379,6 +379,7 @@ impl FramePool {
         })
     }
 
+    // ANCHOR: frame_pool
     fn take(self: &Rc<Self>) -> Option<OwnedFrame> {
         let mut buffer = self.free.borrow_mut().pop()?;
         buffer[0] = 1;
@@ -397,6 +398,7 @@ unsafe extern "C" fn release_buffer(rc: NonNull<u16>, ctx: *mut ()) {
     let buffer = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(rc.as_ptr(), words)) };
     pool.free.borrow_mut().push(buffer);
 }
+// ANCHOR_END: frame_pool
 
 #[cfg(test)]
 mod tests {

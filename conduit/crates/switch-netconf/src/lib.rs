@@ -14,7 +14,16 @@
 //! # Ok::<(), switch_netconf::ConfigError>(())
 //! ```
 //!
-//! See the switch book, chapter "The network config file".
+//! The `switch-netconf` command: checks a network config file, writes one from a Linux interface, and moves a PCI card between its kernel driver and `vfio-pci` so a DPDK program can open it. `check` prints the config summary or the first rule it breaks; `discover` reads the interface's address, MAC, MTU, PCI details and gateway (with `--aws`, also EC2 instance metadata) and prints the config or merges it into an existing file with `-o`; `bind` refuses before writing anything unless every check passes, and puts the kernel driver back if a later step fails; `unbind` returns the card to its kernel driver. `bind` and `unbind` need root. Exit status: 0 success, 1 failure (one `switch-netconf:` line on stderr), 2 usage error.
+//!
+//! ```text
+//! switch-netconf check FILE
+//! switch-netconf discover --interface IF [--ipv4 ADDR] [--aws] [-o FILE]
+//! switch-netconf bind FILE [--noiommu] [--dry-run]
+//! switch-netconf unbind FILE
+//! ```
+//!
+//! See the switch book, chapters "The network config file" and "switch-netconf: check, discover, bind, unbind".
 
 mod aws;
 mod config;

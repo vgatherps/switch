@@ -10,14 +10,14 @@
 //! `switch-netconf discover` writes.
 //!
 //! To try it without a NIC, as root on Linux (or in the Docker image with
-//! `--cap-add NET_ADMIN --device /dev/net/tun`), save the tap config from
-//! crates/switch-nic/README.md section 3 as `tap.json`. Start a kernel-side
-//! server that replies and then closes, start the client, and give the tap
-//! device its kernel address once the client has created it:
+//! `--cap-add NET_ADMIN --device /dev/net/tun`), use
+//! `switch-net/examples/tap.json`. Start a kernel-side server that replies and
+//! then closes, start the client, and give the tap device its kernel address
+//! once the client has created it:
 //!
 //! ```text
 //! python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-//! taskset -c 3 target/debug/examples/tcp_client tap.json 192.0.2.1:7000 &
+//! taskset -c 3 target/debug/examples/tcp_client switch-net/examples/tap.json 192.0.2.1:7000 &
 //! until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 //! ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 //! wait
@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let handle = stack.add_tcp(socket)?;
     stack.connect(&handle, server, LOCAL_PORT)?;
     // ANCHOR_END: connect
-    let mut said_hello = false;
+    let mut sent = 0;
     let mut server_closed = false;
     let mut out = io::stdout().lock();
     // ANCHOR: loop
@@ -104,9 +104,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let Some(frame) = socket.recv()? else { break };
             out.write_all(frame.payload())?;
         }
-        if !said_hello && socket.may_send() {
-            socket.send_slice(b"hello\n")?;
-            said_hello = true;
+        if sent < b"hello\n".len() && socket.may_send() {
+            sent += socket.send_slice(&b"hello\n"[sent..])?;
         }
         if socket.state() == State::CloseWait {
             server_closed = true;

@@ -69,7 +69,6 @@ impl Daemon {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         });
-        // ANCHOR: wait_ready
         loop {
             let exited = self.child.as_mut().unwrap().try_wait().unwrap();
             assert!(exited.is_none(), "daemon exited {exited:?}: {}", self.diagnostics());
@@ -81,7 +80,6 @@ impl Daemon {
             assert!(Instant::now() < deadline, "daemon did not serve: {}", self.diagnostics());
             std::thread::sleep(Duration::from_millis(1));
         }
-        // ANCHOR_END: wait_ready
     }
 
     fn diagnostics(&self) -> String {

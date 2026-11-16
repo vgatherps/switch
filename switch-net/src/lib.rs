@@ -373,8 +373,7 @@ fn tcp_recv_ready(socket: &tcp::Socket<'_>) -> bool {
 }
 
 /// Whether `room(len)` resolves: the socket can no longer send, or a frame of
-/// `len` bytes fits (`send_frame` refuses with `Full` when it exceeds the free
-/// bytes or no frame slot is free; `frame_send_room` is 0 without a slot).
+/// `len` bytes fits in the socket's free send bytes.
 fn tcp_room_ready(socket: &tcp::Socket<'_>, len: usize) -> bool {
     !socket.may_send()
         || (socket.send_capacity() - socket.send_queue() >= len && socket.frame_send_room() != 0)
@@ -1190,9 +1189,9 @@ impl UdpRx {
 pub struct UdpTx(Half);
 
 impl UdpTx {
-    /// Sends `frame` as one datagram (conduit `udp_send_frame`); `to` may be
-    /// `None` for a connected socket. Every error returns the same frame;
-    /// `Full` (TX queue full) clears after a turn.
+    /// Sends `frame` as one datagram to `to`. `None` returns `NoDestination`:
+    /// switch-net UDP sockets have no default destination. Every error returns
+    /// the same frame; `Full` (TX queue full) clears after a turn.
     pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
         let Inner::Local(inner) = &mut *inner else {

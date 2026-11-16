@@ -2,17 +2,21 @@
 //!
 //! DPDK's EAL starts once per process and belongs to the thread that started it, while the standard test harness runs each test on a new thread. [`pinned_test`] replaces `#[test]` and sends the test body to one worker thread per test binary, so every body in the binary runs on the thread that owns EAL. A panic in the body fails that test with its original payload. A body that runs longer than its bound, [`PINNED_TEST_BOUND`] (180 s) unless `#[pinned_test(bound_ms = N)]` sets another, prints the test's name to stderr and ends the whole test process with exit status 1, because the stuck worker still owns EAL. [`run`] is the function the attribute expands to. Run test binaries with `--test-threads=1`, in a process allowed on exactly one CPU.
 //!
-//! ```no_run
-//! use switch_test_support::pinned_test;
+//! This test, from `switch-test-kit`'s tests, starts EAL on the worker and checks who owns it:
 //!
-//! #[pinned_test]
-//! fn opens_a_port() {
-//!     // start EAL (for example with switch_test_kit::with_eal) and use it here
+//! ```ignore
+//! use switch_test_kit::with_eal;
+//!
+//! #[switch_test_support::pinned_test]
+//! fn eal_belongs_to_the_test_worker() {
+//!     with_eal(|eal| {
+//!         assert_eq!(eal.owner_lcore_id(), 7);
+//!     });
 //! }
-//!
-//! #[pinned_test(bound_ms = 5000)]
-//! fn must_finish_quickly() {}
 //! ```
+//!
+//! The block is not compiled here because `switch-test-kit` needs DPDK and this crate does not.
+//! `#[pinned_test(bound_ms = 5000)]` gives a body a 5-second bound instead of the default.
 //!
 //! See the switch book, chapter "Writing tests that use DPDK".
 use std::any::Any;

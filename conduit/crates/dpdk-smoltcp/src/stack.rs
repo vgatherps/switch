@@ -442,9 +442,10 @@ impl Stack {
         Ok(())
     }
 
-    /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
-    /// tidying (which wakes sockets waiting for a free frame if one is free), flush,
-    /// one RX burst, maintenance, then ingress. A burst that returned packets, a previously
+    /// Check time, service DPDK timers once a second, and check for Port reset recovery
+    /// on every call (see `turn`). Then tidy (waking sockets waiting for a free frame
+    /// if one is free), flush, take one RX burst, maintain, and process ingress.
+    /// A burst that returned packets, a previously
     /// low RX pool, or a recovered Port prompts a check against the low mark (one RX ring
     /// refill plus one burst). While low, each TCP socket processing a segment keeps no
     /// out-of-order data (`Interface::set_rx_pool_low`).
@@ -735,9 +736,8 @@ impl Stack {
     /// the frame until the peer ACKs its last byte. Errors return the frame
     /// untouched: `Foreign` when it came from another Stack's `tx_frame`,
     /// `InvalidState` unless the socket may send, `Empty` for a zero-length
-    /// frame, and `Full` when it exceeds the socket's free bytes or it has no
-    /// free frame slot (`frame_send_room`). Each frame takes one slot; one longer
-    /// than the segment payload is copied at send.
+    /// frame, and `Full` when it exceeds the socket's free send bytes.
+    /// A frame longer than the segment payload is copied at send.
     pub fn tcp_send_frame(
         &mut self,
         handle: &TcpHandle,

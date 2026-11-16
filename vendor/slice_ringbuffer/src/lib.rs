@@ -31,9 +31,11 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! Memory ordering: header and payload writes, then head Release, then reader head Acquire. After publication, each plain reference count is accessed only on the reader's thread; the writer never reads it. Frame release, then reclaim, then tail Release, then writer tail Acquire orders those accesses before reuse. Concurrent initialization through other backing handles or processes is outside the contract.
-//!
 //! See the switch book, chapter "Shared memory and the receive ring".
+//!
+//! # For implementers
+//!
+//! Memory ordering: header and payload writes, then head Release, then reader head Acquire. After publication, each plain reference count is accessed only on the reader's thread; the writer never reads it. Frame release, then reclaim, then tail Release, then writer tail Acquire orders those accesses before reuse. Concurrent initialization through other backing handles or processes is outside the contract.
 
 use switch_frame::OwnedFrame;
 use shared_memory::{Backing, DoubleMapping, Mapping};

@@ -1,4 +1,4 @@
-//! The same TCP client as `tcp_client.rs`, connected through a running
+//! The same TCP client as `tcp_client_local.rs`, connected through a running
 //! `switch-junctiond` instead of owning the NIC.
 //!
 //! ```text

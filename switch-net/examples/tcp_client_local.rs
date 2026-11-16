@@ -2,18 +2,18 @@
 //! prints what the server sends back, and shuts down once the server closes its side.
 //!
 //! ```text
-//! cargo build -p switch-net --example tcp_client
-//! taskset -c 3 target/debug/examples/tcp_client tap.json 192.0.2.1:7000
+//! cargo build -p switch-net --example tcp_client_local
+//! taskset -c 3 target/debug/examples/tcp_client_local tap.json 192.0.2.1:7000
 //! ```
 //!
-//! `switch_open::open` needs a process allowed on exactly one CPU, hence `taskset`.
+//! `switch_open::open` needs a calling thread allowed on exactly one CPU, hence `taskset`.
 //! To try it without a NIC (Linux with `CAP_NET_ADMIN` and `/dev/net/tun`, or the
 //! Docker image), use `tap.json` next to this file, start a kernel-side server, start
 //! the client, and give the tap device its kernel address once the client created it:
 //!
 //! ```text
 //! python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-//! taskset -c 3 target/debug/examples/tcp_client tap.json 192.0.2.1:7000 &
+//! taskset -c 3 target/debug/examples/tcp_client_local tap.json 192.0.2.1:7000 &
 //! until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 //! ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 //! wait
@@ -79,8 +79,11 @@ async fn hello(
 }
 
 async fn talk(handle: &NetHandle, server: IpEndpoint, socket: tcp::Config) -> Result<(), Error> {
+    // ANCHOR: core
+    // ANCHOR: connect
     let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
     let stream = handle.tcp_connect(socket, server, local).await?;
+    // ANCHOR_END: connect
     let (mut rx, mut tx) = stream.split();
 
     // ANCHOR: send
@@ -102,6 +105,7 @@ async fn talk(handle: &NetHandle, server: IpEndpoint, socket: tcp::Config) -> Re
         }
     }
     // ANCHOR_END: recv
+    // ANCHOR_END: core
 
     tx.shutdown();
     tx.delivered().await;
@@ -113,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR: config
     let mut args = std::env::args().skip(1);
     let (Some(config), Some(server)) = (args.next(), args.next()) else {
-        return Err("usage: tcp_client CONFIG HOST:PORT".into());
+        return Err("usage: tcp_client_local CONFIG HOST:PORT".into());
     };
     let config = Config::load(Path::new(&config))?;
     // Name lookup goes through the kernel and blocks, so do it before open.

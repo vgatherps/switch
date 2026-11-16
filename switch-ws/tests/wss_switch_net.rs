@@ -736,11 +736,13 @@ fn server_close_ends_recv_cleanly() {
             assert_close_notify_then_fin(ws.into_inner());
             echo
         },
+        // ANCHOR: server_close_client
         |mut wss| async move {
             assert!(wss.recv().await.expect("recv").is_none(), "a message instead of the end");
             assert_eq!(wss.peer_close(), Some((1001, "bye")));
             wss
         },
+        // ANCHOR_END: server_close_client
         || {},
     );
     let echo = echo.expect("the echoed close payload");

@@ -1,32 +1,58 @@
-//! TLS 1.3 client over TCP frames, on rustls's unbuffered client. Use it for a TLS connection over a switch-net TCP stream with your own protocol on top; for `wss://`, use switch-ws, which runs this crate underneath.
+//! TLS 1.3 client over TCP frames, on rustls's unbuffered client. Use it for a TLS connection
+//! over a switch-net TCP stream with your own protocol on top; for `wss://`, use switch-ws,
+//! which runs this crate underneath.
 //!
-//! [`TlsRx`] hands each received frame's bytes to rustls, which decrypts records in place: a record lying wholly inside one frame is returned as a slice of that frame. Only a record straddling frames is copied, into one reusable scratch buffer, and decrypted there. Decryption is lazy: one record per run.
-//!
-//! [`TlsTx`] owns the rustls connection and seals each frame's plaintext into one record in that frame, on top of a lower [`FrameTx`] that sends frames as they are; it is a [`FrameTx`] itself.
-//!
-//! Feature `switch-net`: module `switch_net`, TLS over switch-net TCP. `switch_net::tls_connect` runs the handshake on a connected `TcpStream` and returns a `Tls` holding the two halves and the TCP receive half; `Tls::ready` waits for plaintext, `switch_net::send_bytes` sends, `Tls::close` sends close_notify and FIN and waits for their delivery. The `rustls::ClientConfig` must allow TLS 1.3 only. Without the feature only the TLS layer over the frame traits builds; it needs no DPDK.
+//! Feature `switch-net`: module `switch_net`, TLS over switch-net TCP.
+//! `switch_net::tls_connect` runs the handshake on a connected `TcpStream` and returns a `Tls`
+//! holding the two halves and the TCP receive half; `Tls::ready` waits for plaintext,
+//! `switch_net::send_bytes` sends, `Tls::close` sends close_notify and FIN and waits for their
+//! delivery. The `rustls::ClientConfig` must allow TLS 1.3 only. Every wait that depends on the
+//! server can last as long as the server stays silent, so bound the exchange with
+//! `switch_net::within`. Without the feature only the TLS layer over the frame traits builds; it
+//! needs no DPDK.
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "switch-net")]
 //! # mod example {
 //! use std::sync::Arc;
+//! use std::time::Duration;
 //! use rustls::ClientConfig;
-//! use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp};
+//! use switch::Spawner;
+//! use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp, within};
 //! use switch_tls::switch_net::{send_bytes, tls_connect};
 //!
-//! async fn get(handle: &NetHandle, config: Arc<ClientConfig>, server: IpEndpoint, socket: tcp::Config) -> Result<(), String> {
-//!     let local = IpListenEndpoint { addr: None, port: 49152 };
-//!     let stream = handle.tcp_connect(socket, server, local).await.map_err(|e| format!("{e:?}"))?;
-//!     let mut tls = tls_connect(handle, stream, config, "example.com", 1).await.map_err(|e| e.to_string())?;
-//!     send_bytes(&mut tls.tx, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await.map_err(|e| e.to_string())?;
-//!     while tls.ready().await.map_err(|e| e.to_string())? {
-//!         let n = tls.rx.current().len();
-//!         tls.rx.consume(n);
-//!     }
-//!     tls.close().await.map_err(|e| e.to_string())
+//! async fn get(
+//!     handle: &NetHandle,
+//!     spawner: &Spawner,
+//!     config: Arc<ClientConfig>,
+//!     server: IpEndpoint,
+//!     socket: tcp::Config,
+//! ) -> Result<(), String> {
+//!     let exchange = async {
+//!         let local = IpListenEndpoint { addr: None, port: 49152 };
+//!         let stream = handle.tcp_connect(socket, server, local).await.map_err(|e| format!("{e:?}"))?;
+//!         // min_plain: smallest plaintext room wanted; send_bytes splits larger data
+//!         let mut tls = tls_connect(handle, stream, config, "example.com", 1).await.map_err(|e| e.to_string())?;
+//!         let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+//!         send_bytes(&mut tls.tx, request).await.map_err(|e| e.to_string())?;
+//!         // `ready` is Ok(false) once the server sent close_notify
+//!         while tls.ready().await.map_err(|e| e.to_string())? {
+//!             let n = tls.rx.current().len();
+//!             tls.rx.consume(n);
+//!         }
+//!         tls.close().await.map_err(|e| e.to_string())
+//!     };
+//!     within(spawner, Duration::from_secs(10), exchange).await.unwrap_or(Err("timed out".to_owned()))
 //! }
 //! # }
 //! ```
+//!
+//! For embedding on another frame source: [`TlsRx`] hands each received frame's bytes to rustls,
+//! which decrypts records in place: a record lying wholly inside one frame is returned as a slice
+//! of that frame. Only a record straddling frames is copied, into one reusable scratch buffer, and
+//! decrypted there. Decryption is lazy: one record per run. [`TlsTx`] owns the rustls connection
+//! and seals each frame's plaintext into one record in that frame, on top of a lower [`FrameTx`]
+//! that sends frames as they are; it is a [`FrameTx`] itself.
 //!
 //! Book: See the switch book, chapter "TLS without WebSocket".
 

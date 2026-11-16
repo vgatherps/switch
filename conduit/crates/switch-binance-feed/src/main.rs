@@ -1,5 +1,4 @@
-//! Binance bookTicker over TLS 1.3 and WebSocket on switch's net_tap TCP socket, as a switch
-//! task on a switch-net Net. See `usage`.
+//! The `switch-binance-feed` binary; usage and exit statuses are in the library's crate docs.
 
 use std::ffi::OsString;
 use std::fs;

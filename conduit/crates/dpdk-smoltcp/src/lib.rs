@@ -19,7 +19,9 @@
 //!     let handle = stack.add_tcp(tcp::Config { rx_capacity: 65536, tx_capacity: 65536, mss_cap: None })?;
 //!     // There is no ephemeral port allocator; the local port must be nonzero.
 //!     stack.connect(&handle, server, 40000)?;
-//!     let mut said_hello = false;
+//!     let line = b"hello\n";
+//!     // `send_slice` queues what fits, possibly nothing; keep going until the line is queued.
+//!     let mut queued = 0;
 //!     loop {
 //!         stack.receive(clock(), 32)?;
 //!         let socket = stack.tcp_mut(&handle);
@@ -27,9 +29,8 @@
 //!             let Some(frame) = socket.recv()? else { break };
 //!             println!("{:?}", frame.payload());
 //!         }
-//!         if !said_hello && socket.may_send() {
-//!             socket.send_slice(b"hello\n")?;
-//!             said_hello = true;
+//!         if queued < line.len() && socket.may_send() {
+//!             queued += socket.send_slice(&line[queued..])?;
 //!         }
 //!         if socket.state() == State::CloseWait {
 //!             stack.close(&handle);
