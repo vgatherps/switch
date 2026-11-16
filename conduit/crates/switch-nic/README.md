@@ -152,8 +152,8 @@ clang and lld, then use the Dockerfile's `PKG_CONFIG_PATH`, `LD_LIBRARY_PATH` an
 Arguments: `switch-nic --config FILE <MODE> [MODE OPTIONS]`. The config contains the network, device,
 offload and EAL settings. `open` chooses EAL's main lcore from the one CPU allowed by `taskset` or Docker's
 CPU set, and rejects a process that may run on more than one CPU. An argument error prints `error:` and the
-usage text. Exit codes: 0 ok, 2 packet buffers held at close (a switch bug), 3 argument, setup or run error
-(the `error:` line says which), 101 panic.
+usage text. Exit codes: 0 ok, 2 packet buffers held at close after a successful run (a switch bug),
+3 argument, setup or run error (even if buffers are also held; the `error:` line says which), 101 panic.
 
 A vdev config for a local tap is:
 ```
@@ -256,7 +256,7 @@ Defaults: UDP port 11111, no TCP, 8 TCP connections, `--seconds 0` (run until SI
 `--report-seconds 5`. The server prints `switch-nic: server: ready` when it accepts traffic. On Ctrl-C
 (SIGINT) or SIGTERM it attempts TCP FIN close with a five-second deadline, prints `report: final`
 and the counters, and closes the port. Successful shutdown exits 0; a close timeout or pending UDP
-reply fails with exit 3, and outstanding buffers at port close cause exit 2.
+reply fails with exit 3, even if buffers remain held at port close. Outstanding buffers after an otherwise successful run cause exit 2.
 
 Peer clients are sockperf 3.10 (the image has it at /opt/sockperf/bin/sockperf; distro 3.7 is
 wire-identical). To build it: `git clone -b 3.10 https://github.com/Mellanox/sockperf && cd sockperf &&

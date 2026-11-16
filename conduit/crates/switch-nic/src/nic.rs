@@ -80,7 +80,7 @@ pub fn close(port: Port, mut code: i32) -> i32 {
                 "port_close",
                 format_args!("buffers still in use: rx={rx} tx={tx} frame={frame}"),
             );
-            code = 2;
+            code = outstanding_buffers_code(code);
             drop(port);
         }
         Err((port, error)) => {
@@ -92,6 +92,10 @@ pub fn close(port: Port, mut code: i32) -> i32 {
     code
 }
 
+fn outstanding_buffers_code(run_code: i32) -> i32 {
+    if run_code == 0 { 2 } else { run_code }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -101,6 +105,12 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Args {
         crate::args::parse(args.iter().map(OsString::from)).unwrap()
+    }
+
+    #[test]
+    fn held_buffers_only_change_a_successful_run_to_exit_two() {
+        assert_eq!(super::outstanding_buffers_code(0), 2);
+        assert_eq!(super::outstanding_buffers_code(3), 3);
     }
 
     #[test]

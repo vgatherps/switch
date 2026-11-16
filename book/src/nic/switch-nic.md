@@ -106,8 +106,8 @@ The feed runs as a switch task on a `Net` over the Stack, and the drive loop bus
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 2 | packet buffers were still held when the card was closed: `port_close: buffers still in use: rx=.. tx=.. frame=..`. This code replaces 0 or 3 from the run itself. |
-| 3 | an argument, setup or run error; the `switch-nic: error:` line (or `port_open_error`) says which |
+| 2 | packet buffers were still held after an otherwise successful run: `port_close: buffers still in use: rx=.. tx=.. frame=..`. This code replaces only 0 from the run itself. |
+| 3 | an argument, setup or run error, even if buffers remain held at close; the `switch-nic: error:` line (or `port_open_error`) says which |
 | 101 | a panic |
 
 An argument error prints `switch-nic: error: <problem>` followed by the usage text. When `open` fails after the card's port exists, `switch-nic` still closes the port and prints `port_close`; [Opening the NIC from code](open.md#when-it-fails) shows that code, and [When the NIC won't open](troubleshooting.md) lists the messages.
