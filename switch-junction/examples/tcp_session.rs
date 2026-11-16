@@ -1,4 +1,4 @@
-// Send a fixed message through the daemon from book/src/junction/running.md.
+// Send a fixed message through the daemon from docs/operations/junctiond.md.
 // Build without DPDK: cargo build --locked --release -p switch-junction --example tcp_session
 // With that daemon running, start a receiver on its tap peer (10.77.0.1):
 // python3 -c 'import socket; s=socket.socket(); s.bind(("10.77.0.1",7000)); s.listen(); c,_=s.accept(); print(c.makefile("rb").read()); c.close()'
@@ -21,7 +21,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let peer: SocketAddrV4 = args.next().unwrap_or_else(|| "10.77.0.1:7000".into()).parse()?;
     let local_port: u16 = args.next().unwrap_or_else(|| "30000".into()).parse()?;
 
-    // ANCHOR: connect
     let mut session = Session::connect(&control, 1)?;
     let id = session.connect_tcp(
         TcpConfig {
@@ -48,9 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         thread::sleep(Duration::from_millis(1));
     }
-    // ANCHOR_END: connect
 
-    // ANCHOR: send
     loop {
         match session.send_tcp(id, b"hello from Session\n") {
             Ok(()) => break,
@@ -70,9 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(error) => return Err(error.into()),
         }
     }
-    // ANCHOR_END: send
 
-    // ANCHOR: close
     session.shutdown(id);
     let mut delivered = false;
     while !delivered {
@@ -96,9 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.poll(|_, event| freed |= matches!(event, Event::Freed), |_, _, _| {})?;
         thread::sleep(Duration::from_millis(1));
     }
-    // ANCHOR_END: close
 
-    // ANCHOR: finish
     loop {
         match session.finish() {
             Ok(()) => break,
@@ -112,7 +105,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         session.poll(|_, _| {}, |_, _, _| {})?;
         thread::sleep(Duration::from_millis(1));
     }
-    // ANCHOR_END: finish
     println!("message delivered; socket freed; session finished");
     Ok(())
 }

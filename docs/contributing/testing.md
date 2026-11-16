@@ -187,7 +187,7 @@ It writes a `.log` and `.exit` file per suite and `tests.json`, and exits 0 only
 ## API documentation
 
 ```sh
-make api-docs
+make docs
 ```
 
 builds the API reference of every workspace crate, with all of `switch`'s features, in the Docker image, writes it to `target/api-docs`, and opens `target/api-docs/switch/index.html`.

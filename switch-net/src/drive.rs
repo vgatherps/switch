@@ -84,7 +84,6 @@ mod tests {
 
     use super::*;
 
-    // ANCHOR: exact_deadline
     #[switch_runtime::task]
     async fn timeout(spawner: Spawner, completed: Rc<Cell<Option<bool>>>) {
         let result = within(&spawner, Duration::from_nanos(123_456), pending::<()>()).await;
@@ -109,7 +108,6 @@ mod tests {
         runtime.poll(deadline).unwrap();
         assert_eq!(completed.get(), Some(true));
     }
-    // ANCHOR_END: exact_deadline
 
     #[test]
     #[should_panic(expected = "limit fits u64 nanoseconds")]

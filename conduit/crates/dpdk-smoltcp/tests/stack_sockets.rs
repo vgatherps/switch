@@ -247,7 +247,6 @@ fn held_tcp_frame_after_removal(reap: bool) {
     });
 }
 
-// ANCHOR: pair
 #[switch_test_support::pinned_test]
 fn cloned_received_tcp_frame_keeps_mbuf_after_socket_removal() {
     with_eal(|eal| {
@@ -264,7 +263,6 @@ fn cloned_received_tcp_frame_keeps_mbuf_after_socket_removal() {
                 App::Idle
             }
         });
-        // ANCHOR_END: pair
         let frame = pair.b.tcp_mut(&server).recv().unwrap().unwrap().into_frame().freeze();
         let clone = std::mem::ManuallyDrop::new(frame.clone().slice(1..4));
         drop(frame);

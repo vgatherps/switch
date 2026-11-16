@@ -143,7 +143,6 @@ fn run(args: Args) -> i32 {
         line("feed_mss_cap", socket.mss_cap.expect("feed_socket caps the MSS"));
     }
     let free_before = hugepages::free(std::path::Path::new(hugepages::SYSFS));
-    // ANCHOR: open_errors
     // SAFETY: EAL creates the configured PCI device or vdev from the config, so
     // the ethdev is new and no caller-attached ring exists. This sole thread
     // owns its queue pair and all packets. The selected PMD must honor Port's
@@ -209,7 +208,6 @@ fn run(args: Args) -> i32 {
             return 3;
         }
     };
-    // ANCHOR_END: open_errors
     let Opened {
         mut stack,
         eal: _eal,

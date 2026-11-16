@@ -1,6 +1,6 @@
 # switch-macros
 
-See [Writing and spawning tasks](../book/src/runtime/tasks.md) in the switch book.
+See [Writing and spawning tasks](../switch/docs/guide/tasks.md) in the switch guide.
 Generate the API reference with `cargo doc -p switch-macros --no-deps`.
 
 The `#[task]` attribute for [`switch-runtime`](../switch-runtime/README.md). Use it as `#[switch_runtime::task]`; switch-runtime re-exports it, so depend on switch-runtime, not on this crate.

@@ -163,7 +163,7 @@ help:
 		'Docker: docker-image docker-doctor docker-build docker-doc docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Junction Autobahn: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
-		'Docs: README.md, docker/README.md (tests), crates/switch-nic/README.md (NIC host), docs/USAGE.md (API)'
+		'Docs: README.md, docker/README.md (tests), ../docs/operations/host-setup.md (NIC host); make docs at the repository root (guide and API)'
 
 doctor:
 	@test "$$(uname -s)" = Linux || { echo 'Native targets require Linux; use Docker on macOS.' >&2; exit 1; }

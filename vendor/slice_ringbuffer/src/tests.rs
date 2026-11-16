@@ -4,7 +4,6 @@ use shared_memory::unique_name;
 use std::rc::Rc;
 use std::thread;
 
-// ANCHOR: ring_setup
 fn ring() -> (Backing, Backing, RingWriter, RingReader) {
     let name = unique_name("/junction-ring-").unwrap();
     let mut producer = Backing::create_shm(&name).unwrap();
@@ -24,7 +23,6 @@ fn publish(writer: &mut RingWriter, len: usize, value: u8) {
     record.payload().fill(value);
     record.commit();
 }
-// ANCHOR_END: ring_setup
 
 #[test]
 fn record_crosses_physical_end_as_one_slice() {
@@ -40,7 +38,6 @@ fn record_crosses_physical_end_as_one_slice() {
     assert_eq!(&*frame, expected.as_slice());
 }
 
-// ANCHOR: reclaim_prefix
 #[test]
 fn reclaim_only_releases_contiguous_prefix() {
     let (_producer, _consumer, mut writer, mut reader) = ring();
@@ -59,7 +56,6 @@ fn reclaim_only_releases_contiguous_prefix() {
     reader.reclaim();
     assert!(writer.reserve(writer.max_payload(), meta(0)).is_some());
 }
-// ANCHOR_END: reclaim_prefix
 
 #[test]
 fn cloned_frame_blocks_reclaim_until_the_last_drop() {

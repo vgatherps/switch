@@ -141,7 +141,6 @@ impl Drop for Daemon {
     }
 }
 
-// ANCHOR: exchange
 fn exchange(session: &mut Session, peer: &UdpSocket) {
     let id = session.bind_udp(UdpConfig {
         local: ListenEndpoint { addr: None, port: 30000 },
@@ -192,7 +191,6 @@ fn exchange(session: &mut Session, peer: &UdpSocket) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
-// ANCHOR_END: exchange
 
 #[test]
 fn udp_exchange_and_sigterm_reports_host_shutdown() {

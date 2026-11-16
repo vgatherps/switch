@@ -43,7 +43,6 @@ fn new_stack(port: Port, max_udp_sockets: usize) -> Stack {
     }
 }
 
-// ANCHOR: udp_config
 fn udp_config(port: u16, rx_queue: usize) -> UdpConfig {
     UdpConfig {
         port,
@@ -53,7 +52,6 @@ fn udp_config(port: u16, rx_queue: usize) -> UdpConfig {
         broadcast: false,
     }
 }
-// ANCHOR_END: udp_config
 
 fn from_peer(src_port: u16, payload: &[u8]) -> Vec<u8> {
     let caps = ChecksumCapabilities::default();

@@ -153,7 +153,6 @@ impl fmt::Display for BookTicker<'_> {
     }
 }
 
-// ANCHOR: client_config
 /// rustls with ring, TLS 1.3 only (switch-tls's protocol), `roots` and no client auth.
 pub fn client_config(roots: RootCertStore) -> Arc<ClientConfig> {
     Arc::new(
@@ -171,9 +170,7 @@ pub fn webpki_client_config() -> Arc<ClientConfig> {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     })
 }
-// ANCHOR_END: client_config
 
-// ANCHOR: socket
 /// Configures feed RX and TX buffers and an optional MSS cap.
 pub fn socket(mss_cap: Option<u16>) -> tcp::Config {
     tcp::Config {
@@ -182,7 +179,6 @@ pub fn socket(mss_cap: Option<u16>) -> tcp::Config {
         mss_cap,
     }
 }
-// ANCHOR_END: socket
 
 /// Why [`connect`] or [`feed`] failed.
 #[derive(Debug)]
@@ -254,8 +250,6 @@ impl fmt::Display for FeedError {
 
 impl std::error::Error for FeedError {}
 
-// ANCHOR: within
-// ANCHOR: within_step
 /// `work`, or `Timeout { step, limit }` once `limit` passed; dropping `work` drops what it holds.
 async fn within<T>(
     spawner: &Spawner,
@@ -267,10 +261,7 @@ async fn within<T>(
         .await
         .unwrap_or(Err(FeedError::Timeout { step, limit }))
 }
-// ANCHOR_END: within_step
-// ANCHOR_END: within
 
-// ANCHOR: connect
 /// Opens TCP from `local_port`, then TLS and WebSocket, within one `limit`. On any error the
 /// socket is dropped (a socket that never got a SYN-ACK closes without sending anything).
 pub async fn connect(
@@ -307,7 +298,6 @@ pub async fn connect(
     };
     within(spawner, "TCP, TLS and WebSocket connect", limit, open).await
 }
-// ANCHOR_END: connect
 
 /// What a feed saw: the updates read, their first and last update ids, and the latency of every
 /// message received.
@@ -365,7 +355,6 @@ impl fmt::Display for Latencies {
 /// Where [`feed`] puts what it read and its result.
 pub type Outcome = Rc<Cell<Option<(Summary, Result<(), FeedError>)>>>;
 
-// ANCHOR: feed
 /// The feed, as a switch task: connects within CONNECT_LIMIT, reads updates until `stop`
 /// finishes, `read_for` passed since the connect, or a read fails, then attempts the close within
 /// CLOSE_LIMIT, after a failed read too. Prints `{name}: {key}: {value}` lines: feed_connected,
@@ -423,7 +412,6 @@ pub async fn feed(
     };
     out.set(Some((summary, result)));
 }
-// ANCHOR_END: feed
 
 fn line(name: &str, key: &str, value: impl fmt::Display) {
     let _ = writeln!(io::stdout(), "{name}: {key}: {value}");
@@ -442,8 +430,6 @@ fn write_latency(
     }
 }
 
-// ANCHOR: read
-// ANCHOR: read_loop
 /// Reads updates into `summary` until `stop` finishes, printing the first `print`; messages
 /// already received come first. Server pings are answered inside `recv`.
 async fn read(
@@ -475,10 +461,7 @@ async fn read(
         }
     }
 }
-// ANCHOR_END: read_loop
-// ANCHOR_END: read
 
-// ANCHOR: close
 /// Sends the WebSocket close (1000) and reads until the server's close echo, dropping the updates
 /// before it; switch-ws then sends close_notify and FIN and returns once the server acked them, so the
 /// Net may be dropped right after. All within CLOSE_LIMIT.
@@ -490,7 +473,6 @@ async fn close(mut wss: Wss, spawner: &Spawner) -> Result<(), FeedError> {
     };
     within(spawner, "WebSocket close", CLOSE_LIMIT, close).await
 }
-// ANCHOR_END: close
 
 #[cfg(test)]
 mod tests {

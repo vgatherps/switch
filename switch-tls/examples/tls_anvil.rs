@@ -111,7 +111,6 @@ fn client_config() -> Arc<ClientConfig> {
     Arc::new(config)
 }
 
-// ANCHOR: connection
 /// One connection: handshake, request, read until close_notify, then close_notify and FIN.
 /// switch-tls sends the alert for a TLS error itself. Returns how the connection ended.
 async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfig>) -> String {
@@ -143,7 +142,6 @@ async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfi
         Err(e) => format!("ended by close_notify; closing: {e}"),
     }
 }
-// ANCHOR_END: connection
 
 /// `connection`, abandoned after `CONNECTION_LIMIT_NS`; how it ended goes to `ended`.
 #[switch_runtime::task]

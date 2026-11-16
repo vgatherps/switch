@@ -27,7 +27,6 @@ fn stalling_config() -> tcp::Config {
     tcp::Config { tx_capacity: 32 * 1024, ..tcp_config() }
 }
 
-// ANCHOR: filled
 /// `data` in a fresh frame from `handle`.
 async fn filled(handle: &NetHandle, data: &[u8]) -> ImmutableFrame {
     let mut frame = handle.tx_frame().await;
@@ -35,9 +34,7 @@ async fn filled(handle: &NetHandle, data: &[u8]) -> ImmutableFrame {
     frame.truncate(data.len());
     frame.freeze()
 }
-// ANCHOR_END: filled
 
-// ANCHOR: send_all
 /// `data` in frames of `CHUNK` bytes, each sent after `room` resolves.
 async fn send_all(handle: &NetHandle, tx: &mut TcpTx, data: &[u8]) {
     for chunk in data.chunks(CHUNK) {
@@ -46,7 +43,6 @@ async fn send_all(handle: &NetHandle, tx: &mut TcpTx, data: &[u8]) {
         tx.try_send(frame).map_err(|(_, error)| error).unwrap();
     }
 }
-// ANCHOR_END: send_all
 
 /// One poll of `future`: its output, or `None` if pending.
 async fn poll_once<F: Future>(future: F) -> Option<F::Output> {

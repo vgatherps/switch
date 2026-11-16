@@ -3,7 +3,6 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-// ANCHOR: countdown
 /// Documented, public, async, with a `'static` reference argument.
 #[switch_runtime::task]
 pub async fn countdown(spawner: switch_runtime::Spawner, left: u32, label: &'static str) {
@@ -11,15 +10,12 @@ pub async fn countdown(spawner: switch_runtime::Spawner, left: u32, label: &'sta
         spawner.spawn(countdown(spawner.clone(), left - 1, label)).unwrap();
     }
 }
-// ANCHOR_END: countdown
 
-// ANCHOR: plain_fn
 /// A `!Send` future returned by a plain function.
 #[switch_runtime::task]
 fn local(count: Rc<Cell<u32>>) -> impl Future<Output = ()> {
     async move { count.set(count.get() + 1) }
 }
-// ANCHOR_END: plain_fn
 
 struct Holder<T>(PhantomData<T>);
 

@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
 
 # ENA: device PHC reads, datapath reset notifications, and metrics error propagation.
-# ANCHOR: dpdk
 COPY dpdk-ena-read-clock.patch /tmp/dpdk-ena-read-clock.patch
 RUN curl --fail --location --retry 2 -o /tmp/dpdk.tar.xz \
         https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz \
@@ -23,7 +22,6 @@ RUN curl --fail --location --retry 2 -o /tmp/dpdk.tar.xz \
         -Denable_drivers=net/ring,net/pcap,net/tap,net/memif,net/af_packet,net/ena,net/intel/ixgbe,net/intel/i40e,net/intel/ice \
     && ninja -C /tmp/dpdk/build && meson install -C /tmp/dpdk/build \
     && rm -rf /tmp/dpdk /tmp/dpdk.tar.xz /tmp/dpdk-ena-read-clock.patch
-# ANCHOR_END: dpdk
 
 COPY packetdrill-relearn-isn.patch /tmp/packetdrill-relearn-isn.patch
 RUN apt-get update && apt-get install -y --no-install-recommends flex bison patch \

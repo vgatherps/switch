@@ -190,7 +190,6 @@ impl Host {
         if let Some(xstats) = self.xstats.take() {
             xstats.finish();
         }
-        // ANCHOR: finish_session
         if self.local.is_none() {
             let mut session = self.net.into_session()
                 .map_err(|_| "a socket outlived the tasks".to_owned())?;
@@ -206,7 +205,6 @@ impl Host {
             }
             return Ok(());
         }
-        // ANCHOR_END: finish_session
         let stack = self
             .net
             .into_stack()

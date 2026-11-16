@@ -135,7 +135,6 @@ async fn bind_echo(
     *bound.borrow_mut() = Some(handle.udp_bind(config).await);
 }
 
-// ANCHOR: echo_datagrams
 #[switch_runtime::task]
 async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
     loop {
@@ -157,9 +156,7 @@ async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
         }
     }
 }
-// ANCHOR_END: echo_datagrams
 
-// ANCHOR: arm_accept
 /// Keeps `count` accept tasks alive, retrying when socket slots are full.
 fn spawn_accepts(
     spawner: &Spawner,
@@ -228,10 +225,8 @@ async fn serve_conn(handle: NetHandle, stream: TcpStream, ws: bool) {
         tcp_echo(&handle, stream).await;
     }
 }
-// ANCHOR_END: arm_accept
 
 
-// ANCHOR: tcp_echo
 /// Echoes all bytes received from a TCP connection.
 async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
     let (mut rx, mut tx) = stream.split();
@@ -263,9 +258,7 @@ async fn tcp_echo(handle: &NetHandle, stream: TcpStream) {
         }
     }
 }
-// ANCHOR_END: tcp_echo
 
-// ANCHOR: ws_echo
 /// One ws connection of the DUT: every message back with its kind, through switch-ws. Returns when
 /// the peer closes or fails the connection.
 async fn ws_echo(mut ws: Ws) {
@@ -279,7 +272,6 @@ async fn ws_echo(mut ws: Ws) {
         }
     }
 }
-// ANCHOR_END: ws_echo
 
 #[cfg(test)]
 mod sizing_tests {

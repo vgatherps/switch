@@ -1,16 +1,13 @@
 use switch_test_kit::pair::{App, Pair, Side, T0, config, establish};
 use switch_test_kit::with_eal;
 
-// ANCHOR: pinned
 #[switch_test_support::pinned_test]
 fn eal_belongs_to_the_test_worker() {
     with_eal(|eal| {
         assert_eq!(eal.owner_lcore_id(), 7);
     });
 }
-// ANCHOR_END: pinned
 
-// ANCHOR: pair
 #[switch_test_support::pinned_test]
 fn four_bytes_reach_the_peer() {
     with_eal(|eal| {
@@ -37,4 +34,3 @@ fn four_bytes_reach_the_peer() {
         assert_eq!(pair.close(), 0);
     });
 }
-// ANCHOR_END: pair

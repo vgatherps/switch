@@ -37,7 +37,6 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         settle(&mut pair);
         assert_eq!(popped(&mut pair.a), [], "nothing was armed");
 
-        // ANCHOR: tcp_tokens
         // Idle turns fire nothing.
         pair.a.arm_tcp(key, ReadySide::Rx, 1);
         pair.a.arm_tcp(key, ReadySide::Tx, 2);
@@ -76,7 +75,6 @@ fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
         settle(&mut pair);
         assert_eq!(pair.a.tcp(&h[0]).send_queue(), 0);
         assert_eq!(popped(&mut pair.a), [5]);
-        // ANCHOR_END: tcp_tokens
 
         // TIME-WAIT ends on a timer: turns of A alone fire nothing until it does.
         pair.a.close(&h[0]);

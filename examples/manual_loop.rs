@@ -10,16 +10,13 @@ async fn print_event(event: &'static str) {
     println!("{event}");
 }
 
-// ANCHOR: sleep_task
 #[switch::task]
 async fn print_after_sleep(spawner: Spawner) {
     spawner.sleep(10).unwrap().await.unwrap();
     println!("deadline reached");
 }
-// ANCHOR_END: sleep_task
 
 fn main() {
-    // ANCHOR: tick_loop
     let mut runtime = Runtime::new(100);
     let spawner = runtime.spawner();
     let task_spawner = spawner.clone();
@@ -36,5 +33,4 @@ fn main() {
         let report = runtime.poll(now).unwrap();
         println!("tick {now}: {report:?}");
     }
-    // ANCHOR_END: tick_loop
 }

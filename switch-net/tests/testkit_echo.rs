@@ -2,7 +2,6 @@
 //! the testkit example of the book's "Writing tests that use DPDK" page.
 //! Needs CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 
-// ANCHOR: setup
 use std::io::{Read, Write};
 
 use switch_net::testkit::{client_server, Backend, TapConfig};
@@ -10,18 +9,14 @@ use switch_net::{tcp, NetHandle, TcpStream};
 
 const PORT: u16 = 7000;
 const LINE: &[u8] = b"hello";
-// ANCHOR_END: setup
 
-// ANCHOR: tap
 const TAP: TapConfig = TapConfig {
     name: "bookecho",
     socket: tcp::Config { rx_capacity: 64 * 1024, tx_capacity: 64 * 1024, mss_cap: None },
     max_sockets: 1,
     random_seed: 1,
 };
-// ANCHOR_END: tap
 
-// ANCHOR: serve
 /// The kernel side: reads one line and writes it back.
 fn serve(mut stream: std::net::TcpStream) -> Vec<u8> {
     let mut line = vec![0; LINE.len()];
@@ -29,9 +24,7 @@ fn serve(mut stream: std::net::TcpStream) -> Vec<u8> {
     stream.write_all(&line).expect("echo the line");
     line
 }
-// ANCHOR_END: serve
 
-// ANCHOR: client
 /// The switch side, run as a task: sends the line and reads until it is back. Returns the
 /// halves so the connection stays open until the peer is done.
 async fn client(handle: NetHandle, stream: TcpStream) -> (switch_net::TcpRx, switch_net::TcpTx) {
@@ -49,9 +42,7 @@ async fn client(handle: NetHandle, stream: TcpStream) -> (switch_net::TcpRx, swi
     assert_eq!(echoed, LINE);
     (rx, tx)
 }
-// ANCHOR_END: client
 
-// ANCHOR: run
 fn echo(backend: Backend) {
     let seen = client_server(backend, &TAP, PORT, |_| {}, serve, client, || {});
     assert_eq!(seen, LINE);
@@ -66,7 +57,6 @@ fn echo_local_backend() {
 fn echo_junction_backend() {
     echo(Backend::Junction);
 }
-// ANCHOR_END: run
 
 #[switch_runtime::task]
 async fn timeout(spawner: switch_runtime::Spawner, done: std::rc::Rc<std::cell::Cell<bool>>) {

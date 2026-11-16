@@ -298,7 +298,6 @@ mod tests {
     use std::boxed::Box;
     use std::cell::Cell;
 
-    // ANCHOR: producer
     #[repr(C)]
     struct Storage {
         refs: u16,
@@ -335,9 +334,7 @@ mod tests {
         // SAFETY: this is the pointer returned by Box::into_raw, released once.
         drop(unsafe { Box::from_raw(producer.storage.take().unwrap().as_ptr()) });
     }
-    // ANCHOR_END: producer
 
-    // ANCHOR: clones
     #[test]
     fn clones_share_bytes_and_release_only_after_last_drop() {
         let producer = Producer::default();
@@ -356,7 +353,6 @@ mod tests {
         assert_eq!(producer.releases.get(), 1);
         assert_eq!(producer.released_count.get(), 1);
     }
-    // ANCHOR_END: clones
 
     #[test]
     fn try_own_requires_the_sole_reference() {

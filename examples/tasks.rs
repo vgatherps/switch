@@ -4,7 +4,6 @@
 
 use switch::{Runtime, Spawner};
 
-// ANCHOR: async_task
 #[switch::task]
 async fn parent(spawner: Spawner) {
     println!("parent polled");
@@ -15,9 +14,7 @@ async fn parent(spawner: Spawner) {
 async fn child() {
     println!("child polled");
 }
-// ANCHOR_END: async_task
 
-// ANCHOR: plain_fn
 #[switch::task]
 fn plain(message: &'static str) -> impl Future<Output = ()> {
     println!("plain function called at spawn time");
@@ -25,7 +22,6 @@ fn plain(message: &'static str) -> impl Future<Output = ()> {
         println!("plain future polled: {message}");
     }
 }
-// ANCHOR_END: plain_fn
 
 fn main() {
     let mut runtime = Runtime::new(0);

@@ -10,7 +10,6 @@
 # time with its loss reported and a complete summary.
 # Usage: [GENS=2] [SENDERS=2*GENS] [PROTOS="udp tcp ws"] smoke.sh OUT_DIR [extra sweep flags...]
 set -eu
-# ANCHOR: vars
 out=$1
 shift
 gens=${GENS:-2}
@@ -20,13 +19,11 @@ bench=${BENCH:-../target/release/switch-bench}
 cpus=$(taskset -pc $$ | sed 's/.*: //')
 case "$cpus" in *-*) first=${cpus%-*}; last=${cpus#*-} ;; *) echo "need a CPU range, got $cpus" >&2; exit 2 ;; esac
 [ $((last - first + 1)) -ge $((gens + 2)) ] || { echo "need $((gens + 2)) CPUs, have $cpus" >&2; exit 2; }
-# ANCHOR_END: vars
 [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "needs net.ipv4.ip_forward=1" >&2; exit 2; }
 mkdir -p "$out"
 dut_addr=10.10.0.2
 kernel_addr=10.10.0.1
 
-# ANCHOR: node
 # switch node NAME with net_tap iface cdNAME on 10.NET.0.0/24: switch .2, the kernel side .1 (its gateway).
 node() { # name net
     cat >"$out/$1.json" <<EOF
@@ -42,14 +39,12 @@ ip address add 10.$2.0.1/24 dev cd$1
 ip link set cd$1 up
 EOF
 }
-# ANCHOR_END: node
 node dut 10
 i=0
 while [ $i -lt "$gens" ]; do
     node gen$i $((20 + i))
     i=$((i + 1))
 done
-# ANCHOR: gen
 gen_cpu=$((first + 2))
 cat >"$out/gen.sh" <<EOF
 #!/bin/sh
@@ -60,7 +55,6 @@ sh $out/up-gen\$1.sh &
 exec taskset -c \$(($gen_cpu + \$1)) $bench gen --config $out/gen\$1.json --proto \$2 --target \$3 \
     --senders \$4 --size \$5 --local-port 40000
 EOF
-# ANCHOR_END: gen
 
 dut=
 sink=

@@ -73,14 +73,12 @@ fn resolve_peer(fixture: &RingPort, stack: &mut Stack) {
     assert_eq!((turn.rx_processed, turn.tx_accepted), (1, 0));
 }
 
-// ANCHOR: frame
 fn frame(stack: &mut Stack, payload: &[u8]) -> ImmutableFrame {
     let mut frame = stack.tx_frame().unwrap();
     frame.as_mut()[..payload.len()].copy_from_slice(payload);
     frame.truncate(payload.len());
     frame.freeze()
 }
-// ANCHOR_END: frame
 
 fn peer(port: u16) -> Option<IpEndpoint> {
     Some(IpEndpoint::new(PEER.into(), port))

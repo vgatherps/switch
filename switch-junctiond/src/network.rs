@@ -175,12 +175,10 @@ impl Network {
         }
         state.drain_backlogs();
         state.retry_rx();
-        // ANCHOR: fired
         let turn = state.stack.turn(now, self.config.ingress_budget);
         while let Some(token) = state.stack.pop_fired() {
             state.service_rx(token);
         }
-        // ANCHOR_END: fired
         turn
     }
 
@@ -316,7 +314,6 @@ impl NetworkState {
     }
 
     /// Services only attached, non-errored sessions; pending entries exactly name held frames.
-    // ANCHOR: service_rx
     fn service_rx(&mut self, index: u32) {
         let Some(socket) = self.sockets[index as usize].as_mut() else {
             return;
@@ -344,7 +341,6 @@ impl NetworkState {
             self.rx_pending.retain(|pending| *pending != index);
         }
     }
-    // ANCHOR_END: service_rx
 
     fn retry_rx(&mut self) {
         let count = self.rx_pending.len();

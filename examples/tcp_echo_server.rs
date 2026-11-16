@@ -35,7 +35,6 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 type Failure = Rc<RefCell<Option<String>>>;
 
-// ANCHOR: accept_loop
 #[switch::task]
 async fn accept_loop(
     spawner: Spawner,
@@ -62,7 +61,6 @@ async fn accept_loop(
         }
     }
 }
-// ANCHOR_END: accept_loop
 
 #[switch::task]
 async fn serve(handle: NetHandle, stream: TcpStream, failure: Failure) {
@@ -71,7 +69,6 @@ async fn serve(handle: NetHandle, stream: TcpStream, failure: Failure) {
     }
 }
 
-// ANCHOR: echo
 async fn echo(handle: &NetHandle, stream: TcpStream) -> Result<(), Error> {
     let (mut rx, mut tx) = stream.split();
     let max_payload = tx.max_segment_payload().ok_or(Error::Closed)?;
@@ -96,7 +93,6 @@ async fn echo(handle: &NetHandle, stream: TcpStream) -> Result<(), Error> {
     tx.delivered().await;
     Ok(())
 }
-// ANCHOR_END: echo
 
 struct Clock {
     start: WallInstant,

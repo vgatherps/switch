@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use switch::{Runtime, Spawner};
 
-// ANCHOR: sliced_work
 #[switch::task]
 async fn sum_in_slices(values: Vec<u64>) {
     let mut total = 0;
@@ -18,19 +17,15 @@ async fn sum_in_slices(values: Vec<u64>) {
     }
     println!("sum = {total}");
 }
-// ANCHOR_END: sliced_work
 
-// ANCHOR: sleep_duration
 #[switch::task]
 async fn wait_two_ms(spawner: Spawner) {
     let ticks = u64::try_from(Duration::from_millis(2).as_nanos()).unwrap();
     spawner.sleep(ticks).unwrap().await.unwrap();
     println!("2 ms passed");
 }
-// ANCHOR_END: sleep_duration
 
 fn main() {
-    // ANCHOR: loop
     let start = Instant::now();
     let mut runtime = Runtime::new(0);
     let spawner = runtime.spawner();
@@ -44,5 +39,4 @@ fn main() {
         }
         std::thread::sleep(Duration::from_micros(100));
     }
-    // ANCHOR_END: loop
 }

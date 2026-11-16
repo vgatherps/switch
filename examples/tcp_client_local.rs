@@ -37,7 +37,6 @@ const LIMIT: Duration = Duration::from_secs(30);
 /// There is no ephemeral port allocator; the local port must be nonzero.
 const LOCAL_PORT: u16 = 40000;
 
-// ANCHOR: clock
 /// Monotonic time since `start`: Stack time in microseconds and runtime ticks in nanoseconds.
 struct Clock {
     start: WallInstant,
@@ -59,9 +58,7 @@ impl Clock {
         (Instant::from_micros(micros), nanos)
     }
 }
-// ANCHOR_END: clock
 
-// ANCHOR: task
 /// Runs the conversation and leaves its result in `done` for the drive loop.
 #[switch::task]
 async fn hello(
@@ -74,14 +71,10 @@ async fn hello(
 }
 
 async fn talk(handle: &NetHandle, server: IpEndpoint, socket: tcp::Config) -> Result<(), Error> {
-    // ANCHOR: core
-    // ANCHOR: connect
     let local = IpListenEndpoint { addr: None, port: LOCAL_PORT };
     let stream = handle.tcp_connect(socket, server, local).await?;
-    // ANCHOR_END: connect
     let (mut rx, mut tx) = stream.split();
 
-    // ANCHOR: send
     let line = b"hello\n";
     let mut frame = handle.tx_frame().await;
     frame.as_mut()[..line.len()].copy_from_slice(line);
@@ -89,9 +82,7 @@ async fn talk(handle: &NetHandle, server: IpEndpoint, socket: tcp::Config) -> Re
     let frame = frame.freeze();
     tx.room(line.len()).await?;
     tx.try_send(frame).map_err(|(_frame, error)| error)?;
-    // ANCHOR_END: send
 
-    // ANCHOR: recv
     loop {
         match rx.recv().await {
             Ok(frame) => print!("{}", String::from_utf8_lossy(frame.payload())),
@@ -99,17 +90,13 @@ async fn talk(handle: &NetHandle, server: IpEndpoint, socket: tcp::Config) -> Re
             Err(error) => return Err(error),
         }
     }
-    // ANCHOR_END: recv
-    // ANCHOR_END: core
 
     tx.shutdown();
     tx.delivered().await;
     Ok(())
 }
-// ANCHOR_END: task
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ANCHOR: config
     let mut args = std::env::args().skip(1);
     let (Some(config), Some(server)) = (args.next(), args.next()) else {
         return Err("usage: tcp_client_local CONFIG HOST:PORT".into());
@@ -119,9 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(SocketAddr::V4(server)) = server.to_socket_addrs()?.find(SocketAddr::is_ipv4) else {
         return Err("server has no IPv4 address".into());
     };
-    // ANCHOR_END: config
 
-    // ANCHOR: setup
     let socket = tcp::Config {
         rx_capacity: BUFFER,
         tx_capacity: BUFFER,
@@ -151,9 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.spawner()
         .spawn(hello(net.handle(), server, socket, Rc::clone(&done)))
         .map_err(|error| format!("spawn: {:?}", error.reason))?;
-    // ANCHOR_END: setup
 
-    // ANCHOR: drive
     let result = loop {
         if let Some(result) = done.take() {
             break result;
@@ -168,13 +151,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(IDLE_SLEEP);
         }
     };
-    // ANCHOR_END: drive
 
-    // ANCHOR: teardown
     rt.shutdown();
     let stack = net.into_stack().map_err(|_net| "a socket or handle outlived the task")?;
     stack.into_port().try_close().map_err(|(_port, error)| format!("port close: {error}"))?;
-    // ANCHOR_END: teardown
     println!("port closed");
     result.map_err(|error| format!("connection: {error}").into())
 }

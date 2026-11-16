@@ -242,7 +242,6 @@ fn udp_visit(
     stamps: bool,
     turns: &mut Turns,
 ) -> Result<(), String> {
-    // ANCHOR: udp_retry
     if let Some(datagram) = &slot.pending {
         match stack.udp_send(&slot.handle, Some(datagram.src()), datagram.payload()) {
             Ok(()) => {
@@ -282,7 +281,6 @@ fn udp_visit(
         counts.replies += 1;
         turns.flush(stack)?;
     }
-    // ANCHOR_END: udp_retry
     Ok(())
 }
 

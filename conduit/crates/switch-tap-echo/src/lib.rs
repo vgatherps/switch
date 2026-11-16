@@ -56,7 +56,6 @@ impl EchoServer {
         listeners: usize,
         buffer: usize,
     ) -> Result<Self, EchoError> {
-        // ANCHOR: listeners
         let mut handles = Vec::with_capacity(listeners);
         for _ in 0..listeners {
             let added = stack
@@ -79,7 +78,6 @@ impl EchoServer {
                 }
             }
         }
-        // ANCHOR_END: listeners
         Ok(Self {
             port,
             echoed: vec![0; handles.len()],
@@ -104,7 +102,6 @@ impl EchoServer {
     pub fn step(&mut self, stack: &mut Stack) -> bool {
         let mut changed = false;
         for ((handle, echoed), pending) in self.handles.iter().zip(&mut self.echoed).zip(&mut self.pending) {
-            // ANCHOR: relisten
             if stack.tcp(handle).state() == State::Closed {
                 stack
                     .listen(handle, self.port)
@@ -113,8 +110,6 @@ impl EchoServer {
                 *echoed = 0;
                 changed = true;
             }
-            // ANCHOR_END: relisten
-            // ANCHOR: echo
             let socket = stack.tcp_mut(handle);
             // send_slice fails outside Established and CloseWait. In LastAck
             // smoltcp still enqueues payload from an in-window segment that
@@ -152,7 +147,6 @@ impl EchoServer {
                 }
                 changed = true;
             }
-            // ANCHOR_END: echo
             if self.close_after == Some(*echoed) {
                 if socket.may_send() {
                     stack.close(handle);
@@ -196,7 +190,6 @@ pub fn serve(
     start: std::time::Instant,
     mut stop: impl FnMut(&mut Stack, &EchoServer) -> bool,
 ) -> Result<(), StackError> {
-    // ANCHOR: serve_loop
     loop {
         let micros = i64::try_from(start.elapsed().as_micros())
             .expect("elapsed wall time fits i64 microseconds");
@@ -216,5 +209,4 @@ pub fn serve(
         };
         std::thread::sleep(sleep);
     }
-    // ANCHOR_END: serve_loop
 }
