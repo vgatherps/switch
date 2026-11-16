@@ -43,8 +43,8 @@ const TRIGGER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8090);
 /// Server name sent; TLS-Anvil's certificate is accepted whatever its names (`AnyCert`).
 const HOST: &str = "tls-anvil";
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: tls-anvil\r\n\r\n";
-/// Runtime ticks are milliseconds since start; a connection is abandoned after this many.
-const CONNECTION_LIMIT_MS: u64 = 10_000;
+/// Runtime ticks are nanoseconds since start; abandon a connection after ten seconds.
+const CONNECTION_LIMIT_NS: u64 = 10_000_000_000;
 /// How often the main loop looks for `<run-dir>/done`.
 const DONE_CHECK: Duration = Duration::from_millis(100);
 
@@ -145,7 +145,7 @@ async fn connection(handle: &NetHandle, local_port: u16, config: Arc<ClientConfi
 }
 // ANCHOR_END: connection
 
-/// `connection`, abandoned after `CONNECTION_LIMIT_MS`; how it ended goes to `ended`.
+/// `connection`, abandoned after `CONNECTION_LIMIT_NS`; how it ended goes to `ended`.
 #[switch::task]
 async fn bounded(
     spawner: Spawner,
@@ -155,7 +155,7 @@ async fn bounded(
     ended: Rc<RefCell<Option<String>>>,
 ) {
     let mut work = pin!(connection(&handle, local_port, config));
-    let mut limit = pin!(spawner.sleep(CONNECTION_LIMIT_MS).expect("the runtime is open"));
+    let mut limit = pin!(spawner.sleep(CONNECTION_LIMIT_NS).expect("the runtime is open"));
     let outcome = poll_fn(|cx| {
         if let Poll::Ready(ended) = work.as_mut().poll(cx) {
             return Poll::Ready(ended);
@@ -214,7 +214,7 @@ fn main() {
                 rt.spawner().spawn(task).expect("spawn a connection");
             }
             net.turn(clock.now()).expect("turn the Net");
-            rt.poll(clock.ms()).expect("poll the connections");
+            rt.poll(clock.ns()).expect("poll the connections");
             if checked.elapsed() >= DONE_CHECK {
                 checked = Instant::now();
                 if dir.join("done").exists() {

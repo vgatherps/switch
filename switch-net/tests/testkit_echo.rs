@@ -67,3 +67,41 @@ fn echo_junction_backend() {
     echo(Backend::Junction);
 }
 // ANCHOR_END: run
+
+#[switch::task]
+async fn timeout(spawner: switch::Spawner, done: std::rc::Rc<std::cell::Cell<bool>>) {
+    assert!(switch_net::within(
+        &spawner,
+        std::time::Duration::from_millis(10),
+        std::future::pending::<()>(),
+    ).await.is_none());
+    done.set(true);
+}
+
+fn written_timeout(backend: Backend) {
+    switch_net::testkit::with_tap_net(backend, &TAP, |net, clock| {
+        let mut runtime = switch::Runtime::new(clock.ns());
+        let spawner = runtime.spawner();
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        spawner.spawn(timeout(spawner.clone(), done.clone())).unwrap();
+        let start = clock.elapsed();
+        while !done.get() {
+            assert!(clock.elapsed() - start < std::time::Duration::from_secs(1), "10 ms timeout did not expire");
+            net.turn(clock.now()).unwrap();
+            runtime.poll(clock.ns()).unwrap();
+            std::thread::sleep(switch_net::testkit::ROUND_SLEEP);
+        }
+        assert!(clock.elapsed() - start >= std::time::Duration::from_millis(10));
+        runtime.shutdown();
+    });
+}
+
+#[switch_test_support::pinned_test]
+fn within_uses_written_duration_local_backend() {
+    written_timeout(Backend::Conduit);
+}
+
+#[switch_test_support::pinned_test]
+fn within_uses_written_duration_junction_backend() {
+    written_timeout(Backend::Junction);
+}

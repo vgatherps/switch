@@ -86,9 +86,9 @@ impl Clock {
         Instant::from_micros(i64::try_from(self.0.elapsed().as_micros()).unwrap())
     }
 
-    /// Milliseconds, for `Runtime::poll`.
-    pub fn ms(&self) -> u64 {
-        u64::try_from(self.0.elapsed().as_millis()).unwrap()
+    /// Monotonic nanoseconds, for `Runtime::poll` and relative sleeps.
+    pub fn ns(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_nanos()).unwrap()
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -319,7 +319,7 @@ pub fn client_server<T: Send + 'static, H: 'static, F: Future<Output = H> + 'sta
             assert!(clock.elapsed() < LIMIT, "client done {}, peer done {}", client_done(), peer.is_finished());
             peer.accept();
             net.turn(clock.now()).expect("turn the Net");
-            rt.poll(clock.ms()).expect("poll the client");
+            rt.poll(clock.ns()).expect("poll the client");
             each_round();
             thread::sleep(ROUND_SLEEP);
         }

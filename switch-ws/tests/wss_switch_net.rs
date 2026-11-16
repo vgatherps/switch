@@ -175,7 +175,7 @@ fn until_client_watching<T: Send + 'static, H: 'static, F: Future<Output = H> + 
             peer.accept();
             net.turn(clock.now()).expect("turn the Net");
             each_turn(net);
-            rt.poll(clock.ms()).expect("poll the client");
+            rt.poll(clock.ns()).expect("poll the client");
             std::thread::sleep(ROUND_SLEEP);
         }
         let saw = peer.join();

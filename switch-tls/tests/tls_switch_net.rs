@@ -227,7 +227,7 @@ fn until_client<T: Send + 'static, H: 'static, F: Future<Output = H> + 'static>(
             assert!(clock.elapsed() < LIMIT, "client not done");
             peer.accept();
             net.turn(clock.now()).expect("turn the Net");
-            rt.poll(clock.ms()).expect("poll the client");
+            rt.poll(clock.ns()).expect("poll the client");
             thread::sleep(ROUND_SLEEP);
         }
         let saw = peer.join();
@@ -334,7 +334,7 @@ fn read_to_end(conn: &mut ServerConnection, stream: &mut std::net::TcpStream) ->
 /// `work`'s output, or `None` once `ms` milliseconds passed.
 async fn within<T>(spawner: &Spawner, ms: u64, work: impl Future<Output = T>) -> Option<T> {
     let mut work = pin!(work);
-    let mut limit = pin!(spawner.sleep(ms).expect("the runtime is open"));
+    let mut limit = pin!(spawner.sleep(ms * 1_000_000).expect("the runtime is open"));
     poll_fn(|cx| {
         if let Poll::Ready(out) = work.as_mut().poll(cx) {
             return Poll::Ready(Some(out));
@@ -425,7 +425,7 @@ fn receive_error_waits_for_a_server_that_never_reads_until_the_caller_gives_up(b
                 match handle.tcp_connect(TAP.socket, remote, local).await {
                     Err(NetError::SocketsFull) => {
                         assert!(started.elapsed() < Duration::from_secs(5), "the dropped connection kept its slot");
-                        spawner.sleep(1).expect("the runtime is open").await.expect("sleep");
+                        spawner.sleep(1_000_000).expect("the runtime is open").await.expect("sleep");
                     }
                     result => break result,
                 }

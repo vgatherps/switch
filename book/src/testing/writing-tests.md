@@ -135,7 +135,7 @@ The client returns its two stream halves. `client_server` drops what the client 
 
 `with_tap_net(backend, &config, body)` is the lower-level form: it gives `body` a `TapNet`, which you turn yourself, and a `Clock`, and leaves the peer to you. Either way the body must drop every handle, socket and frame it made before it returns. Then `with_tap_net` takes the Stack back, closes the port with every packet buffer returned, and removes the tap device; anything still alive fails the test.
 
-`client_server` sleeps 50 µs each time through its loop, so the peer thread gets the CPU.
+`Clock::now()` supplies the Stack's microsecond `Instant`; `Clock::ns()` supplies monotonic nanosecond ticks for `Runtime::poll` and relative sleeps. `client_server` polls its runtime in nanoseconds, so `within` limits use their written durations. It sleeps 50 µs each time through its loop, so the peer thread gets the CPU.
 
 ## Running one body on both backends
 
