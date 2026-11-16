@@ -23,6 +23,7 @@ use slice_ringbuffer::RingWriter;
 
 use crate::control::{
     ClientMessage, EndReason, Event, HostMessage, Op, SocketId, VERSION, Welcome, WelcomeStatus,
+    write_queued,
 };
 
 pub type SessionId = u64;
@@ -121,18 +122,7 @@ impl Connection {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        while self.written < self.output.len() {
-            match self.socket.write(&self.output[self.written..]) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => self.written += n,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        self.output.clear();
-        self.written = 0;
-        Ok(())
+        write_queued(&mut self.socket, &mut self.output, &mut self.written)
     }
 
     // Terminal messages get exactly one nonblocking write attempt, including queued events.

@@ -28,7 +28,7 @@ use crate::rx::{OwnedFrame, PacketMeta};
 
 use crate::control::{
     ClientMessage, ConfigError, DecodeError, EndReason, Event, HostMessage, ListenEndpoint, Op,
-    SocketId, TcpConfig, UdpConfig, VERSION, WelcomeStatus,
+    SocketId, TcpConfig, UdpConfig, VERSION, WelcomeStatus, write_queued,
 };
 use crate::send::{self, TCP_SEND_HEADER, UDP_SEND_HEADER};
 
@@ -500,26 +500,9 @@ impl Session {
         if self.write_error.is_some() {
             return;
         }
-        while self.written < self.output.len() {
-            match self.socket.write(&self.output[self.written..]) {
-                Ok(0) => {
-                    self.write_error = Some(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "control socket write returned zero",
-                    ));
-                    return;
-                }
-                Ok(n) => self.written += n,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    self.write_error = Some(error);
-                    return;
-                }
-            }
+        if let Err(error) = write_queued(&mut self.socket, &mut self.output, &mut self.written) {
+            self.write_error = Some(error);
         }
-        self.output.clear();
-        self.written = 0;
     }
 
     /// Flushes pending control output and handles queued host events without blocking.

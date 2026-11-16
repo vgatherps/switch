@@ -1,6 +1,7 @@
 //! Little-endian, framed control messages. Decoders consume one message at a time.
 
 use std::fmt;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroU16;
 
@@ -637,5 +638,93 @@ impl HostMessage {
             }
         };
         Ok(Some((message, total)))
+    }
+}
+
+/// Writes queued control bytes `output[*written..]` until the nonblocking `socket` would block.
+/// When everything is written the buffer is cleared. While bytes remain, the written prefix is
+/// dropped once it is at least as long as the rest, so the buffer holds less than twice the
+/// unwritten bytes and moving the rest costs O(1) amortized per written byte.
+pub(crate) fn write_queued(
+    socket: &mut impl Write,
+    output: &mut Vec<u8>,
+    written: &mut usize,
+) -> io::Result<()> {
+    while *written < output.len() {
+        match socket.write(&output[*written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "control socket write returned zero",
+                ));
+            }
+            Ok(n) => *written += n,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if *written >= output.len() - *written {
+                    output.drain(..*written);
+                    *written = 0;
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    output.clear();
+    *written = 0;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Accepts up to `room` bytes, then reports WouldBlock until `room` is raised again.
+    struct Paced {
+        room: usize,
+        received: Vec<u8>,
+    }
+
+    impl Write for Paced {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            self.received.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn written_prefix_is_reclaimed_while_the_reader_lags() {
+        const BACKLOG: usize = 64 * 1024;
+        const STEP: usize = 1000;
+        let byte = |index: usize| (index % 251) as u8;
+        let mut peer = Paced { room: 0, received: Vec::new() };
+        let (mut output, mut written) = (Vec::new(), 0);
+        output.extend((0..BACKLOG).map(byte));
+        let mut queued = BACKLOG;
+        // The reader takes as much as is produced each round but never catches up with the
+        // backlog, so the buffer never empties: memory must track the unwritten bytes,
+        // not everything ever queued.
+        for _ in 0..256 {
+            output.extend((queued..queued + STEP).map(byte));
+            queued += STEP;
+            peer.room = STEP;
+            write_queued(&mut peer, &mut output, &mut written).unwrap();
+            let unwritten = output.len() - written;
+            assert!(unwritten > 0);
+            assert!(output.len() < 2 * unwritten, "buffer {} for {unwritten} unwritten bytes", output.len());
+        }
+        peer.room = usize::MAX;
+        write_queued(&mut peer, &mut output, &mut written).unwrap();
+        assert_eq!((output.len(), written), (0, 0));
+        assert!(peer.received.iter().copied().eq((0..queued).map(byte)), "bytes reordered or lost");
     }
 }
