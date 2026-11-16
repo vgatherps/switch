@@ -14,7 +14,7 @@ make book        # the book only (needs mdbook: cargo install mdbook)
 make api-docs    # the API reference only
 ```
 
-The API reference builds in the Docker image described under [Building](#building), because most of the crates need DPDK; build the image once with `make -C conduit docker-image`. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
+The API reference builds in the repository's Docker image (see [Try it](#try-it)), because most of the crates need DPDK; build the image once with `make -C conduit docker-image`. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
 
 ## Using the crates
 
