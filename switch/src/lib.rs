@@ -8,6 +8,7 @@ pub use switch_runtime::{
     JoinHandle, PollReport, RemoteWaker, Runtime, RuntimeError, Sleep, SleepError, SpawnError,
     SpawnToken, Spawner, StoredWaker, YieldNow, boxed, oneshot, request_turn, yield_now,
 };
+#[doc(inline)]
 pub use switch_macros::facade_task as task;
 
 #[doc(hidden)]

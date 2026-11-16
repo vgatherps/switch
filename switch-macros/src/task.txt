@@ -1,0 +1,19 @@
+Marks a function as a task that can be spawned on a switch runtime.
+
+Write `#[switch::task]` on an `async fn`, or on a function returning
+`impl Future<Output = T>` (optionally `+ 'static`). Calling the function returns
+a `switch::SpawnToken`; pass it to `Spawner::spawn` to start the task, or to
+`Spawner::spawn_join` to get a `JoinHandle<T>` for its result. Calling the
+function packages its arguments without running its body. A plain function's
+body runs at spawn; arguments its returned future does not capture are dropped
+then. The future runs when the runtime polls it.
+
+The function keeps its name, visibility, generics and attributes. Type and const
+generics, `where` clauses and `impl Trait` arguments are supported. Each generic
+instantiation has its own task pool. The future and its output must be
+`'static`; neither has to be `Send`. The future and task metadata must fit in a
+64 KiB task block, checked at compile time.
+
+Arguments must be plain identifiers, optionally `mut`. The attribute takes no
+arguments. A `self` receiver, `const`, `unsafe` or `extern` functions, argument
+patterns, and other return types or bounds (including `+ Send`) are rejected.

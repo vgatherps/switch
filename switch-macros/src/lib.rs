@@ -1,10 +1,6 @@
-//! # switch-macros
+//! Task attributes re-exported by `switch` and `switch-runtime`.
 //!
-//! The `#[switch_runtime::task]` attribute, which marks a function as a task of the `switch-runtime` runtime. `switch-runtime` re-exports it: depend on `switch-runtime` and write `#[switch_runtime::task]`, not on this crate.
-//!
-//! The attribute goes on an `async fn`, or on a `fn` returning `impl Future<Output = T>` (optionally `+ 'static`). The function keeps its name, visibility, generics and attributes, but calling it returns a `switch_runtime::SpawnToken` that holds the arguments; `Spawner::spawn` or `Spawner::spawn_join` starts the task. Arguments must be plain identifiers (`mut` is allowed), and the future and its value must be `'static`. A `self` receiver, `const`, `unsafe` or `extern` functions, other argument patterns, other return types (including `+ Send` bounds) and arguments to the attribute are compile errors. Generic task functions are allowed.
-//!
-//! Book: see the switch book, chapter "Writing and spawning tasks".
+//! Application code uses `#[switch::task]`; this crate implements the attribute.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -16,14 +12,13 @@ use syn::{
     TypeImplTrait, TypeParamBound, parse_macro_input,
 };
 
-/// Marks a task function: `async fn`, or `fn` returning `impl Future<Output = T>`,
-/// with arguments bound to plain identifiers and a `'static` return value. Each
-/// instantiation of a generic task function has its own pool. Takes no arguments.
+#[doc = include_str!("task.txt")]
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     task_attribute(attr, item, quote!(::switch_runtime), "switch_runtime::task")
 }
 
+#[doc = include_str!("task.txt")]
 #[doc(hidden)]
 #[proc_macro_attribute]
 pub fn facade_task(attr: TokenStream, item: TokenStream) -> TokenStream {
