@@ -115,6 +115,8 @@ The generators can use either backend, independently of the receiver. On the jun
 
 `switch-bench/local/junction-smoke.sh` checks this path end to end inside the DPDK container. Build the binaries first (`cargo build --locked -p switch-junctiond -p switch-bench --bins`), then run it in a container that may use two CPUs, with the tap capabilities. It writes its own tap config, starts the daemon, echoes UDP and TCP messages from kernel clients through `serve --backend junction`, runs a short UDP step with `gen --backend junction`, and requires every process to exit cleanly. The daemon's network CPU and the application's CPU are the environment variables `JUNCTION_CPU` (default 0) and `APP_CPU` (default 2); the script puts the daemon's control thread on `APP_CPU` too.
 
+A TCP peer closing before a complete echo fails the smoke run immediately. The echo reader's split-receive and EOF regressions run without DPDK: `python3 -m unittest discover -s switch-bench/local`.
+
 The two backends report pushback differently, as [Measuring latency under load](index.md#when-the-generator-is-the-limit) explains: on the local backend a full TCP connection shows up as latency and loss, on the junction backend a full send ring shows up as a sender-late step.
 
 ## Command reference

@@ -103,7 +103,9 @@ For junction (build `cargo build --locked -p switch-junctiond -p switch-bench --
 `sh switch-bench/local/junction-smoke.sh` inside the DPDK container with two CPUs and NET_ADMIN plus
 `/dev/net/tun`. `JUNCTION_CPU=0 APP_CPU=2` are defaults. It runs the daemon on a tap vdev, checks
 kernel-client UDP and TCP echoes through `serve --backend junction`, then runs a short UDP
-`gen --backend junction` against a kernel echo peer. All processes must retire cleanly.
+`gen --backend junction` against a kernel echo peer. A peer closing before a complete TCP echo fails
+immediately rather than spinning on EOF. All processes must retire cleanly.
+The echo reader's regression tests need only Python: `python3 -m unittest discover -s switch-bench/local`.
 
 ## Tests
 

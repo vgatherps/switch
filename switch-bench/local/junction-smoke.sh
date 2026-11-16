@@ -16,6 +16,15 @@ import tempfile
 import threading
 import time
 
+def recv_echo(peer, size):
+    echoed = b""
+    while len(echoed) < size:
+        data = peer.recv(4096)
+        if not data:
+            raise EOFError(f"echo peer closed after {len(echoed)}/{size} bytes")
+        echoed += data
+    return echoed
+
 with tempfile.TemporaryDirectory(prefix="bench-junction-") as root:
     root = Path(root)
     config = root / "nic.json"
@@ -94,9 +103,7 @@ with tempfile.TemporaryDirectory(prefix="bench-junction-") as root:
                 for i in range(16):
                     payload = f"junction-{proto}-{i:02d}".encode()
                     peer.sendall(payload)
-                    echoed = b""
-                    while len(echoed) < len(payload):
-                        echoed += peer.recv(4096)
+                    echoed = recv_echo(peer, len(payload))
                     assert echoed == payload, (proto, echoed)
                 print(f"serve --backend junction {proto}: 16/16 echoes", flush=True)
             app.send_signal(signal.SIGTERM)
