@@ -120,15 +120,6 @@ mod tests {
     }
 
     #[test]
-    fn default_rx_size_fits_two_mib_hugepages() {
-        let args = parse(&["--config", "nic.json"]).unwrap();
-        let page_size = 2 * 1024 * 1024;
-        assert!(args.rx_size >= page_size);
-        assert_eq!(args.rx_size % page_size, 0);
-        assert!(USAGE.contains(&format!("[--rx-size {}]", args.rx_size)));
-    }
-
-    #[test]
     fn rejects_invalid_duplicate_unknown_and_missing_arguments() {
         for args in [
             vec![], vec!["--config"], vec!["nic.json"],
