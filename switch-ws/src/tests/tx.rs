@@ -782,7 +782,7 @@ fn invalid_input_changes_nothing() {
     c.ping(b"p");
     let before = state(&c);
     assert_eq!(ready(c.send(Kind::Text, &[b'a', 0xff])), Err(TxError::InvalidText));
-    assert_eq!(ready(c.send(Kind::Binary, &[0; MAX + 1])), Err(TxError::TooBig));
+    assert_eq!(ready(c.send(Kind::Binary, &[0; MAX + 1])), Err(TxError::TooBig { max_send: MAX }));
     assert_eq!(ready(c.close(1000, &"r".repeat(124))), Err(TxError::InvalidClose));
     for code in [999, 1005, 1006, 1015] {
         assert_eq!(ready(c.close(code, "")), Err(TxError::InvalidClose), "{code}");
@@ -795,6 +795,23 @@ fn invalid_input_changes_nothing() {
     assert_eq!(ready(c.send(Kind::Text, b"late")), Err(TxError::Closed));
     let msgs = messages(Role::Server, &log);
     assert_eq!(msgs[..3], [TMessage::Pong(b"p".to_vec().into()), TMessage::Binary(vec![4; 3000].into()), TMessage::Binary(vec![5; MAX].into())]);
+}
+
+/// The public error retains the configured send limit and displays it in bytes.
+#[test]
+#[cfg(feature = "switch-net")]
+fn oversized_send_reports_the_configured_limit() {
+    use crate::switch_net::Error;
+
+    for max_send in [0, 7, 4000] {
+        let config = Config::new(Role::Server, Limits { max_send, ..Limits::default() });
+        let (mut c, _) = mock::<true>(&config, ROOM);
+        let error = ready(c.send(Kind::Binary, &vec![0; max_send + 1])).unwrap_err();
+        assert_eq!(error, TxError::TooBig { max_send });
+        let error = Error::from(error);
+        assert!(matches!(error, Error::TooBig { max_send: limit } if limit == max_send));
+        assert_eq!(error.to_string(), format!("message over {max_send} B"));
+    }
 }
 
 /// The send buffer grows by clamped doubling: across increasing message sizes (40, 41, 63 MiB)

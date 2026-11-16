@@ -58,7 +58,7 @@ A message goes out as one WebSocket message, in as many frames as it needs, and 
 | Error | Why |
 |---|---|
 | `InvalidText` | `Kind::Text` with bytes that are not UTF-8 |
-| `TooBig` | the payload is over `Limits::max_send` |
+| `TooBig { max_send }` | the payload is over `Limits::max_send`; the error carries that configured limit |
 | `Closed` | you already called `close` or `linger` |
 | `Failed(f)` | the connection failed earlier; `f` is that first failure |
 
@@ -104,7 +104,7 @@ pub struct Limits {
 }
 ```
 
-`Limits::default()` is 16 MiB per WebSocket frame, 64 MiB per received message and 64 MiB per sent message. A received WebSocket frame or message over its limit fails the connection with `Failed(Failure::Protocol(ProtocolError::FrameTooBig))` or `MessageTooBig`. A send over `max_send` is refused with `TooBig` and nothing is sent.
+`Limits::default()` is 16 MiB per WebSocket frame, 64 MiB per received message and 64 MiB per sent message. A received WebSocket frame or message over its limit fails the connection with `Failed(Failure::Protocol(ProtocolError::FrameTooBig))` or `MessageTooBig`. A send over `max_send` is refused with `TooBig { max_send }` and nothing is sent. Its `Display` text reports the configured limit in bytes, for example `message over 4096 B`.
 
 The receive buffer for messages that straddle frames grows only as bytes arrive, so a large `max_message` costs memory only when a large message actually comes.
 

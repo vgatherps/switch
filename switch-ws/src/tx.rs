@@ -65,7 +65,7 @@ pub(crate) enum TxError {
     /// A close is queued or sent (RFC 6455 §5.5.1).
     Closed,
     Failed(Failure),
-    TooBig,
+    TooBig { max_send: usize },
     InvalidText,
     InvalidClose,
 }
@@ -507,7 +507,7 @@ impl<L: PlainTx> TxCore<L> {
     pub(crate) fn check_send(&self, kind: Kind, payload: &[u8]) -> Result<(), TxError> {
         self.refuse()?;
         if payload.len() > self.max_send {
-            return Err(TxError::TooBig);
+            return Err(TxError::TooBig { max_send: self.max_send });
         }
         if kind == Kind::Text && core::str::from_utf8(payload).is_err() {
             return Err(TxError::InvalidText);

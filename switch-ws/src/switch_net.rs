@@ -66,7 +66,7 @@ pub enum Error {
     /// A close code we may not send, or a reason over 123 B; nothing was sent.
     InvalidClose,
     /// A message over the connection's `Limits::max_send`; nothing was sent.
-    TooBig,
+    TooBig { max_send: usize },
 }
 
 impl From<TxError> for Error {
@@ -74,7 +74,7 @@ impl From<TxError> for Error {
         match e {
             TxError::Closed => Self::Closed,
             TxError::Failed(f) => Self::Failed(f),
-            TxError::TooBig => Self::TooBig,
+            TxError::TooBig { max_send } => Self::TooBig { max_send },
             TxError::InvalidText => Self::InvalidText,
             TxError::InvalidClose => Self::InvalidClose,
         }
@@ -94,7 +94,7 @@ impl fmt::Display for Error {
             Self::Failed(e) => write!(f, "connection failed: {e:?}"),
             Self::InvalidText => f.write_str("text message is not UTF-8"),
             Self::InvalidClose => f.write_str("close code not sendable or reason over 123 B"),
-            Self::TooBig => f.write_str("message over 64 MiB"),
+            Self::TooBig { max_send } => write!(f, "message over {max_send} B"),
         }
     }
 }
