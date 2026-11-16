@@ -13,11 +13,11 @@ A card opened with [`open`](crate::nic::open) belongs to that one process. When 
                network card
 ```
 
-The tasks of your program do not change. What changes is how `main` gets its [`Net`](crate::net::Net) and how it gives it back.
+Only `main` changes: how it gets its [`Net`](crate::net::Net) and how it gives it back.
 
 ## What changes in the code
 
-The example `tcp_client_junction` is the client from [Your first network program](crate::guide::first_connection) with these lines in place of the config file, `Sizing` and `open`:
+The example `tcp_client_junction` is the client from [Your first network program](crate::guide::first_connection) with the config file, `Sizing` and `open` replaced by a connection to the daemon. Written as a function, that part is:
 
 ```rust
 use std::path::Path;
@@ -39,11 +39,13 @@ fn connect(control: &str) -> Result<(Net, tcp::Config), Box<dyn std::error::Erro
 }
 ```
 
-[`Session::connect`](crate::junction::session::Session::connect) takes the path of the daemon's `control.sock` and the number of sockets, TCP and UDP together, the program wants to have open at once. A [`Session`](crate::junction::session::Session) is this program's connection to the daemon. [`Net::remote`](crate::net::Net::remote) wraps it; `tx_frames` is the size of the program's pool of [send frames](crate::guide::frames).
+[`Session::connect`](crate::junction::session::Session::connect) takes the path of the daemon's `control.sock` and the number of sockets, TCP and UDP together, the program wants to have open at once. A [`Session`](crate::junction::session::Session) is this program's connection to the daemon. [`Net::remote`](crate::net::Net::remote) wraps it; `tx_frames` is the size of the program's pool of [send frames](crate::guide::frames). `tx_mbuf_budget` takes an MTU and the session reports the size of a frame, which is 28 bytes less, so the code adds them back.
+
+The program has no config file, so it has nothing to compute `mss_cap` from and passes `None`; the daemon's network stack applies the limits of its own config.
 
 From there the program is the same: `net.handle()`, the task, and the loop calling [`round`](crate::net::round).
 
-At the end, `main` takes the session back and finishes it, so the daemon knows the program left on purpose:
+At the end, the program takes the session back and finishes it, so the daemon knows it left on purpose. As a function:
 
 ```rust
 use std::time::{Duration, Instant};
@@ -56,7 +58,7 @@ fn close(mut rt: Runtime, net: Net) -> Result<(), Box<dyn std::error::Error>> {
     let mut session = net.into_session().map_err(|_net| "a socket or handle outlived the task")?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !session.closed() {
-        // An error means the daemon has not yet taken everything sent before; try again.
+        // Until the end of the session can be sent, `finish` fails: poll and try again.
         let _ = session.finish();
         session.poll(|_, _| {}, |_, _, _| {}).map_err(|error| format!("finish session: {error}"))?;
         if Instant::now() >= deadline {
@@ -68,7 +70,7 @@ fn close(mut rt: Runtime, net: Net) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`into_session` has the same condition as `into_stack` in [Shutting down](crate::guide::shutdown): no handle or socket may be left. `finish` asks the daemon to end the session and `closed` turns true when the daemon has confirmed it. A session that is dropped without this looks like a crash to the daemon, which then resets the program's open connections.
+`into_session` has the same condition as `into_stack` in [Shutting down](crate::guide::shutdown): no handle or socket may be left. `finish` asks the daemon to end the session and `closed` turns true when the daemon has confirmed it. `poll` keeps the session moving in the meantime; its two callbacks are for socket events and received packets, and with no socket left both are empty. A session that is dropped without this looks like a crash to the daemon, which then resets the program's open connections.
 
 ## Running it
 
@@ -79,7 +81,7 @@ cargo build -p switch-junctiond --bin switch-junctiond
 cargo build -p switch-examples --features net --example tcp_client_junction
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
 taskset -c 0 target/debug/switch-junctiond --config examples/tap.json --dir /tmp/example-junction --control-cpus 1 &
-until test -S /tmp/example-junction/control.sock; do sleep 0.1; done
+until test -S /tmp/example-junction/control.sock && ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 taskset -c 2 target/debug/examples/tcp_client_junction /tmp/example-junction/control.sock 192.0.2.1:7000
 kill %2
@@ -98,19 +100,15 @@ The `EAL:` lines are the daemon's. Start the client under `taskset` as shown: th
 
 ## What behaves differently
 
-| | Owning the card | Sharing it |
+| | Owning the card | Sharing a card |
 |---|---|---|
-| After `room(len)` resolves | `try_send` of that length succeeds | `try_send` can still return `Full`; keep the frame and await `room` again |
-| A peer that reads slowly | `room` waits once `tx_capacity` bytes are unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
+| After `room(len)` resolves | `try_send` of that length does not return `Full` | `try_send` can still return `Full`; keep the frame and await `room` again |
+| A peer that reads slowly | `room` waits while `tx_capacity` bytes are queued or unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
 | UDP `send` to an address that cannot be reached yet | Returns `NoRoute`, `NeighborPending` or `Unaddressable` | Returns `Ok`; the daemon drops the datagram |
-| A `tcp::Config` that is not valid | Panics | The open returns `InvalidConfig` |
 | Size of a frame from `tx_frame` | The config's `mtu` less 28 | `session.frame_capacity()` |
-| Copies on send | None for a frame that qualifies ([Frames](crate::guide::frames)) | One, into shared memory |
 | Received frames you hold | Keep the card's buffers | Keep space in the session's receive area, which all the program's sockets share |
-| `net.poll_at()` | The next TCP timer | Always `None`; TCP's timers run in the daemon |
-| Binding a port right after dropping a socket on it | Works | Can return `PortInUse` for a moment |
 
-The first two rows matter most. Code that should run both ways sends like this:
+The reference for [`Net`](crate::net::Net) lists every difference. Code that should run both ways sends like this:
 
 ```rust
 use switch::net::{Error, ImmutableFrame, TcpTx};
@@ -131,6 +129,6 @@ Because the daemon accepts bytes faster than a slow peer reads them, a program t
 
 ## When the daemon goes away
 
-If the daemon stops or crashes, the next `round` returns `RoundError::Turn(TurnError::HostLost(_))`. From then on opens fail with `HostLost`, and sends and TCP receives with `InvalidState`, once data already received has been read. A task waiting in a UDP `recv` is not woken. Leave the loop, shut the runtime down and exit; the session cannot be resumed.
+If the daemon stops or crashes, `round` soon returns `RoundError::Turn(TurnError::HostLost(_))`. Leave the loop, shut the runtime down and exit; the session cannot be resumed.
 
 Next: [A complete program](crate::guide::feed).

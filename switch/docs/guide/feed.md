@@ -1,6 +1,6 @@
 # A complete program
 
-The example `wss_client` is a small market-data client. It connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits. It is shown here whole, in the order of the file.
+The example `wss_client` is a small market-data client. It connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits.
 
 ```toml
 [package]
@@ -402,11 +402,11 @@ async fn read_feed(
 
 Each phase of the task is under [`within`](crate::guide::timeouts).
 
-Connecting is one block: the TCP connect, then [`connect`](crate::ws::net::connect) for TLS and the WebSocket upgrade. If the limit passes, the block is dropped wherever it was, and the socket it had opened is closed with it.
+Connecting is one block: the TCP connect, then [`connect`](crate::ws::net::connect) for TLS and the WebSocket upgrade.
 
-The message loop puts a limit on every `recv`. A book-ticker feed is never quiet for long, so ten seconds of silence means the connection is dead even though TCP has reported nothing; [TCP has no keep-alive](crate::guide::tcp). Each `message` borrows the connection and is released at the end of the loop body. Server pings are answered inside `recv`.
+The message loop puts a limit on every `recv`: the program gives up when no complete message has arrived for ten seconds. Without the limit a feed that had gone quiet would keep the task waiting, because [TCP has no keep-alive](crate::guide::tcp).
 
-Closing follows [the WebSocket chapter](crate::guide::websocket): send the close frame, then receive until `None`. The feed keeps sending updates until it has seen the close, and the loop reads past them.
+Closing is as in [WebSocket](crate::guide::websocket). The feed keeps sending updates until it has seen the close, and the loop reads past them.
 
 The task's errors are turned into strings so that the three kinds, from TCP, from WebSocket and from the limits, fit one `Result`. The whole body is an inner `async` block so that `?` can be used and the outcome still lands in `done`, where `main` finds it.
 
@@ -517,7 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let roots = args
         .next()
         .unwrap_or_else(|| "/etc/ssl/certs/ca-certificates.crt".into());
-    // Resolve and load certificates before opening the NIC: both use the kernel.
+    // Look up the server and load the certificates before opening the card.
     let server = (host.as_str(), port)
         .to_socket_addrs()?
         .find_map(|address| match address {
@@ -601,7 +601,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 # }
 ```
 
-Looking up the server's name and reading the certificate file are done by the kernel and can block. They come first, while nothing depends on the loop going round. switch has no name lookup of its own.
+The blocking setup comes before the card is opened, as in [Your first network program](crate::guide::first_connection): here the name lookup and the certificate file.
 
 ## Opening the card
 
@@ -748,7 +748,7 @@ Looking up the server's name and reading the certificate file are done by the ke
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     };
     let start = WallInstant::now();
-    // SAFETY: this thread owns the device and its packets; EAL outlives the port.
+    // SAFETY: this thread alone uses the card, and `_eal` lives until it is closed.
     let opened = unsafe {
         open(&config, &sizing, None, &mut || {
             Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap())
@@ -794,7 +794,7 @@ Looking up the server's name and reading the certificate file are done by the ke
 # }
 ```
 
-This is the setup of [the first network program](crate::guide::first_connection): one TCP socket, sized for one connection. The server is on the internet, so the config file must name a `gateway`. `open` finds the gateway's hardware address before it returns.
+This is the setup of [the first network program](crate::guide::first_connection): one TCP socket, sized for one connection. The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer within three seconds.
 
 ## The loop and the end
 
@@ -987,20 +987,20 @@ This is the setup of [the first network program](crate::guide::first_connection)
 }
 ```
 
-The [loop](crate::guide::drive_loop) reads the clock once per round, in nanoseconds for the runtime and microseconds for the network. It sleeps a millisecond after an idle round, which suits a program that prints to a terminal. A feed handler that cares about every microsecond removes the sleep and gives the loop a CPU of its own.
+The [loop](crate::guide::drive_loop) sleeps a millisecond after an idle round, which suits a program that prints to a terminal. A feed handler that cares about every microsecond removes the sleep and gives the loop a CPU of its own.
 
 The loop needs no time limit, because every wait in the task has one and the task always ends. When it has, the program [shuts down](crate::guide::shutdown) in order.
 
 ## Running it
 
-On a machine whose card reaches the internet, with a config file that has a gateway:
+On a machine whose card reaches the internet (`docs/operations/host-setup.md` in the repository prepares one and writes its config file):
 
 ```sh
 cargo build -p switch-examples --features ws --example wss_client
-taskset -c 0 target/debug/examples/wss_client /etc/switch/nic.json
+taskset -c 0 target/debug/examples/wss_client /etc/switch/dut.json
 ```
 
-The other arguments default to the Binance feed, three messages and the system's certificate file. To run it in a container on the tap device, the container has to forward the program's packets to the internet; `examples/README.md` in the repository has the commands. After the report on the card, a run prints:
+The other arguments default to the Binance feed, three messages and the system's certificate file. To run it in a container on the tap device, the container has to forward the program's packets to the internet; `examples/README.md` in the repository has the steps. After the report on the card, a run prints:
 
 ```text
 {"u":103008143177,"s":"BTCUSDT","b":"64604.23000000","B":"2.17781000","a":"64604.24000000","A":"0.16129000"}

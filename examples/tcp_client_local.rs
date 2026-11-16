@@ -37,21 +37,23 @@ const LIMIT: Duration = Duration::from_secs(30);
 /// There is no ephemeral port allocator; the local port must be nonzero.
 const LOCAL_PORT: u16 = 40000;
 
-/// Monotonic time since `start`: Stack time in microseconds and runtime ticks in nanoseconds.
+/// Time since `start`, in the two units the program needs.
 struct Clock {
     start: WallInstant,
 }
 
 impl Clock {
+    /// Network time, in microseconds.
     fn now(&self) -> Instant {
         self.sample().0
     }
 
+    /// The runtime's tick, in nanoseconds.
     fn ns(&self) -> u64 {
         u64::try_from(self.start.elapsed().as_nanos()).expect("elapsed time fits u64 nanoseconds")
     }
 
-    /// Stack time and runtime tick from the same clock sample.
+    /// Both, from one reading of the clock.
     fn sample(&self) -> (Instant, u64) {
         let nanos = self.ns();
         let micros = i64::try_from(nanos / 1_000).expect("elapsed time fits i64 microseconds");
@@ -59,7 +61,7 @@ impl Clock {
     }
 }
 
-/// Runs the conversation and leaves its result in `done` for the drive loop.
+/// Runs the conversation and leaves its result in `done` for the loop in `main`.
 #[switch::task]
 async fn hello(
     handle: NetHandle,
@@ -102,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: tcp_client_local CONFIG HOST:PORT".into());
     };
     let config = Config::load(Path::new(&config))?;
-    // Name lookup goes through the kernel and blocks, so do it before open.
+    // Name lookup goes through the kernel and blocks, so do it before opening the card.
     let Some(SocketAddr::V4(server)) = server.to_socket_addrs()?.find(SocketAddr::is_ipv4) else {
         return Err("server has no IPv4 address".into());
     };
@@ -123,8 +125,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Every receive and every poll gets its time from this one clock.
     let clock = Clock { start: WallInstant::now() };
-    // SAFETY: EAL creates the device named in the config, this thread owns it and every
-    // packet, and EAL (`_eal` below) lives until the Port is closed.
+    // SAFETY: this thread alone uses the card and everything made from it, and `_eal`
+    // lives until the card is closed.
     let opened = unsafe { open(&config, &sizing, None, &mut || clock.now()) }?;
     println!("{}", opened.report);
     let _eal = opened.eal;

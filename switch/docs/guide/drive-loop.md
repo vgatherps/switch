@@ -4,7 +4,7 @@ Packets are received and sent, and tasks run, only when the loop in `main` goes 
 
 ## A round
 
-[`round`](crate::net::round) does one:
+One call to [`round`](crate::net::round) is one round:
 
 ```rust
 use switch::Runtime;
@@ -39,7 +39,7 @@ fn drive(
                 |
                 v
    +------------------------+
-   | send                   |  everything queued goes to the card
+   | send                   |  queued data goes to the card
    |   net.send()           |
    +------------------------+
                 |
@@ -47,36 +47,19 @@ fn drive(
         back to the top
 ```
 
-The order is what makes a reply fast: a task woken by a packet runs in the same round, and what it sends in answer leaves at the end of that round.
+The order is what makes a reply fast: a task woken by a packet can run in the same round, and what it sends in answer can leave at the end of that round.
 
-It also sets what a task may assume. `try_send` on a socket queues data and returns; the data leaves in the send step. A task waiting in `recv` runs again only after a receive step has found data for it. So a task that keeps the thread for a long time delays every packet in both directions, which is why long work is cut up with [`yield_now`](crate::guide::tasks).
+`try_send` on a socket queues data and returns; the data leaves in a send step. A task waiting in `recv` runs again only after a receive step has found data, or the end of the connection, for it.
 
 `round` is three calls, [`Net::receive`](crate::net::Net::receive), [`Runtime::poll`](crate::Runtime::poll) and [`Net::send`](crate::net::Net::send). A loop with work of its own to do between them can call them itself.
 
-## One clock, two units
+## The clock
 
 A round takes the time twice. `now` is the network's time, an [`Instant`](crate::net::Instant) counted in microseconds, which TCP uses for its timers. `tick` is the runtime's tick from [Your first task](crate::guide::first_task).
 
-Read the clock once per round and derive both from that reading, so tasks and the network agree on the time. Count ticks in nanoseconds: the [timeout helpers](crate::guide::timeouts) convert a `Duration` to ticks on that assumption. The `Clock` of the first network program does both:
+Read the clock once per round and derive both from that reading, so tasks and the network agree on the time. Count ticks in nanoseconds: the [timeout helpers](crate::guide::timeouts) convert a `Duration` to ticks on that assumption. The `Clock` in [Your first network program](crate::guide::first_connection) does both in its `sample`.
 
-```rust
-use std::time::Instant as WallInstant;
-use switch::net::Instant;
-
-struct Clock {
-    start: WallInstant,
-}
-
-impl Clock {
-    fn sample(&self) -> (Instant, u64) {
-        let nanos = u64::try_from(self.start.elapsed().as_nanos()).expect("fits u64 nanoseconds");
-        let micros = i64::try_from(nanos / 1_000).expect("fits i64 microseconds");
-        (Instant::from_micros(micros), nanos)
-    }
-}
-```
-
-`std::time::Instant` never goes backwards, which both units require. Use the same clock for the `Runtime::new` tick and for the clock passed to `open`.
+`std::time::Instant` never goes backwards, which both units require. Pass the same clock to `open`, and start the runtime at a tick no later than the first reading: `Runtime::new(0)` will do when ticks count from the program's start.
 
 ## Going round without pause, or sleeping
 
@@ -85,8 +68,8 @@ The loop above calls `round` again at once, whether or not anything happened. Th
 A program that shares its CPU can sleep when a round did nothing. `round` returns `false` when no packet was received or sent, none is waiting, and no task ran:
 
 ```rust
-# use switch::Runtime;
-# use switch::net::{Instant, Net, RoundError};
+use switch::Runtime;
+use switch::net::{Instant, Net, RoundError};
 use std::time::Duration;
 
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
@@ -105,7 +88,7 @@ fn drive(
 }
 ```
 
-While the loop sleeps, nothing is received, no TCP timer runs and no task's sleep ends, so everything is late by up to the length of the sleep. One millisecond is a reasonable bound for most uses. To sleep longer, ask [`net.poll_at()`](crate::net::Net::poll_at) for the time of the network's next timer and wake by then; `None` means it has none. Tasks' own sleeps are not included in that answer.
+While the loop sleeps, nothing is received, no TCP timer runs and no task's sleep ends, so everything can be late by the length of the sleep. The examples sleep one millisecond. [`net.poll_at()`](crate::net::Net::poll_at) gives the time of the network's next timer, for a loop that wants to sleep until then; `None` means it has none. The runtime has no such call for tasks' sleeps, so a loop whose tasks sleep keeps its own sleeps short.
 
 ## When a round fails
 

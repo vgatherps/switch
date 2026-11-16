@@ -7,7 +7,7 @@ A switch program needs one dependency. switch is used from a clone of its reposi
 switch = { path = "<clone>/switch" }
 ```
 
-With no features enabled, `switch` has tasks and timers and no network, and it builds on any machine with cargo. The code below is the example `first_task`. From the clone, run it with:
+With no features enabled, `switch` has tasks and timers and no network, and it builds on any machine with cargo. The example `first_task` does the three things below in one `main`; here each is shown as a small program of its own. From the clone, run the example with:
 
 ```sh
 cargo run -p switch-examples --example first_task
@@ -39,7 +39,7 @@ Hello, switch!
 
 `Runtime::new(0)` creates the runtime. `runtime.spawner()` returns a [`Spawner`](crate::Spawner), a handle that starts tasks and can be cloned freely. Calling `hello("switch")` does not run the body. It packs the argument into a token, and `spawner.spawn` starts the task from that token.
 
-The task still has not run. Tasks run inside [`runtime.poll`](crate::Runtime::poll), which runs every task that is ready and returns a [`PollReport`](crate::PollReport). The report's `live_tasks` field counts the tasks that have not finished, so this loop polls until `hello` is done. The runtime never runs anything by itself: it has no threads, and between two calls to `poll` nothing happens.
+The task still has not run. Tasks run inside [`runtime.poll`](crate::Runtime::poll), which runs the tasks that are ready and returns a [`PollReport`](crate::PollReport). The report's `live_tasks` field counts the tasks that have not finished, so this loop polls until `hello` is done. The runtime never runs anything by itself: it has no threads, and between two calls to `poll` nothing happens.
 
 ## Getting a value back
 

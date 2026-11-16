@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo build -p switch-examples --features ws --example wss_client
-//! taskset -c 0 target/debug/examples/wss_client /etc/switch/nic.json stream.binance.com 9443 /ws/btcusdt@bookTicker 3 /etc/ssl/certs/ca-certificates.crt
+//! taskset -c 0 target/debug/examples/wss_client /etc/switch/dut.json stream.binance.com 9443 /ws/btcusdt@bookTicker 3 /etc/ssl/certs/ca-certificates.crt
 //! ```
 //!
 //! Arguments after CONFIG default to the values above. The peer is Binance's
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let roots = args
         .next()
         .unwrap_or_else(|| "/etc/ssl/certs/ca-certificates.crt".into());
-    // Resolve and load certificates before opening the NIC: both use the kernel.
+    // Look up the server and load the certificates before opening the card.
     let server = (host.as_str(), port)
         .to_socket_addrs()?
         .find_map(|address| match address {
@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     };
     let start = WallInstant::now();
-    // SAFETY: this thread owns the device and its packets; EAL outlives the port.
+    // SAFETY: this thread alone uses the card, and `_eal` lives until it is closed.
     let opened = unsafe {
         open(&config, &sizing, None, &mut || {
             Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap())

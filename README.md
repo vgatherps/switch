@@ -17,11 +17,14 @@ That gives tasks and timers. The features `net`, `tls` and `ws` add sockets, TLS
 
 ## Documentation
 
+The documentation is built in the repository's Docker image, because most of the code needs DPDK to compile. With Docker installed, build the image once, then the documentation:
+
 ```sh
+make -C conduit docker-image
 make docs
 ```
 
-builds the documentation of the `switch` crate and opens it in a browser. Its front page leads to the guide, which goes from a first task to a complete WebSocket client, and to the API reference.
+`make docs` opens the documentation of the `switch` crate in a browser. Its front page leads to the guide, which goes from a first task to a complete WebSocket client, and to the API reference.
 
 ## Try it
 

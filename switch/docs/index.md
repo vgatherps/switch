@@ -27,4 +27,4 @@ Your program runs one loop on one CPU. Each time round, the loop receives packet
 
 The network parts need Linux with DPDK 25.11.3 to build; tasks and timers alone build anywhere with cargo.
 
-Start with the [guide](crate::guide). Its first chapter runs a task in two minutes on any machine, and the third is a complete TCP client.
+Start with the [guide](crate::guide).

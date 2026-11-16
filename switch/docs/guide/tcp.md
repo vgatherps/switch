@@ -37,7 +37,7 @@ Data that has arrived is always delivered first. After it, `recv` says how the s
 
 ## Sending
 
-Sending is two calls. `room(len)` waits until the connection can take `len` more bytes. `try_send(frame)` then queues the frame without waiting, and the frame leaves at the end of the [round](crate::guide::drive_loop). This function sends a buffer of any length, a frame at a time (from the example `tcp_echo_server`):
+To send, wait in `room(len)` until the connection can take `len` more bytes, then queue the frame with `try_send(frame)`, which does not wait. TCP sends queued data in the [round's](crate::guide::drive_loop) send step, as fast as the peer's window allows. This function sends a buffer of any length, a frame at a time (from the example `tcp_echo_server`):
 
 ```rust
 use switch::net::{Error, NetHandle, TcpTx};
@@ -57,13 +57,13 @@ async fn send_all(handle: &NetHandle, tx: &mut TcpTx, mut rest: &[u8]) -> Result
 }
 ```
 
-`max_segment_payload` is the most bytes one TCP packet of this connection carries. Filling each frame up to that keeps one frame to one packet.
+`max_segment_payload` is the most bytes one TCP packet of this connection can carry. A frame no longer than that can go out as one packet.
 
 `room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if you did not wait for room. Its error comes with the frame, as the `map_err` above shows.
 
 ## When the peer is slow
 
-A sent frame stays with its socket until the peer acknowledges it. The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full. That wait is how a slow reader slows your sender down: when the peer stops reading, its window closes, acknowledgements stop freeing space, and your task stays in `room` until the peer reads again.
+A sent frame stays with its socket until the peer acknowledges it. The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full. That wait is how a slow peer slows your sender down: until the peer acknowledges more, no space is freed and your task stays in `room`.
 
 A task that must not wait behind a slow peer puts a [time limit](crate::guide::timeouts) on `room`.
 
@@ -87,17 +87,10 @@ Dropping both halves closes the connection, like `close()` on a Linux socket. If
 
 A dropped connection keeps its place among the program's sockets, and its local port, until TCP has finished closing it, which can take ten seconds or more. A program that reconnects often gives each attempt a new local port and reserves more than one place in `max_sockets`.
 
-## Timers
+## When the peer is silent
 
-| Behavior | Value |
-|---|---|
-| Retransmission | 300 ms after the first send; once the connection has measured its round-trip time, that time plus a margin of at least 50 ms. Each further retransmission doubles the wait, up to 60 s. |
-| Giving up | A connection your task holds never gives up; it retransmits until the peer answers. A dropped connection gives up after 8 doublings. |
-| Keep-alive | None. An idle connection sends nothing, so a peer that vanished is noticed only when you send. |
-| Delayed acknowledgement | 10 ms |
-| Small writes | Sent at once; there is no Nagle delay. |
-| After you close first | The connection lingers 10 s before its port can be used again for the same peer. |
+A connection your task holds never gives up: it retransmits until the peer answers. There is no keep-alive either, so an idle connection sends nothing, and a peer that vanished is noticed only when you send. `connect`, `recv`, `room` and `delivered` can therefore each wait forever. [Timeouts and cancelling](crate::guide::timeouts) shows how to bound them.
 
-Because a held connection never gives up, `connect`, `recv`, `room` and `delivered` can each wait forever on a silent peer. [Timeouts and cancelling](crate::guide::timeouts) shows how to bound them.
+Small writes are sent at once; there is no Nagle delay.
 
 Next: [UDP sockets](crate::guide::udp).

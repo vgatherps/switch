@@ -1,4 +1,4 @@
-The chapters are in reading order.
+How to write and run a switch program, from a first task to a complete WebSocket client.
 
 1. [Your first task](crate::guide::first_task): run a task, get a value back from it and wait on a timer, with only cargo.
 2. [Setting up for network programs](crate::guide::setup): get a Linux environment with DPDK, in a container or on a Linux machine.

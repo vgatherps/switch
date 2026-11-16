@@ -15,9 +15,11 @@ use switch::net::{NetHandle, TcpStream};
 use switch::ws::net::{accept_ws, Error};
 use switch::ws::Limits;
 
+const LIMITS: Limits = Limits { max_message: 64 * 1024, max_send: 64 * 1024 };
+
 /// Serves one accepted connection: sends every message back.
 async fn echo(handle: &NetHandle, stream: TcpStream) -> Result<(), Error> {
-    let mut ws = accept_ws(handle, stream, Limits::default()).await?;
+    let mut ws = accept_ws(handle, stream, LIMITS).await?;
     while let Some((message, mut sender)) = ws.recv_with_sender().await? {
         sender.send(message.kind(), message.bytes()).await?;
     }

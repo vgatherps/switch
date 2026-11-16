@@ -99,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = tcp::Config { rx_capacity: BUFFER, tx_capacity: BUFFER, mss_cap: None };
     let session = Session::connect(Path::new(&control), MAX_SOCKETS)
         .map_err(|error| format!("connect {control}: {error}"))?;
-    // The daemon's MTU: its frame capacity is the MTU minus 28 bytes of IP and UDP headers.
+    // The daemon's MTU: its frame capacity plus 28 bytes of IP and UDP headers.
     let mtu = session.frame_capacity() as usize + 28;
     let mut net = Net::remote(session, RemoteConfig { tx_frames: tcp::tx_mbuf_budget(&socket, mtu) });
 
@@ -130,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = net.into_session().map_err(|_net| "a socket or handle outlived the task")?;
     let deadline = WallInstant::now() + Duration::from_secs(10);
     while !session.closed() {
-        // An error means nothing was committed yet; poll and try again.
+        // Until the end of the session can be sent, `finish` fails: poll and try again.
         let _ = session.finish();
         session.poll(|_, _| {}, |_, _, _| {}).map_err(|error| format!("finish session: {error}"))?;
         if WallInstant::now() >= deadline {

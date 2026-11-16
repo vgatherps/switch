@@ -1,6 +1,6 @@
 # Timeouts and cancelling
 
-No socket call takes a time limit. A connect waits for the server, `recv` for data, `room` for space, and each will wait as long as the peer stays silent. Limits are added from outside, with two functions that work on any future: [`within`](crate::net::within) and [`first`](crate::net::first).
+No socket call takes a time limit. Limits are added from outside, with [`within`](crate::net::within) and [`first`](crate::net::first), which work on any future.
 
 ## A time limit
 
@@ -33,11 +33,11 @@ The first `?` handles the timeout and the second the connect's own error.
 `work` can be an `async` block, so one limit can cover several steps:
 
 ```rust
-# use std::error::Error;
-# use std::time::Duration;
-# use switch::Spawner;
-use switch::net::{TcpRx, TcpTx};
-# use switch::net::within;
+use std::error::Error;
+use std::time::Duration;
+
+use switch::Spawner;
+use switch::net::{within, TcpRx, TcpTx};
 
 async fn finish(spawner: &Spawner, rx: &mut TcpRx, tx: &mut TcpTx) -> Result<(), Box<dyn Error>> {
     let closing = async {
@@ -50,7 +50,7 @@ async fn finish(spawner: &Spawner, rx: &mut TcpRx, tx: &mut TcpTx) -> Result<(),
 }
 ```
 
-The limit is a [sleep](crate::guide::tasks) on the task's runtime. The runtime's ticks must therefore be nanoseconds, because `within` converts the `Duration` to that many ticks. The limit is noticed when the loop next polls the runtime at or after the deadline, so a loop that sleeps a millisecond when idle can report a timeout up to a millisecond late. If `work` is ready in the same poll in which the limit expires, `work` wins.
+The limit is a [sleep](crate::guide::tasks) on the task's runtime, so it is as punctual as any sleep, and the runtime's ticks must be nanoseconds ([The drive loop](crate::guide::drive_loop)). If `work` is ready in the same poll in which the limit expires, `work` wins.
 
 ## Whichever comes first
 
@@ -73,8 +73,6 @@ async fn read_until_stopped(rx: &mut TcpRx, mut stop: Receiver<()>) -> Result<()
 
 `a` is checked before `b`, so data that has already arrived is printed before a stop is obeyed. `stop` is passed as `&mut stop`: when `recv` wins, only the borrow is dropped and the receiver is still there for the next time round.
 
-`within` is `first` with a sleep as `b`.
-
 ## What cancelling does
 
 When the limit passes or `b` wins, the other future is dropped, and dropping a future is how a wait is cancelled in switch. What that means depends on the future:
@@ -84,7 +82,7 @@ When the limit passes or `b` wins, the other future is dropped, and dropping a f
 | `tcp_connect`, `tcp_accept`, `udp_bind` | The socket being opened is closed. |
 | `recv` on TCP or UDP | Nothing is lost. Data stays queued for the next `recv`. |
 | `room`, `delivered`, `tx_frame` | Nothing is lost. Call it again. |
-| An `async` block of yours | Everything the block holds is dropped: its sockets close as in [Dropping a stream](crate::guide::tcp), its frames return to the pool. |
+| An `async` block of yours | Everything the block owns is dropped: its sockets close as in [Dropping a stream](crate::guide::tcp), its frames return to the pool. What it only borrowed stays with its owner, and steps it had finished are not undone. |
 
 Sends cannot be cancelled halfway, because `try_send` and UDP's `send` do not wait: a frame is either queued or handed back.
 

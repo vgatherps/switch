@@ -28,9 +28,8 @@ fn main() {
     let mut runtime = Runtime::new(0);
     let value = Arc::new(AtomicU32::new(0));
     let waker = Arc::new(OnceLock::new());
-    let task = wait_for_value(value.clone(), waker.clone());
-    runtime.spawner().spawn(task).unwrap();
-    // The first poll runs the task once: it publishes its RemoteWaker and parks.
+    runtime.spawner().spawn(wait_for_value(value.clone(), waker.clone())).unwrap();
+    // The first poll runs the task once: it publishes its RemoteWaker and waits.
     runtime.poll(0).unwrap();
 
     let worker = std::thread::spawn(move || {

@@ -16,7 +16,7 @@ async fn connect(handle: &NetHandle, socket: tcp::Config) -> Result<TcpStream, E
 }
 ```
 
-`local` is where the connection comes from. `addr: None` means the program's own address, and the port is yours to choose: switch has no automatic port selection, and port 0 is refused with `Unaddressable`. Two connections to the same server need two different local ports.
+`local` is where the connection comes from. `addr: None` means the program's own address, and the port is yours to choose: switch has no automatic port selection, and port 0 is refused with `Unaddressable`. Two connections from one local address to the same server address and port need different local ports; a pair already in use gives `PortInUse`.
 
 The future resolves when the TCP handshake completes. A server that answers with a reset gives `Refused`. A server that never answers gives nothing: the connect keeps retrying, so put a [time limit](crate::guide::timeouts) on it. Dropping the future abandons the attempt and frees the socket.
 
@@ -80,18 +80,12 @@ async fn bind(handle: &NetHandle) -> Result<UdpSocket, Error> {
 }
 ```
 
-`port` must not be 0. `local_addr: None` receives on every address the program has. `rx_queue` is how many received datagrams the socket holds for you before it drops new ones. [`UdpConfig`](crate::net::UdpConfig) documents the last two fields.
+`port` must not be 0. `local_addr: None` receives on every address the program has. `rx_queue` is how many received datagrams the socket holds for you before it drops new ones. `tx_checksum: true` gives sent datagrams a UDP checksum, and `broadcast: true` allows sending to a broadcast address.
 
-## What an open can return
+## Errors
 
-| Call | On success | Errors |
-|---|---|---|
-| `tcp_connect(config, remote, local).await` | [`TcpStream`](crate::net::TcpStream) | `SocketsFull`, `Unaddressable` (port 0, or no usable remote address), `PortInUse` (this local port already has a connection to that server), `Refused`, `Closed` (the attempt ended without a reset) |
-| `tcp_accept(config, local).await` | [`TcpStream`](crate::net::TcpStream) | `SocketsFull`, `Unaddressable` |
-| `udp_bind(config).await` | [`UdpSocket`](crate::net::UdpSocket) | `SocketsFull`, `PortInUse`, `InvalidConfig` (port 0 or `rx_queue` 0), `Unaddressable` (`local_addr` is not one of the program's addresses) |
+The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant. `Error` implements `Display` and `std::error::Error`, so `?` into a `Box<dyn Error>` works.
 
-[`Error`](crate::net::Error) lists every variant. It implements `Display` and `std::error::Error`, so `?` into a `Box<dyn Error>` works.
+Await socket futures, here and in the following chapters, in switch tasks. On another executor, a socket future that has to wait panics.
 
-All of these futures, and every socket future in the following chapters, must be awaited in a switch task. Awaited on another executor, they panic.
-
-Before using the sockets, the next chapter looks at what they send and receive: [Frames](crate::guide::frames).
+Next: [Frames](crate::guide::frames).

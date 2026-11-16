@@ -1,6 +1,6 @@
 # Tasks
 
-All the tasks of a runtime share one thread. A task runs until it reaches an `.await` that is not ready, and only then does the next task run; nothing interrupts a task in between. Tasks wait for time, for each other and for other threads with the tools below. Each is shown with a runnable example: `cargo run -p switch-examples --example NAME`.
+All the tasks of a runtime share one thread. A task runs until it reaches an `.await` that is not ready, and only then does the next task run; nothing interrupts a task in between. The code comes from runnable examples: `cargo run -p switch-examples --example NAME`.
 
 ## Writing and spawning
 
@@ -39,7 +39,7 @@ To get a task's return value, spawn it with `spawn_join` and await the [`JoinHan
 
 ## Sleeping
 
-`spawner.sleep(ticks)` waits that many ticks from the latest tick the runtime was given, and `spawner.sleep_until(tick)` waits for an absolute tick. A sleep ends during the first poll whose tick has reached its deadline, so it is as punctual as your loop: a loop that polls every millisecond ends sleeps up to a millisecond late.
+[Your first task](crate::guide::first_task) slept with `spawner.sleep(ticks)`; `spawner.sleep_until(tick)` waits for an absolute tick. A sleep is as punctual as your loop: a loop that polls every millisecond can end a sleep a millisecond late.
 
 With ticks in nanoseconds, a `Duration` converts directly (example `clock_loop`):
 
@@ -55,11 +55,11 @@ async fn wait_two_ms(spawner: Spawner) {
 }
 ```
 
-Dropping a sleep cancels it. The errors a sleep can return are on [`SleepError`](crate::SleepError); with one runtime that stays open, none of them occurs.
+Dropping a sleep cancels it. The errors a sleep can return are on [`SleepError`](crate::SleepError).
 
 ## Yielding
 
-A task that computes for a long time holds up every other task and, in a network program, the network too: packets are received and sent between polls. [`yield_now`](crate::yield_now) hands the thread back. The task stays ready and continues in the next call to `runtime.poll`, after the loop has been round once.
+A task that computes for a long time holds up every other task and, in a network program, the network too: packets are received and sent between polls. [`yield_now`](crate::yield_now) hands the thread back. The other ready tasks run, the loop goes round, and the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is in `clock_loop` too:
 
 ```rust
 #[switch::task]
