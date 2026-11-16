@@ -53,7 +53,7 @@ Every flag takes a value, written as `--name value`. Unknown flags, repeated fla
 |---|---|---|
 | `--config PATH` | required | The network config file. |
 | `--dir PATH` | `/run/switch-junctiond` | The daemon's directory. Created with mode 0700 if it does not exist. |
-| `--rx-size N` | `1048576` | Size in bytes of each session's receive ring. A power of two, at most 2 GiB, and a multiple of the page size of the filesystem holding `--dir`; the default suits ordinary directories. |
+| `--rx-size N` | `2097152` | Size in bytes of each session's receive ring. A power of two, at most 2 GiB, and a multiple of the page size of the filesystem holding `--dir`; the default suits ordinary pages and 2 MiB hugepages. |
 | `--max-sessions N` | `64` | How many sessions can be connected at once. Must be positive. |
 | `--max-sockets N` | `1024` | The most sockets one session may ask for when it connects. 1 to 65535. |
 | `--tcp-sockets N` | `1024` | TCP sockets in the Stack, shared by all sessions. Must be positive. |
@@ -62,7 +62,7 @@ Every flag takes a value, written as `--name value`. Unknown flags, repeated fla
 
 `--max-sockets` limits each session, while `--tcp-sockets` and `--udp-sockets` limit the whole daemon. A session that asked for 100 sockets can still be refused a TCP socket when other sessions hold all of `--tcp-sockets`; [What applications share](sharing.md) covers this.
 
-The daemon also fixes a few sizes itself. It advertises a frame capacity of MTU − 28 bytes to every session (the largest UDP payload that fits the MTU), and it gives each CPU 1 MiB of send ring. [Connecting](apps.md#connecting) shows how an application reads these values.
+The daemon also fixes a few sizes itself. It advertises a frame capacity of MTU − 28 bytes to every session (the largest UDP payload that fits the MTU), and it gives each CPU 2 MiB of send ring. Both ring defaults fit a `--dir` on a filesystem with 2 MiB hugepages; custom receive sizes must still be multiples of that filesystem's page size. [Connecting](apps.md#connecting) shows how an application reads these values.
 
 ## CPUs
 

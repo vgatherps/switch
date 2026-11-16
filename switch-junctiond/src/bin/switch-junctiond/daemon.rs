@@ -130,9 +130,9 @@ pub fn run(args: Args) -> Result<(), String> {
     let directory = Directory::acquire(&args.dir).map_err(|error| format!("--dir: {error}"))?;
     let frame_capacity = u32::from(config.mtu) - 28;
     let max_record = frame_capacity + 24;
-    // Ingress is per possible CPU; one MiB per ring also fits a maximum-size IP datagram.
+    // Ingress is per possible CPU; two MiB per ring also fits 2 MiB hugepages.
     let reader = Reader::create(ceph_ring::Config {
-        ring_size: 1024 * 1024,
+        ring_size: 2 * 1024 * 1024,
         max_record: max_record as usize,
         dir: directory.path.clone(),
     }).map_err(|error| format!("ingress: {error}"))?;

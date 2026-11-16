@@ -24,7 +24,7 @@ Applications connected to the same daemon share one NIC, one Stack and one set o
 
 When `try_send` (TCP) or `send` (UDP) returns `Ok` on the junction backend, the bytes have been copied into the send ring as one [record](../reference/glossary.md), and nothing more. The daemon has not looked at them yet, and the peer has not received them. The frame you passed returns to your frame pool, unless you kept a clone or slice of it.
 
-`Full` means the send ring for the CPU your thread is running on has no room right now. There is one 1 MiB ring per CPU, and every session sending from that CPU writes into it, so another application on the same CPU can fill it as easily as your own program. Applications pinned to different CPUs use different rings. Keep the frame that came back with the error and try again after the next [turn](../net/drive-loop.md). switch-net helps with this: after any socket of a `Net` sees `Full`, [`room`](../net/tcp.md) on every socket of that `Net` waits until the next turn.
+`Full` means the send ring for the CPU your thread is running on has no room right now. There is one 2 MiB ring per CPU, and every session sending from that CPU writes into it, so another application on the same CPU can fill it as easily as your own program. Applications pinned to different CPUs use different rings. Keep the frame that came back with the error and try again after the next [turn](../net/drive-loop.md). switch-net helps with this: after any socket of a `Net` sees `Full`, [`room`](../net/tcp.md) on every socket of that `Net` waits until the next turn.
 
 `Full` says nothing about the peer. A peer that reads slowly, or a TCP window that is closed, does not make `try_send` fail or wait. This is the main difference from the local backend, where `room` waits until the peer acknowledges data.
 
@@ -62,7 +62,7 @@ Some limits belong to the daemon as a whole:
 | TCP sockets in the Stack | `--tcp-sockets` | `Error::SocketsFull` when opening, even if your own session's socket table has free entries |
 | UDP sockets in the Stack | `--udp-sockets` | `Error::SocketsFull` when binding |
 | sessions | `--max-sessions` | `ConnectError::Rejected(SessionsFull)` when connecting |
-| send ring space | 1 MiB per CPU, shared by senders on that CPU | `Error::Full` when sending |
+| send ring space | 2 MiB per CPU, shared by senders on that CPU | `Error::Full` when sending |
 
 Each session also has its own table of `max_sockets` entries; running out of those also gives `Error::SocketsFull`.
 

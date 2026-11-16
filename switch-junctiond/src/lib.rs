@@ -1,7 +1,7 @@
 //! `switch-junctiond` owns one NIC port and serves TCP and UDP sockets to applications on the same machine, through a Unix control socket and shared-memory rings in its directory. Linux only. Start it as root with its main thread pinned to exactly one CPU; it runs until SIGINT or SIGTERM. Apart from DPDK's own `EAL:` lines while the NIC opens, it prints nothing; its own errors are one line on stderr, `switch-junctiond: <reason>`.
 //!
 //! ```text
-//! taskset -c 2 switch-junctiond --config nic.json [--dir /run/switch-junctiond] [--rx-size 1048576]
+//! taskset -c 2 switch-junctiond --config nic.json [--dir /run/switch-junctiond] [--rx-size 2097152]
 //!     [--max-sessions 64] [--max-sockets 1024] [--tcp-sockets 1024] [--udp-sockets 1024]
 //!     [--control-cpus 0]
 //! ```

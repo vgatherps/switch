@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 pub const USAGE: &str = "\
 usage: switch-junctiond --config <netconf.json>
-                [--dir /run/switch-junctiond] [--rx-size 1048576]
+                [--dir /run/switch-junctiond] [--rx-size 2097152]
                 [--max-sessions 64] [--max-sockets 1024]
                 [--tcp-sockets 1024] [--udp-sockets 1024]
                 [--control-cpus 0]
@@ -53,7 +53,7 @@ impl Args {
         let parsed = Self {
             config: flags.take("config")?.ok_or("--config is required")?,
             dir: flags.or("dir", PathBuf::from("/run/switch-junctiond"))?,
-            rx_size: flags.or("rx-size", 1024 * 1024)?,
+            rx_size: flags.or("rx-size", 2 * 1024 * 1024)?,
             max_sessions: flags.or("max-sessions", 64)?,
             max_sockets: flags.or("max-sockets", 1024)?,
             tcp_sockets: flags.or("tcp-sockets", 1024)?,
@@ -107,7 +107,7 @@ mod tests {
     fn defaults_and_explicit_flags() {
         let args = parse(&["--config", "nic.json"]).unwrap();
         assert_eq!(args.dir, PathBuf::from("/run/switch-junctiond"));
-        assert_eq!((args.rx_size, args.max_sessions, args.max_sockets), (1048576, 64, 1024));
+        assert_eq!((args.rx_size, args.max_sessions, args.max_sockets), (2097152, 64, 1024));
         assert_eq!((args.tcp_sockets, args.udp_sockets), (1024, 1024));
         let args = parse(&["--config", "nic.json", "--dir", "ipc", "--rx-size", "65536",
             "--max-sessions", "2", "--max-sockets", "8", "--tcp-sockets", "4",
@@ -117,6 +117,15 @@ mod tests {
         assert_eq!((args.rx_size, args.max_sessions, args.max_sockets), (65536, 2, 8));
         assert_eq!((args.tcp_sockets, args.udp_sockets), (4, 0));
         assert_eq!(unsafe { libc::CPU_COUNT(&args.control_cpus) }, 3);
+    }
+
+    #[test]
+    fn default_rx_size_fits_two_mib_hugepages() {
+        let args = parse(&["--config", "nic.json"]).unwrap();
+        let page_size = 2 * 1024 * 1024;
+        assert!(args.rx_size >= page_size);
+        assert_eq!(args.rx_size % page_size, 0);
+        assert!(USAGE.contains(&format!("[--rx-size {}]", args.rx_size)));
     }
 
     #[test]

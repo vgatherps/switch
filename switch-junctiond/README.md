@@ -16,7 +16,7 @@ Connect applications with `Session::connect(Path::new("/run/switch-junctiond/con
 | --- | --- | --- |
 | `--config` | required | Existing netconf JSON: device, addresses, MTU, offloads and EAL arguments. |
 | `--dir` | `/run/switch-junctiond` | Control socket, persistent lock file, ingress and per-session RX backings. Created mode 0700 if absent. Relative paths are resolved before publishing backing names. |
-| `--rx-size` | `1048576` | Bytes per session RX ring; power of two, a backing-page multiple, at most 2 GiB. |
+| `--rx-size` | `2097152` | Bytes per session RX ring; power of two, a backing-page multiple, at most 2 GiB. |
 | `--max-sessions` | `64` | Concurrent session slots. Must be positive. |
 | `--max-sockets` | `1024` | Maximum sockets requested by one session; 1–65535. |
 | `--tcp-sockets` | `1024` | Global Stack TCP slots. Must be positive. |
@@ -29,7 +29,7 @@ The parent temporarily switches to the housekeeping mask while spawning the cont
 
 Temporary control accept shortages (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`) defer new accepts to a later pass without ending established sessions. A new connection that cannot be made nonblocking is dropped; other accept errors remain fatal.
 
-The host advertises TX frame capacity `MTU - 28`, and cephalopod maximum record size `frame_capacity + 24`. Ingress rings are one MiB per possible CPU. The Stack shares 4096 frame-pool mbufs across sockets, with RX staging 128, TX pending 64, and 256 neighbor entries. TCP/UDP slot limits are global, independent of per-session limits.
+The host advertises TX frame capacity `MTU - 28`, and cephalopod maximum record size `frame_capacity + 24`. Ingress rings are 2 MiB per possible CPU. The default receive and send ring sizes fit both ordinary pages and 2 MiB hugepages when `--dir` is on a hugepage filesystem; a custom `--rx-size` must remain a multiple of that filesystem's page size. The Stack shares 4096 frame-pool mbufs across sockets, with RX staging 128, TX pending 64, and 256 neighbor entries. TCP/UDP slot limits are global, independent of per-session limits.
 
 Use a dedicated, daemon-owned directory. `switch-junctiond` holds a nonblocking exclusive `flock` on `DIR/lock` for its lifetime; a second daemon fails without disturbing the first. The lock inode remains after exit and must not be removed while a daemon is running. After acquiring the lock, startup removes stale `control.sock` sockets and regular backing files whose entire name is `cph` or `jnctrx` followed by 16 lowercase hex digits. Those names are reserved for this daemon. Other names, directories and symlinks are untouched; a non-socket at `control.sock` causes an error rather than being deleted. Do not share the directory with another service or place unrelated files in the reserved namespace.
 
