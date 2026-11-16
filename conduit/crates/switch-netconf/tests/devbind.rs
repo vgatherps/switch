@@ -668,6 +668,52 @@ fn bind_override_failure_after_kernel_unbind_rebinds_kernel_driver() {
 }
 
 #[test]
+fn bind_clear_failure_after_vfio_bind_restores_kernel_driver() {
+    struct FailClear<'a> {
+        kernel: KernelOutput<'a>,
+        failed: bool,
+    }
+    impl Write for FailClear<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let written = self.kernel.write(bytes)?;
+            if !self.failed && self.kernel.next == 2 {
+                self.failed = true;
+                fs::remove_file(self.kernel.tree.roots.sys.join(DEVICE).join("driver_override"))?;
+            }
+            Ok(written)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let tree = Tree::new();
+    let mut output = FailClear {
+        kernel: KernelOutput::steps(
+            &tree,
+            &[
+                (("bus/pci/devices/0000:00:06.0/driver_override", "vfio-pci"), None),
+                (("bus/pci/devices/0000:00:06.0/driver_override", "\n"), Some("vfio-pci")),
+                (("bus/pci/drivers/vfio-pci/unbind", BDF), None),
+                (("bus/pci/drivers/ena/bind", BDF), Some("ena")),
+            ],
+        ),
+        failed: false,
+    };
+    let err = devbind::bind(&tree.roots, &tree.config, 0, false, false, &mut output)
+        .unwrap_err()
+        .to_string();
+    let mut expected = tree.bind_writes(true);
+    expected.extend([
+        ("bus/pci/drivers/vfio-pci/unbind", BDF),
+        ("bus/pci/devices/0000:00:06.0/driver_override", "\n"),
+        ("bus/pci/drivers/ena/bind", BDF),
+    ]);
+    assert_eq!(output.kernel.text, tree.log(&expected, false));
+    assert!(err.contains("driver_override: "), "{err}");
+    assert!(err.ends_with("; rebind ok; current driver ena"), "{err}");
+}
+
+#[test]
 fn bind_verification_failure_detaches_vfio_before_kernel_rebind() {
     let tree = Tree::new();
     fs::remove_file(tree.roots.dev.join("vfio/7")).unwrap();

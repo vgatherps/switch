@@ -392,7 +392,6 @@ pub fn bind(
         }
     }
     let unbind_path = state.device.join("driver/unbind");
-    let bind_path = vfio.join("bind");
     // a failure after this run unbound the kernel driver puts the device back on it; a write
     // failing on a device that had no driver changed no binding, so nothing is recovered
     let mut unbound = false;
@@ -404,7 +403,7 @@ pub fn bind(
                 e
             });
         }
-        unbound = (unbound || write.path == unbind_path) && write.path != bind_path;
+        unbound |= write.path == unbind_path;
     }
     if !dry_run {
         let group = verify_bind(roots, &state).map_err(|e| recover(roots, &state, e, output))?;
