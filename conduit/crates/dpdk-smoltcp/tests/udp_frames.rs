@@ -14,8 +14,8 @@ use dpdk_smoltcp::{
     Port, Stack, StackConfig, UdpConfig, UdpHandle, UdpSendError, UdpSendFrameError,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
-use zhida_test_kit::ring_port::{arp, RingPort};
-use zhida_test_kit::with_eal;
+use switch_test_kit::ring_port::{arp, RingPort};
+use switch_test_kit::with_eal;
 
 const T: Instant = Instant::from_millis_const(10);
 const MAC: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
@@ -121,7 +121,7 @@ fn finish(fixture: RingPort, stack: Stack) {
 /// frame reach the wire as the same datagram `udp_send` sends; each frame
 /// returns to the pool once the ring consumer frees it, the shared frame's
 /// clone when the app drops it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_send_frame_reaches_wire_like_udp_send() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpfr_wire", 16, 16);
@@ -155,7 +155,7 @@ fn udp_send_frame_reaches_wire_like_udp_send() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn sliced_unique_udp_frame_reaches_wire() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpfr_slice", 16, 16);
@@ -198,7 +198,7 @@ fn refused(
 /// Refusals before the device return the frame untouched and send nothing:
 /// a frame from another Stack's pool (`Foreign`, even to a valid
 /// destination), then the destination errors in their order.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_send_frame_refusals_return_frame_and_send_nothing() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpfr_ref", 16, 16);
@@ -242,7 +242,7 @@ fn udp_send_frame_refusals_return_frame_and_send_nothing() {
 /// with every frame held by the app both report `WouldBlock` and send nothing, even toward an
 /// unroutable destination, because the empty pool is checked before the neighbor lookup.
 /// One frame released lets the copy go out.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_copy_with_frame_pool_empty_would_block() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpfr_empty", 16, 16);
@@ -290,7 +290,7 @@ fn stack_other(port: Port) -> Stack {
 /// (frame pool in use rises from the app's 1 by 8, the TX pool is untouched);
 /// the ring consumer frees every copy, and the frame returns when the app
 /// drops it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_broadcast_one_frame_to_eight_sockets() {
     const N: usize = 8;
     with_eal(|eal| {

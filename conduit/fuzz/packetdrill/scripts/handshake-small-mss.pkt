@@ -1,5 +1,5 @@
 // A client that announces MSS 536 (with Linux's other SYN options) gets segments of at
-// most 536 payload bytes: Zhida honors the peer's MSS without timestamp options.
+// most 536 payload bytes: switch honors the peer's MSS without timestamp options.
 // Its own SYN-ACK still announces 1460.
 // smoltcp 0.14.0 src/socket/tcp.rs; SYN-ACK and ISN conventions as in
 // handshake-linux-options.pkt, data path and close as in echo-and-close.pkt.

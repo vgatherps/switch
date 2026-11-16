@@ -9,7 +9,7 @@
 //! ring_rx: inside the timed loop for both runs, a test-only producer allocates
 //! the batch from the port's own RX pool (found by name), copies the frame
 //! bytes and enqueues it on the RX ring; the burst then receives it and every
-//! packet is dropped through the zhida destructor.
+//! packet is dropped through the switch destructor.
 
 use std::collections::VecDeque;
 use std::ffi::{c_void, CStr};
@@ -18,11 +18,11 @@ use std::ptr::{null_mut, NonNull};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use dpdk_smoltcp::{Eal, PortConfig, RxBurst};
-use zhida_buffer::{Mbuf, PoolConfig, PoolManager};
-use zhida_dpdk_sys::*;
+use switch_buffer::{Mbuf, PoolConfig, PoolManager};
+use switch_dpdk_sys::*;
 
-use zhida_test_kit::ring_port::RingPort;
-use zhida_test_kit::{wire, with_eal};
+use switch_test_kit::ring_port::RingPort;
+use switch_test_kit::{wire, with_eal};
 
 const BATCH: usize = 32;
 const FRAME: u16 = 64;

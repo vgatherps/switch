@@ -20,12 +20,12 @@ use dpdk_smoltcp::{
     frame_reserve, rx_reserve, ReadySide, Stack, StackConfig, TcpHandle, Turn,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
-use zhida_dpdk_sys::{
+use switch_dpdk_sys::{
     dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free, dpdk_raw_ring_dequeue_burst,
     dpdk_raw_ring_enqueue_burst, rte_mbuf, rte_mempool, RTE_PKTMBUF_HEADROOM,
 };
-use zhida_test_kit::ring_port::{arp, RingPort};
-use zhida_test_kit::{pair, wire, with_eal};
+use switch_test_kit::ring_port::{arp, RingPort};
+use switch_test_kit::{pair, wire, with_eal};
 
 const OURS: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
 const OUR_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 1);
@@ -131,7 +131,7 @@ fn metadata(m: &rte_mbuf) -> (u64, u64, u64, u64) {
 
 /// The mbuf behind a frame-pool frame: its buffer starts FRAME_DATA_OFF bytes
 /// before the payload, after the mbuf header and the pool's 8-byte private
-/// area (zhida pools keep a per-object cache slot there).
+/// area (switch pools keep a per-object cache slot there).
 fn frame_mbuf(frame: &ImmutableFrame, frame_pool: *mut rte_mempool) -> *const rte_mbuf {
     const PRIV_SIZE: usize = 8;
     let buf = frame.as_ref().as_ptr().wrapping_sub(usize::from(FRAME_DATA_OFF));
@@ -309,7 +309,7 @@ impl Host {
     fn occupy_tx_ring(&self, count: usize) {
         let rx_pool = self.fixture.rx_pool();
         for tag in 0..count {
-            let m = wire::copy_into(rx_pool, &zhida_test_kit::ring_port::frame(tag as u8));
+            let m = wire::copy_into(rx_pool, &switch_test_kit::ring_port::frame(tag as u8));
             let objects = [m.cast::<std::ffi::c_void>()];
             // SAFETY: enqueues one owned mbuf pointer.
             let queued = unsafe {
@@ -395,7 +395,7 @@ impl Host {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn contiguous_burst_past_advertised_window_reaches_application() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "rxpastwin", 1, None);
@@ -425,7 +425,7 @@ fn contiguous_burst_past_advertised_window_reaches_application() {
 
 /// The TX ring consumer drops its reference first, then the ACK releases the
 /// socket's: the frame returns to the pool at the ACK.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_completion_before_ack_frees_on_ack() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "tcbefore", 1, None);
@@ -446,7 +446,7 @@ fn tx_completion_before_ack_frees_on_ack() {
 
 /// The ACK releases the socket's reference while the TX ring still holds the
 /// frame: it returns to the pool when the ring consumer frees it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ack_before_tx_completion_frees_on_drain() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "tcafter", 1, None);
@@ -506,7 +506,7 @@ fn drain_after_release(host: &mut Host) -> Vec<Vec<u8>> {
 /// Reusing the socket resets it and releases its queue while one frame sits
 /// in the TX ring and two are pending; each reaches the wire intact and is
 /// freed once by its last holder.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reset_with_frames_pending_and_in_ring() {
     with_eal(|eal| {
         let (mut host, conn) = frames_in_ring_and_pending(eal, "rstpend");
@@ -521,7 +521,7 @@ fn reset_with_frames_pending_and_in_ring() {
 
 /// `remove_tcp` drops the socket and its queue while one frame sits in the TX
 /// ring and two are pending.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn remove_with_frames_pending_and_in_ring() {
     with_eal(|eal| {
         let (mut host, conn) = frames_in_ring_and_pending(eal, "rmpend");
@@ -534,7 +534,7 @@ fn remove_with_frames_pending_and_in_ring() {
 
 /// When the PMD accepts a prefix of a burst, the unaccepted frames stay
 /// shared between the socket and the pending queue and leave intact later.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn partial_tx_acceptance_keeps_suffix_shared() {
     with_eal(|eal| {
         let (mut host, conn) = frames_in_ring_and_pending(eal, "partial");
@@ -561,7 +561,7 @@ fn partial_tx_acceptance_keeps_suffix_shared() {
 
 /// Case (a): a unique frame that starts the unsent data and fits goes out in
 /// place, with no TX-pool packet.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn send_unique_in_place() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "inplace", 1, None);
@@ -585,7 +585,7 @@ fn send_unique_in_place() {
 /// Case (b): after the ring consumer freed the first send, the RTO
 /// retransmission is exactly that frame, unique again: its headers are
 /// rewritten in place and no TX-pool packet is used.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn retransmit_single_frame_in_place() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "rtxplace", 1, None);
@@ -612,7 +612,7 @@ fn retransmit_single_frame_in_place() {
 /// Case (c): two frames sent in separate egresses stay on the paused TX ring;
 /// the RTO retransmission is one TX-pool copy spanning both, as the byte
 /// ring would send, and the first sends keep their bytes and metadata.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn retransmit_copies_coalesced() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "rtxcopy", 1, None);
@@ -642,7 +642,7 @@ fn retransmit_copies_coalesced() {
 
 /// Case (c): a frame the application still shares is copied into a TX-pool
 /// packet; the frame itself is never published.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn shared_frame_send_copies() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "sharecp", 1, None);
@@ -667,7 +667,7 @@ fn shared_frame_send_copies() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn sliced_unique_tcp_frame_reaches_wire() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "slice_cp", 1, None);
@@ -688,7 +688,7 @@ fn sliced_unique_tcp_frame_reaches_wire() {
 
 /// Case (c): a 1448-byte frame against a 724-byte window leaves as two
 /// TX-pool copies of 724 bytes; the frame is never published.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn cut_copies_into_reserve_frame() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "cutcopy", 1, None);
@@ -717,7 +717,7 @@ fn cut_copies_into_reserve_frame() {
 /// One frame cloned to 8 TCP sockets: every packet is a TX-pool copy with
 /// its own socket's headers and the same payload; the frame is never
 /// published; each socket releases its clone at its ACK.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn broadcast_frame_over_tcp() {
     with_eal(|eal| {
         const N: usize = 8;
@@ -759,7 +759,7 @@ fn broadcast_frame_over_tcp() {
 /// A socket swapped into another Stack keeps its own Stack's frame pool alive
 /// after that Stack and Port are gone, allocates from it, and cannot publish
 /// through the other Stack's device.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn swapped_socket_outlives_source_stack() {
     with_eal(|eal| {
         let mut a = Host::new(eal, "swapa", 1, None);
@@ -797,7 +797,7 @@ fn swapped_socket_outlives_source_stack() {
 
 /// A frame from another Stack's pool is refused with `Foreign` and returned
 /// untouched.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_frame_from_other_stack_is_foreign() {
     with_eal(|eal| {
         let mut a = Host::new(eal, "forna", 1, None);
@@ -819,7 +819,7 @@ fn tcp_frame_from_other_stack_is_foreign() {
 /// socket's full-sized-segment estimate. With the application holding all but three frames,
 /// one socket's 4096-byte send takes them; the second socket's send then queues nothing
 /// (`Ok(0)`) and `tx_frame` has none until the first socket's data is ACKed.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
     with_eal(|eal| {
         let pool = frame_reserve(RING as u16, PENDING) + SMALL_FRAMES;
@@ -863,7 +863,7 @@ fn frame_pool_exhaustion_refuses_sends_until_acked_frames_return() {
 
 /// Individually emitted small writes may occupy more frames than the full-sized
 /// estimate; the byte limit and the shared pool still bound queued data.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn small_writes_exceed_frame_estimate_but_respect_byte_capacity() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "smwrites", 1, None);
@@ -901,7 +901,7 @@ fn small_writes_exceed_frame_estimate_but_respect_byte_capacity() {
 /// B's application arms B's TX token; D is in the same wait and is removed. When the peer ACKs
 /// A's data, the next turn finds free frames and fires B's token, with no retry from B; B's send
 /// then goes out. Removing D took it off the wait.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_pool_wait_fires_the_tx_token_when_frames_return() {
     with_eal(|eal| {
         let pool = frame_reserve(RING as u16, PENDING);
@@ -950,7 +950,7 @@ fn frame_pool_wait_fires_the_tx_token_when_frames_return() {
 /// The application holds every frame but the reserve and one socket's full-sized
 /// estimate: the peer's data is still ACKed, an ARP request is still answered,
 /// and the socket can still queue its full byte capacity.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn app_held_saturation_leaves_ack_and_arp_working() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "appfull", 1, None);
@@ -995,7 +995,7 @@ fn app_held_saturation_leaves_ack_and_arp_working() {
 /// A whole-frame send needs only a pending slot: with the TX pool empty and
 /// no spare TX packet, it still goes out, on a template hit and on a template
 /// miss with the neighbor known (a new neighbor changes the cache).
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_send_takes_no_tx_packet() {
     with_eal(|eal| {
         let mut host = Host::new(eal, "notoken", 1, None);
@@ -1043,7 +1043,7 @@ fn frame_send_takes_no_tx_packet() {
 /// published and the socket has since released, the frame pool still holds
 /// the full-sized-segment estimate and C + 2 more, and published frames use
 /// no TX packet.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn kit_ring_descriptors_match_ring_size_with_published_frames() {
     with_eal(|eal| {
         const RING: u32 = 32;

@@ -17,7 +17,7 @@ MSS_WS = b"\x02\x04\x05\xb4" + b"\x01\x03\x03\x07"
 
 
 class Harness:
-    """One Conn driven by hand: `zhida` plays Zhida's segments (through the runner's
+    """One Conn driven by hand: `switch` plays switch's segments (through the runner's
     well-formed-output check), `sent` collects the fuzzer's frames."""
 
     def __init__(self, plan):
@@ -32,7 +32,7 @@ class Harness:
         """The ACK number covering the SYN and n payload bytes of the fuzzer."""
         return seqmath.add(self.c.isn, 1 + n)
 
-    def zhida(self, flags, seq, ack, payload=b"", window=65535, ts=False, now=0.0):
+    def switch(self, flags, seq, ack, payload=b"", window=65535, ts=False, now=0.0):
         if flags & RST:
             options = b""
         elif flags & SYN:
@@ -47,16 +47,16 @@ class Harness:
 
     def establish(self, ts=False, now=0.01):
         self.c.start(0.0)
-        self.zhida(SYN | ACK, CISN, self.ack_of(0), ts=ts, now=now)
+        self.switch(SYN | ACK, CISN, self.ack_of(0), ts=ts, now=now)
 
     def echo(self, lo, hi, now):
-        """Zhida echoes payload bytes [lo, hi) and ACKs all the fuzzer's payload."""
-        self.zhida(PSH | ACK, CISN + 1 + lo, self.ack_of(self.c.L), self.c.data[lo:hi],
+        """switch echoes payload bytes [lo, hi) and ACKs all the fuzzer's payload."""
+        self.switch(PSH | ACK, CISN + 1 + lo, self.ack_of(self.c.L), self.c.data[lo:hi],
                      now=now)
 
     def close(self, now):
-        """Zhida's FIN after the whole echo, ACKing the fuzzer's FIN."""
-        self.zhida(FIN | ACK, CISN + 1 + self.c.L, self.ack_of(self.c.L + 1), now=now)
+        """switch's FIN after the whole echo, ACKing the fuzzer's FIN."""
+        self.switch(FIN | ACK, CISN + 1 + self.c.L, self.ack_of(self.c.L + 1), now=now)
 
 
 def disruptive_probe(*mutations):
@@ -68,7 +68,7 @@ def spec(cls, kind, target, p=4):
 
 
 class DataAfterFinTest(unittest.TestCase):
-    """Payload at or past a FIN exercises Zhida's receive-side discard."""
+    """Payload at or past a FIN exercises switch's receive-side discard."""
 
     def conn(self):
         h = Harness(disruptive_probe())
@@ -204,11 +204,11 @@ class DeadlineTest(unittest.TestCase):
 class ClientModelTest(unittest.TestCase):
     """Invariants of the Linux-like client the oracles rely on."""
 
-    def test_teardown_acks_zhidas_latest_segment_then_resets_at_its_ack(self):
+    def test_teardown_acks_switchs_latest_segment_then_resets_at_its_ack(self):
         h = Harness(disruptive_probe(spec("ip", "ttl_1", "syn")))
         h.establish()
-        h.zhida(ACK, CISN + 1, h.ack_of(500), now=0.02)  # Zhida's latest: ACKs 500 bytes
-        h.zhida(RST, CISN + 1, 0, window=0, now=0.03)  # SEQ = the fuzzer's ACK: rst_reply
+        h.switch(ACK, CISN + 1, h.ack_of(500), now=0.02)  # switch's latest: ACKs 500 bytes
+        h.switch(RST, CISN + 1, 0, window=0, now=0.03)  # SEQ = the fuzzer's ACK: rst_reply
         self.assertEqual(h.c.failures, [])
         self.assertEqual(h.c.phase, "teardown")
         before = len(h.sent)
@@ -218,7 +218,7 @@ class ClientModelTest(unittest.TestCase):
         self.assertEqual((ack.flags, ack.seq, ack.ack), (ACK, h.ack_of(500), CISN + 1))
         self.assertEqual((rst.flags, rst.seq), (RST, h.ack_of(500)))
         self.assertEqual((h.c.phase, h.c.failures), ("done", []))
-        self.assertEqual(h.stats["disruptive_teardown_after_zhida_rst"], 1)
+        self.assertEqual(h.stats["disruptive_teardown_after_switch_rst"], 1)
 
     def test_stale_pure_ack_is_discarded_with_a_rate_limited_dup_ack(self):
         h = Harness(probe_plan(1, 0))
@@ -227,11 +227,11 @@ class ClientModelTest(unittest.TestCase):
         acks = []
         for t in (0.1, 0.2, 0.1 + STALE_DUPACK_INTERVAL + 0.01):
             before = len(h.sent)
-            h.zhida(ACK, CISN + 1, h.ack_of(h.c.L), now=t)  # SEQ below RCV.NXT (rewound after an RTO)
+            h.switch(ACK, CISN + 1, h.ack_of(h.c.L), now=t)  # SEQ below RCV.NXT (rewound after an RTO)
             acks.append([(s.flags, s.ack) for s in h.segs(before)])
         self.assertEqual(acks, [[(ACK, CISN + 101)], [], [(ACK, CISN + 101)]])
 
-        self.assertEqual(h.stats["stale_zhida_segments_discarded"], 3)
+        self.assertEqual(h.stats["stale_switch_segments_discarded"], 3)
         self.assertEqual(h.c.failures, [])
 
     def test_out_of_order_reassembly(self):
@@ -264,7 +264,7 @@ class ClientModelTest(unittest.TestCase):
 
 
 class WindowBoundTest(unittest.TestCase):
-    """Zhida's window is bounded by 65535 scaled by the shift its SYN-ACK announced
+    """switch's window is bounded by 65535 scaled by the shift its SYN-ACK announced
     (MSS_WS: 7), not by the unscaled SYN-ACK window."""
 
     def setUp(self):
@@ -295,7 +295,7 @@ class ProbeTimestampTest(unittest.TestCase):
             with self.subTest(isn=isn):
                 h = Harness(probe_plan(1, 0))
                 h.c.start(0.0)
-                h.zhida(SYN | ACK, isn, h.ack_of(0), now=0.01)
+                h.switch(SYN | ACK, isn, h.ack_of(0), now=0.01)
                 self.assertEqual(h.c.failures, [])
                 self.assertEqual(h.c.cisn, isn)
                 self.assertEqual(h.c.rcv_nxt, seqmath.add(isn, 1))
@@ -331,7 +331,7 @@ class ProbeTimestampTest(unittest.TestCase):
 
 class PacingTest(unittest.TestCase):
     def test_pacing_gaps_sum_within_the_bound(self):
-        """Without loss and with Zhida ACKing everything at once into a large window, the
+        """Without loss and with switch ACKing everything at once into a large window, the
         first transmission of the whole payload ends within PACING_TOTAL_MS of gaps."""
         checked = 0
         for i in range(300):
@@ -342,7 +342,7 @@ class PacingTest(unittest.TestCase):
             h.establish(now=0.0)
             t = 0.0
             while not h.c.failures:
-                h.zhida(ACK, CISN + 1, seqmath.add(h.c.isn, h.c.snd_max),
+                h.switch(ACK, CISN + 1, seqmath.add(h.c.isn, h.c.snd_max),
                           now=t)
                 if h.c.snd_max > h.c.L:
                     break

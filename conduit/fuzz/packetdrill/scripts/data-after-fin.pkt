@@ -1,9 +1,9 @@
 // K7 regression, found by the Scapy fuzzer: payload past the peer's FIN is discarded
 // silently; its ACK still acknowledges transmitted data. RFC 9293 3.10.7.4, seventh
 // step, says to ignore segment text after FIN.
-// - Ten bytes echo, then the peer's FIN at 11 moves Zhida to CloseWait. tap-echo
-//   closes, moving Zhida to LastAck and sending its FIN at 11.
-// - The overlapping payload at 6:26 acknowledges the echo (ack 11), but not Zhida's
+// - Ten bytes echo, then the peer's FIN at 11 moves switch to CloseWait. switch-tap-echo
+//   closes, moving switch to LastAck and sending its FIN at 11.
+// - The overlapping payload at 6:26 acknowledges the echo (ack 11), but not switch's
 //   FIN. Its payload is discarded: no new stream data, ACK of that data, or RST.
 // - The next ACK (seq 12, ack 12) closes LastAck; a new SYN gets a SYN-ACK.
 // packetdrill fills payloads with zero bytes; the check is on sequence numbers only.

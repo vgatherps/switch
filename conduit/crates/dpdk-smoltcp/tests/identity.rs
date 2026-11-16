@@ -5,10 +5,10 @@ use dpdk_smoltcp::smoltcp::socket::tcp::{ConnectError, State};
 use dpdk_smoltcp::smoltcp::wire::{EthernetFrame, EthernetProtocol, IpEndpoint, Ipv4Address, TcpControl};
 use dpdk_smoltcp::Eal;
 
-use zhida_test_kit::pair::{
+use switch_test_kit::pair::{
     config, establish, segment, tcp_socket_sized, Dir, Pair, Side, CLIENT_PORT, SERVER_PORT, T0,
 };
-use zhida_test_kit::with_eal;
+use switch_test_kit::with_eal;
 
 /// Two sockets per Stack.
 fn pair(eal: &Eal, names: [&str; 2]) -> Pair {
@@ -36,7 +36,7 @@ fn server() -> IpEndpoint {
 
 /// A refused connect leaves the socket Closed with no endpoints and sends nothing: from an
 /// address the Stack does not own, and on a tuple a live connection holds.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn failed_connect_changes_nothing() {
     with_eal(|eal| {
         let mut pair = pair(eal, ["ida", "idb"]);
@@ -57,7 +57,7 @@ fn failed_connect_changes_nothing() {
 
 /// After abort, the socket owes one RST: the Stack's next deadline is now, and the next
 /// round sends it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn abort_schedules_its_rst() {
     with_eal(|eal| {
         let mut pair = pair(eal, ["idc", "idd"]);
@@ -79,7 +79,7 @@ fn abort_schedules_its_rst() {
 /// Abort, then connect the same socket on the same tuple, with no poll between. The
 /// reconnect replaces the RST the abort owed, so the next round sends the new SYN, which the
 /// peer, still Established on the tuple, answers with an ACK.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn abort_then_reconnect_same_tuple_before_any_poll() {
     with_eal(|eal| {
         let mut pair = pair(eal, ["ide", "idf"]);
@@ -101,7 +101,7 @@ fn abort_then_reconnect_same_tuple_before_any_poll() {
 
 /// Close on a listener removes it from the Stack at once: a SYN in the next round gets an
 /// RST.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn closed_listener_takes_no_syn() {
     with_eal(|eal| {
         let mut pair = pair(eal, ["idg", "idh"]);
@@ -133,7 +133,7 @@ fn closed_listener_takes_no_syn() {
 /// allowed: the next round sends the RST and then the new socket's SYN. The peer, its
 /// connection reset and no listener on the port, answers the SYN with an RST, which closes the
 /// new socket.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn abort_then_connect_another_socket_on_the_tuple() {
     with_eal(|eal| {
         let mut pair = pair(eal, ["idi", "idj"]);

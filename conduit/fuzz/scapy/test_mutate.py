@@ -17,10 +17,10 @@ IP_CSUM, TCP_CSUM = {24, 25}, {50, 51}
 
 
 def fuzzer_frame(flags=PSH | ACK, payload=PAYLOAD, options=TS, seq=SEQ):
-    """A clean frame from the fuzzer (tester -> Zhida)."""
+    """A clean frame from the fuzzer (tester -> switch)."""
     return tcp_frame(flags, seq, ACKNO, window=502, options=options, payload=payload,
-                     src_mac=ENV.tester_mac, dst_mac=ENV.zhida_mac, src_ip=ENV.tester_ip,
-                     dst_ip=ENV.zhida_ip, sport=40000, dport=8080)
+                     src_mac=ENV.tester_mac, dst_mac=ENV.switch_mac, src_ip=ENV.tester_ip,
+                     dst_ip=ENV.switch_ip, sport=40000, dport=8080)
 
 
 def view():

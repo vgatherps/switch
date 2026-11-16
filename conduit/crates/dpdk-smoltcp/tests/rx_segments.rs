@@ -1,5 +1,5 @@
-use zhida_test_kit::pair::{BUDGET, CLIENT_PORT, SERVER_PORT, Side, pattern, segment};
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::{BUDGET, CLIENT_PORT, SERVER_PORT, Side, pattern, segment};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::Turn;
 use dpdk_smoltcp::smoltcp::wire::TcpControl;
 
@@ -21,7 +21,7 @@ fn assert_turn(turn: Turn, received: usize, sent: usize) {
     );
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_segments_keep_incoming_frames_until_read() {
     with_eal(|eal| {
         let k = 8usize;

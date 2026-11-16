@@ -1,4 +1,4 @@
-// A Linux client's last data segment carries FIN (10 bytes, FIN|PSH|ACK). Zhida echoes
+// A Linux client's last data segment carries FIN (10 bytes, FIN|PSH|ACK). Switch echoes
 // the 10 bytes, acknowledges the FIN and sends its own FIN, all in one segment; the
 // client's ACK closes the connection, which a SYN-ACK to a new SYN on the 4-tuple proves.
 // Handshake, ISNs, window 32768 and the 100 ms gap before a new SYN: see
@@ -8,7 +8,7 @@
 //   turn's egress sends nothing: no data queued, ACK delayed, no window update outside
 //   the receiving states (2415-2431).
 // - EchoServer::step then queues the 10 bytes and, in CloseWait with nothing left to read,
-//   calls close() (crates/tap-echo/src/lib.rs, step; tcp.rs 1094: LastAck). The next turn
+//   calls close() (crates/switch-tap-echo/src/lib.rs, step; tcp.rs 1094: LastAck). The next turn
 //   sends the data (2521); having sent all of the tx buffer in LastAck it sets FIN, not PSH
 //   (2724-2728), and the ACK field covers the client's FIN (2564). One segment: the
 //   delayed ACK never fires on its own.

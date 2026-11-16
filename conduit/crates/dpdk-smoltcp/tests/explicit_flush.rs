@@ -1,6 +1,6 @@
 //! Pending frames survive refused flushes and keep their order.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::smoltcp::wire::{
     ArpOperation, ArpPacket, EthernetAddress, EthernetFrame, EthernetProtocol, TcpControl,
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, TCP_HEADER_LEN,
@@ -8,7 +8,7 @@ use dpdk_smoltcp::smoltcp::wire::{
 use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Sent, StackConfig, Turn, UdpConfig};
 
-use zhida_test_kit::{many, pair, wire, with_eal};
+use switch_test_kit::{many, pair, wire, with_eal};
 use pair::{config, establish, pool_count, segment, windows, Dir, Pair, Side, T0};
 use wire::Link;
 
@@ -116,7 +116,7 @@ fn assert_segments(frames: &[Vec<u8>], src: Side, data: &[u8], mss: usize) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn template_acks_keep_exact_tx_pool_counts() {
     with_eal(|eal| {
         const CONNECTIONS: u16 = 4;
@@ -287,7 +287,7 @@ fn template_acks_keep_exact_tx_pool_counts() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn send_backpressure_resumes_same_socket() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["eq3a", "eq3b"], 2);
@@ -321,7 +321,7 @@ fn send_backpressure_resumes_same_socket() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn receive_blocks_on_full_pending_queue() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["eq4a", "eq4b"], 2);
@@ -362,7 +362,7 @@ fn receive_blocks_on_full_pending_queue() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn into_port_returns_unflushed_frames() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["eq5a", "eq5b"], 32);
@@ -383,7 +383,7 @@ fn into_port_returns_unflushed_frames() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn receive_pushes_refused_frames_before_ingress() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["eq8a", "eq8b"], 1);
@@ -393,7 +393,7 @@ fn receive_pushes_refused_frames_before_ingress() {
         fill_tx_ring(&mut pair);
         assert_eq!(pair.a.tcp_mut(&a).send_slice(&data), Ok(data.len()));
         assert_eq!(pair.a.send(), Ok(Sent { tx_accepted: 0, tx_pending: 1 }));
-        let request = zhida_test_kit::ring_port::arp(
+        let request = switch_test_kit::ring_port::arp(
             ArpOperation::Request,
             EthernetAddress::BROADCAST,
             (Side::B.mac(), Side::B.ip()),
@@ -418,7 +418,7 @@ fn receive_pushes_refused_frames_before_ingress() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn flush_with_nothing_pending() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["eq6a", "eq6b"], 32);

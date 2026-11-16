@@ -1,0 +1,15 @@
+[package]
+name = "switch-memif-bench"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+dpdk-smoltcp.workspace = true
+libc.workspace = true
+switch-buffer.workspace = true
+switch-dpdk-sys.workspace = true
+
+[dev-dependencies]
+switch-test-kit.workspace = true
+switch-test-support.workspace = true

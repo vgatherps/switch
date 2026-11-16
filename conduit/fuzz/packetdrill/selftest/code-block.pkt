@@ -2,6 +2,6 @@
 // run.sh must refuse this script without running it.
 // expect-refused: :5: contains
 
-%{ open("/tmp/zhida-code-ran", "w") }%
+%{ open("/tmp/switch-code-ran", "w") }%
 0   < S 0:0(0) win 64240 <mss 1460>
 +0  > S. 0:0(0) ack 1 win 65535 <mss 1460>

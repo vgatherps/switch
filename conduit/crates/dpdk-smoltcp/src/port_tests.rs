@@ -3,7 +3,7 @@ use crate::eal::with_test_eal;
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
-use zhida_buffer::PoolManager;
+use switch_buffer::PoolManager;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Faults {
@@ -446,7 +446,7 @@ pub(crate) fn assert_no_pools() {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn real_open_start_close_reuses_all_names_and_reports_descriptors() {
     with_test_eal(|eal| {
         for _ in 0..3 {
@@ -486,7 +486,7 @@ fn real_open_start_close_reuses_all_names_and_reports_descriptors() {
 /// different (here: a changed request, as changed device limits after a reset would give)
 /// fail it, since the Stack sized its pools from them: the Port stays not ready and still
 /// closes cleanly.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn recover_refuses_changed_descriptor_counts() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -511,7 +511,7 @@ fn recover_refuses_changed_descriptor_counts() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn preflight_failures_leave_the_caller_device_and_pool_names_untouched() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -543,7 +543,7 @@ fn preflight_failures_leave_the_caller_device_and_pool_names_untouched() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn open_rejects_exact_fit_room_below_rule() {
     with_test_eal(|eal| {
         for (mtu, required_room, short_rooms) in
@@ -585,7 +585,7 @@ fn open_rejects_exact_fit_room_below_rule() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn open_fails_when_pmd_reports_scattered_rx() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -614,7 +614,7 @@ fn open_fails_when_pmd_reports_scattered_rx() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn open_fails_when_rxq_info_errors() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -644,7 +644,7 @@ fn open_fails_when_rxq_info_errors() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn open_succeeds_when_rxq_info_unsupported() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -662,7 +662,7 @@ fn open_succeeds_when_rxq_info_unsupported() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn open_succeeds_when_pmd_reports_single_segment_rx() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -679,7 +679,7 @@ fn open_succeeds_when_pmd_reports_single_segment_rx() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_pool_creation_failure_releases_rx_without_adopting_device() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -703,7 +703,7 @@ fn tx_pool_creation_failure_releases_rx_without_adopting_device() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_pool_room_and_creation_failures_release_every_pool() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -744,7 +744,7 @@ fn frame_pool_room_and_creation_failures_release_every_pool() {
 /// A frame's payload starts 42 bytes after the mbuf headroom (room for UDP
 /// headers; TCP's 54 fit too) and holds IP MTU − 28 bytes. One share makes the
 /// refcount 2; each release drops one, and the last returns the mbuf once.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_pool_layout_share_and_exhaustion() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -807,7 +807,7 @@ fn frame_pool_layout_share_and_exhaustion() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn actual_late_tx_queue_failure_rolls_back_and_start_error_stops_running_port() {
     with_test_eal(|eal| {
         for fault in [
@@ -841,7 +841,7 @@ fn actual_late_tx_queue_failure_rolls_back_and_start_error_stops_running_port() 
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rollback_stop_refusal_retains_both_empty_pools_and_original_error() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -883,7 +883,7 @@ fn rollback_stop_refusal_retains_both_empty_pools_and_original_error() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn released_id_close_error_latches_and_never_retries_device_or_frees_empty_pools() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -931,7 +931,7 @@ fn released_id_close_error_latches_and_never_retries_device_or_frees_empty_pools
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn attached_ring_packet_survives_device_close_until_external_drain() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -965,7 +965,7 @@ fn attached_ring_packet_survives_device_close_until_external_drain() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn port_drop_preserves_original_panic_and_releases_names() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -980,7 +980,7 @@ fn port_drop_preserves_original_panic_and_releases_names() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn actual_config_readback_validation_rejects_changed_mtu() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1036,7 +1036,7 @@ const TX_TCP_UDP_CHECKSUMS: Offloads = Offloads {
     tx_udp_checksum: true,
 };
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn missing_rx_timestamp_offload_is_error() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1066,7 +1066,7 @@ fn missing_rx_timestamp_offload_is_error() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_timestamp_readback_must_match() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1101,7 +1101,7 @@ fn rx_timestamp_readback_must_match() {
 /// net_ring advertises no checksum offloads. Requesting one fails before
 /// pool acquisition with an error naming it, leaving the device unconfigured
 /// with the caller; a readback lacking a requested bit fails too.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn missing_requested_offload_is_error() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1157,7 +1157,7 @@ fn missing_requested_offload_is_error() {
 
 /// A readback holding any offload bit outside the requested set fails, with
 /// or without a requested profile.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unrequested_offload_is_error() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1198,7 +1198,7 @@ fn unrequested_offload_is_error() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn forced_multi_segs_accepted() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1225,7 +1225,7 @@ fn forced_multi_segs_accepted() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unknown_forced_offload_still_refused() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1252,7 +1252,7 @@ fn unknown_forced_offload_still_refused() {
 
 /// ENA sets scattered RX without `rx_queue_info_get`; the room rule alone
 /// must refuse a frame that would chain.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn room_rule_refuses_when_rxq_info_unsupported() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1282,7 +1282,7 @@ fn room_rule_refuses_when_rxq_info_unsupported() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn failed_drop_retains_empty_pools_preserves_panic_and_never_repeats_explicit_cleanup() {
     #[derive(Clone, Copy)]
     enum Case {
@@ -1381,7 +1381,7 @@ fn failed_drop_retains_empty_pools_preserves_panic_and_never_repeats_explicit_cl
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn readiness_requires_successful_setup_and_is_revoked_on_refused_close() {
     with_test_eal(|eal| {
         for fault in [
@@ -1504,7 +1504,7 @@ fn ring_take(ring: *mut rte_ring, max: u32) -> Vec<Mbuf> {
         .collect()
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_burst_transfers_accepted_prefix_and_retries_ordered_suffix_after_saturation() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1568,7 +1568,7 @@ fn tx_burst_transfers_accepted_prefix_and_retries_ordered_suffix_after_saturatio
 /// owners reuse those mbufs and nothing frees them a second time, while the
 /// suffix stays owned and intact. Mempool memory stays mapped, so a stray read
 /// of a freed mbuf would not be detected here.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_burst_disarms_a_prefix_the_pmd_freed_synchronously() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1607,7 +1607,7 @@ fn tx_burst_disarms_a_prefix_the_pmd_freed_synchronously() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_burst_never_disarms_packets_a_pmd_over_reports_but_was_not_offered() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1639,7 +1639,7 @@ fn tx_burst_never_disarms_packets_a_pmd_over_reports_but_was_not_offered() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_burst_refuses_unready_ports_without_calling_the_pmd() {
     with_test_eal(|eal| {
         // Retained after failed setup, then after a refused close.
@@ -1688,7 +1688,7 @@ fn tx_burst_refuses_unready_ports_without_calling_the_pmd() {
 
 /// An idle flush offers nothing: `tx_burst` returns 0 without the PMD call
 /// that memif's copy-mode TX mishandles for an empty burst.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_burst_with_nothing_pending_never_calls_the_pmd() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1718,7 +1718,7 @@ fn exhaust_tx_pool(port: &Port) -> Vec<Packet> {
 
 /// With the TX pool exhausted, `alloc_tx` asks the PMD once to reclaim sent
 /// mbufs; net_ring has no cleanup (-ENOTSUP), so the allocation fails.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn alloc_tx_on_exhausted_pool_tries_one_cleanup_then_fails_without_support() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1741,7 +1741,7 @@ fn alloc_tx_on_exhausted_pool_tries_one_cleanup_then_fails_without_support() {
 /// Sent mbufs the "NIC" (the fixture's TX ring) still holds exhaust the pool;
 /// the cleanup releases them, as a NIC PMD reclaiming completed descriptors
 /// does, and the one retry allocates.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn alloc_tx_retries_once_after_cleanup_reclaims_sent_mbufs() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1773,7 +1773,7 @@ fn alloc_tx_retries_once_after_cleanup_reclaims_sent_mbufs() {
 
 /// A length beyond the TX room is refused before the pool is touched, so it
 /// never triggers a cleanup, even with the pool exhausted.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn alloc_tx_too_long_never_calls_cleanup() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1794,7 +1794,7 @@ fn alloc_tx_too_long_never_calls_cleanup() {
 
 /// A cleanup error other than -ENOTSUP panics naming port, queue and code;
 /// the Port and its packets stay intact.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn alloc_tx_panics_on_unexpected_cleanup_error() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1827,7 +1827,7 @@ fn alloc_tx_panics_on_unexpected_cleanup_error() {
 /// set up) or after a refused close, allocates from its pool but never calls
 /// the cleanup on exhaustion: `None`, zero calls. The cleanup seam would
 /// fail with -EINVAL, so a call would panic.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn alloc_tx_on_unready_port_never_calls_cleanup() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1933,7 +1933,7 @@ fn bad_checksum_dropped_and_counted(flags: u64) {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bad_and_unknown_l4_tcp_staged() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -1959,7 +1959,7 @@ fn bad_and_unknown_l4_tcp_staged() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bad_ipv4_dropped_and_counted() {
     bad_checksum_dropped_and_counted(RTE_MBUF_F_RX_IP_CKSUM_BAD | RTE_MBUF_F_RX_L4_CKSUM_GOOD);
 }
@@ -1971,7 +1971,7 @@ fn rx(accepted: usize, rejected: usize) -> Result<RxBurst, PortError> {
     })
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_into_buf_aliases_mbuf_and_frees_to_rx_pool() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2009,7 +2009,7 @@ fn rx_into_buf_aliases_mbuf_and_frees_to_rx_pool() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_burst_imports_own_pool_packets_in_order_within_burst_and_spare_capacity() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2048,7 +2048,7 @@ fn rx_burst_imports_own_pool_packets_in_order_within_burst_and_spare_capacity() 
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_burst_with_full_staging_never_calls_the_pmd() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2085,7 +2085,7 @@ unsafe extern "C" fn count_ext_free(_buf: *mut c_void, _opaque: *mut c_void) {
     EXT_FREES.set(EXT_FREES.get() + 1);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_burst_frees_valid_unsupported_packets_once_with_standard_free() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2223,7 +2223,7 @@ fn rx_burst_frees_valid_unsupported_packets_once_with_standard_free() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_burst_refuses_unready_ports_and_leaves_packets_queued() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2295,7 +2295,7 @@ fn assert_pool_defaults(pool: &PoolManager, ids: &[*mut rte_mbuf]) {
 /// runs the cache-flush path as well as the cached put. The single-segment
 /// free is meant to behave exactly like the general free here, which would
 /// pass this test too; a double or missing free would not.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dropped_packets_return_to_their_own_pools_beyond_the_cache() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2331,7 +2331,7 @@ fn dropped_packets_return_to_their_own_pools_beyond_the_cache() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn shutdown_refuses_until_staged_queued_and_ring_held_packets_each_return_once() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2391,7 +2391,7 @@ fn shutdown_refuses_until_staged_queued_and_ring_held_packets_each_return_once()
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn caller_unwind_returns_adapter_packets_and_never_frees_ring_held_ones() {
     with_test_eal(|eal| {
         // Port declared before its queues: the queues drop first, then the

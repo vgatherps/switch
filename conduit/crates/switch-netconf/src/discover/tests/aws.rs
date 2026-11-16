@@ -1,0 +1,907 @@
+use super::*;
+use crate::imds::Imds;
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+struct Server {
+    imds: Imds,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+impl Server {
+    fn new(responses: Vec<(String, Vec<u8>)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let imds = Imds::new(listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = thread::spawn(move || {
+            for (expected, response) in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopping.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let request = read_request(&mut stream);
+                assert_eq!(request.lines().next().unwrap(), expected);
+                if expected.starts_with("GET ") {
+                    assert!(request.contains("\r\nX-aws-ec2-metadata-token: secret\r\n"));
+                }
+                recorded.lock().unwrap().push(request);
+                stream.write_all(&response).unwrap();
+            }
+        });
+        Self {
+            imds,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+fn read_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).unwrap(), 1);
+        request.push(byte[0]);
+    }
+    String::from_utf8(request).unwrap()
+}
+fn token_response(response: Vec<u8>) -> (String, Vec<u8>) {
+    ("PUT /latest/api/token HTTP/1.1".into(), response)
+}
+fn get_response(path: &str, response: Vec<u8>) -> (String, Vec<u8>) {
+    (format!("GET /latest/meta-data/{path} HTTP/1.1"), response)
+}
+fn response(status: u16, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+fn metadata(device: &str, local: &str, subnet: &str, blocks: &str, public: (u16, &str)) -> Server {
+    metadata_for_mac("0a:12:34:56:78:9a", device, local, subnet, blocks, public)
+}
+fn metadata_for_mac(
+    mac: &str,
+    device: &str,
+    local: &str,
+    subnet: &str,
+    blocks: &str,
+    public: (u16, &str),
+) -> Server {
+    metadata_with_prefixes(mac, device, local, subnet, blocks, public, (404, ""))
+}
+/// The metadata items `derive` reads, in its order; `prefixes` answers `ipv4-prefix`.
+fn metadata_with_prefixes(
+    mac: &str,
+    device: &str,
+    local: &str,
+    subnet: &str,
+    blocks: &str,
+    public: (u16, &str),
+    prefixes: (u16, &str),
+) -> Server {
+    let mut responses = vec![token_response(response(200, "secret"))];
+    for (item, status, body) in [
+        ("device-number", 200, device),
+        ("local-ipv4s", 200, local),
+        ("subnet-ipv4-cidr-block", 200, subnet),
+        ("vpc-ipv4-cidr-blocks", 200, blocks),
+        ("public-ipv4s", public.0, public.1),
+        ("ipv4-prefix", prefixes.0, prefixes.1),
+    ] {
+        responses.push(get_response(
+            &format!("network/interfaces/macs/{mac}/{item}"),
+            response(status, body),
+        ));
+    }
+    Server::new(responses)
+}
+
+fn aws(tree: &Tree, server: &Server, addresses: &[Ipv4Cidr]) -> Result<Discovered, DiscoverError> {
+    discover_aws(&tree.roots, "eth1", addresses, None, &server.imds)
+}
+fn ordinary(public: (u16, &str)) -> Server {
+    metadata(
+        "1",
+        "10.0.1.23\n10.0.1.24\n",
+        "10.0.1.0/24",
+        "10.0.0.0/16\n192.168.0.0/16\n",
+        public,
+    )
+}
+#[test]
+fn imds_put_token_then_get_with_header() {
+    let path = "network/interfaces/macs/0a:12:34:56:78:9a/device-number";
+    let server = Server::new(vec![
+        token_response(response(200, "secret")),
+        get_response(path, response(200, "1")),
+    ]);
+    let token = server.imds.token().unwrap();
+    assert_eq!(format!("{token:?}"), "Token(..)");
+    assert_eq!(server.imds.get(&token, path).unwrap().as_deref(), Some("1"));
+    let requests = server.requests.lock().unwrap();
+    assert!(requests[0].starts_with("PUT /latest/api/token HTTP/1.1\r\n"));
+    for header in [
+        "Host: 169.254.169.254\r\n",
+        "X-aws-ec2-metadata-token-ttl-seconds: 60\r\n",
+        "Content-Length: 0\r\n",
+        "Connection: close\r\n",
+    ] {
+        assert!(requests[0].contains(header));
+    }
+    assert!(requests[1].starts_with(&format!("GET /latest/meta-data/{path} HTTP/1.1\r\n")));
+    assert!(requests[1].contains("X-aws-ec2-metadata-token: secret\r\n"));
+    drop(requests);
+
+    let tree = Tree::new();
+    let mac = "02:ab:cd:ef:01:23";
+    tree.write("class/net/eth1/address", &format!("{mac}\n"));
+    let server = metadata_for_mac(
+        mac,
+        "1",
+        "10.0.1.23\n10.0.1.24\n",
+        "10.0.1.0/24",
+        "10.0.0.0/16",
+        (200, "1.2.3.4"),
+    );
+    let discovered = aws(&tree, &server, &addresses()).unwrap();
+    assert_eq!(discovered.config.mac, Some(mac.parse().unwrap()));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 7);
+    assert_eq!(
+        requests[0].lines().next(),
+        Some("PUT /latest/api/token HTTP/1.1")
+    );
+    for (request, item) in requests[1..].iter().zip([
+        "device-number",
+        "local-ipv4s",
+        "subnet-ipv4-cidr-block",
+        "vpc-ipv4-cidr-blocks",
+        "public-ipv4s",
+        "ipv4-prefix",
+    ]) {
+        assert_eq!(
+            request.lines().next().unwrap(),
+            format!("GET /latest/meta-data/network/interfaces/macs/{mac}/{item} HTTP/1.1")
+        );
+        assert!(request.contains("\r\nX-aws-ec2-metadata-token: secret\r\n"));
+    }
+}
+#[test]
+fn imds_401_is_token_error() {
+    let server = Server::new(vec![
+        token_response(response(200, "secret")),
+        get_response("item", response(401, "")),
+    ]);
+    let token = server.imds.token().unwrap();
+    assert_eq!(
+        server.imds.get(&token, "item").unwrap_err().to_string(),
+        "IMDS rejected the session token (401) for /latest/meta-data/item"
+    );
+}
+#[test]
+fn imds_unreachable_names_hop_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let error = Imds::new(addr).token().unwrap_err().to_string();
+    assert!(error.contains("hop limit") && error.contains(&addr.to_string()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (release, held) = mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let request = read_request(&mut stream);
+        assert_eq!(
+            request.lines().next(),
+            Some("PUT /latest/api/token HTTP/1.1")
+        );
+        let _ = held.recv();
+        drop(stream);
+    });
+    let (completed, result) = mpsc::channel();
+    let client = thread::spawn(move || {
+        let start = Instant::now();
+        let result = Imds::new(addr)
+            .token()
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        completed.send((start.elapsed(), result)).unwrap();
+    });
+    let outcome = result.recv_timeout(Duration::from_secs(5));
+    drop(release);
+    let (elapsed, result) = outcome.expect("IMDS client did not return within 5 seconds");
+    server.join().unwrap();
+    client.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "IMDS call took {elapsed:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(error.contains("hop limit") && error.contains(&addr.to_string()));
+}
+#[test]
+fn imds_refuses_redirect_and_chunked() {
+    for (raw, message) in [
+        (
+            "HTTP/1.1 301 Moved\r\nLocation: http://elsewhere/\r\n\r\n",
+            "refused redirect (301)",
+        ),
+        (
+            "HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: chunked\r\n\r\n0\r\n\r\n",
+            "Transfer-Encoding",
+        ),
+    ] {
+        let server = Server::new(vec![
+            token_response(response(200, "secret")),
+            get_response("item", raw.as_bytes().to_vec()),
+        ]);
+        let token = server.imds.token().unwrap();
+        assert!(server
+            .imds
+            .get(&token, "item")
+            .unwrap_err()
+            .to_string()
+            .contains(message));
+    }
+}
+#[test]
+fn aws_gateway_is_subnet_base_plus_one() {
+    let tree = Tree::new();
+    for (subnet, local, gateway) in [
+        ("10.0.1.0/24", "10.0.1.23", "10.0.1.1"),
+        ("10.0.4.0/22", "10.0.4.23", "10.0.4.1"),
+    ] {
+        tree.routes("");
+        let server = metadata("1", local, subnet, "10.0.0.0/16", (200, "1.2.3.4"));
+        assert_eq!(
+            aws(&tree, &server, &[]).unwrap().config.gateway,
+            Some(gateway.parse().unwrap())
+        );
+    }
+    tree.routes("eth1 00000000 FE01000A 0003 0 0 0 00000000\n");
+    let server = ordinary((200, "1.2.3.4"));
+    let error = aws(&tree, &server, &addresses()).err().unwrap().to_string();
+    assert!(error.contains("10.0.1.254") && error.contains("10.0.1.1"));
+}
+#[test]
+fn aws_refuses_device_number_zero() {
+    let tree = Tree::new();
+    let server = metadata("0", "10.0.1.23", "10.0.1.0/24", "10.0.0.0/16", (200, ""));
+    assert_eq!(
+        aws(&tree, &server, &addresses()).err().unwrap().to_string(),
+        "eth1 is the primary ENI (device-number 0); it carries IMDS and SSH"
+    );
+}
+#[test]
+fn aws_kernel_ip_not_in_local_ipv4s_is_error() {
+    let tree = Tree::new();
+    let server = ordinary((200, "1.2.3.4"));
+    let error = aws(&tree, &server, &["10.0.1.25/24".parse().unwrap()])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("10.0.1.25") && error.contains("local-ipv4s (10.0.1.23, 10.0.1.24)"));
+    let server = ordinary((200, "1.2.3.4"));
+    assert_eq!(
+        aws(&tree, &server, &[]).unwrap().config.ipv4,
+        addresses()[0]
+    );
+}
+#[test]
+fn aws_prefix_mismatch_is_error() {
+    let tree = Tree::new();
+    let server = ordinary((200, "1.2.3.4"));
+    let error = aws(&tree, &server, &["10.0.1.23/22".parse().unwrap()])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("10.0.1.23/22") && error.contains("10.0.1.0/24"));
+}
+#[test]
+fn aws_vpc_blocks_become_1500_rules() {
+    let tree = Tree::new();
+    let server = ordinary((200, "1.2.3.4"));
+    let config = aws(&tree, &server, &addresses()).unwrap().config;
+    assert_eq!(config.mtu, 1500);
+    assert_eq!(
+        config
+            .paths
+            .iter()
+            .map(|p| (p.prefix.to_string(), p.mtu, p.why.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("10.0.0.0/16".into(), 1500, "vpc"),
+            ("192.168.0.0/16".into(), 1500, "vpc"),
+            ("0.0.0.0/0".into(), 1500, "default")
+        ]
+    );
+    let server = metadata("1", "10.0.1.23", "10.0.1.0/24", "10.0.1.0/16", (200, ""));
+    assert!(aws(&tree, &server, &addresses())
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("host bits"));
+}
+#[test]
+fn default_rule_is_1500() {
+    let tree = Tree::new();
+    assert_eq!(
+        tree.discover(&addresses(), None).unwrap().config.paths,
+        vec![PathRule {
+            prefix: "0.0.0.0/0".parse().unwrap(),
+            mtu: 1500,
+            why: "default".into()
+        }]
+    );
+}
+#[test]
+fn operator_rules_survive_rediscover() {
+    let tree = Tree::new();
+    let server = metadata(
+        "1",
+        "10.0.1.23",
+        "10.0.1.0/24",
+        "10.0.0.0/16\n172.16.0.0/16\n",
+        (200, "1.2.3.4"),
+    );
+    let discovered = aws(&tree, &server, &addresses()).unwrap();
+    let mut previous = discovered.config.clone();
+    previous.paths.insert(
+        0,
+        PathRule {
+            prefix: "10.2.3.4/32".parse().unwrap(),
+            mtu: 8500,
+            why: "operator".into(),
+        },
+    );
+    previous.paths[1].why = "peering".into();
+    previous.paths[1].mtu = 8500;
+    previous.paths[2].prefix = "192.168.0.0/16".parse().unwrap();
+    previous.offloads = Offloads::Explicit {
+        rx_checksum: false,
+        tx_tcp_checksum: false,
+        tx_udp_checksum: true,
+    };
+    previous.descriptors = 512;
+    previous.rx_timestamps = true;
+    previous.eal.file_prefix = "custom".into();
+    if let Device::Pci(p) = &mut previous.device {
+        p.devargs = "custom=1".into();
+    }
+    previous.mtu = 9001;
+    let path = tree.dir.join("config.json");
+    fs::write(&path, previous.to_json()).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    let merged = Config::load(&path).unwrap();
+    assert_eq!(merged.paths[..2], previous.paths[..2]);
+    assert_eq!(
+        merged.paths,
+        vec![
+            previous.paths[0].clone(),
+            previous.paths[1].clone(),
+            PathRule {
+                prefix: "172.16.0.0/16".parse().unwrap(),
+                mtu: 1500,
+                why: "vpc".into(),
+            },
+            PathRule {
+                prefix: "0.0.0.0/0".parse().unwrap(),
+                mtu: 1500,
+                why: "default".into(),
+            },
+        ]
+    );
+    assert!(!merged
+        .paths
+        .iter()
+        .any(|p| p.prefix == "192.168.0.0/16".parse().unwrap()));
+    assert_eq!(merged.mtu, 9001);
+    assert_eq!(merged.path_mtu("10.2.3.4".parse().unwrap()), 8500);
+    assert_eq!(merged.path_mtu("172.16.1.1".parse().unwrap()), 1500);
+    assert_eq!(merged.offloads, previous.offloads);
+    assert_eq!(merged.descriptors, previous.descriptors);
+    assert_eq!(merged.rx_timestamps, previous.rx_timestamps);
+    assert_eq!(merged.eal, previous.eal);
+    assert_eq!(merged.device, previous.device);
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "changed: paths\n"
+    );
+}
+#[test]
+fn public_ipv4s_404_or_empty_warns() {
+    let tree = Tree::new();
+    for public in [(404, ""), (200, "\n  \n")] {
+        let server = ordinary(public);
+        let discovered = aws(&tree, &server, &addresses()).unwrap();
+        assert_eq!(discovered.warnings, vec!["eth1 has no public IPv4 (IMDS public-ipv4s); internet destinations need an Elastic IP on this ENI or a NAT gateway route"]);
+    }
+}
+#[test]
+fn public_ipv4s_500_is_error() {
+    let tree = Tree::new();
+    let server = ordinary((500, "error"));
+    assert_eq!(aws(&tree, &server, &addresses()).err().unwrap().to_string(), "IMDS answered 500 for /latest/meta-data/network/interfaces/macs/0a:12:34:56:78:9a/public-ipv4s");
+}
+
+#[test]
+fn imds_response_framing_and_status_errors() {
+    for (raw, message) in [
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx".to_vec(),
+            "Content-Length",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nx".to_vec(),
+            "Content-Length",
+        ),
+        (b"HTTP/1.1 200 OK\r\n\r\n\xff".to_vec(), "UTF-8"),
+        (b"HTTP/2 200 OK\r\n\r\n".to_vec(), "status line"),
+        (b"HTTP/1.1 200 OK\r\n".to_vec(), "header terminator"),
+        (response(200, &"x".repeat(65536)), "64 KiB"),
+    ] {
+        let server = Server::new(vec![token_response(raw)]);
+        assert!(server
+            .imds
+            .token()
+            .unwrap_err()
+            .to_string()
+            .contains(message));
+    }
+    let server = Server::new(vec![
+        token_response(b"HTTP/1.0 200 OK\r\n\r\nsecret".to_vec()),
+        get_response("optional", response(404, "")),
+    ]);
+    let token = server.imds.token().unwrap();
+    assert!(server.imds.get(&token, "optional").unwrap().is_none());
+    let server = Server::new(vec![token_response(response(403, ""))]);
+    assert_eq!(
+        server.imds.token().unwrap_err().to_string(),
+        "IMDS token request answered 403"
+    );
+}
+
+#[test]
+fn aws_required_items_and_address_selection() {
+    let tree = Tree::new();
+    let values = ["1", "10.0.1.23", "10.0.1.0/24", "10.0.0.0/16"];
+    for (missing, name) in [
+        "device-number",
+        "local-ipv4s",
+        "subnet-ipv4-cidr-block",
+        "vpc-ipv4-cidr-blocks",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut replies = vec![token_response(response(200, "secret"))];
+        for (item, value) in [
+            "device-number",
+            "local-ipv4s",
+            "subnet-ipv4-cidr-block",
+            "vpc-ipv4-cidr-blocks",
+        ]
+        .iter()
+        .zip(&values)
+        .take(missing)
+        {
+            replies.push(get_response(
+                &format!("network/interfaces/macs/0a:12:34:56:78:9a/{item}"),
+                response(200, value),
+            ));
+        }
+        replies.push(get_response(
+            &format!("network/interfaces/macs/0a:12:34:56:78:9a/{name}"),
+            response(404, ""),
+        ));
+        let server = Server::new(replies);
+        let error = aws(&tree, &server, &addresses()).err().unwrap().to_string();
+        assert!(error.contains(name) && error.contains("404"));
+    }
+    let addresses = [
+        "10.0.1.23/24".parse().unwrap(),
+        "10.0.1.24/24".parse().unwrap(),
+    ];
+    let server = ordinary((200, "1.2.3.4"));
+    assert!(aws(&tree, &server, &addresses)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("choose one with --ipv4"));
+    let server = ordinary((200, "1.2.3.4"));
+    assert_eq!(
+        discover_aws(
+            &tree.roots,
+            "eth1",
+            &addresses,
+            Some(addresses[1].address()),
+            &server.imds
+        )
+        .unwrap()
+        .config
+        .ipv4,
+        addresses[1]
+    );
+    tree.write("class/net/eth1/mtu", "1400\n");
+    let server = ordinary((200, "1.2.3.4"));
+    let config = aws(&tree, &server, &addresses[..1]).unwrap().config;
+    assert_eq!(config.mtu, 1400);
+    assert!(config.paths.iter().all(|p| p.mtu == 1500));
+    assert_eq!(config.path_mtu("10.0.2.1".parse().unwrap()), 1400);
+    assert_eq!(config.path_mtu("8.8.8.8".parse().unwrap()), 1400);
+}
+
+/// An unnumbered interface (no kernel IPv4): `--ipv4` selects from IMDS local-ipv4s; an address
+/// not in that list is an error, not the first IMDS address.
+#[test]
+fn aws_unnumbered_interface_honours_ipv4_selection() {
+    let tree = Tree::new();
+    let select = |ipv4: &str| {
+        let server = ordinary((200, "1.2.3.4"));
+        discover_aws(&tree.roots, "eth1", &[], Some(ipv4.parse().unwrap()), &server.imds)
+    };
+    assert_eq!(
+        select("10.0.1.24").unwrap().config.ipv4,
+        "10.0.1.24/24".parse().unwrap()
+    );
+    assert_eq!(
+        select("10.0.1.99").err().unwrap().to_string(),
+        "10.0.1.99 is not in IMDS local-ipv4s (10.0.1.23, 10.0.1.24)"
+    );
+    let server = ordinary((200, "1.2.3.4"));
+    assert_eq!(
+        aws(&tree, &server, &[]).unwrap().config.ipv4,
+        "10.0.1.23/24".parse().unwrap()
+    );
+}
+
+const MAC: &str = "0a:12:34:56:78:9a";
+fn with_prefixes(prefixes: (u16, &str)) -> Server {
+    metadata_with_prefixes(
+        MAC,
+        "1",
+        "10.0.1.23\n10.0.1.24\n",
+        "10.0.1.0/24",
+        "10.0.0.0/16",
+        (200, "1.2.3.4"),
+        prefixes,
+    )
+}
+fn cidrs(texts: &[&str]) -> Vec<Ipv4Cidr> {
+    texts.iter().map(|t| t.parse().unwrap()).collect()
+}
+
+/// Every local-ipv4s address is owned as a /32 and every delegated prefix as itself, the
+/// selected primary among them; the primary (`ipv4`) is chosen as before.
+#[test]
+fn aws_owns_every_local_ipv4_and_prefix() {
+    let tree = Tree::new();
+    let server = with_prefixes((200, "10.0.1.64/28\n10.0.1.48/28\n"));
+    let config = aws(&tree, &server, &addresses()).unwrap().config;
+    assert_eq!(config.ipv4, addresses()[0]);
+    assert_eq!(
+        config.owned_ipv4,
+        cidrs(&[
+            "10.0.1.23/32",
+            "10.0.1.24/32",
+            "10.0.1.48/28",
+            "10.0.1.64/28"
+        ])
+    );
+    let selected: Vec<Ipv4Cidr> = cidrs(&["10.0.1.23/24", "10.0.1.24/24"]);
+    let server = with_prefixes((200, "10.0.1.48/28\n"));
+    let config = discover_aws(
+        &tree.roots,
+        "eth1",
+        &selected,
+        Some(selected[1].address()),
+        &server.imds,
+    )
+    .unwrap()
+    .config;
+    assert_eq!(config.ipv4, selected[1]);
+    assert_eq!(
+        config.owned_ipv4,
+        cidrs(&["10.0.1.23/32", "10.0.1.24/32", "10.0.1.48/28"])
+    );
+    // local addresses inside a delegated prefix (here both) are owned once, by the prefix
+    let server = with_prefixes((200, "10.0.1.16/28\n"));
+    let config = aws(&tree, &server, &addresses()).unwrap().config;
+    assert_eq!(config.owned_ipv4, cidrs(&["10.0.1.16/28"]));
+}
+
+/// `ipv4-prefix` answering 404, or 200 with no lines, means no prefixes; any other status, an
+/// invalid CIDR or one with host bits set fails discovery.
+#[test]
+fn aws_ipv4_prefix_404_is_none_other_errors_fail() {
+    let tree = Tree::new();
+    for prefixes in [(404, ""), (200, "\n  \n")] {
+        let server = with_prefixes(prefixes);
+        let config = aws(&tree, &server, &addresses()).unwrap().config;
+        assert_eq!(
+            config.owned_ipv4,
+            cidrs(&["10.0.1.23/32", "10.0.1.24/32"]),
+            "{prefixes:?}"
+        );
+    }
+    for prefixes in [
+        (500, "error"),
+        (401, ""),
+        (200, "10.0.1.48"),
+        (200, "10.0.1.49/28"),
+    ] {
+        let server = with_prefixes(prefixes);
+        let error = aws(&tree, &server, &addresses()).err().unwrap().to_string();
+        assert!(error.contains("ipv4-prefix"), "{prefixes:?}: {error}");
+    }
+}
+
+/// A delegated prefix holding the subnet's gateway (base + 1) fails the config's ownership rules;
+/// the error names the prefix's entry (after the two local /32s).
+#[test]
+fn aws_prefix_holding_the_gateway_is_rejected() {
+    let tree = Tree::new();
+    let server = with_prefixes((200, "10.0.1.0/28\n"));
+    let error = aws(&tree, &server, &addresses()).err().unwrap().to_string();
+    assert!(error.starts_with("owned_ipv4[2]:"), "{error}");
+}
+
+/// An AWS rediscovery replaces the owned addresses with the current ones and reports every entry
+/// it drops, including a hand-added one IMDS does not list, and every entry it adds.
+#[test]
+fn aws_rediscover_replaces_and_reports_owned_ipv4() {
+    let tree = Tree::new();
+    let mut previous = aws(&tree, &with_prefixes((404, "")), &addresses())
+        .unwrap()
+        .config;
+    previous.owned_ipv4.extend(cidrs(&["172.16.0.9/32"]));
+    let discovered = aws(&tree, &with_prefixes((200, "10.0.1.48/28\n")), &addresses()).unwrap();
+    let path = tree.dir.join("config.json");
+    fs::write(&path, previous.to_json()).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    assert_eq!(
+        Config::load(&path).unwrap().owned_ipv4,
+        discovered.config.owned_ipv4
+    );
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "changed: owned_ipv4\nowned_ipv4 removed: 172.16.0.9/32\nowned_ipv4 added: 10.0.1.48/28\n"
+    );
+}
+
+/// Kernel discovery does not list owned addresses: a rediscovery keeps the configured ones, like
+/// the other fields it cannot discover, and reports no change.
+#[test]
+fn kernel_rediscover_keeps_configured_owned_ipv4() {
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    assert!(discovered.config.owned_ipv4.is_empty());
+    let mut previous = discovered.config.clone();
+    previous.owned_ipv4 = cidrs(&["10.0.1.48/28", "172.16.0.9/32"]);
+    let path = tree.dir.join("config.json");
+    fs::write(&path, previous.to_json()).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    assert_eq!(Config::load(&path).unwrap().owned_ipv4, previous.owned_ipv4);
+    assert_eq!(String::from_utf8(output).unwrap(), "");
+}
+
+/// The config written at `name` in a fresh tree, its loaded form and the new discovery.
+fn rediscover_fixture(name: &str) -> (Tree, std::path::PathBuf, Config, Discovered) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let mut previous = discovered.config.clone();
+    previous.mtu = 1400;
+    let path = tree.dir.join(name);
+    fs::write(&path, previous.to_json()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = crate::rediscover::load_existing(&path).unwrap().unwrap();
+    (tree, path, loaded, discovered)
+}
+
+/// Names in `dir` starting with `.{name}.`: temp files of `name`.
+fn temp_files(dir: &std::path::Path, name: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(&format!(".{name}.")))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A first discovery whose write fails part way (here the file size limit, as a full disk would)
+/// leaves no config at the path, whole or partial, and no temp file. Runs in a child process: the
+/// limit is per process.
+#[test]
+fn initial_discovery_failure_leaves_no_partial_config() {
+    const CHILD: &str = "SWITCH_NETCONF_FSIZE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discover::tests::aws::initial_discovery_failure_leaves_no_partial_config",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let path = tree.dir.join("config.json");
+    // SAFETY: plain libc calls on this process's own limit and signal disposition.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit { rlim_cur: 16, rlim_max: libc::RLIM_INFINITY };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    let written = crate::rediscover::write(&path, &discovered, None, &mut Vec::new());
+    assert!(written.is_err(), "the write past the size limit succeeded");
+    assert!(!path.exists(), "a partial config was left at the path");
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
+/// A first discovery (nothing loaded) never replaces a config that appeared at the path since:
+/// it is refused as before, the other config stays as it was and no temp file is left.
+#[test]
+fn initial_discovery_refuses_a_config_that_appeared_since_load() {
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let path = tree.dir.join("config.json");
+    assert!(crate::rediscover::load_existing(&path).unwrap().is_none());
+    fs::write(&path, "written by someone else").unwrap();
+    let error = crate::rediscover::write(&path, &discovered, None, &mut Vec::new())
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with(&format!("{}: ", path.display())), "{error}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "written by someone else");
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
+/// Once the first discovery's config is linked into place, a temp name that cannot be removed
+/// (here an append-only directory: entries can be added, not removed) leaves the write a success
+/// with the config in place, not a failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn initial_discovery_succeeds_when_the_temp_name_cannot_be_removed() {
+    struct AppendOnly(std::ffi::CString);
+    impl AppendOnly {
+        fn set(dir: &std::path::Path, flags: libc::c_uint) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `dir` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::chflags(dir.as_ptr(), flags) }, 0);
+            Self(dir)
+        }
+    }
+    impl Drop for AppendOnly {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe { libc::chflags(self.0.as_ptr(), 0) };
+        }
+    }
+    let tree = Tree::new();
+    let discovered = tree.discover(&addresses(), None).unwrap();
+    let dir = tree.dir.join("append-only");
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("config.json");
+    let _append_only = AppendOnly::set(&dir, libc::UF_APPEND);
+    crate::rediscover::write(&path, &discovered, None, &mut Vec::new()).unwrap();
+    assert_eq!(
+        crate::rediscover::load_existing(&path).unwrap(),
+        Some(discovered.config)
+    );
+}
+
+/// A rediscovery replaces the file whole (a new inode with the full new config and the old
+/// file's permissions), never truncates it in place, and leaves no temp file.
+#[test]
+fn rediscover_replaces_the_file_atomically() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let (tree, path, loaded, discovered) = rediscover_fixture("config.json");
+    let inode = fs::metadata(&path).unwrap().ino();
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    let expected = crate::rediscover::merge(discovered.config.clone(), false, &loaded).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected.to_json());
+    let metadata = fs::metadata(&path).unwrap();
+    assert_ne!(metadata.ino(), inode, "rewritten in place");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(temp_files(&tree.dir, "config.json"), Vec::<String>::new());
+}
+
+/// If the temp file cannot be created (here its name is too long for the file system, even for
+/// root), the write fails and the old bytes stay.
+#[test]
+fn failed_temp_file_leaves_the_old_config() {
+    let name = "c".repeat(250);
+    let (tree, path, loaded, discovered) = rediscover_fixture(&name);
+    let old = fs::read(&path).unwrap();
+    let mut output = Vec::new();
+    assert!(crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).is_err());
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        old,
+        "a failed write changed the old config"
+    );
+    assert_eq!(temp_files(&tree.dir, &name), Vec::<String>::new());
+}
+
+/// Temp files a killed run left behind (under the old fixed name, and under the names this
+/// process would try next, as after pid reuse) do not block the next rediscovery.
+#[test]
+fn leftover_temp_file_does_not_block_rediscover() {
+    let (tree, path, loaded, discovered) = rediscover_fixture("config.json");
+    let next = crate::rediscover::TEMP_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+    let mut leftovers = vec![tree.dir.join(".config.json.tmp")];
+    leftovers.extend((next..next + 8).map(|n| crate::rediscover::temp_path(&path, n)));
+    for leftover in &leftovers {
+        fs::write(leftover, "partial").unwrap();
+    }
+    let mut output = Vec::new();
+    crate::rediscover::write(&path, &discovered, Some(&loaded), &mut output).unwrap();
+    let expected = crate::rediscover::merge(discovered.config.clone(), false, &loaded).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected.to_json());
+    let mut left: Vec<String> = leftovers
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        temp_files(&tree.dir, "config.json"),
+        left,
+        "only the leftovers remain"
+    );
+}

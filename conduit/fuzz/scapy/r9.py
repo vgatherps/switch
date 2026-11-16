@@ -1,6 +1,6 @@
-"""Deterministic exact-tuple SYN regressions; run with two tap-echo listeners.
+"""Deterministic exact-tuple SYN regressions; run with two switch-tap-echo listeners.
 
-../target/debug/tap-echo --listeners 2 -- python3 fuzz/scapy/r9.py
+../target/debug/switch-tap-echo --listeners 2 -- python3 fuzz/scapy/r9.py
 """
 
 import argparse

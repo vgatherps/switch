@@ -2,7 +2,7 @@
 
 Parsing follows the receiver's view smoltcp takes (src/wire/ipv4.rs check_len: IHL >= 5,
 total length >= header, buffer >= total length; TCP payload = IP bytes [IHL*4, total length)),
-so a mutated frame is read the way Zhida reads it. Checksum validity and option parse
+so a mutated frame is read the way switch reads it. Checksum validity and option parse
 errors are reported as fields, not raised, so oracles can name them.
 """
 
@@ -18,7 +18,7 @@ IP_PROTO_TCP = 6
 FIN, SYN, RST, PSH, ACK, URG, ECE, CWR = 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80
 
 OPT_EOL, OPT_NOP, OPT_MSS, OPT_WSCALE, OPT_SACK_PERM, OPT_SACK, OPT_TS = 0, 1, 2, 3, 4, 5, 8
-# Fixed lengths of the option kinds Zhida may emit (RFC 9293, 7323, 2018).
+# Fixed lengths of the option kinds switch may emit (RFC 9293, 7323, 2018).
 OPT_LENGTHS = {OPT_MSS: 4, OPT_WSCALE: 3, OPT_SACK_PERM: 2, OPT_TS: 10}
 
 
@@ -39,34 +39,34 @@ def parse_mac(text):
 
 @dataclass(frozen=True)
 class Env:
-    """Addresses tap-echo hands its tester (crates/tap-echo/src/main.rs tester_env)."""
+    """Addresses switch-tap-echo hands its tester (crates/switch-tap-echo/src/main.rs tester_env)."""
     iface: str
-    zhida_mac: bytes
+    switch_mac: bytes
     tester_mac: bytes
-    zhida_ip: bytes
+    switch_ip: bytes
     tester_ip: bytes
     port: int
 
     @classmethod
     def from_environ(cls, environ):
-        return cls(iface=environ["ZHIDA_IFACE"],
-                   zhida_mac=parse_mac(environ["ZHIDA_MAC"]),
+        return cls(iface=environ["SWITCH_IFACE"],
+                   switch_mac=parse_mac(environ["SWITCH_MAC"]),
                    tester_mac=parse_mac(environ["TESTER_MAC"]),
-                   zhida_ip=socket.inet_aton(environ["ZHIDA_IP"]),
+                   switch_ip=socket.inet_aton(environ["SWITCH_IP"]),
                    tester_ip=socket.inet_aton(environ["TESTER_IP"]),
                    port=int(environ["ECHO_PORT"]))
 
     @property
-    def zhida_mac_str(self):
-        return mac_str(self.zhida_mac)
+    def switch_mac_str(self):
+        return mac_str(self.switch_mac)
 
     @property
     def tester_mac_str(self):
         return mac_str(self.tester_mac)
 
     @property
-    def zhida_ip_str(self):
-        return socket.inet_ntoa(self.zhida_ip)
+    def switch_ip_str(self):
+        return socket.inet_ntoa(self.switch_ip)
 
     @property
     def tester_ip_str(self):
@@ -207,7 +207,7 @@ IP_MF_OFFSET = 0x3FFF
 
 
 def smoltcp_accepts(seg):
-    """True if Zhida's smoltcp hands this parsed segment (parse_tcp already applied the
+    """True if switch's smoltcp hands this parsed segment (parse_tcp already applied the
     IPv4 and TCP length checks) to its sockets: valid IPv4 and TCP checksums (software
     checksums, dpdk-smoltcp port.rs), not a fragment (src/wire/ipv4.rs 557-561, no
     fragmentation feature), and TcpRepr::parse (src/wire/tcp.rs 907-945): ports not 0, at
@@ -332,8 +332,8 @@ class Builder:
         """One Linux-like segment: DF set, TTL 64, IP ID counting up per frame."""
         self.ip_id = (self.ip_id + 1) & 0xFFFF
         e = self.env
-        pkt = (self._Ether(src=e.tester_mac_str, dst=e.zhida_mac_str, type=ETH_P_IP)
-               / self._IP(src=e.tester_ip_str, dst=e.zhida_ip_str, ttl=64, flags="DF",
+        pkt = (self._Ether(src=e.tester_mac_str, dst=e.switch_mac_str, type=ETH_P_IP)
+               / self._IP(src=e.tester_ip_str, dst=e.switch_ip_str, ttl=64, flags="DF",
                           id=self.ip_id)
                / self._TCP(sport=sport, dport=e.port, seq=seq, ack=ack, flags=flags,
                            window=window, options=list(options), urgptr=urgent))

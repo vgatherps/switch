@@ -452,7 +452,7 @@ impl Stack {
         self.set_now(now)?;
         if now >= self.next_service {
             // SAFETY: the Port's owner thread, an EAL lcore.
-            unsafe { zhida_dpdk_sys::rte_timer_manage() };
+            unsafe { switch_dpdk_sys::rte_timer_manage() };
             self.next_service = now + SERVICE_PERIOD;
         }
         let recovered = if self.device.port_mut().reset_pending() {

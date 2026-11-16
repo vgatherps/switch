@@ -1,4 +1,4 @@
-// tap-echo: --close-after 10 --listeners 2
+// switch-tap-echo: --close-after 10 --listeners 2
 // follows Linux v6.12 tcp_timewait_state_process (TCP_TW_SYN)
 // SYN SEQ 5000 is after RCV.NXT 12, allowing reopening without timestamps.
 // The old socket closes and the second listener answers SYN-ACK immediately.

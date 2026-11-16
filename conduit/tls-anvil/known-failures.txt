@@ -1,4 +1,4 @@
-# TLS-Anvil client tests that fail against sheath for reasons outside sheath (make docker-tls-anvil).
+# TLS-Anvil client tests that fail against switch-tls for reasons outside switch-tls (make docker-tls-anvil).
 # <test id> <test>: <reason>. tls-anvil/compare.py fails the run on any failing test not listed here.
 # Baseline: TLS-Anvil 1.5.3 image (pinned in the Makefile), strength 1, rustls 0.23.43 + ring.
 #

@@ -2,9 +2,9 @@
 //! and the connection carries on, including the bytes the reset destroyed.
 
 use dpdk_smoltcp::{port_by_name, port_resets};
-use zhida_dpdk_sys::rte_eth_dev_stop;
-use zhida_test_kit::pair::{drain_bytes, establish, new_pair, pattern, App, Side};
-use zhida_test_kit::with_eal;
+use switch_dpdk_sys::rte_eth_dev_stop;
+use switch_test_kit::pair::{drain_bytes, establish, new_pair, pattern, App, Side};
+use switch_test_kit::with_eal;
 
 /// Less than the 4 KiB socket buffers: each side queues all of it at once.
 const DATA: usize = 3000;
@@ -13,7 +13,7 @@ const DATA: usize = 3000;
 /// the frames it had not sent gone. Then B's PMD reports the reset. B's next turn must reset,
 /// configure and start the port again, once; both sides' data then arrives whole, B's by
 /// retransmission, and every pool is idle at close.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reset_mid_transfer_recovers_and_keeps_the_connection() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rsta", "rstb"]);

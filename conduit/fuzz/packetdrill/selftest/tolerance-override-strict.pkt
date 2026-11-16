@@ -1,4 +1,4 @@
-// Runner self-test: Zhida echoes immediately, but this script expects the echo 15 ms
+// Runner self-test: switch echoes immediately, but this script expects the echo 15 ms
 // later. The 25000-usec default would accept that gap; the 4000-usec override must make
 // packetdrill report a timing error, proving the override reached its invocation.
 // tolerance_usecs: 4000

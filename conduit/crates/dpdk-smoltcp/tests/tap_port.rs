@@ -7,9 +7,9 @@ use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use zhida_test_kit::tap::{ifindex, TapVdev};
-use zhida_test_kit::wire::{in_use, pool_exists};
-use zhida_test_kit::with_eal;
+use switch_test_kit::tap::{ifindex, TapVdev};
+use switch_test_kit::wire::{in_use, pool_exists};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
@@ -17,8 +17,8 @@ use dpdk_smoltcp::smoltcp::wire::{
     UdpPacket, UdpRepr,
 };
 use dpdk_smoltcp::{device_info, port_by_name, Eal, Offloads, Packet, Port, PortConfig, PortError};
-use zhida_buffer::PoolConfig;
-use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
+use switch_buffer::PoolConfig;
+use switch_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
 const PORT_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
 const TESTER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x02];
@@ -58,7 +58,7 @@ fn config(port_id: u16, names: &Names) -> PortConfig<'static> {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn device_info_reports_net_tap_driver_mac_and_mtu_limits() {
     let names = Names {
         vdev: c"net_tap_info",
@@ -93,7 +93,7 @@ fn device_info_reports_net_tap_driver_mac_and_mtu_limits() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn port_by_name_finds_vdev_and_rejects_unknown() {
     let names = Names {
         vdev: c"net_tap_by_name",
@@ -364,7 +364,7 @@ impl KernelSide {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tap_port_exchanges_frames_with_kernel_netdev() {
     let names = Names {
         vdev: c"net_tap_xchg",
@@ -442,7 +442,7 @@ fn tap_port_exchanges_frames_with_kernel_netdev() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tap_port_close_refuses_while_a_received_packet_is_held() {
     let names = Names {
         vdev: c"net_tap_held",
@@ -471,7 +471,7 @@ fn tap_port_close_refuses_while_a_received_packet_is_held() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tap_port_recreates_the_same_vdev_after_uninit() {
     let names = Names {
         vdev: c"net_tap_again",
@@ -522,9 +522,9 @@ fn checksum_profile_opens(names: &Names, offloads: Offloads, expected: (u64, u64
             ..config(tap.port_id(), names)
         };
         let mut port = unsafe { Port::open(eal, config) }.unwrap();
-        let mut conf: zhida_dpdk_sys::rte_eth_conf = unsafe { std::mem::zeroed() };
+        let mut conf: switch_dpdk_sys::rte_eth_conf = unsafe { std::mem::zeroed() };
         assert_eq!(
-            unsafe { zhida_dpdk_sys::rte_eth_dev_conf_get(tap.port_id(), &mut conf) },
+            unsafe { switch_dpdk_sys::rte_eth_dev_conf_get(tap.port_id(), &mut conf) },
             0
         );
         assert_eq!((conf.rxmode.offloads, conf.txmode.offloads), expected);
@@ -546,7 +546,7 @@ fn checksum_profile_opens(names: &Names, offloads: Offloads, expected: (u64, u64
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_checksum_profile_opens() {
     let names = Names {
         vdev: c"net_tap_rxck",
@@ -612,7 +612,7 @@ fn checksum_segment() -> Vec<u8> {
     bytes
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tap_rx_checksum_stages_injected_bad_segment() {
     let names = Names {
         vdev: c"net_tap_rx_bad",
@@ -694,7 +694,7 @@ fn tap_rx_checksum_stages_injected_bad_segment() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_checksum_profile_opens() {
     let names = Names {
         vdev: c"net_tap_txck",
@@ -712,7 +712,7 @@ fn tx_checksum_profile_opens() {
     checksum_profile_opens(&names, offloads, (0, TX_OFFLOAD_TCP_CKSUM));
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_udp_checksum_profile_opens() {
     let names = Names {
         vdev: c"net_tap_txudpck",
@@ -765,7 +765,7 @@ fn checksum_datagram() -> Vec<u8> {
     bytes
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tap_rx_checksum_udp_verdicts() {
     let names = Names {
         vdev: c"net_tap_rx_udpck",

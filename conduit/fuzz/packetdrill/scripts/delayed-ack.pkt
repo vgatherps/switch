@@ -1,5 +1,5 @@
 // tolerance_usecs: 4000
-// Zhida delays the ACK of data it cannot answer with data by 10 ms; a second segment
+// Switch delays the ACK of data it cannot answer with data by 10 ms; a second segment
 // inside those 10 ms does not restart the timer, so one ACK covers both; once more than
 // one MSS of data is unacknowledged it ACKs at once. RFC 9293 3.8.6.3 (SHLD-18/19)
 // allows all three; Linux delays ACKs too, with a longer minimum (TCP_ATO_MIN, 40 ms).
@@ -23,7 +23,7 @@
 //   2. Not restarted: 100 bytes at 0.100 s and 100 more at 0.106 s, one ACK at 0.110 s,
 //      all three absolute, so no packetdrill pause can move the expectation. A timer
 //      restarted by the second segment would fire at or after 0.116 s, at least 6 ms
-//      late, 2 ms outside the tolerance. The second segment must reach Zhida before the
+//      late, 2 ms outside the tolerance. The second segment must reach switch before the
 //      first one's timer fires: 4 ms of slack for its processing lagging the first's.
 //      The 6 ms between them is the whole budget: the restart's lateness and the slack
 //      add up to the 10 ms timer, and the tolerance takes 4 ms of the lateness.

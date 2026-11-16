@@ -12,7 +12,7 @@
 //! it; each ring supports exactly one writer and one reader, ever. Concurrent
 //! initialization through other backing handles or processes is outside the contract.
 
-use netframe::OwnedFrame;
+use switch_frame::OwnedFrame;
 use shared_memory::{Backing, DoubleMapping, Mapping};
 use std::convert::TryFrom;
 use std::io;

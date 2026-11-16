@@ -84,28 +84,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
-name = "binance-feed"
-version = "0.1.0"
-dependencies = [
- "dpdk-smoltcp",
- "rcgen",
- "relay",
- "rustls",
- "serde",
- "serde_json",
- "sheath",
- "switch",
- "switchnet",
- "tap-echo",
- "tungstenite",
- "webpki-roots",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
- "zhida-test-support",
-]
-
-[[package]]
 name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -424,10 +402,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
-name = "depot"
-version = "0.1.0"
-
-[[package]]
 name = "der-parser"
 version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -487,10 +461,10 @@ dependencies = [
  "criterion",
  "libc",
  "smoltcp",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
- "zhida-test-support",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-test-kit",
+ "switch-test-support",
 ]
 
 [[package]]
@@ -742,38 +716,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "junction"
-version = "0.1.0"
-dependencies = [
- "ceph-fifo",
- "ceph-proto",
- "ceph-ring",
- "libc",
- "netframe",
- "shared-memory",
- "slice_ringbuffer",
-]
-
-[[package]]
-name = "junctiond"
-version = "0.1.0"
-dependencies = [
- "ceph-fifo",
- "ceph-proto",
- "ceph-ring",
- "dpdk-smoltcp",
- "junction",
- "libc",
- "slice_ringbuffer",
- "switch",
- "switchnet",
- "zhida-netconf",
- "zhida-open",
- "zhida-test-kit",
- "zhida-test-support",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -823,18 +765,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memif-bench"
-version = "0.1.0"
-dependencies = [
- "dpdk-smoltcp",
- "libc",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
- "zhida-test-support",
-]
-
-[[package]]
 name = "mimalloc"
 version = "0.1.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -848,26 +778,6 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
-name = "netframe"
-version = "0.1.0"
-
-[[package]]
-name = "nic-runner"
-version = "0.1.0"
-dependencies = [
- "binance-feed",
- "dpdk-smoltcp",
- "libc",
- "mimalloc",
- "sockperf-wire",
- "switch",
- "switchnet",
- "zhida-dpdk-sys",
- "zhida-netconf",
- "zhida-open",
-]
 
 [[package]]
 name = "nom"
@@ -1205,27 +1115,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "relay"
-version = "0.1.0"
-dependencies = [
- "data-encoding",
- "httparse",
- "junction",
- "libc",
- "rand 0.10.3",
- "rcgen",
- "rustls",
- "sha1",
- "sheath",
- "switch",
- "switchnet",
- "tap-echo",
- "trybuild",
- "tungstenite",
- "zhida-test-support",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1397,18 +1286,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sheath"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rcgen",
- "rustls",
- "switch",
- "switchnet",
- "zhida-test-support",
-]
-
-[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1430,8 +1307,8 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 name = "slice_ringbuffer"
 version = "0.1.0"
 dependencies = [
- "netframe",
  "shared-memory",
+ "switch-frame",
 ]
 
 [[package]]
@@ -1440,15 +1317,11 @@ version = "0.14.0"
 dependencies = [
  "byteorder",
  "heapless",
- "netframe",
  "rustc-hash",
- "zhida-buffer",
- "zhida-dpdk-sys",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-frame",
 ]
-
-[[package]]
-name = "sockperf-wire"
-version = "0.1.0"
 
 [[package]]
 name = "stable_deref_trait"
@@ -1467,8 +1340,115 @@ name = "switch"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "depot",
+ "switch-depot",
  "switch-macros",
+]
+
+[[package]]
+name = "switch-bench"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "libc",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "switch",
+ "switch-dpdk-sys",
+ "switch-junction",
+ "switch-net",
+ "switch-netconf",
+ "switch-open",
+ "switch-test-support",
+ "switch-ws",
+ "tungstenite",
+]
+
+[[package]]
+name = "switch-binance-feed"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "switch",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-net",
+ "switch-tap-echo",
+ "switch-test-kit",
+ "switch-test-support",
+ "switch-tls",
+ "switch-ws",
+ "tungstenite",
+ "webpki-roots",
+]
+
+[[package]]
+name = "switch-buffer"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "criterion",
+ "proptest",
+ "quickcheck",
+ "quickcheck_macros",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-depot"
+version = "0.1.0"
+
+[[package]]
+name = "switch-dpdk-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "libc",
+ "pkg-config",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-frame"
+version = "0.1.0"
+
+[[package]]
+name = "switch-junction"
+version = "0.1.0"
+dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
+ "libc",
+ "shared-memory",
+ "slice_ringbuffer",
+ "switch-frame",
+]
+
+[[package]]
+name = "switch-junctiond"
+version = "0.1.0"
+dependencies = [
+ "ceph-fifo",
+ "ceph-proto",
+ "ceph-ring",
+ "dpdk-smoltcp",
+ "libc",
+ "slice_ringbuffer",
+ "switch",
+ "switch-junction",
+ "switch-net",
+ "switch-netconf",
+ "switch-open",
+ "switch-test-kit",
+ "switch-test-support",
 ]
 
 [[package]]
@@ -1483,21 +1463,149 @@ dependencies = [
 ]
 
 [[package]]
-name = "switchnet"
+name = "switch-memif-bench"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "libc",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-test-kit",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-net"
 version = "0.1.0"
 dependencies = [
  "ceph-fifo",
  "ceph-ring",
  "criterion",
  "dpdk-smoltcp",
- "junction",
- "junctiond",
  "switch",
- "switchnet",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
- "zhida-test-support",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-junction",
+ "switch-junctiond",
+ "switch-net",
+ "switch-test-kit",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-netconf"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "smoltcp",
+]
+
+[[package]]
+name = "switch-nic"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "libc",
+ "mimalloc",
+ "switch",
+ "switch-binance-feed",
+ "switch-dpdk-sys",
+ "switch-net",
+ "switch-netconf",
+ "switch-open",
+ "switch-sockperf-wire",
+]
+
+[[package]]
+name = "switch-open"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "libc",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-netconf",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-sockperf-wire"
+version = "0.1.0"
+
+[[package]]
+name = "switch-tap-echo"
+version = "0.1.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "libc",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-test-kit",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-test-kit"
+version = "0.0.0"
+dependencies = [
+ "dpdk-smoltcp",
+ "libc",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-test-support"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "proptest",
+ "switch-test-support-macros",
+]
+
+[[package]]
+name = "switch-test-support-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "switch-tls"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rcgen",
+ "rustls",
+ "switch",
+ "switch-net",
+ "switch-test-support",
+]
+
+[[package]]
+name = "switch-ws"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "httparse",
+ "libc",
+ "rand 0.10.3",
+ "rcgen",
+ "rustls",
+ "sha1",
+ "switch",
+ "switch-junction",
+ "switch-net",
+ "switch-tap-echo",
+ "switch-test-support",
+ "switch-tls",
+ "trybuild",
+ "tungstenite",
 ]
 
 [[package]]
@@ -1531,18 +1639,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "tap-echo"
-version = "0.1.0"
-dependencies = [
- "dpdk-smoltcp",
- "libc",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-kit",
- "zhida-test-support",
 ]
 
 [[package]]
@@ -1987,102 +2083,6 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
-
-[[package]]
-name = "zhida-bench"
-version = "0.1.0"
-dependencies = [
- "dpdk-smoltcp",
- "junction",
- "libc",
- "mimalloc",
- "relay",
- "serde",
- "serde_json",
- "switch",
- "switchnet",
- "tungstenite",
- "zhida-dpdk-sys",
- "zhida-netconf",
- "zhida-open",
- "zhida-test-support",
-]
-
-[[package]]
-name = "zhida-buffer"
-version = "0.1.0"
-dependencies = [
- "arbitrary",
- "criterion",
- "proptest",
- "quickcheck",
- "quickcheck_macros",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-support",
-]
-
-[[package]]
-name = "zhida-dpdk-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "cc",
- "libc",
- "pkg-config",
- "zhida-test-support",
-]
-
-[[package]]
-name = "zhida-netconf"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "smoltcp",
-]
-
-[[package]]
-name = "zhida-open"
-version = "0.1.0"
-dependencies = [
- "dpdk-smoltcp",
- "libc",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-netconf",
- "zhida-test-support",
-]
-
-[[package]]
-name = "zhida-test-kit"
-version = "0.0.0"
-dependencies = [
- "dpdk-smoltcp",
- "libc",
- "zhida-buffer",
- "zhida-dpdk-sys",
- "zhida-test-support",
-]
-
-[[package]]
-name = "zhida-test-support"
-version = "0.0.0"
-dependencies = [
- "libc",
- "proptest",
- "zhida-test-support-macros",
-]
-
-[[package]]
-name = "zhida-test-support-macros"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
 
 [[package]]
 name = "zmij"

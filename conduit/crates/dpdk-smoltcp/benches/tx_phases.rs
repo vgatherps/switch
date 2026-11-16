@@ -76,11 +76,11 @@ use dpdk_smoltcp::{
     frame_reserve, rx_reserve, Eal, Sent, TcpHandle, Turn,
 };
 
-use zhida_test_kit::pair::{
+use switch_test_kit::pair::{
     self, establish_sized, pattern, segment, tcp_frame, tcp_socket_sized, Dir, Pair, Side,
     BUDGET, CLIENT_PORT, IDLE_ROUNDS, MAX_ROUNDS, SERVER_PORT, T0,
 };
-use zhida_test_kit::with_eal;
+use switch_test_kit::with_eal;
 
 const WARMUP: usize = 6;
 const RING: u32 = 512;
@@ -351,14 +351,14 @@ fn setup(eal: &Eal, case: Case, id: usize) -> Bench {
             port.tx_pool.count = TX_POOL;
             // The frame reserve, the full-sized-segment estimate for the socket,
             // and the one frame the application holds between allocate and enqueue.
-            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [buffer])) + 1;
+            port.frame_pool.count = switch_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), switch_test_kit::pair::windows(port.mtu, [buffer])) + 1;
             // A's RX pool also holds up to RING - 1 injected ACKs.
-            port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+            port.rx_pool.count = switch_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
                 port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
-            ), zhida_test_kit::pair::windows(port.mtu, [buffer])) + RING;
+            ), switch_test_kit::pair::windows(port.mtu, [buffer])) + RING;
         },
         |side, port| {
             if side == Side::A && case.offload {

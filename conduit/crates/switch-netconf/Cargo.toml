@@ -1,0 +1,14 @@
+[package]
+name = "switch-netconf"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+smoltcp.workspace = true
+
+[lints]
+workspace = true

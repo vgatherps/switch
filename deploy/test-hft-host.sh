@@ -49,13 +49,13 @@ stub systemctl "case \"\$1\" in
     is-enabled) [ -e '$tmp/enabled' ] ;;
     is-active) [ \"\${FAKE_CHRONYD_INACTIVE:-}\" != 1 ] ;;
     enable) touch '$tmp/enabled' ;;
-    reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' && touch '$tmp/unmanaged-before-reboot'
-        cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf' && touch '$tmp/policy-before-reboot'
+    reboot) cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-switch-data.network' && touch '$tmp/unmanaged-before-reboot'
+        cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-switch-kernel-receiver.conf' && touch '$tmp/policy-before-reboot'
         true ;;
     restart) [ \"\${FAKE_NETWORKD_FAIL:-}\" != 1 ] || exit 1
         if [ \"\$2\" = systemd-networkd.service ]; then
-            cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-zhida-data.network' &&
-            cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf' &&
+            cmp -s '$tmp/unmanaged.network' '$root/etc/systemd/network/00-switch-data.network' &&
+            cmp -s '$tmp/networkd-policy.conf' '$root/etc/systemd/networkd.conf.d/90-switch-kernel-receiver.conf' &&
                 touch '$tmp/policy-before-restart'
         fi ;;
 esac"
@@ -77,10 +77,10 @@ stub rpm 'case "$1" in
     -Vf) echo ".......T. /lib/modules/$(uname -r)/modules.builtin.alias.bin"; exit 1 ;;
     *) exit 1 ;;
 esac'
-# zhida-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
+# switch-netconf: discover writes pretty JSON with rx_timestamps false (as the real one does); check
 # prints the field as the real one does, or fails without the file; bind moves the data device to
 # vfio-pci.
-stub zhida-netconf "case \"\$1\" in
+stub switch-netconf "case \"\$1\" in
     discover) printf '{\\n  \"version\": 1,\\n  \"rx_timestamps\": false,\\n  \"descriptors\": 1024\\n}\\n' >\"\$6\" ;;
     check) [ -f \"\$2\" ] && sed -n 's/^  \"rx_timestamps\": \\(.*\\),\$/rx_timestamps: \\1/p' \"\$2\" || exit 1
         # The real summary has more lines after rx_timestamps; a long one fails its writes
@@ -88,7 +88,7 @@ stub zhida-netconf "case \"\$1\" in
         [ -z \"\${FAKE_CHECK_LONG:-}\" ] || yes '  summary line' | head -n 100000 ;;
     bind) ln -sfn ../../drivers/vfio-pci '$root/sys/bus/pci/devices/0000:00:06.0/driver' ;;
 esac"
-stub zhida-nic "echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489'"
+stub switch-nic "echo 'switch-nic: hugepages: hugepages-2048kB used=23 free=489'"
 export PATH="$stubs:$PATH"
 
 nic() { # name pci mac driver
@@ -133,7 +133,7 @@ host() {
     cp "$tmp/sources-phc" "$root/sources"
     # /opt/dpdk as this script builds it: 25.11.3 with the ENA read_clock patch.
     mkdir -p "$root/opt/dpdk/share"
-    echo "$dpdk_stamp" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
+    echo "$dpdk_stamp" >"$root/opt/dpdk/share/switch-dpdk.stamp"
     for irq in 10 11 12; do
         mkdir -p "$root/proc/irq/$irq"
         echo 0-7 >"$root/proc/irq/$irq/smp_affinity_list"
@@ -158,7 +158,7 @@ reboot() {
     # irqaffinity= puts the IRQs on the housekeeping CPUs at boot.
     for irq in 10 11 12; do echo 0-5 >"$root/proc/irq/$irq/effective_affinity_list"; done
     # Model networkd's next boot: without the MAC-matched unmanaged file, data DHCP wins.
-    if cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-zhida-data.network"; then
+    if cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-switch-data.network"; then
         echo 'default via 10.0.0.1 dev ens5 proto dhcp metric 512' >"$tmp/routes"
     else
         echo 'default via 10.0.0.1 dev ens6 proto dhcp metric 100' >"$tmp/routes"
@@ -171,7 +171,7 @@ run() { # mode [args]
 status_is() { [ "$(cat "$tmp/status")" = "$1" ]; }
 has() { grep -q "^$1: $2" "$tmp/out"; }
 called() { grep -q -- "$1" "$calls" 2>/dev/null; }
-env_has() { grep -qx "$1" "$root/etc/zhida/host.env"; }
+env_has() { grep -qx "$1" "$root/etc/switch/host.env"; }
 
 # vfio-pci is already patched on the fake host so apply does not build it (that path downloads
 # amzn-drivers); the reboot then only applies the command line.
@@ -189,30 +189,30 @@ check "kernel receiver persists Linux ENA mode" env_has DATA_DRIVER=ena
 check "kernel receiver stages the data ENI unmanaged before reboot" test -e "$tmp/unmanaged-before-reboot"
 check "kernel receiver installs policy drop-in before reboot" test -e "$tmp/policy-before-reboot"
 check "kernel receiver does not restart networkd before a requested reboot" sh -c "! grep -q '^systemctl restart systemd-networkd.service' '$calls'"
-check "kernel receiver apply never binds or unbinds" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+check "kernel receiver apply never binds or unbinds" sh -c "! grep -q 'switch-netconf bind\\|switch-netconf unbind' '$calls'"
 reboot
 run boot
 check "kernel receiver boot succeeds" status_is 0
 check "kernel receiver boot keeps data ENI on ena" test "$(basename "$(readlink "$root/sys/bus/pci/devices/0000:00:06.0/driver")")" = ena
-check "kernel receiver boot leaves NIC binding alone" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+check "kernel receiver boot leaves NIC binding alone" sh -c "! grep -q 'switch-netconf bind\\|switch-netconf unbind' '$calls'"
 check "kernel receiver boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5" "$root/proc/irq/10/smp_affinity_list"
 run verify
 check "kernel receiver verifies on ena without VFIO" status_is 0
 check "kernel receiver verify reports its actual driver" has data "ok 0000:00:06.0 (0a:00:00:00:00:06) on ena"
 check "kernel receiver verify does not claim VFIO is loaded" has vfio_wc "ok not required for kernel receiver"
-rm "$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf"
+rm "$root/etc/systemd/networkd.conf.d/90-switch-kernel-receiver.conf"
 : >"$calls"
 run apply --kernel-receiver
 check "kernel receiver no-reboot apply succeeds" status_is 0
 check "no-reboot apply installs policy before restarting networkd" test -e "$tmp/policy-before-restart"
 check "no-reboot apply restarts networkd to activate policy" called "systemctl restart systemd-networkd.service"
-check "no-reboot apply does not bind or unbind" sh -c "! grep -q 'zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+check "no-reboot apply does not bind or unbind" sh -c "! grep -q 'switch-netconf bind\\|switch-netconf unbind' '$calls'"
 : >"$calls"
 # POSIX shells may retain assignments preceding function calls; scope one-shot faults explicitly.
 (FAKE_NETWORKD_FAIL=1 run apply --kernel-receiver)
 check "networkd restart failure stops kernel receiver setup" status_is 1
 check "networkd restart failure is reported" has networkd_policy "FAIL cannot restart systemd-networkd"
-check "networkd restart failure does not flush or bind" sh -c "! grep -q 'flush\\|zhida-netconf bind\\|zhida-netconf unbind' '$calls'"
+check "networkd restart failure does not flush or bind" sh -c "! grep -q 'flush\\|switch-netconf bind\\|switch-netconf unbind' '$calls'"
 check "networkd failure injection does not escape its scenario" test -z "${FAKE_NETWORKD_FAIL:-}"
 ln -sfn ../../drivers/vfio-pci "$root/sys/bus/pci/devices/0000:00:06.0/driver"
 run verify
@@ -221,20 +221,20 @@ check "kernel receiver verify rejects a non-ena data driver" has data "FAIL 0000
 fresh_apply
 check "first apply reboots (exit 100) for the command line" status_is 100
 check "the reboot is requested" called "systemctl reboot"
-check "DPDK setup does not install kernel receiver policy" test ! -e "$root/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf"
+check "DPDK setup does not install kernel receiver policy" test ! -e "$root/etc/systemd/networkd.conf.d/90-switch-kernel-receiver.conf"
 check "DPDK setup does not restart networkd" sh -c "! grep -q '^systemctl restart systemd-networkd.service' '$calls'"
 check "the exact MAC-matched unmanaged config exists when reboot is requested" test -e "$tmp/unmanaged-before-reboot"
 check "staging reloads networkd before reboot" called "networkctl reload"
 check "grubby gets every argument" grep -qx "$want_args" "$tmp/grubby"
 check "management is the lowest-metric default route" env_has MGMT_IF=ens5
-check "data is the other ena interface" sh -c "grep -qx DATA_IF=ens6 '$root/etc/zhida/host.env' && grep -qx DATA_PCI=0000:00:06.0 '$root/etc/zhida/host.env'"
-check "two distinct CPUs are saved and isolated, highest remains app" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx JUNCTION_CPU=6 '$root/etc/zhida/host.env' && grep -qx ISOLATED=6,7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3,4,5 '$root/etc/zhida/host.env'"
-check "deployment builds the daemon crate" called "cargo build -q --release --locked -p nic-runner -p zhida-netconf -p junctiond"
-check "deployment installs the daemon binary" called "target/release/junctiond /usr/local/bin/"
-check "the config comes from zhida-netconf discover --aws on the data ENI" called "zhida-netconf discover --interface ens6 --aws -o $root/etc/zhida/dut.json"
-check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
-check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/zhida-hft-host boot' '$root/etc/systemd/system/zhida-host.service' && [ -e '$tmp/enabled' ]"
-check "no interface is flushed or bound before the reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+check "data is the other ena interface" sh -c "grep -qx DATA_IF=ens6 '$root/etc/switch/host.env' && grep -qx DATA_PCI=0000:00:06.0 '$root/etc/switch/host.env'"
+check "two distinct CPUs are saved and isolated, highest remains app" sh -c "grep -qx APP_CPU=7 '$root/etc/switch/host.env' && grep -qx JUNCTION_CPU=6 '$root/etc/switch/host.env' && grep -qx ISOLATED=6,7 '$root/etc/switch/host.env' && grep -qx HOUSEKEEPING=0,1,2,3,4,5 '$root/etc/switch/host.env'"
+check "deployment builds the daemon crate" called "cargo build -q --release --locked -p switch-nic -p switch-netconf -p switch-junctiond"
+check "deployment installs the daemon binary" called "target/release/switch-junctiond /usr/local/bin/"
+check "the config comes from switch-netconf discover --aws on the data ENI" called "switch-netconf discover --interface ens6 --aws -o $root/etc/switch/dut.json"
+check "the host config keeps rx_timestamps as discovered (false)" grep -qx '  "rx_timestamps": false,' "$root/etc/switch/dut.json"
+check "the boot unit is installed and enabled" sh -c "grep -q 'ExecStart=/usr/local/sbin/switch-hft-host boot' '$root/etc/systemd/system/switch-host.service' && [ -e '$tmp/enabled' ]"
+check "no interface is flushed or bound before the reboot" sh -c "! grep -q 'flush\|switch-netconf bind' '$calls'"
 # chronyd exits at start on a PHC refclock it cannot open: before the reboot there is no
 # /dev/ptp_ena, so apply leaves chrony.conf alone.
 check "apply leaves chrony.conf alone" sh -c "! grep -q '^refclock' '$root/etc/chrony.conf' && ! grep -q '^systemctl restart chronyd' '$calls'"
@@ -243,10 +243,10 @@ check "apply enables chronyd" called "systemctl enable -q chronyd.service"
 reboot
 HFT_ROOT=$root sh "$script" boot >"$tmp/out" 2>&1
 echo $? >"$tmp/status"
-check "boot (zhida-host.service) succeeds" status_is 0
-check "boot makes the data ENI unmanaged by MAC" grep -qx "MACAddress=0a:00:00:00:00:06" "$root/etc/systemd/network/00-zhida-data.network"
+check "boot (switch-host.service) succeeds" status_is 0
+check "boot makes the data ENI unmanaged by MAC" grep -qx "MACAddress=0a:00:00:00:00:06" "$root/etc/systemd/network/00-switch-data.network"
 check "boot flushes the data ENI and only it" sh -c "grep -q 'ip addr flush dev ens6' '$calls' && ! grep -q 'dev ens5' '$calls'"
-check "boot binds with --noiommu (no IOMMU groups)" called "zhida-netconf bind $root/etc/zhida/dut.json --noiommu"
+check "boot binds with --noiommu (no IOMMU groups)" called "switch-netconf bind $root/etc/switch/dut.json --noiommu"
 check "boot moves IRQs to housekeeping" grep -qx "0,1,2,3,4,5" "$root/proc/irq/10/smp_affinity_list"
 check "boot stops irqbalance" called "systemctl disable --now -q irqbalance.service"
 check "boot with /dev/ptp_ena adds AWS's PHC refclock line after AL2023's NTP server" sh -c "[ \"\$(tail -n 1 '$root/etc/chrony.conf')\" = 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' ] && grep -qx 'server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4' '$root/etc/chrony.conf'"
@@ -281,11 +281,11 @@ check "apply after the reboot needs no reboot and succeeds" status_is 0
 check "a second apply does not rerun grubby" sh -c "! grep -q '^grubby --update' '$calls'"
 check "a bound data ENI is not rediscovered" sh -c "! grep -q 'discover' '$calls'"
 check "apply reports the data ENI as already bound" has interfaces "ok management ens5; data 0000:00:06.0 (0a:00:00:00:00:06) already on vfio-pci"
-cp "$root/etc/zhida/host.env" "$tmp/host.env"
+cp "$root/etc/switch/host.env" "$tmp/host.env"
 : >"$calls"
 run apply --kernel-receiver
 check "kernel receiver apply refuses a vfio-bound data ENI" sh -c "[ \$(cat '$tmp/status') = 1 ] && grep -q '^interfaces: FAIL data 0000:00:06.0 is on vfio-pci' '$tmp/out'"
-check "the refused kernel receiver apply leaves host.env and the binding alone" sh -c "cmp -s '$tmp/host.env' '$root/etc/zhida/host.env' && ! grep -q '^zhida-netconf\\|^networkctl\\|^systemctl\\|^grubby' '$calls'"
+check "the refused kernel receiver apply leaves host.env and the binding alone" sh -c "cmp -s '$tmp/host.env' '$root/etc/switch/host.env' && ! grep -q '^switch-netconf\\|^networkctl\\|^systemctl\\|^grubby' '$calls'"
 check "an unchanged unmanaged config does not reload networkd" sh -c "! grep -q '^networkctl reload' '$calls'"
 check "an unchanged chrony.conf keeps one refclock line and no restart" sh -c "[ \$(grep -c '^refclock PHC' '$root/etc/chrony.conf') = 1 ] && ! grep -q '^systemctl restart chronyd' '$calls'"
 sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
@@ -293,11 +293,11 @@ sed -i.bak '/^refclock PHC/d' "$root/etc/chrony.conf"
 run apply
 check "apply's boot restores a removed refclock line with /dev/ptp_ena present and restarts chronyd" sh -c "grep -q '^systemctl restart chronyd.service' '$calls' && grep -qx 'refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer' '$root/etc/chrony.conf'"
 
-rm "$root/etc/systemd/network/00-zhida-data.network"
+rm "$root/etc/systemd/network/00-switch-data.network"
 : >"$calls"
 run apply
 check "no-reboot reapply restores a missing unmanaged config" status_is 0
-check "no-reboot reapply writes the exact MAC-matched config" cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-zhida-data.network"
+check "no-reboot reapply writes the exact MAC-matched config" cmp -s "$tmp/unmanaged.network" "$root/etc/systemd/network/00-switch-data.network"
 check "no-reboot reapply reloads networkd for the restored config" called "networkctl reload"
 check "restoring unmanaged config does not request a reboot" sh -c "! grep -q '^systemctl reboot' '$calls'"
 
@@ -320,24 +320,24 @@ cp "$tmp/sources-phc" "$root/sources"
 check "verify sees management on its kernel driver with the default route" has management "ok ens5 on ena with the default route"
 check "verify reports no run yet" has pools "ok no run logged yet"
 
-mkdir -p "$root/var/log/zhida"
-echo 'zhida-nic: hugepages: hugepages-2048kB used=600 free=0' >"$root/var/log/zhida/binance.log"
+mkdir -p "$root/var/log/switch"
+echo 'switch-nic: hugepages: hugepages-2048kB used=600 free=0' >"$root/var/log/switch/binance.log"
 run verify
 check "a run that took more pages than reserved fails" has pools "FAIL last run took 600"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance refuses while verify fails" sh -c "[ $? = 1 ] && ! grep -q '^zhida-nic ' '$calls'"
-echo 'zhida-nic: hugepages: hugepages-2048kB used=23 free=489' >>"$root/var/log/zhida/binance.log"
+check "run-binance refuses while verify fails" sh -c "[ $? = 1 ] && ! grep -q '^switch-nic ' '$calls'"
+echo 'switch-nic: hugepages: hugepages-2048kB used=23 free=489' >>"$root/var/log/switch/binance.log"
 run verify
 check "the last run's own report is what counts" has pools "ok last run took 23 of 512"
 : >"$calls"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance pins zhida-nic feed to the app CPU with its own config" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
-check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/zhida/binance.json"
-check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/zhida/binance.json' | cmp -s - '$root/etc/zhida/dut.json'"
-check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/zhida/dut.json"
+check "run-binance pins switch-nic feed to the app CPU with its own config" called "taskset -c 7 switch-nic --config $root/etc/switch/binance.json feed --seconds 5"
+check "run-binance's config asks for hardware RX timestamps" grep -qx '  "rx_timestamps": true,' "$root/etc/switch/binance.json"
+check "and is the host config otherwise" sh -c "sed 's/\"rx_timestamps\": true/\"rx_timestamps\": false/' '$root/etc/switch/binance.json' | cmp -s - '$root/etc/switch/dut.json'"
+check "the host config is left as discovered" grep -qx '  "rx_timestamps": false,' "$root/etc/switch/dut.json"
 : >"$calls"
 FAKE_CHECK_LONG=1 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
-check "run-binance starts when check's summary outlives an early-exiting reader" called "taskset -c 7 zhida-nic --config $root/etc/zhida/binance.json feed --seconds 5"
+check "run-binance starts when check's summary outlives an early-exiting reader" called "taskset -c 7 switch-nic --config $root/etc/switch/binance.json feed --seconds 5"
 # The feed compares CLOCK_REALTIME with PHC stamps: without the PHC selected it refuses, although
 # verify passes (no PHC device).
 mv "$root/dev/ptp_ena" "$tmp/ptp_ena"
@@ -348,12 +348,12 @@ check "run-binance refuses without the PHC selected and says to use a precision-
 mv "$tmp/ptp_ena" "$root/dev/ptp_ena"
 cp "$tmp/sources-phc" "$root/sources"
 # A config whose rx_timestamps line is not netconf's format cannot be turned on: refuse.
-cp "$root/etc/zhida/dut.json" "$tmp/dut"
-printf '{"version": 1, "rx_timestamps": false}\n' >"$root/etc/zhida/dut.json"
+cp "$root/etc/switch/dut.json" "$tmp/dut"
+printf '{"version": 1, "rx_timestamps": false}\n' >"$root/etc/switch/dut.json"
 : >"$calls"
 HFT_ROOT=$root bash "$here/run-binance.sh" --seconds 5 >"$tmp/out" 2>&1
 check "run-binance refuses when rx_timestamps cannot be set" sh -c "[ $? = 1 ] && grep -q 'not starting' '$tmp/out' && ! grep -q '^taskset' '$calls'"
-cp "$tmp/dut" "$root/etc/zhida/dut.json"
+cp "$tmp/dut" "$root/etc/switch/dut.json"
 
 echo 7 >"$root/proc/irq/11/effective_affinity_list"
 ln -sfn ../../drivers/ena "$root/sys/bus/pci/devices/0000:00:06.0/driver"
@@ -383,24 +383,24 @@ printf '%s\n' 'default via 10.0.0.1 dev ens6 metric 100' >"$tmp/routes"
 run boot
 check "boot refuses when the default route moved" has unmanaged "FAIL default route moved from ens5 to ens6"
 check "a changed management route exits unsuccessfully" status_is 1
-check "and neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|zhida-netconf bind' '$calls'"
+check "and neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|switch-netconf bind' '$calls'"
 
 stub networkctl 'exit 1'
 fresh_apply
 check "a failed staging reload fails apply" status_is 1
 check "the staging reload failure is reported" has unmanaged "FAIL networkctl reload failed"
-check "a failed staging reload neither reboots nor touches an interface" sh -c "! grep -q 'systemctl reboot\|flush\|zhida-netconf bind' '$calls'"
+check "a failed staging reload neither reboots nor touches an interface" sh -c "! grep -q 'systemctl reboot\|flush\|switch-netconf bind' '$calls'"
 stub networkctl ""
 
 fresh_apply
 reboot
-rm "$root/etc/systemd/network/00-zhida-data.network"
-mkdir "$root/etc/systemd/network/00-zhida-data.network"
+rm "$root/etc/systemd/network/00-switch-data.network"
+mkdir "$root/etc/systemd/network/00-switch-data.network"
 : >"$calls"
 run boot
 check "an unwritable unmanaged config fails boot" status_is 1
 check "the config write failure is reported" has unmanaged "FAIL cannot write"
-check "a failed config write neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|zhida-netconf bind' '$calls'"
+check "a failed config write neither reloads networkd nor touches an interface" sh -c "! grep -q 'networkctl reload\|flush\|switch-netconf bind' '$calls'"
 
 host
 echo 6,7 >"$root/sys/devices/system/cpu/cpu7/topology/thread_siblings_list"
@@ -409,7 +409,7 @@ echo 4,5 >"$root/sys/devices/system/cpu/cpu5/topology/thread_siblings_list"
 echo 4,5 >"$root/sys/devices/system/cpu/cpu4/topology/thread_siblings_list"
 : >"$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci/vfio-pci-core.ko.xz_no_wc"
 run apply
-check "junction skips app SMT sibling and isolates both cores" sh -c "grep -qx APP_CPU=7 '$root/etc/zhida/host.env' && grep -qx JUNCTION_CPU=5 '$root/etc/zhida/host.env' && grep -qx ISOLATED=4,5,6,7 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,2,3 '$root/etc/zhida/host.env'"
+check "junction skips app SMT sibling and isolates both cores" sh -c "grep -qx APP_CPU=7 '$root/etc/switch/host.env' && grep -qx JUNCTION_CPU=5 '$root/etc/switch/host.env' && grep -qx ISOLATED=4,5,6,7 '$root/etc/switch/host.env' && grep -qx HOUSEKEEPING=0,1,2,3 '$root/etc/switch/host.env'"
 
 host
 echo 6,7 >"$root/sys/devices/system/node/node0/cpulist"
@@ -426,7 +426,7 @@ check "two cores without housekeeping are refused" has cpus "FAIL no housekeepin
 host
 echo 2-3 >"$root/sys/devices/system/node/node0/cpulist"
 run apply
-check "both selected CPUs stay on the data NUMA node" sh -c "grep -qx APP_CPU=3 '$root/etc/zhida/host.env' && grep -qx JUNCTION_CPU=2 '$root/etc/zhida/host.env' && grep -qx HOUSEKEEPING=0,1,4,5,6,7 '$root/etc/zhida/host.env'"
+check "both selected CPUs stay on the data NUMA node" sh -c "grep -qx APP_CPU=3 '$root/etc/switch/host.env' && grep -qx JUNCTION_CPU=2 '$root/etc/switch/host.env' && grep -qx HOUSEKEEPING=0,1,4,5,6,7 '$root/etc/switch/host.env'"
 
 host
 : >"$root/lib/modules/6.1.0-test/kernel/drivers/vfio/pci/vfio-pci-core.ko.xz_no_wc"
@@ -474,10 +474,10 @@ host
 run build
 check "a patched DPDK is not rebuilt" sh -c "! grep -q 'curl.*dpdk-25.11.3.tar.xz' '$calls'"
 check "build names the patch" has dpdk "ok 25.11.3 with dpdk-ena-read-clock.patch"
-rm "$root/opt/dpdk/share/zhida-dpdk.stamp"
+rm "$root/opt/dpdk/share/switch-dpdk.stamp"
 run build
 check "a stock DPDK (pkg-config says 25.11.3, no stamp) is rebuilt" called "curl --fail --location --retry 2 -s -o $root/var/tmp/dpdk-25.11.3.tar.xz https://fast.dpdk.org/rel/dpdk-25.11.3.tar.xz"
-echo "dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490 patch 0000" >"$root/opt/dpdk/share/zhida-dpdk.stamp"
+echo "dpdk-25.11.3 3719acc586b310c4f60ba230683bf4f1e12c6f2f5bee11f7c01b1bbd0ded7490 patch 0000" >"$root/opt/dpdk/share/switch-dpdk.stamp"
 : >"$calls"
 run build
 check "a DPDK built with another patch is rebuilt" called "curl .*dpdk-25.11.3.tar.xz"
@@ -508,7 +508,7 @@ run apply
 check "official 6.18 apply reboots for cmdline, not a VFIO rebuild" status_is 100
 check "native WC needs no kernel-devel or amzn-drivers download" sh -c "! grep -q 'kernel-devel\|amzn-drivers' '$calls'"
 check "native WC checks RPM ownership and the module's own digest" sh -c "grep -q '^rpm -qf ' '$calls' && grep -q 'FILEDIGESTALGO' '$calls' && grep -q 'FILEDIGESTS' '$calls'"
-check "native apply does not touch the data ENI before reboot" sh -c "! grep -q 'flush\|zhida-netconf bind' '$calls'"
+check "native apply does not touch the data ENI before reboot" sh -c "! grep -q 'flush\|switch-netconf bind' '$calls'"
 reboot
 run boot
 check "native WC resumes host setup after reboot" status_is 0

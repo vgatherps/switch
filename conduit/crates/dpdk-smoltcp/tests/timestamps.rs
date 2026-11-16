@@ -1,6 +1,6 @@
 //! Stack connections omit TCP timestamps; caller time still controls timers.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
@@ -9,8 +9,8 @@ use dpdk_smoltcp::smoltcp::wire::{
     TcpRepr, TcpSeqNumber, TcpTimestampRepr,
 };
 
-use zhida_test_kit::{pair, wire, with_eal};
-use zhida_test_kit::ring_port::arp;
+use switch_test_kit::{pair, wire, with_eal};
+use switch_test_kit::ring_port::arp;
 use pair::{ceil_ms, config, segment, tcp_socket_sized, Dir, Pair, Side, CLIENT_PORT, SERVER_PORT, T0};
 use wire::Verdict;
 
@@ -110,7 +110,7 @@ fn exchange(pair: &mut Pair, handles: &[TcpHandle; 2], at: [Instant; 2]) -> Vec<
     round(pair, at)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_connections_never_negotiate_timestamps() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["tsna", "tsnb"], [config(Side::A), config(Side::B)], T0);
@@ -142,7 +142,7 @@ fn timer_segments(stamps: Vec<Stamp>) -> Vec<(Dir, TcpControl, usize)> {
         .collect()
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn caller_time_controls_retransmission_and_delayed_ack() {
     with_eal(|eal| {
         // Timers use the full caller time, including times beyond 2^32 ms.
@@ -191,7 +191,7 @@ fn caller_time_controls_retransmission_and_delayed_ack() {
 }
 
 /// A peer offers timestamps in its SYN, then completes the connection.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_declines_peer_timestamp_offer() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["tspa", "tspb"], [config(Side::A), config(Side::B)], T0);

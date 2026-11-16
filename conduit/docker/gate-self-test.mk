@@ -1,4 +1,4 @@
-# Fixtures for `make docker-gate-self-test`, run as `make -f` in the Zhida
+# Fixtures for `make docker-gate-self-test`, run as `make -f` in the switch
 # container. Each goal is one stuck step followed by another, like `make test`.
 # hang: a step with no bound of its own never ends.
 # term: a step bounded like the real ones runs until the self-test, once it has

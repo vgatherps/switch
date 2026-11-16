@@ -11,7 +11,7 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{Port, Stack, StackConfig, StackError, DEFAULT_NEIGHBOR_CAPACITY};
 
-use zhida_test_kit::{ring_port, with_eal};
+use switch_test_kit::{ring_port, with_eal};
 use ring_port::{arp, RingPort};
 
 const OURS: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
@@ -101,7 +101,7 @@ fn arp_replies(stack: &mut Stack, fixture: &RingPort, targets: &[Ipv4Address]) -
 /// `count` owned single addresses with a neighbour (not owned) after each: every owned address
 /// gets one ARP reply sent from it, no neighbour gets one, at 1, 50, 500, 1000 and 4096 owned
 /// addresses.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn arp_reply_for_every_owned_address_none_for_neighbours() {
     with_eal(|eal| {
         let subnet = Ipv4Cidr::new(OUR_IP, 16);
@@ -125,7 +125,7 @@ fn arp_reply_for_every_owned_address_none_for_neighbours() {
 
 /// Duplicate, overlapping and adjacent entries merge into one set: both ends of each merged
 /// range answer, the addresses just outside do not.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn merged_ranges_answer_at_their_edges_only() {
     with_eal(|eal| {
         let owned: Vec<Ipv4Cidr> = ["10.0.0.32/28", "10.0.0.40/32", "10.0.0.40/32", "10.0.0.48/28", "10.0.0.100/32"]
@@ -166,7 +166,7 @@ fn echo_request(dst_addr: Ipv4Address) -> Vec<u8> {
 
 /// An echo request to an owned address, in or outside the subnet, is answered from that
 /// address; one to a neighbour gets nothing.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn icmp_echo_reply_comes_from_the_owned_address() {
     with_eal(|eal| {
         let in_subnet = Ipv4Address::new(10, 0, 0, 77);
@@ -200,7 +200,7 @@ fn icmp_echo_reply_comes_from_the_owned_address() {
 
 /// `Stack::new` refuses an owned set holding a non-unicast address, the gateway, the subnet
 /// broadcast or a prefix with host bits set, and returns the Port untouched.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_new_validates_owned_addresses() {
     with_eal(|eal| {
         let fixture = RingPort::new("ownvalid", 16, 16);
@@ -234,11 +234,11 @@ fn stack_new_validates_owned_addresses() {
 /// changes nothing: a closed socket stays closed with its endpoint, window target and transmit
 /// capacity; a listening socket keeps listening on its owned address. A peer then connects to that
 /// owned address and the connection's local endpoint is it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn listen_refuses_unowned_address_and_accepts_on_owned() {
     use dpdk_smoltcp::smoltcp::socket::tcp::{ListenError, State};
     use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint};
-    use zhida_test_kit::pair::{self, tcp_socket_sized, App, Pair, Side};
+    use switch_test_kit::pair::{self, tcp_socket_sized, App, Pair, Side};
 
     with_eal(|eal| {
         let owned_ip = Ipv4Address::new(10, 0, 0, 77);

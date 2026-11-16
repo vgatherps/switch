@@ -1,9 +1,9 @@
-use zhida_test_kit::pair::drain_bytes;
-use zhida_test_kit::many;
-use zhida_test_kit::pair::{self, pool_count, tcp_socket_sized, windows, Pair, Side, T0};
-use zhida_test_kit::peers;
-use zhida_test_kit::ring_port::{arp, RingPort};
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::drain_bytes;
+use switch_test_kit::many;
+use switch_test_kit::pair::{self, pool_count, tcp_socket_sized, windows, Pair, Side, T0};
+use switch_test_kit::peers;
+use switch_test_kit::ring_port::{arp, RingPort};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -69,7 +69,7 @@ fn reconnect(eal: &Eal, p: usize, neighbor_capacity: usize) -> [(usize, Duration
     [first, second]
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn nine_on_link_peers_keep_their_entries() {
     with_eal(|eal| {
         let [first, second] = reconnect(eal, 9, DEFAULT_NEIGHBOR_CAPACITY);
@@ -79,7 +79,7 @@ fn nine_on_link_peers_keep_their_entries() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn neighbor_capacity_bounds_the_cache() {
     with_eal(|eal| {
         let [first, second] = reconnect(eal, 5, 4);
@@ -90,7 +90,7 @@ fn neighbor_capacity_bounds_the_cache() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn established_connection_uses_changed_peer_mac() {
     with_eal(|eal| {
         let mut pair = Pair::new(
@@ -173,7 +173,7 @@ fn established_connection_uses_changed_peer_mac() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn zero_neighbor_capacity_is_invalid_config() {
     with_eal(|eal| {
         let fixture = RingPort::new("nbrzero", 16, 16);
@@ -220,7 +220,7 @@ fn gateway_pair(eal: &Eal, names: [&str; 2]) -> Pair {
     Pair::new(eal, names, [a, pair::config(Side::B)], T0)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn resolve_gateway_sends_one_request_then_mac_after_reply() {
     with_eal(|eal| {
         let mut pair = gateway_pair(eal, ["nbrresa", "nbrresb"]);
@@ -237,7 +237,7 @@ fn resolve_gateway_sends_one_request_then_mac_after_reply() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn resolve_gateway_stale_entry_returns_mac_and_owes_probe() {
     with_eal(|eal| {
         let mut pair = gateway_pair(eal, ["nbrstalea", "nbrstaleb"]);
@@ -262,7 +262,7 @@ fn resolve_gateway_stale_entry_returns_mac_and_owes_probe() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn resolve_gateway_respects_one_second_silence() {
     with_eal(|eal| {
         let mut pair = gateway_pair(eal, ["nbrsila", "nbrsilb"]);
@@ -292,7 +292,7 @@ fn resolve_gateway_respects_one_second_silence() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn resolve_gateway_without_gateway_is_no_route() {
     with_eal(|eal| {
         let mut pair = Pair::new(

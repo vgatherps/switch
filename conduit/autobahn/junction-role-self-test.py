@@ -18,7 +18,7 @@ args = sys.argv[1:]
 assert args[0] == "-c"
 cpu, binary, args = args[1], Path(args[2]).name, args[3:]
 root = Path(os.environ["TEST_ROOT"])
-if binary == "junctiond":
+if binary == "switch-junctiond":
     assert cpu == "3"
     assert args[args.index("--control-cpus") + 1] == "4"
     sock = socket.socket(socket.AF_UNIX)
@@ -31,7 +31,7 @@ if binary == "junctiond":
     while True:
         time.sleep(.01)
 else:
-    assert binary == "relay-autobahn" and cpu == "4"
+    assert binary == "switch-ws-autobahn" and cpu == "4"
     assert args[args.index("--backend") + 1] == "junction"
     assert Path(args[args.index("--junction-socket") + 1]).is_socket()
     (root / "finished").write_text("yes")
@@ -53,8 +53,8 @@ for app, host, success in [(0, 0, True), (7, 0, False), (0, 9, False)]:
         )
         assert (result.returncode == 0) == success, result
         assert (root / "stopped").exists(), result
-        assert f"relay-autobahn exit {app}" in result.stderr, result
-        assert f"junctiond exit {host}" in result.stderr, result
+        assert f"switch-ws-autobahn exit {app}" in result.stderr, result
+        assert f"switch-junctiond exit {host}" in result.stderr, result
 
 # Exercise make's actual expanded dispatch, including a failing server.
 dry = subprocess.run(

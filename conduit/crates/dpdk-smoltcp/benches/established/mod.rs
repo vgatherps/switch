@@ -10,7 +10,7 @@ use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{EthernetFrame, EthernetProtocol, TcpControl, TCP_HEADER_LEN};
 use dpdk_smoltcp::Turn;
 
-use zhida_test_kit::pair::{establish_sized, pattern, segment, App, Dir, Pair, Side, BUDGET};
+use switch_test_kit::pair::{establish_sized, pattern, segment, App, Dir, Pair, Side, BUDGET};
 
 /// Frames per TCP round: the Pair ports' RX burst, so B takes them in one turn.
 pub const SEGMENTS: usize = 8;

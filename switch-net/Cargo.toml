@@ -1,0 +1,37 @@
+[package]
+name = "switch-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Module `testkit`: a Net on a net_tap Port for Docker tests and drivers against kernel peers.
+testkit = ["dep:switch-test-kit", "dep:switch-buffer", "dep:switch-dpdk-sys", "dep:switch-junctiond", "dep:ceph-fifo", "dep:ceph-ring", "switch-junction/testkit"]
+
+[dependencies]
+dpdk-smoltcp.workspace = true
+switch.workspace = true
+switch-junction.workspace = true
+switch-test-kit = { workspace = true, optional = true }
+switch-buffer = { workspace = true, optional = true }
+switch-dpdk-sys = { workspace = true, optional = true }
+switch-junctiond = { workspace = true, optional = true }
+ceph-fifo = { workspace = true, optional = true }
+ceph-ring = { workspace = true, optional = true }
+
+[dev-dependencies]
+switch-net = { workspace = true, features = ["testkit"] }
+switch-test-kit.workspace = true
+switch-test-support.workspace = true
+criterion.workspace = true
+switch-junctiond.workspace = true
+ceph-fifo.workspace = true
+ceph-ring.workspace = true
+
+[[bench]]
+name = "turn"
+harness = false
+
+[lints]
+workspace = true

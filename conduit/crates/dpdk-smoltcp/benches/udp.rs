@@ -43,8 +43,8 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{tx_reserve, Eal, Sent, Turn, UdpConfig, UdpHandle, UdpSendError};
 
-use zhida_test_kit::pair::{self, Pair, Side, T0};
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::{self, Pair, Side, T0};
+use switch_test_kit::with_eal;
 
 const PORT: u16 = 1234;
 const BURST: usize = 32;

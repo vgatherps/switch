@@ -1,7 +1,7 @@
 //! Two Stacks over net_ring at IP MTU 9000, a 9000/1500 pair, and the pool
 //! room check `Port::open` applies at MTU 9000.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
@@ -13,14 +13,14 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Port, PortError};
-use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
+use switch_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
-use zhida_test_kit::pair::{
+use switch_test_kit::pair::{
     config, establish_sized, pattern, segment, tcp_frame_between, tcp_socket_sized, App, Dir, Pair,
     Side, CLIENT_PORT, SERVER_PORT, T0, BUDGET,
 };
-use zhida_test_kit::ring_port::{arp, resize, RingPort};
-use zhida_test_kit::with_eal;
+use switch_test_kit::ring_port::{arp, resize, RingPort};
+use switch_test_kit::with_eal;
 
 /// IP MTU and pool data room after headroom.
 type Size = (u16, u16);
@@ -170,7 +170,7 @@ fn assert_no_drops(pair: &Pair) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn jumbo_pair_negotiates_8960_and_sends_full_segments() {
     with_eal(|eal| {
         let mut pair = sized_pair(eal, ["jmba", "jmbb"], [JUMBO, JUMBO]);
@@ -189,7 +189,7 @@ fn jumbo_pair_negotiates_8960_and_sends_full_segments() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn jumbo_pair_mss_cap_limits_both_directions() {
     with_eal(|eal| {
         let mut pair = sized_pair_with_mss_cap(eal, ["jmca", "jmcb"], [JUMBO, JUMBO], Some(1460));
@@ -235,7 +235,7 @@ fn jumbo_pair_mss_cap_limits_both_directions() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn mismatched_mss_respects_smaller_limit() {
     with_eal(|eal| {
         let mut pair = sized_pair(eal, ["jmma", "jmmb"], [JUMBO, STANDARD]);
@@ -258,7 +258,7 @@ fn mismatched_mss_respects_smaller_limit() {
 
 /// At MTU 9000 RX needs 9216 usable bytes, while TX needs 9014. One byte
 /// below either limit, with the other pool valid, fails before pool creation.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn jumbo_room_too_small_rejected() {
     with_eal(|eal| {
         let fixture = RingPort::new("jroom", 16, 16);
@@ -316,7 +316,7 @@ fn establish_with_app_cap(pair: &mut Pair, cap: u16) -> ([TcpHandle; 2], Vec<(Di
     (handles, frames)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn path_rule_caps_active_syn_mss_and_segments() {
     with_eal(|eal| {
         let paths = [host_path(Side::B.ip(), 1500)];
@@ -331,7 +331,7 @@ fn path_rule_caps_active_syn_mss_and_segments() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn app_cap_stricter_than_path_wins() {
     with_eal(|eal| {
         let paths = [host_path(Side::B.ip(), 1500)];
@@ -351,7 +351,7 @@ fn app_cap_stricter_than_path_wins() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reconnect_reclassifies() {
     with_eal(|eal| {
         let c = Ipv4Address::new(10, 0, 0, 3);
@@ -392,7 +392,7 @@ fn reconnect_reclassifies() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn longest_prefix_wins_and_subnet_is_implicit() {
     with_eal(|eal| {
         let default = PathMtu { prefix: "0.0.0.0/0".parse().unwrap(), mtu: 1500 };
@@ -407,7 +407,7 @@ fn longest_prefix_wins_and_subnet_is_implicit() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn empty_paths_keep_port_mtu() {
     with_eal(|eal| {
         let mut pair = sized_pair_with_paths(eal, ["pmempa", "pmempb"], [JUMBO, JUMBO], None, [&[], &[]]);
@@ -419,7 +419,7 @@ fn empty_paths_keep_port_mtu() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn path_rule_window_uses_byte_capacity() {
     with_eal(|eal| {
         let paths = [host_path(Side::B.ip(), 1500)];
@@ -436,7 +436,7 @@ fn path_rule_window_uses_byte_capacity() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn path_rule_caps_passive_synack_mss_from_syn_source() {
     with_eal(|eal| {
         let paths = [host_path(Side::A.ip(), 1500)];
@@ -531,7 +531,7 @@ fn listener_reply(
     replies[0]
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn listener_reuse_reclassifies() {
     with_eal(|eal| {
         let c = Ipv4Address::new(10, 0, 0, 3);
@@ -556,7 +556,7 @@ fn listener_reuse_reclassifies() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn invalid_syn_leaves_listener_unchanged() {
     with_eal(|eal| {
         let x = Ipv4Address::new(10, 0, 0, 3);
@@ -590,7 +590,7 @@ fn invalid_syn_leaves_listener_unchanged() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ten_small_segments_reach_one_jumbo_tcp_socket_in_one_turn() {
     with_eal(|eal| {
         let configs = [config(Side::A), config(Side::B)];

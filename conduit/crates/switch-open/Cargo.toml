@@ -1,0 +1,18 @@
+[package]
+name = "switch-open"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+switch-netconf.workspace = true
+dpdk-smoltcp.workspace = true
+switch-buffer.workspace = true
+switch-dpdk-sys.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+switch-test-support.workspace = true
+
+[lints]
+workspace = true

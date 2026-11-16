@@ -1,8 +1,0 @@
-[package]
-name = "sockperf-wire"
-version.workspace = true
-edition = "2021"
-license.workspace = true
-
-[lints]
-workspace = true

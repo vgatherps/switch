@@ -41,7 +41,7 @@ class CheckFrameTest(unittest.TestCase):
         self.assert_flags(tcp_frame(ACK, 1, 2, ip_options=b"\x01\x01\x01\x00"), "IHL 6")
 
     def test_addresses_and_port(self):
-        self.assert_flags(tcp_frame(ACK, 1, 2, src_mac=b"\x02" * 6), "not ZHIDA_MAC")
+        self.assert_flags(tcp_frame(ACK, 1, 2, src_mac=b"\x02" * 6), "not SWITCH_MAC")
         self.assert_flags(tcp_frame(ACK, 1, 2, dst_mac=b"\x02" * 6), "is not TESTER_MAC")
         self.assert_flags(tcp_frame(ACK, 1, 2, dst_ip=b"\x0a\0\0\x01"), "IP addresses")
         self.assert_flags(tcp_frame(ACK, 1, 2, src_ip=b"\x0a\0\0\x01"), "IP addresses")
@@ -130,10 +130,10 @@ class RstTest(unittest.TestCase):
         return parse_tcp(tcp_frame(flags, seq, ack, window=window, payload=payload))
 
     def request(self, flags, seq, ack, payload=b""):
-        """A fuzzer segment as Zhida reads it."""
+        """A fuzzer segment as switch reads it."""
         return parse_tcp(tcp_frame(flags, seq, ack, payload=payload, src_mac=ENV.tester_mac,
-                                   dst_mac=ENV.zhida_mac, src_ip=ENV.tester_ip,
-                                   dst_ip=ENV.zhida_ip, sport=40000, dport=8080))
+                                   dst_mac=ENV.switch_mac, src_ip=ENV.tester_ip,
+                                   dst_ip=ENV.switch_ip, sport=40000, dport=8080))
 
     def test_rst_reply_shapes(self):
         # src/socket/tcp.rs 1459-1473: SEQ = the request's ACK (0 without ACK); RST|ACK
@@ -205,7 +205,7 @@ class EchoTest(unittest.TestCase):
         self.assertIsNotNone(self.echo(10, b"\xEF"))
 
     def test_bytes_outside_the_window_are_not_recorded(self):
-        left, size = seqmath.add(self.base, 1000), 4096  # Zhida's ACK at offset 1000
+        left, size = seqmath.add(self.base, 1000), 4096  # switch's ACK at offset 1000
         old = seqmath.add(self.base, 1000 - 12346 - 100)  # ends 12346 below the ACK
         for seq in (old, seqmath.add(left, 1 << 30), seqmath.add(left, -(1 << 31))):
             self.record.add(seq, b"\xEE" * 100, (left, size))

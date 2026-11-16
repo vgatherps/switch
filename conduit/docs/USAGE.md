@@ -1,23 +1,23 @@
-# Zhida application guide
+# switch application guide
 
 ## Which layer
 
-Applications in this repo run on `switchnet`: a `Net` wraps the `Stack` and gives `switch` tasks
+Applications in this repo run on `switch-net`: a `Net` wraps the `Stack` and gives `switch` tasks
 async TCP and UDP sockets (`NetHandle::tcp_connect`, `tcp_accept`, `udp_bind`, `tx_frame`), and
-`relay` (WebSocket) and `sheath` (TLS 1.3) layer on its TCP streams. The loop that owns the
-thread calls `switchnet::round(net, rt, now, tick)`, one `Net::turn` and one `Runtime::poll`, and
+`switch-ws` (WebSocket) and `switch-tls` (TLS 1.3) layer on its TCP streams. The loop that owns the
+thread calls `switch_net::round(net, rt, now, tick)`, one `Net::turn` and one `Runtime::poll`, and
 on a dedicated core calls it again at once: a sleep holds every packet that arrives during it
-(`zhida-nic feed` busy-polls through `binance_feed::run(.., None, ..)`). Sleep only when the core is
-shared, as the tap demos (binance-feed, relay-autobahn) do, 1 ms at most, with their tester
-process. switchnet's README, relay's crate docs and binance-feed's README are the place to
+(`switch-nic feed` busy-polls through `switch_binance_feed::run(.., None, ..)`). Sleep only when the core is
+shared, as the tap demos (switch-binance-feed, switch-ws-autobahn) do, 1 ms at most, with their tester
+process. switch-net's README, switch-ws's crate docs and switch-binance-feed's README are the place to
 start.
 
-This guide is the contract underneath: the `Stack` itself, which switchnet drives and which a
+This guide is the contract underneath: the `Stack` itself, which switch-net drives and which a
 program may also drive directly (its readiness tokens: `arm_tcp`, `arm_udp`, `pop_fired`).
 
-## What Zhida is
+## What switch is
 
-Zhida runs a TCP/UDP stack on DPDK with IPv4 over Ethernet. One `Stack` owns one `Port`, which
+Switch runs a TCP/UDP stack on DPDK with IPv4 over Ethernet. One `Stack` owns one `Port`, which
 controls one RX queue and one TX queue, both queue 0. The application drives packet processing on
 one thread and supplies time. Packet processing never reads a clock or waits for a packet, writable
 socket, or timer; the application decides when to drive it again. The adapter is `dpdk_smoltcp`,
@@ -26,7 +26,7 @@ counter types. The Stack answers ICMP echo requests (ping) to its address automa
 
 ## Process model
 
-Zhida is single-threaded. Initialize EAL on the application thread and keep `Eal`, the `Port`,
+Switch is single-threaded. Initialize EAL on the application thread and keep `Eal`, the `Port`,
 the `Stack`, socket handles, held frames and datagrams, and their packet operations and cleanup on
 that same thread. `Eal`, `TcpHandle`, and `UdpHandle` are not `Send`.
 
@@ -37,7 +37,7 @@ Do not move sockets, handles, or frames between Stacks. The DPDK lcore identity 
 socket removal or a refused port close.
 
 For multicore deployment, run one process per NIC, each with one Stack, its own EAL instance and
-its own CPU. Share no Zhida ports, stacks, sockets, pools, or buffers between those processes.
+its own CPU. Share no switch ports, stacks, sockets, pools, or buffers between those processes.
 `Eal::init` does not create that isolation.
 
 EAL lasts for the process. Dropping `Eal` does not clean up DPDK or unregister its main lcore. After
@@ -48,9 +48,9 @@ deadlines, scheduling, waiting, and protocols.
 
 ### Open from a netconf config
 
-Applications start from a config file written by `zhida-netconf discover` (see
-[crates/nic-runner/README.md](../crates/nic-runner/README.md) §2) and open everything with one call
-to `zhida_open::open`. [crates/netconf-open/examples/tcp_client.rs](../crates/netconf-open/examples/tcp_client.rs)
+Applications start from a config file written by `switch-netconf discover` (see
+[crates/switch-nic/README.md](../crates/switch-nic/README.md) §2) and open everything with one call
+to `switch_open::open`. [crates/switch-open/examples/tcp_client.rs](../crates/switch-open/examples/tcp_client.rs)
 is a complete client built this way: it opens, connects, sends a line, prints what comes back and
 closes the Port.
 
@@ -59,13 +59,13 @@ names:
 
 ```toml
 [dependencies]
-dpdk-smoltcp = { path = "../zhida/crates/dpdk-smoltcp" }
-zhida-netconf = { path = "../zhida/crates/netconf" }
-zhida-open = { path = "../zhida/crates/netconf-open" }
+dpdk-smoltcp = { path = "../switch/crates/dpdk-smoltcp" }
+switch-netconf = { path = "../switch/crates/switch-netconf" }
+switch-open = { path = "../switch/crates/switch-open" }
 ```
 
 Setup for one TCP socket looks like this. The same code is
-[crates/netconf-open/examples/setup.rs](../crates/netconf-open/examples/setup.rs), which the build
+[crates/switch-open/examples/setup.rs](../crates/switch-open/examples/setup.rs), which the build
 compiles; a test fails if the two differ.
 
 ```rust
@@ -77,14 +77,14 @@ use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::Ipv4Address;
 
 fn setup() -> Result<(), Box<dyn std::error::Error>> {
-    let config = zhida_netconf::Config::load(Path::new("dut.json"))?;
+    let config = switch_netconf::Config::load(Path::new("dut.json"))?;
     let server = Ipv4Address::new(192, 0, 2, 1);
     let tcp_config = tcp::Config {
         rx_capacity: 65536,
         tx_capacity: 65536,
         mss_cap: Some(config.path_mtu(server) - 40),
     };
-    let sizing = zhida_open::Sizing {
+    let sizing = switch_open::Sizing {
         frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
         max_sockets: 1,
         max_udp_sockets: 0,
@@ -94,7 +94,7 @@ fn setup() -> Result<(), Box<dyn std::error::Error>> {
     };
     let start = std::time::Instant::now();
     let mut clock = || Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
-    let opened = unsafe { zhida_open::open(&config, &sizing, None, &mut clock) }?;
+    let opened = unsafe { switch_open::open(&config, &sizing, None, &mut clock) }?;
     println!("{}", opened.report);
     let (mut stack, _eal) = (opened.stack, opened.eal);
     let handle = stack.add_tcp(tcp_config)?;
@@ -125,7 +125,7 @@ offloads (`"auto"` picks per driver; the report says why), opens the Port, waits
 link, builds the Stack at `clock()`, then resolves the gateway's MAC. Each failure is one
 `OpenError` variant. Every failure after `Port::open` hands back the `Port`, or the `Stack` for
 `GatewayUnresolved` and `Receive`, so the caller can close it and return every buffer. The `?` above
-drops it; `crates/nic-runner/src/main.rs` matches each variant and closes the Port. `open` is
+drops it; `crates/switch-nic/src/main.rs` matches each variant and closes the Port. `open` is
 `unsafe` for the same reasons as `Eal::init` and `Port::open`; see its doc comment.
 
 Gateway warm-up: with a `gateway` in the config, `open` loops `Stack::resolve_gateway()` and
@@ -145,9 +145,9 @@ matching prefix wins, the Stack's own subnet is an implicit rule at the Port MTU
 clamped to the Port MTU. TCP caps a connection's MSS at path MTU - 40 toward the peer, on `connect`
 and on an accepted SYN; a UDP send larger than path MTU - 28 returns `TooLarge`. Port and rule MTUs
 must be at least 88, both in the config and in `Stack::new`. A peer raises an advertised MSS below
-48 up to 48 (Linux and zhida both do), so a smaller path cannot carry its full-size segments. The
+48 up to 48 (Linux and switch both do), so a smaller path cannot carry its full-size segments. The
 68-87 range is refused for UDP too.
-Fresh discovery sets the Port MTU to `min(NIC MTU, 1500)`. `zhida-netconf discover --aws`
+Fresh discovery sets the Port MTU to `min(NIC MTU, 1500)`. `switch-netconf discover --aws`
 writes these path rules; the table shows effective MTUs after the Port MTU clamp:
 
 | destination | path MTU | TCP MSS | UDP payload max |
@@ -162,7 +162,7 @@ Port MTU. Add custom rules for peered VPCs (intra-region 9001; inter-region, tra
 VPN (≤ 1446) or Direct Connect; without one they fall into the 1500 default. Before sizing sockets,
 `config.path_mtu(addr)` returns the same answer the Stack will use.
 
-DNS: Zhida does not resolve names. Resolve with the kernel (`ToSocketAddrs`) before `open` or
+DNS: switch does not resolve names. Resolve with the kernel (`ToSocketAddrs`) before `open` or
 outside the packet loop, never inside it (it blocks). On EC2 the kernel resolver goes through the
 primary ENI, which stays kernel-owned.
 
@@ -173,27 +173,27 @@ instances with the ENA PHC `refclock PHC /dev/ptp_ena`.
 ### Setting up by hand
 
 The next four sections do by hand what `open` does: initialize EAL, find the ethdev, configure the
-Port and build the Stack. `tap-echo` and the tests set up this way. An application that calls
+Port and build the Stack. `switch-tap-echo` and the tests set up this way. An application that calls
 `open` can skip to "Pool sizing".
 
 ### Initialize EAL
 
 Restrict the process to one CPU before startup, with `taskset -c N` or a container CPU set with
-one CPU. `zhida_dpdk_sys::only_allowed_cpu` queries the calling thread's affinity and errors unless
+one CPU. `switch_dpdk_sys::only_allowed_cpu` queries the calling thread's affinity and errors unless
 exactly one CPU is allowed.
 
-Pass a complete argument vector to `Eal::init(&[&str])`, including the program name. Zhida adds no
+Pass a complete argument vector to `Eal::init(&[&str])`, including the program name. Switch adds no
 options. EAL pins its main lcore according to the supplied arguments. The tap driver maps lcore 7
 onto the one allowed CPU; the lcore number and CPU number need not be equal.
 
-This is the argument shape in `crates/tap-echo/src/driver.rs`. `memory` is a decimal MiB count sized
+This is the argument shape in `crates/switch-tap-echo/src/driver.rs`. `memory` is a decimal MiB count sized
 by the driver for its pools and EAL overhead.
 
 ```rust
-let cpu = zhida_dpdk_sys::only_allowed_cpu()?;
+let cpu = switch_dpdk_sys::only_allowed_cpu()?;
 let lcores = format!("--lcores=7@{cpu}");
 let eal_args = [
-    "tap-echo", "--no-pci", "--no-huge", "-m", memory.as_str(),
+    "switch-tap-echo", "--no-pci", "--no-huge", "-m", memory.as_str(),
     "--no-shconf", "--no-telemetry",
     lcores.as_str(), "--main-lcore=7",
 ];
@@ -219,7 +219,7 @@ only after its Port has closed successfully.
 
 ### Configure the Port
 
-`PortConfig<'a>` supplies device settings and separate `zhida_buffer::PoolConfig<'a>` pools. Open a
+`PortConfig<'a>` supplies device settings and separate `switch_buffer::PoolConfig<'a>` pools. Open a
 fresh device with `let port = unsafe { Port::open(&eal, config) }?;` after satisfying the safety
 obligations below.
 
@@ -382,7 +382,7 @@ waiting, it allocates 32 mbufs per call and receives nothing if that allocation 
 mark (below) must stay free on top of those, or the pool reads low on every burst and TCP sockets
 never keep out-of-order data. At 1024 RX descriptors, rx_burst 32, staging 32 and cache 8 the
 reserve is 1024 + 1056 + 32 + 12 = 2124.
-`crates/memif-bench/src/memif.rs` documents additional memif room and disconnect requirements.
+`crates/switch-memif-bench/src/memif.rs` documents additional memif room and disconnect requirements.
 
 Size the RX pool as `rx_reserve(...)` plus a share: the RX mbufs all sockets together may hold at
 once (unread in-order data, out-of-order segments, queued UDP datagrams, frames and datagrams the
@@ -420,7 +420,7 @@ ACK at its in-order edge; in-order data is still stored. Other sockets are untou
 resends what was dropped; RFC 2018 lets a receiver discard data it already reported in SACK
 blocks, and the sender must then resend it too.
 
-`zhida-open::open` (used by `nic-runner` and the `netconf-open` examples) does not size from a share:
+`switch-open::open` (used by `switch-nic` and the `switch-open` examples) does not size from a share:
 its RX pool is a fixed 32767 mbufs (2^15 - 1), with RX bursts of 128. At 1024 descriptors,
 staging 128 and cache 8, the reserve is 2316. Keeping out-of-order data needs the posted buffers,
 the low mark and what the sockets hold all at once; a pool that big leaves room for all of them, so it does not read low
@@ -449,7 +449,7 @@ capacity bounds retention. Ingress needs a TX packet before processing each RX f
 needs no reply, so an empty TX pool blocks receive too. Add room for PMD-specific allocations such
 as the `net_tap` checksum header copy.
 
-`Stack::tx_frame() -> Option<OwnedFrame>` takes exclusive `netframe` storage covering the frame
+`Stack::tx_frame() -> Option<OwnedFrame>` takes exclusive `switch-frame` storage covering the frame
 pool's full payload room, IP MTU − 28 bytes, starting 42 bytes after the mbuf headroom.
 Write through the mutable slice, `truncate(n)` to the payload length, then `freeze()` to obtain
 the `ImmutableFrame` accepted by TCP and UDP sends. Only immutable frames can be cloned;
@@ -494,7 +494,7 @@ runs TCP egress passes, then flushes. Egress stops when a pass makes no socket p
 frame. A full pending queue bounds how much it can build in that call.
 
 Application work after `turn` sees received data. TCP bytes written then wait for `send` or the next
-`turn`, as in tap-echo's `serve` loop. `ingress_budget` bounds frames handed to
+`turn`, as in switch-tap-echo's `serve` loop. `ingress_budget` bounds frames handed to
 smoltcp, not frames fetched in the RX burst, frames drained by the application, or egress work. A
 zero budget stages RX and runs maintenance and egress without processing staged RX. Staged frames
 are processed on subsequent calls even when the new burst receives nothing.
@@ -572,7 +572,7 @@ time. Unprocessed dropped handles or frame-drop wakes, or a dropped TCP socket t
 also report that time, so the next drive call cleans them up. `None` means no socket deadline. The
 timer wheel can report a boundary before the actual socket deadline. `poll_at` does not cover
 staged RX frames, pending TX frames, or packet arrivals, so never wait on it indefinitely.
-binance-feed's tap demo caps its idle wait at 1 ms; a busy-poll application (`zhida-nic feed`)
+switch-binance-feed's tap demo caps its idle wait at 1 ms; a busy-poll application (`switch-nic feed`)
 calls again immediately.
 
 If `rx_staged > 0`, call ingress again promptly: either the ingress budget ran out, or processing
@@ -801,7 +801,7 @@ loop {
 
 `TcpFrame` owns its RX mbuf. `payload()` gives `&[u8]`, `payload_mut()` gives `&mut [u8]`, and
 `rx_timestamp()` gives the raw hardware stamp (see Hardware RX timestamps).
-`into_frame()` transfers the payload to a `netframe::OwnedFrame`; save the timestamp first if needed.
+`into_frame()` transfers the payload to a `switch_frame::OwnedFrame`; save the timestamp first if needed.
 Freeze it to share immutable clones, or slice it without copying. The mbuf and
 `held_frames().count()` remain held until the last clone drops, even after socket removal,
 handle drop, or Stack teardown. The wrapper itself is not cloneable.
@@ -939,7 +939,7 @@ drop(datagram);
 `src()` returns `IpEndpoint`, including source port; `dst_addr()` returns `Ipv4Address`;
 `rx_timestamp()` returns the raw hardware stamp, 0 for none. `payload()` gives `&[u8]`, and
 `payload_mut()` gives `&mut [u8]`. `into_frame()` transfers the payload to a
-`netframe::OwnedFrame`; save the addresses and timestamp first if needed. The wrapper is not
+`switch_frame::OwnedFrame`; save the addresses and timestamp first if needed. The wrapper is not
 cloneable, but its frozen payload is. A held datagram consumes one receive credit even when
 `rx_queued() == 0`, until its last payload clone drops. Datagrams arriving at the credit limit are dropped and counted; UDP does not
 backpressure the sender. `udp(&handle).stats()` reads the socket's `rx_dropped_full` count. `remove_udp(handle)` consumes the handle, frees queued datagrams, unbinds the
@@ -958,14 +958,14 @@ offload")` if the PMD does not advertise the capability, then registers DPDK's R
 field; a registration failure returns `PortError::Dpdk`. There is no fallback to software time.
 
 Each received packet the PMD flags as stamped carries the PMD's raw `u64` unchanged; an unflagged
-packet, or any packet with the offload off, reports 0. Zhida converts nothing and never reads a
+packet, or any packet with the offload off, reports 0. Switch converts nothing and never reads a
 clock. Read it with `UdpDatagram::rx_timestamp()` or `TcpFrame::rx_timestamp()`. A TCP frame reports
 the stamp of the received segment supplying its bytes.
 
 The unit and clock are the PMD's: ENA reports ns on the device clock (Amazon Time Sync PHC),
 `net_af_packet` reports ns of the kernel socket stamp, and `net_pcap` does not advertise the offload.
-[crates/nic-runner/README.md](../crates/nic-runner/README.md) lists which real NICs offer it under
-DPDK 25.11.3, and [section 4](../crates/nic-runner/README.md#4-timestamps) shows how the runner
+[crates/switch-nic/README.md](../crates/switch-nic/README.md) lists which real NICs offer it under
+DPDK 25.11.3, and [section 4](../crates/switch-nic/README.md#4-timestamps) shows how the runner
 reports stamps when `rx_timestamps` is enabled in the config.
 
 ## Counters and observability
@@ -1127,7 +1127,7 @@ These panic:
 - overflow in reserve arithmetic, frame-budget conversions, or timer arithmetic near the
   integer limit; excessive `neighbor_capacity` at startup
 - a TX-done cleanup failure other than `-ENOTSUP` when a drive operation allocates a TX packet
-- with TX checksum offload, the PMD's checksum preparation refusing a frame during flush (Zhida does
+- with TX checksum offload, the PMD's checksum preparation refusing a frame during flush (switch does
   not validate frame headers there)
 
 A panic unwinding out of `turn`, `receive`, `send`, or `flush` leaves the Stack unusable: after
@@ -1154,14 +1154,14 @@ Keep EAL and its owner identity alive until every buffer has returned.
 
 ## Where to look next
 
-- [crates/netconf-open/examples/tcp_client.rs](../crates/netconf-open/examples/tcp_client.rs): the
+- [crates/switch-open/examples/tcp_client.rs](../crates/switch-open/examples/tcp_client.rs): the
   `open` path end to end. Load a config, size and open, connect, receive and send, close, check
   `try_close`.
-- `crates/nic-runner`: the real-NIC runbook and `zhida-nic`, which calls `open` and handles each
+- `crates/switch-nic`: the real-NIC runbook and `switch-nic`, which calls `open` and handles each
   `OpenError` variant (`src/main.rs`, sizing in `src/nic.rs`). Also lists RX timestamp support per NIC.
-- `crates/binance-feed`: bookTicker over TLS 1.3 and WebSocket (relay and sheath) as a switch task on
-  a switchnet `Net`, with application deadlines; its binary sets up by hand through tap-echo's
-  driver, and `zhida-nic feed` runs the same client after `open`.
-- `crates/tap-echo`: EAL/vdev/Port setup by hand, bounded echo I/O, drive loop, and explicit teardown.
-- `crates/memif-bench`: pool sizing, queued drive calls, stream workloads, and in-place UDP sending.
+- `crates/switch-binance-feed`: bookTicker over TLS 1.3 and WebSocket (switch-ws and switch-tls) as a switch task on
+  a switch-net `Net`, with application deadlines; its binary sets up by hand through switch-tap-echo's
+  driver, and `switch-nic feed` runs the same client after `open`.
+- `crates/switch-tap-echo`: EAL/vdev/Port setup by hand, bounded echo I/O, drive loop, and explicit teardown.
+- `crates/switch-memif-bench`: pool sizing, queued drive calls, stream workloads, and in-place UDP sending.
 - [docker/README.md](../docker/README.md): Linux DPDK test setup and commands.

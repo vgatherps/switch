@@ -8,7 +8,7 @@
 //! connection attempt, P per iteration; P = 1024 uses 10 samples. The virtual
 //! clock advances across iterations and never goes backwards.
 //!
-//! The responder and connect drive come from `zhida_test_kit::peers`.
+//! The responder and connect drive come from `switch_test_kit::peers`.
 //! Setup uses one Pair, A with P slots and a /16, B with one unused slot.
 //! Both Ports have 64-slot rings, RX bursts of 32 and 127-packet TX pools.
 //! RX pools cover the reserve and A's P sockets of 256 bytes. A stages and
@@ -32,10 +32,10 @@ use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
 use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, StackConfig};
 
-use zhida_test_kit::many;
-use zhida_test_kit::pair::{tcp_socket_sized, Pair, Side, T0};
-use zhida_test_kit::peers::{assert_idle, connect_all};
-use zhida_test_kit::with_eal;
+use switch_test_kit::many;
+use switch_test_kit::pair::{tcp_socket_sized, Pair, Side, T0};
+use switch_test_kit::peers::{assert_idle, connect_all};
+use switch_test_kit::with_eal;
 
 const PEERS: [usize; 5] = [1, 8, 9, 64, 1024];
 
@@ -68,13 +68,13 @@ fn setup(eal: &Eal, p: usize) -> (Pair, Vec<TcpHandle>) {
         64,
         |side, port| {
             port.rx_burst = 32;
-            port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+            port.rx_pool.count = switch_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
                 port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
-            ), zhida_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));
-            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));
+            ), switch_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));
+            port.frame_pool.count = switch_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), switch_test_kit::pair::windows(port.mtu, std::iter::repeat_n(256, if side == Side::A { p } else { 0 })));
             port.tx_pool.count = 127;
         },
     );

@@ -3,9 +3,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant as WallInstant;
 
-use zhida_test_kit::pair::{self, Pair, Side};
-use zhida_test_kit::wire::{Link, Verdict};
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::{self, Pair, Side};
+use switch_test_kit::wire::{Link, Verdict};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
 use dpdk_smoltcp::smoltcp::wire::{
@@ -454,9 +454,9 @@ fn run(eal: &dpdk_smoltcp::Eal, seed: u64, seconds: u64) {
             let tx_pending = configs[side.index()].tx_pending;
             port.tx_pool.count = tx_reserve(port.tx_descriptors, tx_pending) as u32;
             // Reserve plus two full-sized-segment send-queue estimates.
-            port.frame_pool.count = zhida_test_kit::pair::pool_count(
+            port.frame_pool.count = switch_test_kit::pair::pool_count(
                 frame_reserve(port.tx_descriptors, tx_pending),
-                zhida_test_kit::pair::windows(port.mtu, [BUFFER; 2]),
+                switch_test_kit::pair::windows(port.mtu, [BUFFER; 2]),
             );
             port.rx_burst = 64;
             port.tx_burst = 32;

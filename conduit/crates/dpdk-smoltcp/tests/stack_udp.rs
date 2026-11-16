@@ -1,9 +1,9 @@
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-use zhida_test_kit::pair::{self, App, Pair, Side};
-use zhida_test_kit::ring_port::RingPort;
-use zhida_test_kit::{wire, with_eal};
+use switch_test_kit::pair::{self, App, Pair, Side};
+use switch_test_kit::ring_port::RingPort;
+use switch_test_kit::{wire, with_eal};
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -14,7 +14,7 @@ use dpdk_smoltcp::{
     rx_reserve, AddUdpError, Port, PortError, Stack, StackConfig, UdpConfig,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
-use zhida_dpdk_sys::dpdk_raw_ring_enqueue_burst;
+use switch_dpdk_sys::dpdk_raw_ring_enqueue_burst;
 
 const T0: Instant = pair::T0;
 const PORT: u16 = 1234;
@@ -95,7 +95,7 @@ fn finish(fixture: RingPort, stack: Stack) {
     fixture.close();
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_rx_payload_points_into_rx_mbuf() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpaddr", 16, 16);
@@ -114,7 +114,7 @@ fn udp_rx_payload_points_into_rx_mbuf() {
         let queued =
             unsafe { dpdk_raw_ring_enqueue_burst(fixture.rx_ring(), raw.as_ptr(), 1, null_mut()) };
         if queued != 1 {
-            unsafe { zhida_dpdk_sys::dpdk_raw_pktmbuf_free(packet) };
+            unsafe { switch_dpdk_sys::dpdk_raw_pktmbuf_free(packet) };
         }
         assert_eq!(queued, 1);
         let turn = stack.turn(T0, 8).unwrap();
@@ -136,7 +136,7 @@ fn udp_rx_payload_points_into_rx_mbuf() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn datagram_drop_returns_mbuf() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpdrop", 16, 16);
@@ -154,7 +154,7 @@ fn datagram_drop_returns_mbuf() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn held_datagrams_make_try_close_refuse_then_succeed() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpclose", 16, 16);
@@ -178,7 +178,7 @@ fn held_datagrams_make_try_close_refuse_then_succeed() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn over_limit_dropped_counted_tcp_progresses() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(|side| StackConfig {
@@ -255,7 +255,7 @@ fn over_limit_dropped_counted_tcp_progresses() {
 
 /// The RX pool holds 11 mbufs beyond its reserve; a 4096-byte TCP socket (6 frames) and UDP
 /// queues of 5 and 64 datagrams are all added.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn add_udp_admits_queues_beyond_the_shared_rx_pool() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpcap", 16, 16);
@@ -281,7 +281,7 @@ fn add_udp_admits_queues_beyond_the_shared_rx_pool() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn removed_socket_held_datagrams_keep_rx_mbufs_until_dropped() {
     with_eal(|eal| {
         let fixture = RingPort::new("udprm", 16, 16);
@@ -324,7 +324,7 @@ fn removed_socket_held_datagrams_keep_rx_mbufs_until_dropped() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn cloned_received_udp_datagram_keeps_mbuf_and_queue_credit() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpclone", 16, 16);
@@ -353,7 +353,7 @@ fn cloned_received_udp_datagram_keeps_mbuf_and_queue_credit() {
 
 /// A local address the Stack does not own is refused with nothing changed: no slot taken, so a
 /// socket needing the only slot then fits on an owned address (also outside the subnet).
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unowned_local_address_refused_without_change() {
     const OWNED: Ipv4Address = Ipv4Address::new(10, 9, 0, 1);
     with_eal(|eal| {
@@ -378,7 +378,7 @@ fn unowned_local_address_refused_without_change() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn port_in_use_and_full_refused() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpfull", 16, 16);
@@ -412,7 +412,7 @@ fn port_in_use_and_full_refused() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn connected_socket_drops_other_peer() {
     with_eal(|eal| {
         let fixture = RingPort::new("udppeer", 16, 16);

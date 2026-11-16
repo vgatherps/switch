@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# Runs packetdrill scripts against Zhida, each in a fresh tap-echo process, packetdrill
-# being its tester (run directly, so tap-echo's kill reaches it) in shared-object mode
-# through target/fuzz/zhida_shim.so. GNU timeout runs without --foreground, so expiry
+# Runs packetdrill scripts against switch, each in a fresh switch-tap-echo process, packetdrill
+# being its tester (run directly, so switch-tap-echo's kill reaches it) in shared-object mode
+# through target/fuzz/switch_shim.so. GNU timeout runs without --foreground, so expiry
 # signals its whole process group, packetdrill included; expiry fails the script.
 #
 # Usage: fuzz/packetdrill/run.sh [script.pkt...]   (default: scripts/*.pkt selftest/*.pkt)
 # scripts/*.pkt must pass the packet-only check and exit 0. Each selftest/*.pkt carries
 # one header line: `// expect-pass` (exit 0), `// expect-refused: <text>` (the check refuses it, unrun, with <text>
 # in the reason) or `// expect-error: <text>` (it exits exactly 1 with <text> in the
-# output). Any script may carry one `// tap-echo: <flags>` line, flags only `--buffer N`,
+# output). Any script may carry one `// switch-tap-echo: <flags>` line, flags only `--buffer N`,
 # `--close-after N` and `--listeners N` (each at most once), passed before `--`; any other
-# line starting `// tap-echo:`, or a second one, refuses the script unrun.
+# line starting `// switch-tap-echo:`, or a second one, refuses the script unrun.
 # packetdrill gets `--tolerance_usecs=25000` by default. One `// tolerance_usecs: N`
 # line, with positive integer N in usecs, overrides it per script; an invalid or repeated
 # header refuses the script unrun.
 #
-# ZHIDA_CPU and PACKETDRILL_CPU (required, distinct CPU numbers): tap-echo runs pinned to the first,
-# packetdrill to the second, so packetdrill's timing checks never wait for Zhida's CPU;
+# SWITCH_CPU and PACKETDRILL_CPU (required, distinct CPU numbers): switch-tap-echo runs pinned to the first,
+# packetdrill to the second, so packetdrill's timing checks never wait for switch's CPU;
 # the shim fails a run whose packetdrill may run anywhere else (exported for it).
 # PACKETDRILL_TIMEOUT: seconds each script may run (default 60); expiry fails it (exit 124).
 set -euo pipefail
 
-: "${ZHIDA_CPU:?ZHIDA_CPU: the CPU tap-echo runs on}"
+: "${SWITCH_CPU:?SWITCH_CPU: the CPU switch-tap-echo runs on}"
 : "${PACKETDRILL_CPU:?PACKETDRILL_CPU: the CPU packetdrill runs on}"
-if ! [[ $ZHIDA_CPU =~ ^(0|[1-9][0-9]*)$ && $PACKETDRILL_CPU =~ ^(0|[1-9][0-9]*)$ ]]; then
-    echo "run.sh: ZHIDA_CPU ($ZHIDA_CPU) and PACKETDRILL_CPU ($PACKETDRILL_CPU) must each be one CPU number" >&2
+if ! [[ $SWITCH_CPU =~ ^(0|[1-9][0-9]*)$ && $PACKETDRILL_CPU =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "run.sh: SWITCH_CPU ($SWITCH_CPU) and PACKETDRILL_CPU ($PACKETDRILL_CPU) must each be one CPU number" >&2
     exit 2
 fi
-if [[ $ZHIDA_CPU == "$PACKETDRILL_CPU" ]]; then
-    echo "run.sh: ZHIDA_CPU and PACKETDRILL_CPU are both $ZHIDA_CPU" >&2
+if [[ $SWITCH_CPU == "$PACKETDRILL_CPU" ]]; then
+    echo "run.sh: SWITCH_CPU and PACKETDRILL_CPU are both $SWITCH_CPU" >&2
     exit 2
 fi
 timeout_s=${PACKETDRILL_TIMEOUT:-60}
@@ -40,8 +40,8 @@ export PACKETDRILL_CPU
 
 cd "$(dirname "$0")/../.."
 dir=fuzz/packetdrill
-tap_echo=../target/debug/tap-echo
-shim=target/fuzz/zhida_shim.so
+tap_echo=../target/debug/switch-tap-echo
+shim=target/fuzz/switch_shim.so
 
 # packetdrill's lexer treats newlines as whitespace and its grammar allows adjacent events,
 # so the check pins each line to one whole event. A line that is not a // comment and
@@ -73,30 +73,30 @@ packet_only() {
     done <"$1"
 }
 
-header_line='^// tap-echo:(( --(buffer|close-after|listeners) [0-9]+)+)$'
+header_line='^// switch-tap-echo:(( --(buffer|close-after|listeners) [0-9]+)+)$'
 
-# Prints the flags of $1's `// tap-echo:` line (nothing without one), or prints why it is
+# Prints the flags of $1's `// switch-tap-echo:` line (nothing without one), or prints why it is
 # refused and returns 1.
 tap_echo_flags() {
     local hits flags
-    hits=$(grep -n -E '^[[:space:]]*//[[:space:]]*tap-echo:' "$1" || true)
+    hits=$(grep -n -E '^[[:space:]]*//[[:space:]]*switch-tap-echo:' "$1" || true)
     [[ -z $hits ]] && return 0
     if [[ $hits == *$'\n'* ]]; then
-        echo "$1: more than one tap-echo header"
+        echo "$1: more than one switch-tap-echo header"
         return 1
     fi
     if ! [[ ${hits#*:} =~ $header_line ]]; then
-        echo "$1:${hits%%:*}: tap-echo header takes only --buffer N, --close-after N and --listeners N"
+        echo "$1:${hits%%:*}: switch-tap-echo header takes only --buffer N, --close-after N and --listeners N"
         return 1
     fi
     flags=${BASH_REMATCH[1]}
     if [[ $flags == *--buffer*--buffer* || $flags == *--close-after*--close-after*
         || $flags == *--listeners*--listeners* ]]; then
-        echo "$1:${hits%%:*}: tap-echo header repeats a flag"
+        echo "$1:${hits%%:*}: switch-tap-echo header repeats a flag"
         return 1
     fi
     if [[ $flags =~ --listeners[[:space:]]+0+([[:space:]]|$) ]]; then
-        echo "$1:${hits%%:*}: tap-echo header --listeners needs a positive integer"
+        echo "$1:${hits%%:*}: switch-tap-echo header --listeners needs a positive integer"
         return 1
     fi
     echo "${flags# }"
@@ -150,12 +150,12 @@ output=$(mktemp)
 # A process sleeping on an idle vCPU of the Docker Desktop VM wakes up to 10 ms late
 # (measured: 50 ms sleeps overshoot by a median 10.07 ms on an idle CPU, 0.06 ms beside a
 # busy loop), beyond the strict scripts' 4 ms tolerance. A SCHED_IDLE busy loop on each of
-# the two CPUs keeps them awake; a waking tap-echo or packetdrill of this container preempts
+# the two CPUs keeps them awake; a waking switch-tap-echo or packetdrill of this container preempts
 # it at once, and it gets only a minimal share (weight 3 vs 1024) while they stay runnable.
 # Another container's processes on these CPUs compete with it as equals (each container is
 # its own CPU-share group), so callers hold locked.sh's lock: one run at a time.
 awake=()
-for cpu in "$ZHIDA_CPU" "$PACKETDRILL_CPU"; do
+for cpu in "$SWITCH_CPU" "$PACKETDRILL_CPU"; do
     taskset -c "$cpu" chrt -i 0 sh -c 'while :; do :; done' &
     awake+=($!)
 done
@@ -197,7 +197,7 @@ for script in "${scripts[@]}"; do
     read -ra flag_args <<<"$flags"
     start=$(date +%s%N)
     status=0
-    timeout --kill-after=5 "$timeout_s" taskset -c "$ZHIDA_CPU" "$tap_echo" "${flag_args[@]}" -- \
+    timeout --kill-after=5 "$timeout_s" taskset -c "$SWITCH_CPU" "$tap_echo" "${flag_args[@]}" -- \
         taskset -c "$PACKETDRILL_CPU" packetdrill \
         --so_filename="$shim" --ip_version=ipv4 --strict_segments --tolerance_usecs="$tolerance" \
         --local_ip=192.0.2.2 --remote_ip=192.0.2.1 --bind_port=8080 \

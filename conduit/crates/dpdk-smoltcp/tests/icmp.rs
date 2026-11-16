@@ -10,7 +10,7 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{Port, Stack, StackConfig, DEFAULT_NEIGHBOR_CAPACITY};
 
-use zhida_test_kit::{ring_port, with_eal};
+use switch_test_kit::{ring_port, with_eal};
 use ring_port::{arp, RingPort};
 
 const OURS: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
@@ -108,7 +108,7 @@ fn echo_request(src_addr: Ipv4Address, dst_addr: Ipv4Address, corrupt: bool) -> 
     bytes
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unicast_echo_reply_preserves_ident_seq_and_odd_payload() {
     with_eal(|eal| {
         let fixture = RingPort::new("icmpecho", 16, 16);
@@ -149,7 +149,7 @@ fn unicast_echo_reply_preserves_ident_seq_and_odd_payload() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn broadcast_invalid_checksum_and_non_unicast_source_echo_no_reply() {
     with_eal(|eal| {
         let fixture = RingPort::new("icmpignored", 16, 16);
@@ -178,7 +178,7 @@ fn broadcast_invalid_checksum_and_non_unicast_source_echo_no_reply() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unknown_protocol_dropped_no_reply() {
     with_eal(|eal| {
         let fixture = RingPort::new("icmpunknown", 16, 16);
@@ -198,7 +198,7 @@ fn unknown_protocol_dropped_no_reply() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn closed_udp_port_dropped_counted_no_reply() {
     with_eal(|eal| {
         let fixture = RingPort::new("udpclosed", 16, 16);

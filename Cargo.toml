@@ -2,19 +2,19 @@
 resolver = "3"
 members = [
     # conduit
-    "conduit/crates/zhida-buffer",
-    "conduit/crates/zhida-dpdk-sys",
+    "conduit/crates/switch-buffer",
+    "conduit/crates/switch-dpdk-sys",
     "conduit/crates/dpdk-smoltcp",
-    "conduit/crates/tap-echo",
-    "conduit/crates/memif-bench",
-    "conduit/crates/binance-feed",
-    "conduit/crates/nic-runner",
-    "conduit/crates/netconf",
-    "conduit/crates/netconf-open",
-    "conduit/crates/sockperf-wire",
-    "conduit/test-support",
-    "conduit/test-support/kit",
-    "conduit/test-support/macros",
+    "conduit/crates/switch-tap-echo",
+    "conduit/crates/switch-memif-bench",
+    "conduit/crates/switch-binance-feed",
+    "conduit/crates/switch-nic",
+    "conduit/crates/switch-netconf",
+    "conduit/crates/switch-open",
+    "conduit/crates/switch-sockperf-wire",
+    "conduit/switch-test-support",
+    "conduit/switch-test-support/switch-test-kit",
+    "conduit/switch-test-support/switch-test-support-macros",
     # cephalopod
     "cephalopod/crates/rseq",
     "cephalopod/crates/ring",
@@ -24,24 +24,24 @@ members = [
     # switch
     "switch",
     "switch-macros",
-    # depot (task slot numbers for switch)
-    "depot",
-    # switchnet
-    "switchnet",
-    # relay (WebSocket over conduit frames)
-    "relay",
+    # switch-depot (task slot numbers for switch)
+    "switch-depot",
+    # switch-net
+    "switch-net",
+    # switch-ws (WebSocket over conduit frames)
+    "switch-ws",
     # TLS 1.3 client over conduit frames
-    "sheath",
+    "switch-tls",
     # latency/load bench (plans/bench/design.md)
-    "bench",
+    "switch-bench",
     # NIC hardware RX stamp → now latency on the CPU's invariant counter
     # shared-memory backing and single/double mappings
     "shared-memory",
     # shared packet frames
-    "netframe",
-    # junction (host control protocol and client session)
-    "junction",
-    "junctiond",
+    "switch-frame",
+    # switch-junction (host control protocol and client session)
+    "switch-junction",
+    "switch-junctiond",
     # vendored
     "vendor/slice_ringbuffer",
 ]
@@ -56,7 +56,7 @@ version = "0.1.0"
 # external
 criterion = "0.5"
 libc = "0.2"
-# global allocator of zhida-nic and zhida-bench
+# global allocator of switch-nic and switch-bench
 mimalloc = "0.1.52"
 proptest = "1.5"
 quickcheck = "1"
@@ -66,34 +66,34 @@ serde_json = "1"
 tungstenite = "=0.30.0"
 
 # internal
-binance-feed = { path = "conduit/crates/binance-feed" }
+switch-binance-feed = { path = "conduit/crates/switch-binance-feed" }
 ceph-rseq = { path = "cephalopod/crates/rseq" }
 ceph-ring = { path = "cephalopod/crates/ring" }
 ceph-fifo = { path = "cephalopod/crates/fifo" }
 ceph-proto = { path = "cephalopod/crates/proto" }
 ceph-control = { path = "cephalopod/crates/control" }
-depot = { path = "depot" }
+switch-depot = { path = "switch-depot" }
 dpdk-smoltcp = { path = "conduit/crates/dpdk-smoltcp" }
-junction = { path = "junction" }
-junctiond = { path = "junctiond" }
-netframe = { path = "netframe" }
-relay = { path = "relay" }
-sheath = { path = "sheath" }
+switch-junction = { path = "switch-junction" }
+switch-junctiond = { path = "switch-junctiond" }
+switch-frame = { path = "switch-frame" }
+switch-ws = { path = "switch-ws" }
+switch-tls = { path = "switch-tls" }
 shared-memory = { path = "shared-memory" }
 slice_ringbuffer = { path = "vendor/slice_ringbuffer" }
 smoltcp = { version = "=0.14.0", path = "conduit/vendor/smoltcp", default-features = false }
-sockperf-wire = { path = "conduit/crates/sockperf-wire" }
+switch-sockperf-wire = { path = "conduit/crates/switch-sockperf-wire" }
 switch = { path = "switch" }
 switch-macros = { path = "switch-macros" }
-switchnet = { path = "switchnet" }
-tap-echo = { path = "conduit/crates/tap-echo" }
-zhida-buffer = { path = "conduit/crates/zhida-buffer" }
-zhida-dpdk-sys = { path = "conduit/crates/zhida-dpdk-sys" }
-zhida-netconf = { path = "conduit/crates/netconf" }
-zhida-open = { path = "conduit/crates/netconf-open" }
-zhida-test-kit = { path = "conduit/test-support/kit" }
-zhida-test-support = { path = "conduit/test-support" }
-zhida-test-support-macros = { path = "conduit/test-support/macros" }
+switch-net = { path = "switch-net" }
+switch-tap-echo = { path = "conduit/crates/switch-tap-echo" }
+switch-buffer = { path = "conduit/crates/switch-buffer" }
+switch-dpdk-sys = { path = "conduit/crates/switch-dpdk-sys" }
+switch-netconf = { path = "conduit/crates/switch-netconf" }
+switch-open = { path = "conduit/crates/switch-open" }
+switch-test-kit = { path = "conduit/switch-test-support/switch-test-kit" }
+switch-test-support = { path = "conduit/switch-test-support" }
+switch-test-support-macros = { path = "conduit/switch-test-support/switch-test-support-macros" }
 
 [workspace.lints.clippy]
 doc_lazy_continuation = "allow"

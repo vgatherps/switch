@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 .NOTPARALLEL:
-.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test bench memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
+.PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-switch-net test-wss test-binance test-memif test-autobahn-check test bench switch-memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
 .PHONY: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client
 
 DOCKER ?= docker
@@ -8,10 +8,10 @@ DOCKER ?= docker
 # arm64 host) and defaults the image tag and target volume per platform, so :local stays native.
 DOCKER_PLATFORM ?=
 DOCKER_PLATFORM_TAG = $(subst /,-,$(DOCKER_PLATFORM))
-DOCKER_IMAGE ?= zhida-dpdk-test:$(if $(DOCKER_PLATFORM),$(DOCKER_PLATFORM_TAG),local)
-DOCKER_TARGET_VOLUME ?= zhida-linux-target$(if $(DOCKER_PLATFORM),-$(DOCKER_PLATFORM_TAG))
+DOCKER_IMAGE ?= switch-dpdk-test:$(if $(DOCKER_PLATFORM),$(DOCKER_PLATFORM_TAG),local)
+DOCKER_TARGET_VOLUME ?= switch-linux-target$(if $(DOCKER_PLATFORM),-$(DOCKER_PLATFORM_TAG))
 # Image with nftables for Binance's live stream.
-BINANCE_IMAGE ?= zhida-dpdk-test:binance
+BINANCE_IMAGE ?= switch-dpdk-test:binance
 # Seconds the tester keeps the live feed open.
 BINANCE_SECONDS ?= 10
 # TLS server name and HTTP Host of the feed (TLS 1.3 only: data-stream.binance.vision is TLS 1.2).
@@ -31,10 +31,10 @@ TIMEOUT = timeout --kill-after=10 $(TEST_TIMEOUT)
 # Container flags other than the cpuset.
 # The repository root (the cargo workspace root) is mounted at /work and the container runs in
 # /work/conduit. The target volume is cargo's target dir (/work/target) and also the cwd-relative
-# target/ that the gates write (conduit/target: target/fuzz, target/memif-bench, ...).
+# target/ that the gates write (conduit/target: target/fuzz, target/switch-memif-bench, ...).
 DOCKER_ACCESS = --cap-add NET_ADMIN --device /dev/net/tun \
 	-v "$(abspath $(CURDIR)/..):/work" -w /work/conduit \
-	-v zhida-cargo-registry:/usr/local/cargo/registry \
+	-v switch-cargo-registry:/usr/local/cargo/registry \
 	-v $(DOCKER_TARGET_VOLUME):/work/target \
 	-v $(DOCKER_TARGET_VOLUME):/work/conduit/target
 DOCKER_DPDK = --cpuset-cpus=$(DOCKER_CPUSET) $(DOCKER_ACCESS)
@@ -47,47 +47,47 @@ DOCKER_RUN = $(DOCKER) run --rm --init $(DOCKER_DPDK) $(DOCKER_IMAGE)
 MAKE_TEST_TIMEOUT ?= 3600
 # make test's container: also gets the packetdrill CPUs (the later --cpuset-cpus
 # wins); make is pinned to DOCKER_CPUSET (every EAL process needs exactly one
-# allowed CPU); run.sh moves tap-echo and packetdrill to their own CPUs.
+# allowed CPU); run.sh moves switch-tap-echo and packetdrill to their own CPUs.
 # The packetdrill lock (fuzz/packetdrill/locked.sh) is on PACKETDRILL_LOCK_VOLUME,
 # which every such container mounts, so it is one lock for all worktrees.
-PACKETDRILL_LOCK_VOLUME ?= zhida-packetdrill-lock
+PACKETDRILL_LOCK_VOLUME ?= switch-packetdrill-lock
 PACKETDRILL_CPUS = DOCKER_CPUSET=$(DOCKER_CPUSET) PACKETDRILL_CPUSET=$(PACKETDRILL_CPUSET) \
-	PACKETDRILL_ZHIDA_CPUSET=$(PACKETDRILL_ZHIDA_CPUSET) PACKETDRILL_LOCK=/packetdrill-lock/run.lock \
+	PACKETDRILL_SWITCH_CPUSET=$(PACKETDRILL_SWITCH_CPUSET) PACKETDRILL_LOCK=/packetdrill-lock/run.lock \
 	PACKETDRILL_LOCK_TIMEOUT=$(PACKETDRILL_LOCK_TIMEOUT)
 DOCKER_MAKE_TEST = $(DOCKER) run --rm --init $(DOCKER_DPDK) -v $(PACKETDRILL_LOCK_VOLUME):/packetdrill-lock \
-	--cpuset-cpus=$(DOCKER_CPUSET),$(PACKETDRILL_CPUSET),$(PACKETDRILL_ZHIDA_CPUSET) $(DOCKER_IMAGE) \
+	--cpuset-cpus=$(DOCKER_CPUSET),$(PACKETDRILL_CPUSET),$(PACKETDRILL_SWITCH_CPUSET) $(DOCKER_IMAGE) \
 	taskset -c $(DOCKER_CPUSET) timeout --kill-after=10 $(MAKE_TEST_TIMEOUT) make $(PACKETDRILL_CPUS)
 # Built for DOCKER_PLATFORM (native when empty), tagged per platform like DOCKER_IMAGE.
-AUTOBAHN_IMAGE ?= zhida-autobahn:25.10.1$(if $(DOCKER_PLATFORM),-$(DOCKER_PLATFORM_TAG))
+AUTOBAHN_IMAGE ?= switch-autobahn:25.10.1$(if $(DOCKER_PLATFORM),-$(DOCKER_PLATFORM_TAG))
 # Seconds for the driver and for wstest each; expiry fails the run.
 AUTOBAHN_TIMEOUT ?= 600
 # The CPU of the Autobahn peer container; it must differ from DOCKER_CPUSET.
 AUTOBAHN_CPUSET ?= 1
-# packetdrill runs (test-packetdrill): tap-echo alone on
-# PACKETDRILL_ZHIDA_CPUSET, packetdrill alone on PACKETDRILL_CPUSET, both off
+# packetdrill runs (test-packetdrill): switch-tap-echo alone on
+# PACKETDRILL_SWITCH_CPUSET, packetdrill alone on PACKETDRILL_CPUSET, both off
 # DOCKER_CPUSET (which every gate shares), so the scripts' timing checks see
 # neither side wait for a CPU. Single CPU numbers, distinct from DOCKER_CPUSET
 # and from each other.
 PACKETDRILL_CPUSET ?= 2
-PACKETDRILL_ZHIDA_CPUSET ?= 7
+PACKETDRILL_SWITCH_CPUSET ?= 7
 # One packetdrill run at a time holds those CPUs (fuzz/packetdrill/locked.sh):
 # the lock file (native default; Docker containers use the shared volume above),
 # and the seconds a run waits for it before failing (the suite takes about 65 s).
-PACKETDRILL_LOCK ?= /tmp/zhida-packetdrill.lock
+PACKETDRILL_LOCK ?= /tmp/switch-packetdrill.lock
 PACKETDRILL_LOCK_TIMEOUT ?= 600
-PACKETDRILL_ENV = ZHIDA_CPU=$(PACKETDRILL_ZHIDA_CPUSET) PACKETDRILL_CPU=$(PACKETDRILL_CPUSET) \
+PACKETDRILL_ENV = SWITCH_CPU=$(PACKETDRILL_SWITCH_CPUSET) PACKETDRILL_CPU=$(PACKETDRILL_CPUSET) \
 	PACKETDRILL_LOCK=$(PACKETDRILL_LOCK) PACKETDRILL_LOCK_TIMEOUT=$(PACKETDRILL_LOCK_TIMEOUT)
 CHECK_CPUSETS = if [ "$(AUTOBAHN_CPUSET)" = "$(DOCKER_CPUSET)" ]; then \
-	echo "$@: AUTOBAHN_CPUSET and DOCKER_CPUSET are both $(DOCKER_CPUSET); the peer and Zhida need separate CPUs" >&2; \
+	echo "$@: AUTOBAHN_CPUSET and DOCKER_CPUSET are both $(DOCKER_CPUSET); the peer and switch need separate CPUs" >&2; \
 	exit 1; \
 	fi
-CHECK_PACKETDRILL_CPUSET = for cpu in "$(DOCKER_CPUSET)" "$(PACKETDRILL_CPUSET)" "$(PACKETDRILL_ZHIDA_CPUSET)"; do \
+CHECK_PACKETDRILL_CPUSET = for cpu in "$(DOCKER_CPUSET)" "$(PACKETDRILL_CPUSET)" "$(PACKETDRILL_SWITCH_CPUSET)"; do \
 	case $$cpu in 0|[1-9]|[1-9]*[0-9]) case $$cpu in *[!0-9]*) cpu=;; esac;; *) cpu=;; esac; \
-	[ -n "$$cpu" ] || { echo "$@: DOCKER_CPUSET, PACKETDRILL_CPUSET and PACKETDRILL_ZHIDA_CPUSET ($(DOCKER_CPUSET), $(PACKETDRILL_CPUSET), $(PACKETDRILL_ZHIDA_CPUSET)) must each be one CPU number" >&2; exit 1; }; \
+	[ -n "$$cpu" ] || { echo "$@: DOCKER_CPUSET, PACKETDRILL_CPUSET and PACKETDRILL_SWITCH_CPUSET ($(DOCKER_CPUSET), $(PACKETDRILL_CPUSET), $(PACKETDRILL_SWITCH_CPUSET)) must each be one CPU number" >&2; exit 1; }; \
 	done; \
-	if [ "$(DOCKER_CPUSET)" = "$(PACKETDRILL_CPUSET)" ] || [ "$(DOCKER_CPUSET)" = "$(PACKETDRILL_ZHIDA_CPUSET)" ] || \
-		[ "$(PACKETDRILL_CPUSET)" = "$(PACKETDRILL_ZHIDA_CPUSET)" ]; then \
-	echo "$@: DOCKER_CPUSET, PACKETDRILL_CPUSET and PACKETDRILL_ZHIDA_CPUSET ($(DOCKER_CPUSET), $(PACKETDRILL_CPUSET), $(PACKETDRILL_ZHIDA_CPUSET)) must differ" >&2; \
+	if [ "$(DOCKER_CPUSET)" = "$(PACKETDRILL_CPUSET)" ] || [ "$(DOCKER_CPUSET)" = "$(PACKETDRILL_SWITCH_CPUSET)" ] || \
+		[ "$(PACKETDRILL_CPUSET)" = "$(PACKETDRILL_SWITCH_CPUSET)" ]; then \
+	echo "$@: DOCKER_CPUSET, PACKETDRILL_CPUSET and PACKETDRILL_SWITCH_CPUSET ($(DOCKER_CPUSET), $(PACKETDRILL_CPUSET), $(PACKETDRILL_SWITCH_CPUSET)) must differ" >&2; \
 	exit 1; \
 	fi
 # Seconds for the Autobahn image build (host side; a cold build takes about
@@ -107,7 +107,7 @@ TLS_ANVIL_TIMEOUT ?= 7200
 TLS_ANVIL_CPUSET ?= 1-3
 # More TLS-Anvil options, e.g. -testPackage de.rub.nds.tlstest.suite.tests.client.tls13 for a subset.
 TLS_ANVIL_ARGS ?=
-# memif-bench CPUs: EAL control threads, peer process, client process; the
+# switch-memif-bench CPUs: EAL control threads, peer process, client process; the
 # Docker cpuset holds all three (off CPU 0, where other gates run).
 MEMIF_CONTROL_CPU ?= 3
 MEMIF_PEER_CPU ?= 4
@@ -140,9 +140,9 @@ cpuset_free = ids=$$($(DOCKER) ps -q) || { echo '$@: docker ps failed.' >&2; exi
 	printf '%s\n' "$$running" | sh docker/cpuset-overlap.sh '$(1)' || \
 		{ echo '$@ needs $(2) ($(1)) free of other containers.' >&2; exit 1; }
 
-# Bench harness smoke (../bench/local/smoke.sh): validates the tooling, not a measurement. Its
-# CPUs: the coordinator, the Zhida DUT, then BENCH_GENS generators; output in
-# ../bench/out/smoke (report.md, results.json, plots).
+# Bench harness smoke (../switch-bench/local/smoke.sh): validates the tooling, not a measurement. Its
+# CPUs: the coordinator, the switch DUT, then BENCH_GENS generators; output in
+# ../switch-bench/out/smoke (report.md, results.json, plots).
 BENCH_CPUSET ?= 9-12
 BENCH_GENS ?= 2
 BENCH_SENDERS ?= 4
@@ -158,11 +158,11 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 	FUZZ_TIMEOUT=$(FUZZ_TIMEOUT)
 
 help:
-	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-switchnet test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench memif-bench fuzz binance test-smoltcp bench-stack soak' \
-		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
+	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-switch-net test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench switch-memif-bench fuzz binance test-smoltcp bench-stack soak' \
+		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Junction Autobahn: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
-		'Docs: README.md, docker/README.md (tests), crates/nic-runner/README.md (NIC host), docs/USAGE.md (API)'
+		'Docs: README.md, docker/README.md (tests), crates/switch-nic/README.md (NIC host), docs/USAGE.md (API)'
 
 doctor:
 	@test "$$(uname -s)" = Linux || { echo 'Native targets require Linux; use Docker on macOS.' >&2; exit 1; }
@@ -182,56 +182,56 @@ build: doctor
 	cargo build --locked --workspace --all-targets --features proptest,dpdk-smoltcp/bench-offload
 
 test-support:
-	$(TIMEOUT) cargo test --locked -p zhida-test-support -p zhida-test-support-macros
+	$(TIMEOUT) cargo test --locked -p switch-test-support -p switch-test-support-macros
 
 test-sys: doctor
-	$(TIMEOUT) cargo test --locked -p zhida-dpdk-sys -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-dpdk-sys -- --test-threads=1
 
 test-buffer: doctor
-	$(TIMEOUT) cargo test --locked -p zhida-buffer -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-buffer -- --test-threads=1
 
 test-props: doctor
-	$(TIMEOUT) cargo test --locked -p zhida-buffer --features proptest --test props -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-buffer --features proptest --test props -- --test-threads=1
 
 # Debug test and fuzz builds of the stack also run smoltcp's O(N)-per-packet cross-checks
 # (vendor/smoltcp's diagnostics feature). Release, bench and application builds never do.
 DIAGNOSTICS = --features dpdk-smoltcp/diagnostics
 
 test-stack: doctor
-	$(TIMEOUT) cargo test --locked -p dpdk-smoltcp -p zhida-test-kit $(DIAGNOSTICS) -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p dpdk-smoltcp -p switch-test-kit $(DIAGNOSTICS) -- --test-threads=1
 
 test-stack-release: doctor
 	$(TIMEOUT) cargo test --locked --release -p dpdk-smoltcp -- --test-threads=1
 
 test-echo: doctor
-	$(TIMEOUT) cargo test --locked -p tap-echo $(DIAGNOSTICS) -- --test-threads=1 --show-output
+	$(TIMEOUT) cargo test --locked -p switch-tap-echo $(DIAGNOSTICS) -- --test-threads=1 --show-output
 
-test-nic-runner: doctor
-	TEST_TIMEOUT=$(TEST_TIMEOUT) DOCKER_CPUSET=$(DOCKER_CPUSET) $(TIMEOUT) sh crates/nic-runner/tests/run.sh
+test-switch-nic: doctor
+	TEST_TIMEOUT=$(TEST_TIMEOUT) DOCKER_CPUSET=$(DOCKER_CPUSET) $(TIMEOUT) sh crates/switch-nic/tests/run.sh
 
 test-bench: doctor
-	$(TIMEOUT) cargo test --locked -p zhida-bench --features e2e -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-bench --features e2e -- --test-threads=1
 
 test-netconf: doctor
-	$(TIMEOUT) cargo test --locked -p zhida-netconf -p zhida-open -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-netconf -p switch-open -- --test-threads=1
 
-test-switchnet: doctor
-	$(TIMEOUT) cargo test --locked -p switchnet -- --test-threads=1
-	$(TIMEOUT) cargo test --locked -p switchnet --benches --no-run
+test-switch-net: doctor
+	$(TIMEOUT) cargo test --locked -p switch-net -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-net --benches --no-run
 
-# relay (WebSocket) and sheath (TLS), including their Docker tests over net_tap: relay's ws://
-# and wss:// clients (relay's switchnet feature) against kernel tungstenite servers, sheath's
-# TLS client (sheath's switchnet feature) against a kernel rustls server. `e2e` is each crate's
-# test-only feature for those tests (switchnet's testkit).
+# switch-ws (WebSocket) and switch-tls (TLS), including their Docker tests over net_tap: switch-ws's ws://
+# and wss:// clients (switch-ws's switch-net feature) against kernel tungstenite servers, switch-tls's
+# TLS client (switch-tls's switch-net feature) against a kernel rustls server. `e2e` is each crate's
+# test-only feature for those tests (switch-net's testkit).
 test-wss: doctor
-	$(TIMEOUT) cargo test --locked -p relay --features e2e -- --test-threads=1
-	$(TIMEOUT) cargo test --locked -p sheath --features e2e -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-ws --features e2e -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-tls --features e2e -- --test-threads=1
 
 test-binance: doctor
-	$(TIMEOUT) cargo test --locked -p binance-feed -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-binance-feed -- --test-threads=1
 
 test-memif: doctor
-	$(TIMEOUT) cargo test --locked -p memif-bench -- --test-threads=1
+	$(TIMEOUT) cargo test --locked -p switch-memif-bench -- --test-threads=1
 	$(TIMEOUT) sh docker/cpuset-overlap.sh --self-test
 
 test-autobahn-check:
@@ -240,7 +240,7 @@ test-autobahn-check:
 	$(TIMEOUT) python3 autobahn/junction-cpus.py --self-test
 	$(TIMEOUT) python3 autobahn/junction-role-self-test.py
 
-# smoltcp's own lib unit test gate uses Zhida's smoltcp features (crates/dpdk-smoltcp/Cargo.toml).
+# smoltcp's own lib unit test gate uses switch's smoltcp features (crates/dpdk-smoltcp/Cargo.toml).
 # vendor/smoltcp is outside the workspace, so it has its own lockfile and target dir. Include the
 # TCP ISN integration test: it exercises production ISNs, while socket unit tests keep their fixed
 # ISN. The second run adds diagnostics, the O(N)-per-packet TCP cross-checks.
@@ -262,10 +262,10 @@ test-packetdrill: packetdrill-build
 test-scapy:
 	$(TIMEOUT) python3 -B -m unittest discover -s fuzz/scapy
 
-test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-nic-runner test-bench test-netconf test-packetdrill test-switchnet test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
+test: test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-packetdrill test-switch-net test-wss test-binance test-memif test-autobahn-check test-scapy test-smoltcp
 
 bench: doctor
-	cargo bench --locked -p zhida-buffer --bench buffer
+	cargo bench --locked -p switch-buffer --bench buffer
 
 # Every bench process needs exactly one allowed CPU (the EAL lcore's); run it
 # natively under e.g. `taskset -c 6`.
@@ -278,30 +278,30 @@ soak:
 	SOAK_SECONDS=$(SOAK_SECONDS) SOAK_SEED=$(SOAK_SEED) $(TIMEOUT_SOAK) \
 		cargo test --locked --release -p dpdk-smoltcp --test soak -- --ignored --nocapture --test-threads=1
 
-memif-bench: doctor
-	cargo build --locked --release -p memif-bench
-	../target/release/memif-bench matrix --peer-cpu $(MEMIF_PEER_CPU) \
+switch-memif-bench: doctor
+	cargo build --locked --release -p switch-memif-bench
+	../target/release/switch-memif-bench matrix --peer-cpu $(MEMIF_PEER_CPU) \
 		--client-cpu $(MEMIF_CLIENT_CPU) --control-cpu $(MEMIF_CONTROL_CPU)
 
-# tap-echo and the packetdrill shim, the inputs of fuzz/packetdrill/run.sh.
+# switch-tap-echo and the packetdrill shim, the inputs of fuzz/packetdrill/run.sh.
 packetdrill-build: doctor
-	cargo build --locked -p tap-echo $(DIAGNOSTICS)
+	cargo build --locked -p switch-tap-echo $(DIAGNOSTICS)
 	mkdir -p target/fuzz
 	clang -shared -fPIC -Wall -Werror -I/opt/packetdrill/include \
-		-o target/fuzz/zhida_shim.so fuzz/packetdrill/zhida_shim.c
+		-o target/fuzz/switch_shim.so fuzz/packetdrill/switch_shim.c
 
 # The Scapy mutation fuzzer only; its unit tests run in make test.
 fuzz: doctor
-	cargo build --locked -p tap-echo $(DIAGNOSTICS)
-	timeout --kill-after=10 $(FUZZ_TIMEOUT) ../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py \
+	cargo build --locked -p switch-tap-echo $(DIAGNOSTICS)
+	timeout --kill-after=10 $(FUZZ_TIMEOUT) ../target/debug/switch-tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py \
 		--seed $(FUZZ_SEED) --connections $(FUZZ_CONNECTIONS) $(if $(FUZZ_ONLY),--only $(FUZZ_ONLY))
 
 # Native live feed; needs internet and the tester's network permissions.
 binance: doctor
-	cargo build --locked -p binance-feed
-	timeout --kill-after=10 $$(( $(BINANCE_SECONDS) + 60 )) ../target/debug/binance-feed \
+	cargo build --locked -p switch-binance-feed
+	timeout --kill-after=10 $$(( $(BINANCE_SECONDS) + 60 )) ../target/debug/switch-binance-feed \
 		--host '$(BINANCE_HOST)' --port $(BINANCE_PORT) --path '$(BINANCE_PATH)' \
-		--print $(BINANCE_PRINT) -- crates/binance-feed/tester.sh $(BINANCE_SECONDS)
+		--print $(BINANCE_PRINT) -- crates/switch-binance-feed/tester.sh $(BINANCE_SECONDS)
 
 docker-image:
 	$(if $(DOCKER_PLATFORM),$(DOCKER) buildx build --load --platform $(DOCKER_PLATFORM),$(DOCKER) build) \
@@ -313,7 +313,7 @@ docker-doctor:
 docker-build:
 	$(DOCKER_RUN) make build
 
-# make test in the Zhida container (bounded by MAKE_TEST_TIMEOUT), then both
+# make test in the switch container (bounded by MAKE_TEST_TIMEOUT), then both
 # Autobahn roles (docker-autobahn) even if make test failed; exit 0 only if both pass.
 # An interrupt, or make test ending by a signal (exit >= 128), stops here.
 docker-test:
@@ -332,7 +332,7 @@ docker-test:
 	echo "docker-test: $$result: make test exit $$suite, docker-autobahn exit $$autobahn" >&2; \
 	[ $$result = PASS ]
 
-# A stuck step must end the Zhida container with a failure. Runs goals of
+# A stuck step must end the switch container with a failure. Runs goals of
 # docker/gate-self-test.mk in a container named for the case, as `bounded`
 # ($(DOCKER_MAKE_TEST), the docker-test shape) or `plain` ($(DOCKER_RUN) make,
 # the docker-fuzz shape; it guards --init alone):
@@ -355,7 +355,7 @@ docker-gate-self-test:
 		wait $$bp; \
 	}; \
 	check() { \
-		goal=$$1 run=$$2 want=$$3 bound=$$4; name=zhida-gate-self-test-$$goal-$$run-$$$$; \
+		goal=$$1 run=$$2 want=$$3 bound=$$4; name=switch-gate-self-test-$$goal-$$run-$$$$; \
 		log=$$(mktemp) || return 1; \
 		start=$$(date +%s); deadline=$$(( start + bound + 25 )); \
 		if [ $$run = bounded ]; then \
@@ -407,14 +407,14 @@ docker-bench:
 docker-bench-smoke:
 	@$(call cpuset_free,$(BENCH_CPUSET),BENCH_CPUSET)
 	$(DOCKER) run --rm --init --cpuset-cpus=$(BENCH_CPUSET) --sysctl net.ipv4.ip_forward=1 $(DOCKER_ACCESS) \
-		$(DOCKER_IMAGE) sh -c 'set -e; cargo build --locked --release -p zhida-bench; rm -rf ../bench/out/smoke; \
-		GENS=$(BENCH_GENS) SENDERS=$(BENCH_SENDERS) PROTOS="$(BENCH_PROTOS)" timeout 900 sh ../bench/local/smoke.sh ../bench/out/smoke $(BENCH_SMOKE_ARGS); \
-		python3 ../bench/report.py ../bench/out/smoke --title "Local smoke (tooling validation over net_tap; not a measurement)"'
+		$(DOCKER_IMAGE) sh -c 'set -e; cargo build --locked --release -p switch-bench; rm -rf ../switch-bench/out/smoke; \
+		GENS=$(BENCH_GENS) SENDERS=$(BENCH_SENDERS) PROTOS="$(BENCH_PROTOS)" timeout 900 sh ../switch-bench/local/smoke.sh ../switch-bench/out/smoke $(BENCH_SMOKE_ARGS); \
+		python3 ../switch-bench/report.py ../switch-bench/out/smoke --title "Local smoke (tooling validation over net_tap; not a measurement)"'
 
-docker-memif-bench:
+docker-switch-memif-bench:
 	@$(call cpuset_free,$(MEMIF_CPUSET),MEMIF_CPUSET)
 	$(DOCKER) run --rm --cpuset-cpus=$(MEMIF_CPUSET) $(DOCKER_ACCESS) $(DOCKER_IMAGE) \
-		make memif-bench MEMIF_PEER_CPU=$(MEMIF_PEER_CPU) \
+		make switch-memif-bench MEMIF_PEER_CPU=$(MEMIF_PEER_CPU) \
 		MEMIF_CLIENT_CPU=$(MEMIF_CLIENT_CPU) MEMIF_CONTROL_CPU=$(MEMIF_CONTROL_CPU)
 
 # The stack benches on STACK_BENCH_CPU alone (cpuset_free), never DOCKER_CPUSET.
@@ -465,9 +465,9 @@ docker-autobahn-image:
 	done; \
 	wait $$pid
 
-# Once per role, server (wstest fuzzingclient against `relay-autobahn server`) then
-# client (`relay-autobahn client` against wstest fuzzingserver), each in a fresh
-# autobahn/run/<role>/: Zhida container C (driver + tester) and Autobahn
+# Once per role, server (wstest fuzzingclient against `switch-ws-autobahn server`) then
+# client (`switch-ws-autobahn client` against wstest fuzzingserver), each in a fresh
+# autobahn/run/<role>/: switch container C (driver + tester) and Autobahn
 # container A (wstest, in C's netns), both detached; see docker/README.md. A role
 # passes only if C exited 0 within AUTOBAHN_TIMEOUT + 60 s, A ended within 30 s
 # of C without being killed, wstest's status in autobahn/run/<role>/done is 0,
@@ -523,29 +523,29 @@ docker-autobahn: docker-autobahn-image
 		run=autobahn/run/$$mode; \
 		rm -rf $$run && mkdir -p $$run || return 1; \
 		start=$$(date +%s); failed=; \
-		c=zhida-autobahn-c-$$mode-$$$$; \
+		c=switch-autobahn-c-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$c $(DOCKER_DPDK) -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
 			$(DOCKER_IMAGE) timeout --kill-after=10 $(AUTOBAHN_TIMEOUT) \
-			../target/release/relay-autobahn $$mode "$$@" \
-			-- autobahn/zhida-tester.sh $$mode >/dev/null || { remove 1; return 1; }; \
-		a=zhida-autobahn-a-$$mode-$$$$; \
+			../target/release/switch-ws-autobahn $$mode "$$@" \
+			-- autobahn/switch-tester.sh $$mode >/dev/null || { remove 1; return 1; }; \
+		a=switch-autobahn-a-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$a --network container:$$c --cpuset-cpus=$(AUTOBAHN_CPUSET) \
 			-v "$(CURDIR)/autobahn:/work/autobahn" -w /work -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
 			$(AUTOBAHN_IMAGE) sh autobahn/peer.sh $$mode >/dev/null || { remove 1; return 1; }; \
-		watch $$c $$(( start + $(AUTOBAHN_TIMEOUT) + 60 )) "$(AUTOBAHN_TIMEOUT) + 60 s after start" zhida "$$c $$a"; \
+		watch $$c $$(( start + $(AUTOBAHN_TIMEOUT) + 60 )) "$(AUTOBAHN_TIMEOUT) + 60 s after start" switch "$$c $$a"; \
 		driver=$$($(DOCKER) inspect -f '{{.State.ExitCode}}' $$c 2>/dev/null || echo unknown); \
 		watch $$a $$(( $$(date +%s) + 30 )) "30 s after the driver" autobahn $$a; \
-		$(DOCKER) logs $$c > $$run/zhida.log 2>&1 || failed="$$failed logs"; \
+		$(DOCKER) logs $$c > $$run/switch.log 2>&1 || failed="$$failed logs"; \
 		$(DOCKER) logs $$a > $$run/autobahn.log 2>&1 || failed="$$failed logs"; \
 		peer=$$(cat $$run/done 2>/dev/null || echo missing); \
-		cat $$run/zhida.log; \
+		cat $$run/switch.log; \
 		[ "$$driver" = 0 ] && [ "$$peer" = 0 ] && [ -z "$$failed" ]; verdict=$$?; \
 		remove $$verdict || { verdict=1; failed="$$failed remove"; }; \
 		[ $$verdict = 0 ] && result=PASS || result=FAIL; \
 		echo "docker-autobahn: $$mode $$result: $$(( $$(date +%s) - start )) s, driver exit $$driver, wstest $$peer, failures:$${failed:- none} (logs in $$run/)"; \
 		return $$verdict; \
 	}; \
-	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p relay --features e2e --bin relay-autobahn || exit 1; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p switch-ws --features e2e --bin switch-ws-autobahn || exit 1; \
 	role server --expect-connections $(AUTOBAHN_CASES); server=$$?; \
 	role client --expect-cases $(AUTOBAHN_CASES); client=$$?; \
 	[ $$server = 0 ] && [ $$client = 0 ]
@@ -555,7 +555,7 @@ docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junctio
 	@set -u; \
 	cpus=$$(python3 autobahn/junction-cpus.py "$(DOCKER_CPUSET)" "$(AUTOBAHN_CPUSET)") || exit 1; \
 	set -- $$cpus; network=$$1; app=$$2; cpuset=$$3; \
-	echo "$@: junctiond CPU $$network, app/control CPU $$app, role cpuset $$cpuset (DOCKER_CPUSET=$(DOCKER_CPUSET))"; \
+	echo "$@: switch-junctiond CPU $$network, app/control CPU $$app, role cpuset $$cpuset (DOCKER_CPUSET=$(DOCKER_CPUSET))"; \
 	lock=autobahn/run.lock; \
 	if ! mkdir $$lock 2>/dev/null; then \
 		echo "$@: lock $(CURDIR)/$$lock exists: another run in this checkout, or a stale lock (remove it by hand)" >&2; \
@@ -603,28 +603,28 @@ docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junctio
 		run=autobahn/run/$$mode; \
 		rm -rf $$run && mkdir -p $$run || return 1; \
 		start=$$(date +%s); failed=; \
-		c=zhida-autobahn-junction-c-$$mode-$$$$; \
+		c=switch-autobahn-junction-c-$$mode-$$$$; \
 		$(DOCKER) run -d --init --name $$c --cpuset-cpus=$$cpuset $(DOCKER_ACCESS) -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
 			$(DOCKER_IMAGE) timeout --kill-after=10 $(AUTOBAHN_TIMEOUT) \
 			sh autobahn/junction-role.sh $$mode $$network $$app "$$@" >/dev/null || { remove 1; return 1; }; \
-		a=zhida-autobahn-junction-a-$$mode-$$$$; \
+		a=switch-autobahn-junction-a-$$mode-$$$$; \
 		$(DOCKER) run -d --name $$a --network container:$$c --cpuset-cpus=$(AUTOBAHN_CPUSET) \
 			-v "$(CURDIR)/autobahn:/work/autobahn" -w /work -e AUTOBAHN_TIMEOUT=$(AUTOBAHN_TIMEOUT) \
 			$(AUTOBAHN_IMAGE) sh autobahn/peer.sh $$mode >/dev/null || { remove 1; return 1; }; \
-		watch $$c $$(( start + $(AUTOBAHN_TIMEOUT) + 60 )) "$(AUTOBAHN_TIMEOUT) + 60 s after start" zhida "$$c $$a"; \
+		watch $$c $$(( start + $(AUTOBAHN_TIMEOUT) + 60 )) "$(AUTOBAHN_TIMEOUT) + 60 s after start" switch "$$c $$a"; \
 		driver=$$($(DOCKER) inspect -f '{{.State.ExitCode}}' $$c 2>/dev/null || echo unknown); \
 		watch $$a $$(( $$(date +%s) + 30 )) "30 s after the driver" autobahn $$a; \
-		$(DOCKER) logs $$c > $$run/zhida.log 2>&1 || failed="$$failed logs"; \
+		$(DOCKER) logs $$c > $$run/switch.log 2>&1 || failed="$$failed logs"; \
 		$(DOCKER) logs $$a > $$run/autobahn.log 2>&1 || failed="$$failed logs"; \
 		peer=$$(cat $$run/done 2>/dev/null || echo missing); \
-		cat $$run/zhida.log; \
+		cat $$run/switch.log; \
 		[ "$$driver" = 0 ] && [ "$$peer" = 0 ] && [ -z "$$failed" ]; verdict=$$?; \
 		remove $$verdict || { verdict=1; failed="$$failed remove"; }; \
 		[ $$verdict = 0 ] && result=PASS || result=FAIL; \
 		echo "$@: $$mode $$result: $$(( $$(date +%s) - start )) s, driver exit $$driver, wstest $$peer, failures:$${failed:- none} (logs in $$run/)"; \
 		return $$verdict; \
 	}; \
-	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p relay --features e2e --bin relay-autobahn -p junctiond --bin junctiond || exit 1; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p switch-ws --features e2e --bin switch-ws-autobahn -p switch-junctiond --bin switch-junctiond || exit 1; \
 	case "$@" in \
 		*-server) role server --expect-connections $(AUTOBAHN_CASES);; \
 		*-client) role client --expect-cases $(AUTOBAHN_CASES);; \
@@ -633,8 +633,8 @@ docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junctio
 			[ $$server = 0 ] && [ $$client = 0 ];; \
 	esac
 
-# TLS-Anvil's client tests against sheath (TLS 1.3 over switchnet on net_tap), not part of make
-# test. Container C runs the driver (sheath example tls_anvil): it takes TLS-Anvil's address
+# TLS-Anvil's client tests against switch-tls (TLS 1.3 over switch-net on net_tap), not part of make
+# test. Container C runs the driver (switch-tls example tls_anvil): it takes TLS-Anvil's address
 # 192.0.2.1 on the tap netdev, writes tls-anvil/run/ready and starts one TLS connection per
 # trigger. Container A runs TLS-Anvil in C's network namespace, listening on port 8443; its
 # trigger script connects to the driver's trigger port 127.0.0.1:8090. Once A exits, `done`
@@ -643,11 +643,11 @@ docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junctio
 # TLS-Anvil and the driver both exited 0 and no test failed that is not a known failure.
 docker-tls-anvil:
 	@set -u; \
-	run=tls-anvil/run; c=zhida-tls-anvil-c-$$$$; a=zhida-tls-anvil-a-$$$$; \
+	run=tls-anvil/run; c=switch-tls-anvil-c-$$$$; a=switch-tls-anvil-a-$$$$; \
 	say() { echo "docker-tls-anvil: $$*" >&2; }; \
 	cleanup() { rc=$$?; $(DOCKER) rm -f $$c $$a >/dev/null 2>&1; exit $$rc; }; \
 	trap cleanup EXIT; trap 'exit 130' INT TERM HUP; \
-	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p sheath --features e2e --example tls_anvil || exit 1; \
+	$(DOCKER_RUN) $(TIMEOUT) cargo build --release --locked -p switch-tls --features e2e --example tls_anvil || exit 1; \
 	rm -rf $$run && mkdir -p $$run || exit 1; \
 	$(DOCKER) run -d --name $$c $(DOCKER_DPDK) $(DOCKER_IMAGE) \
 		timeout --kill-after=10 $$(( $(TLS_ANVIL_TIMEOUT) + 120 )) ../target/release/examples/tls_anvil $$run >/dev/null || exit 1; \
@@ -661,7 +661,7 @@ docker-tls-anvil:
 	$(DOCKER) run -d --name $$a --platform $(TLS_ANVIL_PLATFORM) --network container:$$c --cpuset-cpus=$(TLS_ANVIL_CPUSET) \
 		-v "$(CURDIR)/$$run:/output" $(TLS_ANVIL_IMAGE) \
 		-disableTcpDump -strength $(TLS_ANVIL_STRENGTH) -parallelHandshakes 1 -parallelTests 1 \
-		-identifier sheath -outputFolder /output/results -prettyPrintJSON $(TLS_ANVIL_ARGS) \
+		-identifier switch-tls -outputFolder /output/results -prettyPrintJSON $(TLS_ANVIL_ARGS) \
 		client -port 8443 -triggerScript bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090' >/dev/null || exit 1; \
 	while [ "$$($(DOCKER) inspect -f '{{.State.Running}}' $$a)" = true ]; do \
 		if [ $$(( $$(date +%s) - start )) -ge $(TLS_ANVIL_TIMEOUT) ]; then say "TLS-Anvil still running after $(TLS_ANVIL_TIMEOUT) s"; $(DOCKER) kill $$a >/dev/null; break; fi; \

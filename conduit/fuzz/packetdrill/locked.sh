@@ -3,7 +3,7 @@
 # packetdrill CPUs: concurrent runs from other worktrees' containers would share them (the
 # busy loops in run.sh only yield to processes of their own container) and make each other
 # late. The lock is flock(2) on the file PACKETDRILL_LOCK; in Docker that file is on a named
-# volume every gate container mounts. COMMAND and every process it starts (tap-echo,
+# volume every gate container mounts. COMMAND and every process it starts (switch-tap-echo,
 # packetdrill, the busy loops) inherit the locked descriptor, and the kernel releases the
 # lock only when the last of them has exited, so a cancelled run keeps it until its last
 # process is gone and a killed run leaves no stale lock. A held lock is waited for, up to

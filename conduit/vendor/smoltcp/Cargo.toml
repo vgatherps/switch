@@ -9,7 +9,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Zhida's fork of smoltcp for IPv4 TCP and UDP over Ethernet."
+description = "switch's fork of smoltcp for IPv4 TCP and UDP over Ethernet."
 homepage = "https://github.com/smoltcp-rs/smoltcp"
 documentation = "https://docs.rs/smoltcp/"
 keywords = [
@@ -32,7 +32,7 @@ auto-icmp-echo-reply = []
 # default; one test-smoltcp run enables it.
 diagnostics = []
 # TX buffers are frame-pool mbufs (conduit). Without it they are heap buffers (smoltcp's tests).
-dpdk = ["dep:zhida-buffer", "dep:zhida-dpdk-sys"]
+dpdk = ["dep:switch-buffer", "dep:switch-dpdk-sys"]
 
 [lib]
 name = "smoltcp"
@@ -42,19 +42,19 @@ path = "src/lib.rs"
 name = "tcp_isn"
 path = "tests/tcp_isn.rs"
 
-[dependencies.netframe]
-path = "../../../netframe"
+[dependencies.switch-frame]
+path = "../../../switch-frame"
 
 [dependencies.byteorder]
 version = "1.0"
 default-features = false
 
-[dependencies.zhida-buffer]
-path = "../../crates/zhida-buffer"
+[dependencies.switch-buffer]
+path = "../../crates/switch-buffer"
 optional = true
 
-[dependencies.zhida-dpdk-sys]
-path = "../../crates/zhida-dpdk-sys"
+[dependencies.switch-dpdk-sys]
+path = "../../crates/switch-dpdk-sys"
 optional = true
 
 [dependencies.heapless]

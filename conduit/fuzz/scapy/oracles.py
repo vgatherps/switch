@@ -1,7 +1,7 @@
-"""Fuzzer oracles, observed from outside Zhida (docker/README.md, docker-fuzz).
+"""Fuzzer oracles, observed from outside switch (docker/README.md, docker-fuzz).
 
 Pure functions and plain data structures: each takes what was seen on the wire and returns
-error strings (empty / None when the check passes). The panic and pool oracles are tap-echo's
+error strings (empty / None when the check passes). The panic and pool oracles are switch-tap-echo's
 exit statuses 101 and 2, which the tester's own exit status joins, not checked here.
 """
 
@@ -11,47 +11,47 @@ import seqmath
 
 
 def check_arp(frame, env):
-    """Zhida's ARP frames must be well-formed Ethernet/IPv4 requests from ZHIDA_MAC/IP,
-    as Linux requires before answering (same rule as fuzz/packetdrill/zhida_shim.c)."""
+    """switch's ARP frames must be well-formed Ethernet/IPv4 requests from SWITCH_MAC/IP,
+    as Linux requires before answering (same rule as fuzz/packetdrill/switch_shim.c)."""
     try:
         arp = parse_arp(frame)
     except Malformed as e:
-        return [f"malformed ARP from Zhida: {e}"]
+        return [f"malformed ARP from switch: {e}"]
     errors = []
     if (arp.htype, arp.ptype, arp.hlen, arp.plen) != (1, ETH_P_IP, 6, 4):
         errors.append(f"ARP htype/ptype/hlen/plen {arp.htype}/{arp.ptype:#x}/{arp.hlen}/"
                       f"{arp.plen}, expected 1/0x800/6/4")
     if arp.op != 1:
-        errors.append(f"ARP op {arp.op} from Zhida, expected a request (1)")
-    if arp.sha != env.zhida_mac or arp.spa != env.zhida_ip:
+        errors.append(f"ARP op {arp.op} from switch, expected a request (1)")
+    if arp.sha != env.switch_mac or arp.spa != env.switch_ip:
         errors.append(f"ARP sender {arp.sha.hex(':')} {'.'.join(map(str, arp.spa))} "
-                      f"is not Zhida's MAC/IP")
+                      f"is not switch's MAC/IP")
     return errors
 
 
 def check_frame(frame, env):
-    """Well-formed output for one frame Zhida sent. Returns (kind, parsed, errors) with kind
-    "arp", "tcp" or None. TCP frames: ZHIDA_MAC/IP to TESTER_MAC/IP from ECHO_PORT, IHL 5,
+    """Well-formed output for one frame switch sent. Returns (kind, parsed, errors) with kind
+    "arp", "tcp" or None. TCP frames: SWITCH_MAC/IP to TESTER_MAC/IP from ECHO_PORT, IHL 5,
     valid IP and TCP checksums, options that parse, no SYN+FIN or SYN+RST, ACK on every
     segment but RST (see check_rst for RSTs)."""
-    if frame[6:12] != env.zhida_mac:
-        return None, None, [f"frame from {frame[6:12].hex(':')}, not ZHIDA_MAC"]
+    if frame[6:12] != env.switch_mac:
+        return None, None, [f"frame from {frame[6:12].hex(':')}, not SWITCH_MAC"]
     kind = ethertype(frame)
     if kind == ETH_P_ARP:
         return "arp", parse_arp(frame) if len(frame) >= 42 else None, check_arp(frame, env)
     if kind != ETH_P_IP:
-        return None, None, [f"ethertype {kind} from Zhida is neither ARP nor IPv4"]
+        return None, None, [f"ethertype {kind} from switch is neither ARP nor IPv4"]
     try:
         seg = parse_tcp(frame)
     except Malformed as e:
-        return None, None, [f"malformed IPv4/TCP from Zhida: {e}"]
+        return None, None, [f"malformed IPv4/TCP from switch: {e}"]
     errors = []
     if seg.dst_mac != env.tester_mac:
         errors.append(f"destination MAC {seg.dst_mac.hex(':')} is not TESTER_MAC")
-    if seg.src_ip != env.zhida_ip or seg.dst_ip != env.tester_ip:
-        errors.append("IP addresses are not ZHIDA_IP -> TESTER_IP")
+    if seg.src_ip != env.switch_ip or seg.dst_ip != env.tester_ip:
+        errors.append("IP addresses are not SWITCH_IP -> TESTER_IP")
     if seg.ihl != 5:
-        errors.append(f"IHL {seg.ihl}, Zhida emits no IP options")
+        errors.append(f"IHL {seg.ihl}, switch emits no IP options")
     if not seg.ip_checksum_ok:
         errors.append("bad IP header checksum")
     if not seg.tcp_checksum_ok:
@@ -116,7 +116,7 @@ class SeqCoverage:
 
 
 def check_ack_bound(ack, coverage, syn_seqs):
-    """Zhida never ACKs sequence space the fuzzer never sent: some SYN the fuzzer sent at S
+    """switch never ACKs sequence space the fuzzer never sent: some SYN the fuzzer sent at S
     must start a covered run [S, ack) (S + 1 for the SYN alone)."""
     for syn in syn_seqs:
         if seqmath.gt(ack, syn) and coverage.covers(syn, ack):
@@ -164,8 +164,8 @@ class SentRecord:
         self.extras = {}  # seq -> set of byte values other than the stream's
 
     def add(self, seq, payload, window=None):
-        """window: (left, size), the only sequence numbers whose bytes Zhida can keep;
-        bytes outside it are dropped by Zhida (smoltcp keeps only the in-window part of a
+        """window: (left, size), the only sequence numbers whose bytes switch can keep;
+        bytes outside it are dropped by switch (smoltcp keeps only the in-window part of a
         segment, src/socket/tcp.rs 1772-1784) and not recorded."""
         if window is not None:
             left, size = window
@@ -201,9 +201,9 @@ class SentRecord:
 
 
 def check_echo(record, peer_isn, local_base, seq, payload):
-    """Echo-only: Zhida's payload byte at its stream offset k (seq - (peer_isn + 1)) must be
+    """Echo-only: switch's payload byte at its stream offset k (seq - (peer_isn + 1)) must be
     a byte the fuzzer sent at its own sequence number local_base + k (local_base: the ACK of
-    Zhida's SYN-ACK, i.e. the fuzzer's ISN + 1)."""
+    Switch's SYN-ACK, i.e. the fuzzer's ISN + 1)."""
     if not payload:
         return None
     k = seqmath.offset(seq, seqmath.add(peer_isn, 1))
@@ -215,7 +215,7 @@ def check_echo(record, peer_isn, local_base, seq, payload):
         return None
     for i, b in enumerate(payload):
         if not record.sent(seqmath.add(local, i), b):
-            return (f"Zhida sent byte {b:#04x} at its stream offset {k + i}; the fuzzer never "
+            return (f"switch sent byte {b:#04x} at its stream offset {k + i}; the fuzzer never "
                     f"sent that byte at seq {seqmath.add(local, i)}")
     return None
 
@@ -243,16 +243,16 @@ def check_stream_prefix(sent, echoed):
             f"sent; first difference at offset {i}")
 
 
-def check_clean_close(fin_acked, peer_fin, zhida_rsts):
-    """Stream-preserving close: the fuzzer's FIN acknowledged, Zhida's FIN received, no RST
-    from Zhida."""
+def check_clean_close(fin_acked, peer_fin, switch_rsts):
+    """Stream-preserving close: the fuzzer's FIN acknowledged, switch's FIN received, no RST
+    from switch."""
     errors = []
     if not fin_acked:
-        errors.append("close: Zhida never acknowledged the fuzzer's FIN")
+        errors.append("close: switch never acknowledged the fuzzer's FIN")
     if not peer_fin:
-        errors.append("close: no FIN from Zhida")
-    if zhida_rsts:
-        errors.append(f"close: Zhida sent {zhida_rsts} RST(s)")
+        errors.append("close: no FIN from switch")
+    if switch_rsts:
+        errors.append(f"close: switch sent {switch_rsts} RST(s)")
     return errors
 
 

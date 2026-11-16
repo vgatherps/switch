@@ -5,8 +5,8 @@ use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::IpEndpoint;
 use dpdk_smoltcp::{frame_reserve, ReadySide, Stack, StackConfig, UdpConfig, UdpSendError};
-use zhida_test_kit::pair::{self, establish_sized, Pair, Side, BUDGET, MAX_ROUNDS};
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::{self, establish_sized, Pair, Side, BUDGET, MAX_ROUNDS};
+use switch_test_kit::with_eal;
 
 /// Socket receive window target and transmit capacity used by these tests.
 const SMALL: usize = 6 * (1500 - 52);
@@ -28,7 +28,7 @@ fn settle(pair: &mut Pair) {
     panic!("deadlines remain after {MAX_ROUNDS} rounds");
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_tokens_fire_on_segments_acks_app_calls_and_time_wait_end_only() {
     with_eal(|eal| {
         let mut pair = pair::new_pair(eal, ["rdya", "rdyb"]);
@@ -137,7 +137,7 @@ fn udp_config(port: u16) -> UdpConfig {
     UdpConfig { port, local_addr: None, rx_queue: 8, tx_checksum: true, broadcast: false }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_token_fires_on_a_queued_datagram_only() {
     with_eal(|eal| {
         let mut pair = udp_pair(eal);

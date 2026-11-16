@@ -5,7 +5,7 @@ use dpdk_smoltcp::{
     tx_reserve, Port, Stack, StackConfig, StackError, Turn, DEFAULT_NEIGHBOR_CAPACITY,
 };
 
-use zhida_test_kit::{pair::tcp_socket_sized, ring_port, with_eal};
+use switch_test_kit::{pair::tcp_socket_sized, ring_port, with_eal};
 use ring_port::{arp, RingPort};
 
 const OURS: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
@@ -77,7 +77,7 @@ fn finish(fixture: RingPort, stack: Stack) {
     fixture.close();
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn backward_time_rejected_without_work() {
     with_eal(|eal| {
         // TX ring holds 3, so 2 of 5 replies stay pending.
@@ -130,7 +130,7 @@ fn backward_time_rejected_without_work() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn same_time_turns_repeat_safely() {
     with_eal(|eal| {
         let fixture = RingPort::new("same", 16, 16);
@@ -154,7 +154,7 @@ fn same_time_turns_repeat_safely() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ingress_budget_bounds_processing_rest_staged() {
     with_eal(|eal| {
         let fixture = RingPort::new("budget", 16, 16);
@@ -185,7 +185,7 @@ fn ingress_budget_bounds_processing_rest_staged() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn turn_flushes_pending_beyond_one_tx_burst() {
     with_eal(|eal| {
         // Six replies, bursts of two, a TX ring with room for all of them.
@@ -210,7 +210,7 @@ fn turn_flushes_pending_beyond_one_tx_burst() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_flood_each_turn_finite() {
     with_eal(|eal| {
         // The RX ring holds 15; staging 4 and budget 2 bound every turn.
@@ -248,7 +248,7 @@ fn rx_flood_each_turn_finite() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn undrained_tx_ring_blocks_ingress_keeps_rx_staged_then_recovers() {
     with_eal(|eal| {
         // TX ring holds 3, pending holds 2: replies back up into staging.
@@ -322,7 +322,7 @@ fn undrained_tx_ring_blocks_ingress_keeps_rx_staged_then_recovers() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn invalid_config_returns_port() {
     with_eal(|eal| {
         let fixture = RingPort::new("invalid", 16, 16);
@@ -437,7 +437,7 @@ fn invalid_config_returns_port() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_new_refuses_tx_pool_below_reserve() {
     with_eal(|eal| {
         assert_eq!(tx_reserve(16, 8), 24);
@@ -468,7 +468,7 @@ fn stack_new_refuses_tx_pool_below_reserve() {
 
 /// Below 68 Stack::new refuses the IPv4 minimum itself; 68-87 reaches the path table, which needs
 /// room for a 48-byte TCP segment; 88 builds.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_new_refuses_ip_mtu_below_88() {
     with_eal(|eal| {
         for mtu in [67, 87, 88] {
@@ -505,7 +505,7 @@ fn stack_new_refuses_ip_mtu_below_88() {
 /// returns the Port unchanged; a /31 has no network or broadcast address, so
 /// both its addresses are hosts. A valid gateway builds, and the first connect
 /// outside the subnet asks ARP for the gateway, not the destination.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn gateway_must_be_another_unicast_address_in_the_subnet() {
     with_eal(|eal| {
         let fixture = RingPort::new("gateway", 16, 16);
@@ -575,7 +575,7 @@ fn gateway_must_be_another_unicast_address_in_the_subnet() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_drop_releases_queues_before_port_close() {
     with_eal(|eal| {
         // TX ring holds 3; budget 4 leaves 2 staged and 1 pending.

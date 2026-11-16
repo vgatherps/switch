@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run inside the role container; junctiond alone owns the tap and Stack.
+# Run inside the role container; switch-junctiond alone owns the tap and Stack.
 set -u
 mode=$1 network=$2 app=$3
 shift 3
@@ -16,7 +16,7 @@ cleanup() {
     if [ -n "$daemon" ]; then
         kill -TERM "$daemon" 2>/dev/null || rc=1
         wait "$daemon"; host=$?
-        say "junctiond exit $host"
+        say "switch-junctiond exit $host"
         [ "$host" = 0 ] || rc=1
     fi
     rm -rf "$ipc" || rc=1
@@ -25,21 +25,21 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-taskset -c "$network" ../target/release/junctiond --config autobahn/junction-netconf.json \
+taskset -c "$network" ../target/release/switch-junctiond --config autobahn/junction-netconf.json \
     --dir "$ipc" --max-sessions 1 --max-sockets 1024 --tcp-sockets 1024 --udp-sockets 0 \
     --control-cpus "$app" &
 daemon=$!
 deadline=$(($(date +%s) + 60))
 until [ -S "$ipc/control.sock" ]; do
-    kill -0 "$daemon" 2>/dev/null || { say "junctiond exited before control socket"; exit 1; }
+    kill -0 "$daemon" 2>/dev/null || { say "switch-junctiond exited before control socket"; exit 1; }
     [ "$(date +%s)" -lt "$deadline" ] || { say "no control socket within 60 s"; exit 1; }
     sleep 0.01
 done
-taskset -c "$app" ../target/release/relay-autobahn "$mode" "$@" \
+taskset -c "$app" ../target/release/switch-ws-autobahn "$mode" "$@" \
     --backend junction --junction-socket "$ipc/control.sock" \
-    -- autobahn/zhida-tester.sh "$mode" &
+    -- autobahn/switch-tester.sh "$mode" &
 child=$!
 wait "$child"; status=$?
 child=
-say "relay-autobahn exit $status"
+say "switch-ws-autobahn exit $status"
 exit "$status"

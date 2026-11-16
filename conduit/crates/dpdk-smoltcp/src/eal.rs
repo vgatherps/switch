@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::rc::Rc;
 
-use zhida_buffer::{PoolConfig, PoolCreateError, PoolManager};
-use zhida_dpdk_sys::{rte_eal_init, rte_timer_subsystem_init, zhida_errno, zhida_lcore_id, EALREADY};
+use switch_buffer::{PoolConfig, PoolCreateError, PoolManager};
+use switch_dpdk_sys::{rte_eal_init, rte_timer_subsystem_init, switch_errno, switch_lcore_id, EALREADY};
 
 /// The calling thread's process-lifetime EAL setup.
 ///
@@ -67,7 +67,7 @@ impl Eal {
         // Each pointer refers to writable, NUL-terminated storage for this call.
         let return_code = unsafe { rte_eal_init(argc, argv.as_mut_ptr()) };
         let errno = if return_code < 0 {
-            unsafe { zhida_errno() }
+            unsafe { switch_errno() }
         } else {
             0
         };
@@ -82,7 +82,7 @@ impl Eal {
             return Err(EalError::TimerSubsystem { return_code });
         }
         Ok(Self {
-            owner_lcore_id: unsafe { zhida_lcore_id() },
+            owner_lcore_id: unsafe { switch_lcore_id() },
             _thread_local: PhantomData,
         })
     }
@@ -126,7 +126,7 @@ impl Drop for PoolResources {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "Zhida retained pool backing with {in_use} buffers still in use"
+                "switch retained pool backing with {in_use} buffers still in use"
             );
         }
     }
@@ -188,12 +188,12 @@ pub(crate) fn with_test_eal<R>(body: impl FnOnce(&Eal) -> R) -> R {
     }
     EAL.with(|owner| {
         let eal = owner.get_or_init(|| {
-            let args = zhida_test_kit::eal_args();
+            let args = switch_test_kit::eal_args();
             Eal::init(&args.iter().map(String::as_str).collect::<Vec<_>>())
                 .expect("resource test EAL initialization")
         });
         assert_eq!(eal.owner_lcore_id(), 7);
-        assert_eq!(unsafe { zhida_lcore_id() }, 7);
+        assert_eq!(unsafe { switch_lcore_id() }, 7);
         body(eal)
     })
 }
@@ -221,12 +221,12 @@ mod tests {
             name,
             count: 63,
             cache_size: 8,
-            data_room_size: zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM as u16 + 512,
+            data_room_size: switch_dpdk_sys::RTE_PKTMBUF_HEADROOM as u16 + 512,
             socket_id: -1,
         }
     }
 
-    #[zhida_test_support::pinned_test]
+    #[switch_test_support::pinned_test]
     fn clean_resource_drop_releases_pool_name() {
         let name = CString::new("resource_clean").unwrap();
         let cfg = resource_config(&name);
@@ -241,13 +241,13 @@ mod tests {
 
     // Called only after the Rust owner was dropped with one real survivor.
     fn return_survivor_and_free_retained_backing(
-        survivor: zhida_buffer::Mbuf,
-        backing: *mut zhida_dpdk_sys::rte_mempool,
-        cache: *mut zhida_dpdk_sys::rte_mempool_cache,
+        survivor: switch_buffer::Mbuf,
+        backing: *mut switch_dpdk_sys::rte_mempool,
+        cache: *mut switch_dpdk_sys::rte_mempool_cache,
     ) {
-        use zhida_dpdk_sys::{
+        use switch_dpdk_sys::{
             dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free, rte_mempool_free,
-            rte_mempool_in_use_count, zhida_mempool_cache_flush,
+            rte_mempool_in_use_count, switch_mempool_cache_flush,
         };
         assert_eq!(survivor.len(), 4);
         assert_eq!(survivor.data(), b"live");
@@ -273,12 +273,12 @@ mod tests {
             unsafe { dpdk_raw_pktmbuf_free(packet) };
         }
         // Return cached free objects before releasing the test's retained pool.
-        unsafe { zhida_mempool_cache_flush(cache, backing) };
+        unsafe { switch_mempool_cache_flush(cache, backing) };
         assert_eq!(unsafe { rte_mempool_in_use_count(backing) }, 0);
         unsafe { rte_mempool_free(backing) };
     }
 
-    #[zhida_test_support::pinned_test]
+    #[switch_test_support::pinned_test]
     fn live_resource_drop_preserves_surviving_packet() {
         let name = CString::new("resource_live_drop").unwrap();
         let cfg = resource_config(&name);
@@ -292,7 +292,7 @@ mod tests {
         drop(unsafe { PoolResources::new(cfg) }.unwrap());
     }
 
-    #[zhida_test_support::pinned_test]
+    #[switch_test_support::pinned_test]
     fn live_resource_unwind_preserves_original_panic_and_packet() {
         let name = CString::new("resource_unwind").unwrap();
         let cfg = resource_config(&name);

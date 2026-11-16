@@ -1,4 +1,4 @@
-// tap-echo: --buffer 65535 --close-after 0
+// switch-tap-echo: --buffer 65535 --close-after 0
 // SYN in TIME-WAIT gets a challenge ACK before ACK/window validation.
 // Socket::process preserves TIME-WAIT and its close timer; challenge_ack_allowed
 // shares the per-socket 500 ms limit. The later FIN is ACKed without rate limiting
@@ -8,21 +8,21 @@
 // in the TIME-WAIT state does not affect the TCP connection.
 // Adapted from freebsd-net/tcp-testsuite commit 04b8c73fc5081fe3792f1bed9168c9b22aaedddb,
 // state-event-engine/rcv-syn-time-wait/rcv-syn-time-wait-using-shutdown-outside-left-secure-ipv4.pkt
-// (BSD-2-Clause; notice below). Changes for Zhida's packet-only runner, tap-echo
+// (BSD-2-Clause; notice below). Changes for switch's packet-only runner, switch-tap-echo
 // being the application (fuzz/packetdrill/README.md, "Upstream suites"):
 // - IPv4 variant. Dropped: sysctls, which set FreeBSD defaults and
-//   net.inet.tcp.insecure_syn=0 (RFC 5961 SYN checks on); Zhida has no such switch;
+//   net.inet.tcp.insecure_syn=0 (RFC 5961 SYN checks on); switch has no such switch;
 //   fcntl; getsockopt(SO_RCVBUF); --tolerance_usecs=75000 (the runner keeps
 //   packetdrill's 4 ms); sockstat and tcpdrop commands except where replaced below.
-// - socket/bind/listen/accept dropped: tap-echo listens on port 8080 and accepts.
-// - shutdown(SHUT_WR) becomes tap-echo --close-after 0: Zhida sends its FIN right
+// - socket/bind/listen/accept dropped: switch-tap-echo listens on port 8080 and accepts.
+// - shutdown(SHUT_WR) becomes switch-tap-echo --close-after 0: switch sends its FIN right
 //   after the handshake (upstream: 0.1 s later).
-// - Receive window: tap-echo --buffer 65535, so Zhida's RCV.WND is 65535, its
+// - Receive window: switch-tap-echo --buffer 65535, so switch's RCV.WND is 65535, its
 //   advertised window (no window scale), as upstream's.
 // - Upstream's #ifdef STANDARD branch kept (the RFC expectation); its #ifdef FreeBSD
 //   branch, FreeBSD's own behavior, dropped.
 // - Still in TIME-WAIT (upstream: sockstat 0.1 s after the event): the client
-//   retransmits its FIN 1.1 s later and Zhida ACKs it; a listener would answer RST.
+//   retransmits its FIN 1.1 s later and switch ACKs it; a listener would answer RST.
 //   The interval is retained from the adaptation. FIN replies are exempt from the
 //   shared 500 ms limit on pure ACKs and SYN challenge ACKs (out_of_window_reply).
 //

@@ -1,11 +1,11 @@
-use zhida_test_kit::with_eal;
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
     Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
-use zhida_buffer::{Mbuf, PoolConfig, PoolManager};
-use zhida_dpdk_sys::*;
+use switch_buffer::{Mbuf, PoolConfig, PoolManager};
+use switch_dpdk_sys::*;
 
 const SRC: [u8; 4] = [192, 0, 2, 1];
 const DST: [u8; 4] = [198, 51, 100, 2];
@@ -103,7 +103,7 @@ fn ones_complement_sum(bytes: &[u8]) -> u16 {
     sum as u16
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn prepare_seed_completes_to_software_checksum() {
     let pool = pool();
     let mut offload_caps = ChecksumCapabilities::default();
@@ -143,7 +143,7 @@ fn prepare_seed_completes_to_software_checksum() {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn prepare_refusal_reported() {
     let pool = pool();
     let packet = pool.alloc_with_len(53).unwrap();

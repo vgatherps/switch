@@ -1,10 +1,10 @@
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-use zhida_test_kit::pair::{
+use switch_test_kit::pair::{
     self, establish, segment, tcp_socket_sized, App, Dir, Pair, Rounds, Side, BUDGET, CLIENT_PORT,
     SERVER_PORT, T0,
 };
-use zhida_test_kit::{ring_port::RingPort, with_eal};
+use switch_test_kit::{ring_port::RingPort, with_eal};
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
 use dpdk_smoltcp::smoltcp::time::Duration;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -108,7 +108,7 @@ fn connect_pair(eal: &Eal, names: [&str; 2]) -> Pair {
     })
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn connect_rejects_time_wait_tuple_until_expiry() {
     with_eal(|eal| {
         for orphaned in [false, true] {
@@ -188,7 +188,7 @@ fn connect_rejects_time_wait_tuple_until_expiry() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn connect_rejects_dirty_syn_sent_tuple_but_allows_closed_and_listener() {
     with_eal(|eal| {
         let mut pair = connect_pair(eal, ["h_dirtupa", "h_dirtupb"]);
@@ -214,7 +214,7 @@ fn connect_rejects_dirty_syn_sent_tuple_but_allows_closed_and_listener() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn drop_established_sends_fin_and_frees_slot_after_close() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_fina", "h_finb"]);
@@ -264,7 +264,7 @@ fn drop_established_sends_fin_and_frees_slot_after_close() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn drop_close_wait_frees_slot_after_fin_ack() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_passa", "h_passb"]);
@@ -297,7 +297,7 @@ fn drop_close_wait_frees_slot_after_fin_ack() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn drop_during_handshake() {
     with_eal(|eal| {
         // Linux tcp_close: a SYN-SENT socket closes without sending anything; the
@@ -343,7 +343,7 @@ fn drop_during_handshake() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dropped_idle_handle_wakes_poll_at_and_sends_fin() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_wakea", "h_wakeb"]);
@@ -368,7 +368,7 @@ fn dropped_idle_handle_wakes_poll_at_and_sends_fin() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn drop_listener_frees_slot() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_lista", "h_listb"]);
@@ -398,7 +398,7 @@ fn drop_listener_frees_slot() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn drop_with_unread_data_sends_rst() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_reada", "h_readb"]);
@@ -432,7 +432,7 @@ fn drop_with_unread_data_sends_rst() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn orphan_receiving_data_sends_rst() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_dataa", "h_datab"]);
@@ -456,7 +456,7 @@ fn orphan_receiving_data_sends_rst() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn orphan_fin_wait_2_times_out() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_timea", "h_timeb"]);
@@ -522,7 +522,7 @@ fn udp_payloads(frames: &Frames, side: Side) -> Vec<Vec<u8>> {
     }).collect()
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_drop_frees_port() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(|side| dpdk_smoltcp::StackConfig {
@@ -581,7 +581,7 @@ fn udp_drop_frees_port() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_drop_with_live_sockets_returns_mbufs() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(|side| dpdk_smoltcp::StackConfig {
@@ -639,7 +639,7 @@ fn stack_drop_with_live_sockets_returns_mbufs() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn plain_stack_drop_with_live_sockets_releases_pools() {
     with_eal(|eal| {
         let fixtures = ["h_plain_a", "h_plain_b"].map(|name| RingPort::new(name, 16, 16));
@@ -708,7 +708,7 @@ fn plain_stack_drop_with_live_sockets_releases_pools() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 #[should_panic(expected = "TCP handle belongs to another Stack")]
 fn handle_from_another_stack_panics() {
     with_eal(|eal| {
@@ -723,7 +723,7 @@ fn handle_from_another_stack_panics() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 #[should_panic(expected = "UDP handle belongs to another Stack")]
 fn udp_handle_from_another_stack_panics() {
     with_eal(|eal| {
@@ -742,7 +742,7 @@ fn udp_handle_from_another_stack_panics() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reconnect_loop_one_slot() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["h_loopa", "h_loopb"]);
@@ -803,7 +803,7 @@ fn reconnect_loop_one_slot() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dropped_udp_is_cleaned_at_each_entry() {
     with_eal(|eal| {
         for call in 0..5 {

@@ -3,9 +3,9 @@
 //! bytes in lowercase hex. ARP frames are recorded whole; IPv4/TCP frames include
 //! Ethernet, IPv4 and TCP headers with all options, without payload bytes.
 //! The sixteen-connection trace omits these header bytes. These fixtures pin them
-//! before the emitter changes. Run with ZHIDA_FRAMES_BLESS=1 to write the fixtures.
+//! before the emitter changes. Run with SWITCH_FRAMES_BLESS=1 to write the fixtures.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::rc::Rc;
@@ -20,12 +20,12 @@ use dpdk_smoltcp::smoltcp::wire::{
 use dpdk_smoltcp::Stack;
 use dpdk_smoltcp::{frame_reserve, rx_reserve, tx_reserve};
 
-use zhida_test_kit::pair::{
+use switch_test_kit::pair::{
     ceil_ms, config, pattern, pool_count, segment, tcp_frame, tcp_socket_sized, windows, App, Dir, Pair,
     Round, Side, CLIENT_PORT, IDLE_ROUNDS, MAX_ROUNDS, SERVER_PORT, T0,
 };
-use zhida_test_kit::wire::Verdict;
-use zhida_test_kit::with_eal;
+use switch_test_kit::wire::Verdict;
+use switch_test_kit::with_eal;
 
 const BULK: usize = 256 * 1024;
 const ACK_DELAY: Duration = Duration::from_millis(10);
@@ -288,7 +288,7 @@ fn compare(name: &str, lines: Vec<String>) {
     let mut text = lines.join("\n");
     text.push('\n');
     let path = format!("{FIXTURES}/{name}.txt");
-    if std::env::var("ZHIDA_FRAMES_BLESS").as_deref() == Ok("1") {
+    if std::env::var("SWITCH_FRAMES_BLESS").as_deref() == Ok("1") {
         std::fs::create_dir_all(FIXTURES).unwrap();
         std::fs::write(path, &text).unwrap();
         return;
@@ -324,7 +324,7 @@ fn bulk_scenario(mut scenario: impl FnMut(&mut Pair, &RefCell<Trace>, &[TcpHandl
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_handshake() {
     bulk_scenario(|pair, trace, handles| {
         let recorded = trace.borrow();
@@ -374,7 +374,7 @@ fn bulk_handshake() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_handshake_ack_receive_window() {
     bulk_scenario(|pair, trace, handles| {
         let recorded = trace.borrow();
@@ -406,7 +406,7 @@ fn bulk_handshake_ack_receive_window() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_small_writes() {
     bulk_scenario(|pair, trace, handles| {
         let (mut next, peer_seq) = {
@@ -515,7 +515,7 @@ fn hold_every_frame(
 }
 
 /// Retaining frames does not limit delivery of the next receive window.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn receiving_continues_while_frames_are_held() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frza", "frzb"], [config(Side::A), config(Side::B)], T0);
@@ -530,7 +530,7 @@ fn receiving_continues_while_frames_are_held() {
 }
 
 /// Frames remain valid when B's socket is removed and are released when dropped.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn held_frames_dropped_after_remove_tcp() {
     with_eal(|eal| {
         let mut pair = Pair::new(eal, ["frra", "frrb"], [config(Side::A), config(Side::B)], T0);
@@ -550,7 +550,7 @@ fn held_frames_dropped_after_remove_tcp() {
 
 /// Under a large window, dropping held frames cannot make a window update due:
 /// `poll_at` stays quiet and no frame goes out.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_held_frames_dropped_between_turns_stay_quiet() {
     bulk_scenario(|pair, trace, handles| {
         let data = pattern(3000, 41);
@@ -581,7 +581,7 @@ fn bulk_held_frames_dropped_between_turns_stay_quiet() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn peer_zero_window_probe_then_full_delivery() {
     with_eal(|eal| {
         let mut pair = Pair::new(
@@ -676,7 +676,7 @@ fn peer_zero_window_probe_then_full_delivery() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_tail_loss() {
     bulk_scenario(|pair, trace, handles| {
         let data = pattern(1000, 7);
@@ -728,7 +728,7 @@ fn bulk_tail_loss() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_fast_retransmit() {
     bulk_scenario(|pair, trace, handles| {
         let mss = {
@@ -832,7 +832,7 @@ fn bulk_fast_retransmit() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_fin() {
     bulk_scenario(|pair, trace, handles| {
         let start = trace.borrow().frames.len();
@@ -892,7 +892,7 @@ fn bulk_fin() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bulk_frames_match_committed() {
     let lines = with_eal(|eal| {
         let mut pair = Pair::with_pools(
@@ -1114,7 +1114,7 @@ fn bulk_frames_match_committed() {
     compare("bulk", lines);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn plain_frames_match_committed() {
     let lines = with_eal(|eal| {
         let mut pair = Pair::new(

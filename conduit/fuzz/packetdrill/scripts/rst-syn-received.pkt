@@ -1,4 +1,4 @@
-// A Linux client answers Zhida's SYN-ACK with an RST (what Linux sends for a SYN-ACK it
+// A Linux client answers switch's SYN-ACK with an RST (what Linux sends for a SYN-ACK it
 // no longer wants: sequence number its ACK field, no ACK flag, no options). The listener
 // returns to Listen: the next SYN, 100 ms later, gets a SYN-ACK with a fresh ISN.
 // Handshake, ISNs and the 100 ms gap: see

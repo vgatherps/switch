@@ -1,11 +1,11 @@
-// tap-echo: --buffer 1024
+// switch-tap-echo: --buffer 1024
 // tolerance_usecs: 4000
 // The peer holds its receive window at zero, so the first 1024-byte echo fills
-// Zhida's tx buffer and later in-order segments remain unread. Zhida advertises
+// Switch's tx buffer and later in-order segments remain unread. Switch advertises
 // its 1024-byte receive window target throughout, independent of those held frames.
 // Each full-window segment triggers an immediate window-update ACK. The peer's
 // probe gets an ACK, then opening its window lets every queued echo drain.
-// The peer opens at 1.46 s, before Zhida's 1.5 s zero-window probe.
+// The peer opens at 1.46 s, before switch's 1.5 s zero-window probe.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 1024 <mss 1460,wscale 0,sackOK,eol,eol,eol>

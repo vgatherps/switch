@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use smoltcp::phy::{RxBuf, TxSource};
-use zhida_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
-use zhida_dpdk_sys::*;
+use switch_buffer::{FramePool, Mbuf, PoolConfig, PoolCreateError};
+use switch_dpdk_sys::*;
 
 use crate::eal::{Eal, PoolResources};
 use crate::rx_pool::rx_low_mark;
@@ -124,7 +124,7 @@ pub struct Offloads {
     /// reports the PMD's raw u64 unchanged: ENA uses ns on the Amazon Time Sync
     /// PHC clock; net_af_packet uses ns from the kernel socket stamp; net_pcap
     /// writes µs but does not advertise the offload. An unflagged packet reports
-    /// 0. Zhida converts nothing.
+    /// 0. Switch converts nothing.
     pub rx_timestamp: bool,
     /// TX TCP checksum computation (`RTE_ETH_TX_OFFLOAD_TCP_CKSUM`).
     ///
@@ -272,7 +272,7 @@ pub struct RxBurst {
 }
 
 /// Restricted packet owner: one direct, single-segment mbuf with `refcnt == 1`,
-/// no external buffer and `pkt_len == data_len`, from a Zhida production pool.
+/// no external buffer and `pkt_len == data_len`, from a switch production pool.
 /// Dropping it returns the mbuf to its pool with the single-segment free; the
 /// wrapped `Mbuf`'s chain-walking free never runs.
 #[repr(transparent)]
@@ -410,13 +410,13 @@ impl Drop for TxPacket {
     fn drop(&mut self) {
         // SAFETY: this value owns one reference to a direct, single-segment
         // mbuf whose pool's cache slot is set; it returns with its last reference.
-        unsafe { zhida_pktmbuf_free_seg(self.as_ptr()) };
+        unsafe { switch_pktmbuf_free_seg(self.as_ptr()) };
     }
 }
 
 unsafe extern "C" fn release_rx_packet(rc: NonNull<u16>, ctx: *mut ()) {
     // SAFETY: into_rx_buf identifies this live mbuf by its embedded count;
-    // netframe leaves that count at 1 on the last release.
+    // switch-frame leaves that count at 1 on the last release.
     unsafe {
         RxBuf::release_context(ctx);
         let raw = rc.as_ptr().cast::<u8>()
@@ -439,7 +439,7 @@ unsafe fn release_packet(owner: NonNull<()>) {
     // (refcnt 1, one segment, no next, direct, no external buffer); the
     // mbuf's pool is a production pool with its cache slot set, on this
     // owner thread. TX preparation changes only offload metadata and bytes.
-    unsafe { zhida_pktmbuf_free_minimal(raw) };
+    unsafe { switch_pktmbuf_free_minimal(raw) };
 }
 
 #[derive(Clone, Copy)]
@@ -456,7 +456,7 @@ fn register_rx_timestamp() -> Result<RxTimestampField, PortError> {
     let code = unsafe { rte_mbuf_dyn_rx_timestamp_register(&mut offset, &mut flag) };
     if code == -1 {
         // SAFETY: read this thread's rte_errno immediately after registration failed.
-        checked("rte_mbuf_dyn_rx_timestamp_register", unsafe { -zhida_errno() })?;
+        checked("rte_mbuf_dyn_rx_timestamp_register", unsafe { -switch_errno() })?;
     }
     Ok(RxTimestampField {
         // Successful registration returns a nonnegative mbuf byte offset.
@@ -1207,13 +1207,13 @@ impl Drop for Port {
             self.cleanup_attempted = true;
             if let Err(error) = self.cleanup() {
                 use std::io::Write;
-                let _ = writeln!(std::io::stderr(), "Zhida retained port backing: {error}");
+                let _ = writeln!(std::io::stderr(), "switch retained port backing: {error}");
             }
         } else if !self.released {
             use std::io::Write;
             let _ = writeln!(
                 std::io::stderr(),
-                "Zhida retained port backing after refused cleanup"
+                "switch retained port backing after refused cleanup"
             );
         }
         if !self.reset_registered {
@@ -1224,7 +1224,7 @@ impl Drop for Port {
 }
 
 fn check_owner(expected: u32) -> Result<(), PortError> {
-    let actual = unsafe { zhida_lcore_id() };
+    let actual = unsafe { switch_lcore_id() };
     if actual != expected {
         return Err(PortError::OwnerMismatch { expected, actual });
     }
@@ -1315,9 +1315,9 @@ pub(crate) use tests::eth_tx_prepare;
 #[cfg(test)]
 use tests::{close, eth_rx_burst, eth_tx_burst, rx_queue_info_get, start, stop, tx_done_cleanup};
 #[cfg(not(test))]
-pub(crate) use zhida_dpdk_sys::dpdk_raw_eth_tx_prepare as eth_tx_prepare;
+pub(crate) use switch_dpdk_sys::dpdk_raw_eth_tx_prepare as eth_tx_prepare;
 #[cfg(not(test))]
-use zhida_dpdk_sys::{
+use switch_dpdk_sys::{
     dpdk_raw_eth_rx_burst as eth_rx_burst, dpdk_raw_eth_tx_burst as eth_tx_burst,
     rte_eth_dev_close as close, rte_eth_dev_start as start, rte_eth_dev_stop as stop,
     rte_eth_rx_queue_info_get as rx_queue_info_get, rte_eth_tx_done_cleanup as tx_done_cleanup,

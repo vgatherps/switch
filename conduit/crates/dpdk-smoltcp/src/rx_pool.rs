@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(rx_reserve(16, 1, 0, 1), 32 + 33 + 1);
     }
 
-    /// An ENA-shaped port as netconf-open sizes it (nic-runner's feed and the netconf-open
+    /// An ENA-shaped port as switch-open sizes it (switch-nic's feed and the switch-open
     /// examples): 1024 RX descriptors, rx_burst 32, mempool cache 8, staging 32, RX pool =
     /// reserve + share. ENA keeps its ring posted (1023 mbufs: it refills once min(ring / 8,
     /// 256) descriptors are empty), staging is full and the sockets hold their whole share, so

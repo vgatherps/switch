@@ -114,8 +114,8 @@ class BuilderTest(unittest.TestCase):
         frame = b.tcp(40000, 0xFFFFFFFE, 77, PSH | ACK, 502,
                       [("NOP", None), ("NOP", None), ("Timestamp", (5, 6))], b"xyz")
         seg = parse_tcp(frame)
-        self.assertEqual((seg.src_mac, seg.dst_mac), (ENV.tester_mac, ENV.zhida_mac))
-        self.assertEqual((seg.src_ip, seg.dst_ip), (ENV.tester_ip, ENV.zhida_ip))
+        self.assertEqual((seg.src_mac, seg.dst_mac), (ENV.tester_mac, ENV.switch_mac))
+        self.assertEqual((seg.src_ip, seg.dst_ip), (ENV.tester_ip, ENV.switch_ip))
         self.assertEqual((seg.sport, seg.dport, seg.seq, seg.ack), (40000, 8080, 0xFFFFFFFE, 77))
         self.assertEqual((seg.window, seg.payload, seg.timestamp), (502, b"xyz", (5, 6)))
         self.assertTrue(seg.ip_checksum_ok and seg.tcp_checksum_ok)

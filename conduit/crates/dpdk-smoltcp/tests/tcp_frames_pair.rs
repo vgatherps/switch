@@ -5,13 +5,13 @@
 
 use dpdk_smoltcp::smoltcp::wire::TcpSeqNumber;
 use dpdk_smoltcp::{frame_reserve, rx_reserve, Stack, TcpHandle};
-use zhida_test_kit::many;
-use zhida_test_kit::pair::{
+use switch_test_kit::many;
+use switch_test_kit::pair::{
     self, drain_bytes, establish, establish_sized, new_pair, pattern, segment, App, Dir, Pair,
     Side, T0,
 };
-use zhida_test_kit::wire::Verdict;
-use zhida_test_kit::with_eal;
+use switch_test_kit::wire::Verdict;
+use switch_test_kit::with_eal;
 
 /// Queue `data[*sent..]` on `handle` in frames of at most one MSS while the
 /// socket has byte room and the shared pool has frames; returns whether anything was queued.
@@ -87,7 +87,7 @@ fn deliver(pair: &mut Pair, server: &TcpHandle, expected: &[u8]) -> Vec<(Dir, Ve
 
 /// 1 MiB sent from A as application frames over a 64 KiB socket arrives at B
 /// byte for byte.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_frames_1mib_byte_exact() {
     with_eal(|eal| {
         const BUFFER: usize = 65536;
@@ -138,7 +138,7 @@ fn tcp_frames_1mib_byte_exact() {
 /// Two frames queued together leave as two whole segments; both are lost.
 /// The RTO retransmission is one copied segment carrying both, as the byte
 /// ring would send, and B reads the bytes once.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn lost_segment_retransmits_by_coalesced_copy() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["lsca", "lscb"]);
@@ -172,7 +172,7 @@ fn lost_segment_retransmits_by_coalesced_copy() {
 /// is lost. Its retransmission is a copy of the shared payload, the other
 /// connection's segment is unaffected, and both receivers read the payload
 /// once. The application's clone stays intact throughout.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn lost_broadcast_segment_retransmits_by_copy() {
     with_eal(|eal| {
         let configs = [many::config(Side::A, 2), many::config(Side::B, 2)];
@@ -240,7 +240,7 @@ fn lost_broadcast_segment_retransmits_by_copy() {
 /// trigger a fast retransmission before any RTO: one MSS from the lost byte,
 /// copied across the first two frames as the byte ring would send it, and B
 /// reads every byte once.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dupack_fast_retransmit() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["dupfa", "dupfb"]);

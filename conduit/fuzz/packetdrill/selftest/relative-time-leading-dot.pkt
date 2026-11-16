@@ -1,7 +1,7 @@
 // Runner self-test: times written with a leading dot (`+.1`, as upstream google/packetdrill
 // scripts write them) pass the packet-only check and mean what packetdrill's lexer reads,
 // 0.1 s after the previous event. The handshake's ACK goes at +.1 (0.1 s) and the data
-// with it; Zhida echoes the data at once, about 0.1 s, but the script expects the echo
+// with it; switch echoes the data at once, about 0.1 s, but the script expects the echo
 // at +.05, so packetdrill must report a timing error naming 0.15x s: 0.05 s after the
 // data actually went out, a few ms after 0.1 s. Refusing `+.N` lines fails this test.
 // The peer omits timestamps, as in handshake-linux-options.pkt.

@@ -1,11 +1,11 @@
-use zhida_test_kit::pair::pattern;
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::pattern;
+use switch_test_kit::with_eal;
 
 #[allow(dead_code)]
 #[path = "../benches/rx/mod.rs"]
 mod rx;
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_batch_baseline_checks_all_bytes() {
     with_eal(|eal| {
         for k in [1usize, 8] {
@@ -44,7 +44,7 @@ fn rx_batch_baseline_checks_all_bytes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_seg_checks_all_bytes() {
     with_eal(|eal| {
         let k = 8usize;

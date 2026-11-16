@@ -3,13 +3,13 @@ use std::ptr::NonNull;
 
 use smoltcp::phy::{self, Checksum, DeviceCapabilities, Medium, ImmutableFrame, TxChecksum, TxSource};
 use smoltcp::time::Instant;
-use zhida_dpdk_sys::{
-    rte_mbuf, zhida_errno, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
+use switch_dpdk_sys::{
+    rte_mbuf, switch_errno, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
     RTE_MBUF_F_RX_L4_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_MASK, RTE_MBUF_F_TX_IPV4,
     RTE_MBUF_F_TX_TCP_CKSUM, RTE_MBUF_F_TX_UDP_CKSUM,
 };
 
-use zhida_buffer::{FramePool, FRAME_DATA_OFF};
+use switch_buffer::{FramePool, FRAME_DATA_OFF};
 use crate::port::{eth_tx_prepare, Packet, Port, PortError, RxBurst, TxPacket};
 
 /// smoltcp device over one Port with bounded RX staging and TX pending queues.
@@ -88,7 +88,7 @@ impl Device {
                     panic!(
                         "port {port_id}: TX checksum preparation refused at frame {}, rte_errno {}",
                         index + usize::from(ready),
-                        unsafe { zhida_errno() }
+                        unsafe { switch_errno() }
                     );
                 }
                 index += packets.len();

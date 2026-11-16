@@ -24,8 +24,8 @@ use dpdk_smoltcp::smoltcp::wire::{
 use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Turn};
 
-use zhida_test_kit::many::{self, assert_quiet};
-use zhida_test_kit::pair::{
+use switch_test_kit::many::{self, assert_quiet};
+use switch_test_kit::pair::{
     establish_sized, pattern, segment, App, Dir, Pair, Side, BUDGET, CLIENT_PORT, SERVER_PORT, T0,
 };
 
@@ -60,13 +60,13 @@ pub(super) fn setup(eal: &Eal, k: usize, buffer: usize) -> (Pair, [TcpHandle; 2]
         T0,
         16,
         |side, port| {
-            port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+            port.rx_pool.count = switch_test_kit::pair::pool_count(rx_reserve(
                 port.rx_descriptors,
                 port.rx_burst,
                 configs[side.index()].rx_staging,
                 port.rx_pool.cache_size,
-            ), zhida_test_kit::pair::windows(port.mtu, [buffer]));
-            port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [buffer]));
+            ), switch_test_kit::pair::windows(port.mtu, [buffer]));
+            port.frame_pool.count = switch_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), switch_test_kit::pair::windows(port.mtu, [buffer]));
         },
     );
     let (handles, frames) = establish_sized(&mut pair, Side::A, buffer);

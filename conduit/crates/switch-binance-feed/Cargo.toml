@@ -1,0 +1,25 @@
+[package]
+name = "switch-binance-feed"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+switch-ws = { workspace = true, features = ["switch-net"] }
+switch.workspace = true
+switch-net.workspace = true
+switch-tap-echo.workspace = true
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+webpki-roots = "=1.0.9"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+dpdk-smoltcp.workspace = true
+switch-test-kit.workspace = true
+switch-test-support.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+switch-tls.workspace = true
+tungstenite.workspace = true
+switch-buffer.workspace = true
+switch-dpdk-sys.workspace = true

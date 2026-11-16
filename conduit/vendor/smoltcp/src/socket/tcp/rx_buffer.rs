@@ -1,5 +1,5 @@
 use alloc::rc::Rc;
-use netframe::OwnedFrame;
+use switch_frame::OwnedFrame;
 
 use crate::phy::RxShared;
 use super::rx_store::RxStore;

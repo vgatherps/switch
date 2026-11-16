@@ -1,5 +1,5 @@
 // A Linux client (window scale 7) sends 1000 bytes while advertising 4 window units,
-// 512 bytes. Zhida echoes exactly 512 bytes and holds the other 488 until the client's
+// 512 bytes. Switch echoes exactly 512 bytes and holds the other 488 until the client's
 // ACK slides the window, then sends them. Handshake and window 32768: see
 // handshake-linux-options.pkt and echo-and-close.pkt. smoltcp 0.14.0 src/socket/tcp.rs:
 // - The client's window is its field shifted by its scale, 4 << 7 (2064-2070). It is
@@ -10,12 +10,12 @@
 //   what is in flight (2643-2656), within Cubic's 1 MiB initial window and the 1460-byte MSS. No PSH: the segment does not empty the tx
 //   buffer (2724-2734).
 // - The client's ACK of 512 with the same 4 units moves the right edge to 1025; the same
-//   turn sends the remaining 488 bytes, now emptying the tx buffer, so PSH. Had Zhida
+//   turn sends the remaining 488 bytes, now emptying the tx buffer, so PSH. Had switch
 //   sent past the window during the 50 ms gap, that segment would be the next one
 //   packetdrill reads instead of the 488 bytes.
 // Window-update ACK after the handshake: the SYN-ACK window is unscaled, capped 65535;
 // the 128 KiB receive window is 32768 << 2, at least twice 65535,
-// so Zhida sends one pure window-update ACK.
+// so switch sends one pure window-update ACK.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>

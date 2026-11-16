@@ -1,4 +1,4 @@
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use dpdk_smoltcp::TcpHandle;
@@ -9,7 +9,7 @@ use dpdk_smoltcp::smoltcp::wire::{
     TcpRepr, TcpSeqNumber,
 };
 
-use zhida_test_kit::{pair, ring_port, with_eal};
+use switch_test_kit::{pair, ring_port, with_eal};
 use pair::{
     establish, establish_sized, new_pair, pattern, segment, App, Dir, Pair, Side, CLIENT_PORT, MAX_ROUNDS,
     SERVER_PORT,
@@ -21,8 +21,8 @@ const ECHO_LEN: usize = 64 * 1024;
 const RTO: Duration = Duration::from_millis(300);
 
 fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
-    use zhida_test_kit::wire::{in_use, pool_by_name};
-    use zhida_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
+    use switch_test_kit::wire::{in_use, pool_by_name};
+    use switch_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
 
     assert_eq!(in_use(name), 0);
     let pool = pool_by_name(name);
@@ -46,7 +46,7 @@ fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn single_hole_fill_with_all_ooo_slots_progresses() {
     with_eal(|eal| {
         const SEGMENT: usize = 1448;
@@ -96,9 +96,9 @@ fn single_hole_fill_with_all_ooo_slots_progresses() {
         pair.a_to_b.impair(move |frame| {
             if !dropped && !segment(frame, Side::A).payload.is_empty() {
                 dropped = true;
-                zhida_test_kit::wire::Verdict::Drop
+                switch_test_kit::wire::Verdict::Drop
             } else {
-                zhida_test_kit::wire::Verdict::Deliver
+                switch_test_kit::wire::Verdict::Deliver
             }
         });
         pair.b_to_a.paused = true;
@@ -198,7 +198,7 @@ fn assert_no_drops(pair: &Pair) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn arp_and_handshake_a_connects_b_listens() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["hs1a", "hs1b"]);
@@ -209,7 +209,7 @@ fn arp_and_handshake_a_connects_b_listens() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn two_connections_interleave_one_segment_per_visit() {
     with_eal(|eal| {
         {
@@ -296,7 +296,7 @@ fn two_connections_interleave_one_segment_per_visit() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn arp_and_handshake_b_connects_a_listens() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["hs2a", "hs2b"]);
@@ -387,7 +387,7 @@ fn establish_small_segment_clients(pair: &mut Pair, count: u16) -> Vec<TcpHandle
     handles
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn turn_sends_all_six_segments_in_connection_order() {
     with_eal(|eal| {
         let mut config = pair::config(Side::A);
@@ -427,7 +427,7 @@ fn turn_sends_all_six_segments_in_connection_order() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn lone_burst_keeps_poll_at_and_retransmits_at_deadline() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["idlertoa", "idlertob"]);
@@ -659,7 +659,7 @@ fn close_both(pair: &mut Pair, handles: &[TcpHandle; 2]) {
     );
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn echo_64k_each_way_short_reads_fin_close_all_pools_zero() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["echoa", "echob"]);
@@ -672,7 +672,7 @@ fn echo_64k_each_way_short_reads_fin_close_all_pools_zero() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn two_stack_mixed_sizes_deliver_bytes() {
     with_eal(|eal| {
         const CAPACITY: usize = 65536;
@@ -754,7 +754,7 @@ fn two_stack_mixed_sizes_deliver_bytes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn two_stacks_pipelined_messages_complete_without_ack_delay() {
     with_eal(|eal| {
         const MESSAGE_LEN: usize = 300;
@@ -841,7 +841,7 @@ fn two_stacks_pipelined_messages_complete_without_ack_delay() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn drive_fails_at_round_cap_when_app_never_finishes() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["capa", "capb"]);

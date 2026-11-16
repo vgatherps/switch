@@ -1,5 +1,0 @@
-[package]
-name = "depot"
-version.workspace = true
-edition.workspace = true
-description = "Growable slot-number allocator: lowest free slot first, no capacity"

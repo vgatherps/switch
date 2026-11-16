@@ -1,4 +1,4 @@
-// A Linux client sends 1000 bytes and gets them back, then closes; Zhida ACKs the FIN,
+// A Linux client sends 1000 bytes and gets them back, then closes; switch ACKs the FIN,
 // sends its own FIN and listens again: a second connection on the same 4-tuple gets a
 // SYN-ACK and echoes 10 bytes, and after the client's RST a third SYN gets a SYN-ACK
 // (proving the RST was processed). The data segments carry the handshake's ACK too, so the
@@ -6,10 +6,10 @@
 // packetdrill fills inbound payloads with zero bytes, so echoes check length and sequence
 // position only; echoed content is covered by the kernel_interop tests. smoltcp 0.14.0
 // src/socket/tcp.rs unless noted; EchoServer and serve are
-// crates/tap-echo/src/lib.rs; Stack::turn is crates/dpdk-smoltcp/src/stack.rs, which runs
+// crates/switch-tap-echo/src/lib.rs; Stack::turn is crates/dpdk-smoltcp/src/stack.rs, which runs
 // Stack::ingress then Stack::egress.
 // - SYN-ACK options: see handshake-linux-options.pkt. The peer omits timestamps,
-//   so Zhida sends no timestamp options.
+//   so switch sends no timestamp options.
 // - Payload sizes: smoltcp's effective MSS is min(1460, Linux's 1460), i.e. 1460
 //   (2313-2320); 1000 and 10 bytes stay one segment each.
 // - Data: no separate ACK. The 1000 bytes start the 10 ms delayed-ACK timer (300, 617,
@@ -26,7 +26,7 @@
 //   and step listens again (lib.rs 96-102); otherwise the second SYN would meet the LastAck
 //   socket, which drops a segment without ACK (1660-1663), and packetdrill would time out
 //   waiting for the SYN-ACK.
-// - Each handshake: tap-echo uses OS entropy for the interface seed; smoltcp derives
+// - Each handshake: switch-tap-echo uses OS entropy for the interface seed; smoltcp derives
 //   its ISN from a keyed tuple hash plus a 4 us clock (RFC 6528). Patched packetdrill
 //   learns each new handshake's server ISN and maps it to 0; subsequent server
 //   sequence numbers and client ACKs are offsets from that ISN. SYN-ACK
@@ -37,13 +37,13 @@
 //   would be dropped by the established socket (1660-1663) and packetdrill would time out.
 // - The client waits 100 ms before each new SYN so that the packet closing the previous
 //   connection and the SYN are not processed in one turn's ingress: the SYN would reach
-//   tap-echo's single listener while it is closed, before step listens again (lib.rs
+//   switch-tap-echo's single listener while it is closed, before step listens again (lib.rs
 //   174-175). smoltcp 0.14 has no accept backlog, so such a SYN is refused with RST
 //   (src/iface/interface/tcp.rs 43-56); Linux queues it on the listener. Temporary, until
-//   Zhida's smoltcp fork.
+//   Switch's smoltcp fork.
 // - Window update after each handshake: the SYN-ACK window is unscaled, capped 65535;
 //   the 128 KiB receive window is 32768 << 2, at least twice 65535,
-//   so Zhida sends one pure window-update ACK.
+//   so switch sends one pure window-update ACK.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>
 +0    > S. 0:0(0) ack 1 win 65535 <mss 1460,wscale 2,sackOK,eol,eol,eol>

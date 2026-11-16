@@ -1,0 +1,56 @@
+[package]
+name = "switch-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# WebSocket over switch-net TCP (module `switch-net`): ws:// and wss:// (through switch-tls) clients,
+# a ws:// server.
+switch-net = ["dep:switch-net", "dep:rustls", "switch-tls/switch-net"]
+# Test-only: the Docker end-to-end tests (DPDK net_tap, Linux), on switch-net's testkit.
+e2e = ["switch-net", "switch-net/testkit", "dep:switch", "dep:switch-test-support", "dep:switch-tap-echo", "dep:switch-junction"]
+
+[dependencies]
+# Client-role frame masks (RFC 6455 §5.3) and Sec-WebSocket-Key: per-connection CSPRNG.
+rand = "0.10"
+# The TLS lower layer (TlsRx/TlsTx) and the frame traits.
+switch-tls.workspace = true
+# The WebSocket upgrade (rare path): HTTP request and response parse, Sec-WebSocket-Accept.
+httparse = "1.10"
+sha1 = "0.11"
+data-encoding = "2.11"
+rustls = { version = "=0.23.43", default-features = false, features = ["std"], optional = true }
+switch-net = { workspace = true, optional = true }
+# The Runtime of the Autobahn driver and the e2e tests.
+switch = { workspace = true, optional = true }
+switch-test-support = { workspace = true, optional = true }
+# The Autobahn driver (bin switch-ws-autobahn): tester process, EAL and net_tap Port.
+switch-tap-echo = { workspace = true, optional = true }
+switch-junction = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The send core's wake tests run in a switch Runtime.
+switch.workspace = true
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+tungstenite.workspace = true
+trybuild = "1.0"
+# setsockopt in the Docker end-to-end tests.
+libc.workspace = true
+
+[[bin]]
+name = "switch-ws-autobahn"
+required-features = ["e2e"]
+
+[[test]]
+name = "wss_switch_net"
+required-features = ["e2e"]
+
+[[test]]
+name = "compile_fail"
+required-features = ["switch-net"]
+
+[lints]
+workspace = true

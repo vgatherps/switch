@@ -1,6 +1,6 @@
 // A reordered Linux-peer segment retains its payload even though its ACK is older
 // than SND.UNA (Linux tcp_ack old_ack). The peer sends the gap-fill before seeing
-// the first echo; a later segment acknowledging that echo reaches Zhida first.
+// the first echo; a later segment acknowledging that echo reaches switch first.
 // The delayed gap-fill must advance RCV.NXT to 10 and release all six buffered bytes.
 // Its zero-window advertisement must not replace the later segment's open window.
 // smoltcp 0.14.0 src/socket/tcp.rs:

@@ -2,33 +2,33 @@
 //!
 //! Start with `docs/USAGE.md` in the repository. It covers EAL, `Port`, `Stack`,
 //! pool sizing, the drive calls and shutdown. Most applications open the Stack
-//! through `zhida-open` instead of calling `Eal::init` and `Port::open` here.
+//! through `switch-open` instead of calling `Eal::init` and `Port::open` here.
 //!
-//! `make test-stack` builds `zhida-buffer` with default features as a dependency
-//! of this crate (`tap-echo` also depends on it that way), so these doctests check
+//! `make test-stack` builds `switch-buffer` with default features as a dependency
+//! of this crate (`switch-tap-echo` also depends on it that way), so these doctests check
 //! that the test-only EAL and pool helpers are not exported. They assume a
 //! per-package run (`cargo test -p dpdk-smoltcp`): testing several packages at
-//! once, `zhida-buffer`'s included, unifies the `testing` feature that its self
+//! once, `switch-buffer`'s included, unifies the `testing` feature that its self
 //! dev-dependency enables, and these `compile_fail` tests then fail.
 //!
 //! ```compile_fail,E0432
-//! use zhida_buffer::ensure_eal_init;
+//! use switch_buffer::ensure_eal_init;
 //! ```
 //! ```compile_fail,E0432
-//! use zhida_buffer::acquire_test_pool;
+//! use switch_buffer::acquire_test_pool;
 //! ```
 //! ```compile_fail,E0432
-//! use zhida_buffer::TestPoolGuard;
+//! use switch_buffer::TestPoolGuard;
 //! ```
 //! ```compile_fail,E0599
-//! let _ = zhida_buffer::PoolManager::new;
+//! let _ = switch_buffer::PoolManager::new;
 //! ```
 //! ```compile_fail,E0599
-//! let _ = zhida_buffer::PoolManager::new_unchecked;
+//! let _ = switch_buffer::PoolManager::new_unchecked;
 //! ```
 //! The production API resolves through the same paths:
 //! ```
-//! use zhida_buffer::{Mbuf, PoolConfig, PoolCreateError, PoolManager};
+//! use switch_buffer::{Mbuf, PoolConfig, PoolCreateError, PoolManager};
 //! let _ = PoolManager::new_production;
 //! ```
 //! Applications cannot disable TX frame-pool wakes:

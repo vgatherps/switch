@@ -4,7 +4,7 @@ Frames are serialized valid first (wire.Builder, Scapy), then their bytes are ch
 so Scapy never repairs a malformed field. Byte constructors change exactly one field (or,
 for options and lengths, the header fields that describe them); `apply` then recomputes the
 checksums as the receiver reads the mutated header (wire.fix_checksums), unless the
-mutation is a bad checksum, so a mutated segment reaches Zhida's TCP logic instead of
+mutation is a bad checksum, so a mutated segment reaches switch's TCP logic instead of
 dying at the checksum.
 
 A mutation spec, drawn by `draw` into the plan, is {"class", "kind", "target", "p"}:
@@ -183,10 +183,10 @@ def payload_xor(frame, lo, hi):
 @dataclass
 class View:
     """What a mutation may know when it fires, all absolute sequence numbers."""
-    peer_ack: int  # Zhida's latest ACK number: its RCV.NXT
-    peer_right: int  # right edge of Zhida's advertised window
-    peer_max_right: int  # peer_ack + the largest window Zhida's announced scale allows
-    rcv_nxt: int  # the fuzzer's RCV.NXT (Zhida's sequence space)
+    peer_ack: int  # switch's latest ACK number: its RCV.NXT
+    peer_right: int  # right edge of switch's advertised window
+    peer_max_right: int  # peer_ack + the largest window switch's announced scale allows
+    rcv_nxt: int  # the fuzzer's RCV.NXT (switch's sequence space)
     stream: bytes  # the planned payload, for SYN data
     build: Callable  # (seq, flags, payload=b"") -> clean frame from the fuzzer
 

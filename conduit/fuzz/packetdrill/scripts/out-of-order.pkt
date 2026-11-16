@@ -1,6 +1,6 @@
-// The client's second segment arrives before its first: Zhida answers at once with a
+// The client's second segment arrives before its first: switch answers at once with a
 // duplicate ACK whose SACK block names the buffered segment (RFC 2018, RFC 5681 4.2), as
-// Linux does. When the first segment fills the hole, Zhida ACKs both at once and
+// Linux does. When the first segment fills the hole, switch ACKs both at once and
 // echoes 2896 bytes at the right sequence positions. packetdrill sends zero payloads, so
 // the byte order itself is covered by the kernel_interop tests, not here.
 // smoltcp 0.14.0 src/socket/tcp.rs; SYN-ACK and ISN conventions as in
@@ -20,7 +20,7 @@
 //   the complete 2896-byte echo: 1460 bytes followed immediately by 1436.
 //   The second segment carries PSH because it empties the TX buffer.
 // Window-update ACK after the handshake: the SYN-ACK window is unscaled, capped 65535;
-// the 128 KiB receive target (32768 << 2) is >= 2 x 65535, so Zhida sends
+// the 128 KiB receive target (32768 << 2) is >= 2 x 65535, so switch sends
 // one pure window-update ACK.
 
 0     < S 0:0(0) win 64240 <mss 1460,nop,nop,sackOK,nop,wscale 7>

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare an Autobahn report index.json to relay's expected results.
+"""Compare an Autobahn report index.json to switch-ws's expected results.
 
 Exit 0: exact per-case match. Exit 1: mismatch. Exit 2: malformed input.
 """
@@ -12,9 +12,9 @@ import subprocess
 import sys
 import tempfile
 
-AGENT = "relay"
+AGENT = "switch-ws"
 COMPARED = ("behavior", "behaviorClose", "remoteCloseCode")
-DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expected-results-relay.json")
+DEFAULT_EXPECTED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expected-results-switch-ws.json")
 
 
 class Malformed(Exception):

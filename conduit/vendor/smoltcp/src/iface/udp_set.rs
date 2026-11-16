@@ -1,6 +1,6 @@
 use alloc::{collections::VecDeque, rc::Rc, vec::Vec};
 use core::ops::Range;
-use netframe::OwnedFrame;
+use switch_frame::OwnedFrame;
 
 use super::Interface;
 use super::{bind_word, slot_map, SlotMap};

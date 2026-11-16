@@ -1,0 +1,35 @@
+[package]
+name = "switch-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "switch-bench"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc.workspace = true
+dpdk-smoltcp.workspace = true
+libc.workspace = true
+switch-junction.workspace = true
+switch-ws = { workspace = true, features = ["switch-net"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+switch.workspace = true
+switch-net.workspace = true
+tungstenite.workspace = true
+switch-dpdk-sys.workspace = true
+switch-netconf.workspace = true
+switch-open.workspace = true
+
+[features]
+# Test-only: the Docker end-to-end test over net_tap (NET_ADMIN, /dev/net/tun).
+e2e = []
+
+[dev-dependencies]
+switch-test-support.workspace = true
+
+[lints]
+workspace = true

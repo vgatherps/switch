@@ -111,7 +111,7 @@ mod held_frames;
 
 pub use self::loopback::Loopback;
 pub use self::rx_buf::RxBuf;
-pub use netframe::{ImmutableFrame, OwnedFrame};
+pub use switch_frame::{ImmutableFrame, OwnedFrame};
 pub use self::tx_buf::{alloc_frame, frame_headroom, frame_packet, TxPool, TxSource, TX_HEADROOM};
 #[cfg(feature = "dpdk")]
 pub use self::tx_buf::frame_mbuf;

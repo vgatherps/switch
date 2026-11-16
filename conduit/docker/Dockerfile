@@ -39,7 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends flex bison patc
 RUN apt-get update && apt-get install -y --no-install-recommends python3-scapy \
     && rm -rf /var/lib/apt/lists/*
 
-# Kernel-side load-latency client for the Zhida sockperf-compatible server.
+# Kernel-side load-latency client for the switch sockperf-compatible server.
 RUN apt-get update && apt-get install -y --no-install-recommends autoconf automake libtool \
     && rm -rf /var/lib/apt/lists/* \
     && curl --fail --location --retry 2 -o /tmp/sockperf.tar.gz \

@@ -6,14 +6,14 @@ use crate::port::tests::{
     produce, rx_frame_bytes, tx_calls, FaultGuard, Faults, Fixture,
 };
 use crate::port::{Offloads, PortError};
-use zhida_test_kit::pair::{self, Side};
-use zhida_test_kit::pcap::{write_pcap, PcapVdev};
+use switch_test_kit::pair::{self, Side};
+use switch_test_kit::pcap::{write_pcap, PcapVdev};
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, TcpSet};
 use smoltcp::phy::{
     Checksum, ChecksumCapabilities, Device as _, PacketMeta, RxToken as _,
     TxChecksum, TxToken as _,
 };
-use zhida_buffer::PoolConfig;
+use switch_buffer::PoolConfig;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, HardwareAddress, IpAddress,
     IpCidr, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
@@ -24,7 +24,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use zhida_dpdk_sys::{
+use switch_dpdk_sys::{
     RTE_MBUF_F_RX_IP_CKSUM_BAD, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
     RTE_MBUF_F_RX_L4_CKSUM_BAD, RTE_MBUF_F_RX_L4_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_MASK,
 };
@@ -234,7 +234,7 @@ fn checksum_ingress(fixture: &Fixture, device: &mut Device, bytes: &[u8], flags:
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn good_skips_verify() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -252,7 +252,7 @@ fn good_skips_verify() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unknown_still_verified() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -295,7 +295,7 @@ fn unknown_still_verified() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bad_l4_meta_is_not_verified() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -310,7 +310,7 @@ fn bad_l4_meta_is_not_verified() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn none_is_not_good_or_bad() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -336,7 +336,7 @@ fn none_is_not_good_or_bad() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn profile_off_ignores_verdicts() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -377,7 +377,7 @@ fn tx_metadata(packet: &TxPacket) -> (u64, u64, u64, u64) {
     mbuf_tx_metadata(packet.as_ptr())
 }
 
-fn mbuf_tx_metadata(mbuf: *mut zhida_dpdk_sys::rte_mbuf) -> (u64, u64, u64, u64) {
+fn mbuf_tx_metadata(mbuf: *mut switch_dpdk_sys::rte_mbuf) -> (u64, u64, u64, u64) {
     unsafe {
         let raw = &*mbuf;
         let lengths = &raw.__bindgen_anon_3.__bindgen_anon_1;
@@ -426,7 +426,7 @@ fn udp_frame() -> Vec<u8> {
     bytes
 }
 
-fn poison_tx_pool(device: &mut Device) -> Vec<*mut zhida_dpdk_sys::rte_mbuf> {
+fn poison_tx_pool(device: &mut Device) -> Vec<*mut switch_dpdk_sys::rte_mbuf> {
     assert!(device.tx.is_empty());
     let mut ids = Vec::new();
     if let Some(packet) = device.spare.as_mut() {
@@ -473,7 +473,7 @@ fn capture_socket_frame(
     fixture: &Fixture,
     device: &mut Device,
     offload: bool,
-    poisoned: &[*mut zhida_dpdk_sys::rte_mbuf],
+    poisoned: &[*mut switch_dpdk_sys::rte_mbuf],
 ) -> Vec<u8> {
     assert_eq!(device.tx.len(), 1);
     let packet = &device.tx[0];
@@ -512,7 +512,7 @@ fn capture_socket_frame(
     assert_eq!(tx_metadata(&device.tx[0]), metadata);
     if offload {
         assert_eq!(
-            unsafe { zhida_dpdk_sys::dpdk_raw_net_intel_cksum_prepare(raw) },
+            unsafe { switch_dpdk_sys::dpdk_raw_net_intel_cksum_prepare(raw) },
             0
         );
         // SAFETY: the pending packet is this TX-pool mbuf's only reference.
@@ -673,7 +673,7 @@ fn socket_template_frames(
     frames
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn template_socket_frames_complete_to_software_checksum() {
     with_test_eal(|eal| {
         for timestamps in [false, true] {
@@ -686,7 +686,7 @@ fn template_socket_frames_complete_to_software_checksum() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn template_emit_overwrites_reused_mbuf_bytes() {
     with_test_eal(|eal| {
         for timestamps in [false, true] {
@@ -699,7 +699,7 @@ fn template_emit_overwrites_reused_mbuf_bytes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_metadata_and_one_prepare_for_mixed_frames() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 8);
@@ -751,7 +751,7 @@ fn tx_metadata_and_one_prepare_for_mixed_frames() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_only_profile_prepares_complete_udp_without_offload() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -771,7 +771,7 @@ fn tcp_only_profile_prepares_complete_udp_without_offload() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_profile_off_leaves_complete_frames_untouched() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -791,7 +791,7 @@ fn tx_profile_off_leaves_complete_frames_untouched() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dropped_tx_metadata_and_spare_flags_do_not_reach_next_frame() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -814,7 +814,7 @@ fn dropped_tx_metadata_and_spare_flags_do_not_reach_next_frame() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn flush_prepares_each_range_once() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -844,7 +844,7 @@ fn flush_prepares_each_range_once() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn flush_prepares_once_across_partial_bursts() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -908,7 +908,7 @@ fn flush_prepares_once_across_partial_bursts() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn capabilities_follow_tx_profile() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -927,7 +927,7 @@ fn capabilities_follow_tx_profile() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn wrapped_flush_prepares_both_unprepared_parts_once() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 8);
@@ -978,7 +978,7 @@ fn wrapped_flush_prepares_both_unprepared_parts_once() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn prepare_refusal_panics_in_flush() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1011,7 +1011,7 @@ fn prepare_refusal_panics_in_flush() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_prepare_refusal_panics_in_flush() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1038,7 +1038,7 @@ fn udp_prepare_refusal_panics_in_flush() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_frames_without_metadata_are_not_parsed() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1068,7 +1068,7 @@ fn udp_frames_without_metadata_are_not_parsed() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn prepared_frames_return_to_pool_after_flush_panic() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1104,7 +1104,7 @@ fn prepared_frames_return_to_pool_after_flush_panic() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn complete_frames_without_metadata_ignore_header_shape() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1148,7 +1148,7 @@ fn complete_frames_without_metadata_ignore_header_shape() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_send_offload_writes_zero_and_flags_frame() {
     use smoltcp::iface::{UdpConfig, UdpSet};
     use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, IpEndpoint};
@@ -1223,7 +1223,7 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
                 assert_eq!(prepare_args(), (device.port.port_id(), 0, 1));
                 let raw = device.tx[0].as_ptr();
                 assert_eq!(
-                    unsafe { zhida_dpdk_sys::dpdk_raw_net_intel_cksum_prepare(raw) },
+                    unsafe { switch_dpdk_sys::dpdk_raw_net_intel_cksum_prepare(raw) },
                     0
                 );
                 // SAFETY: the pending packet is this TX-pool mbuf's only reference.
@@ -1247,7 +1247,7 @@ fn udp_send_offload_writes_zero_and_flags_frame() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_template_frames_match_generic_and_flags() {
     use smoltcp::iface::{UdpConfig, UdpSet};
     use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, IpEndpoint};
@@ -1336,7 +1336,7 @@ fn udp_template_frames_match_generic_and_flags() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn hardware_stamp_reaches_rx_buf() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1362,7 +1362,7 @@ impl PcapFiles {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "zhida-pcap-{}-{time}-{}",
+            "switch-pcap-{}-{time}-{}",
             std::process::id(),
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1403,7 +1403,7 @@ fn check_pcap_rx_timestamp(eal: &crate::Eal, enabled: bool) {
     // SAFETY: both output pointers are valid; this retrieves the registration
     // net_pcap made at probe without enabling timestamp reads on the Port.
     assert_eq!(
-        unsafe { zhida_dpdk_sys::rte_mbuf_dyn_rx_timestamp_register(&mut offset, &mut flag) },
+        unsafe { switch_dpdk_sys::rte_mbuf_dyn_rx_timestamp_register(&mut offset, &mut flag) },
         0
     );
     assert!(offset >= 0);
@@ -1439,17 +1439,17 @@ fn check_pcap_rx_timestamp(eal: &crate::Eal, enabled: bool) {
     assert_no_pools();
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pcap_pmd_stamp_reaches_rx_buf() {
     with_test_eal(|eal| check_pcap_rx_timestamp(eal, true));
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pcap_pmd_stamp_ignored_when_off() {
     with_test_eal(|eal| check_pcap_rx_timestamp(eal, false));
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pcap_hardware_open_refused() {
     with_test_eal(|eal| {
         let files = PcapFiles::new(&udp_frame());
@@ -1474,7 +1474,7 @@ fn pcap_hardware_open_refused() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn hardware_mode_unflagged_packet_has_no_stamp() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1486,7 +1486,7 @@ fn hardware_mode_unflagged_packet_has_no_stamp() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn off_mode_ignores_flagged_stamp() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1503,7 +1503,7 @@ fn off_mode_ignores_flagged_stamp() {
 }
 
 fn write_rx_timestamp(
-    raw: *mut zhida_dpdk_sys::rte_mbuf,
+    raw: *mut switch_dpdk_sys::rte_mbuf,
     field: crate::port::RxTimestampField,
     stamp: u64,
     flagged: bool,
@@ -1538,7 +1538,7 @@ fn check_rx_timestamp(
     assert_eq!(in_use(&device.port).0, 0);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_datagram_reports_hardware_stamp() {
     use crate::{Stack, StackConfig, UdpConfig, DEFAULT_NEIGHBOR_CAPACITY};
     use smoltcp::wire::Ipv4Cidr;
@@ -1603,7 +1603,7 @@ fn udp_datagram_reports_hardware_stamp() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_token_owns_exact_bytes_and_returns_buffer() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1656,7 +1656,7 @@ fn check_tcp_rx_timestamps(eal: &crate::Eal, payloads: [&[u8]; 2]) {
         packets.push(device.rx.pop_front().unwrap());
         reply.seq_number += payload.len();
     }
-    let arp = zhida_test_kit::ring_port::arp(
+    let arp = switch_test_kit::ring_port::arp(
         ArpOperation::Reply,
         Side::A.mac(),
         (Side::B.mac(), Side::B.ip()),
@@ -1748,7 +1748,7 @@ fn owned_address_stack(
     let fixture = Fixture::new();
     let port = unsafe { Port::open(eal, stack_port_config(&fixture, 8)) }.unwrap();
     let device = Device::new(port, 4, 4);
-    let arp = zhida_test_kit::ring_port::arp(
+    let arp = switch_test_kit::ring_port::arp(
         ArpOperation::Reply,
         Side::A.mac(),
         (Side::B.mac(), Side::B.ip()),
@@ -1801,7 +1801,7 @@ fn sent_tcp(fixture: &Fixture) -> Vec<(Ipv4Address, bool, bool)> {
 /// Abort, then reconnect on the same tuple from an owned (not interface) address before the
 /// Stack runs: the reconnect replaces the RST the abort owed, so the next send emits only the
 /// new SYN, from the owned address.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn same_tuple_reconnect_on_owned_address_sends_syn() {
     use smoltcp::socket::tcp::State;
     use smoltcp::wire::Ipv4Cidr;
@@ -1824,21 +1824,21 @@ fn same_tuple_reconnect_on_owned_address_sends_syn() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_views_carry_hardware_stamps() {
     with_test_eal(|eal| {
         check_tcp_rx_timestamps(eal, [&[b'a'; 200], &[b'b'; 200]]);
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_small_consecutive_segments_keep_hardware_stamps() {
     with_test_eal(|eal| {
         check_tcp_rx_timestamps(eal, [b"abc", b"def"]);
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_into_buf_releases_on_drop_without_copy() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1865,7 +1865,7 @@ fn token_ptr(token: &Tx<'_>) -> *const u8 {
     token.packet.as_ref().unwrap().data().as_ptr()
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn unused_tokens_hold_one_tx_buffer() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1894,7 +1894,7 @@ fn unused_tokens_hold_one_tx_buffer() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn consumed_spare_leaves_none_and_next_token_allocates() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1917,7 +1917,7 @@ fn consumed_spare_leaves_none_and_next_token_allocates() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn spare_returns_on_into_port_and_on_drop() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1939,7 +1939,7 @@ fn spare_returns_on_into_port_and_on_drop() {
 }
 
 /// More staged and pending packets than the 8-entry mempool cache holds.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn into_port_returns_many_staged_and_pending_packets() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 20, 21);
@@ -1957,7 +1957,7 @@ fn into_port_returns_many_staged_and_pending_packets() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_consume_queues_exactly_len_bytes() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1979,7 +1979,7 @@ fn tx_consume_queues_exactly_len_bytes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn implicit_drop_releases_packets_before_port_cleanup() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -1993,7 +1993,7 @@ fn implicit_drop_releases_packets_before_port_cleanup() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn partial_flush_keeps_suffix() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2024,7 +2024,7 @@ fn frames(range: std::ops::Range<u8>) -> Vec<Vec<u8>> {
     range.map(|value| vec![value; 60]).collect()
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn flush_offers_bursts_until_pending_drains() {
     with_test_eal(|eal| {
         // Bursts of two; the seven-slot TX ring takes all six frames.
@@ -2049,7 +2049,7 @@ fn flush_offers_bursts_until_pending_drains() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn flush_stops_after_the_first_short_burst_and_keeps_suffix() {
     with_test_eal(|eal| {
         // Bursts of four into a seven-slot ring: four, then three of four.
@@ -2079,7 +2079,7 @@ fn flush_stops_after_the_first_short_burst_and_keeps_suffix() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn callback_panic_queues_nothing_and_releases() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2105,7 +2105,7 @@ fn callback_panic_queues_nothing_and_releases() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn callback_panic_on_spare_frees_it_and_next_token_is_full_frame() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2128,7 +2128,7 @@ fn callback_panic_on_spare_frees_it_and_next_token_is_full_frame() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn oversize_consume_panics_and_releases() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2148,7 +2148,7 @@ fn oversize_consume_panics_and_releases() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_pool_exhausted_receive_none_rx_stays_staged_then_recovers() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2168,7 +2168,7 @@ fn tx_pool_exhausted_receive_none_rx_stays_staged_then_recovers() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn spare_serves_one_token_then_exhausted_pool_refuses_and_recovers() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2193,7 +2193,7 @@ fn spare_serves_one_token_then_exhausted_pool_refuses_and_recovers() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn full_pending_refuses_tokens_until_flush() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 2);
@@ -2219,7 +2219,7 @@ fn full_pending_refuses_tokens_until_flush() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn capabilities_frame_is_mtu_plus_14() {
     with_test_eal(|eal| {
         let (fixture, device) = open(eal, 4, 4);
@@ -2234,7 +2234,7 @@ fn capabilities_frame_is_mtu_plus_14() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn interface_answers_arp_request_through_paired_token_exact_bytes() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2302,7 +2302,7 @@ fn interface_answers_arp_request_through_paired_token_exact_bytes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
     with_test_eal(|eal| {
         let fixture = Fixture::new();
@@ -2338,13 +2338,13 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
             tx_checksum: true,
             broadcast: false,
         }).unwrap();
-        let arp = zhida_test_kit::ring_port::arp(
+        let arp = switch_test_kit::ring_port::arp(
             smoltcp::wire::ArpOperation::Reply,
             config.ethernet,
             (EthernetAddress([0x02, 0, 0, 0, 0, 2]), Ipv4Address::new(10, 0, 0, 2)),
             (config.ethernet, config.ipv4.address()),
         );
-        produce(&fixture, &[zhida_test_kit::wire::copy_into(pool, &arp)]);
+        produce(&fixture, &[switch_test_kit::wire::copy_into(pool, &arp)]);
         stack.turn(NOW, 4).unwrap();
         drop(peer_receive(&fixture, 16));
         produce(&fixture, &[raw]);
@@ -2359,7 +2359,7 @@ fn stack_l4_bad_verified_in_software_and_l4_good_trusted() {
         }).unwrap();
         drop(frames);
         let inject = |bytes: &[u8], flags: u64| {
-            let raw = zhida_test_kit::wire::copy_into(pool, bytes);
+            let raw = switch_test_kit::wire::copy_into(pool, bytes);
             unsafe { (*raw).ol_flags = flags };
             produce(&fixture, &[raw]);
         };
@@ -2489,7 +2489,7 @@ fn wire(header: &Header, payload: &[u8]) -> Vec<u8> {
     [header.bytes(), payload].concat()
 }
 
-fn mbuf(frame: &ImmutableFrame) -> &zhida_dpdk_sys::rte_mbuf {
+fn mbuf(frame: &ImmutableFrame) -> &switch_dpdk_sys::rte_mbuf {
     // SAFETY: the frame's reference keeps its mbuf live; only read here.
     unsafe { &*phy::frame_mbuf(frame).as_ptr() }
 }
@@ -2507,7 +2507,7 @@ fn ring_bytes(fixture: &Fixture) -> Vec<Vec<u8>> {
 /// UDP-shaped publish: the frame's only reference moves to pending, headers go
 /// in place in front of its payload, no TX-pool mbuf is used, and the PMD's
 /// free returns it to the frame pool.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn send_unique_in_place() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2537,7 +2537,7 @@ fn send_unique_in_place() {
 /// TCP-shaped publish with offload metadata: the device takes a second
 /// reference, the caller's comes back with its payload unchanged, and the
 /// mbuf carries the TCP offload flags and lengths.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn consume_retain_shares_and_sets_offload_metadata() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2575,7 +2575,7 @@ fn consume_retain_shares_and_sets_offload_metadata() {
 /// socket's release) and TX completion (the ring consumer's free) comes first.
 /// When completion comes first the frame is unique again and a retransmit
 /// rewrites its headers in place, still without a TX-pool mbuf.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn retained_frame_freed_once_in_both_orders() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2615,7 +2615,7 @@ fn retained_frame_freed_once_in_both_orders() {
 
 /// `transmit_frame` reserves only a pending slot: a dropped token takes no
 /// frame reference and no TX-pool mbuf, and a full pending queue gives none.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn transmit_frame_token_drop_takes_no_reference() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 2);
@@ -2643,7 +2643,7 @@ fn transmit_frame_token_drop_takes_no_reference() {
 
 /// A frame from another Stack's frame pool panics with the origin message;
 /// unwinding returns it to its own pool and nothing is queued.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn foreign_pool_frame_panics() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2654,7 +2654,7 @@ fn foreign_pool_frame_panics() {
                         name: c"device_foreign_frame",
                         count: 7,
                         cache_size: 2,
-                        data_room_size: zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM as u16 + 1514,
+                        data_room_size: switch_dpdk_sys::RTE_PKTMBUF_HEADROOM as u16 + 1514,
                         socket_id: -1,
                     },
                     1472,
@@ -2691,7 +2691,7 @@ fn foreign_pool_frame_panics() {
 /// Unsent pending frames at teardown drop one reference each: a moved (UDP)
 /// frame returns to the pool, a retained (TCP) frame stays with its holder
 /// until that releases it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pending_teardown_frees_shared_frames() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2721,7 +2721,7 @@ fn pending_teardown_frees_shared_frames() {
 /// TX checksum preparation after publish writes only the L4 checksum field of
 /// a retained frame's headers, never its payload: here the Intel prepare a
 /// real PMD runs, applied to the pending mbuf.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_prepare_writes_header_only() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2747,7 +2747,7 @@ fn tx_prepare_writes_header_only() {
         assert_eq!(device.flush(), Ok(0));
         drop(guard);
         let raw = device.tx[0].as_ptr();
-        assert_eq!(unsafe { zhida_dpdk_sys::dpdk_raw_net_intel_cksum_prepare(raw) }, 0);
+        assert_eq!(unsafe { switch_dpdk_sys::dpdk_raw_net_intel_cksum_prepare(raw) }, 0);
         let published = pending(&device).remove(0);
         let changed: Vec<_> = (0..54).filter(|&i| published[i] != header.bytes()[i]).collect();
         assert!(changed.iter().all(|i| (50..52).contains(i)), "{changed:?}");
@@ -2768,7 +2768,7 @@ fn tx_prepare_writes_header_only() {
 /// last burst, and the holders release in both orders. Once the senders drop
 /// their references, the packets the ring and pending queue hold leave
 /// exactly the reserve's slack free, and every mbuf returns once.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn published_frames_fill_ring_and_pending_within_reserve() {
     const PENDING: usize = 4;
     with_test_eal(|eal| {
@@ -2854,7 +2854,7 @@ fn check_published(
 /// headers, an empty payload, a 62-byte header (TCP with 8 option bytes) and
 /// the 64-byte header maximum. Each reaches the wire as header ++ payload,
 /// and every frame returns to the pool.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_publish_edges_reach_the_wire_exactly() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2898,7 +2898,7 @@ fn frame_publish_edges_reach_the_wire_exactly() {
 /// Checksum offload metadata reaches the published frame mbuf: UDP through
 /// `consume`, TCP with options through `consume_retain`; the wire bytes are
 /// header ++ payload and both pools end at zero.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_publish_sets_udp_and_tcp_offload_metadata() {
     with_test_eal(|eal| {
         let (fixture, mut device) = open(eal, 4, 4);
@@ -2950,7 +2950,7 @@ fn frame_publish_sets_udp_and_tcp_offload_metadata() {
 /// the peer frees its reference, the RTO retransmission republishes the same
 /// mbuf in place with the same metadata and is prepared again; payload and
 /// sequence number are unchanged and smoltcp leaves the checksum to the NIC.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn retransmit_with_tx_checksum_offload() {
     use smoltcp::socket::tcp::State;
     use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr};
@@ -3118,7 +3118,7 @@ fn udp_socket(
 }
 
 /// A frame from `device`'s frame pool holding `payload`, and its mbuf.
-fn app_frame(device: &Device, payload: &[u8]) -> (smoltcp::phy::ImmutableFrame, *mut zhida_dpdk_sys::rte_mbuf) {
+fn app_frame(device: &Device, payload: &[u8]) -> (smoltcp::phy::ImmutableFrame, *mut switch_dpdk_sys::rte_mbuf) {
     let mut frame = smoltcp::phy::alloc_frame(device.frame_pool()).unwrap();
     frame.as_mut()[..payload.len()].copy_from_slice(payload);
     frame.truncate(payload.len());
@@ -3137,7 +3137,7 @@ struct FrameMbufState {
     headroom: Vec<u8>,
 }
 
-fn frame_mbuf_state(raw: *mut zhida_dpdk_sys::rte_mbuf) -> FrameMbufState {
+fn frame_mbuf_state(raw: *mut switch_dpdk_sys::rte_mbuf) -> FrameMbufState {
     // SAFETY: the test holds a reference to this frame mbuf; only read here.
     unsafe {
         let m = &*raw;
@@ -3149,7 +3149,7 @@ fn frame_mbuf_state(raw: *mut zhida_dpdk_sys::rte_mbuf) -> FrameMbufState {
     }
 }
 
-fn refcnt(raw: *mut zhida_dpdk_sys::rte_mbuf) -> u16 {
+fn refcnt(raw: *mut switch_dpdk_sys::rte_mbuf) -> u16 {
     // SAFETY: the test holds a reference to this frame mbuf; only read here.
     unsafe { (*raw).refcnt() }
 }
@@ -3170,7 +3170,7 @@ fn send_udp_frame(
 /// checksum mode: the published mbuf is the frame's own (headers in its
 /// headroom, one segment, refcount 1, the copy path's offload metadata and
 /// wire bytes), no TX-pool mbuf is used, and the PMD's free returns it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
     use smoltcp::iface::UdpSet;
     use smoltcp::wire::IpEndpoint;
@@ -3227,7 +3227,7 @@ fn udp_unique_frame_publishes_in_place_like_the_copy_path() {
 /// frame with the unique path's bytes and metadata; its own mbuf is never
 /// written and drops back to refcount 1 when the send releases the sent
 /// reference. The TX pool is not used.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_shared_frame_copies_into_a_new_frame() {
     use smoltcp::iface::UdpSet;
     use smoltcp::wire::IpEndpoint;
@@ -3281,7 +3281,7 @@ fn udp_shared_frame_copies_into_a_new_frame() {
 /// copy with that socket's headers and the same payload; the frame mbuf is
 /// never published and its refcount steps down by one per send. Draining the
 /// ring frees each copy once; the frame is freed once when the app drops it.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_broadcast_clones_copy_once_per_socket() {
     use smoltcp::iface::UdpSet;
     use smoltcp::wire::IpEndpoint;
@@ -3338,7 +3338,7 @@ fn udp_broadcast_clones_copy_once_per_socket() {
 /// frame pool for a shared frame's copy, no route, and a pending neighbor. A
 /// unique frame's ARP request takes one pending slot; a rate-limited retry
 /// takes none.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_frame_refusals_write_nothing() {
     use smoltcp::iface::{UdpSendError, UdpSet};
     use smoltcp::wire::IpEndpoint;
@@ -3363,7 +3363,7 @@ fn udp_frame_refusals_write_nothing() {
             handle: smoltcp::iface::UdpHandle,
             to: IpEndpoint,
             frame: smoltcp::phy::ImmutableFrame,
-            raw: *mut zhida_dpdk_sys::rte_mbuf,
+            raw: *mut switch_dpdk_sys::rte_mbuf,
             error: UdpSendError,
         ) -> smoltcp::phy::ImmutableFrame {
             let before = frame_mbuf_state(raw);

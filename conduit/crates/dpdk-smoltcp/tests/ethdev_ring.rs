@@ -6,10 +6,10 @@
 use std::ffi::c_void;
 use std::ptr::{null, null_mut, NonNull};
 
-use zhida_test_kit::ring_port::RingPort;
-use zhida_test_kit::with_eal;
-use zhida_buffer::{Mbuf, PoolConfig, PoolManager};
-use zhida_dpdk_sys::*;
+use switch_test_kit::ring_port::RingPort;
+use switch_test_kit::with_eal;
+use switch_buffer::{Mbuf, PoolConfig, PoolManager};
+use switch_dpdk_sys::*;
 
 /// One started net_ring port with 8-slot rings, configured raw with RX from a
 /// production pool. `owned` holds the test's packets in order. Fields drop in
@@ -150,7 +150,7 @@ impl Raw {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn real_ring_bursts_transfer_only_prefix_and_preserve_fifo() {
     let mut raw = Raw::new();
     assert_eq!(raw.tx(false), 0);
@@ -191,7 +191,7 @@ fn real_ring_bursts_transfer_only_prefix_and_preserve_fifo() {
     assert_eq!(raw.close(), 3);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stopped_ring_keeps_queued_packets_until_raw_drain() {
     let mut raw = Raw::new();
     raw.allocate(7, 10);

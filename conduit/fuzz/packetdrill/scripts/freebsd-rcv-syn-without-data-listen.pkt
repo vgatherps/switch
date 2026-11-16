@@ -1,17 +1,17 @@
-// tap-echo: --buffer 65535
+// switch-tap-echo: --buffer 65535
 // Ensure that the reception of a TCP segments with the SYN-bit set in the
 // LISTEN state does trigger the sending of a SYN-ACK segment.
 // Adapted from freebsd-net/tcp-testsuite commit 04b8c73fc5081fe3792f1bed9168c9b22aaedddb,
 // state-event-engine/rcv-syn-listen/rcv-syn-without-data-listen-ipv4.pkt
-// (BSD-2-Clause; notice below). Changes for Zhida's packet-only runner, tap-echo
+// (BSD-2-Clause; notice below). Changes for switch's packet-only runner, switch-tap-echo
 // being the application (fuzz/packetdrill/README.md, "Upstream suites"):
 // - IPv4 variant. Dropped: sysctls, which set FreeBSD defaults; fcntl;
 //   getsockopt(SO_RCVBUF); --tolerance_usecs=75000 (the runner keeps packetdrill's 4
 //   ms); sockstat and tcpdrop commands except where replaced below.
-// - socket/bind/listen dropped: tap-echo listens on port 8080. --buffer 65535 makes
-//   Zhida's SYN-ACK window 65535, as upstream's.
+// - socket/bind/listen dropped: switch-tap-echo listens on port 8080. --buffer 65535 makes
+//   Switch's SYN-ACK window 65535, as upstream's.
 // - The first segment goes at time 0 (upstream: 0.1 s after listen(); packetdrill
-//   requires the first event at 0, and tap-echo listens before the script starts).
+//   requires the first event at 0, and switch-tap-echo listens before the script starts).
 //
 //
 // Copyright (c) 2016 Michael Tuexen

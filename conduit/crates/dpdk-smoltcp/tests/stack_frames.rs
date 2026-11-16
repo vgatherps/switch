@@ -10,8 +10,8 @@ use dpdk_smoltcp::{
     rx_reserve, tx_reserve, Port, PortError, Stack, StackConfig, StackError,
     DEFAULT_NEIGHBOR_CAPACITY,
 };
-use zhida_test_kit::ring_port::{self, RingPort};
-use zhida_test_kit::with_eal;
+use switch_test_kit::ring_port::{self, RingPort};
+use switch_test_kit::with_eal;
 
 const T: Instant = Instant::from_millis_const(10);
 
@@ -47,7 +47,7 @@ fn finish(fixture: RingPort, port: Port) {
     fixture.close();
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tx_frame_allocates_full_capacity_frames_until_the_pool_is_empty() {
     with_eal(|eal| {
         let fixture = RingPort::new("frame_alloc", 16, 16);
@@ -83,7 +83,7 @@ fn tx_frame_allocates_full_capacity_frames_until_the_pool_is_empty() {
 
 /// `Stack::new` needs TX descriptors + tx_pending + 1 frames; one fewer
 /// returns the Port unchanged.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frame_pool_admission_refuses() {
     with_eal(|eal| {
         assert_eq!(tx_reserve(16, 8), 24);
@@ -115,7 +115,7 @@ fn frame_pool_admission_refuses() {
 /// An RX pool one below `rx_reserve` (16 descriptors floored at 32, plus the low mark of 32
 /// and the RX burst of 8, staging 8, cache 8: 92) is refused with the Port returned
 /// unchanged; at the reserve the Stack is built.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_pool_floor_refuses() {
     with_eal(|eal| {
         assert_eq!(rx_reserve(16, 8, 8, 8), 92);
@@ -144,7 +144,7 @@ fn rx_pool_floor_refuses() {
 /// The kit opens net_ring with as many TX descriptors as its TX ring has
 /// slots, so a ring full of sent frames leaves `tx_pending` + 1 TX packets in a
 /// pool of exactly `tx_reserve`, and `Stack::new` accepts that pool.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn kit_ring_descriptors_match_ring_size() {
     with_eal(|eal| {
         const RING: u16 = 32;
@@ -176,7 +176,7 @@ fn kit_ring_descriptors_match_ring_size() {
 
 /// Frames the application holds keep the frame pool in use after the Stack is
 /// gone: Port close refuses until they drop.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn frames_outlive_stack_via_into_port() {
     with_eal(|eal| {
         let fixture = RingPort::new("frame_life", 16, 16);
@@ -197,13 +197,13 @@ fn frames_outlive_stack_via_into_port() {
     });
 }
 
-const CHILD: &str = "ZHIDA_PORT_DROP_CHILD";
+const CHILD: &str = "SWITCH_PORT_DROP_CHILD";
 
 /// Dropping a Port while a frame is out retains its pools forever (the names
 /// stay taken), so this runs in a child process of this test binary: the
 /// child drops the Port with a frame out, writes and drops the frame, and
 /// checks it returned to the retained pool.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn port_drop_retains_pools_with_frames_out() {
     if std::env::var_os(CHILD).is_some() {
         port_drop_child();
@@ -225,7 +225,7 @@ fn port_drop_retains_pools_with_frames_out() {
     assert!(stdout.contains("1 passed"), "child ran no test\nstdout:\n{stdout}");
     assert!(
         stderr.contains(
-            "Zhida retained port backing: OutstandingBuffers { rx: 0, tx: 0, frame: 1 }"
+            "switch retained port backing: OutstandingBuffers { rx: 0, tx: 0, frame: 1 }"
         ),
         "stderr:\n{stderr}"
     );

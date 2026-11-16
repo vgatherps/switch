@@ -2,7 +2,7 @@
 
 use alloc::rc::Rc;
 use core::{ptr::NonNull, slice};
-use netframe::{ImmutableFrame, OwnedFrame, RawParts};
+use switch_frame::{ImmutableFrame, OwnedFrame, RawParts};
 
 pub use owner::TxPool;
 
@@ -107,10 +107,10 @@ pub use owner::frame_mbuf;
 mod owner {
     use super::*;
     use core::mem::offset_of;
-    use zhida_buffer::FRAME_DATA_OFF;
-    use zhida_dpdk_sys::{rte_mbuf, zhida_pktmbuf_free_seg};
+    use switch_buffer::FRAME_DATA_OFF;
+    use switch_dpdk_sys::{rte_mbuf, switch_pktmbuf_free_seg};
 
-    pub use zhida_buffer::FramePool as TxPool;
+    pub use switch_buffer::FramePool as TxPool;
 
     const RC_OFF: usize = offset_of!(rte_mbuf, __bindgen_anon_1.__bindgen_anon_1.refcnt);
 
@@ -132,7 +132,7 @@ mod owner {
 
     unsafe extern "C" fn release(rc: NonNull<u16>, _: *mut ()) {
         // SAFETY: the last count remains 1; DPDK returns this direct, single-segment mbuf.
-        unsafe { zhida_pktmbuf_free_seg(mbuf(rc).as_ptr()) };
+        unsafe { switch_pktmbuf_free_seg(mbuf(rc).as_ptr()) };
     }
 
     #[inline]

@@ -1,8 +1,8 @@
-// A client SYN with no TCP options gets a SYN-ACK carrying only MSS: Zhida echoes no
-// window scale, SACK-permitted or timestamp option it was not offered. Zhida then sends
+// A client SYN with no TCP options gets a SYN-ACK carrying only MSS: switch echoes no
+// window scale, SACK-permitted or timestamp option it was not offered. Switch then sends
 // to the client's default MSS, 536 (RFC 9293 3.7.1, no MSS option), and advertises its
 // window unscaled. Linux behaves the same on all three.
-// smoltcp 0.14.0 src/socket/tcp.rs; tap-echo, EchoServer and the turn order as in
+// smoltcp 0.14.0 src/socket/tcp.rs; switch-tap-echo, EchoServer and the turn order as in
 // echo-and-close.pkt; TS and ISN conventions as in handshake-linux-options.pkt.
 // - SYN-ACK <mss 1460> only: a SYN without the options leaves remote_win_scale None and
 //   remote_has_sack false (1922-1923) and removes the TS generator (1929-1931), so the

@@ -1,4 +1,4 @@
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
@@ -11,8 +11,8 @@ use dpdk_smoltcp::smoltcp::wire::{
 use dpdk_smoltcp::rx_reserve;
 use dpdk_smoltcp::{AddTcpError, Port, Stack, StackConfig, Turn, DEFAULT_NEIGHBOR_CAPACITY};
 
-use zhida_test_kit::pair::{self, ceil_ms, App, Pair, Side};
-use zhida_test_kit::{ring_port, with_eal};
+use switch_test_kit::pair::{self, ceil_ms, App, Pair, Side};
+use switch_test_kit::{ring_port, with_eal};
 use ring_port::{arp, RingPort};
 
 const OURS: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
@@ -141,7 +141,7 @@ fn limited_stack(eal: &dpdk_smoltcp::Eal, fixture: &RingPort) -> Stack {
     stack(port, 3, 4)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn sockets_full_returns_config_without_allocating_tx_ring() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxtxfull", 16, 16);
@@ -158,7 +158,7 @@ fn sockets_full_returns_config_without_allocating_tx_ring() {
 }
 
 /// Three sockets share an RX pool with 12 mbufs beyond its reserve, and the third listens.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn add_tcp_admits_sockets_beyond_the_shared_rx_pool() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxshare", 16, 16);
@@ -178,12 +178,12 @@ fn add_tcp_admits_sockets_beyond_the_shared_rx_pool() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn removed_tcp_frame_keeps_its_rx_mbuf_until_dropped() {
     held_tcp_frame_after_removal(false);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reaped_tcp_frame_keeps_its_rx_mbuf_until_dropped() {
     held_tcp_frame_after_removal(true);
 }
@@ -248,7 +248,7 @@ fn held_tcp_frame_after_removal(reap: bool) {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn cloned_received_tcp_frame_keeps_mbuf_and_held_count() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(pair::config);
@@ -280,7 +280,7 @@ fn cloned_received_tcp_frame_keeps_mbuf_and_held_count() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
     with_eal(|eal| {
         let configs = [Side::A, Side::B].map(|side| StackConfig {
@@ -325,7 +325,7 @@ fn remove_tcp_frees_one_slot_and_unread_mbufs_without_sending() {
 /// them, one more than the free neighbor slots, would otherwise evict the
 /// peer learned first, and the following SYN to the peer would wait behind a
 /// new ARP request instead of leaving at once.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn arp_request_from_off_subnet_sender_is_answered_not_learned() {
     with_eal(|eal| {
         let fixture = RingPort::new("arpoff", 16, 16);
@@ -379,7 +379,7 @@ fn arp_request_from_off_subnet_sender_is_answered_not_learned() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn socket_capacity_refused_then_slot_reused() {
     with_eal(|eal| {
         let fixture = RingPort::new("cap", 16, 16);
@@ -415,7 +415,7 @@ fn socket_capacity_refused_then_slot_reused() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn tcp_read_leaves_socket_untouched() {
     with_eal(|eal| {
         let fixture = RingPort::new("tcpread", 16, 16);
@@ -430,7 +430,7 @@ fn tcp_read_leaves_socket_untouched() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn connect_unknown_neighbor_sends_arp_and_reports_silence_deadline() {
     with_eal(|eal| {
         let fixture = RingPort::new("silence", 16, 16);
@@ -546,7 +546,7 @@ fn handshake(
 }
 
 fn exhaust_and_reallocate_rx_pool(fixture: &RingPort) {
-    use zhida_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
+    use switch_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
 
     let tx = fixture.in_use().1;
     assert_eq!(fixture.in_use(), (0, tx));
@@ -587,7 +587,7 @@ fn peer_data(isn: TcpSeqNumber, peer_seq: TcpSeqNumber, payload: &[u8]) -> Vec<u
     })
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reused_port_refreshes_rx_pressure_at_stack_construction() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxreuse", 16, 16);
@@ -621,7 +621,7 @@ fn reused_port_refreshes_rx_pressure_at_stack_construction() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn received_segment_stays_in_rx_mbuf_until_read() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxheld", 16, 16);
@@ -657,7 +657,7 @@ fn received_segment_stays_in_rx_mbuf_until_read() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reordered_segments_held_then_released_after_fill() {
     with_eal(|eal| {
         let fixture = RingPort::new("rxreorder", 16, 16);
@@ -751,7 +751,7 @@ fn read_ping_and_finish(fixture: RingPort, mut stack: Stack, handle: TcpHandle) 
     finish(fixture, stack);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ack_now_sends_owed_ack_once() {
     with_eal(|eal| {
         let (fixture, mut stack, handle, acked) =
@@ -772,7 +772,7 @@ fn ack_now_sends_owed_ack_once() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ack_now_leaves_on_turn() {
     with_eal(|eal| {
         let (fixture, mut stack, handle, acked) =
@@ -787,7 +787,7 @@ fn ack_now_leaves_on_turn() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ack_now_after_delayed_ack_sent_is_noop() {
     with_eal(|eal| {
         let (fixture, mut stack, handle, acked) =
@@ -801,7 +801,7 @@ fn ack_now_after_delayed_ack_sent_is_noop() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ack_now_rides_on_written_data() {
     with_eal(|eal| {
         let (fixture, mut stack, handle, acked) =
@@ -818,7 +818,7 @@ fn ack_now_rides_on_written_data() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ack_now_without_ack_delay_sends_one_ack() {
     with_eal(|eal| {
         let (fixture, mut stack, handle, acked) = received_ping(eal, "acknowoff", None);
@@ -832,7 +832,7 @@ fn ack_now_without_ack_delay_sends_one_ack() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reset_remove_unwind_return_once() {
     with_eal(|eal| {
         for (name, reset) in [("rxrstremove", true), ("rxstackdrop", false)] {
@@ -893,7 +893,7 @@ fn reset_remove_unwind_return_once() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn turn_respects_budget_and_services_egress() {
     with_eal(|eal| {
         // Pending holds 2, the TX ring 3.
@@ -952,7 +952,7 @@ fn turn_respects_budget_and_services_egress() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn connection_without_peer_timestamps_stays_without_them() {
     with_eal(|eal| {
         let fixture = RingPort::new("nots", 16, 16);
@@ -985,7 +985,7 @@ fn connection_without_peer_timestamps_stays_without_them() {
 
 /// A failed connect, a failed listen and a
 /// remove/add round trip leave the live connection without them.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn live_socket_keeps_timestamps_off() {
     with_eal(|eal| {
         let fixture = RingPort::new("tslive", 16, 16);
@@ -1101,7 +1101,7 @@ fn next_client_gets_no_timestamps(fixture: &RingPort, stack: &mut Stack, handle:
 }
 
 /// After abort and `Stack::listen`, the next client's timestamp offer is declined.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn relisten_after_client_without_timestamps_stays_without_them() {
     with_eal(|eal| {
         let fixture = RingPort::new("tsrel", 16, 16);
@@ -1120,7 +1120,7 @@ fn relisten_after_client_without_timestamps_stays_without_them() {
 }
 
 /// The client's RST returns the listener to Listen. Its next SYN-ACK has no timestamps.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn peer_reset_in_syn_received_keeps_timestamps_off() {
     with_eal(|eal| {
         let fixture = RingPort::new("tsk2", 16, 16);
@@ -1150,7 +1150,7 @@ fn peer_reset_in_syn_received_keeps_timestamps_off() {
 }
 
 /// A reconnected socket still omits timestamps from its SYN.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reconnect_offers_no_timestamps() {
     with_eal(|eal| {
         let fixture = RingPort::new("tsre", 16, 16);
@@ -1180,7 +1180,7 @@ fn reconnect_offers_no_timestamps() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn poll_at_past_deadline_normalized_to_last_now() {
     with_eal(|eal| {
         let fixture = RingPort::new("pollat", 16, 16);

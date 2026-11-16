@@ -3,7 +3,7 @@
 use core::{fmt, mem::ManuallyDrop, ops::Range, ptr::NonNull, slice};
 
 use alloc::{alloc::{alloc, dealloc, handle_alloc_error, Layout}, rc::Rc, vec::Vec};
-use netframe::{OwnedFrame, Release};
+use switch_frame::{OwnedFrame, Release};
 
 use super::RxShared;
 

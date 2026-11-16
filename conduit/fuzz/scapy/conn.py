@@ -1,4 +1,4 @@
-"""One fuzzer connection: a Linux-like TCP client that applies a Plan to Zhida's echo server.
+"""One fuzzer connection: a Linux-like TCP client that applies a Plan to switch's echo server.
 
 Sender: sequence numbers are kept as offsets u from the ISN (u 0 the SYN, 1..L the payload,
 L + 1 the FIN); go-back-N retransmission on an RTO (Linux TCP_RTO_MIN 200 ms, doubling), fast
@@ -7,19 +7,19 @@ retransmit of the head on the third duplicate ACK, zero-window probes as Linux s
 immediate ACKs for out-of-order, duplicate and FIN segments; a receive buffer whose right edge
 never moves back. Like Linux (tcp_sequence), a pure ACK with SEQ below RCV.NXT and a data
 segment ending below it are discarded with a duplicate ACK (rate-limited to one per 500 ms for
-pure ACKs, tcp_invalid_ratelimit); Zhida sends such pure ACKs after an RTO (smoltcp rewinds
+pure ACKs, tcp_invalid_ratelimit); switch sends such pure ACKs after an RTO (smoltcp rewinds
 its send pointer to SND.UNA), which is never an error. TS is used only if both SYNs carry it, and
-any segment boundary Zhida picks is accepted (smoltcp segments by its own rules).
+any segment boundary switch picks is accepted (smoltcp segments by its own rules).
 
 Disruptive plans: the plan's mutations (mutate.py) replace the clean SYN, handshake ACK,
 first FIN or first transmission of a data segment at their target; a mutated SYN is
 followed after 200 ms by a clean one, whose SYN-ACK the liveness bound applies to. A
 mutation counts as applied once a changed or extra frame of it was sent (not when it was a
 no-op or its target never came); until then the connection
-is stream-preserving and judged so. A disrupted connection ends, after its close, a Zhida
-RST or the plan's budget, with a teardown: quiet for longer than Zhida's delayed ACK, an
-ACK of Zhida's latest segment (which completes a handshake Zhida may still hold in
-SYN-RECEIVED), then an RST at Zhida's latest ACK number, repeated at most twice at the
+is stream-preserving and judged so. A disrupted connection ends, after its close, a switch
+RST or the plan's budget, with a teardown: quiet for longer than switch's delayed ACK, an
+ACK of switch's latest segment (which completes a handshake switch may still hold in
+SYN-RECEIVED), then an RST at switch's latest ACK number, repeated at most twice at the
 number a challenge ACK names, so the socket closes and EchoServer listens again.
 """
 
@@ -38,7 +38,7 @@ RTO_MAX = 1.6  # Linux allows 120 s; capped so a connection fits its deadline
 HANDSHAKE_BOUND = 3.0
 STALE_DUPACK_INTERVAL = 0.5  # Linux tcp_invalid_ratelimit
 REORDER_HOLD_MAX = 0.005
-QUIESCE = 0.05  # > Zhida's delayed ACK, 10 ms (smoltcp tcp.rs:300 ACK_DELAY_DEFAULT)
+QUIESCE = 0.05  # > switch's delayed ACK, 10 ms (smoltcp tcp.rs:300 ACK_DELAY_DEFAULT)
 TEARDOWN_RST_RETRIES = 2
 OWN_MTU_MSS = 1460
 TS_OVERHEAD = 12
@@ -61,7 +61,7 @@ class Conn:
         self.timers = {}
         self.disrupted = False  # a mutation's changed or extra frame was sent
         self.mutations = list(plan.mutations)
-        self.latest = None  # Zhida's latest non-RST segment
+        self.latest = None  # switch's latest non-RST segment
         self.teardown_rst = None
         self.teardown_rsts = 0
 
@@ -72,7 +72,7 @@ class Conn:
         self.rto = RTO_MIN
         self.dupacks = 0
         self.last_ack_seen = None  # (u_ack, window) of the latest acceptable ACK
-        self.peer_right = 0  # u of the right edge of Zhida's window
+        self.peer_right = 0  # u of the right edge of switch's window
         self.boundaries = []
         total = 0
         for n in plan.sizes:
@@ -86,12 +86,12 @@ class Conn:
         self.syn_sent_at = None
         self.synack_after = None
 
-        # Receiver (Zhida's echo stream).
+        # Receiver (switch's echo stream).
         self.cisn = None
         self.rcv_nxt = None
         self.received = bytearray()
         self.ooo = {}  # echo offset -> bytes
-        self.peer_fin_at = None  # echo offset of Zhida's FIN
+        self.peer_fin_at = None  # echo offset of switch's FIN
         self.peer_fin = False
         self.unread = 0
         self.stall_done = plan.stall is None
@@ -119,7 +119,7 @@ class Conn:
         self.syn_seqs = set()
         self.rst_shapes = set()  # oracles.rst_reply_shape of each segment smoltcp accepts
         self.synack_ack = None
-        self.zhida_rsts = 0
+        self.switch_rsts = 0
         self.challenge_armed = False
         self.last_tx = now
 
@@ -136,14 +136,14 @@ class Conn:
         return (self.plan.ts_base + int((now - self.t0) * 1000)) & seqmath.MASK
 
     def _acceptable(self):
-        """(left, size): every sequence number Zhida may still accept bytes at. Its
+        """(left, size): every sequence number switch may still accept bytes at. Its
         RCV.NXT only grows, so nothing below its latest ACK seen here; it is at most our
         SND.MAX, and its window at most 65535 << the scale it announced. Valid only after
         the SYN-ACK (snd_una > 0)."""
         return self.seq(self.snd_una), self.snd_max - self.snd_una + (MAX_WINDOW << self.peer_ws)
 
     def _max_right(self, frame):
-        """u past every right edge Zhida's window can have while `frame` is in flight: its
+        """u past every right edge switch's window can have while `frame` is in flight: its
         RCV.NXT is at most the end of what we sent, `frame` included."""
         seg = parse_tcp(frame)
         end = seqmath.offset(seqmath.add(seg.seq, seg.seg_len), self.isn)
@@ -154,7 +154,7 @@ class Conn:
 
     def _emit(self, frame, now):
         """Send one frame; record what it put on the wire that smoltcp accepts, read as
-        Zhida reads it (wire.smoltcp_accepts)."""
+        Switch reads it (wire.smoltcp_accepts)."""
         try:
             seg = parse_tcp(frame)
         except Malformed:
@@ -284,7 +284,7 @@ class Conn:
             return  # the ACK-bound oracle has judged it; Linux would RST, we ignore it
         if self.cisn is not None:
             if seg.seq == self.cisn:
-                self.stats["zhida_retransmissions"] += 1
+                self.stats["switch_retransmissions"] += 1
                 self._send_ack(now)
             elif not self.disrupted:
                 self.fail(f"second SYN-ACK with ISN {seg.seq}, first was {self.cisn}")
@@ -296,7 +296,7 @@ class Conn:
         self.synack_after = now - self.syn_sent_at
         s = self.plan.syn
         if seg.timestamp is not None and self.plan.index.startswith("probe"):
-            self.fail(f"Zhida's SYN-ACK carried TS despite the probe expecting none "
+            self.fail(f"switch's SYN-ACK carried TS despite the probe expecting none "
                       f"({seg.describe()})")
             return
         self.ts_on = s["ts"] and seg.timestamp is not None
@@ -320,26 +320,26 @@ class Conn:
     # ---------------------------------------------------------------- receive
 
     def on_segment(self, seg, now):
-        """A TCP segment from Zhida for this connection (check_frame already passed)."""
+        """A TCP segment from switch for this connection (check_frame already passed)."""
         new_from = self._oracles(seg)
         if not seg.flags & RST:
             self.latest = seg
         if self.disrupted:
             if seg.flags & RST:
-                self.zhida_rsts += 1
+                self.switch_rsts += 1
                 if self.phase == "est" and not self.failures:
-                    self._teardown(now, "after_zhida_rst")
+                    self._teardown(now, "after_switch_rst")
                 return
             if self.phase in ("teardown", "done") or self.failures:
                 return
-        # After the close completed, Zhida's socket is gone (passive close, no TIME-WAIT):
+        # After the close completed, switch's socket is gone (passive close, no TIME-WAIT):
         # an ACK of ours, e.g. re-ACKing a FIN retransmission that crossed our final ACK,
         # draws an RST per RFC 9293 3.10.7.1, whose shape check_rst has checked.
         elif seg.flags & RST and self.phase != "done" and not self.failures:
-            self.zhida_rsts += 1
-            self.fail(f"Zhida sent RST on a stream-preserving connection ({seg.describe()})")
+            self.switch_rsts += 1
+            self.fail(f"switch sent RST on a stream-preserving connection ({seg.describe()})")
         elif seg.flags & RST and self.phase == "done":
-            self.stats["zhida_rsts_after_close"] += 1
+            self.stats["switch_rsts_after_close"] += 1
         if self.phase == "done" or self.failures:
             if not self.failures and self.peer_fin and seg.flags & FIN:
                 self._send_ack(now)  # FIN retransmitted into our TIME-WAIT
@@ -356,19 +356,19 @@ class Conn:
         self._check_done(now)
 
     def _oracles(self, seg):
-        """Per-connection oracles on one Zhida segment. Returns the echo offset from which
+        """Per-connection oracles on one switch segment. Returns the echo offset from which
         its payload is new (the highest offset seen before it)."""
         st = self.stats
         armed, self.challenge_armed = self.challenge_armed, False
         if seg.flags & RST:
-            st["zhida_rsts"] += 1
+            st["switch_rsts"] += 1
             st["check_rst"] += 1
             error = oracles.check_rst(seg, self.rst_shapes)
         else:
             st["check_ack_bound"] += 1
             error = oracles.check_ack_bound(seg.ack, self.coverage, self.syn_seqs)
             if armed and not seg.payload and not seg.flags & (SYN | FIN):
-                st["zhida_challenge_acks"] += 1
+                st["switch_challenge_acks"] += 1
         if error:
             self.failures.append(f"{error} ({seg.describe()})")
         new_from = self.rx_high
@@ -385,19 +385,19 @@ class Conn:
                 self.failures.append(f"{error} ({seg.describe()})")
             k = seqmath.offset(data_seq, seqmath.add(peer_isn, 1))
             if k < self.rx_high:
-                st["zhida_retransmissions"] += 1
+                st["switch_retransmissions"] += 1
             self.rx_high = max(self.rx_high, k + len(seg.payload))
         if seg.flags & FIN and not seg.flags & RST:
             self.peer_fin_seen += 1
             if self.peer_fin_seen > 1:
-                st["zhida_retransmissions"] += 1
+                st["switch_retransmissions"] += 1
         if self.failures:
             self.phase = "done"
         return new_from
 
     def _impair_rx(self, seg, new_from):
-        """Planned loss of a Zhida segment: the first arrival of a planned echo offset, or
-        Zhida's first FIN. Zhida must retransmit."""
+        """Planned loss of a switch segment: the first arrival of a planned echo offset, or
+        Switch's first FIN. Switch must retransmit."""
         if seg.payload and self.rx_drop:
             k = seqmath.offset(seg.seq, seqmath.add(self.cisn, 1))
             hit = [x for x in self.rx_drop if max(k, new_from) <= x < k + len(seg.payload)]
@@ -417,14 +417,14 @@ class Conn:
         pure = not payload and not fin
         if off + len(payload) + fin < 0:
             # Linux tcp_sequence: the segment ends below RCV.NXT (a pure ACK whose SEQ is).
-            self.stats["stale_zhida_segments_discarded"] += 1
+            self.stats["stale_switch_segments_discarded"] += 1
             if not pure or self.last_stale_dupack is None or \
                     now - self.last_stale_dupack >= STALE_DUPACK_INTERVAL:
                 self.last_stale_dupack = now
                 self._send_ack(now)
             return
         if off > seqmath.diff(self.adv_right, self.rcv_nxt):
-            self.stats["zhida_beyond_window"] += 1
+            self.stats["switch_beyond_window"] += 1
             self._send_ack(now)
             return
         self._on_ack(seg, now)
@@ -434,9 +434,9 @@ class Conn:
             self._accept(off, payload, fin, now)
 
     def _accept(self, off, payload, fin, now):
-        """Queue Zhida's data/FIN at `off` from RCV.NXT and ACK per the plan's policy."""
+        """Queue switch's data/FIN at `off` from RCV.NXT and ACK per the plan's policy."""
         if self.peer_fin:
-            self._send_ack(now)  # nothing follows Zhida's FIN: a retransmission
+            self._send_ack(now)  # nothing follows switch's FIN: a retransmission
             return
         if off < 0:
             payload, off = payload[-off:], 0
@@ -446,7 +446,7 @@ class Conn:
             payload = payload[:max(0, window - off)]
             fin = False
             immediate = True
-            self.stats["zhida_beyond_window"] += 1
+            self.stats["switch_beyond_window"] += 1
         base = len(self.received)
         if fin:
             self.peer_fin_at = base + off + len(payload)
@@ -682,8 +682,8 @@ class Conn:
         if m is not None:
             self._send_mutated(m, frame, now)
             return
-        # Planned ACK loss and duplication never hit ACKs of Zhida's FIN: a lost one would
-        # leave Zhida in LAST-ACK after we are done, and a copy reaching the closed socket
+        # Planned ACK loss and duplication never hit ACKs of switch's FIN: a lost one would
+        # leave switch in LAST-ACK after we are done, and a copy reaching the closed socket
         # draws a (correct) RST, which stream-preserving connections must not see.
         if self.peer_fin:
             self.extra_acks = 0
@@ -731,7 +731,7 @@ class Conn:
         if self.disrupted:
             self._teardown(now, "at_budget")
         else:
-            # Nothing disruptive reached Zhida: no mutation fires after the budget, and the
+            # Nothing disruptive reached switch: no mutation fires after the budget, and the
             # connection continues as a stream-preserving one.
             self._drop_unreached()
 
@@ -757,7 +757,7 @@ class Conn:
         self._arm("td_end", now + QUIESCE)
 
     def _t_td_end(self, now):
-        ack = self.latest.ack  # a challenge ACK names the sequence number Zhida expects
+        ack = self.latest.ack  # a challenge ACK names the sequence number switch expects
         if ack != self.teardown_rst and self.teardown_rsts <= TEARDOWN_RST_RETRIES:
             self.stats["fuzzer_teardown_rst_retries"] += 1
             self.teardown_rst = ack
@@ -803,8 +803,8 @@ class Conn:
                 self.snd_una == self.L + 2 and self.peer_fin:
             if self.disrupted:
                 # The fuzzer's view of the close can be wrong after a mutation (e.g. an
-                # injected FIN Zhida took but the sender model did not count leaves the
-                # fuzzer's ACKs below Zhida's RCV.NXT and Zhida in LAST-ACK: seed 2
+                # injected FIN switch took but the sender model did not count leaves the
+                # fuzzer's ACKs below switch's RCV.NXT and switch in LAST-ACK: seed 2
                 # connection 155), so the teardown always runs.
                 self._teardown(now, "after_close")
             else:
@@ -841,7 +841,7 @@ class Conn:
                 errors.append(error)
             st["check_clean_close"] += 1
             errors += oracles.check_clean_close(self.snd_una == self.L + 2, self.peer_fin,
-                                                self.zhida_rsts)
+                                                self.switch_rsts)
         st["check_handshake"] += 1
         error = oracles.check_handshake(self.synack_after, HANDSHAKE_BOUND)
         if error:

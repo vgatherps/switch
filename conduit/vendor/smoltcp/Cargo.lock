@@ -266,10 +266,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "netframe"
-version = "0.1.0"
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,13 +460,13 @@ version = "0.14.0"
 dependencies = [
  "byteorder",
  "heapless",
- "netframe",
  "rand",
  "rand_chacha",
  "rstest",
  "rustc-hash",
- "zhida-buffer",
- "zhida-dpdk-sys",
+ "switch-buffer",
+ "switch-dpdk-sys",
+ "switch-frame",
 ]
 
 [[package]]
@@ -478,6 +474,27 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "switch-buffer"
+version = "0.1.0"
+dependencies = [
+ "switch-dpdk-sys",
+]
+
+[[package]]
+name = "switch-dpdk-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
+name = "switch-frame"
+version = "0.1.0"
 
 [[package]]
 name = "syn"
@@ -537,21 +554,4 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
-]
-
-[[package]]
-name = "zhida-buffer"
-version = "0.1.0"
-dependencies = [
- "zhida-dpdk-sys",
-]
-
-[[package]]
-name = "zhida-dpdk-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "cc",
- "libc",
- "pkg-config",
 ]

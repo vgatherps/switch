@@ -1,7 +1,7 @@
 """Connection plans: everything connection i does comes from random.Random(f"{seed}:{i}").
 
 A plan fixes the client's SYN options, ISN, port, payload, segment boundaries, pacing, ACK
-policy, close style and impairments; the engine (conn.py) applies it to whatever Zhida does,
+policy, close style and impairments; the engine (conn.py) applies it to whatever switch does,
 so a replay repeats the schedule, not the timing. Impairments are keyed by stream offset ("the
 first transmission of the segment carrying byte X"), not by packet index, so they do not depend
 on how the window split the stream. Weights favor what a modern Linux peer in a data center
@@ -45,7 +45,7 @@ class Plan:
     close: str  # after_echo | after_send | with_data
     tx: list = field(default_factory=list)  # {"at": offset, "do": action, ...}
     rx_drop: list = field(default_factory=list)  # echo offsets whose first arrival is ignored
-    drop_peer_fin: bool = False  # ignore Zhida's first FIN
+    drop_peer_fin: bool = False  # ignore switch's first FIN
     drop_own_fin: bool = False  # first transmission of the fuzzer's FIN is lost
     ack_drop: list = field(default_factory=list)  # indices of pure ACKs lost (0 = handshake)
     dup_acks: list = field(default_factory=list)  # {"at": echo offset, "count": n}

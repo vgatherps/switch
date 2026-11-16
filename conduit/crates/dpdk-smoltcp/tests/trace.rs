@@ -5,9 +5,9 @@
 //! ring is one line of tests/trace/sixteen.txt (dropped ones included); the
 //! test compares the run with that file line by line. A change that alters
 //! what goes on the wire, or when, shows up as a diff of that file; rerun with
-//! ZHIDA_TRACE_BLESS=1 to rewrite it.
+//! SWITCH_TRACE_BLESS=1 to rewrite it.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use std::cell::RefCell;
 use std::fmt::Write;
 use std::rc::Rc;
@@ -19,10 +19,10 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::Stack;
 
-use zhida_test_kit::many::{self, Conn, CLIENT_BASE, SERVER_BASE};
-use zhida_test_kit::pair::{pattern, segment, App, Dir, Pair, Side, IDLE_ROUNDS, MAX_ROUNDS, T0};
-use zhida_test_kit::wire::Verdict;
-use zhida_test_kit::with_eal;
+use switch_test_kit::many::{self, Conn, CLIENT_BASE, SERVER_BASE};
+use switch_test_kit::pair::{pattern, segment, App, Dir, Pair, Side, IDLE_ROUNDS, MAX_ROUNDS, T0};
+use switch_test_kit::wire::Verdict;
+use switch_test_kit::with_eal;
 
 const CONNECTIONS: u16 = 16;
 const BUFFER: usize = 4096;
@@ -258,7 +258,7 @@ fn close(pair: &mut Pair, trace: &RefCell<Trace>, group: &[Conn]) {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn sixteen_connection_wire_trace_matches_committed() {
     let lines = with_eal(|eal| {
         let capacity = usize::from(CONNECTIONS);
@@ -297,7 +297,7 @@ fn sixteen_connection_wire_trace_matches_committed() {
 
     let mut text = lines.join("\n");
     text.push('\n');
-    if std::env::var("ZHIDA_TRACE_BLESS").as_deref() == Ok("1") {
+    if std::env::var("SWITCH_TRACE_BLESS").as_deref() == Ok("1") {
         std::fs::write(TRACE, &text).unwrap();
         return;
     }

@@ -89,10 +89,10 @@ use dpdk_smoltcp::smoltcp::wire::{
 };
 use dpdk_smoltcp::{frame_reserve, rx_reserve};
 use dpdk_smoltcp::{Eal, Packet, Port, PortConfig, RxBurst, Stack, StackConfig, TxPacket};
-use zhida_buffer::PoolConfig;
-use zhida_dpdk_sys::*;
+use switch_buffer::PoolConfig;
+use switch_dpdk_sys::*;
 
-use zhida_test_kit::{pair, ring_port, wire, with_eal};
+use switch_test_kit::{pair, ring_port, wire, with_eal};
 use established::{expected_turn, turn_counts, Established, SEGMENTS, TCP_BUFFER};
 use pair::{config, segment, Dir, Pair, Side, T0};
 use ring_port::RingPort;
@@ -243,13 +243,13 @@ struct Templates {
 fn tcp_bench(c: &mut Criterion, eal: &Eal) -> Templates {
     let configs = [config(Side::A), config(Side::B)];
     let mut pair = Pair::with_ports(eal, ["sbta", "sbtb"], configs, T0, 16, |side, port| {
-        port.rx_pool.count = zhida_test_kit::pair::pool_count(rx_reserve(
+        port.rx_pool.count = switch_test_kit::pair::pool_count(rx_reserve(
             port.rx_descriptors,
             port.rx_burst,
             configs[side.index()].rx_staging,
             port.rx_pool.cache_size,
-        ), zhida_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));
-        port.frame_pool.count = zhida_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), zhida_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));
+        ), switch_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));
+        port.frame_pool.count = switch_test_kit::pair::pool_count(frame_reserve(port.tx_descriptors, configs[side.index()].tx_pending), switch_test_kit::pair::windows(port.mtu, [TCP_BUFFER]));
     });
     let (mut data, mut ack) = (Vec::new(), Vec::new());
     let mut established = Established::connect(&mut pair);

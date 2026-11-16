@@ -7,5 +7,5 @@ edition = "2018"
 testkit = []
 
 [dependencies]
-netframe.workspace = true
+switch-frame.workspace = true
 shared-memory.workspace = true

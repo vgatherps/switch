@@ -1,7 +1,7 @@
 //! Two stacks over impaired copying links: timers on the supplied clock, loss,
 //! reordering, RST, FIN drain, TIME-WAIT, minimal pools and a paused wire.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::socket::tcp::{self, RecvError, SendError, State};
 use dpdk_smoltcp::smoltcp::time::Duration;
@@ -9,8 +9,8 @@ use dpdk_smoltcp::smoltcp::wire::{TcpControl, TcpSeqNumber};
 use dpdk_smoltcp::{frame_reserve, rx_reserve, tx_reserve};
 use dpdk_smoltcp::{Stack, StackConfig, StackError, Turn};
 
-use zhida_test_kit::ring_port::RingPort;
-use zhida_test_kit::{pair, wire, with_eal};
+use switch_test_kit::ring_port::RingPort;
+use switch_test_kit::{pair, wire, with_eal};
 use pair::{
     assert_lossless, ceil_ms, config, establish_sized, establish_with, new_pair, pattern,
     segment, tcp_socket_sized, App, Dir, Pair, Round, Side, T0,
@@ -25,8 +25,8 @@ const RTO: Duration = Duration::from_millis(300);
 const TIME_WAIT: Duration = Duration::from_millis(10_000);
 
 fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
-    use zhida_test_kit::wire::{in_use, pool_by_name};
-    use zhida_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
+    use switch_test_kit::wire::{in_use, pool_by_name};
+    use switch_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
 
     assert_eq!(in_use(name), 0);
     let pool = pool_by_name(name);
@@ -50,7 +50,7 @@ fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pair_loss_reorder_mixed_sizes() {
     with_eal(|eal| {
         const CAPACITY: usize = 4096;
@@ -291,7 +291,7 @@ fn assert_ring_overflowed(links: &[&Link]) {
     assert!(ring_full > 0, "no RX ring overflow");
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn clock_advances_to_deadline_for_delayed_ack() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["dacka", "dackb"]);
@@ -338,7 +338,7 @@ fn drop_first_data(link: &mut Link) {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dropped_data_segment_retransmitted_deadline_only() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["ddsa", "ddsb"]);
@@ -366,7 +366,7 @@ fn dropped_data_segment_retransmitted_deadline_only() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn wan_tail_loss_delivers_exact_bytes() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["wtla", "wtlb"]);
@@ -434,7 +434,7 @@ fn wan_tail_loss_delivers_exact_bytes() {
 }
 
 /// After an RTO, A resends one full 1460-byte segment without a runt.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rto_retransmission_is_one_full_segment() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rtoka", "rtokb"]);
@@ -467,7 +467,7 @@ fn rto_retransmission_is_one_full_segment() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn dropped_ack_recovered() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["dacka2", "dackb2"]);
@@ -507,7 +507,7 @@ fn dropped_ack_recovered() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reordered_segments_delivered_in_order() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rsda", "rsdb"]);
@@ -548,7 +548,7 @@ fn reordered_segments_delivered_in_order() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn close_frees_held_and_ring_frames() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["cfa", "cfb"]);
@@ -579,7 +579,7 @@ fn close_frees_held_and_ring_frames() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rst_on_abort_closes_peer() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rsta", "rstb"]);
@@ -617,7 +617,7 @@ fn rst_on_abort_closes_peer() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn data_then_close_drains_before_finished() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["fina", "finb"]);
@@ -678,7 +678,7 @@ fn data_then_close_drains_before_finished() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn time_wait_expires_from_supplied_time() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["twa", "twb"]);
@@ -809,7 +809,7 @@ fn bulk(pair: &mut Pair, handles: &[TcpHandle; 2], data: &[Vec<u8>; 2]) -> ([Vec
     (received, pressure)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
     with_eal(|eal| {
         // The TX pool covers 16 descriptors and Q = 16 pending slots: 32 mbufs.
@@ -867,7 +867,7 @@ fn bidirectional_bulk_with_minimal_pools_no_deadlock() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
     with_eal(|eal| {
         // The TX pool covers 16 descriptors and Q = 16 pending slots: 32 mbufs.
@@ -927,7 +927,7 @@ fn bidirectional_bulk_lossless_small_rings_both_sides_stay_pending() {
 /// SND.UNA + 2048 while cwnd is one MSS and nothing is acknowledged. Pure ACKs
 /// and ACK replies carry the highest sequence number sent instead, which the
 /// peer accepts, reading their ACK.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn mutual_ack_loss_across_rto_recovers() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["lva", "lvb"]);
@@ -987,7 +987,7 @@ fn mutual_ack_loss_across_rto_recovers() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn admission_refuses_tx_pools_for_full_ring() {
     with_eal(|eal| {
         let q1 = StackConfig {
@@ -1020,7 +1020,7 @@ fn admission_refuses_tx_pools_for_full_ring() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn admission_full_tx_ring_still_answers() {
     with_eal(|eal| {
         let q1 = |side| StackConfig {
@@ -1181,7 +1181,7 @@ fn paused_turn(k: usize) -> Turn {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
     with_eal(|eal| {
         let mut pair = message_pair(eal, ["pwa", "pwb"]);
@@ -1284,7 +1284,7 @@ fn paused_wire_both_stacks_report_blocked_turns_finite_then_resume_completes() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rto_while_wire_paused_then_resume() {
     with_eal(|eal| {
         let mut pair = message_pair(eal, ["rpa", "rpb"]);
@@ -1402,7 +1402,7 @@ fn rto_while_wire_paused_then_resume() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn fresh_connection_sends_full_peer_window_before_first_ack() {
     with_eal(|eal| {
         const WINDOW: usize = 8192;
@@ -1452,7 +1452,7 @@ fn fresh_connection_sends_full_peer_window_before_first_ack() {
 
 /// Cubic sends 40 000 bytes before an ACK. Three sequence ranges are lost once;
 /// successive partial ACKs repair all three before the RTO.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn cubic_send_allowance_trace_with_sequence_pinned_losses() {
     with_eal(|eal| {
         let configs = [config(Side::A), config(Side::B)];
@@ -1597,7 +1597,7 @@ fn cubic_send_allowance_trace_with_sequence_pinned_losses() {
 
 /// The default 1 MiB Cubic window fits seven full segments. Holes at 0, 2
 /// and 4 are repaired on successive cumulative ACKs at the same supplied time.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn burst_loss_partial_acks_repair_all_holes_before_rto() {
     with_eal(|eal| {
         const MSS: usize = 1460;
@@ -1824,7 +1824,7 @@ impl TimedLink {
 /// estimate W_est outgrows the cubic curve and carries cwnd past w_max well
 /// before K; at 70 ms the concave cubic approach is visible and cwnd crosses
 /// w_max on the cubic curve after K.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn cubic_growth_and_recovery_across_rtts() {
     with_eal(|eal| {
         use dpdk_smoltcp::smoltcp::wire::IpEndpoint;

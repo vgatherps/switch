@@ -1,5 +1,5 @@
 // Runner self-test: packets keep the kernel's receive time. After the handshake (the
-// shim warmed Zhida's ARP cache before the script), Zhida echoes 10 bytes about 2 ms
+// shim warmed switch's ARP cache before the script), switch echoes 10 bytes about 2 ms
 // after they arrive, while packetdrill sleeps until 0.05 s to send a duplicate ACK. The
 // script expects the echo at 0.05 s, so packetdrill
 // must report a timing error (run.c verify_time, 4 ms tolerance). A shim stamping packets

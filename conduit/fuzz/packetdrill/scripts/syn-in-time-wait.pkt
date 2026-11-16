@@ -1,4 +1,4 @@
-// tap-echo: --close-after 10
+// switch-tap-echo: --close-after 10
 // follows Linux v6.12 tcp_v4_rcv (TCP_TW_SYN without a listener falls through to TCP_TW_ACK)
 // SYN SEQ 5000 is after RCV.NXT 12, allowing reopening without timestamps.
 // With no listener, TIME-WAIT stays and returns an ACK without rate limiting.

@@ -2,14 +2,14 @@
 //! stay apart, closed connections free their slots for new ones, dropped
 //! segments are retransmitted, and pool use returns to its idle level.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::smoltcp::socket::tcp::{RecvError, State};
 use dpdk_smoltcp::smoltcp::wire::{EthernetFrame, EthernetProtocol};
 
-use zhida_test_kit::many::{self, assert_quiet, Conn, SERVER_BASE, WAVE};
-use zhida_test_kit::pair::{pattern, segment, App, Pair, Side, T0};
-use zhida_test_kit::wire::Verdict;
-use zhida_test_kit::with_eal;
+use switch_test_kit::many::{self, assert_quiet, Conn, SERVER_BASE, WAVE};
+use switch_test_kit::pair::{pattern, segment, App, Pair, Side, T0};
+use switch_test_kit::wire::Verdict;
+use switch_test_kit::with_eal;
 
 const CONNECTIONS: u16 = 1024;
 const BUFFER: usize = 2048;
@@ -17,8 +17,8 @@ const BUFFER: usize = 2048;
 const MSS: usize = 1448;
 
 fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
-    use zhida_test_kit::wire::{in_use, pool_by_name};
-    use zhida_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
+    use switch_test_kit::wire::{in_use, pool_by_name};
+    use switch_dpdk_sys::{dpdk_raw_pktmbuf_alloc, dpdk_raw_pktmbuf_free};
 
     assert_eq!(in_use(name), 0);
     let pool = pool_by_name(name);
@@ -42,19 +42,19 @@ fn exhaust_rx_pool(name: &std::ffi::CStr, count: u32) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn packet_rx_full_window_64_connections() {
     with_eal(|eal| {
         const COUNT: u16 = 64;
         const CAPACITY: usize = 4096;
         let configs = [many::config(Side::A, 64), many::config(Side::B, 64)];
         // Every connection's full window each way at once: the test fills all 64.
-        let full = zhida_test_kit::pair::windows(1500, [CAPACITY; 64]);
-        let pool_count = zhida_test_kit::pair::pool_count(
+        let full = switch_test_kit::pair::windows(1500, [CAPACITY; 64]);
+        let pool_count = switch_test_kit::pair::pool_count(
             dpdk_smoltcp::rx_reserve(16, 8, configs[0].rx_staging, 8),
             usize::from(COUNT) * 4,
         );
-        let frame_count = zhida_test_kit::pair::pool_count(
+        let frame_count = switch_test_kit::pair::pool_count(
             dpdk_smoltcp::frame_reserve(16, configs[0].tx_pending),
             full,
         );
@@ -270,7 +270,7 @@ fn exchange(pair: &mut Pair, conns: &[&Conn]) {
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn thousand_connections_keep_streams_apart() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["mc1a", "mc1b"]);
@@ -321,7 +321,7 @@ fn end(pair: &mut Pair, group: &[Conn], abort: bool) {
     assert_no_overflow(pair);
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn thousand_connections_close_remove_and_reuse_slots() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["mc2a", "mc2b"]);
@@ -381,7 +381,7 @@ fn thousand_connections_close_remove_and_reuse_slots() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn thousand_connections_retransmit_dropped_segments() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["mc3a", "mc3b"]);

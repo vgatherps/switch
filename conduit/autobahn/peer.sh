@@ -1,8 +1,8 @@
 #!/bin/sh
 # Autobahn side of make docker-autobahn, in the Autobahn container sharing the
-# Zhida container's netns. Waits for the tester's `ready`, runs wstest, and
+# switch container's netns. Waits for the tester's `ready`, runs wstest, and
 # writes its exit status to `done` on any exit. Run from /work (repo root).
-# server: wstest fuzzingclient against Zhida under timeout(1); done =
+# server: wstest fuzzingclient against switch under timeout(1); done =
 # wstest's status (124/137 if timeout ended it).
 # client: wstest fuzzingserver on 192.0.2.1:9001, started directly in the
 # background so $! is wstest itself (env restores SIGINT, which sh ignores in

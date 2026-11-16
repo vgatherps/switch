@@ -1,15 +1,15 @@
 # Autobahn report checker
 
-`expected-results-relay.json` holds relay's expected results (agent `relay`, the driver
-`relay-autobahn` in relay/src/bin): tungstenite's `autobahn/expected-results.json` at tag v0.30.0
+`expected-results-switch-ws.json` holds switch-ws's expected results (agent `switch-ws`, the driver
+`switch-ws-autobahn` in switch-ws/src/bin): tungstenite's `autobahn/expected-results.json` at tag v0.30.0
 (commit 7f4aeaf094, sha256 `1ef1023a82e8602e10404c0d0cacfff9400b122131546972fe597d2298ab5c8f`),
 cut to the compared fields, with these divergences:
 
-| Case | tungstenite | relay | Why |
+| Case | tungstenite | switch-ws | Why |
 |---|---|---|---|
-| 2.10 | OK, close 1000 | FAILED, close none | A ping replaces an unsent pong (RFC 6455 §5.5.3 allows it; Autobahn wants every pong, "not required by the Spec"). Autobahn then closes with an empty close, which relay echoes |
-| 2.11 | OK, close 1000 | FAILED, close none **or** OK, close 1000 | Byte-wise Ping delivery can let relay answer every Ping or replace an unsent Pong, depending on session scheduling; both outcomes are accepted |
-| 6.4.3, 6.4.4 | NON-STRICT | OK | relay validates UTF-8 per frame as bytes arrive and fails fast on the first invalid byte; tungstenite waits for the message |
+| 2.10 | OK, close 1000 | FAILED, close none | A ping replaces an unsent pong (RFC 6455 §5.5.3 allows it; Autobahn wants every pong, "not required by the Spec"). Autobahn then closes with an empty close, which switch-ws echoes |
+| 2.11 | OK, close 1000 | FAILED, close none **or** OK, close 1000 | Byte-wise Ping delivery can let switch-ws answer every Ping or replace an unsent Pong, depending on session scheduling; both outcomes are accepted |
+| 6.4.3, 6.4.4 | NON-STRICT | OK | switch-ws validates UTF-8 per frame as bytes arrive and fails fast on the first invalid byte; tungstenite waits for the message |
 
 517 cases: 296 or 297 OK/OK, 216 UNIMPLEMENTED/OK (12.x and 13.x: no permessage-deflate),
 3 INFORMATIONAL/INFORMATIONAL, 2 or 1 FAILED/OK, depending on case 2.11.
@@ -19,7 +19,7 @@ python3 autobahn/check.py <outdir>/index.json [--expected <path>]
 python3 autobahn/check.py --self-test    # make test-autobahn-check
 ```
 
-Python 3 stdlib only. Both files must have exactly the one agent key `relay` and the same case
+Python 3 stdlib only. Both files must have exactly the one agent key `switch-ws` and the same case
 ids; each case must match on `behavior`, `behaviorClose` and `remoteCloseCode` (null is a value).
 An expected entry may be a nonempty list of accepted outcome objects; the report must match
 one complete outcome, never a mixture of fields. Report entries remain single objects.
@@ -39,14 +39,14 @@ Both accepted case 2.11 outcomes pass; a third outcome and a mixture of fields f
 
 ## Junction backend
 
-`make docker-autobahn-junction` runs both roles through a separate `junctiond` process,
+`make docker-autobahn-junction` runs both roles through a separate `switch-junctiond` process,
 including the client when the server fails; the target succeeds only if both roles pass.
 `docker-autobahn-junction-server` and `docker-autobahn-junction-client` run one role.
 `docker-autobahn` remains the conduit gate, unchanged. All use the same 517 cases,
 agent, `run/<role>/` markers, peer container/network namespace, and expected checker.
 Each role replaces its previous reports; preserve `run/` before comparing backends.
 
-The junction role container starts `junctiond` on the first CPU in `DOCKER_CPUSET`
+The junction role container starts `switch-junctiond` on the first CPU in `DOCKER_CPUSET`
 and the app on the second. If the set has only one CPU, it adds exactly one: the
 lowest CPU not in `DOCKER_CPUSET` or `AUTOBAHN_CPUSET`. Defaults therefore extend
 `0` to `0,2`; the Autobahn peer stays on `1`. The control thread shares the app CPU.
@@ -57,7 +57,7 @@ MTU, descriptors and disabled checksum offloads. The daemon uses its normal
 Stack/pool sizing. The app opens no EAL or Stack, and sizes its TX frame pool with
 `tcp::tx_mbuf_budget`, as the socket test fixture does. After the same checker completes,
 the app recovers `Net::into_session`, finishes it and waits for retirement before
-exiting. `junction-role.sh` then sends SIGTERM to `junctiond`, reaps it and checks
+exiting. `junction-role.sh` then sends SIGTERM to `switch-junctiond`, reaps it and checks
 both exit statuses. The outer role timeout bounds startup, run and shutdown.
 
 `make test-autobahn-check` also checks CPU selection and the junction role wrapper:

@@ -1,5 +1,5 @@
 use super::*;
-use netframe::OwnedFrame;
+use switch_frame::OwnedFrame;
 use shared_memory::unique_name;
 use std::rc::Rc;
 use std::thread;

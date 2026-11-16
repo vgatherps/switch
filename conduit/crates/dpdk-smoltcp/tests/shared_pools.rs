@@ -9,12 +9,12 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use zhida_test_kit::many::{self, Conn, CLIENT_BASE};
-use zhida_test_kit::pair::{
+use switch_test_kit::many::{self, Conn, CLIENT_BASE};
+use switch_test_kit::pair::{
     pattern, pool_count, segment, windows, App, Pair, Side, MAX_ROUNDS, T0,
 };
-use zhida_test_kit::wire::{Link, Verdict};
-use zhida_test_kit::with_eal;
+use switch_test_kit::wire::{Link, Verdict};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, TcpSeqNumber};
 use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, Stack, UdpConfig, UdpHandle, UdpSendError};
 
@@ -79,7 +79,7 @@ fn read_all(b: &mut Stack, conn: &Conn, received: &mut Vec<u8>) -> bool {
 /// Four connections share 24 RX mbufs beyond the reserve: all four are added and each
 /// delivers its whole 256 KiB intact while its reader
 /// keeps up; the pool's mbufs all return.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn sockets_beyond_the_sum_of_windows_all_deliver() {
     with_eal(|eal| {
         const SOCKETS: u16 = 4;
@@ -111,7 +111,7 @@ fn sockets_beyond_the_sum_of_windows_all_deliver() {
 /// B's reader stops while A sends a whole 256 KiB window: its shared RX pool runs out
 /// and the link drops the rest. Once B reads, the
 /// mbufs return, A retransmits what was dropped, and every byte arrives in order.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn rx_pool_exhaustion_drops_until_the_app_reads() {
     with_eal(|eal| {
         let mut pair = shared_pair(eal, ["shxa", "shxb"], 1, 0);
@@ -205,7 +205,7 @@ fn drain_udp(b: &mut Stack, udp: &UdpHandle) -> bool {
 /// back. Once the gap segments get through, every connection delivers its bytes in order.
 /// Without pruning the out-of-order frames keep the pool empty, every resent gap segment is
 /// dropped for lack of an mbuf, and no connection progresses.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn out_of_order_frames_filling_the_pool_are_pruned_and_gaps_recover() {
     with_eal(|eal| {
         const SOCKETS: u16 = 4;
@@ -253,7 +253,7 @@ fn out_of_order_frames_filling_the_pool_are_pruned_and_gaps_recover() {
 /// arriving out of order behind a lost one is refused, not held. Once the application reads
 /// the datagrams the pool recovers, and the next out-of-order segment is held; when the lost
 /// segment gets through, every byte arrives in order.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn low_rx_pool_refuses_out_of_order_until_it_recovers() {
     with_eal(|eal| {
         let mut pair = shared_pair(eal, ["shla", "shlb"], 1, 1);
@@ -293,7 +293,7 @@ fn low_rx_pool_refuses_out_of_order_until_it_recovers() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn empty_burst_rechecks_low_pool_before_processing_staged_segments() {
     with_eal(|eal| {
         let mut pair = shared_pair(eal, ["shea", "sheb"], 1, 1);
@@ -349,7 +349,7 @@ fn empty_burst_rechecks_low_pool_before_processing_staged_segments() {
 /// UDP datagrams, unread, take B's RX pool down to empty: the link drops arrivals, S1's
 /// resends among them. Once the application reads S2 and the datagrams, the pool refills, S1's
 /// resent segment lands, and S1 delivers every byte in order, as does S2.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pool_drained_by_other_sockets_recovers_once_apps_read() {
     with_eal(|eal| {
         let mut pair = shared_pair(eal, ["shda", "shdb"], 2, 1);
@@ -403,7 +403,7 @@ fn pool_drained_by_other_sockets_recovers_once_apps_read() {
 /// RX pool low. A segment for S2 processed under that pressure is stored in order and S1's
 /// out-of-order frames stay held: B's RX mbufs in use grow by S2's one frame. Once the pool
 /// recovers and S1's gap gets through, S1 delivers every byte.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pressure_prunes_only_the_receiving_socket() {
     with_eal(|eal| {
         let mut pair = shared_pair(eal, ["shua", "shub"], 2, 1);

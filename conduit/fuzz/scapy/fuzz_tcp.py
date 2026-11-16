@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Seeded Scapy TCP fuzzer against Zhida's echo server; runs as tap-echo's tester.
+"""Seeded Scapy TCP fuzzer against switch's echo server; runs as switch-tap-echo's tester.
 
-    tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py [--seed S] [--connections N] [--only I]
+    switch-tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py [--seed S] [--connections N] [--only I]
 
-One AF_PACKET socket (Scapy's L2 socket) on ZHIDA_IFACE; the fuzzer answers ARP for
+One AF_PACKET socket (Scapy's L2 socket) on SWITCH_IFACE; the fuzzer answers ARP for
 TESTER_IP itself and plays a Linux-like TCP client (conn.py), one connection at a time with a
 100 ms quiet gap before every SYN (one listener, and smoltcp has no accept backlog).
 Connection i follows plan.make_plan(seed, i); a clean probe connection runs after every 25
@@ -44,7 +44,7 @@ PACKET_STATISTICS = 6
 
 
 def wait_iface_up(name):
-    """tap-echo starts its tester before DPDK creates the netdev (as zhida_shim.c)."""
+    """switch-tap-echo starts its tester before DPDK creates the netdev (as switch_shim.c)."""
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     request = struct.pack("16sH14s", name.encode(), 0, b"")
     deadline = time.monotonic() + IFACE_UP_TIMEOUT
@@ -145,7 +145,7 @@ class Runner:
                     self.errors += [f"previous connection {conn.plan.index}: {f}"
                                     for f in conn.failures]
                 return
-        self.errors.append(f"Zhida segment for port {parsed.dport}, neither the current nor "
+        self.errors.append(f"switch segment for port {parsed.dport}, neither the current nor "
                            f"the previous connection ({parsed.describe()})")
 
     def run(self, plan):
@@ -199,7 +199,7 @@ class Runner:
         print(f"mutations not applied, target not reached: {group('mutunreached_')}")
         print(f"disruptive endings: {group('disruptive_')}")
         print(f"oracle checks: {group('check_')}")
-        print(f"zhida: {group('zhida_')}")
+        print(f"switch: {group('switch_')}")
         print(f"fuzzer: {group('fuzzer_')}")
         print(f"socket: {st['socket_received']} frames received, {st['socket_dropped']} dropped "
               f"by the kernel")
@@ -210,9 +210,9 @@ class Runner:
         base = f"{OUT_DIR}/fail-s{self.args.seed}-c{plan.index}"
         write_pcap(f"{base}.pcap", self.previous_frames + self.frames)
         previous = self.previous.plan if self.previous is not None else None
-        # A probe has no --only of its own: the plan before it is what broke Zhida.
+        # A probe has no --only of its own: the plan before it is what broke switch.
         target = plan if plan.index.isdigit() else previous
-        replay = f"../target/debug/tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed {self.args.seed}"
+        replay = f"../target/debug/switch-tap-echo -- python3 -B fuzz/scapy/fuzz_tcp.py --seed {self.args.seed}"
         replay += f" --only {target.index}" if target is not None and target.index.isdigit() \
             else f" --connections {self.args.connections}"
         with open(f"{base}.json", "w") as f:
@@ -228,7 +228,7 @@ class Runner:
               f"and {base}.json")
         print(f"replay: {replay}")
         if target is plan and previous is not None and previous.index.isdigit():
-            print(f"        or, if connection {previous.index} left Zhida broken: "
+            print(f"        or, if connection {previous.index} left switch broken: "
                   f"--only {previous.index}")
 
 

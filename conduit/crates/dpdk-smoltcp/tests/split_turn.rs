@@ -2,13 +2,13 @@
 //! application that reads and writes sockets between them replies in the
 //! loop iteration that received the request.
 
-use zhida_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::drain_bytes;
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::{Duration, Instant};
 use dpdk_smoltcp::rx_reserve;
 use dpdk_smoltcp::{Eal, Sent, Stack, StackConfig, Turn};
 
-use zhida_test_kit::{pair, wire, with_eal};
+use switch_test_kit::{pair, wire, with_eal};
 use pair::{config, establish, segment, Pair, Side, T0};
 use wire::{Link, Verdict};
 
@@ -111,7 +111,7 @@ fn swap_next_two(link: &mut Link) {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn reply_written_between_receive_and_send_leaves_in_send() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rpla", "rplb"]);
@@ -162,7 +162,7 @@ fn reply_written_between_receive_and_send_leaves_in_send() {
 
 /// A on its own clock, B 300 ms ahead; phases interleave A receive, B
 /// receive, A send, B send. Both Stacks send without timestamps.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn interleaved_stacks_send_without_timestamps() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["ilva", "ilvb"]);
@@ -238,7 +238,7 @@ fn echo_rounds(pair: &mut Pair, mode: Mode) -> Trace {
     (steps, from_a)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn turn_matches_receive_then_send() {
     with_eal(|eal| {
         let [turned, split] = [(Mode::Turn, ["mtta", "mttb"]), (Mode::Split, ["mtsa", "mtsb"])]
@@ -284,7 +284,7 @@ fn turn_matches_receive_then_send() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn receive_flushes_frames_built_during_ingress() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["rfla", "rflb"]);
@@ -411,7 +411,7 @@ fn backpressure(eal: &Eal, names: [&str; 2], queued: usize, mode: Mode) -> (Turn
 /// flush; `receive` flushes first, so `send` queues it in the same iteration.
 /// With room on the TX ring it leaves (`tx_accepted` 3, not 2); with the ring
 /// full it stays pending (`tx_pending` 1, not 0). Nothing else differs.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn receive_flush_differs_from_turn_only_under_backpressure() {
     with_eal(|eal| {
         let acks = Turn {
@@ -454,7 +454,7 @@ fn receive_flush_differs_from_turn_only_under_backpressure() {
 /// `send` after a `turn`, with no `receive`, sends what the application wrote
 /// at that turn's time, though A ran later on this thread. A second `send`
 /// with nothing new sends nothing.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn send_alone_and_repeated() {
     with_eal(|eal| {
         let mut pair = new_pair(eal, ["sola", "solb"]);

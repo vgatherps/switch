@@ -1,0 +1,15 @@
+[package]
+name = "switch-tap-echo"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+dpdk-smoltcp.workspace = true
+switch-buffer.workspace = true
+switch-dpdk-sys.workspace = true
+
+[dev-dependencies]
+switch-test-kit.workspace = true
+switch-test-support.workspace = true
+libc.workspace = true

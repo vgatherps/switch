@@ -1,7 +1,7 @@
-use zhida_test_kit::pair::drain_bytes;
-use zhida_test_kit::pair::{self, Pair, Side};
-use zhida_test_kit::ring_port::arp;
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::drain_bytes;
+use switch_test_kit::pair::{self, Pair, Side};
+use switch_test_kit::ring_port::arp;
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -92,7 +92,7 @@ fn ip(frame: &[u8]) -> Ipv4Packet<&[u8]> {
     packet
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn ipv4_fragment_dropped() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpfraga", "udpfragb"]);
@@ -116,7 +116,7 @@ fn ipv4_fragment_dropped() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn stream_exact_bytes_order_counts() {
     with_eal(|eal| {
         for checksum in [true, false] {
@@ -205,7 +205,7 @@ fn stream_exact_bytes_order_counts() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn first_send_arps_then_succeeds() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpfa", "udpfb"]);
@@ -255,7 +255,7 @@ fn first_send_arps_then_succeeds() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn pending_full_would_block_and_blocks_rx_until_flush() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair_with_tx_pool(eal, ["udppfa", "udppfb"], 255);
@@ -313,7 +313,7 @@ fn pending_full_would_block_and_blocks_rx_until_flush() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn udp_tcp_share_pending_in_call_order() {
     with_eal(|eal| {
         let (mut pair, udp) = new_pair(eal, ["udporda", "udpordb"]);
@@ -360,7 +360,7 @@ fn udp_tcp_share_pending_in_call_order() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn connected_send_default_peer_and_mismatch() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpcona", "udpconb"]);
@@ -397,7 +397,7 @@ fn connected_send_default_peer_and_mismatch() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn one_way_stream_across_neighbor_expiry() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpexpa", "udpexpb"]);
@@ -500,7 +500,7 @@ fn one_way_stream_across_neighbor_expiry() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn parallel_peers_each_get_arp_udp() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udp3a", "udp3b"]);
@@ -590,7 +590,7 @@ fn parallel_peers_each_get_arp_udp() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn too_large_and_broadcast_opt_in() {
     with_eal(|eal| {
         let (mut pair, handles) = new_pair(eal, ["udpbra", "udpbrb"]);
@@ -636,7 +636,7 @@ fn too_large_and_broadcast_opt_in() {
 /// the same port: A's datagram to 10.0.0.9 reaches only the bound socket, one to B's address only
 /// the all-IP socket. Each of B's sockets sends from its address on the wire, and A sees that
 /// source.
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn bound_socket_receives_and_sends_on_its_address() {
     const SECOND: Ipv4Address = Ipv4Address::new(10, 0, 0, 9);
     with_eal(|eal| {

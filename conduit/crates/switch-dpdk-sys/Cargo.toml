@@ -1,0 +1,17 @@
+[package]
+name = "switch-dpdk-sys"
+version.workspace = true
+edition = "2021"
+build = "build.rs"
+license.workspace = true
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"
+cc = "1.0"
+
+[dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+switch-test-support.workspace = true

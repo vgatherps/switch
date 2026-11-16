@@ -1,7 +1,7 @@
 //! Per-runtime block pools.
 //!
 //! Each runtime that spawns a task key owns one [`RuntimePool`], listed in its
-//! executor: a depot of slot numbers and the blocks those slots live in. A task
+//! executor: a switch-depot of slot numbers and the blocks those slots live in. A task
 //! key is the `TypeId` of (marker type, future type); `#[switch::task]` makes the
 //! marker unique per function and instantiation, so a pool and its blocks only
 //! ever hold one future type. A pool allocates its own blocks, which stay its
@@ -12,7 +12,7 @@
 
 use std::any::TypeId;
 
-use depot::DynDepot;
+use switch_depot::DynDepot;
 
 use super::block::{BlockSpec, Meta};
 use super::header::TaskHeader;

@@ -1,0 +1,26 @@
+[package]
+name = "switch-junctiond"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+switch-junction.workspace = true
+dpdk-smoltcp.workspace = true
+ceph-fifo.workspace = true
+ceph-proto.workspace = true
+slice_ringbuffer.workspace = true
+ceph-ring.workspace = true
+libc.workspace = true
+switch-netconf.workspace = true
+switch-open.workspace = true
+
+[dev-dependencies]
+switch-test-kit.workspace = true
+switch-test-support.workspace = true
+switch-net.workspace = true
+switch.workspace = true
+
+[lints]
+workspace = true

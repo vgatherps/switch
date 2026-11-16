@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use zhida_test_kit::{tap::ifindex, with_eal};
+use switch_test_kit::{tap::ifindex, with_eal};
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -17,14 +17,14 @@ use dpdk_smoltcp::smoltcp::wire::{
 use dpdk_smoltcp::{
     Offloads, Port, PortConfig, Stack, StackConfig, UdpConfig, DEFAULT_NEIGHBOR_CAPACITY,
 };
-use zhida_buffer::PoolConfig;
-use zhida_dpdk_sys::{
+use switch_buffer::PoolConfig;
+use switch_dpdk_sys::{
     rte_eth_dev_get_port_by_name, rte_vdev_init, rte_vdev_uninit, RTE_PKTMBUF_HEADROOM,
 };
 
 const PORT: u16 = 1234;
 const PEER_PORT: u16 = 4321;
-const ZHIDA_MAC: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
+const SWITCH_MAC: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
 const BURST: usize = 8;
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -184,7 +184,7 @@ fn udp_frame(src: Ipv4Address, dst: Ipv4Address, payload: &[u8]) -> Vec<u8> {
     let caps = ChecksumCapabilities::default();
     let eth = EthernetRepr {
         src_addr: EthernetAddress([0x02, 0, 0, 0, 0, 0x02]),
-        dst_addr: ZHIDA_MAC,
+        dst_addr: SWITCH_MAC,
         ethertype: EthernetProtocol::Ipv4,
     };
     let udp = UdpRepr {
@@ -214,14 +214,14 @@ fn udp_frame(src: Ipv4Address, dst: Ipv4Address, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn af_packet_hardware_mode_opens_and_stamps() {
     with_eal(|eal| {
         let pid = std::process::id();
         let subnet = u16::try_from(pid % 16_384).unwrap();
         let third = (subnet / 64) as u8;
         let fourth = ((subnet % 64) * 4) as u8;
-        let zhida_ip = Ipv4Address::new(198, 19, third, fourth + 1);
+        let switch_ip = Ipv4Address::new(198, 19, third, fourth + 1);
         let peer_ip = Ipv4Addr::new(198, 19, third, fourth + 2);
         let pair = VethPair::new(pid, peer_ip);
         let vdev = AfPacketVdev::new(pid, &pair.iface);
@@ -256,8 +256,8 @@ fn af_packet_hardware_mode_opens_and_stamps() {
         // supplies direct, single-segment mbufs and closes before the veth pair.
         let port = unsafe { Port::open(eal, config) }.unwrap();
         let config = StackConfig {
-            ethernet: ZHIDA_MAC,
-            ipv4: Ipv4Cidr::new(zhida_ip, 30),
+            ethernet: SWITCH_MAC,
+            ipv4: Ipv4Cidr::new(switch_ip, 30),
             gateway: None,
             paths: &[],
             owned_ipv4: &[],
@@ -283,7 +283,7 @@ fn af_packet_hardware_mode_opens_and_stamps() {
         let kernel = peer_socket(&pair.peer);
         let peer = IpEndpoint::new(peer_ip.into(), PEER_PORT);
         let frames: Vec<_> = (0..5u8)
-            .map(|index| udp_frame(peer_ip, zhida_ip, &[index]))
+            .map(|index| udp_frame(peer_ip, switch_ip, &[index]))
             .collect();
         let start = Instant::now();
         let before = realtime_ns();

@@ -1,7 +1,7 @@
-use zhida_test_kit::pair::{self, Pair, Side};
-use zhida_test_kit::peers::{peer_ip, peer_mac};
-use zhida_test_kit::ring_port::arp;
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::{self, Pair, Side};
+use switch_test_kit::peers::{peer_ip, peer_mac};
+use switch_test_kit::ring_port::arp;
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::time::Instant;
 use dpdk_smoltcp::smoltcp::wire::{
@@ -120,7 +120,7 @@ fn assert_datagram(frame: &[u8], dst: Ipv4Address, mac: EthernetAddress, payload
     assert!(udp.verify_checksum(&Side::A.ip().into(), &dst.into()));
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn off_subnet_send_uses_gateway_mac() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, Some(Side::B.ip()), PEERS);
@@ -141,7 +141,7 @@ fn off_subnet_send_uses_gateway_mac() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn off_subnet_receive_from_gateway_mac() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, Some(Side::B.ip()), PEERS);
@@ -206,7 +206,7 @@ fn off_subnet_receive_from_gateway_mac() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn off_subnet_without_gateway_no_route() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, None, PEERS);
@@ -232,7 +232,7 @@ fn off_subnet_without_gateway_no_route() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn gateway_stale_keeps_sending() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, Some(Side::B.ip()), PEERS);
@@ -307,7 +307,7 @@ fn drain_peer(pair: &Pair, i: usize, payload: &[u8], replies: &mut Vec<Vec<u8>>)
     (requests, datagrams)
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn send_to_many_peers() {
     with_eal(|eal| {
         let (mut pair, handle) = new_pair(eal, None, PEERS);

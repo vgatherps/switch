@@ -1,6 +1,6 @@
-use zhida_test_kit::pair::{config, drain_bytes, pattern, tcp_socket_sized, Side, BUDGET, T0};
-use zhida_test_kit::ring_port::{resize, RingPort};
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::{config, drain_bytes, pattern, tcp_socket_sized, Side, BUDGET, T0};
+use switch_test_kit::ring_port::{resize, RingPort};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::iface::PathMtu;
 use dpdk_smoltcp::smoltcp::phy::ChecksumCapabilities;
 use dpdk_smoltcp::smoltcp::socket::tcp::State;
@@ -63,9 +63,9 @@ impl Network {
             resize(&mut port, 9000, 9216);
             port.rx_pool.count = 8191;
             port.tx_pool.count = 127;
-            port.frame_pool.count = zhida_test_kit::pair::pool_count(
+            port.frame_pool.count = switch_test_kit::pair::pool_count(
                 frame_reserve(port.tx_descriptors, stack.tx_pending),
-                zhida_test_kit::pair::windows(9000, std::iter::repeat_n(BUFFER, stack.max_sockets)),
+                switch_test_kit::pair::windows(9000, std::iter::repeat_n(BUFFER, stack.max_sockets)),
             );
             match Stack::new(rings[node].open_with(eal, port), stack, T0) {
                 Ok(stack) => stack,
@@ -190,7 +190,7 @@ fn transfer(
     panic!("TCP transfers did not complete");
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn one_stack_mixed_tcp_mss_active_and_passive() {
     with_eal(|eal| {
         let mut net = Network::new(eal, ["mixma", "mixmb", "mixmc"]);
@@ -242,7 +242,7 @@ fn one_stack_mixed_tcp_mss_active_and_passive() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn mixed_retransmission_keeps_cap() {
     with_eal(|eal| {
         let mut net = Network::new(eal, ["mixra", "mixrb", "mixrc"]);
@@ -285,7 +285,7 @@ fn mixed_retransmission_keeps_cap() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn mixed_udp_destinations() {
     with_eal(|eal| {
         let mut net = Network::new(eal, ["mixua", "mixub", "mixuc"]);

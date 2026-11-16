@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use zhida_test_kit::pair::pattern;
-use zhida_test_kit::with_eal;
+use switch_test_kit::pair::pattern;
+use switch_test_kit::with_eal;
 
 #[path = "rx/mod.rs"]
 mod rx;

@@ -1,0 +1,24 @@
+[package]
+name = "switch-nic"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[[bin]]
+name = "switch-nic"
+path = "src/main.rs"
+
+[dependencies]
+switch-binance-feed.workspace = true
+switch.workspace = true
+switch-net.workspace = true
+switch-open.workspace = true
+switch-netconf.workspace = true
+dpdk-smoltcp.workspace = true
+switch-dpdk-sys.workspace = true
+switch-sockperf-wire.workspace = true
+libc.workspace = true
+mimalloc.workspace = true
+
+[lints]
+workspace = true

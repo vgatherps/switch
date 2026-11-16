@@ -1,15 +1,15 @@
 #!/bin/sh
 # Turns a fresh Amazon Linux 2023 EC2 instance (x86_64 or arm64) with two ENIs into a host for the
-# Binance listener (`zhida-nic feed`, run by deploy/run-binance.sh). Run as root from the repository.
+# Binance listener (`switch-nic feed`, run by deploy/run-binance.sh). Run as root from the repository.
 #
 # Usage: hft-host.sh build|apply|boot|verify [--interface IF] [--kernel-receiver]
 #
 #   build   dnf toolchain, rustup (rust-toolchain.toml), DPDK 25.11.3 under /opt/dpdk with
-#           conduit/docker/Dockerfile's meson options, release zhida-nic (mimalloc), zhida-netconf,
-#           and junctiond
+#           conduit/docker/Dockerfile's meson options, release switch-nic (mimalloc), switch-netconf,
+#           and switch-junctiond
 #           into /usr/local/bin.
 #   apply   build, then every setting below. Reboots once when the kernel command line or the ENA
-#           module changed; zhida-host.service runs `boot` at every boot, after which verify passes.
+#           module changed; switch-host.service runs `boot` at every boot, after which verify passes.
 #   boot    the settings a reboot resets: irqbalance off, IRQs on the housekeeping CPUs, the data ENI
 #           unmanaged and flushed, then bound to vfio-pci unless --kernel-receiver was used.
 #   verify  one line per setting, "<step>: ok <detail>" or "<step>: FAIL <detail>"; exit 1 if any failed.
@@ -17,7 +17,7 @@
 # Interfaces: the management ENI is the interface of the lowest-metric IPv4 default route; nothing
 # here changes it, and every step that touches the data ENI first checks that the two differ. The data
 # ENI is the one other interface on the ena driver (--interface IF when there are several). Its config
-# (/etc/zhida/dut.json) comes from `zhida-netconf discover --aws`.
+# (/etc/switch/dut.json) comes from `switch-netconf discover --aws`.
 # CPUs: APP_CPU is the highest-numbered CPU on the data ENI's NUMA node; JUNCTION_CPU is the
 # highest CPU on a different physical core there. Both and their SMT siblings are isolated.
 # Every other CPU is housekeeping (irqaffinity, IRQs); at least one must remain.
@@ -28,15 +28,15 @@
 # amzn-drivers at AMZN_COMMIT, built for the running kernel. Rerun apply after a kernel update.
 set -u
 R=${HFT_ROOT:-}
-ETC=$R/etc/zhida
+ETC=$R/etc/switch
 ENV=$ETC/host.env
 DUT=$ETC/dut.json
-LOG=$R/var/log/zhida/binance.log
-UNIT=$R/etc/systemd/system/zhida-host.service
-SELF=$R/usr/local/sbin/zhida-hft-host
-NETWORK=$R/etc/systemd/network/00-zhida-data.network
-NETWORKD_POLICY=$R/etc/systemd/networkd.conf.d/90-zhida-kernel-receiver.conf
-UNMOVABLE=$R/run/zhida-unmovable-irqs
+LOG=$R/var/log/switch/binance.log
+UNIT=$R/etc/systemd/system/switch-host.service
+SELF=$R/usr/local/sbin/switch-hft-host
+NETWORK=$R/etc/systemd/network/00-switch-data.network
+NETWORKD_POLICY=$R/etc/systemd/networkd.conf.d/90-switch-kernel-receiver.conf
+UNMOVABLE=$R/run/switch-unmovable-irqs
 HUGEPAGES=512
 CHRONY_CONF=$R/etc/chrony.conf
 # chrony disciplines CLOCK_REALTIME to the ENA PTP hardware clock (Amazon Time Sync), the line AWS
@@ -140,7 +140,7 @@ step_rust() {
 DPDK_PATCH=$REPO/conduit/docker/dpdk-ena-read-clock.patch
 # What a /opt/dpdk built by this script records in $DPDK_STAMP: the release tarball and the patch.
 # pkg-config alone cannot tell a patched 25.11.3 from a stock one.
-DPDK_STAMP=$R/opt/dpdk/share/zhida-dpdk.stamp
+DPDK_STAMP=$R/opt/dpdk/share/switch-dpdk.stamp
 dpdk_stamp() { echo "dpdk-$DPDK_VERSION $DPDK_SHA256 patch $(sha256sum "$DPDK_PATCH" | cut -d' ' -f1)"; }
 
 # The meson options of conduit/docker/Dockerfile; test-hft-host.sh checks they stay equal.
@@ -176,11 +176,11 @@ step_dpdk() {
 }
 
 step_binaries() {
-    (cd "$REPO" && cargo build -q --release --locked -p nic-runner -p zhida-netconf -p junctiond) \
+    (cd "$REPO" && cargo build -q --release --locked -p switch-nic -p switch-netconf -p switch-junctiond) \
         || fatal binaries "cargo build failed"
-    install -m 0755 "$REPO/target/release/zhida-nic" "$REPO/target/release/zhida-netconf" "$REPO/target/release/junctiond" /usr/local/bin/ \
+    install -m 0755 "$REPO/target/release/switch-nic" "$REPO/target/release/switch-netconf" "$REPO/target/release/switch-junctiond" /usr/local/bin/ \
         || fatal binaries "install failed"
-    report binaries ok "/usr/local/bin/zhida-nic /usr/local/bin/zhida-netconf /usr/local/bin/junctiond (release)"
+    report binaries ok "/usr/local/bin/switch-nic /usr/local/bin/switch-netconf /usr/local/bin/switch-junctiond (release)"
 }
 
 build() {
@@ -194,7 +194,7 @@ build() {
 # ---------------------------------------------------------------- host settings
 # Fixes MGMT_IF, DATA_IF, DATA_PCI, DATA_MAC and NUMA_NODE in host.env. A data ENI already on vfio-pci
 # has no interface any more; its saved facts are kept. --kernel-receiver refuses such a host: the
-# data ENI must be back on ena (zhida-netconf unbind) first.
+# data ENI must be back on ena (switch-netconf unbind) first.
 step_interfaces() {
     MGMT_IF=$(mgmt_if)
     [ -n "$MGMT_IF" ] || fatal interfaces "no IPv4 default route: cannot tell the management interface"
@@ -202,7 +202,7 @@ step_interfaces() {
         # shellcheck source=/dev/null
         . "$ENV"
         if [ "$(pci_driver "$DATA_PCI")" = vfio-pci ]; then
-            [ "$requested_driver" = vfio-pci ] || fatal interfaces "data $DATA_PCI is on vfio-pci; run zhida-netconf unbind $DUT, then apply --kernel-receiver"
+            [ "$requested_driver" = vfio-pci ] || fatal interfaces "data $DATA_PCI is on vfio-pci; run switch-netconf unbind $DUT, then apply --kernel-receiver"
             report interfaces ok "management $MGMT_IF; data $DATA_PCI ($DATA_MAC) already on vfio-pci"
             return 0
         fi
@@ -264,9 +264,9 @@ HOUSEKEEPING=$HOUSEKEEPING" || true
 
 step_config() {
     if [ "$(pci_driver "$DATA_PCI")" != vfio-pci ]; then
-        zhida-netconf discover --interface "$DATA_IF" --aws -o "$DUT" || fatal config "zhida-netconf discover failed"
+        switch-netconf discover --interface "$DATA_IF" --aws -o "$DUT" || fatal config "switch-netconf discover failed"
     fi
-    zhida-netconf check "$DUT" >/dev/null || fatal config "zhida-netconf check $DUT failed"
+    switch-netconf check "$DUT" >/dev/null || fatal config "switch-netconf check $DUT failed"
     report config ok "$DUT"
 }
 
@@ -341,8 +341,8 @@ step_vfio_wc() {
             6.18.*) fatal vfio_wc "requires the unmodified official AL2023 kernel6.18 module for $(uname -r): $vfio_wc_error" ;;
         esac
         dir=$(amzn) || fatal vfio_wc "kernel-devel-$(uname -r) or amzn-drivers $AMZN_COMMIT unavailable"
-        (cd "$dir/userspace/dpdk/enav2-vfio-patch" && TERM=dumb bash get-vfio-with-wc.sh) >/var/log/zhida-vfio-wc.log 2>&1 \
-            || fatal vfio_wc "get-vfio-with-wc.sh failed; see /var/log/zhida-vfio-wc.log"
+        (cd "$dir/userspace/dpdk/enav2-vfio-patch" && TERM=dumb bash get-vfio-with-wc.sh) >/var/log/switch-vfio-wc.log 2>&1 \
+            || fatal vfio_wc "get-vfio-with-wc.sh failed; see /var/log/switch-vfio-wc.log"
         vfio_wc_installed || fatal vfio_wc "get-vfio-with-wc.sh left no patched vfio-pci-core in $(vfio_dir)"
     fi
     if [ -d "$R/sys/module/vfio_pci_core" ] && [ "$(cat "$R/sys/module/vfio_pci_core/srcversion")" != "$(modinfo -F srcversion vfio_pci_core)" ]; then
@@ -356,21 +356,21 @@ step_vfio_wc() {
 step_unit() {
     install -D -m 0755 "$0" "$SELF" || fatal unit "cannot install $SELF"
     if put "$UNIT" "[Unit]
-Description=Zhida host settings a reboot resets (deploy/hft-host.sh boot)
+Description=switch host settings a reboot resets (deploy/hft-host.sh boot)
 After=systemd-networkd.service network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/zhida-hft-host boot
+ExecStart=/usr/local/sbin/switch-hft-host boot
 
 [Install]
 WantedBy=multi-user.target"; then
         systemctl daemon-reload
     fi
-    systemctl enable -q zhida-host.service || fatal unit "systemctl enable failed"
-    report unit ok "zhida-host.service runs boot at every boot"
+    systemctl enable -q switch-host.service || fatal unit "systemctl enable failed"
+    report unit ok "switch-host.service runs boot at every boot"
 }
 
 # The PHC refclock goes after AL2023's own chrony.conf (its Time Sync NTP server line stays), and
@@ -386,8 +386,8 @@ step_chrony() {
         fi
         # Rewritten in place (cat >), keeping the file's owner and mode; grep -v exits 1 when
         # the line was the only one.
-        { grep -vxF "$PHC_REFCLOCK" "$CHRONY_CONF" || [ $? = 1 ]; } >"$CHRONY_CONF.zhida" &&
-            cat "$CHRONY_CONF.zhida" >"$CHRONY_CONF" && rm -f "$CHRONY_CONF.zhida" ||
+        { grep -vxF "$PHC_REFCLOCK" "$CHRONY_CONF" || [ $? = 1 ]; } >"$CHRONY_CONF.switch" &&
+            cat "$CHRONY_CONF.switch" >"$CHRONY_CONF" && rm -f "$CHRONY_CONF.switch" ||
             fatal chrony "cannot write $CHRONY_CONF"
         systemctl restart chronyd.service || fatal chrony "systemctl restart chronyd failed"
         report chrony changed "no /dev/ptp_ena: PHC refclock removed from $CHRONY_CONF; chronyd restarted"
@@ -448,7 +448,7 @@ step_bind() {
     guard_mgmt bind
     noiommu=
     [ -n "$(ls -A "$R/sys/kernel/iommu_groups" 2>/dev/null)" ] || noiommu=--noiommu
-    zhida-netconf bind "$DUT" $noiommu || fatal bind "zhida-netconf bind $DUT $noiommu failed"
+    switch-netconf bind "$DUT" $noiommu || fatal bind "switch-netconf bind $DUT $noiommu failed"
     report bind ok "$DATA_PCI on vfio-pci${noiommu:+ (no IOMMU)}"
 }
 
@@ -481,7 +481,7 @@ ManageForeignRoutingPolicyRules=no"
     fi
     if [ -n "$reboot_needed" ]; then
         stage_unmanaged
-        echo "reboot: rebooting now for:$reboot_needed; zhida-host.service finishes at boot, then run hft-host.sh verify"
+        echo "reboot: rebooting now for:$reboot_needed; switch-host.service finishes at boot, then run hft-host.sh verify"
         systemctl reboot
         exit 100
     fi
@@ -558,8 +558,8 @@ verify() {
         report hugepages FAIL "node $NUMA_NODE: $total x 2 MiB (want $HUGEPAGES), hugetlbfs $(mountpoint -q "$R/dev/hugepages" && echo mounted || echo 'not mounted')"
     fi
 
-    # zhida-nic's own line from the last run: "zhida-nic: hugepages: hugepages-2048kB used=N free=M".
-    used=$(sed -n 's/^zhida-nic: hugepages: hugepages-2048kB used=\([0-9]*\) .*/\1/p' "$LOG" 2>/dev/null | tail -n 1)
+    # switch-nic's own line from the last run: "switch-nic: hugepages: hugepages-2048kB used=N free=M".
+    used=$(sed -n 's/^switch-nic: hugepages: hugepages-2048kB used=\([0-9]*\) .*/\1/p' "$LOG" 2>/dev/null | tail -n 1)
     if [ -z "$used" ]; then
         report pools ok "no run logged yet ($LOG); the first run-binance.sh reports its use"
     elif [ "$used" -le "$HUGEPAGES" ]; then
@@ -608,13 +608,13 @@ verify() {
         report clocksource ok "tsc ($(uname -m)); dmesg shows no TSC instability"
     fi
 
-    if systemctl is-enabled -q zhida-host.service 2>/dev/null; then
-        report unit ok "zhida-host.service enabled"
+    if systemctl is-enabled -q switch-host.service 2>/dev/null; then
+        report unit ok "switch-host.service enabled"
     else
-        report unit FAIL "zhida-host.service not enabled"
+        report unit FAIL "switch-host.service not enabled"
     fi
 
-    if zhida-netconf check "$DUT" >/dev/null 2>&1; then report config ok "$DUT"; else report config FAIL "zhida-netconf check $DUT"; fi
+    if switch-netconf check "$DUT" >/dev/null 2>&1; then report config ok "$DUT"; else report config FAIL "switch-netconf check $DUT"; fi
 
     # CLOCK_REALTIME, which the feed compares with NIC stamps, must follow the PHC refclock:
     # `chronyc sources` selects it (a `#*` PHC row).

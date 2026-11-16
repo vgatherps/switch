@@ -10,9 +10,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use zhida_test_kit::tap::{ifindex, TapVdev};
-use zhida_test_kit::wire::{in_use, pool_exists};
-use zhida_test_kit::with_eal;
+use switch_test_kit::tap::{ifindex, TapVdev};
+use switch_test_kit::wire::{in_use, pool_exists};
+use switch_test_kit::with_eal;
 use dpdk_smoltcp::smoltcp::time::Instant as StackInstant;
 use dpdk_smoltcp::smoltcp::wire::{
     EthernetAddress, EthernetFrame, IpAddress, IpEndpoint, IpProtocol, Ipv4Address, Ipv4Cidr,
@@ -22,11 +22,11 @@ use dpdk_smoltcp::{
     Eal, Offloads, Port, PortConfig, Stack, StackConfig, UdpConfig, UdpDatagram, UdpHandle,
     UdpSendError, DEFAULT_NEIGHBOR_CAPACITY,
 };
-use zhida_buffer::PoolConfig;
-use zhida_dpdk_sys::RTE_PKTMBUF_HEADROOM;
+use switch_buffer::PoolConfig;
+use switch_dpdk_sys::RTE_PKTMBUF_HEADROOM;
 
 const KERNEL_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
-const ZHIDA_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
+const SWITCH_ADDR: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 const PORT: u16 = 1234;
 const BURST: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -87,7 +87,7 @@ fn with_stack_gateway(
     tap.set_kernel_mtu(1500);
     assert_eq!(tap.kernel_mtu(), 1500);
     set_kernel_address(names.iface);
-    let [a, b, c, d] = ZHIDA_ADDR.octets();
+    let [a, b, c, d] = SWITCH_ADDR.octets();
     let config = StackConfig {
         ethernet: EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
         ipv4: Ipv4Cidr::new(Ipv4Address::new(a, b, c, d), 24),
@@ -116,7 +116,7 @@ fn with_stack_gateway(
     }
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn kernel_off_subnet_peer_through_gateway() {
     with_eal(|eal| {
         let iface = c"cdudp_gateway";
@@ -149,13 +149,13 @@ fn kernel_off_subnet_peer_through_gateway() {
                 kernel.set_nonblocking(true).unwrap();
                 let peer = endpoint(kernel.local_addr().unwrap());
                 let handle = add_udp(stack, true);
-                send_zhida(stack, start, &handle, Some(peer), b"to remote");
+                send_switch(stack, start, &handle, Some(peer), b"to remote");
                 recv_kernel(stack, start, &kernel, b"to remote");
                 send_kernel(stack, start, &kernel, b"from remote");
-                let datagram = recv_zhida(stack, start, &handle);
+                let datagram = recv_switch(stack, start, &handle);
                 assert_eq!(datagram.src(), peer);
                 assert_eq!(datagram.payload(), b"from remote");
-                send_zhida(
+                send_switch(
                     stack,
                     start,
                     &handle,
@@ -224,7 +224,7 @@ impl UdpCapture {
             }
             let eth = EthernetFrame::new_checked(&buffer[..len as usize]).unwrap();
             let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
-            if ip.src_addr().octets() != ZHIDA_ADDR.octets() || ip.next_header() != IpProtocol::Udp {
+            if ip.src_addr().octets() != SWITCH_ADDR.octets() || ip.next_header() != IpProtocol::Udp {
                 continue;
             }
             assert!(ip.verify_checksum());
@@ -280,8 +280,8 @@ fn kernel_socket() -> UdpSocket {
     socket
 }
 
-fn zhida_address() -> SocketAddr {
-    (ZHIDA_ADDR, PORT).into()
+fn switch_address() -> SocketAddr {
+    (SWITCH_ADDR, PORT).into()
 }
 
 fn endpoint(address: SocketAddr) -> IpEndpoint {
@@ -316,7 +316,7 @@ fn turn(stack: &mut Stack, start: Instant) {
 fn send_kernel(stack: &mut Stack, start: Instant, socket: &UdpSocket, payload: &[u8]) {
     loop {
         turn(stack, start);
-        match socket.send_to(payload, zhida_address()) {
+        match socket.send_to(payload, switch_address()) {
             Ok(len) => {
                 assert_eq!(len, payload.len());
                 return;
@@ -327,7 +327,7 @@ fn send_kernel(stack: &mut Stack, start: Instant, socket: &UdpSocket, payload: &
     }
 }
 
-fn recv_zhida(stack: &mut Stack, start: Instant, handle: &UdpHandle) -> UdpDatagram {
+fn recv_switch(stack: &mut Stack, start: Instant, handle: &UdpHandle) -> UdpDatagram {
     loop {
         turn(stack, start);
         if let Some(datagram) = stack.udp_mut(handle).recv() {
@@ -336,7 +336,7 @@ fn recv_zhida(stack: &mut Stack, start: Instant, handle: &UdpHandle) -> UdpDatag
     }
 }
 
-fn send_zhida(
+fn send_switch(
     stack: &mut Stack,
     start: Instant,
     handle: &UdpHandle,
@@ -348,7 +348,7 @@ fn send_zhida(
         match stack.udp_send(handle, to, payload) {
             Ok(()) => return,
             Err(UdpSendError::NeighborPending | UdpSendError::WouldBlock) => {}
-            Err(error) => panic!("Zhida udp_send: {error:?}"),
+            Err(error) => panic!("switch udp_send: {error:?}"),
         }
     }
 }
@@ -359,7 +359,7 @@ fn recv_kernel(stack: &mut Stack, start: Instant, socket: &UdpSocket, payload: &
         turn(stack, start);
         match socket.recv_from(&mut buffer) {
             Ok((len, src)) => {
-                assert_eq!(src, zhida_address());
+                assert_eq!(src, switch_address());
                 assert_eq!(&buffer[..len], payload);
                 return;
             }
@@ -394,8 +394,8 @@ fn payloads() -> Vec<Vec<u8>> {
     result
 }
 
-#[zhida_test_support::pinned_test]
-fn kernel_to_zhida_datagrams() {
+#[switch_test_support::pinned_test]
+fn kernel_to_switch_datagrams() {
     with_eal(|eal| {
         let names = Names {
             vdev: c"net_tap_udpk_rx",
@@ -411,7 +411,7 @@ fn kernel_to_zhida_datagrams() {
             let payloads = payloads();
             for payload in &payloads {
                 send_kernel(stack, start, &kernel, payload);
-                let datagram = recv_zhida(stack, start, &handle);
+                let datagram = recv_switch(stack, start, &handle);
                 assert_eq!(datagram.src(), src);
                 assert_eq!(datagram.payload(), payload);
                 drop(datagram);
@@ -423,8 +423,8 @@ fn kernel_to_zhida_datagrams() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn offload_kernel_to_zhida_and_back() {
+#[switch_test_support::pinned_test]
+fn offload_kernel_to_switch_and_back() {
     with_eal(|eal| {
         for (tx_checksum, names) in [
             (true, Names {
@@ -456,7 +456,7 @@ fn offload_kernel_to_zhida_and_back() {
                 let payloads = payloads();
                 for payload in &payloads {
                     send_kernel(stack, start, &kernel, payload);
-                    let datagram = recv_zhida(stack, start, &handle);
+                    let datagram = recv_switch(stack, start, &handle);
                     assert_eq!(datagram.src(), peer);
                     assert_eq!(datagram.payload(), payload);
                     drop(datagram);
@@ -464,7 +464,7 @@ fn offload_kernel_to_zhida_and_back() {
                 assert_eq!(stack.udp(&handle).rx_queued(), 0);
                 let capture = UdpCapture::bind(iface);
                 for payload in &payloads {
-                    send_zhida(stack, start, &handle, Some(peer), payload);
+                    send_switch(stack, start, &handle, Some(peer), payload);
                     recv_kernel(stack, start, &kernel, payload);
                     capture.verify_next(stack, start, peer, payload);
                 }
@@ -474,8 +474,8 @@ fn offload_kernel_to_zhida_and_back() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn zhida_to_kernel_datagrams() {
+#[switch_test_support::pinned_test]
+fn switch_to_kernel_datagrams() {
     with_eal(|eal| {
         let names = Names {
             vdev: c"net_tap_udpk_tx",
@@ -489,7 +489,7 @@ fn zhida_to_kernel_datagrams() {
             let kernel = kernel_socket();
             let to = Some(endpoint(kernel.local_addr().unwrap()));
             for payload in payloads() {
-                send_zhida(stack, start, &handle, to, &payload);
+                send_switch(stack, start, &handle, to, &payload);
                 recv_kernel(stack, start, &kernel, &payload);
             }
             assert_kernel_quiet(stack, start, &kernel);
@@ -497,7 +497,7 @@ fn zhida_to_kernel_datagrams() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn kernel_zero_checksum_accepted() {
     with_eal(|eal| {
         let names = Names {
@@ -524,7 +524,7 @@ fn kernel_zero_checksum_accepted() {
             assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
             let payload = b"kernel checksum zero";
             send_kernel(stack, start, &kernel, payload);
-            let datagram = recv_zhida(stack, start, &handle);
+            let datagram = recv_switch(stack, start, &handle);
             assert_eq!(datagram.src(), endpoint(kernel.local_addr().unwrap()));
             assert_eq!(datagram.payload(), payload);
             drop(datagram);
@@ -532,7 +532,7 @@ fn kernel_zero_checksum_accepted() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn offload_kernel_zero_checksum_accepted() {
     with_eal(|eal| {
         let names = Names {
@@ -565,7 +565,7 @@ fn offload_kernel_zero_checksum_accepted() {
             assert_eq!(rc, 0, "SO_NO_CHECK: {}", io::Error::last_os_error());
             let payload = b"kernel checksum zero";
             send_kernel(stack, start, &kernel, payload);
-            let datagram = recv_zhida(stack, start, &handle);
+            let datagram = recv_switch(stack, start, &handle);
             assert_eq!(datagram.src(), endpoint(kernel.local_addr().unwrap()));
             assert_eq!(datagram.payload(), payload);
             drop(datagram);
@@ -573,8 +573,8 @@ fn offload_kernel_zero_checksum_accepted() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn zhida_zero_checksum_accepted_by_kernel() {
+#[switch_test_support::pinned_test]
+fn switch_zero_checksum_accepted_by_kernel() {
     with_eal(|eal| {
         let names = Names {
             vdev: c"net_tap_udpk_ztx",
@@ -586,8 +586,8 @@ fn zhida_zero_checksum_accepted_by_kernel() {
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, false);
             let kernel = kernel_socket();
-            let payload = b"Zhida checksum zero";
-            send_zhida(
+            let payload = b"switch checksum zero";
+            send_switch(
                 stack,
                 start,
                 &handle,
@@ -600,8 +600,8 @@ fn zhida_zero_checksum_accepted_by_kernel() {
     });
 }
 
-#[zhida_test_support::pinned_test]
-fn connected_zhida_socket_echo() {
+#[switch_test_support::pinned_test]
+fn connected_switch_socket_echo() {
     with_eal(|eal| {
         let names = Names {
             vdev: c"net_tap_udpk_echo",
@@ -618,10 +618,10 @@ fn connected_zhida_socket_echo() {
             let payloads = payloads();
             for payload in &payloads {
                 send_kernel(stack, start, &kernel, payload);
-                let datagram = recv_zhida(stack, start, &handle);
+                let datagram = recv_switch(stack, start, &handle);
                 assert_eq!(datagram.src(), peer);
                 assert_eq!(datagram.payload(), payload);
-                send_zhida(stack, start, &handle, None, datagram.payload());
+                send_switch(stack, start, &handle, None, datagram.payload());
                 drop(datagram);
                 recv_kernel(stack, start, &kernel, payload);
             }
@@ -631,7 +631,7 @@ fn connected_zhida_socket_echo() {
             // The tap and the Stack keep arrival order: the peer's later datagram
             // arriving alone shows the wrong peer's was processed and dropped.
             send_kernel(stack, start, &kernel, b"marker");
-            let datagram = recv_zhida(stack, start, &handle);
+            let datagram = recv_switch(stack, start, &handle);
             assert_eq!((datagram.src(), datagram.payload()), (peer, &b"marker"[..]));
             drop(datagram);
             assert!(stack.udp_mut(&handle).recv().is_none());
@@ -642,7 +642,7 @@ fn connected_zhida_socket_echo() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn closed_port_no_icmp() {
     with_eal(|eal| {
         let names = Names {
@@ -655,7 +655,7 @@ fn closed_port_no_icmp() {
         with_stack(eal, names, |stack, start| {
             let handle = add_udp(stack, false);
             let kernel = kernel_socket();
-            kernel.connect((ZHIDA_ADDR, PORT + 1)).unwrap();
+            kernel.connect((SWITCH_ADDR, PORT + 1)).unwrap();
             let payload = b"closed port";
             loop {
                 turn(stack, start);
@@ -672,7 +672,7 @@ fn closed_port_no_icmp() {
             // datagrams behind the same ARP resolution: the bound port receiving the
             // later one shows the closed-port datagram was processed first.
             send_kernel(stack, start, &kernel_socket(), b"marker");
-            let datagram = recv_zhida(stack, start, &handle);
+            let datagram = recv_switch(stack, start, &handle);
             assert_eq!(datagram.payload(), b"marker");
             drop(datagram);
             assert_kernel_quiet(stack, start, &kernel);
@@ -692,7 +692,7 @@ fn closed_port_no_icmp() {
     });
 }
 
-#[zhida_test_support::pinned_test]
+#[switch_test_support::pinned_test]
 fn oversize_refused() {
     with_eal(|eal| {
         let names = Names {
@@ -706,7 +706,7 @@ fn oversize_refused() {
             let handle = add_udp(stack, true);
             let kernel = kernel_socket();
             let to = Some(endpoint(kernel.local_addr().unwrap()));
-            send_zhida(stack, start, &handle, to, b"warm");
+            send_switch(stack, start, &handle, to, b"warm");
             recv_kernel(stack, start, &kernel, b"warm");
             assert_eq!(
                 stack.udp_send(&handle, to, &[0x5a; 1473]),

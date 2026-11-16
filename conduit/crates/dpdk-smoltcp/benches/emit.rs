@@ -29,11 +29,11 @@ use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::wire::{TcpControl, TcpSeqNumber, ETHERNET_HEADER_LEN, IPV4_HEADER_LEN};
 use dpdk_smoltcp::{Eal, Sent, Turn};
 
-use zhida_test_kit::many::{self, assert_quiet, Conn};
-use zhida_test_kit::pair::{
+use switch_test_kit::many::{self, assert_quiet, Conn};
+use switch_test_kit::pair::{
     establish_sized, pattern, segment, Pair, Side, BUDGET, CLIENT_PORT, SERVER_PORT, T0,
 };
-use zhida_test_kit::with_eal;
+use switch_test_kit::with_eal;
 
 const COUNTS: [usize; 3] = [1, 64, 10_240];
 const FILLER_BUFFER: usize = 256;
