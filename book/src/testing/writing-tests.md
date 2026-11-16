@@ -1,8 +1,17 @@
 # Writing tests that use DPDK
 
-A test that opens a NIC port, builds a Stack or turns a `Net` has to start DPDK first, and DPDK has rules that the standard Rust test harness breaks. This page explains the rule, the `#[pinned_test]` attribute that works around it, the fixtures in `switch-test-kit` that give tests fake NICs and a simulated wire, and the `testkit` module of `switch-net` for testing code against the Linux kernel as the peer.
+Mark a test that uses DPDK `#[switch_test_support::pinned_test]` instead of `#[test]`, and start DPDK in it with `switch_test_kit::with_eal`. A test that opens a NIC port, builds a Stack or turns a `Net` needs both, because DPDK has rules that the standard Rust test harness breaks. This page explains the rule and the attribute, the fixtures in `switch-test-kit` that give tests fake NICs and a simulated wire, and the `testkit` module of `switch-net` for testing code against the Linux kernel as the peer.
 
-These tests build and run where any DPDK code does: in the Docker image, or on Linux with DPDK installed ([Setting up a build environment](../getting-started/environment.md)). [Running the test suite](suite.md) shows how to run them.
+These tests build and run where any DPDK code does: in the Docker image, or on Linux with DPDK installed ([Setting up a build environment](../getting-started/environment.md)). [Running the test suite](suite.md) shows how to run them. A crate outside this repository uses them as path dependencies of a clone:
+
+```toml
+[dev-dependencies]
+switch-test-support = { path = "<clone>/conduit/switch-test-support" }
+switch-test-kit = { path = "<clone>/conduit/switch-test-support/switch-test-kit" }
+switch-net = { path = "<clone>/switch-net", features = ["testkit"] }
+```
+
+`switch-test-kit` is for tests of the Stack itself; `switch-net` with its `testkit` feature is for tests of code written with switch-net.
 
 ## Why tests need one thread
 
@@ -24,29 +33,21 @@ The test harness still sees one test per function, with its own pass or fail. A 
 
 ## The #[pinned_test] attribute
 
-Add `switch-test-support` as a dev-dependency and write `#[switch_test_support::pinned_test]` where you would write `#[test]`:
+Write `#[switch_test_support::pinned_test]` where you would write `#[test]`. This test starts EAL with `with_eal`, described in the next section, and checks that it belongs to the worker thread:
 
 ```rust,ignore
-{{#include ../../../conduit/switch-test-support/tests/pinned.rs:pinned}}
+{{#include ../../../conduit/switch-test-support/switch-test-kit/tests/book.rs:pinned}}
 ```
 
 The attribute replaces `#[test]`; if the function also has a `#[test]`, it is removed. Other attributes, such as `#[ignore]`, stay. It also works inside `proptest!` blocks.
 
 Each body has a time limit, 180 seconds by default (`switch_test_support::PINNED_TEST_BOUND`). `#[pinned_test(bound_ms = N)]` sets a different one. A body that runs past its limit ends the whole test process: the worker thread is stuck holding EAL, so no later test in that binary could run anyway. The process prints ``pinned test `NAME` did not finish within BOUND; exiting the test process`` to stderr and exits with status 1, without running exit handlers or flushing stdout, so the harness's own `test NAME ...` line may be missing. The `timeout` the Makefile wraps around every test step is the backstop if even that fails.
 
-The test binary must run with `--test-threads=1`, as every target in the Makefile does, and its process must be allowed on exactly one CPU.
+The test binary must run with `--test-threads=1`, as every DPDK target in the Makefile does, and its process must be allowed on exactly one CPU.
 
 ## EAL and fake NICs
 
-`switch-test-kit` holds the fixtures the workspace's DPDK tests share. Its entry point is `with_eal`, which starts EAL on the current thread the first time and hands it to the closure:
-
-```rust,ignore
-switch_test_kit::with_eal(|eal| {
-    // open ports and build Stacks with `eal`
-});
-```
-
-EAL starts with no PCI devices, no hugepages and 1 GiB of ordinary memory, with its main thread pinned to the one CPU the process may use; it panics if the process may use more than one. Call it from inside a `#[pinned_test]` body, so it always runs on the worker thread.
+`switch-test-kit` holds the fixtures the workspace's DPDK tests share. Its entry point is `with_eal`, which starts EAL on the current thread the first time and hands it to the closure, as in the test above. EAL starts with no PCI devices, no hugepages and 1 GiB of ordinary memory, with its main thread pinned to the one CPU the process may use; it panics if the process may use more than one. Call it from inside a `#[pinned_test]` body, so it always runs on the worker thread.
 
 Instead of real NICs, tests use DPDK's virtual devices:
 
@@ -75,17 +76,13 @@ Most Stack tests need two endpoints talking to each other. `pair::Pair` holds tw
 
 A Pair round (`Pair::round`; not the same thing as switch-net's [`round`](../net/drive-loop.md), which turns a `Net` and polls the runtime) turns `a`, forwards what it sent to `b`, turns `b`, and forwards what it sent back to `a`. `pair.drive(observe, app)` repeats Pair rounds and calls `app` with both Stacks after each, until `app` returns `App::Done`. When a Pair round moves nothing and `app` returns `App::Idle`, it advances the clock to the earliest timer of either Stack, so retransmissions and delayed ACKs happen without real waiting. Sixteen idle Pair rounds in a row, or 100,000 in all, fail the test.
 
-This test from `dpdk-smoltcp` establishes a TCP connection, sends four bytes from `a` and drives until `b` has them:
+This test establishes a TCP connection from `a` to `b`, sends four bytes from `a`, drives until `b` has them, and closes the pair:
 
 ```rust,ignore
-{{#include ../../../conduit/crates/dpdk-smoltcp/tests/stack_sockets.rs:pair}}
+{{#include ../../../conduit/switch-test-support/switch-test-kit/tests/book.rs:pair}}
 ```
 
-`pair::establish` connects a client on one side to a listener on the other and drives until both are established. It returns the two socket handles, client first. At the end, `pair.close()` frees every frame still on the rings or held by the links, closes both ports and checks that every packet buffer came back; it returns how many frames it had to free:
-
-```rust,ignore
-assert_eq!(pair.close(), 0);
-```
+`pair::establish(&mut pair, Side::A)` connects a client on side A to a listener on side B and drives until both are established. It returns the two socket handles in side order, A then B (here client, then server), and every frame it delivered on the way. `pair.close()` frees every frame still on the rings or held by the links, closes both ports and checks that every packet buffer came back; it returns how many frames it had to free, so a clean test expects 0.
 
 The links can also damage the traffic. `Link::impair` takes a closure that sees each frame and returns a `wire::Verdict`: `Deliver`, `Duplicate`, `Drop`, or `Hold`, which keeps the frame back and delivers it right after the next one, reordering the two. From a teardown test in `switch-test-kit`:
 
@@ -98,7 +95,13 @@ pair.a_to_b.impair(move |_| verdicts.next().unwrap());
 
 For code written with [switch-net](../net/index.md), the `testkit` module of `switch-net` (enabled by its `testkit` feature) sets up a `Net` on a tap device, with the Linux kernel at the other end. Your switch code runs as a [task](../getting-started/first-task.md); the peer is ordinary blocking Rust using `std::net` on a thread of its own.
 
-Addresses are fixed: switch is `SWITCH_ADDR`, 192.0.2.2/24, and the kernel side of the tap is `KERNEL_ADDR`, 192.0.2.1, where the peer listens. A `TapConfig` names the tap device and sets the socket configuration and socket count:
+Addresses are fixed: switch is `SWITCH_ADDR`, 192.0.2.2/24, and the kernel side of the tap is `KERNEL_ADDR`, 192.0.2.1, where the peer listens. The example below uses these imports and constants:
+
+```rust,ignore
+{{#include ../../../switch-net/tests/testkit_echo.rs:setup}}
+```
+
+A `TapConfig` names the tap device and sets the socket configuration and socket count:
 
 ```rust,ignore
 {{#include ../../../switch-net/tests/testkit_echo.rs:tap}}
@@ -106,7 +109,17 @@ Addresses are fixed: switch is `SWITCH_ADDR`, 192.0.2.2/24, and the kernel side 
 
 The name must be short and unique among taps alive at once: the device is `net_tap_<name>` and the Linux interface `cdtap_<name>`.
 
-`client_server` runs one connection end to end. It starts a listener on 192.0.2.1 and runs your `serve` function on a thread with the connection it accepts. It connects to that listener from the `Net`, from a fresh local port, and runs your `client` as a task with the `NetHandle` and the connected `TcpStream`. It turns the `Net` and polls the runtime until both are done, and returns what `serve` returned. Here the peer reads one line and echoes it:
+`client_server` runs one connection end to end. Its seven arguments are:
+
+1. `backend`: `Backend::Conduit` or `Backend::Junction` (see the last section),
+2. `tap`: the `TapConfig`,
+3. `port`: the port the peer listens on, on 192.0.2.1,
+4. `listener_setup`: a closure run on the peer's `TcpListener` before it accepts, for socket options (`|_| {}` for none),
+5. `serve`: the peer, run on its own thread with the accepted `std::net::TcpStream`; its return value is what `client_server` returns,
+6. `client`: a function (an `async fn` works) that takes the `NetHandle` and the connected `TcpStream` and returns the future `client_server` runs as a switch task; `client_server` opens the stream from a fresh local port, and drops what the future returns only after the peer has finished,
+7. `each_round`: a closure called each time through `client_server`'s loop (`|| {}` for none).
+
+It turns the `Net` and polls the runtime until both sides are done. Here the peer reads one line and echoes it:
 
 ```rust,ignore
 {{#include ../../../switch-net/tests/testkit_echo.rs:serve}}
@@ -122,7 +135,7 @@ The client returns its two stream halves. `client_server` drops what the client 
 
 `with_tap_net(backend, &config, body)` is the lower-level form: it gives `body` a `TapNet`, which you turn yourself, and a `Clock`, and leaves the peer to you. Either way the body must drop every handle, socket and frame it made before it returns. Then `with_tap_net` takes the Stack back, closes the port with every packet buffer returned, and removes the tap device; anything still alive fails the test.
 
-On each pass through its loop, `client_server` accepts the peer's connection if it has arrived, turns the `Net` at the test `Clock`'s current time, polls the runtime with a tick from the same clock, and sleeps 50 µs so the peer thread gets the CPU. [Timeouts and racing futures](../net/timeouts.md#the-clock-requirement) explains which tick unit `within` and sleeps expect.
+`client_server` sleeps 50 µs each time through its loop, so the peer thread gets the CPU.
 
 ## Running one body on both backends
 

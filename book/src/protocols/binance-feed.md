@@ -38,7 +38,7 @@ The demo binary runs on a tap device inside a container. Its `main` resolves the
 {{#include ../../../conduit/crates/switch-binance-feed/src/main.rs:drive}}
 ```
 
-This is the [drive loop](../net/drive-loop.md) from the first network program, with three additions. It samples one clock for both the Stack time and the runtime tick (`Clock::sample`). It sleeps for 1 ms when a [round](../net/drive-loop.md) moved nothing, because in this demo the CPU is shared with a helper process; on a dedicated pinned CPU you would call `round` again at once. And it fires the `stop` sender once the helper process has exited.
+This is the [drive loop](../net/drive-loop.md) from the first network program: one clock sample each time through (`Clock::sample`), and a 1 ms sleep when a [round](../net/drive-loop.md) moved nothing. The one addition fires the `stop` sender once the helper process has exited.
 
 ```text
  drive loop                         feed task                     helper process
@@ -78,7 +78,7 @@ The binary's own command line is
 switch-binance-feed [--host HOST] [--port PORT] [--path PATH] [--print N] -- <tester> [args...]
 ```
 
-with defaults `stream.binance.com`, 9443, `/ws/btcusdt@bookTicker` and 10. Each option may appear once. `<tester>` is the helper process. The exit status is 0 when the tester exited 0, 1 when the tester failed, 2 when packet buffers were still in use when the NIC port closed, 3 for bad arguments or a setup, feed or teardown error, and 101 for a panic.
+with defaults `stream.binance.com`, 9443, `/ws/btcusdt@bookTicker` and 10. Each option may appear once. `<tester>` is the helper process. The exit status is 0 when the tester exited 0, 1 when the tester failed, 2 when packet buffers were still in use when the NIC port closed, 3 for bad arguments or a setup, feed or teardown error, and 101 for a panic. Statuses 2 and 3 take precedence over the tester's status.
 
 Binance's servers answer HTTP 451 from restricted locations. The feed then fails with `Upgrade(Status(Some(451)))` and the run exits with status 3.
 

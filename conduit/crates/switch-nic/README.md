@@ -144,7 +144,7 @@ nic() {
       exec taskset -c "$0" ../target/release/switch-nic "$@"' "${SWITCH_CPU:-2}" "$@"
 }
 ```
-Native: install DPDK 25.11.3 under /opt/dpdk with the meson options in docker/Dockerfile, Rust 1.93,
+Native: install DPDK 25.11.3 under /opt/dpdk with the meson options in docker/Dockerfile, Rust 1.99.1,
 clang and lld, then use the Dockerfile's `PKG_CONFIG_PATH`, `LD_LIBRARY_PATH` and `RUSTFLAGS`, and
 `cargo build --locked --release -p switch-nic`; run the binary as
 `taskset -c <core> ../target/release/switch-nic ...`.

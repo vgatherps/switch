@@ -1,6 +1,6 @@
 # Programming the Stack directly
 
-Everything in the switch-net chapter runs on top of one type: `Stack`, from the `dpdk-smoltcp` crate. The Stack is a TCP/IP stack for one NIC port. It is built on smoltcp (a small TCP/IP stack written in Rust, vendored in this repository with changes) and talks to the NIC through DPDK. switch-net wraps it in async sockets, and the junction daemon, whose part of the book ended on the [previous page](../junction/closing.md), runs one for many applications.
+Everything in the switch-net chapter runs on top of one type: `Stack`, from the `dpdk-smoltcp` crate. The Stack is a TCP/IP stack for one NIC port. It is built on smoltcp (a small TCP/IP stack written in Rust, vendored in this repository with changes) and talks to the NIC through DPDK. switch-net wraps it in async sockets, and the [junction daemon](../junction/index.md) runs one for many applications.
 
 You can also call the Stack yourself, with no async runtime at all. This part of the book shows how. It is for programs that want a plain synchronous loop, for library and daemon authors building their own layer on top, and for anyone who wants to know what switch-net does underneath.
 
@@ -22,31 +22,31 @@ A program that uses the Stack goes through the same steps every time:
 
 ```text
  only_allowed_cpu()            this thread may run on exactly one CPU
-        │
- Eal::init(args) ──▶ Eal       DPDK starts once per process; keep it alive
-        │
+        |
+ Eal::init(args) --> Eal       DPDK starts once per process; keep it alive
+        |
  find or create the device     port_by_name, or a test device
-        │
- Port::open(&eal, config) ──▶ Port     queues and the three pools
-        │
- Stack::new(port, config, now) ──▶ Stack
-        │
- add_tcp / add_udp ──▶ handles
-        │
- ┌──▶ turn(now) / receive(now) … send()     the drive loop
- └──────┘
-        │
+        |
+ Port::open(&eal, config) --> Port     queues and the three pools
+        |
+ Stack::new(port, config, now) --> Stack
+        |
+ add_tcp / add_udp --> handles
+        |
+ +--> turn(now) / receive(now) ... send()     the drive loop
+ +------+
+        |
  drop frames you hold, then
- stack.into_port() ──▶ Port
-        │
- port.try_close()              Ok: every packet buffer is back
-        │
+ stack.into_port() --> Port
+        |
+ port.try_close()              closes the device; Ok once every
+        |                      packet buffer is back
  Eal is never torn down; it lives until the process exits
 ```
 
 `switch_open::open` does the first five steps from a network config file and returns the `Stack` and the `Eal` together (see [opening the NIC from code](../nic/open.md)). The [by-hand page](by-hand.md) does them one by one.
 
-The end of the lifecycle matters as much as the start. `into_port` drops the sockets and every packet still queued inside the Stack, and gives back the `Port`. `try_close` then closes the NIC port, but only if every packet buffer has come back to its pool. A received frame your code still holds keeps its buffer, even after the Stack is gone, so drop those first. If something is still held, `try_close` returns the `Port` together with `PortError::OutstandingBuffers { rx, tx, frame }`, counting what is missing from each pool.
+The end of the lifecycle matters as much as the start. `into_port` drops the sockets and every packet still queued inside the Stack, and gives back the `Port`. `try_close` stops and closes the device, then frees its pools once every packet buffer is back. A received frame your code still holds keeps its buffer, even after the Stack is gone. If some buffers are still held, `try_close` returns the `Port` together with `PortError::OutstandingBuffers { rx, tx, frame }`, counting what is missing from each pool: drop the held frames and call `try_close` again. The port does no more network work either way.
 
 ## A complete client
 
@@ -84,7 +84,7 @@ The loop is the heart of the program:
 {{#include ../../../conduit/crates/switch-open/examples/tcp_client.rs:loop}}
 ```
 
-Each iteration calls `receive` with the current time. That takes arriving packets from the NIC and processes them. Then the program reads and writes its socket: it prints every received frame and drops it, sends its line once the connection may send, and closes its side once the server has closed (`State::CloseWait`). Finally `send` builds the outgoing segments, including what the program just wrote, and hands them to the NIC. The loop never sleeps; it is meant to run alone on its pinned CPU.
+Each time through the loop, the program calls `receive` with the current time. That takes arriving packets from the NIC and processes them. Then the program reads and writes its socket: it prints every received frame and drops it, queues its line once the connection may send (`send_slice` returns how many bytes it took, so the program keeps going until the whole line is queued), and closes its side once the server has closed (`State::CloseWait`). Finally `send` builds the outgoing segments, including what the program just wrote, and hands them to the NIC. The loop never sleeps; it is meant to run alone on its pinned CPU.
 
 When the connection reaches `Closed`, the program checks how it ended and closes the port:
 
@@ -94,7 +94,19 @@ When the connection reaches `Closed`, the program checks how it ended and closes
 
 Every received frame was dropped inside the loop, so `try_close` finds all packet buffers back in their pools.
 
-To run it, see the instructions at the top of the example file: it needs a network config file, a server, and `taskset -c N` so the process may run on exactly one CPU.
+To run it, work in the DPDK environment from [Setting up a build environment](../getting-started/environment.md), at the repository root. The tap device needs no NIC. Start a kernel-side server that replies and closes, start the client on one CPU, and give the tap interface its kernel-side address once the client has created it:
+
+```text
+cargo build -p switch-open --example tcp_client
+
+python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
+taskset -c 3 target/debug/examples/tcp_client switch-net/examples/tap.json 192.0.2.1:7000 &
+until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
+ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
+wait
+```
+
+`taskset -c 3` allows the process on exactly one CPU; pick any CPU your container may use. The program prints the report from `open`, then the server's reply, then `port closed`.
 
 ## The rest of this part
 

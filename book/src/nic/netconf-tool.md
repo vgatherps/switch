@@ -1,6 +1,6 @@
 # switch-netconf: check, discover, bind, unbind
 
-`switch-netconf` is the command-line side of the [network config file](config.md). It has four subcommands:
+`switch-netconf` is the command-line side of the [network config file](config.md) the previous page described: it writes, checks and applies that file. [Preparing a Linux machine](host-setup.md) runs it as one step among others; this page is its reference. It has four subcommands:
 
 ```text
 switch-netconf check FILE
@@ -67,7 +67,7 @@ A freshly discovered file has these values for the keys Linux cannot tell it:
 | `eal` | `{"file_prefix": "switch", "extra": []}` |
 | `devargs` | empty |
 
-`discover` refuses, with one line on stderr and exit 1, when the interface does not exist, is not a PCI device, has no kernel driver bound, has no IPv4 address, or has several default gateways. When the interface has several IPv4 addresses, it asks you to pick one with `--ipv4 ADDR`. If the interface's link is not up, it still writes the file and warns:
+`discover` refuses, with one line on stderr and exit 1, when the interface does not exist, is not a PCI device, has no kernel driver bound, has no IPv4 address (without `--aws`), or has several default gateways. When the interface has several IPv4 addresses, it asks you to pick one with `--ipv4 ADDR`. If the interface's link is not up, it still writes the file and warns:
 
 ```text
 switch-netconf: warning: eth1 operstate is down
@@ -109,6 +109,15 @@ switch-netconf bind dut.json              # machines with an IOMMU
 switch-netconf bind dut.json --noiommu    # machines without one (EC2 instances other than metal)
 ```
 
+A dry run prints each step with a `dry-run: ` prefix, starting with the module load when `vfio-pci` is not loaded yet:
+
+```text
+dry-run: modprobe vfio-pci
+dry-run: write '0000:00:06.0' > /sys/bus/pci/devices/0000:00:06.0/driver/unbind
+dry-run: write 'vfio-pci' > /sys/bus/pci/devices/0000:00:06.0/driver_override
+...
+```
+
 Before it writes anything, `bind` checks:
 
 1. It runs as root (`bind/unbind needs euid 0`).
@@ -116,38 +125,22 @@ Before it writes anything, `bind` checks:
 3. The device at `pci` exists and still has the `pci_id` from the config.
 4. If the card is on its kernel driver, the interface's MAC equals the config's `mac`.
 5. The card is on its kernel driver, on `vfio-pci`, or on no driver. Any other driver is refused.
-6. While the card is on its kernel driver, the interface carries no route except its own connected subnet. A default route or any route through a router is refused (`eth1 has route 0.0.0.0/0 via 10.0.1.1`), so binding never cuts the route you are logged in through.
-7. Every other device in the card's IOMMU group is unbound or already on `vfio-pci`.
+6. While the card is on its kernel driver, the interface carries no route except its own connected subnet. `bind` refuses while the interface carries a default or routed entry (`eth1 has route 0.0.0.0/0 via 10.0.1.1`), and allows only its own subnet's route. It does not check your SSH connection: log in through the management interface before binding the data NIC.
+7. Every other device in the card's IOMMU group (the devices the IOMMU can only isolate together; `vfio-pci` takes a whole group) is unbound or already on `vfio-pci`.
 8. If the card has no IOMMU group, you passed `--noiommu`.
 
 Each refusal is one line on stderr, exit 1, and nothing has been written.
 
-Then it loads the `vfio-pci` module if it is missing, and makes the move with a short series of writes to sysfs, printing each one as `write '<value>' > <path>`: switch on the kernel's unsafe no-IOMMU mode if `--noiommu` needs it, detach the card from its kernel driver, mark it for `vfio-pci`, attach it, and clear the mark. It then verifies that the card is on `vfio-pci` and that its device node exists under `/dev/vfio/`, and prints:
+It loads `vfio-pci` if needed, moves the card to it, and prints each write it makes, as `write '<value>' > <path>`. If a step fails after the card has left its kernel driver, it gives the card back to that driver and says which driver it ended on. When the move succeeds, it prints:
 
 ```text
 0000:00:06.0 bound to vfio-pci (/dev/vfio/noiommu-0)
 node0 hugepages-2048kB HugePages_Free: 512
 ```
 
-The last lines show the free hugepages on the card's NUMA node, so you can see whether the program will find packet memory there.
+After a fresh bind (and after a dry run), the last lines show the free hugepages on the card's NUMA node, so you can see whether the program will find packet memory there.
 
-```text
-        kernel driver (ena, ice, ...)                     vfio-pci
-       ┌───────────────────────────┐   bind (root)   ┌─────────────────────┐
-       │ interface eth1 exists     │ ──────────────► │ no Linux interface  │
-       │ SSH/DNS could use it      │   checks 1-8    │ one DPDK program    │
-       └───────────────────────────┘   first         │ may open it         │
-                 ▲     ▲                             └──────────┬──────────┘
-                 │     │ a write or the final check fails       │
-                 │     └── after the kernel driver was detached:│
-                 │         detach from vfio-pci, clear the mark,│
-                 │         re-attach the kernel driver          │
-                 └──────────────── unbind (root) ───────────────┘
-```
-
-If a write fails or the final check fails after `bind` detached the kernel driver, it puts the card back: detach it from `vfio-pci` if it got there, clear the mark, and re-attach the kernel driver. The error then reports the original failure, any failure of those recovery steps, and which driver the card ended up on. A write that fails on a card that had no driver changes no binding and is reported alone.
-
-A card that is already on `vfio-pci` is not touched again: `bind` clears a leftover mark if there is one, checks the device node and prints `0000:00:06.0 already bound to vfio-pci (...)`, exit 0. So running `bind` again after an interrupted run finishes the job.
+A card that is already on `vfio-pci` is not moved again: `bind` clears a leftover `driver_override` setting if there is one, checks the device node and prints `0000:00:06.0 already bound to vfio-pci (...)`, exit 0. So running `bind` again after an interrupted run finishes the job.
 
 `--noiommu` turns on the kernel's unsafe no-IOMMU mode. Without an IOMMU, nothing stops the card from writing to any memory the device driver tells it to, and the kernel marks itself tainted when the mode is used. It is the only way to use DPDK on machines without an IOMMU, such as EC2 instances other than metal ones.
 
@@ -179,4 +172,4 @@ Warnings from `discover` start `switch-netconf: warning:` and do not change the 
 
 The library behind the command is public. `switch_netconf::Config` is the config itself; `discover::{discover, discover_aws}`, `rediscover::write` and `devbind::{bind, unbind}` are what the subcommands call. They take a `Roots` value naming where `/sys`, `/proc` and `/dev` are, which lets tests run them against a fake tree. Most programs only need `Config::load`.
 
-Next: [Opening the NIC from code](open.md).
+Next: [switch-nic](switch-nic.md), the program that opens the card you just bound and reports on it.

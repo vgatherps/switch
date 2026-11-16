@@ -58,7 +58,7 @@ With `"rx_timestamps": true`, the card records when each packet arrived, by its 
 
 The value is the raw value from the NIC driver, 0 = none; units are the driver's (ENA: nanoseconds of the NIC clock). A packet the driver did not stamp, or any packet when `rx_timestamps` is off, reports 0.
 
-`rx_timestamps` is never turned on by `"auto"`; it is requested exactly as written. If the NIC driver does not offer it, opening the port fails with `InvalidSettings("PMD lacks the requested RX timestamp offload")`. The `rx_offload_capa` line of the report shows the driver's receive capabilities; timestamps are DPDK's receive offload bit 14 (`0x4000`).
+`rx_timestamps` is never turned on by `"auto"`; it is requested exactly as written. `rx_timestamps` needs the driver to list timestamps among its receive capabilities; if it does not, the open fails as above, with `InvalidSettings("PMD lacks the requested RX timestamp offload")`.
 
 Two drivers add a note to the report when timestamps are on:
 
@@ -81,8 +81,6 @@ It returns `Ok(value)`, the card's clock (ENA: nanoseconds of the NIC clock the 
 
 ## Device resets
 
-Some cards can ask to be reset when they detect a fault; ENA's health watchdog does this. The Stack checks for such a request once a second, during a `turn` or `receive` call. When there is one, it resets the NIC port, configures and starts it again, and carries on. Your sockets stay as they were. Packets the card was holding go back to their pools, and TCP resends whatever was lost. If recovery fails, the drive call returns `StackError::Port`, and every later call fails as well; close the Stack.
+Some cards can ask to be reset when they detect a fault; ENA's health watchdog does this. Each `turn` or `receive` checks for a pending reset request before processing packets, and recovers the NIC port when there is one; [The Stack's drive loop](../stack/drive-loop.md) explains what recovery does. The card's clock may not continue smoothly across a reset, so `dpdk_smoltcp::port_resets()` counts the resets recovered so far in this process: `switch-nic feed` reads it before and after its run and marks its latency figures invalid if it changed.
 
-`dpdk_smoltcp::port_resets()` counts the resets recovered so far in this process. The card's clock may not continue smoothly across a reset, so a program that compares hardware timestamps over a long run should check this counter: `switch-nic feed` reads it before and after its run and marks its latency figures invalid if it changed.
-
-Next: [Preparing a Linux machine](host-setup.md).
+Next: [When the NIC won't open](troubleshooting.md), the error messages of this part in one place.

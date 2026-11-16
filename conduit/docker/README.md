@@ -16,7 +16,7 @@ make docker-binance   # live Binance example, needs internet (section below)
 
 ## Image
 
-The image uses the native host architecture by default, Rust 1.93.0 and Ubuntu 24.04, with both
+The image uses the native host architecture by default, Rust 1.99.1 and Ubuntu 24.04, with both
 base image digests pinned. It builds checksum-pinned upstream DPDK 25.11.3 from source, because
 Ubuntu's 23.11 package has a different mbuf field structure that these Rust accessors do not
 compile against. Cargo.lock pins Rust dependencies; system build tools come from the Ubuntu
@@ -719,8 +719,8 @@ the alert reaching the server, and that refused, timed-out and failed connects f
 
 A Linux machine runs the same targets without Docker. It needs what docker/Dockerfile installs:
 
-- Rust 1.93.0. `rust-toolchain.toml` at the repository root pins it for cargo commands in this
-  repository (`cargo +nightly` overrides it). The Dockerfile's `rust:1.93.0-bookworm` base image must
+- Rust 1.99.1. `rust-toolchain.toml` at the repository root pins it for cargo commands in this
+  repository (`cargo +nightly` overrides it). The Dockerfile's `rust:1.99.1-bookworm` base image must
   name the same version; bump both together.
 - clang 18 and lld 18, `clang` and `ld.lld` on `PATH`, plus pkg-config, meson, ninja,
   python3-pyelftools, libnuma-dev, libpcap-dev, iproute2 and ethtool (Ubuntu 24.04 package

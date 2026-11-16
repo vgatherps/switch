@@ -1,6 +1,6 @@
 # The network config file
 
-Everything `switch_open::open` needs to know about the card lives in one JSON file, the network config file, the first item on the path laid out in [Owning a NIC](index.md#from-a-bare-machine-to-a-running-stack). It says which device to open, which IPv4 address the Stack uses, where the gateway is, how large packets may be, which checksum work to hand to the card, and a few DPDK settings. The examples in this book call it `dut.json` for a real card and `tap.json` for a tap device. The crate `switch-netconf` reads and checks it, and the [`switch-netconf` command](netconf-tool.md) can write it for you from what Linux knows about an interface.
+[Preparing a Linux machine](host-setup.md) and [Running on EC2](ec2.md) both end with a file called `dut.json`, written by `switch-netconf discover`. That file is the network config file: everything `switch_open::open` needs to know about the card. It says which device to open, which IPv4 address the Stack uses, where the gateway is, how large packets may be, which checksum work to hand to the card, and a few DPDK settings. The examples in this book call it `dut.json` for a real card and `tap.json` for a tap device. The crate `switch-netconf` reads and checks it, and the [`switch-netconf` command](netconf-tool.md), the next page, writes it from what Linux knows about an interface.
 
 This page goes through the file key by key. The loader is strict: it rejects a file with an unknown key or a missing one, so every key below is either required or explicitly marked optional.
 
@@ -22,7 +22,7 @@ Each key feeds one part of opening the card:
 
 ```text
  key               consumed by
- ───────────────   ──────────────────────────────────────────────────────────
+ ---------------   ----------------------------------------------------------
  version           loader (must be 1)
  device            EAL arguments (-a <pci>[,<devargs>]  or  --no-pci --vdev <spec>),
                    then device lookup by PCI address or vdev name
@@ -32,7 +32,7 @@ Each key feeds one part of opening the card:
  owned_ipv4        Stack: extra addresses it answers for
  mtu               NIC port MTU, packet-buffer sizes, path MTU table
  paths             path MTU table (TCP MSS and UDP size limit per destination)
- offloads          offload choice → NIC port configuration
+ offloads          offload choice -> NIC port configuration
  rx_timestamps     NIC port configuration (hardware receive timestamps)
  descriptors       NIC port receive and transmit ring sizes
  eal.file_prefix   EAL arguments (--file-prefix)
@@ -60,7 +60,7 @@ A tap device, or any other virtual DPDK device, is an object with one key, `vdev
 
 ## Addresses
 
-`ipv4` is the Stack's own address with its subnet length, `"10.0.1.23/24"`. It decides three things: which address the Stack answers ARP for, which destinations are on the local subnet and reached directly, and the source address of everything the Stack sends. It must be a unicast address.
+`ipv4` is the Stack's own address with its subnet length, `"10.0.1.23/24"`. It decides three things: which address the Stack answers ARP for, which destinations are on the local subnet and reached directly, and the default source address. It must be a unicast address.
 
 `gateway` is the next-hop router for every destination outside the subnet, or `null` if the Stack only talks to machines on its own subnet. The key must be present either way. When a gateway is set, `open` sends ARP for it and waits for the answer before returning, so a wrong gateway shows up at startup, not on the first connect. The loader requires a gateway to be:
 
@@ -69,7 +69,7 @@ A tap device, or any other virtual DPDK device, is an object with one key, `vdev
 - different from our own address,
 - neither the subnet's network address nor its broadcast address.
 
-`owned_ipv4` is optional. It lists more addresses the Stack answers for: single addresses as `/32`, or whole prefixes. EC2 uses it for an interface's secondary private addresses and delegated prefixes. These addresses are for receiving only: `ipv4` still decides routing, the subnet broadcast and the default source address. Each entry must have no host bits set (`10.0.2.0/24`, not `10.0.2.7/24`) and may not cover 0.0.0.0, a multicast address, 255.255.255.255, the gateway or the subnet's broadcast address. When the file loads, the list is sorted, and duplicates and entries that sit inside another entry are dropped.
+`owned_ipv4` is optional. It lists more addresses the Stack answers for: single addresses as `/32`, or whole prefixes. EC2 uses it for an interface's secondary private addresses and delegated prefixes. Sockets can listen on and bind to these addresses, and use them as their source. Adding them adds no routes and does not change the default source address: `ipv4` still decides routing, the subnet broadcast and the default source. Each entry must have no host bits set (`10.0.2.0/24`, not `10.0.2.7/24`) and may not cover 0.0.0.0, a multicast address, 255.255.255.255, the gateway or the subnet's broadcast address. When the file loads, the list is sorted, and duplicates and entries that sit inside another entry are dropped.
 
 ## MTU and path rules
 
@@ -157,4 +157,4 @@ The loader applies all of these. The message is what `ConfigError` displays.
 | `descriptors` | greater than 0 | `descriptors: must be > 0` |
 | `eal.file_prefix` | not empty | `eal.file_prefix: must not be empty` |
 
-Next: [switch-netconf: check, discover, bind, unbind](netconf-tool.md), the command that writes and checks this file.
+Next: [switch-netconf: check, discover, bind, unbind](netconf-tool.md), the command that writes, checks and applies this file.

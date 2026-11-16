@@ -2,7 +2,7 @@
 
 switch-net is the usual way to use the daemon. Underneath it is `Session`, from the `switch-junction` crate, and a program can use it directly: a program with its own loop and no async runtime, a test tool, or a client library for another framework. This page walks through the raw API, starting from the session you already know how to connect (see [Connecting an application through switch-net](apps.md#connecting)).
 
-A `Session` never blocks and never runs anything in the background apart from the `junction-ctl` thread that reads the control socket. Your program calls it in a loop: open sockets, poll for events and packets, send. Like switch-net, it belongs to the thread that connected it.
+Once `Session::connect` has returned, no `Session` method waits: opening, sending and polling return at once. One background thread, `junction-ctl`, reads the control socket. Your program calls the session in a loop: open sockets, poll for events and packets, send. Like switch-net, it belongs to the thread that connected it.
 
 ## Socket ids
 
@@ -20,20 +20,19 @@ pub struct SocketId {
 A socket slot moves through these states:
 
 ```text
-                    connect_tcp / listen_tcp / bind_udp
-   free ------------------------------------------------> open
-    ^                                                       |
-    |  Rejected(code)                                       |  Connected / Bound,
-    +-------------------------------------------------------+  then PeerFin, Delivered,
-    |                                                       |  Closed as they happen
-    |                                                       |
-    |                      close / abort                    v
-    |  Freed           +-------------------------------- (open)
-    +----------- closing <---+
-       (next open of this slot gets generation + 1)
+            connect_tcp / listen_tcp / bind_udp
+   free -----------------------------------------> open
+    ^  ^                                            |  |
+    |  |              Rejected(code)                |  |
+    |  +--------------------------------------------+  |
+    |                                                  | close / abort
+    |                 Freed                            v
+    +--------------------------------------------- closing
+
+   (the next open of a freed slot gets generation + 1)
 ```
 
-A slot is free again only after the daemon answers with `Freed` (after a close) or `Rejected` (the open failed). A closing socket still occupies its slot, so `OpenError::NoFreeSlot` means every slot is open or closing.
+`Connected`, `Bound`, `PeerFin`, `Delivered` and `Closed` arrive while the slot is open and do not change its state. A slot is free again only after the daemon answers with `Freed` (after a close) or `Rejected` (the open failed). A closing socket still occupies its slot, so `OpenError::NoFreeSlot` means every slot is open or closing.
 
 ## Opening sockets and events
 
@@ -87,21 +86,37 @@ The smallest complete use of a session binds a UDP socket, receives one datagram
 {{#include ../../../switch-junctiond/tests/process.rs:exchange}}
 ```
 
+`peer` is an ordinary nonblocking kernel UDP socket bound to 10.77.0.1:30001, and `WAIT` is the test's 20-second limit on each wait.
+
 It follows the rules above in order. It opens the socket, then polls events until `Bound` arrives. It then polls until the datagram arrives; `&*frame` is the payload, and `meta` says where it came from. Only then does it send. While it waits for the kernel to receive the answer it keeps calling `poll_events`, which flushes control output and notices loss.
 
-The test sleeps 1 ms between polls because it shares its CPU with the kernel peer. A latency-sensitive program polls in a loop on its pinned CPU instead.
+The test sleeps 1 ms between polls because it shares its CPU with the kernel peer. A latency-sensitive program polls in a loop on its pinned CPU instead. To run it, use the DPDK container as root: `cargo test --locked -p switch-junctiond --test process -- --test-threads=1`.
 
 ## TCP
 
-A TCP client opens with `connect_tcp` and waits for `Connected`. The daemon's tests do it like this, then wait for the `Connected` event for `id`:
+A complete TCP client is the crate's example `tcp_session.rs`. It connects to a server, sends one line, half-closes, waits until the peer has acknowledged everything, frees the socket and finishes the session. It builds without DPDK. With the daemon from the [walkthrough](apps.md#running-it) running, start a receiver on the kernel side of the tap device, then run the example:
 
-```rust,ignore
-let id = client
-    .connect_tcp(tcp_config(), peer_endpoint(PEER_PORT), local(port))
-    .unwrap();
+```sh
+cargo build --locked --release -p switch-junction --example tcp_session
+python3 -c 'import socket; s=socket.socket(); s.bind(("10.77.0.1",7000)); s.listen(); c,_=s.accept(); print(c.makefile("rb").read()); c.close()' &
+taskset -c 3 target/release/examples/tcp_session /tmp/jn/control.sock 10.77.0.1:7000
 ```
 
-The local port must be nonzero. If the peer refuses the connection, the socket gets `Closed { reset_by_peer: true }` without a `Connected` first; call `close(id, false)` and wait for `Freed`.
+The receiver prints `b'hello from Session\n'` and the example prints `message delivered; socket freed; session finished`. A third argument sets the local port (30000 by default); the local port must be nonzero.
+
+First the example connects and waits for the answer:
+
+```rust,ignore
+{{#include ../../../switch-junction/examples/tcp_session.rs:connect}}
+```
+
+`Connected` means the connection is up. `Rejected` means the daemon refused the open, and `Closed` without `Connected` means the peer refused the connection (`Closed { reset_by_peer: true }`); a real program would then call `close(id, false)` and wait for `Freed` before reusing the slot. Each time through the loop the example calls `poll` and sleeps 1 ms; a latency-sensitive program polls without sleeping on its pinned CPU.
+
+Then it sends:
+
+```rust,ignore
+{{#include ../../../switch-junction/examples/tcp_session.rs:send}}
+```
 
 Once connected, send bytes with `send_tcp(id, payload)`. Each call commits one record to the send ring, so a payload may be at most `max_record() − 16` bytes; larger data goes in several calls. For UDP, `send_udp(id, to, payload)` takes at most `max_record() − 24` bytes. Both return:
 
@@ -110,11 +125,19 @@ Once connected, send bytes with `send_tcp(id, payload)`. Each call commits one r
 | `Ok(())` | the record is in the send ring (see [What applications share](sharing.md#what-ok-and-full-mean)) |
 | `Err(SendError::Full)` | the send ring has no room right now; retry later |
 | `Err(SendError::TooLarge)` | header plus payload is larger than `max_record()` |
-| `Err(SendError::NotOpen)` | the socket is closing, or it is a TCP socket after `shutdown` |
+| `Err(SendError::NotOpen)` | the socket is closing, its open was rejected, or it is a TCP socket after `shutdown` |
 
-Sending on a socket of the wrong kind, or with a stale id, panics.
+Sending on a socket of the wrong kind, or with a stale id, panics. The example's retry polls between attempts, because only polling flushes control output and reports loss.
 
 Received TCP data arrives as packets in byte order. The chunks do not match the sender's writes: the daemon writes whatever the Stack received, and splits a chunk larger than the ring can hold into several records.
+
+Last, the example half-closes, waits for `Delivered`, and closes the socket:
+
+```rust,ignore
+{{#include ../../../switch-junction/examples/tcp_session.rs:close}}
+```
+
+`shutdown` sends a FIN after the queued data. `Delivered` says the peer acknowledged all of it. `close(id, false)` then releases the socket, and `Freed` says the slot is free again. The example then finishes the session, which [the next page](closing.md#finishing-a-session) explains.
 
 ## Received packets and ring space
 

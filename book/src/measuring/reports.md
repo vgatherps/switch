@@ -1,6 +1,6 @@
 # Reading a benchmark report
 
-A sweep writes one JSON line per step, as on [Running a sweep on one machine](local.md). `switch-bench/report.py` turns a directory of sweeps into a report you can read: a table and a plot per sweep, with flags that say which rows to trust. This page runs it, walks through one row column by column, and explains the flags and what makes a report incomplete.
+Run `report.py` on the directory the sweeps wrote. It turns each sweep's JSON lines into a table and a plot, and flags the rows not to trust. This page runs it, reads a real report row by row, and explains the flags and what makes a report incomplete.
 
 ## Running report.py
 
@@ -18,33 +18,30 @@ It prints `wrote RESULTS_DIR/report.md` and exits 0 when the results are complet
 
 A few optional files in the directory add to the report. The AWS runner writes them; for a local run they are absent and the report works without them. `expected.json` lists every sweep the run meant to produce, `source.json` records the commit, `host-setup.txt` holds the host verification output, and `<sweep>.placement.json` records which CPU every thread ran on.
 
-## A row, column by column
+## A real report
 
-Each sweep's table has one row per step, sorted by offered rate:
+This is the TCP section of the report from one `make -C conduit docker-bench-smoke` run, made with `python3 switch-bench/report.py switch-bench/out/smoke --title 'Local smoke (tooling validation over net_tap; not a measurement)'` after the run stopped at its overload check, as [Running a sweep on one machine](local.md#the-smoke-run) describes. It ran over tap devices in a Docker VM, so it is tooling validation, not a measurement. The plot and table are exactly as `report.py` wrote them:
 
-```text
-| offered pps | sent pps | received pps | not echoed % | p50 µs | p99 µs | p99.9 µs | max µs | flags        |
-       |           |             |              |           \______ latency percentiles ______/      |
-       |           |             |              |                                                     |
-  rate asked   messages the    echoes that   measured messages not echoed            which rows to trust
-  for          generators'     arrived in    by the end of the drain,
-               stacks accepted the window    never-sent ones included
-```
+![tcp-switch](tcp-switch.svg)
 
-Offered pps is the rate the step asked for, summed over the workers. Sent pps is the number of messages the generators' network stacks accepted during the measurement window, divided by the window. It counts what the generator handed to its stack, not what the NIC transmitted. Received pps counts echoes that arrived within the window, including echoes of warmup messages.
+{{#include smoke-report.md:24:40}}
 
-Not echoed % is the share of measured messages that had not come back when the drain ended. Messages that were due but never sent count as not echoed.
+Each row is one step, sorted by offered rate. Take the first row, offered 1000.
 
-The latency columns are percentiles of receive time minus scheduled send time, in microseconds, over every echoed measured message. They come from one histogram merged across all workers; percentiles are never averaged. A step with no echo at all shows `-` in these columns and `NO ECHO` in the flags, and the plot marks it with an x.
+Offered pps is the rate the step asked for, summed over the workers: 1000 messages per second. Sent pps is the number of messages the generators' network stacks accepted during the measurement window, divided by the window. It counts what the generator handed to its stack, not what the NIC transmitted. Received pps counts echoes that arrived within the window, including echoes of warmup messages. Here all three are 1000.
 
-A healthy receiver shows sent and received close to offered, nothing lost, and latencies that stay flat as the rate rises. Saturation looks like latency rising sharply, then the not-echoed share rising, and on a sweep where the generator could not keep up, a `SENDER-LATE` row after which the sweep stops.
+Not echoed % is the share of measured messages that had not come back when the drain ended; messages that were due but never sent count as not echoed. Here it is 0.
+
+The four latency columns are percentiles of receive time minus scheduled send time, in microseconds, over every echoed measured message: half the messages came back within 15.3 µs, 99% within 19.1 µs. They come from one histogram merged across all workers; percentiles are never averaged. A step with no echo at all shows `-` in these columns and `NO ECHO` in the flags, and the plot marks it with an x.
+
+Down the table, sent and received follow offered and the median stays near 15 µs, while two rows are `BUDGET-BOUND`: some messages there waited for their connection's budget. The last row, at 128000 messages per second, is where a generator fell behind its timetable: the median jumps to 81.4 µs, a few messages are not echoed, and the row is `SENDER-LATE`, so the sweep stopped there. A saturating receiver looks similar, with latency rising sharply and then the not-echoed share rising; the `SENDER-LATE` flag says that this time the generator, or backpressure on it, set the limit.
 
 ## Flags
 
 | Flag | Meaning |
 |---|---|
 | `-` | Nothing to note. |
-| `SENDER-LATE` | A sender fell behind its timetable in this step: it still owed messages at the end of its window, or its send lag had a 99th percentile above 20 µs. The sweep stopped after this step. The flag does not say why; pushback from the receiver can also delay sends. |
+| `SENDER-LATE` | A generator fell behind in this step: it still had messages due that it had not sent (not counting those a blocked connection was holding), or the 99th percentile of its senders' send lag was above 20 µs. The sweep stopped after this step. The flag does not say whether the generator or receiver backpressure was the limit. |
 | `BUDGET-BOUND` | Some measured message waited because its connection already had its budget in flight (`--budget-us`). The latency in this row may be the budget's, not the receiver's. |
 | `NO ECHO` | No measured message came back. |
 | `CARRYOVER` | Only on junction-backend TCP and WebSocket sweeps without a budget, on steps after the first step with loss or a sender-late step. The daemon may still hold queued work from earlier steps, so these rows are not comparable with others. Budgeted sweeps are never marked. |
@@ -53,7 +50,16 @@ A sweep whose CPU placement check failed has `— INVALID` in its section headin
 
 ## Incomplete reports
 
-When the results are incomplete, `report.md` starts with `# INCOMPLETE:` and a list of reasons, still followed by everything that ran, and `report.py` exits 1 and prints each reason on stderr prefixed `incomplete:`. The reasons are:
+When the results are incomplete, `report.md` starts with `# INCOMPLETE:` and a list of reasons, still followed by everything that ran, and `report.py` exits 1 and prints each reason on stderr prefixed `incomplete:`. The run above printed four:
+
+```text
+incomplete: overload-check: sender fell behind schedule; receiver capacity is not isolated
+incomplete: tcp-switch: sender fell behind schedule; receiver capacity is not isolated
+incomplete: udp-switch: sender fell behind schedule; receiver capacity is not isolated
+incomplete: ws-switch: sender fell behind schedule; receiver capacity is not isolated
+```
+
+The reasons are:
 
 - a sweep listed in `expected.json` has no file (`<sweep>: missing`), or the directory has no sweeps at all,
 - a sweep has no summary line, so it did not finish,

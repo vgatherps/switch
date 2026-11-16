@@ -1,6 +1,6 @@
 # TCP streams
 
-A `TcpStream` is an open TCP connection, from `tcp_connect` or `tcp_accept` ([Opening sockets](opening.md)). This page shows how to read from it, how to write to it with [frames](frames.md), what happens when the connection cannot take more data, and how to close it.
+A `TcpStream` is an open TCP connection, from `tcp_connect` or `tcp_accept` ([Opening sockets](opening.md)). You read from it and write to it with [frames](frames.md), wait for room when the connection cannot take more data, and close it by shutting down and dropping its halves.
 
 ```text
    tcp_connect / tcp_accept
@@ -32,7 +32,7 @@ A `TcpStream` is an open TCP connection, from `tcp_connect` or `tcp_accept` ([Op
 The first network program reads until `Finished`:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:recv}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:recv}}
 ```
 
 Dropping a `recv` future before it completes loses nothing; data stays queued for the next call.
@@ -53,15 +53,15 @@ Sending takes two steps. `tx.room(len).await` waits until the socket has room fo
 
 `try_send` can fail with `Full` (no room now), `InvalidState` (the socket cannot send), `Empty` (the frame has zero length) or `Foreign` (the frame came from another `Net`'s pool). `tx.is_on(&handle)` tells you whether a stream belongs to the same `Net` as a handle, and so whether that handle's frames are its own.
 
-On the local backend, a frame longer than the connection's segment size is cut into segments and copied when it is sent. `tx.max_segment_payload()` tells you the segment size, so you can size frames to fit.
+On the local backend, a frame longer than the connection's segment size is cut into segments and copied when it is sent. A frame from `tx_frame()` is IP MTU − 28 bytes long, which is longer than a TCP segment, so a full-size frame is always copied. Fill at most `tx.max_segment_payload()` bytes to send each frame in place.
 
 ## Backpressure
 
 **Backpressure** is what happens when a send cannot be queued right now. It looks different on the two backends.
 
-On the local backend, a queued frame stays in the socket until the peer acknowledges its last byte. Unacknowledged data is limited by the socket's `tx_capacity` and by the frame pool, which all sockets share. `room` waits until acknowledgements free enough bytes and a frame slot. When `room(len)` resolves, a `try_send` of a frame that size succeeds until the next turn.
+On the local backend, a queued frame stays in the socket until the peer acknowledges its last byte. Unacknowledged data is limited by the socket's `tx_capacity` and by the frame pool, which all sockets share. `room` waits until acknowledgements free enough bytes. The shared frame pool limits you earlier, at `tx_frame().await`. When `room(len)` resolves, a `try_send` of a frame that size succeeds until the next turn.
 
-On the junction backend, `try_send` copies the bytes into the shared send ring to the daemon and gives the frame back to the pool at once; the peer's window does not slow your sends. `room` is only a hint here: `try_send` can still return `Full` because the send ring is full. After any socket of the `Net` gets `Full`, `room` on every socket of that `Net` waits until the next turn. The daemon keeps bytes the peer cannot take yet, with no size limit, so a program that must bound memory paces its sends with `delivered()` or with acknowledgements of its own protocol. [What applications share](../junction/sharing.md) explains the send ring.
+On the junction backend, `try_send` copies the bytes into the shared send ring to the daemon and gives the frame back to the pool at once; the peer's window does not slow your sends. `room` is only a hint here: `try_send` can still return `Full` because the send ring is full. After any socket of the `Net` gets `Full`, `room` on every socket of that `Net` waits until the next turn. The daemon keeps bytes the peer cannot take yet, with no size limit. A program that must bound memory on a long-lived connection paces its sends with acknowledgements in its own protocol. For a fixed amount of data, send it, call `shutdown`, then await `delivered()` ([What applications share](../junction/sharing.md)).
 
 Code that works on both backends keeps the frame it got back and waits for room again, as switch-bench's echo server does:
 

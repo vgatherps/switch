@@ -1,12 +1,12 @@
 # Sockets with switch-net
 
-switch-net gives switch tasks async TCP and UDP sockets. A task connects, accepts, binds, sends and receives with `.await`, much as it would with any async socket library. What is different is who moves the packets: not a background thread, but your own drive loop, which runs on the same thread as the tasks. [Your first network program](../getting-started/first-connection.md) showed the whole shape once; this chapter goes through each part.
+switch-net gives switch tasks async TCP and UDP sockets. A task connects, accepts, binds, sends and receives with `.await`, much as it would with any async socket library. What is different is who moves the packets: your own drive loop moves them, on the same thread as the tasks. [Your first network program](../getting-started/first-connection.md) showed the whole shape once; this chapter goes through each part.
 
 ## Net and NetHandle
 
 switch-net splits the work between two types.
 
-The `Net` belongs to the drive loop. It owns the connection to the NIC and is the only thing that turns the network: `Net::turn` takes in packets, runs timers, sends what tasks queued and wakes tasks. There is one `Net`, and it is not `Clone`.
+The `Net` belongs to the drive loop. It owns the connection to the NIC and is the only thing that turns the network: `Net::turn` takes in packets, runs timers, sends what tasks queued and wakes tasks. Each drive loop owns its `Net`; it is not `Clone`.
 
 A `NetHandle` belongs to tasks. You get one from `net.handle()` and clone it freely. With a handle a task opens sockets (`tcp_connect`, `tcp_accept`, `udp_bind`) and gets empty frames to send (`tx_frame`). A handle cannot turn the network.
 
@@ -42,11 +42,12 @@ The switch-bench tool picks the backend from its command line and builds the `Ne
 
 ```rust,ignore
 // Local backend
-let net = Net::new(opened.stack, NetConfig { ingress_budget: INGRESS_BUDGET });
+let net = Net::new(opened.stack, NetConfig { ingress_budget: 32 });
 
 // Junction backend
-let session = Session::connect(path, max_sockets)?;
-let net = Net::remote(session, RemoteConfig { tx_frames });
+// 8 socket slots for this session; 64 client-side frames to send from
+let session = Session::connect(Path::new("/run/switch-junctiond/control.sock"), 8)?;
+let net = Net::remote(session, RemoteConfig { tx_frames: 64 });
 ```
 
 The backends do differ in a handful of behaviors: when errors arrive, what a successful `room` promises, how frames are held. Each page mentions the difference where it matters, and [Local and junction backends compared](backends.md) collects them in one table.

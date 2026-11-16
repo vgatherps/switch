@@ -1,6 +1,6 @@
 # The junction control protocol
 
-This page describes what a `Session` and the daemon exchange, for someone writing a client in another language or checking a packet capture of the control socket. Application authors do not need it; `Session` in the `switch-junction` crate implements all of it (see [Using a Session directly](../junction/session.md)). The [crate map](crates.md) before it lists where `switch-junction` and `switch-junctiond` live.
+This page describes what a `Session` and the daemon exchange, for reading a capture of the control socket, or for writing a client that uses the `ceph-ring` and `slice_ringbuffer` crates for the two rings. Application authors do not need it; `Session` in the `switch-junction` crate implements all of it (see [Using a Session directly](../junction/session.md)). The [crate map](crates.md) before it lists where `switch-junction` and `switch-junctiond` live.
 
 ## Channels
 
@@ -95,7 +95,7 @@ The crate's tests check this and a `ConnectTcp` and a `Welcome` byte for byte (`
 
 ## Send records
 
-Each send is one record in the send ring. The record starts with a header, followed directly by the payload:
+Each send is one record in the send ring. A send-ring record is a [cephalopod](../blocks/cephalopod.md) record: a 32-byte header carrying, at offsets 0, 8, 16 and 24, the commit tag, the payload length, the session's stream id (from `Welcome.stream`) and a sequence number that counts from 0 for each session. The record's payload starts with the junction send header, followed directly by the data:
 
 ```text
  TCP send, 16-byte header          UDP send, 24-byte header
@@ -111,6 +111,18 @@ Each send is one record in the send ring. The record starts with a header, follo
                                    24     ...  payload
 ```
 
-So a TCP payload can be at most `max_record − 16` bytes and a UDP payload `max_record − 24`. A record for a slot the session never opened, for a socket of the other kind, or with a malformed header ends the session with `ProtocolError`. Records for an earlier generation of a slot are dropped. The session ends its send stream with the ring's end record, which `Session::finish` writes.
+So a TCP payload can be at most `max_record − 16` bytes and a UDP payload `max_record − 24`. Records for an earlier generation of a slot are dropped. The session ends its send stream with the ring's end record, a record with bit 63 of the sequence number set, which `Session::finish` writes. Writing into the per-CPU rings safely takes the `ceph-ring` crate's writer (it uses Linux restartable sequences), and reading the receive ring takes the `slice_ringbuffer` crate's reader.
+
+## Rules the daemon enforces
+
+The daemon ends a session with `End(ProtocolError)` when the client:
+
+- sends a message it cannot decode;
+- sends an operation before `Hello`, or a second `Hello`;
+- uses a socket slot at or above the `max_sockets` it asked for;
+- opens a socket on a slot that is still in use in the daemon;
+- sends an operation for a slot with the wrong generation;
+- sends `ShutdownTcp` or `AbortTcp` for a UDP socket;
+- sends a send record for a slot it never opened, for a socket of the other kind, or with a malformed header.
 
 Next: the [glossary](glossary.md) defines the terms used throughout the book.

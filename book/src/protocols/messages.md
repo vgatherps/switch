@@ -1,6 +1,6 @@
 # Sending and receiving messages
 
-The [previous page](wss-client.md) ended with a connected `Wss`. This page uses it: how messages arrive, how long you may keep them, how sending works, and the one rule that surprises people coming from other WebSocket libraries: the connection only does work while your task is inside one of its methods. Everything here applies to `Ws` (`ws://`) the same way.
+A connected `Wss` receives whole messages and sends them. This page covers how messages arrive, how long you may keep them, how sending works, and one rule: the connection does work only while your task is inside one of its methods. Everything here applies to `Ws` (`ws://`) the same way. It continues from [Connecting to a wss:// server](wss-client.md).
 
 ## Receiving
 
@@ -21,7 +21,7 @@ A `Message` has four methods:
 
 You only see Text and Binary messages. Ping, pong and close are WebSocket control frames; `recv` handles them itself and never returns one. Masking of client frames is handled for you as well.
 
-The feed's read loop is a good model. It races `recv` against a stop signal with [`first`](../net/timeouts.md#racing-a-receive-against-a-stop-signal), records the latency from the hardware timestamp, and parses the text as JSON without copying it:
+The feed's read loop races `recv` against a stop signal with [`first`](../net/timeouts.md#racing-a-receive-against-a-stop-signal), records the latency from the hardware timestamp, and parses the text as JSON without copying it:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-binance-feed/src/lib.rs:read}}
@@ -51,9 +51,9 @@ pub async fn send(&mut self, kind: Kind, payload: &[u8]) -> Result<(), Error>
 wss.send(Kind::Text, sent.as_bytes()).await.expect("send");
 ```
 
-`send` waits for [room](../net/tcp.md) in the TCP send buffer when the buffer is full; that is the backpressure, and `send` never returns a "full" error. If the peer stops reading, your `send` waits until it reads again.
+`send` waits when TCP has no room ([Backpressure](../net/tcp.md#backpressure)), and never returns a "full" error. On the local backend that is the peer's window: if the peer stops reading, `send` waits until it reads again. On the junction backend `send` waits only while the send ring is full; the daemon keeps what the peer cannot take yet, so a sender that must bound memory uses replies or acknowledgements in its own protocol.
 
-A message goes out as one WebSocket message, in as many frames as it needs, and is never interleaved with another message. A message that does not fit one frame finishes during later calls (see the next section). `send` refuses some messages outright, with nothing sent:
+A message goes out as one WebSocket message, in as many frames as it needs, and is never interleaved with another message. `send(...).await` returns once the whole message has been handed to TCP. If you cancel it after the connection accepted the message, the next `send`, `close` or `recv` finishes it first (see [Cancellation](#cancellation)). `send` refuses some messages outright, with nothing sent:
 
 | Error | Why |
 |---|---|
@@ -64,22 +64,23 @@ A message goes out as one WebSocket message, in as many frames as it needs, and 
 
 ## No background task
 
-There is no task behind the connection. It sends and receives only while your task is inside `send`, `close`, `recv` or `linger`. Whatever one call leaves unsent goes out during the next of those calls: the rest of a long message, the answer (pong) to a server's ping, the echo of the server's close.
+There is no task behind the connection. It sends and receives only while your task is inside `send`, `close`, `recv` or `linger`. Whatever one call leaves unsent goes out during the next of those calls: the answer (pong) to a server's ping, the echo of the server's close, and the rest of a message whose `send` was cancelled after the message was accepted.
 
 ```text
             your task calls ...          what goes out during the call
             ---------------------------  -------------------------------------
-            send(m2)                     rest of m1 (if any), then m2
-            recv()                       queued output (rest of a message,
-                                         pong, close echo), then waits for
-                                         the next message
+            send(m2)                     rest of a cancelled m1 (if any),
+                                         then all of m2
+            recv()                       queued output (pong, close echo,
+                                         rest of a cancelled send), then
+                                         waits for the next message
             close(code, reason)          queued output, then the close frame
             linger()                     queued output, then the end of TLS
                                          and TCP
             (no call)                    nothing
 ```
 
-Two consequences follow. First, a program that only sends must still call `recv` from time to time, or the server's pings go unanswered and output queued by earlier calls stays queued. Second, `send` and `recv` both take `&mut self`, so one connection cannot do both at once. If both ends send more than the other's receive window before either reads, both wait for room forever. Keep your sends within the window, or alternate them with reads.
+Two consequences follow. First, a program that only sends must still call `recv` from time to time, or the server's pings go unanswered and output queued by earlier calls stays queued. Second, `send` and `recv` both take `&mut self`, so one connection cannot do both at once. On the local backend, if both ends send more than the other's receive window before either reads, both wait for room forever. Keep your sends within the window, or alternate them with reads.
 
 A connection is used from one task.
 
@@ -105,6 +106,14 @@ pub struct Limits {
 
 `Limits::default()` is 16 MiB per WebSocket frame, 64 MiB per received message and 64 MiB per sent message. A received WebSocket frame or message over its limit fails the connection with `Failed(Failure::Protocol(ProtocolError::FrameTooBig))` or `MessageTooBig`. A send over `max_send` is refused with `TooBig` and nothing is sent.
 
-The receive buffer for messages that straddle frames grows only as bytes arrive, so a large `max_message` costs memory only when a large message actually comes. Messages that fit in one frame are not copied at all.
+The receive buffer for messages that straddle frames grows only as bytes arrive, so a large `max_message` costs memory only when a large message actually comes.
+
+## Where copies happen
+
+Received bytes stay in the packet buffer they arrived in wherever possible, and sent bytes are written straight into the packet buffer that leaves.
+
+On receive, a TLS record that lies wholly inside one frame is decrypted in place, inside that frame. A record that straddles frames is first copied into one reusable scratch buffer and decrypted there. Then a message that lies wholly inside one run of plaintext is handed to you as a slice of that memory: `Message<'_>` borrows it. A message that straddles frames, records or WebSocket frames is copied once into another reusable buffer, which grows only as far as the bytes actually received and never past `max_message`.
+
+On send, a message that fits in one frame is written into the frame right behind its WebSocket header. A longer message is copied once into a reusable send buffer and then goes out one frame at a time. Over `wss://` there is one more copy: switch-tls copies each frame's plaintext once for rustls, which encrypts it into the frame.
 
 The next page ends connections and handles everything that can go wrong: [Closing connections and handling failures](closing.md).

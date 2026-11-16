@@ -6,13 +6,17 @@ The words this book uses, each with a short definition and a link to the page th
 
 **backing.** A named shared-memory file that processes map to share memory. See [Shared memory and the receive ring](../blocks/rings.md).
 
-**backpressure.** A send that cannot be queued right now: `try_send` returning `Full`, a UDP send returning `WouldBlock`, or a `room` that waits. See [TCP streams](../net/tcp.md).
+**backpressure.** A send that cannot be queued right now: `try_send` returning `Full`, a UDP send returning `Full`, or a `room` that waits. See [TCP streams](../net/tcp.md).
 
 **bind (a NIC).** Detach a PCI NIC from its kernel driver and attach it to `vfio-pci`, so a userspace program can drive it. Done with `switch-netconf bind`. See [switch-netconf](../nic/netconf-tool.md).
 
 **busy polling.** Running the drive loop again at once, without sleeping, when nothing moved. It keeps the pinned CPU fully busy in exchange for the lowest latency. See [The drive loop](../net/drive-loop.md).
 
+**cephalopod.** The group of `ceph-*` crates that let many processes send ordered messages to one reader through per-CPU shared-memory rings. The junction send ring is built on them. See [cephalopod](../blocks/cephalopod.md).
+
 **control socket.** The daemon's Unix socket, `control.sock` in its directory, which carries each session's handshake, socket opens and closes, and events. Packet data does not use it. See [Sharing a NIC with the junction daemon](../junction/index.md).
+
+**coordinator.** `switch-bench sweep`, the process that starts the generator workers, splits each step's rate among them and collects their results. It owns no NIC. See [Measuring latency under load](../measuring/index.md#workers).
 
 **daemon.** `switch-junctiond`, the process that owns a NIC and runs the Stack for many applications on the same machine. See [Sharing a NIC with the junction daemon](../junction/index.md).
 
@@ -34,25 +38,29 @@ The words this book uses, each with a short definition and a link to the page th
 
 **gateway.** The next-hop router for addresses outside the NIC's subnet. Its hardware address is resolved by ARP when the NIC opens. See [The network config file](../nic/config.md).
 
+**generator; receiver.** In a benchmark, the generator sends timed messages and records when each echo comes back; the receiver is the echo server being measured. See [Measuring latency under load](../measuring/index.md).
+
 **hardware timestamp.** The time the NIC received a packet, as the raw value from the NIC driver, read with `rx_timestamp()`. 0 means no timestamp; units are the driver's. See [Offloads and hardware timestamps](../nic/offloads.md).
 
-**helper threads.** Threads DPDK starts for interrupts and control work. `open` keeps them off the pinned CPU. See [The pinned CPU and helper threads](../nic/cpus.md).
+**helper threads.** Threads DPDK starts for interrupts and control work. `open` puts them on the housekeeping CPUs when the pinned CPU is isolated from the kernel scheduler or when you name helper CPUs; otherwise they share the pinned CPU. See [The pinned CPU and helper threads](../nic/cpus.md).
 
 **housekeeping CPUs.** The CPUs left for the operating system, interrupts and helper threads. See [The pinned CPU and helper threads](../nic/cpus.md).
 
 **hugepages.** Large memory pages the machine reserves ahead of time; real NICs take their packet memory from them. Tap devices run without them. See [Owning a NIC](../nic/index.md).
 
-**ingress; ingress budget.** Ingress is the step of a Stack turn that processes received packets: TCP segments go to their sockets, ARP requests get replies. The ingress budget is the most received packets one turn processes; the rest wait for the next turn. It is passed as `NetConfig::ingress_budget` or to `Stack::turn`. See [The Stack's drive loop](../stack/drive-loop.md). The daemon's code also calls the send ring "ingress"; this book does not.
+**ingress; ingress budget.** Ingress is the step of a Stack turn that processes received packets: TCP segments go to their sockets, ARP requests get replies. The ingress budget is the most received packets one turn processes; the rest wait for the next turn. It is passed as `NetConfig::ingress_budget` or to `Stack::turn`. See [The Stack's drive loop](../stack/drive-loop.md). The daemon's code also calls the send ring "ingress".
 
 **isolated CPU.** A CPU the kernel keeps other work off, set with boot options. The pinned CPU is usually one. See [The pinned CPU and helper threads](../nic/cpus.md).
 
 **kick.** The daemon ending a session whose send stream has a gap it cannot fill. See [Closing sockets and ending a session](../junction/closing.md).
 
+**memif.** DPDK's shared-memory virtual NIC (`net_memif`): two processes exchange packets through shared memory instead of a wire. See [Stack-to-stack throughput with switch-memif-bench](../measuring/memif.md).
+
 **mirrored mapping.** The same shared memory mapped twice, back to back, so a record that runs past the end of a ring continues at its start without being split. Code calls it `DoubleMapping`. See [Shared memory and the receive ring](../blocks/rings.md).
 
 **MTU; path MTU; MSS.** The MTU is the largest IP packet the NIC port sends. A path MTU is a smaller limit the network config file sets for some destinations. The MSS is the largest TCP payload in one segment: the path MTU minus 40. See [The network config file](../nic/config.md).
 
-**Net; NetHandle.** `Net` belongs to the drive loop and is the only thing that turns the network; there is one per program and it is not `Clone`. `NetHandle` is what tasks hold to open sockets and get frames; it is cheap to clone. See [Sockets with switch-net](../net/index.md).
+**Net; NetHandle.** `Net` owns one local Stack or one junction session and belongs to its drive loop, which is the only place the network is turned; it is not `Clone`. `NetHandle` is what tasks hold to open sockets and get frames; it is cheap to clone. See [Sockets with switch-net](../net/index.md).
 
 **network config file.** The JSON file that describes one NIC port: device, addresses, gateway, MTU, offloads and DPDK options. The examples call it `dut.json` or `tap.json`. See [The network config file](../nic/config.md).
 
@@ -70,13 +78,13 @@ The words this book uses, each with a short definition and a link to the page th
 
 **packet buffer.** DPDK's memory buffer for one packet; DPDK calls it an mbuf. See [Packet-buffer pools](../nic/pools.md).
 
-**pass (of a poll).** One sweep over the tasks that are ready when it starts, inside a single poll of the runtime. Tasks woken during a pass run in the next pass of the same poll; the poll stops when no task is ready or after 1024 task polls. See [Driving the runtime](../runtime/driving.md#one-poll-step-by-step).
+**pass (of a poll).** One sweep over the tasks that are ready when it starts, inside a single poll of the runtime. Tasks woken during a pass run in the next pass of the same poll; the poll stops when no task is ready, after a pass that reaches 1024 task polls (a started pass finishes), or when a task calls `request_turn`. See [Driving the runtime](../runtime/driving.md#one-poll-step-by-step).
 
 **pinned CPU.** The one CPU a drive-loop thread is allowed to run on. Opening a NIC refuses to start if the process may run on more than one. See [Your first network program](../getting-started/first-connection.md) and [The pinned CPU and helper threads](../nic/cpus.md).
 
 **pinned test.** A test whose body runs on one long-lived thread that owns DPDK's EAL, marked `#[pinned_test]`. See [Writing tests that use DPDK](../testing/writing-tests.md).
 
-**poll (of the runtime).** One call to `Runtime::poll(tick)`: it runs every ready task until each waits again, then returns. Nothing runs between polls. See [Your first task](../getting-started/first-task.md).
+**poll (of the runtime).** One call to `Runtime::poll(tick)`: it advances timers and runs ready tasks in passes, and returns when none is ready, after the 1024-poll budget, or when a task calls `request_turn`; ready work can remain for the next call. Nothing runs between polls. See [Your first task](../getting-started/first-task.md).
 
 **pool; RX pool; TX pool; frame pool.** A pool is a fixed set of packet buffers made at startup. The RX pool holds arriving packets. The TX pool holds packets the Stack builds itself (ACKs, ARP, resets, copies). The frame pool holds the buffers your code writes into, which TCP keeps until they are acknowledged. See [Packet-buffer pools](../nic/pools.md).
 
@@ -94,13 +102,19 @@ The words this book uses, each with a short definition and a link to the page th
 
 **send ring.** The shared-memory rings, one per CPU and shared by every session, that carry sends from applications to the daemon. Code calls them ingress. See [Sharing a NIC with the junction daemon](../junction/index.md).
 
-**sender-late.** A benchmark step in which a generator fell behind its timetable, so the step measured the generator rather than the receiver. See [Measuring latency under load](../measuring/index.md).
+**sender-late.** A benchmark step in which a generator fell behind its timetable. The flag does not say whether the generator or receiver backpressure was the limit. See [Measuring latency under load](../measuring/index.md).
 
 **session.** One application's connection to the daemon, type `Session` from `switch-junction`. See [Sharing a NIC with the junction daemon](../junction/index.md).
 
+**smoltcp.** A TCP/IP stack written in Rust. The Stack is built on a copy of it vendored in this repository. See [Programming the Stack directly](../stack/index.md).
+
 **socket slot; socket id.** A socket slot is an entry in a socket table: the Stack's (sized by `max_sockets` and `max_udp_sockets`) or a junction session's. A socket id, `SocketId { slot, generation }`, names one use of a session's socket slot; the generation counts reuse. See [Using a Session directly](../junction/session.md) and [TCP sockets on the Stack](../stack/tcp.md).
 
+**sockperf.** A Linux network latency and load-test tool; `switch-nic sockperf-server` answers its clients. See [switch-nic](../nic/switch-nic.md#sockperf-server).
+
 **spawner.** The cloneable `Spawner` handle that starts tasks and creates sleeps. See [Your first task](../getting-started/first-task.md).
+
+**the Stack.** The TCP/IP stack (type `Stack`, crate `dpdk-smoltcp`) that runs over one NIC port on one thread. See [Owning a NIC](../nic/index.md) and [Programming the Stack directly](../stack/index.md).
 
 **stream; sequence number.** cephalopod's terms for one producer's connection and the counter on each of its messages. Used only on the cephalopod page. See [cephalopod](../blocks/cephalopod.md).
 
@@ -110,15 +124,13 @@ The words this book uses, each with a short definition and a link to the page th
 
 **task.** One call of a `#[switch::task]` function, spawned on the runtime. See [Your first task](../getting-started/first-task.md).
 
-**the Stack.** The TCP/IP stack (type `Stack`, crate `dpdk-smoltcp`) that runs over one NIC port on one thread. See [Owning a NIC](../nic/index.md) and [Programming the Stack directly](../stack/index.md).
-
 **tick.** The `u64` clock value your code passes to `poll`. The unit is yours, but it must be nanoseconds once you use `within` or `Duration`-based sleeps, and ticks never go backwards. See [Your first task](../getting-started/first-task.md).
 
 **turn.** One call that does the network's work, `Net::turn` or `Stack::turn`: take in packets, run timers, send what was queued, and wake tasks whose sockets changed. See [The drive loop](../net/drive-loop.md).
 
 **vfio-pci.** The Linux kernel driver that lets one userspace process control a PCI device. Binding a NIC attaches it to `vfio-pci`. See [Owning a NIC](../nic/index.md).
 
-**wake.** Marking a waiting task ready, so the next poll runs it. See [The switch runtime](../runtime/index.md).
+**wake.** Marking a waiting task ready, so that a later pass of the current poll, or the next poll, runs it. See [The switch runtime](../runtime/index.md).
 
 **WebSocket frame, TLS record, message.** The protocol units on top of TCP, always written with their qualifier. A message is one whole WebSocket message, which may span several WebSocket frames. See [TLS and WebSocket over switch-net](../protocols/index.md).
 

@@ -16,7 +16,7 @@ loop {
 }
 ```
 
-Each call to `poll` is one *poll* of the runtime. During a poll, every task that is ready runs until it next has to wait, and then `poll` returns. Between two polls, no task runs at all.
+Each call to `poll` is one *poll* of the runtime. During a poll, the tasks that are ready run until each waits again. A poll also stops after 1024 task polls, or when a task asks the loop for a turn ([Driving the runtime](driving.md#one-poll-step-by-step)). Between two polls, no task runs at all.
 
 ## Why the program drives
 
@@ -40,25 +40,11 @@ A *tick* is the `u64` clock value you pass to `poll`. Ticks must never go backwa
 
 ## Waking
 
-A parked task runs again only after it is *woken*: marked ready, so that the next poll runs it. Each kind of thing a task can wait on wakes it in its own way, but all of them end in the same queue:
-
-```text
- same thread                               other threads
- -----------                               -------------
- a std Waker (any future's wake)  --.
- a StoredWaker (switch-net sockets) -+
- a Sleep reaching its deadline  ----+--> ready tasks --> run by the next poll
- a oneshot send or drop  ----------'          ^
-                                              |
- RemoteWaker::wake() on another thread --> mailbox, emptied at the
-                                           start of the next poll
-```
-
-Wakes from the runtime's own thread take effect at once: the task joins the ready set and the next poll (or a later pass of the current one, as [Driving the runtime](driving.md#one-poll-step-by-step) explains) runs it. Wakes from another thread go through a `RemoteWaker` into a mailbox, which the runtime empties at the start of its next poll. [Tasks working together, and other threads](cooperating.md) covers both.
+A parked task runs again only after something wakes it: a socket becoming ready, a sleep reaching its deadline, a value arriving on a channel. Waking a task from another thread takes a special handle, covered in [Tasks working together](cooperating.md#waking-a-task-from-another-thread).
 
 ## One thread
 
-"Single-threaded" means more here than "runs on one thread". `Runtime`, `Spawner`, `SpawnToken`, `Sleep`, `JoinHandle` and both halves of a oneshot channel are neither `Send` nor `Sync`. The compiler stops them from leaving the thread that created the runtime, and that same thread is the one that polls it.
+`Runtime`, `Spawner`, `SpawnToken`, `Sleep`, `JoinHandle` and both halves of a oneshot channel are neither `Send` nor `Sync`. The compiler stops them from leaving the thread that created the runtime, and that same thread is the one that polls it.
 
 The benefit is that tasks may freely use `Rc`, `RefCell` and `Cell` to share state with each other and with the loop. There are no locks between tasks, because there is never a second thread running one.
 

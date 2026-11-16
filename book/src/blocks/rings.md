@@ -24,7 +24,7 @@ The creator owns the name. Dropping the creating `Backing` removes the name (so 
 
 Removing the name does not tear anything down. Mappings that already exist keep working after the name is gone and after every descriptor is closed; the memory is freed when the last mapping goes away. It does mean that a process opening the name after that point gets `NotFound`, so the creator has to keep its `Backing` alive until the other side has opened it.
 
-Files and objects are created with mode 0600, readable and writable only by the user who created them. Two processes running as different users cannot share a backing.
+Files and objects are created with mode 0600, readable and writable only by the user who created them (and by root). Two processes running as different non-root users cannot share a backing.
 
 A new backing has length zero. `resize(len)` sets its length. `allocate(len)` does the same but on Linux also reserves the storage up front, so a full filesystem shows up as an error from `allocate` instead of a crash the first time a page is touched; on macOS it is the same as `resize`. Never shrink a backing while it is mapped.
 
@@ -54,7 +54,7 @@ A ring buffer reuses a fixed region over and over, so sooner or later a record s
 
 A write through either view is visible through the other, because they are the same memory. `len` has to be a multiple of the backing's page size. On Linux, `populate = true` faults all the pages in when mapping, so the first packet does not pay for that; elsewhere it has no effect.
 
-The crate's test writes eight bytes across the end of the first view and reads them back at both addresses:
+The crate's test writes a byte at each end of the first view, then two bytes across the boundary, and reads them through both views:
 
 ```rust,ignore
 {{#include ../../../shared-memory/tests/behavior.rs:wrap}}

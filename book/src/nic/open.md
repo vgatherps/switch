@@ -1,6 +1,6 @@
 # Opening the NIC from code
 
-You have a [network config file](config.md) that passes `switch-netconf check` (see [the previous page](netconf-tool.md)). One call turns it into a running Stack:
+[switch-nic](switch-nic.md) opened the card from a [network config file](config.md) and printed what it found. Your own program does the same with one call, which turns the config into a running Stack:
 
 ```rust,ignore
 let opened = unsafe { switch_open::open(&config, &sizing, None, &mut clock) }?;
@@ -19,7 +19,7 @@ pub unsafe fn open(
 ) -> Result<Opened, OpenError>
 ```
 
-Here is a complete setup, from loading the config to a connected socket on the Stack. It is the program `conduit/crates/switch-open/examples/setup.rs`:
+Here is a complete setup, from loading the config to a socket that has started connecting; the drive loop that completes the connection is in [Programming the Stack directly](../stack/index.md). It is the program `conduit/crates/switch-open/examples/setup.rs`:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-open/examples/setup.rs:setup}}
@@ -38,9 +38,9 @@ Call `open` once per process, from the thread that will run the drive loop, with
 | `frame_share` | packet buffers that all TCP send queues and your own code may hold at once, on top of a fixed reserve |
 | `max_sockets` | TCP socket slots; must be at least 1 |
 | `max_udp_sockets` | UDP socket slots; 0 disables UDP |
-| `rx_staging` | received packets the Stack may hold before processing them |
-| `tx_pending` | packets built but not yet taken by the card |
-| `neighbor_capacity` | entries in the ARP cache; `DEFAULT_NEIGHBOR_CAPACITY` is 256 |
+| `rx_staging` | received packets the Stack may hold before processing them; must be positive |
+| `tx_pending` | packets built but not yet taken by the card; must be positive |
+| `neighbor_capacity` | entries in the ARP cache; must be positive; `DEFAULT_NEIGHBOR_CAPACITY` is 256 |
 
 The examples compute `frame_share` from the socket's own configuration with `tcp::tx_mbuf_budget`, and use 32 for `rx_staging` and `tx_pending`. [Packet-buffer pools](pools.md) explains what each number controls and what happens when a pool runs dry.
 
@@ -61,7 +61,7 @@ Resolve host names before you call `open`. Name lookup goes through the kernel, 
 
 ```text
  step                                         fails with                carries
- ───────────────────────────────────────────  ────────────────────────  ─────────────
+ -------------------------------------------  ------------------------  -------------
  1  check the thread may run on exactly       NotPinned                 nothing
     one CPU; that CPU becomes the pinned CPU
  2  build EAL arguments from the config
@@ -81,8 +81,8 @@ Resolve host names before you call `open`. Name lookup goes through the kernel, 
 11  build the Stack (clock() = start time)    Stack                     the Port
 12  if a gateway is set: ARP for it,          GatewayUnresolved,        the Stack
     up to 3 s                                 Receive                   (and its Port)
-                                     │
-                                     ▼
+                                     |
+                                     v
                          Ok(Opened { stack, eal, report })
 ```
 
@@ -130,7 +130,7 @@ gateway: none
 
 `OpenError` names the step that failed, and its `Display` text says the same in a short phrase, for example `link wait: link down after 10 seconds`. [When the NIC won't open](troubleshooting.md) lists every message with its cause.
 
-Errors from step 9 on carry the NIC port, or the Stack holding it, because the port exists by then and should be closed properly. `PortOpen` may carry a retained port as well. If your program simply returns the error, the port is dropped instead of closed. That is what the example above does, and it is fine for a program that exits on error. A long-running program, or one that wants to report how many buffers were still out, closes it. `switch-nic` does:
+Errors from step 9 on carry the NIC port, or the Stack holding it, because the port exists by then and should be closed properly. `PortOpen` may carry a retained port as well. If your program just returns the error, dropping the port still stops and closes the device, but the error only goes to stderr and the pools stay allocated. That is what the example above does, and it is fine for a program that exits on error. `try_close` lets you report the failure, and how many buffers were still out. `switch-nic` does:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-nic/src/main.rs:open_errors}}

@@ -1,31 +1,31 @@
 # Connecting to a wss:// server
 
-This page connects a task to a `wss://` server, from opening the TCP socket to holding a `Wss` that can receive the first message, using the `connect` function from the [table on the previous page](index.md#which-function-to-call). The code comes from the market-data feed in `switch-binance-feed`, which the [walkthrough](binance-feed.md) reads end to end. You should already know how a task [opens a TCP connection](../net/opening.md) and how [`within`](../net/timeouts.md) bounds a wait.
+A `wss://` client is a TCP connection, a TLS 1.3 session on top of it and a WebSocket upgrade on top of that. This page opens one from a task, from the TCP socket to a `Wss` ready to receive, using the `connect` function from the [table on the previous page](index.md#which-function-to-call). The code comes from the market-data feed in `switch-binance-feed`, which the [walkthrough](binance-feed.md) reads end to end. You should already know how a task [opens a TCP connection](../net/opening.md) and how [`within`](../net/timeouts.md) bounds a wait.
 
-A connect goes through four steps, each a round trip with the server:
+Opening a connection takes three round trips with the server: TCP, TLS, then the WebSocket upgrade. After `connect` returns, `recv` waits for the first message.
 
 ```text
- task                                         server
-  |  tcp_connect(...).await                      |
-  |  ---- SYN --------------------------------->  |
-  |  <--- SYN-ACK ------------------------------  |   TcpStream
-  |  switch_ws::switch_net::connect(...).await    |
-  |  ---- ClientHello -------------------------> |
-  |  <--- ServerHello ... Finished -------------- |   TLS 1.3 handshake
-  |  ---- Finished, GET /path Upgrade ---------> |
-  |  <--- HTTP/1.1 101 Switching Protocols ------ |   WebSocket upgrade
-  |                                               |   Wss
-  |  wss.recv().await                             |
-  |  <--- first message ------------------------- |
-  |                                               |
-  |<------------ within(&spawner, limit, ...) -->|   one bound for all of it
+ task                                            server
+  |  tcp_connect(...).await                         |       ^
+  |  ---- SYN ------------------------------------> |       |
+  |  <--- SYN-ACK ---------------------------------  |       |
+  |                                     TcpStream    |       |
+  |  switch_ws::switch_net::connect(...).await       |       |
+  |  ---- ClientHello ----------------------------> |       |  within(&spawner,
+  |  <--- ServerHello ... Finished ----------------  |       |    limit, ...)
+  |  ---- Finished, GET /path Upgrade ------------> |       |
+  |  <--- HTTP/1.1 101 Switching Protocols --------  |       |
+  |                                     Wss          |       v
+  |                                                  |
+  |  wss.recv().await                                |
+  |  <--- first message ---------------------------  |
 ```
 
-The first step is switch-net's; `connect` runs the TLS handshake and the upgrade.
+The first round trip is switch-net's; `connect` runs the TLS handshake and the upgrade. The `within` bound ends when `connect` returns the `Wss`; receiving is bounded separately.
 
-## 1. The TLS configuration
+## The TLS configuration
 
-switch-tls uses [rustls](https://docs.rs/rustls) for the cryptography and takes a ready `Arc<rustls::ClientConfig>`. You choose the crypto provider and the root certificates. The config must allow TLS 1.3 only. The feed builds its config with the `ring` provider and the Mozilla root certificates from `webpki-roots`:
+switch-tls uses [rustls](https://docs.rs/rustls) for the cryptography and takes a ready `Arc<rustls::ClientConfig>`. You choose the crypto provider and the root certificates. The config must allow TLS 1.3 only. The feed builds its config with the `ring` provider; `webpki_client_config` fills in the Mozilla root certificates from `webpki-roots`:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-binance-feed/src/lib.rs:client_config}}
@@ -33,7 +33,7 @@ switch-tls uses [rustls](https://docs.rs/rustls) for the cryptography and takes 
 
 Certificate checking is whatever this config does; switch-tls adds nothing to it. Build the config once and clone the `Arc` for each connection.
 
-## 2. Open the TCP connection
+## Opening the TCP connection
 
 The socket needs buffers big enough for the traffic you expect. The feed uses 256 KiB each way:
 
@@ -41,11 +41,11 @@ The socket needs buffers big enough for the traffic you expect. The feed uses 25
 {{#include ../../../conduit/crates/switch-binance-feed/src/lib.rs:socket}}
 ```
 
-The send buffer (`tx_capacity`) has a lower bound that matters here. Each frame must be able to carry the largest WebSocket control frame inside one TLS record, so a very small send buffer makes `connect` fail with `Config(RoomTooSmall)` before anything is sent. Any ordinary buffer size is far above that bound.
+Each frame must be able to carry the largest WebSocket control frame inside one TLS record. How much one frame carries is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the TLS `max_fragment_size` caps it further. If that is too small, `connect` fails with `Config(RoomTooSmall)` before anything is sent. The feed's buffers are far above that bound.
 
 Then open the connection as on [Opening sockets](../net/opening.md). There is no ephemeral port, so pick a nonzero local port yourself.
 
-## 3. Run `connect`
+## Running `connect`
 
 ```rust,ignore
 pub async fn connect(
@@ -63,9 +63,9 @@ pub async fn connect(
 
 `connect` consumes the stream. It splits it, runs the TLS handshake, sends the upgrade request, reads the server's response, and returns a `Wss` once the server answered `101 Switching Protocols`. The handle must be the one the stream came from; a stream from another `Net` is refused as `Config(ForeignHandle)` before anything is sent.
 
-## 4. Bound the whole connect
+## Bounding the connect
 
-A connect can wait a long time: for the SYN-ACK, for the server's handshake, for the upgrade response. A failing handshake also waits. When the server's handshake is rejected, switch-tls sends the TLS alert and a FIN and returns the error only after the server has acknowledged them, or the connection has ended. A server that goes silent therefore keeps `connect` pending for as long as it stays silent. Always wrap the connect in `within`.
+A connect can wait a long time: for the SYN-ACK, for the server's handshake, for the upgrade response. A failing handshake also waits. When the server's handshake is rejected, switch-tls sends the TLS alert and a FIN, best effort, and returns the error only after the server has acknowledged them or the connection has ended. A server that goes silent therefore keeps `connect` pending for as long as it stays silent. Always wrap the connect in `within`.
 
 The feed puts TCP, TLS and WebSocket under one limit:
 
@@ -81,17 +81,17 @@ The `within` used here is a small helper in the same file that turns a timeout i
 
 When the limit passes, `within` drops the connect future, and with it the socket. Nothing else needs cleaning up.
 
-## 5. When it fails
+## When it fails
 
 The errors that can come out of `connect` are all variants of `switch_ws::switch_net::Error`:
 
 | Error | Meaning | What to do |
 |---|---|---|
-| `Tls(e)` | The TLS handshake failed, for example an unknown certificate issuer. The alert has been delivered. | Check the config's roots and the host name. |
+| `Tls(e)` | The TLS handshake failed, for example an unknown certificate issuer. switch-tls sent the alert and FIN, best effort, and waited until the server acknowledged them or the connection ended. | Check the config's roots and the host name. |
 | `Handshake(msg)` | The handshake could not start (the host is not a valid server name) or ended in an unexpected state. | Fix the host name. |
 | `Upgrade(e)` | The server refused or garbled the WebSocket upgrade. `UpgradeError::Status(Some(code))` carries the HTTP status when it is not 101. | Check the path and the server; see below. |
 | `Recv(e)`, `Send(e)` | TCP failed under the handshake or the upgrade. | Treat as a lost connection. |
-| `Config(SetupError::RoomTooSmall { room, need })` | One frame cannot carry the largest control frame or TLS record. | Increase `tcp::Config::tx_capacity`. |
+| `Config(SetupError::RoomTooSmall { room, need })` | One frame cannot carry the largest control frame or TLS record. The room is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the TLS `max_fragment_size` caps it further; `room` and `need` are byte counts. | Raise whichever is too small: `tx_capacity` on the local backend, `mss_cap` or the path MTU, or `max_fragment_size`. |
 | `Config(SetupError::ForeignHandle)` | The stream belongs to another `Net`. | Pass the stream's own handle. |
 | `Failed(Failure::Dead)` | The socket was already closed or reset. | Treat as a lost connection. |
 
@@ -104,7 +104,7 @@ A few upgrade failures are worth knowing by name. The upgrade response head may 
 For a server without TLS, call `connect_ws` instead. It takes no TLS config and returns a `Ws`, which has the same methods as `Wss`:
 
 ```rust,ignore
-let mut ws = connect_ws(&handle, stream, HOST, SERVER_PORT, PATH, Limits::default()).await.expect("ws connect");
+let mut ws = connect_ws(&handle, stream, "example.com", 80, "/", Limits::default()).await?;
 ```
 
 Here the `Host:` header carries the port when it is not 80.

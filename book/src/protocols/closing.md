@@ -1,6 +1,6 @@
 # Closing connections and handling failures
 
-A WebSocket connection ends with a close handshake: one side sends a close frame with a status code and a reason, the other answers with its own close frame, and then the transport closes. Over `wss://` that means TLS close_notify (TLS's "I am done sending" record) and then a TCP FIN. This page shows how the API exposes that handshake, how a connection ends without one, and every way a connection can fail. It continues from [Sending and receiving messages](messages.md).
+A WebSocket connection ends with a close handshake: one side sends a close frame with a status code and a reason, the other answers with its own close frame, and then the transport closes. Over `wss://` that means TLS close_notify (TLS's "I am done sending" record) and then a TCP FIN. This page shows how the API exposes that handshake, how a connection ends without one, and every way a connection can fail. It follows [Sending and receiving messages](messages.md).
 
 The short version: call `close`, then call `recv` until it returns `None`, and put a time limit around both.
 
@@ -48,10 +48,10 @@ When the server starts the close, you see it in `recv`. `recv` answers with a cl
   peer_close() == Some((1001, "bye"))
 ```
 
-After `recv` has returned `None`, `peer_close()` gives the server's status code and reason. A close frame with no status reads as code 1005. A status code that the peer was not allowed to send reads as 1002, which is also what was echoed back. This test from the repository shows a server-initiated close end to end:
+After `recv` has returned `None`, `peer_close()` gives the server's status code and reason. A close frame with no status reads as code 1005. A status code that the peer was not allowed to send reads as 1002, which is also what was echoed back. In the repository's test of a server-initiated close, the server sends close code 1001 (going away) with reason `"bye"`. The client's part of the test is one `recv` that returns `None`, then `peer_close`:
 
 ```rust,ignore
-{{#include ../../../switch-ws/tests/wss_switch_net.rs:server_close}}
+{{#include ../../../switch-ws/tests/wss_switch_net.rs:server_close_client}}
 ```
 
 If both sides send a close at the same time, only one close frame and one FIN go out from your side. Bytes the server sends after its close frame are read and dropped. Once the server's close has arrived, a TCP reset that follows counts as a clean end, not as a failure.
@@ -68,7 +68,7 @@ The main use is after the peer broke the protocol, as in the [echo server](ws-se
 
 ## Failures
 
-Once a connection is up, a failure is reported as `Error::Failed(failure)`. The first failure is kept: every later `send`, `close` and `recv` returns the same one. Before `recv` returns it, the connection delivers whatever it still owes the peer (a TLS alert, close_notify, FIN), so you may drop the connection as soon as you have the error.
+Once a connection is up, a failure is reported as `Error::Failed(failure)`. The first failure is kept: every later `send`, `close` and `recv` returns the same one. Before `recv` returns it, the connection delivers whatever it still owes the peer (a TLS alert, close_notify, FIN), so you may drop the connection as soon as you have the error. If the peer may still be sending, call `linger` first so the drop sends no reset ([Ending without a close frame](#ending-without-a-close-frame)).
 
 | Failure | What happened | What the connection sent before reporting it |
 |---|---|---|
@@ -80,7 +80,7 @@ Once a connection is up, a failure is reported as `Error::Failed(failure)`. The 
 
 `PeerEof` and `Tls(Truncated)` differ in how the peer ended. A peer that sent close_notify and then FIN, without a WebSocket close, is `PeerEof`. A peer whose TCP stream simply stopped, with no close_notify, is `Truncated`.
 
-Calls can also return errors that do not fail the connection. `InvalidText`, `InvalidClose` and `TooBig` refuse one call and send nothing; `Closed` means you already called `close` or `linger` and tried to send again. The errors from connecting are on the [previous page](wss-client.md#5-when-it-fails).
+Calls can also return errors that do not fail the connection. `InvalidText`, `InvalidClose` and `TooBig` refuse one call and send nothing; `Closed` means you already called `close` or `linger` and tried to send again. The errors from connecting are on [Connecting to a wss:// server](wss-client.md#when-it-fails).
 
 The paths out of a connection, in one picture:
 

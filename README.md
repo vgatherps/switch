@@ -6,23 +6,37 @@ A program gets its NIC in one of two ways. It can own the NIC itself, with the n
 
 ## The book
 
-The documentation is an mdBook in [`book/`](book/src/SUMMARY.md). Start with the [Introduction](book/src/introduction.md), then [How the pieces fit together](book/src/overview/architecture.md). To read it rendered:
+The documentation is an mdBook in [`book/`](book/src/SUMMARY.md). Start with the [Introduction](book/src/introduction.md), then [How the pieces fit together](book/src/overview/architecture.md). To build it, or to read it rendered in a browser:
 
 ```sh
-mdbook serve book --open
+cargo install mdbook
+mdbook build book            # writes the HTML to book/book/
+mdbook serve book --open     # or build, serve and open it
 ```
 
-API reference for each crate is its rustdoc, for example `cargo doc --no-deps -p switch-net --open`. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
+API reference for each crate is its rustdoc, for example `cargo doc --no-deps -p switch --open`. Crates that use DPDK document only where DPDK is installed. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
+
+## Using the crates
+
+The crates are used from a clone of this repository. Clone it, then depend on the crates by path from your own `Cargo.toml`:
+
+```toml
+[dependencies]
+switch = { path = "<clone>/switch" }
+switch-net = { path = "<clone>/switch-net" }
+```
+
+`<clone>` is where you cloned the repository. The [crate map](book/src/reference/crates.md) says which other crates an application may need.
 
 ## Try it
 
-The runtime builds anywhere. On macOS or Linux, with only a Rust toolchain:
+The runtime builds on macOS or Linux with only a Rust toolchain. From the clone:
 
 ```sh
 cargo run -p switch --example first_task
 ```
 
-This runs three small tasks on the switch runtime with no network, and is explained in [Your first task](book/src/getting-started/first-task.md).
+This runs three short examples on the switch runtime with no network, and is explained in [Your first task](book/src/getting-started/first-task.md).
 
 Anything that touches the NIC needs Linux with DPDK 25.11.3. The repository ships a Docker image with everything installed, which also works on macOS:
 
@@ -40,7 +54,7 @@ Inside the container, [Your first network program](book/src/getting-started/firs
 
 ## Tests
 
-`make test` at the repository root runs the tests that need no DPDK, on any machine. `make docker-test` runs the full suite in the Docker image. [Running the test suite](book/src/testing/suite.md) has the details.
+`make test` at the repository root runs the tests that need no DPDK, on macOS or Linux. `make docker-test` runs the full suite in the Docker image. [Running the test suite](book/src/testing/suite.md) has the details.
 
 ## License
 

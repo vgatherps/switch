@@ -10,22 +10,23 @@ A NIC port has three pools:
 
 ```text
                       arriving packets
- NIC ──────────────▶ RX pool ──────▶ TcpFrame / UdpDatagram / Datagram
+ NIC --------------> RX pool -------> TcpFrame / UdpDatagram / Datagram
                      (fixed size)      held by your code until dropped
 
                      packets the Stack builds itself
- NIC ◀────────────── TX pool ◀────── ACKs, ARP, resets
-                     (exactly its reserve with open)
+ NIC <-------------- TX pool <------- ACKs, ARP, resets,
+                     (exactly its        TCP segments sent by copy
+                      reserve with open)
 
                      data your code sends
- NIC ◀────────────── frame pool ◀─── send_slice, tx_frame, try_send
-                     (reserve + frame_share)   TCP keeps each frame until
-                                               the peer acknowledges it
+ NIC <-------------- frame pool <---- send_slice, tx_frame, try_send
+                     (reserve +          TCP keeps each frame until
+                      frame_share)       the peer acknowledges it
 ```
 
 The RX pool holds arriving packets. The NIC driver takes an empty buffer from it for each packet it receives. When the Stack hands you received data, as a `TcpFrame` or `UdpDatagram` on the Stack or a `TcpFrame` or `Datagram` in switch-net, that value still owns its packet buffer. The buffer goes back to the RX pool when you drop the value (or the last clone of the frame you made from it).
 
-The TX pool holds packets the Stack builds on its own: acknowledgements, ARP requests and replies, resets. Your data does not go here.
+The TX pool holds packets the Stack builds on its own (acknowledgements, ARP requests and replies, resets) and TCP segments it sends by copy. A TCP segment goes out as a copy when it cannot be sent as one whole frame: a frame longer than the segment, a shared or sliced frame, a segment that spans frames, or part of a frame being retransmitted. [TCP sockets on the Stack](../stack/tcp.md#handing-over-a-frame-tcp_send_frame) says more about when that happens.
 
 The frame pool holds the data your program sends. On the Stack, `send_slice` copies bytes into frames from this pool, and `Stack::tx_frame` hands you an empty one to fill. In switch-net, `NetHandle::tx_frame` does the same on the local backend. A TCP socket keeps each frame it queued until the peer acknowledges the frame's last byte. A UDP frame returns to the pool once the NIC has sent it.
 
@@ -41,17 +42,7 @@ Each pool is sized in two parts. The reserve is what the Stack and the NIC drive
 
 Nothing is reserved per socket. Every socket draws on the same shares. A socket added after the Stack starts is never refused because a pool is too small; `add_tcp` only fails when every socket slot is taken. A pool that is too small for many busy sockets shows up later, as the backpressure described in [Running dry](#running-dry) below.
 
-`dpdk-smoltcp` exports the reserve formulas as functions:
-
-| Function | Value |
-|---|---|
-| `rx_reserve(rx_descriptors, rx_burst, rx_staging, rx_cache_size)` | max(rx_descriptors, 32) + max(rx_descriptors, 32) + rx_burst + rx_staging + ⌊3 × rx_cache_size / 2⌋ |
-| `tx_reserve(tx_descriptors, tx_pending)` | tx_descriptors + tx_pending |
-| `frame_reserve(tx_descriptors, tx_pending)` | tx_descriptors + tx_pending + 1 |
-
-The RX reserve covers the buffers the driver keeps posted in its receive ring, one more ring refill plus one receive burst (the "low mark", explained below), the Stack's staging queue and one CPU's pool cache. The TX and frame reserves cover packets the NIC driver may still hold after sending and packets waiting in the Stack's pending queue. Descriptor counts here are the ones the driver actually agreed to (`Port::descriptor_counts()`), which can differ from the ones you asked for.
-
-`Stack::new` checks each pool against its reserve and refuses to start if one is below it. The error names the pool, its size and the size it needs: `RxPoolTooSmall { count, required }`, `TxPoolTooSmall { count, required }` or `TxFramePoolTooSmall { count, required }`. Through `switch_open::open` these arrive inside `OpenError::Stack`. Enlarge the named pool to at least `required`.
+`Stack::new` checks each pool against a reserve it computes from the descriptor counts and queue sizes, and refuses to start if one is below it. The error names the pool, its size and the size it needs: `RxPoolTooSmall { count, required }`, `TxPoolTooSmall { count, required }` or `TxFramePoolTooSmall { count, required }`. Through `switch_open::open` these arrive inside `OpenError::Stack`. Enlarge the named pool to at least `required`. When you open the port by hand you compute the reserves yourself; [Sizing pools by hand](#sizing-pools-by-hand) gives the formulas.
 
 ## Filling `Sizing`
 
@@ -78,7 +69,7 @@ The fields of `Sizing` are:
 
 The number that needs thought is `frame_share`. A TCP socket can hold up to its `tx_capacity` bytes in frames: queued data plus data sent but not yet acknowledged. `tcp::tx_mbuf_budget(&config, ip_mtu)` estimates how many frames that is when every frame is a full segment: `tx_capacity` divided by the segment payload (IP MTU − 40, or `mss_cap` if smaller), rounded up, and never less than 6. Smaller writes use more frames for the same bytes. The function panics for an IP MTU below 68 or `mss_cap == Some(0)`.
 
-The first network program has one socket, so its share is one socket's budget:
+The Stack client from [Programming the Stack directly](../stack/index.md#a-complete-client), like the first network program, has one socket, so its share is one socket's budget:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-open/examples/tcp_client.rs:sizing}}
@@ -116,7 +107,7 @@ There is no single right size. These are the values the programs in this reposit
 
 | Program | `frame_share` | `rx_staging` | `tx_pending` |
 |---|---|---|---|
-| first network program (`switch-open` example `tcp_client`) | one 64 KiB socket's `tx_mbuf_budget` | 32 | 32 |
+| Stack client (`switch-open` example `tcp_client`) and the first network program | one 64 KiB socket's `tx_mbuf_budget` | 32 | 32 |
 | `switch-bench serve`, TCP and WebSocket | sockets × `tx_mbuf_budget` + 64 | 128 | 64 |
 | `switch-bench serve`, UDP | 64 | 128 | 64 |
 | `switch-nic` | one socket's `tx_mbuf_budget`, shared by all | 32 (128 in `feed` mode) | 32, or the TCP connection count if larger |
@@ -126,7 +117,17 @@ On the junction backend your program does not size these pools; the daemon does.
 
 ## Sizing pools by hand
 
-If you open the port yourself instead of through `open`, you fill a `PortConfig` with one `PoolConfig` per pool and choose every count. The [by-hand page](../stack/by-hand.md) walks through it. The rule is the same: each count is its reserve plus a share. The tap echo harness gives its RX pool one window of full segments as share and its frame pool one socket's budget:
+If you open the port yourself instead of through `open`, you fill a `PortConfig` with one `PoolConfig` per pool and choose every count. The [by-hand page](../stack/by-hand.md) walks through it. The rule is the same: each count is its reserve plus a share. `dpdk-smoltcp` exports the reserve formulas as functions:
+
+| Function | Value |
+|---|---|
+| `rx_reserve(rx_descriptors, rx_burst, rx_staging, rx_cache_size)` | max(rx_descriptors, 32) + max(rx_descriptors, 32) + rx_burst + rx_staging + floor(3 × rx_cache_size / 2) |
+| `tx_reserve(tx_descriptors, tx_pending)` | tx_descriptors + tx_pending |
+| `frame_reserve(tx_descriptors, tx_pending)` | tx_descriptors + tx_pending + 1 |
+
+The RX reserve covers the buffers the driver keeps posted in its receive ring, one more ring refill plus one receive burst (the low mark, described in [Running dry](#running-dry)), the Stack's staging queue and one CPU's pool cache. The TX and frame reserves cover packets the NIC driver may still hold after sending and packets waiting in the Stack's pending queue. Descriptor counts here are the ones the driver actually agreed to (`Port::descriptor_counts()`), which can differ from the ones you asked for.
+
+The tap echo harness gives its RX pool one window of full segments as share and its frame pool one socket's budget:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-tap-echo/src/driver.rs:port_config}}

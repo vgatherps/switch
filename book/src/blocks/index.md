@@ -2,7 +2,7 @@
 
 When an application uses the junction backend, its sockets live in another process. The [daemon](../junction/index.md) owns the NIC and runs the Stack; the application only exchanges data with it. This part of the book explains the pieces that carry that data between the two processes, and the frame type that every layer of switch hands to application code.
 
-You do not need any of this to write a program with switch-net. Read it when you want to know what happens to a packet between the daemon and your task, when you are writing a test or a tool that talks to these crates directly, or when you want to use one of them on its own. Each crate here works without DPDK and without the rest of switch. The previous part ended with [Stack errors and panics](../stack/errors.md); this part leaves the Stack behind and looks only at what connects an application to the daemon.
+You do not need any of this to write a program with switch-net. Read it when you want to know what happens to a packet between the daemon and your task, when you are writing a test or a tool that talks to these crates directly, or when you want to use one of them on its own. Each crate here works without DPDK and without the rest of switch.
 
 ## Two directions, two mechanisms
 
@@ -12,26 +12,38 @@ Received packets go from one writer, the daemon, to one reader, your session. Ea
 
 Sends go the other way, from many applications to one daemon. Every session pushes its sends into one shared set of send rings, with one ring for each CPU on the machine. A sender always writes to the ring of the CPU it is running on, so two senders never write the same ring at the same moment. The daemon reads all the rings and puts each session's sends back in the order the session made them, using a sequence number on every record.
 
+The picture below shows both directions together with the third channel, the control socket, and the threads on each side that use them.
+
 ```text
- application process                              switch-junctiond
-+----------------------------+                  +------------------------------+
-| Session                    |                  |                              |
-|                            |   send rings     |                              |
-|  send ---- ceph-ring ------+--(one per CPU,---+--> ceph-fifo: merges rings   |
-|            Writer          |   all sessions)  |    into per-session order    |
-|                            |                  |                              |
-|                            |   receive ring   |                              |
-|  poll <-- slice_ringbuffer-+--(one per -------+--- slice_ringbuffer          |
-|           RingReader       |   session)       |    RingWriter                |
-|    |                       |                  |                              |
-|    v                       |                  |                              |
-|  switch-frame OwnedFrame   |                  |                              |
-|  (points into the ring)    |                  |                              |
-+----------------------------+                  +------------------------------+
-        both kinds of ring: a shared-memory backing, mapped twice back to back
+ application process                                  switch-junctiond
+
+ +--------------------------------+                  +----------------------------------+
+ | your tasks / switch-net        |                  | network thread (one pinned CPU)  |
+ |                                |                  |   busy-polls the NIC and Stack   |
+ |  Session::send_*               |   send rings     |                                  |
+ |    ceph-ring Writer -----------+--(one per CPU;---+--> ceph-fifo Fifo: merges the    |
+ |                                |   each used by   |    rings into per-session order, |
+ |                                |   every session  |    applies the sends             |
+ |                                |   sending from   |                                  |
+ |                                |   that CPU)      |                                  |
+ |                                |                  |                                  |
+ |  Session::poll_packets         |   receive ring   |                                  |
+ |    slice_ringbuffer RingReader <--(one per -------+--- slice_ringbuffer RingWriter   |
+ |      |                         |   session)       |    writes received packets       |
+ |      v                         |                  |                                  |
+ |    switch-frame OwnedFrame     |                  +----------------------------------+
+ |    (points into the ring)      |                  | control thread (housekeeping     |
+ |                                |  control socket  |   CPUs): sessions, socket opens  |
+ |  Session opens, closes <-------+--(control.sock,--+-> and closes, events             |
+ |  junction-ctl thread: reads    |   Unix socket)   |                                  |
+ |    events from the socket      |                  |                                  |
+ +--------------------------------+                  +----------------------------------+
+
+    both kinds of ring: a shared-memory backing (a file in the daemon's --dir),
+    mapped twice back to back
 ```
 
-The control messages that set up sockets and sessions take a third path, a Unix socket between the session and the daemon. That protocol belongs to junction itself and is described in [The junction control protocol](../reference/junction-protocol.md).
+The control socket carries the rare messages that set up and end sessions and sockets, and the events that answer them. `Session::connect` starts one reader thread, `junction-ctl`, that receives those messages for the session. That protocol belongs to junction itself and is described in [The junction control protocol](../reference/junction-protocol.md); because control and data take different paths, they are not ordered against each other, as [Using a Session directly](../junction/session.md) explains.
 
 ## The crates
 

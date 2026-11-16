@@ -1,6 +1,8 @@
 # Benchmarking on AWS
 
-`switch-bench/aws/switch_aws_bench.py` runs a fixed benchmark matrix on EC2 in one command. It creates its own network and instances, prepares every host with the script from [Running on EC2](../nic/ec2.md), builds the code on the hosts, runs the sweeps, fetches the results, deletes everything it created and writes the [report](reports.md). This page covers what it needs, each of its commands, the checks that can mark a sweep invalid, and where its output goes.
+Run `python3 switch-bench/aws/switch_aws_bench.py run` to measure on real ENA hardware. The script runs a fixed benchmark matrix on EC2 in one command: it creates its own network and instances, prepares every host with `deploy/hft-host.sh` from [Running on EC2](../nic/ec2.md), builds the code on the hosts, runs the sweeps, fetches the results, deletes everything it created and writes the [report](reports.md).
+
+A few AWS words appear below. A VPC is the private network the run's instances live in, with one subnet in one availability zone. An ENI is an instance's network interface; each host gets a second one as its data NIC. A placement group asks AWS to place instances close together; the run uses a cluster placement group so the hosts are near each other. [Running on EC2](../nic/ec2.md) explains how a host uses its two ENIs.
 
 The runner creates paid resources in your AWS account. Every resource is tagged with the run's id and an expiry time, every instance powers itself off when the run's time-to-live (TTL) runs out, and teardown runs however the script ends.
 
@@ -89,7 +91,7 @@ Everything goes to `DIR/<run-id>/`, where `DIR` is `--out` (default `switch-benc
 | `<sweep>.jsonl` | The coordinator's step and summary lines |
 | `<sweep>.coord.log`, `<sweep>.receiver.log` | The coordinator's progress and the receiver's stderr |
 | `<sweep>.<role>.placement.txt`, `...placement.end.txt`, `<sweep>.placement.json` | The placement snapshots and the check's result |
-| `<sweep>.<role>.junctiond.log` | Each daemon's output and exit status (junction backend) |
+| `<sweep>.<role>.switch-junctiond.log` | Each daemon's output and exit status (junction backend) |
 | `source.json` | The commit and the SHA-256 of the source archive the hosts built |
 | `host-setup.txt` | Each host's `hft-host.sh verify` output |
 | `created.json` | Every resource the run created, by id |
@@ -114,7 +116,7 @@ It uses `DIR/ID/created.json` plus a lookup by tag (only the tag lookup if the f
 python3 switch-bench/aws/switch_aws_bench.py kernel --region R
 ```
 
-`test` runs native test suites on one EC2 host instead of benchmarks: an x86-64 c6in.2xlarge by default, or an arm64 c7gn.xlarge with `--shape arm`. It runs three suites, `rings`, `switch-junctiond` and `switch-net-switch-tls`, writes a `.log` and `.exit` file per suite and `tests.json`, and exits 0 only when every suite passed, every fetch succeeded and teardown verified. [Running the test suite](../testing/suite.md) lists the commands it runs.
+`test` runs native test suites on one EC2 host instead of benchmarks: an x86-64 c6in.2xlarge by default, or an arm64 c7gn.xlarge with `--shape arm`. It runs three suites, `rings`, `switch-junctiond` and `switch-net-switch-tls`, writes a `.log` and `.exit` file per suite and `tests.json`, and exits 0 only when every suite passed, every fetch succeeded and teardown verified. [Running the test suite](../testing/suite.md#on-an-ec2-host) lists the commands each suite runs.
 
 `binance` runs the market-data feed (`deploy/run-binance.sh`) for `--seconds` (default 600) on one m7g.xlarge in a `precision-time` placement group with an Elastic IP, fetches its log and output, and tears down. [Walkthrough: a market-data feed](../protocols/binance-feed.md) explains the feed.
 

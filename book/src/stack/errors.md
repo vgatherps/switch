@@ -53,8 +53,8 @@ Some DPDK argument errors, and `--help`, exit the process inside `Eal::init` ins
 
 | `StackError` | From | Meaning | What to do |
 |---|---|---|---|
-| `InvalidConfig(reason)` | `new` | A `StackConfig` rule failed, or the start time is below zero. | Fix the config. |
-| `IpMtuBelowIpv4Minimum { mtu }` | `new` | The port's IP MTU is below 68. | Use a larger MTU. |
+| `InvalidConfig(reason)` | `new` | A `StackConfig` rule failed, the start time is below zero, the port's IP MTU is from 68 to 87, or a path MTU is below 88. 88 is the smallest MTU that carries a 48-byte TCP segment, the same floor the config file enforces. | Fix the config. |
+| `IpMtuBelowIpv4Minimum { mtu }` | `new` | The port's IP MTU is below 68. | Use an MTU of at least 88. |
 | `RxPoolTooSmall { count, required }` | `new` | The RX pool is below its reserve. | Make the pool at least `required`. |
 | `TxPoolTooSmall { count, required }` | `new` | The TX pool is below its reserve. | Make the pool at least `required`. |
 | `TxFramePoolTooSmall { count, required }` | `new` | The frame pool is below its reserve. | Make the pool at least `required`. |

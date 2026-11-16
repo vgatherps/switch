@@ -10,13 +10,13 @@ A readiness token is a `u32` you choose, armed on one half of a socket. A TCP so
 
 ```text
    arm_tcp(key, Rx, 7)          a segment arrives during a turn
-          │                                 │
-          ▼                                 ▼
-    ┌──────────┐      something that   ┌──────────┐   pop_fired()  ┌──────────┐
-    │  armed   │ ───  may change the ─▶│  fired   │ ─────────────▶ │ disarmed │
-    └──────────┘      socket happens   └──────────┘   returns 7    └──────────┘
-          ▲                                                              │
-          └────────────────── check the socket, then arm again ──────────┘
+          |                                 |
+          v                                 v
+    +----------+      something that   +----------+   pop_fired()  +----------+
+    |  armed   | ---  may change the ->|  fired   | -------------> | disarmed |
+    +----------+      socket happens   +----------+   returns 7    +----------+
+          ^                                                              |
+          +------------------ check the socket, then arm again ----------+
 ```
 
 First take the socket's key, once, and keep it beside the handle. Taking the key checks that the handle belongs to this Stack and names a live socket; arming with the key afterwards skips that check.
@@ -27,13 +27,7 @@ stack.arm_tcp(key, ReadySide::Rx, 1);
 stack.arm_tcp(key, ReadySide::Tx, 2);
 ```
 
-After each turn, drain the fired tokens:
-
-```rust,ignore
-while let Some(token) = stack.pop_fired() {
-    // look up the socket for `token`, check its state, arm again if still waiting
-}
-```
+After each turn, drain the fired tokens and service each socket they name. The [example below](#a-real-loop-the-junction-daemon) shows a complete loop.
 
 `pop_fired` returns each fired token once, in no particular order, and `None` when there are no more. A fired token is disarmed: it will not fire again until you arm it again. Arming a half that already has a token replaces it.
 
@@ -48,7 +42,7 @@ A TCP token fires on any of these:
 - the first `turn`, `receive` or `send` that finds a free frame after the socket's `send_slice` found the frame pool empty;
 - a state change during egress, such as a close timer or the end of TIME-WAIT.
 
-Sending data fires nothing by itself. The peer's ACK that frees room in the send queue does. Idle turns fire nothing.
+Transmitting queued data during a turn fires nothing; the peer's ACK that frees room in the send queue does. Idle turns fire nothing.
 
 Because `tcp_mut` fires the socket's tokens, arm after you have finished reading and writing a socket, not before. Otherwise your own `recv` fires the token you just armed.
 
@@ -62,14 +56,20 @@ A UDP token fires when a datagram is queued on the socket.
 
 A key is valid until its socket is removed. Only debug builds check that a key still names a live socket. In a release build, a key used after its socket was removed (or on another Stack) sends the token to whatever socket now holds that slot, where it fires for no reason, and panics if the slot does not exist.
 
-## A complete example
+## A real loop: the junction daemon
 
-The readiness tests drive a pair of Stacks connected back to back and check exactly which calls fire which token. This excerpt shows idle turns firing nothing, a received segment firing both halves, `tcp_mut` and `tcp_send_frame` firing at once, and an ACK firing the send half:
+The junction daemon runs one Stack for many applications and receives on every socket they open. It uses each socket's index in its own socket table as the token, and arms only the receive half. After each turn it drains the fired tokens:
 
 ```rust,ignore
-{{#include ../../../conduit/crates/dpdk-smoltcp/tests/readiness.rs:tcp_tokens}}
+{{#include ../../../switch-junctiond/src/network.rs:fired}}
 ```
 
-`pair.round` turns both Stacks once; `popped` collects every token `pop_fired` returns, sorted.
+For each token it looks the socket up, disarms it, reads what arrived, and arms it again with the same token:
+
+```rust,ignore
+{{#include ../../../switch-junctiond/src/network.rs:service_rx}}
+```
+
+`socket.socket.disarm` and `socket.socket.arm` are the daemon's small wrappers around `disarm_tcp`/`disarm_udp` and `arm_tcp(key, ReadySide::Rx, token)`/`arm_udp`; a TCP socket that has closed is not armed again. `socket.receive` reads the socket and hands the data to the application's [session](../junction/session.md). The order matters. Reading goes through `tcp_mut`, which fires the socket's token, so the daemon disarms first and arms only after reading. The token it arms then fires at the next change, not because of its own read. A socket the daemon could not finish reading (the application's receive ring was full) goes on a retry list, which the daemon works through before its next turn.
 
 Next: [Stack errors and panics](errors.md).

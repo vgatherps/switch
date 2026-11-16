@@ -1,11 +1,11 @@
 # TLS and WebSocket over switch-net
 
-The previous part, which ended with [Shutting down cleanly](../net/shutdown.md), worked with a TCP stream: a task opens it with `NetHandle::tcp_connect`, reads [frames](../net/frames.md) from it and sends frames into it. Many real services do not speak raw TCP, though. A market-data feed is usually a `wss://` URL: WebSocket messages inside TLS inside TCP. Two crates add those layers on top of a switch-net TCP stream:
+switch-net gives a task TCP streams: it opens one with `NetHandle::tcp_connect`, reads [frames](../net/frames.md) from it and sends frames into it. Many real services do not speak raw TCP, though. A market-data feed is usually a `wss://` URL: WebSocket messages inside TLS inside TCP. Two crates add those layers on top of a switch-net TCP stream:
 
 - `switch-tls` is a TLS 1.3 client. It turns a connected TCP stream into an encrypted byte stream.
 - `switch-ws` is a WebSocket (RFC 6455) client, for `ws://` and `wss://`, and a `ws://` server. It turns a TCP stream, or a TLS stream from `switch-tls`, into a stream of whole messages.
 
-Both run inside switch tasks, on the same drive loop as everything else. They start no threads and no background tasks of their own. This page shows how the layers fit and which function to call. The following pages walk through a `wss://` client in detail, then a `ws://` server, then TLS on its own, and end with a complete application.
+They run entirely inside your tasks, on the same drive loop as everything else. This page shows how the layers fit and which function to call. The following pages walk through a `wss://` client in detail, then a `ws://` server, then TLS on its own, and end with a complete application.
 
 ## The layers
 
@@ -37,7 +37,7 @@ Three different units appear here, and they do not line up with each other. A *f
  WebSocket       |hdr| message 1 |hdr|  message 2 (two WebSocket frames) |
 ```
 
-In this picture record B straddles frames 1 and 2, and message 2 straddles records B and C. The next section says what that costs.
+In this picture record B straddles frames 1 and 2, and message 2 straddles records B and C.
 
 ## Which function to call
 
@@ -52,17 +52,21 @@ All entry points take a `TcpStream` that is already connected (or accepted), plu
 
 `Wss` and `Ws` have the same methods: `recv`, `send`, `close`, `linger` and `peer_close`. `Ws` also has `recv_with_sender` for echo-style servers.
 
-The `switch_net` modules of both crates sit behind the crate feature `switch-net`. Without it, only the protocol cores build; they need no DPDK and are tested on any machine.
+The `switch_net` modules of both crates sit behind the crate feature `switch-net`. Without it, only the protocol cores build; they need no DPDK and are tested on any machine. A `wss://` client depends on switch-ws with the feature, and on rustls with a crypto provider and a set of root certificates. These are the lines the market-data feed uses:
 
-The TLS client speaks TLS 1.3 only, and the `rustls::ClientConfig` you pass must allow only TLS 1.3. There is a TLS client and no TLS server, so the WebSocket server is `ws://` only. switch-ws offers no extensions and no subprotocols, and fails the upgrade if a server selects one; in particular there is no permessage-deflate compression.
+```toml
+switch-ws = { path = "<clone>/switch-ws", features = ["switch-net"] }
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+webpki-roots = "=1.0.9"
+```
 
-## Where bytes are copied
+`<clone>` is the directory where you cloned this repository. Turning on switch-ws's `switch-net` feature turns on switch-tls's as well. For TLS without WebSocket, depend on `switch-tls` with the same feature.
 
-The reason these crates exist is to keep received bytes in the packet buffer they arrived in, and to write sent bytes straight into the packet buffer that leaves. The rules:
+The TLS client speaks TLS 1.3 only; the `rustls::ClientConfig` you pass must allow only TLS 1.3. The WebSocket server is `ws://`. switch-ws asks for no extensions or subprotocols and fails the upgrade (`UpgradeError::Unrequested`) if a server picks one.
 
-On receive, a TLS record that lies wholly inside one frame is decrypted in place, inside that frame. A record that straddles frames is first copied into one reusable scratch buffer and decrypted there. Then a message that lies wholly inside one run of plaintext is handed to you as a slice of that memory: `Message<'_>` borrows it. A message that straddles frames, records or WebSocket frames is copied once into another reusable buffer, which grows only as far as the bytes actually received (and never past the receive limit, see [Limits](messages.md#limits)).
+## Copies and timestamps
 
-On send, a message that fits in one frame is written into the frame right behind its WebSocket header. A longer message is copied once into a reusable send buffer and then goes out one frame at a time. Over `wss://` there is one more copy: switch-tls copies each frame's plaintext once for rustls, which encrypts it into the frame.
+Received messages are, where possible, slices of the packet buffer they arrived in; sent messages are written straight into outgoing frames. [Sending and receiving messages](messages.md#where-copies-happen) shows what that means for you.
 
 Each received frame carries a [hardware timestamp](../nic/offloads.md), the NIC's receive time (0 when the NIC gave none). That stamp survives the layers: `Message::rx_timestamp()` returns the stamp of the frame that held the message's first byte (over `wss://`, the frame holding the TLS record with that byte).
 

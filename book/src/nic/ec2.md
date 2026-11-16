@@ -1,16 +1,18 @@
 # Running on EC2
 
-Amazon EC2 instances reach the network through ENA, Amazon's virtual NIC, and DPDK drives it with the `net_ena` [NIC driver](index.md). The steps are the ones on [Preparing a Linux machine](host-setup.md), with a few EC2-specific differences. You can follow them by hand, or let `deploy/hft-host.sh` do all of them on an Amazon Linux 2023 instance. This page covers both, then shows how to check the result and run the market-data feed on it.
+On EC2 this page replaces [Preparing a Linux machine](host-setup.md): it ends at the same point, a checked NIC and a program running on it. EC2 instances reach the network through ENA, Amazon's virtual NIC, and DPDK drives it with the `net_ena` [NIC driver](index.md). The steps are the generic ones with a few EC2-specific differences. You can follow them by hand, or let `deploy/hft-host.sh` do all of them on an Amazon Linux 2023 instance.
 
 ## Instance and network setup
 
 These are done in the AWS console or CLI before you log in.
 
-The instance needs two network interfaces, which AWS calls ENIs. The primary ENI (device number 0) stays with Linux as the [management NIC](index.md): it carries SSH, DNS and the instance metadata service, and keeps the default route. Attach a second ENI for DPDK; it becomes the [data NIC](index.md). Leave ENA Express off on it.
+The instance needs two network interfaces, which AWS calls ENIs (elastic network interfaces). The primary ENI (device number 0) stays with Linux as the [management NIC](index.md): it carries SSH, DNS and the instance metadata service, and keeps the default route. Attach a second ENI for DPDK; it becomes the [data NIC](index.md). Leave ENA Express off on it: with it on, UDP needs a lower MTU to make room for ENA Express's own headers.
 
 AWS gives no public IPv4 address to an instance with more than one ENI. If your program talks to the internet (the market-data feed does), attach an Elastic IP to the data ENI, or route its subnet through a NAT gateway. Security groups apply to the data ENI as to any other: allow the ports your program uses, for example outbound TCP 9443 for the feed, or UDP and TCP 11111-11130 between two instances for `switch-nic sockperf-server`.
 
-The setup script picks two CPUs on the data ENI's NUMA node and isolates both physical cores, so the instance needs two physical cores there plus at least one more CPU for housekeeping. For hardware receive timestamps, which the feed asks for, the instance type and placement also matter; `deploy/README.md` lists the instance families and the `precision-time` placement group AWS requires.
+The setup script picks two CPUs on the data ENI's NUMA node and isolates both physical cores, so the instance needs two physical cores there plus at least one more CPU for housekeeping.
+
+Hardware receive timestamps, which the market-data feed asks for, need two more things. The instance must be of a family whose ENA gives timestamps and a PTP hardware clock; per AWS's user guide these are the Gen7 and later families M7a, M7g, M7gd, M7i, M7i-flex, M8a, M8g, M8i, M8i-flex, M9g, M9gd, C7a, C7gd, C7i, C7i-flex, C8a, C8g, C8gd, C8i, C8i-flex, C9g, C9gd, R7a, R7g, R7i, R8a, R8g, R9g, R9gd, X8g and X8i (not C7gn). And it must be launched in a placement group with the `precision-time` strategy (`aws ec2 create-placement-group --group-name G --strategy precision-time`, then launch with `--placement GroupName=G`). An instance belongs to one placement group, so such an instance cannot also be in a cluster placement group.
 
 ## By hand
 
@@ -18,15 +20,15 @@ On EC2 the generic steps change in these places:
 
 - Discover with `--aws`: `switch-netconf discover --interface <data-if> --aws -o dut.json`. It reads the ENI's address, subnet, gateway (the VPC router) and VPC address ranges from the instance metadata service, refuses the primary ENI, and warns when the ENI has no public IPv4 address. Inside a Docker container it needs `--network host` to reach the metadata service. [switch-netconf](netconf-tool.md) describes the rest.
 - Bind with `--noiommu`. Instances other than bare metal have no IOMMU.
+- Before binding, take the data interface away from the network manager and flush its routes and addresses, as in [step 6 of Preparing a Linux machine](host-setup.md#6-discover-check-and-bind). Amazon Linux 2023 uses systemd-networkd; the script does this with a file `/etc/systemd/network/00-switch-data.network` that matches the data ENI's MAC address and sets `Unmanaged=yes`.
 - Use a `vfio-pci` module with write combining. ENA's fast transmit mode (LLQ) needs write combining on the device's memory, which mainline `vfio-pci` does not provide on older kernels. Amazon Linux 2023's `kernel6.18` package includes it; for other kernels Amazon publishes a patched module in its `amzn-drivers` repository (`userspace/dpdk/enav2-vfio-patch`). Without it the ENA driver prints a warning on stderr that LLQ is disabled.
 - Pick the CPU on the data ENI's NUMA node, as everywhere.
 
 ## With hft-host.sh
 
-`deploy/hft-host.sh` turns a fresh Amazon Linux 2023 instance (x86-64 or arm64) with two ENIs into a ready host. Run it as root from a checkout of the repository:
+`deploy/hft-host.sh` turns a fresh Amazon Linux 2023 instance (x86-64 or arm64) with two ENIs into a ready host. Clone the repository on the instance first, then run the script as root from the repository root:
 
 ```sh
-git clone <repo> && cd <repo>
 sudo deploy/hft-host.sh apply        # builds, configures, reboots once; SSH drops here
 # reconnect
 sudo deploy/hft-host.sh verify       # every line ok, exit 0
@@ -34,7 +36,7 @@ sudo deploy/hft-host.sh verify       # every line ok, exit 0
 
 ### What apply does
 
-`apply` runs these steps in order. Each prints one line, `<step>: ok <detail>`, or stops at the first failure.
+`apply` runs these steps in order. Each prints lines of the form `<step>: ok <detail>`, or `<step>: changed <detail>` when it changed something; the build step prints one line per part (packages, rust, dpdk, binaries). A failing step prints `<step>: FAIL <detail>` and the script exits with status 1.
 
 1. Build. Installs the compiler toolchain with `dnf` and Rust with `rustup`, builds DPDK 25.11.3 under `/opt/dpdk` with the same options and patch as the Docker image, and installs release builds of `switch-nic`, `switch-netconf` and `switch-junctiond` into `/usr/local/bin`.
 2. Interfaces. The management interface is the one with the lowest-metric IPv4 default route. The data interface is the one other interface on the `ena` driver; pass `--interface IF` if there are several. The script refuses if the two would be the same, and every later step that touches the data ENI checks this again first.
@@ -97,6 +99,23 @@ sudo deploy/run-binance.sh --seconds 3600
 
 It runs `hft-host.sh verify` first and refuses to start if any line fails, or if chrony does not have the ENA hardware clock selected (the instance must be in a `precision-time` placement group). It then writes `/etc/switch/binance.json`, a copy of `dut.json` with hardware receive timestamps on, refuses to start unless `switch-netconf check` reads that back, and runs `switch-nic --config /etc/switch/binance.json feed` with your options, pinned to `APP_CPU`, appending its output to `/var/log/switch/binance.log`. On an instance type whose ENA offers no receive timestamps, opening the NIC fails with `PMD lacks the requested RX timestamp offload`.
 
+## Running your own program
+
+[Step 8 of Preparing a Linux machine](host-setup.md#8-run-your-own-program-on-the-nic) runs the first network program on the prepared NIC; on EC2 it works the same way with the script's files and CPU. The script builds with DPDK's paths set in its own environment, so set the same ones in your root shell before building, from the repository root:
+
+```sh
+sudo -i
+cd <repository root>
+export PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig LD_LIBRARY_PATH=/opt/dpdk/lib \
+    RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld' \
+    LIBCLANG_PATH=/usr/lib64/llvm18/lib PATH=/usr/lib64/llvm18/bin:/root/.cargo/bin:$PATH
+cargo build --locked --release -p switch-net --example tcp_client_local
+. /etc/switch/host.env
+taskset -c "$APP_CPU" target/release/examples/tcp_client_local /etc/switch/dut.json <peer>:7000
+```
+
+The peer is a second instance in the same subnet running the one-shot server from that step, with the security group allowing TCP 7000 between the two.
+
 ## Where to go next
 
-[switch-nic](switch-nic.md) documents the `info`, `sockperf-server` and `feed` modes. [Benchmarking on AWS](../measuring/aws.md) runs the latency benchmark on hosts this script prepares, without logging in by hand.
+[The network config file](config.md) explains every field of `dut.json`. [switch-nic](switch-nic.md) documents the `info`, `sockperf-server` and `feed` modes. [Benchmarking on AWS](../measuring/aws.md) runs the latency benchmark on hosts this script prepares, without logging in by hand.

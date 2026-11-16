@@ -14,7 +14,7 @@ You do not need a spare network card for this. The program talks to a **tap devi
  +-------------------------------------+       +----------------------+
 ```
 
-You need the build environment from [Setting up a build environment](environment.md): a Linux machine with DPDK, or a container from the Docker image started as shown in [Running a container for the examples](environment.md#running-a-container-for-the-examples), which allows the container on CPU 3 only. The whole program is `switch-net/examples/tcp_client.rs`; this page walks through it in the order it runs.
+You need the build environment from [Setting up a build environment](environment.md): a Linux machine with DPDK, or a container from the Docker image started as shown in [Running a container for the examples](environment.md#running-a-container-for-the-examples), which allows the container on CPU 3 only. The whole program is `switch-net/examples/tcp_client_local.rs`; this page walks through it in the order it runs.
 
 ## The network config file
 
@@ -29,7 +29,7 @@ The parts that matter here: `device` asks DPDK to create a tap device whose Linu
 The program first loads the file and looks up the server's address:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:config}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:config}}
 ```
 
 Resolve names before you open the NIC. Name lookup goes through the kernel's resolver and blocks, and once your program owns the NIC, its traffic no longer passes through the kernel.
@@ -39,20 +39,28 @@ Resolve names before you open the NIC. Name lookup goes through the kernel's res
 Opening takes a few lines, and each line sets up one piece:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:setup}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:setup}}
 ```
 
 `tcp::Config` is the socket's configuration: receive and send buffer sizes, and an upper bound on segment size taken from the config file's path MTU (the largest IP packet the config allows toward that destination). `Sizing` tells `switch_open::open` how many sockets to make room for and how many packet buffers to set aside for sending. A packet buffer is DPDK's fixed-size memory buffer for one packet; DPDK makes a fixed number of them when the NIC opens. The program has one TCP socket and no UDP sockets, and its packet-buffer share comes from `tcp::tx_mbuf_budget`, which estimates what one socket with this config can hold at once. [Packet-buffer pools](../nic/pools.md) explains the numbers.
 
+A few values in this block deserve a word each:
+
+- The 40 in `path_mtu - 40` is the IPv4 and TCP headers, so `mss_cap` is the largest TCP payload one packet can carry.
+- `frame_share`, `rx_staging`, `tx_pending` and the two socket counts size the packet-buffer pools ([Packet-buffer pools](../nic/pools.md)). This program reserves one TCP socket and no UDP sockets.
+- The `None` passed to `open` means no helper CPUs: unless the pinned CPU is isolated, DPDK's helper threads share it ([The pinned CPU and helper threads](../nic/cpus.md)).
+- The closure passed to `open` is the clock it uses for the Stack's start time and while it waits for the gateway's ARP reply. It reads the same clock the drive loop uses.
+- `ingress_budget` in `NetConfig` is the most received packets one turn processes ([The drive loop](../net/drive-loop.md)).
+
 The clock comes next. Everything in this program takes its time from one `std::time::Instant` taken at startup:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:clock}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:clock}}
 ```
 
 The network stack counts time in microseconds; the switch runtime counts ticks, and we use nanoseconds. `sample` reads the clock once and returns both, so the network and the tasks always agree on the time. Use one clock for every call; never feed a second clock into the same program.
 
-`switch_open::open` starts DPDK, opens the NIC port (one receive queue and one send queue of the NIC, set up for DPDK), and builds **the Stack**, the TCP/IP stack that runs inside your process. It is `unsafe` because your code promises that this thread alone uses the NIC port and that DPDK's state (`opened.eal`) outlives it. It also checks that the process may run on exactly one CPU and refuses to start otherwise. That one CPU is the **pinned CPU**: the program's network work and its tasks all run there. [Opening the NIC from code](../nic/open.md) covers `open` in full.
+`switch_open::open` starts the EAL, DPDK's per-process setup, opens the NIC port (one receive queue and one send queue of the NIC, set up for DPDK), and builds **the Stack**, the TCP/IP stack that runs inside your process. It is `unsafe` because your code promises that this thread alone uses the NIC port and that DPDK's state (`opened.eal`) outlives it. It also checks that the calling thread may run on exactly one CPU and refuses to start otherwise (`taskset` on the process satisfies it). That one CPU is the **pinned CPU**: the program's network work and its tasks all run there. [Opening the NIC from code](../nic/open.md) covers `open` in full.
 
 Then the program hands the Stack to switch-net and creates the runtime:
 
@@ -60,21 +68,21 @@ Then the program hands the Stack to switch-net and creates the runtime:
 - `net.handle()` gives a `NetHandle`. Tasks hold handles to open sockets and get buffers to send. A handle is cheap to clone.
 - `Runtime::new(clock.ns())` creates the switch runtime at the current tick, and the task is spawned on it.
 
-Using a `Net` this way, with the Stack inside your process, is the **local backend**. [Sockets with switch-net](../net/index.md) introduces the other one.
+Using a `Net` this way, with the Stack inside your process, is the **local backend**. The other one, the junction backend, appeared in the [Introduction](../introduction.md#two-ways-to-get-a-nic); [Sockets with switch-net](../net/index.md) uses both.
 
 ## The task
 
 The task does the actual work, written as ordinary async Rust:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:task}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:task}}
 ```
 
 `tcp_connect` opens a TCP connection to the server from local port 40000. There is no ephemeral port allocator, so a connection always names a nonzero local port. When the connection is established, `split` divides it into a receive half `rx` and a send half `tx`.
 
 Sending works with **frames**. A frame is a handle to a packet buffer that the Stack can transmit without copying. The task asks the handle for an empty frame, copies the line into it, cuts it to the line's length with `truncate`, and `freeze`s it into an immutable frame that is ready to send. `room(len)` waits until the socket has space for that many bytes, and `try_send` queues the frame. If `try_send` fails it gives the frame back along with the error; here we just keep the error. [Frames](../net/frames.md) and [TCP streams](../net/tcp.md) explain both steps.
 
-Receiving is a loop over `recv`. Each call returns the next piece of data the server sent, as a frame, in order. When the server closes its side, `recv` returns `Err(Error::Finished)`. The task then closes its own side with `shutdown` and waits for `delivered`, which resolves once the server has acknowledged everything we sent, including our end-of-stream. When `talk` returns, both halves are dropped, which releases the socket.
+Receiving is a loop over `recv`. Each call returns the next piece of data the server sent, as a frame, in order. When the server closes its side, `recv` returns `Err(Error::Finished)`. The task then closes its own side with `shutdown` and waits for `delivered`, which resolves once the server has acknowledged everything we sent, including our end-of-stream, or once the connection is gone and nothing more can be delivered. When `talk` returns, both halves are dropped, which releases the socket.
 
 The task stores its result in a shared cell so the drive loop can see that it is done.
 
@@ -83,10 +91,10 @@ The task stores its result in a shared cell so the drive loop can see that it is
 Nothing in the task touches the network directly. `try_send` only queues; packets leave and arrive when the drive loop says so. The **drive loop** is your own loop that runs on the pinned CPU:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:drive}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:drive}}
 ```
 
-Each pass calls `switch_net::round`, which does two things with one clock sample. First a **turn**: the Net takes in received packets, runs TCP's timers, sends what tasks queued, and wakes the tasks whose sockets changed. Then one poll of the runtime, which runs those tasks until they wait again.
+Each time through the loop, it calls `switch_net::round`, which does two things with one clock sample. First a **turn**: the Net takes in received packets, runs TCP's timers, sends what tasks queued, and wakes the tasks whose sockets changed. Then one poll of the runtime, which runs those tasks until they wait again.
 
 ```text
         +---------------------------+
@@ -115,7 +123,7 @@ Each pass calls `switch_net::round`, which does two things with one clock sample
 When the task is done, the program takes everything apart in order:
 
 ```rust,ignore
-{{#include ../../../switch-net/examples/tcp_client.rs:teardown}}
+{{#include ../../../switch-net/examples/tcp_client_local.rs:teardown}}
 ```
 
 `rt.shutdown()` drops any tasks that are still alive, together with the sockets and handles they hold. `net.into_stack()` gives the Stack back, but only when no `NetHandle`, no socket half and no future holding a socket is left anywhere; otherwise it returns the `Net` as an error. `into_port().try_close()` closes the NIC port and checks that every packet buffer came back. Received frames hold packet buffers, so drop any you kept before `try_close`. [Shutting down cleanly](../net/shutdown.md) explains each failure.
@@ -125,16 +133,16 @@ When the task is done, the program takes everything apart in order:
 Build the example, then start the server, the client, and give the tap interface its kernel-side address once the client has created it:
 
 ```text
-cargo build -p switch-net --example tcp_client
+cargo build -p switch-net --example tcp_client_local
 
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-taskset -c 3 target/debug/examples/tcp_client switch-net/examples/tap.json 192.0.2.1:7000 &
+taskset -c 3 target/debug/examples/tcp_client_local switch-net/examples/tap.json 192.0.2.1:7000 &
 until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 wait
 ```
 
-`taskset -c 3` allows the process on exactly one CPU (pick any CPU your container may use). The client first prints the report from `open`, which describes the port it opened, then the server's reply `tick`, then `port closed`.
+`taskset -c 3` allows the process on exactly one CPU (use the CPU the container was started with, `--cpuset-cpus`). The client first prints the report from `open`, which describes the port it opened, then the server's reply `tick`, then `port closed`. If `open` fails, [When the NIC won't open](../nic/troubleshooting.md) lists each message.
 
 ## Where each piece is explained
 

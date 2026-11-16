@@ -82,7 +82,15 @@ You create the first handle with the unsafe constructor `OwnedFrame::from_raw_pa
 
 The release function has the signature `unsafe extern "C" fn(rc: NonNull<u16>, ctx: *mut ())`. It is called exactly once, when the last handle is dropped, with the count still at 1. `ctx` is whatever you passed to `from_raw_parts`; producers use it to find their pool. A producer reads it back from a live frame with `ctx()`.
 
-The test module of `switch-frame` contains a complete producer: storage is a boxed struct with the count first and eight bytes after it, and release frees the box.
+Frames outlive the objects that handed them out, so a producer has to keep everything its release function touches alive until the last reference is gone, whenever that is. The usual way is to give each frame its own counted reference to the producer's state. switch-net's junction backend does this for its send-frame pool: `take` passes `Rc::into_raw` of the pool as `ctx`, so every live frame holds the pool, and `release_buffer` turns `ctx` back into that `Rc` with `Rc::from_raw`, returns the buffer to the pool, and drops the frame's reference.
+
+```rust,ignore
+{{#include ../../../switch-net/src/remote.rs:frame_pool}}
+```
+
+Here the count is the first two bytes of each boxed buffer and the payload follows it, which is the layout the diagram above shows. This is the pattern to copy.
+
+The test module of `switch-frame` has a smaller producer, a test fixture: storage is a boxed struct with the count first and eight bytes after it, and release frees the box. Its `ctx` is a plain pointer to a `Producer` that the test borrows, so it is only correct because each test keeps its `Producer` alive until every frame is dropped. A real producer cannot rely on that.
 
 ```rust,ignore
 {{#include ../../../switch-frame/src/lib.rs:producer}}

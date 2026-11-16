@@ -22,9 +22,9 @@ Applications connected to the same daemon share one NIC, one Stack and one set o
 
 ## What `Ok` and `Full` mean
 
-When `try_send` (TCP) or `send` (UDP) returns `Ok` on the junction backend, the bytes have been copied into the send ring, and nothing more. The daemon has not looked at them yet, and the peer has certainly not received them. The frame you passed in has already gone back to your frame pool.
+When `try_send` (TCP) or `send` (UDP) returns `Ok` on the junction backend, the bytes have been copied into the send ring as one [record](../reference/glossary.md), and nothing more. The daemon has not looked at them yet, and the peer has not received them. The frame you passed returns to your frame pool, unless you kept a clone or slice of it.
 
-`Full` means the send ring has no room for this record right now. The send ring is shared by every session on the daemon, so another application sending fast can fill it as easily as your own program. Keep the frame that came back with the error and try again after the next turn. switch-net helps with this: after any socket of a `Net` sees `Full`, `room` on every socket of that `Net` waits until the next turn.
+`Full` means the send ring for the CPU your thread is running on has no room right now. There is one 1 MiB ring per CPU, and every session sending from that CPU writes into it, so another application on the same CPU can fill it as easily as your own program. Applications pinned to different CPUs use different rings. Keep the frame that came back with the error and try again after the next [turn](../net/drive-loop.md). switch-net helps with this: after any socket of a `Net` sees `Full`, [`room`](../net/tcp.md) on every socket of that `Net` waits until the next turn.
 
 `Full` says nothing about the peer. A peer that reads slowly, or a TCP window that is closed, does not make `try_send` fail or wait. This is the main difference from the local backend, where `room` waits until the peer acknowledges data.
 
@@ -35,13 +35,13 @@ The daemon gives each TCP socket's bytes to the Stack as fast as the Stack accep
 An application that must bound this memory paces its TCP sends itself, with one of two signals:
 
 - its own application-level acknowledgements from the peer (a request/response protocol does this naturally: send the next request after the reply arrives), or
-- `tx.shutdown()` followed by `tx.delivered().await`, which resolves once the peer has acknowledged every byte and the FIN. This fits a sender that has a fixed amount of data to send.
+- `tx.shutdown()` followed by `tx.delivered().await`, which resolves once the peer has acknowledged every byte and the FIN, or when the connection or session is lost and no more can be delivered. This fits a sender that has a fixed amount of data to send. When you need to know the peer received or processed the data, use a reply in your own protocol.
 
 ## Closing sockets
 
-Dropping both halves of a TCP stream closes it. On the junction backend the daemon does not apply that close immediately. It waits until the shared send ring is idle, so that every byte any session committed before the close is applied first, and until the socket's own queued bytes have gone to the Stack. Then it sends the FIN and frees the socket.
+Dropping both halves of a TCP stream closes it. On the junction backend the daemon does not apply that close immediately. It waits until the send rings are idle, so that every byte any session committed before the close is applied first, and until the socket's own queued bytes have gone to the Stack. Then it sends the FIN and frees the socket.
 
-A consequence is that one application's close or `shutdown` can wait while another application keeps sending. This is how the daemon keeps every close behind the data that preceded it, and it is the intended behavior. A reset (dropping a stream with unread received data) does not wait.
+A consequence is that one application's close or `shutdown` can wait while another application keeps sending. The close travels over the control socket and the data through the rings, so the daemon waits until the rings are empty to be sure none of this session's earlier sends is still in one. A reset (dropping a stream with unread received data) does not wait.
 
 Because closes are applied later, opening a socket on the same port right after closing one can fail with `Error::PortInUse`: the old socket still exists in the daemon. A program that reuses ports should retry after a short delay. With a raw `Session`, wait for the `Freed` event, described in [Using a Session directly](session.md).
 
@@ -49,7 +49,9 @@ Because closes are applied later, opening a socket on the same port right after 
 
 Each session has one receive ring, `--rx-size` bytes, which the daemon fills with the data it receives for all of that session's sockets. A received frame is a view into that ring. Its space becomes free again only when the frame is dropped and a later turn reclaims it, and reclaiming goes in order: space after the oldest frame still held cannot be reused until that frame is dropped too.
 
-So holding received frames shrinks the receive ring for the whole session, not only for the socket the frames came from. When the ring is full, the daemon keeps the next pending chunk or datagram for each socket and retries on every pass. TCP data meanwhile waits in the daemon, and TCP's own flow control slows the peer. Notices that a peer closed the connection also wait, because they are sent only after the data before them is in the ring. Copy out what you need to keep for a long time and drop the frame.
+So holding received frames shrinks the receive ring for the whole session, not only for the socket the frames came from. When the ring is full, the daemon keeps the next pending chunk or datagram for each socket and retries every time through its network loop. TCP data meanwhile waits in the daemon, and TCP's own flow control slows the peer. Notices that a peer closed the connection also wait, because they are sent only after the data before them is in the ring. Copy out what you need to keep for a long time and drop the frame.
+
+UDP datagrams are not split the way TCP data is: a datagram larger than `--rx-size` − 40 bytes is dropped. Size the ring for your largest datagram as well as the frames you hold.
 
 ## Limits shared across sessions
 
@@ -60,13 +62,19 @@ Some limits belong to the daemon as a whole:
 | TCP sockets in the Stack | `--tcp-sockets` | `Error::SocketsFull` when opening, even if your own session's socket table has free entries |
 | UDP sockets in the Stack | `--udp-sockets` | `Error::SocketsFull` when binding |
 | sessions | `--max-sessions` | `ConnectError::Rejected(SessionsFull)` when connecting |
-| send ring space | 1 MiB per CPU | `Error::Full` when sending |
+| send ring space | 1 MiB per CPU, shared by senders on that CPU | `Error::Full` when sending |
 
 Each session also has its own table of `max_sockets` entries; running out of those also gives `Error::SocketsFull`.
 
+## Addresses and ports
+
+Every application connected to a daemon uses the daemon's IP address (10.77.0.2 in the tap example) and one shared set of ports. A UDP port bound by one application is in use for all of them. Two applications cannot hold connections with the same local port to the same remote address and port; give each application its own local ports. Listeners on the same port in different applications all wait for connections on it, and each new connection goes to one of them ([Opening sockets](../net/opening.md#accepting)).
+
+A UDP bind or a TCP connect that collides with a port another application holds fails with `Error::PortInUse`, the same as if your own program held it.
+
 ## Control events and data
 
-Opens, closes and the events that answer them (such as "connected" or "peer closed") travel over the control socket, which the daemon's control thread serves about once a millisecond. Packet data does not go that way. So events can trail the data they relate to by up to about a millisecond, while data itself moves as fast as the drive loops of the daemon and the application turn. switch-net hides the ordering consequences; [Using a Session directly](session.md#event-and-packet-ordering) spells them out for raw sessions.
+Opens, closes and the events that answer them (such as "connected" or "peer closed") travel over the control socket. Packet data does not go that way. Requests from your program reach the daemon at once. Events from the daemon's network thread are forwarded at least once a millisecond, so they can trail the data they relate to by about that much, while data itself moves as fast as the drive loops of the daemon and the application turn. switch-net hides the ordering consequences; [Using a Session directly](session.md#event-and-packet-ordering) spells them out for raw sessions.
 
 ## Delivery guarantees
 

@@ -22,7 +22,7 @@ The consumer reads all the rings. A producer that the operating system moves to 
 - a stream id, which identifies the producer's connection. A producer gets one when it connects and uses it on every message.
 - a sequence number, which counts the producer's messages on that stream: 0, 1, 2, and so on.
 
-The consumer delivers each stream's messages in sequence-number order, whichever rings they are in.
+The consumer delivers each stream's messages in sequence-number order, whichever rings they are in. That puts a stream back together after its producer moved between CPUs. It does not sort messages that a producer put into one ring in the wrong order; the [rules for producers](#rules-for-producers) below keep that from happening.
 
 The work splits across the crates like this. `ceph-ring` is the rings: `Reader` creates the shared file and reads it, `Writer` attaches to it and pushes. `ceph-fifo` wraps a `Reader` in a `Fifo` that sweeps the rings and puts each stream back in order. `ceph-control` is a small Unix-socket service that hands each connecting producer its stream id and the path of the shared file. `ceph-proto` holds the two message types that `ceph-control` and `ceph-fifo` exchange, and `ceph-rseq` holds the low-level push that `ceph-ring` uses.
 
@@ -42,12 +42,29 @@ The sequencer creates a `Reader` with 2 MiB rings and records of at most 4096 by
 
 The player calls `ceph_control::connect` on the sequencer's socket and gets a `ceph_control::Session` (cephalopod's own type, unrelated to junction's `Session`) holding its stream id and the shared file's path. `Writer::attach` maps the rings. Each `try_push` sends one message with the next sequence number, retrying while the ring is full. `try_finish(stream, count)` sends the end-of-stream record, numbered one past the last message. The player then waits until `session.closed()` is true, which happens when the sequencer has delivered the end record and closed the connection.
 
-To run them on Linux, start the sequencer with a socket path and a directory for the shared file, then run any number of players against the same socket:
+To run them on Linux, start the sequencer in one terminal with a socket path and a directory for the shared file. It runs until you stop it.
 
 ```text
 $ cargo run --release -p ceph-fifo --example sequencer -- /tmp/ceph.sock /dev/shm
-$ cargo run --release -p ceph-fifo --example player -- /tmp/ceph.sock 1000
 ```
+
+In a second terminal, run a player against the same socket, here with three messages. You can run any number of players, one after another or at the same time.
+
+```text
+$ cargo run --release -p ceph-fifo --example player -- /tmp/ceph.sock 3
+done
+```
+
+The sequencer prints one line per message, with the payload length (each payload is the sequence number as text), then `end` when the end record arrives:
+
+```text
+stream=1 seq=0 len=1
+stream=1 seq=1 len=1
+stream=1 seq=2 len=1
+end
+```
+
+The first player gets stream id 1 (the first stream place, 0, in the high 32 bits and the first unique id, 1, in the low 32 bits); later players get other ids.
 
 One player's run, from connecting to `closed()`, looks like this:
 
@@ -65,11 +82,21 @@ One player's run, from connecting to `closed()`, looks like this:
    | closed() == true                 |                          |
 ```
 
+## Rules for producers
+
+The library does not number messages for you: every push takes the stream id and the sequence number from the caller. The ordering described in the next section holds only if producers follow three rules.
+
+Each stream's messages have to be committed in sequence-number order. The simplest way is one pushing thread per stream. If several threads share one stream, they must serialize taking the next number and pushing it, so that no thread can take number 6 and push it while another thread holds 5 and has not pushed yet. Two pushes to a stream from different CPUs are fine; two pushes into the same CPU's ring in the wrong order are not, because the later number would stall that ring with the missing one queued behind it.
+
+Move to the next sequence number only after a push succeeds. When `try_push` returns `Full`, retry with the same number; a skipped number is a gap the consumer waits for.
+
+Sequence numbers stay below 2^63. The top bit of the number marks the end-of-stream record that `try_finish` writes.
+
 ## What a program can rely on
 
 ### Pushing and backpressure
 
-`try_push(payload, stream, seq)` returns `Ok(())` once the message is committed in a ring, where the consumer will find it. It returns `Err(PushError::Full)` when the ring of the CPU the thread is on has no room. That is a property of one CPU's ring, not of the whole set: the consumer frees space as it delivers. The usual response is to retry. It returns `Err(PushError::TooLarge)` when the payload is longer than the `max_record` the consumer chose; retrying will not help.
+`try_push(payload, stream, seq)` returns `Ok(())` once the message is committed in a ring, where the consumer will find it. It returns `Err(PushError::Full)` when the ring of the CPU the thread is on has no room. That is a property of one CPU's ring, not of the whole set. Space comes back after the consumer has delivered messages: it returns their space to the writers at the start of its next sweep. The usual response is to retry. It returns `Err(PushError::TooLarge)` when the payload is longer than the `max_record` the consumer chose; retrying will not help.
 
 `try_push_with_header(header, payload, stream, seq)` writes a short header and the payload as one record, so a caller can prefix its own fields without copying the payload into a new buffer first. The header must be a multiple of 8 bytes and at most 32 bytes, or the call panics, and `max_record` limits header and payload together. This is the call junction uses.
 
@@ -105,7 +132,7 @@ A producer has to keep its `ceph_control::Session` alive until `closed()` return
 
 ### Kicking a stream
 
-A gap that is never filled would stall rings forever. When a full sweep delivers nothing, discards nothing and finds no newly stalled ring, while some rings are stalled, the `Fifo` looks for a stream whose expected message is in none of the stalled rings. It drops that stream, which is called kicking it, and sends `Retire::Kicked` to the control service, which closes the producer's connection. Nothing more from that stream is delivered. The producer sees `closed()` become true even though it never finished.
+A gap that is never filled would stall rings forever. When a full sweep delivers nothing, discards nothing and finds no newly stalled ring, while some rings are stalled, the `Fifo` looks for a stream whose expected message is in none of the stalled rings. It drops that stream, which is called kicking it, and sends `Retire::Kicked` to the control service, which closes the producer's connection. If every expected message is present somewhere, a producer committed its own messages out of order within a ring, and the `Fifo` kicks the first stalled stream. Nothing more from a kicked stream is delivered. The producer sees `closed()` become true even though it never finished.
 
 In junction, a kick ends the application's session; [Closing sockets and ending a session](../junction/closing.md) says what the application sees.
 
@@ -121,7 +148,7 @@ Both sides must trust each other: the consumer reads layout and lengths straight
 
 A thread can be interrupted or moved to another CPU at any instruction, including halfway through writing a record into "its" ring. cephalopod handles that with a Linux feature called restartable sequences (rseq). The push runs as a short critical section registered with the kernel: if the kernel preempts the thread or moves it to another CPU before the section finishes, it sends the thread to an abort path instead of resuming in the middle. The half-written record was never committed, so the push simply starts again, now on the new CPU's ring.
 
-A record becomes visible to the consumer through a single store at the end of the section, which writes the record's tag word; until then the consumer ignores whatever bytes are there. That one store is the commit. The consumer only reads the rings and moves its own read positions, which it publishes for the writers once per sweep. It never writes into a ring. `ceph-rseq` contains this critical section and the record layout; nothing outside `ceph-ring` calls it.
+A record becomes visible to the consumer only when its push completes; until then the consumer ignores whatever bytes are there. The consumer only reads the rings and never writes into them. `ceph-rseq` contains this critical section and the record layout; nothing outside `ceph-ring` calls it.
 
 ## Platforms
 

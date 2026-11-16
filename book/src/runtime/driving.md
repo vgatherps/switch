@@ -33,28 +33,31 @@ The `PollReport` that `poll` returns has two fields. `tasks_polled` counts how m
 ```text
  poll(tick)
    |
-   |-- tick lower than the last accepted tick?  -> Err(TimeRegressed), nothing changes
    |-- runtime shut down or panicked?           -> Err(Closed) / Err(Panicked)
+   |-- tick lower than the last accepted tick?  -> Err(TimeRegressed), nothing changes
    |
-   |-- finish the pass that request_turn() cut short last time, if any
    |-- deliver wakes that other threads queued in the mailbox
+   |-- requeue the tasks that yielded during the last poll
    |-- move the tick forward; every sleep whose deadline <= tick wakes its task
    |
-   |   pass 1: tasks woken or spawned since the last poll,
-   |           then tasks that yielded during the last poll,
-   |           then tasks whose sleep just expired
+   |-- finish the pass that request_turn() cut short last time, if any
+   |   pass 1: tasks woken or spawned since the last poll, then the yielded
+   |           tasks, then the tasks whose sleep just expired
    |   pass 2: tasks woken or spawned during pass 1
    |   pass 3: ...
-   |   (a new pass starts only while fewer than 1024 task polls were made)
+   |   (stop when no task is ready, when 1024 task polls were made,
+   |    or right after a task calls request_turn())
    |
    '-- return PollReport { tasks_polled, live_tasks }
 ```
+
+The tick moves forward before any task runs, so every task in this poll, including one left over from a cut-short pass, sees the new tick.
 
 Each pass takes the set of ready tasks as it stands when the pass starts, and runs each one until it returns `Pending` or finishes. If a running task wakes or spawns another task, that task waits for the next pass of the same poll. Passes continue until no task is ready.
 
 The 1024 limit keeps one poll from running forever when tasks keep waking each other. It is checked between passes: a pass that has started always finishes, so one poll can make somewhat more than 1024 task polls. Work left over when the limit stops the poll is not lost; it runs in the next poll.
 
-Calling `poll` again while a poll is running, for example from inside a task that somehow reaches the `Runtime`, panics.
+Calling `poll` from inside a task of the same runtime panics.
 
 ## Ticks
 
@@ -62,19 +65,32 @@ The tick is the only clock the runtime has. You give it a starting tick in `Runt
 
 The rule for ticks is simple: they must never go backwards. A tick equal to the last one is fine; the runtime just has no new timers to fire. A tick lower than the last accepted one makes `poll` return `Err(RuntimeError::TimeRegressed { current, supplied })`, where `current` is the runtime's tick and `supplied` the one you passed. Nothing else happens: no task runs and no state changes, so the loop can pass a correct tick next time.
 
-The unit is yours. Tests often use small numbers, as on this page. Real programs read a monotonic clock. Once a program uses [`switch_net::within`](../net/timeouts.md) or sleeps measured in `Duration`s, its ticks must be nanoseconds, because those functions turn a `Duration` into ticks by counting nanoseconds. Every program in this repository that touches the network passes nanoseconds since a `std::time::Instant` taken at startup. [The drive loop](../net/drive-loop.md) shows how one clock sample gives both the runtime's tick and the network stack's time.
+The unit is yours. Tests often use small numbers, as on this page. Real programs read a monotonic clock. Once a program uses [`switch_net::within`](../net/timeouts.md) or sleeps measured in `Duration`s, its ticks must be nanoseconds, because those functions turn a `Duration` into ticks by counting nanoseconds. [The drive loop](../net/drive-loop.md) shows how one clock sample gives both the runtime's tick and the network stack's time.
 
 ## Tasks woken before a poll run in it
 
 Anything that wakes or spawns a task between two polls is picked up by the next poll. This is how the network fits in: the loop first moves packets, which wakes the tasks waiting on them, and then polls, which runs those tasks.
 
-The test in `switch/examples/manual_loop.rs` shows the rule with a stand-in for the network, an `EventQueue` that spawns one task per pending event:
+In `switch/examples/manual_loop.rs`, `EventQueue` stands in for the network: `poll_nonblocking` spawns one task for each event waiting in it.
 
 ```rust,ignore
 {{#include ../../../switch/examples/manual_loop.rs:events_before_poll}}
 ```
 
 Two events are dispatched before the first poll, and that poll runs both tasks once. With no new events, the second poll has nothing to do and returns an empty report.
+
+The example's `main` drives the same queue together with a sleeping task (shown on [Time and sleeping](time.md)). Run it with `cargo run -p switch --example manual_loop`:
+
+```text
+first event
+tick 100: PollReport { tasks_polled: 2, live_tasks: 1 }
+tick 100: PollReport { tasks_polled: 0, live_tasks: 1 }
+event at deadline
+deadline reached
+tick 110: PollReport { tasks_polled: 2, live_tasks: 0 }
+```
+
+The event pushed before the third poll runs in that poll, together with the task whose sleep reached its deadline.
 
 The opposite is also true. Work your loop does *after* a poll is not seen by any task until the following poll.
 
@@ -106,11 +122,20 @@ Here is a complete loop that runs tasks against a real clock, from `switch/examp
 {{#include ../../../switch/examples/clock_loop.rs:loop}}
 ```
 
-The tick is the time since `start` in nanoseconds, read once per pass. After each poll the loop sleeps for 100 µs. That sleep is the loop's *idle strategy*, and it is up to you. There are two shapes in this repository.
+Run it with `cargo run -p switch --example clock_loop`. It prints:
 
-*Busy polling* goes straight back to the top of the loop. The thread never sleeps, so a woken task runs within one loop pass and a timer fires on the first poll at or after its deadline. This is what latency-sensitive programs do, on a CPU set aside for the loop (see [The pinned CPU and helper threads](../nic/cpus.md)). The benchmark host in `switch-bench` works this way: each pass turns the network and polls the runtime, with no sleep.
+```text
+sum = 49995000
+2 ms passed
+```
 
-*Sleeping when idle* checks whether the last pass did anything and, if not, sleeps the thread for a short fixed time. `switch-binance-feed` sleeps 1 ms after a pass where nothing moved:
+In this run, the sum's ten slices, one per poll, finished before the other task's 2 ms were up.
+
+The tick is the time since `start` in nanoseconds, read once each time through the loop. After each poll the loop sleeps for 100 µs. That sleep is the loop's *idle strategy*, and it is up to you. There are two shapes in this repository.
+
+*Busy polling* goes straight back to the top of the loop. The thread never sleeps, so a woken task runs usually the next time through the loop, and a timer fires on the first poll at or after its deadline. This is what latency-sensitive programs do, on a CPU set aside for the loop (see [The pinned CPU and helper threads](../nic/cpus.md)). The benchmark tool `switch-bench` ([Measuring](../measuring/index.md)) works this way: each time through its loop it turns the network and polls the runtime, with no sleep.
+
+*Sleeping when idle* checks whether the last time through the loop did anything and, if not, sleeps the thread for a short fixed time. `switch-binance-feed`, the market-data feed walked through in [Walkthrough: a market-data feed](../protocols/binance-feed.md), sleeps 1 ms after a time through its loop where nothing moved:
 
 ```rust,ignore
 if !moved {

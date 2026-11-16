@@ -1,6 +1,6 @@
 # UDP sockets
 
-A `UdpSocket` sends and receives datagrams on one local port. It is bound with `handle.udp_bind(config)` ([Opening sockets](opening.md#binding-udp)) and, like a [TCP stream](tcp.md), splits into a receive half `UdpRx` and a send half `UdpTx`. This page covers receiving, sending, which send errors to retry, and what happens when datagrams arrive faster than you read them.
+A `UdpSocket` sends and receives datagrams on one local port. It is bound with `handle.udp_bind(config)` ([Opening sockets](opening.md#binding-udp)) and, like a [TCP stream](tcp.md), splits into a receive half `UdpRx` and a send half `UdpTx`. Receiving never fails; sending fails in a few ways, two of which you retry.
 
 ## Receive
 
@@ -15,13 +15,13 @@ Two errors are temporary:
 - `Full`: the Stack cannot take the datagram right now, because its queue of outgoing packets is full or no frame is free for a copy. It clears after a turn.
 - `NeighborPending`: the Stack has not yet learned the destination's hardware address (by ARP). It clears once a later turn receives the ARP reply.
 
-The others mean the send cannot succeed as it stands: `NoRoute`, `Unaddressable`, `TooLarge`, `PeerMismatch`, `InvalidState`, `Foreign`. switch-bench's UDP echo copies each datagram into a fresh frame, drops the datagram, and retries the two temporary errors, yielding to the drive loop between tries:
+The others mean the send cannot succeed as it stands: `NoRoute`, `Unaddressable`, `TooLarge`, `InvalidState`, `Foreign`. switch-bench's UDP echo copies each datagram into a fresh frame, drops the datagram, and retries the two temporary errors, yielding to the drive loop between tries:
 
 ```rust,ignore
 {{#include ../../../switch-bench/src/serve.rs:echo_datagrams}}
 ```
 
-`switch::yield_now()` lets the task run again in the next poll, after the drive loop has turned the network.
+`switch::yield_now()` lets the task run again in the next poll, after the drive loop has turned the network. A client that starts the conversation does the same with a destination it knows: `tx.send(Some(IpEndpoint::new(addr.into(), port)), frame)`.
 
 ## When a send copies
 
@@ -33,13 +33,13 @@ On the junction backend every send copies the bytes into the send ring to the da
 
 ## Receive queue overflow
 
-`UdpConfig::rx_queue` is the most datagrams a socket holds, counting both those waiting for `recv` and those your code still holds. On the local backend, a datagram that arrives when the queue is full is dropped and counted. `tx.stats()` returns `UdpSocketStats`, whose `rx_dropped_full` field is that count. `stats()` borrows the whole `Net`, so do not call it in a hot path.
+On the local backend, `UdpConfig::rx_queue` is the most datagrams a socket holds, counting both those waiting for `recv` and those your code still holds. There, a datagram that arrives when the queue is full is dropped and counted. `tx.stats()` returns `UdpSocketStats`, whose `rx_dropped_full` field is that count. `stats()` borrows the whole `Net`, so do not call it in a hot path.
 
 ## On the junction backend
 
 The daemon runs the Stack, and a few things look different from the application:
 
-- The daemon enforces the receive queue limit. `stats()` always returns zeros.
+- The daemon applies `rx_queue` to datagrams waiting in its own socket. Datagrams your code holds count against the session's receive ring instead ([Frames](frames.md#what-holding-a-frame-costs)). `stats()` returns zeros.
 - A datagram is handed to the daemon as soon as `send` copies it into the send ring. If the daemon then cannot route it, or the neighbor is not resolved, or the destination is not addressable, it drops the datagram; `send` never returns `NoRoute`, `NeighborPending` or `Unaddressable` on this backend. `Full` means the send ring is full.
 - After the session with the daemon is lost, `recv` keeps waiting; it does not return an error. Watch the drive loop's turn error instead ([When the daemon goes away](errors.md#when-the-daemon-goes-away)).
 

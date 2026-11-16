@@ -47,33 +47,12 @@ A task's destructor may run code, and that code runs during shutdown. It must no
 
 Tasks own sockets. A socket that lives inside a parked task's future stays open until that task is dropped. Closing the network, as [Shutting down cleanly](../net/shutdown.md) describes, requires every socket to be gone first, so the runtime has to be shut down before the network is closed.
 
-The benchmark host in `switch-bench` does exactly that in its `close` method:
-
-```rust,ignore
-/// Drops every task, then closes the Port; fails if a socket or frame outlived them.
-pub fn close(mut self) -> Result<(), String> {
-    self.rt.shutdown();
-```
-
-Shutting down drops every task, and with them every socket they held; after that, the network can be taken apart. [Shutting down cleanly](../net/shutdown.md) gives the full order for each backend.
+The first network program does it in this order: `rt.shutdown()`, then `net.into_stack()`, then `try_close` ([Teardown](../getting-started/first-connection.md#teardown)). [Shutting down cleanly](../net/shutdown.md) gives the full order for each backend.
 
 ## How task storage works
 
-You do not need this section to use the runtime, but it explains two of its rules: there is no limit on the number of tasks, and a program should create one runtime and keep it for the life of the process.
+Task storage grows as tasks are spawned, so the number of live tasks has no limit. Each task's future must fit in a 64 KiB block; a bigger one is rejected at compile time.
 
-A task's future is not allocated on its own. Each task function has its own *task pool* in the runtime, made of 64 KiB blocks. (This is unrelated to the packet-buffer pools of the network chapters.) A block is divided into equal *slots*, each big enough for one future of that function. Spawning a task puts its future in a free slot, where it stays without moving until the task ends.
-
-```text
- runtime
-  |-- task pool for hello()     [ block 64 KiB: slot 0 | slot 1 | ... ]
-  |-- task pool for report()    [ block 64 KiB: slot 0 | ... ] [ block ... ]
-  '-- task pool for show::<u8>() [ block 64 KiB: ... ]
-                                  (each instantiation of a generic task
-                                   function has its own task pool)
-```
-
-A task pool always fills its lowest free slot first; the `switch-depot` crate keeps track of which slot numbers are free. When every slot in a task pool's blocks is taken, it adds another block. That is why the number of live tasks has no limit, and why a future bigger than a block cannot exist and is rejected at compile time.
-
-Blocks are never freed. When a task ends, its slot is reused by the next task of the same function, but the block stays. Even when a runtime is dropped, its blocks are deliberately left allocated: a stale waker that still points into them then points at valid memory, and waking it does nothing. The cost is that each runtime's peak task memory stays allocated until the process exits. A program that creates and drops many runtimes grows its memory every time. The intended shape is a runtime created at startup and kept until the process ends.
+Memory for tasks is never returned, not even after the runtime is dropped. A program that creates and drops many runtimes grows its memory every time, so create one runtime at startup and keep it until the process ends.
 
 This is the end of the runtime chapter. The next part puts it to work: [Sockets with switch-net](../net/index.md) gives tasks TCP and UDP sockets, and [The drive loop](../net/drive-loop.md) adds the network to the loop you have been writing.

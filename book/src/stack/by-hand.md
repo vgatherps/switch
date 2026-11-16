@@ -14,7 +14,7 @@ DPDK starts with one call per process, `Eal::init`. EAL (DPDK's environment abst
 {{#include ../../../conduit/crates/switch-tap-echo/src/driver.rs:only_allowed_cpu}}
 ```
 
-The arguments are an ordinary command line, starting with a program name. The harness gives DPDK's thread number 7 that CPU with `--lcores=7@<cpu>` and makes thread 7 the main thread with `--main-lcore=7`. A tap device needs no PCI devices and no hugepages, so it passes `--no-pci` and `--no-huge` with a memory size (`-m`) large enough for its pools:
+The arguments are an ordinary command line, starting with a program name. The harness gives DPDK's thread number 7 that CPU with `--lcores=7@<cpu>` and makes thread 7 the main thread with `--main-lcore=7`. Any lcore number works; `open` uses 0 (`--lcores=0@<cpu>`). A tap device needs no PCI devices and no hugepages, so it passes `--no-pci` and `--no-huge` with a memory size (`-m`) large enough for its pools:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-tap-echo/src/driver.rs:eal_init}}
@@ -39,7 +39,7 @@ A `PortConfig` describes the one receive queue and one transmit queue the Stack 
 | Field | Meaning |
 |---|---|
 | `port_id` | The DPDK port id from step 2. |
-| `mtu` | The IP MTU. Must be inside the device's MTU range. |
+| `mtu` | The IP MTU. Must be inside the device's MTU range, and at least 88 for `Stack::new` to accept the port. |
 | `rx_descriptors`, `tx_descriptors` | Slots in the NIC's receive and transmit rings. Must be positive. |
 | `rx_burst`, `tx_burst` | Most packets taken from or offered to the driver per call. Must be positive. |
 | `queue_socket` | NUMA node for the queues; -1 for any. |
@@ -48,7 +48,7 @@ A `PortConfig` describes the one receive queue and one transmit queue the Stack 
 
 A `PoolConfig` names the pool (`name`, a C string unique in the process), gives its `count` of packet buffers, the per-CPU `cache_size`, the `data_room_size` of each buffer in bytes including DPDK's headroom (`RTE_PKTMBUF_HEADROOM`), and the NUMA `socket_id` (-1 for any).
 
-The data room must hold a whole packet in one buffer. `Port::open` checks:
+The data room must hold a whole packet in one buffer, because the Port never chains buffers together. `Port::open` checks:
 
 - RX pool: at least headroom + (MTU + 26) rounded up to a multiple of 1024.
 - TX pool and frame pool: at least headroom + MTU + 14.
@@ -85,10 +85,10 @@ A failure returns `PortOpenError`, with three fields. `cause` is the `PortError`
 
 | Field | Meaning |
 |---|---|
-| `ethernet` | The port's MAC address. Must be unicast and nonzero. |
+| `ethernet` | The MAC address the Stack sends from. Must be unicast and nonzero. Use the device's own, `EthernetAddress(device_info(&eal, port_id)?.mac)`, as `open` does. |
 | `ipv4` | Our address and subnet, as an `Ipv4Cidr`. |
 | `gateway` | The default route for destinations outside the subnet, or `None` for on-link peers only. Must be a unicast address inside the subnet other than ours, the network address or the broadcast address. |
-| `paths` | Per-destination path MTUs (`PathMtu { prefix, mtu }`), longest prefix wins. TCP connections cap their MSS at path MTU − 40. |
+| `paths` | Per-destination path MTUs (`PathMtu { prefix, mtu }`), longest prefix wins. Each must be at least 88. TCP connections cap their MSS at path MTU − 40. |
 | `owned_ipv4` | Extra addresses the Stack answers ARP for and accepts traffic to. Routing, the subnet broadcast and the default source address stay with `ipv4`. |
 | `random_seed` | Seed for the Stack's random numbers, including TCP initial sequence numbers. Use `os_random_seed()` in production. |
 | `neighbor_capacity` | ARP cache entries; `DEFAULT_NEIGHBOR_CAPACITY` is 256. Must be positive. |
@@ -101,25 +101,27 @@ These are the same rules the [network config file](../nic/config.md) enforces; `
 {{#include ../../../conduit/crates/switch-tap-echo/src/driver.rs:stack_config}}
 ```
 
+The harness uses a fixed MAC address of its own.
+
 The start time sets the origin of the Stack's clock. The harness starts the Stack at `Instant::ZERO` and takes a `std::time::Instant` just before, so every later time is the microseconds elapsed since then:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-tap-echo/src/driver.rs:stack_new}}
 ```
 
-A refused config gives back the `Port` with a `StackError`: `InvalidConfig(reason)` for a rule above (or a start time before zero), `IpMtuBelowIpv4Minimum` for an IP MTU below 68, or one of the `*PoolTooSmall` errors from the pool checks. Close the returned port as in step 6.
+A refused config gives back the `Port` with a `StackError`: `InvalidConfig(reason)` for a rule above (or a start time before zero), `IpMtuBelowIpv4Minimum` for an IP MTU below 68, `InvalidConfig` for an IP MTU from 68 to 87 (88 is the smallest MTU that carries a 48-byte TCP segment, the same floor the config file enforces), or one of the `*PoolTooSmall` errors from the pool checks. Close the returned port as in step 6.
 
 From here the program adds sockets and runs its [drive loop](drive-loop.md).
 
 ## 6. Close in order
 
-Shutdown runs the lifecycle backwards. Drop every frame and datagram your code holds. Call `stack.into_port()`, which drops the sockets and every packet still queued inside the Stack and returns the `Port`. Call `port.try_close()`. Only when it returns `Ok` is the device closed and every packet buffer back, so only then remove a test device you created:
+Shutdown runs the lifecycle backwards. Drop every frame and datagram your code holds. Call `stack.into_port()`, which drops the sockets and every packet still queued inside the Stack and returns the `Port`. Call `port.try_close()`. It stops and closes the device, then frees its pools once every packet buffer is back. Only when it returns `Ok` is all of that done, so only then remove a test device you created:
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-tap-echo/src/driver.rs:teardown}}
 ```
 
-`PortError::OutstandingBuffers { rx, tx, frame }` means something still holds packet buffers from those pools. The `Port` comes back with the error, so you can drop what is held and call `try_close` again. If a `Port` is dropped while buffers are still out, it keeps its pool memory for the rest of the process and prints a line to stderr saying how many buffers were in use.
+`PortError::OutstandingBuffers { rx, tx, frame }` means the device is closed but something still holds packet buffers from those pools. The `Port` comes back with the error, so you can drop what is held and call `try_close` again; the port does no more network work either way. If a `Port` is dropped while buffers are still out, it keeps its pool memory for the rest of the process and prints a line to stderr saying how many buffers were in use.
 
 EAL itself is never torn down. It lives until the process exits.
 

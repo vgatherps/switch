@@ -5,8 +5,8 @@
 
 # Getting started
 
-- [Setting up a build environment](getting-started/environment.md)
 - [Your first task](getting-started/first-task.md)
+- [Setting up a build environment](getting-started/environment.md)
 - [Your first network program](getting-started/first-connection.md)
 
 # The switch runtime
@@ -44,15 +44,15 @@
 # Owning a NIC
 
 - [Owning a NIC](nic/index.md)
+    - [Preparing a Linux machine](nic/host-setup.md)
+    - [Running on EC2](nic/ec2.md)
     - [The network config file](nic/config.md)
     - [switch-netconf: check, discover, bind, unbind](nic/netconf-tool.md)
+    - [switch-nic: checking a NIC and serving load](nic/switch-nic.md)
     - [Opening the NIC from code](nic/open.md)
     - [Packet-buffer pools](nic/pools.md)
     - [The pinned CPU and helper threads](nic/cpus.md)
     - [Offloads and hardware timestamps](nic/offloads.md)
-    - [Preparing a Linux machine](nic/host-setup.md)
-    - [Running on EC2](nic/ec2.md)
-    - [switch-nic: checking a NIC and serving load](nic/switch-nic.md)
     - [When the NIC won't open](nic/troubleshooting.md)
 
 # Sharing a NIC: the junction daemon

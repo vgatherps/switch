@@ -24,15 +24,21 @@ A oneshot channel carries exactly one value from one place to one task. `switch:
 {{#include ../../../switch/examples/oneshot.rs:run}}
 ```
 
+Run it with `cargo run -p switch --example oneshot`. It prints:
+
+```text
+received 42
+```
+
 The receiver is a future that resolves to `Result<T, Canceled>`. It resolves to `Ok(value)` once the value is sent; sending wakes the receiving task. If the sender is dropped without sending, the receiver resolves to `Err(Canceled)`.
 
 `send` takes the sender by value and returns `Result<(), T>`. If the receiver has already been dropped, nobody will ever read the value, so `send` hands it back as `Err(value)`.
 
-The sender can be used from anywhere on the runtime's thread: from a task, or from the loop itself between polls. A common use of the second kind is a stop signal. `switch-binance-feed`'s loop holds a `Sender<()>` and sends on it when the program should stop; the feed task races its work against the receiver (see [Timeouts and racing futures](../net/timeouts.md#racing-a-receive-against-a-stop-signal)).
+The sender can be used from anywhere on the runtime's thread: from a task, or from the loop itself between polls. A common use of the second kind is a stop signal. `switch-binance-feed`, the market-data feed walked through in [Walkthrough: a market-data feed](../protocols/binance-feed.md), keeps a `Sender<()>` in its loop and sends on it when the program should stop; the feed task races its work against the receiver (see [Timeouts and racing futures](../net/timeouts.md#racing-a-receive-against-a-stop-signal)).
 
 The receiver must be awaited by a switch task, because it parks that task while it waits. Polled anywhere else while the sender still exists, it panics. Once the value was sent or the sender dropped, the outcome is settled and any poller gets it.
 
-A channel costs one heap allocation. Neither half is `Send` or `Sync`; a oneshot channel connects tasks on one runtime, not threads.
+A channel costs one heap allocation. Neither half is `Send` or `Sync`: a oneshot channel connects tasks on one thread, which may belong to different runtimes, not tasks on different threads.
 
 ## Waiting on another task
 
@@ -46,7 +52,7 @@ The futures in this book's libraries (sockets in switch-net, oneshot channels, j
 
 `StoredWaker::new` panics if the `Context` does not come from a switch task. Like the tasks themselves, a `StoredWaker` is neither `Send` nor `Sync`.
 
-A stored waker may outlive the task it points to. Waking it is still safe. If no task has taken the old task's place in the runtime's storage, the wake does nothing; if a newer task has ([How task storage works](errors.md#how-task-storage-works) explains the reuse), that task gets at most one extra poll.
+A stored waker may outlive the task it points to. Waking it is still safe. If no task has taken the old task's place in the runtime's storage, the wake does nothing; if a newer task has, that task gets at most one extra poll.
 
 ## Waking a task from another thread
 
@@ -58,7 +64,13 @@ Sometimes a task waits for something another thread produces: a value computed o
 {{#include ../../../switch/examples/remote_wake.rs:task}}
 ```
 
-The task publishes its waker each time it is polled and parks until the shared value is set. In `main`, the first poll runs the task once, so its waker exists. Then another thread sets the value and wakes the task:
+On its first poll the task publishes a `RemoteWaker`, then parks until the shared value is set. `main` creates the runtime and the shared values, spawns the task and polls once, so the waker exists:
+
+```rust,ignore
+{{#include ../../../switch/examples/remote_wake.rs:setup}}
+```
+
+Then another thread sets the value and wakes the task:
 
 ```rust,ignore
 {{#include ../../../switch/examples/remote_wake.rs:thread}}
@@ -68,6 +80,12 @@ The loop keeps polling until the task has finished:
 
 ```rust,ignore
 {{#include ../../../switch/examples/remote_wake.rs:loop}}
+```
+
+Run it with `cargo run -p switch --example remote_wake`. It prints:
+
+```text
+woken with 7
 ```
 
 A wake from another thread does not run anything on that thread, and it does not interrupt the loop. It puts the task into the runtime's *mailbox*, and the runtime empties the mailbox at the start of its next poll:
@@ -83,9 +101,23 @@ A wake from another thread does not run anything on that thread, and it does not
                                             task runs, sees 7, finishes
 ```
 
-So the delay before the task runs is however long your loop takes to reach its next poll. A busy-polling loop picks the wake up on its next pass; a loop that sleeps when idle picks it up after its sleep.
+So the delay before the task runs is however long your loop takes to reach its next poll. A busy-polling loop picks the wake up the next time through the loop; a loop that sleeps when idle picks it up after its sleep.
 
 On the task's own thread, `RemoteWaker::wake` is an ordinary wake. After the runtime has shut down, a wake from any thread is dropped. As with `StoredWaker`, a stale handle at most gives whichever task took the old task's place one extra poll.
+
+Every way of waking a task ends in the same set of ready tasks. Wakes from the runtime's own thread take effect at once; wakes from other threads wait in the mailbox until the next poll:
+
+```text
+ same thread                               other threads
+ -----------                               -------------
+ a std Waker (any future's wake)  --.
+ a StoredWaker (switch-net sockets) -+
+ a Sleep reaching its deadline  ----+--> ready tasks --> run by a poll
+ a oneshot send or drop  ----------'          ^
+                                              |
+ RemoteWaker::wake() on another thread --> mailbox, emptied at the
+                                           start of the next poll
+```
 
 ## The thread rules
 

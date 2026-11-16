@@ -1,6 +1,6 @@
 # Connecting an application through switch-net
 
-[Your first network program](../getting-started/first-connection.md) opened a NIC and ran one task that connected to a server, sent a line and printed the reply. This page runs the same task through the daemon you started in [Running switch-junctiond](running.md). The task does not change at all. Only the code before the drive loop and after it is different.
+[Your first network program](../getting-started/first-connection.md) opened a NIC and ran one task that connected to a server, sent a line and printed the reply. This page runs the same task through the daemon from [Running switch-junctiond](running.md), started on a tap device in [Running it](#running-it) below. The task does not change at all. Only the code before the drive loop and after it is different.
 
 ## What changes
 
@@ -27,7 +27,7 @@ The program no longer needs a network config file, hugepages or DPDK setup at ru
 
 `Session::connect` takes the path of the daemon's `control.sock` and the number of sockets this application wants. It connects to the daemon, introduces itself, and returns once the daemon accepts the session. If the daemon is still opening its NIC, the call waits until it is done (see [Knowing it is ready](running.md#knowing-it-is-ready)).
 
-The session reports two sizes the daemon chose. `frame_capacity()` is the largest packet payload the daemon will carry, its MTU minus 28 bytes of IP and UDP headers. `max_record()` is the largest single send the session accepts, header included. The example turns the frame capacity back into an MTU to size its send frames.
+The session reports two sizes the daemon chose. `frame_capacity()` is the largest UDP payload that fits the daemon's MTU (MTU − 28); switch-net makes its send frames this size. `max_record()` is the largest single send the session accepts, header included. The example turns the frame capacity back into an MTU to size its frame pool.
 
 `Net::remote` wraps the session in a `Net`. From here on the program uses `net.handle()`, `switch_net::round` and its tasks exactly as before.
 
@@ -35,7 +35,7 @@ When the connect fails, the error says why:
 
 | Error | Meaning |
 |---|---|
-| `ConnectError::Io(..)` | the socket could not be reached (wrong path, no daemon, permissions), or the daemon closed the connection before answering, for example because it exited during startup |
+| `ConnectError::Io(..)` | the socket could not be reached (wrong path, no daemon, permissions), the daemon closed the connection before answering (for example because it exited during startup), or the ring files could not be opened |
 | `ConnectError::Rejected(BadMaxSockets)` | `max_sockets` was 0 or above the daemon's `--max-sockets` |
 | `ConnectError::Rejected(SessionsFull)` | all `--max-sessions` sessions are in use. This can last a moment after another session ends, while the daemon releases its resources; retry |
 | `ConnectError::Rejected(HostResources)` | the daemon could not create this session's receive ring |
@@ -44,9 +44,9 @@ When the connect fails, the error says why:
 
 ## Choosing `max_sockets` and `tx_frames`
 
-`max_sockets` is the size of this session's socket table. Every TCP connection, every listener and every UDP socket the application has open at once takes one entry, and an entry is reused only after the daemon has finished with the old socket. If the table is full, opening another socket fails with `Error::SocketsFull` on the first poll. The repository's tools set it to the number of sockets they open (one per connection plus one per listener).
+`max_sockets` is the size of this session's socket table. Every TCP connection, every listener and every UDP socket the application has open at once takes one entry, and an entry is reused only after the daemon has finished with the old socket. If the table is full, opening another socket fails with `Error::SocketsFull` on the first poll. `switch-bench` sets it to the number of sockets it opens (one per connection plus one per listener).
 
-`RemoteConfig.tx_frames` is the number of send frames in the application's own frame pool. Each is `frame_capacity` bytes. A task's `handle.tx_frame().await` takes one from this pool and waits while the pool is empty. On the junction backend a frame returns to the pool as soon as `try_send` has copied its bytes into the send ring, so frames are not held while the peer acknowledges. The repository's programs size the pool the same way they size the local frame pool: `tcp::tx_mbuf_budget(&config, mtu)` for one connection, or that times the number of connections plus 64 for the benchmark server.
+`RemoteConfig.tx_frames` is the number of send frames in the application's own frame pool. Each is `frame_capacity` bytes. A task's `handle.tx_frame().await` takes one from this pool and waits while the pool is empty. On the junction backend, once `try_send` has copied a frame's bytes into the send ring, the frame you passed returns to your pool, unless you kept a clone or slice of it; frames are not held while the peer acknowledges. This example sizes the pool with `tcp::tx_mbuf_budget(&config, mtu)` for its one connection; `switch-bench` uses that times the number of connections, plus 64.
 
 ## Threads and CPUs
 
@@ -62,22 +62,36 @@ A `Session`, like everything in switch-net, belongs to the thread that created i
 
 The order matches the local program. Shut the runtime down first so every task, socket and frame is dropped. Then `net.into_session()` hands back the session; it returns `Err(net)` while any `NetHandle`, socket half or frame-holding future is still alive.
 
-Then finish the session. `finish()` tells the daemon this application is leaving on purpose. It can return an error when the request cannot be queued yet; nothing was sent in that case, so poll and call it again. After it succeeds, keep polling until `closed()` returns true, which means the daemon has confirmed. Open TCP connections then close with a normal FIN. The deadline guards against a daemon that never answers.
+Then finish the session. `finish()` tells the daemon this application is leaving on purpose. It can return an error when the request cannot be queued yet; the end request was not queued in that case, so poll and call it again. After it succeeds, keep polling until `closed()` returns true, which means the daemon has confirmed. Open TCP connections then close with a normal FIN. The deadline guards against a daemon that never answers.
 
 Skipping this step and simply dropping the session counts as a crash: the daemon resets every socket the application still had. [Closing sockets and ending a session](closing.md) has the details, and [Shutting down cleanly](../net/shutdown.md#junction-backend) gives the teardown order for both backends side by side.
 
 ## Running it
 
-Start the daemon on the tap config from [Running switch-junctiond](running.md), which gives the daemon the address 10.77.0.2 on interface `jn0`. In the same container, with the daemon on CPU 2 and its control thread on CPU 0:
+The daemon needs CPUs of its own, so this walkthrough uses a container with four CPUs, 0 to 3: the daemon's control thread on CPU 0, its network thread on CPU 2 and the client on CPU 3. Start it like the container in [Setting up a build environment](../getting-started/environment.md), with `--cpuset-cpus=0-3`:
 
 ```sh
-sudo taskset -c 2 target/debug/switch-junctiond --config tap.json \
-    --dir /tmp/jn --control-cpus 0 &
+docker run --rm -it --init \
+    --cap-add NET_ADMIN --device /dev/net/tun \
+    --cpuset-cpus=0-3 \
+    -v "$PWD:/work" -w /work \
+    -v switch-cargo-registry:/usr/local/cargo/registry \
+    -v switch-linux-target:/work/target \
+    switch-dpdk-test:local bash
+```
+
+The container's shell runs as root, which the daemon and the tap device need. Save the tap config from [Running switch-junctiond](running.md) as `jn0.json` in `/work`; it gives the daemon the address 10.77.0.2 on interface `jn0`. Then build both programs, start the daemon, give the kernel side of `jn0` its address, start a one-shot server on the kernel side (the same one as in [Your first network program](../getting-started/first-connection.md)), and run the client:
+
+```sh
+cargo build --locked --release -p switch-junctiond --bins
+cargo build --locked --release -p switch-net --example tcp_client_junction
+
+taskset -c 2 target/release/switch-junctiond --config jn0.json --dir /tmp/jn --control-cpus 0 &
 until [ -S /tmp/jn/control.sock ] && ip link show jn0 >/dev/null 2>&1; do sleep 0.1; done
 ip addr add 10.77.0.1/24 dev jn0 && ip link set jn0 up
 
 python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-taskset -c 3 target/debug/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7000
+taskset -c 3 target/release/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7000
 ```
 
 The client prints the server's reply and then `session finished`:
@@ -86,6 +100,23 @@ The client prints the server's reply and then `session finished`:
 tick
 session finished
 ```
+
+Running the client again within about 10 seconds against the same server fails with `PortInUse`. The client closed the connection first, so the daemon's Stack keeps it, with local port 40000, in TCP's TIME-WAIT state for 10 seconds, and the new connection would use the same addresses and ports.
+
+## Two applications at once
+
+The daemon exists so that several programs can use one NIC. With the daemon still running, and at least 10 seconds after the first run (for the reason just given), start two one-shot servers and two clients, the second on CPU 1:
+
+```sh
+python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
+python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7001)); c, _ = s.accept(); c.recv(100); c.sendall(b"tock\n"); c.close()' &
+taskset -c 3 target/release/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7000 &
+first=$!
+taskset -c 1 target/release/examples/tcp_client_junction /tmp/jn/control.sock 10.77.0.1:7001
+wait $first
+```
+
+Each client prints its own reply and `session finished`. They are two sessions on one daemon, and because they run on different CPUs they write into different send rings. Both use local port 40000, which the example fixes, and the daemon has only one set of ports for all its applications; they can run side by side because they connect to different server ports. [What applications share](sharing.md#addresses-and-ports) explains this.
 
 Stop the daemon with `kill %1` (SIGTERM) when you are done.
 

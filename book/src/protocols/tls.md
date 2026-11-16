@@ -1,6 +1,6 @@
 # TLS without WebSocket
 
-Some services speak their own protocol over TLS, with no WebSocket in between. For those, use switch-tls directly: it gives you an encrypted byte stream over a switch-net TCP connection. The [previous page](ws-server.md) was about switch-ws as a server; this one is about the TLS client underneath it. It is the same TLS client that `wss://` connections use (see [Connecting to a wss:// server](wss-client.md)), so the configuration rules are the same: a `rustls::ClientConfig` that allows TLS 1.3 only.
+switch-tls is a TLS 1.3 client that gives you an encrypted byte stream over a switch-net TCP connection, for services that speak their own protocol over TLS with no WebSocket in between. It is the same TLS client that `wss://` connections use (see [Connecting to a wss:// server](wss-client.md)), so the configuration rules are the same: a `rustls::ClientConfig` that allows TLS 1.3 only. This page follows [Serving ws:// connections](ws-server.md).
 
 The API is lower level than switch-ws. You get the received plaintext as runs of bytes, not as messages, and you decide where one unit of your protocol ends.
 
@@ -16,9 +16,9 @@ pub async fn tls_connect(
 ) -> Result<Tls, Error>
 ```
 
-`tls_connect` takes a connected TCP stream and runs the TLS 1.3 handshake for `host`, which is the server name sent in the handshake and checked against the certificate. `min_plain` is the size of the largest piece of plaintext you will send as one TLS record; 0 counts as 1. Each frame must be able to carry one record of that size. If it cannot, because the socket's send buffer, the connection's MSS or the config's `max_fragment_size` is too small, `tls_connect` returns `Setup(SetupError::RoomTooSmall { room, need })` before it sends the ClientHello. Passing 1 is fine if you send through `send_bytes` (below), which splits data to fit.
+`tls_connect` takes a connected TCP stream and runs the TLS 1.3 handshake for `host`, which is the server name sent in the handshake and checked against the certificate. `min_plain` is the size of the largest piece of plaintext you will send as one TLS record; 0 counts as 1. Each frame must be able to carry one record of that size. How much one frame carries is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the config's `max_fragment_size` caps it further. If that is too small, `tls_connect` returns `Setup(SetupError::RoomTooSmall { room, need })` before it sends the ClientHello. Passing 1 is fine if you send through `send_bytes` (below), which splits data to fit.
 
-As with `wss://`, a failing handshake sends the TLS alert and a FIN and returns only after the server acknowledged them or the connection ended. Bound the connect with [`within`](../net/timeouts.md).
+As with `wss://`, a failing handshake sends the TLS alert and a FIN, best effort, and returns only after the server acknowledged them or the connection ended. Bound the connect with [`within`](../net/timeouts.md).
 
 The result is a `Tls` with three public fields:
 
@@ -69,6 +69,8 @@ pub async fn send_bytes<L: FrameTx>(lower: &mut L, bytes: &[u8]) -> Result<(), L
 
 ```rust,ignore
 if let Err(e) = send_bytes(&mut tls.tx, REQUEST).await {
+    return format!("send request: {e}");
+}
 ```
 
 Its error type is `switch_tls::TxError<switch_net::Error>`:
@@ -82,7 +84,7 @@ Its error type is `switch_tls::TxError<switch_net::Error>`:
 
 ## Closing
 
-`Tls::close().await` sends close_notify, then FIN, and returns once the server has acknowledged them or the connection has ended. After that the `Tls` can be dropped. Receiving still works while `close` waits. A server that never acknowledges keeps `close` waiting, so bound it.
+`Tls::close().await` sends close_notify, then FIN, and returns once the server has acknowledged them or the connection has ended. After that the `Tls` can be dropped. `close` does not read; data the server sends meanwhile stays queued in TCP. A server that never acknowledges keeps `close` waiting, so bound it.
 
 ## Errors
 
@@ -90,7 +92,7 @@ Its error type is `switch_tls::TxError<switch_net::Error>`:
 
 | Error | Meaning |
 |---|---|
-| `Tls(switch_tls::Error::Tls(e))` | The handshake or a received record failed (`e` is the rustls error). The alert and FIN have been delivered. |
+| `Tls(switch_tls::Error::Tls(e))` | The handshake or a received record failed (`e` is the rustls error). switch-tls sent the alert and FIN, best effort, and waited until the server acknowledged them or the connection ended. |
 | `Tls(switch_tls::Error::Truncated)` | The TCP stream ended without the server's close_notify. |
 | `Recv(e)` | TCP receive failed (for example, a reset). |
 | `Send(e)` | Sending failed; `e` is a `TxError` as above. |

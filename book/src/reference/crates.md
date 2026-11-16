@@ -2,13 +2,13 @@
 
 This page lists every package in the repository's Cargo workspace: what it is for, what kind of package it is, whether building it needs DPDK, and the chapter that explains it. "Needs DPDK" means the package links DPDK's C libraries, so it builds only on Linux with DPDK 25.11.3 installed, or in the Docker image ([Setting up a build environment](../getting-started/environment.md)).
 
-Each library's API reference is its rustdoc. Build and open it with:
+An application depends on `switch` and `switch-net`, and optionally on `switch-ws` or `switch-tls` for WebSocket and TLS and on `switch-junction` for the junction backend. Everything else here is a building block under those crates, a tool, a benchmark or test infrastructure. The [glossary](glossary.md) explains words such as the Stack, EAL, sockperf and memif.
+
+Each library's API reference is its rustdoc. Use the package name from the first column. Packages that need DPDK document only where DPDK is installed, as in the Docker container; `switch` documents anywhere:
 
 ```sh
-cargo doc --no-deps -p switch-net --open
+cargo doc --no-deps -p switch --open
 ```
-
-Use the package name from the first column. Packages that need DPDK document only where DPDK is installed, as in the Docker container.
 
 ## Writing applications
 
@@ -28,7 +28,7 @@ Use the package name from the first column. Packages that need DPDK document onl
 | `switch-netconf` | library and binary `switch-netconf` | no | The network config file: types, loading, checking, discovery, binding a NIC | [The network config file](../nic/config.md), [switch-netconf](../nic/netconf-tool.md) |
 | `switch-open` | library | yes | `switch_open::open`: from a network config file to a running Stack | [Opening the NIC from code](../nic/open.md) |
 | `dpdk-smoltcp` | library | yes | The Stack: TCP/IP over one NIC port on one thread, with `Eal` and `Port` | [Programming the Stack directly](../stack/index.md) |
-| `switch-buffer` | library | yes | Packet buffers and pools under the NIC port; users see only `PoolConfig` | [Packet-buffer pools](../nic/pools.md) |
+| `switch-buffer` | library; test-only binary `profile` (feature `testing`) | yes | Packet buffers and pools under the NIC port; users see only `PoolConfig` | [Packet-buffer pools](../nic/pools.md) |
 | `switch-dpdk-sys` | library | yes | Bindings to DPDK 25.11.3, and `only_allowed_cpu` | [The pinned CPU and helper threads](../nic/cpus.md) |
 | `switch-nic` | binary `switch-nic` | yes | Checks a NIC (`info`), answers sockperf clients, runs the market-data feed on real hardware | [switch-nic](../nic/switch-nic.md) |
 | `switch-sockperf-wire` | library | no | sockperf message framing used by `switch-nic` | [switch-nic](../nic/switch-nic.md) |
@@ -59,9 +59,9 @@ Use the package name from the first column. Packages that need DPDK document onl
 | Package | Kind | Needs DPDK | What it is | Chapter |
 |---|---|---|---|---|
 | `switch-binance-feed` | library and binary `switch-binance-feed` | yes | A `wss://` client of Binance's bookTicker stream that measures latency | [Walkthrough: a market-data feed](../protocols/binance-feed.md) |
-| `switch-ws-autobahn` | binary in `switch-ws` (feature `e2e`) | yes | WebSocket echo server for the Autobahn conformance suite | [Protocol conformance](../testing/conformance.md) |
+| `switch-ws-autobahn` | binary in `switch-ws` (feature `e2e`) | yes | Autobahn conformance driver: a `ws://` echo server in the `server` role, the switch-ws client in the `client` role | [Protocol conformance](../testing/conformance.md) |
 | `switch-bench` | binary `switch-bench`, and library | yes | Open-loop latency benchmark: `serve`, `gen`, `sweep`, `kernel-serve` | [Measuring latency under load](../measuring/index.md) |
-| `switch-memif-bench` | binary `switch-memif-bench` | yes | Throughput of two Stacks wired through DPDK shared memory | [switch-memif-bench](../measuring/memif.md) |
+| `switch-memif-bench` | library and binary `switch-memif-bench` | yes | Throughput of two Stacks wired through DPDK shared memory | [switch-memif-bench](../measuring/memif.md) |
 | `switch-test-support` | library | no | The `#[pinned_test]` attribute's runner | [Writing tests that use DPDK](../testing/writing-tests.md) |
 | `switch-test-support-macros` | proc-macro | no | The `#[pinned_test]` attribute; use it through `switch-test-support` | [Writing tests that use DPDK](../testing/writing-tests.md) |
 | `switch-test-kit` | library | yes | DPDK test fixtures: fake NICs, simulated wires, two-Stack pairs | [Writing tests that use DPDK](../testing/writing-tests.md) |

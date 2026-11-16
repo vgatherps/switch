@@ -1,6 +1,6 @@
 # When the NIC won't open
 
-This page lists the messages you can meet while preparing a machine and opening a card, with what each one means and what to do. The messages are quoted as the code prints them. In [`switch-nic`](switch-nic.md) output, errors from `open` appear after `switch-nic: error:`; in your own program they are the `Display` text of `OpenError`.
+This page closes the part. It collects the messages you can meet while preparing a machine and opening a card, with what each one means and what to do. The messages are quoted as the code prints them. In your own program, errors from `open` are the `Display` text of `OpenError`. [`switch-nic`](switch-nic.md) prints most of them unchanged after `switch-nic: error:`; where it prints its own wording, the table shows both forms.
 
 When something fails inside DPDK, its NIC driver usually writes the details to stderr. Always keep stderr when you run a program that opens a card.
 
@@ -16,13 +16,14 @@ When something fails inside DPDK, its NIC driver usually writes the details to s
 | `device lookup: "0000:00:06.0" was not found` | DPDK has no device by that PCI address or virtual device name. For a PCI card, DPDK only takes cards bound to `vfio-pci`. | Check `pci` in the config; run `switch-netconf bind`. For a tap or other virtual device, the name is the part of the `vdev` string before the first comma. |
 | `device MAC: config 0a-12-34-56-78-9a differs from device 0a-12-34-56-78-9b` | `MacMismatch`: the card at `pci` is not the card the config was written for. | Run `switch-netconf discover -o` against the right interface before binding, or fix `pci`. |
 | `descriptor adjustment: ...` | The NIC driver refused to adjust the ring sizes. | Change `descriptors`. |
-| `port configuration: ...` pool count or data room messages | `Sizing` or `mtu` produced a pool larger than DPDK accepts. | Reduce `frame_share`, `tx_pending` or `descriptors`. See [Packet-buffer pools](pools.md). |
-| `port open: port setup failed: InvalidSettings("PMD lacks the requested RX IPv4/TCP/UDP checksum offload")` (or `TX TCP checksum`, `TX UDP checksum`) | An explicit offload the NIC driver does not offer. | Set that offload to `false`, or use `"auto"`. See [Offloads](offloads.md). |
-| `port open: port setup failed: InvalidSettings("PMD lacks the requested RX timestamp offload")` | `rx_timestamps: true` on a driver without receive timestamps. | Set `rx_timestamps` to `false`. |
-| `port open: port setup failed: InvalidSettings(...)` other reasons | The card refused another setting, for example an MTU outside its range (the report's `min_mtu` and `max_mtu` lines show the range). | Fix the setting the reason names. |
+| `port configuration: TX pool count exceeds u32`, `port configuration: frame pool count exceeds u32` | `tx_pending`, `frame_share` or `descriptors` add up to more packet buffers than a pool can hold. | Reduce `frame_share`, `tx_pending` or `descriptors`. See [Packet-buffer pools](pools.md). |
+| `port configuration: pool data room exceeds u16` | `mtu` makes a packet buffer larger than DPDK allows. | Use a smaller `mtu`. |
+| your program: `port open: port setup failed: InvalidSettings("PMD lacks the requested RX IPv4/TCP/UDP checksum offload")` (or `TX TCP checksum`, `TX UDP checksum`); switch-nic: `port_open_error: InvalidSettings("PMD lacks the requested ...")` | An explicit offload the NIC driver does not offer. | Set that offload to `false`, or use `"auto"`. See [Offloads](offloads.md). |
+| your program: `port open: port setup failed: InvalidSettings("PMD lacks the requested RX timestamp offload")`; switch-nic: `port_open_error: InvalidSettings("PMD lacks the requested RX timestamp offload")` | `rx_timestamps: true` on a driver without receive timestamps. | Set `rx_timestamps` to `false`. |
+| your program: `port open: port setup failed: InvalidSettings(...)`; switch-nic: `port_open_error: InvalidSettings(...)`, other reasons | The card refused another setting, for example an MTU outside its range (the report's `min_mtu` and `max_mtu` lines show the range). | Fix the setting the reason names. |
 | `link query: ...` | DPDK could not read the link state. | Read stderr. |
-| `link wait: link down after 10 seconds` | The card did not report its link up within ten seconds. | Check that the cable, the switch port or the cloud network interface is attached and up. `switch-nic` prints `eth_stats` here too. |
-| `stack random seed: ...` | Reading `/dev/urandom` failed. | Check that `/dev/urandom` exists in the container. |
+| your program: `link wait: link down after 10 seconds`; switch-nic: `error: link down after 10 seconds` | The card did not report its link up within ten seconds. | Check that the cable, the switch port or the cloud network interface is attached and up. `switch-nic` prints `eth_stats` here too. |
+| your program: `stack random seed: ...`; switch-nic: `error: OS random seed: ...` | Reading `/dev/urandom` failed. | Check that `/dev/urandom` exists in the container. |
 | `Stack::new: TxPoolTooSmall { count: .., required: .. }` (also `TxFramePoolTooSmall`, `RxPoolTooSmall`) | A pool is below the minimum the Stack needs for its rings. | Enlarge the named pool to at least `required`. See [Packet-buffer pools](pools.md). |
 | `gateway 10.0.1.1 unresolved after 3.000s` | No ARP answer from the gateway within three seconds. | Check `gateway` in the config: it must be a router on the same network segment as the card. On EC2 it is the subnet's base address plus one. |
 | `gateway receive: ...` | A Stack error while waiting for the gateway's ARP answer. | Read the error; it comes from the Stack ([Stack errors](../stack/errors.md)). |
@@ -56,9 +57,9 @@ Each of these refusals happens before anything is written.
 | `bind/unbind needs euid 0` | Not root. | Run with `sudo`. |
 | `bind needs a PCI device` | The config is for a tap or other virtual device. | Nothing to do: virtual devices need no binding. |
 | `0000:00:06.0 PCI ID 8086:1592, config 1d0f:ec20` | The card at that address is a different model from the config's. | Fix `pci`, or discover again. |
-| `0000:00:06.0 MAC 0a:12:..., config ...` | The card's MAC differs from `mac`. | Discover again for this interface. |
+| `0000:00:06.0 MAC 0a:12:34:56:78:9b, config 0a-12-34-56-78-9a` | The card's MAC (as Linux prints it) differs from `mac` in the config. | Discover again for this interface. |
 | `0000:00:06.0 is bound to <driver>` | The card is on a driver that is neither its kernel driver nor `vfio-pci`. | Unbind it from that driver by hand first. |
-| `eth1 has route 0.0.0.0/0 via 10.0.1.1` | The interface carries a route other than its own subnet. Binding would cut it. | Move that route to the management interface, or remove it, then bind. |
+| `eth1 has route 0.0.0.0/0 via 10.0.1.1` | The interface carries a route other than its own subnet. `bind` does not check your SSH connection; it refuses any such route. | Stop the network manager from managing the interface and remove its routes, as [Preparing a Linux machine](host-setup.md) shows, then bind. |
 | `IOMMU peer 0000:00:06.1 is bound to <driver>` | Another device in the same IOMMU group is still on a kernel driver. | Unbind that device or move it to `vfio-pci` as well; `vfio-pci` hands out a whole IOMMU group at once. |
 | `no-IOMMU mode taints the kernel and needs --noiommu` | The machine has no IOMMU for this card. | Add `--noiommu` if you accept that (see [bind](netconf-tool.md#bind)). |
 | `vfio-pci driver missing after modprobe (...)` | The `vfio-pci` module could not be loaded. | Install or enable it for the running kernel. |

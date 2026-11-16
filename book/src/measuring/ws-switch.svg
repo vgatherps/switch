@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" font-family="sans-serif" font-size="11">
+<rect width="760" height="420" fill="white"/>
+<text x="380.0" y="20" text-anchor="middle" font-size="14">ws-switch</text>
+<rect x="70" y="40" width="620" height="330" fill="none" stroke="#888"/>
+<line x1="70" y1="370.0" x2="690" y2="370.0" stroke="#eee"/>
+<text x="64" y="374.0" text-anchor="end">10 µs</text>
+<line x1="70" y1="260.0" x2="690" y2="260.0" stroke="#eee"/>
+<text x="64" y="264.0" text-anchor="end">100 µs</text>
+<line x1="70" y1="150.0" x2="690" y2="150.0" stroke="#eee"/>
+<text x="64" y="154.0" text-anchor="end">1000 µs</text>
+<line x1="70" y1="40.0" x2="690" y2="40.0" stroke="#eee"/>
+<text x="64" y="44.0" text-anchor="end">10000 µs</text>
+<line x1="70.0" y1="40" x2="70.0" y2="370" stroke="#eee"/>
+<text x="70.0" y="386" text-anchor="middle">1000</text>
+<line x1="364.2" y1="40" x2="364.2" y2="370" stroke="#eee"/>
+<text x="364.2" y="386" text-anchor="middle">10000</text>
+<line x1="658.5" y1="40" x2="658.5" y2="370" stroke="#eee"/>
+<text x="658.5" y="386" text-anchor="middle">100000</text>
+<text x="380.0" y="410" text-anchor="middle">offered pps</text>
+<text x="694" y="44">1%</text><text x="694" y="56">drop</text>
+<text x="694" y="370">0%</text>
+<polyline points="70.0,348.9 114.3,349.1 158.6,349.1 202.8,349.1 247.1,348.5 291.4,349.1 335.7,349.3 380.0,349.7 424.3,349.3 468.6,349.7 512.9,349.9 557.1,349.5 601.4,349.9 645.7,348.7 690.0,267.2" fill="none" stroke="#1f77b4" stroke-width="1.5"/>
+<text x="78" y="54" fill="#1f77b4">p50</text>
+<polyline points="70.0,322.3 114.3,323.2 158.6,315.0 202.8,333.7 247.1,307.0 291.4,332.9 335.7,323.0 380.0,334.6 424.3,322.5 468.6,334.9 512.9,190.8 557.1,334.3 601.4,333.7 645.7,304.5 690.0,244.2" fill="none" stroke="#ff7f0e" stroke-width="1.5"/>
+<text x="148" y="54" fill="#ff7f0e">p99</text>
+<polyline points="70.0,304.0 114.3,265.9 158.6,257.3 202.8,319.9 247.1,271.7 291.4,306.7 335.7,291.5 380.0,316.0 424.3,298.4 468.6,267.8 512.9,108.7 557.1,312.9 601.4,318.6 645.7,222.3 690.0,209.3" fill="none" stroke="#2ca02c" stroke-width="1.5"/>
+<text x="218" y="54" fill="#2ca02c">p999</text>
+<polyline points="70.0,304.0 114.3,265.9 158.6,257.3 202.8,319.9 247.1,245.7 291.4,267.4 335.7,279.0 380.0,304.5 424.3,237.2 468.6,206.4 512.9,105.0 557.1,256.9 601.4,278.0 645.7,212.1 690.0,198.1" fill="none" stroke="#d62728" stroke-width="1.5"/>
+<text x="288" y="54" fill="#d62728">max</text>
+<polyline points="70.0,370.0 114.3,370.0 158.6,370.0 202.8,370.0 247.1,370.0 291.4,370.0 335.7,370.0 380.0,370.0 424.3,370.0 468.6,370.0 512.9,370.0 557.1,370.0 601.4,370.0 645.7,370.0 690.0,370.0" fill="none" stroke="#9467bd" stroke-dasharray="4 3"/>
+<text x="358" y="54" fill="#9467bd">not echoed %</text>
+</svg>

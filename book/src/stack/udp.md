@@ -1,12 +1,10 @@
 # UDP sockets on the Stack
 
-UDP on the Stack works like [TCP](tcp.md) in one way: calls only queue work, and packets move when the [drive loop](drive-loop.md) runs. Otherwise it is simpler. A socket is bound to a port, received datagrams wait in a queue until you take them, and a send either goes into the Stack's pending queue for the NIC or returns an error saying why it could not.
-
-The Stack speaks IPv4 only. It has no multicast.
+A UDP socket on the Stack is bound to a local port. Received datagrams wait in the socket's queue until you take them, each one still in the packet buffer it arrived in. A send either goes into the Stack's pending queue for the NIC or returns an error saying why it could not. As with [TCP](tcp.md), calls only queue work, and packets move when the [drive loop](drive-loop.md) runs.
 
 ## Binding
 
-`stack.add_udp(config)` binds a socket and returns its `UdpHandle`. The `UdpConfig`, as the UDP tests build it:
+`stack.add_udp(config)` binds a socket and returns its `UdpHandle`. The `UdpConfig`, as the UDP tests build it (their helper takes the port and the queue size):
 
 ```rust,ignore
 {{#include ../../../conduit/crates/dpdk-smoltcp/tests/stack_udp.rs:udp_config}}
@@ -26,7 +24,7 @@ A refused bind changes nothing and returns `AddUdpError`, checked in this order:
 
 ## Receiving
 
-`stack.udp_mut(&handle).recv()` returns the next datagram, or `None` when the queue is empty. It never fails. The UDP test reads one like this:
+`stack.udp_mut(&handle).recv()` returns the next datagram, or `None` when the queue is empty. It never fails. The UDP test reads one like this; `Side::A` and `Side::B` are the test's two hosts, and `PEER_PORT` is the sender's port:
 
 ```rust,ignore
 let datagram = stack.udp_mut(&handle).recv().unwrap();
@@ -44,15 +42,17 @@ The socket's `rx_queue` limit counts datagrams waiting in the queue and datagram
 
 ## Sending by copy: `udp_send`
 
-`stack.udp_send(&handle, to, payload)` copies `payload` into a frame from the frame pool and queues it as one datagram:
+`stack.udp_send(&handle, to, payload)` copies `payload` into a frame from the frame pool and queues it as one datagram. `to` is the destination address and port. It may be `None` if you have connected the socket: `stack.udp_mut(&handle).connect(peer)` fixes a peer (unicast IPv4 and a nonzero port, or `UdpConnectError::Invalid`), and sends with `None` go there. The datagram leaves on the next flush: `flush()` itself, or the flush inside `turn`, `receive` or `send`.
+
+A send can fail for a reason that goes away by itself, and a sending program must be ready for that. A send whose next hop's MAC address is not cached yet returns `NeighborPending` after queuing an ARP request; the datagram is not kept. Keep the payload, keep calling `receive` or `turn` (to take in the ARP reply and move time forward), and send again. A learned address stays usable after it ages: the Stack keeps sending to it while it refreshes it with an ARP probe. So sends through the gateway that `open` resolved before it returned do not hit this, unless the ARP cache fills with more neighbors than `neighbor_capacity` and evicts the gateway. `WouldBlock` is the other error to retry; the [table below](#send-errors) gives its two causes.
+
+`switch-nic`'s UDP echo server shows the pattern. When a reply cannot be sent, it keeps the received datagram in `slot.pending`, returns to its drive loop, and tries that datagram first the next time it visits the socket:
 
 ```rust,ignore
-stack.udp_send(&handle, peer(PEER_PORT), &payload).unwrap();
+{{#include ../../../conduit/crates/switch-nic/src/server.rs:udp_retry}}
 ```
 
-`to` is the destination address and port. It may be `None` if you have connected the socket: `stack.udp_mut(&handle).connect(peer)` fixes a peer (unicast IPv4 and a nonzero port, or `UdpConnectError::Invalid`), and sends with `None` go there.
-
-The datagram leaves on the next flush: `flush()` itself, or the flush inside `turn`, `receive` or `send`.
+`turns.flush` is the server's own wrapper around `Stack::flush`.
 
 ## Sending in place: `udp_send_frame`
 
@@ -70,7 +70,7 @@ A zero-length frame sends an empty datagram.
 
 ## Send errors
 
-Both send calls check in the same order and return the first error that applies:
+Both send calls check in this order and return the first error that applies:
 
 | Error | Meaning | What to do |
 |---|---|---|
@@ -78,15 +78,14 @@ Both send calls check in the same order and return the first error that applies:
 | `PeerMismatch` | `to` differs from the connected peer. | Send to the peer, or use another socket. |
 | `Unaddressable` | The destination is unspecified, multicast, one of our own addresses, port 0, or the broadcast address without `broadcast: true`. | Fix the destination. |
 | `TooLarge` | The payload is longer than the destination's path MTU − 28. There is no fragmentation. | Send less. |
-| `WouldBlock` | The frame pool is empty (only when a copy is needed), or the pending queue is full. | Flush, then retry. |
-| `NoRoute` | The destination is off the subnet and there is no gateway. | Configure a gateway, or send on-link. |
+| `WouldBlock` (frame pool) | The frame pool is empty. Checked here only when the send needs a copy: always for `udp_send`, and for a shared or sliced frame. | Retry once frames return. |
+| `NoRoute` | The destination is off the subnet and there is no gateway, or there is no source address for it. | Configure a gateway, or send on-link. |
 | `NeighborPending` | The next hop's MAC address is not known yet. The Stack queued an ARP request; this datagram was dropped. | Run the drive loop so the ARP reply is taken in, then send again. |
-
-`NeighborPending` is the one that surprises people. The first send to a new neighbor always fails this way, because the Stack does not keep datagrams waiting for ARP. A sending loop must keep calling `receive` or `turn`, both to take in the ARP reply and to move time forward.
+| `WouldBlock` (pending queue) | The pending queue for the NIC is full. | Flush, then retry. |
 
 `WouldBlock` from a full pending queue means the NIC driver has not taken the packets already queued. Flush at least once every `tx_pending` sends (the `StackConfig` field) to keep it from filling.
 
-The Stack drops IPv4 fragments it receives and never fragments what it sends.
+The Stack speaks IPv4 only and has no multicast. It drops IPv4 fragments it receives and never fragments what it sends.
 
 ## Removing a socket
 

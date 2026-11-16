@@ -1,6 +1,6 @@
 # Errors
 
-Socket operations in switch-net return `switch_net::Error`, one error type shared by both backends. The drive loop has its own errors, `TurnError` and `RoundError`. This page lists them all with what to do about each, and then describes what a program sees when the junction daemon goes away. It comes after [TCP streams](tcp.md) and [UDP sockets](udp.md), which introduce the operations, and [Timeouts and racing futures](timeouts.md), which showed how to stop waiting on them.
+Socket operations in switch-net return `switch_net::Error`, one error type shared by both backends. The drive loop has its own errors, `TurnError` and `RoundError`. Below are all of them with what to do about each, followed by what a program sees when the junction daemon goes away. The operations were introduced in [TCP streams](tcp.md) and [UDP sockets](udp.md), and [Timeouts and racing futures](timeouts.md) showed how to stop waiting on them.
 
 ## Socket errors
 
@@ -21,7 +21,7 @@ Socket operations in switch-net return `switch_net::Error`, one error type share
 | 11 | `Empty` | empty frame | `try_send` | TCP cannot send a zero-length frame. |
 | 12 | `Foreign` | frame belongs to another Net | `try_send`, UDP `send` | Get frames from a handle of the same `Net`. |
 | 13 | `NoDestination` | no destination | UDP `send` | Pass `Some(endpoint)`. |
-| 14 | `PeerMismatch` | destination differs from connected peer | UDP `send` (local) | Send to the socket's peer. |
+| 14 | `PeerMismatch` | destination differs from connected peer | not returned by switch-net | — |
 | 15 | `NoRoute` | no route | UDP `send` (local) | The Stack has no route to that address; check the address and the config file's routes. |
 | 16 | `NeighborPending` | neighbor resolution pending | UDP `send` (local) | Keep the frame and retry after a turn. |
 | 17 | `HostLost` | junction host session lost | opening calls (junction) | The daemon is gone; see below. |

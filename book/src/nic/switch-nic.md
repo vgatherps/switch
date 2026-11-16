@@ -1,6 +1,6 @@
 # switch-nic: checking a NIC and serving load
 
-`switch-nic` is a ready-made program built on `switch_open::open`. Point it at a [network config file](config.md) and it opens the card, prints what it found, and then does one of three things: nothing more (`info`), answer sockperf load-test clients (`sockperf-server`), or read a live market-data feed over TLS (`feed`). [Preparing a Linux machine](host-setup.md) ends by running `switch-nic info`, and [Running on EC2](ec2.md) uses `info` and `feed` on a prepared host; this page documents all three modes. Use it to check that a machine is set up correctly before you run your own program on it, and as a reference for what a complete owning-the-NIC program looks like.
+`switch-nic` is a ready-made program built on `switch_open::open`. Point it at a [network config file](config.md), such as the one [switch-netconf](netconf-tool.md) wrote, and it opens the card, prints what it found, and then does one of three things: nothing more (`info`), answer sockperf load-test clients (`sockperf-server`), or read a live market-data feed over TLS (`feed`). Its source is `conduit/crates/switch-nic`; build it with `cargo build --locked --release -p switch-nic` (binary `target/release/switch-nic`). [Preparing a Linux machine](host-setup.md) ends by running `switch-nic info`, and [Running on EC2](ec2.md) uses `info` and `feed` on a prepared host; this page documents all three modes. Use it to check that a machine is set up correctly before you run your own program on it, and as a reference for what a complete owning-the-NIC program looks like.
 
 ```text
 switch-nic --config FILE <MODE> [MODE OPTIONS]
@@ -83,7 +83,7 @@ Replies keep their order per socket, not across sockets, so give each sockperf c
 
 On SIGINT or SIGTERM, or when `--seconds` runs out, the server closes its TCP connections with FIN, waiting at most five seconds, prints the final report and closes the card. If the connections do not close in time, or a UDP reply is still waiting to be sent, it exits 3.
 
-The wire format is small: every sockperf message starts with a 14-byte header whose bytes 10 to 13 hold the message length (big-endian) and whose flags say whether the client wants a reply. A UDP datagram must be exactly one message. On TCP, messages are cut out of the byte stream by their length field; a length below 14 or above 65507 marks the stream malformed and the server resets that connection. The crate `switch-sockperf-wire` implements this framing.
+A malformed sockperf message resets that TCP connection; `switch-sockperf-wire` implements the framing.
 
 ## feed
 
@@ -97,7 +97,7 @@ The wire format is small: every sockperf message starts with a 14-byte header wh
 | `--print N` | 10 | how many messages to print |
 | `--seconds S` | 30 | how long to read, counted from when the WebSocket opens |
 
-`feed` needs a `gateway` in the config; without one it stops with `feed requires a gateway in the config`. It resolves the host name before it opens the card, and prints `resolved: <host> -> <address>` and `feed_mss_cap: <n>`, the TCP segment limit it took from the path MTU toward that address. After the card opens it prints `phc_check`: the difference between the card's clock and the system clock, read once, or `unsupported` if the driver cannot read its clock. It is logged, not checked.
+`feed` needs a `gateway` in the config; without one it stops with `feed requires a gateway in the config`. It resolves the host name before it opens the card, and prints `resolved: <host> -> <address>` and `feed_mss_cap: <n>`, the TCP segment limit it took from the path MTU toward that address. After the card opens it prints `phc_check`: the difference between the card's clock and the system clock, read once ([Reading the NIC clock](offloads.md#reading-the-nic-clock)), or `unsupported` if the driver cannot read its clock. It is logged, not checked.
 
 The feed runs as a switch task on a `Net` over the Stack, and the drive loop busy-polls. SIGINT or SIGTERM tells the feed task to stop early. It fails (exit 3) if no message arrived. The lines it prints about messages and latency are described in [the walkthrough](../protocols/binance-feed.md). If the card was reset during the run, the latency figures are reported as invalid, because the card's clock may have jumped ([Device resets](offloads.md#device-resets)).
 
@@ -112,4 +112,4 @@ The feed runs as a switch task on a `Net` over the Stack, and the drive loop bus
 
 An argument error prints `switch-nic: error: <problem>` followed by the usage text. When `open` fails after the card's port exists, `switch-nic` still closes the port and prints `port_close`; [Opening the NIC from code](open.md#when-it-fails) shows that code, and [When the NIC won't open](troubleshooting.md) lists the messages.
 
-Next: [When the NIC won't open](troubleshooting.md).
+Next: [Opening the NIC from code](open.md), the call `switch-nic` makes, for your own program.

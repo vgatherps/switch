@@ -1,14 +1,9 @@
 # Introduction
 
-switch is a set of Rust crates for writing network programs that send and receive with low, predictable latency: market-data feeds, order gateways, echo servers, load generators. Your program is written as async Rust tasks that open TCP and UDP sockets, and optionally TLS and WebSocket connections on top of them. A task looks much like it would with any async socket library:
+switch is a set of Rust crates for writing network programs that send and receive with low, predictable latency: market-data feeds, order gateways, echo servers, load generators. Your program is written as async Rust tasks that open TCP and UDP sockets, and optionally TLS and WebSocket connections on top of them. Here is the core of the TCP client this book builds in [Your first network program](getting-started/first-connection.md). It connects, splits the connection into a receive half and a send half, puts one line into a frame (a buffer the network can send without copying), sends it, then prints what the server sends back until the server closes the connection:
 
 ```rust,ignore
-let stream = handle.tcp_connect(socket, server, local).await?;
-let (mut rx, mut tx) = stream.split();
-// ... put a line into a frame, then:
-tx.room(line.len()).await?;
-tx.try_send(frame).map_err(|(_frame, error)| error)?;
-let reply = rx.recv().await?;
+{{#include ../../switch-net/examples/tcp_client_local.rs:core}}
 ```
 
 What is different is everything underneath that code. This page explains it in plain terms, then shows how the rest of the book is laid out.
@@ -17,7 +12,7 @@ What is different is everything underneath that code. This page explains it in p
 
 A normal Linux program never touches the network card (the NIC). It calls `connect` and `send`, and the kernel's TCP/IP stack builds the packets and hands them to the kernel's driver. Every send and receive crosses into the kernel and back, and the kernel decides when your thread runs again.
 
-A switch program takes the NIC away from the kernel. It uses DPDK, a userspace NIC driver framework, to put packets on the NIC and take them off directly from its own memory. The TCP/IP stack runs inside the program too. This book calls it the Stack: one TCP/IP stack over one NIC, built on the Rust stack smoltcp. Bypassing the kernel this way removes the system calls and copies of the normal path, at a price: the program now has to do the work the kernel used to do, and it has to do it all the time.
+A switch program takes the NIC away from the kernel. It uses DPDK, a userspace NIC driver framework, to put packets on the NIC and take them off directly from its own memory. The TCP/IP stack runs inside the program too. This book calls it the Stack: one TCP/IP stack over one NIC, built on smoltcp, a TCP/IP stack written in Rust. Bypassing the kernel this way removes the system calls and copies of the normal path, at a price: the program now has to do the work the kernel used to do, and it has to do it all the time.
 
 ## You own the loop, the CPU and the clock
 
@@ -36,9 +31,9 @@ Nothing in switch runs by itself. There is no background thread that receives pa
    +-----------------------------------------------+
 ```
 
-One thread drives both the network and the tasks, and it does so on one CPU that it is pinned to: the process is allowed to run on that CPU only. Between two trips through the loop nothing happens at all. A task that called `try_send` has only queued its data; the packet leaves on the next turn. A task waiting on `recv` runs again only after a turn has found data for it and a poll has run it.
+One thread drives both the network and the tasks, and it does so on one CPU that it is pinned to: the thread that drives the network is allowed to run on that CPU only. Between two trips through the loop nothing happens at all. A task that called `try_send` has only queued its data; the packet leaves on the next turn. A task waiting on `recv` runs again only after a turn has found data for it and a poll has run it.
 
-The program also supplies time. The runtime and the Stack read no clock. The drive loop reads one clock once each time through and hands the same reading to both. A loop that wants the lowest latency starts again at once without sleeping, which keeps its CPU busy all the time.
+The program also supplies time. The runtime and the Stack have no clock of their own. The drive loop reads one clock once each time through and hands the same reading to both. A loop that wants the lowest latency starts again at once without sleeping, which keeps its CPU busy all the time.
 
 If you have used tokio, this is the main thing to unlearn: here your code calls the runtime, and the runtime never calls back on its own.
 
@@ -92,13 +87,13 @@ A tap device is a virtual NIC that DPDK creates and that Linux sees as an ordina
 
 ## Where it runs
 
-The runtime and the protocol cores build and run on any machine with a Rust toolchain, macOS included. Everything that touches the NIC uses DPDK, and DPDK builds only on Linux. On macOS you use the repository's Docker image, which runs Linux with DPDK installed; [Setting up a build environment](getting-started/environment.md) lists which crates build where and how to start the container.
+The runtime and the TLS and WebSocket code (without their switch-net integration) build on macOS and Linux with a Rust toolchain. Everything that touches the NIC uses DPDK, and DPDK builds only on Linux. On macOS you use the repository's Docker image, which runs Linux with DPDK installed; [Setting up a build environment](getting-started/environment.md) lists which crates build where and how to start the container.
 
 ## How to read this book
 
 The book is written to be read front to back by someone who has not used switch before. Each page ends by pointing to the next one.
 
-If you are writing an application, read Getting started first: [Setting up a build environment](getting-started/environment.md), [Your first task](getting-started/first-task.md) (the runtime alone, on any machine) and [Your first network program](getting-started/first-connection.md) (a TCP client over a tap device). Then read [The switch runtime](runtime/index.md) and [Sockets with switch-net](net/index.md) in order, and [TLS and WebSocket](protocols/index.md) if your program speaks `wss://` or `ws://`. To deploy, choose a backend: [Owning a NIC](nic/index.md) for the local backend, or [Sharing a NIC with the junction daemon](junction/index.md) for the junction backend.
+If you are writing an application, read Getting started first: [Your first task](getting-started/first-task.md) (the runtime alone, on any machine), [Setting up a build environment](getting-started/environment.md) and [Your first network program](getting-started/first-connection.md) (a TCP client over a tap device). Then read [The switch runtime](runtime/index.md) and [Sockets with switch-net](net/index.md) in order, and [TLS and WebSocket](protocols/index.md) if your program speaks `wss://` or `ws://`. To deploy, choose a backend: [Owning a NIC](nic/index.md) for the local backend, or [Sharing a NIC with the junction daemon](junction/index.md) for the junction backend.
 
 If you run machines, read this page and [How the pieces fit together](overview/architecture.md), then [Owning a NIC](nic/index.md) (preparing a Linux machine or an EC2 instance, the network config file, the `switch-netconf` and `switch-nic` tools), [Running switch-junctiond](junction/running.md), and [Measuring latency under load](measuring/index.md).
 

@@ -4,21 +4,33 @@ A task is one call of a function marked `#[switch::task]`, started on the runtim
 
 ## Marking a function as a task
 
-The attribute goes on an `async fn`:
+The attribute goes on an `async fn`. This one, from `switch/examples/tasks.rs`, takes a spawner and uses it to start a second task that prints:
 
 ```rust,ignore
-{{#include ../../../switch-macros/tests/ui/pass_forms.rs:countdown}}
+{{#include ../../../switch/examples/tasks.rs:async_task}}
 ```
 
-or on a plain `fn` that returns `impl Future<Output = T>`, for the cases where you want to do some work before building the future, or return a hand-written future:
+It also goes on a plain `fn` that returns `impl Future<Output = T>`. The body of such a function runs when the task is spawned and builds the future, so it can do some work first; here it prints before returning its `async move` block:
 
 ```rust,ignore
-{{#include ../../../switch-macros/tests/ui/pass_forms.rs:plain_fn}}
+{{#include ../../../switch/examples/tasks.rs:plain_fn}}
 ```
+
+`main` spawns `parent`, polls until no task is left, then spawns `plain("hello")`, prints a line, and polls again. Run it with `cargo run -p switch --example tasks`:
+
+```text
+parent polled
+child polled
+plain function called at spawn time
+before polling the plain future
+plain future polled: hello
+```
+
+The child is spawned during the first poll and runs in a later pass of that same poll. The plain function's body runs inside `spawn`, before `main` prints its line; the `async move` block runs only when the runtime polls it.
 
 The function keeps its name, visibility and generics. What changes is its return type: calling it now returns a `SpawnToken`, and the `T` of the future becomes the task's result.
 
-The `countdown` example also shows the usual way a task gets hold of a spawner: it takes one as an argument. `Spawner` is cheap to clone, so a task that starts other tasks, or creates timers, receives its own clone when it is spawned.
+The first example also shows the usual way a task gets hold of a spawner: it takes one as an argument. `Spawner` is cheap to clone, so a task that starts other tasks, or creates timers, receives its own clone when it is spawned.
 
 ## What the attribute accepts
 
@@ -36,10 +48,8 @@ The rules come from one requirement: a task's future lives inside the runtime fo
 | `const fn`, `unsafe fn` or `extern fn` | compile error |
 | an argument pattern that is not a plain name: `(a, b): (u8, u8)`, `ref a: u8` | compile error |
 | any other return type, including `impl Future<..> + Send` and `Pin<Box<dyn Future<..>>>` | compile error |
-| arguments that borrow for a shorter lifetime, such as `value: &u8` | compile error (the future is not `'static`) |
+| an argument that borrows for a shorter lifetime, such as `value: &u8`, in an `async fn` or captured by the returned future | compile error (the future is not `'static`) |
 | arguments to the attribute itself, such as `#[switch::task(name = "x")]` | compile error |
-
-The accepted forms are taken from `switch-macros/tests/ui/pass_forms.rs` and `pass_generics.rs`, and the rejected ones from the `fail_*.rs` files next to them; those files are compiled by the crate's tests, so the table matches what the compiler does.
 
 One more limit is checked at compile time. A task's future, plus a small header the runtime keeps with it, must fit in 64 KiB. A task whose future is bigger, for example one that keeps a large array across an `.await`, fails to compile. Put large buffers in a `Box` or a `Vec` to keep them out of the future itself.
 
@@ -64,7 +74,7 @@ spawner.spawn(token).unwrap();    // the task exists now; the next poll runs it
 
 The token is a `SpawnToken`. It is not `Send`, `Sync` or `Clone`, so it is spawned once, on the thread that made it. Dropping a token without spawning it drops its arguments and nothing else; for an `async fn`, no line of the body ever ran.
 
-Spawning does not run the task either. `spawn` places the task in the runtime and marks it ready. It first runs during the next call to `Runtime::poll`, or later in the current poll if a running task spawned it (see [Driving the runtime](driving.md#one-poll-step-by-step)).
+Spawning does not poll the returned future. `spawn` places the task in the runtime and marks it ready. It first runs during the next call to `Runtime::poll`, or later in the current poll if a running task spawned it (see [Driving the runtime](driving.md#one-poll-step-by-step)).
 
 Here is the whole life of a task:
 
@@ -102,7 +112,7 @@ There are two ways to spawn a token.
 
 A `JoinHandle` resolves to `Ok(value)` when the task returns, at once if it had already finished. It resolves to `Err(Canceled)` when the task ended without a value: the runtime was shut down or dropped before the task finished, or the task panicked. A handle must be awaited by a switch task; polled anywhere else while the task is still running, it panics.
 
-Dropping a `JoinHandle` does not stop the task. It detaches it, and the result is dropped when the task finishes (or right away, if it already did). To stop a task early, have it wait on something you control, such as a oneshot receiver raced against its work with [`first`](../net/timeouts.md#racing-a-receive-against-a-stop-signal).
+Dropping a `JoinHandle` does not stop the task. It detaches it, and the result is dropped when the task finishes (or right away, if it already did). To stop a task early, have it wait on something you control, such as a oneshot receiver raced against its work with [`first` (from switch-net)](../net/timeouts.md#racing-a-receive-against-a-stop-signal).
 
 ## When spawning fails
 
@@ -117,7 +127,7 @@ pub struct SpawnError<T> {
 
 The `reason` is `RuntimeError::Closed` or `RuntimeError::Panicked`. The token comes back unspawned, so you decide when its arguments are dropped. A full runtime is never a reason; task storage grows as needed ([How task storage works](errors.md#how-task-storage-works)). [Panics, errors and shutdown](errors.md) lists every error.
 
-`SpawnError` and `RuntimeError` implement `Debug` but not `Display`, so programs print them with `{:?}`, as `switch-binance-feed` does:
+`SpawnError` and `RuntimeError` implement `Debug` but not `Display`, so programs print them with `{:?}`, as `switch-binance-feed` (the market-data feed walked through in [Walkthrough: a market-data feed](../protocols/binance-feed.md)) does:
 
 ```rust,ignore
 .map_err(|error| format!("spawning the feed: {:?}", error.reason))?;
@@ -129,7 +139,7 @@ Task functions may be generic over types and constants, and may take `impl Trait
 
 ```rust,ignore
 #[switch::task]
-async fn show<T: Display + 'static>(value: T, log: Log) {
+async fn show<T: Display + 'static>(value: T, log: Rc<RefCell<Vec<String>>>) {
     log.borrow_mut().push(value.to_string());
 }
 ```

@@ -34,15 +34,22 @@ When your ticks are nanoseconds, convert a `Duration` by counting nanoseconds:
 {{#include ../../../switch/examples/clock_loop.rs:sleep_duration}}
 ```
 
+`cargo run -p switch --example clock_loop` runs this task next to the sliced sum from [Driving the runtime](driving.md#fairness-no-task-is-interrupted); the sleep finishes after the sum:
+
+```text
+sum = 49995000
+2 ms passed
+```
+
 `switch_net::within`, described in [Timeouts and racing futures](../net/timeouts.md), does this conversion for you.
 
 ## When a sleep fires
 
-A sleep completes during the first poll whose tick is at or past its deadline. That poll wakes the task, and the task runs in the same poll.
+A sleep completes during the first poll whose tick is at or past its deadline. That poll wakes the task. It runs in the same poll unless the poll ends first, after 1024 task polls or because a task asked for a turn; then it runs in the next one.
 
-A sleep whose deadline is already at or before the runtime's tick completes the first time it is awaited, without parking. The test in `switch/tests/public_runtime.rs` shows this with `sleep_until(110)` created when the runtime is already at 110: the task runs to the end in a single poll.
+A sleep whose deadline is already at or before the runtime's tick completes the first time it is awaited, without parking. For example, a task that awaits `sleep_until(110)` on a runtime already at tick 110 runs to the end in a single poll.
 
-A timer never fires between polls, because nothing runs between polls. How late it fires depends on how often your loop polls. With [busy polling](driving.md#writing-the-loop), that is one loop pass. With a loop that sleeps when idle, it can be up to one idle sleep, since the runtime offers no way to ask when the next timer is due. If your program has timers much shorter than its idle sleep, shorten the idle sleep or busy poll.
+A timer never fires between polls, because nothing runs between polls. How late it fires depends on how often your loop polls. With [busy polling](driving.md#writing-the-loop), that is usually the next time through the loop. With a loop that sleeps when idle, it can be up to one idle sleep, since the runtime offers no way to ask when the next timer is due. If your program has timers much shorter than its idle sleep, shorten the idle sleep or busy poll.
 
 The timers are kept in a structure that covers the whole `u64` range, so a deadline far in the future costs the same as a near one.
 
@@ -66,7 +73,7 @@ Both creating a sleep and awaiting it can fail with a `SleepError`:
 | `WrongRuntime` | The sleep was awaited, with its deadline still ahead, by something other than a task of its own runtime: a task of another runtime, or a future polled outside any switch task. |
 | `RegistrationExhausted` | The runtime cannot register another timer: about four billion are already registered. |
 
-The overflow case, from `switch/tests/public_runtime.rs`:
+For example, on a runtime whose latest tick is above 0, a relative sleep of `u64::MAX` ticks overflows:
 
 ```rust,ignore
 assert_eq!(

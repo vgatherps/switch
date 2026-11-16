@@ -16,8 +16,9 @@ The biggest difference is where outgoing data waits, and so where backpressure c
   task --try_send--> socket send queue            task --try_send--> copy into send ring
                      (frame held until ACK)                          (frame back to pool)
                            |                                               |
-          bounded by tx_capacity and                    bounded by ring space shared with
-          the shared frame pool                         other sockets and applications
+          bounded by tx_capacity and                    bounded by the send ring of your
+          the shared frame pool                         thread's CPU, shared with every
+                                                        socket and application on that CPU
                            |                                               v
                            v                                  daemon: Stack, its own queue
                      Stack -> NIC                             per socket -> NIC

@@ -6,51 +6,11 @@ Often you want several programs on one NIC: a market-data feed, an order gateway
 
 ## Why a daemon
 
-The daemon is one long-running process that owns the NIC. It opens the NIC port from the same [network config file](../nic/config.md) an application would use, runs the Stack on its own [pinned CPU](../nic/cpus.md), and serves TCP and UDP sockets to any number of application processes on the same machine.
+The daemon is one long-running process that owns the NIC. It opens the NIC port from the same [network config file](../nic/config.md) an application would use, runs [the Stack](../nic/index.md) on its own [pinned CPU](../nic/cpus.md), and serves TCP and UDP sockets to any number of application processes on the same machine.
 
 An application that talks to the daemon has no Stack of its own. It asks the daemon to open sockets, hands it bytes to send, and reads the packets the daemon received for it. All of the IP address, ARP, TCP state and timers live in the daemon. If the daemon stops, every application loses its sockets.
 
 Each application's connection to the daemon is called a **session**. A session is created with `Session::connect` from the `switch-junction` crate and lasts until the application ends it or either process goes away.
-
-## The picture
-
-A session uses two kinds of channel. Rare messages, such as "open a TCP connection to 10.0.0.5:443" or "socket 3 is now connected", travel over a Unix socket in the daemon's directory. Packet data travels through shared memory, memory that both processes map, so sending and receiving involve no system calls and no kernel copies.
-
-```text
-  application A                 application B
- +-------------------+         +-------------------+
- | your tasks        |         | your tasks        |
- |   switch-net      |         |   switch-net      |
- |   Session         |         |   Session         |
- +--+------+------+--+         +--+------+------+--+
-    |      |      ^               |      |      ^
-    |      |      |               |      |      |
-    |  sends|     | received      |      |      |
-    |      v      | packets       |      v      |
-    |  +---------------------------------+     |
-    |  |  send ring (shared by all       |     |
-    |  |  sessions, one per CPU)         |     |
-    |  +----------------+----------------+     |
-    |                   |                      |
-    |  control socket   |      receive ring    | receive ring
-    |  (control.sock)   |      (one per        | (one per
-    |                   |       session)       |  session)
-    v                   v           ^          ^
- +-----------------------------------------------------------+
- | switch-junctiond                                          |
- |   control thread            network thread                |
- |   (housekeeping CPUs):      (one pinned CPU):             |
- |   sessions, opens, events   busy-polls the NIC and Stack, |
- |                             applies sends, writes         |
- |                             received packets              |
- +-----------------------------+-----------------------------+
-                               |
-                              NIC
-```
-
-The **send ring** carries what applications send. It is a set of shared-memory rings, one per CPU, shared by every session; the daemon reads them on its network thread and puts each session's sends back in order. The **receive ring** belongs to one session. The daemon writes each received TCP chunk or UDP datagram into it as one **record**, and the application reads records out as [frames](../net/frames.md) without copying.
-
-Control messages and data take different paths, so they are not ordered against each other. Most applications never notice this, because switch-net handles it. Programs that use a `Session` directly need to know the rules, which [Using a Session directly](session.md) covers.
 
 ## What an application does
 
@@ -67,7 +27,27 @@ Almost every application uses the daemon through [switch-net](../net/index.md), 
 
 switch-net calls this the junction backend; [Local and junction backends compared](../net/backends.md) lists every behavior that differs between the two.
 
-The `switch-junction` crate itself does not use DPDK. An application that uses it through switch-net still builds against DPDK, because switch-net always depends on the Stack's crate. See [Setting up a build environment](../getting-started/environment.md).
+An application that uses the daemon through switch-net still builds against DPDK, because switch-net depends on the Stack's crate; `switch-junction` on its own does not. See [Setting up a build environment](../getting-started/environment.md).
+
+## The picture
+
+```text
+ +---------------+  +---------------+  +---------------+
+ | application A |  | application B |  | application C |
+ +-------+-------+  +-------+-------+  +-------+-------+
+         |                  |                  |
+         +------------------+------------------+
+                            |   one session each
+                 +----------+-----------+
+                 |   switch-junctiond   |
+                 +----------+-----------+
+                            |
+                           NIC
+```
+
+Each session uses three channels. The **control socket** is a Unix socket, `control.sock` in the daemon's directory; rare messages such as "open a TCP connection to 10.0.0.5:443" or "socket 3 is now connected" travel over it. The **send ring** carries what applications send: shared memory, one ring per CPU, written by every session sending from that CPU and read by the daemon. The **receive ring** belongs to one session: the daemon writes each received TCP chunk or UDP datagram into it as one **record**, and the application reads records out as [frames](../net/frames.md) without copying. Shared memory is memory both processes map, so sending and receiving involve no system calls and no kernel copies.
+
+Control messages and data take different paths, so they are not ordered against each other. Most applications never notice this, because switch-net handles it. Programs that use a `Session` directly need to know the rules, which [Using a Session directly](session.md) covers. The detailed picture of the processes, threads and rings is in [Under the hood](../blocks/index.md).
 
 ## This part of the book
 

@@ -1,44 +1,45 @@
 # Setting up a build environment
 
-Some of switch builds on any machine with a Rust toolchain. The rest talks to the NIC through DPDK, and DPDK builds only on Linux. [How the pieces fit together](../overview/architecture.md) showed which crate does what; this page tells you which crates build where, and then gets you a Linux environment with the right DPDK: either a Docker container (the usual choice on macOS, and the quickest on Linux) or a Linux machine set up by hand. It ends with a running container, which is where the [first network program](first-connection.md) runs.
+[Your first task](first-task.md) ran on the switch runtime alone and needed nothing but cargo. The next program opens a NIC, and that needs DPDK, which builds only on Linux. This page shows which crates build where, then gets you a Linux environment with the right DPDK: a Docker container (the usual choice on macOS, and the quickest on Linux) or a Linux machine set up by hand. It ends with a running container, which is where [your first network program](first-connection.md) runs.
 
 ## What builds where
 
-The split follows one dependency. Every crate that links `dpdk-smoltcp`, the crate that holds [the Stack](../nic/index.md), needs DPDK's C libraries to build. Crates that do not link it build anywhere.
+The split follows DPDK's C libraries. A crate that links them, directly or through another crate, needs DPDK installed to build; the others do not.
 
-| Crate | Builds on | Needs DPDK |
+| Crate | Platforms | Needs DPDK |
 |---|---|---|
-| `switch`, `switch-macros`, `switch-depot` (the runtime) | any OS | no |
-| `switch-tls`, `switch-ws` without their `switch-net` support | any OS | no |
-| `ceph-rseq`, `ceph-ring`, `ceph-fifo`, `ceph-proto`, `ceph-control` | any OS | no |
-| `switch-frame`, `shared-memory`, `slice_ringbuffer` (packet-buffer handles, shared-memory files and the receive ring; see [Frames, shared memory and rings](../blocks/index.md)) | any OS | no |
-| `switch-netconf` (the config file tool and library) | any OS; `discover` and `bind` read Linux's `/sys` and only work on Linux | no |
-| `switch-test-support`, `switch-test-support-macros` | any OS | no |
-| `switch-net` | Linux | yes, for either backend |
-| `switch-open`, `switch-nic`, `switch-junctiond`, `switch-bench` and everything else that links `dpdk-smoltcp` | Linux | yes |
+| `switch`, `switch-macros`, `switch-depot` (the runtime) | macOS, Linux | no |
+| `switch-tls`, `switch-ws` without their `switch-net` support | macOS, Linux | no |
+| `switch-frame`, `slice_ringbuffer` (packet-buffer handles, the receive ring) | macOS, Linux | no |
+| `shared-memory`, `ceph-control`, `ceph-proto`, `ceph-fifo` | macOS, Linux | no |
+| `ceph-rseq`, `ceph-ring` | macOS, Linux (glibc, x86_64 or aarch64) | no |
+| `switch-junction` (the client side of the junction daemon) | Linux | no |
+| `switch-netconf` (the config file tool and library) | macOS, Linux; `discover` and `bind` read Linux's `/sys` and only work on Linux | no |
+| `switch-sockperf-wire`, `switch-test-support`, `switch-test-support-macros` | macOS, Linux | no |
+| `switch-dpdk-sys`, `switch-buffer` (the DPDK bindings and packet buffers) | Linux | yes |
+| `dpdk-smoltcp` ([the Stack](../stack/index.md)), `switch-open`, `switch-net`, `switch-junctiond`, `switch-nic`, `switch-bench`, `switch-test-kit` and the other tools | Linux | yes |
 
-`switch-net` depends on `dpdk-smoltcp` unconditionally. A program that only ever uses the [junction backend](../net/backends.md), and so never opens a NIC itself, still needs `libdpdk` installed to build.
+`switch-net` depends on `dpdk-smoltcp` unconditionally. A program that only ever uses the [junction backend](../net/backends.md), and so never opens a NIC itself, still needs `libdpdk` installed to build. The [crate map](../reference/crates.md) lists every package.
 
 DPDK must be exactly version 25.11.3. The Rust bindings read DPDK's packet-buffer fields directly, and other versions lay them out differently; the `doctor` targets described below refuse any other version.
 
-A plain `cargo build` or `cargo test` at the workspace root builds every member, the DPDK crates included, so on a machine without DPDK use the root `make test` (see [Tests that run without DPDK](#tests-that-run-without-dpdk)) or name the packages you want with `-p`.
+A plain `cargo build` or `cargo test` at the workspace root builds every member, the DPDK crates included. On a machine without DPDK, name the packages you want with `-p`, or use the root `make test` (see [Tests that run without DPDK](#tests-that-run-without-dpdk)).
 
 ## The Docker image
 
-The repository ships a Docker image with everything the DPDK crates need: Ubuntu 24.04, Rust 1.93.0, clang and lld 18, and DPDK 25.11.3 built from source under `/opt/dpdk`. It builds for the host's native architecture, so it runs natively on both x86-64 and arm64 machines, Apple silicon included.
+The repository ships a Docker image with everything the DPDK crates need: Ubuntu 24.04, Rust 1.99.1, clang and lld 18, and DPDK 25.11.3 built from source under `/opt/dpdk`. It builds for the host's native architecture, so it runs natively on both x86-64 and arm64 machines, Apple silicon included.
 
-The Docker targets live in `conduit/Makefile`. Run them from the `conduit/` directory:
+The Docker targets live in `conduit/Makefile`. From the repository root:
 
 ```sh
-cd conduit
-make docker-image     # build the image, tagged switch-dpdk-test:local
-make docker-doctor    # print the toolchain and DPDK versions inside it
-make docker-build     # build the whole workspace inside it
+make -C conduit docker-image     # build the image, tagged switch-dpdk-test:local
+make -C conduit docker-doctor    # print the toolchain and DPDK versions inside it
+make -C conduit docker-build     # build the whole workspace inside it
 ```
 
 `docker-build` mounts the repository root at `/work` in the container and keeps cargo's registry and the Linux build output in two named Docker volumes, so later runs reuse them. The build output volume hides your host's `target/` directory from the container, so macOS and Linux artifacts never mix.
 
-Docker's virtual machine (on macOS, Docker Desktop's VM) needs at least 8 CPUs. The Makefile's test and benchmark targets put different jobs on fixed CPU numbers, up to CPU 7 by default; [Running the test suite](../testing/suite.md) lists them. In Docker Desktop the setting is under Settings, Resources, CPU limit.
+The example container below uses CPU 3, so Docker's virtual machine (on macOS, Docker Desktop's VM) needs at least 4 CPUs. The full test suite's default CPUs need 8, `docker-soak` 9, and the benchmark smoke run 13 (or `BENCH_CPUSET=3-6`); [Running the test suite](../testing/suite.md#cpus-and-timeouts) lists them. In Docker Desktop the setting is under Settings, Resources, CPU limit.
 
 ## Running a container for the examples
 
@@ -56,27 +57,38 @@ docker run --rm -it --init \
     switch-dpdk-test:local bash
 ```
 
-These are the same capabilities, mounts and volumes the Makefile's own targets use, so a build in this shell shares its cache with `make docker-build`. `--init` makes a small init process the container's first process, so Ctrl-C and `docker kill` reach the program you run.
+These are the same capabilities and cache volumes the Makefile's own targets use, so a build in this shell shares its cache with `make -C conduit docker-build`. `--init` makes a small init process the container's first process, so Ctrl-C and `docker kill` reach the program you run.
 
-`--cpuset-cpus=3` limits the whole container to CPU 3. The reason is a rule that runs through all of switch: a thread that drives the network runs on exactly one CPU, its [pinned CPU](../nic/cpus.md). When DPDK starts in a process, it pins its main thread to the one CPU the process is allowed to use, and it refuses to start, naming the count, if the process may run on more than one. Inside this container every process is allowed only CPU 3, so DPDK programs start without further setup, and `taskset -c 3` in the examples is correct too. Any free CPU works; change the number in both places if you pick another.
+`--cpuset-cpus=3` limits the whole container to CPU 3. The reason is a rule that runs through all of switch: a thread that drives the network runs on exactly one CPU, its [pinned CPU](../nic/cpus.md). `switch_open::open` checks that the calling thread may run on exactly one CPU and otherwise fails with `NotPinned`, naming how many it may use; it then starts DPDK with its main thread on that CPU. Inside this container every process is allowed only CPU 3, so the examples start without further setup, and `taskset -c 3` in their commands is correct too. Any free CPU works; change the number in both places if you pick another.
 
 Inside the container, build as usual:
 
 ```text
-root@container:/work# cargo build -p switch-net --example tcp_client
+root@container:/work# cargo build -p switch-net --example tcp_client_local
 ```
 
 The first build compiles DPDK's bindings and the workspace and takes a few minutes; the volumes keep the result for the next container.
 
 ## A Linux machine without Docker
 
-On Linux you can also install the toolchain natively. The machine needs what the Dockerfile (`conduit/docker/Dockerfile`) installs:
+On Linux you can also install the toolchain natively, the way the image (`conduit/docker/Dockerfile`) does it. On Ubuntu 24.04:
 
-- Rust 1.93.0. `rust-toolchain.toml` at the repository root pins it for cargo commands in this repository.
-- clang 18 and lld 18 on `PATH`, plus pkg-config, meson, ninja, python3-pyelftools, libnuma-dev, libpcap-dev, iproute2 and ethtool (Ubuntu 24.04 package names).
-- DPDK 25.11.3 built from source into `/opt/dpdk` with the Dockerfile's meson options, after applying `conduit/docker/dpdk-ena-read-clock.patch`.
+```sh
+sudo apt-get install build-essential make pkg-config clang-18 libclang-18-dev lld-18 \
+    meson ninja-build python3-pyelftools libnuma-dev libpcap-dev curl ca-certificates iproute2 ethtool
+sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
+sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
+```
 
-Then point the build at that DPDK and check it:
+Rust comes from `rustup`; `rust-toolchain.toml` at the repository root pins 1.99.1 for cargo commands in this repository.
+
+Then build and install DPDK into `/opt/dpdk` the way the image does. These are the image's build steps. On a native machine, copy `conduit/docker/dpdk-ena-read-clock.patch` to `/tmp`, then run the command after `RUN` in a shell, with `sudo` for `meson install`:
+
+```dockerfile
+{{#include ../../../conduit/docker/Dockerfile:dpdk}}
+```
+
+Point the build at that DPDK and check it:
 
 ```sh
 export PKG_CONFIG_PATH=/opt/dpdk/lib/pkgconfig
@@ -85,20 +97,20 @@ export RUSTFLAGS='-C linker=clang -C link-arg=-fuse-ld=lld'
 make -C conduit doctor
 ```
 
-`make doctor` checks that it runs on Linux, finds cargo, clang and pkg-config, finds `libdpdk`, and fails with `Expected DPDK 25.11.3` for any other version. The full list of what the test suite needs on a native machine (packetdrill, Scapy, sockperf) is in `conduit/docker/README.md`, section "Linux VM".
+`make doctor` checks that it runs on Linux, finds cargo, clang and pkg-config, finds `libdpdk`, and fails with `Expected DPDK 25.11.3` for any other version. The full test suite needs a few more tools on a native machine (packetdrill, Scapy, sockperf); `conduit/docker/README.md`, section "Linux VM", lists them.
 
 Running the examples natively also needs what the container grants: root, or `CAP_NET_ADMIN` and `/dev/net/tun`, for tap devices. Run each DPDK program under `taskset -c N` so it is allowed on one CPU.
 
 ## Tests that run without DPDK
 
-On any machine, including macOS without Docker, one root Makefile target runs most of the tests that need no DPDK:
+On any machine, including macOS without Docker:
 
 ```sh
 make test
 ```
 
-It runs `cargo test` for the runtime, the TLS and WebSocket protocol cores and the `ceph-*` crates, then the vendored smoltcp tests and the tests of the EC2 host-setup script. The frame and shared-memory crates also test natively, by name: `cargo test -p switch-frame -p shared-memory -p slice_ringbuffer`. [Running the test suite](../testing/suite.md) covers the full suite, which runs in Docker.
+[Running the test suite](../testing/suite.md#tests-that-run-anywhere) says what it covers and how to run the full suite in Docker.
 
 ## Where to go next
 
-With a container running, you have everything the next two pages need. [Your first task](first-task.md) runs the switch runtime alone, with no network, and works on your host machine too. [Your first network program](first-connection.md) then opens a tap device inside the container.
+With a container running, go on to [Your first network program](first-connection.md), which opens a tap device inside it.

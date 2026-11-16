@@ -1,6 +1,6 @@
 # The pinned CPU and helper threads
 
-A program that owns a NIC runs its drive loop on one CPU and keeps that CPU busy all the time. [Opening the NIC from code](open.md) and [Packet-buffer pools](pools.md) covered what `open` needs as arguments; this page covers what it needs from the machine: the rule `open` enforces about CPUs, how to arrange the rest of the machine's CPUs around it, and where DPDK's own threads end up.
+A program that owns a NIC runs its drive loop on one CPU and keeps that CPU busy all the time. [Opening the NIC from code](open.md) and [Packet-buffer pools](pools.md) covered what `open` needs as arguments; this page covers what it needs from the machine: the rule `open` enforces about CPUs, why [Preparing a Linux machine](host-setup.md) isolated a CPU, and where DPDK's own threads end up.
 
 ## Why one CPU
 
@@ -32,11 +32,7 @@ Pick the CPU with care on a real machine. It should be on the same NUMA node as 
 
 ## Isolated and housekeeping CPUs
 
-Pinning stops your thread from moving. It does not stop Linux from putting other work on the same CPU: other processes, interrupt handlers, kernel housekeeping. Each such interruption is a pause in your drive loop. To keep the pinned CPU to yourself, isolate it at boot with kernel options. The repository's EC2 setup script writes these:
-
-```text
-isolcpus=managed_irq,domain,<isolated> nohz_full=<isolated> rcu_nocbs=<isolated> irqaffinity=<housekeeping>
-```
+Pinning stops your thread from moving. It does not stop Linux from putting other work on the same CPU: other processes, interrupt handlers, kernel housekeeping. Each such interruption is a pause in your drive loop. To keep the pinned CPU to yourself, isolate it at boot with kernel options; [Preparing a Linux machine](host-setup.md#3-choosing-and-isolating-a-cpu) gives the boot line.
 
 An isolated CPU is one the kernel keeps other work off. Housekeeping CPUs are the rest: they run the operating system, take interrupts and host helper threads. A machine set up this way needs at least one of each. On a machine with two hardware threads per core, isolate the pinned CPU's sibling thread as well, so nothing shares the physical core; the EC2 script does.
 
@@ -67,7 +63,7 @@ In every case the thread's affinity is set back to the single pinned CPU before 
 
 ## In containers
 
-The repository's Docker setup runs its tests on one CPU per container, set with `--cpuset-cpus` (the Makefile variable `DOCKER_CPUSET`, default 0). Inside such a container `open` finds exactly one allowed CPU and uses it, and DPDK's helpers share it. That is fine for tests and for trying things.
+The repository's test containers run on one CPU. Inside such a container `open` finds exactly one allowed CPU and uses it, and DPDK's helpers share it. That is fine for tests and for trying things.
 
 To keep the helpers off the pinned CPU in a container, give the container the pinned CPU plus one or more housekeeping CPUs, start the program under `taskset -c` on the pinned CPU, and pass the other CPUs as `helper_cpus`. The junction daemon works this way: it passes the CPUs from its `--control-cpus` flag to `open` as `Some(&helper_cpus)`.
 

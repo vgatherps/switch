@@ -1,8 +1,8 @@
 # Your first task
 
-Before any network code, it helps to see the switch runtime on its own. This page runs async code with no NIC, no DPDK and no special permissions. Everything here builds and runs on macOS and on Linux as an ordinary user, outside the Docker container from [Setting up a build environment](environment.md).
+Before any network code, it helps to see the switch runtime on its own. This page runs async code with no NIC, no DPDK and no special permissions. Everything here builds and runs with cargo on macOS and on Linux as an ordinary user; the Docker container that network programs need comes on the next page.
 
-By the end you will have written three small tasks, run them, and seen the one idea that shapes every switch program: **your code owns the loop**. The runtime does nothing until you call it, and it never decides what time it is.
+By the end you will have run three short examples and seen the one idea that shapes every switch program: **your code owns the loop**. The runtime does nothing until you call it, and it never decides what time it is.
 
 ## Add the dependency
 
@@ -14,6 +14,8 @@ switch.workspace = true
 ```
 
 That is the only dependency. The `#[switch::task]` attribute used below comes with it.
+
+A program outside this repository depends on a clone of it: `switch = { path = "<clone>/switch" }`. The crates use Rust edition 2024.
 
 The code on this page is one program, `switch/examples/first_task.rs`. Run it with:
 
@@ -40,7 +42,7 @@ Line by line:
 - `Runtime::new(0)` creates the runtime. The `0` is its starting *tick*, the clock value the runtime believes it is at. More on ticks below.
 - `runtime.spawner()` returns a `Spawner`, a cheap, cloneable handle whose job is to start tasks (and, later, to create timers).
 - `hello("switch")` does not run the function body. It packages the argument into a token that describes the call. `spawner.spawn(..)` takes that token and starts the task.
-- `runtime.poll(0)` is one *poll* of the runtime: it runs every task that is ready, then returns a `PollReport`. Its `live_tasks` field counts the tasks that have not finished yet.
+- `runtime.poll(0)` is one *poll* of the runtime: it runs the tasks that are ready, then returns `Ok(PollReport)`; the `Err` cases are in [Panics, errors and shutdown](../runtime/errors.md), and `unwrap` is fine here. The report's `live_tasks` field counts the tasks that have not finished yet.
 
 The program prints `Hello, switch!` during the first poll. The task finishes, `live_tasks` is 0, and the loop ends.
 
@@ -90,7 +92,7 @@ At tick 0 the task runs, creates its sleep and parks: it is still live but not r
 
 This is why the hello loop above, `while poll(0).live_tasks != 0 {}`, is only safe for tasks that finish without timers. Had `hello` slept, that loop would run forever with the tick stuck at 0. A task that waits on a sleep needs a loop that moves the tick forward.
 
-In a real program the tick comes from a real clock, read once per loop pass. Programs that use the network pass nanoseconds since program start; [Driving the runtime](../runtime/driving.md#ticks) explains why.
+In a real program the tick comes from a real clock, read once each time through the loop. Programs that use the network pass nanoseconds since program start; [Driving the runtime](../runtime/driving.md#ticks) explains why.
 
 ## What you just saw
 
@@ -108,6 +110,6 @@ Every switch program has this shape:
     back to the top)
 ```
 
-The runtime does not sleep, read a clock or start threads. Nothing happens between two calls to `poll`. You decide how often to call it, what tick to pass, and what else the loop does between calls. In a network program, the other thing the loop does is move packets, and the next page adds exactly that.
+The runtime does not sleep, read a clock or start threads. Nothing happens between two calls to `poll`. You decide how often to call it, what tick to pass, and what else the loop does between calls. In a network program, the other thing the loop does is move packets, and [Your first network program](first-connection.md) adds exactly that.
 
-Next: [Your first network program](first-connection.md) puts a TCP client on this loop. For the full story of the runtime, read [The switch runtime](../runtime/index.md); for timers in depth, [Time and sleeping](../runtime/time.md).
+Next: [Setting up a build environment](environment.md) prepares the Linux environment that network programs need. For the full story of the runtime, read [The switch runtime](../runtime/index.md); for timers in depth, [Time and sleeping](../runtime/time.md).

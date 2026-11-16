@@ -69,7 +69,7 @@ There are two ways to send: copy bytes in, or hand over a frame you filled.
 
 `stack.tcp_mut(&handle).send_slice(data)` copies as much of `data` as fits and returns how many bytes it took. Two limits apply: the socket's free transmit bytes (`tx_capacity` minus what it holds), and free frames in the shared frame pool. When neither has room it returns `Ok(0)`; that is not an error. It returns `Err(SendError::InvalidState)` only when the socket's transmit side is not open.
 
-The echo step in the tap echo harness shows the usual pattern: read a frame, copy as much of it as fits, keep the rest for the next pass.
+The echo step in the tap echo harness shows the usual pattern: read a frame, copy as much of it as fits, keep the rest for the next time through the loop.
 
 ```rust,ignore
 {{#include ../../../conduit/crates/switch-tap-echo/src/lib.rs:echo}}
@@ -79,7 +79,7 @@ When `send_slice` stops short because the frame pool is empty, the socket is wok
 
 ### Handing over a frame: `tcp_send_frame`
 
-To write data in place, without a copy, take an empty frame from the Stack, fill it, shorten it to the length you wrote, freeze it and give it to the socket. From the readiness test:
+To write data in place, without a copy, take an empty frame from the Stack, fill it, shorten it to the length you wrote, freeze it and give it to the socket. In this excerpt from the readiness test, `pair.a` is a Stack and `h[0]` its TCP handle:
 
 ```rust,ignore
 let mut out = pair.a.tx_frame().unwrap();
@@ -98,7 +98,7 @@ assert!(pair.a.tcp_send_frame(&h[0], out).is_ok());
 | `SendFrameError::Empty` | The frame has zero length. |
 | `SendFrameError::Full` | The frame is longer than the socket's free transmit bytes (`frame_send_room()`). |
 
-A frame longer than the connection's segment size is copied into segment-sized frames when it is sent. `max_segment_payload()` returns that size once the connection is established.
+A frame goes out in place when it is sent as one whole segment. The Stack sends a segment by copying it into a packet from the TX pool instead when that is not possible: the frame is longer than the connection's segment size, the frame is shared or sliced, the segment spans several frames, or part of a frame is retransmitted. `max_segment_payload()` returns the segment size once the connection is established.
 
 ## Closing
 
@@ -115,21 +115,21 @@ Dropping a handle does not touch the socket immediately. The Stack processes dro
 
 ```text
  handle dropped
-       │  (next turn / receive / send / add_tcp / add_udp)
-       ▼
- unread in-order data? ──yes──▶ discard it, send reset ──────────┐
-       │ no                                                      │
-       ▼                                                         │
- SynSent? ──yes──▶ closed, nothing sent ─────────────────────────┤
-       │ no                                                      │
-       ▼                                                         │
- close: FIN after queued data                                    │
-       │                                                         │
-       ├─ FinWait2 with no FIN from peer for 60 s ──▶ closed ────┤
-       ├─ peer stops answering: closed after 8 backoffs ─────────┤
-       ▼                                                         │
- normal close, TIME-WAIT 10 s ───────────────────────────────────┤
-                                                                 ▼
+       |  (next turn / receive / send / add_tcp / add_udp)
+       v
+ unread in-order data? --yes--> discard it, send reset ----------+
+       | no                                                      |
+       v                                                         |
+ SynSent? --yes--> closed, nothing sent -------------------------+
+       | no                                                      |
+       v                                                         |
+ close: FIN after queued data                                    |
+       |                                                         |
+       +- FinWait2 with no FIN from peer for 60 s --> closed ----+
+       +- peer stops answering: closed after 8 backoffs ---------+
+       v                                                         |
+ normal close, TIME-WAIT 10 s -----------------------------------+
+                                                                 v
                                                      slot free again
 ```
 
