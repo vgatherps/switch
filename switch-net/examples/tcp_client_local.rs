@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
     };
 
-    // Every turn and every poll gets its time from this one clock.
+    // Every receive and every poll gets its time from this one clock.
     let clock = Clock { start: WallInstant::now() };
     // SAFETY: EAL creates the device named in the config, this thread owns it and every
     // packet, and EAL (`_eal` below) lives until the Port is closed.
