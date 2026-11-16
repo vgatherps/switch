@@ -6,15 +6,15 @@ A program gets its NIC in one of two ways. It can own the NIC itself, with the n
 
 ## The book
 
-The documentation is an mdBook in [`book/`](book/src/SUMMARY.md). Start with the [Introduction](book/src/introduction.md), then [How the pieces fit together](book/src/overview/architecture.md). To build it, or to read it rendered in a browser:
+The documentation is an mdBook in [`book/`](book/src/SUMMARY.md) plus each crate's API reference (rustdoc). Start with the [Introduction](book/src/introduction.md), then [How the pieces fit together](book/src/overview/architecture.md). To read both rendered in a browser:
 
 ```sh
-cargo install mdbook
-mdbook build book            # writes the HTML to book/book/
-mdbook serve book --open     # or build, serve and open it
+make docs        # builds the book and the API reference, and opens both
+make book        # the book only (needs mdbook: cargo install mdbook)
+make api-docs    # the API reference only
 ```
 
-API reference for each crate is its rustdoc, for example `cargo doc --no-deps -p switch --open`. Crates that use DPDK document only where DPDK is installed. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
+The API reference builds in the Docker image described under [Building](#building), because most of the crates need DPDK; build the image once with `make -C conduit docker-image`. The [crate map](book/src/reference/crates.md) lists every package and the chapter that covers it.
 
 ## Using the crates
 

@@ -2,7 +2,7 @@
 .NOTPARALLEL:
 .PHONY: help doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-switch-net test-wss test-binance test-memif test-autobahn-check test bench switch-memif-bench fuzz binance docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil test-smoltcp bench-stack docker-bench-stack test-packetdrill test-scapy packetdrill-build soak docker-soak
 .PHONY: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client
-.PHONY: test-junction
+.PHONY: test-junction doc docker-doc
 
 DOCKER ?= docker
 # Empty = native host architecture. DOCKER_PLATFORM=linux/amd64 builds through buildx (emulated on an
@@ -159,8 +159,8 @@ FUZZ_VARS = FUZZ_SEED=$(FUZZ_SEED) FUZZ_CONNECTIONS=$(FUZZ_CONNECTIONS) FUZZ_ONL
 	FUZZ_TIMEOUT=$(FUZZ_TIMEOUT)
 
 help:
-	@printf '%s\n' 'Native Linux: doctor build test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-switch-net test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench switch-memif-bench fuzz binance test-smoltcp bench-stack soak' \
-		'Docker: docker-image docker-doctor docker-build docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
+	@printf '%s\n' 'Native Linux: doctor build doc test-support test-sys test-buffer test-props test-stack test-stack-release test-echo test-switch-nic test-bench test-netconf test-switch-net test-wss test-binance test-memif test-autobahn-check test-packetdrill test-scapy test bench switch-memif-bench fuzz binance test-smoltcp bench-stack soak' \
+		'Docker: docker-image docker-doctor docker-build docker-doc docker-test docker-gate-self-test docker-bench docker-switch-memif-bench docker-bench-smoke docker-fuzz docker-binance-image docker-binance docker-autobahn-image docker-autobahn docker-tls-anvil docker-bench-stack docker-soak' \
 		'Junction Autobahn: docker-autobahn-junction docker-autobahn-junction-server docker-autobahn-junction-client' \
 		'Override image: make DOCKER_IMAGE=your-image docker-test' \
 		'Docs: README.md, docker/README.md (tests), crates/switch-nic/README.md (NIC host), docs/USAGE.md (API)'
@@ -181,6 +181,10 @@ doctor:
 
 build: doctor
 	cargo build --locked --workspace --all-targets --features proptest,dpdk-smoltcp/bench-offload
+
+# API reference for every workspace crate, with the switch-net modules of switch-tls and switch-ws.
+doc: doctor
+	cargo doc --locked --no-deps --workspace --features switch-tls/switch-net,switch-ws/switch-net
 
 test-support:
 	$(TIMEOUT) cargo test --locked -p switch-test-support -p switch-test-support-macros
@@ -317,6 +321,14 @@ docker-doctor:
 
 docker-build:
 	$(DOCKER_RUN) make build
+
+# make doc in the image, then target/doc copied out of the target volume to the host's
+# target/api-docs. No cpuset: nothing here starts EAL.
+API_DOCS = $(abspath $(CURDIR)/../target/api-docs)
+docker-doc:
+	mkdir -p "$(API_DOCS)"
+	$(DOCKER) run --rm --init $(DOCKER_ACCESS) -v "$(API_DOCS):/api-docs" $(DOCKER_IMAGE) \
+		sh -c 'make doc && rm -rf /api-docs/* && cp -a /work/target/doc/. /api-docs/'
 
 # make test in the switch container (bounded by MAKE_TEST_TIMEOUT), then both
 # Autobahn roles (docker-autobahn) even if make test failed; exit 0 only if both pass.
