@@ -3,11 +3,15 @@
 //!
 //! ```text
 //! cargo build -p switch-examples --features net --example tcp_client_junction
-//! taskset -c 3 target/debug/examples/tcp_client_junction /run/switch-junctiond/control.sock 10.77.0.1:7000
+//! taskset -c 2 target/debug/examples/tcp_client_junction /tmp/example-junction/control.sock 192.0.2.1:7000
 //! ```
 //!
 //! Pin the process before it connects: `Session::connect` starts a background thread
 //! that inherits the caller's CPU affinity.
+//!
+//! The peer is the Python TCP server in `tcp_client_local.rs`. Start the daemon with
+//! `taskset -c 0 target/debug/switch-junctiond --config examples/tap.json --dir /tmp/example-junction --control-cpus 1`,
+//! then assign `192.0.2.1/24` to `cdnic0` and bring it up before starting the client.
 
 use std::cell::Cell;
 use std::net::{SocketAddr, ToSocketAddrs};

@@ -1,5 +1,7 @@
 //! Your first task: spawn a task, get a value back, and wait on a timer, all on a
 //! runtime that only runs when `main` polls it.
+//!
+//! Run: `cargo run -p switch-examples --example first_task`. No peer.
 
 use switch::{JoinHandle, Runtime, Spawner};
 

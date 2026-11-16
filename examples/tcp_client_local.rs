@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo build -p switch-examples --features net --example tcp_client_local
-//! taskset -c 3 target/debug/examples/tcp_client_local tap.json 192.0.2.1:7000
+//! taskset -c 0 target/debug/examples/tcp_client_local examples/tap.json 192.0.2.1:7000
 //! ```
 //!
 //! `switch::nic::open` needs a calling thread allowed on exactly one CPU, hence `taskset`.
@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-//! taskset -c 3 target/debug/examples/tcp_client_local tap.json 192.0.2.1:7000 &
+//! taskset -c 0 target/debug/examples/tcp_client_local examples/tap.json 192.0.2.1:7000 &
 //! until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 //! ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 //! wait
@@ -25,17 +25,17 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant as WallInstant};
 
-use switch::nic::DEFAULT_NEIGHBOR_CAPACITY;
 use switch::Runtime;
 use switch::net::{tcp, Error, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle};
-use switch::nic::Config;
-use switch::nic::{open, Sizing};
+use switch::nic::{open, Config, Sizing, DEFAULT_NEIGHBOR_CAPACITY};
 
 const BUFFER: usize = 64 * 1024;
 const INGRESS_BUDGET: usize = 32;
 /// The longest sleep after a round that moved nothing: the kernel peer shares the CPU.
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const LIMIT: Duration = Duration::from_secs(30);
+/// There is no ephemeral port allocator; the local port must be nonzero.
+const LOCAL_PORT: u16 = 40000;
 
 // ANCHOR: clock
 /// Monotonic time since `start`: Stack time in microseconds and runtime ticks in nanoseconds.
@@ -45,9 +45,7 @@ struct Clock {
 
 impl Clock {
     fn now(&self) -> Instant {
-        let micros = i64::try_from(self.start.elapsed().as_micros())
-            .expect("elapsed wall time fits i64 microseconds");
-        Instant::from_micros(micros)
+        self.sample().0
     }
 
     fn ns(&self) -> u64 {
@@ -64,9 +62,6 @@ impl Clock {
 // ANCHOR_END: clock
 
 // ANCHOR: task
-/// There is no ephemeral port allocator; the local port must be nonzero.
-const LOCAL_PORT: u16 = 40000;
-
 /// Runs the conversation and leaves its result in `done` for the drive loop.
 #[switch::task]
 async fn hello(

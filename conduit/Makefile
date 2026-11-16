@@ -180,7 +180,7 @@ doctor:
 	pkg-config --modversion libdpdk
 
 build: doctor
-	cargo build --locked --workspace --all-targets --features proptest,dpdk-smoltcp/bench-offload
+	cargo build --locked --workspace --all-targets --features proptest,dpdk-smoltcp/bench-offload,switch-examples/ws
 
 # API reference for every workspace crate, including every switch facade module.
 doc: doctor

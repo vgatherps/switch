@@ -1,4 +1,6 @@
 //! Manual event and timer driving with caller-supplied ticks.
+//!
+//! Run: `cargo run -p switch-examples --example manual_loop`. No peer.
 
 use std::collections::VecDeque;
 use switch::{Runtime, Spawner};
@@ -16,22 +18,6 @@ async fn print_after_sleep(spawner: Spawner) {
 }
 // ANCHOR_END: sleep_task
 
-struct EventQueue {
-    pending: VecDeque<&'static str>,
-}
-
-impl EventQueue {
-    fn poll_nonblocking(&mut self, spawner: &Spawner) -> usize {
-        let mut dispatched = 0;
-        while let Some(event) = self.pending.pop_front() {
-            spawner.spawn(print_event(event)).unwrap();
-            dispatched += 1;
-        }
-        dispatched
-    }
-}
-
-
 fn main() {
     // ANCHOR: tick_loop
     let mut runtime = Runtime::new(100);
@@ -39,14 +25,14 @@ fn main() {
     let task_spawner = spawner.clone();
     spawner.spawn(print_after_sleep(task_spawner)).unwrap();
 
-    let mut events = EventQueue {
-        pending: VecDeque::from(["first event"]),
-    };
+    let mut events = VecDeque::from(["first event"]);
     for now in [100, 100, 110] {
         if now == 110 {
-            events.pending.push_back("event at deadline");
+            events.push_back("event at deadline");
         }
-        events.poll_nonblocking(&spawner);
+        while let Some(event) = events.pop_front() {
+            spawner.spawn(print_event(event)).unwrap();
+        }
         let report = runtime.poll(now).unwrap();
         println!("tick {now}: {report:?}");
     }

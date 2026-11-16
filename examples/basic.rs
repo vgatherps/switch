@@ -1,4 +1,6 @@
-//! Basic example.
+//! Spawn an immediate task and a task that yields once.
+//!
+//! Run: `cargo run -p switch-examples --example basic`. No peer.
 
 #[switch::task]
 async fn immediate() {

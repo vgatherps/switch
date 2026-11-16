@@ -7,10 +7,12 @@ publish = false
 
 [features]
 net = ["switch/net"]
-ws = ["net", "switch/ws"]
+tls = ["net", "switch/tls", "dep:rustls"]
+ws = ["tls", "switch/ws"]
 
 [dependencies]
 switch.workspace = true
+rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"], optional = true }
 
 [[example]]
 name = "first_task"
@@ -54,6 +56,26 @@ required-features = ["net"]
 name = "tcp_client_junction"
 path = "tcp_client_junction.rs"
 required-features = ["net"]
+
+[[example]]
+name = "udp_echo"
+path = "udp_echo.rs"
+required-features = ["net"]
+
+[[example]]
+name = "ws_echo_server"
+path = "ws_echo_server.rs"
+required-features = ["ws"]
+
+[[example]]
+name = "tls_client"
+path = "tls_client.rs"
+required-features = ["tls"]
+
+[[example]]
+name = "wss_client"
+path = "wss_client.rs"
+required-features = ["ws"]
 
 [lints]
 workspace = true

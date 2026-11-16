@@ -1,4 +1,6 @@
 //! Waking a switch task from another thread with a `RemoteWaker`.
+//!
+//! Run: `cargo run -p switch-examples --example remote_wake`. The peer is the worker thread.
 
 use std::future::poll_fn;
 use std::sync::atomic::{AtomicU32, Ordering};

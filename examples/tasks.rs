@@ -1,3 +1,7 @@
+//! Spawn from a task, then spawn a plain function's returned future.
+//!
+//! Run: `cargo run -p switch-examples --example tasks`. No peer.
+
 use switch::{Runtime, Spawner};
 
 // ANCHOR: async_task

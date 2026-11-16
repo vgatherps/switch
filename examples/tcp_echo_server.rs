@@ -1,10 +1,10 @@
 //! Echoes TCP bytes over the local backend on a Linux tap device.
 //!
-//! Build from the repository root, then run as root on an allowed CPU (3 below):
+//! Build from the repository root, then run as root on an allowed CPU (0 below):
 //!
 //! ```text
 //! cargo build -p switch-examples --features net --example tcp_echo_server
-//! taskset -c 3 target/debug/examples/tcp_echo_server examples/tap.json 7000 &
+//! taskset -c 0 target/debug/examples/tcp_echo_server examples/tap.json 7000 &
 //! server=$!
 //! until ip link show cdnic0 >/dev/null 2>&1; do kill -0 "$server" || exit 1; sleep 0.1; done
 //! ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up

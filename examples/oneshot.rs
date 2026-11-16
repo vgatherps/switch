@@ -1,4 +1,6 @@
 //! Handing one value from one task to another with a oneshot channel.
+//!
+//! Run: `cargo run -p switch-examples --example oneshot`. No peer.
 
 use switch::oneshot::{self, Receiver, Sender};
 use switch::{Runtime, Spawner};

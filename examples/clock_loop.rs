@@ -1,5 +1,7 @@
 //! A runtime driven by a real clock: ticks are nanoseconds since the program
 //! started, and the loop sleeps briefly between polls.
+//!
+//! Run: `cargo run -p switch-examples --example clock_loop`. No peer.
 
 use std::time::{Duration, Instant};
 
