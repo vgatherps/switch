@@ -74,7 +74,7 @@ Inside the container, `make test` from `conduit/Makefile` runs these targets in 
 | `test-packetdrill` | packetdrill scripts, scripted TCP conversations with exact timing, against `switch-tap-echo` |
 | `test-switch-net` | `switch-net`, a build of its benchmarks, and a build of the `switch-examples` programs that need only feature `net` |
 | `test-junction` | `switch-junction`, then `switch-junctiond` |
-| `test-wss` | `switch-ws` and `switch-tls` with their network support, against kernel servers over a tap device |
+| `test-wss` | `switch-ws` and `switch-tls` with their network support, against kernel servers over a tap device; then the guide's code blocks (doctests of `switch` with feature `ws`) and a build of every `switch-examples` program |
 | `test-binance` | `switch-binance-feed`, offline |
 | `test-memif` | `switch-memif-bench` |
 | `test-autobahn-check`, `test-scapy` | Self-tests of the Autobahn scripts and of the Scapy TCP fuzzer |

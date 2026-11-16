@@ -232,10 +232,13 @@ test-junction: doctor
 # switch-ws (WebSocket) and switch-tls (TLS), including their Docker tests over net_tap: switch-ws's ws://
 # and wss:// clients (switch-ws's switch-net feature) against kernel tungstenite servers, switch-tls's
 # TLS client (switch-tls's switch-net feature) against a kernel rustls server. `e2e` is each crate's
-# test-only feature for those tests (switch-net's testkit).
+# test-only feature for those tests (switch-net's testkit). Then the guide's code blocks (switch/docs),
+# which are doctests of `switch` and mostly need the network features, and every example program.
 test-wss: doctor
 	$(TIMEOUT) cargo test --locked -p switch-ws --features e2e -- --test-threads=1
 	$(TIMEOUT) cargo test --locked -p switch-tls --features e2e -- --test-threads=1
+	$(TIMEOUT) cargo test --locked --doc -p switch --features ws
+	$(TIMEOUT) cargo build --locked -p switch-examples --examples --features ws
 
 test-binance: doctor
 	$(TIMEOUT) cargo test --locked -p switch-binance-feed -- --test-threads=1
