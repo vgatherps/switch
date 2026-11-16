@@ -38,7 +38,7 @@ Packetdrill defaults to 25 ms, with stricter per-script overrides.
 DPDK is configured with `platform=generic`, `enable_stdatomic=false`, `mbuf_refcnt_atomic=false`
 and `enable_iova_as_pa=true`. It builds the ring, PCAP, TAP, memif and af_packet network PMDs
 (af_packet for its kernel RX timestamps), plus net/ena and net/intel/{ixgbe,i40e,ice} for the
-real-NIC runner `switch-nic` (runbook: crates/switch-nic/README.md). No test uses those four. mlx5
+real-NIC runner `switch-nic` (runbook: [docs/operations/switch-nic.md](../../docs/operations/switch-nic.md)). No test uses those four. mlx5
 is not built (it needs rdma-core). DPDK's own app/test targets are disabled. The image also
 installs sockperf 3.10 (checksum-pinned source build, `/opt/sockperf/bin/sockperf`) as the kernel
 client of `make test-switch-nic`.

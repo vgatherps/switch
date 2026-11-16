@@ -2,9 +2,7 @@
 
 These steps take a Linux machine with a spare network card to the point where a switch program owns that card. They are written for Ubuntu 24.04 and an Intel card; on EC2, follow [Running on EC2](ec2.md) instead.
 
-DPDK as the repository builds it (the Docker image, and `deploy/hft-host.sh`) has drivers for Intel E810 (`net_ice`), X710 and relatives (`net_i40e`), 82599 and X5xx (`net_ixgbe`) and Amazon ENA (`net_ena`), plus the virtual `net_tap`, `net_af_packet`, `net_memif`, `net_pcap` and `net_ring`. Other cards, such as Mellanox ConnectX, need a DPDK built with their driver.
-
-An E810 also needs its DDP package, `ice.pkg`. DPDK's driver loads it from `/lib/firmware/updates/intel/ice/ddp/` or `/lib/firmware/intel/ice/ddp/` when the card opens; without it the card does not start, and stderr contains `Failed to load the DDP package`.
+The repository builds DPDK with drivers for Intel's E810 (`net_ice`), its 700 series such as the X710 (`net_i40e`), its 82599, X520, X540 and X550 (`net_ixgbe`), and Amazon's ENA (`net_ena`). Other cards need a DPDK built with their driver.
 
 When a program owns a card, Linux no longer sees it: the interface disappears from `ip link`, and SSH, DNS and package updates cannot use it. The machine therefore needs two interfaces. The management interface stays with Linux and keeps the default route. The data interface is the one your program takes.
 
@@ -14,7 +12,7 @@ When a program owns a card, Linux no longer sees it: the interface disappears fr
  3. isolate a CPU                                root, boot options
  4. IOMMU on, or plan for --noiommu              root, boot options
  5. build switch-netconf and switch-nic
- 6. discover, check, bind                        bind: root, every boot
+ 6. discover, check, bind                        root; bind every boot
  7. switch-nic info                              root
  8. run your program                             root
  9. unbind when done                             root
@@ -28,7 +26,7 @@ To test two ports of one machine against each other, move the peer port into its
 
 ## 2. Reserve hugepages
 
-A real card's packet buffers live in hugepages, which must be reserved before the program starts. Reserve them on the NUMA node the card is attached to; the node number is in `/sys/class/net/<if>/device/numa_node`. For 1 GiB of 2 MiB pages on node `N`:
+DPDK takes the packet buffers of a real card from hugepages, which must be reserved before the program starts. Reserve them on the NUMA node the card is attached to; the node number is in `/sys/class/net/<if>/device/numa_node`. For 1 GiB of 2 MiB pages on node `N`:
 
 ```sh
 echo 512 | sudo tee /sys/devices/system/node/node<N>/hugepages/hugepages-2048kB/nr_hugepages
@@ -63,9 +61,7 @@ sudo systemctl disable --now irqbalance
 
 ## 4. IOMMU
 
-A PCI card is handed to a program through the `vfio-pci` kernel driver. With an IOMMU, the hardware limits which memory the card can reach. Turn it on in the firmware, and on Intel add `intel_iommu=on` to the boot options of step 3.
-
-A machine without an IOMMU, such as most virtual machines, can still bind the card in no-IOMMU mode with `switch-netconf bind --noiommu`. That mode taints the kernel, and `bind` refuses to use it without the flag.
+A PCI card is handed to a program through the `vfio-pci` kernel driver. With an IOMMU, the hardware limits which memory the card can reach. Turn it on in the firmware, and on Intel add `intel_iommu=on` to the boot options of step 3. Without one, binding needs `--noiommu` ([switch-netconf](switch-netconf.md#bind)).
 
 ## 5. Build the tools
 
@@ -83,13 +79,14 @@ cargo build --locked --release -p switch-nic
 
 The commands below assume both binaries from `target/release` are on your `PATH`.
 
-Without a native DPDK, build the Docker image (`make -C conduit docker-image`) and use this shell function, defined in the `conduit/` directory. It builds `switch-nic` in the image and runs it pinned to `SWITCH_CPU` (default 2), with the host's network, hugepages, VFIO devices and `/lib/firmware`, for the E810's DDP package:
+Without a native DPDK, build the Docker image (`make -C conduit docker-image`), `cd` into `conduit/`, and define this shell function there. It builds `switch-nic` in the image and runs it pinned to `SWITCH_CPU` (default 2), with the host's network, hugepages, VFIO devices, `/etc/switch` and `/lib/firmware`:
 
 ```sh
 nic() {
   docker run --rm -it --privileged --network host \
     --cpuset-cpus="${SWITCH_CPU:-2}" \
-    -v /dev/hugepages:/dev/hugepages -v /dev/vfio:/dev/vfio -v /lib/firmware:/lib/firmware:ro \
+    -v /dev/hugepages:/dev/hugepages -v /dev/vfio:/dev/vfio \
+    -v /etc/switch:/etc/switch:ro -v /lib/firmware:/lib/firmware:ro \
     -v "$PWD/..:/work" -w /work/conduit \
     -v switch-cargo-registry:/usr/local/cargo/registry -v switch-nic-target:/work/target \
     switch-dpdk-test:local sh -c 'cargo build --locked --release -p switch-nic &&
@@ -97,18 +94,17 @@ nic() {
 }
 ```
 
-File arguments to `nic` are relative to `conduit/`.
-
 ## 6. Discover, check and bind
 
 While the card is still on its kernel driver, write its config file and check it:
 
 ```sh
-switch-netconf discover --interface ens5f0 -o dut.json
-switch-netconf check dut.json
+sudo mkdir -p /etc/switch
+sudo switch-netconf discover --interface ens5f0 -o /etc/switch/dut.json
+switch-netconf check /etc/switch/dut.json
 ```
 
-`discover` prints `wrote dut.json`; `check` prints a summary of the file and exits 0. If the interface has no default route, `gateway` is `null`: set it by hand if the program must reach other subnets. Edit offloads, timestamps or EAL options now if you need them ([The network config file](config.md)), and run `check` again.
+`discover` prints `wrote /etc/switch/dut.json`; `check` prints a summary of the file and exits 0. If the interface has no default route, `gateway` is `null`: set it by hand if the program must reach other subnets. Edit offloads, timestamps or EAL options now if you need them ([The network config file](config.md)), and run `check` again.
 
 Next, stop your network manager from managing the interface and remove its addresses and routes, otherwise it puts the routes back and `bind` refuses. Under NetworkManager:
 
@@ -123,9 +119,9 @@ Under systemd-networkd, write a `.network` file that matches the interface and s
 Bind, first as a dry run:
 
 ```sh
-sudo switch-netconf bind dut.json --dry-run
-sudo switch-netconf bind dut.json             # with an IOMMU
-sudo switch-netconf bind dut.json --noiommu   # without one
+sudo switch-netconf bind /etc/switch/dut.json --dry-run
+sudo switch-netconf bind /etc/switch/dut.json             # the card has an IOMMU group
+sudo switch-netconf bind /etc/switch/dut.json --noiommu   # it has none
 ```
 
 A successful bind ends with lines like:
@@ -140,12 +136,14 @@ The binding does not survive a reboot; bind again after each boot. [switch-netco
 ## 7. Check with switch-nic info
 
 ```sh
-sudo taskset -c <cpu> switch-nic --config dut.json info 2>&1 | tee info.log
+sudo taskset -c <cpu> switch-nic --config /etc/switch/dut.json info 2>&1 | tee info.log
 ```
 
-With the Docker function: `SWITCH_CPU=<cpu> nic --config dut.json info 2>&1 | tee info.log`.
+With the Docker function: `SWITCH_CPU=<cpu> nic --config /etc/switch/dut.json info 2>&1 | tee info.log`.
 
 A good run exits 0 and its last lines include `switch-nic: link_status: up` and `switch-nic: port_close: ok`. DPDK writes its own messages to stderr, hence `2>&1`. [switch-nic](switch-nic.md) explains each line, and [Troubleshooting](troubleshooting.md) each error.
+
+An E810 also needs its DDP package, `ice.pkg`, which DPDK's driver loads from `/lib/firmware/updates/intel/ice/ddp/` or `/lib/firmware/intel/ice/ddp/`. Without it the card does not start, and stderr contains `Failed to load the DDP package`.
 
 ## 8. Run your program
 
@@ -164,7 +162,7 @@ python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s
 Then run the client as root, pinned to the isolated CPU:
 
 ```sh
-sudo taskset -c <cpu> target/release/examples/tcp_client_local dut.json <peer>:7000
+sudo taskset -c <cpu> target/release/examples/tcp_client_local /etc/switch/dut.json <peer>:7000
 ```
 
 It prints the report from opening the card, then the server's reply `tick`, then `port closed`.
@@ -172,7 +170,7 @@ It prints the report from opening the card, then the server's reply `tick`, then
 ## 9. Give the card back
 
 ```sh
-sudo switch-netconf unbind dut.json
+sudo switch-netconf unbind /etc/switch/dut.json
 ```
 
 This puts the card back on its kernel driver and prints whether the IPv4 address came back on the interface. It does not restore addresses or routes: hand the interface back to your network manager (`sudo nmcli device set ens5f0 managed yes`) for that. Remove the boot options to undo the isolation and the permanent hugepages.

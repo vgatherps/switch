@@ -1,6 +1,14 @@
 # Running the tests
 
-Most of the workspace links DPDK and builds only on Linux with DPDK 25.11.3. The rest builds anywhere. So there are two entry points: `make test` at the repository root runs the tests that need no DPDK, on macOS or Linux, and `make docker-test` runs everything in the Docker image. Run the first while you work and the second before you push.
+Most of the workspace links DPDK and builds only on Linux with DPDK 25.11.3; the rest builds anywhere. Each suite runs under one of these commands:
+
+| Command | Where | Runs |
+|---|---|---|
+| `make test` (repository root) | macOS or Linux | The tests of the packages that need no DPDK, the vendored smoltcp's tests, and the EC2 host setup script's tests |
+| `make docker-test` | the Docker image | The DPDK suites (the targets of `conduit/Makefile`'s `make test`), then the Autobahn WebSocket suite |
+| `make miri` | macOS or Linux, nightly toolchain | The runtime's and `switch-ws`'s unsafe code under Miri |
+
+`make docker-test` does not run the tests of `switch-runtime`, `switch`, `switch-examples`, `switch-macros`, `switch-depot`, `switch-frame`, `shared-memory`, `slice_ringbuffer` or the `ceph-*` crates, nor the host setup script's tests; only the root `make test` does. Run `make test` while you work and both before you push.
 
 ## Tests that need no DPDK
 
@@ -12,7 +20,7 @@ make test
 
 This runs `cargo test` for `switch-runtime`, `switch`, `switch-examples`, `switch-macros`, `switch-depot`, `switch-frame`, `shared-memory`, `slice_ringbuffer`, `switch-ws`, `switch-tls` and the five `ceph-*` crates. `switch`, `switch-examples`, `switch-ws` and `switch-tls` are built without their network features here, because those need DPDK. Then it runs the vendored smoltcp's tests, and last `sh deploy/test-hft-host.sh`, which tests the EC2 host setup script against a fake `/proc`, `/sys` and `/etc` without root. That script ends with `test-hft-host: all passed`.
 
-Two more packages test without DPDK when you name them:
+`switch-test-support`, its macros and `switch-sockperf-wire` need no DPDK either. `make docker-test` runs their tests (targets `test-support` and `test-switch-nic`); on macOS, run them by name:
 
 ```sh
 cargo test --locked -p switch-sockperf-wire
@@ -117,7 +125,7 @@ Natively, the tests that create tap devices and veth pairs need root or `CAP_NET
 
 ## Tests that need two CPUs
 
-Two tests check where DPDK's helper threads run, so they need more than the one CPU every other DPDK test requires. Inside `make test` they print `SKIP: ...` and pass. Run them by hand when you change how `switch-open` or `switch-junctiond` place helper threads. Start the container above with `--cpuset-cpus=0,2` instead of `--cpuset-cpus=3`, and run each test on its own with `--exact`, because the tests around it need exactly one CPU:
+The tests of where DPDK's helper threads run need more than the one CPU every other DPDK test requires. Inside `make test` they print `SKIP: ...` and pass. Run them by hand when you change how `switch-open` or `switch-junctiond` place helper threads. Start the container above with `--cpuset-cpus=0,2` instead of `--cpuset-cpus=3`, and run each test on its own with `--exact`, because the tests around it need exactly one CPU:
 
 ```sh
 cargo test --locked -p switch-open --lib eal_affinity::tests::eal_helpers_avoid_polling_cpu -- --exact
@@ -190,4 +198,4 @@ It writes a `.log` and `.exit` file per suite and `tests.json`, and exits 0 only
 make docs
 ```
 
-builds the API reference of every workspace crate, with all of `switch`'s features, in the Docker image, writes it to `target/api-docs`, and opens `target/api-docs/switch/index.html`.
+builds the API reference of every workspace crate, with all of `switch`'s features, in the Docker image (build it first with `make -C conduit docker-image`), writes it to `target/api-docs`, and opens `target/api-docs/switch/index.html`.

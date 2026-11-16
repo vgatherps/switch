@@ -43,19 +43,19 @@ eal: {"file_prefix":"switch-tap","extra":["--no-huge","-m","256","--no-shconf"]}
 `mac: device` means the file has `"mac": null`, so the device's own address is used. Path rules print one per line under `paths:`, as `10.0.0.0/16 mtu 1500 (vpc)`. An invalid file prints the reason and exits 1:
 
 ```text
-$ switch-netconf check dut.json
-switch-netconf: dut.json: gateway: gateway must be inside the IPv4 subnet
+$ switch-netconf check /etc/switch/dut.json
+switch-netconf: /etc/switch/dut.json: gateway: gateway must be inside the IPv4 subnet
 ```
 
 [The network config file](config.md#checking-a-file) lists every message.
 
 ## discover
 
-`discover` writes a config for an interface that is still on its Linux driver, from what the kernel knows about it: its IPv4 address and prefix, MAC address, MTU, PCI address and id, driver and NUMA node. It takes the gateway from the interface's default route; without one, `gateway` is `null`. It does not need root.
+`discover` writes a config for an interface that is still on its Linux driver, from what the kernel knows about it: its IPv4 address and prefix, MAC address, MTU, PCI address and id, driver and NUMA node. It takes the gateway from the interface's default route; without one, `gateway` is `null`. It needs root only to write under `/etc`.
 
 ```sh
-switch-netconf discover --interface eth1               # print the config on stdout
-switch-netconf discover --interface eth1 -o dut.json   # write or update dut.json
+switch-netconf discover --interface eth1                                # print the config on stdout
+sudo switch-netconf discover --interface eth1 -o /etc/switch/dut.json   # write or update the file
 ```
 
 For what the kernel cannot tell it, a new file gets:
@@ -96,16 +96,16 @@ With `--aws`, `discover` also asks the EC2 instance metadata service at `169.254
 - every path rule not labelled `vpc` or `default`;
 - `owned_ipv4`, except with `--aws`, which replaces it.
 
-For each key that changed it prints `changed: <key>` on stderr, and for `owned_ipv4` also one `owned_ipv4 removed: <cidr>` or `owned_ipv4 added: <cidr>` line per entry. If the write fails or is interrupted, the old file stays as it was. So you can edit the keys you care about and run `discover -o` again whenever the machine's network changes.
+For each key that changed it prints `changed: <key>` on stderr, and for `owned_ipv4` also one `owned_ipv4 removed: <cidr>` or `owned_ipv4 added: <cidr>` line per entry. The file is replaced in one step, so an interrupted update leaves either the complete old file or the complete new one. The `changed:` lines are printed after the new file is in place: if printing them fails, `discover` exits 1 with the new file already installed. So you can edit the keys you care about and run `discover -o` again whenever the machine's network changes.
 
 ## bind
 
 `bind` hands a PCI card to `vfio-pci`. Run it as root after `discover` and `check`:
 
 ```sh
-switch-netconf bind dut.json --dry-run    # prints every write, changes nothing
-switch-netconf bind dut.json              # with an IOMMU
-switch-netconf bind dut.json --noiommu    # without one
+switch-netconf bind /etc/switch/dut.json --dry-run    # prints every write, changes nothing
+switch-netconf bind /etc/switch/dut.json              # the card has an IOMMU group
+switch-netconf bind /etc/switch/dut.json --noiommu    # it has none
 ```
 
 Before it writes anything, `bind` checks that:
@@ -128,14 +128,14 @@ Each refusal is one line on stderr, exit 1, with nothing changed. [Troubleshooti
 node0 hugepages-2048kB HugePages_Free: 512
 ```
 
-If a step fails after the card left its Linux driver, `bind` puts it back and says which driver it ended on. A card already on `vfio-pci` prints `0000:00:06.0 already bound to vfio-pci (...)` and exits 0, so running `bind` again finishes an interrupted run.
+If a step fails after the card left its Linux driver, `bind` tries to give it back to that driver and reports the driver the card ended on. A card already on `vfio-pci` prints `0000:00:06.0 already bound to vfio-pci (...)` and exits 0, so running `bind` again finishes an interrupted run.
 
-`--noiommu` turns on the kernel's no-IOMMU mode for `vfio-pci`. Nothing then stops the card from writing to any memory, and the kernel marks itself tainted. On machines without an IOMMU, such as EC2 instances other than bare metal, it is the only way to bind a card.
+`--noiommu` turns on the kernel's no-IOMMU mode for `vfio-pci`, which `bind` refuses to use without the flag when the card has no IOMMU group. Nothing then stops the card from writing to any memory, and the kernel marks itself tainted. It is the only way to bind a card that has no IOMMU group.
 
 ## unbind
 
 ```sh
-switch-netconf unbind dut.json
+switch-netconf unbind /etc/switch/dut.json
 ```
 
 `unbind` gives the card back to its `kernel_driver`, checks that the `kernel_interface` reappeared, and prints whether the address came back:

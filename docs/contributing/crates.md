@@ -1,6 +1,6 @@
 # Crate map
 
-The workspace has 30 packages. Applications depend on one of them, `switch`, which re-exports what an application uses from the others. Everything else is a building block under `switch`, a tool, a benchmark or test infrastructure.
+Applications depend on one package, `switch`, which re-exports what an application uses from the others. Everything else in the workspace is a building block under `switch`, a tool, a benchmark or test infrastructure.
 
 "Needs DPDK" means the package links DPDK's C libraries, so it builds only on Linux with DPDK 25.11.3, or in the Docker image. The packages marked "no" build and test on macOS too; [Running the tests](testing.md) says which of them `make test` covers.
 
@@ -26,8 +26,8 @@ The workspace has 30 packages. Applications depend on one of them, `switch`, whi
 | `switch-net` | `switch-net/` | yes | Async TCP and UDP sockets for tasks, over a card the process owns or one shared through `switch-junctiond`; `switch::net` |
 | `switch-tls` | `switch-tls/` | only with feature `switch-net` | A TLS 1.3 client over a TCP stream; `switch::tls` |
 | `switch-ws` | `switch-ws/` | only with feature `switch-net` | WebSocket: `wss://` and `ws://` clients and a `ws://` server; `switch::ws`. Also the binary `switch-ws-autobahn` (feature `e2e`), the [Autobahn](conformance.md#autobahn) driver |
-| `switch-junction` | `switch-junction/` | no | The client side of the junction daemon: a session with `switch-junctiond` over a Unix socket and shared memory; `switch::junction` |
-| `switch-junctiond` | `switch-junctiond/` | yes | The junction daemon, which owns one card and serves sockets to applications on the same machine. Its library holds the daemon's network loop for in-process test fixtures |
+| `switch-junction` | `switch-junction/` | no | The client side of sharing a card through the daemon: a session with `switch-junctiond` over a Unix socket and shared memory; `switch::junction` |
+| `switch-junctiond` | `switch-junctiond/` | yes | The daemon, which owns one card and serves sockets to applications on the same machine. Its library holds the daemon's network loop for in-process test fixtures |
 
 ## Owning a network card
 
@@ -43,14 +43,14 @@ The workspace has 30 packages. Applications depend on one of them, `switch`, whi
 
 ## Frames, shared memory and rings
 
-These sit under `switch-net` and the junction daemon.
+These sit under `switch-net` and `switch-junctiond`.
 
 | Package | Directory | Needs DPDK | What it is |
 |---|---|---|---|
 | `switch-frame` | `switch-frame/` | no | Packet frames, the buffers every layer hands to application code |
 | `shared-memory` | `shared-memory/` | no | Shared-memory backings and single or mirrored mappings |
-| `slice_ringbuffer` | `vendor/slice_ringbuffer/` | no | A one-writer, one-reader shared-memory record ring: the junction daemon's receive path |
-| `ceph-ring` | `cephalopod/crates/ring/` | no | Per-CPU shared-memory rings with many writers and one reader: the junction daemon's send path |
+| `slice_ringbuffer` | `vendor/slice_ringbuffer/` | no | A one-writer, one-reader shared-memory record ring: how received packets reach an application that shares a card through the daemon |
+| `ceph-ring` | `cephalopod/crates/ring/` | no | Per-CPU shared-memory rings with many writers and one reader: how such applications send to the daemon |
 | `ceph-rseq` | `cephalopod/crates/rseq/` | no | The record layout and the write into a per-CPU ring that `ceph-ring` uses |
 | `ceph-fifo` | `cephalopod/crates/fifo/` | no | Ordered delivery per stream over `ceph-ring` |
 | `ceph-proto` | `cephalopod/crates/proto/` | no | Types shared by `ceph-fifo` and `ceph-control` |
@@ -68,4 +68,4 @@ These sit under `switch-net` and the junction daemon.
 | `switch-test-support-macros` | `conduit/switch-test-support/switch-test-support-macros/` | no | The `#[pinned_test]` attribute itself; use it through `switch-test-support` |
 | `switch-test-kit` | `conduit/switch-test-support/switch-test-kit/` | yes | DPDK test fixtures: fake ports, simulated wires, two-stack pairs |
 
-Two vendored crates are outside the workspace: smoltcp, which `dpdk-smoltcp` is built on, in `conduit/vendor/smoltcp`, and rustls, which `switch-tls` uses, in `vendor/rustls`. smoltcp's tests run in `make test`. `vendor/rustls` is the crates.io release with the patches in `vendor/patches/rustls/` applied; never edit it by hand, and `make vendor-check` fails if it differs from release plus patches.
+The vendored smoltcp, which `dpdk-smoltcp` is built on, is outside the workspace in `conduit/vendor/smoltcp`; its tests run in `make test`. So is rustls, which `switch-tls` uses, in `vendor/rustls`: the crates.io release with the patches in `vendor/patches/rustls/` applied. Never edit it by hand; `make vendor-check` fails if it differs from release plus patches.

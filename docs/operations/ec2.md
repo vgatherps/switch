@@ -6,17 +6,17 @@ On EC2 the data card is an ENA, Amazon's virtual network card, which DPDK drives
 
 Do these in the AWS console or CLI.
 
-1. Give the instance two network interfaces (ENIs). The primary one (device number 0) stays with Linux: it carries SSH and the instance metadata service and keeps the default route. Attach a second ENI for your program, with ENA Express off.
-2. AWS gives no public IPv4 address to an instance with more than one ENI. If your program talks to the internet, attach an Elastic IP to the data ENI, or route its subnet through a NAT gateway.
+1. Give the instance two network interfaces (ENIs). The primary one (device number 0) stays with Linux: it carries SSH and the instance metadata service and keeps the default route. The second ENI is for your program.
+2. AWS does not auto-assign a public IPv4 address when you launch with more than one network interface ([AWS: Manage the IPv4 addresses](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/working-with-ip-addresses.html)), so either attach the second ENI after launch or give the primary one an Elastic IP for SSH. If your program talks to the internet, attach an Elastic IP to the data ENI, or route its subnet through a NAT gateway; `switch-netconf discover --aws` warns when the data ENI has no public address.
 3. Allow your program's ports on the data ENI's security group, for example outbound TCP 9443 for the market-data feed of `switch-nic feed`.
 4. Choose an instance type with at least two physical cores on the data ENI's NUMA node plus one more CPU. The script isolates two cores and needs a CPU left for Linux.
-5. For hardware receive timestamps, choose a family whose ENA provides them and a PTP hardware clock. Per AWS's user guide these are M7a, M7g, M7gd, M7i, M7i-flex, M8a, M8g, M8i, M8i-flex, M9g, M9gd, C7a, C7gd, C7i, C7i-flex, C8a, C8g, C8gd, C8i, C8i-flex, C9g, C9gd, R7a, R7g, R7i, R8a, R8g, R9g, R9gd, X8g and X8i (not C7gn). Launch it in a placement group with the `precision-time` strategy:
+5. For hardware receive timestamps and the card's clock (`/dev/ptp_ena`), choose a family that supports AWS's precision time placement groups, such as M7g or C7i ([AWS lists them](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configure-ec2-ntp.html)), and launch it in a placement group with the `precision-time` strategy:
 
    ```sh
    aws ec2 create-placement-group --group-name G --strategy precision-time
    ```
 
-   and launch with `--placement GroupName=G`. An instance is in one placement group only, so it cannot also be in a cluster placement group.
+   and launch with `--placement GroupName=G`. An instance can be in one placement group at a time, so it cannot also be in a cluster placement group.
 
 ## By hand
 
@@ -25,12 +25,13 @@ Follow [Preparing a Linux machine](host-setup.md) with these changes.
 - Discover with `--aws`. It reads the ENI's address, subnet, gateway and VPC address ranges from the instance metadata service, and refuses the primary ENI:
 
   ```sh
-  switch-netconf discover --interface <data-if> --aws -o dut.json
+  sudo mkdir -p /etc/switch
+  sudo switch-netconf discover --interface <data-if> --aws -o /etc/switch/dut.json
   ```
 
   From inside a Docker container this needs `--network host`.
-- Bind with `--noiommu`. Instances other than bare metal have no IOMMU.
-- Amazon Linux 2023 manages interfaces with systemd-networkd. Before binding, write `/etc/systemd/network/00-switch-data.network`:
+- If `bind` refuses with `no-IOMMU mode taints the kernel and needs --noiommu`, the ENI has no IOMMU group; bind with `--noiommu`.
+- Amazon Linux 2023 manages interfaces with systemd-networkd ([AWS: Networking service](https://docs.aws.amazon.com/linux/al2023/ug/networking-service.html)). Before binding, write `/etc/systemd/network/00-switch-data.network`:
 
   ```ini
   [Match]
@@ -41,8 +42,8 @@ Follow [Preparing a Linux machine](host-setup.md) with these changes.
   ```
 
   then run `sudo networkctl reload` and flush the interface's addresses and routes as in [step 6](host-setup.md#6-discover-check-and-bind).
-- Use a `vfio-pci` module with write combining, which ENA's fast transmit mode (LLQ) needs. Amazon Linux 2023's `kernel6.18` package has it. For older kernels Amazon publishes a patched module in its `amzn-drivers` repository, under `userspace/dpdk/enav2-vfio-patch`.
-- To compare hardware timestamps with the system clock, add `ena.phc_enable=1` to the boot options, which exposes the ENA's clock as `/dev/ptp_ena`, and after the reboot add `refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer` to `/etc/chrony.conf` and restart `chronyd`, so the system clock follows the card's.
+- ENA's low-latency queue mode needs a `vfio-pci` with write combining, which mainline `vfio-pci` does not have (DPDK's ENA guide). Amazon's ENA DPDK documentation in its `amzn-drivers` repository, under `userspace/dpdk`, describes the patched module. `hft-host.sh` accepts the module of Amazon Linux 2023's official `kernel6.18` package and installs Amazon's patched one on older kernels.
+- To compare hardware timestamps with the system clock, add `ena.phc_enable=1` to the boot options. On a recent Amazon Linux 2023 the card's clock then appears as `/dev/ptp_ena`; after the reboot add `refclock PHC /dev/ptp_ena poll 0 delay 0.000010 prefer` to `/etc/chrony.conf` and restart `chronyd`, so the system clock follows the card's.
 
 ## With hft-host.sh
 
@@ -110,7 +111,7 @@ sudo taskset -c "$APP_CPU" switch-nic --config /etc/switch/dut.json info
 sudo deploy/run-binance.sh --seconds 3600
 ```
 
-Its arguments go to `switch-nic feed` ([switch-nic](switch-nic.md#feed)). It refuses to start unless `hft-host.sh verify` passes and chrony has the ENA hardware clock selected, which needs the `precision-time` placement group. It writes `/etc/switch/binance.json`, a copy of `dut.json` with `rx_timestamps` on, runs the feed on `APP_CPU`, and appends the output to `/var/log/switch/binance.log`. On an instance type without hardware timestamps, opening the card fails with `PMD lacks the requested RX timestamp offload`.
+Its arguments go to `switch-nic feed` ([switch-nic](switch-nic.md#feed)). It refuses to start unless `hft-host.sh verify` passes and chrony has selected the ENA hardware clock, which requires `/dev/ptp_ena` (step 5 of [Before you log in](#before-you-log-in)). It writes `/etc/switch/binance.json`, a copy of `dut.json` with `rx_timestamps` on, runs the feed on `APP_CPU`, and appends the output to `/var/log/switch/binance.log`. On an instance type without hardware timestamps, opening the card fails with `PMD lacks the requested RX timestamp offload`.
 
 ## Running your own program
 

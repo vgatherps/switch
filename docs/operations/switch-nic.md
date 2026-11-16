@@ -20,7 +20,7 @@ cargo build --locked --release -p switch-nic
 Like every program that opens a card, it must be allowed on exactly one CPU ([CPUs](cpus.md)). Run it as root for a real card:
 
 ```sh
-sudo taskset -c 3 target/release/switch-nic --config dut.json info 2>&1 | tee info.log
+sudo taskset -c 3 target/release/switch-nic --config /etc/switch/dut.json info 2>&1 | tee info.log
 ```
 
 Results go to stdout, one per line, as `switch-nic: <key>: <value>`. DPDK writes its own messages to stderr, and they often explain a failure, so keep both streams.
@@ -36,7 +36,7 @@ An argument error prints `switch-nic: error: <problem>` followed by the usage te
 
 ## info
 
-`info` opens the card, prints the report, and closes it. If `info` exits 0, your program can open the card with the same config. This is a run on the tap device from [the config page](config.md#two-examples):
+`info` opens the card, prints the report, and closes it. If `info` exits 0, your program can open the card with the same config. This is a run on the tap device from [the config page](config.md#examples):
 
 ```text
 switch-nic: driver: net_tap
@@ -78,7 +78,7 @@ switch-nic: port_close: ok
 | `rx_checksum`, `tx_tcp_checksum`, `tx_udp_checksum` | each offload, whether it was requested and why ([Offloads](offloads.md)) |
 | `link_speed_mbps`, `link_duplex`, `link_status` | the link as the card reports it |
 | `gateway` | `none`, or the gateway's address, Ethernet address and how long it took to answer ARP: `gateway: 10.0.1.1 at 0a-12-34-56-78-01 after 1 ms` |
-| `hugepages` | per hugepage size, the pages this process took (`used`) and those still free |
+| `hugepages` | per hugepage size, how far the system's free count dropped while the card opened (`used`) and the free count afterwards |
 | `eth_stats` | the card's counters: packets in and out, packets dropped because no buffer was free (`imissed`, `rx_nombuf`), and errors |
 | `port_close` | `ok` when every packet buffer came back |
 
@@ -92,21 +92,21 @@ To find out which offloads a card accepts, run `info` once with `"offloads": "au
 |---|---|---|
 | `--udp-ports P[,P..]` | `11111` | UDP ports to answer on, one socket each |
 | `--tcp-port P` | none | TCP port to accept connections on |
-| `--tcp-connections N` | 8 | TCP connections open at once; only with `--tcp-port` |
+| `--tcp-connections N` | 8 | TCP connections open at once; ignored without `--tcp-port` |
 | `--seconds S` | 0 | stop after S seconds; 0 runs until SIGINT or SIGTERM |
 | `--report-seconds R` | 5 | print counters every R seconds |
 
 ```sh
-sudo taskset -c 3 switch-nic --config dut.json sockperf-server --udp-ports 11111 --tcp-port 11112 \
+sudo taskset -c 3 switch-nic --config /etc/switch/dut.json sockperf-server --udp-ports 11111 --tcp-port 11112 \
     --tcp-connections 16 2>&1 | tee server.log
 ```
 
 On the client machine, with sockperf 3.10:
 
 ```sh
-sockperf ping-pong -i 10.0.1.23 -p 11111 -t 10 --msg-size 64 --data-integrity
-sockperf ping-pong -i 10.0.1.23 -p 11112 --tcp -t 10 --msg-size 64 --data-integrity
-sockperf under-load -i 10.0.1.23 -p 11111 -t 10 --msg-size 64 --mps 10000
+sockperf ping-pong --ip 10.0.1.23 --port 11111 -t 10 --msg-size 64 --data-integrity
+sockperf ping-pong --ip 10.0.1.23 --port 11112 --tcp -t 10 --msg-size 64 --data-integrity
+sockperf under-load --ip 10.0.1.23 --port 11111 -t 10 --msg-size 64 --mps 10000
 ```
 
 A clean client run ends with `# dropped messages = 0; # duplicated messages = 0; # out-of-order messages = 0`.
@@ -120,15 +120,15 @@ Once listening, the server prints `udp_listen` and `tcp_listen` lines and `switc
 | Line | Meaning |
 |---|---|
 | `report: periodic`, `report: final` | start of a report |
-| `udp: received= replies= malformed=` | UDP messages received, answered, and rejected as malformed |
-| `tcp: received= replies= malformed= accepted= closed=` | the same for TCP, plus connections accepted and closed |
+| `udp: received= replies= malformed=` | UDP messages received, replies sent, and messages rejected as malformed |
+| `tcp: received= replies= malformed= accepted= closed=` | the same for TCP, where `replies` counts replies queued; `accepted` counts connection slots seen outside `LISTEN` and `CLOSED` (including handshakes not yet complete), and `closed` counts those later seen back in `LISTEN` or `CLOSED` |
 | `udp_timestamps: datagrams= stamped= first= last= decreases=`, `tcp_timestamps: segments= ...` | only with `rx_timestamps` on; see below |
 | `udp_socket: port= pending= UdpSocketStats { rx_dropped_full: }` | per UDP port: `pending=1` while a reply waits for room to send or for ARP; `rx_dropped_full` counts datagrams dropped because the socket's receive queue was full |
 | `tcp_socket: slot= state= retransmits= loss_events= rx_refused_segments=` | per TCP connection slot: its state (`LISTEN`, `ESTABLISHED`, ...), segments sent again, loss episodes, and out-of-order segments refused because too many were already held |
 | `stack_totals` | packets received, rejected and processed, packets sent, and what is still queued |
 | `eth_stats` | the card's counters, as in `info` |
 
-The timestamp lines count the UDP datagrams, or the TCP frames handed to the server, that arrived (`datagrams`, `segments`) and how many carried a hardware timestamp (`stamped`). `first` and `last` are the first and latest stamp, in the driver's raw units ([Offloads](offloads.md#hardware-receive-timestamps)). `decreases` counts stamps lower than the previous one on the same socket; that is not an error. A nonzero stamp while `rx_timestamps` is off stops the server with `nonzero RX timestamp <n> with rx_timestamps disabled`.
+The timestamp lines count the UDP datagrams, or the TCP frames handed to the server, that arrived (`datagrams`, `segments`) and how many carried a hardware timestamp (`stamped`). `first` and `last` are the first and latest stamp, in the driver's raw units ([Offloads](offloads.md#hardware-receive-timestamps)). `decreases` counts stamps lower than the previous one on the same socket; that is not an error.
 
 On SIGINT, SIGTERM or the end of `--seconds`, the server closes its TCP connections, waiting up to five seconds, prints the final report and closes the card. It exits 3 if the connections did not close in time or a UDP reply was still unsent.
 
@@ -137,7 +137,7 @@ On SIGINT, SIGTERM or the end of `--seconds`, the server closes its TCP connecti
 `conduit/crates/switch-nic/sockperf_merge.py` combines the latency logs of several `under-load` clients into one summary. Run each client with `--full-rtt --full-log <file>`, then merge the files:
 
 ```sh
-sockperf under-load -i 10.0.1.23 -p 11111 -t 10 --mps 10000 --full-rtt --full-log client1.full
+sockperf under-load --ip 10.0.1.23 --port 11111 -t 10 --mps 10000 --full-rtt --full-log client1.full
 python3 conduit/crates/switch-nic/sockperf_merge.py client1.full client2.full
 ```
 

@@ -1,6 +1,6 @@
 # CPUs
 
-A program that owns a card runs its loop on one CPU and keeps that CPU busy all the time. It never waits for the kernel to report a packet; it asks the card again and again. That gives the shortest delay between a packet arriving and the program seeing it, and costs one CPU at 100% whether traffic flows or not.
+A program that owns a card runs its loop on one CPU and keeps that CPU busy all the time. It never waits for the kernel to report a packet; it asks the card again and again, so it uses one CPU at 100% whether traffic flows or not.
 
 ## Pin the process to one CPU
 
@@ -13,10 +13,10 @@ CPU affinity: the calling thread may run on 4 CPUs, not exactly one; restrict it
 Restrict the process before it starts; every thread it creates inherits the restriction:
 
 ```sh
-taskset -c 3 ./my-program dut.json
+taskset -c 3 ./my-program /etc/switch/dut.json
 ```
 
-or give a container one CPU with `docker run --cpuset-cpus=3 ...`. On a real machine, choose a CPU on the card's NUMA node (the config's `numa_node`), and not CPU 0, where Linux does much of its own work.
+In a container started with one CPU (`docker run --cpuset-cpus=3 ...`), every process is already restricted to that CPU, and `taskset` is not needed. On a real machine, choose a CPU on the card's NUMA node (the config's `numa_node`), and not CPU 0, where Linux does much of its own work.
 
 `switch-junctiond` has the same rule for its network thread: start it under `taskset -c N` ([switch-junctiond](junctiond.md#cpus)).
 

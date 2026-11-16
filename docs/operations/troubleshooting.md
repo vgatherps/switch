@@ -1,6 +1,6 @@
 # Troubleshooting
 
-The messages below are quoted as the code prints them. A program that opens a card gets them as the text of the error `switch::nic::open` returns; `switch-nic` prints them after `switch-nic: error: `, and `switch-junctiond` after `switch-junctiond: open: `. Where `switch-nic` uses its own wording, the table shows both.
+A program that opens a card gets these messages as the text of the error `switch::nic::open` returns; `switch-nic` prints them after `switch-nic: error: `, and `switch-junctiond` after `switch-junctiond: open: `. Where `switch-nic` uses its own wording, the table shows both.
 
 When something fails inside DPDK, its driver usually writes the details to stderr, so keep stderr when you run a program that opens a card. For `switch-junctiond`'s own startup errors, see [switch-junctiond](junctiond.md#when-it-fails).
 
@@ -37,11 +37,17 @@ When something fails inside DPDK, its driver usually writes the details to stder
 |---|---|
 | `OutstandingBuffers { rx: .., tx: .., frame: .. }`; switch-nic: `port_close: buffers still in use: rx=.. tx=.. frame=..`, exit status 2 | The program still held packet buffers when it closed the card. Drop every received frame and send buffer, and shut the runtime down, before closing; the guide chapter Shutting down in the `switch` crate documentation (`make docs`) gives the order. |
 
+## Running switch-nic sockperf-server
+
+| Message | Cause and what to do |
+|---|---|
+| `switch-nic: error: nonzero RX timestamp <n> with rx_timestamps disabled` | The driver stamped a packet although the config asked for no timestamps. Turn `rx_timestamps` on, or report the driver's behaviour. |
+
 ## Writing the config
 
 | Message | Cause and what to do |
 |---|---|
-| `switch-netconf: dut.json: <key>: <reason>` | The file breaks a rule; see [The network config file](config.md#checking-a-file). |
+| `switch-netconf: /etc/switch/dut.json: <key>: <reason>` | The file breaks a rule; see [The network config file](config.md#checking-a-file). |
 | `interface eth1 does not exist` | Check the name with `ip link`. A card already bound to `vfio-pci` has no interface; `unbind` it first. |
 | `eth1 is not a PCI device` | The interface is virtual (a bridge, a veth, a tap). Write a `vdev` config by hand. |
 | `eth1 (0000:00:06.0) has no kernel driver bound` | Load the card's Linux driver, or write the config by hand. |
@@ -71,4 +77,4 @@ When something fails inside DPDK, its driver usually writes the details to stder
 | `IOMMU peer 0000:00:06.1 is bound to <driver>` | Another device in the card's IOMMU group is on a Linux driver. `vfio-pci` takes the whole group: unbind that device or bind it to `vfio-pci` too. |
 | `no-IOMMU mode taints the kernel and needs --noiommu` | The machine has no IOMMU for this card. Add `--noiommu` ([switch-netconf](switch-netconf.md#bind)). |
 | `vfio-pci driver missing after modprobe (...)` | The `vfio-pci` module could not be loaded. Install it for the running kernel. |
-| `...; rebind ok; current driver ena` | A step failed after the card left its Linux driver, and `bind` put it back. Fix the first error in the message and bind again. |
+| `...; rebind ok; current driver ena` | A step failed after the card left its Linux driver, and `bind` tried to give it back; the message ends with the driver the card is on now. Fix the first error in the message and bind again. |

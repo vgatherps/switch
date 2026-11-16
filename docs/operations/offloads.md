@@ -69,11 +69,9 @@ Which drivers offer receive timestamps, in the DPDK the repository builds:
 
 `switch-nic info` shows whether a card offers them: bit 14 (`0x4000`) of `rx_offload_capa` is set.
 
-Two drivers add a line to the report when timestamps are on:
+With timestamps on, the report adds a note for ice and ENA:
 
 ```text
 ice: RX timestamp forces scalar RX
 ena: stamps are device ns on the Time Sync clock
 ```
-
-On ice, timestamps make the driver use its scalar receive path instead of its vector one.

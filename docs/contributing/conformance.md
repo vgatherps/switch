@@ -46,9 +46,9 @@ When you change switch-ws so that a case's outcome changes on purpose, edit its 
 
 `make -C conduit test-autobahn-check` runs the checker's self-tests and those of the scripts around it. It needs Linux but not DPDK, and the full `make test` in the container runs it.
 
-### Through the junction daemon
+### Sharing a card through the daemon
 
-The same cases can run with the driver connected to `switch-junctiond` instead of owning the tap device:
+The same cases can run with the driver sharing the tap device through the daemon, `switch-junctiond`, instead of owning it:
 
 ```sh
 make -C conduit docker-autobahn-junction          # both roles
@@ -72,6 +72,6 @@ The run ends with:
 docker-tls-anvil: <seconds> s, TLS-Anvil exit 0, driver exit 0; results in .../conduit/tls-anvil/run/results
 ```
 
-followed by the comparison of the results with `conduit/tls-anvil/known-failures.txt`, which lists the tests that fail for reasons outside switch-tls, each with its reason. The comparison prints `NEW FAILURE <test id> <test>` for each failure not on the list and `known failure no longer fails: ...` for listed tests that passed, and ends with a count line starting `compare.py:`. The target exits 0 only if TLS-Anvil and the driver exited 0 and there is no new failure. When a listed test starts passing, remove it from the list.
+followed by the comparison of the results with `conduit/tls-anvil/known-failures.txt`, which lists the tests that fail for reasons outside switch-tls, each with its reason. The comparison prints `NEW FAILURE <test id> <test>` for each failure not on the list and `known failure no longer fails: <test id> <result>: <reason>` for each listed test that did not fail, and ends with a count line starting `compare.py:`. That line also appears for a listed test that was disabled or did not run, so check its result before you remove the test from the list. The target exits 0 only if TLS-Anvil and the driver exited 0 and there is no new failure.
 
 `TLS_ANVIL_ARGS` passes more options to TLS-Anvil, for example `TLS_ANVIL_ARGS='-testPackage de.rub.nds.tlstest.suite.tests.client.tls13'` to run a subset.

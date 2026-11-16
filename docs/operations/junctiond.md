@@ -10,74 +10,12 @@ cargo build --locked --release -p switch-junctiond --bins
 
 It reads the same [network config file](config.md) as a program that owns the card, so a machine prepared as in [Preparing a Linux machine](host-setup.md) or [Running on EC2](ec2.md) is ready for it. Run it as root.
 
-## Try it on a tap device
+## Starting it
 
-The daemon needs a CPU for its network thread and another for its other threads, and an application needs a CPU of its own, so use a container with three CPUs. These steps use the tap config `examples/tap.json` (shown in [The network config file](config.md#two-examples)) and the same CPUs and directory as the guide chapter Sharing a network card.
-
-1. From the repository root, start a container from the Docker image:
-
-   ```sh
-   docker run --rm -it --init \
-       --cap-add NET_ADMIN --device /dev/net/tun \
-       --cpuset-cpus=0-2 \
-       -v "$PWD:/work" -w /work \
-       -v switch-cargo-registry:/usr/local/cargo/registry \
-       -v switch-linux-target:/work/target \
-       switch-dpdk-test:local bash
-   ```
-
-2. Inside it, build the daemon and the example client:
-
-   ```sh
-   cargo build --locked --release -p switch-junctiond --bins
-   cargo build --locked --release -p switch-examples --features net --example tcp_client_junction
-   ```
-
-3. Start the daemon with its network thread on CPU 0 and its other threads on CPU 1, wait until it is serving, and give the Linux side of the tap device, `cdnic0`, its address:
-
-   ```sh
-   taskset -c 0 target/release/switch-junctiond --config examples/tap.json --dir /tmp/example-junction --control-cpus 1 &
-   until [ -S /tmp/example-junction/control.sock ] && ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
-   ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
-   ```
-
-   The daemon prints DPDK's `EAL:` lines and nothing else. Its directory now holds the socket applications connect to:
-
-   ```text
-   $ ls /tmp/example-junction
-   control.sock
-   cphc4be34a27a7d0f93
-   lock
-   ```
-
-4. Start a one-shot server on the Linux side and run the client on CPU 2:
-
-   ```sh
-   python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-   taskset -c 2 target/release/examples/tcp_client_junction /tmp/example-junction/control.sock 192.0.2.1:7000
-   ```
-
-   It prints the server's reply and `session finished`:
-
-   ```text
-   tick
-   session finished
-   ```
-
-5. Stop the daemon:
-
-   ```sh
-   kill %1
-   ```
-
-   It exits with status 0 and leaves only `lock` in its directory.
-
-## On a real card
-
-On a prepared machine, the shape is the same:
+The guide chapter Sharing a network card in the `switch` crate documentation walks through the daemon and a client program on a tap device. On a prepared machine:
 
 ```sh
-sudo taskset -c 2 switch-junctiond --config dut.json --control-cpus 0-1
+sudo taskset -c 2 switch-junctiond --config /etc/switch/dut.json --control-cpus 0-1
 ```
 
 On EC2, after `deploy/hft-host.sh`, use the CPUs it chose:
@@ -86,6 +24,8 @@ On EC2, after `deploy/hft-host.sh`, use the CPUs it chose:
 . /etc/switch/host.env
 sudo taskset -c "$JUNCTION_CPU" switch-junctiond --config /etc/switch/dut.json --control-cpus "$HOUSEKEEPING"
 ```
+
+The daemon prints DPDK's `EAL:` lines and nothing else while it runs.
 
 ## Flags
 
@@ -124,7 +64,13 @@ Only one daemon can use a directory; a second one exits with `--dir: /run/switch
 
 ## Knowing it is ready
 
-The daemon prints no ready message. `control.sock` appears before the card is open, and an application that connects then waits until the daemon has opened the card and serves it, or fails if the daemon exits. So a script waits until `control.sock` exists and then starts its applications, as in step 3. Connecting has no timeout of its own.
+The daemon prints no ready message. It creates `control.sock` before it opens the card. An application that connects at that point waits in `Session::connect` until the daemon has opened the card and serves it, or fails if the daemon exits; connecting has no timeout of its own. So a script that starts applications waits until `control.sock` exists:
+
+```sh
+until [ -S /run/switch-junctiond/control.sock ]; do sleep 0.1; done
+```
+
+A tap device's Linux interface appears only while the daemon opens the card, after `control.sock`. To configure the Linux side of a tap device, wait for the interface as well, for example `until [ -S <dir>/control.sock ] && ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done`.
 
 ## Stopping it
 
@@ -134,7 +80,7 @@ If the daemon is killed with SIGKILL or crashes, it cannot tell anyone or clean 
 
 ## When it fails
 
-Every failure is one line on stderr, `switch-junctiond: <reason>`, and exit status 1.
+A failure the daemon reports prints `switch-junctiond: <reason>` on stderr and exits with status 1. A flag error is followed by the usage text, and DPDK may print its own lines before an `open:` error.
 
 | Message | Cause |
 |---|---|
@@ -148,4 +94,4 @@ Every failure is one line on stderr, `switch-junctiond: <reason>`, and exit stat
 | `open: EAL helper CPU affinity: EAL helper CPUs are outside the effective cpuset` | a CPU in `--control-cpus` is not available to the process, for example outside Docker's `--cpuset-cpus` |
 | `open: ...` | the card could not be opened; see [Troubleshooting](troubleshooting.md#opening-the-card) |
 
-While running, the daemon also exits with status 1 if one of its threads fails or panics, and after a stop signal if closing the card or cleaning the directory fails.
+While running, the daemon also exits with status 1 if its control thread fails or panics or its network loop returns an error, and after a stop signal if closing the card or cleaning the directory fails. A panic in the network loop ends the process with Rust's panic message and status 101, without closing the card or cleaning the directory, as after a crash.

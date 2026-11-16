@@ -27,7 +27,7 @@ fn eal_belongs_to_the_test_worker() {
 }
 ```
 
-`with_eal` starts EAL the first time it is called and passes it to the closure. It starts with no PCI devices, no hugepages and 1 GiB of ordinary memory, with its main thread on the one CPU the process may use. It panics if the process may use more than one, so run every DPDK test binary pinned to one CPU and with one test thread:
+`with_eal` starts EAL the first time it is called and passes it to the closure. It starts with no PCI devices, no hugepages and 1 GiB of ordinary memory, with its main thread on the one CPU the process may use. That thread gets DPDK's thread number (lcore) 7 (`--lcores=7@<cpu>`), so the assertion above checks that the worker thread is the one that owns EAL. `with_eal` panics if the process may use more than one CPU, so run every DPDK test binary pinned to one CPU and with one test thread:
 
 ```sh
 taskset -c 3 cargo test --locked -p dpdk-smoltcp -- --test-threads=1
@@ -99,7 +99,7 @@ fn four_bytes_reach_the_peer() {
 
 `pair.close()` frees every frame still on the rings or held by the links, closes both ports, and checks that every packet buffer came back. It returns how many frames it had to free; a clean test expects 0.
 
-A link can damage the traffic. `Link::impair` takes a closure that sees each frame and returns a `wire::Verdict`: `Deliver`, `Duplicate`, `Drop`, or `Hold`, which keeps the frame back and delivers it right after the next one. This drops every frame from `b` to `a`:
+A link can damage the traffic. `Link::impair` takes a closure that sees each frame and returns a `wire::Verdict`: `Deliver`, `Duplicate`, `Drop`, or `Hold`, which keeps one frame back and delivers it right after the next frame the link delivers. A link holds one frame at a time; a second `Hold` while it holds one panics. This drops every frame from `b` to `a`:
 
 ```rust
 use switch_test_kit::wire::Verdict;
@@ -117,7 +117,7 @@ switch-net = { workspace = true, features = ["testkit"] }
 switch-test-support.workspace = true
 ```
 
-`client_server` runs one TCP connection end to end. This test sends a line from switch and checks that the kernel peer echoes it, on both backends:
+`client_server` runs one TCP connection end to end. This test sends a line from switch and checks that the kernel peer echoes it twice: once with the `Net` owning the tap device (`Backend::Conduit`), and once sharing it through the daemon (`Backend::Junction`), whose side runs on the same test thread over the same tap device:
 
 ```rust
 use std::io::{Read, Write};
@@ -180,7 +180,5 @@ fn echo_junction_backend() {
 The tap name must be short and unique among taps alive at once; the device becomes `net_tap_<name>` and the Linux interface `cdtap_<name>`.
 
 `client_server(backend, tap, port, listener_setup, serve, client, each_round)` starts the peer listening on 192.0.2.1:`port`, calling `listener_setup` on its `TcpListener` first. It runs `serve` on the connection the peer accepts, and `client` as a switch task on a stream connected from a fresh local port. It drives the `Net` until both are done, calling `each_round` each time round, and returns what `serve` returned. It drops what `client` returned only after the peer has finished, so what the peer saw came from the client's sends, not from its socket closing. The whole run must finish within 60 seconds.
-
-`Backend::Conduit` gives the test a `Net` that owns the tap device. `Backend::Junction` runs the daemon's side on the same test thread, over the same tap device, and gives the test a `Net` connected to it, so one body covers both backends.
 
 `with_tap_net(backend, &config, body)` is the lower-level form when the test needs its own loop: `body` gets a `TapNet`, whose `receive(now)` and `send()` it calls around its own runtime polls, and a `Clock`. `Clock::now()` is the time for `receive`; `Clock::ns()` is the tick for the runtime. Either way, the body must drop every handle, socket and frame it made before it returns; anything still alive when the tap is torn down fails the test.

@@ -10,7 +10,7 @@ The runner runs on your own machine and needs:
 
 - Python 3 with `boto3`, and `ssh`, `scp` and `git`;
 - AWS credentials allowed to manage EC2 networking, instances, key pairs and tags, and to call `ssm:GetParameter`, `sts:GetCallerIdentity` and `servicequotas:GetServiceQuota` (`python3 switch-bench/aws/switch_aws_bench.py -h` lists every permission);
-- a region, given with `--region` or set in your AWS profile (`aws configure`, or `AWS_REGION`);
+- a region, given with `--region` or configured in the AWS profile boto3 uses (`aws configure`);
 - free on-demand Standard vCPU quota (quota code `L-1216C47A`): 16 vCPUs for the `arm` shape, 56 for `intel`;
 - a clean working tree with everything committed. The hosts build `git archive HEAD`, so uncommitted changes would not be measured.
 
@@ -40,7 +40,7 @@ Nothing is built on your machine.
    python3 switch-bench/aws/switch_aws_bench.py run --region eu-west-1
    ```
 
-   The runner logs each stage on a line starting `switch-aws-bench:`. Expect `run <id> start: provisioning hosts`, `hosts up: ...`, and, once every host is prepared and has built `switch-bench`, `code built: ...`. Preparing a host includes a reboot. Then each sweep runs in turn, with the coordinator's progress lines. A failed sweep is logged and the next one still runs. At the end the runner tears down, writes the report, and logs `run <id>: nothing left` and `run <id> end: success`, or `failed`.
+   The runner logs each stage on a line starting `switch-aws-bench:`. Expect `run <id> start: provisioning hosts`, `hosts up: ...`, and, once every host is prepared and has built `switch-bench`, `code built: ...`. Preparing a host includes a reboot. Then each sweep runs in turn, with the coordinator's progress lines. A sweep whose coordinator exits nonzero, or whose placement check fails, is recorded as failed and the next sweep runs. An error the runner does not handle, such as an SSH command that times out while a sweep starts, ends the matrix there and goes straight to teardown. At the end the runner tears down, writes the report, and logs `run <id>: nothing left` and `run <id> end: success`, or `failed`.
 
 The command exits 0 only when the report is complete, every fetch succeeded, no sweep failed and teardown verified that nothing is left.
 
@@ -55,13 +55,17 @@ A run has one receiver host and three sender hosts:
 
 Each host has a second network interface as its data card. The receiver runs `switch-bench serve`, each sender host runs one generator, and the coordinator runs on the first sender host. The echo server and the generators each run on the host's isolated application CPU, `APP_CPU`.
 
-`--backend` picks the backend of the receiver and the generators: `conduit` (the default, each process owns its card), `junction` (each host runs `switch-junctiond` on its `JUNCTION_CPU`), or `--backend conduit junction` to run every sweep once per backend.
+`--backend` chooses how the echo server and the generators reach their cards: `conduit` (the default) makes each process own its card; `junction` makes each host run `switch-junctiond` on its `JUNCTION_CPU` and the processes share the card through it; `--backend conduit junction` runs every sweep both ways.
 
-The sweeps are fixed. There are five: UDP, TCP with `--budget-us 50` and without, and WebSocket with `--budget-us 50` and without. Every sweep uses 12 connections (4 per sender host), 64-byte messages and the same 11 rates: 10k, 100k, 400k, 800k, 900k, 1M, 1.1M, 1.2M, 1.4M, 1.8M and 2.5M messages per second. Each step measures for 10 seconds after a 250 ms warmup, then drains for 200 ms. Sweep files are named `BACKEND-PROTO-n12-s64-uncapped` or `BACKEND-PROTO-n12-s64-b50`, for example `conduit-tcp-n12-s64-b50`.
+The sweeps are fixed: UDP, TCP with `--budget-us 50` and without, and WebSocket with `--budget-us 50` and without. Every sweep uses 12 connections (4 per sender host), 64-byte messages and the same 11 rates: 10k, 100k, 400k, 800k, 900k, 1M, 1.1M, 1.2M, 1.4M, 1.8M and 2.5M messages per second. Each step measures for 10 seconds after a 250 ms warmup, then drains for 200 ms. Sweep files are named `BACKEND-PROTO-n12-s64-uncapped` or `BACKEND-PROTO-n12-s64-b50`, where `BACKEND` is the `--backend` value, for example `conduit-tcp-n12-s64-b50`.
+
+When sharing the card, the runner stops each daemon after its sweep and writes its exit status at the end of `<sweep>.<role>.switch-junctiond.log`. A nonzero status is logged but does not fail the sweep, so check those lines.
+
+When a process owns its card, the echo server and the generators also write the card's ENA allowance counters (`pps_allowance_exceeded`, `bw_in_allowance_exceeded`, `bw_out_allowance_exceeded`) and its reset count to their logs, as `ena_xstats` JSON lines at start and at close, with an `invalid` list naming any reset or counter that went backwards. The report does not read these lines, so a rising counter or a reset does not make it incomplete; check the logs before trusting a sweep's numbers.
 
 ## INVALID sweeps
 
-A latency number from a host where something else ran on the measured CPU is not worth much, so the runner records where every thread ran, at the start of each sweep and near its end. The report marks a sweep INVALID when:
+A latency number from a host where something else ran on the measured CPU is not worth much. At the start of each sweep and near its end, the runner snapshots every userspace thread's allowed CPUs and the CPU it last ran on, and it counts interrupts between the two snapshots. The report marks a sweep INVALID when:
 
 - the echo server, a generator or the daemon is not pinned to exactly its CPU;
 - any other thread of those processes, or any other process, may run on a CPU the benchmark uses (the application's `junction-ctl` thread may share `APP_CPU`);
@@ -80,7 +84,7 @@ Everything goes to `DIR/<run-id>/`, where `DIR` is `--out` (default `switch-benc
 | `<sweep>.jsonl` | The coordinator's step and summary lines |
 | `<sweep>.coord.log`, `<sweep>.receiver.log`, `sender<i>/gen-<sweep>.log` | The coordinator's progress and the stderr of the echo server and each generator |
 | `<sweep>.placement.json`, `<sweep>.<role>.placement.txt`, `<sweep>.<role>.placement.end.txt` | The placement check's result and its snapshots |
-| `<sweep>.<role>.switch-junctiond.log` | Each daemon's output (junction backend) |
+| `<sweep>.<role>.switch-junctiond.log` | Each daemon's output and exit status, when sharing the card |
 | `source.json` | The commit and the SHA-256 of the source archive the hosts built |
 | `host-setup.txt` | Each host's `hft-host.sh verify` output and CPU assignment |
 | `expected.json` | The sweeps the run meant to produce |
@@ -108,4 +112,4 @@ It uses `created.json` from the run's directory (pass `--out DIR` if it is not t
 python3 switch-bench/aws/switch_aws_bench.py kernel --region R
 ```
 
-Its sweep files carry the generators' backend in their names, as in a `run`; the report's title says the receiver was the Linux kernel.
+Its sweep files are named as in a `run`, after how the generators reach their cards; the report's title says the receiver was the Linux kernel.
