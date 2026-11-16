@@ -88,12 +88,14 @@ The errors that can come out of `connect` are all variants of `switch_ws::switch
 | Error | Meaning | What to do |
 |---|---|---|
 | `Tls(e)` | The TLS handshake failed, for example an unknown certificate issuer. switch-tls sent the alert and FIN, best effort, and waited until the server acknowledged them or the connection ended. | Check the config's roots and the host name. |
-| `Handshake(msg)` | The handshake could not start (the host is not a valid server name) or ended in an unexpected state. | Fix the host name. |
+| `Handshake(msg)` | The handshake could not start (the host is not a valid server name), negotiated a version other than TLS 1.3, or ended in an unexpected state. | Check the host name and use a TLS 1.3 server. |
 | `Upgrade(e)` | The server refused or garbled the WebSocket upgrade. `UpgradeError::Status(Some(code))` carries the HTTP status when it is not 101. | Check the path and the server; see below. |
 | `Recv(e)`, `Send(e)` | TCP failed under the handshake or the upgrade. | Treat as a lost connection. |
 | `Config(SetupError::RoomTooSmall { room, need })` | One frame cannot carry the largest control frame or TLS record. The room is the smallest of the frame size, the connection's MSS and the socket's send capacity, and the TLS `max_fragment_size` caps it further; `room` and `need` are byte counts. | Raise whichever is too small: `tx_capacity` on the local backend, `mss_cap` or the path MTU, or `max_fragment_size`. |
 | `Config(SetupError::ForeignHandle)` | The stream belongs to another `Net`. | Pass the stream's own handle. |
 | `Failed(Failure::Dead)` | The socket was already closed or reset. | Treat as a lost connection. |
+
+switch-tls supports TLS 1.3 only. If the supplied rustls config also permits TLS 1.2 and the server negotiates it, `connect` returns `Handshake(msg)` rather than panicking. A TLS 1.3-only config rejects a TLS 1.2-only server during the rustls handshake instead, returning `Tls(e)`.
 
 A few upgrade failures are worth knowing by name. The upgrade response head may be at most 16 KiB; a longer one is `UpgradeError::HeadTooBig`. A server that selects an extension or a subprotocol fails with `UpgradeError::Unrequested`, since switch-ws asks for none. A response with the wrong `Sec-WebSocket-Accept` is `UpgradeError::WrongAccept`. Binance's servers answer HTTP 451 from restricted locations, which arrives as `Upgrade(UpgradeError::Status(Some(451)))`.
 

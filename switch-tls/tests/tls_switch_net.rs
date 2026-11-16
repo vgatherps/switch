@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::version::TLS13;
+use rustls::version::{TLS12, TLS13};
 use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
 use switch_tls::switch_net::{Error as TlsError, Tls as ClientTls, send_bytes, tls_connect};
 use switch::{Runtime, Spawner};
@@ -34,12 +34,19 @@ const TAP: TapConfig = TapConfig {
 };
 
 fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+    tls_configs_with_versions(&[&TLS13], &[&TLS13])
+}
+
+fn tls_configs_with_versions(
+    server_versions: &[&'static rustls::SupportedProtocolVersion],
+    client_versions: &[&'static rustls::SupportedProtocolVersion],
+) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec![HOST.to_owned()]).expect("generate test certificate");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
     let server = ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&TLS13])
+        .with_protocol_versions(server_versions)
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![cert.der().clone()], key)
@@ -47,7 +54,7 @@ fn tls_configs() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
     let mut roots = RootCertStore::empty();
     roots.add(cert.der().clone()).unwrap();
     let client = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&TLS13])
+        .with_protocol_versions(client_versions)
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -70,6 +77,35 @@ fn run<T: Send + 'static, F: Future<Output = ()> + 'static>(
         move |handle, stream| client(handle, stream, client_tls),
         || {},
     )
+}
+
+/// Even when the client config permits TLS 1.2, connect refuses it before constructing TlsTx.
+fn negotiated_tls12_returns_an_error(backend: Backend) {
+    let (server_tls, client_tls) = tls_configs_with_versions(&[&TLS12], &[&TLS13, &TLS12]);
+    let negotiated = client_server(
+        backend,
+        &TAP,
+        SERVER_PORT,
+        |_| {},
+        move |mut stream| {
+            let mut conn = ServerConnection::new(server_tls).unwrap();
+            while conn.is_handshaking() {
+                conn.complete_io(&mut stream).expect("server TLS 1.2 handshake");
+            }
+            conn.protocol_version()
+        },
+        move |handle, stream| async move {
+            match tls_connect(&handle, stream, client_tls, HOST, 1).await {
+                Err(TlsError::Handshake(message)) => {
+                    assert_eq!(message, "negotiated Some(TLSv1_2); TLS 1.3 required");
+                }
+                Err(e) => panic!("unexpected error {e}"),
+                Ok(_) => panic!("TLS 1.2 was accepted"),
+            }
+        },
+        || {},
+    );
+    assert_eq!(negotiated, Some(rustls::ProtocolVersion::TLSv1_2));
 }
 
 /// Bytes the server sends after the record the client rejects: still unread when the client
@@ -544,6 +580,10 @@ macro_rules! backend_tests {
 }
 
 backend_tests! {
+    negotiated_tls12_returns_an_error => (
+        negotiated_tls12_returns_an_error_conduit,
+        negotiated_tls12_returns_an_error_junction
+    ),
     rejected_handshake_sends_the_alert_before_the_rst => (
         rejected_handshake_sends_the_alert_before_the_rst_conduit,
         rejected_handshake_sends_the_alert_before_the_rst_junction

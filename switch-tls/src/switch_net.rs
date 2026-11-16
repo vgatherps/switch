@@ -11,7 +11,7 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
 
-use rustls::ClientConfig;
+use rustls::{ClientConfig, ProtocolVersion};
 use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::ServerName;
 use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
@@ -146,8 +146,8 @@ pub enum Error {
     Tls(TlsError),
     /// Sending failed (TLS or TCP).
     Send(TxError<NetError>),
-    /// The handshake could not start (a bad server name) or ended in a state other than
-    /// application traffic.
+    /// The handshake could not start (a bad server name), negotiated a version other than
+    /// TLS 1.3, or ended in a state other than application traffic.
     Handshake(String),
     /// The connection could not be set up; nothing was sent.
     Setup(SetupError),
@@ -254,6 +254,8 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
 /// `min_plain` is the largest plaintext record the caller will send (0 counts as 1); a frame
 /// that cannot carry it as one record (its room, or the client's `max_fragment_size`) is
 /// `Setup(RoomTooSmall)` before the ClientHello.
+/// A negotiated version other than TLS 1.3 is refused with `Handshake`, even if `config`
+/// permits it.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -336,6 +338,9 @@ pub async fn tls_connect(
             }
             Next::Done => break,
         }
+    }
+    if conn.protocol_version() != Some(ProtocolVersion::TLSv1_3) {
+        return Err(Error::Handshake(format!("negotiated {:?}; TLS 1.3 required", conn.protocol_version())));
     }
     Ok(Tls {
         tx: TlsTx::new(conn, raw, max_fragment_size),

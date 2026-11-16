@@ -49,7 +49,8 @@ pub enum Error {
     Tls(switch_tls::Error),
     /// Sending the upgrade failed below WebSocket (TLS or TCP).
     Send(TlsTxError<NetError>),
-    /// The TLS handshake could not start or ended in a state other than application traffic.
+    /// The handshake could not start, negotiated a version other than TLS 1.3, or ended in a
+    /// state other than application traffic.
     Handshake(String),
     /// The server refused or botched the WebSocket upgrade.
     Upgrade(UpgradeError),
